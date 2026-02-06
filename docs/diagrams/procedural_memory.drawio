@@ -1,0 +1,210 @@
+<mxfile>
+  <diagram name="Procedural Memory" id="procedural-memory">
+    <mxGraphModel dx="1300" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1500" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ===================== TITLE ===================== -->
+        <mxCell id="2" value="&lt;font style=&quot;font-size: 20px;&quot;&gt;&lt;b&gt;Procedural Memory (PM) — Fast Low-Rank Weights + Eligibility&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="650" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;font color=&quot;#808080&quot; style=&quot;font-size: 11px;&quot;&gt;B×L instances (1 per layer per block). Each PM has r=8 low-rank slots that modulate the layer's computation.&lt;br&gt;Read-only within spans; commits only at plasticity boundaries (every P tokens).&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="52" width="700" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== CONFIG/STATE BOX ===================== -->
+        <mxCell id="4" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Configuration&lt;/b&gt;&lt;br&gt;r = 8 (slots per PM instance)&lt;br&gt;D_h = D/B (e.g. 128)&lt;br&gt;ρ = 0.95 (eligibility decay)&lt;br&gt;a_max = 3.0, budget = 4.0&lt;br&gt;commit_top_k = 2, τ = 1.0&lt;br&gt;&lt;br&gt;&lt;b&gt;State (per stream, per instance):&lt;/b&gt;&lt;br&gt;pm_K: [BS, r, D_h] — unit-normalized keys&lt;br&gt;pm_V: [BS, r, D_h] — unit-normalized values&lt;br&gt;pm_a: [BS, r] — bounded strengths&lt;br&gt;elig_K: [BS, r, D_h] — eligibility keys&lt;br&gt;elig_V: [BS, r, D_h] — eligibility values&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="20" width="300" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- Scaling annotation -->
+        <mxCell id="5" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Instance Scaling:&lt;/b&gt;&lt;br&gt;Tier A: 4×8 = 32 PM instances&lt;br&gt;Tier B: 6×12 = 72 PM instances&lt;br&gt;Tier C: 8×24 = 192 PM instances&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="260" width="230" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== TWO PATHS LABEL ===================== -->
+        <mxCell id="9" value="&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#555&quot;&gt;Two timescales of operation:&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="300" y="97" width="200" height="18" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== LEFT PATH: PER-TOKEN (READ + ELIGIBILITY) ===================== -->
+        <mxCell id="10" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#82b366;dashed=0;strokeWidth=2;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="480" height="700" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Per-Token Path&lt;/b&gt;  &lt;font color=&quot;#888&quot;&gt;(every token)&lt;/font&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="50" y="125" width="300" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- Input -->
+        <mxCell id="20" value="&lt;b&gt;x_block&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D_h]&lt;br&gt;layer input&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="160" width="130" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- === READ PATH === -->
+        <mxCell id="12" value="&lt;font style=&quot;font-size: 11px;&quot; color=&quot;#2d7600;&quot;&gt;&lt;b&gt;READ (apply)&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="60" y="230" width="120" height="18" as="geometry"/>
+        </mxCell>
+
+        <!-- Normalize -->
+        <mxCell id="21" value="&lt;b&gt;Unit Normalize&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;x_q = normalize(x_block)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="255" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="20" target="21" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Score -->
+        <mxCell id="23" value="&lt;b&gt;Score Slots&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;scores = einsum(pm_K, x_q) → [BS, r]&lt;br&gt;Cosine similarity to each of r slots&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="315" width="240" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="21" target="23" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Weighted sum -->
+        <mxCell id="25" value="&lt;b&gt;Strength-Weighted Readout&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;y_pm = einsum(pm_a ⊙ scores, pm_V) → [BS, D_h]&lt;br&gt;Slots with higher pm_a contribute more&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="390" width="290" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="26" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="23" target="25" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- y_pm output -->
+        <mxCell id="27" value="&lt;b&gt;y_pm&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D_h]&lt;br&gt;→ fused into layer recurrence&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="465" width="200" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="28" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="25" target="27" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- PM slots visual -->
+        <mxCell id="29" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;r=8 Slot Bank (frozen within span):&lt;/b&gt;&lt;br&gt;┌──────┬──────┬──────┬──────┬───┬──────┐&lt;br&gt;│ K₀,V₀│ K₁,V₁│ K₂,V₂│ K₃,V₃│···│ K₇,V₇│&lt;br&gt;│ a₀ │ a₁ │ a₂ │ a₃ │ │ a₇ │&lt;br&gt;└──────┴──────┴──────┴──────┴───┴──────┘&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=#82b366;fillColor=#eef7ee;rounded=1;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="320" y="270" width="190" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- === ELIGIBILITY PATH === -->
+        <mxCell id="13" value="&lt;font style=&quot;font-size: 11px;&quot; color=&quot;#2d7600;&quot;&gt;&lt;b&gt;ELIGIBILITY (accumulate)&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="60" y="545" width="220" height="18" as="geometry"/>
+        </mxCell>
+
+        <!-- h (post-synaptic) input -->
+        <mxCell id="30" value="&lt;b&gt;h&lt;/b&gt; (post-synaptic)&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D_h] — layer output&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="280" y="160" width="190" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Pre-synaptic projection -->
+        <mxCell id="31" value="&lt;b&gt;W_k_pre&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D_h, D_h)&lt;br&gt;k_cand = normalize(W_k_pre(x))&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="575" width="200" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Post-synaptic projection -->
+        <mxCell id="32" value="&lt;b&gt;W_v_post&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D_h, D_h)&lt;br&gt;v_cand = W_v_post(h)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="290" y="575" width="200" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows to eligibility projections -->
+        <mxCell id="33" value="&lt;font style=&quot;font-size: 8px;&quot;&gt;pre-synaptic&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;dashed=1;strokeColor=#82b366;" edge="1" source="20" target="31" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="145" y="540"/>
+              <mxPoint x="160" y="540"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="34" value="&lt;font style=&quot;font-size: 8px;&quot;&gt;post-synaptic&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;dashed=1;strokeColor=#82b366;" edge="1" source="30" target="32" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="375" y="540"/>
+              <mxPoint x="390" y="540"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Eligibility accumulation -->
+        <mxCell id="35" value="&lt;b&gt;Eligibility Accumulation&lt;/b&gt; (differentiable)&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;elig_K = ρ · elig_K + k_cand.unsqueeze(1)  — broadcast to r slots&lt;br&gt;elig_V = ρ · elig_V + v_cand.unsqueeze(1)  — ρ=0.95 decay&lt;br&gt;&lt;br&gt;Eligibility traces accumulate a Hebbian-like signal:&lt;br&gt;pre-synaptic (input) × post-synaptic (output)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="60" y="660" width="440" height="95" as="geometry"/>
+        </mxCell>
+        <mxCell id="36" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="31" target="35" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="37" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="32" target="35" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Differentiable annotation -->
+        <mxCell id="38" value="&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#2d7600;&quot;&gt;Gradients flow through eligibility →&lt;br&gt;trains W_k_pre and W_v_post via backprop&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="60" y="760" width="260" height="28" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== RIGHT PATH: BOUNDARY COMMIT ===================== -->
+        <mxCell id="50" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9673a6;dashed=0;strokeWidth=2;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="560" y="120" width="470" height="700" as="geometry"/>
+        </mxCell>
+        <mxCell id="51" value="&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Boundary Path&lt;/b&gt;  &lt;font color=&quot;#888&quot;&gt;(every P tokens)&lt;/font&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="570" y="125" width="340" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- PMController -->
+        <mxCell id="52" value="&lt;b&gt;PMController&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Heuristic (MVP): commit if elig_norm &gt; threshold&lt;br&gt;Future: RL-based gating policy&lt;br&gt;&lt;br&gt;Inputs: elig_norm, pm_usage, span_surprise&lt;br&gt;Output: commit_mask [BS] bool&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="590" y="165" width="280" height="95" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow down from controller -->
+        <mxCell id="53" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;commit_mask&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#9673a6;" edge="1" source="52" target="55" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Slot Selection -->
+        <mxCell id="55" value="&lt;b&gt;Soft Top-k Slot Selection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;1. scores = einsum(pm_K, elig_K_norm) → [BS, r]&lt;br&gt;2. Weakness bias: scores −= weakness_weight × pm_a&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;(prefer overwriting weak slots)&lt;br&gt;3. w = soft_topk(scores, k=2, τ=1.0) → [BS, r]&lt;br&gt;4. α = w × g × commit_mask → [BS, r]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="580" y="300" width="320" height="105" as="geometry"/>
+        </mxCell>
+
+        <!-- EMA Update -->
+        <mxCell id="56" value="&lt;b&gt;EMA Update (no grad)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;pm_K = normalize((1−α) · pm_K + α · elig_K_norm)&lt;br&gt;pm_V = normalize((1−α) · pm_V + α · elig_V_norm)&lt;br&gt;pm_a = clamp(pm_a + α, 0, a_max)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="580" y="440" width="320" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="57" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="55" target="56" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Budget + Decay -->
+        <mxCell id="58" value="&lt;b&gt;Stability Rails&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;• Decay: pm_a *= decay (0.999)&lt;br&gt;• Budget: enforce sum(pm_a) ≤ budget (4.0) per stream&lt;br&gt;• Normalize: pm_K, pm_V unit-normalized after update&lt;br&gt;• Clamp: pm_a ∈ [0, a_max=3.0]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="580" y="550" width="320" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="59" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="56" target="58" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Reset eligibility -->
+        <mxCell id="60" value="&lt;b&gt;Reset Eligibility&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;For committing streams:&lt;br&gt;elig_K *= (1 − commit_mask)&lt;br&gt;elig_V *= (1 − commit_mask)&lt;br&gt;(Keeps differentiable path alive)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="580" y="665" width="280" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="61" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="58" target="60" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Eligibility feeds into commit (dashed arrow from left to right) -->
+        <mxCell id="65" value="&lt;font style=&quot;font-size: 8px;&quot;&gt;elig_K, elig_V&lt;br&gt;accumulated over span&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;dashed=1;strokeColor=#82b366;" edge="1" source="35" target="55" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="530" y="700"/>
+              <mxPoint x="530" y="350"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===================== CONCEPTUAL SUMMARY ===================== -->
+        <mxCell id="80" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Conceptual Summary:&lt;/b&gt;&lt;br&gt;PM acts as &lt;b&gt;fast, adaptive low-rank weights&lt;/b&gt; that modulate the layer's computation.&lt;br&gt;Unlike standard weights (trained by backprop), PM weights evolve at runtime via&lt;br&gt;neuromodulated Hebbian-like updates. This enables in-context adaptation.&lt;br&gt;&lt;br&gt;&lt;b&gt;Analogy:&lt;/b&gt; PM is to standard weights as short-term synaptic plasticity is to&lt;br&gt;long-term potentiation — it captures patterns within a document/session.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="860" width="520" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Timing diagram annotation -->
+        <mxCell id="81" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Timing (P=32 tokens per span):&lt;/b&gt;&lt;br&gt;┌─ token 0 ──── token 31 ─┐ ┌─ token 32 ──── token 63 ─┐&lt;br&gt;│ READ + ELIGIBILITY │ │ READ + ELIGIBILITY │&lt;br&gt;│ (pm_K/V/a frozen) │ │ (pm_K/V/a frozen) │&lt;br&gt;└────────────┬────────────┘ └────────────┬────────────┘&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;COMMIT&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;COMMIT&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;fontFamily=monospace;" vertex="1" parent="1">
+          <mxGeometry x="600" y="860" width="460" height="120" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

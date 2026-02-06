@@ -1,0 +1,210 @@
+<mxfile>
+  <diagram name="Episodic Memory" id="episodic-memory">
+    <mxGraphModel dx="1300" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1500" pageHeight="1500" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ===================== TITLE ===================== -->
+        <mxCell id="2" value="&lt;font style=&quot;font-size: 20px;&quot;&gt;&lt;b&gt;Episodic Memory (EM) — Per-Block Vector Store&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="560" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;font color=&quot;#808080&quot; style=&quot;font-size: 11px;&quot;&gt;B instances (1 per block, shared across all L layers in that block). Stores and retrieves latent vectors (not tokens).&lt;br&gt;Retrieves every token; writes only at plasticity boundaries (every P tokens). Controlled by EMController.&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="52" width="720" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== CONFIG/STATE BOX ===================== -->
+        <mxCell id="4" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Configuration&lt;/b&gt;&lt;br&gt;M = 256 (slot capacity per EM bank)&lt;br&gt;D_em = 128 (key/value dimension)&lt;br&gt;k_ret = 4 (retrieval count)&lt;br&gt;C = 8 (candidates selected per span)&lt;br&gt;k_write = 4 (slots updated per candidate)&lt;br&gt;S_max = 3.0, budget = 8.0, decay = 0.999&lt;br&gt;&lt;br&gt;&lt;b&gt;State (per stream, per block):&lt;/b&gt;&lt;br&gt;em_K: [BS, M, D_em] — unit-normalized keys&lt;br&gt;em_V: [BS, M, D_em] — values&lt;br&gt;em_S: [BS, M] — strength/importance&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="20" width="310" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Scaling annotation -->
+        <mxCell id="5" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Instance Scaling:&lt;/b&gt;&lt;br&gt;Tier A: B=4 → 4 EM banks&lt;br&gt;Tier B: B=6 → 6 EM banks&lt;br&gt;Tier C: B=8 → 8 EM banks&lt;br&gt;Each bank: M=256 slots&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="240" width="230" height="85" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== LEFT PATH: PER-TOKEN RETRIEVAL ===================== -->
+        <mxCell id="10" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#d6b656;dashed=0;strokeWidth=2;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="480" height="560" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Per-Token: Retrieve&lt;/b&gt;  &lt;font color=&quot;#888&quot;&gt;(every token)&lt;/font&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="50" y="115" width="320" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- Inputs -->
+        <mxCell id="20" value="&lt;b&gt;x&lt;/b&gt; [BS, D]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;token embedding&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="150" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="21" value="&lt;b&gt;y_wm&lt;/b&gt; [BS, D]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;WM output&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="200" y="150" width="120" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Query computation -->
+        <mxCell id="22" value="&lt;b&gt;Query Projection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;q = normalize(W_q_em(concat(x, y_wm)))&lt;br&gt;→ [BS, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="220" width="280" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="23" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="20" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="21" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Score + Top-k -->
+        <mxCell id="25" value="&lt;b&gt;Score + Top-k Retrieval&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;scores = einsum(q, em_K) → [BS, M]&lt;br&gt;Mask inactive slots (em_S == 0)&lt;br&gt;top-k: select k_ret=4 highest scoring slots&lt;br&gt;V_top = gather(em_V, topk_idx) → [BS, k_ret, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="60" y="300" width="310" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="26" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="22" target="25" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- EM bank visual -->
+        <mxCell id="27" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;EM Bank (M=256 slots):&lt;/b&gt;&lt;br&gt;┌────┬────┬────┬───┬────────┐&lt;br&gt;│K₀,V₀│K₁,V₁│K₂,V₂│···│K₂₅₅,V₂₅₅│&lt;br&gt;│ S₀ │ S₁ │ S₂ │ │ S₂₅₅ │&lt;br&gt;└────┴────┴────┴───┴────────┘&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=#d6b656;fillColor=#fff8ee;rounded=1;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="385" y="230" width="125" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- Cross-attention aggregation -->
+        <mxCell id="28" value="&lt;b&gt;Cross-Attention Aggregation&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;q_cross = W_q_cross(x) → [BS, D_em]&lt;br&gt;attn = softmax(q_cross @ V_top^T / √D_em) → [BS, k_ret]&lt;br&gt;out = attn @ V_top → [BS, D_em]&lt;br&gt;&lt;br&gt;Aggregates k_ret memory tokens into one vector,&lt;br&gt;preserving multi-item recall capability.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="60" y="410" width="340" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="29" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="25" target="28" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Output projection -->
+        <mxCell id="30" value="&lt;b&gt;W_o_cross&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D_em, D) → y_em&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="120" y="540" width="180" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="28" target="30" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Output -->
+        <mxCell id="32" value="&lt;b&gt;y_em&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D]&lt;br&gt;→ projected to D_h per block,&lt;br&gt;fed to all L layers in this block&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="610" width="220" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="33" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="30" target="32" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== MIDDLE: CANDIDATE PROPOSAL ===================== -->
+        <mxCell id="40" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#d6b656;dashed=1;strokeWidth=2;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="700" width="480" height="240" as="geometry"/>
+        </mxCell>
+        <mxCell id="41" value="&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Per-Token: Propose Candidate&lt;/b&gt;  &lt;font color=&quot;#888&quot;&gt;(buffered for boundary write)&lt;/font&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="50" y="705" width="460" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- h_final input -->
+        <mxCell id="42" value="&lt;b&gt;h_final&lt;/b&gt; [BS, D_h]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;block output&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="740" width="130" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Candidate computation -->
+        <mxCell id="43" value="&lt;b&gt;Candidate Key + Value&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;k_cand = normalize(W_k_cand(concat(x, y_wm))) → [BS, D_em]&lt;br&gt;v_cand = W_v_cand(h_final) → [BS, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="60" y="740" width="260" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Novelty score -->
+        <mxCell id="44" value="&lt;b&gt;Novelty Score&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;novelty = 0.5 × surprise + 0.5 × (1 − max_cos_sim(em_K, k_cand))&lt;br&gt;Combines: how surprising? + how different from existing memories?&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="60" y="820" width="420" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="45" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="43" target="44" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Buffer annotation -->
+        <mxCell id="46" value="&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#b85c00;&quot;&gt;Candidates buffered over span (P tokens):&lt;br&gt;cand_K: [BS, P, D_em], cand_V: [BS, P, D_em], cand_score: [BS, P]&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="60" y="875" width="430" height="28" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== RIGHT PATH: BOUNDARY WRITE ===================== -->
+        <mxCell id="50" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9673a6;dashed=0;strokeWidth=2;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="560" y="110" width="470" height="830" as="geometry"/>
+        </mxCell>
+        <mxCell id="51" value="&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Boundary: Write&lt;/b&gt;  &lt;font color=&quot;#888&quot;&gt;(every P tokens)&lt;/font&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="570" y="115" width="340" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- EMController -->
+        <mxCell id="52" value="&lt;b&gt;EMController&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Heuristic (MVP): write if mean_novelty &gt; 0.3&lt;br&gt;Future: RL-based gating policy&lt;br&gt;&lt;br&gt;Inputs: span_surprise, em_usage, cand_novelty_mean&lt;br&gt;Outputs: write_mask [BS] bool, g_em [BS] strength&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="590" y="155" width="300" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Top-C selection -->
+        <mxCell id="53" value="&lt;b&gt;Select Top-C Candidates&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;From span buffer, pick C=8 highest novelty:&lt;br&gt;topC_idx = topk(cand_score, C) → [BS, C]&lt;br&gt;K_C, V_C = gather from buffer → [BS, C, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="590" y="295" width="310" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="54" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;write_mask, g_em&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#9673a6;" edge="1" source="52" target="53" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- For each candidate loop -->
+        <mxCell id="55" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff8ee;strokeColor=#d6b656;dashed=1;strokeWidth=1;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="580" y="400" width="430" height="290" as="geometry"/>
+        </mxCell>
+        <mxCell id="56" value="&lt;font style=&quot;font-size: 11px;&quot;&gt;&lt;b&gt;For each candidate c (C=8 iterations):&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="590" y="405" width="340" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="57" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="53" target="55" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Slot scoring -->
+        <mxCell id="58" value="&lt;b&gt;1. Score Existing Slots&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;scores_slot = einsum(k_c, em_K) → [BS, M]&lt;br&gt;Weakness bias: scores −= weakness_weight × em_S&lt;br&gt;(Prefer overwriting weak/unused slots)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="600" y="435" width="310" height="65" as="geometry"/>
+        </mxCell>
+
+        <!-- Soft top-k -->
+        <mxCell id="59" value="&lt;b&gt;2. Soft Top-k Selection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;w = soft_topk(scores_slot, k_write=4, τ=1.0) → [BS, M]&lt;br&gt;α = w × g_em × write_mask → [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="600" y="515" width="310" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="60" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="58" target="59" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- EMA update -->
+        <mxCell id="61" value="&lt;b&gt;3. EMA Update (no grad)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;em_K = normalize((1−α) · em_K + α · k_c)&lt;br&gt;em_V = (1−α) · em_V + α · v_c&lt;br&gt;em_S = clamp(em_S + α × score_c, 0, S_max)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="600" y="585" width="310" height="65" as="geometry"/>
+        </mxCell>
+        <mxCell id="62" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="59" target="61" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Budget + Decay -->
+        <mxCell id="63" value="&lt;b&gt;Stability Rails&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;• Decay: em_S *= decay (0.999) — gradual forgetting&lt;br&gt;• Budget: enforce sum(em_S) ≤ budget (8.0) per stream&lt;br&gt;• Clamp: em_S ∈ [0, S_max=3.0]&lt;br&gt;• Keys always unit-normalized after update&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="590" y="720" width="320" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="64" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="55" target="63" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Candidate buffer arrow to boundary write -->
+        <mxCell id="65" value="&lt;font style=&quot;font-size: 8px;&quot;&gt;span buffer&lt;br&gt;(P candidates)&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;dashed=1;strokeColor=#d6b656;" edge="1" source="44" target="53" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="540" y="845"/>
+              <mxPoint x="540" y="332"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===================== RESET ANNOTATION ===================== -->
+        <mxCell id="70" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Doc Boundary Reset (per stream):&lt;/b&gt;&lt;br&gt;• em_S[stream] = 0 (deactivate all slots)&lt;br&gt;• em_K, em_V persist but effectively masked inactive&lt;br&gt;• Phase E: skip reset for lifelong memory&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="590" y="830" width="340" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== CONCEPTUAL SUMMARY ===================== -->
+        <mxCell id="80" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Conceptual Summary:&lt;/b&gt;&lt;br&gt;EM acts as an &lt;b&gt;explicit, addressable memory bank&lt;/b&gt; for storing noteworthy representations.&lt;br&gt;Unlike WM (which stores raw token K/V), EM stores &lt;b&gt;latent vectors&lt;/b&gt; — compressed&lt;br&gt;representations that capture meaning rather than surface form.&lt;br&gt;&lt;br&gt;&lt;b&gt;Analogy:&lt;/b&gt; EM is like a person's episodic memory — recalling &lt;i&gt;what happened&lt;/i&gt; at key&lt;br&gt;moments, not verbatim text. The novelty signal acts as a &lt;i&gt;&amp;quot;this is worth remembering&amp;quot;&lt;/i&gt; filter.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="970" width="520" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Comparison to PM -->
+        <mxCell id="81" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;EM vs PM — Key Differences:&lt;/b&gt;&lt;br&gt;• EM stores &lt;b&gt;explicit episodes&lt;/b&gt; (what); PM stores &lt;b&gt;patterns/skills&lt;/b&gt; (how)&lt;br&gt;• EM: M=256 slots, retrieved by similarity; PM: r=8 slots, modulate computation&lt;br&gt;• EM: 1 per block; PM: 1 per layer per block&lt;br&gt;• EM: novelty-driven writes; PM: eligibility-driven commits&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="600" y="970" width="380" height="90" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

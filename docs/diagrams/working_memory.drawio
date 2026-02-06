@@ -1,0 +1,169 @@
+<mxfile>
+  <diagram name="Working Memory" id="working-memory">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ===================== TITLE ===================== -->
+        <mxCell id="2" value="&lt;font style=&quot;font-size: 20px;&quot;&gt;&lt;b&gt;Working Memory (WM) — Sliding Window Attention&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="560" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;font color=&quot;#808080&quot; style=&quot;font-size: 11px;&quot;&gt;1 shared instance across the entire model. Provides short-context precision (copying, binding).&lt;br&gt;No post-training evolution — standard cached attention with a bounded ring buffer.&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="52" width="600" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== CONFIG BOX ===================== -->
+        <mxCell id="4" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Configuration&lt;/b&gt;&lt;br&gt;W = 256 (window size / ring buffer capacity)&lt;br&gt;D_wm = 128 (key/value dimension)&lt;br&gt;n_heads = 4 (attention heads)&lt;br&gt;head_dim = D_wm / n_heads = 32&lt;br&gt;&lt;br&gt;&lt;b&gt;State (per stream):&lt;/b&gt;&lt;br&gt;wm_K: [BS, W, D_wm] — key cache&lt;br&gt;wm_V: [BS, W, D_wm] — value cache&lt;br&gt;wm_valid: [BS, W] bool — slot validity&lt;br&gt;wm_ptr: [BS] int — ring buffer write pointer&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="980" y="20" width="300" height="185" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== INPUT ===================== -->
+        <mxCell id="10" value="&lt;b&gt;x&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D]&lt;br&gt;token embedding&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="340" y="120" width="140" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== Q/K/V PROJECTIONS ===================== -->
+        <mxCell id="20" value="&lt;b&gt;W_q&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D, D_wm)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="120" y="230" width="140" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="21" value="&lt;b&gt;W_k&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D, D_wm)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="230" width="140" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="22" value="&lt;b&gt;W_v&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D, D_wm)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="230" width="140" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows from x to Q/K/V -->
+        <mxCell id="23" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="10" target="20" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="24" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="10" target="21" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="25" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="10" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Labels -->
+        <mxCell id="26" value="&lt;font color=&quot;#4a86c8&quot; style=&quot;font-size: 9px;&quot;&gt;q [BS, D_wm]&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="130" y="280" width="90" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="27" value="&lt;font color=&quot;#4a86c8&quot; style=&quot;font-size: 9px;&quot;&gt;k [BS, D_wm]&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="355" y="280" width="90" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="28" value="&lt;font color=&quot;#4a86c8&quot; style=&quot;font-size: 9px;&quot;&gt;v [BS, D_wm]&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="575" y="280" width="90" height="15" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== RING BUFFER (K/V Cache) ===================== -->
+        <mxCell id="30" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;verticalAlign=top;opacity=30;" vertex="1" parent="1">
+          <mxGeometry x="290" y="330" width="460" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="31" value="&lt;font style=&quot;font-size: 12px;&quot;&gt;&lt;b&gt;Ring Buffer (K/V Cache)&lt;/b&gt;&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="300" y="335" width="220" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- Buffer slots (visual representation) -->
+        <mxCell id="32" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;slot 0&lt;br&gt;K₀, V₀&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="310" y="370" width="60" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="33" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;slot 1&lt;br&gt;K₁, V₁&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="375" y="370" width="60" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="34" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;slot 2&lt;br&gt;K₂, V₂&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="440" y="370" width="60" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="35" value="&lt;font style=&quot;font-size: 14px;&quot; color=&quot;#888&quot;&gt;···&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="510" y="378" width="40" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="36" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;ptr→&lt;/b&gt;&lt;br&gt;K_t, V_t&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#b9d4f1;strokeColor=#4a86c8;fontSize=9;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="555" y="370" width="60" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="37" value="&lt;font style=&quot;font-size: 14px;&quot; color=&quot;#888&quot;&gt;···&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="620" y="378" width="40" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="38" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;slot W−1&lt;br&gt;K, V&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="660" y="370" width="65" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Write arrow: k, v → ring buffer -->
+        <mxCell id="39" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#4a86c8;strokeWidth=2;" edge="1" source="21" target="36" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="410" y="310"/>
+              <mxPoint x="585" y="310"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="39b" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#4a86c8;strokeWidth=2;" edge="1" source="22" target="36" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="630" y="310"/>
+              <mxPoint x="585" y="310"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Write annotation -->
+        <mxCell id="40" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;WRITE&lt;/b&gt;: store (k, v) at wm_ptr.&lt;br&gt;Values are &lt;b&gt;detached&lt;/b&gt; (no grad through cache).&lt;br&gt;Pointer advances: ptr = (ptr + 1) % W&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;strokeColor=none;fillColor=none;fontColor=#4a86c8;" vertex="1" parent="1">
+          <mxGeometry x="310" y="430" width="260" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Valid mask -->
+        <mxCell id="41" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;wm_valid&lt;/b&gt;: [BS, W] bool mask&lt;br&gt;Only attend over valid (written) positions&lt;br&gt;Cleared at doc boundaries per stream&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;strokeColor=none;fillColor=none;fontColor=#666;" vertex="1" parent="1">
+          <mxGeometry x="310" y="478" width="260" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Pointer wrap annotation -->
+        <mxCell id="42" value="&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;← W=256 slots (ring buffer wraps) →&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="410" y="525" width="230" height="15" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== MULTI-HEAD ATTENTION ===================== -->
+        <mxCell id="50" value="&lt;b&gt;Multi-Head Attention&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;n_heads=4 parallel heads, head_dim=32&lt;br&gt;&lt;br&gt;q_h = q.view(BS, n_heads, head_dim)&lt;br&gt;K_h = wm_K.view(BS, W, n_heads, head_dim).T&lt;br&gt;V_h = wm_V.view(BS, W, n_heads, head_dim).T&lt;br&gt;&lt;br&gt;attn = softmax(q_h @ K_h / √head_dim)&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;masked by wm_valid&lt;br&gt;out = attn @ V_h → merge heads&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="355" width="210" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: q → attention -->
+        <mxCell id="51" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#6c8ebf;" edge="1" source="20" target="50" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: ring buffer → attention (read) -->
+        <mxCell id="52" value="&lt;font style=&quot;font-size: 8px;&quot;&gt;READ&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#6c8ebf;dashed=1;" edge="1" source="30" target="50" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===================== OUTPUT PROJECTION ===================== -->
+        <mxCell id="60" value="&lt;b&gt;W_o&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Linear(D_wm, D)&lt;br&gt;Output projection&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="95" y="590" width="140" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="61" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="50" target="60" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Output -->
+        <mxCell id="62" value="&lt;b&gt;y_wm&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot; color=&quot;#888&quot;&gt;[BS, D]&lt;br&gt;Shared across all B blocks&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="80" y="700" width="170" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="63" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="60" target="62" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== RESET BEHAVIOR ===================== -->
+        <mxCell id="70" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Doc Boundary Reset (per stream):&lt;/b&gt;&lt;br&gt;• wm_valid[stream] = all False&lt;br&gt;• wm_ptr[stream] = 0&lt;br&gt;• K/V cache data persists but masked invalid&lt;br&gt;&lt;br&gt;&lt;b&gt;TBPTT Boundary:&lt;/b&gt;&lt;br&gt;• Cache carries over (no detach needed)&lt;br&gt;• State is non-differentiable (values detached on write)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="800" y="330" width="310" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ===================== DATA FLOW SUMMARY ===================== -->
+        <mxCell id="80" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Per-Token Data Flow:&lt;/b&gt;&lt;br&gt;1. Project: q = W_q(x), k = W_k(x), v = W_v(x)&lt;br&gt;2. Write: store (k.detach(), v.detach()) at wm_ptr&lt;br&gt;3. Read: multi-head attention q against all valid K,V&lt;br&gt;4. Output: y_wm = W_o(attend(q, K, V))&lt;br&gt;5. Advance: wm_ptr = (ptr + 1) % W&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="800" y="520" width="310" height="110" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

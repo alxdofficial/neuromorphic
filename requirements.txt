@@ -1,0 +1,16 @@
+# Core dependencies for neuromorphic LM training
+
+# PyTorch (install separately with CUDA support for your system)
+# See: https://pytorch.org/get-started/locally/
+torch>=2.0.0
+
+# HuggingFace libraries
+transformers>=4.35.0
+datasets>=2.14.0
+tokenizers>=0.15.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Numerical computing
+numpy>=1.24.0
