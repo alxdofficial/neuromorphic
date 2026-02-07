@@ -309,6 +309,12 @@ PHASE_CONFIGS = {
         mix_weights=[0.5, 0.5],
         description="Mathematical reasoning focus. Tests PM/EM on proofs/definitions.",
     ),
+    "E": PhaseConfig(
+        name="Phase E: Lifelong Learning",
+        datasets=["fineweb-edu", "wikipedia"],
+        mix_weights=[0.7, 0.3],
+        description="PM/EM persist across doc boundaries.",
+    ),
     "longctx": PhaseConfig(
         name="Long Context Evaluation",
         datasets=["wikipedia"],

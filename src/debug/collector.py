@@ -83,6 +83,10 @@ class MetricsCollector:
         # Flush accumulated commit/write rates
         self._flush_rates(record)
 
+        # Lifelong persistence stats (Phase E)
+        if self.config.lifelong_mode:
+            self._collect_lifelong_stats(record)
+
         self._write(record)
 
     def record_pm_commit(self, block_idx: int, layer_idx: int,
@@ -187,6 +191,47 @@ class MetricsCollector:
         if wm.wm_valid is not None:
             valid = wm.wm_valid.detach().float()  # [BS, W]
             record["wm_buffer_util"] = valid.mean().item()
+
+    def _collect_lifelong_stats(self, record: dict):
+        """Collect cross-document memory persistence stats (Phase E)."""
+        pm_nonzero_total = 0.0
+        pm_slots_total = 0
+        pm_budget_total = 0.0
+        pm_budget_cap = 0.0
+
+        for block in self.model.blocks:
+            for layer in block.layers:
+                pm = layer.pm
+                if pm.pm_a is None:
+                    continue
+                pm_a = pm.pm_a.detach()
+                pm_nonzero_total += (pm_a > 0.01).float().sum().item()
+                pm_slots_total += pm_a.numel()
+                pm_budget_total += pm_a.sum().item()
+                pm_budget_cap += pm.budget * pm_a.shape[0]  # budget * BS
+
+        if pm_slots_total > 0:
+            record["pm_persistence"] = pm_nonzero_total / pm_slots_total
+            record["pm_budget_util"] = pm_budget_total / pm_budget_cap if pm_budget_cap > 0 else 0.0
+
+        em_nonzero_total = 0.0
+        em_slots_total = 0
+        em_budget_total = 0.0
+        em_budget_cap = 0.0
+
+        for block in self.model.blocks:
+            em = block.em
+            if em.em_S is None:
+                continue
+            em_S = em.em_S.detach()
+            em_nonzero_total += (em_S > 0.01).float().sum().item()
+            em_slots_total += em_S.numel()
+            em_budget_total += em_S.sum().item()
+            em_budget_cap += em.budget * em_S.shape[0]  # budget * BS
+
+        if em_slots_total > 0:
+            record["em_persistence"] = em_nonzero_total / em_slots_total
+            record["em_budget_util"] = em_budget_total / em_budget_cap if em_budget_cap > 0 else 0.0
 
     def _collect_grad_norms(self, record: dict):
         """Per-module gradient norms after backward."""

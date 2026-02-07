@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training.
 
-**Last verified against code:** 2026-02-06
+**Last verified against code:** 2026-02-07
 
 ---
 
@@ -283,6 +283,21 @@ Called every P=32 tokens. The commit process:
 
 **Why under no_grad?** The commit updates `pm_K`, `pm_V`, `pm_a` which are plain tensors, not parameters. They evolve via explicit update rules, not gradient descent. This is by design -- these are "fast weights" that adapt at runtime. The gradient signal for *what* to commit flows through the eligibility projections (which are `nn.Parameter`).
 
+### 7.5 PM Eligibility-Only Reset (Phase E)
+
+In lifelong mode (Phase E), doc boundaries call `reset_eligibility(mask)` instead of the full `reset_states(mask)`:
+
+```python
+def reset_eligibility(self, mask):
+    # Zero only elig_K, elig_V for masked streams
+    # pm_K, pm_V, pm_a persist (committed knowledge carries forward)
+    expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+    self.elig_K = self.elig_K * (~expanded)
+    self.elig_V = self.elig_V * (~expanded)
+```
+
+**Intuition:** Eligibility traces represent partial, uncommitted learning from the current document. They are stale across doc boundaries and should reset. But committed PM state (`pm_K`, `pm_V`, `pm_a`) has passed through the controller's selection logic and represents consolidated knowledge -- it should persist.
+
 ---
 
 ## 8. Episodic Memory (EM)
@@ -421,6 +436,28 @@ def commit_pm(self, force_mode="normal"):
 
 The `force_mode` parameter exists for Phase D RL counterfactual rollouts.
 
+### 9.1 Block State Reset (Lifelong Mode)
+
+`Block.reset_states(mask)` branches on `config.lifelong_mode`:
+
+**Phases A-D (lifelong_mode=False):**
+```python
+for layer in self.layers:
+    layer.reset_states(mask)     # zeros h
+    layer.pm.reset_states(mask)  # zeros all PM state
+self.em.reset_states(mask)       # zeros em_S
+```
+
+**Phase E (lifelong_mode=True):**
+```python
+for layer in self.layers:
+    layer.reset_states(mask)         # zeros h (always)
+    layer.pm.reset_eligibility(mask) # zeros only elig_K, elig_V
+# EM fully persists -- no reset call
+```
+
+This is the core of the soft reset: transient state (h, eligibility) resets at doc boundaries, but committed PM weights and EM content persist across documents. Natural memory turnover is handled by existing decay (0.999/span) and budget enforcement.
+
 ---
 
 ## 10. Controllers (Neuromodulation)
@@ -481,6 +518,8 @@ All stateful modules inherit from `StateMixin`, which provides:
 
 ### 11.2 State Reset Semantics
 
+**Phases A-D (lifelong_mode=False):**
+
 | Module | What resets on doc boundary | What is preserved |
 |--------|---------------------------|-------------------|
 | Layer | `h` (hidden state) | -- |
@@ -489,7 +528,17 @@ All stateful modules inherit from `StateMixin`, which provides:
 | WM | `wm_valid` cleared, `wm_ptr` reset | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
-The EM override is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse.
+**Phase E (lifelong_mode=True) — Soft Reset:**
+
+| Module | What resets on doc boundary | What persists |
+|--------|---------------------------|---------------|
+| Layer | `h` (hidden state) | -- |
+| PM | `elig_K, elig_V` only | `pm_K, pm_V, pm_a` (committed knowledge) |
+| EM | -- (nothing resets) | `em_K, em_V, em_S` (all persist) |
+| WM | `wm_valid` cleared, `wm_ptr` reset | -- |
+| Model | `surprise` zeroed for masked streams | -- |
+
+The EM override in Phases A-D is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase E, even strengths persist -- natural decay and budget enforcement provide forgetting pressure instead.
 
 ### 11.3 Bulk Operations (state.py)
 
@@ -557,10 +606,11 @@ This is critical for VRAM: `[32, 256, 32000]` in float32 would be ~1GB per chunk
 
 ### 12.4 Loss Masking
 
-When `reset_on_doc_boundary=True` (Phases A-C):
+When `reset_on_doc_boundary=True` (Phases A-E):
 - Skip loss at positions where `input_tokens[:, t] == eot_id`
 - This avoids training on cross-document transitions (predicting first token of next doc from EOT is meaningless)
 - We still train on predicting EOT within documents
+- Note: `reset_on_doc_boundary` remains True even in Phase E (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
 
 ### 12.5 Why PM Commits Use elig_norm as Surprise Proxy
 
@@ -735,16 +785,16 @@ Implementation: widen controller output heads. Only after binary gates are stabl
 | **B** | WM + PM (heuristic commits) | Memory bench improvement, stable budgets |
 | **C** | WM + PM + EM (heuristic writes) | Explicit recall at long delays |
 | **D** | WM + PM + EM + RL controllers | Learned gating, better commit/write decisions |
-| **E** | Lifelong + persistence | Disable doc resets, save/load state |
+| **E** | WM + PM + EM + lifelong | PM/EM persist across doc boundaries, soft reset |
 
 Each phase inherits from the previous. `config.set_phase("X")` toggles the appropriate flags:
 
 ```python
-"A": wm=True,  pm=False, em=False
-"B": wm=True,  pm=True,  em=False
-"C": wm=True,  pm=True,  em=True
-"D": wm=True,  pm=True,  em=True  (+ RL controllers)
-"E": wm=True,  pm=True,  em=True  (+ persistence, no doc reset)
+"A": wm=True,  pm=False, em=False, lifelong=False
+"B": wm=True,  pm=True,  em=False, lifelong=False
+"C": wm=True,  pm=True,  em=True,  lifelong=False
+"D": wm=True,  pm=True,  em=True,  lifelong=False  (+ RL controllers)
+"E": wm=True,  pm=True,  em=True,  lifelong=True   (PM/EM persist across docs)
 ```
 
 ---
@@ -827,5 +877,6 @@ Understanding what learns via backprop vs what needs RL:
 | `src/model/state.py` | `save_runtime_state`, `load_runtime_state`, `detach_all`, `reset_all` |
 | `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, span boundaries |
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
+| `src/training/eval_lifelong.py` | Phase E evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |
-| `src/train.py` | Entry point -- config, optimizer, scheduler, training loop |
+| `src/train.py` | Entry point -- config, optimizer, scheduler, training loop (+ runtime state checkpointing) |

@@ -49,6 +49,7 @@ class ModelConfig:
     T: int = 256              # TBPTT segment length
     P: int = 32               # plasticity span
     reset_on_doc_boundary: bool = True
+    lifelong_mode: bool = False  # Phase E: PM/EM persist across doc boundaries
 
     # Phase toggles
     wm_enabled: bool = True   # always on
@@ -66,7 +67,8 @@ class ModelConfig:
         A: WM only
         B: WM + PM
         C: WM + PM + EM
-        D: WM + PM + EM (+ RL controllers, future)
+        D: WM + PM + EM (+ RL controllers)
+        E: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
         """
         phase = phase.upper()
         if phase == "A":
@@ -83,6 +85,9 @@ class ModelConfig:
             self.em_enabled = True
         else:
             raise ValueError(f"Unknown phase: {phase}. Expected A/B/C/D/E.")
+
+        # Phase E: enable lifelong mode
+        self.lifelong_mode = (phase == "E")
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":

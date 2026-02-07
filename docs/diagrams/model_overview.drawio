@@ -214,8 +214,8 @@
                 <mxCell id="113" value="&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#d6b656&quot;&gt;surprise fed to&lt;br&gt;all layers at t+1&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;strokeColor=none;fillColor=none;" parent="1" vertex="1">
                     <mxGeometry x="1432" y="1490" width="100" height="30" as="geometry"/>
                 </mxCell>
-                <mxCell id="120" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Training Loop:&lt;/b&gt;&lt;br&gt;TBPTT segment: T tokens (e.g. 256)&lt;br&gt;Plasticity span: P tokens (e.g. 32)&lt;br&gt;T/P = 8 spans per TBPTT segment&lt;br&gt;&lt;br&gt;&lt;b&gt;Phased Training:&lt;/b&gt;&lt;br&gt;A: WM only&lt;br&gt;B: WM + PM&lt;br&gt;C: WM + PM + EM&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" parent="1" vertex="1">
-                    <mxGeometry x="950" y="1420" width="260" height="155" as="geometry"/>
+                <mxCell id="120" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Training Loop:&lt;/b&gt;&lt;br&gt;TBPTT segment: T tokens (e.g. 256)&lt;br&gt;Plasticity span: P tokens (e.g. 32)&lt;br&gt;T/P = 8 spans per TBPTT segment&lt;br&gt;&lt;br&gt;&lt;b&gt;Phased Training:&lt;/b&gt;&lt;br&gt;A: WM only&lt;br&gt;B: WM + PM&lt;br&gt;C: WM + PM + EM&lt;br&gt;D: + RL controllers&lt;br&gt;E: + lifelong (PM/EM persist across docs)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" parent="1" vertex="1">
+                    <mxGeometry x="950" y="1420" width="300" height="175" as="geometry"/>
                 </mxCell>
             </root>
         </mxGraphModel>

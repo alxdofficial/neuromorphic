@@ -3,7 +3,7 @@
 
 **Version:** 2.0  
 **Status:** Implementation Ready (MVP)  
-**Last Updated:** 2026-02-06
+**Last Updated:** 2026-02-07
 **Primary Constraint:** single RTX 4090 (24GB), mixed precision, persistent-stream TBPTT
 
 This v2 spec is designed to be handed directly to an implementation agent. It intentionally preserves the training-correctness and state semantics learned from v1.7, while adding Working Memory (WM) + Episodic Memory (EM) and making the core **scan-friendly** via an **affine recurrence** and **plasticity updates only at fixed boundaries**.
@@ -391,10 +391,19 @@ Do not stack logits. For each token step produce `[BS, vocab]` and accumulate sc
 ### 7.5 Per-timestep reset (must be correct)
 Reset is triggered before processing token `t` if token `t-1` was EOT (or prev-chunk last token).
 
-Reset affects (phases A–D):
+Reset affects (phases A–D, `lifelong_mode=False`):
 - PM: `pm_K/pm_V/pm_a`, `elig_K/elig_V`, `h` — all zeroed for masked streams
 - WM: clear cache validity (`wm_valid`)
 - EM: only `em_S=0` for masked streams (keys `em_K` and values `em_V` are preserved; zeroing strengths makes old slots invisible to retrieval while keeping content for future overwrites)
+
+Reset affects (phase E, `lifelong_mode=True` — soft reset):
+- `h` — zeroed (short-term context, don't leak across docs)
+- `elig_K/elig_V` — zeroed (in-progress learning, stale across docs)
+- PM committed state (`pm_K/pm_V/pm_a`) — **persists** (consolidated knowledge)
+- EM (`em_K/em_V/em_S`) — **persists** (memories remain retrievable)
+- WM: clear cache validity (`wm_valid`) — same as phases A–D
+
+`Block.reset_states()` branches on `config.lifelong_mode`. In lifelong mode, it calls `pm.reset_eligibility(mask)` instead of `pm.reset_states(mask)`, and skips `em.reset_states(mask)` entirely.
 
 ### 7.6 TBPTT boundary detachment
 After each TBPTT segment:
@@ -535,11 +544,15 @@ model.detach_states()  # TBPTT boundary
 * Keep λ/g/slot defaults initially.
   Reward: future loss delta − memory/drift penalties.
 
-### Phase E — Lifelong + persistence
+### Phase E — Lifelong learning (persistent cross-document memory)
 
-* Disable doc resets.
-* Save/load runtime state (PM + EM + WM caches optional).
-* Run long streaming eval.
+* `config.lifelong_mode = True` (set by `config.set_phase("E")`)
+* Soft reset at doc boundaries: h + eligibility traces reset, PM committed state + EM persist
+* `reset_on_doc_boundary` remains True (loss masking still active)
+* `PM.reset_eligibility(mask)` zeros only `elig_K/elig_V` for masked streams
+* Runtime state (PM/EM contents) saved/loaded in checkpoints via `save_runtime_state()`/`load_runtime_state()`
+* Natural memory turnover via existing decay (0.999/span) + budget enforcement
+* Evaluation: domain adaptation, drift monitoring (<5% regression), cross-document recall
 
 ---
 
@@ -644,6 +657,7 @@ This resolves ambiguity by construction.
   * `apply(x_block) → y_pm`
   * `update_eligibility(x, h)`
   * `base_decay()` — per-span `pm_a *= decay` on ALL streams
+  * `reset_eligibility(mask)` — zero only `elig_K/elig_V` for masked streams (Phase E soft reset)
   * `commit(commit_mask, lambda_vals, g, slot_logits)` — soft top-k EMA update for committing streams
 
 * `PMController` (B × L instances)
@@ -708,6 +722,7 @@ training:
   P: 32                     # plasticity span
   precision: bf16           # bf16 for forward/backward, fp32 for state
   reset_on_doc_boundary: true
+  lifelong_mode: false        # Phase E: PM/EM persist across doc boundaries
   eot_id: 50256             # GPT-2 <|endoftext|>
   lr: 3.0e-4                # peak learning rate
   lr_min: 1.0e-5            # cosine decay target

@@ -138,8 +138,18 @@ class Block(nn.Module, StateMixin):
         self.em.detach_states()
 
     def reset_states(self, mask: Tensor):
-        """Reset states for masked streams."""
+        """Reset states for masked streams.
+
+        In lifelong mode (Phase E), only transient state resets:
+        h and eligibility traces. PM committed state and EM persist.
+        """
         for layer in self.layers:
-            layer.reset_states(mask)
-            layer.pm.reset_states(mask)
-        self.em.reset_states(mask)
+            layer.reset_states(mask)  # always zeros h
+            if self.config.lifelong_mode:
+                layer.pm.reset_eligibility(mask)  # only elig_K, elig_V
+            else:
+                layer.pm.reset_states(mask)  # zeros all PM state
+
+        if not self.config.lifelong_mode:
+            self.em.reset_states(mask)  # zeros em_S
+        # In lifelong mode: EM fully persists

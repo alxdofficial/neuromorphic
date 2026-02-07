@@ -106,6 +106,17 @@ class ProceduralMemory(nn.Module, StateMixin):
             with torch.no_grad():
                 self.pm_a = self.pm_a * self.decay
 
+    def reset_eligibility(self, mask: Tensor):
+        """Zero only eligibility traces for masked streams.
+
+        Used in lifelong mode: committed PM weights persist,
+        but in-progress eligibility clears at doc boundaries.
+        """
+        if self.elig_K is not None and mask.any():
+            expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+            self.elig_K = self.elig_K * (~expanded).to(self.elig_K.dtype)
+            self.elig_V = self.elig_V * (~expanded).to(self.elig_V.dtype)
+
     def commit(self, commit_mask: Tensor, lambda_vals: Tensor = None,
                g: Tensor = None, slot_logits: Tensor = None):
         """Span-boundary commit. Soft top-k slot selection + EMA update.

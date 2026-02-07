@@ -173,9 +173,26 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ### Phase E — Lifelong Learning & Persistence
 
-**Goal:** Demonstrate the model adapts to new domains/users during inference without retraining. Disable doc-boundary resets.
+**Goal:** Enable persistent cross-document memory. PM/EM accumulate knowledge across document boundaries instead of resetting.
 
-**Datasets for adaptation evaluation:**
+**Prerequisite:** Phase D (RL controllers) must be implemented and stable. Without trained controllers deciding when to commit/write, persistent memory would accumulate noise.
+
+**Core mechanism — Soft reset at doc boundaries:**
+Instead of binary "reset everything" or "reset nothing", Phase E uses a **soft reset** via `config.lifelong_mode = True`:
+
+| State | Phase A-D | Phase E | Rationale |
+|-------|-----------|---------|-----------|
+| surprise, h | Zero | Zero | Per-token/short-term, fresh start |
+| WM (cache) | Clear | Clear | Short-term window, cycles naturally |
+| elig_K, elig_V | Zero | **Zero** | In-progress learning, stale across docs |
+| pm_K, pm_V, pm_a | Zero | **Persist** | Committed patterns carry forward |
+| em_K, em_V, em_S | Zero em_S | **Persist** | Memories remain retrievable |
+
+Key insight: eligibility traces still reset (partial, uncommitted learning), but committed PM weights and EM state persist. Existing decay (0.999/span) + budget enforcement handle staleness naturally.
+
+**Primary dataset:** FineWeb-Edu (70%) + Wikipedia (30%)
+
+**Supplementary datasets for evaluation:**
 - **Wikipedia** (latest dump): Domain adaptation — feed articles from a specific topic, test recall
   - HuggingFace: `wikimedia/wikipedia` (20231101.en)
   - Use specific topic subsets (e.g., all chemistry articles, then test chemistry knowledge)
@@ -188,17 +205,16 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 **Config:**
 - Deploy model from Phase D (or Phase C if skipping RL)
-- `reset_on_doc_boundary = False` — PM/EM persist across documents
-- No gradient updates to slow weights
-- Only PM/EM state evolves during inference
-- Use `save_state()`/`load_state()` for session persistence
-- Measure adaptation quality over session length
+- `config.lifelong_mode = True` (set automatically by `config.set_phase("E")`)
+- `reset_on_doc_boundary` remains True (loss masking still skips EOT positions)
+- Soft reset: h + eligibility traces reset at doc boundaries; PM committed state and EM fully persist
+- Runtime state saved/loaded in checkpoints (PM/EM contents ARE the accumulated knowledge)
+- Use `save_runtime_state()`/`load_runtime_state()` for session persistence
 
-**Evaluation:**
-- Adaptation speed: how quickly does perplexity drop on new domain text?
-- Fact recall: accuracy on injected facts at various distances (PM short-term, EM long-term)
-- Cross-document memory: can the model reference facts from earlier documents?
-- Stability: does the model degrade on general text after domain adaptation?
+**Evaluation (implemented in `src/training/eval_lifelong.py`):**
+- **Domain adaptation:** Stream Wikipedia chunks, measure per-chunk perplexity decrease. Lifelong mode should show faster drop vs non-lifelong.
+- **Drift monitoring:** After domain adaptation, verify perplexity on held-out general text stays within 5% of Phase D baseline.
+- **Cross-document recall:** Stream factual text, probe at increasing distances. Measures how long PM/EM retain useful information.
 
 ---
 
@@ -314,15 +330,24 @@ Option B: Assign ~70% of streams to FineWeb-Edu and ~30% to SlimPajama.
 - RL counterfactuals compare commit/write-vs-no-commit/write within a single document
 - Document isolation helps credit assignment for `PMController` and `EMController` policies
 
-### Phase E+: Lifelong (no resets)
-- `reset_on_doc_boundary = False`
-- Controllers are now trained and selective
-- PM/EM persist across documents indefinitely
+### Phase E+: Lifelong (soft resets)
+- `config.lifelong_mode = True` (set by `config.set_phase("E")`)
+- `reset_on_doc_boundary` remains True (loss masking still active)
+- **Soft reset** at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
+- Controllers are now trained and selective about what to commit/write
 - Base decay (0.999/span) provides natural forgetting
 - Budget caps force overwriting of weak slots when capacity is full
+- Runtime state checkpointed alongside model parameters
 
 ### Implementation
-Single boolean flag: `config.reset_on_doc_boundary`
+Two flags control reset behavior:
+- `config.reset_on_doc_boundary`: controls loss masking at EOT (True in all phases)
+- `config.lifelong_mode`: controls whether PM/EM state persists across doc boundaries (True only in Phase E)
+
+`Block.reset_states()` branches on `lifelong_mode`:
+- **lifelong_mode=False (Phases A-D):** Full reset — h, all PM state, and EM strengths zeroed
+- **lifelong_mode=True (Phase E):** Soft reset — h zeroed, PM eligibility zeroed, but PM committed state (pm_K/pm_V/pm_a) and EM (em_K/em_V/em_S) persist
+
 Per-stream reset via boolean mask (different streams hit doc boundaries at different times).
 
 ---

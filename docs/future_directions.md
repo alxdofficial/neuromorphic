@@ -31,6 +31,7 @@ This aligns more closely with a *brain-like system* than with a prompt-centric l
 * ✅ **Declarative / episodic memory** — added via per-block EM (vector store with top-k retrieval)
 * ✅ **Scan-friendly recurrence** — GRU replaced with affine form (h_t = a_t ⊙ h_{t-1} + b_t)
 * ✅ **Working memory** — sliding-window attention (W=256 tokens)
+* ✅ **Lifelong learning** — Phase E soft reset: PM/EM persist across doc boundaries with natural decay + budget enforcement
 
 ---
 
@@ -89,6 +90,7 @@ This addresses the gap from v1.7: the model now has both *implicit* and *declara
 * ✅ **Sequential training bottleneck** — scan-friendly affine recurrence
 * ✅ **Exact copying and pointing** — WM sliding-window attention
 * ✅ **Episodic recall** — EM with top-k retrieval
+* ✅ **Cross-document persistence** — Phase E lifelong mode with soft reset
 
 ### Remaining Gaps
 
@@ -220,7 +222,8 @@ The v1.7 roadmap proposed these upgrades. v2 status:
 2. ✅ **Procedural Memory (PM)** — low-rank adapters, B×L instances with `PMController`
 3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMController`
 4. ✅ **Working Memory (WM)** — sliding-window attention, W=256 tokens
-5. ⏳ **Consolidation mechanism** — not yet implemented (future work)
+5. ✅ **Lifelong learning (Phase E)** — soft reset at doc boundaries, PM/EM persist, eval framework
+6. ⏳ **Consolidation mechanism** — not yet implemented (future work)
 
 v2 remains fundamentally different from transformers:
 
@@ -236,10 +239,14 @@ v2 implements the key architectural recommendations from the v1.7 roadmap:
 * ✅ Scan-friendly recurrence for parallel training
 * ✅ Episodic memory for declarative recall
 * ✅ Working memory for short-term precision
+* ✅ Lifelong learning with persistent cross-document memory (Phase E)
 * ⏳ Consolidation remains for future work
 
 The architecture remains fundamentally different from transformers:
 
 > A scalable, stable, adaptive agent core where memory lives inside computation rather than inside prompts.
 
-v2 is now implementation-ready. The next major milestone is demonstrating that PM/EM provide measurable advantages on memory benchmarks and online adaptation tasks.
+The next major milestones are:
+- Demonstrating that PM/EM provide measurable advantages on memory benchmarks and online adaptation tasks
+- Phase E evaluation: domain adaptation speed, drift monitoring, cross-document recall
+- Consolidation: transferring fast memory (PM/EM) to slow weights for permanent knowledge acquisition

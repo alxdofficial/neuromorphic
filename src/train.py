@@ -13,6 +13,7 @@ import os
 import torch
 
 from .model import ModelConfig, NeuromorphicLM
+from .model.state import save_runtime_state, load_runtime_state
 from .data import get_tokenizer, get_special_token_ids, create_dataloader
 from .training import TBPTTTrainer
 from .debug import MetricsCollector
@@ -148,6 +149,8 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "runtime_state" in ckpt:
+            load_runtime_state(model, ckpt["runtime_state"])
         start_step = ckpt.get("step", 0)
     else:
         start_step = 0
@@ -206,6 +209,7 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "step": trainer.global_step,
             "config": config,
+            "runtime_state": save_runtime_state(model),
         }, save_path)
         print(f"\nSaved checkpoint: {save_path}")
 
