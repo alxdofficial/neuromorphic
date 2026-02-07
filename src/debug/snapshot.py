@@ -21,6 +21,9 @@ import sys
 
 import torch
 
+from ..model import NeuromorphicLM
+from ..model.state import load_runtime_state
+
 # ============================================================================
 # Configuration — edit these directly
 # ============================================================================
@@ -44,6 +47,14 @@ def main():
 
     state_dict = ckpt.get("model_state_dict", ckpt)
     config = ckpt.get("config", None)
+    runtime_state = ckpt.get("runtime_state", None)
+
+    model = None
+    if config is not None:
+        model = NeuromorphicLM(config)
+        model.load_state_dict(state_dict, strict=False)
+        if runtime_state is not None:
+            load_runtime_state(model, runtime_state)
 
     # 1. Config dump
     if config is not None:
@@ -97,9 +108,18 @@ def main():
     pm_dir = os.path.join(output_dir, "pm_state")
     os.makedirs(pm_dir, exist_ok=True)
     pm_tensors = {}
-    for name, tensor in state_dict.items():
-        if any(k in name for k in ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]):
-            pm_tensors[name] = tensor
+    if model is not None:
+        for b_idx, block in enumerate(model.blocks):
+            for l_idx, layer in enumerate(block.layers):
+                pm = layer.pm
+                for k in ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]:
+                    t = getattr(pm, k, None)
+                    if t is not None:
+                        pm_tensors[f"blocks.{b_idx}.layers.{l_idx}.pm.{k}"] = t.detach().cpu()
+    else:
+        for name, tensor in state_dict.items():
+            if any(k in name for k in ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]):
+                pm_tensors[name] = tensor
     if pm_tensors:
         torch.save(pm_tensors, os.path.join(pm_dir, "pm_all.pt"))
         print(f"  pm_state/ ({len(pm_tensors)} tensors)")
@@ -108,18 +128,33 @@ def main():
     em_dir = os.path.join(output_dir, "em_state")
     os.makedirs(em_dir, exist_ok=True)
     em_tensors = {}
-    for name, tensor in state_dict.items():
-        if any(k in name for k in ["em_K", "em_V", "em_S"]):
-            em_tensors[name] = tensor
+    if model is not None:
+        for b_idx, block in enumerate(model.blocks):
+            em = block.em
+            for k in ["em_K", "em_V", "em_S"]:
+                t = getattr(em, k, None)
+                if t is not None:
+                    em_tensors[f"blocks.{b_idx}.em.{k}"] = t.detach().cpu()
+    else:
+        for name, tensor in state_dict.items():
+            if any(k in name for k in ["em_K", "em_V", "em_S"]):
+                em_tensors[name] = tensor
     if em_tensors:
         torch.save(em_tensors, os.path.join(em_dir, "em_all.pt"))
         print(f"  em_state/ ({len(em_tensors)} tensors)")
 
     # 7. WM state
     wm_tensors = {}
-    for name, tensor in state_dict.items():
-        if any(k in name for k in ["wm_K", "wm_V", "wm_valid", "wm_ptr"]):
-            wm_tensors[name] = tensor
+    if model is not None:
+        wm = model.wm
+        for k in ["wm_K", "wm_V", "wm_valid", "wm_ptr"]:
+            t = getattr(wm, k, None)
+            if t is not None:
+                wm_tensors[f"wm.{k}"] = t.detach().cpu()
+    else:
+        for name, tensor in state_dict.items():
+            if any(k in name for k in ["wm_K", "wm_V", "wm_valid", "wm_ptr"]):
+                wm_tensors[name] = tensor
     if wm_tensors:
         wm_path = os.path.join(output_dir, "wm_state.pt")
         torch.save(wm_tensors, wm_path)
@@ -127,10 +162,16 @@ def main():
 
     # 8. Hidden states
     hidden_tensors = {}
-    for name, tensor in state_dict.items():
-        # Match layer hidden states (e.g., blocks.0.layers.0.h)
-        if name.endswith(".h") and "layers" in name:
-            hidden_tensors[name] = tensor
+    if model is not None:
+        for b_idx, block in enumerate(model.blocks):
+            for l_idx, layer in enumerate(block.layers):
+                if layer.h is not None:
+                    hidden_tensors[f"blocks.{b_idx}.layers.{l_idx}.h"] = layer.h.detach().cpu()
+    else:
+        for name, tensor in state_dict.items():
+            # Match layer hidden states (e.g., blocks.0.layers.0.h)
+            if name.endswith(".h") and "layers" in name:
+                hidden_tensors[name] = tensor
     if hidden_tensors:
         h_path = os.path.join(output_dir, "hidden_states.pt")
         torch.save(hidden_tensors, h_path)

@@ -38,6 +38,9 @@ class Layer(nn.Module, StateMixin):
         self.gate_a = nn.Linear(input_dim, D_h)  # sigmoid -> retention
         self.gate_b = nn.Linear(input_dim, D_h)  # tanh -> update
 
+        # Per-layer output projection (spec §7.4)
+        self.W_o = nn.Linear(D_h, D_h)
+
         self.norm = nn.LayerNorm(D_h)
 
         # Recurrent hidden state (lazily initialized)
@@ -80,8 +83,8 @@ class Layer(nn.Module, StateMixin):
         # Affine recurrence with carry mask for doc boundaries
         self.h = a * (carry * self.h) + b
 
-        # Residual from block input + LayerNorm
-        output = self.norm(self.h + x_block)
+        # Output projection + residual + LayerNorm (spec §7.4)
+        output = self.norm(self.W_o(self.h) + x_block)
 
         if collect:
             stats = {

@@ -83,16 +83,21 @@ class WorkingMemory(nn.Module, StateMixin):
         k = self.W_k(x)    # [BS, D_wm]
         v = self.W_v(x)    # [BS, D_wm]
 
-        # Write (k, v) into ring buffer at current ptr
+        # Write (k, v) into ring buffer using functional scatter.
+        # Avoids cloning the full [BS, W, D_wm] buffer every token while
+        # keeping gradients alive for W_k / W_v.
         ptr = self.wm_ptr  # [BS]
-        batch_idx = torch.arange(BS, device=device)
+        write_mask = torch.nn.functional.one_hot(
+            ptr, self.W
+        ).to(dtype=self.wm_K.dtype)  # [BS, W]
+        write_mask_3d = write_mask.unsqueeze(-1)  # [BS, W, 1]
 
-        self.wm_K = self.wm_K.clone()
-        self.wm_V = self.wm_V.clone()
+        self.wm_K = self.wm_K * (1 - write_mask_3d) + k.unsqueeze(1) * write_mask_3d
+        self.wm_V = self.wm_V * (1 - write_mask_3d) + v.unsqueeze(1) * write_mask_3d
+
+        # Update validity (non-differentiable bool, clone is cheap)
         self.wm_valid = self.wm_valid.clone()
-
-        self.wm_K[batch_idx, ptr] = k.detach()
-        self.wm_V[batch_idx, ptr] = v.detach()
+        batch_idx = torch.arange(BS, device=device)
         self.wm_valid[batch_idx, ptr] = True
 
         # Multi-head attention over valid entries

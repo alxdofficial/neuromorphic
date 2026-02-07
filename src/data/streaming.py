@@ -13,7 +13,7 @@ each batch item is an independent sequence.
 
 import torch
 from torch.utils.data import IterableDataset, DataLoader
-from datasets import load_dataset, IterableDataset as HFIterableDataset
+from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
 from typing import Optional, Iterator, List, Dict, Any
 from dataclasses import dataclass
@@ -142,36 +142,47 @@ class PersistentStreamDataset(IterableDataset):
         self.eos_token_id = tokenizer.eos_token_id
 
         # Will be initialized on first iteration
+        self._base_dataset = None
+        self._stream_restarts: Optional[List[int]] = None
         self.streams: Optional[List[DocumentStream]] = None
         self.prev_tokens: Optional[torch.Tensor] = None
         self.step_count = 0
+        self.stream_restarts_total = 0
+        self.stream_restarts_last_batch = 0
+        self.streams_exhausted_last_batch = 0
+
+    def _make_stream(self, stream_idx: int) -> DocumentStream:
+        """Create one stream iterator (supports exhausted-stream recycling)."""
+        assert self._base_dataset is not None
+        restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
+        stream_seed = self.seed + stream_idx + 9973 * restart_count
+
+        if self.config.streaming:
+            ds_i = self._base_dataset.shuffle(seed=stream_seed, buffer_size=10000)
+        else:
+            ds_i = self._base_dataset.shuffle(seed=stream_seed)
+
+        return DocumentStream(
+            dataset_iter=iter(ds_i),
+            tokenizer=self.tokenizer,
+            text_column=self.config.text_column,
+        )
 
     def _init_streams(self):
         """Initialize BS independent document streams."""
         self.streams = []
+        self._stream_restarts = [0 for _ in range(self.batch_size)]
+
+        # Load dataset once, create BS shuffled iterators from it.
+        self._base_dataset = load_dataset(
+            self.config.hf_path,
+            self.config.hf_name,
+            split=self.config.split,
+            streaming=self.config.streaming,
+        )
 
         for i in range(self.batch_size):
-            # Each stream gets its own dataset iterator with different shuffling
-            ds = load_dataset(
-                self.config.hf_path,
-                self.config.hf_name,
-                split=self.config.split,
-                streaming=self.config.streaming,
-            )
-
-            # Shuffle with different seed per stream
-            # buffer_size only applies to IterableDataset (streaming mode)
-            if self.config.streaming:
-                ds = ds.shuffle(seed=self.seed + i, buffer_size=10000)
-            else:
-                ds = ds.shuffle(seed=self.seed + i)
-
-            stream = DocumentStream(
-                dataset_iter=iter(ds),
-                tokenizer=self.tokenizer,
-                text_column=self.config.text_column,
-            )
-            self.streams.append(stream)
+            self.streams.append(self._make_stream(i))
 
         # Initialize prev_tokens to EOS (triggers reset on first chunk)
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
@@ -194,18 +205,37 @@ class PersistentStreamDataset(IterableDataset):
             # Collect T+1 tokens from each stream (need +1 for target shift)
             batch_tokens = []
             all_exhausted = True
+            batch_restarts = 0
+            batch_exhausted = 0
 
-            for stream in self.streams:
+            for i, stream in enumerate(self.streams):
+                needed = self.seq_length + 1
                 tokens = stream.get_tokens(self.seq_length + 1)
-                if len(tokens) < self.seq_length + 1:
-                    # Pad with EOS if stream exhausted
-                    tokens.extend([self.eos_token_id] * (self.seq_length + 1 - len(tokens)))
-                else:
+                produced_any = len(tokens) > 0
+
+                # Recycle exhausted streams so batch capacity does not decay.
+                if len(tokens) < needed and stream.is_exhausted():
+                    batch_exhausted += 1
+                    self._stream_restarts[i] += 1
+                    self.stream_restarts_total += 1
+                    self.streams[i] = self._make_stream(i)
+                    refill = self.streams[i].get_tokens(needed - len(tokens))
+                    tokens.extend(refill)
+                    produced_any = produced_any or (len(refill) > 0)
+                    batch_restarts += 1
+
+                if len(tokens) < needed:
+                    tokens.extend([self.eos_token_id] * (needed - len(tokens)))
+
+                if produced_any:
                     all_exhausted = False
                 batch_tokens.append(tokens)
 
             if all_exhausted:
                 break
+
+            self.stream_restarts_last_batch = batch_restarts
+            self.streams_exhausted_last_batch = batch_exhausted
 
             # Convert to tensors
             tokens_tensor = torch.tensor(batch_tokens, dtype=torch.long)  # [BS, T+1]
@@ -227,9 +257,22 @@ class PersistentStreamDataset(IterableDataset):
 
     def reset(self):
         """Reset streams to start from beginning."""
+        self._base_dataset = None
+        self._stream_restarts = None
         self.streams = None
         self.prev_tokens = None
         self.step_count = 0
+        self.stream_restarts_total = 0
+        self.stream_restarts_last_batch = 0
+        self.streams_exhausted_last_batch = 0
+
+    def monitor_stats(self) -> dict:
+        """Latest stream-health counters for monitoring/logging."""
+        return {
+            "stream_restarts_total": self.stream_restarts_total,
+            "stream_restarts_last_batch": self.stream_restarts_last_batch,
+            "streams_exhausted_last_batch": self.streams_exhausted_last_batch,
+        }
 
 
 class MixedStreamDataset(IterableDataset):
@@ -280,9 +323,14 @@ class MixedStreamDataset(IterableDataset):
         # Assign streams to datasets based on weights
         self.stream_assignments = self._compute_assignments()
 
+        self._ds_cache: Optional[Dict[Any, Any]] = None
+        self._stream_restarts: Optional[List[int]] = None
         self.streams: Optional[List[DocumentStream]] = None
         self.prev_tokens: Optional[torch.Tensor] = None
         self.step_count = 0
+        self.stream_restarts_total = 0
+        self.stream_restarts_last_batch = 0
+        self.streams_exhausted_last_batch = 0
 
     def _compute_assignments(self) -> List[int]:
         """Assign each stream to a dataset based on weights."""
@@ -306,30 +354,22 @@ class MixedStreamDataset(IterableDataset):
     def _init_streams(self):
         """Initialize streams with mixed sources."""
         self.streams = []
+        self._stream_restarts = [0 for _ in range(self.batch_size)]
+
+        # Load each unique dataset once, keyed by (hf_path, hf_name, split).
+        self._ds_cache = {}
+        for config in self.configs:
+            key = (config.hf_path, config.hf_name, config.split, config.streaming)
+            if key not in self._ds_cache:
+                self._ds_cache[key] = load_dataset(
+                    config.hf_path,
+                    config.hf_name,
+                    split=config.split,
+                    streaming=config.streaming,
+                )
 
         for i in range(self.batch_size):
-            ds_idx = self.stream_assignments[i]
-            config = self.configs[ds_idx]
-
-            ds = load_dataset(
-                config.hf_path,
-                config.hf_name,
-                split=config.split,
-                streaming=config.streaming,
-            )
-
-            # Shuffle with different seed per stream
-            if config.streaming:
-                ds = ds.shuffle(seed=self.seed + i, buffer_size=10000)
-            else:
-                ds = ds.shuffle(seed=self.seed + i)
-
-            stream = DocumentStream(
-                dataset_iter=iter(ds),
-                tokenizer=self.tokenizer,
-                text_column=config.text_column,
-            )
-            self.streams.append(stream)
+            self.streams.append(self._make_stream(i))
 
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
@@ -344,17 +384,36 @@ class MixedStreamDataset(IterableDataset):
 
             batch_tokens = []
             all_exhausted = True
+            batch_restarts = 0
+            batch_exhausted = 0
 
-            for stream in self.streams:
-                tokens = stream.get_tokens(self.seq_length + 1)
-                if len(tokens) < self.seq_length + 1:
-                    tokens.extend([self.eos_token_id] * (self.seq_length + 1 - len(tokens)))
-                else:
+            for i, stream in enumerate(self.streams):
+                needed = self.seq_length + 1
+                tokens = stream.get_tokens(needed)
+                produced_any = len(tokens) > 0
+
+                if len(tokens) < needed and stream.is_exhausted():
+                    batch_exhausted += 1
+                    self._stream_restarts[i] += 1
+                    self.stream_restarts_total += 1
+                    self.streams[i] = self._make_stream(i)
+                    refill = self.streams[i].get_tokens(needed - len(tokens))
+                    tokens.extend(refill)
+                    produced_any = produced_any or (len(refill) > 0)
+                    batch_restarts += 1
+
+                if len(tokens) < needed:
+                    tokens.extend([self.eos_token_id] * (needed - len(tokens)))
+
+                if produced_any:
                     all_exhausted = False
                 batch_tokens.append(tokens)
 
             if all_exhausted:
                 break
+
+            self.stream_restarts_last_batch = batch_restarts
+            self.streams_exhausted_last_batch = batch_exhausted
 
             tokens_tensor = torch.tensor(batch_tokens, dtype=torch.long)
             input_ids = tokens_tensor[:, :-1]
@@ -372,9 +431,61 @@ class MixedStreamDataset(IterableDataset):
             yield batch
 
     def reset(self):
+        self._ds_cache = None
+        self._stream_restarts = None
         self.streams = None
         self.prev_tokens = None
         self.step_count = 0
+        self.stream_restarts_total = 0
+        self.stream_restarts_last_batch = 0
+        self.streams_exhausted_last_batch = 0
+
+    def monitor_stats(self) -> dict:
+        return {
+            "stream_restarts_total": self.stream_restarts_total,
+            "stream_restarts_last_batch": self.stream_restarts_last_batch,
+            "streams_exhausted_last_batch": self.streams_exhausted_last_batch,
+        }
+
+    def _make_stream(self, stream_idx: int) -> DocumentStream:
+        """Create one stream for its assigned dataset (supports recycling)."""
+        assert self._ds_cache is not None
+        ds_idx = self.stream_assignments[stream_idx]
+        config = self.configs[ds_idx]
+        key = (config.hf_path, config.hf_name, config.split, config.streaming)
+        ds = self._ds_cache[key]
+
+        restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
+        stream_seed = self.seed + stream_idx + 9973 * restart_count
+        if config.streaming:
+            ds_i = ds.shuffle(seed=stream_seed, buffer_size=10000)
+        else:
+            ds_i = ds.shuffle(seed=stream_seed)
+
+        return DocumentStream(
+            dataset_iter=iter(ds_i),
+            tokenizer=self.tokenizer,
+            text_column=config.text_column,
+        )
+
+
+class _DatasetIterator:
+    """Iterator wrapper that exposes underlying dataset monitor stats."""
+
+    def __init__(self, dataset: IterableDataset):
+        self.dataset = dataset
+        self._it = iter(dataset)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def monitor_stats(self) -> dict:
+        if hasattr(self.dataset, "monitor_stats"):
+            return self.dataset.monitor_stats()
+        return {}
 
 
 def create_dataloader(
@@ -428,7 +539,7 @@ def create_dataloader(
             max_steps=max_steps,
         )
 
-    return iter(dataset)
+    return _DatasetIterator(dataset)
 
 
 if __name__ == "__main__":

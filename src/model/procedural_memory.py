@@ -10,9 +10,10 @@ State per stream:
     elig_K: [BS, r, D_h]   — eligibility trace for keys
     elig_V: [BS, r, D_h]   — eligibility trace for values
 
-pm_K, pm_V, pm_a are plain tensors (NOT parameters). Updated under
-torch.no_grad() at span boundaries. Eligibility projections (W_k_pre,
-W_v_post) ARE parameters trained by backprop through eligibility.
+pm_K, pm_V, pm_a are plain tensors (NOT parameters). They are updated at
+span boundaries and may carry computation graphs within a TBPTT chunk so
+eligibility projections can receive LM gradients from downstream reads.
+Eligibility projections (W_k_pre, W_v_post) are trained by backprop.
 """
 
 import torch
@@ -143,39 +144,38 @@ class ProceduralMemory(nn.Module, StateMixin):
         elig_K_norm = unit_normalize(self.elig_K)  # [BS, r, D_h]
         elig_V_norm = self.elig_V                   # [BS, r, D_h]
 
-        with torch.no_grad():
-            # Slot selection: similarity between current keys and eligibility
-            # scores: [BS, r] — how well each slot matches the eligibility
-            scores = torch.einsum("brd, brd -> br", self.pm_K, elig_K_norm)
+        # Slot selection: similarity between current keys and eligibility
+        # scores: [BS, r] — how well each slot matches the eligibility
+        scores = torch.einsum("brd, brd -> br", self.pm_K, elig_K_norm)
 
-            # Weakness bias: prefer overwriting weak slots
-            scores = scores - self.weakness_weight * self.pm_a
+        # Weakness bias: prefer overwriting weak slots
+        scores = scores - self.weakness_weight * self.pm_a
 
-            # Use controller-provided slot_logits if given, else use similarity
-            if slot_logits is not None:
-                scores = scores + slot_logits
+        # Use controller-provided slot_logits if given, else use similarity
+        if slot_logits is not None:
+            scores = scores + slot_logits
 
-            # Soft top-k selection
-            weights = soft_topk(scores, self.commit_top_k, self.tau)  # [BS, r]
+        # Soft top-k selection
+        weights = soft_topk(scores, self.commit_top_k, self.tau)  # [BS, r]
 
-            # Apply commit mask and per-stream write strength
-            mask_expanded = commit_mask.float().unsqueeze(-1)  # [BS, 1]
-            alpha = weights * g.unsqueeze(-1) * mask_expanded  # [BS, r]
+        # Apply commit mask and per-stream write strength
+        mask_expanded = commit_mask.float().unsqueeze(-1)  # [BS, 1]
+        alpha = weights * g.unsqueeze(-1) * mask_expanded  # [BS, r]
 
-            # Apply commit-time decay on committing streams using controller lambda
-            lambda_expanded = lambda_vals.unsqueeze(-1)  # [BS, 1]
-            self.pm_a = self.pm_a * (1.0 - mask_expanded * (1.0 - lambda_expanded))
+        # Apply commit-time decay on committing streams using controller lambda
+        lambda_expanded = lambda_vals.unsqueeze(-1)  # [BS, 1]
+        self.pm_a = self.pm_a * (1.0 - mask_expanded * (1.0 - lambda_expanded))
 
-            # EMA update of keys and values
-            alpha_3d = alpha.unsqueeze(-1)  # [BS, r, 1]
-            self.pm_K = unit_normalize((1 - alpha_3d) * self.pm_K + alpha_3d * elig_K_norm)
-            self.pm_V = unit_normalize((1 - alpha_3d) * self.pm_V + alpha_3d * elig_V_norm)
+        # EMA update of keys and values
+        alpha_3d = alpha.unsqueeze(-1)  # [BS, r, 1]
+        self.pm_K = unit_normalize((1 - alpha_3d) * self.pm_K + alpha_3d * elig_K_norm)
+        self.pm_V = unit_normalize((1 - alpha_3d) * self.pm_V + alpha_3d * elig_V_norm)
 
-            # Strength update
-            self.pm_a = (self.pm_a + alpha).clamp(0.0, self.a_max)
+        # Strength update
+        self.pm_a = (self.pm_a + alpha).clamp(0.0, self.a_max)
 
-            # Budget enforcement
-            self.pm_a = budget_enforce(self.pm_a, self.budget)
+        # Budget enforcement
+        self.pm_a = budget_enforce(self.pm_a, self.budget)
 
         # Reset eligibility for committing streams (keep differentiable path alive)
         reset_3d = commit_mask.float().unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]

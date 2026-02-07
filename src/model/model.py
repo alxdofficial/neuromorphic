@@ -69,22 +69,31 @@ class NeuromorphicLM(nn.Module, StateMixin):
         if self.surprise is None:
             self.surprise = torch.zeros(BS, 1, device=device)
 
-        # Reset states for masked streams
-        if reset_mask.any():
-            self.reset_at_doc_boundary(reset_mask)
+        # Respect reset_on_doc_boundary across all reset-related paths.
+        if self.config.reset_on_doc_boundary:
+            effective_reset_mask = reset_mask
+        else:
+            effective_reset_mask = torch.zeros_like(reset_mask)
+
+        # Reset states for masked streams when doc-boundary reset is enabled.
+        if effective_reset_mask.any():
+            self.reset_at_doc_boundary(effective_reset_mask)
 
         # Embed token
         x = self.embedding(input_id)  # [BS, D]
 
         # Working memory
-        y_wm = self.wm.step(x, reset_mask)  # [BS, D]
+        if self.config.wm_enabled:
+            y_wm = self.wm.step(x, effective_reset_mask)  # [BS, D]
+        else:
+            y_wm = torch.zeros_like(x)
 
         # Split input across blocks
         x_proj = self.W_in(x)  # [BS, D]
         x_blocks = x_proj.view(BS, self.config.B, self.config.D_h)  # [BS, B, D_h]
 
         # Carry mask: 0 at doc boundaries, 1 otherwise
-        carry = (~reset_mask).float().unsqueeze(-1)  # [BS, 1]
+        carry = (~effective_reset_mask).float().unsqueeze(-1)  # [BS, 1]
 
         # Process each block
         h_blocks = []
@@ -109,29 +118,41 @@ class NeuromorphicLM(nn.Module, StateMixin):
             return logits, x, y_wm, block_stats
         return logits, x, y_wm
 
-    def update_surprise(self, logits: Tensor, target: Tensor):
+    def update_surprise(self, logits: Tensor, target: Tensor, mask: Tensor = None):
         """Update surprise signal from teacher-forced target.
 
         Args:
             logits: [BS, vocab] — model output
             target: [BS] — target token ids
+            mask: [BS] bool — optional update mask; masked-out streams get 0
         """
         with torch.no_grad():
             logp = F.log_softmax(logits, dim=-1)
-            self.surprise = -logp.gather(-1, target.unsqueeze(-1))  # [BS, 1]
+            next_surprise = -logp.gather(-1, target.unsqueeze(-1))  # [BS, 1]
+            if mask is not None:
+                if mask.dtype is not torch.bool:
+                    mask = mask.bool()
+                next_surprise = next_surprise * mask.unsqueeze(-1).float()
+            self.surprise = next_surprise
 
-    def commit_at_boundary(self, force_mode: str = "normal"):
+    def commit_at_boundary(self, force_mode: str = "normal",
+                           span_surprise: Tensor = None):
         """Called every P tokens. Triggers PM commits + EM writes.
 
         Args:
             force_mode: "normal" — use controller decisions
                         "force_on" — commit all streams
                         "force_off" — skip all commits
+            span_surprise: [BS] — mean surprise over span (for PM controller)
         """
-        for block in self.blocks:
+        commit_info = {}
+        for b_idx, block in enumerate(self.blocks):
             if self.config.pm_enabled:
-                block.commit_pm(force_mode=force_mode)
+                commit_info[b_idx] = block.commit_pm(
+                    force_mode=force_mode, span_surprise=span_surprise
+                )
             # EM writes are handled by the trainer (needs candidate buffers)
+        return commit_info
 
     def reset_at_doc_boundary(self, mask: Tensor):
         """Per-stream reset of all memory states.

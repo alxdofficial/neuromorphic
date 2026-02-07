@@ -9,9 +9,6 @@ Two-tier collection:
 import json
 import math
 import os
-import time
-from pathlib import Path
-
 import torch
 from torch import Tensor
 
@@ -49,10 +46,12 @@ class MetricsCollector:
         return self.collect_every > 0 and step % self.collect_every == 0
 
     def log_basic(self, step: int, loss: float, ppl: float, lr: float,
-                  tok_s: float, grad_norm: float, reg: float, elapsed: float):
+                  tok_s: float, grad_norm: float, reg: float, elapsed: float,
+                  extras: dict = None, mode: str = "train"):
         """Write a basic metrics line (every step)."""
         record = {
             "step": step,
+            "mode": mode,
             "loss": loss,
             "ppl": min(ppl, 1e6),
             "lr": lr,
@@ -61,13 +60,19 @@ class MetricsCollector:
             "reg": reg,
             "elapsed": elapsed,
         }
+        if extras:
+            record.update(extras)
         self._write(record)
 
-    def log_full(self, step: int, gate_stats: dict, basic: dict):
+    def log_full(self, step: int, gate_stats: dict, basic: dict,
+                 extras: dict = None, mode: str = "train"):
         """Write a full metrics line merging basic + gate + memory + grad stats."""
         record = dict(basic)
         record["step"] = step
+        record["mode"] = mode
         record["full"] = True
+        if extras:
+            record.update(extras)
 
         # Gate stats from forward pass
         self._merge_gate_stats(record, gate_stats)
@@ -82,6 +87,9 @@ class MetricsCollector:
 
         # Flush accumulated commit/write rates
         self._flush_rates(record)
+
+        # Global summaries and warning signals
+        self._collect_plasticity_summary(record)
 
         # Lifelong persistence stats (Phase E)
         if self.config.lifelong_mode:
@@ -192,6 +200,56 @@ class MetricsCollector:
             valid = wm.wm_valid.detach().float()  # [BS, W]
             record["wm_buffer_util"] = valid.mean().item()
 
+    def _collect_plasticity_summary(self, record: dict):
+        """Global PM/EM/gate summaries with warning flags."""
+        pm_commit_vals = [
+            v for k, v in record.items()
+            if k.startswith("pm_commit_rate_b") and isinstance(v, (float, int))
+        ]
+        em_write_vals = [
+            v for k, v in record.items()
+            if k.startswith("em_write_rate_b") and isinstance(v, (float, int))
+        ]
+        gate_near0_vals = [
+            v for k, v in record.items()
+            if k.endswith("_gate_a_near0") and isinstance(v, (float, int))
+        ]
+        gate_near1_vals = [
+            v for k, v in record.items()
+            if k.endswith("_gate_a_near1") and isinstance(v, (float, int))
+        ]
+
+        if pm_commit_vals:
+            record["pm_commit_rate_global"] = sum(pm_commit_vals) / len(pm_commit_vals)
+        if em_write_vals:
+            record["em_write_rate_global"] = sum(em_write_vals) / len(em_write_vals)
+        if gate_near0_vals and gate_near1_vals:
+            record["gate_a_near0_global"] = sum(gate_near0_vals) / len(gate_near0_vals)
+            record["gate_a_near1_global"] = sum(gate_near1_vals) / len(gate_near1_vals)
+            record["gate_a_saturation_global"] = (
+                record["gate_a_near0_global"] + record["gate_a_near1_global"]
+            )
+
+        pm_budget = record.get("pm_budget_util_global")
+        em_budget = record.get("em_budget_util_global")
+        pm_commit = record.get("pm_commit_rate_global")
+        em_write = record.get("em_write_rate_global")
+        gate_sat = record.get("gate_a_saturation_global")
+
+        record["warn_commit_collapse"] = float(
+            pm_commit is not None and pm_commit < 1e-3
+        )
+        record["warn_write_collapse"] = float(
+            em_write is not None and em_write < 1e-3
+        )
+        record["warn_budget_saturation"] = float(
+            (pm_budget is not None and pm_budget > 0.98)
+            or (em_budget is not None and em_budget > 0.98)
+        )
+        record["warn_gate_saturation"] = float(
+            gate_sat is not None and gate_sat > 0.98
+        )
+
     def _collect_lifelong_stats(self, record: dict):
         """Collect cross-document memory persistence stats (Phase E)."""
         pm_nonzero_total = 0.0
@@ -272,6 +330,10 @@ class MetricsCollector:
                 clean[k] = v
         self._file.write(json.dumps(clean) + "\n")
         self._file.flush()
+
+    def log_record(self, record: dict):
+        """Write an arbitrary metrics record."""
+        self._write(record)
 
     def close(self):
         """Close the output file."""

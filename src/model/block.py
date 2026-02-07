@@ -92,18 +92,21 @@ class Block(nn.Module, StateMixin):
             return x, layer_stats
         return x  # final layer output [BS, D_h]
 
-    def commit_pm(self, force_mode: str = "normal"):
+    def commit_pm(self, force_mode: str = "normal",
+                  span_surprise: Tensor = None) -> dict:
         """Trigger PM commits for all layers in this block.
 
         Args:
             force_mode: "normal" — use controller decisions
                         "force_on" — commit all streams
                         "force_off" — skip all commits
+            span_surprise: [BS] — mean surprise over span (for controller)
         """
+        commit_info = {}
         if force_mode == "force_off":
-            return
+            return commit_info
 
-        for layer in self.layers:
+        for l_idx, layer in enumerate(self.layers):
             pm = layer.pm
 
             # Compute eligibility norm for controller
@@ -111,7 +114,7 @@ class Block(nn.Module, StateMixin):
                 elig_norm = pm.elig_K.norm(dim=-1).mean(dim=-1)  # [BS]
                 pm_usage = pm.pm_a.sum(dim=-1)  # [BS]
             else:
-                return
+                continue
 
             if force_mode == "force_on":
                 BS = elig_norm.shape[0]
@@ -121,14 +124,18 @@ class Block(nn.Module, StateMixin):
                                          device=elig_norm.device)
                 g = torch.full((BS,), 0.5, device=elig_norm.device)
                 pm.commit(commit_mask, lambda_vals, g, None)
+                commit_info[l_idx] = commit_mask.detach()
             else:
                 # Controller decides commit mask and parameters
-                # (span_surprise not available here in MVP — use elig_norm proxy)
+                surprise_input = span_surprise if span_surprise is not None else elig_norm
                 commit_mask, lambda_vals, g, slot_logits = \
                     layer.pm_controller.forward(
-                        elig_norm, pm_usage, elig_norm  # surprise proxy
+                        elig_norm, pm_usage, surprise_input
                     )
                 pm.commit(commit_mask, lambda_vals, g, slot_logits)
+                commit_info[l_idx] = commit_mask.detach()
+
+        return commit_info
 
     def detach_states(self):
         """Detach all states in child modules."""

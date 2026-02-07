@@ -331,9 +331,9 @@ Each `Layer` (within a block) computes:
 - Input fusion: `u = concat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])` → `[BS, D_in]`
 - Gates: `a = sigmoid(W_a u)`, `b = tanh(W_b u)` → `[BS, D_h]`
 - Recurrence: `h = a ⊙ (carry * h_prev) + b` → `[BS, D_h]`
-- Output: `W_o(h)` → residual + layernorm → `[BS, D_h]`
+- Output: `norm(W_o(h) + x_block)` → `[BS, D_h]`
 
-`W_o`, residual, and layernorm are **per-layer** operations. The model-level output simply concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds to `lm_head`.
+`W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. The model-level output simply concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds to `lm_head`.
 
 ---
 
@@ -444,7 +444,10 @@ for span_start in range(0, T, P):
     cand_K = [[] for _ in range(B)]
     cand_V = [[] for _ in range(B)]
     cand_score = [[] for _ in range(B)]
+    cand_token_valid = [[] for _ in range(B)]      # loss_mask per token
     span_surprise_accum = zeros(BS)
+    span_valid_tokens = zeros(BS)                   # per-stream valid count
+    span_last_reset = zeros(BS, dtype=long)         # last reset position in span
 
     for t in range(span_start, span_end):
         # --- per-timestep doc reset mask ---
@@ -453,11 +456,17 @@ for span_start in range(0, T, P):
         else:
             reset_mask = (input_tokens[:, t-1] == eot_id)
 
+        # --- clear span accumulators for streams resetting mid-span ---
+        if reset_mask.any() and config.reset_on_doc_boundary:
+            local_t = t - span_start
+            span_last_reset[reset_mask] = local_t
+            span_surprise_accum[reset_mask] = 0
+            span_valid_tokens[reset_mask] = 0
+
         # --- forward one token (embedding + WM + blocks internally) ---
         logits, x_emb, y_wm = model.forward_one_token(
             input_tokens[:, t], reset_mask
         )
-        # logits: [BS, vocab], x_emb: [BS, D], y_wm: [BS, D]
 
         # --- loss masking at cross-doc transition ---
         is_eot = (input_tokens[:, t] == eot_id)
@@ -466,40 +475,53 @@ for span_start in range(0, T, P):
         chunk_loss += token_loss
         valid += count
 
-        # --- update surprise (teacher forcing) ---
-        model.update_surprise(logits, target_tokens[:, t])
-        span_surprise_accum += model.surprise.squeeze(-1)
+        # --- update surprise (teacher forcing, masked) ---
+        model.update_surprise(logits, target_tokens[:, t], mask=loss_mask)
+        span_surprise_accum += model.surprise.squeeze(-1) * loss_mask.float()
+        span_valid_tokens += loss_mask.float()
 
         # --- buffer EM candidate proposals per block ---
         if config.em_enabled:
             for b in range(B):
-                h_final = model.blocks[b].layers[-1].h  # [BS, D_h]
+                h_final = model.blocks[b].layers[-1].h
                 k_c, v_c, novelty = model.blocks[b].em.propose_candidate(
                     x_emb, y_wm, h_final, model.surprise
                 )
                 cand_K[b].append(k_c)
                 cand_V[b].append(v_c)
                 cand_score[b].append(novelty)
+                cand_token_valid[b].append(loss_mask)
+
+    # ---- per-stream span surprise mean ----
+    span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
 
     # ---- span boundary: PM base decay + commits ----
     if config.pm_enabled:
         for block in model.blocks:
             for layer in block.layers:
-                layer.pm.base_decay()            # per-span decay on ALL streams
-        model.commit_at_boundary()               # PMController decides per-stream
+                layer.pm.base_decay()
+        model.commit_at_boundary(
+            span_surprise=span_surprise_mean.detach()
+        )
 
     # ---- span boundary: EM writes ----
     if config.em_enabled:
-        span_surprise_mean = span_surprise_accum / span_length
         for b, block in enumerate(model.blocks):
-            stacked_K = stack(cand_K[b], dim=1)      # [BS, P, D_em]
+            stacked_K = stack(cand_K[b], dim=1)            # [BS, P, D_em]
             stacked_V = stack(cand_V[b], dim=1)
             stacked_score = stack(cand_score[b], dim=1)
+            stacked_valid = stack(cand_token_valid[b], dim=1)
+
+            # Candidate validity: at/after last reset AND loss-mask valid
+            pos = arange(P).unsqueeze(0)                   # [1, P]
+            cand_valid = (pos >= span_last_reset.unsqueeze(1)) & stacked_valid.bool()
+
             write_mask, g_em = block.em_controller(
                 span_surprise_mean, em_usage, cand_novelty_mean
             )
             block.em.write_at_boundary(
-                stacked_K, stacked_V, stacked_score, write_mask, g_em
+                stacked_K, stacked_V, stacked_score,
+                write_mask, g_em, cand_valid=cand_valid
             )
 
 # finalize loss
@@ -608,7 +630,7 @@ This resolves ambiguity by construction.
   * `blocks: nn.ModuleList[Block]` (B blocks)
   * `surprise: Tensor[BS, 1]` (runtime state)
   * `forward_one_token(input_id, reset_mask) → (logits, x_emb, y_wm)` or `(logits, x_emb, y_wm, stats)` when `collect=True`
-  * `commit_at_boundary(force_mode="normal")` — triggers PM commits; supports `"force_on"` / `"force_off"` for RL rollouts
+  * `commit_at_boundary(force_mode="normal", span_surprise=None)` — triggers PM commits with actual span surprise; supports `"force_on"` / `"force_off"` for RL rollouts
   * `reset_at_doc_boundary(mask: Tensor[BS])`
   * `detach_states()`
   * State persistence via `state.save_runtime_state(model)` / `state.load_runtime_state(model, state)`
@@ -642,7 +664,7 @@ This resolves ambiguity by construction.
   * `em_S: Tensor[BS, M]`
   * `retrieve(x_emb, y_wm) → y_em: [BS, D]` (retrieval + cross-attention aggregation combined)
   * `propose_candidate(x_emb, y_wm, h_final, surprise) → (k_cand, v_cand, novelty)`
-  * `write_at_boundary(cand_K, cand_V, cand_score, write_mask, g_em)`
+  * `write_at_boundary(cand_K, cand_V, cand_score, write_mask, g_em, cand_valid=None)` — `cand_valid: [BS, P]` masks out pre-reset and EOT candidates
   * `reset_states(mask)` — overrides StateMixin: only zeros `em_S` (preserves `em_K`, `em_V`)
 
 * `EMController` (B instances)
@@ -728,7 +750,7 @@ training:
   lr_min: 1.0e-5            # cosine decay target
   warmup_steps: 1000
   max_grad_norm: 1.0
-  weight_decay: 0.01
+  weight_decay: 0.01          # applied only to ndim>1 non-bias params; biases and LayerNorm excluded
 ```
 
 ---

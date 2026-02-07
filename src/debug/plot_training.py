@@ -46,9 +46,14 @@ def main():
     if len(sys.argv) > 1:
         path = sys.argv[1]
 
-    records = load_metrics(path)
-    if not records:
+    all_records = load_metrics(path)
+    if not all_records:
         print(f"No records found in {path}")
+        return
+    records = [r for r in all_records if r.get("mode", "train") == "train"]
+    val_records = [r for r in all_records if r.get("mode") == "val"]
+    if not records:
+        print(f"No training records found in {path}")
         return
 
     nan = float("nan")
@@ -72,6 +77,10 @@ def main():
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
     ax.set_title("Loss")
+    if val_records:
+        v_steps = [r.get("step", i) for i, r in enumerate(val_records)]
+        v_loss = [r.get("val_loss", nan) for r in val_records]
+        ax.scatter(v_steps, v_loss, color="black", s=12, alpha=0.8, label="val")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -85,6 +94,10 @@ def main():
     ax.set_xlabel("step")
     ax.set_ylabel("perplexity")
     ax.set_title("Perplexity")
+    if val_records:
+        v_steps = [r.get("step", i) for i, r in enumerate(val_records)]
+        v_ppl = [r.get("val_ppl", nan) for r in val_records]
+        ax.scatter(v_steps, v_ppl, color="black", s=12, alpha=0.8, label="val")
     ax.legend()
     ax.grid(True, alpha=0.3)
 

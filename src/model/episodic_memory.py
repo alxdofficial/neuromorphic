@@ -111,8 +111,11 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Cross-attention aggregation
         q_cross = self.W_q_cross(x)  # [BS, D_em]
-        # Attention: q_cross against V_top as both keys and values
+        # Attention: q_cross against V_top as both keys and values.
+        # Adding topk_scores preserves a differentiable path from retrieval query
+        # (W_q_em) to downstream loss through selected memory logits.
         attn = torch.einsum("bd, bkd -> bk", q_cross, V_top) * self.cross_scale
+        attn = attn + topk_scores
         # Mask out -inf topk positions (no active slots)
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
         attn = torch.softmax(attn, dim=-1)
@@ -141,10 +144,20 @@ class EpisodicMemory(nn.Module, StateMixin):
         k_cand = unit_normalize(self.W_k_cand(torch.cat([x, y_wm], dim=-1)))
         v_cand = self.W_v_cand(h_final)
 
-        # Novelty = surprise + (1 - max cosine similarity to existing keys)
+        # Novelty = surprise + (1 - max cosine similarity to active keys)
         if self.em_K is not None:
             cos_sim = torch.einsum("bd, bmd -> bm", k_cand, self.em_K)  # [BS, M]
-            max_sim = cos_sim.max(dim=-1).values  # [BS]
+            if self.em_S is not None:
+                active_mask = self.em_S > 0
+                masked = cos_sim.masked_fill(~active_mask, float("-inf"))
+                any_active = active_mask.any(dim=-1)
+                max_sim = torch.where(
+                    any_active,
+                    masked.max(dim=-1).values,
+                    torch.zeros_like(masked[..., 0]),
+                )
+            else:
+                max_sim = cos_sim.max(dim=-1).values
         else:
             max_sim = torch.zeros(x.shape[0], device=x.device)
 
@@ -154,7 +167,7 @@ class EpisodicMemory(nn.Module, StateMixin):
 
     def write_at_boundary(self, cand_K: Tensor, cand_V: Tensor,
                           cand_score: Tensor, write_mask: Tensor,
-                          g_em: Tensor):
+                          g_em: Tensor, cand_valid: Tensor = None):
         """Span-boundary EM write. Top-C candidates, soft multi-slot EMA.
 
         Args:
@@ -163,21 +176,29 @@ class EpisodicMemory(nn.Module, StateMixin):
             cand_score: [BS, P] — novelty scores from span
             write_mask: [BS] bool — which streams write
             g_em: [BS] — write strength per stream
+            cand_valid: [BS, P] bool — optional candidate validity mask
         """
-        if not write_mask.any() or self.em_K is None:
+        if self.em_K is None:
             return
 
         BS = write_mask.shape[0]
+        device = cand_score.device
 
-        with torch.no_grad():
-            # Select top-C candidates per stream
-            C = min(self.C, cand_score.shape[1])
-            topC_scores, topC_idx = cand_score.topk(C, dim=-1)  # [BS, C]
+        if cand_valid is None:
+            cand_valid = torch.ones_like(cand_score, dtype=torch.bool, device=device)
+        else:
+            cand_valid = cand_valid.bool()
 
-            topC_idx_exp = topC_idx.unsqueeze(-1).expand(-1, -1, self.D_em)
-            K_C = cand_K.gather(1, topC_idx_exp)  # [BS, C, D_em]
-            V_C = cand_V.gather(1, topC_idx_exp)  # [BS, C, D_em]
+        # Select top-C candidates per stream
+        C = min(self.C, cand_score.shape[1])
+        masked_scores = cand_score.masked_fill(~cand_valid, float("-inf"))
+        topC_scores, topC_idx = masked_scores.topk(C, dim=-1)  # [BS, C]
 
+        topC_idx_exp = topC_idx.unsqueeze(-1).expand(-1, -1, self.D_em)
+        K_C = cand_K.gather(1, topC_idx_exp)  # [BS, C, D_em]
+        V_C = cand_V.gather(1, topC_idx_exp)  # [BS, C, D_em]
+
+        if write_mask.any():
             # For each candidate, soft-select slots to update
             for c in range(C):
                 k_c = K_C[:, c]   # [BS, D_em]
@@ -193,7 +214,9 @@ class EpisodicMemory(nn.Module, StateMixin):
                 w = soft_topk(scores_slot, self.k_write, self.tau)  # [BS, M]
 
                 # Apply write mask and strength
-                alpha = w * g_em.unsqueeze(-1) * write_mask.float().unsqueeze(-1)  # [BS, M]
+                score_ok = torch.isfinite(topC_scores[:, c])
+                cand_write_mask = write_mask & score_ok
+                alpha = w * g_em.unsqueeze(-1) * cand_write_mask.float().unsqueeze(-1)  # [BS, M]
 
                 # EMA update
                 alpha_3d = alpha.unsqueeze(-1)  # [BS, M, 1]
@@ -203,13 +226,16 @@ class EpisodicMemory(nn.Module, StateMixin):
                 self.em_V = (1 - alpha_3d) * self.em_V + alpha_3d * v_c.unsqueeze(1)
 
                 # Strength update
-                self.em_S = (self.em_S + alpha * topC_scores[:, c].unsqueeze(-1)).clamp(
+                score_strength = torch.where(
+                    score_ok, topC_scores[:, c], torch.zeros_like(topC_scores[:, c])
+                )
+                self.em_S = (self.em_S + alpha * score_strength.unsqueeze(-1)).clamp(
                     0.0, self.S_max
                 )
 
-            # Decay and budget enforcement
-            self.em_S = self.em_S * self.decay
-            self.em_S = budget_enforce(self.em_S, self.budget)
+        # Always decay strengths each boundary (even if no writes happened).
+        self.em_S = self.em_S * self.decay
+        self.em_S = budget_enforce(self.em_S, self.budget)
 
 
 class EMController(nn.Module):

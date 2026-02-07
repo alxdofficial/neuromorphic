@@ -187,7 +187,7 @@ h = a * (carry * h_prev) + b
 # When carry=1: h = a*h_prev + b (normal recurrence)
 ```
 
-**Output:** `norm(h + x_block)` -- residual connection from block input plus LayerNorm.
+**Output:** `norm(W_o(h) + x_block)` -- output projection, residual connection from block input, plus LayerNorm. `W_o: nn.Linear(D_h, D_h)` is a per-layer learned projection that allows the layer to transform its hidden state before the residual add.
 
 **What each input contributes:**
 - `x_block: [BS, D_h]` -- the current token's representation for this block
@@ -420,21 +420,22 @@ for layer in self.layers:
 return x   # [BS, D_h]
 ```
 
-**Block.commit_pm(force_mode) at span boundary:**
+**Block.commit_pm(force_mode, span_surprise) at span boundary:**
 ```python
-def commit_pm(self, force_mode="normal"):
+def commit_pm(self, force_mode="normal", span_surprise=None):
     if force_mode == "force_off": return
     for layer in self.layers:
         if force_mode == "force_on":
             # Commit all streams unconditionally
             pm.commit(all_true_mask, default_lambda, default_g, None)
         else:
-            # Controller decides
-            mask, lam, g, slots = layer.pm_controller(elig_norm, pm_usage, surprise)
+            # Controller decides — uses actual span surprise when available
+            surprise_input = span_surprise if span_surprise is not None else elig_norm
+            mask, lam, g, slots = layer.pm_controller(elig_norm, pm_usage, surprise_input)
             pm.commit(mask, lam, g, slots)
 ```
 
-The `force_mode` parameter exists for Phase D RL counterfactual rollouts.
+The `force_mode` parameter exists for Phase D RL counterfactual rollouts. The `span_surprise` parameter receives the actual per-stream mean surprise over the span, computed in the trainer. If not provided (e.g., during standalone evaluation), the controller falls back to using `elig_norm` as a proxy.
 
 ### 9.1 Block State Reset (Lifelong Mode)
 
@@ -549,6 +550,8 @@ save_runtime_state(model)  # Serialize all state for checkpointing / RL rollouts
 load_runtime_state(model, state)  # Restore saved state
 ```
 
+**Path-based checkpoint keys:** `save_runtime_state()` uses stable module paths as dictionary keys (e.g., `"blocks.0.layers.1.pm"`, `"blocks.2.em"`). These keys are derived from the module tree structure and remain stable across unrelated model changes. `load_runtime_state()` first tries path-based keys, then falls back to legacy index-based keys (`mixin_0_ProceduralMemory`) for backward compatibility with older checkpoints.
+
 **Critical for RL:** `save_runtime_state()` returns references to live tensors. For counterfactual rollouts that mutate state, you **must** `copy.deepcopy()` the saved state before loading it.
 
 ---
@@ -571,25 +574,31 @@ A chunk contains T/P = 8 spans. Each span boundary triggers PM base decay + comm
 ```
 For each span (8 spans per chunk):
     Reset EM candidate buffers
+    Reset per-stream span accumulators (surprise, valid token counts)
+    Track per-stream last-reset position for candidate validity
 
     For each token in span (32 tokens):
         1. Compute doc-boundary reset mask
-        2. forward_one_token() -> logits, x_emb, y_wm
-        3. Compute + accumulate loss (online, masked at EOT)
-        4. Update surprise signal
-        5. Accumulate span surprise for controller decisions
-        6. Buffer EM candidates (if enabled)
+        2. Clear span accumulators for streams that reset mid-span
+        3. forward_one_token() -> logits, x_emb, y_wm
+        4. Compute + accumulate loss (online, masked at EOT)
+        5. Update surprise signal (masked: EOT positions get 0)
+        6. Accumulate per-stream span surprise (only valid positions)
+        7. Buffer EM candidates with validity mask (if enabled)
 
     At span boundary:
-        7. PM base decay (all streams): pm_a *= decay_pm
-        8. PM commits: controller decides, commit() updates pm_K/pm_V/pm_a
-        9. EM writes: controller decides, write_at_boundary() updates em_K/em_V/em_S
+        8. Compute per-stream span_surprise_mean
+        9. PM base decay (all streams): pm_a *= decay_pm
+       10. PM commits: pass span_surprise_mean to controller
+       11. EM writes: controller decides, write_at_boundary()
+           filters candidates by validity (post-reset only)
 
 After all spans:
-    10. Finalize loss: avg_loss = chunk_loss / valid_count
-    11. Add regularizers (PM/EM budget penalties)
-    12. Backward + gradient clipping + optimizer step
-    13. Detach all states (TBPTT boundary)
+    12. Finalize loss: avg_loss = chunk_loss / valid_count
+    13. Add regularizers (PM/EM budget penalties)
+    14. Backward + gradient clipping + optimizer step
+    15. Detach all states (TBPTT boundary)
+    16. Save last token per stream (for checkpoint resume)
 ```
 
 ### 12.3 Online Loss Accumulation
@@ -612,9 +621,19 @@ When `reset_on_doc_boundary=True` (Phases A-E):
 - We still train on predicting EOT within documents
 - Note: `reset_on_doc_boundary` remains True even in Phase E (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
 
-### 12.5 Why PM Commits Use elig_norm as Surprise Proxy
+### 12.5 PM Commit Surprise Signal
 
-Currently, `block.commit_pm()` is called from `model.commit_at_boundary()`, which does not pass span surprise statistics. The PMController receives `elig_norm` as a proxy for `span_surprise`. This is a known simplification -- when Phase D RL controllers are implemented, they will receive proper surprise statistics computed in the trainer's rl_step method.
+The trainer computes `span_surprise_mean` (per-stream mean surprise over valid tokens in the span) and passes it to `model.commit_at_boundary(span_surprise=span_surprise_mean.detach())`. This flows through to each `block.commit_pm(span_surprise=...)`, where the PMController receives it as its `span_surprise` input. The `.detach()` ensures the commit decision path does not interfere with the main LM gradient.
+
+If `span_surprise` is not available (e.g., standalone evaluation without the trainer), the controller falls back to using `elig_norm` as a proxy.
+
+### 12.6 Checkpoint Resume and prev_token Persistence
+
+When training resumes from a checkpoint, the dataloader creates fresh streams with `prev_token = EOS`. This would trigger doc-boundary resets on the first batch, wiping restored PM/EM state. To prevent this:
+
+1. The trainer tracks `_last_prev_token` (the final input token per stream from each chunk).
+2. Checkpoints save this as `last_prev_token`.
+3. On resume, `trainer.override_prev_token` is set from the checkpoint. On the first batch, this overrides the dataloader's `prev_token`, preserving memory state continuity.
 
 ---
 
@@ -879,4 +898,4 @@ Understanding what learns via backprop vs what needs RL:
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
 | `src/training/eval_lifelong.py` | Phase E evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |
-| `src/train.py` | Entry point -- config, optimizer, scheduler, training loop (+ runtime state checkpointing) |
+| `src/train.py` | Entry point -- config, optimizer (weight decay excludes biases/norms), scheduler, training loop, runtime state + prev_token checkpointing |

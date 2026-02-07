@@ -43,7 +43,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 |-----------|-------|
 | Optimizer | AdamW |
 | Learning rate | 3e-4 (cosine decay to 1e-5) |
-| Weight decay | 0.01 |
+| Weight decay | 0.01 (ndim>1 non-bias params only; biases and LayerNorm get 0.0) |
 | Batch size (BS) | 16 (can increase for Tier A) |
 | TBPTT chunk (T) | 256 tokens |
 | Plasticity span (P) | 32 tokens |
@@ -405,7 +405,7 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 | **Plasticity span** | P=32 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
 | **Compile** | `torch.compile(model)` for kernel fusion (RTX 4090 Ada Lovelace supports it well) |
 | **Data loading** | `num_workers=4`, `pin_memory=True`, streaming from disk/HF |
-| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights + PM/EM/WM state via `save_state()` |
+| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume) |
 | **Monitoring** | Log: loss, commit/write rates per block, surprise distribution, PM/EM norms, eligibility norms |
 
 ---
