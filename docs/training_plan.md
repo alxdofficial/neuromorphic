@@ -9,8 +9,8 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 ### v2 Architecture Summary
 - **B blocks** (default 6), each containing **L layers** (default 12)
 - **Working Memory (WM):** sliding-window attention (W=256), 1 shared instance
-- **Procedural Memory (PM):** fast low-rank weights + eligibility, B×L instances (each with `PMController`)
-- **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMController`)
+- **Procedural Memory (PM):** fast low-rank weights + eligibility, B×L instances (each with `PMNeuromodulator`)
+- **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMNeuromodulator`)
 - **Plasticity boundaries:** PM/EM writes every P=32 tokens (scan-friendly within spans)
 
 ---
@@ -75,9 +75,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ---
 
-### Phase B — Enable PM (heuristic commits at plasticity boundaries)
+### Phase B — Enable PM + Learned Continuous Heads
 
-**Goal:** Train general language competence with Procedural Memory active. `PMController` logs decisions but uses heuristic commit timing initially.
+**Goal:** Train general language competence with Procedural Memory active. `PMNeuromodulator` creates backbone + continuous heads (`lambda_head`, `g_head`, `slot_head`) trained via main loss backprop, with heuristic commit gate (`elig_norm > 1.0`).
 
 **Primary dataset:** FineWeb-Edu (sample-10BT)
 - HuggingFace: `HuggingFaceFW/fineweb-edu` (use the `sample-10BT` subset)
@@ -101,9 +101,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 **Config:**
 - BS=16, TBPTT T=256, plasticity span P=32
-- PM enabled: reads always, commits at span boundaries (heuristic: elig_norm threshold or every span)
+- PM enabled: reads always, commits at span boundaries (heuristic gate: elig_norm > 1.0)
+- PM neuromod continuous heads (lambda, g, slot_logits) active and differentiable — trained via main optimizer
 - EM still disabled (retrieval/writes off)
-- `PMController` in logging-only mode (records what it would do)
 - Base decay 0.999/span, eligibility decay ρ=0.95
 - All stability rails active (clip, budget, normalize, commit cap)
 
@@ -117,9 +117,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ---
 
-### Phase C — Add EM Retrieval + Heuristic Writes
+### Phase C — Add EM Retrieval + Learned Continuous Heads
 
-**Goal:** Enable Episodic Memory retrieval and writes. `EMController` uses heuristic write policy initially.
+**Goal:** Enable Episodic Memory retrieval and writes. `EMNeuromodulator` creates backbone + g_head trained via main loss backprop, with heuristic write gate (`novelty > 0.3`). `EpisodicMemory.W_nov` learned novelty adjuster also trains via backprop.
 
 **Dataset:** Continue FineWeb-Edu + SlimPajama streaming
 
@@ -132,10 +132,11 @@ This plan covers datasets, configuration, and training phases for the ~40M param
   - Recent news articles with names, dates, facts
 
 **Config:**
-- PM continues with heuristic commits (same as Phase B)
+- PM continues with heuristic gate + learned continuous heads (same as Phase B)
 - EM retrieval enabled: top k_ret=4 latent memory tokens → cross-attention aggregation
-- EM writes at span boundaries: heuristic (surprise spike + novelty threshold)
-- `EMController` in logging-only mode (records decisions for later RL)
+- EM writes at span boundaries: heuristic gate (novelty threshold) + learned g_em strength
+- EM neuromod continuous head (g_em) active and differentiable — trained via main optimizer
+- `W_nov` learned novelty adjuster active — trained via main optimizer
 - All stability rails active (EM budget, strength caps)
 
 **Training budget:** ~2–3B tokens
@@ -148,18 +149,21 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ---
 
-### Phase D — Learn Gating via RL (optional)
+### Phase D — RL Counterfactual Training (optional)
 
-**Goal:** Train `PMController` and `EMController` commit/write policies using RL (boundary-time decisions).
+**Goal:** Add RL counterfactual training for PM gate (`p_commit`) and EM strength (`g_em`). PM continuous heads and EM backbone carry over from Phases B/C; all neuromod params move from main optimizer to RL optimizer.
 
 **Dataset:** Continue FineWeb-Edu + SlimPajama + ProofPile-2 streaming
 
 **Config:**
-- Train `commit_mask` (per layer per block) and `write_mask` (per block)
-- Keep λ/g/slot defaults initially
+- PM: Add `gate_head` → train `commit_mask` via RL counterfactual (force_off vs force_on). Continuous heads (`lambda`, `g`, `slot_logits`) carry over from Phase B (pre-trained via backprop)
+- EM: Switch to always-write (remove heuristic gate); train `g_em` via RL counterfactual (baseline g_em=0.3 vs neuromod's chosen g_em). Safety rails: g_em in [0.001, 0.95] (near-zero floor enables soft "don't write"). g_head carries over from Phase C
+- `W_nov` remains on main optimizer (not RL)
 - Reward: future loss delta − memory/drift penalties
 - Backbone LR reduced to 1e-4, controller LRs at 3e-4
 - Continue all stability rails
+
+**Phase transition:** Optimizer state loading is skipped (param groups change as neuromod params move from main to RL optimizer). The RL optimizer receives a linear LR warmup over `rl_warmup_steps=500` steps to mitigate the cold Adam state on pre-trained continuous-head weights.
 
 **Training budget:** ~2–3B tokens with RL events at span boundaries
 
@@ -175,7 +179,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 **Goal:** Enable persistent cross-document memory. PM/EM accumulate knowledge across document boundaries instead of resetting.
 
-**Prerequisite:** Phase D (RL controllers) must be implemented and stable. Without trained controllers deciding when to commit/write, persistent memory would accumulate noise.
+**Prerequisite:** Phase C (learned continuous heads) or Phase D (RL controllers) should be stable. Without trained neuromodulator continuous heads deciding commit/write strength, persistent memory would accumulate noise.
 
 **Core mechanism — Soft reset at doc boundaries:**
 Instead of binary "reset everything" or "reset nothing", Phase E uses a **soft reset** via `config.lifelong_mode = True`:
@@ -328,13 +332,13 @@ Option B: Assign ~70% of streams to FineWeb-Edu and ~30% to SlimPajama.
 ### Phase D: Reset + RL training
 - Same reset policy as Phase A–C
 - RL counterfactuals compare commit/write-vs-no-commit/write within a single document
-- Document isolation helps credit assignment for `PMController` and `EMController` policies
+- Document isolation helps credit assignment for `PMNeuromodulator` and `EMNeuromodulator` policies
 
 ### Phase E+: Lifelong (soft resets)
 - `config.lifelong_mode = True` (set by `config.set_phase("E")`)
 - `reset_on_doc_boundary` remains True (loss masking still active)
 - **Soft reset** at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
-- Controllers are now trained and selective about what to commit/write
+- Neuromodulator continuous heads are trained (from Phase B/C) and selective about commit/write strength
 - Base decay (0.999/span) provides natural forgetting
 - Budget caps force overwriting of weak slots when capacity is full
 - Runtime state checkpointed alongside model parameters
@@ -405,7 +409,7 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 | **Plasticity span** | P=32 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
 | **Compile** | `torch.compile(model)` for kernel fusion (RTX 4090 Ada Lovelace supports it well) |
 | **Data loading** | `num_workers=4`, `pin_memory=True`, streaming from disk/HF |
-| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume) |
+| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume). Phase transitions detected automatically — optimizer state skipped when param groups change, RL optimizer gets LR warmup |
 | **Monitoring** | Log: loss, commit/write rates per block, surprise distribution, PM/EM norms, eligibility norms |
 
 ---
@@ -414,9 +418,9 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 
 1. **Set up data pipeline** — streaming FineWeb-Edu + PG19 with packing
 2. **Phase A** — verify backbone + WM works (TinyStories)
-3. **Phase B** — enable PM with heuristic commits (FineWeb-Edu + SlimPajama, bulk of training)
-4. **Phase C** — add EM retrieval + heuristic writes (continue main mix + ProofPile-2)
-5. **Phase D** — RL controller training (optional; train `PMController` and `EMController` policies)
+3. **Phase B** — enable PM + learned continuous heads (FineWeb-Edu + SlimPajama, bulk of training)
+4. **Phase C** — add EM retrieval + learned write strength + W_nov (continue main mix + ProofPile-2)
+5. **Phase D** — RL counterfactual training (optional; add PM gate_head, EM always-write + RL on g_em)
 6. **Phase E** — lifelong learning evaluation (Wikipedia, synthetic tests, no doc resets)
 7. **Phase F** — agentic fine-tuning (function calling datasets)
 8. **Phase G** — multimodal (future, requires architecture extension)

@@ -11,7 +11,7 @@ from torch import Tensor
 
 from .config import ModelConfig
 from .layer import Layer
-from .episodic_memory import EpisodicMemory, EMController
+from .episodic_memory import EpisodicMemory, EMNeuromodulator
 from .utils import StateMixin
 
 
@@ -30,14 +30,15 @@ class Block(nn.Module, StateMixin):
 
         # Episodic memory (1 per block)
         self.em = EpisodicMemory(config)
-        self.em_controller = EMController(config)
+        self.em_neuromodulator = EMNeuromodulator(config)
 
         # Projections from shared D to per-block D_h
         self.W_wm_proj = nn.Linear(config.D, config.D_h, bias=False)
         self.W_em_proj = nn.Linear(config.D, config.D_h, bias=False)
 
     def step(self, x_block: Tensor, y_wm: Tensor, x_emb: Tensor,
-             surprise: Tensor, carry: Tensor, collect: bool = False):
+             surprise: Tensor, carry: Tensor, collect: bool = False,
+             return_layers: bool = False):
         """Process one token through this block.
 
         Args:
@@ -46,11 +47,13 @@ class Block(nn.Module, StateMixin):
             x_emb: [BS, D] — token embedding (for EM retrieval query)
             surprise: [BS, 1] — surprise signal
             carry: [BS, 1] — 0 at doc boundaries, 1 otherwise
-            collect: bool — if True, return (h_out, stats_dict)
+            collect: bool — if True, include per-layer gate stats
+            return_layers: bool — if True, include stacked layer outputs
 
         Returns:
             h_out: [BS, D_h] — final layer output
             stats: dict (only when collect=True) — per-layer gate stats
+            layer_outputs: [BS, L, D_h] (only when return_layers=True)
         """
         # EM retrieval (if enabled)
         if self.config.em_enabled:
@@ -65,6 +68,7 @@ class Block(nn.Module, StateMixin):
         # Sequential layers
         x = x_block
         layer_stats = {}
+        layer_outs = [] if return_layers else None
         for l_idx, layer in enumerate(self.layers):
             # PM read (if enabled)
             if self.config.pm_enabled:
@@ -82,14 +86,25 @@ class Block(nn.Module, StateMixin):
             else:
                 h = result
 
+            if return_layers:
+                layer_outs.append(h)
+
             # Update eligibility traces (if PM enabled)
             if self.config.pm_enabled:
                 layer.pm.update_eligibility(x, h)
 
             x = h  # next layer's input
 
+        # Build stacked layer outputs [BS, L, D_h]
+        layer_stack = torch.stack(layer_outs, dim=1) if return_layers else None
+
+        # Return based on flags
+        if collect and return_layers:
+            return x, layer_stats, layer_stack
         if collect:
             return x, layer_stats
+        if return_layers:
+            return x, layer_stack
         return x  # final layer output [BS, D_h]
 
     def commit_pm(self, force_mode: str = "normal",
@@ -126,11 +141,13 @@ class Block(nn.Module, StateMixin):
                 pm.commit(commit_mask, lambda_vals, g, None)
                 commit_info[l_idx] = commit_mask.detach()
             else:
-                # Controller decides commit mask and parameters
+                # Neuromodulator decides commit mask and parameters
                 surprise_input = span_surprise if span_surprise is not None else elig_norm
-                commit_mask, lambda_vals, g, slot_logits = \
-                    layer.pm_controller.forward(
-                        elig_norm, pm_usage, surprise_input
+                commit_mask, lambda_vals, g, slot_logits, _p_commit = \
+                    layer.pm_neuromodulator.forward(
+                        elig_norm,
+                        pm_usage / self.config.budget_pm,
+                        surprise_input,
                     )
                 pm.commit(commit_mask, lambda_vals, g, slot_logits)
                 commit_info[l_idx] = commit_mask.detach()
@@ -160,3 +177,6 @@ class Block(nn.Module, StateMixin):
         if not self.config.lifelong_mode:
             self.em.reset_states(mask)  # zeros em_S
         # In lifelong mode: EM fully persists
+
+
+

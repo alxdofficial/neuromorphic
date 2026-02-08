@@ -49,6 +49,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.W_k_cand = nn.Linear(D + D, config.D_em)    # from (x, y_wm)
         self.W_v_cand = nn.Linear(config.D_h, config.D_em)  # from h_final (per-block)
 
+        # Learned novelty weight adjuster (Phase C+, backprop only)
+        self.W_nov = nn.Linear(D + D, 1) if config.em_enabled else None
+
         # State (lazily initialized)
         self.em_K: Tensor = None
         self.em_V: Tensor = None
@@ -161,7 +164,12 @@ class EpisodicMemory(nn.Module, StateMixin):
         else:
             max_sim = torch.zeros(x.shape[0], device=x.device)
 
-        novelty = (0.5 * surprise.squeeze(-1) + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
+        surprise_1d = surprise.squeeze(-1)
+        if self.W_nov is not None:
+            w_nov = torch.sigmoid(self.W_nov(torch.cat([x, y_wm], dim=-1))).squeeze(-1)
+            novelty = (w_nov * surprise_1d + (1.0 - w_nov) * (1.0 - max_sim)).clamp(0.0, 1.0)
+        else:
+            novelty = (0.5 * surprise_1d + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
 
         return k_cand, v_cand, novelty
 
@@ -238,31 +246,74 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_S = budget_enforce(self.em_S, self.budget)
 
 
-class EMController(nn.Module):
-    """Heuristic write decisions based on novelty + surprise.
+class EMNeuromodulator(nn.Module):
+    """Neuromodulator for EM write strength.
 
-    MVP: writes if mean novelty exceeds a threshold. Future versions
-    will use RL-based gating.
+    Phase A–B (em_enabled=False): empty shell, no parameters.
+    Phase C (em_enabled=True, rl_enabled=False): learned g_em via backbone
+        + g_head (main optimizer backprop), with heuristic write gate
+        (novelty > threshold). g_em clamped to [g_em_floor, g_em_ceil].
+    Phase D+ (em_enabled=True, rl_enabled=True): always write, learned g_em
+        (dual-trained: main loss backprop + RL counterfactual).
+        g_em clamped to [g_em_floor, g_em_ceil].
+
+    Returns:
+        write_mask: [BS] bool (always True in Phase D+ learned mode)
+        g_em: [BS] write strength
+        p_write: None (removed; kept for API compat)
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.rl_enabled = config.rl_enabled
+        self.em_enabled = config.em_enabled
         self.novelty_threshold = 0.3
         self.default_g = 0.3
+        self.g_em_floor = config.g_em_floor
+        self.g_em_ceil = config.g_em_ceil
+
+        # Backbone + g_head: created when EM is enabled (Phase C+)
+        if self.em_enabled:
+            H = config.rl_controller_hidden
+            self.backbone = nn.Sequential(
+                nn.Linear(3, H),
+                nn.ReLU(),
+            )
+            self.g_head = nn.Linear(H, 1)
 
     def forward(self, span_surprise: Tensor, em_usage: Tensor,
                 cand_novelty_mean: Tensor) -> tuple:
-        """Decide which streams should write and with what strength.
+        if self.em_enabled:
+            if self.rl_enabled:
+                return self._forward_learned(span_surprise, em_usage, cand_novelty_mean)
+            return self._forward_continuous(span_surprise, em_usage, cand_novelty_mean)
+        return self._forward_heuristic(span_surprise, em_usage, cand_novelty_mean)
 
-        Args:
-            span_surprise: [BS] — mean surprise over span
-            em_usage: [BS] — sum of em_S (current usage)
-            cand_novelty_mean: [BS] — mean novelty of candidates
-
-        Returns:
-            write_mask: [BS] bool
-            g_em: [BS] — write strength
-        """
+    def _forward_heuristic(self, span_surprise, em_usage, cand_novelty_mean):
+        """No learnable params (Phase A–B fallback)."""
         write_mask = cand_novelty_mean > self.novelty_threshold
         g_em = torch.full_like(span_surprise, self.default_g)
-        return write_mask, g_em
+        return write_mask, g_em, None
+
+    def _forward_continuous(self, span_surprise, em_usage, cand_novelty_mean):
+        """Heuristic write gate + learned g_em (Phase C)."""
+        write_mask = cand_novelty_mean > self.novelty_threshold
+
+        features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
+        h = self.backbone(features)
+
+        raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
+        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
+
+        return write_mask, g_em, None
+
+    def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean):
+        """Always write + learned g_em (Phase D+)."""
+        features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
+        h = self.backbone(features)
+
+        raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
+        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
+
+        write_mask = torch.ones_like(g_em, dtype=torch.bool)
+        return write_mask, g_em, None

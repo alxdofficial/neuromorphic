@@ -41,6 +41,16 @@ def smooth(values, window):
     return np.convolve(values, kernel, mode="valid")
 
 
+def _safe_float(val, default=float("nan")):
+    """Convert JSON metric value to float, mapping null/invalid to NaN."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def main():
     path = METRICS_FILE
     if len(sys.argv) > 1:
@@ -58,12 +68,12 @@ def main():
 
     nan = float("nan")
     steps = [r.get("step", i) for i, r in enumerate(records)]
-    loss = [r.get("loss", nan) for r in records]
-    ppl = [r.get("ppl", nan) for r in records]
-    lr = [r.get("lr", nan) for r in records]
-    tok_s = [r.get("tok_s", nan) for r in records]
-    grad_norm = [r.get("grad_norm", nan) for r in records]
-    reg = [r.get("reg", nan) for r in records]
+    loss = [_safe_float(r.get("loss", nan)) for r in records]
+    ppl = [_safe_float(r.get("ppl", nan)) for r in records]
+    lr = [_safe_float(r.get("lr", nan)) for r in records]
+    tok_s = [_safe_float(r.get("tok_s", nan)) for r in records]
+    grad_norm = [_safe_float(r.get("grad_norm", nan)) for r in records]
+    reg = [_safe_float(r.get("reg", nan)) for r in records]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle("Training Curves", fontsize=14)
@@ -79,7 +89,7 @@ def main():
     ax.set_title("Loss")
     if val_records:
         v_steps = [r.get("step", i) for i, r in enumerate(val_records)]
-        v_loss = [r.get("val_loss", nan) for r in val_records]
+        v_loss = [_safe_float(r.get("val_loss", nan)) for r in val_records]
         ax.scatter(v_steps, v_loss, color="black", s=12, alpha=0.8, label="val")
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -96,7 +106,7 @@ def main():
     ax.set_title("Perplexity")
     if val_records:
         v_steps = [r.get("step", i) for i, r in enumerate(val_records)]
-        v_ppl = [r.get("val_ppl", nan) for r in val_records]
+        v_ppl = [_safe_float(r.get("val_ppl", nan)) for r in val_records]
         ax.scatter(v_steps, v_ppl, color="black", s=12, alpha=0.8, label="val")
     ax.legend()
     ax.grid(True, alpha=0.3)

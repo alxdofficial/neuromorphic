@@ -13,6 +13,7 @@ from torch import Tensor
 from .config import ModelConfig
 from .working_memory import WorkingMemory
 from .block import Block
+from .decoder import SpatialDecoder
 from .utils import StateMixin
 
 
@@ -33,11 +34,20 @@ class NeuromorphicLM(nn.Module, StateMixin):
         # Input projection: D -> D (split across blocks after)
         self.W_in = nn.Linear(config.D, config.D, bias=False)
 
+        # Spatial decoder (hierarchical aggregation + deep cross-attention)
+        self.spatial_decoder = SpatialDecoder(config) if config.snapshot_enabled else None
+
         # Surprise signal (lazily initialized)
         self.surprise: Tensor = None
 
         # Initialize weights
         self._init_weights()
+
+        # Small-init the decoder output_proj after global init so it starts
+        # near-identity (h_final + small_noise) while still allowing gradient flow.
+        # Zero-init would kill ALL gradients through the decoder (chain rule: grad × 0 = 0).
+        if self.spatial_decoder is not None:
+            nn.init.normal_(self.spatial_decoder.output_proj.weight, std=0.01)
 
     def _init_weights(self):
         """Initialize weights with small values for stability."""
@@ -96,14 +106,23 @@ class NeuromorphicLM(nn.Module, StateMixin):
         carry = (~effective_reset_mask).float().unsqueeze(-1)  # [BS, 1]
 
         # Process each block
+        snapshot = self.config.snapshot_enabled
         h_blocks = []
+        block_layer_outputs = [] if snapshot else None
         block_stats = {}
         for b, block in enumerate(self.blocks):
             result = block.step(x_blocks[:, b], y_wm, x, self.surprise, carry,
-                                collect=collect)
-            if collect:
+                                collect=collect, return_layers=snapshot)
+            if collect and snapshot:
+                h_b, bstats, layers_b = result
+                block_stats[b] = bstats
+                block_layer_outputs.append(layers_b)
+            elif collect:
                 h_b, bstats = result
                 block_stats[b] = bstats
+            elif snapshot:
+                h_b, layers_b = result
+                block_layer_outputs.append(layers_b)
             else:
                 h_b = result
             h_blocks.append(h_b)
@@ -111,12 +130,59 @@ class NeuromorphicLM(nn.Module, StateMixin):
         # Merge block outputs
         h_final = torch.cat(h_blocks, dim=-1)  # [BS, D]
 
-        # LM head
-        logits = self.lm_head(h_final)  # [BS, vocab]
+        # Spatial decoder or direct LM head
+        if snapshot:
+            pm_summary = self._compute_pm_summary(BS, device)
+            em_summary = self._compute_em_summary(BS, device)
+            h_decoded = self.spatial_decoder(
+                block_layer_outputs, pm_summary, em_summary, y_wm, h_final,
+            )
+            logits = self.lm_head(h_decoded)  # [BS, vocab]
+        else:
+            logits = self.lm_head(h_final)  # [BS, vocab]
 
         if collect:
             return logits, x, y_wm, block_stats
         return logits, x, y_wm
+
+    def _compute_pm_summary(self, BS: int, device: torch.device) -> Tensor:
+        """Strength-weighted readout of PM slots, averaged across all instances.
+
+        Returns: [BS, D_h] — zero vector if PM is disabled or uninitialized.
+        """
+        if not self.config.pm_enabled:
+            return torch.zeros(BS, self.config.D_h, device=device)
+        readouts = []
+        for block in self.blocks:
+            for layer in block.layers:
+                pm = layer.pm
+                if pm.pm_a is not None and pm.pm_V is not None:
+                    weights = pm.pm_a.unsqueeze(-1)  # [BS, r, 1]
+                    denom = pm.pm_a.sum(dim=1, keepdim=True) + 1e-8  # [BS, 1]
+                    readout = (weights * pm.pm_V).sum(dim=1) / denom  # [BS, D_h]
+                    readouts.append(readout)
+        if readouts:
+            return torch.stack(readouts, dim=0).mean(dim=0)  # [BS, D_h]
+        return torch.zeros(BS, self.config.D_h, device=device)
+
+    def _compute_em_summary(self, BS: int, device: torch.device) -> Tensor:
+        """Strength-weighted readout of EM slots, averaged across all instances.
+
+        Returns: [BS, D_em] — zero vector if EM is disabled or uninitialized.
+        """
+        if not self.config.em_enabled:
+            return torch.zeros(BS, self.config.D_em, device=device)
+        readouts = []
+        for block in self.blocks:
+            em = block.em
+            if em.em_S is not None and em.em_V is not None:
+                weights = em.em_S.unsqueeze(-1)  # [BS, M, 1]
+                denom = em.em_S.sum(dim=1, keepdim=True) + 1e-8  # [BS, 1]
+                readout = (weights * em.em_V).sum(dim=1) / denom  # [BS, D_em]
+                readouts.append(readout)
+        if readouts:
+            return torch.stack(readouts, dim=0).mean(dim=0)  # [BS, D_em]
+        return torch.zeros(BS, self.config.D_em, device=device)
 
     def update_surprise(self, logits: Tensor, target: Tensor, mask: Tensor = None):
         """Update surprise signal from teacher-forced target.
@@ -178,6 +244,12 @@ class NeuromorphicLM(nn.Module, StateMixin):
         self.wm.detach_states()
         for block in self.blocks:
             block.detach_states()
+
+    def rl_parameters(self):
+        """Yield neuromodulator MLP parameters (for separate RL optimizer)."""
+        for name, param in self.named_parameters():
+            if "neuromodulator" in name:
+                yield param
 
     def param_count(self) -> int:
         """Total trainable parameter count."""

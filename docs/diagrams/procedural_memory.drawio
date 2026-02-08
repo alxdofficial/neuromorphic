@@ -145,8 +145,8 @@
           <mxGeometry x="570" y="125" width="340" height="22" as="geometry"/>
         </mxCell>
 
-        <!-- PMController -->
-        <mxCell id="52" value="&lt;b&gt;PMController&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Heuristic (MVP): commit if elig_norm &gt; threshold&lt;br&gt;Future: RL-based gating policy&lt;br&gt;&lt;br&gt;Inputs: elig_norm, pm_usage, span_surprise&lt;br&gt;Output: commit_mask [BS] bool&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <!-- PMNeuromodulator -->
+        <mxCell id="52" value="&lt;b&gt;PMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Heuristic (A): commit if elig_norm &gt; 1.0, fixed defaults&lt;br&gt;Continuous (B–C): heuristic gate + learned λ, g, slots&lt;br&gt;Learned (D+): + RL gate_head for p_commit&lt;br&gt;&lt;br&gt;Inputs: elig_norm, pm_usage, span_surprise&lt;br&gt;Outputs: commit_mask, λ, g, slot_logits, p_commit&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="590" y="165" width="280" height="95" as="geometry"/>
         </mxCell>
 

@@ -24,12 +24,14 @@ class MetricsCollector:
         output_path: str = "checkpoints/metrics.jsonl",
         collect_every: int = 50,
         basic_every: int = 1,
+        phase: str | None = None,
     ):
         self.model = model
         self.config = config
         self.output_path = output_path
         self.collect_every = collect_every
         self.basic_every = basic_every
+        self.phase = phase
 
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -107,13 +109,15 @@ class MetricsCollector:
         self._pm_commit_accum[key][1] += 1
 
     def record_em_write(self, block_idx: int, write_mask: Tensor,
-                        novelty_mean: float):
+                        novelty_mean: float, g_em_mean: float = None):
         """Accumulate EM write rate across spans within a chunk."""
         if block_idx not in self._em_write_accum:
-            self._em_write_accum[block_idx] = [0.0, 0, 0.0]
+            self._em_write_accum[block_idx] = [0.0, 0, 0.0, 0.0]
         self._em_write_accum[block_idx][0] += write_mask.float().mean().item()
         self._em_write_accum[block_idx][1] += 1
         self._em_write_accum[block_idx][2] += novelty_mean
+        if g_em_mean is not None:
+            self._em_write_accum[block_idx][3] += g_em_mean
 
     def _flush_rates(self, record: dict):
         """Flush accumulated commit/write rates into the record."""
@@ -122,10 +126,13 @@ class MetricsCollector:
                 record[f"pm_commit_rate_b{b}_l{l}"] = total / count
         self._pm_commit_accum.clear()
 
-        for b, (total, count, nov) in self._em_write_accum.items():
+        for b, accum in self._em_write_accum.items():
+            total, count, nov = accum[0], accum[1], accum[2]
             if count > 0:
                 record[f"em_write_rate_b{b}"] = total / count
                 record[f"em_novelty_mean_b{b}"] = nov / count
+                if len(accum) > 3 and accum[3] > 0:
+                    record[f"em_g_em_mean_b{b}"] = accum[3] / count
         self._em_write_accum.clear()
 
     def _merge_gate_stats(self, record: dict, gate_stats: dict):
@@ -301,12 +308,16 @@ class MetricsCollector:
         }
         for b_idx, block in enumerate(self.model.blocks):
             module_groups[f"block_{b_idx}"] = [block]
+            if self.config.rl_enabled:
+                module_groups[f"b{b_idx}_em_neuromod"] = [block.em_neuromodulator]
             for l_idx, layer in enumerate(block.layers):
                 module_groups[f"b{b_idx}_l{l_idx}_gates"] = [
                     layer.gate_a, layer.gate_b
                 ]
                 if self.config.pm_enabled:
                     module_groups[f"b{b_idx}_l{l_idx}_pm"] = [layer.pm]
+                if self.config.rl_enabled:
+                    module_groups[f"b{b_idx}_l{l_idx}_pm_neuromod"] = [layer.pm_neuromodulator]
 
         for name, modules in module_groups.items():
             total_norm_sq = 0.0
@@ -318,6 +329,8 @@ class MetricsCollector:
 
     def _write(self, record: dict):
         """Write a single JSON line."""
+        if self.phase is not None and "phase" not in record:
+            record = {**record, "phase": self.phase}
         # Convert any remaining non-serializable values
         clean = {}
         for k, v in record.items():

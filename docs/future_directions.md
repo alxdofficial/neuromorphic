@@ -52,7 +52,7 @@ Low-rank adapters (K_pm/V_pm/a_pm) per layer per block (B×L=32 instances):
 * Persistent, abstract memory in representation space
 * Associative recall by similarity
 * Behavioral biasing rather than explicit recall
-* Each instance controlled by its own `PMController`
+* Each instance controlled by its own `PMNeuromodulator`
 
 Psychologically, this maps to:
 
@@ -66,7 +66,7 @@ Per-block vector store (B=4 instances), each with:
 
 * Itemized facts or events (M=256 items per block)
 * Top-k retrieval (k_ret=4 latent tokens) + cross-attention aggregation
-* Each instance controlled by its own `EMController`
+* Each instance controlled by its own `EMNeuromodulator`
 
 This addresses the gap from v1.7: the model now has both *implicit* and *declarative* memory.
 
@@ -146,7 +146,7 @@ v2 implements the recommended episodic memory:
 * Item-based vector store (K_e, V_e, S_e)
 * Supports top-k retrieval (k_ret=4 latent tokens)
 * Capacity M=256 items per block (B=4 blocks → 1024 total items)
-* Per-block `EMController` for write decisions
+* Per-block `EMNeuromodulator` for write decisions
 
 This enables:
 
@@ -159,8 +159,8 @@ This enables:
 | Memory | Type | Capacity | Controller |
 |--------|------|----------|------------|
 | Working Memory (WM) | Sliding-window attention | W=256 tokens | None |
-| Procedural Memory (PM) | Low-rank adapters | r=8 × B×L | `PMController` per instance |
-| Episodic Memory (EM) | Vector store | M=256 × B | `EMController` per instance |
+| Procedural Memory (PM) | Low-rank adapters | r=8 × B×L | `PMNeuromodulator` per instance |
+| Episodic Memory (EM) | Vector store | M=256 × B | `EMNeuromodulator` per instance |
 
 ---
 
@@ -219,8 +219,8 @@ Further improvements may include:
 The v1.7 roadmap proposed these upgrades. v2 status:
 
 1. ✅ **Scan-friendly recurrent core** — affine recurrence (h_t = a_t ⊙ h_{t-1} + b_t)
-2. ✅ **Procedural Memory (PM)** — low-rank adapters, B×L instances with `PMController`
-3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMController`
+2. ✅ **Procedural Memory (PM)** — low-rank adapters, B×L instances with `PMNeuromodulator`
+3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMNeuromodulator`
 4. ✅ **Working Memory (WM)** — sliding-window attention, W=256 tokens
 5. ✅ **Lifelong learning (Phase E)** — soft reset at doc boundaries, PM/EM persist, eval framework
 6. ⏳ **Consolidation mechanism** — not yet implemented (future work)

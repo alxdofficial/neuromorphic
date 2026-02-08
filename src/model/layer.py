@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
-from .procedural_memory import ProceduralMemory, PMController
+from .procedural_memory import ProceduralMemory, PMNeuromodulator
 from .utils import StateMixin
 
 
@@ -29,7 +29,7 @@ class Layer(nn.Module, StateMixin):
 
         # Procedural memory for this layer
         self.pm = ProceduralMemory(config)
-        self.pm_controller = PMController(config)
+        self.pm_neuromodulator = PMNeuromodulator(config)
 
         # Gate input: x_block + y_pm + y_wm_proj + y_em_proj + surprise
         input_dim = 4 * D_h + 1

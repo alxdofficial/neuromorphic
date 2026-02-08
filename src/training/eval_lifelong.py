@@ -169,8 +169,10 @@ def _compute_chunk_ppl(
                     cand_valid_f = cand_valid.float()
                     cand_count = cand_valid_f.sum(dim=-1).clamp(min=1)  # [BS]
                     cand_novelty_mean = (stacked_score * cand_valid_f).sum(dim=-1) / cand_count
-                    write_mask, g_em = block.em_controller.forward(
-                        span_surprise_mean, em_usage, cand_novelty_mean
+                    write_mask, g_em, _p_write = block.em_neuromodulator.forward(
+                        span_surprise_mean,
+                        em_usage / config.budget_em,
+                        cand_novelty_mean,
                     )
                     block.em.write_at_boundary(
                         stacked_K, stacked_V, stacked_score, write_mask, g_em,

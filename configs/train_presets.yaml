@@ -1,0 +1,52 @@
+default_preset: phase_a_to_d
+
+defaults:
+  output_root: outputs
+  tokenizer: tinyllama
+  tier: a
+  bs: 32
+  lr: 0.0003
+  lr_min: 0.00001
+  warmup_steps: 1000
+  seed: 42
+  no_plots: false
+  resume: null
+  use_phase_default_steps: true
+
+presets:
+  phase_a_to_d:
+    run_name: phase_a_to_d
+    phases:
+      - phase: A
+        steps: 10000
+        resume: null
+      - phase: B
+        steps: 300000
+        resume: auto_previous
+      - phase: C
+        steps: 300000
+        resume: auto_previous
+      - phase: D
+        steps: 300000
+        resume: auto_previous
+
+  phase_d_from_ckpt:
+    run_name: phase_d_from_ckpt
+    phases:
+      - phase: D
+        steps: 300000
+        resume: checkpoints/manual_phase_c_last.pt
+
+  full_a_to_e:
+    run_name: full_a_to_e
+    phases:
+      - phase: A
+        resume: null
+      - phase: B
+        resume: auto_previous
+      - phase: C
+        resume: auto_previous
+      - phase: D
+        resume: auto_previous
+      - phase: E
+        resume: auto_previous

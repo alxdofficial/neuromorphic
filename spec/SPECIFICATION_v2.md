@@ -1,9 +1,9 @@
 ````markdown
 # Brain-Stack Neuromorphic LM — v2 Implementation Specification
 
-**Version:** 2.0  
-**Status:** Implementation Ready (MVP)  
-**Last Updated:** 2026-02-07
+**Version:** 2.5
+**Status:** Phases A–E implemented; three-mode neuromodulators (heuristic → continuous-learned → fully-learned); enhanced EM: always-write + RL on strength + learned novelty; phase-transition checkpoint safety; RL optimizer warmup; spatial decoder (hierarchical aggregation + deep cross-attention)
+**Last Updated:** 2026-02-08
 **Primary Constraint:** single RTX 4090 (24GB), mixed precision, persistent-stream TBPTT
 
 This v2 spec is designed to be handed directly to an implementation agent. It intentionally preserves the training-correctness and state semantics learned from v1.7, while adding Working Memory (WM) + Episodic Memory (EM) and making the core **scan-friendly** via an **affine recurrence** and **plasticity updates only at fixed boundaries**.
@@ -53,16 +53,16 @@ v2 decomposes memory into four parts:
 
 1) **Genetic memory (slow weights):** normal parameters trained by backprop. Frozen at deployment.
 2) **Working Memory (WM):** bounded sliding-window attention over the last `W` tokens (precise copying / binding). No post-training evolution. **One WM shared across the model.**
-3) **Procedural Memory (PM):** fast low-rank weights (`pm_K/pm_V/pm_a`) + differentiable eligibility. Updated via neuromodulated commits. **One PM per layer per block = B × L instances**, each with its own `PMController`.
-4) **Episodic Memory (EM):** fixed-size per-stream vector store (`em_K/em_V/em_S`). Retrieves **latent vectors** (not tokens). Written via neuromodulation. **One EM per block = B instances**, each with its own `EMController`.
+3) **Procedural Memory (PM):** fast low-rank weights (`pm_K/pm_V/pm_a`) + differentiable eligibility. Updated via neuromodulated commits. **One PM per layer per block = B × L instances**, each with its own `PMNeuromodulator`.
+4) **Episodic Memory (EM):** fixed-size per-stream vector store (`em_K/em_V/em_S`). Retrieves **latent vectors** (not tokens). Written via neuromodulation. **One EM per block = B instances**, each with its own `EMNeuromodulator`.
 
 ### 1.3 Memory Ownership Summary
 
-| Memory | Count | Controller | Scope |
-|--------|-------|------------|-------|
+| Memory | Count | Neuromodulator | Scope |
+|--------|-------|----------------|-------|
 | WM | 1 | None (standard attention) | Shared across model |
-| PM | B × L | `PMController` per instance | Per layer within each block |
-| EM | B | `EMController` per instance | Per block (shared across L layers in that block) |
+| PM | B × L | `PMNeuromodulator` per instance | Per layer within each block |
+| EM | B | `EMNeuromodulator` per instance | Per block (shared across L layers in that block) |
 
 ### 1.4 Scan-Friendliness via Plasticity Boundaries
 
@@ -85,10 +85,12 @@ At timestep `t`:
      - PM read: `y_pm = PM[b][ℓ].apply(x_block)` → `[BS, D_h]`
      - Recurrence: `h = a ⊙ h_prev + b` (a, b from input features)
      - Eligibility: `elig_K = ρ * elig_K + k_cand`, `elig_V = ρ * elig_V + v_cand`
-4) Merge: `logits = LMHead(concat(h^L for all blocks))` → `[BS, vocab]`
+4) **Output pathway** (two modes):
+   - **Simple** (`snapshot_enabled=False`): `logits = LMHead(concat(h^L for all blocks))` → `[BS, vocab]`
+   - **Spatial decoder** (`snapshot_enabled=True`): hierarchical aggregation of intermediate layer outputs + memory readouts, then deep cross-attention decoder → enhanced `h` → `LMHead` → `[BS, vocab]`. See §4.11.
 5) At plasticity boundaries (every P tokens):
-   - `EMController[b]` decides EM writes per block
-   - `PMController[b][ℓ]` decides PM commits per (block, layer)
+   - `EMNeuromodulator[b]` decides EM writes per block
+   - `PMNeuromodulator[b][ℓ]` decides PM commits per (block, layer)
 
 ---
 
@@ -175,7 +177,7 @@ All tiers fit comfortably on a 4090. Tier C leaves headroom for gradient checkpo
 **Note:** For a later optimized path, compute WM over each span `[BS, P, D]` using a block/windowed SDPA with prefix cache. MVP can be streaming per token.
 
 ### 4.3 Episodic Memory (EM) — per-block, per-stream bank
-**Key decision:** one EM bank per block (B total), each controlled by its own `EMController`. Each EM is shared across all L layers within its block.
+**Key decision:** one EM bank per block (B total), each controlled by its own `EMNeuromodulator`. Each EM is shared across all L layers within its block.
 
 #### 4.3.1 EM State (per block, per stream)
 Each of the B blocks has its own EM bank with tensors:
@@ -218,8 +220,9 @@ At each token, compute:
 - `k_cand = normalize(W_k_cand(concat(x, y_wm)))` → `[BS, D_em]`
 - `v_cand = W_v_cand(h_final)` → `[BS, D_em]`
   **Implementation choice:** use top layer merged representation `h_final` (MVP stable).
-- `novelty` → `[BS]` (heuristic novelty score), e.g.:
-  - `novelty = clamp(α * surprise + β * (1 - max_cos_sim(em_K, k_cand)), 0, 1)`
+- `novelty` → `[BS]` (novelty score):
+  - Heuristic (`em_enabled=False`): `novelty = clamp(0.5 * surprise + 0.5 * (1 - max_cos_sim(em_K, k_cand)), 0, 1)`
+  - Learned (`em_enabled=True`, Phase C+): `w_nov = sigmoid(W_nov(concat(x, y_wm)))`, then `novelty = clamp(w_nov * surprise + (1 - w_nov) * (1 - max_sim), 0, 1)`. `W_nov: nn.Linear(D + D, 1)` is on `EpisodicMemory`, trained by main loss backprop.
 
 Store candidates into a per-span buffer:
 - `cand_K: [BS, P, D_em]`
@@ -235,8 +238,8 @@ We update EM with "soft multi-slot commits" inspired by PM.
 
 Inputs at boundary:
 - candidate set `(K_C, V_C)` and scores
-- write decision `write_mask: [BS]` (from block's `EMController` or heuristic)
-- write strength `g_em: [BS, 1]`
+- write decision `write_mask: [BS]` (from block's `EMNeuromodulator`; always True in Phase D+ fully-learned mode; heuristic gate in Phase C continuous-learned mode)
+- write strength `g_em: [BS, 1]` (in [g_em_floor, g_em_ceil] when `em_enabled=True` (Phase C+); fixed 0.3 when `em_enabled=False`)
 - config: `k_write` slots to update per candidate, `τ_em`, `weakness_weight`
 
 For each candidate `c` (C is small, e.g. 8), do:
@@ -276,19 +279,90 @@ Same as v1.7:
 - `scores = pm_K @ x_q` → `[BS, r]`
 - `y_pm = (pm_a * scores) @ pm_V` → `[BS, D_h]`
 
-#### 4.4.3 Eligibility Update (differentiable)
-Same philosophy as v1.7:
-- keys from pre-synaptic (input-side), values from post-synaptic (state-side)
+#### 4.4.3 Eligibility Update (differentiable, neo-Hebbian)
+Follows the **neo-Hebbian three-factor learning rule**: `ΔW ∝ pre × post × neuromodulator`.
+
+- `k_cand = normalize(W_k_pre(x))` — pre-synaptic (input-side)
+- `v_cand = W_v_post(h)` — post-synaptic (state-side)
 - `elig_K = ρ * elig_K + k_cand` (differentiable)
 - `elig_V = ρ * elig_V + v_cand` (differentiable)
 - candidates computed with gradients through projection layers
+- The implicit outer product `v_cand ⊗ k_cand` is the Hebbian update; the neuromodulator (third factor) gates whether it is committed at span boundaries
 
 #### 4.4.4 PM Commit at span boundary (soft top-k EMA)
 Use v1.7 soft commit almost unchanged, but triggered only at span boundaries:
-- `PMController` outputs detached (λ, g, slot_logits)
+- `PMNeuromodulator` outputs: `commit_mask` detached (Phase D: from `gate_head`; Phases B–C: heuristic); `lambda_vals`, `g`, `slot_logits` retain grad when continuous heads exist (Phase B+)
 - Eligibility (`elig_K`, `elig_V`) not detached (gradients flow to projections)
 - per-stream `commit_mask` controls which streams update
 - decay/write applied only for commit streams
+
+### 4.11 Spatial Decoder (Hierarchical Aggregation + Deep Cross-Attention)
+
+**Toggle:** `snapshot_enabled` (config flag, independent of training phase). When `False`, the model uses the original path: `concat(h_blocks) → lm_head`. When `True`, intermediate layer outputs from all blocks feed through a three-level decoder.
+
+**Biological motivation:** NML blocks are analogous to cortical columns — each specializes in different patterns. Without the spatial decoder, only the top layer of each column reaches the LM head. The spatial decoder gives the decoder access to the full "column" of computation, with biologically-inspired hierarchical aggregation:
+
+#### Level 1: Columnar Attention (per block)
+
+Each block has L layers producing intermediate outputs `[BS, D_h]`. A learned summary query cross-attends to all L outputs (tagged with layer-position embeddings) to produce a single **column summary** per block.
+
+- Input: `[BS, L, D_h]` (L layer outputs within one block)
+- Output: `[BS, D_h]` (column summary)
+- One `ColumnarAttention` instance per block (B total)
+- Analogy: cortical column integrating across its laminar layers
+
+#### Level 2: Thalamic Integrator (across blocks + memory types)
+
+Integrates B column summaries with explicit memory readouts:
+
+| Input token | Shape | Source |
+|-------------|-------|--------|
+| B column summaries | `[BS, B, d_dec]` | Level 1 output, projected |
+| PM readout | `[BS, 1, d_dec]` | Strength-weighted PM slot average, projected |
+| EM readout | `[BS, 1, d_dec]` | Strength-weighted EM slot average, projected |
+| WM output | `[BS, 1, d_dec]` | WM step output, projected |
+
+Total: B+3 input tokens. Each tagged with type embeddings (cortical/PM/EM/WM) and block-position embeddings (cortical tokens only).
+
+K learned output queries cross-attend to these B+3 tokens, producing K **integrated memory tokens**.
+
+- Input: B+3 tokens at `d_dec`
+- Output: `[BS, K, d_dec]` (K = `thalamic_tokens`, default 4)
+- Analogy: thalamus binding cortical regions with memory systems
+
+#### Level 3: Deep Decoder
+
+Standard pre-norm transformer decoder layers. A single query token (projected from `h_final`) cross-attends to the K integrated memory tokens:
+
+```
+q = query_proj(h_final)     [BS, 1, d_dec]
+for each decoder layer:
+    q = self_attn(q) + q
+    q = cross_attn(q, memory) + q
+    q = FFN(q) + q
+context = output_proj(q)     [BS, D]
+h_decoded = h_final + context
+logits = lm_head(h_decoded)
+```
+
+- `decoder_layers` layers (default 2), each with self-attention + cross-attention + FFN
+- `output_proj` is **small-initialized** (`std=0.01`) so that at activation time the decoder initially contributes negligible noise (`h_decoded ≈ h_final`). Zero-init would block all gradient flow through the decoder (chain rule: `grad × 0 = 0`), preventing it from learning.
+- Analogy: language production area reading from organized memory
+
+#### Dimensions (Tier A)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `d_dec` | 256 | Decoder working dimension |
+| `n_heads_decoder` | 4 | Attention heads (all levels) |
+| `decoder_layers` | 2 | Depth of Level 3 decoder |
+| `thalamic_tokens` | 4 | Output tokens from Level 2 (K) |
+
+Parameter cost: ~3M new parameters on Tier A (~50M base). Compute: attention over 8, 7, and 4 tokens respectively — negligible.
+
+#### Gradient flow
+
+The spatial decoder creates a **shortcut gradient path** from the loss to all intermediate layer outputs, bypassing the serial GRU chain. This can significantly help training deep stacks (L=8+) by providing direct gradient signal to early layers.
 
 ---
 
@@ -333,38 +407,102 @@ Each `Layer` (within a block) computes:
 - Recurrence: `h = a ⊙ (carry * h_prev) + b` → `[BS, D_h]`
 - Output: `norm(W_o(h) + x_block)` → `[BS, D_h]`
 
-`W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. The model-level output simply concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds to `lm_head`.
+`W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. When `snapshot_enabled=False`, the model concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds directly to `lm_head`. When `snapshot_enabled=True`, intermediate layer outputs from all blocks feed through the spatial decoder (§4.11) before the LM head.
 
 ---
 
-## 6) Controllers (Neuromodulation)
+## 6) Neuromodulators (Gating / Neuromodulation)
 
-### 6.1 PMController (per layer per block, boundary-time)
-- One `PMController` per (block, layer) pair — B × L instances total.
-- Called only at span boundary with summary stats:
-  - `elig_norm`, `pm_usage = sum(pm_a)`, `span_surprise`
-- Outputs:
-  - `commit_mask: [BS]` — which streams commit (heuristic early, RL later)
-  - `lambda_vals: [BS]` — commit-time decay per stream (heuristic: `config.decay_pm`)
-  - `g: [BS]` — write strength per stream (heuristic: `0.5`)
-  - `slot_logits: [BS, r] or None` — slot selection bias (heuristic: `None`, uses similarity)
+Each neuromodulator operates in one of three modes, determined by whether its memory system is enabled and whether RL is active:
+- **Heuristic mode** (memory system disabled): threshold-based decisions with fixed defaults. No MLP heads created, zero parameters.
+- **Continuous-learned mode** (memory system enabled, `rl_enabled=False`): MLP backbone + continuous heads, trained via main loss backprop (main optimizer). Heuristic gate preserved. PM: Phase B+. EM: Phase C+.
+- **Fully-learned mode** (memory system enabled, `rl_enabled=True`, Phase D+): MLP backbone + continuous heads + gate head (PM only). Gate trained via RL counterfactual rollouts; continuous outputs trained via main loss backprop. All neuromodulator params on RL optimizer. EM always writes (no gate).
 
-### 6.2 EMController (per block, boundary-time)
-- One `EMController` per block — B instances total.
+### 6.1 PMNeuromodulator (per layer per block, boundary-time)
+- One `PMNeuromodulator` per (block, layer) pair — B × L instances total.
+- Lives at `layer.pm_neuromodulator`.
+- Called only at span boundary with summary stats.
+
+**Inputs (3 features):**
+
+| Feature | Source | Range |
+|---------|--------|-------|
+| `elig_norm` | `pm.elig_K.norm().mean()` | ~0–5 |
+| `pm_usage` | `pm_a.sum() / budget_pm` | [0, 1] |
+| `span_surprise` | mean surprise over span | ~0–10 |
+
+**Outputs (5-element tuple):**
+
+| Output | Shape | Heuristic (Phase A) | Continuous-Learned (Phases B–C) | Fully-Learned (Phase D+) | Training |
+|--------|-------|--------------------|---------------------------------|--------------------------|----------|
+| `commit_mask` | `[BS]` | `elig_norm > 1.0` | `elig_norm > 1.0` (same heuristic) | `(p_commit > 0.5).detach()` | — |
+| `lambda_vals` | `[BS]` | `config.decay_pm` | sigmoid → scaled to `[decay_pm, 1.0]` | same | Main loss backprop |
+| `g` | `[BS]` | `0.5` | sigmoid | same | Main loss backprop |
+| `slot_logits` | `[BS, r]` or `None` | `None` | raw linear | same | Main loss backprop |
+| `p_commit` | `[BS]` or `None` | `None` | `None` | sigmoid | RL (BCE with counterfactual reward) |
+
+Backbone + continuous heads (`lambda_head`, `g_head`, `slot_head`) created when `pm_enabled=True` (Phase B+): `Linear(3, H) → ReLU → {lambda_head, g_head, slot_head}`. Gate head added when `rl_enabled=True` (Phase D+). `H = config.rl_controller_hidden` (default 32).
+
+### 6.2 EMNeuromodulator (per block, boundary-time)
+- One `EMNeuromodulator` per block — B instances total.
+- Lives at `block.em_neuromodulator`.
 - Called at span boundary for its block's EM bank.
 
-Inputs:
-- `span_surprise` (mean/max) from layers in this block
-- `em_usage = sum(em_S)` and saturation for this block's EM
-- candidate stats (top candidate novelty mean/max)
-- optional "event boundary" flags
+**Inputs (3 features):**
 
-Outputs (MVP):
-- `write_mask: [BS]` — which streams write
-- `g_em: [BS]` — write strength per stream
-- (optional) budget/decay adjustments
+| Feature | Source | Range |
+|---------|--------|-------|
+| `span_surprise` | mean surprise over span | ~0–10 |
+| `em_usage` | `em_S.sum() / budget_em` | [0, 1] |
+| `cand_novelty_mean` | mean candidate novelty | ~0–1 |
 
-**Ownership is unambiguous:** each block's `EMController` controls exactly one EM bank.
+**Outputs (3-element tuple):**
+
+| Output | Shape | Heuristic (Phases A–B) | Continuous-Learned (Phase C) | Fully-Learned (Phase D+) | Training |
+|--------|-------|----------------------|------------------------------|--------------------------|----------|
+| `write_mask` | `[BS]` | `cand_novelty_mean > 0.3` | `cand_novelty_mean > 0.3` (same heuristic) | always True | — |
+| `g_em` | `[BS]` | `0.3` | `floor + (ceil - floor) * sigmoid(raw)`, in [g_em_floor, g_em_ceil] | same formula, dual-trained | Main loss backprop (Phase C); + RL BCE (Phase D+) |
+| `p_write` | `[BS]` or `None` | `None` | `None` | `None` (removed) | — |
+
+Backbone + g_head created when `em_enabled=True` (Phase C+): `Linear(3, H) → ReLU → g_head`. No `gate_head` -- Phase D always writes. Phase C uses heuristic gate + learned g_em. Phase D adds RL counterfactual comparing baseline strength (g_em=0.3) vs the neuromod's chosen strength.
+
+### 6.3 Neuromodulator Training by Phase
+
+**Phases B–C (continuous-learned mode):** Continuous outputs (`lambda_vals`, `g`, `slot_logits`, `g_em`) are differentiable through PM/EM operations → trained by main loss backprop on the **main optimizer**. Neuromodulator params are NOT excluded from the main optimizer when `rl_enabled=False`.
+
+**Phase D+ (fully-learned mode):** Same continuous outputs receive main loss backprop gradients, but neuromodulator params are now on the **RL optimizer** (excluded from main optimizer). The main optimizer excludes neuromodulator params; gradients accumulate on the neuromodulator `.grad` tensors.
+
+**Gate/strength outputs** are trained via counterfactual rollouts at selected span boundaries:
+
+**PM (binary gate on p_commit) — deconfounded per-target:**
+1. Select top `rl_pm_targets_per_event` (default 1) PM controllers ranked by eligibility norm
+2. **For each target `(b_idx, l_idx)`:**
+   a. **Snapshot** state before commit/write via `save_runtime_state()` + deepcopy
+   b. **Rollout force_off**: restore snapshot, force target controller off (others run normally), run next P tokens → `loss_off`
+   c. **Rollout force_on**: restore snapshot, force target controller on with fixed defaults (others run normally), run next P tokens → `loss_on`
+   d. **Reward**: `reward = loss_off - loss_on` (positive = committing helped)
+   e. **Re-forward** target neuromodulator to get `p_commit` with grad
+   f. **BCE update**: label = `(reward > 0)`, weight = `|reward| * credit`
+   g. **Restore** real state and continue
+
+**EM (continuous strength on g_em) — deconfounded per-target:**
+1. Select top `rl_em_targets_per_event` (default 1) EM blocks ranked by candidate novelty
+2. **For each target block `b_idx`:**
+   a. **Snapshot** state (includes neuromod's chosen g_em)
+   b. **Rollout baseline**: restore snapshot, write at fixed default g_em=0.3 for target block (others run normally), run next P tokens → `loss_baseline`
+   c. **Rollout chosen**: restore snapshot, write at neuromod's chosen g_em for target block (others run normally), run next P tokens → `loss_chosen`
+   d. **Reward**: `reward = loss_baseline - loss_chosen` (positive = neuromod's strength was better)
+   e. **Re-forward** target neuromodulator to get g_em with grad, normalize to [0,1]
+   f. **Weighted MSE update**: `target_g = chosen_g` if reward > 0, else `baseline_g`. `loss = weighted_mean((g_em_norm - target_norm)^2)`, weight = `|reward| * credit`
+   g. **Restore** real state and continue
+
+Credit assignment is **deconfounded**: each rollout isolates one controller, so the reward directly reflects its contribution. Within an update, `credit` further weights by controller salience (PM: `elig_norm / max`; EM: `novelty / max`). Target selection controlled by `rl_pm_targets_per_event` and `rl_em_targets_per_event`.
+
+**Optimizer step (Phase D only)**: A single RL optimizer (Adam, `config.rl_lr`) steps once after both gradient sources (continuous + gate) contribute to `.grad`. Neuromodulator params are excluded from the main optimizer and from gradient clipping only when `rl_enabled=True`.
+
+**Phase transition checkpoint handling**: Model weights load with `strict=False` (new params init fresh). Optimizer state loading is skipped when a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled`/`rl_enabled` differ from current config), since parameter group sizes change across phases. The RL optimizer receives a linear LR warmup over `rl_warmup_steps` (default 500) to mitigate the cold Adam state on warm weights.
+
+**Ownership is unambiguous:** each block's `EMNeuromodulator` controls exactly one EM bank; each layer's `PMNeuromodulator` controls exactly one PM instance.
 
 ---
 
@@ -420,12 +558,12 @@ After each TBPTT segment:
 - WM state: `wm_K`, `wm_V`, `wm_valid`, `wm_ptr` (1 shared WM)
 - Per block b (B total):
   - EM state: `em_K[b]`, `em_V[b]`, `em_S[b]`
-  - `EMController[b]`
+  - `EMNeuromodulator[b]`
   - Per layer ℓ (L total):
     - PM state: `pm_K[b][ℓ]`, `pm_V[b][ℓ]`, `pm_a[b][ℓ]`
     - Eligibility: `elig_K[b][ℓ]`, `elig_V[b][ℓ]`
     - Recurrent: `h[b][ℓ]`
-    - `PMController[b][ℓ]`
+    - `PMNeuromodulator[b][ℓ]`
 
 ### 8.2 Training step over one TBPTT segment
 **Inputs:**
@@ -516,7 +654,7 @@ for span_start in range(0, T, P):
             pos = arange(P).unsqueeze(0)                   # [1, P]
             cand_valid = (pos >= span_last_reset.unsqueeze(1)) & stacked_valid.bool()
 
-            write_mask, g_em = block.em_controller(
+            write_mask, g_em, _ = block.em_neuromodulator(
                 span_surprise_mean, em_usage, cand_novelty_mean
             )
             block.em.write_at_boundary(
@@ -547,24 +685,35 @@ model.detach_states()  # TBPTT boundary
 * Disable EM retrieval/writes.
   Goal: perplexity decreases; stable streaming.
 
-### Phase B — Enable PM (heuristic commits at boundaries)
+### Phase B — Enable PM + learned continuous heads
 
 * Enable PM reads always.
 * Eligibility accumulates per token.
-* Commit every P tokens using heuristic (or threshold on elig_norm).
-  Goal: memory bench improvement; stable budgets.
+* Commit every P tokens using heuristic gate (`elig_norm > 1.0`).
+* `PMNeuromodulator` creates backbone + continuous heads (`lambda_head`, `g_head`, `slot_head`) → trained via main loss backprop on main optimizer. Heuristic commit gate preserved; learned continuous outputs control commit strength/decay/slot selection.
+  Goal: memory bench improvement; stable budgets; learned commit parameters.
 
-### Phase C — Add EM retrieval + heuristic writes
+### Phase C — Add EM retrieval + learned continuous heads
 
 * Enable EM retrieve (fixed k_ret).
-* Write at boundaries when surprise spikes + novelty high.
-  Goal: explicit recall improvements at long delays.
+* Write at boundaries when surprise spikes + novelty high (heuristic gate).
+* `EMNeuromodulator` creates backbone + g_head → learned `g_em` on main optimizer (heuristic write gate preserved).
+* `EpisodicMemory.W_nov`: learned novelty adjuster (`nn.Linear(D+D, 1)`) replaces hardcoded 0.5/0.5 weighting; main optimizer.
+  Goal: explicit recall improvements at long delays; learned write strength + novelty weighting.
 
-### Phase D — Learn gating via RL (optional next step)
+### Phase D — RL counterfactual training (implemented)
 
-* Train `p_commit_pm` and `p_write_em` (boundary-time policies).
-* Keep λ/g/slot defaults initially.
-  Reward: future loss delta − memory/drift penalties.
+* `config.rl_enabled = True` (set by `config.set_phase("D")`)
+* `PMNeuromodulator` adds `gate_head` — `p_commit` trained via counterfactual rollouts (GRPO-style):
+  - At selected span boundaries (`rl_events_per_chunk` per T-token chunk), snapshot state
+  - Run force_off vs force_on rollouts over the next P tokens
+  - Reward = `loss_off - loss_on`; BCE update with credit weighting
+* EM switches to always-write (no binary gate); `g_em` trained via deconfounded RL counterfactual (baseline g_em=0.3 vs neuromod's chosen g_em); weighted MSE regressing toward the better-performing strength
+* All neuromodulator params move from main optimizer to separate RL optimizer (Adam, `config.rl_lr`)
+* PM continuous outputs (`lambda_vals`, `g`, `slot_logits`) still receive main loss backprop gradients (which accumulate on RL optimizer params)
+* EM `g_em` dual-trained: main loss backprop (through write → retrieve → loss) + RL counterfactual (weighted MSE on normalized g_em toward the better-performing strength)
+* `W_nov` stays on main optimizer (not a neuromodulator param)
+* All 36 neuromodulator instances (32 PM + 4 EM) are `nn.Module` submodules → automatically in `state_dict()`
 
 ### Phase E — Lifelong learning (persistent cross-document memory)
 
@@ -605,14 +754,14 @@ model.detach_states()  # TBPTT boundary
 
 ## 11) Ownership and "Who Controls What?" (Final Answer)
 
-* **PM (Procedural Memory):** B × L instances, each controlled by its own `PMController`. Each PM belongs to one specific (block, layer) pair.
-* **EM (Episodic Memory):** B instances, each controlled by its own `EMController`. Each EM belongs to one block and is shared across all L layers in that block.
-* **WM (Working Memory):** No controller (standard attention + cached state, not plastic). One WM shared across the model.
+* **PM (Procedural Memory):** B × L instances, each controlled by its own `PMNeuromodulator`. Each PM belongs to one specific (block, layer) pair.
+* **EM (Episodic Memory):** B instances, each controlled by its own `EMNeuromodulator`. Each EM belongs to one block and is shared across all L layers in that block.
+* **WM (Working Memory):** No neuromodulator (standard attention + cached state, not plastic). One WM shared across the model.
 
-| Component | Count | Controller | Ownership |
-|-----------|-------|------------|-----------|
-| PM | B × L | `PMController[b][ℓ]` | Per (block, layer) |
-| EM | B | `EMController[b]` | Per block |
+| Component | Count | Neuromodulator | Ownership |
+|-----------|-------|----------------|-----------|
+| PM | B × L | `PMNeuromodulator[b][ℓ]` (at `layer.pm_neuromodulator`) | Per (block, layer) |
+| EM | B | `EMNeuromodulator[b]` (at `block.em_neuromodulator`) | Per block |
 | WM | 1 | None | Shared |
 
 This resolves ambiguity by construction.
@@ -628,25 +777,36 @@ This resolves ambiguity by construction.
   * `lm_head: nn.Linear(D, vocab, bias=False)` (optionally tied)
   * `wm: WorkingMemory` (1 instance, shared)
   * `blocks: nn.ModuleList[Block]` (B blocks)
+  * `spatial_decoder: SpatialDecoder` (if `snapshot_enabled`, else `None`)
   * `surprise: Tensor[BS, 1]` (runtime state)
   * `forward_one_token(input_id, reset_mask) → (logits, x_emb, y_wm)` or `(logits, x_emb, y_wm, stats)` when `collect=True`
-  * `commit_at_boundary(force_mode="normal", span_surprise=None)` — triggers PM commits with actual span surprise; supports `"force_on"` / `"force_off"` for RL rollouts
+  * `commit_at_boundary(force_mode="normal", span_surprise=None)` — triggers PM commits with actual span surprise; supports `"force_on"` / `"force_off"` for PM RL rollouts
   * `reset_at_doc_boundary(mask: Tensor[BS])`
   * `detach_states()`
   * State persistence via `state.save_runtime_state(model)` / `state.load_runtime_state(model, state)`
+
+### Spatial Decoder (when `snapshot_enabled=True`)
+
+* `SpatialDecoder`
+  * `columnar: nn.ModuleList[ColumnarAttention]` (B instances)
+  * `thalamic: ThalamicIntegrator` (cross-block + memory integration)
+  * `decoder_blocks: nn.ModuleList[DecoderBlock]` (decoder_layers instances)
+  * `output_proj: nn.Linear(d_dec, D, bias=False)` — small-initialized (`std=0.01`)
+  * `forward(block_layer_outputs, pm_summary, em_summary, wm_output, h_final) → h_decoded: [BS, D]`
 
 ### Block
 
 * `Block` (B instances)
   * `layers: nn.ModuleList[Layer]` (L layers per block)
   * `em: EpisodicMemory` (1 per block)
-  * `em_controller: EMController` (1 per block)
+  * `em_neuromodulator: EMNeuromodulator` (1 per block)
+  * `step(..., return_layers=False)` — when `return_layers=True`, also returns `[BS, L, D_h]` stacked layer outputs
 
 ### Layer
 
 * `Layer` (B × L instances)
   * `pm: ProceduralMemory`
-  * `pm_controller: PMController`
+  * `pm_neuromodulator: PMNeuromodulator`
   * `h: Tensor[BS, D_h]` (recurrent state)
   * `gate_a: nn.Linear`, `gate_b: nn.Linear` (scan-friendly recurrence)
 
@@ -667,8 +827,11 @@ This resolves ambiguity by construction.
   * `write_at_boundary(cand_K, cand_V, cand_score, write_mask, g_em, cand_valid=None)` — `cand_valid: [BS, P]` masks out pre-reset and EOT candidates
   * `reset_states(mask)` — overrides StateMixin: only zeros `em_S` (preserves `em_K`, `em_V`)
 
-* `EMController` (B instances)
-  * `forward(span_surprise, em_usage, cand_novelty_mean) → (write_mask, g_em)`
+* `EMNeuromodulator` (B instances)
+  * `forward(span_surprise, em_usage, cand_novelty_mean) → (write_mask, g_em, p_write=None)`
+  * Heuristic mode (`em_enabled=False`): threshold-based write_mask, fixed g_em=0.3
+  * Continuous-learned mode (`em_enabled=True`, `rl_enabled=False`): MLP backbone + g_head, heuristic write gate, learned g_em in [g_em_floor, g_em_ceil] (main optimizer)
+  * Fully-learned mode (`em_enabled=True`, `rl_enabled=True`): same MLP, always writes, g_em dual-trained (RL optimizer)
 
 ### Procedural Memory
 
@@ -682,8 +845,11 @@ This resolves ambiguity by construction.
   * `reset_eligibility(mask)` — zero only `elig_K/elig_V` for masked streams (Phase E soft reset)
   * `commit(commit_mask, lambda_vals, g, slot_logits)` — soft top-k EMA update for committing streams
 
-* `PMController` (B × L instances)
-  * `forward(elig_norm, pm_usage, span_surprise) → (commit_mask, lambda_vals, g, slot_logits)`
+* `PMNeuromodulator` (B × L instances)
+  * `forward(elig_norm, pm_usage, span_surprise) → (commit_mask, lambda_vals, g, slot_logits, p_commit)`
+  * Heuristic mode (`pm_enabled=False`): threshold-based, `slot_logits=None`, `p_commit=None`, zero params
+  * Continuous-learned mode (`pm_enabled=True`, `rl_enabled=False`): MLP backbone + lambda/g/slot heads, heuristic gate (main optimizer)
+  * Fully-learned mode (`pm_enabled=True`, `rl_enabled=True`): + gate_head for RL-trained commit gate (RL optimizer)
 
 ### Training
 
@@ -694,6 +860,14 @@ This resolves ambiguity by construction.
   * loss masking at EOT inputs (phases A–C)
   * online loss accumulation via `online_cross_entropy()` (in `training/loss.py`)
   * regularization via `compute_regularizers(model)` (free function in `training/loss.py`)
+  * Phase D: `BoundarySnapshot` capture at selected span boundaries
+  * Phase D: `_rl_step()` with counterfactual rollouts (`_rollout_span`)
+  * Phase D: `_update_pm_neuromodulators()` / `_update_em_neuromodulators()` for PM gate BCE + EM weighted-MSE updates
+  * Phase D: separate RL optimizer for neuromodulator params (excluded from main optimizer + grad clipping). In Phases B–C, neuromodulator params are on the main optimizer.
+
+* `NeuromorphicLM` also provides:
+  * `rl_parameters()` — yields all params with `"neuromodulator"` in name (for RL optimizer separation)
+  * `commit_at_boundary(force_mode, span_surprise)` — supports `"force_on"` / `"force_off"` for RL rollouts
 
 ---
 
@@ -725,6 +899,8 @@ em:
   S_max: 3.0                # max strength per slot
   budget: 8.0               # sum(em_S) budget per stream
   decay: 0.999              # per-span strength decay
+  g_em_floor: 0.001         # minimum write strength (near-zero = soft "don't write")
+  g_em_ceil: 0.95           # maximum write strength (learned mode)
 
 # === Procedural Memory (per layer per block) ===
 pm:
@@ -745,6 +921,14 @@ training:
   precision: bf16           # bf16 for forward/backward, fp32 for state
   reset_on_doc_boundary: true
   lifelong_mode: false        # Phase E: PM/EM persist across doc boundaries
+  rl_enabled: false           # Phase D: learned neuromodulators
+  rl_controller_hidden: 32    # MLP hidden size for neuromodulators
+  rl_lr: 1.0e-3              # RL optimizer learning rate
+  rl_events_per_chunk: 2      # counterfactual rollouts per T-token chunk
+  rl_pm_targets_per_event: 1  # PM controllers counterfactually trained per event
+  rl_em_targets_per_event: 1  # EM controllers counterfactually trained per event
+  rl_memory_penalty: 0.0      # penalty per commit/write (future use)
+  rl_warmup_steps: 500        # LR warmup for RL optimizer after phase transition
   eot_id: 50256             # GPT-2 <|endoftext|>
   lr: 3.0e-4                # peak learning rate
   lr_min: 1.0e-5            # cosine decay target
@@ -768,7 +952,7 @@ training:
 3. **Episodic Memory (EM) added**:
    * One EM bank per block (B total), each per-stream
    * Fixed `k_ret` latent memory tokens → cross-attention aggregation
-   * Per-block `EMController` owns writes
+   * Per-block `EMNeuromodulator` owns writes
 
 4. **Working Memory (WM) added**:
    * Bounded sliding-window attention (W tokens)
@@ -778,11 +962,24 @@ training:
    * `pm_K/pm_V/pm_a` for PM state, `elig_K/elig_V` for eligibility
    * `em_K/em_V/em_S` for EM state
    * `wm_K/wm_V` for WM cache
-   * `PMController` and `EMController` for neuromodulators
+   * `PMNeuromodulator` and `EMNeuromodulator` for gating (renamed from `PMController`/`EMController` in Phase D)
 
 6. **Scaling tiers defined** (A/B/C) for 4090 training:
    * Tier B (~150M) recommended for competitive results
    * bf16 mixed precision throughout
+
+7. **Phase D neuromodulators** (implemented):
+   * Three-mode architecture: heuristic (memory disabled) → continuous-learned (Phase B/C, main optimizer) → fully-learned (Phase D+, RL optimizer)
+   * Backbone + continuous heads created when memory system enabled; gate head added only for RL
+   * Gate outputs trained via RL counterfactual rollouts (Phase D+)
+   * Continuous outputs trained via main loss backprop (starting Phase B/C)
+   * Separate RL optimizer; ~16,500 additional params (~0.04% of Tier A)
+
+8. **Spatial decoder** (implemented):
+   * Three-level hierarchical aggregation: columnar attention (per-block, across L layers) → thalamic integrator (across blocks + memory types) → deep cross-attention decoder
+   * `snapshot_enabled` toggle — independent of training phase, `output_proj` small-initialized (`std=0.01`) for near-identity startup with gradient flow
+   * ~3M additional params on Tier A (~6%), negligible compute (attention over 8, 7, and 4 tokens)
+   * Creates shortcut gradient path from loss to intermediate layer outputs
 
 ---
 

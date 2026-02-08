@@ -183,38 +183,91 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.elig_V = self.elig_V * (1.0 - reset_3d)
 
 
-class PMController(nn.Module):
-    """Heuristic commit decisions based on eligibility norm + surprise.
+class PMNeuromodulator(nn.Module):
+    """Neuromodulator for PM commit decisions.
 
-    MVP: commits if eligibility norm exceeds a threshold. Returns full
-    (commit_mask, lambda, g, slot_logits) tuple with heuristic defaults.
-    Future Phase D will use RL-based controllers.
+    Phase A (pm_enabled=False): empty shell, no parameters.
+    Phases B–C (pm_enabled=True, rl_enabled=False): learned continuous heads
+        (lambda, g, slot_logits) trained via main optimizer backprop,
+        with heuristic commit gate (elig_norm > threshold).
+    Phase D+ (pm_enabled=True, rl_enabled=True): full learned MLP —
+        adds gate_head trained via RL counterfactual.
+
+    Returns:
+        commit_mask: [BS] bool
+        lambda_vals: [BS]
+        g: [BS]
+        slot_logits: [BS, r] or None
+        p_commit: [BS] or None (only when rl_enabled)
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.threshold = 1.0  # heuristic threshold on eligibility norm
+        self.rl_enabled = config.rl_enabled
+        self.pm_enabled = config.pm_enabled
+        self.threshold = 1.0
         self.default_g = 0.5
         self.default_decay = config.decay_pm
 
+        # Backbone + continuous heads: created when PM is enabled (Phase B+)
+        if self.pm_enabled:
+            H = config.rl_controller_hidden
+            self.backbone = nn.Sequential(
+                nn.Linear(3, H),
+                nn.ReLU(),
+            )
+            self.lambda_head = nn.Linear(H, 1)
+            self.g_head = nn.Linear(H, 1)
+            self.slot_head = nn.Linear(H, config.r)
+
+            # Gate head: only created for RL (Phase D+)
+            if self.rl_enabled:
+                self.gate_head = nn.Linear(H, 1)
+
     def forward(self, elig_norm: Tensor, pm_usage: Tensor,
                 span_surprise: Tensor) -> tuple:
-        """Decide which streams should commit and with what parameters.
+        if self.pm_enabled:
+            if self.rl_enabled:
+                return self._forward_learned(elig_norm, pm_usage, span_surprise)
+            return self._forward_continuous(elig_norm, pm_usage, span_surprise)
+        return self._forward_heuristic(elig_norm, pm_usage, span_surprise)
 
-        Args:
-            elig_norm: [BS] — L2 norm of eligibility traces
-            pm_usage: [BS] — sum of pm_a (current usage)
-            span_surprise: [BS] — mean surprise over span
-
-        Returns:
-            commit_mask: [BS] bool — which streams commit
-            lambda_vals: [BS] — per-stream commit decay (heuristic: config.decay_pm)
-            g: [BS] — per-stream write strength (heuristic: 0.5)
-            slot_logits: None — slot selection deferred to commit() similarity
-        """
+    def _forward_heuristic(self, elig_norm, pm_usage, span_surprise):
+        """Heuristic mode — no learnable params (Phase A fallback)."""
         BS = elig_norm.shape[0]
         commit_mask = elig_norm > self.threshold
         lambda_vals = torch.full((BS,), self.default_decay,
                                  device=elig_norm.device)
         g = torch.full((BS,), self.default_g, device=elig_norm.device)
-        return commit_mask, lambda_vals, g, None
+        return commit_mask, lambda_vals, g, None, None
+
+    def _forward_continuous(self, elig_norm, pm_usage, span_surprise):
+        """Heuristic gate + learned continuous heads (Phases B–C)."""
+        commit_mask = elig_norm > self.threshold
+
+        features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)
+        h = self.backbone(features)
+
+        raw_lambda = torch.sigmoid(self.lambda_head(h)).squeeze(-1)
+        lambda_vals = self.default_decay + (1.0 - self.default_decay) * raw_lambda
+
+        g = torch.sigmoid(self.g_head(h)).squeeze(-1)
+        slot_logits = self.slot_head(h)
+
+        return commit_mask, lambda_vals, g, slot_logits, None
+
+    def _forward_learned(self, elig_norm, pm_usage, span_surprise):
+        """Full learned mode — gate + continuous heads (Phase D+)."""
+        features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)
+        h = self.backbone(features)
+
+        p_commit = torch.sigmoid(self.gate_head(h)).squeeze(-1)
+        commit_mask = (p_commit > 0.5).detach()
+
+        raw_lambda = torch.sigmoid(self.lambda_head(h)).squeeze(-1)
+        lambda_vals = self.default_decay + (1.0 - self.default_decay) * raw_lambda
+
+        g = torch.sigmoid(self.g_head(h)).squeeze(-1)
+        slot_logits = self.slot_head(h)
+
+        return commit_mask, lambda_vals, g, slot_logits, p_commit

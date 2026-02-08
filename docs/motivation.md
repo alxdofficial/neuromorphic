@@ -163,7 +163,7 @@ The goal is to show a compelling "new capability" story:
 3) With EM enabled, it can:
    - remember session facts explicitly,
    - retrieve relevant past experiences at long delays.
-4) With RL-trained controllers (`PMController` and `EMController`), it commits/writes more intelligently than heuristics.
+4) With RL-trained controllers (`PMNeuromodulator` and `EMNeuromodulator`), it commits/writes more intelligently than heuristics.
 5) All of this happens without destabilizing core competence.
 
 This is the investor-facing proof:
