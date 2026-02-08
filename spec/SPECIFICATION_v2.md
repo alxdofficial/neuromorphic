@@ -131,19 +131,25 @@ All tiers fit comfortably on a 4090. Tier C leaves headroom for gradient checkpo
 - `vocab` — vocabulary size (GPT-2 50257 recommended; `vocab_size` and `eot_id` set from chosen tokenizer at runtime)
 
 **Procedural Memory (PM):**
-- `r = 8` — slots per PM instance (B × L = 72 instances total)
+- `r = 16` — slots per PM instance (B × L = 72 instances total)
 - `ρ = 0.95` — eligibility decay
 
 **Working Memory (WM):**
-- `W = 256` — sliding window size (tokens)
-- `D_wm = 128` — WM key/value dimension
-- `n_heads_wm = 4` — attention heads
+- `W = 512` — sliding window size (tokens)
+- `D_wm = 192` — WM key/value dimension
+- `n_heads_wm = 6` — attention heads
 
 **Episodic Memory (EM):**
-- `M = 256` — capacity per EM bank (B = 6 banks total)
-- `D_em = 128` — EM key/value dimension
-- `k_ret = 4` — retrieval count
-- `C = 8` — candidates per span
+- `M = 512` — capacity per EM bank (B = 6 banks total)
+- `D_em = 192` — EM key/value dimension
+- `k_ret = 8` — retrieval count
+- `C = 16` — candidates per span
+
+**Spatial Decoder (Tier B):**
+- `d_dec = 384` — decoder working dimension
+- `n_heads_decoder = 6` — attention heads
+
+Memory capacities scale with tier. Tier A uses smaller defaults (r=8, W=256, M=256) for rapid iteration. Tier C doubles again (r=32, W=1024, M=1024) for maximum capacity.
 
 **Training:**
 - `P = 32` — plasticity span (tokens)
@@ -210,10 +216,13 @@ Initialize (per block):
 **Return format:**
 - Return `mem_tokens = V_top` as **k_ret latent "memory tokens"**.
 - Aggregate into one vector with a single-query cross-attention:
-  - `y_em = CrossAttn(query=W_q(x), keys=mem_tokens, values=mem_tokens)`
-  - output `y_em` projected to `D` → `[BS, D]`
+  - `out = CrossAttn(query=W_q(x), keys=mem_tokens, values=mem_tokens)` → `[BS, D_em]`
+  - Post-retrieval FFN: `out = out + FFN(LayerNorm(out))` (pre-norm residual, GELU, 4× expansion)
+  - `y_em = W_o_cross(out)` → `[BS, D]`
 
-This "return k tokens + cross-attend" avoids forcing premature averaging and preserves multi-item recall.
+The readout FFN (controlled by `em_readout_ffn`, default `True`) adds nonlinear processing after cross-attention aggregation, allowing the model to reason about what it retrieved before injecting into the recurrence.
+
+This "return k tokens + cross-attend + process" avoids forcing premature averaging and preserves multi-item recall.
 
 #### 4.3.3 EM Candidate Proposals (computed per token, written at boundaries)
 At each token, compute:
@@ -274,10 +283,13 @@ Per block b and layer ℓ (B × L instances total):
 - `h: [BS, D_h]` (core recurrent state)
 
 #### 4.4.2 PM Apply (read-only within span)
-Same as v1.7:
+Same as v1.7 linear lookup, followed by a post-readout FFN:
 - `x_q = normalize(x_block)` → `[BS, D_h]`
 - `scores = pm_K @ x_q` → `[BS, r]`
-- `y_pm = (pm_a * scores) @ pm_V` → `[BS, D_h]`
+- `y_raw = (pm_a * scores) @ pm_V` → `[BS, D_h]`
+- `y_pm = y_raw + FFN(LayerNorm(y_raw))` → `[BS, D_h]` (pre-norm residual, GELU, 4× expansion)
+
+The readout FFN adds nonlinear processing capacity to the linear key-value lookup, allowing the model to transform retrieved procedural knowledge before injecting it into the recurrence. Controlled by `pm_readout_ffn` (default `True`).
 
 #### 4.4.3 Eligibility Update (differentiable, neo-Hebbian)
 Follows the **neo-Hebbian three-factor learning rule**: `ΔW ∝ pre × post × neuromodulator`.
@@ -304,11 +316,14 @@ Use v1.7 soft commit almost unchanged, but triggered only at span boundaries:
 
 #### Level 1: Columnar Attention (per block)
 
-Each block has L layers producing intermediate outputs `[BS, D_h]`. A learned summary query cross-attends to all L outputs (tagged with layer-position embeddings) to produce a single **column summary** per block.
+Each block has L layers producing intermediate outputs `[BS, D_h]`. A learned summary query iteratively cross-attends to all L outputs (tagged with layer-position embeddings) through `columnar_layers` (default 2) refinement layers, producing a single **column summary** per block.
+
+Each refinement layer: pre-norm cross-attention + pre-norm FFN (4× expansion, GELU).
 
 - Input: `[BS, L, D_h]` (L layer outputs within one block)
 - Output: `[BS, D_h]` (column summary)
 - One `ColumnarAttention` instance per block (B total)
+- Depth: `columnar_layers` attention+FFN layers per block (default 2)
 - Analogy: cortical column integrating across its laminar layers
 
 #### Level 2: Thalamic Integrator (across blocks + memory types)
@@ -324,10 +339,13 @@ Integrates B column summaries with explicit memory readouts:
 
 Total: B+3 input tokens. Each tagged with type embeddings (cortical/PM/EM/WM) and block-position embeddings (cortical tokens only).
 
-K learned output queries cross-attend to these B+3 tokens, producing K **integrated memory tokens**.
+K learned output queries iteratively cross-attend to these B+3 tokens through `thalamic_layers` (default 2) refinement layers, producing K **integrated memory tokens**.
+
+Each refinement layer: pre-norm cross-attention + pre-norm FFN (4× expansion, GELU).
 
 - Input: B+3 tokens at `d_dec`
 - Output: `[BS, K, d_dec]` (K = `thalamic_tokens`, default 4)
+- Depth: `thalamic_layers` attention+FFN layers (default 2)
 - Analogy: thalamus binding cortical regions with memory systems
 
 #### Level 3: Deep Decoder
@@ -356,9 +374,11 @@ logits = lm_head(h_decoded)
 | `d_dec` | 256 | Decoder working dimension |
 | `n_heads_decoder` | 4 | Attention heads (all levels) |
 | `decoder_layers` | 2 | Depth of Level 3 decoder |
+| `columnar_layers` | 2 | Depth of Level 1 columnar attention |
+| `thalamic_layers` | 2 | Depth of Level 2 thalamic integrator |
 | `thalamic_tokens` | 4 | Output tokens from Level 2 (K) |
 
-Parameter cost: ~3M new parameters on Tier A (~50M base). Compute: attention over 8, 7, and 4 tokens respectively — negligible.
+Parameter cost: ~6M new parameters on Tier A (~50M base). Compute: attention over 8, 7, and 4 tokens respectively — negligible per layer. Tier B scales `d_dec=384, n_heads_decoder=6`; Tier C scales `d_dec=512, n_heads_decoder=8, decoder_layers=3`.
 
 #### Gradient flow
 
@@ -405,7 +425,10 @@ Each `Layer` (within a block) computes:
 - Input fusion: `u = concat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])` → `[BS, D_in]`
 - Gates: `a = sigmoid(W_a u)`, `b = tanh(W_b u)` → `[BS, D_h]`
 - Recurrence: `h = a ⊙ (carry * h_prev) + b` → `[BS, D_h]`
-- Output: `norm(W_o(h) + x_block)` → `[BS, D_h]`
+- Output projection + residual: `out = norm(W_o(h) + x_block)` → `[BS, D_h]`
+- Post-recurrence FFN: `out = out + FFN(LayerNorm(out))` → `[BS, D_h]` (pre-norm residual, GELU, `ffn_expansion`× expansion, default 4×; set `ffn_expansion=0` to disable)
+
+The recurrence mixes temporal information; the FFN adds per-position nonlinear processing depth. Without the FFN, each layer has limited capacity to transform what it retrieves from memory before passing it forward.
 
 `W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. When `snapshot_enabled=False`, the model concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds directly to `lm_head`. When `snapshot_enabled=True`, intermediate layer outputs from all blocks feed through the spatial decoder (§4.11) before the LM head.
 

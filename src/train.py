@@ -608,45 +608,39 @@ def run_phase(
             print(f"  Missing keys on resume: {len(incompat.missing_keys)}")
         if incompat.unexpected_keys:
             print(f"  Unexpected keys on resume: {len(incompat.unexpected_keys)}")
-        # Detect phase/architecture transition: optimizer param groups may have changed
+        # Detect phase/architecture transition: optimizer param groups may have changed.
+        # Check phase toggles, structural memory sizes, decoder config, and layer config.
         ckpt_config = ckpt.get("config")
-        _decoder_fields = ("snapshot_enabled", "d_dec", "decoder_layers",
-                           "thalamic_tokens", "n_heads_decoder")
-        _decoder_changed = (
-            ckpt_config is not None
-            and any(
-                getattr(ckpt_config, f, None) != getattr(config, f, None)
-                for f in _decoder_fields
-            )
+        _structural_fields = (
+            # Phase toggles
+            "pm_enabled", "em_enabled", "rl_enabled",
+            # Decoder architecture
+            "snapshot_enabled", "d_dec", "decoder_layers",
+            "thalamic_tokens", "n_heads_decoder",
+            "columnar_layers", "thalamic_layers",
+            # Layer structure
+            "ffn_expansion",
+            # Memory dimensions (tier-scaled)
+            "r", "M", "W", "D_wm", "D_em", "n_heads_wm",
+            "k_ret", "C_em", "k_write",
+            # Readout FFNs (add/remove parameters)
+            "pm_readout_ffn", "em_readout_ffn",
         )
-        phase_changed = (
-            ckpt_config is not None
-            and hasattr(ckpt_config, "pm_enabled")
-            and (ckpt_config.pm_enabled != config.pm_enabled
-                 or ckpt_config.em_enabled != config.em_enabled
-                 or ckpt_config.rl_enabled != config.rl_enabled
-                 or _decoder_changed)
-        )
+        _changed_fields = []
+        if ckpt_config is not None:
+            for f in _structural_fields:
+                old_val = getattr(ckpt_config, f, None)
+                new_val = getattr(config, f, None)
+                if old_val != new_val:
+                    _changed_fields.append(f)
+        phase_changed = len(_changed_fields) > 0
         if phase_changed:
-            print("  Phase/architecture transition detected — reinitializing optimizer state.")
-            if hasattr(ckpt_config, "wm_enabled"):
-                print(
-                    "  Transition:"
-                    f" wm {ckpt_config.wm_enabled}->{config.wm_enabled},"
-                    f" pm {ckpt_config.pm_enabled}->{config.pm_enabled},"
-                    f" em {ckpt_config.em_enabled}->{config.em_enabled},"
-                    f" rl {ckpt_config.rl_enabled}->{config.rl_enabled},"
-                    f" snapshot {getattr(ckpt_config, 'snapshot_enabled', False)}->{config.snapshot_enabled}"
-                )
-            if _decoder_changed:
-                print(
-                    "  Decoder config changed:"
-                    + "".join(
-                        f" {f} {getattr(ckpt_config, f, None)}->{getattr(config, f, None)},"
-                        for f in _decoder_fields
-                        if getattr(ckpt_config, f, None) != getattr(config, f, None)
-                    )
-                )
+            print("  Architecture transition detected — reinitializing optimizer state.")
+            print("  Changed fields:")
+            for f in _changed_fields:
+                old_val = getattr(ckpt_config, f, None)
+                new_val = getattr(config, f, None)
+                print(f"    {f}: {old_val} -> {new_val}")
         else:
             try:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -670,7 +664,10 @@ def run_phase(
             except (ValueError, KeyError):
                 print("  RL optimizer state incompatible; reinitializing.")
         if "runtime_state" in ckpt:
-            load_runtime_state(model, ckpt["runtime_state"])
+            if phase_changed:
+                print("  Skipping runtime state load (architecture transition — shapes may differ).")
+            else:
+                load_runtime_state(model, ckpt["runtime_state"])
         start_step = ckpt.get("step", 0)
     else:
         start_step = 0

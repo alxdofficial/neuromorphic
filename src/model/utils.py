@@ -107,7 +107,22 @@ class StateMixin:
         return {name: getattr(self, name, None) for name in self._state_tensor_names}
 
     def load_state_runtime(self, state: Dict[str, Optional[Tensor]]):
-        """Load runtime state from checkpoint."""
+        """Load runtime state from checkpoint.
+
+        Shape-safe: skips tensors whose shapes don't match the current
+        model's initialized state. This handles tier/config changes
+        (e.g. r=8 -> r=16) gracefully — mismatched state is discarded
+        and the model falls back to lazy re-initialization.
+        """
         for name, val in state.items():
-            if name in self._state_tensor_names:
+            if name not in self._state_tensor_names:
+                continue
+            current = getattr(self, name, None)
+            if val is None:
+                setattr(self, name, None)
+            elif current is not None and current.shape != val.shape:
+                # Shape mismatch — skip (will be re-initialized lazily)
+                print(f"  Runtime state shape mismatch for {type(self).__name__}.{name}: "
+                      f"checkpoint {list(val.shape)} vs model {list(current.shape)}, skipping.")
+            else:
                 setattr(self, name, val)

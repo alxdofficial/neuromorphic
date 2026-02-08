@@ -52,6 +52,18 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Learned novelty weight adjuster (Phase C+, backprop only)
         self.W_nov = nn.Linear(D + D, 1) if config.em_enabled else None
 
+        # Post-retrieval MLP: processes the aggregated retrieved memory
+        if config.em_readout_ffn:
+            self.readout_norm = nn.LayerNorm(config.D_em)
+            self.readout_ffn = nn.Sequential(
+                nn.Linear(config.D_em, config.D_em * 4),
+                nn.GELU(),
+                nn.Linear(config.D_em * 4, config.D_em),
+            )
+        else:
+            self.readout_norm = None
+            self.readout_ffn = None
+
         # State (lazily initialized)
         self.em_K: Tensor = None
         self.em_V: Tensor = None
@@ -125,6 +137,11 @@ class EpisodicMemory(nn.Module, StateMixin):
         attn = attn.nan_to_num(0.0)
 
         out = torch.einsum("bk, bkd -> bd", attn, V_top)  # [BS, D_em]
+
+        # Post-retrieval processing
+        if self.readout_ffn is not None:
+            out = out + self.readout_ffn(self.readout_norm(out))
+
         y_em = self.W_o_cross(out)  # [BS, D]
 
         return y_em

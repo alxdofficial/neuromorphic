@@ -15,6 +15,7 @@ class ModelConfig:
     D: int = 512              # model width
     L: int = 8                # layers per block
     B: int = 4                # parallel blocks
+    ffn_expansion: int = 4    # FFN expansion factor per layer (0 = no FFN)
     vocab_size: int = 32000   # set from tokenizer at runtime
     eot_id: int = 2           # set from tokenizer at runtime
 
@@ -32,6 +33,7 @@ class ModelConfig:
     commit_top_k: int = 2     # slots updated per commit
     tau_pm: float = 1.0       # softmax temperature
     weakness_weight_pm: float = 0.5  # bias toward weak slots
+    pm_readout_ffn: bool = True       # MLP after PM linear lookup
 
     # Episodic Memory (per block, B instances)
     M: int = 256              # EM capacity per bank
@@ -46,6 +48,7 @@ class ModelConfig:
     decay_em: float = 0.999   # per-span strength decay
     g_em_floor: float = 0.001  # minimum write strength (learned mode, near-zero = soft "don't write")
     g_em_ceil: float = 0.95    # maximum write strength (learned mode)
+    em_readout_ffn: bool = True       # MLP after EM cross-attention retrieval
 
     # Training
     T: int = 256              # TBPTT segment length
@@ -67,7 +70,9 @@ class ModelConfig:
     snapshot_enabled: bool = False  # architecture toggle (independent of phase)
     d_dec: int = 256               # decoder working dimension
     n_heads_decoder: int = 4       # attention heads in columnar/thalamic/decoder
-    decoder_layers: int = 2        # deep decoder depth
+    decoder_layers: int = 2        # deep decoder depth (Level 3)
+    columnar_layers: int = 2       # columnar attention depth (Level 1)
+    thalamic_layers: int = 2       # thalamic integrator depth (Level 2)
     thalamic_tokens: int = 4       # output tokens from thalamic integrator
 
     # Phase toggles
@@ -79,6 +84,36 @@ class ModelConfig:
     def D_h(self) -> int:
         """Per-block hidden dimension."""
         return self.D // self.B
+
+    def validate(self):
+        """Check config validity. Call before model construction.
+
+        Raises ValueError with clear messages for invalid combinations
+        that would otherwise cause opaque crashes deep in PyTorch.
+        """
+        if self.D % self.B != 0:
+            raise ValueError(
+                f"D ({self.D}) must be divisible by B ({self.B}) "
+                f"to compute D_h = D/B."
+            )
+        if self.snapshot_enabled:
+            if self.d_dec % self.n_heads_decoder != 0:
+                raise ValueError(
+                    f"d_dec ({self.d_dec}) must be divisible by "
+                    f"n_heads_decoder ({self.n_heads_decoder}) for "
+                    f"MultiheadAttention in the spatial decoder."
+                )
+            D_h = self.D // self.B
+            if D_h < self.n_heads_decoder:
+                raise ValueError(
+                    f"D_h ({D_h}) must be >= n_heads_decoder "
+                    f"({self.n_heads_decoder}) for columnar attention."
+                )
+        if self.D_wm % self.n_heads_wm != 0:
+            raise ValueError(
+                f"D_wm ({self.D_wm}) must be divisible by "
+                f"n_heads_wm ({self.n_heads_wm}) for WM attention."
+            )
 
     def set_phase(self, phase: str):
         """Set component toggles for training phase.
@@ -132,14 +167,28 @@ class ModelConfig:
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Competitive tier (~150M params). D=768, L=12, B=6."""
-        defaults = dict(D=768, L=12, B=6)
+        """Competitive tier. D=768, L=12, B=6. Scaled memory."""
+        defaults = dict(
+            D=768, L=12, B=6,
+            # Scaled memory capacities
+            r=16, W=512, D_wm=192, n_heads_wm=6,
+            M=512, D_em=192, k_ret=8, C_em=16, k_write=8,
+            # Scaled decoder
+            d_dec=384, n_heads_decoder=6,
+        )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
-        """Strong tier (~350M params). D=1024, L=24, B=8."""
-        defaults = dict(D=1024, L=24, B=8)
+        """Strong tier. D=1024, L=24, B=8. Scaled memory."""
+        defaults = dict(
+            D=1024, L=24, B=8,
+            # Scaled memory capacities
+            r=32, W=1024, D_wm=256, n_heads_wm=8,
+            M=1024, D_em=256, k_ret=16, C_em=32, k_write=16,
+            # Scaled decoder
+            d_dec=512, n_heads_decoder=8, decoder_layers=3,
+        )
         defaults.update(overrides)
         return cls(**defaults)

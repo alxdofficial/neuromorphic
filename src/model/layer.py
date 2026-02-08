@@ -1,8 +1,9 @@
 """
-Layer — scan-friendly recurrence with procedural memory.
+Layer — scan-friendly recurrence with procedural memory and FFN.
 
 One Layer per (block, layer). Contains the affine recurrence
-h_t = a_t * (carry * h_{t-1}) + b_t  and a PM instance.
+h_t = a_t * (carry * h_{t-1}) + b_t, a post-recurrence FFN for
+nonlinear per-position processing, and a PM instance.
 
 Gate inputs: concat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])
 giving input_dim = 4*D_h + 1.
@@ -42,6 +43,20 @@ class Layer(nn.Module, StateMixin):
         self.W_o = nn.Linear(D_h, D_h)
 
         self.norm = nn.LayerNorm(D_h)
+
+        # Post-recurrence FFN for nonlinear per-position processing.
+        # The recurrence mixes temporal info; the FFN adds reasoning depth.
+        if config.ffn_expansion > 0:
+            d_ff = D_h * config.ffn_expansion
+            self.ffn_norm = nn.LayerNorm(D_h)
+            self.ffn = nn.Sequential(
+                nn.Linear(D_h, d_ff),
+                nn.GELU(),
+                nn.Linear(d_ff, D_h),
+            )
+        else:
+            self.ffn_norm = None
+            self.ffn = None
 
         # Recurrent hidden state (lazily initialized)
         self.h: Tensor = None
@@ -85,6 +100,10 @@ class Layer(nn.Module, StateMixin):
 
         # Output projection + residual + LayerNorm (spec §7.4)
         output = self.norm(self.W_o(self.h) + x_block)
+
+        # Post-recurrence FFN (pre-norm residual)
+        if self.ffn is not None:
+            output = output + self.ffn(self.ffn_norm(output))
 
         if collect:
             stats = {

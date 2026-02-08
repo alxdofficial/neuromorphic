@@ -22,6 +22,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        config.validate()
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.D)

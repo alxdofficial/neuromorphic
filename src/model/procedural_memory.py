@@ -45,6 +45,18 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.W_k_pre = nn.Linear(D_h, D_h)
         self.W_v_post = nn.Linear(D_h, D_h)
 
+        # Post-readout MLP: processes the linear lookup result
+        if config.pm_readout_ffn:
+            self.readout_norm = nn.LayerNorm(D_h)
+            self.readout_ffn = nn.Sequential(
+                nn.Linear(D_h, D_h * 4),
+                nn.GELU(),
+                nn.Linear(D_h * 4, D_h),
+            )
+        else:
+            self.readout_norm = None
+            self.readout_ffn = None
+
         # State tensors (lazily initialized)
         self.pm_K: Tensor = None
         self.pm_V: Tensor = None
@@ -77,6 +89,11 @@ class ProceduralMemory(nn.Module, StateMixin):
         scores = torch.einsum("brd, bd -> br", self.pm_K, x_q)
         # y_pm = (pm_a * scores) @ pm_V -> [BS, D_h]
         y_pm = torch.einsum("br, brd -> bd", self.pm_a * scores, self.pm_V)
+
+        # Post-readout processing
+        if self.readout_ffn is not None:
+            y_pm = y_pm + self.readout_ffn(self.readout_norm(y_pm))
+
         return y_pm
 
     def update_eligibility(self, x: Tensor, h: Tensor):

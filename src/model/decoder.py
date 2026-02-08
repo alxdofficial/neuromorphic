@@ -35,22 +35,34 @@ class ColumnarAttention(nn.Module):
     """Summarize L layer outputs within a single block.
 
     A learned summary query cross-attends to all layer outputs (tagged with
-    layer-position embeddings).  Produces one column summary vector per block.
+    layer-position embeddings), refined through multiple layers.
+    Produces one column summary vector per block.
 
     Input:  layer_outputs [BS, L, D_h]
     Output: column_summary [BS, D_h]
     """
 
-    def __init__(self, D_h: int, L: int, n_heads: int):
+    def __init__(self, D_h: int, L: int, n_heads: int, n_layers: int = 1):
         super().__init__()
         self.L = L
         self.layer_emb = nn.Embedding(L, D_h)
         self.summary_query = nn.Parameter(torch.zeros(1, 1, D_h))
         nn.init.normal_(self.summary_query, std=0.02)
-        self.cross_attn = nn.MultiheadAttention(
-            D_h, n_heads, batch_first=True,
-        )
-        self.norm = nn.LayerNorm(D_h)
+
+        # Multi-layer refinement: each layer is cross-attn + FFN
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                "norm_ca": nn.LayerNorm(D_h),
+                "cross_attn": nn.MultiheadAttention(D_h, n_heads, batch_first=True),
+                "norm_ff": nn.LayerNorm(D_h),
+                "ffn": nn.Sequential(
+                    nn.Linear(D_h, D_h * 4),
+                    nn.GELU(),
+                    nn.Linear(D_h * 4, D_h),
+                ),
+            }))
+        self.final_norm = nn.LayerNorm(D_h)
 
     def forward(self, layer_outputs: Tensor) -> Tensor:
         """
@@ -64,11 +76,17 @@ class ColumnarAttention(nn.Module):
         pos = self.layer_emb(torch.arange(self.L, device=device))  # [L, D_h]
         kv = layer_outputs + pos.unsqueeze(0)  # [BS, L, D_h]
 
-        # Learned query cross-attends to all layers
+        # Iteratively refine the summary query
         q = self.summary_query.expand(BS, -1, -1)  # [BS, 1, D_h]
-        summary, _ = self.cross_attn(q, kv, kv)    # [BS, 1, D_h]
+        for layer in self.layers:
+            # Pre-norm cross-attention
+            q_norm = layer["norm_ca"](q)
+            q = q + layer["cross_attn"](q_norm, kv, kv)[0]
+            # Pre-norm FFN
+            q_norm = layer["norm_ff"](q)
+            q = q + layer["ffn"](q_norm)
 
-        return self.norm(summary.squeeze(1))  # [BS, D_h]
+        return self.final_norm(q.squeeze(1))  # [BS, D_h]
 
 
 # ============================================================================
@@ -91,7 +109,8 @@ class ThalamicIntegrator(nn.Module):
     Output: [BS, K, d_dec]
     """
 
-    def __init__(self, d_dec: int, K: int, B: int, n_heads: int):
+    def __init__(self, d_dec: int, K: int, B: int, n_heads: int,
+                 n_layers: int = 1):
         super().__init__()
         self.K = K
         self.B = B
@@ -105,10 +124,20 @@ class ThalamicIntegrator(nn.Module):
         self.output_queries = nn.Parameter(torch.zeros(1, K, d_dec))
         nn.init.normal_(self.output_queries, std=0.02)
 
-        self.cross_attn = nn.MultiheadAttention(
-            d_dec, n_heads, batch_first=True,
-        )
-        self.norm = nn.LayerNorm(d_dec)
+        # Multi-layer refinement: each layer is cross-attn + FFN
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                "norm_ca": nn.LayerNorm(d_dec),
+                "cross_attn": nn.MultiheadAttention(d_dec, n_heads, batch_first=True),
+                "norm_ff": nn.LayerNorm(d_dec),
+                "ffn": nn.Sequential(
+                    nn.Linear(d_dec, d_dec * 4),
+                    nn.GELU(),
+                    nn.Linear(d_dec * 4, d_dec),
+                ),
+            }))
+        self.final_norm = nn.LayerNorm(d_dec)
 
     def forward(self, cortical: Tensor, pm: Tensor,
                 em: Tensor, wm: Tensor) -> Tensor:
@@ -126,7 +155,6 @@ class ThalamicIntegrator(nn.Module):
         # Tag cortical tokens with type=0 + block position
         block_ids = torch.arange(self.B, device=device)
         cortical = cortical + self.type_emb(torch.zeros_like(block_ids)) + self.block_emb(block_ids)
-        # cortical: [BS, B, d_dec]
 
         # Tag memory tokens with their type
         pm_tok = pm.unsqueeze(1) + self.type_emb(torch.tensor(1, device=device))   # [BS, 1, d_dec]
@@ -136,11 +164,17 @@ class ThalamicIntegrator(nn.Module):
         # Assemble all memory tokens
         memory = torch.cat([cortical, pm_tok, em_tok, wm_tok], dim=1)  # [BS, B+3, d_dec]
 
-        # Learned queries cross-attend to memory
+        # Iteratively refine the output queries
         q = self.output_queries.expand(BS, -1, -1)  # [BS, K, d_dec]
-        integrated, _ = self.cross_attn(q, memory, memory)  # [BS, K, d_dec]
+        for layer in self.layers:
+            # Pre-norm cross-attention to memory
+            q_norm = layer["norm_ca"](q)
+            q = q + layer["cross_attn"](q_norm, memory, memory)[0]
+            # Pre-norm FFN
+            q_norm = layer["norm_ff"](q)
+            q = q + layer["ffn"](q_norm)
 
-        return self.norm(integrated)  # [BS, K, d_dec]
+        return self.final_norm(q)  # [BS, K, d_dec]
 
 
 # ============================================================================
@@ -225,7 +259,8 @@ class SpatialDecoder(nn.Module):
         while col_heads > 1 and D_h % col_heads != 0:
             col_heads -= 1
         self.columnar = nn.ModuleList([
-            ColumnarAttention(D_h, L, n_heads=col_heads)
+            ColumnarAttention(D_h, L, n_heads=col_heads,
+                              n_layers=config.columnar_layers)
             for _ in range(B)
         ])
 
@@ -236,7 +271,8 @@ class SpatialDecoder(nn.Module):
         self.wm_proj = nn.Linear(D, d_dec)
 
         # Level 2: Thalamic integrator
-        self.thalamic = ThalamicIntegrator(d_dec, K, B, n_heads)
+        self.thalamic = ThalamicIntegrator(d_dec, K, B, n_heads,
+                                           n_layers=config.thalamic_layers)
 
         # Level 3: Deep decoder
         self.query_proj = nn.Linear(D, d_dec)
