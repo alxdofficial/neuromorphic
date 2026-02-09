@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -1079,8 +1080,14 @@ class TBPTTTrainer:
             list of per-step metric dicts
         """
         metrics = []
+        pbar = tqdm(
+            range(num_steps),
+            desc=f"Training (step {self.global_step})",
+            unit="step",
+            dynamic_ncols=True,
+        )
 
-        for step_idx in range(num_steps):
+        for step_idx in pbar:
             try:
                 batch = next(self.dataloader)
             except StopIteration:
@@ -1091,10 +1098,17 @@ class TBPTTTrainer:
             self.global_step += 1
             metrics.append(step_metrics)
 
+            # Update progress bar postfix
+            m = step_metrics
+            lr = self.optimizer.param_groups[0]["lr"]
+            pbar.set_postfix_str(
+                f"loss={m['loss']:.3f} ppl={m['ppl']:.0f} tok/s={m['tokens_per_sec']:.0f} lr={lr:.1e}",
+                refresh=False,
+            )
+            pbar.set_description(f"Step {self.global_step}", refresh=False)
+
             if self.global_step % self.log_interval == 0:
-                m = step_metrics
-                lr = self.optimizer.param_groups[0]["lr"]
-                print(
+                tqdm.write(
                     f"step {m['step']:5d} | "
                     f"loss {m['loss']:.4f} | "
                     f"ppl {m['ppl']:.1f} | "
@@ -1105,4 +1119,5 @@ class TBPTTTrainer:
             if step_callback is not None:
                 step_callback(step_metrics)
 
+        pbar.close()
         return metrics
