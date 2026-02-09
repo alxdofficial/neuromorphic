@@ -186,11 +186,15 @@ class NeuromorphicLM(nn.Module, StateMixin):
         return torch.zeros(BS, self.config.D_em, device=device)
 
     def update_surprise(self, logits: Tensor, target: Tensor, mask: Tensor = None):
-        """Update surprise signal from teacher-forced target.
+        """Update surprise signal: -log p(target).
+
+        During training, target is the ground-truth next token (teacher forcing).
+        During inference, target is the model's own sampled/chosen token,
+        giving an equivalent self-supervised surprise signal with identical scale.
 
         Args:
             logits: [BS, vocab] — model output
-            target: [BS] — target token ids
+            target: [BS] — target token ids (ground truth or sampled)
             mask: [BS] bool — optional update mask; masked-out streams get 0
         """
         with torch.no_grad():
@@ -201,6 +205,101 @@ class NeuromorphicLM(nn.Module, StateMixin):
                     mask = mask.bool()
                 next_surprise = next_surprise * mask.unsqueeze(-1).float()
             self.surprise = next_surprise
+
+    @torch.no_grad()
+    def generate(self, prompt_ids: Tensor, max_new_tokens: int,
+                 temperature: float = 1.0, top_k: int = 0,
+                 top_p: float = 1.0) -> Tensor:
+        """Autoregressive generation with self-supervised surprise.
+
+        Processes the prompt token-by-token (updating all memory systems),
+        then generates new tokens. Surprise is computed from the model's
+        own predictions: -log p(sampled_token), identical in form to
+        training surprise but without requiring ground truth.
+
+        Args:
+            prompt_ids: [BS, T_prompt] — prompt token ids (must have T_prompt >= 1)
+            max_new_tokens: number of tokens to generate (0 = just process prompt)
+            temperature: sampling temperature (1.0 = unchanged)
+            top_k: if > 0, keep only top-k logits before sampling
+            top_p: nucleus sampling threshold (1.0 = disabled)
+
+        Returns:
+            generated: [BS, T_prompt + max_new_tokens] — full sequence
+        """
+        BS, T_prompt = prompt_ids.shape
+        device = prompt_ids.device
+        eot_id = self.config.eot_id
+
+        if T_prompt == 0:
+            raise ValueError("prompt_ids must have at least 1 token")
+
+        generated = [prompt_ids]
+
+        # --- Process prompt ---
+        # First token always resets (doc start); subsequent tokens check for EOT
+        reset_mask = torch.ones(BS, dtype=torch.bool, device=device)
+        for t in range(T_prompt):
+            logits, _, _ = self.forward_one_token(prompt_ids[:, t], reset_mask)
+
+            # Next token's reset: True if current token is EOT
+            if t < T_prompt - 1:
+                is_eot = (prompt_ids[:, t] == eot_id)
+                loss_mask = ~is_eot if self.config.reset_on_doc_boundary else None
+                self.update_surprise(logits, prompt_ids[:, t + 1], mask=loss_mask)
+                reset_mask = is_eot if self.config.reset_on_doc_boundary else \
+                    torch.zeros(BS, dtype=torch.bool, device=device)
+
+            elif max_new_tokens > 0:
+                # Last prompt token: sample first generated token
+                is_eot = (prompt_ids[:, t] == eot_id)
+                loss_mask = ~is_eot if self.config.reset_on_doc_boundary else None
+                next_token = self._sample(logits, temperature, top_k, top_p)
+                self.update_surprise(logits, next_token, mask=loss_mask)
+                generated.append(next_token.unsqueeze(1))
+                reset_mask = is_eot if self.config.reset_on_doc_boundary else \
+                    torch.zeros(BS, dtype=torch.bool, device=device)
+
+        # --- Generate remaining tokens ---
+        for i in range(max_new_tokens - 1):
+            prev_token = generated[-1].squeeze(1)
+            logits, _, _ = self.forward_one_token(prev_token, reset_mask)
+            next_token = self._sample(logits, temperature, top_k, top_p)
+
+            # EOT handling: mask surprise, set reset for next step
+            is_eot = (prev_token == eot_id)
+            loss_mask = ~is_eot if self.config.reset_on_doc_boundary else None
+            self.update_surprise(logits, next_token, mask=loss_mask)
+            reset_mask = is_eot if self.config.reset_on_doc_boundary else \
+                torch.zeros(BS, dtype=torch.bool, device=device)
+
+            generated.append(next_token.unsqueeze(1))
+
+        return torch.cat(generated, dim=1)
+
+    @staticmethod
+    def _sample(logits: Tensor, temperature: float = 1.0,
+                top_k: int = 0, top_p: float = 1.0) -> Tensor:
+        """Sample from logits with temperature, top-k, and nucleus filtering."""
+        logits = logits / max(temperature, 1e-8)
+
+        if top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            threshold = logits.topk(top_k, dim=-1).values[:, -1:]
+            logits = logits.masked_fill(logits < threshold, float("-inf"))
+
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+            probs_sorted = sorted_logits.softmax(dim=-1)
+            cumulative_probs = probs_sorted.cumsum(dim=-1)
+            # Keep the first token that pushes cumulative above top_p,
+            # remove everything after
+            remove_mask = (cumulative_probs - probs_sorted) >= top_p
+            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+            logits = sorted_logits.scatter(-1, sorted_idx, sorted_logits)
+
+        probs = logits.softmax(dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def commit_at_boundary(self, force_mode: str = "normal",
                            span_surprise: Tensor = None):

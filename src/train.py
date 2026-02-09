@@ -26,7 +26,7 @@ from typing import Any
 
 from .model import ModelConfig, NeuromorphicLM
 from .model.state import save_runtime_state, load_runtime_state
-from .data import get_tokenizer, get_special_token_ids, create_dataloader
+from .data import PHASE_CONFIGS, create_dataloader, get_special_token_ids, get_tokenizer
 from .training import TBPTTTrainer, evaluate_validation
 from .debug import MetricsCollector
 
@@ -96,6 +96,8 @@ VAL_STEPS = 20          # validation chunks per eval pass
 VAL_DATA_PHASE = None   # None => same policy as DATA_PHASE auto-logic
 VAL_SEED = 4242
 ABLATE_INTERVAL = 1000  # run PM/EM ablation eval every N steps (0 = disabled)
+PLOT_INTERVAL = 1000    # regenerate training curve plots every N steps (0 = disabled)
+TEXT_SAMPLE_INTERVAL = 200  # generate text comparison samples every N steps (0 = disabled)
 
 # -- Safety checks --
 SAFETY_FAIL_FAST = True
@@ -103,7 +105,7 @@ MAX_CONSEC_ZERO_VALID = 3
 
 # -- Checkpointing --
 SAVE_DIR = "checkpoints"
-SAVE_INTERVAL = 1000
+SAVE_INTERVAL = 2500
 RESUME = None       # set to checkpoint path to resume, e.g. "checkpoints/neuromorphic_a_A_step5000.pt"
 
 # -- Metrics collection --
@@ -153,6 +155,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip automatic plot generation")
     p.add_argument("--tokenizer", type=str, default=None,
                    help="Tokenizer name")
+    p.add_argument("--data-phase", type=str, default=None,
+                   help="Training dataset phase key (e.g. A, B, B-diverse, longctx)")
+    p.add_argument("--val-data-phase", type=str, default=None,
+                   help="Validation dataset phase key (default follows train data phase policy)")
     p.add_argument("--seed", type=int, default=None,
                    help="Training seed")
     p.add_argument("--config", type=str, default=None,
@@ -163,6 +169,10 @@ def parse_args() -> argparse.Namespace:
                    help="Base directory for per-run outputs")
     p.add_argument("--run-name", type=str, default=None,
                    help="Run grouping name under output-root")
+    p.add_argument("--save-interval", type=int, default=None,
+                   help="Checkpoint save interval in steps")
+    p.add_argument("--plot-interval", type=int, default=None,
+                   help="Live plot regeneration interval in steps (0 = disabled)")
     # Spatial decoder
     p.add_argument("--snapshot", action="store_true", default=None,
                    help="Enable spatial decoder (snapshot_enabled=True)")
@@ -354,8 +364,26 @@ def resolve_settings(args: argparse.Namespace) -> dict:
         "bs": args.bs if args.bs is not None else int(preset_payload.get("bs", BS)),
         "save_dir": args.save_dir or preset_payload.get("save_dir"),
         "metrics_file": args.metrics_file or preset_payload.get("metrics_file"),
+        "save_interval": (
+            args.save_interval
+            if args.save_interval is not None
+            else int(preset_payload.get("save_interval", SAVE_INTERVAL))
+        ),
+        "plot_interval": (
+            args.plot_interval
+            if args.plot_interval is not None
+            else int(preset_payload.get("plot_interval", PLOT_INTERVAL))
+        ),
         "no_plots": args.no_plots or bool(preset_payload.get("no_plots", False)),
         "tokenizer": args.tokenizer or preset_payload.get("tokenizer", TOKENIZER),
+        "data_phase": (
+            args.data_phase if args.data_phase is not None
+            else preset_payload.get("data_phase", DATA_PHASE)
+        ),
+        "val_data_phase": (
+            args.val_data_phase if args.val_data_phase is not None
+            else preset_payload.get("val_data_phase", VAL_DATA_PHASE)
+        ),
         "seed": args.seed if args.seed is not None else int(preset_payload.get("seed", TRAIN_SEED)),
         "output_root": args.output_root or preset_payload.get("output_root", "outputs"),
         "run_name": args.run_name or preset_payload.get("run_name", run_name_default),
@@ -446,7 +474,19 @@ def config_digest(config: ModelConfig) -> str:
 def _resolve_data_phase(train_phase: str, requested: str | None) -> str:
     """Resolve dataset phase: explicit value or phase-aware default."""
     if requested is not None:
-        return requested.upper()
+        req = str(requested).strip()
+        if not req:
+            raise ValueError("Data phase cannot be an empty string.")
+        if req in PHASE_CONFIGS:
+            return req
+        # Accept case-insensitive names and return canonical key.
+        canon = {k.lower(): k for k in PHASE_CONFIGS}
+        key = req.lower()
+        if key in canon:
+            return canon[key]
+        raise ValueError(
+            f"Unknown data phase '{requested}'. Available: {list(PHASE_CONFIGS.keys())}"
+        )
     return "A" if train_phase.upper() == "A" else "B"
 
 
@@ -496,8 +536,12 @@ def run_phase(
     is_auto: bool = False,
     global_step_offset: int = 0,
     phase_entry: dict[str, Any] | None = None,
-) -> tuple[str | None, int]:
-    """Run a single training phase. Returns (final_checkpoint_path, steps_completed)."""
+) -> tuple[str | None, int, int]:
+    """Run a single training phase.
+
+    Returns:
+        (final_checkpoint_path, steps_completed_in_this_call, phase_end_global_step)
+    """
 
     phase_name = phase.upper()
     bs = settings["bs"]
@@ -523,8 +567,8 @@ def run_phase(
             print(f"Phase E: inherited rl_enabled={config.rl_enabled} from checkpoint")
         del _ckpt_cfg
 
-    train_data_phase = _resolve_data_phase(phase_name, DATA_PHASE)
-    val_data_phase = _resolve_data_phase(phase_name, VAL_DATA_PHASE)
+    train_data_phase = _resolve_data_phase(phase_name, settings.get("data_phase", DATA_PHASE))
+    val_data_phase = _resolve_data_phase(phase_name, settings.get("val_data_phase", VAL_DATA_PHASE))
     tokens_per_step = bs * config.T
     max_steps_total, max_steps_source = _resolve_max_steps(
         phase_name, tokens_per_step, settings, phase_entry=phase_entry
@@ -651,7 +695,7 @@ def run_phase(
         # warmup + cosine schedule so the new phase's LR ramp isn't polluted
         # by the prior phase's last_epoch.
         if "scheduler_state_dict" in ckpt:
-            if not phase_changed and not is_auto:
+            if not phase_changed:
                 try:
                     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 except (ValueError, KeyError):
@@ -674,7 +718,7 @@ def run_phase(
 
     # Phase transitions and auto mode always train the full step budget.
     # Only same-phase single-phase resume continues from the checkpoint step.
-    if is_auto or phase_changed:
+    if phase_changed:
         start_step = 0
 
     # Dataloader
@@ -698,10 +742,11 @@ def run_phase(
     print(f"Metrics: {metrics_file} (full every {COLLECT_EVERY} steps)")
 
     # Phase start marker
+    phase_start_step = (global_step_offset + start_step) if is_auto else start_step
     collector.log_record({
         "mode": "phase_start",
         "phase": phase_name,
-        "step": global_step_offset,
+        "step": phase_start_step,
         "run_id": run_id,
         "resume_from": resume_path,
     })
@@ -743,7 +788,7 @@ def run_phase(
         rl_optimizer=rl_optimizer,
     )
     # Continuous step numbering for JSONL in auto mode
-    trainer.global_step = global_step_offset if is_auto else start_step
+    trainer.global_step = (global_step_offset + start_step) if is_auto else start_step
 
     # RL optimizer warmup after phase transition (mitigates cold Adam state)
     if phase_changed and rl_optimizer is not None:
@@ -768,7 +813,7 @@ def run_phase(
             "final_checkpoint": None,
         })
         collector.close()
-        return None, 0
+        return None, 0, trainer.global_step
 
     print(f"\nStarting phase {phase_name} training ({remaining} steps from step {trainer.global_step})...")
     print("=" * 60)
@@ -834,10 +879,32 @@ def run_phase(
         return record
 
     last_save_path = None
+    save_interval = settings.get("save_interval", SAVE_INTERVAL)
+    plot_interval = settings.get("plot_interval", PLOT_INTERVAL)
+    no_plots = settings.get("no_plots", False)
+
+    # Lazy-load validation batch for text samples (fetched once on first use)
+    _text_sample_batch = [None]  # mutable container for nonlocal
+
+    def _get_text_sample_batch():
+        if _text_sample_batch[0] is None:
+            try:
+                sample_loader = create_dataloader(
+                    phase=val_data_phase,
+                    tokenizer=tokenizer,
+                    batch_size=bs,
+                    seq_length=config.T,
+                    seed=VAL_SEED + 99,
+                    max_steps=1,
+                )
+                _text_sample_batch[0] = next(iter(sample_loader))
+            except Exception:
+                pass
+        return _text_sample_batch[0]
 
     def on_step(_step_metrics: dict):
         nonlocal last_save_path
-        if SAVE_INTERVAL > 0 and trainer.global_step % SAVE_INTERVAL == 0:
+        if save_interval > 0 and trainer.global_step % save_interval == 0:
             last_save_path = save_checkpoint(trainer.global_step)
 
         val_record = None
@@ -854,6 +921,39 @@ def run_phase(
                 f"ppl {val_record['val_ppl']:.1f} | "
                 f"valid {val_record['val_valid_fraction']:.3f}"
             )
+
+        # Text sample generation
+        if TEXT_SAMPLE_INTERVAL > 0 and trainer.global_step % TEXT_SAMPLE_INTERVAL == 0:
+            sample_batch = _get_text_sample_batch()
+            if sample_batch is not None:
+                try:
+                    from .debug.plot_text_samples import generate_text_sample_plot
+                    sample_path = os.path.join(
+                        save_dir,
+                        f"text_samples_step{trainer.global_step}.png",
+                    )
+                    current_loss = _step_metrics.get("loss")
+                    generate_text_sample_plot(
+                        model=model,
+                        tokenizer=tokenizer,
+                        batch=sample_batch,
+                        step=trainer.global_step,
+                        loss=current_loss,
+                        save_path=sample_path,
+                    )
+                    # Restore model state for training (reset full batch)
+                    reset_mask = torch.ones(bs, dtype=torch.bool, device=device)
+                    model.reset_at_doc_boundary(reset_mask)
+                except Exception as e:
+                    print(f"  Warning: text sample generation failed: {e}")
+
+        # Live plot regeneration
+        if not no_plots and plot_interval > 0 and trainer.global_step % plot_interval == 0:
+            try:
+                from .debug.plot_combined import generate_phase_plots
+                generate_phase_plots(metrics_file, phase_name, save_dir)
+            except Exception as e:
+                print(f"  Warning: live plot generation failed: {e}")
 
         if ABLATE_INTERVAL > 0 and trainer.global_step % ABLATE_INTERVAL == 0:
             if val_record is None:
@@ -908,7 +1008,7 @@ def run_phase(
     final = metrics[-1] if metrics else {}
     print(f"\nPhase {phase_name} complete. Final loss: {final.get('loss', 'N/A')}")
 
-    return final_ckpt, steps_completed
+    return final_ckpt, steps_completed, trainer.global_step
 
 
 # ============================================================================
@@ -970,7 +1070,9 @@ def main():
             "lr_min": settings.get("lr_min", LR_MIN),
             "weight_decay": WEIGHT_DECAY,
             "max_grad_norm": MAX_GRAD_NORM,
-            "save_interval": SAVE_INTERVAL,
+            "save_interval": settings.get("save_interval", SAVE_INTERVAL),
+            "plot_interval": settings.get("plot_interval", PLOT_INTERVAL),
+            "text_sample_interval": TEXT_SAMPLE_INTERVAL,
             "val_interval": VAL_INTERVAL,
             "val_steps": VAL_STEPS,
             "ablate_interval": ABLATE_INTERVAL,
@@ -1016,7 +1118,7 @@ def main():
             print(f"{'='*60}")
             print(f"Resume: {resume_path}")
 
-            ckpt_path, steps_done = run_phase(
+            ckpt_path, steps_done, phase_end_step = run_phase(
                 phase=phase,
                 tier=tier,
                 resume_path=resume_path,
@@ -1030,7 +1132,7 @@ def main():
                 global_step_offset=global_step_offset,
                 phase_entry=phase_entry,
             )
-            global_step_offset += steps_done
+            global_step_offset = phase_end_step
             run_state["global_step_offset"] = global_step_offset
             run_state["last_checkpoint"] = ckpt_path
             run_state["phase_history"].append({
@@ -1089,7 +1191,7 @@ def main():
         print(f"\nSingle-phase mode: {phase}")
         phase_entry = effective_phase_plan[0] if effective_phase_plan else None
 
-        ckpt_path, steps_done = run_phase(
+        ckpt_path, steps_done, _phase_end_step = run_phase(
             phase=phase,
             tier=tier,
             resume_path=settings["resume"],

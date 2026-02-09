@@ -91,7 +91,7 @@ class Block(nn.Module, StateMixin):
 
             # Update eligibility traces (if PM enabled)
             if self.config.pm_enabled:
-                layer.pm.update_eligibility(x, h)
+                layer.pm.update_eligibility(x, h, surprise)
 
             x = h  # next layer's input
 

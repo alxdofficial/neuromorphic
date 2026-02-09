@@ -165,6 +165,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         v_cand = self.W_v_cand(h_final)
 
         # Novelty = surprise + (1 - max cosine similarity to active keys)
+        cold_start = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
         if self.em_K is not None:
             cos_sim = torch.einsum("bd, bmd -> bm", k_cand, self.em_K)  # [BS, M]
             if self.em_S is not None:
@@ -176,8 +177,10 @@ class EpisodicMemory(nn.Module, StateMixin):
                     masked.max(dim=-1).values,
                     torch.zeros_like(masked[..., 0]),
                 )
+                cold_start = ~any_active
             else:
                 max_sim = cos_sim.max(dim=-1).values
+                cold_start = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         else:
             max_sim = torch.zeros(x.shape[0], device=x.device)
 
@@ -187,6 +190,10 @@ class EpisodicMemory(nn.Module, StateMixin):
             novelty = (w_nov * surprise_1d + (1.0 - w_nov) * (1.0 - max_sim)).clamp(0.0, 1.0)
         else:
             novelty = (0.5 * surprise_1d + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
+
+        # Cold start: when no active slots, similarity term is undefined.
+        # Use surprise only — don't get a free +0.5 from max_sim=0.
+        novelty = torch.where(cold_start, surprise_1d.clamp(0.0, 1.0), novelty)
 
         return k_cand, v_cand, novelty
 

@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests > 5s (skipped by default, run with --run-slow)",
+    "invariant: mathematical invariants that should NEVER change",
+    "design: design choice tests, expected to change with design_constants.py",
+]
+addopts = "-v --tb=short -m 'not slow'"

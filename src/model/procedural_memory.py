@@ -96,12 +96,17 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         return y_pm
 
-    def update_eligibility(self, x: Tensor, h: Tensor):
+    def update_eligibility(self, x: Tensor, h: Tensor, surprise: Tensor):
         """Differentiable per-token eligibility accumulation.
+
+        Eligibility is gated by surprise: only tokens the model doesn't
+        predict well contribute to the trace. This prevents the trace norm
+        from saturating (which would make the commit gate always fire).
 
         Args:
             x: [BS, D_h] — layer input (pre-synaptic)
             h: [BS, D_h] — layer output (post-synaptic)
+            surprise: [BS, 1] — current surprise signal
         """
         if self.elig_K is None:
             self._lazy_init(x.shape[0], x.device)
@@ -109,10 +114,15 @@ class ProceduralMemory(nn.Module, StateMixin):
         k_cand = unit_normalize(self.W_k_pre(x))   # [BS, D_h]
         v_cand = self.W_v_post(h)                   # [BS, D_h]
 
+        # Gate by surprise: low surprise → near-zero accumulation
+        # surprise is in ~[0, 5]; map to [0, 1] via clamp + normalize
+        gate = (surprise.squeeze(-1) / 5.0).clamp(0.0, 1.0)  # [BS]
+        gate = gate.unsqueeze(1).unsqueeze(2)                  # [BS, 1, 1]
+
         # Accumulate into all r slots (broadcast)
         # elig_K: [BS, r, D_h], k_cand: [BS, 1, D_h]
-        self.elig_K = self.rho * self.elig_K + k_cand.unsqueeze(1)
-        self.elig_V = self.rho * self.elig_V + v_cand.unsqueeze(1)
+        self.elig_K = self.rho * self.elig_K + gate * k_cand.unsqueeze(1)
+        self.elig_V = self.rho * self.elig_V + gate * v_cand.unsqueeze(1)
 
     def base_decay(self):
         """Per-span strength decay applied to ALL streams.

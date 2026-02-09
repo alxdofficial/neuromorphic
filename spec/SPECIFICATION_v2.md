@@ -636,7 +636,9 @@ for span_start in range(0, T, P):
         chunk_loss += token_loss
         valid += count
 
-        # --- update surprise (teacher forcing, masked) ---
+        # --- update surprise (teacher forcing during training, masked) ---
+        # At inference, pass the sampled token instead of target for
+        # self-supervised surprise with identical scale.
         model.update_surprise(logits, target_tokens[:, t], mask=loss_mask)
         span_surprise_accum += model.surprise.squeeze(-1) * loss_mask.float()
         span_valid_tokens += loss_mask.float()
@@ -803,6 +805,8 @@ This resolves ambiguity by construction.
   * `spatial_decoder: SpatialDecoder` (if `snapshot_enabled`, else `None`)
   * `surprise: Tensor[BS, 1]` (runtime state)
   * `forward_one_token(input_id, reset_mask) → (logits, x_emb, y_wm)` or `(logits, x_emb, y_wm, stats)` when `collect=True`
+  * `update_surprise(logits, target, mask=None)` — computes `-log p(target)`. During training, `target` is ground truth (teacher forcing). During inference, `target` is the sampled token — same formula, identical scale, no calibration needed.
+  * `generate(prompt_ids, max_new_tokens, temperature=1.0, top_k=0, top_p=1.0) → [BS, T_prompt + max_new_tokens]` — autoregressive generation with self-supervised surprise (uses `-log p(sampled_token)` for surprise signal). Supports temperature, top-k, and nucleus sampling.
   * `commit_at_boundary(force_mode="normal", span_surprise=None)` — triggers PM commits with actual span surprise; supports `"force_on"` / `"force_off"` for PM RL rollouts
   * `reset_at_doc_boundary(mask: Tensor[BS])`
   * `detach_states()`
@@ -1003,6 +1007,42 @@ training:
    * `snapshot_enabled` toggle — independent of training phase, `output_proj` small-initialized (`std=0.01`) for near-identity startup with gradient flow
    * ~3M additional params on Tier A (~6%), negligible compute (attention over 8, 7, and 4 tokens)
    * Creates shortcut gradient path from loss to intermediate layer outputs
+
+---
+
+## 13) Inference / Generation
+
+### Surprise at inference
+
+During training, surprise is teacher-forced: `surprise = -log p(ground_truth_target)`.
+During inference, no ground truth exists. The solution is to use the model's own sampled
+token: `surprise = -log p(sampled_token)`.
+
+This works because:
+- **Identical formula**: same `-log p(token)`, just a different token source.
+- **Identical scale**: no calibration or normalization needed.
+- **Semantically correct**: when the model is confident (picks a high-probability token),
+  surprise is low. When it's uncertain, even the best token has moderate `-log p`, so
+  surprise is appropriately elevated.
+
+The `generate` method handles this automatically — after each sampled token, it calls
+`update_surprise(logits, sampled_token)` to keep the surprise signal flowing through
+all memory systems (PM eligibility gating, EM novelty scoring, recurrence gates).
+
+### Prompt processing
+
+During prompt processing, ground-truth next tokens are available (the rest of the prompt),
+so `generate` uses teacher-forced surprise for prompt tokens: `update_surprise(logits, prompt[t+1])`.
+Only the last prompt token and all generated tokens use self-supervised surprise.
+
+### Memory during generation
+
+All memory systems remain active during generation:
+- **WM**: ring buffer continues accumulating context
+- **PM**: eligibility traces accumulate (gated by surprise), but no span-boundary commits occur
+  during generation (no explicit boundary triggers). PM reads still work.
+- **EM**: retrieval works normally. No EM writes during generation (no boundary triggers).
+- **Surprise**: self-supervised via `-log p(sampled_token)`, feeds into all gates and neuromodulators.
 
 ---
 
