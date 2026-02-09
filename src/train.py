@@ -173,6 +173,12 @@ def parse_args() -> argparse.Namespace:
                    help="Checkpoint save interval in steps")
     p.add_argument("--plot-interval", type=int, default=None,
                    help="Live plot regeneration interval in steps (0 = disabled)")
+    p.add_argument("--val-interval", type=int, default=None,
+                   help="Validation interval in steps")
+    p.add_argument("--text-sample-interval", type=int, default=None,
+                   help="Text sample generation interval in steps (0 = disabled)")
+    p.add_argument("--log-interval", type=int, default=None,
+                   help="Log print interval in steps")
     # Spatial decoder
     p.add_argument("--snapshot", action="store_true", default=None,
                    help="Enable spatial decoder (snapshot_enabled=True)")
@@ -373,6 +379,21 @@ def resolve_settings(args: argparse.Namespace) -> dict:
             args.plot_interval
             if args.plot_interval is not None
             else int(preset_payload.get("plot_interval", PLOT_INTERVAL))
+        ),
+        "val_interval": (
+            args.val_interval
+            if args.val_interval is not None
+            else int(preset_payload.get("val_interval", VAL_INTERVAL))
+        ),
+        "text_sample_interval": (
+            args.text_sample_interval
+            if args.text_sample_interval is not None
+            else int(preset_payload.get("text_sample_interval", TEXT_SAMPLE_INTERVAL))
+        ),
+        "log_interval": (
+            args.log_interval
+            if args.log_interval is not None
+            else int(preset_payload.get("log_interval", LOG_INTERVAL))
         ),
         "no_plots": args.no_plots or bool(preset_payload.get("no_plots", False)),
         "tokenizer": args.tokenizer or preset_payload.get("tokenizer", TOKENIZER),
@@ -781,7 +802,7 @@ def run_phase(
         config=config,
         device=device,
         max_grad_norm=MAX_GRAD_NORM,
-        log_interval=LOG_INTERVAL,
+        log_interval=settings.get("log_interval", LOG_INTERVAL),
         collector=collector,
         fail_fast=SAFETY_FAIL_FAST,
         max_consecutive_zero_valid=MAX_CONSEC_ZERO_VALID,
@@ -881,6 +902,8 @@ def run_phase(
     last_save_path = None
     save_interval = settings.get("save_interval", SAVE_INTERVAL)
     plot_interval = settings.get("plot_interval", PLOT_INTERVAL)
+    val_interval = settings.get("val_interval", VAL_INTERVAL)
+    text_sample_interval = settings.get("text_sample_interval", TEXT_SAMPLE_INTERVAL)
     no_plots = settings.get("no_plots", False)
 
     # Lazy-load validation batch for text samples (fetched once on first use)
@@ -908,7 +931,7 @@ def run_phase(
             last_save_path = save_checkpoint(trainer.global_step)
 
         val_record = None
-        if VAL_INTERVAL > 0 and trainer.global_step % VAL_INTERVAL == 0:
+        if val_interval > 0 and trainer.global_step % val_interval == 0:
             val_record = run_validation(
                 trainer.global_step,
                 pm_enabled=config.pm_enabled,
@@ -923,7 +946,7 @@ def run_phase(
             )
 
         # Text sample generation
-        if TEXT_SAMPLE_INTERVAL > 0 and trainer.global_step % TEXT_SAMPLE_INTERVAL == 0:
+        if text_sample_interval > 0 and trainer.global_step % text_sample_interval == 0:
             sample_batch = _get_text_sample_batch()
             if sample_batch is not None:
                 try:
@@ -1072,8 +1095,9 @@ def main():
             "max_grad_norm": MAX_GRAD_NORM,
             "save_interval": settings.get("save_interval", SAVE_INTERVAL),
             "plot_interval": settings.get("plot_interval", PLOT_INTERVAL),
-            "text_sample_interval": TEXT_SAMPLE_INTERVAL,
-            "val_interval": VAL_INTERVAL,
+            "text_sample_interval": settings.get("text_sample_interval", TEXT_SAMPLE_INTERVAL),
+            "val_interval": settings.get("val_interval", VAL_INTERVAL),
+            "log_interval": settings.get("log_interval", LOG_INTERVAL),
             "val_steps": VAL_STEPS,
             "ablate_interval": ABLATE_INTERVAL,
             "collect_every": COLLECT_EVERY,
