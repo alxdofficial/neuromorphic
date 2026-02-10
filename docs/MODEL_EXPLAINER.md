@@ -50,6 +50,8 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 
 ## 2. Architecture at a Glance
 
+The diagram below shows the **full Phase D architecture** (all subsystems active, RL enabled). In earlier phases, some components are absent: Phase A has WM only; Phase B adds PM; Phase C adds EM; Phase D adds RL. See [§17](#17-phased-training-plan) for the phase progression.
+
 ```
 Token ID ──► Embedding ──► x: [BS, D]
                               │
@@ -65,7 +67,7 @@ Token ID ──► Embedding ──► x: [BS, D]
                      │                  │
                      │  ┌─── Per Layer ─┐│  × L layers sequentially
                      │  │ PM read       ││  y_pm = PM[b][l].apply(x_block)
-                     │  │ Gate compute  ││  a, b from concat(inputs)
+                     │  │ Gate compute  ││  a, b from concat(inputs + surprise)
                      │  │ Recurrence    ││  h = a * (carry * h_prev) + b
                      │  │ Proj+Res+Norm ││  output = norm(W_o(h) + x_block)
                      │  │ Elig update   ││  elig_K += k_cand, elig_V += v_cand
@@ -91,6 +93,28 @@ Token ID ──► Embedding ──► x: [BS, D]
               └───────┬───────┘
                       │
                  LM Head ──► logits: [BS, vocab]
+                                │
+                           ┌────┘
+                           ▼
+                   Per-token surprise ──► span_surprise_mean
+                           │
+              ┌────────────┴─────────────┐
+              ▼                          ▼
+     PM Neuromodulators            EM Neuromodulators
+     (at span boundaries)          (at span boundaries)
+     ├─ inputs: elig_norm,         ├─ inputs: surprise,
+     │  usage, surprise            │  usage, novelty
+     ├─ outputs: commit_mask,      ├─ outputs: write_mask,
+     │  lambda, g, slots,          │  g_em (write strength)
+     │  p_commit (RL gate)         │
+     ▼                             ▼
+     PM commit: update             EM write: update
+     pm_K, pm_V, pm_a             em_K, em_V, em_S
+              │                          │
+              └──── RL (Phase D+) ───────┘
+              Counterfactual rollouts:
+              PM: force_on vs force_off → reward → BCE on p_commit
+              EM: baseline vs chosen g_em → reward → weighted MSE on g_em
 ```
 
 **Dimensions (Tier A defaults):** D=512, B=4, L=8, D_h=128, vocab=32000
@@ -146,6 +170,8 @@ return logits, x, y_wm
 ```
 
 **Returns:** Always `(logits, x_emb, y_wm)`. The trainer needs `x_emb` and `y_wm` for EM candidate proposals (they cannot be recomputed cheaply because WM state has already advanced).
+
+**What happens outside `forward_one_token`:** The model forward is read-only with respect to PM and EM — it reads from them but doesn't write. Memory updates happen at span boundaries in the trainer: PM eligibility traces are accumulated post-forward, then neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). In Phase D+, RL counterfactual rollouts train the commit/write gates (see [§11](#11-phase-d----hybrid-rl--backprop-training)).
 
 ---
 
