@@ -67,7 +67,7 @@ class ModelConfig:
     rl_em_targets_per_event: int = 1  # EM controllers counterfactually trained per event
 
     # Spatial Decoder (hierarchical aggregation + deep cross-attention)
-    snapshot_enabled: bool = False  # architecture toggle (independent of phase)
+    snapshot_enabled: bool = True   # architecture toggle (independent of phase)
     d_dec: int = 256               # decoder working dimension
     n_heads_decoder: int = 4       # attention heads in columnar/thalamic/decoder
     decoder_layers: int = 2        # deep decoder depth (Level 3)

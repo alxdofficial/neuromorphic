@@ -132,3 +132,80 @@ class WorkingMemory(nn.Module, StateMixin):
         self.wm_ptr = (ptr + 1) % self.W
 
         return y_wm
+
+    def forward_span(self, x_all: Tensor, reset_mask_all: Tensor) -> Tensor:
+        """Process P tokens in parallel through working memory.
+
+        Batches the Q/K/V projections across all P tokens, then runs
+        per-token attention sequentially (matching step() exactly).
+        The sequential attention is not the bottleneck — the projections are.
+
+        Args:
+            x_all: [BS, P, D] — token embeddings for all span tokens
+            reset_mask_all: [BS, P] bool — True at doc boundaries
+
+        Returns:
+            y_wm_all: [BS, P, D] — working memory outputs
+        """
+        BS, P, D = x_all.shape
+        device = x_all.device
+
+        if self.wm_K is None:
+            self._lazy_init(BS, device)
+
+        # Batch projections (the expensive part)
+        q_all = self.W_q(x_all)   # [BS, P, D_wm]
+        k_all = self.W_k(x_all)   # [BS, P, D_wm]
+        v_all = self.W_v(x_all)   # [BS, P, D_wm]
+
+        # Sequential attention per token (matches step() exactly)
+        outputs = []
+        for t in range(P):
+            reset_t = reset_mask_all[:, t]
+
+            # Reset validity for masked streams
+            if reset_t.any():
+                self.wm_valid = self.wm_valid.clone()
+                self.wm_valid[reset_t] = False
+                self.wm_ptr = self.wm_ptr.clone()
+                self.wm_ptr[reset_t] = 0
+
+            q = q_all[:, t]  # [BS, D_wm]
+            k = k_all[:, t]  # [BS, D_wm]
+            v = v_all[:, t]  # [BS, D_wm]
+
+            # Write into ring buffer
+            ptr = self.wm_ptr
+            write_mask = torch.nn.functional.one_hot(
+                ptr, self.W
+            ).to(dtype=self.wm_K.dtype)
+            write_mask_3d = write_mask.unsqueeze(-1)
+
+            self.wm_K = self.wm_K * (1 - write_mask_3d) + k.unsqueeze(1) * write_mask_3d
+            self.wm_V = self.wm_V * (1 - write_mask_3d) + v.unsqueeze(1) * write_mask_3d
+
+            # Update validity
+            self.wm_valid = self.wm_valid.clone()
+            batch_idx = torch.arange(BS, device=device)
+            self.wm_valid[batch_idx, ptr] = True
+
+            # Multi-head attention
+            q_h = q.view(BS, self.n_heads, self.head_dim)
+            K_h = self.wm_K.view(BS, self.W, self.n_heads, self.head_dim).transpose(1, 2)
+            V_h = self.wm_V.view(BS, self.W, self.n_heads, self.head_dim).transpose(1, 2)
+
+            attn = torch.einsum("bnd, bnwd -> bnw", q_h, K_h) * self.scale
+            valid_mask = self.wm_valid.unsqueeze(1)
+            attn = attn.masked_fill(~valid_mask, float("-inf"))
+            attn = torch.softmax(attn, dim=-1)
+            attn = attn.nan_to_num(0.0)
+
+            out = torch.einsum("bnw, bnwd -> bnd", attn, V_h)
+            out = out.reshape(BS, self.D_wm)
+            y_wm = self.W_o(out)
+            outputs.append(y_wm)
+
+            # Advance pointer
+            self.wm_ptr = (ptr + 1) % self.W
+
+        return torch.stack(outputs, dim=1)  # [BS, P, D]

@@ -146,6 +146,57 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         return y_em
 
+    def retrieve_batch(self, x_all: Tensor, y_wm_all: Tensor) -> Tensor:
+        """Query EM for P tokens in parallel.
+
+        Args:
+            x_all: [BS, P, D] — token embeddings
+            y_wm_all: [BS, P, D] — working memory outputs
+
+        Returns:
+            y_em_all: [BS, P, D]
+        """
+        BS, P, D = x_all.shape
+        device = x_all.device
+
+        if self.em_K is None:
+            self._lazy_init(BS, device)
+
+        # Compute queries: [BS, P, D_em]
+        q = unit_normalize(self.W_q_em(torch.cat([x_all, y_wm_all], dim=-1)))
+
+        # Score against all slots: [BS, P, M]
+        scores = torch.einsum("bpd, bmd -> bpm", q, self.em_K)
+
+        # Mask inactive slots
+        active_mask = self.em_S > 0  # [BS, M]
+        scores = scores.masked_fill(~active_mask.unsqueeze(1), float("-inf"))
+
+        # Top-k retrieval per token
+        k = min(self.k_ret, self.M)
+        topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, P, k]
+
+        # Gather values: expand indices to [BS, P, k, D_em]
+        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.D_em)
+        em_V_exp = self.em_V.unsqueeze(1).expand(-1, P, -1, -1)  # [BS, P, M, D_em]
+        V_top = em_V_exp.gather(2, topk_idx_exp)  # [BS, P, k, D_em]
+
+        # Cross-attention: [BS, P, D_em]
+        q_cross = self.W_q_cross(x_all)
+        attn = torch.einsum("bpd, bpkd -> bpk", q_cross, V_top) * self.cross_scale
+        attn = attn + topk_scores
+        attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
+        attn = torch.softmax(attn, dim=-1)
+        attn = attn.nan_to_num(0.0)
+
+        out = torch.einsum("bpk, bpkd -> bpd", attn, V_top)  # [BS, P, D_em]
+
+        if self.readout_ffn is not None:
+            out = out + self.readout_ffn(self.readout_norm(out))
+
+        y_em_all = self.W_o_cross(out)  # [BS, P, D]
+        return y_em_all
+
     def propose_candidate(self, x: Tensor, y_wm: Tensor,
                           h_final: Tensor, surprise: Tensor) -> tuple:
         """Per-token candidate proposal.
@@ -194,6 +245,69 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Cold start: when no active slots, similarity term is undefined.
         # Use surprise only — don't get a free +0.5 from max_sim=0.
         novelty = torch.where(cold_start, surprise_1d.clamp(0.0, 1.0), novelty)
+
+        return k_cand, v_cand, novelty
+
+    def propose_candidate_batch(self, x_all: Tensor, y_wm_all: Tensor,
+                                h_final_all: Tensor,
+                                surprise_all: Tensor) -> tuple:
+        """Per-token candidate proposal for P tokens in parallel.
+
+        Args:
+            x_all: [BS, P, D] — token embeddings
+            y_wm_all: [BS, P, D] — WM outputs
+            h_final_all: [BS, P, D_h] — final layer outputs
+            surprise_all: [BS, P, 1] — per-token surprise
+
+        Returns:
+            k_cand: [BS, P, D_em]
+            v_cand: [BS, P, D_em]
+            novelty: [BS, P]
+        """
+        BS, P, D = x_all.shape
+
+        k_cand = unit_normalize(self.W_k_cand(torch.cat([x_all, y_wm_all], dim=-1)))
+        v_cand = self.W_v_cand(h_final_all)
+
+        # Novelty = surprise + (1 - max cosine similarity to active keys)
+        cold_start = torch.ones(BS, dtype=torch.bool, device=x_all.device)
+        if self.em_K is not None:
+            # [BS, P, M]
+            cos_sim = torch.einsum("bpd, bmd -> bpm", k_cand, self.em_K)
+            if self.em_S is not None:
+                active_mask = self.em_S > 0  # [BS, M]
+                masked = cos_sim.masked_fill(
+                    ~active_mask.unsqueeze(1), float("-inf")
+                )
+                any_active = active_mask.any(dim=-1)  # [BS]
+                max_sim = masked.max(dim=-1).values    # [BS, P]
+                max_sim = torch.where(
+                    any_active.unsqueeze(1),
+                    max_sim,
+                    torch.zeros_like(max_sim),
+                )
+                cold_start = ~any_active
+            else:
+                max_sim = cos_sim.max(dim=-1).values
+                cold_start = torch.zeros(BS, dtype=torch.bool, device=x_all.device)
+        else:
+            max_sim = torch.zeros(BS, P, device=x_all.device)
+
+        surprise_2d = surprise_all.squeeze(-1)  # [BS, P]
+        if self.W_nov is not None:
+            w_nov = torch.sigmoid(
+                self.W_nov(torch.cat([x_all, y_wm_all], dim=-1))
+            ).squeeze(-1)  # [BS, P]
+            novelty = (w_nov * surprise_2d + (1.0 - w_nov) * (1.0 - max_sim)).clamp(0.0, 1.0)
+        else:
+            novelty = (0.5 * surprise_2d + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
+
+        # Cold start: use surprise only
+        novelty = torch.where(
+            cold_start.unsqueeze(1),
+            surprise_2d.clamp(0.0, 1.0),
+            novelty,
+        )
 
         return k_cand, v_cand, novelty
 

@@ -146,6 +146,148 @@ class NeuromorphicLM(nn.Module, StateMixin):
             return logits, x, y_wm, block_stats
         return logits, x, y_wm
 
+    def forward_span(self, input_ids: Tensor,
+                     reset_mask_first: Tensor) -> tuple:
+        """Process P tokens in parallel (one plasticity span).
+
+        Surprise is frozen at the span-initial value for all P tokens.
+        PM/EM are read-only within the span (same as sequential path).
+
+        Args:
+            input_ids: [BS, P] — token IDs for one span
+            reset_mask_first: [BS] bool — reset mask for the first token
+                (subsequent resets derived from eot_id in input_ids)
+
+        Returns:
+            logits_all: [BS, P, vocab]
+            x_emb_all: [BS, P, D]
+            y_wm_all: [BS, P, D]
+        """
+        BS, P = input_ids.shape
+        device = input_ids.device
+
+        # Initialize surprise on first call
+        if self.surprise is None:
+            self.surprise = torch.zeros(BS, 1, device=device)
+
+        # 1. Compute per-token reset masks
+        reset_mask_all = self._compute_reset_masks(
+            input_ids, reset_mask_first
+        )  # [BS, P]
+
+        # Respect reset_on_doc_boundary
+        if not self.config.reset_on_doc_boundary:
+            reset_mask_all = torch.zeros_like(reset_mask_all)
+
+        # 2. Handle reset for first token (state resets happen here)
+        if reset_mask_all[:, 0].any():
+            self.reset_at_doc_boundary(reset_mask_all[:, 0])
+
+        # Handle mid-span resets (tokens 1..P-1): reset states
+        # We need to process these before the forward pass. The sequential
+        # path resets at the start of each token. For the parallel path,
+        # mid-span resets only affect the carry mask (which zeros h at
+        # boundaries). Block/EM/PM state resets for mid-span boundaries
+        # are handled by the carry mask zeroing out h, which is equivalent
+        # to what reset_at_doc_boundary does to Layer.h.
+        # WM handles resets internally in forward_span.
+
+        # 3. Freeze surprise for this span
+        surprise_span = self.surprise  # [BS, 1]
+
+        # 4. Carry mask: [BS, P, 1]
+        carry_all = (~reset_mask_all).float().unsqueeze(-1)
+
+        # 5. Embed all tokens
+        x_emb_all = self.embedding(input_ids)  # [BS, P, D]
+
+        # 6. Working memory
+        if self.config.wm_enabled:
+            y_wm_all = self.wm.forward_span(
+                x_emb_all, reset_mask_all
+            )  # [BS, P, D]
+        else:
+            y_wm_all = torch.zeros_like(x_emb_all)
+
+        # 7. Project and split across blocks
+        x_proj_all = self.W_in(x_emb_all)  # [BS, P, D]
+        x_blocks_all = x_proj_all.view(
+            BS, P, self.config.B, self.config.D_h
+        )  # [BS, P, B, D_h]
+
+        # 8. Process each block
+        h_blocks = []
+        for b, block in enumerate(self.blocks):
+            h_b = block.forward_span(
+                x_blocks_all[:, :, b],  # [BS, P, D_h]
+                y_wm_all, x_emb_all, surprise_span, carry_all,
+            )
+            h_blocks.append(h_b)
+
+        # 9. Merge block outputs
+        h_final = torch.cat(h_blocks, dim=-1)  # [BS, P, D]
+
+        # 10. Spatial decoder or direct LM head
+        if self.config.snapshot_enabled and self.spatial_decoder is not None:
+            # Collect per-layer outputs from blocks (already cached)
+            # Each: [BS, P, L, D_h]
+            block_layer_outputs = [block._last_layer_stack for block in self.blocks]
+
+            # PM/EM summaries are frozen within span — compute once
+            pm_summary = self._compute_pm_summary(BS, device)   # [BS, D_h]
+            em_summary = self._compute_em_summary(BS, device)    # [BS, D_em]
+
+            # Reshape everything to [BS*P, ...] for decoder
+            L = self.config.L
+            D_h = self.config.D_h
+            D = self.config.D
+            BP = BS * P
+            # [BS, P, L, D_h] -> [BS*P, L, D_h]
+            block_layer_flat = [blo.reshape(BP, L, D_h) for blo in block_layer_outputs]
+            pm_flat = pm_summary.unsqueeze(1).expand(BS, P, -1).reshape(BP, D_h)
+            em_flat = em_summary.unsqueeze(1).expand(BS, P, -1).reshape(BP, -1)
+            wm_flat = y_wm_all.reshape(BP, D)
+            h_flat = h_final.reshape(BP, D)
+
+            # Run decoder on all BS*P positions at once
+            h_decoded = self.spatial_decoder(
+                block_layer_flat, pm_flat, em_flat, wm_flat, h_flat
+            )  # [BS*P, D]
+
+            logits_all = self.lm_head(h_decoded.reshape(BS, P, D))  # [BS, P, vocab]
+        else:
+            logits_all = self.lm_head(h_final)  # [BS, P, vocab]
+
+        return logits_all, x_emb_all, y_wm_all
+
+    def _compute_reset_masks(self, input_ids: Tensor,
+                             reset_mask_first: Tensor) -> Tensor:
+        """Derive per-token reset masks from input_ids.
+
+        Token t gets reset if:
+        - t == 0 and reset_mask_first is True, OR
+        - t > 0 and input_ids[:, t-1] == eot_id
+
+        Args:
+            input_ids: [BS, P]
+            reset_mask_first: [BS] bool
+
+        Returns:
+            reset_mask_all: [BS, P] bool
+        """
+        BS, P = input_ids.shape
+        eot_id = self.config.eot_id
+        device = input_ids.device
+
+        reset_mask_all = torch.zeros(BS, P, dtype=torch.bool, device=device)
+        reset_mask_all[:, 0] = reset_mask_first
+
+        if P > 1:
+            # Token t resets if previous token (t-1) was eot
+            reset_mask_all[:, 1:] = (input_ids[:, :-1] == eot_id)
+
+        return reset_mask_all
+
     def _compute_pm_summary(self, BS: int, device: torch.device) -> Tensor:
         """Strength-weighted readout of PM slots, averaged across all instances.
 

@@ -107,6 +107,53 @@ class Block(nn.Module, StateMixin):
             return x, layer_stack
         return x  # final layer output [BS, D_h]
 
+    def forward_span(self, x_block_all: Tensor, y_wm_all: Tensor,
+                     x_emb_all: Tensor, surprise_span: Tensor,
+                     carry_all: Tensor) -> Tensor:
+        """Process P tokens in parallel through this block.
+
+        Note: PM eligibility is NOT updated here — it's deferred to the
+        trainer's post-forward step (Step 8 in the refactor plan).
+
+        Args:
+            x_block_all: [BS, P, D_h] — block input for all tokens
+            y_wm_all: [BS, P, D] — shared WM output
+            x_emb_all: [BS, P, D] — token embeddings
+            surprise_span: [BS, 1] — frozen surprise for this span
+            carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
+
+        Returns:
+            h_out_all: [BS, P, D_h] — final layer output for all tokens
+        """
+        # EM retrieval (if enabled)
+        if self.config.em_enabled:
+            y_em_all = self.em.retrieve_batch(x_emb_all, y_wm_all)
+        else:
+            y_em_all = torch.zeros_like(y_wm_all)
+
+        # Project to D_h: [BS, P, D_h]
+        y_wm_proj_all = self.W_wm_proj(y_wm_all)
+        y_em_proj_all = self.W_em_proj(y_em_all)
+
+        # Sequential layers (each with batched forward)
+        x = x_block_all
+        for layer in self.layers:
+            if self.config.pm_enabled:
+                y_pm_all = layer.pm.apply_batch(x)
+            else:
+                y_pm_all = torch.zeros_like(x)
+
+            x = layer.forward_span(x, y_pm_all, y_wm_proj_all, y_em_proj_all,
+                                   surprise_span, carry_all)
+
+        # Collect per-layer outputs for spatial decoder.
+        # Each layer's _last_h_all is [BS, P, D_h], stored during forward_span.
+        self._last_layer_stack = torch.stack(
+            [layer._last_h_all for layer in self.layers], dim=2
+        )  # [BS, P, L, D_h]
+
+        return x
+
     def commit_pm(self, force_mode: str = "normal",
                   span_surprise: Tensor = None) -> dict:
         """Trigger PM commits for all layers in this block.

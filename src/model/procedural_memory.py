@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
+from .scan import parallel_affine_scan
 from .utils import StateMixin, unit_normalize, soft_topk, budget_enforce
 
 
@@ -96,6 +97,28 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         return y_pm
 
+    def apply_batch(self, x_block_all: Tensor) -> Tensor:
+        """Read-only PM lookup for P tokens in parallel.
+
+        Args:
+            x_block_all: [BS, P, D_h] — block input for all tokens
+
+        Returns:
+            y_pm_all: [BS, P, D_h]
+        """
+        if self.pm_K is None:
+            self._lazy_init(x_block_all.shape[0], x_block_all.device)
+
+        x_q = unit_normalize(x_block_all)                             # [BS, P, D_h]
+        scores = torch.einsum("brd, bpd -> bpr", self.pm_K, x_q)     # [BS, P, r]
+        weighted = self.pm_a.unsqueeze(1) * scores                    # [BS, P, r]
+        y_pm = torch.einsum("bpr, brd -> bpd", weighted, self.pm_V)  # [BS, P, D_h]
+
+        if self.readout_ffn is not None:
+            y_pm = y_pm + self.readout_ffn(self.readout_norm(y_pm))
+
+        return y_pm
+
     def update_eligibility(self, x: Tensor, h: Tensor, surprise: Tensor):
         """Differentiable per-token eligibility accumulation.
 
@@ -123,6 +146,62 @@ class ProceduralMemory(nn.Module, StateMixin):
         # elig_K: [BS, r, D_h], k_cand: [BS, 1, D_h]
         self.elig_K = self.rho * self.elig_K + gate * k_cand.unsqueeze(1)
         self.elig_V = self.rho * self.elig_V + gate * v_cand.unsqueeze(1)
+
+    def update_eligibility_batch(self, x_all: Tensor, h_all: Tensor,
+                                 surprise_all: Tensor,
+                                 reset_mask: Tensor):
+        """Batched eligibility accumulation over P tokens using affine scan.
+
+        Equivalent to calling update_eligibility() P times with
+        reset_eligibility() at doc boundaries, but batches the projections
+        and uses parallel_affine_scan for the recurrence.
+
+        Args:
+            x_all: [BS, P, D_h] — layer input (pre-synaptic) for all tokens
+            h_all: [BS, P, D_h] — layer output (post-synaptic) for all tokens
+            surprise_all: [BS, P, 1] — per-token surprise
+            reset_mask: [BS, P] bool — True at doc boundaries
+        """
+        BS, P, D_h = x_all.shape
+        r = self.r
+
+        if self.elig_K is None:
+            self._lazy_init(BS, x_all.device)
+
+        # Batched projections (the expensive part — 2 matmuls instead of 2*P)
+        k_cand_all = unit_normalize(self.W_k_pre(x_all))  # [BS, P, D_h]
+        v_cand_all = self.W_v_post(h_all)                  # [BS, P, D_h]
+
+        # Surprise gating: [BS, P] → [BS, P, 1, 1] for broadcast over [r, D_h]
+        gate = (surprise_all.squeeze(-1) / 5.0).clamp(0.0, 1.0)  # [BS, P]
+        gate = gate.unsqueeze(-1).unsqueeze(-1)                    # [BS, P, 1, 1]
+
+        # b terms: gate * cand broadcast across r slots → [BS, P, r, D_h]
+        b_K = (gate * k_cand_all.unsqueeze(2)).expand(BS, P, r, D_h)
+        b_V = (gate * v_cand_all.unsqueeze(2)).expand(BS, P, r, D_h)
+
+        # Carry mask: 0 at reset positions (zeros previous elig), 1 elsewhere
+        carry = (~reset_mask).float()  # [BS, P]
+
+        # a = rho * carry, expanded to [BS, P, r, D_h]
+        a = (self.rho * carry).unsqueeze(-1).unsqueeze(-1).expand(
+            BS, P, r, D_h
+        )
+
+        # Flatten [r, D_h] → [r*D_h] for scan (contiguous for reshape)
+        a_flat = a.contiguous().reshape(BS, P, r * D_h)
+        b_K_flat = b_K.contiguous().reshape(BS, P, r * D_h)
+        b_V_flat = b_V.contiguous().reshape(BS, P, r * D_h)
+        h_K_init = self.elig_K.reshape(BS, r * D_h)
+        h_V_init = self.elig_V.reshape(BS, r * D_h)
+
+        # Affine scan: elig_t = a_t * elig_{t-1} + b_t
+        elig_K_all = parallel_affine_scan(a_flat, b_K_flat, h_K_init)
+        elig_V_all = parallel_affine_scan(a_flat, b_V_flat, h_V_init)
+
+        # Update state to last token
+        self.elig_K = elig_K_all[:, -1].reshape(BS, r, D_h)
+        self.elig_V = elig_V_all[:, -1].reshape(BS, r, D_h)
 
     def base_decay(self):
         """Per-span strength decay applied to ALL streams.

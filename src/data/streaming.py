@@ -23,6 +23,19 @@ from .config import DatasetConfig, DATASET_CONFIGS
 from .tokenizer import get_tokenizer
 
 
+def _effective_streaming(config: DatasetConfig) -> bool:
+    """Return whether to use streaming mode for this dataset.
+
+    Datasets with ``download_first=True`` are loaded as map-style datasets
+    so that HuggingFace downloads (and caches) them locally.  This avoids
+    opening hundreds of concurrent HTTP connections when many parallel
+    streams are created.
+    """
+    if config.download_first:
+        return False
+    return config.streaming
+
+
 @dataclass
 class StreamBatch:
     """A batch of tokens from persistent streams."""
@@ -157,7 +170,7 @@ class PersistentStreamDataset(IterableDataset):
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
         stream_seed = self.seed + stream_idx + 9973 * restart_count
 
-        if self.config.streaming:
+        if self._is_streaming:
             ds_i = self._base_dataset.shuffle(seed=stream_seed, buffer_size=10000)
         else:
             ds_i = self._base_dataset.shuffle(seed=stream_seed)
@@ -174,12 +187,14 @@ class PersistentStreamDataset(IterableDataset):
         self._stream_restarts = [0 for _ in range(self.batch_size)]
 
         # Load dataset once, create BS shuffled iterators from it.
+        use_streaming = _effective_streaming(self.config)
         self._base_dataset = load_dataset(
             self.config.hf_path,
             self.config.hf_name,
             split=self.config.split,
-            streaming=self.config.streaming,
+            streaming=use_streaming,
         )
+        self._is_streaming = use_streaming
 
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
@@ -357,16 +372,20 @@ class MixedStreamDataset(IterableDataset):
         self._stream_restarts = [0 for _ in range(self.batch_size)]
 
         # Load each unique dataset once, keyed by (hf_path, hf_name, split).
+        # Datasets with download_first=True are loaded as map-style (local).
         self._ds_cache = {}
+        self._ds_streaming = {}
         for config in self.configs:
-            key = (config.hf_path, config.hf_name, config.split, config.streaming)
+            use_streaming = _effective_streaming(config)
+            key = (config.hf_path, config.hf_name, config.split, use_streaming)
             if key not in self._ds_cache:
                 self._ds_cache[key] = load_dataset(
                     config.hf_path,
                     config.hf_name,
                     split=config.split,
-                    streaming=config.streaming,
+                    streaming=use_streaming,
                 )
+            self._ds_streaming[id(config)] = use_streaming
 
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
@@ -452,12 +471,13 @@ class MixedStreamDataset(IterableDataset):
         assert self._ds_cache is not None
         ds_idx = self.stream_assignments[stream_idx]
         config = self.configs[ds_idx]
-        key = (config.hf_path, config.hf_name, config.split, config.streaming)
+        use_streaming = self._ds_streaming[id(config)]
+        key = (config.hf_path, config.hf_name, config.split, use_streaming)
         ds = self._ds_cache[key]
 
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
         stream_seed = self.seed + stream_idx + 9973 * restart_count
-        if config.streaming:
+        if use_streaming:
             ds_i = ds.shuffle(seed=stream_seed, buffer_size=10000)
         else:
             ds_i = ds.shuffle(seed=stream_seed)

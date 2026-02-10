@@ -15,6 +15,7 @@ from torch import Tensor
 
 from .config import ModelConfig
 from .procedural_memory import ProceduralMemory, PMNeuromodulator
+from .scan import parallel_affine_scan
 from .utils import StateMixin
 
 
@@ -112,4 +113,61 @@ class Layer(nn.Module, StateMixin):
                 "h_norm": self.h.detach().norm(dim=-1).mean().item(),
             }
             return output, stats
+        return output
+
+    def forward_span(self, x_all: Tensor, y_pm_all: Tensor,
+                     y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
+                     surprise_span: Tensor, carry_all: Tensor) -> Tensor:
+        """Process P tokens in parallel through this layer.
+
+        Args:
+            x_all: [BS, P, D_h] — block input for all tokens
+            y_pm_all: [BS, P, D_h] — PM output for all tokens
+            y_wm_proj_all: [BS, P, D_h] — WM output projected to D_h
+            y_em_proj_all: [BS, P, D_h] — EM output projected to D_h
+            surprise_span: [BS, 1] — frozen surprise for this span
+            carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
+
+        Returns:
+            output_all: [BS, P, D_h] — layer outputs for all tokens
+        """
+        BS, P, D_h = x_all.shape
+        device = x_all.device
+
+        if self.h is None:
+            self._lazy_init(BS, device)
+
+        # Expand frozen surprise to [BS, P, 1]
+        surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
+
+        # Fuse inputs: [BS, P, 4*D_h + 1]
+        u = torch.cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
+                        surprise_all], dim=-1)
+
+        # Batched gate computation
+        a = torch.sigmoid(self.gate_a(u))   # [BS, P, D_h]
+        b = torch.tanh(self.gate_b(u))      # [BS, P, D_h]
+
+        # Apply carry mask (zero at doc boundaries)
+        a_eff = a * carry_all               # [BS, P, D_h]
+
+        # Parallel affine scan
+        h_all = parallel_affine_scan(a_eff, b, self.h)  # [BS, P, D_h]
+
+        # Update state to last token
+        self.h = h_all[:, -1]
+
+        # Batched output projection + residual + LayerNorm
+        output = self.norm(self.W_o(h_all) + x_all)
+
+        # Batched post-recurrence FFN
+        if self.ffn is not None:
+            output = output + self.ffn(self.ffn_norm(output))
+
+        # Store full output sequence for post-forward eligibility/EM.
+        # Must be the full output (post W_o + residual + norm + FFN) to
+        # match what the sequential path passes to update_eligibility()
+        # and propose_candidate().
+        self._last_h_all = output
+
         return output

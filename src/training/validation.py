@@ -8,12 +8,13 @@ cross-entropy/perplexity without optimizer updates.
 from typing import Iterator, Optional
 
 import torch
+import torch.nn.functional as F
 
 from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
-from .loss import online_cross_entropy
+from .loss import batched_cross_entropy
 
 
 def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
@@ -47,9 +48,9 @@ def evaluate_validation(
     pm_enabled: Optional[bool] = None,
     em_enabled: Optional[bool] = None,
 ) -> dict:
-    """Evaluate masked CE/perplexity over validation chunks.
+    """Validate masked CE/perplexity over held-out chunks.
 
-    Runtime state and config toggles are restored after evaluation.
+    Runtime state and config toggles are restored after validation.
     """
     total_loss = 0.0
     valid_count = 0
@@ -91,93 +92,121 @@ def evaluate_validation(
 
             for span_start in range(0, T, P):
                 span_end = min(span_start + P, T)
+                span_P = span_end - span_start
 
+                span_ids = input_ids[:, span_start:span_end]
+                span_targets = target_ids[:, span_start:span_end]
+
+                # Reset mask for first token
+                if span_start == 0:
+                    reset_first = (prev_token == eot_id)
+                else:
+                    reset_first = (input_ids[:, span_start - 1] == eot_id)
+
+                # Parallel forward
+                logits_all, x_emb_all, y_wm_all = model.forward_span(
+                    span_ids, reset_first
+                )
+
+                if not torch.isfinite(logits_all).all():
+                    raise RuntimeError("Non-finite logits detected during validation.")
+
+                # Loss masking
+                is_eot_all = (span_ids == eot_id)
+                if config.reset_on_doc_boundary:
+                    loss_mask_all = ~is_eot_all
+                else:
+                    loss_mask_all = torch.ones_like(is_eot_all)
+
+                # Batched loss
+                span_loss, span_valid = batched_cross_entropy(
+                    logits_all, span_targets, loss_mask_all
+                )
+                total_loss += float(span_loss.item())
+                valid_count += span_valid
+
+                # Compute per-token surprise
+                logp = F.log_softmax(logits_all, dim=-1)
+                token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
+                token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
+                # Note: model.surprise updated below to span mean (matching trainer)
+
+                # Compute reset masks for accumulators
+                reset_mask_all = model._compute_reset_masks(span_ids, reset_first)
+                if not config.reset_on_doc_boundary:
+                    reset_mask_all = torch.zeros_like(reset_mask_all)
+
+                # Track span surprise for boundary decisions
                 span_surprise_accum = torch.zeros(BS, device=device)
                 span_valid_tokens = torch.zeros(BS, device=device)
                 span_last_reset = torch.zeros(BS, dtype=torch.long, device=device)
 
-                B = config.B
-                cand_K = [[] for _ in range(B)]
-                cand_V = [[] for _ in range(B)]
-                cand_score = [[] for _ in range(B)]
-                cand_token_valid = [[] for _ in range(B)]
-
-                for t in range(span_start, span_end):
-                    if t == 0:
-                        reset_mask = (prev_token == eot_id)
-                    else:
-                        reset_mask = (input_ids[:, t - 1] == eot_id)
-
-                    if reset_mask.any() and config.reset_on_doc_boundary:
-                        local_t = t - span_start
-                        span_last_reset[reset_mask] = local_t
-                        span_surprise_accum[reset_mask] = 0
-                        span_valid_tokens[reset_mask] = 0
-
-                    logits, x_emb, y_wm = model.forward_one_token(
-                        input_ids[:, t], reset_mask
+                for t_local in range(span_P):
+                    reset_t = reset_mask_all[:, t_local]
+                    if reset_t.any() and config.reset_on_doc_boundary:
+                        span_last_reset[reset_t] = t_local
+                        span_surprise_accum[reset_t] = 0
+                        span_valid_tokens[reset_t] = 0
+                    lm = loss_mask_all[:, t_local]
+                    span_surprise_accum = (
+                        span_surprise_accum
+                        + token_surprise[:, t_local, 0] * lm.float()
                     )
-                    if not torch.isfinite(logits).all():
-                        raise RuntimeError("Non-finite logits detected during validation.")
+                    span_valid_tokens = span_valid_tokens + lm.float()
 
-                    is_eot = (input_ids[:, t] == eot_id)
-                    if config.reset_on_doc_boundary:
-                        loss_mask = ~is_eot
-                    else:
-                        loss_mask = torch.ones_like(is_eot)
-
-                    token_loss, count = online_cross_entropy(
-                        logits, target_ids[:, t], loss_mask
-                    )
-                    total_loss += float(token_loss.item())
-                    valid_count += int(count)
-
-                    model.update_surprise(logits, target_ids[:, t], mask=loss_mask)
-                    if model.surprise is not None:
-                        span_surprise_accum = (
-                            span_surprise_accum
-                            + model.surprise.squeeze(-1) * loss_mask.float()
-                        )
-                    span_valid_tokens = span_valid_tokens + loss_mask.float()
-
-                    if config.em_enabled:
-                        for b, block in enumerate(model.blocks):
-                            h_final = block.layers[-1].h
-                            if h_final is not None:
-                                k_c, v_c, nov = block.em.propose_candidate(
-                                    x_emb, y_wm, h_final, model.surprise
-                                )
-                                cand_K[b].append(k_c)
-                                cand_V[b].append(v_c)
-                                cand_score[b].append(nov)
-                                cand_token_valid[b].append(loss_mask)
-
-                    total_tokens += BS
-                    eot_inputs += int(is_eot.sum().item())
-                    resets += int(reset_mask.sum().item())
+                total_tokens += BS * span_P
+                eot_inputs += int(is_eot_all.sum().item())
+                resets += int(reset_mask_all.sum().item())
 
                 span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
 
+                # Update model surprise to span mean (matching trainer)
+                model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+
+                # PM eligibility + commit
                 if config.pm_enabled:
+                    # Batched eligibility (matching trainer)
+                    x_proj_all = model.W_in(x_emb_all)  # [BS, span_P, D]
+                    x_blocks_all = x_proj_all.view(
+                        BS, span_P, config.B, config.D_h
+                    )  # [BS, span_P, B, D_h]
+
+                    for b, block in enumerate(model.blocks):
+                        for layer in block.layers:
+                            if not hasattr(layer, '_last_h_all') or layer._last_h_all is None:
+                                continue
+
+                            l_idx = layer.layer_idx
+                            if l_idx == 0:
+                                x_in = x_blocks_all[:, :, b]
+                            else:
+                                x_in = block.layers[l_idx - 1]._last_h_all
+
+                            h_out = layer._last_h_all
+
+                            layer.pm.update_eligibility_batch(
+                                x_in, h_out, token_surprise, reset_mask_all,
+                            )
+                    # Decay + commit
                     for block in model.blocks:
                         for layer in block.layers:
                             layer.pm.base_decay()
                     model.commit_at_boundary(span_surprise=span_surprise_mean)
 
+                # EM candidates + write
                 if config.em_enabled:
                     for b, block in enumerate(model.blocks):
-                        if len(cand_K[b]) == 0:
+                        h_final_all = getattr(block.layers[-1], '_last_h_all', None)
+                        if h_final_all is None:
                             continue
-                        stacked_K = torch.stack(cand_K[b], dim=1)
-                        stacked_V = torch.stack(cand_V[b], dim=1)
-                        stacked_score = torch.stack(cand_score[b], dim=1)
-                        stacked_token_valid = torch.stack(cand_token_valid[b], dim=1)
-
-                        S = stacked_score.shape[1]
+                        k_c, v_c, nov = block.em.propose_candidate_batch(
+                            x_emb_all, y_wm_all, h_final_all, token_surprise,
+                        )
+                        S = nov.shape[1]
                         pos = torch.arange(S, device=device).unsqueeze(0)
                         cand_valid = (
                             pos >= span_last_reset.unsqueeze(1)
-                        ) & stacked_token_valid.bool()
+                        ) & loss_mask_all.bool()
 
                         em_usage = (
                             block.em.em_S.sum(dim=-1)
@@ -186,14 +215,14 @@ def evaluate_validation(
                         )
                         cand_valid_f = cand_valid.float()
                         cand_count = cand_valid_f.sum(dim=-1).clamp(min=1)
-                        cand_novelty_mean = (stacked_score * cand_valid_f).sum(dim=-1) / cand_count
+                        cand_novelty_mean = (nov * cand_valid_f).sum(dim=-1) / cand_count
                         write_mask, g_em, _p_write = block.em_neuromodulator.forward(
                             span_surprise_mean,
                             em_usage / config.budget_em,
                             cand_novelty_mean,
                         )
                         block.em.write_at_boundary(
-                            stacked_K, stacked_V, stacked_score, write_mask, g_em,
+                            k_c, v_c, nov, write_mask, g_em,
                             cand_valid=cand_valid,
                         )
 

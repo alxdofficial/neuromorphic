@@ -21,7 +21,8 @@ from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
-from .loss import online_cross_entropy, compute_regularizers
+from .loss import online_cross_entropy, batched_cross_entropy, compute_regularizers
+from ..model.utils import unit_normalize
 
 if TYPE_CHECKING:
     from ..debug.collector import MetricsCollector
@@ -251,87 +252,130 @@ class TBPTTTrainer:
             span_surprise_accum.zero_()
             span_valid_tokens.zero_()
 
+            span_P = span_end - span_start
+            span_ids = input_ids[:, span_start:span_end]          # [BS, span_P]
+            span_targets = target_ids[:, span_start:span_end]     # [BS, span_P]
+
+            # Reset mask for first token of this span
+            if span_start == 0:
+                reset_first = (prev_token == eot_id)
+            else:
+                reset_first = (input_ids[:, span_start - 1] == eot_id)
+
             with amp_ctx:
-                for t in range(span_start, span_end):
-                    # Doc boundary reset mask
-                    if t == 0:
-                        reset_mask = (prev_token == eot_id)
-                    else:
-                        reset_mask = (input_ids[:, t - 1] == eot_id)
+                # --- Parallel forward pass ---
+                logits_all, x_emb_all, y_wm_all = self.model.forward_span(
+                    span_ids, reset_first
+                )
 
-                    # Clear span-level accumulators at doc boundary for streams
-                    # that reset in this span (only when reset is enabled).
-                    if reset_mask.any() and self.config.reset_on_doc_boundary:
-                        local_t = t - span_start
-                        span_last_reset[reset_mask] = local_t
-                        span_surprise_accum[reset_mask] = 0
-                        span_valid_tokens[reset_mask] = 0
-
-                    # Collect on last token of last span for full-collection steps
-                    collect_this = (do_full and is_last_span and t == span_end - 1)
-
-                    # Forward one token
-                    result = self.model.forward_one_token(
-                        input_ids[:, t], reset_mask, collect=collect_this
+                if self.fail_fast and not torch.isfinite(logits_all).all():
+                    raise RuntimeError(
+                        f"Non-finite logits at global step {self.global_step}, "
+                        f"span [{span_start}, {span_end})."
                     )
-                    if collect_this:
-                        logits, x_emb, y_wm, gate_stats = result
-                    else:
-                        logits, x_emb, y_wm = result
 
-                    if self.fail_fast and not torch.isfinite(logits).all():
-                        raise RuntimeError(
-                            f"Non-finite logits at global step {self.global_step}, "
-                            f"span [{span_start}, {span_end}), token index {t}."
-                        )
+                # Loss masking: skip EOT input positions [BS, span_P]
+                is_eot_all = (span_ids == eot_id)
+                if self.config.reset_on_doc_boundary:
+                    loss_mask_all = ~is_eot_all
+                else:
+                    loss_mask_all = torch.ones_like(is_eot_all)
 
-                    # Loss masking: skip EOT input positions
-                    is_eot = (input_ids[:, t] == eot_id)
-                    if self.config.reset_on_doc_boundary:
-                        loss_mask = ~is_eot
-                    else:
-                        loss_mask = torch.ones_like(is_eot)
-                    eot_inputs += int(is_eot.sum().item())
-                    reset_events += int(reset_mask.sum().item())
+                # Batched loss
+                span_loss, span_valid = batched_cross_entropy(
+                    logits_all, span_targets, loss_mask_all
+                )
+                chunk_loss = chunk_loss + span_loss
+                valid_count += span_valid
 
-                    # Accumulate loss
-                    token_loss, count = online_cross_entropy(
-                        logits, target_ids[:, t], loss_mask
+                # --- Post-forward: compute per-token surprise ---
+                with torch.no_grad():
+                    logp = F.log_softmax(logits_all, dim=-1)          # [BS, span_P, V]
+                    token_surprise = -logp.gather(
+                        -1, span_targets.unsqueeze(-1)
+                    )  # [BS, span_P, 1]
+                    # Mask out EOT positions
+                    token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
+
+                    # Note: model.surprise is updated below (after span_surprise_mean
+                    # is computed) to use the span mean rather than a single noisy sample.
+
+                # Compute reset masks for span (needed for accumulators)
+                reset_mask_all = self.model._compute_reset_masks(span_ids, reset_first)
+                if not self.config.reset_on_doc_boundary:
+                    reset_mask_all = torch.zeros_like(reset_mask_all)
+
+                # Track span_last_reset and accumulate surprise per-stream
+                for t_local in range(span_P):
+                    reset_t = reset_mask_all[:, t_local]
+                    if reset_t.any() and self.config.reset_on_doc_boundary:
+                        span_last_reset[reset_t] = t_local
+                        span_surprise_accum[reset_t] = 0
+                        span_valid_tokens[reset_t] = 0
+
+                    lm = loss_mask_all[:, t_local]
+                    span_surprise_accum = (
+                        span_surprise_accum
+                        + token_surprise[:, t_local, 0] * lm.float()
                     )
-                    chunk_loss = chunk_loss + token_loss
-                    valid_count += count
+                    span_valid_tokens = span_valid_tokens + lm.float()
 
-                    # Update surprise (mask out excluded EOT positions so they
-                    # do not drive PM/EM controller statistics).
-                    self.model.update_surprise(logits, target_ids[:, t], mask=loss_mask)
+                eot_inputs += int(is_eot_all.sum().item())
+                reset_events += int(reset_mask_all.sum().item())
 
-                    # Accumulate surprise for controller decisions
-                    if self.model.surprise is not None:
-                        span_surprise_accum = (
-                            span_surprise_accum
-                            + self.model.surprise.squeeze(-1) * loss_mask.float()
-                        )
-                    span_valid_tokens = span_valid_tokens + loss_mask.float()
+                # --- Post-forward: PM eligibility accumulation ---
+                if self.config.pm_enabled:
+                    # Compute block inputs once (shared across all blocks)
+                    x_proj_all = self.model.W_in(x_emb_all)  # [BS, span_P, D]
+                    x_blocks_all = x_proj_all.view(
+                        BS, span_P, self.config.B, self.config.D_h
+                    )  # [BS, span_P, B, D_h]
 
-                    # Buffer EM candidates (if enabled)
-                    if self.config.em_enabled:
-                        for b, block in enumerate(self.model.blocks):
-                            # Get final layer hidden state for this block
-                            h_final = block.layers[-1].h
-                            if h_final is not None:
-                                k_c, v_c, nov = block.em.propose_candidate(
-                                    x_emb, y_wm, h_final,
-                                    self.model.surprise
-                                )
-                                cand_K[b].append(k_c)
-                                cand_V[b].append(v_c)
-                                cand_score[b].append(nov)
-                                cand_token_valid[b].append(loss_mask)
+                    for b, block in enumerate(self.model.blocks):
+                        for layer in block.layers:
+                            if layer._last_h_all is None:
+                                continue
 
-            # Per-stream surprise mean for this span (used by both PM and EM)
+                            # Layer input: block input (layer 0) or previous
+                            # layer's output (_last_h_all).
+                            l_idx = layer.layer_idx
+                            if l_idx == 0:
+                                x_in = x_blocks_all[:, :, b]  # [BS, span_P, D_h]
+                            else:
+                                x_in = block.layers[l_idx - 1]._last_h_all
+
+                            h_out = layer._last_h_all  # [BS, span_P, D_h]
+
+                            # Batched eligibility: projections + affine scan
+                            layer.pm.update_eligibility_batch(
+                                x_in, h_out, token_surprise, reset_mask_all,
+                            )
+
+                # --- Post-forward: EM candidate proposal ---
+                if self.config.em_enabled:
+                    for b, block in enumerate(self.model.blocks):
+                        h_final_all = block.layers[-1]._last_h_all
+                        if h_final_all is not None:
+                            k_c, v_c, nov = block.em.propose_candidate_batch(
+                                x_emb_all, y_wm_all, h_final_all,
+                                token_surprise,
+                            )
+                            # Store as stacked tensors directly
+                            cand_K[b].append(k_c)         # [BS, span_P, D_em]
+                            cand_V[b].append(v_c)          # [BS, span_P, D_em]
+                            cand_score[b].append(nov)      # [BS, span_P]
+                            cand_token_valid[b].append(loss_mask_all)  # [BS, span_P]
+
+            # Per-stream surprise mean for this span (used by boundary controllers
+            # AND as the frozen surprise for the next span's layer gates).
             span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
             span_valid_mean_accum += float(span_valid_tokens.mean().item())
             span_count += 1
+
+            # Update model surprise to span mean (frozen for next span's gates).
+            # Using the mean is more stable than the last token's value, which
+            # is a single noisy sample (and would be 0 if last token was EOT).
+            self.model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
 
             # Pre-compute EM candidate stacks and novelty (needed for both
             # the RL snapshot and the actual EM write below).
@@ -339,10 +383,11 @@ class TBPTTTrainer:
             if self.config.em_enabled:
                 for b, block in enumerate(self.model.blocks):
                     if len(cand_K[b]) > 0:
-                        sK = torch.stack(cand_K[b], dim=1)
-                        sV = torch.stack(cand_V[b], dim=1)
-                        sScore = torch.stack(cand_score[b], dim=1)
-                        sTokValid = torch.stack(cand_token_valid[b], dim=1)
+                        # Each entry is [BS, span_P, ...] from batch proposal
+                        sK = torch.cat(cand_K[b], dim=1)             # [BS, span_P, D_em]
+                        sV = torch.cat(cand_V[b], dim=1)             # [BS, span_P, D_em]
+                        sScore = torch.cat(cand_score[b], dim=1)     # [BS, span_P]
+                        sTokValid = torch.cat(cand_token_valid[b], dim=1)  # [BS, span_P]
                         S = sScore.shape[1]
                         pos = torch.arange(S, device=self.device).unsqueeze(0)
                         sValid = (
@@ -601,7 +646,7 @@ class TBPTTTrainer:
             extras.update(dataloader_stats)
             if rl_metrics:
                 extras.update(rl_metrics)
-            if do_full and gate_stats is not None:
+            if do_full:
                 basic = {
                     "loss": step_metrics["loss"],
                     "ppl": step_metrics["ppl"],
@@ -612,7 +657,8 @@ class TBPTTTrainer:
                     "elapsed": elapsed,
                 }
                 self.collector.log_full(
-                    self.global_step, gate_stats, basic, extras=extras, mode="train"
+                    self.global_step, gate_stats or {}, basic,
+                    extras=extras, mode="train",
                 )
             else:
                 self.collector.log_basic(
