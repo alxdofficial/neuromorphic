@@ -92,7 +92,7 @@ class TestEMGemClamping:
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
         cand_novelty = torch.randn(BS)
-        _, g_em, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        _, g_em, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
         assert (g_em <= cfg.g_em_ceil + 1e-6).all()
 
@@ -104,7 +104,7 @@ class TestEMGemClamping:
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
         cand_novelty = torch.randn(BS)
-        _, g_em, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        _, g_em, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
         assert (g_em <= cfg.g_em_ceil + 1e-6).all()
 
@@ -156,5 +156,5 @@ class TestEMNeuromodulator:
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
         cand_novelty = torch.randn(BS)
-        write_mask, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        write_mask, _, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
         assert write_mask.all()

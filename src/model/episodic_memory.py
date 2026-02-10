@@ -10,6 +10,8 @@ State per stream:
     em_S: [BS, M]          — strengths (bounded)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -313,7 +315,8 @@ class EpisodicMemory(nn.Module, StateMixin):
 
     def write_at_boundary(self, cand_K: Tensor, cand_V: Tensor,
                           cand_score: Tensor, write_mask: Tensor,
-                          g_em: Tensor, cand_valid: Tensor = None):
+                          g_em: Tensor, tau=None, weakness_weight=None,
+                          cand_valid: Tensor = None):
         """Span-boundary EM write. Top-C candidates, soft multi-slot EMA.
 
         Args:
@@ -322,6 +325,8 @@ class EpisodicMemory(nn.Module, StateMixin):
             cand_score: [BS, P] — novelty scores from span
             write_mask: [BS] bool — which streams write
             g_em: [BS] — write strength per stream
+            tau: [BS] or scalar or None — soft top-k temperature (default: self.tau)
+            weakness_weight: [BS] or scalar or None — weakness weight (default: self.weakness_weight)
             cand_valid: [BS, P] bool — optional candidate validity mask
         """
         if self.em_K is None:
@@ -344,6 +349,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         K_C = cand_K.gather(1, topC_idx_exp)  # [BS, C, D_em]
         V_C = cand_V.gather(1, topC_idx_exp)  # [BS, C, D_em]
 
+        _tau = tau if tau is not None else self.tau
+        _ww = weakness_weight if weakness_weight is not None else self.weakness_weight
+
         if write_mask.any():
             # For each candidate, soft-select slots to update
             for c in range(C):
@@ -354,10 +362,13 @@ class EpisodicMemory(nn.Module, StateMixin):
                 scores_slot = torch.einsum("bd, bmd -> bm", k_c, self.em_K)  # [BS, M]
 
                 # Weakness bias: prefer overwriting weak slots
-                scores_slot = scores_slot - self.weakness_weight * self.em_S
+                if isinstance(_ww, Tensor) and _ww.dim() >= 1:
+                    scores_slot = scores_slot - _ww.unsqueeze(-1) * self.em_S
+                else:
+                    scores_slot = scores_slot - _ww * self.em_S
 
                 # Soft top-k selection
-                w = soft_topk(scores_slot, self.k_write, self.tau)  # [BS, M]
+                w = soft_topk(scores_slot, self.k_write, _tau)  # [BS, M]
 
                 # Apply write mask and strength
                 score_ok = torch.isfinite(topC_scores[:, c])
@@ -385,20 +396,21 @@ class EpisodicMemory(nn.Module, StateMixin):
 
 
 class EMNeuromodulator(nn.Module):
-    """Neuromodulator for EM write strength.
+    """Neuromodulator for EM write strength, temperature, and weakness weight.
 
     Phase A–B (em_enabled=False): empty shell, no parameters.
     Phase C (em_enabled=True, rl_enabled=False): learned g_em via backbone
         + g_head (main optimizer backprop), with heuristic write gate
         (novelty > threshold). g_em clamped to [g_em_floor, g_em_ceil].
-    Phase D+ (em_enabled=True, rl_enabled=True): always write, learned g_em
-        (dual-trained: main loss backprop + RL counterfactual).
-        g_em clamped to [g_em_floor, g_em_ceil].
+        tau and ww are learned via backbone + heads.
+    Phase D+ (em_enabled=True, rl_enabled=True): always write, learned g_em,
+        tau, ww (dual-trained: main loss backprop + RL counterfactual).
 
     Returns:
         write_mask: [BS] bool (always True in Phase D+ learned mode)
         g_em: [BS] write strength
-        p_write: None (removed; kept for API compat)
+        tau: [BS] soft top-k temperature (or None in heuristic mode)
+        ww: [BS] weakness weight (or None in heuristic mode)
     """
 
     def __init__(self, config: ModelConfig):
@@ -407,10 +419,16 @@ class EMNeuromodulator(nn.Module):
         self.em_enabled = config.em_enabled
         self.novelty_threshold = 0.3
         self.default_g = 0.3
+        self.default_tau = config.tau_em
+        self.default_ww = config.weakness_weight_em
         self.g_em_floor = config.g_em_floor
         self.g_em_ceil = config.g_em_ceil
+        self.tau_floor = config.tau_em_floor
+        self.tau_ceil = config.tau_em_ceil
+        self.ww_floor = config.ww_em_floor
+        self.ww_ceil = config.ww_em_ceil
 
-        # Backbone + g_head: created when EM is enabled (Phase C+)
+        # Backbone + heads: created when EM is enabled (Phase C+)
         if self.em_enabled:
             H = config.rl_controller_hidden
             self.backbone = nn.Sequential(
@@ -418,6 +436,21 @@ class EMNeuromodulator(nn.Module):
                 nn.ReLU(),
             )
             self.g_head = nn.Linear(H, 1)
+            self.tau_head = nn.Linear(H, 1)
+            self.ww_head = nn.Linear(H, 1)
+
+            # Init tau/ww heads so output at init matches heuristic defaults.
+            # Zero weights + calibrated bias = constant default until
+            # gradients make the output input-dependent.
+            tau_frac = (config.tau_em - config.tau_em_floor) / max(config.tau_em_ceil - config.tau_em_floor, 1e-8)
+            tau_frac = max(min(tau_frac, 0.999), 0.001)  # avoid log(0)
+            nn.init.zeros_(self.tau_head.weight)
+            nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
+
+            ww_frac = (config.weakness_weight_em - config.ww_em_floor) / max(config.ww_em_ceil - config.ww_em_floor, 1e-8)
+            ww_frac = max(min(ww_frac, 0.999), 0.001)
+            nn.init.zeros_(self.ww_head.weight)
+            nn.init.constant_(self.ww_head.bias, math.log(ww_frac / (1.0 - ww_frac)))
 
     def forward(self, span_surprise: Tensor, em_usage: Tensor,
                 cand_novelty_mean: Tensor) -> tuple:
@@ -431,10 +464,12 @@ class EMNeuromodulator(nn.Module):
         """No learnable params (Phase A–B fallback)."""
         write_mask = cand_novelty_mean > self.novelty_threshold
         g_em = torch.full_like(span_surprise, self.default_g)
-        return write_mask, g_em, None
+        tau = torch.full_like(span_surprise, self.default_tau)
+        ww = torch.full_like(span_surprise, self.default_ww)
+        return write_mask, g_em, tau, ww
 
     def _forward_continuous(self, span_surprise, em_usage, cand_novelty_mean):
-        """Heuristic write gate + learned g_em (Phase C)."""
+        """Heuristic write gate + learned g_em/tau/ww (Phase C)."""
         write_mask = cand_novelty_mean > self.novelty_threshold
 
         features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
@@ -443,15 +478,27 @@ class EMNeuromodulator(nn.Module):
         raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
         g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
 
-        return write_mask, g_em, None
+        raw_tau = torch.sigmoid(self.tau_head(h)).squeeze(-1)
+        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * raw_tau
+
+        raw_ww = torch.sigmoid(self.ww_head(h)).squeeze(-1)
+        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * raw_ww
+
+        return write_mask, g_em, tau, ww
 
     def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean):
-        """Always write + learned g_em (Phase D+)."""
+        """Always write + learned g_em/tau/ww (Phase D+)."""
         features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
         h = self.backbone(features)
 
         raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
         g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
 
+        raw_tau = torch.sigmoid(self.tau_head(h)).squeeze(-1)
+        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * raw_tau
+
+        raw_ww = torch.sigmoid(self.ww_head(h)).squeeze(-1)
+        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * raw_ww
+
         write_mask = torch.ones_like(g_em, dtype=torch.bool)
-        return write_mask, g_em, None
+        return write_mask, g_em, tau, ww

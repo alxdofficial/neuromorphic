@@ -216,13 +216,14 @@ def evaluate_validation(
                         cand_valid_f = cand_valid.float()
                         cand_count = cand_valid_f.sum(dim=-1).clamp(min=1)
                         cand_novelty_mean = (nov * cand_valid_f).sum(dim=-1) / cand_count
-                        write_mask, g_em, _p_write = block.em_neuromodulator.forward(
+                        write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
                             span_surprise_mean,
                             em_usage / config.budget_em,
                             cand_novelty_mean,
                         )
                         block.em.write_at_boundary(
                             k_c, v_c, nov, write_mask, g_em,
+                            tau=tau_em, weakness_weight=ww_em,
                             cand_valid=cand_valid,
                         )
 

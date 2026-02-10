@@ -286,13 +286,14 @@ class TestNeuromodulatorShapes:
         cand_novelty = torch.randn(BS)
 
         result = neuromod.forward(span_surprise, em_usage, cand_novelty)
-        assert len(result) == 3
-        write_mask, g_em, p_write = result
+        assert len(result) == 4
+        write_mask, g_em, tau, ww = result
 
         assert write_mask.shape == (BS,)
         assert write_mask.dtype == torch.bool
         assert g_em.shape == (BS,)
-        assert p_write is None  # always None
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
 
 
 # ============================================================================

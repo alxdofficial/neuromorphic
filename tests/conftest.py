@@ -224,7 +224,7 @@ def forward_and_write_em(model, n, BS=2, vocab=64):
                     span_surprise = model.surprise.squeeze(-1) if model.surprise is not None else torch.zeros(BS)
                     cand_novelty_mean = cand_score.mean(dim=1)
 
-                    write_mask, g_em, _ = block.em_neuromodulator.forward(
+                    write_mask, g_em, _tau, _ww = block.em_neuromodulator.forward(
                         span_surprise, em_usage, cand_novelty_mean
                     )
                     # Force write for test purposes

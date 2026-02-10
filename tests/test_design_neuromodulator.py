@@ -55,8 +55,9 @@ class TestNeuromodulatorModes:
         cfg.set_phase("A")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        write_mask, g_em, p_write = result
-        assert p_write is None
+        write_mask, g_em, tau, ww = result
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
         assert g_em.shape == (BS,)
 
     def test_em_continuous_in_phase_c(self):
@@ -65,8 +66,9 @@ class TestNeuromodulatorModes:
         cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        _, g_em, p_write = result
-        assert p_write is None
+        _, g_em, tau, ww = result
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
 
     def test_em_learned_in_phase_d(self):
@@ -75,9 +77,10 @@ class TestNeuromodulatorModes:
         cfg.set_phase("D")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        write_mask, g_em, p_write = result
+        write_mask, g_em, tau, ww = result
         assert write_mask.all()
-        assert p_write is None
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
 
 
 # ============================================================================

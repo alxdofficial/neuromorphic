@@ -326,8 +326,8 @@ for each PM instance:
 
 # EM: neuromodulator write decision
 for each EM instance:
-    neuromodulator decides write_mask, g_em
-    em.write_at_boundary(cand_K, cand_V, scores, mask, g_em)   # EMA update em_K, em_V, em_S
+    neuromodulator decides write_mask, g_em, tau, ww
+    em.write_at_boundary(cand_K, cand_V, scores, mask, g_em, tau=tau, ww=ww)   # EMA update em_K, em_V, em_S
     em_S *= 0.999; budget_enforce(em_S)                         # decay + budget
 ```
 
@@ -731,8 +731,10 @@ For each span (8 spans per chunk, P=32 tokens each):
       └── p_commit gate (Phase D): detached binary → which streams commit
       └── PM.commit(): update pm_K, pm_V, pm_a with EMA
 
-    EM neuromodulators: (surprise, usage, novelty) → write_mask, g_em
+    EM neuromodulators: (surprise, usage, novelty) → write_mask, g_em, tau, ww
       └── g_em = floor + range * sigmoid(raw)  [0.001, 0.95]
+      └── tau  = floor + range * sigmoid(raw)  [0.05, 5.0]   (soft top-k temperature)
+      └── ww   = floor + range * sigmoid(raw)  [0.0, 2.0]    (weakness weight)
       └── EM.write_at_boundary(): update em_K, em_V, em_S with alpha = g_em * weights
 
 After all spans:
@@ -751,7 +753,7 @@ After all spans:
         PM: restore state → force_off rollout → force_on rollout → reward
             → BCE on p_commit (via re-forward neuromod with snapshot inputs)
         EM: restore state → baseline rollout → chosen rollout → reward
-            → weighted MSE on g_em (via re-forward neuromod with snapshot inputs)
+            → weighted MSE on g_em + tau + ww (via re-forward neuromod with snapshot inputs)
       Restore final real state
       rl_optimizer.step() (combined continuous + RL gradients)
       rl_optimizer.zero_grad()
@@ -769,25 +771,24 @@ After all spans:
 | Eligibility update | Inside `Block.step`, interleaved | Post-forward loop in trainer |
 | EM candidate proposal | Inside trainer token loop | Post-forward batch in trainer |
 | Span boundary logic | Unchanged | Unchanged |
-| RL rollouts | Use `forward_one_token` | Use `forward_one_token` (unchanged) |
+| RL rollouts | Use `forward_one_token` | Use `forward_span` (parallel, frozen surprise) |
 
 ### 10.3 RL Rollouts and the Parallel Path
 
-RL rollouts (`_rollout_span`) use the sequential `forward_one_token` path, not `forward_span`. This is intentional:
-- Rollouts are infrequent (2 per chunk on selected spans)
-- They run under `torch.no_grad()` (cheaper)
-- They need per-token surprise updates (the sequential path does this naturally)
-- Performance is not critical for the rollout path
+RL rollouts (`_rollout_span`) now use `forward_span` with frozen surprise from the snapshot, rather than sequential `forward_one_token` with per-token surprise updates. This provides ~3-7x speedup per rollout while producing equivalent RL signals:
+- Both counterfactual arms see identical surprise (frozen from the snapshot's `span_surprise_mean`)
+- The reward = `loss_arm_A - loss_arm_B` remains a valid relative comparison since surprise is symmetric
+- The neuromodulator gate heads are re-forwarded with the same span-mean surprise from the snapshot
 
 **How RL interacts with the parallel training path:**
 
-The training forward pass uses `forward_span` (parallel). Neuromodulators run at span boundaries in the trainer, not inside the model forward. RL snapshots are captured BEFORE commit/write. The rollout then forks from the snapshot, applies forced commit/write, and measures loss over the next span using `forward_one_token` (sequential).
+The training forward pass uses `forward_span` (parallel). Neuromodulators run at span boundaries in the trainer, not inside the model forward. RL snapshots are captured BEFORE commit/write. The rollout then forks from the snapshot, applies forced commit/write, sets surprise from the snapshot, and measures loss over the next span using a single `forward_span` call.
 
-**Surprise regime difference:** The main path freezes surprise for all P tokens in a span (span-mean from the previous span). The rollout updates surprise per-token. This means the rollout's layer gates (a_t, b_t) see different surprise values than the main path saw for the same tokens. However, this does not affect RL correctness for two reasons:
+**Surprise regime:** Both the main training path and RL rollouts now use frozen span-mean surprise for all P tokens. The rollout sets `model.surprise = snap.span_surprise_mean` before `forward_span`, matching the main path's regime. This ensures:
 
-1. **Symmetric comparison:** Both counterfactual arms (force_on/force_off, or baseline/chosen) start from the same snapshot and both see the same per-token surprise trajectory. The reward = `loss_arm_A - loss_arm_B` is a valid relative comparison because the surprise dynamics cancel out.
+1. **Symmetric comparison:** Both counterfactual arms start from the same snapshot with the same frozen surprise. The reward is a valid relative comparison.
 
-2. **Consistent gate training regime:** The neuromodulator gate heads are trained with span-mean surprise as input (via `_update_pm_neuromodulators` / `_update_em_neuromodulators`), which is the same input they see during the normal training path. The train/inference regime is self-consistent.
+2. **Consistent gate training regime:** The neuromodulator gate heads are trained with span-mean surprise as input (via `_update_pm_neuromodulators` / `_update_em_neuromodulators`), which is the same input they see during both the normal training path and rollouts.
 
 **What the gate head sees:**
 
@@ -798,7 +799,7 @@ The training forward pass uses `forward_span` (parallel). Neuromodulators run at
 | `span_surprise_mean` | Computed post-forward | Same snapshot value | Yes |
 | `em_novelty` | From snapshot | Same snapshot value | Yes |
 
-The gate head's inputs are always the span-level summaries from the snapshot. The per-token surprise in the rollout only affects the rollout's loss measurement (through layer gates), not the gate head's training inputs. This means the RL signal is: "given these span-level statistics, was committing/writing the right decision?" — which is exactly the right question for a span-boundary controller.
+The gate head's inputs are always the span-level summaries from the snapshot. The frozen surprise in the rollout's `forward_span` affects layer gates identically in both counterfactual arms (symmetric), so the reward signal is unbiased. The RL signal is: "given these span-level statistics, was committing/writing the right decision?" — which is exactly the right question for a span-boundary controller.
 
 **PM eligibility and RL:** Eligibility traces are accumulated per-token with per-token surprise gating (in `update_eligibility_batch`), but the commit decision uses span-mean surprise. This is correct because the commit gate receives `elig_norm` (which already encodes the per-token dynamics as a scalar summary) alongside span-mean surprise. The gate has sufficient information.
 
@@ -844,13 +845,13 @@ Parallel: `update_eligibility` receives the *current* token's surprise (computed
 
 The parallel path is arguably more correct — gating eligibility by how surprising the current token is, rather than using a one-step-lagged value.
 
-### 11.5 RL Rollout vs Main Path Surprise
+### 11.5 RL Rollout Surprise Regime
 
 **Magnitude:** None (RL correctness unaffected).
 
-The RL rollout uses `forward_one_token` with per-token surprise updates, while the main path uses `forward_span` with frozen surprise. This means rollout layer gates see different surprise values than the main forward. However, this does **not** affect RL correctness:
+Both the main training path and RL rollouts now use `forward_span` with frozen surprise. The rollout sets `model.surprise = snap.span_surprise_mean` before calling `forward_span`, so both counterfactual arms see identical, frozen surprise values. This matches the main path's regime and ensures:
 
-- Both counterfactual arms see identical surprise trajectories (symmetric comparison)
+- Both counterfactual arms see identical surprise (symmetric comparison)
 - The neuromodulator gate heads are re-forwarded with span-mean surprise from the snapshot (matching the training regime)
 - The reward measures the relative effect of commit/write decisions, not absolute loss
 
@@ -864,7 +865,7 @@ See [§10.3](#103-rl-rollouts-and-the-parallel-path) for full analysis.
 | PM state leak mid-span | PM read output | A-D | ≤31 per boundary | Low-medium |
 | EM strength leak mid-span | EM retrieval output | C-D | ≤31 per boundary | Low-medium |
 | Eligibility surprise timing | Eligibility trace | B+ | All P tokens | Negligible (arguably better) |
-| RL rollout surprise regime | Rollout gate values | D+ | All P tokens in rollout | None (symmetric) |
+| RL rollout surprise regime | N/A (matches main path) | D+ | N/A | None (same as main path) |
 
 ### 11.7 What Is Identical
 
@@ -877,7 +878,7 @@ Everything not listed above is numerically identical between the two paths:
 - EM candidate proposals and validity masking
 - Loss computation
 - Span boundary logic (PM commits, EM writes, neuromodulator decisions)
-- RL rollouts (use sequential path)
+- RL rollouts (now also use `forward_span` with frozen surprise)
 
 ---
 

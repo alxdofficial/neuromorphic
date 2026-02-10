@@ -50,6 +50,8 @@ class BoundarySnapshot:
     em_cand_score: list = field(default_factory=list)     # [B] of [BS, P]
     em_cand_valid: list = field(default_factory=list)     # [B] of [BS, P]
     em_g_em_chosen: dict = field(default_factory=dict)    # {b_idx: [BS]}
+    em_tau_chosen: dict = field(default_factory=dict)    # {b_idx: [BS]}
+    em_ww_chosen: dict = field(default_factory=dict)     # {b_idx: [BS]}
 
 
 def _detached_runtime_state(model) -> dict:
@@ -417,6 +419,8 @@ class TBPTTTrainer:
                     snap_novelties[b] = novelty.detach().clone()
 
                 snap_g_em = {}
+                snap_tau = {}
+                snap_ww = {}
                 if self.config.rl_enabled:
                     for b in snap_novelties:
                         block = self.model.blocks[b]
@@ -425,12 +429,14 @@ class TBPTTTrainer:
                             if block.em.em_S is not None
                             else torch.zeros(BS, device=self.device)
                         )
-                        _, g_em_val, _ = block.em_neuromodulator.forward(
+                        _, g_em_val, tau_val, ww_val = block.em_neuromodulator.forward(
                             span_surprise_mean,
                             em_usage / self.config.budget_em,
                             snap_novelties[b],
                         )
                         snap_g_em[b] = g_em_val.detach().clone()
+                        snap_tau[b] = tau_val.detach().clone()
+                        snap_ww[b] = ww_val.detach().clone()
 
                 snap = BoundarySnapshot(
                     runtime_state=_detached_runtime_state(self.model),
@@ -447,6 +453,8 @@ class TBPTTTrainer:
                     em_cand_score=snap_cS,
                     em_cand_valid=snap_cValid,
                     em_g_em_chosen=snap_g_em,
+                    em_tau_chosen=snap_tau,
+                    em_ww_chosen=snap_ww,
                 )
                 snapshots.append(snap)
 
@@ -478,7 +486,7 @@ class TBPTTTrainer:
 
                     em_usage = block.em.em_S.sum(dim=-1) if block.em.em_S is not None else torch.zeros_like(span_surprise_mean)
 
-                    write_mask, g_em, _p_write = block.em_neuromodulator.forward(
+                    write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
                         span_surprise_mean,
                         em_usage / self.config.budget_em,
                         cand_novelty_mean,
@@ -494,7 +502,9 @@ class TBPTTTrainer:
 
                     block.em.write_at_boundary(
                         sK, sV, sScore,
-                        write_mask, g_em, cand_valid=sValid
+                        write_mask, g_em,
+                        tau=tau_em, weakness_weight=ww_em,
+                        cand_valid=sValid,
                     )
 
         # Finalize loss
@@ -804,20 +814,25 @@ class TBPTTTrainer:
                       pm_target: Optional[tuple[int, int]] = None,
                       em_target: Optional[int] = None) -> Tensor:
         """Run counterfactual rollout: apply forced commit/write, then measure
-        loss over the next span of tokens.
+        loss over the next span of tokens using forward_span (parallel).
 
         The snapshot was taken BEFORE the real commit/write. This method:
         1. Applies forced PM commit + EM write (using snapshot candidate buffers)
-        2. Runs the next span's tokens forward-only
-        3. Returns per-stream loss [BS]
+        2. Sets frozen surprise from the snapshot
+        3. Runs the next span via a single forward_span call
+        4. Returns per-stream loss [BS]
         """
         P = self.config.P
         input_ids = snap.input_ids
         target_ids = snap.target_ids
         span_start = snap.span_start
         span_end = min(span_start + P, input_ids.shape[1])
+        span_P = span_end - span_start
         BS = input_ids.shape[0]
         eot_id = self.config.eot_id
+
+        span_ids = input_ids[:, span_start:span_end]        # [BS, span_P]
+        span_targets = target_ids[:, span_start:span_end]   # [BS, span_P]
 
         amp_ctx = torch.autocast(
             device_type=self.device.type, dtype=self.amp_dtype,
@@ -826,7 +841,6 @@ class TBPTTTrainer:
 
         with torch.no_grad(), amp_ctx:
             # Step 1: Apply forced PM commit + EM write BEFORE measuring tokens.
-            # This is the operation being counterfactually tested.
             if self.config.pm_enabled:
                 for block in self.model.blocks:
                     for layer in block.layers:
@@ -850,14 +864,26 @@ class TBPTTTrainer:
                     if em_target is not None and b != em_target:
                         local_mode = "normal"
 
-                    default_g = getattr(block.em_neuromodulator, "default_g", 0.3)
+                    neuromod = block.em_neuromodulator
+                    default_g = getattr(neuromod, "default_g", 0.3)
+                    default_tau = getattr(neuromod, "default_tau", self.config.tau_em)
+                    default_ww = getattr(neuromod, "default_ww", self.config.weakness_weight_em)
+
                     if local_mode == "baseline":
                         write_mask = torch.ones(BS, dtype=torch.bool, device=self.device)
                         g_em = torch.full((BS,), default_g, device=self.device)
+                        tau_em = torch.full((BS,), default_tau, device=self.device)
+                        ww_em = torch.full((BS,), default_ww, device=self.device)
                     elif local_mode == "chosen":
                         write_mask = torch.ones(BS, dtype=torch.bool, device=self.device)
                         g_em = snap.em_g_em_chosen.get(
                             b, torch.full((BS,), default_g, device=self.device)
+                        )
+                        tau_em = snap.em_tau_chosen.get(
+                            b, torch.full((BS,), default_tau, device=self.device)
+                        )
+                        ww_em = snap.em_ww_chosen.get(
+                            b, torch.full((BS,), default_ww, device=self.device)
                         )
                     else:  # "normal"
                         em_usage = (
@@ -868,7 +894,7 @@ class TBPTTTrainer:
                         cvf = sValid.float()
                         cc = cvf.sum(dim=-1).clamp(min=1)
                         novelty = (sScore * cvf).sum(dim=-1) / cc
-                        write_mask, g_em, _ = block.em_neuromodulator.forward(
+                        write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
                             snap.span_surprise_mean,
                             em_usage / self.config.budget_em,
                             novelty,
@@ -876,32 +902,35 @@ class TBPTTTrainer:
 
                     block.em.write_at_boundary(
                         sK, sV, sScore,
-                        write_mask, g_em, cand_valid=sValid,
+                        write_mask, g_em,
+                        tau=tau_em, weakness_weight=ww_em,
+                        cand_valid=sValid,
                     )
 
-            # Step 2: Run the next span's tokens and measure loss.
-            stream_loss = torch.zeros(BS, device=self.device)
-            stream_count = torch.zeros(BS, device=self.device)
+            # Step 2: Set frozen surprise from snapshot for forward_span gates.
+            self.model.surprise = snap.span_surprise_mean.unsqueeze(-1)
 
-            for t in range(span_start, span_end):
-                if t == span_start:
-                    if span_start == 0:
-                        reset_mask = torch.zeros(BS, dtype=torch.bool, device=self.device)
-                    else:
-                        reset_mask = (input_ids[:, span_start - 1] == eot_id)
-                else:
-                    reset_mask = (input_ids[:, t - 1] == eot_id)
+            # Step 3: Compute reset_mask_first for the span.
+            if span_start == 0:
+                reset_first = torch.zeros(BS, dtype=torch.bool, device=self.device)
+            else:
+                reset_first = (input_ids[:, span_start - 1] == eot_id)
 
-                logits, x_emb, y_wm = self.model.forward_one_token(
-                    input_ids[:, t], reset_mask
-                )
-                is_eot = (input_ids[:, t] == eot_id)
-                loss_mask = ~is_eot if self.config.reset_on_doc_boundary else torch.ones_like(is_eot)
-                self.model.update_surprise(logits, target_ids[:, t], mask=loss_mask)
+            # Step 4: Single parallel forward pass.
+            logits_all, _, _ = self.model.forward_span(span_ids, reset_first)
+            # [BS, span_P, vocab]
 
-                per_token = F.cross_entropy(logits, target_ids[:, t], reduction="none")
-                stream_loss = stream_loss + per_token * loss_mask.float()
-                stream_count = stream_count + loss_mask.float()
+            # Step 5: Compute per-stream loss.
+            eot_mask = (span_ids == eot_id)
+            loss_mask = ~eot_mask if self.config.reset_on_doc_boundary else torch.ones_like(eot_mask)
+            per_token = F.cross_entropy(
+                logits_all.reshape(BS * span_P, -1),
+                span_targets.reshape(BS * span_P),
+                reduction="none",
+            ).reshape(BS, span_P)
+
+            stream_loss = (per_token * loss_mask.float()).sum(dim=1)
+            stream_count = loss_mask.float().sum(dim=1)
 
         return stream_loss / stream_count.clamp(min=1)
 
@@ -937,10 +966,11 @@ class TBPTTTrainer:
 
     def _update_em_neuromodulators(self, snap: BoundarySnapshot, reward: Tensor,
                                    targets: Optional[set[int]] = None) -> float:
-        """Continuous EM objective for g_em using deconfounded rewards.
+        """Continuous EM objective for g_em, tau, and weakness_weight
+        using deconfounded rewards.
 
-        Positive reward -> move toward chosen g_em.
-        Negative reward -> move toward baseline g_em.
+        Positive reward -> move toward chosen values.
+        Negative reward -> move toward baseline (default) values.
         """
         total_loss_val = 0.0
         for b_idx in range(self.config.B):
@@ -959,25 +989,54 @@ class TBPTTTrainer:
             if chosen_g is None:
                 continue
 
-            # Re-forward to get g_em with grad
-            _, g_em, _ = neuromod(
+            # Re-forward to get g_em/tau/ww with grad
+            _, g_em, tau_em, ww_em = neuromod(
                 snap.span_surprise_mean, em_usage_norm, novelty,
             )
-
-            baseline_g = torch.full_like(chosen_g, neuromod.default_g)
-            target_g = torch.where(reward > 0, chosen_g, baseline_g)
-
-            scale = max(neuromod.g_em_ceil - neuromod.g_em_floor, 1e-6)
-            g_em_normalized = ((g_em - neuromod.g_em_floor) / scale).clamp(0.0, 1.0)
-            target_normalized = ((target_g - neuromod.g_em_floor) / scale).clamp(0.0, 1.0)
 
             credit = novelty / novelty.clamp(min=1e-6).max()
             weight = reward.abs() * credit
 
-            sq_err = (g_em_normalized - target_normalized).pow(2)
-            loss = (sq_err * weight).sum() / weight.sum().clamp(min=1e-6)
-            total_loss_val += loss.item()
-            loss.backward()
+            # -- g_em loss (existing) --
+            baseline_g = torch.full_like(chosen_g, neuromod.default_g)
+            target_g = torch.where(reward > 0, chosen_g, baseline_g)
+
+            g_scale = max(neuromod.g_em_ceil - neuromod.g_em_floor, 1e-6)
+            g_em_normalized = ((g_em - neuromod.g_em_floor) / g_scale).clamp(0.0, 1.0)
+            target_g_normalized = ((target_g - neuromod.g_em_floor) / g_scale).clamp(0.0, 1.0)
+
+            sq_err_g = (g_em_normalized - target_g_normalized).pow(2)
+            loss_g = (sq_err_g * weight).sum() / weight.sum().clamp(min=1e-6)
+
+            # -- tau loss --
+            chosen_tau = snap.em_tau_chosen.get(b_idx)
+            if chosen_tau is not None:
+                baseline_tau = torch.full_like(chosen_tau, neuromod.default_tau)
+                target_tau = torch.where(reward > 0, chosen_tau, baseline_tau)
+                tau_scale = max(neuromod.tau_ceil - neuromod.tau_floor, 1e-6)
+                tau_normalized = ((tau_em - neuromod.tau_floor) / tau_scale).clamp(0.0, 1.0)
+                target_tau_normalized = ((target_tau - neuromod.tau_floor) / tau_scale).clamp(0.0, 1.0)
+                sq_err_tau = (tau_normalized - target_tau_normalized).pow(2)
+                loss_tau = (sq_err_tau * weight).sum() / weight.sum().clamp(min=1e-6)
+            else:
+                loss_tau = torch.tensor(0.0, device=g_em.device)
+
+            # -- weakness_weight loss --
+            chosen_ww = snap.em_ww_chosen.get(b_idx)
+            if chosen_ww is not None:
+                baseline_ww = torch.full_like(chosen_ww, neuromod.default_ww)
+                target_ww = torch.where(reward > 0, chosen_ww, baseline_ww)
+                ww_scale = max(neuromod.ww_ceil - neuromod.ww_floor, 1e-6)
+                ww_normalized = ((ww_em - neuromod.ww_floor) / ww_scale).clamp(0.0, 1.0)
+                target_ww_normalized = ((target_ww - neuromod.ww_floor) / ww_scale).clamp(0.0, 1.0)
+                sq_err_ww = (ww_normalized - target_ww_normalized).pow(2)
+                loss_ww = (sq_err_ww * weight).sum() / weight.sum().clamp(min=1e-6)
+            else:
+                loss_ww = torch.tensor(0.0, device=g_em.device)
+
+            total_loss = loss_g + loss_tau + loss_ww
+            total_loss_val += total_loss.item()
+            total_loss.backward()
         return total_loss_val
 
     def _rl_step(self, snapshots: list) -> dict:
@@ -1106,7 +1165,7 @@ class TBPTTTrainer:
                     em_usage = last_snap.em_usages.get(b_idx)
                     em_nov = last_snap.em_novelties.get(b_idx)
                     if em_usage is not None and em_nov is not None:
-                        _, gem, _ = nm_em(
+                        _, gem, tau_out, ww_out = nm_em(
                             last_snap.span_surprise_mean, em_usage, em_nov,
                         )
                         g_em_vals.append(gem.mean().item())

@@ -8,7 +8,7 @@ providing common state management (detach/reset/save/load).
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 
 # ---------------------------------------------------------------------------
@@ -20,17 +20,21 @@ def unit_normalize(x: Tensor, dim: int = -1, eps: float = 1e-8) -> Tensor:
     return x / (x.norm(dim=dim, keepdim=True) + eps)
 
 
-def soft_topk(scores: Tensor, k: int, tau: float = 1.0) -> Tensor:
+def soft_topk(scores: Tensor, k: int, tau: Union[float, Tensor] = 1.0) -> Tensor:
     """Softmax over top-k entries, zero rest.
 
     Args:
         scores: [*, N] raw scores
         k: number of entries to keep
-        tau: softmax temperature
+        tau: softmax temperature — scalar or [*] tensor for per-row temperature
 
     Returns:
         weights: [*, N] with top-k softmaxed, rest zero
     """
+    # If tau is a tensor with batch dims, unsqueeze for broadcasting with [..., N]
+    if isinstance(tau, Tensor) and tau.dim() >= 1:
+        tau = tau.unsqueeze(-1)  # [*, 1]
+
     N = scores.shape[-1]
     if k >= N:
         return torch.softmax(scores / tau, dim=-1)

@@ -48,6 +48,10 @@ class ModelConfig:
     decay_em: float = 0.999   # per-span strength decay
     g_em_floor: float = 0.001  # minimum write strength (learned mode, near-zero = soft "don't write")
     g_em_ceil: float = 0.95    # maximum write strength (learned mode)
+    tau_em_floor: float = 0.05   # min soft top-k temperature (learned mode)
+    tau_em_ceil: float = 5.0     # max soft top-k temperature (learned mode)
+    ww_em_floor: float = 0.0    # min weakness weight (learned mode)
+    ww_em_ceil: float = 2.0     # max weakness weight (learned mode)
     em_readout_ffn: bool = True       # MLP after EM cross-attention retrieval
 
     # Training
