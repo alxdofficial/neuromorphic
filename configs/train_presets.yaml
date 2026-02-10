@@ -37,6 +37,22 @@ presets:
         steps: 7000
         resume: checkpoints/manual_phase_c_last.pt
 
+  quick_test:
+    run_name: quick_test
+    phases:
+      - phase: A
+        steps: 100
+        resume: null
+      - phase: B
+        steps: 200
+        resume: auto_previous
+      - phase: C
+        steps: 200
+        resume: auto_previous
+      - phase: D
+        steps: 200
+        resume: auto_previous
+
   full_a_to_e:
     run_name: full_a_to_e
     phases:
