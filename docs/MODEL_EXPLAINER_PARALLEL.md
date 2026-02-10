@@ -587,7 +587,7 @@ model.surprise = span_surprise_mean                              # next span's f
 
 **Impact of the PM/EM gap:** In non-lifelong mode (phases A-D), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=31 tokens per boundary event. In lifelong mode (Phase E), PM/EM state intentionally persists across documents, so there is no gap.
 
-**Eligibility reset detail** (trainer.py:355-361):
+**Eligibility reset detail** (span_ops.py: `apply_pm_eligibility_batch`):
 ```python
 for t_local in range(span_P):
     reset_t = reset_mask_all[:, t_local]
@@ -687,7 +687,7 @@ Uses `propose_candidate_batch()` which batches the same math as `propose_candida
 
 ## 10. Training Loop Integration
 
-**File:** `src/training/trainer.py`
+**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops used by trainer, validation, and eval_lifelong), `src/training/rl_rollout.py` (RL counterfactual rollouts)
 
 ### 10.1 Span Loop Structure (Phase D — Full Architecture)
 
@@ -904,6 +904,8 @@ The parallel path intentionally does not support:
 | `src/model/block.py` | `Block.forward_span()` — orchestrates batched components, caches `_last_layer_stack` |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `_compute_reset_masks()` |
-| `src/training/trainer.py` | Span loop with parallel forward, post-forward eligibility/EM/surprise |
+| `src/training/trainer.py` | Span loop orchestration, delegates to span_ops and rl_rollout |
+| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM/EM accumulation and commits |
+| `src/training/rl_rollout.py` | `RLRolloutEngine` — counterfactual rollouts for neuromodulator training |
 | `src/training/loss.py` | `batched_cross_entropy()` — span-level loss computation |
 | `tests/test_scan.py` | 28 equivalence tests: parallel vs sequential output, state, gradients |

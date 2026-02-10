@@ -885,7 +885,6 @@ The following metrics are logged to JSONL when RL is active:
 | `rl_em_tau_loss` | Mean weighted MSE loss for EM tau (normalized to [0,1]) |
 | `rl_em_ww_loss` | Mean weighted MSE loss for EM ww (normalized to [0,1]) |
 | `rl_pm_commit_rate` | Fraction of streams where `p_commit > 0.5` |
-| `rl_em_write_rate` | Always 1.0 in learned mode (every stream writes) |
 | `rl_pm_lambda_mean` | Mean learned lambda across all PM instances |
 | `rl_pm_g_mean` | Mean learned g across all PM instances |
 | `rl_em_g_mean` | Mean learned g_em across all EM instances |
@@ -1059,7 +1058,7 @@ load_runtime_state(model, state)  # Restore saved state
 
 ## 14. Training Loop (TBPTT + Spans)
 
-**File:** `src/training/trainer.py`
+**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops), `src/training/rl_rollout.py` (RL counterfactual rollouts)
 
 ### 14.1 Two Time Scales
 
@@ -1583,7 +1582,9 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 | `src/model/episodic_memory.py` | `EpisodicMemory`, `EMNeuromodulator` (three-mode: heuristic / continuous-learned / fully-learned) |
 | `src/model/utils.py` | `StateMixin`, `unit_normalize`, `soft_topk`, `budget_enforce` |
 | `src/model/state.py` | `save_runtime_state`, `load_runtime_state`, `detach_all`, `reset_all` |
-| `src/training/trainer.py` | `TBPTTTrainer`, `BoundarySnapshot` -- chunk processing, span boundaries, RL rollouts |
+| `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, orchestrates span loop |
+| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM eligibility/commit, EM candidates/write |
+| `src/training/rl_rollout.py` | `BoundarySnapshot`, `RLRolloutEngine` -- counterfactual RL rollouts for neuromodulators |
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
 | `src/training/eval_lifelong.py` | Phase E evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |

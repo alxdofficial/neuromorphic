@@ -76,11 +76,11 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 10_000,            # smoke + base competence
-    "B": 300_000,           # ~2.5B tokens at BS=32,T=256
-    "C": 300_000,           # ~2.5B tokens at BS=32,T=256
-    "D": 300_000,           # ~2.5B tokens at BS=32,T=256 (+ rollout overhead)
-    "E": 120_000,           # lifelong adaptation/eval window
+    "A": 2_000,             # ~25M tokens at BS=48 (~30min): base WM competence
+    "B": 4_000,             # ~49M tokens (~2hr): PM slot filling + commit learning
+    "C": 5_000,             # ~61M tokens (~3.5hr): EM retrieval + write patterns
+    "D": 7_000,             # ~86M tokens (~6hr): RL neuromod convergence (slowest phase)
+    "E": 2_500,             # ~31M tokens: lifelong adaptation window
 }
 
 # -- Regularization --
@@ -742,7 +742,13 @@ def run_phase(
     if phase_changed or is_auto:
         start_step = 0
 
-    # Dataloader
+    # Dataloader — creates a fresh stream from seed. On resume, the model's
+    # runtime state (h, PM, EM) is restored but the dataloader restarts from
+    # the beginning. Only prev_token is patched (below) to avoid a false
+    # doc-boundary reset on the first batch. This means resumed memory state
+    # is inconsistent with the token stream for the first few chunks until
+    # PM/EM naturally adapt. This is acceptable because PM/EM are designed
+    # to be robust to distribution shifts (same mechanism as Phase E lifelong).
     dataloader = create_dataloader(
         phase=train_data_phase,
         tokenizer=tokenizer,
@@ -951,22 +957,24 @@ def run_phase(
             if sample_batch is not None:
                 try:
                     from .debug.plot_text_samples import generate_text_sample_plot
+                    from .model.state import save_runtime_state as _save_rt, load_runtime_state as _load_rt
                     sample_path = os.path.join(
                         save_dir,
                         f"text_samples_step{trainer.global_step}.png",
                     )
                     current_loss = _step_metrics.get("loss")
+                    # Save full runtime state so generation doesn't corrupt training
+                    _rt_state = _save_rt(model)
                     generate_text_sample_plot(
                         model=model,
                         tokenizer=tokenizer,
-                        batch=sample_batch,
+                        batch=sample_batch.input_ids,
                         step=trainer.global_step,
                         loss=current_loss,
                         save_path=sample_path,
                     )
-                    # Restore model state for training (reset full batch)
-                    reset_mask = torch.ones(bs, dtype=torch.bool, device=device)
-                    model.reset_at_doc_boundary(reset_mask)
+                    # Restore runtime state (not just reset — preserves PM/EM)
+                    _load_rt(model, _rt_state)
                 except Exception as e:
                     print(f"  Warning: text sample generation failed: {e}")
 

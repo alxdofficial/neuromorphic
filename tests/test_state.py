@@ -10,7 +10,6 @@ from src.model.model import NeuromorphicLM
 from src.model.state import (
     _walk_state_mixins, save_runtime_state, load_runtime_state,
 )
-from src.model.utils import StateMixin
 from tests.conftest import make_tiny_config, forward_n_tokens, forward_and_write_em
 
 pytestmark = pytest.mark.invariant

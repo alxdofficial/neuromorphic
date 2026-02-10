@@ -133,10 +133,6 @@ def count_tokens(text: str, tokenizer: PreTrainedTokenizerFast) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
-# Legacy compatibility - these will be set dynamically based on tokenizer
-EOT_TOKEN_ID = None  # Use tokenizer.eos_token_id instead
-VOCAB_SIZE = None    # Use len(tokenizer) instead
-
 
 if __name__ == "__main__":
     print("Available tokenizer presets:")

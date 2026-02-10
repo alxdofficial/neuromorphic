@@ -15,6 +15,7 @@ from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
 from .loss import batched_cross_entropy
+from . import span_ops
 
 
 def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
@@ -50,7 +51,10 @@ def evaluate_validation(
 ) -> dict:
     """Validate masked CE/perplexity over held-out chunks.
 
-    Runtime state and config toggles are restored after validation.
+    Runtime state and config toggles (pm_enabled, em_enabled) are temporarily
+    overridden if caller passes explicit values, then restored in the finally
+    block. Model runtime state is also saved/restored so validation is
+    side-effect free.
     """
     total_loss = 0.0
     valid_count = 0
@@ -112,11 +116,9 @@ def evaluate_validation(
                     raise RuntimeError("Non-finite logits detected during validation.")
 
                 # Loss masking
-                is_eot_all = (span_ids == eot_id)
-                if config.reset_on_doc_boundary:
-                    loss_mask_all = ~is_eot_all
-                else:
-                    loss_mask_all = torch.ones_like(is_eot_all)
+                is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
+                    span_ids, eot_id, config.reset_on_doc_boundary
+                )
 
                 # Batched loss
                 span_loss, span_valid = batched_cross_entropy(
@@ -129,30 +131,22 @@ def evaluate_validation(
                 logp = F.log_softmax(logits_all, dim=-1)
                 token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
                 token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
-                # Note: model.surprise updated below to span mean (matching trainer)
 
                 # Compute reset masks for accumulators
-                reset_mask_all = model._compute_reset_masks(span_ids, reset_first)
-                if not config.reset_on_doc_boundary:
-                    reset_mask_all = torch.zeros_like(reset_mask_all)
+                reset_mask_all = span_ops.compute_reset_mask(
+                    model, span_ids, reset_first, config.reset_on_doc_boundary
+                )
 
                 # Track span surprise for boundary decisions
                 span_surprise_accum = torch.zeros(BS, device=device)
                 span_valid_tokens = torch.zeros(BS, device=device)
                 span_last_reset = torch.zeros(BS, dtype=torch.long, device=device)
 
-                for t_local in range(span_P):
-                    reset_t = reset_mask_all[:, t_local]
-                    if reset_t.any() and config.reset_on_doc_boundary:
-                        span_last_reset[reset_t] = t_local
-                        span_surprise_accum[reset_t] = 0
-                        span_valid_tokens[reset_t] = 0
-                    lm = loss_mask_all[:, t_local]
-                    span_surprise_accum = (
-                        span_surprise_accum
-                        + token_surprise[:, t_local, 0] * lm.float()
-                    )
-                    span_valid_tokens = span_valid_tokens + lm.float()
+                span_ops.accumulate_span_surprise(
+                    token_surprise, loss_mask_all, reset_mask_all,
+                    config.reset_on_doc_boundary,
+                    span_surprise_accum, span_valid_tokens, span_last_reset,
+                )
 
                 total_tokens += BS * span_P
                 eot_inputs += int(is_eot_all.sum().item())
@@ -165,67 +159,32 @@ def evaluate_validation(
 
                 # PM eligibility + commit
                 if config.pm_enabled:
-                    # Batched eligibility (matching trainer)
-                    x_proj_all = model.W_in(x_emb_all)  # [BS, span_P, D]
-                    x_blocks_all = x_proj_all.view(
-                        BS, span_P, config.B, config.D_h
-                    )  # [BS, span_P, B, D_h]
-
-                    for b, block in enumerate(model.blocks):
-                        for layer in block.layers:
-                            if not hasattr(layer, '_last_h_all') or layer._last_h_all is None:
-                                continue
-
-                            l_idx = layer.layer_idx
-                            if l_idx == 0:
-                                x_in = x_blocks_all[:, :, b]
-                            else:
-                                x_in = block.layers[l_idx - 1]._last_h_all
-
-                            h_out = layer._last_h_all
-
-                            layer.pm.update_eligibility_batch(
-                                x_in, h_out, token_surprise, reset_mask_all,
-                            )
-                    # Decay + commit
-                    for block in model.blocks:
-                        for layer in block.layers:
-                            layer.pm.base_decay()
-                    model.commit_at_boundary(span_surprise=span_surprise_mean)
+                    span_ops.apply_pm_eligibility_batch(
+                        model, x_emb_all, token_surprise,
+                        reset_mask_all, config,
+                    )
+                    span_ops.apply_pm_boundary(model, span_surprise_mean)
 
                 # EM candidates + write
                 if config.em_enabled:
-                    for b, block in enumerate(model.blocks):
-                        h_final_all = getattr(block.layers[-1], '_last_h_all', None)
-                        if h_final_all is None:
-                            continue
-                        k_c, v_c, nov = block.em.propose_candidate_batch(
-                            x_emb_all, y_wm_all, h_final_all, token_surprise,
-                        )
-                        S = nov.shape[1]
-                        pos = torch.arange(S, device=device).unsqueeze(0)
-                        cand_valid = (
-                            pos >= span_last_reset.unsqueeze(1)
-                        ) & loss_mask_all.bool()
+                    B = config.B
+                    cand_K = [[] for _ in range(B)]
+                    cand_V = [[] for _ in range(B)]
+                    cand_score = [[] for _ in range(B)]
+                    cand_token_valid = [[] for _ in range(B)]
 
-                        em_usage = (
-                            block.em.em_S.sum(dim=-1)
-                            if block.em.em_S is not None
-                            else torch.zeros_like(span_surprise_mean)
-                        )
-                        cand_valid_f = cand_valid.float()
-                        cand_count = cand_valid_f.sum(dim=-1).clamp(min=1)
-                        cand_novelty_mean = (nov * cand_valid_f).sum(dim=-1) / cand_count
-                        write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
-                            span_surprise_mean,
-                            em_usage / config.budget_em,
-                            cand_novelty_mean,
-                        )
-                        block.em.write_at_boundary(
-                            k_c, v_c, nov, write_mask, g_em,
-                            tau=tau_em, weakness_weight=ww_em,
-                            cand_valid=cand_valid,
-                        )
+                    span_ops.propose_em_candidates(
+                        model, x_emb_all, y_wm_all, token_surprise,
+                        loss_mask_all, cand_K, cand_V, cand_score,
+                        cand_token_valid,
+                    )
+                    em_stacked = span_ops.stack_em_candidates(
+                        cand_K, cand_V, cand_score, cand_token_valid,
+                        span_last_reset, device,
+                    )
+                    span_ops.apply_em_boundary(
+                        model, em_stacked, span_surprise_mean, config,
+                    )
 
             model.detach_states()
             steps_done += 1

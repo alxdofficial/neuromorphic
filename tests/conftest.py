@@ -13,7 +13,6 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.model.config import ModelConfig
-from src.model.model import NeuromorphicLM
 
 
 # ---------------------------------------------------------------------------
@@ -48,92 +47,8 @@ def make_tiny_config(**overrides):
 
 
 # ---------------------------------------------------------------------------
-# Config fixtures
-# ---------------------------------------------------------------------------
-@pytest.fixture
-def tiny_config():
-    return make_tiny_config()
-
-
-@pytest.fixture
-def tiny_config_phase_a():
-    cfg = make_tiny_config()
-    cfg.set_phase("A")
-    return cfg
-
-
-@pytest.fixture
-def tiny_config_phase_b():
-    cfg = make_tiny_config()
-    cfg.set_phase("B")
-    return cfg
-
-
-@pytest.fixture
-def tiny_config_phase_c():
-    cfg = make_tiny_config()
-    cfg.set_phase("C")
-    return cfg
-
-
-@pytest.fixture
-def tiny_config_phase_d():
-    cfg = make_tiny_config()
-    cfg.set_phase("D")
-    return cfg
-
-
-@pytest.fixture
-def tiny_config_phase_e():
-    cfg = make_tiny_config()
-    cfg.set_phase("D")   # get rl_enabled=True first
-    cfg.set_phase("E")
-    return cfg
-
-
-@pytest.fixture
-def tiny_config_decoder():
-    cfg = make_tiny_config(snapshot_enabled=True)
-    cfg.set_phase("C")
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Model fixtures
-# ---------------------------------------------------------------------------
-@pytest.fixture
-def tiny_model(tiny_config_phase_a):
-    return NeuromorphicLM(tiny_config_phase_a)
-
-
-@pytest.fixture
-def tiny_model_phase_b(tiny_config_phase_b):
-    return NeuromorphicLM(tiny_config_phase_b)
-
-
-@pytest.fixture
-def tiny_model_phase_c(tiny_config_phase_c):
-    return NeuromorphicLM(tiny_config_phase_c)
-
-
-@pytest.fixture
-def tiny_model_phase_d(tiny_config_phase_d):
-    return NeuromorphicLM(tiny_config_phase_d)
-
-
-@pytest.fixture
-def tiny_model_decoder(tiny_config_decoder):
-    return NeuromorphicLM(tiny_config_decoder)
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def make_random_batch(BS=2, T=16, vocab=64):
-    """Return (input_ids, targets) as [BS, T] LongTensors."""
-    input_ids = torch.randint(0, vocab, (BS, T))
-    targets = torch.randint(0, vocab, (BS, T))
-    return input_ids, targets
 
 
 def forward_n_tokens(model, n, BS=2, vocab=64, with_commits=False):

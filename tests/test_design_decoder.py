@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from src.model.model import NeuromorphicLM
-from src.model.decoder import SpatialDecoder
 from src.model.config import ModelConfig
 from tests.conftest import make_tiny_config
 from tests.design_constants import DEFAULTS, DECODER_OUTPUT_PROJ_INIT_STD

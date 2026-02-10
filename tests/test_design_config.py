@@ -1,7 +1,6 @@
 """Design-specific config tests — update design_constants.py when design changes."""
 
 import pytest
-from dataclasses import fields
 
 from src.model.config import ModelConfig
 from tests.design_constants import (

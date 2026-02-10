@@ -18,23 +18,23 @@ presets:
     run_name: phase_a_to_d
     phases:
       - phase: A
-        steps: 10000
+        steps: 2000
         resume: null
       - phase: B
-        steps: 300000
+        steps: 4000
         resume: auto_previous
       - phase: C
-        steps: 300000
+        steps: 5000
         resume: auto_previous
       - phase: D
-        steps: 300000
+        steps: 7000
         resume: auto_previous
 
   phase_d_from_ckpt:
     run_name: phase_d_from_ckpt
     phases:
       - phase: D
-        steps: 300000
+        steps: 7000
         resume: checkpoints/manual_phase_c_last.pt
 
   full_a_to_e:
@@ -49,4 +49,5 @@ presets:
       - phase: D
         resume: auto_previous
       - phase: E
+        steps: 2500
         resume: auto_previous

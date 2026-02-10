@@ -22,6 +22,7 @@ from torch import Tensor
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
+from . import span_ops
 
 
 @dataclass
@@ -43,6 +44,12 @@ def _compute_chunk_ppl(
     prev_token: Optional[Tensor] = None,
 ) -> tuple:
     """Run model over a token chunk, return perplexity and last token.
+
+    INVARIANT: Uses forward_one_token (not forward_span) because lifelong
+    eval streams tokens sequentially with persistent state across chunks.
+    Surprise is updated per-token via model.update_surprise(), and EM
+    candidates use propose_candidate (singular, not _batch). Boundary ops
+    share span_ops.apply_pm_boundary / apply_em_boundary with the trainer.
 
     Args:
         model: the model (with persistent state)
@@ -141,44 +148,31 @@ def _compute_chunk_ppl(
 
         # Span boundary commits
         if config.pm_enabled:
-            for block in model.blocks:
-                for layer in block.layers:
-                    layer.pm.base_decay()
-            model.commit_at_boundary(span_surprise=span_surprise_mean)
+            span_ops.apply_pm_boundary(model, span_surprise_mean)
 
         # Span boundary EM writes
         if config.em_enabled:
-            for b, block in enumerate(model.blocks):
+            # INVARIANT: forward_one_token path uses torch.stack (not cat)
+            # because each candidate is [BS, D_em], not [BS, span_P, D_em].
+            # We stack them into [BS, num_tokens, ...] then use shared stacking.
+            stacked_cand_K = [[] for _ in range(B)]
+            stacked_cand_V = [[] for _ in range(B)]
+            stacked_cand_score = [[] for _ in range(B)]
+            stacked_cand_valid = [[] for _ in range(B)]
+            for b in range(B):
                 if len(cand_K[b]) > 0:
-                    stacked_K = torch.stack(cand_K[b], dim=1)
-                    stacked_V = torch.stack(cand_V[b], dim=1)
-                    stacked_score = torch.stack(cand_score[b], dim=1)
-                    stacked_token_valid = torch.stack(cand_token_valid[b], dim=1)
+                    stacked_cand_K[b].append(torch.stack(cand_K[b], dim=1))
+                    stacked_cand_V[b].append(torch.stack(cand_V[b], dim=1))
+                    stacked_cand_score[b].append(torch.stack(cand_score[b], dim=1))
+                    stacked_cand_valid[b].append(torch.stack(cand_token_valid[b], dim=1))
 
-                    S = stacked_score.shape[1]
-                    pos = torch.arange(S, device=device).unsqueeze(0)  # [1, S]
-                    cand_valid = (
-                        pos >= span_last_reset.unsqueeze(1)
-                    ) & stacked_token_valid.bool()                     # [BS, S]
-
-                    em_usage = (
-                        block.em.em_S.sum(dim=-1)
-                        if block.em.em_S is not None
-                        else torch.zeros_like(span_surprise_mean)
-                    )
-                    cand_valid_f = cand_valid.float()
-                    cand_count = cand_valid_f.sum(dim=-1).clamp(min=1)  # [BS]
-                    cand_novelty_mean = (stacked_score * cand_valid_f).sum(dim=-1) / cand_count
-                    write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
-                        span_surprise_mean,
-                        em_usage / config.budget_em,
-                        cand_novelty_mean,
-                    )
-                    block.em.write_at_boundary(
-                        stacked_K, stacked_V, stacked_score, write_mask, g_em,
-                        tau=tau_em, weakness_weight=ww_em,
-                        cand_valid=cand_valid,
-                    )
+            em_stacked = span_ops.stack_em_candidates(
+                stacked_cand_K, stacked_cand_V, stacked_cand_score,
+                stacked_cand_valid, span_last_reset, device,
+            )
+            span_ops.apply_em_boundary(
+                model, em_stacked, span_surprise_mean, config,
+            )
 
     # Detach states after chunk
     model.detach_states()

@@ -6,3 +6,8 @@ markers = [
     "design: design choice tests, expected to change with design_constants.py",
 ]
 addopts = "-v --tb=short -m 'not slow'"
+
+[tool.ruff]
+line-length = 120
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

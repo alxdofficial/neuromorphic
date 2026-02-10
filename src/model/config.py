@@ -127,6 +127,10 @@ class ModelConfig:
         C: WM + PM + EM
         D: WM + PM + EM (+ RL controllers)
         E: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
+
+        Design intent: All downstream code branches on capability flags
+        (pm_enabled, em_enabled, rl_enabled) — never on phase letters.
+        This method is the single point where phase -> flags mapping lives.
         """
         phase = phase.upper()
         if phase == "A":
