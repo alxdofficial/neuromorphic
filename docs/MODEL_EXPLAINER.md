@@ -390,6 +390,48 @@ def reset_eligibility(self, mask):
 
 **Intuition:** Eligibility traces represent partial, uncommitted learning from the current document. They are stale across doc boundaries and should reset. But committed PM state (`pm_K`, `pm_V`, `pm_a`) has passed through the neuromodulator's selection logic and represents consolidated knowledge -- it should persist.
 
+### 7.6 PM: Complete Learnable Components Reference
+
+This table covers **every learnable weight, runtime state, and control signal** that PM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "RL" means the parameter is updated via counterfactual rollout (BCE or weighted MSE). "Rules" means updated by explicit code (EMA, decay, budget enforcement) — no gradient.
+
+#### Learned Parameters (nn.Parameter, saved in state_dict)
+
+| Component | Location | Shape (Tier A) | What It Controls | Training | Phase | Parallelization | Lifelong Role |
+|-----------|----------|----------------|------------------|----------|-------|-----------------|---------------|
+| `W_k_pre` | `PM.W_k_pre` | `Linear(D_h, D_h)` per instance | Projects layer **input** into candidate keys — decides *what patterns to match* | Backprop (main opt) | B+ | Per-token in `update_eligibility_batch`; parallelized in `forward_span` | Learns general pattern-recognition; persists across docs |
+| `W_v_post` | `PM.W_v_post` | `Linear(D_h, D_h)` per instance | Projects layer **output** into candidate values — decides *what to retrieve when matched* | Backprop (main opt) | B+ | Per-token in `update_eligibility_batch`; parallelized in `forward_span` | Learns general value-encoding; persists across docs |
+| `readout_norm` | `PM.readout_norm` | `LayerNorm(D_h)` | Normalizes raw PM read output before FFN | Backprop (main opt) | B+ | Per-token in `apply`/`apply_batch` | Static after convergence |
+| `readout_ffn` | `PM.readout_ffn` | `Linear(D_h, 4*D_h)` + `Linear(4*D_h, D_h)` | Nonlinear transform of retrieved PM content before injection into recurrence | Backprop (main opt) | B+ | Per-token in `apply`/`apply_batch` | Static after convergence |
+| `gate_a, gate_b` | `Layer.gate_a/b` | `Linear(4*D_h+1, D_h)` | Retention/update gates consuming PM read output (among other signals) | Backprop (main opt) | A+ | Per-token, parallelized via scan | Static after convergence |
+| `W_o` | `Layer.W_o` | `Linear(D_h, D_h)` | Output projection after recurrence | Backprop (main opt) | A+ | Per-token, parallelized via scan | Static after convergence |
+| PMNeuromod `backbone` | `layer.pm_neuromodulator` | `Linear(3, H=32)` + ReLU | Shared representation for all PM neuromod heads | Backprop (main B–C; RL opt D+) | B+ | Boundary-only (once per P tokens) | Adapts to stream-specific surprise/usage patterns |
+| PMNeuromod `lambda_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Decay rate** for pm_a after commit: controls how quickly slot strengths decay. Range `[decay_pm, 1.0]` via sigmoid | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Sets forgetting speed; learned per-stream |
+| PMNeuromod `g_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Commit strength** (alpha blending factor): how strongly new eligibility overwrites existing slots | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Controls plasticity-stability tradeoff |
+| PMNeuromod `slot_head` | `layer.pm_neuromodulator` | `Linear(H, r=8)` | **Slot selection bias**: additive logits for soft top-k slot choice — shifts which slots get overwritten | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Learns slot allocation strategy |
+| PMNeuromod `gate_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Commit gate** (p_commit): binary decision whether to commit at all. `(p_commit > 0.5).detach()` → non-differentiable | RL only (BCE on p_commit) | D+ | Boundary-only | Learns when to consolidate new knowledge vs skip |
+
+#### Runtime State (not nn.Parameter — updated by rules at boundaries)
+
+| State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
+|-------|-------|----------------|-------------|--------------|-------------------|
+| `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `soft_topk_weights * g * commit_mask` | Span boundary (commit) | Persists in Phase E; accumulates cross-doc knowledge |
+| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase E |
+| `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase E; base_decay prevents runaway |
+| `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase E: reset_eligibility) |
+| `elig_V` | `[BS, r, D_h]` | Value eligibility trace | Same as elig_K with v_cand | Every token | Reset on doc boundary |
+| `h` | `[BS, D_h]` | Layer hidden state | Affine recurrence: `h = a*h + b` from gates | Every token | Reset on doc boundary (even Phase E) |
+
+#### Control Signals (computed, not stored — ephemeral per boundary)
+
+| Signal | Source | What It Decides | Differentiable? |
+|--------|--------|-----------------|-----------------|
+| `commit_mask` | PMNeuromod | Whether to commit at all (Phase A–C: heuristic `elig_norm > 1.0`; Phase D: `p_commit > 0.5`) | No (detached bool) |
+| `lambda_vals` | PMNeuromod | Per-stream decay rate for pm_a post-commit | Yes (Phase B+) |
+| `g` | PMNeuromod | Per-stream commit strength (alpha multiplier) | Yes (Phase B+) |
+| `slot_logits` | PMNeuromod | Additive bias on slot scores for soft top-k | Yes (Phase B+) |
+| `soft_topk weights` | `soft_topk(scores, k=2)` | Which slots to overwrite (continuous [0,1] weights) | Yes |
+| `alpha` | `weights * g * commit_mask` | Final per-slot blending factor | Partially (commit_mask is detached) |
+
 ---
 
 ## 8. Episodic Memory (EM)
@@ -516,6 +558,48 @@ At the span boundary, candidates are selected and written:
 **Why?** Zeroing strengths makes all slots invisible to retrieval (the `em_S > 0` mask filters them out) without destroying the actual key-value content. When new writes occur, they can reuse these slots via the weakness-biased slot selection (slots with `em_S=0` are preferred targets). This is more graceful than re-randomizing keys, which would destroy any useful patterns in the key space.
 
 In Phase E (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
+
+### 8.6 EM: Complete Learnable Components Reference
+
+This table covers **every learnable weight, runtime state, and control signal** that EM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "RL" means updated via counterfactual rollout (weighted MSE). "Rules" means updated by explicit code (EMA, decay, budget enforcement).
+
+#### Learned Parameters (nn.Parameter, saved in state_dict)
+
+| Component | Location | Shape (Tier A) | What It Controls | Training | Phase | Parallelization | Lifelong Role |
+|-----------|----------|----------------|------------------|----------|-------|-----------------|---------------|
+| `W_q_em` | `EM.W_q_em` | `Linear(D+D, D_em)` | **Retrieval query** from `concat(x_emb, y_wm)` — decides *how to search* the memory bank | Backprop (main opt) | C+ | Per-token in `retrieve_batch`; parallelized in `forward_span` | Static after convergence |
+| `W_q_cross` | `EM.W_q_cross` | `Linear(D_em, D_em)` | **Cross-attention query** over top-k retrieved values — decides *which retrieved memory to attend to* | Backprop (main opt) | C+ | Per-token in `retrieve_batch` | Static after convergence |
+| `W_o_cross` | `EM.W_o_cross` | `Linear(D_em, D)` | **Output projection** from EM dim back to model dim — shapes *how retrieved content is injected* | Backprop (main opt) | C+ | Per-token in `retrieve_batch` | Static after convergence |
+| `readout_norm` | `EM.readout_norm` | `LayerNorm(D_em)` | Normalizes cross-attention output before FFN | Backprop (main opt) | C+ | Per-token | Static after convergence |
+| `readout_ffn` | `EM.readout_ffn` | `Linear(D_em, 4*D_em)` + `Linear(4*D_em, D_em)` | Nonlinear transform of retrieved EM content before projection to model dim | Backprop (main opt) | C+ | Per-token | Static after convergence |
+| `W_k_cand` | `EM.W_k_cand` | `Linear(D+D, D_em)` | Projects `concat(x_emb, y_wm)` into **candidate keys** — decides *what patterns to store* | Backprop (main opt) | C+ | Per-token in `propose_candidate_batch` | Learns general pattern encoding |
+| `W_v_cand` | `EM.W_v_cand` | `Linear(D_h, D_em)` | Projects final layer hidden state into **candidate values** — decides *what content to store* | Backprop (main opt) | C+ | Per-token in `propose_candidate_batch` | Learns general value encoding |
+| `W_nov` | `EM.W_nov` | `Linear(D+D, 1)` | **Learned novelty weighting** — per-token blend of surprise vs dissimilarity for scoring candidate importance. Replaces hardcoded 0.5/0.5 | Backprop (main opt only, never RL) | C+ | Per-token in `propose_candidate_batch` | Adapts novelty sensing to domain |
+| EMNeuromod `backbone` | `block.em_neuromodulator` | `Linear(3, H=32)` + ReLU | Shared representation for all EM neuromod heads. Inputs: span_surprise, em_usage, cand_novelty_mean | Backprop (main C; RL opt D+) | C+ | Boundary-only (once per P tokens) | Adapts write decisions to stream context |
+| EMNeuromod `g_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Write strength** (g_em): how strongly new candidates overwrite existing slots. Range `[0.001, 0.95]` via `floor + range * sigmoid(raw)` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Controls plasticity-stability tradeoff for episodic memory |
+| EMNeuromod `tau_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Slot selection temperature** (tau): controls `soft_topk` sharpness. Low tau → sharper selection (few slots updated strongly). Range `[0.05, 5.0]` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Learns whether to concentrate or spread writes |
+| EMNeuromod `ww_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Weakness weight** (ww): how much to prefer overwriting weak slots vs similar slots. Range `[0.0, 2.0]` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Learns slot replacement strategy |
+
+#### Runtime State (not nn.Parameter — updated by rules at boundaries)
+
+| State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
+|-------|-------|----------------|-------------|--------------|-------------------|
+| `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `soft_topk_weights * g_em * write_mask` | Span boundary (per candidate in span) | Persists in Phase E; K/V content survives doc reset |
+| `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase E |
+| `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay_em`, then budget_enforce | Span boundary | Persists in Phase E; base_decay prevents runaway. In Phases A–D: zeroed on doc boundary (makes slots invisible but preserves K/V) |
+
+#### Control Signals (computed, not stored — ephemeral per boundary)
+
+| Signal | Source | What It Decides | Differentiable? |
+|--------|--------|-----------------|-----------------|
+| `write_mask` | EMNeuromod | Whether to write at all (Phase A–C: heuristic `novelty > 0.3`; Phase D: always True) | No (bool) |
+| `g_em` | EMNeuromod | Per-stream write strength (alpha multiplier). Near-zero floor enables soft "don't write" | Yes (Phase C+) |
+| `tau` | EMNeuromod | Per-stream soft_topk temperature — sharpness of slot selection | Yes (Phase C+); batched `[BS]` tensor |
+| `ww` (weakness_weight) | EMNeuromod | Per-stream bias toward overwriting weak slots (low em_S) | Yes (Phase C+); batched `[BS]` tensor |
+| `soft_topk weights` | `soft_topk(scores, k=k_write, tau)` | Which slots to overwrite (continuous [0,1] weights over top-k within top-C) | Yes |
+| `alpha` | `weights * g_em * write_mask` | Final per-slot blending factor (one per candidate per slot) | Partially (write_mask is detached) |
+| `cand_score` (novelty) | `propose_candidate_batch` | Per-token novelty score: blend of surprise + dissimilarity from existing keys | Yes (through W_nov, Phase C+) |
+| `cand_valid` | Trainer | Mask for candidates within current doc and non-EOT | No (computed from token IDs) |
 
 ---
 
@@ -1147,7 +1231,7 @@ def compute_regularizers(model):
 | **A** | WM only | False | False | Empty shells (0 params) | Stable streaming, perplexity decreases |
 | **B** | WM + PM | False | False | PM: backbone + continuous heads (main optimizer) | Memory bench improvement, learned commit strength |
 | **C** | WM + PM + EM | False | False | PM + EM: backbone + continuous heads + W_nov (main optimizer) | Explicit recall, learned write strength + novelty |
-| **D** | WM + PM + EM + RL | True | False | PM: + gate_head; EM: always-write + RL on g_em (RL optimizer) | Learned gating, RL counterfactual training |
+| **D** | WM + PM + EM + RL | True | False | PM: + gate_head; EM: always-write + RL on g_em/tau/ww (RL optimizer) | Learned gating, RL counterfactual training |
 | **E** | WM + PM + EM + lifelong | *inherited* | True | Inherited from prior phase | PM/EM persist across doc boundaries |
 
 `config.set_phase("X")` toggles the appropriate flags:
@@ -1267,7 +1351,7 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
                 ╎
           RL optimizer combines:
           PM: continuous grads + gate grad (BCE on p_commit)
-          EM: continuous grads + RL grad (weighted MSE on normalized g_em)
+          EM: continuous grads + RL grad (weighted MSE on g_em, tau, ww)
           → single rl_optimizer.step()
 
     Main optimizer (separate):
@@ -1307,6 +1391,177 @@ This section documents the design decisions that were verified during the Phase 
 - **EM counterfactual uses baseline strength (g_em=0.3) vs chosen strength:** Both arms always write. The counterfactual tests whether the neuromod's chosen `g_em` outperforms a fixed default, teaching the neuromod to deviate from the default only when beneficial.
 - **4 forward passes per RL event** (PM force_off/on + EM baseline/chosen): PM and EM need independent counterfactuals because their effects are different (PM affects layer computation, EM affects block-level retrieval).
 - **Surprise as neuromodulator input** (not just novelty): Surprise reflects the model's overall prediction quality, which is a useful signal for deciding whether to consolidate learning. Novelty is specific to EM candidates.
+
+---
+
+## 21. Training Cost and Performance Estimates
+
+This section provides throughput estimates, training budgets, and hardware recommendations for different scenarios. All numbers are **estimates** based on standard GPU throughput formulas, cloud pricing as of early 2025, and the model's non-transformer architecture (which has different compute characteristics than standard attention-based models).
+
+### 21.1 Key Architectural Differences from Transformers
+
+Our model uses **affine recurrence** (not attention) as the core sequence mechanism, plus memory reads/writes at span boundaries. This means:
+
+- **No quadratic attention cost:** Compute scales linearly with sequence length (within spans)
+- **Parallelizable within spans:** `forward_span` uses a parallel scan over P=32 tokens
+- **Boundary overhead:** PM commit + EM write + neuromodulator forward at every span boundary
+- **RL overhead (Phase D):** 4 extra forward passes per RL event (PM force_off/on + EM baseline/chosen), amortized by `rl_event_prob` (default 0.3) and `rl_event_interval` (default 3)
+
+The recurrence + memory architecture means throughput is **lower than a pure transformer of equal parameter count** but has the advantage of truly O(1) per-token memory and O(n) compute.
+
+### 21.2 Parameter Counts by Tier and Phase
+
+| Tier | D | L | B | Phase A (WM) | Phase D (all) | Neuromod overhead |
+|------|---|---|---|-------------|---------------|-------------------|
+| **A** (Debug) | 512 | 8 | 4 | 56,012,416 | 56,033,136 | 20,720 (0.04%) |
+| **B** (Competitive) | 768 | 12 | 6 | 102,555,456 | 102,620,400 | 64,944 (0.06%) |
+| **C** (Strong) | 1024 | 24 | 8 | 196,265,728 | 196,530,272 | 264,544 (0.13%) |
+
+Neuromodulators add negligible parameter overhead. The cost difference across phases comes from compute, not parameters.
+
+### 21.3 Estimated Throughput by Phase (Single GPU)
+
+Throughput depends heavily on batch size, span length (P=32), and which phases are active. These are rough estimates for typical configurations:
+
+**Tier A (~56M) on RTX 4090 (24GB), BS=32:**
+
+| Phase | Components | Est. tok/s | Bottleneck |
+|-------|-----------|-----------|------------|
+| **A** | WM only | ~500 | Recurrence + WM attention |
+| **B** | WM + PM | ~400 | + PM read/elig every token, commit at boundary |
+| **C** | WM + PM + EM | ~300 | + EM retrieval every token, write at boundary |
+| **D** | WM + PM + EM + RL | ~180 | + 4 rollout forward_span per RL event (~30% of boundaries) |
+| **E** | Lifelong (inherited) | ~250 | Similar to C/D but amortized RL |
+
+**Tier B (~103M) on A100 80GB, BS=32:**
+
+| Phase | Est. tok/s |
+|-------|-----------|
+| **A** | ~800 |
+| **B** | ~650 |
+| **C** | ~500 |
+| **D** | ~300 |
+
+**Tier C (~197M) on A100 80GB, BS=16:**
+
+| Phase | Est. tok/s |
+|-------|-----------|
+| **A** | ~500 |
+| **B** | ~400 |
+| **C** | ~300 |
+| **D** | ~180 |
+
+### 21.4 Training Budget: Tokens vs Time
+
+How long to train on N tokens, given estimated throughput:
+
+**Tier A on 1x RTX 4090 (weighted average ~300 tok/s across phases):**
+
+| Tokens | Hours | Days | Cost @ $0.34/hr |
+|--------|-------|------|-----------------|
+| 1B | 926 | 39 | $315 |
+| 5B | 4,630 | 193 | $1,574 |
+| 10B | 9,259 | 386 | $3,148 |
+| 20B | 18,519 | 772 | $6,296 |
+
+**Tier B on 1x A100 80GB (weighted average ~500 tok/s):**
+
+| Tokens | Hours | Days | Cost @ $1.40/hr |
+|--------|-------|------|-----------------|
+| 5B | 2,778 | 116 | $3,889 |
+| 10B | 5,556 | 231 | $7,778 |
+| 20B | 11,111 | 463 | $15,556 |
+
+**Tier C on 1x A100 80GB (weighted average ~300 tok/s):**
+
+| Tokens | Hours | Days | Cost @ $1.40/hr |
+|--------|-------|------|-----------------|
+| 10B | 9,259 | 386 | $12,963 |
+| 20B | 18,519 | 772 | $25,926 |
+
+### 21.5 Multi-GPU Scaling
+
+For Tier B and C, multi-GPU training significantly reduces wall-clock time. With data-parallel training (each GPU processes different streams):
+
+| Config | Effective tok/s | 10B tokens wall-clock |
+|--------|----------------|----------------------|
+| Tier B, 1x A100 | ~500 | ~231 days |
+| Tier B, 4x A100 | ~1,800 | ~64 days |
+| Tier B, 8x A100 | ~3,200 | ~36 days |
+| Tier C, 4x A100 | ~1,000 | ~116 days |
+| Tier C, 8x A100 | ~1,800 | ~64 days |
+| Tier C, 8x H100 | ~4,000 | ~29 days |
+
+Scaling efficiency is estimated at ~85-90% for data parallelism (independent streams, minimal communication overhead since each stream's memory state is local).
+
+### 21.6 Recommended Training Configurations
+
+#### Overnight Run (Proof-of-concept, single RTX 4090)
+
+- **Tier A**, Phases A→B→C→D, ~12 hours total
+- **Tokens:** ~10M (A: 5M, B: 2M, C: 2M, D: 1M) — enough for loss curves, not convergence
+- **BS:** 32, **T:** 256
+- **Cost:** ~$4
+
+#### Weekend Run (Meaningful training, single RTX 4090)
+
+- **Tier A**, all phases, ~48 hours
+- **Tokens:** ~50M total (~15M per phase, D gets less due to slower throughput)
+- **Cost:** ~$16
+- Should show clear perplexity improvement and memory utilization
+
+#### Serious Experiment (Publishable ablation, single 4090)
+
+- **Tier A**, all phases, ~2 weeks
+- **Tokens:** ~500M (A: 200M, B: 150M, C: 100M, D: 50M)
+- **Cost:** ~$115
+- Sufficient to demonstrate architecture viability and ablate components
+
+#### Publishable Experimental Model (Tier A, full training)
+
+- **Tier A** on 1x RTX 4090
+- **Tokens:** 5B (comparable to Chinchilla-optimal for 56M params)
+- **Duration:** ~193 days (~6.5 months)
+- **Cost:** ~$1,574
+- Alternative: 4x RTX 4090 → ~50 days, ~$1,600 (cluster pricing)
+
+#### Competitive Model (Match GPT-2 Small 124M)
+
+- **Tier B** (~103M params) on 4x A100 80GB
+- **Tokens:** 10-20B (GPT-2 used ~40B tokens for 124M, but Chinchilla scaling suggests ~2B is optimal for 103M; more tokens help with memory systems)
+- **Duration:** 36-64 days
+- **Cost:** $7,800-$15,600 (at $1.40/hr/GPU)
+
+#### Strong Model (Match GPT-2 Medium 345M)
+
+- **Tier C** (~197M params) on 8x A100 80GB
+- **Tokens:** 20B
+- **Duration:** ~64 days
+- **Cost:** ~$15,500 (at $1.40/hr/GPU)
+- Alternative: 8x H100 → ~29 days, ~$11,500 (at $2.50/hr/GPU)
+
+### 21.7 Comparison to Reference Models
+
+| Model | Params | Tokens | Hardware | GPU-hours | Est. Cloud Cost |
+|-------|--------|--------|----------|-----------|-----------------|
+| **GPT-2 Small** | 124M | 40B | 256x V100 | ~43,000 | ~$43K (at V100 rates) |
+| **GPT-2 Medium** | 345M | 40B | 256x V100 | ~120,000 | ~$120K |
+| **LLaMA 1 7B** | 7B | 1.4T | 2048x A100 | ~82,000 | ~$115K (at A100 rates) |
+| **LLaMA 2 7B** | 7B | 2T | A100-80GB cluster | 184,320 | ~$258K |
+| **LLaMA 2 13B** | 13B | 2T | A100-80GB cluster | 368,640 | ~$516K |
+| **LLaMA 2 70B** | 70B | 2T | A100-80GB cluster | 1,720,320 | ~$2.4M |
+
+Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms could achieve better performance-per-parameter than standard transformers, especially on tasks requiring long-context recall, domain adaptation, and continual learning. The publishable hypothesis is that a 56M neuromorphic model with trained memory can match or outperform a 124M standard transformer on relevant benchmarks.
+
+### 21.8 Cloud Pricing Reference (Early 2025)
+
+| GPU | VRAM | RunPod Community | RunPod Secure | Lambda Labs | Northflank |
+|-----|------|-----------------|---------------|-------------|------------|
+| RTX 4090 | 24GB | $0.34/hr | $0.69/hr | — | — |
+| A100 40GB | 40GB | $1.19/hr | $1.39/hr | $1.29/hr | $1.42/hr |
+| A100 80GB | 80GB | $1.39/hr | $1.49/hr | $1.79/hr | $1.76/hr |
+| H100 SXM | 80GB | $2.69/hr | $2.69/hr | $2.99/hr | $2.74/hr |
+| H200 | 141GB | $3.59/hr | $3.59/hr | — | $3.14/hr |
 
 ---
 
