@@ -71,7 +71,7 @@ def generate_text_sample_plot(
     model.eval()
 
     BS, T = batch.shape
-    n_samples = min(n_samples, BS)
+    n_display = min(n_samples, BS)
     # Need enough tokens for prompt + ground truth continuation
     effective_prompt = min(prompt_len, T // 2)
     effective_gt_len = min(gen_len, T - effective_prompt)
@@ -81,11 +81,13 @@ def generate_text_sample_plot(
         return
 
     device = next(model.parameters()).device
-    prompt = batch[:n_samples, :effective_prompt].to(device)
-    gt_continuation = batch[:n_samples, effective_prompt:effective_prompt + effective_gt_len]
+    # Use full batch for generation (internal state may be sized for BS),
+    # then display only n_display items.
+    prompt = batch[:, :effective_prompt].to(device)
+    gt_continuation = batch[:n_display, effective_prompt:effective_prompt + effective_gt_len]
 
     # Reset model memory state for clean generation
-    reset_mask = torch.ones(n_samples, dtype=torch.bool, device=device)
+    reset_mask = torch.ones(BS, dtype=torch.bool, device=device)
     model.reset_at_doc_boundary(reset_mask)
 
     try:
@@ -95,7 +97,7 @@ def generate_text_sample_plot(
             temperature=temperature,
             top_k=top_k,
         )
-        pred_continuation = generated[:, effective_prompt:effective_prompt + effective_gt_len]
+        pred_continuation = generated[:n_display, effective_prompt:effective_prompt + effective_gt_len]
     except Exception as e:
         print(f"  Text sample generation failed: {e}")
         model.train(was_training)
@@ -103,15 +105,15 @@ def generate_text_sample_plot(
 
     # Decode all samples
     samples = []
-    for i in range(n_samples):
+    for i in range(n_display):
         prompt_text = _decode_safe(tokenizer, prompt[i].cpu().tolist())
         pred_text = _decode_safe(tokenizer, pred_continuation[i].cpu().tolist())
         gt_text = _decode_safe(tokenizer, gt_continuation[i].cpu().tolist())
         samples.append((prompt_text, pred_text, gt_text))
 
     # Build figure
-    fig, axes = plt.subplots(n_samples, 1, figsize=(14, 4 * n_samples))
-    if n_samples == 1:
+    fig, axes = plt.subplots(n_display, 1, figsize=(14, 4 * n_display))
+    if n_display == 1:
         axes = [axes]
 
     title = f"Text Samples — Step {step}"
