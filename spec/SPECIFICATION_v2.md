@@ -3,7 +3,7 @@
 
 **Version:** 2.5
 **Status:** Phases A–E implemented; three-mode neuromodulators (heuristic → continuous-learned → fully-learned); enhanced EM: always-write + RL on strength + learned novelty; phase-transition checkpoint safety; RL optimizer warmup; spatial decoder (hierarchical aggregation + deep cross-attention)
-**Last Updated:** 2026-02-08
+**Last Updated:** 2026-02-10
 **Primary Constraint:** single RTX 4090 (24GB), mixed precision, persistent-stream TBPTT
 
 This v2 spec is designed to be handed directly to an implementation agent. It intentionally preserves the training-correctness and state semantics learned from v1.7, while adding Working Memory (WM) + Episodic Memory (EM) and making the core **scan-friendly** via an **affine recurrence** and **plasticity updates only at fixed boundaries**.
@@ -16,9 +16,9 @@ These are required for correctness/stability/VRAM.
 
 ### 0.1 Persistent parallel streams + TBPTT correctness
 - Training uses **BS independent persistent streams**, not independent sequences.
-- **Per-timestep** doc-boundary reset (not per TBPTT segment).
+- **Per-timestep** doc-boundary reset (not per TBPTT segment). Note: the parallel `forward_span` path resets only at the first token of each span; PM/EM state leaks across mid-span doc boundaries (bounded to P-1 tokens). This is an intentional trade-off for scan efficiency — see `MODEL_EXPLAINER_PARALLEL.md` §10.
 - **Skip loss** at cross-document transitions (mask positions where `input_tokens[:, t] == eot_id`) during phases that enforce doc isolation.
-- **Online loss accumulation** (do **not** materialize `[BS, T, vocab]` logits).
+- **Online loss accumulation** — do **not** materialize full `[BS, T, vocab]` logits. Per-span `[BS, P, vocab]` materialization is acceptable (P ≪ T).
 
 ### 0.2 Runtime state semantics
 - Memory/state tensors are **plain tensor attributes** (NOT `register_buffer`).
@@ -87,7 +87,7 @@ At timestep `t`:
      - Eligibility: `elig_K = ρ * elig_K + k_cand`, `elig_V = ρ * elig_V + v_cand`
 4) **Output pathway** (two modes):
    - **Simple** (`snapshot_enabled=False`): `logits = LMHead(concat(h^L for all blocks))` → `[BS, vocab]`
-   - **Spatial decoder** (`snapshot_enabled=True`): hierarchical aggregation of intermediate layer outputs + memory readouts, then deep cross-attention decoder → enhanced `h` → `LMHead` → `[BS, vocab]`. See §4.11.
+   - **Spatial decoder** (`snapshot_enabled=True`, the default): hierarchical aggregation of intermediate layer outputs + memory readouts, then deep cross-attention decoder → enhanced `h` → `LMHead` → `[BS, vocab]`. See §4.11. Supported in both sequential and parallel forward paths.
 5) At plasticity boundaries (every P tokens):
    - `EMNeuromodulator[b]` decides EM writes per block
    - `PMNeuromodulator[b][ℓ]` decides PM commits per (block, layer)
@@ -310,7 +310,7 @@ Use v1.7 soft commit almost unchanged, but triggered only at span boundaries:
 
 ### 4.11 Spatial Decoder (Hierarchical Aggregation + Deep Cross-Attention)
 
-**Toggle:** `snapshot_enabled` (config flag, independent of training phase). When `False`, the model uses the original path: `concat(h_blocks) → lm_head`. When `True`, intermediate layer outputs from all blocks feed through a three-level decoder.
+**Toggle:** `snapshot_enabled` (config flag, default `True`, independent of training phase). When `False`, the model uses the original path: `concat(h_blocks) → lm_head`. When `True`, intermediate layer outputs from all blocks feed through a three-level decoder. Both the sequential and parallel forward paths support the decoder.
 
 **Biological motivation:** NML blocks are analogous to cortical columns — each specializes in different patterns. Without the spatial decoder, only the top layer of each column reaches the LM head. The spatial decoder gives the decoder access to the full "column" of computation, with biologically-inspired hierarchical aggregation:
 
@@ -430,7 +430,7 @@ Each `Layer` (within a block) computes:
 
 The recurrence mixes temporal information; the FFN adds per-position nonlinear processing depth. Without the FFN, each layer has limited capacity to transform what it retrieves from memory before passing it forward.
 
-`W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. When `snapshot_enabled=False`, the model concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds directly to `lm_head`. When `snapshot_enabled=True`, intermediate layer outputs from all blocks feed through the spatial decoder (§4.11) before the LM head.
+`W_o: nn.Linear(D_h, D_h)`, residual, and layernorm are **per-layer** operations. When `snapshot_enabled=False`, the model concatenates all block outputs (`concat(h_blocks)` → `[BS, D]`) and feeds directly to `lm_head`. When `snapshot_enabled=True` (the default), intermediate layer outputs from all blocks feed through the spatial decoder (§4.11) before the LM head.
 
 ---
 
@@ -910,17 +910,17 @@ model:
 
 # === Working Memory ===
 wm:
-  W: 256                    # sliding window size
-  D_wm: 128                 # WM key/value dimension
-  n_heads: 4                # attention heads
+  W: 512                    # sliding window size
+  D_wm: 192                 # WM key/value dimension
+  n_heads: 6                # attention heads
 
 # === Episodic Memory (per block) ===
 em:
-  M: 256                    # capacity per EM bank
-  D_em: 128                 # EM key/value dimension
-  k_ret: 4                  # retrieval count
-  C: 8                      # candidates per span
-  k_write: 4                # slots updated per candidate
+  M: 512                    # capacity per EM bank
+  D_em: 192                 # EM key/value dimension
+  k_ret: 8                  # retrieval count
+  C: 16                     # candidates per span
+  k_write: 8                # slots updated per candidate
   τ_em: 1.0                 # softmax temperature
   weakness_weight: 0.5      # bias toward weak slots
   S_max: 3.0                # max strength per slot
@@ -931,7 +931,7 @@ em:
 
 # === Procedural Memory (per layer per block) ===
 pm:
-  r: 8                      # slots per PM instance
+  r: 16                     # slots per PM instance
   ρ: 0.95                   # eligibility decay
   a_max: 3.0                # max strength per slot
   budget: 4.0               # sum(pm_a) budget per stream
@@ -1010,7 +1010,7 @@ training:
 
 ---
 
-## 13) Inference / Generation
+## 15) Inference / Generation
 
 ### Surprise at inference
 

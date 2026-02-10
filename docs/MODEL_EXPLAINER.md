@@ -1,8 +1,8 @@
-# Neuromorphic LM -- Full Model Explainer
+# Neuromorphic LM -- Full Model Explainer (Sequential Path)
 
-**Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training.
+**Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-08 (post spatial decoder: hierarchical aggregation + deep cross-attention)
+**Last verified against code:** 2026-02-10
 
 ---
 
@@ -67,7 +67,7 @@ Token ID ──► Embedding ──► x: [BS, D]
                      │  │ PM read       ││  y_pm = PM[b][l].apply(x_block)
                      │  │ Gate compute  ││  a, b from concat(inputs)
                      │  │ Recurrence    ││  h = a * (carry * h_prev) + b
-                     │  │ Residual+Norm ││  output = norm(h + x_block)
+                     │  │ Proj+Res+Norm ││  output = norm(W_o(h) + x_block)
                      │  │ Elig update   ││  elig_K += k_cand, elig_V += v_cand
                      │  └───────────────┘│
                      │                    │
@@ -192,7 +192,7 @@ return logits, x, y_wm
 
 **Intuition:** Each layer maintains a recurrent hidden state `h: [BS, D_h]` that is updated via a scan-friendly affine recurrence. This is the backbone of the model -- it processes the fused signal from all memory systems and propagates information forward in time.
 
-**Why "scan-friendly"?** The gates `a` and `b` are computed from input features only -- they do **not** depend on the previous hidden state `h_{t-1}`. This means that given a span of P tokens, the entire recurrence `h_t = a_t * h_{t-1} + b_t` can be computed via a parallel prefix scan (like Mamba, RWKV, or S4). We currently run token-by-token for simplicity, but the math allows parallelization.
+**Why "scan-friendly"?** The gates `a` and `b` are computed from input features only -- they do **not** depend on the previous hidden state `h_{t-1}`. This means that given a span of P tokens, the entire recurrence `h_t = a_t * h_{t-1} + b_t` can be computed via a parallel prefix scan (like Mamba, RWKV, or S4). The parallel span path (`forward_span`) exploits this; the sequential path described here runs token-by-token. See `MODEL_EXPLAINER_PARALLEL.md` for the parallel path.
 
 **Gate computation:**
 ```python
@@ -278,13 +278,16 @@ This is a read-only operation. PM keys and values are frozen within each plastic
 k_cand = normalize(W_k_pre(x))    # [BS, D_h] -- from pre-synaptic (input)
 v_cand = W_v_post(h)               # [BS, D_h] -- from post-synaptic (output)
 
-elig_K = rho * elig_K + k_cand.unsqueeze(1)  # accumulate into all r slots
-elig_V = rho * elig_V + v_cand.unsqueeze(1)
+# Gate by surprise: low surprise → near-zero accumulation
+gate = (surprise / 5.0).clamp(0, 1)  # [BS, 1] → [BS, 1, 1]
+
+elig_K = rho * elig_K + gate * k_cand.unsqueeze(1)  # accumulate into all r slots
+elig_V = rho * elig_V + gate * v_cand.unsqueeze(1)
 ```
 
-**Intuition:** Eligibility traces are a running average of "what the model wanted to write." The projections `W_k_pre` and `W_v_post` are learned parameters -- gradients from the LM loss flow back through them, teaching the model *what* constitutes a good key-value pair to store. But the *decision* of whether to actually commit these traces into PM is made by the neuromodulator at span boundaries.
+**Intuition:** Eligibility traces are a running average of "what the model wanted to write," gated by surprise. Only tokens the model predicted poorly contribute significantly to the trace -- this prevents the trace norm from saturating (which would make the commit gate always fire). The projections `W_k_pre` and `W_v_post` are learned parameters -- gradients from the LM loss flow back through them, teaching the model *what* constitutes a good key-value pair to store. But the *decision* of whether to actually commit these traces into PM is made by the neuromodulator at span boundaries.
 
-`rho=0.95` is the eligibility decay -- recent tokens contribute more than older ones. This creates a recency-weighted summary of the span's proposed writes.
+`rho=0.95` is the eligibility decay -- recent tokens contribute more than older ones. This creates a recency-weighted, surprise-gated summary of the span's proposed writes.
 
 **Key insight:** Eligibility is **differentiable** (no `torch.no_grad()`). The projections `W_k_pre` and `W_v_post` are `nn.Linear` layers trained by backprop. The model learns what to propose; the neuromodulator learns when to commit.
 
@@ -507,7 +510,7 @@ x = x_block                                     # [BS, D_h]
 for layer in self.layers:
     y_pm = layer.pm.apply(x)                     # PM read
     h = layer.step(x, y_pm, y_wm_proj, y_em_proj, surprise, carry)
-    layer.pm.update_eligibility(x, h)            # accumulate elig traces
+    layer.pm.update_eligibility(x, h, surprise)  # accumulate elig traces (surprise-gated)
     x = h                                        # next layer's input
 
 return x   # [BS, D_h]
@@ -777,7 +780,7 @@ Grad norms are captured BEFORE `rl_optimizer.zero_grad()` to ensure they reflect
 
 **File:** `src/model/decoder.py`
 
-**Toggle:** `config.snapshot_enabled` (default `False`). When off, the model uses the original path: `concat(h_blocks) → lm_head`. When on, intermediate layer outputs from all blocks feed through a three-level hierarchical decoder before the LM head.
+**Toggle:** `config.snapshot_enabled` (default `True`). When off, the model uses the original path: `concat(h_blocks) → lm_head`. When on, intermediate layer outputs from all blocks feed through a three-level hierarchical decoder before the LM head. Both the sequential (`forward_one_token`) and parallel (`forward_span`) paths support the decoder.
 
 ### 12.1 Why a hierarchical decoder?
 
@@ -944,7 +947,9 @@ load_runtime_state(model, state)  # Restore saved state
 
 A chunk contains T/P = 8 spans. Each span boundary triggers PM base decay + commits + EM writes.
 
-### 14.2 Chunk Processing (train_chunk)
+### 14.2 Chunk Processing (train_chunk) — Sequential Path
+
+**Note:** This describes the original sequential training loop using `forward_one_token()`. The primary training path now uses the parallel span forward pass — see `MODEL_EXPLAINER_PARALLEL.md` §14.2.
 
 ```
 For each span (8 spans per chunk):
@@ -1289,4 +1294,5 @@ This section documents the design decisions that were verified during the Phase 
 | `src/training/eval_lifelong.py` | Phase E evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |
 | `src/train.py` | Entry point -- config, main + RL optimizers, scheduler, training loop, checkpoint save/load |
+| `src/model/scan.py` | `parallel_affine_scan` -- affine recurrence scan for `forward_span()` |
 | `src/debug/collector.py` | `MetricsCollector` -- two-tier JSONL logging, gate stats, memory stats, grad norms |

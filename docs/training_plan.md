@@ -421,7 +421,7 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 3. **Phase B** — enable PM + learned continuous heads (FineWeb-Edu + SlimPajama, bulk of training)
 4. **Phase C** — add EM retrieval + learned write strength + W_nov (continue main mix + ProofPile-2)
 5. **Phase D** — RL counterfactual training (optional; add PM gate_head, EM always-write + RL on g_em)
-6. **Phase E** — lifelong learning evaluation (Wikipedia, synthetic tests, no doc resets)
+6. **Phase E** — lifelong learning evaluation (Wikipedia, synthetic tests, soft resets only: h + eligibility traces reset at doc boundaries, PM committed state and EM persist)
 7. **Phase F** — agentic fine-tuning (function calling datasets)
 8. **Phase G** — multimodal (future, requires architecture extension)
 
