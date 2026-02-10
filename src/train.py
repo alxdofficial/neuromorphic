@@ -739,7 +739,7 @@ def run_phase(
 
     # Phase transitions and auto mode always train the full step budget.
     # Only same-phase single-phase resume continues from the checkpoint step.
-    if phase_changed:
+    if phase_changed or is_auto:
         start_step = 0
 
     # Dataloader

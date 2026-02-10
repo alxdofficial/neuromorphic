@@ -530,14 +530,26 @@ class TBPTTTrainer:
             main_params, self.max_grad_norm
         ).item()
 
-        if self.fail_fast and not math.isfinite(grad_norm):
-            raise RuntimeError(
-                f"Non-finite gradient norm at global step {self.global_step}."
+        if not math.isfinite(grad_norm):
+            # Skip this step: zero out nan/inf grads, don't update weights.
+            # Scheduler still steps to keep LR schedule consistent.
+            self.optimizer.zero_grad()
+            if self.scheduler is not None:
+                self.scheduler.step()
+            self._nan_steps = getattr(self, '_nan_steps', 0) + 1
+            tqdm.write(
+                f"WARNING: Non-finite gradient norm at step {self.global_step} "
+                f"(skipped, total nan steps: {self._nan_steps})"
             )
-
-        self.optimizer.step()
-        if self.scheduler is not None:
-            self.scheduler.step()
+            if self.fail_fast and self._nan_steps > 10:
+                raise RuntimeError(
+                    f"Too many non-finite gradient steps ({self._nan_steps}). "
+                    f"Training is unstable — check loss/data."
+                )
+        else:
+            self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
         # RL: counterfactual rollouts ADD gate grads on top of continuous grads,
         # then rl_optimizer steps with the combined gradient.
