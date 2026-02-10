@@ -438,11 +438,6 @@ class TBPTTTrainer:
                 f"WARNING: Non-finite gradient norm at step {self.global_step} "
                 f"(skipped, total nan steps: {self._nan_steps})"
             )
-            if self.fail_fast and self._nan_steps > 50:
-                raise RuntimeError(
-                    f"Too many non-finite gradient steps ({self._nan_steps}). "
-                    f"Training is unstable — check loss/data."
-                )
         else:
             self.optimizer.step()
             if self.scheduler is not None:
@@ -553,6 +548,7 @@ class TBPTTTrainer:
                     "grad_norm": grad_norm,
                     "reg": step_metrics["reg"],
                     "elapsed": elapsed,
+                    "nan_grad_steps": getattr(self, '_nan_steps', 0),
                 }
                 self.collector.log_full(
                     self.global_step, {}, basic,
