@@ -16,8 +16,13 @@ from typing import Dict, Optional, Union
 # ---------------------------------------------------------------------------
 
 def unit_normalize(x: Tensor, dim: int = -1, eps: float = 1e-8) -> Tensor:
-    """L2-normalize along `dim`."""
-    return x / (x.norm(dim=dim, keepdim=True) + eps)
+    """L2-normalize along `dim`. Backward-safe for zero inputs.
+
+    Uses squared-norm + eps inside sqrt so the gradient is well-defined
+    when x == 0 (avoids 0/0 NaN from torch.norm backward).
+    """
+    norm_sq = (x * x).sum(dim=dim, keepdim=True)
+    return x / (norm_sq + eps).sqrt()
 
 
 def soft_topk(scores: Tensor, k: int, tau: Union[float, Tensor] = 1.0) -> Tensor:
