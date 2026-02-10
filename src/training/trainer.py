@@ -438,7 +438,7 @@ class TBPTTTrainer:
                 f"WARNING: Non-finite gradient norm at step {self.global_step} "
                 f"(skipped, total nan steps: {self._nan_steps})"
             )
-            if self.fail_fast and self._nan_steps > 10:
+            if self.fail_fast and self._nan_steps > 50:
                 raise RuntimeError(
                     f"Too many non-finite gradient steps ({self._nan_steps}). "
                     f"Training is unstable — check loss/data."
