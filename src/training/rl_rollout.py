@@ -367,6 +367,8 @@ class RLRolloutEngine:
             credit = elig_norm / elig_norm.clamp(min=1e-6).max()
             weight = reward.abs() * credit
 
+            # Clamp to avoid CUDA assert in BCE from fp16 rounding
+            p_commit = p_commit.clamp(1e-6, 1 - 1e-6)
             loss = F.binary_cross_entropy(p_commit, label, weight=weight)
             total_loss_val += loss.item()
             loss.backward()
