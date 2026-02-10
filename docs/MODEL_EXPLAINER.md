@@ -28,6 +28,7 @@
 18. [Scaling Tiers](#18-scaling-tiers)
 19. [Gradient Flow Map](#19-gradient-flow-map)
 20. [Design Integrity Notes](#20-design-integrity-notes)
+21. [Training Cost and Performance Estimates](#21-training-cost-and-performance-estimates)
 
 ---
 
@@ -105,7 +106,7 @@ Token ID ──► Embedding ──► x: [BS, D]
      ├─ inputs: elig_norm,         ├─ inputs: surprise,
      │  usage, surprise            │  usage, novelty
      ├─ outputs: commit_mask,      ├─ outputs: write_mask,
-     │  lambda, g, slots,          │  g_em (write strength)
+     │  lambda, g, slots,          │  g_em, tau, ww
      │  p_commit (RL gate)         │
      ▼                             ▼
      PM commit: update             EM write: update
@@ -114,7 +115,7 @@ Token ID ──► Embedding ──► x: [BS, D]
               └──── RL (Phase D+) ───────┘
               Counterfactual rollouts:
               PM: force_on vs force_off → reward → BCE on p_commit
-              EM: baseline vs chosen g_em → reward → weighted MSE on g_em
+              EM: baseline vs chosen → reward → weighted MSE on g_em, tau, ww
 ```
 
 **Dimensions (Tier A defaults):** D=512, B=4, L=8, D_h=128, vocab=32000
@@ -768,14 +769,14 @@ Neuromodulator backbones and continuous heads are created starting in Phases B/C
 
 - **PM gate output** (`p_commit`): Binary decision that cannot be differentiated through (commit_mask is detached). Created only in Phase D. Trained via **RL counterfactual rollouts**.
 - **PM continuous outputs** (`lambda`, `g`, `slot_logits`): Created in Phase B. Flow through PM commit operations into future predictions. Trained via **main loss backprop**. In Phase D, they move from the main optimizer to the RL optimizer, where both main-loss backprop and RL gradients accumulate.
-- **EM write strength** (`g_em`): Created in Phase C with heuristic gate. In Phase D, always writes (no binary gate). `g_em` is **dual-trained**: main loss backprop (through write -> retrieve -> loss) + RL counterfactual (weighted MSE regressing g_em toward whichever strength — chosen or baseline — performed better).
+- **EM write parameters** (`g_em`, `tau`, `ww`): Created in Phase C with heuristic gate. In Phase D, always writes (no binary gate). All three are **dual-trained**: main loss backprop (through write -> retrieve -> loss) + RL counterfactual (weighted MSE regressing each value toward whichever setting — chosen or baseline — performed better). `g_em` controls write strength, `tau` controls soft top-k slot selection temperature, `ww` controls weakness-weight bias toward overwriting weak slots.
 - **Learned novelty** (`W_nov`): Per-token projection on `EpisodicMemory`. Created in Phase C. Trained via **main loss backprop only** (main optimizer, not RL optimizer — stays on main optimizer even in Phase D).
 
 In Phase D, both main-loss and RL gradient sources accumulate on neuromodulator parameters before a single RL optimizer step.
 
 ### 11.1 Why Not Backprop for Gates?
 
-PM commits and EM writes update plain tensors (`pm_K`, `pm_V`, `pm_a`, `em_K`, `em_V`, `em_S`). The continuous outputs (`g`, `lambda`, `slot_logits`, `g_em`) flow through the EMA update math (which is differentiable), so backprop reaches them. But PM's `commit_mask` is a hard boolean -- you either commit or you don't. This binary gate is the `(p_commit > 0.5).detach()` call, which explicitly breaks the gradient. We need RL to train it.
+PM commits and EM writes update plain tensors (`pm_K`, `pm_V`, `pm_a`, `em_K`, `em_V`, `em_S`). The continuous outputs (`g`, `lambda`, `slot_logits`, `g_em`, `tau`, `ww`) flow through the EMA update math (which is differentiable), so backprop reaches them. But PM's `commit_mask` is a hard boolean -- you either commit or you don't. This binary gate is the `(p_commit > 0.5).detach()` call, which explicitly breaks the gradient. We need RL to train it.
 
 **Note on EM:** The EM neuromodulator no longer has a binary gate. Instead of deciding "write or not," it decides "how strongly to write" via `g_em`, and "how to write" via `tau` (soft top-k temperature) and `ww` (weakness weight). All three are continuous outputs clamped to their respective `[floor, ceil]` ranges. In Phase D+, all three are trained via deconfounded RL counterfactual rollouts comparing the neuromod's chosen values against fixed baseline defaults, using weighted MSE to regress toward the better-performing settings.
 
@@ -849,13 +850,13 @@ The training step proceeds as:
 5. RL rollouts (if this chunk has rollout events)
    → snapshot was captured BEFORE commit/write during the forward pass
    → PM: per-target force_on/off rollouts measure deconfounded reward; BCE on p_commit
-   → EM: per-target baseline/chosen rollouts measure deconfounded reward; weighted MSE on g_em
+   → EM: per-target baseline/chosen rollouts measure deconfounded reward; weighted MSE on g_em, tau, ww
    → RL backward adds RL grad to existing continuous-head grad on same params
 
 6. rl_optimizer.step()
    → updates neuromodulator params with COMBINED gradient:
      PM: continuous grads (lambda, g, slots) + gate grad (BCE on p_commit)
-     EM: continuous grads (g_em via write→retrieve→loss) + RL grad (weighted MSE on g_em)
+     EM: continuous grads (g_em, tau, ww via write→retrieve→loss) + RL grad (weighted MSE on g_em, tau, ww)
    → rl_optimizer.zero_grad()
 
    OR (if no rollout events this chunk):
@@ -881,11 +882,15 @@ The following metrics are logged to JSONL when RL is active:
 | `rl_em_reward_mean` | Mean reward across EM rollouts (positive = neuromod's g_em beat baseline) |
 | `rl_pm_gate_loss` | Mean BCE loss for PM gate heads |
 | `rl_em_g_loss` | Mean weighted MSE loss for EM g_em (normalized to [0,1]) |
+| `rl_em_tau_loss` | Mean weighted MSE loss for EM tau (normalized to [0,1]) |
+| `rl_em_ww_loss` | Mean weighted MSE loss for EM ww (normalized to [0,1]) |
 | `rl_pm_commit_rate` | Fraction of streams where `p_commit > 0.5` |
 | `rl_em_write_rate` | Always 1.0 in learned mode (every stream writes) |
 | `rl_pm_lambda_mean` | Mean learned lambda across all PM instances |
 | `rl_pm_g_mean` | Mean learned g across all PM instances |
 | `rl_em_g_mean` | Mean learned g_em across all EM instances |
+| `rl_em_tau_mean` | Mean learned tau across all EM instances |
+| `rl_em_ww_mean` | Mean learned weakness weight across all EM instances |
 | `rl_events` | Number of rollout events this step |
 | `gnorm_b{b}_l{l}_pm_neuromod` | Per-instance PM neuromodulator grad norm |
 | `gnorm_b{b}_em_neuromod` | Per-block EM neuromodulator grad norm |
@@ -1106,12 +1111,12 @@ After all spans:
     22. Save last token per stream (for checkpoint resume)
 ```
 
-**Step 10 is critical:** The RL snapshot is captured BEFORE PM commit and EM write. This means the rollout can test different commit/write strategies and measure the downstream effect on the next span's tokens. PM rollouts use force_on/force_off. EM rollouts use baseline (g_em=0.3) vs chosen (neuromod's g_em). The snapshot includes:
+**Step 10 is critical:** The RL snapshot is captured BEFORE PM commit and EM write. This means the rollout can test different commit/write strategies and measure the downstream effect on the next span's tokens. PM rollouts use force_on/force_off. EM rollouts use baseline (default g_em/tau/ww) vs chosen (neuromod's outputs). The snapshot includes:
 - Full runtime state (deepcopy, detached)
 - EM candidate buffers (detached clones)
 - Per-instance eligibility norms and PM usages
 - Per-block EM novelties and usages
-- Per-block neuromod's chosen g_em (for EM "chosen" arm)
+- Per-block neuromod's chosen g_em, tau, ww (for EM "chosen" arm)
 - Span surprise mean
 
 ### 14.3 Online Loss Accumulation
@@ -1320,11 +1325,11 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
     │  ┌────────────────────────┐  │   │  ┌─────────────────────────────┐  │
     │  │   PMNeuromodulator     │  │   │  │     EMNeuromodulator        │  │
     │  │                        │  │   │  │                             │  │
-    │  │  backbone → 4 heads:   │  │   │  │  backbone → g_head only    │  │
-    │  │  gate  g  lambda slot  │  │   │  │  (no gate — always writes) │  │
+    │  │  backbone → 4 heads:   │  │   │  │  backbone → 3 heads:       │  │
+    │  │  gate  g  lambda slot  │  │   │  │  g_em  tau  ww  (no gate)  │  │
     │  │   │    │    │     │    │  │   │  │         │                   │  │
-    │  │   │    ╎    ╎     ╎    │  │   │  │  g_em = floor + range *    │  │
-    │  │ .detach ╎   ╎     ╎    │  │   │  │         sigmoid(raw)       │  │
+    │  │   │    ╎    ╎     ╎    │  │   │  │  all: floor + range *       │  │
+    │  │ .detach ╎   ╎     ╎    │  │   │  │    sigmoid(raw) [BS]       │  │
     │  │   │    ╎    ╎     ╎    │  │   │  │         │                   │  │
     │  │ commit ╎ alpha = g *   │  │   │  │  alpha = g_em * weights    │  │
     │  │ mask   ╎  weights      │  │   │  │  (DIFFERENTIABLE ──────────┤  │
@@ -1332,8 +1337,8 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
     │  │   │    ╎    │          │  │   │  │  into em_K / em_V / em_S)  │  │
     │  │   │    ╎    ▼          │  │   │  │         │                   │  │
     │  │   │    ╎ DIFFERENTIABLE│  │   │  │  RL (weighted MSE on       │  │
-    │  │   │    ╎ through commit│  │   │  │  g_em): baseline vs chosen │  │
-    │  │   │    ╎ into pm_K/V/a │  │   │  │  strength counterfactual  │  │
+    │  │   │    ╎ through commit│  │   │  │  g_em, tau, ww): baseline  │  │
+    │  │   │    ╎ into pm_K/V/a │  │   │  │  vs chosen counterfactual │  │
     │  │   │    ╎    │          │  │   │  └─────────────────────────────┘  │
     │  │ RL(BCE ╎    │          │  │   │                                    │
     │  │ on     ╎    │          │  │   │   affects FUTURE EM.retrieve ──────┘
@@ -1341,7 +1346,7 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
     │  └────────╎────┼──────────┘  │   │   Layer.step() → logits → loss
     │           ╎    │              │   │         │
     │   affects FUTURE PM.apply ───┘   │   loss.backward() reaches
-    │           ╎    │                  │   EM g_head via write → retrieve
+    │           ╎    │                  │   EM g/tau/ww_head via write→ret
     │   Layer.step() → logits → loss   │
     │           ╎    │                  │
     │   loss.backward() reaches        │
@@ -1373,22 +1378,22 @@ This section documents the design decisions that were verified during the Phase 
 
 ### 20.1 Verified Invariants
 
-1. **Snapshot timing:** RL snapshots are captured BEFORE PM commit + EM write. This ensures the counterfactual rollout can test different strategies (PM: force_on/force_off; EM: baseline vs chosen g_em) and measure the downstream effect.
+1. **Snapshot timing:** RL snapshots are captured BEFORE PM commit + EM write. This ensures the counterfactual rollout can test different strategies (PM: force_on/force_off; EM: baseline vs chosen g_em/tau/ww) and measure the downstream effect.
 
 2. **Rollout structure:** Rollouts apply forced commit/write BEFORE running the next span's tokens. This matches the normal training flow where commit happens at span boundary, then the next span reads from the updated PM/EM.
 
 3. **Phase E inherits rl_enabled:** `set_phase("E")` does not touch `rl_enabled`. This allows D->E transitions to preserve learned neuromodulators, and C->E transitions to use heuristic neuromodulators.
 
-4. **Continuous-head gradient path:** PM: `lambda_vals`, `g`, and `slot_logits` carry gradients through `pm.commit()` because the EMA update (`alpha = weights * g * mask`, `pm_K = (1-alpha)*pm_K + alpha*elig_K`) is composed of differentiable tensor operations. `loss.backward()` reaches these heads through: neuromodulator output -> alpha -> pm_K/pm_V update -> future `pm.apply(x)` -> layer output -> logits -> loss. EM: `g_em` carries gradients through `write_at_boundary()` via the same mechanism: g_em -> alpha -> em_K/em_V update -> future `EM.retrieve()` -> layer output -> logits -> loss. This gradient path is active starting in Phase B/C (when continuous heads are created), not just Phase D.
+4. **Continuous-head gradient path:** PM: `lambda_vals`, `g`, and `slot_logits` carry gradients through `pm.commit()` because the EMA update (`alpha = weights * g * mask`, `pm_K = (1-alpha)*pm_K + alpha*elig_K`) is composed of differentiable tensor operations. `loss.backward()` reaches these heads through: neuromodulator output -> alpha -> pm_K/pm_V update -> future `pm.apply(x)` -> layer output -> logits -> loss. EM: `g_em`, `tau`, and `ww` carry gradients through `write_at_boundary()` via the same mechanism: g_em -> alpha -> em_K/em_V update -> future `EM.retrieve()` -> layer output -> logits -> loss. `tau` and `ww` affect gradient flow through `soft_topk` slot selection weights. This gradient path is active starting in Phase B/C (when continuous heads are created), not just Phase D.
 
-5. **Gradient isolation (Phase D only):** When `rl_enabled=True`, neuromodulator params are excluded from main gradient clipping (`clip_grad_norm_`) so continuous-head gradients survive for combination with RL gradients (PM gate BCE, EM g_em weighted MSE) in the RL optimizer step. In Phases B–C, neuromodulator params are on the main optimizer and DO participate in gradient clipping — this is intentional, as there is no RL gradient to preserve.
+5. **Gradient isolation (Phase D only):** When `rl_enabled=True`, neuromodulator params are excluded from main gradient clipping (`clip_grad_norm_`) so continuous-head gradients survive for combination with RL gradients (PM gate BCE, EM g_em/tau/ww weighted MSE) in the RL optimizer step. In Phases B–C, neuromodulator params are on the main optimizer and DO participate in gradient clipping — this is intentional, as there is no RL gradient to preserve.
 
 6. **EM novelty in rollouts:** RL snapshots store real candidate novelty (from `propose_candidate()`), not a proxy. This ensures `_update_em_neuromodulators` re-forwards the EMNeuromodulator with the same inputs it saw during the normal forward pass.
 
 ### 20.2 Intentional Design Decisions (Not Bugs)
 
 - **PM `force_on` uses fixed defaults (g=0.5, lambda=decay):** The counterfactual tests the binary "commit vs. skip" question. Using fixed defaults isolates the gate decision.
-- **EM counterfactual uses baseline strength (g_em=0.3) vs chosen strength:** Both arms always write. The counterfactual tests whether the neuromod's chosen `g_em` outperforms a fixed default, teaching the neuromod to deviate from the default only when beneficial.
+- **EM counterfactual uses baseline settings (g_em=0.3, tau=default, ww=default) vs chosen settings:** Both arms always write. The counterfactual tests whether the neuromod's chosen `g_em`, `tau`, and `ww` outperform fixed defaults, teaching the neuromod to deviate from defaults only when beneficial.
 - **4 forward passes per RL event** (PM force_off/on + EM baseline/chosen): PM and EM need independent counterfactuals because their effects are different (PM affects layer computation, EM affects block-level retrieval).
 - **Surprise as neuromodulator input** (not just novelty): Surprise reflects the model's overall prediction quality, which is a useful signal for deciding whether to consolidate learning. Novelty is specific to EM candidates.
 

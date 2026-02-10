@@ -34,13 +34,13 @@ The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was design
 
 The parallel path batches P=32 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 32x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Result: ~5x throughput increase.
 
-**Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference, RL rollouts, and as a correctness oracle.
+**Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle. RL rollouts also use `forward_span` (parallel, with frozen surprise from the snapshot).
 
 ---
 
 ## 2. Architecture Comparison
 
-This document covers the full Phase D architecture (all subsystems + RL). In earlier phases some components are absent (see `MODEL_EXPLAINER.md` §17). The scan-friendly parallel path is used for all forward passes during training; the sequential path is retained for RL rollouts and inference.
+This document covers the full Phase D architecture (all subsystems + RL). In earlier phases some components are absent (see `MODEL_EXPLAINER.md` §17). The scan-friendly parallel path is used for all forward passes during training, including RL rollouts; the sequential path is retained for inference.
 
 ```
 SEQUENTIAL (forward_one_token, called T times):
@@ -62,11 +62,11 @@ PARALLEL (forward_span, called T/P times):
     → [Phase D] RL snapshot captured BEFORE commit/write
 
   After all spans:
-    → [Phase D] RL counterfactual rollouts (sequential path, torch.no_grad)
+    → [Phase D] RL counterfactual rollouts (forward_span, torch.no_grad)
     → rl_optimizer.step() with combined continuous + RL gradients
 ```
 
-The parallel path processes an entire span in one `forward_span()` call, then handles surprise, eligibility, and EM candidates as post-forward steps in the trainer. RL rollouts remain sequential (see [§10.3](#103-rl-rollouts)).
+The parallel path processes an entire span in one `forward_span()` call, then handles surprise, eligibility, and EM candidates as post-forward steps in the trainer. RL rollouts also use `forward_span` with frozen surprise (see [§10.3](#103-rl-rollouts-and-the-parallel-path)).
 
 ---
 
@@ -725,7 +725,7 @@ For each span (8 spans per chunk, P=32 tokens each):
     Pre-compute EM candidate stacks + mean novelty
 
     [Phase D] RL snapshot: save runtime state, elig norms, PM usages,
-              EM novelties/candidates/g_em_chosen — BEFORE commit/write
+              EM novelties/candidates/g_em/tau/ww chosen — BEFORE commit/write
 
     PM neuromodulators: (elig_norm, usage, surprise) → commit_mask, lambda, g, slots
       └── p_commit gate (Phase D): detached binary → which streams commit
