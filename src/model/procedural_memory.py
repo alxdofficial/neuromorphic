@@ -16,6 +16,8 @@ eligibility projections can receive LM gradients from downstream reads.
 Eligibility projections (W_k_pre, W_v_post) are trained by backprop.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -138,8 +140,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         v_cand = self.W_v_post(h)                   # [BS, D_h]
 
         # Gate by surprise: low surprise → near-zero accumulation
-        # surprise is in ~[0, 5]; map to [0, 1] via clamp + normalize
-        gate = (surprise.squeeze(-1) / 5.0).clamp(0.0, 1.0)  # [BS]
+        gate = (surprise.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS]
         gate = gate.unsqueeze(1).unsqueeze(2)                  # [BS, 1, 1]
 
         # Accumulate into all r slots (broadcast)
@@ -173,7 +174,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         v_cand_all = self.W_v_post(h_all)                  # [BS, P, D_h]
 
         # Surprise gating: [BS, P] → [BS, P, 1, 1] for broadcast over [r, D_h]
-        gate = (surprise_all.squeeze(-1) / 5.0).clamp(0.0, 1.0)  # [BS, P]
+        gate = (surprise_all.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS, P]
         gate = gate.unsqueeze(-1).unsqueeze(-1)                    # [BS, P, 1, 1]
 
         # b terms: gate * cand broadcast across r slots → [BS, P, r, D_h]
@@ -311,8 +312,8 @@ class PMNeuromodulator(nn.Module):
         super().__init__()
         self.rl_enabled = config.rl_enabled
         self.pm_enabled = config.pm_enabled
-        self.threshold = 1.0
-        self.default_g = 0.5
+        self.threshold = config.commit_threshold
+        self.default_g = config.g_pm_default
         self.default_decay = config.decay_pm
 
         # Backbone + continuous heads: created when PM is enabled (Phase B+)
@@ -325,6 +326,27 @@ class PMNeuromodulator(nn.Module):
             self.lambda_head = nn.Linear(H, 1)
             self.g_head = nn.Linear(H, 1)
             self.slot_head = nn.Linear(H, config.r)
+
+            # Zero backbone bias: ensures zero input → zero backbone output
+            # → head outputs equal their calibrated biases exactly at init.
+            nn.init.zeros_(self.backbone[0].bias)
+
+            # Init heads so output at init ≈ heuristic defaults.
+            # Small random weights + calibrated bias: output is ~constant
+            # at init but gradients flow to backbone from step 1.
+            # g: sigmoid(bias) = default_g → bias = logit(default_g)
+            g_frac = max(min(config.g_pm_default, 0.999), 0.001)
+            nn.init.normal_(self.g_head.weight, std=0.01)
+            nn.init.constant_(self.g_head.bias, math.log(g_frac / (1.0 - g_frac)))
+
+            # lambda: sigmoid(bias) maps to [default_decay, 1.0]
+            # At init, raw_lambda should produce default_decay → raw=0 → bias=logit(eps)
+            nn.init.normal_(self.lambda_head.weight, std=0.01)
+            nn.init.constant_(self.lambda_head.bias, math.log(0.001 / 0.999))  # near-zero raw → lambda ≈ default_decay
+
+            # slot_logits: small init → no strong slot preference at init
+            nn.init.normal_(self.slot_head.weight, std=0.01)
+            nn.init.zeros_(self.slot_head.bias)
 
             # Gate head: only created for RL (Phase D+)
             if self.rl_enabled:

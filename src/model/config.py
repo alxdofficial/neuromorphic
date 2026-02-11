@@ -34,6 +34,9 @@ class ModelConfig:
     tau_pm: float = 1.0       # softmax temperature
     weakness_weight_pm: float = 0.5  # bias toward weak slots
     pm_readout_ffn: bool = True       # MLP after PM linear lookup
+    surprise_scale: float = 5.0       # eligibility gate: gate = (surprise / scale).clamp(0,1)
+    commit_threshold: float = 1.0     # PM commit threshold (elig_norm > threshold)
+    g_pm_default: float = 0.5         # default PM write strength
 
     # Episodic Memory (per block, B instances)
     M: int = 256              # EM capacity per bank
@@ -46,8 +49,10 @@ class ModelConfig:
     S_max: float = 3.0        # max strength per slot
     budget_em: float = 8.0    # sum(em_S) budget per stream
     decay_em: float = 0.999   # per-span strength decay
+    g_em_default: float = 0.3   # default EM write strength
     g_em_floor: float = 0.001  # minimum write strength (learned mode, near-zero = soft "don't write")
     g_em_ceil: float = 0.95    # maximum write strength (learned mode)
+    novelty_threshold: float = 0.3  # EM write gate: write_mask = novelty > threshold
     tau_em_floor: float = 0.05   # min soft top-k temperature (learned mode)
     tau_em_ceil: float = 5.0     # max soft top-k temperature (learned mode)
     ww_em_floor: float = 0.0    # min weakness weight (learned mode)

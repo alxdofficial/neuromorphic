@@ -184,7 +184,7 @@ class Block(nn.Module, StateMixin):
                                          device=elig_norm.device)
                 lambda_vals = torch.full((BS,), pm.decay,
                                          device=elig_norm.device)
-                g = torch.full((BS,), 0.5, device=elig_norm.device)
+                g = torch.full((BS,), self.config.g_pm_default, device=elig_norm.device)
                 pm.commit(commit_mask, lambda_vals, g, None)
                 commit_info[l_idx] = commit_mask.detach()
             else:

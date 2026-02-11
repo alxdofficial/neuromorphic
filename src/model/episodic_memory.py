@@ -417,8 +417,8 @@ class EMNeuromodulator(nn.Module):
         super().__init__()
         self.rl_enabled = config.rl_enabled
         self.em_enabled = config.em_enabled
-        self.novelty_threshold = 0.3
-        self.default_g = 0.3
+        self.novelty_threshold = config.novelty_threshold
+        self.default_g = config.g_em_default
         self.default_tau = config.tau_em
         self.default_ww = config.weakness_weight_em
         self.g_em_floor = config.g_em_floor
@@ -439,17 +439,28 @@ class EMNeuromodulator(nn.Module):
             self.tau_head = nn.Linear(H, 1)
             self.ww_head = nn.Linear(H, 1)
 
-            # Init tau/ww heads so output at init matches heuristic defaults.
+            # Zero backbone bias: ensures zero input → zero backbone output
+            # → head outputs equal their calibrated biases exactly at init.
+            # Backbone weights stay Kaiming-init so non-zero inputs produce signal.
+            nn.init.zeros_(self.backbone[0].bias)
+
+            # Init heads so output at init matches heuristic defaults.
             # Zero weights + calibrated bias = constant default until
             # gradients make the output input-dependent.
+            # g_em: sigmoid maps to [g_em_floor, g_em_ceil], init to g_em_default
+            g_frac = (config.g_em_default - config.g_em_floor) / max(config.g_em_ceil - config.g_em_floor, 1e-8)
+            g_frac = max(min(g_frac, 0.999), 0.001)
+            nn.init.normal_(self.g_head.weight, std=0.01)
+            nn.init.constant_(self.g_head.bias, math.log(g_frac / (1.0 - g_frac)))
+
             tau_frac = (config.tau_em - config.tau_em_floor) / max(config.tau_em_ceil - config.tau_em_floor, 1e-8)
             tau_frac = max(min(tau_frac, 0.999), 0.001)  # avoid log(0)
-            nn.init.zeros_(self.tau_head.weight)
+            nn.init.normal_(self.tau_head.weight, std=0.01)
             nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
 
             ww_frac = (config.weakness_weight_em - config.ww_em_floor) / max(config.ww_em_ceil - config.ww_em_floor, 1e-8)
             ww_frac = max(min(ww_frac, 0.999), 0.001)
-            nn.init.zeros_(self.ww_head.weight)
+            nn.init.normal_(self.ww_head.weight, std=0.01)
             nn.init.constant_(self.ww_head.bias, math.log(ww_frac / (1.0 - ww_frac)))
 
     def forward(self, span_surprise: Tensor, em_usage: Tensor,
