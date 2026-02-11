@@ -30,6 +30,8 @@ def _make_trainer(phase="B", use_rl=False, **overrides):
     """Create a minimal TBPTTTrainer for testing."""
     cfg = make_tiny_config(**overrides)
     cfg.set_phase(phase)
+    if use_rl:
+        cfg.rl_enabled = True
     model = NeuromorphicLM(cfg)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 

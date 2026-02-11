@@ -3,7 +3,7 @@ Entry point for neuromorphic LM training.
 
 Usage:
     python -m src.train                              # file defaults (backward compat)
-    python -m src.train --phases A,B,C,D,E --tier a  # auto-transition full run
+    python -m src.train --phases A,B,C,D --tier a     # auto-transition full run
     python -m src.train --phase D --resume ckpt.pt   # single phase with resume
     python -m src.train --phase A --steps 5000        # override step count
     python -m src.train --phases A,B --no-plots       # skip plot generation
@@ -41,14 +41,13 @@ TIER = "a"          # ~41M params, fast iteration
 # TIER = "c"        # ~107M params, strong
 
 # -- Training phase --
-PHASE = "A"         # WM only (sanity check on TinyStories)
-# PHASE = "B"       # WM + PM
-# PHASE = "C"       # WM + PM + EM
-# PHASE = "D"       # WM + PM + EM + RL controllers
-# PHASE = "E"       # WM + PM + EM + lifelong (inherits RL on resume)
+PHASE = "A"         # WM + PM (base)
+# PHASE = "B"       # WM + PM + EM
+# PHASE = "C"       # WM + PM + EM + RL controllers
+# PHASE = "D"       # WM + PM + EM + lifelong (inherits RL on resume)
 
 # -- Data phase (which datasets to use) --
-DATA_PHASE = None   # None => auto: A->A, B/C/D/E->B
+DATA_PHASE = None   # None => auto: all phases use B (FineWeb-Edu + DCLM)
 # DATA_PHASE = "A"  # TinyStories
 # DATA_PHASE = "B"  # FineWeb-Edu + DCLM
 
@@ -76,11 +75,10 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 2_000,             # ~25M tokens at BS=48 (~30min): base WM competence
-    "B": 4_000,             # ~49M tokens (~2hr): PM slot filling + commit learning
-    "C": 5_000,             # ~61M tokens (~3.5hr): EM retrieval + write patterns
-    "D": 7_000,             # ~86M tokens (~6hr): RL neuromod convergence (slowest phase)
-    "E": 2_500,             # ~31M tokens: lifelong adaptation window
+    "A": 5_000,             # ~61M tokens: WM + PM backbone training
+    "B": 5_000,             # ~61M tokens: + EM retrieval + write patterns
+    "C": 7_000,             # ~86M tokens: + RL neuromod convergence (slowest phase)
+    "D": 2_500,             # ~31M tokens: lifelong adaptation window
 }
 
 # -- Regularization --
@@ -96,7 +94,7 @@ VAL_STEPS = 20          # validation chunks per eval pass
 VAL_DATA_PHASE = None   # None => same policy as DATA_PHASE auto-logic
 VAL_SEED = 4242
 ABLATE_INTERVAL = 1000  # run PM/EM ablation eval every N steps (0 = disabled)
-PLOT_INTERVAL = 1000    # regenerate training curve plots every N steps (0 = disabled)
+PLOT_INTERVAL = 500     # regenerate training curve plots every N steps (0 = disabled)
 TEXT_SAMPLE_INTERVAL = 200  # generate text comparison samples every N steps (0 = disabled)
 
 # -- Safety checks --
@@ -130,9 +128,9 @@ def parse_args() -> argparse.Namespace:
     )
     group = p.add_mutually_exclusive_group()
     group.add_argument("--phases", type=str, default=None,
-                       help="Comma-separated auto-transition sequence (e.g. A,B,C,D,E)")
+                       help="Comma-separated auto-transition sequence (e.g. A,B,C,D)")
     group.add_argument("--phase", type=str, default=None,
-                       help="Single phase to run (A-E)")
+                       help="Single phase to run (A-D)")
     p.add_argument("--tier", type=str, default=None, choices=["a", "b", "c"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
@@ -252,8 +250,8 @@ def _normalize_phase_plan(raw: Any) -> list[dict[str, Any]] | None:
     plan = [_normalize_phase_entry(e) for e in raw]
     for item in plan:
         p = item["phase"]
-        if p not in ("A", "B", "C", "D", "E"):
-            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/C/D/E.")
+        if p not in ("A", "B", "C", "D"):
+            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/C/D.")
     return plan
 
 
@@ -309,8 +307,14 @@ def resolve_settings(args: argparse.Namespace) -> dict:
     preset_name: str | None = args.preset
     preset_payload: dict[str, Any] = {}
 
-    if args.config is not None:
-        config_payload = _load_yaml_config(args.config)
+    config_path = args.config
+    if config_path is None and preset_name is not None:
+        # Auto-load default preset config when --preset is used without --config
+        default_config = os.path.join(os.path.dirname(__file__), "..", "configs", "train_presets.yaml")
+        if os.path.exists(default_config):
+            config_path = default_config
+    if config_path is not None:
+        config_payload = _load_yaml_config(config_path)
         all_presets = config_payload.get("presets", {})
         if not isinstance(all_presets, dict):
             raise ValueError("Config field 'presets' must be a mapping/object.")
@@ -508,7 +512,9 @@ def _resolve_data_phase(train_phase: str, requested: str | None) -> str:
         raise ValueError(
             f"Unknown data phase '{requested}'. Available: {list(PHASE_CONFIGS.keys())}"
         )
-    return "A" if train_phase.upper() == "A" else "B"
+    # All phases use the same dataset so loss changes at phase transitions
+    # reflect only model capability changes, not distribution shift.
+    return "B"
 
 
 def _resolve_max_steps(
@@ -579,13 +585,13 @@ def run_phase(
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     config.eot_id = eot_id
 
-    # Phase E inherits rl_enabled from checkpoint config (if resuming).
-    if resume_path and phase_name == "E":
+    # Phase D inherits rl_enabled from checkpoint config (if resuming).
+    if resume_path and phase_name == "D":
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         _ckpt_cfg = ckpt.get("config")
         if _ckpt_cfg is not None and hasattr(_ckpt_cfg, "rl_enabled"):
             config.rl_enabled = _ckpt_cfg.rl_enabled
-            print(f"Phase E: inherited rl_enabled={config.rl_enabled} from checkpoint")
+            print(f"Phase D: inherited rl_enabled={config.rl_enabled} from checkpoint")
         del _ckpt_cfg
 
     train_data_phase = _resolve_data_phase(phase_name, settings.get("data_phase", DATA_PHASE))
@@ -606,7 +612,7 @@ def run_phase(
         f"target_tokens~{target_tokens:,}"
     )
     print(f"Data phase: train={train_data_phase}, val={val_data_phase}")
-    if phase_name in ("B", "C", "D", "E") and resume_path is None:
+    if phase_name in ("B", "C", "D") and resume_path is None:
         print(
             "Warning: running a later phase without resume. "
             "This is valid for debugging, but not a smooth phase transition."
@@ -748,7 +754,7 @@ def run_phase(
     # doc-boundary reset on the first batch. This means resumed memory state
     # is inconsistent with the token stream for the first few chunks until
     # PM/EM naturally adapt. This is acceptable because PM/EM are designed
-    # to be robust to distribution shifts (same mechanism as Phase E lifelong).
+    # to be robust to distribution shifts (same mechanism as Phase D lifelong).
     dataloader = create_dataloader(
         phase=train_data_phase,
         tokenizer=tokenizer,
@@ -958,8 +964,10 @@ def run_phase(
                 try:
                     from .debug.plot_text_samples import generate_text_sample_plot
                     from .model.state import save_runtime_state as _save_rt, load_runtime_state as _load_rt
+                    text_sample_dir = os.path.join(save_dir, "text_samples")
+                    os.makedirs(text_sample_dir, exist_ok=True)
                     sample_path = os.path.join(
-                        save_dir,
+                        text_sample_dir,
                         f"text_samples_step{trainer.global_step}.png",
                     )
                     current_loss = _step_metrics.get("loss")

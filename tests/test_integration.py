@@ -32,8 +32,8 @@ class TestForwardPass:
 
     def test_forward_phase_e(self):
         cfg = make_tiny_config()
+        cfg.set_phase("C")
         cfg.set_phase("D")
-        cfg.set_phase("E")
         model = NeuromorphicLM(cfg)
 
         logits, target = forward_n_tokens(model, 4, BS=BS, vocab=VOCAB)
@@ -42,7 +42,7 @@ class TestForwardPass:
 
     def test_forward_with_decoder(self):
         cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         logits, target = forward_n_tokens(model, 4, BS=BS, vocab=VOCAB)
@@ -57,7 +57,7 @@ class TestForwardPass:
 class TestBackward:
     def test_forward_backward_no_crash(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         logits, target = forward_n_tokens(model, 4)
@@ -73,7 +73,7 @@ class TestMultiTokenCommits:
     @pytest.mark.slow
     def test_multi_token_with_commits_no_nan(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         for _ in range(3):
@@ -88,7 +88,7 @@ class TestMultiTokenCommits:
 class TestDocBoundary:
     def test_doc_boundary_reset_no_crash(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         forward_n_tokens(model, 4)
@@ -219,7 +219,7 @@ class TestCheckpointRoundtrip:
     def test_checkpoint_roundtrip(self):
         """Save/load state_dict + runtime_state, get identical logits."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model1 = NeuromorphicLM(cfg)
         forward_n_tokens(model1, cfg.P, with_commits=True)
 
@@ -255,7 +255,7 @@ class TestCheckpointRoundtrip:
 class TestTBPTT:
     def test_detach_then_forward_no_crash(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         forward_n_tokens(model, 4)
@@ -272,7 +272,7 @@ class TestTBPTT:
 class TestEMWriteIntegration:
     def test_em_write_populates_state(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
 
@@ -340,7 +340,7 @@ class TestGenerate:
     def test_generate_surprise_nonzero(self):
         """After generation, surprise should be populated (nonzero)."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         model.train(False)
 
@@ -414,7 +414,7 @@ class TestGenerate:
     def test_generate_eot_masks_surprise(self):
         """EOT positions get zero surprise (consistent with training)."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         cfg.reset_on_doc_boundary = True
         model = NeuromorphicLM(cfg)
         model.train(False)

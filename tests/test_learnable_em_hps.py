@@ -58,7 +58,7 @@ class TestEMNeuromodulatorTauWw:
     def test_continuous_tau_in_range(self):
         """Phase C: learned tau is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         _, _, tau, ww = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (tau >= cfg.tau_em_floor - 1e-6).all()
@@ -67,7 +67,7 @@ class TestEMNeuromodulatorTauWw:
     def test_continuous_ww_in_range(self):
         """Phase C: learned ww is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         _, _, tau, ww = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (ww >= cfg.ww_em_floor - 1e-6).all()
@@ -76,7 +76,7 @@ class TestEMNeuromodulatorTauWw:
     def test_learned_tau_in_range(self):
         """Phase D: learned tau is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         _, _, tau, ww = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (tau >= cfg.tau_em_floor - 1e-6).all()
@@ -85,7 +85,7 @@ class TestEMNeuromodulatorTauWw:
     def test_learned_ww_in_range(self):
         """Phase D: learned ww is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         _, _, tau, ww = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (ww >= cfg.ww_em_floor - 1e-6).all()
@@ -94,7 +94,7 @@ class TestEMNeuromodulatorTauWw:
     def test_tau_head_exists_phase_c(self):
         """Phase C+: tau_head and ww_head are created."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         assert hasattr(nm, "tau_head")
         assert hasattr(nm, "ww_head")
@@ -110,7 +110,7 @@ class TestEMNeuromodulatorTauWw:
     def test_init_tau_matches_heuristic_default(self):
         """At init, learned tau should be close to heuristic default (tau_em)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         # Use zero inputs to get pure-bias output (exact match)
         _, _, tau, _ = nm(torch.zeros(BS), torch.zeros(BS), torch.zeros(BS))
@@ -119,7 +119,7 @@ class TestEMNeuromodulatorTauWw:
     def test_init_ww_matches_heuristic_default(self):
         """At init, learned ww should be close to heuristic default (weakness_weight_em)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         # Use zero inputs to get pure-bias output (exact match)
         _, _, _, ww = nm(torch.zeros(BS), torch.zeros(BS), torch.zeros(BS))
@@ -180,7 +180,7 @@ class TestWriteAtBoundaryTauWw:
     def test_accepts_tensor_tau_ww(self):
         """write_at_boundary works with [BS] tau and ww tensors."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         em = self._make_em_with_state(cfg)
 
         P = cfg.P
@@ -201,7 +201,7 @@ class TestWriteAtBoundaryTauWw:
     def test_none_tau_ww_uses_defaults(self):
         """When tau/ww are None, defaults from config are used."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         em = self._make_em_with_state(cfg)
 
         P = cfg.P
@@ -219,7 +219,7 @@ class TestWriteAtBoundaryTauWw:
     def test_different_tau_gives_different_writes(self):
         """Different per-stream tau values produce different EM states."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
 
         P = cfg.P
         cand_K = torch.randn(BS, P, cfg.D_em)
@@ -256,7 +256,7 @@ class TestTauWwGradientFlow:
     def test_tau_head_has_grad_after_rl_loss(self):
         """tau_head params get gradients from the RL loss."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
 
         surprise = torch.randn(BS)
@@ -277,7 +277,7 @@ class TestTauWwGradientFlow:
     def test_ww_head_has_grad_after_rl_loss(self):
         """ww_head params get gradients from the RL loss."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
 
         surprise = torch.randn(BS)
@@ -297,7 +297,7 @@ class TestTauWwGradientFlow:
     def test_backbone_gets_grad_from_all_heads(self):
         """Backbone gets gradients from g_em, tau, and ww heads."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
 
         surprise = torch.randn(BS)

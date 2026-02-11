@@ -167,6 +167,7 @@ class TBPTTTrainer:
         )
 
         accum = span_ops.SpanAccumulator.create(BS, self.config.B, self.device)
+        last_gate_stats = None
 
         for span_start in range(0, T, P):
             span_end = min(span_start + P, T)
@@ -183,14 +184,19 @@ class TBPTTTrainer:
                 reset_first = (input_ids[:, span_start - 1] == eot_id)
 
             # Forward pass + loss + surprise + PM/EM accumulation
+            # Collect gate stats on the last span of full-collection steps
+            is_last_span = (span_start + P >= T)
+            collect_gates = do_full and is_last_span
             fwd = self._forward_span_and_loss(
                 span_ids, span_targets, reset_first, amp_ctx, accum,
-                span_start, span_end,
+                span_start, span_end, collect=collect_gates,
             )
             chunk_loss = chunk_loss + fwd["span_loss"]
             valid_count += fwd["span_valid"]
             eot_inputs += fwd["eot_count"]
             reset_events += fwd["reset_count"]
+            if collect_gates:
+                last_gate_stats = fwd["gate_stats"]
 
             # Finalize span: compute surprise mean and stack EM candidates
             result = accum.finalize(self.device, self.config)
@@ -237,16 +243,22 @@ class TBPTTTrainer:
 
     def _forward_span_and_loss(
         self, span_ids, span_targets, reset_first, amp_ctx, accum,
-        span_start, span_end,
+        span_start, span_end, collect: bool = False,
     ) -> dict:
         """Forward pass + loss + surprise + PM/EM accumulation for one span.
 
-        Returns dict with span_loss, span_valid, eot_count, reset_count.
+        Returns dict with span_loss, span_valid, eot_count, reset_count,
+        and optionally gate_stats (when collect=True).
         """
         with amp_ctx:
-            logits_all, x_emb_all, y_wm_all = self.model.forward_span(
-                span_ids, reset_first
+            fwd_result = self.model.forward_span(
+                span_ids, reset_first, collect=collect,
             )
+            if collect:
+                logits_all, x_emb_all, y_wm_all, gate_stats = fwd_result
+            else:
+                logits_all, x_emb_all, y_wm_all = fwd_result
+                gate_stats = None
 
             if self.fail_fast and not torch.isfinite(logits_all).all():
                 raise RuntimeError(
@@ -303,6 +315,7 @@ class TBPTTTrainer:
             "span_valid": span_valid,
             "eot_count": int(is_eot_all.sum().item()),
             "reset_count": int(reset_mask_all.sum().item()),
+            "gate_stats": gate_stats,
         }
 
     def _build_rl_snapshot(
@@ -551,7 +564,9 @@ class TBPTTTrainer:
                     "nan_grad_steps": getattr(self, '_nan_steps', 0),
                 }
                 self.collector.log_full(
-                    self.global_step, {}, basic,
+                    self.global_step,
+                    last_gate_stats if last_gate_stats else {},
+                    basic,
                     extras=extras, mode="train",
                 )
             else:

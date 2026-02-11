@@ -93,7 +93,7 @@ class MetricsCollector:
         # Global summaries and warning signals
         self._collect_plasticity_summary(record)
 
-        # Lifelong persistence stats (Phase E)
+        # Lifelong persistence stats (Phase D)
         if self.config.lifelong_mode:
             self._collect_lifelong_stats(record)
 
@@ -258,7 +258,7 @@ class MetricsCollector:
         )
 
     def _collect_lifelong_stats(self, record: dict):
-        """Collect cross-document memory persistence stats (Phase E)."""
+        """Collect cross-document memory persistence stats (Phase D)."""
         pm_nonzero_total = 0.0
         pm_slots_total = 0
         pm_budget_total = 0.0

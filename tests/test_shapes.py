@@ -123,7 +123,7 @@ class TestWMShapes:
 class TestPMShapes:
     def test_pm_apply_shape(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         _run_one(model)
         for block in model.blocks:
@@ -134,7 +134,7 @@ class TestPMShapes:
 
     def test_pm_state_shapes(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         _run_one(model)
         for block in model.blocks:
@@ -146,7 +146,7 @@ class TestPMShapes:
 
     def test_pm_summary_shape(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         _run_one(model)
         summary = model._compute_pm_summary(BS, torch.device("cpu"))
@@ -160,7 +160,7 @@ class TestPMShapes:
 class TestEMShapes:
     def test_em_retrieve_shape(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         _, x_emb, y_wm = _run_one(model)
         # Retrieve should return [BS, D]
@@ -170,7 +170,7 @@ class TestEMShapes:
 
     def test_em_state_shapes(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         _run_one(model)
         for block in model.blocks:
@@ -181,7 +181,7 @@ class TestEMShapes:
 
     def test_em_propose_candidate_shapes(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         _, x_emb, y_wm = _run_one(model)
         for block in model.blocks:
@@ -195,7 +195,7 @@ class TestEMShapes:
 
     def test_em_summary_shape(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         _run_one(model)
         summary = model._compute_em_summary(BS, torch.device("cpu"))
@@ -224,7 +224,7 @@ class TestNeuromodulatorShapes:
     def test_pm_neuromod_output_shapes(self):
         """PMNeuromodulator returns 5-tuple."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         _run_one(model)
 
@@ -248,9 +248,9 @@ class TestNeuromodulatorShapes:
         assert p_commit is None
 
     def test_pm_neuromod_heuristic_shapes(self):
-        """Phase A: heuristic mode."""
+        """pm_enabled=False: heuristic fallback mode."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.pm_enabled = False
         neuromod = PMNeuromodulator(cfg)
         elig_norm = torch.randn(BS)
         pm_usage = torch.randn(BS)
@@ -262,10 +262,26 @@ class TestNeuromodulatorShapes:
         assert slot_logits is None
         assert p_commit is None
 
-    def test_pm_neuromod_learned_shapes(self):
-        """Phase D: learned mode with p_commit."""
+    def test_pm_neuromod_continuous_shapes(self):
+        """Phase A: continuous mode (PM enabled, no RL)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("A")
+        neuromod = PMNeuromodulator(cfg)
+        elig_norm = torch.randn(BS)
+        pm_usage = torch.randn(BS)
+        surprise = torch.randn(BS)
+
+        result = neuromod.forward(elig_norm, pm_usage, surprise)
+        commit_mask, lambda_vals, g, slot_logits, p_commit = result
+        assert commit_mask.shape == (BS,)
+        assert slot_logits is not None
+        assert slot_logits.shape[1] == cfg.r
+        assert p_commit is None  # no RL → no p_commit
+
+    def test_pm_neuromod_learned_shapes(self):
+        """Phase C: learned mode with p_commit (RL enabled)."""
+        cfg = make_tiny_config()
+        cfg.set_phase("C")
         neuromod = PMNeuromodulator(cfg)
         elig_norm = torch.randn(BS)
         pm_usage = torch.randn(BS)
@@ -279,7 +295,7 @@ class TestNeuromodulatorShapes:
     def test_em_neuromod_output_shapes(self):
         """EMNeuromodulator returns 3-tuple."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
@@ -370,7 +386,7 @@ class TestDecoderAssemblyInvariants:
     def test_thalamic_input_token_count(self):
         """Thalamic integrator receives B cortical + 3 memory = B+3 tokens."""
         cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         dec = model.spatial_decoder
         thal = dec.thalamic
@@ -427,7 +443,7 @@ class TestDecoderAssemblyInvariants:
         - query_proj: D -> d_dec
         """
         cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         dec = model.spatial_decoder
 
@@ -451,7 +467,7 @@ class TestDecoderAssemblyInvariants:
         With output_proj weights zeroed, h_decoded must equal h_final exactly.
         """
         cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         dec = model.spatial_decoder
 

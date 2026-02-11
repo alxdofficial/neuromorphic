@@ -71,32 +71,32 @@ class TestPhaseToggles:
                 f"Phase {phase}: {key} = {getattr(cfg, key)}, expected {val}"
 
     def test_phase_e_inherits_rl_enabled(self):
-        """set_phase('E') does NOT set rl_enabled — inherits prior value."""
+        """set_phase('D') does NOT set rl_enabled — inherits prior value."""
         # From Phase D (rl_enabled=True)
         cfg1 = ModelConfig()
-        cfg1.set_phase("D")
+        cfg1.set_phase("C")
         assert cfg1.rl_enabled is True
-        cfg1.set_phase("E")
+        cfg1.set_phase("D")
         assert cfg1.rl_enabled is True, "Phase E should inherit rl_enabled=True from D"
         assert cfg1.lifelong_mode is True
 
         # From Phase C (rl_enabled=False)
         cfg2 = ModelConfig()
-        cfg2.set_phase("C")
+        cfg2.set_phase("B")
         assert cfg2.rl_enabled is False
-        cfg2.set_phase("E")
+        cfg2.set_phase("D")
         assert cfg2.rl_enabled is False, "Phase E should inherit rl_enabled=False from C"
         assert cfg2.lifelong_mode is True
 
     def test_phase_e_enables_lifelong(self):
         cfg = ModelConfig()
-        cfg.set_phase("E")
+        cfg.set_phase("D")
         assert cfg.lifelong_mode is True
 
     def test_non_e_disables_lifelong(self):
         cfg = ModelConfig()
-        cfg.set_phase("E")
         cfg.set_phase("D")
+        cfg.set_phase("C")
         assert cfg.lifelong_mode is False
 
     def test_invalid_phase_raises(self):

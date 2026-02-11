@@ -111,7 +111,7 @@ class TestBudgetEnforce:
 class TestPMNormalization:
     def test_pm_keys_unit_normalized_after_init(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         BS = 2
         x = torch.randint(0, 64, (BS,))
@@ -124,7 +124,7 @@ class TestPMNormalization:
 
     def test_pm_keys_unit_normalized_after_commit(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, model.config.P, with_commits=True)
         for block in model.blocks:
@@ -140,7 +140,7 @@ class TestPMNormalization:
 class TestEMNormalization:
     def test_em_keys_unit_normalized_after_init(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         BS = 2
         x = torch.randint(0, 64, (BS,))
@@ -152,7 +152,7 @@ class TestEMNormalization:
 
     def test_em_keys_unit_normalized_after_write(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, model.config.P)
         for block in model.blocks:
@@ -167,7 +167,7 @@ class TestEMNormalization:
 class TestPMStrengthBounds:
     def test_pm_strengths_bounded_by_a_max(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         # Run multiple commit cycles
         for _ in range(3):
@@ -179,7 +179,7 @@ class TestPMStrengthBounds:
 
     def test_pm_strengths_bounded_by_budget(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         for _ in range(3):
             forward_n_tokens(model, cfg.P, with_commits=True)
@@ -196,7 +196,7 @@ class TestPMStrengthBounds:
 class TestEMStrengthBounds:
     def test_em_strengths_bounded_by_s_max(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         for _ in range(3):
             forward_and_write_em(model, cfg.P)
@@ -206,7 +206,7 @@ class TestEMStrengthBounds:
 
     def test_em_strengths_bounded_by_budget(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         for _ in range(3):
             forward_and_write_em(model, cfg.P)
@@ -252,14 +252,14 @@ class TestCarryGate:
 class TestNoNaN:
     def test_no_nan_in_forward_pass(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         logits, _ = forward_n_tokens(model, 8)
         assert torch.isfinite(logits).all()
 
     def test_no_nan_after_commit(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
         for block in model.blocks:
@@ -270,7 +270,7 @@ class TestNoNaN:
 
     def test_no_nan_after_em_write(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
         for block in model.blocks:
@@ -330,7 +330,7 @@ class TestEligibilityDecay:
         gated eligibility accumulation has nonzero gate values.
         """
         cfg = make_tiny_config(rho=0.5)
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         BS = 2
         reset = torch.zeros(BS, dtype=torch.bool)
@@ -368,7 +368,7 @@ class TestEligibilityDecay:
         patterns it already predicts well.
         """
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         BS = 2
 
@@ -393,7 +393,7 @@ class TestEligibilityDecay:
     def test_high_surprise_accumulates_eligibility(self):
         """When surprise is high, eligibility accumulates normally."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         BS = 2
 
@@ -448,7 +448,7 @@ class TestOnlineCrossEntropy:
 class TestDecay:
     def test_pm_decay_reduces_strengths(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
 
@@ -465,7 +465,7 @@ class TestDecay:
 
     def test_em_decay_reduces_strengths(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
 
@@ -642,7 +642,7 @@ class TestEMWriteEquations:
                                tau_em=1.0, weakness_weight_em=0.0,
                                S_max=10.0, budget_em=40.0, decay_em=0.9,
                                D=8, B=2, L=1)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         em = EpisodicMemory(cfg)
         return em
 
@@ -794,7 +794,7 @@ class TestEMColdStartNovelty:
     def test_cold_start_novelty_equals_surprise(self):
         """With no active slots (em_S=0), novelty should equal clamped surprise."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         BS = 2
@@ -828,7 +828,7 @@ class TestEMColdStartNovelty:
         This verifies that Fix B actually prevents spurious cold-start writes.
         """
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         BS = 2
@@ -854,7 +854,7 @@ class TestEMColdStartNovelty:
         (not surprise-only).
         """
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         # Populate EM with writes
         forward_and_write_em(model, cfg.P)

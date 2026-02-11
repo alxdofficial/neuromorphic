@@ -269,7 +269,7 @@ class TestPMApplyBatch:
 class TestEMRetrieveBatch:
     def test_matches_sequential(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         em = EpisodicMemory(cfg)
         torch.manual_seed(42)
 
@@ -299,7 +299,7 @@ class TestEMRetrieveBatch:
 class TestEMProposeCandidateBatch:
     def test_matches_sequential(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         em = EpisodicMemory(cfg)
         torch.manual_seed(42)
 

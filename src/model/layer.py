@@ -117,7 +117,8 @@ class Layer(nn.Module, StateMixin):
 
     def forward_span(self, x_all: Tensor, y_pm_all: Tensor,
                      y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
-                     surprise_span: Tensor, carry_all: Tensor) -> Tensor:
+                     surprise_span: Tensor, carry_all: Tensor,
+                     collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this layer.
 
         Args:
@@ -127,9 +128,11 @@ class Layer(nn.Module, StateMixin):
             y_em_proj_all: [BS, P, D_h] — EM output projected to D_h
             surprise_span: [BS, 1] — frozen surprise for this span
             carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
+            collect: if True, return (output, gate_stats) tuple
 
         Returns:
             output_all: [BS, P, D_h] — layer outputs for all tokens
+            (if collect: also returns gate_stats dict)
         """
         BS, P, D_h = x_all.shape
         device = x_all.device
@@ -170,4 +173,11 @@ class Layer(nn.Module, StateMixin):
         # and propose_candidate().
         self._last_h_all = output
 
+        if collect:
+            stats = {
+                "gate_a": a.detach().mean(dim=1),  # [BS, D_h] — mean over P
+                "gate_b": b.detach().mean(dim=1),  # [BS, D_h] — mean over P
+                "h_norm": self.h.detach().norm(dim=-1).mean().item(),
+            }
+            return output, stats
         return output

@@ -185,7 +185,7 @@ class TestSpanAccumulator:
 
     def test_finalize_with_em(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")  # EM enabled
+        cfg.set_phase("B")  # EM enabled
         accum = span_ops.SpanAccumulator.create(BS, cfg.B, torch.device("cpu"))
         accum.surprise_accum.fill_(4.0)
         accum.valid_tokens.fill_(2.0)

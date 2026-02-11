@@ -87,7 +87,7 @@ class TestEMGemClamping:
     def test_continuous_g_em_in_range(self):
         """In continuous mode, g_em should be in [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
@@ -99,7 +99,7 @@ class TestEMGemClamping:
     def test_learned_g_em_in_range(self):
         """In learned mode, g_em should be in [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
@@ -125,14 +125,14 @@ class TestEMNeuromodulator:
     def test_continuous_mode_has_backbone(self):
         """Phase C: backbone + g_head."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         assert hasattr(neuromod, "backbone")
         assert hasattr(neuromod, "g_head")
 
     def test_backbone_input_dim(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         assert neuromod.backbone[0].in_features == EM_NEUROMOD_INPUT_DIM
 
@@ -151,7 +151,7 @@ class TestEMNeuromodulator:
     def test_learned_write_mask_all_true(self):
         """Phase D: write_mask is always True."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)

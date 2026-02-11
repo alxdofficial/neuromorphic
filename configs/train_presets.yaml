@@ -1,4 +1,4 @@
-default_preset: phase_a_to_d
+default_preset: phase_a_to_c
 
 defaults:
   output_root: outputs
@@ -14,34 +14,31 @@ defaults:
   use_phase_default_steps: true
 
 presets:
-  phase_a_to_d:
-    run_name: phase_a_to_d
+  phase_a_to_c:
+    run_name: phase_a_to_c
     phases:
       - phase: A
-        steps: 2000
+        steps: 5000
         resume: null
       - phase: B
-        steps: 4000
-        resume: auto_previous
-      - phase: C
         steps: 5000
         resume: auto_previous
-      - phase: D
+      - phase: C
         steps: 7000
         resume: auto_previous
 
-  phase_d_from_ckpt:
-    run_name: phase_d_from_ckpt
+  phase_c_from_ckpt:
+    run_name: phase_c_from_ckpt
     phases:
-      - phase: D
+      - phase: C
         steps: 7000
-        resume: checkpoints/manual_phase_c_last.pt
+        resume: checkpoints/manual_phase_b_last.pt
 
   quick_test:
     run_name: quick_test
     phases:
       - phase: A
-        steps: 100
+        steps: 200
         resume: null
       - phase: B
         steps: 200
@@ -49,12 +46,9 @@ presets:
       - phase: C
         steps: 200
         resume: auto_previous
-      - phase: D
-        steps: 200
-        resume: auto_previous
 
-  full_a_to_e:
-    run_name: full_a_to_e
+  full_a_to_d:
+    run_name: full_a_to_d
     phases:
       - phase: A
         resume: null
@@ -63,7 +57,5 @@ presets:
       - phase: C
         resume: auto_previous
       - phase: D
-        resume: auto_previous
-      - phase: E
         steps: 2500
         resume: auto_previous

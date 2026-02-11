@@ -63,9 +63,9 @@ class ModelConfig:
     T: int = 256              # TBPTT segment length
     P: int = 32               # plasticity span
     reset_on_doc_boundary: bool = True
-    lifelong_mode: bool = False  # Phase E: PM/EM persist across doc boundaries
+    lifelong_mode: bool = False  # Phase D: PM/EM persist across doc boundaries
 
-    # RL controllers (Phase D)
+    # RL controllers (Phase C)
     rl_enabled: bool = False
     rl_controller_hidden: int = 32
     rl_lr: float = 1e-3
@@ -86,8 +86,8 @@ class ModelConfig:
 
     # Phase toggles
     wm_enabled: bool = True   # always on
-    pm_enabled: bool = False  # Phase B+
-    em_enabled: bool = False  # Phase C+
+    pm_enabled: bool = True   # always on (Phase A+)
+    em_enabled: bool = False  # Phase B+
 
     @property
     def D_h(self) -> int:
@@ -127,11 +127,10 @@ class ModelConfig:
     def set_phase(self, phase: str):
         """Set component toggles for training phase.
 
-        A: WM only
-        B: WM + PM
-        C: WM + PM + EM
-        D: WM + PM + EM (+ RL controllers)
-        E: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
+        A: WM + PM (base — PM is always on)
+        B: WM + PM + EM
+        C: WM + PM + EM + RL controllers
+        D: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
 
         Design intent: All downstream code branches on capability flags
         (pm_enabled, em_enabled, rl_enabled) — never on phase letters.
@@ -140,36 +139,31 @@ class ModelConfig:
         phase = phase.upper()
         if phase == "A":
             self.wm_enabled = True
-            self.pm_enabled = False
+            self.pm_enabled = True
             self.em_enabled = False
             self.rl_enabled = False
         elif phase == "B":
             self.wm_enabled = True
             self.pm_enabled = True
-            self.em_enabled = False
+            self.em_enabled = True
             self.rl_enabled = False
         elif phase == "C":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-            self.rl_enabled = False
+            self.rl_enabled = True
         elif phase == "D":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-            self.rl_enabled = True
-        elif phase == "E":
-            self.wm_enabled = True
-            self.pm_enabled = True
-            self.em_enabled = True
-            # Phase E inherits rl_enabled — does not force it on or off.
-            # This allows Phase E to run with or without neuromodulators
-            # depending on prior config (e.g. resuming from Phase D).
+            # Phase D inherits rl_enabled — does not force it on or off.
+            # This allows Phase D to run with or without neuromodulators
+            # depending on prior config (e.g. resuming from Phase C).
         else:
-            raise ValueError(f"Unknown phase: {phase}. Expected A/B/C/D/E.")
+            raise ValueError(f"Unknown phase: {phase}. Expected A/B/C/D.")
 
-        # Phase E: enable lifelong mode
-        self.lifelong_mode = (phase == "E")
+        # Phase D: enable lifelong mode
+        self.lifelong_mode = (phase == "D")
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":

@@ -69,13 +69,12 @@ DEFAULTS = dict(
 # Phase toggles: phase -> expected flags after set_phase()
 # ---------------------------------------------------------------------------
 PHASE_TOGGLES = {
-    "A": dict(wm_enabled=True, pm_enabled=False, em_enabled=False, rl_enabled=False, lifelong_mode=False),
-    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, rl_enabled=False, lifelong_mode=False),
-    "C": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=False, lifelong_mode=False),
-    "D": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=True, lifelong_mode=False),
-    # Phase E does NOT set rl_enabled — it inherits the prior value.
+    "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, rl_enabled=False, lifelong_mode=False),
+    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=False, lifelong_mode=False),
+    "C": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=True, lifelong_mode=False),
+    # Phase D does NOT set rl_enabled — it inherits the prior value.
     # The test should verify rl_enabled is unchanged.
-    "E": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
+    "D": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
 }
 
 # ---------------------------------------------------------------------------

@@ -51,10 +51,11 @@ class TestPhaseGradients:
         for name, param in model.named_parameters():
             is_pm = "pm" in name and "neuromodulator" not in name
             is_em = "em" in name and "neuromodulator" not in name
-            is_inactive = is_pm or is_em
+            is_neuromod = "neuromodulator" in name
+            is_inactive = is_pm or is_em or is_neuromod
 
             if is_inactive:
-                # PM/EM params should have zero or None grad
+                # PM/EM/neuromod params should have zero or None grad in Phase A
                 if param.grad is not None and param.grad.abs().max() > 1e-10:
                     inactive_with_grad.append(name)
             else:
@@ -68,7 +69,7 @@ class TestPhaseGradients:
     def test_all_params_get_grad_phase_b(self):
         """Phase B: After PM commit, all PM params get gradients."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
@@ -90,7 +91,7 @@ class TestPhaseGradients:
     def test_all_params_get_grad_phase_c(self):
         """Phase C: After EM write, all EM params get gradients."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
@@ -118,7 +119,7 @@ class TestPhaseGradients:
 class TestSpecificGradients:
     def test_pm_readout_ffn_gets_gradients(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
@@ -134,7 +135,7 @@ class TestSpecificGradients:
 
     def test_em_readout_ffn_gets_gradients(self):
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
@@ -148,7 +149,7 @@ class TestSpecificGradients:
 
     def test_pm_eligibility_projections_get_gradients(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
@@ -223,7 +224,7 @@ class TestDecoderGradients:
 
     def test_decoder_all_levels_get_gradients(self):
         cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
@@ -252,7 +253,7 @@ class TestGradientSafety:
     def test_gradients_are_finite(self):
         """No NaN/Inf in any param.grad."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
 
         loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
@@ -265,7 +266,7 @@ class TestGradientSafety:
 
     def test_detach_states_removes_grad_graph(self):
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         forward_n_tokens(model, 4, with_commits=True)
@@ -290,7 +291,7 @@ class TestGradientSafety:
     def test_backward_with_doc_boundary(self):
         """forward_one_token with reset_mask=[True,False] doesn't crash backward."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
         # Run a few tokens first to populate state

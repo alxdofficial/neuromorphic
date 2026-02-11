@@ -109,7 +109,8 @@ class Block(nn.Module, StateMixin):
 
     def forward_span(self, x_block_all: Tensor, y_wm_all: Tensor,
                      x_emb_all: Tensor, surprise_span: Tensor,
-                     carry_all: Tensor) -> Tensor:
+                     carry_all: Tensor,
+                     collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this block.
 
         Note: PM eligibility is NOT updated here — it's deferred to the
@@ -121,9 +122,11 @@ class Block(nn.Module, StateMixin):
             x_emb_all: [BS, P, D] — token embeddings
             surprise_span: [BS, 1] — frozen surprise for this span
             carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
+            collect: if True, return (h_out, layer_stats) tuple
 
         Returns:
             h_out_all: [BS, P, D_h] — final layer output for all tokens
+            (if collect: also returns {layer_idx: gate_stats} dict)
         """
         # EM retrieval (if enabled)
         if self.config.em_enabled:
@@ -137,14 +140,20 @@ class Block(nn.Module, StateMixin):
 
         # Sequential layers (each with batched forward)
         x = x_block_all
-        for layer in self.layers:
+        layer_stats = {} if collect else None
+        for l_idx, layer in enumerate(self.layers):
             if self.config.pm_enabled:
                 y_pm_all = layer.pm.apply_batch(x)
             else:
                 y_pm_all = torch.zeros_like(x)
 
-            x = layer.forward_span(x, y_pm_all, y_wm_proj_all, y_em_proj_all,
-                                   surprise_span, carry_all)
+            result = layer.forward_span(x, y_pm_all, y_wm_proj_all, y_em_proj_all,
+                                        surprise_span, carry_all, collect=collect)
+            if collect:
+                x, lstats = result
+                layer_stats[l_idx] = lstats
+            else:
+                x = result
 
         # Collect per-layer outputs for spatial decoder.
         # Each layer's _last_h_all is [BS, P, D_h], stored during forward_span.
@@ -152,6 +161,8 @@ class Block(nn.Module, StateMixin):
             [layer._last_h_all for layer in self.layers], dim=2
         )  # [BS, P, L, D_h]
 
+        if collect:
+            return x, layer_stats
         return x
 
     def commit_pm(self, force_mode: str = "normal",
@@ -211,7 +222,7 @@ class Block(nn.Module, StateMixin):
     def reset_states(self, mask: Tensor):
         """Reset states for masked streams.
 
-        In lifelong mode (Phase E), only transient state resets:
+        In lifelong mode (Phase D), only transient state resets:
         h and eligibility traces. PM committed state and EM persist.
         """
         for layer in self.layers:

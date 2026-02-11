@@ -147,7 +147,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         return logits, x, y_wm
 
     def forward_span(self, input_ids: Tensor,
-                     reset_mask_first: Tensor) -> tuple:
+                     reset_mask_first: Tensor,
+                     collect: bool = False) -> tuple:
         """Process P tokens in parallel (one plasticity span).
 
         Surprise is frozen at the span-initial value for all P tokens.
@@ -157,11 +158,13 @@ class NeuromorphicLM(nn.Module, StateMixin):
             input_ids: [BS, P] — token IDs for one span
             reset_mask_first: [BS] bool — reset mask for the first token
                 (subsequent resets derived from eot_id in input_ids)
+            collect: if True, 4th return element is gate_stats dict
 
         Returns:
             logits_all: [BS, P, vocab]
             x_emb_all: [BS, P, D]
             y_wm_all: [BS, P, D]
+            (if collect: gate_stats: {block_idx: {layer_idx: stats}})
         """
         BS, P = input_ids.shape
         device = input_ids.device
@@ -217,11 +220,18 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
         # 8. Process each block
         h_blocks = []
+        gate_stats = {} if collect else None
         for b, block in enumerate(self.blocks):
-            h_b = block.forward_span(
+            result = block.forward_span(
                 x_blocks_all[:, :, b],  # [BS, P, D_h]
                 y_wm_all, x_emb_all, surprise_span, carry_all,
+                collect=collect,
             )
+            if collect:
+                h_b, bstats = result
+                gate_stats[b] = bstats
+            else:
+                h_b = result
             h_blocks.append(h_b)
 
         # 9. Merge block outputs
@@ -258,6 +268,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         else:
             logits_all = self.lm_head(h_final)  # [BS, P, vocab]
 
+        if collect:
+            return logits_all, x_emb_all, y_wm_all, gate_stats
         return logits_all, x_emb_all, y_wm_all
 
     def _compute_reset_masks(self, input_ids: Tensor,

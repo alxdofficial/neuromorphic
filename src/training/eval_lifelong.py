@@ -1,5 +1,5 @@
 """
-Lifelong learning evaluation — Phase E evaluation tasks.
+Lifelong learning evaluation — Phase D evaluation tasks.
 
 Three evaluation modes:
 1. Domain adaptation: stream Wikipedia articles, measure per-chunk perplexity decrease.

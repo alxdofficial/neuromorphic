@@ -89,17 +89,17 @@ class TestEligibilityConfig:
 
 class TestPMNeuromodulator:
     def test_heuristic_mode_no_params(self):
-        """Phase A: no learnable params."""
+        """pm_enabled=False: no learnable params (heuristic fallback)."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.pm_enabled = False
         neuromod = PMNeuromodulator(cfg)
         param_count = sum(1 for _ in neuromod.parameters())
         assert param_count == 0
 
     def test_continuous_mode_has_backbone(self):
-        """Phase B: backbone + continuous heads, no gate_head."""
+        """Phase A: backbone + continuous heads, no gate_head."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         neuromod = PMNeuromodulator(cfg)
         assert hasattr(neuromod, "backbone")
         assert hasattr(neuromod, "lambda_head")
@@ -108,16 +108,16 @@ class TestPMNeuromodulator:
         assert not hasattr(neuromod, "gate_head")
 
     def test_learned_mode_has_gate_head(self):
-        """Phase D: full MLP with gate_head."""
+        """Phase C: full MLP with gate_head (RL enabled)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         neuromod = PMNeuromodulator(cfg)
         assert hasattr(neuromod, "gate_head")
 
     def test_backbone_input_dim(self):
         """Backbone takes 3 features."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         neuromod = PMNeuromodulator(cfg)
         assert neuromod.backbone[0].in_features == PM_NEUROMOD_INPUT_DIM
 

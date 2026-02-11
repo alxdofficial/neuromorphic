@@ -165,13 +165,13 @@ class TestSaveLoad:
         Mismatched tensors must remain byte-identical to their pre-load values.
         """
         cfg1 = make_tiny_config(r=4)
-        cfg1.set_phase("B")
+        cfg1.set_phase("A")
         model1 = NeuromorphicLM(cfg1)
         forward_n_tokens(model1, 4, BS=BS)
         state = save_runtime_state(model1)
 
         cfg2 = make_tiny_config(r=8)
-        cfg2.set_phase("B")
+        cfg2.set_phase("A")
         model2 = NeuromorphicLM(cfg2)
         forward_n_tokens(model2, 4, BS=BS)
 
@@ -269,8 +269,8 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_pm_state(self):
         """In lifelong_mode: pm_K/pm_V/pm_a survive reset."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
-        cfg.set_phase("E")  # now lifelong_mode=True
+        cfg.set_phase("C")
+        cfg.set_phase("D")  # now lifelong_mode=True
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
 
@@ -304,8 +304,8 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_em_state(self):
         """In lifelong_mode: EM state completely survives (EM reset never called)."""
         cfg = make_tiny_config()
+        cfg.set_phase("C")
         cfg.set_phase("D")
-        cfg.set_phase("E")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
 
