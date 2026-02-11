@@ -235,6 +235,7 @@ class TBPTTTrainer:
             avg_loss, reg, valid_count, total_tokens, eot_inputs,
             reset_events, grad_norm, rl_metrics, elapsed,
             span_valid_mean_accum, span_count, do_full,
+            gate_stats=last_gate_stats,
         )
 
     # ------------------------------------------------------------------
@@ -479,6 +480,7 @@ class TBPTTTrainer:
         self, avg_loss, reg, valid_count, total_tokens, eot_inputs,
         reset_events, grad_norm, rl_metrics, elapsed,
         span_valid_mean_accum, span_count, do_full,
+        gate_stats=None,
     ) -> dict:
         """Assemble step metrics dict and log to collector. Pure bookkeeping."""
         tokens = total_tokens
@@ -565,7 +567,7 @@ class TBPTTTrainer:
                 }
                 self.collector.log_full(
                     self.global_step,
-                    last_gate_stats if last_gate_stats else {},
+                    gate_stats if gate_stats else {},
                     basic,
                     extras=extras, mode="train",
                 )
