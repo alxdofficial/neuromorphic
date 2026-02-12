@@ -672,6 +672,8 @@ def run_phase(
             "k_ret", "C_em",
             # Readout FFNs (add/remove parameters)
             "pm_readout_ffn", "em_readout_ffn",
+            # Lifelong mode (Phase D)
+            "lifelong_mode",
         )
         _changed_fields = []
         if ckpt_config is not None:
@@ -712,8 +714,8 @@ def run_phase(
             # are still None would be loaded blindly, risking shape mismatches
             # on the first real forward pass.
             with torch.no_grad():
-                dummy = torch.zeros(config.bs, dtype=torch.long, device=device)
-                reset = torch.zeros(config.bs, dtype=torch.bool, device=device)
+                dummy = torch.zeros(bs, dtype=torch.long, device=device)
+                reset = torch.zeros(bs, dtype=torch.bool, device=device)
                 model.forward_one_token(dummy, reset)
                 model.detach_states()
 
