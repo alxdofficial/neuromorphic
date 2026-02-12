@@ -119,7 +119,7 @@ class TestEvaluateValidation:
 
     def test_config_restored_after_validation(self):
         """Config toggles overridden during validation must be restored."""
-        model, cfg = _tiny_model("C")
+        model, cfg = _tiny_model("B")
         assert cfg.pm_enabled is True
         assert cfg.em_enabled is True
 
@@ -134,7 +134,7 @@ class TestEvaluateValidation:
 
     def test_overrides_take_effect(self):
         """pm_enabled/em_enabled overrides should affect validation behavior."""
-        model, cfg = _tiny_model("C")
+        model, cfg = _tiny_model("B")
         dl1 = _batch_iterator(BS, cfg.T, num_batches=3)
         result_full = evaluate_validation(model, dl1, cfg, torch.device("cpu"), num_steps=3)
 

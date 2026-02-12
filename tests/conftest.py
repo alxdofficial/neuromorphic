@@ -23,16 +23,17 @@ TINY_DEFAULTS = dict(
     # WM (must satisfy D_wm % n_heads_wm == 0)
     W=16, D_wm=16, n_heads_wm=2,     # head_dim = 8
     # PM
-    r=4, commit_top_k=2,
+    r=4,
     # EM
-    M=8, D_em=16, k_ret=4, C_em=4, k_write=4,
+    M=8, D_em=16, k_ret=4, C_em=4,
     # Decoder (must satisfy d_dec % n_heads_decoder == 0, D_h >= n_heads_decoder)
     d_dec=16, n_heads_decoder=2, decoder_layers=1, columnar_layers=1,
     thalamic_layers=1, thalamic_tokens=2,
     # Training
     T=16, P=4,
-    # RL
-    rl_controller_hidden=8,
+    # Neuromodulator
+    neuromod_hidden=8,
+    content_proj_dim=4,
     # FFN
     ffn_expansion=2,  # d_ff = D_h * 2 = 32
 )
@@ -109,9 +110,6 @@ def forward_and_write_em(model, n, BS=2, vocab=64):
 
         # Propose EM candidates
         for b_idx, block in enumerate(model.blocks):
-            # Get block's final layer output for h_final
-            # We need to re-run a forward to get h_final per-block, but
-            # we can use the last layer's h state as a proxy
             h_block = block.layers[-1].h
             if h_block is not None:
                 k_c, v_c, novelty = block.em.propose_candidate(
@@ -139,13 +137,14 @@ def forward_and_write_em(model, n, BS=2, vocab=64):
                     span_surprise = model.surprise.squeeze(-1) if model.surprise is not None else torch.zeros(BS)
                     cand_novelty_mean = cand_score.mean(dim=1)
 
-                    write_mask, g_em, _tau, _ww = block.em_neuromodulator.forward(
+                    g_em, tau_em, ww_em, decay_em = block.em_neuromodulator.forward(
                         span_surprise, em_usage, cand_novelty_mean
                     )
-                    # Force write for test purposes
-                    write_mask = torch.ones(BS, dtype=torch.bool)
+                    # Force full write strength for test purposes
+                    g_em = torch.ones(BS) * 0.5
                     block.em.write_at_boundary(cand_K, cand_V, cand_score,
-                                                write_mask, g_em)
+                                                g_em, tau_em, ww_em,
+                                                decay=decay_em)
 
                     # Reset buffers
                     cand_buffers[b_idx] = {"K": [], "V": [], "scores": []}

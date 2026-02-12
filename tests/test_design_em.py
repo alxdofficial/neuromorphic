@@ -10,7 +10,7 @@ from src.model.config import ModelConfig
 from tests.conftest import make_tiny_config, forward_and_write_em
 from tests.design_constants import (
     DEFAULTS, EM_READOUT_FFN_EXPANSION, EM_NEUROMOD_INPUT_DIM,
-    EM_NEUROMOD_NOVELTY_THRESHOLD, EM_NEUROMOD_DEFAULT_G,
+    EM_NEUROMOD_DEFAULT_G,
 )
 
 pytestmark = pytest.mark.design
@@ -34,10 +34,6 @@ class TestEMCapacity:
     def test_default_C_em(self):
         cfg = ModelConfig()
         assert cfg.C_em == DEFAULTS["C_em"]
-
-    def test_default_k_write(self):
-        cfg = ModelConfig()
-        assert cfg.k_write == DEFAULTS["k_write"]
 
 
 # ============================================================================
@@ -85,26 +81,14 @@ class TestEMGemClamping:
         assert cfg.g_em_ceil == DEFAULTS["g_em_ceil"]
 
     def test_continuous_g_em_in_range(self):
-        """In continuous mode, g_em should be in [floor, ceil]."""
+        """In learned mode (Phase B), g_em should be in [floor, ceil]."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
         cand_novelty = torch.randn(BS)
-        _, g_em, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
-        assert (g_em >= cfg.g_em_floor - 1e-6).all()
-        assert (g_em <= cfg.g_em_ceil + 1e-6).all()
-
-    def test_learned_g_em_in_range(self):
-        """In learned mode, g_em should be in [floor, ceil]."""
-        cfg = make_tiny_config()
-        cfg.set_phase("C")
-        neuromod = EMNeuromodulator(cfg)
-        span_surprise = torch.randn(BS)
-        em_usage = torch.randn(BS)
-        cand_novelty = torch.randn(BS)
-        _, g_em, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        g_em, _, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
         assert (g_em <= cfg.g_em_ceil + 1e-6).all()
 
@@ -115,7 +99,7 @@ class TestEMGemClamping:
 
 class TestEMNeuromodulator:
     def test_heuristic_mode_no_params(self):
-        """Phase A-B: no learnable params."""
+        """Phase A: no learnable params (em_enabled=False)."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         neuromod = EMNeuromodulator(cfg)
@@ -123,7 +107,7 @@ class TestEMNeuromodulator:
         assert param_count == 0
 
     def test_continuous_mode_has_backbone(self):
-        """Phase C: backbone + g_head."""
+        """Phase B: backbone + g_head."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
@@ -131,16 +115,19 @@ class TestEMNeuromodulator:
         assert hasattr(neuromod, "g_head")
 
     def test_backbone_input_dim(self):
+        """Backbone takes 3 scalar features + content_proj_dim."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
-        assert neuromod.backbone[0].in_features == EM_NEUROMOD_INPUT_DIM
+        expected_dim = 3 + cfg.content_proj_dim  # scalar features + content projection
+        assert neuromod.backbone[0].in_features == expected_dim
 
-    def test_heuristic_novelty_threshold(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
+    def test_backbone_input_dim_defaults(self):
+        """Default config should match EM_NEUROMOD_INPUT_DIM constant."""
+        cfg = ModelConfig()
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
-        assert neuromod.novelty_threshold == EM_NEUROMOD_NOVELTY_THRESHOLD
+        assert neuromod.backbone[0].in_features == EM_NEUROMOD_INPUT_DIM
 
     def test_heuristic_default_g(self):
         cfg = make_tiny_config()
@@ -148,13 +135,48 @@ class TestEMNeuromodulator:
         neuromod = EMNeuromodulator(cfg)
         assert neuromod.default_g == EM_NEUROMOD_DEFAULT_G
 
-    def test_learned_write_mask_all_true(self):
-        """Phase D: write_mask is always True."""
+    def test_learned_g_em_gates_writes(self):
+        """Phase B: g_em is continuous and gates writes (no binary write_mask)."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
         span_surprise = torch.randn(BS)
         em_usage = torch.randn(BS)
         cand_novelty = torch.randn(BS)
-        write_mask, _, _, _ = neuromod.forward(span_surprise, em_usage, cand_novelty)
-        assert write_mask.all()
+        g_em, tau, ww, decay = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        # g_em should be a continuous value in [floor, ceil]
+        assert g_em.shape == (BS,)
+        assert (g_em >= cfg.g_em_floor - 1e-6).all()
+        assert (g_em <= cfg.g_em_ceil + 1e-6).all()
+
+    def test_heuristic_returns_4_tuple(self):
+        """Phase A: neuromodulator returns (g_em, tau, ww, decay)."""
+        cfg = make_tiny_config()
+        cfg.set_phase("A")
+        neuromod = EMNeuromodulator(cfg)
+        span_surprise = torch.randn(BS)
+        em_usage = torch.randn(BS)
+        cand_novelty = torch.randn(BS)
+        result = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        assert len(result) == 4
+        g_em, tau, ww, decay = result
+        assert g_em.shape == (BS,)
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
+        assert decay.shape == (BS,)
+
+    def test_learned_returns_4_tuple(self):
+        """Phase B: neuromodulator returns (g_em, tau, ww, decay)."""
+        cfg = make_tiny_config()
+        cfg.set_phase("B")
+        neuromod = EMNeuromodulator(cfg)
+        span_surprise = torch.randn(BS)
+        em_usage = torch.randn(BS)
+        cand_novelty = torch.randn(BS)
+        result = neuromod.forward(span_surprise, em_usage, cand_novelty)
+        assert len(result) == 4
+        g_em, tau, ww, decay = result
+        assert g_em.shape == (BS,)
+        assert tau.shape == (BS,)
+        assert ww.shape == (BS,)
+        assert decay.shape == (BS,)

@@ -16,7 +16,7 @@ VOCAB = 64
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _tiny_model(phase="C"):
+def _tiny_model(phase="B"):
     cfg = make_tiny_config()
     cfg.set_phase(phase)
     return NeuromorphicLM(cfg), cfg
@@ -282,7 +282,7 @@ class TestApplyPmBoundary:
 
 class TestApplyEmBoundary:
     def test_returns_write_info(self):
-        model, cfg = _tiny_model("C")
+        model, cfg = _tiny_model("B")
         D_em = cfg.D_em
         em_stacked = {}
         for b in range(cfg.B):
@@ -297,7 +297,7 @@ class TestApplyEmBoundary:
         write_info = span_ops.apply_em_boundary(model, em_stacked, surprise, cfg)
         assert isinstance(write_info, list)
         assert len(write_info) == cfg.B
-        for b_idx, write_mask, novelty_mean, g_em_mean in write_info:
+        for b_idx, novelty_mean, g_em_mean in write_info:
             assert isinstance(b_idx, int)
 
 
@@ -307,7 +307,7 @@ class TestApplyEmBoundary:
 
 class TestProposeEmCandidates:
     def test_appends_to_lists(self):
-        model, cfg = _tiny_model("C")
+        model, cfg = _tiny_model("B")
         # Forward a span to populate _last_h_all
         span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
         reset_first = torch.zeros(BS, dtype=torch.bool)

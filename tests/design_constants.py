@@ -11,13 +11,13 @@ TIER_A = dict(D=512, L=8, B=4)
 TIER_B = dict(
     D=768, L=12, B=6,
     r=16, W=512, D_wm=192, n_heads_wm=6,
-    M=512, D_em=192, k_ret=8, C_em=16, k_write=8,
+    M=512, D_em=192, k_ret=8, C_em=16,
     d_dec=384, n_heads_decoder=6,
 )
 TIER_C = dict(
     D=1024, L=24, B=8,
     r=32, W=1024, D_wm=256, n_heads_wm=8,
-    M=1024, D_em=256, k_ret=16, C_em=32, k_write=16,
+    M=1024, D_em=256, k_ret=16, C_em=32,
     d_dec=512, n_heads_decoder=8, decoder_layers=3,
 )
 
@@ -31,7 +31,6 @@ DEFAULTS = dict(
     a_max=3.0,
     budget_pm=4.0,
     decay_pm=0.999,
-    commit_top_k=2,
     tau_pm=1.0,
     weakness_weight_pm=0.5,
     pm_readout_ffn=True,
@@ -40,7 +39,6 @@ DEFAULTS = dict(
     D_em=128,
     k_ret=4,
     C_em=8,
-    k_write=4,
     tau_em=1.0,
     weakness_weight_em=0.5,
     S_max=3.0,
@@ -61,19 +59,17 @@ DEFAULTS = dict(
     columnar_layers=2,
     thalamic_layers=2,
     thalamic_tokens=4,
-    # RL
-    rl_controller_hidden=32,
+    # Neuromodulator
+    neuromod_hidden=32,
+    content_proj_dim=8,
 )
 
 # ---------------------------------------------------------------------------
 # Phase toggles: phase -> expected flags after set_phase()
 # ---------------------------------------------------------------------------
 PHASE_TOGGLES = {
-    "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, rl_enabled=False, lifelong_mode=False),
-    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=False, lifelong_mode=False),
-    "C": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, rl_enabled=True, lifelong_mode=False),
-    # Phase D does NOT set rl_enabled — it inherits the prior value.
-    # The test should verify rl_enabled is unchanged.
+    "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, lifelong_mode=False),
+    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=False),
     "D": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
 }
 
@@ -83,23 +79,17 @@ PHASE_TOGGLES = {
 # Gate input dim = 4 * D_h + 1 (x_block + y_pm + y_wm_proj + y_em_proj + surprise)
 GATE_INPUT_FORMULA = lambda D_h: 4 * D_h + 1
 
-# PM neuromodulator backbone input dim
-PM_NEUROMOD_INPUT_DIM = 3  # (elig_norm, pm_usage, span_surprise)
+# PM neuromodulator backbone input dim (3 scalars + content_proj_dim)
+PM_NEUROMOD_INPUT_DIM = 3 + 8  # (elig_norm, pm_usage, span_surprise) + content_proj
 
-# EM neuromodulator backbone input dim
-EM_NEUROMOD_INPUT_DIM = 3  # (span_surprise, em_usage, cand_novelty_mean)
+# EM neuromodulator backbone input dim (3 scalars + content_proj_dim)
+EM_NEUROMOD_INPUT_DIM = 3 + 8  # (span_surprise, em_usage, cand_novelty_mean) + content_proj
 
 # PM readout FFN expansion factor
 PM_READOUT_FFN_EXPANSION = 4
 
 # EM readout FFN expansion factor
 EM_READOUT_FFN_EXPANSION = 4
-
-# PM neuromodulator threshold for heuristic commit
-PM_NEUROMOD_THRESHOLD = 1.0
-
-# EM neuromodulator novelty threshold for heuristic write
-EM_NEUROMOD_NOVELTY_THRESHOLD = 0.3
 
 # EM neuromodulator default g in heuristic mode
 EM_NEUROMOD_DEFAULT_G = 0.3

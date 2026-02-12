@@ -24,7 +24,7 @@ from torch import Tensor
 
 from .config import ModelConfig
 from .scan import parallel_affine_scan
-from .utils import StateMixin, unit_normalize, soft_topk, budget_enforce
+from .utils import StateMixin, unit_normalize, budget_enforce
 
 
 class ProceduralMemory(nn.Module, StateMixin):
@@ -40,8 +40,6 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.a_max = config.a_max
         self.budget = config.budget_pm
         self.decay = config.decay_pm
-        self.commit_top_k = config.commit_top_k
-        self.tau = config.tau_pm
         self.weakness_weight = config.weakness_weight_pm
 
         # Eligibility projection layers (learned parameters)
@@ -225,53 +223,56 @@ class ProceduralMemory(nn.Module, StateMixin):
             self.elig_K = self.elig_K * (~expanded).to(self.elig_K.dtype)
             self.elig_V = self.elig_V * (~expanded).to(self.elig_V.dtype)
 
-    def commit(self, commit_mask: Tensor, lambda_vals: Tensor = None,
-               g: Tensor = None, slot_logits: Tensor = None):
-        """Span-boundary commit. Soft top-k slot selection + EMA update.
+    def commit(self, p_commit: Tensor, lambda_vals: Tensor,
+               g: Tensor, slot_logits: Tensor, tau: Tensor):
+        """Span-boundary commit. Fully differentiable soft commit.
+
+        All arguments are continuous tensors — no binary masks. The commit
+        strength is controlled by p_commit (learned gate) * g (learned strength).
 
         Args:
-            commit_mask: [BS] bool — which streams commit
-            lambda_vals: [BS] — commit-time decay per stream (default: self.decay)
-            g: [BS] — write strength per stream (default: 0.5)
-            slot_logits: [BS, r] or None — slot selection logits (default: similarity-based)
+            p_commit: [BS] — commit probability (continuous 0-1, from gate_head)
+            lambda_vals: [BS] — commit-time decay per stream
+            g: [BS] — write strength per stream
+            slot_logits: [BS, r] — slot selection bias from neuromod
+            tau: [BS] — softmax temperature for slot selection
         """
-        if not commit_mask.any() or self.pm_K is None:
+        if self.pm_K is None:
             return
-
-        BS = commit_mask.shape[0]
-        device = commit_mask.device
-
-        # Apply defaults for any None args
-        if lambda_vals is None:
-            lambda_vals = torch.full((BS,), self.decay, device=device)
-        if g is None:
-            g = torch.full((BS,), 0.5, device=device)
 
         # Normalized eligibility as commit candidates
         elig_K_norm = unit_normalize(self.elig_K)  # [BS, r, D_h]
         elig_V_norm = self.elig_V                   # [BS, r, D_h]
 
+        # Eligibility magnitude gate: when eligibility traces are near-zero,
+        # the commit should be proportionally suppressed to avoid strengthening
+        # PM slots with uninformative (noise) candidates.
+        # elig_mag: [BS] in (0, 1], saturates at 1.0 for non-trivial eligibility.
+        elig_norm = self.elig_K.norm(dim=-1).mean(dim=-1)  # [BS] mean L2 across slots
+        elig_mag = (elig_norm / (elig_norm + 1.0)).detach()  # [BS] smooth 0→1 gate
+
         # Slot selection: similarity between current keys and eligibility
-        # scores: [BS, r] — how well each slot matches the eligibility
-        scores = torch.einsum("brd, brd -> br", self.pm_K, elig_K_norm)
+        scores = torch.einsum("brd, brd -> br", self.pm_K, elig_K_norm)  # [BS, r]
 
         # Weakness bias: prefer overwriting weak slots
         scores = scores - self.weakness_weight * self.pm_a
 
-        # Use controller-provided slot_logits if given, else use similarity
+        # Add controller-provided slot bias
         if slot_logits is not None:
             scores = scores + slot_logits
 
-        # Soft top-k selection
-        weights = soft_topk(scores, self.commit_top_k, self.tau)  # [BS, r]
+        # Softmax slot selection (replaces hard top-k)
+        tau_expanded = tau.unsqueeze(-1)  # [BS, 1]
+        weights = torch.softmax(scores / tau_expanded, dim=-1)  # [BS, r]
 
-        # Apply commit mask and per-stream write strength
-        mask_expanded = commit_mask.float().unsqueeze(-1)  # [BS, 1]
-        alpha = weights * g.unsqueeze(-1) * mask_expanded  # [BS, r]
+        # Soft commit: p_commit * g * elig_mag controls total write strength.
+        # elig_mag suppresses commits when eligibility traces are near-zero.
+        alpha = weights * g.unsqueeze(-1) * p_commit.unsqueeze(-1) * elig_mag.unsqueeze(-1)  # [BS, r]
 
-        # Apply commit-time decay on committing streams using controller lambda
+        # Soft commit-time decay (proportional to p_commit)
         lambda_expanded = lambda_vals.unsqueeze(-1)  # [BS, 1]
-        self.pm_a = self.pm_a * (1.0 - mask_expanded * (1.0 - lambda_expanded))
+        p_expanded = p_commit.unsqueeze(-1)  # [BS, 1]
+        self.pm_a = self.pm_a * (1.0 - p_expanded * (1.0 - lambda_expanded))
 
         # EMA update of keys and values
         alpha_3d = alpha.unsqueeze(-1)  # [BS, r, 1]
@@ -284,8 +285,8 @@ class ProceduralMemory(nn.Module, StateMixin):
         # Budget enforcement
         self.pm_a = budget_enforce(self.pm_a, self.budget)
 
-        # Reset eligibility for committing streams (keep differentiable path alive)
-        reset_3d = commit_mask.float().unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+        # Soft eligibility reset (proportional to commit strength)
+        reset_3d = p_commit.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
         self.elig_K = self.elig_K * (1.0 - reset_3d)
         self.elig_V = self.elig_V * (1.0 - reset_3d)
 
@@ -293,104 +294,125 @@ class ProceduralMemory(nn.Module, StateMixin):
 class PMNeuromodulator(nn.Module):
     """Neuromodulator for PM commit decisions.
 
-    Phase A (pm_enabled=False): empty shell, no parameters.
-    Phases B–C (pm_enabled=True, rl_enabled=False): learned continuous heads
-        (lambda, g, slot_logits) trained via main optimizer backprop,
-        with heuristic commit gate (elig_norm > threshold).
-    Phase D+ (pm_enabled=True, rl_enabled=True): full learned MLP —
-        adds gate_head trained via RL counterfactual.
+    Produces fully differentiable outputs for all commit parameters.
+    All outputs are continuous — trained by main-loss gradient through
+    the PM write → read chain.
+
+    When pm_enabled: learned backbone with content-aware features.
+    When not pm_enabled: heuristic defaults (shouldn't happen — PM always on).
 
     Returns:
-        commit_mask: [BS] bool
-        lambda_vals: [BS]
-        g: [BS]
-        slot_logits: [BS, r] or None
-        p_commit: [BS] or None (only when rl_enabled)
+        p_commit: [BS] — commit strength (continuous 0-1)
+        lambda_vals: [BS] — commit-time decay
+        g: [BS] — write strength
+        slot_logits: [BS, r] — slot selection bias
+        tau: [BS] — softmax temperature for slot selection
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.rl_enabled = config.rl_enabled
         self.pm_enabled = config.pm_enabled
-        self.threshold = config.commit_threshold
         self.default_g = config.g_pm_default
         self.default_decay = config.decay_pm
+        self.tau_floor = config.tau_pm_floor
+        self.tau_ceil = config.tau_pm_ceil
+        self.default_tau = config.tau_pm
 
-        # Backbone + continuous heads: created when PM is enabled (Phase B+)
         if self.pm_enabled:
-            H = config.rl_controller_hidden
+            H = config.neuromod_hidden
+            n_scalar = 3  # elig_norm, pm_usage, span_surprise
+            n_content = config.content_proj_dim
+            n_features = n_scalar + n_content
+
+            # Content projection: elig_K mean [D_h] → [content_proj_dim]
+            self.content_proj = nn.Linear(config.D_h, n_content)
+
             self.backbone = nn.Sequential(
-                nn.Linear(3, H),
+                nn.Linear(n_features, H),
                 nn.ReLU(),
             )
+
+            self.gate_head = nn.Linear(H, 1)
             self.lambda_head = nn.Linear(H, 1)
             self.g_head = nn.Linear(H, 1)
             self.slot_head = nn.Linear(H, config.r)
+            self.tau_head = nn.Linear(H, 1)
 
-            # Zero backbone bias: ensures zero input → zero backbone output
-            # → head outputs equal their calibrated biases exactly at init.
+            # Zero backbone bias: zero input → zero backbone → head biases
             nn.init.zeros_(self.backbone[0].bias)
 
-            # Init heads so output at init ≈ heuristic defaults.
-            # Small random weights + calibrated bias: output is ~constant
-            # at init but gradients flow to backbone from step 1.
-            # g: sigmoid(bias) = default_g → bias = logit(default_g)
+            # Content proj: small init so content features start near zero
+            nn.init.normal_(self.content_proj.weight, std=0.01)
+            nn.init.zeros_(self.content_proj.bias)
+
+            # gate_head: init to p_commit ≈ 0.5 (sigmoid(0))
+            nn.init.normal_(self.gate_head.weight, std=0.01)
+            nn.init.zeros_(self.gate_head.bias)
+
+            # g_head: sigmoid(bias) = default_g
             g_frac = max(min(config.g_pm_default, 0.999), 0.001)
             nn.init.normal_(self.g_head.weight, std=0.01)
             nn.init.constant_(self.g_head.bias, math.log(g_frac / (1.0 - g_frac)))
 
-            # lambda: sigmoid(bias) maps to [default_decay, 1.0]
-            # At init, raw_lambda should produce default_decay → raw=0 → bias=logit(eps)
+            # lambda: near-zero raw → lambda ≈ default_decay
             nn.init.normal_(self.lambda_head.weight, std=0.01)
-            nn.init.constant_(self.lambda_head.bias, math.log(0.001 / 0.999))  # near-zero raw → lambda ≈ default_decay
+            nn.init.constant_(self.lambda_head.bias, math.log(0.001 / 0.999))
 
-            # slot_logits: small init → no strong slot preference at init
+            # slot_logits: small init → no slot preference at init
             nn.init.normal_(self.slot_head.weight, std=0.01)
             nn.init.zeros_(self.slot_head.bias)
 
-            # Gate head: only created for RL (Phase D+)
-            if self.rl_enabled:
-                self.gate_head = nn.Linear(H, 1)
+            # tau: init to default_tau within [floor, ceil]
+            tau_frac = (config.tau_pm - config.tau_pm_floor) / max(config.tau_pm_ceil - config.tau_pm_floor, 1e-8)
+            tau_frac = max(min(tau_frac, 0.999), 0.001)
+            nn.init.normal_(self.tau_head.weight, std=0.01)
+            nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
 
     def forward(self, elig_norm: Tensor, pm_usage: Tensor,
-                span_surprise: Tensor) -> tuple:
+                span_surprise: Tensor,
+                content_emb: Tensor = None) -> tuple:
+        """Forward pass.
+
+        Args:
+            elig_norm: [BS] — mean eligibility trace norm
+            pm_usage: [BS] — normalized PM usage (sum(pm_a) / budget)
+            span_surprise: [BS] — mean surprise over span
+            content_emb: [BS, D_h] or None — mean eligibility key embedding
+
+        Returns:
+            (p_commit, lambda_vals, g, slot_logits, tau)
+        """
         if self.pm_enabled:
-            if self.rl_enabled:
-                return self._forward_learned(elig_norm, pm_usage, span_surprise)
-            return self._forward_continuous(elig_norm, pm_usage, span_surprise)
-        return self._forward_heuristic(elig_norm, pm_usage, span_surprise)
+            return self._forward_learned(elig_norm, pm_usage, span_surprise, content_emb)
+        return self._forward_heuristic(elig_norm)
 
-    def _forward_heuristic(self, elig_norm, pm_usage, span_surprise):
-        """Heuristic mode — no learnable params (Phase A fallback)."""
+    def _forward_heuristic(self, elig_norm):
+        """Fallback with constant defaults (should rarely be used — PM always on)."""
         BS = elig_norm.shape[0]
-        commit_mask = elig_norm > self.threshold
-        lambda_vals = torch.full((BS,), self.default_decay,
-                                 device=elig_norm.device)
-        g = torch.full((BS,), self.default_g, device=elig_norm.device)
-        return commit_mask, lambda_vals, g, None, None
+        device = elig_norm.device
+        p_commit = torch.full((BS,), 0.5, device=device)
+        lambda_vals = torch.full((BS,), self.default_decay, device=device)
+        g = torch.full((BS,), self.default_g, device=device)
+        tau = torch.full((BS,), self.default_tau, device=device)
+        return p_commit, lambda_vals, g, None, tau
 
-    def _forward_continuous(self, elig_norm, pm_usage, span_surprise):
-        """Heuristic gate + learned continuous heads (Phases B–C)."""
-        commit_mask = elig_norm > self.threshold
+    def _forward_learned(self, elig_norm, pm_usage, span_surprise, content_emb):
+        """Fully differentiable learned mode — all outputs continuous."""
+        scalar_features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)  # [BS, 3]
 
-        features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)
-        h = self.backbone(features)
+        if content_emb is not None:
+            content_features = self.content_proj(content_emb)  # [BS, content_proj_dim]
+            features = torch.cat([scalar_features, content_features], dim=-1)
+        else:
+            features = torch.cat([
+                scalar_features,
+                torch.zeros(elig_norm.shape[0], self.content_proj.out_features,
+                            device=elig_norm.device)
+            ], dim=-1)
 
-        raw_lambda = torch.sigmoid(self.lambda_head(h)).squeeze(-1)
-        lambda_vals = self.default_decay + (1.0 - self.default_decay) * raw_lambda
-
-        g = torch.sigmoid(self.g_head(h)).squeeze(-1)
-        slot_logits = self.slot_head(h)
-
-        return commit_mask, lambda_vals, g, slot_logits, None
-
-    def _forward_learned(self, elig_norm, pm_usage, span_surprise):
-        """Full learned mode — gate + continuous heads (Phase D+)."""
-        features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)
         h = self.backbone(features)
 
         p_commit = torch.sigmoid(self.gate_head(h)).squeeze(-1)
-        commit_mask = (p_commit > 0.5).detach()
 
         raw_lambda = torch.sigmoid(self.lambda_head(h)).squeeze(-1)
         lambda_vals = self.default_decay + (1.0 - self.default_decay) * raw_lambda
@@ -398,4 +420,7 @@ class PMNeuromodulator(nn.Module):
         g = torch.sigmoid(self.g_head(h)).squeeze(-1)
         slot_logits = self.slot_head(h)
 
-        return commit_mask, lambda_vals, g, slot_logits, p_commit
+        raw_tau = torch.sigmoid(self.tau_head(h)).squeeze(-1)
+        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * raw_tau
+
+        return p_commit, lambda_vals, g, slot_logits, tau

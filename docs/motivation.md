@@ -134,21 +134,13 @@ This design aligns with the silicon goal:
 
 ---
 
-## Why we train neuromodulators with targeted RL (instead of pure backprop)
-Backprop can train the slow weights to predict tokens. But deciding *when to write memory* is different:
-- some writes help only later,
-- some writes corrupt the model,
-- “never write” can look locally optimal without a stronger signal.
+## Why neuromodulators are trained via main-loss backprop
+Backprop can train the slow weights to predict tokens. Memory commit/write decisions are also trained end-to-end through the main loss:
+- neuromodulator outputs (write strength, decay rate, slot selection temperature, etc.) flow through differentiable memory operations,
+- the gradient from future predictions reaches the neuromodulator heads through: commit/write → PM/EM state → retrieval → layer output → logits → loss,
+- this naturally learns to write only when it increases future performance, avoid harmful writes, and stay within energy/budget constraints.
 
-So we treat memory commits as decisions and train them with a targeted RL-like method:
-- identify salient “events” (high surprise / novelty),
-- compare commit vs no-commit with a short rollout,
-- reinforce the policy to commit when it actually helps.
-
-This learns an internal behavior:
-- write only when it increases future performance,
-- avoid harmful writes,
-- stay within energy/budget constraints.
+This approach is simpler and more stable than RL-based alternatives, and uses only a single optimizer for all parameters.
 
 ---
 
@@ -163,7 +155,7 @@ The goal is to show a compelling "new capability" story:
 3) With EM enabled, it can:
    - remember session facts explicitly,
    - retrieve relevant past experiences at long delays.
-4) With RL-trained controllers (`PMNeuromodulator` and `EMNeuromodulator`), it commits/writes more intelligently than heuristics.
+4) With learned controllers (`PMNeuromodulator` and `EMNeuromodulator`), it commits/writes more intelligently than heuristics.
 5) All of this happens without destabilizing core competence.
 
 This is the investor-facing proof:
@@ -191,13 +183,13 @@ This is the investor-facing proof:
 This prototype should prioritize:
 - **stability and debuggability** over maximum novelty,
 - **mechanism isolation** (clear baselines and ablations),
-- **4090-friendly engineering** (TBPTT, mixed precision, sparse RL).
+- **4090-friendly engineering** (TBPTT, mixed precision, single optimizer).
 
 We intentionally reuse mature components (tokenizers, dataset streaming, AMP training) so we spend effort only on the novel parts:
 - fast memory representation,
 - eligibility traces,
 - neuromodulated commits,
-- event-driven RL training loop.
+- neuromodulated memory training via main-loss backprop.
 
 ---
 

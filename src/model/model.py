@@ -499,12 +499,6 @@ class NeuromorphicLM(nn.Module, StateMixin):
         for block in self.blocks:
             block.detach_states()
 
-    def rl_parameters(self):
-        """Yield neuromodulator MLP parameters (for separate RL optimizer)."""
-        for name, param in self.named_parameters():
-            if "neuromodulator" in name:
-                yield param
-
     def param_count(self) -> int:
         """Total trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

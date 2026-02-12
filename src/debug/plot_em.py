@@ -89,14 +89,14 @@ def main():
 
     # Write rate
     ax = axes[0, 2]
-    wr_keys = find_keys(records, "em_write_rate_")
+    wr_keys = find_keys(records, "em_g_em_mean_")
     for key in wr_keys:
-        label = key.replace("em_write_rate_", "block ")
+        label = key.replace("em_g_em_mean_", "block ")
         vals = [r.get(key, nan) for r in records]
         ax.plot(steps, vals, alpha=0.7, label=label)
     ax.set_xlabel("step")
-    ax.set_ylabel("write rate")
-    ax.set_title("EM Write Rate")
+    ax.set_ylabel("mean g_em")
+    ax.set_title("EM Write Strength (g_em)")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(-0.05, 1.05)

@@ -477,9 +477,12 @@ class TestDecay:
             empty_K = torch.zeros(2, 1, cfg.D_em)
             empty_V = torch.zeros(2, 1, cfg.D_em)
             empty_score = torch.zeros(2, 1)
-            no_write = torch.zeros(2, dtype=torch.bool)
-            g = torch.tensor([0.5, 0.5])
-            block.em.write_at_boundary(empty_K, empty_V, empty_score, no_write, g)
+            g_em = torch.zeros(2)  # g_em=0 → no writes
+            tau = torch.ones(2)
+            ww = torch.zeros(2)
+            decay = torch.full((2,), cfg.decay_em)
+            block.em.write_at_boundary(empty_K, empty_V, empty_score,
+                                       g_em, tau, ww, decay=decay)
             after = block.em.em_S
             # Decay should reduce strengths
             mask = before > 1e-8
@@ -496,18 +499,25 @@ class TestPMCommitEquations:
 
     All state is set manually (no model forward pass) so the test is
     fully deterministic and independent of any other code path.
+
+    New interface: commit(p_commit, lambda_vals, g, slot_logits, tau)
+    Uses softmax slot selection instead of soft_topk.
     """
 
     def _make_pm(self, r=2, D_h=4):
         """Build a tiny PM and inject known state."""
-        cfg = make_tiny_config(r=r, D=D_h * 2, B=2, L=1, commit_top_k=1,
+        cfg = make_tiny_config(r=r, D=D_h * 2, B=2, L=1,
                                tau_pm=1.0, weakness_weight_pm=0.0,
                                a_max=10.0, budget_pm=20.0, decay_pm=0.9)
         pm = ProceduralMemory(cfg)
         return pm
 
     def test_ema_key_update(self):
-        """pm_K = unit_normalize((1-alpha) * pm_K + alpha * elig_K_norm)"""
+        """pm_K = unit_normalize((1-alpha) * pm_K + alpha * elig_K_norm)
+
+        With softmax on equal scores [0, 0], weights = [0.5, 0.5].
+        alpha = [0.5 * g * p_commit] for each slot.
+        """
         pm = self._make_pm(r=2, D_h=4)
 
         # Inject known state (BS=1)
@@ -522,48 +532,48 @@ class TestPMCommitEquations:
         pm.elig_V = torch.tensor([[[1.0, 1.0, 0.0, 0.0],
                                     [0.0, 0.0, 1.0, 1.0]]])  # [1,2,4]
 
-        commit_mask = torch.tensor([True])
+        p_commit = torch.tensor([1.0])
         g = torch.tensor([0.5])
         lambda_vals = torch.tensor([0.9])
+        tau = torch.tensor([1.0])
 
-        # We know: weakness_weight=0, no slot_logits, commit_top_k=1
-        # So soft_topk picks the slot with highest similarity to elig_K_norm.
+        # weakness_weight=0, no slot_logits
         # elig_K_norm: slot 0 = [0,1,0,0], slot 1 = [0,0,1,0]
         # Similarity pm_K · elig_K_norm:
         #   slot 0: [1,0,0,0]·[0,1,0,0] = 0
         #   slot 1: [0,1,0,0]·[0,0,1,0] = 0
-        # Equal scores → softmax([0,0]/tau=1) → [0.5, 0.5]
-        # But commit_top_k=1 → only top-1 kept. Ties broken by topk.
-        # torch.topk with k=1 on equal values returns index 0.
-        # So weights = [1.0, 0.0] (softmax of single entry = 1.0)
-        # alpha = weights * g * mask = [1.0 * 0.5 * 1.0, 0.0] = [0.5, 0.0]
+        # Equal scores → softmax([0,0]/1) = [0.5, 0.5]
+        # Eligibility magnitude gate:
+        #   elig_norm = mean([||[0,2,0,0]||, ||[0,0,2,0]||]) = mean([2, 2]) = 2.0
+        #   elig_mag = 2.0 / (2.0 + 1.0) = 2/3
+        # alpha = [0.5, 0.5] * 0.5 * 1.0 * (2/3) = [1/6, 1/6]
+        elig_mag = 2.0 / 3.0
+        alpha_val = 0.5 * 0.5 * 1.0 * elig_mag  # ≈ 0.1667
 
         pm_K_before = pm.pm_K.clone()
         pm_a_before = pm.pm_a.clone()
-        elig_K_norm = unit_normalize(pm.elig_K)
 
-        pm.commit(commit_mask, lambda_vals, g, None)
+        pm.commit(p_commit, lambda_vals, g, None, tau)
 
-        # Verify alpha for slot 0 was 0.5, slot 1 was 0.0
-        # pm_a decay: pm_a * (1 - mask*(1-lambda)) = [1.0, 0.0] * (1 - 1*(1-0.9)) = * 0.9
+        # pm_a decay: pm_a * (1 - p_commit*(1-lambda)) = [1.0, 0.0] * (1 - 1*(0.1)) = * 0.9
         #   = [0.9, 0.0]
-        # Then strength update: pm_a + alpha = [0.9 + 0.5, 0.0 + 0.0] = [1.4, 0.0]
-        expected_a = torch.tensor([[1.4, 0.0]])
-        assert torch.allclose(pm.pm_a, expected_a, atol=1e-5), \
+        # Then strength update: pm_a + alpha = [0.9 + 1/6, 0.0 + 1/6]
+        expected_a = torch.tensor([[0.9 + alpha_val, 0.0 + alpha_val]])
+        assert torch.allclose(pm.pm_a, expected_a, atol=1e-4), \
             f"pm_a: {pm.pm_a} != expected {expected_a}"
 
-        # Key EMA: slot 0 = unit_normalize((1-0.5)*[1,0,0,0] + 0.5*[0,1,0,0])
-        #        = unit_normalize([0.5, 0.5, 0, 0]) = [1/√2, 1/√2, 0, 0]
-        expected_K0 = unit_normalize(torch.tensor([[0.5, 0.5, 0.0, 0.0]]))
-        assert torch.allclose(pm.pm_K[0, 0], expected_K0.squeeze(), atol=1e-5), \
+        # Key EMA slot 0: unit_normalize((1-alpha)*[1,0,0,0] + alpha*[0,1,0,0])
+        expected_K0 = unit_normalize(torch.tensor([[1.0 - alpha_val, alpha_val, 0.0, 0.0]]))
+        assert torch.allclose(pm.pm_K[0, 0], expected_K0.squeeze(), atol=1e-4), \
             f"pm_K slot 0: {pm.pm_K[0,0]} != {expected_K0}"
 
-        # Slot 1 unchanged (alpha=0): stays at original
-        assert torch.allclose(pm.pm_K[0, 1], pm_K_before[0, 1], atol=1e-5), \
-            "pm_K slot 1 should be unchanged"
+        # Key EMA slot 1: unit_normalize((1-alpha)*[0,1,0,0] + alpha*[0,0,1,0])
+        expected_K1 = unit_normalize(torch.tensor([[0.0, 1.0 - alpha_val, alpha_val, 0.0]]))
+        assert torch.allclose(pm.pm_K[0, 1], expected_K1.squeeze(), atol=1e-4), \
+            f"pm_K slot 1: {pm.pm_K[0,1]} != {expected_K1}"
 
     def test_eligibility_reset_after_commit(self):
-        """Eligibility for committing streams is zeroed after commit."""
+        """Eligibility for committing streams (p_commit=1) is zeroed after commit."""
         pm = self._make_pm(r=2, D_h=4)
         pm.pm_K = unit_normalize(torch.randn(1, 2, 4))
         pm.pm_V = unit_normalize(torch.randn(1, 2, 4))
@@ -571,15 +581,45 @@ class TestPMCommitEquations:
         pm.elig_K = torch.randn(1, 2, 4) * 5  # non-zero
         pm.elig_V = torch.randn(1, 2, 4) * 5
 
-        commit_mask = torch.tensor([True])
-        pm.commit(commit_mask, None, None, None)
+        p_commit = torch.tensor([1.0])
+        lambda_vals = torch.tensor([0.9])
+        g = torch.tensor([0.5])
+        tau = torch.tensor([1.0])
+        pm.commit(p_commit, lambda_vals, g, None, tau)
 
-        # elig should be zeroed: elig * (1 - reset_3d) where reset=1 for committing
+        # elig *= (1 - p_commit) = (1 - 1.0) = 0
         assert torch.allclose(pm.elig_K, torch.zeros_like(pm.elig_K), atol=1e-7)
         assert torch.allclose(pm.elig_V, torch.zeros_like(pm.elig_V), atol=1e-7)
 
+    def test_zero_eligibility_no_strength_growth(self):
+        """With zero eligibility traces, pm_a should not increase even with p_commit=1.
+
+        The eligibility magnitude gate (elig_mag) suppresses alpha when
+        elig_K is all zeros, preventing noise injection into PM slots.
+        """
+        pm = self._make_pm(r=2, D_h=4)
+        pm.pm_K = unit_normalize(torch.randn(1, 2, 4))
+        pm.pm_V = unit_normalize(torch.randn(1, 2, 4))
+        pm.pm_a = torch.tensor([[2.0, 1.0]])
+        pm.elig_K = torch.zeros(1, 2, 4)  # zero eligibility
+        pm.elig_V = torch.zeros(1, 2, 4)
+
+        a_before = pm.pm_a.clone()
+
+        p_commit = torch.tensor([1.0])
+        lambda_vals = torch.tensor([0.9])
+        g = torch.tensor([0.5])
+        tau = torch.tensor([1.0])
+        pm.commit(p_commit, lambda_vals, g, None, tau)
+
+        # elig_mag = 0 / (0 + 1) = 0 → alpha = 0
+        # Only decay applies: pm_a * (1 - 1*(1-0.9)) = pm_a * 0.9
+        expected_a = a_before * 0.9
+        assert torch.allclose(pm.pm_a, expected_a, atol=1e-6), \
+            f"pm_a grew with zero eligibility: {pm.pm_a} != {expected_a}"
+
     def test_non_committing_stream_unchanged(self):
-        """Stream with commit_mask=False: pm_a exactly unchanged,
+        """Stream with p_commit=0: pm_a exactly unchanged,
         pm_K/pm_V approximately unchanged (unit_normalize re-applied with eps).
         """
         pm = self._make_pm(r=2, D_h=4)
@@ -593,11 +633,14 @@ class TestPMCommitEquations:
         V_before = pm.pm_V[1].clone()
         a_before = pm.pm_a[1].clone()
 
-        # Only stream 0 commits
-        commit_mask = torch.tensor([True, False])
-        pm.commit(commit_mask, None, None, None)
+        # Only stream 0 commits (p_commit=1), stream 1 doesn't (p_commit=0)
+        p_commit = torch.tensor([1.0, 0.0])
+        lambda_vals = torch.tensor([0.9, 0.9])
+        g = torch.tensor([0.5, 0.5])
+        tau = torch.tensor([1.0, 1.0])
+        pm.commit(p_commit, lambda_vals, g, None, tau)
 
-        # pm_a is exact (no normalize applied)
+        # pm_a is exact: decay = (1 - 0*(1-0.9)) = 1, alpha=0
         assert torch.equal(pm.pm_a[1], a_before), "non-committing stream a changed"
         # pm_K/pm_V pass through unit_normalize even with alpha=0,
         # so allow eps-level floating point difference from renormalization
@@ -607,7 +650,7 @@ class TestPMCommitEquations:
             "non-committing stream V changed beyond renormalization tolerance"
 
     def test_commit_time_decay_formula(self):
-        """pm_a = pm_a * (1 - mask * (1 - lambda)) for committing streams."""
+        """pm_a = pm_a * (1 - p_commit * (1 - lambda)) for committing streams."""
         pm = self._make_pm(r=2, D_h=4)
         pm.pm_K = unit_normalize(torch.randn(1, 2, 4))
         pm.pm_V = unit_normalize(torch.randn(1, 2, 4))
@@ -616,11 +659,12 @@ class TestPMCommitEquations:
         pm.elig_V = torch.randn(1, 2, 4)
 
         lambda_val = 0.8
-        commit_mask = torch.tensor([True])
+        p_commit = torch.tensor([1.0])
         lambda_vals = torch.tensor([lambda_val])
         g = torch.tensor([0.0])  # g=0 so alpha=0, only decay matters
+        tau = torch.tensor([1.0])
 
-        pm.commit(commit_mask, lambda_vals, g, None)
+        pm.commit(p_commit, lambda_vals, g, None, tau)
 
         # With g=0: alpha=0 everywhere, so key/value EMA is identity
         # Decay: pm_a * (1 - 1*(1-0.8)) = pm_a * 0.8
@@ -635,10 +679,14 @@ class TestPMCommitEquations:
 # ============================================================================
 
 class TestEMWriteEquations:
-    """Verify EM write_at_boundary formulas against hand-computed values."""
+    """Verify EM write_at_boundary formulas against hand-computed values.
+
+    New interface: write_at_boundary(cand_K, cand_V, cand_score, g_em, tau, ww)
+    Uses softmax slot selection instead of soft_topk.
+    """
 
     def _make_em(self, M=4, D_em=4):
-        cfg = make_tiny_config(M=M, D_em=D_em, k_write=1, C_em=1,
+        cfg = make_tiny_config(M=M, D_em=D_em, C_em=1,
                                tau_em=1.0, weakness_weight_em=0.0,
                                S_max=10.0, budget_em=40.0, decay_em=0.9,
                                D=8, B=2, L=1)
@@ -649,6 +697,8 @@ class TestEMWriteEquations:
     def test_ema_key_value_update(self):
         """em_K = unit_normalize((1-alpha) * em_K + alpha * k_c.unsqueeze(1))
            em_V = (1-alpha) * em_V + alpha * v_c.unsqueeze(1)  (no normalization on V!)
+
+        scores_slot = [1.0, 0.0], softmax([1.0, 0.0]/1.0) = [e/(e+1), 1/(e+1)]
         """
         em = self._make_em(M=2, D_em=4)
 
@@ -664,35 +714,40 @@ class TestEMWriteEquations:
         v_c = torch.tensor([[[0.0, 5.0, 0.0, 0.0]]])                  # [1,1,4]
         score = torch.tensor([[0.8]])  # [1,1]
 
-        write_mask = torch.tensor([True])
         g_em = torch.tensor([0.5])
+        tau = torch.tensor([1.0])
+        ww = torch.tensor([0.0])
+        decay = torch.tensor([0.9])
 
-        # k_write=1, weakness_weight=0
-        # scores_slot = einsum(k_c, em_K) = [1*1+0+0+0, 1*0+0+0+0] = [1.0, 0.0]
-        # soft_topk(k=1) on [1.0, 0.0] → slot 0 selected, weight = [1.0, 0.0]
-        # alpha = w * g * write_mask = [0.5, 0.0]
+        # weakness_weight=0
+        # scores_slot = einsum(k_c, em_K) = [1.0, 0.0]
+        # softmax([1.0, 0.0] / 1.0):
+        e_val = torch.exp(torch.tensor(1.0))
+        w0 = e_val / (e_val + 1)  # ≈ 0.7311
+        w1 = 1.0 / (e_val + 1)   # ≈ 0.2689
+        # alpha = w * g * 1.0 (score_ok)
+        a0 = (w0 * 0.5).item()
+        a1 = (w1 * 0.5).item()
 
         em_K_before = em.em_K.clone()
         em_V_before = em.em_V.clone()
-        em_S_before = em.em_S.clone()
 
-        em.write_at_boundary(k_c, v_c, score, write_mask, g_em)
+        em.write_at_boundary(k_c, v_c, score, g_em, tau, ww, decay=decay)
 
-        # Key update slot 0: unit_normalize((1-0.5)*[1,0,0,0] + 0.5*[1,0,0,0])
-        # = unit_normalize([1,0,0,0]) = [1,0,0,0]
-        assert torch.allclose(em.em_K[0, 0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1e-5)
+        # Key update slot 0: unit_normalize((1-a0)*[1,0,0,0] + a0*[1,0,0,0])
+        # = unit_normalize([(1-a0)+a0, 0, 0, 0]) = [1, 0, 0, 0]
+        assert torch.allclose(em.em_K[0, 0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1e-4)
 
-        # Slot 1 unchanged (alpha=0)
-        assert torch.allclose(em.em_K[0, 1], em_K_before[0, 1], atol=1e-5)
+        # Key update slot 1: unit_normalize((1-a1)*[0,1,0,0] + a1*[1,0,0,0])
+        # = unit_normalize([a1, (1-a1), 0, 0])
+        expected_K1 = unit_normalize(torch.tensor([[a1, 1.0 - a1, 0.0, 0.0]]))
+        assert torch.allclose(em.em_K[0, 1], expected_K1.squeeze(), atol=1e-4), \
+            f"em_K slot 1: {em.em_K[0,1]} != {expected_K1}"
 
-        # Value update slot 0: (1-0.5)*[1,0,0,0] + 0.5*[0,5,0,0] = [0.5, 2.5, 0, 0]
-        # NOTE: em_V is NOT normalized
-        expected_V0 = torch.tensor([0.5, 2.5, 0.0, 0.0])
-        assert torch.allclose(em.em_V[0, 0], expected_V0, atol=1e-5), \
+        # Value update slot 0: (1-a0)*[1,0,0,0] + a0*[0,5,0,0]
+        expected_V0 = torch.tensor([1.0 - a0, 5.0 * a0, 0.0, 0.0])
+        assert torch.allclose(em.em_V[0, 0], expected_V0, atol=1e-4), \
             f"em_V slot 0: {em.em_V[0,0]} != {expected_V0}"
-
-        # Slot 1 V unchanged
-        assert torch.allclose(em.em_V[0, 1], em_V_before[0, 1], atol=1e-5)
 
     def test_strength_update_and_decay(self):
         """em_S = clamp(em_S + alpha * score) then * decay then budget_enforce."""
@@ -708,17 +763,25 @@ class TestEMWriteEquations:
         v_c = torch.tensor([[[0.0, 1.0, 0.0, 0.0]]])
         score = torch.tensor([[0.6]])
 
-        write_mask = torch.tensor([True])
         g_em = torch.tensor([0.4])
+        tau = torch.tensor([1.0])
+        ww = torch.tensor([0.0])
+        decay = torch.tensor([0.9])
 
-        # alpha for slot 0 = 1.0 * 0.4 * 1.0 = 0.4  (k_write=1 selects slot 0)
-        # strength: S[0] = clamp(2.0 + 0.4*0.6) = clamp(2.24) = 2.24
-        #           S[1] = clamp(1.0 + 0.0*0.6) = 1.0
-        # then decay: S *= 0.9 → [2.016, 0.9]
-        # budget=40 so no enforcement
-        em.write_at_boundary(k_c, v_c, score, write_mask, g_em)
+        # scores_slot = [1.0, 0.0], softmax = [w0, w1]
+        e_val = torch.exp(torch.tensor(1.0))
+        w0 = e_val / (e_val + 1)
+        w1 = 1.0 / (e_val + 1)
+        a0 = (w0 * 0.4).item()
+        a1 = (w1 * 0.4).item()
 
-        expected_S = torch.tensor([[2.24 * 0.9, 1.0 * 0.9]])
+        # strength: S[0] = clamp(2.0 + a0*0.6), S[1] = clamp(1.0 + a1*0.6)
+        # then decay: S *= 0.9
+        em.write_at_boundary(k_c, v_c, score, g_em, tau, ww, decay=decay)
+
+        expected_S0 = (2.0 + a0 * 0.6) * 0.9
+        expected_S1 = (1.0 + a1 * 0.6) * 0.9
+        expected_S = torch.tensor([[expected_S0, expected_S1]])
         assert torch.allclose(em.em_S, expected_S, atol=1e-4), \
             f"em_S: {em.em_S} != {expected_S}"
 
@@ -735,18 +798,19 @@ class TestEMWriteEquations:
         v_c = torch.tensor([[[0.0, 20.0, 0.0, 0.0]]])
         score = torch.tensor([[0.5]])
 
-        write_mask = torch.tensor([True])
         g_em = torch.tensor([0.5])
+        tau = torch.tensor([1.0])
+        ww = torch.tensor([0.0])
+        decay = torch.tensor([0.9])
 
-        em.write_at_boundary(k_c, v_c, score, write_mask, g_em)
+        em.write_at_boundary(k_c, v_c, score, g_em, tau, ww, decay=decay)
 
-        # Slot 0 V = (1-0.5)*[10,0,0,0] + 0.5*[0,20,0,0] = [5, 10, 0, 0]
-        # Norm is sqrt(125) ≈ 11.18 — definitely not 1.0
+        # Slot 0 gets large alpha from softmax, V has large non-unit components
         v_norm = em.em_V[0, 0].norm().item()
         assert v_norm > 1.5, f"em_V should NOT be unit-normalized, but norm={v_norm}"
 
     def test_no_write_stream_unchanged(self):
-        """Stream with write_mask=False: em_V exactly unchanged,
+        """Stream with g_em=0: em_V exactly unchanged,
         em_K approximately unchanged (unit_normalize re-applied with eps),
         em_S only decayed.
         """
@@ -763,11 +827,13 @@ class TestEMWriteEquations:
         v_c = torch.randn(2, 1, 4)
         score = torch.tensor([[0.5], [0.5]])
 
-        # Only stream 0 writes
-        write_mask = torch.tensor([True, False])
-        g_em = torch.tensor([0.5, 0.5])
+        # Only stream 0 writes (g_em=0.5), stream 1 doesn't (g_em=0)
+        g_em = torch.tensor([0.5, 0.0])
+        tau = torch.tensor([1.0, 1.0])
+        ww = torch.tensor([0.0, 0.0])
+        decay = torch.tensor([0.9, 0.9])
 
-        em.write_at_boundary(k_c, v_c, score, write_mask, g_em)
+        em.write_at_boundary(k_c, v_c, score, g_em, tau, ww, decay=decay)
 
         # em_K passes through unit_normalize even with alpha=0 (eps-level change)
         assert torch.allclose(em.em_K[1], K_before, atol=1e-6), \

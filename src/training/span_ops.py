@@ -3,7 +3,7 @@ Shared span-boundary operations for neuromorphic LM training.
 
 Extracted from trainer.py and validation.py to eliminate ~200 lines of
 copy-pasted logic. These are free functions (no shared mutable state).
-Used by trainer.py, validation.py, and rl_rollout.py.
+Used by trainer.py and validation.py.
 
 Design note: In the parallel (forward_span) path, PM eligibility and EM
 candidates are accumulated over the full span, then committed at the boundary.
@@ -281,10 +281,10 @@ def apply_em_boundary(
     em_stacked: dict,
     span_surprise_mean: Tensor,
     config: ModelConfig,
-) -> list[tuple[int, Tensor, float, float]]:
+) -> list[tuple[int, float, float]]:
     """For each block: neuromod forward + write_at_boundary.
 
-    Returns list of (block_idx, write_mask, novelty_mean, g_em_mean)
+    Returns list of (block_idx, novelty_mean, g_em_mean)
     for collector recording.
     """
     write_info = []
@@ -299,22 +299,29 @@ def apply_em_boundary(
             else torch.zeros_like(span_surprise_mean)
         )
 
-        write_mask, g_em, tau_em, ww_em = block.em_neuromodulator.forward(
+        # Content embedding: mean of VALID candidate keys for content-aware neuromod.
+        # sValid masks out pre-reset candidates that shouldn't influence g_em/tau/ww.
+        valid_mask = sValid.unsqueeze(-1).float()  # [BS, P, 1]
+        valid_count = valid_mask.sum(dim=1).clamp(min=1.0)  # [BS, 1]
+        content_emb = (sK * valid_mask).sum(dim=1) / valid_count  # [BS, D_em]
+
+        g_em, tau_em, ww_em, decay_em = block.em_neuromodulator.forward(
             span_surprise_mean,
             em_usage / config.budget_em,
             cand_novelty_mean,
+            content_emb=content_emb,
         )
 
         write_info.append((
-            b, write_mask,
+            b,
             cand_novelty_mean.mean().item(),
             g_em.mean().item(),
         ))
 
         block.em.write_at_boundary(
             sK, sV, sScore,
-            write_mask, g_em,
-            tau=tau_em, weakness_weight=ww_em,
+            g_em, tau_em, ww_em,
+            decay=decay_em,
             cand_valid=sValid,
         )
 

@@ -34,13 +34,13 @@ The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was design
 
 The parallel path batches P=32 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 32x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Result: ~5x throughput increase.
 
-**Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle. RL rollouts also use `forward_span` (parallel, with frozen surprise from the snapshot).
+**Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle.
 
 ---
 
 ## 2. Architecture Comparison
 
-This document covers the full Phase D architecture (all subsystems + RL). In earlier phases some components are absent (see `MODEL_EXPLAINER.md` §17). The scan-friendly parallel path is used for all forward passes during training, including RL rollouts; the sequential path is retained for inference.
+This document covers the full architecture (all subsystems). In earlier phases some components are absent (see `MODEL_EXPLAINER.md` §17). The scan-friendly parallel path is used for all forward passes during training; the sequential path is retained for inference.
 
 ```
 SEQUENTIAL (forward_one_token, called T times):
@@ -59,14 +59,12 @@ PARALLEL (forward_span, called T/P times):
     → PM eligibility accumulation (post-forward)
     → EM candidate proposal (post-forward)
     → span boundary: neuromodulators decide PM commits + EM writes
-    → [Phase D] RL snapshot captured BEFORE commit/write
 
   After all spans:
-    → [Phase D] RL counterfactual rollouts (forward_span, torch.no_grad)
-    → rl_optimizer.step() with combined continuous + RL gradients
+    → optimizer.step() (single main optimizer for all params)
 ```
 
-The parallel path processes an entire span in one `forward_span()` call, then handles surprise, eligibility, and EM candidates as post-forward steps in the trainer. RL rollouts also use `forward_span` with frozen surprise (see [§10.3](#103-rl-rollouts-and-the-parallel-path)).
+The parallel path processes an entire span in one `forward_span()` call, then handles surprise, eligibility, and EM candidates as post-forward steps in the trainer.
 
 ---
 
@@ -128,7 +126,7 @@ return logits_all, x_emb_all, y_wm_all
 
 ## 4. Concrete Walkthrough: One Span, Token by Token
 
-Trace the full lifecycle of one span (P=32 tokens) on Tier A (D=512, B=4, L=8, D_h=128, D_wm=128, D_em=128, r=8, M=256, W=256, k_ret=4). BS=32 streams. Assume Phase C (WM + PM + EM enabled, no RL). Assume a doc boundary (EOT) occurs at position t=12 within the span.
+Trace the full lifecycle of one span (P=32 tokens) on Tier A (D=512, B=4, L=8, D_h=128, D_wm=128, D_em=128, r=8, M=256, W=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
 
 ### 4.1 State entering this span
 
@@ -326,9 +324,9 @@ for each PM instance:
 
 # EM: neuromodulator write decision
 for each EM instance:
-    neuromodulator decides write_mask, g_em, tau, ww
-    em.write_at_boundary(cand_K, cand_V, scores, mask, g_em, tau=tau, ww=ww)   # EMA update em_K, em_V, em_S
-    em_S *= 0.999; budget_enforce(em_S)                         # decay + budget
+    neuromodulator decides g_em, tau, ww, decay
+    em.write_at_boundary(cand_K, cand_V, scores, g_em, tau=tau, ww=ww, decay=decay)   # EMA update em_K, em_V, em_S
+    em_S *= decay; budget_enforce(em_S)                         # per-stream learned decay + budget
 ```
 
 State is now ready for the next span. The cycle repeats.
@@ -585,7 +583,7 @@ model.surprise = span_surprise_mean                              # next span's f
 | WM state | Handled internally by `wm.forward_span` | Yes |
 | `model.surprise` | Frozen anyway | N/A |
 
-**Impact of the PM/EM gap:** In non-lifelong mode (phases A-D), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=31 tokens per boundary event. In lifelong mode (Phase E), PM/EM state intentionally persists across documents, so there is no gap.
+**Impact of the PM/EM gap:** In non-lifelong mode (phases A-B), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=31 tokens per boundary event. In lifelong mode (Phase D), PM/EM state intentionally persists across documents, so there is no gap.
 
 **Eligibility reset detail** (span_ops.py: `apply_pm_eligibility_batch`):
 ```python
@@ -687,11 +685,11 @@ Uses `propose_candidate_batch()` which batches the same math as `propose_candida
 
 ## 10. Training Loop Integration
 
-**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops used by trainer, validation, and eval_lifelong), `src/training/rl_rollout.py` (RL counterfactual rollouts)
+**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops used by trainer, validation, and eval_lifelong)
 
-### 10.1 Span Loop Structure (Phase D — Full Architecture)
+### 10.1 Span Loop Structure (Full Architecture)
 
-The walkthrough below shows the complete Phase D flow with all subsystems active and RL enabled. In earlier phases, PM/EM/RL steps are skipped when their respective flags are disabled.
+The walkthrough below shows the complete flow with all subsystems active (Phase B+). In Phase A, PM/EM neuromodulator steps use heuristic defaults.
 
 ```
 For each span (8 spans per chunk, P=32 tokens each):
@@ -724,39 +722,26 @@ For each span (8 spans per chunk, P=32 tokens each):
     Compute span_surprise_mean for neuromodulators
     Pre-compute EM candidate stacks + mean novelty
 
-    [Phase D] RL snapshot: save runtime state, elig norms, PM usages,
-              EM novelties/candidates/g_em/tau/ww chosen — BEFORE commit/write
-
     PM neuromodulators: (elig_norm, usage, surprise) → commit_mask, lambda, g, slots
-      └── p_commit gate (Phase D): detached binary → which streams commit
+      └── commit_mask: heuristic gate (elig_norm > 1.0)
       └── PM.commit(): update pm_K, pm_V, pm_a with EMA
 
-    EM neuromodulators: (surprise, usage, novelty) → write_mask, g_em, tau, ww
-      └── g_em = floor + range * sigmoid(raw)  [0.001, 0.95]
-      └── tau  = floor + range * sigmoid(raw)  [0.05, 5.0]   (soft top-k temperature)
-      └── ww   = floor + range * sigmoid(raw)  [0.0, 2.0]    (weakness weight)
+    EM neuromodulators: (surprise, usage, novelty) → g_em, tau, ww, decay
+      └── g_em  = floor + range * sigmoid(raw)  [0.001, 0.95]
+      └── tau   = floor + range * sigmoid(raw)  [0.05, 5.0]   (soft top-k temperature)
+      └── ww    = floor + range * sigmoid(raw)  [0.0, 2.0]    (weakness weight)
+      └── decay = floor + range * sigmoid(raw)  [0.99, 0.9999] (memory retention)
       └── EM.write_at_boundary(): update em_K, em_V, em_S with alpha = g_em * weights
 
 After all spans:
     Finalize loss, add regularizers (PM/EM/WM)
-    optimizer.zero_grad() + rl_optimizer.zero_grad()
+    optimizer.zero_grad()
     total_loss.backward()
-      └── gradient flows through: neuromod continuous heads → commit/write → PM/EM state
+      └── gradient flows through: neuromod heads → commit/write → PM/EM state
           → future PM.apply / EM.retrieve → layer outputs → logits → loss
-      └── PM gate_head gets ZERO grad (commit_mask was .detach())
 
-    clip_grad_norm_(main_params_only)                  # neuromods excluded
-    main_optimizer.step() + scheduler.step()
-
-    [Phase D] RL counterfactual rollouts:
-      For each snapshot (2 per chunk, evenly spaced):
-        PM: restore state → force_off rollout → force_on rollout → reward
-            → BCE on p_commit (via re-forward neuromod with snapshot inputs)
-        EM: restore state → baseline rollout → chosen rollout → reward
-            → weighted MSE on g_em + tau + ww (via re-forward neuromod with snapshot inputs)
-      Restore final real state
-      rl_optimizer.step() (combined continuous + RL gradients)
-      rl_optimizer.zero_grad()
+    clip_grad_norm_(all_params)
+    optimizer.step() + scheduler.step()
 
     Detach all states (TBPTT boundary)
 ```
@@ -771,38 +756,6 @@ After all spans:
 | Eligibility update | Inside `Block.step`, interleaved | Post-forward loop in trainer |
 | EM candidate proposal | Inside trainer token loop | Post-forward batch in trainer |
 | Span boundary logic | Unchanged | Unchanged |
-| RL rollouts | Use `forward_one_token` | Use `forward_span` (parallel, frozen surprise) |
-
-### 10.3 RL Rollouts and the Parallel Path
-
-RL rollouts (`_rollout_span`) now use `forward_span` with frozen surprise from the snapshot, rather than sequential `forward_one_token` with per-token surprise updates. This provides ~3-7x speedup per rollout while producing equivalent RL signals:
-- Both counterfactual arms see identical surprise (frozen from the snapshot's `span_surprise_mean`)
-- The reward = `loss_arm_A - loss_arm_B` remains a valid relative comparison since surprise is symmetric
-- The neuromodulator gate heads are re-forwarded with the same span-mean surprise from the snapshot
-
-**How RL interacts with the parallel training path:**
-
-The training forward pass uses `forward_span` (parallel). Neuromodulators run at span boundaries in the trainer, not inside the model forward. RL snapshots are captured BEFORE commit/write. The rollout then forks from the snapshot, applies forced commit/write, sets surprise from the snapshot, and measures loss over the next span using a single `forward_span` call.
-
-**Surprise regime:** Both the main training path and RL rollouts now use frozen span-mean surprise for all P tokens. The rollout sets `model.surprise = snap.span_surprise_mean` before `forward_span`, matching the main path's regime. This ensures:
-
-1. **Symmetric comparison:** Both counterfactual arms start from the same snapshot with the same frozen surprise. The reward is a valid relative comparison.
-
-2. **Consistent gate training regime:** The neuromodulator gate heads are trained with span-mean surprise as input (via `_update_pm_neuromodulators` / `_update_em_neuromodulators`), which is the same input they see during both the normal training path and rollouts.
-
-**What the gate head sees:**
-
-| Input | Normal path | RL update | Consistent? |
-|-------|------------|-----------|-------------|
-| `elig_norm` | From snapshot (post-forward) | Same snapshot value | Yes |
-| `pm_usage` | From snapshot | Same snapshot value | Yes |
-| `span_surprise_mean` | Computed post-forward | Same snapshot value | Yes |
-| `em_novelty` | From snapshot | Same snapshot value | Yes |
-
-The gate head's inputs are always the span-level summaries from the snapshot. The frozen surprise in the rollout's `forward_span` affects layer gates identically in both counterfactual arms (symmetric), so the reward signal is unbiased. The RL signal is: "given these span-level statistics, was committing/writing the right decision?" — which is exactly the right question for a span-boundary controller.
-
-**PM eligibility and RL:** Eligibility traces are accumulated per-token with per-token surprise gating (in `update_eligibility_batch`), but the commit decision uses span-mean surprise. This is correct because the commit gate receives `elig_norm` (which already encodes the per-token dynamics as a scalar summary) alongside span-mean surprise. The gate has sufficient information.
-
 ---
 
 ## 11. Exact Semantic Differences
@@ -818,7 +771,7 @@ Parallel: all tokens see `surprise = mean_surprise(previous_span)` (frozen span-
 
 The frozen value is the mean surprise over all valid tokens in the previous span, which is a smoother signal than the sequential path's single-token lag. For tokens 1..P-1, the sequential path would have updated surprise per-token — the parallel path holds the mean constant.
 
-### 11.2 PM Committed State at Mid-Span Boundaries (Phases A-D)
+### 11.2 PM Committed State at Mid-Span Boundaries (Phases A-B)
 
 **Magnitude:** Low-medium. Bounded to at most 31 tokens per boundary.
 
@@ -827,7 +780,7 @@ Parallel: PM state not zeroed mid-span → post-boundary tokens read stale PM fr
 
 In practice: PM state is slow-changing and typically weak during early training. Self-corrects at next span boundary.
 
-### 11.3 EM Strengths at Mid-Span Boundaries (Phases C-D)
+### 11.3 EM Strengths at Mid-Span Boundaries (Phases A-B)
 
 **Magnitude:** Low-medium. Bounded to at most 31 tokens per boundary.
 
@@ -845,29 +798,16 @@ Parallel: `update_eligibility` receives the *current* token's surprise (computed
 
 The parallel path is arguably more correct — gating eligibility by how surprising the current token is, rather than using a one-step-lagged value.
 
-### 11.5 RL Rollout Surprise Regime
-
-**Magnitude:** None (RL correctness unaffected).
-
-Both the main training path and RL rollouts now use `forward_span` with frozen surprise. The rollout sets `model.surprise = snap.span_surprise_mean` before calling `forward_span`, so both counterfactual arms see identical, frozen surprise values. This matches the main path's regime and ensures:
-
-- Both counterfactual arms see identical surprise (symmetric comparison)
-- The neuromodulator gate heads are re-forwarded with span-mean surprise from the snapshot (matching the training regime)
-- The reward measures the relative effect of commit/write decisions, not absolute loss
-
-See [§10.3](#103-rl-rollouts-and-the-parallel-path) for full analysis.
-
-### 11.6 Summary Table
+### 11.5 Summary Table
 
 | Difference | Affects | Phases | Max tokens affected | Severity |
 |-----------|---------|--------|-------------------|----------|
 | Frozen surprise in gates | Gate values `a`, `b` | All | All P tokens in span | Low |
-| PM state leak mid-span | PM read output | A-D | ≤31 per boundary | Low-medium |
-| EM strength leak mid-span | EM retrieval output | C-D | ≤31 per boundary | Low-medium |
+| PM state leak mid-span | PM read output | A-B | ≤31 per boundary | Low-medium |
+| EM strength leak mid-span | EM retrieval output | A-B | ≤31 per boundary | Low-medium |
 | Eligibility surprise timing | Eligibility trace | B+ | All P tokens | Negligible (arguably better) |
-| RL rollout surprise regime | N/A (matches main path) | D+ | N/A | None (same as main path) |
 
-### 11.7 What Is Identical
+### 11.6 What Is Identical
 
 Everything not listed above is numerically identical between the two paths:
 - Embedding, spatial decoder, and LM head computation
@@ -878,8 +818,6 @@ Everything not listed above is numerically identical between the two paths:
 - EM candidate proposals and validity masking
 - Loss computation
 - Span boundary logic (PM commits, EM writes, neuromodulator decisions)
-- RL rollouts (now also use `forward_span` with frozen surprise)
-
 ---
 
 ## 12. What Is NOT Supported
@@ -904,8 +842,7 @@ The parallel path intentionally does not support:
 | `src/model/block.py` | `Block.forward_span()` — orchestrates batched components, caches `_last_layer_stack` |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `_compute_reset_masks()` |
-| `src/training/trainer.py` | Span loop orchestration, delegates to span_ops and rl_rollout |
+| `src/training/trainer.py` | Span loop orchestration, delegates to span_ops |
 | `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM/EM accumulation and commits |
-| `src/training/rl_rollout.py` | `RLRolloutEngine` — counterfactual rollouts for neuromodulator training |
 | `src/training/loss.py` | `batched_cross_entropy()` — span-level loss computation |
 | `tests/test_scan.py` | 28 equivalence tests: parallel vs sequential output, state, gradients |

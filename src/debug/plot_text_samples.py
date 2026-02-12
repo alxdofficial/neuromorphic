@@ -38,6 +38,22 @@ def _wrap(text: str, width: int = 80) -> str:
     return "\n".join(wrapped)
 
 
+def _find_clean_offset(row: torch.Tensor, eot_id: int, need: int) -> int:
+    """Find the first offset in row where row[offset:offset+need] has no EOT.
+
+    Scans forward looking for a contiguous region within a single document.
+    Returns 0 as fallback if no clean region exists (short docs).
+    """
+    T = row.shape[0]
+    if need > T:
+        return 0
+    for start in range(T - need + 1):
+        chunk = row[start:start + need]
+        if not (chunk == eot_id).any():
+            return start
+    return 0  # fallback: use start of batch
+
+
 @torch.no_grad()
 def generate_text_sample_plot(
     model,
@@ -53,6 +69,10 @@ def generate_text_sample_plot(
     top_k: int = 50,
 ):
     """Generate text samples and save comparison plot.
+
+    For each batch row, finds a contiguous region within a single document
+    (no EOT tokens) to use as prompt + ground truth. This avoids confusing
+    displays where prompt and truth span different documents.
 
     Args:
         model: NeuromorphicLM instance (on device, in eval mode)
@@ -72,19 +92,40 @@ def generate_text_sample_plot(
 
     BS, T = batch.shape
     n_display = min(n_samples, BS)
-    # Need enough tokens for prompt + ground truth continuation
     effective_prompt = min(prompt_len, T // 2)
     effective_gt_len = min(gen_len, T - effective_prompt)
+    need = effective_prompt + effective_gt_len
 
     if effective_prompt < 2 or effective_gt_len < 2:
         model.train(was_training)
         return
 
     device = next(model.parameters()).device
-    # Use full batch for generation (internal state may be sized for BS),
-    # then display only n_display items.
-    prompt = batch[:, :effective_prompt].to(device)
-    gt_continuation = batch[:n_display, effective_prompt:effective_prompt + effective_gt_len]
+    eot_id = model.config.eot_id
+
+    # Per-sample: find clean region within a single document
+    offsets = []
+    for i in range(n_display):
+        off = _find_clean_offset(batch[i], eot_id, need)
+        offsets.append(off)
+
+    # Build per-sample prompt and ground truth tensors
+    prompt_list = []
+    gt_list = []
+    for i in range(n_display):
+        off = offsets[i]
+        prompt_list.append(batch[i, off:off + effective_prompt])
+        gt_list.append(batch[i, off + effective_prompt:off + effective_prompt + effective_gt_len])
+    # For generation we need uniform prompt shape — pad remaining batch rows
+    # with the first sample's prompt (they won't be displayed)
+    all_prompts = []
+    for i in range(BS):
+        if i < n_display:
+            all_prompts.append(batch[i, offsets[i]:offsets[i] + effective_prompt])
+        else:
+            all_prompts.append(batch[i, offsets[0]:offsets[0] + effective_prompt])
+    prompt = torch.stack(all_prompts).to(device)
+    gt_continuation = torch.stack(gt_list)
 
     # Reset model memory state for clean generation
     reset_mask = torch.ones(BS, dtype=torch.bool, device=device)
@@ -106,7 +147,7 @@ def generate_text_sample_plot(
     # Decode all samples
     samples = []
     for i in range(n_display):
-        prompt_text = _decode_safe(tokenizer, prompt[i].cpu().tolist())
+        prompt_text = _decode_safe(tokenizer, prompt_list[i].cpu().tolist())
         pred_text = _decode_safe(tokenizer, pred_continuation[i].cpu().tolist())
         gt_text = _decode_safe(tokenizer, gt_continuation[i].cpu().tolist())
         samples.append((prompt_text, pred_text, gt_text))

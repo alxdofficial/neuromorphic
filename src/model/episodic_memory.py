@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
-from .utils import StateMixin, unit_normalize, soft_topk, budget_enforce
+from .utils import StateMixin, unit_normalize, budget_enforce
 
 
 class EpisodicMemory(nn.Module, StateMixin):
@@ -30,7 +30,6 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.D_em = config.D_em
         self.k_ret = config.k_ret
         self.C = config.C_em
-        self.k_write = config.k_write
         self.tau = config.tau_em
         self.weakness_weight = config.weakness_weight_em
         self.S_max = config.S_max
@@ -51,7 +50,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.W_k_cand = nn.Linear(D + D, config.D_em)    # from (x, y_wm)
         self.W_v_cand = nn.Linear(config.D_h, config.D_em)  # from h_final (per-block)
 
-        # Learned novelty weight adjuster (Phase C+, backprop only)
+        # Learned novelty weight adjuster (Phase B+, backprop only)
         self.W_nov = nn.Linear(D + D, 1) if config.em_enabled else None
 
         # Post-retrieval MLP: processes the aggregated retrieved memory
@@ -314,25 +313,29 @@ class EpisodicMemory(nn.Module, StateMixin):
         return k_cand, v_cand, novelty
 
     def write_at_boundary(self, cand_K: Tensor, cand_V: Tensor,
-                          cand_score: Tensor, write_mask: Tensor,
-                          g_em: Tensor, tau=None, weakness_weight=None,
+                          cand_score: Tensor,
+                          g_em: Tensor, tau: Tensor, weakness_weight: Tensor,
+                          decay: Tensor,
                           cand_valid: Tensor = None):
-        """Span-boundary EM write. Top-C candidates, soft multi-slot EMA.
+        """Span-boundary EM write. Top-C candidates, softmax multi-slot EMA.
+
+        All arguments are continuous — no binary write_mask. Write strength
+        is controlled by g_em (near-floor = soft "don't write").
 
         Args:
             cand_K: [BS, P, D_em] — candidate keys from span
             cand_V: [BS, P, D_em] — candidate values from span
             cand_score: [BS, P] — novelty scores from span
-            write_mask: [BS] bool — which streams write
             g_em: [BS] — write strength per stream
-            tau: [BS] or scalar or None — soft top-k temperature (default: self.tau)
-            weakness_weight: [BS] or scalar or None — weakness weight (default: self.weakness_weight)
+            tau: [BS] — softmax temperature for slot selection
+            weakness_weight: [BS] — weakness bias weight
+            decay: [BS] — per-stream strength decay rate
             cand_valid: [BS, P] bool — optional candidate validity mask
         """
         if self.em_K is None:
             return
 
-        BS = write_mask.shape[0]
+        BS = g_em.shape[0]
         device = cand_score.device
 
         if cand_valid is None:
@@ -349,104 +352,103 @@ class EpisodicMemory(nn.Module, StateMixin):
         K_C = cand_K.gather(1, topC_idx_exp)  # [BS, C, D_em]
         V_C = cand_V.gather(1, topC_idx_exp)  # [BS, C, D_em]
 
-        _tau = tau if tau is not None else self.tau
-        _ww = weakness_weight if weakness_weight is not None else self.weakness_weight
+        # For each candidate, softmax-select slots to update
+        tau_expanded = tau.unsqueeze(-1)  # [BS, 1]
 
-        if write_mask.any():
-            # For each candidate, soft-select slots to update
-            for c in range(C):
-                k_c = K_C[:, c]   # [BS, D_em]
-                v_c = V_C[:, c]   # [BS, D_em]
+        for c in range(C):
+            k_c = K_C[:, c]   # [BS, D_em]
+            v_c = V_C[:, c]   # [BS, D_em]
 
-                # Score against existing slots
-                scores_slot = torch.einsum("bd, bmd -> bm", k_c, self.em_K)  # [BS, M]
+            # Score against existing slots
+            scores_slot = torch.einsum("bd, bmd -> bm", k_c, self.em_K)  # [BS, M]
 
-                # Weakness bias: prefer overwriting weak slots
-                if isinstance(_ww, Tensor) and _ww.dim() >= 1:
-                    scores_slot = scores_slot - _ww.unsqueeze(-1) * self.em_S
-                else:
-                    scores_slot = scores_slot - _ww * self.em_S
+            # Weakness bias: prefer overwriting weak slots
+            scores_slot = scores_slot - weakness_weight.unsqueeze(-1) * self.em_S
 
-                # Soft top-k selection
-                w = soft_topk(scores_slot, self.k_write, _tau)  # [BS, M]
+            # Softmax slot selection (replaces hard top-k)
+            w = torch.softmax(scores_slot / tau_expanded, dim=-1)  # [BS, M]
 
-                # Apply write mask and strength
-                score_ok = torch.isfinite(topC_scores[:, c])
-                cand_write_mask = write_mask & score_ok
-                alpha = w * g_em.unsqueeze(-1) * cand_write_mask.float().unsqueeze(-1)  # [BS, M]
+            # Apply write strength (g_em gates writes — no binary mask)
+            score_ok = torch.isfinite(topC_scores[:, c])
+            alpha = w * g_em.unsqueeze(-1) * score_ok.float().unsqueeze(-1)  # [BS, M]
 
-                # EMA update
-                alpha_3d = alpha.unsqueeze(-1)  # [BS, M, 1]
-                self.em_K = unit_normalize(
-                    (1 - alpha_3d) * self.em_K + alpha_3d * k_c.unsqueeze(1)
-                )
-                self.em_V = (1 - alpha_3d) * self.em_V + alpha_3d * v_c.unsqueeze(1)
+            # EMA update
+            alpha_3d = alpha.unsqueeze(-1)  # [BS, M, 1]
+            self.em_K = unit_normalize(
+                (1 - alpha_3d) * self.em_K + alpha_3d * k_c.unsqueeze(1)
+            )
+            self.em_V = (1 - alpha_3d) * self.em_V + alpha_3d * v_c.unsqueeze(1)
 
-                # Strength update
-                score_strength = torch.where(
-                    score_ok, topC_scores[:, c], torch.zeros_like(topC_scores[:, c])
-                )
-                self.em_S = (self.em_S + alpha * score_strength.unsqueeze(-1)).clamp(
-                    0.0, self.S_max
-                )
+            # Strength update
+            score_strength = torch.where(
+                score_ok, topC_scores[:, c], torch.zeros_like(topC_scores[:, c])
+            )
+            self.em_S = (self.em_S + alpha * score_strength.unsqueeze(-1)).clamp(
+                0.0, self.S_max
+            )
 
         # Always decay strengths each boundary (even if no writes happened).
-        self.em_S = self.em_S * self.decay
+        self.em_S = self.em_S * decay.unsqueeze(-1)  # [BS] -> [BS, 1] broadcast
         self.em_S = budget_enforce(self.em_S, self.budget)
 
 
 class EMNeuromodulator(nn.Module):
-    """Neuromodulator for EM write strength, temperature, and weakness weight.
+    """Neuromodulator for EM write strength, temperature, weakness weight, and decay.
 
-    Phase A–B (em_enabled=False): empty shell, no parameters.
-    Phase C (em_enabled=True, rl_enabled=False): learned g_em via backbone
-        + g_head (main optimizer backprop), with heuristic write gate
-        (novelty > threshold). g_em clamped to [g_em_floor, g_em_ceil].
-        tau and ww are learned via backbone + heads.
-    Phase D+ (em_enabled=True, rl_enabled=True): always write, learned g_em,
-        tau, ww (dual-trained: main loss backprop + RL counterfactual).
+    Produces fully differentiable outputs. Trained by main-loss gradient
+    through the EM write → retrieve chain.
+
+    When em_enabled: learned backbone with content-aware features.
+    When not em_enabled: heuristic defaults.
 
     Returns:
-        write_mask: [BS] bool (always True in Phase D+ learned mode)
-        g_em: [BS] write strength
-        tau: [BS] soft top-k temperature (or None in heuristic mode)
-        ww: [BS] weakness weight (or None in heuristic mode)
+        g_em: [BS] — write strength
+        tau: [BS] — softmax temperature for slot selection
+        ww: [BS] — weakness weight
+        decay: [BS] — per-span strength decay rate
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.rl_enabled = config.rl_enabled
         self.em_enabled = config.em_enabled
-        self.novelty_threshold = config.novelty_threshold
         self.default_g = config.g_em_default
         self.default_tau = config.tau_em
         self.default_ww = config.weakness_weight_em
+        self.default_decay = config.decay_em
         self.g_em_floor = config.g_em_floor
         self.g_em_ceil = config.g_em_ceil
         self.tau_floor = config.tau_em_floor
         self.tau_ceil = config.tau_em_ceil
         self.ww_floor = config.ww_em_floor
         self.ww_ceil = config.ww_em_ceil
+        self.decay_floor = config.decay_em_floor
+        self.decay_ceil = config.decay_em_ceil
 
-        # Backbone + heads: created when EM is enabled (Phase C+)
         if self.em_enabled:
-            H = config.rl_controller_hidden
+            H = config.neuromod_hidden
+            n_scalar = 3  # span_surprise, em_usage, cand_novelty_mean
+            n_content = config.content_proj_dim
+            n_features = n_scalar + n_content
+
+            # Content projection: cand_K mean [D_em] → [content_proj_dim]
+            self.content_proj = nn.Linear(config.D_em, n_content)
+
             self.backbone = nn.Sequential(
-                nn.Linear(3, H),
+                nn.Linear(n_features, H),
                 nn.ReLU(),
             )
             self.g_head = nn.Linear(H, 1)
             self.tau_head = nn.Linear(H, 1)
             self.ww_head = nn.Linear(H, 1)
+            self.decay_head = nn.Linear(H, 1)
 
-            # Zero backbone bias: ensures zero input → zero backbone output
-            # → head outputs equal their calibrated biases exactly at init.
-            # Backbone weights stay Kaiming-init so non-zero inputs produce signal.
+            # Zero backbone bias: zero input → zero backbone → head biases
             nn.init.zeros_(self.backbone[0].bias)
 
-            # Init heads so output at init matches heuristic defaults.
-            # Zero weights + calibrated bias = constant default until
-            # gradients make the output input-dependent.
+            # Content proj: small init so content features start near zero
+            nn.init.normal_(self.content_proj.weight, std=0.01)
+            nn.init.zeros_(self.content_proj.bias)
+
             # g_em: sigmoid maps to [g_em_floor, g_em_ceil], init to g_em_default
             g_frac = (config.g_em_default - config.g_em_floor) / max(config.g_em_ceil - config.g_em_floor, 1e-8)
             g_frac = max(min(g_frac, 0.999), 0.001)
@@ -454,7 +456,7 @@ class EMNeuromodulator(nn.Module):
             nn.init.constant_(self.g_head.bias, math.log(g_frac / (1.0 - g_frac)))
 
             tau_frac = (config.tau_em - config.tau_em_floor) / max(config.tau_em_ceil - config.tau_em_floor, 1e-8)
-            tau_frac = max(min(tau_frac, 0.999), 0.001)  # avoid log(0)
+            tau_frac = max(min(tau_frac, 0.999), 0.001)
             nn.init.normal_(self.tau_head.weight, std=0.01)
             nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
 
@@ -463,27 +465,51 @@ class EMNeuromodulator(nn.Module):
             nn.init.normal_(self.ww_head.weight, std=0.01)
             nn.init.constant_(self.ww_head.bias, math.log(ww_frac / (1.0 - ww_frac)))
 
-    def forward(self, span_surprise: Tensor, em_usage: Tensor,
-                cand_novelty_mean: Tensor) -> tuple:
-        if self.em_enabled:
-            if self.rl_enabled:
-                return self._forward_learned(span_surprise, em_usage, cand_novelty_mean)
-            return self._forward_continuous(span_surprise, em_usage, cand_novelty_mean)
-        return self._forward_heuristic(span_surprise, em_usage, cand_novelty_mean)
+            decay_frac = (config.decay_em - config.decay_em_floor) / max(config.decay_em_ceil - config.decay_em_floor, 1e-8)
+            decay_frac = max(min(decay_frac, 0.999), 0.001)
+            nn.init.normal_(self.decay_head.weight, std=0.01)
+            nn.init.constant_(self.decay_head.bias, math.log(decay_frac / (1.0 - decay_frac)))
 
-    def _forward_heuristic(self, span_surprise, em_usage, cand_novelty_mean):
-        """No learnable params (Phase A–B fallback)."""
-        write_mask = cand_novelty_mean > self.novelty_threshold
+    def forward(self, span_surprise: Tensor, em_usage: Tensor,
+                cand_novelty_mean: Tensor,
+                content_emb: Tensor = None) -> tuple:
+        """Forward pass.
+
+        Args:
+            span_surprise: [BS] — mean surprise over span
+            em_usage: [BS] — total EM strength usage
+            cand_novelty_mean: [BS] — mean candidate novelty
+            content_emb: [BS, D_em] or None — mean candidate key embedding
+
+        Returns:
+            (g_em, tau, ww, decay)
+        """
+        if self.em_enabled:
+            return self._forward_learned(span_surprise, em_usage, cand_novelty_mean, content_emb)
+        return self._forward_heuristic(span_surprise)
+
+    def _forward_heuristic(self, span_surprise):
+        """Defaults when EM disabled (Phase A)."""
         g_em = torch.full_like(span_surprise, self.default_g)
         tau = torch.full_like(span_surprise, self.default_tau)
         ww = torch.full_like(span_surprise, self.default_ww)
-        return write_mask, g_em, tau, ww
+        decay = torch.full_like(span_surprise, self.default_decay)
+        return g_em, tau, ww, decay
 
-    def _forward_continuous(self, span_surprise, em_usage, cand_novelty_mean):
-        """Heuristic write gate + learned g_em/tau/ww (Phase C)."""
-        write_mask = cand_novelty_mean > self.novelty_threshold
+    def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean, content_emb):
+        """Fully differentiable learned mode."""
+        scalar_features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)  # [BS, 3]
 
-        features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
+        if content_emb is not None:
+            content_features = self.content_proj(content_emb)  # [BS, content_proj_dim]
+            features = torch.cat([scalar_features, content_features], dim=-1)
+        else:
+            features = torch.cat([
+                scalar_features,
+                torch.zeros(span_surprise.shape[0], self.content_proj.out_features,
+                            device=span_surprise.device)
+            ], dim=-1)
+
         h = self.backbone(features)
 
         raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
@@ -495,21 +521,7 @@ class EMNeuromodulator(nn.Module):
         raw_ww = torch.sigmoid(self.ww_head(h)).squeeze(-1)
         ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * raw_ww
 
-        return write_mask, g_em, tau, ww
+        raw_decay = torch.sigmoid(self.decay_head(h)).squeeze(-1)
+        decay = self.decay_floor + (self.decay_ceil - self.decay_floor) * raw_decay
 
-    def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean):
-        """Always write + learned g_em/tau/ww (Phase D+)."""
-        features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)
-        h = self.backbone(features)
-
-        raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
-        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
-
-        raw_tau = torch.sigmoid(self.tau_head(h)).squeeze(-1)
-        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * raw_tau
-
-        raw_ww = torch.sigmoid(self.ww_head(h)).squeeze(-1)
-        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * raw_ww
-
-        write_mask = torch.ones_like(g_em, dtype=torch.bool)
-        return write_mask, g_em, tau, ww
+        return g_em, tau, ww, decay

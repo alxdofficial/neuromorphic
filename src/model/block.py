@@ -191,24 +191,28 @@ class Block(nn.Module, StateMixin):
 
             if force_mode == "force_on":
                 BS = elig_norm.shape[0]
-                commit_mask = torch.ones(BS, dtype=torch.bool,
-                                         device=elig_norm.device)
+                p_commit = torch.ones(BS, device=elig_norm.device)
                 lambda_vals = torch.full((BS,), pm.decay,
                                          device=elig_norm.device)
                 g = torch.full((BS,), self.config.g_pm_default, device=elig_norm.device)
-                pm.commit(commit_mask, lambda_vals, g, None)
-                commit_info[l_idx] = commit_mask.detach()
+                tau = torch.full((BS,), self.config.tau_pm, device=elig_norm.device)
+                pm.commit(p_commit, lambda_vals, g, None, tau)
+                commit_info[l_idx] = p_commit.detach()
             else:
-                # Neuromodulator decides commit mask and parameters
+                # Content embedding: mean eligibility key for content-aware neuromod
+                content_emb = pm.elig_K.mean(dim=1)  # [BS, D_h]
+
+                # Neuromodulator decides all commit parameters (fully differentiable)
                 surprise_input = span_surprise if span_surprise is not None else elig_norm
-                commit_mask, lambda_vals, g, slot_logits, _p_commit = \
+                p_commit, lambda_vals, g, slot_logits, tau = \
                     layer.pm_neuromodulator.forward(
                         elig_norm,
                         pm_usage / self.config.budget_pm,
                         surprise_input,
+                        content_emb=content_emb,
                     )
-                pm.commit(commit_mask, lambda_vals, g, slot_logits)
-                commit_info[l_idx] = commit_mask.detach()
+                pm.commit(p_commit, lambda_vals, g, slot_logits, tau)
+                commit_info[l_idx] = p_commit.detach()
 
         return commit_info
 

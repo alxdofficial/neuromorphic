@@ -47,7 +47,7 @@ def _run_one_collect(model, BS=2):
 # Model output shapes
 # ============================================================================
 
-@pytest.mark.parametrize("phase", ["A", "B", "C", "D"])
+@pytest.mark.parametrize("phase", ["A", "B", "D"])
 class TestModelOutputShapes:
     def test_logits_shape(self, phase):
         model, cfg = _make_model(phase)
@@ -222,7 +222,7 @@ class TestSurpriseShape:
 
 class TestNeuromodulatorShapes:
     def test_pm_neuromod_output_shapes(self):
-        """PMNeuromodulator returns 5-tuple."""
+        """PMNeuromodulator returns 5-tuple (p_commit, lambda_vals, g, slot_logits, tau)."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
@@ -236,16 +236,15 @@ class TestNeuromodulatorShapes:
 
         result = layer.pm_neuromodulator.forward(elig_norm, pm_usage, surprise)
         assert len(result) == 5
-        commit_mask, lambda_vals, g, slot_logits, p_commit = result
+        p_commit, lambda_vals, g, slot_logits, tau = result
 
-        assert commit_mask.shape == (BS,)
-        assert commit_mask.dtype == torch.bool
+        assert p_commit.shape == (BS,)
         assert lambda_vals.shape == (BS,)
         assert g.shape == (BS,)
-        # In Phase B (continuous mode): slot_logits present, p_commit None
+        assert tau.shape == (BS,)
+        # In learned mode: slot_logits present
         assert slot_logits is not None
         assert slot_logits.shape == (BS, cfg.r)
-        assert p_commit is None
 
     def test_pm_neuromod_heuristic_shapes(self):
         """pm_enabled=False: heuristic fallback mode."""
@@ -257,13 +256,13 @@ class TestNeuromodulatorShapes:
         surprise = torch.randn(BS)
 
         result = neuromod.forward(elig_norm, pm_usage, surprise)
-        commit_mask, lambda_vals, g, slot_logits, p_commit = result
-        assert commit_mask.shape == (BS,)
+        p_commit, lambda_vals, g, slot_logits, tau = result
+        assert p_commit.shape == (BS,)
+        assert tau.shape == (BS,)
         assert slot_logits is None
-        assert p_commit is None
 
-    def test_pm_neuromod_continuous_shapes(self):
-        """Phase A: continuous mode (PM enabled, no RL)."""
+    def test_pm_neuromod_learned_shapes(self):
+        """Phase A: learned mode — all outputs continuous."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         neuromod = PMNeuromodulator(cfg)
@@ -272,28 +271,14 @@ class TestNeuromodulatorShapes:
         surprise = torch.randn(BS)
 
         result = neuromod.forward(elig_norm, pm_usage, surprise)
-        commit_mask, lambda_vals, g, slot_logits, p_commit = result
-        assert commit_mask.shape == (BS,)
+        p_commit, lambda_vals, g, slot_logits, tau = result
+        assert p_commit.shape == (BS,)
+        assert tau.shape == (BS,)
         assert slot_logits is not None
         assert slot_logits.shape[1] == cfg.r
-        assert p_commit is None  # no RL → no p_commit
-
-    def test_pm_neuromod_learned_shapes(self):
-        """Phase C: learned mode with p_commit (RL enabled)."""
-        cfg = make_tiny_config()
-        cfg.set_phase("C")
-        neuromod = PMNeuromodulator(cfg)
-        elig_norm = torch.randn(BS)
-        pm_usage = torch.randn(BS)
-        surprise = torch.randn(BS)
-
-        result = neuromod.forward(elig_norm, pm_usage, surprise)
-        commit_mask, lambda_vals, g, slot_logits, p_commit = result
-        assert p_commit is not None
-        assert p_commit.shape == (BS,)
 
     def test_em_neuromod_output_shapes(self):
-        """EMNeuromodulator returns 3-tuple."""
+        """EMNeuromodulator returns 4-tuple (g_em, tau, ww, decay)."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         neuromod = EMNeuromodulator(cfg)
@@ -303,13 +288,12 @@ class TestNeuromodulatorShapes:
 
         result = neuromod.forward(span_surprise, em_usage, cand_novelty)
         assert len(result) == 4
-        write_mask, g_em, tau, ww = result
+        g_em, tau, ww, decay = result
 
-        assert write_mask.shape == (BS,)
-        assert write_mask.dtype == torch.bool
         assert g_em.shape == (BS,)
         assert tau.shape == (BS,)
         assert ww.shape == (BS,)
+        assert decay.shape == (BS,)
 
 
 # ============================================================================
@@ -331,7 +315,7 @@ class TestCollectMode:
 
 class TestDecoderShapes:
     def test_decoder_output_shape(self):
-        model, cfg = _make_model("C", decoder=True)
+        model, cfg = _make_model("B", decoder=True)
         logits, x, y_wm = _run_one(model)
         assert logits.shape == (BS, cfg.vocab_size)
 

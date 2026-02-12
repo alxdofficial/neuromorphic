@@ -2,7 +2,7 @@
 
 ## Overview
 
-This plan covers datasets, configuration, and training phases for the ~40M parameter neuromorphic model (D=512, L=8, B=4) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, RL-based neuromodulation, lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
+This plan covers datasets, configuration, and training phases for the ~40M parameter neuromorphic model (D=512, L=8, B=4) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, neuromodulated memory (PM + EM), lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
 
 **Aligned with:** spec v2.0
 
@@ -75,9 +75,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ---
 
-### Phase B — Enable PM + Learned Continuous Heads
+### Phase B — Enable PM + EM with Learned Neuromodulators
 
-**Goal:** Train general language competence with Procedural Memory active. `PMNeuromodulator` creates backbone + continuous heads (`lambda_head`, `g_head`, `slot_head`) trained via main loss backprop, with heuristic commit gate (`elig_norm > 1.0`).
+**Goal:** Train general language competence with both Procedural Memory and Episodic Memory active. Both `PMNeuromodulator` and `EMNeuromodulator` create backbone + continuous heads trained via main loss backprop. PM uses heuristic commit gate (`elig_norm > 1.0`). EM uses learned write parameters (g_em, tau, ww, decay) and `W_nov` learned novelty adjuster.
 
 **Primary dataset:** FineWeb-Edu (sample-10BT)
 - HuggingFace: `HuggingFaceFW/fineweb-edu` (use the `sample-10BT` subset)
@@ -93,17 +93,24 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 **Recommended mix:** 70% FineWeb-Edu + 30% SlimPajama (interleaved streaming)
 
-**Long-context PM training:** PG19 (full-length books)
+**Long-context memory training:** PG19 (full-length books)
 - HuggingFace: `deepmind/pg19`
 - ~28K public domain books, avg ~69K tokens each
-- Critical for exercising PM across long sequences
+- Critical for exercising PM and EM across long sequences
 - Use as supplementary stream: process full books sequentially to test memory persistence
 
 **Config:**
 - BS=16, TBPTT T=256, plasticity span P=32
 - PM enabled: reads always, commits at span boundaries (heuristic gate: elig_norm > 1.0)
 - PM neuromod continuous heads (lambda, g, slot_logits) active and differentiable — trained via main optimizer
-- EM still disabled (retrieval/writes off)
+- EM retrieval enabled: top k_ret latent memory tokens → cross-attention aggregation
+- EM writes at span boundaries with learned parameters:
+  - `g_em`: write strength in [g_em_floor, g_em_ceil]
+  - `tau`: softmax temperature in [tau_em_floor, tau_em_ceil]
+  - `ww`: weakness weight in [ww_em_floor, ww_em_ceil]
+  - `decay`: per-stream decay rate in [decay_em_floor, decay_em_ceil]
+- `W_nov` learned novelty adjuster active — trained via main optimizer
+- All neuromod params on main optimizer (no separate RL optimizer)
 - Base decay 0.999/span, eligibility decay ρ=0.95
 - All stability rails active (clip, budget, normalize, commit cap)
 
@@ -112,117 +119,45 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 **Evaluation:**
 - Validation perplexity on held-out FineWeb-Edu
 - PM ON vs OFF comparison (perplexity gap)
+- EM ON vs OFF comparison for long-context tasks
 - PG19 long-range memory: fact recall at distance (>1000 tokens back)
-- Stable PM budgets across blocks
+- Stable PM and EM budgets across blocks
 
 ---
 
-### Phase C — Add EM Retrieval + Learned Continuous Heads
+### Phase D — Lifelong Learning (persistent cross-document memory)
 
-**Goal:** Enable Episodic Memory retrieval and writes. `EMNeuromodulator` creates backbone + g_head trained via main loss backprop, with heuristic write gate (`novelty > 0.3`). `EpisodicMemory.W_nov` learned novelty adjuster also trains via backprop.
+**Goal:** Enable persistent cross-document memory. PM/EM accumulate knowledge across document boundaries instead of resetting.
 
-**Dataset:** Continue FineWeb-Edu + SlimPajama streaming
+**Prerequisite:** Phase B (learned neuromodulator heads) should be stable. Without trained neuromodulators deciding commit/write strength, persistent memory would accumulate noise.
 
-**Supplementary datasets for challenging memory scenarios:**
-- **PG19** (continued): Long books stress-test when to write to EM vs. not
-- **ProofPile-2** (subset): Mathematical/logical text where memory of definitions matters
-  - HuggingFace: `EleutherAI/proof-pile-2`
-  - Use ~1–2B token subset
-- **RedPajama v2 — CommonCrawl news subset**: Factual text where storing key facts helps
-  - Recent news articles with names, dates, facts
+**Dataset:** Continue FineWeb-Edu + SlimPajama streaming. Add Wikipedia for domain adaptation evaluation.
 
 **Config:**
-- PM continues with heuristic gate + learned continuous heads (same as Phase B)
-- EM retrieval enabled: top k_ret=4 latent memory tokens → cross-attention aggregation
-- EM writes at span boundaries: heuristic gate (novelty threshold) + learned g_em strength
-- EM neuromod continuous head (g_em) active and differentiable — trained via main optimizer
-- `W_nov` learned novelty adjuster active — trained via main optimizer
-- All stability rails active (EM budget, strength caps)
+- `config.lifelong_mode = True` (set by `config.set_phase("D")`)
+- `reset_on_doc_boundary` remains True (loss masking still active)
+- Soft reset at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
+- All neuromod params remain on main optimizer (same as Phase B)
+- Existing learned decay + budget enforcement handle staleness naturally
+- Continue all stability rails
 
 **Training budget:** ~2–3B tokens
 
 **Evaluation:**
-- Explicit recall improvements at long delays (>1000 tokens)
-- EM usage statistics per block
-- Compare EM ON vs OFF for long-context tasks
-- Perplexity should improve on PG19 with EM enabled
-
----
-
-### Phase D — RL Counterfactual Training (optional)
-
-**Goal:** Add RL counterfactual training for PM gate (`p_commit`) and EM strength (`g_em`). PM continuous heads and EM backbone carry over from Phases B/C; all neuromod params move from main optimizer to RL optimizer.
-
-**Dataset:** Continue FineWeb-Edu + SlimPajama + ProofPile-2 streaming
-
-**Config:**
-- PM: Add `gate_head` → train `commit_mask` via RL counterfactual (force_off vs force_on). Continuous heads (`lambda`, `g`, `slot_logits`) carry over from Phase B (pre-trained via backprop)
-- EM: Switch to always-write (remove heuristic gate); train `g_em` via RL counterfactual (baseline g_em=0.3 vs neuromod's chosen g_em). Safety rails: g_em in [0.001, 0.95] (near-zero floor enables soft "don't write"). g_head carries over from Phase C
-- `W_nov` remains on main optimizer (not RL)
-- Reward: future loss delta − memory/drift penalties
-- Backbone LR reduced to 1e-4, controller LRs at 3e-4
-- Continue all stability rails
-
-**Phase transition:** Optimizer state loading is skipped (param groups change as neuromod params move from main to RL optimizer). The RL optimizer receives a linear LR warmup over `rl_warmup_steps=500` steps to mitigate the cold Adam state on pre-trained continuous-head weights.
-
-**Training budget:** ~2–3B tokens with RL events at span boundaries
-
-**Evaluation:**
-- Compare RL-trained policies vs. Phase C heuristics
+- Domain adaptation: stream Wikipedia chunks, measure per-chunk perplexity decrease
+- Drift monitoring: perplexity on general text stays within 5% of Phase B baseline
+- Cross-document recall: stream factual text, probe at increasing distances
 - Commit/write rate statistics (should be sparse and targeted)
-- Memory benchmark: delayed key-value recall, passage continuation
-- Drift suite: perplexity with PM/EM OFF should remain stable
 
 ---
 
-### Phase E — Lifelong Learning & Persistence
+### Phase E (Future) — Agentic Learning (Start Small)
 
-**Goal:** Enable persistent cross-document memory. PM/EM accumulate knowledge across document boundaries instead of resetting.
-
-**Prerequisite:** Phase C (learned continuous heads) or Phase D (RL controllers) should be stable. Without trained neuromodulator continuous heads deciding commit/write strength, persistent memory would accumulate noise.
-
-**Core mechanism — Soft reset at doc boundaries:**
-Instead of binary "reset everything" or "reset nothing", Phase E uses a **soft reset** via `config.lifelong_mode = True`:
-
-| State | Phase A-D | Phase E | Rationale |
-|-------|-----------|---------|-----------|
-| surprise, h | Zero | Zero | Per-token/short-term, fresh start |
-| WM (cache) | Clear | Clear | Short-term window, cycles naturally |
-| elig_K, elig_V | Zero | **Zero** | In-progress learning, stale across docs |
-| pm_K, pm_V, pm_a | Zero | **Persist** | Committed patterns carry forward |
-| em_K, em_V, em_S | Zero em_S | **Persist** | Memories remain retrievable |
-
-Key insight: eligibility traces still reset (partial, uncommitted learning), but committed PM weights and EM state persist. Existing decay (0.999/span) + budget enforcement handle staleness naturally.
-
-**Primary dataset:** FineWeb-Edu (70%) + Wikipedia (30%)
-
-**Supplementary datasets for evaluation:**
-- **Wikipedia** (latest dump): Domain adaptation — feed articles from a specific topic, test recall
-  - HuggingFace: `wikimedia/wikipedia` (20231101.en)
-  - Use specific topic subsets (e.g., all chemistry articles, then test chemistry knowledge)
-- **Personalization corpus** (synthetic): Create user-profile sequences
-  - Generate synthetic "user says X, later ask about X" test pairs
-  - Test within-session personalization
-- **NarrativeQA**: Reading comprehension over long narratives
-  - HuggingFace: `deepmind/narrativeqa`
-  - Tests whether PM/EM helps answer questions about previously-read content
-
-**Config:**
-- Deploy model from Phase D (or Phase C if skipping RL)
-- `config.lifelong_mode = True` (set automatically by `config.set_phase("E")`)
-- `reset_on_doc_boundary` remains True (loss masking still skips EOT positions)
-- Soft reset: h + eligibility traces reset at doc boundaries; PM committed state and EM fully persist
-- Runtime state saved/loaded in checkpoints (PM/EM contents ARE the accumulated knowledge)
-- Use `save_runtime_state()`/`load_runtime_state()` for session persistence
-
-**Evaluation (implemented in `src/training/eval_lifelong.py`):**
-- **Domain adaptation:** Stream Wikipedia chunks, measure per-chunk perplexity decrease. Lifelong mode should show faster drop vs non-lifelong.
-- **Drift monitoring:** After domain adaptation, verify perplexity on held-out general text stays within 5% of Phase D baseline.
-- **Cross-document recall:** Stream factual text, probe at increasing distances. Measures how long PM/EM retain useful information.
+**Note:** Phase D now implements lifelong learning (previously planned as Phase E). The phase letter "E" is reserved for future agentic capabilities.
 
 ---
 
-### Phase F (Future) — Agentic Learning (Start Small)
+### Phase F (Future) — Agentic Learning (Expanded)
 
 **Goal:** The model learns tool-use patterns and improves task execution within sessions using PM/EM.
 
@@ -323,34 +258,29 @@ Option B: Assign ~70% of streams to FineWeb-Edu and ~30% to SlimPajama.
 - Training the controllers needs **clean signal** (document isolation helps credit assignment)
 - Solution: phased curriculum
 
-### Phase A–C: Reset at document boundaries
+### Phases A–B: Reset at document boundaries
 - `reset_on_doc_boundary = True`
 - PM (`pm_K/pm_V/pm_a`), EM (`em_K/em_V/em_S`), eligibility (`elig_K/elig_V`), hidden state (`h`), and WM cache cleared when `<|eot|>` is encountered
 - Clean learning signal: model learns within-document memory patterns
 - No risk of stale memory from unrelated text
 
-### Phase D: Reset + RL training
-- Same reset policy as Phase A–C
-- RL counterfactuals compare commit/write-vs-no-commit/write within a single document
-- Document isolation helps credit assignment for `PMNeuromodulator` and `EMNeuromodulator` policies
-
-### Phase E+: Lifelong (soft resets)
-- `config.lifelong_mode = True` (set by `config.set_phase("E")`)
+### Phase D: Lifelong (soft resets)
+- `config.lifelong_mode = True` (set by `config.set_phase("D")`)
 - `reset_on_doc_boundary` remains True (loss masking still active)
 - **Soft reset** at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
-- Neuromodulator continuous heads are trained (from Phase B/C) and selective about commit/write strength
-- Base decay (0.999/span) provides natural forgetting
+- Neuromodulator continuous heads are trained (from Phase B) and selective about commit/write strength
+- Learned per-stream decay (EM) + base decay (PM) provide natural forgetting
 - Budget caps force overwriting of weak slots when capacity is full
 - Runtime state checkpointed alongside model parameters
 
 ### Implementation
 Two flags control reset behavior:
 - `config.reset_on_doc_boundary`: controls loss masking at EOT (True in all phases)
-- `config.lifelong_mode`: controls whether PM/EM state persists across doc boundaries (True only in Phase E)
+- `config.lifelong_mode`: controls whether PM/EM state persists across doc boundaries (True only in Phase D)
 
 `Block.reset_states()` branches on `lifelong_mode`:
-- **lifelong_mode=False (Phases A-D):** Full reset — h, all PM state, and EM strengths zeroed
-- **lifelong_mode=True (Phase E):** Soft reset — h zeroed, PM eligibility zeroed, but PM committed state (pm_K/pm_V/pm_a) and EM (em_K/em_V/em_S) persist
+- **lifelong_mode=False (Phases A–B):** Full reset — h, all PM state, and EM strengths zeroed
+- **lifelong_mode=True (Phase D):** Soft reset — h zeroed, PM eligibility zeroed, but PM committed state (pm_K/pm_V/pm_a) and EM (em_K/em_V/em_S) persist
 
 Per-stream reset via boolean mask (different streams hit doc boundaries at different times).
 
@@ -417,13 +347,11 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 ## 7. Implementation Order
 
 1. **Set up data pipeline** — streaming FineWeb-Edu + PG19 with packing
-2. **Phase A** — verify backbone + WM works (TinyStories)
-3. **Phase B** — enable PM + learned continuous heads (FineWeb-Edu + SlimPajama, bulk of training)
-4. **Phase C** — add EM retrieval + learned write strength + W_nov (continue main mix + ProofPile-2)
-5. **Phase D** — RL counterfactual training (optional; add PM gate_head, EM always-write + RL on g_em)
-6. **Phase E** — lifelong learning evaluation (Wikipedia, synthetic tests, soft resets only: h + eligibility traces reset at doc boundaries, PM committed state and EM persist)
-7. **Phase F** — agentic fine-tuning (function calling datasets)
-8. **Phase G** — multimodal (future, requires architecture extension)
+2. **Phase A** — verify backbone + WM + PM works (TinyStories)
+3. **Phase B** — enable PM + EM with learned neuromodulators (FineWeb-Edu + SlimPajama, bulk of training)
+4. **Phase D** — lifelong learning (soft resets: h + eligibility traces reset at doc boundaries, PM committed state and EM persist)
+5. **Phase E (future)** — agentic fine-tuning (function calling datasets)
+6. **Phase F (future)** — multimodal (requires architecture extension)
 
 ---
 

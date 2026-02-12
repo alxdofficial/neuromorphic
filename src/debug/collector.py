@@ -100,24 +100,25 @@ class MetricsCollector:
         self._write(record)
 
     def record_pm_commit(self, block_idx: int, layer_idx: int,
-                         commit_mask: Tensor):
-        """Accumulate PM commit rate across spans within a chunk."""
+                         p_commit: Tensor):
+        """Accumulate PM commit strength across spans within a chunk.
+
+        p_commit is a continuous [BS] tensor (0-1), not a binary mask.
+        """
         key = (block_idx, layer_idx)
         if key not in self._pm_commit_accum:
             self._pm_commit_accum[key] = [0.0, 0]
-        self._pm_commit_accum[key][0] += commit_mask.float().mean().item()
+        self._pm_commit_accum[key][0] += p_commit.float().mean().item()
         self._pm_commit_accum[key][1] += 1
 
-    def record_em_write(self, block_idx: int, write_mask: Tensor,
-                        novelty_mean: float, g_em_mean: float = None):
-        """Accumulate EM write rate across spans within a chunk."""
+    def record_em_write(self, block_idx: int,
+                        novelty_mean: float, g_em_mean: float):
+        """Accumulate EM write stats across spans within a chunk."""
         if block_idx not in self._em_write_accum:
-            self._em_write_accum[block_idx] = [0.0, 0, 0.0, 0.0]
-        self._em_write_accum[block_idx][0] += write_mask.float().mean().item()
-        self._em_write_accum[block_idx][1] += 1
-        self._em_write_accum[block_idx][2] += novelty_mean
-        if g_em_mean is not None:
-            self._em_write_accum[block_idx][3] += g_em_mean
+            self._em_write_accum[block_idx] = [0.0, 0, 0.0]
+        self._em_write_accum[block_idx][0] += 1
+        self._em_write_accum[block_idx][1] += novelty_mean
+        self._em_write_accum[block_idx][2] += g_em_mean
 
     def _flush_rates(self, record: dict):
         """Flush accumulated commit/write rates into the record."""
@@ -127,12 +128,10 @@ class MetricsCollector:
         self._pm_commit_accum.clear()
 
         for b, accum in self._em_write_accum.items():
-            total, count, nov = accum[0], accum[1], accum[2]
+            count, nov, g = accum[0], accum[1], accum[2]
             if count > 0:
-                record[f"em_write_rate_b{b}"] = total / count
                 record[f"em_novelty_mean_b{b}"] = nov / count
-                if len(accum) > 3 and accum[3] > 0:
-                    record[f"em_g_em_mean_b{b}"] = accum[3] / count
+                record[f"em_g_em_mean_b{b}"] = g / count
         self._em_write_accum.clear()
 
     def _merge_gate_stats(self, record: dict, gate_stats: dict):
@@ -215,7 +214,7 @@ class MetricsCollector:
         ]
         em_write_vals = [
             v for k, v in record.items()
-            if k.startswith("em_write_rate_b") and isinstance(v, (float, int))
+            if k.startswith("em_g_em_mean_b") and isinstance(v, (float, int))
         ]
         gate_near0_vals = [
             v for k, v in record.items()
@@ -308,7 +307,7 @@ class MetricsCollector:
         }
         for b_idx, block in enumerate(self.model.blocks):
             module_groups[f"block_{b_idx}"] = [block]
-            if self.config.rl_enabled:
+            if self.config.em_enabled:
                 module_groups[f"b{b_idx}_em_neuromod"] = [block.em_neuromodulator]
             for l_idx, layer in enumerate(block.layers):
                 module_groups[f"b{b_idx}_l{l_idx}_gates"] = [
@@ -316,7 +315,6 @@ class MetricsCollector:
                 ]
                 if self.config.pm_enabled:
                     module_groups[f"b{b_idx}_l{l_idx}_pm"] = [layer.pm]
-                if self.config.rl_enabled:
                     module_groups[f"b{b_idx}_l{l_idx}_pm_neuromod"] = [layer.pm_neuromodulator]
 
         for name, modules in module_groups.items():

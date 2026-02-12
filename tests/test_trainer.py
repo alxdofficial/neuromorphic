@@ -26,20 +26,12 @@ def _make_batch(BS, T, vocab=VOCAB):
     return StreamBatch(input_ids=input_ids, target_ids=target_ids, prev_token=prev_token)
 
 
-def _make_trainer(phase="B", use_rl=False, **overrides):
+def _make_trainer(phase="B", **overrides):
     """Create a minimal TBPTTTrainer for testing."""
     cfg = make_tiny_config(**overrides)
     cfg.set_phase(phase)
-    if use_rl:
-        cfg.rl_enabled = True
     model = NeuromorphicLM(cfg)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    rl_optimizer = None
-    if use_rl:
-        rl_params = list(model.rl_parameters())
-        if rl_params:
-            rl_optimizer = torch.optim.Adam(rl_params, lr=1e-4)
 
     def dummy_dataloader():
         while True:
@@ -52,7 +44,6 @@ def _make_trainer(phase="B", use_rl=False, **overrides):
         dataloader=dummy_dataloader(),
         config=cfg,
         device=torch.device("cpu"),
-        rl_optimizer=rl_optimizer,
     )
     return trainer, cfg, model
 
@@ -97,21 +88,13 @@ class TestTrainChunk:
             losses.append(metrics["loss"])
         assert all(l < 1e6 for l in losses)
 
-    def test_phase_c_with_em(self):
-        """Phase C enables EM — train_chunk should still work."""
-        trainer, cfg, model = _make_trainer("C")
+    def test_phase_d_without_rl(self):
+        """Phase D (lifelong) — train_chunk should work without RL."""
+        trainer, cfg, model = _make_trainer("D")
         batch = _make_batch(BS, cfg.T)
         metrics = trainer.train_chunk(batch)
         assert isinstance(metrics, dict)
         assert metrics["loss"] < 1e6
-
-    def test_phase_d_with_rl(self):
-        """Phase D enables RL — train_chunk should run RL rollouts."""
-        trainer, cfg, model = _make_trainer("D", use_rl=True)
-        batch = _make_batch(BS, cfg.T)
-        metrics = trainer.train_chunk(batch)
-        assert isinstance(metrics, dict)
-        assert "rl_events" in metrics
 
     def test_valid_fraction_range(self):
         trainer, cfg, model = _make_trainer("B")
@@ -181,12 +164,11 @@ class TestBackwardAndStep:
             target_ids[:, :cfg.P].reshape(-1),
         )
 
-        avg_loss, reg, grad_norm, rl_metrics = trainer._backward_and_step(
-            loss, BS * cfg.P, [],
+        avg_loss, reg, grad_norm = trainer._backward_and_step(
+            loss, BS * cfg.P,
         )
         assert isinstance(grad_norm, float)
         assert grad_norm >= 0.0
-        assert isinstance(rl_metrics, dict)
 
     def test_nan_loss_raises_with_fail_fast(self):
         """NaN loss with fail_fast=True should raise RuntimeError."""
@@ -199,7 +181,7 @@ class TestBackwardAndStep:
         loss = logits.sum() * float("inf") * 0  # NaN
 
         with pytest.raises(RuntimeError, match="Non-finite total loss"):
-            trainer._backward_and_step(loss, BS * cfg.P, [])
+            trainer._backward_and_step(loss, BS * cfg.P)
 
 
 # ============================================================================
@@ -219,8 +201,8 @@ class TestApplyBoundaryUpdates:
         # Should not raise
         trainer._apply_boundary_updates(result, surprise_mean)
 
-    def test_em_boundary_applied_phase_c(self):
-        trainer, cfg, model = _make_trainer("C")
+    def test_em_boundary_applied_phase_b(self):
+        trainer, cfg, model = _make_trainer("B")
         span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
         reset_first = torch.zeros(BS, dtype=torch.bool)
         model.forward_span(span_ids, reset_first)

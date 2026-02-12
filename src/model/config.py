@@ -30,12 +30,12 @@ class ModelConfig:
     a_max: float = 3.0        # max strength per slot
     budget_pm: float = 4.0    # sum(pm_a) budget per stream
     decay_pm: float = 0.999   # per-span strength decay
-    commit_top_k: int = 2     # slots updated per commit
-    tau_pm: float = 1.0       # softmax temperature
+    tau_pm: float = 1.0       # softmax temperature (default for PM slot selection)
+    tau_pm_floor: float = 0.05  # min PM slot selection temperature (learned mode)
+    tau_pm_ceil: float = 5.0    # max PM slot selection temperature (learned mode)
     weakness_weight_pm: float = 0.5  # bias toward weak slots
     pm_readout_ffn: bool = True       # MLP after PM linear lookup
     surprise_scale: float = 5.0       # eligibility gate: gate = (surprise / scale).clamp(0,1)
-    commit_threshold: float = 1.0     # PM commit threshold (elig_norm > threshold)
     g_pm_default: float = 0.5         # default PM write strength
 
     # Episodic Memory (per block, B instances)
@@ -43,37 +43,31 @@ class ModelConfig:
     D_em: int = 128           # EM key/value dimension
     k_ret: int = 4            # retrieval count
     C_em: int = 8             # candidates per span
-    k_write: int = 4          # slots updated per candidate
-    tau_em: float = 1.0       # softmax temperature
+    tau_em: float = 1.0       # softmax temperature (default for EM slot selection)
     weakness_weight_em: float = 0.5  # bias toward weak slots
     S_max: float = 3.0        # max strength per slot
     budget_em: float = 8.0    # sum(em_S) budget per stream
     decay_em: float = 0.999   # per-span strength decay
     g_em_default: float = 0.3   # default EM write strength
-    g_em_floor: float = 0.001  # minimum write strength (learned mode, near-zero = soft "don't write")
-    g_em_ceil: float = 0.95    # maximum write strength (learned mode)
-    novelty_threshold: float = 0.3  # EM write gate: write_mask = novelty > threshold
-    tau_em_floor: float = 0.05   # min soft top-k temperature (learned mode)
-    tau_em_ceil: float = 5.0     # max soft top-k temperature (learned mode)
-    ww_em_floor: float = 0.0    # min weakness weight (learned mode)
-    ww_em_ceil: float = 2.0     # max weakness weight (learned mode)
+    g_em_floor: float = 0.001  # minimum write strength (near-zero = soft "don't write")
+    g_em_ceil: float = 0.95    # maximum write strength
+    tau_em_floor: float = 0.05   # min soft slot selection temperature
+    tau_em_ceil: float = 5.0     # max soft slot selection temperature
+    ww_em_floor: float = 0.0    # min weakness weight
+    ww_em_ceil: float = 2.0     # max weakness weight
+    decay_em_floor: float = 0.99     # fast forgetting (~2.2K token half-life)
+    decay_em_ceil: float = 0.9999    # near-permanent (~220K token half-life)
     em_readout_ffn: bool = True       # MLP after EM cross-attention retrieval
+
+    # Neuromodulator architecture
+    neuromod_hidden: int = 32         # hidden dim for neuromod backbone MLPs
+    content_proj_dim: int = 8         # projection dim for content embeddings in neuromods
 
     # Training
     T: int = 256              # TBPTT segment length
     P: int = 32               # plasticity span
     reset_on_doc_boundary: bool = True
     lifelong_mode: bool = False  # Phase D: PM/EM persist across doc boundaries
-
-    # RL controllers (Phase C)
-    rl_enabled: bool = False
-    rl_controller_hidden: int = 32
-    rl_lr: float = 1e-3
-    rl_events_per_chunk: int = 2    # rollout events per T-token chunk
-    rl_memory_penalty: float = 0.0  # penalty per commit/write (future use)
-    rl_warmup_steps: int = 500      # LR warmup for RL optimizer after phase transition
-    rl_pm_targets_per_event: int = 1  # PM controllers counterfactually trained per event
-    rl_em_targets_per_event: int = 1  # EM controllers counterfactually trained per event
 
     # Spatial Decoder (hierarchical aggregation + deep cross-attention)
     snapshot_enabled: bool = True   # architecture toggle (independent of phase)
@@ -129,38 +123,30 @@ class ModelConfig:
 
         A: WM + PM (base — PM is always on)
         B: WM + PM + EM
-        C: WM + PM + EM + RL controllers
         D: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
 
-        Design intent: All downstream code branches on capability flags
-        (pm_enabled, em_enabled, rl_enabled) — never on phase letters.
-        This method is the single point where phase -> flags mapping lives.
+        All downstream code branches on capability flags (pm_enabled,
+        em_enabled) — never on phase letters. This method is the single
+        point where phase -> flags mapping lives.
+
+        Neuromodulators are trained by main-loss gradient in all phases.
+        No separate RL optimizer or phase needed.
         """
         phase = phase.upper()
         if phase == "A":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = False
-            self.rl_enabled = False
         elif phase == "B":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-            self.rl_enabled = False
-        elif phase == "C":
-            self.wm_enabled = True
-            self.pm_enabled = True
-            self.em_enabled = True
-            self.rl_enabled = True
         elif phase == "D":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-            # Phase D inherits rl_enabled — does not force it on or off.
-            # This allows Phase D to run with or without neuromodulators
-            # depending on prior config (e.g. resuming from Phase C).
         else:
-            raise ValueError(f"Unknown phase: {phase}. Expected A/B/C/D.")
+            raise ValueError(f"Unknown phase: {phase}. Expected A/B/D.")
 
         # Phase D: enable lifelong mode
         self.lifelong_mode = (phase == "D")
@@ -179,7 +165,7 @@ class ModelConfig:
             D=768, L=12, B=6,
             # Scaled memory capacities
             r=16, W=512, D_wm=192, n_heads_wm=6,
-            M=512, D_em=192, k_ret=8, C_em=16, k_write=8,
+            M=512, D_em=192, k_ret=8, C_em=16,
             # Scaled decoder
             d_dec=384, n_heads_decoder=6,
         )
@@ -193,7 +179,7 @@ class ModelConfig:
             D=1024, L=24, B=8,
             # Scaled memory capacities
             r=32, W=1024, D_wm=256, n_heads_wm=8,
-            M=1024, D_em=256, k_ret=16, C_em=32, k_write=16,
+            M=1024, D_em=256, k_ret=16, C_em=32,
             # Scaled decoder
             d_dec=512, n_heads_decoder=8, decoder_layers=3,
         )

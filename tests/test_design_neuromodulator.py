@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from src.model.model import NeuromorphicLM
 from src.model.procedural_memory import PMNeuromodulator
 from src.model.episodic_memory import EMNeuromodulator
 from tests.conftest import make_tiny_config
@@ -18,91 +17,88 @@ BS = 2
 # ============================================================================
 
 class TestNeuromodulatorModes:
-    def test_pm_continuous_in_phase_a(self):
-        """Phase A: PM enabled, neuromodulator uses continuous heads (no RL)."""
+    def test_pm_heuristic_in_phase_a(self):
+        """Phase A: PM enabled, neuromodulator in heuristic mode (no learnable params)."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         nm = PMNeuromodulator(cfg)
         assert cfg.pm_enabled
-        assert not cfg.rl_enabled
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        _, _, _, slot_logits, p_commit = result
-        assert slot_logits is not None
-        assert p_commit is None
+        p_commit, lambda_vals, g, slot_logits, tau = result
+        assert p_commit.shape == (BS,)
+        assert tau.shape == (BS,)
 
     def test_pm_continuous_in_phase_b(self):
-        """Phase B: PM neuromodulator still uses continuous heads (EM added, no RL)."""
+        """Phase B: PM neuromodulator uses learned backbone + heads."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         nm = PMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        _, _, _, slot_logits, p_commit = result
-        assert slot_logits is not None
-        assert p_commit is None
+        p_commit, lambda_vals, g, slot_logits, tau = result
+        assert p_commit.shape == (BS,)
+        assert lambda_vals.shape == (BS,)
+        assert g.shape == (BS,)
+        assert tau.shape == (BS,)
 
-    def test_pm_learned_in_phase_c(self):
-        """Phase C: PM neuromodulator uses learned gate (RL enabled)."""
+    def test_pm_phase_c_raises(self):
+        """Phase C was removed — set_phase('C') must raise ValueError."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
-        nm = PMNeuromodulator(cfg)
-        result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        _, _, _, slot_logits, p_commit = result
-        assert slot_logits is not None
-        assert p_commit is not None
+        with pytest.raises(ValueError, match="Unknown phase"):
+            cfg.set_phase("C")
 
     def test_em_heuristic_in_phase_a(self):
-        """Phase A: EM neuromodulator uses heuristic."""
+        """Phase A: EM disabled, neuromodulator uses heuristic defaults."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        write_mask, g_em, tau, ww = result
+        g_em, tau, ww, decay = result
+        assert g_em.shape == (BS,)
         assert tau.shape == (BS,)
         assert ww.shape == (BS,)
-        assert g_em.shape == (BS,)
+        assert decay.shape == (BS,)
 
     def test_em_continuous_in_phase_b(self):
-        """Phase B: EM neuromodulator uses continuous g_em."""
+        """Phase B: EM neuromodulator uses learned continuous g_em."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        _, g_em, tau, ww = result
+        g_em, tau, ww, decay = result
+        assert g_em.shape == (BS,)
         assert tau.shape == (BS,)
         assert ww.shape == (BS,)
+        assert decay.shape == (BS,)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
 
-    def test_em_learned_in_phase_c(self):
-        """Phase C: EM neuromodulator uses learned gate (RL enabled)."""
+    def test_em_continuous_in_phase_d(self):
+        """Phase D: EM neuromodulator uses learned continuous g_em (lifelong)."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("D")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
-        write_mask, g_em, tau, ww = result
-        assert write_mask.all()
+        g_em, tau, ww, decay = result
+        assert g_em.shape == (BS,)
         assert tau.shape == (BS,)
         assert ww.shape == (BS,)
+        assert decay.shape == (BS,)
 
-
-# ============================================================================
-# RL parameter isolation
-# ============================================================================
-
-class TestRLParameterIsolation:
-    def test_rl_parameters_only_neuromodulator(self):
-        """model.rl_parameters() yields only params with 'neuromodulator' in name."""
+    def test_pm_content_emb_accepted(self):
+        """PM neuromodulator accepts optional content_emb kwarg."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
-        model = NeuromorphicLM(cfg)
+        cfg.set_phase("B")
+        nm = PMNeuromodulator(cfg)
+        content_emb = torch.randn(BS, cfg.D_h)
+        result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS),
+                            content_emb=content_emb)
+        assert len(result) == 5
 
-        rl_param_names = set()
-        for name, param in model.named_parameters():
-            if "neuromodulator" in name:
-                rl_param_names.add(id(param))
-
-        yielded_ids = set()
-        for param in model.rl_parameters():
-            yielded_ids.add(id(param))
-
-        assert yielded_ids == rl_param_names, \
-            "rl_parameters() should yield exactly the neuromodulator params"
+    def test_em_content_emb_accepted(self):
+        """EM neuromodulator accepts optional content_emb kwarg."""
+        cfg = make_tiny_config()
+        cfg.set_phase("B")
+        nm = EMNeuromodulator(cfg)
+        content_emb = torch.randn(BS, cfg.D_em)
+        result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS),
+                            content_emb=content_emb)
+        assert len(result) == 4

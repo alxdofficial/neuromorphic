@@ -3,9 +3,9 @@
 ## Quick Start
 
 ```bash
-# Full training (all 5 phases, tier B, optimized BS)
+# Full training (all 3 phases, tier B, optimized BS)
 tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
-  "python -u -m src.train --phases A,B,C,D,E --tier b --bs 48 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
+  "python -u -m src.train --preset phase_a_to_d --bs 48 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
 
 # Attach to monitor
 tmux attach -t neuromorphic-train
@@ -35,13 +35,13 @@ tmux attach -t neuromorphic-train
 
 | Phase | Steps | Tokens (BS=48) | Features |
 |-------|-------|-----------------|----------|
-| A     | 10K   | ~125M           | WM only (TinyStories) |
-| B     | 300K  | ~3.7B           | WM + PM (FineWeb-Edu + DCLM) |
-| C     | 300K  | ~3.7B           | WM + PM + EM |
-| D     | 300K  | ~3.7B           | WM + PM + EM + RL |
-| E     | 120K  | ~1.5B           | Lifelong learning |
+| A     | 10K   | ~125M           | WM + PM (TinyStories) |
+| B     | 300K  | ~3.7B           | WM + PM + EM (FineWeb-Edu + DCLM) |
+| D     | 300K  | ~3.7B           | WM + PM + EM + lifelong (PM/EM persist across docs) |
 
-Total: ~1.03M steps, ~12.7B tokens at BS=48
+Total: ~610K steps, ~7.5B tokens at BS=48
+
+Neuromodulators (PM and EM) are trained by main-loss gradient in all phases — no separate RL optimizer.
 
 ## Tokens Per Step
 

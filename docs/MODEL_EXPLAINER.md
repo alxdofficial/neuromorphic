@@ -18,7 +18,7 @@
 8. [Episodic Memory (EM)](#8-episodic-memory-em)
 9. [Blocks: Putting It Together](#9-blocks-putting-it-together)
 10. [Neuromodulators](#10-neuromodulators)
-11. [Phase D -- Hybrid RL + Backprop Training](#11-phase-d----hybrid-rl--backprop-training)
+11. [Neuromodulator Training (All Phases)](#11-neuromodulator-training-all-phases)
 12. [Spatial Decoder](#12-spatial-decoder)
 13. [State Management](#13-state-management)
 14. [Training Loop (TBPTT + Spans)](#14-training-loop-tbptt--spans)
@@ -43,7 +43,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 | **Procedural memory** (PM) | Cerebellum / skill memory | Across documents/lifelong | Eligibility traces + neuromodulated commits |
 | **Episodic memory** (EM) | Hippocampus / event memory | Across documents/lifelong | Novelty-based writes to vector store + neuromodulation |
 
-**Why not just use a transformer?** Transformers have a single memory mechanism (KV cache) that scales linearly with context. Our model separates *what* to remember from *how long* to remember it. WM handles precise short-range copying. PM learns reusable patterns (like skills). EM stores specific surprising events for later recall. Each system can be independently controlled, budgeted, and -- as of Phase D -- learned via RL.
+**Why not just use a transformer?** Transformers have a single memory mechanism (KV cache) that scales linearly with context. Our model separates *what* to remember from *how long* to remember it. WM handles precise short-range copying. PM learns reusable patterns (like skills). EM stores specific surprising events for later recall. Each system can be independently controlled, budgeted, and -- starting in Phase B -- learned via main-loss backprop through neuromodulators.
 
 **Key constraint:** Single RTX 4090 (24GB). Everything must fit in VRAM with bf16 mixed precision. This rules out large KV caches or dense attention over long contexts, motivating the fixed-size memory banks.
 
@@ -51,7 +51,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 
 ## 2. Architecture at a Glance
 
-The diagram below shows the **full Phase D architecture** (all subsystems active, RL enabled). In earlier phases, some components are absent: Phase A has WM only; Phase B adds PM; Phase C adds EM; Phase D adds RL. See [§17](#17-phased-training-plan) for the phase progression.
+The diagram below shows the **full architecture** (all subsystems active). In earlier phases, some components are absent: Phase A has WM + PM; Phase B adds EM; Phase D adds lifelong persistence. See [§17](#17-phased-training-plan) for the phase progression.
 
 ```
 Token ID ──► Embedding ──► x: [BS, D]
@@ -105,17 +105,14 @@ Token ID ──► Embedding ──► x: [BS, D]
      (at span boundaries)          (at span boundaries)
      ├─ inputs: elig_norm,         ├─ inputs: surprise,
      │  usage, surprise            │  usage, novelty
-     ├─ outputs: commit_mask,      ├─ outputs: write_mask,
-     │  lambda, g, slots,          │  g_em, tau, ww
-     │  p_commit (RL gate)         │
+     ├─ outputs: commit_mask,      ├─ outputs: g_em,
+     │  lambda, g, slots           │  tau, ww, decay
      ▼                             ▼
      PM commit: update             EM write: update
      pm_K, pm_V, pm_a             em_K, em_V, em_S
               │                          │
-              └──── RL (Phase D+) ───────┘
-              Counterfactual rollouts:
-              PM: force_on vs force_off → reward → BCE on p_commit
-              EM: baseline vs chosen → reward → weighted MSE on g_em, tau, ww
+              └── All trained via ───────┘
+                  main loss backprop
 ```
 
 **Dimensions (Tier A defaults):** D=512, B=4, L=8, D_h=128, vocab=32000
@@ -172,7 +169,7 @@ return logits, x, y_wm
 
 **Returns:** Always `(logits, x_emb, y_wm)`. The trainer needs `x_emb` and `y_wm` for EM candidate proposals (they cannot be recomputed cheaply because WM state has already advanced).
 
-**What happens outside `forward_one_token`:** The model forward is read-only with respect to PM and EM — it reads from them but doesn't write. Memory updates happen at span boundaries in the trainer: PM eligibility traces are accumulated post-forward, then neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). In Phase D+, RL counterfactual rollouts train the commit/write gates (see [§11](#11-phase-d----hybrid-rl--backprop-training)).
+**What happens outside `forward_one_token`:** The model forward is read-only with respect to PM and EM — it reads from them but doesn't write. Memory updates happen at span boundaries in the trainer: PM eligibility traces are accumulated post-forward, then neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). All neuromodulator heads are trained via main loss backprop (see [§11](#11-neuromodulator-training-all-phases)).
 
 ---
 
@@ -337,26 +334,19 @@ Called every P=32 tokens. The commit process:
    - `slot_logits: None` -- slot selection uses similarity
    - `p_commit: None` -- no learned probability
 
-   In continuous-learned mode (Phases B–C — `pm_enabled=True`, `rl_enabled=False`):
+   In learned mode (Phase B+ — `pm_enabled=True`):
    - `commit_mask: [BS]` -- heuristic gate: `elig_norm > 1.0`
    - `lambda_vals: [BS]` -- sigmoid, scaled to `[decay_pm, 1.0]` (differentiable, main optimizer)
    - `g: [BS]` -- sigmoid output (differentiable, main optimizer)
    - `slot_logits: [BS, r]` -- raw linear output (differentiable, main optimizer)
-   - `p_commit: None` -- no RL gate yet
-
-   In fully-learned mode (Phase D+ — `pm_enabled=True`, `rl_enabled=True`):
-   - `commit_mask: [BS]` -- `(p_commit > 0.5).detach()` (hard gate, no grad)
-   - `lambda_vals: [BS]` -- sigmoid, scaled to `[decay_pm, 1.0]` (differentiable)
-   - `g: [BS]` -- sigmoid output (differentiable)
-   - `slot_logits: [BS, r]` -- raw linear output (differentiable)
-   - `p_commit: [BS]` -- sigmoid probability (used for RL training)
+   - `p_commit: None` -- reserved (unused)
 
 3. **Slot selection** (soft top-k):
    ```python
    scores = einsum(pm_K, elig_K_norm)       # [BS, r] -- similarity
    scores -= weakness_weight * pm_a          # prefer overwriting weak slots
    if slot_logits is not None:
-       scores += slot_logits                 # learned bias (Phase D)
+       scores += slot_logits                 # learned bias (Phase B+)
    weights = soft_topk(scores, k=2, tau=1.0) # [BS, r] -- softmax over top-2
    ```
 
@@ -374,11 +364,11 @@ Called every P=32 tokens. The commit process:
 
 **Why soft top-k?** Rather than hard-selecting one slot to overwrite, soft top-k distributes the write across the k=2 most suitable slots with softmax weights. This provides a smoother gradient signal and avoids catastrophic overwriting of a single slot.
 
-**Differentiable continuous outputs:** Starting in Phase B (continuous-learned mode), `lambda_vals`, `g`, and `slot_logits` carry gradients through the commit operation. The `alpha` computation and the EMA update are differentiable tensor operations, so `total_loss.backward()` reaches the neuromodulator's continuous heads. In Phases B–C these heads are on the main optimizer; in Phase D they move to the RL optimizer. Only `commit_mask` is detached (it is a binary gate trained via RL, added in Phase D).
+**Differentiable continuous outputs:** Starting in Phase B (learned mode), `lambda_vals`, `g`, and `slot_logits` carry gradients through the commit operation. The `alpha` computation and the EMA update are differentiable tensor operations, so `total_loss.backward()` reaches the neuromodulator's continuous heads on the main optimizer. `commit_mask` is a heuristic binary gate (detached, no gradient).
 
-### 7.5 PM Eligibility-Only Reset (Phase E)
+### 7.5 PM Eligibility-Only Reset (Phase D)
 
-In lifelong mode (Phase E), doc boundaries call `reset_eligibility(mask)` instead of the full `reset_states(mask)`:
+In lifelong mode (Phase D), doc boundaries call `reset_eligibility(mask)` instead of the full `reset_states(mask)`:
 
 ```python
 def reset_eligibility(self, mask):
@@ -393,7 +383,7 @@ def reset_eligibility(self, mask):
 
 ### 7.6 PM: Complete Learnable Components Reference
 
-This table covers **every learnable weight, runtime state, and control signal** that PM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "RL" means the parameter is updated via counterfactual rollout (BCE or weighted MSE). "Rules" means updated by explicit code (EMA, decay, budget enforcement) — no gradient.
+This table covers **every learnable weight, runtime state, and control signal** that PM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "Rules" means updated by explicit code (EMA, decay, budget enforcement) — no gradient.
 
 #### Learned Parameters (nn.Parameter, saved in state_dict)
 
@@ -405,28 +395,27 @@ This table covers **every learnable weight, runtime state, and control signal** 
 | `readout_ffn` | `PM.readout_ffn` | `Linear(D_h, 4*D_h)` + `Linear(4*D_h, D_h)` | Nonlinear transform of retrieved PM content before injection into recurrence | Backprop (main opt) | B+ | Per-token in `apply`/`apply_batch` | Static after convergence |
 | `gate_a, gate_b` | `Layer.gate_a/b` | `Linear(4*D_h+1, D_h)` | Retention/update gates consuming PM read output (among other signals) | Backprop (main opt) | A+ | Per-token, parallelized via scan | Static after convergence |
 | `W_o` | `Layer.W_o` | `Linear(D_h, D_h)` | Output projection after recurrence | Backprop (main opt) | A+ | Per-token, parallelized via scan | Static after convergence |
-| PMNeuromod `backbone` | `layer.pm_neuromodulator` | `Linear(3, H=32)` + ReLU | Shared representation for all PM neuromod heads | Backprop (main B–C; RL opt D+) | B+ | Boundary-only (once per P tokens) | Adapts to stream-specific surprise/usage patterns |
-| PMNeuromod `lambda_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Decay rate** for pm_a after commit: controls how quickly slot strengths decay. Range `[decay_pm, 1.0]` via sigmoid | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Sets forgetting speed; learned per-stream |
-| PMNeuromod `g_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Commit strength** (alpha blending factor): how strongly new eligibility overwrites existing slots | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Controls plasticity-stability tradeoff |
-| PMNeuromod `slot_head` | `layer.pm_neuromodulator` | `Linear(H, r=8)` | **Slot selection bias**: additive logits for soft top-k slot choice — shifts which slots get overwritten | Backprop (main B–C; RL opt D+) | B+ | Boundary-only | Learns slot allocation strategy |
-| PMNeuromod `gate_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Commit gate** (p_commit): binary decision whether to commit at all. `(p_commit > 0.5).detach()` → non-differentiable | RL only (BCE on p_commit) | D+ | Boundary-only | Learns when to consolidate new knowledge vs skip |
+| PMNeuromod `backbone` | `layer.pm_neuromodulator` | `Linear(3, H=32)` + ReLU | Shared representation for all PM neuromod heads | Backprop (main opt) | B+ | Boundary-only (once per P tokens) | Adapts to stream-specific surprise/usage patterns |
+| PMNeuromod `lambda_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Decay rate** for pm_a after commit: controls how quickly slot strengths decay. Range `[decay_pm, 1.0]` via sigmoid | Backprop (main opt) | B+ | Boundary-only | Sets forgetting speed; learned per-stream |
+| PMNeuromod `g_head` | `layer.pm_neuromodulator` | `Linear(H, 1)` | **Commit strength** (alpha blending factor): how strongly new eligibility overwrites existing slots | Backprop (main opt) | B+ | Boundary-only | Controls plasticity-stability tradeoff |
+| PMNeuromod `slot_head` | `layer.pm_neuromodulator` | `Linear(H, r=8)` | **Slot selection bias**: additive logits for soft top-k slot choice — shifts which slots get overwritten | Backprop (main opt) | B+ | Boundary-only | Learns slot allocation strategy |
 
 #### Runtime State (not nn.Parameter — updated by rules at boundaries)
 
 | State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
 |-------|-------|----------------|-------------|--------------|-------------------|
-| `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `soft_topk_weights * g * commit_mask` | Span boundary (commit) | Persists in Phase E; accumulates cross-doc knowledge |
-| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase E |
-| `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase E; base_decay prevents runaway |
-| `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase E: reset_eligibility) |
+| `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `soft_topk_weights * g * commit_mask` | Span boundary (commit) | Persists in Phase D; accumulates cross-doc knowledge |
+| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase D |
+| `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase D; base_decay prevents runaway |
+| `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase D: reset_eligibility) |
 | `elig_V` | `[BS, r, D_h]` | Value eligibility trace | Same as elig_K with v_cand | Every token | Reset on doc boundary |
-| `h` | `[BS, D_h]` | Layer hidden state | Affine recurrence: `h = a*h + b` from gates | Every token | Reset on doc boundary (even Phase E) |
+| `h` | `[BS, D_h]` | Layer hidden state | Affine recurrence: `h = a*h + b` from gates | Every token | Reset on doc boundary (even Phase D) |
 
 #### Control Signals (computed, not stored — ephemeral per boundary)
 
 | Signal | Source | What It Decides | Differentiable? |
 |--------|--------|-----------------|-----------------|
-| `commit_mask` | PMNeuromod | Whether to commit at all (Phase A–C: heuristic `elig_norm > 1.0`; Phase D: `p_commit > 0.5`) | No (detached bool) |
+| `commit_mask` | PMNeuromod | Whether to commit at all (heuristic `elig_norm > 1.0` in all phases) | No (detached bool) |
 | `lambda_vals` | PMNeuromod | Per-stream decay rate for pm_a post-commit | Yes (Phase B+) |
 | `g` | PMNeuromod | Per-stream commit strength (alpha multiplier) | Yes (Phase B+) |
 | `slot_logits` | PMNeuromod | Additive bias on slot scores for soft top-k | Yes (Phase B+) |
@@ -504,7 +493,7 @@ novelty = clamp(0.5 * surprise + 0.5 * (1 - max_sim), 0, 1)
 
 **Intuition:** A candidate is "novel" if it's both surprising (model predicted poorly) and dissimilar from existing EM entries (not a duplicate). The projections `W_k_cand` and `W_v_cand` are `nn.Linear` layers trained by backprop -- the model learns *what* to propose as memory candidates.
 
-**Learned novelty weighting (Phase C+):** When `em_enabled=True`, `EpisodicMemory` creates `W_nov: nn.Linear(D + D, 1)` -- a per-token projection that replaces the hardcoded 0.5/0.5 weighting:
+**Learned novelty weighting (Phase B+):** When `em_enabled=True`, `EpisodicMemory` creates `W_nov: nn.Linear(D + D, 1)` -- a per-token projection that replaces the hardcoded 0.5/0.5 weighting:
 
 ```python
 w_nov = sigmoid(W_nov(concat(x, y_wm)))      # [BS, 1] -- learned weight
@@ -522,25 +511,19 @@ Candidates are **buffered for the entire span** (P=32 tokens), producing:
 
 At the span boundary, candidates are selected and written:
 
-1. **Neuromodulator decision:** `EMNeuromodulator.forward(span_surprise, em_usage, cand_novelty_mean)` returns a 4-tuple `(write_mask, g_em, tau, ww)`.
+1. **Neuromodulator decision:** `EMNeuromodulator.forward(span_surprise, em_usage, cand_novelty_mean)` returns a 4-tuple `(g_em, tau, ww, decay)`.
 
-   In heuristic mode (Phases A–B — `em_enabled=False`):
-   - `write_mask: [BS]` -- write if `cand_novelty_mean > 0.3`
-   - `g_em: [BS]` -- fixed 0.3
+   In heuristic mode (Phase A — `em_enabled=False`):
+   - `g_em: [BS]` -- fixed `config.g_em_default` (0.3)
    - `tau: [BS]` -- fixed `config.tau_em` (default 1.0)
    - `ww: [BS]` -- fixed `config.weakness_weight_em` (default 0.5)
+   - `decay: [BS]` -- fixed `config.decay_em` (default 0.999)
 
-   In continuous-learned mode (Phase C — `em_enabled=True`, `rl_enabled=False`):
-   - `write_mask: [BS]` -- heuristic gate: `cand_novelty_mean > 0.3`
+   In learned mode (Phase B+ — `em_enabled=True`):
    - `g_em: [BS]` -- in `[g_em_floor, g_em_ceil]` (default [0.001, 0.95]) via `floor + (ceil - floor) * sigmoid(raw)` (differentiable, main optimizer; near-zero floor enables soft "don't write")
    - `tau: [BS]` -- in `[tau_em_floor, tau_em_ceil]` (default [0.05, 5.0]) via same sigmoid+clamp pattern. Controls soft top-k sharpness for slot selection.
    - `ww: [BS]` -- in `[ww_em_floor, ww_em_ceil]` (default [0.0, 2.0]) via same pattern. Controls preference for overwriting weak slots.
-
-   In fully-learned mode (Phase D+ — `em_enabled=True`, `rl_enabled=True`):
-   - `write_mask: [BS]` -- always True (every stream always writes)
-   - `g_em: [BS]` -- in `[g_em_floor, g_em_ceil]` via same formula (differentiable, dual-trained: main loss backprop + RL counterfactual)
-   - `tau: [BS]` -- in `[tau_em_floor, tau_em_ceil]` (dual-trained like g_em)
-   - `ww: [BS]` -- in `[ww_em_floor, ww_em_ceil]` (dual-trained like g_em)
+   - `decay: [BS]` -- in `[decay_em_floor, decay_em_ceil]` (default [0.99, 0.9999]) via same pattern. Controls per-stream memory retention timescale.
 
 2. **For each candidate c** in the span (with `cand_valid` masking):
    - Score candidate key against all M existing slots (similarity + weakness bias)
@@ -548,7 +531,7 @@ At the span boundary, candidates are selected and written:
    - EMA blend: `em_K = normalize((1-alpha)*em_K + alpha*k_c)`, same for `em_V`
    - Strength update: `em_S += alpha * score`
 
-3. **Decay + budget:** `em_S *= decay_em`, then scale to enforce `sum(em_S) <= budget_em`.
+3. **Decay + budget:** `em_S *= decay` (per-stream learned decay), then scale to enforce `sum(em_S) <= budget_em`.
 
 **Candidate validity:** The trainer tracks `cand_valid: [BS, P]` which masks out candidates from before a mid-span doc-boundary reset and from EOT positions. This prevents writing stale cross-document content.
 
@@ -558,11 +541,11 @@ At the span boundary, candidates are selected and written:
 
 **Why?** Zeroing strengths makes all slots invisible to retrieval (the `em_S > 0` mask filters them out) without destroying the actual key-value content. When new writes occur, they can reuse these slots via the weakness-biased slot selection (slots with `em_S=0` are preferred targets). This is more graceful than re-randomizing keys, which would destroy any useful patterns in the key space.
 
-In Phase E (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
+In Phase D (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
 
 ### 8.6 EM: Complete Learnable Components Reference
 
-This table covers **every learnable weight, runtime state, and control signal** that EM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "RL" means updated via counterfactual rollout (weighted MSE). "Rules" means updated by explicit code (EMA, decay, budget enforcement).
+This table covers **every learnable weight, runtime state, and control signal** that EM uses or produces. "Backprop" means gradients from `total_loss.backward()` reach the parameter. "Rules" means updated by explicit code (EMA, decay, budget enforcement).
 
 #### Learned Parameters (nn.Parameter, saved in state_dict)
 
@@ -575,31 +558,32 @@ This table covers **every learnable weight, runtime state, and control signal** 
 | `readout_ffn` | `EM.readout_ffn` | `Linear(D_em, 4*D_em)` + `Linear(4*D_em, D_em)` | Nonlinear transform of retrieved EM content before projection to model dim | Backprop (main opt) | C+ | Per-token | Static after convergence |
 | `W_k_cand` | `EM.W_k_cand` | `Linear(D+D, D_em)` | Projects `concat(x_emb, y_wm)` into **candidate keys** — decides *what patterns to store* | Backprop (main opt) | C+ | Per-token in `propose_candidate_batch` | Learns general pattern encoding |
 | `W_v_cand` | `EM.W_v_cand` | `Linear(D_h, D_em)` | Projects final layer hidden state into **candidate values** — decides *what content to store* | Backprop (main opt) | C+ | Per-token in `propose_candidate_batch` | Learns general value encoding |
-| `W_nov` | `EM.W_nov` | `Linear(D+D, 1)` | **Learned novelty weighting** — per-token blend of surprise vs dissimilarity for scoring candidate importance. Replaces hardcoded 0.5/0.5 | Backprop (main opt only, never RL) | C+ | Per-token in `propose_candidate_batch` | Adapts novelty sensing to domain |
-| EMNeuromod `backbone` | `block.em_neuromodulator` | `Linear(3, H=32)` + ReLU | Shared representation for all EM neuromod heads. Inputs: span_surprise, em_usage, cand_novelty_mean | Backprop (main C; RL opt D+) | C+ | Boundary-only (once per P tokens) | Adapts write decisions to stream context |
-| EMNeuromod `g_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Write strength** (g_em): how strongly new candidates overwrite existing slots. Range `[0.001, 0.95]` via `floor + range * sigmoid(raw)` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Controls plasticity-stability tradeoff for episodic memory |
-| EMNeuromod `tau_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Slot selection temperature** (tau): controls `soft_topk` sharpness. Low tau → sharper selection (few slots updated strongly). Range `[0.05, 5.0]` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Learns whether to concentrate or spread writes |
-| EMNeuromod `ww_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Weakness weight** (ww): how much to prefer overwriting weak slots vs similar slots. Range `[0.0, 2.0]` | Backprop (main C; RL opt D+) + RL weighted MSE (D+) | C+ | Boundary-only | Learns slot replacement strategy |
+| `W_nov` | `EM.W_nov` | `Linear(D+D, 1)` | **Learned novelty weighting** — per-token blend of surprise vs dissimilarity for scoring candidate importance. Replaces hardcoded 0.5/0.5 | Backprop (main opt) | B+ | Per-token in `propose_candidate_batch` | Adapts novelty sensing to domain |
+| EMNeuromod `backbone` | `block.em_neuromodulator` | `Linear(3+content_proj_dim, H=32)` + ReLU | Shared representation for all EM neuromod heads. Inputs: span_surprise, em_usage, cand_novelty_mean + content embedding | Backprop (main opt) | B+ | Boundary-only (once per P tokens) | Adapts write decisions to stream context |
+| EMNeuromod `g_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Write strength** (g_em): how strongly new candidates overwrite existing slots. Range `[0.001, 0.95]` via `floor + range * sigmoid(raw)` | Backprop (main opt) | B+ | Boundary-only | Controls plasticity-stability tradeoff for episodic memory |
+| EMNeuromod `tau_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Slot selection temperature** (tau): controls `soft_topk` sharpness. Low tau → sharper selection (few slots updated strongly). Range `[0.05, 5.0]` | Backprop (main opt) | B+ | Boundary-only | Learns whether to concentrate or spread writes |
+| EMNeuromod `ww_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Weakness weight** (ww): how much to prefer overwriting weak slots vs similar slots. Range `[0.0, 2.0]` | Backprop (main opt) | B+ | Boundary-only | Learns slot replacement strategy |
+| EMNeuromod `decay_head` | `block.em_neuromodulator` | `Linear(H, 1)` | **Decay rate** (decay): per-stream memory retention timescale. Range `[0.99, 0.9999]` | Backprop (main opt) | B+ | Boundary-only | Learns forgetting speed per stream |
 
 #### Runtime State (not nn.Parameter — updated by rules at boundaries)
 
 | State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
 |-------|-------|----------------|-------------|--------------|-------------------|
-| `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `soft_topk_weights * g_em * write_mask` | Span boundary (per candidate in span) | Persists in Phase E; K/V content survives doc reset |
-| `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase E |
-| `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay_em`, then budget_enforce | Span boundary | Persists in Phase E; base_decay prevents runaway. In Phases A–D: zeroed on doc boundary (makes slots invisible but preserves K/V) |
+| `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `soft_topk_weights * g_em` | Span boundary (per candidate in span) | Persists in Phase D; K/V content survives doc reset |
+| `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase D |
+| `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay` (per-stream learned), then budget_enforce | Span boundary | Persists in Phase D (lifelong); learned decay controls retention. In Phases A–B: zeroed on doc boundary (makes slots invisible but preserves K/V) |
 
 #### Control Signals (computed, not stored — ephemeral per boundary)
 
 | Signal | Source | What It Decides | Differentiable? |
 |--------|--------|-----------------|-----------------|
-| `write_mask` | EMNeuromod | Whether to write at all (Phase A–C: heuristic `novelty > 0.3`; Phase D: always True) | No (bool) |
-| `g_em` | EMNeuromod | Per-stream write strength (alpha multiplier). Near-zero floor enables soft "don't write" | Yes (Phase C+) |
-| `tau` | EMNeuromod | Per-stream soft_topk temperature — sharpness of slot selection | Yes (Phase C+); batched `[BS]` tensor |
-| `ww` (weakness_weight) | EMNeuromod | Per-stream bias toward overwriting weak slots (low em_S) | Yes (Phase C+); batched `[BS]` tensor |
+| `g_em` | EMNeuromod | Per-stream write strength (alpha multiplier). Near-zero floor enables soft "don't write" | Yes (Phase B+) |
+| `tau` | EMNeuromod | Per-stream soft_topk temperature — sharpness of slot selection | Yes (Phase B+); batched `[BS]` tensor |
+| `ww` (weakness_weight) | EMNeuromod | Per-stream bias toward overwriting weak slots (low em_S) | Yes (Phase B+); batched `[BS]` tensor |
+| `decay` | EMNeuromod | Per-stream memory retention decay rate | Yes (Phase B+); batched `[BS]` tensor |
 | `soft_topk weights` | `soft_topk(scores, k=k_write, tau)` | Which slots to overwrite (continuous [0,1] weights over top-k within top-C) | Yes |
-| `alpha` | `weights * g_em * write_mask` | Final per-slot blending factor (one per candidate per slot) | Partially (write_mask is detached) |
-| `cand_score` (novelty) | `propose_candidate_batch` | Per-token novelty score: blend of surprise + dissimilarity from existing keys | Yes (through W_nov, Phase C+) |
+| `alpha` | `weights * g_em` | Final per-slot blending factor (one per candidate per slot) | Yes |
+| `cand_score` (novelty) | `propose_candidate_batch` | Per-token novelty score: blend of surprise + dissimilarity from existing keys | Yes (through W_nov, Phase B+) |
 | `cand_valid` | Trainer | Mask for candidates within current doc and non-EOT | No (computed from token IDs) |
 
 ---
@@ -630,32 +614,25 @@ for layer in self.layers:
 return x   # [BS, D_h]
 ```
 
-**Block.commit_pm(force_mode, span_surprise) at span boundary:**
+**Block.commit_pm(span_surprise) at span boundary:**
 ```python
-def commit_pm(self, force_mode="normal", span_surprise=None):
-    if force_mode == "force_off": return {}
+def commit_pm(self, span_surprise=None):
     for layer in self.layers:
-        if force_mode == "force_on":
-            # Commit all streams with fixed defaults (g=0.5, lambda=decay)
-            pm.commit(all_true_mask, default_lambda, default_g, None)
-        else:
-            # Neuromodulator decides
-            surprise_input = span_surprise if span_surprise is not None else elig_norm
-            mask, lam, g, slots, _p = layer.pm_neuromodulator(
-                elig_norm, pm_usage / config.budget_pm, surprise_input
-            )
-            pm.commit(mask, lam, g, slots)
+        # Neuromodulator decides
+        surprise_input = span_surprise if span_surprise is not None else elig_norm
+        mask, lam, g, slots, _p = layer.pm_neuromodulator(
+            elig_norm, pm_usage / config.budget_pm, surprise_input
+        )
+        pm.commit(mask, lam, g, slots)
 ```
 
-The `force_mode` parameter exists for Phase D RL counterfactual rollouts: `"force_on"` commits unconditionally with fixed defaults, `"force_off"` skips all commits. The `span_surprise` parameter receives the actual per-stream mean surprise over the span, computed in the trainer.
-
-**Why `force_on` uses fixed defaults:** The counterfactual tests the binary question "did committing help or not?" -- it is not trying to evaluate the continuous parameters (lambda, g, slots). Using fixed defaults isolates the gate decision from continuous-output quality.
+The `span_surprise` parameter receives the actual per-stream mean surprise over the span, computed in the trainer. If not available (e.g., standalone evaluation), the neuromodulator falls back to using `elig_norm` as a proxy.
 
 ### 9.1 Block State Reset (Lifelong Mode)
 
 `Block.reset_states(mask)` branches on `config.lifelong_mode`:
 
-**Phases A-D (lifelong_mode=False):**
+**Phases A-B (lifelong_mode=False):**
 ```python
 for layer in self.layers:
     layer.reset_states(mask)     # zeros h
@@ -663,7 +640,7 @@ for layer in self.layers:
 self.em.reset_states(mask)       # zeros em_S
 ```
 
-**Phase E (lifelong_mode=True):**
+**Phase D (lifelong_mode=True):**
 ```python
 for layer in self.layers:
     layer.reset_states(mask)         # zeros h (always)
@@ -671,13 +648,13 @@ for layer in self.layers:
 # EM fully persists -- no reset call
 ```
 
-This is the core of the soft reset: transient state (h, eligibility) resets at doc boundaries, but committed PM weights and EM content persist across documents. Natural memory turnover is handled by existing decay (0.999/span) and budget enforcement.
+This is the core of the soft reset: transient state (h, eligibility) resets at doc boundaries, but committed PM weights and EM content persist across documents. Natural memory turnover is handled by existing decay and budget enforcement.
 
 ---
 
 ## 10. Neuromodulators
 
-Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=32 tokens. Each neuromodulator is an `nn.Module` that operates in one of three modes depending on whether its memory system is enabled and whether RL is active.
+Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=32 tokens. Each neuromodulator is an `nn.Module` that operates in one of two modes depending on whether its memory system is enabled: heuristic (zero params) or learned (backbone + heads, trained via main loss backprop).
 
 ### 10.1 PMNeuromodulator
 
@@ -695,25 +672,20 @@ Neuromodulators decide **when** and **how strongly** to write to memory. They op
 
 **Outputs (5-tuple):**
 
-| Output | Shape | Heuristic (Phase A) | Continuous-Learned (Phases B–C) | Fully-Learned (Phase D+) | Training |
-|--------|-------|--------------------|---------------------------------|--------------------------|----------|
-| `commit_mask` | `[BS]` | `elig_norm > 1.0` | `elig_norm > 1.0` (same heuristic) | `(p_commit > 0.5).detach()` | -- |
-| `lambda_vals` | `[BS]` | `config.decay_pm` | sigmoid, scaled to `[decay_pm, 1.0]` | same | Main loss backprop |
-| `g` | `[BS]` | `0.5` | sigmoid | same | Main loss backprop |
-| `slot_logits` | `[BS, r]` | `None` | raw linear | same | Main loss backprop |
-| `p_commit` | `[BS]` | `None` | `None` | sigmoid | RL (counterfactual) |
+| Output | Shape | Heuristic (Phase A) | Learned (Phase B+) | Training |
+|--------|-------|--------------------|---------------------------------|----------|
+| `commit_mask` | `[BS]` | `elig_norm > 1.0` | `elig_norm > 1.0` (same heuristic) | -- |
+| `lambda_vals` | `[BS]` | `config.decay_pm` | sigmoid, scaled to `[decay_pm, 1.0]` | Main loss backprop |
+| `g` | `[BS]` | `0.5` | sigmoid | Main loss backprop |
+| `slot_logits` | `[BS, r]` | `None` | raw linear | Main loss backprop |
+| `p_commit` | `[BS]` | `None` | `None` | -- (reserved) |
 
 **Backbone + continuous heads** (created when `pm_enabled=True`, i.e. Phase B+):
 ```
 3 inputs → Linear(3, H) → ReLU → {lambda_head, g_head, slot_head}
 ```
 
-**Gate head** (added only when `rl_enabled=True`, i.e. Phase D+):
-```
-backbone → gate_head
-```
-
-Hidden size H = `config.rl_controller_hidden` (default 32). Without gate: ~458 params per instance. With gate: ~491 params per instance, ~15,700 total across 32 instances.
+Hidden size H = `config.rl_controller_hidden` (default 32). ~458 params per instance, ~14,600 total across 32 instances.
 
 ### 10.2 EMNeuromodulator
 
@@ -731,170 +703,68 @@ Hidden size H = `config.rl_controller_hidden` (default 32). Without gate: ~458 p
 
 **Outputs (4-tuple):**
 
-| Output | Shape | Heuristic (Phases A–B) | Continuous-Learned (Phase C) | Fully-Learned (Phase D+) | Training |
-|--------|-------|----------------------|------------------------------|--------------------------|----------|
-| `write_mask` | `[BS]` | `novelty > 0.3` | `novelty > 0.3` (same heuristic) | always True | -- |
-| `g_em` | `[BS]` | `0.3` | `floor + (ceil - floor) * sigmoid(raw)`, in [0.001, 0.95] | same formula, dual-trained | Main loss backprop (Phase C); + RL weighted MSE (Phase D+) |
-| `tau` | `[BS]` | `config.tau_em` (1.0) | `tau_floor + (tau_ceil - tau_floor) * sigmoid(raw)`, in [0.05, 5.0] | same formula, dual-trained | Main loss backprop (Phase C); + RL weighted MSE (Phase D+) |
-| `ww` | `[BS]` | `config.weakness_weight_em` (0.5) | `ww_floor + (ww_ceil - ww_floor) * sigmoid(raw)`, in [0.0, 2.0] | same formula, dual-trained | Main loss backprop (Phase C); + RL weighted MSE (Phase D+) |
+| Output | Shape | Heuristic (Phase A) | Learned (Phase B+) | Training |
+|--------|-------|----------------------|------------------------------|----------|
+| `g_em` | `[BS]` | `config.g_em_default` (0.3) | `floor + (ceil - floor) * sigmoid(raw)`, in [g_em_floor, g_em_ceil] | Main loss backprop |
+| `tau` | `[BS]` | `config.tau_em` (1.0) | `tau_floor + (tau_ceil - tau_floor) * sigmoid(raw)`, in [0.05, 5.0] | Main loss backprop |
+| `ww` | `[BS]` | `config.weakness_weight_em` (0.5) | `ww_floor + (ww_ceil - ww_floor) * sigmoid(raw)`, in [0.0, 2.0] | Main loss backprop |
+| `decay` | `[BS]` | `config.decay_em` (0.999) | `floor + (ceil - floor) * sigmoid(raw)`, in [0.99, 0.9999] | Main loss backprop |
 
-**Backbone + heads** (created when `em_enabled=True`, i.e. Phase C+):
+**Backbone + heads** (created when `em_enabled=True`, i.e. Phase B+):
 ```
-3 inputs → Linear(3, H) → ReLU → g_head
-                                → tau_head
-                                → ww_head
+3 + content_proj_dim inputs → Linear(in, H) → ReLU → g_head
+                                                     → tau_head
+                                                     → ww_head
+                                                     → decay_head
 ```
-No `gate_head` -- fully-learned mode (Phase D+) always writes. The binary write gate was removed because writing is almost always beneficial when candidates have high novelty; the gate rarely learned to say "no." In continuous-learned mode (Phase C), the heuristic gate (`novelty > 0.3`) is preserved alongside the learned `g_em`. In Phase D, the RL signal additionally trains `g_em`, `tau`, and `ww` via counterfactual rollouts.
+No `write_mask` or `gate_head` — writes always occur. The near-zero `g_em_floor` enables a soft "don't write" — the model can drive g_em close to zero for low-novelty spans, resulting in negligible alpha without requiring a binary gate.
 
-**g_em safety rails:** `g_em = g_em_floor + (g_em_ceil - g_em_floor) * sigmoid(raw)` with defaults `g_em_floor=0.001`, `g_em_ceil=0.95`. The near-zero floor enables a soft "don't write" — the model can drive g_em close to zero for low-novelty spans, resulting in negligible alpha without requiring a binary gate. Ceiling prevents sigmoid saturation (leaves gradient room for weighted-MSE RL regression and backprop).
+**g_em safety rails:** `g_em = g_em_floor + (g_em_ceil - g_em_floor) * sigmoid(raw)` with defaults `g_em_floor=0.001`, `g_em_ceil=0.95`. Ceiling prevents sigmoid saturation (leaves gradient room).
 
-**tau/ww safety rails:** Same `floor + (ceil - floor) * sigmoid(raw)` pattern. `tau` in [0.05, 5.0] controls soft top-k temperature — low tau makes slot selection sharper, high tau spreads writes more evenly. `ww` (weakness weight) in [0.0, 2.0] controls how strongly the model prefers overwriting weak slots. Both are per-stream `[BS]` tensors, enabling `soft_topk` to use batched temperature.
+**tau/ww/decay safety rails:** Same `floor + (ceil - floor) * sigmoid(raw)` pattern. `tau` in [0.05, 5.0] controls soft top-k temperature — low tau makes slot selection sharper, high tau spreads writes more evenly. `ww` (weakness weight) in [0.0, 2.0] controls how strongly the model prefers overwriting weak slots. `decay` in [0.99, 0.9999] controls per-stream memory retention timescale — low decay forgets quickly (~2.2K token half-life), high decay retains nearly permanently (~220K token half-life). All are per-stream `[BS]` tensors.
 
-~161 params per instance, ~644 total across 4 instances.
+All heads use **calibrated bias init**: `bias = log(frac / (1 - frac))` where `frac = (default - floor) / (ceil - floor)`. This ensures zero input produces the config default, so the learned mode starts at the same operating point as the heuristic mode.
 
 ### 10.3 Neuromodulator Parameter Handling
 
 Since neuromodulators are `nn.Module` submodules of `Layer` and `Block` (which are in the model's `ModuleList`), their parameters are automatically included in `model.state_dict()` and `model.named_parameters()`. This means they are saved/loaded in checkpoints automatically.
 
-The model provides `rl_parameters()` to yield only neuromodulator params (by filtering on `"neuromodulator" in name`). **Optimizer assignment depends on the phase:**
+**All neuromodulator params are on the main optimizer in all phases.** There is no separate RL optimizer.
 
-- **Phases B–C** (`rl_enabled=False`): `rl_param_ids` is empty, so neuromodulator params are NOT excluded from the main optimizer. The backbone + continuous heads are trained via main loss backprop alongside all other model params. No RL optimizer is created.
-- **Phase D+** (`rl_enabled=True`): `rl_param_ids` is populated from `rl_parameters()`, so neuromodulator params ARE excluded from the main optimizer and assigned to a separate RL optimizer (Adam, `config.rl_lr`). They are also excluded from gradient clipping so continuous-head grads survive for combination with RL gradients.
+In all phases where neuromodulators exist (B+), the backbone and all heads are trained via main loss backprop alongside all other model params on the single main optimizer.
 
 ---
 
-## 11. Phase D -- Hybrid RL + Backprop Training
+## 11. Neuromodulator Training (All Phases)
 
-Neuromodulator backbones and continuous heads are created starting in Phases B/C (when their memory systems are enabled) and trained via main loss backprop. Phase D adds the RL-specific components on top:
+All neuromodulator parameters are trained via main loss backprop on the main optimizer. There is no separate RL optimizer or counterfactual rollout system.
 
-- **PM gate output** (`p_commit`): Binary decision that cannot be differentiated through (commit_mask is detached). Created only in Phase D. Trained via **RL counterfactual rollouts**.
-- **PM continuous outputs** (`lambda`, `g`, `slot_logits`): Created in Phase B. Flow through PM commit operations into future predictions. Trained via **main loss backprop**. In Phase D, they move from the main optimizer to the RL optimizer, where both main-loss backprop and RL gradients accumulate.
-- **EM write parameters** (`g_em`, `tau`, `ww`): Created in Phase C with heuristic gate. In Phase D, always writes (no binary gate). All three are **dual-trained**: main loss backprop (through write -> retrieve -> loss) + RL counterfactual (weighted MSE regressing each value toward whichever setting — chosen or baseline — performed better). `g_em` controls write strength, `tau` controls soft top-k slot selection temperature, `ww` controls weakness-weight bias toward overwriting weak slots.
-- **Learned novelty** (`W_nov`): Per-token projection on `EpisodicMemory`. Created in Phase C. Trained via **main loss backprop only** (main optimizer, not RL optimizer — stays on main optimizer even in Phase D).
+- **PM continuous outputs** (`lambda`, `g`, `slot_logits`): Created in Phase B (when `pm_enabled=True`). Flow through PM commit operations into future predictions. Trained via **main loss backprop**.
+- **PM commit gate** (`commit_mask`): Heuristic (`elig_norm > 1.0`) in all phases. The `p_commit` output is reserved but unused.
+- **EM write parameters** (`g_em`, `tau`, `ww`, `decay`): Created in Phase B (when `em_enabled=True`). All four are trained via **main loss backprop** (through write → retrieve → loss). `g_em` controls write strength, `tau` controls soft top-k slot selection temperature, `ww` controls weakness-weight bias toward overwriting weak slots, `decay` controls per-stream memory retention timescale.
+- **Learned novelty** (`W_nov`): Per-token projection on `EpisodicMemory`. Created in Phase B. Trained via **main loss backprop**.
 
-In Phase D, both main-loss and RL gradient sources accumulate on neuromodulator parameters before a single RL optimizer step.
+### 11.1 Gradient Flow Through Memory Operations
 
-### 11.1 Why Not Backprop for Gates?
+PM commits and EM writes update plain tensors (`pm_K`, `pm_V`, `pm_a`, `em_K`, `em_V`, `em_S`). The continuous outputs (`g`, `lambda`, `slot_logits` for PM; `g_em`, `tau`, `ww`, `decay` for EM) flow through the EMA update math (which is differentiable), so backprop reaches them. PM's `commit_mask` is a hard boolean (`elig_norm > 1.0`) which breaks the gradient — but the continuous outputs that control *how* commits happen (strength, decay, slot selection) still learn via backprop.
 
-PM commits and EM writes update plain tensors (`pm_K`, `pm_V`, `pm_a`, `em_K`, `em_V`, `em_S`). The continuous outputs (`g`, `lambda`, `slot_logits`, `g_em`, `tau`, `ww`) flow through the EMA update math (which is differentiable), so backprop reaches them. But PM's `commit_mask` is a hard boolean -- you either commit or you don't. This binary gate is the `(p_commit > 0.5).detach()` call, which explicitly breaks the gradient. We need RL to train it.
+**EM has no binary gate.** Instead of deciding "write or not," it decides "how strongly to write" via `g_em`, "how to write" via `tau` (temperature) and `ww` (weakness weight), and "how fast to forget" via `decay`. All four are continuous outputs clamped to their respective `[floor, ceil]` ranges, fully differentiable through the write operations.
 
-**Note on EM:** The EM neuromodulator no longer has a binary gate. Instead of deciding "write or not," it decides "how strongly to write" via `g_em`, and "how to write" via `tau` (soft top-k temperature) and `ww` (weakness weight). All three are continuous outputs clamped to their respective `[floor, ceil]` ranges. In Phase D+, all three are trained via deconfounded RL counterfactual rollouts comparing the neuromod's chosen values against fixed baseline defaults, using weighted MSE to regress toward the better-performing settings.
-
-### 11.2 Why Not REINFORCE?
-
-REINFORCE would sample commit/write decisions, observe the resulting loss, and use `loss * log_prob` as the gradient. Problems:
-- High variance: a single loss observation is noisy
-- Credit assignment: which of the 32 PM instances and 4 EM instances caused the loss change?
-- Baseline estimation: requires careful EMA baseline tuning
-
-### 11.3 GRPO-Style Counterfactual Rollouts
-
-Instead, we directly measure the causal effect of committing by comparing two futures:
-
-**At selected span boundaries** (`config.rl_events_per_chunk=2` of the 8 boundaries per chunk, evenly spaced):
-
-1. **Snapshot state** BEFORE PM commit + EM write (via `save_runtime_state()` + deepcopy). The snapshot also captures EM candidate buffers, eligibility norms, PM usages, EM novelties, and span surprise -- everything needed to re-run the neuromodulators during the update step.
-
-2. **PM counterfactual — deconfounded per-target** (if PM enabled):
-   - Select the top `rl_pm_targets_per_event` (default 1) PM controllers ranked by eligibility norm (`_select_pm_targets`).
-   - **For each target `(b_idx, l_idx)`:**
-     - **Rollout A (force_off):** Restore snapshot, force the target controller off (skip commit), all other controllers run normally. Run P=32 tokens forward. Measure per-stream loss.
-     - **Rollout B (force_on):** Restore snapshot, force the target controller on (commit with fixed defaults g=0.5, lambda=decay), all other controllers run normally. Run P=32 tokens forward. Measure per-stream loss.
-     - **Reward** = `loss_off - loss_on` (positive means committing helped)
-     - Update **only the target controller** with this deconfounded reward.
-
-3. **EM counterfactual — deconfounded per-target** (if EM enabled):
-   - Select the top `rl_em_targets_per_event` (default 1) EM controllers ranked by candidate novelty (`_select_em_targets`).
-   - Both arms always write (no more force_off). The counterfactual compares write *strength* and *hyperparameters*.
-   - **For each target `b_idx`:**
-     - **Rollout A (baseline):** Restore snapshot, write at fixed defaults (`g_em=0.3`, `tau=config.tau_em`, `ww=config.weakness_weight_em`) for the target block, all other blocks run normally. Run a single `forward_span` pass over P tokens with frozen surprise. Measure per-stream loss.
-     - **Rollout B (chosen):** Restore snapshot, write at the neuromodulator's outputs (`g_em`, `tau`, `ww` captured in the snapshot) for the target block, all other blocks run normally. Run a single `forward_span` pass. Measure per-stream loss.
-     - **Reward** = `loss_baseline - loss_chosen` (positive means neuromod's settings were better than defaults)
-     - Update **only the target controller** with this deconfounded reward.
-
-4. **Gate/strength update:**
-   - **PM (BCE):** Re-forward neuromodulator to get `p_commit` with grad. `label = (reward > 0).float()`, `weight = |reward| * credit`. `loss = BCE(p_commit, label, weight=weight)`. `loss.backward()`.
-   - **EM (weighted MSE toward better policy — 3 losses):** Re-forward neuromodulator to get `g_em`, `tau`, `ww` with grad. For each output, the target is the empirically better value: `target = chosen` if reward > 0 (neuromod was right), else `baseline` (default was better). All values are normalized to [0,1] via `(val - floor) / (ceil - floor)`. `loss = weighted_mean((norm - target_norm)^2)`, weighted by `|reward| * credit`. The total loss is `loss_g + loss_tau + loss_ww`. `total_loss.backward()`. This regresses each output toward whichever setting performed better.
-
-5. **Restore** final real state and continue training.
-
-### 11.4 Credit Assignment
-
-Each rollout isolates a single controller (deconfounded), so the reward directly reflects that controller's contribution. Within a controller's update, the reward is further weighted by a **credit** term that reflects how active the controller was:
-
-- **PM credit:** `credit = elig_norm / elig_norm.max()` — controllers with larger eligibility traces had more to commit.
-- **EM credit:** `credit = novelty / novelty.max()` — blocks with more novel candidates had more to write.
-
-**Target selection** (`_select_pm_targets`, `_select_em_targets`) picks the top-k most salient controllers per snapshot, controlled by `rl_pm_targets_per_event` and `rl_em_targets_per_event` (both default 1). This bounds rollout cost while focusing RL signal on the controllers with the most potential impact.
-
-### 11.5 Optimizer Separation and Gradient Flow
-
-The training step proceeds as:
+### 11.2 Training Step
 
 ```
 1. Forward all T=256 tokens (normal training)
-   → neuromodulators produce continuous outputs (lambda, g, slot_logits, g_em)
+   → neuromodulators produce continuous outputs (lambda, g, slot_logits, g_em, tau, ww, decay)
    → these flow through commit/write → affect PM/EM state → affect future predictions
 
 2. total_loss.backward()
-   → computes gradient on ALL params, including neuromodulator continuous heads
-   → PM commit_mask was .detach(), so PM gate_head gets zero grad from this step
-   → EM g_em is NOT detached — EM g_head gets continuous grad from this step too
+   → computes gradient on ALL params, including neuromodulator heads
 
-3. clip_grad_norm_(main_params_only)
-   → neuromodulator params EXCLUDED from clipping (their continuous grads preserved)
+3. clip_grad_norm_(all_params)
 
-4. main_optimizer.step()
-   → updates only main model params (neuromodulators excluded)
-
-5. RL rollouts (if this chunk has rollout events)
-   → snapshot was captured BEFORE commit/write during the forward pass
-   → PM: per-target force_on/off rollouts measure deconfounded reward; BCE on p_commit
-   → EM: per-target baseline/chosen rollouts measure deconfounded reward; weighted MSE on g_em, tau, ww
-   → RL backward adds RL grad to existing continuous-head grad on same params
-
-6. rl_optimizer.step()
-   → updates neuromodulator params with COMBINED gradient:
-     PM: continuous grads (lambda, g, slots) + gate grad (BCE on p_commit)
-     EM: continuous grads (g_em, tau, ww via write→retrieve→loss) + RL grad (weighted MSE on g_em, tau, ww)
-   → rl_optimizer.zero_grad()
-
-   OR (if no rollout events this chunk):
-
-6. rl_optimizer.step()
-   → updates neuromodulators with continuous-head grads only
-   → rl_optimizer.zero_grad()
+4. optimizer.step()
+   → updates all model params including neuromodulators
 ```
-
-This ensures continuous heads are always trained (every chunk), while gate heads receive RL signal on chunks that have rollout events.
-
-### 11.6 Rollout Cost
-
-Per rollout event: `2 * rl_pm_targets_per_event + 2 * rl_em_targets_per_event` forward passes (force_off + force_on per PM target, baseline + chosen per EM target), each running P=32 tokens. With defaults (1 PM target, 1 EM target) and 2 events per chunk: `2 * (2 + 2) * 32 = 256` extra forward tokens, ~100% overhead. With higher target counts the cost scales linearly. These are no-gradient forward passes (cheaper than training forward).
-
-### 11.7 RL Metrics
-
-The following metrics are logged to JSONL when RL is active:
-
-| Metric | Description |
-|--------|-------------|
-| `rl_pm_reward_mean` | Mean reward across PM rollouts (positive = committing helped) |
-| `rl_em_reward_mean` | Mean reward across EM rollouts (positive = neuromod's g_em beat baseline) |
-| `rl_pm_gate_loss` | Mean BCE loss for PM gate heads |
-| `rl_em_g_loss` | Mean weighted MSE loss for EM g_em (normalized to [0,1]) |
-| `rl_em_tau_loss` | Mean weighted MSE loss for EM tau (normalized to [0,1]) |
-| `rl_em_ww_loss` | Mean weighted MSE loss for EM ww (normalized to [0,1]) |
-| `rl_pm_commit_rate` | Fraction of streams where `p_commit > 0.5` |
-| `rl_pm_lambda_mean` | Mean learned lambda across all PM instances |
-| `rl_pm_g_mean` | Mean learned g across all PM instances |
-| `rl_em_g_mean` | Mean learned g_em across all EM instances |
-| `rl_em_tau_mean` | Mean learned tau across all EM instances |
-| `rl_em_ww_mean` | Mean learned weakness weight across all EM instances |
-| `rl_events` | Number of rollout events this step |
-| `gnorm_b{b}_l{l}_pm_neuromod` | Per-instance PM neuromodulator grad norm |
-| `gnorm_b{b}_em_neuromod` | Per-block EM neuromodulator grad norm |
-
-Grad norms are captured BEFORE `rl_optimizer.zero_grad()` to ensure they reflect the combined gradient.
 
 ---
 
@@ -1013,13 +883,13 @@ All stateful modules inherit from `StateMixin`, which provides:
 - **`_state_tensor_names`**: Class variable listing runtime state attributes (e.g., `["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]`)
 - **`detach_states()`**: Detaches all state tensors from the computation graph (TBPTT boundary)
 - **`reset_states(mask)`**: Zeros state for masked streams (doc boundary)
-- **`state_dict_runtime()` / `load_state_runtime()`**: Serialize/deserialize for checkpointing and RL rollouts
+- **`state_dict_runtime()` / `load_state_runtime()`**: Serialize/deserialize for checkpointing
 
 **Convention:** Runtime state tensors are plain attributes, NOT `nn.Parameter` or `register_buffer`. They are updated explicitly -- either under `torch.no_grad()` (for PM/EM slot updates) or via differentiable operations (for eligibility, recurrent h).
 
 ### 13.2 State Reset Semantics
 
-**Phases A-D (lifelong_mode=False):**
+**Phases A-B (lifelong_mode=False):**
 
 | Module | What resets on doc boundary | What is preserved |
 |--------|---------------------------|-------------------|
@@ -1029,7 +899,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 | WM | `wm_valid` cleared, `wm_ptr` reset | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
-**Phase E (lifelong_mode=True) -- Soft Reset:**
+**Phase D (lifelong_mode=True) -- Soft Reset:**
 
 | Module | What resets on doc boundary | What persists |
 |--------|---------------------------|---------------|
@@ -1039,26 +909,24 @@ All stateful modules inherit from `StateMixin`, which provides:
 | WM | `wm_valid` cleared, `wm_ptr` reset | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
-The EM override in Phases A-D is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase E, even strengths persist -- natural decay and budget enforcement provide forgetting pressure instead.
+The EM override in Phases A-B is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase D, even strengths persist -- natural decay (per-stream learned) and budget enforcement provide forgetting pressure instead.
 
 ### 13.3 Bulk Operations (state.py)
 
 ```python
 detach_all(model)          # Walk tree, detach all StateMixin states
 reset_all(model, mask)     # Walk tree, reset masked streams
-save_runtime_state(model)  # Serialize all state for checkpointing / RL rollouts
+save_runtime_state(model)  # Serialize all state for checkpointing
 load_runtime_state(model, state)  # Restore saved state
 ```
 
 **Path-based checkpoint keys:** `save_runtime_state()` uses stable module paths as dictionary keys (e.g., `"blocks.0.layers.1.pm"`, `"blocks.2.em"`). These keys are derived from the module tree structure and remain stable across unrelated model changes. `load_runtime_state()` first tries path-based keys, then falls back to legacy index-based keys for backward compatibility.
 
-**Critical for RL:** `save_runtime_state()` returns references to live tensors. For counterfactual rollouts that mutate state, you **must** deepcopy the saved state before loading it. The trainer uses a dedicated `_detached_runtime_state()` helper that clones + detaches all tensors.
-
 ---
 
 ## 14. Training Loop (TBPTT + Spans)
 
-**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops), `src/training/rl_rollout.py` (RL counterfactual rollouts)
+**Files:** `src/training/trainer.py` (orchestration), `src/training/span_ops.py` (shared span-boundary ops)
 
 ### 14.1 Two Time Scales
 
@@ -1090,33 +958,22 @@ For each span (8 spans per chunk):
 
     At span boundary:
         8.  Compute per-stream span_surprise_mean
-        9.  Pre-compute EM candidate stacks + novelty (for snapshot + write)
-       10.  [Phase D] Capture RL snapshot BEFORE commit/write
-       11.  PM base decay (all streams): pm_a *= decay_pm
-       12.  PM commits: neuromodulator decides, pm.commit()
-       13.  EM writes: neuromodulator decides, write_at_boundary()
+        9.  Pre-compute EM candidate stacks + novelty
+       10.  PM base decay (all streams): pm_a *= decay_pm
+       11.  PM commits: neuromodulator decides, pm.commit()
+       12.  EM writes: neuromodulator decides, write_at_boundary()
             filters candidates by validity (post-reset only)
 
 After all spans:
-    14. Finalize loss: avg_loss = chunk_loss / valid_count
-    15. Add regularizers (PM/EM budget penalties)
-    16. optimizer.zero_grad() + rl_optimizer.zero_grad()
-    17. total_loss.backward()
-    18. Clip gradients (main params only; neuromodulator grads excluded)
-    19. main_optimizer.step() + scheduler.step()
-    20. [Phase D] RL rollouts + rl_optimizer.step()
-        OR rl_optimizer.step() (continuous grads only, no rollout events)
-    21. Detach all states (TBPTT boundary)
-    22. Save last token per stream (for checkpoint resume)
+    13. Finalize loss: avg_loss = chunk_loss / valid_count
+    14. Add regularizers (PM/EM budget penalties)
+    15. optimizer.zero_grad()
+    16. total_loss.backward()
+    17. Clip gradients
+    18. optimizer.step() + scheduler.step()
+    19. Detach all states (TBPTT boundary)
+    20. Save last token per stream (for checkpoint resume)
 ```
-
-**Step 10 is critical:** The RL snapshot is captured BEFORE PM commit and EM write. This means the rollout can test different commit/write strategies and measure the downstream effect on the next span's tokens. PM rollouts use force_on/force_off. EM rollouts use baseline (default g_em/tau/ww) vs chosen (neuromod's outputs). The snapshot includes:
-- Full runtime state (deepcopy, detached)
-- EM candidate buffers (detached clones)
-- Per-instance eligibility norms and PM usages
-- Per-block EM novelties and usages
-- Per-block neuromod's chosen g_em, tau, ww (for EM "chosen" arm)
-- Span surprise mean
 
 ### 14.3 Online Loss Accumulation
 
@@ -1136,7 +993,7 @@ When `reset_on_doc_boundary=True` (all phases):
 - Skip loss at positions where `input_tokens[:, t] == eot_id`
 - This avoids training on cross-document transitions (predicting first token of next doc from EOT is meaningless)
 - We still train on predicting EOT within documents
-- Note: `reset_on_doc_boundary` remains True even in Phase E (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
+- Note: `reset_on_doc_boundary` remains True even in Phase D (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
 
 ### 14.5 PM Commit Surprise Signal
 
@@ -1230,29 +1087,25 @@ def compute_regularizers(model):
 
 ## 17. Phased Training Plan
 
-| Phase | Components | rl_enabled | lifelong_mode | Neuromod State | Goal |
-|-------|-----------|------------|---------------|----------------|------|
-| **A** | WM only | False | False | Empty shells (0 params) | Stable streaming, perplexity decreases |
-| **B** | WM + PM | False | False | PM: backbone + continuous heads (main optimizer) | Memory bench improvement, learned commit strength |
-| **C** | WM + PM + EM | False | False | PM + EM: backbone + continuous heads + W_nov (main optimizer) | Explicit recall, learned write strength + novelty |
-| **D** | WM + PM + EM + RL | True | False | PM: + gate_head; EM: always-write + RL on g_em/tau/ww (RL optimizer) | Learned gating, RL counterfactual training |
-| **E** | WM + PM + EM + lifelong | *inherited* | True | Inherited from prior phase | PM/EM persist across doc boundaries |
+| Phase | Components | lifelong_mode | Neuromod State | Goal |
+|-------|-----------|---------------|----------------|------|
+| **A** | WM + PM | False | PM: heuristic (0 params) | Stable streaming, perplexity decreases |
+| **B** | WM + PM + EM | False | PM + EM: backbone + heads + W_nov (main optimizer) | Memory bench improvement, learned commit/write params |
+| **D** | WM + PM + EM + lifelong | True | Same as B (inherited) | PM/EM persist across doc boundaries |
 
 `config.set_phase("X")` toggles the appropriate flags:
 
 ```python
-"A": wm=True,  pm=False, em=False, rl=False,     lifelong=False
-"B": wm=True,  pm=True,  em=False, rl=False,     lifelong=False
-"C": wm=True,  pm=True,  em=True,  rl=False,     lifelong=False
-"D": wm=True,  pm=True,  em=True,  rl=True,      lifelong=False
-"E": wm=True,  pm=True,  em=True,  rl=inherited,  lifelong=True
+"A": wm=True,  pm=True,  em=False, lifelong=False
+"B": wm=True,  pm=True,  em=True,  lifelong=False
+"D": wm=True,  pm=True,  em=True,  lifelong=True
 ```
 
-**Phase E inherits `rl_enabled`:** When transitioning from Phase D to Phase E, `set_phase("E")` does NOT force `rl_enabled` on or off. If the model was trained with Phase D neuromodulators, they remain active in Phase E. This allows lifelong mode to benefit from learned gating rather than falling back to heuristics. If transitioning from Phase C (no RL), Phase E uses heuristic neuromodulators.
+All neuromodulator params are on the main optimizer in all phases. There is no separate RL optimizer.
 
-**Phase transition via checkpoint resume:** `src/train.py` loads model checkpoints with `strict=False`, so new parameters are initialized fresh when they first appear. When transitioning A→B, PM neuromodulator backbone + continuous heads init fresh. B→C adds EM neuromodulator backbone + g_head + W_nov. C→D adds PM gate_head only — all existing backbone/continuous-head weights carry over. D→E preserves everything.
+**Phase transition via checkpoint resume:** `src/train.py` loads model checkpoints with `strict=False`, so new parameters are initialized fresh when they first appear. When transitioning A→B, PM and EM neuromodulator backbones + heads + W_nov init fresh. B→D preserves everything (only `lifelong_mode` flag changes).
 
-**Optimizer state across phase transitions:** When a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled`/`rl_enabled` differ from current config), optimizer state loading is skipped because parameter group sizes change across phases (e.g., neuromod params move from main optimizer to RL optimizer in C→D). Both optimizers reinitialize with fresh Adam state. To mitigate the cold-start effect on the RL optimizer (which receives warm weights but has no momentum/variance history), a linear LR warmup ramps `rl_lr` from 0 to its configured value over `rl_warmup_steps` (default 500) steps. This prevents the effective learning rate spike that would otherwise destabilize well-tuned continuous heads.
+**Optimizer state across phase transitions:** When a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled` differ from current config), optimizer state loading is skipped because parameter group sizes change across phases. The optimizer reinitializes with fresh Adam state.
 
 ---
 
@@ -1351,21 +1204,14 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
     │   loss.backward() reaches        │
     │   g_head, lambda_head,           │
     │   slot_head via alpha            │
-    └───────────╎──────────────────────┘
-                ╎
-          RL optimizer combines:
-          PM: continuous grads + gate grad (BCE on p_commit)
-          EM: continuous grads + RL grad (weighted MSE on g_em, tau, ww)
-          → single rl_optimizer.step()
+    └──────────────────────────────────┘
 
-    Main optimizer (separate):
-    W_nov (on EpisodicMemory) trained via main loss backprop only
+    All parameters on single main optimizer.
+    W_nov, neuromod backbone + heads all trained via main loss backprop.
 ```
 
 **Summary:**
-- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase C+). In Phases B–C, neuromodulator backbone + continuous heads also train here.
-- **Learns via backprop (RL optimizer, continuous heads) — Phase D+ only:** PM neuromodulator `lambda_head`, `g_head`, `slot_head`; EM neuromodulator `g_head`, `tau_head`, `ww_head` -- gradients flow through commit/write operations into future predictions. (In Phases B–C, these same heads are on the main optimizer instead.)
-- **Learns via RL (RL optimizer, gate/strength heads) — Phase D+ only:** PM neuromodulator `gate_head` (trained via counterfactual rollout BCE on p_commit); EM neuromodulator `g_head`, `tau_head`, `ww_head` (trained via counterfactual rollout weighted MSE on normalized values toward the better-performing settings -- baseline vs chosen)
+- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), neuromodulator backbone + all heads (Phase B+). Single optimizer for everything.
 - **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
 - **Not plastic (no memory update mechanism):** WM KV cache (ring buffer of recent token projections; gradients flow through within TBPTT chunks, detached at chunk boundaries)
 
@@ -1373,27 +1219,22 @@ Understanding what learns via backprop, what needs RL, and how the hybrid traini
 
 ## 20. Design Integrity Notes
 
-This section documents the design decisions that were verified during the Phase D bug-fix audit (2026-02-07) and confirms that the core architecture remains intact.
+This section documents verified design decisions and confirms that the core architecture remains intact.
 
 ### 20.1 Verified Invariants
 
-1. **Snapshot timing:** RL snapshots are captured BEFORE PM commit + EM write. This ensures the counterfactual rollout can test different strategies (PM: force_on/force_off; EM: baseline vs chosen g_em/tau/ww) and measure the downstream effect.
+1. **Continuous-head gradient path:** PM: `lambda_vals`, `g`, and `slot_logits` carry gradients through `pm.commit()` because the EMA update (`alpha = weights * g * mask`, `pm_K = (1-alpha)*pm_K + alpha*elig_K`) is composed of differentiable tensor operations. `loss.backward()` reaches these heads through: neuromodulator output -> alpha -> pm_K/pm_V update -> future `pm.apply(x)` -> layer output -> logits -> loss. EM: `g_em`, `tau`, `ww`, and `decay` carry gradients through `write_at_boundary()` via the same mechanism: g_em -> alpha -> em_K/em_V update -> future `EM.retrieve()` -> layer output -> logits -> loss. `tau` and `ww` affect gradient flow through `soft_topk` slot selection weights. `decay` affects gradient flow through em_S strength decay. This gradient path is active starting in Phase B (when learned heads are created).
 
-2. **Rollout structure:** Rollouts apply forced commit/write BEFORE running the next span's tokens. This matches the normal training flow where commit happens at span boundary, then the next span reads from the updated PM/EM.
+2. **Single optimizer:** All parameters (model weights + neuromodulator backbone + heads) are on a single main optimizer with unified gradient clipping. No separate RL optimizer.
 
-3. **Phase E inherits rl_enabled:** `set_phase("E")` does not touch `rl_enabled`. This allows D->E transitions to preserve learned neuromodulators, and C->E transitions to use heuristic neuromodulators.
+3. **Calibrated bias init:** All neuromod heads use `bias = log(frac / (1 - frac))` where `frac = (default - floor) / (ceil - floor)`. Zero input produces the config default, so the learned mode starts at the same operating point as the heuristic mode.
 
-4. **Continuous-head gradient path:** PM: `lambda_vals`, `g`, and `slot_logits` carry gradients through `pm.commit()` because the EMA update (`alpha = weights * g * mask`, `pm_K = (1-alpha)*pm_K + alpha*elig_K`) is composed of differentiable tensor operations. `loss.backward()` reaches these heads through: neuromodulator output -> alpha -> pm_K/pm_V update -> future `pm.apply(x)` -> layer output -> logits -> loss. EM: `g_em`, `tau`, and `ww` carry gradients through `write_at_boundary()` via the same mechanism: g_em -> alpha -> em_K/em_V update -> future `EM.retrieve()` -> layer output -> logits -> loss. `tau` and `ww` affect gradient flow through `soft_topk` slot selection weights. This gradient path is active starting in Phase B/C (when continuous heads are created), not just Phase D.
-
-5. **Gradient isolation (Phase D only):** When `rl_enabled=True`, neuromodulator params are excluded from main gradient clipping (`clip_grad_norm_`) so continuous-head gradients survive for combination with RL gradients (PM gate BCE, EM g_em/tau/ww weighted MSE) in the RL optimizer step. In Phases B–C, neuromodulator params are on the main optimizer and DO participate in gradient clipping — this is intentional, as there is no RL gradient to preserve.
-
-6. **EM novelty in rollouts:** RL snapshots store real candidate novelty (from `propose_candidate()`), not a proxy. This ensures `_update_em_neuromodulators` re-forwards the EMNeuromodulator with the same inputs it saw during the normal forward pass.
+4. **Surprise as neuromodulator input** (not just novelty): Surprise reflects the model's overall prediction quality, which is a useful signal for deciding whether to consolidate learning. Novelty is specific to EM candidates.
 
 ### 20.2 Intentional Design Decisions (Not Bugs)
 
-- **PM `force_on` uses fixed defaults (g=0.5, lambda=decay):** The counterfactual tests the binary "commit vs. skip" question. Using fixed defaults isolates the gate decision.
-- **EM counterfactual uses baseline settings (g_em=0.3, tau=default, ww=default) vs chosen settings:** Both arms always write. The counterfactual tests whether the neuromod's chosen `g_em`, `tau`, and `ww` outperform fixed defaults, teaching the neuromod to deviate from defaults only when beneficial.
-- **4 forward passes per RL event** (PM force_off/on + EM baseline/chosen): PM and EM need independent counterfactuals because their effects are different (PM affects layer computation, EM affects block-level retrieval).
+- **PM commit_mask is heuristic (`elig_norm > 1.0`) in all phases:** The binary gate is not learned; only the continuous outputs (lambda, g, slot_logits) are learned via backprop.
+- **EM decay is per-stream learned (Phase B+):** Each stream learns its own memory retention timescale in `[0.99, 0.9999]`, replacing the previous fixed scalar `config.decay_em`.
 - **Surprise as neuromodulator input** (not just novelty): Surprise reflects the model's overall prediction quality, which is a useful signal for deciding whether to consolidate learning. Novelty is specific to EM candidates.
 
 ---
@@ -1409,7 +1250,6 @@ Our model uses **affine recurrence** (not attention) as the core sequence mechan
 - **No quadratic attention cost:** Compute scales linearly with sequence length (within spans)
 - **Parallelizable within spans:** `forward_span` uses a parallel scan over P=32 tokens
 - **Boundary overhead:** PM commit + EM write + neuromodulator forward at every span boundary
-- **RL overhead (Phase D):** 4 extra forward passes per RL event (PM force_off/on + EM baseline/chosen), amortized by `rl_event_prob` (default 0.3) and `rl_event_interval` (default 3)
 
 The recurrence + memory architecture means throughput is **lower than a pure transformer of equal parameter count** but has the advantage of truly O(1) per-token memory and O(n) compute.
 
@@ -1573,21 +1413,20 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 
 | File | Primary Content |
 |------|----------------|
-| `src/model/config.py` | `ModelConfig` dataclass, tier presets, phase toggles, RL config fields |
+| `src/model/config.py` | `ModelConfig` dataclass, tier presets, phase toggles |
 | `src/model/model.py` | `NeuromorphicLM` -- top-level: embedding, WM, blocks, lm_head, `rl_parameters()` |
 | `src/model/block.py` | `Block` -- parallel unit: L layers + 1 EM + 1 `EMNeuromodulator` |
 | `src/model/layer.py` | `Layer` -- affine recurrence + PM instance + `PMNeuromodulator` |
 | `src/model/working_memory.py` | `WorkingMemory` -- sliding window attention |
-| `src/model/procedural_memory.py` | `ProceduralMemory`, `PMNeuromodulator` (three-mode: heuristic / continuous-learned / fully-learned) |
-| `src/model/episodic_memory.py` | `EpisodicMemory`, `EMNeuromodulator` (three-mode: heuristic / continuous-learned / fully-learned) |
+| `src/model/procedural_memory.py` | `ProceduralMemory`, `PMNeuromodulator` (two-mode: heuristic / learned) |
+| `src/model/episodic_memory.py` | `EpisodicMemory`, `EMNeuromodulator` (two-mode: heuristic / learned) |
 | `src/model/utils.py` | `StateMixin`, `unit_normalize`, `soft_topk`, `budget_enforce` |
 | `src/model/state.py` | `save_runtime_state`, `load_runtime_state`, `detach_all`, `reset_all` |
 | `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, orchestrates span loop |
 | `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM eligibility/commit, EM candidates/write |
-| `src/training/rl_rollout.py` | `BoundarySnapshot`, `RLRolloutEngine` -- counterfactual RL rollouts for neuromodulators |
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
-| `src/training/eval_lifelong.py` | Phase E evaluation: domain adaptation, drift, cross-doc recall |
+| `src/training/eval_lifelong.py` | Phase D evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |
-| `src/train.py` | Entry point -- config, main + RL optimizers, scheduler, training loop, checkpoint save/load |
+| `src/train.py` | Entry point -- config, optimizer, scheduler, training loop, checkpoint save/load |
 | `src/model/scan.py` | `parallel_affine_scan` -- affine recurrence scan for `forward_span()` |
 | `src/debug/collector.py` | `MetricsCollector` -- two-tier JSONL logging, gate stats, memory stats, grad norms |

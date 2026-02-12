@@ -107,7 +107,7 @@ class TestReset:
 class TestEMReset:
     def test_em_reset_only_zeros_strengths(self):
         """EM reset: em_S zeroed for masked. em_K/em_V UNCHANGED."""
-        model, cfg = _init_model("C")
+        model, cfg = _init_model("B")
         forward_and_write_em(model, cfg.P)
 
         for block in model.blocks:
@@ -235,7 +235,7 @@ class TestSaveLoad:
 class TestWalkModelTree:
     def test_reset_all_walks_model_tree(self):
         """model.reset_at_doc_boundary(mask) reaches all StateMixin instances."""
-        model, cfg = _init_model("C")
+        model, cfg = _init_model("B")
         forward_and_write_em(model, cfg.P)
 
         mask = torch.ones(BS, dtype=torch.bool)
@@ -269,8 +269,7 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_pm_state(self):
         """In lifelong_mode: pm_K/pm_V/pm_a survive reset."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
-        cfg.set_phase("D")  # now lifelong_mode=True
+        cfg.set_phase("D")  # lifelong_mode=True
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
 
@@ -304,7 +303,6 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_em_state(self):
         """In lifelong_mode: EM state completely survives (EM reset never called)."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
         cfg.set_phase("D")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
@@ -351,7 +349,7 @@ class TestNormalReset:
 
     def test_normal_reset_zeros_em_strengths(self):
         """lifelong_mode=False: em_S zeroed for masked. em_K/em_V preserved."""
-        model, cfg = _init_model("C")
+        model, cfg = _init_model("B")
         forward_and_write_em(model, cfg.P)
 
         for block in model.blocks:
@@ -374,7 +372,7 @@ class TestNormalReset:
 
 class TestStateDictCompleteness:
     def test_state_dict_runtime_has_all_keys(self):
-        model, _ = _init_model("C")
+        model, _ = _init_model("B")
 
         for path, mixin in _walk_state_mixins(model):
             sd = mixin.state_dict_runtime()

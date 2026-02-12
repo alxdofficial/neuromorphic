@@ -3,7 +3,7 @@ Entry point for neuromorphic LM training.
 
 Usage:
     python -m src.train                              # file defaults (backward compat)
-    python -m src.train --phases A,B,C,D --tier a     # auto-transition full run
+    python -m src.train --phases A,B,D --tier a        # auto-transition full run
     python -m src.train --phase D --resume ckpt.pt   # single phase with resume
     python -m src.train --phase A --steps 5000        # override step count
     python -m src.train --phases A,B --no-plots       # skip plot generation
@@ -43,8 +43,7 @@ TIER = "a"          # ~41M params, fast iteration
 # -- Training phase --
 PHASE = "A"         # WM + PM (base)
 # PHASE = "B"       # WM + PM + EM
-# PHASE = "C"       # WM + PM + EM + RL controllers
-# PHASE = "D"       # WM + PM + EM + lifelong (inherits RL on resume)
+# PHASE = "D"       # WM + PM + EM + lifelong
 
 # -- Data phase (which datasets to use) --
 DATA_PHASE = None   # None => auto: all phases use B (FineWeb-Edu + DCLM)
@@ -77,7 +76,6 @@ USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 5_000,             # ~61M tokens: WM + PM backbone training
     "B": 5_000,             # ~61M tokens: + EM retrieval + write patterns
-    "C": 7_000,             # ~86M tokens: + RL neuromod convergence (slowest phase)
     "D": 2_500,             # ~31M tokens: lifelong adaptation window
 }
 
@@ -128,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     group = p.add_mutually_exclusive_group()
     group.add_argument("--phases", type=str, default=None,
-                       help="Comma-separated auto-transition sequence (e.g. A,B,C,D)")
+                       help="Comma-separated auto-transition sequence (e.g. A,B,D)")
     group.add_argument("--phase", type=str, default=None,
-                       help="Single phase to run (A-D)")
+                       help="Single phase to run (A, B, or D)")
     p.add_argument("--tier", type=str, default=None, choices=["a", "b", "c"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
@@ -250,8 +248,8 @@ def _normalize_phase_plan(raw: Any) -> list[dict[str, Any]] | None:
     plan = [_normalize_phase_entry(e) for e in raw]
     for item in plan:
         p = item["phase"]
-        if p not in ("A", "B", "C", "D"):
-            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/C/D.")
+        if p not in ("A", "B", "D"):
+            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/D.")
     return plan
 
 
@@ -585,15 +583,6 @@ def run_phase(
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     config.eot_id = eot_id
 
-    # Phase D inherits rl_enabled from checkpoint config (if resuming).
-    if resume_path and phase_name == "D":
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        _ckpt_cfg = ckpt.get("config")
-        if _ckpt_cfg is not None and hasattr(_ckpt_cfg, "rl_enabled"):
-            config.rl_enabled = _ckpt_cfg.rl_enabled
-            print(f"Phase D: inherited rl_enabled={config.rl_enabled} from checkpoint")
-        del _ckpt_cfg
-
     train_data_phase = _resolve_data_phase(phase_name, settings.get("data_phase", DATA_PHASE))
     val_data_phase = _resolve_data_phase(phase_name, settings.get("val_data_phase", VAL_DATA_PHASE))
     tokens_per_step = bs * config.T
@@ -605,14 +594,14 @@ def run_phase(
     print(f"Tier: {tier.upper()} | Phase: {phase_name} | "
           f"D={config.D}, L={config.L}, B={config.B}, D_h={config.D_h}")
     print(f"BS={bs}, T={config.T}, P={config.P}")
-    print(f"WM={config.wm_enabled}, PM={config.pm_enabled}, EM={config.em_enabled}, RL={config.rl_enabled}")
+    print(f"WM={config.wm_enabled}, PM={config.pm_enabled}, EM={config.em_enabled}")
     print(
         f"Run length: max_steps={max_steps_total} "
         f"(source={max_steps_source}), tokens/step={tokens_per_step}, "
         f"target_tokens~{target_tokens:,}"
     )
     print(f"Data phase: train={train_data_phase}, val={val_data_phase}")
-    if phase_name in ("B", "C", "D") and resume_path is None:
+    if phase_name in ("B", "D") and resume_path is None:
         print(
             "Warning: running a later phase without resume. "
             "This is valid for debugging, but not a smooth phase transition."
@@ -623,16 +612,11 @@ def run_phase(
     param_count = model.param_count()
     print(f"Parameters: {param_count:,} ({param_count / 1e6:.1f}M)")
 
-    # Collect RL parameter ids for exclusion from main optimizer
-    rl_param_ids = set()
-    if config.rl_enabled:
-        rl_param_ids = {id(p) for p in model.rl_parameters()}
-
-    # Optimizer — exclude biases, LayerNorm, and RL params from main optimizer
+    # Optimizer — exclude biases and LayerNorm from weight decay
     decay_params = []
     no_decay_params = []
     for name, param in model.named_parameters():
-        if not param.requires_grad or id(param) in rl_param_ids:
+        if not param.requires_grad:
             continue
         if param.ndim <= 1 or name.endswith(".bias"):
             no_decay_params.append(param)
@@ -647,14 +631,6 @@ def run_phase(
         lr=lr,
         betas=(0.9, 0.95),
     )
-
-    # RL optimizer (separate, for neuromodulator params only)
-    rl_optimizer = None
-    if config.rl_enabled:
-        rl_params = list(model.rl_parameters())
-        if rl_params:
-            rl_optimizer = torch.optim.Adam(rl_params, lr=config.rl_lr)
-            print(f"RL optimizer: {len(rl_params)} params, lr={config.rl_lr}")
 
     # LR scheduler: linear warmup + cosine decay (per-phase: fresh warmup each phase)
     def lr_lambda(step):
@@ -684,7 +660,7 @@ def run_phase(
         ckpt_config = ckpt.get("config")
         _structural_fields = (
             # Phase toggles
-            "pm_enabled", "em_enabled", "rl_enabled",
+            "pm_enabled", "em_enabled",
             # Decoder architecture
             "snapshot_enabled", "d_dec", "decoder_layers",
             "thalamic_tokens", "n_heads_decoder",
@@ -693,7 +669,7 @@ def run_phase(
             "ffn_expansion",
             # Memory dimensions (tier-scaled)
             "r", "M", "W", "D_wm", "D_em", "n_heads_wm",
-            "k_ret", "C_em", "k_write",
+            "k_ret", "C_em",
             # Readout FFNs (add/remove parameters)
             "pm_readout_ffn", "em_readout_ffn",
         )
@@ -729,16 +705,25 @@ def run_phase(
                     print("  Scheduler state incompatible; reinitializing.")
             else:
                 print("  Fresh LR scheduler for new phase.")
-        if rl_optimizer and "rl_optimizer_state_dict" in ckpt:
-            try:
-                rl_optimizer.load_state_dict(ckpt["rl_optimizer_state_dict"])
-            except (ValueError, KeyError):
-                print("  RL optimizer state incompatible; reinitializing.")
         if "runtime_state" in ckpt:
+            # Warm-up forward to trigger lazy-init of all state tensors (pm_K,
+            # em_K, etc.) so that load_state_runtime can shape-check checkpoint
+            # values against the current config.  Without this, tensors that
+            # are still None would be loaded blindly, risking shape mismatches
+            # on the first real forward pass.
+            with torch.no_grad():
+                dummy = torch.zeros(config.bs, dtype=torch.long, device=device)
+                reset = torch.zeros(config.bs, dtype=torch.bool, device=device)
+                model.forward_one_token(dummy, reset)
+                model.detach_states()
+
+            # load_state_runtime is shape-safe: it skips tensors whose shapes
+            # don't match. Phase transitions that only toggle flags (e.g. A→B
+            # enables em_enabled) don't change EM/PM/WM buffer shapes, so
+            # discarding runtime state would destroy learned memories.
             if phase_changed:
-                print("  Skipping runtime state load (architecture transition — shapes may differ).")
-            else:
-                load_runtime_state(model, ckpt["runtime_state"])
+                print("  Phase transition: loading compatible runtime state (shape-safe).")
+            load_runtime_state(model, ckpt["runtime_state"])
         start_step = ckpt.get("step", 0)
     else:
         start_step = 0
@@ -818,15 +803,9 @@ def run_phase(
         collector=collector,
         fail_fast=SAFETY_FAIL_FAST,
         max_consecutive_zero_valid=MAX_CONSEC_ZERO_VALID,
-        rl_optimizer=rl_optimizer,
     )
     # Continuous step numbering for JSONL in auto mode
     trainer.global_step = (global_step_offset + start_step) if is_auto else start_step
-
-    # RL optimizer warmup after phase transition (mitigates cold Adam state)
-    if phase_changed and rl_optimizer is not None:
-        trainer.set_rl_warmup(config.rl_warmup_steps)
-        print(f"  RL optimizer warmup: {config.rl_warmup_steps} steps")
 
     # Restore last prev_token to prevent false doc-boundary reset on resume
     if resume_path and ckpt.get("last_prev_token") is not None:
@@ -867,8 +846,6 @@ def run_phase(
             "runtime_state": save_runtime_state(model),
             "last_prev_token": getattr(trainer, "_last_prev_token", None),
         }
-        if rl_optimizer is not None:
-            ckpt_data["rl_optimizer_state_dict"] = rl_optimizer.state_dict()
         torch.save(ckpt_data, save_path)
         print(f"\nSaved checkpoint: {save_path}")
         return save_path

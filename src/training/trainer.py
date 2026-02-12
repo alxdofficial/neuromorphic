@@ -20,10 +20,6 @@ from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from .loss import batched_cross_entropy, compute_regularizers
 from . import span_ops
-from .rl_rollout import (
-    BoundarySnapshot, RLRolloutEngine,
-    detached_runtime_state, select_rl_spans,
-)
 
 if TYPE_CHECKING:
     from ..debug.collector import MetricsCollector
@@ -43,12 +39,10 @@ class TBPTTTrainer:
         collector: Optional["MetricsCollector"] = None,
         fail_fast: bool = True,
         max_consecutive_zero_valid: int = 3,
-        rl_optimizer: Optional[torch.optim.Optimizer] = None,
     ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.rl_optimizer = rl_optimizer
         self.dataloader = dataloader
         self.config = config
         self.device = device
@@ -64,26 +58,10 @@ class TBPTTTrainer:
         # so that doc-boundary resets don't wipe restored memory state.
         self.override_prev_token: Optional[Tensor] = None
 
-        # Cache RL param ids for excluding from main grad clip
-        self._rl_param_ids: set = set()
-        if config.rl_enabled:
-            self._rl_param_ids = {id(p) for p in model.rl_parameters()}
-
         # bf16 mixed precision (spec §3): forward/backward in bf16,
         # optimizer + state tensors stay fp32. No GradScaler needed for bf16.
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
-
-        # RL rollout engine (handles all counterfactual rollout logic)
-        self._rl_engine = RLRolloutEngine(
-            model=model, config=config, device=device,
-            use_amp=self.use_amp, amp_dtype=self.amp_dtype,
-            rl_optimizer=rl_optimizer,
-        )
-
-    def set_rl_warmup(self, warmup_steps: int):
-        """Enable RL optimizer LR warmup for the next N steps."""
-        self._rl_engine.set_rl_warmup(warmup_steps)
 
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""
@@ -152,14 +130,6 @@ class TBPTTTrainer:
         # Determine if this step should do full collection
         do_full = (self.collector is not None
                    and self.collector.should_collect_full(self.global_step))
-        # RL rollout setup
-        if self.config.rl_enabled:
-            num_spans = T // P
-            rl_span_indices = set(select_rl_spans(num_spans, self.config.rl_events_per_chunk))
-            snapshots = []
-        else:
-            rl_span_indices = set()
-            snapshots = []
 
         t_start = time.time()
         amp_ctx = torch.autocast(
@@ -207,20 +177,12 @@ class TBPTTTrainer:
             # Update model surprise to span mean (frozen for next span's gates).
             self.model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
 
-            # RL snapshot: capture state BEFORE PM commit + EM write
-            span_idx = span_start // P
-            if self.config.rl_enabled and span_idx in rl_span_indices and span_end < T:
-                snapshots.append(self._build_rl_snapshot(
-                    result.em_stacked, span_surprise_mean,
-                    input_ids, target_ids, span_end, BS,
-                ))
-
             # Span boundary: PM commit + EM write
             self._apply_boundary_updates(result, span_surprise_mean)
 
-        # Backward + clip + optimizer step + RL rollouts
-        avg_loss, reg, grad_norm, rl_metrics = self._backward_and_step(
-            chunk_loss, valid_count, snapshots,
+        # Backward + clip + optimizer step
+        avg_loss, reg, grad_norm = self._backward_and_step(
+            chunk_loss, valid_count,
         )
 
         # TBPTT boundary: detach all states
@@ -233,7 +195,7 @@ class TBPTTTrainer:
 
         return self._build_step_metrics(
             avg_loss, reg, valid_count, total_tokens, eot_inputs,
-            reset_events, grad_norm, rl_metrics, elapsed,
+            reset_events, grad_norm, elapsed,
             span_valid_mean_accum, span_count, do_full,
             gate_stats=last_gate_stats,
         )
@@ -319,63 +281,6 @@ class TBPTTTrainer:
             "gate_stats": gate_stats,
         }
 
-    def _build_rl_snapshot(
-        self, em_stacked, span_surprise_mean,
-        input_ids, target_ids, span_end, BS,
-    ) -> BoundarySnapshot:
-        """Capture pre-boundary state for RL counterfactual rollout."""
-        num_blocks = self.config.B
-        snap_cK = [None] * num_blocks
-        snap_cV = [None] * num_blocks
-        snap_cS = [None] * num_blocks
-        snap_cValid = [None] * num_blocks
-        snap_novelties = {}
-        for b, tup in em_stacked.items():
-            sK, sV, sScore, sValid, novelty = tup
-            snap_cK[b] = sK.detach().clone()
-            snap_cV[b] = sV.detach().clone()
-            snap_cS[b] = sScore.detach().clone()
-            snap_cValid[b] = sValid.detach().clone()
-            snap_novelties[b] = novelty.detach().clone()
-
-        snap_g_em = {}
-        snap_tau = {}
-        snap_ww = {}
-        for b in snap_novelties:
-            block = self.model.blocks[b]
-            em_usage = (
-                block.em.em_S.sum(dim=-1)
-                if block.em.em_S is not None
-                else torch.zeros(BS, device=self.device)
-            )
-            _, g_em_val, tau_val, ww_val = block.em_neuromodulator.forward(
-                span_surprise_mean,
-                em_usage / self.config.budget_em,
-                snap_novelties[b],
-            )
-            snap_g_em[b] = g_em_val.detach().clone()
-            snap_tau[b] = tau_val.detach().clone()
-            snap_ww[b] = ww_val.detach().clone()
-
-        return BoundarySnapshot(
-            runtime_state=detached_runtime_state(self.model),
-            span_start=span_end,
-            input_ids=input_ids,
-            target_ids=target_ids,
-            span_surprise_mean=span_surprise_mean.detach().clone(),
-            pm_elig_norms=self._collect_elig_norms(),
-            pm_usages=self._collect_pm_usages(),
-            em_novelties=snap_novelties,
-            em_usages=self._collect_em_usages(),
-            em_cand_K=snap_cK,
-            em_cand_V=snap_cV,
-            em_cand_score=snap_cS,
-            em_cand_valid=snap_cValid,
-            em_g_em_chosen=snap_g_em,
-            em_tau_chosen=snap_tau,
-            em_ww_chosen=snap_ww,
-        )
-
     def _apply_boundary_updates(
         self, result: span_ops.SpanResult, span_surprise_mean: Tensor,
     ) -> None:
@@ -386,9 +291,9 @@ class TBPTTTrainer:
             )
             if self.collector is not None:
                 for b_idx, layer_dict in commit_info.items():
-                    for l_idx, commit_mask in layer_dict.items():
+                    for l_idx, p_commit in layer_dict.items():
                         self.collector.record_pm_commit(
-                            b_idx, l_idx, commit_mask
+                            b_idx, l_idx, p_commit
                         )
 
         if self.config.em_enabled:
@@ -396,18 +301,17 @@ class TBPTTTrainer:
                 self.model, result.em_stacked, span_surprise_mean, self.config,
             )
             if self.collector is not None:
-                for b_idx, write_mask, novelty_mean, g_em_mean in write_info:
+                for b_idx, novelty_mean, g_em_mean in write_info:
                     self.collector.record_em_write(
-                        b_idx, write_mask, novelty_mean,
-                        g_em_mean=g_em_mean,
+                        b_idx, novelty_mean, g_em_mean,
                     )
 
     def _backward_and_step(
-        self, chunk_loss, valid_count, snapshots,
+        self, chunk_loss, valid_count,
     ) -> tuple:
-        """Backward, gradient clip, optimizer step, RL rollouts.
+        """Backward, gradient clip, optimizer step.
 
-        Returns (avg_loss, reg, grad_norm, rl_metrics).
+        Returns (avg_loss, reg, grad_norm).
         """
         # Finalize loss
         if valid_count > 0:
@@ -426,19 +330,10 @@ class TBPTTTrainer:
 
         # Backward + clip + step
         self.optimizer.zero_grad()
-        if self.rl_optimizer is not None:
-            self.rl_optimizer.zero_grad()
         total_loss.backward()
 
-        # Clip only main-model params; neuromodulator continuous-head grads
-        # must survive for the RL optimizer to combine with gate grads.
-        if self._rl_param_ids:
-            main_params = [p for p in self.model.parameters()
-                           if id(p) not in self._rl_param_ids]
-        else:
-            main_params = list(self.model.parameters())
         grad_norm = nn.utils.clip_grad_norm_(
-            main_params, self.max_grad_norm
+            self.model.parameters(), self.max_grad_norm
         ).item()
 
         if not math.isfinite(grad_norm):
@@ -457,20 +352,7 @@ class TBPTTTrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
-        # RL: counterfactual rollouts ADD gate grads on top of continuous grads,
-        # then rl_optimizer steps with the combined gradient.
-        rl_metrics = {}
-        if self.config.rl_enabled and snapshots:
-            final_state = detached_runtime_state(self.model)
-            rl_metrics = self._rl_engine.rl_step(snapshots, final_state)
-        elif self.rl_optimizer is not None:
-            # No rollout events this chunk — still step for continuous grads.
-            rl_metrics.update(self._rl_engine.collect_neuromod_grad_norms())
-            self._rl_engine._tick_rl_warmup()
-            self.rl_optimizer.step()
-            self.rl_optimizer.zero_grad()
-
-        return avg_loss, reg, grad_norm, rl_metrics
+        return avg_loss, reg, grad_norm
 
     # ------------------------------------------------------------------
     # Metrics helpers
@@ -478,7 +360,7 @@ class TBPTTTrainer:
 
     def _build_step_metrics(
         self, avg_loss, reg, valid_count, total_tokens, eot_inputs,
-        reset_events, grad_norm, rl_metrics, elapsed,
+        reset_events, grad_norm, elapsed,
         span_valid_mean_accum, span_count, do_full,
         gate_stats=None,
     ) -> dict:
@@ -532,8 +414,6 @@ class TBPTTTrainer:
             "warn_memory_saturation": warn_memory_saturation,
         }
         step_metrics.update(dataloader_stats)
-        if rl_metrics:
-            step_metrics.update(rl_metrics)
 
         # Log to collector
         if self.collector is not None:
@@ -552,8 +432,6 @@ class TBPTTTrainer:
                 "warn_memory_saturation": warn_memory_saturation,
             }
             extras.update(dataloader_stats)
-            if rl_metrics:
-                extras.update(rl_metrics)
             if do_full:
                 basic = {
                     "loss": step_metrics["loss"],
@@ -586,41 +464,6 @@ class TBPTTTrainer:
                 )
 
         return step_metrics
-
-    # ------------------------------------------------------------------
-    # RL snapshot helpers (used in train_chunk for building snapshots)
-    # ------------------------------------------------------------------
-
-    def _collect_elig_norms(self) -> dict:
-        """Collect eligibility norms for all PM instances."""
-        norms = {}
-        for b_idx, block in enumerate(self.model.blocks):
-            for l_idx, layer in enumerate(block.layers):
-                pm = layer.pm
-                if pm.elig_K is not None:
-                    norms[(b_idx, l_idx)] = pm.elig_K.detach().norm(dim=-1).mean(dim=-1)
-        return norms
-
-    def _collect_pm_usages(self) -> dict:
-        """Collect normalized PM usage for all instances."""
-        usages = {}
-        for b_idx, block in enumerate(self.model.blocks):
-            for l_idx, layer in enumerate(block.layers):
-                pm = layer.pm
-                if pm.pm_a is not None:
-                    usages[(b_idx, l_idx)] = (
-                        pm.pm_a.detach().sum(dim=-1) / self.config.budget_pm
-                    )
-        return usages
-
-    def _collect_em_usages(self) -> dict:
-        """Collect normalized EM usage for all blocks."""
-        usages = {}
-        for b_idx, block in enumerate(self.model.blocks):
-            em = block.em
-            if em.em_S is not None:
-                usages[b_idx] = em.em_S.detach().sum(dim=-1) / self.config.budget_em
-        return usages
 
     def train_epoch(
         self,
