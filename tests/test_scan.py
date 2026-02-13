@@ -397,7 +397,7 @@ class TestWMForwardSpan:
 # ============================================================
 
 class TestBlockForwardSpan:
-    @pytest.mark.parametrize("phase", ["A", "B", "D"])
+    @pytest.mark.parametrize("phase", ["A", "B", "C"])
     def test_matches_sequential(self, phase):
         cfg = make_tiny_config()
         cfg.set_phase(phase)
@@ -440,7 +440,7 @@ class TestBlockForwardSpan:
 # ============================================================
 
 class TestModelForwardSpan:
-    @pytest.mark.parametrize("phase", ["A", "B", "D"])
+    @pytest.mark.parametrize("phase", ["A", "B", "C"])
     def test_logits_match_sequential(self, phase):
         """forward_span logits match P calls to forward_one_token (frozen surprise)."""
         cfg = make_tiny_config()
@@ -829,7 +829,7 @@ class TestSpatialDecoderSpan:
         for name, grad in decoder_grads.items():
             assert torch.isfinite(grad).all(), f"Non-finite grad: {name}"
 
-    @pytest.mark.parametrize("phase", ["A", "B", "D"])
+    @pytest.mark.parametrize("phase", ["A", "B", "C"])
     def test_span_matches_sequential_with_decoder(self, phase):
         """forward_span with decoder matches sequential forward_one_token with decoder."""
         cfg = make_tiny_config(snapshot_enabled=True)

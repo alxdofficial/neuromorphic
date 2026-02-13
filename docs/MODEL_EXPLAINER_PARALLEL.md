@@ -579,11 +579,11 @@ model.surprise = span_surprise_mean                              # next span's f
 | `Layer.h` | Carry mask zeros `a_eff`, giving `h_t = b_t` | Yes |
 | `elig_K, elig_V` | Zeroed in trainer post-forward loop | Yes |
 | `pm_K, pm_V, pm_a` | NOT zeroed mid-span | **No** (phases A-D) |
-| `em_S` | NOT zeroed mid-span | **No** (phases A-D) |
+| `em_S` | NOT zeroed mid-span | **No** (phases A-C) |
 | WM state | Handled internally by `wm.forward_span` | Yes |
 | `model.surprise` | Frozen anyway | N/A |
 
-**Impact of the PM/EM gap:** In non-lifelong mode (phases A-B), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=31 tokens per boundary event. In lifelong mode (Phase D), PM/EM state intentionally persists across documents, so there is no gap.
+**Impact of the PM/EM gap:** In non-lifelong mode (phases A-B), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=31 tokens per boundary event. In lifelong mode (Phase C), PM/EM state intentionally persists across documents, so there is no gap.
 
 **Eligibility reset detail** (span_ops.py: `apply_pm_eligibility_batch`):
 ```python

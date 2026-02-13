@@ -20,7 +20,7 @@ VOCAB = 64
 # ============================================================================
 
 class TestForwardPass:
-    @pytest.mark.parametrize("phase", ["A", "B", "D"])
+    @pytest.mark.parametrize("phase", ["A", "B", "C"])
     def test_forward_per_phase(self, phase):
         cfg = make_tiny_config()
         cfg.set_phase(phase)
@@ -30,9 +30,9 @@ class TestForwardPass:
         assert logits.shape == (BS, VOCAB)
         assert torch.isfinite(logits).all()
 
-    def test_forward_phase_d(self):
+    def test_forward_phase_c(self):
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         model = NeuromorphicLM(cfg)
 
         logits, target = forward_n_tokens(model, 4, BS=BS, vocab=VOCAB)
@@ -198,11 +198,11 @@ class TestLossReduction:
 
 class TestPhaseTransitions:
     @pytest.mark.slow
-    def test_phase_transitions_a_b_d(self):
+    def test_phase_transitions_a_b_c(self):
         """Config set_phase() + model reinit doesn't crash."""
         cfg = make_tiny_config()
 
-        for phase in ["A", "B", "D"]:
+        for phase in ["A", "B", "C"]:
             cfg.set_phase(phase)
             model = NeuromorphicLM(cfg)
             logits, _ = forward_n_tokens(model, 4, BS=BS, vocab=VOCAB)
@@ -313,7 +313,7 @@ class TestWMReset:
 # ============================================================================
 
 class TestGenerate:
-    @pytest.mark.parametrize("phase", ["A", "B", "D"])
+    @pytest.mark.parametrize("phase", ["A", "B", "C"])
     def test_generate_output_shape(self, phase):
         """generate() returns [BS, T_prompt + max_new_tokens]."""
         cfg = make_tiny_config()

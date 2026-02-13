@@ -269,7 +269,7 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_pm_state(self):
         """In lifelong_mode: pm_K/pm_V/pm_a survive reset."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")  # lifelong_mode=True
+        cfg.set_phase("C")  # lifelong_mode=True
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
 
@@ -303,7 +303,7 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_em_state(self):
         """In lifelong_mode: EM state completely survives (EM reset never called)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
 

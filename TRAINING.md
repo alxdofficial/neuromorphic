@@ -5,7 +5,7 @@
 ```bash
 # Full training (all 3 phases, tier B, optimized BS)
 tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
-  "python -u -m src.train --preset phase_a_to_d --bs 48 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
+  "python -u -m src.train --preset phase_a_to_c --bs 48 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
 
 # Attach to monitor
 tmux attach -t neuromorphic-train
@@ -37,7 +37,7 @@ tmux attach -t neuromorphic-train
 |-------|-------|-----------------|----------|
 | A     | 10K   | ~125M           | WM + PM (TinyStories) |
 | B     | 300K  | ~3.7B           | WM + PM + EM (FineWeb-Edu + DCLM) |
-| D     | 300K  | ~3.7B           | WM + PM + EM + lifelong (PM/EM persist across docs) |
+| C     | 300K  | ~3.7B           | WM + PM + EM + lifelong (PM/EM persist across docs) |
 
 Total: ~610K steps, ~7.5B tokens at BS=48
 

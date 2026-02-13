@@ -226,7 +226,7 @@ class Block(nn.Module, StateMixin):
     def reset_states(self, mask: Tensor):
         """Reset states for masked streams.
 
-        In lifelong mode (Phase D), only transient state resets:
+        In lifelong mode (Phase C), only transient state resets:
         h and eligibility traces. PM committed state and EM persist.
         """
         for layer in self.layers:

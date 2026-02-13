@@ -70,7 +70,7 @@ DEFAULTS = dict(
 PHASE_TOGGLES = {
     "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, lifelong_mode=False),
     "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=False),
-    "D": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
+    "C": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
 }
 
 # ---------------------------------------------------------------------------

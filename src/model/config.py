@@ -67,7 +67,7 @@ class ModelConfig:
     T: int = 256              # TBPTT segment length
     P: int = 32               # plasticity span
     reset_on_doc_boundary: bool = True
-    lifelong_mode: bool = False  # Phase D: PM/EM persist across doc boundaries
+    lifelong_mode: bool = False  # Phase C: PM/EM persist across doc boundaries
 
     # Spatial Decoder (hierarchical aggregation + deep cross-attention)
     snapshot_enabled: bool = True   # architecture toggle (independent of phase)
@@ -123,7 +123,7 @@ class ModelConfig:
 
         A: WM + PM (base — PM is always on)
         B: WM + PM + EM
-        D: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
+        C: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
 
         All downstream code branches on capability flags (pm_enabled,
         em_enabled) — never on phase letters. This method is the single
@@ -141,15 +141,15 @@ class ModelConfig:
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-        elif phase == "D":
+        elif phase == "C":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
         else:
-            raise ValueError(f"Unknown phase: {phase}. Expected A/B/D.")
+            raise ValueError(f"Unknown phase: {phase}. Expected A/B/C.")
 
-        # Phase D: enable lifelong mode
-        self.lifelong_mode = (phase == "D")
+        # Phase C: enable lifelong mode
+        self.lifelong_mode = (phase == "C")
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":

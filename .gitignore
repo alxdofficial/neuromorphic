@@ -15,3 +15,5 @@ wandb/
 .env
 .serena/
 .claude/
+auxiliary_repos/baselines/model_cache/
+auxiliary_repos/baselines/results/

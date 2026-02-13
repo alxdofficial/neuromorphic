@@ -695,9 +695,9 @@ model.detach_states()  # TBPTT boundary
 * All neuromodulator params on main optimizer (no separate RL optimizer).
   Goal: memory bench improvement; explicit recall at long delays; learned write/commit parameters; stable budgets.
 
-### Phase D — Lifelong learning (persistent cross-document memory)
+### Phase C — Lifelong learning (persistent cross-document memory)
 
-* `config.lifelong_mode = True` (set by `config.set_phase("D")`)
+* `config.lifelong_mode = True` (set by `config.set_phase("C")`)
 * Soft reset at doc boundaries: h + eligibility traces reset, PM committed state + EM persist
 * `reset_on_doc_boundary` remains True (loss masking still active)
 * `PM.reset_eligibility(mask)` zeros only `elig_K/elig_V` for masked streams
@@ -824,7 +824,7 @@ This resolves ambiguity by construction.
   * `apply(x_block) → y_pm`
   * `update_eligibility(x, h)`
   * `base_decay()` — per-span `pm_a *= decay` on ALL streams
-  * `reset_eligibility(mask)` — zero only `elig_K/elig_V` for masked streams (Phase D soft reset)
+  * `reset_eligibility(mask)` — zero only `elig_K/elig_V` for masked streams (Phase C soft reset)
   * `commit(commit_mask, lambda_vals, g, slot_logits)` — soft top-k EMA update for committing streams
 
 * `PMNeuromodulator` (B × L instances)
@@ -899,7 +899,7 @@ training:
   P: 32                     # plasticity span
   precision: bf16           # bf16 for forward/backward, fp32 for state
   reset_on_doc_boundary: true
-  lifelong_mode: false        # Phase D: PM/EM persist across doc boundaries
+  lifelong_mode: false        # Phase C: PM/EM persist across doc boundaries
   rl_controller_hidden: 32    # MLP hidden size for neuromodulators
   eot_id: 50256             # GPT-2 <|endoftext|>
   lr: 3.0e-4                # peak learning rate
@@ -934,7 +934,7 @@ training:
    * `pm_K/pm_V/pm_a` for PM state, `elig_K/elig_V` for eligibility
    * `em_K/em_V/em_S` for EM state
    * `wm_K/wm_V` for WM cache
-   * `PMNeuromodulator` and `EMNeuromodulator` for gating (renamed from `PMController`/`EMController` in Phase D)
+   * `PMNeuromodulator` and `EMNeuromodulator` for gating (renamed from `PMController`/`EMController` in Phase C)
 
 6. **Scaling tiers defined** (A/B/C) for 4090 training:
    * Tier B (~150M) recommended for competitive results

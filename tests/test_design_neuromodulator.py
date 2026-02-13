@@ -40,11 +40,11 @@ class TestNeuromodulatorModes:
         assert g.shape == (BS,)
         assert tau.shape == (BS,)
 
-    def test_pm_phase_c_raises(self):
-        """Phase C was removed — set_phase('C') must raise ValueError."""
+    def test_pm_phase_d_raises(self):
+        """Phase D was renamed to C — set_phase('D') must raise ValueError."""
         cfg = make_tiny_config()
         with pytest.raises(ValueError, match="Unknown phase"):
-            cfg.set_phase("C")
+            cfg.set_phase("D")
 
     def test_em_heuristic_in_phase_a(self):
         """Phase A: EM disabled, neuromodulator uses heuristic defaults."""
@@ -71,10 +71,10 @@ class TestNeuromodulatorModes:
         assert decay.shape == (BS,)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
 
-    def test_em_continuous_in_phase_d(self):
-        """Phase D: EM neuromodulator uses learned continuous g_em (lifelong)."""
+    def test_em_continuous_in_phase_c(self):
+        """Phase C: EM neuromodulator uses learned continuous g_em (lifelong)."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         g_em, tau, ww, decay = result

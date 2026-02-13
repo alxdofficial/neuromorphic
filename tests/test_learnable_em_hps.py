@@ -71,19 +71,19 @@ class TestEMNeuromodulatorTauWw:
         assert (ww >= cfg.ww_em_floor - 1e-6).all()
         assert (ww <= cfg.ww_em_ceil + 1e-6).all()
 
-    def test_learned_tau_in_range_phase_d(self):
-        """Phase D: learned tau is within [floor, ceil]."""
+    def test_learned_tau_in_range_phase_c(self):
+        """Phase C: learned tau is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         g_em, tau, ww, decay = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (tau >= cfg.tau_em_floor - 1e-6).all()
         assert (tau <= cfg.tau_em_ceil + 1e-6).all()
 
-    def test_learned_ww_in_range_phase_d(self):
-        """Phase D: learned ww is within [floor, ceil]."""
+    def test_learned_ww_in_range_phase_c(self):
+        """Phase C: learned ww is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("D")
+        cfg.set_phase("C")
         nm = EMNeuromodulator(cfg)
         g_em, tau, ww, decay = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (ww >= cfg.ww_em_floor - 1e-6).all()

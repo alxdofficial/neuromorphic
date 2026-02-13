@@ -125,7 +125,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ---
 
-### Phase D — Lifelong Learning (persistent cross-document memory)
+### Phase C — Lifelong Learning (persistent cross-document memory)
 
 **Goal:** Enable persistent cross-document memory. PM/EM accumulate knowledge across document boundaries instead of resetting.
 
@@ -134,7 +134,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 **Dataset:** Continue FineWeb-Edu + SlimPajama streaming. Add Wikipedia for domain adaptation evaluation.
 
 **Config:**
-- `config.lifelong_mode = True` (set by `config.set_phase("D")`)
+- `config.lifelong_mode = True` (set by `config.set_phase("C")`)
 - `reset_on_doc_boundary` remains True (loss masking still active)
 - Soft reset at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
 - All neuromod params remain on main optimizer (same as Phase B)
@@ -153,7 +153,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ### Phase E (Future) — Agentic Learning (Start Small)
 
-**Note:** Phase D now implements lifelong learning (previously planned as Phase E). The phase letter "E" is reserved for future agentic capabilities.
+**Note:** Phase C now implements lifelong learning (previously planned as Phase E). The phase letter "E" is reserved for future agentic capabilities.
 
 ---
 
@@ -264,8 +264,8 @@ Option B: Assign ~70% of streams to FineWeb-Edu and ~30% to SlimPajama.
 - Clean learning signal: model learns within-document memory patterns
 - No risk of stale memory from unrelated text
 
-### Phase D: Lifelong (soft resets)
-- `config.lifelong_mode = True` (set by `config.set_phase("D")`)
+### Phase C: Lifelong (soft resets)
+- `config.lifelong_mode = True` (set by `config.set_phase("C")`)
 - `reset_on_doc_boundary` remains True (loss masking still active)
 - **Soft reset** at doc boundaries: h and eligibility traces reset; PM committed state and EM fully persist
 - Neuromodulator continuous heads are trained (from Phase B) and selective about commit/write strength
@@ -276,11 +276,11 @@ Option B: Assign ~70% of streams to FineWeb-Edu and ~30% to SlimPajama.
 ### Implementation
 Two flags control reset behavior:
 - `config.reset_on_doc_boundary`: controls loss masking at EOT (True in all phases)
-- `config.lifelong_mode`: controls whether PM/EM state persists across doc boundaries (True only in Phase D)
+- `config.lifelong_mode`: controls whether PM/EM state persists across doc boundaries (True only in Phase C)
 
 `Block.reset_states()` branches on `lifelong_mode`:
 - **lifelong_mode=False (Phases A–B):** Full reset — h, all PM state, and EM strengths zeroed
-- **lifelong_mode=True (Phase D):** Soft reset — h zeroed, PM eligibility zeroed, but PM committed state (pm_K/pm_V/pm_a) and EM (em_K/em_V/em_S) persist
+- **lifelong_mode=True (Phase C):** Soft reset — h zeroed, PM eligibility zeroed, but PM committed state (pm_K/pm_V/pm_a) and EM (em_K/em_V/em_S) persist
 
 Per-stream reset via boolean mask (different streams hit doc boundaries at different times).
 
@@ -349,7 +349,7 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 1. **Set up data pipeline** — streaming FineWeb-Edu + PG19 with packing
 2. **Phase A** — verify backbone + WM + PM works (TinyStories)
 3. **Phase B** — enable PM + EM with learned neuromodulators (FineWeb-Edu + SlimPajama, bulk of training)
-4. **Phase D** — lifelong learning (soft resets: h + eligibility traces reset at doc boundaries, PM committed state and EM persist)
+4. **Phase C** — lifelong learning (soft resets: h + eligibility traces reset at doc boundaries, PM committed state and EM persist)
 5. **Phase E (future)** — agentic fine-tuning (function calling datasets)
 6. **Phase F (future)** — multimodal (requires architecture extension)
 

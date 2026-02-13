@@ -51,7 +51,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 
 ## 2. Architecture at a Glance
 
-The diagram below shows the **full architecture** (all subsystems active). In earlier phases, some components are absent: Phase A has WM + PM; Phase B adds EM; Phase D adds lifelong persistence. See [§17](#17-phased-training-plan) for the phase progression.
+The diagram below shows the **full architecture** (all subsystems active). In earlier phases, some components are absent: Phase A has WM + PM; Phase B adds EM; Phase C adds lifelong persistence. See [§17](#17-phased-training-plan) for the phase progression.
 
 ```
 Token ID ──► Embedding ──► x: [BS, D]
@@ -366,9 +366,9 @@ Called every P=32 tokens. The commit process:
 
 **Differentiable continuous outputs:** Starting in Phase B (learned mode), `lambda_vals`, `g`, and `slot_logits` carry gradients through the commit operation. The `alpha` computation and the EMA update are differentiable tensor operations, so `total_loss.backward()` reaches the neuromodulator's continuous heads on the main optimizer. `commit_mask` is a heuristic binary gate (detached, no gradient).
 
-### 7.5 PM Eligibility-Only Reset (Phase D)
+### 7.5 PM Eligibility-Only Reset (Phase C)
 
-In lifelong mode (Phase D), doc boundaries call `reset_eligibility(mask)` instead of the full `reset_states(mask)`:
+In lifelong mode (Phase C), doc boundaries call `reset_eligibility(mask)` instead of the full `reset_states(mask)`:
 
 ```python
 def reset_eligibility(self, mask):
@@ -404,12 +404,12 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 | State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
 |-------|-------|----------------|-------------|--------------|-------------------|
-| `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `soft_topk_weights * g * commit_mask` | Span boundary (commit) | Persists in Phase D; accumulates cross-doc knowledge |
-| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase D |
-| `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase D; base_decay prevents runaway |
-| `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase D: reset_eligibility) |
+| `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `soft_topk_weights * g * commit_mask` | Span boundary (commit) | Persists in Phase C; accumulates cross-doc knowledge |
+| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase C |
+| `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase C; base_decay prevents runaway |
+| `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase C: reset_eligibility) |
 | `elig_V` | `[BS, r, D_h]` | Value eligibility trace | Same as elig_K with v_cand | Every token | Reset on doc boundary |
-| `h` | `[BS, D_h]` | Layer hidden state | Affine recurrence: `h = a*h + b` from gates | Every token | Reset on doc boundary (even Phase D) |
+| `h` | `[BS, D_h]` | Layer hidden state | Affine recurrence: `h = a*h + b` from gates | Every token | Reset on doc boundary (even Phase C) |
 
 #### Control Signals (computed, not stored — ephemeral per boundary)
 
@@ -537,11 +537,11 @@ At the span boundary, candidates are selected and written:
 
 ### 8.5 EM Doc-Boundary Reset
 
-**Critical design decision:** On doc boundary reset (Phases A-D), EM only zeros `em_S` (strengths). It preserves `em_K` and `em_V`. This is implemented via an override of `StateMixin.reset_states()` in `EpisodicMemory`.
+**Critical design decision:** On doc boundary reset (Phases A-C), EM only zeros `em_S` (strengths). It preserves `em_K` and `em_V`. This is implemented via an override of `StateMixin.reset_states()` in `EpisodicMemory`.
 
 **Why?** Zeroing strengths makes all slots invisible to retrieval (the `em_S > 0` mask filters them out) without destroying the actual key-value content. When new writes occur, they can reuse these slots via the weakness-biased slot selection (slots with `em_S=0` are preferred targets). This is more graceful than re-randomizing keys, which would destroy any useful patterns in the key space.
 
-In Phase D (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
+In Phase C (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
 
 ### 8.6 EM: Complete Learnable Components Reference
 
@@ -569,9 +569,9 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 | State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
 |-------|-------|----------------|-------------|--------------|-------------------|
-| `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `soft_topk_weights * g_em` | Span boundary (per candidate in span) | Persists in Phase D; K/V content survives doc reset |
-| `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase D |
-| `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay` (per-stream learned), then budget_enforce | Span boundary | Persists in Phase D (lifelong); learned decay controls retention. In Phases A–B: zeroed on doc boundary (makes slots invisible but preserves K/V) |
+| `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `soft_topk_weights * g_em` | Span boundary (per candidate in span) | Persists in Phase C; K/V content survives doc reset |
+| `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase C |
+| `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay` (per-stream learned), then budget_enforce | Span boundary | Persists in Phase C (lifelong); learned decay controls retention. In Phases A–B: zeroed on doc boundary (makes slots invisible but preserves K/V) |
 
 #### Control Signals (computed, not stored — ephemeral per boundary)
 
@@ -640,7 +640,7 @@ for layer in self.layers:
 self.em.reset_states(mask)       # zeros em_S
 ```
 
-**Phase D (lifelong_mode=True):**
+**Phase C (lifelong_mode=True):**
 ```python
 for layer in self.layers:
     layer.reset_states(mask)         # zeros h (always)
@@ -899,7 +899,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 | WM | `wm_valid` cleared, `wm_ptr` reset | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
-**Phase D (lifelong_mode=True) -- Soft Reset:**
+**Phase C (lifelong_mode=True) -- Soft Reset:**
 
 | Module | What resets on doc boundary | What persists |
 |--------|---------------------------|---------------|
@@ -909,7 +909,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 | WM | `wm_valid` cleared, `wm_ptr` reset | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
-The EM override in Phases A-B is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase D, even strengths persist -- natural decay (per-stream learned) and budget enforcement provide forgetting pressure instead.
+The EM override in Phases A-B is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase C, even strengths persist -- natural decay (per-stream learned) and budget enforcement provide forgetting pressure instead.
 
 ### 13.3 Bulk Operations (state.py)
 
@@ -993,7 +993,7 @@ When `reset_on_doc_boundary=True` (all phases):
 - Skip loss at positions where `input_tokens[:, t] == eot_id`
 - This avoids training on cross-document transitions (predicting first token of next doc from EOT is meaningless)
 - We still train on predicting EOT within documents
-- Note: `reset_on_doc_boundary` remains True even in Phase D (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
+- Note: `reset_on_doc_boundary` remains True even in Phase C (lifelong mode). The `lifelong_mode` flag controls state persistence, not loss masking.
 
 ### 14.5 PM Commit Surprise Signal
 
@@ -1098,12 +1098,12 @@ def compute_regularizers(model):
 ```python
 "A": wm=True,  pm=True,  em=False, lifelong=False
 "B": wm=True,  pm=True,  em=True,  lifelong=False
-"D": wm=True,  pm=True,  em=True,  lifelong=True
+"C": wm=True,  pm=True,  em=True,  lifelong=True
 ```
 
 All neuromodulator params are on the main optimizer in all phases. There is no separate RL optimizer.
 
-**Phase transition via checkpoint resume:** `src/train.py` loads model checkpoints with `strict=False`, so new parameters are initialized fresh when they first appear. When transitioning A→B, PM and EM neuromodulator backbones + heads + W_nov init fresh. B→D preserves everything (only `lifelong_mode` flag changes).
+**Phase transition via checkpoint resume:** `src/train.py` loads model checkpoints with `strict=False`, so new parameters are initialized fresh when they first appear. When transitioning A→B, PM and EM neuromodulator backbones + heads + W_nov init fresh. B→C preserves everything (only `lifelong_mode` flag changes).
 
 **Optimizer state across phase transitions:** When a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled` differ from current config), optimizer state loading is skipped because parameter group sizes change across phases. The optimizer reinitializes with fresh Adam state.
 
@@ -1255,7 +1255,7 @@ The recurrence + memory architecture means throughput is **lower than a pure tra
 
 ### 21.2 Parameter Counts by Tier and Phase
 
-| Tier | D | L | B | Phase A (WM) | Phase D (all) | Neuromod overhead |
+| Tier | D | L | B | Phase A (WM) | Phase C (all) | Neuromod overhead |
 |------|---|---|---|-------------|---------------|-------------------|
 | **A** (Debug) | 512 | 8 | 4 | 56,012,416 | 56,033,136 | 20,720 (0.04%) |
 | **B** (Competitive) | 768 | 12 | 6 | 102,555,456 | 102,620,400 | 64,944 (0.06%) |
@@ -1425,7 +1425,7 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 | `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, orchestrates span loop |
 | `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM eligibility/commit, EM candidates/write |
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
-| `src/training/eval_lifelong.py` | Phase D evaluation: domain adaptation, drift, cross-doc recall |
+| `src/training/eval_lifelong.py` | Phase C evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |
 | `src/train.py` | Entry point -- config, optimizer, scheduler, training loop, checkpoint save/load |
 | `src/model/scan.py` | `parallel_affine_scan` -- affine recurrence scan for `forward_span()` |

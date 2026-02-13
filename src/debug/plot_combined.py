@@ -93,8 +93,7 @@ SMOOTH_WINDOW = 50
 PHASE_COLORS = {
     "A": "#1f77b4",
     "B": "#ff7f0e",
-    "C": "#2ca02c",
-    "D": "#d62728",
+    "C": "#d62728",
 }
 
 

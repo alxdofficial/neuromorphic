@@ -1,5 +1,5 @@
 """
-Lifelong learning evaluation — Phase D evaluation tasks.
+Lifelong learning evaluation — Phase C evaluation tasks.
 
 Three evaluation modes:
 1. Domain adaptation: stream Wikipedia articles, measure per-chunk perplexity decrease.
@@ -266,7 +266,7 @@ def drift_monitoring(
         general_chunks: list of [BS, T] general token tensors
         config: model config
         device: compute device
-        baseline_ppl: Phase D baseline perplexity (if None, skip threshold check)
+        baseline_ppl: Phase C baseline perplexity (if None, skip threshold check)
         drift_threshold: max acceptable relative increase (default 5%)
 
     Returns:

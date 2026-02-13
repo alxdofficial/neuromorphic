@@ -3,11 +3,11 @@ Entry point for neuromorphic LM training.
 
 Usage:
     python -m src.train                              # file defaults (backward compat)
-    python -m src.train --phases A,B,D --tier a        # auto-transition full run
-    python -m src.train --phase D --resume ckpt.pt   # single phase with resume
+    python -m src.train --phases A,B,C --tier a        # auto-transition full run
+    python -m src.train --phase C --resume ckpt.pt   # single phase with resume
     python -m src.train --phase A --steps 5000        # override step count
     python -m src.train --phases A,B --no-plots       # skip plot generation
-    python -m src.train --config configs/train_presets.yaml --preset phase_a_to_d
+    python -m src.train --config configs/train_presets.yaml --preset phase_a_to_c
 
 All configuration constants below serve as defaults when no CLI args are given.
 CLI args override the corresponding constant.
@@ -43,7 +43,7 @@ TIER = "a"          # ~41M params, fast iteration
 # -- Training phase --
 PHASE = "A"         # WM + PM (base)
 # PHASE = "B"       # WM + PM + EM
-# PHASE = "D"       # WM + PM + EM + lifelong
+# PHASE = "C"       # WM + PM + EM + lifelong
 
 # -- Data phase (which datasets to use) --
 DATA_PHASE = None   # None => auto: all phases use B (FineWeb-Edu + DCLM)
@@ -76,7 +76,7 @@ USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 5_000,             # ~61M tokens: WM + PM backbone training
     "B": 5_000,             # ~61M tokens: + EM retrieval + write patterns
-    "D": 2_500,             # ~31M tokens: lifelong adaptation window
+    "C": 2_500,             # ~31M tokens: lifelong adaptation window
 }
 
 # -- Regularization --
@@ -126,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     group = p.add_mutually_exclusive_group()
     group.add_argument("--phases", type=str, default=None,
-                       help="Comma-separated auto-transition sequence (e.g. A,B,D)")
+                       help="Comma-separated auto-transition sequence (e.g. A,B,C)")
     group.add_argument("--phase", type=str, default=None,
-                       help="Single phase to run (A, B, or D)")
+                       help="Single phase to run (A, B, or C)")
     p.add_argument("--tier", type=str, default=None, choices=["a", "b", "c"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
@@ -248,8 +248,8 @@ def _normalize_phase_plan(raw: Any) -> list[dict[str, Any]] | None:
     plan = [_normalize_phase_entry(e) for e in raw]
     for item in plan:
         p = item["phase"]
-        if p not in ("A", "B", "D"):
-            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/D.")
+        if p not in ("A", "B", "C"):
+            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/C.")
     return plan
 
 
@@ -601,7 +601,7 @@ def run_phase(
         f"target_tokens~{target_tokens:,}"
     )
     print(f"Data phase: train={train_data_phase}, val={val_data_phase}")
-    if phase_name in ("B", "D") and resume_path is None:
+    if phase_name in ("B", "C") and resume_path is None:
         print(
             "Warning: running a later phase without resume. "
             "This is valid for debugging, but not a smooth phase transition."
@@ -672,7 +672,7 @@ def run_phase(
             "k_ret", "C_em",
             # Readout FFNs (add/remove parameters)
             "pm_readout_ffn", "em_readout_ffn",
-            # Lifelong mode (Phase D)
+            # Lifelong mode (Phase C)
             "lifelong_mode",
         )
         _changed_fields = []
@@ -741,7 +741,7 @@ def run_phase(
     # doc-boundary reset on the first batch. This means resumed memory state
     # is inconsistent with the token stream for the first few chunks until
     # PM/EM naturally adapt. This is acceptable because PM/EM are designed
-    # to be robust to distribution shifts (same mechanism as Phase D lifelong).
+    # to be robust to distribution shifts (same mechanism as Phase C lifelong).
     dataloader = create_dataloader(
         phase=train_data_phase,
         tokenizer=tokenizer,
@@ -897,24 +897,24 @@ def run_phase(
     text_sample_interval = settings.get("text_sample_interval", TEXT_SAMPLE_INTERVAL)
     no_plots = settings.get("no_plots", False)
 
-    # Lazy-load validation batch for text samples (fetched once on first use)
-    _text_sample_batch = [None]  # mutable container for nonlocal
+    # Draw a fresh validation batch for text samples each time
+    _text_sample_call_count = [0]
 
     def _get_text_sample_batch():
-        if _text_sample_batch[0] is None:
-            try:
-                sample_loader = create_dataloader(
-                    phase=val_data_phase,
-                    tokenizer=tokenizer,
-                    batch_size=bs,
-                    seq_length=config.T,
-                    seed=VAL_SEED + 99,
-                    max_steps=1,
-                )
-                _text_sample_batch[0] = next(iter(sample_loader))
-            except Exception:
-                pass
-        return _text_sample_batch[0]
+        try:
+            seed = VAL_SEED + 99 + _text_sample_call_count[0]
+            _text_sample_call_count[0] += 1
+            sample_loader = create_dataloader(
+                phase=val_data_phase,
+                tokenizer=tokenizer,
+                batch_size=bs,
+                seq_length=config.T,
+                seed=seed,
+                max_steps=1,
+            )
+            return next(iter(sample_loader))
+        except Exception:
+            return None
 
     def on_step(_step_metrics: dict):
         nonlocal last_save_path

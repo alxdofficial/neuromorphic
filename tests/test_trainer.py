@@ -88,9 +88,9 @@ class TestTrainChunk:
             losses.append(metrics["loss"])
         assert all(l < 1e6 for l in losses)
 
-    def test_phase_d_without_rl(self):
-        """Phase D (lifelong) — train_chunk should work without RL."""
-        trainer, cfg, model = _make_trainer("D")
+    def test_phase_c_without_rl(self):
+        """Phase C (lifelong) — train_chunk should work without RL."""
+        trainer, cfg, model = _make_trainer("C")
         batch = _make_batch(BS, cfg.T)
         metrics = trainer.train_chunk(batch)
         assert isinstance(metrics, dict)

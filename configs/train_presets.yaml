@@ -1,4 +1,4 @@
-default_preset: phase_a_to_d
+default_preset: phase_a_to_c
 
 defaults:
   output_root: outputs
@@ -24,21 +24,21 @@ presets:
         steps: 5000
         resume: auto_previous
 
-  phase_a_to_d:
-    run_name: phase_a_to_d
+  phase_a_to_c:
+    run_name: phase_a_to_c
     phases:
       - phase: A
         resume: null
       - phase: B
         resume: auto_previous
-      - phase: D
+      - phase: C
         steps: 2500
         resume: auto_previous
 
-  phase_d_from_ckpt:
-    run_name: phase_d_from_ckpt
+  phase_c_from_ckpt:
+    run_name: phase_c_from_ckpt
     phases:
-      - phase: D
+      - phase: C
         steps: 7000
         resume: checkpoints/manual_phase_b_last.pt
 
