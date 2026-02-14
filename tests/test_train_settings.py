@@ -40,6 +40,7 @@ def _args(**overrides):
         "decoder_layers": None,
         "thalamic_tokens": None,
         "n_heads_decoder": None,
+        "compile": None,
     }
     base.update(overrides)
     return argparse.Namespace(**base)

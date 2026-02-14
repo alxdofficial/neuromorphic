@@ -23,10 +23,16 @@ def parallel_affine_scan(a: Tensor, b: Tensor, h_init: Tensor) -> Tensor:
     Returns:
         h_all: [BS, P, D] — hidden states for all P timesteps
     """
-    P = a.shape[1]
+    BS, P, D = a.shape
+    # Promote across all three inputs (a, b, h_init) so higher-precision b
+    # is not silently downcast.  Uses torch.promote_types on dtype objects
+    # (not tensors) so the call is traceable under torch.compile fullgraph.
+    out_dtype = torch.promote_types(
+        torch.promote_types(a.dtype, b.dtype), h_init.dtype
+    )
+    h_all = torch.empty(BS, P, D, dtype=out_dtype, device=a.device)
     h = h_init
-    h_list = []
     for t in range(P):
         h = a[:, t] * h + b[:, t]
-        h_list.append(h)
-    return torch.stack(h_list, dim=1)
+        h_all[:, t] = h
+    return h_all

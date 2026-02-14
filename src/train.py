@@ -180,6 +180,11 @@ def parse_args() -> argparse.Namespace:
                    help="Enable spatial decoder (snapshot_enabled=True)")
     p.add_argument("--no-snapshot", dest="snapshot", action="store_false",
                    help="Disable spatial decoder")
+    # torch.compile
+    p.add_argument("--compile", action="store_true", default=None,
+                   help="Enable torch.compile for CUDA training")
+    p.add_argument("--no-compile", dest="compile", action="store_false",
+                   help="Disable torch.compile")
     p.add_argument("--d-dec", type=int, default=None,
                    help="Decoder working dimension")
     p.add_argument("--decoder-layers", type=int, default=None,
@@ -432,6 +437,12 @@ def resolve_settings(args: argparse.Namespace) -> dict:
             if args.n_heads_decoder is not None
             else preset_payload.get("n_heads_decoder")
         ),
+        # torch.compile
+        "use_compile": (
+            args.compile
+            if args.compile is not None
+            else preset_payload.get("use_compile")
+        ),
     }
 
     if isinstance(settings["resume"], str):
@@ -472,6 +483,8 @@ def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelC
             config.thalamic_tokens = settings["thalamic_tokens"]
         if settings.get("n_heads_decoder") is not None:
             config.n_heads_decoder = settings["n_heads_decoder"]
+        if settings.get("use_compile") is not None:
+            config.use_compile = settings["use_compile"]
     return config
 
 

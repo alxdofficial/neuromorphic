@@ -134,6 +134,11 @@ class TestValidation:
         with pytest.raises(ValueError, match="D_h.*must be >= n_heads_decoder"):
             cfg.validate()
 
+    def test_p_greater_than_w_raises(self):
+        cfg = ModelConfig(P=512, W=256)
+        with pytest.raises(ValueError, match="P.*must be <= W"):
+            cfg.validate()
+
     def test_valid_config_passes(self):
         cfg = ModelConfig(D=512, B=4, D_wm=128, n_heads_wm=4)
         cfg.validate()  # should not raise

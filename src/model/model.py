@@ -499,6 +499,23 @@ class NeuromorphicLM(nn.Module, StateMixin):
         for block in self.blocks:
             block.detach_states()
 
+    def compile_for_training(self):
+        """Apply torch.compile to performance-critical submodules.
+
+        Compiles each Layer (fusing gates + scan + output proj + FFN) and
+        each PM's eligibility update (fusing projections + gating + scan).
+        WM is NOT compiled because forward_span has a data-dependent dispatch
+        (reset_mask_all[:, 1:].any()) that would cause graph breaks.
+        """
+        for block in self.blocks:
+            for layer in block.layers:
+                layer.forward_span = torch.compile(
+                    layer.forward_span, fullgraph=True,
+                )
+                layer.pm.update_eligibility_batch = torch.compile(
+                    layer.pm.update_eligibility_batch, fullgraph=True,
+                )
+
     def param_count(self) -> int:
         """Total trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

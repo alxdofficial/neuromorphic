@@ -49,7 +49,8 @@ DEFAULTS = dict(
     em_readout_ffn=True,
     # Training
     T=256,
-    P=32,
+    P=64,
+    use_compile=False,
     # FFN
     ffn_expansion=4,
     # Decoder

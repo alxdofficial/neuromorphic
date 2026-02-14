@@ -131,23 +131,33 @@ def accumulate_span_surprise(
     span_valid_tokens: Tensor,
     span_last_reset: Tensor,
 ) -> Tensor:
-    """Per-token loop: accumulate surprise, handle resets.
+    """Vectorized surprise accumulation over a span.
 
     Mutates span_surprise_accum, span_valid_tokens, span_last_reset in-place.
     Returns span_surprise_mean [BS].
     """
-    span_P = loss_mask_all.shape[1]
+    BS, span_P = loss_mask_all.shape
+    device = loss_mask_all.device
 
-    for t_local in range(span_P):
-        reset_t = reset_mask_all[:, t_local]
-        if reset_t.any() and reset_on_doc_boundary:
-            span_last_reset[reset_t] = t_local
-            span_surprise_accum[reset_t] = 0
-            span_valid_tokens[reset_t] = 0
+    # Find last reset position per stream
+    if reset_on_doc_boundary and reset_mask_all.any():
+        positions = torch.arange(span_P, device=device).unsqueeze(0)  # [1, P]
+        reset_pos = (reset_mask_all.float() * positions).max(dim=1).values.long()  # [BS]
+        has_reset = reset_mask_all.any(dim=1)  # [BS]
+        span_last_reset[has_reset] = reset_pos[has_reset]
+    else:
+        reset_pos = span_last_reset
 
-        lm = loss_mask_all[:, t_local]
-        span_surprise_accum.add_(token_surprise[:, t_local, 0] * lm.float())
-        span_valid_tokens.add_(lm.float())
+    # Mask: only tokens at or after last reset, AND in loss mask
+    positions = torch.arange(span_P, device=device).unsqueeze(0)  # [1, P]
+    after_reset = positions >= span_last_reset.unsqueeze(1)  # [BS, P]
+    effective = after_reset & loss_mask_all.bool()  # [BS, P]
+    effective_f = effective.float()
+
+    # Vectorized sum
+    surprise_vals = token_surprise[:, :, 0] * effective_f  # [BS, P]
+    span_surprise_accum.copy_(surprise_vals.sum(dim=1))
+    span_valid_tokens.copy_(effective_f.sum(dim=1))
 
     return span_surprise_accum / span_valid_tokens.clamp(min=1)
 

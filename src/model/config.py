@@ -65,7 +65,8 @@ class ModelConfig:
 
     # Training
     T: int = 256              # TBPTT segment length
-    P: int = 32               # plasticity span
+    P: int = 64               # plasticity span
+    use_compile: bool = False # torch.compile for CUDA training
     reset_on_doc_boundary: bool = True
     lifelong_mode: bool = False  # Phase C: PM/EM persist across doc boundaries
 
@@ -116,6 +117,11 @@ class ModelConfig:
             raise ValueError(
                 f"D_wm ({self.D_wm}) must be divisible by "
                 f"n_heads_wm ({self.n_heads_wm}) for WM attention."
+            )
+        if self.P > self.W:
+            raise ValueError(
+                f"P ({self.P}) must be <= W ({self.W}) so the "
+                f"batched WM attention span fits within the cache."
             )
 
     def set_phase(self, phase: str):

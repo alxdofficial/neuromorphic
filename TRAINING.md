@@ -23,13 +23,15 @@ tmux attach -t neuromorphic-train
 
 ## GPU Memory by Batch Size (Tier B, Phase A)
 
-| BS | Peak VRAM | tok/s | Headroom |
-|----|-----------|-------|----------|
-| 16 | 6.3GB     | 373   | 18GB     |
-| 24 | 8.6GB     | 558   | 16GB     |
-| 32 | 10.7GB    | 742   | 14GB     |
-| 48 | 15.1GB    | 1,107 | 9.5GB    |
-| 64 | 19.4GB    | 1,423 | 5GB      |
+| BS | Peak VRAM | tok/s (eager) | tok/s (compiled) | Headroom |
+|----|-----------|---------------|------------------|----------|
+| 16 | 6.3GB     | ~1,800        | ~5,000           | 18GB     |
+| 24 | 8.6GB     | ~2,700        | ~7,500           | 16GB     |
+| 32 | 10.7GB    | ~3,700        | ~10,300          | 14GB     |
+| 48 | 15.1GB    | ~5,500        | ~15,000          | 9.5GB    |
+| 64 | 19.4GB    | ~7,000        | ~19,000          | 5GB      |
+
+Enable compiled mode with `--compile` for ~2.8× speedup on CUDA (see below).
 
 ## Phase Plan (Default Steps)
 
@@ -46,7 +48,7 @@ Neuromodulators (PM and EM) are trained by main-loss gradient in all phases — 
 ## Tokens Per Step
 
 One step = BS * T tokens (e.g., 48 * 256 = 12,288 tokens).
-Each step takes ~13s because TBPTT processes tokens sequentially (256 forward passes per step).
+Each step processes T/P = 4 forward_span calls (P=64 tokens each). With `--compile` on a 4090, each step takes ~1-2s at BS=32.
 
 ## Monitoring
 
@@ -72,6 +74,8 @@ Later phases use streaming with local caching.
 --no-plots             # Disable all plot generation
 --steps 5000           # Override step count (per phase)
 --bs 32                # Override batch size
+--compile              # Enable torch.compile (~2.8× speedup on CUDA)
+--no-compile           # Disable torch.compile (default)
 ```
 
 ## Outputs

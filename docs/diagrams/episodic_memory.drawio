@@ -190,7 +190,7 @@
         </mxCell>
 
         <!-- ===================== RESET ANNOTATION ===================== -->
-        <mxCell id="70" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Doc Boundary Reset (per stream):&lt;/b&gt;&lt;br&gt;• em_S[stream] = 0 (deactivate all slots)&lt;br&gt;• em_K, em_V persist but effectively masked inactive&lt;br&gt;• Phase E: skip reset for lifelong memory&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+        <mxCell id="70" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Doc Boundary Reset (per stream):&lt;/b&gt;&lt;br&gt;• em_S[stream] = 0 (deactivate all slots)&lt;br&gt;• em_K, em_V persist but effectively masked inactive&lt;br&gt;• Phase C: skip reset for lifelong memory&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0ff;strokeColor=#9999cc;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
           <mxGeometry x="590" y="830" width="340" height="75" as="geometry"/>
         </mxCell>
 

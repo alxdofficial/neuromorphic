@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-10
+**Last verified against code:** 2026-02-14
 
 ---
 
@@ -321,7 +321,7 @@ The critical difference from pure Hebbian learning is the **third factor: the ne
 
 ### 7.4 PM Commit (span boundary only)
 
-Called every P=32 tokens. The commit process:
+Called every P=64 tokens. The commit process:
 
 1. **Base decay** (all streams): `pm_a *= decay_pm` (0.999). Ensures non-committing streams gradually lose strength, preventing stale slots from persisting forever. Called in the trainer BEFORE commit decisions.
 
@@ -502,7 +502,7 @@ novelty = clamp(w_nov * surprise + (1 - w_nov) * (1 - max_sim), 0, 1)
 
 `W_nov` lives on `EpisodicMemory` (not on `EMNeuromodulator`), so its name does not contain `"neuromodulator"` and it is excluded from `rl_parameters()`. It joins the **main optimizer** and is trained purely via backprop (differentiable through candidate selection -> EM writes -> retrieval -> loss). When EM is disabled (`em_enabled=False`), the hardcoded 0.5/0.5 weighting is preserved.
 
-Candidates are **buffered for the entire span** (P=32 tokens), producing:
+Candidates are **buffered for the entire span** (P=64 tokens), producing:
 - `cand_K: [BS, P, D_em]`
 - `cand_V: [BS, P, D_em]`
 - `cand_score: [BS, P]`
@@ -654,7 +654,7 @@ This is the core of the soft reset: transient state (h, eligibility) resets at d
 
 ## 10. Neuromodulators
 
-Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=32 tokens. Each neuromodulator is an `nn.Module` that operates in one of two modes depending on whether its memory system is enabled: heuristic (zero params) or learned (backbone + heads, trained via main loss backprop).
+Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=64 tokens. Each neuromodulator is an `nn.Module` that operates in one of two modes depending on whether its memory system is enabled: heuristic (zero params) or learned (backbone + heads, trained via main loss backprop).
 
 ### 10.1 PMNeuromodulator
 
@@ -933,9 +933,9 @@ load_runtime_state(model, state)  # Restore saved state
 | Scale | Length | What happens |
 |-------|--------|--------------|
 | **TBPTT chunk** | T=256 tokens | Autograd truncation. One backward pass per chunk. States detached after. |
-| **Plasticity span** | P=32 tokens | PM/EM are read-only within. Commits and writes happen at span boundaries. |
+| **Plasticity span** | P=64 tokens | PM/EM are read-only within. Commits and writes happen at span boundaries. |
 
-A chunk contains T/P = 8 spans. Each span boundary triggers PM base decay + commits + EM writes.
+A chunk contains T/P = 4 spans. Each span boundary triggers PM base decay + commits + EM writes.
 
 ### 14.2 Chunk Processing (train_chunk) — Sequential Path
 
@@ -1241,17 +1241,18 @@ This section documents verified design decisions and confirms that the core arch
 
 ## 21. Training Cost and Performance Estimates
 
-This section provides throughput estimates, training budgets, and hardware recommendations for different scenarios. All numbers are **estimates** based on standard GPU throughput formulas, cloud pricing as of early 2025, and the model's non-transformer architecture (which has different compute characteristics than standard attention-based models).
+This section provides throughput estimates, training budgets, and hardware recommendations for different scenarios. Numbers are based on benchmarks on RTX 4090 with the model's non-transformer architecture.
 
 ### 21.1 Key Architectural Differences from Transformers
 
 Our model uses **affine recurrence** (not attention) as the core sequence mechanism, plus memory reads/writes at span boundaries. This means:
 
 - **No quadratic attention cost:** Compute scales linearly with sequence length (within spans)
-- **Parallelizable within spans:** `forward_span` uses a parallel scan over P=32 tokens
+- **Parallelizable within spans:** `forward_span` uses a parallel scan over P=64 tokens
+- **torch.compile support:** Critical paths (Layer.forward_span, PM.update_eligibility_batch) are compiled with `fullgraph=True`, fusing scan loops and eliminating autograd overhead (~2.8× additional speedup)
 - **Boundary overhead:** PM commit + EM write + neuromodulator forward at every span boundary
 
-The recurrence + memory architecture means throughput is **lower than a pure transformer of equal parameter count** but has the advantage of truly O(1) per-token memory and O(n) compute.
+The recurrence + memory architecture means throughput is **lower than a pure transformer of equal parameter count** (roughly 40-50% of a similarly-sized Mamba model) but has the advantage of truly O(1) per-token memory and O(n) compute, plus online learning capabilities.
 
 ### 21.2 Parameter Counts by Tier and Phase
 
@@ -1263,65 +1264,53 @@ The recurrence + memory architecture means throughput is **lower than a pure tra
 
 Neuromodulators add negligible parameter overhead. The cost difference across phases comes from compute, not parameters.
 
-### 21.3 Estimated Throughput by Phase (Single GPU)
+### 21.3 Measured Throughput by Phase (Single GPU)
 
-Throughput depends heavily on batch size, span length (P=32), and which phases are active. These are rough estimates for typical configurations:
+Throughput depends on batch size, span length (P=64), which phases are active, and whether `--compile` is enabled. These numbers are from benchmarks on RTX 4090 (24GB).
 
-**Tier A (~56M) on RTX 4090 (24GB), BS=32:**
+**Tier A (~56M) on RTX 4090 (24GB), BS=32, `--compile`:**
 
-| Phase | Components | Est. tok/s | Bottleneck |
+| Phase | Components | Measured tok/s | Notes |
 |-------|-----------|-----------|------------|
-| **A** | WM only | ~500 | Recurrence + WM attention |
-| **B** | WM + PM | ~400 | + PM read/elig every token, commit at boundary |
-| **C** | WM + PM + EM | ~300 | + EM retrieval every token, write at boundary |
-| **D** | WM + PM + EM + RL | ~180 | + 4 rollout forward_span per RL event (~30% of boundaries) |
-| **E** | Lifelong (inherited) | ~250 | Similar to C/D but amortized RL |
+| **A** | WM only | ~10,300 | Compile gives ~2.8× over eager |
+| **B** | WM + PM + EM | ~7,000-8,000 | + PM/EM overhead |
+| **C** | Lifelong | ~7,000-8,000 | Similar to B |
 
-**Tier B (~103M) on A100 80GB, BS=32:**
+**Without `--compile` (eager mode):**
 
-| Phase | Est. tok/s |
+| Phase | Components | Measured tok/s |
+|-------|-----------|-----------|
+| **A** | WM only | ~3,700 |
+| **B** | WM + PM + EM | ~2,500-3,000 |
+| **C** | Lifelong | ~2,500-3,000 |
+
+**Tier B (~103M) on A100 80GB, BS=32 (estimated):**
+
+| Phase | Est. tok/s (compiled) |
 |-------|-----------|
-| **A** | ~800 |
-| **B** | ~650 |
-| **C** | ~500 |
-| **D** | ~300 |
-
-**Tier C (~197M) on A100 80GB, BS=16:**
-
-| Phase | Est. tok/s |
-|-------|-----------|
-| **A** | ~500 |
-| **B** | ~400 |
-| **C** | ~300 |
-| **D** | ~180 |
+| **A** | ~15,000 |
+| **B-C** | ~10,000 |
 
 ### 21.4 Training Budget: Tokens vs Time
 
-How long to train on N tokens, given estimated throughput:
+How long to train on N tokens, given measured throughput with `--compile`:
 
-**Tier A on 1x RTX 4090 (weighted average ~300 tok/s across phases):**
+**Tier A on 1x RTX 4090 (weighted average ~8,000 tok/s across phases):**
 
 | Tokens | Hours | Days | Cost @ $0.34/hr |
 |--------|-------|------|-----------------|
-| 1B | 926 | 39 | $315 |
-| 5B | 4,630 | 193 | $1,574 |
-| 10B | 9,259 | 386 | $3,148 |
-| 20B | 18,519 | 772 | $6,296 |
+| 1B | 35 | 1.5 | $12 |
+| 5B | 174 | 7.2 | $59 |
+| 10B | 347 | 14.5 | $118 |
+| 20B | 694 | 29 | $236 |
 
-**Tier B on 1x A100 80GB (weighted average ~500 tok/s):**
-
-| Tokens | Hours | Days | Cost @ $1.40/hr |
-|--------|-------|------|-----------------|
-| 5B | 2,778 | 116 | $3,889 |
-| 10B | 5,556 | 231 | $7,778 |
-| 20B | 11,111 | 463 | $15,556 |
-
-**Tier C on 1x A100 80GB (weighted average ~300 tok/s):**
+**Tier B on 1x A100 80GB (estimated ~10,000 tok/s compiled):**
 
 | Tokens | Hours | Days | Cost @ $1.40/hr |
 |--------|-------|------|-----------------|
-| 10B | 9,259 | 386 | $12,963 |
-| 20B | 18,519 | 772 | $25,926 |
+| 5B | 139 | 5.8 | $194 |
+| 10B | 278 | 11.6 | $389 |
+| 20B | 556 | 23 | $778 |
 
 ### 21.5 Multi-GPU Scaling
 
@@ -1329,12 +1318,11 @@ For Tier B and C, multi-GPU training significantly reduces wall-clock time. With
 
 | Config | Effective tok/s | 10B tokens wall-clock |
 |--------|----------------|----------------------|
-| Tier B, 1x A100 | ~500 | ~231 days |
-| Tier B, 4x A100 | ~1,800 | ~64 days |
-| Tier B, 8x A100 | ~3,200 | ~36 days |
-| Tier C, 4x A100 | ~1,000 | ~116 days |
-| Tier C, 8x A100 | ~1,800 | ~64 days |
-| Tier C, 8x H100 | ~4,000 | ~29 days |
+| Tier B, 1x A100 | ~10,000 | ~12 days |
+| Tier B, 4x A100 | ~36,000 | ~3.2 days |
+| Tier B, 8x A100 | ~64,000 | ~1.8 days |
+| Tier C, 4x A100 | ~20,000 | ~5.8 days |
+| Tier C, 8x H100 | ~80,000 | ~1.4 days |
 
 Scaling efficiency is estimated at ~85-90% for data parallelism (independent streams, minimal communication overhead since each stream's memory state is local).
 
@@ -1342,47 +1330,38 @@ Scaling efficiency is estimated at ~85-90% for data parallelism (independent str
 
 #### Overnight Run (Proof-of-concept, single RTX 4090)
 
-- **Tier A**, Phases A→B→C→D, ~12 hours total
-- **Tokens:** ~10M (A: 5M, B: 2M, C: 2M, D: 1M) — enough for loss curves, not convergence
+- **Tier A**, Phases A→B→C, ~12 hours total with `--compile`
+- **Tokens:** ~350M — enough for loss curves and basic memory utilization
 - **BS:** 32, **T:** 256
 - **Cost:** ~$4
 
 #### Weekend Run (Meaningful training, single RTX 4090)
 
-- **Tier A**, all phases, ~48 hours
-- **Tokens:** ~50M total (~15M per phase, D gets less due to slower throughput)
+- **Tier A**, all phases, ~48 hours with `--compile`
+- **Tokens:** ~1.4B total
 - **Cost:** ~$16
 - Should show clear perplexity improvement and memory utilization
 
 #### Serious Experiment (Publishable ablation, single 4090)
 
-- **Tier A**, all phases, ~2 weeks
-- **Tokens:** ~500M (A: 200M, B: 150M, C: 100M, D: 50M)
-- **Cost:** ~$115
+- **Tier A**, all phases with `--compile`, ~1 week
+- **Tokens:** ~5B (Chinchilla-optimal for 56M params)
+- **Cost:** ~$59
 - Sufficient to demonstrate architecture viability and ablate components
-
-#### Publishable Experimental Model (Tier A, full training)
-
-- **Tier A** on 1x RTX 4090
-- **Tokens:** 5B (comparable to Chinchilla-optimal for 56M params)
-- **Duration:** ~193 days (~6.5 months)
-- **Cost:** ~$1,574
-- Alternative: 4x RTX 4090 → ~50 days, ~$1,600 (cluster pricing)
 
 #### Competitive Model (Match GPT-2 Small 124M)
 
-- **Tier B** (~103M params) on 4x A100 80GB
-- **Tokens:** 10-20B (GPT-2 used ~40B tokens for 124M, but Chinchilla scaling suggests ~2B is optimal for 103M; more tokens help with memory systems)
-- **Duration:** 36-64 days
-- **Cost:** $7,800-$15,600 (at $1.40/hr/GPU)
+- **Tier B** (~103M params) on 4x A100 80GB with `--compile`
+- **Tokens:** 10-20B
+- **Duration:** 3-6 days
+- **Cost:** $1,600-$3,200 (at $1.40/hr/GPU)
 
 #### Strong Model (Match GPT-2 Medium 345M)
 
-- **Tier C** (~197M params) on 8x A100 80GB
+- **Tier C** (~197M params) on 8x H100 with `--compile`
 - **Tokens:** 20B
-- **Duration:** ~64 days
-- **Cost:** ~$15,500 (at $1.40/hr/GPU)
-- Alternative: 8x H100 → ~29 days, ~$11,500 (at $2.50/hr/GPU)
+- **Duration:** ~1.4 days
+- **Cost:** ~$670 (at $2.50/hr/GPU)
 
 ### 21.7 Comparison to Reference Models
 

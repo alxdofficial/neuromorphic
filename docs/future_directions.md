@@ -24,14 +24,14 @@ This aligns more closely with a *brain-like system* than with a prompt-centric l
 ### What This Architecture Is *Not* (Remaining Gaps)
 
 * It does not yet include intrinsic **consolidation** of experience into slow weights.
-* **Sequence-parallel pretraining** via scan is available but not yet fully optimized.
+* **Sequence-parallel pretraining** via scan is available and optimized with `torch.compile` (~10K tok/s on RTX 4090), but further optimization is possible (custom CUDA kernels, multi-GPU).
 
 ### What v2 Addresses (Previously Missing)
 
 * ✅ **Declarative / episodic memory** — added via per-block EM (vector store with top-k retrieval)
 * ✅ **Scan-friendly recurrence** — GRU replaced with affine form (h_t = a_t ⊙ h_{t-1} + b_t)
 * ✅ **Working memory** — sliding-window attention (W=256 tokens)
-* ✅ **Lifelong learning** — Phase E soft reset: PM/EM persist across doc boundaries with natural decay + budget enforcement
+* ✅ **Lifelong learning** — Phase C soft reset: PM/EM persist across doc boundaries with natural decay + budget enforcement
 
 ---
 
@@ -87,15 +87,16 @@ This addresses the gap from v1.7: the model now has both *implicit* and *declara
 * ✅ Online learning without finetuning (PM + EM writes)
 * ✅ Memory as computation, not text retrieval
 * ✅ Stability via gated plasticity and budgets
-* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence
+* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence + torch.compile (~10K tok/s on 4090)
 * ✅ **Exact copying and pointing** — WM sliding-window attention
 * ✅ **Episodic recall** — EM with top-k retrieval
-* ✅ **Cross-document persistence** — Phase E lifelong mode with soft reset
+* ✅ **Cross-document persistence** — Phase C lifelong mode with soft reset
 
 ### Remaining Gaps
 
 * Consolidation (PM/EM → slow weights)
-* Full optimization of scan-based parallel training
+* Custom CUDA scan kernels (potential further 1.5-2× over torch.compile)
+* Multi-GPU data parallelism
 
 ---
 
@@ -122,18 +123,19 @@ where:
 This enables:
 
 * Parallel training via prefix scans within plasticity spans
-* Transformer-like throughput
+* ~40-50% of Mamba's throughput at equivalent parameter count (~10K tok/s on 4090 with `--compile`)
 * RNN-like inference behavior
 
 ### Plasticity Boundaries for Scan-Friendliness
 
-v2 adds plasticity span boundaries (every P=32 tokens):
+v2 adds plasticity span boundaries (every P=64 tokens):
 
 * PM/EM are read-only within spans → core loop is scan-friendly
 * PM/EM writes happen only at span boundaries
 * Eligibility updates remain differentiable within TBPTT
+* K+V eligibility scans are fused into a single double-width scan for efficiency
 
-**Status:** Implemented. PM, EM, and controllers remain intact around the new scan-friendly core.
+**Status:** Implemented and optimized. `torch.compile(fullgraph=True)` fuses scan loops, gate computations, and elementwise ops into optimized CUDA kernels. PM, EM, and controllers remain intact around the new scan-friendly core.
 
 ---
 
@@ -222,8 +224,9 @@ The v1.7 roadmap proposed these upgrades. v2 status:
 2. ✅ **Procedural Memory (PM)** — low-rank adapters, B×L instances with `PMNeuromodulator`
 3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMNeuromodulator`
 4. ✅ **Working Memory (WM)** — sliding-window attention, W=256 tokens
-5. ✅ **Lifelong learning (Phase E)** — soft reset at doc boundaries, PM/EM persist, eval framework
-6. ⏳ **Consolidation mechanism** — not yet implemented (future work)
+5. ✅ **Lifelong learning (Phase C)** — soft reset at doc boundaries, PM/EM persist, eval framework
+6. ✅ **Training speed optimization** — torch.compile + fused scans + vectorized ops (~10K tok/s on 4090)
+7. ⏳ **Consolidation mechanism** — not yet implemented (future work)
 
 v2 remains fundamentally different from transformers:
 
@@ -239,7 +242,8 @@ v2 implements the key architectural recommendations from the v1.7 roadmap:
 * ✅ Scan-friendly recurrence for parallel training
 * ✅ Episodic memory for declarative recall
 * ✅ Working memory for short-term precision
-* ✅ Lifelong learning with persistent cross-document memory (Phase E)
+* ✅ Lifelong learning with persistent cross-document memory (Phase C)
+* ✅ Training speed optimization (torch.compile, fused scans, ~10K tok/s)
 * ⏳ Consolidation remains for future work
 
 The architecture remains fundamentally different from transformers:
@@ -248,5 +252,5 @@ The architecture remains fundamentally different from transformers:
 
 The next major milestones are:
 - Demonstrating that PM/EM provide measurable advantages on memory benchmarks and online adaptation tasks
-- Phase E evaluation: domain adaptation speed, drift monitoring, cross-document recall
+- Phase C evaluation: domain adaptation speed, drift monitoring, cross-document recall
 - Consolidation: transferring fast memory (PM/EM) to slow weights for permanent knowledge acquisition

@@ -116,6 +116,16 @@ class TestParallelAffineScan:
         expected_last = b.sum(dim=1)  # cumulative sum
         _assert_tensors_close(result[:, -1], expected_last, "accum_last", atol=1e-5)
 
+    def test_preserves_h_init_dtype(self):
+        """Output dtype matches promoted dtype when h_init is higher precision."""
+        a = torch.rand(BS, P, 16, dtype=torch.bfloat16)
+        b = torch.rand(BS, P, 16, dtype=torch.bfloat16)
+        h_init = torch.rand(BS, 16, dtype=torch.float32)
+
+        result = parallel_affine_scan(a, b, h_init)
+        assert result.dtype == torch.float32, \
+            f"Expected float32 (from h_init promotion), got {result.dtype}"
+
     def test_carry_integration(self):
         """a_eff = a * carry produces correct reset behavior."""
         torch.manual_seed(42)
@@ -390,6 +400,48 @@ class TestWMForwardSpan:
         _assert_tensors_close(par_out, seq_out, "wm_reset_output", atol=1e-5)
         assert (wm_par.wm_valid == wm_seq.wm_valid).all()
         assert (wm_par.wm_ptr == wm_seq.wm_ptr).all()
+
+    def test_matches_sequential_with_warm_cache(self):
+        """Batched path matches sequential when cache is fully populated.
+
+        Exercises the overwrite masking: when the ring buffer wraps and
+        overwrites previously valid entries, the stale cache values must
+        not leak through alongside the fresh span values.
+        """
+        cfg = make_tiny_config()  # W=16, P=4
+        wm = WorkingMemory(cfg)
+        torch.manual_seed(42)
+
+        # Fill the entire cache (W/P = 4 spans) so all entries are valid
+        wm._lazy_init(BS, torch.device("cpu"))
+        no_reset = torch.zeros(BS, P, dtype=torch.bool)
+        for _ in range(cfg.W // P):
+            x_fill = torch.randn(BS, P, cfg.D)
+            wm.forward_span(x_fill, no_reset)
+        assert wm.wm_valid.all(), "Cache should be fully valid"
+        assert (wm.wm_ptr == 0).all(), "Pointer should wrap to 0"
+
+        # Detach state so deepcopy works (state is non-leaf after forward)
+        wm.wm_K = wm.wm_K.detach()
+        wm.wm_V = wm.wm_V.detach()
+
+        # Now run one more span — this overwrites positions 0..P-1
+        x_test = torch.randn(BS, P, cfg.D)
+
+        wm_seq = copy.deepcopy(wm)
+        seq_out = []
+        for t in range(P):
+            seq_out.append(wm_seq.step(x_test[:, t], no_reset[:, t]))
+        seq_out = torch.stack(seq_out, dim=1)
+
+        wm_par = copy.deepcopy(wm)
+        par_out = wm_par.forward_span(x_test, no_reset)
+
+        _assert_tensors_close(par_out, seq_out, "wm_warm_cache_output", atol=1e-5)
+        _assert_tensors_close(wm_par.wm_K, wm_seq.wm_K, "wm_warm_K", atol=1e-5)
+        _assert_tensors_close(wm_par.wm_V, wm_seq.wm_V, "wm_warm_V", atol=1e-5)
+        assert (wm_par.wm_valid == wm_seq.wm_valid).all(), "wm_valid mismatch"
+        assert (wm_par.wm_ptr == wm_seq.wm_ptr).all(), "wm_ptr mismatch"
 
 
 # ============================================================

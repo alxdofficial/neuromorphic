@@ -194,9 +194,13 @@ class ProceduralMemory(nn.Module, StateMixin):
         h_K_init = self.elig_K.reshape(BS, r * D_h)
         h_V_init = self.elig_V.reshape(BS, r * D_h)
 
-        # Affine scan: elig_t = a_t * elig_{t-1} + b_t
-        elig_K_all = parallel_affine_scan(a_flat, b_K_flat, h_K_init)
-        elig_V_all = parallel_affine_scan(a_flat, b_V_flat, h_V_init)
+        # Fused K+V scan: one double-width scan instead of two separate
+        b_KV = torch.cat([b_K_flat, b_V_flat], dim=-1)       # [BS, P, 2*r*D_h]
+        a_KV = torch.cat([a_flat, a_flat], dim=-1)            # [BS, P, 2*r*D_h]
+        h_KV_init = torch.cat([h_K_init, h_V_init], dim=-1)  # [BS, 2*r*D_h]
+
+        elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)  # [BS, P, 2*r*D_h]
+        elig_K_all, elig_V_all = elig_KV_all.chunk(2, dim=-1)
 
         # Update state to last token
         self.elig_K = elig_K_all[:, -1].reshape(BS, r, D_h)

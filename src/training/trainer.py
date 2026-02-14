@@ -63,6 +63,10 @@ class TBPTTTrainer:
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
 
+        # torch.compile critical paths for CUDA training
+        if config.use_compile and device.type == "cuda":
+            model.compile_for_training()
+
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""
         pm_util = None

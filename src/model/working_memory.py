@@ -136,9 +136,8 @@ class WorkingMemory(nn.Module, StateMixin):
     def forward_span(self, x_all: Tensor, reset_mask_all: Tensor) -> Tensor:
         """Process P tokens in parallel through working memory.
 
-        Batches the Q/K/V projections across all P tokens, then runs
-        per-token attention sequentially (matching step() exactly).
-        The sequential attention is not the bottleneck — the projections are.
+        Dispatches to batched path when no mid-span resets exist (common case),
+        falls back to sequential path for mid-span resets (rare).
 
         Args:
             x_all: [BS, P, D] — token embeddings for all span tokens
@@ -153,12 +152,25 @@ class WorkingMemory(nn.Module, StateMixin):
         if self.wm_K is None:
             self._lazy_init(BS, device)
 
-        # Batch projections (the expensive part)
+        # Batch projections (shared by both paths)
         q_all = self.W_q(x_all)   # [BS, P, D_wm]
         k_all = self.W_k(x_all)   # [BS, P, D_wm]
         v_all = self.W_v(x_all)   # [BS, P, D_wm]
 
-        # Sequential attention per token (matches step() exactly)
+        if reset_mask_all[:, 1:].any():
+            # Mid-span reset (rare) — fall back to sequential
+            return self._forward_span_sequential(
+                q_all, k_all, v_all, reset_mask_all, BS, P, device
+            )
+        return self._forward_span_batched(
+            q_all, k_all, v_all, reset_mask_all, BS, P, device
+        )
+
+    def _forward_span_sequential(
+        self, q_all: Tensor, k_all: Tensor, v_all: Tensor,
+        reset_mask_all: Tensor, BS: int, P: int, device: torch.device,
+    ) -> Tensor:
+        """Sequential per-token attention (fallback for mid-span resets)."""
         outputs = []
         for t in range(P):
             reset_t = reset_mask_all[:, t]
@@ -209,3 +221,114 @@ class WorkingMemory(nn.Module, StateMixin):
             self.wm_ptr = (ptr + 1) % self.W
 
         return torch.stack(outputs, dim=1)  # [BS, P, D]
+
+    def _forward_span_batched(
+        self, q_all: Tensor, k_all: Tensor, v_all: Tensor,
+        reset_mask_all: Tensor, BS: int, P: int, device: torch.device,
+    ) -> Tensor:
+        """Batched causal attention over [cache + span] (no mid-span resets).
+
+        Handles first-token resets only. Builds a combined KV of
+        [wm_K, k_all] and uses a carefully constructed mask for exact
+        sequential equivalence.
+        """
+        W = self.W
+
+        # --- Handle first-token resets (invalidate cache for those streams) ---
+        reset_first = reset_mask_all[:, 0]  # [BS]
+        if reset_first.any():
+            self.wm_valid = self.wm_valid.clone()
+            self.wm_valid[reset_first] = False
+            self.wm_ptr = self.wm_ptr.clone()
+            self.wm_ptr[reset_first] = 0
+
+        wm_ptr = self.wm_ptr  # [BS] — starting write pointer
+
+        # --- Build combined KV: [cache | span] → [BS, W+P, D_wm] ---
+        combined_K = torch.cat([self.wm_K, k_all], dim=1)  # [BS, W+P, D_wm]
+        combined_V = torch.cat([self.wm_V, v_all], dim=1)  # [BS, W+P, D_wm]
+
+        # --- Build attention mask [BS, P, W+P] ---
+        # Cache portion: per-query validity excluding overwritten positions
+        offsets = torch.arange(P, device=device)  # [P]
+        write_pos = (wm_ptr.unsqueeze(1) + offsets.unsqueeze(0)) % W  # [BS, P]
+
+        # write_onehot[b, t, w] = True if span token t writes to cache position w
+        write_onehot = torch.zeros(BS, P, W, dtype=torch.bool, device=device)
+        write_onehot.scatter_(2, write_pos.unsqueeze(-1), True)
+
+        # cumulative_overwrite[b, t, w] = True if any token 0..t writes to position w
+        # For query at position t, cache positions overwritten by tokens 0..t must
+        # be masked — the old values are stale, and the fresh values are already
+        # available in the span portion of the combined KV via the causal mask.
+        cumulative_overwrite = write_onehot.cumsum(dim=1).bool()  # [BS, P, W]
+
+        # Cache valid per query: original validity minus overwritten positions
+        cache_valid_per_query = self.wm_valid.unsqueeze(1).expand(BS, P, W) & ~cumulative_overwrite
+        # [BS, P, W]
+
+        # Span portion: lower-triangular causal mask (token t attends to 0..t)
+        span_causal = torch.tril(torch.ones(P, P, dtype=torch.bool, device=device))
+        span_causal = span_causal.unsqueeze(0).expand(BS, P, P)  # [BS, P, P]
+
+        # Combined mask: [BS, P, W+P]
+        attn_mask = torch.cat([cache_valid_per_query, span_causal], dim=2)
+
+        # --- Multi-head attention ---
+        # Reshape for multi-head: Q [BS, P, n_heads, head_dim]
+        q_h = q_all.view(BS, P, self.n_heads, self.head_dim)
+        K_h = combined_K.view(BS, W + P, self.n_heads, self.head_dim)
+        V_h = combined_V.view(BS, W + P, self.n_heads, self.head_dim)
+
+        # Transpose to [BS, n_heads, seq, head_dim]
+        q_h = q_h.transpose(1, 2)    # [BS, n_heads, P, head_dim]
+        K_h = K_h.transpose(1, 2)    # [BS, n_heads, W+P, head_dim]
+        V_h = V_h.transpose(1, 2)    # [BS, n_heads, W+P, head_dim]
+
+        # Attention scores: [BS, n_heads, P, W+P]
+        attn = torch.matmul(q_h, K_h.transpose(-2, -1)) * self.scale
+
+        # Apply mask: [BS, 1, P, W+P] broadcast over heads
+        attn_mask_4d = attn_mask.unsqueeze(1)  # [BS, 1, P, W+P]
+        attn = attn.masked_fill(~attn_mask_4d, float("-inf"))
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = attn.nan_to_num(0.0)  # all-invalid -> zero attention
+
+        # Weighted sum: [BS, n_heads, P, head_dim]
+        out = torch.matmul(attn, V_h)
+
+        # Merge heads: [BS, P, D_wm]
+        out = out.transpose(1, 2).reshape(BS, P, self.D_wm)
+
+        # Output projection: [BS, P, D]
+        y_wm_all = self.W_o(out)
+
+        # --- Differentiable cache update (write all P tokens at once) ---
+        # write_masks[b, t, w] = 1.0 if span token t writes to cache position w
+        write_masks = torch.zeros(BS, P, W, dtype=self.wm_K.dtype, device=device)
+        write_masks.scatter_(2, write_pos.unsqueeze(-1), 1.0)
+
+        # For positions written by multiple span tokens (P > W edge, but P <= W
+        # guaranteed), only the last write matters. Use the last writer's value.
+        # any_written[b, w, 1] = max over t of write_masks[b, t, w]
+        any_written = write_masks.max(dim=1).values.unsqueeze(-1)  # [BS, W, 1]
+
+        # Scatter span k/v into cache positions via einsum
+        new_K = torch.einsum("bpw, bpd -> bwd", write_masks, k_all)  # [BS, W, D_wm]
+        new_V = torch.einsum("bpw, bpd -> bwd", write_masks, v_all)  # [BS, W, D_wm]
+
+        # Differentiable blend: keep old where not overwritten, new where overwritten
+        self.wm_K = self.wm_K * (1 - any_written) + new_K
+        self.wm_V = self.wm_V * (1 - any_written) + new_V
+
+        # --- Update wm_valid and advance wm_ptr ---
+        new_valid = self.wm_valid.clone()
+        # Mark all written positions as valid
+        any_written_bool = any_written.squeeze(-1).bool()  # [BS, W]
+        new_valid = new_valid | any_written_bool
+        self.wm_valid = new_valid
+
+        self.wm_ptr = (wm_ptr + P) % W
+
+        return y_wm_all
