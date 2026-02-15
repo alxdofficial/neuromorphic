@@ -83,21 +83,25 @@ class WorkingMemory(nn.Module, StateMixin):
         k = self.W_k(x)    # [BS, D_wm]
         v = self.W_v(x)    # [BS, D_wm]
 
-        # Write (k, v) into ring buffer using functional scatter.
-        # Avoids cloning the full [BS, W, D_wm] buffer every token while
-        # keeping gradients alive for W_k / W_v.
+        # Write (k, v) into ring buffer.
         ptr = self.wm_ptr  # [BS]
-        write_mask = torch.nn.functional.one_hot(
-            ptr, self.W
-        ).to(dtype=self.wm_K.dtype)  # [BS, W]
-        write_mask_3d = write_mask.unsqueeze(-1)  # [BS, W, 1]
-
-        self.wm_K = self.wm_K * (1 - write_mask_3d) + k.unsqueeze(1) * write_mask_3d
-        self.wm_V = self.wm_V * (1 - write_mask_3d) + v.unsqueeze(1) * write_mask_3d
-
-        # Update validity (non-differentiable bool, clone is cheap)
-        self.wm_valid = self.wm_valid.clone()
         batch_idx = torch.arange(BS, device=device)
+
+        if torch.is_grad_enabled():
+            # Functional scatter keeps gradients alive for W_k / W_v
+            write_mask = torch.nn.functional.one_hot(
+                ptr, self.W
+            ).to(dtype=self.wm_K.dtype)  # [BS, W]
+            write_mask_3d = write_mask.unsqueeze(-1)  # [BS, W, 1]
+            self.wm_K = self.wm_K * (1 - write_mask_3d) + k.unsqueeze(1) * write_mask_3d
+            self.wm_V = self.wm_V * (1 - write_mask_3d) + v.unsqueeze(1) * write_mask_3d
+        else:
+            # In-place index write (no allocation, no autograd overhead)
+            self.wm_K[batch_idx, ptr] = k
+            self.wm_V[batch_idx, ptr] = v
+
+        # Update validity
+        self.wm_valid = self.wm_valid.clone()
         self.wm_valid[batch_idx, ptr] = True
 
         # Multi-head attention over valid entries

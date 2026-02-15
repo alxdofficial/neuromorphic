@@ -127,7 +127,7 @@
         </mxCell>
 
         <!-- EMNeuromodulator -->
-        <mxCell id="52" value="&lt;b&gt;EMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;Heuristic (A–B): write if novelty &gt; 0.3, g_em=0.3&lt;br&gt;Continuous (C): heuristic gate + learned g_em ∈ [0.001, 0.95]&lt;br&gt;Learned (D+): always write, RL-trained g_em&lt;br&gt;&lt;br&gt;Inputs: span_surprise, em_usage, cand_novelty_mean&lt;br&gt;Outputs: write_mask [BS], g_em [BS]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="52" value="&lt;b&gt;EMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;A: disabled (EM off)&lt;br&gt;B–C: learned continuous write parameters (main-loss backprop)&lt;br&gt;No separate RL path&lt;br&gt;&lt;br&gt;Inputs: span_surprise, em_usage, cand_novelty_mean, content_emb&lt;br&gt;Outputs: g_em, τ, ww, decay&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="590" y="155" width="300" height="100" as="geometry"/>
         </mxCell>
 
@@ -135,7 +135,7 @@
         <mxCell id="53" value="&lt;b&gt;Select Top-C Candidates&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;From span buffer, pick C=8 highest novelty:&lt;br&gt;topC_idx = topk(cand_score, C) → [BS, C]&lt;br&gt;K_C, V_C = gather from buffer → [BS, C, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="590" y="295" width="310" height="75" as="geometry"/>
         </mxCell>
-        <mxCell id="54" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;write_mask, g_em&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#9673a6;" edge="1" source="52" target="53" parent="1">
+        <mxCell id="54" value="&lt;font style=&quot;font-size: 9px;&quot;&gt;g_em, τ, ww, decay&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;strokeColor=#9673a6;" edge="1" source="52" target="53" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
@@ -156,7 +156,7 @@
         </mxCell>
 
         <!-- Soft top-k -->
-        <mxCell id="59" value="&lt;b&gt;2. Soft Top-k Selection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;w = soft_topk(scores_slot, k_write=4, τ=1.0) → [BS, M]&lt;br&gt;α = w × g_em × write_mask → [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="59" value="&lt;b&gt;2. Slot Softmax Selection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;w = softmax(scores_slot / τ) → [BS, M]&lt;br&gt;α = w × g_em × score_ok → [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="600" y="515" width="310" height="55" as="geometry"/>
         </mxCell>
         <mxCell id="60" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="58" target="59" parent="1">

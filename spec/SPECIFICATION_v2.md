@@ -2,8 +2,8 @@
 # Brain-Stack Neuromorphic LM — v2 Implementation Specification
 
 **Version:** 2.6
-**Status:** Phases A, B, D implemented; two-mode neuromodulators (heuristic → learned via main-loss backprop); enhanced EM with learned g_em, tau, ww, decay + novelty; no RL — all neuromod params trained by main optimizer; spatial decoder (hierarchical aggregation + deep cross-attention)
-**Last Updated:** 2026-02-12
+**Status:** Phases A, B, C implemented; two-mode neuromodulators (heuristic fallback → learned via main-loss backprop); enhanced EM with learned g_em, tau, ww, decay + novelty; no RL — all neuromod params trained by main optimizer; spatial decoder (hierarchical aggregation + deep cross-attention)
+**Last Updated:** 2026-02-15
 **Primary Constraint:** single RTX 4090 (24GB), mixed precision, persistent-stream TBPTT
 
 This v2 spec is designed to be handed directly to an implementation agent. It intentionally preserves the training-correctness and state semantics learned from v1.7, while adding Working Memory (WM) + Episodic Memory (EM) and making the core **scan-friendly** via an **affine recurrence** and **plasticity updates only at fixed boundaries**.
@@ -102,9 +102,9 @@ All tiers designed to train on a single RTX 4090 (24GB) with bf16 mixed precisio
 
 | Tier | Params | D | L | B | D_h | Target | 4090 BS |
 |------|--------|---|---|---|-----|--------|---------|
-| **A (Debug)** | ~50M | 512 | 8 | 4 | 128 | Rapid iteration, sanity checks | 32–64 |
-| **B (Competitive)** | ~150M | 768 | 12 | 6 | 128 | Match GPT-2 Small scale | 16–32 |
-| **C (Strong)** | ~350M | 1024 | 24 | 8 | 128 | Match GPT-2 Medium scale | 8–16 |
+| **A (Debug)** | ~56M | 512 | 8 | 4 | 128 | Rapid iteration, sanity checks | 32–64 |
+| **B (Competitive)** | ~103M | 768 | 12 | 6 | 128 | Match GPT-2 Small scale | 16–32 |
+| **C (Strong)** | ~197M | 1024 | 24 | 8 | 128 | Match GPT-2 Medium scale | 8–16 |
 
 **Note:** Early LLMs (GPT-1/GPT-2 Small at ~125M) showed meaningful language understanding. Tier B is our target for demonstrating competitive results.
 
@@ -152,7 +152,7 @@ All tiers fit comfortably on a 4090. Tier C leaves headroom for gradient checkpo
 Memory capacities scale with tier. Tier A uses smaller defaults (r=8, W=256, M=256) for rapid iteration. Tier C doubles again (r=32, W=1024, M=1024) for maximum capacity.
 
 **Training:**
-- `P = 32` — plasticity span (tokens)
+- `P = 64` — plasticity span (tokens)
 - `T = 256` — TBPTT segment length (8 spans per segment)
 - `BS = 16` — batch size (persistent streams)
 
@@ -251,20 +251,19 @@ Inputs at boundary:
 - softmax temperature `tau: [BS]` (learned in Phase B+; fixed `tau_em` in Phase A)
 - weakness weight `ww: [BS]` (learned in Phase B+; fixed `weakness_weight_em` in Phase A)
 - decay rate `decay: [BS]` (learned in Phase B+; fixed `decay_em` in Phase A)
-- config: `k_write` slots to update per candidate
+- slot selection over all `M` slots via `softmax(scores / tau)` (no hard top-k)
 
 For each candidate `c` (C is small, e.g. 8), do:
 1) `scores_slot = em_K @ K_C[:, c]` → `[BS, M]`
 2) weakness bias: `scores_slot += -weakness_weight * em_S`
 3) `w = softmax(scores_slot / τ_em)` → `[BS, M]`
-4) sparsify top-k: keep only top `k_write`, renormalize
-5) EMA update:
+4) EMA update:
    - `α = w * g_em` → `[BS, M]`
    - `em_K = normalize((1-α)[...,None]*em_K + α[...,None]*K_C[:,c,None,:])`
    - `em_V = (1-α)[...,None]*em_V + α[...,None]*V_C[:,c,None,:]`
-6) Strength update:
+5) Strength update:
    - `em_S = clamp(em_S + α * f(score_C[:,c]), 0, S_max)`
-7) Apply budget / decay:
+6) Apply budget / decay:
    - per-stream learned decay each span: `em_S *= decay` (decay is per-stream from EMNeuromodulator, in [decay_em_floor, decay_em_ceil])
    - enforce `sum(em_S, dim=-1) <= budget_em` via scaling (per-stream)
 
@@ -303,12 +302,13 @@ Follows the **neo-Hebbian three-factor learning rule**: `ΔW ∝ pre × post × 
 - candidates computed with gradients through projection layers
 - The implicit outer product `v_cand ⊗ k_cand` is the Hebbian update; the neuromodulator (third factor) gates whether it is committed at span boundaries
 
-#### 4.4.4 PM Commit at span boundary (soft top-k EMA)
-Use v1.7 soft commit almost unchanged, but triggered only at span boundaries:
-- `PMNeuromodulator` outputs: `commit_mask` detached (heuristic: `elig_norm > 1.0`); `lambda_vals`, `g`, `slot_logits` retain grad when continuous heads exist (Phase B+)
-- Eligibility (`elig_K`, `elig_V`) not detached (gradients flow to projections)
-- per-stream `commit_mask` controls which streams update
-- decay/write applied only for commit streams
+#### 4.4.4 PM Commit at span boundary (soft slot-weighted EMA)
+PM commit is continuous and fully differentiable:
+- `PMNeuromodulator` outputs: `p_commit`, `lambda_vals`, `g`, `slot_logits`, `tau`
+- Slot weights use `softmax(scores / tau)` over PM slots (no hard top-k)
+- Final write strength is `alpha = weights * g * p_commit * elig_mag`
+- Eligibility traces are softly reset per stream via `elig *= (1 - p_commit)`
+- Eligibility (`elig_K`, `elig_V`) is not detached; gradients flow to `W_k_pre` / `W_v_post`
 
 ### 4.11 Spatial Decoder (Hierarchical Aggregation + Deep Cross-Attention)
 
@@ -439,8 +439,8 @@ The recurrence mixes temporal information; the FFN adds per-position nonlinear p
 ## 6) Neuromodulators (Gating / Neuromodulation)
 
 Each neuromodulator operates in one of two modes, determined by whether its memory system is enabled:
-- **Heuristic mode** (memory system disabled): threshold-based decisions with fixed defaults. No MLP heads created, zero parameters.
-- **Learned mode** (memory system enabled): MLP backbone + continuous heads, trained via main loss backprop (main optimizer). PM: Phase B+ (when `pm_enabled=True`). EM: Phase B+ (when `em_enabled=True`). All neuromod params stay on the main optimizer in all phases.
+- **Fallback mode** (memory system disabled): fixed defaults. No MLP heads created, zero parameters.
+- **Learned mode** (memory system enabled): MLP backbone + continuous heads, trained via main loss backprop (main optimizer). PM is learned in Phase A+ (`pm_enabled=True` in all phases). EM is learned in Phase B+ (`em_enabled=True`). All neuromod params stay on the main optimizer in all phases.
 
 ### 6.1 PMNeuromodulator (per layer per block, boundary-time)
 - One `PMNeuromodulator` per (block, layer) pair — B × L instances total.
@@ -457,15 +457,15 @@ Each neuromodulator operates in one of two modes, determined by whether its memo
 
 **Outputs (5-element tuple):**
 
-| Output | Shape | Heuristic (Phase A) | Learned (Phase B+) | Training |
-|--------|-------|--------------------|---------------------------------|----------|
-| `commit_mask` | `[BS]` | `elig_norm > 1.0` | `elig_norm > 1.0` (same heuristic) | — |
+| Output | Shape | Fallback (`pm_enabled=False`) | Active mode (Phase A+, `pm_enabled=True`) | Training |
+|--------|-------|-----------------------------|-------------------------------------------|----------|
+| `p_commit` | `[BS]` | `0.5` | `sigmoid(gate_head)` | Main loss backprop |
 | `lambda_vals` | `[BS]` | `config.decay_pm` | sigmoid → scaled to `[decay_pm, 1.0]` | Main loss backprop |
 | `g` | `[BS]` | `0.5` | sigmoid | Main loss backprop |
 | `slot_logits` | `[BS, r]` or `None` | `None` | raw linear | Main loss backprop |
-| `p_commit` | `[BS]` or `None` | `None` | `None` | — (reserved) |
+| `tau` | `[BS]` | `config.tau_pm` | `floor + (ceil - floor) * sigmoid(raw)`, in [tau_pm_floor, tau_pm_ceil] | Main loss backprop |
 
-Backbone + continuous heads (`lambda_head`, `g_head`, `slot_head`) created when `pm_enabled=True` (Phase B+): `Linear(3, H) → ReLU → {lambda_head, g_head, slot_head}`. `H = config.rl_controller_hidden` (default 32).
+Backbone + continuous heads created when `pm_enabled=True` (Phase A+): `Linear(3+content_proj_dim, H) → ReLU → {gate_head, lambda_head, g_head, slot_head, tau_head}`. `H = config.neuromod_hidden` (default 32).
 
 ### 6.2 EMNeuromodulator (per block, boundary-time)
 - One `EMNeuromodulator` per block — B instances total.
@@ -493,9 +493,9 @@ Backbone + heads created when `em_enabled=True` (Phase B+): `Linear(3+content_pr
 
 ### 6.3 Neuromodulator Training
 
-**All phases (B+):** Continuous outputs (`lambda_vals`, `g`, `slot_logits` for PM; `g_em`, `tau`, `ww`, `decay` for EM) are differentiable through PM/EM operations → trained by main loss backprop on the **main optimizer**. There is no separate RL optimizer — all neuromodulator params are part of the main optimizer in all phases.
+**All phases (PM: A+, EM: B+):** Continuous outputs (`p_commit`, `lambda_vals`, `g`, `slot_logits`, `tau` for PM; `g_em`, `tau`, `ww`, `decay` for EM) are differentiable through PM/EM operations → trained by main loss backprop on the **main optimizer**. There is no separate RL optimizer — all neuromodulator params are part of the main optimizer in all phases.
 
-**Phase transition checkpoint handling**: Model weights load with `strict=False` (new params init fresh). When transitioning A→B, PM and EM neuromodulator backbones + heads init fresh. Optimizer state loading is skipped when a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled` differ from current config), since parameter group sizes change across phases.
+**Phase transition checkpoint handling**: Model weights load with `strict=False` (new params init fresh). When transitioning A→B, EM neuromodulator + `W_nov` params init fresh; PM neuromodulator params already exist from Phase A. Optimizer state loading is skipped when a phase transition is detected (checkpoint's `pm_enabled`/`em_enabled` differ from current config), since parameter group sizes change across phases.
 
 **Ownership is unambiguous:** each block's `EMNeuromodulator` controls exactly one EM bank; each layer's `PMNeuromodulator` controls exactly one PM instance.
 
@@ -509,7 +509,7 @@ Same as v1.7:
 
 ### 7.2 Two time scales during training
 - TBPTT segment length `T` (e.g. 256): determines autograd truncation.
-- Plasticity span length `P` (e.g. 32): determines how often PM/EM can update.
+- Plasticity span length `P` (e.g. 64): determines how often PM/EM can update.
 
 Within a TBPTT segment of length `T`, we do `T/P` spans.
 
@@ -529,7 +529,7 @@ Reset affects (phases A–B, `lifelong_mode=False`):
 - WM: clear cache validity (`wm_valid`)
 - EM: only `em_S=0` for masked streams (keys `em_K` and values `em_V` are preserved; zeroing strengths makes old slots invisible to retrieval while keeping content for future overwrites)
 
-Reset affects (phase D, `lifelong_mode=True` — soft reset):
+Reset affects (phase C, `lifelong_mode=True` — soft reset):
 - `h` — zeroed (short-term context, don't leak across docs)
 - `elig_K/elig_V` — zeroed (in-progress learning, stale across docs)
 - PM committed state (`pm_K/pm_V/pm_a`) — **persists** (consolidated knowledge)
@@ -825,12 +825,12 @@ This resolves ambiguity by construction.
   * `update_eligibility(x, h)`
   * `base_decay()` — per-span `pm_a *= decay` on ALL streams
   * `reset_eligibility(mask)` — zero only `elig_K/elig_V` for masked streams (Phase C soft reset)
-  * `commit(commit_mask, lambda_vals, g, slot_logits)` — soft top-k EMA update for committing streams
+  * `commit(p_commit, lambda_vals, g, slot_logits, tau)` — soft slot-weighted EMA update
 
 * `PMNeuromodulator` (B × L instances)
-  * `forward(elig_norm, pm_usage, span_surprise) → (commit_mask, lambda_vals, g, slot_logits, p_commit)`
-  * Heuristic mode (`pm_enabled=False`): threshold-based, `slot_logits=None`, `p_commit=None`, zero params
-  * Learned mode (`pm_enabled=True`): MLP backbone + lambda/g/slot heads, heuristic gate (main optimizer)
+  * `forward(elig_norm, pm_usage, span_surprise) → (p_commit, lambda_vals, g, slot_logits, tau)`
+  * Fallback mode (`pm_enabled=False`): fixed defaults (`p_commit=0.5`, `lambda=decay_pm`, `g=g_pm_default`, `tau=tau_pm`), `slot_logits=None`, zero params
+  * Learned mode (`pm_enabled=True`): MLP backbone + gate/lambda/g/slot/tau heads (main optimizer)
 
 ### Training
 
@@ -870,9 +870,12 @@ em:
   D_em: 192                 # EM key/value dimension
   k_ret: 8                  # retrieval count
   C: 16                     # candidates per span
-  k_write: 8                # slots updated per candidate
   τ_em: 1.0                 # softmax temperature
+  τ_em_floor: 0.05          # learned lower bound
+  τ_em_ceil: 5.0            # learned upper bound
   weakness_weight: 0.5      # bias toward weak slots
+  ww_floor: 0.0             # learned lower bound for weakness weight
+  ww_ceil: 2.0              # learned upper bound for weakness weight
   S_max: 3.0                # max strength per slot
   budget: 8.0               # sum(em_S) budget per stream
   decay: 0.999              # per-span strength decay (default; learned in Phase B+)
@@ -888,19 +891,22 @@ pm:
   a_max: 3.0                # max strength per slot
   budget: 4.0               # sum(pm_a) budget per stream
   decay: 0.999              # per-span strength decay
-  commit_top_k: 2           # slots updated per commit
   τ_pm: 1.0                 # softmax temperature
+  τ_pm_floor: 0.05          # learned lower bound
+  τ_pm_ceil: 5.0            # learned upper bound
   weakness_weight: 0.5      # bias toward weak slots
+  surprise_scale: 5.0       # eligibility surprise gate scale
+  g_pm_default: 0.5         # default PM write strength
 
 # === Training ===
 training:
   BS: 16                    # batch size (persistent streams)
   T: 256                    # TBPTT segment length
-  P: 32                     # plasticity span
+  P: 64                     # plasticity span
   precision: bf16           # bf16 for forward/backward, fp32 for state
   reset_on_doc_boundary: true
   lifelong_mode: false        # Phase C: PM/EM persist across doc boundaries
-  rl_controller_hidden: 32    # MLP hidden size for neuromodulators
+  neuromod_hidden: 32         # MLP hidden size for neuromodulators
   eot_id: 50256             # GPT-2 <|endoftext|>
   lr: 3.0e-4                # peak learning rate
   lr_min: 1.0e-5            # cosine decay target
@@ -937,15 +943,15 @@ training:
    * `PMNeuromodulator` and `EMNeuromodulator` for gating (renamed from `PMController`/`EMController` in Phase C)
 
 6. **Scaling tiers defined** (A/B/C) for 4090 training:
-   * Tier B (~150M) recommended for competitive results
+   * Tier B (~103M) recommended for competitive results
    * bf16 mixed precision throughout
 
 7. **Learned neuromodulators** (implemented):
    * Two-mode architecture: heuristic (memory disabled) → learned (memory enabled, main optimizer)
-   * Backbone + continuous heads created when memory system enabled (Phase B+)
+   * Backbone + continuous heads created when memory system enabled (PM in A+, EM in B+)
    * All outputs trained via main loss backprop on the main optimizer
-   * PM: commit_mask heuristic, lambda/g/slot learned; EM: g_em/tau/ww/decay all learned
-   * No separate RL optimizer — simplifies training and eliminates phase C/D RL complexity
+   * PM: p_commit/lambda/g/slot_logits/tau all learned in Phase A+; EM: g_em/tau/ww/decay all learned in Phase B+
+   * No separate RL optimizer — simplifies training and eliminates earlier phase C/D RL complexity
 
 8. **Spatial decoder** (implemented):
    * Three-level hierarchical aggregation: columnar attention (per-block, across L layers) → thalamic integrator (across blocks + memory types) → deep cross-attention decoder

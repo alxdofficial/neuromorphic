@@ -165,6 +165,13 @@ class ModelConfig:
         return cls(**defaults)
 
     @classmethod
+    def tier_a_wide(cls, **overrides) -> "ModelConfig":
+        """Wide variant of tier A. D=768, L=8, B=4, D_h=192."""
+        defaults = dict(D=768, L=8, B=4, D_wm=192, n_heads_wm=6)
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
         """Competitive tier. D=768, L=12, B=6. Scaled memory."""
         defaults = dict(

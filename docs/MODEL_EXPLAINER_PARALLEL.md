@@ -87,7 +87,7 @@ surprise_span = self.surprise   # [BS, 1] — same value for all P tokens
 # 4. Embed all tokens
 x_emb_all = self.embedding(input_ids)           # [BS, P, D]
 
-# 5. Working memory (batched projections, sequential attention)
+# 5. Working memory (batched span path)
 y_wm_all = self.wm.forward_span(x_emb_all, reset_mask_all)  # [BS, P, D]
 
 # 6. Project and split across blocks
@@ -161,14 +161,17 @@ x_emb_all = embedding(input_ids)  # [32, 64, 512]
 ```
 One kernel launch. 64× more work per launch than the sequential path.
 
-**Step 4 — Working memory (batched projections, sequential attention):**
+**Step 4 — Working memory (batched span path):**
 ```
 q_all = W_q(x_emb_all)    # [32, 64, 128]  — one matmul
 k_all = W_k(x_emb_all)    # [32, 64, 128]  — one matmul
 v_all = W_v(x_emb_all)    # [32, 64, 128]  — one matmul
 ```
-Then for each t=0..63: write (k,v) into ring buffer, attend over valid entries, output y_wm.
-At t=13: streams with reset clear wm_valid and reset wm_ptr to 0.
+`forward_span()` dispatches:
+- no mid-span resets: batched attention over `[cache | span]` with overwrite-aware masking
+- any mid-span reset: exact sequential fallback path
+
+At t=13: streams with reset clear `wm_valid` and reset `wm_ptr` to 0.
 ```
 y_wm_all:  [32, 64, 512]  — WM output for all tokens
 ```
@@ -312,7 +315,7 @@ For each block b=0..3:
 
 Candidates are buffered. Pre-reset candidates (t < 13 for reset streams) are masked invalid later.
 
-Note: mid-span resets can affect at most P-1=63 tokens per boundary event.
+Note: mid-span resets can affect at most `P-1` tokens per boundary event (63 with the current default `P=64`).
 
 ### 4.4 Phase 3: Span boundary (same as sequential path)
 
@@ -323,9 +326,9 @@ model.surprise = span_surprise_mean.unsqueeze(-1)               # [32, 1] — fo
 # PM: base decay + neuromodulator commit decision
 for each PM instance:
     pm_a *= 0.999                                               # decay
-    neuromodulator decides commit_mask, g, lambda, slot_logits
-    pm.commit(mask, lambda, g, slots)                           # EMA update pm_K, pm_V, pm_a
-    reset eligibility for committing streams
+    neuromodulator decides p_commit, g, lambda, slot_logits, tau
+    pm.commit(p_commit, lambda, g, slot_logits, tau)            # EMA update pm_K, pm_V, pm_a
+    soft eligibility reset via p_commit
 
 # EM: neuromodulator write decision
 for each EM instance:
@@ -379,23 +382,13 @@ With `torch.compile` (§12), the scan loops, gate computations, and elementwise 
 
 **Sequential** (`step()`): Projects Q/K/V for one token, writes to ring buffer, attends over valid entries, advances pointer.
 
-**Parallel** (`forward_span()`): Projects Q/K/V for all P tokens in one batched matmul, then runs per-token attention sequentially (matching `step()` exactly):
+**Parallel** (`forward_span()`): Projects Q/K/V for all P tokens in one batched matmul, then dispatches:
+- **Batched path** (`_forward_span_batched`) when there are no mid-span resets.
+- **Sequential fallback** (`_forward_span_sequential`) when any mid-span reset exists.
 
-```python
-# Batch projections (the expensive part)
-q_all = self.W_q(x_all)    # [BS, P, D_wm]
-k_all = self.W_k(x_all)    # [BS, P, D_wm]
-v_all = self.W_v(x_all)    # [BS, P, D_wm]
+The batched path performs attention over `[cache | span]` using an overwrite-aware mask, and updates the ring buffer with span writes in one shot.
 
-# Sequential attention per token (matches step() exactly)
-for t in range(P):
-    # Reset validity for masked streams
-    # Write (k,v) into ring buffer at ptr
-    # Multi-head attention over valid entries
-    # Advance pointer
-```
-
-**Difference:** None in output. The per-token inner loop is identical to `step()`. Only the Q/K/V projections are batched. WM handles mid-span resets internally (clearing validity and resetting pointer).
+**Difference:** None in output/state vs sequential. Mid-span resets are handled internally via fallback to the sequential path.
 
 ### 5.3 Procedural Memory Read
 
@@ -590,22 +583,21 @@ model.surprise = span_surprise_mean                              # next span's f
 | State | How it's handled | Equivalent to sequential? |
 |-------|-----------------|--------------------------|
 | `Layer.h` | Carry mask zeros `a_eff`, giving `h_t = b_t` | Yes |
-| `elig_K, elig_V` | Zeroed in trainer post-forward loop | Yes |
-| `pm_K, pm_V, pm_a` | NOT zeroed mid-span | **No** (phases A-D) |
+| `elig_K, elig_V` | Reset via carry mask in `update_eligibility_batch` (`a=0` at reset positions) | Yes |
+| `pm_K, pm_V, pm_a` | NOT zeroed mid-span | **No** (phases A-B) |
 | `em_S` | NOT zeroed mid-span | **No** (phases A-C) |
 | WM state | Handled internally by `wm.forward_span` | Yes |
 | `model.surprise` | Frozen anyway | N/A |
 
-**Impact of the PM/EM gap:** In non-lifelong mode (phases A-B), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most P-1=63 tokens per boundary event. In lifelong mode (Phase C), PM/EM state intentionally persists across documents, so there is no gap.
+**Impact of the PM/EM gap:** In non-lifelong mode (phases A-B), post-boundary tokens within the same span may read stale PM state and retrieve stale EM memories from the old document. This affects at most `P-1` tokens per boundary event (63 at `P=64`). In lifelong mode (Phase C), PM/EM state intentionally persists across documents, so there is no gap.
 
-**Eligibility reset detail** (span_ops.py: `apply_pm_eligibility_batch`):
+**Eligibility reset detail** (`ProceduralMemory.update_eligibility_batch`):
 ```python
-for t_local in range(span_P):
-    reset_t = reset_mask_all[:, t_local]
-    if reset_t.any():
-        pm.reset_eligibility(reset_t)    # zero elig_K, elig_V
-    pm.update_eligibility(x_in[:, t_local], h_out[:, t_local],
-                          surprise_for_elig[:, t_local])
+carry = (~reset_mask).float()  # [BS, P]
+a = (rho * carry).unsqueeze(-1).unsqueeze(-1)
+# ...
+elig_all = parallel_affine_scan(a_flat, b_flat, elig_init)
+# at reset positions: a=0 => elig_t = b_t (equivalent to explicit zero-then-update)
 ```
 
 ---
@@ -741,13 +733,12 @@ For each span (4 spans per chunk, P=64 tokens each):
     Compute span_surprise_mean for neuromodulators
     Pre-compute EM candidate stacks + mean novelty
 
-    PM neuromodulators: (elig_norm, usage, surprise) → commit_mask, lambda, g, slots
-      └── commit_mask: heuristic gate (elig_norm > 1.0)
+    PM neuromodulators: (elig_norm, usage, surprise) → p_commit, lambda, g, slots, tau
       └── PM.commit(): update pm_K, pm_V, pm_a with EMA
 
     EM neuromodulators: (surprise, usage, novelty) → g_em, tau, ww, decay
       └── g_em  = floor + range * sigmoid(raw)  [0.001, 0.95]
-      └── tau   = floor + range * sigmoid(raw)  [0.05, 5.0]   (soft top-k temperature)
+      └── tau   = floor + range * sigmoid(raw)  [0.05, 5.0]   (slot-softmax temperature)
       └── ww    = floor + range * sigmoid(raw)  [0.0, 2.0]    (weakness weight)
       └── decay = floor + range * sigmoid(raw)  [0.99, 0.9999] (memory retention)
       └── EM.write_at_boundary(): update em_K, em_V, em_S with alpha = g_em * weights
@@ -841,9 +832,10 @@ Everything not listed above is numerically identical between the two paths:
 
 ## 12. What Is NOT Supported / Compile Support
 
-The parallel path intentionally does not support:
+The parallel path intentionally keeps top-level compilation scope narrow:
 
-1. **Gate stats collection** (`collect=True`): `forward_span` does not return per-layer gate statistics. The trainer handles this by passing `gate_stats or {}` to the collector.
+1. `WorkingMemory.forward_span` is not compiled (data-dependent dispatch on mid-span resets).
+2. `Block.forward_span` / `NeuromorphicLM.forward_span` are not compiled at top level to avoid graph breaks from control flow.
 
 ### torch.compile Support
 
@@ -853,7 +845,7 @@ The parallel path intentionally does not support:
 - **`PM.update_eligibility_batch`**: Compiles the eligibility projections, surprise gating, and fused K+V affine scan.
 
 **Not compiled:**
-- **`WorkingMemory.forward_span`**: Contains a data-dependent branch (`reset_mask_all[:, 1:].any()`) that would cause graph breaks. WM's per-token attention loop is already the correct granularity.
+- **`WorkingMemory.forward_span`**: Contains a data-dependent dispatch (`reset_mask_all[:, 1:].any()`) that would cause graph breaks.
 - **`Block.forward_span`** / **`NeuromorphicLM.forward_span`**: Not compiled at the top level — compilation is applied at the Layer granularity to avoid graph breaks from WM and other control flow.
 
 **Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First step is slow (~30-60s) due to tracing; subsequent steps use cached compiled kernels. Provides ~2.8× speedup (measured: 3,687 → 10,278 tok/s on RTX 4090, Tier A, BS=32).
@@ -868,7 +860,7 @@ The parallel path intentionally does not support:
 | `src/model/layer.py` | `Layer.forward_span()` — batched gates + scan + `_last_h_all` cache |
 | `src/model/procedural_memory.py` | `ProceduralMemory.apply_batch()` — batched PM read |
 | `src/model/episodic_memory.py` | `EpisodicMemory.retrieve_batch()`, `propose_candidate_batch()` |
-| `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V projections, sequential attention |
+| `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V, batched no-reset path, sequential fallback |
 | `src/model/block.py` | `Block.forward_span()` — orchestrates batched components, caches `_last_layer_stack` |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `_compute_reset_masks()` |

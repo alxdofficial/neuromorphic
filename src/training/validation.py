@@ -78,6 +78,11 @@ def evaluate_validation(
         cleared = False
         eot_id = config.eot_id
         P = config.P
+        # Match training dtype so torch.compile doesn't recompile on dtype change
+        use_amp = device.type == "cuda"
+        amp_ctx = torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+        )
 
         for _ in range(num_steps):
             try:
@@ -107,84 +112,86 @@ def evaluate_validation(
                 else:
                     reset_first = (input_ids[:, span_start - 1] == eot_id)
 
-                # Parallel forward
-                logits_all, x_emb_all, y_wm_all = model.forward_span(
-                    span_ids, reset_first
-                )
-
-                if not torch.isfinite(logits_all).all():
-                    raise RuntimeError("Non-finite logits detected during validation.")
-
-                # Loss masking
-                is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
-                    span_ids, eot_id, config.reset_on_doc_boundary
-                )
-
-                # Batched loss
-                span_loss, span_valid = batched_cross_entropy(
-                    logits_all, span_targets, loss_mask_all
-                )
-                total_loss += float(span_loss.item())
-                valid_count += span_valid
-
-                # Compute per-token surprise
-                logp = F.log_softmax(logits_all, dim=-1)
-                token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
-                token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
-
-                # Compute reset masks for accumulators
-                reset_mask_all = span_ops.compute_reset_mask(
-                    model, span_ids, reset_first, config.reset_on_doc_boundary
-                )
-
-                # Track span surprise for boundary decisions
-                span_surprise_accum = torch.zeros(BS, device=device)
-                span_valid_tokens = torch.zeros(BS, device=device)
-                span_last_reset = torch.zeros(BS, dtype=torch.long, device=device)
-
-                span_ops.accumulate_span_surprise(
-                    token_surprise, loss_mask_all, reset_mask_all,
-                    config.reset_on_doc_boundary,
-                    span_surprise_accum, span_valid_tokens, span_last_reset,
-                )
-
-                total_tokens += BS * span_P
-                eot_inputs += int(is_eot_all.sum().item())
-                resets += int(reset_mask_all.sum().item())
-
-                span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
-
-                # Update model surprise to span mean (matching trainer)
-                model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
-
-                # PM eligibility + commit
-                if config.pm_enabled:
-                    span_ops.apply_pm_eligibility_batch(
-                        model, x_emb_all, token_surprise,
-                        reset_mask_all, config,
+                # Wrap entire span (forward + PM + EM) under autocast to match
+                # training dtype and avoid torch.compile recompilation
+                with amp_ctx:
+                    logits_all, x_emb_all, y_wm_all = model.forward_span(
+                        span_ids, reset_first
                     )
-                    span_ops.apply_pm_boundary(model, span_surprise_mean)
 
-                # EM candidates + write
-                if config.em_enabled:
-                    B = config.B
-                    cand_K = [[] for _ in range(B)]
-                    cand_V = [[] for _ in range(B)]
-                    cand_score = [[] for _ in range(B)]
-                    cand_token_valid = [[] for _ in range(B)]
+                    if not torch.isfinite(logits_all).all():
+                        raise RuntimeError("Non-finite logits detected during validation.")
 
-                    span_ops.propose_em_candidates(
-                        model, x_emb_all, y_wm_all, token_surprise,
-                        loss_mask_all, cand_K, cand_V, cand_score,
-                        cand_token_valid,
+                    # Loss masking
+                    is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
+                        span_ids, eot_id, config.reset_on_doc_boundary
                     )
-                    em_stacked = span_ops.stack_em_candidates(
-                        cand_K, cand_V, cand_score, cand_token_valid,
-                        span_last_reset, device,
+
+                    # Batched loss
+                    span_loss, span_valid = batched_cross_entropy(
+                        logits_all, span_targets, loss_mask_all
                     )
-                    span_ops.apply_em_boundary(
-                        model, em_stacked, span_surprise_mean, config,
+                    total_loss += float(span_loss.item())
+                    valid_count += span_valid
+
+                    # Compute per-token surprise
+                    logp = F.log_softmax(logits_all, dim=-1)
+                    token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
+                    token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
+
+                    # Compute reset masks for accumulators
+                    reset_mask_all = span_ops.compute_reset_mask(
+                        model, span_ids, reset_first, config.reset_on_doc_boundary
                     )
+
+                    # Track span surprise for boundary decisions
+                    span_surprise_accum = torch.zeros(BS, device=device)
+                    span_valid_tokens = torch.zeros(BS, device=device)
+                    span_last_reset = torch.zeros(BS, dtype=torch.long, device=device)
+
+                    span_ops.accumulate_span_surprise(
+                        token_surprise, loss_mask_all, reset_mask_all,
+                        config.reset_on_doc_boundary,
+                        span_surprise_accum, span_valid_tokens, span_last_reset,
+                    )
+
+                    total_tokens += BS * span_P
+                    eot_inputs += int(is_eot_all.sum().item())
+                    resets += int(reset_mask_all.sum().item())
+
+                    span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
+
+                    # Update model surprise to span mean (matching trainer)
+                    model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+
+                    # PM eligibility + commit
+                    if config.pm_enabled:
+                        span_ops.apply_pm_eligibility_batch(
+                            model, x_emb_all, token_surprise,
+                            reset_mask_all, config,
+                        )
+                        span_ops.apply_pm_boundary(model, span_surprise_mean)
+
+                    # EM candidates + write
+                    if config.em_enabled:
+                        B = config.B
+                        cand_K = [[] for _ in range(B)]
+                        cand_V = [[] for _ in range(B)]
+                        cand_score = [[] for _ in range(B)]
+                        cand_token_valid = [[] for _ in range(B)]
+
+                        span_ops.propose_em_candidates(
+                            model, x_emb_all, y_wm_all, token_surprise,
+                            loss_mask_all, cand_K, cand_V, cand_score,
+                            cand_token_valid,
+                        )
+                        em_stacked = span_ops.stack_em_candidates(
+                            cand_K, cand_V, cand_score, cand_token_valid,
+                            span_last_reset, device,
+                        )
+                        span_ops.apply_em_boundary(
+                            model, em_stacked, span_surprise_mean, config,
+                        )
 
             model.detach_states()
             steps_done += 1

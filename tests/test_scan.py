@@ -144,6 +144,7 @@ class TestParallelAffineScan:
         _assert_tensors_close(result[:, 2], b[:, 2], "carry_reset", atol=1e-6)
 
 
+
 # ============================================================
 # 2. Layer forward_span equivalence
 # ============================================================

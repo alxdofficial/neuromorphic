@@ -129,7 +129,8 @@ def parse_args() -> argparse.Namespace:
                        help="Comma-separated auto-transition sequence (e.g. A,B,C)")
     group.add_argument("--phase", type=str, default=None,
                        help="Single phase to run (A, B, or C)")
-    p.add_argument("--tier", type=str, default=None, choices=["a", "b", "c"],
+    p.add_argument("--tier", type=str, default=None,
+                   choices=["a", "a_wide", "b", "c"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")
@@ -468,7 +469,12 @@ def _get_device() -> torch.device:
 
 
 def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelConfig:
-    tier_fn = {"a": ModelConfig.tier_a, "b": ModelConfig.tier_b, "c": ModelConfig.tier_c}[tier]
+    tier_fn = {
+        "a": ModelConfig.tier_a,
+        "a_wide": ModelConfig.tier_a_wide,
+        "b": ModelConfig.tier_b,
+        "c": ModelConfig.tier_c,
+    }[tier]
     config = tier_fn()
     config.set_phase(phase)
     # Apply spatial decoder settings (None = keep dataclass default)

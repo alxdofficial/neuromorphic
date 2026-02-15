@@ -19,7 +19,7 @@ tmux attach -t neuromorphic-train
 - **Batch size**: BS=48 is optimal for RTX 4090 (24GB). Uses ~15GB VRAM, leaves headroom for PM/EM in later phases.
   - BS=64 works for Phase A (19.4GB) but may OOM in later phases with PM/EM enabled
   - BS=32 is a safe fallback (~10.7GB)
-- **Tier B** (~90.8M params) is the current training tier
+- **Tier B** (~102.7M params) is the current training tier
 
 ## GPU Memory by Batch Size (Tier B, Phase A)
 
@@ -37,11 +37,11 @@ Enable compiled mode with `--compile` for ~2.8× speedup on CUDA (see below).
 
 | Phase | Steps | Tokens (BS=48) | Features |
 |-------|-------|-----------------|----------|
-| A     | 10K   | ~125M           | WM + PM (TinyStories) |
-| B     | 300K  | ~3.7B           | WM + PM + EM (FineWeb-Edu + DCLM) |
-| C     | 300K  | ~3.7B           | WM + PM + EM + lifelong (PM/EM persist across docs) |
+| A     | 5K    | ~61.4M          | WM + PM (TinyStories) |
+| B     | 5K    | ~61.4M          | WM + PM + EM (FineWeb-Edu + DCLM) |
+| C     | 2.5K  | ~30.7M          | WM + PM + EM + lifelong (PM/EM persist across docs) |
 
-Total: ~610K steps, ~7.5B tokens at BS=48
+Total (preset `phase_a_to_c`): ~12.5K steps, ~153.6M tokens at BS=48
 
 Neuromodulators (PM and EM) are trained by main-loss gradient in all phases — no separate RL optimizer.
 
@@ -56,7 +56,7 @@ Each step processes T/P = 4 forward_span calls (P=64 tokens each). With `--compi
 - **Log lines**: Every 50 steps (LOG_INTERVAL)
 - **Validation**: Every 200 steps (VAL_INTERVAL)
 - **Text samples**: Every 200 steps (TEXT_SAMPLE_INTERVAL) — saved as PNG
-- **Training curve plots**: Every 1000 steps (PLOT_INTERVAL) — regenerates all 6 PNGs
+- **Training curve plots**: Every 500 steps (PLOT_INTERVAL) — regenerates all 6 PNGs
 - **Checkpoints**: Every 2500 steps (SAVE_INTERVAL)
 - **Ablation eval**: Every 1000 steps (ABLATE_INTERVAL)
 

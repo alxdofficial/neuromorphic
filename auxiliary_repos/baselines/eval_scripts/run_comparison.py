@@ -30,23 +30,38 @@ sys.path.insert(0, str(ROOT))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Model checkpoints
-OUR_CKPT = ROOT / "outputs/phase_d/20260212_214745/checkpoints/neuromorphic_a_D_20260212_214745_step5000.pt"
+# Model checkpoints — find latest a_b_c run dynamically
+def _find_latest_run():
+    """Find the most recent a_b_c training run directory."""
+    abc_dir = ROOT / "outputs/a_b_c"
+    if not abc_dir.exists():
+        return None
+    runs = sorted(abc_dir.iterdir(), reverse=True)
+    return runs[0] if runs else None
+
+def _find_latest_ckpt(run_dir):
+    """Find the latest checkpoint .pt file in a run directory."""
+    if run_dir is None:
+        return None
+    ckpt_dir = run_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+    pts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return pts[0] if pts else None
+
+_LATEST_RUN = _find_latest_run()
+OUR_CKPT = _find_latest_ckpt(_LATEST_RUN)
 PYTHIA_CKPT_DIR = ROOT / "outputs/baseline_pythia_160m/checkpoints"
 MAMBA_CKPT_DIR = ROOT / "outputs/baseline_mamba_130m/checkpoints"
 
 # Training logs
-OUR_METRICS = [
-    ROOT / "outputs/phase_a_to_d/20260212_114315/metrics.jsonl",
-    ROOT / "outputs/phase_b/20260212_160136/metrics.jsonl",
-    ROOT / "outputs/phase_d/20260212_214745/metrics.jsonl",
-]
+OUR_METRICS = [_LATEST_RUN / "metrics.jsonl"] if _LATEST_RUN else []
 PYTHIA_METRICS = ROOT / "outputs/baseline_pythia_160m/metrics.jsonl"
 MAMBA_METRICS = ROOT / "outputs/baseline_mamba_130m/metrics.jsonl"
 
 OUTPUT_DIR = ROOT / "outputs/comparison"
 
-OUR_PARAMS = 56.1e6
+OUR_PARAMS = 94.5e6
 PYTHIA_PARAMS = 134.2e6
 MAMBA_PARAMS = 115.1e6
 
@@ -60,9 +75,11 @@ def load_our_model():
     from src.model.config import ModelConfig
     from src.model.model import NeuromorphicLM
 
-    config = ModelConfig.tier_a()
+    config = ModelConfig.tier_a_wide()
     config.set_phase("C")
     model = NeuromorphicLM(config).to(DEVICE)
+    if OUR_CKPT is None or not OUR_CKPT.exists():
+        raise FileNotFoundError(f"No checkpoint found. Latest run: {_LATEST_RUN}")
     ckpt = torch.load(str(OUR_CKPT), map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.requires_grad_(False)

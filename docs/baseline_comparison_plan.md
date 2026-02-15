@@ -266,7 +266,7 @@ Adds recurrent memory tokens to transformer. Achieves needle-in-haystack retriev
 
 ### 3.5 LifeSpan Cognitive Systems (Wang et al., 2025)
 
-Framework for continuous, high-frequency interactions with environments. Emphasizes incremental updates and accurate recall -- conceptually aligned with our Phase E lifelong learning.
+Framework for continuous, high-frequency interactions with environments. Emphasizes incremental updates and accurate recall -- conceptually aligned with our Phase C lifelong learning.
 
 **Source:** Wang et al., "Towards LifeSpan Cognitive Systems," TMLR 2025.
 
@@ -436,7 +436,7 @@ Target: a b c d e
 
 **Why critical:** Tests whether EM can selectively retrieve relevant information while ignoring noise -- exactly what top-k retrieval with learned novelty scoring should enable.
 
-### 6.3 Cross-Document Knowledge Retention (Phase E / Lifelong)
+### 6.3 Cross-Document Knowledge Retention (Phase C / Lifelong)
 
 #### 6.3.1 Domain Adaptation Curve
 
@@ -540,8 +540,8 @@ The most important experiments for proving the architecture works. Each ablation
 
 | Ablation | What it tests |
 |----------|---------------|
-| Phase B (heuristic PM commit) vs Phase D (RL commit) | Value of learned commit policy |
-| Phase C (heuristic EM write) vs Phase D (RL write) | Value of learned write policy |
+| PM active (A/B/C) vs PM ablated | Value of PM commit policy and procedural memory |
+| EM active (B/C) vs EM ablated | Value of EM write policy and episodic memory |
 | Fixed g_pm=0.5 vs learned g_pm | Value of learned write strength |
 | Fixed g_em=0.3 vs learned g_em | Value of learned write strength |
 
@@ -660,8 +660,8 @@ These are the experiments needed to convincingly demonstrate the architecture:
 10. **Training throughput** comparison (tokens/sec vs Pythia, Mamba at matched params)
 
 #### Priority 3: Advanced Claims (nice to have)
-11. **Lifelong learning domain adaptation curve** (Phase E)
-12. **RL ablation** (Phase D vs Phase C heuristics)
+11. **Lifelong learning domain adaptation curve** (Phase C)
+12. **Memory-policy ablation** (PM/EM on vs off)
 13. **IsoFLOP scaling** at 3+ compute levels
 14. **Cross-document fact recall** at various distances
 15. **Forgetting curve** post-domain-adaptation

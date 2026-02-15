@@ -146,26 +146,15 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.elig_K = self.rho * self.elig_K + gate * k_cand.unsqueeze(1)
         self.elig_V = self.rho * self.elig_V + gate * v_cand.unsqueeze(1)
 
-    def update_eligibility_batch(self, x_all: Tensor, h_all: Tensor,
+    def _update_eligibility_core(self, x_all: Tensor, h_all: Tensor,
                                  surprise_all: Tensor,
                                  reset_mask: Tensor):
-        """Batched eligibility accumulation over P tokens using affine scan.
+        """Compiled inner loop: projections + gating + fused K/V scan.
 
-        Equivalent to calling update_eligibility() P times with
-        reset_eligibility() at doc boundaries, but batches the projections
-        and uses parallel_affine_scan for the recurrence.
-
-        Args:
-            x_all: [BS, P, D_h] — layer input (pre-synaptic) for all tokens
-            h_all: [BS, P, D_h] — layer output (post-synaptic) for all tokens
-            surprise_all: [BS, P, 1] — per-token surprise
-            reset_mask: [BS, P] bool — True at doc boundaries
+        No lazy init — safe for torch.compile(fullgraph=True).
         """
         BS, P, D_h = x_all.shape
         r = self.r
-
-        if self.elig_K is None:
-            self._lazy_init(BS, x_all.device)
 
         # Batched projections (the expensive part — 2 matmuls instead of 2*P)
         k_cand_all = unit_normalize(self.W_k_pre(x_all))  # [BS, P, D_h]
@@ -180,7 +169,8 @@ class ProceduralMemory(nn.Module, StateMixin):
         b_V = (gate * v_cand_all.unsqueeze(2)).expand(BS, P, r, D_h)
 
         # Carry mask: 0 at reset positions (zeros previous elig), 1 elsewhere
-        carry = (~reset_mask).float()  # [BS, P]
+        # Use activation dtype (bf16 under autocast) to keep scan in bf16
+        carry = (~reset_mask).to(k_cand_all.dtype)  # [BS, P]
 
         # a = rho * carry, expanded to [BS, P, r, D_h]
         a = (self.rho * carry).unsqueeze(-1).unsqueeze(-1).expand(
@@ -191,8 +181,8 @@ class ProceduralMemory(nn.Module, StateMixin):
         a_flat = a.contiguous().reshape(BS, P, r * D_h)
         b_K_flat = b_K.contiguous().reshape(BS, P, r * D_h)
         b_V_flat = b_V.contiguous().reshape(BS, P, r * D_h)
-        h_K_init = self.elig_K.reshape(BS, r * D_h)
-        h_V_init = self.elig_V.reshape(BS, r * D_h)
+        h_K_init = self.elig_K.reshape(BS, r * D_h).to(a_flat.dtype)
+        h_V_init = self.elig_V.reshape(BS, r * D_h).to(a_flat.dtype)
 
         # Fused K+V scan: one double-width scan instead of two separate
         b_KV = torch.cat([b_K_flat, b_V_flat], dim=-1)       # [BS, P, 2*r*D_h]
@@ -202,9 +192,21 @@ class ProceduralMemory(nn.Module, StateMixin):
         elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)  # [BS, P, 2*r*D_h]
         elig_K_all, elig_V_all = elig_KV_all.chunk(2, dim=-1)
 
-        # Update state to last token
-        self.elig_K = elig_K_all[:, -1].reshape(BS, r, D_h)
-        self.elig_V = elig_V_all[:, -1].reshape(BS, r, D_h)
+        # Update state to last token, restore fp32 for inter-span precision
+        self.elig_K = elig_K_all[:, -1].reshape(BS, r, D_h).float()
+        self.elig_V = elig_V_all[:, -1].reshape(BS, r, D_h).float()
+
+    def update_eligibility_batch(self, x_all: Tensor, h_all: Tensor,
+                                 surprise_all: Tensor,
+                                 reset_mask: Tensor):
+        """Batched eligibility accumulation over P tokens using affine scan.
+
+        Thin wrapper that handles lazy init, then delegates to the
+        compilable core.
+        """
+        if self.elig_K is None:
+            self._lazy_init(x_all.shape[0], x_all.device)
+        self._update_eligibility_core(x_all, h_all, surprise_all, reset_mask)
 
     def base_decay(self):
         """Per-span strength decay applied to ALL streams.

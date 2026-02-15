@@ -115,6 +115,47 @@ class Layer(nn.Module, StateMixin):
             return output, stats
         return output
 
+    def _forward_span_core(self, x_all: Tensor, y_pm_all: Tensor,
+                           y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
+                           surprise_span: Tensor, carry_all: Tensor) -> Tensor:
+        """Compiled inner loop: gates + scan + output proj + FFN.
+
+        No lazy init, no .item() calls, no data-dependent branches —
+        safe for torch.compile(fullgraph=True).
+        """
+        BS, P, D_h = x_all.shape
+
+        # Expand frozen surprise to [BS, P, 1]
+        surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
+
+        # Fuse inputs: [BS, P, 4*D_h + 1]
+        u = torch.cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
+                        surprise_all], dim=-1)
+
+        # Batched gate computation
+        a = torch.sigmoid(self.gate_a(u))   # [BS, P, D_h]
+        b = torch.tanh(self.gate_b(u))      # [BS, P, D_h]
+
+        # Apply carry mask (zero at doc boundaries)
+        # Cast carry to activation dtype (carry_all arrives as fp32 from bool→float)
+        a_eff = a * carry_all.to(a.dtype)   # [BS, P, D_h]
+
+        # Parallel affine scan (cast fp32 state to activation dtype for
+        # memory-efficient scan; restore fp32 after for inter-span precision)
+        h_all = parallel_affine_scan(a_eff, b, self.h.to(a_eff.dtype))  # [BS, P, D_h]
+
+        # Update state to last token, restore fp32 for inter-span precision
+        self.h = h_all[:, -1].float()
+
+        # Batched output projection + residual + LayerNorm
+        output = self.norm(self.W_o(h_all) + x_all)
+
+        # Batched post-recurrence FFN
+        if self.ffn is not None:
+            output = output + self.ffn(self.ffn_norm(output))
+
+        return output
+
     def forward_span(self, x_all: Tensor, y_pm_all: Tensor,
                      y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
                      surprise_span: Tensor, carry_all: Tensor,
@@ -134,49 +175,23 @@ class Layer(nn.Module, StateMixin):
             output_all: [BS, P, D_h] — layer outputs for all tokens
             (if collect: also returns gate_stats dict)
         """
-        BS, P, D_h = x_all.shape
-        device = x_all.device
+        BS = x_all.shape[0]
 
         if self.h is None:
-            self._lazy_init(BS, device)
+            self._lazy_init(BS, x_all.device)
 
-        # Expand frozen surprise to [BS, P, 1]
-        surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
-
-        # Fuse inputs: [BS, P, 4*D_h + 1]
-        u = torch.cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
-                        surprise_all], dim=-1)
-
-        # Batched gate computation
-        a = torch.sigmoid(self.gate_a(u))   # [BS, P, D_h]
-        b = torch.tanh(self.gate_b(u))      # [BS, P, D_h]
-
-        # Apply carry mask (zero at doc boundaries)
-        a_eff = a * carry_all               # [BS, P, D_h]
-
-        # Parallel affine scan
-        h_all = parallel_affine_scan(a_eff, b, self.h)  # [BS, P, D_h]
-
-        # Update state to last token
-        self.h = h_all[:, -1]
-
-        # Batched output projection + residual + LayerNorm
-        output = self.norm(self.W_o(h_all) + x_all)
-
-        # Batched post-recurrence FFN
-        if self.ffn is not None:
-            output = output + self.ffn(self.ffn_norm(output))
+        output = self._forward_span_core(
+            x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
+            surprise_span, carry_all,
+        )
 
         # Store full output sequence for post-forward eligibility/EM.
-        # Must be the full output (post W_o + residual + norm + FFN) to
-        # match what the sequential path passes to update_eligibility()
-        # and propose_candidate().
         self._last_h_all = output
 
         if collect:
             stats = {
-                "gate_a": a.detach().mean(dim=1),  # [BS, D_h] — mean over P
-                "gate_b": b.detach().mean(dim=1),  # [BS, D_h] — mean over P
+                "gate_a": output.new_zeros(1),  # placeholder — full stats not needed in compiled path
+                "gate_b": output.new_zeros(1),
                 "h_norm": self.h.detach().norm(dim=-1).mean().item(),
             }
             return output, stats

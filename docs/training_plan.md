@@ -2,16 +2,16 @@
 
 ## Overview
 
-This plan covers datasets, configuration, and training phases for the ~40M parameter neuromorphic model (D=512, L=8, B=4) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, neuromodulated memory (PM + EM), lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
+This plan covers datasets, configuration, and training phases for the current Tier-A neuromorphic model (~56M parameters, D=512, L=8, B=4) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, neuromodulated memory (PM + EM), lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
 
 **Aligned with:** spec v2.0
 
 ### v2 Architecture Summary
-- **B blocks** (default 6), each containing **L layers** (default 12)
+- **B blocks** (default 4), each containing **L layers** (default 8)
 - **Working Memory (WM):** sliding-window attention (W=256), 1 shared instance
 - **Procedural Memory (PM):** fast low-rank weights + eligibility, B×L instances (each with `PMNeuromodulator`)
 - **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMNeuromodulator`)
-- **Plasticity boundaries:** PM/EM writes every P=32 tokens (scan-friendly within spans)
+- **Plasticity boundaries:** PM/EM writes every P=64 tokens (scan-friendly within spans)
 
 ---
 
@@ -21,9 +21,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 | Tier | Params | D | L | B | Target | 4090 BS |
 |------|--------|---|---|---|--------|---------|
-| **A (Debug)** | ~50M | 512 | 8 | 4 | Rapid iteration | 32–64 |
-| **B (Competitive)** | ~150M | 768 | 12 | 6 | Match GPT-2 Small | 16–32 |
-| **C (Strong)** | ~350M | 1024 | 24 | 8 | Match GPT-2 Medium | 8–16 |
+| **A (Debug)** | ~56M | 512 | 8 | 4 | Rapid iteration | 32–64 |
+| **B (Competitive)** | ~103M | 768 | 12 | 6 | Match GPT-2 Small | 16–32 |
+| **C (Strong)** | ~197M | 1024 | 24 | 8 | Match GPT-2 Medium | 8–16 |
 
 **Note:** Early LLMs (GPT-1/GPT-2 Small at ~125M) showed meaningful language understanding. **Tier B is the recommended target** for demonstrating competitive results.
 
@@ -55,9 +55,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ## 2. Training Phases & Datasets
 
-### Phase A — Base Competence (WM + scan core, no PM/EM writes)
+### Phase A — Base Competence (WM + PM)
 
-**Goal:** Verify the backbone + WM learns language; PM/EM disabled or read-only.
+**Goal:** Verify the backbone + WM+PM learns language with stable PM commits; EM remains disabled.
 
 **Dataset:** TinyStories (small, clean, fast iteration)
 - HuggingFace: `roneneldan/TinyStories`
@@ -67,7 +67,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 **Config:**
 - WM enabled (sliding window attention)
-- PM reads disabled (a=0) or entirely off
+- PM enabled (reads + boundary commits with learned continuous heads)
 - EM retrieval/writes disabled
 - BS=32, ~5–10K steps
 
@@ -77,7 +77,7 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 
 ### Phase B — Enable PM + EM with Learned Neuromodulators
 
-**Goal:** Train general language competence with both Procedural Memory and Episodic Memory active. Both `PMNeuromodulator` and `EMNeuromodulator` create backbone + continuous heads trained via main loss backprop. PM uses heuristic commit gate (`elig_norm > 1.0`). EM uses learned write parameters (g_em, tau, ww, decay) and `W_nov` learned novelty adjuster.
+**Goal:** Train general language competence with both Procedural Memory and Episodic Memory active. Both `PMNeuromodulator` and `EMNeuromodulator` create backbone + continuous heads trained via main loss backprop. PM uses learned continuous commit parameters (`p_commit`, `lambda`, `g`, `slot_logits`, `tau`). EM uses learned write parameters (`g_em`, `tau`, `ww`, `decay`) and `W_nov` learned novelty adjuster.
 
 **Primary dataset:** FineWeb-Edu (sample-10BT)
 - HuggingFace: `HuggingFaceFW/fineweb-edu` (use the `sample-10BT` subset)
@@ -100,9 +100,9 @@ This plan covers datasets, configuration, and training phases for the ~40M param
 - Use as supplementary stream: process full books sequentially to test memory persistence
 
 **Config:**
-- BS=16, TBPTT T=256, plasticity span P=32
-- PM enabled: reads always, commits at span boundaries (heuristic gate: elig_norm > 1.0)
-- PM neuromod continuous heads (lambda, g, slot_logits) active and differentiable — trained via main optimizer
+- BS=16, TBPTT T=256, plasticity span P=64
+- PM enabled: reads always, commits at span boundaries with continuous learned parameters
+- PM neuromod continuous heads (`p_commit`, `lambda`, `g`, `slot_logits`, `tau`) active and differentiable — trained via main optimizer
 - EM retrieval enabled: top k_ret latent memory tokens → cross-attention aggregation
 - EM writes at span boundaries with learned parameters:
   - `g_em`: write strength in [g_em_floor, g_em_ceil]
@@ -336,10 +336,10 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 | **Batch size** | Tier A: 32–64, Tier B: 16–32, Tier C: 8–16 |
 | **Gradient accumulation** | Use if effective BS needs to be larger |
 | **TBPTT** | Chunk T=256, detach all recurrent state (`h`, `elig_K`, `elig_V`, `pm_K`, `pm_V`) between chunks |
-| **Plasticity span** | P=32 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
+| **Plasticity span** | P=64 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
 | **Compile** | `torch.compile(model)` for kernel fusion (RTX 4090 Ada Lovelace supports it well) |
 | **Data loading** | `num_workers=4`, `pin_memory=True`, streaming from disk/HF |
-| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume). Phase transitions detected automatically — optimizer state skipped when param groups change, RL optimizer gets LR warmup |
+| **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume). Phase transitions detected automatically; optimizer state may be skipped when parameter groups change |
 | **Monitoring** | Log: loss, commit/write rates per block, surprise distribution, PM/EM norms, eligibility norms |
 
 ---
