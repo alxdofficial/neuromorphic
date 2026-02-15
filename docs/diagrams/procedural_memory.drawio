@@ -19,7 +19,7 @@
         </mxCell>
 
         <!-- Scaling annotation -->
-        <mxCell id="5" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Instance Scaling:&lt;/b&gt;&lt;br&gt;Tier A: 4×8 = 32 PM instances&lt;br&gt;Tier B: 6×12 = 72 PM instances&lt;br&gt;Tier C: 8×24 = 192 PM instances&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+        <mxCell id="5" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Instance Scaling:&lt;/b&gt;&lt;br&gt;Tier A wide: 2×8 = 16 PM instances&lt;br&gt;Tier B: 6×12 = 72 PM instances&lt;br&gt;Tier C: 8×24 = 192 PM instances&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
           <mxGeometry x="1060" y="260" width="230" height="75" as="geometry"/>
         </mxCell>
 

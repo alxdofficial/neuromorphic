@@ -42,23 +42,28 @@ class ColumnarAttention(nn.Module):
     Output: column_summary [BS, D_h]
     """
 
-    def __init__(self, D_h: int, L: int, n_heads: int, n_layers: int = 1):
+    def __init__(self, D_h: int, L: int, n_heads: int, n_layers: int = 1,
+                 dropout: float = 0.0):
         super().__init__()
         self.L = L
         self.layer_emb = nn.Embedding(L, D_h)
         self.summary_query = nn.Parameter(torch.zeros(1, 1, D_h))
         nn.init.normal_(self.summary_query, std=0.02)
+        self.drop = nn.Dropout(dropout)
 
         # Multi-layer refinement: each layer is cross-attn + FFN
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             self.layers.append(nn.ModuleDict({
                 "norm_ca": nn.LayerNorm(D_h),
-                "cross_attn": nn.MultiheadAttention(D_h, n_heads, batch_first=True),
+                "cross_attn": nn.MultiheadAttention(D_h, n_heads,
+                                                     batch_first=True,
+                                                     dropout=dropout),
                 "norm_ff": nn.LayerNorm(D_h),
                 "ffn": nn.Sequential(
                     nn.Linear(D_h, D_h * 4),
                     nn.GELU(),
+                    nn.Dropout(dropout),
                     nn.Linear(D_h * 4, D_h),
                 ),
             }))
@@ -81,10 +86,10 @@ class ColumnarAttention(nn.Module):
         for layer in self.layers:
             # Pre-norm cross-attention
             q_norm = layer["norm_ca"](q)
-            q = q + layer["cross_attn"](q_norm, kv, kv)[0]
+            q = q + self.drop(layer["cross_attn"](q_norm, kv, kv)[0])
             # Pre-norm FFN
             q_norm = layer["norm_ff"](q)
-            q = q + layer["ffn"](q_norm)
+            q = q + self.drop(layer["ffn"](q_norm))
 
         return self.final_norm(q.squeeze(1))  # [BS, D_h]
 
@@ -110,7 +115,7 @@ class ThalamicIntegrator(nn.Module):
     """
 
     def __init__(self, d_dec: int, K: int, B: int, n_heads: int,
-                 n_layers: int = 1):
+                 n_layers: int = 1, dropout: float = 0.0):
         super().__init__()
         self.K = K
         self.B = B
@@ -123,17 +128,21 @@ class ThalamicIntegrator(nn.Module):
         # Learned output queries
         self.output_queries = nn.Parameter(torch.zeros(1, K, d_dec))
         nn.init.normal_(self.output_queries, std=0.02)
+        self.drop = nn.Dropout(dropout)
 
         # Multi-layer refinement: each layer is cross-attn + FFN
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             self.layers.append(nn.ModuleDict({
                 "norm_ca": nn.LayerNorm(d_dec),
-                "cross_attn": nn.MultiheadAttention(d_dec, n_heads, batch_first=True),
+                "cross_attn": nn.MultiheadAttention(d_dec, n_heads,
+                                                     batch_first=True,
+                                                     dropout=dropout),
                 "norm_ff": nn.LayerNorm(d_dec),
                 "ffn": nn.Sequential(
                     nn.Linear(d_dec, d_dec * 4),
                     nn.GELU(),
+                    nn.Dropout(dropout),
                     nn.Linear(d_dec * 4, d_dec),
                 ),
             }))
@@ -169,10 +178,10 @@ class ThalamicIntegrator(nn.Module):
         for layer in self.layers:
             # Pre-norm cross-attention to memory
             q_norm = layer["norm_ca"](q)
-            q = q + layer["cross_attn"](q_norm, memory, memory)[0]
+            q = q + self.drop(layer["cross_attn"](q_norm, memory, memory)[0])
             # Pre-norm FFN
             q_norm = layer["norm_ff"](q)
-            q = q + layer["ffn"](q_norm)
+            q = q + self.drop(layer["ffn"](q_norm))
 
         return self.final_norm(q)  # [BS, K, d_dec]
 
@@ -184,22 +193,25 @@ class ThalamicIntegrator(nn.Module):
 class DecoderBlock(nn.Module):
     """Single decoder layer: self-attention + cross-attention + FFN."""
 
-    def __init__(self, d_dec: int, n_heads: int, d_ff: int):
+    def __init__(self, d_dec: int, n_heads: int, d_ff: int,
+                 dropout: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_dec)
         self.self_attn = nn.MultiheadAttention(
-            d_dec, n_heads, batch_first=True,
+            d_dec, n_heads, batch_first=True, dropout=dropout,
         )
         self.norm2 = nn.LayerNorm(d_dec)
         self.cross_attn = nn.MultiheadAttention(
-            d_dec, n_heads, batch_first=True,
+            d_dec, n_heads, batch_first=True, dropout=dropout,
         )
         self.norm3 = nn.LayerNorm(d_dec)
         self.ffn = nn.Sequential(
             nn.Linear(d_dec, d_ff),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_ff, d_dec),
         )
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, memory: Tensor) -> Tensor:
         """
@@ -210,15 +222,15 @@ class DecoderBlock(nn.Module):
         """
         # Pre-norm self-attention
         x_norm = self.norm1(x)
-        x = x + self.self_attn(x_norm, x_norm, x_norm)[0]
+        x = x + self.drop(self.self_attn(x_norm, x_norm, x_norm)[0])
 
         # Pre-norm cross-attention to memory
         x_norm = self.norm2(x)
-        x = x + self.cross_attn(x_norm, memory, memory)[0]
+        x = x + self.drop(self.cross_attn(x_norm, memory, memory)[0])
 
         # Pre-norm FFN
         x_norm = self.norm3(x)
-        x = x + self.ffn(x_norm)
+        x = x + self.drop(self.ffn(x_norm))
 
         return x
 
@@ -258,9 +270,11 @@ class SpatialDecoder(nn.Module):
         # Ensure D_h is divisible by col_heads for MultiheadAttention
         while col_heads > 1 and D_h % col_heads != 0:
             col_heads -= 1
+        drop = config.dropout
         self.columnar = nn.ModuleList([
             ColumnarAttention(D_h, L, n_heads=col_heads,
-                              n_layers=config.columnar_layers)
+                              n_layers=config.columnar_layers,
+                              dropout=drop)
             for _ in range(B)
         ])
 
@@ -272,12 +286,13 @@ class SpatialDecoder(nn.Module):
 
         # Level 2: Thalamic integrator
         self.thalamic = ThalamicIntegrator(d_dec, K, B, n_heads,
-                                           n_layers=config.thalamic_layers)
+                                           n_layers=config.thalamic_layers,
+                                           dropout=drop)
 
         # Level 3: Deep decoder
         self.query_proj = nn.Linear(D, d_dec)
         self.decoder_blocks = nn.ModuleList([
-            DecoderBlock(d_dec, n_heads, d_dec * 4)
+            DecoderBlock(d_dec, n_heads, d_dec * 4, dropout=drop)
             for _ in range(config.decoder_layers)
         ])
 

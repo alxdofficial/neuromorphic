@@ -80,7 +80,7 @@ Instead of relying on unbounded attention over long token histories, the model m
 4) **Episodic memory (EM)** — vector store
 - Updates via neuromodulated writes at plasticity boundaries.
 - Encodes specific facts, events, user preferences.
-- B=4 instances (one per block), each with its own controller.
+- B instances (one per block), each with its own controller.
 - Bounded + decaying + capacity-limited to prevent drift.
 
 ---

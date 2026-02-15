@@ -74,9 +74,9 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 5_000,             # ~61M tokens: WM + PM backbone training
-    "B": 5_000,             # ~61M tokens: + EM retrieval + write patterns
-    "C": 2_500,             # ~31M tokens: lifelong adaptation window
+    "A": 1_000,             # ~8M tokens: WM + PM backbone warmup (brief head start)
+    "B": 11_500,            # ~94M tokens: WM + PM + EM (bulk of training)
+    "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
 
 # -- Regularization --
@@ -1150,6 +1150,17 @@ def main():
                 resume_path = None
             else:
                 resume_path = str(resume_rule)
+
+            # Skip phases with 0 default steps (e.g. lifelong disabled),
+            # unless explicitly overridden via phase_entry.steps or --steps
+            phase_steps = PHASE_DEFAULT_STEPS.get(phase.upper(), None)
+            has_explicit_steps = (
+                phase_entry.get("steps") is not None
+                or settings.get("steps_override") is not None
+            )
+            if phase_steps is not None and phase_steps <= 0 and not has_explicit_steps:
+                print(f"\nSkipping Phase {phase} (0 steps configured)")
+                continue
 
             print(f"\n{'='*60}")
             print(f"Phase {phase} ({i+1}/{len(phases)})")

@@ -2,12 +2,12 @@
 
 ## Overview
 
-This plan covers datasets, configuration, and training phases for the current Tier-A neuromorphic model (~56M parameters, D=512, L=8, B=4) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, neuromodulated memory (PM + EM), lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
+This plan covers datasets, configuration, and training phases for the current Tier-A wide neuromorphic model (~85M parameters, D=768, L=8, B=2) on a single RTX 4090 (24 GB VRAM). It addresses: basic LM skills, neuromodulated memory (PM + EM), lifelong learning / post-training adaptation, agentic capabilities (start small), and future multimodal expansion.
 
 **Aligned with:** spec v2.0
 
 ### v2 Architecture Summary
-- **B blocks** (default 4), each containing **L layers** (default 8)
+- **B blocks** (default 2), each containing **L layers** (default 8)
 - **Working Memory (WM):** sliding-window attention (W=256), 1 shared instance
 - **Procedural Memory (PM):** fast low-rank weights + eligibility, B×L instances (each with `PMNeuromodulator`)
 - **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMNeuromodulator`)
@@ -21,7 +21,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 
 | Tier | Params | D | L | B | Target | 4090 BS |
 |------|--------|---|---|---|--------|---------|
-| **A (Debug)** | ~56M | 512 | 8 | 4 | Rapid iteration | 32–64 |
+| **A (Wide)** | ~85M | 768 | 8 | 2 | Rapid iteration | 32–64 |
 | **B (Competitive)** | ~103M | 768 | 12 | 6 | Match GPT-2 Small | 16–32 |
 | **C (Strong)** | ~197M | 1024 | 24 | 8 | Match GPT-2 Medium | 8–16 |
 

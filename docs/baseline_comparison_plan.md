@@ -1,6 +1,6 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM, ~56M params (Tier A: D=512, L=8, B=4), recurrent architecture with parallel blocks, Procedural Memory (PM), Episodic Memory (EM), Working Memory (WM), and spatial decoder.
+**Target model:** Neuromorphic LM, ~85M params (Tier A wide: D=768, L=8, B=2), recurrent architecture with parallel blocks, Procedural Memory (PM), Episodic Memory (EM), Working Memory (WM), and spatial decoder.
 
 **Date:** 2026-02-11
 
@@ -32,7 +32,7 @@ The gold standard for small-model research. All models trained on the Pile (dedu
 | **Pythia-160M** | 160M | 85M | 12 | 768 | 12 | ~300B (1.5 epochs) |
 | **Pythia-410M** | 410M | 302M | 24 | 1024 | 16 | ~300B (1.5 epochs) |
 
-**Why ideal:** Same D=512 as our Tier A (Pythia-70M), reproducible, extensively benchmarked, public weights, public training data. Pythia-70M is the closest parameter-matched transformer baseline.
+**Why ideal:** Closest parameter-matched transformer baselines. Pythia-160M (~85M non-embed) is close to our Tier A wide (~85M). Reproducible, extensively benchmarked, public weights, public training data.
 
 **Published zero-shot benchmarks (from Pythia paper, Table 4, lm-eval-harness):**
 
@@ -575,11 +575,9 @@ Train at 3-4 model sizes with matched parameter counts:
 
 | Tier | Our model | Pythia | Mamba |
 |------|-----------|--------|-------|
-| ~50M | Tier A (D=512, L=8, B=4) | Pythia-70M | Mamba-130M* |
+| ~85M | Tier A wide (D=768, L=8, B=2) | Pythia-70M / Pythia-160M | Mamba-130M |
 | ~150M | Tier B (D=768, L=12, B=6) | Pythia-160M | Mamba-130M |
 | ~350M | Tier C (D=1024, L=24, B=8) | Pythia-410M | Mamba-370M |
-
-*No Mamba at exactly 50M; closest is 130M.
 
 **Plot:** Validation loss vs parameter count for each architecture family. If our curve is below baselines, the architecture is more parameter-efficient.
 

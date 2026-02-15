@@ -44,6 +44,7 @@ class Layer(nn.Module, StateMixin):
         self.W_o = nn.Linear(D_h, D_h)
 
         self.norm = nn.LayerNorm(D_h)
+        self.drop_resid = nn.Dropout(config.dropout)
 
         # Post-recurrence FFN for nonlinear per-position processing.
         # The recurrence mixes temporal info; the FFN adds reasoning depth.
@@ -53,6 +54,7 @@ class Layer(nn.Module, StateMixin):
             self.ffn = nn.Sequential(
                 nn.Linear(D_h, d_ff),
                 nn.GELU(),
+                nn.Dropout(config.dropout),
                 nn.Linear(d_ff, D_h),
             )
         else:
@@ -100,11 +102,11 @@ class Layer(nn.Module, StateMixin):
         self.h = a * (carry * self.h) + b
 
         # Output projection + residual + LayerNorm (spec §7.4)
-        output = self.norm(self.W_o(self.h) + x_block)
+        output = self.norm(self.drop_resid(self.W_o(self.h)) + x_block)
 
         # Post-recurrence FFN (pre-norm residual)
         if self.ffn is not None:
-            output = output + self.ffn(self.ffn_norm(output))
+            output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
 
         if collect:
             stats = {
@@ -148,11 +150,11 @@ class Layer(nn.Module, StateMixin):
         self.h = h_all[:, -1].float()
 
         # Batched output projection + residual + LayerNorm
-        output = self.norm(self.W_o(h_all) + x_all)
+        output = self.norm(self.drop_resid(self.W_o(h_all)) + x_all)
 
         # Batched post-recurrence FFN
         if self.ffn is not None:
-            output = output + self.ffn(self.ffn_norm(output))
+            output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
 
         return output
 

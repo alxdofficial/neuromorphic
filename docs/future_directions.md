@@ -62,7 +62,7 @@ Psychologically, this maps to:
 
 ### Declarative / Episodic Memory (EM) — v2 ✅
 
-Per-block vector store (B=4 instances), each with:
+Per-block vector store (B instances), each with:
 
 * Itemized facts or events (M=256 items per block)
 * Top-k retrieval (k_ret=4 latent tokens) + cross-attention aggregation
@@ -147,7 +147,7 @@ v2 implements the recommended episodic memory:
 
 * Item-based vector store (K_e, V_e, S_e)
 * Supports top-k retrieval (k_ret=4 latent tokens)
-* Capacity M=256 items per block (B=4 blocks → 1024 total items)
+* Capacity M=256 items per block (B blocks, e.g. B=2 → 512 total items)
 * Per-block `EMNeuromodulator` for write decisions
 
 This enables:

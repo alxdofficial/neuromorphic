@@ -32,6 +32,10 @@ class NeuromorphicLM(nn.Module, StateMixin):
         ])
         self.lm_head = nn.Linear(config.D, config.vocab_size, bias=False)
 
+        # Tie embedding and LM head weights (shared [vocab_size, D] matrix)
+        if config.tie_embeddings:
+            self.lm_head.weight = self.embedding.weight
+
         # Input projection: D -> D (split across blocks after)
         self.W_in = nn.Linear(config.D, config.D, bias=False)
 

@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-14
+**Last verified against code:** 2026-02-15
 
 ---
 
@@ -70,7 +70,7 @@ Token ID ──► Embedding ──► x: [BS, D]
                      │  │ PM read       ││  y_pm = PM[b][l].apply(x_block)
                      │  │ Gate compute  ││  a, b from concat(inputs + surprise)
                      │  │ Recurrence    ││  h = a * (carry * h_prev) + b
-                     │  │ Proj+Res+Norm ││  output = norm(W_o(h) + x_block)
+                     │  │ Proj+Drop+Res+Norm│  output = norm(drop(W_o(h)) + x_block)
                      │  │ Elig update   ││  elig_K += k_cand, elig_V += v_cand
                      │  └───────────────┘│
                      │                    │
@@ -115,17 +115,17 @@ Token ID ──► Embedding ──► x: [BS, D]
                   main loss backprop
 ```
 
-**Dimensions (Tier A defaults):** D=512, B=4, L=8, D_h=128, vocab=32000
+**Dimensions (tier_a_wide defaults):** D=768, B=2, L=8, D_h=384, vocab=32000
 
 **Instance counts:**
 
 | Component | Class | Count | Location |
 |-----------|-------|-------|----------|
 | WM | `WorkingMemory` | 1 | `model.wm` (shared) |
-| EM banks | `EpisodicMemory` | B=4 | `block.em` (one per block) |
-| PM instances | `ProceduralMemory` | B*L=32 | `layer.pm` (one per layer per block) |
-| PM neuromodulators | `PMNeuromodulator` | B*L=32 | `layer.pm_neuromodulator` |
-| EM neuromodulators | `EMNeuromodulator` | B=4 | `block.em_neuromodulator` |
+| EM banks | `EpisodicMemory` | B=2 | `block.em` (one per block) |
+| PM instances | `ProceduralMemory` | B*L=16 | `layer.pm` (one per layer per block) |
+| PM neuromodulators | `PMNeuromodulator` | B*L=16 | `layer.pm_neuromodulator` |
+| EM neuromodulators | `EMNeuromodulator` | B=2 | `block.em_neuromodulator` |
 | Spatial decoder | `SpatialDecoder` | 0 or 1 | `model.spatial_decoder` (if `snapshot_enabled`) |
 
 ---
@@ -177,7 +177,7 @@ return logits, x, y_wm
 
 **Embedding:** `nn.Embedding(vocab_size, D)` -- standard lookup table. Output `x: [BS, D]` is the raw token representation used by all downstream systems.
 
-**LM Head:** `nn.Linear(D, vocab_size, bias=False)` -- projects merged block outputs to vocabulary logits. Not weight-tied with embedding (optional future optimization).
+**LM Head:** `nn.Linear(D, vocab_size, bias=False)` -- projects merged block outputs to vocabulary logits. When `tie_embeddings=True` (default), the embedding matrix and lm_head share the same `[vocab_size, D]` weight matrix. This saves ~24.6M parameters and acts as a regularizer.
 
 **Input projection:** `W_in: nn.Linear(D, D, bias=False)` -- learned projection before splitting across blocks. This allows the model to learn how to distribute information across the B parallel tracks, rather than using a fixed partition of embedding dimensions.
 
@@ -198,7 +198,7 @@ return logits, x, y_wm
 **Per-token operation:**
 1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`
 2. Write `(k, v)` into ring buffer at `wm_ptr` via functional scatter (differentiable within TBPTT chunk)
-3. Multi-head attention (`n_heads=4`) over all valid positions in the buffer
+3. Multi-head attention (`n_heads=4`) over all valid positions in the buffer, with dropout (rate `config.dropout`, default 0.1) applied after the attention softmax
 4. Project output: `y_wm = W_o(attn_output)` -> `[BS, D]`
 5. Advance pointer: `wm_ptr = (wm_ptr + 1) % W`
 
@@ -237,14 +237,14 @@ h = a * (carry * h_prev) + b
 # When carry=1: h = a*h_prev + b (normal recurrence)
 ```
 
-**Output:** `norm(W_o(h) + x_block)` -- output projection, residual connection from block input, plus LayerNorm. `W_o: nn.Linear(D_h, D_h)` is a per-layer learned projection that allows the layer to transform its hidden state before the residual add.
+**Output:** `norm(dropout(W_o(h)) + x_block)` -- output projection, dropout (rate `config.dropout`, default 0.1), residual connection from block input, plus LayerNorm. `W_o: nn.Linear(D_h, D_h)` is a per-layer learned projection that allows the layer to transform its hidden state before the residual add. Dropout is applied after `W_o` but before the residual add, controlled by `config.dropout`.
 
 **Post-recurrence FFN:** After the output projection + residual + LayerNorm, each layer applies a feed-forward network with pre-norm residual:
 ```python
-output = output + ffn(ffn_norm(output))
+output = output + dropout(ffn(ffn_norm(output)))
 # ffn: Linear(D_h, D_h*4) → GELU → Linear(D_h*4, D_h)
 ```
-The recurrence mixes temporal information across time steps; the FFN adds per-position nonlinear depth, giving the model capacity to transform what it retrieves from memory before passing it to the next layer. Controlled by `ffn_expansion` (default 4; set to 0 to disable).
+The recurrence mixes temporal information across time steps; the FFN adds per-position nonlinear depth, giving the model capacity to transform what it retrieves from memory before passing it to the next layer. Controlled by `ffn_expansion` (default 4; set to 0 to disable). Dropout (rate `config.dropout`, default 0.1) is applied after the FFN output but before the residual add.
 
 **What each input contributes:**
 - `x_block: [BS, D_h]` -- the current token's representation for this block
@@ -261,7 +261,7 @@ The recurrence mixes temporal information across time steps; the FFN adds per-po
 
 **Intuition:** PM is the model's "skill memory." It stores low-rank key-value pairs that represent learned associations -- like a lookup table of patterns the model has encountered. When the model sees input that matches a stored key, PM retrieves the corresponding value and injects it into the processing pipeline. Unlike slow weights (parameters), PM can be updated *during inference* via neuromodulated commits at span boundaries.
 
-**Instance count:** One PM per (block, layer) pair. B*L = 32 instances total (Tier A). Each operates independently on its own `[BS, D_h]` slice.
+**Instance count:** One PM per (block, layer) pair. B*L = 16 instances total (tier_a_wide). Each operates independently on its own `[BS, D_h]` slice.
 
 ### 7.1 PM State
 
@@ -275,7 +275,7 @@ Per PM instance, per stream:
 | `elig_K` | `[BS, r, D_h]` | Key eligibility trace. Accumulates proposed key candidates over time. |
 | `elig_V` | `[BS, r, D_h]` | Value eligibility trace. Accumulates proposed value candidates over time. |
 
-`r=8` slots per instance. Total PM state: B*L*r = 256 slot-pairs.
+`r=8` slots per instance. Total PM state: B*L*r = 128 slot-pairs.
 
 ### 7.2 PM Read (every token)
 
@@ -287,12 +287,12 @@ y_pm = einsum("br, brd -> bd", pm_a * scores, pm_V)  # [BS, D_h]
 
 **Intuition:** The input is compared against all r stored keys. Each key that matches well contributes its value, weighted by both the match score and the slot strength `pm_a`. Slots with `pm_a=0` contribute nothing (invisible).
 
-**Post-readout FFN:** After the linear lookup, the result passes through a pre-norm residual FFN:
+**Post-readout FFN (optional):** After the linear lookup, the result can optionally pass through a pre-norm residual FFN:
 ```python
 y_pm = y_raw + readout_ffn(readout_norm(y_raw))
 # readout_ffn: Linear(D_h, D_h*4) → GELU → Linear(D_h*4, D_h)
 ```
-This adds nonlinear processing to the linear key-value lookup, allowing the model to transform retrieved procedural knowledge before injecting it into the recurrence. Controlled by `pm_readout_ffn` (default `True`).
+This adds nonlinear processing to the linear key-value lookup, allowing the model to transform retrieved procedural knowledge before injecting it into the recurrence. Controlled by `pm_readout_ffn` (default `False` in tier_a_wide). The readout FFN is disabled in the current default config because the per-layer FFN (see section 6) already provides nonlinear processing after PM info is integrated into the recurrence, making the dedicated readout FFN redundant.
 
 This is a read-only operation. PM keys and values are frozen within each plasticity span.
 
@@ -422,7 +422,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 **Intuition:** EM is the model's long-term event store. While PM learns reusable patterns (procedural knowledge), EM stores specific *episodes* -- particular token contexts that were surprising or novel. When the model encounters a situation similar to a stored episode, EM retrieves it, providing a form of "I've seen something like this before" recall.
 
-**Instance count:** One EM per block. B=4 instances total (Tier A). Each EM is shared across all L layers within its block.
+**Instance count:** One EM per block. B=2 instances total (tier_a_wide). Each EM is shared across all L layers within its block.
 
 ### 8.1 EM State
 
@@ -652,7 +652,7 @@ Neuromodulators decide **when** and **how strongly** to write to memory. They op
 
 **File:** `src/model/procedural_memory.py`
 **Attribute:** `layer.pm_neuromodulator`
-**Count:** One per (block, layer) pair -- B*L=32 instances total.
+**Count:** One per (block, layer) pair -- B*L=16 instances total.
 
 **Inputs (3 features):**
 
@@ -684,7 +684,7 @@ Hidden size H = `config.neuromod_hidden` (default 32).
 
 **File:** `src/model/episodic_memory.py`
 **Attribute:** `block.em_neuromodulator`
-**Count:** One per block -- B=4 instances total.
+**Count:** One per block -- B=2 instances total.
 
 **Inputs (3 features):**
 
@@ -788,7 +788,7 @@ Layer outputs: [h_0, h_1, ..., h_7]  each [BS, D_h]
        Column summary: [BS, D_h]
 ```
 
-One `ColumnarAttention` instance per block (B=4 total). Cross-attention over 8 tokens × `columnar_layers` rounds — negligible compute.
+One `ColumnarAttention` instance per block (B=2 total). Cross-attention over 8 tokens × `columnar_layers` rounds — negligible compute.
 
 ### 12.3 Level 2 — Thalamic Integrator
 
@@ -798,18 +798,18 @@ Integrates B column summaries (cortical processing) with explicit memory readout
 
 | Token type | Count | Source | Embedding |
 |------------|-------|--------|-----------|
-| Cortical | B=4 | Column summaries from Level 1 | type=cortical + block position |
+| Cortical | B=2 | Column summaries from Level 1 | type=cortical + block position |
 | PM | 1 | Strength-weighted PM slot average | type=procedural |
 | EM | 1 | Strength-weighted EM slot average | type=episodic |
 | WM | 1 | WM step output | type=working |
 
-Total: B+3 = 7 input tokens, all projected to `d_dec`.
+Total: B+3 = 5 input tokens, all projected to `d_dec`.
 
-K learned output queries (default K=4) iteratively cross-attend to these 7 tokens through `thalamic_layers` (default 2) refinement layers. Each layer applies pre-norm cross-attention followed by a pre-norm FFN (4× expansion, GELU). Produces K **integrated memory tokens** `[BS, K, d_dec]`.
+K learned output queries (default K=4) iteratively cross-attend to these 5 tokens through `thalamic_layers` (default 2) refinement layers. Each layer applies pre-norm cross-attention followed by a pre-norm FFN (4× expansion, GELU). Produces K **integrated memory tokens** `[BS, K, d_dec]`.
 
-**PM summary:** For each PM instance (B*L=32), compute strength-weighted readout `sum(pm_a * pm_V) / sum(pm_a)`, then average across all instances → `[BS, D_h]`.
+**PM summary:** For each PM instance (B*L=16), compute strength-weighted readout `sum(pm_a * pm_V) / sum(pm_a)`, then average across all instances → `[BS, D_h]`.
 
-**EM summary:** For each EM instance (B=4), compute strength-weighted readout `sum(em_S * em_V) / sum(em_S)`, then average → `[BS, D_em]`.
+**EM summary:** For each EM instance (B=2), compute strength-weighted readout `sum(em_S * em_V) / sum(em_S)`, then average → `[BS, D_em]`.
 
 When PM or EM is disabled/uninitialized, zero vectors are used (the thalamic integrator still has those token positions — they just carry no signal).
 
@@ -819,8 +819,8 @@ When PM or EM is disabled/uninitialized, zero vectors are used (the thalamic int
 
 A single query token (projected from `h_final`) passes through `decoder_layers` (default 2) pre-norm transformer decoder layers. Each layer does:
 
-1. Self-attention (on the single query)
-2. Cross-attention to K integrated memory tokens from Level 2
+1. Self-attention (on the single query), with dropout after softmax (`config.dropout`)
+2. Cross-attention to K integrated memory tokens from Level 2, with dropout after softmax (`config.dropout`)
 3. FFN (GELU, expansion factor 4x)
 
 ```
@@ -856,7 +856,7 @@ This means `snapshot_enabled=True` initially produces near-identical logits to t
 | `thalamic_layers` | 2 | Depth of Level 2 thalamic integrator |
 | `thalamic_tokens` | 4 | Output tokens from Level 2 (K) |
 
-Additional parameters: ~6M on Tier A (~12% overhead). Compute: cross-attention over sequences of length 8, 7, and 4 × their respective layer counts — effectively free compared to the O(D_h^2) recurrence per layer. Tier B scales `d_dec=384, n_heads_decoder=6`; Tier C scales `d_dec=512, n_heads_decoder=8, decoder_layers=3`.
+Additional parameters: ~6M on Tier A (~7% overhead). Compute: cross-attention over sequences of length 8, 5, and 4 × their respective layer counts — effectively free compared to the O(D_h^2) recurrence per layer. Tier B scales `d_dec=384, n_heads_decoder=6`; Tier C scales `d_dec=512, n_heads_decoder=8, decoder_layers=3`.
 
 ### 12.7 Gradient flow benefit
 
@@ -1105,11 +1105,11 @@ All neuromodulator params are on the main optimizer in all phases. There is no s
 
 | Tier | D | L | B | ~Params | 4090 BS | Use Case |
 |------|---|---|---|---------|---------|----------|
-| **A** (Debug) | 512 | 8 | 4 | ~56M | 32-64 | Rapid iteration |
+| **A** (tier_a_wide, default) | 768 | 8 | 2 | ~85M | 32-64 | Development and ablation |
 | **B** (Competitive) | 768 | 12 | 6 | ~103M | 16-32 | Match GPT-2 Small |
 | **C** (Strong) | 1024 | 24 | 8 | ~197M | 8-16 | Match GPT-2 Medium |
 
-All tiers keep D_h = D/B = 128 constant. Scaling comes from wider model (D), more layers (L), more parallel blocks (B), **and scaled memory capacities**:
+Tier A uses D_h = D/B = 384 (wide blocks); higher tiers keep D_h = D/B = 128 with more blocks. Scaling comes from wider model (D), more layers (L), more parallel blocks (B), **and scaled memory capacities**:
 
 | Component | Tier A | Tier B | Tier C |
 |-----------|--------|--------|--------|
@@ -1198,11 +1198,11 @@ The recurrence + memory architecture means throughput is **lower than a pure tra
 
 ### 21.2 Parameter Counts by Tier and Phase
 
-| Tier | D | L | B | Phase A (WM+PM) | Phase C (WM+PM+EM, lifelong) | Neuromod overhead |
-|------|---|---|---|-------------|---------------|-------------------|
-| **A** (Debug) | 512 | 8 | 4 | 56,012,416 | 56,033,136 | 20,720 (0.04%) |
-| **B** (Competitive) | 768 | 12 | 6 | 102,555,456 | 102,620,400 | 64,944 (0.06%) |
-| **C** (Strong) | 1024 | 24 | 8 | 196,265,728 | 196,530,272 | 264,544 (0.13%) |
+| Tier | D | L | B | ~Params (tied embeddings) | Notes |
+|------|---|---|---|--------------------------|-------|
+| **A** (tier_a_wide) | 768 | 8 | 2 | ~85M | Default config, tied embeddings |
+| **B** (Competitive) | 768 | 12 | 6 | ~103M | |
+| **C** (Strong) | 1024 | 24 | 8 | ~197M | |
 
 Neuromodulators add negligible parameter overhead. The cost difference across phases comes from compute, not parameters.
 
@@ -1210,7 +1210,7 @@ Neuromodulators add negligible parameter overhead. The cost difference across ph
 
 Throughput depends on batch size, span length (P=64), which phases are active, and whether `--compile` is enabled. These numbers are from benchmarks on RTX 4090 (24GB).
 
-**Tier A (~56M) on RTX 4090 (24GB), BS=32, `--compile`:**
+**Tier A (~85M) on RTX 4090 (24GB), BS=32, `--compile`:**
 
 | Phase | Components | Measured tok/s | Notes |
 |-------|-----------|-----------|------------|
@@ -1287,7 +1287,7 @@ Scaling efficiency is estimated at ~85-90% for data parallelism (independent str
 #### Serious Experiment (Publishable ablation, single 4090)
 
 - **Tier A**, all phases with `--compile`, ~1 week
-- **Tokens:** ~5B (Chinchilla-optimal for 56M params)
+- **Tokens:** ~5B (Chinchilla-optimal for 85M params)
 - **Cost:** ~$59
 - Sufficient to demonstrate architecture viability and ablate components
 
@@ -1316,7 +1316,7 @@ Scaling efficiency is estimated at ~85-90% for data parallelism (independent str
 | **LLaMA 2 13B** | 13B | 2T | A100-80GB cluster | 368,640 | ~$516K |
 | **LLaMA 2 70B** | 70B | 2T | A100-80GB cluster | 1,720,320 | ~$2.4M |
 
-Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms could achieve better performance-per-parameter than standard transformers, especially on tasks requiring long-context recall, domain adaptation, and continual learning. The publishable hypothesis is that a 56M neuromorphic model with trained memory can match or outperform a 124M standard transformer on relevant benchmarks.
+Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms could achieve better performance-per-parameter than standard transformers, especially on tasks requiring long-context recall, domain adaptation, and continual learning. The publishable hypothesis is that an 85M neuromorphic model with trained memory can match or outperform a 124M standard transformer on relevant benchmarks.
 
 ### 21.8 Cloud Pricing Reference (Early 2025)
 
@@ -1341,7 +1341,7 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 | `src/model/working_memory.py` | `WorkingMemory` -- sliding window attention |
 | `src/model/procedural_memory.py` | `ProceduralMemory`, `PMNeuromodulator` (two-mode: heuristic / learned) |
 | `src/model/episodic_memory.py` | `EpisodicMemory`, `EMNeuromodulator` (two-mode: heuristic / learned) |
-| `src/model/utils.py` | `StateMixin`, `unit_normalize`, `soft_topk`, `budget_enforce` |
+| `src/model/utils.py` | `StateMixin`, `unit_normalize`, `budget_enforce` |
 | `src/model/state.py` | `save_runtime_state`, `load_runtime_state`, `detach_all`, `reset_all` |
 | `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, orchestrates span loop |
 | `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM eligibility/commit, EM candidates/write |

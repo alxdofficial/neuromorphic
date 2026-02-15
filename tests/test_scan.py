@@ -168,6 +168,7 @@ class TestLayerForwardSpan:
     def test_outputs_match_sequential(self, layer_and_inputs):
         """forward_span outputs match P calls to step()."""
         layer, x, y_pm, y_wm_proj, y_em_proj, surprise, carry, cfg = layer_and_inputs
+        layer.eval()  # disable dropout for deterministic comparison
 
         # Sequential path
         layer_seq = copy.deepcopy(layer)
@@ -192,6 +193,7 @@ class TestLayerForwardSpan:
     def test_with_doc_boundary_reset(self, layer_and_inputs):
         """Carry=0 mid-span produces correct reset in both paths."""
         layer, x, y_pm, y_wm_proj, y_em_proj, surprise, _, cfg = layer_and_inputs
+        layer.eval()  # disable dropout for deterministic comparison
         carry = torch.ones(BS, P, 1)
         carry[:, 2, :] = 0.0  # reset at position 2
 
@@ -214,6 +216,7 @@ class TestLayerForwardSpan:
     def test_gradients_match(self, layer_and_inputs):
         """Gradients through both paths match."""
         layer, x, y_pm, y_wm_proj, y_em_proj, surprise, carry, cfg = layer_and_inputs
+        layer.eval()  # disable dropout for deterministic comparison
 
         # Sequential gradient
         layer_seq = copy.deepcopy(layer)
@@ -352,6 +355,7 @@ class TestWMForwardSpan:
     def test_matches_sequential(self):
         cfg = make_tiny_config()
         wm = WorkingMemory(cfg)
+        wm.eval()  # disable dropout for deterministic comparison
         torch.manual_seed(42)
 
         x = torch.randn(BS, P, cfg.D)
@@ -381,6 +385,7 @@ class TestWMForwardSpan:
     def test_with_midspan_reset(self):
         cfg = make_tiny_config()
         wm = WorkingMemory(cfg)
+        wm.eval()  # disable dropout for deterministic comparison
         torch.manual_seed(42)
 
         x = torch.randn(BS, P, cfg.D)
@@ -411,6 +416,7 @@ class TestWMForwardSpan:
         """
         cfg = make_tiny_config()  # W=16, P=4
         wm = WorkingMemory(cfg)
+        wm.eval()  # disable dropout for deterministic comparison
         torch.manual_seed(42)
 
         # Fill the entire cache (W/P = 4 spans) so all entries are valid
@@ -455,6 +461,7 @@ class TestBlockForwardSpan:
         cfg = make_tiny_config()
         cfg.set_phase(phase)
         block = Block(cfg, block_idx=0)
+        block.eval()  # disable dropout for deterministic comparison
         torch.manual_seed(42)
 
         D_h = cfg.D_h
@@ -500,6 +507,7 @@ class TestModelForwardSpan:
         cfg.set_phase(phase)
         torch.manual_seed(42)
         model = NeuromorphicLM(cfg)
+        model.eval()  # disable dropout for deterministic comparison
 
         input_ids = torch.randint(0, cfg.vocab_size, (BS, P))
         reset_first = torch.zeros(BS, dtype=torch.bool)
@@ -537,6 +545,7 @@ class TestModelForwardSpan:
         cfg.set_phase("A")
         torch.manual_seed(42)
         model = NeuromorphicLM(cfg)
+        model.eval()  # disable dropout for deterministic comparison
 
         input_ids = torch.randint(0, cfg.vocab_size, (BS, P))
         input_ids[0, 1] = cfg.eot_id  # force reset at position 2 for stream 0
@@ -588,6 +597,7 @@ class TestModelForwardSpan:
         cfg.set_phase("A")
         torch.manual_seed(42)
         model = NeuromorphicLM(cfg)
+        model.eval()
 
         input_ids = torch.randint(0, cfg.vocab_size, (BS, P))
         reset_first = torch.zeros(BS, dtype=torch.bool)
@@ -666,6 +676,7 @@ class TestEdgeCases:
         cfg.set_phase("A")
         torch.manual_seed(42)
         model = NeuromorphicLM(cfg)
+        model.eval()
         model.surprise = torch.zeros(BS, 1)
 
         input_ids = torch.randint(0, cfg.vocab_size, (BS, 1))
@@ -889,6 +900,7 @@ class TestSpatialDecoderSpan:
         cfg.set_phase(phase)
         torch.manual_seed(42)
         model = NeuromorphicLM(cfg)
+        model.eval()  # disable dropout for deterministic comparison
 
         input_ids = torch.randint(0, cfg.vocab_size, (BS, P))
         reset_first = torch.zeros(BS, dtype=torch.bool)

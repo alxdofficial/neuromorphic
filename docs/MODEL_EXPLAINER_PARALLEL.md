@@ -29,7 +29,7 @@
 The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was designed to be scan-friendly: gates `a` and `b` depend only on input features, never on `h_{t-1}`. Despite this, the original implementation processed tokens one at a time in a Python for-loop. This meant:
 
 - Every token launched separate CUDA kernels for gate projections, PM reads, EM retrieval, FFN, etc.
-- GPU utilization was poor: each kernel operated on `[BS, D_h]` tensors (e.g. `[32, 128]` = 4K elements), far below the threshold for saturating GPU compute.
+- GPU utilization was poor: each kernel operated on `[BS, D_h]` tensors (e.g. `[32, 384]` = 12K elements), far below the threshold for saturating GPU compute.
 - Training speed was ~250 tok/s on a 4090 for Tier A — viable for debugging, too slow for serious experiments.
 
 The parallel path batches P=64 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 64x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~40x throughput increase over the original sequential path (~10K tok/s on a 4090 for Tier A).
@@ -126,17 +126,17 @@ return logits_all, x_emb_all, y_wm_all
 
 ## 4. Concrete Walkthrough: One Span, Token by Token
 
-Trace the full lifecycle of one span (P=64 tokens) on Tier A (D=512, B=4, L=8, D_h=128, D_wm=128, D_em=128, r=8, M=256, W=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
+Trace the full lifecycle of one span (P=64 tokens) on Tier A wide (D=768, B=2, L=8, D_h=384, D_wm=192, D_em=128, r=8, M=256, W=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
 
 ### 4.1 State entering this span
 
 ```
 model.surprise:  [32, 1]    — mean surprise from previous span (e.g. 3.2 for each stream)
-Layer.h:         [32, 128]  — per layer, per block (32 instances total). Carries forward from last span.
-WM ring buffer:  wm_K [32, 256, 128], wm_V [32, 256, 128], wm_ptr [32], wm_valid [32, 256]
-PM state:        pm_K [32, 8, 128], pm_V [32, 8, 128], pm_a [32, 8]  — per layer per block (32 instances)
-PM eligibility:  elig_K [32, 8, 128], elig_V [32, 8, 128]            — per layer per block (32 instances)
-EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256]  — per block (4 instances)
+Layer.h:         [32, 384]  — per layer, per block (16 instances total). Carries forward from last span.
+WM ring buffer:  wm_K [32, 256, 192], wm_V [32, 256, 192], wm_ptr [32], wm_valid [32, 256]
+PM state:        pm_K [32, 8, 384], pm_V [32, 8, 384], pm_a [32, 8]  — per layer per block (16 instances)
+PM eligibility:  elig_K [32, 8, 384], elig_V [32, 8, 384]            — per layer per block (16 instances)
+EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256]  — per block (2 instances)
 ```
 
 ### 4.2 Phase 1: Forward pass (model.forward_span)
@@ -157,15 +157,15 @@ This single value will be broadcast to all 32 tokens in every layer's gate compu
 
 **Step 3 — Embed all tokens:**
 ```
-x_emb_all = embedding(input_ids)  # [32, 64, 512]
+x_emb_all = embedding(input_ids)  # [32, 64, 768]
 ```
 One kernel launch. 64× more work per launch than the sequential path.
 
 **Step 4 — Working memory (batched span path):**
 ```
-q_all = W_q(x_emb_all)    # [32, 64, 128]  — one matmul
-k_all = W_k(x_emb_all)    # [32, 64, 128]  — one matmul
-v_all = W_v(x_emb_all)    # [32, 64, 128]  — one matmul
+q_all = W_q(x_emb_all)    # [32, 64, 192]  — one matmul
+k_all = W_k(x_emb_all)    # [32, 64, 192]  — one matmul
+v_all = W_v(x_emb_all)    # [32, 64, 192]  — one matmul
 ```
 `forward_span()` dispatches:
 - no mid-span resets: batched attention over `[cache | span]` with overwrite-aware masking
@@ -173,85 +173,85 @@ v_all = W_v(x_emb_all)    # [32, 64, 128]  — one matmul
 
 At t=13: streams with reset clear `wm_valid` and reset `wm_ptr` to 0.
 ```
-y_wm_all:  [32, 64, 512]  — WM output for all tokens
+y_wm_all:  [32, 64, 768]  — WM output for all tokens
 ```
 
 **Step 5 — Project and split across blocks:**
 ```
-x_proj_all = W_in(x_emb_all)                          # [32, 64, 512]  — one matmul
-x_blocks_all = x_proj_all.view(32, 64, 4, 128)        # [32, 64, 4, 128]
+x_proj_all = W_in(x_emb_all)                          # [32, 64, 768]  — one matmul
+x_blocks_all = x_proj_all.view(32, 64, 2, 384)        # [32, 64, 2, 384]
 ```
 
-**Step 6 — Process each block (b=0..3):**
+**Step 6 — Process each block (b=0..1):**
 
 For block 0:
 ```
-x_block_all = x_blocks_all[:, :, 0]                    # [32, 64, 128]
+x_block_all = x_blocks_all[:, :, 0]                    # [32, 64, 384]
 
 # EM retrieval (frozen em_K, em_V, em_S)
-y_em_all = em.retrieve_batch(x_emb_all, y_wm_all)     # [32, 64, 512]
+y_em_all = em.retrieve_batch(x_emb_all, y_wm_all)     # [32, 64, 768]
 
 # Project shared signals to per-block dim
-y_wm_proj_all = W_wm_proj(y_wm_all)                   # [32, 64, 128]  — one matmul
-y_em_proj_all = W_em_proj(y_em_all)                    # [32, 64, 128]  — one matmul
+y_wm_proj_all = W_wm_proj(y_wm_all)                   # [32, 64, 384]  — one matmul
+y_em_proj_all = W_em_proj(y_em_all)                    # [32, 64, 384]  — one matmul
 ```
 
 Then for each layer (l=0..7):
 ```
   # PM read (frozen pm_K, pm_V, pm_a)
-  y_pm_all = pm.apply_batch(x)                         # [32, 64, 128]  — batched einsum
+  y_pm_all = pm.apply_batch(x)                         # [32, 64, 384]  — batched einsum
 
   # Fuse all inputs + frozen surprise
   u = cat([x, y_pm_all, y_wm_proj_all, y_em_proj_all, surprise_all])
-                                                        # [32, 64, 513]
+                                                        # [32, 64, 1537]
 
   # Batched gate computation (two matmuls instead of 64×2)
-  a = sigmoid(gate_a(u))                                # [32, 64, 128]
-  b = tanh(gate_b(u))                                   # [32, 64, 128]
+  a = sigmoid(gate_a(u))                                # [32, 64, 384]
+  b = tanh(gate_b(u))                                   # [32, 64, 384]
 
   # Apply carry mask: at t=13 for reset streams, a_eff becomes 0
-  a_eff = a * carry_all                                 # [32, 64, 128]
+  a_eff = a * carry_all                                 # [32, 64, 384]
 
   # Affine scan: h_t = a_eff_t * h_{t-1} + b_t
   # At t=13 for reset streams: h_13 = 0 * h_12 + b_13 = b_13 (fresh start)
-  h_all = parallel_affine_scan(a_eff, b, self.h)        # [32, 64, 128]
+  h_all = parallel_affine_scan(a_eff, b, self.h)        # [32, 64, 384]
   self.h = h_all[:, -1]                                  # update state to token 63
 
   # Output projection + residual + norm + FFN (all batched)
-  output = norm(W_o(h_all) + x)                         # [32, 64, 128]
-  output = output + ffn(ffn_norm(output))               # [32, 64, 128]
+  output = norm(W_o(h_all) + x)                         # [32, 64, 384]
+  output = output + ffn(ffn_norm(output))               # [32, 64, 384]
 
   # Cache for post-forward eligibility/EM
-  self._last_h_all = output                              # [32, 64, 128]
+  self._last_h_all = output                              # [32, 64, 384]
 
   x = output  # next layer's input
 ```
 
-Block 0 returns `x: [32, 64, 128]`. Repeat for blocks 1, 2, 3.
+Block 0 returns `x: [32, 64, 384]`. Repeat for block 1.
 
 **Step 7 — Merge and predict (with spatial decoder):**
 ```
-h_final = cat([h_b0, h_b1, h_b2, h_b3], dim=-1)       # [32, 64, 512]
+h_final = cat([h_b0, h_b1], dim=-1)                    # [32, 64, 768]
 
 # Spatial decoder (snapshot_enabled=True, the default):
 # Collect cached per-layer outputs from each block
 block_layer_outputs = [block._last_layer_stack for block in blocks]
-                                                        # 4 × [32, 64, 8, 128]
+                                                        # 2 × [32, 64, 8, 384]
 # PM/EM summaries frozen within span
-pm_summary = _compute_pm_summary(32, device)            # [32, 128]
+pm_summary = _compute_pm_summary(32, device)            # [32, 384]
 em_summary = _compute_em_summary(32, device)            # [32, 128]
 
 # Reshape everything to [BS*P, ...] = [2048, ...]
-block_layer_flat = [blo.reshape(2048, 8, 128) for blo in block_layer_outputs]
-pm_flat = pm_summary.unsqueeze(1).expand(32, 64, 128).reshape(2048, 128)
+block_layer_flat = [blo.reshape(2048, 8, 384) for blo in block_layer_outputs]
+pm_flat = pm_summary.unsqueeze(1).expand(32, 64, 384).reshape(2048, 384)
 em_flat = em_summary.unsqueeze(1).expand(32, 64, 128).reshape(2048, 128)
-wm_flat = y_wm_all.reshape(2048, 512)
-h_flat = h_final.reshape(2048, 512)
+wm_flat = y_wm_all.reshape(2048, 768)
+h_flat = h_final.reshape(2048, 768)
 
 # Run decoder on all 2048 positions at once
 h_decoded = spatial_decoder(block_layer_flat, pm_flat,
-                            em_flat, wm_flat, h_flat)   # [2048, 512]
-logits_all = lm_head(h_decoded.reshape(32, 64, 512))   # [32, 64, 32000]
+                            em_flat, wm_flat, h_flat)   # [2048, 768]
+logits_all = lm_head(h_decoded.reshape(32, 64, 768))   # [32, 64, 32000]
 ```
 
 `forward_span` returns `(logits_all, x_emb_all, y_wm_all)`.
@@ -276,27 +276,27 @@ span_loss = cross_entropy(logits_all.reshape(2048, 32000),
 
 `W_in` computed once for all blocks:
 ```
-  x_proj_all = W_in(x_emb_all).view(32, 64, 4, 128)                   # 1 matmul
+  x_proj_all = W_in(x_emb_all).view(32, 64, 2, 384)                   # 1 matmul
 ```
 
-For each block b=0..3, each layer l=0..7:
+For each block b=0..1, each layer l=0..7:
 ```
-  x_in  = previous layer's _last_h_all (or x_proj_all[:,:,b] for l=0)  # [32, 64, 128]
-  h_out = this layer's _last_h_all                                      # [32, 64, 128]
+  x_in  = previous layer's _last_h_all (or x_proj_all[:,:,b] for l=0)  # [32, 64, 384]
+  h_out = this layer's _last_h_all                                      # [32, 64, 384]
 
   # Batched projections (2 matmuls instead of 128)
-  k_cand_all = normalize(W_k_pre(x_in))                                # [32, 64, 128]
-  v_cand_all = W_v_post(h_out)                                         # [32, 64, 128]
+  k_cand_all = normalize(W_k_pre(x_in))                                # [32, 64, 384]
+  v_cand_all = W_v_post(h_out)                                         # [32, 64, 384]
 
   # Surprise gating + carry mask for resets
   gate = (token_surprise / 5.0).clamp(0, 1)                            # [32, 64, 1, 1]
-  a = 0.95 * carry  (0 at t=13 for reset streams)                      # [32, 64, 8, 128]
-  b_K = gate * k_cand_all  (broadcast over r=8)                        # [32, 64, 8, 128]
+  a = 0.95 * carry  (0 at t=13 for reset streams)                      # [32, 64, 8, 384]
+  b_K = gate * k_cand_all  (broadcast over r=8)                        # [32, 64, 8, 384]
 
   # Affine scan: elig_t = a_t * elig_{t-1} + b_t (fused K+V double-width)
-  elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)           # [32, 64, 2048]
+  elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)           # [32, 64, 6144]
   elig_K, elig_V = elig_KV_all.chunk(2, dim=-1)                        # split back
-  elig_K = elig_K[:, -1].reshape(32, 8, 128)                           # update to token 63
+  elig_K = elig_K[:, -1].reshape(32, 8, 384)                           # update to token 63
 ```
 
 At t=13 for reset streams: carry=0 so `elig = 0 * elig_prev + gate * cand` (fresh start, equivalent to zeroing).
@@ -305,9 +305,9 @@ Note: The K and V eligibility scans are fused into a single double-width scan (c
 
 **Step 11 — EM candidate proposal (batched):**
 
-For each block b=0..3:
+For each block b=0..1:
 ```
-  h_final_all = block.layers[-1]._last_h_all            # [32, 64, 128]
+  h_final_all = block.layers[-1]._last_h_all            # [32, 64, 384]
   k_cand = normalize(W_k_cand(cat(x_emb_all, y_wm_all)))  # [32, 64, 128]
   v_cand = W_v_cand(h_final_all)                            # [32, 64, 128]
   novelty = blend(token_surprise, 1 - max_sim(k_cand, em_K))  # [32, 64]
@@ -349,16 +349,16 @@ In the sequential path, steps 3-7 would each be called 64 times with `[32, ...]`
 | WM Q/K/V projection | 64 × 3 = 192 launches | 3 launches |
 | WM attention (sequential either way) | 64 launches | 64 launches |
 | W_in projection | 64 launches | 1 launch |
-| Per-block EM retrieval | 64 × 4 = 256 launches | 4 launches |
-| Per-block WM/EM projection | 64 × 4 × 2 = 512 launches | 4 × 2 = 8 launches |
-| Per-layer PM read | 64 × 32 = 2048 launches | 32 launches |
-| Per-layer gate_a + gate_b | 64 × 32 × 2 = 4096 launches | 32 × 2 = 64 launches |
-| Per-layer scan (sequential either way) | 64 × 32 = 2048 element-wise | 32 × 64 = 2048 element-wise |
-| Per-layer W_o + FFN | 64 × 32 × 3 = 6144 launches | 32 × 3 = 96 launches |
+| Per-block EM retrieval | 64 × 2 = 128 launches | 2 launches |
+| Per-block WM/EM projection | 64 × 2 × 2 = 256 launches | 2 × 2 = 4 launches |
+| Per-layer PM read | 64 × 16 = 1024 launches | 16 launches |
+| Per-layer gate_a + gate_b | 64 × 16 × 2 = 2048 launches | 16 × 2 = 32 launches |
+| Per-layer scan (sequential either way) | 64 × 16 = 1024 element-wise | 16 × 64 = 1024 element-wise |
+| Per-layer W_o + FFN | 64 × 16 × 3 = 3072 launches | 16 × 3 = 48 launches |
 | LM head | 64 launches | 1 launch |
-| PM eligibility projections (post-fwd) | 64 × 32 × 2 = 4096 launches | 32 × 2 = 64 launches |
-| PM eligibility scan (post-fwd, fused K+V) | 64 × 32 × 2 = 4096 element-wise | 32 × 64 = 2048 element-wise |
-| **Total kernel launches** | **~23,700** | **~440 + 64 seq** |
+| PM eligibility projections (post-fwd) | 64 × 16 × 2 = 2048 launches | 16 × 2 = 32 launches |
+| PM eligibility scan (post-fwd, fused K+V) | 64 × 16 × 2 = 2048 element-wise | 16 × 64 = 1024 element-wise |
+| **Total kernel launches** | **~12,500** | **~230 + 64 seq** |
 
 Each parallel launch does 64× more work, saturating GPU compute. The scan loops (layer recurrence + eligibility) are the same cost either way but trivial compared to the matmuls. `W_in` is computed once and shared across all blocks for both the forward pass and eligibility.
 
@@ -429,7 +429,7 @@ y_em_all = W_o_cross(out)                                      # [BS, P, D]
 
 **Sequential** (`step()`):
 ```python
-u = cat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])  # [BS, 4*D_h+1]
+u = cat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])  # [BS, 4*D_h+1=1537]
 a = sigmoid(gate_a(u))                                      # [BS, D_h]
 b = tanh(gate_b(u))                                         # [BS, D_h]
 self.h = a * (carry * self.h) + b                           # scalar recurrence
@@ -441,7 +441,7 @@ output = output + ffn(ffn_norm(output))                     # post-recurrence FF
 ```python
 surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)         # frozen!
 u = cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
-         surprise_all], dim=-1)                                     # [BS, P, 4*D_h+1]
+         surprise_all], dim=-1)                                     # [BS, P, 4*D_h+1=1537]
 
 a = sigmoid(gate_a(u))                                              # [BS, P, D_h] — batched
 b = tanh(gate_b(u))                                                 # [BS, P, D_h] — batched
@@ -458,7 +458,7 @@ self._last_h_all = output                                          # cached for 
 
 **Key differences:**
 1. **Surprise is frozen** — `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7).
-2. **Gate projections batched** — one `gate_a` forward on `[BS, P, 4*D_h+1]` instead of P separate calls on `[BS, 4*D_h+1]`. This is where most of the speedup comes from.
+2. **Gate projections batched** — one `gate_a` forward on `[BS, P, 4*D_h+1=1537]` instead of P separate calls on `[BS, 4*D_h+1=1537]`. This is where most of the speedup comes from.
 3. **Recurrence via scan** — `parallel_affine_scan` computes all P hidden states given pre-computed `a` and `b` (§6).
 4. **`_last_h_all` cached** — The full `[BS, P, D_h]` output sequence is stored for the trainer's post-forward eligibility and EM candidate steps.
 
@@ -520,7 +520,7 @@ def parallel_affine_scan(a, b, h_init):
     return h_all  # [BS, P, D]
 ```
 
-**This is intentionally a sequential loop.** The scan itself is NOT the bottleneck — P=64 iterations of element-wise ops on `[BS, D_h]` = `[32, 128]` tensors takes microseconds. The speedup comes from batching the expensive operations *around* the scan (gate projections, FFN, attention), and from `torch.compile` (§12) which unrolls the loop and fuses all elementwise ops into optimized CUDA kernels. A true CUDA parallel prefix scan could replace this later as a further optimization.
+**This is intentionally a sequential loop.** The scan itself is NOT the bottleneck — P=64 iterations of element-wise ops on `[BS, D_h]` = `[32, 384]` tensors takes microseconds. The speedup comes from batching the expensive operations *around* the scan (gate projections, FFN, attention), and from `torch.compile` (§12) which unrolls the loop and fuses all elementwise ops into optimized CUDA kernels. A true CUDA parallel prefix scan could replace this later as a further optimization.
 
 **Dtype promotion:** Uses `torch.promote_types` on dtype objects (not tensors) to ensure the output dtype accommodates all three inputs. This is compile-safe under `torch.compile(fullgraph=True)` — the older `torch.result_type(tensor, tensor)` approach caused graph breaks.
 
@@ -550,7 +550,7 @@ This is frozen at `model.py:197` (`surprise_span = self.surprise`) and broadcast
 **The frozen value is the previous span's mean surprise** — averaged over all valid (non-EOT) tokens in the span. This is more stable than a single token's surprise, which would be a noisy sample (and would be 0 if the last token happened to be EOT).
 
 **Why freezing is acceptable:**
-1. Surprise is 1 dimension out of `4*D_h + 1 = 513` gate input dimensions.
+1. Surprise is 1 dimension out of `4*D_h + 1 = 1537` gate input dimensions.
 2. The spec §1.4 explicitly designed plasticity boundaries (every P tokens) as the granularity for slowly-varying signals. PM and EM are already frozen within spans; surprise follows the same pattern.
 3. Per-token surprise IS still computed post-forward for everything else: eligibility gating, EM candidate scoring, span-mean surprise for boundary controllers.
 
@@ -681,7 +681,7 @@ The K and V scans are fused into a single double-width scan by concatenating alo
 ### 9.4 EM Candidate Proposal
 
 ```python
-for b, block in enumerate(model.blocks):
+for b, block in enumerate(model.blocks):  # b=0..1
     h_final_all = block.layers[-1]._last_h_all  # [BS, P, D_h]
     k_c, v_c, nov = block.em.propose_candidate_batch(
         x_emb_all, y_wm_all, h_final_all, token_surprise,
@@ -774,7 +774,7 @@ These are the places where the parallel path produces different numerical result
 
 ### 11.1 Surprise in Layer Gates
 
-**Magnitude:** Small (1/513 gate input dimensions)
+**Magnitude:** Small (1/1537 gate input dimensions)
 
 Sequential: token t sees `surprise = -log p(target_{t-1})` (lagged by one token).
 Parallel: all tokens see `surprise = mean_surprise(previous_span)` (frozen span-mean).

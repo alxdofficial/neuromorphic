@@ -40,6 +40,8 @@ class WorkingMemory(nn.Module, StateMixin):
         self.W_o = nn.Linear(config.D_wm, config.D)
 
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.attn_drop = nn.Dropout(config.dropout)
+        self.drop_resid = nn.Dropout(config.dropout)
 
         # State tensors (lazily initialized on first step)
         self.wm_K: Tensor = None
@@ -122,15 +124,17 @@ class WorkingMemory(nn.Module, StateMixin):
         attn = torch.softmax(attn, dim=-1)
         attn = attn.nan_to_num(0.0)  # all-invalid -> zero attention
 
-        # Store for debug metrics (overwritten each step, ~32K floats)
+        # Store for debug metrics before dropout (normalized probs for entropy)
         self._last_attn = attn.detach()  # [BS, n_heads, W]
+
+        attn = self.attn_drop(attn)
 
         # Weighted sum: [BS, n_heads, head_dim]
         out = torch.einsum("bnw, bnwd -> bnd", attn, V_h)
 
         # Merge heads and project
         out = out.reshape(BS, self.D_wm)
-        y_wm = self.W_o(out)  # [BS, D]
+        y_wm = self.drop_resid(self.W_o(out))  # [BS, D]
 
         # Advance pointer (ring buffer wrap)
         self.wm_ptr = (ptr + 1) % self.W
@@ -215,10 +219,11 @@ class WorkingMemory(nn.Module, StateMixin):
             attn = attn.masked_fill(~valid_mask, float("-inf"))
             attn = torch.softmax(attn, dim=-1)
             attn = attn.nan_to_num(0.0)
+            attn = self.attn_drop(attn)
 
             out = torch.einsum("bnw, bnwd -> bnd", attn, V_h)
             out = out.reshape(BS, self.D_wm)
-            y_wm = self.W_o(out)
+            y_wm = self.drop_resid(self.W_o(out))
             outputs.append(y_wm)
 
             # Advance pointer
@@ -298,6 +303,7 @@ class WorkingMemory(nn.Module, StateMixin):
 
         attn = torch.softmax(attn, dim=-1)
         attn = attn.nan_to_num(0.0)  # all-invalid -> zero attention
+        attn = self.attn_drop(attn)
 
         # Weighted sum: [BS, n_heads, P, head_dim]
         out = torch.matmul(attn, V_h)
@@ -306,7 +312,7 @@ class WorkingMemory(nn.Module, StateMixin):
         out = out.transpose(1, 2).reshape(BS, P, self.D_wm)
 
         # Output projection: [BS, P, D]
-        y_wm_all = self.W_o(out)
+        y_wm_all = self.drop_resid(self.W_o(out))
 
         # --- Differentiable cache update (write all P tokens at once) ---
         # write_masks[b, t, w] = 1.0 if span token t writes to cache position w

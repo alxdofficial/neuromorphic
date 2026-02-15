@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.model.utils import unit_normalize, soft_topk, budget_enforce
+from src.model.utils import unit_normalize, budget_enforce
 from src.model.model import NeuromorphicLM
 from src.model.procedural_memory import ProceduralMemory
 from src.model.episodic_memory import EpisodicMemory
@@ -33,37 +33,6 @@ class TestUnitNormalize:
         out = unit_normalize(x)
         assert torch.isfinite(out).all()
         assert not torch.isnan(out).any()
-
-
-# ============================================================================
-# soft_topk
-# ============================================================================
-
-class TestSoftTopk:
-    def test_output_sums_to_one(self):
-        scores = torch.randn(3, 10)
-        w = soft_topk(scores, k=3)
-        sums = w.sum(dim=-1)
-        assert torch.allclose(sums, torch.ones(3), atol=1e-5)
-
-    def test_non_topk_entries_are_zero(self):
-        scores = torch.randn(2, 10)
-        k = 3
-        w = soft_topk(scores, k=k)
-        # At most k entries should be non-zero per row
-        nonzero_count = (w > 1e-7).sum(dim=-1)
-        assert (nonzero_count <= k).all()
-
-    def test_respects_temperature(self):
-        scores = torch.randn(2, 8)
-        w_low = soft_topk(scores, k=4, tau=0.1)
-        w_high = soft_topk(scores, k=4, tau=10.0)
-        # High temperature should be more uniform among top-k
-        # Entropy of top-k entries should be higher with higher tau
-        def topk_entropy(w):
-            w_pos = w[w > 1e-8]
-            return -(w_pos * w_pos.log()).sum()
-        assert topk_entropy(w_high) > topk_entropy(w_low)
 
 
 # ============================================================================
@@ -226,6 +195,7 @@ class TestCarryGate:
         cfg = make_tiny_config()
         cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
+        model.eval()  # disable dropout for deterministic comparison
         BS = 2
         input_id = torch.randint(0, 64, (BS,))
 

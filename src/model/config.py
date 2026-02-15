@@ -63,6 +63,10 @@ class ModelConfig:
     neuromod_hidden: int = 32         # hidden dim for neuromod backbone MLPs
     content_proj_dim: int = 8         # projection dim for content embeddings in neuromods
 
+    # Regularization
+    dropout: float = 0.1      # dropout rate (residual, attention, FFN)
+    tie_embeddings: bool = True  # share embedding and lm_head weights
+
     # Training
     T: int = 256              # TBPTT segment length
     P: int = 64               # plasticity span
@@ -166,8 +170,9 @@ class ModelConfig:
 
     @classmethod
     def tier_a_wide(cls, **overrides) -> "ModelConfig":
-        """Wide variant of tier A. D=768, L=8, B=4, D_h=192."""
-        defaults = dict(D=768, L=8, B=4, D_wm=192, n_heads_wm=6)
+        """Wide variant of tier A. D=768, L=8, B=2, D_h=384."""
+        defaults = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6,
+                        pm_readout_ffn=False)
         defaults.update(overrides)
         return cls(**defaults)
 

@@ -8,7 +8,7 @@ providing common state management (detach/reset/save/load).
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -24,31 +24,6 @@ def unit_normalize(x: Tensor, dim: int = -1, eps: float = 1e-8) -> Tensor:
     norm_sq = (x * x).sum(dim=dim, keepdim=True)
     return x / (norm_sq + eps).sqrt()
 
-
-def soft_topk(scores: Tensor, k: int, tau: Union[float, Tensor] = 1.0) -> Tensor:
-    """Softmax over top-k entries, zero rest.
-
-    Args:
-        scores: [*, N] raw scores
-        k: number of entries to keep
-        tau: softmax temperature — scalar or [*] tensor for per-row temperature
-
-    Returns:
-        weights: [*, N] with top-k softmaxed, rest zero
-    """
-    # If tau is a tensor with batch dims, unsqueeze for broadcasting with [..., N]
-    if isinstance(tau, Tensor) and tau.dim() >= 1:
-        tau = tau.unsqueeze(-1)  # [*, 1]
-
-    N = scores.shape[-1]
-    if k >= N:
-        return torch.softmax(scores / tau, dim=-1)
-
-    topk_vals, topk_idx = scores.topk(k, dim=-1)
-    weights = torch.zeros_like(scores)
-    softmaxed = torch.softmax(topk_vals / tau, dim=-1)
-    weights.scatter_(-1, topk_idx, softmaxed)
-    return weights
 
 
 def budget_enforce(strengths: Tensor, budget: float) -> Tensor:
@@ -81,13 +56,6 @@ class StateMixin:
     # Subclasses should set this to a list of attribute names that are
     # runtime state tensors (e.g. ["pm_K", "pm_V", "pm_a"]).
     _state_tensor_names: list = []
-
-    def _get_state_tensors(self) -> Dict[str, Optional[Tensor]]:
-        """Return dict of name -> tensor for all runtime state."""
-        result = {}
-        for name in self._state_tensor_names:
-            result[name] = getattr(self, name, None)
-        return result
 
     def detach_states(self):
         """Detach all runtime state tensors in-place (TBPTT boundary)."""

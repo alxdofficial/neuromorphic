@@ -206,7 +206,7 @@ class TestSpecificGradients:
         layer = model.blocks[0].layers[0]
         if layer.ffn is not None:
             assert layer.ffn[0].weight.grad is not None
-            assert layer.ffn[2].weight.grad is not None
+            assert layer.ffn[3].weight.grad is not None
 
 
 # ============================================================================

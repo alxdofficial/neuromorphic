@@ -8,6 +8,7 @@ update this file. If not, the code has a regression.
 # Tier defaults (from ModelConfig.tier_a/b/c classmethods)
 # ---------------------------------------------------------------------------
 TIER_A = dict(D=512, L=8, B=4)
+TIER_A_WIDE = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6, pm_readout_ffn=False)
 TIER_B = dict(
     D=768, L=12, B=6,
     r=16, W=512, D_wm=192, n_heads_wm=6,
@@ -51,6 +52,9 @@ DEFAULTS = dict(
     T=256,
     P=64,
     use_compile=False,
+    # Regularization
+    dropout=0.1,
+    tie_embeddings=True,
     # FFN
     ffn_expansion=4,
     # Decoder
@@ -77,9 +81,6 @@ PHASE_TOGGLES = {
 # ---------------------------------------------------------------------------
 # Architecture constants
 # ---------------------------------------------------------------------------
-# Gate input dim = 4 * D_h + 1 (x_block + y_pm + y_wm_proj + y_em_proj + surprise)
-GATE_INPUT_FORMULA = lambda D_h: 4 * D_h + 1
-
 # PM neuromodulator backbone input dim (3 scalars + content_proj_dim)
 PM_NEUROMOD_INPUT_DIM = 3 + 8  # (elig_norm, pm_usage, span_surprise) + content_proj
 

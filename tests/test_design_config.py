@@ -4,7 +4,7 @@ import pytest
 
 from src.model.config import ModelConfig
 from tests.design_constants import (
-    TIER_A, TIER_B, TIER_C, DEFAULTS, PHASE_TOGGLES,
+    TIER_A, TIER_A_WIDE, TIER_B, TIER_C, DEFAULTS, PHASE_TOGGLES,
 )
 
 pytestmark = pytest.mark.design
@@ -29,6 +29,11 @@ class TestTierDefaults:
         cfg = ModelConfig.tier_c()
         for key, val in TIER_C.items():
             assert getattr(cfg, key) == val, f"tier_c.{key}: {getattr(cfg, key)} != {val}"
+
+    def test_tier_a_wide_defaults(self):
+        cfg = ModelConfig.tier_a_wide()
+        for key, val in TIER_A_WIDE.items():
+            assert getattr(cfg, key) == val, f"tier_a_wide.{key}: {getattr(cfg, key)} != {val}"
 
     def test_tier_a_overrides(self):
         cfg = ModelConfig.tier_a(D=1024, L=16)
