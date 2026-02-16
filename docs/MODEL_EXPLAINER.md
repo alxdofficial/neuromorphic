@@ -1197,7 +1197,7 @@ This section documents verified design decisions and confirms that the core arch
 
 ## 21. Training Cost and Performance Estimates
 
-This section provides throughput estimates, training budgets, and hardware recommendations for different scenarios. Numbers are based on benchmarks on RTX 4090 with the model's non-transformer architecture.
+This section provides throughput estimates, training budgets, and hardware recommendations for different scenarios. Numbers are based on benchmarks on RTX 4090 with the model's non-transformer architecture. For detailed profiling data (kernel breakdown, VRAM usage, GPU utilization), see `docs/speed_optimizations.md`.
 
 ### 21.1 Key Architectural Differences from Transformers
 
@@ -1205,7 +1205,7 @@ Our model uses **affine recurrence** (not attention) as the core sequence mechan
 
 - **No quadratic attention cost:** Compute scales linearly with sequence length (within spans)
 - **Parallelizable within spans:** `forward_span` uses a parallel scan over P=64 tokens
-- **torch.compile support:** Critical paths (Layer.forward_span, PM.update_eligibility_batch) are compiled with `fullgraph=True`, fusing scan loops and eliminating autograd overhead (~2.8× additional speedup)
+- **torch.compile support:** Block-level compilation (`Block.forward_span` + `PM._update_eligibility_core`) fuses entire block forward passes and scan loops into optimized CUDA kernels (~2.1× speedup over function-level compile)
 - **Boundary overhead:** PM commit + EM write + neuromodulator forward at every span boundary
 
 The recurrence + memory architecture means throughput is **lower than a pure transformer of equal parameter count** (roughly 40-50% of a similarly-sized Mamba model) but has the advantage of truly O(1) per-token memory and O(n) compute, plus online learning capabilities.

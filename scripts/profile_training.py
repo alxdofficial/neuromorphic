@@ -21,7 +21,7 @@ def main():
 
     device = torch.device("cuda")
     BS = 32
-    config = ModelConfig.tier_a(use_compile=True)
+    config = ModelConfig.tier_a_wide(use_compile=True)
     config.set_phase("B")
 
     model = NeuromorphicLM(config).to(device)
@@ -52,6 +52,12 @@ def main():
 
     torch.cuda.synchronize()
 
+    # VRAM usage after warmup
+    torch.cuda.reset_peak_memory_stats()
+    vram_alloc = torch.cuda.memory_allocated() / 1e9
+    vram_reserved = torch.cuda.memory_reserved() / 1e9
+    print(f"\nVRAM after warmup: {vram_alloc:.2f} GB allocated, {vram_reserved:.2f} GB reserved")
+
     # Wall-clock timing
     print(f"\nTiming {args.steps} steps...")
     times = []
@@ -69,7 +75,11 @@ def main():
 
     avg = sum(times) / len(times)
     tok_per_step = BS * config.T
+    vram_peak = torch.cuda.max_memory_allocated() / 1e9
     print(f"\nAverage: {avg:.4f}s/step = {tok_per_step/avg:.0f} tok/s")
+    print(f"Peak VRAM during training: {vram_peak:.2f} GB")
+    print(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    print(f"Config: D={config.D}, L={config.L}, B={config.B}, T={config.T}, P={config.P}")
 
     # PyTorch profiler
     print(f"\nRunning PyTorch profiler ({args.steps} steps)...")
