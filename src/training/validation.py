@@ -14,7 +14,7 @@ from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
-from .loss import batched_cross_entropy
+from .loss import batched_cross_entropy, compute_loss_and_surprise
 from . import span_ops
 
 
@@ -127,17 +127,12 @@ def evaluate_validation(
                         span_ids, eot_id, config.reset_on_doc_boundary
                     )
 
-                    # Batched loss
-                    span_loss, span_valid = batched_cross_entropy(
-                        logits_all, span_targets, loss_mask_all
+                    # Fused loss + surprise from a single log_softmax
+                    span_loss, span_valid, token_surprise = compute_loss_and_surprise(
+                        logits_all, span_targets, loss_mask_all,
                     )
                     total_loss += float(span_loss.item())
                     valid_count += span_valid
-
-                    # Compute per-token surprise
-                    logp = F.log_softmax(logits_all, dim=-1)
-                    token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
-                    token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
 
                     # Compute reset masks for accumulators
                     reset_mask_all = span_ops.compute_reset_mask(
@@ -167,9 +162,17 @@ def evaluate_validation(
                     # PM eligibility + commit
                     if config.pm_enabled:
                         span_ops.apply_pm_eligibility_batch(
-                            model, x_emb_all, token_surprise,
+                            model, token_surprise,
                             reset_mask_all, config,
                         )
+
+                    # Clear PM content + EM strengths for streams that had
+                    # mid-span doc-boundary resets
+                    span_ops.apply_mid_span_resets(
+                        model, reset_mask_all, config,
+                    )
+
+                    if config.pm_enabled:
                         span_ops.apply_pm_boundary(model, span_surprise_mean)
 
                     # EM candidates + write
@@ -181,8 +184,9 @@ def evaluate_validation(
                         cand_token_valid = [[] for _ in range(B)]
 
                         span_ops.propose_em_candidates(
-                            model, x_emb_all, y_wm_all, token_surprise,
-                            loss_mask_all, cand_K, cand_V, cand_score,
+                            model, model._last_x_proj_all, y_wm_all,
+                            token_surprise, loss_mask_all,
+                            cand_K, cand_V, cand_score,
                             cand_token_valid,
                         )
                         em_stacked = span_ops.stack_em_candidates(

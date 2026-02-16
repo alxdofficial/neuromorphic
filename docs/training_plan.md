@@ -38,18 +38,19 @@ This plan covers datasets, configuration, and training phases for the current Ti
 | PM/EM/WM state | ~100 MB |
 | **Total** | **~4 GB** (16% of 24 GB) |
 
-### Base Training Hyperparameters (Tier B)
+### Base Training Hyperparameters (Tier A, fair comparison)
 | Parameter | Value |
 |-----------|-------|
-| Optimizer | AdamW |
-| Learning rate | 3e-4 (cosine decay to 1e-5) |
+| Optimizer | AdamW (betas 0.9, 0.95) |
+| Learning rate | 3e-4 (cosine decay to 3e-5, 10% of peak) |
 | Weight decay | 0.01 (ndim>1 non-bias params only; biases and LayerNorm get 0.0) |
-| Batch size (BS) | 16 (can increase for Tier A) |
+| Batch size (BS) | 32 (Tier A) |
 | TBPTT chunk (T) | 256 tokens |
-| Plasticity span (P) | 32 tokens |
+| Plasticity span (P) | 64 tokens |
 | Gradient clipping | 1.0 (global norm) |
-| Precision | **bf16** (PM/EM state in fp32) |
+| Precision | **bf16** |
 | Warmup | 1000 steps |
+| Token budget | **2.0B tokens** (matches baselines: Pythia-160M BS=96, Mamba-130M BS=64) |
 
 ---
 

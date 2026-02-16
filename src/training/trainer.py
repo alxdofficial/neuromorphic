@@ -18,7 +18,7 @@ from typing import Iterator, Optional, Callable, TYPE_CHECKING
 from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
-from .loss import batched_cross_entropy, compute_regularizers
+from .loss import batched_cross_entropy, compute_loss_and_surprise, compute_regularizers
 from . import span_ops
 
 if TYPE_CHECKING:
@@ -172,14 +172,35 @@ class TBPTTTrainer:
             if collect_gates:
                 last_gate_stats = fwd["gate_stats"]
 
-            # Finalize span: compute surprise mean and stack EM candidates
-            result = accum.finalize(self.device, self.config)
-            span_surprise_mean = result.surprise_mean
+            # Compute surprise mean early (needed for model state update
+            # before mid-span reset and EM proposal)
+            span_surprise_mean = accum.surprise_accum / accum.valid_tokens.clamp(min=1)
             span_valid_mean_accum += float(accum.valid_tokens.mean().item())
             span_count += 1
 
             # Update model surprise to span mean (frozen for next span's gates).
             self.model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+
+            # Clear PM content + EM strengths for streams that had mid-span
+            # doc-boundary resets (prevents cross-document retrieval leakage)
+            span_ops.apply_mid_span_resets(
+                self.model, fwd["reset_mask_all"], self.config,
+            )
+
+            # EM candidate proposal AFTER mid-span reset so novelty
+            # scoring sees correct (post-reset) EM state.
+            if self.config.em_enabled:
+                with amp_ctx:
+                    span_ops.propose_em_candidates(
+                        self.model, self.model._last_x_proj_all,
+                        fwd["y_wm_all"], fwd["token_surprise"],
+                        fwd["loss_mask_all"],
+                        accum.em_cand_K, accum.em_cand_V,
+                        accum.em_cand_score, accum.em_cand_valid,
+                    )
+
+            # Finalize span: stack EM candidates for boundary writes
+            result = accum.finalize(self.device, self.config)
 
             # Span boundary: PM commit + EM write
             self._apply_boundary_updates(result, span_surprise_mean)
@@ -238,16 +259,10 @@ class TBPTTTrainer:
                 span_ids, self.config.eot_id, self.config.reset_on_doc_boundary
             )
 
-            # Batched loss
-            span_loss, span_valid = batched_cross_entropy(
-                logits_all, span_targets, loss_mask_all
+            # Fused loss + surprise from a single log_softmax
+            span_loss, span_valid, token_surprise = compute_loss_and_surprise(
+                logits_all, span_targets, loss_mask_all,
             )
-
-            # Per-token surprise (no grad — used for PM/EM gating only)
-            with torch.no_grad():
-                logp = F.log_softmax(logits_all, dim=-1)
-                token_surprise = -logp.gather(-1, span_targets.unsqueeze(-1))
-                token_surprise = token_surprise * loss_mask_all.unsqueeze(-1).float()
 
             # Reset masks for span accumulators
             reset_mask_all = span_ops.compute_reset_mask(
@@ -265,24 +280,24 @@ class TBPTTTrainer:
             # PM eligibility accumulation
             if self.config.pm_enabled:
                 span_ops.apply_pm_eligibility_batch(
-                    self.model, x_emb_all, token_surprise,
+                    self.model, token_surprise,
                     reset_mask_all, self.config,
                 )
 
-            # EM candidate proposal (stacking deferred to accum.finalize)
-            if self.config.em_enabled:
-                span_ops.propose_em_candidates(
-                    self.model, x_emb_all, y_wm_all, token_surprise,
-                    loss_mask_all, accum.em_cand_K, accum.em_cand_V,
-                    accum.em_cand_score, accum.em_cand_valid,
-                )
+            # NOTE: EM candidate proposal is deferred to train_chunk,
+            # AFTER apply_mid_span_resets, so novelty scoring sees
+            # correct (post-reset) EM state.
 
         return {
             "span_loss": span_loss,
             "span_valid": span_valid,
             "eot_count": int(is_eot_all.sum().item()),
             "reset_count": int(reset_mask_all.sum().item()),
+            "reset_mask_all": reset_mask_all,
             "gate_stats": gate_stats,
+            "y_wm_all": y_wm_all,
+            "token_surprise": token_surprise,
+            "loss_mask_all": loss_mask_all,
         }
 
     def _apply_boundary_updates(
@@ -333,7 +348,7 @@ class TBPTTTrainer:
             )
 
         # Backward + clip + step
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
 
         grad_norm = nn.utils.clip_grad_norm_(

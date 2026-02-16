@@ -36,7 +36,7 @@ class Block(nn.Module, StateMixin):
         self.W_wm_proj = nn.Linear(config.D, config.D_h, bias=False)
         self.W_em_proj = nn.Linear(config.D, config.D_h, bias=False)
 
-    def step(self, x_block: Tensor, y_wm: Tensor, x_emb: Tensor,
+    def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
              surprise: Tensor, carry: Tensor, collect: bool = False,
              return_layers: bool = False):
         """Process one token through this block.
@@ -44,7 +44,7 @@ class Block(nn.Module, StateMixin):
         Args:
             x_block: [BS, D_h] — input slice for this block
             y_wm: [BS, D] — shared WM output
-            x_emb: [BS, D] — token embedding (for EM retrieval query)
+            x_proj: [BS, D] — W_in projection (for EM retrieval query)
             surprise: [BS, 1] — surprise signal
             carry: [BS, 1] — 0 at doc boundaries, 1 otherwise
             collect: bool — if True, include per-layer gate stats
@@ -57,7 +57,7 @@ class Block(nn.Module, StateMixin):
         """
         # EM retrieval (if enabled)
         if self.config.em_enabled:
-            y_em = self.em.retrieve(x_emb, y_wm)  # [BS, D]
+            y_em = self.em.retrieve(x_proj, y_wm)  # [BS, D]
         else:
             y_em = torch.zeros_like(y_wm)
 
@@ -108,7 +108,7 @@ class Block(nn.Module, StateMixin):
         return x  # final layer output [BS, D_h]
 
     def forward_span(self, x_block_all: Tensor, y_wm_all: Tensor,
-                     x_emb_all: Tensor, surprise_span: Tensor,
+                     x_proj_all: Tensor, surprise_span: Tensor,
                      carry_all: Tensor,
                      collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this block.
@@ -119,7 +119,7 @@ class Block(nn.Module, StateMixin):
         Args:
             x_block_all: [BS, P, D_h] — block input for all tokens
             y_wm_all: [BS, P, D] — shared WM output
-            x_emb_all: [BS, P, D] — token embeddings
+            x_proj_all: [BS, P, D] — W_in projections (for EM retrieval)
             surprise_span: [BS, 1] — frozen surprise for this span
             carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
             collect: if True, return (h_out, layer_stats) tuple
@@ -130,7 +130,7 @@ class Block(nn.Module, StateMixin):
         """
         # EM retrieval (if enabled)
         if self.config.em_enabled:
-            y_em_all = self.em.retrieve_batch(x_emb_all, y_wm_all)
+            y_em_all = self.em.retrieve_batch(x_proj_all, y_wm_all)
         else:
             y_em_all = torch.zeros_like(y_wm_all)
 
@@ -155,11 +155,11 @@ class Block(nn.Module, StateMixin):
             else:
                 x = result
 
-        # Collect per-layer outputs for spatial decoder.
-        # Each layer's _last_h_all is [BS, P, D_h], stored during forward_span.
-        self._last_layer_stack = torch.stack(
-            [layer._last_h_all for layer in self.layers], dim=2
-        )  # [BS, P, L, D_h]
+        # Collect per-layer outputs for spatial decoder (only when needed).
+        if self.config.snapshot_enabled:
+            self._last_layer_stack = torch.stack(
+                [layer._last_h_all for layer in self.layers], dim=2
+            )  # [BS, P, L, D_h]
 
         if collect:
             return x, layer_stats

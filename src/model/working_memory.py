@@ -43,6 +43,10 @@ class WorkingMemory(nn.Module, StateMixin):
         self.attn_drop = nn.Dropout(config.dropout)
         self.drop_resid = nn.Dropout(config.dropout)
 
+        # ALiBi recency bias: fixed slopes per head (not learned)
+        slopes = 2.0 ** (-8.0 * torch.arange(1, self.n_heads + 1, dtype=torch.float32) / self.n_heads)
+        self.register_buffer("alibi_slopes", slopes)  # [n_heads]
+
         # State tensors (lazily initialized on first step)
         self.wm_K: Tensor = None
         self.wm_V: Tensor = None
@@ -55,6 +59,50 @@ class WorkingMemory(nn.Module, StateMixin):
         self.wm_V = torch.zeros(BS, self.W, self.D_wm, device=device)
         self.wm_valid = torch.zeros(BS, self.W, dtype=torch.bool, device=device)
         self.wm_ptr = torch.zeros(BS, dtype=torch.long, device=device)
+
+    def _alibi_bias_step(self, BS: int) -> Tensor:
+        """ALiBi recency bias for single-token attention over cache.
+
+        Age of cache slot j = (ptr - j) % W, where ptr is the current
+        write position. Bias = -slope * age (recent slots get less penalty).
+
+        Returns: [BS, n_heads, W]
+        """
+        slot_idx = torch.arange(self.W, device=self.alibi_slopes.device)  # [W]
+        distances = (self.wm_ptr.unsqueeze(1) - slot_idx.unsqueeze(0)) % self.W  # [BS, W]
+        # slopes: [n_heads] -> [1, n_heads, 1]; distances: [BS, W] -> [BS, 1, W]
+        return -self.alibi_slopes.view(1, -1, 1) * distances.unsqueeze(1).float()
+
+    def _alibi_bias_span(self, BS: int, P: int, write_pos: Tensor) -> Tensor:
+        """ALiBi recency bias for span attention over [cache | span].
+
+        Cache portion: distance from query t to cache slot j =
+            (write_pos[t] - j) % W, accounting for ring buffer position.
+        Span portion: causal distance t - i for i <= t.
+
+        Args:
+            write_pos: [BS, P] — ring buffer write positions per span token
+
+        Returns: [BS, n_heads, P, W+P]
+        """
+        W = self.W
+        device = self.alibi_slopes.device
+
+        # Cache distances: [BS, P, W]
+        slot_idx = torch.arange(W, device=device)  # [W]
+        cache_dist = (write_pos.unsqueeze(-1) - slot_idx.view(1, 1, W)) % W  # [BS, P, W]
+
+        # Span distances: causal [P, P], clamped to 0 for non-causal (masked out)
+        # dist[t, i] = t - i (query t, key i); non-causal entries clamped to 0
+        span_pos = torch.arange(P, device=device)
+        span_dist = (span_pos.unsqueeze(1) - span_pos.unsqueeze(0)).clamp(min=0)  # [P, P]
+        span_dist = span_dist.unsqueeze(0).expand(BS, P, P)  # [BS, P, P]
+
+        # Combined: [BS, P, W+P]
+        distances = torch.cat([cache_dist, span_dist], dim=-1).float()
+
+        # slopes: [n_heads] -> [1, n_heads, 1, 1]; distances -> [BS, 1, P, W+P]
+        return -self.alibi_slopes.view(1, -1, 1, 1) * distances.unsqueeze(1)
 
     def step(self, x: Tensor, reset_mask: Tensor) -> Tensor:
         """Process one token through working memory.
@@ -115,6 +163,7 @@ class WorkingMemory(nn.Module, StateMixin):
 
         # Attention scores: [BS, n_heads, W]
         attn = torch.einsum("bnd, bnwd -> bnw", q_h, K_h) * self.scale
+        attn = attn + self._alibi_bias_step(BS)
 
         # Mask invalid positions
         valid_mask = self.wm_valid.unsqueeze(1)  # [BS, 1, W]
@@ -215,6 +264,7 @@ class WorkingMemory(nn.Module, StateMixin):
             V_h = self.wm_V.view(BS, self.W, self.n_heads, self.head_dim).transpose(1, 2)
 
             attn = torch.einsum("bnd, bnwd -> bnw", q_h, K_h) * self.scale
+            attn = attn + self._alibi_bias_step(BS)
             valid_mask = self.wm_valid.unsqueeze(1)
             attn = attn.masked_fill(~valid_mask, float("-inf"))
             attn = torch.softmax(attn, dim=-1)
@@ -296,6 +346,7 @@ class WorkingMemory(nn.Module, StateMixin):
 
         # Attention scores: [BS, n_heads, P, W+P]
         attn = torch.matmul(q_h, K_h.transpose(-2, -1)) * self.scale
+        attn = attn + self._alibi_bias_span(BS, P, write_pos)
 
         # Apply mask: [BS, 1, P, W+P] broadcast over heads
         attn_mask_4d = attn_mask.unsqueeze(1)  # [BS, 1, P, W+P]

@@ -2,7 +2,7 @@
 
 **Purpose:** Documents the scan-friendly parallel training path (`forward_span`), its relationship to the sequential path (`forward_one_token`), and every place where the two paths differ in logic or math. Read `MODEL_EXPLAINER.md` first for full architecture context; this document focuses on what changes.
 
-**Last verified against code:** 2026-02-14
+**Last verified against code:** 2026-02-16
 
 ---
 
@@ -96,7 +96,7 @@ x_blocks_all = x_proj_all.view(BS, P, B, D_h)                # [BS, P, B, D_h]
 
 # 7. Process each block (batched layers + scan)
 for b, block in enumerate(self.blocks):
-    h_b = block.forward_span(x_blocks_all[:,:,b], y_wm_all, x_emb_all,
+    h_b = block.forward_span(x_blocks_all[:,:,b], y_wm_all, x_proj_all,
                              surprise_span, carry_all)        # [BS, P, D_h]
 
 # 8. Merge block outputs

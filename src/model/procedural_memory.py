@@ -141,10 +141,14 @@ class ProceduralMemory(nn.Module, StateMixin):
         gate = (surprise.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS]
         gate = gate.unsqueeze(1).unsqueeze(2)                  # [BS, 1, 1]
 
-        # Accumulate into all r slots (broadcast)
-        # elig_K: [BS, r, D_h], k_cand: [BS, 1, D_h]
-        self.elig_K = self.rho * self.elig_K + gate * k_cand.unsqueeze(1)
-        self.elig_V = self.rho * self.elig_V + gate * v_cand.unsqueeze(1)
+        # Slot-specific routing: weight candidate contribution per slot
+        route_logits = torch.einsum("brd, bd -> br", self.pm_K, k_cand) / self.config.tau_route_pm
+        route_w = torch.softmax(route_logits, dim=-1).unsqueeze(-1)  # [BS, r, 1]
+
+        # Accumulate with per-slot routing weights
+        # elig_K: [BS, r, D_h], k_cand: [BS, 1, D_h], route_w: [BS, r, 1]
+        self.elig_K = self.rho * self.elig_K + gate * route_w * k_cand.unsqueeze(1)
+        self.elig_V = self.rho * self.elig_V + gate * route_w * v_cand.unsqueeze(1)
 
     def _update_eligibility_core(self, x_all: Tensor, h_all: Tensor,
                                  surprise_all: Tensor,
@@ -164,9 +168,13 @@ class ProceduralMemory(nn.Module, StateMixin):
         gate = (surprise_all.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS, P]
         gate = gate.unsqueeze(-1).unsqueeze(-1)                    # [BS, P, 1, 1]
 
-        # b terms: gate * cand broadcast across r slots → [BS, P, r, D_h]
-        b_K = (gate * k_cand_all.unsqueeze(2)).expand(BS, P, r, D_h)
-        b_V = (gate * v_cand_all.unsqueeze(2)).expand(BS, P, r, D_h)
+        # Slot-specific routing: weight candidate contribution per slot
+        route_logits = torch.einsum("brd, bpd -> bpr", self.pm_K, k_cand_all) / self.config.tau_route_pm
+        route_w = torch.softmax(route_logits, dim=-1)  # [BS, P, r]
+
+        # b terms: gate * route_w * cand → [BS, P, r, D_h]
+        b_K = gate * route_w.unsqueeze(-1) * k_cand_all.unsqueeze(2)
+        b_V = gate * route_w.unsqueeze(-1) * v_cand_all.unsqueeze(2)
 
         # Carry mask: 0 at reset positions (zeros previous elig), 1 elsewhere
         # Use activation dtype (bf16 under autocast) to keep scan in bf16
@@ -217,6 +225,22 @@ class ProceduralMemory(nn.Module, StateMixin):
         if self.pm_a is not None:
             with torch.no_grad():
                 self.pm_a = self.pm_a * self.decay
+
+    def reset_content(self, mask: Tensor):
+        """Zero committed PM state for masked streams.
+
+        Clears pm_K, pm_V, pm_a but NOT eligibility traces (elig_K, elig_V).
+        Used for mid-span doc-boundary resets in the parallel path where
+        eligibility is already handled by the carry mask in the scan.
+        """
+        if mask.any():
+            for name in ("pm_K", "pm_V", "pm_a"):
+                t = getattr(self, name, None)
+                if t is not None:
+                    expanded = mask
+                    for _ in range(t.dim() - 1):
+                        expanded = expanded.unsqueeze(-1)
+                    setattr(self, name, t * (~expanded).to(t.dtype))
 
     def reset_eligibility(self, mask: Tensor):
         """Zero only eligibility traces for masked streams.

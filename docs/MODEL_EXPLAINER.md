@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-15
+**Last verified against code:** 2026-02-16
 
 ---
 
@@ -167,7 +167,7 @@ else:
 return logits, x, y_wm
 ```
 
-**Returns:** Always `(logits, x_emb, y_wm)`. The trainer needs `x_emb` and `y_wm` for EM candidate proposals (they cannot be recomputed cheaply because WM state has already advanced).
+**Returns:** Always `(logits, x_emb, y_wm)`. The trainer needs `y_wm` for EM candidate proposals (it cannot be recomputed cheaply because WM state has already advanced). EM candidates and retrieval use `x_proj` (the W_in projection), accessed via `model._last_x_proj_all` cache.
 
 **What happens outside `forward_one_token`:** The model forward is read-only with respect to PM and EM — it reads from them but doesn't write. Memory updates happen at span boundaries in the trainer: PM eligibility traces are accumulated post-forward, then neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). All neuromodulator heads are trained via main loss backprop (see [§11](#11-neuromodulator-training-all-phases)).
 
@@ -198,7 +198,7 @@ return logits, x, y_wm
 **Per-token operation:**
 1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`
 2. Write `(k, v)` into ring buffer at `wm_ptr` via functional scatter (differentiable within TBPTT chunk)
-3. Multi-head attention (`n_heads=4`) over all valid positions in the buffer, with dropout (rate `config.dropout`, default 0.1) applied after the attention softmax
+3. Multi-head attention (`n_heads=4`) over all valid positions in the buffer, with **ALiBi recency bias** (fixed slopes per head, distance-based penalty) and dropout (rate `config.dropout`, default 0.1) applied after the attention softmax. ALiBi slopes are `2^(-8k/n_heads)` for head `k`, biasing attention toward recent tokens without learned positional embeddings.
 4. Project output: `y_wm = W_o(attn_output)` -> `[BS, D]`
 5. Advance pointer: `wm_ptr = (wm_ptr + 1) % W`
 
@@ -305,11 +305,16 @@ v_cand = W_v_post(h)               # [BS, D_h] -- from post-synaptic (output)
 # Gate by surprise: low surprise → near-zero accumulation
 gate = (surprise / 5.0).clamp(0, 1)  # [BS, 1] → [BS, 1, 1]
 
-elig_K = rho * elig_K + gate * k_cand.unsqueeze(1)  # accumulate into all r slots
-elig_V = rho * elig_V + gate * v_cand.unsqueeze(1)
+# Slot-specific routing: weight candidate contribution per slot
+route_logits = einsum("brd, bd -> br", pm_K, k_cand) / tau_route_pm
+route_w = softmax(route_logits, dim=-1)  # [BS, r] — slot affinity
+elig_K = rho * elig_K + gate * route_w.unsqueeze(-1) * k_cand.unsqueeze(1)
+elig_V = rho * elig_V + gate * route_w.unsqueeze(-1) * v_cand.unsqueeze(1)
 ```
 
 **Intuition:** Eligibility traces are a running average of "what the model wanted to write," gated by surprise. Only tokens the model predicted poorly contribute significantly to the trace -- this prevents the trace norm from saturating (which would make the commit gate always fire). The projections `W_k_pre` and `W_v_post` are learned parameters -- gradients from the LM loss flow back through them, teaching the model *what* constitutes a good key-value pair to store. But the *decision* of whether to actually commit these traces into PM is made by the neuromodulator at span boundaries.
+
+**Slot-specific routing** (`tau_route_pm`, default 1.0): Rather than broadcasting the same candidate uniformly to all r slots, each slot receives a weighted contribution based on its affinity to the candidate. Route weights are `softmax(pm_K · k_cand / tau_route_pm)` -- slots whose existing content is similar to the candidate receive more of the update. When `pm_K` is all zeros (fresh init), routing is uniform (1/r), mathematically equivalent to the old broadcast scaled by 1/r. Slots differentiate as they accumulate distinct content.
 
 `rho=0.95` is the eligibility decay -- recent tokens contribute more than older ones. This creates a recency-weighted, surprise-gated summary of the span's proposed writes.
 
@@ -448,11 +453,12 @@ scores[em_S == 0] = -inf                        # mask inactive slots
 
 # 3. Top-k retrieval (k_ret = 4)
 topk_scores, topk_idx = scores.topk(k_ret)     # [BS, k_ret]
+K_top = gather(em_K, topk_idx)                  # [BS, k_ret, D_em]
 V_top = gather(em_V, topk_idx)                  # [BS, k_ret, D_em]
 
-# 4. Cross-attention aggregation
-q_cross = W_q_cross(x_emb)                     # [BS, D_em]
-attn = softmax(q_cross @ V_top.T * scale)      # [BS, k_ret]
+# 4. Cross-attention aggregation (K_top for attention weights, V_top for output)
+q_cross = W_q_cross(x_proj)                    # [BS, D_em]
+attn = softmax(q_cross @ K_top.T * scale)      # [BS, k_ret]
 out = attn @ V_top                              # [BS, D_em]
 
 # 5. Post-retrieval FFN (pre-norm residual)
@@ -467,7 +473,9 @@ The readout FFN (controlled by `em_readout_ffn`, default `True`) adds nonlinear 
 
 **Why cross-attention instead of weighted average?** Cross-attention lets the model learn a query-dependent weighting over the retrieved memory tokens, rather than averaging them by similarity score. This preserves the ability to selectively focus on one retrieved memory while ignoring others.
 
-**Important:** The query uses `x_emb` (raw token embedding) and `y_wm` (working memory output) -- both are input-side features. The query does NOT use recurrent state `h`, which makes retrieval independent of the recurrence and avoids circular dependencies.
+**Important:** The query uses `x_proj` (W_in projection of the token embedding) and `y_wm` (working memory output) -- both are input-side features. Using `x_proj` rather than raw `x_emb` provides a more task-aligned representation since W_in is trained. The query does NOT use recurrent state `h`, which makes retrieval independent of the recurrence and avoids circular dependencies.
+
+**K/V separation in cross-attention:** The retrieved keys (`K_top`) are used to compute attention weights, while the retrieved values (`V_top`) are used for the output. This is standard cross-attention -- "what to attend to" (keys) is separate from "what to retrieve" (values).
 
 ### 8.3 EM Candidate Proposals (every token, buffered)
 
@@ -586,10 +594,10 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 A Block is a self-contained processing unit: B blocks run in parallel, each handling `D_h = D/B` dimensions.
 
-**Block.step(x_block, y_wm, x_emb, surprise, carry) per token:**
+**Block.step(x_block, y_wm, x_proj, surprise, carry) per token:**
 ```python
-# 1. EM retrieval (one EM per block, queries using x_emb and y_wm)
-y_em = self.em.retrieve(x_emb, y_wm)           # [BS, D]
+# 1. EM retrieval (one EM per block, queries using x_proj and y_wm)
+y_em = self.em.retrieve(x_proj, y_wm)           # [BS, D]
 
 # 2. Project shared signals to per-block dimension
 y_wm_proj = self.W_wm_proj(y_wm)               # [BS, D_h]

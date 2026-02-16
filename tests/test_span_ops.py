@@ -259,6 +259,190 @@ class TestStackEmCandidates:
 
 
 # ============================================================================
+# apply_mid_span_resets
+# ============================================================================
+
+class TestApplyMidSpanResets:
+    def test_clears_pm_content_on_mid_span_reset(self):
+        """PM committed content (pm_a) should be zeroed for streams with mid-span resets."""
+        model, cfg = _tiny_model("B")
+        # Populate PM state by running tokens + committing
+        reset = torch.zeros(BS, dtype=torch.bool)
+        for _ in range(cfg.P):
+            x = torch.randint(0, VOCAB, (BS,))
+            model.forward_one_token(x, reset)
+            model.update_surprise(model.forward_one_token(x, reset)[0], x)
+        model.commit_at_boundary(force_mode="force_on")
+
+        # Verify PM has nonzero content
+        pm0 = model.blocks[0].layers[0].pm
+        assert pm0.pm_a is not None
+        assert pm0.pm_a.abs().sum() > 0, "PM should have nonzero content after commit"
+
+        # Simulate mid-span reset at position 2 for stream 0 only
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        reset_mask_all[0, 2] = True  # mid-span reset for stream 0
+
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        # Stream 0: PM content should be zeroed
+        assert pm0.pm_a[0].abs().sum() == 0, "Stream 0 PM content should be cleared"
+        # Stream 1: PM content should be preserved
+        assert pm0.pm_a[1].abs().sum() > 0, "Stream 1 PM content should be preserved"
+
+    def test_clears_em_strengths_on_mid_span_reset(self):
+        """EM strengths (em_S) should be zeroed for streams with mid-span resets."""
+        model, cfg = _tiny_model("B")
+        # Initialize EM state
+        reset = torch.zeros(BS, dtype=torch.bool)
+        x = torch.randint(0, VOCAB, (BS,))
+        model.forward_one_token(x, reset)  # lazy-init EM
+
+        # Manually set EM strengths
+        for block in model.blocks:
+            if block.em.em_S is not None:
+                block.em.em_S = torch.ones_like(block.em.em_S) * 0.5
+
+        # Mid-span reset at position 1 for stream 0
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        reset_mask_all[0, 1] = True
+
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        for block in model.blocks:
+            assert block.em.em_S[0].abs().sum() == 0, "Stream 0 EM strengths should be cleared"
+            assert block.em.em_S[1].abs().sum() > 0, "Stream 1 EM strengths should be preserved"
+
+    def test_preserves_eligibility(self):
+        """Eligibility traces should NOT be cleared by mid-span reset."""
+        model, cfg = _tiny_model("B")
+        # Forward a span to populate eligibility
+        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
+        reset_first = torch.zeros(BS, dtype=torch.bool)
+        model.forward_span(span_ids, reset_first)
+
+        # Run PM eligibility batch to populate elig_K/V
+        reset_mask = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        surprise = torch.ones(BS, cfg.P, 1)
+        span_ops.apply_pm_eligibility_batch(
+            model, surprise, reset_mask, cfg,
+        )
+
+        # Snapshot eligibility before reset
+        pm0 = model.blocks[0].layers[0].pm
+        elig_before = pm0.elig_K.clone()
+
+        # Mid-span reset for stream 0
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        reset_mask_all[0, 2] = True
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        # Eligibility should be untouched
+        assert torch.equal(pm0.elig_K, elig_before), "Eligibility should not be cleared"
+
+    def test_noop_for_first_position_reset(self):
+        """Reset at position 0 only should not trigger mid-span reset."""
+        model, cfg = _tiny_model("B")
+        reset = torch.zeros(BS, dtype=torch.bool)
+        x = torch.randint(0, VOCAB, (BS,))
+        model.forward_one_token(x, reset)
+
+        # Set EM strengths
+        for block in model.blocks:
+            if block.em.em_S is not None:
+                block.em.em_S = torch.ones_like(block.em.em_S) * 0.5
+
+        # Reset only at position 0 — this is handled by forward_span, not mid-span
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        reset_mask_all[:, 0] = True  # first position only
+
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        # EM strengths should be unchanged (no mid-span reset)
+        for block in model.blocks:
+            assert block.em.em_S.abs().sum() > 0, "No mid-span reset should have occurred"
+
+    def test_noop_in_lifelong_mode(self):
+        """Lifelong mode should preserve PM/EM content across doc boundaries."""
+        model, cfg = _tiny_model("B")
+        cfg.lifelong_mode = True
+        reset = torch.zeros(BS, dtype=torch.bool)
+        x = torch.randint(0, VOCAB, (BS,))
+        model.forward_one_token(x, reset)
+
+        for block in model.blocks:
+            if block.em.em_S is not None:
+                block.em.em_S = torch.ones_like(block.em.em_S) * 0.5
+
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        reset_mask_all[0, 2] = True
+
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        # Lifelong mode: EM strengths should be preserved
+        for block in model.blocks:
+            assert block.em.em_S[0].abs().sum() > 0, "Lifelong mode should preserve EM"
+
+    def test_noop_when_no_mid_span_resets(self):
+        """No reset at positions 1..P-1 means no PM/EM clearing."""
+        model, cfg = _tiny_model("B")
+        reset = torch.zeros(BS, dtype=torch.bool)
+        x = torch.randint(0, VOCAB, (BS,))
+        model.forward_one_token(x, reset)
+
+        for block in model.blocks:
+            if block.em.em_S is not None:
+                block.em.em_S = torch.ones_like(block.em.em_S) * 0.5
+
+        # No resets at all
+        reset_mask_all = torch.zeros(BS, cfg.P, dtype=torch.bool)
+        span_ops.apply_mid_span_resets(model, reset_mask_all, cfg)
+
+        for block in model.blocks:
+            assert block.em.em_S.abs().sum() > 0
+
+
+# ============================================================================
+# PM.reset_content
+# ============================================================================
+
+class TestPMResetContent:
+    def test_zeros_content_preserves_eligibility(self):
+        """reset_content should zero pm_K/pm_V/pm_a but NOT elig_K/elig_V."""
+        model, cfg = _tiny_model("B")
+        # Populate PM content via commit
+        reset = torch.zeros(BS, dtype=torch.bool)
+        for _ in range(cfg.P):
+            x = torch.randint(0, VOCAB, (BS,))
+            model.forward_one_token(x, reset)
+            model.update_surprise(model.forward_one_token(x, reset)[0], x)
+        model.commit_at_boundary(force_mode="force_on")
+
+        # Run more tokens to re-populate eligibility after commit's soft-reset
+        for _ in range(cfg.P):
+            x = torch.randint(0, VOCAB, (BS,))
+            model.forward_one_token(x, reset)
+            model.update_surprise(model.forward_one_token(x, reset)[0], x)
+
+        pm = model.blocks[0].layers[0].pm
+        # Verify everything is populated
+        assert pm.pm_a.abs().sum() > 0
+        assert pm.elig_K.abs().sum() > 0
+
+        elig_before = pm.elig_K.clone()
+
+        # Reset content for stream 0 only
+        mask = torch.tensor([True, False])
+        pm.reset_content(mask)
+
+        assert pm.pm_a[0].abs().sum() == 0
+        assert pm.pm_K[0].abs().sum() == 0
+        assert pm.pm_V[0].abs().sum() == 0
+        assert pm.pm_a[1].abs().sum() > 0  # stream 1 preserved
+        assert torch.equal(pm.elig_K, elig_before)  # eligibility untouched
+
+
+# ============================================================================
 # apply_pm_boundary
 # ============================================================================
 

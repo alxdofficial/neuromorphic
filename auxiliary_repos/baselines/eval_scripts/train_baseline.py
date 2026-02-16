@@ -6,8 +6,8 @@ on FineWeb-Edu (60%) + DCLM (40%), using the same TinyLlama tokenizer and
 token budget as our model for an apples-to-apples comparison.
 
 Usage:
-    python train_baseline.py --model pythia-160m --steps 300000 --bs 48
-    python train_baseline.py --model mamba-130m --steps 300000 --bs 48
+    python train_baseline.py --model pythia-160m   # BS=96, ~81K steps, 2B tokens
+    python train_baseline.py --model mamba-130m    # BS=64, ~122K steps, 2B tokens
 
     # Quick test run
     python train_baseline.py --model pythia-160m --steps 100 --bs 8
@@ -30,7 +30,7 @@ from itertools import cycle
 
 import torch
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from datasets import load_dataset, interleave_datasets
 from transformers import (
     AutoConfig,
@@ -45,7 +45,14 @@ from transformers import (
 
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 SEQ_LENGTH = 256  # Must match our T=256
+TOKEN_BUDGET = 2_000_000_000  # 2B tokens (matches neuromorphic training)
 GRAD_ACCUM = 1
+
+# Per-model optimal batch sizes (RTX 4090 24GB, bf16)
+MODEL_OPTIMAL_BS = {
+    "pythia-160m": 96,
+    "mamba-130m": 64,
+}
 
 # Datasets (same as our Phase B)
 FINEWEB_EDU_PATH = "HuggingFaceFW/fineweb-edu"
@@ -271,15 +278,10 @@ def train(
         num_training_steps=max_steps,
     )
 
-    # Mixed precision — Mamba needs bf16 (fp16 causes NaN with selective scan)
-    is_mamba = "mamba" in model_name
-    if device == "cuda" and is_mamba:
+    # Mixed precision — bf16 for all models (matches neuromorphic training)
+    if device == "cuda":
         amp_dtype = torch.bfloat16
         scaler = None  # bf16 doesn't need GradScaler
-        use_amp = True
-    elif device == "cuda":
-        amp_dtype = torch.float16
-        scaler = GradScaler("cuda")
         use_amp = True
     else:
         amp_dtype = torch.float32
@@ -462,12 +464,12 @@ def main():
         help="Which baseline architecture to train",
     )
     parser.add_argument(
-        "--steps", type=int, default=300_000,
-        help="Total training steps (default: 300K to match Phase B)",
+        "--steps", type=int, default=None,
+        help="Total training steps (default: derived from 2B token budget and BS)",
     )
     parser.add_argument(
-        "--bs", type=int, default=48,
-        help="Batch size (default: 48 to match our training)",
+        "--bs", type=int, default=None,
+        help="Batch size (default: per-model optimal for RTX 4090)",
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
@@ -483,14 +485,18 @@ def main():
     )
     args = parser.parse_args()
 
+    batch_size = args.bs or MODEL_OPTIMAL_BS.get(args.model, 32)
+    tokens_per_step = batch_size * SEQ_LENGTH
+    max_steps = args.steps or (TOKEN_BUDGET // tokens_per_step)
+
     output_dir = args.output_dir or os.path.join(
         "outputs", f"baseline_{args.model.replace('-', '_')}"
     )
 
     train(
         model_name=args.model,
-        max_steps=args.steps,
-        batch_size=args.bs,
+        max_steps=max_steps,
+        batch_size=batch_size,
         output_dir=output_dir,
         resume_from=args.resume,
         seed=args.seed,

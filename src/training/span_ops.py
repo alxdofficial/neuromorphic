@@ -7,11 +7,13 @@ Used by trainer.py and validation.py.
 
 Design note: In the parallel (forward_span) path, PM eligibility and EM
 candidates are accumulated over the full span, then committed at the boundary.
-Mid-span doc-boundary resets zero the surprise accumulators. PM eligibility
-IS reset at doc boundaries via the carry mask in update_eligibility_batch
-(carry=0 at reset positions zeros the recurrent eligibility state). EM
-candidates are masked via cand_valid to exclude tokens before the last
-reset within the span.
+Mid-span doc-boundary resets are handled at multiple levels:
+- Layer h: zeroed via carry mask in the parallel scan.
+- PM eligibility: zeroed via carry mask in update_eligibility_batch.
+- Surprise accumulators: only accumulate from tokens after last reset.
+- EM candidates: masked via cand_valid to exclude tokens before last reset.
+- PM content + EM strengths: cleared via apply_mid_span_resets() before
+  boundary commits/writes (prevents cross-document retrieval leakage).
 """
 
 from __future__ import annotations
@@ -168,18 +170,18 @@ def accumulate_span_surprise(
 
 def apply_pm_eligibility_batch(
     model: NeuromorphicLM,
-    x_emb_all: Tensor,
     token_surprise: Tensor,
     reset_mask_all: Tensor,
     config: ModelConfig,
 ) -> None:
-    """Project embeddings via W_in, route to blocks, call update_eligibility_batch.
+    """Route cached x_proj to blocks, call update_eligibility_batch.
 
+    Uses model._last_x_proj_all (cached by forward_span).
     Modifies PM eligibility traces in-place.
     """
     BS, span_P = token_surprise.shape[:2]
 
-    x_proj_all = model.W_in(x_emb_all)  # [BS, span_P, D]
+    x_proj_all = model._last_x_proj_all  # cached by forward_span
     x_blocks_all = x_proj_all.view(
         BS, span_P, config.B, config.D_h
     )  # [BS, span_P, B, D_h]
@@ -208,7 +210,7 @@ def apply_pm_eligibility_batch(
 
 def propose_em_candidates(
     model: NeuromorphicLM,
-    x_emb_all: Tensor,
+    x_proj_all: Tensor,
     y_wm_all: Tensor,
     token_surprise: Tensor,
     loss_mask_all: Tensor,
@@ -225,7 +227,7 @@ def propose_em_candidates(
         h_final_all = block.layers[-1]._last_h_all
         if h_final_all is not None:
             k_c, v_c, nov = block.em.propose_candidate_batch(
-                x_emb_all, y_wm_all, h_final_all, token_surprise,
+                x_proj_all, y_wm_all, h_final_all, token_surprise,
             )
             cand_K[b].append(k_c)
             cand_V[b].append(v_c)
@@ -263,6 +265,48 @@ def stack_em_candidates(
             novelty = (sScore * cvf).sum(dim=-1) / cc
             em_stacked[b] = (sK, sV, sScore, sValid, novelty)
     return em_stacked
+
+
+# ------------------------------------------------------------------
+# Mid-span doc-boundary reset for PM/EM content
+# ------------------------------------------------------------------
+
+def apply_mid_span_resets(
+    model: NeuromorphicLM,
+    reset_mask_all: Tensor,
+    config: ModelConfig,
+) -> None:
+    """Clear PM content + EM strengths for streams that had mid-span resets.
+
+    In the parallel span path, mid-span doc boundaries reset h (via carry
+    mask) and PM eligibility (via carry in the scan), but PM committed
+    content (pm_K/pm_V/pm_a) and EM strengths (em_S) are not cleared.
+    This causes retrieval leakage from the previous document into future
+    spans.
+
+    Call this AFTER the forward pass and PM eligibility update, but BEFORE
+    boundary commits/writes. Only applies in non-lifelong mode (lifelong
+    mode preserves PM/EM content across doc boundaries by design).
+
+    Args:
+        model: the model instance
+        reset_mask_all: [BS, span_P] bool — per-token reset mask
+        config: model config
+    """
+    if config.lifelong_mode:
+        return
+    if reset_mask_all.shape[1] <= 1:
+        return
+
+    # Streams that had at least one reset at positions 1..P-1
+    had_mid_span_reset = reset_mask_all[:, 1:].any(dim=1)  # [BS]
+    if not had_mid_span_reset.any():
+        return
+
+    for block in model.blocks:
+        for layer in block.layers:
+            layer.pm.reset_content(had_mid_span_reset)
+        block.em.reset_states(had_mid_span_reset)
 
 
 # ------------------------------------------------------------------

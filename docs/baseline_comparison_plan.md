@@ -593,40 +593,34 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 
 #### 7.3.1 Controlled Variables
 
-| Variable | Strategy |
-|----------|----------|
-| **Training data** | Same dataset (FineWeb-Edu subset) for all models |
-| **Tokenizer** | Same tokenizer (GPT-NeoX / Llama tokenizer with vocab ~32K) |
-| **Training tokens** | Same total tokens for all models at each comparison point |
-| **Optimizer** | AdamW with same hyperparameters (or per-model tuned LR with sweep) |
-| **Batch size** | Same effective batch size (tokens per update) |
-| **Precision** | bf16 for all models |
+| Variable | Setting |
+|----------|---------|
+| **Training data** | FineWeb-Edu 60% + DCLM 40% (all models) |
+| **Tokenizer** | TinyLlama (32K vocab, all models) |
+| **Token budget** | **2.0B tokens** (all models) |
+| **Optimizer** | AdamW, betas (0.9, 0.95) |
+| **Weight decay** | 0.01 (all models) |
+| **Gradient clipping** | 1.0 (all models) |
+| **Precision** | bf16 (all models) |
+| **Seq length** | T=256 (all models) |
 | **Evaluation** | Same lm-eval-harness version, same prompts |
 
-#### 7.3.2 What Must Be Tuned Per-Model
+**Per-model training config (implemented in `train_baseline.py`):**
 
-| Variable | Strategy |
-|----------|----------|
-| **Learning rate** | Grid search per architecture (1e-4 to 1e-3) |
-| **Warmup steps** | May need adjustment per architecture |
-| **Weight decay** | Standard 0.01 unless architecture-specific recommendation exists |
+| Model | Params | BS | Steps | LR | LR min | Warmup |
+|-------|--------|----|-------|-----|--------|--------|
+| Neuromorphic Tier A | 39.7M | 32 | 244K | 3e-4 | 3e-5 | 1000 steps |
+| Pythia-160M | 134.2M | 96 | 81K | 6e-4 | 6e-5 | 1% (810 steps) |
+| Mamba-130M | 115.1M | 64 | 122K | 6e-4 | 6e-5 | 1% (1220 steps) |
 
-#### 7.3.3 Baseline Implementation Options
+Batch sizes are per-model optimal for RTX 4090 (24GB). Different BS is acceptable because the comparison invariant is **total tokens**, not batch size. Each model uses its architecture-appropriate LR.
 
-**Option A: Train baselines from scratch** (best for fairness)
-- Implement transformer and Mamba at matched param count
-- Train on identical data with identical pipeline
-- Most work but strongest claims
+#### 7.3.2 Implementation
 
-**Option B: Use published checkpoints + early checkpoints** (pragmatic)
-- Use Pythia checkpoints at matched token counts
-- Note: different training data (Pile vs FineWeb-Edu)
-- Weaker claims but much less compute
-
-**Option C: Hybrid** (recommended)
-- Train small transformer baseline from scratch (matching our Tier A exactly)
-- Use Pythia checkpoints for reference
-- Use Mamba published numbers for SSM comparison
+**All baselines trained from scratch** (Option A: strongest claims):
+- Pythia-160M (GPT-NeoX architecture) and Mamba-130M, both randomly initialized
+- Trained on identical data pipeline with identical tokenizer
+- Script: `auxiliary_repos/baselines/eval_scripts/train_baseline.py`
 
 ### 7.4 Statistical Rigor
 

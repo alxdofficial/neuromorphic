@@ -65,7 +65,7 @@ TRAIN_SEED = 42
 
 # -- Learning rate --
 LR = 3e-4
-LR_MIN = 1e-5
+LR_MIN = 3e-5           # 10% of peak (standard cosine floor)
 WARMUP_STEPS = 1000
 
 # -- Training length --
@@ -75,9 +75,10 @@ MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 1_000,             # ~8M tokens: WM + PM backbone warmup (brief head start)
-    "B": 11_500,            # ~94M tokens: WM + PM + EM (bulk of training)
+    "B": 243_000,           # ~1.99B tokens: WM + PM + EM (bulk of training)
     "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
+# Total A+B = 244K steps × BS=32 × T=256 ≈ 2.0B tokens (matches baseline budget)
 
 # -- Regularization --
 WEIGHT_DECAY = 0.01
@@ -649,6 +650,7 @@ def run_phase(
         ],
         lr=lr,
         betas=(0.9, 0.95),
+        fused=(device.type == "cuda"),
     )
 
     # LR scheduler: linear warmup + cosine decay (per-phase: fresh warmup each phase)

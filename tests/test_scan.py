@@ -769,11 +769,15 @@ class TestEligibilityBatch:
 
         # Sequential path
         pm_seq._lazy_init(BS, x_all.device)
+
+        # Batch path — sync runtime state so routing sees same pm_K
+        pm_batch._lazy_init(BS, x_all.device)
+        pm_batch.pm_K = pm_seq.pm_K.clone()
+        pm_batch.pm_V = pm_seq.pm_V.clone()
+
         for t in range(P):
             pm_seq.update_eligibility(x_all[:, t], h_all[:, t], surprise_all[:, t])
 
-        # Batch path
-        pm_batch._lazy_init(BS, x_all.device)
         pm_batch.update_eligibility_batch(x_all, h_all, surprise_all, reset_mask)
 
         torch.testing.assert_close(pm_batch.elig_K, pm_seq.elig_K, atol=1e-6, rtol=1e-5)
@@ -796,13 +800,17 @@ class TestEligibilityBatch:
 
         # Sequential path (reset before update at that position)
         pm_seq._lazy_init(BS, x_all.device)
+
+        # Batch path — sync runtime state so routing sees same pm_K
+        pm_batch._lazy_init(BS, x_all.device)
+        pm_batch.pm_K = pm_seq.pm_K.clone()
+        pm_batch.pm_V = pm_seq.pm_V.clone()
+
         for t in range(P):
             if reset_mask[:, t].any():
                 pm_seq.reset_eligibility(reset_mask[:, t])
             pm_seq.update_eligibility(x_all[:, t], h_all[:, t], surprise_all[:, t])
 
-        # Batch path
-        pm_batch._lazy_init(BS, x_all.device)
         pm_batch.update_eligibility_batch(x_all, h_all, surprise_all, reset_mask)
 
         torch.testing.assert_close(pm_batch.elig_K, pm_seq.elig_K, atol=1e-6, rtol=1e-5)
@@ -824,6 +832,9 @@ class TestEligibilityBatch:
         # Pre-populate eligibility with non-zero values
         pm_seq._lazy_init(BS, x_all.device)
         pm_batch._lazy_init(BS, x_all.device)
+        # Sync runtime state so routing sees same pm_K
+        pm_batch.pm_K = pm_seq.pm_K.clone()
+        pm_batch.pm_V = pm_seq.pm_V.clone()
         init_elig_K = torch.randn(BS, cfg.r, D_h)
         init_elig_V = torch.randn(BS, cfg.r, D_h)
         pm_seq.elig_K = init_elig_K.clone()

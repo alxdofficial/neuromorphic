@@ -117,7 +117,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
         block_layer_outputs = [] if snapshot else None
         block_stats = {}
         for b, block in enumerate(self.blocks):
-            result = block.step(x_blocks[:, b], y_wm, x, self.surprise, carry,
+            result = block.step(x_blocks[:, b], y_wm, x_proj, self.surprise, carry,
                                 collect=collect, return_layers=snapshot)
             if collect and snapshot:
                 h_b, bstats, layers_b = result
@@ -219,6 +219,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
         # 7. Project and split across blocks
         x_proj_all = self.W_in(x_emb_all)  # [BS, P, D]
+        self._last_x_proj_all = x_proj_all  # cache for PM eligibility
         x_blocks_all = x_proj_all.view(
             BS, P, self.config.B, self.config.D_h
         )  # [BS, P, B, D_h]
@@ -229,7 +230,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
         for b, block in enumerate(self.blocks):
             result = block.forward_span(
                 x_blocks_all[:, :, b],  # [BS, P, D_h]
-                y_wm_all, x_emb_all, surprise_span, carry_all,
+                y_wm_all, x_proj_all, surprise_span, carry_all,
                 collect=collect,
             )
             if collect:

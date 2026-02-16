@@ -32,7 +32,7 @@
         </mxCell>
 
         <!-- Inputs -->
-        <mxCell id="20" value="&lt;b&gt;x&lt;/b&gt; [BS, D]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;token embedding&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="20" value="&lt;b&gt;x_proj&lt;/b&gt; [BS, D]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;W_in projection&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="60" y="150" width="120" height="40" as="geometry"/>
         </mxCell>
         <mxCell id="21" value="&lt;b&gt;y_wm&lt;/b&gt; [BS, D]&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#888&quot;&gt;WM output&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
@@ -51,7 +51,7 @@
         </mxCell>
 
         <!-- Score + Top-k -->
-        <mxCell id="25" value="&lt;b&gt;Score + Top-k Retrieval&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;scores = einsum(q, em_K) → [BS, M]&lt;br&gt;Mask inactive slots (em_S == 0)&lt;br&gt;top-k: select k_ret=4 highest scoring slots&lt;br&gt;V_top = gather(em_V, topk_idx) → [BS, k_ret, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="25" value="&lt;b&gt;Score + Top-k Retrieval&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;scores = einsum(q, em_K) → [BS, M]&lt;br&gt;Mask inactive slots (em_S == 0)&lt;br&gt;top-k: select k_ret=4 highest scoring slots&lt;br&gt;K_top = gather(em_K, topk_idx) → [BS, k_ret, D_em]&lt;br&gt;V_top = gather(em_V, topk_idx) → [BS, k_ret, D_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="60" y="300" width="310" height="80" as="geometry"/>
         </mxCell>
         <mxCell id="26" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="22" target="25" parent="1">
@@ -64,7 +64,7 @@
         </mxCell>
 
         <!-- Cross-attention aggregation -->
-        <mxCell id="28" value="&lt;b&gt;Cross-Attention Aggregation&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;q_cross = W_q_cross(x) → [BS, D_em]&lt;br&gt;attn = softmax(q_cross @ V_top^T / √D_em) → [BS, k_ret]&lt;br&gt;out = attn @ V_top → [BS, D_em]&lt;br&gt;&lt;br&gt;Aggregates k_ret memory tokens into one vector,&lt;br&gt;preserving multi-item recall capability.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="28" value="&lt;b&gt;Cross-Attention Aggregation&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 9px;&quot; color=&quot;#555&quot;&gt;q_cross = W_q_cross(x_proj) → [BS, D_em]&lt;br&gt;attn = softmax(q_cross @ K_top^T / √D_em) → [BS, k_ret]&lt;br&gt;out = attn @ V_top → [BS, D_em]&lt;br&gt;&lt;br&gt;K_top for attention weights, V_top for output.&lt;br&gt;Aggregates k_ret memory tokens into one vector.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;" vertex="1" parent="1">
           <mxGeometry x="60" y="410" width="340" height="100" as="geometry"/>
         </mxCell>
         <mxCell id="29" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;" edge="1" source="25" target="28" parent="1">

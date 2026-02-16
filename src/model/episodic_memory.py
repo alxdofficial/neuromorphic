@@ -121,16 +121,17 @@ class EpisodicMemory(nn.Module, StateMixin):
         k = min(self.k_ret, self.M)
         topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, k]
 
-        # Gather values
+        # Gather keys and values
         topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, self.D_em)
+        K_top = self.em_K.gather(1, topk_idx_exp)  # [BS, k, D_em]
         V_top = self.em_V.gather(1, topk_idx_exp)  # [BS, k, D_em]
 
         # Cross-attention aggregation
         q_cross = self.W_q_cross(x)  # [BS, D_em]
-        # Attention: q_cross against V_top as both keys and values.
+        # Attention weights from K_top (keys), applied to V_top (values).
         # Adding topk_scores preserves a differentiable path from retrieval query
         # (W_q_em) to downstream loss through selected memory logits.
-        attn = torch.einsum("bd, bkd -> bk", q_cross, V_top) * self.cross_scale
+        attn = torch.einsum("bd, bkd -> bk", q_cross, K_top) * self.cross_scale
         attn = attn + topk_scores
         # Mask out -inf topk positions (no active slots)
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
@@ -177,14 +178,16 @@ class EpisodicMemory(nn.Module, StateMixin):
         k = min(self.k_ret, self.M)
         topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, P, k]
 
-        # Gather values: expand indices to [BS, P, k, D_em]
+        # Gather keys and values: expand indices to [BS, P, k, D_em]
         topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.D_em)
+        em_K_exp = self.em_K.unsqueeze(1).expand(-1, P, -1, -1)  # [BS, P, M, D_em]
+        K_top = em_K_exp.gather(2, topk_idx_exp)  # [BS, P, k, D_em]
         em_V_exp = self.em_V.unsqueeze(1).expand(-1, P, -1, -1)  # [BS, P, M, D_em]
         V_top = em_V_exp.gather(2, topk_idx_exp)  # [BS, P, k, D_em]
 
         # Cross-attention: [BS, P, D_em]
         q_cross = self.W_q_cross(x_all)
-        attn = torch.einsum("bpd, bpkd -> bpk", q_cross, V_top) * self.cross_scale
+        attn = torch.einsum("bpd, bpkd -> bpk", q_cross, K_top) * self.cross_scale
         attn = attn + topk_scores
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
         attn = torch.softmax(attn, dim=-1)

@@ -34,6 +34,7 @@ class ModelConfig:
     tau_pm_floor: float = 0.05  # min PM slot selection temperature (learned mode)
     tau_pm_ceil: float = 5.0    # max PM slot selection temperature (learned mode)
     weakness_weight_pm: float = 0.5  # bias toward weak slots
+    tau_route_pm: float = 1.0         # temperature for PM slot routing in eligibility
     pm_readout_ffn: bool = True       # MLP after PM linear lookup
     surprise_scale: float = 5.0       # eligibility gate: gate = (surprise / scale).clamp(0,1)
     g_pm_default: float = 0.5         # default PM write strength
@@ -126,6 +127,11 @@ class ModelConfig:
             raise ValueError(
                 f"P ({self.P}) must be <= W ({self.W}) so the "
                 f"batched WM attention span fits within the cache."
+            )
+        if self.tau_route_pm <= 0:
+            raise ValueError(
+                f"tau_route_pm ({self.tau_route_pm}) must be positive "
+                f"to avoid division by zero in PM slot routing."
             )
 
     def set_phase(self, phase: str):
