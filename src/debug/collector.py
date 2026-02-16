@@ -136,7 +136,7 @@ class MetricsCollector:
 
     def _merge_gate_stats(self, record: dict, gate_stats: dict):
         """Merge per-block, per-layer gate stats into flat record."""
-        # gate_stats: {block_idx: {layer_idx: {"gate_a": Tensor, "gate_b": Tensor, "h_norm": float}}}
+        # gate_stats: {block_idx: {layer_idx: {"gate_a": Tensor, "gate_b": Tensor, "h_norm": Tensor|float}}}
         for b_idx, layers in gate_stats.items():
             for l_idx, lstats in layers.items():
                 prefix = f"b{b_idx}_l{l_idx}"
@@ -151,8 +151,9 @@ class MetricsCollector:
                 record[f"{prefix}_gate_b_mean"] = gb.mean().item()
                 record[f"{prefix}_gate_b_std"] = gb.std().item()
                 record[f"{prefix}_gate_b_abs_mean"] = gb.abs().mean().item()
-                # Hidden state norm
-                record[f"{prefix}_h_norm"] = lstats["h_norm"]
+                # Hidden state norm (may be tensor or float)
+                h_norm = lstats["h_norm"]
+                record[f"{prefix}_h_norm"] = h_norm.item() if isinstance(h_norm, Tensor) else h_norm
 
     def _collect_pm_stats(self, record: dict):
         """Read PM state tensors and compute summary stats."""
@@ -311,7 +312,7 @@ class MetricsCollector:
                 module_groups[f"b{b_idx}_em_neuromod"] = [block.em_neuromodulator]
             for l_idx, layer in enumerate(block.layers):
                 module_groups[f"b{b_idx}_l{l_idx}_gates"] = [
-                    layer.gate_a, layer.gate_b
+                    layer.gate_ab
                 ]
                 if self.config.pm_enabled:
                     module_groups[f"b{b_idx}_l{l_idx}_pm"] = [layer.pm]

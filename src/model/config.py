@@ -20,9 +20,11 @@ class ModelConfig:
     eot_id: int = 2           # set from tokenizer at runtime
 
     # Working Memory (1 shared instance)
-    W: int = 256              # sliding window size
+    wm_type: str = "gla"      # "gla" (Gated Linear Attention) or "softmax" (ring buffer)
+    W: int = 256              # sliding window size (softmax WM only)
     D_wm: int = 128           # WM key/value dimension
     n_heads_wm: int = 4       # attention heads
+    gate_low_rank: int = 16   # gate projection bottleneck dim (GLA WM only)
 
     # Procedural Memory (per layer per block, B*L instances)
     r: int = 8                # PM slots
@@ -123,7 +125,11 @@ class ModelConfig:
                 f"D_wm ({self.D_wm}) must be divisible by "
                 f"n_heads_wm ({self.n_heads_wm}) for WM attention."
             )
-        if self.P > self.W:
+        if self.wm_type not in ("gla", "softmax"):
+            raise ValueError(
+                f"wm_type must be 'gla' or 'softmax', got '{self.wm_type}'."
+            )
+        if self.wm_type == "softmax" and self.P > self.W:
             raise ValueError(
                 f"P ({self.P}) must be <= W ({self.W}) so the "
                 f"batched WM attention span fits within the cache."

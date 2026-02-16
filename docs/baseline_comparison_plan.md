@@ -385,7 +385,7 @@ Input:  a b c d e [SEP] ?
 Target: a b c d e
 ```
 
-**Why critical:** Tests raw memory capacity. Our WM (sliding window attention) should provide direct copying ability. Mamba and pure recurrent models struggle with this.
+**Why critical:** Tests raw memory capacity. Our WM (Gated Linear Attention with recurrent state) should provide direct copying ability. Mamba and pure recurrent models struggle with this.
 
 **Protocol:**
 - Vary copy length (32, 64, 128, 256, 512)
@@ -477,7 +477,7 @@ Target: a b c d e
 
 **Setup:** Standard few-shot evaluation with k=0,1,2,4,8 examples.
 
-**Why critical:** WM (sliding window attention) enables attending to examples. EM could provide "pseudo-few-shot" by retrieving relevant past episodes.
+**Why critical:** WM (Gated Linear Attention with recurrent state) enables attending to recent context. EM could provide "pseudo-few-shot" by retrieving relevant past episodes.
 
 **Protocol:**
 - Tasks: simple classification (SST-2, TREC), arithmetic, word manipulation

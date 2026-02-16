@@ -133,7 +133,7 @@ Trace the full lifecycle of one span (P=64 tokens) on Tier A wide (D=768, B=2, L
 ```
 model.surprise:  [32, 1]    — mean surprise from previous span (e.g. 3.2 for each stream)
 Layer.h:         [32, 384]  — per layer, per block (16 instances total). Carries forward from last span.
-WM ring buffer:  wm_K [32, 256, 192], wm_V [32, 256, 192], wm_ptr [32], wm_valid [32, 256]
+WM GLA state:   gla_state [32, 4, 48, 48]  — recurrent state matrix (H=4 heads, head_dim=D_wm/H=48)
 PM state:        pm_K [32, 8, 384], pm_V [32, 8, 384], pm_a [32, 8]  — per layer per block (16 instances)
 PM eligibility:  elig_K [32, 8, 384], elig_V [32, 8, 384]            — per layer per block (16 instances)
 EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256]  — per block (2 instances)
@@ -161,17 +161,16 @@ x_emb_all = embedding(input_ids)  # [32, 64, 768]
 ```
 One kernel launch. 64× more work per launch than the sequential path.
 
-**Step 4 — Working memory (batched span path):**
+**Step 4 — Working memory (GLA recurrence over span):**
 ```
 q_all = W_q(x_emb_all)    # [32, 64, 192]  — one matmul
 k_all = W_k(x_emb_all)    # [32, 64, 192]  — one matmul
 v_all = W_v(x_emb_all)    # [32, 64, 192]  — one matmul
+g_all = logsigmoid(W_g(x_emb_all)) / 16  # [32, 64, 192] — decay gates
 ```
-`forward_span()` dispatches:
-- no mid-span resets: batched attention over `[cache | span]` with overwrite-aware masking
-- any mid-span reset: exact sequential fallback path
-
-At t=13: streams with reset clear `wm_valid` and reset `wm_ptr` to 0.
+`forward_span()` runs a sequential GLA recurrence over P=64 tokens (torch.compile fuses the loop):
+- Per token: `S_t = diag(exp(g_t)) * S_{t-1} + k_t^T @ v_t`, `o_t = q_t @ S_t`
+- Mid-span resets: at doc boundaries (e.g. t=13), `gla_state` is zeroed before that token
 ```
 y_wm_all:  [32, 64, 768]  — WM output for all tokens
 ```
@@ -378,17 +377,13 @@ With `torch.compile` (§12), the scan loops, gate computations, and elementwise 
 
 ### 5.2 Working Memory
 
-**File:** `src/model/working_memory.py` — `forward_span()`
+**File:** `src/model/working_memory.py` — `GLAWorkingMemory.forward_span()`
 
-**Sequential** (`step()`): Projects Q/K/V for one token, writes to ring buffer, attends over valid entries, advances pointer.
+**Sequential** (`step()`): Projects Q/K/V/G for one token, applies decay gate to recurrent state, updates state with outer product, queries state for output.
 
-**Parallel** (`forward_span()`): Projects Q/K/V for all P tokens in one batched matmul, then dispatches:
-- **Batched path** (`_forward_span_batched`) when there are no mid-span resets.
-- **Sequential fallback** (`_forward_span_sequential`) when any mid-span reset exists.
+**Parallel** (`forward_span()`): Projects Q/K/V/G for all P tokens in one batched matmul, then runs a sequential GLA recurrence loop over the P tokens. Mid-span doc-boundary resets zero the state before the reset token. torch.compile fuses the recurrence loop.
 
-The batched path performs attention over `[cache | span]` using an overwrite-aware mask, and updates the ring buffer with span writes in one shot.
-
-**Difference:** None in output/state vs sequential. Mid-span resets are handled internally via fallback to the sequential path.
+**Difference:** None in output/state vs sequential. Both paths produce identical results — the recurrence is inherently sequential, but batched projections and torch.compile fusion make it efficient.
 
 ### 5.3 Procedural Memory Read
 
@@ -821,7 +816,7 @@ The parallel path is arguably more correct — gating eligibility by how surpris
 
 Everything not listed above is numerically identical between the two paths:
 - Embedding, spatial decoder, and LM head computation
-- Working memory attention and ring buffer state
+- Working memory GLA recurrence and state
 - Recurrent hidden state `h` (carry mask is equivalent to zeroing h)
 - PM read math (`apply` vs `apply_batch`)
 - EM retrieval math (`retrieve` vs `retrieve_batch`)

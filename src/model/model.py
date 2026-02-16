@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
-from .working_memory import WorkingMemory
+from .working_memory import WorkingMemory, GLAWorkingMemory
 from .block import Block
 from .decoder import SpatialDecoder
 from .utils import StateMixin
@@ -26,7 +26,10 @@ class NeuromorphicLM(nn.Module, StateMixin):
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.D)
-        self.wm = WorkingMemory(config)
+        if config.wm_type == "gla":
+            self.wm = GLAWorkingMemory(config)
+        else:
+            self.wm = WorkingMemory(config)
         self.blocks = nn.ModuleList([
             Block(config, b) for b in range(config.B)
         ])
@@ -63,6 +66,35 @@ class NeuromorphicLM(nn.Module, StateMixin):
             elif "bias" in name:
                 nn.init.zeros_(p)
 
+    def _state_needs_init(self, state: torch.Tensor | None, BS: int) -> bool:
+        """Check if a state tensor needs (re-)initialization."""
+        return state is None or state.shape[0] != BS
+
+    def initialize_states(self, BS: int, device: torch.device):
+        """Pre-allocate all runtime states. Must call before compile.
+
+        This eliminates lazy-init guards from forward paths, which would
+        otherwise cause graph breaks in torch.compile. Re-initializes if
+        batch size changes.
+        """
+        if self._state_needs_init(self.surprise, BS):
+            self.surprise = torch.zeros(BS, 1, device=device)
+        if self.config.wm_enabled:
+            wm_state = getattr(self.wm, 'gla_state', None)
+            if wm_state is None:
+                wm_state = getattr(self.wm, 'wm_K', None)
+            if self._state_needs_init(wm_state, BS):
+                self.wm._lazy_init(BS, device)
+        for block in self.blocks:
+            if self.config.em_enabled and \
+                    self._state_needs_init(block.em.em_K, BS):
+                block.em._lazy_init(BS, device)
+            for layer in block.layers:
+                if self._state_needs_init(layer.h, BS):
+                    layer._lazy_init(BS, device)
+                if self._state_needs_init(layer.pm.pm_K, BS):
+                    layer.pm._lazy_init(BS, device)
+
     def forward_one_token(self, input_id: Tensor, reset_mask: Tensor,
                           collect: bool = False):
         """Process one token through the full model.
@@ -81,9 +113,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         BS = input_id.shape[0]
         device = input_id.device
 
-        # Initialize surprise on first call
-        if self.surprise is None:
-            self.surprise = torch.zeros(BS, 1, device=device)
+        # Ensure all states are pre-allocated (idempotent)
+        self.initialize_states(BS, device)
 
         # Respect reset_on_doc_boundary across all reset-related paths.
         if self.config.reset_on_doc_boundary:
@@ -92,8 +123,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
             effective_reset_mask = torch.zeros_like(reset_mask)
 
         # Reset states for masked streams when doc-boundary reset is enabled.
-        if effective_reset_mask.any():
-            self.reset_at_doc_boundary(effective_reset_mask)
+        # Called unconditionally — when mask is all-False, resets are no-ops.
+        self.reset_at_doc_boundary(effective_reset_mask)
 
         # Embed token
         x = self.embedding(input_id)  # [BS, D]
@@ -174,9 +205,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         BS, P = input_ids.shape
         device = input_ids.device
 
-        # Initialize surprise on first call
-        if self.surprise is None:
-            self.surprise = torch.zeros(BS, 1, device=device)
+        # Ensure all states are pre-allocated (idempotent)
+        self.initialize_states(BS, device)
 
         # 1. Compute per-token reset masks
         reset_mask_all = self._compute_reset_masks(
@@ -188,8 +218,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
             reset_mask_all = torch.zeros_like(reset_mask_all)
 
         # 2. Handle reset for first token (state resets happen here)
-        if reset_mask_all[:, 0].any():
-            self.reset_at_doc_boundary(reset_mask_all[:, 0])
+        # Called unconditionally — when mask is all-False, resets are no-ops.
+        self.reset_at_doc_boundary(reset_mask_all[:, 0])
 
         # Handle mid-span resets (tokens 1..P-1): reset states
         # We need to process these before the forward pass. The sequential
@@ -508,18 +538,24 @@ class NeuromorphicLM(nn.Module, StateMixin):
     def compile_for_training(self):
         """Apply torch.compile to performance-critical submodules.
 
-        Compiles the inner _core methods (no lazy init, no .item(), no
-        data-dependent branches) with fullgraph=True for maximum fusion.
-        The outer wrappers handle lazy init without compilation.
+        Block-level compilation: compiles block.forward_span as a single
+        graph covering EM retrieval + L layers × (PM apply + layer forward)
+        + layer output stacking. This produces ~4 compiled graphs instead
+        of ~96 (per-layer _core methods), drastically reducing CPU-side
+        kernel launch overhead.
 
-        WM is NOT compiled because forward_span has a data-dependent dispatch
-        (reset_mask_all[:, 1:].any()) that would cause graph breaks.
+        Requires initialize_states() to have been called first so lazy
+        init guards don't cause graph breaks.
+
+        PM eligibility update is compiled separately (called post-forward
+        in span_ops).
         """
+        # Compile each block's forward_span as a single graph
+        for block in self.blocks:
+            block.forward_span = torch.compile(block.forward_span)
+        # PM eligibility is separate (called post-forward in span_ops)
         for block in self.blocks:
             for layer in block.layers:
-                layer._forward_span_core = torch.compile(
-                    layer._forward_span_core, fullgraph=True,
-                )
                 layer.pm._update_eligibility_core = torch.compile(
                     layer.pm._update_eligibility_core, fullgraph=True,
                 )

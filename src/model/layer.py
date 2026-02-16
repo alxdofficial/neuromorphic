@@ -36,9 +36,8 @@ class Layer(nn.Module, StateMixin):
         # Gate input: x_block + y_pm + y_wm_proj + y_em_proj + surprise
         input_dim = 4 * D_h + 1
 
-        # Scan-friendly gates (no dependence on h_{t-1})
-        self.gate_a = nn.Linear(input_dim, D_h)  # sigmoid -> retention
-        self.gate_b = nn.Linear(input_dim, D_h)  # tanh -> update
+        # Fused gate: single GEMM produces both retention (sigmoid) and update (tanh)
+        self.gate_ab = nn.Linear(input_dim, 2 * D_h)
 
         # Per-layer output projection (spec §7.4)
         self.W_o = nn.Linear(D_h, D_h)
@@ -63,6 +62,27 @@ class Layer(nn.Module, StateMixin):
 
         # Recurrent hidden state (lazily initialized)
         self.h: Tensor = None
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        """Handle loading old checkpoints with separate gate_a/gate_b."""
+        wa = prefix + "gate_a.weight"
+        wb = prefix + "gate_b.weight"
+        ba = prefix + "gate_a.bias"
+        bb = prefix + "gate_b.bias"
+        wab = prefix + "gate_ab.weight"
+        if wa in state_dict and wab not in state_dict:
+            state_dict[wab] = torch.cat(
+                [state_dict.pop(wa), state_dict.pop(wb)], dim=0
+            )
+            state_dict[prefix + "gate_ab.bias"] = torch.cat(
+                [state_dict.pop(ba), state_dict.pop(bb)], dim=0
+            )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def _lazy_init(self, BS: int, device: torch.device):
         self.h = torch.zeros(BS, self.config.D_h, device=device)
@@ -94,9 +114,11 @@ class Layer(nn.Module, StateMixin):
         # Fuse inputs
         u = torch.cat([x_block, y_pm, y_wm_proj, y_em_proj, surprise], dim=-1)
 
-        # Compute gates (no dependence on h_prev -> scan-friendly)
-        a = torch.sigmoid(self.gate_a(u))  # [BS, D_h]
-        b = torch.tanh(self.gate_b(u))     # [BS, D_h]
+        # Fused gate computation: one GEMM, then split + activate
+        ab = self.gate_ab(u)                             # [BS, 2*D_h]
+        a_raw, b_raw = ab.chunk(2, dim=-1)
+        a = torch.sigmoid(a_raw)                         # [BS, D_h] retention
+        b = torch.tanh(b_raw)                            # [BS, D_h] update
 
         # Affine recurrence with carry mask for doc boundaries
         self.h = a * (carry * self.h) + b
@@ -134,9 +156,15 @@ class Layer(nn.Module, StateMixin):
         u = torch.cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
                         surprise_all], dim=-1)
 
-        # Batched gate computation
-        a = torch.sigmoid(self.gate_a(u))   # [BS, P, D_h]
-        b = torch.tanh(self.gate_b(u))      # [BS, P, D_h]
+        # Fused gate computation: one GEMM, then split + activate
+        ab = self.gate_ab(u)                         # [BS, P, 2*D_h]
+        a_raw, b_raw = ab.chunk(2, dim=-1)
+        a = torch.sigmoid(a_raw)                     # [BS, P, D_h]
+        b = torch.tanh(b_raw)                        # [BS, P, D_h]
+
+        # Cache mean gate values for collect path (pure tensor ops, compile-safe)
+        self._last_gate_a_mean = a.detach().mean(dim=1)  # [BS, D_h]
+        self._last_gate_b_mean = b.detach().mean(dim=1)  # [BS, D_h]
 
         # Apply carry mask (zero at doc boundaries)
         # Cast carry to activation dtype (carry_all arrives as fp32 from bool→float)
@@ -177,11 +205,6 @@ class Layer(nn.Module, StateMixin):
             output_all: [BS, P, D_h] — layer outputs for all tokens
             (if collect: also returns gate_stats dict)
         """
-        BS = x_all.shape[0]
-
-        if self.h is None:
-            self._lazy_init(BS, x_all.device)
-
         output = self._forward_span_core(
             x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
             surprise_span, carry_all,
@@ -192,9 +215,9 @@ class Layer(nn.Module, StateMixin):
 
         if collect:
             stats = {
-                "gate_a": output.new_zeros(1),  # placeholder — full stats not needed in compiled path
-                "gate_b": output.new_zeros(1),
-                "h_norm": self.h.detach().norm(dim=-1).mean().item(),
+                "gate_a": self._last_gate_a_mean,  # [BS, D_h] mean over P
+                "gate_b": self._last_gate_b_mean,  # [BS, D_h] mean over P
+                "h_norm": self.h.detach().norm(dim=-1).mean(),  # scalar tensor
             }
             return output, stats
         return output

@@ -159,10 +159,6 @@ class EpisodicMemory(nn.Module, StateMixin):
             y_em_all: [BS, P, D]
         """
         BS, P, D = x_all.shape
-        device = x_all.device
-
-        if self.em_K is None:
-            self._lazy_init(BS, device)
 
         # Compute queries: [BS, P, D_em]
         q = unit_normalize(self.W_q_em(torch.cat([x_all, y_wm_all], dim=-1)))
@@ -178,12 +174,12 @@ class EpisodicMemory(nn.Module, StateMixin):
         k = min(self.k_ret, self.M)
         topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, P, k]
 
-        # Gather keys and values: expand indices to [BS, P, k, D_em]
-        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.D_em)
-        em_K_exp = self.em_K.unsqueeze(1).expand(-1, P, -1, -1)  # [BS, P, M, D_em]
-        K_top = em_K_exp.gather(2, topk_idx_exp)  # [BS, P, k, D_em]
-        em_V_exp = self.em_V.unsqueeze(1).expand(-1, P, -1, -1)  # [BS, P, M, D_em]
-        V_top = em_V_exp.gather(2, topk_idx_exp)  # [BS, P, k, D_em]
+        # Gather keys and values from [BS, M, D_em] directly (avoids
+        # materializing [BS, P, M, D_em] intermediate tensors).
+        topk_flat = topk_idx.reshape(BS, P * k)                          # [BS, P*k]
+        topk_flat_exp = topk_flat.unsqueeze(-1).expand(-1, -1, self.D_em)  # [BS, P*k, D_em]
+        K_top = self.em_K.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
+        V_top = self.em_V.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
 
         # Cross-attention: [BS, P, D_em]
         q_cross = self.W_q_cross(x_all)
@@ -199,6 +195,10 @@ class EpisodicMemory(nn.Module, StateMixin):
             out = out + self.readout_ffn(self.readout_norm(out))
 
         y_em_all = self.W_o_cross(out)  # [BS, P, D]
+
+        # Cache top-k indices for novelty approximation in propose_candidate_batch
+        self._last_topk_idx = topk_idx  # [BS, P, k]
+
         return y_em_all
 
     def propose_candidate(self, x: Tensor, y_wm: Tensor,
@@ -274,21 +274,40 @@ class EpisodicMemory(nn.Module, StateMixin):
         v_cand = self.W_v_cand(h_final_all)
 
         # Novelty = surprise + (1 - max cosine similarity to active keys)
+        # Approximation: only score against top-k retrieved slots (cached from
+        # retrieve_batch) instead of full O(BS*P*M*D_em) dense pass. The top-k
+        # most similar slots under retrieval are almost certainly the most
+        # similar under the candidate key projection too.
         cold_start = torch.ones(BS, dtype=torch.bool, device=x_all.device)
-        if self.em_K is not None:
-            # [BS, P, M]
+        if self.em_K is not None and hasattr(self, '_last_topk_idx') and self._last_topk_idx is not None:
+            # Gather only the top-k retrieved keys: [BS, P, k, D_em]
+            topk_idx = self._last_topk_idx  # [BS, P, k]
+            k = topk_idx.shape[-1]
+            topk_flat = topk_idx.reshape(BS, P * k)
+            topk_flat_exp = topk_flat.unsqueeze(-1).expand(-1, -1, self.D_em)
+            K_topk = self.em_K.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
+            # Score k_cand against retrieved keys only: [BS, P, k]
+            cos_sim_topk = torch.einsum("bpd, bpkd -> bpk", k_cand, K_topk)
+            if self.em_S is not None:
+                any_active = (self.em_S > 0).any(dim=-1)  # [BS]
+                max_sim = cos_sim_topk.max(dim=-1).values  # [BS, P]
+                max_sim = torch.where(
+                    any_active.unsqueeze(1), max_sim, torch.zeros_like(max_sim),
+                )
+                cold_start = ~any_active
+            else:
+                max_sim = cos_sim_topk.max(dim=-1).values
+                cold_start = torch.zeros(BS, dtype=torch.bool, device=x_all.device)
+        elif self.em_K is not None:
+            # Fallback: full dense scoring (when retrieve_batch wasn't called)
             cos_sim = torch.einsum("bpd, bmd -> bpm", k_cand, self.em_K)
             if self.em_S is not None:
-                active_mask = self.em_S > 0  # [BS, M]
-                masked = cos_sim.masked_fill(
-                    ~active_mask.unsqueeze(1), float("-inf")
-                )
-                any_active = active_mask.any(dim=-1)  # [BS]
-                max_sim = masked.max(dim=-1).values    # [BS, P]
+                active_mask = self.em_S > 0
+                masked = cos_sim.masked_fill(~active_mask.unsqueeze(1), float("-inf"))
+                any_active = active_mask.any(dim=-1)
+                max_sim = masked.max(dim=-1).values
                 max_sim = torch.where(
-                    any_active.unsqueeze(1),
-                    max_sim,
-                    torch.zeros_like(max_sim),
+                    any_active.unsqueeze(1), max_sim, torch.zeros_like(max_sim),
                 )
                 cold_start = ~any_active
             else:
@@ -358,37 +377,48 @@ class EpisodicMemory(nn.Module, StateMixin):
         # For each candidate, softmax-select slots to update
         tau_expanded = tau.unsqueeze(-1)  # [BS, 1]
 
-        for c in range(C):
-            k_c = K_C[:, c]   # [BS, D_em]
-            v_c = V_C[:, c]   # [BS, D_em]
+        # Vectorized write: score ALL candidates against the initial em_K state
+        # (stale scoring — each candidate doesn't see previous writes).
+        # Bounded approximation: g_em alphas are small, each write changes <1%.
 
-            # Score against existing slots
-            scores_slot = torch.einsum("bd, bmd -> bm", k_c, self.em_K)  # [BS, M]
+        # Score all C candidates against current (frozen) em_K: [BS, C, M]
+        scores_slot = torch.einsum("bcd, bmd -> bcm", K_C, self.em_K)
+        scores_slot = scores_slot - weakness_weight.unsqueeze(-1).unsqueeze(-1) * self.em_S.unsqueeze(1)
 
-            # Weakness bias: prefer overwriting weak slots
-            scores_slot = scores_slot - weakness_weight.unsqueeze(-1) * self.em_S
+        # Softmax slot selection per candidate: [BS, C, M]
+        w = torch.softmax(scores_slot / tau_expanded.unsqueeze(-1), dim=-1)
 
-            # Softmax slot selection (replaces hard top-k)
-            w = torch.softmax(scores_slot / tau_expanded, dim=-1)  # [BS, M]
+        # Apply write strength: [BS, C, M]
+        score_ok = torch.isfinite(topC_scores)  # [BS, C]
+        alpha = w * g_em.unsqueeze(-1).unsqueeze(-1) * score_ok.float().unsqueeze(-1)
 
-            # Apply write strength (g_em gates writes — no binary mask)
-            score_ok = torch.isfinite(topC_scores[:, c])
-            alpha = w * g_em.unsqueeze(-1) * score_ok.float().unsqueeze(-1)  # [BS, M]
+        # Sum alpha across all candidates: [BS, M]
+        alpha_raw_sum = alpha.sum(dim=1)  # [BS, M] — raw sum, possibly > 1
+        # Clamp to [0, 1] so EMA interpolation stays valid — multiple candidates
+        # targeting the same slot can push the raw sum above 1.
+        alpha_sum = alpha_raw_sum.clamp(max=1.0)
 
-            # EMA update
-            alpha_3d = alpha.unsqueeze(-1)  # [BS, M, 1]
-            self.em_K = unit_normalize(
-                (1 - alpha_3d) * self.em_K + alpha_3d * k_c.unsqueeze(1)
-            )
-            self.em_V = (1 - alpha_3d) * self.em_V + alpha_3d * v_c.unsqueeze(1)
+        # Weighted average of candidate keys/values: [BS, M, D_em]
+        # Each slot gets a blend of all C candidates weighted by their alpha.
+        # Normalize with raw sum so weights sum to 1.0 (convex combination).
+        alpha_norm = alpha / alpha_raw_sum.unsqueeze(1).clamp(min=1e-8)  # [BS, C, M]
+        # Compute blends in float32 for numerical safety (alpha_norm is already f32)
+        blended_K = torch.einsum("bcm, bcd -> bmd", alpha_norm, K_C.float())  # [BS, M, D_em]
+        blended_V = torch.einsum("bcm, bcd -> bmd", alpha_norm, V_C.float())  # [BS, M, D_em]
 
-            # Strength update
-            score_strength = torch.where(
-                score_ok, topC_scores[:, c], torch.zeros_like(topC_scores[:, c])
-            )
-            self.em_S = (self.em_S + alpha * score_strength.unsqueeze(-1)).clamp(
-                0.0, self.S_max
-            )
+        # EMA update with combined alpha
+        alpha_sum_3d = alpha_sum.unsqueeze(-1)  # [BS, M, 1]
+        self.em_K = unit_normalize(
+            (1 - alpha_sum_3d) * self.em_K + alpha_sum_3d * blended_K
+        )
+        self.em_V = (1 - alpha_sum_3d) * self.em_V + alpha_sum_3d * blended_V
+
+        # Strength update: sum of per-candidate strength contributions
+        score_strength = torch.where(
+            score_ok, topC_scores, torch.zeros_like(topC_scores)
+        )  # [BS, C]
+        strength_contrib = (alpha * score_strength.unsqueeze(-1)).sum(dim=1)  # [BS, M]
+        self.em_S = (self.em_S + strength_contrib).clamp(0.0, self.S_max)
 
         # Always decay strengths each boundary (even if no writes happened).
         self.em_S = self.em_S * decay.unsqueeze(-1)  # [BS] -> [BS, 1] broadcast

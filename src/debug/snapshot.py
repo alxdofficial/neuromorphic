@@ -88,7 +88,7 @@ def main():
     # 3. Gate weights
     gate_tensors = {}
     for name, tensor in state_dict.items():
-        if "gate_a" in name or "gate_b" in name:
+        if "gate_a" in name or "gate_b" in name or "gate_ab" in name:
             gate_tensors[name] = tensor
     if gate_tensors:
         gate_path = os.path.join(output_dir, "gate_weights.pt")

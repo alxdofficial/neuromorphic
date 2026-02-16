@@ -67,7 +67,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 - Perfect for verifying loss goes down and the model generates coherent text
 
 **Config:**
-- WM enabled (sliding window attention)
+- WM enabled (GLA recurrence, default)
 - PM enabled (reads + boundary commits with learned continuous heads)
 - EM retrieval/writes disabled
 - BS=32, ~5–10K steps
@@ -231,7 +231,7 @@ Per block b (shared across layers):
 - `em_S`: `[BS, M]` — EM strengths per stream
 
 Shared:
-- `wm_K, wm_V`: `[BS, W, D_wm]` — WM cache per stream
+- `gla_state`: `[BS, H, head_dim, head_dim]` — WM recurrent state per stream (or `wm_K, wm_V` if softmax)
 
 No cross-stream mixing. PyTorch broadcast handles this naturally.
 

@@ -132,7 +132,7 @@ def evaluate_validation(
                         logits_all, span_targets, loss_mask_all,
                     )
                     total_loss += float(span_loss.item())
-                    valid_count += span_valid
+                    valid_count += int(span_valid.item())
 
                     # Compute reset masks for accumulators
                     reset_mask_all = span_ops.compute_reset_mask(

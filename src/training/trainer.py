@@ -63,9 +63,8 @@ class TBPTTTrainer:
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
 
-        # torch.compile critical paths for CUDA training
-        if config.use_compile and device.type == "cuda":
-            model.compile_for_training()
+        self._states_initialized = False
+        self._compile_requested = config.use_compile and device.type == "cuda"
 
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""
@@ -113,6 +112,14 @@ class TBPTTTrainer:
         T = batch.input_ids.shape[1]
         P = self.config.P
         eot_id = self.config.eot_id
+        BS = batch.input_ids.shape[0]
+
+        # Pre-allocate all states before compile (once, on first chunk)
+        if not self._states_initialized:
+            self.model.initialize_states(BS, self.device)
+            self._states_initialized = True
+            if self._compile_requested:
+                self.model.compile_for_training()
 
         input_ids = batch.input_ids.to(self.device)
         target_ids = batch.target_ids.to(self.device)
@@ -124,12 +131,11 @@ class TBPTTTrainer:
             prev_token = batch.prev_token.to(self.device)
 
         chunk_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        valid_count = 0
-        BS = input_ids.shape[0]
+        valid_count = torch.tensor(0, device=self.device, dtype=torch.long)
         total_tokens = BS * T
-        eot_inputs = 0
-        reset_events = 0
-        span_valid_mean_accum = 0.0
+        eot_inputs = torch.tensor(0, device=self.device, dtype=torch.long)
+        reset_events = torch.tensor(0, device=self.device, dtype=torch.long)
+        span_valid_mean_accum = torch.tensor(0.0, device=self.device)
         span_count = 0
         # Determine if this step should do full collection
         do_full = (self.collector is not None
@@ -175,7 +181,7 @@ class TBPTTTrainer:
             # Compute surprise mean early (needed for model state update
             # before mid-span reset and EM proposal)
             span_surprise_mean = accum.surprise_accum / accum.valid_tokens.clamp(min=1)
-            span_valid_mean_accum += float(accum.valid_tokens.mean().item())
+            span_valid_mean_accum = span_valid_mean_accum + accum.valid_tokens.mean()
             span_count += 1
 
             # Update model surprise to span mean (frozen for next span's gates).
@@ -291,8 +297,8 @@ class TBPTTTrainer:
         return {
             "span_loss": span_loss,
             "span_valid": span_valid,
-            "eot_count": int(is_eot_all.sum().item()),
-            "reset_count": int(reset_mask_all.sum().item()),
+            "eot_count": is_eot_all.sum(),        # GPU tensor, no .item() sync
+            "reset_count": reset_mask_all.sum(),   # GPU tensor, no .item() sync
             "reset_mask_all": reset_mask_all,
             "gate_stats": gate_stats,
             "y_wm_all": y_wm_all,
@@ -332,11 +338,11 @@ class TBPTTTrainer:
 
         Returns (avg_loss, reg, grad_norm).
         """
-        # Finalize loss
-        if valid_count > 0:
-            avg_loss = chunk_loss / valid_count
+        # Finalize loss (valid_count may be a GPU tensor — avoid .item() sync)
+        if torch.is_tensor(valid_count):
+            avg_loss = chunk_loss / valid_count.float().clamp(min=1.0)
         else:
-            avg_loss = chunk_loss
+            avg_loss = chunk_loss / max(valid_count, 1)
 
         reg = compute_regularizers(self.model)
         total_loss = avg_loss + reg
@@ -384,6 +390,11 @@ class TBPTTTrainer:
         gate_stats=None,
     ) -> dict:
         """Assemble step metrics dict and log to collector. Pure bookkeeping."""
+        # Convert GPU tensor accumulators to Python scalars (single sync batch)
+        valid_count = int(valid_count.item()) if torch.is_tensor(valid_count) else int(valid_count)
+        eot_inputs = int(eot_inputs.item()) if torch.is_tensor(eot_inputs) else int(eot_inputs)
+        reset_events = int(reset_events.item()) if torch.is_tensor(reset_events) else int(reset_events)
+        span_valid_mean_accum = float(span_valid_mean_accum.item()) if torch.is_tensor(span_valid_mean_accum) else float(span_valid_mean_accum)
         tokens = total_tokens
 
         if valid_count == 0:
@@ -402,7 +413,11 @@ class TBPTTTrainer:
         eot_input_fraction = eot_inputs / max(tokens, 1)
         reset_fraction = reset_events / max(tokens, 1)
         mean_span_valid_tokens = span_valid_mean_accum / max(span_count, 1)
-        pm_budget_util, em_budget_util = self._memory_budget_utils()
+        # Only compute budget utils at log intervals (avoids 18 GPU→CPU syncs/step)
+        if (self.global_step + 1) % self.log_interval == 0 or self.global_step == 0:
+            pm_budget_util, em_budget_util = self._memory_budget_utils()
+        else:
+            pm_budget_util, em_budget_util = None, None
         dataloader_stats = {}
         if hasattr(self.dataloader, "monitor_stats"):
             dataloader_stats = self.dataloader.monitor_stats()

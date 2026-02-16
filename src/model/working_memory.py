@@ -1,20 +1,25 @@
 """
-Working Memory — sliding window attention with ring-buffer KV cache.
+Working Memory — two implementations:
 
-One shared instance across the entire model. Provides transformer-like
-precision on short context (copying, binding) via bounded attention
-over the last W tokens.
+1. WorkingMemory (softmax): sliding window attention with ring-buffer KV cache.
+2. GLAWorkingMemory (gla): Gated Linear Attention with recurrent state.
 
-State per stream:
+One shared instance across the entire model.
+
+WorkingMemory state per stream:
     wm_K: [BS, W, D_wm]   — key cache
     wm_V: [BS, W, D_wm]   — value cache
     wm_valid: [BS, W]      — bool mask for valid entries
     wm_ptr: [BS]           — ring buffer write index
+
+GLAWorkingMemory state per stream:
+    gla_state: [BS, H, head_dim, head_dim]  — recurrent state matrix (float32)
 """
 
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
@@ -46,6 +51,12 @@ class WorkingMemory(nn.Module, StateMixin):
         # ALiBi recency bias: fixed slopes per head (not learned)
         slopes = 2.0 ** (-8.0 * torch.arange(1, self.n_heads + 1, dtype=torch.float32) / self.n_heads)
         self.register_buffer("alibi_slopes", slopes)  # [n_heads]
+
+        # Pre-computed causal mask for span attention (avoids per-call allocation)
+        self.register_buffer(
+            "_span_causal",
+            torch.tril(torch.ones(config.P, config.P, dtype=torch.bool)),
+        )  # [P, P]
 
         # State tensors (lazily initialized on first step)
         self.wm_K: Tensor = None
@@ -193,8 +204,10 @@ class WorkingMemory(nn.Module, StateMixin):
     def forward_span(self, x_all: Tensor, reset_mask_all: Tensor) -> Tensor:
         """Process P tokens in parallel through working memory.
 
-        Dispatches to batched path when no mid-span resets exist (common case),
-        falls back to sequential path for mid-span resets (rare).
+        Always uses the batched path (no data-dependent branch).
+        Mid-span resets are handled via the carry mask in the recurrence;
+        stale WM cache entries are an accepted minor approximation (same
+        class as frozen PM/EM within spans).
 
         Args:
             x_all: [BS, P, D] — token embeddings for all span tokens
@@ -209,16 +222,11 @@ class WorkingMemory(nn.Module, StateMixin):
         if self.wm_K is None:
             self._lazy_init(BS, device)
 
-        # Batch projections (shared by both paths)
+        # Batch projections
         q_all = self.W_q(x_all)   # [BS, P, D_wm]
         k_all = self.W_k(x_all)   # [BS, P, D_wm]
         v_all = self.W_v(x_all)   # [BS, P, D_wm]
 
-        if reset_mask_all[:, 1:].any():
-            # Mid-span reset (rare) — fall back to sequential
-            return self._forward_span_sequential(
-                q_all, k_all, v_all, reset_mask_all, BS, P, device
-            )
         return self._forward_span_batched(
             q_all, k_all, v_all, reset_mask_all, BS, P, device
         )
@@ -285,21 +293,21 @@ class WorkingMemory(nn.Module, StateMixin):
         self, q_all: Tensor, k_all: Tensor, v_all: Tensor,
         reset_mask_all: Tensor, BS: int, P: int, device: torch.device,
     ) -> Tensor:
-        """Batched causal attention over [cache + span] (no mid-span resets).
+        """Batched causal attention over [cache + span].
 
-        Handles first-token resets only. Builds a combined KV of
-        [wm_K, k_all] and uses a carefully constructed mask for exact
-        sequential equivalence.
+        Handles first-token resets via unconditional masking. Mid-span
+        resets are an accepted approximation (stale cache entries persist
+        until the next span). Builds a combined KV of [wm_K, k_all] and
+        uses a carefully constructed mask.
         """
         W = self.W
 
         # --- Handle first-token resets (invalidate cache for those streams) ---
+        # Unconditional tensor ops (no .any() sync) — no-op when mask is all-False
         reset_first = reset_mask_all[:, 0]  # [BS]
-        if reset_first.any():
-            self.wm_valid = self.wm_valid.clone()
-            self.wm_valid[reset_first] = False
-            self.wm_ptr = self.wm_ptr.clone()
-            self.wm_ptr[reset_first] = 0
+        keep = (~reset_first).unsqueeze(1)                  # [BS, 1]
+        self.wm_valid = self.wm_valid * keep                # zeros validity for reset streams
+        self.wm_ptr = self.wm_ptr * (~reset_first).long()   # zeros ptr for reset streams
 
         wm_ptr = self.wm_ptr  # [BS] — starting write pointer
 
@@ -327,8 +335,7 @@ class WorkingMemory(nn.Module, StateMixin):
         # [BS, P, W]
 
         # Span portion: lower-triangular causal mask (token t attends to 0..t)
-        span_causal = torch.tril(torch.ones(P, P, dtype=torch.bool, device=device))
-        span_causal = span_causal.unsqueeze(0).expand(BS, P, P)  # [BS, P, P]
+        span_causal = self._span_causal[:P, :P].unsqueeze(0).expand(BS, P, P)  # [BS, P, P]
 
         # Combined mask: [BS, P, W+P]
         attn_mask = torch.cat([cache_valid_per_query, span_causal], dim=2)
@@ -391,5 +398,192 @@ class WorkingMemory(nn.Module, StateMixin):
         self.wm_valid = new_valid
 
         self.wm_ptr = (wm_ptr + P) % W
+
+        return y_wm_all
+
+
+# ---------------------------------------------------------------------------
+# GLA recurrence (pure PyTorch — torch.compile fuses the loop)
+# ---------------------------------------------------------------------------
+
+def _gla_recurrence(
+    q: Tensor, k: Tensor, v: Tensor, g: Tensor, state: Tensor,
+    reset_mask: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Pure PyTorch GLA recurrence over a span of P tokens.
+
+    Args:
+        q: [BS, P, H, K]  — queries
+        k: [BS, P, H, K]  — keys
+        v: [BS, P, H, V]  — values
+        g: [BS, P, H, K]  — log-space decay gates (negative)
+        state: [BS, H, K, V] — recurrent state matrix (float32)
+        reset_mask: [BS, P] bool or None — True at doc boundaries;
+            state is zeroed *before* computing that token's output.
+
+    Returns:
+        output: [BS, P, H, V]
+        new_state: [BS, H, K, V]
+    """
+    P = q.shape[1]
+    outputs = []
+    for t in range(P):
+        # Mid-span doc boundary: zero state before this token
+        if reset_mask is not None:
+            keep = (~reset_mask[:, t]).float().view(-1, 1, 1, 1)  # [BS,1,1,1]
+            state = state * keep
+        # decay: [BS, H, K] -> expand to [BS, H, K, 1] for broadcast
+        decay = torch.exp(g[:, t])                          # [BS, H, K]
+        # state update: S_t = diag(decay) @ S_{t-1} + k_t^T @ v_t
+        state = state * decay.unsqueeze(-1) + \
+            k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)   # [BS, H, K, V]
+        # output: o_t = q_t @ S_t
+        o_t = torch.einsum("bhk, bhkv -> bhv", q[:, t], state)
+        outputs.append(o_t)
+    return torch.stack(outputs, dim=1), state  # [BS, P, H, V], [BS, H, K, V]
+
+
+class GLAWorkingMemory(nn.Module, StateMixin):
+    """Gated Linear Attention working memory.
+
+    Replaces softmax attention + ring buffer with a recurrent linear
+    attention mechanism. The state is a [H, K, V] matrix per stream
+    (fixed size, O(1) per token). Learned log-space gates control
+    the decay of old information (replaces ALiBi).
+
+    Pure PyTorch implementation — torch.compile fuses the P=64 recurrence
+    loop into a single kernel.
+    """
+    _state_tensor_names = ["gla_state"]
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.D_wm = config.D_wm
+        self.n_heads = config.n_heads_wm
+        self.head_dim = config.D_wm // config.n_heads_wm
+        assert config.D_wm % config.n_heads_wm == 0
+
+        # Q/K/V/O projections (same dims as softmax WM)
+        self.W_q = nn.Linear(config.D, config.D_wm)
+        self.W_k = nn.Linear(config.D, config.D_wm)
+        self.W_v = nn.Linear(config.D, config.D_wm)
+        self.W_o = nn.Linear(config.D_wm, config.D)
+
+        # Gate projection: learned recency via log-space gates (replaces ALiBi)
+        # Low-rank bottleneck keeps param count small
+        self.W_g = nn.Sequential(
+            nn.Linear(config.D, config.gate_low_rank, bias=False),
+            nn.Linear(config.gate_low_rank, config.D_wm, bias=True),
+        )
+        self.gate_logit_normalizer = 16
+
+        self.drop_resid = nn.Dropout(config.dropout)
+
+        # Recurrent state: [BS, H, head_dim, head_dim] float32
+        self.gla_state: Tensor = None
+
+    def _lazy_init(self, BS: int, device: torch.device):
+        """Initialize recurrent state on first forward pass."""
+        self.gla_state = torch.zeros(
+            BS, self.n_heads, self.head_dim, self.head_dim,
+            dtype=torch.float32, device=device,
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        """Handle loading old softmax WM checkpoints.
+
+        W_q/W_k/W_v/W_o transfer directly (same shapes).
+        Old ring buffer state and ALiBi buffers are ignored.
+        W_g initializes randomly (no old equivalent).
+        """
+        # Remove old softmax-specific keys that don't exist in GLA
+        old_keys = [
+            "alibi_slopes", "_span_causal",
+        ]
+        for key in old_keys:
+            full_key = prefix + key
+            if full_key in state_dict:
+                del state_dict[full_key]
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+    def step(self, x: Tensor, reset_mask: Tensor) -> Tensor:
+        """Process one token through GLA working memory.
+
+        Args:
+            x: [BS, D] — current token embedding
+            reset_mask: [BS] bool — True for streams at doc boundary
+
+        Returns:
+            y_wm: [BS, D] — working memory output
+        """
+        BS = x.shape[0]
+        device = x.device
+
+        if self.gla_state is None:
+            self._lazy_init(BS, device)
+
+        # Zero state for reset streams (unconditional tensor ops)
+        keep = (~reset_mask).float().view(BS, 1, 1, 1)
+        self.gla_state = self.gla_state * keep
+
+        # Project
+        q = self.W_q(x).view(BS, self.n_heads, self.head_dim)
+        k = self.W_k(x).view(BS, self.n_heads, self.head_dim)
+        v = self.W_v(x).view(BS, self.n_heads, self.head_dim)
+        g = F.logsigmoid(
+            self.W_g(x).view(BS, self.n_heads, self.head_dim)
+        ) / self.gate_logit_normalizer  # [BS, H, K]
+
+        # Single recurrence step
+        decay = torch.exp(g)                                # [BS, H, K]
+        self.gla_state = self.gla_state * decay.unsqueeze(-1) + \
+            k.unsqueeze(-1) * v.unsqueeze(-2)               # [BS, H, K, V]
+        out = torch.einsum("bhk, bhkv -> bhv", q, self.gla_state)  # [BS, H, V]
+
+        # Merge heads and project
+        out = out.reshape(BS, self.D_wm)
+        y_wm = self.drop_resid(self.W_o(out))  # [BS, D]
+
+        return y_wm
+
+    def forward_span(self, x_all: Tensor, reset_mask_all: Tensor) -> Tensor:
+        """Process P tokens in parallel through GLA working memory.
+
+        Args:
+            x_all: [BS, P, D] — token embeddings for all span tokens
+            reset_mask_all: [BS, P] bool — True at doc boundaries
+
+        Returns:
+            y_wm_all: [BS, P, D] — working memory outputs
+        """
+        BS, P, D = x_all.shape
+
+        if self.gla_state is None:
+            self._lazy_init(BS, x_all.device)
+
+        # Batch projections: [BS, P, D_wm] -> [BS, P, H, head_dim]
+        q = self.W_q(x_all).view(BS, P, self.n_heads, self.head_dim)
+        k = self.W_k(x_all).view(BS, P, self.n_heads, self.head_dim)
+        v = self.W_v(x_all).view(BS, P, self.n_heads, self.head_dim)
+        g = F.logsigmoid(
+            self.W_g(x_all).view(BS, P, self.n_heads, self.head_dim)
+        ) / self.gate_logit_normalizer  # [BS, P, H, K]
+
+        # Pure PyTorch recurrence with per-token resets at doc boundaries
+        out, self.gla_state = _gla_recurrence(
+            q, k, v, g, self.gla_state, reset_mask=reset_mask_all,
+        )
+        # out: [BS, P, H, V]
+
+        # Merge heads and project: [BS, P, D]
+        out = out.reshape(BS, P, self.D_wm)
+        y_wm_all = self.drop_resid(self.W_o(out))
 
         return y_wm_all

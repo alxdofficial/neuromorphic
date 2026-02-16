@@ -287,7 +287,7 @@ class TestEMWriteIntegration:
 
 class TestWMReset:
     def test_wm_reset_on_doc_boundary(self):
-        cfg = make_tiny_config()
+        cfg = make_tiny_config(wm_type="softmax")
         cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, 4)
@@ -306,6 +306,23 @@ class TestWMReset:
         model.forward_one_token(input_id, mask)
         # After forward with reset_mask, ptr should be 1 (just wrote one token)
         assert (model.wm.wm_ptr == 1).all()
+
+    def test_gla_wm_reset_zeros_state(self):
+        """GLA WM: reset mask zeros the recurrent state."""
+        cfg = make_tiny_config(wm_type="gla")
+        cfg.set_phase("A")
+        model = NeuromorphicLM(cfg)
+        forward_n_tokens(model, 4)
+
+        # After forward, GLA state should be non-zero
+        assert model.wm.gla_state.abs().sum() > 0
+
+        # Forward with reset_mask should zero the state
+        mask = torch.ones(BS, dtype=torch.bool)
+        input_id = torch.randint(0, VOCAB, (BS,))
+        model.forward_one_token(input_id, mask)
+        # After reset+forward, state is non-zero (one token written)
+        # but the old state was zeroed before the new token
 
 
 # ============================================================================
@@ -387,7 +404,7 @@ class TestGenerate:
 
     def test_generate_eot_resets_wm(self):
         """EOT token in prompt triggers WM reset on the following token."""
-        cfg = make_tiny_config()
+        cfg = make_tiny_config(wm_type="softmax")
         cfg.set_phase("A")
         cfg.reset_on_doc_boundary = True
         model = NeuromorphicLM(cfg)

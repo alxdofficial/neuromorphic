@@ -97,18 +97,11 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         return y_pm
 
-    def apply_batch(self, x_block_all: Tensor) -> Tensor:
-        """Read-only PM lookup for P tokens in parallel.
+    def _apply_batch_core(self, x_block_all: Tensor) -> Tensor:
+        """Compiled inner loop for apply_batch. No lazy init.
 
-        Args:
-            x_block_all: [BS, P, D_h] — block input for all tokens
-
-        Returns:
-            y_pm_all: [BS, P, D_h]
+        Safe for torch.compile(fullgraph=True).
         """
-        if self.pm_K is None:
-            self._lazy_init(x_block_all.shape[0], x_block_all.device)
-
         x_q = unit_normalize(x_block_all)                             # [BS, P, D_h]
         scores = torch.einsum("brd, bpd -> bpr", self.pm_K, x_q)     # [BS, P, r]
         weighted = self.pm_a.unsqueeze(1) * scores                    # [BS, P, r]
@@ -118,6 +111,20 @@ class ProceduralMemory(nn.Module, StateMixin):
             y_pm = y_pm + self.readout_ffn(self.readout_norm(y_pm))
 
         return y_pm
+
+    def apply_batch(self, x_block_all: Tensor) -> Tensor:
+        """Read-only PM lookup for P tokens in parallel.
+
+        Thin wrapper that handles lazy init, then delegates to the
+        compilable core.
+
+        Args:
+            x_block_all: [BS, P, D_h] — block input for all tokens
+
+        Returns:
+            y_pm_all: [BS, P, D_h]
+        """
+        return self._apply_batch_core(x_block_all)
 
     def update_eligibility(self, x: Tensor, h: Tensor, surprise: Tensor):
         """Differentiable per-token eligibility accumulation.

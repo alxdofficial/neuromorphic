@@ -39,7 +39,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 | System | Biological Analogy | Persistence | Update Mechanism |
 |--------|--------------------|-------------|------------------|
 | **Genetic memory** (slow weights) | DNA / long-term evolutionary adaptation | Permanent after training | Standard backprop (frozen at deployment) |
-| **Working memory** (WM) | Prefrontal cortex / scratchpad | Last W tokens | Sliding window attention (no plasticity) |
+| **Working memory** (WM) | Prefrontal cortex / scratchpad | Recurrent state (GLA) | Gated Linear Attention — learned recency via decay gates (no plasticity) |
 | **Procedural memory** (PM) | Cerebellum / skill memory | Across documents/lifelong | Eligibility traces + neuromodulated commits |
 | **Episodic memory** (EM) | Hippocampus / event memory | Across documents/lifelong | Novelty-based writes to vector store + neuromodulation |
 
@@ -142,7 +142,7 @@ if reset_mask.any():
 # 2. Embed
 x = self.embedding(input_id)           # [BS, D]
 
-# 3. Working memory (shared, sliding window attention)
+# 3. Working memory (shared, GLA recurrence)
 y_wm = self.wm.step(x, reset_mask)    # [BS, D]
 
 # 4. Project and split for parallel blocks
@@ -187,24 +187,30 @@ return logits, x, y_wm
 
 **File:** `src/model/working_memory.py`
 
-**Intuition:** WM is the model's scratchpad -- bounded sliding-window attention over the last W=256 tokens. It provides transformer-like precision for short-range patterns (copying a name from 50 tokens ago, binding an adjective to its noun) without the unbounded memory cost of full attention.
+**Intuition:** WM is the model's scratchpad — bounded recurrent attention that provides short-range precision (copying a name from 50 tokens ago, binding an adjective to its noun) without the unbounded memory cost of full attention.
 
-**State per stream:**
-- `wm_K: [BS, W, D_wm]` -- key cache (ring buffer)
-- `wm_V: [BS, W, D_wm]` -- value cache (ring buffer)
-- `wm_valid: [BS, W]` -- bool mask for occupied slots
-- `wm_ptr: [BS]` -- ring buffer write index
+**Default implementation: Gated Linear Attention (GLA)** (`wm_type="gla"`)
 
-**Per-token operation:**
-1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`
-2. Write `(k, v)` into ring buffer at `wm_ptr` via functional scatter (differentiable within TBPTT chunk)
-3. Multi-head attention (`n_heads=4`) over all valid positions in the buffer, with **ALiBi recency bias** (fixed slopes per head, distance-based penalty) and dropout (rate `config.dropout`, default 0.1) applied after the attention softmax. ALiBi slopes are `2^(-8k/n_heads)` for head `k`, biasing attention toward recent tokens without learned positional embeddings.
-4. Project output: `y_wm = W_o(attn_output)` -> `[BS, D]`
-5. Advance pointer: `wm_ptr = (wm_ptr + 1) % W`
+State per stream:
+- `gla_state: [BS, H, head_dim, head_dim]` — recurrent state matrix (float32)
+- H = `n_heads_wm` (default 4), head_dim = `D_wm / H` (default 32)
 
-**Doc boundary reset:** Clears `wm_valid` and resets `wm_ptr` to 0 for masked streams. This prevents cross-document information leakage.
+Per-token operation (`step()`):
+1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`, reshaped to `[BS, H, head_dim]`
+2. Compute decay gate: `g = logsigmoid(W_g(x)) / 16` — learned log-space decay in (-inf, 0], `exp(g)` ∈ (0, 1]
+3. Update state: `S_t = diag(exp(g)) * S_{t-1} + k^T @ v` — exponential decay + outer product update
+4. Read output: `o = q @ S_t` — query against accumulated state
+5. Project: `y_wm = dropout(W_o(merge_heads(o)))` → `[BS, D]`
 
-**Gradient flow through the KV buffer:** Within a TBPTT chunk, gradients flow through the ring buffer back to `W_k` and `W_v`. The write uses a functional scatter (`wm_K = wm_K * (1 - mask) + k * mask`) rather than in-place mutation, keeping the gradient path alive. At TBPTT chunk boundaries, all buffer state is detached. WM is *non-plastic* in that it has no explicit memory update mechanism (no commits, no decay, no RL controller) — it simply caches the W most recent token projections. But `W_k`, `W_v`, `W_q`, and `W_o` are all trained via backprop through the attention computation.
+The gate projection `W_g` uses a low-rank bottleneck (`D → gate_low_rank → D_wm`, default `gate_low_rank=16`) to keep parameter count small. The `logsigmoid / 16` normalization ensures stable decay rates.
+
+**Doc boundary reset:** Zeros `gla_state` for masked streams. This prevents cross-document information leakage.
+
+**Gradient flow:** Within a TBPTT chunk, gradients flow through the recurrence back to W_q, W_k, W_v, W_g, and W_o. At chunk boundaries, `gla_state` is detached. WM is *non-plastic* in that it has no explicit memory update mechanism — it simply maintains a compressed representation of recent context via the decaying state matrix. But all projection weights are trained via backprop.
+
+**Fallback: Softmax ring buffer** (`wm_type="softmax"`)
+
+The original sliding-window attention implementation is available as a fallback. It uses a ring buffer (`wm_K, wm_V, wm_valid, wm_ptr`) with ALiBi recency bias and softmax attention. Set `wm_type="softmax"` in config to use it.
 
 **Shared across model:** There is exactly one WM instance. Its output `y_wm: [BS, D]` is broadcast to all B blocks, where each block projects it down to `D_h` via its own `W_wm_proj`.
 
@@ -896,7 +902,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 | Layer | `h` (hidden state) | -- |
 | PM | `pm_K, pm_V, pm_a, elig_K, elig_V` (all zeroed) | -- |
 | EM | `em_S` only (strengths zeroed) | `em_K, em_V` preserved |
-| WM | `wm_valid` cleared, `wm_ptr` reset | -- |
+| WM | `gla_state` zeroed (or `wm_valid` cleared if softmax) | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
 **Phase C (lifelong_mode=True) -- Soft Reset:**
@@ -906,7 +912,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 | Layer | `h` (hidden state) | -- |
 | PM | `elig_K, elig_V` only | `pm_K, pm_V, pm_a` (committed knowledge) |
 | EM | -- (nothing resets) | `em_K, em_V, em_S` (all persist) |
-| WM | `wm_valid` cleared, `wm_ptr` reset | -- |
+| WM | `gla_state` zeroed (or `wm_valid` cleared if softmax) | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
 The EM override in Phases A-B is deliberate: zeroing strengths makes old memories invisible without destroying key-value content, allowing graceful slot reuse. In Phase C, even strengths persist -- natural decay (per-stream learned) and budget enforcement provide forgetting pressure instead.
@@ -1157,13 +1163,13 @@ parameter gradients to:
 Runtime state updates (not parameters, no optimizer state):
   - PM state: pm_K, pm_V, pm_a, elig_K, elig_V
   - EM state: em_K, em_V, em_S
-  - WM cache: wm_K, wm_V, wm_valid, wm_ptr
+  - WM state: gla_state (or wm_K, wm_V, wm_valid, wm_ptr if softmax)
 ```
 
 **Summary:**
 - **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), and EM neuromodulator backbone + heads (Phase B+). Single optimizer for everything.
 - **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
-- **Not plastic (no memory update mechanism):** WM KV cache (ring buffer of recent token projections; gradients flow through within TBPTT chunks, detached at chunk boundaries)
+- **Not plastic (no memory update mechanism):** WM recurrent state (GLA state matrix; gradients flow through within TBPTT chunks, detached at chunk boundaries)
 
 ---
 
@@ -1346,7 +1352,7 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 | `src/model/model.py` | `NeuromorphicLM` -- top-level: embedding, WM, blocks, spatial decoder, lm_head |
 | `src/model/block.py` | `Block` -- parallel unit: L layers + 1 EM + 1 `EMNeuromodulator` |
 | `src/model/layer.py` | `Layer` -- affine recurrence + PM instance + `PMNeuromodulator` |
-| `src/model/working_memory.py` | `WorkingMemory` -- sliding window attention |
+| `src/model/working_memory.py` | `GLAWorkingMemory` (default GLA) + `WorkingMemory` (softmax fallback) |
 | `src/model/procedural_memory.py` | `ProceduralMemory`, `PMNeuromodulator` (two-mode: heuristic / learned) |
 | `src/model/episodic_memory.py` | `EpisodicMemory`, `EMNeuromodulator` (two-mode: heuristic / learned) |
 | `src/model/utils.py` | `StateMixin`, `unit_normalize`, `budget_enforce` |

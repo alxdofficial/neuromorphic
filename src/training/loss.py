@@ -82,13 +82,11 @@ def compute_loss_and_surprise(
         reduction="none",
     ).reshape(BS, P)  # [BS, P]
 
-    # Loss: masked sum (with grad)
+    # Loss: masked sum (with grad). When mask is all-False, mask_f is all
+    # zeros → loss is 0.0 with valid grad graph (no .item() sync needed).
     mask_f = loss_mask_all.float()                      # [BS, P]
-    valid_count = int(loss_mask_all.sum().item())
-    if valid_count > 0:
-        loss = (per_token_ce * mask_f).sum()
-    else:
-        loss = per_token_ce.sum() * 0  # zero loss preserving grad graph
+    valid_count = loss_mask_all.sum()                   # stays on GPU
+    loss = (per_token_ce * mask_f).sum()
 
     # Surprise: detached [BS, P, 1] (used for PM/EM gating, no grad needed)
     token_surprise = (per_token_ce.detach() * mask_f).unsqueeze(-1)

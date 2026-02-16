@@ -103,17 +103,31 @@ class TestBlockLayerShapes:
 # ============================================================================
 
 class TestWMShapes:
-    def test_wm_kv_cache_shapes(self):
+    def test_wm_state_shapes(self):
         model, cfg = _make_model("A")
         _run_one(model)
         wm = model.wm
-        assert wm.wm_K.shape == (BS, cfg.W, cfg.D_wm)
-        assert wm.wm_V.shape == (BS, cfg.W, cfg.D_wm)
+        if cfg.wm_type == "softmax":
+            assert wm.wm_K.shape == (BS, cfg.W, cfg.D_wm)
+            assert wm.wm_V.shape == (BS, cfg.W, cfg.D_wm)
+        else:
+            head_dim = cfg.D_wm // cfg.n_heads_wm
+            assert wm.gla_state.shape == (BS, cfg.n_heads_wm, head_dim, head_dim)
 
     def test_wm_step_output_shape(self):
         model, cfg = _make_model("A")
         _, _, y_wm = _run_one(model)
         assert y_wm.shape == (BS, cfg.D)
+
+    def test_wm_softmax_kv_cache_shapes(self):
+        """Softmax WM specific: ring buffer KV shapes."""
+        cfg = make_tiny_config(wm_type="softmax")
+        cfg.set_phase("A")
+        model = NeuromorphicLM(cfg)
+        _run_one(model, BS=BS)
+        wm = model.wm
+        assert wm.wm_K.shape == (BS, cfg.W, cfg.D_wm)
+        assert wm.wm_V.shape == (BS, cfg.W, cfg.D_wm)
 
 
 # ============================================================================

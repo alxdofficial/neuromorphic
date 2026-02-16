@@ -114,5 +114,6 @@ STATE_TENSOR_NAMES = {
     "ProceduralMemory": ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"],
     "EpisodicMemory": ["em_K", "em_V", "em_S"],
     "WorkingMemory": ["wm_K", "wm_V", "wm_valid", "wm_ptr"],
+    "GLAWorkingMemory": ["gla_state"],
     "Block": [],
 }
