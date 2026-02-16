@@ -50,7 +50,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 | Gradient clipping | 1.0 (global norm) |
 | Precision | **bf16** |
 | Warmup | 1000 steps |
-| Token budget | **2.0B tokens** (matches baselines: Pythia-160M BS=96, Mamba-130M BS=64) |
+| Token budget | **1.5B tokens** (matches baselines: Pythia-160M BS=96, Mamba-130M BS=64) |
 
 ---
 

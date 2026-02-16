@@ -75,10 +75,10 @@ MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 1_000,             # ~8M tokens: WM + PM backbone warmup (brief head start)
-    "B": 243_000,           # ~1.99B tokens: WM + PM + EM (bulk of training)
+    "B": 182_000,           # ~1.49B tokens: WM + PM + EM (bulk of training)
     "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
-# Total A+B = 244K steps × BS=32 × T=256 ≈ 2.0B tokens (matches baseline budget)
+# Total A+B = 183K steps × BS=32 × T=256 ≈ 1.5B tokens (matches baseline budget)
 
 # -- Regularization --
 WEIGHT_DECAY = 0.01

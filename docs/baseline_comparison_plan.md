@@ -597,7 +597,7 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 |----------|---------|
 | **Training data** | FineWeb-Edu 60% + DCLM 40% (all models) |
 | **Tokenizer** | TinyLlama (32K vocab, all models) |
-| **Token budget** | **2.0B tokens** (all models) |
+| **Token budget** | **1.5B tokens** (all models) |
 | **Optimizer** | AdamW, betas (0.9, 0.95) |
 | **Weight decay** | 0.01 (all models) |
 | **Gradient clipping** | 1.0 (all models) |
@@ -609,9 +609,9 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 
 | Model | Params | BS | Steps | LR | LR min | Warmup |
 |-------|--------|----|-------|-----|--------|--------|
-| Neuromorphic Tier A | 39.7M | 32 | 244K | 3e-4 | 3e-5 | 1000 steps |
-| Pythia-160M | 134.2M | 96 | 81K | 6e-4 | 6e-5 | 1% (810 steps) |
-| Mamba-130M | 115.1M | 64 | 122K | 6e-4 | 6e-5 | 1% (1220 steps) |
+| Neuromorphic Tier A | 39.7M | 32 | 183K | 3e-4 | 3e-5 | 1000 steps |
+| Pythia-160M | 134.2M | 96 | 61K | 6e-4 | 6e-5 | 1% (610 steps) |
+| Mamba-130M | 115.1M | 64 | 91K | 6e-4 | 6e-5 | 1% (910 steps) |
 
 Batch sizes are per-model optimal for RTX 4090 (24GB). Different BS is acceptable because the comparison invariant is **total tokens**, not batch size. Each model uses its architecture-appropriate LR.
 

@@ -6,8 +6,8 @@ on FineWeb-Edu (60%) + DCLM (40%), using the same TinyLlama tokenizer and
 token budget as our model for an apples-to-apples comparison.
 
 Usage:
-    python train_baseline.py --model pythia-160m   # BS=96, ~81K steps, 2B tokens
-    python train_baseline.py --model mamba-130m    # BS=64, ~122K steps, 2B tokens
+    python train_baseline.py --model pythia-160m   # BS=96, ~61K steps, 1.5B tokens
+    python train_baseline.py --model mamba-130m    # BS=64, ~91K steps, 1.5B tokens
 
     # Quick test run
     python train_baseline.py --model pythia-160m --steps 100 --bs 8
@@ -45,7 +45,7 @@ from transformers import (
 
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 SEQ_LENGTH = 256  # Must match our T=256
-TOKEN_BUDGET = 2_000_000_000  # 2B tokens (matches neuromorphic training)
+TOKEN_BUDGET = 1_500_000_000  # 1.5B tokens (matches neuromorphic training)
 GRAD_ACCUM = 1
 
 # Per-model optimal batch sizes (RTX 4090 24GB, bf16)
