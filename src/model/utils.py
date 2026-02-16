@@ -25,6 +25,15 @@ def unit_normalize(x: Tensor, dim: int = -1, eps: float = 1e-8) -> Tensor:
     return x / (norm_sq + eps).sqrt()
 
 
+def runtime_state_dtype(device: torch.device) -> torch.dtype:
+    """Runtime state precision policy.
+
+    Keep recurrent/plastic state in bf16 on CUDA for throughput and
+    consistent precision across stateful subsystems. Fall back to fp32 on CPU.
+    """
+    return torch.bfloat16 if device.type == "cuda" else torch.float32
+
+
 
 def budget_enforce(strengths: Tensor, budget: float) -> Tensor:
     """Scale down strengths if sum exceeds budget (per-stream).

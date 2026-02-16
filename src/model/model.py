@@ -14,7 +14,7 @@ from .config import ModelConfig
 from .working_memory import WorkingMemory, GLAWorkingMemory
 from .block import Block
 from .decoder import SpatialDecoder
-from .utils import StateMixin
+from .utils import StateMixin, runtime_state_dtype
 
 
 class NeuromorphicLM(nn.Module, StateMixin):
@@ -78,7 +78,9 @@ class NeuromorphicLM(nn.Module, StateMixin):
         batch size changes.
         """
         if self._state_needs_init(self.surprise, BS):
-            self.surprise = torch.zeros(BS, 1, device=device)
+            self.surprise = torch.zeros(
+                BS, 1, device=device, dtype=runtime_state_dtype(device)
+            )
         if self.config.wm_enabled:
             wm_state = getattr(self.wm, 'gla_state', None)
             if wm_state is None:
@@ -393,7 +395,9 @@ class NeuromorphicLM(nn.Module, StateMixin):
             if mask is not None:
                 if mask.dtype is not torch.bool:
                     mask = mask.bool()
-                next_surprise = next_surprise * mask.unsqueeze(-1).float()
+                next_surprise = next_surprise * mask.unsqueeze(-1).to(next_surprise.dtype)
+            if self.surprise is not None:
+                next_surprise = next_surprise.to(self.surprise.dtype)
             self.surprise = next_surprise
 
     @torch.inference_mode()
@@ -518,7 +522,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         """
         # Reset surprise for masked streams
         if self.surprise is not None:
-            self.surprise = self.surprise * (~mask).float().unsqueeze(-1)
+            keep = (~mask).to(self.surprise.dtype).unsqueeze(-1)
+            self.surprise = self.surprise * keep
 
         # Reset all blocks
         for block in self.blocks:
@@ -543,6 +548,8 @@ class NeuromorphicLM(nn.Module, StateMixin):
         + layer output stacking. This produces ~4 compiled graphs instead
         of ~96 (per-layer _core methods), drastically reducing CPU-side
         kernel launch overhead.
+        When wm_type='gla', also compiles wm.forward_span so the
+        per-token GLA recurrence loop is fused.
 
         Requires initialize_states() to have been called first so lazy
         init guards don't cause graph breaks.
@@ -553,6 +560,9 @@ class NeuromorphicLM(nn.Module, StateMixin):
         # Compile each block's forward_span as a single graph
         for block in self.blocks:
             block.forward_span = torch.compile(block.forward_span)
+        # Compile GLA WM span path so the recurrence loop can be fused.
+        if self.config.wm_enabled and self.config.wm_type == "gla":
+            self.wm.forward_span = torch.compile(self.wm.forward_span)
         # PM eligibility is separate (called post-forward in span_ops)
         for block in self.blocks:
             for layer in block.layers:
@@ -567,7 +577,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
         Compiles layer.step and pm.apply/update_eligibility for each layer.
         A warmup forward pass triggers all lazy inits before compilation.
 
-        WM is NOT compiled (data-dependent reset_mask.any() branch).
+        WM is not compiled here by default.
 
         Args:
             batch_size: BS for warmup — must match generation BS.

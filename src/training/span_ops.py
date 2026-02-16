@@ -141,14 +141,14 @@ def accumulate_span_surprise(
     BS, span_P = loss_mask_all.shape
     device = loss_mask_all.device
 
-    # Find last reset position per stream
-    if reset_on_doc_boundary and reset_mask_all.any():
+    # Find last reset position per stream (tensorized, no Python branching on GPU tensors)
+    if reset_on_doc_boundary:
         positions = torch.arange(span_P, device=device).unsqueeze(0)  # [1, P]
-        reset_pos = (reset_mask_all.float() * positions).max(dim=1).values.long()  # [BS]
+        reset_pos = (
+            reset_mask_all.to(positions.dtype) * positions
+        ).max(dim=1).values.long()  # [BS]
         has_reset = reset_mask_all.any(dim=1)  # [BS]
-        span_last_reset[has_reset] = reset_pos[has_reset]
-    else:
-        reset_pos = span_last_reset
+        span_last_reset.copy_(torch.where(has_reset, reset_pos, span_last_reset))
 
     # Mask: only tokens at or after last reset, AND in loss mask
     positions = torch.arange(span_P, device=device).unsqueeze(0)  # [1, P]
@@ -298,10 +298,9 @@ def apply_mid_span_resets(
     if reset_mask_all.shape[1] <= 1:
         return
 
-    # Streams that had at least one reset at positions 1..P-1
+    # Streams that had at least one reset at positions 1..P-1.
+    # Reset helpers are mask-multiplicative no-ops when mask is all-False.
     had_mid_span_reset = reset_mask_all[:, 1:].any(dim=1)  # [BS]
-    if not had_mid_span_reset.any():
-        return
 
     for block in model.blocks:
         for layer in block.layers:
@@ -335,10 +334,10 @@ def apply_em_boundary(
     em_stacked: dict,
     span_surprise_mean: Tensor,
     config: ModelConfig,
-) -> list[tuple[int, float, float]]:
+) -> list[tuple[int, Tensor, Tensor]]:
     """For each block: neuromod forward + write_at_boundary.
 
-    Returns list of (block_idx, novelty_mean, g_em_mean)
+    Returns list of (block_idx, novelty_mean_tensor, g_em_mean_tensor)
     for collector recording.
     """
     write_info = []
@@ -368,8 +367,8 @@ def apply_em_boundary(
 
         write_info.append((
             b,
-            cand_novelty_mean.mean().item(),
-            g_em.mean().item(),
+            cand_novelty_mean.mean().detach(),
+            g_em.mean().detach(),
         ))
 
         block.em.write_at_boundary(

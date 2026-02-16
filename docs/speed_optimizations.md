@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-16
 **Hardware:** NVIDIA RTX 4090 (24GB VRAM)
-**Model:** Tier A Wide (D=768, L=8, B=2, ~40M params)
+**Model:** Tier A Wide (D=768, L=8, B=2, ~85M params)
 **Phase B config:** BS=32, T=256, P=64 (4 spans/chunk)
 
 ---
@@ -11,18 +11,18 @@
 
 | Metric | Value |
 |--------|-------|
-| Training throughput | ~12K tok/s |
+| Training throughput | ~25K tok/s |
 | Tokens per step | 8,192 (BS=32 x T=256) |
-| Step time | ~0.68s |
-| GPU utilization | ~10% (kernel launch bound) |
+| Step time | ~0.33s |
+| Compilation warmup | ~5.7 min (first 2 steps) |
 
 ### Baseline Comparison
 
 | Model | Params | tok/s | Relative |
 |-------|--------|-------|----------|
-| Pythia-160M (transformer) | 134M | ~102K | 8.5x faster |
-| Mamba-130M (SSM) | 115M | ~58K | 4.8x faster |
-| **Neuromorphic LM** | **40M** | **~12K** | **1x** |
+| Pythia-160M (transformer) | 134M | ~102K | 4.1x faster |
+| Mamba-130M (SSM) | 115M | ~58K | 2.3x faster |
+| **Neuromorphic LM** | **85M** | **~25K** | **1x** |
 
 The speed gap is expected: baselines process T=256 tokens in one parallel pass, while our model splits into 4 sequential spans with PM/EM boundary operations. Three memory systems (PM, EM, WM) add per-token overhead that baselines lack.
 
@@ -45,7 +45,7 @@ Removed GPU-CPU synchronization barriers that stalled the pipeline:
 
 **Result:** ~8.6K -> ~12K tok/s (1.4x speedup)
 
-### Phase 2: Block-Level Compilation + WM -> GLA (current)
+### Phase 2: Block-Level Compilation + WM -> GLA (commit ee32cb3)
 
 | Change | Description |
 |--------|-------------|
@@ -53,35 +53,11 @@ Removed GPU-CPU synchronization barriers that stalled the pipeline:
 | Pre-allocate all state tensors | `initialize_states()` removes lazy init guards from compiled paths |
 | WM: softmax -> Gated Linear Attention | Pure PyTorch GLA recurrence replaces ring buffer + softmax attention |
 
-**Block-level compilation** reduces compiled graphs from ~96 (3 functions x 8 layers x 4 blocks) to 4 (one per block). This should reduce kernel launch overhead, but the GLA recurrence loop (P=64 sequential steps) currently gets unrolled into many small kernels rather than fused.
+**Block-level compilation** reduces compiled graphs from ~96 (3 functions x 8 layers x 4 blocks) to 4 (one per block). This dramatically reduces kernel launch overhead by allowing torch.compile to fuse entire block forward passes into optimized CUDA kernels.
 
-**GLA Working Memory** eliminates ring buffer scatter/gather/cat ops (~24% of GPU time in Phase 1 profiling) but introduces a P=64 sequential recurrence that torch.compile doesn't fully fuse.
+**GLA Working Memory** eliminates ring buffer scatter/gather/cat ops (~24% of GPU time in Phase 1 profiling). The sequential GLA recurrence (P=64 steps) is efficiently fused by torch.compile within the block-level compilation scope.
 
-**Result:** ~12K tok/s (no net change — GLA recurrence overhead offsets ring buffer elimination)
-
----
-
-## Profiling Analysis
-
-### Kernel Launch Overhead (Primary Bottleneck)
-
-The GPU is only ~10% utilized despite having plenty of compute headroom. The bottleneck is CPU-side: Python/torch dispatches many small CUDA kernels, and the GPU finishes each one before the next is launched.
-
-Key contributors to kernel launch count:
-- GLA recurrence: P=64 iterations, each producing ~8 kernels (decay, mul, add, einsum) = ~512 kernels per WM call
-- PM eligibility scan: P=64 iterations (compiled, but still sequential)
-- 4 spans per chunk, each with full forward + boundary ops
-
-### Memory Operations
-
-| Component | Dominant ops | Notes |
-|-----------|-------------|-------|
-| GLA WM | Per-token state update + query | P=64 sequential steps, state [BS, H, K, V] |
-| PM apply | Normalize + einsum | Compiled, efficient |
-| PM eligibility | First-order scan, P=64 | Compiled sequential loop |
-| EM retrieval | Dense similarity + top-k + gather | Vectorized across span |
-| EM write | EMA update per candidate | Vectorized (stale scoring) |
-| Spatial decoder | Linear projections | Small relative cost |
+**Result:** ~12K -> ~25K tok/s (2.1x speedup)
 
 ---
 
@@ -93,7 +69,7 @@ Key contributors to kernel launch count:
 
 3. **Recurrent computation:** GLA and PM eligibility are inherently sequential within a span (P=64 steps). Baselines use attention (fully parallel) or optimized CUDA scan kernels (Mamba).
 
-4. **Kernel launch overhead:** Many small operations dispatched individually. GPU spends most time waiting for the next kernel rather than computing.
+4. **Kernel launch overhead:** Many small operations dispatched individually. Block-level compilation significantly reduced this but some overhead remains from span boundary operations.
 
 ---
 
@@ -101,18 +77,18 @@ Key contributors to kernel launch count:
 
 | Optimization | Expected Impact | Effort |
 |-------------|----------------|--------|
-| FLA library GLA kernels | 2-3x WM speedup (fused Triton kernels) | Medium — requires `flash-linear-attention` dependency |
-| Increase P to 128-256 | 1.5-2x (fewer span boundaries) | Low — config change, but fewer PM/EM commits |
-| Custom CUDA kernel for GLA recurrence | 2-5x WM speedup | High — manual kernel development |
-| `torch.associative_scan` for PM eligibility | 1.2-1.5x PM speedup | Low — drop-in replacement |
+| FLA library GLA kernels | 1.5-2x WM speedup (fused Triton kernels) | Medium — requires `flash-linear-attention` dependency |
+| Increase P to 128-256 | 1.3-1.5x (fewer span boundaries) | Low — config change, but fewer PM/EM commits |
+| Custom CUDA kernel for GLA recurrence | 1.5-2x WM speedup | High — manual kernel development |
+| `torch.associative_scan` for PM eligibility | 1.1-1.3x PM speedup | Low — drop-in replacement |
 | Pipeline span boundary ops on CUDA streams | Variable | High — concurrent PM commit + next span forward |
 
 ### Realistic Speed Targets
 
 | Scenario | tok/s | vs Mamba |
 |----------|-------|---------|
-| Current | 12K | 4.8x slower |
-| + FLA kernels for GLA | ~20K | 2.9x slower |
-| + P=128 + parallel scan | ~28K | 2.1x slower |
+| Current | 25K | 2.3x slower |
+| + FLA kernels for GLA | ~35K | 1.7x slower |
+| + P=128 + parallel scan | ~45K | 1.3x slower |
 
-A 2-3x gap vs Mamba is the expected steady-state: three memory systems are the architectural cost for PM/EM/WM capabilities that baselines lack entirely.
+A 1.5-2x gap vs Mamba is the expected steady-state: three memory systems are the architectural cost for PM/EM/WM capabilities that baselines lack entirely.

@@ -68,14 +68,14 @@ Instead of relying on unbounded attention over long token histories, the model m
 - Encodes general language understanding and skills.
 - Frozen during normal deployment.
 
-2) **Working memory (WM)** — sliding-window attention
+2) **Working memory (WM)** — Gated Linear Attention (GLA)
 - Short-term precision: copies, bindings, recent tokens.
-- Bounded window (W=256 tokens), no post-training evolution.
+- Fixed-size recurrent state per head, no post-training evolution.
 
 3) **Procedural memory (PM)** — fast low-rank weights
 - Updates while the model runs via neuromodulated commits.
 - Encodes behavioral patterns, skills, habits.
-- B×L=32 instances (one per layer per block), each with its own controller.
+- B×L instances (one per layer per block), each with its own controller.
 
 4) **Episodic memory (EM)** — vector store
 - Updates via neuromodulated writes at plasticity boundaries.
@@ -197,7 +197,7 @@ We intentionally reuse mature components (tokenizers, dataset streaming, AMP tra
 v2 already implements key upgrades from the roadmap:
 - **scan-friendly recurrence** (affine: h_t = a_t ⊙ h_{t-1} + b_t),
 - **episodic memory** (per-block EM with dedicated controllers),
-- **working memory** (sliding-window attention).
+- **working memory** (Gated Linear Attention).
 
 Future directions include:
 - intrinsic multimodality (image/audio tokens),

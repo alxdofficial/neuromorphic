@@ -23,8 +23,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
-from .scan import parallel_affine_scan
-from .utils import StateMixin, unit_normalize, budget_enforce
+from .utils import StateMixin, unit_normalize, budget_enforce, runtime_state_dtype
 
 
 class ProceduralMemory(nn.Module, StateMixin):
@@ -67,11 +66,16 @@ class ProceduralMemory(nn.Module, StateMixin):
 
     def _lazy_init(self, BS: int, device: torch.device):
         """Initialize state on first forward pass."""
-        self.pm_K = unit_normalize(torch.randn(BS, self.r, self.D_h, device=device))
-        self.pm_V = unit_normalize(torch.randn(BS, self.r, self.D_h, device=device))
-        self.pm_a = torch.zeros(BS, self.r, device=device)
-        self.elig_K = torch.zeros(BS, self.r, self.D_h, device=device)
-        self.elig_V = torch.zeros(BS, self.r, self.D_h, device=device)
+        state_dtype = runtime_state_dtype(device)
+        self.pm_K = unit_normalize(
+            torch.randn(BS, self.r, self.D_h, device=device, dtype=state_dtype)
+        )
+        self.pm_V = unit_normalize(
+            torch.randn(BS, self.r, self.D_h, device=device, dtype=state_dtype)
+        )
+        self.pm_a = torch.zeros(BS, self.r, device=device, dtype=state_dtype)
+        self.elig_K = torch.zeros(BS, self.r, self.D_h, device=device, dtype=state_dtype)
+        self.elig_V = torch.zeros(BS, self.r, self.D_h, device=device, dtype=state_dtype)
 
     def apply(self, x_block: Tensor) -> Tensor:
         """Read-only PM lookup.
@@ -160,7 +164,7 @@ class ProceduralMemory(nn.Module, StateMixin):
     def _update_eligibility_core(self, x_all: Tensor, h_all: Tensor,
                                  surprise_all: Tensor,
                                  reset_mask: Tensor):
-        """Compiled inner loop: projections + gating + fused K/V scan.
+        """Compiled inner loop: projections + gating + fused K/V recurrence.
 
         No lazy init — safe for torch.compile(fullgraph=True).
         """
@@ -183,38 +187,35 @@ class ProceduralMemory(nn.Module, StateMixin):
         b_K = gate * route_w.unsqueeze(-1) * k_cand_all.unsqueeze(2)
         b_V = gate * route_w.unsqueeze(-1) * v_cand_all.unsqueeze(2)
 
-        # Carry mask: 0 at reset positions (zeros previous elig), 1 elsewhere
-        # Use activation dtype (bf16 under autocast) to keep scan in bf16
+        # Carry mask: 0 at reset positions (zeros previous elig), 1 elsewhere.
         carry = (~reset_mask).to(k_cand_all.dtype)  # [BS, P]
 
-        # a = rho * carry, expanded to [BS, P, r, D_h]
-        a = (self.rho * carry).unsqueeze(-1).unsqueeze(-1).expand(
-            BS, P, r, D_h
-        )
-
-        # Flatten [r, D_h] → [r*D_h] for scan (contiguous for reshape)
-        a_flat = a.contiguous().reshape(BS, P, r * D_h)
+        # Flatten [r, D_h] → [r*D_h] (contiguous for reshape)
         b_K_flat = b_K.contiguous().reshape(BS, P, r * D_h)
         b_V_flat = b_V.contiguous().reshape(BS, P, r * D_h)
-        h_K_init = self.elig_K.reshape(BS, r * D_h).to(a_flat.dtype)
-        h_V_init = self.elig_V.reshape(BS, r * D_h).to(a_flat.dtype)
+        h_K_init = self.elig_K.reshape(BS, r * D_h)
+        h_V_init = self.elig_V.reshape(BS, r * D_h)
 
-        # Fused K+V scan: one double-width scan instead of two separate
+        # Fused K+V recurrence: update only final state (t=P-1).
+        # This avoids materializing [BS, P, ...] intermediates that are unused.
         b_KV = torch.cat([b_K_flat, b_V_flat], dim=-1)       # [BS, P, 2*r*D_h]
-        a_KV = torch.cat([a_flat, a_flat], dim=-1)            # [BS, P, 2*r*D_h]
         h_KV_init = torch.cat([h_K_init, h_V_init], dim=-1)  # [BS, 2*r*D_h]
 
-        elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)  # [BS, P, 2*r*D_h]
-        elig_K_all, elig_V_all = elig_KV_all.chunk(2, dim=-1)
+        h_KV = h_KV_init
+        for t in range(P):
+            # Scalar carry per stream/timestep, broadcast over flattened state.
+            a_t = (self.rho * carry[:, t]).unsqueeze(-1)   # [BS, 1]
+            h_KV = a_t * h_KV + b_KV[:, t]
+        elig_K_final, elig_V_final = h_KV.chunk(2, dim=-1)
 
-        # Update state to last token, restore fp32 for inter-span precision
-        self.elig_K = elig_K_all[:, -1].reshape(BS, r, D_h).float()
-        self.elig_V = elig_V_all[:, -1].reshape(BS, r, D_h).float()
+        # Update state to last token, preserving configured runtime precision.
+        self.elig_K = elig_K_final.reshape(BS, r, D_h).to(self.elig_K.dtype)
+        self.elig_V = elig_V_final.reshape(BS, r, D_h).to(self.elig_V.dtype)
 
     def update_eligibility_batch(self, x_all: Tensor, h_all: Tensor,
                                  surprise_all: Tensor,
                                  reset_mask: Tensor):
-        """Batched eligibility accumulation over P tokens using affine scan.
+        """Batched eligibility accumulation over P tokens via final-state recurrence.
 
         Thin wrapper that handles lazy init, then delegates to the
         compilable core.
@@ -240,14 +241,13 @@ class ProceduralMemory(nn.Module, StateMixin):
         Used for mid-span doc-boundary resets in the parallel path where
         eligibility is already handled by the carry mask in the scan.
         """
-        if mask.any():
-            for name in ("pm_K", "pm_V", "pm_a"):
-                t = getattr(self, name, None)
-                if t is not None:
-                    expanded = mask
-                    for _ in range(t.dim() - 1):
-                        expanded = expanded.unsqueeze(-1)
-                    setattr(self, name, t * (~expanded).to(t.dtype))
+        for name in ("pm_K", "pm_V", "pm_a"):
+            t = getattr(self, name, None)
+            if t is not None:
+                expanded = mask
+                for _ in range(t.dim() - 1):
+                    expanded = expanded.unsqueeze(-1)
+                setattr(self, name, t * (~expanded).to(t.dtype))
 
     def reset_eligibility(self, mask: Tensor):
         """Zero only eligibility traces for masked streams.
@@ -255,7 +255,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         Used in lifelong mode: committed PM weights persist,
         but in-progress eligibility clears at doc boundaries.
         """
-        if self.elig_K is not None and mask.any():
+        if self.elig_K is not None:
             expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
             self.elig_K = self.elig_K * (~expanded).to(self.elig_K.dtype)
             self.elig_V = self.elig_V * (~expanded).to(self.elig_V.dtype)
@@ -435,16 +435,18 @@ class PMNeuromodulator(nn.Module):
 
     def _forward_learned(self, elig_norm, pm_usage, span_surprise, content_emb):
         """Fully differentiable learned mode — all outputs continuous."""
+        feat_dtype = self.backbone[0].weight.dtype
         scalar_features = torch.stack([elig_norm, pm_usage, span_surprise], dim=-1)  # [BS, 3]
+        scalar_features = scalar_features.to(feat_dtype)
 
         if content_emb is not None:
-            content_features = self.content_proj(content_emb)  # [BS, content_proj_dim]
+            content_features = self.content_proj(content_emb.to(feat_dtype))  # [BS, content_proj_dim]
             features = torch.cat([scalar_features, content_features], dim=-1)
         else:
             features = torch.cat([
                 scalar_features,
                 torch.zeros(elig_norm.shape[0], self.content_proj.out_features,
-                            device=elig_norm.device)
+                            device=elig_norm.device, dtype=feat_dtype)
             ], dim=-1)
 
         h = self.backbone(features)

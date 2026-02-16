@@ -14,6 +14,7 @@ from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
+from ..model.utils import runtime_state_dtype
 from .loss import batched_cross_entropy, compute_loss_and_surprise
 from . import span_ops
 
@@ -23,7 +24,9 @@ def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
     """Hard-reset runtime state so validation starts from a clean slate."""
     mask = torch.ones(batch_size, dtype=torch.bool, device=device)
     if model.surprise is None or model.surprise.shape[0] != batch_size:
-        model.surprise = torch.zeros(batch_size, 1, device=device)
+        model.surprise = torch.zeros(
+            batch_size, 1, device=device, dtype=runtime_state_dtype(device)
+        )
     else:
         model.surprise = torch.zeros_like(model.surprise)
 
@@ -157,7 +160,10 @@ def evaluate_validation(
                     span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
 
                     # Update model surprise to span mean (matching trainer)
-                    model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+                    next_surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+                    if model.surprise is not None:
+                        next_surprise = next_surprise.to(model.surprise.dtype)
+                    model.surprise = next_surprise
 
                     # PM eligibility + commit
                     if config.pm_enabled:

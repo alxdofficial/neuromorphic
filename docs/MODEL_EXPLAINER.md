@@ -1224,49 +1224,43 @@ Neuromodulators add negligible parameter overhead. The cost difference across ph
 
 Throughput depends on batch size, span length (P=64), which phases are active, and whether `--compile` is enabled. These numbers are from benchmarks on RTX 4090 (24GB).
 
-**Tier A (~85M) on RTX 4090 (24GB), BS=32, `--compile`:**
+**Tier A Wide (~85M) on RTX 4090 (24GB), BS=32, `--compile`:**
 
 | Phase | Components | Measured tok/s | Notes |
 |-------|-----------|-----------|------------|
-| **A** | WM + PM | ~10,300 | Compile gives ~2.8× over eager |
-| **B** | WM + PM + EM | ~7,000-8,000 | + PM/EM overhead |
-| **C** | Lifelong | ~7,000-8,000 | Similar to B |
+| **A** | WM + PM | ~30,000 | Block-level compile + GLA WM |
+| **B** | WM + PM + EM | ~25,000 | + EM retrieval/write overhead |
+| **C** | Lifelong | ~25,000 | Similar to B |
 
-**Without `--compile` (eager mode):**
-
-| Phase | Components | Measured tok/s |
-|-------|-----------|-----------|
-| **A** | WM + PM | ~3,700 |
-| **B** | WM + PM + EM | ~2,500-3,000 |
-| **C** | Lifelong | ~2,500-3,000 |
+Compilation warmup takes ~5.7 minutes (first 2 steps). Subsequent steps run at steady-state throughput. Speed improvement from earlier versions: sync removal (8.6K→12K), then block-level compile + GLA WM (12K→25K).
 
 **Tier B (~103M) on A100 80GB, BS=32 (estimated):**
 
 | Phase | Est. tok/s (compiled) |
 |-------|-----------|
-| **A** | ~15,000 |
-| **B-C** | ~10,000 |
+| **A** | ~40,000 |
+| **B-C** | ~30,000 |
 
 ### 21.4 Training Budget: Tokens vs Time
 
 How long to train on N tokens, given measured throughput with `--compile`:
 
-**Tier A on 1x RTX 4090 (weighted average ~8,000 tok/s across phases):**
+**Tier A Wide on 1x RTX 4090 (weighted average ~25,000 tok/s, compiled):**
 
 | Tokens | Hours | Days | Cost @ $0.34/hr |
 |--------|-------|------|-----------------|
-| 1B | 35 | 1.5 | $12 |
-| 5B | 174 | 7.2 | $59 |
-| 10B | 347 | 14.5 | $118 |
-| 20B | 694 | 29 | $236 |
+| 1B | 11 | 0.5 | $4 |
+| 1.5B | 17 | 0.7 | $6 |
+| 5B | 56 | 2.3 | $19 |
+| 10B | 111 | 4.6 | $38 |
 
-**Tier B on 1x A100 80GB (estimated ~10,000 tok/s compiled):**
+**Tier B on 1x A100 80GB (estimated ~30,000 tok/s compiled):**
 
 | Tokens | Hours | Days | Cost @ $1.40/hr |
 |--------|-------|------|-----------------|
-| 5B | 139 | 5.8 | $194 |
-| 10B | 278 | 11.6 | $389 |
-| 20B | 556 | 23 | $778 |
+| 1.5B | 14 | 0.6 | $19 |
+| 5B | 46 | 1.9 | $65 |
+| 10B | 93 | 3.9 | $130 |
 
 ### 21.5 Multi-GPU Scaling
 
@@ -1274,11 +1268,11 @@ For Tier B and C, multi-GPU training significantly reduces wall-clock time. With
 
 | Config | Effective tok/s | 10B tokens wall-clock |
 |--------|----------------|----------------------|
-| Tier B, 1x A100 | ~10,000 | ~12 days |
-| Tier B, 4x A100 | ~36,000 | ~3.2 days |
-| Tier B, 8x A100 | ~64,000 | ~1.8 days |
-| Tier C, 4x A100 | ~20,000 | ~5.8 days |
-| Tier C, 8x H100 | ~80,000 | ~1.4 days |
+| Tier B, 1x A100 | ~30,000 | ~3.9 days |
+| Tier B, 4x A100 | ~108,000 | ~1.1 days |
+| Tier B, 8x A100 | ~192,000 | ~14.5 hours |
+| Tier C, 4x A100 | ~60,000 | ~1.9 days |
+| Tier C, 8x H100 | ~240,000 | ~11.6 hours |
 
 Scaling efficiency is estimated at ~85-90% for data parallelism (independent streams, minimal communication overhead since each stream's memory state is local).
 
@@ -1286,31 +1280,31 @@ Scaling efficiency is estimated at ~85-90% for data parallelism (independent str
 
 #### Overnight Run (Proof-of-concept, single RTX 4090)
 
-- **Tier A**, Phases A→B→C, ~12 hours total with `--compile`
-- **Tokens:** ~350M — enough for loss curves and basic memory utilization
+- **Tier A Wide**, Phases A→B→C, ~6 hours total with `--compile`
+- **Tokens:** ~500M — enough for loss curves and basic memory utilization
 - **BS:** 32, **T:** 256
-- **Cost:** ~$4
+- **Cost:** ~$2
 
 #### Weekend Run (Meaningful training, single RTX 4090)
 
-- **Tier A**, all phases, ~48 hours with `--compile`
-- **Tokens:** ~1.4B total
-- **Cost:** ~$16
+- **Tier A Wide**, all phases, ~17 hours with `--compile`
+- **Tokens:** ~1.5B total (full token budget)
+- **Cost:** ~$6
 - Should show clear perplexity improvement and memory utilization
 
 #### Serious Experiment (Publishable ablation, single 4090)
 
-- **Tier A**, all phases with `--compile`, ~1 week
+- **Tier A Wide**, all phases with `--compile`, ~2.5 days
 - **Tokens:** ~5B (Chinchilla-optimal for 85M params)
-- **Cost:** ~$59
+- **Cost:** ~$19
 - Sufficient to demonstrate architecture viability and ablate components
 
 #### Competitive Model (Match GPT-2 Small 124M)
 
 - **Tier B** (~103M params) on 4x A100 80GB with `--compile`
 - **Tokens:** 10-20B
-- **Duration:** 3-6 days
-- **Cost:** $1,600-$3,200 (at $1.40/hr/GPU)
+- **Duration:** 1-2 days
+- **Cost:** $460-$920 (at $1.40/hr/GPU)
 
 #### Strong Model (Match GPT-2 Medium 345M)
 

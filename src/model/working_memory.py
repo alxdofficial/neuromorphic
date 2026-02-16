@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
-from .utils import StateMixin
+from .utils import StateMixin, runtime_state_dtype
 
 
 class WorkingMemory(nn.Module, StateMixin):
@@ -66,8 +66,9 @@ class WorkingMemory(nn.Module, StateMixin):
 
     def _lazy_init(self, BS: int, device: torch.device):
         """Initialize state tensors on first forward pass."""
-        self.wm_K = torch.zeros(BS, self.W, self.D_wm, device=device)
-        self.wm_V = torch.zeros(BS, self.W, self.D_wm, device=device)
+        state_dtype = runtime_state_dtype(device)
+        self.wm_K = torch.zeros(BS, self.W, self.D_wm, device=device, dtype=state_dtype)
+        self.wm_V = torch.zeros(BS, self.W, self.D_wm, device=device, dtype=state_dtype)
         self.wm_valid = torch.zeros(BS, self.W, dtype=torch.bool, device=device)
         self.wm_ptr = torch.zeros(BS, dtype=torch.long, device=device)
 
@@ -132,12 +133,10 @@ class WorkingMemory(nn.Module, StateMixin):
         if self.wm_K is None:
             self._lazy_init(BS, device)
 
-        # Reset validity for masked streams
-        if reset_mask.any():
-            self.wm_valid = self.wm_valid.clone()
-            self.wm_valid[reset_mask] = False
-            self.wm_ptr = self.wm_ptr.clone()
-            self.wm_ptr[reset_mask] = 0
+        # Reset validity for masked streams (unconditional tensor ops)
+        keep = (~reset_mask).unsqueeze(1)
+        self.wm_valid = self.wm_valid & keep
+        self.wm_ptr = self.wm_ptr * (~reset_mask).long()
 
         # Project q, k, v
         q = self.W_q(x)    # [BS, D_wm]
@@ -241,11 +240,9 @@ class WorkingMemory(nn.Module, StateMixin):
             reset_t = reset_mask_all[:, t]
 
             # Reset validity for masked streams
-            if reset_t.any():
-                self.wm_valid = self.wm_valid.clone()
-                self.wm_valid[reset_t] = False
-                self.wm_ptr = self.wm_ptr.clone()
-                self.wm_ptr[reset_t] = 0
+            keep = (~reset_t).unsqueeze(1)
+            self.wm_valid = self.wm_valid & keep
+            self.wm_ptr = self.wm_ptr * (~reset_t).long()
 
             q = q_all[:, t]  # [BS, D_wm]
             k = k_all[:, t]  # [BS, D_wm]
@@ -320,15 +317,13 @@ class WorkingMemory(nn.Module, StateMixin):
         offsets = torch.arange(P, device=device)  # [P]
         write_pos = (wm_ptr.unsqueeze(1) + offsets.unsqueeze(0)) % W  # [BS, P]
 
-        # write_onehot[b, t, w] = True if span token t writes to cache position w
-        write_onehot = torch.zeros(BS, P, W, dtype=torch.bool, device=device)
-        write_onehot.scatter_(2, write_pos.unsqueeze(-1), True)
-
-        # cumulative_overwrite[b, t, w] = True if any token 0..t writes to position w
-        # For query at position t, cache positions overwritten by tokens 0..t must
-        # be masked — the old values are stale, and the fresh values are already
-        # available in the span portion of the combined KV via the causal mask.
-        cumulative_overwrite = write_onehot.cumsum(dim=1).bool()  # [BS, P, W]
+        # Cache slot overwrite mask by modular position arithmetic:
+        # slot_age[b,w] = first timestep index that overwrites slot w.
+        slot_idx = torch.arange(W, device=device)  # [W]
+        slot_age = (slot_idx.unsqueeze(0) - wm_ptr.unsqueeze(1)) % W  # [BS, W]
+        cumulative_overwrite = (
+            slot_age.unsqueeze(1) <= offsets.view(1, P, 1)
+        )  # [BS, P, W]
 
         # Cache valid per query: original validity minus overwritten positions
         cache_valid_per_query = self.wm_valid.unsqueeze(1).expand(BS, P, W) & ~cumulative_overwrite
@@ -373,28 +368,15 @@ class WorkingMemory(nn.Module, StateMixin):
         y_wm_all = self.drop_resid(self.W_o(out))
 
         # --- Differentiable cache update (write all P tokens at once) ---
-        # write_masks[b, t, w] = 1.0 if span token t writes to cache position w
-        write_masks = torch.zeros(BS, P, W, dtype=self.wm_K.dtype, device=device)
-        write_masks.scatter_(2, write_pos.unsqueeze(-1), 1.0)
-
-        # For positions written by multiple span tokens (P > W edge, but P <= W
-        # guaranteed), only the last write matters. Use the last writer's value.
-        # any_written[b, w, 1] = max over t of write_masks[b, t, w]
-        any_written = write_masks.max(dim=1).values.unsqueeze(-1)  # [BS, W, 1]
-
-        # Scatter span k/v into cache positions via einsum
-        new_K = torch.einsum("bpw, bpd -> bwd", write_masks, k_all)  # [BS, W, D_wm]
-        new_V = torch.einsum("bpw, bpd -> bwd", write_masks, v_all)  # [BS, W, D_wm]
-
-        # Differentiable blend: keep old where not overwritten, new where overwritten
-        self.wm_K = self.wm_K * (1 - any_written) + new_K
-        self.wm_V = self.wm_V * (1 - any_written) + new_V
+        # P <= W is guaranteed by config validation, so write_pos is unique per stream.
+        scatter_idx = write_pos.unsqueeze(-1).expand(-1, -1, self.D_wm)  # [BS, P, D_wm]
+        self.wm_K = self.wm_K.scatter(1, scatter_idx, k_all)
+        self.wm_V = self.wm_V.scatter(1, scatter_idx, v_all)
 
         # --- Update wm_valid and advance wm_ptr ---
         new_valid = self.wm_valid.clone()
         # Mark all written positions as valid
-        any_written_bool = any_written.squeeze(-1).bool()  # [BS, W]
-        new_valid = new_valid | any_written_bool
+        new_valid.scatter_(1, write_pos, True)
         self.wm_valid = new_valid
 
         self.wm_ptr = (wm_ptr + P) % W
@@ -430,7 +412,7 @@ def _gla_recurrence(
     for t in range(P):
         # Mid-span doc boundary: zero state before this token
         if reset_mask is not None:
-            keep = (~reset_mask[:, t]).float().view(-1, 1, 1, 1)  # [BS,1,1,1]
+            keep = (~reset_mask[:, t]).to(state.dtype).view(-1, 1, 1, 1)  # [BS,1,1,1]
             state = state * keep
         # decay: [BS, H, K] -> expand to [BS, H, K, 1] for broadcast
         decay = torch.exp(g[:, t])                          # [BS, H, K]
@@ -480,14 +462,14 @@ class GLAWorkingMemory(nn.Module, StateMixin):
 
         self.drop_resid = nn.Dropout(config.dropout)
 
-        # Recurrent state: [BS, H, head_dim, head_dim] float32
+        # Recurrent state: [BS, H, head_dim, head_dim]
         self.gla_state: Tensor = None
 
     def _lazy_init(self, BS: int, device: torch.device):
         """Initialize recurrent state on first forward pass."""
         self.gla_state = torch.zeros(
             BS, self.n_heads, self.head_dim, self.head_dim,
-            dtype=torch.float32, device=device,
+            dtype=runtime_state_dtype(device), device=device,
         )
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
@@ -530,7 +512,7 @@ class GLAWorkingMemory(nn.Module, StateMixin):
             self._lazy_init(BS, device)
 
         # Zero state for reset streams (unconditional tensor ops)
-        keep = (~reset_mask).float().view(BS, 1, 1, 1)
+        keep = (~reset_mask).to(self.gla_state.dtype).view(BS, 1, 1, 1)
         self.gla_state = self.gla_state * keep
 
         # Project

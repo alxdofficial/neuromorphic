@@ -16,7 +16,7 @@ from torch import Tensor
 from .config import ModelConfig
 from .procedural_memory import ProceduralMemory, PMNeuromodulator
 from .scan import parallel_affine_scan
-from .utils import StateMixin
+from .utils import StateMixin, runtime_state_dtype
 
 
 class Layer(nn.Module, StateMixin):
@@ -85,7 +85,9 @@ class Layer(nn.Module, StateMixin):
         )
 
     def _lazy_init(self, BS: int, device: torch.device):
-        self.h = torch.zeros(BS, self.config.D_h, device=device)
+        self.h = torch.zeros(
+            BS, self.config.D_h, device=device, dtype=runtime_state_dtype(device)
+        )
 
     def step(self, x_block: Tensor, y_pm: Tensor, y_wm_proj: Tensor,
              y_em_proj: Tensor, surprise: Tensor, carry: Tensor,
@@ -174,8 +176,8 @@ class Layer(nn.Module, StateMixin):
         # memory-efficient scan; restore fp32 after for inter-span precision)
         h_all = parallel_affine_scan(a_eff, b, self.h.to(a_eff.dtype))  # [BS, P, D_h]
 
-        # Update state to last token, restore fp32 for inter-span precision
-        self.h = h_all[:, -1].float()
+        # Update state to last token, preserving configured runtime precision.
+        self.h = h_all[:, -1].to(self.h.dtype)
 
         # Batched output projection + residual + LayerNorm
         output = self.norm(self.drop_resid(self.W_o(h_all)) + x_all)

@@ -38,7 +38,7 @@ class MetricsCollector:
 
         # PM commit rate accumulators: {(block_idx, layer_idx): [count, total]}
         self._pm_commit_accum: dict[tuple, list] = {}
-        # EM write rate accumulators: {block_idx: [count, total, novelty_sum]}
+        # EM write rate accumulators: {block_idx: [count, novelty_sum, g_sum]}
         self._em_write_accum: dict[int, list] = {}
 
         self._file = open(output_path, "a")
@@ -107,31 +107,46 @@ class MetricsCollector:
         """
         key = (block_idx, layer_idx)
         if key not in self._pm_commit_accum:
-            self._pm_commit_accum[key] = [0.0, 0]
-        self._pm_commit_accum[key][0] += p_commit.float().mean().item()
+            self._pm_commit_accum[key] = [torch.zeros((), device=p_commit.device), 0]
+        self._pm_commit_accum[key][0] += p_commit.float().mean().detach()
         self._pm_commit_accum[key][1] += 1
 
     def record_em_write(self, block_idx: int,
-                        novelty_mean: float, g_em_mean: float):
+                        novelty_mean: Tensor | float, g_em_mean: Tensor | float):
         """Accumulate EM write stats across spans within a chunk."""
+        if torch.is_tensor(novelty_mean):
+            novelty = novelty_mean.detach()
+        else:
+            novelty = torch.tensor(float(novelty_mean))
+        if torch.is_tensor(g_em_mean):
+            g_em = g_em_mean.detach()
+        else:
+            g_em = torch.tensor(float(g_em_mean))
+
         if block_idx not in self._em_write_accum:
-            self._em_write_accum[block_idx] = [0.0, 0, 0.0]
+            self._em_write_accum[block_idx] = [0, novelty, g_em]
+        else:
+            nov_sum = self._em_write_accum[block_idx][1]
+            g_sum = self._em_write_accum[block_idx][2]
+            self._em_write_accum[block_idx][1] = nov_sum + novelty.to(nov_sum.device)
+            self._em_write_accum[block_idx][2] = g_sum + g_em.to(g_sum.device)
         self._em_write_accum[block_idx][0] += 1
-        self._em_write_accum[block_idx][1] += novelty_mean
-        self._em_write_accum[block_idx][2] += g_em_mean
 
     def _flush_rates(self, record: dict):
         """Flush accumulated commit/write rates into the record."""
         for (b, l), (total, count) in self._pm_commit_accum.items():
             if count > 0:
-                record[f"pm_commit_rate_b{b}_l{l}"] = total / count
+                val = total / count
+                record[f"pm_commit_rate_b{b}_l{l}"] = float(val.item()) if torch.is_tensor(val) else val
         self._pm_commit_accum.clear()
 
         for b, accum in self._em_write_accum.items():
             count, nov, g = accum[0], accum[1], accum[2]
             if count > 0:
-                record[f"em_novelty_mean_b{b}"] = nov / count
-                record[f"em_g_em_mean_b{b}"] = g / count
+                nov_val = nov / count
+                g_val = g / count
+                record[f"em_novelty_mean_b{b}"] = float(nov_val.item()) if torch.is_tensor(nov_val) else nov_val
+                record[f"em_g_em_mean_b{b}"] = float(g_val.item()) if torch.is_tensor(g_val) else g_val
         self._em_write_accum.clear()
 
     def _merge_gate_stats(self, record: dict, gate_stats: dict):

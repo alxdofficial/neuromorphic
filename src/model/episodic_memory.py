@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
-from .utils import StateMixin, unit_normalize, budget_enforce
+from .utils import StateMixin, unit_normalize, budget_enforce, runtime_state_dtype
 
 
 class EpisodicMemory(nn.Module, StateMixin):
@@ -87,9 +87,14 @@ class EpisodicMemory(nn.Module, StateMixin):
 
     def _lazy_init(self, BS: int, device: torch.device):
         """Initialize state on first forward pass."""
-        self.em_K = unit_normalize(torch.randn(BS, self.M, self.D_em, device=device))
-        self.em_V = torch.randn(BS, self.M, self.D_em, device=device) * 0.01
-        self.em_S = torch.zeros(BS, self.M, device=device)
+        state_dtype = runtime_state_dtype(device)
+        self.em_K = unit_normalize(
+            torch.randn(BS, self.M, self.D_em, device=device, dtype=state_dtype)
+        )
+        self.em_V = (
+            torch.randn(BS, self.M, self.D_em, device=device, dtype=state_dtype) * 0.01
+        )
+        self.em_S = torch.zeros(BS, self.M, device=device, dtype=state_dtype)
 
     def retrieve(self, x: Tensor, y_wm: Tensor) -> Tensor:
         """Query EM and return aggregated output.
@@ -359,6 +364,14 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         BS = g_em.shape[0]
         device = cand_score.device
+        state_dtype = self.em_K.dtype
+        cand_K = cand_K.to(state_dtype)
+        cand_V = cand_V.to(state_dtype)
+        cand_score = cand_score.to(state_dtype)
+        g_em = g_em.to(state_dtype)
+        tau = tau.to(state_dtype)
+        weakness_weight = weakness_weight.to(state_dtype)
+        decay = decay.to(state_dtype)
 
         if cand_valid is None:
             cand_valid = torch.ones_like(cand_score, dtype=torch.bool, device=device)
@@ -390,7 +403,7 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Apply write strength: [BS, C, M]
         score_ok = torch.isfinite(topC_scores)  # [BS, C]
-        alpha = w * g_em.unsqueeze(-1).unsqueeze(-1) * score_ok.float().unsqueeze(-1)
+        alpha = w * g_em.unsqueeze(-1).unsqueeze(-1) * score_ok.to(w.dtype).unsqueeze(-1)
 
         # Sum alpha across all candidates: [BS, M]
         alpha_raw_sum = alpha.sum(dim=1)  # [BS, M] — raw sum, possibly > 1
@@ -402,9 +415,8 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Each slot gets a blend of all C candidates weighted by their alpha.
         # Normalize with raw sum so weights sum to 1.0 (convex combination).
         alpha_norm = alpha / alpha_raw_sum.unsqueeze(1).clamp(min=1e-8)  # [BS, C, M]
-        # Compute blends in float32 for numerical safety (alpha_norm is already f32)
-        blended_K = torch.einsum("bcm, bcd -> bmd", alpha_norm, K_C.float())  # [BS, M, D_em]
-        blended_V = torch.einsum("bcm, bcd -> bmd", alpha_norm, V_C.float())  # [BS, M, D_em]
+        blended_K = torch.einsum("bcm, bcd -> bmd", alpha_norm, K_C)  # [BS, M, D_em]
+        blended_V = torch.einsum("bcm, bcd -> bmd", alpha_norm, V_C)  # [BS, M, D_em]
 
         # EMA update with combined alpha
         alpha_sum_3d = alpha_sum.unsqueeze(-1)  # [BS, M, 1]
@@ -531,16 +543,18 @@ class EMNeuromodulator(nn.Module):
 
     def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean, content_emb):
         """Fully differentiable learned mode."""
+        feat_dtype = self.backbone[0].weight.dtype
         scalar_features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)  # [BS, 3]
+        scalar_features = scalar_features.to(feat_dtype)
 
         if content_emb is not None:
-            content_features = self.content_proj(content_emb)  # [BS, content_proj_dim]
+            content_features = self.content_proj(content_emb.to(feat_dtype))  # [BS, content_proj_dim]
             features = torch.cat([scalar_features, content_features], dim=-1)
         else:
             features = torch.cat([
                 scalar_features,
                 torch.zeros(span_surprise.shape[0], self.content_proj.out_features,
-                            device=span_surprise.device)
+                            device=span_surprise.device, dtype=feat_dtype)
             ], dim=-1)
 
         h = self.backbone(features)

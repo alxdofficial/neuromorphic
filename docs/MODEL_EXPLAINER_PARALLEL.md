@@ -32,7 +32,7 @@ The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was design
 - GPU utilization was poor: each kernel operated on `[BS, D_h]` tensors (e.g. `[32, 384]` = 12K elements), far below the threshold for saturating GPU compute.
 - Training speed was ~250 tok/s on a 4090 for Tier A — viable for debugging, too slow for serious experiments.
 
-The parallel path batches P=64 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 64x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~40x throughput increase over the original sequential path (~10K tok/s on a 4090 for Tier A).
+The parallel path batches P=64 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 64x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~100x throughput increase over the original sequential path (~25K tok/s on a 4090 for Tier A Wide).
 
 **Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle.
 
@@ -126,7 +126,7 @@ return logits_all, x_emb_all, y_wm_all
 
 ## 4. Concrete Walkthrough: One Span, Token by Token
 
-Trace the full lifecycle of one span (P=64 tokens) on Tier A wide (D=768, B=2, L=8, D_h=384, D_wm=192, D_em=128, r=8, M=256, W=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
+Trace the full lifecycle of one span (P=64 tokens) on Tier A wide (D=768, B=2, L=8, D_h=384, D_wm=192, D_em=128, r=8, M=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
 
 ### 4.1 State entering this span
 
@@ -827,23 +827,21 @@ Everything not listed above is numerically identical between the two paths:
 
 ## 12. What Is NOT Supported / Compile Support
 
-The parallel path intentionally keeps top-level compilation scope narrow:
-
-1. `WorkingMemory.forward_span` is not compiled (data-dependent dispatch on mid-span resets).
-2. `Block.forward_span` / `NeuromorphicLM.forward_span` are not compiled at top level to avoid graph breaks from control flow.
-
 ### torch.compile Support
 
-`torch.compile(fullgraph=True)` is supported and tested for the two performance-critical paths:
+Block-level compilation is the current strategy: `block.forward_span` is compiled as a single graph per block, covering EM retrieval + L layers × (PM apply + gates + scan + FFN) + layer output stacking. This reduces compiled graphs from ~96 (individual functions) to 4 (one per block in Tier A Wide with B=2).
 
-- **`Layer.forward_span`**: Compiles the gate computation, affine scan, output projection, and FFN into fused CUDA kernels. The scan loop is unrolled by the compiler, and the backward pass replaces ~200K `SelectBackward0` autograd nodes with efficient fused backward kernels.
-- **`PM.update_eligibility_batch`**: Compiles the eligibility projections, surprise gating, and fused K+V affine scan.
+**Compiled:**
+- **`Block.forward_span`**: Compiles the entire block forward pass — EM retrieval, per-layer PM reads, gate computation, affine scans, output projections, and FFN — into fused CUDA kernels. The scan loops are unrolled by the compiler, and the backward pass replaces autograd nodes with efficient fused backward kernels.
+- **`PM._update_eligibility_core`**: Compiles the eligibility projections, surprise gating, and fused K+V affine scan with `fullgraph=True`.
 
-**Not compiled:**
-- **`WorkingMemory.forward_span`**: Contains a data-dependent dispatch (`reset_mask_all[:, 1:].any()`) that would cause graph breaks.
-- **`Block.forward_span`** / **`NeuromorphicLM.forward_span`**: Not compiled at the top level — compilation is applied at the Layer granularity to avoid graph breaks from WM and other control flow.
+**Not compiled at top level:**
+- **`NeuromorphicLM.forward_span`**: Not compiled at the model level — compilation is applied at the Block granularity.
+- **`WorkingMemory.forward_span`**: Contains data-dependent dispatch for mid-span resets. Runs outside block compilation scope.
 
-**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First step is slow (~30-60s) due to tracing; subsequent steps use cached compiled kernels. Provides ~2.8× speedup (measured: 3,687 → 10,278 tok/s on RTX 4090, Tier A, BS=32).
+**Pre-initialization requirement:** `model.initialize_states(BS, device)` must be called before `compile_for_training()` to pre-allocate all runtime state tensors (Layer.h, PM state, EM state, WM state). This eliminates lazy init guards from the forward path, preventing graph breaks during compilation.
+
+**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~25K tok/s on RTX 4090 (Tier A Wide, BS=32).
 
 ---
 

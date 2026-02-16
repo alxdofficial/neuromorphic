@@ -185,7 +185,10 @@ class TBPTTTrainer:
             span_count += 1
 
             # Update model surprise to span mean (frozen for next span's gates).
-            self.model.surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+            next_surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
+            if self.model.surprise is not None:
+                next_surprise = next_surprise.to(self.model.surprise.dtype)
+            self.model.surprise = next_surprise
 
             # Clear PM content + EM strengths for streams that had mid-span
             # doc-boundary resets (prevents cross-document retrieval leakage)
