@@ -47,6 +47,7 @@ class ColumnarAttention(nn.Module):
         super().__init__()
         self.L = L
         self.layer_emb = nn.Embedding(L, D_h)
+        self.register_buffer('_layer_ids', torch.arange(L))
         self.summary_query = nn.Parameter(torch.zeros(1, 1, D_h))
         nn.init.normal_(self.summary_query, std=0.02)
         self.drop = nn.Dropout(dropout)
@@ -75,10 +76,9 @@ class ColumnarAttention(nn.Module):
         Returns: [BS, D_h]
         """
         BS = layer_outputs.shape[0]
-        device = layer_outputs.device
 
         # Add layer-position embeddings
-        pos = self.layer_emb(torch.arange(self.L, device=device))  # [L, D_h]
+        pos = self.layer_emb(self._layer_ids)  # [L, D_h]
         kv = layer_outputs + pos.unsqueeze(0)  # [BS, L, D_h]
 
         # Iteratively refine the summary query
@@ -124,6 +124,8 @@ class ThalamicIntegrator(nn.Module):
         self.type_emb = nn.Embedding(4, d_dec)
         # Block position embeddings (for cortical tokens only)
         self.block_emb = nn.Embedding(B, d_dec)
+        self.register_buffer('_block_ids', torch.arange(B))
+        self.register_buffer('_type_ids', torch.arange(4))
 
         # Learned output queries
         self.output_queries = nn.Parameter(torch.zeros(1, K, d_dec))
@@ -159,16 +161,14 @@ class ThalamicIntegrator(nn.Module):
         Returns:  [BS, K, d_dec]  — integrated memory tokens
         """
         BS = cortical.shape[0]
-        device = cortical.device
 
         # Tag cortical tokens with type=0 + block position
-        block_ids = torch.arange(self.B, device=device)
-        cortical = cortical + self.type_emb(torch.zeros_like(block_ids)) + self.block_emb(block_ids)
+        cortical = cortical + self.type_emb(self._type_ids[0:1].expand(self.B)) + self.block_emb(self._block_ids)
 
         # Tag memory tokens with their type
-        pm_tok = pm.unsqueeze(1) + self.type_emb(torch.tensor(1, device=device))   # [BS, 1, d_dec]
-        em_tok = em.unsqueeze(1) + self.type_emb(torch.tensor(2, device=device))   # [BS, 1, d_dec]
-        wm_tok = wm.unsqueeze(1) + self.type_emb(torch.tensor(3, device=device))   # [BS, 1, d_dec]
+        pm_tok = pm.unsqueeze(1) + self.type_emb(self._type_ids[1:2])   # [BS, 1, d_dec]
+        em_tok = em.unsqueeze(1) + self.type_emb(self._type_ids[2:3])   # [BS, 1, d_dec]
+        wm_tok = wm.unsqueeze(1) + self.type_emb(self._type_ids[3:4])   # [BS, 1, d_dec]
 
         # Assemble all memory tokens
         memory = torch.cat([cortical, pm_tok, em_tok, wm_tok], dim=1)  # [BS, B+3, d_dec]
@@ -304,14 +304,14 @@ class SpatialDecoder(nn.Module):
 
     def forward(
         self,
-        block_layer_outputs: list[Tensor],
+        block_layer_outputs: Tensor,
         pm_summary: Tensor,
         em_summary: Tensor,
         wm_output: Tensor,
         h_final: Tensor,
     ) -> Tensor:
         """
-        block_layer_outputs: list of B tensors, each [BS, L, D_h]
+        block_layer_outputs: [BS, B, L, D_h] — stacked per-block layer outputs
         pm_summary:  [BS, D_h]  — strength-weighted PM readout (zeros if disabled)
         em_summary:  [BS, D_em] — strength-weighted EM readout (zeros if disabled)
         wm_output:   [BS, D]    — WM step output
@@ -322,7 +322,7 @@ class SpatialDecoder(nn.Module):
         # Level 1: Columnar summaries
         col_summaries = []
         for b, columnar in enumerate(self.columnar):
-            col_summaries.append(columnar(block_layer_outputs[b]))  # [BS, D_h]
+            col_summaries.append(columnar(block_layer_outputs[:, b]))  # [BS, D_h]
         col_stack = torch.stack(col_summaries, dim=1)  # [BS, B, D_h]
 
         # Project all inputs to d_dec

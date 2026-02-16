@@ -47,15 +47,18 @@ Cerebellum / basal ganglia — motor skills, cognitive procedures, learned assoc
 
 ### Core Mechanism: Neo-Hebbian Three-Factor Learning
 
-**Read (every token):** Linear key-value lookup weighted by slot strengths.
+**Read (every token):** Holographic modulation — input flows through stored patterns.
 ```
-y_pm = (pm_a * (pm_K @ x_q)) @ pm_V
+scores = normalize(x) @ pm_K^T
+y_pm = sum_i(pm_a_i * scores_i * x * pm_V_i)
 ```
+Mathematically: y_d = x_d * [W @ x]_d — quadratic in x. Each slot applies an
+input-dependent transformation rather than returning a fixed vector.
 
 **Eligibility traces (every token, differentiable):**
 ```
 k_cand = normalize(W_k_pre(x))          # pre-synaptic
-v_cand = W_v_post(h)                    # post-synaptic
+v_cand = W_v_post(x * h)               # Hebbian interaction (pre × post)
 gate = (surprise / 5.0).clamp(0, 1)     # third factor
 route_w = softmax(pm_K @ k_cand / tau)  # slot-specific routing
 elig_K = rho * elig_K + gate * route_w * k_cand

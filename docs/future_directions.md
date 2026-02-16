@@ -24,7 +24,7 @@ This aligns more closely with a *brain-like system* than with a prompt-centric l
 ### What This Architecture Is *Not* (Remaining Gaps)
 
 * It does not yet include intrinsic **consolidation** of experience into slow weights.
-* **Sequence-parallel pretraining** via scan is available and optimized with `torch.compile` (~25K tok/s on RTX 4090), but further optimization is possible (FLA library kernels, custom CUDA kernels, multi-GPU).
+* **Sequence-parallel pretraining** via scan is available and optimized with `torch.compile` (~26K tok/s on RTX 4090), but further optimization is possible (FLA library kernels, custom CUDA kernels, multi-GPU).
 
 ### What v2 Addresses (Previously Missing)
 
@@ -47,11 +47,11 @@ Gated Linear Attention (GLA) with recurrent state matrix:
 
 ### Procedural / Implicit Memory (PM) — Strong
 
-Low-rank adapters (K_pm/V_pm/a_pm) per layer per block (B×L instances):
+Holographic modulation slots (K_pm/V_pm/a_pm) per layer per block (B×L instances):
 
-* Persistent, abstract memory in representation space
-* Associative recall by similarity
-* Behavioral biasing rather than explicit recall
+* Persistent, abstract memory as input-dependent transformations
+* Holographic read: input flows through stored modulation patterns (quadratic in x)
+* Hebbian eligibility: stores input-output interaction (x * h), not just output
 * Each instance controlled by its own `PMNeuromodulator`
 
 Psychologically, this maps to:
@@ -87,7 +87,7 @@ This addresses the gap from v1.7: the model now has both *implicit* and *declara
 * ✅ Online learning without finetuning (PM + EM writes)
 * ✅ Memory as computation, not text retrieval
 * ✅ Stability via gated plasticity and budgets
-* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence + block-level torch.compile (~25K tok/s on 4090)
+* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence + block-level torch.compile (~26K tok/s on 4090)
 * ✅ **Exact copying and pointing** — WM Gated Linear Attention
 * ✅ **Episodic recall** — EM with top-k retrieval
 * ✅ **Cross-document persistence** — Phase C lifelong mode with soft reset
@@ -123,7 +123,7 @@ where:
 This enables:
 
 * Parallel training via prefix scans within plasticity spans
-* ~43% of Mamba's throughput at equivalent parameter count (~25K tok/s on 4090 with `--compile`)
+* ~45% of Mamba's throughput at equivalent parameter count (~26K tok/s on 4090 with `--compile`)
 * RNN-like inference behavior
 
 ### Plasticity Boundaries for Scan-Friendliness
@@ -161,7 +161,7 @@ This enables:
 | Memory | Type | Capacity | Controller |
 |--------|------|----------|------------|
 | Working Memory (WM) | Gated Linear Attention (GLA) | O(1) state matrix per head | None |
-| Procedural Memory (PM) | Low-rank adapters | r=8 × B×L | `PMNeuromodulator` per instance |
+| Procedural Memory (PM) | Holographic modulation slots | r=8 × B×L | `PMNeuromodulator` per instance |
 | Episodic Memory (EM) | Vector store | M=256 × B | `EMNeuromodulator` per instance |
 
 ---
@@ -221,11 +221,11 @@ Further improvements may include:
 The v1.7 roadmap proposed these upgrades. v2 status:
 
 1. ✅ **Scan-friendly recurrent core** — affine recurrence (h_t = a_t ⊙ h_{t-1} + b_t)
-2. ✅ **Procedural Memory (PM)** — low-rank adapters, B×L instances with `PMNeuromodulator`
+2. ✅ **Procedural Memory (PM)** — holographic modulation slots, B×L instances with `PMNeuromodulator`
 3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMNeuromodulator`
 4. ✅ **Working Memory (WM)** — Gated Linear Attention (GLA) recurrence
 5. ✅ **Lifelong learning (Phase C)** — soft reset at doc boundaries, PM/EM persist, eval framework
-6. ✅ **Training speed optimization** — block-level torch.compile + GLA WM + fused scans (~25K tok/s on 4090)
+6. ✅ **Training speed optimization** — block-level torch.compile + GLA WM + fused scans (~26K tok/s on 4090)
 7. ⏳ **Consolidation mechanism** — not yet implemented (future work)
 
 v2 remains fundamentally different from transformers:
@@ -243,7 +243,7 @@ v2 implements the key architectural recommendations from the v1.7 roadmap:
 * ✅ Episodic memory for declarative recall
 * ✅ Working memory for short-term precision
 * ✅ Lifelong learning with persistent cross-document memory (Phase C)
-* ✅ Training speed optimization (block-level torch.compile, GLA WM, ~25K tok/s)
+* ✅ Training speed optimization (block-level torch.compile, GLA WM, ~26K tok/s)
 * ⏳ Consolidation remains for future work
 
 The architecture remains fundamentally different from transformers:

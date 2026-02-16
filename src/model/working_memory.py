@@ -407,22 +407,22 @@ def _gla_recurrence(
         output: [BS, P, H, V]
         new_state: [BS, H, K, V]
     """
-    P = q.shape[1]
-    outputs = []
+    BS, P, H, V = v.shape
+    # Preallocate output tensor (avoids list + stack)
+    outputs = torch.empty(BS, P, H, V, dtype=q.dtype, device=q.device)
+    # Hoist exp outside the loop (one fused kernel instead of P separate ones)
+    decay_all = torch.exp(g)  # [BS, P, H, K]
     for t in range(P):
         # Mid-span doc boundary: zero state before this token
         if reset_mask is not None:
             keep = (~reset_mask[:, t]).to(state.dtype).view(-1, 1, 1, 1)  # [BS,1,1,1]
             state = state * keep
-        # decay: [BS, H, K] -> expand to [BS, H, K, 1] for broadcast
-        decay = torch.exp(g[:, t])                          # [BS, H, K]
         # state update: S_t = diag(decay) @ S_{t-1} + k_t^T @ v_t
-        state = state * decay.unsqueeze(-1) + \
+        state = state * decay_all[:, t].unsqueeze(-1) + \
             k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)   # [BS, H, K, V]
         # output: o_t = q_t @ S_t
-        o_t = torch.einsum("bhk, bhkv -> bhv", q[:, t], state)
-        outputs.append(o_t)
-    return torch.stack(outputs, dim=1), state  # [BS, P, H, V], [BS, H, K, V]
+        outputs[:, t] = torch.matmul(q[:, t].unsqueeze(-2), state).squeeze(-2)
+    return outputs, state  # [BS, P, H, V], [BS, H, K, V]
 
 
 class GLAWorkingMemory(nn.Module, StateMixin):
@@ -527,7 +527,7 @@ class GLAWorkingMemory(nn.Module, StateMixin):
         decay = torch.exp(g)                                # [BS, H, K]
         self.gla_state = self.gla_state * decay.unsqueeze(-1) + \
             k.unsqueeze(-1) * v.unsqueeze(-2)               # [BS, H, K, V]
-        out = torch.einsum("bhk, bhkv -> bhv", q, self.gla_state)  # [BS, H, V]
+        out = torch.matmul(q.unsqueeze(-2), self.gla_state).squeeze(-2)  # [BS, H, V]
 
         # Merge heads and project
         out = out.reshape(BS, self.D_wm)

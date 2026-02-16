@@ -1,14 +1,33 @@
 """
-Procedural Memory — fast low-rank weights with eligibility traces.
+Procedural Memory — holographic modulation with eligibility traces.
 
 One PM instance per (block, layer). B*L total instances.
 
+Read mechanism (holographic):
+    Each slot stores a (key, value, strength) triple. Rather than retrieving
+    values directly, the input flows *through* the stored modulation patterns:
+
+        scores = normalize(x) @ K^T                  # [BS, r]
+        y = sum_i(a_i * score_i * x * v_i)           # [BS, D_h]
+
+    Mathematically: y_d = x_d * [W @ x]_d where W = K^T diag(a) V.
+    This is quadratic in x — the effective transformation is input-dependent,
+    giving each slot the expressiveness of a learned transformation rather
+    than a fixed vector retrieval. Analogous to dendritic computation: the
+    stored pattern (v) modulates the incoming signal (x) per-dimension.
+
+Eligibility (Hebbian):
+    v_cand = W_v_post(x * h) — stores the input-output *interaction*,
+    not just the output. The element-wise product x * h captures which
+    dimensions co-activated between pre-synaptic input and post-synaptic
+    output, naturally pairing with the holographic read.
+
 State per stream:
     pm_K: [BS, r, D_h]     — key bank (unit-normalized)
-    pm_V: [BS, r, D_h]     — value bank (unit-normalized)
+    pm_V: [BS, r, D_h]     — value bank (unit-normalized modulation patterns)
     pm_a: [BS, r]           — slot strengths (bounded)
     elig_K: [BS, r, D_h]   — eligibility trace for keys
-    elig_V: [BS, r, D_h]   — eligibility trace for values
+    elig_V: [BS, r, D_h]   — eligibility trace for values (interaction patterns)
 
 pm_K, pm_V, pm_a are plain tensors (NOT parameters). They are updated at
 span boundaries and may carry computation graphs within a TBPTT chunk so
@@ -78,7 +97,9 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.elig_V = torch.zeros(BS, self.r, self.D_h, device=device, dtype=state_dtype)
 
     def apply(self, x_block: Tensor) -> Tensor:
-        """Read-only PM lookup.
+        """Holographic PM read: input modulated by stored patterns.
+
+        y_d = x_d * sum_i(a_i * (x · k_i) * v_{id}) — quadratic in x.
 
         Args:
             x_block: [BS, D_h] — block input
@@ -91,9 +112,10 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         x_q = unit_normalize(x_block)          # [BS, D_h]
         # scores = pm_K @ x_q -> [BS, r]
-        scores = torch.einsum("brd, bd -> br", self.pm_K, x_q)
-        # y_pm = (pm_a * scores) @ pm_V -> [BS, D_h]
-        y_pm = torch.einsum("br, brd -> bd", self.pm_a * scores, self.pm_V)
+        scores = torch.matmul(x_q.unsqueeze(1), self.pm_K.transpose(-1, -2)).squeeze(1)
+        # Holographic read: input flows through stored modulation patterns
+        weighted = (self.pm_a * scores).unsqueeze(-1)           # [BS, r, 1]
+        y_pm = (weighted * x_q.unsqueeze(1) * self.pm_V).sum(1)  # [BS, D_h]
 
         # Post-readout processing
         if self.readout_ffn is not None:
@@ -102,14 +124,15 @@ class ProceduralMemory(nn.Module, StateMixin):
         return y_pm
 
     def _apply_batch_core(self, x_block_all: Tensor) -> Tensor:
-        """Compiled inner loop for apply_batch. No lazy init.
+        """Compiled holographic PM read for P tokens. No lazy init.
 
         Safe for torch.compile(fullgraph=True).
         """
-        x_q = unit_normalize(x_block_all)                             # [BS, P, D_h]
-        scores = torch.einsum("brd, bpd -> bpr", self.pm_K, x_q)     # [BS, P, r]
-        weighted = self.pm_a.unsqueeze(1) * scores                    # [BS, P, r]
-        y_pm = torch.einsum("bpr, brd -> bpd", weighted, self.pm_V)  # [BS, P, D_h]
+        x_q = unit_normalize(x_block_all)                                        # [BS, P, D_h]
+        scores = torch.matmul(x_q, self.pm_K.transpose(-1, -2))                  # [BS, P, r]
+        # Holographic read: input flows through stored modulation patterns
+        weighted = (self.pm_a.unsqueeze(1) * scores).unsqueeze(-1)               # [BS, P, r, 1]
+        y_pm = (weighted * x_q.unsqueeze(2) * self.pm_V.unsqueeze(1)).sum(2)     # [BS, P, D_h]
 
         if self.readout_ffn is not None:
             y_pm = y_pm + self.readout_ffn(self.readout_norm(y_pm))
@@ -133,6 +156,10 @@ class ProceduralMemory(nn.Module, StateMixin):
     def update_eligibility(self, x: Tensor, h: Tensor, surprise: Tensor):
         """Differentiable per-token eligibility accumulation.
 
+        Uses Hebbian interaction: v_cand = W_v_post(x * h), capturing the
+        per-dimension correlation between pre- and post-synaptic signals.
+        This pairs with the holographic read where V modulates the input.
+
         Eligibility is gated by surprise: only tokens the model doesn't
         predict well contribute to the trace. This prevents the trace norm
         from saturating (which would make the commit gate always fire).
@@ -146,14 +173,14 @@ class ProceduralMemory(nn.Module, StateMixin):
             self._lazy_init(x.shape[0], x.device)
 
         k_cand = unit_normalize(self.W_k_pre(x))   # [BS, D_h]
-        v_cand = self.W_v_post(h)                   # [BS, D_h]
+        v_cand = self.W_v_post(x * h)               # [BS, D_h] — Hebbian interaction
 
         # Gate by surprise: low surprise → near-zero accumulation
         gate = (surprise.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS]
         gate = gate.unsqueeze(1).unsqueeze(2)                  # [BS, 1, 1]
 
         # Slot-specific routing: weight candidate contribution per slot
-        route_logits = torch.einsum("brd, bd -> br", self.pm_K, k_cand) / self.config.tau_route_pm
+        route_logits = torch.matmul(k_cand.unsqueeze(1), self.pm_K.transpose(-1, -2)).squeeze(1) / self.config.tau_route_pm
         route_w = torch.softmax(route_logits, dim=-1).unsqueeze(-1)  # [BS, r, 1]
 
         # Accumulate with per-slot routing weights
@@ -173,14 +200,14 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         # Batched projections (the expensive part — 2 matmuls instead of 2*P)
         k_cand_all = unit_normalize(self.W_k_pre(x_all))  # [BS, P, D_h]
-        v_cand_all = self.W_v_post(h_all)                  # [BS, P, D_h]
+        v_cand_all = self.W_v_post(x_all * h_all)          # [BS, P, D_h] — Hebbian interaction
 
         # Surprise gating: [BS, P] → [BS, P, 1, 1] for broadcast over [r, D_h]
         gate = (surprise_all.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS, P]
         gate = gate.unsqueeze(-1).unsqueeze(-1)                    # [BS, P, 1, 1]
 
         # Slot-specific routing: weight candidate contribution per slot
-        route_logits = torch.einsum("brd, bpd -> bpr", self.pm_K, k_cand_all) / self.config.tau_route_pm
+        route_logits = torch.matmul(k_cand_all, self.pm_K.transpose(-1, -2)) / self.config.tau_route_pm
         route_w = torch.softmax(route_logits, dim=-1)  # [BS, P, r]
 
         # b terms: gate * route_w * cand → [BS, P, r, D_h]
@@ -289,7 +316,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         elig_mag = (elig_norm / (elig_norm + 1.0)).detach()  # [BS] smooth 0→1 gate
 
         # Slot selection: similarity between current keys and eligibility
-        scores = torch.einsum("brd, brd -> br", self.pm_K, elig_K_norm)  # [BS, r]
+        scores = (self.pm_K * elig_K_norm).sum(-1)  # [BS, r]
 
         # Weakness bias: prefer overwriting weak slots
         scores = scores - self.weakness_weight * self.pm_a

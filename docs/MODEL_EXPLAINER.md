@@ -265,7 +265,7 @@ The recurrence mixes temporal information across time steps; the FFN adds per-po
 
 **File:** `src/model/procedural_memory.py`
 
-**Intuition:** PM is the model's "skill memory." It stores low-rank key-value pairs that represent learned associations -- like a lookup table of patterns the model has encountered. When the model sees input that matches a stored key, PM retrieves the corresponding value and injects it into the processing pipeline. Unlike slow weights (parameters), PM can be updated *during inference* via neuromodulated commits at span boundaries.
+**Intuition:** PM is the model's "skill memory." It stores holographic modulation slots -- each slot is a (key, modulation pattern, strength) triple that applies an input-dependent transformation when matched. Rather than retrieving a fixed value, the input flows *through* the stored pattern: `y_d = x_d * sum_i(a_i * (x · k_i) * v_{i,d})`. This is quadratic in x, analogous to dendritic computation where synaptic patterns modulate incoming signals per-dimension. Unlike slow weights (parameters), PM can be updated *during inference* via neuromodulated commits at span boundaries.
 
 **Instance count:** One PM per (block, layer) pair. B*L = 16 instances total (tier_a_wide). Each operates independently on its own `[BS, D_h]` slice.
 
@@ -276,29 +276,32 @@ Per PM instance, per stream:
 | Tensor | Shape | Description |
 |--------|-------|-------------|
 | `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized). What patterns to match. |
-| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized). What to retrieve when matched. |
+| `pm_V` | `[BS, r, D_h]` | Modulation patterns (unit-normalized). How to transform inputs when matched. |
 | `pm_a` | `[BS, r]` | Slot strengths. How "confident" each slot is. Range [0, a_max]. |
 | `elig_K` | `[BS, r, D_h]` | Key eligibility trace. Accumulates proposed key candidates over time. |
-| `elig_V` | `[BS, r, D_h]` | Value eligibility trace. Accumulates proposed value candidates over time. |
+| `elig_V` | `[BS, r, D_h]` | Value eligibility trace. Accumulates Hebbian interaction patterns (x * h) over time. |
 
 `r=8` slots per instance. Total PM state: B*L*r = 128 slot-pairs.
 
-### 7.2 PM Read (every token)
+### 7.2 PM Read — Holographic Modulation (every token)
 
 ```python
-x_q = normalize(x_block)                    # [BS, D_h]
-scores = einsum("brd, bd -> br", pm_K, x_q) # [BS, r]
-y_pm = einsum("br, brd -> bd", pm_a * scores, pm_V)  # [BS, D_h]
+x_q = normalize(x_block)                                    # [BS, D_h]
+scores = matmul(x_q.unsqueeze(1), pm_K.transpose(-1, -2)).squeeze(1)  # [BS, r]
+weighted = (pm_a * scores).unsqueeze(-1)                     # [BS, r, 1]
+y_pm = (weighted * x_q.unsqueeze(1) * pm_V).sum(1)          # [BS, D_h]
 ```
 
-**Intuition:** The input is compared against all r stored keys. Each key that matches well contributes its value, weighted by both the match score and the slot strength `pm_a`. Slots with `pm_a=0` contribute nothing (invisible).
+**Mathematically:** `y_d = x_d * sum_i(a_i * (x · k_i) * v_{i,d})` — this is **quadratic** in x. Each slot's value `v_i` acts as a per-dimension modulation pattern on the input rather than a fixed vector to retrieve. The effective transformation is input-dependent: `y = x * (W @ x)` where `W = K^T diag(a) V`.
 
-**Post-readout FFN (optional):** After the linear lookup, the result can optionally pass through a pre-norm residual FFN:
+**Intuition:** The input doesn't just *select* stored knowledge — it *flows through* the stored patterns. Where `x` and `v_i` co-activate, the signal passes; where they don't, it's suppressed. This is analogous to dendritic computation in biological neurons, where synaptic patterns modulate incoming signals per-dimension before integration. Slots with `pm_a=0` contribute nothing (invisible at initialization).
+
+**Post-readout FFN (optional):** After the holographic read, the result can optionally pass through a pre-norm residual FFN:
 ```python
 y_pm = y_raw + readout_ffn(readout_norm(y_raw))
 # readout_ffn: Linear(D_h, D_h*4) → GELU → Linear(D_h*4, D_h)
 ```
-This adds nonlinear processing to the linear key-value lookup, allowing the model to transform retrieved procedural knowledge before injecting it into the recurrence. Controlled by `pm_readout_ffn` (default `False` in tier_a_wide). The readout FFN is disabled in the current default config because the per-layer FFN (see section 6) already provides nonlinear processing after PM info is integrated into the recurrence, making the dedicated readout FFN redundant.
+This adds further nonlinear processing on top of the already-quadratic holographic read. Controlled by `pm_readout_ffn` (default `False` in tier_a_wide).
 
 This is a read-only operation. PM keys and values are frozen within each plasticity span.
 
@@ -306,13 +309,13 @@ This is a read-only operation. PM keys and values are frozen within each plastic
 
 ```python
 k_cand = normalize(W_k_pre(x))    # [BS, D_h] -- from pre-synaptic (input)
-v_cand = W_v_post(h)               # [BS, D_h] -- from post-synaptic (output)
+v_cand = W_v_post(x * h)          # [BS, D_h] -- Hebbian interaction (pre × post)
 
 # Gate by surprise: low surprise → near-zero accumulation
 gate = (surprise / 5.0).clamp(0, 1)  # [BS, 1] → [BS, 1, 1]
 
 # Slot-specific routing: weight candidate contribution per slot
-route_logits = einsum("brd, bd -> br", pm_K, k_cand) / tau_route_pm
+route_logits = matmul(k_cand.unsqueeze(1), pm_K.transpose(-1, -2)).squeeze(1) / tau_route_pm
 route_w = softmax(route_logits, dim=-1)  # [BS, r] — slot affinity
 elig_K = rho * elig_K + gate * route_w.unsqueeze(-1) * k_cand.unsqueeze(1)
 elig_V = rho * elig_V + gate * route_w.unsqueeze(-1) * v_cand.unsqueeze(1)
@@ -320,13 +323,15 @@ elig_V = rho * elig_V + gate * route_w.unsqueeze(-1) * v_cand.unsqueeze(1)
 
 **Intuition:** Eligibility traces are a running average of "what the model wanted to write," gated by surprise. Only tokens the model predicted poorly contribute significantly to the trace -- this prevents the trace norm from saturating (which would make the commit gate always fire). The projections `W_k_pre` and `W_v_post` are learned parameters -- gradients from the LM loss flow back through them, teaching the model *what* constitutes a good key-value pair to store. But the *decision* of whether to actually commit these traces into PM is made by the neuromodulator at span boundaries.
 
+**Hebbian value candidates:** `v_cand = W_v_post(x * h)` uses the element-wise product of the pre-synaptic input `x` and post-synaptic output `h` -- the per-dimension correlation between what came in and what came out. This naturally pairs with the holographic read: since PM values act as modulation patterns on future inputs, the eligibility trace stores the input-output *relationship* (how the input should be transformed) rather than just the output (what to retrieve). Each dimension of `x * h` captures "when input_d was active and output_d was active, the transformation at dimension d was useful."
+
 **Slot-specific routing** (`tau_route_pm`, default 1.0): Rather than broadcasting the same candidate uniformly to all r slots, each slot receives a weighted contribution based on its affinity to the candidate. Route weights are `softmax(pm_K · k_cand / tau_route_pm)` -- slots whose existing content is similar to the candidate receive more of the update. When `pm_K` is all zeros (fresh init), routing is uniform (1/r), mathematically equivalent to the old broadcast scaled by 1/r. Slots differentiate as they accumulate distinct content.
 
 `rho=0.95` is the eligibility decay -- recent tokens contribute more than older ones. This creates a recency-weighted, surprise-gated summary of the span's proposed writes.
 
 **Key insight:** Eligibility is **differentiable** (no `torch.no_grad()`). The projections `W_k_pre` and `W_v_post` are `nn.Linear` layers trained by backprop. The model learns what to propose; the neuromodulator learns when to commit.
 
-**Relationship to Hebbian learning:** This follows the **neo-Hebbian three-factor learning rule** from neuroscience. Classical Hebbian learning ("fire together, wire together") updates synapses based on the correlation between pre-synaptic input and post-synaptic output: `ΔW ∝ post ⊗ pre`. Our eligibility traces accumulate exactly this -- `k_cand` from the pre-synaptic signal (layer input `x`) and `v_cand` from the post-synaptic signal (layer output `h`). Their implicit outer product `v_cand ⊗ k_cand` is the Hebbian update that *would* be applied.
+**Relationship to Hebbian learning:** This follows the **neo-Hebbian three-factor learning rule** from neuroscience. Classical Hebbian learning ("fire together, wire together") updates synapses based on the correlation between pre-synaptic input and post-synaptic output: `ΔW ∝ post ⊗ pre`. Our eligibility traces directly encode this Hebbian signal -- `k_cand` from the pre-synaptic signal (layer input `x`) and `v_cand` from the element-wise interaction `x * h` (the per-dimension correlation). The holographic read then applies these stored interaction patterns as input-dependent transformations.
 
 The critical difference from pure Hebbian learning is the **third factor: the neuromodulator**. Rather than applying `post ⊗ pre` immediately at every token (which causes catastrophic drift), the eligibility trace buffers the proposed update with exponential decay, and the neuromodulator decides at span boundaries whether to commit it. This three-factor rule -- `ΔW ∝ post × pre × neuromodulator` -- is how biological synapses are believed to work: local activity creates eligibility for change, but a global modulatory signal (dopamine, norepinephrine) determines whether that change is consolidated.
 
@@ -390,7 +395,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 | Component | Location | Shape (Tier A) | What It Controls | Training | Phase | Parallelization | Lifelong Role |
 |-----------|----------|----------------|------------------|----------|-------|-----------------|---------------|
 | `W_k_pre` | `PM.W_k_pre` | `Linear(D_h, D_h)` per instance | Projects layer **input** into candidate keys — decides *what patterns to match* | Backprop (main opt) | A+ | Per-token in `update_eligibility_batch`; parallelized in `forward_span` | Learns general pattern-recognition; persists across docs |
-| `W_v_post` | `PM.W_v_post` | `Linear(D_h, D_h)` per instance | Projects layer **output** into candidate values — decides *what to retrieve when matched* | Backprop (main opt) | A+ | Per-token in `update_eligibility_batch`; parallelized in `forward_span` | Learns general value-encoding; persists across docs |
+| `W_v_post` | `PM.W_v_post` | `Linear(D_h, D_h)` per instance | Projects Hebbian interaction `x * h` into candidate modulation patterns — decides *what input-dependent transformation to store* | Backprop (main opt) | A+ | Per-token in `update_eligibility_batch`; parallelized in `forward_span` | Learns general transformation-encoding; persists across docs |
 | `readout_norm` | `PM.readout_norm` | `LayerNorm(D_h)` | Normalizes raw PM read output before FFN | Backprop (main opt) | A+ | Per-token in `apply`/`apply_batch` | Static after convergence |
 | `readout_ffn` | `PM.readout_ffn` | `Linear(D_h, 4*D_h)` + `Linear(4*D_h, D_h)` | Nonlinear transform of retrieved PM content before injection into recurrence | Backprop (main opt) | A+ | Per-token in `apply`/`apply_batch` | Static after convergence |
 | `gate_a, gate_b` | `Layer.gate_a/b` | `Linear(4*D_h+1, D_h)` | Retention/update gates consuming PM read output (among other signals) | Backprop (main opt) | A+ | Per-token, parallelized via scan | Static after convergence |
@@ -407,7 +412,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 | State | Shape | What It Stores | Update Rule | When Updated | Lifelong Behavior |
 |-------|-------|----------------|-------------|--------------|-------------------|
 | `pm_K` | `[BS, r, D_h]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `pm_K = normalize((1-α)*pm_K + α*elig_K)` where α = `weights * g * p_commit * elig_mag` | Span boundary (commit) | Persists in Phase C; accumulates cross-doc knowledge |
-| `pm_V` | `[BS, r, D_h]` | Value bank (unit-normalized) — *what to retrieve when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase C |
+| `pm_V` | `[BS, r, D_h]` | Modulation patterns (unit-normalized) — *how to transform inputs when matched* | Same EMA as pm_K but with elig_V | Span boundary (commit) | Persists in Phase C |
 | `pm_a` | `[BS, r]` | Slot strengths [0, a_max] — *how confident each slot is* | `pm_a += α * score`, then base_decay (`*= decay_pm`), then budget_enforce | Span boundary | Persists in Phase C; base_decay prevents runaway |
 | `elig_K` | `[BS, r, D_h]` | Key eligibility trace — *running average of what to write* | `elig_K = ρ * elig_K + gate * k_cand` where gate = `(surprise/5).clamp(0,1)` | Every token | Reset on doc boundary (Phase C: reset_eligibility) |
 | `elig_V` | `[BS, r, D_h]` | Value eligibility trace | Same as elig_K with v_cand | Every token | Reset on doc boundary |
@@ -1229,10 +1234,10 @@ Throughput depends on batch size, span length (P=64), which phases are active, a
 | Phase | Components | Measured tok/s | Notes |
 |-------|-----------|-----------|------------|
 | **A** | WM + PM | ~30,000 | Block-level compile + GLA WM |
-| **B** | WM + PM + EM | ~25,000 | + EM retrieval/write overhead |
-| **C** | Lifelong | ~25,000 | Similar to B |
+| **B** | WM + PM + EM | ~26,400 | + EM retrieval/write overhead |
+| **C** | Lifelong | ~26,400 | Similar to B |
 
-Compilation warmup takes ~5.7 minutes (first 2 steps). Subsequent steps run at steady-state throughput. Speed improvement from earlier versions: sync removal (8.6K→12K), then block-level compile + GLA WM (12K→25K).
+Compilation warmup takes ~5.7 minutes (first 2 steps). Subsequent steps run at steady-state throughput. Speed improvement from earlier versions: sync removal (8.6K→12K), block-level compile + GLA WM (12K→25K), decoder compilation + micro-optimizations (25K→26.4K).
 
 **Tier B (~103M) on A100 80GB, BS=32 (estimated):**
 
@@ -1245,7 +1250,7 @@ Compilation warmup takes ~5.7 minutes (first 2 steps). Subsequent steps run at s
 
 How long to train on N tokens, given measured throughput with `--compile`:
 
-**Tier A Wide on 1x RTX 4090 (weighted average ~25,000 tok/s, compiled):**
+**Tier A Wide on 1x RTX 4090 (weighted average ~26,000 tok/s, compiled):**
 
 | Tokens | Hours | Days | Cost @ $0.34/hr |
 |--------|-------|------|-----------------|

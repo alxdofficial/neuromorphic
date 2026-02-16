@@ -479,7 +479,7 @@ class TestDecoderAssemblyInvariants:
         D_em = cfg.D_em
         D = cfg.D
 
-        block_layer_outputs = [torch.randn(BS, L, D_h) for _ in range(B)]
+        block_layer_outputs = torch.randn(BS, B, L, D_h)
         pm_summary = torch.randn(BS, D_h)
         em_summary = torch.randn(BS, D_em)
         wm_output = torch.randn(BS, D)

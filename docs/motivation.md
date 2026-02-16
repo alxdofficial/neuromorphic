@@ -72,9 +72,9 @@ Instead of relying on unbounded attention over long token histories, the model m
 - Short-term precision: copies, bindings, recent tokens.
 - Fixed-size recurrent state per head, no post-training evolution.
 
-3) **Procedural memory (PM)** — fast low-rank weights
+3) **Procedural memory (PM)** — holographic modulation slots
 - Updates while the model runs via neuromodulated commits.
-- Encodes behavioral patterns, skills, habits.
+- Encodes behavioral patterns, skills, habits as input-dependent transformations.
 - B×L instances (one per layer per block), each with its own controller.
 
 4) **Episodic memory (EM)** — vector store
@@ -115,10 +115,11 @@ This is crucial because naïvely updating memory every token causes drift and in
 
 ---
 
-## Why the plastic memories are low-rank / item-based (efficiency + hardware story)
+## Why the plastic memories are slot-based / item-based (efficiency + hardware story)
 
-**Procedural Memory (PM)** uses low-rank slots (r=8 per instance):
-- each slot has a key vector, value vector, and strength scalar.
+**Procedural Memory (PM)** uses holographic modulation slots (r=8 per instance):
+- each slot has a key vector, modulation pattern (value), and strength scalar.
+- the input flows through stored patterns (quadratic: y = x * (W @ x)), not linear retrieval.
 - yields **O(r·D_h)** compute per token.
 - clear capacity limits (only r slots per layer per block).
 

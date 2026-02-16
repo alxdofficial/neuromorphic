@@ -53,7 +53,7 @@ v2 decomposes memory into four parts:
 
 1) **Genetic memory (slow weights):** normal parameters trained by backprop. Frozen at deployment.
 2) **Working Memory (WM):** bounded sliding-window attention over the last `W` tokens (precise copying / binding). No post-training evolution. **One WM shared across the model.**
-3) **Procedural Memory (PM):** fast low-rank weights (`pm_K/pm_V/pm_a`) + differentiable eligibility. Updated via neuromodulated commits. **One PM per layer per block = B × L instances**, each with its own `PMNeuromodulator`.
+3) **Procedural Memory (PM):** holographic modulation slots (`pm_K/pm_V/pm_a`) + Hebbian eligibility. Updated via neuromodulated commits. **One PM per layer per block = B × L instances**, each with its own `PMNeuromodulator`.
 4) **Episodic Memory (EM):** fixed-size per-stream vector store (`em_K/em_V/em_S`). Retrieves **latent vectors** (not tokens). Written via neuromodulation. **One EM per block = B instances**, each with its own `EMNeuromodulator`.
 
 ### 1.3 Memory Ownership Summary
@@ -271,32 +271,32 @@ For each candidate `c` (C is small, e.g. 8), do:
 
 ---
 
-### 4.4 Procedural Memory (PM) — fast low-rank weights + eligibility
-PM is essentially v1.7 fast memory, with one additional constraint: **K/V/a are frozen within a span** and updated only at span boundaries.
+### 4.4 Procedural Memory (PM) — holographic modulation + Hebbian eligibility
+PM stores input-dependent transformations as (key, modulation pattern, strength) triples. **K/V/a are frozen within a span** and updated only at span boundaries.
 
 #### 4.4.1 PM State (per layer per block)
 Per block b and layer ℓ (B × L instances total):
-- `pm_K: [BS, r, D_h]` (unit-normalized)
-- `pm_V: [BS, r, D_h]` (unit-normalized)
+- `pm_K: [BS, r, D_h]` (unit-normalized keys)
+- `pm_V: [BS, r, D_h]` (unit-normalized modulation patterns)
 - `pm_a: [BS, r]` (bounded strengths, gradient-free)
 - `elig_K: [BS, r, D_h]` (differentiable within TBPTT)
-- `elig_V: [BS, r, D_h]` (differentiable within TBPTT)
+- `elig_V: [BS, r, D_h]` (differentiable within TBPTT — Hebbian interaction patterns)
 - `h: [BS, D_h]` (core recurrent state)
 
-#### 4.4.2 PM Apply (read-only within span)
-Same as v1.7 linear lookup, followed by a post-readout FFN:
+#### 4.4.2 PM Apply — Holographic Read (read-only within span)
+The input flows through stored modulation patterns (quadratic in x):
 - `x_q = normalize(x_block)` → `[BS, D_h]`
 - `scores = pm_K @ x_q` → `[BS, r]`
-- `y_raw = (pm_a * scores) @ pm_V` → `[BS, D_h]`
-- `y_pm = y_raw + FFN(LayerNorm(y_raw))` → `[BS, D_h]` (pre-norm residual, GELU, 4× expansion)
+- `y_raw = sum_i(pm_a_i * scores_i * x_q * pm_V_i)` → `[BS, D_h]`
+- `y_pm = y_raw + FFN(LayerNorm(y_raw))` → `[BS, D_h]` (optional post-readout FFN)
 
-The readout FFN adds nonlinear processing capacity to the linear key-value lookup, allowing the model to transform retrieved procedural knowledge before injecting it into the recurrence. Controlled by `pm_readout_ffn` (default `True`).
+Mathematically: `y_d = x_d * [W @ x]_d` where `W = K^T diag(a) V`. Each slot's modulation pattern v_i gates the input per-dimension rather than returning a fixed vector. Controlled by `pm_readout_ffn` (default `True`).
 
 #### 4.4.3 Eligibility Update (differentiable, neo-Hebbian)
 Follows the **neo-Hebbian three-factor learning rule**: `ΔW ∝ pre × post × neuromodulator`.
 
 - `k_cand = normalize(W_k_pre(x))` — pre-synaptic (input-side)
-- `v_cand = W_v_post(h)` — post-synaptic (state-side)
+- `v_cand = W_v_post(x * h)` — Hebbian interaction (pre × post per-dimension)
 - `elig_K = ρ * elig_K + k_cand` (differentiable)
 - `elig_V = ρ * elig_V + v_cand` (differentiable)
 - candidates computed with gradients through projection layers

@@ -32,7 +32,7 @@ The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was design
 - GPU utilization was poor: each kernel operated on `[BS, D_h]` tensors (e.g. `[32, 384]` = 12K elements), far below the threshold for saturating GPU compute.
 - Training speed was ~250 tok/s on a 4090 for Tier A — viable for debugging, too slow for serious experiments.
 
-The parallel path batches P=64 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 64x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~100x throughput increase over the original sequential path (~25K tok/s on a 4090 for Tier A Wide).
+The parallel path batches P=64 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 64x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~100x throughput increase over the original sequential path (~26K tok/s on a 4090 for Tier A Wide).
 
 **Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle.
 
@@ -285,7 +285,7 @@ For each block b=0..1, each layer l=0..7:
 
   # Batched projections (2 matmuls instead of 128)
   k_cand_all = normalize(W_k_pre(x_in))                                # [32, 64, 384]
-  v_cand_all = W_v_post(h_out)                                         # [32, 64, 384]
+  v_cand_all = W_v_post(x_in * h_out)                                   # [32, 64, 384] — Hebbian interaction
 
   # Surprise gating + carry mask for resets
   gate = (token_surprise / 5.0).clamp(0, 1)                            # [32, 64, 1, 1]
@@ -389,17 +389,19 @@ With `torch.compile` (§12), the scan loops, gate computations, and elementwise 
 
 **File:** `src/model/procedural_memory.py` — `apply_batch()`
 
-**Sequential** (`apply()`): `[BS, D_h]` input → scores against `pm_K` → weighted sum from `pm_V` → `[BS, D_h]`
+**Sequential** (`apply()`): `[BS, D_h]` input → scores against `pm_K` → holographic modulation (input × values) → `[BS, D_h]`
 
-**Parallel** (`apply_batch()`): Same math, batched over P:
+**Parallel** (`apply_batch()`): Same holographic read, batched over P:
 ```python
-x_q = unit_normalize(x_block_all)                             # [BS, P, D_h]
-scores = torch.einsum("brd, bpd -> bpr", self.pm_K, x_q)     # [BS, P, r]
-weighted = self.pm_a.unsqueeze(1) * scores                    # [BS, P, r]
-y_pm = torch.einsum("bpr, brd -> bpd", weighted, self.pm_V)  # [BS, P, D_h]
+x_q = unit_normalize(x_block_all)                                        # [BS, P, D_h]
+scores = torch.matmul(x_q, self.pm_K.transpose(-1, -2))                  # [BS, P, r]
+weighted = (self.pm_a.unsqueeze(1) * scores).unsqueeze(-1)               # [BS, P, r, 1]
+y_pm = (weighted * x_q.unsqueeze(2) * self.pm_V.unsqueeze(1)).sum(2)     # [BS, P, D_h]
 ```
 
-**Difference:** None — PM state (`pm_K`, `pm_V`, `pm_a`) is frozen within a span in both paths. The einsum handles the extra P dimension natively.
+The input flows through stored modulation patterns: `y_d = x_d * sum_i(a_i * score_i * v_{i,d})`. This is quadratic in x — each slot applies an input-dependent transformation rather than returning a fixed vector.
+
+**Difference:** None — PM state (`pm_K`, `pm_V`, `pm_a`) is frozen within a span in both paths.
 
 ### 5.4 Episodic Memory Retrieval
 
@@ -841,7 +843,7 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 
 **Pre-initialization requirement:** `model.initialize_states(BS, device)` must be called before `compile_for_training()` to pre-allocate all runtime state tensors (Layer.h, PM state, EM state, WM state). This eliminates lazy init guards from the forward path, preventing graph breaks during compilation.
 
-**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~25K tok/s on RTX 4090 (Tier A Wide, BS=32).
+**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~26K tok/s on RTX 4090 (Tier A Wide, BS=32).
 
 ---
 

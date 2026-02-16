@@ -9,7 +9,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 ### v2 Architecture Summary
 - **B blocks** (default 2), each containing **L layers** (default 8)
 - **Working Memory (WM):** Gated Linear Attention (GLA) recurrence, 1 shared instance
-- **Procedural Memory (PM):** fast low-rank weights + eligibility, B×L instances (each with `PMNeuromodulator`)
+- **Procedural Memory (PM):** holographic modulation slots + Hebbian eligibility, B×L instances (each with `PMNeuromodulator`)
 - **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMNeuromodulator`)
 - **Plasticity boundaries:** PM/EM writes every P=64 tokens (scan-friendly within spans)
 

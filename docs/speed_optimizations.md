@@ -11,9 +11,9 @@
 
 | Metric | Value |
 |--------|-------|
-| Training throughput | ~25K tok/s |
+| Training throughput | ~26.4K tok/s |
 | Tokens per step | 8,192 (BS=32 x T=256) |
-| Step time | ~0.33s |
+| Step time | ~0.31s |
 | Peak VRAM | 10.3 GB |
 | VRAM allocated (steady state) | 1.6 GB |
 | VRAM reserved (PyTorch cache) | 10.7 GB |
@@ -23,9 +23,9 @@
 
 | Model | Params | tok/s | Relative |
 |-------|--------|-------|----------|
-| Pythia-160M (transformer) | 134M | ~102K | 4.1x faster |
-| Mamba-130M (SSM) | 115M | ~58K | 2.3x faster |
-| **Neuromorphic LM** | **85M** | **~25K** | **1x** |
+| Pythia-160M (transformer) | 134M | ~102K | 3.9x faster |
+| Mamba-130M (SSM) | 115M | ~59K | 2.2x faster |
+| **Neuromorphic LM** | **85M** | **~26.4K** | **1x** |
 
 The speed gap is expected: baselines process T=256 tokens in one parallel pass, while our model splits into 4 sequential spans with PM/EM boundary operations. Three memory systems (PM, EM, WM) add per-token overhead that baselines lack.
 
@@ -62,6 +62,24 @@ Removed GPU-CPU synchronization barriers that stalled the pipeline:
 
 **Result:** ~12K -> ~25K tok/s (2.1x speedup)
 
+### Phase 3: Decoder Compilation + Micro-Optimizations + Holographic PM
+
+| Change | Description |
+|--------|-------------|
+| Compile spatial decoder | Register index buffers, change `list[Tensor]` → stacked `Tensor`, `torch.compile(decoder.forward)` |
+| einsum → matmul/bmm | Replace 9 einsum calls with direct matmul/bmm in PM and WM |
+| GLA recurrence optimization | Hoist `torch.exp(g)` outside loop, preallocate output tensor |
+| Carry mask dtype fix | `.float()` → `.to(runtime_state_dtype(device))` avoids bf16→fp32 cast |
+| Holographic PM read | `y = x * (W @ x)` — element-wise multiply is same cost as old linear read |
+
+**Decoder compilation** eliminates ~14% overhead the decoder added in eager mode. The decoder (`SpatialDecoder.forward`) had 5 graph break sources: dynamic `torch.arange`/`torch.tensor` calls and `list[Tensor]` inputs. Fixed by registering index buffers in `__init__` and stacking block outputs into a single tensor before the call.
+
+**Micro-optimizations** (einsum→matmul, GLA preallocate, dtype fix) provide small incremental gains that compound.
+
+**Holographic PM** changes the read from linear retrieval (`scores @ V`) to input-modulated retrieval (`x * (scores @ V)`). This is mathematically richer (quadratic in x) with negligible compute overhead (one extra element-wise multiply).
+
+**Result:** ~25K -> ~26.4K tok/s (5.6% speedup)
+
 ---
 
 ## Why We're Slower Than Baselines
@@ -90,9 +108,9 @@ Removed GPU-CPU synchronization barriers that stalled the pipeline:
 
 | Scenario | tok/s | vs Mamba |
 |----------|-------|---------|
-| Current | 25K | 2.3x slower |
-| + FLA kernels for GLA | ~35K | 1.7x slower |
-| + P=128 + parallel scan | ~45K | 1.3x slower |
+| Current | 26.4K | 2.2x slower |
+| + FLA kernels for GLA | ~37K | 1.6x slower |
+| + P=128 + parallel scan | ~47K | 1.3x slower |
 
 A 1.5-2x gap vs Mamba is the expected steady-state: three memory systems are the architectural cost for PM/EM/WM capabilities that baselines lack entirely.
 

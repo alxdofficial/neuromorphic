@@ -142,7 +142,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
         x_blocks = x_proj.view(BS, self.config.B, self.config.D_h)  # [BS, B, D_h]
 
         # Carry mask: 0 at doc boundaries, 1 otherwise
-        carry = (~effective_reset_mask).float().unsqueeze(-1)  # [BS, 1]
+        carry = (~effective_reset_mask).to(runtime_state_dtype(device)).unsqueeze(-1)  # [BS, 1]
 
         # Process each block
         snapshot = self.use_spatial_decoder
@@ -171,10 +171,11 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
         # Spatial decoder or direct LM head
         if snapshot:
+            block_layers_stacked = torch.stack(block_layer_outputs, dim=1)  # [BS, B, L, D_h]
             pm_summary = self._compute_pm_summary(BS, device)
             em_summary = self._compute_em_summary(BS, device)
             h_decoded = self.spatial_decoder(
-                block_layer_outputs, pm_summary, em_summary, y_wm, h_final,
+                block_layers_stacked, pm_summary, em_summary, y_wm, h_final,
             )
             logits = self.lm_head(h_decoded)  # [BS, vocab]
         else:
@@ -236,7 +237,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
         surprise_span = self.surprise  # [BS, 1]
 
         # 4. Carry mask: [BS, P, 1]
-        carry_all = (~reset_mask_all).float().unsqueeze(-1)
+        carry_all = (~reset_mask_all).to(runtime_state_dtype(device)).unsqueeze(-1)
 
         # 5. Embed all tokens
         x_emb_all = self.embedding(input_ids)  # [BS, P, D]
@@ -277,21 +278,21 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
         # 10. Spatial decoder or direct LM head
         if self.config.snapshot_enabled and self.spatial_decoder is not None:
-            # Collect per-layer outputs from blocks (already cached)
-            # Each: [BS, P, L, D_h]
-            block_layer_outputs = [block._last_layer_stack for block in self.blocks]
+            # Stack per-layer outputs: list of B × [BS, P, L, D_h] → [BS, P, B, L, D_h]
+            block_layers = torch.stack(
+                [block._last_layer_stack for block in self.blocks], dim=2
+            )
 
             # PM/EM summaries are frozen within span — compute once
             pm_summary = self._compute_pm_summary(BS, device)   # [BS, D_h]
             em_summary = self._compute_em_summary(BS, device)    # [BS, D_em]
 
             # Reshape everything to [BS*P, ...] for decoder
-            L = self.config.L
             D_h = self.config.D_h
             D = self.config.D
             BP = BS * P
-            # [BS, P, L, D_h] -> [BS*P, L, D_h]
-            block_layer_flat = [blo.reshape(BP, L, D_h) for blo in block_layer_outputs]
+            # [BS, P, B, L, D_h] -> [BS*P, B, L, D_h]
+            block_layers_flat = block_layers.reshape(BP, self.config.B, self.config.L, D_h)
             pm_flat = pm_summary.unsqueeze(1).expand(BS, P, -1).reshape(BP, D_h)
             em_flat = em_summary.unsqueeze(1).expand(BS, P, -1).reshape(BP, -1)
             wm_flat = y_wm_all.reshape(BP, D)
@@ -299,7 +300,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
             # Run decoder on all BS*P positions at once
             h_decoded = self.spatial_decoder(
-                block_layer_flat, pm_flat, em_flat, wm_flat, h_flat
+                block_layers_flat, pm_flat, em_flat, wm_flat, h_flat
             )  # [BS*P, D]
 
             logits_all = self.lm_head(h_decoded.reshape(BS, P, D))  # [BS, P, vocab]
@@ -563,6 +564,9 @@ class NeuromorphicLM(nn.Module, StateMixin):
         # Compile GLA WM span path so the recurrence loop can be fused.
         if self.config.wm_enabled and self.config.wm_type == "gla":
             self.wm.forward_span = torch.compile(self.wm.forward_span)
+        # Compile spatial decoder forward (hierarchical attention is graph-safe now)
+        if self.config.snapshot_enabled and self.spatial_decoder is not None:
+            self.spatial_decoder.forward = torch.compile(self.spatial_decoder.forward)
         # PM eligibility is separate (called post-forward in span_ops)
         for block in self.blocks:
             for layer in block.layers:
