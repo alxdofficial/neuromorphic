@@ -272,6 +272,11 @@ class TBPTTTrainer:
             span_loss, span_valid, token_surprise = compute_loss_and_surprise(
                 logits_all, span_targets, loss_mask_all,
             )
+            # F.cross_entropy returns fp32 even under autocast.  Cast surprise
+            # to bf16 so downstream PM/EM element-wise ops stay on TensorCores
+            # instead of promoting back to fp32.
+            if self.use_amp:
+                token_surprise = token_surprise.to(self.amp_dtype)
 
             # Reset masks for span accumulators
             reset_mask_all = span_ops.compute_reset_mask(
