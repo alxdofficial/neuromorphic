@@ -203,6 +203,15 @@ class PersistentStreamDataset(IterableDataset):
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
 
+    def reset_streams(self):
+        """Re-initialize streams from the already-loaded base dataset."""
+        if self._base_dataset is None:
+            return  # will be initialized on first __iter__
+        self._stream_restarts = [0 for _ in range(self.batch_size)]
+        self.streams = [self._make_stream(i) for i in range(self.batch_size)]
+        self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
+        self.step_count = 0
+
     def __iter__(self) -> Iterator[StreamBatch]:
         """
         Iterate over batches of tokens.
@@ -390,6 +399,15 @@ class MixedStreamDataset(IterableDataset):
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
 
+        self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
+        self.step_count = 0
+
+    def reset_streams(self):
+        """Re-initialize streams from already-loaded datasets."""
+        if self._ds_cache is None:
+            return
+        self._stream_restarts = [0 for _ in range(self.batch_size)]
+        self.streams = [self._make_stream(i) for i in range(self.batch_size)]
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
 

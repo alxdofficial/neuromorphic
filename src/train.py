@@ -75,10 +75,10 @@ MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 1_000,             # ~8M tokens: WM + PM backbone warmup (brief head start)
-    "B": 182_000,           # ~1.49B tokens: WM + PM + EM (bulk of training)
+    "B": 91_000,            # ~1.49B tokens @ BS=64 (was 182K @ BS=32)
     "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
-# Total A+B = 183K steps × BS=32 × T=256 ≈ 1.5B tokens (matches baseline budget)
+# Total A+B ≈ 1.5B tokens (matches baseline budget)
 
 # -- Regularization --
 WEIGHT_DECAY = 0.01
@@ -876,16 +876,24 @@ def run_phase(
         print(f"\nSaved checkpoint: {save_path}")
         return save_path
 
+    _val_iter = None
+
     def run_validation(step: int, pm_enabled: bool, em_enabled: bool,
                        mode: str) -> dict:
-        val_loader = create_dataloader(
-            phase=val_data_phase,
-            tokenizer=tokenizer,
-            batch_size=bs,
-            seq_length=config.T,
-            seed=VAL_SEED,
-            max_steps=VAL_STEPS,
-        )
+        nonlocal _val_iter
+        if _val_iter is None:
+            _val_iter = create_dataloader(
+                phase=val_data_phase,
+                tokenizer=tokenizer,
+                batch_size=bs,
+                seq_length=config.T,
+                seed=VAL_SEED,
+                max_steps=VAL_STEPS,
+            )
+        else:
+            _val_iter.dataset.reset_streams()
+            _val_iter._it = iter(_val_iter.dataset)
+        val_loader = _val_iter
         t0 = time.time()
         metrics = evaluate_validation(
             model=model,
