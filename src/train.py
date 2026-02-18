@@ -989,14 +989,18 @@ def run_phase(
                     current_loss = _step_metrics.get("loss")
                     # Save full runtime state so generation doesn't corrupt training
                     _rt_state = _save_rt(model)
-                    generate_text_sample_plot(
-                        model=model,
-                        tokenizer=tokenizer,
-                        batch=sample_batch.input_ids,
-                        step=trainer.global_step,
-                        loss=current_loss,
-                        save_path=sample_path,
-                    )
+                    with torch.autocast(
+                        device_type=device.type, dtype=torch.bfloat16,
+                        enabled=(device.type == "cuda"),
+                    ):
+                        generate_text_sample_plot(
+                            model=model,
+                            tokenizer=tokenizer,
+                            batch=sample_batch.input_ids,
+                            step=trainer.global_step,
+                            loss=current_loss,
+                            save_path=sample_path,
+                        )
                     # Restore runtime state (not just reset — preserves PM/EM)
                     _load_rt(model, _rt_state)
                 except Exception as e:
