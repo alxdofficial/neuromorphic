@@ -111,11 +111,14 @@ class ProceduralMemory(nn.Module, StateMixin):
             self._lazy_init(x_block.shape[0], x_block.device)
 
         x_q = unit_normalize(x_block)          # [BS, D_h]
+        # Cast to state dtype (bf16 on CUDA) for matmul with pm_K/pm_V
+        x_q = x_q.to(self.pm_K.dtype)
         # scores = pm_K @ x_q -> [BS, r]
         scores = torch.matmul(x_q.unsqueeze(1), self.pm_K.transpose(-1, -2)).squeeze(1)
         # Holographic read: input flows through stored modulation patterns
         weighted = (self.pm_a * scores).unsqueeze(-1)           # [BS, r, 1]
         y_pm = (weighted * x_q.unsqueeze(1) * self.pm_V).sum(1)  # [BS, D_h]
+        y_pm = y_pm.float()  # back to param dtype for LayerNorm/FFN
 
         # Post-readout processing
         if self.readout_ffn is not None:
@@ -129,10 +132,13 @@ class ProceduralMemory(nn.Module, StateMixin):
         Safe for torch.compile(fullgraph=True).
         """
         x_q = unit_normalize(x_block_all)                                        # [BS, P, D_h]
+        # Cast to state dtype (bf16 on CUDA) for matmul with pm_K/pm_V
+        x_q = x_q.to(self.pm_K.dtype)
         scores = torch.matmul(x_q, self.pm_K.transpose(-1, -2))                  # [BS, P, r]
         # Holographic read: input flows through stored modulation patterns
         weighted = (self.pm_a.unsqueeze(1) * scores).unsqueeze(-1)               # [BS, P, r, 1]
         y_pm = (weighted * x_q.unsqueeze(2) * self.pm_V.unsqueeze(1)).sum(2)     # [BS, P, D_h]
+        y_pm = y_pm.float()  # back to param dtype for LayerNorm/FFN
 
         if self.readout_ffn is not None:
             y_pm = y_pm + self.readout_ffn(self.readout_norm(y_pm))
@@ -175,9 +181,14 @@ class ProceduralMemory(nn.Module, StateMixin):
         k_cand = unit_normalize(self.W_k_pre(x))   # [BS, D_h]
         v_cand = self.W_v_post(x * h)               # [BS, D_h] — Hebbian interaction
 
+        # Cast to state dtype (bf16 on CUDA) for matmul with pm_K
+        state_dtype = self.pm_K.dtype
+        k_cand = k_cand.to(state_dtype)
+        v_cand = v_cand.to(state_dtype)
+
         # Gate by surprise: low surprise → near-zero accumulation
         gate = (surprise.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS]
-        gate = gate.unsqueeze(1).unsqueeze(2)                  # [BS, 1, 1]
+        gate = gate.to(state_dtype).unsqueeze(1).unsqueeze(2)  # [BS, 1, 1]
 
         # Slot-specific routing: weight candidate contribution per slot
         route_logits = torch.matmul(k_cand.unsqueeze(1), self.pm_K.transpose(-1, -2)).squeeze(1) / self.config.tau_route_pm
@@ -202,9 +213,14 @@ class ProceduralMemory(nn.Module, StateMixin):
         k_cand_all = unit_normalize(self.W_k_pre(x_all))  # [BS, P, D_h]
         v_cand_all = self.W_v_post(x_all * h_all)          # [BS, P, D_h] — Hebbian interaction
 
+        # Cast to state dtype (bf16 on CUDA) for matmul with pm_K and elig state
+        state_dtype = self.pm_K.dtype
+        k_cand_all = k_cand_all.to(state_dtype)
+        v_cand_all = v_cand_all.to(state_dtype)
+
         # Surprise gating: [BS, P] → [BS, P, 1, 1] for broadcast over [r, D_h]
         gate = (surprise_all.squeeze(-1) / self.config.surprise_scale).clamp(0.0, 1.0)  # [BS, P]
-        gate = gate.unsqueeze(-1).unsqueeze(-1)                    # [BS, P, 1, 1]
+        gate = gate.to(state_dtype).unsqueeze(-1).unsqueeze(-1)  # [BS, P, 1, 1]
 
         # Slot-specific routing: weight candidate contribution per slot
         route_logits = torch.matmul(k_cand_all, self.pm_K.transpose(-1, -2)) / self.config.tau_route_pm

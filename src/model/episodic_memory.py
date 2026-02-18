@@ -112,8 +112,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         if self.em_K is None:
             self._lazy_init(BS, device)
 
-        # Compute query
+        # Compute query (cast to state dtype to match em_K which is bf16 on CUDA)
         q = unit_normalize(self.W_q_em(torch.cat([x, y_wm], dim=-1)))  # [BS, D_em]
+        q = q.to(self.em_K.dtype)
 
         # Score against all slots
         scores = torch.einsum("bd, bmd -> bm", q, self.em_K)  # [BS, M]
@@ -132,7 +133,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         V_top = self.em_V.gather(1, topk_idx_exp)  # [BS, k, D_em]
 
         # Cross-attention aggregation
-        q_cross = self.W_q_cross(x)  # [BS, D_em]
+        q_cross = self.W_q_cross(x).to(K_top.dtype)  # [BS, D_em]
         # Attention weights from K_top (keys), applied to V_top (values).
         # Adding topk_scores preserves a differentiable path from retrieval query
         # (W_q_em) to downstream loss through selected memory logits.
@@ -144,6 +145,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         attn = attn.nan_to_num(0.0)
 
         out = torch.einsum("bk, bkd -> bd", attn, V_top)  # [BS, D_em]
+        out = out.float()  # back to param dtype for LayerNorm/FFN/projection
 
         # Post-retrieval processing
         if self.readout_ffn is not None:
@@ -165,8 +167,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         BS, P, D = x_all.shape
 
-        # Compute queries: [BS, P, D_em]
+        # Compute queries: [BS, P, D_em] (cast to state dtype to match em_K)
         q = unit_normalize(self.W_q_em(torch.cat([x_all, y_wm_all], dim=-1)))
+        q = q.to(self.em_K.dtype)
 
         # Score against all slots: [BS, P, M]
         scores = torch.einsum("bpd, bmd -> bpm", q, self.em_K)
@@ -187,7 +190,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         V_top = self.em_V.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
 
         # Cross-attention: [BS, P, D_em]
-        q_cross = self.W_q_cross(x_all)
+        q_cross = self.W_q_cross(x_all).to(K_top.dtype)
         attn = torch.einsum("bpd, bpkd -> bpk", q_cross, K_top) * self.cross_scale
         attn = attn + topk_scores
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
@@ -195,6 +198,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         attn = attn.nan_to_num(0.0)
 
         out = torch.einsum("bpk, bpkd -> bpd", attn, V_top)  # [BS, P, D_em]
+        out = out.float()  # back to param dtype for LayerNorm/FFN/projection
 
         if self.readout_ffn is not None:
             out = out + self.readout_ffn(self.readout_norm(out))
@@ -227,7 +231,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Novelty = surprise + (1 - max cosine similarity to active keys)
         cold_start = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
         if self.em_K is not None:
-            cos_sim = torch.einsum("bd, bmd -> bm", k_cand, self.em_K)  # [BS, M]
+            cos_sim = torch.einsum("bd, bmd -> bm", k_cand.to(self.em_K.dtype), self.em_K)  # [BS, M]
             if self.em_S is not None:
                 active_mask = self.em_S > 0
                 masked = cos_sim.masked_fill(~active_mask, float("-inf"))
@@ -292,7 +296,7 @@ class EpisodicMemory(nn.Module, StateMixin):
             topk_flat_exp = topk_flat.unsqueeze(-1).expand(-1, -1, self.D_em)
             K_topk = self.em_K.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
             # Score k_cand against retrieved keys only: [BS, P, k]
-            cos_sim_topk = torch.einsum("bpd, bpkd -> bpk", k_cand, K_topk)
+            cos_sim_topk = torch.einsum("bpd, bpkd -> bpk", k_cand.to(K_topk.dtype), K_topk)
             if self.em_S is not None:
                 any_active = (self.em_S > 0).any(dim=-1)  # [BS]
                 max_sim = cos_sim_topk.max(dim=-1).values  # [BS, P]
@@ -305,7 +309,7 @@ class EpisodicMemory(nn.Module, StateMixin):
                 cold_start = torch.zeros(BS, dtype=torch.bool, device=x_all.device)
         elif self.em_K is not None:
             # Fallback: full dense scoring (when retrieve_batch wasn't called)
-            cos_sim = torch.einsum("bpd, bmd -> bpm", k_cand, self.em_K)
+            cos_sim = torch.einsum("bpd, bmd -> bpm", k_cand.to(self.em_K.dtype), self.em_K)
             if self.em_S is not None:
                 active_mask = self.em_S > 0
                 masked = cos_sim.masked_fill(~active_mask.unsqueeze(1), float("-inf"))
@@ -395,7 +399,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Bounded approximation: g_em alphas are small, each write changes <1%.
 
         # Score all C candidates against current (frozen) em_K: [BS, C, M]
-        scores_slot = torch.einsum("bcd, bmd -> bcm", K_C, self.em_K)
+        scores_slot = torch.einsum("bcd, bmd -> bcm", K_C.to(self.em_K.dtype), self.em_K)
         scores_slot = scores_slot - weakness_weight.unsqueeze(-1).unsqueeze(-1) * self.em_S.unsqueeze(1)
 
         # Softmax slot selection per candidate: [BS, C, M]

@@ -734,7 +734,10 @@ def run_phase(
             # values against the current config.  Without this, tensors that
             # are still None would be loaded blindly, risking shape mismatches
             # on the first real forward pass.
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16,
+                enabled=(device.type == "cuda"),
+            ):
                 dummy = torch.zeros(bs, dtype=torch.long, device=device)
                 reset = torch.zeros(bs, dtype=torch.bool, device=device)
                 model.forward_one_token(dummy, reset)
