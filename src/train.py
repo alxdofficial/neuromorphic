@@ -932,19 +932,24 @@ def run_phase(
     # Draw a fresh validation batch for text samples each time
     _text_sample_call_count = [0]
 
+    _text_sample_dataset = None
+
     def _get_text_sample_batch():
+        nonlocal _text_sample_dataset
         try:
-            seed = VAL_SEED + 99 + _text_sample_call_count[0]
-            _text_sample_call_count[0] += 1
-            sample_loader = create_dataloader(
-                phase=val_data_phase,
-                tokenizer=tokenizer,
-                batch_size=bs,
-                seq_length=config.T,
-                seed=seed,
-                max_steps=1,
-            )
-            return next(iter(sample_loader))
+            if _text_sample_dataset is None:
+                _text_sample_dataset = create_dataloader(
+                    phase=val_data_phase,
+                    tokenizer=tokenizer,
+                    batch_size=bs,
+                    seq_length=config.T,
+                    seed=VAL_SEED + 99,
+                    max_steps=1,
+                )
+            else:
+                _text_sample_dataset.dataset.reset_streams()
+                _text_sample_dataset._it = iter(_text_sample_dataset.dataset)
+            return next(iter(_text_sample_dataset))
         except Exception:
             return None
 
