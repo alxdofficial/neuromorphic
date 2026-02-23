@@ -141,8 +141,11 @@ class EpisodicMemory(nn.Module, StateMixin):
         attn = attn + topk_scores
         # Mask out -inf topk positions (no active slots)
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
+        # When all slots are inactive, all attn values are -inf and softmax
+        # would produce NaN. Detect this and zero out those rows instead.
+        all_inactive = (topk_scores == float("-inf")).all(dim=-1, keepdim=True)  # [BS, 1]
         attn = torch.softmax(attn, dim=-1)
-        attn = attn.nan_to_num(0.0)
+        attn = torch.where(all_inactive, torch.zeros_like(attn), attn)
 
         out = torch.einsum("bk, bkd -> bd", attn, V_top)  # [BS, D_em]
         out = out.float()  # back to param dtype for LayerNorm/FFN/projection
@@ -194,8 +197,11 @@ class EpisodicMemory(nn.Module, StateMixin):
         attn = torch.einsum("bpd, bpkd -> bpk", q_cross, K_top) * self.cross_scale
         attn = attn + topk_scores
         attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
+        # When all slots are inactive, all attn values are -inf and softmax
+        # would produce NaN. Detect this and zero out those rows instead.
+        all_inactive = (topk_scores == float("-inf")).all(dim=-1, keepdim=True)  # [BS, P, 1]
         attn = torch.softmax(attn, dim=-1)
-        attn = attn.nan_to_num(0.0)
+        attn = torch.where(all_inactive, torch.zeros_like(attn), attn)
 
         out = torch.einsum("bpk, bpkd -> bpd", attn, V_top)  # [BS, P, D_em]
         out = out.float()  # back to param dtype for LayerNorm/FFN/projection

@@ -135,7 +135,7 @@ v2 adds plasticity span boundaries (every P=64 tokens):
 * Eligibility updates remain differentiable within TBPTT
 * K+V eligibility scans are fused into a single double-width scan for efficiency
 
-**Status:** Implemented and optimized. `torch.compile(fullgraph=True)` fuses scan loops, gate computations, and elementwise ops into optimized CUDA kernels. PM, EM, and controllers remain intact around the new scan-friendly core.
+**Status:** Implemented and optimized. Block-level `torch.compile(mode="max-autotune-no-cudagraphs")` fuses scan loops, gate computations, and elementwise ops into autotuned CUDA kernels. PM eligibility updates are compiled separately with `fullgraph=True`. PM, EM, and controllers remain intact around the new scan-friendly core.
 
 ---
 

@@ -23,6 +23,11 @@ class Block(nn.Module, StateMixin):
         self.config = config
         self.block_idx = block_idx
 
+        # Pre-LayerNorm for Layer 0 input: ensures L0 receives normalized
+        # input (like L1+ which get LayerNorm'd output from previous layer),
+        # fixing gradient asymmetry between L0 and deeper layers.
+        self.input_norm = nn.LayerNorm(config.D_h)
+
         # L sequential layers
         self.layers = nn.ModuleList([
             Layer(config, block_idx, l) for l in range(config.L)
@@ -65,8 +70,8 @@ class Block(nn.Module, StateMixin):
         y_wm_proj = self.W_wm_proj(y_wm)      # [BS, D_h]
         y_em_proj = self.W_em_proj(y_em)        # [BS, D_h]
 
-        # Sequential layers
-        x = x_block
+        # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
+        x = self.input_norm(x_block)
         layer_stats = {}
         layer_outs = [] if return_layers else None
         for l_idx, layer in enumerate(self.layers):
@@ -138,8 +143,8 @@ class Block(nn.Module, StateMixin):
         y_wm_proj_all = self.W_wm_proj(y_wm_all)
         y_em_proj_all = self.W_em_proj(y_em_all)
 
-        # Sequential layers (each with batched forward)
-        x = x_block_all
+        # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
+        x = self.input_norm(x_block_all)
         layer_stats = {} if collect else None
         for l_idx, layer in enumerate(self.layers):
             if self.config.pm_enabled:

@@ -179,9 +179,10 @@ class WorkingMemory(nn.Module, StateMixin):
         valid_mask = self.wm_valid.unsqueeze(1)  # [BS, 1, W]
         attn = attn.masked_fill(~valid_mask, float("-inf"))
 
-        # Softmax (handle all-invalid case)
+        # Softmax (handle all-invalid: zero attention instead of NaN)
+        all_invalid = (~valid_mask).all(dim=-1, keepdim=True)  # [BS, 1, 1]
         attn = torch.softmax(attn, dim=-1)
-        attn = attn.nan_to_num(0.0)  # all-invalid -> zero attention
+        attn = torch.where(all_invalid, torch.zeros_like(attn), attn)
 
         # Store for debug metrics before dropout (normalized probs for entropy)
         self._last_attn = attn.detach()  # [BS, n_heads, W]
@@ -272,8 +273,9 @@ class WorkingMemory(nn.Module, StateMixin):
             attn = attn + self._alibi_bias_step(BS)
             valid_mask = self.wm_valid.unsqueeze(1)
             attn = attn.masked_fill(~valid_mask, float("-inf"))
+            all_invalid = (~valid_mask).all(dim=-1, keepdim=True)
             attn = torch.softmax(attn, dim=-1)
-            attn = attn.nan_to_num(0.0)
+            attn = torch.where(all_invalid, torch.zeros_like(attn), attn)
             attn = self.attn_drop(attn)
 
             out = torch.einsum("bnw, bnwd -> bnd", attn, V_h)
@@ -354,8 +356,10 @@ class WorkingMemory(nn.Module, StateMixin):
         attn_mask_4d = attn_mask.unsqueeze(1)  # [BS, 1, P, W+P]
         attn = attn.masked_fill(~attn_mask_4d, float("-inf"))
 
+        # Handle all-invalid rows (e.g. first token with empty WM cache)
+        all_invalid = (~attn_mask_4d).all(dim=-1, keepdim=True)  # [BS, 1, P, 1]
         attn = torch.softmax(attn, dim=-1)
-        attn = attn.nan_to_num(0.0)  # all-invalid -> zero attention
+        attn = torch.where(all_invalid, torch.zeros_like(attn), attn)
         attn = self.attn_drop(attn)
 
         # Weighted sum: [BS, n_heads, P, head_dim]

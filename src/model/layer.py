@@ -12,6 +12,7 @@ giving input_dim = 4*D_h + 1.
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import ModelConfig
 from .procedural_memory import ProceduralMemory, PMNeuromodulator
@@ -130,7 +131,13 @@ class Layer(nn.Module, StateMixin):
 
         # Post-recurrence FFN (pre-norm residual)
         if self.ffn is not None:
-            output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
+            if self.config.gradient_checkpointing and torch.is_grad_enabled():
+                ffn_out = grad_checkpoint(
+                    self.ffn, self.ffn_norm(output), use_reentrant=False
+                )
+                output = output + self.drop_resid(ffn_out)
+            else:
+                output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
 
         if collect:
             stats = {
@@ -184,7 +191,13 @@ class Layer(nn.Module, StateMixin):
 
         # Batched post-recurrence FFN
         if self.ffn is not None:
-            output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
+            if self.config.gradient_checkpointing and torch.is_grad_enabled():
+                ffn_out = grad_checkpoint(
+                    self.ffn, self.ffn_norm(output), use_reentrant=False
+                )
+                output = output + self.drop_resid(ffn_out)
+            else:
+                output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
 
         return output
 

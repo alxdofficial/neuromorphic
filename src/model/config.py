@@ -74,6 +74,7 @@ class ModelConfig:
     T: int = 256              # TBPTT segment length
     P: int = 64               # plasticity span
     use_compile: bool = False # torch.compile for CUDA training
+    gradient_checkpointing: bool = False  # recompute FFN activations to save VRAM
     reset_on_doc_boundary: bool = True
     lifelong_mode: bool = False  # Phase C: PM/EM persist across doc boundaries
 
