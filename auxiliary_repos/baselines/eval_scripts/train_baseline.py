@@ -26,7 +26,6 @@ import math
 import os
 import sys
 import time
-from itertools import cycle
 
 import torch
 import torch.nn.functional as F
@@ -54,10 +53,13 @@ MODEL_OPTIMAL_BS = {
     "mamba-130m": 64,
 }
 
-# Datasets (same as our Phase B)
-FINEWEB_EDU_PATH = "HuggingFaceFW/fineweb-edu"
-FINEWEB_EDU_NAME = "sample-10BT"
-DCLM_PATH = "mlfoundations/dclm-baseline-1.0"
+# Datasets (same as our Phase B) — local pre-downloaded parquet files
+# Run `python scripts/prepare_data.py` first to create these.
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.normpath(os.path.join(_ROOT, "..", "..", "..", "data", "phase_B"))
+FINEWEB_EDU_LOCAL = os.path.join(_DATA_DIR, "fineweb_edu.parquet")
+DCLM_LOCAL = os.path.join(_DATA_DIR, "dclm.parquet")
+VAL_LOCAL = os.path.join(_DATA_DIR, "val_fineweb_edu.parquet")
 MIX_WEIGHTS = [0.6, 0.4]  # FineWeb-Edu 60%, DCLM 40%
 
 # Optimizer (standard transformer training)
@@ -72,7 +74,7 @@ GRAD_CLIP = 1.0
 # Logging
 LOG_INTERVAL = 50
 VAL_INTERVAL = 500
-SAVE_INTERVAL = 5000
+SAVE_INTERVAL = 2000
 
 # ============================================================================
 # Model configs (from-scratch architecture definitions)
@@ -115,46 +117,57 @@ MODEL_CONFIGS = {
 # Data pipeline
 # ============================================================================
 
-class StreamingTokenDataset:
-    """Stream tokens from HuggingFace datasets, matching our training pipeline."""
+class LocalTokenDataset:
+    """Load tokens from local parquet files (no network calls during training).
+
+    Run ``python scripts/prepare_data.py`` first to create the local files.
+    """
 
     def __init__(self, tokenizer, seq_length: int, batch_size: int, seed: int = 42):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.batch_size = batch_size
         self.eos_token_id = tokenizer.eos_token_id
+        self._seed = seed
 
-        # Load datasets in streaming mode
-        print("Loading FineWeb-Edu (streaming)...")
+        self._build_dataset()
+        self._token_buffer = []
+
+    def _build_dataset(self):
+        """Load and interleave local parquet datasets."""
+        for path in (FINEWEB_EDU_LOCAL, DCLM_LOCAL):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Local data not found: {path}\n"
+                    f"Run: python scripts/prepare_data.py"
+                )
+
+        print(f"Loading FineWeb-Edu (local): {FINEWEB_EDU_LOCAL}")
         ds_fineweb = load_dataset(
-            FINEWEB_EDU_PATH, FINEWEB_EDU_NAME,
-            split="train", streaming=True,
+            "parquet", data_files=FINEWEB_EDU_LOCAL, split="train",
         )
-        print("Loading DCLM (streaming)...")
+        print(f"Loading DCLM (local): {DCLM_LOCAL}")
         ds_dclm = load_dataset(
-            DCLM_PATH, split="train", streaming=True,
+            "parquet", data_files=DCLM_LOCAL, split="train",
         )
 
-        # Interleave with mix weights
         self.dataset = interleave_datasets(
             [ds_fineweb, ds_dclm],
             probabilities=MIX_WEIGHTS,
-            seed=seed,
+            seed=self._seed,
             stopping_strategy="all_exhausted",
         )
         self._iter = iter(self.dataset)
-        self._token_buffer = []
 
     def _fill_buffer(self, min_tokens: int):
-        """Fill token buffer from streaming dataset."""
+        """Fill token buffer from dataset."""
         while len(self._token_buffer) < min_tokens:
             try:
                 example = next(self._iter)
             except StopIteration:
-                # Restart stream
+                # Recycle dataset
                 self._iter = iter(self.dataset)
                 example = next(self._iter)
-
             text = example.get("text", "")
             if not text.strip():
                 continue
@@ -178,6 +191,71 @@ class StreamingTokenDataset:
         input_ids = tokens[:, :-1]   # [BS, T]
         labels = tokens[:, 1:]       # [BS, T]
         return input_ids, labels
+
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+def build_val_dataset(tokenizer, batch_size: int, n_batches: int = 100,
+                      seed: int = 1337) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Pre-fetch a fixed val set from local parquet (held-out from training).
+
+    Materialised once at startup so val evaluation is fast and deterministic.
+    """
+    if not os.path.exists(VAL_LOCAL):
+        raise FileNotFoundError(
+            f"Local validation data not found: {VAL_LOCAL}\n"
+            f"Run: python scripts/prepare_data.py"
+        )
+    print(f"Building validation set from {VAL_LOCAL} "
+          f"({n_batches} batches, seed={seed})...", flush=True)
+    ds = load_dataset("parquet", data_files=VAL_LOCAL,
+                      split="train").shuffle(seed=seed)
+    eos = tokenizer.eos_token_id
+    buf = []
+    batches = []
+    for example in ds:
+        text = example.get("text", "")
+        if not text.strip():
+            continue
+        toks = tokenizer.encode(text, add_special_tokens=False)
+        toks.append(eos)
+        buf.extend(toks)
+        while len(buf) >= batch_size * (SEQ_LENGTH + 1):
+            batch_tokens = []
+            for _ in range(batch_size):
+                chunk = buf[:SEQ_LENGTH + 1]
+                buf = buf[SEQ_LENGTH + 1:]
+                batch_tokens.append(chunk)
+            t = torch.tensor(batch_tokens, dtype=torch.long)
+            batches.append((t[:, :-1], t[:, 1:]))
+            if len(batches) >= n_batches:
+                break
+        if len(batches) >= n_batches:
+            break
+    print(f"  Val set ready: {len(batches)} batches x {batch_size} x {SEQ_LENGTH}")
+    return batches
+
+
+@torch.no_grad()
+def run_validation(model, val_batches: list, device: str,
+                   amp_dtype: torch.dtype) -> dict:
+    """Compute val loss/ppl over the pre-fetched val set."""
+    model.train(False)
+    total_loss = 0.0
+    total_tokens = 0
+    for input_ids, labels in val_batches:
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
+        with autocast("cuda", dtype=amp_dtype):
+            out = model(input_ids=input_ids, labels=labels)
+        n = (labels != -100).sum().item()
+        total_loss += out.loss.item() * n
+        total_tokens += n
+    model.train(True)
+    avg_loss = total_loss / max(total_tokens, 1)
+    return {"val_loss": avg_loss, "val_ppl": min(math.exp(avg_loss), 1e6)}
 
 
 # ============================================================================
@@ -230,7 +308,14 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
     print(f"  Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
     print(f"  Config: {config}")
 
-    return model.to(device)
+    model = model.to(device)
+
+    # torch.compile for GPTNeoX (Mamba's selective scan doesn't compile cleanly)
+    if cfg_spec["model_type"] == "gpt_neox":
+        print("  Compiling with torch.compile...")
+        model = torch.compile(model)
+
+    return model
 
 
 def train(
@@ -268,6 +353,7 @@ def train(
         lr=LR,
         betas=(BETA1, BETA2),
         weight_decay=WEIGHT_DECAY,
+        fused=(device == "cuda"),
     )
 
     # LR scheduler (cosine with warmup, same shape as our training)
@@ -290,7 +376,8 @@ def train(
 
     # Data
     print("Setting up data pipeline...")
-    data = StreamingTokenDataset(tokenizer, SEQ_LENGTH, batch_size, seed=seed)
+    data = LocalTokenDataset(tokenizer, SEQ_LENGTH, batch_size, seed=seed)
+    val_batches = build_val_dataset(tokenizer, batch_size=min(batch_size, 32))
 
     # Resume
     start_step = 0
@@ -351,7 +438,7 @@ def train(
         labels = labels.to(device)
 
         # Forward + backward
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         if use_amp:
             with autocast("cuda", dtype=amp_dtype):
                 outputs = model(input_ids=input_ids, labels=labels)
@@ -389,8 +476,8 @@ def train(
         if (step + 1) % LOG_INTERVAL == 0 or step == start_step:
             avg_loss = running_loss / LOG_INTERVAL if step > start_step else loss_val
             total_elapsed = time.time() - t_start
-            tokens_done = (step + 1 - start_step) * tokens_per_step
-            avg_tok_s = tokens_done / total_elapsed if total_elapsed > 0 else 0
+            session_tokens = (step + 1 - start_step) * tokens_per_step
+            avg_tok_s = session_tokens / total_elapsed if total_elapsed > 0 else 0
 
             record = {
                 "step": step + 1,
@@ -404,7 +491,7 @@ def train(
                 "tok_s": tok_s,
                 "avg_tok_s": avg_tok_s,
                 "elapsed": total_elapsed,
-                "tokens_seen": tokens_done,
+                "tokens_seen": (step + 1) * tokens_per_step,
             }
             logger.log(record)
 
@@ -416,6 +503,22 @@ def train(
                 f"elapsed={total_elapsed:.0f}s"
             )
             running_loss = 0.0
+
+        # Validation
+        if (step + 1) % VAL_INTERVAL == 0:
+            val = run_validation(model, val_batches, device, amp_dtype)
+            val_record = {
+                "step": step + 1,
+                "mode": "val",
+                "model": model_name,
+                **val,
+                "tokens_seen": (step + 1) * tokens_per_step,
+            }
+            logger.log(val_record)
+            print(
+                f"  [val] step={step+1} "
+                f"val_loss={val['val_loss']:.4f} val_ppl={val['val_ppl']:.2f}"
+            )
 
         # Checkpoint
         if (step + 1) % SAVE_INTERVAL == 0 or step + 1 == max_steps:

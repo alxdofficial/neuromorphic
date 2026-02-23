@@ -30,14 +30,28 @@ sys.path.insert(0, str(ROOT))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Model checkpoints — find latest a_b_c run dynamically
+# Model checkpoints — find latest training run dynamically
 def _find_latest_run():
-    """Find the most recent a_b_c training run directory."""
-    abc_dir = ROOT / "outputs/a_b_c"
-    if not abc_dir.exists():
+    """Find the most recent neuromorphic training run directory."""
+    # Search across all phase output dirs (a, b, a_b_c, etc.)
+    outputs = ROOT / "outputs"
+    if not outputs.exists():
         return None
-    runs = sorted(abc_dir.iterdir(), reverse=True)
-    return runs[0] if runs else None
+    best = None
+    best_mtime = 0
+    for phase_dir in outputs.iterdir():
+        if not phase_dir.is_dir():
+            continue
+        for run_dir in phase_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            ckpt_dir = run_dir / "checkpoints"
+            if ckpt_dir.exists() and any(ckpt_dir.glob("*.pt")):
+                mtime = max(p.stat().st_mtime for p in ckpt_dir.glob("*.pt"))
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best = run_dir
+    return best
 
 def _find_latest_ckpt(run_dir):
     """Find the latest checkpoint .pt file in a run directory."""
@@ -51,17 +65,18 @@ def _find_latest_ckpt(run_dir):
 
 _LATEST_RUN = _find_latest_run()
 OUR_CKPT = _find_latest_ckpt(_LATEST_RUN)
-PYTHIA_CKPT_DIR = ROOT / "outputs/baseline_pythia_160m/checkpoints"
-MAMBA_CKPT_DIR = ROOT / "outputs/baseline_mamba_130m/checkpoints"
+_BASELINE_OUT = ROOT / "auxiliary_repos/baselines/eval_scripts/outputs"
+PYTHIA_CKPT_DIR = _BASELINE_OUT / "baseline_pythia_160m/checkpoints"
+MAMBA_CKPT_DIR = _BASELINE_OUT / "baseline_mamba_130m/checkpoints"
 
 # Training logs
 OUR_METRICS = [_LATEST_RUN / "metrics.jsonl"] if _LATEST_RUN else []
-PYTHIA_METRICS = ROOT / "outputs/baseline_pythia_160m/metrics.jsonl"
-MAMBA_METRICS = ROOT / "outputs/baseline_mamba_130m/metrics.jsonl"
+PYTHIA_METRICS = _BASELINE_OUT / "baseline_pythia_160m/metrics.jsonl"
+MAMBA_METRICS = _BASELINE_OUT / "baseline_mamba_130m/metrics.jsonl"
 
 OUTPUT_DIR = ROOT / "outputs/comparison"
 
-OUR_PARAMS = 94.5e6
+OUR_PARAMS = 85.1e6
 PYTHIA_PARAMS = 134.2e6
 MAMBA_PARAMS = 115.1e6
 
@@ -76,8 +91,8 @@ def load_our_model():
     from src.model.model import NeuromorphicLM
 
     config = ModelConfig.tier_a_wide()
-    config.set_phase("C")
-    model = NeuromorphicLM(config).to(DEVICE)
+    config.set_phase("B")
+    model = NeuromorphicLM(config).to(dtype=torch.bfloat16, device=DEVICE)
     if OUR_CKPT is None or not OUR_CKPT.exists():
         raise FileNotFoundError(f"No checkpoint found. Latest run: {_LATEST_RUN}")
     ckpt = torch.load(str(OUR_CKPT), map_location=DEVICE, weights_only=False)
@@ -99,13 +114,14 @@ def load_pythia(ckpt_dir=None):
     )
     model = GPTNeoXForCausalLM(config).to(DEVICE)
 
-    ckpt_path = Path(ckpt_dir) / "step_15000.pt"
-    if not ckpt_path.exists():
-        ckpt_path = Path(ckpt_dir) / "latest.pt"
+    ckpt_path = Path(ckpt_dir) / "latest.pt"
     if ckpt_path.exists():
         ckpt = torch.load(str(ckpt_path), map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f"    Loaded weights from {ckpt_path.name}")
+        state = ckpt["model_state_dict"]
+        # torch.compile saves keys with "_orig_mod." prefix — strip it
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        model.load_state_dict(state)
+        print(f"    Loaded weights from {ckpt_path.name} (step {ckpt.get('step', '?')})")
     model.requires_grad_(False)
     return model
 
@@ -122,13 +138,11 @@ def load_mamba(ckpt_dir=None):
     )
     model = MambaForCausalLM(config).to(DEVICE)
 
-    ckpt_path = Path(ckpt_dir) / "step_15000.pt"
-    if not ckpt_path.exists():
-        ckpt_path = Path(ckpt_dir) / "latest.pt"
+    ckpt_path = Path(ckpt_dir) / "latest.pt"
     if ckpt_path.exists():
         ckpt = torch.load(str(ckpt_path), map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        print(f"    Loaded weights from {ckpt_path.name}")
+        print(f"    Loaded weights from {ckpt_path.name} (step {ckpt.get('step', '?')})")
     model.requires_grad_(False)
     return model
 
@@ -154,7 +168,13 @@ def compute_training_curves():
             continue
         with open(log_path) as f:
             for line in f:
-                d = json.loads(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 if d.get("mode") != "train":
                     continue
                 loss = d.get("loss")
@@ -187,7 +207,13 @@ def compute_training_curves():
             continue
         with open(path) as f:
             for line in f:
-                d = json.loads(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 loss = d.get("loss")
                 if loss is None:
                     continue
@@ -246,7 +272,8 @@ def benchmark_inference():
     context_lengths = [256, 512, 1024, 2048, 4096]
     results = {}
 
-    # --- Our model ---
+    # --- Our model (using forward_span for efficient chunk processing) ---
+    SPAN_SIZE = 256  # process this many tokens per forward_span call
     print("\n  Loading neuromorphic model...")
     our_model = load_our_model()
 
@@ -255,31 +282,31 @@ def benchmark_inference():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        tokens = torch.randint(0, 32000, (ctx_len,), device=DEVICE)
+        # Shape: [1, ctx_len] (batch size 1)
+        tokens = torch.randint(0, 32000, (1, ctx_len), device=DEVICE)
         reset = torch.tensor([True], dtype=torch.bool, device=DEVICE)
         no_reset = torch.tensor([False], dtype=torch.bool, device=DEVICE)
 
-        # Warmup
-        with torch.no_grad():
-            for t in range(min(32, ctx_len)):
-                our_model.forward_one_token(tokens[t:t+1], reset if t == 0 else no_reset)
+        # Warmup — one span
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            our_model.forward_span(tokens[:, :min(SPAN_SIZE, ctx_len)], reset)
 
         # Reset state and measure
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        with torch.no_grad():
-            our_model.forward_one_token(tokens[0:1], reset)
 
         torch.cuda.synchronize()
         t0 = time.time()
-        with torch.no_grad():
-            for t in range(1, ctx_len):
-                our_model.forward_one_token(tokens[t:t+1], no_reset)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            for start in range(0, ctx_len, SPAN_SIZE):
+                end = min(start + SPAN_SIZE, ctx_len)
+                rmask = reset if start == 0 else no_reset
+                our_model.forward_span(tokens[:, start:end], rmask)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
 
         peak_mem = torch.cuda.max_memory_allocated() / 1e9
-        tok_s = (ctx_len - 1) / elapsed if elapsed > 0 else 0
+        tok_s = ctx_len / elapsed if elapsed > 0 else 0
 
         our_results.append({
             "ctx_len": ctx_len, "tok_s": round(tok_s),
@@ -369,10 +396,10 @@ def measure_pg19_position_ppl():
 
     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    # Load PG19 test set
+    # Load PG19 test set (downloaded locally, not streamed)
     print("  Loading PG19 test set (first 10 books)...")
     try:
-        ds = load_dataset("deepmind/pg19", split="test", streaming=True)
+        ds = load_dataset("deepmind/pg19", split="test")
     except Exception as e:
         print(f"  ERROR loading PG19: {e}")
         return {}
@@ -398,7 +425,8 @@ def measure_pg19_position_ppl():
         print("  No documents long enough, skipping")
         return {}
 
-    # --- Our model ---
+    # --- Our model (using forward_span for efficiency) ---
+    SPAN = 256
     print("\n  Measuring neuromorphic model...")
     our_model = load_our_model()
 
@@ -407,19 +435,26 @@ def measure_pg19_position_ppl():
     reset = torch.tensor([True], dtype=torch.bool, device=DEVICE)
 
     for doc_idx, tokens in enumerate(docs):
-        token_t = torch.tensor(tokens, dtype=torch.long, device=DEVICE)
+        token_t = torch.tensor([tokens], dtype=torch.long, device=DEVICE)  # [1, L]
 
-        with torch.no_grad():
-            our_model.forward_one_token(token_t[0:1], reset)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            for start in range(0, len(tokens), SPAN):
+                end = min(start + SPAN, len(tokens))
+                rmask = reset if start == 0 else no_reset
+                logits_span = our_model.forward_span(
+                    token_t[:, start:end], rmask
+                )[0].float()  # [1, P, vocab]
 
-            for t in range(1, len(tokens)):
-                logits, _, _ = our_model.forward_one_token(token_t[t:t+1], no_reset)
-                loss = F.cross_entropy(logits, token_t[t:t+1]).item()
-
-                for (lo, hi), label in zip(bins, bin_labels):
-                    if lo <= t < hi:
-                        our_bin_losses[label].append(loss)
-                        break
+                # Score each position (predict next token)
+                for j in range(logits_span.shape[1] - 1):
+                    t = start + j  # absolute position
+                    loss = F.cross_entropy(
+                        logits_span[0, j:j+1], token_t[0, start+j+1:start+j+2]
+                    ).item()
+                    for (lo, hi), label in zip(bins, bin_labels):
+                        if lo <= t < hi:
+                            our_bin_losses[label].append(loss)
+                            break
 
         if (doc_idx + 1) % 5 == 0:
             print(f"    Doc {doc_idx + 1}/{len(docs)} done")
@@ -540,28 +575,42 @@ def measure_wikitext2_ppl():
 
     results = {}
 
-    # --- Our model (sequential, no sliding window needed) ---
+    # --- Our model (using forward_span for efficient chunk processing) ---
+    SPAN = 256
     print("\n  Measuring neuromorphic model...")
     our_model = load_our_model()
 
     total_loss = 0.0
     n_scored = 0
-    token_t = torch.tensor(tokens_list, dtype=torch.long, device=DEVICE)
+    token_t = torch.tensor([tokens_list], dtype=torch.long, device=DEVICE)  # [1, N]
     no_reset = torch.tensor([False], dtype=torch.bool, device=DEVICE)
     reset_mask = torch.tensor([True], dtype=torch.bool, device=DEVICE)
 
-    with torch.no_grad():
-        our_model.forward_one_token(token_t[0:1], reset_mask)
-        for t in range(1, len(tokens_list)):
-            logits, _, _ = our_model.forward_one_token(token_t[t:t+1], no_reset)
-            loss = F.cross_entropy(logits, token_t[t:t+1]).item()
-            if not math.isnan(loss):
-                total_loss += loss
-                n_scored += 1
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        for start in range(0, len(tokens_list), SPAN):
+            end = min(start + SPAN, len(tokens_list))
+            rmask = reset_mask if start == 0 else no_reset
+            logits_span = our_model.forward_span(
+                token_t[:, start:end], rmask
+            )[0].float()  # [1, P, vocab]
 
-            if (t + 1) % 10000 == 0:
+            # Score: logits[j] predicts token at position start+j+1
+            for j in range(logits_span.shape[1] - 1):
+                target = token_t[0, start + j + 1:start + j + 2]
+                loss = F.cross_entropy(
+                    logits_span[0, j:j + 1], target
+                ).item()
+                if not math.isnan(loss):
+                    total_loss += loss
+                    n_scored += 1
+
+            if n_scored > 0 and (start + SPAN) % 10000 < SPAN:
                 avg = total_loss / n_scored
-                print(f"    {t+1}/{len(tokens_list)} tokens, running ppl={math.exp(avg):.1f}")
+                print(
+                    f"    {min(start + SPAN, len(tokens_list))}"
+                    f"/{len(tokens_list)} tokens,"
+                    f" running ppl={math.exp(avg):.1f}"
+                )
 
     avg_loss = total_loss / n_scored
     ppl = math.exp(avg_loss)
