@@ -13,7 +13,7 @@ WorkingMemory state per stream:
     wm_ptr: [BS]           — ring buffer write index
 
 GLAWorkingMemory state per stream:
-    gla_state: [BS, H, head_dim, head_dim]  — recurrent state matrix (float32)
+    gla_state: [BS, H, head_dim, head_dim]  — recurrent state matrix (bf16 on CUDA, fp32 on CPU)
 """
 
 import math
@@ -403,7 +403,7 @@ def _gla_recurrence(
         k: [BS, P, H, K]  — keys
         v: [BS, P, H, V]  — values
         g: [BS, P, H, K]  — log-space decay gates (negative)
-        state: [BS, H, K, V] — recurrent state matrix (float32)
+        state: [BS, H, K, V] — recurrent state matrix (bf16 on CUDA, fp32 on CPU)
         reset_mask: [BS, P] bool or None — True at doc boundaries;
             state is zeroed *before* computing that token's output.
 

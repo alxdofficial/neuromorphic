@@ -193,7 +193,7 @@ def apply_pm_eligibility_batch(
 
             l_idx = layer.layer_idx
             if l_idx == 0:
-                x_in = x_blocks_all[:, :, b]  # [BS, span_P, D_h]
+                x_in = block.input_norm(x_blocks_all[:, :, b])  # [BS, span_P, D_h]
             else:
                 x_in = block.layers[l_idx - 1]._last_h_all
 

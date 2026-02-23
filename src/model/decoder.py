@@ -86,7 +86,7 @@ class ColumnarAttention(nn.Module):
         for layer in self.layers:
             # Pre-norm cross-attention
             q_norm = layer["norm_ca"](q)
-            q = q + self.drop(layer["cross_attn"](q_norm, kv, kv)[0])
+            q = q + self.drop(layer["cross_attn"](q_norm, kv, kv, need_weights=False)[0])
             # Pre-norm FFN
             q_norm = layer["norm_ff"](q)
             q = q + self.drop(layer["ffn"](q_norm))
@@ -178,7 +178,7 @@ class ThalamicIntegrator(nn.Module):
         for layer in self.layers:
             # Pre-norm cross-attention to memory
             q_norm = layer["norm_ca"](q)
-            q = q + self.drop(layer["cross_attn"](q_norm, memory, memory)[0])
+            q = q + self.drop(layer["cross_attn"](q_norm, memory, memory, need_weights=False)[0])
             # Pre-norm FFN
             q_norm = layer["norm_ff"](q)
             q = q + self.drop(layer["ffn"](q_norm))
@@ -222,11 +222,11 @@ class DecoderBlock(nn.Module):
         """
         # Pre-norm self-attention
         x_norm = self.norm1(x)
-        x = x + self.drop(self.self_attn(x_norm, x_norm, x_norm)[0])
+        x = x + self.drop(self.self_attn(x_norm, x_norm, x_norm, need_weights=False)[0])
 
         # Pre-norm cross-attention to memory
         x_norm = self.norm2(x)
-        x = x + self.drop(self.cross_attn(x_norm, memory, memory)[0])
+        x = x + self.drop(self.cross_attn(x_norm, memory, memory, need_weights=False)[0])
 
         # Pre-norm FFN
         x_norm = self.norm3(x)
