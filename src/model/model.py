@@ -561,24 +561,24 @@ class NeuromorphicLM(nn.Module, StateMixin):
         # Compile each block's forward_span as a single graph
         for block in self.blocks:
             block.forward_span = torch.compile(
-                block.forward_span, mode="max-autotune-no-cudagraphs",
+                block.forward_span, mode="default",
             )
         # Compile GLA WM span path so the recurrence loop can be fused.
         if self.config.wm_enabled and self.config.wm_type == "gla":
             self.wm.forward_span = torch.compile(
-                self.wm.forward_span, mode="max-autotune-no-cudagraphs",
+                self.wm.forward_span, mode="default",
             )
         # Compile spatial decoder forward (hierarchical attention is graph-safe now)
         if self.config.snapshot_enabled and self.spatial_decoder is not None:
             self.spatial_decoder.forward = torch.compile(
-                self.spatial_decoder.forward, mode="max-autotune-no-cudagraphs",
+                self.spatial_decoder.forward, mode="default",
             )
         # PM eligibility is separate (called post-forward in span_ops)
         for block in self.blocks:
             for layer in block.layers:
                 layer.pm._update_eligibility_core = torch.compile(
                     layer.pm._update_eligibility_core,
-                    fullgraph=True, mode="max-autotune-no-cudagraphs",
+                    fullgraph=True, mode="default",
                 )
 
     def compile_for_inference(self, batch_size: int = 1,
