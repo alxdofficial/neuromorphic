@@ -204,6 +204,25 @@ class ModelConfig:
         return cls(**defaults)
 
     @classmethod
+    def tier_1b(cls, **overrides) -> "ModelConfig":
+        """1B-class tier (~1.07B params). D=2048, L=16, B=2, D_h=1024.
+
+        Designed for cloud GPU training (A100 80GB). Matches Pythia-1B's
+        width (D=2048) and depth (16 layers) for direct comparison.
+        Estimated ~21 GB VRAM for training with BS=8, T=256.
+        """
+        defaults = dict(
+            D=2048, L=16, B=2,
+            # Scaled memory capacities
+            r=16, D_wm=384, n_heads_wm=8, gate_low_rank=32,
+            M=512, D_em=256, k_ret=8, C_em=16,
+            # Scaled decoder
+            d_dec=512, n_heads_decoder=8, decoder_layers=3,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
         """Strong tier. D=1024, L=24, B=8. Scaled memory."""
         defaults = dict(

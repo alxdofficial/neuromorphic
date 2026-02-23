@@ -17,15 +17,19 @@ This plan covers datasets, configuration, and training phases for the current Ti
 
 ## 1. VRAM Budget & Model Scaling
 
-### Scaling Tiers (all fit on RTX 4090)
+### Scaling Tiers
 
-| Tier | Params | D | L | B | Target | 4090 BS |
-|------|--------|---|---|---|--------|---------|
-| **A (Wide)** | ~85M | 768 | 8 | 2 | Rapid iteration | 32–64 |
-| **B (Competitive)** | ~103M | 768 | 12 | 6 | Match GPT-2 Small | 16–32 |
-| **C (Strong)** | ~197M | 1024 | 24 | 8 | Match GPT-2 Medium | 8–16 |
+| Tier | Params | D | L | B | D_h | Target | GPU | BS |
+|------|--------|---|---|---|-----|--------|-----|----|
+| **A** | 39.7M | 512 | 8 | 4 | 128 | Debug | RTX 4090 | 32-64 |
+| **A Wide** | 85.1M | 768 | 8 | 2 | 384 | Development | RTX 4090 | 32 |
+| **B** | 78.1M | 768 | 12 | 6 | 128 | Research | RTX 4090 | 16-32 |
+| **1B** | 1,070M | 2048 | 16 | 2 | 1024 | Conversational | A100 80GB | 8 |
+| **C** | 164.0M | 1024 | 24 | 8 | 128 | Research | RTX 4090 | 8-16 |
 
-**Note:** Early LLMs (GPT-1/GPT-2 Small at ~125M) showed meaningful language understanding. **Tier B is the recommended target** for demonstrating competitive results.
+**Scaling pattern:** D_h = D/B. To scale up, increase D proportionally with B (keeping D_h >= 384). The 1B tier matches Pythia-1B's width (D=2048) and depth (L=16) for direct comparison.
+
+**Note:** Tier 1B requires cloud GPU (A100 80GB or similar). Tiers A/A Wide/B/C fit on a single RTX 4090.
 
 ### VRAM Budget (Tier B, bf16 training)
 
@@ -86,13 +90,14 @@ This plan covers datasets, configuration, and training phases for the current Ti
 - Filtered and deduplicated, good quality/size ratio
 - Streaming-friendly (no need to download all at once)
 
-**Secondary dataset:** SlimPajama-627B (for diversity)
-- HuggingFace: `cerebras/SlimPajama-627B`
-- Mix of web, books, code, Wikipedia, StackExchange, arXiv
-- Use a 5–10B token subset via streaming
-- Provides domain diversity the model needs
+**Secondary dataset:** DCLM (for diversity)
+- HuggingFace: `mlfoundations/dclm-baseline-1.0`
+- High-quality filtered web text, 3.8T tokens total
+- Streamed or downloaded locally via `scripts/prepare_data.py`
 
-**Recommended mix:** 70% FineWeb-Edu + 30% SlimPajama (interleaved streaming)
+**Recommended mix:** 60% FineWeb-Edu + 40% DCLM (interleaved)
+
+**Local data pipeline:** Run `python scripts/prepare_data.py --tokens 2B --seed 42` to download ~2B tokens as local parquet files. This eliminates streaming network errors and ensures identical data across all models (neuromorphic + baselines). See `data/phase_B/manifest.json` for metadata.
 
 **Long-context memory training:** PG19 (full-length books)
 - HuggingFace: `deepmind/pg19`

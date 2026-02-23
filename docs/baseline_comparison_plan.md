@@ -1,8 +1,8 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM, ~85M params (Tier A wide: D=768, L=8, B=2), recurrent architecture with parallel blocks, Procedural Memory (PM), Episodic Memory (EM), Working Memory (WM), and spatial decoder.
+**Target model:** Neuromorphic LM, recurrent architecture with parallel blocks, Procedural Memory (PM), Episodic Memory (EM), Working Memory (WM), and spatial decoder. Primary tiers: Tier A Wide (~85M, D=768, L=8, B=2) for RTX 4090 development and Tier 1B (~1.07B, D=2048, L=16, B=2) for cloud GPU training.
 
-**Date:** 2026-02-11
+**Date:** 2026-02-23
 
 ---
 
@@ -280,7 +280,7 @@ Addresses SSM weakness in in-context retrieval by mixing training objectives (st
 
 ## 4. Consolidated Benchmark Table
 
-Best available zero-shot numbers for models nearest to our ~56M parameter scale. All numbers from published papers using lm-evaluation-harness unless noted.
+Best available zero-shot numbers for models nearest to our ~85M (Tier A Wide) and ~1B (Tier 1B) parameter scales. All numbers from published papers using lm-evaluation-harness unless noted.
 
 | Model | Params | Type | HellaSwag | PIQA | ARC-E | ARC-C | WinoGrande | LAMBADA (acc) |
 |-------|--------|------|-----------|------|-------|-------|------------|---------------|
@@ -302,8 +302,8 @@ Best available zero-shot numbers for models nearest to our ~56M parameter scale.
 **Important caveats:**
 - SmolLM numbers appear higher due to 600B training tokens of curated data vs ~300B for Pythia/Mamba on less filtered data
 - Benchmark numbers vary by lm-eval-harness version and prompt format
-- Our model at ~56M is between Pythia-70M and the next tier down (no standard baselines below 70M)
-- Direct parameter matching is Pythia-70M; architecture matching (recurrent) is Mamba-130M
+- At Tier A Wide (~85M), direct parameter matching is Pythia-160M (~85M non-embed); architecture matching (recurrent) is Mamba-130M
+- At Tier 1B (~1.07B), direct parameter matching is TinyLlama-1.1B and Pythia-1B; architecture matching is Mamba-790M
 
 ---
 
@@ -337,7 +337,7 @@ Use lm-evaluation-harness (EleutherAI) for reproducibility. These are the standa
 | **BoolQ** | Yes/no QA | acc | Weakly |
 | **OpenBookQA** | Open-book science | acc_norm | Weakly |
 
-**Recommendation for ~56M model:** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale).
+**Recommendation for ~85M model (Tier A Wide):** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale). **At ~1B (Tier 1B):** All benchmarks become more discriminating; report the full suite including HellaSwag and WinoGrande.
 
 ### 5.3 Token-Level and Efficiency Metrics
 
@@ -573,11 +573,12 @@ This demonstrates whether our architecture achieves better loss-per-FLOP than ba
 
 Train at 3-4 model sizes with matched parameter counts:
 
-| Tier | Our model | Pythia | Mamba |
-|------|-----------|--------|-------|
-| ~85M | Tier A wide (D=768, L=8, B=2) | Pythia-70M / Pythia-160M | Mamba-130M |
-| ~150M | Tier B (D=768, L=12, B=6) | Pythia-160M | Mamba-130M |
-| ~350M | Tier C (D=1024, L=24, B=8) | Pythia-410M | Mamba-370M |
+| Tier | Our model | Pythia | Mamba | Other |
+|------|-----------|--------|-------|-------|
+| ~85M | Tier A Wide (D=768, L=8, B=2) | Pythia-160M (~85M non-embed) | Mamba-130M | SmolLM-135M |
+| ~150M | Tier B (D=768, L=12, B=6) | Pythia-160M | Mamba-130M | RWKV-4 169M |
+| ~350M | Tier C (D=1024, L=24, B=8) | Pythia-410M | Mamba-370M | SmolLM-360M |
+| **~1B** | **Tier 1B (D=2048, L=16, B=2)** | **Pythia-1B** | **Mamba-790M** | **TinyLlama-1.1B** |
 
 **Plot:** Validation loss vs parameter count for each architecture family. If our curve is below baselines, the architecture is more parameter-efficient.
 
@@ -607,13 +608,23 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 
 **Per-model training config (implemented in `train_baseline.py`):**
 
+**Tier A Wide (~85M) comparison on RTX 4090:**
+
 | Model | Params | BS | Steps | LR | LR min | Warmup |
 |-------|--------|----|-------|-----|--------|--------|
-| Neuromorphic Tier A | 39.7M | 32 | 183K | 3e-4 | 3e-5 | 1000 steps |
+| Neuromorphic A Wide | 85.1M | 32 | 183K | 3e-4 | 3e-5 | 1000 steps |
 | Pythia-160M | 134.2M | 96 | 61K | 6e-4 | 6e-5 | 1% (610 steps) |
 | Mamba-130M | 115.1M | 64 | 91K | 6e-4 | 6e-5 | 1% (910 steps) |
 
-Batch sizes are per-model optimal for RTX 4090 (24GB). Different BS is acceptable because the comparison invariant is **total tokens**, not batch size. Each model uses its architecture-appropriate LR.
+**Tier 1B (~1.07B) comparison on A100 80GB:**
+
+| Model | Params | BS | Steps (est.) | LR | GPU |
+|-------|--------|----|-------|-----|-----|
+| Neuromorphic 1B | 1,070M | 8 | ~730K | 1.5e-4 | A100 80GB |
+| Pythia-1B | 1,011M | 32 | ~183K | 3e-4 | A100 80GB |
+| Mamba-790M | 790M | 16 | ~366K | 3e-4 | A100 80GB |
+
+Batch sizes are per-model optimal for each GPU. Different BS is acceptable because the comparison invariant is **total tokens**, not batch size. Each model uses its architecture-appropriate LR.
 
 #### 7.3.2 Implementation
 
@@ -621,6 +632,8 @@ Batch sizes are per-model optimal for RTX 4090 (24GB). Different BS is acceptabl
 - Pythia-160M (GPT-NeoX architecture) and Mamba-130M, both randomly initialized
 - Trained on identical data pipeline with identical tokenizer
 - Script: `auxiliary_repos/baselines/eval_scripts/train_baseline.py`
+
+**Tier 1B baselines:** For 1B-scale comparison, training from scratch on 1.5B tokens is the primary strategy. Pretrained Pythia-1B checkpoints (trained on 300B tokens of the Pile) can serve as reference upper bounds but are not directly comparable due to 200x more training tokens. Mamba-790M pretrained weights can also be used as reference.
 
 ### 7.4 Statistical Rigor
 
@@ -638,7 +651,7 @@ Batch sizes are per-model optimal for RTX 4090 (24GB). Different BS is acceptabl
 These are the experiments needed to convincingly demonstrate the architecture:
 
 #### Priority 1: Core Claims (must have)
-1. **Perplexity on WikiText-103 and Pile validation** at Tier A (~56M) vs Pythia-70M
+1. **Perplexity on WikiText-103 and Pile validation** at Tier A Wide (~85M) vs Pythia-160M, and Tier 1B (~1.07B) vs Pythia-1B
 2. **Component ablation table** (full, no-PM, no-EM, no-WM, bare recurrence) on WikiText-103
 3. **PG19 perplexity vs position curve** showing memory advantage at long distances
 4. **MQAR accuracy** at varying sequence lengths showing EM advantage

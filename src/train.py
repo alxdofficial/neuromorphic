@@ -474,6 +474,7 @@ def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelC
         "a": ModelConfig.tier_a,
         "a_wide": ModelConfig.tier_a_wide,
         "b": ModelConfig.tier_b,
+        "1b": ModelConfig.tier_1b,
         "c": ModelConfig.tier_c,
     }[tier]
     config = tier_fn()

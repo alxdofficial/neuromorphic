@@ -24,7 +24,7 @@ This aligns more closely with a *brain-like system* than with a prompt-centric l
 ### What This Architecture Is *Not* (Remaining Gaps)
 
 * It does not yet include intrinsic **consolidation** of experience into slow weights.
-* **Sequence-parallel pretraining** via scan is available and optimized with `torch.compile` (~26K tok/s on RTX 4090), but further optimization is possible (FLA library kernels, custom CUDA kernels, multi-GPU).
+* **Sequence-parallel pretraining** via scan is available and optimized with `torch.compile` (~84K tok/s on RTX 4090 for Tier A Wide), but further optimization is possible (FLA library kernels, custom CUDA kernels, multi-GPU).
 
 ### What v2 Addresses (Previously Missing)
 
@@ -87,7 +87,7 @@ This addresses the gap from v1.7: the model now has both *implicit* and *declara
 * ✅ Online learning without finetuning (PM + EM writes)
 * ✅ Memory as computation, not text retrieval
 * ✅ Stability via gated plasticity and budgets
-* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence + block-level torch.compile (~26K tok/s on 4090)
+* ✅ **Sequential training bottleneck** — scan-friendly affine recurrence + block-level torch.compile (~84K tok/s on 4090 for Tier A Wide)
 * ✅ **Exact copying and pointing** — WM Gated Linear Attention
 * ✅ **Episodic recall** — EM with top-k retrieval
 * ✅ **Cross-document persistence** — Phase C lifelong mode with soft reset
@@ -123,7 +123,7 @@ where:
 This enables:
 
 * Parallel training via prefix scans within plasticity spans
-* ~45% of Mamba's throughput at equivalent parameter count (~26K tok/s on 4090 with `--compile`)
+* Competitive with Mamba's throughput (~84K tok/s on 4090 with `--compile`, vs Mamba-130M ~59K tok/s)
 * RNN-like inference behavior
 
 ### Plasticity Boundaries for Scan-Friendliness
@@ -135,7 +135,7 @@ v2 adds plasticity span boundaries (every P=64 tokens):
 * Eligibility updates remain differentiable within TBPTT
 * K+V eligibility scans are fused into a single double-width scan for efficiency
 
-**Status:** Implemented and optimized. Block-level `torch.compile(mode="max-autotune-no-cudagraphs")` fuses scan loops, gate computations, and elementwise ops into autotuned CUDA kernels. PM eligibility updates are compiled separately with `fullgraph=True`. PM, EM, and controllers remain intact around the new scan-friendly core.
+**Status:** Implemented and optimized. Block-level `torch.compile(mode="default")` fuses scan loops, gate computations, and elementwise ops into optimized CUDA kernels. PM eligibility updates are compiled separately with `fullgraph=True`. PM, EM, and controllers remain intact around the new scan-friendly core. `max-autotune` was benchmarked but is 3.5% slower at current scale — the default mode's kernels are already near-optimal.
 
 ---
 
@@ -225,7 +225,7 @@ The v1.7 roadmap proposed these upgrades. v2 status:
 3. ✅ **Episodic Memory (EM)** — vector store, B instances with `EMNeuromodulator`
 4. ✅ **Working Memory (WM)** — Gated Linear Attention (GLA) recurrence
 5. ✅ **Lifelong learning (Phase C)** — soft reset at doc boundaries, PM/EM persist, eval framework
-6. ✅ **Training speed optimization** — block-level torch.compile + GLA WM + fused scans (~26K tok/s on 4090)
+6. ✅ **Training speed optimization** — block-level torch.compile + GLA WM + fused scans (~84K tok/s on 4090)
 7. ⏳ **Consolidation mechanism** — not yet implemented (future work)
 
 v2 remains fundamentally different from transformers:
@@ -243,7 +243,7 @@ v2 implements the key architectural recommendations from the v1.7 roadmap:
 * ✅ Episodic memory for declarative recall
 * ✅ Working memory for short-term precision
 * ✅ Lifelong learning with persistent cross-document memory (Phase C)
-* ✅ Training speed optimization (block-level torch.compile, GLA WM, ~26K tok/s)
+* ✅ Training speed optimization (block-level torch.compile, GLA WM, ~84K tok/s)
 * ⏳ Consolidation remains for future work
 
 The architecture remains fundamentally different from transformers:

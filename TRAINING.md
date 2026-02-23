@@ -3,9 +3,13 @@
 ## Quick Start
 
 ```bash
-# Full training (all 3 phases, tier B, optimized BS)
+# Tier A Wide on RTX 4090 (all 3 phases, optimized BS)
 tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
-  "python -u -m src.train --preset phase_a_to_c --bs 48 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
+  "python -u -m src.train --preset phase_a_to_c --tier a_wide --bs 32 --compile 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
+
+# Tier 1B on A100 80GB (cloud training)
+tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
+  "python -u -m src.train --preset phase_a_to_c --tier 1b --bs 8 --compile 2>&1 | tee outputs/train_1b_\$(date +%Y%m%d_%H%M%S).log"
 
 # Attach to monitor
 tmux attach -t neuromorphic-train
@@ -13,42 +17,67 @@ tmux attach -t neuromorphic-train
 # Detach: Ctrl+B, then D
 ```
 
+## Model Tiers
+
+| Tier | Params | D | L | B | D_h | Target GPU | Recommended BS |
+|------|--------|---|---|---|-----|------------|---------------|
+| **A** | 39.7M | 512 | 8 | 4 | 128 | RTX 4090 | 32-64 |
+| **A Wide** | 85.1M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
+| **B** | 78.1M | 768 | 12 | 6 | 128 | RTX 4090 | 16-32 |
+| **1B** | 1,070M | 2048 | 16 | 2 | 1024 | A100 80GB | 8 |
+| **C** | 164.0M | 1024 | 24 | 8 | 128 | RTX 4090 | 8-16 |
+
+**Scaling pattern:** D_h = D/B. Increasing model size → increase D (and optionally B). Keep D_h >= 384 for expressive layers. At 1B+, scale D proportionally with B (e.g. B=4 needs D=4096 to maintain D_h=1024).
+
+Select tier with `--tier a_wide` / `--tier 1b` / etc.
+
 ## Key Settings
 
 - **Always use `-u` flag** with python to disable output buffering (otherwise tee/log files stay empty)
-- **Batch size**: BS=48 is optimal for RTX 4090 (24GB). Uses ~15GB VRAM, leaves headroom for PM/EM in later phases.
-  - BS=64 works for Phase A (19.4GB) but may OOM in later phases with PM/EM enabled
-  - BS=32 is a safe fallback (~10.7GB)
-- **Tier B** (~102.7M params) is the current training tier
+- **Tier A Wide** (~85M params): Primary development tier on RTX 4090
+- **Tier 1B** (~1.07B params): Target tier for conversational quality (cloud GPU)
+- **`--compile`**: Enables `torch.compile(mode="default")` for ~84K tok/s on 4090 (tier A Wide)
 
-## GPU Memory by Batch Size (Tier B, Phase A)
+## Performance by Tier (compiled, Phase B)
 
-| BS | Peak VRAM | tok/s (eager) | tok/s (compiled) | Headroom |
-|----|-----------|---------------|------------------|----------|
-| 16 | 6.3GB     | ~1,800        | ~5,000           | 18GB     |
-| 24 | 8.6GB     | ~2,700        | ~7,500           | 16GB     |
-| 32 | 10.7GB    | ~3,700        | ~10,300          | 14GB     |
-| 48 | 15.1GB    | ~5,500        | ~15,000          | 9.5GB    |
-| 64 | 19.4GB    | ~7,000        | ~19,000          | 5GB      |
+| Tier | Params | tok/s | ms/step | Peak VRAM | GPU |
+|------|--------|-------|---------|-----------|-----|
+| **A Wide** (BS=32) | 85M | ~84,000 | ~24 ms | ~2.4 GB | RTX 4090 |
+| **A Wide** (BS=32, grad ckpt) | 85M | ~83,000 | ~25 ms | ~2.1 GB | RTX 4090 |
+| **1B** (BS=8) | 1,070M | TBD | TBD | ~21 GB est. | A100 80GB |
 
-Enable compiled mode with `--compile` for ~2.8× speedup on CUDA (see below).
+Gradient checkpointing (`gradient_checkpointing: True` in config) trades ~1% speed for ~12% less VRAM. Useful for fitting larger batch sizes.
 
 ## Phase Plan (Default Steps)
 
-| Phase | Steps | Tokens (BS=48) | Features |
+| Phase | Steps | Tokens (BS=32) | Features |
 |-------|-------|-----------------|----------|
-| A     | 5K    | ~61.4M          | WM + PM (TinyStories) |
-| B     | 5K    | ~61.4M          | WM + PM + EM (FineWeb-Edu + DCLM) |
-| C     | 2.5K  | ~30.7M          | WM + PM + EM + lifelong (PM/EM persist across docs) |
+| A     | 5K    | ~40.9M          | WM + PM (TinyStories) |
+| B     | 5K    | ~40.9M          | WM + PM + EM (FineWeb-Edu + DCLM) |
+| C     | 2.5K  | ~20.5M          | WM + PM + EM + lifelong (PM/EM persist across docs) |
 
-Total (preset `phase_a_to_c`): ~12.5K steps, ~153.6M tokens at BS=48
+Total (preset `phase_a_to_c`): ~12.5K steps, ~102M tokens at BS=32
 
 Neuromodulators (PM and EM) are trained by main-loss gradient in all phases — no separate RL optimizer.
 
 ## Tokens Per Step
 
-One step = BS * T tokens (e.g., 48 * 256 = 12,288 tokens).
-Each step processes T/P = 4 forward_span calls (P=64 tokens each). With `--compile` on a 4090, each step takes ~1-2s at BS=32.
+One step = BS * T tokens (e.g., 32 * 256 = 8,192 tokens).
+Each step processes T/P = 4 forward_span calls (P=64 tokens each).
+
+## Local Data Pipeline
+
+For reliable training without network dependencies, download data locally first:
+
+```bash
+# Download ~2B tokens of FineWeb-Edu + DCLM as local parquet files
+python scripts/prepare_data.py --tokens 2B --seed 42
+
+# Verify
+cat data/phase_B/manifest.json
+```
+
+This creates `data/phase_B/` with parquet files (~4-8 GB). The training pipeline auto-detects local files and uses them instead of streaming.
 
 ## Monitoring
 
@@ -60,21 +89,16 @@ Each step processes T/P = 4 forward_span calls (P=64 tokens each). With `--compi
 - **Checkpoints**: Every 2500 steps (SAVE_INTERVAL)
 - **Ablation eval**: Every 1000 steps (ABLATE_INTERVAL)
 
-## Dataset Caching
-
-Datasets are cached in `~/.cache/huggingface/datasets/` (~2.4GB).
-Restarts do NOT re-download. Phase A (TinyStories) is fully local.
-Later phases use streaming with local caching.
-
 ## CLI Overrides
 
 ```bash
+--tier a_wide          # Select model tier (a, a_wide, b, 1b, c)
 --save-interval 5000   # Less frequent checkpoints
 --plot-interval 500    # More frequent plot regeneration
 --no-plots             # Disable all plot generation
 --steps 5000           # Override step count (per phase)
 --bs 32                # Override batch size
---compile              # Enable torch.compile (~2.8× speedup on CUDA)
+--compile              # Enable torch.compile (recommended for CUDA)
 --no-compile           # Disable torch.compile (default)
 ```
 
@@ -91,12 +115,12 @@ All outputs go to `outputs/<run_name>/<run_id>/`:
 ## Cleanup
 
 Delete short/aborted runs from `outputs/` to save disk.
-Checkpoints are ~170MB each (tier A) or larger for tier B.
+Checkpoints are ~170MB each (tier A Wide) or ~4GB (tier 1B).
 
 ## Resuming
 
 ```bash
-python -u -m src.train --phase B --tier b --bs 48 --resume outputs/.../checkpoints/latest.pt
+python -u -m src.train --phase B --tier a_wide --bs 32 --compile --resume outputs/.../checkpoints/latest.pt
 ```
 
 ## Important Notes
@@ -104,4 +128,4 @@ python -u -m src.train --phase B --tier b --bs 48 --resume outputs/.../checkpoin
 - The `outputs/` directory is in `.gitignore`
 - Always commit code changes before starting long training runs
 - Monitor GPU memory in later phases — PM/EM add VRAM overhead
-- If OOM in later phases, reduce BS (try 32)
+- If OOM in later phases, reduce BS or enable gradient checkpointing
