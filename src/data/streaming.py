@@ -11,13 +11,19 @@ This is fundamentally different from transformer data loading where
 each batch item is an independent sequence.
 """
 
+import logging
+import os
+import time
+
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
-from typing import Optional, Iterator, List, Dict, Any
+from typing import Callable, Optional, Iterator, List, Dict, Any
 from dataclasses import dataclass
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from .config import DatasetConfig, DATASET_CONFIGS
 from .tokenizer import get_tokenizer
@@ -36,12 +42,54 @@ def _effective_streaming(config: DatasetConfig) -> bool:
     return config.streaming
 
 
+def _load_dataset_from_config(config: DatasetConfig):
+    """Load a dataset from either a local file or the HuggingFace hub.
+
+    If ``config.hf_path`` points to an existing local file (parquet, jsonl,
+    csv, etc.), the file is loaded directly via ``load_dataset``.  Otherwise
+    the path is treated as a HuggingFace hub identifier.
+    """
+    path = config.hf_path
+    if os.path.exists(path):
+        ext = os.path.splitext(path)[1].lstrip(".")
+        logger.info("Loading local dataset: %s (format=%s)", path, ext)
+        return load_dataset(ext, data_files=path, split="train"), False
+    # Remote HuggingFace dataset
+    use_streaming = _effective_streaming(config)
+    ds = load_dataset(
+        path, config.hf_name, split=config.split, streaming=use_streaming,
+    )
+    return ds, use_streaming
+
+
 @dataclass
 class StreamBatch:
     """A batch of tokens from persistent streams."""
     input_ids: torch.Tensor      # [BS, T] - input tokens
     target_ids: torch.Tensor     # [BS, T] - target tokens (shifted by 1)
     prev_token: torch.Tensor     # [BS] - last token from previous chunk (for reset detection)
+
+
+_MAX_RETRIES = 10
+_BASE_WAIT = 5  # seconds
+
+_NETWORK_ERROR_FRAGMENTS = (
+    "Cannot send a request",
+    "client has been closed",
+    "ConnectionError",
+    "ReadTimeout",
+    "RemoteDisconnected",
+    "Server disconnected",
+    "IncompleteRead",
+    "ConnectionReset",
+    "ChunkedEncodingError",
+)
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transient HTTP/network failure."""
+    msg = str(exc)
+    return any(frag in msg for frag in _NETWORK_ERROR_FRAGMENTS)
 
 
 class DocumentStream:
@@ -58,6 +106,7 @@ class DocumentStream:
         tokenizer: PreTrainedTokenizerFast,
         text_column: str = "text",
         buffer_size: int = 8192,
+        iter_factory: Optional[Callable[[], Iterator[Dict[str, Any]]]] = None,
     ):
         """
         Args:
@@ -65,18 +114,21 @@ class DocumentStream:
             tokenizer: Tokenizer for encoding text
             text_column: Column name containing text data
             buffer_size: Number of tokens to buffer before yielding
+            iter_factory: Optional callable that builds a fresh iterator
+                          (used to recover from transient network errors)
         """
         self.dataset_iter = dataset_iter
         self.tokenizer = tokenizer
         self.text_column = text_column
         self.buffer_size = buffer_size
+        self._iter_factory = iter_factory
 
         self.token_buffer: List[int] = []
         self.exhausted = False
         self.eos_token_id = tokenizer.eos_token_id
 
     def _fill_buffer(self):
-        """Fill token buffer from dataset."""
+        """Fill token buffer from dataset, retrying on transient network errors."""
         while len(self.token_buffer) < self.buffer_size and not self.exhausted:
             try:
                 example = next(self.dataset_iter)
@@ -88,6 +140,32 @@ class DocumentStream:
             except StopIteration:
                 self.exhausted = True
                 break
+            except Exception as exc:
+                if not _is_network_error(exc) or self._iter_factory is None:
+                    raise
+                # Transient network error — rebuild the iterator and retry
+                for attempt in range(1, _MAX_RETRIES + 1):
+                    wait = _BASE_WAIT * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Network error in DocumentStream: %s — "
+                        "retrying in %ds (attempt %d/%d)",
+                        exc, wait, attempt, _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    try:
+                        self.dataset_iter = self._iter_factory()
+                        # Iterator rebuilt successfully, continue filling
+                        break
+                    except Exception as rebuild_exc:
+                        if attempt == _MAX_RETRIES:
+                            raise RuntimeError(
+                                f"Failed to rebuild dataset iterator after "
+                                f"{_MAX_RETRIES} attempts"
+                            ) from rebuild_exc
+                        logger.warning(
+                            "Rebuild attempt %d failed: %s",
+                            attempt, rebuild_exc,
+                        )
 
     def get_tokens(self, count: int) -> List[int]:
         """
@@ -170,15 +248,19 @@ class PersistentStreamDataset(IterableDataset):
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
         stream_seed = self.seed + stream_idx + 9973 * restart_count
 
-        if self._is_streaming:
-            ds_i = self._base_dataset.shuffle(seed=stream_seed, buffer_size=10000)
-        else:
-            ds_i = self._base_dataset.shuffle(seed=stream_seed)
+        ds = self._base_dataset
+        is_streaming = self._is_streaming
+
+        def _make_iter():
+            if is_streaming:
+                return iter(ds.shuffle(seed=stream_seed, buffer_size=10000))
+            return iter(ds.shuffle(seed=stream_seed))
 
         return DocumentStream(
-            dataset_iter=iter(ds_i),
+            dataset_iter=_make_iter(),
             tokenizer=self.tokenizer,
             text_column=self.config.text_column,
+            iter_factory=_make_iter,
         )
 
     def _init_streams(self):
@@ -187,14 +269,9 @@ class PersistentStreamDataset(IterableDataset):
         self._stream_restarts = [0 for _ in range(self.batch_size)]
 
         # Load dataset once, create BS shuffled iterators from it.
-        use_streaming = _effective_streaming(self.config)
-        self._base_dataset = load_dataset(
-            self.config.hf_path,
-            self.config.hf_name,
-            split=self.config.split,
-            streaming=use_streaming,
+        self._base_dataset, self._is_streaming = _load_dataset_from_config(
+            self.config
         )
-        self._is_streaming = use_streaming
 
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
@@ -380,21 +457,16 @@ class MixedStreamDataset(IterableDataset):
         self.streams = []
         self._stream_restarts = [0 for _ in range(self.batch_size)]
 
-        # Load each unique dataset once, keyed by (hf_path, hf_name, split).
-        # Datasets with download_first=True are loaded as map-style (local).
+        # Load each unique dataset once, keyed by hf_path.
         self._ds_cache = {}
         self._ds_streaming = {}
         for config in self.configs:
-            use_streaming = _effective_streaming(config)
-            key = (config.hf_path, config.hf_name, config.split, use_streaming)
+            key = (config.hf_path, config.hf_name, config.split)
             if key not in self._ds_cache:
-                self._ds_cache[key] = load_dataset(
-                    config.hf_path,
-                    config.hf_name,
-                    split=config.split,
-                    streaming=use_streaming,
-                )
-            self._ds_streaming[id(config)] = use_streaming
+                ds, is_streaming = _load_dataset_from_config(config)
+                self._ds_cache[key] = ds
+                self._ds_streaming[key] = is_streaming
+            self._ds_streaming[id(config)] = self._ds_streaming[key]
 
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
@@ -489,21 +561,23 @@ class MixedStreamDataset(IterableDataset):
         assert self._ds_cache is not None
         ds_idx = self.stream_assignments[stream_idx]
         config = self.configs[ds_idx]
-        use_streaming = self._ds_streaming[id(config)]
-        key = (config.hf_path, config.hf_name, config.split, use_streaming)
+        is_streaming = self._ds_streaming[id(config)]
+        key = (config.hf_path, config.hf_name, config.split)
         ds = self._ds_cache[key]
 
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
         stream_seed = self.seed + stream_idx + 9973 * restart_count
-        if use_streaming:
-            ds_i = ds.shuffle(seed=stream_seed, buffer_size=10000)
-        else:
-            ds_i = ds.shuffle(seed=stream_seed)
+
+        def _make_iter():
+            if is_streaming:
+                return iter(ds.shuffle(seed=stream_seed, buffer_size=10000))
+            return iter(ds.shuffle(seed=stream_seed))
 
         return DocumentStream(
-            dataset_iter=iter(ds_i),
+            dataset_iter=_make_iter(),
             tokenizer=self.tokenizer,
             text_column=config.text_column,
+            iter_factory=_make_iter,
         )
 
 

@@ -17,3 +17,4 @@ wandb/
 .claude/
 auxiliary_repos/baselines/model_cache/
 auxiliary_repos/baselines/results/
+/data/

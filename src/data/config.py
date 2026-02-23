@@ -84,6 +84,51 @@ DCLM = DatasetConfig(
                 "Excels on commonsense reasoning. Used by SmolLM2.",
 )
 
+# =============================================================================
+# Local (pre-downloaded) variants — see scripts/prepare_data.py
+# =============================================================================
+
+_LOCAL_DATA_DIR = "data/phase_B"
+
+FINEWEB_EDU_LOCAL = DatasetConfig(
+    name="FineWeb-Edu (local)",
+    hf_path=f"{_LOCAL_DATA_DIR}/fineweb_edu.parquet",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=False,
+    download_first=False,
+    estimated_tokens=1_250_000_000,
+    estimated_disk_gb=3.0,
+    description="Local subset of FineWeb-Edu sample-10BT (~1.25B tokens).",
+)
+
+DCLM_LOCAL = DatasetConfig(
+    name="DCLM (local)",
+    hf_path=f"{_LOCAL_DATA_DIR}/dclm.parquet",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=False,
+    download_first=False,
+    estimated_tokens=830_000_000,
+    estimated_disk_gb=2.0,
+    description="Local subset of DCLM (~830M tokens).",
+)
+
+VAL_FINEWEB_EDU_LOCAL = DatasetConfig(
+    name="FineWeb-Edu validation (local)",
+    hf_path=f"{_LOCAL_DATA_DIR}/val_fineweb_edu.parquet",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=False,
+    download_first=False,
+    estimated_tokens=5_000_000,
+    estimated_disk_gb=0.02,
+    description="Local held-out validation from FineWeb-Edu (seed=1337, ~5M tokens).",
+)
+
 COSMOPEDIA = DatasetConfig(
     name="Cosmopedia-v2",
     hf_path="HuggingFaceTB/cosmopedia",
@@ -238,6 +283,11 @@ DATASET_CONFIGS = {
     "cosmopedia": COSMOPEDIA,
     "slimpajama": SLIMPAJAMA,
 
+    # Local (pre-downloaded) variants
+    "fineweb-edu-local": FINEWEB_EDU_LOCAL,
+    "dclm-local": DCLM_LOCAL,
+    "val-fineweb-edu-local": VAL_FINEWEB_EDU_LOCAL,
+
     # Code training (gated - requires HF access)
     "starcoder": STARCODER,
 
@@ -280,10 +330,17 @@ PHASE_CONFIGS = {
         description="Verify backbone + WM learns language. PM/EM disabled.",
     ),
     "B": PhaseConfig(
-        name="Phase B: Base Language (SmolLM2-style)",
+        name="Phase B: Base Language (Local)",
+        datasets=["fineweb-edu-local", "dclm-local"],
+        mix_weights=[0.6, 0.4],
+        description="Educational + conversational web text from local parquet files. "
+                    "Run scripts/prepare_data.py first.",
+    ),
+    "B-streaming": PhaseConfig(
+        name="Phase B: Base Language (Streaming)",
         datasets=["fineweb-edu", "dclm"],
         mix_weights=[0.6, 0.4],
-        description="Educational + conversational web text. PM with heuristic commits.",
+        description="Educational + conversational web text. Streaming from HF hub.",
     ),
     "B-diverse": PhaseConfig(
         name="Phase B: Diverse Sources",

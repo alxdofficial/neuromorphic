@@ -88,13 +88,13 @@ MAX_GRAD_NORM = 1.0
 LOG_INTERVAL = 50
 
 # -- Validation / monitoring --
-VAL_INTERVAL = 200      # run held-out eval every N train steps (0 = disabled)
+VAL_INTERVAL = 2000     # run held-out eval every N train steps (0 = disabled)
 VAL_STEPS = 20          # validation chunks per eval pass
 VAL_DATA_PHASE = None   # None => same policy as DATA_PHASE auto-logic
 VAL_SEED = 4242
-ABLATE_INTERVAL = 1000  # run PM/EM ablation eval every N steps (0 = disabled)
-PLOT_INTERVAL = 500     # regenerate training curve plots every N steps (0 = disabled)
-TEXT_SAMPLE_INTERVAL = 200  # generate text comparison samples every N steps (0 = disabled)
+ABLATE_INTERVAL = 2000  # run PM/EM ablation eval every N steps (0 = disabled)
+PLOT_INTERVAL = 2000    # regenerate training curve plots every N steps (0 = disabled)
+TEXT_SAMPLE_INTERVAL = 2000  # generate text comparison samples every N steps (0 = disabled)
 
 # -- Safety checks --
 SAFETY_FAIL_FAST = True
@@ -102,7 +102,7 @@ MAX_CONSEC_ZERO_VALID = 3
 
 # -- Checkpointing --
 SAVE_DIR = "checkpoints"
-SAVE_INTERVAL = 2500
+SAVE_INTERVAL = 10000
 RESUME = None       # set to checkpoint path to resume, e.g. "checkpoints/neuromorphic_a_A_step5000.pt"
 
 # -- Metrics collection --
