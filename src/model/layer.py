@@ -6,17 +6,19 @@ h_t = a_t * (carry * h_{t-1}) + b_t, a post-recurrence FFN for
 nonlinear per-position processing, and a PM instance.
 
 Gate inputs: concat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])
-giving input_dim = 4*D_h + 1.
+giving input_dim = 4*D_h + surprise_dim, where surprise_dim is D_pc
+when PCM is enabled (vector surprise) or 1 (scalar surprise).
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import ModelConfig
 from .procedural_memory import ProceduralMemory, PMNeuromodulator
-from .scan import parallel_affine_scan
+from .scan import parallel_affine_scan, _HAS_FLA_HGRN, fla_hgrn_scan
 from .utils import StateMixin, runtime_state_dtype
 
 
@@ -35,7 +37,9 @@ class Layer(nn.Module, StateMixin):
         self.pm_neuromodulator = PMNeuromodulator(config)
 
         # Gate input: x_block + y_pm + y_wm_proj + y_em_proj + surprise
-        input_dim = 4 * D_h + 1
+        # surprise_dim is D_pc (vector δ) when PCM is enabled, else 1 (scalar)
+        self.surprise_dim = config.D_pc if config.pcm_enabled else 1
+        input_dim = 4 * D_h + self.surprise_dim
 
         # Fused gate: single GEMM produces both retention (sigmoid) and update (tanh)
         self.gate_ab = nn.Linear(input_dim, 2 * D_h)
@@ -67,19 +71,41 @@ class Layer(nn.Module, StateMixin):
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys,
                               error_msgs):
-        """Handle loading old checkpoints with separate gate_a/gate_b."""
+        """Handle loading old checkpoints.
+
+        Supports two migration paths:
+        1. Old separate gate_a/gate_b → fused gate_ab
+        2. Old gate_ab with surprise_dim=1 → new gate_ab with surprise_dim=D_pc
+           (pads with zeros so PCM surprise columns start at zero)
+        """
         wa = prefix + "gate_a.weight"
         wb = prefix + "gate_b.weight"
         ba = prefix + "gate_a.bias"
         bb = prefix + "gate_b.bias"
         wab = prefix + "gate_ab.weight"
+        bab = prefix + "gate_ab.bias"
         if wa in state_dict and wab not in state_dict:
             state_dict[wab] = torch.cat(
                 [state_dict.pop(wa), state_dict.pop(wb)], dim=0
             )
-            state_dict[prefix + "gate_ab.bias"] = torch.cat(
+            state_dict[bab] = torch.cat(
                 [state_dict.pop(ba), state_dict.pop(bb)], dim=0
             )
+
+        # Pad gate_ab input dim if checkpoint has fewer columns than current
+        # (e.g. loading surprise_dim=1 checkpoint into pcm_enabled model)
+        if wab in state_dict:
+            saved_in = state_dict[wab].shape[1]
+            current_in = self.gate_ab.in_features
+            if saved_in < current_in:
+                pad_cols = current_in - saved_in
+                state_dict[wab] = torch.cat([
+                    state_dict[wab],
+                    torch.zeros(state_dict[wab].shape[0], pad_cols,
+                                device=state_dict[wab].device,
+                                dtype=state_dict[wab].dtype),
+                ], dim=1)
+
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
@@ -92,7 +118,7 @@ class Layer(nn.Module, StateMixin):
 
     def step(self, x_block: Tensor, y_pm: Tensor, y_wm_proj: Tensor,
              y_em_proj: Tensor, surprise: Tensor, carry: Tensor,
-             collect: bool = False):
+             ffn_gain: Tensor = None, collect: bool = False):
         """Process one token through this layer.
 
         Args:
@@ -100,8 +126,9 @@ class Layer(nn.Module, StateMixin):
             y_pm: [BS, D_h] — PM output (zeros if disabled)
             y_wm_proj: [BS, D_h] — WM output projected to D_h
             y_em_proj: [BS, D_h] — EM output projected to D_h (zeros if disabled)
-            surprise: [BS, 1] — surprise signal
+            surprise: [BS, surprise_dim] — surprise signal (D_pc vector or scalar)
             carry: [BS, 1] — 0 at doc boundaries, 1 otherwise
+            ffn_gain: [BS, D_h] — optional PCM multiplicative gain for FFN input
             collect: bool — if True, return (output, stats_dict)
 
         Returns:
@@ -131,13 +158,16 @@ class Layer(nn.Module, StateMixin):
 
         # Post-recurrence FFN (pre-norm residual)
         if self.ffn is not None:
+            ffn_input = self.ffn_norm(output)
+            if ffn_gain is not None:
+                ffn_input = ffn_input * ffn_gain
             if self.config.gradient_checkpointing and torch.is_grad_enabled():
                 ffn_out = grad_checkpoint(
-                    self.ffn, self.ffn_norm(output), use_reentrant=False
+                    self.ffn, ffn_input, use_reentrant=False
                 )
                 output = output + self.drop_resid(ffn_out)
             else:
-                output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
+                output = output + self.drop_resid(self.ffn(ffn_input))
 
         if collect:
             stats = {
@@ -150,79 +180,111 @@ class Layer(nn.Module, StateMixin):
 
     def _forward_span_core(self, x_all: Tensor, y_pm_all: Tensor,
                            y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
-                           surprise_span: Tensor, carry_all: Tensor) -> Tensor:
+                           surprise_all: Tensor, carry_all: Tensor,
+                           ffn_gain_all: Tensor = None) -> Tensor:
         """Compiled inner loop: gates + scan + output proj + FFN.
 
         No lazy init, no .item() calls, no data-dependent branches —
         safe for torch.compile(fullgraph=True).
+
+        Args:
+            surprise_all: [BS, P_b, surprise_dim] — pre-expanded surprise signal.
+                When PCM is enabled: [BS, P_b, D_pc] (vector δ per token).
+                When PCM is disabled: [BS, P, 1] (scalar surprise, expanded by caller).
+            ffn_gain_all: [BS, P_b, D_h] — optional PCM multiplicative gain for FFN.
         """
         BS, P, D_h = x_all.shape
 
-        # Expand frozen surprise to [BS, P, 1]
-        surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
-
-        # Fuse inputs: [BS, P, 4*D_h + 1]
+        # Fuse inputs: [BS, P, 4*D_h + surprise_dim]
         u = torch.cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
                         surprise_all], dim=-1)
 
         # Fused gate computation: one GEMM, then split + activate
         ab = self.gate_ab(u)                         # [BS, P, 2*D_h]
         a_raw, b_raw = ab.chunk(2, dim=-1)
-        a = torch.sigmoid(a_raw)                     # [BS, P, D_h]
         b = torch.tanh(b_raw)                        # [BS, P, D_h]
 
-        # Cache raw gates for collect path (reference only, no compute)
-        self._last_gate_a = a
-        self._last_gate_b = b
+        if self.config.use_fla_kernels and _HAS_FLA_HGRN and a_raw.is_cuda:
+            # FLA HGRN path: log-space gates → fused Triton scan kernel
+            g_log = F.logsigmoid(a_raw)              # [BS, P, D_h]
 
-        # Apply carry mask (zero at doc boundaries)
-        # Cast carry to activation dtype (carry_all arrives as fp32 from bool→float)
-        a_eff = a * carry_all.to(a.dtype)   # [BS, P, D_h]
+            # Apply carry mask in log space: where carry=0 (doc boundary),
+            # set gate to -30 (exp(-30) ≈ 0, effectively zeroing retention)
+            carry_bool = carry_all.to(torch.bool)    # [BS, P, 1]
+            g_log = torch.where(carry_bool, g_log,
+                                g_log.new_full((), -30.0))
 
-        # Parallel affine scan (cast fp32 state to activation dtype for
-        # memory-efficient scan; restore fp32 after for inter-span precision)
-        h_all = parallel_affine_scan(a_eff, b, self.h.to(a_eff.dtype))  # [BS, P, D_h]
+            h_all, h_final = fla_hgrn_scan(
+                g_log, b, self.h.to(g_log.dtype)
+            )
+            self.h = h_final.to(self.h.dtype)
 
-        # Update state to last token, preserving configured runtime precision.
-        self.h = h_all[:, -1].to(self.h.dtype)
+            # Cache activated gates for collect path
+            self._last_gate_a = torch.sigmoid(a_raw)
+            self._last_gate_b = b
+        else:
+            # Pure PyTorch fallback (torch.compile fuses the loop)
+            a = torch.sigmoid(a_raw)                 # [BS, P, D_h]
+
+            # Cache gates for collect path
+            self._last_gate_a = a
+            self._last_gate_b = b
+
+            # Apply carry mask (zero at doc boundaries)
+            a_eff = a * carry_all.to(a.dtype)        # [BS, P, D_h]
+
+            # Parallel affine scan
+            h_all = parallel_affine_scan(a_eff, b, self.h.to(a_eff.dtype))
+            self.h = h_all[:, -1].to(self.h.dtype)
 
         # Batched output projection + residual + LayerNorm
         output = self.norm(self.drop_resid(self.W_o(h_all)) + x_all)
 
         # Batched post-recurrence FFN
         if self.ffn is not None:
+            ffn_input = self.ffn_norm(output)
+            if ffn_gain_all is not None:
+                ffn_input = ffn_input * ffn_gain_all
             if self.config.gradient_checkpointing and torch.is_grad_enabled():
                 ffn_out = grad_checkpoint(
-                    self.ffn, self.ffn_norm(output), use_reentrant=False
+                    self.ffn, ffn_input, use_reentrant=False
                 )
                 output = output + self.drop_resid(ffn_out)
             else:
-                output = output + self.drop_resid(self.ffn(self.ffn_norm(output)))
+                output = output + self.drop_resid(self.ffn(ffn_input))
 
         return output
 
     def forward_span(self, x_all: Tensor, y_pm_all: Tensor,
                      y_wm_proj_all: Tensor, y_em_proj_all: Tensor,
-                     surprise_span: Tensor, carry_all: Tensor,
+                     surprise_all: Tensor, carry_all: Tensor,
+                     ffn_gain_all: Tensor = None,
                      collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this layer.
 
         Args:
-            x_all: [BS, P, D_h] — block input for all tokens
-            y_pm_all: [BS, P, D_h] — PM output for all tokens
-            y_wm_proj_all: [BS, P, D_h] — WM output projected to D_h
-            y_em_proj_all: [BS, P, D_h] — EM output projected to D_h
-            surprise_span: [BS, 1] — frozen surprise for this span
-            carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
+            x_all: [BS, P_b, D_h] — block input for all tokens
+            y_pm_all: [BS, P_b, D_h] — PM output for all tokens
+            y_wm_proj_all: [BS, P_b, D_h] — WM output projected to D_h
+            y_em_proj_all: [BS, P_b, D_h] — EM output projected to D_h
+            surprise_all: [BS, P_b, surprise_dim] or [BS, surprise_dim] — surprise.
+                If 2D, auto-expanded to [BS, P_b, surprise_dim] for backward compat.
+            carry_all: [BS, P_b, 1] — 0 at doc boundaries, 1 otherwise
+            ffn_gain_all: [BS, P_b, D_h] — optional PCM FFN gain modulation
             collect: if True, return (output, gate_stats) tuple
 
         Returns:
-            output_all: [BS, P, D_h] — layer outputs for all tokens
+            output_all: [BS, P_b, D_h] — layer outputs for all tokens
             (if collect: also returns gate_stats dict)
         """
+        # Auto-expand 2D surprise to 3D for backward compatibility
+        if surprise_all.dim() == 2:
+            P = x_all.shape[1]
+            surprise_all = surprise_all.unsqueeze(1).expand(-1, P, -1)
+
         output = self._forward_span_core(
             x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
-            surprise_span, carry_all,
+            surprise_all, carry_all, ffn_gain_all,
         )
 
         # Store full output sequence for post-forward eligibility/EM.

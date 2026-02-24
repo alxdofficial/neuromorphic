@@ -37,6 +37,8 @@ def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
             layer.pm.reset_states(mask)      # pm_K/pm_V/pm_a/elig
         # Keep em_K/em_V but zero strengths so retrieval is inactive.
         block.em.reset_states(mask)
+        if block.pcm is not None:
+            block.pcm.reset_states(mask)     # z_hat
 
     model.wm.reset_states(mask)
     model.detach_states()
@@ -137,6 +139,11 @@ def evaluate_validation(
                     total_loss += float(span_loss.item())
                     valid_count += int(span_valid.item())
 
+                    # When PCM enabled, override with ‖δ‖ surprise
+                    pcm_surprise = model.get_pcm_token_surprise()
+                    if pcm_surprise is not None:
+                        token_surprise = pcm_surprise
+
                     # Compute reset masks for accumulators
                     reset_mask_all = span_ops.compute_reset_mask(
                         model, span_ids, reset_first, config.reset_on_doc_boundary
@@ -177,6 +184,10 @@ def evaluate_validation(
                     span_ops.apply_mid_span_resets(
                         model, reset_mask_all, config,
                     )
+
+                    # PCM hypothesis update (val: we don't accumulate losses)
+                    if config.pcm_enabled:
+                        span_ops.apply_pcm_boundary(model, config)
 
                     if config.pm_enabled:
                         span_ops.apply_pm_boundary(model, span_surprise_mean)

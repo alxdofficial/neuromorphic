@@ -25,6 +25,13 @@ from torch import Tensor
 from .config import ModelConfig
 from .utils import StateMixin, runtime_state_dtype
 
+# Try to import FLA GLA kernel (fused Triton chunkwise parallel)
+try:
+    from fla.ops.gla import chunk_gla as _fla_gla
+    _HAS_FLA_GLA = True
+except ImportError:
+    _HAS_FLA_GLA = False
+
 
 class WorkingMemory(nn.Module, StateMixin):
     _state_tensor_names = ["wm_K", "wm_V", "wm_valid", "wm_ptr"]
@@ -562,10 +569,27 @@ class GLAWorkingMemory(nn.Module, StateMixin):
             self.W_g(x_all).view(BS, P, self.n_heads, self.head_dim)
         ) / self.gate_logit_normalizer  # [BS, P, H, K]
 
-        # Pure PyTorch recurrence with per-token resets at doc boundaries
-        out, self.gla_state = _gla_recurrence(
-            q, k, v, g, self.gla_state, reset_mask=reset_mask_all,
-        )
+        if self.config.use_fla_kernels and _HAS_FLA_GLA and x_all.is_cuda:
+            # FLA path: fused Triton GLA chunkwise kernel
+            # Handle first-token reset (mid-span resets are accepted approximation)
+            if reset_mask_all is not None:
+                first_reset = reset_mask_all[:, 0]   # [BS]
+                keep = (~first_reset).to(self.gla_state.dtype).view(-1, 1, 1, 1)
+                self.gla_state = self.gla_state * keep
+
+            # FLA uses same [BS, T, H, K] layout as our code
+            out, final_state = _fla_gla(
+                q, k, v, g,
+                scale=1.0,
+                initial_state=self.gla_state.float(),
+                output_final_state=True,
+            )
+            self.gla_state = final_state.to(self.gla_state.dtype)
+        else:
+            # Pure PyTorch fallback with per-token resets at doc boundaries
+            out, self.gla_state = _gla_recurrence(
+                q, k, v, g, self.gla_state, reset_mask=reset_mask_all,
+            )
         # out: [BS, P, H, V]
 
         # Merge heads and project: [BS, P, D]

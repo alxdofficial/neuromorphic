@@ -74,9 +74,21 @@ class ModelConfig:
     T: int = 256              # TBPTT segment length
     P: int = 64               # plasticity span
     use_compile: bool = False # torch.compile for CUDA training
+    use_fla_kernels: bool = False  # use FLA Triton kernels for scan/GLA (incompatible with compile)
     gradient_checkpointing: bool = False  # recompute FFN activations to save VRAM
     reset_on_doc_boundary: bool = True
     lifelong_mode: bool = False  # Phase C: PM/EM persist across doc boundaries
+
+    # Predictive Coding Module (per block)
+    pcm_enabled: bool = False          # master toggle
+    D_pc: int = 128                    # PCM latent dimension
+    pcm_pred_weight: float = 0.01      # prediction loss weight
+    pcm_recon_weight: float = 0.01     # reconstruction loss weight
+    pcm_warmup_steps: int = 100        # steps before PCM losses ramp in
+
+    # Multi-Timescale Blocks
+    block_scales: tuple = None         # per-block scale factors, e.g. (1, 4) for B=2
+                                       # None = all scale 1 (current behavior)
 
     # Spatial Decoder (hierarchical aggregation + deep cross-attention)
     snapshot_enabled: bool = True   # architecture toggle (independent of phase)
@@ -140,6 +152,22 @@ class ModelConfig:
                 f"tau_route_pm ({self.tau_route_pm}) must be positive "
                 f"to avoid division by zero in PM slot routing."
             )
+        if self.pcm_enabled and self.D_pc <= 0:
+            raise ValueError(
+                f"D_pc ({self.D_pc}) must be positive when pcm_enabled=True."
+            )
+        if self.block_scales is not None:
+            if len(self.block_scales) != self.B:
+                raise ValueError(
+                    f"block_scales length ({len(self.block_scales)}) must "
+                    f"equal B ({self.B})."
+                )
+            for i, s in enumerate(self.block_scales):
+                if s < 1 or self.P % s != 0:
+                    raise ValueError(
+                        f"block_scales[{i}]={s} must be >= 1 and "
+                        f"divide P ({self.P}) evenly."
+                    )
 
     def set_phase(self, phase: str):
         """Set component toggles for training phase.

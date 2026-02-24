@@ -17,6 +17,13 @@ try:
 except ImportError:
     _HAS_ASSOC_SCAN = False
 
+# Try to import FLA HGRN kernel (fused Triton recurrence)
+try:
+    from fla.ops.hgrn import fused_recurrent_hgrn as _fla_hgrn
+    _HAS_FLA_HGRN = True
+except ImportError:
+    _HAS_FLA_HGRN = False
+
 
 def _combine_fn(left: tuple[Tensor, Tensor],
                 right: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
@@ -66,6 +73,30 @@ def _parallel_prefix_scan(a: Tensor, b: Tensor, h_init: Tensor) -> Tensor:
 
     # Skip the prepended initial state
     return result[1][:, 1:]
+
+
+def fla_hgrn_scan(g_log: Tensor, b: Tensor, h_init: Tensor) -> tuple[Tensor, Tensor]:
+    """FLA HGRN kernel: h_t = exp(g_t) * h_{t-1} + b_t.
+
+    Fused Triton kernel for GPU.
+
+    Args:
+        g_log: [BS, P, D] — log-space retention gates (negative)
+        b: [BS, P, D] — update values
+        h_init: [BS, D] — initial hidden state
+
+    Returns:
+        h_all: [BS, P, D] — all hidden states
+        h_final: [BS, D] — final hidden state
+    """
+    # FLA HGRN expects [BS, T, D] — no head dimension
+    o, final_state = _fla_hgrn(
+        b,                                            # x: [BS, P, D]
+        g_log,                                        # g: [BS, P, D]
+        initial_state=h_init.float(),                 # [BS, D]
+        output_final_state=True,
+    )
+    return o, final_state                             # [BS, P, D], [BS, D]
 
 
 def parallel_affine_scan(a: Tensor, b: Tensor, h_init: Tensor) -> Tensor:

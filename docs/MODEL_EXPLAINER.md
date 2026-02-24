@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-16
+**Last verified against code:** 2026-02-24
 
 ---
 
@@ -42,6 +42,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 | **Working memory** (WM) | Prefrontal cortex / scratchpad | Recurrent state (GLA) | Gated Linear Attention — learned recency via decay gates (no plasticity) |
 | **Procedural memory** (PM) | Cerebellum / skill memory | Across documents/lifelong | Eligibility traces + neuromodulated commits |
 | **Episodic memory** (EM) | Hippocampus / event memory | Across documents/lifelong | Novelty-based writes to vector store + neuromodulation |
+| **Predictive coding** (PCM) | Cortical prediction error | Per-span hypothesis | Evidence-hypothesis surprise (δ = z - ẑ) |
 
 **Why not just use a transformer?** Transformers have a single memory mechanism (KV cache) that scales linearly with context. Our model separates *what* to remember from *how long* to remember it. WM handles precise short-range copying. PM learns reusable patterns (like skills). EM stores specific surprising events for later recall. Each system can be independently controlled, budgeted, and -- starting in Phase B -- learned via main-loss backprop through neuromodulators.
 
@@ -126,6 +127,8 @@ Token ID ──► Embedding ──► x: [BS, D]
 | PM instances | `ProceduralMemory` | B*L=16 | `layer.pm` (one per layer per block) |
 | PM neuromodulators | `PMNeuromodulator` | B*L=16 | `layer.pm_neuromodulator` |
 | EM neuromodulators | `EMNeuromodulator` | B=2 | `block.em_neuromodulator` |
+| PCM | `PredictiveCodingModule` | 0 or B | `block.pcm` (if `pcm_enabled`) |
+| Temporal pooler | `TemporalPooler` | B | `block.pooler` (identity when scale=1) |
 | Spatial decoder | `SpatialDecoder` | 0 or 1 | `model.spatial_decoder` (if `snapshot_enabled`) |
 
 ---
@@ -228,12 +231,14 @@ The original sliding-window attention implementation is available as a fallback.
 ```python
 # Fuse all inputs into a single feature vector
 u = concat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])
-# u: [BS, 4*D_h + 1]
+# u: [BS, 4*D_h + S] where S = D_pc if pcm_enabled, else 1 (scalar surprise)
 
 # Compute gates (NO dependence on h_prev)
 a = sigmoid(W_a(u))   # [BS, D_h]  -- retention gate (how much to keep)
 b = tanh(W_b(u))       # [BS, D_h]  -- update gate (what to add)
 ```
+
+When PCM is enabled, `surprise` is the full D_pc-dimensional vector δ (prediction error), giving gates a rich signal about *what* was unexpected. When PCM is disabled, surprise is a scalar (-log p(target) from previous span).
 
 **Recurrence with doc-boundary carry:**
 ```python
@@ -247,17 +252,22 @@ h = a * (carry * h_prev) + b
 
 **Post-recurrence FFN:** After the output projection + residual + LayerNorm, each layer applies a feed-forward network with pre-norm residual:
 ```python
-output = output + dropout(ffn(ffn_norm(output)))
+ffn_input = ffn_norm(output)
+if ffn_gain is not None:  # PCM-provided multiplicative gain
+    ffn_input = ffn_input * ffn_gain   # [BS, D_h] *= [BS, D_h]
+output = output + dropout(ffn(ffn_input))
 # ffn: Linear(D_h, D_h*4) → GELU → Linear(D_h*4, D_h)
 ```
 The recurrence mixes temporal information across time steps; the FFN adds per-position nonlinear depth, giving the model capacity to transform what it retrieves from memory before passing it to the next layer. Controlled by `ffn_expansion` (default 4; set to 0 to disable). Dropout (rate `config.dropout`, default 0.1) is applied after the FFN output but before the residual add.
+
+When PCM is enabled, `ffn_gain = 1 + W_gain(δ)` modulates the FFN input per-dimension based on prediction surprise. W_gain is zero-initialized so gain starts at exactly 1.0 (identity). This lets the model amplify or suppress FFN processing based on what was unexpected.
 
 **What each input contributes:**
 - `x_block: [BS, D_h]` -- the current token's representation for this block
 - `y_pm: [BS, D_h]` -- what procedural memory recalls for this input (learned patterns)
 - `y_wm_proj: [BS, D_h]` -- what working memory recalled (recent context)
 - `y_em_proj: [BS, D_h]` -- what episodic memory recalled (long-range events)
-- `surprise: [BS, 1]` -- how surprised the model was at the previous prediction (scalar signal)
+- `surprise: [BS, 1] or [BS, D_pc]` -- surprise signal. Scalar -log p(target) when PCM is disabled; vector prediction error δ when PCM is enabled
 
 ---
 
@@ -603,7 +613,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 **File:** `src/model/block.py`
 
-A Block is a self-contained processing unit: B blocks run in parallel, each handling `D_h = D/B` dimensions.
+A Block is a self-contained processing unit: B blocks run in parallel, each handling `D_h = D/B` dimensions. Each block optionally contains a Predictive Coding Module (PCM) and a Temporal Pooler for multi-timescale processing.
 
 **Block.step(x_block, y_wm, x_proj, surprise, carry) per token:**
 ```python
@@ -614,12 +624,25 @@ y_em = self.em.retrieve(x_proj, y_wm)           # [BS, D]
 y_wm_proj = self.W_wm_proj(y_wm)               # [BS, D_h]
 y_em_proj = self.W_em_proj(y_em)                # [BS, D_h]
 
-# 3. Sequential layers (L=8)
-x = x_block                                     # [BS, D_h]
+# 3. PCM: encode evidence, compute surprise and FFN gain (if enabled)
+if pcm is not None:
+    z = pcm.encode(x_block.unsqueeze(1))         # [BS, 1, D_pc]
+    delta = pcm.compute_surprise(z)              # [BS, 1, D_pc]
+    gate_surprise = delta.squeeze(1)             # [BS, D_pc] — vector surprise for gates
+    ffn_gain = pcm.compute_ffn_gain(delta).squeeze(1)  # [BS, D_h]
+    pm_surprise = delta.norm(dim=-1)             # [BS, 1] — scalar ‖δ‖ for PM eligibility
+else:
+    gate_surprise = surprise                     # [BS, 1] — scalar surprise
+    ffn_gain = None
+    pm_surprise = surprise
+
+# 4. Sequential layers (L=8)
+x = input_norm(x_block)                         # [BS, D_h] — pre-LayerNorm for L0
 for layer in self.layers:
     y_pm = layer.pm.apply(x)                     # PM read
-    h = layer.step(x, y_pm, y_wm_proj, y_em_proj, surprise, carry)
-    layer.pm.update_eligibility(x, h, surprise)  # accumulate elig traces (surprise-gated)
+    h = layer.step(x, y_pm, y_wm_proj, y_em_proj, gate_surprise, carry,
+                   ffn_gain=ffn_gain)
+    layer.pm.update_eligibility(x, h, pm_surprise)  # surprise-gated elig traces
     x = h                                        # next layer's input
 
 return x   # [BS, D_h]
@@ -660,6 +683,80 @@ for layer in self.layers:
 ```
 
 This is the core of the soft reset: transient state (h, eligibility) resets at doc boundaries, but committed PM weights and EM content persist across documents. Natural memory turnover is handled by existing decay and budget enforcement.
+
+### 9.2 Predictive Coding Module (PCM)
+
+**File:** `src/model/predictive_coding.py`
+
+**Intuition:** The brain is a prediction machine. PCM implements a per-block hypothesis-evidence-surprise loop inspired by Karl Friston's free energy principle. Instead of measuring surprise as scalar -log p(target) from the language model head (which conflates rare words with genuinely novel context), PCM measures surprise as a **vector prediction error** in a learned latent space — capturing whether the model's *internal representation* changed unexpectedly.
+
+**Components:**
+
+| Component | Architecture | Purpose |
+|-----------|-------------|---------|
+| Evidence encoder | `LayerNorm(D_h) → Linear(D_h, D_pc)` | Compress block input to latent (bottom-up) |
+| Hypothesis predictor | `Linear(D_pc+D_h+D_h+D_em, D_pc*2) → GELU → Linear(D_pc*2, D_pc)` | Predict next span's latent from current state + memory summaries |
+| Reconstruction decoder | `Linear(D_pc, D_h)` | Aux loss only — prevents encoder collapse |
+| FFN gain modulator | `Linear(D_pc, D_h)` (zero-initialized) | `gain = 1 + W_gain(δ)` — modulates FFN input |
+
+**Per-span flow:**
+```python
+# During forward pass (per token):
+z = encoder(LayerNorm(x_block))              # [BS, P_b, D_pc] — evidence
+delta = z - z_hat.unsqueeze(1)               # [BS, P_b, D_pc] — surprise vector (δ)
+ffn_gain = 1 + W_gain(delta)                 # [BS, P_b, D_h] — FFN modulation
+
+# At span boundary:
+L_pred = ||z_hat - z_end.detach()||²         # prediction loss (how wrong was hypothesis?)
+z_hat_new = predictor(cat([z_end, ctx_b, pm_summary_b, em_summary_b]).detach())
+L_recon = ||decoder(z) - x_block.detach()||² # reconstruction loss
+```
+
+**Surprise routing (when PCM is enabled):**
+- **Gate inputs:** Vector δ replaces scalar surprise → `cat([x, y_pm, y_wm, y_em, δ])` with dim `4*D_h + D_pc`
+- **FFN gain:** `ffn_input *= (1 + W_gain(δ))` — per-dimension modulation
+- **PM eligibility:** Scalar `‖δ‖` (L2 norm of prediction error) replaces loss-based surprise
+- **PM neuromodulator:** Scalar `‖δ‖` as surprise input at span boundary
+- **EM candidate scoring:** Per-token `‖δ‖` for novelty scoring
+- **EM neuromodulator:** Span-mean `‖δ‖` as surprise input
+
+**Key design decisions:**
+- **z_hat is NOT detached** across TBPTT boundaries — its computation graph (just the predictor's forward pass on detached inputs) persists so L_pred can backprop through predictor weights.
+- **W_gain is zero-initialized** so gain starts at exactly 1.0 (identity). The model learns to modulate as needed.
+- **Predictor inputs are all detached** — the predictor learns to predict, but doesn't affect the main model's gradient flow.
+- **Warmup schedule:** PCM aux losses ramp linearly from 0 to full weight over `pcm_warmup_steps`, letting the main model stabilize before PCM gradients kick in.
+
+**Config:** `pcm_enabled=False` (default), `D_pc=128`, `pcm_pred_weight=0.01`, `pcm_recon_weight=0.01`, `pcm_warmup_steps=100`
+
+### 9.3 Multi-Timescale Blocks
+
+**File:** `src/model/temporal_pool.py`
+
+**Intuition:** The brain has no global clock — neurons operate at heterogeneous timescales. When `block_scales` is set (e.g., `(1, 4)` for B=2), each block processes input at a different temporal resolution via causal convolution pooling. Block 0 (scale=1) sees every token; Block 1 (scale=4) sees causal averages of 4-token windows, producing smoother representations naturally aligned with PM/EM's span-level operation.
+
+**Components:**
+
+| Component | Architecture | Purpose |
+|-----------|-------------|---------|
+| `TemporalPooler` | `Conv1d(D_h, D_h, kernel=scale, stride=scale, groups=D_h)` | Learnable causal downsampling (depthwise conv, init as average) |
+| `causal_avg_pool` | Non-parameterized | Pool auxiliary signals (y_wm, x_proj) to match block's resolution |
+| `carry_min_pool` | Min-pool over carry mask | Any boundary in conv window forces reset (conservative) |
+
+**Per-block flow (scale > 1):**
+```python
+# Downsample: [BS, P, D_h] → [BS, P//s, D_h]
+x_block_b = pooler.downsample(x_block_all)
+y_wm_b = causal_avg_pool(y_wm_all, s)
+carry_b = carry_min_pool(carry_all, s)
+
+# Process at reduced resolution (same L layers, PCM, etc.)
+...layers...
+
+# Upsample back: [BS, P//s, D_h] → [BS, P, D_h] (repeat_interleave)
+x_up = pooler.upsample(x, P)
+```
+
+**Config:** `block_scales=None` (default, all scale 1). Set e.g. `block_scales=(1, 4)` for 2-block multi-timescale.
 
 ---
 
@@ -1152,11 +1249,11 @@ Neuromodulator overhead is negligible: ~16,500 params total (~0.04% of Tier A), 
 Understanding what learns via backprop and what evolves as runtime state:
 
 ```text
-LM loss
+LM loss + PCM aux losses (L_pred + L_recon, if pcm_enabled)
   ↓
 logits ← lm_head ← (spatial decoder or h_final)
   ↓
-layer/block computation (gates, recurrence, FFN, WM/PM/EM reads)
+layer/block computation (gates, recurrence, FFN with gain modulation, WM/PM/EM reads)
   ↓
 parameter gradients to:
   - core model weights (embedding, gates, FFN, projections, lm_head)
@@ -1164,16 +1261,20 @@ parameter gradients to:
   - EM candidate/novelty projections (W_k_cand, W_v_cand, W_nov)
   - PM neuromodulator heads (p_commit, lambda, g, slot logits, tau)
   - EM neuromodulator heads (g_em, tau, ww, decay)
+  - PCM weights (encoder, decoder, predictor, W_gain — if pcm_enabled)
+  - Temporal pooler conv weights (if block_scales configured)
 
 Runtime state updates (not parameters, no optimizer state):
   - PM state: pm_K, pm_V, pm_a, elig_K, elig_V
   - EM state: em_K, em_V, em_S
   - WM state: gla_state (or wm_K, wm_V, wm_valid, wm_ptr if softmax)
+  - PCM state: z_hat (hypothesis, graph preserved across TBPTT — if pcm_enabled)
 ```
 
 **Summary:**
-- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), and EM neuromodulator backbone + heads (Phase B+). Single optimizer for everything.
+- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled), temporal pooler conv weights (if block_scales configured). Single optimizer for everything.
 - **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
+- **Evolves via explicit rules (graph preserved):** PCM z_hat — updated at span boundaries by predictor forward pass; graph persists across TBPTT for L_pred backprop
 - **Not plastic (no memory update mechanism):** WM recurrent state (GLA state matrix; gradients flow through within TBPTT chunks, detached at chunk boundaries)
 
 ---

@@ -2,7 +2,7 @@
 
 **Purpose:** Documents the scan-friendly parallel training path (`forward_span`), its relationship to the sequential path (`forward_one_token`), and every place where the two paths differ in logic or math. Read `MODEL_EXPLAINER.md` first for full architecture context; this document focuses on what changes.
 
-**Last verified against code:** 2026-02-16
+**Last verified against code:** 2026-02-24
 
 ---
 
@@ -426,74 +426,110 @@ y_em_all = W_o_cross(out)                                      # [BS, P, D]
 
 **Sequential** (`step()`):
 ```python
-u = cat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])  # [BS, 4*D_h+1=1537]
+u = cat([x_block, y_pm, y_wm_proj, y_em_proj, surprise])  # [BS, 4*D_h+S]
+# S = D_pc if pcm_enabled (vector surprise δ), else 1 (scalar surprise)
 a = sigmoid(gate_a(u))                                      # [BS, D_h]
 b = tanh(gate_b(u))                                         # [BS, D_h]
 self.h = a * (carry * self.h) + b                           # scalar recurrence
 output = norm(W_o(self.h) + x_block)                        # projection + residual + norm
-output = output + ffn(ffn_norm(output))                     # post-recurrence FFN
+ffn_input = ffn_norm(output)
+if ffn_gain is not None:                                     # PCM-provided gain
+    ffn_input = ffn_input * ffn_gain                         # [BS, D_h] *= [BS, D_h]
+output = output + ffn(ffn_input)                            # post-recurrence FFN
 ```
 
 **Parallel** (`forward_span()`):
 ```python
-surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)         # frozen!
+# surprise_all: [BS, P_b, D_pc] if PCM (vector δ), or [BS, P_b, 1] if scalar
 u = cat([x_all, y_pm_all, y_wm_proj_all, y_em_proj_all,
-         surprise_all], dim=-1)                                     # [BS, P, 4*D_h+1=1537]
+         surprise_all], dim=-1)                                     # [BS, P_b, 4*D_h+S]
 
-a = sigmoid(gate_a(u))                                              # [BS, P, D_h] — batched
-b = tanh(gate_b(u))                                                 # [BS, P, D_h] — batched
+a = sigmoid(gate_a(u))                                              # [BS, P_b, D_h] — batched
+b = tanh(gate_b(u))                                                 # [BS, P_b, D_h] — batched
 a_eff = a * carry_all                                               # zero at doc boundaries
 
-h_all = parallel_affine_scan(a_eff, b, self.h)                     # [BS, P, D_h] — scan
+h_all = parallel_affine_scan(a_eff, b, self.h)                     # [BS, P_b, D_h] — scan
 self.h = h_all[:, -1]                                               # update state
 
 output = norm(W_o(h_all) + x_all)                                  # batched projection + norm
-output = output + ffn(ffn_norm(output))                            # batched FFN
+ffn_input = ffn_norm(output)
+if ffn_gain_all is not None:                                        # PCM-provided gain
+    ffn_input = ffn_input * ffn_gain_all                            # [BS, P_b, D_h]
+output = output + ffn(ffn_input)                                   # batched FFN
 
 self._last_h_all = output                                          # cached for post-forward
 ```
 
 **Key differences:**
-1. **Surprise is frozen** — `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7).
-2. **Gate projections batched** — one `gate_a` forward on `[BS, P, 4*D_h+1=1537]` instead of P separate calls on `[BS, 4*D_h+1=1537]`. This is where most of the speedup comes from.
-3. **Recurrence via scan** — `parallel_affine_scan` computes all P hidden states given pre-computed `a` and `b` (§6).
-4. **`_last_h_all` cached** — The full `[BS, P, D_h]` output sequence is stored for the trainer's post-forward eligibility and EM candidate steps.
+1. **Surprise is frozen** — When PCM is disabled, `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7). When PCM is enabled, the surprise is the full δ vector computed per-token at the block's temporal resolution.
+2. **Gate projections batched** — one `gate_a` forward on `[BS, P_b, 4*D_h+S]` instead of P separate calls. This is where most of the speedup comes from.
+3. **Recurrence via scan** — `parallel_affine_scan` computes all P_b hidden states given pre-computed `a` and `b` (§6).
+4. **`_last_h_all` cached** — The full `[BS, P_b, D_h]` output sequence is stored for the trainer's post-forward eligibility and EM candidate steps.
+5. **FFN gain modulation** — When PCM is enabled, `ffn_gain_all = 1 + W_gain(δ)` modulates FFN input per-dimension based on prediction surprise.
 
 ### 5.6 Block
 
 **File:** `src/model/block.py` — `forward_span()`
 
-**Sequential** (`step()`): Per layer: PM read → layer step → eligibility update → next layer
+**Sequential** (`step()`): Per layer: PCM encode → PM read → layer step (with δ + FFN gain) → eligibility update → next layer
 
-**Parallel** (`forward_span()`): Per layer: PM batch read → layer forward_span → next layer. **Eligibility is NOT updated** inside the block — it's deferred to the trainer (§9).
+**Parallel** (`forward_span()`): Temporal downsample → PCM encode → per layer: PM batch read → layer forward_span (with δ + FFN gain) → next layer → temporal upsample. **Eligibility is NOT updated** inside the block — it's deferred to the trainer (§9).
 
 ```python
-def forward_span(self, x_block_all, y_wm_all, x_emb_all,
+def forward_span(self, x_block_all, y_wm_all, x_proj_all,
                  surprise_span, carry_all):
-    # EM retrieval (batched, frozen state)
-    y_em_all = self.em.retrieve_batch(x_emb_all, y_wm_all)     # [BS, P, D]
+    BS, P, D_h = x_block_all.shape
+
+    # --- Temporal downsampling (multi-timescale) ---
+    x_block_b = self.pooler.downsample(x_block_all)       # [BS, P_b, D_h] where P_b = P // scale
+    y_wm_b = causal_avg_pool(y_wm_all, self.scale)        # [BS, P_b, D]
+    carry_b = carry_min_pool(carry_all, self.scale)        # [BS, P_b, 1]
+
+    # EM retrieval at pooled resolution (batched, frozen state)
+    y_em_b = self.em.retrieve_batch(x_proj_b, y_wm_b)     # [BS, P_b, D]
 
     # Project shared signals to per-block dimension
-    y_wm_proj_all = self.W_wm_proj(y_wm_all)                   # [BS, P, D_h]
-    y_em_proj_all = self.W_em_proj(y_em_all)                    # [BS, P, D_h]
+    y_wm_proj_b = self.W_wm_proj(y_wm_b)                  # [BS, P_b, D_h]
+    y_em_proj_b = self.W_em_proj(y_em_b)                   # [BS, P_b, D_h]
 
-    x = x_block_all
+    # --- PCM: encode evidence, compute surprise, FFN gain ---
+    if self.pcm is not None:
+        z = self.pcm.encode(x_block_b)                     # [BS, P_b, D_pc]
+        delta = self.pcm.compute_surprise(z)               # [BS, P_b, D_pc]
+        surprise_b = delta                                 # vector surprise for gates
+        ffn_gain_b = self.pcm.compute_ffn_gain(delta)      # [BS, P_b, D_h]
+        # Cache scalar ‖δ‖ for PM/EM (upsampled to full resolution)
+        self._last_token_surprise = self.pooler.upsample(
+            delta.norm(dim=-1, keepdim=True), P)           # [BS, P, 1]
+    else:
+        surprise_b = surprise_span.unsqueeze(1).expand(BS, P_b, 1)
+        ffn_gain_b = None
+
+    # Pre-LayerNorm for Layer 0
+    x = self.input_norm(x_block_b)
     for layer in self.layers:
-        y_pm_all = layer.pm.apply_batch(x)                      # PM read (batched)
-        x = layer.forward_span(x, y_pm_all, y_wm_proj_all,
-                               y_em_proj_all, surprise_span, carry_all)
+        y_pm_b = layer.pm.apply_batch(x)                   # PM read (batched)
+        x = layer.forward_span(x, y_pm_b, y_wm_proj_b,
+                               y_em_proj_b, surprise_b, carry_b,
+                               ffn_gain_all=ffn_gain_b)
 
-    # Cache per-layer outputs for spatial decoder
-    self._last_layer_stack = torch.stack(
-        [layer._last_h_all for layer in self.layers], dim=2
-    )  # [BS, P, L, D_h]
+    # --- Temporal upsampling back to P ---
+    x_up = self.pooler.upsample(x, P)                     # [BS, P, D_h]
 
-    return x
+    # Cache per-layer outputs for spatial decoder (upsampled)
+    if self.config.snapshot_enabled:
+        self._last_layer_stack = torch.stack(
+            [self.pooler.upsample(layer._last_h_all, P)
+             for layer in self.layers], dim=2)             # [BS, P, L, D_h]
+
+    return x_up
 ```
 
-**Key differences:**
-1. Eligibility accumulation is decoupled from the forward pass and handled in the trainer post-forward step. This is necessary because eligibility needs per-token surprise (not available until after logits are computed).
-2. `_last_layer_stack` is cached on the block for the spatial decoder. Each layer already caches `_last_h_all` during `forward_span`; the block stacks them into `[BS, P, L, D_h]`. The model reshapes to `[BS*P, L, D_h]` before passing to the decoder.
+**Key differences from sequential:**
+1. **Temporal pooling** — When `block_scales` is configured, input is downsampled before processing and upsampled after. All computation (PCM, layers) happens at reduced resolution `P_b = P // scale`, reducing FLOPs proportionally.
+2. **PCM operates at pooled resolution** — Evidence encoding, surprise computation, and FFN gain are computed on `[BS, P_b, ...]` tensors. The scalar surprise `‖δ‖` is upsampled to full resolution for PM eligibility and EM candidate scoring.
+3. **Eligibility accumulation** is decoupled from the forward pass and handled in the trainer post-forward step.
+4. `_last_layer_stack` is cached on the block for the spatial decoder, with layer outputs upsampled to original P if multi-timescale.
 
 ---
 
@@ -858,9 +894,11 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 | `src/model/procedural_memory.py` | `ProceduralMemory.apply_batch()` — batched PM read |
 | `src/model/episodic_memory.py` | `EpisodicMemory.retrieve_batch()`, `propose_candidate_batch()` |
 | `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V, batched no-reset path, sequential fallback |
-| `src/model/block.py` | `Block.forward_span()` — orchestrates batched components, caches `_last_layer_stack` |
+| `src/model/block.py` | `Block.forward_span()` — temporal pooling, PCM, batched layers, caches `_last_layer_stack` |
+| `src/model/predictive_coding.py` | `PredictiveCodingModule` — evidence encoder, hypothesis predictor, surprise/gain computation |
+| `src/model/temporal_pool.py` | `TemporalPooler`, `causal_avg_pool`, `carry_min_pool` — multi-timescale support |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
-| `src/model/model.py` | `NeuromorphicLM.forward_span()`, `_compute_reset_masks()` |
+| `src/model/model.py` | `NeuromorphicLM.forward_span()`, `apply_pcm_boundary()`, `get_pcm_token_surprise()` |
 | `src/training/trainer.py` | Span loop orchestration, delegates to span_ops |
 | `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM/EM accumulation and commits |
 | `src/training/loss.py` | `batched_cross_entropy()` — span-level loss computation |

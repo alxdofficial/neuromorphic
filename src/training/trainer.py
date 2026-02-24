@@ -211,8 +211,11 @@ class TBPTTTrainer:
             # Finalize span: stack EM candidates for boundary writes
             result = accum.finalize(self.device, self.config)
 
-            # Span boundary: PM commit + EM write
-            self._apply_boundary_updates(result, span_surprise_mean)
+            # Span boundary: PM commit + EM write + PCM hypothesis update
+            L_pred, L_recon = self._apply_boundary_updates(
+                result, span_surprise_mean,
+            )
+            chunk_loss = chunk_loss + L_pred + L_recon
 
         # Backward + clip + optimizer step
         avg_loss, reg, grad_norm = self._backward_and_step(
@@ -273,6 +276,14 @@ class TBPTTTrainer:
                     f"Non-finite loss at global step {self.global_step}, "
                     f"span [{span_start}, {span_end})."
                 )
+
+            # When PCM enabled, use ‖δ‖ from PCM as the surprise signal
+            # instead of loss-based -log p(target). PCM surprise is computed
+            # per-block during forward_span and averaged across blocks.
+            pcm_surprise = self.model.get_pcm_token_surprise()
+            if pcm_surprise is not None:
+                token_surprise = pcm_surprise
+
             # F.cross_entropy returns fp32 even under autocast.  Cast surprise
             # to bf16 so downstream PM/EM element-wise ops stay on TensorCores
             # instead of promoting back to fp32.
@@ -317,8 +328,16 @@ class TBPTTTrainer:
 
     def _apply_boundary_updates(
         self, result: span_ops.SpanResult, span_surprise_mean: Tensor,
-    ) -> None:
-        """PM base_decay + commit, EM neuromod + write at span boundary."""
+    ) -> tuple[Tensor, Tensor]:
+        """PM base_decay + commit, EM neuromod + write, PCM hypothesis update.
+
+        Returns (L_pred, L_recon) — PCM aux losses (zeros if disabled).
+        """
+        # PCM hypothesis update (must happen before PM commit so z_end is cached)
+        L_pred, L_recon = span_ops.apply_pcm_boundary(
+            self.model, self.config, self.global_step,
+        )
+
         if self.config.pm_enabled:
             commit_info = span_ops.apply_pm_boundary(
                 self.model, span_surprise_mean,
@@ -339,6 +358,8 @@ class TBPTTTrainer:
                     self.collector.record_em_write(
                         b_idx, novelty_mean, g_em_mean,
                     )
+
+        return L_pred, L_recon
 
     def _backward_and_step(
         self, chunk_loss, valid_count,

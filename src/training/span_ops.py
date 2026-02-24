@@ -177,6 +177,8 @@ def apply_pm_eligibility_batch(
     """Route cached x_proj to blocks, call update_eligibility_batch.
 
     Uses model._last_x_proj_all (cached by forward_span).
+    When PCM is enabled, uses per-block ‖δ‖ surprise instead of
+    the global loss-based token_surprise.
     Modifies PM eligibility traces in-place.
     """
     BS, span_P = token_surprise.shape[:2]
@@ -187,6 +189,13 @@ def apply_pm_eligibility_batch(
     )  # [BS, span_P, B, D_h]
 
     for b, block in enumerate(model.blocks):
+        # Per-block PCM surprise when available, else global loss-based
+        block_surprise = (
+            block._last_token_surprise
+            if getattr(block, '_last_token_surprise', None) is not None
+            else token_surprise
+        )
+
         for layer in block.layers:
             if layer._last_h_all is None:
                 continue
@@ -200,7 +209,7 @@ def apply_pm_eligibility_batch(
             h_out = layer._last_h_all  # [BS, span_P, D_h]
 
             layer.pm.update_eligibility_batch(
-                x_in, h_out, token_surprise, reset_mask_all,
+                x_in, h_out, block_surprise, reset_mask_all,
             )
 
 
@@ -221,13 +230,22 @@ def propose_em_candidates(
 ) -> None:
     """Propose EM candidates per block. Appends to the cand_* lists in-place.
 
+    When PCM is enabled, uses per-block ‖δ‖ surprise for novelty scoring
+    instead of the global loss-based token_surprise.
+
     Stacking is deferred to SpanAccumulator.finalize() or stack_em_candidates().
     """
     for b, block in enumerate(model.blocks):
         h_final_all = block.layers[-1]._last_h_all
         if h_final_all is not None:
+            # Per-block PCM surprise when available
+            block_surprise = (
+                block._last_token_surprise
+                if getattr(block, '_last_token_surprise', None) is not None
+                else token_surprise
+            )
             k_c, v_c, nov = block.em.propose_candidate_batch(
-                x_proj_all, y_wm_all, h_final_all, token_surprise,
+                x_proj_all, y_wm_all, h_final_all, block_surprise,
             )
             cand_K[b].append(k_c)
             cand_V[b].append(v_c)
@@ -311,6 +329,34 @@ def apply_mid_span_resets(
 # ------------------------------------------------------------------
 # Span-boundary commits and writes
 # ------------------------------------------------------------------
+
+def apply_pcm_boundary(
+    model: NeuromorphicLM,
+    config: ModelConfig,
+    global_step: int = 0,
+) -> tuple[Tensor, Tensor]:
+    """Update PCM hypotheses and compute aux losses with warmup schedule.
+
+    Returns (L_pred_weighted, L_recon_weighted) — scalar losses ready
+    to add to the main loss. Both are zero when pcm_enabled=False.
+    """
+    if not config.pcm_enabled:
+        device = next(model.parameters()).device
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+    L_pred_raw, L_recon_raw = model.apply_pcm_boundary()
+
+    # Warmup ramp: linearly scale PCM losses from 0 to full weight
+    warmup = config.pcm_warmup_steps
+    if warmup > 0 and global_step < warmup:
+        ramp = global_step / warmup
+    else:
+        ramp = 1.0
+
+    L_pred = config.pcm_pred_weight * ramp * L_pred_raw
+    L_recon = config.pcm_recon_weight * ramp * L_recon_raw
+    return L_pred, L_recon
+
 
 def apply_pm_boundary(
     model: NeuromorphicLM,

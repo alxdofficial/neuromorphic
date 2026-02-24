@@ -91,6 +91,9 @@ class NeuromorphicLM(nn.Module, StateMixin):
             if self.config.em_enabled and \
                     self._state_needs_init(block.em.em_K, BS):
                 block.em._lazy_init(BS, device)
+            if block.pcm is not None and \
+                    self._state_needs_init(block.pcm.z_hat, BS):
+                block.pcm._lazy_init(BS, device)
             for layer in block.layers:
                 if self._state_needs_init(layer.h, BS):
                     layer._lazy_init(BS, device)
@@ -378,6 +381,54 @@ class NeuromorphicLM(nn.Module, StateMixin):
             return torch.stack(readouts, dim=0).mean(dim=0)  # [BS, D_em]
         return torch.zeros(BS, self.config.D_em, device=device)
 
+    def _compute_pm_summary_per_block(self, block_idx: int, BS: int,
+                                      device: torch.device) -> Tensor:
+        """PM readout for a single block (all layers averaged).
+
+        Returns: [BS, D_h] — for PCM hypothesis predictor input.
+        """
+        block = self.blocks[block_idx]
+        readouts = []
+        for layer in block.layers:
+            pm = layer.pm
+            if pm.pm_a is not None and pm.pm_V is not None:
+                weights = pm.pm_a.unsqueeze(-1)  # [BS, r, 1]
+                denom = pm.pm_a.sum(dim=1, keepdim=True) + 1e-8
+                readout = (weights * pm.pm_V).sum(dim=1) / denom  # [BS, D_h]
+                readouts.append(readout)
+        if readouts:
+            return torch.stack(readouts, dim=0).mean(dim=0)
+        return torch.zeros(BS, self.config.D_h, device=device)
+
+    def _compute_em_summary_per_block(self, block_idx: int, BS: int,
+                                      device: torch.device) -> Tensor:
+        """EM readout for a single block.
+
+        Returns: [BS, D_em] — for PCM hypothesis predictor input.
+        """
+        em = self.blocks[block_idx].em
+        if em.em_S is not None and em.em_V is not None:
+            weights = em.em_S.unsqueeze(-1)  # [BS, M, 1]
+            denom = em.em_S.sum(dim=1, keepdim=True) + 1e-8
+            return (weights * em.em_V).sum(dim=1) / denom  # [BS, D_em]
+        return torch.zeros(BS, self.config.D_em, device=device)
+
+    def get_pcm_token_surprise(self) -> Tensor | None:
+        """Average per-block PCM ‖δ‖ at full resolution.
+
+        Returns: [BS, P, 1] — per-token scalar surprise from PCM.
+        None if PCM is disabled or no cached surprise available.
+        """
+        if not self.config.pcm_enabled:
+            return None
+        surprises = []
+        for block in self.blocks:
+            if block._last_token_surprise is not None:
+                surprises.append(block._last_token_surprise)
+        if not surprises:
+            return None
+        return torch.stack(surprises, dim=0).mean(dim=0)  # [BS, P, 1]
+
     def update_surprise(self, logits: Tensor, target: Tensor, mask: Tensor = None):
         """Update surprise signal: -log p(target).
 
@@ -515,6 +566,51 @@ class NeuromorphicLM(nn.Module, StateMixin):
             # EM writes are handled by the trainer (needs candidate buffers)
         return commit_info
 
+    def apply_pcm_boundary(self) -> tuple[Tensor, Tensor]:
+        """Update PCM hypothesis for all blocks at span boundary.
+
+        Must be called after forward_span. Uses cached z (evidence) and
+        last layer output from each block.
+
+        Returns:
+            L_pred_total: scalar — sum of prediction losses across blocks
+            L_recon_total: scalar — sum of reconstruction losses across blocks
+        """
+        if not self.config.pcm_enabled:
+            device = next(self.parameters()).device
+            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+        BS = self.blocks[0].layers[0].h.shape[0]
+        device = self.blocks[0].layers[0].h.device
+        L_pred_total = torch.tensor(0.0, device=device)
+        L_recon_total = torch.tensor(0.0, device=device)
+
+        for b_idx, block in enumerate(self.blocks):
+            pcm = block.pcm
+            if pcm is None:
+                continue
+
+            z = block._last_z                        # [BS, P_b, D_pc]
+            z_end = z[:, -1]                         # [BS, D_pc]
+
+            # Block context: last layer output at last pooled position
+            ctx_b = block.layers[-1]._last_h_all[:, -1]  # [BS, D_h]
+
+            # Per-block memory summaries for hypothesis predictor
+            pm_summary_b = self._compute_pm_summary_per_block(b_idx, BS, device)
+            em_summary_b = self._compute_em_summary_per_block(b_idx, BS, device)
+
+            L_pred = pcm.boundary_update(z_end, ctx_b, pm_summary_b, em_summary_b)
+            L_pred_total = L_pred_total + L_pred
+            L_recon_total = L_recon_total + block._last_L_recon
+
+            # Free cached tensors to release computation graph memory
+            block._last_z = None
+            block._last_L_recon = None
+            block._last_token_surprise = None
+
+        return L_pred_total, L_recon_total
+
     def reset_at_doc_boundary(self, mask: Tensor):
         """Per-stream reset of all memory states.
 
@@ -552,19 +648,28 @@ class NeuromorphicLM(nn.Module, StateMixin):
         When wm_type='gla', also compiles wm.forward_span so the
         per-token GLA recurrence loop is fused.
 
+        When use_fla_kernels=True, FLA Triton kernels are used instead.
+        These have @torch.compiler.disable so compilation is skipped for
+        modules that call them (graph breaks would negate the benefit).
+
         Requires initialize_states() to have been called first so lazy
         init guards don't cause graph breaks.
 
         PM eligibility update is compiled separately (called post-forward
         in span_ops).
         """
+        use_fla = self.config.use_fla_kernels
         # Compile each block's forward_span as a single graph
-        for block in self.blocks:
-            block.forward_span = torch.compile(
-                block.forward_span, mode="default",
-            )
+        # Skip when FLA kernels are used (they cause graph breaks via
+        # @torch.compiler.disable, which splits the compiled graph)
+        if not use_fla:
+            for block in self.blocks:
+                block.forward_span = torch.compile(
+                    block.forward_span, mode="default",
+                )
         # Compile GLA WM span path so the recurrence loop can be fused.
-        if self.config.wm_enabled and self.config.wm_type == "gla":
+        # Skip when FLA GLA kernel is used (same graph break issue).
+        if self.config.wm_enabled and self.config.wm_type == "gla" and not use_fla:
             self.wm.forward_span = torch.compile(
                 self.wm.forward_span, mode="default",
             )

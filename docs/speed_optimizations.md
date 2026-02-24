@@ -143,16 +143,37 @@ Removed GPU-CPU synchronization barriers:
 
 ---
 
+### Phase 5: FLA Triton Kernel Integration (optional `--fla` flag)
+
+| Change | Description |
+|--------|-------------|
+| FLA HGRN for layer scan | `fused_recurrent_hgrn` replaces `_sequential_scan` for `h_t = a*h + b` |
+| FLA chunk_gla for GLA WM | `chunk_gla` replaces `_gla_recurrence` for working memory |
+| Gate reparameterization | `sigmoid(a_raw)` → `logsigmoid(a_raw)` for HGRN log-space gates |
+| Carry mask in log space | Doc boundary carry=0 → gate=-30 (exp(-30) ≈ 0) |
+
+**Result:** FLA kernels are numerically correct (HGRN max diff 0.023, GLA max diff 0.001 in bf16). However, **no throughput improvement at P=64 with torch.compile**:
+
+- FLA functions have `@torch.compiler.disable`, causing graph breaks inside compiled regions
+- torch.compile already fuses the P=64 sequential loop into efficient kernels
+- Net effect: ~23K tok/s with or without FLA when compile is active
+- Without compile: FLA gives ~7K tok/s vs ~8K without (slightly slower due to kernel launch overhead)
+
+**When FLA helps:** At larger P (128-256+), torch.compile's unrolled loop becomes less efficient while FLA's chunkwise parallel kernel maintains constant overhead. FLA may also help when their `@torch.compiler.disable` is relaxed in future versions.
+
+**Usage:** `--fla` flag enables FLA kernels (automatically skips torch.compile for affected modules). Default is off (torch.compile preferred at P=64).
+
+---
+
 ## Potential Future Optimizations
 
 | Optimization | Expected Impact | Effort |
 |-------------|----------------|--------|
-| FLA library GLA kernels | 1.5-2x WM speedup (fused Triton kernels) | Medium |
-| Increase P to 128-256 | 1.3-1.5x (fewer span boundaries) | Low — config change |
+| Increase P to 128-256 | 1.3-1.5x (fewer span boundaries, FLA shines here) | Low — config change |
 | FlashAttention in spatial decoder | Minor (decoder is <5% of cost) | Low |
-| Custom CUDA kernel for GLA recurrence | 1.5-2x WM speedup | High |
 | `torch.associative_scan` for PM eligibility | 1.1-1.3x PM speedup | Low |
 | Multi-GPU data parallelism | Linear scaling with GPU count | Medium |
+| FLA torch.compile support | Would combine FLA speed with compile fusion | Depends on FLA upstream |
 
 ---
 

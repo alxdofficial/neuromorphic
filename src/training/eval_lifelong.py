@@ -146,6 +146,10 @@ def _compute_chunk_ppl(
         # Per-stream surprise mean for this span (used by both PM and EM)
         span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
 
+        # PCM hypothesis update (eval: discard aux losses)
+        if config.pcm_enabled:
+            span_ops.apply_pcm_boundary(model, config)
+
         # Span boundary commits
         if config.pm_enabled:
             span_ops.apply_pm_boundary(model, span_surprise_mean)
