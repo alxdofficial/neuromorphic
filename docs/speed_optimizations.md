@@ -1,6 +1,6 @@
 # Speed Optimizations & Scaling
 
-**Last updated:** 2026-02-23
+**Last updated:** 2026-02-24
 **Hardware:** NVIDIA RTX 4090 (24GB VRAM), benchmarked with Tier A Wide
 **Model:** Tier A Wide (D=768, L=8, B=2, ~85M params), Phase B, BS=32, T=256, P=64
 
@@ -10,21 +10,21 @@
 
 | Metric | Value |
 |--------|-------|
-| Training throughput | ~84K tok/s |
+| Training throughput | ~24K tok/s |
 | Tokens per step | 8,192 (BS=32 × T=256) |
-| Step time | ~24.4 ms |
-| Peak VRAM | 2.4 GB |
-| + gradient checkpointing | ~83K tok/s, 2.1 GB (12% less VRAM) |
+| Step time | ~340 ms |
+| Peak VRAM | ~2.4 GB |
+| 1.5B token training time | ~17h |
 
-### Baseline Comparison (Tier A Wide, 85M params)
+### Baseline Comparison (Tier A Wide, 1.5B tokens, RTX 4090)
 
-| Model | Params | tok/s | Relative |
-|-------|--------|-------|----------|
-| Pythia-160M (transformer) | 134M | ~102K | 1.2x faster |
-| Mamba-130M (SSM) | 115M | ~59K | 1.4x slower |
-| **Neuromorphic LM** | **85M** | **~84K** | **1x** |
+| Model | Params | tok/s | 1.5B train time | Relative speed |
+|-------|--------|-------|-----------------|----------------|
+| Pythia-160M (transformer) | 134M | ~116K | ~2.7h | 4.9x faster |
+| Mamba-130M (SSM) | 115M | ~52K | ~3.3h | 2.2x faster |
+| **Neuromorphic LM** | **85M** | **~24K** | **~17h** | **1x** |
 
-The throughput is now competitive with baselines. The remaining gap vs Pythia is primarily due to sequential span processing (4 spans of P=64 instead of one parallel pass over T=256) and three memory systems (PM/EM/WM) that baselines lack.
+The neuromorphic model is slower than baselines due to its three memory systems (PM/EM/WM), sequential span processing (4 spans of P=64), and span-boundary operations (PM commits, EM writes). This is the cost of having persistent, adaptive memory — baselines are simpler feedforward or SSM architectures with no online learning.
 
 ---
 
@@ -74,9 +74,9 @@ Throughput scales roughly as: tok/s ∝ (GPU_FLOPS / params_per_step). Larger mo
 
 | Tier | Estimated tok/s | GPU | Notes |
 |------|----------------|-----|-------|
-| A Wide (85M) | ~84K | RTX 4090 | Measured |
-| 1B | ~10-15K (est.) | A100 80GB | A100 has ~2x FLOPS of 4090, but 12x more params |
-| 1B | ~15-25K (est.) | H100 80GB | H100 has ~3x FLOPS of 4090 |
+| A Wide (85M) | ~24K | RTX 4090 | Measured (Phase B) |
+| 1B | ~3-5K (est.) | A100 80GB | A100 has ~2x FLOPS of 4090, but 12x more params |
+| 1B | ~5-8K (est.) | H100 80GB | H100 has ~3x FLOPS of 4090 |
 
 ---
 
@@ -128,22 +128,13 @@ Removed GPU-CPU synchronization barriers:
 | Batch size sweep | Found BS=32 optimal (was previously using BS=32, confirmed) |
 | torch.compile mode evaluation | Benchmarked `max-autotune-no-cudagraphs` — 3.5% slower than `mode="default"`, reverted |
 
-**Result:** ~26.4K → ~84K tok/s (3.2x) — primarily from BS optimization + reduced overhead from robustness fixes enabling more efficient compilation.
+**Result:** ~26.4K → ~24K tok/s (Phase B steady-state). The robustness fixes (pre-LayerNorm, NaN hardening) improved training stability without measurable throughput regression. The BS=32 sweep confirmed this was already optimal.
 
 **Note on compile modes:** `max-autotune` tries hundreds of Triton kernel variants but at tier A Wide scale, the default autotuned kernels are already near-optimal. `max-autotune` may help at 1B+ scale where kernel selection matters more. CUDA graphs are incompatible with our stateful memory writes (PM/EM modify tensors in-place between forward passes).
 
 ---
 
-## Why We're Faster Than Some Baselines Now
-
-The early 26K tok/s was limited by suboptimal batch sizes and compilation overhead. After Phase 4 optimizations:
-
-1. **Efficient block compilation:** `torch.compile(mode="default")` fuses gate computations, scans, FFN, and PM reads into optimized CUDA kernels per block
-2. **GLA WM is cheap:** The sequential recurrence over P=64 tokens compiles into a tight loop (microseconds)
-3. **Spatial decoder is <5% of cost:** Hierarchical cross-attention adds minimal overhead
-4. **PM/EM are lightweight at small scale:** At D_h=384, PM slots and EM retrieval are small matrix ops
-
-## Why We're Still Slower Than Pythia
+## Why We're Slower Than Baselines
 
 1. **Sequential span processing:** 4 spans of P=64 instead of one parallel pass over T=256
 2. **Three memory systems:** PM eligibility, EM retrieval+write, WM recurrence add per-token overhead

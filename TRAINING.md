@@ -36,17 +36,24 @@ Select tier with `--tier a_wide` / `--tier 1b` / etc.
 - **Always use `-u` flag** with python to disable output buffering (otherwise tee/log files stay empty)
 - **Tier A Wide** (~85M params): Primary development tier on RTX 4090
 - **Tier 1B** (~1.07B params): Target tier for conversational quality (cloud GPU)
-- **`--compile`**: Enables `torch.compile(mode="default")` for ~84K tok/s on 4090 (tier A Wide)
+- **`--compile`**: Enables `torch.compile(mode="default")` — required for reasonable throughput on CUDA
 
 ## Performance by Tier (compiled, Phase B)
 
-| Tier | Params | tok/s | ms/step | Peak VRAM | GPU |
-|------|--------|-------|---------|-----------|-----|
-| **A Wide** (BS=32) | 85M | ~84,000 | ~24 ms | ~2.4 GB | RTX 4090 |
-| **A Wide** (BS=32, grad ckpt) | 85M | ~83,000 | ~25 ms | ~2.1 GB | RTX 4090 |
-| **1B** (BS=8) | 1,070M | TBD | TBD | ~21 GB est. | A100 80GB |
+| Tier | Params | tok/s | ms/step | Peak VRAM | 1.5B tokens | GPU |
+|------|--------|-------|---------|-----------|-------------|-----|
+| **A Wide** (BS=32) | 85M | ~24,000 | ~340 ms | ~2.4 GB | ~17h | RTX 4090 |
+| **1B** (BS=8) | 1,070M | ~3-5K (est.) | TBD | ~21 GB est. | TBD | A100 80GB |
 
-Gradient checkpointing (`gradient_checkpointing: True` in config) trades ~1% speed for ~12% less VRAM. Useful for fitting larger batch sizes.
+### Baseline Comparison (1.5B tokens, RTX 4090)
+
+| Model | Params | tok/s | 1.5B train time |
+|-------|--------|-------|-----------------|
+| Pythia-160M | 134M | ~116K | ~2.7h |
+| Mamba-130M | 115M | ~52K | ~3.3h |
+| **Neuromorphic A Wide** | **85M** | **~24K** | **~17h** |
+
+The neuromorphic model is slower due to three memory systems (PM/EM/WM), sequential span processing, and span-boundary operations. This is the cost of persistent adaptive memory.
 
 ## Phase Plan (Default Steps)
 

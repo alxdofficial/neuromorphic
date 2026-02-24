@@ -845,7 +845,7 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 
 **Pre-initialization requirement:** `model.initialize_states(BS, device)` must be called before `compile_for_training()` to pre-allocate all runtime state tensors (Layer.h, PM state, EM state, WM state). This eliminates lazy init guards from the forward path, preventing graph breaks during compilation.
 
-**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~84K tok/s on RTX 4090 (Tier A Wide, BS=32, Phase B).
+**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~24K tok/s on RTX 4090 (Tier A Wide, BS=32, Phase B).
 
 ---
 
