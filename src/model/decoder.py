@@ -63,7 +63,7 @@ class ColumnarAttention(nn.Module):
                 "norm_ff": nn.LayerNorm(D_h),
                 "ffn": nn.Sequential(
                     nn.Linear(D_h, D_h * 4),
-                    nn.GELU(),
+                    nn.GELU(approximate="tanh"),
                     nn.Dropout(dropout),
                     nn.Linear(D_h * 4, D_h),
                 ),
@@ -143,7 +143,7 @@ class ThalamicIntegrator(nn.Module):
                 "norm_ff": nn.LayerNorm(d_dec),
                 "ffn": nn.Sequential(
                     nn.Linear(d_dec, d_dec * 4),
-                    nn.GELU(),
+                    nn.GELU(approximate="tanh"),
                     nn.Dropout(dropout),
                     nn.Linear(d_dec * 4, d_dec),
                 ),
@@ -207,7 +207,7 @@ class DecoderBlock(nn.Module):
         self.norm3 = nn.LayerNorm(d_dec)
         self.ffn = nn.Sequential(
             nn.Linear(d_dec, d_ff),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_dec),
         )

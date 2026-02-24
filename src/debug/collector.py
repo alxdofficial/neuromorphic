@@ -42,6 +42,8 @@ class MetricsCollector:
         self._em_write_accum: dict[int, list] = {}
 
         self._file = open(output_path, "a")
+        self._writes_since_flush = 0
+        self._flush_every = 50  # flush to disk every N writes
 
     def should_collect_full(self, step: int) -> bool:
         """Whether this step requires full collection."""
@@ -50,7 +52,9 @@ class MetricsCollector:
     def log_basic(self, step: int, loss: float, ppl: float, lr: float,
                   tok_s: float, grad_norm: float, reg: float, elapsed: float,
                   extras: dict = None, mode: str = "train"):
-        """Write a basic metrics line (every step)."""
+        """Write a basic metrics line (respects basic_every interval)."""
+        if self.basic_every > 1 and step % self.basic_every != 0:
+            return
         record = {
             "step": step,
             "mode": mode,
@@ -356,12 +360,16 @@ class MetricsCollector:
             else:
                 clean[k] = v
         self._file.write(json.dumps(clean) + "\n")
-        self._file.flush()
+        self._writes_since_flush += 1
+        if self._writes_since_flush >= self._flush_every:
+            self._file.flush()
+            self._writes_since_flush = 0
 
     def log_record(self, record: dict):
         """Write an arbitrary metrics record."""
         self._write(record)
 
     def close(self):
-        """Close the output file."""
+        """Flush remaining buffered writes and close the output file."""
+        self._file.flush()
         self._file.close()

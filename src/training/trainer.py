@@ -257,12 +257,6 @@ class TBPTTTrainer:
                 logits_all, x_emb_all, y_wm_all = fwd_result
                 gate_stats = None
 
-            if self.fail_fast and not torch.isfinite(logits_all).all():
-                raise RuntimeError(
-                    f"Non-finite logits at global step {self.global_step}, "
-                    f"span [{span_start}, {span_end})."
-                )
-
             # Loss masking: skip EOT input positions [BS, span_P]
             is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
                 span_ids, self.config.eot_id, self.config.reset_on_doc_boundary
@@ -272,6 +266,13 @@ class TBPTTTrainer:
             span_loss, span_valid, token_surprise = compute_loss_and_surprise(
                 logits_all, span_targets, loss_mask_all,
             )
+
+            # Check scalar loss instead of scanning all 65M logit values
+            if self.fail_fast and not torch.isfinite(span_loss):
+                raise RuntimeError(
+                    f"Non-finite loss at global step {self.global_step}, "
+                    f"span [{span_start}, {span_end})."
+                )
             # F.cross_entropy returns fp32 even under autocast.  Cast surprise
             # to bf16 so downstream PM/EM element-wise ops stay on TensorCores
             # instead of promoting back to fp32.

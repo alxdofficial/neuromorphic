@@ -53,7 +53,7 @@ class Layer(nn.Module, StateMixin):
             self.ffn_norm = nn.LayerNorm(D_h)
             self.ffn = nn.Sequential(
                 nn.Linear(D_h, d_ff),
-                nn.GELU(),
+                nn.GELU(approximate="tanh"),
                 nn.Dropout(config.dropout),
                 nn.Linear(d_ff, D_h),
             )
@@ -171,9 +171,9 @@ class Layer(nn.Module, StateMixin):
         a = torch.sigmoid(a_raw)                     # [BS, P, D_h]
         b = torch.tanh(b_raw)                        # [BS, P, D_h]
 
-        # Cache mean gate values for collect path (pure tensor ops, compile-safe)
-        self._last_gate_a_mean = a.detach().mean(dim=1)  # [BS, D_h]
-        self._last_gate_b_mean = b.detach().mean(dim=1)  # [BS, D_h]
+        # Cache raw gates for collect path (reference only, no compute)
+        self._last_gate_a = a
+        self._last_gate_b = b
 
         # Apply carry mask (zero at doc boundaries)
         # Cast carry to activation dtype (carry_all arrives as fp32 from bool→float)
@@ -230,8 +230,8 @@ class Layer(nn.Module, StateMixin):
 
         if collect:
             stats = {
-                "gate_a": self._last_gate_a_mean,  # [BS, D_h] mean over P
-                "gate_b": self._last_gate_b_mean,  # [BS, D_h] mean over P
+                "gate_a": self._last_gate_a.detach().mean(dim=1),  # [BS, D_h]
+                "gate_b": self._last_gate_b.detach().mean(dim=1),  # [BS, D_h]
                 "h_norm": self.h.detach().norm(dim=-1).mean(),  # scalar tensor
             }
             return output, stats

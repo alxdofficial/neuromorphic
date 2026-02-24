@@ -69,7 +69,7 @@ class ProceduralMemory(nn.Module, StateMixin):
             self.readout_norm = nn.LayerNorm(D_h)
             self.readout_ffn = nn.Sequential(
                 nn.Linear(D_h, D_h * 4),
-                nn.GELU(),
+                nn.GELU(approximate="tanh"),
                 nn.Linear(D_h * 4, D_h),
             )
         else:

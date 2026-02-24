@@ -58,7 +58,7 @@ class EpisodicMemory(nn.Module, StateMixin):
             self.readout_norm = nn.LayerNorm(config.D_em)
             self.readout_ffn = nn.Sequential(
                 nn.Linear(config.D_em, config.D_em * 4),
-                nn.GELU(),
+                nn.GELU(approximate="tanh"),
                 nn.Linear(config.D_em * 4, config.D_em),
             )
         else:
