@@ -2,7 +2,7 @@
 
 **Purpose:** Documents the scan-friendly parallel training path (`forward_span`), its relationship to the sequential path (`forward_one_token`), and every place where the two paths differ in logic or math. Read `MODEL_EXPLAINER.md` first for full architecture context; this document focuses on what changes.
 
-**Last verified against code:** 2026-02-24
+**Last verified against code:** 2026-02-25
 
 ---
 
@@ -133,7 +133,7 @@ Trace the full lifecycle of one span (P=32 tokens) on Tier A wide (D=768, B=2, L
 ```
 model.surprise:  [32, 1]    — mean surprise from previous span (e.g. 3.2 for each stream)
 Layer.h:         [32, 384]  — per layer, per block (16 instances total). Carries forward from last span.
-WM GLA state:   gla_state [32, 4, 48, 48]  — recurrent state matrix (H=4 heads, head_dim=D_wm/H=48)
+WM state:       wm_K [32, 128, 192], wm_V [32, 128, 192]  — sliding-window ring buffer (W=128 recent tokens)
 PM state:        pm_K [32, 8, 384], pm_V [32, 8, 384], pm_a [32, 8]  — per layer per block (16 instances)
 PM eligibility:  elig_K [32, 8, 384], elig_V [32, 8, 384]            — per layer per block (16 instances)
 EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256]  — per block (2 instances)
@@ -161,16 +161,15 @@ x_emb_all = embedding(input_ids)  # [32, 32, 768]
 ```
 One kernel launch. 64× more work per launch than the sequential path.
 
-**Step 4 — Working memory (GLA recurrence over span):**
+**Step 4 — Working memory (softmax sliding-window attention over span):**
 ```
 q_all = W_q(x_emb_all)    # [32, 32, 192]  — one matmul
 k_all = W_k(x_emb_all)    # [32, 32, 192]  — one matmul
 v_all = W_v(x_emb_all)    # [32, 32, 192]  — one matmul
-g_all = logsigmoid(W_g(x_emb_all)) / 16  # [32, 32, 192] — decay gates
 ```
-`forward_span()` runs a sequential GLA recurrence over P=32 tokens (torch.compile fuses the loop):
-- Per token: `S_t = diag(exp(g_t)) * S_{t-1} + k_t^T @ v_t`, `o_t = q_t @ S_t`
-- Mid-span resets: at doc boundaries (e.g. t=13), `gla_state` is zeroed before that token
+`forward_span()` runs softmax attention over the W=128 sliding window for P=32 tokens:
+- Per token: write k_t, v_t to ring buffer, attend over valid positions with ALiBi recency bias
+- Mid-span resets: at doc boundaries (e.g. t=13), ring buffer is zeroed before that token
 ```
 y_wm_all:  [32, 32, 768]  — WM output for all tokens
 ```
@@ -377,13 +376,13 @@ With `torch.compile` (§12), the scan loops, gate computations, and elementwise 
 
 ### 5.2 Working Memory
 
-**File:** `src/model/working_memory.py` — `GLAWorkingMemory.forward_span()`
+**File:** `src/model/working_memory.py` — `WorkingMemory.forward_span()`
 
-**Sequential** (`step()`): Projects Q/K/V/G for one token, applies decay gate to recurrent state, updates state with outer product, queries state for output.
+**Sequential** (`step()`): Projects Q/K/V for one token, writes to ring buffer, attends over valid positions with ALiBi bias.
 
-**Parallel** (`forward_span()`): Projects Q/K/V/G for all P tokens in one batched matmul, then runs a sequential GLA recurrence loop over the P tokens. Mid-span doc-boundary resets zero the state before the reset token. torch.compile fuses the recurrence loop.
+**Parallel** (`forward_span()`): Projects Q/K/V for all P tokens in one batched matmul, then runs a sequential attention loop over the P tokens (each token writes to the ring buffer, then attends). Mid-span doc-boundary resets zero the ring buffer before the reset token. torch.compile fuses the loop.
 
-**Difference:** None in output/state vs sequential. Both paths produce identical results — the recurrence is inherently sequential, but batched projections and torch.compile fusion make it efficient.
+**Difference:** None in output/state vs sequential. Both paths produce identical results — the ring buffer update is sequential, but batched projections make it efficient.
 
 ### 5.3 Procedural Memory Read
 
@@ -461,76 +460,67 @@ self._last_h_all = output                                          # cached for 
 ```
 
 **Key differences:**
-1. **Surprise is frozen** — When PCM is disabled, `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7). When PCM is enabled, the surprise is the full δ vector computed per-token at the block's temporal resolution.
+1. **Surprise is frozen** — When PCM is disabled, `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7). When PCM is enabled, the surprise is the full δ vector computed per-token.
 2. **Gate projections batched** — one `gate_a` forward on `[BS, P_b, 4*D_h+S]` instead of P separate calls. This is where most of the speedup comes from.
 3. **Recurrence via scan** — `parallel_affine_scan` computes all P_b hidden states given pre-computed `a` and `b` (§6).
 4. **`_last_h_all` cached** — The full `[BS, P_b, D_h]` output sequence is stored for the trainer's post-forward eligibility and EM candidate steps.
-5. **FFN gain modulation** — When PCM is enabled, `ffn_gain_all = 1 + W_gain(δ)` modulates FFN input per-dimension based on prediction surprise.
+5. **FFN gain modulation** — When PCM is enabled, `ffn_gain_all = 1 + 0.1 * tanh(W_gain(δ))` modulates FFN input per-dimension, bounded to [0.9, 1.1].
 
 ### 5.6 Block
 
 **File:** `src/model/block.py` — `forward_span()`
 
-**Sequential** (`step()`): Per layer: PCM encode → PM read → layer step (with δ + FFN gain) → eligibility update → next layer
+**Sequential** (`step()`): PCM encode → per layer: PM read → layer step (with δ + FFN gain) → eligibility update → next layer
 
-**Parallel** (`forward_span()`): Temporal downsample → PCM encode → per layer: PM batch read → layer forward_span (with δ + FFN gain) → next layer → temporal upsample. **Eligibility is NOT updated** inside the block — it's deferred to the trainer (§9).
+**Parallel** (`forward_span()`): PCM encode → per layer: PM batch read → layer forward_span (with δ + FFN gain) → next layer. **Eligibility is NOT updated** inside the block — it's deferred to the trainer (§9).
 
 ```python
 def forward_span(self, x_block_all, y_wm_all, x_proj_all,
                  surprise_span, carry_all):
     BS, P, D_h = x_block_all.shape
 
-    # --- Temporal downsampling (learned weighted aggregation, multi-timescale) ---
-    x_block_b = self.pooler.downsample(x_block_all, carry_all)  # [BS, P_b, D_h]
-    y_wm_b = self.pooler.downsample(y_wm_all, carry_all)        # [BS, P_b, D]
-    x_proj_b = self.pooler.downsample(x_proj_all, carry_all)    # [BS, P_b, D]
-    carry_b = carry_min_pool(carry_all, self.scale)              # [BS, P_b, 1]
-
-    # EM retrieval at pooled resolution (batched, frozen state)
-    y_em_b = self.em.retrieve_batch(x_proj_b, y_wm_b)     # [BS, P_b, D]
+    # EM retrieval (batched, frozen state, full resolution)
+    y_em = self.em.retrieve_batch(x_proj_all, y_wm_all)   # [BS, P, D]
 
     # Project shared signals to per-block dimension
-    y_wm_proj_b = self.W_wm_proj(y_wm_b)                  # [BS, P_b, D_h]
-    y_em_proj_b = self.W_em_proj(y_em_b)                   # [BS, P_b, D_h]
+    y_wm_proj = self.W_wm_proj(y_wm_all)                  # [BS, P, D_h]
+    y_em_proj = self.W_em_proj(y_em)                       # [BS, P, D_h]
 
     # --- PCM: encode evidence, compute surprise, FFN gain ---
     if self.pcm is not None:
-        z = self.pcm.encode(x_block_b)                     # [BS, P_b, D_pc]
-        delta = self.pcm.compute_surprise(z)               # [BS, P_b, D_pc]
-        surprise_b = delta                                 # vector surprise for gates
-        ffn_gain_b = self.pcm.compute_ffn_gain(delta)      # [BS, P_b, D_h]
-        # Cache scalar ‖δ‖ for PM/EM (upsampled to full resolution)
-        self._last_token_surprise = self.pooler.upsample(
-            delta.norm(dim=-1, keepdim=True), P)           # [BS, P, 1]
+        z = self.pcm.encode(x_block_all)                   # [BS, P, D_pc]
+        delta = self.pcm.compute_surprise(z)               # [BS, P, D_pc]
+        surprise_all = delta                               # vector surprise for gates
+        ffn_gain_all = self.pcm.compute_ffn_gain(delta)    # [BS, P, D_h]
+        # RMS-normalized scalar surprise for PM/EM
+        self._last_token_surprise = delta.norm(
+            dim=-1, keepdim=True) / sqrt(D_pc)             # [BS, P, 1]
     else:
-        surprise_b = surprise_span.unsqueeze(1).expand(BS, P_b, 1)
-        ffn_gain_b = None
+        surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
+        ffn_gain_all = None
 
-    # Pre-LayerNorm for Layer 0
-    x = self.input_norm(x_block_b)
+    # Pre-LayerNorm for Layer 0 + cache block input for PM eligibility
+    x = self.input_norm(x_block_all)
+    self._last_x_block_input = x_block_all
     for layer in self.layers:
-        y_pm_b = layer.pm.apply_batch(x)                   # PM read (batched)
-        x = layer.forward_span(x, y_pm_b, y_wm_proj_b,
-                               y_em_proj_b, surprise_b, carry_b,
-                               ffn_gain_all=ffn_gain_b)
+        y_pm = layer.pm.apply_batch(x)                     # PM read (batched)
+        x = layer.forward_span(x, y_pm, y_wm_proj,
+                               y_em_proj, surprise_all, carry_all,
+                               ffn_gain_all=ffn_gain_all)
 
-    # --- Temporal upsampling back to P ---
-    x_up = self.pooler.upsample(x, P)                     # [BS, P, D_h]
-
-    # Cache per-layer outputs for spatial decoder (upsampled)
+    # Cache per-layer outputs for spatial decoder (already at full P)
     if self.config.snapshot_enabled:
         self._last_layer_stack = torch.stack(
-            [self.pooler.upsample(layer._last_h_all, P)
-             for layer in self.layers], dim=2)             # [BS, P, L, D_h]
+            [layer._last_h_all for layer in self.layers],
+            dim=2)                                         # [BS, P, L, D_h]
 
-    return x_up
+    return x
 ```
 
 **Key differences from sequential:**
-1. **Temporal pooling** — When `block_scales` is configured, input is aggregated via learned weighted sums within non-overlapping windows before processing and repeat-upsampled after. All computation (PCM, layers) happens at reduced resolution `P_b = P // scale`, reducing FLOPs proportionally. Carry-aware masking within each window prevents cross-document mixing.
-2. **PCM operates at pooled resolution** — Evidence encoding, surprise computation, and FFN gain are computed on `[BS, P_b, ...]` tensors. The scalar surprise `‖δ‖` is upsampled to full resolution for PM eligibility and EM candidate scoring.
-3. **Eligibility accumulation** is decoupled from the forward pass and handled in the trainer post-forward step.
-4. `_last_layer_stack` is cached on the block for the spatial decoder, with layer outputs upsampled to original P if multi-timescale.
+1. **PCM operates at full resolution** — Evidence encoding, surprise computation, and FFN gain are computed on `[BS, P, ...]` tensors. The scalar surprise is RMS-normalized (`‖δ‖/√D_pc`) to keep scale near ~1.
+2. **Eligibility accumulation** is decoupled from the forward pass and handled in the trainer post-forward step.
+3. `_last_layer_stack` is cached on the block for the spatial decoder.
 
 ---
 
@@ -895,9 +885,8 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 | `src/model/procedural_memory.py` | `ProceduralMemory.apply_batch()` — batched PM read |
 | `src/model/episodic_memory.py` | `EpisodicMemory.retrieve_batch()`, `propose_candidate_batch()` |
 | `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V, batched no-reset path, sequential fallback |
-| `src/model/block.py` | `Block.forward_span()` — temporal pooling, PCM, batched layers, caches `_last_layer_stack` |
+| `src/model/block.py` | `Block.forward_span()` — PCM, batched layers, caches `_last_layer_stack` |
 | `src/model/predictive_coding.py` | `PredictiveCodingModule` — evidence encoder, hypothesis predictor, surprise/gain computation |
-| `src/model/temporal_pool.py` | `TemporalPooler` (learned window aggregation), `carry_min_pool` — multi-timescale support |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `apply_pcm_boundary()`, `get_pcm_token_surprise()` |
 | `src/training/trainer.py` | Span loop orchestration, delegates to span_ops |

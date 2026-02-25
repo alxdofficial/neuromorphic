@@ -277,12 +277,18 @@ class TBPTTTrainer:
                     f"span [{span_start}, {span_end})."
                 )
 
-            # When PCM enabled, use ‖δ‖ from PCM as the surprise signal
-            # instead of loss-based -log p(target). PCM surprise is computed
-            # per-block during forward_span and averaged across blocks.
+            # When PCM enabled, use RMS-normalized ‖δ‖ from PCM as the
+            # surprise signal instead of loss-based -log p(target). During
+            # warmup, blend CE and PCM surprise to avoid cold-start noise
+            # (early PCM encoder outputs are random, so δ is meaningless).
             pcm_surprise = self.model.get_pcm_token_surprise()
             if pcm_surprise is not None:
-                token_surprise = pcm_surprise
+                warmup = self.config.pcm_warmup_steps
+                if warmup > 0 and self.global_step < warmup:
+                    alpha = self.global_step / warmup
+                    token_surprise = (1 - alpha) * token_surprise + alpha * pcm_surprise
+                else:
+                    token_surprise = pcm_surprise
 
             # F.cross_entropy returns fp32 even under autocast.  Cast surprise
             # to bf16 so downstream PM/EM element-wise ops stay on TensorCores

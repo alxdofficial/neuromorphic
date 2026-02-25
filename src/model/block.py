@@ -4,12 +4,12 @@ Block — parallel processing unit with L sequential layers + 1 EM bank.
 One Block per parallel track (B total). Each block processes D_h dimensions,
 contains L Layers (each with their own PM), and one shared EpisodicMemory.
 
-When multi-timescale is enabled (block_scales), each block can operate at a
-different temporal resolution via TemporalPooler (causal conv downsampling).
-
 When PCM is enabled, each block has a PredictiveCodingModule that computes
 vector surprise (δ) from evidence vs hypothesis, replacing scalar surprise.
+PCM surprise is RMS-normalized (||δ|| / sqrt(D_pc)) to keep scale near ~1.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,6 @@ from torch import Tensor
 from .config import ModelConfig
 from .layer import Layer
 from .episodic_memory import EpisodicMemory, EMNeuromodulator
-from .temporal_pool import TemporalPooler, carry_min_pool
 from .predictive_coding import PredictiveCodingModule
 from .utils import StateMixin
 
@@ -30,13 +29,6 @@ class Block(nn.Module, StateMixin):
         super().__init__()
         self.config = config
         self.block_idx = block_idx
-
-        # Multi-timescale: per-block temporal scale factor
-        if config.block_scales is not None:
-            self.scale = config.block_scales[block_idx]
-        else:
-            self.scale = 1
-        self.pooler = TemporalPooler(config.D_h, self.scale)
 
         # Predictive Coding Module (per block)
         if config.pcm_enabled:
@@ -66,33 +58,12 @@ class Block(nn.Module, StateMixin):
         self._last_z: Tensor | None = None
         self._last_L_recon: Tensor | None = None
         self._last_token_surprise: Tensor | None = None
-
-        # Multi-timescale step() mode state
-        # Slow blocks only process every `scale` tokens; on hold steps
-        # they return the cached output from the last update step.
-        self._step_counter: int = 0
-        self._last_step_output: Tensor | None = None
-        self._last_step_layer_stack: Tensor | None = None
-
-    def _step_hold_result(self, collect: bool, return_layers: bool):
-        """Return cached output for multi-timescale hold steps."""
-        h = self._last_step_output
-        if collect and return_layers:
-            return h, {}, self._last_step_layer_stack
-        if collect:
-            return h, {}
-        if return_layers:
-            return h, self._last_step_layer_stack
-        return h
+        self._last_x_block_input: Tensor | None = None  # for PM eligibility
 
     def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
              surprise: Tensor, carry: Tensor, collect: bool = False,
              return_layers: bool = False):
         """Process one token through this block.
-
-        For multi-timescale blocks (scale > 1), only processes every s-th
-        token and holds the last output on intermediate steps. Doc boundaries
-        (carry=0) force immediate processing and counter reset.
 
         Args:
             x_block: [BS, D_h] — input slice for this block
@@ -108,18 +79,6 @@ class Block(nn.Module, StateMixin):
             stats: dict (only when collect=True) — per-layer gate stats
             layer_outputs: [BS, L, D_h] (only when return_layers=True)
         """
-        s = self.scale
-        if s > 1:
-            # Doc boundary forces immediate processing and counter reset
-            has_boundary = (carry < 0.5).any()
-            if has_boundary:
-                self._step_counter = 0
-
-            # Hold steps: return cached output, skip all computation
-            if self._step_counter > 0 and self._last_step_output is not None:
-                self._step_counter = (self._step_counter + 1) % s
-                return self._step_hold_result(collect, return_layers)
-
         # EM retrieval (if enabled)
         if self.config.em_enabled:
             y_em = self.em.retrieve(x_proj, y_wm)  # [BS, D]
@@ -136,8 +95,8 @@ class Block(nn.Module, StateMixin):
             delta = self.pcm.compute_surprise(z)         # [BS, 1, D_pc]
             gate_surprise = delta.squeeze(1)             # [BS, D_pc]
             ffn_gain = self.pcm.compute_ffn_gain(delta).squeeze(1)  # [BS, D_h]
-            # Scalar surprise from PCM for PM eligibility: ‖δ‖
-            pm_surprise = delta.norm(dim=-1)             # [BS, 1]
+            # RMS-normalized scalar surprise for PM eligibility
+            pm_surprise = delta.norm(dim=-1) / math.sqrt(self.config.D_pc)  # [BS, 1]
         else:
             gate_surprise = surprise                     # [BS, 1]
             ffn_gain = None
@@ -168,7 +127,7 @@ class Block(nn.Module, StateMixin):
                 layer_outs.append(h)
 
             # Update eligibility traces (if PM enabled)
-            # Uses ‖δ‖ from PCM when enabled, else model's scalar surprise
+            # Uses RMS-normalized ‖δ‖ from PCM when enabled, else scalar surprise
             if self.config.pm_enabled:
                 layer.pm.update_eligibility(x, h, pm_surprise)
 
@@ -176,12 +135,6 @@ class Block(nn.Module, StateMixin):
 
         # Build stacked layer outputs [BS, L, D_h]
         layer_stack = torch.stack(layer_outs, dim=1) if return_layers else None
-
-        # Cache output for multi-timescale hold steps
-        if s > 1:
-            self._last_step_output = x
-            self._last_step_layer_stack = layer_stack
-            self._step_counter = (self._step_counter + 1) % s
 
         # Return based on flags
         if collect and return_layers:
@@ -198,12 +151,8 @@ class Block(nn.Module, StateMixin):
                      collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this block.
 
-        When multi-timescale is enabled (scale > 1), input is downsampled
-        before processing and upsampled after. PCM operates at the pooled
-        resolution.
-
         Note: PM eligibility is NOT updated here — it's deferred to the
-        trainer's post-forward step (Step 8 in the refactor plan).
+        trainer's post-forward step (span_ops.apply_pm_eligibility_batch).
 
         Args:
             x_block_all: [BS, P, D_h] — block input for all tokens
@@ -218,64 +167,53 @@ class Block(nn.Module, StateMixin):
             (if collect: also returns {layer_idx: gate_stats} dict)
         """
         BS, P, D_h = x_block_all.shape
-        s = self.scale
 
-        # --- Temporal downsampling (multi-timescale) ---
-        # Learned weighted aggregation within non-overlapping windows.
-        # carry_all is passed so tokens from previous docs within a window
-        # are masked out before aggregation (boundary-aware pooling).
-        x_block_b = self.pooler.downsample(x_block_all, carry_all)  # [BS, P_b, D_h]
-        P_b = x_block_b.shape[1]
-
-        y_wm_b = self.pooler.downsample(y_wm_all, carry_all)       # [BS, P_b, D]
-        x_proj_b = self.pooler.downsample(x_proj_all, carry_all)    # [BS, P_b, D]
-        # carry uses min-pool: any boundary in window forces reset
-        carry_b = carry_min_pool(carry_all, s)           # [BS, P_b, 1]
-
-        # EM retrieval at pooled resolution (if enabled)
+        # EM retrieval (if enabled)
         if self.config.em_enabled:
-            y_em_b = self.em.retrieve_batch(x_proj_b, y_wm_b)
+            y_em = self.em.retrieve_batch(x_proj_all, y_wm_all)
         else:
-            y_em_b = torch.zeros_like(y_wm_b)
+            y_em = torch.zeros_like(y_wm_all)
 
-        # Project to D_h: [BS, P_b, D_h]
-        y_wm_proj_b = self.W_wm_proj(y_wm_b)
-        y_em_proj_b = self.W_em_proj(y_em_b)
+        # Project to D_h: [BS, P, D_h]
+        y_wm_proj = self.W_wm_proj(y_wm_all)
+        y_em_proj = self.W_em_proj(y_em)
 
         # --- PCM: encode evidence, compute surprise, FFN gain ---
         if self.pcm is not None:
-            z = self.pcm.encode(x_block_b)                  # [BS, P_b, D_pc]
-            delta = self.pcm.compute_surprise(z)             # [BS, P_b, D_pc]
-            surprise_b = delta                               # [BS, P_b, D_pc]
-            ffn_gain_b = self.pcm.compute_ffn_gain(delta)    # [BS, P_b, D_h]
+            z = self.pcm.encode(x_block_all)                 # [BS, P, D_pc]
+            delta = self.pcm.compute_surprise(z)             # [BS, P, D_pc]
+            surprise_all = delta                             # [BS, P, D_pc]
+            ffn_gain_all = self.pcm.compute_ffn_gain(delta)  # [BS, P, D_h]
 
-            # Per-token scalar surprise from ‖δ‖ (for PM eligibility + EM candidates)
-            pcm_surprise_b = delta.norm(dim=-1, keepdim=True)  # [BS, P_b, 1]
-            self._last_token_surprise = self.pooler.upsample(
-                pcm_surprise_b, P
+            # RMS-normalized per-token scalar surprise (for PM eligibility + EM)
+            pcm_surprise = delta.norm(dim=-1, keepdim=True) / math.sqrt(
+                self.config.D_pc
             )  # [BS, P, 1]
+            self._last_token_surprise = pcm_surprise
 
             # Cache for boundary ops (called after forward pass)
             self._last_z = z
-            self._last_L_recon = self.pcm.compute_recon_loss(z, x_block_b)
+            self._last_L_recon = self.pcm.compute_recon_loss(z, x_block_all)
         else:
-            # Scalar surprise: expand [BS, 1] → [BS, P_b, 1]
-            surprise_b = surprise_span.unsqueeze(1).expand(BS, P_b, 1)
-            ffn_gain_b = None
+            # Scalar surprise: expand [BS, 1] → [BS, P, 1]
+            surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
+            ffn_gain_all = None
             self._last_token_surprise = None
 
         # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
-        x = self.input_norm(x_block_b)
+        x = self.input_norm(x_block_all)
+        # Cache block input for PM eligibility reconstruction in span_ops
+        self._last_x_block_input = x_block_all
         layer_stats = {} if collect else None
         for l_idx, layer in enumerate(self.layers):
             if self.config.pm_enabled:
-                y_pm_b = layer.pm.apply_batch(x)
+                y_pm = layer.pm.apply_batch(x)
             else:
-                y_pm_b = torch.zeros_like(x)
+                y_pm = torch.zeros_like(x)
 
-            result = layer.forward_span(x, y_pm_b, y_wm_proj_b, y_em_proj_b,
-                                        surprise_b, carry_b,
-                                        ffn_gain_all=ffn_gain_b,
+            result = layer.forward_span(x, y_pm, y_wm_proj, y_em_proj,
+                                        surprise_all, carry_all,
+                                        ffn_gain_all=ffn_gain_all,
                                         collect=collect)
             if collect:
                 x, lstats = result
@@ -283,19 +221,15 @@ class Block(nn.Module, StateMixin):
             else:
                 x = result
 
-        # --- Temporal upsampling back to P ---
-        x_up = self.pooler.upsample(x, P)  # [BS, P, D_h]
-
         # Collect per-layer outputs for spatial decoder (at original resolution).
         if self.config.snapshot_enabled:
             self._last_layer_stack = torch.stack(
-                [self.pooler.upsample(layer._last_h_all, P)
-                 for layer in self.layers], dim=2
+                [layer._last_h_all for layer in self.layers], dim=2
             )  # [BS, P, L, D_h]
 
         if collect:
-            return x_up, layer_stats
-        return x_up
+            return x, layer_stats
+        return x
 
     def commit_pm(self, force_mode: str = "normal",
                   span_surprise: Tensor = None) -> dict:
@@ -376,9 +310,3 @@ class Block(nn.Module, StateMixin):
 
         if self.pcm is not None:
             self.pcm.reset_states(mask)
-
-        # Reset step-mode state for multi-timescale blocks
-        if self.scale > 1 and mask.any():
-            self._step_counter = 0
-            self._last_step_output = None
-            self._last_step_layer_stack = None

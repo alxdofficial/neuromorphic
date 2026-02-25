@@ -13,7 +13,7 @@ This is a **biologically-inspired language model** that decomposes memory into f
 | Memory System | Brain Analogy | Persistence | Update Mechanism | Capacity |
 |---------------|---------------|-------------|------------------|----------|
 | **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | ~85M params |
-| **Working Memory** | Prefrontal cortex | Recurrent state | Gated Linear Attention (GLA) | O(1) state matrix per head |
+| **Working Memory** | Prefrontal cortex | Sliding window | Softmax attention (W=128) | O(W) ring buffer per stream |
 | **Procedural Memory** | Cerebellum / basal ganglia | Across documents (lifelong) | Eligibility traces + neuromodulated commits | r=8 slots/layer, B*L instances |
 | **Episodic Memory** | Hippocampus | Across documents (lifelong) | Novelty-based writes + neuromodulation | M=256 slots/block, B instances |
 
@@ -25,18 +25,17 @@ This is a **biologically-inspired language model** that decomposes memory into f
 Prefrontal cortex — mental "scratchpad" for active maintenance of recent information.
 
 ### Core Mechanism
-Gated Linear Attention (GLA). Each token updates a recurrent state matrix `S` via learned decay gates and outer-product writes. The state `S: [H, K, V]` per head compresses recent context into a fixed-size matrix. Decay gates (`logsigmoid(W_g(x)) / 16`) provide learned recency bias — replacing ALiBi's fixed slopes with data-dependent forgetting.
+Sliding-window softmax attention (W=128). A ring buffer stores the W most recent K/V pairs. Each token writes to the buffer and attends over all valid positions with ALiBi recency bias. This provides precise short-range copying and binding.
 
 ### Sacred Properties
-- **Fixed-size state**: O(1) memory per stream (H × head_dim × head_dim matrix)
+- **Fixed-size state**: O(W) ring buffer per stream (W=128 recent tokens)
 - **Non-plastic nature**: WM is pure ephemeral cache, not a learning system
-- **Gradient flow within TBPTT chunks**: Recurrence preserves gradients through state updates
-- **Doc-boundary reset**: Zero the state matrix for masked streams
+- **Gradient flow within TBPTT chunks**: Attention preserves gradients through buffer
+- **Doc-boundary reset**: Zero the ring buffer for masked streams
 
 ### Negotiable
-- State dimensions (D_wm, n_heads_wm, gate_low_rank)
-- **Implementation**: Softmax ring-buffer attention available as fallback (`wm_type="softmax"`)
-- Could switch to chunk-parallel GLA (fla library) for longer spans
+- Window size W (default 128), state dimensions (D_wm, n_heads_wm)
+- **Implementation**: GLA recurrence available as alternative (`wm_type="gla"`)
 
 ---
 

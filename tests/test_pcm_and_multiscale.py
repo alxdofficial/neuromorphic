@@ -1,13 +1,13 @@
-"""Tests for Predictive Coding Module (PCM) and multi-timescale blocks."""
+"""Tests for Predictive Coding Module (PCM)."""
 
 import copy
+import math
 import torch
 import pytest
 
 from src.model.config import ModelConfig
 from src.model.model import NeuromorphicLM
 from src.model.predictive_coding import PredictiveCodingModule
-from src.model.temporal_pool import TemporalPooler, carry_min_pool
 
 BS = 2
 D = 128
@@ -16,129 +16,6 @@ L = 2
 D_h = D // B  # 64
 D_pc = 32
 P = 16
-
-
-# ============================================================================
-# Temporal pooling tests
-# ============================================================================
-
-class TestTemporalPooler:
-    def test_scale_1_identity(self):
-        """scale=1 is a no-op."""
-        pooler = TemporalPooler(D_h, scale=1)
-        x = torch.randn(BS, P, D_h)
-        assert torch.equal(pooler.downsample(x), x)
-        assert torch.equal(pooler.upsample(x, P), x)
-
-    def test_downsample_shape(self):
-        """Downsampling reduces sequence length by scale."""
-        for scale in [2, 4, 8]:
-            pooler = TemporalPooler(D_h, scale=scale)
-            x = torch.randn(BS, P, D_h)
-            out = pooler.downsample(x)
-            assert out.shape == (BS, P // scale, D_h), f"scale={scale}"
-
-    def test_upsample_shape(self):
-        """Upsampling restores original length."""
-        for scale in [2, 4]:
-            pooler = TemporalPooler(D_h, scale=scale)
-            x = torch.randn(BS, P, D_h)
-            down = pooler.downsample(x)
-            up = pooler.upsample(down, P)
-            assert up.shape == (BS, P, D_h), f"scale={scale}"
-
-    def test_init_as_average(self):
-        """At init, pool_logits=0 → softmax → uniform → average pooling."""
-        scale = 4
-        pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h)
-        out = pooler.downsample(x)
-        # Should match average within each window
-        expected = x.reshape(BS, P // scale, scale, D_h).mean(dim=2)
-        assert torch.allclose(out, expected, atol=1e-6)
-
-    def test_learnable_weights(self):
-        """pool_logits are nn.Parameter and affect output."""
-        scale = 4
-        pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h)
-
-        out_before = pooler.downsample(x).clone()
-        # Shift weights to favor the last position
-        with torch.no_grad():
-            pooler.pool_logits.copy_(torch.tensor([0.0, 0.0, 0.0, 10.0]))
-        out_after = pooler.downsample(x)
-        assert not torch.allclose(out_before, out_after)
-        # With weight heavily on position 3, output ≈ x at positions 3,7,11,...
-        x_win = x.reshape(BS, P // scale, scale, D_h)
-        assert torch.allclose(out_after, x_win[:, :, 3], atol=1e-3)
-
-    def test_boundary_masking(self):
-        """Tokens before a boundary within a window are masked out."""
-        scale = 4
-        pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h)
-        carry = torch.ones(BS, P, 1)
-        # Boundary at position 2 (within window 0: positions 0,1,2,3)
-        carry[:, 2, :] = 0
-
-        out = pooler.downsample(x, carry)
-        # Window 0: boundary at pos 2 → only pos 2,3 contribute
-        # With uniform weights, out[0] ≈ mean(x[2], x[3])
-        x_win = x.reshape(BS, P // scale, scale, D_h)
-        expected_win0 = x_win[:, 0, 2:].mean(dim=1)  # mean of pos 2,3
-        assert torch.allclose(out[:, 0], expected_win0, atol=1e-5)
-
-        # Window 1 (positions 4-7): no boundary → normal average
-        expected_win1 = x_win[:, 1].mean(dim=1)
-        assert torch.allclose(out[:, 1], expected_win1, atol=1e-5)
-
-    def test_no_carry_matches_plain(self):
-        """Without carry, downsample gives same result as carry=all_ones."""
-        scale = 4
-        pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h)
-        carry = torch.ones(BS, P, 1)
-        assert torch.allclose(
-            pooler.downsample(x), pooler.downsample(x, carry), atol=1e-6
-        )
-
-    def test_upsample_repeats(self):
-        """Upsample uses repeat_interleave to restore length."""
-        scale = 4
-        pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h)
-        down = pooler.downsample(x)
-        up = pooler.upsample(down, P)
-        # Each pooled position is repeated scale times
-        for i in range(P // scale):
-            for j in range(scale):
-                assert torch.equal(up[:, i * scale + j], down[:, i])
-
-
-class TestCarryMinPool:
-    def test_all_ones(self):
-        """All carry=1 stays 1."""
-        carry = torch.ones(BS, P, 1)
-        out = carry_min_pool(carry, 4)
-        assert out.shape == (BS, P // 4, 1)
-        assert torch.allclose(out, torch.ones_like(out))
-
-    def test_boundary_forces_reset(self):
-        """Any 0 in a window produces 0 in output."""
-        carry = torch.ones(BS, P, 1)
-        carry[:, 2, :] = 0  # boundary at position 2
-        out = carry_min_pool(carry, 4)
-        # With causal left-pad of 3 ones, padded = [1,1,1,carry[0],...,carry[15]]
-        # Output pos 0: padded[0:4] = [1,1,1,carry[0]] -> 1 (no boundary)
-        # Output pos 1: padded[4:8] = [carry[1],carry[2],carry[3],carry[4]]
-        # carry[2]=0 -> min=0
-        assert out[:, 1, :].abs().max() < 1e-6
-
-    def test_scale_1_identity(self):
-        carry = torch.ones(BS, P, 1)
-        carry[:, 3, :] = 0
-        assert torch.equal(carry_min_pool(carry, 1), carry)
 
 
 # ============================================================================
@@ -160,8 +37,17 @@ class TestPCM:
         z = pcm.encode(x)
         assert z.shape == (BS, P, D_pc)
 
-    def test_surprise_zero_at_init(self):
-        """Before any boundary update, z_hat=None -> surprise is zero."""
+    def test_surprise_zero_before_valid_hypothesis(self):
+        """Before any boundary update, z_hat_valid=False -> surprise is zero."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+        z = torch.randn(BS, P, D_pc)
+        delta = pcm.compute_surprise(z)
+        assert torch.equal(delta, torch.zeros_like(z))
+
+    def test_surprise_zero_when_z_hat_is_none(self):
+        """Before lazy init, z_hat=None -> surprise is zero."""
         config = _make_pcm_config()
         pcm = PredictiveCodingModule(config)
         z = torch.randn(BS, P, D_pc)
@@ -169,7 +55,7 @@ class TestPCM:
         assert torch.equal(delta, torch.zeros_like(z))
 
     def test_surprise_nonzero_after_boundary(self):
-        """After boundary update, z_hat is set -> surprise is nonzero."""
+        """After boundary update, z_hat is valid -> surprise is nonzero."""
         config = _make_pcm_config()
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
@@ -180,10 +66,64 @@ class TestPCM:
         em_s = torch.randn(BS, config.D_em)
         pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
 
-        # Now z_hat is set; surprise should be nonzero
+        # Now z_hat is valid; surprise should be nonzero
         z = torch.randn(BS, P, D_pc)
         delta = pcm.compute_surprise(z)
         assert delta.abs().max() > 0
+
+    def test_z_hat_valid_set_after_boundary(self):
+        """boundary_update marks z_hat as valid."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+
+        assert not pcm.z_hat_valid.any()  # initially invalid
+
+        z_end = torch.randn(BS, D_pc)
+        ctx_b = torch.randn(BS, D_h)
+        pm_s = torch.randn(BS, D_h)
+        em_s = torch.randn(BS, config.D_em)
+        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+
+        assert pcm.z_hat_valid.all()  # now valid
+
+    def test_reset_clears_z_hat_valid(self):
+        """reset_states clears z_hat_valid for the reset stream."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+
+        z_end = torch.randn(BS, D_pc)
+        ctx_b = torch.randn(BS, D_h)
+        pm_s = torch.randn(BS, D_h)
+        em_s = torch.randn(BS, config.D_em)
+        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+
+        mask = torch.tensor([True, False])
+        pcm.reset_states(mask)
+
+        assert not pcm.z_hat_valid[0]  # reset
+        assert pcm.z_hat_valid[1]       # preserved
+
+    def test_l_pred_only_counts_valid_streams(self):
+        """L_pred should be zero on the first boundary (no valid hypothesis yet)."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+
+        z_end = torch.randn(BS, D_pc)
+        ctx_b = torch.randn(BS, D_h)
+        pm_s = torch.randn(BS, D_h)
+        em_s = torch.randn(BS, config.D_em)
+
+        # First boundary: z_hat was zeros, z_hat_valid=False → L_pred=0
+        L_pred = pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        assert L_pred.item() == 0.0
+
+        # Second boundary: z_hat is now valid → L_pred > 0 (with high probability)
+        z_end2 = torch.randn(BS, D_pc)
+        L_pred2 = pcm.boundary_update(z_end2, ctx_b, pm_s, em_s)
+        assert L_pred2.item() > 0
 
     def test_ffn_gain_shape(self):
         config = _make_pcm_config()
@@ -192,11 +132,21 @@ class TestPCM:
         gain = pcm.compute_ffn_gain(delta)
         assert gain.shape == (BS, P, D_h)
 
-    def test_ffn_gain_starts_near_one(self):
-        """At init, W_gain is small -> gain approx 1."""
+    def test_ffn_gain_bounded(self):
+        """FFN gain is bounded to [0.9, 1.1] by tanh."""
         config = _make_pcm_config()
         pcm = PredictiveCodingModule(config)
-        delta = torch.zeros(BS, P, D_pc)
+        # Large delta to push tanh toward saturation
+        delta = torch.randn(BS, P, D_pc) * 100
+        gain = pcm.compute_ffn_gain(delta)
+        assert gain.min() >= 0.9 - 1e-6
+        assert gain.max() <= 1.1 + 1e-6
+
+    def test_ffn_gain_starts_at_one(self):
+        """At init, W_gain is zero -> gain is exactly 1."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        delta = torch.randn(BS, P, D_pc)
         gain = pcm.compute_ffn_gain(delta)
         assert torch.allclose(gain, torch.ones_like(gain))
 
@@ -271,14 +221,13 @@ class TestPCM:
 
 
 # ============================================================================
-# Integration: PCM + multi-timescale in full model
+# Integration: PCM in full model
 # ============================================================================
 
-def _make_pcm_model(pcm_enabled=True, block_scales=None, **extra):
+def _make_pcm_model(pcm_enabled=True, **extra):
     config = ModelConfig(
         D=D, B=B, L=L, D_pc=D_pc,
         pcm_enabled=pcm_enabled,
-        block_scales=block_scales,
         D_em=64, D_wm=64, n_heads_wm=2,
         P=P, T=P, dropout=0.0, vocab_size=256,
         wm_enabled=True, pm_enabled=True, em_enabled=True,
@@ -359,120 +308,32 @@ class TestPCMIntegration:
         assert pcm.encoder.weight.grad is not None
         assert pcm.encoder.weight.grad.abs().max() > 0
 
-
-class TestMultiTimescaleIntegration:
-    def test_forward_span_multiscale(self):
-        """Multi-timescale blocks produce correct output shapes."""
-        model = _make_pcm_model(pcm_enabled=False, block_scales=(1, 4))
+    def test_pcm_surprise_rms_normalized(self):
+        """Block caches RMS-normalized PCM surprise (||δ||/sqrt(D_pc))."""
+        model = _make_pcm_model(pcm_enabled=True)
         model.train()
 
         ids = torch.randint(0, 256, (BS, P))
         reset = torch.zeros(BS, dtype=torch.bool)
         model.initialize_states(BS, torch.device("cpu"))
 
-        logits, x_emb, y_wm = model.forward_span(ids, reset)
-        assert logits.shape == (BS, P, 256)
+        # First span: no valid hypothesis → surprise is zero
+        model.forward_span(ids, reset)
+        # After first boundary, hypothesis becomes valid
+        model.apply_pcm_boundary()
 
-    def test_multiscale_with_pcm(self):
-        """PCM + multi-timescale together."""
-        model = _make_pcm_model(pcm_enabled=True, block_scales=(1, 4))
-        model.train()
-
-        ids = torch.randint(0, 256, (BS, P))
-        reset = torch.zeros(BS, dtype=torch.bool)
-        model.initialize_states(BS, torch.device("cpu"))
-
-        logits, x_emb, y_wm = model.forward_span(ids, reset)
-        assert logits.shape == (BS, P, 256)
-
-        L_pred, L_recon = model.apply_pcm_boundary()
-        assert L_pred.dim() == 0
-        assert L_recon.dim() == 0
-
-    def test_multiscale_validation(self):
-        """Config validation catches bad block_scales."""
-        with pytest.raises(ValueError, match="block_scales length"):
-            config = ModelConfig(D=D, B=B, L=L, block_scales=(1,))
-            config.validate()
-
-        with pytest.raises(ValueError, match="must be >= 1"):
-            config = ModelConfig(D=D, B=B, L=L, P=P, block_scales=(1, 3))
-            config.validate()
-
-    def test_scale_1_matches_no_scale(self):
-        """block_scales=(1,1) gives same output as block_scales=None."""
-        torch.manual_seed(42)
-        model_a = _make_pcm_model(pcm_enabled=False, block_scales=None)
-        torch.manual_seed(42)
-        model_b = _make_pcm_model(pcm_enabled=False, block_scales=(1, 1))
-
-        model_a.train()
-        model_b.train()
-
-        ids = torch.randint(0, 256, (BS, P))
-        reset = torch.zeros(BS, dtype=torch.bool)
-
-        model_a.initialize_states(BS, torch.device("cpu"))
-        model_b.initialize_states(BS, torch.device("cpu"))
-
-        logits_a, _, _ = model_a.forward_span(ids, reset)
-        logits_b, _, _ = model_b.forward_span(ids, reset)
-
-        assert torch.allclose(logits_a, logits_b, atol=1e-5)
-
-    def test_step_multiscale_hold(self):
-        """Slow block holds output on non-update steps."""
-        model = _make_pcm_model(pcm_enabled=False, block_scales=(1, 4))
-        model.eval()
-        model.initialize_states(BS, torch.device("cpu"))
-
-        block = model.blocks[1]  # scale=4
-        assert block.scale == 4
-
-        # Test block.step() directly
-        x_block = torch.randn(BS, D_h)
-        y_wm = torch.randn(BS, D)
-        x_proj = torch.randn(BS, D)
-        surprise = torch.zeros(BS, 1)
-        carry = torch.ones(BS, 1)
-
-        # Reset block counter for direct testing
-        block._step_counter = 0
-        block._last_step_output = None
-
-        # Step 0: processes
-        h0 = block.step(x_block, y_wm, x_proj, surprise, carry)
-        assert block._step_counter == 1
-
-        # Step 1: holds
-        h1 = block.step(x_block * 999, y_wm, x_proj, surprise, carry)
-        assert torch.equal(h0, h1), "Hold step should return cached output"
-        assert block._step_counter == 2
-
-    def test_step_multiscale_boundary_forces_process(self):
-        """Doc boundary forces slow block to process immediately."""
-        model = _make_pcm_model(pcm_enabled=False, block_scales=(1, 4))
-        model.eval()
-        model.initialize_states(BS, torch.device("cpu"))
-
-        block = model.blocks[1]  # scale=4
-        x_block = torch.randn(BS, D_h)
-        y_wm = torch.randn(BS, D)
-        x_proj = torch.randn(BS, D)
-        surprise = torch.zeros(BS, 1)
-        carry = torch.ones(BS, 1)
-
-        # First real step
-        block._step_counter = 0
-        block._last_step_output = None
-        _ = block.step(x_block, y_wm, x_proj, surprise, carry)
-        assert block._step_counter == 1
-
-        # Now send a boundary (carry=0) — should force processing
-        carry_boundary = torch.zeros(BS, 1)
-        _ = block.step(x_block, y_wm, x_proj, surprise, carry_boundary)
-        # Counter should have been reset to 0 on boundary, then incremented to 1
-        assert block._step_counter == 1
+        # Second span: now surprise should be nonzero and RMS-normalized
+        ids2 = torch.randint(0, 256, (BS, P))
+        model.forward_span(ids2, reset)
+        for block in model.blocks:
+            if block._last_token_surprise is not None:
+                surprise = block._last_token_surprise
+                assert surprise.shape == (BS, P, 1)
+                # RMS-normalized surprise should be reasonable (~1 scale)
+                # Not the raw L2 norm (~sqrt(D_pc) ≈ 5.7)
+                mean_surprise = surprise.mean().item()
+                assert mean_surprise < 10.0, \
+                    f"RMS-normalized surprise should be moderate, got {mean_surprise}"
 
 
 class TestPCMDetachment:

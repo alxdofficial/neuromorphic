@@ -2,7 +2,7 @@
 
 **Purpose:** Independent reference for verifying that all code changes remain aligned with the design intent. Covers every module, its intuition, its concrete implementation, and how modules compose during training. This document describes the **sequential** (`forward_one_token`) path. For the parallel scan-friendly training path, see `MODEL_EXPLAINER_PARALLEL.md`.
 
-**Last verified against code:** 2026-02-24
+**Last verified against code:** 2026-02-25
 
 ---
 
@@ -39,7 +39,7 @@ The neuromorphic LM decomposes language model memory into four biologically-insp
 | System | Biological Analogy | Persistence | Update Mechanism |
 |--------|--------------------|-------------|------------------|
 | **Genetic memory** (slow weights) | DNA / long-term evolutionary adaptation | Permanent after training | Standard backprop (frozen at deployment) |
-| **Working memory** (WM) | Prefrontal cortex / scratchpad | Recurrent state (GLA) | Gated Linear Attention — learned recency via decay gates (no plasticity) |
+| **Working memory** (WM) | Prefrontal cortex / scratchpad | Sliding-window attention state | Softmax attention over W=128 recent tokens (no plasticity) |
 | **Procedural memory** (PM) | Cerebellum / skill memory | Across documents/lifelong | Eligibility traces + neuromodulated commits |
 | **Episodic memory** (EM) | Hippocampus / event memory | Across documents/lifelong | Novelty-based writes to vector store + neuromodulation |
 | **Predictive coding** (PCM) | Cortical prediction error | Per-span hypothesis | Evidence-hypothesis surprise (δ = z - ẑ) |
@@ -66,19 +66,21 @@ Token ID ──► Embedding ──► x: [BS, D]
                      │                  │
                      │  EM retrieve     │  y_em = EM[b].retrieve(x, y_wm)
                      │  Project to D_h  │  y_wm_proj, y_em_proj
+                     │  PCM encode      │  z = encode(x_block)
+                     │  PCM surprise    │  δ = z - ẑ (if ẑ valid)
+                     │  PCM FFN gain    │  1 + 0.1*tanh(W_gain(δ))
+                     │  Input norm      │  LayerNorm(x_block)
                      │                  │
                      │  ┌─── Per Layer ─┐│  × L layers sequentially
-                     │  │ PM read       ││  y_pm = PM[b][l].apply(x_block)
-                     │  │ Gate compute  ││  a, b from concat(inputs + surprise)
-                     │  │ Recurrence    ││  h = a * (carry * h_prev) + b
-                     │  │ Proj+Drop+Res+Norm│  output = norm(drop(W_o(h)) + x_block)
-                     │  │ Elig update   ││  elig_K += k_cand, elig_V += v_cand
+                     │  │ PM read       ││  y_pm = PM[b][l].apply(x)
+                     │  │ Gate compute  ││  a, b from cat(x, y_pm, y_wm, y_em, surprise)
+                     │  │ Recurrence    ││  h = a ⊙ (carry ⊙ h_prev) + b
+                     │  │ W_o + Res+Norm││  out = LN(drop(W_o(h)) + x)
+                     │  │ FFN + Res     ││  out += FFN(LN(out) * ffn_gain)
+                     │  │ PM elig accum ││  elig_K += gate * route * k_cand
                      │  └───────────────┘│
                      │                    │
                      │  h_out: [BS, D_h]  │
-                     │  (+ all L layer    │
-                     │   outputs if       │
-                     │   snapshot_enabled) │
                      └────────┬───────────┘
                               │
                      concat all blocks ──► h_final: [BS, D]
@@ -99,21 +101,19 @@ Token ID ──► Embedding ──► x: [BS, D]
                            ┌────┘
                            ▼
                    Per-token surprise ──► span_surprise_mean
+                   (CE-based or PCM ‖δ‖/√D_pc, blended during warmup)
                            │
-              ┌────────────┴─────────────┐
-              ▼                          ▼
-     PM Neuromodulators            EM Neuromodulators
-     (at span boundaries)          (at span boundaries)
-     ├─ inputs: elig_norm,         ├─ inputs: surprise,
-     │  usage, surprise            │  usage, novelty
-     ├─ outputs: p_commit,         ├─ outputs: g_em,
-     │  lambda, g, slots, tau      │  tau, ww, decay
-     ▼                             ▼
-     PM commit: update             EM write: update
-     pm_K, pm_V, pm_a             em_K, em_V, em_S
-              │                          │
-              └── All trained via ───────┘
-                  main loss backprop
+              ┌────────────┼─────────────────────┐
+              ▼            │                     ▼
+     PM Neuromodulators    │               EM Neuromodulators
+     (at span boundaries)  │               (at span boundaries)
+     ├─ commit decision    │               ├─ write decision
+     ▼                     │               ▼
+     PM commit: update     │               EM write: update
+     pm_K, pm_V, pm_a     │               em_K, em_V, em_S
+                           ▼
+                   PCM hypothesis update
+                   ẑ_new = predictor(z_end, ctx, PM, EM)
 ```
 
 **Dimensions (tier_a_wide defaults):** D=768, B=2, L=8, D_h=384, vocab=32000
@@ -128,7 +128,6 @@ Token ID ──► Embedding ──► x: [BS, D]
 | PM neuromodulators | `PMNeuromodulator` | B*L=16 | `layer.pm_neuromodulator` |
 | EM neuromodulators | `EMNeuromodulator` | B=2 | `block.em_neuromodulator` |
 | PCM | `PredictiveCodingModule` | 0 or B | `block.pcm` (if `pcm_enabled`) |
-| Temporal pooler | `TemporalPooler` | B | `block.pooler` (identity when scale=1) |
 | Spatial decoder | `SpatialDecoder` | 0 or 1 | `model.spatial_decoder` (if `snapshot_enabled`) |
 
 ---
@@ -145,23 +144,33 @@ if reset_mask.any():
 # 2. Embed
 x = self.embedding(input_id)           # [BS, D]
 
-# 3. Working memory (shared, GLA recurrence)
+# 3. Working memory: read + push into ring buffer (shared across blocks)
 y_wm = self.wm.step(x, reset_mask)    # [BS, D]
 
 # 4. Project and split for parallel blocks
 x_proj = self.W_in(x)                  # [BS, D]
 x_blocks = x_proj.view(BS, B, D_h)    # [BS, B, D_h]
 
-# 5. Each block processes its D_h slice with access to x, y_wm
+# 5. Each block processes its D_h slice
 carry = (~reset_mask).float()[:, None]  # [BS, 1]
 for b, block in enumerate(self.blocks):
-    h_b = block.step(x_blocks[:, b], y_wm, x, surprise, carry)
+    # Inside block.step():
+    #   a. EM retrieve (query with x_proj + y_wm)
+    #   b. Project y_wm, y_em to D_h
+    #   c. PCM encode evidence → compute δ surprise → FFN gain (if enabled)
+    #   d. LayerNorm(x_block)
+    #   f. For each layer:
+    #      - PM holographic read
+    #      - Gate compute: a, b = split(Linear(cat(x, y_pm, y_wm, y_em, δ)))
+    #      - Recurrence: h = sigmoid(a) ⊙ (carry ⊙ h_prev) + tanh(b)
+    #      - Output: LN(drop(W_o(h)) + x) → FFN with gain modulation
+    #      - PM eligibility accumulation (surprise-gated)
+    h_b = block.step(x_blocks[:, b], y_wm, x_proj, surprise, carry)
 
 # 6. Merge and predict
 h_final = concat(h_blocks)             # [BS, D]
 
 if snapshot_enabled:
-    # Hierarchical aggregation → deep cross-attention (§12)
     h_decoded = spatial_decoder(layer_outputs, pm_summary, em_summary, y_wm, h_final)
     logits = self.lm_head(h_decoded)   # [BS, vocab]
 else:
@@ -192,28 +201,28 @@ return logits, x, y_wm
 
 **Intuition:** WM is the model's scratchpad — bounded recurrent attention that provides short-range precision (copying a name from 50 tokens ago, binding an adjective to its noun) without the unbounded memory cost of full attention.
 
-**Default implementation: Gated Linear Attention (GLA)** (`wm_type="gla"`)
+**Default implementation: Softmax sliding-window attention** (`wm_type="softmax"`)
 
 State per stream:
-- `gla_state: [BS, H, head_dim, head_dim]` — recurrent state matrix (float32)
-- H = `n_heads_wm` (default 4), head_dim = `D_wm / H` (default 32)
+- `wm_K: [BS, W, D_wm]` — key ring buffer (W=128 recent tokens)
+- `wm_V: [BS, W, D_wm]` — value ring buffer
+- `wm_valid: [BS, W]` — mask for occupied positions
+- `wm_ptr: [BS]` — write pointer into ring buffer
 
 Per-token operation (`step()`):
-1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`, reshaped to `[BS, H, head_dim]`
-2. Compute decay gate: `g = logsigmoid(W_g(x)) / 16` — learned log-space decay in (-inf, 0], `exp(g)` ∈ (0, 1]
-3. Update state: `S_t = diag(exp(g)) * S_{t-1} + k^T @ v` — exponential decay + outer product update
-4. Read output: `o = q @ S_t` — query against accumulated state
-5. Project: `y_wm = dropout(W_o(merge_heads(o)))` → `[BS, D]`
+1. Project current token: `q = W_q(x)`, `k = W_k(x)`, `v = W_v(x)` all `[BS, D_wm]`
+2. Write to ring buffer: `wm_K[:, ptr] = k`, `wm_V[:, ptr] = v`
+3. Compute attention: `scores = q @ wm_K.T / sqrt(head_dim)` with ALiBi recency bias
+4. Read output: `o = softmax(scores) @ wm_V`
+5. Project: `y_wm = dropout(W_o(o))` → `[BS, D]`
 
-The gate projection `W_g` uses a low-rank bottleneck (`D → gate_low_rank → D_wm`, default `gate_low_rank=16`) to keep parameter count small. The `logsigmoid / 16` normalization ensures stable decay rates.
+**Doc boundary reset:** Zeros ring buffer and validity mask for masked streams. This prevents cross-document information leakage.
 
-**Doc boundary reset:** Zeros `gla_state` for masked streams. This prevents cross-document information leakage.
+**Gradient flow:** Within a TBPTT chunk, gradients flow through the attention computation back to W_q, W_k, W_v, and W_o. At chunk boundaries, the ring buffer state is detached. WM is *non-plastic* — no explicit memory update mechanism, just a fixed-size window of recent context. All projection weights are trained via backprop.
 
-**Gradient flow:** Within a TBPTT chunk, gradients flow through the recurrence back to W_q, W_k, W_v, W_g, and W_o. At chunk boundaries, `gla_state` is detached. WM is *non-plastic* in that it has no explicit memory update mechanism — it simply maintains a compressed representation of recent context via the decaying state matrix. But all projection weights are trained via backprop.
+**Alternative: Gated Linear Attention (GLA)** (`wm_type="gla"`)
 
-**Fallback: Softmax ring buffer** (`wm_type="softmax"`)
-
-The original sliding-window attention implementation is available as a fallback. It uses a ring buffer (`wm_K, wm_V, wm_valid, wm_ptr`) with ALiBi recency bias and softmax attention. Set `wm_type="softmax"` in config to use it.
+A GLA implementation is also available, using a recurrent state matrix `[BS, H, head_dim, head_dim]` with learned decay gates. Set `wm_type="gla"` in config to use it.
 
 **Shared across model:** There is exactly one WM instance. Its output `y_wm: [BS, D]` is broadcast to all B blocks, where each block projects it down to `D_h` via its own `W_wm_proj`.
 
@@ -613,7 +622,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 **File:** `src/model/block.py`
 
-A Block is a self-contained processing unit: B blocks run in parallel, each handling `D_h = D/B` dimensions. Each block optionally contains a Predictive Coding Module (PCM) and a Temporal Pooler for multi-timescale processing.
+A Block is a self-contained processing unit: B blocks run in parallel, each handling `D_h = D/B` dimensions. Each block optionally contains a Predictive Coding Module (PCM).
 
 **Block.step(x_block, y_wm, x_proj, surprise, carry) per token:**
 ```python
@@ -629,8 +638,8 @@ if pcm is not None:
     z = pcm.encode(x_block.unsqueeze(1))         # [BS, 1, D_pc]
     delta = pcm.compute_surprise(z)              # [BS, 1, D_pc]
     gate_surprise = delta.squeeze(1)             # [BS, D_pc] — vector surprise for gates
-    ffn_gain = pcm.compute_ffn_gain(delta).squeeze(1)  # [BS, D_h]
-    pm_surprise = delta.norm(dim=-1)             # [BS, 1] — scalar ‖δ‖ for PM eligibility
+    ffn_gain = pcm.compute_ffn_gain(delta).squeeze(1)  # [BS, D_h] — bounded [0.9, 1.1]
+    pm_surprise = delta.norm(dim=-1) / sqrt(D_pc)  # [BS, 1] — RMS-normalized scalar for PM
 else:
     gate_surprise = surprise                     # [BS, 1] — scalar surprise
     ffn_gain = None
@@ -697,71 +706,41 @@ This is the core of the soft reset: transient state (h, eligibility) resets at d
 | Evidence encoder | `LayerNorm(D_h) → Linear(D_h, D_pc)` | Compress block input to latent (bottom-up) |
 | Hypothesis predictor | `Linear(D_pc+D_h+D_h+D_em, D_pc*2) → GELU → Linear(D_pc*2, D_pc)` | Predict next span's latent from current state + memory summaries |
 | Reconstruction decoder | `Linear(D_pc, D_h)` | Aux loss only — prevents encoder collapse |
-| FFN gain modulator | `Linear(D_pc, D_h)` (zero-initialized) | `gain = 1 + W_gain(δ)` — modulates FFN input |
+| FFN gain modulator | `Linear(D_pc, D_h)` (zero-initialized) | `gain = 1 + 0.1 * tanh(W_gain(δ))` — bounded [0.9, 1.1] FFN modulation |
 
 **Per-span flow:**
 ```python
 # During forward pass (per token):
-z = encoder(LayerNorm(x_block))              # [BS, P_b, D_pc] — evidence
-delta = z - z_hat.unsqueeze(1)               # [BS, P_b, D_pc] — surprise vector (δ)
-ffn_gain = 1 + W_gain(delta)                 # [BS, P_b, D_h] — FFN modulation
+z = encoder(LayerNorm(x_block))              # [BS, P, D_pc] — evidence
+delta = z - z_hat.detach().unsqueeze(1)      # [BS, P, D_pc] — surprise vector (δ)
+delta *= z_hat_valid.unsqueeze(-1,-1)        # zero if no valid hypothesis yet
+ffn_gain = 1 + 0.1 * tanh(W_gain(delta))    # [BS, P, D_h] — bounded FFN modulation
 
 # At span boundary:
-L_pred = ||z_hat - z_end.detach()||²         # prediction loss (how wrong was hypothesis?)
+L_pred = ||z_hat - z_end.detach()||²         # prediction loss (only if z_hat_valid)
 z_hat_new = predictor(cat([z_end, ctx_b, pm_summary_b, em_summary_b]).detach())
+z_hat_valid = True                           # mark hypothesis as valid
 L_recon = ||decoder(z) - x_block.detach()||² # reconstruction loss
 ```
 
 **Surprise routing (when PCM is enabled):**
 - **Gate inputs:** Vector δ replaces scalar surprise → `cat([x, y_pm, y_wm, y_em, δ])` with dim `4*D_h + D_pc`
-- **FFN gain:** `ffn_input *= (1 + W_gain(δ))` — per-dimension modulation
-- **PM eligibility:** Scalar `‖δ‖` (L2 norm of prediction error) replaces loss-based surprise
-- **PM neuromodulator:** Scalar `‖δ‖` as surprise input at span boundary
-- **EM candidate scoring:** Per-token `‖δ‖` for novelty scoring
-- **EM neuromodulator:** Span-mean `‖δ‖` as surprise input
+- **FFN gain:** `ffn_input *= (1 + 0.1 * tanh(W_gain(δ)))` — bounded [0.9, 1.1] per-dimension modulation
+- **PM eligibility:** RMS-normalized scalar `‖δ‖/√D_pc` replaces loss-based surprise (keeps scale ~1)
+- **PM neuromodulator:** RMS-normalized surprise at span boundary
+- **EM candidate scoring:** Per-token RMS-normalized `‖δ‖/√D_pc` for novelty scoring
+- **EM neuromodulator:** Span-mean of RMS-normalized surprise
+- **Surprise warmup blend:** During `pcm_warmup_steps`, surprise is `(1-α)*CE_surprise + α*PCM_surprise` with α ramping 0→1, preventing cold-start noise from untrained PCM
 
 **Key design decisions:**
+- **z_hat_valid flag:** Per-stream boolean, initially False. Set to True after first `boundary_update`. Prevents garbage surprise from the zero hypothesis before any prediction exists. Cleared on doc boundary resets.
 - **z_hat is NOT detached** across TBPTT boundaries — its computation graph (just the predictor's forward pass on detached inputs) persists so L_pred can backprop through predictor weights.
-- **W_gain is zero-initialized** so gain starts at exactly 1.0 (identity). The model learns to modulate as needed.
+- **W_gain is zero-initialized** so gain starts at exactly 1.0 (identity). Bounded by tanh to [0.9, 1.1] to prevent sign flips or magnitude blowups.
 - **Predictor inputs are all detached** — the predictor learns to predict, but doesn't affect the main model's gradient flow.
-- **Warmup schedule:** PCM aux losses ramp linearly from 0 to full weight over `pcm_warmup_steps`, letting the main model stabilize before PCM gradients kick in.
+- **Warmup schedule:** PCM aux losses ramp linearly from 0 to full weight over `pcm_warmup_steps`. Surprise signal also blends from CE to PCM over the same schedule.
+- **Mid-span doc boundary reset:** PCM hypothesis (z_hat) is cleared when a new document starts mid-span, preventing stale predictions from the old document.
 
 **Config:** `pcm_enabled=False` (default), `D_pc=128`, `pcm_pred_weight=0.01`, `pcm_recon_weight=0.01`, `pcm_warmup_steps=100`
-
-### 9.3 Multi-Timescale Blocks
-
-**File:** `src/model/temporal_pool.py`
-
-**Intuition:** The brain has no global clock — neurons operate at heterogeneous timescales. When `block_scales` is set (e.g., `(1, 4)` for B=2), each block processes input at a different temporal resolution. Block 0 (scale=1) sees every token; Block 1 (scale=4) aggregates 4-token windows into a single representation.
-
-**Downsampling** uses a learnable weighted sum within non-overlapping windows: each output position is a weighted combination of `s` input tokens, with softmax-normalized weights initialized to uniform (= average pooling at init). The model learns which positions within each window matter most.
-
-**Boundary safety:** When a doc boundary falls inside a window, all tokens from the previous document are masked out before aggregation (carry-aware masking within each window). This prevents cross-document mixing while preserving the learnable aggregation.
-
-**Components:**
-
-| Component | Architecture | Purpose |
-|-----------|-------------|---------|
-| `TemporalPooler` | Learned weighted sum in non-overlapping windows + `repeat_interleave` | Boundary-safe learnable downsampling (s params, init as avg pool) |
-| `carry_min_pool` | Min-pool over carry mask | Any boundary in window forces recurrence reset (conservative) |
-
-**Per-block flow (scale > 1):**
-```python
-# Downsample: [BS, P, D_h] → [BS, P//s, D_h] (learnable, boundary-aware)
-x_block_b = pooler.downsample(x_block_all, carry_all)
-y_wm_b = pooler.downsample(y_wm_all, carry_all)
-carry_b = carry_min_pool(carry_all, s)
-
-# Process at reduced resolution (same L layers, PCM, etc.)
-...layers...
-
-# Upsample back: [BS, P//s, D_h] → [BS, P, D_h] (repeat_interleave)
-x_up = pooler.upsample(x, P)
-```
-
-**Step mode (autoregressive generation):** Slow blocks use a counter — only process every s-th token, holding the last output on intermediate steps. Doc boundaries force immediate processing and counter reset.
-
-**Config:** `block_scales=None` (default, all scale 1). Set e.g. `block_scales=(1, 4)` for 2-block multi-timescale.
 
 ---
 
@@ -1267,7 +1246,6 @@ parameter gradients to:
   - PM neuromodulator heads (p_commit, lambda, g, slot logits, tau)
   - EM neuromodulator heads (g_em, tau, ww, decay)
   - PCM weights (encoder, decoder, predictor, W_gain — if pcm_enabled)
-  - Temporal pooler learned weights (if block_scales configured)
 
 Runtime state updates (not parameters, no optimizer state):
   - PM state: pm_K, pm_V, pm_a, elig_K, elig_V
@@ -1277,7 +1255,7 @@ Runtime state updates (not parameters, no optimizer state):
 ```
 
 **Summary:**
-- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled), temporal pooler weights (if block_scales configured). Single optimizer for everything.
+- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled). Single optimizer for everything.
 - **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
 - **Evolves via explicit rules (graph preserved):** PCM z_hat — updated at span boundaries by predictor forward pass; graph persists across TBPTT for L_pred backprop
 - **Not plastic (no memory update mechanism):** WM recurrent state (GLA state matrix; gradients flow through within TBPTT chunks, detached at chunk boundaries)

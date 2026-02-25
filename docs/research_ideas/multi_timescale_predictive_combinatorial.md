@@ -1,7 +1,14 @@
 # Research Ideas: Multi-Timescale, Predictive Coding, Combinatorial Memory
 
-Status: **#1 Multi-Timescale and #2 Predictive Coding are IMPLEMENTED** (see `src/model/temporal_pool.py`, `src/model/predictive_coding.py`). #3 Combinatorial Memory remains brainstorm.
-Date: 2025-02-19 (ideas), 2026-02-24 (implementation of #1 and #2)
+Status: **#2 Predictive Coding is IMPLEMENTED** (see `src/model/predictive_coding.py`). #1 Multi-Timescale was implemented then **removed** (single shared weight vector too few degrees of freedom, LayerNorm washes out the effect, recurrence already handles temporal dynamics). #3 Combinatorial Memory remains brainstorm.
+Date: 2025-02-19 (ideas), 2026-02-25 (implementation of #2, removal of #1)
+
+**Implementation notes (2026-02-25):**
+- **PCM surprise** is RMS-normalized: `‖δ‖/√D_pc` (keeps scale near ~1 instead of raw L2 ~√D_pc ≈ 11.3).
+- **FFN gain** is bounded: `1 + 0.1 * tanh(W_gain(δ))` → [0.9, 1.1].
+- **z_hat_valid** flag prevents garbage surprise before first boundary_update.
+- **Surprise warmup blend**: `(1-α)*CE + α*PCM` with α ramping 0→1 over pcm_warmup_steps.
+- **Mid-span doc boundary reset** clears PCM hypothesis when new doc starts mid-span.
 
 ---
 

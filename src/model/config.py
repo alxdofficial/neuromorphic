@@ -20,8 +20,8 @@ class ModelConfig:
     eot_id: int = 2           # set from tokenizer at runtime
 
     # Working Memory (1 shared instance)
-    wm_type: str = "gla"      # "gla" (Gated Linear Attention) or "softmax" (ring buffer)
-    W: int = 256              # sliding window size (softmax WM only)
+    wm_type: str = "softmax"  # "softmax" (sliding window attention) or "gla" (Gated Linear Attention)
+    W: int = 128              # sliding window size (softmax WM only)
     D_wm: int = 128           # WM key/value dimension
     n_heads_wm: int = 4       # attention heads
     gate_low_rank: int = 16   # gate projection bottleneck dim (GLA WM only)
@@ -85,10 +85,6 @@ class ModelConfig:
     pcm_pred_weight: float = 0.01      # prediction loss weight
     pcm_recon_weight: float = 0.01     # reconstruction loss weight
     pcm_warmup_steps: int = 100        # steps before PCM losses ramp in
-
-    # Multi-Timescale Blocks
-    block_scales: tuple = None         # per-block scale factors, e.g. (1, 4) for B=2
-                                       # None = all scale 1 (current behavior)
 
     # Spatial Decoder (hierarchical aggregation + deep cross-attention)
     snapshot_enabled: bool = True   # architecture toggle (independent of phase)
@@ -156,18 +152,6 @@ class ModelConfig:
             raise ValueError(
                 f"D_pc ({self.D_pc}) must be positive when pcm_enabled=True."
             )
-        if self.block_scales is not None:
-            if len(self.block_scales) != self.B:
-                raise ValueError(
-                    f"block_scales length ({len(self.block_scales)}) must "
-                    f"equal B ({self.B})."
-                )
-            for i, s in enumerate(self.block_scales):
-                if s < 1 or self.P % s != 0:
-                    raise ValueError(
-                        f"block_scales[{i}]={s} must be >= 1 and "
-                        f"divide P ({self.P}) evenly."
-                    )
 
     def set_phase(self, phase: str):
         """Set component toggles for training phase.

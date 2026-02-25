@@ -44,7 +44,6 @@ def _args(**overrides):
         "fla": False,
         "pcm": None,
         "d_pc": None,
-        "block_scales": None,
     }
     base.update(overrides)
     return argparse.Namespace(**base)

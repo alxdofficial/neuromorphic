@@ -196,9 +196,6 @@ def parse_args() -> argparse.Namespace:
                    help="Disable Predictive Coding Module")
     p.add_argument("--d-pc", type=int, default=None,
                    help="PCM latent dimension")
-    # Multi-timescale blocks
-    p.add_argument("--block-scales", type=str, default=None,
-                   help="Per-block temporal scales, comma-separated (e.g. '1,4')")
     p.add_argument("--d-dec", type=int, default=None,
                    help="Decoder working dimension")
     p.add_argument("--decoder-layers", type=int, default=None,
@@ -466,12 +463,6 @@ def resolve_settings(args: argparse.Namespace) -> dict:
             else preset_payload.get("pcm_enabled")
         ),
         "D_pc": args.d_pc if args.d_pc is not None else preset_payload.get("D_pc"),
-        # Multi-timescale blocks
-        "block_scales": (
-            args.block_scales
-            if args.block_scales is not None
-            else preset_payload.get("block_scales")
-        ),
     }
 
     if isinstance(settings["resume"], str):
@@ -527,13 +518,6 @@ def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelC
             config.pcm_enabled = settings["pcm_enabled"]
         if settings.get("D_pc") is not None:
             config.D_pc = settings["D_pc"]
-        # Multi-timescale blocks
-        if settings.get("block_scales") is not None:
-            raw = settings["block_scales"]
-            if isinstance(raw, str):
-                config.block_scales = tuple(int(x) for x in raw.split(","))
-            else:
-                config.block_scales = tuple(raw)
     return config
 
 
