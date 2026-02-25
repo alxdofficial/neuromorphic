@@ -7,8 +7,8 @@ update this file. If not, the code has a regression.
 # ---------------------------------------------------------------------------
 # Tier defaults (from ModelConfig.tier_a/b/c classmethods)
 # ---------------------------------------------------------------------------
-TIER_A = dict(D=512, L=8, B=4)
-TIER_A_WIDE = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6, pm_readout_ffn=False)
+TIER_A = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6, pm_readout_ffn=False)
+TIER_A_WIDE = TIER_A  # deprecated alias
 TIER_B = dict(
     D=768, L=12, B=6,
     r=16, W=512, D_wm=192, n_heads_wm=6,

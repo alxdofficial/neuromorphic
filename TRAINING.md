@@ -3,9 +3,9 @@
 ## Quick Start
 
 ```bash
-# Tier A Wide on RTX 4090 (all 3 phases, optimized BS)
+# Tier A on RTX 4090 (all 3 phases, optimized BS)
 tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
-  "python -u -m src.train --preset phase_a_to_c --tier a_wide --bs 32 --compile 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
+  "python -u -m src.train --preset phase_a_to_c --tier a --bs 32 --compile 2>&1 | tee outputs/train_full_\$(date +%Y%m%d_%H%M%S).log"
 
 # Tier 1B on A100 80GB (cloud training)
 tmux new-session -d -s neuromorphic-train -c /home/alex/code/neuromorphic \
@@ -21,20 +21,19 @@ tmux attach -t neuromorphic-train
 
 | Tier | Params | D | L | B | D_h | Target GPU | Recommended BS |
 |------|--------|---|---|---|-----|------------|---------------|
-| **A** | 39.7M | 512 | 8 | 4 | 128 | RTX 4090 | 32-64 |
-| **A Wide** | 85.1M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
+| **A** | 85.1M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
 | **B** | 78.1M | 768 | 12 | 6 | 128 | RTX 4090 | 16-32 |
 | **1B** | 1,070M | 2048 | 16 | 2 | 1024 | A100 80GB | 8 |
 | **C** | 164.0M | 1024 | 24 | 8 | 128 | RTX 4090 | 8-16 |
 
 **Scaling pattern:** D_h = D/B. Increasing model size → increase D (and optionally B). Keep D_h >= 384 for expressive layers. At 1B+, scale D proportionally with B (e.g. B=4 needs D=4096 to maintain D_h=1024).
 
-Select tier with `--tier a_wide` / `--tier 1b` / etc.
+Select tier with `--tier a` / `--tier 1b` / etc.
 
 ## Key Settings
 
 - **Always use `-u` flag** with python to disable output buffering (otherwise tee/log files stay empty)
-- **Tier A Wide** (~85M params): Primary development tier on RTX 4090
+- **Tier A** (~85M params): Primary development tier on RTX 4090
 - **Tier 1B** (~1.07B params): Target tier for conversational quality (cloud GPU)
 - **`--compile`**: Enables `torch.compile(mode="default")` — required for reasonable throughput on CUDA
 
@@ -99,7 +98,7 @@ This creates `data/phase_B/` with parquet files (~4-8 GB). The training pipeline
 ## CLI Overrides
 
 ```bash
---tier a_wide          # Select model tier (a, a_wide, b, 1b, c)
+--tier a               # Select model tier (a, b, 1b, c)
 --save-interval 5000   # Less frequent checkpoints
 --plot-interval 500    # More frequent plot regeneration
 --no-plots             # Disable all plot generation
@@ -122,12 +121,12 @@ All outputs go to `outputs/<run_name>/<run_id>/`:
 ## Cleanup
 
 Delete short/aborted runs from `outputs/` to save disk.
-Checkpoints are ~170MB each (tier A Wide) or ~4GB (tier 1B).
+Checkpoints are ~170MB each (tier A) or ~4GB (tier 1B).
 
 ## Resuming
 
 ```bash
-python -u -m src.train --phase B --tier a_wide --bs 32 --compile --resume outputs/.../checkpoints/latest.pt
+python -u -m src.train --phase B --tier a --bs 32 --compile --resume outputs/.../checkpoints/latest.pt
 ```
 
 ## Important Notes

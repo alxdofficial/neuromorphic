@@ -32,7 +32,7 @@ The neuromorphic LM's affine recurrence (`h_t = a_t * h_{t-1} + b_t`) was design
 - GPU utilization was poor: each kernel operated on `[BS, D_h]` tensors (e.g. `[32, 384]` = 12K elements), far below the threshold for saturating GPU compute.
 - Training speed was ~250 tok/s on a 4090 for Tier A — viable for debugging, too slow for serious experiments.
 
-The parallel path batches P=32 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 32x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~100x throughput increase over the original sequential path (~26K tok/s on a 4090 for Tier A Wide).
+The parallel path batches P=32 tokens (one plasticity span) into `[BS, P, ...]` tensors. The expensive operations (linear projections, attention, FFN) now operate on 32x more elements per kernel launch, while the recurrence itself remains a cheap sequential loop. Combined with `torch.compile` (§12), this yields ~100x throughput increase over the original sequential path (~26K tok/s on a 4090 for Tier A).
 
 **Design constraint:** The parallel path must produce identical (or near-identical) results to the sequential path. Both paths share the same `nn.Module` parameters. The sequential path remains available for inference and as a correctness oracle.
 
@@ -125,7 +125,7 @@ return logits_all, x_emb_all, y_wm_all
 
 ## 4. Concrete Walkthrough: One Span, Token by Token
 
-Trace the full lifecycle of one span (P=32 tokens) on Tier A wide (D=768, B=2, L=8, D_h=384, D_wm=192, D_em=128, r=8, M=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
+Trace the full lifecycle of one span (P=32 tokens) on Tier A (D=768, B=2, L=8, D_h=384, D_wm=192, D_em=128, r=8, M=256, k_ret=4). BS=32 streams. Assume Phase B (WM + PM + EM enabled). Assume a doc boundary (EOT) occurs at position t=12 within the span.
 
 ### 4.1 State entering this span
 
@@ -845,7 +845,7 @@ Everything not listed above is numerically identical between the two paths:
 
 ### torch.compile Support
 
-Block-level compilation is the current strategy: `block.forward_span` is compiled as a single graph per block using `mode="default"`, covering EM retrieval + L layers × (PM apply + gates + scan + FFN) + layer output stacking. This reduces compiled graphs from ~96 (individual functions) to ~4 (one per block in Tier A Wide with B=2). CUDA graph capture (`max-autotune`) was benchmarked but is incompatible with the model's stateful memory writes (PM/EM modify tensors in-place between forward passes) and was 3.5% slower at current scale.
+Block-level compilation is the current strategy: `block.forward_span` is compiled as a single graph per block using `mode="default"`, covering EM retrieval + L layers × (PM apply + gates + scan + FFN) + layer output stacking. This reduces compiled graphs from ~96 (individual functions) to ~4 (one per block in Tier A with B=2). CUDA graph capture (`max-autotune`) was benchmarked but is incompatible with the model's stateful memory writes (PM/EM modify tensors in-place between forward passes) and was 3.5% slower at current scale.
 
 **Compiled:**
 - **`Block.forward_span`**: Compiled with `mode="default"`. Covers the entire block forward pass — EM retrieval, per-layer PM reads, gate computation, affine scans, output projections, and FFN — into fused CUDA kernels. The scan loops are unrolled by the compiler, and the backward pass replaces autograd nodes with efficient fused backward kernels.
@@ -859,7 +859,7 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 
 **Pre-initialization requirement:** `model.initialize_states(BS, device)` must be called before `compile_for_training()` to pre-allocate all runtime state tensors (Layer.h, PM state, EM state, WM state). This eliminates lazy init guards from the forward path, preventing graph breaks during compilation.
 
-**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~24K tok/s on RTX 4090 (Tier A Wide, BS=32, Phase B).
+**Usage:** Enable with `--compile` on the training CLI or `use_compile: True` in config. Requires CUDA. First two steps are slow (~5.7 min total) due to tracing; subsequent steps use cached compiled kernels. Provides ~24K tok/s on RTX 4090 (Tier A, BS=32, Phase B).
 
 ---
 

@@ -90,7 +90,7 @@ def load_our_model():
     from src.model.config import ModelConfig
     from src.model.model import NeuromorphicLM
 
-    config = ModelConfig.tier_a_wide()
+    config = ModelConfig.tier_a()
     config.set_phase("B")
     model = NeuromorphicLM(config).to(dtype=torch.bfloat16, device=DEVICE)
     if OUR_CKPT is None or not OUR_CKPT.exists():

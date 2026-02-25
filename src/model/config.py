@@ -188,18 +188,16 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Debug tier (~50M params). D=512, L=8, B=4."""
-        defaults = dict(D=512, L=8, B=4)
+        """Development tier (~85M params). D=768, L=8, B=2, D_h=384."""
+        defaults = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6,
+                        pm_readout_ffn=False)
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
     def tier_a_wide(cls, **overrides) -> "ModelConfig":
-        """Wide variant of tier A. D=768, L=8, B=2, D_h=384."""
-        defaults = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6,
-                        pm_readout_ffn=False)
-        defaults.update(overrides)
-        return cls(**defaults)
+        """Deprecated alias for tier_a (kept for backward compat)."""
+        return cls.tier_a(**overrides)
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":

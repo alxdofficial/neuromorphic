@@ -116,7 +116,7 @@ Token ID ──► Embedding ──► x: [BS, D]
                    ẑ_new = predictor(z_mean, ctx, PM, EM)
 ```
 
-**Dimensions (tier_a_wide defaults):** D=768, B=2, L=8, D_h=384, vocab=32000
+**Dimensions (tier_a defaults):** D=768, B=2, L=8, D_h=384, vocab=32000
 
 **Instance counts:**
 
@@ -286,7 +286,7 @@ When PCM is enabled, `ffn_gain = 1 + W_gain(δ)` modulates the FFN input per-dim
 
 **Intuition:** PM is the model's "skill memory." It stores holographic modulation slots -- each slot is a (key, modulation pattern, strength) triple that applies an input-dependent transformation when matched. Rather than retrieving a fixed value, the input flows *through* the stored pattern: `y_d = x_d * sum_i(a_i * (x · k_i) * v_{i,d})`. This is quadratic in x, analogous to dendritic computation where synaptic patterns modulate incoming signals per-dimension. Unlike slow weights (parameters), PM can be updated *during inference* via neuromodulated commits at span boundaries.
 
-**Instance count:** One PM per (block, layer) pair. B*L = 16 instances total (tier_a_wide). Each operates independently on its own `[BS, D_h]` slice.
+**Instance count:** One PM per (block, layer) pair. B*L = 16 instances total (tier_a). Each operates independently on its own `[BS, D_h]` slice.
 
 ### 7.1 PM State
 
@@ -320,7 +320,7 @@ y_pm = (weighted * x_q.unsqueeze(1) * pm_V).sum(1)          # [BS, D_h]
 y_pm = y_raw + readout_ffn(readout_norm(y_raw))
 # readout_ffn: Linear(D_h, D_h*4) → GELU → Linear(D_h*4, D_h)
 ```
-This adds further nonlinear processing on top of the already-quadratic holographic read. Controlled by `pm_readout_ffn` (default `False` in tier_a_wide).
+This adds further nonlinear processing on top of the already-quadratic holographic read. Controlled by `pm_readout_ffn` (default `False` in tier_a).
 
 This is a read-only operation. PM keys and values are frozen within each plasticity span.
 
@@ -457,7 +457,7 @@ This table covers **every learnable weight, runtime state, and control signal** 
 
 **Intuition:** EM is the model's long-term event store. While PM learns reusable patterns (procedural knowledge), EM stores specific *episodes* -- particular token contexts that were surprising or novel. When the model encounters a situation similar to a stored episode, EM retrieves it, providing a form of "I've seen something like this before" recall.
 
-**Instance count:** One EM per block. B=2 instances total (tier_a_wide). Each EM is shared across all L layers within its block.
+**Instance count:** One EM per block. B=2 instances total (tier_a). Each EM is shared across all L layers within its block.
 
 ### 8.1 EM State
 
@@ -1215,7 +1215,7 @@ All neuromodulator params are on the main optimizer in all phases. There is no s
 
 | Tier | D | L | B | ~Params | 4090 BS | Use Case |
 |------|---|---|---|---------|---------|----------|
-| **A** (tier_a_wide, default) | 768 | 8 | 2 | ~85M | 32-64 | Development and ablation |
+| **A** (tier_a, default) | 768 | 8 | 2 | ~85M | 32-64 | Development and ablation |
 | **B** (Competitive) | 768 | 12 | 6 | ~103M | 16-32 | Match GPT-2 Small |
 | **C** (Strong) | 1024 | 24 | 8 | ~197M | 8-16 | Match GPT-2 Medium |
 
@@ -1313,7 +1313,7 @@ The recurrence + memory architecture means throughput is **lower than a pure tra
 
 | Tier | D | L | B | ~Params (tied embeddings) | Notes |
 |------|---|---|---|--------------------------|-------|
-| **A** (tier_a_wide) | 768 | 8 | 2 | ~85M | Default config, tied embeddings |
+| **A** (tier_a) | 768 | 8 | 2 | ~85M | Default config, tied embeddings |
 | **B** (Competitive) | 768 | 12 | 6 | ~103M | |
 | **C** (Strong) | 1024 | 24 | 8 | ~197M | |
 

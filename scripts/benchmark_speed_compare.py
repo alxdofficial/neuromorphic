@@ -48,7 +48,7 @@ def bench_neuromorphic(
     device: torch.device,
     use_compile: bool,
 ) -> BenchResult:
-    cfg = ModelConfig.tier_a_wide(T=t)
+    cfg = ModelConfig.tier_a(T=t)
     cfg.set_phase("B")
     cfg.vocab_size = vocab
     cfg.eot_id = 2
@@ -88,7 +88,7 @@ def bench_neuromorphic(
     avg = sum(times) / len(times)
     tok_per_step = bs * t
     return BenchResult(
-        name="neuromorphic_tier_a_wide_phase_b",
+        name="neuromorphic_tier_a_phase_b",
         avg_step_s=avg,
         tok_per_s=tok_per_step / avg,
         warmup_steps=warmup,

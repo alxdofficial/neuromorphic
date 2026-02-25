@@ -191,6 +191,6 @@ python -m scripts.profile_training --steps 10 --warmup 5
 
 ```bash
 # Run actual training for a few steps with --compile
-python -m src.train --phase B --tier a_wide --steps 10 --compile
+python -m src.train --phase B --tier a --steps 10 --compile
 # Watch for "tok/s" in training logs after compilation warmup (~5 min)
 ```

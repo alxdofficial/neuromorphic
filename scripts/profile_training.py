@@ -21,7 +21,7 @@ def main():
 
     device = torch.device("cuda")
     BS = 32
-    config = ModelConfig.tier_a_wide(use_compile=True)
+    config = ModelConfig.tier_a(use_compile=True)
     config.set_phase("B")
 
     model = NeuromorphicLM(config).to(device)

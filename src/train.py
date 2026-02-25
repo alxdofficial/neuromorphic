@@ -36,8 +36,8 @@ from .debug import MetricsCollector
 # ============================================================================
 
 # -- Model tier --
-TIER = "a"          # ~41M params, fast iteration
-# TIER = "b"        # ~67M params, competitive
+TIER = "a"          # ~85M params, D=768, L=8, B=2
+# TIER = "b"        # ~103M params, competitive
 # TIER = "c"        # ~107M params, strong
 
 # -- Training phase --
@@ -131,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--phase", type=str, default=None,
                        help="Single phase to run (A, B, or C)")
     p.add_argument("--tier", type=str, default=None,
-                   choices=["a", "a_wide", "b", "c"],
-                   help="Model size tier")
+                   choices=["a", "a_wide", "b", "1b", "c"],
+                   help="Model size tier (a_wide is deprecated alias for a)")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")
     p.add_argument("--steps", type=int, default=None,
