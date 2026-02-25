@@ -181,7 +181,7 @@ return logits, x, y_wm
 
 **Returns:** Always `(logits, x_emb, y_wm)`. The trainer needs `y_wm` for EM candidate proposals (it cannot be recomputed cheaply because WM state has already advanced). EM candidates and retrieval use `x_proj` (the W_in projection), accessed via `model._last_x_proj_all` cache.
 
-**What happens outside `forward_one_token`:** The model forward is read-only with respect to PM and EM — it reads from them but doesn't write. Memory updates happen at span boundaries in the trainer: PM eligibility traces are accumulated post-forward, then neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). All neuromodulator heads are trained via main loss backprop (see [§11](#11-neuromodulator-training-all-phases)).
+**What happens outside `forward_one_token`:** The forward pass reads from PM and EM and accumulates PM eligibility traces (inside `Block.step`), but does not commit PM writes or write to EM. Memory commits happen at span boundaries in the trainer: neuromodulators decide PM commits and EM writes (see [§10](#10-neuromodulators)). All neuromodulator heads are trained via main loss backprop (see [§11](#11-neuromodulator-training-all-phases)).
 
 ---
 
@@ -1451,7 +1451,7 @@ Our model's advantage: memory systems (PM, EM) and neuroplasticity mechanisms co
 | `src/model/utils.py` | `StateMixin`, `unit_normalize`, `budget_enforce` |
 | `src/model/state.py` | `save_runtime_state`, `load_runtime_state`, `detach_all`, `reset_all` |
 | `src/training/trainer.py` | `TBPTTTrainer` -- chunk processing, orchestrates span loop |
-| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM eligibility/commit, EM candidates/write |
+| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM commit, EM candidates/write |
 | `src/training/loss.py` | `online_cross_entropy`, `compute_regularizers` |
 | `src/training/eval_lifelong.py` | Phase C evaluation: domain adaptation, drift, cross-doc recall |
 | `src/data/streaming.py` | `PersistentStreamDataset`, `StreamBatch`, `DocumentStream` |

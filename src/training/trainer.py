@@ -310,12 +310,7 @@ class TBPTTTrainer:
                 accum.surprise_accum, accum.valid_tokens, accum.last_reset,
             )
 
-            # PM eligibility accumulation
-            if self.config.pm_enabled:
-                span_ops.apply_pm_eligibility_batch(
-                    self.model, token_surprise,
-                    reset_mask_all, self.config,
-                )
+            # PM eligibility is now updated inline in Block.forward_span.
 
             # NOTE: EM candidate proposal is deferred to train_chunk,
             # AFTER apply_mid_span_resets, so novelty scoring sees

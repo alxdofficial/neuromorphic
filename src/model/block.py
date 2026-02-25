@@ -58,7 +58,7 @@ class Block(nn.Module, StateMixin):
         self._last_z: Tensor | None = None
         self._last_L_recon: Tensor | None = None
         self._last_token_surprise: Tensor | None = None
-        self._last_x_block_normed: Tensor | None = None  # normed input for PM eligibility
+        self._last_carry: Tensor | None = None
 
     def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
              surprise: Tensor, carry: Tensor, collect: bool = False,
@@ -151,8 +151,8 @@ class Block(nn.Module, StateMixin):
                      collect: bool = False) -> Tensor:
         """Process P tokens in parallel through this block.
 
-        Note: PM eligibility is NOT updated here — it's deferred to the
-        trainer's post-forward step (span_ops.apply_pm_eligibility_batch).
+        PM eligibility is updated inline after each layer (matching the
+        sequential path in step()), using PCM surprise when available.
 
         Args:
             x_block_all: [BS, P, D_h] — block input for all tokens
@@ -190,6 +190,7 @@ class Block(nn.Module, StateMixin):
                 self.config.D_pc
             )  # [BS, P, 1]
             self._last_token_surprise = pcm_surprise
+            elig_surprise = pcm_surprise  # used for inline eligibility
 
             # Cache for boundary ops (called after forward pass)
             self._last_z = z
@@ -200,17 +201,22 @@ class Block(nn.Module, StateMixin):
             surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
             ffn_gain_all = None
             self._last_token_surprise = None
+            elig_surprise = surprise_all  # [BS, P, 1]
+
+        # Reset mask for eligibility (derived from carry_all)
+        reset_mask = ~carry_all.squeeze(-1).bool()  # [BS, P]
 
         # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
         x = self.input_norm(x_block_all)
-        # Cache normed input for PM eligibility (avoids recomputing LayerNorm in span_ops)
-        self._last_x_block_normed = x
         layer_stats = {} if collect else None
         for l_idx, layer in enumerate(self.layers):
             if self.config.pm_enabled:
                 y_pm = layer.pm.apply_batch(x)
             else:
                 y_pm = torch.zeros_like(x)
+
+            # x_in for eligibility is the current x (before layer processes it)
+            x_in = x
 
             result = layer.forward_span(x, y_pm, y_wm_proj, y_em_proj,
                                         surprise_all, carry_all,
@@ -222,11 +228,21 @@ class Block(nn.Module, StateMixin):
             else:
                 x = result
 
+            # Inline PM eligibility update (x_in = pre-layer input, x = h_out)
+            if self.config.pm_enabled:
+                layer.pm.update_eligibility_batch(
+                    x_in, x, elig_surprise, reset_mask,
+                )
+
         # Collect per-layer outputs for spatial decoder (at original resolution).
         if self.config.snapshot_enabled:
             self._last_layer_stack = torch.stack(
                 [layer._last_h_all for layer in self.layers], dim=2
             )  # [BS, P, L, D_h]
+
+        # Free intermediate _last_h_all (only final layer needed for EM candidates)
+        for layer in self.layers[:-1]:
+            layer._last_h_all = None
 
         if collect:
             return x, layer_stats

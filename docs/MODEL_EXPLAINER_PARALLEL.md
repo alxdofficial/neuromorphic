@@ -16,7 +16,7 @@
 6. [The Affine Scan](#6-the-affine-scan)
 7. [Surprise Freezing](#7-surprise-freezing)
 8. [Doc-Boundary Resets in Parallel](#8-doc-boundary-resets-in-parallel)
-9. [Post-Forward: Eligibility, EM Candidates, Loss](#9-post-forward)
+9. [Post-Forward: EM Candidates, Loss](#9-post-forward)
 10. [Training Loop Integration](#10-training-loop-integration)
 11. [Exact Semantic Differences](#11-exact-semantic-differences)
 12. [What Is NOT Supported](#12-what-is-not-supported)
@@ -56,7 +56,6 @@ PARALLEL (forward_span, called T/P times):
     → lm_head_all [BS,P,vocab]
     → batched_loss
     → per-token surprise (post-forward)
-    → PM eligibility accumulation (post-forward)
     → EM candidate proposal (post-forward)
     → span boundary: neuromodulators decide PM commits + EM writes
 
@@ -64,7 +63,7 @@ PARALLEL (forward_span, called T/P times):
     → optimizer.step() (single main optimizer for all params)
 ```
 
-The parallel path processes an entire span in one `forward_span()` call, then handles surprise, eligibility, and EM candidates as post-forward steps in the trainer.
+The parallel path processes an entire span in one `forward_span()` call (which includes inline PM eligibility updates), then handles surprise and EM candidates as post-forward steps in the trainer.
 
 ---
 
@@ -219,8 +218,11 @@ Then for each layer (l=0..7):
   output = norm(W_o(h_all) + x)                         # [32, 32, 384]
   output = output + ffn(ffn_norm(output))               # [32, 32, 384]
 
-  # Cache for post-forward eligibility/EM
+  # Cache for EM candidate proposal (only final layer retained)
   self._last_h_all = output                              # [32, 32, 384]
+
+  # Inline PM eligibility update (x_in = pre-layer input, output = h_out)
+  pm.update_eligibility_batch(x_in, output, elig_surprise, reset_mask)
 
   x = output  # next layer's input
 ```
@@ -270,38 +272,31 @@ span_loss = cross_entropy(logits_all.reshape(2048, 32000),
                           mask.reshape(2048))           # scalar
 ```
 
-**Step 10 — PM eligibility accumulation (batched projections + affine scan, per layer per block):**
+**Step 10 — PM eligibility (handled inline in Block.forward_span, not post-forward):**
 
-`W_in` computed once for all blocks:
+PM eligibility is now updated inline within `Block.forward_span`, immediately after each layer. This matches the sequential path's `Block.step()` where `update_eligibility` follows each layer. The inline approach eliminates a second pass over activations and allows intermediate `_last_h_all` to be freed (only the final layer's is retained for EM candidates).
+
 ```
-  x_proj_all = W_in(x_emb_all).view(32, 64, 2, 384)                   # 1 matmul
+  # Inside Block.forward_span, after each layer:
+  # x_in = pre-layer input, x = post-layer output (h_out)
+  pm.update_eligibility_batch(x_in, x, elig_surprise, reset_mask)
+    └── elig_surprise = PCM's ‖δ‖/√D_pc [BS, P, 1] (or scalar surprise if PCM disabled)
+    └── reset_mask = ~carry_all.squeeze(-1) [BS, P] — carry=0 at doc boundaries
 ```
 
-For each block b=0..1, each layer l=0..7:
+Inside `update_eligibility_batch`, the same batched projections + fused K+V affine scan as before:
 ```
-  x_in  = previous layer's _last_h_all (or x_proj_all[:,:,b] for l=0)  # [32, 32, 384]
-  h_out = this layer's _last_h_all                                      # [32, 32, 384]
-
-  # Batched projections (2 matmuls instead of 128)
   k_cand_all = normalize(W_k_pre(x_in))                                # [32, 32, 384]
-  v_cand_all = W_v_post(x_in * h_out)                                   # [32, 32, 384] — Hebbian interaction
-
-  # Surprise gating + carry mask for resets
-  gate = (token_surprise / 5.0).clamp(0, 1)                            # [32, 32, 1, 1]
-  a = 0.95 * carry  (0 at t=13 for reset streams)                      # [32, 32, 8, 384]
-  b_K = gate * k_cand_all  (broadcast over r=8)                        # [32, 32, 8, 384]
-
-  # Affine scan: elig_t = a_t * elig_{t-1} + b_t (fused K+V double-width)
-  elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)           # [32, 32, 6144]
-  elig_K, elig_V = elig_KV_all.chunk(2, dim=-1)                        # split back
-  elig_K = elig_K[:, -1].reshape(32, 8, 384)                           # update to token 63
+  v_cand_all = W_v_post(x_in * x)                                      # [32, 32, 384] — Hebbian
+  gate = (elig_surprise / 5.0).clamp(0, 1)                             # [32, 32, 1, 1]
+  a = rho * carry  (0 at resets)                                        # [32, 32, 8, 384]
+  elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)           # fused K+V scan
+  elig_K, elig_V = elig_KV_all.chunk(2, dim=-1)                        # update state
 ```
 
-At t=13 for reset streams: carry=0 so `elig = 0 * elig_prev + gate * cand` (fresh start, equivalent to zeroing).
+At t=13 for reset streams: carry=0 so `elig = 0 * elig_prev + gate * cand` (fresh start).
 
-Note: The K and V eligibility scans are fused into a single double-width scan (concatenated along the last dimension) to halve scan kernel launches. This is a pure performance optimization — mathematically equivalent to two separate scans since the recurrence is element-wise.
-
-**Step 11 — EM candidate proposal (batched):**
+**Step 11 — EM candidate proposal (batched, post-forward):**
 
 For each block b=0..1:
 ```
@@ -361,8 +356,8 @@ In the sequential path, steps 3-7 would each be called 32 times with `[32, ...]`
 | Per-layer scan (sequential either way) | 32 × 16 = 512 element-wise | 16 × 32 = 512 element-wise |
 | Per-layer W_o + FFN | 32 × 16 × 3 = 1536 launches | 16 × 3 = 48 launches |
 | LM head | 32 launches | 1 launch |
-| PM eligibility projections (post-fwd) | 32 × 16 × 2 = 1024 launches | 16 × 2 = 32 launches |
-| PM eligibility scan (post-fwd, fused K+V) | 32 × 16 × 2 = 1024 element-wise | 16 × 32 = 512 element-wise |
+| PM eligibility projections (inline) | 32 × 16 × 2 = 1024 launches | 16 × 2 = 32 launches |
+| PM eligibility scan (inline, fused K+V) | 32 × 16 × 2 = 1024 element-wise | 16 × 32 = 512 element-wise |
 | **Total kernel launches** | **~12,500** | **~230 + 64 seq** |
 
 Each parallel launch does 64× more work, saturating GPU compute. The scan loops (layer recurrence + eligibility) are the same cost either way but trivial compared to the matmuls. `W_in` is computed once and shared across all blocks for both the forward pass and eligibility.
@@ -471,7 +466,7 @@ self._last_h_all = output                                          # cached for 
 1. **Surprise is frozen** — When PCM is disabled, `surprise_span` is the same `[BS, 1]` value broadcast to all P positions (§7). When PCM is enabled, the surprise is the full δ vector computed per-token.
 2. **Gate projections batched** — one `gate_a` forward on `[BS, P_b, 4*D_h+S]` instead of P separate calls. This is where most of the speedup comes from.
 3. **Recurrence via scan** — `parallel_affine_scan` computes all P_b hidden states given pre-computed `a` and `b` (§6).
-4. **`_last_h_all` cached** — The full `[BS, P_b, D_h]` output sequence is stored for the trainer's post-forward eligibility and EM candidate steps.
+4. **`_last_h_all` cached** — The full `[BS, P_b, D_h]` output sequence is stored for EM candidate proposals (only the final layer's is retained; intermediate layers are freed after inline eligibility update).
 5. **FFN gain modulation** — When PCM is enabled, `ffn_gain_all = 1 + 0.1 * tanh(W_gain(δ))` modulates FFN input per-dimension, bounded to [0.9, 1.1].
 
 ### 5.6 Block
@@ -480,7 +475,7 @@ self._last_h_all = output                                          # cached for 
 
 **Sequential** (`step()`): PCM encode → per layer: PM read → layer step (with δ + FFN gain) → eligibility update → next layer
 
-**Parallel** (`forward_span()`): PCM encode → per layer: PM batch read → layer forward_span (with δ + FFN gain) → next layer. **Eligibility is NOT updated** inside the block — it's deferred to the trainer (§9).
+**Parallel** (`forward_span()`): PCM encode → per layer: PM batch read → layer forward_span (with δ + FFN gain) → **inline eligibility update** → next layer. Eligibility is updated inside the block, matching the sequential path.
 
 ```python
 def forward_span(self, x_block_all, y_wm_all, x_proj_all,
@@ -500,21 +495,31 @@ def forward_span(self, x_block_all, y_wm_all, x_proj_all,
         delta = self.pcm.compute_surprise(z)               # [BS, P, D_pc]
         surprise_all = delta                               # vector surprise for gates
         ffn_gain_all = self.pcm.compute_ffn_gain(delta)    # [BS, P, D_h]
-        # RMS-normalized scalar surprise for PM/EM
-        self._last_token_surprise = delta.norm(
+        # RMS-normalized scalar surprise for PM eligibility + EM
+        elig_surprise = delta.norm(
             dim=-1, keepdim=True) / sqrt(D_pc)             # [BS, P, 1]
+        self._last_token_surprise = elig_surprise
     else:
         surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
         ffn_gain_all = None
+        elig_surprise = surprise_all                       # [BS, P, 1]
 
-    # Pre-LayerNorm for Layer 0 + cache normed input for PM eligibility
+    # Reset mask for eligibility (derived from carry_all)
+    reset_mask = ~carry_all.squeeze(-1).bool()             # [BS, P]
+
+    # Pre-LayerNorm for Layer 0
     x = self.input_norm(x_block_all)
-    self._last_x_block_normed = x  # reused in span_ops (avoids recomputing LN)
-    for layer in self.layers:
+    for l_idx, layer in enumerate(self.layers):
         y_pm = layer.pm.apply_batch(x)                     # PM read (batched)
+        x_in = x                                           # capture pre-layer input
         x = layer.forward_span(x, y_pm, y_wm_proj,
                                y_em_proj, surprise_all, carry_all,
                                ffn_gain_all=ffn_gain_all)
+
+        # Inline PM eligibility update (matches sequential path)
+        if self.config.pm_enabled:
+            layer.pm.update_eligibility_batch(
+                x_in, x, elig_surprise, reset_mask)
 
     # Cache per-layer outputs for spatial decoder (already at full P)
     if self.config.snapshot_enabled:
@@ -522,13 +527,18 @@ def forward_span(self, x_block_all, y_wm_all, x_proj_all,
             [layer._last_h_all for layer in self.layers],
             dim=2)                                         # [BS, P, L, D_h]
 
+    # Free intermediate _last_h_all (only final layer needed for EM candidates)
+    for layer in self.layers[:-1]:
+        layer._last_h_all = None
+
     return x
 ```
 
 **Key differences from sequential:**
 1. **PCM operates at full resolution** — Evidence encoding, surprise computation, and FFN gain are computed on `[BS, P, ...]` tensors. The scalar surprise is RMS-normalized (`‖δ‖/√D_pc`) to keep scale near ~1.
-2. **Eligibility accumulation** is decoupled from the forward pass and handled in the trainer post-forward step.
-3. `_last_layer_stack` is cached on the block for the spatial decoder.
+2. **Eligibility is updated inline** after each layer, matching the sequential path. Uses `update_eligibility_batch` (batched projections + fused K+V affine scan) instead of per-token `update_eligibility` calls.
+3. **Intermediate `_last_h_all` freed** — After inline eligibility update, only the final layer's `_last_h_all` is retained (for EM candidate proposals). This reduces peak memory.
+4. `_last_layer_stack` is cached on the block for the spatial decoder.
 
 ---
 
@@ -634,9 +644,9 @@ elig_all = parallel_affine_scan(a_flat, b_flat, elig_init)
 
 ---
 
-## 9. Post-Forward: Eligibility, EM Candidates, Loss
+## 9. Post-Forward: EM Candidates, Loss
 
-After `forward_span()` returns `logits_all`, `x_emb_all`, `y_wm_all`, the trainer runs several post-forward steps that are NOT inside the model's forward pass:
+After `forward_span()` returns `logits_all`, `x_emb_all`, `y_wm_all`, the trainer runs several post-forward steps. Note that PM eligibility is now handled **inline** within `Block.forward_span` (see §5.6), not as a post-forward step.
 
 ### 9.1 Loss (batched)
 
@@ -658,57 +668,31 @@ with torch.no_grad():
 
 This is the real per-token surprise used for everything except layer gates (which saw frozen surprise). The frozen surprise for the *next* span is set to the span mean (averaged over valid tokens), not the last token's value — see §4.4.
 
-### 9.3 PM Eligibility Accumulation
+### 9.3 PM Eligibility (Inline in Block.forward_span)
 
-In the sequential path, eligibility is updated inside `Block.step()` — one call per token per layer, interleaved with the forward pass. In the parallel path, eligibility uses `update_eligibility_batch()` which batches the projections and runs an affine scan:
+PM eligibility is **no longer a post-forward step**. It is updated inline within `Block.forward_span`, immediately after each layer processes its tokens. This matches the sequential path's `Block.step()` where `update_eligibility` follows each layer.
 
 ```python
-# W_in computed once (shared across all blocks)
-x_proj_all = W_in(x_emb_all).view(BS, P, B, D_h)  # one matmul
+# Inside Block.forward_span:
+for l_idx, layer in enumerate(self.layers):
+    y_pm = layer.pm.apply_batch(x)
+    x_in = x                                           # pre-layer input
+    x = layer.forward_span(x, y_pm, ...)               # layer output (h_out)
 
-for b, block in enumerate(model.blocks):
-    for layer in block.layers:
-        # Layer input: block input (layer 0) or previous layer's output
-        if layer.layer_idx == 0:
-            x_in = x_proj_all[:, :, b]
-        else:
-            x_in = block.layers[layer.layer_idx - 1]._last_h_all
-
-        h_out = layer._last_h_all
-
-        # Batched: projections + affine scan (replaces P-step loop)
-        layer.pm.update_eligibility_batch(x_in, h_out, token_surprise, reset_mask_all)
+    # Inline eligibility — same data flow as sequential path
+    if self.config.pm_enabled:
+        layer.pm.update_eligibility_batch(x_in, x, elig_surprise, reset_mask)
 ```
 
-Inside `update_eligibility_batch()`:
-```python
-# Batch projections (2 matmuls instead of 2*P)
-k_cand_all = unit_normalize(W_k_pre(x_all))   # [BS, P, D_h]
-v_cand_all = W_v_post(h_all)                   # [BS, P, D_h]
+**Key details:**
+- **Surprise source**: Uses PCM's RMS-normalized `‖δ‖/√D_pc` when PCM is enabled (same surprise that drives gates and EM candidates), or scalar surprise otherwise.
+- **Reset mask**: Derived from `carry_all` (`reset_mask = ~carry_all.squeeze(-1).bool()`), same carry mask used for the layer recurrence scan.
+- **Memory optimization**: After eligibility update, intermediate layers' `_last_h_all` are freed. Only the final layer's output is retained for EM candidate proposals.
+- **Compilation**: `PM._update_eligibility_core` remains separately compiled with `fullgraph=True` — the inline call sites invoke this compiled function.
 
-# Surprise gating
-gate = (surprise_all / 5.0).clamp(0, 1)        # [BS, P, 1, 1]
-b_K = gate * k_cand_all  (broadcast over r)     # [BS, P, r, D_h]
+The K and V eligibility scans are fused into a single double-width scan (concatenated along last dimension). Mathematically equivalent to two separate scans, but halves scan kernel launches.
 
-# Carry mask: a=0 at resets (equivalent to zeroing elig before accumulation)
-a = rho * carry  (0 at resets, rho elsewhere)   # [BS, P, r, D_h]
-
-# Fused K+V scan: one double-width scan instead of two separate
-b_KV = cat([b_K_flat, b_V_flat], dim=-1)       # [BS, P, 2*r*D_h]
-a_KV = cat([a_flat, a_flat], dim=-1)            # [BS, P, 2*r*D_h]
-h_KV_init = cat([h_K_init, h_V_init], dim=-1)  # [BS, 2*r*D_h]
-elig_KV_all = parallel_affine_scan(a_KV, b_KV, h_KV_init)  # [BS, P, 2*r*D_h]
-elig_K_all, elig_V_all = elig_KV_all.chunk(2, dim=-1)
-self.elig_K = elig_K_all[:, -1]                 # update to last token
-self.elig_V = elig_V_all[:, -1]
-```
-
-The K and V scans are fused into a single double-width scan by concatenating along the last dimension. This is mathematically equivalent to two separate scans (the recurrence is element-wise), but halves the number of scan kernel launches.
-
-**Differences from sequential path:**
-1. **`_last_h_all` is the full layer output** (post W_o + residual + norm + FFN), matching what the sequential path passes as `h` to `update_eligibility`. This was a bug that was fixed — originally `_last_h_all` stored raw recurrent `h` before the output projection.
-2. **Surprise gating uses per-token surprise**, not frozen surprise. In the sequential path, `update_eligibility` receives `model.surprise` which lags by one token (it's the previous token's surprise). In the parallel path, it receives the current token's actual surprise. This is arguably more correct.
-3. **Doc-boundary resets via carry mask**: Instead of explicitly calling `reset_eligibility()` before each token, the carry mask sets `a=0` at reset positions — mathematically equivalent (`elig_t = 0 * elig_{t-1} + gate * cand = gate * cand`).
+**Difference from sequential path**: Doc-boundary resets use carry mask (`a=0` at reset positions) instead of explicit `reset_eligibility()` calls — mathematically equivalent (`elig_t = 0 * elig_prev + gate * cand`).
 
 ### 9.4 EM Candidate Proposal
 
@@ -738,24 +722,23 @@ The walkthrough below shows the complete flow with all subsystems active (Phase 
 For each span (8 spans per chunk, P=32 tokens each):
     Reset EM candidate buffers, span accumulators
 
-    # --- Parallel forward ---
+    # --- Parallel forward (includes inline PM eligibility) ---
     logits_all, x_emb_all, y_wm_all = model.forward_span(span_ids, reset_first)
       └── Embedding → WM.forward_span → Block.forward_span (per block):
             EM.retrieve_batch → per-layer: PM.apply_batch → gates → scan → FFN
+              → PM.update_eligibility_batch (inline after each layer)
           → SpatialDecoder (if snapshot_enabled) → LM head → logits [BS,P,vocab]
 
     span_loss, span_valid = batched_cross_entropy(logits_all, targets, mask)
     chunk_loss += span_loss
 
-    # --- Post-forward (no grad for surprise; grad for eligibility projections) ---
+    # --- Post-forward (no grad for surprise) ---
     Compute per-token surprise from logits             # [BS, P, 1]
     Compute reset_mask_all for accumulators
     Accumulate span_surprise_mean per stream           # [BS] scalar
     Update model.surprise = span_surprise_mean         # frozen for next span's gates
 
-    PM eligibility accumulation:                       # per block, per layer
-      update_eligibility_batch(x_in, h_out, token_surprise, resets)
-        └── surprise gating → affine scan → elig_K, elig_V updated
+    # (PM eligibility already updated inline in Block.forward_span)
 
     EM candidate proposal:                             # per block
       propose_candidate_batch(x_emb, y_wm, h_final, surprise)
@@ -796,7 +779,7 @@ After all spans:
 | Forward calls per span | P calls to `forward_one_token` | 1 call to `forward_span` |
 | Loss computation | P calls to `online_cross_entropy` | 1 call to `batched_cross_entropy` |
 | Surprise update | Per-token, between forward calls | Batched post-forward, from logits |
-| Eligibility update | Inside `Block.step`, interleaved | Post-forward loop in trainer |
+| Eligibility update | Inside `Block.step`, interleaved | Inline in `Block.forward_span`, after each layer |
 | EM candidate proposal | Inside trainer token loop | Post-forward batch in trainer |
 | Span boundary logic | Unchanged | Unchanged |
 ---
@@ -834,12 +817,7 @@ In practice: EM content from old document is unrelated to new document, but retr
 
 ### 11.4 Eligibility Surprise Gating
 
-**Magnitude:** Tiny.
-
-Sequential: `update_eligibility` receives `model.surprise` which is the *previous* token's surprise.
-Parallel: `update_eligibility` receives the *current* token's surprise (computed post-forward).
-
-The parallel path is arguably more correct — gating eligibility by how surprising the current token is, rather than using a one-step-lagged value.
+**No difference.** Both paths now use the same surprise source inline: PCM's RMS-normalized `‖δ‖/√D_pc` (when PCM is enabled) or the frozen scalar surprise. The parallel path's eligibility is updated inline in `Block.forward_span` after each layer, matching the sequential path's `Block.step()`. The previous difference (sequential used lagged surprise, parallel used post-forward per-token surprise) no longer exists.
 
 ### 11.5 Summary Table
 
@@ -848,7 +826,7 @@ The parallel path is arguably more correct — gating eligibility by how surpris
 | Frozen surprise in gates | Gate values `a`, `b` | All | All P tokens in span | Low |
 | PM state leak mid-span | PM read output | A-B | ≤31 per boundary | Low-medium |
 | EM strength leak mid-span | EM retrieval output | A-B | ≤31 per boundary | Low-medium |
-| Eligibility surprise timing | Eligibility trace | B+ | All P tokens | Negligible (arguably better) |
+| ~~Eligibility surprise timing~~ | ~~Eligibility trace~~ | — | — | **Eliminated** (inline, same source) |
 
 ### 11.6 What Is Identical
 
@@ -871,7 +849,7 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 
 **Compiled:**
 - **`Block.forward_span`**: Compiled with `mode="default"`. Covers the entire block forward pass — EM retrieval, per-layer PM reads, gate computation, affine scans, output projections, and FFN — into fused CUDA kernels. The scan loops are unrolled by the compiler, and the backward pass replaces autograd nodes with efficient fused backward kernels.
-- **`PM._update_eligibility_core`**: Compiled with `fullgraph=True, mode="default"`. Covers eligibility projections, surprise gating, and fused K+V affine scan.
+- **`PM._update_eligibility_core`**: Compiled with `fullgraph=True, mode="default"`. Covers eligibility projections, surprise gating, and fused K+V affine scan. Called inline from `Block.forward_span` after each layer (not as a post-forward step).
 - **`GLAWorkingMemory.forward_span`**: Compiled with `mode="default"`. Fuses the GLA recurrence loop.
 - **`SpatialDecoder.forward`**: Compiled with `mode="default"`. Fuses hierarchical cross-attention.
 
@@ -890,15 +868,15 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 | File | Parallel Path Content |
 |------|----------------------|
 | `src/model/scan.py` | `parallel_affine_scan(a, b, h_init)` — sequential-loop scan |
-| `src/model/layer.py` | `Layer.forward_span()` — batched gates + scan + `_last_h_all` cache |
+| `src/model/layer.py` | `Layer.forward_span()` — batched gates + scan + `_last_h_all` cache (final layer only) |
 | `src/model/procedural_memory.py` | `ProceduralMemory.apply_batch()` — batched PM read |
 | `src/model/episodic_memory.py` | `EpisodicMemory.retrieve_batch()`, `propose_candidate_batch()` |
 | `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V, batched no-reset path, sequential fallback |
-| `src/model/block.py` | `Block.forward_span()` — PCM, batched layers, caches `_last_layer_stack` |
+| `src/model/block.py` | `Block.forward_span()` — PCM, batched layers + inline PM eligibility, caches `_last_layer_stack` |
 | `src/model/predictive_coding.py` | `PredictiveCodingModule` — evidence encoder, hypothesis predictor, surprise/gain computation |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `apply_pcm_boundary()`, `get_pcm_token_surprise()` |
 | `src/training/trainer.py` | Span loop orchestration, delegates to span_ops |
-| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, PM/EM accumulation and commits |
+| `src/training/span_ops.py` | Shared span-boundary ops: loss masking, surprise, EM candidate accumulation and commits |
 | `src/training/loss.py` | `batched_cross_entropy()` — span-level loss computation |
 | `tests/test_scan.py` | 28 equivalence tests: parallel vs sequential output, state, gradients |

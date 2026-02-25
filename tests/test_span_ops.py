@@ -316,17 +316,10 @@ class TestApplyMidSpanResets:
     def test_preserves_eligibility(self):
         """Eligibility traces should NOT be cleared by mid-span reset."""
         model, cfg = _tiny_model("B")
-        # Forward a span to populate eligibility
+        # Forward a span — eligibility is now updated inline in forward_span
         span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
         reset_first = torch.zeros(BS, dtype=torch.bool)
         model.forward_span(span_ids, reset_first)
-
-        # Run PM eligibility batch to populate elig_K/V
-        reset_mask = torch.zeros(BS, cfg.P, dtype=torch.bool)
-        surprise = torch.ones(BS, cfg.P, 1)
-        span_ops.apply_pm_eligibility_batch(
-            model, surprise, reset_mask, cfg,
-        )
 
         # Snapshot eligibility before reset
         pm0 = model.blocks[0].layers[0].pm

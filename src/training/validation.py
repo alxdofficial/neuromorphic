@@ -172,12 +172,7 @@ def evaluate_validation(
                         next_surprise = next_surprise.to(model.surprise.dtype)
                     model.surprise = next_surprise
 
-                    # PM eligibility + commit
-                    if config.pm_enabled:
-                        span_ops.apply_pm_eligibility_batch(
-                            model, token_surprise,
-                            reset_mask_all, config,
-                        )
+                    # PM eligibility is updated inline in Block.forward_span.
 
                     # Clear PM content + EM strengths for streams that had
                     # mid-span doc-boundary resets

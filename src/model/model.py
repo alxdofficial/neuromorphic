@@ -267,7 +267,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
         # 7. Project and split across blocks
         x_proj_all = self.W_in(x_emb_all)  # [BS, P, D]
-        self._last_x_proj_all = x_proj_all  # cache for PM eligibility
+        self._last_x_proj_all = x_proj_all  # cache for EM candidate proposal
         x_blocks_all = x_proj_all.view(
             BS, P, self.config.B, self.config.D_h
         )  # [BS, P, B, D_h]
@@ -701,7 +701,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
             self.spatial_decoder.forward = torch.compile(
                 self.spatial_decoder.forward, mode="default",
             )
-        # PM eligibility is separate (called post-forward in span_ops)
+        # PM eligibility core (called inline from Block.forward_span)
         for block in self.blocks:
             for layer in block.layers:
                 layer.pm._update_eligibility_core = torch.compile(

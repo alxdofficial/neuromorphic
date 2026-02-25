@@ -5,11 +5,12 @@ Extracted from trainer.py and validation.py to eliminate ~200 lines of
 copy-pasted logic. These are free functions (no shared mutable state).
 Used by trainer.py and validation.py.
 
-Design note: In the parallel (forward_span) path, PM eligibility and EM
-candidates are accumulated over the full span, then committed at the boundary.
+Design note: In the parallel (forward_span) path, PM eligibility is
+updated inline in Block.forward_span (after each layer). EM candidates
+are accumulated post-forward and committed at the boundary.
 Mid-span doc-boundary resets are handled at multiple levels:
 - Layer h: zeroed via carry mask in the parallel scan.
-- PM eligibility: zeroed via carry mask in update_eligibility_batch.
+- PM eligibility: zeroed via carry mask in update_eligibility_batch (inline).
 - Surprise accumulators: only accumulate from tokens after last reset.
 - EM candidates: masked via cand_valid to exclude tokens before last reset.
 - PM content + EM strengths: cleared via apply_mid_span_resets() before
@@ -162,55 +163,6 @@ def accumulate_span_surprise(
     span_valid_tokens.copy_(effective_f.sum(dim=1))
 
     return span_surprise_accum / span_valid_tokens.clamp(min=1)
-
-
-# ------------------------------------------------------------------
-# PM eligibility
-# ------------------------------------------------------------------
-
-def apply_pm_eligibility_batch(
-    model: NeuromorphicLM,
-    token_surprise: Tensor,
-    reset_mask_all: Tensor,
-    config: ModelConfig,
-) -> None:
-    """Route cached x_proj to blocks, call update_eligibility_batch.
-
-    Uses model._last_x_proj_all (cached by forward_span).
-    When PCM is enabled, uses per-block RMS-normalized ‖δ‖ surprise
-    instead of the global loss-based token_surprise.
-    """
-    BS, span_P = token_surprise.shape[:2]
-
-    x_proj_all = model._last_x_proj_all  # cached by forward_span
-    x_blocks_all = x_proj_all.view(
-        BS, span_P, config.B, config.D_h
-    )  # [BS, span_P, B, D_h]
-
-    for b, block in enumerate(model.blocks):
-        # Per-block PCM surprise when available, else global loss-based
-        block_surprise = (
-            block._last_token_surprise
-            if getattr(block, '_last_token_surprise', None) is not None
-            else token_surprise
-        )
-
-        for layer in block.layers:
-            if layer._last_h_all is None:
-                continue
-
-            l_idx = layer.layer_idx
-            if l_idx == 0:
-                # Use the normed input cached from forward_span (no recompute)
-                x_in = block._last_x_block_normed
-            else:
-                x_in = block.layers[l_idx - 1]._last_h_all
-
-            h_out = layer._last_h_all  # [BS, P, D_h]
-
-            layer.pm.update_eligibility_batch(
-                x_in, h_out, block_surprise, reset_mask_all,
-            )
 
 
 # ------------------------------------------------------------------
