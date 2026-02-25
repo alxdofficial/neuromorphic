@@ -334,6 +334,12 @@ for each EM instance:
     em.age_tick(P)                                                                    # age active slots by P tokens
     em.write_at_boundary(cand_K, cand_V, scores, g_em, tau=tau, ww=ww, decay=decay)   # EMA update em_K, em_V, em_S, em_age
     em_S *= decay; budget_enforce(em_S)                         # per-stream learned decay + budget
+
+# PCM: update hypothesis
+for each PCM instance:
+    z_mean = block._last_z.mean(dim=1)                          # [BS, D_pc] — span-mean evidence
+    L_pred = MSE(z_hat, z_mean.detach())                        # train predictor from old hypothesis
+    z_hat = predictor(cat([z_mean, ctx_b, pm_summary, em_summary]).detach())  # new hypothesis
 ```
 
 State is now ready for the next span. The cycle repeats.

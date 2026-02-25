@@ -603,7 +603,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
                 continue
 
             z = block._last_z                        # [BS, P_b, D_pc]
-            z_end = z[:, -1]                         # [BS, D_pc]
+            z_mean = z.mean(dim=1)                   # [BS, D_pc]
 
             # Block context: last layer output at last pooled position
             ctx_b = block.layers[-1]._last_h_all[:, -1]  # [BS, D_h]
@@ -612,7 +612,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
             pm_summary_b = self._compute_pm_summary_per_block(b_idx, BS, device)
             em_summary_b = self._compute_em_summary_per_block(b_idx, BS, device)
 
-            L_pred = pcm.boundary_update(z_end, ctx_b, pm_summary_b, em_summary_b)
+            L_pred = pcm.boundary_update(z_mean, ctx_b, pm_summary_b, em_summary_b)
             L_pred_total = L_pred_total + L_pred
             L_recon_total = L_recon_total + block._last_L_recon
 

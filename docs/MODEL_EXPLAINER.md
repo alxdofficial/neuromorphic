@@ -113,7 +113,7 @@ Token ID ──► Embedding ──► x: [BS, D]
      pm_K, pm_V, pm_a     │               em_K, em_V, em_S, em_age
                            ▼
                    PCM hypothesis update
-                   ẑ_new = predictor(z_end, ctx, PM, EM)
+                   ẑ_new = predictor(z_mean, ctx, PM, EM)
 ```
 
 **Dimensions (tier_a_wide defaults):** D=768, B=2, L=8, D_h=384, vocab=32000
@@ -726,8 +726,9 @@ delta *= z_hat_valid.unsqueeze(-1,-1)        # zero if no valid hypothesis yet
 ffn_gain = 1 + 0.1 * tanh(W_gain(delta))    # [BS, P, D_h] — bounded FFN modulation
 
 # At span boundary:
-L_pred = ||z_hat - z_end.detach()||²         # prediction loss (only if z_hat_valid)
-z_hat_new = predictor(cat([z_end, ctx_b, pm_summary_b, em_summary_b]).detach())
+z_mean = z.mean(dim=1)                       # [BS, D_pc] — span-mean evidence
+L_pred = ||z_hat - z_mean.detach()||²        # prediction loss (only if z_hat_valid)
+z_hat_new = predictor(cat([z_mean, ctx_b, pm_summary_b, em_summary_b]).detach())
 z_hat_valid = True                           # mark hypothesis as valid
 L_recon = ||decoder(z) - x_block.detach()||² # reconstruction loss
 ```

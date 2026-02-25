@@ -3,8 +3,8 @@ Per-block Predictive Coding Module (PCM).
 
 Implements a hypothesis-evidence-surprise loop:
 - Evidence encoder: compresses block input to a D_pc latent (per token)
-- Hypothesis predictor: predicts next span's latent from current state +
-  memory summaries (per span boundary)
+- Hypothesis predictor: predicts next span's mean latent from current
+  span-mean evidence + context + memory summaries (per span boundary)
 - Surprise signal: δ = evidence - hypothesis (per token, vectorial)
 
 The surprise vector δ enters the model in two places:
@@ -46,7 +46,7 @@ class PredictiveCodingModule(nn.Module, StateMixin):
         # Reconstruction decoder: latent → block input (aux loss only)
         self.decoder = nn.Linear(D_pc, D_h)
 
-        # Hypothesis predictor: (z_end, ctx_b, pm_summary_b, em_summary_b) → z_hat
+        # Hypothesis predictor: (z_mean, ctx_b, pm_summary_b, em_summary_b) → z_hat
         pred_input = D_pc + D_h + D_h + D_em
         self.predictor = nn.Sequential(
             nn.Linear(pred_input, D_pc * 2),
@@ -145,7 +145,7 @@ class PredictiveCodingModule(nn.Module, StateMixin):
 
     def boundary_update(
         self,
-        z_end: Tensor,
+        z_mean: Tensor,
         ctx_b: Tensor,
         pm_summary_b: Tensor,
         em_summary_b: Tensor,
@@ -156,8 +156,13 @@ class PredictiveCodingModule(nn.Module, StateMixin):
         (only if valid), then generates a new hypothesis for the next span
         and marks it as valid.
 
+        The target is the span-mean evidence (averaged over P tokens) rather
+        than a single position. Since z_hat is broadcast identically over all
+        P tokens during compute_surprise, the mean is the natural centroid —
+        tokens that deviate from it are genuinely surprising.
+
         Args:
-            z_end: [BS, D_pc] — evidence at last position
+            z_mean: [BS, D_pc] — mean evidence over the span
             ctx_b: [BS, D_h] — block output at last position
             pm_summary_b: [BS, D_h] — PM strength-weighted readout for this block
             em_summary_b: [BS, D_em] — EM strength-weighted readout for this block
@@ -170,17 +175,17 @@ class PredictiveCodingModule(nn.Module, StateMixin):
         if self.z_hat is not None and self.z_hat_valid is not None \
                 and self.z_hat_valid.any():
             # Mask loss to only count valid streams
-            err = (self.z_hat - z_end.detach()).pow(2)  # [BS, D_pc]
+            err = (self.z_hat - z_mean.detach()).pow(2)  # [BS, D_pc]
             valid_f = self.z_hat_valid.to(err.dtype).unsqueeze(-1)  # [BS, 1]
             L_pred = (err * valid_f).sum() / valid_f.sum().clamp(min=1) / self.D_pc
         else:
             # No valid hypothesis yet (z_hat=None, or z_hat_valid all-False)
-            L_pred = z_end.new_tensor(0.0)
+            L_pred = z_mean.new_tensor(0.0)
 
         # Generate new hypothesis for next span
         # All inputs detached: predictor learns to predict, main model unaffected
         pred_input = torch.cat([
-            z_end.detach(),
+            z_mean.detach(),
             ctx_b.detach(),
             pm_summary_b.detach(),
             em_summary_b.detach(),
