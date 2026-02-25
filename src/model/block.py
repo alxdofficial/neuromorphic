@@ -221,14 +221,14 @@ class Block(nn.Module, StateMixin):
         s = self.scale
 
         # --- Temporal downsampling (multi-timescale) ---
-        # Strided sampling avoids token mixing across doc boundaries
-        # that would occur with causal conv or avg pooling.
-        x_block_b = self.pooler.downsample(x_block_all)  # [BS, P_b, D_h]
+        # Learned weighted aggregation within non-overlapping windows.
+        # carry_all is passed so tokens from previous docs within a window
+        # are masked out before aggregation (boundary-aware pooling).
+        x_block_b = self.pooler.downsample(x_block_all, carry_all)  # [BS, P_b, D_h]
         P_b = x_block_b.shape[1]
 
-        # Strided subsample of auxiliary signals to match block resolution
-        y_wm_b = self.pooler.downsample(y_wm_all)       # [BS, P_b, D]
-        x_proj_b = self.pooler.downsample(x_proj_all)    # [BS, P_b, D]
+        y_wm_b = self.pooler.downsample(y_wm_all, carry_all)       # [BS, P_b, D]
+        x_proj_b = self.pooler.downsample(x_proj_all, carry_all)    # [BS, P_b, D]
         # carry uses min-pool: any boundary in window forces reset
         carry_b = carry_min_pool(carry_all, s)           # [BS, P_b, 1]
 

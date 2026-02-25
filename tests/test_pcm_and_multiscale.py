@@ -47,14 +47,61 @@ class TestTemporalPooler:
             up = pooler.upsample(down, P)
             assert up.shape == (BS, P, D_h), f"scale={scale}"
 
-    def test_strided_sampling_values(self):
-        """Strided sampling picks every s-th token exactly."""
+    def test_init_as_average(self):
+        """At init, pool_logits=0 → softmax → uniform → average pooling."""
         scale = 4
         pooler = TemporalPooler(D_h, scale=scale)
         x = torch.randn(BS, P, D_h)
         out = pooler.downsample(x)
-        # Verify it's taking every 4th token
-        assert torch.equal(out, x[:, ::4])
+        # Should match average within each window
+        expected = x.reshape(BS, P // scale, scale, D_h).mean(dim=2)
+        assert torch.allclose(out, expected, atol=1e-6)
+
+    def test_learnable_weights(self):
+        """pool_logits are nn.Parameter and affect output."""
+        scale = 4
+        pooler = TemporalPooler(D_h, scale=scale)
+        x = torch.randn(BS, P, D_h)
+
+        out_before = pooler.downsample(x).clone()
+        # Shift weights to favor the last position
+        with torch.no_grad():
+            pooler.pool_logits.copy_(torch.tensor([0.0, 0.0, 0.0, 10.0]))
+        out_after = pooler.downsample(x)
+        assert not torch.allclose(out_before, out_after)
+        # With weight heavily on position 3, output ≈ x at positions 3,7,11,...
+        x_win = x.reshape(BS, P // scale, scale, D_h)
+        assert torch.allclose(out_after, x_win[:, :, 3], atol=1e-3)
+
+    def test_boundary_masking(self):
+        """Tokens before a boundary within a window are masked out."""
+        scale = 4
+        pooler = TemporalPooler(D_h, scale=scale)
+        x = torch.randn(BS, P, D_h)
+        carry = torch.ones(BS, P, 1)
+        # Boundary at position 2 (within window 0: positions 0,1,2,3)
+        carry[:, 2, :] = 0
+
+        out = pooler.downsample(x, carry)
+        # Window 0: boundary at pos 2 → only pos 2,3 contribute
+        # With uniform weights, out[0] ≈ mean(x[2], x[3])
+        x_win = x.reshape(BS, P // scale, scale, D_h)
+        expected_win0 = x_win[:, 0, 2:].mean(dim=1)  # mean of pos 2,3
+        assert torch.allclose(out[:, 0], expected_win0, atol=1e-5)
+
+        # Window 1 (positions 4-7): no boundary → normal average
+        expected_win1 = x_win[:, 1].mean(dim=1)
+        assert torch.allclose(out[:, 1], expected_win1, atol=1e-5)
+
+    def test_no_carry_matches_plain(self):
+        """Without carry, downsample gives same result as carry=all_ones."""
+        scale = 4
+        pooler = TemporalPooler(D_h, scale=scale)
+        x = torch.randn(BS, P, D_h)
+        carry = torch.ones(BS, P, 1)
+        assert torch.allclose(
+            pooler.downsample(x), pooler.downsample(x, carry), atol=1e-6
+        )
 
     def test_upsample_repeats(self):
         """Upsample uses repeat_interleave to restore length."""
@@ -382,15 +429,7 @@ class TestMultiTimescaleIntegration:
         block = model.blocks[1]  # scale=4
         assert block.scale == 4
 
-        ids = torch.randint(0, 256, (BS, 1))
-        reset = torch.zeros(BS, dtype=torch.bool)
-
-        # First step: should process (counter = 0)
-        with torch.no_grad():
-            out1, _, _ = model.forward_span(ids, reset)
-
-        # Steps 2-4 via step() should hold the same output from the slow block
-        # We test the block directly
+        # Test block.step() directly
         x_block = torch.randn(BS, D_h)
         y_wm = torch.randn(BS, D)
         x_proj = torch.randn(BS, D)

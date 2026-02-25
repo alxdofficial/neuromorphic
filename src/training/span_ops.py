@@ -202,11 +202,11 @@ def apply_pm_eligibility_batch(
             else token_surprise
         )
 
-        # For multi-timescale blocks, subsample to pooled resolution
+        # For multi-timescale blocks, downsample to pooled resolution
         if s > 1:
-            block_surprise = block_surprise[:, ::s]
-            # Pooled reset mask: any reset in window → reset at pooled position
             carry_full = (~reset_mask_all).float().unsqueeze(-1)  # [BS, P, 1]
+            block_surprise = block.pooler.downsample(block_surprise, carry_full)
+            # Pooled reset mask: any reset in window → reset at pooled position
             carry_b = carry_min_pool(carry_full, s)               # [BS, P_b, 1]
             reset_mask_b = ~(carry_b.squeeze(-1).bool())          # [BS, P_b]
         else:
@@ -221,7 +221,9 @@ def apply_pm_eligibility_batch(
                 # Reconstruct the pooled+normed input that layer 0 actually saw
                 x_in_full = x_blocks_all[:, :, b]  # [BS, P, D_h]
                 if s > 1:
-                    x_in = block.input_norm(x_in_full[:, ::s])
+                    x_in = block.input_norm(
+                        block.pooler.downsample(x_in_full, carry_full)
+                    )
                 else:
                     x_in = block.input_norm(x_in_full)
             else:
@@ -280,10 +282,12 @@ def propose_em_candidates(
         if s > 1:
             P_b = h_final_all.shape[1]
 
-            # Subsample inputs to match pooled resolution
-            x_proj_b = x_proj_all[:, ::s]       # [BS, P_b, D]
-            y_wm_b = y_wm_all[:, ::s]           # [BS, P_b, D]
-            surprise_b = block_surprise[:, ::s]  # [BS, P_b, 1]
+            # Downsample inputs to match pooled resolution.
+            # No carry mask here — candidates are just proposals, boundary
+            # correctness is handled by cand_valid masking downstream.
+            x_proj_b = block.pooler.downsample(x_proj_all)       # [BS, P_b, D]
+            y_wm_b = block.pooler.downsample(y_wm_all)           # [BS, P_b, D]
+            surprise_b = block.pooler.downsample(block_surprise)  # [BS, P_b, 1]
 
             k_c, v_c, nov = block.em.propose_candidate_batch(
                 x_proj_b, y_wm_b, h_final_all, surprise_b,

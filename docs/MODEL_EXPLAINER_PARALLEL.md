@@ -480,11 +480,11 @@ def forward_span(self, x_block_all, y_wm_all, x_proj_all,
                  surprise_span, carry_all):
     BS, P, D_h = x_block_all.shape
 
-    # --- Temporal downsampling (strided sampling, multi-timescale) ---
-    x_block_b = self.pooler.downsample(x_block_all)       # [BS, P_b, D_h] where P_b = P // scale
-    y_wm_b = self.pooler.downsample(y_wm_all)             # [BS, P_b, D]
-    x_proj_b = self.pooler.downsample(x_proj_all)         # [BS, P_b, D]
-    carry_b = carry_min_pool(carry_all, self.scale)        # [BS, P_b, 1]
+    # --- Temporal downsampling (learned weighted aggregation, multi-timescale) ---
+    x_block_b = self.pooler.downsample(x_block_all, carry_all)  # [BS, P_b, D_h]
+    y_wm_b = self.pooler.downsample(y_wm_all, carry_all)        # [BS, P_b, D]
+    x_proj_b = self.pooler.downsample(x_proj_all, carry_all)    # [BS, P_b, D]
+    carry_b = carry_min_pool(carry_all, self.scale)              # [BS, P_b, 1]
 
     # EM retrieval at pooled resolution (batched, frozen state)
     y_em_b = self.em.retrieve_batch(x_proj_b, y_wm_b)     # [BS, P_b, D]
@@ -527,7 +527,7 @@ def forward_span(self, x_block_all, y_wm_all, x_proj_all,
 ```
 
 **Key differences from sequential:**
-1. **Temporal pooling** — When `block_scales` is configured, input is strided-sampled before processing and repeat-upsampled after. All computation (PCM, layers) happens at reduced resolution `P_b = P // scale`, reducing FLOPs proportionally. Strided sampling avoids token mixing across doc boundaries.
+1. **Temporal pooling** — When `block_scales` is configured, input is aggregated via learned weighted sums within non-overlapping windows before processing and repeat-upsampled after. All computation (PCM, layers) happens at reduced resolution `P_b = P // scale`, reducing FLOPs proportionally. Carry-aware masking within each window prevents cross-document mixing.
 2. **PCM operates at pooled resolution** — Evidence encoding, surprise computation, and FFN gain are computed on `[BS, P_b, ...]` tensors. The scalar surprise `‖δ‖` is upsampled to full resolution for PM eligibility and EM candidate scoring.
 3. **Eligibility accumulation** is decoupled from the forward pass and handled in the trainer post-forward step.
 4. `_last_layer_stack` is cached on the block for the spatial decoder, with layer outputs upsampled to original P if multi-timescale.
@@ -897,7 +897,7 @@ Block-level compilation is the current strategy: `block.forward_span` is compile
 | `src/model/working_memory.py` | `WorkingMemory.forward_span()` — batched Q/K/V, batched no-reset path, sequential fallback |
 | `src/model/block.py` | `Block.forward_span()` — temporal pooling, PCM, batched layers, caches `_last_layer_stack` |
 | `src/model/predictive_coding.py` | `PredictiveCodingModule` — evidence encoder, hypothesis predictor, surprise/gain computation |
-| `src/model/temporal_pool.py` | `TemporalPooler` (strided sampling), `carry_min_pool` — multi-timescale support |
+| `src/model/temporal_pool.py` | `TemporalPooler` (learned window aggregation), `carry_min_pool` — multi-timescale support |
 | `src/model/decoder.py` | `SpatialDecoder.forward()` — called with `[BS*P, ...]` tensors in span path |
 | `src/model/model.py` | `NeuromorphicLM.forward_span()`, `apply_pcm_boundary()`, `get_pcm_token_surprise()` |
 | `src/training/trainer.py` | Span loop orchestration, delegates to span_ops |

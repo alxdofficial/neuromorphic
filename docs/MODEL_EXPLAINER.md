@@ -732,22 +732,24 @@ L_recon = ||decoder(z) - x_block.detach()||² # reconstruction loss
 
 **File:** `src/model/temporal_pool.py`
 
-**Intuition:** The brain has no global clock — neurons operate at heterogeneous timescales. When `block_scales` is set (e.g., `(1, 4)` for B=2), each block processes input at a different temporal resolution via strided sampling. Block 0 (scale=1) sees every token; Block 1 (scale=4) sees every 4th token, producing sparser representations naturally aligned with PM/EM's span-level operation.
+**Intuition:** The brain has no global clock — neurons operate at heterogeneous timescales. When `block_scales` is set (e.g., `(1, 4)` for B=2), each block processes input at a different temporal resolution. Block 0 (scale=1) sees every token; Block 1 (scale=4) aggregates 4-token windows into a single representation.
 
-Strided sampling (vs causal conv/avg pooling) avoids token mixing across doc boundaries within the pooling window. It's also parameter-free and simplifies step-mode inference.
+**Downsampling** uses a learnable weighted sum within non-overlapping windows: each output position is a weighted combination of `s` input tokens, with softmax-normalized weights initialized to uniform (= average pooling at init). The model learns which positions within each window matter most.
+
+**Boundary safety:** When a doc boundary falls inside a window, all tokens from the previous document are masked out before aggregation (carry-aware masking within each window). This prevents cross-document mixing while preserving the learnable aggregation.
 
 **Components:**
 
 | Component | Architecture | Purpose |
 |-----------|-------------|---------|
-| `TemporalPooler` | Strided sampling (`x[:, ::s]`) + `repeat_interleave` | Parameter-free down/upsample, no cross-boundary mixing |
-| `carry_min_pool` | Min-pool over carry mask | Any boundary in window forces reset (conservative) |
+| `TemporalPooler` | Learned weighted sum in non-overlapping windows + `repeat_interleave` | Boundary-safe learnable downsampling (s params, init as avg pool) |
+| `carry_min_pool` | Min-pool over carry mask | Any boundary in window forces recurrence reset (conservative) |
 
 **Per-block flow (scale > 1):**
 ```python
-# Downsample: [BS, P, D_h] → [BS, P//s, D_h] (strided sampling)
-x_block_b = pooler.downsample(x_block_all)  # x[:, ::s]
-y_wm_b = pooler.downsample(y_wm_all)
+# Downsample: [BS, P, D_h] → [BS, P//s, D_h] (learnable, boundary-aware)
+x_block_b = pooler.downsample(x_block_all, carry_all)
+y_wm_b = pooler.downsample(y_wm_all, carry_all)
 carry_b = carry_min_pool(carry_all, s)
 
 # Process at reduced resolution (same L layers, PCM, etc.)
@@ -1265,7 +1267,7 @@ parameter gradients to:
   - PM neuromodulator heads (p_commit, lambda, g, slot logits, tau)
   - EM neuromodulator heads (g_em, tau, ww, decay)
   - PCM weights (encoder, decoder, predictor, W_gain — if pcm_enabled)
-  - Temporal pooler (parameter-free strided sampling)
+  - Temporal pooler learned weights (if block_scales configured)
 
 Runtime state updates (not parameters, no optimizer state):
   - PM state: pm_K, pm_V, pm_a, elig_K, elig_V
@@ -1275,7 +1277,7 @@ Runtime state updates (not parameters, no optimizer state):
 ```
 
 **Summary:**
-- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled). Single optimizer for everything. (Temporal pooler is parameter-free.)
+- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled), temporal pooler weights (if block_scales configured). Single optimizer for everything.
 - **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
 - **Evolves via explicit rules (graph preserved):** PCM z_hat — updated at span boundaries by predictor forward pass; graph persists across TBPTT for L_pred backprop
 - **Not plastic (no memory update mechanism):** WM recurrent state (GLA state matrix; gradients flow through within TBPTT chunks, detached at chunk boundaries)
