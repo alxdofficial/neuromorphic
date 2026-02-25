@@ -193,6 +193,7 @@ class Block(nn.Module, StateMixin):
 
             # Cache for boundary ops (called after forward pass)
             self._last_z = z
+            self._last_carry = carry_all  # [BS, P, 1] for masked z_mean
             self._last_L_recon = self.pcm.compute_recon_loss(z, x_block_all)
         else:
             # Scalar surprise: expand [BS, 1] → [BS, P, 1]

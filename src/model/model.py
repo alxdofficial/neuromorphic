@@ -603,7 +603,17 @@ class NeuromorphicLM(nn.Module, StateMixin):
                 continue
 
             z = block._last_z                        # [BS, P_b, D_pc]
-            z_mean = z.mean(dim=1)                   # [BS, D_pc]
+            carry = block._last_carry                # [BS, P_b, 1]
+
+            # Masked mean: only average tokens from the current document.
+            # carry=0 at reset positions; we want tokens AT or AFTER the last
+            # reset (the "current document").  If no reset, all tokens count.
+            P_b = z.shape[1]
+            reset_pos = (carry.squeeze(-1) == 0)     # [BS, P_b]
+            positions = torch.arange(P_b, device=z.device).unsqueeze(0)
+            last_reset = (reset_pos.long() * positions).max(dim=1).values  # [BS]
+            valid = (positions >= last_reset.unsqueeze(1)).unsqueeze(-1).float()  # [BS, P_b, 1]
+            z_mean = (z * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # [BS, D_pc]
 
             # Block context: last layer output at last pooled position
             ctx_b = block.layers[-1]._last_h_all[:, -1]  # [BS, D_h]
@@ -618,6 +628,7 @@ class NeuromorphicLM(nn.Module, StateMixin):
 
             # Free cached tensors to release computation graph memory
             block._last_z = None
+            block._last_carry = None
             block._last_L_recon = None
             block._last_token_surprise = None
 

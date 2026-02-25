@@ -339,7 +339,7 @@ class TBPTTTrainer:
 
         Returns (L_pred, L_recon) — PCM aux losses (zeros if disabled).
         """
-        # PCM hypothesis update (must happen before PM commit so z_end is cached)
+        # PCM hypothesis update (must happen before PM commit so _last_z is still cached)
         L_pred, L_recon = span_ops.apply_pcm_boundary(
             self.model, self.config, self.global_step,
         )

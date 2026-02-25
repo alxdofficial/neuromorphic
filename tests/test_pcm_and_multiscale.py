@@ -60,11 +60,11 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         # Now z_hat is valid; surprise should be nonzero
         z = torch.randn(BS, P, D_pc)
@@ -79,11 +79,11 @@ class TestPCM:
 
         assert not pcm.z_hat_valid.any()  # initially invalid
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         assert pcm.z_hat_valid.all()  # now valid
 
@@ -93,11 +93,11 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         mask = torch.tensor([True, False])
         pcm.reset_states(mask)
@@ -111,18 +111,18 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
 
         # First boundary: z_hat was zeros, z_hat_valid=False → L_pred=0
-        L_pred = pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        L_pred = pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
         assert L_pred.item() == 0.0
 
         # Second boundary: z_hat is now valid → L_pred > 0 (with high probability)
-        z_end2 = torch.randn(BS, D_pc)
-        L_pred2 = pcm.boundary_update(z_end2, ctx_b, pm_s, em_s)
+        z_mean2 = torch.randn(BS, D_pc)
+        L_pred2 = pcm.boundary_update(z_mean2, ctx_b, pm_s, em_s)
         assert L_pred2.item() > 0
 
     def test_ffn_gain_shape(self):
@@ -163,12 +163,12 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
 
-        L_pred = pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        L_pred = pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
         assert L_pred.dim() == 0  # scalar
         assert L_pred.item() >= 0  # MSE is non-negative
 
@@ -178,11 +178,11 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         # z_hat should have a grad_fn (from the predictor forward pass)
         assert pcm.z_hat.grad_fn is not None
@@ -193,11 +193,11 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         pcm.detach_states()
         # z_hat should STILL have a grad_fn
@@ -208,11 +208,11 @@ class TestPCM:
         pcm = PredictiveCodingModule(config)
         pcm._lazy_init(BS, torch.device("cpu"))
 
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         mask = torch.tensor([True, False])  # reset stream 0
         pcm.reset_states(mask)
@@ -344,11 +344,11 @@ class TestPCMDetachment:
         pcm._lazy_init(BS, torch.device("cpu"))
 
         # Set z_hat via boundary update
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         # Compute surprise
         z = torch.randn(BS, P, D_pc, requires_grad=True)
@@ -370,15 +370,15 @@ class TestPCMDetachment:
         pcm._lazy_init(BS, torch.device("cpu"))
 
         # First boundary: sets z_hat with a computation graph
-        z_end = torch.randn(BS, D_pc)
+        z_mean = torch.randn(BS, D_pc)
         ctx_b = torch.randn(BS, D_h)
         pm_s = torch.randn(BS, D_h)
         em_s = torch.randn(BS, config.D_em)
-        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+        pcm.boundary_update(z_mean, ctx_b, pm_s, em_s)
 
         # Second boundary: L_pred should backprop through z_hat into predictor
-        z_end2 = torch.randn(BS, D_pc)
-        L_pred = pcm.boundary_update(z_end2, ctx_b, pm_s, em_s)
+        z_mean2 = torch.randn(BS, D_pc)
+        L_pred = pcm.boundary_update(z_mean2, ctx_b, pm_s, em_s)
         L_pred.backward()
 
         # Predictor weights should have gradients from L_pred
