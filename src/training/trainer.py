@@ -226,7 +226,8 @@ class TBPTTTrainer:
         self.model.detach_states()
 
         # Track last token for checkpoint resume (prevents false doc-boundary reset)
-        self._last_prev_token = input_ids[:, -1].detach().cpu()
+        # Keep on GPU to avoid sync; .cpu() only at checkpoint time
+        self._last_prev_token = input_ids[:, -1].detach()
 
         elapsed = time.time() - t_start
 
@@ -465,10 +466,15 @@ class TBPTTTrainer:
             or (em_budget_util is not None and em_budget_util > 0.98)
         )
 
+        # Batch GPU→CPU sync: stack scalar tensors, transfer once
+        _scalars = torch.stack([avg_loss.detach(), reg.detach(),
+                                torch.exp(avg_loss.detach())]).cpu()
+        _loss_f, _reg_f, _ppl_f = _scalars[0].item(), _scalars[1].item(), min(_scalars[2].item(), 1e6)
+
         step_metrics = {
-            "loss": avg_loss.item(),
-            "reg": reg.item(),
-            "ppl": min(torch.exp(avg_loss).item(), 1e6),
+            "loss": _loss_f,
+            "reg": _reg_f,
+            "ppl": _ppl_f,
             "tokens_per_sec": tokens / max(elapsed, 1e-6),
             "valid_tokens": valid_count,
             "step": self.global_step,

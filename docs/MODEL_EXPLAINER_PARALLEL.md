@@ -507,9 +507,9 @@ def forward_span(self, x_block_all, y_wm_all, x_proj_all,
         surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
         ffn_gain_all = None
 
-    # Pre-LayerNorm for Layer 0 + cache block input for PM eligibility
+    # Pre-LayerNorm for Layer 0 + cache normed input for PM eligibility
     x = self.input_norm(x_block_all)
-    self._last_x_block_input = x_block_all
+    self._last_x_block_normed = x  # reused in span_ops (avoids recomputing LN)
     for layer in self.layers:
         y_pm = layer.pm.apply_batch(x)                     # PM read (batched)
         x = layer.forward_span(x, y_pm, y_wm_proj,

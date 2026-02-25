@@ -58,7 +58,7 @@ class Block(nn.Module, StateMixin):
         self._last_z: Tensor | None = None
         self._last_L_recon: Tensor | None = None
         self._last_token_surprise: Tensor | None = None
-        self._last_x_block_input: Tensor | None = None  # for PM eligibility
+        self._last_x_block_normed: Tensor | None = None  # normed input for PM eligibility
 
     def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
              surprise: Tensor, carry: Tensor, collect: bool = False,
@@ -203,8 +203,8 @@ class Block(nn.Module, StateMixin):
 
         # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
         x = self.input_norm(x_block_all)
-        # Cache block input for PM eligibility reconstruction in span_ops
-        self._last_x_block_input = x_block_all
+        # Cache normed input for PM eligibility (avoids recomputing LayerNorm in span_ops)
+        self._last_x_block_normed = x
         layer_stats = {} if collect else None
         for l_idx, layer in enumerate(self.layers):
             if self.config.pm_enabled:

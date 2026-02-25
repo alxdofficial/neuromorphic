@@ -896,7 +896,11 @@ def run_phase(
             "step": step,
             "config": config,
             "runtime_state": save_runtime_state(model),
-            "last_prev_token": getattr(trainer, "_last_prev_token", None),
+            "last_prev_token": (
+                trainer._last_prev_token.cpu()
+                if torch.is_tensor(getattr(trainer, "_last_prev_token", None))
+                else getattr(trainer, "_last_prev_token", None)
+            ),
         }
         torch.save(ckpt_data, save_path)
         print(f"\nSaved checkpoint: {save_path}")

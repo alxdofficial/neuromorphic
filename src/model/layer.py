@@ -305,4 +305,7 @@ class Layer(nn.Module, StateMixin):
                 "h_norm": self.h.detach().norm(dim=-1).mean(),  # scalar tensor
             }
             return output, stats
+        # Free gate tensors when not collecting (saves 2 * BS*P*D_h memory)
+        self._last_gate_a = None
+        self._last_gate_b = None
         return output

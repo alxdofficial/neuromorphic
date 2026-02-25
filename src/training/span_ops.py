@@ -201,8 +201,8 @@ def apply_pm_eligibility_batch(
 
             l_idx = layer.layer_idx
             if l_idx == 0:
-                # Use the normed input that layer 0 actually saw
-                x_in = block.input_norm(block._last_x_block_input)
+                # Use the normed input cached from forward_span (no recompute)
+                x_in = block._last_x_block_normed
             else:
                 x_in = block.layers[l_idx - 1]._last_h_all
 
