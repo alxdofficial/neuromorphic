@@ -7,7 +7,7 @@ import pytest
 from src.model.config import ModelConfig
 from src.model.model import NeuromorphicLM
 from src.model.predictive_coding import PredictiveCodingModule
-from src.model.temporal_pool import TemporalPooler, causal_avg_pool, carry_min_pool
+from src.model.temporal_pool import TemporalPooler, carry_min_pool
 
 BS = 2
 D = 128
@@ -47,36 +47,26 @@ class TestTemporalPooler:
             up = pooler.upsample(down, P)
             assert up.shape == (BS, P, D_h), f"scale={scale}"
 
-    def test_causality(self):
-        """Output position j only depends on inputs <= j*scale."""
+    def test_strided_sampling_values(self):
+        """Strided sampling picks every s-th token exactly."""
         scale = 4
         pooler = TemporalPooler(D_h, scale=scale)
-        x = torch.randn(BS, P, D_h, requires_grad=True)
+        x = torch.randn(BS, P, D_h)
         out = pooler.downsample(x)
-        # Gradient of output position 1 w.r.t. input
-        out[:, 1].sum().backward()
-        grad = x.grad  # [BS, P, D_h]
-        # positions >= 2*scale should have zero gradient
-        assert grad[:, scale * 2:].abs().max() < 1e-7, "Future positions leaked into output"
+        # Verify it's taking every 4th token
+        assert torch.equal(out, x[:, ::4])
 
-    def test_init_as_average(self):
-        """Conv weights start as 1/scale (average pooling init)."""
+    def test_upsample_repeats(self):
+        """Upsample uses repeat_interleave to restore length."""
         scale = 4
         pooler = TemporalPooler(D_h, scale=scale)
-        expected = 1.0 / scale
-        assert torch.allclose(pooler.pool_conv.weight.data,
-                              torch.full_like(pooler.pool_conv.weight.data, expected))
-
-
-class TestCausalAvgPool:
-    def test_scale_1_identity(self):
-        x = torch.randn(BS, P, D)
-        assert torch.equal(causal_avg_pool(x, 1), x)
-
-    def test_shape(self):
-        x = torch.randn(BS, P, D)
-        out = causal_avg_pool(x, 4)
-        assert out.shape == (BS, P // 4, D)
+        x = torch.randn(BS, P, D_h)
+        down = pooler.downsample(x)
+        up = pooler.upsample(down, P)
+        # Each pooled position is repeated scale times
+        for i in range(P // scale):
+            for j in range(scale):
+                assert torch.equal(up[:, i * scale + j], down[:, i])
 
 
 class TestCarryMinPool:
@@ -382,3 +372,142 @@ class TestMultiTimescaleIntegration:
         logits_b, _, _ = model_b.forward_span(ids, reset)
 
         assert torch.allclose(logits_a, logits_b, atol=1e-5)
+
+    def test_step_multiscale_hold(self):
+        """Slow block holds output on non-update steps."""
+        model = _make_pcm_model(pcm_enabled=False, block_scales=(1, 4))
+        model.eval()
+        model.initialize_states(BS, torch.device("cpu"))
+
+        block = model.blocks[1]  # scale=4
+        assert block.scale == 4
+
+        ids = torch.randint(0, 256, (BS, 1))
+        reset = torch.zeros(BS, dtype=torch.bool)
+
+        # First step: should process (counter = 0)
+        with torch.no_grad():
+            out1, _, _ = model.forward_span(ids, reset)
+
+        # Steps 2-4 via step() should hold the same output from the slow block
+        # We test the block directly
+        x_block = torch.randn(BS, D_h)
+        y_wm = torch.randn(BS, D)
+        x_proj = torch.randn(BS, D)
+        surprise = torch.zeros(BS, 1)
+        carry = torch.ones(BS, 1)
+
+        # Reset block counter for direct testing
+        block._step_counter = 0
+        block._last_step_output = None
+
+        # Step 0: processes
+        h0 = block.step(x_block, y_wm, x_proj, surprise, carry)
+        assert block._step_counter == 1
+
+        # Step 1: holds
+        h1 = block.step(x_block * 999, y_wm, x_proj, surprise, carry)
+        assert torch.equal(h0, h1), "Hold step should return cached output"
+        assert block._step_counter == 2
+
+    def test_step_multiscale_boundary_forces_process(self):
+        """Doc boundary forces slow block to process immediately."""
+        model = _make_pcm_model(pcm_enabled=False, block_scales=(1, 4))
+        model.eval()
+        model.initialize_states(BS, torch.device("cpu"))
+
+        block = model.blocks[1]  # scale=4
+        x_block = torch.randn(BS, D_h)
+        y_wm = torch.randn(BS, D)
+        x_proj = torch.randn(BS, D)
+        surprise = torch.zeros(BS, 1)
+        carry = torch.ones(BS, 1)
+
+        # First real step
+        block._step_counter = 0
+        block._last_step_output = None
+        _ = block.step(x_block, y_wm, x_proj, surprise, carry)
+        assert block._step_counter == 1
+
+        # Now send a boundary (carry=0) — should force processing
+        carry_boundary = torch.zeros(BS, 1)
+        _ = block.step(x_block, y_wm, x_proj, surprise, carry_boundary)
+        # Counter should have been reset to 0 on boundary, then incremented to 1
+        assert block._step_counter == 1
+
+
+class TestPCMDetachment:
+    def test_z_hat_detached_in_surprise(self):
+        """δ = z - z_hat.detach(): LM loss should NOT reach predictor through δ."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+
+        # Set z_hat via boundary update
+        z_end = torch.randn(BS, D_pc)
+        ctx_b = torch.randn(BS, D_h)
+        pm_s = torch.randn(BS, D_h)
+        em_s = torch.randn(BS, config.D_em)
+        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+
+        # Compute surprise
+        z = torch.randn(BS, P, D_pc, requires_grad=True)
+        delta = pcm.compute_surprise(z)
+
+        # Simulate LM loss flowing back through δ
+        fake_lm_loss = delta.sum()
+        fake_lm_loss.backward()
+
+        # Predictor weights should have NO gradients from this path
+        for param in pcm.predictor.parameters():
+            assert param.grad is None or param.grad.abs().max() == 0, \
+                "LM loss should not backprop into predictor through δ"
+
+    def test_z_hat_graph_preserved_for_l_pred(self):
+        """z_hat's own graph (for L_pred) is preserved despite detach in δ."""
+        config = _make_pcm_config()
+        pcm = PredictiveCodingModule(config)
+        pcm._lazy_init(BS, torch.device("cpu"))
+
+        # First boundary: sets z_hat with a computation graph
+        z_end = torch.randn(BS, D_pc)
+        ctx_b = torch.randn(BS, D_h)
+        pm_s = torch.randn(BS, D_h)
+        em_s = torch.randn(BS, config.D_em)
+        pcm.boundary_update(z_end, ctx_b, pm_s, em_s)
+
+        # Second boundary: L_pred should backprop through z_hat into predictor
+        z_end2 = torch.randn(BS, D_pc)
+        L_pred = pcm.boundary_update(z_end2, ctx_b, pm_s, em_s)
+        L_pred.backward()
+
+        # Predictor weights should have gradients from L_pred
+        has_grad = any(p.grad is not None and p.grad.abs().max() > 0
+                       for p in pcm.predictor.parameters())
+        assert has_grad, "L_pred should backprop into predictor"
+
+
+class TestGateZeroInit:
+    def test_delta_columns_zero_at_init(self):
+        """Gate δ columns start at zero to prevent distribution shift."""
+        config = _make_pcm_config()
+        model = _make_pcm_model(pcm_enabled=True)
+
+        for block in model.blocks:
+            for layer in block.layers:
+                # Last D_pc columns of gate_ab weight should be zero
+                delta_cols = layer.gate_ab.weight[:, -D_pc:]
+                assert delta_cols.abs().max() == 0, \
+                    "Gate δ columns should be zero-initialized"
+
+    def test_non_delta_columns_nonzero(self):
+        """Non-δ gate columns should have normal (non-zero) init."""
+        config = _make_pcm_config()
+        model = _make_pcm_model(pcm_enabled=True)
+
+        for block in model.blocks:
+            for layer in block.layers:
+                # First 4*D_h columns should be nonzero (normal Kaiming init)
+                non_delta_cols = layer.gate_ab.weight[:, :4 * D_h]
+                assert non_delta_cols.abs().max() > 0, \
+                    "Non-δ gate columns should have normal init"

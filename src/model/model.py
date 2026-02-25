@@ -66,6 +66,18 @@ class NeuromorphicLM(nn.Module, StateMixin):
             elif "bias" in name:
                 nn.init.zeros_(p)
 
+        # Re-apply targeted zero-inits that xavier overwrote:
+        # - Gate δ columns: so PCM surprise has no effect at init
+        # - W_gain: so FFN gain starts at exactly 1.0
+        if self.config.pcm_enabled:
+            for block in self.blocks:
+                if block.pcm is not None:
+                    nn.init.zeros_(block.pcm.W_gain.weight)
+                    nn.init.zeros_(block.pcm.W_gain.bias)
+                for layer in block.layers:
+                    with torch.no_grad():
+                        layer.gate_ab.weight[:, -layer.surprise_dim:].zero_()
+
     def _state_needs_init(self, state: torch.Tensor | None, BS: int) -> bool:
         """Check if a state tensor needs (re-)initialization."""
         return state is None or state.shape[0] != BS

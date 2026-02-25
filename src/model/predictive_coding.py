@@ -81,6 +81,10 @@ class PredictiveCodingModule(nn.Module, StateMixin):
     def compute_surprise(self, z: Tensor) -> Tensor:
         """Compute prediction error: evidence minus hypothesis.
 
+        z_hat is detached here so the LM loss does NOT backprop into the
+        predictor through the δ → gate → layer → logits path. The predictor
+        is trained only by L_pred (prediction loss at span boundaries).
+
         Args:
             z: [BS, P_b, D_pc] — encoded evidence
 
@@ -90,7 +94,8 @@ class PredictiveCodingModule(nn.Module, StateMixin):
         if self.z_hat is None:
             return torch.zeros_like(z)
         # z_hat is [BS, D_pc], broadcast over P_b
-        return z - self.z_hat.unsqueeze(1)
+        # Detach: predictor learns from L_pred only, not from LM loss
+        return z - self.z_hat.detach().unsqueeze(1)
 
     def compute_ffn_gain(self, delta: Tensor) -> Tensor:
         """Compute multiplicative gain for FFN input.

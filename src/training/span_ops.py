@@ -26,6 +26,7 @@ from torch import Tensor
 
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
+from ..model.temporal_pool import carry_min_pool
 
 
 # ------------------------------------------------------------------
@@ -179,7 +180,10 @@ def apply_pm_eligibility_batch(
     Uses model._last_x_proj_all (cached by forward_span).
     When PCM is enabled, uses per-block ‖δ‖ surprise instead of
     the global loss-based token_surprise.
-    Modifies PM eligibility traces in-place.
+
+    Multi-timescale aware: for blocks with scale > 1, all inputs are
+    subsampled to match the block's pooled resolution P_b = P // scale.
+    PM eligibility cost scales with P_b, preserving the speedup.
     """
     BS, span_P = token_surprise.shape[:2]
 
@@ -189,6 +193,8 @@ def apply_pm_eligibility_batch(
     )  # [BS, span_P, B, D_h]
 
     for b, block in enumerate(model.blocks):
+        s = block.scale
+
         # Per-block PCM surprise when available, else global loss-based
         block_surprise = (
             block._last_token_surprise
@@ -196,20 +202,35 @@ def apply_pm_eligibility_batch(
             else token_surprise
         )
 
+        # For multi-timescale blocks, subsample to pooled resolution
+        if s > 1:
+            block_surprise = block_surprise[:, ::s]
+            # Pooled reset mask: any reset in window → reset at pooled position
+            carry_full = (~reset_mask_all).float().unsqueeze(-1)  # [BS, P, 1]
+            carry_b = carry_min_pool(carry_full, s)               # [BS, P_b, 1]
+            reset_mask_b = ~(carry_b.squeeze(-1).bool())          # [BS, P_b]
+        else:
+            reset_mask_b = reset_mask_all
+
         for layer in block.layers:
             if layer._last_h_all is None:
                 continue
 
             l_idx = layer.layer_idx
             if l_idx == 0:
-                x_in = block.input_norm(x_blocks_all[:, :, b])  # [BS, span_P, D_h]
+                # Reconstruct the pooled+normed input that layer 0 actually saw
+                x_in_full = x_blocks_all[:, :, b]  # [BS, P, D_h]
+                if s > 1:
+                    x_in = block.input_norm(x_in_full[:, ::s])
+                else:
+                    x_in = block.input_norm(x_in_full)
             else:
-                x_in = block.layers[l_idx - 1]._last_h_all
+                x_in = block.layers[l_idx - 1]._last_h_all  # already pooled
 
-            h_out = layer._last_h_all  # [BS, span_P, D_h]
+            h_out = layer._last_h_all  # [BS, P_b, D_h] (pooled if s > 1)
 
             layer.pm.update_eligibility_batch(
-                x_in, h_out, block_surprise, reset_mask_all,
+                x_in, h_out, block_surprise, reset_mask_b,
             )
 
 
@@ -233,17 +254,60 @@ def propose_em_candidates(
     When PCM is enabled, uses per-block ‖δ‖ surprise for novelty scoring
     instead of the global loss-based token_surprise.
 
+    Multi-timescale aware: for blocks with scale > 1, inputs are subsampled
+    to match pooled resolution, candidates are proposed at P_b positions,
+    then scattered back into full-length tensors so downstream stacking
+    and position-based reset masking work unchanged.
+
     Stacking is deferred to SpanAccumulator.finalize() or stack_em_candidates().
     """
+    BS, P = loss_mask_all.shape
+
     for b, block in enumerate(model.blocks):
         h_final_all = block.layers[-1]._last_h_all
-        if h_final_all is not None:
-            # Per-block PCM surprise when available
-            block_surprise = (
-                block._last_token_surprise
-                if getattr(block, '_last_token_surprise', None) is not None
-                else token_surprise
-            )
+        if h_final_all is None:
+            continue
+
+        s = block.scale
+
+        # Per-block PCM surprise when available
+        block_surprise = (
+            block._last_token_surprise
+            if getattr(block, '_last_token_surprise', None) is not None
+            else token_surprise
+        )
+
+        if s > 1:
+            P_b = h_final_all.shape[1]
+
+            # Subsample inputs to match pooled resolution
+            x_proj_b = x_proj_all[:, ::s]       # [BS, P_b, D]
+            y_wm_b = y_wm_all[:, ::s]           # [BS, P_b, D]
+            surprise_b = block_surprise[:, ::s]  # [BS, P_b, 1]
+
+            k_c, v_c, nov = block.em.propose_candidate_batch(
+                x_proj_b, y_wm_b, h_final_all, surprise_b,
+            )  # [BS, P_b, D_em], [BS, P_b, D_em], [BS, P_b]
+
+            # Scatter into full-length tensors at stride positions
+            D_em = k_c.shape[2]
+            positions = torch.arange(P_b, device=k_c.device) * s
+
+            k_full = k_c.new_zeros(BS, P, D_em)
+            v_full = v_c.new_zeros(BS, P, D_em)
+            nov_full = nov.new_zeros(BS, P)
+            valid_full = loss_mask_all.new_zeros(BS, P)
+
+            k_full[:, positions] = k_c
+            v_full[:, positions] = v_c
+            nov_full[:, positions] = nov
+            valid_full[:, positions] = loss_mask_all[:, positions]
+
+            cand_K[b].append(k_full)
+            cand_V[b].append(v_full)
+            cand_score[b].append(nov_full)
+            cand_token_valid[b].append(valid_full)
+        else:
             k_c, v_c, nov = block.em.propose_candidate_batch(
                 x_proj_all, y_wm_all, h_final_all, block_surprise,
             )

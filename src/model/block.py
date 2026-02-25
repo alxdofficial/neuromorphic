@@ -18,7 +18,7 @@ from torch import Tensor
 from .config import ModelConfig
 from .layer import Layer
 from .episodic_memory import EpisodicMemory, EMNeuromodulator
-from .temporal_pool import TemporalPooler, causal_avg_pool, carry_min_pool
+from .temporal_pool import TemporalPooler, carry_min_pool
 from .predictive_coding import PredictiveCodingModule
 from .utils import StateMixin
 
@@ -67,10 +67,32 @@ class Block(nn.Module, StateMixin):
         self._last_L_recon: Tensor | None = None
         self._last_token_surprise: Tensor | None = None
 
+        # Multi-timescale step() mode state
+        # Slow blocks only process every `scale` tokens; on hold steps
+        # they return the cached output from the last update step.
+        self._step_counter: int = 0
+        self._last_step_output: Tensor | None = None
+        self._last_step_layer_stack: Tensor | None = None
+
+    def _step_hold_result(self, collect: bool, return_layers: bool):
+        """Return cached output for multi-timescale hold steps."""
+        h = self._last_step_output
+        if collect and return_layers:
+            return h, {}, self._last_step_layer_stack
+        if collect:
+            return h, {}
+        if return_layers:
+            return h, self._last_step_layer_stack
+        return h
+
     def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
              surprise: Tensor, carry: Tensor, collect: bool = False,
              return_layers: bool = False):
         """Process one token through this block.
+
+        For multi-timescale blocks (scale > 1), only processes every s-th
+        token and holds the last output on intermediate steps. Doc boundaries
+        (carry=0) force immediate processing and counter reset.
 
         Args:
             x_block: [BS, D_h] — input slice for this block
@@ -86,6 +108,18 @@ class Block(nn.Module, StateMixin):
             stats: dict (only when collect=True) — per-layer gate stats
             layer_outputs: [BS, L, D_h] (only when return_layers=True)
         """
+        s = self.scale
+        if s > 1:
+            # Doc boundary forces immediate processing and counter reset
+            has_boundary = (carry < 0.5).any()
+            if has_boundary:
+                self._step_counter = 0
+
+            # Hold steps: return cached output, skip all computation
+            if self._step_counter > 0 and self._last_step_output is not None:
+                self._step_counter = (self._step_counter + 1) % s
+                return self._step_hold_result(collect, return_layers)
+
         # EM retrieval (if enabled)
         if self.config.em_enabled:
             y_em = self.em.retrieve(x_proj, y_wm)  # [BS, D]
@@ -143,6 +177,12 @@ class Block(nn.Module, StateMixin):
         # Build stacked layer outputs [BS, L, D_h]
         layer_stack = torch.stack(layer_outs, dim=1) if return_layers else None
 
+        # Cache output for multi-timescale hold steps
+        if s > 1:
+            self._last_step_output = x
+            self._last_step_layer_stack = layer_stack
+            self._step_counter = (self._step_counter + 1) % s
+
         # Return based on flags
         if collect and return_layers:
             return x, layer_stats, layer_stack
@@ -181,13 +221,15 @@ class Block(nn.Module, StateMixin):
         s = self.scale
 
         # --- Temporal downsampling (multi-timescale) ---
-        # x_block_b: [BS, P_b, D_h] where P_b = P // s
-        x_block_b = self.pooler.downsample(x_block_all)
+        # Strided sampling avoids token mixing across doc boundaries
+        # that would occur with causal conv or avg pooling.
+        x_block_b = self.pooler.downsample(x_block_all)  # [BS, P_b, D_h]
         P_b = x_block_b.shape[1]
 
-        # Pool auxiliary signals to match block's temporal resolution
-        y_wm_b = causal_avg_pool(y_wm_all, s)          # [BS, P_b, D]
-        x_proj_b = causal_avg_pool(x_proj_all, s)       # [BS, P_b, D]
+        # Strided subsample of auxiliary signals to match block resolution
+        y_wm_b = self.pooler.downsample(y_wm_all)       # [BS, P_b, D]
+        x_proj_b = self.pooler.downsample(x_proj_all)    # [BS, P_b, D]
+        # carry uses min-pool: any boundary in window forces reset
         carry_b = carry_min_pool(carry_all, s)           # [BS, P_b, 1]
 
         # EM retrieval at pooled resolution (if enabled)
@@ -335,5 +377,8 @@ class Block(nn.Module, StateMixin):
         if self.pcm is not None:
             self.pcm.reset_states(mask)
 
-
-
+        # Reset step-mode state for multi-timescale blocks
+        if self.scale > 1 and mask.any():
+            self._step_counter = 0
+            self._last_step_output = None
+            self._last_step_layer_stack = None

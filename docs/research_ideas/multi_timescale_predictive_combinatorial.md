@@ -10,7 +10,7 @@ Date: 2025-02-19 (ideas), 2026-02-24 (implementation of #1 and #2)
 ### Core insight
 
 The brain has no global clock — neurons operate on heterogeneous timescales.
-Currently our B blocks all receive the same token stream simultaneously
+Currently` our B blocks all receive the same token stream simultaneously
 (`x_proj.view(BS, B, D_h)` — a pure spatial split of the same timestep).
 The blocks differ in *what dimensions* they see, but not in *when* they see
 them.

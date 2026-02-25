@@ -44,6 +44,14 @@ class Layer(nn.Module, StateMixin):
         # Fused gate: single GEMM produces both retention (sigmoid) and update (tanh)
         self.gate_ab = nn.Linear(input_dim, 2 * D_h)
 
+        # Zero-init the surprise (δ) columns of gate weights so PCM surprise
+        # has no effect at initialization. Prevents sudden distribution shift
+        # in gate activations when z_hat first becomes nonzero after the first
+        # span boundary. (Matches zero-init of W_gain in PCM.)
+        if config.pcm_enabled:
+            with torch.no_grad():
+                self.gate_ab.weight[:, -self.surprise_dim:].zero_()
+
         # Per-layer output projection (spec §7.4)
         self.W_o = nn.Linear(D_h, D_h)
 
