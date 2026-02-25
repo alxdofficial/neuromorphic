@@ -136,7 +136,7 @@ Layer.h:         [32, 384]  — per layer, per block (16 instances total). Carri
 WM state:       wm_K [32, 128, 192], wm_V [32, 128, 192]  — sliding-window ring buffer (W=128 recent tokens)
 PM state:        pm_K [32, 8, 384], pm_V [32, 8, 384], pm_a [32, 8]  — per layer per block (16 instances)
 PM eligibility:  elig_K [32, 8, 384], elig_V [32, 8, 384]            — per layer per block (16 instances)
-EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256]  — per block (2 instances)
+EM state:        em_K [32, 256, 128], em_V [32, 256, 128], em_S [32, 256], em_age [32, 256]  — per block (2 instances)
 ```
 
 ### 4.2 Phase 1: Forward pass (model.forward_span)
@@ -186,7 +186,7 @@ For block 0:
 ```
 x_block_all = x_blocks_all[:, :, 0]                    # [32, 32, 384]
 
-# EM retrieval (frozen em_K, em_V, em_S)
+# EM retrieval (frozen em_K, em_V, em_S, em_age)
 y_em_all = em.retrieve_batch(x_emb_all, y_wm_all)     # [32, 32, 768]
 
 # Project shared signals to per-block dim
@@ -331,7 +331,8 @@ for each PM instance:
 # EM: neuromodulator write decision
 for each EM instance:
     neuromodulator decides g_em, tau, ww, decay
-    em.write_at_boundary(cand_K, cand_V, scores, g_em, tau=tau, ww=ww, decay=decay)   # EMA update em_K, em_V, em_S
+    em.age_tick(P)                                                                    # age active slots by P tokens
+    em.write_at_boundary(cand_K, cand_V, scores, g_em, tau=tau, ww=ww, decay=decay)   # EMA update em_K, em_V, em_S, em_age
     em_S *= decay; budget_enforce(em_S)                         # per-stream learned decay + budget
 ```
 
@@ -412,12 +413,13 @@ The input flows through stored modulation patterns: `y_d = x_d * sum_i(a_i * sco
 ```python
 q = unit_normalize(W_q_em(cat([x_all, y_wm_all], dim=-1)))   # [BS, P, D_em]
 scores = einsum("bpd, bmd -> bpm", q, em_K)                   # [BS, P, M]
+scores += age_gate * log1p(em_age).unsqueeze(1)                # temporal bias [BS, 1, M]
 topk_scores, topk_idx = scores.topk(k_ret, dim=-1)            # [BS, P, k]
 # ... cross-attention ...
 y_em_all = W_o_cross(out)                                      # [BS, P, D]
 ```
 
-**Difference:** None in math. EM state (`em_K`, `em_V`, `em_S`) is frozen within a span in both paths. Implementation uses `em_V.unsqueeze(1).expand(-1, P, -1, -1)` for the gather, which increases peak memory by `P * M * D_em` per block.
+**Difference:** None in math. EM state (`em_K`, `em_V`, `em_S`, `em_age`) is frozen within a span in both paths. The temporal age bias (`age_gate * log1p(em_age)`) is broadcast over P positions identically in both paths. Implementation uses `em_V.unsqueeze(1).expand(-1, P, -1, -1)` for the gather, which increases peak memory by `P * M * D_em` per block.
 
 ### 5.5 Layer (Core Recurrence)
 
@@ -599,7 +601,7 @@ model.surprise = span_surprise_mean                              # next span's f
 - `model.surprise` for masked streams
 - `Layer.h` for all blocks/layers
 - `pm_K, pm_V, pm_a, elig_K, elig_V` (non-lifelong) or just `elig_K, elig_V` (lifelong)
-- `em_S` (non-lifelong only)
+- `em_S`, `em_age` (non-lifelong only)
 - WM validity and pointer
 
 **Parallel path:** `reset_at_doc_boundary` is called **only for the first token** of the span (`model.py:184-185`). For mid-span doc boundaries (tokens 1..P-1):
@@ -609,7 +611,7 @@ model.surprise = span_surprise_mean                              # next span's f
 | `Layer.h` | Carry mask zeros `a_eff`, giving `h_t = b_t` | Yes |
 | `elig_K, elig_V` | Reset via carry mask in `update_eligibility_batch` (`a=0` at reset positions) | Yes |
 | `pm_K, pm_V, pm_a` | NOT zeroed mid-span | **No** (phases A-B) |
-| `em_S` | NOT zeroed mid-span | **No** (phases A-C) |
+| `em_S`, `em_age` | NOT zeroed mid-span | **No** (phases A-C) |
 | WM state | Handled internally by `wm.forward_span` | Yes |
 | `model.surprise` | Frozen anyway | N/A |
 
@@ -712,7 +714,7 @@ for b, block in enumerate(model.blocks):  # b=0..1
     )
 ```
 
-Uses `propose_candidate_batch()` which batches the same math as `propose_candidate()` across P tokens. Uses the full layer output (`_last_h_all`) for value candidates, and real per-token surprise for novelty scoring. EM state (`em_K`, `em_S`) is frozen during scoring.
+Uses `propose_candidate_batch()` which batches the same math as `propose_candidate()` across P tokens. Uses the full layer output (`_last_h_all`) for value candidates, and real per-token surprise for novelty scoring. EM state (`em_K`, `em_S`, `em_age`) is frozen during scoring.
 
 **Candidate validity:** The trainer tracks `span_last_reset` per stream and masks out candidates from tokens before the last doc-boundary reset in the span. This prevents writing stale cross-document content to EM.
 
@@ -765,7 +767,8 @@ For each span (8 spans per chunk, P=32 tokens each):
       └── tau   = floor + range * sigmoid(raw)  [0.05, 5.0]   (slot-softmax temperature)
       └── ww    = floor + range * sigmoid(raw)  [0.0, 2.0]    (weakness weight)
       └── decay = floor + range * sigmoid(raw)  [0.99, 0.9999] (memory retention)
-      └── EM.write_at_boundary(): update em_K, em_V, em_S with alpha = g_em * weights
+      └── EM.age_tick(P): increment em_age for active slots
+      └── EM.write_at_boundary(): update em_K, em_V, em_S, em_age with alpha = g_em * weights
 
 After all spans:
     Finalize loss, add regularizers (PM/EM/WM)
@@ -818,8 +821,8 @@ In practice: PM state is slow-changing and typically weak during early training.
 
 **Magnitude:** Low-medium. Bounded to at most 31 tokens per boundary.
 
-Sequential: `reset_at_doc_boundary` zeros `em_S` → post-boundary tokens retrieve nothing (all slots inactive).
-Parallel: `em_S` not zeroed mid-span → post-boundary tokens retrieve old-document memories.
+Sequential: `reset_at_doc_boundary` zeros `em_S` and `em_age` → post-boundary tokens retrieve nothing (all slots inactive, ages reset).
+Parallel: `em_S` and `em_age` not zeroed mid-span → post-boundary tokens retrieve old-document memories with stale ages.
 
 In practice: EM content from old document is unrelated to new document, but retrieval output passes through learned projections that can dampen irrelevant signals.
 

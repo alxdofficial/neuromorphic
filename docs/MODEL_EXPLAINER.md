@@ -110,7 +110,7 @@ Token ID ──► Embedding ──► x: [BS, D]
      ├─ commit decision    │               ├─ write decision
      ▼                     │               ▼
      PM commit: update     │               EM write: update
-     pm_K, pm_V, pm_a     │               em_K, em_V, em_S
+     pm_K, pm_V, pm_a     │               em_K, em_V, em_S, em_age
                            ▼
                    PCM hypothesis update
                    ẑ_new = predictor(z_end, ctx, PM, EM)
@@ -468,6 +468,7 @@ Per EM instance, per stream:
 | `em_K` | `[BS, M, D_em]` | Keys (unit-normalized). What to match against. |
 | `em_V` | `[BS, M, D_em]` | Values. What to retrieve. |
 | `em_S` | `[BS, M]` | Strengths. How "active" each slot is. Range [0, S_max]. |
+| `em_age` | `[BS, M]` | Tokens since last write. Used for temporal retrieval bias. |
 
 `M=256` slots per bank. `D_em=128`.
 
@@ -477,8 +478,9 @@ Per EM instance, per stream:
 # 1. Compute query from input embedding + WM output
 q = normalize(W_q_em(concat(x_emb, y_wm)))    # [BS, D_em]
 
-# 2. Score against all M slots
+# 2. Score against all M slots (with temporal bias)
 scores = einsum("bd, bmd -> bm", q, em_K)      # [BS, M]
+scores += age_gate * log(1 + em_age)            # temporal retrieval bias
 scores[em_S == 0] = -inf                        # mask inactive slots
 
 # 3. Top-k retrieval (k_ret = 4)
@@ -567,11 +569,11 @@ At the span boundary, candidates are selected and written:
 
 ### 8.5 EM Doc-Boundary Reset
 
-**Critical design decision:** On doc boundary reset (Phases A-C), EM only zeros `em_S` (strengths). It preserves `em_K` and `em_V`. This is implemented via an override of `StateMixin.reset_states()` in `EpisodicMemory`.
+**Critical design decision:** On doc boundary reset (Phases A-C), EM zeros `em_S` (strengths) and `em_age` (temporal coordinates). It preserves `em_K` and `em_V`. This is implemented via an override of `StateMixin.reset_states()` in `EpisodicMemory`.
 
 **Why?** Zeroing strengths makes all slots invisible to retrieval (the `em_S > 0` mask filters them out) without destroying the actual key-value content. When new writes occur, they can reuse these slots via the weakness-biased slot selection (slots with `em_S=0` are preferred targets). This is more graceful than re-randomizing keys, which would destroy any useful patterns in the key space.
 
-In Phase C (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, and `em_S` all persist across document boundaries.
+In Phase C (lifelong mode), EM is not reset at all -- `em_K`, `em_V`, `em_S`, and `em_age` all persist across document boundaries.
 
 ### 8.6 EM: Complete Learnable Components Reference
 
@@ -602,6 +604,13 @@ This table covers **every learnable weight, runtime state, and control signal** 
 | `em_K` | `[BS, M, D_em]` | Key bank (unit-normalized) — *what patterns are stored* | EMA: `em_K = normalize((1-α)*em_K + α*k_cand)` where α = `softmax(scores/tau) * g_em` | Span boundary (per candidate in span) | Persists in Phase C; K/V content survives doc reset |
 | `em_V` | `[BS, M, D_em]` | Value bank — *what to retrieve when matched* | Same EMA as em_K with v_cand | Span boundary | Persists in Phase C |
 | `em_S` | `[BS, M]` | Slot strengths [0, S_max] — *how active each slot is* | `em_S += α * cand_score`, then `*= decay` (per-stream learned), then budget_enforce | Span boundary | Persists in Phase C (lifelong); learned decay controls retention. In Phases A–B: zeroed on doc boundary (makes slots invisible but preserves K/V) |
+| `em_age` | `[BS, M]` | Tokens since last write — *temporal coordinate* | `em_age += P` for active slots each span boundary; `em_age *= (1-α)` on write (strong write resets to ~0) | Span boundary | Zeroed with em_S on doc boundary |
+
+#### Learned Retrieval Parameters
+
+| Parameter | Shape | Description |
+|-----------|-------|-------------|
+| `age_gate` | `[1]` (scalar) | Learned weight on `log(1 + em_age)` added to retrieval scores. Init=0 (no effect). Negative = prefer recent; positive = prefer established. |
 
 #### Control Signals (computed, not stored — ephemeral per boundary)
 
@@ -997,7 +1006,7 @@ All stateful modules inherit from `StateMixin`, which provides:
 |--------|---------------------------|---------------|
 | Layer | `h` (hidden state) | -- |
 | PM | `elig_K, elig_V` only | `pm_K, pm_V, pm_a` (committed knowledge) |
-| EM | -- (nothing resets) | `em_K, em_V, em_S` (all persist) |
+| EM | -- (nothing resets) | `em_K, em_V, em_S, em_age` (all persist) |
 | WM | `gla_state` zeroed (or `wm_valid` cleared if softmax) | -- |
 | Model | `surprise` zeroed for masked streams | -- |
 
@@ -1249,14 +1258,14 @@ parameter gradients to:
 
 Runtime state updates (not parameters, no optimizer state):
   - PM state: pm_K, pm_V, pm_a, elig_K, elig_V
-  - EM state: em_K, em_V, em_S
+  - EM state: em_K, em_V, em_S, em_age
   - WM state: gla_state (or wm_K, wm_V, wm_valid, wm_ptr if softmax)
   - PCM state: z_hat (hypothesis, graph preserved across TBPTT — if pcm_enabled)
 ```
 
 **Summary:**
-- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled). Single optimizer for everything.
-- **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S -- updated at span boundaries by commit/write procedures
+- **Learns via backprop (main optimizer):** All `nn.Parameter` weights -- gate projections, WM projections, EM query/output projections, PM eligibility projections, embedding, lm_head, `EpisodicMemory.W_nov` (learned novelty adjuster, Phase B+), `EpisodicMemory.age_gate` (temporal retrieval bias), PM neuromodulator backbone + heads (Phase A+), EM neuromodulator backbone + heads (Phase B+), PCM encoder/decoder/predictor/W_gain (if pcm_enabled). Single optimizer for everything.
+- **Evolves via explicit rules (no parameter grad):** pm_K, pm_V, pm_a, em_K, em_V, em_S, em_age -- updated at span boundaries by commit/write procedures
 - **Evolves via explicit rules (graph preserved):** PCM z_hat — updated at span boundaries by predictor forward pass; graph persists across TBPTT for L_pred backprop
 - **Not plastic (no memory update mechanism):** WM recurrent state (GLA state matrix; gradients flow through within TBPTT chunks, detached at chunk boundaries)
 

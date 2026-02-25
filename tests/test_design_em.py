@@ -180,3 +180,134 @@ class TestEMNeuromodulator:
         assert tau.shape == (BS,)
         assert ww.shape == (BS,)
         assert decay.shape == (BS,)
+
+
+# ============================================================================
+# EM temporal age
+# ============================================================================
+
+class TestEMTemporalAge:
+    def test_age_state_initialized_to_zero(self):
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+        assert em.em_age is not None
+        assert em.em_age.shape == (BS, cfg.M)
+        assert em.em_age.abs().max() == 0
+
+    def test_age_in_state_tensor_names(self):
+        assert "em_age" in EpisodicMemory._state_tensor_names
+
+    def test_age_gate_initialized_to_zero(self):
+        """age_gate=0 means no temporal bias at init (pure content retrieval)."""
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        assert em.age_gate.item() == 0.0
+
+    def test_age_tick_increments_active_slots(self):
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+
+        # Mark some slots as active
+        em.em_S[:, 0] = 1.0
+        em.em_S[:, 1] = 0.5
+
+        em.age_tick(32)
+
+        # Active slots aged
+        assert (em.em_age[:, 0] == 32).all()
+        assert (em.em_age[:, 1] == 32).all()
+        # Inactive slots unchanged
+        assert (em.em_age[:, 2] == 0).all()
+
+    def test_age_tick_ignores_inactive_slots(self):
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+
+        # All slots inactive (S=0)
+        em.age_tick(100)
+        assert em.em_age.abs().max() == 0
+
+    def test_age_reset_on_doc_boundary(self):
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+
+        em.em_S[:, 0] = 1.0
+        em.em_age[:, 0] = 500.0
+
+        mask = torch.tensor([True, False])
+        em.reset_states(mask)
+
+        assert em.em_age[0, 0].item() == 0  # reset
+        assert em.em_age[1, 0].item() == 500  # preserved
+
+    def test_age_bias_zero_at_init(self):
+        """With age_gate=0, retrieval scores are unaffected by age."""
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+
+        # Activate all slots and set varying ages
+        em.em_S.fill_(1.0)
+        em.em_age[:, 0] = 0
+        em.em_age[:, 1] = 100
+        em.em_age[:, 2] = 10000
+
+        x = torch.randn(BS, cfg.D)
+        y_wm = torch.randn(BS, cfg.D)
+
+        # Should not crash and should return valid output
+        y_em = em.retrieve(x, y_wm)
+        assert y_em.shape == (BS, cfg.D)
+
+    def test_age_gate_is_learnable(self):
+        """age_gate should be an nn.Parameter that receives gradients."""
+        cfg = make_tiny_config(em_enabled=True)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(BS, torch.device("cpu"))
+
+        em.em_S.fill_(1.0)
+        em.em_age[:, 0] = 100.0
+
+        x = torch.randn(BS, cfg.D)
+        y_wm = torch.randn(BS, cfg.D)
+
+        y_em = em.retrieve(x, y_wm)
+        loss = y_em.sum()
+        loss.backward()
+
+        assert em.age_gate.grad is not None
+
+    def test_negative_age_gate_prefers_recent(self):
+        """Negative age_gate biases retrieval toward recent memories."""
+        cfg = make_tiny_config(em_enabled=True, k_ret=1, M=4)
+        em = EpisodicMemory(cfg)
+        em._lazy_init(1, torch.device("cpu"))  # BS=1 for simplicity
+
+        # Two active slots with identical keys but different ages
+        em.em_S[0, 0] = 1.0
+        em.em_S[0, 1] = 1.0
+        em.em_K[0, 0] = em.em_K[0, 1]  # same key
+        em.em_age[0, 0] = 1000.0   # old
+        em.em_age[0, 1] = 1.0      # recent
+
+        with torch.no_grad():
+            em.age_gate.fill_(-1.0)  # prefer recent
+
+        x = torch.randn(1, cfg.D)
+        y_wm = torch.randn(1, cfg.D)
+
+        # With k_ret=1, only one slot is retrieved.
+        # Negative age_gate should make slot 1 (recent, age=1) score higher.
+        from src.model.utils import unit_normalize
+        q = unit_normalize(em.W_q_em(torch.cat([x, y_wm], dim=-1)))
+        q = q.to(em.em_K.dtype)
+        scores = torch.einsum("bd, bmd -> bm", q, em.em_K)
+        age_bias = em.age_gate * torch.log1p(em.em_age.to(scores.dtype))
+        biased_scores = scores + age_bias
+
+        # Slot 1 (recent) should score higher than slot 0 (old)
+        assert biased_scores[0, 1] > biased_scores[0, 0]

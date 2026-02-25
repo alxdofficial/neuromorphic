@@ -423,6 +423,9 @@ def apply_em_boundary(
             g_em.mean().detach(),
         ))
 
+        # Age all active slots by P tokens before writing (write resets ages)
+        block.em.age_tick(config.P)
+
         block.em.write_at_boundary(
             sK, sV, sScore,
             g_em, tau_em, ww_em,

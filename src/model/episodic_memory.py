@@ -8,6 +8,7 @@ State per stream:
     em_K: [BS, M, D_em]   — keys (unit-normalized)
     em_V: [BS, M, D_em]   — values
     em_S: [BS, M]          — strengths (bounded)
+    em_age: [BS, M]        — tokens since last write (for temporal retrieval bias)
 """
 
 import math
@@ -21,7 +22,7 @@ from .utils import StateMixin, unit_normalize, budget_enforce, runtime_state_dty
 
 
 class EpisodicMemory(nn.Module, StateMixin):
-    _state_tensor_names = ["em_K", "em_V", "em_S"]
+    _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -53,6 +54,10 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Learned novelty weight adjuster (Phase B+, backprop only)
         self.W_nov = nn.Linear(D + D, 1) if config.em_enabled else None
 
+        # Temporal retrieval bias: learned scalar weight on log-age
+        # Initialized to 0 (no effect at start, purely content-based retrieval)
+        self.age_gate = nn.Parameter(torch.zeros(1))
+
         # Post-retrieval MLP: processes the aggregated retrieved memory
         if config.em_readout_ffn:
             self.readout_norm = nn.LayerNorm(config.D_em)
@@ -69,21 +74,34 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_K: Tensor = None
         self.em_V: Tensor = None
         self.em_S: Tensor = None
+        self.em_age: Tensor = None
 
     def reset_states(self, mask: Tensor):
-        """Reset EM state for masked streams — only zero strengths.
+        """Reset EM state for masked streams — zero strengths and ages.
 
         Unlike the default StateMixin.reset_states() which zeros all state
         tensors, EM preserves em_K and em_V on doc boundary resets. Only
-        em_S (slot strengths) is zeroed, effectively making old slots
-        invisible to retrieval while keeping their content available for
-        future overwrites.
+        em_S (slot strengths) and em_age are zeroed, effectively making old
+        slots invisible to retrieval while keeping their content available
+        for future overwrites.
         """
         if self.em_S is not None and self.em_S.dim() >= 1:
             expanded = mask
             for _ in range(self.em_S.dim() - 1):
                 expanded = expanded.unsqueeze(-1)
             self.em_S = self.em_S * (~expanded).to(self.em_S.dtype)
+            if self.em_age is not None:
+                self.em_age = self.em_age * (~expanded).to(self.em_age.dtype)
+
+    def age_tick(self, n_tokens: int = 1):
+        """Increment age of all slots by n_tokens.
+
+        Called once per span (n_tokens=P) or once per step (n_tokens=1).
+        Only ages active slots (em_S > 0) to avoid aging empty slots.
+        """
+        if self.em_age is not None and self.em_S is not None:
+            active = (self.em_S > 0).to(self.em_age.dtype)
+            self.em_age = self.em_age + n_tokens * active
 
     def _lazy_init(self, BS: int, device: torch.device):
         """Initialize state on first forward pass."""
@@ -95,6 +113,7 @@ class EpisodicMemory(nn.Module, StateMixin):
             torch.randn(BS, self.M, self.D_em, device=device, dtype=state_dtype) * 0.01
         )
         self.em_S = torch.zeros(BS, self.M, device=device, dtype=state_dtype)
+        self.em_age = torch.zeros(BS, self.M, device=device, dtype=state_dtype)
 
     def retrieve(self, x: Tensor, y_wm: Tensor) -> Tensor:
         """Query EM and return aggregated output.
@@ -118,6 +137,11 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Score against all slots
         scores = torch.einsum("bd, bmd -> bm", q, self.em_K)  # [BS, M]
+
+        # Temporal retrieval bias: learned preference for recent vs old memories
+        if self.em_age is not None:
+            age_bias = self.age_gate * torch.log1p(self.em_age.to(scores.dtype))
+            scores = scores + age_bias
 
         # Mask inactive slots (S == 0)
         active_mask = self.em_S > 0
@@ -176,6 +200,11 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Score against all slots: [BS, P, M]
         scores = torch.einsum("bpd, bmd -> bpm", q, self.em_K)
+
+        # Temporal retrieval bias: learned preference for recent vs old memories
+        if self.em_age is not None:
+            age_bias = self.age_gate * torch.log1p(self.em_age.to(scores.dtype))
+            scores = scores + age_bias.unsqueeze(1)  # [BS, 1, M] broadcast over P
 
         # Mask inactive slots
         active_mask = self.em_S > 0  # [BS, M]
@@ -441,6 +470,10 @@ class EpisodicMemory(nn.Module, StateMixin):
         )  # [BS, C]
         strength_contrib = (alpha * score_strength.unsqueeze(-1)).sum(dim=1)  # [BS, M]
         self.em_S = (self.em_S + strength_contrib).clamp(0.0, self.S_max)
+
+        # Update temporal ages: written slots reset proportional to write strength
+        if self.em_age is not None:
+            self.em_age = self.em_age * (1 - alpha_sum)
 
         # Always decay strengths each boundary (even if no writes happened).
         self.em_S = self.em_S * decay.unsqueeze(-1)  # [BS] -> [BS, 1] broadcast
