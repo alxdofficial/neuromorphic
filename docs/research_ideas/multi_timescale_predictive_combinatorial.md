@@ -76,7 +76,7 @@ Could implement as depthwise conv1d with different filter banks per block.
 
 ### How it addresses the plasticity gap
 
-Currently PM/EM operate at span boundaries (every P=64 tokens) while WM
+Currently PM/EM operate at span boundaries (every P=32 tokens) while WM
 operates at every token. This creates a mismatch: WM has fine-grained
 temporal resolution but PM/EM can only write coarse summaries.
 

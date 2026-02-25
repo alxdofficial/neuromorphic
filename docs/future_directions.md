@@ -128,7 +128,7 @@ This enables:
 
 ### Plasticity Boundaries for Scan-Friendliness
 
-v2 adds plasticity span boundaries (every P=64 tokens):
+v2 adds plasticity span boundaries (every P=32 tokens):
 
 * PM/EM are read-only within spans → core loop is scan-friendly
 * PM/EM writes happen only at span boundaries

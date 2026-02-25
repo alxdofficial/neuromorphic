@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-02-24
 **Hardware:** NVIDIA RTX 4090 (24GB VRAM), benchmarked with Tier A Wide
-**Model:** Tier A Wide (D=768, L=8, B=2, ~85M params), Phase B, BS=32, T=256, P=64
+**Model:** Tier A Wide (D=768, L=8, B=2, ~85M params), Phase B, BS=32, T=256, P=32
 
 ---
 
@@ -24,7 +24,7 @@
 | Mamba-130M (SSM) | 115M | ~52K | ~3.3h | 2.2x faster |
 | **Neuromorphic LM** | **85M** | **~24K** | **~17h** | **1x** |
 
-The neuromorphic model is slower than baselines due to its three memory systems (PM/EM/WM), sequential span processing (4 spans of P=64), and span-boundary operations (PM commits, EM writes). This is the cost of having persistent, adaptive memory — baselines are simpler feedforward or SSM architectures with no online learning.
+The neuromorphic model is slower than baselines due to its three memory systems (PM/EM/WM), sequential span processing (8 spans of P=32), and span-boundary operations (PM commits, EM writes). This is the cost of having persistent, adaptive memory — baselines are simpler feedforward or SSM architectures with no online learning.
 
 ---
 
@@ -136,7 +136,7 @@ Removed GPU-CPU synchronization barriers:
 
 ## Why We're Slower Than Baselines
 
-1. **Sequential span processing:** 4 spans of P=64 instead of one parallel pass over T=256
+1. **Sequential span processing:** 8 spans of P=32 instead of one parallel pass over T=256
 2. **Three memory systems:** PM eligibility, EM retrieval+write, WM recurrence add per-token overhead
 3. **Span boundary operations:** PM commits and EM writes between spans force serialization
 4. **Recurrent computation:** GLA and PM eligibility are inherently sequential within each span
@@ -152,16 +152,16 @@ Removed GPU-CPU synchronization barriers:
 | Gate reparameterization | `sigmoid(a_raw)` → `logsigmoid(a_raw)` for HGRN log-space gates |
 | Carry mask in log space | Doc boundary carry=0 → gate=-30 (exp(-30) ≈ 0) |
 
-**Result:** FLA kernels are numerically correct (HGRN max diff 0.023, GLA max diff 0.001 in bf16). However, **no throughput improvement at P=64 with torch.compile**:
+**Result:** FLA kernels are numerically correct (HGRN max diff 0.023, GLA max diff 0.001 in bf16). However, **no throughput improvement at P=32 with torch.compile**:
 
 - FLA functions have `@torch.compiler.disable`, causing graph breaks inside compiled regions
-- torch.compile already fuses the P=64 sequential loop into efficient kernels
+- torch.compile already fuses the P=32 sequential loop into efficient kernels
 - Net effect: ~23K tok/s with or without FLA when compile is active
 - Without compile: FLA gives ~7K tok/s vs ~8K without (slightly slower due to kernel launch overhead)
 
 **When FLA helps:** At larger P (128-256+), torch.compile's unrolled loop becomes less efficient while FLA's chunkwise parallel kernel maintains constant overhead. FLA may also help when their `@torch.compiler.disable` is relaxed in future versions.
 
-**Usage:** `--fla` flag enables FLA kernels (automatically skips torch.compile for affected modules). Default is off (torch.compile preferred at P=64).
+**Usage:** `--fla` flag enables FLA kernels (automatically skips torch.compile for affected modules). Default is off (torch.compile preferred at P=32).
 
 ---
 

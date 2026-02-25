@@ -11,7 +11,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 - **Working Memory (WM):** Gated Linear Attention (GLA) recurrence, 1 shared instance
 - **Procedural Memory (PM):** holographic modulation slots + Hebbian eligibility, B×L instances (each with `PMNeuromodulator`)
 - **Episodic Memory (EM):** per-stream vector store, B instances (each with `EMNeuromodulator`)
-- **Plasticity boundaries:** PM/EM writes every P=64 tokens (scan-friendly within spans)
+- **Plasticity boundaries:** PM/EM writes every P=32 tokens (scan-friendly within spans)
 
 ---
 
@@ -50,7 +50,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 | Weight decay | 0.01 (ndim>1 non-bias params only; biases and LayerNorm get 0.0) |
 | Batch size (BS) | 32 (Tier A) |
 | TBPTT chunk (T) | 256 tokens |
-| Plasticity span (P) | 64 tokens |
+| Plasticity span (P) | 32 tokens |
 | Gradient clipping | 1.0 (global norm) |
 | Precision | **bf16** |
 | Warmup | 1000 steps |
@@ -106,7 +106,7 @@ This plan covers datasets, configuration, and training phases for the current Ti
 - Use as supplementary stream: process full books sequentially to test memory persistence
 
 **Config:**
-- BS=16, TBPTT T=256, plasticity span P=64
+- BS=16, TBPTT T=256, plasticity span P=32
 - PM enabled: reads always, commits at span boundaries with continuous learned parameters
 - PM neuromod continuous heads (`p_commit`, `lambda`, `g`, `slot_logits`, `tau`) active and differentiable — trained via main optimizer
 - EM retrieval enabled: top k_ret latent memory tokens → cross-attention aggregation
@@ -342,7 +342,7 @@ ds = load_dataset("deepmind/pg19", split="train", streaming=True)
 | **Batch size** | Tier A: 32–64, Tier B: 16–32, Tier C: 8–16 |
 | **Gradient accumulation** | Use if effective BS needs to be larger |
 | **TBPTT** | Chunk T=256, detach all recurrent state (`h`, `elig_K`, `elig_V`, `pm_K`, `pm_V`) between chunks |
-| **Plasticity span** | P=64 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
+| **Plasticity span** | P=32 tokens; PM/EM writes at span boundaries enable scan-friendliness within spans |
 | **Compile** | `torch.compile(model)` for kernel fusion (RTX 4090 Ada Lovelace supports it well) |
 | **Data loading** | `num_workers=4`, `pin_memory=True`, streaming from disk/HF |
 | **Checkpointing** | Save every 1000 steps; checkpoint includes slow weights, optimizer, scheduler, runtime state (PM/EM via `save_runtime_state()`), and `last_prev_token` per stream (prevents false doc-boundary resets on resume). Phase transitions detected automatically; optimizer state may be skipped when parameter groups change |

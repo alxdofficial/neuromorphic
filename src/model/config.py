@@ -72,7 +72,7 @@ class ModelConfig:
 
     # Training
     T: int = 256              # TBPTT segment length
-    P: int = 64               # plasticity span
+    P: int = 32               # plasticity span
     use_compile: bool = False # torch.compile for CUDA training
     use_fla_kernels: bool = False  # use FLA Triton kernels for scan/GLA (incompatible with compile)
     gradient_checkpointing: bool = False  # recompute FFN activations to save VRAM

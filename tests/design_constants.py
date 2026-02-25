@@ -50,7 +50,7 @@ DEFAULTS = dict(
     em_readout_ffn=True,
     # Training
     T=256,
-    P=64,
+    P=32,
     use_compile=False,
     # Regularization
     dropout=0.1,

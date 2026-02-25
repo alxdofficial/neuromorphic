@@ -64,7 +64,7 @@ route_w = softmax(pm_K @ k_cand / tau)  # slot-specific routing
 elig_K = rho * elig_K + gate * route_w * k_cand
 ```
 
-**Commit (span boundary, every P=64 tokens):**
+**Commit (span boundary, every P=32 tokens):**
 Neuromodulator MLP produces (p_commit, lambda, g, slot_logits, tau). Continuous softmax slot selection + EMA update.
 
 ### Sacred Properties
@@ -187,7 +187,7 @@ All state tensors are per-stream: Layer.h, pm_K/pm_V/pm_a, elig_K/elig_V, em_K/e
 - Architecture dimensions (D, L, B, r, M, W, D_wm, D_em)
 - WM attention mechanism (softmax, linear attention, GLA, DeltaNet)
 - Scan implementation (sequential loop, parallel prefix, accelerated-scan)
-- Span length P (64, 128, 256)
+- Span length P (32, 64, 128)
 - Hyperparameters (decay rates, scaling factors, budgets, temperatures)
 - Optional components (readout FFNs, spatial decoder)
 - Training schedules, phase curriculum

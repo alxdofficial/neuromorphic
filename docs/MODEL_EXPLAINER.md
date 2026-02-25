@@ -347,7 +347,7 @@ The critical difference from pure Hebbian learning is the **third factor: the ne
 
 ### 7.4 PM Commit (span boundary only)
 
-Called every P=64 tokens. The commit process:
+Called every P=32 tokens. The commit process:
 
 1. **Base decay** (all streams): `pm_a *= decay_pm` (0.999). This prevents stale slots from persisting indefinitely.
 
@@ -523,7 +523,7 @@ novelty = clamp(w_nov * surprise + (1 - w_nov) * (1 - max_sim), 0, 1)
 
 `W_nov` lives on `EpisodicMemory` (not on `EMNeuromodulator`) and is part of the standard model parameter set on the **main optimizer**. It is trained purely via backprop (differentiable through candidate selection -> EM writes -> retrieval -> loss). When EM is disabled (`em_enabled=False`), the hardcoded 0.5/0.5 weighting is preserved.
 
-Candidates are **buffered for the entire span** (P=64 tokens), producing:
+Candidates are **buffered for the entire span** (P=32 tokens), producing:
 - `cand_K: [BS, P, D_em]`
 - `cand_V: [BS, P, D_em]`
 - `cand_score: [BS, P]`
@@ -767,7 +767,7 @@ x_up = pooler.upsample(x, P)
 
 ## 10. Neuromodulators
 
-Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=64 tokens. Each neuromodulator is an `nn.Module` that operates in one of two modes depending on whether its memory system is enabled: heuristic (zero params) or learned (backbone + heads, trained via main loss backprop).
+Neuromodulators decide **when** and **how strongly** to write to memory. They operate at span boundaries only -- once every P=32 tokens. Each neuromodulator is an `nn.Module` that operates in one of two modes depending on whether its memory system is enabled: heuristic (zero params) or learned (backbone + heads, trained via main loss backprop).
 
 ### 10.1 PMNeuromodulator
 
@@ -1046,7 +1046,7 @@ load_runtime_state(model, state)  # Restore saved state
 | Scale | Length | What happens |
 |-------|--------|--------------|
 | **TBPTT chunk** | T=256 tokens | Autograd truncation. One backward pass per chunk. States detached after. |
-| **Plasticity span** | P=64 tokens | PM/EM are read-only within. Commits and writes happen at span boundaries. |
+| **Plasticity span** | P=32 tokens | PM/EM are read-only within. Commits and writes happen at span boundaries. |
 
 A chunk contains T/P = 4 spans. Each span boundary triggers PM base decay + commits + EM writes.
 
@@ -1315,7 +1315,7 @@ This section provides throughput estimates, training budgets, and hardware recom
 Our model uses **affine recurrence** (not attention) as the core sequence mechanism, plus memory reads/writes at span boundaries. This means:
 
 - **No quadratic attention cost:** Compute scales linearly with sequence length (within spans)
-- **Parallelizable within spans:** `forward_span` uses a parallel scan over P=64 tokens
+- **Parallelizable within spans:** `forward_span` uses a parallel scan over P=32 tokens
 - **torch.compile support:** Block-level compilation (`Block.forward_span` + `PM._update_eligibility_core`) fuses entire block forward passes and scan loops into optimized CUDA kernels (~2.1× speedup over function-level compile)
 - **Boundary overhead:** PM commit + EM write + neuromodulator forward at every span boundary
 
@@ -1333,7 +1333,7 @@ Neuromodulators add negligible parameter overhead. The cost difference across ph
 
 ### 21.3 Measured Throughput by Phase (Single GPU)
 
-Throughput depends on batch size, span length (P=64), which phases are active, and whether `--compile` is enabled. These numbers are from benchmarks on RTX 4090 (24GB).
+Throughput depends on batch size, span length (P=32), which phases are active, and whether `--compile` is enabled. These numbers are from benchmarks on RTX 4090 (24GB).
 
 **Tier A Wide (~85M) on RTX 4090 (24GB), BS=32, `--compile`:**
 
