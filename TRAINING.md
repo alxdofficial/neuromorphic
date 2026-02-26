@@ -29,8 +29,8 @@ tmux attach -t neuromorphic-train
 
 | Tier | Transformer | SSM | Recurrent |
 |------|-------------|-----|-----------|
-| **A** | pythia-160m | mamba-130m | rwkv7-168m |
-| **B** | pythia-410m | mamba-370m | rwkv7-421m |
+| **A** | gpt2-small, pythia-160m | mamba-130m | rwkv7-168m |
+| **B** | gpt2-medium, pythia-410m | mamba-370m | rwkv7-421m |
 | **C** | pythia-1b, tinyllama-1.1b | mamba-1.4b | rwkv7-1.5b |
 
 Select tier with `--tier a` / `--tier b` / `--tier c`.

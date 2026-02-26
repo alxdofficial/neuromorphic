@@ -6,12 +6,14 @@ Trains baseline architectures from random initialization on FineWeb-Edu (60%)
 model for an apples-to-apples comparison.
 
 Tier A (~100M):
-    python train_baseline.py --model pythia-160m   # Transformer baseline
+    python train_baseline.py --model gpt2-small    # Transformer baseline (GPT-2)
+    python train_baseline.py --model pythia-160m   # Transformer baseline (GPT-NeoX)
     python train_baseline.py --model mamba-130m    # SSM baseline
     python train_baseline.py --model rwkv7-168m    # Recurrent baseline
 
 Tier B (~400M):
-    python train_baseline.py --model pythia-410m   # Transformer baseline
+    python train_baseline.py --model gpt2-medium   # Transformer baseline (GPT-2)
+    python train_baseline.py --model pythia-410m   # Transformer baseline (GPT-NeoX)
     python train_baseline.py --model mamba-370m    # SSM baseline
     python train_baseline.py --model rwkv7-421m    # Recurrent baseline
 
@@ -63,10 +65,12 @@ GRAD_ACCUM = 1
 # Tier B/C models need smaller BS due to VRAM; adjust if using A100.
 MODEL_OPTIMAL_BS = {
     # Tier A (~100M)
+    "gpt2-small": 96,
     "pythia-160m": 96,
     "mamba-130m": 64,
     "rwkv7-169m": 64,
     # Tier B (~400M)
+    "gpt2-medium": 32,
     "pythia-410m": 32,
     "mamba-370m": 32,
     "rwkv7-421m": 32,
@@ -108,6 +112,20 @@ MODEL_CONFIGS = {
     # =================================================================
     # Tier A (~100M params)
     # =================================================================
+    "gpt2-small": {
+        "model_type": "gpt2",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "n_embd": 768,
+            "n_layer": 12,
+            "n_head": 12,
+            "n_positions": 2048,
+            "activation_function": "gelu_new",
+            "resid_pdrop": 0.1,
+            "embd_pdrop": 0.1,
+            "attn_pdrop": 0.1,
+        },
+    },
     "pythia-160m": {
         "model_type": "gpt_neox",
         "config_kwargs": {
@@ -159,6 +177,20 @@ MODEL_CONFIGS = {
     # =================================================================
     # Tier B (~400M params)
     # =================================================================
+    "gpt2-medium": {
+        "model_type": "gpt2",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "n_embd": 1024,
+            "n_layer": 24,
+            "n_head": 16,
+            "n_positions": 2048,
+            "activation_function": "gelu_new",
+            "resid_pdrop": 0.1,
+            "embd_pdrop": 0.1,
+            "attn_pdrop": 0.1,
+        },
+    },
     "mamba-370m": {
         "model_type": "mamba",
         "config_kwargs": {
@@ -456,7 +488,11 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
     cfg_spec = MODEL_CONFIGS[model_name]
     model_type = cfg_spec["model_type"]
 
-    if model_type == "gpt_neox":
+    if model_type == "gpt2":
+        from transformers import GPT2Config, GPT2LMHeadModel
+        config = GPT2Config(**cfg_spec["config_kwargs"])
+        model = GPT2LMHeadModel(config)
+    elif model_type == "gpt_neox":
         from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
         config = GPTNeoXConfig(**cfg_spec["config_kwargs"])
         model = GPTNeoXForCausalLM(config)
@@ -491,7 +527,7 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
 
     # torch.compile for transformer architectures
     # (Mamba's selective scan and RWKV's custom kernels don't compile cleanly)
-    if model_type in ("gpt_neox", "llama"):
+    if model_type in ("gpt2", "gpt_neox", "llama"):
         print("  Compiling with torch.compile...")
         model = torch.compile(model)
 
