@@ -75,9 +75,8 @@ DEFAULTS = dict(
 # Phase toggles: phase -> expected flags after set_phase()
 # ---------------------------------------------------------------------------
 PHASE_TOGGLES = {
-    "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=False, lifelong_mode=False),
-    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=False),
-    "C": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
+    "A": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=False),
+    "B": dict(wm_enabled=True, pm_enabled=True, em_enabled=True, lifelong_mode=True),
 }
 
 # ---------------------------------------------------------------------------

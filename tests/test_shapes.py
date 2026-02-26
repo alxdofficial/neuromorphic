@@ -47,7 +47,7 @@ def _run_one_collect(model, BS=2):
 # Model output shapes
 # ============================================================================
 
-@pytest.mark.parametrize("phase", ["A", "B", "C"])
+@pytest.mark.parametrize("phase", ["A", "B"])
 class TestModelOutputShapes:
     def test_logits_shape(self, phase):
         model, cfg = _make_model(phase)

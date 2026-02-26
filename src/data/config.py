@@ -53,6 +53,49 @@ TINYSTORIES = DatasetConfig(
 )
 
 # =============================================================================
+# The Pile (primary training data — matches Pythia/Mamba/RWKV baselines)
+# =============================================================================
+
+THE_PILE = DatasetConfig(
+    name="The Pile (deduplicated)",
+    hf_path="EleutherAI/the_pile_deduplicated",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=True,
+    download_first=False,
+    estimated_tokens=300_000_000_000,  # ~300B tokens (full dataset)
+    estimated_disk_gb=800.0,
+    description="Diverse English text corpus. Same data as Pythia, Mamba, RWKV-7 baselines. "
+                "Use scripts/prepare_data.py to download a local subset.",
+)
+
+_PILE_DATA_DIR = "data/pile"
+
+PILE_LOCAL = DatasetConfig(
+    name="The Pile (local)",
+    hf_path=f"{_PILE_DATA_DIR}/pile_train.parquet",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=False,
+    download_first=False,
+    description="Local pre-downloaded subset of The Pile. "
+                "Run scripts/prepare_data.py first.",
+)
+
+PILE_VAL_LOCAL = DatasetConfig(
+    name="The Pile validation (local)",
+    hf_path=f"{_PILE_DATA_DIR}/pile_val.parquet",
+    hf_name=None,
+    split="train",
+    text_column="text",
+    streaming=False,
+    download_first=False,
+    description="Local held-out Pile validation set.",
+)
+
+# =============================================================================
 # Phase B-C: Main Training (Modern SLM Datasets)
 # =============================================================================
 
@@ -274,10 +317,15 @@ OPENHERMES = DatasetConfig(
 # =============================================================================
 
 DATASET_CONFIGS = {
-    # Phase A: Sanity check
+    # The Pile (primary training data)
+    "pile": THE_PILE,
+    "pile-local": PILE_LOCAL,
+    "val-pile-local": PILE_VAL_LOCAL,
+
+    # Sanity check
     "tinystories": TINYSTORIES,
 
-    # Phase B-C: Main training (modern SLM datasets)
+    # Legacy: FineWeb-Edu + DCLM (modern SLM datasets)
     "fineweb-edu": FINEWEB_EDU,
     "dclm": DCLM,
     "cosmopedia": COSMOPEDIA,
@@ -325,16 +373,22 @@ class PhaseConfig:
 
 PHASE_CONFIGS = {
     "A": PhaseConfig(
-        name="Phase A: Sanity Check",
-        datasets=["tinystories"],
-        description="Verify backbone + WM learns language. PM/EM disabled.",
+        name="Phase A: The Pile (Local)",
+        datasets=["pile-local"],
+        description="All memory systems active (WM+PM+EM+PCM). Trains on local Pile subset. "
+                    "Run scripts/prepare_data.py first.",
     ),
     "B": PhaseConfig(
-        name="Phase B: Base Language (Local)",
+        name="Phase B: Lifelong Learning (Local Pile)",
+        datasets=["pile-local"],
+        description="Phase A + lifelong mode (PM/EM persist across doc boundaries). "
+                    "Same data as Phase A.",
+    ),
+    "B-legacy": PhaseConfig(
+        name="Phase B Legacy: FineWeb-Edu + DCLM (Local)",
         datasets=["fineweb-edu-local", "dclm-local"],
         mix_weights=[0.6, 0.4],
-        description="Educational + conversational web text from local parquet files. "
-                    "Run scripts/prepare_data.py first.",
+        description="Educational + conversational web text from local parquet files.",
     ),
     "B-streaming": PhaseConfig(
         name="Phase B: Base Language (Streaming)",

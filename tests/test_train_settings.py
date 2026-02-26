@@ -50,14 +50,14 @@ def _args(**overrides):
 
 
 def test_resolve_data_phase_accepts_custom_mixed_case_keys():
-    assert train._resolve_data_phase("C", "B-diverse") == "B-diverse"
-    assert train._resolve_data_phase("C", "b-diverse") == "B-diverse"
-    assert train._resolve_data_phase("C", "longctx") == "longctx"
+    assert train._resolve_data_phase("A", "B-diverse") == "B-diverse"
+    assert train._resolve_data_phase("A", "b-diverse") == "B-diverse"
+    assert train._resolve_data_phase("A", "longctx") == "longctx"
 
 
 def test_resolve_data_phase_unknown_raises():
     with pytest.raises(ValueError, match="Unknown data phase"):
-        train._resolve_data_phase("C", "nope-not-a-phase")
+        train._resolve_data_phase("A", "nope-not-a-phase")
 
 
 def test_resolve_settings_reads_data_phase_from_preset(tmp_path):

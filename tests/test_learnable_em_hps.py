@@ -41,9 +41,9 @@ class TestConfigTauWwFields:
 
 class TestEMNeuromodulatorTauWw:
     def test_heuristic_returns_defaults(self):
-        """Phase A: tau/ww/decay are fixed defaults from config."""
+        """EM disabled: tau/ww/decay are fixed defaults from config."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.em_enabled = False
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert len(result) == 4
@@ -71,19 +71,19 @@ class TestEMNeuromodulatorTauWw:
         assert (ww >= cfg.ww_em_floor - 1e-6).all()
         assert (ww <= cfg.ww_em_ceil + 1e-6).all()
 
-    def test_learned_tau_in_range_phase_c(self):
-        """Phase C: learned tau is within [floor, ceil]."""
+    def test_learned_tau_in_range_phase_b(self):
+        """Phase B: learned tau is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         g_em, tau, ww, decay = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (tau >= cfg.tau_em_floor - 1e-6).all()
         assert (tau <= cfg.tau_em_ceil + 1e-6).all()
 
-    def test_learned_ww_in_range_phase_c(self):
-        """Phase C: learned ww is within [floor, ceil]."""
+    def test_learned_ww_in_range_phase_b(self):
+        """Phase B: learned ww is within [floor, ceil]."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         g_em, tau, ww, decay = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         assert (ww >= cfg.ww_em_floor - 1e-6).all()
@@ -97,10 +97,10 @@ class TestEMNeuromodulatorTauWw:
         assert hasattr(nm, "tau_head")
         assert hasattr(nm, "ww_head")
 
-    def test_no_heads_in_phase_a(self):
-        """Phase A: no tau/ww heads."""
+    def test_no_heads_when_em_disabled(self):
+        """EM disabled: no tau/ww heads."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.em_enabled = False
         nm = EMNeuromodulator(cfg)
         assert not hasattr(nm, "tau_head")
         assert not hasattr(nm, "ww_head")
@@ -315,10 +315,10 @@ class TestEMNeuromodulatorDecay:
         nm = EMNeuromodulator(cfg)
         assert hasattr(nm, "decay_head")
 
-    def test_no_decay_head_in_phase_a(self):
-        """Phase A: no decay_head."""
+    def test_no_decay_head_when_em_disabled(self):
+        """EM disabled: no decay_head."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.em_enabled = False
         nm = EMNeuromodulator(cfg)
         assert not hasattr(nm, "decay_head")
 

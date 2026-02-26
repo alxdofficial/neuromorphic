@@ -36,7 +36,7 @@ def _get_loss(model, n_tokens=8, with_commits=False, with_em_writes=False):
 
 class TestPhaseGradients:
     def test_all_params_get_grad_phase_a(self):
-        """Phase A: PM/EM disabled. Active modules get grad, inactive get zero/None."""
+        """Phase A: All systems active. Core modules get grad after forward pass."""
         cfg = make_tiny_config()
         cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
@@ -46,19 +46,17 @@ class TestPhaseGradients:
 
         # Active modules should get gradients
         active_no_grad = []
-        inactive_with_grad = []
 
         for name, param in model.named_parameters():
+            # PCM predictor/decoder params may not get grad before warmup
+            is_pcm_aux = ".pcm.predictor" in name or ".pcm.decoder" in name
+            # PM/EM write params need commits/writes to get grad
             is_pm = "pm" in name and "neuromodulator" not in name
             is_em = "em" in name and "neuromodulator" not in name
             is_neuromod = "neuromodulator" in name
-            is_inactive = is_pm or is_em or is_neuromod
+            is_deferred = is_pm or is_em or is_neuromod or is_pcm_aux
 
-            if is_inactive:
-                # PM/EM/neuromod params should have zero or None grad in Phase A
-                if param.grad is not None and param.grad.abs().max() > 1e-10:
-                    inactive_with_grad.append(name)
-            else:
+            if not is_deferred:
                 # Active params should have non-None grad
                 if param.grad is None:
                     active_no_grad.append(name)
@@ -88,8 +86,8 @@ class TestPhaseGradients:
         assert not pm_params_without_grad, \
             f"PM params without grad after commit: {pm_params_without_grad}"
 
-    def test_all_params_get_grad_phase_c(self):
-        """Phase C: After EM write, all EM params get gradients."""
+    def test_all_params_get_grad_phase_b(self):
+        """Phase B: After EM write, all EM params get gradients."""
         cfg = make_tiny_config()
         cfg.set_phase("B")
         model = NeuromorphicLM(cfg)

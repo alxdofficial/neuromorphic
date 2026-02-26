@@ -71,7 +71,7 @@ class TestDetach:
 
 class TestReset:
     def test_reset_zeros_masked_streams_only(self):
-        model, cfg = _init_model("B")
+        model, cfg = _init_model("A")
         forward_n_tokens(model, cfg.P, with_commits=True)
 
         mask = torch.tensor([True, False])
@@ -86,7 +86,7 @@ class TestReset:
                 assert (pm.pm_a[0] == 0).all(), "masked stream pm_a should be zero"
 
     def test_reset_preserves_unmasked_streams(self):
-        model, cfg = _init_model("B")
+        model, cfg = _init_model("A")
         forward_n_tokens(model, cfg.P, with_commits=True)
 
         # Snapshot unmasked stream
@@ -269,7 +269,7 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_pm_state(self):
         """In lifelong_mode: pm_K/pm_V/pm_a survive reset."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")  # lifelong_mode=True
+        cfg.set_phase("B")  # lifelong_mode=True
         model = NeuromorphicLM(cfg)
         forward_n_tokens(model, cfg.P, with_commits=True)
 
@@ -303,7 +303,7 @@ class TestLifelongMode:
     def test_lifelong_reset_preserves_em_state(self):
         """In lifelong_mode: EM state completely survives (EM reset never called)."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         model = NeuromorphicLM(cfg)
         forward_and_write_em(model, cfg.P)
 
@@ -333,7 +333,7 @@ class TestLifelongMode:
 class TestNormalReset:
     def test_normal_reset_zeros_pm_state(self):
         """lifelong_mode=False: pm_K/pm_V/pm_a zeroed for masked streams."""
-        model, cfg = _init_model("B")
+        model, cfg = _init_model("A")
         forward_n_tokens(model, cfg.P, with_commits=True)
 
         mask = torch.tensor([True, False])
@@ -349,7 +349,7 @@ class TestNormalReset:
 
     def test_normal_reset_zeros_em_strengths(self):
         """lifelong_mode=False: em_S zeroed for masked. em_K/em_V preserved."""
-        model, cfg = _init_model("B")
+        model, cfg = _init_model("A")
         forward_and_write_em(model, cfg.P)
 
         for block in model.blocks:

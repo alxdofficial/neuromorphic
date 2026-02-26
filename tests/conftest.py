@@ -36,6 +36,8 @@ TINY_DEFAULTS = dict(
     content_proj_dim=4,
     # FFN
     ffn_expansion=2,  # d_ff = D_h * 2 = 32
+    # PCM off by default in tests (dedicated PCM tests enable it explicitly)
+    pcm_enabled=False,
 )
 
 

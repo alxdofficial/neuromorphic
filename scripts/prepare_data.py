@@ -2,17 +2,20 @@
 """
 Download and save training data locally as parquet files.
 
-Streams from HuggingFace, counts tokens with TinyLlama tokenizer, and stops
-once the target token count is reached.  All models (neuromorphic + baselines)
-then train from these identical local files — no more HTTP streaming crashes
-and guaranteed data parity.
+Streams from The Pile (deduplicated) on HuggingFace, counts tokens with
+the GPT-NeoX tokenizer, and stops once the target token count is reached.
+All models (neuromorphic + baselines) then train from these identical local
+files — no more HTTP streaming crashes and guaranteed data parity.
+
+Using The Pile ensures fair comparison with published baselines (Pythia, Mamba,
+RWKV-7) which were all trained on the same corpus.
 
 Usage:
-    # Download 2B tokens for Phase B (default)
+    # Download 2B tokens (default)
     python scripts/prepare_data.py
 
     # Custom token budget
-    python scripts/prepare_data.py --tokens 3B
+    python scripts/prepare_data.py --tokens 10B
 
     # Validation only (fast)
     python scripts/prepare_data.py --val-only
@@ -36,21 +39,16 @@ import pyarrow.parquet as pq
 # Constants
 # ---------------------------------------------------------------------------
 
+# Use TinyLlama tokenizer (our model's tokenizer) for token counting
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-# Phase B datasets
-FINEWEB_EDU_PATH = "HuggingFaceFW/fineweb-edu"
-FINEWEB_EDU_NAME = "sample-10BT"
-DCLM_PATH = "mlfoundations/dclm-baseline-1.0"
-
-# Mix weights (same as Phase B)
-FINEWEB_WEIGHT = 0.6
-DCLM_WEIGHT = 0.4
+# The Pile (deduplicated) — same data as Pythia/Mamba/RWKV baselines
+PILE_PATH = "EleutherAI/the_pile_deduplicated"
 
 # Output directory
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "phase_B"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "pile"
 
-# Validation set
+# Validation: use The Pile's val split (separate from train)
 VAL_TOKEN_TARGET = 5_000_000  # 5M tokens for validation
 VAL_SEED = 1337
 
@@ -72,11 +70,11 @@ def parse_token_count(s: str) -> int:
 
 def stream_and_save(
     hf_path: str,
-    hf_name: str | None,
     target_tokens: int,
     out_path: Path,
     tokenizer,
     seed: int = 42,
+    split: str = "train",
     text_column: str = "text",
     label: str = "",
 ) -> dict:
@@ -86,11 +84,12 @@ def stream_and_save(
     """
     print(f"\n{'='*60}")
     print(f"Downloading {label or hf_path}")
+    print(f"  Split: {split}")
     print(f"  Target: {target_tokens:,} tokens")
     print(f"  Output: {out_path}")
     print(f"{'='*60}")
 
-    ds = load_dataset(hf_path, hf_name, split="train", streaming=True)
+    ds = load_dataset(hf_path, split=split, streaming=True)
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
 
     texts = []
@@ -111,10 +110,11 @@ def stream_and_save(
         if (i + 1) % PROGRESS_INTERVAL == 0:
             elapsed = time.time() - t0
             rate = total_tokens / elapsed if elapsed > 0 else 0
+            pct = total_tokens / target_tokens * 100
             print(
                 f"  [{i+1:>9,} examples] "
                 f"{total_tokens:>13,} tokens  "
-                f"({total_tokens/1e9:.2f}B)  "
+                f"({total_tokens/1e9:.2f}B / {target_tokens/1e9:.1f}B = {pct:.1f}%)  "
                 f"{rate/1e6:.1f}M tok/s  "
                 f"skipped={skipped}"
             )
@@ -140,19 +140,19 @@ def stream_and_save(
         "file_size_bytes": file_size,
         "elapsed_s": round(elapsed, 1),
         "seed": seed,
+        "split": split,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download training data locally as parquet files"
+        description="Download The Pile training data locally as parquet files"
     )
     parser.add_argument(
         "--tokens",
         type=str,
         default="2B",
-        help="Total token budget (e.g. '2B', '500M'). Split 60/40 between "
-             "FineWeb-Edu and DCLM. Default: 2B",
+        help="Training token budget (e.g. '2B', '10B', '500M'). Default: 2B",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Shuffle seed (default: 42)"
@@ -180,14 +180,9 @@ def main():
     val_tokens = parse_token_count(args.val_tokens)
     out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR
 
-    fineweb_tokens = int(total_tokens * FINEWEB_WEIGHT)
-    dclm_tokens = int(total_tokens * DCLM_WEIGHT)
-
-    print(f"Data preparation for Phase B training")
-    print(f"  Total budget: {total_tokens:,} tokens ({total_tokens/1e9:.1f}B)")
-    print(f"  FineWeb-Edu:  {fineweb_tokens:,} tokens (60%)")
-    print(f"  DCLM:         {dclm_tokens:,} tokens (40%)")
-    print(f"  Validation:   {val_tokens:,} tokens")
+    print(f"Data preparation: The Pile (deduplicated)")
+    print(f"  Train budget: {total_tokens:,} tokens ({total_tokens/1e9:.1f}B)")
+    print(f"  Val budget:   {val_tokens:,} tokens")
     print(f"  Output dir:   {out_dir}")
     print(f"  Train seed:   {args.seed}")
     print(f"  Val seed:     {VAL_SEED}")
@@ -199,26 +194,26 @@ def main():
 
     manifest = {
         "created": datetime.now().isoformat(),
+        "source": "EleutherAI/the_pile_deduplicated",
         "tokenizer": TOKENIZER_NAME,
         "vocab_size": len(tokenizer),
         "total_token_budget": total_tokens,
-        "mix_weights": {"fineweb_edu": FINEWEB_WEIGHT, "dclm": DCLM_WEIGHT},
         "datasets": {},
     }
 
     t_start = time.time()
 
-    # --- Validation set (from FineWeb-Edu, different seed) ---
+    # --- Validation set (from Pile validation split, different seed) ---
     val_meta = stream_and_save(
-        hf_path=FINEWEB_EDU_PATH,
-        hf_name=FINEWEB_EDU_NAME,
+        hf_path=PILE_PATH,
         target_tokens=val_tokens,
-        out_path=out_dir / "val_fineweb_edu.parquet",
+        out_path=out_dir / "pile_val.parquet",
         tokenizer=tokenizer,
         seed=VAL_SEED,
-        label="FineWeb-Edu (validation, seed=1337)",
+        split="validation",
+        label="The Pile (validation, seed=1337)",
     )
-    manifest["datasets"]["val_fineweb_edu"] = val_meta
+    manifest["datasets"]["pile_val"] = val_meta
 
     if args.val_only:
         manifest["total_elapsed_s"] = round(time.time() - t_start, 1)
@@ -226,39 +221,23 @@ def main():
         print("\nValidation-only mode — done.")
         return
 
-    # --- FineWeb-Edu (train) ---
-    fineweb_meta = stream_and_save(
-        hf_path=FINEWEB_EDU_PATH,
-        hf_name=FINEWEB_EDU_NAME,
-        target_tokens=fineweb_tokens,
-        out_path=out_dir / "fineweb_edu.parquet",
+    # --- Training set ---
+    train_meta = stream_and_save(
+        hf_path=PILE_PATH,
+        target_tokens=total_tokens,
+        out_path=out_dir / "pile_train.parquet",
         tokenizer=tokenizer,
         seed=args.seed,
-        label="FineWeb-Edu (train)",
+        split="train",
+        label="The Pile (train)",
     )
-    manifest["datasets"]["fineweb_edu"] = fineweb_meta
-
-    # --- DCLM (train) ---
-    dclm_meta = stream_and_save(
-        hf_path=DCLM_PATH,
-        hf_name=None,
-        target_tokens=dclm_tokens,
-        out_path=out_dir / "dclm.parquet",
-        tokenizer=tokenizer,
-        seed=args.seed,
-        label="DCLM (train)",
-    )
-    manifest["datasets"]["dclm"] = dclm_meta
+    manifest["datasets"]["pile_train"] = train_meta
 
     manifest["total_elapsed_s"] = round(time.time() - t_start, 1)
     _save_manifest(out_dir, manifest)
 
     # --- Summary ---
-    total_saved = sum(
-        d["tokens"]
-        for k, d in manifest["datasets"].items()
-        if not k.startswith("val_")
-    )
+    total_saved = train_meta["tokens"]
     total_size = sum(d["file_size_bytes"] for d in manifest["datasets"].values())
     print(f"\n{'='*60}")
     print(f"COMPLETE")

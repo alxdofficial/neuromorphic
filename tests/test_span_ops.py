@@ -265,7 +265,7 @@ class TestStackEmCandidates:
 class TestApplyMidSpanResets:
     def test_clears_pm_content_on_mid_span_reset(self):
         """PM committed content (pm_a) should be zeroed for streams with mid-span resets."""
-        model, cfg = _tiny_model("B")
+        model, cfg = _tiny_model("A")
         # Populate PM state by running tokens + committing
         reset = torch.zeros(BS, dtype=torch.bool)
         for _ in range(cfg.P):
@@ -292,7 +292,7 @@ class TestApplyMidSpanResets:
 
     def test_clears_em_strengths_on_mid_span_reset(self):
         """EM strengths (em_S) should be zeroed for streams with mid-span resets."""
-        model, cfg = _tiny_model("B")
+        model, cfg = _tiny_model("A")
         # Initialize EM state
         reset = torch.zeros(BS, dtype=torch.bool)
         x = torch.randint(0, VOCAB, (BS,))
@@ -315,7 +315,7 @@ class TestApplyMidSpanResets:
 
     def test_preserves_eligibility(self):
         """Eligibility traces should NOT be cleared by mid-span reset."""
-        model, cfg = _tiny_model("B")
+        model, cfg = _tiny_model("A")
         # Forward a span — eligibility is now updated inline in forward_span
         span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
         reset_first = torch.zeros(BS, dtype=torch.bool)
@@ -335,7 +335,7 @@ class TestApplyMidSpanResets:
 
     def test_noop_for_first_position_reset(self):
         """Reset at position 0 only should not trigger mid-span reset."""
-        model, cfg = _tiny_model("B")
+        model, cfg = _tiny_model("A")
         reset = torch.zeros(BS, dtype=torch.bool)
         x = torch.randint(0, VOCAB, (BS,))
         model.forward_one_token(x, reset)
@@ -378,7 +378,7 @@ class TestApplyMidSpanResets:
 
     def test_noop_when_no_mid_span_resets(self):
         """No reset at positions 1..P-1 means no PM/EM clearing."""
-        model, cfg = _tiny_model("B")
+        model, cfg = _tiny_model("A")
         reset = torch.zeros(BS, dtype=torch.bool)
         x = torch.randint(0, VOCAB, (BS,))
         model.forward_one_token(x, reset)

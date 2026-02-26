@@ -66,7 +66,7 @@ class TestDefaults:
 # ============================================================================
 
 class TestPhaseToggles:
-    @pytest.mark.parametrize("phase", ["A", "B", "C"])
+    @pytest.mark.parametrize("phase", ["A", "B"])
     def test_phase_toggles(self, phase):
         cfg = ModelConfig()
         cfg.set_phase(phase)
@@ -75,15 +75,15 @@ class TestPhaseToggles:
             assert getattr(cfg, key) == val, \
                 f"Phase {phase}: {key} = {getattr(cfg, key)}, expected {val}"
 
-    def test_phase_c_enables_lifelong(self):
+    def test_phase_b_enables_lifelong(self):
         cfg = ModelConfig()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         assert cfg.lifelong_mode is True
 
-    def test_non_c_disables_lifelong(self):
+    def test_phase_a_disables_lifelong(self):
         cfg = ModelConfig()
-        cfg.set_phase("C")
         cfg.set_phase("B")
+        cfg.set_phase("A")
         assert cfg.lifelong_mode is False
 
     def test_invalid_phase_raises(self):
@@ -91,11 +91,11 @@ class TestPhaseToggles:
         with pytest.raises(ValueError, match="Unknown phase"):
             cfg.set_phase("X")
 
-    def test_phase_d_raises(self):
-        """Phase D was renamed to C — set_phase('D') must raise ValueError."""
+    def test_phase_c_raises(self):
+        """Phase C was removed — set_phase('C') must raise ValueError."""
         cfg = ModelConfig()
         with pytest.raises(ValueError, match="Unknown phase"):
-            cfg.set_phase("D")
+            cfg.set_phase("C")
 
 
 # ============================================================================

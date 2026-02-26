@@ -77,10 +77,10 @@ class ModelConfig:
     use_fla_kernels: bool = False  # use FLA Triton kernels for scan/GLA (incompatible with compile)
     gradient_checkpointing: bool = False  # recompute FFN activations to save VRAM
     reset_on_doc_boundary: bool = True
-    lifelong_mode: bool = False  # Phase C: PM/EM persist across doc boundaries
+    lifelong_mode: bool = False  # Phase B: PM/EM persist across doc boundaries
 
     # Predictive Coding Module (per block)
-    pcm_enabled: bool = False          # master toggle
+    pcm_enabled: bool = True           # master toggle
     D_pc: int = 128                    # PCM latent dimension
     pcm_pred_weight: float = 0.01      # prediction loss weight
     pcm_recon_weight: float = 0.01     # reconstruction loss weight
@@ -97,8 +97,8 @@ class ModelConfig:
 
     # Phase toggles
     wm_enabled: bool = True   # always on
-    pm_enabled: bool = True   # always on (Phase A+)
-    em_enabled: bool = False  # Phase B+
+    pm_enabled: bool = True   # always on
+    em_enabled: bool = True   # always on
 
     @property
     def D_h(self) -> int:
@@ -156,9 +156,8 @@ class ModelConfig:
     def set_phase(self, phase: str):
         """Set component toggles for training phase.
 
-        A: WM + PM (base — PM is always on)
-        B: WM + PM + EM
-        C: WM + PM + EM + lifelong (PM/EM persist across doc boundaries)
+        A: WM + PM + EM + PCM (all memory systems active)
+        B: A + lifelong mode (PM/EM persist across doc boundaries)
 
         All downstream code branches on capability flags (pm_enabled,
         em_enabled) — never on phase letters. This method is the single
@@ -171,20 +170,17 @@ class ModelConfig:
         if phase == "A":
             self.wm_enabled = True
             self.pm_enabled = True
-            self.em_enabled = False
+            self.em_enabled = True
         elif phase == "B":
             self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
-        elif phase == "C":
-            self.wm_enabled = True
-            self.pm_enabled = True
-            self.em_enabled = True
+            self.lifelong_mode = True
         else:
-            raise ValueError(f"Unknown phase: {phase}. Expected A/B/C.")
+            raise ValueError(f"Unknown phase: {phase}. Expected A/B.")
 
-        # Phase C: enable lifelong mode
-        self.lifelong_mode = (phase == "C")
+        if phase != "B":
+            self.lifelong_mode = False
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":

@@ -1,9 +1,10 @@
 """
 Train baseline models from scratch on the same data as the neuromorphic LM.
 
-Trains baseline architectures from random initialization on FineWeb-Edu (60%)
-+ DCLM (40%), using the same TinyLlama tokenizer and token budget as our
-model for an apples-to-apples comparison.
+Trains baseline architectures from random initialization on The Pile
+(deduplicated), using the same TinyLlama tokenizer and token budget as our
+model for an apples-to-apples comparison. The Pile is the same data used by
+published Pythia, Mamba, and RWKV-7 baselines.
 
 Tier A (~100M):
     python train_baseline.py --model gpt2-small    # Transformer baseline (GPT-2)
@@ -44,7 +45,7 @@ import time
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast
-from datasets import load_dataset, interleave_datasets
+from datasets import load_dataset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -81,14 +82,13 @@ MODEL_OPTIMAL_BS = {
     "rwkv7-1.5b": 8,
 }
 
-# Datasets (same as our Phase B) — local pre-downloaded parquet files
+# Dataset — The Pile (local pre-downloaded parquet files)
 # Run `python scripts/prepare_data.py` first to create these.
+# Using The Pile matches Pythia/Mamba/RWKV published baselines.
 _ROOT = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.normpath(os.path.join(_ROOT, "..", "..", "..", "data", "phase_B"))
-FINEWEB_EDU_LOCAL = os.path.join(_DATA_DIR, "fineweb_edu.parquet")
-DCLM_LOCAL = os.path.join(_DATA_DIR, "dclm.parquet")
-VAL_LOCAL = os.path.join(_DATA_DIR, "val_fineweb_edu.parquet")
-MIX_WEIGHTS = [0.6, 0.4]  # FineWeb-Edu 60%, DCLM 40%
+_DATA_DIR = os.path.normpath(os.path.join(_ROOT, "..", "..", "..", "data", "pile"))
+TRAIN_LOCAL = os.path.join(_DATA_DIR, "pile_train.parquet")
+VAL_LOCAL = os.path.join(_DATA_DIR, "pile_val.parquet")
 
 # Optimizer (standard transformer training)
 LR = 6e-4
@@ -329,29 +329,17 @@ class LocalTokenDataset:
         self._token_buffer = []
 
     def _build_dataset(self):
-        """Load and interleave local parquet datasets."""
-        for path in (FINEWEB_EDU_LOCAL, DCLM_LOCAL):
-            if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"Local data not found: {path}\n"
-                    f"Run: python scripts/prepare_data.py"
-                )
+        """Load local Pile parquet dataset."""
+        if not os.path.exists(TRAIN_LOCAL):
+            raise FileNotFoundError(
+                f"Local data not found: {TRAIN_LOCAL}\n"
+                f"Run: python scripts/prepare_data.py"
+            )
 
-        print(f"Loading FineWeb-Edu (local): {FINEWEB_EDU_LOCAL}")
-        ds_fineweb = load_dataset(
-            "parquet", data_files=FINEWEB_EDU_LOCAL, split="train",
-        )
-        print(f"Loading DCLM (local): {DCLM_LOCAL}")
-        ds_dclm = load_dataset(
-            "parquet", data_files=DCLM_LOCAL, split="train",
-        )
-
-        self.dataset = interleave_datasets(
-            [ds_fineweb, ds_dclm],
-            probabilities=MIX_WEIGHTS,
-            seed=self._seed,
-            stopping_strategy="all_exhausted",
-        )
+        print(f"Loading The Pile (local): {TRAIN_LOCAL}")
+        self.dataset = load_dataset(
+            "parquet", data_files=TRAIN_LOCAL, split="train",
+        ).shuffle(seed=self._seed)
         self._iter = iter(self.dataset)
 
     def _fill_buffer(self, min_tokens: int):

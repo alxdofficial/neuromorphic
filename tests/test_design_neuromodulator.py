@@ -71,10 +71,10 @@ class TestNeuromodulatorModes:
         assert decay.shape == (BS,)
         assert (g_em >= cfg.g_em_floor - 1e-6).all()
 
-    def test_em_continuous_in_phase_c(self):
-        """Phase C: EM neuromodulator uses learned continuous g_em (lifelong)."""
+    def test_em_continuous_in_phase_b(self):
+        """Phase B: EM neuromodulator uses learned continuous g_em (lifelong)."""
         cfg = make_tiny_config()
-        cfg.set_phase("C")
+        cfg.set_phase("B")
         nm = EMNeuromodulator(cfg)
         result = nm.forward(torch.randn(BS), torch.randn(BS), torch.randn(BS))
         g_em, tau, ww, decay = result

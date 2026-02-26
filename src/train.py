@@ -3,11 +3,10 @@ Entry point for neuromorphic LM training.
 
 Usage:
     python -m src.train                              # file defaults (backward compat)
-    python -m src.train --phases A,B,C --tier a        # auto-transition full run
-    python -m src.train --phase C --resume ckpt.pt   # single phase with resume
-    python -m src.train --phase A --steps 5000        # override step count
-    python -m src.train --phases A,B --no-plots       # skip plot generation
-    python -m src.train --config configs/train_presets.yaml --preset phase_a_to_c
+    python -m src.train --phases A,B --tier a        # auto-transition full run
+    python -m src.train --phase A --steps 5000       # single phase
+    python -m src.train --phase B --resume ckpt.pt   # lifelong phase with resume
+    python -m src.train --phases A,B --no-plots      # skip plot generation
 
 All configuration constants below serve as defaults when no CLI args are given.
 CLI args override the corresponding constant.
@@ -41,14 +40,12 @@ TIER = "a"          # ~85M params, D=768, L=8, B=2
 # TIER = "c"        # ~107M params, strong
 
 # -- Training phase --
-PHASE = "A"         # WM + PM (base)
-# PHASE = "B"       # WM + PM + EM
-# PHASE = "C"       # WM + PM + EM + lifelong
+PHASE = "A"         # WM + PM + EM + PCM (all systems)
+# PHASE = "B"       # A + lifelong (PM/EM persist across docs)
 
 # -- Data phase (which datasets to use) --
-DATA_PHASE = None   # None => auto: all phases use B (FineWeb-Edu + DCLM)
-# DATA_PHASE = "A"  # TinyStories
-# DATA_PHASE = "B"  # FineWeb-Edu + DCLM
+DATA_PHASE = None   # None => auto: uses The Pile (local)
+# DATA_PHASE = "B"  # FineWeb-Edu + DCLM (legacy)
 
 # -- Tokenizer --
 TOKENIZER = "tinyllama"
@@ -127,9 +124,9 @@ def parse_args() -> argparse.Namespace:
     )
     group = p.add_mutually_exclusive_group()
     group.add_argument("--phases", type=str, default=None,
-                       help="Comma-separated auto-transition sequence (e.g. A,B,C)")
+                       help="Comma-separated auto-transition sequence (e.g. A,B)")
     group.add_argument("--phase", type=str, default=None,
-                       help="Single phase to run (A, B, or C)")
+                       help="Single phase to run (A or B)")
     p.add_argument("--tier", type=str, default=None,
                    choices=["a", "a_wide", "b", "1b", "c"],
                    help="Model size tier (a_wide/1b are deprecated aliases)")
@@ -264,8 +261,8 @@ def _normalize_phase_plan(raw: Any) -> list[dict[str, Any]] | None:
     plan = [_normalize_phase_entry(e) for e in raw]
     for item in plan:
         p = item["phase"]
-        if p not in ("A", "B", "C"):
-            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B/C.")
+        if p not in ("A", "B"):
+            raise ValueError(f"Unknown phase '{p}' in config phases. Expected A/B.")
     return plan
 
 
@@ -556,9 +553,9 @@ def _resolve_data_phase(train_phase: str, requested: str | None) -> str:
         raise ValueError(
             f"Unknown data phase '{requested}'. Available: {list(PHASE_CONFIGS.keys())}"
         )
-    # All phases use the same dataset so loss changes at phase transitions
-    # reflect only model capability changes, not distribution shift.
-    return "B"
+    # All phases use the same dataset (The Pile) so loss changes at phase
+    # transitions reflect only model capability changes, not distribution shift.
+    return "A"
 
 
 def _resolve_max_steps(

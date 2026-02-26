@@ -99,17 +99,17 @@ class TestEMGemClamping:
 
 class TestEMNeuromodulator:
     def test_heuristic_mode_no_params(self):
-        """Phase A: no learnable params (em_enabled=False)."""
+        """em_enabled=False: no learnable params."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
+        cfg.em_enabled = False
         neuromod = EMNeuromodulator(cfg)
         param_count = sum(1 for _ in neuromod.parameters())
         assert param_count == 0
 
     def test_continuous_mode_has_backbone(self):
-        """Phase B: backbone + g_head."""
+        """Phase A: EM enabled, backbone + g_head present."""
         cfg = make_tiny_config()
-        cfg.set_phase("B")
+        cfg.set_phase("A")
         neuromod = EMNeuromodulator(cfg)
         assert hasattr(neuromod, "backbone")
         assert hasattr(neuromod, "g_head")
