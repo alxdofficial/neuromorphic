@@ -10,15 +10,16 @@ update this file. If not, the code has a regression.
 TIER_A = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6, pm_readout_ffn=False)
 TIER_A_WIDE = TIER_A  # deprecated alias
 TIER_B = dict(
-    D=768, L=12, B=6,
-    r=16, W=512, D_wm=192, n_heads_wm=6,
+    D=2048, L=10, B=4,
+    pm_readout_ffn=False,
+    r=16, D_wm=256, n_heads_wm=8,
     M=512, D_em=192, k_ret=8, C_em=16,
-    d_dec=384, n_heads_decoder=6,
+    d_dec=384, n_heads_decoder=8,
 )
 TIER_C = dict(
-    D=1024, L=24, B=8,
-    r=32, W=1024, D_wm=256, n_heads_wm=8,
-    M=1024, D_em=256, k_ret=16, C_em=32,
+    D=2048, L=16, B=2,
+    r=16, D_wm=384, n_heads_wm=8,
+    M=512, D_em=256, k_ret=8, C_em=16,
     d_dec=512, n_heads_decoder=8, decoder_layers=3,
 )
 

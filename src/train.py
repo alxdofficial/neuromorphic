@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
                        help="Single phase to run (A, B, or C)")
     p.add_argument("--tier", type=str, default=None,
                    choices=["a", "a_wide", "b", "1b", "c"],
-                   help="Model size tier (a_wide is deprecated alias for a)")
+                   help="Model size tier (a_wide/1b are deprecated aliases)")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")
     p.add_argument("--steps", type=int, default=None,

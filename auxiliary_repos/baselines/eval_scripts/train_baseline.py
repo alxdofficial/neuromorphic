@@ -1,13 +1,22 @@
 """
 Train baseline models from scratch on the same data as the neuromorphic LM.
 
-This trains Pythia-160M and Mamba-130M architectures from random initialization
-on FineWeb-Edu (60%) + DCLM (40%), using the same TinyLlama tokenizer and
-token budget as our model for an apples-to-apples comparison.
+Trains baseline architectures from random initialization on FineWeb-Edu (60%)
++ DCLM (40%), using the same TinyLlama tokenizer and token budget as our
+model for an apples-to-apples comparison.
 
-Usage:
-    python train_baseline.py --model pythia-160m   # BS=96, ~61K steps, 1.5B tokens
-    python train_baseline.py --model mamba-130m    # BS=64, ~91K steps, 1.5B tokens
+Tier A (~100M):
+    python train_baseline.py --model pythia-160m   # Transformer baseline
+    python train_baseline.py --model mamba-130m    # SSM baseline
+    python train_baseline.py --model rwkv7-169m    # Recurrent baseline
+
+Tier B (~400M):
+    python train_baseline.py --model pythia-410m   # Transformer baseline
+    python train_baseline.py --model rwkv7-421m    # Recurrent baseline
+
+Tier C (~1B):
+    python train_baseline.py --model pythia-1b     # Transformer baseline
+    python train_baseline.py --model tinyllama-1b  # Transformer baseline (overtrained)
 
     # Quick test run
     python train_baseline.py --model pythia-160m --steps 100 --bs 8
@@ -48,9 +57,18 @@ TOKEN_BUDGET = 1_500_000_000  # 1.5B tokens (matches neuromorphic training)
 GRAD_ACCUM = 1
 
 # Per-model optimal batch sizes (RTX 4090 24GB, bf16)
+# Tier B/C models need smaller BS due to VRAM; adjust if using A100.
 MODEL_OPTIMAL_BS = {
+    # Tier A (~100M)
     "pythia-160m": 96,
     "mamba-130m": 64,
+    "rwkv7-169m": 64,
+    # Tier B (~400M)
+    "pythia-410m": 32,
+    "rwkv7-421m": 32,
+    # Tier C (~1B)
+    "pythia-1b": 8,
+    "tinyllama-1b": 8,
 }
 
 # Datasets (same as our Phase B) — local pre-downloaded parquet files
@@ -81,15 +99,17 @@ SAVE_INTERVAL = 2000
 # ============================================================================
 
 MODEL_CONFIGS = {
+    # =================================================================
+    # Tier A (~100M params)
+    # =================================================================
     "pythia-160m": {
         "model_type": "gpt_neox",
-        "config_class": "GPTNeoXConfig",
         "config_kwargs": {
-            "vocab_size": 32000,  # TinyLlama tokenizer
+            "vocab_size": 32000,
             "hidden_size": 768,
             "num_hidden_layers": 12,
             "num_attention_heads": 12,
-            "intermediate_size": 3072,  # 4x hidden
+            "intermediate_size": 3072,
             "max_position_embeddings": 2048,
             "rotary_pct": 0.25,
             "use_parallel_residual": True,
@@ -98,9 +118,8 @@ MODEL_CONFIGS = {
     },
     "mamba-130m": {
         "model_type": "mamba",
-        "config_class": "MambaConfig",
         "config_kwargs": {
-            "vocab_size": 32000,  # TinyLlama tokenizer
+            "vocab_size": 32000,
             "hidden_size": 768,
             "num_hidden_layers": 24,
             "state_size": 16,
@@ -108,6 +127,97 @@ MODEL_CONFIGS = {
             "conv_kernel": 4,
             "use_bias": False,
             "use_conv_bias": True,
+        },
+    },
+    "rwkv7-168m": {
+        "model_type": "rwkv7",
+        "hf_repo": "RWKV/RWKV7-Goose-Pile-168M-HF",  # for auto_map
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "intermediate_size": 3072,
+            "head_dim": 64,
+            "hidden_act": "sqrelu",
+            "hidden_ratio": 4.0,
+            "a_low_rank_dim": 64,
+            "decay_low_rank_dim": 64,
+            "gate_low_rank_dim": 128,
+            "v_low_rank_dim": 32,
+            "norm_first": True,
+            "norm_bias": True,
+            "norm_eps": 1e-5,
+            "tie_word_embeddings": False,
+        },
+    },
+    # =================================================================
+    # Tier B (~400M params)
+    # =================================================================
+    "pythia-410m": {
+        "model_type": "gpt_neox",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "intermediate_size": 4096,
+            "max_position_embeddings": 2048,
+            "rotary_pct": 0.25,
+            "use_parallel_residual": True,
+            "layer_norm_eps": 1e-5,
+        },
+    },
+    "rwkv7-421m": {
+        "model_type": "rwkv7",
+        "hf_repo": "RWKV/RWKV7-Goose-Pile-421M-HF",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "intermediate_size": 4096,
+            "head_dim": 64,
+            "hidden_act": "sqrelu",
+            "hidden_ratio": 4.0,
+            "a_low_rank_dim": 64,
+            "decay_low_rank_dim": 64,
+            "gate_low_rank_dim": 128,
+            "v_low_rank_dim": 64,
+            "norm_first": True,
+            "norm_bias": True,
+            "norm_eps": 1e-5,
+            "tie_word_embeddings": False,
+        },
+    },
+    # =================================================================
+    # Tier C (~1B params)
+    # =================================================================
+    "pythia-1b": {
+        "model_type": "gpt_neox",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 8,
+            "intermediate_size": 8192,
+            "max_position_embeddings": 2048,
+            "rotary_pct": 0.25,
+            "use_parallel_residual": True,
+            "layer_norm_eps": 1e-5,
+        },
+    },
+    "tinyllama-1b": {
+        "model_type": "llama",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "intermediate_size": 5632,
+            "max_position_embeddings": 2048,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": False,
         },
     },
 }
@@ -291,17 +401,33 @@ class MetricsLogger:
 def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
     """Create a model from scratch (random init)."""
     cfg_spec = MODEL_CONFIGS[model_name]
+    model_type = cfg_spec["model_type"]
 
-    if cfg_spec["model_type"] == "gpt_neox":
+    if model_type == "gpt_neox":
         from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
         config = GPTNeoXConfig(**cfg_spec["config_kwargs"])
         model = GPTNeoXForCausalLM(config)
-    elif cfg_spec["model_type"] == "mamba":
+    elif model_type == "mamba":
         from transformers import MambaConfig, MambaForCausalLM
         config = MambaConfig(**cfg_spec["config_kwargs"])
         model = MambaForCausalLM(config)
+    elif model_type == "llama":
+        from transformers import LlamaConfig, LlamaForCausalLM
+        config = LlamaConfig(**cfg_spec["config_kwargs"])
+        model = LlamaForCausalLM(config)
+    elif model_type == "rwkv7":
+        # RWKV-7 uses custom code from the HF repo (flash-linear-attention)
+        hf_repo = cfg_spec["hf_repo"]
+        config = AutoConfig.from_pretrained(
+            hf_repo, trust_remote_code=True,
+        )
+        # Override vocab_size for our tokenizer
+        config.vocab_size = cfg_spec["config_kwargs"]["vocab_size"]
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True,
+        )
     else:
-        raise ValueError(f"Unknown model type: {cfg_spec['model_type']}")
+        raise ValueError(f"Unknown model type: {model_type}")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {model_name}")
@@ -310,8 +436,9 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
 
     model = model.to(device)
 
-    # torch.compile for GPTNeoX (Mamba's selective scan doesn't compile cleanly)
-    if cfg_spec["model_type"] == "gpt_neox":
+    # torch.compile for transformer architectures
+    # (Mamba's selective scan and RWKV's custom kernels don't compile cleanly)
+    if model_type in ("gpt_neox", "llama"):
         print("  Compiling with torch.compile...")
         model = torch.compile(model)
 

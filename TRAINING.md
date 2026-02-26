@@ -21,14 +21,19 @@ tmux attach -t neuromorphic-train
 
 | Tier | Params | D | L | B | D_h | Target GPU | Recommended BS |
 |------|--------|---|---|---|-----|------------|---------------|
-| **A** | 85.1M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
-| **B** | 78.1M | 768 | 12 | 6 | 128 | RTX 4090 | 16-32 |
-| **1B** | 1,070M | 2048 | 16 | 2 | 1024 | A100 80GB | 8 |
-| **C** | 164.0M | 1024 | 24 | 8 | 128 | RTX 4090 | 8-16 |
+| **A** | ~87M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
+| **B** | ~408M | 2048 | 10 | 4 | 512 | RTX 4090 / A100 | 8-16 |
+| **C** | ~1B | 2048 | 16 | 2 | 1024 | A100 80GB | 8 |
 
-**Scaling pattern:** D_h = D/B. Increasing model size → increase D (and optionally B). Keep D_h >= 384 for expressive layers. At 1B+, scale D proportionally with B (e.g. B=4 needs D=4096 to maintain D_h=1024).
+**Baselines per tier:**
 
-Select tier with `--tier a` / `--tier 1b` / etc.
+| Tier | Transformer | SSM | Recurrent |
+|------|-------------|-----|-----------|
+| **A** | pythia-160m | mamba-130m | rwkv7-168m |
+| **B** | pythia-410m | — | rwkv7-421m |
+| **C** | pythia-1b, tinyllama-1.1b | — | — |
+
+Select tier with `--tier a` / `--tier b` / `--tier c`.
 
 ## Key Settings
 

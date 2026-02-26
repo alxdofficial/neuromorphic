@@ -201,30 +201,32 @@ class ModelConfig:
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Competitive tier. D=768, L=12, B=6. Scaled memory."""
+        """Research tier (~408M params). D=2048, L=10, B=4, D_h=512."""
         defaults = dict(
-            D=768, L=12, B=6,
+            D=2048, L=10, B=4,
+            pm_readout_ffn=False,
             # Scaled memory capacities
-            r=16, W=512, D_wm=192, n_heads_wm=6,
+            r=16, D_wm=256, n_heads_wm=8,
             M=512, D_em=192, k_ret=8, C_em=16,
             # Scaled decoder
-            d_dec=384, n_heads_decoder=6,
+            d_dec=384, n_heads_decoder=8,
         )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
-    def tier_1b(cls, **overrides) -> "ModelConfig":
-        """1B-class tier (~1.07B params). D=2048, L=16, B=2, D_h=1024.
+    def tier_c(cls, **overrides) -> "ModelConfig":
+        """1B-class tier (~1B params). D=2048, L=16, B=2, D_h=1024.
 
         Designed for cloud GPU training (A100 80GB). Matches Pythia-1B's
         width (D=2048) and depth (16 layers) for direct comparison.
-        Estimated ~21 GB VRAM for training with BS=8, T=256.
+        B and L will scale up once tier_b is validated.
         """
         defaults = dict(
             D=2048, L=16, B=2,
+            pm_readout_ffn=False,
             # Scaled memory capacities
-            r=16, D_wm=384, n_heads_wm=8, gate_low_rank=32,
+            r=16, D_wm=384, n_heads_wm=8,
             M=512, D_em=256, k_ret=8, C_em=16,
             # Scaled decoder
             d_dec=512, n_heads_decoder=8, decoder_layers=3,
@@ -233,15 +235,6 @@ class ModelConfig:
         return cls(**defaults)
 
     @classmethod
-    def tier_c(cls, **overrides) -> "ModelConfig":
-        """Strong tier. D=1024, L=24, B=8. Scaled memory."""
-        defaults = dict(
-            D=1024, L=24, B=8,
-            # Scaled memory capacities
-            r=32, W=1024, D_wm=256, n_heads_wm=8,
-            M=1024, D_em=256, k_ret=16, C_em=32,
-            # Scaled decoder
-            d_dec=512, n_heads_decoder=8, decoder_layers=3,
-        )
-        defaults.update(overrides)
-        return cls(**defaults)
+    def tier_1b(cls, **overrides) -> "ModelConfig":
+        """Deprecated alias for tier_c."""
+        return cls.tier_c(**overrides)
