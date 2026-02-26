@@ -381,8 +381,8 @@ class WorkingMemory(nn.Module, StateMixin):
         # --- Differentiable cache update (write all P tokens at once) ---
         # P <= W is guaranteed by config validation, so write_pos is unique per stream.
         scatter_idx = write_pos.unsqueeze(-1).expand(-1, -1, self.D_wm)  # [BS, P, D_wm]
-        self.wm_K = self.wm_K.scatter(1, scatter_idx, k_all)
-        self.wm_V = self.wm_V.scatter(1, scatter_idx, v_all)
+        self.wm_K = self.wm_K.scatter(1, scatter_idx, k_all.to(self.wm_K.dtype))
+        self.wm_V = self.wm_V.scatter(1, scatter_idx, v_all.to(self.wm_V.dtype))
 
         # --- Update wm_valid and advance wm_ptr ---
         new_valid = self.wm_valid.clone()
