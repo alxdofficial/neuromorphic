@@ -68,7 +68,7 @@ MODEL_OPTIMAL_BS = {
     "gpt2-small": 96,
     "pythia-160m": 96,
     "mamba-130m": 64,
-    "rwkv7-169m": 64,
+    "rwkv7-168m": 16,
     # Tier B (~400M)
     "gpt2-medium": 32,
     "pythia-410m": 32,
@@ -510,8 +510,14 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
         config = AutoConfig.from_pretrained(
             hf_repo, trust_remote_code=True,
         )
-        # Override vocab_size for our tokenizer
+        # Override vocab_size for our tokenizer and fix dtype
+        # (HF config ships dtype=float64 which crashes FLA Triton kernels)
         config.vocab_size = cfg_spec["config_kwargs"]["vocab_size"]
+        config.dtype = "bfloat16"
+        # Disable FLA's fused cross-entropy (l2warp) — has dtype bugs with autocast
+        config.fuse_cross_entropy = False
+        config.fuse_linear_cross_entropy = False
+        config.use_l2warp = False
         model = AutoModelForCausalLM.from_config(
             config, trust_remote_code=True,
         )

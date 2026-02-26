@@ -51,11 +51,13 @@ Select tier with `--tier a` / `--tier b` / `--tier c`.
 
 ### Baseline Comparison (1.5B tokens, RTX 4090)
 
-| Model | Params | tok/s | 1.5B train time |
-|-------|--------|-------|-----------------|
-| Pythia-160M | 134M | ~116K | ~2.7h |
-| Mamba-130M | 115M | ~52K | ~3.3h |
-| **Neuromorphic A Wide** | **85M** | **~24K** | **~17h** |
+| Model | Params | BS | tok/s | 1.5B train time |
+|-------|--------|----|-------|-----------------|
+| GPT-2 Small | 111M | 96 | ~135K | ~3.1h |
+| Pythia-160M | 134M | 96 | ~116K | ~2.7h |
+| RWKV-7 168M | 140M | 16 | ~63K | ~6.6h |
+| Mamba-130M | 115M | 64 | ~52K | ~3.3h |
+| **Neuromorphic A** | **87M** | **32** | **~24K** | **~17h** |
 
 The neuromorphic model is slower due to three memory systems (PM/EM/WM), sequential span processing, and span-boundary operations. This is the cost of persistent adaptive memory.
 
