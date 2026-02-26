@@ -17,7 +17,8 @@ TIER_B = dict(
     d_dec=384, n_heads_decoder=8,
 )
 TIER_C = dict(
-    D=2048, L=16, B=2,
+    D=3840, L=14, B=6,
+    pm_readout_ffn=False,
     r=16, D_wm=384, n_heads_wm=8,
     M=512, D_em=256, k_ret=8, C_em=16,
     d_dec=512, n_heads_decoder=8, decoder_layers=3,
