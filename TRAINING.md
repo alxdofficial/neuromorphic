@@ -23,15 +23,15 @@ tmux attach -t neuromorphic-train
 |------|--------|---|---|---|-----|------------|---------------|
 | **A** | ~87M | 768 | 8 | 2 | 384 | RTX 4090 | 32 |
 | **B** | ~408M | 2048 | 10 | 4 | 512 | RTX 4090 / A100 | 8-16 |
-| **C** | ~970M | 3840 | 14 | 6 | 640 | A100 80GB | 8 |
+| **C** | ~980M | 4096 | 16 | 8 | 512 | A100 80GB | 8 |
 
 **Baselines per tier:**
 
 | Tier | Transformer | SSM | Recurrent |
 |------|-------------|-----|-----------|
 | **A** | pythia-160m | mamba-130m | rwkv7-168m |
-| **B** | pythia-410m | — | rwkv7-421m |
-| **C** | pythia-1b, tinyllama-1.1b | — | — |
+| **B** | pythia-410m | mamba-370m | rwkv7-421m |
+| **C** | pythia-1b, tinyllama-1.1b | mamba-1.4b | rwkv7-1.5b |
 
 Select tier with `--tier a` / `--tier b` / `--tier c`.
 

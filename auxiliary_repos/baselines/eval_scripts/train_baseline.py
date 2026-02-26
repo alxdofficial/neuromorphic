@@ -8,15 +8,18 @@ model for an apples-to-apples comparison.
 Tier A (~100M):
     python train_baseline.py --model pythia-160m   # Transformer baseline
     python train_baseline.py --model mamba-130m    # SSM baseline
-    python train_baseline.py --model rwkv7-169m    # Recurrent baseline
+    python train_baseline.py --model rwkv7-168m    # Recurrent baseline
 
 Tier B (~400M):
     python train_baseline.py --model pythia-410m   # Transformer baseline
+    python train_baseline.py --model mamba-370m    # SSM baseline
     python train_baseline.py --model rwkv7-421m    # Recurrent baseline
 
 Tier C (~1B):
     python train_baseline.py --model pythia-1b     # Transformer baseline
-    python train_baseline.py --model tinyllama-1b  # Transformer baseline (overtrained)
+    python train_baseline.py --model tinyllama-1b  # Transformer baseline (LLaMA arch)
+    python train_baseline.py --model mamba-1.4b    # SSM baseline
+    python train_baseline.py --model rwkv7-1.5b    # Recurrent baseline
 
     # Quick test run
     python train_baseline.py --model pythia-160m --steps 100 --bs 8
@@ -65,10 +68,13 @@ MODEL_OPTIMAL_BS = {
     "rwkv7-169m": 64,
     # Tier B (~400M)
     "pythia-410m": 32,
+    "mamba-370m": 32,
     "rwkv7-421m": 32,
     # Tier C (~1B)
     "pythia-1b": 8,
     "tinyllama-1b": 8,
+    "mamba-1.4b": 8,
+    "rwkv7-1.5b": 8,
 }
 
 # Datasets (same as our Phase B) — local pre-downloaded parquet files
@@ -153,6 +159,19 @@ MODEL_CONFIGS = {
     # =================================================================
     # Tier B (~400M params)
     # =================================================================
+    "mamba-370m": {
+        "model_type": "mamba",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 1024,
+            "num_hidden_layers": 48,
+            "state_size": 16,
+            "expand": 2,
+            "conv_kernel": 4,
+            "use_bias": False,
+            "use_conv_bias": True,
+        },
+    },
     "pythia-410m": {
         "model_type": "gpt_neox",
         "config_kwargs": {
@@ -217,6 +236,40 @@ MODEL_CONFIGS = {
             "max_position_embeddings": 2048,
             "hidden_act": "silu",
             "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": False,
+        },
+    },
+    "mamba-1.4b": {
+        "model_type": "mamba",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "num_hidden_layers": 48,
+            "state_size": 16,
+            "expand": 2,
+            "conv_kernel": 4,
+            "use_bias": False,
+            "use_conv_bias": True,
+        },
+    },
+    "rwkv7-1.5b": {
+        "model_type": "rwkv7",
+        "hf_repo": "RWKV/RWKV7-Goose-Pile-1.47B-HF",
+        "config_kwargs": {
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "intermediate_size": 8192,
+            "head_dim": 64,
+            "hidden_act": "sqrelu",
+            "hidden_ratio": 4.0,
+            "a_low_rank_dim": 64,
+            "decay_low_rank_dim": 64,
+            "gate_low_rank_dim": 128,
+            "v_low_rank_dim": 64,
+            "norm_first": True,
+            "norm_bias": True,
+            "norm_eps": 1e-5,
             "tie_word_embeddings": False,
         },
     },

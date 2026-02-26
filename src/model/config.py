@@ -216,13 +216,13 @@ class ModelConfig:
 
     @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
-        """1B-class tier (~970M params). D=3840, L=14, B=6, D_h=640.
+        """1B-class tier (~980M params). D=4096, L=16, B=8, D_h=512.
 
-        Designed for cloud GPU training (A100 80GB). Matches Pythia-1B
-        scale with B=6 parallel blocks for memory system diversity.
+        Designed for cloud GPU training (A100 80GB). B=8 parallel blocks
+        maximizes memory system diversity at the 1B scale.
         """
         defaults = dict(
-            D=3840, L=14, B=6,
+            D=4096, L=16, B=8,
             pm_readout_ffn=False,
             # Scaled memory capacities
             r=16, D_wm=384, n_heads_wm=8,
