@@ -64,42 +64,51 @@ class TestDetach:
 class TestReset:
     def test_reset_zeros_masked_pm(self):
         model, cfg = _init_model("A")
+        B = cfg.B_blocks
+        BSB = BS * B
 
         # Give PM some content
-        pm = model.blocks[0].pm
-        pm.pm_K = torch.randn(BS, cfg.r, cfg.D_mem)
-        pm.pm_a = torch.ones(BS, cfg.r)
+        pm = model.pm
+        pm.pm_K = torch.randn(BSB, cfg.r, cfg.D_mem)
+        pm.pm_a = torch.ones(BSB, cfg.r)
 
+        # Mask: reset stream 0 (all its B copies), keep stream 1
         mask = torch.tensor([True, False])
-        pm.reset_content(mask)
+        model._reset_memory(mask)
 
-        assert (pm.pm_K[0] == 0).all(), "masked stream pm_K should be zero"
-        assert (pm.pm_a[0] == 0).all(), "masked stream pm_a should be zero"
-        assert pm.pm_K[1].abs().sum() > 0, "unmasked stream should be preserved"
+        # Stream 0's B copies should be zeroed (indices 0..B-1)
+        assert (pm.pm_K[:B] == 0).all(), "masked stream pm_K should be zero"
+        assert (pm.pm_a[:B] == 0).all(), "masked stream pm_a should be zero"
+        # Stream 1's copies should be preserved (indices B..2B-1)
+        assert pm.pm_K[B:].abs().sum() > 0, "unmasked stream should be preserved"
 
 
 class TestEMReset:
     def test_em_reset_only_zeros_strengths(self):
         """EM reset: em_S zeroed for masked. em_K/em_V UNCHANGED."""
         model, cfg = _init_model("A")
+        B = cfg.B_blocks
+        BSB = BS * B
 
-        em = model.blocks[0].em
-        em.em_K = torch.randn(BS, cfg.M, cfg.D_mem)
-        em.em_V = torch.randn(BS, cfg.M, cfg.D_mem)
-        em.em_S = torch.ones(BS, cfg.M)
-        em.em_age = torch.ones(BS, cfg.M) * 50
+        em = model.em
+        em.em_K = torch.randn(BSB, cfg.M, cfg.D_mem)
+        em.em_V = torch.randn(BSB, cfg.M, cfg.D_mem)
+        em.em_S = torch.ones(BSB, cfg.M)
+        em.em_age = torch.ones(BSB, cfg.M) * 50
 
         em_K_before = em.em_K.clone()
         em_V_before = em.em_V.clone()
 
         mask = torch.tensor([True, False])
-        em.reset_states(mask)
+        model._reset_memory(mask)
 
         assert torch.equal(em.em_K, em_K_before), "em_K should be unchanged"
         assert torch.equal(em.em_V, em_V_before), "em_V should be unchanged"
-        assert (em.em_S[0] == 0).all(), "em_S should be zeroed for masked"
-        assert (em.em_age[0] == 0).all(), "em_age should be zeroed for masked"
-        assert (em.em_S[1] > 0).all(), "em_S should be preserved for unmasked"
+        # Stream 0's B copies should be zeroed
+        assert (em.em_S[:B] == 0).all(), "em_S should be zeroed for masked"
+        assert (em.em_age[:B] == 0).all(), "em_age should be zeroed for masked"
+        # Stream 1's copies preserved
+        assert (em.em_S[B:] > 0).all(), "em_S should be preserved for unmasked"
 
 
 class TestSaveLoad:
@@ -137,13 +146,13 @@ class TestSaveLoad:
         model2.initialize_states(BS, torch.device("cpu"))
 
         # Snapshot PM state before load
-        pm_K_before = model2.blocks[0].pm.pm_K.clone()
+        pm_K_before = model2.pm.pm_K.clone()
 
         load_runtime_state(model2, state)
 
         # r=8 state should be unchanged (mismatched shapes skipped)
-        assert model2.blocks[0].pm.pm_K.shape[1] == 8
-        assert torch.equal(model2.blocks[0].pm.pm_K, pm_K_before)
+        assert model2.pm.pm_K.shape[1] == 8
+        assert torch.equal(model2.pm.pm_K, pm_K_before)
 
     def test_save_uses_stable_path_keys(self):
         model, cfg = _init_model("A")
@@ -158,11 +167,11 @@ class TestWalkModelTree:
         model, cfg = _init_model("A")
         mixins = list(_walk_state_mixins(model))
 
-        # Should find PM and EM for each block
+        # Single PM and single EM (batched across B_blocks)
         pm_count = sum(1 for _, m in mixins if type(m).__name__ == "ProceduralMemory")
         em_count = sum(1 for _, m in mixins if type(m).__name__ == "EpisodicMemory")
-        assert pm_count == cfg.B_blocks
-        assert em_count == cfg.B_blocks
+        assert pm_count == 1
+        assert em_count == 1
 
     def test_detach_all_walks_model_tree(self):
         model, _ = _init_model("A")

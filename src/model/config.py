@@ -25,7 +25,7 @@ class ModelConfig:
     vocab_size: int = 32000   # set from tokenizer at runtime
     eot_id: int = 2           # set from tokenizer at runtime
 
-    # Procedural Memory (per block, B_blocks instances)
+    # Procedural Memory (single instance, batched as BS*B)
     r: int = 8                # PM slots
     rho: float = 0.95         # eligibility decay
     a_max: float = 3.0        # max strength per slot
@@ -39,7 +39,7 @@ class ModelConfig:
     surprise_scale: float = 5.0
     g_pm_default: float = 0.5
 
-    # Episodic Memory (per block, B_blocks instances)
+    # Episodic Memory (single instance, batched as BS*B)
     M: int = 64               # EM capacity per bank
     k_ret: int = 4            # retrieval count
     C_em: int = 8             # candidates per pass (top-C_em across N*C)
@@ -140,9 +140,9 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Dev tier. D=768, B_blocks=6, C=4, D_col=128."""
+        """Dev tier (~100M). Matches Pythia-70M / Mamba-130M scale."""
         defaults = dict(
-            D=768, B_blocks=6, C=4, D_col=128, D_mem=256,
+            D=768, B_blocks=6, C=4, D_col=384, D_mem=384,
             D_pcm=64, R=4, N=128, r=8, M=64,
         )
         defaults.update(overrides)
@@ -150,9 +150,9 @@ class ModelConfig:
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Research tier. D=1536, B_blocks=8, C=6, D_col=192."""
+        """Research tier (~400M). Matches Pythia-410M / Mamba-370M."""
         defaults = dict(
-            D=1536, B_blocks=8, C=6, D_col=192, D_mem=384,
+            D=1536, B_blocks=8, C=8, D_col=448, D_mem=640,
             D_pcm=96, R=4, N=128, r=16, M=128,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,
@@ -162,9 +162,9 @@ class ModelConfig:
 
     @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
-        """1B-class tier. D=2048, B_blocks=12, C=8, D_col=256."""
+        """1B-class tier (~1.05B). Matches Pythia-1B / TinyLlama-1.1B / Mamba-790M."""
         defaults = dict(
-            D=2048, B_blocks=12, C=8, D_col=256, D_mem=512,
+            D=2048, B_blocks=12, C=8, D_col=640, D_mem=768,
             D_pcm=128, R=6, N=128, r=16, M=256,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,

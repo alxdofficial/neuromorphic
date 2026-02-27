@@ -1,8 +1,8 @@
 # Future Directions: Neuromorphic AI Brain-Core
 
-> **Note:** Many recommendations from the original v1.7 roadmap have been implemented in **v2.0**. This document has been updated to reflect what v2 achieves and what remains for future work.
+> **Note (2026-02-27):** This document was written for the **v2 architecture** (scan-based recurrence + WM/PM/EM). The current architecture is **v4** (iterative refinement with cortical columns, no WM, no scan). See `architecture_v4_iterative_memory_scan.md` for the current design. Many directions below remain relevant; architecture-specific details (WM, scan, tier sizes) are outdated.
 
-This document summarizes the architectural conclusions, insights, and forward-looking directions. It is intended as a **strategic roadmap**, not an implementation spec. The goal is to clarify what the model already achieves (v2), what it fundamentally cannot do yet, and how to evolve it further.
+This document summarizes the architectural conclusions, insights, and forward-looking directions. It is intended as a **strategic roadmap**, not an implementation spec.
 
 ---
 

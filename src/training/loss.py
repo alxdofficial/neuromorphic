@@ -93,19 +93,17 @@ def compute_regularizers(model) -> Tensor:
     reg = torch.tensor(0.0, device=next(model.parameters()).device)
 
     if model.config.pm_enabled:
-        for block in model.blocks:
-            pm = block.pm
-            if pm.pm_a is not None:
-                usage = pm.pm_a.sum(dim=-1)  # [BS]
-                excess = F.relu(usage - model.config.budget_pm * 0.9)
-                reg = reg + excess.mean() * 0.01
+        pm = model.pm
+        if pm.pm_a is not None:
+            usage = pm.pm_a.sum(dim=-1)  # [BS*B]
+            excess = F.relu(usage - model.config.budget_pm * 0.9)
+            reg = reg + excess.mean() * 0.01
 
     if model.config.em_enabled:
-        for block in model.blocks:
-            em = block.em
-            if em.em_S is not None:
-                usage = em.em_S.sum(dim=-1)  # [BS]
-                excess = F.relu(usage - model.config.budget_em * 0.9)
-                reg = reg + excess.mean() * 0.01
+        em = model.em
+        if em.em_S is not None:
+            usage = em.em_S.sum(dim=-1)  # [BS*B]
+            excess = F.relu(usage - model.config.budget_em * 0.9)
+            reg = reg + excess.mean() * 0.01
 
     return reg

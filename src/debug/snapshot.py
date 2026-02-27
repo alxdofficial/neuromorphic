@@ -109,16 +109,14 @@ def main():
     os.makedirs(pm_dir, exist_ok=True)
     pm_tensors = {}
     if model is not None:
-        for b_idx, block in enumerate(model.blocks):
-            for l_idx, layer in enumerate(block.layers):
-                pm = layer.pm
-                for k in ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]:
-                    t = getattr(pm, k, None)
-                    if t is not None:
-                        pm_tensors[f"blocks.{b_idx}.layers.{l_idx}.pm.{k}"] = t.detach().cpu()
+        pm = model.pm
+        for k in ["pm_K", "pm_V", "pm_a"]:
+            t = getattr(pm, k, None)
+            if t is not None:
+                pm_tensors[f"pm.{k}"] = t.detach().cpu()
     else:
         for name, tensor in state_dict.items():
-            if any(k in name for k in ["pm_K", "pm_V", "pm_a", "elig_K", "elig_V"]):
+            if any(k in name for k in ["pm_K", "pm_V", "pm_a"]):
                 pm_tensors[name] = tensor
     if pm_tensors:
         torch.save(pm_tensors, os.path.join(pm_dir, "pm_all.pt"))
@@ -129,12 +127,11 @@ def main():
     os.makedirs(em_dir, exist_ok=True)
     em_tensors = {}
     if model is not None:
-        for b_idx, block in enumerate(model.blocks):
-            em = block.em
-            for k in ["em_K", "em_V", "em_S"]:
-                t = getattr(em, k, None)
-                if t is not None:
-                    em_tensors[f"blocks.{b_idx}.em.{k}"] = t.detach().cpu()
+        em = model.em
+        for k in ["em_K", "em_V", "em_S"]:
+            t = getattr(em, k, None)
+            if t is not None:
+                em_tensors[f"em.{k}"] = t.detach().cpu()
     else:
         for name, tensor in state_dict.items():
             if any(k in name for k in ["em_K", "em_V", "em_S"]):
@@ -143,39 +140,9 @@ def main():
         torch.save(em_tensors, os.path.join(em_dir, "em_all.pt"))
         print(f"  em_state/ ({len(em_tensors)} tensors)")
 
-    # 7. WM state
-    wm_tensors = {}
-    if model is not None:
-        wm = model.wm
-        for k in ["wm_K", "wm_V", "wm_valid", "wm_ptr"]:
-            t = getattr(wm, k, None)
-            if t is not None:
-                wm_tensors[f"wm.{k}"] = t.detach().cpu()
-    else:
-        for name, tensor in state_dict.items():
-            if any(k in name for k in ["wm_K", "wm_V", "wm_valid", "wm_ptr"]):
-                wm_tensors[name] = tensor
-    if wm_tensors:
-        wm_path = os.path.join(output_dir, "wm_state.pt")
-        torch.save(wm_tensors, wm_path)
-        print(f"  wm_state.pt ({len(wm_tensors)} tensors)")
+    # 7. WM state (removed in v4)
 
-    # 8. Hidden states
-    hidden_tensors = {}
-    if model is not None:
-        for b_idx, block in enumerate(model.blocks):
-            for l_idx, layer in enumerate(block.layers):
-                if layer.h is not None:
-                    hidden_tensors[f"blocks.{b_idx}.layers.{l_idx}.h"] = layer.h.detach().cpu()
-    else:
-        for name, tensor in state_dict.items():
-            # Match layer hidden states (e.g., blocks.0.layers.0.h)
-            if name.endswith(".h") and "layers" in name:
-                hidden_tensors[name] = tensor
-    if hidden_tensors:
-        h_path = os.path.join(output_dir, "hidden_states.pt")
-        torch.save(hidden_tensors, h_path)
-        print(f"  hidden_states.pt ({len(hidden_tensors)} tensors)")
+    # 8. Hidden states (v4: no per-layer hidden states)
 
     print(f"\nSnapshot saved to: {output_dir}")
 

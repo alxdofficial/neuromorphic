@@ -58,15 +58,16 @@ Our resolution: **decouple token processing from memory accumulation.**
 - Columns read from shared memory, compute surprise, do "thinking," and
   accumulate eligibility/novelty signals for memory updates.
 
-Input shape: `[BS, N, D]` → project → `[BS, N, B_blocks, C, D_col]`
-Each column operates on D_col dimensions. After processing, project back to D.
+Input shape: `[BS, N, D]` → fan_out → `[BS, N, G, D_col]` where G = B_blocks × C.
+Each column group operates on D_col dimensions. After processing, fan_in back to D.
 
-**Shared memory systems** (per-block, updated between passes):
+**Shared memory systems** (single instance each, batched across B_blocks):
 - **PM** — procedural memory: Hebbian holographic slots (basal ganglia)
 - **EM** — episodic memory: key-value episode buffer (hippocampus)
 
-PM/EM have their own dimension D_mem (decoupled from D_col). Columns project
-up to D_mem for reads and write candidates, project back down to D_col.
+PM/EM state is batched: `[BS*B, r, D_mem]` / `[BS*B, M, D_mem]`. Columns reshape
+to memory space `[BS*B, N*C, D_mem]` for reads, then back to `[BS, N, G, D_mem]`.
+D_mem is decoupled from D_col; columns project up/down between them.
 
 ### How It Works (High Level)
 
@@ -421,15 +422,21 @@ indirect access to each other through memory. "Depth" emerges.
 ### Column Dimensions
 
 ```
+# Tier A example (~100M params)
 D = 768           # embedding / model dimension
-B_blocks = 6      # blocks (each with own PM + EM)
-C = 4             # columns per block (24 total)
-D_col = 128       # column width
-D_mem = 256       # PM/EM slot dimension (decoupled from D_col)
+B_blocks = 6      # memory blocks (PM/EM state batched as BS*B)
+C = 4             # columns per block → G = B*C = 24 groups total
+D_col = 384       # column width
+D_mem = 384       # PM/EM slot dimension (decoupled from D_col)
 D_pcm = 64        # PCM encoding dimension
 
-Fan-out:  D → B_blocks × C × D_col = 768 → 3072  (~4x)
-Fan-in:   B_blocks × C × D_col → D = 3072 → 768
+Fan-out:  D → G × D_col = 768 → 9216  (12x)
+Fan-in:   G × D_col → D = 9216 → 768
+
+# Tier presets (see config.py):
+# Tier A (~100M):  D=768  B=6  C=4  G=24  Dcol=384  Dmem=384
+# Tier B (~400M):  D=1536 B=8  C=8  G=64  Dcol=448  Dmem=640
+# Tier C (~1.05B): D=2048 B=12 C=8  G=96  Dcol=640  Dmem=768
 ```
 
 ### Segment Length

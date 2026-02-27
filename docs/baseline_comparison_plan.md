@@ -1,6 +1,6 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM, recurrent architecture with parallel blocks, Procedural Memory (PM), Episodic Memory (EM), Working Memory (WM), and spatial decoder. Primary tiers: Tier A Wide (~85M, D=768, L=8, B=2) for RTX 4090 development and Tier 1B (~1.07B, D=2048, L=16, B=2) for cloud GPU training.
+**Target model:** Neuromorphic LM (v4), iterative refinement with cortical columns, Procedural Memory (PM), Episodic Memory (EM), and cross-pass predictive coding (PCM). Three tiers: Tier A (~100M, D=768) for RTX 4090 development, Tier B (~400M, D=1536) for research, and Tier C (~1.05B, D=2048) for cloud GPU training.
 
 **Date:** 2026-02-23
 
@@ -32,7 +32,7 @@ The gold standard for small-model research. All models trained on the Pile (dedu
 | **Pythia-160M** | 160M | 85M | 12 | 768 | 12 | ~300B (1.5 epochs) |
 | **Pythia-410M** | 410M | 302M | 24 | 1024 | 16 | ~300B (1.5 epochs) |
 
-**Why ideal:** Closest parameter-matched transformer baselines. Pythia-160M (~85M non-embed) is close to our Tier A wide (~85M). Reproducible, extensively benchmarked, public weights, public training data.
+**Why ideal:** Closest parameter-matched transformer baselines. Pythia-70M (~100M) brackets our Tier A (~100M); Pythia-410M brackets our Tier B (~400M). Reproducible, extensively benchmarked, public weights, public training data.
 
 **Published zero-shot benchmarks (from Pythia paper, Table 4, lm-eval-harness):**
 
@@ -280,7 +280,7 @@ Addresses SSM weakness in in-context retrieval by mixing training objectives (st
 
 ## 4. Consolidated Benchmark Table
 
-Best available zero-shot numbers for models nearest to our ~85M (Tier A Wide) and ~1B (Tier 1B) parameter scales. All numbers from published papers using lm-evaluation-harness unless noted.
+Best available zero-shot numbers for models nearest to our Tier A (~100M), Tier B (~400M), and Tier C (~1.05B) parameter scales. All numbers from published papers using lm-evaluation-harness unless noted.
 
 | Model | Params | Type | HellaSwag | PIQA | ARC-E | ARC-C | WinoGrande | LAMBADA (acc) |
 |-------|--------|------|-----------|------|-------|-------|------------|---------------|
@@ -302,8 +302,9 @@ Best available zero-shot numbers for models nearest to our ~85M (Tier A Wide) an
 **Important caveats:**
 - SmolLM numbers appear higher due to 600B training tokens of curated data vs ~300B for Pythia/Mamba on less filtered data
 - Benchmark numbers vary by lm-eval-harness version and prompt format
-- At Tier A Wide (~85M), direct parameter matching is Pythia-160M (~85M non-embed); architecture matching (recurrent) is Mamba-130M
-- At Tier 1B (~1.07B), direct parameter matching is TinyLlama-1.1B and Pythia-1B; architecture matching is Mamba-790M
+- At Tier A (~100M): Pythia-70M (70M), Mamba-130M (130M), SmolLM-135M (135M)
+- At Tier B (~400M): Mamba-370M (370M), SmolLM-360M (360M), Pythia-410M (410M)
+- At Tier C (~1.05B): Mamba-790M (790M), Pythia-1B (1,011M), TinyLlama-1.1B (1,100M)
 
 ---
 
@@ -337,7 +338,7 @@ Use lm-evaluation-harness (EleutherAI) for reproducibility. These are the standa
 | **BoolQ** | Yes/no QA | acc | Weakly |
 | **OpenBookQA** | Open-book science | acc_norm | Weakly |
 
-**Recommendation for ~85M model (Tier A Wide):** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale). **At ~1B (Tier 1B):** All benchmarks become more discriminating; report the full suite including HellaSwag and WinoGrande.
+**Recommendation for Tier A (~100M):** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale). **At Tier C (~1.05B):** All benchmarks become more discriminating; report the full suite including HellaSwag and WinoGrande.
 
 ### 5.3 Token-Level and Efficiency Metrics
 
@@ -353,7 +354,7 @@ Use lm-evaluation-harness (EleutherAI) for reproducibility. These are the standa
 
 ## 6. Memory-Specific Evaluations
 
-These benchmarks specifically test whether PM/EM/WM provide value over vanilla architectures. This is the most important section for demonstrating the architecture "makes sense."
+These benchmarks specifically test whether PM/EM provide value over vanilla architectures. This is the most important section for demonstrating the architecture "makes sense."
 
 ### 6.1 Synthetic Memory Tasks
 
@@ -367,13 +368,13 @@ Input:  k1 v1 k2 v2 k3 v3 ... [query] k2 [answer] ?
 Target: v2
 ```
 
-**Why critical:** Tests whether our EM retrieval and WM attention can associate and recall specific key-value pairs. Transformers naturally solve this via induction heads; recurrent models struggle. Our explicit EM should provide an advantage.
+**Why critical:** Tests whether our EM retrieval can associate and recall specific key-value pairs. Transformers naturally solve this via induction heads; recurrent models struggle. Our explicit EM should provide an advantage.
 
 **Protocol:**
 - Vary number of KV pairs (4, 8, 16, 32, 64)
 - Vary sequence length (128, 256, 512, 1024)
 - Measure exact-match accuracy
-- Compare: full model vs EM-off vs WM-off
+- Compare: full model vs EM-off vs PM-off
 
 **Source:** Arora et al., "Zoology: Measuring and Improving Recall in Efficient Language Models," ICLR 2024.
 
@@ -385,7 +386,7 @@ Input:  a b c d e [SEP] ?
 Target: a b c d e
 ```
 
-**Why critical:** Tests raw memory capacity. Our WM (Gated Linear Attention with recurrent state) should provide direct copying ability. Mamba and pure recurrent models struggle with this.
+**Why critical:** Tests raw memory capacity. Our EM (top-k retrieval with cross-attention) and PM (holographic read) should provide copying ability via memory persistence. Mamba and pure recurrent models struggle with this.
 
 **Protocol:**
 - Vary copy length (32, 64, 128, 256, 512)
@@ -398,7 +399,7 @@ Target: a b c d e
 
 **Setup:** A B ... A ? (model should output B, pattern completion)
 
-**Why critical:** Tests the formation of induction-head-like circuits. WM attention should enable this naturally; the question is whether our recurrent blocks can also learn this pattern through PM.
+**Why critical:** Tests the formation of induction-head-like circuits. PM should be able to store A→B associations; EM can retrieve the specific episode. The question is whether iterative refinement + memory can match transformer induction heads.
 
 **Source:** Olsson et al., "In-context Learning and Induction Heads," Transformer Circuits, 2022.
 
@@ -477,12 +478,12 @@ Target: a b c d e
 
 **Setup:** Standard few-shot evaluation with k=0,1,2,4,8 examples.
 
-**Why critical:** WM (Gated Linear Attention with recurrent state) enables attending to recent context. EM could provide "pseudo-few-shot" by retrieving relevant past episodes.
+**Why critical:** EM could provide "pseudo-few-shot" by retrieving relevant past episodes. PM accumulates patterns that help generalize from examples.
 
 **Protocol:**
 - Tasks: simple classification (SST-2, TREC), arithmetic, word manipulation
 - Compare k=0,1,2,4,8 performance curves across architectures
-- Hypothesis: our model should benefit more from additional examples (steeper learning curve) due to WM attention
+- Hypothesis: our model should benefit more from additional examples (steeper learning curve) due to memory persistence
 
 ### 6.5 Memory Utilization Analysis
 
@@ -490,12 +491,12 @@ These are not benchmarks but diagnostic analyses to include in the paper:
 
 | Analysis | What it shows |
 |----------|--------------|
-| PM slot activation heatmap | Which PM slots are active, how activation distributes across layers/blocks |
+| PM slot activation heatmap | Which PM slots are active, how activation distributes across blocks |
 | PM commit rate over training | How often and where PM commits happen |
 | EM write rate and novelty distribution | Whether EM learns to be selective |
 | EM retrieval similarity histogram | Quality of EM retrievals |
-| WM attention pattern visualization | What WM attends to |
-| Surprise distribution over time | How surprise modulates the system |
+| PCM surprise distribution over passes | How surprise modulates refinement |
+| Cross-pass representation change | How much representations evolve across R passes |
 | Memory state norm trajectories | Stability of PM/EM state over long sequences |
 
 ---
@@ -513,10 +514,8 @@ The most important experiments for proving the architecture works. Each ablation
 | **Full model** | All enabled | Baseline |
 | **No PM** | `pm_enabled=False` (zero pm_a) | Value of procedural memory |
 | **No EM** | `em_enabled=False` (skip retrieval/writes) | Value of episodic memory |
-| **No WM** | `wm_enabled=False` (skip WM attention) | Value of working memory |
-| **No PM + No EM** | Both off | Value of memory systems vs bare recurrence |
-| **No PM + No EM + No WM** | All memory off | Pure recurrent baseline |
-| **No Spatial Decoder** | `snapshot_enabled=False` | Value of hierarchical decoding |
+| **No PM + No EM** | Both off | Value of memory systems vs bare columns |
+| **No PCM** | `pcm_enabled=False` | Value of cross-pass predictive coding |
 | **No Surprise Modulation** | Fixed surprise=1.0 | Value of neuromodulation |
 
 **Protocol for each ablation:**
@@ -531,10 +530,10 @@ The most important experiments for proving the architecture works. Each ablation
 |----------|--------------|---------------|
 | PM r=2 | Reduce PM slots | PM capacity sensitivity |
 | PM r=16 | Increase PM slots | Scaling returns |
-| EM M=64 | Reduce EM capacity | EM capacity sensitivity |
-| EM M=512 | Increase EM capacity | Scaling returns |
-| WM W=64 | Reduce WM window | WM window sensitivity |
-| WM W=512 | Increase WM window | Scaling returns |
+| EM M=32 | Reduce EM capacity | EM capacity sensitivity |
+| EM M=256 | Increase EM capacity | Scaling returns |
+| R=2 | Fewer refinement passes | Depth/compute tradeoff |
+| R=6 | More refinement passes | Scaling returns |
 
 #### 7.1.3 Phase-Wise Ablations (Neuromodulation)
 
@@ -575,10 +574,9 @@ Train at 3-4 model sizes with matched parameter counts:
 
 | Tier | Our model | Pythia | Mamba | Other |
 |------|-----------|--------|-------|-------|
-| ~85M | Tier A Wide (D=768, L=8, B=2) | Pythia-160M (~85M non-embed) | Mamba-130M | SmolLM-135M |
-| ~150M | Tier B (D=768, L=12, B=6) | Pythia-160M | Mamba-130M | RWKV-4 169M |
-| ~350M | Tier C (D=1024, L=24, B=8) | Pythia-410M | Mamba-370M | SmolLM-360M |
-| **~1B** | **Tier 1B (D=2048, L=16, B=2)** | **Pythia-1B** | **Mamba-790M** | **TinyLlama-1.1B** |
+| ~100M | Tier A (D=768, B=6, C=4, G=24) | Pythia-70M | Mamba-130M | SmolLM-135M |
+| ~400M | Tier B (D=1536, B=8, C=8, G=64) | Pythia-410M | Mamba-370M | SmolLM-360M |
+| **~1B** | **Tier C (D=2048, B=12, C=8, G=96)** | **Pythia-1B** | **Mamba-790M** | **TinyLlama-1.1B** |
 
 **Plot:** Validation loss vs parameter count for each architecture family. If our curve is below baselines, the architecture is more parameter-efficient.
 
@@ -608,19 +606,19 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 
 **Per-model training config (implemented in `train_baseline.py`):**
 
-**Tier A Wide (~85M) comparison on RTX 4090:**
+**Tier A (~100M) comparison on RTX 4090:**
 
 | Model | Params | BS | Steps | LR | LR min | Warmup |
 |-------|--------|----|-------|-----|--------|--------|
-| Neuromorphic A Wide | 85.1M | 32 | 183K | 3e-4 | 3e-5 | 1000 steps |
-| Pythia-160M | 134.2M | 96 | 61K | 6e-4 | 6e-5 | 1% (610 steps) |
-| Mamba-130M | 115.1M | 64 | 91K | 6e-4 | 6e-5 | 1% (910 steps) |
+| Neuromorphic A | 99M | 32 | 183K | 3e-4 | 3e-5 | 1000 steps |
+| Pythia-70M | 70M | 96 | 61K | 6e-4 | 6e-5 | 1% (610 steps) |
+| Mamba-130M | 130M | 64 | 91K | 6e-4 | 6e-5 | 1% (910 steps) |
 
-**Tier 1B (~1.07B) comparison on A100 80GB:**
+**Tier C (~1.05B) comparison on A100 80GB:**
 
 | Model | Params | BS | Steps (est.) | LR | GPU |
 |-------|--------|----|-------|-----|-----|
-| Neuromorphic 1B | 1,070M | 8 | ~730K | 1.5e-4 | A100 80GB |
+| Neuromorphic C | 1,047M | 8 | ~730K | 1.5e-4 | A100 80GB |
 | Pythia-1B | 1,011M | 32 | ~183K | 3e-4 | A100 80GB |
 | Mamba-790M | 790M | 16 | ~366K | 3e-4 | A100 80GB |
 
@@ -629,11 +627,11 @@ Batch sizes are per-model optimal for each GPU. Different BS is acceptable becau
 #### 7.3.2 Implementation
 
 **All baselines trained from scratch** (Option A: strongest claims):
-- Pythia-160M (GPT-NeoX architecture) and Mamba-130M, both randomly initialized
+- Pythia-70M (GPT-NeoX architecture) and Mamba-130M, both randomly initialized
 - Trained on identical data pipeline with identical tokenizer
 - Script: `auxiliary_repos/baselines/eval_scripts/train_baseline.py`
 
-**Tier 1B baselines:** For 1B-scale comparison, training from scratch on 1.5B tokens is the primary strategy. Pretrained Pythia-1B checkpoints (trained on 300B tokens of the Pile) can serve as reference upper bounds but are not directly comparable due to 200x more training tokens. Mamba-790M pretrained weights can also be used as reference.
+**Tier C baselines:** For 1B-scale comparison, training from scratch on 1.5B tokens is the primary strategy. Pretrained Pythia-1B checkpoints (trained on 300B tokens of the Pile) can serve as reference upper bounds but are not directly comparable due to 200x more training tokens. Mamba-790M pretrained weights can also be used as reference.
 
 ### 7.4 Statistical Rigor
 
@@ -651,14 +649,14 @@ Batch sizes are per-model optimal for each GPU. Different BS is acceptable becau
 These are the experiments needed to convincingly demonstrate the architecture:
 
 #### Priority 1: Core Claims (must have)
-1. **Perplexity on WikiText-103 and Pile validation** at Tier A Wide (~85M) vs Pythia-160M, and Tier 1B (~1.07B) vs Pythia-1B
-2. **Component ablation table** (full, no-PM, no-EM, no-WM, bare recurrence) on WikiText-103
+1. **Perplexity on WikiText-103 and Pile validation** at Tier A (~100M) vs Pythia-70M/Mamba-130M, and Tier C (~1.05B) vs Pythia-1B/Mamba-790M
+2. **Component ablation table** (full, no-PM, no-EM, bare columns) on WikiText-103
 3. **PG19 perplexity vs position curve** showing memory advantage at long distances
 4. **MQAR accuracy** at varying sequence lengths showing EM advantage
 5. **PIQA, ARC-Easy, LAMBADA** zero-shot (with lm-eval-harness)
 
 #### Priority 2: Architecture Understanding (should have)
-6. **Copy task** showing WM advantage
+6. **Copy task** showing memory advantage
 7. **Memory utilization heatmaps** (PM activation, EM write patterns)
 8. **Scaling curve** at 2-3 model sizes (Tier A, Tier B) vs Pythia at matched params
 9. **Needle-in-haystack** retrieval accuracy vs context length
@@ -675,13 +673,13 @@ These are the experiments needed to convincingly demonstrate the architecture:
 
 A paper proving this architecture "makes sense" should follow this structure:
 
-1. **Motivation:** Biological inspiration, memory system decomposition (PM/EM/WM parallel to human memory)
-2. **Architecture:** Full description with diagrams
+1. **Motivation:** Biological inspiration, memory system decomposition (PM/EM parallel to human memory), iterative refinement
+2. **Architecture:** Full description with diagrams (cortical columns, R-pass refinement, PCM)
 3. **Language Modeling:** Perplexity results showing competitive or superior performance vs Pythia/Mamba at matched scale
 4. **Ablation Studies:** Each component contributes; removing any one hurts
-5. **Memory-Specific Tasks:** MQAR, copy, needle-in-haystack showing where memory systems excel
+5. **Memory-Specific Tasks:** MQAR, needle-in-haystack showing where memory systems excel
 6. **Long-Range:** PG19 perplexity curves showing sustained improvement at distance
-7. **Scaling:** Evidence that the architecture scales (2-3 points minimum)
+7. **Scaling:** Evidence that the architecture scales (3 tier points: A/B/C)
 8. **Efficiency:** Throughput analysis showing practical viability
 9. **Lifelong Learning:** (if included) Domain adaptation demonstrating cross-document knowledge transfer
 
@@ -691,10 +689,10 @@ A paper proving this architecture "makes sense" should follow this structure:
 |-------|----------------|
 | "PM improves pattern learning" | PM-on vs PM-off perplexity gap; PM utilization analysis |
 | "EM enables episodic retrieval" | MQAR accuracy; needle-in-haystack; EM-on vs EM-off on PG19 |
-| "WM enables in-context attention" | Copy task; few-shot learning curves; WM-on vs WM-off |
+| "PCM enables cross-pass refinement" | PCM-on vs PCM-off perplexity; surprise distribution analysis |
 | "Memory systems compose" | Full model > any single component ablation |
-| "Architecture scales" | Perplexity at 2+ model sizes tracks or beats baseline scaling |
-| "Recurrence + memory is practical" | Training throughput within 2x of transformer baseline |
+| "Architecture scales" | Perplexity at 3 model sizes tracks or beats baseline scaling |
+| "Iterative refinement is practical" | Training throughput within 2x of transformer baseline |
 
 ---
 

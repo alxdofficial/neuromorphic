@@ -66,28 +66,20 @@ class TBPTTTrainer:
         em_util = None
 
         if self.config.pm_enabled:
-            total = 0.0
-            cap = 0.0
-            for block in self.model.blocks:
-                pm = block.pm
-                if pm.pm_a is None:
-                    continue
-                total += pm.pm_a.detach().sum().item()
-                cap += pm.budget * pm.pm_a.shape[0]
-            if cap > 0:
-                pm_util = total / cap
+            pm = self.model.pm
+            if pm.pm_a is not None:
+                total = pm.pm_a.detach().sum().item()
+                cap = pm.budget * pm.pm_a.shape[0]
+                if cap > 0:
+                    pm_util = total / cap
 
         if self.config.em_enabled:
-            total = 0.0
-            cap = 0.0
-            for block in self.model.blocks:
-                em = block.em
-                if em.em_S is None:
-                    continue
-                total += em.em_S.detach().sum().item()
-                cap += em.budget * em.em_S.shape[0]
-            if cap > 0:
-                em_util = total / cap
+            em = self.model.em
+            if em.em_S is not None:
+                total = em.em_S.detach().sum().item()
+                cap = em.budget * em.em_S.shape[0]
+                if cap > 0:
+                    em_util = total / cap
 
         return pm_util, em_util
 

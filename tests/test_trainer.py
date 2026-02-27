@@ -73,9 +73,8 @@ class TestTrainChunk:
         batch = _make_batch(trainer.config)
         trainer.train_chunk(batch)
 
-        for block in trainer.model.blocks:
-            if block.pm.pm_K is not None:
-                assert block.pm.pm_K.grad_fn is None
+        if trainer.model.pm.pm_K is not None:
+            assert trainer.model.pm.pm_K.grad_fn is None
 
     def test_multi_segment_chunk(self):
         """Chunk should process K_segments * N tokens."""

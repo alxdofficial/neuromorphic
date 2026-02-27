@@ -54,7 +54,7 @@ class TestTierPresets:
         assert cfg.D == 768
         assert cfg.B_blocks == 6
         assert cfg.C == 4
-        assert cfg.D_col == 128
+        assert cfg.D_col == 384
 
     def test_tier_b(self):
         cfg = ModelConfig.tier_b()

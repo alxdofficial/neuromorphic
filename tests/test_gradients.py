@@ -90,7 +90,7 @@ class TestGradientFlow:
         total_loss.backward()
 
         # Check PCM encoder gets gradient
-        pcm = model.blocks[0].columns.pcm
+        pcm = model.columns.pcm
         assert pcm is not None
         assert pcm.encoder.weight.grad is not None
         assert pcm.encoder.weight.grad.abs().sum() > 0
@@ -116,7 +116,7 @@ class TestGradientFlow:
         total_loss.backward()
 
         # PM projection weights should get gradient
-        col = model.blocks[0].columns
+        col = model.columns
         assert col.W_pm_up.weight.grad is not None
 
     def test_gradient_through_em_read(self):
@@ -138,7 +138,7 @@ class TestGradientFlow:
 
         total_loss.backward()
 
-        col = model.blocks[0].columns
+        col = model.columns
         assert col.W_em_up.weight.grad is not None
 
     def test_lambda_logit_gradient(self):

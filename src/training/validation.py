@@ -18,13 +18,14 @@ from ..model.utils import runtime_state_dtype
 from .loss import batched_cross_entropy
 
 
-def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
-                            device: torch.device):
+def _clear_runtime_for_validation(model: NeuromorphicLM, batch_size: int,
+                                  device: torch.device):
     """Hard-reset runtime state so validation starts from a clean slate."""
-    mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-    for block in model.blocks:
-        block.pm.reset_content(mask)
-        block.em.reset_states(mask)
+    # PM/EM state is batched: [BS*B, ...]
+    B = model.config.B_blocks
+    expanded = torch.ones(batch_size * B, dtype=torch.bool, device=device)
+    model.pm.reset_content(expanded)
+    model.em.reset_states(expanded)
     model.detach_states()
 
 
@@ -79,7 +80,7 @@ def evaluate_validation(
             BS, T = input_ids.shape
 
             if not cleared:
-                _clear_runtime_for_eval(model, BS, device)
+                _clear_runtime_for_validation(model, BS, device)
                 cleared = True
 
             for seg_start in range(0, T, N):

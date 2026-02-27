@@ -48,7 +48,7 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        pm = model.blocks[0].pm
+        pm = model.pm
         pm_a_before = pm.pm_a.clone()
 
         # Forward 2 segments (PM gets committed between passes)
@@ -57,7 +57,6 @@ class TestEndToEnd:
             model.forward_segment(input_ids)
 
         # After commits, pm_a should have changed
-        # (may not always change if surprise is 0, but structure is correct)
         assert pm.pm_a is not None
 
     def test_detach_states(self):
@@ -72,11 +71,10 @@ class TestEndToEnd:
         model.detach_states()
 
         # After detach, states should not have grad_fn
-        for block in model.blocks:
-            if block.pm.pm_K is not None:
-                assert block.pm.pm_K.grad_fn is None
-            if block.em.em_K is not None:
-                assert block.em.em_K.grad_fn is None
+        if model.pm.pm_K is not None:
+            assert model.pm.pm_K.grad_fn is None
+        if model.em.em_K is not None:
+            assert model.em.em_K.grad_fn is None
 
     def test_doc_boundary_reset(self):
         """Doc boundary should reset PM/EM state before processing."""
@@ -84,10 +82,13 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
+        B = cfg.B_blocks
+        BSB = BS * B
+
         # Set some PM content
-        pm = model.blocks[0].pm
-        pm.pm_K = torch.randn(BS, cfg.r, cfg.D_mem)
-        pm.pm_a = torch.ones(BS, cfg.r)
+        pm = model.pm
+        pm.pm_K = torch.randn(BSB, cfg.r, cfg.D_mem)
+        pm.pm_a = torch.ones(BSB, cfg.r)
 
         a_before = pm.pm_a.sum().item()
 
@@ -104,10 +105,13 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
+        B = cfg.B_blocks
+        BSB = BS * B
+
         # Set large PM content
-        pm = model.blocks[0].pm
-        pm.pm_K = torch.randn(BS, cfg.r, cfg.D_mem) * 10
-        pm.pm_a = torch.ones(BS, cfg.r) * 5.0
+        pm = model.pm
+        pm.pm_K = torch.randn(BSB, cfg.r, cfg.D_mem) * 10
+        pm.pm_a = torch.ones(BSB, cfg.r) * 5.0
         a_before = pm.pm_a.sum().item()
 
         # Forward with reset — the R-pass loop will add new commits,
@@ -126,10 +130,13 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
+        B = cfg.B_blocks
+        BSB = BS * B
+
         # Set some PM content
-        pm = model.blocks[0].pm
-        pm.pm_K = torch.randn(BS, cfg.r, cfg.D_mem)
-        pm.pm_a = torch.ones(BS, cfg.r)
+        pm = model.pm
+        pm.pm_K = torch.randn(BSB, cfg.r, cfg.D_mem)
+        pm.pm_a = torch.ones(BSB, cfg.r)
 
         a_before = pm.pm_a.sum().item()
 

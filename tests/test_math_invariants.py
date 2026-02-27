@@ -86,10 +86,9 @@ class TestPMNormalization:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-        for block in model.blocks:
-            pm = block.pm
-            # After init, pm_K is zeros — no norm constraint on zero vectors
-            assert torch.isfinite(pm.pm_K).all()
+        pm = model.pm
+        # After init, pm_K is zeros — no norm constraint on zero vectors
+        assert torch.isfinite(pm.pm_K).all()
 
     def test_pm_keys_unit_normalized_after_commit(self):
         """After forward_segment (which includes PM commit), pm_K should
@@ -98,13 +97,12 @@ class TestPMNormalization:
         model = NeuromorphicLM(cfg)
         # Forward multiple segments to trigger commits
         results = forward_k_segments(model, K=3, BS=BS)
-        for block in model.blocks:
-            pm = block.pm
-            # Non-zero rows should be unit-normalized
-            norms = pm.pm_K.norm(dim=-1)
-            nonzero = norms > 1e-6
-            if nonzero.any():
-                assert torch.allclose(norms[nonzero], torch.ones_like(norms[nonzero]), atol=1e-4)
+        pm = model.pm
+        # Non-zero rows should be unit-normalized
+        norms = pm.pm_K.norm(dim=-1)
+        nonzero = norms > 1e-6
+        if nonzero.any():
+            assert torch.allclose(norms[nonzero], torch.ones_like(norms[nonzero]), atol=1e-4)
 
 
 # ============================================================================
@@ -117,8 +115,7 @@ class TestEMNormalization:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-        for block in model.blocks:
-            assert torch.isfinite(block.em.em_K).all()
+        assert torch.isfinite(model.em.em_K).all()
 
     def test_em_keys_finite_after_write(self):
         """After forward_segment (which includes EM write), em_K should
@@ -126,11 +123,10 @@ class TestEMNormalization:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
-        for block in model.blocks:
-            assert torch.isfinite(block.em.em_K).all()
-            norms = block.em.em_K.norm(dim=-1)
-            # EMA of unit vectors has norm <= 1.0
-            assert (norms <= 1.0 + 1e-4).all()
+        assert torch.isfinite(model.em.em_K).all()
+        norms = model.em.em_K.norm(dim=-1)
+        # EMA of unit vectors has norm <= 1.0
+        assert (norms <= 1.0 + 1e-4).all()
 
 
 # ============================================================================
@@ -143,17 +139,15 @@ class TestPMStrengthBounds:
         model = NeuromorphicLM(cfg)
         # Forward multiple segments to accumulate PM commits
         results = forward_k_segments(model, K=4, BS=BS)
-        for block in model.blocks:
-            assert (block.pm.pm_a <= cfg.a_max + 1e-5).all()
-            assert (block.pm.pm_a >= -1e-5).all()
+        assert (model.pm.pm_a <= cfg.a_max + 1e-5).all()
+        assert (model.pm.pm_a >= -1e-5).all()
 
     def test_pm_strengths_bounded_by_budget(self):
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=4, BS=BS)
-        for block in model.blocks:
-            total = block.pm.pm_a.sum(dim=-1)
-            assert (total <= cfg.budget_pm + 1e-5).all()
+        total = model.pm.pm_a.sum(dim=-1)
+        assert (total <= cfg.budget_pm + 1e-5).all()
 
 
 # ============================================================================
@@ -165,17 +159,15 @@ class TestEMStrengthBounds:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=4, BS=BS)
-        for block in model.blocks:
-            assert (block.em.em_S <= cfg.S_max + 1e-5).all()
-            assert (block.em.em_S >= -1e-5).all()
+        assert (model.em.em_S <= cfg.S_max + 1e-5).all()
+        assert (model.em.em_S >= -1e-5).all()
 
     def test_em_strengths_bounded_by_budget(self):
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=4, BS=BS)
-        for block in model.blocks:
-            total = block.em.em_S.sum(dim=-1)
-            assert (total <= cfg.budget_em + 1e-5).all()
+        total = model.em.em_S.sum(dim=-1)
+        assert (total <= cfg.budget_em + 1e-5).all()
 
 
 # ============================================================================
@@ -196,13 +188,12 @@ class TestNoNaN:
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
 
-        for block in model.blocks:
-            assert torch.isfinite(block.pm.pm_K).all()
-            assert torch.isfinite(block.pm.pm_V).all()
-            assert torch.isfinite(block.pm.pm_a).all()
-            assert torch.isfinite(block.em.em_K).all()
-            assert torch.isfinite(block.em.em_V).all()
-            assert torch.isfinite(block.em.em_S).all()
+        assert torch.isfinite(model.pm.pm_K).all()
+        assert torch.isfinite(model.pm.pm_V).all()
+        assert torch.isfinite(model.pm.pm_a).all()
+        assert torch.isfinite(model.em.em_K).all()
+        assert torch.isfinite(model.em.em_V).all()
+        assert torch.isfinite(model.em.em_S).all()
 
     def test_no_nan_in_logits_after_multi_segment(self):
         cfg = make_tiny_config()
