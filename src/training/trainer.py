@@ -59,6 +59,10 @@ class TBPTTTrainer:
 
         self._states_initialized = False
         self._compile_requested = config.use_compile and device.type == "cuda"
+        if self._compile_requested:
+            self.model.forward_segment = torch.compile(
+                self.model.forward_segment, mode="default"
+            )
 
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""

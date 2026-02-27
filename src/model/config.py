@@ -71,7 +71,7 @@ class ModelConfig:
     tie_embeddings: bool = True
 
     # Training
-    use_compile: bool = False
+    use_compile: bool = True
     gradient_checkpointing: bool = False
     reset_on_doc_boundary: bool = True
     lifelong_mode: bool = False
