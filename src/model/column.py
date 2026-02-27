@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import ModelConfig
 from .predictive_coding import GroupedLinear, GroupedLayerNorm, CrossPassPCM
@@ -60,6 +61,15 @@ class CorticalColumnGroup(nn.Module):
             nn.init.zeros_(self.W_gain.weight)
             if self.W_gain.bias is not None:
                 nn.init.zeros_(self.W_gain.bias)
+
+        self._grad_ckpt = config.gradient_checkpointing
+
+    def _ffn_block(self, x_col: Tensor, gain: Tensor | None) -> Tensor:
+        """FFN with optional gain modulation (checkpointable, no side effects)."""
+        h = self.ffn_norm(x_col)
+        if gain is not None:
+            h = h * gain
+        return self.ffn_down(F.gelu(self.ffn_up(h)))
 
     # ------------------------------------------------------------------
     # Forward
@@ -111,11 +121,11 @@ class CorticalColumnGroup(nn.Module):
             delta = None
             gain = None
 
-        # 4. FFN with gain modulation
-        h = self.ffn_norm(x_col)
-        if gain is not None:
-            h = h * gain
-        h = self.ffn_down(F.gelu(self.ffn_up(h)))
+        # 4. FFN with gain modulation (optionally gradient-checkpointed)
+        if self._grad_ckpt and x_col.requires_grad:
+            h = grad_checkpoint(self._ffn_block, x_col, gain, use_reentrant=False)
+        else:
+            h = self._ffn_block(x_col, gain)
         x_out = x_col + h                                   # residual
 
         # 5. PCM hypothesis (predict next pass)

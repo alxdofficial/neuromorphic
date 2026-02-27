@@ -9,6 +9,7 @@ No Python loop over blocks — only a loop over R refinement passes.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
@@ -65,17 +66,22 @@ class NeuromorphicLM(nn.Module):
 
     def forward_segment(
         self, input_ids: Tensor, reset_mask: Tensor | None = None,
-        fitb_mask: Tensor | None = None,
+        fitb_mask: Tensor | None = None, target_ids: Tensor | None = None,
     ):
         """Process N tokens through R refinement passes.
 
         input_ids: [BS, N]
         reset_mask: [BS] bool — streams to reset PM/EM before processing
         fitb_mask: [BS, N] bool — FITB masked positions (None = NTP path)
+        target_ids: [BS, N] — original unmasked IDs for inline FITB loss (optional)
 
         Returns:
-            NTP path  (fitb_mask is None): (logits [BS, N, vocab], aux_loss)
-            FITB path (fitb_mask provided): (per_pass_logits list[R × [BS,N,vocab]], aux_loss)
+            NTP path  (fitb_mask is None):
+                (logits [BS, N, vocab], aux_loss)
+            FITB path (target_ids provided):
+                (fitb_loss scalar, aux_loss, num_valid tensor)
+            FITB path (target_ids is None):
+                (per_pass_logits list[R × [BS,N,vocab]], aux_loss)
         """
         if reset_mask is not None:
             self._reset_memory(reset_mask)
@@ -85,6 +91,7 @@ class NeuromorphicLM(nn.Module):
         device = input_ids.device
 
         is_fitb = fitb_mask is not None
+        inline_loss = is_fitb and target_ids is not None
 
         # Initial embedding
         sequence = input_ids  # may have <FITB> at masked positions
@@ -101,7 +108,16 @@ class NeuromorphicLM(nn.Module):
         aux_loss = torch.tensor(0.0, device=device)
         lam = torch.sigmoid(self.lambda_logit)
 
-        per_pass_logits = [] if is_fitb else None
+        # Pre-compute mask indices for inline FITB loss (masked-only logits)
+        if inline_loss:
+            mask_flat = fitb_mask.reshape(-1)
+            mask_indices = mask_flat.nonzero(as_tuple=False).squeeze(-1)
+            num_masked = mask_indices.shape[0]
+            flat_targets = target_ids.reshape(-1)[mask_indices]
+            fitb_loss = torch.tensor(0.0, device=device)
+            fitb_valid = torch.tensor(0, device=device, dtype=torch.long)
+        elif is_fitb:
+            per_pass_logits = []
 
         for r in range(self.config.R):
             # FITB: re-embed from updated sequence (r > 0)
@@ -121,13 +137,32 @@ class NeuromorphicLM(nn.Module):
             # PM eligibility routing + commit, EM novelty + write
             self._process_and_commit(elig_info, nov_info, x_out)
 
-            if is_fitb:
-                # Produce logits for this pass
+            if inline_loss:
+                # Masked-only logits + inline CE loss (no per_pass_logits stored)
+                if num_masked > 0:
+                    x_out_flat = x_out.reshape(BS * N, -1)
+                    x_masked = x_out_flat[mask_indices]           # [M, G*D_col]
+                    x_readout = self.fan_in(x_masked)             # [M, D]
+                    logits_m = self.lm_head(self.ln_final(x_readout))  # [M, vocab]
+
+                    loss_r = F.cross_entropy(logits_m, flat_targets, reduction='sum')
+                    fitb_loss = fitb_loss + loss_r
+                    fitb_valid = fitb_valid + num_masked
+
+                # Re-embed predictions for next pass
+                if r < self.config.R - 1 and num_masked > 0:
+                    with torch.no_grad():
+                        pred_ids = logits_m.argmax(dim=-1)
+                        new_seq = original_ids.reshape(-1).clone()
+                        new_seq[mask_indices] = pred_ids
+                        sequence = new_seq.reshape(BS, N)
+
+            elif is_fitb:
+                # Legacy FITB path (no target_ids): full logits, stored per pass
                 x_readout = self.fan_in(x_out.reshape(BS, N, -1))
                 logits_r = self.lm_head(self.ln_final(x_readout))
                 per_pass_logits.append(logits_r)
 
-                # Re-embed predictions for next pass (no grad)
                 if r < self.config.R - 1:
                     with torch.no_grad():
                         predicted_ids = logits_r.argmax(dim=-1)
@@ -149,6 +184,8 @@ class NeuromorphicLM(nn.Module):
         if self.config.em_enabled:
             self.em.age_tick(N)
 
+        if inline_loss:
+            return fitb_loss, aux_loss, fitb_valid
         if is_fitb:
             return per_pass_logits, aux_loss
 

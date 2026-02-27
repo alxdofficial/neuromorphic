@@ -237,6 +237,59 @@ class TestFITBIterativeRefinement:
         assert not torch.allclose(per_pass_logits[0], per_pass_logits[1])
 
 
+class TestInlineFITBLoss:
+    """Inline FITB loss (target_ids path) matches legacy per_pass_logits path."""
+
+    def test_inline_loss_backward_runs(self):
+        model = _make_fitb_model()
+        N = model.config.N
+        input_ids = torch.randint(0, VOCAB, (BS, N))
+        fitb_mask = torch.rand(BS, N) < 0.3
+        ids_masked = input_ids.clone()
+        ids_masked[fitb_mask] = model.config.fitb_id
+
+        model.initialize_states(BS, torch.device("cpu"))
+        ce_loss, aux, valid = model.forward_segment(
+            ids_masked, torch.zeros(BS, dtype=torch.bool),
+            fitb_mask=fitb_mask, target_ids=input_ids,
+        )
+        assert ce_loss.dim() == 0
+        assert valid.item() > 0
+        loss = ce_loss / valid.float().clamp(min=1) + aux
+        loss.backward()
+        assert model.embedding.weight.grad is not None
+
+    def test_inline_loss_matches_legacy(self):
+        """Inline path loss should match legacy per_pass_logits + fitb_cross_entropy."""
+        torch.manual_seed(42)
+        model = _make_fitb_model(R=2)
+        N = model.config.N
+        input_ids = torch.randint(0, VOCAB, (BS, N))
+        fitb_mask = torch.rand(BS, N) < 0.5
+        ids_masked = input_ids.clone()
+        ids_masked[fitb_mask] = model.config.fitb_id
+
+        # Legacy path
+        model.initialize_states(BS, torch.device("cpu"))
+        per_pass_logits, aux1 = model.forward_segment(
+            ids_masked, torch.zeros(BS, dtype=torch.bool),
+            fitb_mask=fitb_mask,
+        )
+        loss_legacy, valid_legacy = fitb_cross_entropy(
+            per_pass_logits, input_ids, fitb_mask
+        )
+
+        # Reset states for fresh inline path
+        model.initialize_states(BS, torch.device("cpu"))
+        loss_inline, aux2, valid_inline = model.forward_segment(
+            ids_masked, torch.zeros(BS, dtype=torch.bool),
+            fitb_mask=fitb_mask, target_ids=input_ids,
+        )
+
+        assert valid_inline.item() == valid_legacy.item()
+        assert torch.allclose(loss_inline, loss_legacy, atol=1e-4)
+
+
 class TestResizeTokenEmbeddings:
     """resize_token_embeddings preserves old weights and expands vocab."""
 

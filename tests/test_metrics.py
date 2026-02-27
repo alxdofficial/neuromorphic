@@ -11,7 +11,6 @@ import pytest
 from tests.conftest import make_tiny_config
 from src.model.model import NeuromorphicLM
 from src.training.masking import generate_fitb_mask
-from src.training.loss import fitb_cross_entropy
 from src.metrics.efficiency import (
     EfficiencyReport,
     compute_avg_bytes_per_token,
@@ -375,11 +374,10 @@ class TestFITBThroughput:
             )
             ids_masked = input_ids.clone()
             ids_masked[fitb_mask] = cfg.fitb_id
-            per_pass_logits, aux = model.forward_segment(
-                ids_masked, fitb_mask=fitb_mask,
+            ce_loss, aux, valid = model.forward_segment(
+                ids_masked, fitb_mask=fitb_mask, target_ids=input_ids,
             )
-            loss, _ = fitb_cross_entropy(per_pass_logits, input_ids, fitb_mask)
-            loss = loss + aux
+            loss = ce_loss / valid.float().clamp(min=1) + aux
             loss.backward()
             optimizer.step()
             model.detach_states()

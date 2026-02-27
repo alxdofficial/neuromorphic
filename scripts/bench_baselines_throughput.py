@@ -32,6 +32,7 @@ from src.metrics.efficiency import (
 
 
 DEVICE = torch.device("cuda")
+torch.set_float32_matmul_precision("high")  # TF32 on Ampere+
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +59,10 @@ def make_fitb_step_fn(model, optimizer, input_ids, config):
     """Build a step_fn closure for the FITB training path.
 
     Each call generates a fresh mask, replaces masked tokens with <FITB>,
-    runs forward_segment with fitb_mask, computes fitb_cross_entropy,
+    runs forward_segment with target_ids for inline masked-only loss,
     backward, optimizer step, and detach.
     """
     from src.training.masking import generate_fitb_mask
-    from src.training.loss import fitb_cross_entropy
 
     bs, seq_len = input_ids.shape
     device = input_ids.device
@@ -77,11 +77,10 @@ def make_fitb_step_fn(model, optimizer, input_ids, config):
         ids_masked[fitb_mask] = config.fitb_id
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            per_pass_logits, aux = model.forward_segment(
-                ids_masked, fitb_mask=fitb_mask,
+            ce_loss, aux, valid = model.forward_segment(
+                ids_masked, fitb_mask=fitb_mask, target_ids=input_ids,
             )
-            loss, _ = fitb_cross_entropy(per_pass_logits, input_ids, fitb_mask)
-            loss = loss + aux
+            loss = ce_loss / valid.float().clamp(min=1) + aux
 
         loss.backward()
         optimizer.step()
@@ -196,7 +195,7 @@ def make_gpt2(bs, seq_len, vocab):
     return model, fwd
 
 
-def make_neuromorphic(bs, seq_len, vocab, tier="a"):
+def make_neuromorphic(bs, seq_len, vocab, tier="a", compile_model=False):
     from src.model.config import ModelConfig
     from src.model.model import NeuromorphicLM
 
@@ -205,6 +204,9 @@ def make_neuromorphic(bs, seq_len, vocab, tier="a"):
     model = NeuromorphicLM(config).to(DEVICE).to(torch.bfloat16)
     model.initialize_states(bs, DEVICE)
 
+    if compile_model:
+        model.forward_segment = torch.compile(model.forward_segment, mode="default")
+
     def fwd(m, ids):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits, _aux = m.forward_segment(ids)
@@ -212,7 +214,7 @@ def make_neuromorphic(bs, seq_len, vocab, tier="a"):
     return model, fwd
 
 
-def make_neuromorphic_fitb(bs, seq_len, vocab, tier="a"):
+def make_neuromorphic_fitb(bs, seq_len, vocab, tier="a", compile_model=False):
     """Create neuromorphic model configured for FITB benchmarking.
 
     Sets fitb_id / null_id to the last two vocab entries and mask_rate=0.3.
@@ -229,6 +231,9 @@ def make_neuromorphic_fitb(bs, seq_len, vocab, tier="a"):
     model = NeuromorphicLM(config).to(DEVICE).to(torch.bfloat16)
     model.initialize_states(bs, DEVICE)
 
+    if compile_model:
+        model.forward_segment = torch.compile(model.forward_segment, mode="default")
+
     def fwd(m, ids):
         """FITB forward for FLOPs counting — generates mask and runs FITB path."""
         from src.training.masking import generate_fitb_mask
@@ -239,10 +244,10 @@ def make_neuromorphic_fitb(bs, seq_len, vocab, tier="a"):
         ids_masked = ids.clone()
         ids_masked[fitb_mask] = config.fitb_id
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Use legacy path (no target_ids) for FLOPs counting
             per_pass_logits, _aux = m.forward_segment(
                 ids_masked, fitb_mask=fitb_mask,
             )
-            # Return last-pass logits for FLOPs compatibility (shape [BS,N,V])
             return per_pass_logits[-1]
 
     return model, fwd
@@ -435,12 +440,23 @@ def main():
     use_fitb = args.fitb
 
     # Model factories — closure over seq_len/vocab
+    # Two versions of neuromorphic factory:
+    #   - no compile for BS search (avoids compile memory overhead skewing max BS)
+    #   - with compile for actual benchmark measurement
     if use_fitb:
-        def _neuromorphic(bs):
-            return make_neuromorphic_fitb(bs, seq_len, vocab, tier=args.tier)
+        def _neuro_nocompile(bs):
+            return make_neuromorphic_fitb(bs, seq_len, vocab, tier=args.tier,
+                                          compile_model=False)
+        def _neuro_compiled(bs):
+            return make_neuromorphic_fitb(bs, seq_len, vocab, tier=args.tier,
+                                          compile_model=True)
     else:
-        def _neuromorphic(bs):
-            return make_neuromorphic(bs, seq_len, vocab, tier=args.tier)
+        def _neuro_nocompile(bs):
+            return make_neuromorphic(bs, seq_len, vocab, tier=args.tier,
+                                     compile_model=False)
+        def _neuro_compiled(bs):
+            return make_neuromorphic(bs, seq_len, vocab, tier=args.tier,
+                                     compile_model=True)
 
     def _pythia(bs):
         return make_pythia_160m(bs, seq_len, vocab)
@@ -455,11 +471,12 @@ def main():
     if use_fitb:
         neuro_name += "-FITB"
 
+    # (name, bs_search_factory, benchmark_factory, is_fitb)
     models = [
-        ("Pythia-160M", _pythia, False),
-        ("Mamba-130M", _mamba, False),
-        ("GPT2-124M", _gpt2, False),
-        (neuro_name, _neuromorphic, use_fitb),
+        ("Pythia-160M", _pythia, _pythia, False),
+        ("Mamba-130M", _mamba, _mamba, False),
+        ("GPT2-124M", _gpt2, _gpt2, False),
+        (neuro_name, _neuro_nocompile, _neuro_compiled, use_fitb),
     ]
 
     print(f"GPU: {torch.cuda.get_device_name()}")
@@ -468,18 +485,18 @@ def main():
           f"measure={args.measure}, neuro_mode={mode_str}")
     print(f"{'=' * 95}")
 
-    # Phase 1: find max batch sizes
+    # Phase 1: find max batch sizes (no compile — avoids overhead skewing max BS)
     print("\n--- Finding max training batch sizes ---")
     max_bs = {}
-    for name, factory, is_fitb in models:
+    for name, bs_factory, bench_factory, is_fitb in models:
         try:
-            bs = find_max_bs(name, factory, seq_len, vocab, fitb=is_fitb)
-            max_bs[name] = (factory, bs, is_fitb)
+            bs = find_max_bs(name, bs_factory, seq_len, vocab, fitb=is_fitb)
+            max_bs[name] = (bench_factory, bs, is_fitb)
         except Exception as e:
             import traceback; traceback.print_exc()
             print(f"  {name}: FAILED - {e}")
 
-    # Phase 2: full benchmarks
+    # Phase 2: full benchmarks (with compile for neuromorphic)
     print(f"\n{'=' * 95}")
     print("--- Benchmarking at max batch size ---")
 

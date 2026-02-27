@@ -106,21 +106,21 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         BS, N, B, C, D = q_nov.shape
 
-        # Flatten N*C per (BS, B): [BS, N, B, C] -> [BS, B, N*C]
+        # Only permute the small novelty tensor (no D dim) to [BS, B, N*C]
         nov_flat = novelty.permute(0, 2, 1, 3).reshape(BS, B, N * C)
 
-        # Flatten q/v: [BS, N, B, C, D] -> [BS, B, N*C, D]
-        q_flat = q_nov.permute(0, 2, 1, 3, 4).reshape(BS, B, N * C, D)
-        v_flat = v_nov.permute(0, 2, 1, 3, 4).reshape(BS, B, N * C, D)
-
-        # Top-k candidates
-        C_cand = min(C_cand, nov_flat.shape[-1])
+        C_cand = min(C_cand, N * C)
         topk_scores, topk_idx = nov_flat.topk(C_cand, dim=-1)  # [BS, B, C_cand]
 
-        # Gather
-        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [BS, B, C_cand, D]
-        cand_K = torch.gather(q_flat, 2, topk_idx_expanded)  # [BS, B, C_cand, D]
-        cand_V = torch.gather(v_flat, 2, topk_idx_expanded)  # [BS, B, C_cand, D]
+        # Convert flat indices to (n, c) coordinates for direct gather
+        n_idx = topk_idx // C  # [BS, B, C_cand]
+        c_idx = topk_idx % C   # [BS, B, C_cand]
+
+        # Gather from original [BS, N, B, C, D] layout (avoids 2 large permute copies)
+        bs_idx = torch.arange(BS, device=q_nov.device)[:, None, None]
+        b_idx = torch.arange(B, device=q_nov.device)[None, :, None]
+        cand_K = q_nov[bs_idx, n_idx, b_idx, c_idx]  # [BS, B, C_cand, D]
+        cand_V = v_nov[bs_idx, n_idx, b_idx, c_idx]  # [BS, B, C_cand, D]
 
         return cand_K, cand_V, topk_scores
 

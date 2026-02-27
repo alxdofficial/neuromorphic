@@ -42,16 +42,14 @@ def _make_compiled_step(model, config):
 
 
 def _make_compiled_fitb_step(model, config):
-    """Create a compiled FITB train step that fuses forward + per-pass CE loss."""
+    """Create a compiled FITB train step that fuses forward + inline CE loss."""
     @torch.compile(mode="default")
     def _step(seg_ids_masked, reset_mask, seg_ids_original, fitb_mask):
-        per_pass_logits, aux_loss = model.forward_segment(
-            seg_ids_masked, reset_mask, fitb_mask=fitb_mask
+        ce_loss, aux_loss, total_valid = model.forward_segment(
+            seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
+            target_ids=seg_ids_original,
         )
-        total_loss, total_valid = fitb_cross_entropy(
-            per_pass_logits, seg_ids_original, fitb_mask
-        )
-        return total_loss, aux_loss, total_valid
+        return ce_loss, aux_loss, total_valid
 
     return _step
 
@@ -208,12 +206,10 @@ class TBPTTTrainer:
                     )
                 else:
                     with amp_ctx:
-                        per_pass_logits, aux_loss = self.model.forward_segment(
-                            seg_ids_masked, reset_mask, fitb_mask=fitb_mask
+                        ce_loss, aux_loss, seg_valid = self.model.forward_segment(
+                            seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
+                            target_ids=seg_ids,
                         )
-                    ce_loss, seg_valid = fitb_cross_entropy(
-                        per_pass_logits, seg_ids, fitb_mask
-                    )
             else:
                 # NTP path
                 # Loss masking: skip EOT positions
