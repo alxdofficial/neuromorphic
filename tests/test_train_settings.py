@@ -35,15 +35,8 @@ def _args(**overrides):
         "val_interval": None,
         "text_sample_interval": None,
         "log_interval": None,
-        "snapshot": None,
-        "d_dec": None,
-        "decoder_layers": None,
-        "thalamic_tokens": None,
-        "n_heads_decoder": None,
         "compile": None,
-        "fla": False,
         "pcm": None,
-        "d_pc": None,
     }
     base.update(overrides)
     return argparse.Namespace(**base)

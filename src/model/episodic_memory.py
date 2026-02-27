@@ -1,499 +1,233 @@
 """
-Episodic Memory — fixed-size per-stream vector store.
+Episodic Memory (v4) — fixed-size per-stream vector store.
 
-One EM instance per block (B total). Provides long-range recall via
-novelty-based writes and top-k retrieval with cross-attention aggregation.
-
-State per stream:
-    em_K: [BS, M, D_em]   — keys (unit-normalized)
-    em_V: [BS, M, D_em]   — values
-    em_S: [BS, M]          — strengths (bounded)
-    em_age: [BS, M]        — tokens since last write (for temporal retrieval bias)
+Per-block (B_blocks instances). Operates in D_mem space.
+Read: top-k retrieval with cross-attention. Write: novelty-scored EMA.
 """
-
-import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
-from .utils import StateMixin, unit_normalize, budget_enforce, runtime_state_dtype
+from .utils import StateMixin, unit_normalize, budget_enforce
 
 
 class EpisodicMemory(nn.Module, StateMixin):
+    """Fixed-size episodic memory with top-k retrieval and novelty-based writes.
+
+    State:
+        em_K: [BS, M, D_mem] — keys (unit-normalized)
+        em_V: [BS, M, D_mem] — values
+        em_S: [BS, M] — strengths (bounded)
+        em_age: [BS, M] — tokens since last write
+    """
+
     _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, D_mem: int, M_slots: int, config: ModelConfig):
         super().__init__()
-        self.config = config
-        self.M = config.M
-        self.D_em = config.D_em
+        self.D_mem = D_mem
+        self.M = M_slots
         self.k_ret = config.k_ret
-        self.C = config.C_em
-        self.tau = config.tau_em
-        self.weakness_weight = config.weakness_weight_em
         self.S_max = config.S_max
         self.budget = config.budget_em
-        self.decay = config.decay_em
 
-        D = config.D
+        # Cross-attention for retrieval
+        self.W_q_cross = nn.Linear(D_mem, D_mem)
+        self.W_o_cross = nn.Linear(D_mem, D_mem)
 
-        # Query projection for retrieval
-        self.W_q_em = nn.Linear(D + D, config.D_em)  # concat(x, y_wm)
+        # State (lazily allocated)
+        self.em_K: Tensor | None = None
+        self.em_V: Tensor | None = None
+        self.em_S: Tensor | None = None
+        self.em_age: Tensor | None = None
 
-        # Cross-attention for aggregating retrieved tokens
-        self.W_q_cross = nn.Linear(D, config.D_em)
-        self.W_o_cross = nn.Linear(config.D_em, D)
-        self.cross_scale = (config.D_em) ** -0.5
+    def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
+        self.em_K = torch.zeros(BS, self.M, self.D_mem, device=device, dtype=dtype)
+        self.em_V = torch.zeros(BS, self.M, self.D_mem, device=device, dtype=dtype)
+        self.em_S = torch.zeros(BS, self.M, device=device, dtype=dtype)
+        self.em_age = torch.zeros(BS, self.M, device=device, dtype=dtype)
 
-        # Candidate proposal projections
-        self.W_k_cand = nn.Linear(D + D, config.D_em)    # from (x, y_wm)
-        self.W_v_cand = nn.Linear(config.D_h, config.D_em)  # from h_final (per-block)
+    def is_initialized(self) -> bool:
+        return self.em_K is not None
 
-        # Learned novelty weight adjuster (Phase B+, backprop only)
-        self.W_nov = nn.Linear(D + D, 1) if config.em_enabled else None
+    def read(self, q: Tensor) -> Tensor:
+        """Top-k retrieval + cross-attention.
 
-        # Temporal retrieval bias: learned scalar weight on log-age
-        # Initialized to 0 (no effect at start, purely content-based retrieval)
-        self.age_gate = nn.Parameter(torch.zeros(1))
-
-        # Post-retrieval MLP: processes the aggregated retrieved memory
-        if config.em_readout_ffn:
-            self.readout_norm = nn.LayerNorm(config.D_em)
-            self.readout_ffn = nn.Sequential(
-                nn.Linear(config.D_em, config.D_em * 4),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(config.D_em * 4, config.D_em),
-            )
-        else:
-            self.readout_norm = None
-            self.readout_ffn = None
-
-        # State (lazily initialized)
-        self.em_K: Tensor = None
-        self.em_V: Tensor = None
-        self.em_S: Tensor = None
-        self.em_age: Tensor = None
-
-    def reset_states(self, mask: Tensor):
-        """Reset EM state for masked streams — zero strengths and ages.
-
-        Unlike the default StateMixin.reset_states() which zeros all state
-        tensors, EM preserves em_K and em_V on doc boundary resets. Only
-        em_S (slot strengths) and em_age are zeroed, effectively making old
-        slots invisible to retrieval while keeping their content available
-        for future overwrites.
+        q: [BS,N,C,D_mem] -> [BS,N,C,D_mem]
         """
-        if self.em_S is not None and self.em_S.dim() >= 1:
-            expanded = mask
-            for _ in range(self.em_S.dim() - 1):
-                expanded = expanded.unsqueeze(-1)
-            self.em_S = self.em_S * (~expanded).to(self.em_S.dtype)
-            if self.em_age is not None:
-                self.em_age = self.em_age * (~expanded).to(self.em_age.dtype)
+        BS = q.shape[0]
+        prefix_shape = q.shape[:-1]  # [BS, N, C]
+        D = q.shape[-1]
 
-    def age_tick(self, n_tokens: int = 1):
-        """Increment age of all slots by n_tokens.
+        # Flatten to [BS, N*C, D_mem] for retrieval
+        q_flat = q.reshape(BS, -1, D)  # [BS, N*C, D_mem]
+        NC = q_flat.shape[1]
 
-        Called once per span (n_tokens=P) or once per step (n_tokens=1).
-        Only ages active slots (em_S > 0) to avoid aging empty slots.
-        """
-        if self.em_age is not None and self.em_S is not None:
-            active = (self.em_S > 0).to(self.em_age.dtype)
-            self.em_age = self.em_age + n_tokens * active
-
-    def _lazy_init(self, BS: int, device: torch.device):
-        """Initialize state on first forward pass."""
-        state_dtype = runtime_state_dtype(device)
-        self.em_K = unit_normalize(
-            torch.randn(BS, self.M, self.D_em, device=device, dtype=state_dtype)
-        )
-        self.em_V = (
-            torch.randn(BS, self.M, self.D_em, device=device, dtype=state_dtype) * 0.01
-        )
-        self.em_S = torch.zeros(BS, self.M, device=device, dtype=state_dtype)
-        self.em_age = torch.zeros(BS, self.M, device=device, dtype=state_dtype)
-
-    def retrieve(self, x: Tensor, y_wm: Tensor) -> Tensor:
-        """Query EM and return aggregated output.
-
-        Args:
-            x: [BS, D] — current token embedding
-            y_wm: [BS, D] — working memory output
-
-        Returns:
-            y_em: [BS, D]
-        """
-        BS = x.shape[0]
-        device = x.device
-
-        if self.em_K is None:
-            self._lazy_init(BS, device)
-
-        # Compute query (cast to state dtype to match em_K which is bf16 on CUDA)
-        q = unit_normalize(self.W_q_em(torch.cat([x, y_wm], dim=-1)))  # [BS, D_em]
-        q = q.to(self.em_K.dtype)
-
-        # Score against all slots
-        scores = torch.einsum("bd, bmd -> bm", q, self.em_K)  # [BS, M]
-
-        # Temporal retrieval bias: learned preference for recent vs old memories
-        if self.em_age is not None:
-            age_bias = self.age_gate * torch.log1p(self.em_age.to(scores.dtype))
-            scores = scores + age_bias
+        # Scores against all slots
+        scores = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BS, N*C, M]
 
         # Mask inactive slots (S == 0)
-        active_mask = self.em_S > 0
-        scores = scores.masked_fill(~active_mask, float("-inf"))
+        active_mask = (self.em_S > 0).unsqueeze(1)  # [BS, 1, M]
+        scores = scores.masked_fill(~active_mask, -1e9)
 
         # Top-k retrieval
         k = min(self.k_ret, self.M)
-        topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, k]
+        topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, N*C, k]
 
-        # Gather keys and values
-        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, self.D_em)
-        K_top = self.em_K.gather(1, topk_idx_exp)  # [BS, k, D_em]
-        V_top = self.em_V.gather(1, topk_idx_exp)  # [BS, k, D_em]
+        # Gather top-k keys and values
+        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [BS, N*C, k, D]
+        em_K_expanded = self.em_K.unsqueeze(1).expand(-1, NC, -1, -1)  # [BS, N*C, M, D]
+        em_V_expanded = self.em_V.unsqueeze(1).expand(-1, NC, -1, -1)
+        K_top = torch.gather(em_K_expanded, 2, topk_idx_expanded)  # [BS, N*C, k, D]
+        V_top = torch.gather(em_V_expanded, 2, topk_idx_expanded)
 
-        # Cross-attention aggregation
-        q_cross = self.W_q_cross(x).to(K_top.dtype)  # [BS, D_em]
-        # Attention weights from K_top (keys), applied to V_top (values).
-        # Adding topk_scores preserves a differentiable path from retrieval query
-        # (W_q_em) to downstream loss through selected memory logits.
-        attn = torch.einsum("bd, bkd -> bk", q_cross, K_top) * self.cross_scale
-        attn = attn + topk_scores
-        # Mask out -inf topk positions (no active slots)
-        attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
-        # When all slots are inactive, all attn values are -inf and softmax
-        # would produce NaN. Detect this and zero out those rows instead.
-        all_inactive = (topk_scores == float("-inf")).all(dim=-1, keepdim=True)  # [BS, 1]
-        attn = torch.softmax(attn, dim=-1)
-        attn = torch.where(all_inactive, torch.zeros_like(attn), attn)
+        # Cross-attention
+        q_cross = self.W_q_cross(q_flat)  # [BS, N*C, D_mem]
+        attn_logits = torch.einsum("bnd, bnkd -> bnk", q_cross, K_top)  # [BS, N*C, k]
+        attn_logits = attn_logits + topk_scores  # add retrieval score as bias
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [BS, N*C, k]
+        out = torch.einsum("bnk, bnkd -> bnd", attn_weights, V_top)  # [BS, N*C, D_mem]
+        out = self.W_o_cross(out)
 
-        out = torch.einsum("bk, bkd -> bd", attn, V_top)  # [BS, D_em]
-        out = out.float()  # back to param dtype for LayerNorm/FFN/projection
+        # Reshape back to prefix shape
+        return out.reshape(*prefix_shape, D)
 
-        # Post-retrieval processing
-        if self.readout_ffn is not None:
-            out = out + self.readout_ffn(self.readout_norm(out))
+    def score_novelty(self, q_nov: Tensor, surprise: Tensor, w_nov: Tensor) -> Tensor:
+        """Score novelty for candidate selection.
 
-        y_em = self.W_o_cross(out)  # [BS, D]
-
-        return y_em
-
-    def retrieve_batch(self, x_all: Tensor, y_wm_all: Tensor) -> Tensor:
-        """Query EM for P tokens in parallel.
-
-        Args:
-            x_all: [BS, P, D] — token embeddings
-            y_wm_all: [BS, P, D] — working memory outputs
-
-        Returns:
-            y_em_all: [BS, P, D]
+        q_nov: [BS,N,C,D_mem], surprise: [BS,N,C], w_nov: [BS,N,C]
+        Returns: novelty [BS,N,C]
         """
-        BS, P, D = x_all.shape
+        BS = q_nov.shape[0]
+        prefix_shape = q_nov.shape[:-1]
+        q_flat = q_nov.reshape(BS, -1, self.D_mem)  # [BS, N*C, D_mem]
 
-        # Compute queries: [BS, P, D_em] (cast to state dtype to match em_K)
-        q = unit_normalize(self.W_q_em(torch.cat([x_all, y_wm_all], dim=-1)))
-        q = q.to(self.em_K.dtype)
+        # Max cosine similarity against em_K
+        if self.em_S is not None and (self.em_S > 0).any():
+            sim = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BS, N*C, M]
+            active_mask = (self.em_S > 0).unsqueeze(1)
+            sim = sim.masked_fill(~active_mask, -1.0)
+            max_sim = sim.max(dim=-1).values  # [BS, N*C]
+            max_sim = max_sim.reshape(*prefix_shape)
+        else:
+            max_sim = torch.zeros(prefix_shape, device=q_nov.device, dtype=q_nov.dtype)
 
-        # Score against all slots: [BS, P, M]
-        scores = torch.einsum("bpd, bmd -> bpm", q, self.em_K)
+        novelty = w_nov * surprise + (1 - w_nov) * (1 - max_sim)
+        return novelty
 
-        # Temporal retrieval bias: learned preference for recent vs old memories
-        if self.em_age is not None:
-            age_bias = self.age_gate * torch.log1p(self.em_age.to(scores.dtype))
-            scores = scores + age_bias.unsqueeze(1)  # [BS, 1, M] broadcast over P
+    def select_top_candidates(self, q_nov: Tensor, v_nov: Tensor,
+                               novelty: Tensor, C_cand: int):
+        """Select top-C_cand candidates across all N*C positions.
 
-        # Mask inactive slots
-        active_mask = self.em_S > 0  # [BS, M]
-        scores = scores.masked_fill(~active_mask.unsqueeze(1), float("-inf"))
-
-        # Top-k retrieval per token
-        k = min(self.k_ret, self.M)
-        topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BS, P, k]
-
-        # Gather keys and values from [BS, M, D_em] directly (avoids
-        # materializing [BS, P, M, D_em] intermediate tensors).
-        topk_flat = topk_idx.reshape(BS, P * k)                          # [BS, P*k]
-        topk_flat_exp = topk_flat.unsqueeze(-1).expand(-1, -1, self.D_em)  # [BS, P*k, D_em]
-        K_top = self.em_K.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
-        V_top = self.em_V.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
-
-        # Cross-attention: [BS, P, D_em]
-        q_cross = self.W_q_cross(x_all).to(K_top.dtype)
-        attn = torch.einsum("bpd, bpkd -> bpk", q_cross, K_top) * self.cross_scale
-        attn = attn + topk_scores
-        attn = attn.masked_fill(topk_scores == float("-inf"), float("-inf"))
-        # When all slots are inactive, all attn values are -inf and softmax
-        # would produce NaN. Detect this and zero out those rows instead.
-        all_inactive = (topk_scores == float("-inf")).all(dim=-1, keepdim=True)  # [BS, P, 1]
-        attn = torch.softmax(attn, dim=-1)
-        attn = torch.where(all_inactive, torch.zeros_like(attn), attn)
-
-        out = torch.einsum("bpk, bpkd -> bpd", attn, V_top)  # [BS, P, D_em]
-        out = out.float()  # back to param dtype for LayerNorm/FFN/projection
-
-        if self.readout_ffn is not None:
-            out = out + self.readout_ffn(self.readout_norm(out))
-
-        y_em_all = self.W_o_cross(out)  # [BS, P, D]
-
-        # Cache top-k indices for novelty approximation in propose_candidate_batch
-        self._last_topk_idx = topk_idx  # [BS, P, k]
-
-        return y_em_all
-
-    def propose_candidate(self, x: Tensor, y_wm: Tensor,
-                          h_final: Tensor, surprise: Tensor) -> tuple:
-        """Per-token candidate proposal.
-
-        Args:
-            x: [BS, D] — token embedding
-            y_wm: [BS, D] — WM output
-            h_final: [BS, D_h] — final layer output for this block
-            surprise: [BS, 1] — current surprise
-
-        Returns:
-            k_cand: [BS, D_em]
-            v_cand: [BS, D_em]
-            novelty: [BS]
+        Returns: (cand_K, cand_V, cand_scores) each [BS, C_cand, D_mem] or [BS, C_cand]
         """
-        k_cand = unit_normalize(self.W_k_cand(torch.cat([x, y_wm], dim=-1)))
-        v_cand = self.W_v_cand(h_final)
+        BS = q_nov.shape[0]
+        D = q_nov.shape[-1]
 
-        # Novelty = surprise + (1 - max cosine similarity to active keys)
-        cold_start = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
-        if self.em_K is not None:
-            cos_sim = torch.einsum("bd, bmd -> bm", k_cand.to(self.em_K.dtype), self.em_K)  # [BS, M]
-            if self.em_S is not None:
-                active_mask = self.em_S > 0
-                masked = cos_sim.masked_fill(~active_mask, float("-inf"))
-                any_active = active_mask.any(dim=-1)
-                max_sim = torch.where(
-                    any_active,
-                    masked.max(dim=-1).values,
-                    torch.zeros_like(masked[..., 0]),
-                )
-                cold_start = ~any_active
-            else:
-                max_sim = cos_sim.max(dim=-1).values
-                cold_start = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
-        else:
-            max_sim = torch.zeros(x.shape[0], device=x.device)
+        # Flatten N*C
+        q_flat = q_nov.reshape(BS, -1, D)   # [BS, N*C, D_mem]
+        v_flat = v_nov.reshape(BS, -1, D)   # [BS, N*C, D_mem]
+        nov_flat = novelty.reshape(BS, -1)   # [BS, N*C]
 
-        surprise_1d = surprise.squeeze(-1)
-        if self.W_nov is not None:
-            w_nov = torch.sigmoid(self.W_nov(torch.cat([x, y_wm], dim=-1))).squeeze(-1)
-            novelty = (w_nov * surprise_1d + (1.0 - w_nov) * (1.0 - max_sim)).clamp(0.0, 1.0)
-        else:
-            novelty = (0.5 * surprise_1d + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
+        # Top-k candidates
+        C_cand = min(C_cand, nov_flat.shape[1])
+        topk_scores, topk_idx = nov_flat.topk(C_cand, dim=-1)  # [BS, C_cand]
 
-        # Cold start: when no active slots, similarity term is undefined.
-        # Use surprise only — don't get a free +0.5 from max_sim=0.
-        novelty = torch.where(cold_start, surprise_1d.clamp(0.0, 1.0), novelty)
+        # Gather
+        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, D)  # [BS, C_cand, D_mem]
+        cand_K = torch.gather(q_flat, 1, topk_idx_expanded)  # [BS, C_cand, D_mem]
+        cand_V = torch.gather(v_flat, 1, topk_idx_expanded)  # [BS, C_cand, D_mem]
 
-        return k_cand, v_cand, novelty
+        return cand_K, cand_V, topk_scores
 
-    def propose_candidate_batch(self, x_all: Tensor, y_wm_all: Tensor,
-                                h_final_all: Tensor,
-                                surprise_all: Tensor) -> tuple:
-        """Per-token candidate proposal for P tokens in parallel.
+    def write(self, cand_K: Tensor, cand_V: Tensor, cand_scores: Tensor,
+              g_em: Tensor, tau: Tensor, decay: Tensor):
+        """Write candidates to EM via EMA.
 
-        Args:
-            x_all: [BS, P, D] — token embeddings
-            y_wm_all: [BS, P, D] — WM outputs
-            h_final_all: [BS, P, D_h] — final layer outputs
-            surprise_all: [BS, P, 1] — per-token surprise
-
-        Returns:
-            k_cand: [BS, P, D_em]
-            v_cand: [BS, P, D_em]
-            novelty: [BS, P]
+        cand_K: [BS, C_cand, D_mem]
+        cand_V: [BS, C_cand, D_mem]
+        cand_scores: [BS, C_cand]
+        g_em: [BS]
+        tau: [BS]
+        decay: [BS]
         """
-        BS, P, D = x_all.shape
+        BS, C_cand, D = cand_K.shape
 
-        k_cand = unit_normalize(self.W_k_cand(torch.cat([x_all, y_wm_all], dim=-1)))
-        v_cand = self.W_v_cand(h_final_all)
+        # Score candidates against all slots for slot selection
+        cand_K_norm = unit_normalize(cand_K)
+        slot_scores = torch.einsum(
+            "bcd, bmd -> bcm", cand_K_norm, self.em_K
+        )  # [BS, C_cand, M]
 
-        # Novelty = surprise + (1 - max cosine similarity to active keys)
-        # Approximation: only score against top-k retrieved slots (cached from
-        # retrieve_batch) instead of full O(BS*P*M*D_em) dense pass. The top-k
-        # most similar slots under retrieval are almost certainly the most
-        # similar under the candidate key projection too.
-        cold_start = torch.ones(BS, dtype=torch.bool, device=x_all.device)
-        if self.em_K is not None and hasattr(self, '_last_topk_idx') and self._last_topk_idx is not None:
-            # Gather only the top-k retrieved keys: [BS, P, k, D_em]
-            topk_idx = self._last_topk_idx  # [BS, P, k]
-            k = topk_idx.shape[-1]
-            topk_flat = topk_idx.reshape(BS, P * k)
-            topk_flat_exp = topk_flat.unsqueeze(-1).expand(-1, -1, self.D_em)
-            K_topk = self.em_K.gather(1, topk_flat_exp).reshape(BS, P, k, self.D_em)
-            # Score k_cand against retrieved keys only: [BS, P, k]
-            cos_sim_topk = torch.einsum("bpd, bpkd -> bpk", k_cand.to(K_topk.dtype), K_topk)
-            if self.em_S is not None:
-                any_active = (self.em_S > 0).any(dim=-1)  # [BS]
-                max_sim = cos_sim_topk.max(dim=-1).values  # [BS, P]
-                max_sim = torch.where(
-                    any_active.unsqueeze(1), max_sim, torch.zeros_like(max_sim),
-                )
-                cold_start = ~any_active
-            else:
-                max_sim = cos_sim_topk.max(dim=-1).values
-                cold_start = torch.zeros(BS, dtype=torch.bool, device=x_all.device)
-        elif self.em_K is not None:
-            # Fallback: full dense scoring (when retrieve_batch wasn't called)
-            cos_sim = torch.einsum("bpd, bmd -> bpm", k_cand.to(self.em_K.dtype), self.em_K)
-            if self.em_S is not None:
-                active_mask = self.em_S > 0
-                masked = cos_sim.masked_fill(~active_mask.unsqueeze(1), float("-inf"))
-                any_active = active_mask.any(dim=-1)
-                max_sim = masked.max(dim=-1).values
-                max_sim = torch.where(
-                    any_active.unsqueeze(1), max_sim, torch.zeros_like(max_sim),
-                )
-                cold_start = ~any_active
-            else:
-                max_sim = cos_sim.max(dim=-1).values
-                cold_start = torch.zeros(BS, dtype=torch.bool, device=x_all.device)
-        else:
-            max_sim = torch.zeros(BS, P, device=x_all.device)
+        # Weakness bias: prefer weaker slots
+        weakness = -self.em_S.unsqueeze(1)  # [BS, 1, M]
+        slot_scores = slot_scores + 0.5 * weakness
 
-        surprise_2d = surprise_all.squeeze(-1)  # [BS, P]
-        if self.W_nov is not None:
-            w_nov = torch.sigmoid(
-                self.W_nov(torch.cat([x_all, y_wm_all], dim=-1))
-            ).squeeze(-1)  # [BS, P]
-            novelty = (w_nov * surprise_2d + (1.0 - w_nov) * (1.0 - max_sim)).clamp(0.0, 1.0)
-        else:
-            novelty = (0.5 * surprise_2d + 0.5 * (1.0 - max_sim)).clamp(0.0, 1.0)
+        # Softmax slot selection
+        slot_weights = F.softmax(
+            slot_scores / tau.reshape(BS, 1, 1).clamp(min=0.01), dim=-1
+        )  # [BS, C_cand, M]
 
-        # Cold start: use surprise only
-        novelty = torch.where(
-            cold_start.unsqueeze(1),
-            surprise_2d.clamp(0.0, 1.0),
-            novelty,
-        )
+        # Write strength per candidate
+        cand_weight = cand_scores / (cand_scores.sum(dim=-1, keepdim=True) + 1e-8)
+        alpha = g_em.reshape(BS, 1, 1) * cand_weight.unsqueeze(-1) * slot_weights  # [BS, C_cand, M]
 
-        return k_cand, v_cand, novelty
+        # Sum across candidates for each slot
+        alpha_per_slot = alpha.sum(dim=1)  # [BS, M]
 
-    def write_at_boundary(self, cand_K: Tensor, cand_V: Tensor,
-                          cand_score: Tensor,
-                          g_em: Tensor, tau: Tensor, weakness_weight: Tensor,
-                          decay: Tensor,
-                          cand_valid: Tensor = None):
-        """Span-boundary EM write. Top-C candidates, softmax multi-slot EMA.
+        # Weighted candidate blend per slot
+        blended_K = torch.einsum("bcm, bcd -> bmd", alpha, cand_K_norm)  # [BS, M, D]
+        blended_V = torch.einsum("bcm, bcd -> bmd", alpha, cand_V)       # [BS, M, D]
 
-        All arguments are continuous — no binary write_mask. Write strength
-        is controlled by g_em (near-floor = soft "don't write").
+        # Normalize by alpha
+        denom = alpha_per_slot.unsqueeze(-1).clamp(min=1e-8)
+        blended_K = blended_K / denom
+        blended_V = blended_V / denom
 
-        Args:
-            cand_K: [BS, P, D_em] — candidate keys from span
-            cand_V: [BS, P, D_em] — candidate values from span
-            cand_score: [BS, P] — novelty scores from span
-            g_em: [BS] — write strength per stream
-            tau: [BS] — softmax temperature for slot selection
-            weakness_weight: [BS] — weakness bias weight
-            decay: [BS] — per-stream strength decay rate
-            cand_valid: [BS, P] bool — optional candidate validity mask
-        """
-        if self.em_K is None:
-            return
+        # EMA update (only slots with nonzero alpha)
+        update_mask = (alpha_per_slot > 1e-8).unsqueeze(-1)  # [BS, M, 1]
+        alpha_exp = alpha_per_slot.unsqueeze(-1).clamp(max=1.0)
 
-        BS = g_em.shape[0]
-        device = cand_score.device
-        state_dtype = self.em_K.dtype
-        cand_K = cand_K.to(state_dtype)
-        cand_V = cand_V.to(state_dtype)
-        cand_score = cand_score.to(state_dtype)
-        g_em = g_em.to(state_dtype)
-        tau = tau.to(state_dtype)
-        weakness_weight = weakness_weight.to(state_dtype)
-        decay = decay.to(state_dtype)
+        new_K = (1 - alpha_exp) * self.em_K + alpha_exp * unit_normalize(blended_K)
+        new_V = (1 - alpha_exp) * self.em_V + alpha_exp * blended_V
 
-        if cand_valid is None:
-            cand_valid = torch.ones_like(cand_score, dtype=torch.bool, device=device)
-        else:
-            cand_valid = cand_valid.bool()
+        self.em_K = torch.where(update_mask, new_K, self.em_K)
+        self.em_V = torch.where(update_mask, new_V, self.em_V)
 
-        # Select top-C candidates per stream
-        C = min(self.C, cand_score.shape[1])
-        masked_scores = cand_score.masked_fill(~cand_valid, float("-inf"))
-        topC_scores, topC_idx = masked_scores.topk(C, dim=-1)  # [BS, C]
+        # Strength update
+        self.em_S = (self.em_S + alpha_per_slot).clamp(0, self.S_max)
 
-        topC_idx_exp = topC_idx.unsqueeze(-1).expand(-1, -1, self.D_em)
-        K_C = cand_K.gather(1, topC_idx_exp)  # [BS, C, D_em]
-        V_C = cand_V.gather(1, topC_idx_exp)  # [BS, C, D_em]
+        # Age reset for updated slots
+        self.em_age = self.em_age * (1 - alpha_per_slot)
 
-        # For each candidate, softmax-select slots to update
-        tau_expanded = tau.unsqueeze(-1)  # [BS, 1]
+        # Decay
+        self.em_S = self.em_S * decay.unsqueeze(-1)
 
-        # Vectorized write: score ALL candidates against the initial em_K state
-        # (stale scoring — each candidate doesn't see previous writes).
-        # Bounded approximation: g_em alphas are small, each write changes <1%.
-
-        # Score all C candidates against current (frozen) em_K: [BS, C, M]
-        scores_slot = torch.einsum("bcd, bmd -> bcm", K_C.to(self.em_K.dtype), self.em_K)
-        scores_slot = scores_slot - weakness_weight.unsqueeze(-1).unsqueeze(-1) * self.em_S.unsqueeze(1)
-
-        # Softmax slot selection per candidate: [BS, C, M]
-        w = torch.softmax(scores_slot / tau_expanded.unsqueeze(-1), dim=-1)
-
-        # Apply write strength: [BS, C, M]
-        score_ok = torch.isfinite(topC_scores)  # [BS, C]
-        alpha = w * g_em.unsqueeze(-1).unsqueeze(-1) * score_ok.to(w.dtype).unsqueeze(-1)
-
-        # Sum alpha across all candidates: [BS, M]
-        alpha_raw_sum = alpha.sum(dim=1)  # [BS, M] — raw sum, possibly > 1
-        # Clamp to [0, 1] so EMA interpolation stays valid — multiple candidates
-        # targeting the same slot can push the raw sum above 1.
-        alpha_sum = alpha_raw_sum.clamp(max=1.0)
-
-        # Weighted average of candidate keys/values: [BS, M, D_em]
-        # Each slot gets a blend of all C candidates weighted by their alpha.
-        # Normalize with raw sum so weights sum to 1.0 (convex combination).
-        alpha_norm = alpha / alpha_raw_sum.unsqueeze(1).clamp(min=1e-8)  # [BS, C, M]
-        blended_K = torch.einsum("bcm, bcd -> bmd", alpha_norm, K_C)  # [BS, M, D_em]
-        blended_V = torch.einsum("bcm, bcd -> bmd", alpha_norm, V_C)  # [BS, M, D_em]
-
-        # EMA update with combined alpha
-        alpha_sum_3d = alpha_sum.unsqueeze(-1)  # [BS, M, 1]
-        self.em_K = unit_normalize(
-            (1 - alpha_sum_3d) * self.em_K + alpha_sum_3d * blended_K
-        )
-        self.em_V = (1 - alpha_sum_3d) * self.em_V + alpha_sum_3d * blended_V
-
-        # Strength update: sum of per-candidate strength contributions
-        score_strength = torch.where(
-            score_ok, topC_scores, torch.zeros_like(topC_scores)
-        )  # [BS, C]
-        strength_contrib = (alpha * score_strength.unsqueeze(-1)).sum(dim=1)  # [BS, M]
-        self.em_S = (self.em_S + strength_contrib).clamp(0.0, self.S_max)
-
-        # Update temporal ages: written slots reset proportional to write strength
-        if self.em_age is not None:
-            self.em_age = self.em_age * (1 - alpha_sum)
-
-        # Always decay strengths each boundary (even if no writes happened).
-        self.em_S = self.em_S * decay.unsqueeze(-1)  # [BS] -> [BS, 1] broadcast
+        # Budget enforcement
         self.em_S = budget_enforce(self.em_S, self.budget)
+
+    def age_tick(self, n_tokens: int):
+        """Increment age of active slots."""
+        if self.em_age is not None:
+            active = (self.em_S > 0).float()
+            self.em_age = self.em_age + n_tokens * active
+
+    def reset_states(self, mask: Tensor):
+        """Custom reset: zero S and age, preserve K/V (makes slots invisible)."""
+        if self.em_S is None:
+            return
+        expanded = mask.unsqueeze(-1)  # [BS, 1]
+        self.em_S = self.em_S * (~expanded).to(self.em_S.dtype)
+        self.em_age = self.em_age * (~expanded).to(self.em_age.dtype)
 
 
 class EMNeuromodulator(nn.Module):
-    """Neuromodulator for EM write strength, temperature, weakness weight, and decay.
+    """Neuromodulator for EM write decisions.
 
-    Produces fully differentiable outputs. Trained by main-loss gradient
-    through the EM write → retrieve chain.
-
-    When em_enabled: learned backbone with content-aware features.
-    When not em_enabled: heuristic defaults.
-
-    Returns:
-        g_em: [BS] — write strength
-        tau: [BS] — softmax temperature for slot selection
-        ww: [BS] — weakness weight
-        decay: [BS] — per-span strength decay rate
+    Returns: g_em [BS], tau [BS], decay [BS]
     """
 
     def __init__(self, config: ModelConfig):
@@ -501,117 +235,70 @@ class EMNeuromodulator(nn.Module):
         self.em_enabled = config.em_enabled
         self.default_g = config.g_em_default
         self.default_tau = config.tau_em
-        self.default_ww = config.weakness_weight_em
         self.default_decay = config.decay_em
         self.g_em_floor = config.g_em_floor
         self.g_em_ceil = config.g_em_ceil
         self.tau_floor = config.tau_em_floor
         self.tau_ceil = config.tau_em_ceil
-        self.ww_floor = config.ww_em_floor
-        self.ww_ceil = config.ww_em_ceil
         self.decay_floor = config.decay_em_floor
         self.decay_ceil = config.decay_em_ceil
 
         if self.em_enabled:
             H = config.neuromod_hidden
-            n_scalar = 3  # span_surprise, em_usage, cand_novelty_mean
+            n_scalar = 2  # novelty_mean, em_usage
             n_content = config.content_proj_dim
             n_features = n_scalar + n_content
 
-            # Content projection: cand_K mean [D_em] → [content_proj_dim]
-            self.content_proj = nn.Linear(config.D_em, n_content)
-
+            self.content_proj = nn.Linear(config.D_mem, n_content)
             self.backbone = nn.Sequential(
                 nn.Linear(n_features, H),
                 nn.ReLU(),
             )
             self.g_head = nn.Linear(H, 1)
             self.tau_head = nn.Linear(H, 1)
-            self.ww_head = nn.Linear(H, 1)
             self.decay_head = nn.Linear(H, 1)
 
-            # Zero backbone bias: zero input → zero backbone → head biases
             nn.init.zeros_(self.backbone[0].bias)
-
-            # Content proj: small init so content features start near zero
             nn.init.normal_(self.content_proj.weight, std=0.01)
             nn.init.zeros_(self.content_proj.bias)
 
-            # g_em: sigmoid maps to [g_em_floor, g_em_ceil], init to g_em_default
-            g_frac = (config.g_em_default - config.g_em_floor) / max(config.g_em_ceil - config.g_em_floor, 1e-8)
-            g_frac = max(min(g_frac, 0.999), 0.001)
-            nn.init.normal_(self.g_head.weight, std=0.01)
-            nn.init.constant_(self.g_head.bias, math.log(g_frac / (1.0 - g_frac)))
-
-            tau_frac = (config.tau_em - config.tau_em_floor) / max(config.tau_em_ceil - config.tau_em_floor, 1e-8)
-            tau_frac = max(min(tau_frac, 0.999), 0.001)
-            nn.init.normal_(self.tau_head.weight, std=0.01)
-            nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
-
-            ww_frac = (config.weakness_weight_em - config.ww_em_floor) / max(config.ww_em_ceil - config.ww_em_floor, 1e-8)
-            ww_frac = max(min(ww_frac, 0.999), 0.001)
-            nn.init.normal_(self.ww_head.weight, std=0.01)
-            nn.init.constant_(self.ww_head.bias, math.log(ww_frac / (1.0 - ww_frac)))
-
-            decay_frac = (config.decay_em - config.decay_em_floor) / max(config.decay_em_ceil - config.decay_em_floor, 1e-8)
-            decay_frac = max(min(decay_frac, 0.999), 0.001)
-            nn.init.normal_(self.decay_head.weight, std=0.01)
-            nn.init.constant_(self.decay_head.bias, math.log(decay_frac / (1.0 - decay_frac)))
-
-    def forward(self, span_surprise: Tensor, em_usage: Tensor,
-                cand_novelty_mean: Tensor,
-                content_emb: Tensor = None) -> tuple:
-        """Forward pass.
-
-        Args:
-            span_surprise: [BS] — mean surprise over span
-            em_usage: [BS] — total EM strength usage
-            cand_novelty_mean: [BS] — mean candidate novelty
-            content_emb: [BS, D_em] or None — mean candidate key embedding
-
-        Returns:
-            (g_em, tau, ww, decay)
+    def forward(self, novelty_mean: Tensor, em_usage: Tensor,
+                content_emb: Tensor | None = None):
         """
-        if self.em_enabled:
-            return self._forward_learned(span_surprise, em_usage, cand_novelty_mean, content_emb)
-        return self._forward_heuristic(span_surprise)
+        novelty_mean: [BS]
+        em_usage: [BS]
+        content_emb: [BS, D_mem] (optional)
 
-    def _forward_heuristic(self, span_surprise):
-        """Defaults when EM disabled (Phase A)."""
-        g_em = torch.full_like(span_surprise, self.default_g)
-        tau = torch.full_like(span_surprise, self.default_tau)
-        ww = torch.full_like(span_surprise, self.default_ww)
-        decay = torch.full_like(span_surprise, self.default_decay)
-        return g_em, tau, ww, decay
+        Returns: g_em [BS], tau [BS], decay [BS]
+        """
+        if not self.em_enabled:
+            BS = novelty_mean.shape[0]
+            device = novelty_mean.device
+            return (
+                torch.full((BS,), self.default_g, device=device),
+                torch.full((BS,), self.default_tau, device=device),
+                torch.full((BS,), self.default_decay, device=device),
+            )
 
-    def _forward_learned(self, span_surprise, em_usage, cand_novelty_mean, content_emb):
-        """Fully differentiable learned mode."""
-        feat_dtype = self.backbone[0].weight.dtype
-        scalar_features = torch.stack([span_surprise, em_usage, cand_novelty_mean], dim=-1)  # [BS, 3]
-        scalar_features = scalar_features.to(feat_dtype)
-
+        features = [novelty_mean.unsqueeze(-1), em_usage.unsqueeze(-1)]
         if content_emb is not None:
-            content_features = self.content_proj(content_emb.to(feat_dtype))  # [BS, content_proj_dim]
-            features = torch.cat([scalar_features, content_features], dim=-1)
+            features.append(self.content_proj(content_emb))
         else:
-            features = torch.cat([
-                scalar_features,
-                torch.zeros(span_surprise.shape[0], self.content_proj.out_features,
-                            device=span_surprise.device, dtype=feat_dtype)
-            ], dim=-1)
+            features.append(torch.zeros(
+                novelty_mean.shape[0], self.content_proj.out_features,
+                device=novelty_mean.device, dtype=novelty_mean.dtype,
+            ))
 
-        h = self.backbone(features)
+        x = torch.cat(features, dim=-1)
+        h = self.backbone(x)
 
-        raw_g = torch.sigmoid(self.g_head(h)).squeeze(-1)
-        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * raw_g
+        g_raw = self.g_head(h).squeeze(-1)
+        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * torch.sigmoid(g_raw)
 
-        raw_tau = torch.sigmoid(self.tau_head(h)).squeeze(-1)
-        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * raw_tau
+        tau_raw = self.tau_head(h).squeeze(-1)
+        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * torch.sigmoid(tau_raw)
 
-        raw_ww = torch.sigmoid(self.ww_head(h)).squeeze(-1)
-        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * raw_ww
+        decay_raw = self.decay_head(h).squeeze(-1)
+        decay = self.decay_floor + (self.decay_ceil - self.decay_floor) * torch.sigmoid(decay_raw)
 
-        raw_decay = torch.sigmoid(self.decay_head(h)).squeeze(-1)
-        decay = self.decay_floor + (self.decay_ceil - self.decay_floor) * raw_decay
-
-        return g_em, tau, ww, decay
+        return g_em, tau, decay

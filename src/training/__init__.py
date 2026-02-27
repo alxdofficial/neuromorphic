@@ -1,4 +1,4 @@
-# Training utilities for neuromorphic LM
+# Training utilities for neuromorphic LM (v4)
 from .trainer import TBPTTTrainer
 from .loss import online_cross_entropy, compute_regularizers
 from .validation import evaluate_validation

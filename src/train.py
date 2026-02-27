@@ -128,8 +128,8 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--phase", type=str, default=None,
                        help="Single phase to run (A or B)")
     p.add_argument("--tier", type=str, default=None,
-                   choices=["a", "a_wide", "b", "1b", "c"],
-                   help="Model size tier (a_wide/1b are deprecated aliases)")
+                   choices=["a", "b", "c"],
+                   help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")
     p.add_argument("--steps", type=int, default=None,
@@ -174,33 +174,16 @@ def parse_args() -> argparse.Namespace:
                    help="Text sample generation interval in steps (0 = disabled)")
     p.add_argument("--log-interval", type=int, default=None,
                    help="Log print interval in steps")
-    # Spatial decoder
-    p.add_argument("--snapshot", action="store_true", default=None,
-                   help="Enable spatial decoder (snapshot_enabled=True)")
-    p.add_argument("--no-snapshot", dest="snapshot", action="store_false",
-                   help="Disable spatial decoder")
     # torch.compile
     p.add_argument("--compile", action="store_true", default=None,
                    help="Enable torch.compile for CUDA training")
     p.add_argument("--no-compile", dest="compile", action="store_false",
                    help="Disable torch.compile")
-    p.add_argument("--fla", action="store_true", default=False,
-                   help="Use FLA Triton kernels for scan/GLA (skips compile)")
     # Predictive Coding Module
     p.add_argument("--pcm", action="store_true", default=None,
-                   help="Enable Predictive Coding Module (per-block)")
+                   help="Enable Predictive Coding Module")
     p.add_argument("--no-pcm", dest="pcm", action="store_false",
                    help="Disable Predictive Coding Module")
-    p.add_argument("--d-pc", type=int, default=None,
-                   help="PCM latent dimension")
-    p.add_argument("--d-dec", type=int, default=None,
-                   help="Decoder working dimension")
-    p.add_argument("--decoder-layers", type=int, default=None,
-                   help="Deep decoder depth")
-    p.add_argument("--thalamic-tokens", type=int, default=None,
-                   help="Output tokens from thalamic integrator")
-    p.add_argument("--n-heads-decoder", type=int, default=None,
-                   help="Attention heads in decoder")
     return p.parse_args()
 
 
@@ -423,43 +406,18 @@ def resolve_settings(args: argparse.Namespace) -> dict:
         "seed": args.seed if args.seed is not None else int(preset_payload.get("seed", TRAIN_SEED)),
         "output_root": args.output_root or preset_payload.get("output_root", "outputs"),
         "run_name": args.run_name or preset_payload.get("run_name", run_name_default),
-        # Spatial decoder
-        "snapshot_enabled": (
-            args.snapshot
-            if args.snapshot is not None
-            else preset_payload.get("snapshot_enabled")
-        ),
-        "d_dec": args.d_dec if args.d_dec is not None else preset_payload.get("d_dec"),
-        "decoder_layers": (
-            args.decoder_layers
-            if args.decoder_layers is not None
-            else preset_payload.get("decoder_layers")
-        ),
-        "thalamic_tokens": (
-            args.thalamic_tokens
-            if args.thalamic_tokens is not None
-            else preset_payload.get("thalamic_tokens")
-        ),
-        "n_heads_decoder": (
-            args.n_heads_decoder
-            if args.n_heads_decoder is not None
-            else preset_payload.get("n_heads_decoder")
-        ),
         # torch.compile
         "use_compile": (
             args.compile
             if args.compile is not None
             else preset_payload.get("use_compile")
         ),
-        # FLA Triton kernels
-        "use_fla_kernels": args.fla,
         # Predictive Coding Module
         "pcm_enabled": (
             args.pcm
             if args.pcm is not None
             else preset_payload.get("pcm_enabled")
         ),
-        "D_pc": args.d_pc if args.d_pc is not None else preset_payload.get("D_pc"),
     }
 
     if isinstance(settings["resume"], str):
@@ -487,34 +445,16 @@ def _get_device() -> torch.device:
 def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelConfig:
     tier_fn = {
         "a": ModelConfig.tier_a,
-        "a_wide": ModelConfig.tier_a_wide,
         "b": ModelConfig.tier_b,
-        "1b": ModelConfig.tier_1b,
         "c": ModelConfig.tier_c,
     }[tier]
     config = tier_fn()
     config.set_phase(phase)
-    # Apply spatial decoder settings (None = keep dataclass default)
     if settings is not None:
-        if settings.get("snapshot_enabled") is not None:
-            config.snapshot_enabled = settings["snapshot_enabled"]
-        if settings.get("d_dec") is not None:
-            config.d_dec = settings["d_dec"]
-        if settings.get("decoder_layers") is not None:
-            config.decoder_layers = settings["decoder_layers"]
-        if settings.get("thalamic_tokens") is not None:
-            config.thalamic_tokens = settings["thalamic_tokens"]
-        if settings.get("n_heads_decoder") is not None:
-            config.n_heads_decoder = settings["n_heads_decoder"]
         if settings.get("use_compile") is not None:
             config.use_compile = settings["use_compile"]
-        if settings.get("use_fla_kernels"):
-            config.use_fla_kernels = True
-        # Predictive Coding Module
         if settings.get("pcm_enabled") is not None:
             config.pcm_enabled = settings["pcm_enabled"]
-        if settings.get("D_pc") is not None:
-            config.D_pc = settings["D_pc"]
     return config
 
 
@@ -635,9 +575,9 @@ def run_phase(
     target_tokens = max_steps_total * tokens_per_step
 
     print(f"Tier: {tier.upper()} | Phase: {phase_name} | "
-          f"D={config.D}, L={config.L}, B={config.B}, D_h={config.D_h}")
-    print(f"BS={bs}, T={config.T}, P={config.P}")
-    print(f"WM={config.wm_enabled}, PM={config.pm_enabled}, EM={config.em_enabled}")
+          f"D={config.D}, R={config.R}, B_blocks={config.B_blocks}, C={config.C}, D_col={config.D_col}")
+    print(f"BS={bs}, T={config.T}, N={config.N}, K_segments={config.K_segments}")
+    print(f"PM={config.pm_enabled}, EM={config.em_enabled}")
     print(
         f"Run length: max_steps={max_steps_total} "
         f"(source={max_steps_source}), tokens/step={tokens_per_step}, "
@@ -705,18 +645,12 @@ def run_phase(
         _structural_fields = (
             # Phase toggles
             "pm_enabled", "em_enabled",
-            # Decoder architecture
-            "snapshot_enabled", "d_dec", "decoder_layers",
-            "thalamic_tokens", "n_heads_decoder",
-            "columnar_layers", "thalamic_layers",
-            # Layer structure
+            # Architecture
+            "R", "B_blocks", "C", "D_col", "D_mem", "D_pcm",
             "ffn_expansion",
-            # Memory dimensions (tier-scaled)
-            "r", "M", "W", "D_wm", "D_em", "n_heads_wm",
-            "k_ret", "C_em",
-            # Readout FFNs (add/remove parameters)
-            "pm_readout_ffn", "em_readout_ffn",
-            # Lifelong mode (Phase C)
+            # Memory dimensions
+            "r", "M", "k_ret", "C_em",
+            # Lifelong mode
             "lifelong_mode",
         )
         _changed_fields = []
@@ -752,24 +686,9 @@ def run_phase(
             else:
                 print("  Fresh LR scheduler for new phase.")
         if "runtime_state" in ckpt:
-            # Warm-up forward to trigger lazy-init of all state tensors (pm_K,
-            # em_K, etc.) so that load_state_runtime can shape-check checkpoint
-            # values against the current config.  Without this, tensors that
-            # are still None would be loaded blindly, risking shape mismatches
-            # on the first real forward pass.
-            with torch.no_grad(), torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16,
-                enabled=(device.type == "cuda"),
-            ):
-                dummy = torch.zeros(bs, dtype=torch.long, device=device)
-                reset = torch.zeros(bs, dtype=torch.bool, device=device)
-                model.forward_one_token(dummy, reset)
-                model.detach_states()
+            # Initialize state tensors so load_state_runtime can shape-check.
+            model.initialize_states(bs, device)
 
-            # load_state_runtime is shape-safe: it skips tensors whose shapes
-            # don't match. Phase transitions that only toggle flags (e.g. A→B
-            # enables em_enabled) don't change EM/PM/WM buffer shapes, so
-            # discarding runtime state would destroy learned memories.
             if phase_changed:
                 print("  Phase transition: loading compatible runtime state (shape-safe).")
             load_runtime_state(model, ckpt["runtime_state"])

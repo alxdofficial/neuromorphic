@@ -1,5 +1,5 @@
 """
-Loss utilities for neuromorphic LM training.
+Loss utilities for neuromorphic LM training (v4).
 
 Online cross-entropy (never materializes [BS, T, vocab]) and regularizers.
 """
@@ -34,84 +34,72 @@ def online_cross_entropy(logits: Tensor, targets: Tensor,
 
 def batched_cross_entropy(logits_all: Tensor, targets_all: Tensor,
                           loss_mask_all: Tensor) -> tuple:
-    """Batched CE loss over a span of P tokens.
+    """Batched CE loss over a segment of N tokens.
 
     Args:
-        logits_all: [BS, P, vocab] — model outputs for all span tokens
-        targets_all: [BS, P] — target token ids
-        loss_mask_all: [BS, P] bool — True for valid positions
+        logits_all: [BS, N, vocab] — model outputs
+        targets_all: [BS, N] — target token ids
+        loss_mask_all: [BS, N] bool — True for valid positions
 
     Returns:
         loss_sum: scalar — sum of CE losses for valid positions
-        valid_count: int — number of valid positions
+        valid_count: GPU tensor — number of valid positions
     """
-    BS, P, V = logits_all.shape
-    flat_logits = logits_all.reshape(BS * P, V)
-    flat_targets = targets_all.reshape(BS * P)
-    flat_mask = loss_mask_all.reshape(BS * P)
+    BS, N, V = logits_all.shape
+    flat_logits = logits_all.reshape(BS * N, V)
+    flat_targets = targets_all.reshape(BS * N)
+    flat_mask = loss_mask_all.reshape(BS * N)
 
-    valid_count = flat_mask.sum().item()
+    valid_count = flat_mask.sum()
     if valid_count == 0:
-        return torch.tensor(0.0, device=logits_all.device, requires_grad=True), 0
+        return torch.tensor(0.0, device=logits_all.device, requires_grad=True), valid_count
 
     loss = F.cross_entropy(
         flat_logits[flat_mask], flat_targets[flat_mask], reduction="sum"
     )
-    return loss, int(valid_count)
+    return loss, valid_count
 
 
 def compute_loss_and_surprise(
     logits_all: Tensor, targets_all: Tensor, loss_mask_all: Tensor,
-) -> tuple[Tensor, int, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Combined loss + surprise via a single fused cross_entropy kernel.
-
-    Uses F.cross_entropy(reduction="none") which fuses log_softmax + gather
-    into one CUDA kernel without materializing the full [BS, P, vocab]
-    log-prob tensor.
 
     Returns:
         loss_sum: scalar with grad — sum of NLL over valid positions
-        valid_count: int — number of valid positions
-        token_surprise: [BS, P, 1] detached — per-token surprise
+        valid_count: GPU tensor — number of valid positions
+        token_surprise: [BS, N, 1] detached — per-token surprise
     """
-    BS, P, V = logits_all.shape
-    # Fused kernel: log_softmax + gather in one pass, no [BS,P,vocab] alloc
+    BS, N, V = logits_all.shape
     per_token_ce = F.cross_entropy(
-        logits_all.reshape(BS * P, V),
-        targets_all.reshape(BS * P),
+        logits_all.reshape(BS * N, V),
+        targets_all.reshape(BS * N),
         reduction="none",
-    ).reshape(BS, P)  # [BS, P]
+    ).reshape(BS, N)
 
-    # Loss: masked sum (with grad). When mask is all-False, mask_f is all
-    # zeros → loss is 0.0 with valid grad graph (no .item() sync needed).
-    mask_f = loss_mask_all.float()                      # [BS, P]
-    valid_count = loss_mask_all.sum()                   # stays on GPU
+    mask_f = loss_mask_all.float()
+    valid_count = loss_mask_all.sum()
     loss = (per_token_ce * mask_f).sum()
-
-    # Surprise: detached [BS, P, 1] (used for PM/EM gating, no grad needed)
     token_surprise = (per_token_ce.detach() * mask_f).unsqueeze(-1)
 
     return loss, valid_count, token_surprise
 
 
 def compute_regularizers(model) -> Tensor:
-    """Compute PM budget penalty, EM budget penalty, etc.
+    """Compute PM budget penalty, EM budget penalty.
 
     Returns scalar regularization loss.
     """
     reg = torch.tensor(0.0, device=next(model.parameters()).device)
 
-    # PM budget penalty: penalize if sum(pm_a) approaches budget
     if model.config.pm_enabled:
         for block in model.blocks:
-            for layer in block.layers:
-                pm = layer.pm
-                if pm.pm_a is not None:
-                    usage = pm.pm_a.sum(dim=-1)  # [BS]
-                    excess = F.relu(usage - model.config.budget_pm * 0.9)
-                    reg = reg + excess.mean() * 0.01
+            pm = block.pm
+            if pm.pm_a is not None:
+                usage = pm.pm_a.sum(dim=-1)  # [BS]
+                excess = F.relu(usage - model.config.budget_pm * 0.9)
+                reg = reg + excess.mean() * 0.01
 
-    # EM budget penalty
     if model.config.em_enabled:
         for block in model.blocks:
             em = block.em

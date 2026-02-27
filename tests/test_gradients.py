@@ -1,304 +1,153 @@
-"""Gradient flow tests — NEVER change.
+"""Gradient flow tests (v4) — NEVER change.
 
 If these fail, there's a dead gradient bug.
 """
 
-import pytest
 import torch
 import torch.nn.functional as F
+import pytest
+from tests.conftest import make_tiny_config
 
 from src.model.model import NeuromorphicLM
-from tests.conftest import make_tiny_config, forward_n_tokens, forward_and_write_em
 
-pytestmark = pytest.mark.invariant
 
 BS = 2
 VOCAB = 64
 
 
-def _get_loss(model, n_tokens=8, with_commits=False, with_em_writes=False):
-    """Run tokens and compute loss for backward."""
-    if with_em_writes:
-        logits, target = forward_and_write_em(model, n_tokens, BS=BS, vocab=VOCAB)
-    elif with_commits:
-        logits, target = forward_n_tokens(model, n_tokens, BS=BS, vocab=VOCAB,
-                                           with_commits=True)
-    else:
-        logits, target = forward_n_tokens(model, n_tokens, BS=BS, vocab=VOCAB)
+def _compute_loss(model, N=None):
+    """Forward one segment and compute CE loss. Returns loss scalar."""
+    if N is None:
+        N = model.config.N
+    input_ids = torch.randint(0, VOCAB, (BS, N))
+    target_ids = torch.randint(0, VOCAB, (BS, N))
+    reset_mask = torch.zeros(BS, dtype=torch.bool)
 
-    loss = F.cross_entropy(logits, target)
-    return loss
+    model.initialize_states(BS, torch.device("cpu"))
+    logits, aux_loss = model.forward_segment(input_ids, reset_mask)
+    ce_loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+    return ce_loss + aux_loss
 
 
-# ============================================================================
-# Per-phase gradient reachability
-# ============================================================================
-
-class TestPhaseGradients:
-    def test_all_params_get_grad_phase_a(self):
-        """Phase A: All systems active. Core modules get grad after forward pass."""
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
+class TestGradientFlow:
+    def test_all_params_get_gradient(self):
+        """Every parameter should receive a gradient from a single forward+loss."""
+        cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
 
-        loss = _get_loss(model, n_tokens=8)
+        loss = _compute_loss(model)
         loss.backward()
 
-        # Active modules should get gradients
-        active_no_grad = []
+        # decay_head only affects em_S state evolution (detached between segments),
+        # so gradient doesn't flow through the loss in a single segment
+        expected_no_grad = {"decay_head"}
 
+        no_grad = []
         for name, param in model.named_parameters():
-            # PCM predictor/decoder params may not get grad before warmup
-            is_pcm_aux = ".pcm.predictor" in name or ".pcm.decoder" in name
-            # PM/EM write params need commits/writes to get grad
-            is_pm = "pm" in name and "neuromodulator" not in name
-            is_em = "em" in name and "neuromodulator" not in name
-            is_neuromod = "neuromodulator" in name
-            is_deferred = is_pm or is_em or is_neuromod or is_pcm_aux
+            if param.requires_grad and param.grad is None:
+                if not any(skip in name for skip in expected_no_grad):
+                    no_grad.append(name)
 
-            if not is_deferred:
-                # Active params should have non-None grad
-                if param.grad is None:
-                    active_no_grad.append(name)
+        assert len(no_grad) == 0, f"Parameters with no gradient: {no_grad}"
 
-        assert not active_no_grad, \
-            f"Active params without grad in Phase A: {active_no_grad}"
-
-    def test_all_params_get_grad_phase_b(self):
-        """Phase B: After PM commit, all PM params get gradients."""
+    def test_nonzero_gradients(self):
+        """Gradients should be nonzero for key parameters."""
         cfg = make_tiny_config()
-        cfg.set_phase("A")
         model = NeuromorphicLM(cfg)
 
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
+        loss = _compute_loss(model)
         loss.backward()
 
-        # PM-specific params that should now get gradients
-        # Filter: only check PM readout params (layers.X.pm.*), not EM readout
-        pm_params_without_grad = []
-        for name, param in model.named_parameters():
-            is_pm_param = any(k in name for k in ["W_k_pre", "W_v_post"])
-            is_pm_readout = (".pm.readout_ffn" in name or ".pm.readout_norm" in name)
-            if is_pm_param or is_pm_readout:
-                if param.grad is None or param.grad.abs().max() < 1e-12:
-                    pm_params_without_grad.append(name)
+        # Check key structural parameters
+        for name in ["embedding.weight", "fan_out.weight", "fan_in.weight",
+                      "lm_head.weight", "lambda_logit"]:
+            parts = name.split(".")
+            obj = model
+            for p in parts:
+                obj = getattr(obj, p)
+            assert obj.grad is not None, f"No gradient for {name}"
+            assert obj.grad.abs().sum() > 0, f"Zero gradient for {name}"
 
-        assert not pm_params_without_grad, \
-            f"PM params without grad after commit: {pm_params_without_grad}"
-
-    def test_all_params_get_grad_phase_b(self):
-        """Phase B: After EM write, all EM params get gradients."""
-        cfg = make_tiny_config()
-        cfg.set_phase("B")
+    def test_gradient_with_pcm(self):
+        """PCM parameters should get gradients when enabled."""
+        cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
 
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
+        # Two passes needed: first pass generates z_hat, second generates loss
+        model.initialize_states(BS, torch.device("cpu"))
+
+        N = cfg.N
+        total_loss = torch.tensor(0.0)
+
+        for seg in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, N))
+            target_ids = torch.randint(0, VOCAB, (BS, N))
+            reset_mask = torch.zeros(BS, dtype=torch.bool)
+            logits, aux_loss = model.forward_segment(input_ids, reset_mask)
+            ce_loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+            total_loss = total_loss + ce_loss + aux_loss
+
+        total_loss.backward()
+
+        # Check PCM encoder gets gradient
+        pcm = model.blocks[0].columns.pcm
+        assert pcm is not None
+        assert pcm.encoder.weight.grad is not None
+        assert pcm.encoder.weight.grad.abs().sum() > 0
+
+    def test_gradient_through_pm_read(self):
+        """PM read should be differentiable."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        # Run 2 segments so PM has content from first
+        model.initialize_states(BS, torch.device("cpu"))
+        N = cfg.N
+        total_loss = torch.tensor(0.0)
+
+        for seg in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, N))
+            target_ids = torch.randint(0, VOCAB, (BS, N))
+            reset_mask = torch.zeros(BS, dtype=torch.bool)
+            logits, aux_loss = model.forward_segment(input_ids, reset_mask)
+            ce_loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+            total_loss = total_loss + ce_loss + aux_loss
+
+        total_loss.backward()
+
+        # PM projection weights should get gradient
+        col = model.blocks[0].columns
+        assert col.W_pm_up.weight.grad is not None
+
+    def test_gradient_through_em_read(self):
+        """EM read should be differentiable."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        model.initialize_states(BS, torch.device("cpu"))
+        N = cfg.N
+        total_loss = torch.tensor(0.0)
+
+        for seg in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, N))
+            target_ids = torch.randint(0, VOCAB, (BS, N))
+            reset_mask = torch.zeros(BS, dtype=torch.bool)
+            logits, aux_loss = model.forward_segment(input_ids, reset_mask)
+            ce_loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+            total_loss = total_loss + ce_loss + aux_loss
+
+        total_loss.backward()
+
+        col = model.blocks[0].columns
+        assert col.W_em_up.weight.grad is not None
+
+    def test_lambda_logit_gradient(self):
+        """Damped mixing parameter should get gradient."""
+        cfg = make_tiny_config(R=3)  # Need R>1 for damped mixing
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
         loss.backward()
 
-        # EM-specific params that should now get gradients
-        em_params_without_grad = []
-        for name, param in model.named_parameters():
-            is_em_param = any(k in name for k in [
-                "W_q_em", "W_q_cross", "W_o_cross", "W_k_cand", "W_v_cand",
-            ])
-            # Only check EM params on blocks (not neuromodulator)
-            if is_em_param and "neuromodulator" not in name:
-                if param.grad is None or param.grad.abs().max() < 1e-12:
-                    em_params_without_grad.append(name)
-
-        assert not em_params_without_grad, \
-            f"EM params without grad after write: {em_params_without_grad}"
-
-
-# ============================================================================
-# Specific parameter gradient tests
-# ============================================================================
-
-class TestSpecificGradients:
-    def test_pm_readout_ffn_gets_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
-        loss.backward()
-
-        for block in model.blocks:
-            for layer in block.layers:
-                pm = layer.pm
-                if pm.readout_ffn is not None:
-                    for p in pm.readout_ffn.parameters():
-                        assert p.grad is not None, "readout_ffn should get gradients"
-                        assert p.grad.abs().max() > 0
-
-    def test_em_readout_ffn_gets_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("B")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
-        loss.backward()
-
-        for block in model.blocks:
-            em = block.em
-            if em.readout_ffn is not None:
-                for p in em.readout_ffn.parameters():
-                    assert p.grad is not None, "EM readout_ffn should get gradients"
-
-    def test_pm_eligibility_projections_get_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_commits=True)
-        loss.backward()
-
-        for block in model.blocks:
-            for layer in block.layers:
-                pm = layer.pm
-                assert pm.W_k_pre.weight.grad is not None
-                assert pm.W_k_pre.weight.grad.abs().max() > 0
-                assert pm.W_v_post.weight.grad is not None
-                assert pm.W_v_post.weight.grad.abs().max() > 0
-
-    def test_wm_projections_get_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=8)
-        loss.backward()
-
-        for proj_name in ["W_q", "W_k", "W_v", "W_o"]:
-            param = getattr(model.wm, proj_name).weight
-            assert param.grad is not None, f"WM {proj_name} should get gradients"
-
-    def test_lm_head_gets_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=4)
-        loss.backward()
-
-        assert model.lm_head.weight.grad is not None
-
-    def test_embedding_gets_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=4)
-        loss.backward()
-
-        assert model.embedding.weight.grad is not None
-
-    def test_layer_ffn_gets_gradients(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=4)
-        loss.backward()
-
-        layer = model.blocks[0].layers[0]
-        if layer.ffn is not None:
-            assert layer.ffn[0].weight.grad is not None
-            assert layer.ffn[3].weight.grad is not None
-
-
-# ============================================================================
-# Decoder gradients
-# ============================================================================
-
-class TestDecoderGradients:
-    def test_decoder_output_proj_is_nonzero(self):
-        """output_proj weight initialized with std=0.01, should not be zero."""
-        cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-        w = model.spatial_decoder.output_proj.weight
-        assert w.abs().mean() > 0, "output_proj should be small-init, not zero"
-
-    def test_decoder_all_levels_get_gradients(self):
-        cfg = make_tiny_config(snapshot_enabled=True)
-        cfg.set_phase("B")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
-        loss.backward()
-
-        # Check columnar
-        for col in model.spatial_decoder.columnar:
-            for p in col.parameters():
-                assert p.grad is not None, "Columnar params should get gradients"
-
-        # Check thalamic
-        for p in model.spatial_decoder.thalamic.parameters():
-            assert p.grad is not None, "Thalamic params should get gradients"
-
-        # Check decoder blocks
-        for db in model.spatial_decoder.decoder_blocks:
-            for p in db.parameters():
-                assert p.grad is not None, "Decoder block params should get gradients"
-
-
-# ============================================================================
-# Gradient safety
-# ============================================================================
-
-class TestGradientSafety:
-    def test_gradients_are_finite(self):
-        """No NaN/Inf in any param.grad."""
-        cfg = make_tiny_config()
-        cfg.set_phase("B")
-        model = NeuromorphicLM(cfg)
-
-        loss = _get_loss(model, n_tokens=cfg.P * 2, with_em_writes=True)
-        loss.backward()
-
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                assert torch.isfinite(param.grad).all(), \
-                    f"Non-finite gradient in {name}"
-
-    def test_detach_states_removes_grad_graph(self):
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        forward_n_tokens(model, 4, with_commits=True)
-        model.detach_states()
-
-        # All state tensors should not require grad
-        for block in model.blocks:
-            for layer in block.layers:
-                if layer.h is not None:
-                    assert not layer.h.requires_grad
-                pm = layer.pm
-                for name in pm._state_tensor_names:
-                    t = getattr(pm, name)
-                    if t is not None:
-                        assert not t.requires_grad, f"pm.{name} still requires grad"
-            em = block.em
-            for name in em._state_tensor_names:
-                t = getattr(em, name)
-                if t is not None:
-                    assert not t.requires_grad, f"em.{name} still requires grad"
-
-    def test_backward_with_doc_boundary(self):
-        """forward_one_token with reset_mask=[True,False] doesn't crash backward."""
-        cfg = make_tiny_config()
-        cfg.set_phase("A")
-        model = NeuromorphicLM(cfg)
-
-        # Run a few tokens first to populate state
-        forward_n_tokens(model, 4)
-
-        # Now forward with partial reset
-        input_id = torch.randint(0, 64, (BS,))
-        target = torch.randint(0, 64, (BS,))
-        reset_mask = torch.tensor([True, False])
-        logits, _, _ = model.forward_one_token(input_id, reset_mask)
-        loss = F.cross_entropy(logits, target)
-        loss.backward()  # should not crash
+        assert model.lambda_logit.grad is not None
+        assert model.lambda_logit.grad.abs() > 0

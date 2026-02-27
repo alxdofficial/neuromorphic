@@ -1,210 +1,215 @@
-# Motivation Document — Neuromorphic AI Prototype (Neural Memory + Neuromodulators)
+# Motivation & Design Philosophy — Neuromorphic Language Model
 
-> *Aligned with spec v2.0. For implementation details, see `spec/SPECIFICATION_v2.md`.*
+## Why This Exists
 
-## What we're building
-We’re building a **next-generation sequence model** that behaves less like a static transformer and more like a **brain-inspired system** that can **adapt while it runs**.
+Modern LLMs are powerful but structurally limited:
 
-At a high level, this model should:
-- be **strong at general tasks** (language first, multimodal later),
-- be **intrinsically multimodal** at the token interface level (text/image/audio tokens can all flow through the same backbone),
-- **self-improve during use** without finetuning or retraining,
-- support **agent-like behavior** with persistent, compressible memory,
-- be designed in a way that can plausibly be **mapped to efficient silicon** in the long term.
+1. **LLMs are static** — once deployed, weights don't change. Improving requires
+   finetuning, retraining, or bolting on retrieval (RAG). This leaves a gap between
+   short-term learning, long-term personalization, and robust agent memory.
 
-This prototype is the first proof of concept: show the core mechanism works on language, then demonstrate online adaptation and stability. (The spec defines training Phases A–E; this document's "Phase 1" refers to the overall language-first project phase, not a specific training phase.)
+2. **RAG is not learning** — retrieval can fetch text but doesn't integrate knowledge
+   into the model's computations, adapt behavior continuously, or compress and
+   generalize experience.
 
----
+3. **Transformers are expensive for long context** — O(N²) attention makes lifelong
+   learning impractical. If we want AI embedded everywhere and eventually in silicon,
+   we need O(1) memory that scales as state, not as quadratic attention.
 
-## Why this is worth building (the problem)
-Modern LLMs are extremely capable, but they have structural limitations that make them a poor match for how humans learn and how future consumer AI should behave:
+4. **Agents need to improve by doing** — a practical agent should remember what it has
+   done, refine tool-use patterns, adapt to workflows, and get better over time without
+   cloud retraining.
 
-### 1) LLMs are mostly “static”
-Once deployed, an LLM’s weights don’t change. If you want it to improve:
-- you finetune,
-- you retrain,
-- or you bolt on retrieval (RAG).
+## What We're Building
 
-This creates a gap between:
-- **short-term learning** (what the user just told you),
-- **long-term personalization** (user preferences, style, habits),
-- **robust agent memory** (what you did yesterday, what tools worked, what failed).
+A **brain-inspired sequence model** that decomposes memory into three distinct systems,
+each with different persistence, update rules, and biological analogues. The fundamental
+innovation: **separating WHAT to remember from HOW LONG to remember it**, enabling
+lifelong learning without catastrophic forgetting.
 
-### 2) RAG is not the same as learning
-Retrieval can fetch text, but it doesn’t automatically:
-- integrate knowledge into the model’s internal computations,
-- adapt behavior continuously,
-- protect against repeated mistakes,
-- compress and generalize experience.
-
-### 3) Transformers are expensive for long context
-Attention-based models become costly as context grows.
-If we want “AI embedded everywhere” and eventually baked into silicon, we want:
-- predictable compute,
-- more local, update-friendly operations,
-- and mechanisms that scale like **state** rather than like quadratic attention.
-
-### 4) We want “agents” that get better by doing
-A practical agent should:
-- remember what it has done,
-- improve tool-use patterns,
-- adapt to domain workflows,
-- and refine behavior over time without requiring model updates in the cloud.
+The model maintains constant-memory state that evolves during use — no growing KV
+cache, no retraining. It processes all tokens in a segment simultaneously via
+parallel cortical columns, with memory updated between segments
+(see `architecture_v4_iterative_memory_scan.md` for the full v4 design).
 
 ---
 
-## The core idea (what makes this different)
-The model is built around **Neural Memory Layers (NMLs)** — recurrent layers that include an **online-updatable memory system**.
+## Core Philosophy
 
-Instead of relying on unbounded attention over long token histories, the model maintains **multiple memory systems** that evolve during use. This is inspired by how brains combine:
-- long-term learned structure ("genetics" / stable synapses),
-- short-term precise context (working memory),
-- procedural skills (implicit memory),
-- and episodic recall (explicit memory).
+### Three Memory Systems + Predictive Coding
 
-### Four memory types (v2 architecture)
-1) **Genetic memory / slow weights (stable competence)**
-- Learned during training by gradient descent.
-- Encodes general language understanding and skills.
-- Frozen during normal deployment.
+| Memory System | Brain Analogy | Persistence | Update Mechanism | In v4 |
+|---------------|---------------|-------------|------------------|-------|
+| **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Column FFN weights |
+| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Hebbian eligibility + neuromodulated commits | Between segments |
+| **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based writes + neuromodulation | Between segments |
 
-2) **Working memory (WM)** — Gated Linear Attention (GLA)
-- Short-term precision: copies, bindings, recent tokens.
-- Fixed-size recurrent state per head, no post-training evolution.
+Plus **Predictive Coding (PCM)** — per-column cross-pass prediction + surprise signal
+(inspired by cortical prediction error). Drives PM eligibility gating and EM novelty.
+PCM measures how much each token's representation changes between refinement passes.
 
-3) **Procedural memory (PM)** — holographic modulation slots
-- Updates while the model runs via neuromodulated commits.
-- Encodes behavioral patterns, skills, habits as input-dependent transformations.
-- B×L instances (one per layer per block), each with its own controller.
+### Parallel Processing with Memory Between Segments
 
-4) **Episodic memory (EM)** — vector store
-- Updates via neuromodulated writes at plasticity boundaries.
-- Encodes specific facts, events, user preferences.
-- B instances (one per block), each with its own controller.
-- Bounded + decaying + capacity-limited to prevent drift.
+The key architectural insight (v4): **decouple token processing from memory
+accumulation.** All tokens in a segment are processed simultaneously by cortical
+columns (embarrassingly parallel). PM/EM update between segments using accumulated
+outputs. No within-segment sequential scan — cross-segment context comes entirely
+from PM/EM.
 
 ---
 
-## How “learning during use” works (Hebbian plasticity + neuromodulation)
-We want brain-like “fire together, wire together” behavior, but implemented in a way that’s:
-- stable,
-- controllable,
-- and computationally cheap.
+## Memory Systems in Detail
 
-### Eligibility traces: “what could be learned”
-Every token step produces a candidate learning signal based on local activity:
-- pre activity (input features),
-- post activity (hidden state features).
+### Procedural Memory (PM) — Basal Ganglia
 
-This signal is accumulated in an **eligibility trace**, which is a buffer of “potential updates” that does *not* automatically change memory.
+"Muscle memory" of cognition — learned behavioral patterns, skills, associations.
 
-Think of eligibility as:  
-> “this experience is eligible to be stored.”
+- **Read**: Holographic modulation: `y_d = x_d * [W @ x]_d` (quadratic in x). Each
+  slot applies an input-dependent transformation, not fixed vector retrieval.
+- **Eligibility traces**: Per-token accumulation gated by surprise (third factor).
+  Pre-synaptic (k_cand) and Hebbian post-synaptic (v_cand = pre × post) signals,
+  with slot-specific routing weights.
+- **Commit**: Neuromodulator MLP at periodic boundaries produces (p_commit, lambda,
+  g, slot_logits, tau). Continuous softmax slot selection + soft EMA update.
+- **Sacred**: Differentiable eligibility traces (nn.Linear), surprise gating,
+  neuromodulator trained by main loss, slot-specific routing, budget enforcement +
+  unit normalization, lifelong persistence.
+- **Negotiable**: Number of slots r, eligibility decay rho, routing temperature,
+  EMA vs hard overwrite.
+- **v4**: Slow-changing partition (updated at periodic boundaries). Column accumulates
+  eligibility per-token; neuromodulator decides commits at boundaries. The commit
+  itself is affine (EMA blend).
 
-### Neuromodulator: “should we actually store it?”
-A neuromodulator network outputs low-dimensional control signals that decide:
-- **when** to commit memory (write event),
-- **how strongly** to write,
-- **how much** to decay old memory,
-- **where** to store it (slot selection via softmax-weighted top-k).
+### Episodic Memory (EM) — Hippocampus
 
-Think of neuromodulation as:  
-> “store this now, because it will help.”
+Specific events, surprising experiences, contextual episodes.
 
-This is crucial because naïvely updating memory every token causes drift and instability.
+- **Retrieval**: Query from input features, score against M slots, top-k
+  selection (k=4), cross-attention aggregation.
+- **Candidate proposal**: Novelty = learned blend of surprise + dissimilarity from
+  existing keys. Top-C highest-novelty candidates buffered.
+- **Write**: Neuromodulator at boundaries produces (g_em, tau, write_weights, decay).
+  Sequential EMA update. g_em near-zero = soft "don't write."
+- **Sacred**: Novelty-based writes, learned novelty weighting (Phase B+), top-k
+  retrieval (can't attend all M slots), query from input-side features, candidate
+  validity masking, per-stream learned decay, neuromodulator trained by main loss.
+- **Negotiable**: Capacity M, dimension D_em, cross-attention vs weighted average.
+- **v4**: Slow-changing partition. Column does novelty scoring per-token; actual
+  writes at periodic boundaries. Budget enforcement + decay prevent unbounded growth.
+  Write is affine (EMA into selected slot).
 
----
+### Predictive Coding Module (PCM) — Cortical Prediction Error
 
-## Why the plastic memories are slot-based / item-based (efficiency + hardware story)
+Per-column local prediction and surprise computation.
 
-**Procedural Memory (PM)** uses holographic modulation slots (r=8 per instance):
-- each slot has a key vector, modulation pattern (value), and strength scalar.
-- the input flows through stored patterns (quadratic: y = x * (W @ x)), not linear retrieval.
-- yields **O(r·D_h)** compute per token.
-- clear capacity limits (only r slots per layer per block).
-
-**Episodic Memory (EM)** uses an item-based vector store (M=256 per block):
-- each item has a key vector, value vector, and strength scalar.
-- supports top-k retrieval (k_ret=4 latent tokens).
-- bounded capacity with weakness-based overwriting.
-
-This design aligns with the silicon goal:
-- dot products + weighted sums are hardware-friendly,
-- sparse writes at plasticity boundaries are bandwidth-friendly,
-- no O(D²) matrix updates.
-
----
-
-## Why neuromodulators are trained via main-loss backprop
-Backprop can train the slow weights to predict tokens. Memory commit/write decisions are also trained end-to-end through the main loss:
-- neuromodulator outputs (write strength, decay rate, slot selection temperature, etc.) flow through differentiable memory operations,
-- the gradient from future predictions reaches the neuromodulator heads through: commit/write → PM/EM state → retrieval → layer output → logits → loss,
-- this naturally learns to write only when it increases future performance, avoid harmful writes, and stay within energy/budget constraints.
-
-This approach is simpler and more stable than RL-based alternatives, and uses only a single optimizer for all parameters.
+- **z_hat**: EMA prediction of next token's representation.
+- **Surprise**: RMS-normalized prediction error `||delta||/sqrt(D_pc)` (~1.0 scale).
+- **FFN gain**: `1 + 0.1 * tanh(W_gain(delta))` — bounded [0.9, 1.1] modulation.
+- **v4**: Cross-pass prediction (not in scan carry). Each column predicts what the
+  token's encoding will look like next pass. Surprise gates PM/EM updates.
 
 ---
 
-## What we prove in the language-first phase
-The first goal is not to beat frontier transformers.
-The goal is to show a compelling "new capability" story:
+## How Learning During Use Works
 
-1) The model can learn language normally (baseline competence with WM + scan core).
-2) With PM enabled, it can:
-   - store behavioral patterns and skills,
-   - adapt to new local patterns without finetuning.
-3) With EM enabled, it can:
-   - remember session facts explicitly,
-   - retrieve relevant past experiences at long delays.
-4) With learned controllers (`PMNeuromodulator` and `EMNeuromodulator`), it commits/writes more intelligently than heuristics.
-5) All of this happens without destabilizing core competence.
+### Eligibility Traces: "What Could Be Learned"
 
-This is the investor-facing proof:
-- "the model gets better as you use it" (without retraining),
-- "it can be embedded and personalized efficiently."
+Every token produces a candidate learning signal based on local activity (pre-synaptic
+input, post-synaptic hidden state). This signal accumulates in eligibility traces —
+a buffer of "potential updates" that does NOT automatically change memory. The third
+factor (surprise) gates whether activity is eligible at all.
 
----
+### Neuromodulators: "Should We Actually Store It?"
 
-## What success looks like (concrete outcomes)
-### Core metrics
-- Validation perplexity improves during training (LM works).
-- Memory benchmarks show strong gains with PM/EM ON vs OFF.
+Neuromodulator MLPs output low-dimensional control signals that decide:
+- **when** to commit (write event timing)
+- **how strongly** to write (gating strength)
+- **how much** to decay old memory
+- **where** to store (slot selection via softmax)
 
-### Online adaptation metrics
-- After seeing a user profile once, the model answers profile queries later more accurately (EM).
-- After repeated tool/task patterns, the model reduces mistakes within-session (PM).
+Crucially, neuromodulators are **trained by the main CE loss** — gradient flows through:
+commit → memory state → future reads → logits → loss. No RL, no counterfactual
+rollouts, single optimizer. The model learns to write only when it improves future
+predictions.
 
-### Stability metrics
-- After long adaptation runs, perplexity with PM/EM OFF remains stable (core competence preserved).
-- Commit/write rates stay sparse and bounded per block.
+### Lifelong Learning: Memory Distillation
 
----
+**Phase A**: All systems active, state resets at doc boundaries. Controllers learn
+when to be selective.
 
-## Design philosophy for implementation
-This prototype should prioritize:
-- **stability and debuggability** over maximum novelty,
-- **mechanism isolation** (clear baselines and ablations),
-- **4090-friendly engineering** (TBPTT, mixed precision, single optimizer).
+**Phase B**: Lifelong mode — PM/EM persist across documents. Only eligibility traces
+and recurrent state reset at boundaries. The distillation cycle:
 
-We intentionally reuse mature components (tokenizers, dataset streaming, AMP training) so we spend effort only on the novel parts:
-- fast memory representation,
-- eligibility traces,
-- neuromodulated commits,
-- neuromodulated memory training via main-loss backprop.
+1. New domain → surprise spikes
+2. PM eligibility accumulates patterns (gated by surprise)
+3. PM neuromodulator commits strong patterns to slots
+4. EM writes surprising episodes
+5. Over time, slow weights learn domain patterns → surprise drops
+6. Result: slow weights = general knowledge; PM/EM = domain-specific skills/episodes
 
 ---
 
-## Long-term direction (what this enables later)
-v2 already implements key upgrades from the roadmap:
-- **scan-friendly recurrence** (affine: h_t = a_t ⊙ h_{t-1} + b_t),
-- **episodic memory** (per-block EM with dedicated controllers),
-- **working memory** (Gated Linear Attention).
+## What Makes This Fundamentally Different
 
-Future directions include:
-- intrinsic multimodality (image/audio tokens),
-- consolidation (distilling PM/EM into slow weights during "sleep"),
-- alternative similarity/compatibility functions beyond cosine,
-- silicon mapping and quantization.
+### vs Transformers
+- Transformers ask "how much can we cache?" — we ask "what should we remember?"
+- Fixed memory footprint vs O(N) KV cache growth
+- Functional memory separation vs single KV cache
+- Online PM/EM updates vs retraining required
 
-The language-first phase is the foundation:
-> a model that can learn normally, then adapt online in a stable, controllable way.
+### vs SSMs (Mamba, RWKV)
+- SSMs use sequential scan with flat state; we use parallel processing + structured memory
+- SSMs compress everything into flat state; we separate memory by function + timescale
+- No explicit lifelong learning mechanism in SSMs
+- No neuromodulation, no eligibility traces, no surprise gating in SSMs
+
+### vs RAG
+- Memory is inside the model, not external
+- Updates are automatic (neuromodulated), not manually triggered
+- Knowledge integrates into computation, not just retrieved text
+- Compression and generalization, not verbatim storage
+
+---
+
+## Non-Negotiable (Sacred) Design Principles
+
+1. Three memory systems with distinct timescales (genetic/PM/EM) + PCM
+2. Differentiable eligibility traces (nn.Linear projections trained by backprop)
+3. Neuromodulators trained by main loss (no RL, single optimizer, single loss)
+4. Surprise gating on eligibility (third factor)
+5. Novelty-based EM writes (surprise + dissimilarity)
+6. Budget enforcement + unit normalization (prevents drift)
+7. Lifelong persistence with soft resets
+8. Fixed memory capacity O(1) per token at inference
+9. Per-stream state isolation (no cross-stream mixing)
+10. Parallel token processing (columns) decoupled from memory accumulation (between segments)
+
+## Negotiable — Implementation Details
+
+- Architecture dimensions (D, B, r, M, D_em, D_h)
+- Number of iterative passes R
+- Segment length N (= PM/EM boundary interval)
+- Hyperparameters (decay rates, temperatures, budgets)
+- Shared vs per-pass column weights
+- Token subsampling schedule across passes
+
+---
+
+## What Success Looks Like
+
+### Core: The model learns language normally
+Validation perplexity improves during training. Baseline competence established.
+
+### Adaptation: The model gets better as you use it
+- PM: repeated patterns → fewer mistakes within-session
+- EM: facts seen once → retrieved accurately later
+- Controllers: learned write selectivity outperforms heuristics
+
+### Stability: Core competence is preserved
+- Long adaptation runs don't destabilize base performance
+- Commit/write rates stay sparse and bounded
+
+### Hardware story: Constant memory, parallel compute
+- O(1) inference memory (no growing KV cache)
+- O(R) serial depth (fully parallel within each pass, no scan)
+- Slot-based memory → hardware-friendly dot products + weighted sums

@@ -1,8 +1,8 @@
 """
-TBPTTTrainer — main training loop for neuromorphic LM.
+TBPTTTrainer (v4) — main training loop for neuromorphic LM.
 
-Processes TBPTT chunks with plasticity spans. Handles doc boundary
-resets, online loss accumulation, PM commits, and EM writes.
+Processes TBPTT chunks as K segments of N tokens. PM/EM updates happen
+inside model.forward_segment(), so no external span_ops needed.
 """
 
 import math
@@ -19,7 +19,6 @@ from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from .loss import batched_cross_entropy, compute_loss_and_surprise, compute_regularizers
-from . import span_ops
 
 if TYPE_CHECKING:
     from ..debug.collector import MetricsCollector
@@ -53,13 +52,8 @@ class TBPTTTrainer:
         self.fail_fast = fail_fast
         self.max_consecutive_zero_valid = max_consecutive_zero_valid
         self._consecutive_zero_valid = 0
-        # Tracks last chunk's final tokens for checkpoint resume.
-        # When set, overrides the dataloader's prev_token on the next batch
-        # so that doc-boundary resets don't wipe restored memory state.
         self.override_prev_token: Optional[Tensor] = None
 
-        # bf16 mixed precision (spec §3): forward/backward in bf16,
-        # optimizer + state tensors stay fp32. No GradScaler needed for bf16.
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
 
@@ -75,12 +69,11 @@ class TBPTTTrainer:
             total = 0.0
             cap = 0.0
             for block in self.model.blocks:
-                for layer in block.layers:
-                    pm = layer.pm
-                    if pm.pm_a is None:
-                        continue
-                    total += pm.pm_a.detach().sum().item()
-                    cap += pm.budget * pm.pm_a.shape[0]
+                pm = block.pm
+                if pm.pm_a is None:
+                    continue
+                total += pm.pm_a.detach().sum().item()
+                cap += pm.budget * pm.pm_a.shape[0]
             if cap > 0:
                 pm_util = total / cap
 
@@ -99,7 +92,7 @@ class TBPTTTrainer:
         return pm_util, em_util
 
     def train_chunk(self, batch: StreamBatch) -> dict:
-        """Process one TBPTT chunk (T tokens).
+        """Process one TBPTT chunk (K_segments * N tokens).
 
         Args:
             batch: StreamBatch with input_ids [BS, T], target_ids [BS, T],
@@ -109,21 +102,19 @@ class TBPTTTrainer:
             dict with loss, perplexity, tokens_per_sec, etc.
         """
         self.model.train()
+        N = self.config.N
         T = batch.input_ids.shape[1]
-        P = self.config.P
-        eot_id = self.config.eot_id
         BS = batch.input_ids.shape[0]
+        eot_id = self.config.eot_id
 
-        # Pre-allocate all states before compile (once, on first chunk)
+        # Pre-allocate states (once)
         if not self._states_initialized:
             self.model.initialize_states(BS, self.device)
             self._states_initialized = True
-            if self._compile_requested:
-                self.model.compile_for_training()
 
         input_ids = batch.input_ids.to(self.device)
         target_ids = batch.target_ids.to(self.device)
-        # Use override if set (first batch after checkpoint resume)
+
         if self.override_prev_token is not None:
             prev_token = self.override_prev_token.to(self.device)
             self.override_prev_token = None
@@ -133,244 +124,71 @@ class TBPTTTrainer:
         chunk_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         valid_count = torch.tensor(0, device=self.device, dtype=torch.long)
         total_tokens = BS * T
-        eot_inputs = torch.tensor(0, device=self.device, dtype=torch.long)
-        reset_events = torch.tensor(0, device=self.device, dtype=torch.long)
-        span_valid_mean_accum = torch.tensor(0.0, device=self.device)
-        span_count = 0
-        # Determine if this step should do full collection
-        do_full = (self.collector is not None
-                   and self.collector.should_collect_full(self.global_step))
+        eot_inputs = 0
+        reset_events = 0
+        seg_count = 0
 
         t_start = time.time()
         amp_ctx = torch.autocast(
             device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp
         )
 
-        accum = span_ops.SpanAccumulator.create(BS, self.config.B, self.device)
-        last_gate_stats = None
+        for seg_start in range(0, T, N):
+            seg_end = min(seg_start + N, T)
+            seg_ids = input_ids[:, seg_start:seg_end]
+            seg_targets = target_ids[:, seg_start:seg_end]
 
-        for span_start in range(0, T, P):
-            span_end = min(span_start + P, T)
-
-            accum.reset_span()
-
-            span_ids = input_ids[:, span_start:span_end]
-            span_targets = target_ids[:, span_start:span_end]
-
-            # Reset mask for first token of this span
-            if span_start == 0:
-                reset_first = (prev_token == eot_id)
+            # Doc boundary detection
+            if seg_start == 0:
+                reset_mask = (prev_token == eot_id)
             else:
-                reset_first = (input_ids[:, span_start - 1] == eot_id)
+                reset_mask = (input_ids[:, seg_start - 1] == eot_id)
 
-            # Forward pass + loss + surprise + PM/EM accumulation
-            # Collect gate stats on the last span of full-collection steps
-            is_last_span = (span_start + P >= T)
-            collect_gates = do_full and is_last_span
-            fwd = self._forward_span_and_loss(
-                span_ids, span_targets, reset_first, amp_ctx, accum,
-                span_start, span_end, collect=collect_gates,
-            )
-            chunk_loss = chunk_loss + fwd["span_loss"]
-            valid_count += fwd["span_valid"]
-            eot_inputs += fwd["eot_count"]
-            reset_events += fwd["reset_count"]
-            if collect_gates:
-                last_gate_stats = fwd["gate_stats"]
+            reset_events += int(reset_mask.sum().item())
+            is_eot = (seg_ids == eot_id)
+            eot_inputs += int(is_eot.sum().item())
 
-            # Compute surprise mean early (needed for model state update
-            # before mid-span reset and EM proposal)
-            span_surprise_mean = accum.surprise_accum / accum.valid_tokens.clamp(min=1)
-            span_valid_mean_accum = span_valid_mean_accum + accum.valid_tokens.mean()
-            span_count += 1
+            # Forward (R passes + PM/EM updates all inside)
+            with amp_ctx:
+                logits, aux_loss = self.model.forward_segment(seg_ids, reset_mask)
 
-            # Update model surprise to span mean (frozen for next span's gates).
-            next_surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
-            if self.model.surprise is not None:
-                next_surprise = next_surprise.to(self.model.surprise.dtype)
-            self.model.surprise = next_surprise
+            # Loss masking: skip EOT positions
+            if self.config.reset_on_doc_boundary:
+                loss_mask = ~is_eot
+            else:
+                loss_mask = torch.ones_like(is_eot)
 
-            # Clear PM content + EM strengths for streams that had mid-span
-            # doc-boundary resets (prevents cross-document retrieval leakage)
-            span_ops.apply_mid_span_resets(
-                self.model, fwd["reset_mask_all"], self.config,
-            )
+            # Compute loss
+            ce_loss, seg_valid = batched_cross_entropy(logits, seg_targets, loss_mask)
 
-            # EM candidate proposal AFTER mid-span reset so novelty
-            # scoring sees correct (post-reset) EM state.
-            if self.config.em_enabled:
-                with amp_ctx:
-                    span_ops.propose_em_candidates(
-                        self.model, self.model._last_x_proj_all,
-                        fwd["y_wm_all"], fwd["token_surprise"],
-                        fwd["loss_mask_all"],
-                        accum.em_cand_K, accum.em_cand_V,
-                        accum.em_cand_score, accum.em_cand_valid,
-                    )
+            if self.fail_fast and not torch.isfinite(ce_loss):
+                raise RuntimeError(
+                    f"Non-finite loss at step {self.global_step}, "
+                    f"segment [{seg_start}, {seg_end})."
+                )
 
-            # Finalize span: stack EM candidates for boundary writes
-            result = accum.finalize(self.device, self.config)
-
-            # Span boundary: PM commit + EM write + PCM hypothesis update
-            L_pred, L_recon = self._apply_boundary_updates(
-                result, span_surprise_mean,
-            )
-            chunk_loss = chunk_loss + L_pred + L_recon
+            chunk_loss = chunk_loss + ce_loss + aux_loss
+            valid_count = valid_count + seg_valid
+            seg_count += 1
 
         # Backward + clip + optimizer step
-        avg_loss, reg, grad_norm = self._backward_and_step(
-            chunk_loss, valid_count,
-        )
+        avg_loss, reg, grad_norm = self._backward_and_step(chunk_loss, valid_count)
 
-        # TBPTT boundary: detach all states
+        # TBPTT boundary
         self.model.detach_states()
 
-        # Track last token for checkpoint resume (prevents false doc-boundary reset)
-        # Keep on GPU to avoid sync; .cpu() only at checkpoint time
+        # Track last token for checkpoint resume
         self._last_prev_token = input_ids[:, -1].detach()
 
         elapsed = time.time() - t_start
 
         return self._build_step_metrics(
             avg_loss, reg, valid_count, total_tokens, eot_inputs,
-            reset_events, grad_norm, elapsed,
-            span_valid_mean_accum, span_count, do_full,
-            gate_stats=last_gate_stats,
+            reset_events, grad_norm, elapsed, seg_count,
         )
 
-    # ------------------------------------------------------------------
-    # train_chunk sub-methods
-    # ------------------------------------------------------------------
-
-    def _forward_span_and_loss(
-        self, span_ids, span_targets, reset_first, amp_ctx, accum,
-        span_start, span_end, collect: bool = False,
-    ) -> dict:
-        """Forward pass + loss + surprise + PM/EM accumulation for one span.
-
-        Returns dict with span_loss, span_valid, eot_count, reset_count,
-        and optionally gate_stats (when collect=True).
-        """
-        with amp_ctx:
-            fwd_result = self.model.forward_span(
-                span_ids, reset_first, collect=collect,
-            )
-            if collect:
-                logits_all, x_emb_all, y_wm_all, gate_stats = fwd_result
-            else:
-                logits_all, x_emb_all, y_wm_all = fwd_result
-                gate_stats = None
-
-            # Loss masking: skip EOT input positions [BS, span_P]
-            is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
-                span_ids, self.config.eot_id, self.config.reset_on_doc_boundary
-            )
-
-            # Fused loss + surprise from a single log_softmax
-            span_loss, span_valid, token_surprise = compute_loss_and_surprise(
-                logits_all, span_targets, loss_mask_all,
-            )
-
-            # Check scalar loss instead of scanning all 65M logit values
-            if self.fail_fast and not torch.isfinite(span_loss):
-                raise RuntimeError(
-                    f"Non-finite loss at global step {self.global_step}, "
-                    f"span [{span_start}, {span_end})."
-                )
-
-            # When PCM enabled, use RMS-normalized ‖δ‖ from PCM as the
-            # surprise signal instead of loss-based -log p(target). During
-            # warmup, blend CE and PCM surprise to avoid cold-start noise
-            # (early PCM encoder outputs are random, so δ is meaningless).
-            pcm_surprise = self.model.get_pcm_token_surprise()
-            if pcm_surprise is not None:
-                warmup = self.config.pcm_warmup_steps
-                if warmup > 0 and self.global_step < warmup:
-                    alpha = self.global_step / warmup
-                    token_surprise = (1 - alpha) * token_surprise + alpha * pcm_surprise
-                else:
-                    token_surprise = pcm_surprise
-
-            # F.cross_entropy returns fp32 even under autocast.  Cast surprise
-            # to bf16 so downstream PM/EM element-wise ops stay on TensorCores
-            # instead of promoting back to fp32.
-            if self.use_amp:
-                token_surprise = token_surprise.to(self.amp_dtype)
-
-            # Reset masks for span accumulators
-            reset_mask_all = span_ops.compute_reset_mask(
-                self.model, span_ids, reset_first,
-                self.config.reset_on_doc_boundary,
-            )
-
-            # Accumulate surprise per-stream
-            span_ops.accumulate_span_surprise(
-                token_surprise, loss_mask_all, reset_mask_all,
-                self.config.reset_on_doc_boundary,
-                accum.surprise_accum, accum.valid_tokens, accum.last_reset,
-            )
-
-            # PM eligibility is now updated inline in Block.forward_span.
-
-            # NOTE: EM candidate proposal is deferred to train_chunk,
-            # AFTER apply_mid_span_resets, so novelty scoring sees
-            # correct (post-reset) EM state.
-
-        return {
-            "span_loss": span_loss,
-            "span_valid": span_valid,
-            "eot_count": is_eot_all.sum(),        # GPU tensor, no .item() sync
-            "reset_count": reset_mask_all.sum(),   # GPU tensor, no .item() sync
-            "reset_mask_all": reset_mask_all,
-            "gate_stats": gate_stats,
-            "y_wm_all": y_wm_all,
-            "token_surprise": token_surprise,
-            "loss_mask_all": loss_mask_all,
-        }
-
-    def _apply_boundary_updates(
-        self, result: span_ops.SpanResult, span_surprise_mean: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """PM base_decay + commit, EM neuromod + write, PCM hypothesis update.
-
-        Returns (L_pred, L_recon) — PCM aux losses (zeros if disabled).
-        """
-        # PCM hypothesis update (must happen before PM commit so _last_z is still cached)
-        L_pred, L_recon = span_ops.apply_pcm_boundary(
-            self.model, self.config, self.global_step,
-        )
-
-        if self.config.pm_enabled:
-            commit_info = span_ops.apply_pm_boundary(
-                self.model, span_surprise_mean,
-            )
-            if self.collector is not None:
-                for b_idx, layer_dict in commit_info.items():
-                    for l_idx, p_commit in layer_dict.items():
-                        self.collector.record_pm_commit(
-                            b_idx, l_idx, p_commit
-                        )
-
-        if self.config.em_enabled:
-            write_info = span_ops.apply_em_boundary(
-                self.model, result.em_stacked, span_surprise_mean, self.config,
-            )
-            if self.collector is not None:
-                for b_idx, novelty_mean, g_em_mean in write_info:
-                    self.collector.record_em_write(
-                        b_idx, novelty_mean, g_em_mean,
-                    )
-
-        return L_pred, L_recon
-
-    def _backward_and_step(
-        self, chunk_loss, valid_count,
-    ) -> tuple:
-        """Backward, gradient clip, optimizer step.
-
-        Returns (avg_loss, reg, grad_norm).
-        """
-        # Finalize loss (valid_count may be a GPU tensor — avoid .item() sync)
+    def _backward_and_step(self, chunk_loss, valid_count):
+        """Backward, gradient clip, optimizer step."""
         if torch.is_tensor(valid_count):
             avg_loss = chunk_loss / valid_count.float().clamp(min=1.0)
         else:
@@ -381,11 +199,10 @@ class TBPTTTrainer:
 
         if self.fail_fast and not torch.isfinite(total_loss.detach()):
             raise RuntimeError(
-                f"Non-finite total loss at global step {self.global_step}: "
+                f"Non-finite total loss at step {self.global_step}: "
                 f"avg_loss={avg_loss.item()}, reg={reg.item()}"
             )
 
-        # Backward + clip + step
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
 
@@ -394,8 +211,6 @@ class TBPTTTrainer:
         ).item()
 
         if not math.isfinite(grad_norm):
-            # Skip this step: zero out nan/inf grads, don't update weights.
-            # Scheduler still steps to keep LR schedule consistent.
             self.optimizer.zero_grad()
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -411,23 +226,12 @@ class TBPTTTrainer:
 
         return avg_loss, reg, grad_norm
 
-    # ------------------------------------------------------------------
-    # Metrics helpers
-    # ------------------------------------------------------------------
-
     def _build_step_metrics(
         self, avg_loss, reg, valid_count, total_tokens, eot_inputs,
-        reset_events, grad_norm, elapsed,
-        span_valid_mean_accum, span_count, do_full,
-        gate_stats=None,
+        reset_events, grad_norm, elapsed, seg_count,
     ) -> dict:
-        """Assemble step metrics dict and log to collector. Pure bookkeeping."""
-        # Convert GPU tensor accumulators to Python scalars (single sync batch)
+        """Assemble step metrics dict."""
         valid_count = int(valid_count.item()) if torch.is_tensor(valid_count) else int(valid_count)
-        eot_inputs = int(eot_inputs.item()) if torch.is_tensor(eot_inputs) else int(eot_inputs)
-        reset_events = int(reset_events.item()) if torch.is_tensor(reset_events) else int(reset_events)
-        span_valid_mean_accum = float(span_valid_mean_accum.item()) if torch.is_tensor(span_valid_mean_accum) else float(span_valid_mean_accum)
-        tokens = total_tokens
 
         if valid_count == 0:
             self._consecutive_zero_valid += 1
@@ -441,97 +245,64 @@ class TBPTTTrainer:
                 f"(step {self.global_step})."
             )
 
-        valid_fraction = valid_count / max(tokens, 1)
-        eot_input_fraction = eot_inputs / max(tokens, 1)
-        reset_fraction = reset_events / max(tokens, 1)
-        mean_span_valid_tokens = span_valid_mean_accum / max(span_count, 1)
-        # Only compute budget utils at log intervals (avoids 18 GPU→CPU syncs/step)
+        valid_fraction = valid_count / max(total_tokens, 1)
+        eot_input_fraction = eot_inputs / max(total_tokens, 1)
+        reset_fraction = reset_events / max(total_tokens, 1)
+
         if (self.global_step + 1) % self.log_interval == 0 or self.global_step == 0:
             pm_budget_util, em_budget_util = self._memory_budget_utils()
         else:
             pm_budget_util, em_budget_util = None, None
-        dataloader_stats = {}
-        if hasattr(self.dataloader, "monitor_stats"):
-            dataloader_stats = self.dataloader.monitor_stats()
 
-        warn_high_grad_norm = float(grad_norm >= 0.95 * self.max_grad_norm)
-        warn_low_valid_fraction = float(valid_fraction < 0.2)
-        warn_memory_saturation = float(
-            (pm_budget_util is not None and pm_budget_util > 0.98)
-            or (em_budget_util is not None and em_budget_util > 0.98)
-        )
-
-        # Batch GPU→CPU sync: stack scalar tensors, transfer once
         _scalars = torch.stack([avg_loss.detach(), reg.detach(),
                                 torch.exp(avg_loss.detach())]).cpu()
-        _loss_f, _reg_f, _ppl_f = _scalars[0].item(), _scalars[1].item(), min(_scalars[2].item(), 1e6)
+        _loss_f = _scalars[0].item()
+        _reg_f = _scalars[1].item()
+        _ppl_f = min(_scalars[2].item(), 1e6)
 
         step_metrics = {
             "loss": _loss_f,
             "reg": _reg_f,
             "ppl": _ppl_f,
-            "tokens_per_sec": tokens / max(elapsed, 1e-6),
+            "tokens_per_sec": total_tokens / max(elapsed, 1e-6),
             "valid_tokens": valid_count,
             "step": self.global_step,
             "grad_norm": grad_norm,
             "valid_fraction": valid_fraction,
             "eot_input_fraction": eot_input_fraction,
             "reset_fraction": reset_fraction,
-            "mean_span_valid_tokens": mean_span_valid_tokens,
             "pm_budget_util_global": pm_budget_util,
             "em_budget_util_global": em_budget_util,
-            "warn_high_grad_norm": warn_high_grad_norm,
-            "warn_low_valid_fraction": warn_low_valid_fraction,
-            "warn_memory_saturation": warn_memory_saturation,
         }
-        step_metrics.update(dataloader_stats)
 
-        # Log to collector
         if self.collector is not None:
             lr = self.optimizer.param_groups[0]["lr"]
+            do_full = self.collector.should_collect_full(self.global_step)
             extras = {
                 "mode": "train",
                 "valid_tokens": valid_count,
                 "valid_fraction": valid_fraction,
                 "eot_input_fraction": eot_input_fraction,
                 "reset_fraction": reset_fraction,
-                "mean_span_valid_tokens": mean_span_valid_tokens,
                 "pm_budget_util_global": pm_budget_util,
                 "em_budget_util_global": em_budget_util,
-                "warn_high_grad_norm": warn_high_grad_norm,
-                "warn_low_valid_fraction": warn_low_valid_fraction,
-                "warn_memory_saturation": warn_memory_saturation,
             }
-            extras.update(dataloader_stats)
             if do_full:
                 basic = {
-                    "loss": step_metrics["loss"],
-                    "ppl": step_metrics["ppl"],
-                    "lr": lr,
-                    "tok_s": step_metrics["tokens_per_sec"],
-                    "grad_norm": grad_norm,
-                    "reg": step_metrics["reg"],
+                    "loss": _loss_f, "ppl": _ppl_f,
+                    "lr": lr, "tok_s": step_metrics["tokens_per_sec"],
+                    "grad_norm": grad_norm, "reg": _reg_f,
                     "elapsed": elapsed,
                     "nan_grad_steps": getattr(self, '_nan_steps', 0),
                 }
                 self.collector.log_full(
-                    self.global_step,
-                    gate_stats if gate_stats else {},
-                    basic,
-                    extras=extras, mode="train",
+                    self.global_step, {}, basic, extras=extras, mode="train",
                 )
             else:
                 self.collector.log_basic(
-                    self.global_step,
-                    step_metrics["loss"],
-                    step_metrics["ppl"],
-                    lr,
-                    step_metrics["tokens_per_sec"],
-                    grad_norm,
-                    step_metrics["reg"],
-                    elapsed,
-                    extras=extras,
-                    mode="train",
+                    self.global_step, _loss_f, _ppl_f, lr,
+                    step_metrics["tokens_per_sec"], grad_norm, _reg_f,
+                    elapsed, extras=extras, mode="train",
                 )
 
         return step_metrics
@@ -541,14 +312,7 @@ class TBPTTTrainer:
         num_steps: int,
         step_callback: Optional[Callable[[dict], None]] = None,
     ) -> list:
-        """Train for num_steps TBPTT chunks.
-
-        Args:
-            num_steps: number of chunks to process
-
-        Returns:
-            list of per-step metric dicts
-        """
+        """Train for num_steps TBPTT chunks."""
         metrics = []
         pbar = tqdm(
             range(num_steps),
@@ -568,7 +332,6 @@ class TBPTTTrainer:
             self.global_step += 1
             metrics.append(step_metrics)
 
-            # Update progress bar postfix
             m = step_metrics
             lr = self.optimizer.param_groups[0]["lr"]
             pbar.set_postfix_str(

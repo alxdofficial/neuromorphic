@@ -1,158 +1,95 @@
-"""Design-specific config tests — update design_constants.py when design changes."""
+"""Tests for ModelConfig validation and tier presets (v4)."""
 
 import pytest
-
+from tests.conftest import make_tiny_config, TINY_DEFAULTS
 from src.model.config import ModelConfig
-from tests.design_constants import (
-    TIER_A, TIER_A_WIDE, TIER_B, TIER_C, DEFAULTS, PHASE_TOGGLES,
-)
-
-pytestmark = pytest.mark.design
 
 
-# ============================================================================
-# Tier defaults
-# ============================================================================
+class TestConfigValidation:
+    def test_tiny_defaults_valid(self):
+        cfg = make_tiny_config()
+        cfg.validate()
 
-class TestTierDefaults:
-    def test_tier_a_defaults(self):
+    def test_invalid_R(self):
+        with pytest.raises(ValueError, match="R"):
+            make_tiny_config(R=0)
+
+    def test_invalid_B_blocks(self):
+        with pytest.raises(ValueError, match="B_blocks"):
+            make_tiny_config(B_blocks=0)
+
+    def test_invalid_C(self):
+        with pytest.raises(ValueError, match="C"):
+            make_tiny_config(C=0)
+
+    def test_invalid_D_col(self):
+        with pytest.raises(ValueError, match="D_col"):
+            make_tiny_config(D_col=0)
+
+    def test_invalid_D_mem(self):
+        with pytest.raises(ValueError, match="D_mem"):
+            make_tiny_config(D_mem=0)
+
+    def test_invalid_D_pcm_when_enabled(self):
+        with pytest.raises(ValueError, match="D_pcm"):
+            make_tiny_config(pcm_enabled=True, D_pcm=0)
+
+    def test_invalid_N(self):
+        with pytest.raises(ValueError, match="N"):
+            make_tiny_config(N=0)
+
+    def test_k_ret_exceeds_M(self):
+        with pytest.raises(ValueError, match="k_ret"):
+            make_tiny_config(k_ret=100, M=8)
+
+    def test_T_property(self):
+        cfg = make_tiny_config(N=16, K_segments=3)
+        assert cfg.T == 48
+
+
+class TestTierPresets:
+    def test_tier_a(self):
         cfg = ModelConfig.tier_a()
-        for key, val in TIER_A.items():
-            assert getattr(cfg, key) == val, f"tier_a.{key}: {getattr(cfg, key)} != {val}"
+        cfg.validate()
+        assert cfg.D == 768
+        assert cfg.B_blocks == 6
+        assert cfg.C == 4
+        assert cfg.D_col == 128
 
-    def test_tier_b_defaults(self):
+    def test_tier_b(self):
         cfg = ModelConfig.tier_b()
-        for key, val in TIER_B.items():
-            assert getattr(cfg, key) == val, f"tier_b.{key}: {getattr(cfg, key)} != {val}"
+        cfg.validate()
+        assert cfg.D == 1536
+        assert cfg.B_blocks == 8
 
-    def test_tier_c_defaults(self):
+    def test_tier_c(self):
         cfg = ModelConfig.tier_c()
-        for key, val in TIER_C.items():
-            assert getattr(cfg, key) == val, f"tier_c.{key}: {getattr(cfg, key)} != {val}"
-
-    def test_tier_a_wide_defaults(self):
-        cfg = ModelConfig.tier_a_wide()
-        for key, val in TIER_A_WIDE.items():
-            assert getattr(cfg, key) == val, f"tier_a_wide.{key}: {getattr(cfg, key)} != {val}"
-
-    def test_tier_a_overrides(self):
-        cfg = ModelConfig.tier_a(D=1024, L=16)
-        assert cfg.D == 1024
-        assert cfg.L == 16
-
-    def test_tier_b_overrides(self):
-        cfg = ModelConfig.tier_b(D=1024)
-        assert cfg.D == 1024
-
-    def test_tier_c_overrides(self):
-        cfg = ModelConfig.tier_c(D=2048)
+        cfg.validate()
         assert cfg.D == 2048
+        assert cfg.B_blocks == 12
+
+    def test_tier_overrides(self):
+        cfg = ModelConfig.tier_a(R=6, N=256)
+        assert cfg.R == 6
+        assert cfg.N == 256
 
 
-# ============================================================================
-# Default hyperparameters
-# ============================================================================
-
-class TestDefaults:
-    def test_default_hyperparameters(self):
-        cfg = ModelConfig()
-        for key, val in DEFAULTS.items():
-            assert getattr(cfg, key) == val, \
-                f"Default {key}: {getattr(cfg, key)} != {val}"
-
-
-# ============================================================================
-# Phase toggles
-# ============================================================================
-
-class TestPhaseToggles:
-    @pytest.mark.parametrize("phase", ["A", "B"])
-    def test_phase_toggles(self, phase):
-        cfg = ModelConfig()
-        cfg.set_phase(phase)
-        expected = PHASE_TOGGLES[phase]
-        for key, val in expected.items():
-            assert getattr(cfg, key) == val, \
-                f"Phase {phase}: {key} = {getattr(cfg, key)}, expected {val}"
-
-    def test_phase_b_enables_lifelong(self):
-        cfg = ModelConfig()
-        cfg.set_phase("B")
-        assert cfg.lifelong_mode is True
-
-    def test_phase_a_disables_lifelong(self):
-        cfg = ModelConfig()
-        cfg.set_phase("B")
+class TestPhaseToggle:
+    def test_phase_a(self):
+        cfg = make_tiny_config()
         cfg.set_phase("A")
-        assert cfg.lifelong_mode is False
+        assert cfg.pm_enabled
+        assert cfg.em_enabled
+        assert not cfg.lifelong_mode
 
-    def test_invalid_phase_raises(self):
-        cfg = ModelConfig()
+    def test_phase_b(self):
+        cfg = make_tiny_config()
+        cfg.set_phase("B")
+        assert cfg.pm_enabled
+        assert cfg.em_enabled
+        assert cfg.lifelong_mode
+
+    def test_invalid_phase(self):
+        cfg = make_tiny_config()
         with pytest.raises(ValueError, match="Unknown phase"):
             cfg.set_phase("X")
-
-    def test_phase_c_raises(self):
-        """Phase C was removed — set_phase('C') must raise ValueError."""
-        cfg = ModelConfig()
-        with pytest.raises(ValueError, match="Unknown phase"):
-            cfg.set_phase("C")
-
-
-# ============================================================================
-# D_h property
-# ============================================================================
-
-class TestDhProperty:
-    def test_d_h_computation(self):
-        cfg = ModelConfig(D=512, B=4)
-        assert cfg.D_h == 128
-
-    def test_d_h_with_different_B(self):
-        cfg = ModelConfig(D=768, B=6)
-        assert cfg.D_h == 128
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-class TestValidation:
-    def test_d_not_divisible_by_b_raises(self):
-        cfg = ModelConfig(D=100, B=3)
-        with pytest.raises(ValueError, match="D.*must be divisible by B"):
-            cfg.validate()
-
-    def test_d_wm_not_divisible_by_heads_raises(self):
-        cfg = ModelConfig(D_wm=100, n_heads_wm=3)
-        with pytest.raises(ValueError, match="D_wm.*must be divisible by.*n_heads_wm"):
-            cfg.validate()
-
-    def test_decoder_d_dec_not_divisible_raises(self):
-        cfg = ModelConfig(snapshot_enabled=True, d_dec=100, n_heads_decoder=3)
-        with pytest.raises(ValueError, match="d_dec.*must be divisible by.*n_heads_decoder"):
-            cfg.validate()
-
-    def test_decoder_d_h_too_small_raises(self):
-        cfg = ModelConfig(D=8, B=4, snapshot_enabled=True,
-                          d_dec=16, n_heads_decoder=4)
-        # D_h = 8/4 = 2, n_heads_decoder = 4 -> D_h < n_heads_decoder
-        with pytest.raises(ValueError, match="D_h.*must be >= n_heads_decoder"):
-            cfg.validate()
-
-    def test_p_greater_than_w_raises_softmax(self):
-        cfg = ModelConfig(P=512, W=256, wm_type="softmax")
-        with pytest.raises(ValueError, match="P.*must be <= W"):
-            cfg.validate()
-
-    def test_p_greater_than_w_ok_for_gla(self):
-        cfg = ModelConfig(P=512, W=256, wm_type="gla")
-        cfg.validate()  # should not raise — GLA doesn't use W
-
-    def test_valid_config_passes(self):
-        cfg = ModelConfig(D=512, B=4, D_wm=128, n_heads_wm=4)
-        cfg.validate()  # should not raise
-
-    def test_valid_decoder_config_passes(self):
-        cfg = ModelConfig(D=512, B=4, D_wm=128, n_heads_wm=4,
-                          snapshot_enabled=True, d_dec=256, n_heads_decoder=4)
-        cfg.validate()  # should not raise

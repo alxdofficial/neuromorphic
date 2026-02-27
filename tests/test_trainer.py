@@ -1,223 +1,116 @@
-"""Unit tests for src/training/trainer.py — TBPTTTrainer."""
+"""Unit tests for TBPTTTrainer (v4)."""
 
 import pytest
 import torch
+from tests.conftest import make_tiny_config
 
-from src.data.streaming import StreamBatch
-from src.model.config import ModelConfig
 from src.model.model import NeuromorphicLM
 from src.training.trainer import TBPTTTrainer
-from src.training import span_ops
-from tests.conftest import make_tiny_config
+from src.data.streaming import StreamBatch
+
 
 BS = 2
 VOCAB = 64
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-def _make_batch(BS, T, vocab=VOCAB):
-    """Create a synthetic StreamBatch."""
-    input_ids = torch.randint(0, vocab, (BS, T))
-    target_ids = torch.randint(0, vocab, (BS, T))
-    prev_token = torch.randint(0, vocab, (BS,))
+def _make_batch(config, eot_id=2):
+    """Create a fake StreamBatch for testing."""
+    T = config.T
+    input_ids = torch.randint(0, VOCAB, (BS, T))
+    target_ids = torch.randint(0, VOCAB, (BS, T))
+    prev_token = torch.randint(0, VOCAB, (BS,))
     return StreamBatch(input_ids=input_ids, target_ids=target_ids, prev_token=prev_token)
 
 
-def _make_trainer(phase="B", **overrides):
-    """Create a minimal TBPTTTrainer for testing."""
-    cfg = make_tiny_config(**overrides)
-    cfg.set_phase(phase)
-    model = NeuromorphicLM(cfg)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+def _make_trainer(config=None, **kwargs):
+    """Create a trainer with default config."""
+    if config is None:
+        config = make_tiny_config(vocab_size=VOCAB, **kwargs)
+    model = NeuromorphicLM(config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    dataloader = iter([])  # empty, we'll call train_chunk directly
 
-    def dummy_dataloader():
-        while True:
-            yield _make_batch(BS, cfg.T)
-
-    trainer = TBPTTTrainer(
+    return TBPTTTrainer(
         model=model,
         optimizer=optimizer,
         scheduler=None,
-        dataloader=dummy_dataloader(),
-        config=cfg,
+        dataloader=dataloader,
+        config=config,
         device=torch.device("cpu"),
+        max_grad_norm=1.0,
+        log_interval=50,
+        fail_fast=True,
     )
-    return trainer, cfg, model
 
-
-# ============================================================================
-# train_chunk basic execution
-# ============================================================================
 
 class TestTrainChunk:
-    def test_returns_metrics_dict(self):
-        trainer, cfg, model = _make_trainer("B")
-        batch = _make_batch(BS, cfg.T)
+    def test_basic_forward_backward(self):
+        trainer = _make_trainer()
+        batch = _make_batch(trainer.config)
         metrics = trainer.train_chunk(batch)
-        assert isinstance(metrics, dict)
+
         assert "loss" in metrics
         assert "ppl" in metrics
-        assert "grad_norm" in metrics
         assert "valid_tokens" in metrics
+        assert metrics["loss"] > 0
+        assert metrics["valid_tokens"] > 0
 
-    def test_loss_is_finite(self):
-        trainer, cfg, model = _make_trainer("B")
-        batch = _make_batch(BS, cfg.T)
-        metrics = trainer.train_chunk(batch)
-        assert metrics["loss"] < 1e6
-        assert metrics["ppl"] > 0
+    def test_gradient_update(self):
+        trainer = _make_trainer()
+        batch = _make_batch(trainer.config)
 
-    def test_global_step_starts_at_zero(self):
-        trainer, cfg, model = _make_trainer("A")
-        assert trainer.global_step == 0
-        # global_step is incremented in train_steps(), not train_chunk()
-        batch = _make_batch(BS, cfg.T)
+        # Save params before
+        p_before = trainer.model.embedding.weight.data.clone()
+
         trainer.train_chunk(batch)
-        # train_chunk itself doesn't increment global_step
-        assert trainer.global_step == 0
 
-    def test_multiple_steps(self):
-        trainer, cfg, model = _make_trainer("B")
-        losses = []
-        for _ in range(3):
-            batch = _make_batch(BS, cfg.T)
-            metrics = trainer.train_chunk(batch)
-            losses.append(metrics["loss"])
-        assert all(l < 1e6 for l in losses)
+        # Params should have changed
+        p_after = trainer.model.embedding.weight.data
+        assert not torch.allclose(p_before, p_after)
 
-    def test_phase_b_without_rl(self):
-        """Phase B (lifelong) — train_chunk should work without RL."""
-        trainer, cfg, model = _make_trainer("B")
-        batch = _make_batch(BS, cfg.T)
+    def test_states_detached_after_chunk(self):
+        trainer = _make_trainer()
+        batch = _make_batch(trainer.config)
+        trainer.train_chunk(batch)
+
+        for block in trainer.model.blocks:
+            if block.pm.pm_K is not None:
+                assert block.pm.pm_K.grad_fn is None
+
+    def test_multi_segment_chunk(self):
+        """Chunk should process K_segments * N tokens."""
+        cfg = make_tiny_config(vocab_size=VOCAB, K_segments=3, N=8)
+        trainer = _make_trainer(config=cfg)
+        batch = _make_batch(cfg)
         metrics = trainer.train_chunk(batch)
-        assert isinstance(metrics, dict)
-        assert metrics["loss"] < 1e6
 
-    def test_valid_fraction_range(self):
-        trainer, cfg, model = _make_trainer("B")
-        batch = _make_batch(BS, cfg.T)
+        assert metrics["valid_tokens"] > 0
+
+    def test_doc_boundary_handling(self):
+        """EOT in prev_token should trigger reset."""
+        cfg = make_tiny_config(vocab_size=VOCAB, eot_id=2)
+        trainer = _make_trainer(config=cfg)
+        batch = _make_batch(cfg, eot_id=2)
+        # Force prev_token to eot
+        batch = StreamBatch(
+            input_ids=batch.input_ids,
+            target_ids=batch.target_ids,
+            prev_token=torch.full((BS,), 2),  # eot
+        )
         metrics = trainer.train_chunk(batch)
-        assert 0.0 <= metrics["valid_fraction"] <= 1.0
+        assert metrics["loss"] > 0
 
+    def test_pcm_enabled(self):
+        cfg = make_tiny_config(vocab_size=VOCAB, pcm_enabled=True)
+        trainer = _make_trainer(config=cfg)
+        batch = _make_batch(cfg)
+        metrics = trainer.train_chunk(batch)
+        assert metrics["loss"] > 0
 
-# ============================================================================
-# _forward_span_and_loss
-# ============================================================================
-
-class TestForwardSpanAndLoss:
-    def test_returns_expected_keys(self):
-        trainer, cfg, model = _make_trainer("B")
-        model.train()
-        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
-        span_targets = torch.randint(0, VOCAB, (BS, cfg.P))
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        amp_ctx = torch.autocast("cpu", enabled=False)
-        accum = span_ops.SpanAccumulator.create(BS, cfg.B, torch.device("cpu"))
-
-        fwd = trainer._forward_span_and_loss(
-            span_ids, span_targets, reset_first, amp_ctx, accum,
-            span_start=0, span_end=cfg.P,
-        )
-        assert "span_loss" in fwd
-        assert "span_valid" in fwd
-        assert "eot_count" in fwd
-        assert "reset_count" in fwd
-
-    def test_loss_is_tensor(self):
-        trainer, cfg, model = _make_trainer("B")
-        model.train()
-        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
-        span_targets = torch.randint(0, VOCAB, (BS, cfg.P))
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        amp_ctx = torch.autocast("cpu", enabled=False)
-        accum = span_ops.SpanAccumulator.create(BS, cfg.B, torch.device("cpu"))
-
-        fwd = trainer._forward_span_and_loss(
-            span_ids, span_targets, reset_first, amp_ctx, accum,
-            span_start=0, span_end=cfg.P,
-        )
-        assert isinstance(fwd["span_loss"], torch.Tensor)
-
-
-# ============================================================================
-# _backward_and_step
-# ============================================================================
-
-class TestBackwardAndStep:
-    def test_basic_backward(self):
-        trainer, cfg, model = _make_trainer("B")
-        model.train()
-        # Do a forward pass to get a loss
-        batch = _make_batch(BS, cfg.T)
-        input_ids = batch.input_ids
-        target_ids = batch.target_ids
-
-        # Manually do a forward span to get a loss
-        span_ids = input_ids[:, :cfg.P]
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        logits, _, _ = model.forward_span(span_ids, reset_first)
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, cfg.vocab_size),
-            target_ids[:, :cfg.P].reshape(-1),
-        )
-
-        avg_loss, reg, grad_norm = trainer._backward_and_step(
-            loss, BS * cfg.P,
-        )
-        assert isinstance(grad_norm, float)
-        assert grad_norm >= 0.0
-
-    def test_nan_loss_raises_with_fail_fast(self):
-        """NaN loss with fail_fast=True should raise RuntimeError."""
-        trainer, cfg, model = _make_trainer("B")
-        model.train()
-
-        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        logits, _, _ = model.forward_span(span_ids, reset_first)
-        loss = logits.sum() * float("inf") * 0  # NaN
-
-        with pytest.raises(RuntimeError, match="Non-finite total loss"):
-            trainer._backward_and_step(loss, BS * cfg.P)
-
-
-# ============================================================================
-# _apply_boundary_updates
-# ============================================================================
-
-class TestApplyBoundaryUpdates:
-    def test_pm_boundary_applied(self):
-        trainer, cfg, model = _make_trainer("B")
-        # Forward some tokens first
-        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        model.forward_span(span_ids, reset_first)
-
-        surprise_mean = torch.ones(BS) * 2.0
-        result = span_ops.SpanResult(surprise_mean=surprise_mean, em_stacked={})
-        # Should not raise
-        trainer._apply_boundary_updates(result, surprise_mean)
-
-    def test_em_boundary_applied_phase_b(self):
-        trainer, cfg, model = _make_trainer("B")
-        span_ids = torch.randint(0, VOCAB, (BS, cfg.P))
-        reset_first = torch.zeros(BS, dtype=torch.bool)
-        model.forward_span(span_ids, reset_first)
-
-        D_em = cfg.D_em
-        em_stacked = {}
-        for b in range(cfg.B):
-            em_stacked[b] = (
-                torch.randn(BS, 4, D_em),
-                torch.randn(BS, 4, D_em),
-                torch.rand(BS, 4),
-                torch.ones(BS, 4, dtype=torch.bool),
-                torch.rand(BS),
-            )
-        surprise_mean = torch.ones(BS) * 2.0
-        result = span_ops.SpanResult(surprise_mean=surprise_mean, em_stacked=em_stacked)
-        # Should not raise
-        trainer._apply_boundary_updates(result, surprise_mean)
+    def test_override_prev_token(self):
+        trainer = _make_trainer()
+        trainer.override_prev_token = torch.randint(0, VOCAB, (BS,))
+        batch = _make_batch(trainer.config)
+        metrics = trainer.train_chunk(batch)
+        assert metrics["loss"] > 0
+        assert trainer.override_prev_token is None  # consumed

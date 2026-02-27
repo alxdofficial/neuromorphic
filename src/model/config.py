@@ -1,9 +1,8 @@
 """
-Model configuration for the Neuromorphic LM.
+Model configuration for the Neuromorphic LM (v4: iterative refinement).
 
 Single dataclass holding all hyperparameters. Phase toggles control which
-memory systems are active. Tier presets (A/B/C) provide size configurations
-for single-GPU training on RTX 4090.
+memory systems are active. Tier presets provide size configurations.
 """
 
 from dataclasses import dataclass
@@ -11,168 +10,125 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    # Architecture
-    D: int = 512              # model width
-    L: int = 8                # layers per block
-    B: int = 4                # parallel blocks
-    ffn_expansion: int = 4    # FFN expansion factor per layer (0 = no FFN)
+    # Architecture — v4 iterative refinement
+    D: int = 512              # model width (embedding dim)
+    R: int = 4                # iterative refinement passes
+    B_blocks: int = 4         # memory blocks
+    C: int = 4                # columns per block
+    D_col: int = 128          # column width
+    D_mem: int = 256          # PM/EM dimension (decoupled from D_col)
+    D_pcm: int = 64           # PCM encoding dim
+    N: int = 128              # segment length
+    K_segments: int = 2       # TBPTT chunk = K segments
+    lambda_mix: float = 0.5   # damped pass mixing init
+    ffn_expansion: int = 4    # column FFN expansion
     vocab_size: int = 32000   # set from tokenizer at runtime
     eot_id: int = 2           # set from tokenizer at runtime
 
-    # Working Memory (1 shared instance)
-    wm_type: str = "softmax"  # "softmax" (sliding window attention) or "gla" (Gated Linear Attention)
-    W: int = 128              # sliding window size (softmax WM only)
-    D_wm: int = 128           # WM key/value dimension
-    n_heads_wm: int = 4       # attention heads
-    gate_low_rank: int = 16   # gate projection bottleneck dim (GLA WM only)
-
-    # Procedural Memory (per layer per block, B*L instances)
+    # Procedural Memory (per block, B_blocks instances)
     r: int = 8                # PM slots
     rho: float = 0.95         # eligibility decay
     a_max: float = 3.0        # max strength per slot
     budget_pm: float = 4.0    # sum(pm_a) budget per stream
-    decay_pm: float = 0.999   # per-span strength decay
+    decay_pm: float = 0.999   # per-pass strength decay
     tau_pm: float = 1.0       # softmax temperature (default for PM slot selection)
-    tau_pm_floor: float = 0.05  # min PM slot selection temperature (learned mode)
-    tau_pm_ceil: float = 5.0    # max PM slot selection temperature (learned mode)
-    weakness_weight_pm: float = 0.5  # bias toward weak slots
-    tau_route_pm: float = 1.0         # temperature for PM slot routing in eligibility
-    pm_readout_ffn: bool = True       # MLP after PM linear lookup
-    surprise_scale: float = 5.0       # eligibility gate: gate = (surprise / scale).clamp(0,1)
-    g_pm_default: float = 0.5         # default PM write strength
+    tau_pm_floor: float = 0.05
+    tau_pm_ceil: float = 5.0
+    weakness_weight_pm: float = 0.5
+    tau_route_pm: float = 1.0
+    surprise_scale: float = 5.0
+    g_pm_default: float = 0.5
 
-    # Episodic Memory (per block, B instances)
-    M: int = 256              # EM capacity per bank
-    D_em: int = 128           # EM key/value dimension
+    # Episodic Memory (per block, B_blocks instances)
+    M: int = 64               # EM capacity per bank
     k_ret: int = 4            # retrieval count
-    C_em: int = 8             # candidates per span
-    tau_em: float = 1.0       # softmax temperature (default for EM slot selection)
-    weakness_weight_em: float = 0.5  # bias toward weak slots
-    S_max: float = 3.0        # max strength per slot
-    budget_em: float = 8.0    # sum(em_S) budget per stream
-    decay_em: float = 0.999   # per-span strength decay
-    g_em_default: float = 0.3   # default EM write strength
-    g_em_floor: float = 0.001  # minimum write strength (near-zero = soft "don't write")
-    g_em_ceil: float = 0.95    # maximum write strength
-    tau_em_floor: float = 0.05   # min soft slot selection temperature
-    tau_em_ceil: float = 5.0     # max soft slot selection temperature
-    ww_em_floor: float = 0.0    # min weakness weight
-    ww_em_ceil: float = 2.0     # max weakness weight
-    decay_em_floor: float = 0.99     # fast forgetting (~2.2K token half-life)
-    decay_em_ceil: float = 0.9999    # near-permanent (~220K token half-life)
-    em_readout_ffn: bool = True       # MLP after EM cross-attention retrieval
+    C_em: int = 8             # candidates per pass (top-C_em across N*C)
+    tau_em: float = 1.0
+    weakness_weight_em: float = 0.5
+    S_max: float = 3.0
+    budget_em: float = 8.0
+    decay_em: float = 0.999
+    g_em_default: float = 0.3
+    g_em_floor: float = 0.001
+    g_em_ceil: float = 0.95
+    tau_em_floor: float = 0.05
+    tau_em_ceil: float = 5.0
+    ww_em_floor: float = 0.0
+    ww_em_ceil: float = 2.0
+    decay_em_floor: float = 0.99
+    decay_em_ceil: float = 0.9999
 
     # Neuromodulator architecture
-    neuromod_hidden: int = 32         # hidden dim for neuromod backbone MLPs
-    content_proj_dim: int = 8         # projection dim for content embeddings in neuromods
+    neuromod_hidden: int = 32
+    content_proj_dim: int = 8
+
+    # Predictive Coding Module (per column group, via grouped ops)
+    pcm_enabled: bool = True
+    pcm_pred_weight: float = 0.01
 
     # Regularization
-    dropout: float = 0.1      # dropout rate (residual, attention, FFN)
-    tie_embeddings: bool = True  # share embedding and lm_head weights
+    dropout: float = 0.1
+    tie_embeddings: bool = True
 
     # Training
-    T: int = 256              # TBPTT segment length
-    P: int = 32               # plasticity span
-    use_compile: bool = False # torch.compile for CUDA training
-    use_fla_kernels: bool = False  # use FLA Triton kernels for scan/GLA (incompatible with compile)
-    gradient_checkpointing: bool = False  # recompute FFN activations to save VRAM
+    use_compile: bool = False
+    gradient_checkpointing: bool = False
     reset_on_doc_boundary: bool = True
-    lifelong_mode: bool = False  # Phase B: PM/EM persist across doc boundaries
-
-    # Predictive Coding Module (per block)
-    pcm_enabled: bool = True           # master toggle
-    D_pc: int = 128                    # PCM latent dimension
-    pcm_pred_weight: float = 0.01      # prediction loss weight
-    pcm_recon_weight: float = 0.01     # reconstruction loss weight
-    pcm_warmup_steps: int = 100        # steps before PCM losses ramp in
-
-    # Spatial Decoder (hierarchical aggregation + deep cross-attention)
-    snapshot_enabled: bool = True   # architecture toggle (independent of phase)
-    d_dec: int = 256               # decoder working dimension
-    n_heads_decoder: int = 4       # attention heads in columnar/thalamic/decoder
-    decoder_layers: int = 2        # deep decoder depth (Level 3)
-    columnar_layers: int = 2       # columnar attention depth (Level 1)
-    thalamic_layers: int = 2       # thalamic integrator depth (Level 2)
-    thalamic_tokens: int = 4       # output tokens from thalamic integrator
+    lifelong_mode: bool = False
 
     # Phase toggles
-    wm_enabled: bool = True   # always on
-    pm_enabled: bool = True   # always on
-    em_enabled: bool = True   # always on
+    pm_enabled: bool = True
+    em_enabled: bool = True
 
     @property
-    def D_h(self) -> int:
-        """Per-block hidden dimension."""
-        return self.D // self.B
+    def T(self) -> int:
+        """TBPTT chunk length = K_segments * N."""
+        return self.K_segments * self.N
 
     def validate(self):
-        """Check config validity. Call before model construction.
-
-        Raises ValueError with clear messages for invalid combinations
-        that would otherwise cause opaque crashes deep in PyTorch.
-        """
-        if self.D % self.B != 0:
-            raise ValueError(
-                f"D ({self.D}) must be divisible by B ({self.B}) "
-                f"to compute D_h = D/B."
-            )
-        if self.snapshot_enabled:
-            if self.d_dec % self.n_heads_decoder != 0:
-                raise ValueError(
-                    f"d_dec ({self.d_dec}) must be divisible by "
-                    f"n_heads_decoder ({self.n_heads_decoder}) for "
-                    f"MultiheadAttention in the spatial decoder."
-                )
-            D_h = self.D // self.B
-            if D_h < self.n_heads_decoder:
-                raise ValueError(
-                    f"D_h ({D_h}) must be >= n_heads_decoder "
-                    f"({self.n_heads_decoder}) for columnar attention."
-                )
-        if self.D_wm % self.n_heads_wm != 0:
-            raise ValueError(
-                f"D_wm ({self.D_wm}) must be divisible by "
-                f"n_heads_wm ({self.n_heads_wm}) for WM attention."
-            )
-        if self.wm_type not in ("gla", "softmax"):
-            raise ValueError(
-                f"wm_type must be 'gla' or 'softmax', got '{self.wm_type}'."
-            )
-        if self.wm_type == "softmax" and self.P > self.W:
-            raise ValueError(
-                f"P ({self.P}) must be <= W ({self.W}) so the "
-                f"batched WM attention span fits within the cache."
-            )
+        """Check config validity. Call before model construction."""
+        if self.D <= 0:
+            raise ValueError(f"D ({self.D}) must be positive.")
+        if self.R < 1:
+            raise ValueError(f"R ({self.R}) must be >= 1.")
+        if self.B_blocks < 1:
+            raise ValueError(f"B_blocks ({self.B_blocks}) must be >= 1.")
+        if self.C < 1:
+            raise ValueError(f"C ({self.C}) must be >= 1.")
+        if self.D_col <= 0:
+            raise ValueError(f"D_col ({self.D_col}) must be positive.")
+        if self.D_mem <= 0:
+            raise ValueError(f"D_mem ({self.D_mem}) must be positive.")
+        if self.D_pcm <= 0 and self.pcm_enabled:
+            raise ValueError(f"D_pcm ({self.D_pcm}) must be positive when pcm_enabled.")
+        if self.N < 1:
+            raise ValueError(f"N ({self.N}) must be >= 1.")
+        if self.K_segments < 1:
+            raise ValueError(f"K_segments ({self.K_segments}) must be >= 1.")
         if self.tau_route_pm <= 0:
             raise ValueError(
-                f"tau_route_pm ({self.tau_route_pm}) must be positive "
-                f"to avoid division by zero in PM slot routing."
+                f"tau_route_pm ({self.tau_route_pm}) must be positive."
             )
-        if self.pcm_enabled and self.D_pc <= 0:
+        if self.r < 1:
+            raise ValueError(f"r ({self.r}) must be >= 1 (PM slots).")
+        if self.M < 1:
+            raise ValueError(f"M ({self.M}) must be >= 1 (EM capacity).")
+        if self.k_ret > self.M:
             raise ValueError(
-                f"D_pc ({self.D_pc}) must be positive when pcm_enabled=True."
+                f"k_ret ({self.k_ret}) must be <= M ({self.M})."
             )
 
     def set_phase(self, phase: str):
         """Set component toggles for training phase.
 
-        A: WM + PM + EM + PCM (all memory systems active)
+        A: PM + EM (all memory systems active)
         B: A + lifelong mode (PM/EM persist across doc boundaries)
-
-        All downstream code branches on capability flags (pm_enabled,
-        em_enabled) — never on phase letters. This method is the single
-        point where phase -> flags mapping lives.
-
-        Neuromodulators are trained by main-loss gradient in all phases.
-        No separate RL optimizer or phase needed.
         """
         phase = phase.upper()
         if phase == "A":
-            self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
         elif phase == "B":
-            self.wm_enabled = True
             self.pm_enabled = True
             self.em_enabled = True
             self.lifelong_mode = True
@@ -184,52 +140,34 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Development tier (~85M params). D=768, L=8, B=2, D_h=384."""
-        defaults = dict(D=768, L=8, B=2, D_wm=192, n_heads_wm=6,
-                        pm_readout_ffn=False)
+        """Dev tier. D=768, B_blocks=6, C=4, D_col=128."""
+        defaults = dict(
+            D=768, B_blocks=6, C=4, D_col=128, D_mem=256,
+            D_pcm=64, R=4, N=128, r=8, M=64,
+        )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
-    def tier_a_wide(cls, **overrides) -> "ModelConfig":
-        """Deprecated alias for tier_a (kept for backward compat)."""
-        return cls.tier_a(**overrides)
-
-    @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Research tier (~408M params). D=2048, L=10, B=4, D_h=512."""
+        """Research tier. D=1536, B_blocks=8, C=6, D_col=192."""
         defaults = dict(
-            D=2048, L=10, B=4,
-            pm_readout_ffn=False,
-            # Scaled memory capacities
-            r=16, D_wm=256, n_heads_wm=8,
-            M=512, D_em=192, k_ret=8, C_em=16,
-            # Scaled decoder
-            d_dec=384, n_heads_decoder=8,
+            D=1536, B_blocks=8, C=6, D_col=192, D_mem=384,
+            D_pcm=96, R=4, N=128, r=16, M=128,
+            k_ret=8, C_em=16,
+            neuromod_hidden=64, content_proj_dim=16,
         )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
-        """1B-class tier (~980M params). D=4096, L=16, B=8, D_h=512.
-
-        Designed for cloud GPU training (A100 80GB). B=8 parallel blocks
-        maximizes memory system diversity at the 1B scale.
-        """
+        """1B-class tier. D=2048, B_blocks=12, C=8, D_col=256."""
         defaults = dict(
-            D=4096, L=16, B=8,
-            pm_readout_ffn=False,
-            # Scaled memory capacities
-            r=16, D_wm=384, n_heads_wm=8,
-            M=512, D_em=256, k_ret=8, C_em=16,
-            # Scaled decoder
-            d_dec=512, n_heads_decoder=8, decoder_layers=3,
+            D=2048, B_blocks=12, C=8, D_col=256, D_mem=512,
+            D_pcm=128, R=6, N=128, r=16, M=256,
+            k_ret=8, C_em=16,
+            neuromod_hidden=64, content_proj_dim=16,
         )
         defaults.update(overrides)
         return cls(**defaults)
-
-    @classmethod
-    def tier_1b(cls, **overrides) -> "ModelConfig":
-        """Deprecated alias for tier_c."""
-        return cls.tier_c(**overrides)

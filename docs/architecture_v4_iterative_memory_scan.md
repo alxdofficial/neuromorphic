@@ -1,470 +1,640 @@
-# Architecture v4: Iterative Memory Refinement via Causal Scan
+# Architecture v4: Iterative Refinement with Cortical Columns
 
 ## The Core Insight
 
-Instead of processing tokens sequentially to maintain a perfect running memory
-state, we let the model build an **imperfect but causal** view of the sequence
-in parallel, then **refine it iteratively** — trading exactness for parallelism
-while keeping memory bounded.
+We process all tokens in a segment **simultaneously** through R iterative passes.
+Each pass, every cortical column reads from shared memory (PM/EM), processes its
+token, and produces a richer representation. **After each pass, PM/EM update** —
+absorbing what the columns found surprising or novel. The next pass reads the
+updated memory, giving every token indirect access to what other tokens contributed.
 
-The current architecture insists: "memory at token t must reflect a fully
-processed, sequential pass through tokens 0..t-1." This forces O(N) serial depth.
+PCM measures **cross-pass surprise**: how much did this token's representation
+change now that memory is richer? High surprise = updated memory significantly
+changed understanding of this token = worth further commitment.
 
-The v4 insight: that's unnecessarily strict. The model can work with an
-**approximate memory that improves over R passes**. Each pass is parallel, each
-pass's state is causal, and R passes is much less serial depth than N sequential
-steps. The memory systems don't need a perfect sequential view — they need a
-*good enough* view, refined iteratively.
+R passes = R rounds of both **perception and memory update**, all within one
+segment of N tokens. Each pass sees richer PM/EM because previous passes
+committed their findings.
+
+There is **no within-segment sequential scan**. All tokens in a pass see the
+same PM/EM state. Within-segment order comes from positional encoding.
+Within-segment *context* comes from PM/EM updates between passes — each pass's
+commits are visible to the next pass's reads. Over R passes, information flows
+between tokens through the PM/EM bottleneck.
+
+If prototyping reveals that direct within-segment causal context is necessary,
+a small learned recurrent state can be added to a per-token scan carry. But we
+start without it.
 
 ## Why This Architecture Exists
 
 We face a fundamental tension:
 
-1. **Softmax attention**: O(N²) memory — too expensive for lifelong learning
+1. **Softmax attention**: KV cache grows linearly with context length, and
+   O(N²) compute per layer during prefill — too expensive for lifelong learning
 2. **SSMs / affine recurrence**: our bio-inspired memory updates (Hebbian PM,
    episodic EM) involve non-affine decisions (thresholds, similarity matching,
    slot selection) — can't naively parallelize
 3. **Sequential processing**: O(N) serial depth — underutilizes GPU
 
-Our resolution: **separate the decision from the update.**
+Our resolution: **decouple token processing from memory accumulation.**
 
-- The **decision** (which PM slot to update, whether to write to EM, how much
-  to gate WM) can be arbitrarily complex and non-affine — it's computed by
-  the cortical column's FFN, which reads from memory and does Hebbian/episodic
-  logic internally
-- The **update itself** (the actual state mutation) is always affine:
-  `S_new = A * S_old + b`, where A and b are the OUTPUT of the decision
-
-Since the updates are affine, they compose associatively, enabling parallel
-prefix scan. Since the decisions are unconstrained, we preserve the full
-expressiveness of our bio-inspired memory mechanisms.
+- **Token processing** (cortical columns): embarrassingly parallel over B × N.
+  Each column reads memory, processes one token, outputs features. No
+  cross-token operations. No sequential dependency.
+- **Memory accumulation** (PM/EM updates): happens between passes. Hebbian
+  eligibility, novelty scoring, neuromodulated commits — all the complex
+  bio-inspired logic runs here, unconstrained by parallelism.
+- **Cross-pass refinement** (PCM + PM/EM): R passes let each token's
+  representation and the shared memory improve iteratively together.
 
 ## Architecture
 
 ### Components
 
-**Cortical columns** (B copies, independent parallel processors):
-- **PCM** — local predictive coding (per-column predictions + surprise)
-- **FFN** — local feature transformation (per-column weights)
+**Cortical columns** (narrow, many, independent parallel processors):
+- **PCM** — local predictive coding (per-column cross-pass prediction + surprise)
+- **FFN** — local feature transformation (per-column weights, narrow D_col)
 - Columns read from shared memory, compute surprise, do "thinking," and
-  decide how to update memory. This is the non-affine, complex part.
+  accumulate eligibility/novelty signals for memory updates.
 
-**Shared memory systems** (biologically: centralized infrastructure that
-columns read from and write to):
-- **PM** — procedural memory: Hebbian association slots (basal ganglia)
-- **EM** — episodic memory: episode buffer (hippocampus)
-- **WM** — working memory: recent-token buffer (prefrontal cortex)
+Input shape: `[BS, N, D]` → project → `[BS, N, B_blocks, C, D_col]`
+Each column operates on D_col dimensions. After processing, project back to D.
+
+**Shared memory systems** (per-block, updated between passes):
+- **PM** — procedural memory: Hebbian holographic slots (basal ganglia)
+- **EM** — episodic memory: key-value episode buffer (hippocampus)
+
+PM/EM have their own dimension D_mem (decoupled from D_col). Columns project
+up to D_mem for reads and write candidates, project back down to D_col.
 
 ### How It Works (High Level)
 
 ```
-1. All N tokens are presented simultaneously
-2. Each cortical column reads from frozen memory, does its processing,
-   and decides how memory should be updated → outputs (A, b) per token
-3. These (A, b) updates are composed causally via prefix scan:
-   memory state at position t = accumulated updates from tokens 0..t-1
-4. Repeat for R passes — each pass, columns read richer causal states
-5. After R passes, decode from final causal states → next-token loss
+For r = 1..R passes:
+  1. All B columns process all N tokens in PARALLEL
+     - read from PM/EM (same state for all positions this pass)
+     - PCM encodes token → compare with previous pass → surprise
+     - surprise gates PM eligibility accumulation + EM novelty scoring
+     - FFN processes (modulated by surprise)
+  2. PM/EM UPDATE (neuromodulators commit eligibility, write novel episodes)
+     - next pass reads the UPDATED PM/EM
+
+After R passes: decode from final representations → next-token loss
+Carry PM/EM state to next segment.
 ```
 
-The broad parallel sweep (step 2) is embarrassingly parallel.
-The causal composition (step 3) is O(log N) via scan.
-Repeated R times (step 4) gives depth of contextual understanding.
+Step 1 is embarrassingly parallel (B × N independent computations).
+Step 2 is the only sequential-across-passes part (R times per segment).
 
 ### Forward Pass: R Iterative Passes
 
 ```python
-def forward_segment(tokens, S_init):
+def forward_segment(self, input_ids, reset_mask=None):
     """Process N tokens through R refinement passes.
 
-    tokens:  [BS, N]       — full segment of tokens
-    S_init:  memory state  — from previous segment (constant memory)
+    input_ids:  [BS, N]     — segment of token IDs
+    reset_mask: [BS] bool   — streams to reset PM/EM (doc boundary)
 
-    Returns: logits [BS, N, vocab], final memory state
+    Returns: (logits [BS, N, vocab], aux_loss scalar)
+    PM/EM state is mutated in-place (instance attributes on each block).
     """
-    # Pass 1: all tokens see S_init (no within-segment context yet)
-    # Pass r>1: each token sees its causal state from pass r-1
-    S_prev = broadcast(S_init, N)  # [BS, N, state_size]
+    if reset_mask is not None and reset_mask.any():
+        self._reset_memory(reset_mask)  # zero PM/EM for masked streams
+
+    x = embed(input_ids) + pos_embed(positions)  # [BS, N, D]
+
+    # Project to column space: [BS, N, D] → [BS, N, B_blocks, C, D_col]
+    x_blocks = fan_out(x).view(BS, N, B_blocks, C, D_col)
+
+    z_hat_prev = [None] * B_blocks  # per-block PCM state
+    lam = sigmoid(lambda_logit)     # learnable mixing parameter
 
     for r in range(R):
-        # Step 1: PARALLEL — each column reads memory, does processing,
-        # decides on memory updates. Arbitrarily non-linear internally.
-        # No cross-token operations. Embarrassingly parallel over B × N.
-        A, b = column_updates_r(tokens, S_prev)
+        block_outputs = []
+        z_hat_new = []
 
-        # Step 2: SCAN — compose updates causally via prefix scan.
-        # S[t] includes updates from tokens 0..t-1 only (exclusive).
-        # O(log N) serial depth.
-        S_curr = exclusive_affine_scan(A, b, S_init)
+        for b, block in enumerate(self.blocks):
+            x_b = x_blocks[:, :, b]  # [BS, N, C, D_col]
 
-        S_prev = S_curr  # next pass reads this pass's causal states
+            # --- STEP 1: COLUMN FORWARD (all C columns × N tokens) ---
+            x_out, z, z_hat, pcm_loss, elig, em_cands = \
+                block.forward_pass(x_b, z_hat_prev[b])
 
-    # Decode from final pass's causal states
-    logits = decode(tokens, S_curr)  # [BS, N, vocab]
+            aux_loss += pcm_loss * pcm_pred_weight
 
-    # Next segment's S_init = state after all N tokens
-    S_final = A[:, -1] * S_curr[:, -1] + b[:, -1]
+            # --- STEP 2: PM/EM UPDATE (between passes) ---
+            block.commit_and_write(elig, em_cands)
 
-    return logits, S_final
+            block_outputs.append(x_out)
+            z_hat_new.append(z_hat)
+
+        x_new = stack(block_outputs, dim=2)  # [BS, N, B, C, D_col]
+
+        # Damped mixing
+        if r > 0:
+            x_blocks = (1 - lam) * x_blocks + lam * x_new
+        else:
+            x_blocks = x_new
+
+        z_hat_prev = z_hat_new
+
+    # Project back: [BS, N, B*C*D_col] → [BS, N, D]
+    x = fan_in(x_blocks.reshape(BS, N, -1))
+    logits = lm_head(ln_final(x))  # [BS, N, vocab]
+
+    return logits, aux_loss
 ```
 
-### Per-Token Column Update (The Non-Affine Decision)
+### Per-Block Column Forward (The Parallel Core)
+
+In code, this is split across two classes:
+- **`CorticalColumnGroup.forward`**: column-level ops (PM/EM reads, PCM, FFN,
+  eligibility candidates, novelty candidates). Operates on `[BS, N, C, D_col]`.
+- **`ColumnBlock.forward_pass`**: calls `CorticalColumnGroup.forward`, then
+  aggregates PM eligibility across N×C positions and selects top EM candidates.
+
+Conceptually, for one block:
 
 ```python
-def column_updates_r(tokens, S):
-    """Each cortical column reads memory, processes, decides on updates.
+def block_forward_pass(x_block, pm_state, em_state, z_hat_prev):
+    """One block: all C columns process all N tokens. Embarrassingly parallel.
 
-    The internals are arbitrarily non-linear (FFN, Hebbian rules,
-    surprise thresholds, cosine similarity, softmax slot selection).
-    The OUTPUT is affine parameters (A, b) for the scan.
+    x_block:    [BS, N, C, D_col]     — column representations for this block
+    pm_state:   PM slots for block     — same for all positions this pass
+    em_state:   EM slots for block     — same for all positions this pass
+    z_hat_prev: [BS, N, C, D_pcm]     — PCM predictions from prev pass
 
-    tokens: [BS, N]              — token ids
-    S:      [BS, N, state_size]  — per-position causal state (from prev pass)
-
-    Returns: (A, b) — structured affine update descriptors per token
+    Returns: x_out, z, z_hat, pcm_loss, pm_elig, em_cands
     """
-    x = embed(tokens)  # [BS, N, D]
+    # --- CorticalColumnGroup.forward ---
 
-    # Memory reads — content-addressed lookups (attention over slots, not tokens)
-    # Each position reads from its OWN causal state (different per position)
-    x = x + PM.read(x, S.pm)   # Hebbian association retrieval
-    x = x + EM.read(x, S.em)   # episodic memory retrieval
-    x = x + WM.read(x, S.wm)  # working memory retrieval
+    # 1. PM holographic read (project up to D_mem, modulate, project back)
+    q_pm = W_pm_up(x_block)                             # [BS,N,C,D_mem]
+    y_pm = pm_state.read(q_pm)                           # holographic
+    x_block = x_block + W_pm_down(y_pm)                  # residual
 
-    # Per-column processing
-    surprise = PCM.surprise(x, S.pcm)  # local prediction error
-    x = FFN(x, surprise)               # per-column transformation
+    # 2. EM top-k read (project up, retrieve, cross-attend, project back)
+    q_em = W_em_up(x_block)                              # [BS,N,C,D_mem]
+    y_em = em_state.read(q_em)                           # top-k retrieval
+    x_block = x_block + W_em_down(y_em)                  # residual
 
-    # --- Decide memory updates (non-affine, complex) ---
+    # 3. PCM: encode, surprise, gain
+    z = PCM.encode(x_block)                              # [BS,N,C,D_pcm]
+    if z_hat_prev is not None:
+        delta = z - z_hat_prev.detach()
+        surprise = norm(delta, dim=-1) / sqrt(D_pcm)     # [BS,N,C]
+        gain = 1 + 0.1 * tanh(W_gain(delta))             # [BS,N,C,D_col]
+    else:
+        surprise = zeros; gain = ones                     # pass 1
 
-    # PM (Hebbian): compute eligibility, select slots, determine values
-    pm_eligibility = hebbian_rule(x, S.pm)
-    pm_gate = sigmoid((pm_eligibility - threshold) / temp)  # soft threshold
-    pm_slot_scores = softmax(slot_similarity(x, S.pm))      # which slot
-    pm_value = project_pm(x)                                 # what to write
+    # 4. FFN with gain modulation (gain is per-dimension, not scalar)
+    h = LayerNorm(x_block) * gain                        # element-wise
+    x_out = x_block + ffn_down(gelu(ffn_up(h)))          # residual
 
-    # EM (episodic): surprise-based write decision
-    em_gate = sigmoid((surprise - em_threshold) / temp)
-    em_episode = compress_episode(x)
-    em_slot = softmax(write_scores(S.em))                    # where to write
+    # 5. PCM hypothesis
+    z_hat = PCM.predict(z)                               # [BS,N,C,D_pcm]
 
-    # WM: recent-token update
-    wm_gate = sigmoid(project_wm_gate(x))
-    wm_content = project_wm(x)
-    wm_slot_scores = softmax(slot_scores(x))
+    # 6. PM eligibility candidates
+    k_cand = normalize(W_k_pre(x_out))                  # [BS,N,C,D_mem]
+    v_cand = W_v_post(x_out)                             # [BS,N,C,D_mem]
+    gate = (surprise / scale).clamp(0, 1)                # [BS,N,C]
 
-    # PCM: prediction update (EMA)
-    pcm_alpha = sigmoid(project_alpha(x))
-    pcm_target = project_pcm(x)
+    # 7. EM novelty candidates
+    q_nov = normalize(W_k_cand(x_out))                  # [BS,N,C,D_mem]
+    v_nov = W_v_cand(x_out)                              # [BS,N,C,D_mem]
+    w_nov = sigmoid(W_nov(x_out))                        # [BS,N,C]
 
-    # --- Pack into structured (A, b) descriptors ---
-    # Small descriptors, expanded to full state via outer products / broadcasting
-    A, b = pack_affine_updates(
-        pm_gate, pm_slot_scores, pm_value,
-        em_gate, em_slot, em_episode,
-        wm_gate, wm_slot_scores, wm_content,
-        pcm_alpha, pcm_target,
-    )
+    # --- ColumnBlock.forward_pass (aggregation) ---
 
-    return A, b  # affine params, ready for scan
+    # 8. PM eligibility aggregation across N×C
+    route_w = softmax(k_cand @ pm_K.T / tau)             # [BS,N,C,r]
+    gated = gate * route_w                               # [BS,N,C,r]
+    elig_K = einsum('bncr, bncd -> brd', gated, k_cand)  # [BS,r,D_mem]
+    elig_V = einsum('bncr, bncd -> brd', gated, v_cand)
+
+    # 9. EM candidate selection (top-C_cand across N×C by novelty)
+    novelty = w_nov * surprise + (1-w_nov) * (1 - max_sim)
+    em_cands = topk(novelty.flatten(N*C), C_cand)
+
+    # 10. PCM prediction loss
+    pcm_loss = MSE(z_hat_prev, z.detach()) if z_hat_prev else 0
+
+    return x_out, z, z_hat, pcm_loss, (elig_K, elig_V), em_cands
 ```
 
-**CRITICAL**: No cross-token operations inside this function. No attention over
-the token axis, no convolution, no batch norm across tokens. Each position is
-fully independent. Only LayerNorm (per-position) is allowed. This guarantees
-causality.
+**CRITICAL**: No cross-token operations inside column forward. Each position
+is fully independent. This is what makes C × N parallelism possible within
+each block. The aggregation step (8-9) sums across positions but doesn't
+affect the per-token output.
 
 **Memory reads ARE attention** — but over memory slots, not over other tokens.
-The claim is "no self-attention over the token axis," not "no attention at all."
 
-### Structured Update Descriptors (Factored, Not Dense)
+**Ordering matters**: PCM surprise must be computed before eligibility and
+novelty candidates, since surprise gates both.
 
-The column does NOT produce a dense state-sized vector. It produces small
-structured descriptors that expand into full (A, b) cheaply:
+### PM Holographic Read (Why "Holographic")
 
-```python
-def pack_affine_updates(pm_gate, pm_slots, pm_val, ...):
-    """Convert small decision outputs into full affine parameters.
+Standard memory: query → retrieve stored vector. Output is independent of input.
 
-    Example for WM with W=64 slots, D=768:
-      Input:  wm_gate (scalar), wm_slot_scores (R^64), wm_content (R^768)
-      Expand: A[slot_k, :] = 1 - wm_gate * wm_slot_scores[k]    # broadcast
-              b[slot_k, :] = wm_gate * wm_slot_scores[k] * wm_content
+PM holographic read: the input **flows through** stored patterns. Output depends
+on both input AND stored pattern multiplicatively:
 
-    Column projection: D → ~1700 floats (not D → 100K)
-    Expansion: ~1700 → full state_size via outer products / broadcasting
-    """
-    ...
+```
+q = W_pm_up(x_col)                              # [D_col] → [D_mem]
+scores = normalize(q) @ pm_K.T                   # [r_slots]
+y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D_mem]
+y_pm_out = W_pm_down(y_pm)                       # [D_mem] → [D_col]
 ```
 
-| Module | Descriptor size | Full state size | Expansion |
-|--------|----------------|-----------------|-----------|
-| PM | r + D + 1 = 785 | r × D = 12,288 | gate × slot_scores ⊗ value |
-| EM | M_write + D_em + 1 ≈ 200 | M × D_em = 131,072 | gate × slot ⊗ episode |
-| WM | W + D + 1 = 833 | W × D = 49,152 | gate × slot_scores ⊗ content |
-| PCM | D_h + 1 = 49 | D_h = 48 | alpha blend |
-| **Total** | **~1,870** | **~193K** | |
+Mathematically: `y_d = x_d * [W @ x]_d` — quadratic in x. The stored pattern
+**modulates** the input rather than replacing it. Like a hologram: the stored
+pattern is an interference pattern, the input is the reference beam, you need
+both to reconstruct the output.
 
-Projection is D=768 → 1,870 (a small linear layer), not D → 386K.
+This makes PM a **learned transformation** — each slot stores a "skill" (how to
+process inputs), not a "fact" (a fixed vector). Same slot, different input →
+completely different output. This is why PM is "procedural memory": it encodes
+*how to process*, not *what was seen*.
 
-### Causal Affine Scan
+### EM Read (Key-Value Retrieval)
 
-```python
-def exclusive_affine_scan(A, b, S_init):
-    """Compute causal memory state at every position via EXCLUSIVE prefix scan.
-
-    S[t] includes updates from positions 0..t-1, NOT position t itself.
-    The recurrence: S_{t+1} = A_t ⊙ S_t + b_t  (element-wise gating)
-    Affine composition is associative: (A2,b2)∘(A1,b1) = (A2⊙A1, A2⊙b1+b2)
-
-    Returns: S[BS, N, state_size] — all N causal states in parallel
-        S[0] = S_init
-        S[1] = A_0 ⊙ S_init + b_0
-        S[t] = compose(Δ_0, ..., Δ_{t-1})(S_init)
-
-    Parallel: O(N log N) work, O(log N) depth
-    Differentiable: backward pass is also a scan
-    """
-    ...
 ```
+q = W_em_up(x_col)                              # [D_col] → [D_mem]
+scores = q @ em_K.T                              # [M_slots]
+top_k = topk(scores, k=4)                       # sparse retrieval
+y_em = cross_attention(q, em_K[top_k], em_V[top_k])  # [D_mem]
+y_em_out = W_em_down(y_em)                       # [D_mem] → [D_col]
+```
+
+Standard key-value store with sparse top-k retrieval. EM stores "facts" and
+"episodes" — specific things that were seen. The output IS a stored vector
+(weighted combination of retrieved values), independent of the query beyond
+selection. This is the fundamental difference from PM.
+
+### Cross-Pass PCM (Predictive Coding)
+
+PCM predicts what each token's representation will look like in the **next pass**
+(after PM/EM have updated and the column re-processes with richer memory).
+
+```
+Pass 1: column encodes token → z^1. Predicts z_hat^1.
+         No surprise yet (no previous prediction to compare against).
+         PM/EM update with unmodulated eligibility/novelty.
+
+Pass 2: column encodes token → z^2 (now reading UPDATED PM/EM).
+         Surprise = ||z^2 - z_hat^1||.
+         "Did the PM/EM update change my understanding of this token?"
+         Predicts z_hat^2.
+         PM/EM update with surprise-modulated eligibility/novelty.
+...
+Pass R: column encodes token → z^R. Surprise = ||z^R - z_hat^{R-1}||.
+         Final PM/EM update. Decode.
+```
+
+**What surprise means in v4**: "now that memory has been updated (other tokens
+committed their findings), did my understanding of THIS token change?" High
+surprise = this token's meaning depends heavily on context that wasn't in
+memory before = it's informationally dense.
+
+**PCM optimization**: trained by both:
+1. Auxiliary prediction loss: `L_pred = MSE(z_hat^r, z^{r+1}.detach())`
+2. Downstream: surprise → PM eligibility gating → PM commits → next pass's
+   PM reads → loss. All within the same segment's forward pass.
+
+## Within-Segment Context via PM/EM Updates
+
+Although there is no direct token-to-token communication, tokens gain indirect
+access to each other through **PM/EM updates between passes**:
+
+```
+Pass 1: all tokens process with PM/EM_0 (from previous segment).
+         Token 42 is surprising → high eligibility → committed to PM.
+         Token 99 is novel → written to EM.
+         → PM/EM_1
+
+Pass 2: all tokens process with PM/EM_1.
+         Token 7 now reads PM and retrieves what token 42 committed.
+         Token 50 now reads EM and retrieves token 99's episode.
+         Their representations change → new surprise → new commits.
+         → PM/EM_2
+
+...and so on for R passes.
+```
+
+This is **memory-mediated within-segment context**. Information flows between
+tokens through the PM/EM bottleneck, not through direct attention. Each pass
+adds one hop of indirect communication. After R passes, information has had
+R opportunities to propagate between tokens via memory.
+
+The bottleneck is deliberate: it forces the model to compress and prioritize,
+like biological memory. Not every token's information survives — only what the
+neuromodulators decide is worth committing.
+
+**Remaining limitation**: within a single pass, all positions see the same PM/EM.
+Position ordering within a pass comes only from positional encoding. The causal
+ordering emerges across passes as PM/EM accumulate.
+
+## Gradient Flow
+
+### Within-Segment (Pass-to-Pass)
+
+```
+loss → decode → x^R → column_R(x^{R-1}, PM/EM_{R-1})
+  → PM.read → PM/EM_{R-1}
+  → pm_commit(PM/EM_{R-2}, elig_{R-1}, neuromod_{R-1})
+  → neuromodulator_{R-1} gets gradient!
+  → elig_{R-1} → column_{R-1} outputs → ...back to pass 1
+```
+
+The neuromodulator at pass r gets gradient from pass r+1's loss contribution,
+**within the same segment**. No multi-segment TBPTT needed for neuromodulator
+learning. Each pass is a mini perception-and-commit cycle.
+
+### What Gets Gradient From Where
+
+| Component | Gradient source | Path |
+|-----------|----------------|------|
+| Column FFN | Same pass's contribution to loss | Direct through decode |
+| PCM encode/hypothesis | L_pred (auxiliary) + downstream surprise | Same segment |
+| PM read projections | Same pass's loss through PM read | Direct |
+| EM read projections | Same pass's loss through EM read | Direct |
+| PM neuromodulator | **Next pass's** loss through committed PM state | Pass r → r+1 |
+| EM neuromodulator | **Next pass's** loss through written EM state | Pass r → r+1 |
+| Eligibility projections | **Next pass's** loss through committed eligibility | Pass r → r+1 |
+
+All gradient paths are within the same segment's forward/backward pass. The
+computation graph spans R passes of column processing + R-1 PM/EM commits.
+
+### Cross-Segment Gradient
+
+For the neuromodulator at the **final pass** (pass R), gradient comes from the
+**next segment** — the committed PM/EM_R is read by the next segment's columns.
+This requires TBPTT chunks spanning at least 2 segments:
+
+```
+TBPTT chunk = K segments (e.g., K=2-4)
+Segment 1: R passes → PM/EM updated R times → carry to segment 2
+Segment 2: R passes → loss flows back through PM/EM → segment 1's final commit
+```
+
+K=2 is likely sufficient (the final pass's neuromodulator only needs 1 segment
+of lookahead). Internal passes (1..R-1) get gradient from within their own
+segment.
 
 ## Correctness Analysis
 
-### 1. Causality Proof (by induction)
+### 1. Causality
 
-**Claim**: At position t, pass r, memory state S_t^r contains information
-ONLY from tokens 0..t-1. Never from t or later.
+Causality is maintained at two levels:
+- **Across segments**: PM/EM state at segment k reflects only tokens from
+  segments 0..k-1 and the current segment's completed passes.
+- **Across passes**: PM/EM at pass r reflects all N tokens from passes 1..r-1.
+  All tokens within pass r see the same PM/EM_r (no within-pass ordering).
 
-**Base case (pass 1):** All tokens compute updates from S_init (predates
-current segment). Token i's update depends only on token_i + S_init. The
-exclusive scan accumulates positions 0..t-1 only, by construction. ✓
-
-**Inductive step:** Assume S_i^r has info from tokens 0..i-1 only (all i).
-Token i computes Δ_i^{r+1} from (token_i, S_i^r) — info from tokens 0..i.
-Exclusive scan accumulates j=0..t-1 → S_t^{r+1} has tokens 0..t-1 only. ✓
-
-**Critical requirement**: column function has NO cross-token operations.
+Within a single pass, there is no causal ordering — all positions are equivalent
+(modulo positional encoding).
 
 ### 2. Train/Inference Equivalence
 
-**Inference** maintains R running states. Pass 1 always reads S_init (fixed
-per segment). Pass r reads running state from pass r-1. Decode BEFORE update
-(exclusive semantics).
+**Training**: process N tokens simultaneously for R passes, decode all.
+**Inference**: process one token at a time for R passes, decode.
 
-```python
-def inference_step(token, S_init, states):
-    """Process one token. states = list of R running states."""
-    logits = decode(token, states[R-1])  # decode FIRST (exclusive)
+Equivalent because no cross-token operations within a pass. At inference, PM/EM
+still update after each pass (single token's eligibility/novelty may or may not
+trigger commits — the neuromodulator decides).
 
-    (A1, b1) = column_1(token, S_init)   # pass 1: reads S_init always
-    (A2, b2) = column_2(token, states[0]) # pass 2: reads pass-1 state
-    ...
-    (AR, bR) = column_R(token, states[R-2])
+Inference memory: PM + EM + per-column PCM z_hat + eligibility accumulators.
+**Constant**, does not grow with sequence length.
 
-    states[0] = A1 * states[0] + b1       # advance all states
-    states[1] = A2 * states[1] + b2
-    ...
-    states[R-1] = AR * states[R-1] + bR
+### 3. What R=1 Is
 
-    return logits
-```
+R=1: single pass. No cross-pass surprise (no previous prediction). No PM/EM
+update within the segment (only carries forward to next segment). This is a
+**feedforward model with memory reads** — similar to retrieval-augmented generation.
 
-**Verified with concrete R=2 example** (see detailed proof in previous version).
-Training scan and streaming inference produce identical outputs at every position.
-
-Inference memory: (R+1) × state_size. Constant, does not grow with sequence length.
-
-### 3. What R=1 Actually Is
-
-R=1 is NOT a unigram model. It's a single-layer gated linear recurrence
-(diagonal SSM). The update *parameters* (A_t, b_t) are context-free within the
-segment (computed from token + S_init only), but the *state* S_t is
-context-dependent — it's the scan accumulation of all previous tokens' updates.
-Order matters (gate products affect how earlier writes survive).
-
-- R=1: single scan layer. Tokens compress into state, but update params lack
-  within-segment context. Still a real sequence model.
-- R=2+: update params become contextual (computed from previous pass's causal
-  states). This is where "deep" behavior emerges.
-
-### 4. Gradient Flow
-
-```
-loss@t → decode → S_t^R → (pass-R scan) → Δ_j^R for j<t
-  → column_R(token_j, S_j^{R-1}) → (pass-(R-1) scan) → ...
-  → column_1(token_m, S_init) → token_m embedding
-```
-
-Gradient reaches all earlier tokens through R levels of scan chains.
-Each scan backward is O(log N). Total backward depth: R × O(log N).
-
-**Numerical concern**: gate products A_t·A_{t-1}·...·A_0 vanish if gates < 1.
-Mitigations:
-- Parameterize A = exp(-softplus(...)) — stable decay rate interpretation
-- Initialize gates near 1 (sigmoid with positive bias, like LSTM forget gate)
-- Residual paths across passes (see improvements section)
-- Decode from all passes' states (multi-scale)
-
-### 5. Document Boundary Handling
-
-Setting A_d = 0 blocks state flow through the scan, but b_d computed from
-S_d^{r-1} could carry pre-boundary info.
-
-**Fix**: At document boundaries, the column must read a RESET state (zeros or
-fresh S_init) instead of S_d^{r-1}. This ensures both A_d and b_d are clean.
-Alternatively, use a segmented scan with boundary markers.
-
-### 6. Information Propagation
-
-After R passes, token t's state carries R levels of refined context from all
-preceding tokens. Analogous to R transformer layers.
-
-Key difference: transformer passes N×D values between layers (full residual
-stream). We pass state_size values (memory bottleneck). This forces compression
-but limits bandwidth — we may need larger R than a transformer needs L.
-
-This bottleneck IS the inductive bias: all information must flow through
-memory, forcing the model to compress and prioritize, just like biological
-memory systems.
+R=2+: cross-pass surprise kicks in. PM/EM update between passes. Tokens gain
+indirect access to each other through memory. "Depth" emerges.
 
 ## Practical Design Decisions
 
-### Scan State Partitioning
+### Column Dimensions
 
-Not everything needs per-token scanning. Partition by update frequency:
+```
+D = 768           # embedding / model dimension
+B_blocks = 6      # blocks (each with own PM + EM)
+C = 4             # columns per block (24 total)
+D_col = 128       # column width
+D_mem = 256       # PM/EM slot dimension (decoupled from D_col)
+D_pcm = 64        # PCM encoding dimension
 
-| In scan (per-token) | Outside scan (periodic boundary) |
-|---------------------|----------------------------------|
-| PCM z_hat (~768 floats) | PM slots (~12K floats) |
-| WM buffer (~50K floats) | EM episodes (~131K floats) |
-| Small controller state | |
+Fan-out:  D → B_blocks × C × D_col = 768 → 3072  (~4x)
+Fan-in:   B_blocks × C × D_col → D = 3072 → 768
+```
 
-PM and EM update at periodic boundaries (every 128 tokens). Their update logic
-(Hebbian eligibility, surprise-based episode selection) runs at boundaries using
-accumulated column outputs from the preceding window. This preserves the
-existing PM/EM update mechanisms almost unchanged.
+### Segment Length
 
-### Residual Across Passes
+Segment length N determines how many tokens contribute to each round of R
+PM/EM updates. N=128 means each pass sees 128 tokens of eligibility/novelty
+before committing. Shorter N = more frequent cross-segment updates.
 
-Instead of each pass recomputing state from S_init, use explicit residual:
+### Damped Pass-to-Pass Mixing
 
-    S^r = S^{r-1} + scan(Δ^r, initial=zeros)
+    x^r = (1 - λ) * x^{r-1} + λ * column_output^r
 
-This makes "refinement" literal (each pass adds an increment), improves
-gradient flow, and stabilizes training. Each pass doesn't fight to reconstruct
-everything — it just adds what was missing.
+λ can be learned or per-pass schedule. Start with λ=0.5.
 
 ### Token Subsampling
 
-Earlier passes can process random subsets of tokens for efficiency:
+Earlier passes can process subsets of tokens:
 
 ```
-Pass 1: process 25% of tokens (random), scan over sparse updates
-Pass 2: process 25% (different random subset), scan
+Pass 1: process 25% of tokens (strided)
+Pass 2: process 50%
 ...
-Pass R: process ALL tokens, scan, decode, take loss
+Pass R: process ALL tokens, decode, take loss
 ```
 
-Each pass fills in more of the memory state. Earlier passes are cheaper.
-The stochasticity acts as regularization — the model builds robust memory
-representations that don't depend on any single token's contribution.
-This echoes adding noise in diffusion models.
+Skipped tokens retain their representation unchanged. PM/EM still update
+from the processed subset's eligibility/novelty.
 
-Final pass must process all tokens (for loss computation at every position).
+**Edge cases:**
+- Deterministic schedule at inference (strided). Random only during training.
+- Per-pass auxiliary loss to prevent "early passes don't matter" collapse.
 
-### Per-Column vs Shared Memory in the Scan
+### Scaling: Blocks of Columns
 
-- **PCM**: per-column (B independent scans of D_h floats — tiny, parallel)
-- **WM**: could be partitioned (each column owns W/B slots) or shared
-  (columns aggregate write candidates before scan)
-- **PM/EM**: outside the scan, updated at boundaries. Shared across columns.
-  Columns contribute write candidates; aggregation at boundary resolves conflicts.
+```
+Block b: C columns share PM_b (r_slots × D_mem) + EM_b (M_slots × D_mem)
+```
+
+Total columns = B_blocks × C. Each block's PM/EM can specialize. Analogous
+to different brain regions maintaining different types of memories.
 
 ## Complexity
 
 ### Serial Depth
 
-Per pass: O(1) column + O(log N) scan = O(log N)
-Total: R × O(log N)
-
-R=6, N=256: 6 × 8 = **48 steps**
+Per pass: O(1) — all B × N computations are parallel.
+PM/EM commit between passes: O(1) (small, not N-dependent).
+Total: O(R).
 
 Compare:
 - Current (v1):       O(K×P) = 8×32 = **256 steps**
 - Transformer (L=6):  O(L) = **6 steps** (but O(N²) compute per step)
-- Mamba (L=6):        O(L) = **6 steps** (sequential scan per layer)
+- Mamba (L=6):        O(L×N) (sequential scan per layer)
+- **v4 (R=6)**:       O(R) = **6 steps** (and O(N×D²) compute per step)
 
 ### Compute
 
-Per pass: O(N × D²) for columns + O(N log N × scan_state) for scan
-Total: R × O(N × D²)
-
-Roughly R × cost of a single transformer FFN layer, without the N² attention.
+Per pass: O(N × B_blocks × C × D_col²) for column FFNs
+        + O(N × B_blocks × r × D_mem) for PM reads
+        + O(N × B_blocks × k × D_mem) for EM reads
+Total: R × above
 
 ### Memory
 
-Training: O(R × N × scan_state_size). With gradient checkpointing: O(N × scan_state_size).
-Inference: O(R × state_size) — **constant**, does not grow with sequence length.
+Training: O(R × N × D) for intermediate representations.
+With gradient checkpointing: O(N × D) + recompute per pass.
+Inference: O(PM + EM + B × D_pcm) — **constant**.
 
-## Training Modes
+## Training
 
-### Mode 1: Causal Next-Token Prediction (Pretraining)
+### Loss
 
-Standard teacher-forced CE loss at every position:
+    L = (1/N) Σ_t CE(decode(x^R_t), token_{t+1}) + α * L_pred
 
-    L = (1/N) Σ_t CE(decode(token_t, S_t^R), token_{t+1})
+where L_pred = Σ_r MSE(z_hat^r, z^{r+1}.detach()) averaged over passes.
 
-Training memory: O(R × N × state_size) — linear in N.
-Inference memory: O(R × state_size) — constant.
+### TBPTT Chunks
 
-### Mode 2: Chunk Prediction (Post-Pretraining)
+Process K segments per chunk (K=2-4). Backprop through all K × R passes.
+PM/EM state detached at chunk boundaries.
 
-Fine-tune with iterative chunk generation:
-- Process prompt tokens normally (populate memory)
-- Predict next chunk of K tokens, starting from noise/zeros
-- Iteratively refine predictions (diffusion-like)
-- Loss on refined chunk
+### Phase A: Per-Document Learning
 
-Uses the same R-pass machinery. Aligns training with generation use case.
+PM/EM reset at document boundaries. Neuromodulators learn when to commit.
 
-## Relationship to Existing Work
+### Phase B: Lifelong Adaptation
 
-This architecture IS a gated linear recurrence (diagonal SSM) parallelized via
-prefix scan — squarely in the prefix-scannable model family. The novelty is:
+PM/EM persist across documents within a stream. Only eligibility accumulators
+and PCM z_hat reset at doc boundaries. The distillation cycle:
 
-1. **Structured memory state** (PM/EM/WM/PCM, not flat vectors)
-2. **R iterative passes** with inter-pass context flow (stacked scans)
-3. **Factored updates** (small descriptors expand to full state updates)
-4. **Bio-inspired decision logic** (Hebbian, episodic) producing affine outputs
-5. **Cortical column architecture** (B parallel processors with local PCM)
+1. New domain → surprise spikes (PCM cross-pass surprise)
+2. PM eligibility accumulates (gated by surprise)
+3. PM neuromodulator commits at each pass boundary
+4. EM writes novel episodes at each pass boundary
+5. Over time, slow weights learn domain → surprise drops
+6. Slow weights = general; PM/EM = domain-specific
 
-| Approach | Scan? | Multi-pass? | Structured memory? | Constant inference? |
-|----------|-------|-------------|-------------------|-------------------|
-| Transformer | No | Yes (L layers) | No | No (KV cache grows) |
-| Mamba/S4 | Yes | No (1/layer) | No (flat state) | Yes |
-| RWKV | Yes | No (1/layer) | No (flat state) | Yes |
-| Universal Transformer | No | Yes (shared) | No | No |
-| **v4 (this)** | **Yes** | **Yes (R passes)** | **Yes (PM/EM/WM/PCM)** | **Yes** |
+## Memory System Learning Mechanisms
+
+### PM Eligibility Accumulation
+
+Each token, each pass, each column accumulates eligibility:
+
+```
+# Project to D_mem for compatibility with PM slots
+k_cand = normalize(W_k_pre(x_col))         # → [D_mem]
+v_cand = W_v_post(x_col)                   # → [D_mem]
+gate = (surprise / 5.0).clamp(0, 1)        # third factor
+route_w = softmax(pm_K @ k_cand / tau)     # [r_slots] — which slot?
+
+# Accumulate across all N tokens in this pass
+elig_K += gate * route_w ⊗ k_cand          # [r_slots, D_mem]
+elig_V += gate * route_w ⊗ v_cand
+```
+
+At the end of each pass, the neuromodulator decides how much to commit:
+
+```
+(g, slot_logits, tau) = PM_neuromodulator(elig_summary)
+slot_weights = softmax(slot_logits / tau)   # which slots to update
+pm_K = (1 - g * slot_weights) * pm_K + g * slot_weights * elig_K
+pm_V = (1 - g * slot_weights) * pm_V + g * slot_weights * elig_V
+```
+
+Eligibility accumulators reset after each commit (each pass gets fresh traces).
+
+### EM Novelty Accumulation
+
+Each token, each pass, each column scores novelty:
+
+```
+novelty = w_nov * surprise + (1 - w_nov) * (1 - max_cosine_sim(q, em_K))
+```
+
+Top-C candidates (highest novelty) are buffered per pass. At the end of each
+pass, the neuromodulator decides writes:
+
+```
+(g_em, tau, decay) = EM_neuromodulator(novelty_mean, em_usage, content)
+slot_scores = candidates @ em_K.T / tau   # soft slot selection
+slot_weights = softmax(slot_scores)
+em_K[slot] = (1 - g_em * slot_weights) * em_K[slot] + g_em * slot_weights * candidate_K
+em_V[slot] = (1 - g_em * slot_weights) * em_V[slot] + g_em * slot_weights * candidate_V
+em_S *= decay                             # strength decay before write
+```
+
+### Summary
+
+| Component | Where | When | Parallel? |
+|-----------|-------|------|-----------|
+| PM holographic read | Column | Every token, every pass | Yes (B×N) |
+| EM top-k read | Column | Every token, every pass | Yes (B×N) |
+| PCM encode + surprise | Column | Every token, every pass | Yes (B×N) |
+| FFN | Column | Every token, every pass | Yes (B×N) |
+| PM eligibility accumulate | Column | Every token, every pass | Yes (B×N) |
+| EM novelty score | Column | Every token, every pass | Yes (B×N) |
+| PM neuromod commit | Between passes | Once per pass | Small |
+| EM neuromod write | Between passes | Once per pass | Small |
+
+## Prototyping Plan
+
+### Prototype 0: Columns + PCM only (no PM/EM)
+
+- B columns with FFN + PCM, R passes, no memory reads or updates
+- Goal: can R-pass refinement with cross-pass surprise learn language at all?
+
+### Prototype 1: Add PM/EM reads (frozen)
+
+- PM/EM initialized, frozen (no updates between passes)
+- Goal: does reading from structured memory improve perplexity?
+
+### Prototype 2: Full system
+
+- PM/EM updated between passes via neuromodulators
+- Full Hebbian eligibility + novelty writes
+- Goal: demonstrate the iterative perception + memory update loop
+
+### Prototype 2.5: Optional within-segment scan
+
+- Add small recurrent scan state if within-pass token context proves necessary
+- Goal: handle local syntactic tasks that pure PM/EM can't cover
+
+### Measure
+
+1. tokens/sec at fixed batch and N
+2. peak training memory (GB)
+3. validation loss vs baseline (RWKV-small or tiny transformer)
 
 ## Open Questions
 
-1. **Optimal R**: Empirical. Start with R=4-8. Ablate with auxiliary per-pass loss.
+1. **Optimal R**: Start R=4-6. Per-pass auxiliary loss for ablation.
 
-2. **Shared vs per-pass column weights**: Shared = fewer params, true iterative
-   refinement. Separate = more capacity, like distinct transformer layers. Hybrid
-   possible.
+2. **Shared vs per-pass column weights**: Shared = true iterative refinement.
+   Separate = more capacity. Hybrid possible.
 
-3. **Decode from multiple passes**: Use [S_t^1, ..., S_t^R] concatenated for
-   richer decoding. No extra inference memory (already maintain R states).
+3. **Eligibility reset between passes**: Currently reset after each commit. Could
+   carry eligibility across passes (exponential decay) for multi-pass patterns.
 
-4. **Scan implementation**: For N=256, a fused sequential scan kernel may beat
-   parallel prefix tree (less memory movement). torch.scan (sequential, compilable)
-   vs torch.associative_scan (parallel, prototype, no autograd yet) vs custom
-   Triton kernel.
+4. **Within-segment context**: Is memory-mediated context (R hops through PM/EM)
+   sufficient? Or do we need direct token interaction? Empirical.
 
-5. **Convergence**: Does the iterative process converge? Can we prove contraction?
-   Does fixed-point theory apply?
+5. **Block/column scaling**: How many blocks × columns per block?
 
-6. **Scale of scan state vs R**: R controls depth of reasoning. state_size controls
-   breadth of context. For long sequences, grow state_size. For complex reasoning,
-   grow R.
+6. **PCM prediction target**: Predict next pass's encoding, final pass's encoding,
+   or contrastive loss?
+
+7. **Pass 1 (no surprise)**: What should gate eligibility/novelty in pass 1? Options:
+   a) No gating (accumulate everything), b) Use a fixed prior, c) Skip accumulation.

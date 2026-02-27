@@ -1,0 +1,186 @@
+<mxfile host="app.diagrams.net" modified="2026-02-27" type="device">
+  <diagram name="Episodic Memory Workflow" id="em-workflow">
+    <mxGraphModel dx="1200" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="1500" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title" value="&lt;b&gt;Episodic Memory — Full Workflow&lt;/b&gt;" style="text;html=1;align=center;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="310" y="10" width="350" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== READ SECTION ==================== -->
+        <mxCell id="read_container" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="50" y="60" width="480" height="330" as="geometry"/>
+        </mxCell>
+        <mxCell id="read_title" value="&lt;b&gt;EM Read (Top-k Retrieval + Cross-Attention)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Inside CorticalColumnGroup.forward — every token, every pass&lt;/font&gt;" style="text;html=1;align=left;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="60" y="65" width="450" height="35" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_input" value="x_col&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="110" width="150" height="35" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_proj" value="q = W_em_up(x_col)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="165" width="175" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="re1" style="endArrow=block;endFill=1;" edge="1" source="r_input" target="r_proj" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- EM State -->
+        <mxCell id="em_state" value="&lt;b&gt;EM State&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;em_K [BS, M, D_mem] (unit-norm)&lt;br&gt;em_V [BS, M, D_mem]&lt;br&gt;em_S [BS, M] (strengths)&lt;br&gt;em_age [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="320" y="110" width="190" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_scores" value="scores = q @ em_K.T&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N*C, M]&lt;br&gt;mask inactive slots (em_S == 0)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="220" width="200" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="re2" style="endArrow=block;endFill=1;" edge="1" source="r_proj" target="r_scores" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="re2b" style="endArrow=block;endFill=1;dashed=1;strokeColor=#82b366;" edge="1" source="em_state" target="r_scores" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_topk" value="top-k retrieval (k = k_ret)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;K_top, V_top [BS, N*C, k, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="300" y="225" width="210" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="re3" style="endArrow=block;endFill=1;" edge="1" source="r_scores" target="r_topk" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_cross" value="Cross-Attention&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;q_cross = W_q_cross(q)&lt;br&gt;attn = softmax(q_cross @ K_top.T + topk_scores)&lt;br&gt;out = W_o_cross(attn @ V_top)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="120" y="290" width="300" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="re4" style="endArrow=block;endFill=1;" edge="1" source="r_topk" target="r_cross" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_out" value="x_col += W_em_down(out)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="360" width="190" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="re5" style="endArrow=block;endFill=1;" edge="1" source="r_cross" target="r_out" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== NOVELTY SECTION ==================== -->
+        <mxCell id="nov_container" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="560" y="60" width="480" height="330" as="geometry"/>
+        </mxCell>
+        <mxCell id="nov_title" value="&lt;b&gt;EM Novelty Scoring + Candidate Selection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;After full column forward — every token, every pass&lt;/font&gt;" style="text;html=1;align=left;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="570" y="65" width="400" height="35" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_xout" value="x_out (column output)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="690" y="110" width="170" height="35" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_qnov" value="q_nov = norm(W_k_cand(x_out))&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem] — candidate key&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="580" y="165" width="220" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="n_vnov" value="v_nov = W_v_cand(x_out)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem] — candidate value&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="820" y="165" width="200" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="ne1" style="endArrow=block;endFill=1;" edge="1" source="n_xout" target="n_qnov" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="ne2" style="endArrow=block;endFill=1;" edge="1" source="n_xout" target="n_vnov" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_wnov" value="w_nov = σ(W_nov(x_out))&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C] — surprise vs similarity weight&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="580" y="215" width="230" height="35" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_maxsim" value="max_sim = max(q_nov @ em_K.T)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C] — similarity to existing memories&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="580" y="263" width="250" height="37" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_novelty" value="&lt;b&gt;novelty = w_nov · surprise + (1−w_nov) · (1−max_sim)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C] — blend of surprise and dissimilarity&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="580" y="315" width="350" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="ne3" style="endArrow=block;endFill=1;" edge="1" source="n_wnov" target="n_novelty" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="ne4" style="endArrow=block;endFill=1;" edge="1" source="n_maxsim" target="n_novelty" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n_select" value="select_top_candidates(novelty, C_em)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Flatten N×C, take top-C_em by novelty&lt;br&gt;cand_K, cand_V [BS, C_em, D_mem]&lt;br&gt;cand_scores [BS, C_em]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="630" y="365" width="280" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="ne5" style="endArrow=block;endFill=1;" edge="1" source="n_novelty" target="n_select" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== WRITE SECTION ==================== -->
+        <mxCell id="write_container" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="130" y="450" width="800" height="370" as="geometry"/>
+        </mxCell>
+        <mxCell id="write_title" value="&lt;b&gt;EM Write (Between Passes)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;ColumnBlock.commit_and_write — once per pass per block&lt;/font&gt;" style="text;html=1;align=left;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="455" width="400" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- Neuromodulator -->
+        <mxCell id="w_neuromod_in" value="Neuromod inputs (detached):&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;novelty_mean = mean(cand_scores) [BS]&lt;br&gt;em_usage = Σ em_S [BS]&lt;br&gt;content_emb = mean(cand_K) [BS, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="160" y="500" width="260" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="w_neuromod" value="&lt;b&gt;EMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;MLP: features → backbone(ReLU)&lt;br&gt;→ g_head (sigmoid scaled) → g_em [BS]&lt;br&gt;→ tau_head (sigmoid scaled) → τ [BS]&lt;br&gt;→ decay_head (sigmoid scaled) → decay [BS]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="480" y="495" width="260" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="we1" style="endArrow=block;endFill=1;" edge="1" source="w_neuromod_in" target="w_neuromod" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Slot selection -->
+        <mxCell id="w_slots" value="1. Slot Selection&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;slot_scores = cand_K_norm @ em_K.T + weakness_bias&lt;br&gt;slot_weights = softmax(slot_scores / τ) [BS, C_em, M]&lt;br&gt;α_per_slot = Σ_cand (g_em × cand_weight × slot_weights) [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="160" y="590" width="370" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="we2" style="endArrow=block;endFill=1;" edge="1" source="w_neuromod" target="w_slots" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Blending -->
+        <mxCell id="w_blend" value="2. Candidate Blending per Slot&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;blended_K = Σ_cand (α × cand_K_norm) / α_per_slot&lt;br&gt;blended_V = Σ_cand (α × cand_V) / α_per_slot&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="595" width="320" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="we3" style="endArrow=block;endFill=1;" edge="1" source="w_slots" target="w_blend" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- EMA update -->
+        <mxCell id="w_ema" value="3. EMA Update&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;em_K = (1 − α) · em_K + α · norm(blended_K)&lt;br&gt;em_V = (1 − α) · em_V + α · blended_V  ← NOT normalized&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="160" y="675" width="330" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="we4" style="endArrow=block;endFill=1;" edge="1" source="w_blend" target="w_ema" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Strength + budget + age -->
+        <mxCell id="w_strength" value="4. Strength, Age, Decay, Budget&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;em_S = clamp(em_S + α_per_slot, 0, S_max)&lt;br&gt;em_age *= (1 − α_per_slot)&lt;br&gt;em_S *= decay&lt;br&gt;em_S = budget_enforce(em_S, budget_em)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="670" width="280" height="65" as="geometry"/>
+        </mxCell>
+        <mxCell id="we5" style="endArrow=block;endFill=1;" edge="1" source="w_ema" target="w_strength" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Updated state -->
+        <mxCell id="w_output" value="&lt;b&gt;Updated EM State&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;+ age_tick(N)&lt;br&gt;Available for next pass's read&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="550" y="755" width="180" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="we6" style="endArrow=block;endFill=1;" edge="1" source="w_strength" target="w_output" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow from candidates to write -->
+        <mxCell id="cand_to_write" style="endArrow=block;endFill=1;strokeColor=#82b366;strokeWidth=2;" edge="1" source="n_select" target="w_neuromod_in" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

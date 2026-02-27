@@ -1,329 +1,126 @@
 """
-Block — parallel processing unit with L sequential layers + 1 EM bank.
+ColumnBlock (v4) — block of C cortical columns with shared PM + EM.
 
-One Block per parallel track (B total). Each block processes D_h dimensions,
-contains L Layers (each with their own PM), and one shared EpisodicMemory.
-
-When PCM is enabled, each block has a PredictiveCodingModule that computes
-vector surprise (δ) from evidence vs hypothesis, replacing scalar surprise.
-PCM surprise is RMS-normalized (||δ|| / sqrt(D_pc)) to keep scale near ~1.
+One ColumnBlock per memory block (B_blocks total). Each block owns:
+- CorticalColumnGroup (C columns, batched via GroupedLinear)
+- ProceduralMemory (shared across columns)
+- EpisodicMemory (shared across columns)
+- PM/EM neuromodulators
 """
-
-import math
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from .config import ModelConfig
-from .layer import Layer
+from .column import CorticalColumnGroup
+from .procedural_memory import ProceduralMemory, PMNeuromodulator
 from .episodic_memory import EpisodicMemory, EMNeuromodulator
-from .predictive_coding import PredictiveCodingModule
-from .utils import StateMixin
+from .utils import unit_normalize
 
 
-class Block(nn.Module, StateMixin):
-    _state_tensor_names = []  # state lives in child modules
+class ColumnBlock(nn.Module):
+    """Block of C cortical columns with shared PM + EM."""
 
-    def __init__(self, config: ModelConfig, block_idx: int):
+    def __init__(self, block_idx: int, config: ModelConfig):
         super().__init__()
-        self.config = config
         self.block_idx = block_idx
+        self.config = config
 
-        # Predictive Coding Module (per block)
-        if config.pcm_enabled:
-            self.pcm = PredictiveCodingModule(config)
-        else:
-            self.pcm = None
+        self.columns = CorticalColumnGroup(config)
+        self.pm = ProceduralMemory(config.D_mem, config.r, config)
+        self.em = EpisodicMemory(config.D_mem, config.M, config)
+        self.pm_neuromod = PMNeuromodulator(config)
+        self.em_neuromod = EMNeuromodulator(config)
 
-        # Pre-LayerNorm for Layer 0 input: ensures L0 receives normalized
-        # input (like L1+ which get LayerNorm'd output from previous layer),
-        # fixing gradient asymmetry between L0 and deeper layers.
-        self.input_norm = nn.LayerNorm(config.D_h)
+    def forward_pass(self, x_block: Tensor, z_hat_prev: Tensor | None):
+        """One refinement pass: all C columns * all N tokens.
 
-        # L sequential layers
-        self.layers = nn.ModuleList([
-            Layer(config, block_idx, l) for l in range(config.L)
-        ])
+        x_block: [BS, N, C, D_col]
+        z_hat_prev: [BS, N, C, D_pcm] or None
 
-        # Episodic memory (1 per block)
-        self.em = EpisodicMemory(config)
-        self.em_neuromodulator = EMNeuromodulator(config)
-
-        # Projections from shared D to per-block D_h
-        self.W_wm_proj = nn.Linear(config.D, config.D_h, bias=False)
-        self.W_em_proj = nn.Linear(config.D, config.D_h, bias=False)
-
-        # Runtime caches (set during forward_span, consumed at boundary)
-        self._last_z: Tensor | None = None
-        self._last_L_recon: Tensor | None = None
-        self._last_token_surprise: Tensor | None = None
-        self._last_carry: Tensor | None = None
-
-    def step(self, x_block: Tensor, y_wm: Tensor, x_proj: Tensor,
-             surprise: Tensor, carry: Tensor, collect: bool = False,
-             return_layers: bool = False):
-        """Process one token through this block.
-
-        Args:
-            x_block: [BS, D_h] — input slice for this block
-            y_wm: [BS, D] — shared WM output
-            x_proj: [BS, D] — W_in projection (for EM retrieval query)
-            surprise: [BS, 1] — scalar surprise signal
-            carry: [BS, 1] — 0 at doc boundaries, 1 otherwise
-            collect: bool — if True, include per-layer gate stats
-            return_layers: bool — if True, include stacked layer outputs
-
-        Returns:
-            h_out: [BS, D_h] — final layer output
-            stats: dict (only when collect=True) — per-layer gate stats
-            layer_outputs: [BS, L, D_h] (only when return_layers=True)
+        Returns: x_out, z, z_hat, pcm_loss, pm_elig, em_cands
         """
-        # EM retrieval (if enabled)
-        if self.config.em_enabled:
-            y_em = self.em.retrieve(x_proj, y_wm)  # [BS, D]
+        x_out, z, z_hat, surprise, elig_info, nov_info = \
+            self.columns.forward(x_block, self.pm, self.em, z_hat_prev)
+
+        # Aggregate PM eligibility across N tokens and C columns
+        k_cand, v_cand, gate = elig_info
+
+        if self.config.pm_enabled and self.pm.is_initialized():
+            # Route eligibility to PM slots
+            k_norm = unit_normalize(k_cand)
+            # pm_K: [BS, r, D_mem], k_norm: [BS, N, C, D_mem]
+            route_scores = torch.einsum(
+                "bncd, brd -> bncr", k_norm, self.pm.pm_K
+            )  # [BS, N, C, r]
+            route_w = torch.softmax(
+                route_scores / self.config.tau_route_pm, dim=-1
+            )  # [BS, N, C, r]
+
+            # Gate and aggregate
+            gated_routed = gate.unsqueeze(-1) * route_w  # [BS, N, C, r]
+            elig_K = torch.einsum("bncr, bncd -> brd", gated_routed, k_cand)
+            elig_V = torch.einsum("bncr, bncd -> brd", gated_routed, v_cand)
         else:
-            y_em = torch.zeros_like(y_wm)
+            elig_K = torch.zeros(
+                x_block.shape[0], self.config.r, self.config.D_mem,
+                device=x_block.device, dtype=x_block.dtype,
+            )
+            elig_V = torch.zeros_like(elig_K)
 
-        # Project to D_h
-        y_wm_proj = self.W_wm_proj(y_wm)      # [BS, D_h]
-        y_em_proj = self.W_em_proj(y_em)        # [BS, D_h]
-
-        # PCM: compute vector surprise (δ) and FFN gain
-        if self.pcm is not None:
-            z = self.pcm.encode(x_block.unsqueeze(1))   # [BS, 1, D_pc]
-            delta = self.pcm.compute_surprise(z)         # [BS, 1, D_pc]
-            gate_surprise = delta.squeeze(1)             # [BS, D_pc]
-            ffn_gain = self.pcm.compute_ffn_gain(delta).squeeze(1)  # [BS, D_h]
-            # RMS-normalized scalar surprise for PM eligibility
-            pm_surprise = delta.norm(dim=-1) / math.sqrt(self.config.D_pc)  # [BS, 1]
+        # Score EM novelty and select top candidates
+        q_nov, v_nov, w_nov, surp = nov_info
+        if self.config.em_enabled and self.em.is_initialized():
+            novelty = self.em.score_novelty(q_nov, surp, w_nov)
+            em_cands = self.em.select_top_candidates(
+                q_nov, v_nov, novelty, self.config.C_em
+            )
         else:
-            gate_surprise = surprise                     # [BS, 1]
-            ffn_gain = None
-            pm_surprise = surprise                       # [BS, 1]
+            C_em = self.config.C_em
+            BS = x_block.shape[0]
+            em_cands = (
+                torch.zeros(BS, C_em, self.config.D_mem, device=x_block.device, dtype=x_block.dtype),
+                torch.zeros(BS, C_em, self.config.D_mem, device=x_block.device, dtype=x_block.dtype),
+                torch.zeros(BS, C_em, device=x_block.device, dtype=x_block.dtype),
+            )
 
-        # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
-        x = self.input_norm(x_block)
-        layer_stats = {}
-        layer_outs = [] if return_layers else None
-        for l_idx, layer in enumerate(self.layers):
-            # PM read (if enabled)
-            if self.config.pm_enabled:
-                y_pm = layer.pm.apply(x)
-            else:
-                y_pm = torch.zeros_like(x)
+        # PCM prediction loss
+        pcm_loss = torch.tensor(0.0, device=x_block.device)
+        if self.config.pcm_enabled and z_hat_prev is not None and z is not None:
+            pcm_loss = self.columns.pcm.prediction_loss(z_hat_prev, z)
 
-            # Forward through layer
-            result = layer.step(x, y_pm, y_wm_proj, y_em_proj, gate_surprise,
-                                carry, ffn_gain=ffn_gain, collect=collect)
+        return x_out, z, z_hat, pcm_loss, (elig_K, elig_V), em_cands
 
-            if collect:
-                h, lstats = result
-                layer_stats[l_idx] = lstats
-            else:
-                h = result
+    def commit_and_write(self, elig, em_cands):
+        """PM commit + EM write. Called between passes."""
+        elig_K, elig_V = elig
+        cand_K, cand_V, cand_scores = em_cands
+        BS = elig_K.shape[0]
+        device = elig_K.device
 
-            if return_layers:
-                layer_outs.append(h)
+        # PM commit
+        if self.config.pm_enabled and self.pm.is_initialized():
+            self.pm.base_decay()
+            elig_summary = elig_K.norm(dim=-1).mean(dim=-1)  # [BS]
+            pm_usage = self.pm.pm_a.sum(dim=-1)  # [BS]
+            content_emb = elig_K.mean(dim=1)  # [BS, D_mem]
+            g, slot_logits, tau = self.pm_neuromod(
+                elig_summary.detach(), pm_usage.detach(), content_emb.detach()
+            )
+            self.pm.commit(elig_K, elig_V, g, slot_logits, tau)
 
-            # Update eligibility traces (if PM enabled)
-            # Uses RMS-normalized ‖δ‖ from PCM when enabled, else scalar surprise
-            if self.config.pm_enabled:
-                layer.pm.update_eligibility(x, h, pm_surprise)
+        # EM write
+        if self.config.em_enabled and self.em.is_initialized():
+            em_usage = self.em.em_S.sum(dim=-1)  # [BS]
+            novelty_mean = cand_scores.mean(dim=-1)  # [BS]
+            content_emb = cand_K.mean(dim=1)  # [BS, D_mem]
+            g_em, tau_em, decay = self.em_neuromod(
+                novelty_mean.detach(), em_usage.detach(), content_emb.detach()
+            )
+            self.em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay)
+            self.em.age_tick(self.config.N)
 
-            x = h  # next layer's input
-
-        # Build stacked layer outputs [BS, L, D_h]
-        layer_stack = torch.stack(layer_outs, dim=1) if return_layers else None
-
-        # Return based on flags
-        if collect and return_layers:
-            return x, layer_stats, layer_stack
-        if collect:
-            return x, layer_stats
-        if return_layers:
-            return x, layer_stack
-        return x  # final layer output [BS, D_h]
-
-    def forward_span(self, x_block_all: Tensor, y_wm_all: Tensor,
-                     x_proj_all: Tensor, surprise_span: Tensor,
-                     carry_all: Tensor,
-                     collect: bool = False) -> Tensor:
-        """Process P tokens in parallel through this block.
-
-        PM eligibility is updated inline after each layer (matching the
-        sequential path in step()), using PCM surprise when available.
-
-        Args:
-            x_block_all: [BS, P, D_h] — block input for all tokens
-            y_wm_all: [BS, P, D] — shared WM output
-            x_proj_all: [BS, P, D] — W_in projections (for EM retrieval)
-            surprise_span: [BS, 1] — frozen surprise for this span
-            carry_all: [BS, P, 1] — 0 at doc boundaries, 1 otherwise
-            collect: if True, return (h_out, layer_stats) tuple
-
-        Returns:
-            h_out_all: [BS, P, D_h] — final layer output for all tokens
-            (if collect: also returns {layer_idx: gate_stats} dict)
-        """
-        BS, P, D_h = x_block_all.shape
-
-        # EM retrieval (if enabled)
-        if self.config.em_enabled:
-            y_em = self.em.retrieve_batch(x_proj_all, y_wm_all)
-        else:
-            y_em = torch.zeros_like(y_wm_all)
-
-        # Project to D_h: [BS, P, D_h]
-        y_wm_proj = self.W_wm_proj(y_wm_all)
-        y_em_proj = self.W_em_proj(y_em)
-
-        # --- PCM: encode evidence, compute surprise, FFN gain ---
-        if self.pcm is not None:
-            z = self.pcm.encode(x_block_all)                 # [BS, P, D_pc]
-            delta = self.pcm.compute_surprise(z)             # [BS, P, D_pc]
-            surprise_all = delta                             # [BS, P, D_pc]
-            ffn_gain_all = self.pcm.compute_ffn_gain(delta)  # [BS, P, D_h]
-
-            # RMS-normalized per-token scalar surprise (for PM eligibility + EM)
-            pcm_surprise = delta.norm(dim=-1, keepdim=True) / math.sqrt(
-                self.config.D_pc
-            )  # [BS, P, 1]
-            self._last_token_surprise = pcm_surprise
-            elig_surprise = pcm_surprise  # used for inline eligibility
-
-            # Cache for boundary ops (called after forward pass)
-            self._last_z = z
-            self._last_carry = carry_all  # [BS, P, 1] for masked z_mean
-            self._last_L_recon = self.pcm.compute_recon_loss(z, x_block_all)
-        else:
-            # Scalar surprise: expand [BS, 1] → [BS, P, 1]
-            surprise_all = surprise_span.unsqueeze(1).expand(BS, P, 1)
-            ffn_gain_all = None
-            self._last_token_surprise = None
-            elig_surprise = surprise_all  # [BS, P, 1]
-
-        # Reset mask for eligibility (derived from carry_all)
-        reset_mask = ~carry_all.squeeze(-1).bool()  # [BS, P]
-
-        # Normalize input for Layer 0 (matches the LayerNorm'd output L1+ receive)
-        x = self.input_norm(x_block_all)
-        layer_stats = {} if collect else None
-        for l_idx, layer in enumerate(self.layers):
-            if self.config.pm_enabled:
-                y_pm = layer.pm.apply_batch(x)
-            else:
-                y_pm = torch.zeros_like(x)
-
-            # x_in for eligibility is the current x (before layer processes it)
-            x_in = x
-
-            result = layer.forward_span(x, y_pm, y_wm_proj, y_em_proj,
-                                        surprise_all, carry_all,
-                                        ffn_gain_all=ffn_gain_all,
-                                        collect=collect)
-            if collect:
-                x, lstats = result
-                layer_stats[l_idx] = lstats
-            else:
-                x = result
-
-            # Inline PM eligibility update (x_in = pre-layer input, x = h_out)
-            if self.config.pm_enabled:
-                layer.pm.update_eligibility_batch(
-                    x_in, x, elig_surprise, reset_mask,
-                )
-
-        # Collect per-layer outputs for spatial decoder (at original resolution).
-        if self.config.snapshot_enabled:
-            self._last_layer_stack = torch.stack(
-                [layer._last_h_all for layer in self.layers], dim=2
-            )  # [BS, P, L, D_h]
-
-        # Free intermediate _last_h_all (only final layer needed for EM candidates)
-        for layer in self.layers[:-1]:
-            layer._last_h_all = None
-
-        if collect:
-            return x, layer_stats
-        return x
-
-    def commit_pm(self, force_mode: str = "normal",
-                  span_surprise: Tensor = None) -> dict:
-        """Trigger PM commits for all layers in this block.
-
-        Args:
-            force_mode: "normal" — use controller decisions
-                        "force_on" — commit all streams
-                        "force_off" — skip all commits
-            span_surprise: [BS] — mean surprise over span (for controller)
-        """
-        commit_info = {}
-        if force_mode == "force_off":
-            return commit_info
-
-        for l_idx, layer in enumerate(self.layers):
-            pm = layer.pm
-
-            # Compute eligibility norm for controller
-            if pm.elig_K is not None:
-                elig_norm = pm.elig_K.norm(dim=-1).mean(dim=-1)  # [BS]
-                pm_usage = pm.pm_a.sum(dim=-1)  # [BS]
-            else:
-                continue
-
-            if force_mode == "force_on":
-                BS = elig_norm.shape[0]
-                p_commit = torch.ones(BS, device=elig_norm.device)
-                lambda_vals = torch.full((BS,), pm.decay,
-                                         device=elig_norm.device)
-                g = torch.full((BS,), self.config.g_pm_default, device=elig_norm.device)
-                tau = torch.full((BS,), self.config.tau_pm, device=elig_norm.device)
-                pm.commit(p_commit, lambda_vals, g, None, tau)
-                commit_info[l_idx] = p_commit.detach()
-            else:
-                # Content embedding: mean eligibility key for content-aware neuromod
-                content_emb = pm.elig_K.mean(dim=1)  # [BS, D_h]
-
-                # Neuromodulator decides all commit parameters (fully differentiable)
-                surprise_input = span_surprise if span_surprise is not None else elig_norm
-                p_commit, lambda_vals, g, slot_logits, tau = \
-                    layer.pm_neuromodulator.forward(
-                        elig_norm,
-                        pm_usage / self.config.budget_pm,
-                        surprise_input,
-                        content_emb=content_emb,
-                    )
-                pm.commit(p_commit, lambda_vals, g, slot_logits, tau)
-                commit_info[l_idx] = p_commit.detach()
-
-        return commit_info
-
-    def detach_states(self):
-        """Detach all states in child modules."""
-        for layer in self.layers:
-            layer.detach_states()
-            layer.pm.detach_states()
-        self.em.detach_states()
-        if self.pcm is not None:
-            self.pcm.detach_states()
-
-    def reset_states(self, mask: Tensor):
-        """Reset states for masked streams.
-
-        In lifelong mode (Phase C), only transient state resets:
-        h and eligibility traces. PM committed state and EM persist.
-        """
-        for layer in self.layers:
-            layer.reset_states(mask)  # always zeros h
-            if self.config.lifelong_mode:
-                layer.pm.reset_eligibility(mask)  # only elig_K, elig_V
-            else:
-                layer.pm.reset_states(mask)  # zeros all PM state
-
-        if not self.config.lifelong_mode:
-            self.em.reset_states(mask)  # zeros em_S
-        # In lifelong mode: EM fully persists
-
-        if self.pcm is not None:
-            self.pcm.reset_states(mask)
+    def initialize_states(self, BS: int, device: torch.device, dtype: torch.dtype):
+        self.pm.initialize(BS, device, dtype)
+        self.em.initialize(BS, device, dtype)

@@ -1,8 +1,8 @@
 """
-Validation utilities for neuromorphic LM.
+Validation utilities for neuromorphic LM (v4).
 
-Provides a lightweight held-out evaluation loop that computes masked
-cross-entropy/perplexity without optimizer updates.
+Lightweight held-out evaluation loop: masked cross-entropy/perplexity
+without optimizer updates.
 """
 
 from typing import Iterator, Optional
@@ -15,32 +15,16 @@ from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
 from ..model.utils import runtime_state_dtype
-from .loss import batched_cross_entropy, compute_loss_and_surprise
-from . import span_ops
+from .loss import batched_cross_entropy
 
 
 def _clear_runtime_for_eval(model: NeuromorphicLM, batch_size: int,
                             device: torch.device):
     """Hard-reset runtime state so validation starts from a clean slate."""
     mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-    if model.surprise is None or model.surprise.shape[0] != batch_size:
-        model.surprise = torch.zeros(
-            batch_size, 1, device=device, dtype=runtime_state_dtype(device)
-        )
-    else:
-        model.surprise = torch.zeros_like(model.surprise)
-
-    # Reset transient recurrent state.
     for block in model.blocks:
-        for layer in block.layers:
-            layer.reset_states(mask)         # h
-            layer.pm.reset_states(mask)      # pm_K/pm_V/pm_a/elig
-        # Keep em_K/em_V but zero strengths so retrieval is inactive.
+        block.pm.reset_content(mask)
         block.em.reset_states(mask)
-        if block.pcm is not None:
-            block.pcm.reset_states(mask)     # z_hat
-
-    model.wm.reset_states(mask)
     model.detach_states()
 
 
@@ -54,13 +38,7 @@ def evaluate_validation(
     pm_enabled: Optional[bool] = None,
     em_enabled: Optional[bool] = None,
 ) -> dict:
-    """Validate masked CE/perplexity over held-out chunks.
-
-    Runtime state and config toggles (pm_enabled, em_enabled) are temporarily
-    overridden if caller passes explicit values, then restored in the finally
-    block. Model runtime state is also saved/restored so validation is
-    side-effect free.
-    """
+    """Validate masked CE/perplexity over held-out chunks."""
     total_loss = 0.0
     valid_count = 0
     total_tokens = 0
@@ -79,11 +57,11 @@ def evaluate_validation(
         config.em_enabled = em_enabled
 
     try:
-        model.eval()
+        model.set_eval_mode()
         cleared = False
         eot_id = config.eot_id
-        P = config.P
-        # Match training dtype so torch.compile doesn't recompile on dtype change
+        N = config.N
+
         use_amp = device.type == "cuda"
         amp_ctx = torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
@@ -104,110 +82,37 @@ def evaluate_validation(
                 _clear_runtime_for_eval(model, BS, device)
                 cleared = True
 
-            for span_start in range(0, T, P):
-                span_end = min(span_start + P, T)
-                span_P = span_end - span_start
+            for seg_start in range(0, T, N):
+                seg_end = min(seg_start + N, T)
+                seg_ids = input_ids[:, seg_start:seg_end]
+                seg_targets = target_ids[:, seg_start:seg_end]
 
-                span_ids = input_ids[:, span_start:span_end]
-                span_targets = target_ids[:, span_start:span_end]
-
-                # Reset mask for first token
-                if span_start == 0:
-                    reset_first = (prev_token == eot_id)
+                if seg_start == 0:
+                    reset_mask = (prev_token == eot_id)
                 else:
-                    reset_first = (input_ids[:, span_start - 1] == eot_id)
+                    reset_mask = (input_ids[:, seg_start - 1] == eot_id)
 
-                # Wrap entire span (forward + PM + EM) under autocast to match
-                # training dtype and avoid torch.compile recompilation
+                is_eot = (seg_ids == eot_id)
+                eot_inputs += int(is_eot.sum().item())
+                resets += int(reset_mask.sum().item())
+
                 with amp_ctx:
-                    logits_all, x_emb_all, y_wm_all = model.forward_span(
-                        span_ids, reset_first
-                    )
+                    logits, _ = model.forward_segment(seg_ids, reset_mask)
 
-                    if not torch.isfinite(logits_all).all():
-                        raise RuntimeError("Non-finite logits detected during validation.")
+                if not torch.isfinite(logits).all():
+                    raise RuntimeError("Non-finite logits during validation.")
 
-                    # Loss masking
-                    is_eot_all, loss_mask_all = span_ops.compute_loss_mask(
-                        span_ids, eot_id, config.reset_on_doc_boundary
-                    )
+                if config.reset_on_doc_boundary:
+                    loss_mask = ~is_eot
+                else:
+                    loss_mask = torch.ones_like(is_eot)
 
-                    # Fused loss + surprise from a single log_softmax
-                    span_loss, span_valid, token_surprise = compute_loss_and_surprise(
-                        logits_all, span_targets, loss_mask_all,
-                    )
-                    total_loss += float(span_loss.item())
-                    valid_count += int(span_valid.item())
-
-                    # When PCM enabled, override with ‖δ‖ surprise
-                    pcm_surprise = model.get_pcm_token_surprise()
-                    if pcm_surprise is not None:
-                        token_surprise = pcm_surprise
-
-                    # Compute reset masks for accumulators
-                    reset_mask_all = span_ops.compute_reset_mask(
-                        model, span_ids, reset_first, config.reset_on_doc_boundary
-                    )
-
-                    # Track span surprise for boundary decisions
-                    span_surprise_accum = torch.zeros(BS, device=device)
-                    span_valid_tokens = torch.zeros(BS, device=device)
-                    span_last_reset = torch.zeros(BS, dtype=torch.long, device=device)
-
-                    span_ops.accumulate_span_surprise(
-                        token_surprise, loss_mask_all, reset_mask_all,
-                        config.reset_on_doc_boundary,
-                        span_surprise_accum, span_valid_tokens, span_last_reset,
-                    )
-
-                    total_tokens += BS * span_P
-                    eot_inputs += int(is_eot_all.sum().item())
-                    resets += int(reset_mask_all.sum().item())
-
-                    span_surprise_mean = span_surprise_accum / span_valid_tokens.clamp(min=1)
-
-                    # Update model surprise to span mean (matching trainer)
-                    next_surprise = span_surprise_mean.unsqueeze(-1)  # [BS, 1]
-                    if model.surprise is not None:
-                        next_surprise = next_surprise.to(model.surprise.dtype)
-                    model.surprise = next_surprise
-
-                    # PM eligibility is updated inline in Block.forward_span.
-
-                    # Clear PM content + EM strengths for streams that had
-                    # mid-span doc-boundary resets
-                    span_ops.apply_mid_span_resets(
-                        model, reset_mask_all, config,
-                    )
-
-                    # PCM hypothesis update (val: we don't accumulate losses)
-                    if config.pcm_enabled:
-                        span_ops.apply_pcm_boundary(model, config)
-
-                    if config.pm_enabled:
-                        span_ops.apply_pm_boundary(model, span_surprise_mean)
-
-                    # EM candidates + write
-                    if config.em_enabled:
-                        B = config.B
-                        cand_K = [[] for _ in range(B)]
-                        cand_V = [[] for _ in range(B)]
-                        cand_score = [[] for _ in range(B)]
-                        cand_token_valid = [[] for _ in range(B)]
-
-                        span_ops.propose_em_candidates(
-                            model, model._last_x_proj_all, y_wm_all,
-                            token_surprise, loss_mask_all,
-                            cand_K, cand_V, cand_score,
-                            cand_token_valid,
-                        )
-                        em_stacked = span_ops.stack_em_candidates(
-                            cand_K, cand_V, cand_score, cand_token_valid,
-                            span_last_reset, device,
-                        )
-                        span_ops.apply_em_boundary(
-                            model, em_stacked, span_surprise_mean, config,
-                        )
+                seg_loss, seg_valid = batched_cross_entropy(
+                    logits, seg_targets, loss_mask
+                )
+                total_loss += float(seg_loss.item())
+                valid_count += int(seg_valid.item()) if torch.is_tensor(seg_valid) else int(seg_valid)
+                total_tokens += BS * (seg_end - seg_start)
 
             model.detach_states()
             steps_done += 1
@@ -217,8 +122,6 @@ def evaluate_validation(
         config.em_enabled = em_before
         if was_training:
             model.train()
-        else:
-            model.eval()
 
     if valid_count > 0:
         avg_loss = total_loss / valid_count
