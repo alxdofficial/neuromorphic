@@ -20,6 +20,25 @@ from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from .loss import batched_cross_entropy, compute_loss_and_surprise, compute_regularizers
 
+
+def _make_compiled_step(model, config):
+    """Create a compiled train step that fuses forward + CE loss."""
+    vocab = config.vocab_size
+
+    @torch.compile(mode="default")
+    def _step(seg_ids, reset_mask, seg_targets, loss_mask):
+        logits, aux_loss = model.forward_segment(seg_ids, reset_mask)
+        targets = seg_targets.reshape(-1).clone()
+        targets[~loss_mask.reshape(-1)] = -100
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, vocab), targets,
+            ignore_index=-100, reduction="sum",
+        )
+        valid_count = loss_mask.sum()
+        return ce_loss, aux_loss, valid_count
+
+    return _step
+
 if TYPE_CHECKING:
     from ..debug.collector import MetricsCollector
 
@@ -59,10 +78,9 @@ class TBPTTTrainer:
 
         self._states_initialized = False
         self._compile_requested = config.use_compile and device.type == "cuda"
+        self._compiled_step = None
         if self._compile_requested:
-            self.model.forward_segment = torch.compile(
-                self.model.forward_segment, mode="default"
-            )
+            self._compiled_step = _make_compiled_step(model, config)
 
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""
@@ -144,18 +162,21 @@ class TBPTTTrainer:
             is_eot = (seg_ids == eot_id)
             eot_inputs += int(is_eot.sum().item())
 
-            # Forward (R passes + PM/EM updates all inside)
-            with amp_ctx:
-                logits, aux_loss = self.model.forward_segment(seg_ids, reset_mask)
-
             # Loss masking: skip EOT positions
             if self.config.reset_on_doc_boundary:
                 loss_mask = ~is_eot
             else:
                 loss_mask = torch.ones_like(is_eot)
 
-            # Compute loss
-            ce_loss, seg_valid = batched_cross_entropy(logits, seg_targets, loss_mask)
+            # Forward + loss (compiled step fuses both on CUDA)
+            if self._compiled_step is not None:
+                ce_loss, aux_loss, seg_valid = self._compiled_step(
+                    seg_ids, reset_mask, seg_targets, loss_mask
+                )
+            else:
+                with amp_ctx:
+                    logits, aux_loss = self.model.forward_segment(seg_ids, reset_mask)
+                ce_loss, seg_valid = batched_cross_entropy(logits, seg_targets, loss_mask)
 
             if self.fail_fast and not torch.isfinite(ce_loss):
                 raise RuntimeError(

@@ -76,43 +76,29 @@ class TestCrossPassPCM:
 class TestProceduralMemory:
     def test_read_shape(self):
         cfg = make_tiny_config()
+        B = cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        pm.pm_K = torch.randn(BS, cfg.r, cfg.D_mem)
-        pm.pm_V = torch.randn(BS, cfg.r, cfg.D_mem)
-        pm.pm_a = torch.ones(BS, cfg.r)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_a = torch.ones(BS, B, cfg.r)
 
-        q = torch.randn(BS, 4, 2, cfg.D_mem)  # [BS, N, C, D_mem]
+        q = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)  # [BS, N, B, C, D_mem]
         y = pm.read(q)
         assert y.shape == q.shape
 
-    def test_read_3d_shape(self):
-        """PM read also works with 3D input [BSB, NC, D_mem]."""
-        cfg = make_tiny_config()
-        B = cfg.B_blocks
-        BSB = BS * B
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
-        pm.initialize(BSB, torch.device("cpu"), torch.float32)
-        pm.pm_K = torch.randn(BSB, cfg.r, cfg.D_mem)
-        pm.pm_V = torch.randn(BSB, cfg.r, cfg.D_mem)
-        pm.pm_a = torch.ones(BSB, cfg.r)
-
-        NC = 4 * 2  # N*C
-        q = torch.randn(BSB, NC, cfg.D_mem)
-        y = pm.read(q)
-        assert y.shape == (BSB, NC, cfg.D_mem)
-
     def test_commit(self):
         cfg = make_tiny_config()
+        B = cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
-        elig_K = torch.randn(BS, cfg.r, cfg.D_mem)
-        elig_V = torch.randn(BS, cfg.r, cfg.D_mem)
-        g = torch.full((BS,), 0.5)
-        slot_logits = torch.randn(BS, cfg.r)
-        tau = torch.ones(BS)
+        elig_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        elig_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        g = torch.full((BS, B), 0.5)
+        slot_logits = torch.randn(BS, B, cfg.r)
+        tau = torch.ones(BS, B)
 
         pm.commit(elig_K, elig_V, g, slot_logits, tau)
         assert pm.pm_a is not None
@@ -121,64 +107,61 @@ class TestProceduralMemory:
 
 class TestEpisodicMemory:
     def test_read_shape(self):
-        """EM read with batched input [BSB, NC, D_mem]."""
+        """EM read with 5D input [BS, N, B, C, D_mem]."""
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        BSB = BS * B
         em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
-        em.initialize(BSB, torch.device("cpu"), torch.float32)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        em.em_K = torch.randn(BSB, cfg.M, cfg.D_mem)
-        em.em_S = torch.ones(BSB, cfg.M)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_mem)
+        em.em_S = torch.ones(BS, B, cfg.M)
 
-        NC = 4 * cfg.C
-        q = torch.randn(BSB, NC, cfg.D_mem)  # [BSB, NC, D_mem]
+        N = 4
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
         y = em.read(q)
         assert y.shape == q.shape
 
     def test_novelty_score_shape(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        BSB = BS * B
         em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
-        em.initialize(BSB, torch.device("cpu"), torch.float32)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
 
-        NC = 4 * cfg.C
-        q = torch.randn(BSB, NC, cfg.D_mem)
-        surprise = torch.rand(BSB, NC)
-        w_nov = torch.rand(BSB, NC)
+        N = 4
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        surprise = torch.rand(BS, N, B, cfg.C)
+        w_nov = torch.rand(BS, N, B, cfg.C)
 
         novelty = em.score_novelty(q, surprise, w_nov)
-        assert novelty.shape == (BSB, NC)
+        assert novelty.shape == (BS, N, B, cfg.C)
 
     def test_select_top_candidates(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        BSB = BS * B
         em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
-        em.initialize(BSB, torch.device("cpu"), torch.float32)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
 
-        NC = 4 * cfg.C
-        q = torch.randn(BSB, NC, cfg.D_mem)
-        v = torch.randn(BSB, NC, cfg.D_mem)
-        novelty = torch.rand(BSB, NC)
+        N = 4
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        v = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        novelty = torch.rand(BS, N, B, cfg.C)
 
         cand_K, cand_V, cand_scores = em.select_top_candidates(q, v, novelty, cfg.C_em)
-        assert cand_K.shape == (BSB, cfg.C_em, cfg.D_mem)
-        assert cand_V.shape == (BSB, cfg.C_em, cfg.D_mem)
-        assert cand_scores.shape == (BSB, cfg.C_em)
+        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D_mem)
+        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D_mem)
+        assert cand_scores.shape == (BS, B, cfg.C_em)
 
 
 class TestColumnGroup:
     def test_forward_shape(self):
         cfg = make_tiny_config(pcm_enabled=True)
         G = cfg.B_blocks * cfg.C
+        B = cfg.B_blocks
         col = CorticalColumnGroup(cfg)
-        BSB = BS * cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
-        pm.initialize(BSB, torch.device("cpu"), torch.float32)
-        em.initialize(BSB, torch.device("cpu"), torch.float32)
+        pm.initialize(BS, torch.device("cpu"), torch.float32)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
 
         x = torch.randn(BS, cfg.N, G, cfg.D_col)
         x_out, z, z_hat, surprise, elig_info, nov_info = col.forward(x, pm, em, None)
@@ -189,12 +172,12 @@ class TestColumnGroup:
         assert surprise.shape == (BS, cfg.N, G)
 
         k_cand, v_cand, gate = elig_info
-        assert k_cand.shape == (BS, cfg.N, G, cfg.D_mem)
-        assert gate.shape == (BS, cfg.N, G)
+        assert k_cand.shape == (BS, cfg.N, B, cfg.C, cfg.D_mem)
+        assert gate.shape == (BS, cfg.N, B, cfg.C)
 
         q_nov, v_nov, w_nov, surp = nov_info
-        assert q_nov.shape == (BS, cfg.N, G, cfg.D_mem)
-        assert w_nov.shape == (BS, cfg.N, G)
+        assert q_nov.shape == (BS, cfg.N, B, cfg.C, cfg.D_mem)
+        assert w_nov.shape == (BS, cfg.N, B, cfg.C)
 
 
 class TestFullModel:

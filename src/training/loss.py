@@ -46,18 +46,14 @@ def batched_cross_entropy(logits_all: Tensor, targets_all: Tensor,
         valid_count: GPU tensor — number of valid positions
     """
     BS, N, V = logits_all.shape
-    flat_logits = logits_all.reshape(BS * N, V)
-    flat_targets = targets_all.reshape(BS * N)
-    flat_mask = loss_mask_all.reshape(BS * N)
-
-    valid_count = flat_mask.sum()
-    if valid_count == 0:
-        return torch.tensor(0.0, device=logits_all.device, requires_grad=True), valid_count
-
+    targets = targets_all.reshape(BS * N).clone()
+    mask = loss_mask_all.reshape(BS * N)
+    targets[~mask] = -100
     loss = F.cross_entropy(
-        flat_logits[flat_mask], flat_targets[flat_mask], reduction="sum"
+        logits_all.reshape(BS * N, V), targets,
+        ignore_index=-100, reduction="sum",
     )
-    return loss, valid_count
+    return loss, mask.sum()
 
 
 def compute_loss_and_surprise(

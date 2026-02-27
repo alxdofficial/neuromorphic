@@ -1,7 +1,7 @@
 """
 Procedural Memory (v4) — holographic modulation slots.
 
-Per-block (B_blocks instances). Operates in D_mem space.
+Per-block (B_blocks instances, batched as BS,B dim). Operates in D_mem space.
 Read: holographic modulation. Write: neuromodulated EMA commit.
 """
 
@@ -18,9 +18,9 @@ class ProceduralMemory(nn.Module, StateMixin):
     """Holographic procedural memory with eligibility-based commit.
 
     State:
-        pm_K: [BS, r, D_mem] — key bank (unit-normalized)
-        pm_V: [BS, r, D_mem] — value bank (modulation patterns)
-        pm_a: [BS, r] — slot strengths (bounded)
+        pm_K: [BS, B, r, D_mem] — key bank (unit-normalized)
+        pm_V: [BS, B, r, D_mem] — value bank (modulation patterns)
+        pm_a: [BS, B, r] — slot strengths (bounded)
     """
 
     _state_tensor_names = ["pm_K", "pm_V", "pm_a"]
@@ -29,6 +29,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         super().__init__()
         self.D_mem = D_mem
         self.r = r_slots
+        self.B = config.B_blocks
         self.a_max = config.a_max
         self.budget = config.budget_pm
         self.decay = config.decay_pm
@@ -41,36 +42,32 @@ class ProceduralMemory(nn.Module, StateMixin):
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
         """Pre-allocate state tensors."""
-        self.pm_K = torch.zeros(BS, self.r, self.D_mem, device=device, dtype=dtype)
-        self.pm_V = torch.zeros(BS, self.r, self.D_mem, device=device, dtype=dtype)
-        self.pm_a = torch.zeros(BS, self.r, device=device, dtype=dtype)
+        self.pm_K = torch.zeros(BS, self.B, self.r, self.D_mem, device=device, dtype=dtype)
+        self.pm_V = torch.zeros(BS, self.B, self.r, self.D_mem, device=device, dtype=dtype)
+        self.pm_a = torch.zeros(BS, self.B, self.r, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.pm_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Holographic read. q: [BS,...,D_mem] -> [BS,...,D_mem].
+        """Holographic read. q: [BS, N, B, C, D_mem] -> [BS, N, B, C, D_mem].
 
         scores = normalize(q) @ pm_K.T
         weighted = scores * pm_a
         modulation = einsum(weighted, pm_V)
         y = q * modulation  (holographic)
         """
-        # q: [BS, N, C, D_mem], pm_K: [BS, r, D_mem]
+        # q: [BS, N, B, C, D_mem], pm_K: [BS, B, r, D_mem]
         q_norm = unit_normalize(q)
 
-        # Expand pm_K for batch matmul: [BS, r, D_mem] -> broadcast over N,C
-        scores = torch.einsum("...d, brd -> ...r", q_norm, self.pm_K)  # [BS,N,C,r]
+        # scores: contract over D_mem, broadcast over N,C
+        scores = torch.einsum("snbcd, sbrd -> snbcr", q_norm, self.pm_K)
 
-        # Weight by slot strength
-        # pm_a: [BS, r] -> [BS, 1, 1, r] for broadcast
-        a_expanded = self.pm_a
-        for _ in range(scores.dim() - a_expanded.dim()):
-            a_expanded = a_expanded.unsqueeze(1)
-        weighted = scores * a_expanded  # [BS,N,C,r]
+        # Weight by slot strength: pm_a [BS, B, r] -> broadcast [BS, 1, B, 1, r]
+        weighted = scores * self.pm_a[:, None, :, None, :]
 
         # Modulation
-        modulation = torch.einsum("...r, brd -> ...d", weighted, self.pm_V)  # [BS,N,C,D_mem]
+        modulation = torch.einsum("snbcr, sbrd -> snbcd", weighted, self.pm_V)
 
         # Holographic: element-wise multiply
         return q * modulation
@@ -79,16 +76,16 @@ class ProceduralMemory(nn.Module, StateMixin):
                g: Tensor, slot_logits: Tensor, tau: Tensor):
         """EMA commit of aggregated eligibility.
 
-        elig_K, elig_V: [BS, r, D_mem] — aggregated across N*C
-        g: [BS] — write strength
-        slot_logits: [BS, r] — slot selection bias
-        tau: [BS] — softmax temperature
+        elig_K, elig_V: [BS, B, r, D_mem] — aggregated across N*C
+        g: [BS, B] — write strength
+        slot_logits: [BS, B, r] — slot selection bias
+        tau: [BS, B] — softmax temperature
         """
         # Slot weights
-        slot_weights = F.softmax(slot_logits / tau.unsqueeze(-1).clamp(min=0.01), dim=-1)  # [BS, r]
+        slot_weights = F.softmax(slot_logits / tau.unsqueeze(-1).clamp(min=0.01), dim=-1)  # [BS, B, r]
 
         # Alpha = g * slot_weights
-        alpha = (g.unsqueeze(-1) * slot_weights).unsqueeze(-1)  # [BS, r, 1]
+        alpha = (g.unsqueeze(-1) * slot_weights).unsqueeze(-1)  # [BS, B, r, 1]
 
         # EMA update
         elig_K_norm = unit_normalize(elig_K)
@@ -99,7 +96,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         # Strength update
         self.pm_a = (self.pm_a + alpha.squeeze(-1)).clamp(0, self.a_max)
 
-        # Budget enforcement
+        # Budget enforcement (per-stream-per-block: last dim is r)
         self.pm_a = budget_enforce(self.pm_a, self.budget)
 
     def base_decay(self):
@@ -108,13 +105,16 @@ class ProceduralMemory(nn.Module, StateMixin):
             self.pm_a = self.pm_a * self.decay
 
     def reset_content(self, mask: Tensor):
-        """Zero K/V/a for masked streams (doc boundary, non-lifelong)."""
+        """Zero K/V/a for masked streams (doc boundary, non-lifelong).
+
+        mask: [BS] bool — expand to [BS, 1, 1, 1] for K/V, [BS, 1, 1] for a.
+        """
         if self.pm_K is None:
             return
-        expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+        expanded = mask[:, None, None, None]  # [BS, 1, 1, 1]
         self.pm_K = self.pm_K * ~expanded
         self.pm_V = self.pm_V * ~expanded
-        expanded_a = mask.unsqueeze(-1)  # [BS, 1]
+        expanded_a = mask[:, None, None]  # [BS, 1, 1]
         self.pm_a = self.pm_a * ~expanded_a
 
 
@@ -122,7 +122,7 @@ class PMNeuromodulator(nn.Module):
     """Neuromodulator for PM commit decisions.
 
     Produces fully differentiable outputs for all commit parameters.
-    Returns: g [BS], slot_logits [BS, r], tau [BS]
+    Returns: g [BS*B], slot_logits [BS*B, r], tau [BS*B]
     """
 
     def __init__(self, config: ModelConfig):
@@ -156,9 +156,9 @@ class PMNeuromodulator(nn.Module):
     def forward(self, elig_summary: Tensor, pm_usage: Tensor,
                 content_emb: Tensor | None = None):
         """
-        elig_summary: [BS] — eligibility magnitude
-        pm_usage: [BS] — sum(pm_a)
-        content_emb: [BS, D_mem] — mean eligibility key (optional)
+        elig_summary: [BSB] — eligibility magnitude (flattened BS*B)
+        pm_usage: [BSB] — sum(pm_a)
+        content_emb: [BSB, D_mem] — mean eligibility key (optional)
         """
         if not self.pm_enabled:
             BS = elig_summary.shape[0]

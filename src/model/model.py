@@ -3,7 +3,7 @@ NeuromorphicLM (v4) — iterative refinement with cortical columns.
 
 Processes N-token segments through R iterative passes.  All B_blocks * C
 columns process all N tokens in parallel via a single CorticalColumnGroup
-with G = B*C groups.  PM/EM state is batched across blocks (BS*B batch dim).
+with G = B*C groups.  PM/EM state has explicit B dim: [BS, B, ...].
 No Python loop over blocks — only a loop over R refinement passes.
 """
 
@@ -41,7 +41,7 @@ class NeuromorphicLM(nn.Module):
         # Single merged column group (G = B*C groups)
         self.columns = CorticalColumnGroup(config)
 
-        # Single PM + EM (state batched: BS*B)
+        # Single PM + EM (state: [BS, B, ...])
         self.pm = ProceduralMemory(config.D_mem, config.r, config)
         self.em = EpisodicMemory(config.D_mem, config.M, config)
 
@@ -125,76 +125,82 @@ class NeuromorphicLM(nn.Module):
     def _process_and_commit(self, elig_info, nov_info, x_out):
         """Route eligibility to PM slots, score EM novelty, then commit/write.
 
-        All inputs are in column space [BS, N, G, ...].  We reshape to
-        memory space [BS*B, ...] for PM/EM operations.
+        elig_info: (k_cand, v_cand, gate) — all [BS, N, B, C, D_mem] or [BS, N, B, C]
+        nov_info: (q_nov, v_nov, w_nov, surprise) — same shapes
+        x_out: [BS, N, G, D_col] (unused directly, info extracted in column)
         """
         k_cand, v_cand, gate = elig_info
-        BS, N, G, D_mem = k_cand.shape
-        B, C = self.config.B_blocks, self.config.C
-        BSB = BS * B
+        BS, N, B, C, D_mem = k_cand.shape
 
-        # --- PM eligibility routing ---
-        k_cand_m = self.columns._to_mem_space(k_cand)    # [BSB, N*C, D_mem]
-        v_cand_m = self.columns._to_mem_space(v_cand)    # [BSB, N*C, D_mem]
-        gate_m = self.columns._to_mem_space(gate)         # [BSB, N*C]
-
+        # --- PM eligibility routing (5D einsums) ---
         if self.config.pm_enabled:
-            k_norm = unit_normalize(k_cand_m)
+            k_norm = unit_normalize(k_cand)
             route_scores = torch.einsum(
-                "bnd, brd -> bnr", k_norm, self.pm.pm_K
-            )  # [BSB, N*C, r]
+                "snbcd, sbrd -> snbcr", k_norm, self.pm.pm_K
+            )  # [BS, N, B, C, r]
             route_w = torch.softmax(
                 route_scores / self.config.tau_route_pm, dim=-1
-            )  # [BSB, N*C, r]
-            gated_routed = gate_m.unsqueeze(-1) * route_w  # [BSB, N*C, r]
-            elig_K = torch.einsum("bnr, bnd -> brd", gated_routed, k_cand_m)
-            elig_V = torch.einsum("bnr, bnd -> brd", gated_routed, v_cand_m)
+            )  # [BS, N, B, C, r]
+            gated_routed = gate.unsqueeze(-1) * route_w  # [BS, N, B, C, r]
+            elig_K = torch.einsum("snbcr, snbcd -> sbrd", gated_routed, k_cand)
+            elig_V = torch.einsum("snbcr, snbcd -> sbrd", gated_routed, v_cand)
         else:
             elig_K = torch.zeros(
-                BSB, self.config.r, D_mem,
+                BS, B, self.config.r, D_mem,
                 device=k_cand.device, dtype=k_cand.dtype,
             )
             elig_V = torch.zeros_like(elig_K)
 
         # --- EM novelty scoring + candidate selection ---
         q_nov, v_nov, w_nov, surp = nov_info
-        q_nov_m = self.columns._to_mem_space(q_nov)       # [BSB, N*C, D_mem]
-        v_nov_m = self.columns._to_mem_space(v_nov)       # [BSB, N*C, D_mem]
-        w_nov_m = self.columns._to_mem_space(w_nov)       # [BSB, N*C]
-        surp_m = self.columns._to_mem_space(surp)          # [BSB, N*C]
 
         if self.config.em_enabled:
-            novelty = self.em.score_novelty(q_nov_m, surp_m, w_nov_m)
+            novelty = self.em.score_novelty(q_nov, surp, w_nov)
             em_cands = self.em.select_top_candidates(
-                q_nov_m, v_nov_m, novelty, self.config.C_em
+                q_nov, v_nov, novelty, self.config.C_em
             )
         else:
             em_cands = (
-                torch.zeros(BSB, self.config.C_em, D_mem, device=k_cand.device, dtype=k_cand.dtype),
-                torch.zeros(BSB, self.config.C_em, D_mem, device=k_cand.device, dtype=k_cand.dtype),
-                torch.zeros(BSB, self.config.C_em, device=k_cand.device, dtype=k_cand.dtype),
+                torch.zeros(BS, B, self.config.C_em, D_mem, device=k_cand.device, dtype=k_cand.dtype),
+                torch.zeros(BS, B, self.config.C_em, D_mem, device=k_cand.device, dtype=k_cand.dtype),
+                torch.zeros(BS, B, self.config.C_em, device=k_cand.device, dtype=k_cand.dtype),
             )
 
         # --- PM commit ---
         if self.config.pm_enabled:
             self.pm.base_decay()
-            elig_summary = elig_K.norm(dim=-1).mean(dim=-1)  # [BSB]
-            pm_usage = self.pm.pm_a.sum(dim=-1)              # [BSB]
-            content_emb = elig_K.mean(dim=1)                 # [BSB, D_mem]
+            # Neuromod: flatten [BS, B] -> [BS*B] for MLP, reshape back
+            BSB = BS * B
+            elig_summary = elig_K.norm(dim=-1).mean(dim=-1)  # [BS, B]
+            pm_usage = self.pm.pm_a.sum(dim=-1)              # [BS, B]
+            content_emb = elig_K.mean(dim=2)                 # [BS, B, D_mem]
             g, slot_logits, tau = self.pm_neuromod(
-                elig_summary.detach(), pm_usage.detach(), content_emb.detach()
+                elig_summary.reshape(BSB).detach(),
+                pm_usage.reshape(BSB).detach(),
+                content_emb.reshape(BSB, D_mem).detach(),
             )
+            # Reshape neuromod outputs back to [BS, B, ...]
+            g = g.reshape(BS, B)
+            slot_logits = slot_logits.reshape(BS, B, -1)
+            tau = tau.reshape(BS, B)
             self.pm.commit(elig_K, elig_V, g, slot_logits, tau)
 
         # --- EM write ---
         cand_K, cand_V, cand_scores = em_cands
         if self.config.em_enabled:
-            em_usage = self.em.em_S.sum(dim=-1)              # [BSB]
-            novelty_mean = cand_scores.mean(dim=-1)          # [BSB]
-            content_emb = cand_K.mean(dim=1)                 # [BSB, D_mem]
+            em_usage = self.em.em_S.sum(dim=-1)              # [BS, B]
+            novelty_mean = cand_scores.mean(dim=-1)          # [BS, B]
+            content_emb = cand_K.mean(dim=2)                 # [BS, B, D_mem]
+            BSB = BS * B
             g_em, tau_em, decay = self.em_neuromod(
-                novelty_mean.detach(), em_usage.detach(), content_emb.detach()
+                novelty_mean.reshape(BSB).detach(),
+                em_usage.reshape(BSB).detach(),
+                content_emb.reshape(BSB, D_mem).detach(),
             )
+            # Reshape back to [BS, B]
+            g_em = g_em.reshape(BS, B)
+            tau_em = tau_em.reshape(BS, B)
+            decay = decay.reshape(BS, B)
             self.em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay)
             self.em.age_tick(self.config.N)
 
@@ -205,19 +211,17 @@ class NeuromorphicLM(nn.Module):
     def _reset_memory(self, mask: Tensor):
         """Reset PM/EM for masked streams at doc boundary.
 
-        mask: [BS] bool.  Expand to [BS*B] via repeat_interleave.
+        mask: [BS] bool.  PM/EM handle expansion internally.
         """
-        expanded = mask.repeat_interleave(self.config.B_blocks)
         if not self.config.lifelong_mode:
-            self.pm.reset_content(expanded)
-            self.em.reset_states(expanded)
+            self.pm.reset_content(mask)
+            self.em.reset_states(mask)
 
     def initialize_states(self, BS: int, device: torch.device):
-        """Pre-allocate runtime state tensors (batched: BS*B)."""
-        BSB = BS * self.config.B_blocks
+        """Pre-allocate runtime state tensors (with explicit B dim)."""
         dtype = runtime_state_dtype(device)
-        self.pm.initialize(BSB, device, dtype)
-        self.em.initialize(BSB, device, dtype)
+        self.pm.initialize(BS, device, dtype)
+        self.em.initialize(BS, device, dtype)
 
     def detach_states(self):
         """TBPTT boundary: detach all PM/EM state."""

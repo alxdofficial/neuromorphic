@@ -4,6 +4,11 @@ Cortical Column Group (v4).
 G = B_blocks * C cortical columns batched via GroupedLinear (einsum over
 group dim). Each column: LayerNorm -> FFN with residual, PM/EM projections,
 PCM.  No Python loop over columns or blocks.
+
+Layout: column activations are [BS, N, B, C, D_col] internally.
+GroupedLinear calls: view(BS, N, G, D) -> GroupedLinear -> view(BS, N, B, C, D_out)
+(both free views since B,C,D are contiguous).
+PM/EM: pass 5D tensors directly — PM/EM handle the einsums.
 """
 
 import torch
@@ -23,9 +28,6 @@ class CorticalColumnGroup(nn.Module):
     Each column: LayerNorm -> FFN (D_col -> 4*D_col -> D_col) with residual.
     PM/EM projections for read and write candidates.
     PCM for cross-pass prediction.
-
-    PM/EM reads are reshaped internally:
-      column space [BS, N, G, D] <-> memory space [BS*B, N*C, D]
     """
 
     def __init__(self, config: ModelConfig):
@@ -54,14 +56,9 @@ class CorticalColumnGroup(nn.Module):
         self.W_em_up = GroupedLinear(G, D_col, D_mem)
         self.W_em_down = GroupedLinear(G, D_mem, D_col)
 
-        # PM eligibility candidate projections
-        self.W_k_pre = GroupedLinear(G, D_col, D_mem)
-        self.W_v_post = GroupedLinear(G, D_col, D_mem)
-
-        # EM candidate projections
-        self.W_k_cand = GroupedLinear(G, D_col, D_mem)
-        self.W_v_cand = GroupedLinear(G, D_col, D_mem)
-        self.W_nov = GroupedLinear(G, D_col, 1)
+        # Fused post-processing projections:
+        # k_pre (D_mem) + v_post (D_mem) + k_cand (D_mem) + v_cand (D_mem) + nov (1)
+        self.W_post_fused = GroupedLinear(G, D_col, 4 * D_mem + 1)
 
         # PCM
         self.pcm = CrossPassPCM(G, D_col, D_pcm) if config.pcm_enabled else None
@@ -74,68 +71,42 @@ class CorticalColumnGroup(nn.Module):
                 nn.init.zeros_(self.W_gain.bias)
 
     # ------------------------------------------------------------------
-    # Reshape helpers: column space <-> memory space
-    # ------------------------------------------------------------------
-
-    def _to_mem_space(self, x: Tensor) -> Tensor:
-        """[BS, N, G, D] -> [BS*B, N*C, D]  (4-D input)
-           [BS, N, G]    -> [BS*B, N*C]      (3-D input)"""
-        if x.dim() == 4:
-            BS, N, _G, D = x.shape
-            return (x.view(BS, N, self.B, self.C, D)
-                     .permute(0, 2, 1, 3, 4)
-                     .reshape(BS * self.B, N * self.C, D))
-        # 3-D: no trailing feature dim
-        BS, N, _G = x.shape
-        return (x.view(BS, N, self.B, self.C)
-                 .permute(0, 2, 1, 3)
-                 .reshape(BS * self.B, N * self.C))
-
-    def _from_mem_space(self, x: Tensor) -> Tensor:
-        """[BS*B, N*C, D] -> [BS, N, G, D]  (3-D input)
-           [BS*B, N*C]    -> [BS, N, G]      (2-D input)"""
-        if x.dim() == 3:
-            BSB, NC, D = x.shape
-            BS = BSB // self.B
-            N = NC // self.C
-            return (x.view(BS, self.B, N, self.C, D)
-                     .permute(0, 2, 1, 3, 4)
-                     .reshape(BS, N, self.G, D))
-        BSB, NC = x.shape
-        BS = BSB // self.B
-        N = NC // self.C
-        return (x.view(BS, self.B, N, self.C)
-                 .permute(0, 2, 1, 3)
-                 .reshape(BS, N, self.G))
-
-    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
     def forward(self, x_col, pm_state, em_state, z_hat_prev):
         """
         x_col:      [BS, N, G, D_col]   G = B*C
-        pm_state:   ProceduralMemory — state [BS*B, r, D_mem]
-        em_state:   EpisodicMemory  — state [BS*B, M, D_mem]
+        pm_state:   ProceduralMemory — state [BS, B, r, D_mem]
+        em_state:   EpisodicMemory  — state [BS, B, M, D_mem]
         z_hat_prev: [BS, N, G, D_pcm] or None
 
         Returns: x_out, z, z_hat, surprise, elig_info, novelty_info
         """
+        BS, N, G, D_col = x_col.shape
+        B, C = self.B, self.C
+        D_mem = self.config.D_mem
+
+        # Helper: view between [BS, N, G, D] and [BS, N, B, C, D]
+        # to_5d is always on GroupedLinear output (contiguous) -> free view
+        # to_g uses reshape since einsum outputs may have non-trivial strides
+        def to_5d(x):
+            return x.view(BS, N, B, C, -1)
+
+        def to_g(x):
+            return x.reshape(BS, N, G, -1)
+
         # 1. PM read (holographic, in D_mem space)
         if self.config.pm_enabled:
-            q_pm = self.W_pm_up(x_col)                     # [BS,N,G,D_mem]
-            q_pm_b = self._to_mem_space(q_pm)               # [BS*B,N*C,D_mem]
-            y_pm_b = pm_state.read(q_pm_b)                  # [BS*B,N*C,D_mem]
-            y_pm = self._from_mem_space(y_pm_b)              # [BS,N,G,D_mem]
-            x_col = x_col + self.W_pm_down(y_pm)            # residual
+            q_pm = to_5d(self.W_pm_up(x_col))                    # [BS,N,B,C,D_mem]
+            y_pm = pm_state.read(q_pm)                             # [BS,N,B,C,D_mem]
+            x_col = x_col + self.W_pm_down(to_g(y_pm))            # residual
 
         # 2. EM read (top-k retrieval)
         if self.config.em_enabled:
-            q_em = self.W_em_up(x_col)                      # [BS,N,G,D_mem]
-            q_em_b = self._to_mem_space(q_em)                # [BS*B,N*C,D_mem]
-            y_em_b = em_state.read(q_em_b)                   # [BS*B,N*C,D_mem]
-            y_em = self._from_mem_space(y_em_b)              # [BS,N,G,D_mem]
-            x_col = x_col + self.W_em_down(y_em)            # residual
+            q_em = to_5d(self.W_em_up(x_col))                    # [BS,N,B,C,D_mem]
+            y_em = em_state.read(q_em)                             # [BS,N,B,C,D_mem]
+            x_col = x_col + self.W_em_down(to_g(y_em))            # residual
 
         # 3. PCM encode + surprise
         if self.pcm is not None:
@@ -163,17 +134,22 @@ class CorticalColumnGroup(nn.Module):
         else:
             z_hat = None
 
-        # 6. PM eligibility accumulation info
-        k_cand = unit_normalize(self.W_k_pre(x_out))       # [BS,N,G,D_mem]
-        v_cand = self.W_v_post(x_out)                      # [BS,N,G,D_mem]
-        gate = (surprise / self.config.surprise_scale).clamp(0, 1)  # [BS,N,G]
+        # 6. Fused post-processing projections
+        proj = self.W_post_fused(x_out)                     # [BS,N,G,4*D_mem+1]
+        proj_5d = to_5d(proj)                                # [BS,N,B,C,4*D_mem+1]
+        k_pre, v_post, k_cand_raw, v_cand, nov_raw = proj_5d.split(
+            [D_mem, D_mem, D_mem, D_mem, 1], dim=-1
+        )
 
-        # 7. EM novelty scoring info
-        q_nov = unit_normalize(self.W_k_cand(x_out))       # [BS,N,G,D_mem]
-        v_nov = self.W_v_cand(x_out)                       # [BS,N,G,D_mem]
-        w_nov = torch.sigmoid(self.W_nov(x_out).squeeze(-1))  # [BS,N,G]
+        # PM eligibility info
+        k_cand = unit_normalize(k_pre)                       # [BS,N,B,C,D_mem]
+        gate = (surprise.view(BS, N, B, C) / self.config.surprise_scale).clamp(0, 1)
 
-        elig_info = (k_cand, v_cand, gate)
-        novelty_info = (q_nov, v_nov, w_nov, surprise)
+        # EM novelty info
+        q_nov = unit_normalize(k_cand_raw)                   # [BS,N,B,C,D_mem]
+        w_nov = torch.sigmoid(nov_raw.squeeze(-1))           # [BS,N,B,C]
+
+        elig_info = (k_cand, v_post, gate)
+        novelty_info = (q_nov, v_cand, w_nov, surprise.view(BS, N, B, C))
 
         return x_out, z, z_hat, surprise, elig_info, novelty_info

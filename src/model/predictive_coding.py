@@ -26,8 +26,7 @@ class GroupedLayerNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [..., C, dim]
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        var, mean = torch.var_mean(x, dim=-1, keepdim=True, unbiased=False)
         x_norm = (x - mean) / (var + self.eps).sqrt()
         return x_norm * self.weight + self.bias
 

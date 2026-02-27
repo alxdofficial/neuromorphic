@@ -1,9 +1,9 @@
 """
 Episodic Memory (v4) — fixed-size per-stream vector store.
 
-Single instance (batched across B_blocks via BS*B batch dim).
+Single instance (batched across B_blocks via BS,B dims).
 Operates in D_mem space.
-Read: top-k retrieval with cross-attention (GroupedLinear for per-block params).
+Read: top-k retrieval with cross-attention (direct einsum for per-block params).
 Write: novelty-scored EMA.
 """
 
@@ -20,11 +20,11 @@ from .utils import StateMixin, unit_normalize, budget_enforce
 class EpisodicMemory(nn.Module, StateMixin):
     """Fixed-size episodic memory with top-k retrieval and novelty-based writes.
 
-    State (batched across B_blocks):
-        em_K: [BS*B, M, D_mem] — keys (unit-normalized)
-        em_V: [BS*B, M, D_mem] — values
-        em_S: [BS*B, M] — strengths (bounded)
-        em_age: [BS*B, M] — tokens since last write
+    State (with explicit B dim):
+        em_K: [BS, B, M, D_mem] — keys (unit-normalized)
+        em_V: [BS, B, M, D_mem] — values
+        em_S: [BS, B, M] — strengths (bounded)
+        em_age: [BS, B, M] — tokens since last write
     """
 
     _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
@@ -49,118 +49,100 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_age: Tensor | None = None
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
-        self.em_K = torch.zeros(BS, self.M, self.D_mem, device=device, dtype=dtype)
-        self.em_V = torch.zeros(BS, self.M, self.D_mem, device=device, dtype=dtype)
-        self.em_S = torch.zeros(BS, self.M, device=device, dtype=dtype)
-        self.em_age = torch.zeros(BS, self.M, device=device, dtype=dtype)
+        self.em_K = torch.zeros(BS, self.B, self.M, self.D_mem, device=device, dtype=dtype)
+        self.em_V = torch.zeros(BS, self.B, self.M, self.D_mem, device=device, dtype=dtype)
+        self.em_S = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
+        self.em_age = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.em_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Top-k retrieval + cross-attention (gather-free).
+        """Top-k retrieval + cross-attention (gather-free, merged dot-product).
 
-        q: [BS*B, N*C, D_mem] -> [BS*B, N*C, D_mem]
+        q: [BS, N, B, C, D_mem] -> [BS, N, B, C, D_mem]
 
-        Uses masked dense attention against all M slots instead of
-        topk+gather. Softmax masking ensures only top-k contribute.
-        Eliminates expensive GatherBackward and ExpandBackward in backward.
-
-        Cross-attention projections are per-block (GroupedLinear(B, ...)),
-        so we reshape to [BS, NC, B, D] for those ops, then back to [BS*B, NC, D].
+        Uses a single merged query (q + q_cross) for one matmul against em_K,
+        eliminating the second QK dot-product. Softmax masking ensures only
+        top-k contribute.
         """
-        BSB = q.shape[0]
-        prefix_shape = q.shape[:-1]  # [BS*B, N*C]
-        D = q.shape[-1]
-        BS = BSB // self.B
+        BS, N, B, C, D = q.shape
 
-        # Flatten to [BSB, NC, D_mem] for retrieval
-        q_flat = q.reshape(BSB, -1, D)  # [BSB, NC, D_mem]
-        NC = q_flat.shape[1]
+        # Per-block cross-attention projection via direct einsum
+        q_cross = torch.einsum("snbci, boi -> snbco", q, self.W_q_cross.weight)
+        if self.W_q_cross.bias is not None:
+            q_cross = q_cross + self.W_q_cross.bias[None, None, :, None, :]  # [1,1,B,1,D]
 
-        # Dense retrieval scores against all M slots
-        scores = torch.einsum(
-            "bnd, bmd -> bnm", q_flat, self.em_K
-        )  # [BSB, NC, M]
+        # Merged query: single matmul instead of two separate
+        q_mix = q + q_cross  # [BS, N, B, C, D]
 
-        # Mask inactive slots (S == 0)
-        active_mask = (self.em_S > 0).unsqueeze(1)  # [BSB, 1, M]
+        # Dense scores against all M slots
+        scores = torch.einsum("snbcd, sbmd -> snbcm", q_mix, self.em_K)  # [BS, N, B, C, M]
+
+        # Mask inactive slots
+        active_mask = (self.em_S > 0)[:, None, :, None, :]  # [BS, 1, B, 1, M]
         scores = scores.masked_fill(~active_mask, -1e9)
 
-        # Top-k mask (no gather — just mask non-topk to -inf)
+        # Top-k mask (gather-free)
         k = min(self.k_ret, self.M)
-        topk_vals, _ = scores.topk(k, dim=-1)  # [BSB, NC, k]
-        threshold = topk_vals[..., -1:].detach()  # [BSB, NC, 1]
-        topk_mask = scores >= threshold  # [BSB, NC, M]
+        topk_vals, _ = scores.topk(k, dim=-1)           # [BS, N, B, C, k]
+        threshold = topk_vals[..., -1:].detach()         # [BS, N, B, C, 1]
+        topk_mask = scores >= threshold                  # [BS, N, B, C, M]
 
-        # Cross-attention with per-block GroupedLinear projections
-        q_grouped = q_flat.view(BS, self.B, NC, D).permute(0, 2, 1, 3)
-        q_cross = self.W_q_cross(q_grouped)  # [BS, NC, B, D]
-        q_cross = q_cross.permute(0, 2, 1, 3).reshape(BSB, NC, D)  # [BSB, NC, D]
+        # Masked softmax attention (bf16 — M is small)
+        attn_logits = scores.masked_fill(~topk_mask, -1e9)
+        attn_weights = F.softmax(attn_logits, dim=-1)    # [BS, N, B, C, M]
 
-        # Dense cross-attention logits against all M slots, masked to top-k
-        attn_logits = torch.einsum(
-            "bnd, bmd -> bnm", q_cross, self.em_K
-        )  # [BSB, NC, M]
-        attn_logits = attn_logits + scores
-        attn_logits = attn_logits.masked_fill(~topk_mask, -1e9)
-        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [BSB, NC, M]
+        # Weighted sum
+        out = torch.einsum("snbcm, sbmd -> snbcd", attn_weights, self.em_V)
 
-        # Weighted sum from all slots (only top-k have nonzero weight)
-        out = torch.einsum(
-            "bnm, bmd -> bnd", attn_weights, self.em_V
-        )  # [BSB, NC, D_mem]
+        # Per-block output projection via direct einsum
+        out = torch.einsum("snbci, boi -> snbco", out, self.W_o_cross.weight)
+        if self.W_o_cross.bias is not None:
+            out = out + self.W_o_cross.bias[None, None, :, None, :]  # [1,1,B,1,D]
 
-        # Output projection with per-block GroupedLinear
-        out_grouped = out.view(BS, self.B, NC, D).permute(0, 2, 1, 3)
-        out = self.W_o_cross(out_grouped)  # [BS, NC, B, D]
-        out = out.permute(0, 2, 1, 3).reshape(BSB, NC, D)  # [BSB, NC, D]
-
-        # Reshape back to prefix shape
-        return out.reshape(*prefix_shape, D)
+        return out
 
     def score_novelty(self, q_nov: Tensor, surprise: Tensor, w_nov: Tensor) -> Tensor:
         """Score novelty for candidate selection.
 
-        q_nov: [BSB,NC,D_mem], surprise: [BSB,NC], w_nov: [BSB,NC]
-        Returns: novelty [BSB,NC]
+        q_nov: [BS, N, B, C, D_mem], surprise: [BS, N, B, C], w_nov: [BS, N, B, C]
+        Returns: novelty [BS, N, B, C]
         """
-        BSB = q_nov.shape[0]
-        prefix_shape = q_nov.shape[:-1]
-        q_flat = q_nov.reshape(BSB, -1, self.D_mem)
-
-        # Max cosine similarity against em_K (no branch — masking handles empty memory)
-        sim = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BSB, NC, M]
-        active_mask = (self.em_S > 0).unsqueeze(1)  # [BSB, 1, M]
+        # Max cosine similarity against em_K
+        sim = torch.einsum("snbcd, sbmd -> snbcm", q_nov, self.em_K)  # [BS, N, B, C, M]
+        active_mask = (self.em_S > 0)[:, None, :, None, :]  # [BS, 1, B, 1, M]
         sim = sim.masked_fill(~active_mask, -1.0)
-        max_sim = sim.max(dim=-1).values.clamp(min=0.0)  # [BSB, NC]
-        max_sim = max_sim.reshape(*prefix_shape)
+        max_sim = sim.max(dim=-1).values.clamp(min=0.0)  # [BS, N, B, C]
 
         novelty = w_nov * surprise + (1 - w_nov) * (1 - max_sim)
         return novelty
 
     def select_top_candidates(self, q_nov: Tensor, v_nov: Tensor,
                                novelty: Tensor, C_cand: int):
-        """Select top-C_cand candidates across all N*C positions.
+        """Select top-C_cand candidates across all N*C positions per (BS, B).
 
-        Returns: (cand_K, cand_V, cand_scores) each [BSB, C_cand, D_mem] or [BSB, C_cand]
+        q_nov, v_nov: [BS, N, B, C, D_mem]
+        novelty: [BS, N, B, C]
+        Returns: (cand_K, cand_V, cand_scores) each [BS, B, C_cand, D_mem] or [BS, B, C_cand]
         """
-        BSB = q_nov.shape[0]
-        D = q_nov.shape[-1]
+        BS, N, B, C, D = q_nov.shape
 
-        # Flatten N*C
-        q_flat = q_nov.reshape(BSB, -1, D)   # [BSB, NC, D_mem]
-        v_flat = v_nov.reshape(BSB, -1, D)   # [BSB, NC, D_mem]
-        nov_flat = novelty.reshape(BSB, -1)   # [BSB, NC]
+        # Flatten N*C per (BS, B): [BS, N, B, C] -> [BS, B, N*C]
+        nov_flat = novelty.permute(0, 2, 1, 3).reshape(BS, B, N * C)
+
+        # Flatten q/v: [BS, N, B, C, D] -> [BS, B, N*C, D]
+        q_flat = q_nov.permute(0, 2, 1, 3, 4).reshape(BS, B, N * C, D)
+        v_flat = v_nov.permute(0, 2, 1, 3, 4).reshape(BS, B, N * C, D)
 
         # Top-k candidates
-        C_cand = min(C_cand, nov_flat.shape[1])
-        topk_scores, topk_idx = nov_flat.topk(C_cand, dim=-1)  # [BSB, C_cand]
+        C_cand = min(C_cand, nov_flat.shape[-1])
+        topk_scores, topk_idx = nov_flat.topk(C_cand, dim=-1)  # [BS, B, C_cand]
 
         # Gather
-        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, D)  # [BSB, C_cand, D_mem]
-        cand_K = torch.gather(q_flat, 1, topk_idx_expanded)  # [BSB, C_cand, D_mem]
-        cand_V = torch.gather(v_flat, 1, topk_idx_expanded)  # [BSB, C_cand, D_mem]
+        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [BS, B, C_cand, D]
+        cand_K = torch.gather(q_flat, 2, topk_idx_expanded)  # [BS, B, C_cand, D]
+        cand_V = torch.gather(v_flat, 2, topk_idx_expanded)  # [BS, B, C_cand, D]
 
         return cand_K, cand_V, topk_scores
 
@@ -168,40 +150,40 @@ class EpisodicMemory(nn.Module, StateMixin):
               g_em: Tensor, tau: Tensor, decay: Tensor):
         """Write candidates to EM via EMA.
 
-        cand_K: [BSB, C_cand, D_mem]
-        cand_V: [BSB, C_cand, D_mem]
-        cand_scores: [BSB, C_cand]
-        g_em: [BSB]
-        tau: [BSB]
-        decay: [BSB]
+        cand_K: [BS, B, C_cand, D_mem]
+        cand_V: [BS, B, C_cand, D_mem]
+        cand_scores: [BS, B, C_cand]
+        g_em: [BS, B]
+        tau: [BS, B]
+        decay: [BS, B]
         """
-        BSB, C_cand, D = cand_K.shape
+        BS, B, C_cand, D = cand_K.shape
 
         # Score candidates against all slots for slot selection
         cand_K_norm = unit_normalize(cand_K)
         slot_scores = torch.einsum(
-            "bcd, bmd -> bcm", cand_K_norm, self.em_K
-        )  # [BSB, C_cand, M]
+            "sbcd, sbmd -> sbcm", cand_K_norm, self.em_K
+        )  # [BS, B, C_cand, M]
 
         # Weakness bias: prefer weaker slots
-        weakness = -self.em_S.unsqueeze(1)  # [BSB, 1, M]
+        weakness = -self.em_S.unsqueeze(2)  # [BS, B, 1, M]
         slot_scores = slot_scores + 0.5 * weakness
 
         # Softmax slot selection
         slot_weights = F.softmax(
-            slot_scores / tau.reshape(BSB, 1, 1).clamp(min=0.01), dim=-1
-        )  # [BSB, C_cand, M]
+            slot_scores / tau.reshape(BS, B, 1, 1).clamp(min=0.01), dim=-1
+        )  # [BS, B, C_cand, M]
 
         # Write strength per candidate
         cand_weight = cand_scores / (cand_scores.sum(dim=-1, keepdim=True) + 1e-8)
-        alpha = g_em.reshape(BSB, 1, 1) * cand_weight.unsqueeze(-1) * slot_weights  # [BSB, C_cand, M]
+        alpha = g_em.reshape(BS, B, 1, 1) * cand_weight.unsqueeze(-1) * slot_weights  # [BS, B, C_cand, M]
 
         # Sum across candidates for each slot
-        alpha_per_slot = alpha.sum(dim=1)  # [BSB, M]
+        alpha_per_slot = alpha.sum(dim=2)  # [BS, B, M]
 
         # Weighted candidate blend per slot
-        blended_K = torch.einsum("bcm, bcd -> bmd", alpha, cand_K_norm)  # [BSB, M, D]
-        blended_V = torch.einsum("bcm, bcd -> bmd", alpha, cand_V)       # [BSB, M, D]
+        blended_K = torch.einsum("sbcm, sbcd -> sbmd", alpha, cand_K_norm)  # [BS, B, M, D]
+        blended_V = torch.einsum("sbcm, sbcd -> sbmd", alpha, cand_V)       # [BS, B, M, D]
 
         # Normalize by alpha
         denom = alpha_per_slot.unsqueeze(-1).clamp(min=1e-8)
@@ -209,7 +191,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         blended_V = blended_V / denom
 
         # EMA update (only slots with nonzero alpha)
-        update_mask = (alpha_per_slot > 1e-8).unsqueeze(-1)  # [BSB, M, 1]
+        update_mask = (alpha_per_slot > 1e-8).unsqueeze(-1)  # [BS, B, M, 1]
         alpha_exp = alpha_per_slot.unsqueeze(-1).clamp(max=1.0)
 
         new_K = (1 - alpha_exp) * self.em_K + alpha_exp * unit_normalize(blended_K)
@@ -227,7 +209,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Decay
         self.em_S = self.em_S * decay.unsqueeze(-1)
 
-        # Budget enforcement
+        # Budget enforcement (per-stream-per-block: last dim is M)
         self.em_S = budget_enforce(self.em_S, self.budget)
 
     def age_tick(self, n_tokens: int):
@@ -237,10 +219,13 @@ class EpisodicMemory(nn.Module, StateMixin):
             self.em_age = self.em_age + n_tokens * active
 
     def reset_states(self, mask: Tensor):
-        """Custom reset: zero S and age, preserve K/V (makes slots invisible)."""
+        """Custom reset: zero S and age, preserve K/V (makes slots invisible).
+
+        mask: [BS] bool — expand to [BS, 1, 1] for S/age.
+        """
         if self.em_S is None:
             return
-        expanded = mask.unsqueeze(-1)  # [BSB, 1]
+        expanded = mask[:, None, None]  # [BS, 1, 1]
         self.em_S = self.em_S * ~expanded
         self.em_age = self.em_age * ~expanded
 
@@ -249,6 +234,7 @@ class EMNeuromodulator(nn.Module):
     """Neuromodulator for EM write decisions.
 
     Returns: g_em [BSB], tau [BSB], decay [BSB]
+    (operates on flattened BS*B vectors from model.py)
     """
 
     def __init__(self, config: ModelConfig):

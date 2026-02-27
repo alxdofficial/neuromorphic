@@ -238,10 +238,11 @@ class TestPMCommitEquations:
 
     v4 commit API: commit(elig_K, elig_V, g, slot_logits, tau)
     All state set manually for deterministic testing.
+    State: [BS, B, r, D_mem]; BS=1, B=1 for simplicity.
     """
 
     def _make_pm(self, r=2, D_mem=4):
-        cfg = make_tiny_config(r=r, D_mem=D_mem,
+        cfg = make_tiny_config(r=r, D_mem=D_mem, B_blocks=1,
                                tau_pm=1.0, tau_pm_floor=0.5, tau_pm_ceil=2.0,
                                a_max=10.0, budget_pm=20.0, decay_pm=0.9)
         pm = ProceduralMemory(D_mem, r, cfg)
@@ -251,22 +252,22 @@ class TestPMCommitEquations:
         """pm_K = (1-alpha) * pm_K + alpha * unit_normalize(elig_K)"""
         pm = self._make_pm(r=2, D_mem=4)
 
-        # Inject known state (BS=1)
-        pm.pm_K = unit_normalize(torch.tensor([[[1.0, 0.0, 0.0, 0.0],
-                                                 [0.0, 1.0, 0.0, 0.0]]]))
-        pm.pm_V = unit_normalize(torch.tensor([[[0.0, 0.0, 1.0, 0.0],
-                                                 [0.0, 0.0, 0.0, 1.0]]]))
-        pm.pm_a = torch.tensor([[1.0, 0.0]])
+        # Inject known state (BS=1, B=1)
+        pm.pm_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0],
+                                                  [0.0, 1.0, 0.0, 0.0]]]]))
+        pm.pm_V = unit_normalize(torch.tensor([[[[0.0, 0.0, 1.0, 0.0],
+                                                  [0.0, 0.0, 0.0, 1.0]]]]))
+        pm.pm_a = torch.tensor([[[1.0, 0.0]]])
 
         # Eligibility input (already aggregated across N*C)
-        elig_K = torch.tensor([[[0.0, 2.0, 0.0, 0.0],
-                                 [0.0, 0.0, 2.0, 0.0]]])  # [1,2,4]
-        elig_V = torch.tensor([[[1.0, 1.0, 0.0, 0.0],
-                                 [0.0, 0.0, 1.0, 1.0]]])  # [1,2,4]
+        elig_K = torch.tensor([[[[0.0, 2.0, 0.0, 0.0],
+                                  [0.0, 0.0, 2.0, 0.0]]]])  # [1,1,2,4]
+        elig_V = torch.tensor([[[[1.0, 1.0, 0.0, 0.0],
+                                  [0.0, 0.0, 1.0, 1.0]]]])  # [1,1,2,4]
 
-        g = torch.tensor([0.5])
-        slot_logits = torch.tensor([[0.0, 0.0]])  # equal → softmax = [0.5, 0.5]
-        tau = torch.tensor([1.0])
+        g = torch.tensor([[0.5]])          # [BS=1, B=1]
+        slot_logits = torch.tensor([[[0.0, 0.0]]])  # equal → softmax = [0.5, 0.5]
+        tau = torch.tensor([[1.0]])
 
         # softmax([0,0]/1) = [0.5, 0.5]
         # alpha = g * slot_weights = 0.5 * [0.5, 0.5] = [0.25, 0.25]
@@ -280,21 +281,21 @@ class TestPMCommitEquations:
         # normalize([0,2,0,0]) = [0,1,0,0]
         expected_K0 = (1 - alpha_val) * torch.tensor([1.0, 0.0, 0.0, 0.0]) + \
                        alpha_val * torch.tensor([0.0, 1.0, 0.0, 0.0])
-        assert torch.allclose(pm.pm_K[0, 0], expected_K0, atol=1e-4), \
-            f"pm_K slot 0: {pm.pm_K[0,0]} != {expected_K0}"
+        assert torch.allclose(pm.pm_K[0, 0, 0], expected_K0, atol=1e-4), \
+            f"pm_K slot 0: {pm.pm_K[0,0,0]} != {expected_K0}"
 
     def test_strength_update(self):
         """pm_a = clamp(pm_a + alpha, 0, a_max) then budget_enforce."""
         pm = self._make_pm(r=2, D_mem=4)
-        pm.pm_K = unit_normalize(torch.randn(1, 2, 4))
-        pm.pm_V = unit_normalize(torch.randn(1, 2, 4))
-        pm.pm_a = torch.tensor([[2.0, 1.0]])
+        pm.pm_K = unit_normalize(torch.randn(1, 1, 2, 4))
+        pm.pm_V = unit_normalize(torch.randn(1, 1, 2, 4))
+        pm.pm_a = torch.tensor([[[2.0, 1.0]]])
 
-        elig_K = torch.randn(1, 2, 4)
-        elig_V = torch.randn(1, 2, 4)
-        g = torch.tensor([0.6])
-        slot_logits = torch.tensor([[0.0, 0.0]])
-        tau = torch.tensor([1.0])
+        elig_K = torch.randn(1, 1, 2, 4)
+        elig_V = torch.randn(1, 1, 2, 4)
+        g = torch.tensor([[0.6]])
+        slot_logits = torch.tensor([[[0.0, 0.0]]])
+        tau = torch.tensor([[1.0]])
 
         # alpha = 0.6 * [0.5, 0.5] = [0.3, 0.3]
         alpha_val = 0.3
@@ -309,19 +310,19 @@ class TestPMCommitEquations:
     def test_zero_g_no_key_change(self):
         """With g=0, alpha=0 everywhere: pm_K/pm_V should not change."""
         pm = self._make_pm(r=2, D_mem=4)
-        pm.pm_K = unit_normalize(torch.randn(1, 2, 4))
-        pm.pm_V = unit_normalize(torch.randn(1, 2, 4))
-        pm.pm_a = torch.tensor([[2.0, 1.0]])
+        pm.pm_K = unit_normalize(torch.randn(1, 1, 2, 4))
+        pm.pm_V = unit_normalize(torch.randn(1, 1, 2, 4))
+        pm.pm_a = torch.tensor([[[2.0, 1.0]]])
 
         K_before = pm.pm_K.clone()
         V_before = pm.pm_V.clone()
         a_before = pm.pm_a.clone()
 
-        elig_K = torch.randn(1, 2, 4)
-        elig_V = torch.randn(1, 2, 4)
-        g = torch.tensor([0.0])
-        slot_logits = torch.tensor([[0.0, 0.0]])
-        tau = torch.tensor([1.0])
+        elig_K = torch.randn(1, 1, 2, 4)
+        elig_V = torch.randn(1, 1, 2, 4)
+        g = torch.tensor([[0.0]])
+        slot_logits = torch.tensor([[[0.0, 0.0]]])
+        tau = torch.tensor([[1.0]])
 
         pm.commit(elig_K, elig_V, g, slot_logits, tau)
 
@@ -340,9 +341,11 @@ class TestPMDecay:
     def test_base_decay_reduces_strengths(self):
         """base_decay: pm_a *= decay."""
         cfg = make_tiny_config(decay_pm=0.9)
+        B = cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        pm.pm_a = torch.tensor([[2.0, 1.0], [3.0, 0.5]])
+        pm.pm_a = torch.tensor([[[2.0, 1.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0]],
+                                 [[3.0, 0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]])
 
         before = pm.pm_a.clone()
         pm.base_decay()
@@ -364,10 +367,11 @@ class TestEMWriteEquations:
     """Verify EM write formulas against hand-computed values.
 
     v4 write API: write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+    State: [BS, B, M, D_mem]; BS=1, B=1 for simplicity.
     """
 
     def _make_em(self, M=4, D_mem=4):
-        cfg = make_tiny_config(M=M, D_mem=D_mem, C_em=1,
+        cfg = make_tiny_config(M=M, D_mem=D_mem, C_em=1, B_blocks=1,
                                tau_em=1.0, S_max=10.0, budget_em=40.0,
                                decay_em=0.9)
         em = EpisodicMemory(D_mem, M, cfg)
@@ -376,22 +380,22 @@ class TestEMWriteEquations:
     def test_zero_g_no_key_change(self):
         """With g_em=0, no writes: em_K/em_V unchanged, em_S only decayed."""
         em = self._make_em(M=2, D_mem=4)
-        em.em_K = unit_normalize(torch.randn(1, 2, 4))
-        em.em_V = torch.randn(1, 2, 4)
-        em.em_S = torch.tensor([[1.0, 0.5]])
-        em.em_age = torch.zeros(1, 2)
+        em.em_K = unit_normalize(torch.randn(1, 1, 2, 4))
+        em.em_V = torch.randn(1, 1, 2, 4)
+        em.em_S = torch.tensor([[[1.0, 0.5]]])
+        em.em_age = torch.zeros(1, 1, 2)
 
         K_before = em.em_K.clone()
         V_before = em.em_V.clone()
         S_before = em.em_S.clone()
 
-        cand_K = unit_normalize(torch.randn(1, 1, 4))
-        cand_V = torch.randn(1, 1, 4)
-        cand_scores = torch.tensor([[0.8]])
+        cand_K = unit_normalize(torch.randn(1, 1, 1, 4))
+        cand_V = torch.randn(1, 1, 1, 4)
+        cand_scores = torch.tensor([[[0.8]]])
 
-        g_em = torch.tensor([0.0])
-        tau = torch.tensor([1.0])
-        decay = torch.tensor([0.9])
+        g_em = torch.tensor([[0.0]])
+        tau = torch.tensor([[1.0]])
+        decay = torch.tensor([[0.9]])
 
         em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
 
@@ -407,42 +411,42 @@ class TestEMWriteEquations:
     def test_em_value_not_normalized(self):
         """em_V EMA update must NOT unit-normalize (unlike em_K)."""
         em = self._make_em(M=2, D_mem=4)
-        em.em_K = unit_normalize(torch.tensor([[[1.0, 0.0, 0.0, 0.0],
-                                                 [0.0, 1.0, 0.0, 0.0]]]))
-        em.em_V = torch.tensor([[[10.0, 0.0, 0.0, 0.0],
-                                  [0.0, 0.0, 1.0, 0.0]]])
-        em.em_S = torch.tensor([[1.0, 0.5]])
-        em.em_age = torch.zeros(1, 2)
+        em.em_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0],
+                                                  [0.0, 1.0, 0.0, 0.0]]]]))
+        em.em_V = torch.tensor([[[[10.0, 0.0, 0.0, 0.0],
+                                   [0.0, 0.0, 1.0, 0.0]]]])
+        em.em_S = torch.tensor([[[1.0, 0.5]]])
+        em.em_age = torch.zeros(1, 1, 2)
 
-        cand_K = unit_normalize(torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]))
-        cand_V = torch.tensor([[[0.0, 20.0, 0.0, 0.0]]])
-        cand_scores = torch.tensor([[0.5]])
+        cand_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0]]]]))
+        cand_V = torch.tensor([[[[0.0, 20.0, 0.0, 0.0]]]])
+        cand_scores = torch.tensor([[[0.5]]])
 
-        g_em = torch.tensor([0.5])
-        tau = torch.tensor([1.0])
-        decay = torch.tensor([1.0])  # no decay for clarity
+        g_em = torch.tensor([[0.5]])
+        tau = torch.tensor([[1.0]])
+        decay = torch.tensor([[1.0]])  # no decay for clarity
 
         em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
 
         # After write with large V candidate, V should not be unit-normalized
-        v_norm = em.em_V[0, 0].norm().item()
+        v_norm = em.em_V[0, 0, 0].norm().item()
         assert v_norm > 1.5, f"em_V should NOT be unit-normalized, but norm={v_norm}"
 
     def test_strength_increases_after_write(self):
         """Writing should increase em_S for targeted slots."""
         em = self._make_em(M=2, D_mem=4)
-        em.em_K = unit_normalize(torch.randn(1, 2, 4))
-        em.em_V = torch.randn(1, 2, 4)
-        em.em_S = torch.tensor([[0.5, 0.5]])
-        em.em_age = torch.zeros(1, 2)
+        em.em_K = unit_normalize(torch.randn(1, 1, 2, 4))
+        em.em_V = torch.randn(1, 1, 2, 4)
+        em.em_S = torch.tensor([[[0.5, 0.5]]])
+        em.em_age = torch.zeros(1, 1, 2)
 
-        cand_K = unit_normalize(torch.randn(1, 1, 4))
-        cand_V = torch.randn(1, 1, 4)
-        cand_scores = torch.tensor([[0.8]])
+        cand_K = unit_normalize(torch.randn(1, 1, 1, 4))
+        cand_V = torch.randn(1, 1, 1, 4)
+        cand_scores = torch.tensor([[[0.8]]])
 
-        g_em = torch.tensor([0.5])
-        tau = torch.tensor([1.0])
-        decay = torch.tensor([1.0])  # no decay
+        g_em = torch.tensor([[0.5]])
+        tau = torch.tensor([[1.0]])
+        decay = torch.tensor([[1.0]])  # no decay
 
         S_before = em.em_S.clone()
         em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
@@ -480,11 +484,12 @@ class TestHolographicReadProperties:
     def test_zero_strength_gives_zero_output(self):
         """With pm_a=0, PM read output should be zero (no modulation)."""
         cfg = make_tiny_config()
+        B = cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         pm.initialize(1, torch.device("cpu"), torch.float32)
         # pm_a is already 0 after init
 
-        q = torch.randn(1, cfg.N, cfg.C, cfg.D_mem)
+        q = torch.randn(1, cfg.N, B, cfg.C, cfg.D_mem)
         out = pm.read(q)
 
         # holographic: y = q * modulation. With pm_a=0, modulation=0, so y=0
@@ -493,9 +498,10 @@ class TestHolographicReadProperties:
     def test_read_output_shape(self):
         """PM read should preserve input shape."""
         cfg = make_tiny_config()
+        B = cfg.B_blocks
         pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
-        q = torch.randn(BS, cfg.N, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, cfg.N, B, cfg.C, cfg.D_mem)
         out = pm.read(q)
         assert out.shape == q.shape
