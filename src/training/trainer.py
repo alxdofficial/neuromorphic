@@ -113,7 +113,8 @@ class TBPTTTrainer:
             pm = self.model.pm
             if pm.pm_a is not None:
                 total = pm.pm_a.detach().sum().item()
-                cap = pm.budget * pm.pm_a.shape[0]
+                # pm_a is [BS, B, r] — budget applies per (batch, block) stream
+                cap = pm.budget * pm.pm_a.shape[0] * pm.pm_a.shape[1]
                 if cap > 0:
                     pm_util = total / cap
 
@@ -121,7 +122,8 @@ class TBPTTTrainer:
             em = self.model.em
             if em.em_S is not None:
                 total = em.em_S.detach().sum().item()
-                cap = em.budget * em.em_S.shape[0]
+                # em_S is [BS, B, M] — budget applies per (batch, block) stream
+                cap = em.budget * em.em_S.shape[0] * em.em_S.shape[1]
                 if cap > 0:
                     em_util = total / cap
 

@@ -3,7 +3,12 @@ FITB (Fill-In-The-Blank) masking utilities for neuromorphic LM training.
 
 Generates boolean masks indicating which token positions to replace with <FITB>.
 Supports random masking, span masking (geometric distribution), and mixed mode.
+
+All mask generation happens on CPU to avoid GPU sync from .item() calls,
+then the result is transferred to the target device once.
 """
+
+import random
 
 import torch
 from torch import Tensor
@@ -13,8 +18,9 @@ def generate_random_mask(BS: int, N: int, mask_rate: float,
                          device: torch.device) -> Tensor:
     """Uniform random masking.
 
-    Returns: [BS, N] bool — True at positions to mask.
+    Returns: [BS, N] bool on ``device`` — True at positions to mask.
     """
+    # Random mask is a single vectorized op, safe on any device
     return torch.rand(BS, N, device=device) < mask_rate
 
 
@@ -25,30 +31,30 @@ def generate_span_mask(BS: int, N: int, mask_rate: float,
     Generates spans whose lengths follow Geometric(p=1/mean_span_len).
     Spans are placed until the target mask_rate is approximately reached.
 
-    Returns: [BS, N] bool — True at positions to mask.
+    Mask is built on CPU (no GPU sync), then transferred to ``device`` once.
+
+    Returns: [BS, N] bool on ``device`` — True at positions to mask.
     """
     target_count = int(mask_rate * N)
     if target_count == 0:
         return torch.zeros(BS, N, dtype=torch.bool, device=device)
 
-    mask = torch.zeros(BS, N, dtype=torch.bool, device=device)
     p = 1.0 / max(mean_span_len, 1)
+    mask = torch.zeros(BS, N, dtype=torch.bool)  # CPU
 
     for b in range(BS):
         masked = 0
-        # Retry budget to avoid infinite loops on edge cases
         attempts = 0
         while masked < target_count and attempts < N:
-            # Random span start
-            start = torch.randint(0, N, (1,), device=device).item()
-            # Geometric span length (at least 1)
-            length = int(torch.distributions.Geometric(probs=p).sample().item()) + 1
+            start = random.randint(0, N - 1)
+            # Geometric length (at least 1): sample via inverse-CDF
+            length = int(random.expovariate(p)) + 1
             end = min(start + length, N)
             mask[b, start:end] = True
-            masked = mask[b].sum().item()
+            masked = int(mask[b].sum())
             attempts += 1
 
-    return mask
+    return mask.to(device, non_blocking=True)
 
 
 def generate_fitb_mask(BS: int, N: int, mask_rate: float,
@@ -61,12 +67,12 @@ def generate_fitb_mask(BS: int, N: int, mask_rate: float,
         span_prob: probability of using span masking (vs random)
         mean_span_len: mean length for geometric span distribution
 
-    Returns: [BS, N] bool — True at positions to mask.
+    Returns: [BS, N] bool on ``device`` — True at positions to mask.
     """
     if mask_rate <= 0.0:
         return torch.zeros(BS, N, dtype=torch.bool, device=device)
 
-    use_span = torch.rand(1, device=device).item() < span_prob
+    use_span = random.random() < span_prob
 
     if use_span:
         return generate_span_mask(BS, N, mask_rate, mean_span_len, device)

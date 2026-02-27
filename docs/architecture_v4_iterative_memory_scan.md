@@ -633,6 +633,11 @@ em_V[slot] = (1 - g_em * slot_weights) * em_V[slot] + g_em * slot_weights * cand
 em_S *= decay                             # strength decay before write
 ```
 
+**Note on decay/aging timing:** `pm.base_decay()` and `em.age_tick(N)` run
+**once per segment** (after all R passes), not per pass. Passes are refinement
+steps at the same time index — decay/aging should reflect elapsed segments,
+not refinement depth. PM/EM *commits and writes* still happen between passes.
+
 ### Summary
 
 | Component | Where | When | Parallel? |
@@ -645,6 +650,8 @@ em_S *= decay                             # strength decay before write
 | EM novelty score | Column | Every token, every pass | Yes (B×N) |
 | PM neuromod commit | Between passes | Once per pass | Small |
 | EM neuromod write | Between passes | Once per pass | Small |
+| PM base decay | After R loop | Once per segment | Tiny |
+| EM age tick | After R loop | Once per segment | Tiny |
 
 ## Prototyping Plan
 

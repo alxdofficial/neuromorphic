@@ -640,19 +640,33 @@ def run_phase(
         print(f"Resuming from {resume_path}")
         if ckpt is None:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        # Handle vocab size mismatch (e.g. FITB tokens added after checkpoint)
-        ckpt_vocab = ckpt["model_state_dict"].get("embedding.weight")
-        if ckpt_vocab is not None and ckpt_vocab.shape[0] != config.vocab_size:
-            print(f"  Vocab size mismatch: checkpoint={ckpt_vocab.shape[0]}, "
-                  f"current={config.vocab_size}. Resizing embeddings after load.")
-
-        incompat = model.load_state_dict(
-            ckpt["model_state_dict"], strict=False
+        # Handle vocab size mismatch (e.g. FITB tokens added after checkpoint).
+        # Pop mismatched embedding/lm_head keys from state dict so
+        # load_state_dict doesn't raise on shape mismatch, then manually
+        # copy the overlapping rows into the (already correctly-sized) model.
+        state_dict = ckpt["model_state_dict"]
+        ckpt_emb = state_dict.get("embedding.weight")
+        vocab_mismatch = (
+            ckpt_emb is not None and ckpt_emb.shape[0] != config.vocab_size
         )
+        if vocab_mismatch:
+            ckpt_vocab_size = ckpt_emb.shape[0]
+            print(f"  Vocab size mismatch: checkpoint={ckpt_vocab_size}, "
+                  f"current={config.vocab_size}. "
+                  f"Will copy overlapping rows after load.")
+            # Remove vocab-dependent keys so load_state_dict won't error
+            emb_weight = state_dict.pop("embedding.weight")
+            lm_head_weight = state_dict.pop("lm_head.weight", None)
 
-        # Resize embeddings if vocab changed (preserves loaded weights)
-        if ckpt_vocab is not None and ckpt_vocab.shape[0] != config.vocab_size:
-            model.resize_token_embeddings(config.vocab_size)
+        incompat = model.load_state_dict(state_dict, strict=False)
+
+        # Patch embedding / lm_head rows from checkpoint
+        if vocab_mismatch:
+            copy_n = min(ckpt_vocab_size, config.vocab_size)
+            with torch.no_grad():
+                model.embedding.weight.data[:copy_n] = emb_weight[:copy_n]
+                if not config.tie_embeddings and lm_head_weight is not None:
+                    model.lm_head.weight.data[:copy_n] = lm_head_weight[:copy_n]
 
         if incompat.missing_keys:
             print(f"  Missing keys on resume: {len(incompat.missing_keys)}")

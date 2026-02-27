@@ -141,6 +141,14 @@ class NeuromorphicLM(nn.Module):
 
             z_hat_prev = z_hat
 
+        # Per-segment memory maintenance (once, not per pass).
+        # Passes are refinement at the same time index — decay/aging should
+        # reflect elapsed *segments*, not refinement depth.
+        if self.config.pm_enabled:
+            self.pm.base_decay()
+        if self.config.em_enabled:
+            self.em.age_tick(N)
+
         if is_fitb:
             return per_pass_logits, aux_loss
 
@@ -202,7 +210,8 @@ class NeuromorphicLM(nn.Module):
 
         # --- PM commit ---
         if self.config.pm_enabled:
-            self.pm.base_decay()
+            # NOTE: base_decay() is called once per segment (after R loop),
+            # not per pass. See forward_segment().
             # Neuromod: flatten [BS, B] -> [BS*B] for MLP, reshape back
             BSB = BS * B
             elig_summary = elig_K.norm(dim=-1).mean(dim=-1)  # [BS, B]
@@ -236,7 +245,8 @@ class NeuromorphicLM(nn.Module):
             tau_em = tau_em.reshape(BS, B)
             decay = decay.reshape(BS, B)
             self.em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay)
-            self.em.age_tick(self.config.N)
+            # NOTE: age_tick() is called once per segment (after R loop),
+            # not per pass. See forward_segment().
 
     # ------------------------------------------------------------------
     # Embedding resize (for FITB token registration)
