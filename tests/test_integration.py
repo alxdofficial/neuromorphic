@@ -84,9 +84,9 @@ class TestEndToEnd:
 
         B = cfg.B_blocks
 
-        # Set some PM content (state is [BS, B, r, D_mem])
+        # Set some PM content (state is [BS, B, r, D_col])
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         a_before = pm.pm_a.sum().item()
@@ -108,7 +108,7 @@ class TestEndToEnd:
 
         # Set large PM content
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem) * 10
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col) * 10
         pm.pm_a = torch.ones(BS, B, cfg.r) * 5.0
         a_before = pm.pm_a.sum().item()
 
@@ -132,7 +132,7 @@ class TestEndToEnd:
 
         # Set some PM content
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         a_before = pm.pm_a.sum().item()

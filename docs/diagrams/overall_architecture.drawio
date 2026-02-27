@@ -56,11 +56,11 @@
         </mxCell>
 
         <!-- Inside column group -->
-        <mxCell id="pm_read" value="1. PM Holographic Read&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_pm_up(x) → read(q) → W_pm_down → residual&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="pm_read" value="1. PM Holographic Read&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;view_5d(x) → read(q) → reshape_g → residual&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="220" y="400" width="230" height="40" as="geometry"/>
         </mxCell>
 
-        <mxCell id="em_read" value="2. EM Top-k Retrieval&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_em_up(x) → read(q) → W_em_down → residual&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="em_read" value="2. EM Top-k Retrieval&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;view_5d(x) → read(q) → reshape_g → residual&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="470" y="400" width="230" height="40" as="geometry"/>
         </mxCell>
 

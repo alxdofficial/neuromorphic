@@ -26,10 +26,6 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="D_col"):
             make_tiny_config(D_col=0)
 
-    def test_invalid_D_mem(self):
-        with pytest.raises(ValueError, match="D_mem"):
-            make_tiny_config(D_mem=0)
-
     def test_invalid_D_pcm_when_enabled(self):
         with pytest.raises(ValueError, match="D_pcm"):
             make_tiny_config(pcm_enabled=True, D_pcm=0)
@@ -45,6 +41,24 @@ class TestConfigValidation:
     def test_T_property(self):
         cfg = make_tiny_config(N=16, K_segments=3)
         assert cfg.T == 48
+
+    def test_invalid_mask_rate_low(self):
+        with pytest.raises(ValueError, match="mask_rate"):
+            make_tiny_config(mask_rate=-0.1)
+
+    def test_invalid_mask_rate_high(self):
+        with pytest.raises(ValueError, match="mask_rate"):
+            make_tiny_config(mask_rate=1.1)
+
+    def test_invalid_span_mask_prob(self):
+        with pytest.raises(ValueError, match="span_mask_prob"):
+            make_tiny_config(span_mask_prob=1.5)
+
+    def test_valid_fitb_defaults(self):
+        cfg = make_tiny_config()
+        assert cfg.fitb_id == 63
+        assert cfg.null_id == 62
+        assert cfg.mask_rate == 0.0
 
 
 class TestTierPresets:

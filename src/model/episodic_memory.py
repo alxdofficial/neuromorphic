@@ -2,8 +2,8 @@
 Episodic Memory (v4) — fixed-size per-stream vector store.
 
 Single instance (batched across B_blocks via BS,B dims).
-Operates in D_mem space.
-Read: top-k retrieval with cross-attention (direct einsum for per-block params).
+Operates in D_col space (unified column/memory dimension).
+Read: top-k retrieval (direct dot-product, no projections).
 Write: novelty-scored EMA.
 """
 
@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import ModelConfig
-from .predictive_coding import GroupedLinear
 from .utils import StateMixin, unit_normalize, budget_enforce
 
 
@@ -21,26 +20,22 @@ class EpisodicMemory(nn.Module, StateMixin):
     """Fixed-size episodic memory with top-k retrieval and novelty-based writes.
 
     State (with explicit B dim):
-        em_K: [BS, B, M, D_mem] — keys (unit-normalized)
-        em_V: [BS, B, M, D_mem] — values
+        em_K: [BS, B, M, D_col] — keys (unit-normalized)
+        em_V: [BS, B, M, D_col] — values
         em_S: [BS, B, M] — strengths (bounded)
         em_age: [BS, B, M] — tokens since last write
     """
 
     _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
 
-    def __init__(self, D_mem: int, M_slots: int, config: ModelConfig):
+    def __init__(self, dim: int, M_slots: int, config: ModelConfig):
         super().__init__()
-        self.D_mem = D_mem
+        self.dim = dim
         self.M = M_slots
         self.k_ret = config.k_ret
         self.S_max = config.S_max
         self.budget = config.budget_em
         self.B = config.B_blocks
-
-        # Per-block cross-attention projections via GroupedLinear
-        self.W_q_cross = GroupedLinear(self.B, D_mem, D_mem)
-        self.W_o_cross = GroupedLinear(self.B, D_mem, D_mem)
 
         # State (lazily allocated)
         self.em_K: Tensor | None = None
@@ -49,8 +44,8 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_age: Tensor | None = None
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
-        self.em_K = torch.zeros(BS, self.B, self.M, self.D_mem, device=device, dtype=dtype)
-        self.em_V = torch.zeros(BS, self.B, self.M, self.D_mem, device=device, dtype=dtype)
+        self.em_K = torch.zeros(BS, self.B, self.M, self.dim, device=device, dtype=dtype)
+        self.em_V = torch.zeros(BS, self.B, self.M, self.dim, device=device, dtype=dtype)
         self.em_S = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
         self.em_age = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
 
@@ -58,26 +53,14 @@ class EpisodicMemory(nn.Module, StateMixin):
         return self.em_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Top-k retrieval + cross-attention (gather-free, merged dot-product).
+        """Top-k retrieval (gather-free, no projections).
 
-        q: [BS, N, B, C, D_mem] -> [BS, N, B, C, D_mem]
-
-        Uses a single merged query (q + q_cross) for one matmul against em_K,
-        eliminating the second QK dot-product. Softmax masking ensures only
-        top-k contribute.
+        q: [BS, N, B, C, D_col] -> [BS, N, B, C, D_col]
         """
         BS, N, B, C, D = q.shape
 
-        # Per-block cross-attention projection via direct einsum
-        q_cross = torch.einsum("snbci, boi -> snbco", q, self.W_q_cross.weight)
-        if self.W_q_cross.bias is not None:
-            q_cross = q_cross + self.W_q_cross.bias[None, None, :, None, :]  # [1,1,B,1,D]
-
-        # Merged query: single matmul instead of two separate
-        q_mix = q + q_cross  # [BS, N, B, C, D]
-
         # Dense scores against all M slots
-        scores = torch.einsum("snbcd, sbmd -> snbcm", q_mix, self.em_K)  # [BS, N, B, C, M]
+        scores = torch.einsum("snbcd, sbmd -> snbcm", q, self.em_K)  # [BS, N, B, C, M]
 
         # Mask inactive slots
         active_mask = (self.em_S > 0)[:, None, :, None, :]  # [BS, 1, B, 1, M]
@@ -96,17 +79,12 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Weighted sum
         out = torch.einsum("snbcm, sbmd -> snbcd", attn_weights, self.em_V)
 
-        # Per-block output projection via direct einsum
-        out = torch.einsum("snbci, boi -> snbco", out, self.W_o_cross.weight)
-        if self.W_o_cross.bias is not None:
-            out = out + self.W_o_cross.bias[None, None, :, None, :]  # [1,1,B,1,D]
-
         return out
 
     def score_novelty(self, q_nov: Tensor, surprise: Tensor, w_nov: Tensor) -> Tensor:
         """Score novelty for candidate selection.
 
-        q_nov: [BS, N, B, C, D_mem], surprise: [BS, N, B, C], w_nov: [BS, N, B, C]
+        q_nov: [BS, N, B, C, D_col], surprise: [BS, N, B, C], w_nov: [BS, N, B, C]
         Returns: novelty [BS, N, B, C]
         """
         # Max cosine similarity against em_K
@@ -122,9 +100,9 @@ class EpisodicMemory(nn.Module, StateMixin):
                                novelty: Tensor, C_cand: int):
         """Select top-C_cand candidates across all N*C positions per (BS, B).
 
-        q_nov, v_nov: [BS, N, B, C, D_mem]
+        q_nov, v_nov: [BS, N, B, C, D_col]
         novelty: [BS, N, B, C]
-        Returns: (cand_K, cand_V, cand_scores) each [BS, B, C_cand, D_mem] or [BS, B, C_cand]
+        Returns: (cand_K, cand_V, cand_scores) each [BS, B, C_cand, D_col] or [BS, B, C_cand]
         """
         BS, N, B, C, D = q_nov.shape
 
@@ -150,8 +128,8 @@ class EpisodicMemory(nn.Module, StateMixin):
               g_em: Tensor, tau: Tensor, decay: Tensor):
         """Write candidates to EM via EMA.
 
-        cand_K: [BS, B, C_cand, D_mem]
-        cand_V: [BS, B, C_cand, D_mem]
+        cand_K: [BS, B, C_cand, D_col]
+        cand_V: [BS, B, C_cand, D_col]
         cand_scores: [BS, B, C_cand]
         g_em: [BS, B]
         tau: [BS, B]
@@ -256,7 +234,7 @@ class EMNeuromodulator(nn.Module):
             n_content = config.content_proj_dim
             n_features = n_scalar + n_content
 
-            self.content_proj = nn.Linear(config.D_mem, n_content)
+            self.content_proj = nn.Linear(config.D_col, n_content)
             self.backbone = nn.Sequential(
                 nn.Linear(n_features, H),
                 nn.ReLU(),
@@ -274,7 +252,7 @@ class EMNeuromodulator(nn.Module):
         """
         novelty_mean: [BSB]
         em_usage: [BSB]
-        content_emb: [BSB, D_mem] (optional)
+        content_emb: [BSB, D_col] (optional)
 
         Returns: g_em [BSB], tau [BSB], decay [BSB]
         """

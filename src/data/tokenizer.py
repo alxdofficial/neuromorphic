@@ -128,6 +128,26 @@ def tokenize_documents(
     return all_tokens
 
 
+FITB_SPECIAL_TOKENS = ["<FITB>", "<NULL>"]
+
+
+def add_fitb_tokens(tokenizer: PreTrainedTokenizerFast) -> dict:
+    """Add FITB/NULL special tokens if not already present.
+
+    Returns dict with fitb_id, null_id, eos_id.
+    """
+    existing = set(tokenizer.get_vocab().keys())
+    new_tokens = [t for t in FITB_SPECIAL_TOKENS if t not in existing]
+    if new_tokens:
+        tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+    vocab = tokenizer.get_vocab()
+    return {
+        "fitb_id": vocab["<FITB>"],
+        "null_id": vocab["<NULL>"],
+        "eos_id": tokenizer.eos_token_id,
+    }
+
+
 def count_tokens(text: str, tokenizer: PreTrainedTokenizerFast) -> int:
     """Count tokens in text without allocating full token list."""
     return len(tokenizer.encode(text, add_special_tokens=False))

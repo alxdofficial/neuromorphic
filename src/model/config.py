@@ -15,8 +15,7 @@ class ModelConfig:
     R: int = 4                # iterative refinement passes
     B_blocks: int = 4         # memory blocks
     C: int = 4                # columns per block
-    D_col: int = 128          # column width
-    D_mem: int = 256          # PM/EM dimension (decoupled from D_col)
+    D_col: int = 256          # column width (also PM/EM dimension)
     D_pcm: int = 64           # PCM encoding dim
     N: int = 128              # segment length
     K_segments: int = 2       # TBPTT chunk = K segments
@@ -70,6 +69,13 @@ class ModelConfig:
     dropout: float = 0.1
     tie_embeddings: bool = True
 
+    # FITB (Fill-In-The-Blank) pretraining
+    fitb_id: int = -1              # <FITB> token ID, set from tokenizer at runtime
+    null_id: int = -1              # <NULL> token ID, set from tokenizer at runtime
+    mask_rate: float = 0.3         # fraction of tokens to mask for FITB pretraining
+    span_mask_prob: float = 0.5    # probability of span masking vs random
+    span_mask_mean_len: int = 3    # mean span length (geometric distribution)
+
     # Training
     use_compile: bool = True
     gradient_checkpointing: bool = False
@@ -97,8 +103,6 @@ class ModelConfig:
             raise ValueError(f"C ({self.C}) must be >= 1.")
         if self.D_col <= 0:
             raise ValueError(f"D_col ({self.D_col}) must be positive.")
-        if self.D_mem <= 0:
-            raise ValueError(f"D_mem ({self.D_mem}) must be positive.")
         if self.D_pcm <= 0 and self.pcm_enabled:
             raise ValueError(f"D_pcm ({self.D_pcm}) must be positive when pcm_enabled.")
         if self.N < 1:
@@ -116,6 +120,14 @@ class ModelConfig:
         if self.k_ret > self.M:
             raise ValueError(
                 f"k_ret ({self.k_ret}) must be <= M ({self.M})."
+            )
+        if not 0.0 <= self.mask_rate <= 1.0:
+            raise ValueError(
+                f"mask_rate ({self.mask_rate}) must be in [0, 1]."
+            )
+        if not 0.0 <= self.span_mask_prob <= 1.0:
+            raise ValueError(
+                f"span_mask_prob ({self.span_mask_prob}) must be in [0, 1]."
             )
 
     def set_phase(self, phase: str):
@@ -142,7 +154,7 @@ class ModelConfig:
     def tier_a(cls, **overrides) -> "ModelConfig":
         """Dev tier (~100M). Matches Pythia-70M / Mamba-130M scale."""
         defaults = dict(
-            D=768, B_blocks=6, C=4, D_col=384, D_mem=384,
+            D=768, B_blocks=6, C=4, D_col=384,
             D_pcm=64, R=4, N=128, r=8, M=64,
         )
         defaults.update(overrides)
@@ -152,7 +164,7 @@ class ModelConfig:
     def tier_b(cls, **overrides) -> "ModelConfig":
         """Research tier (~400M). Matches Pythia-410M / Mamba-370M."""
         defaults = dict(
-            D=1536, B_blocks=8, C=8, D_col=448, D_mem=640,
+            D=1536, B_blocks=8, C=8, D_col=576,
             D_pcm=96, R=4, N=128, r=16, M=128,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,
@@ -164,7 +176,7 @@ class ModelConfig:
     def tier_c(cls, **overrides) -> "ModelConfig":
         """1B-class tier (~1.05B). Matches Pythia-1B / TinyLlama-1.1B / Mamba-790M."""
         defaults = dict(
-            D=2048, B_blocks=12, C=8, D_col=640, D_mem=768,
+            D=2048, B_blocks=12, C=8, D_col=768,
             D_pcm=128, R=6, N=128, r=16, M=256,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,

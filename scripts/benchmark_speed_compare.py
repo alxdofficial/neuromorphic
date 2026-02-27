@@ -48,7 +48,7 @@ def bench_neuromorphic(
     device: torch.device,
     use_compile: bool,
 ) -> BenchResult:
-    cfg = ModelConfig.tier_a(T=t)
+    cfg = ModelConfig.tier_a(N=t)
     cfg.set_phase("B")
     cfg.vocab_size = vocab
     cfg.eot_id = 2

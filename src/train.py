@@ -25,7 +25,7 @@ from typing import Any
 
 from .model import ModelConfig, NeuromorphicLM
 from .model.state import save_runtime_state, load_runtime_state
-from .data import PHASE_CONFIGS, create_dataloader, get_special_token_ids, get_tokenizer
+from .data import PHASE_CONFIGS, create_dataloader, get_special_token_ids, get_tokenizer, add_fitb_tokens
 from .training import TBPTTTrainer, evaluate_validation
 from .debug import MetricsCollector
 
@@ -40,7 +40,7 @@ TIER = "a"          # ~85M params, D=768, L=8, B=2
 # TIER = "c"        # ~107M params, strong
 
 # -- Training phase --
-PHASE = "A"         # WM + PM + EM + PCM (all systems)
+PHASE = "A"         # PM + EM + PCM (all systems)
 # PHASE = "B"       # A + lifelong (PM/EM persist across docs)
 
 # -- Data phase (which datasets to use) --
@@ -562,9 +562,15 @@ def run_phase(
 
     # Config
     config = _build_config(tier, phase_name, settings)
-    config.vocab_size = tokenizer.vocab_size
+    config.vocab_size = len(tokenizer)
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     config.eot_id = eot_id
+
+    # FITB token IDs (always set — mask_rate controls whether FITB is active)
+    fitb_vocab = tokenizer.get_vocab()
+    if "<FITB>" in fitb_vocab:
+        config.fitb_id = fitb_vocab["<FITB>"]
+        config.null_id = fitb_vocab["<NULL>"]
 
     train_data_phase = _resolve_data_phase(phase_name, settings.get("data_phase", DATA_PHASE))
     val_data_phase = _resolve_data_phase(phase_name, settings.get("val_data_phase", VAL_DATA_PHASE))
@@ -634,9 +640,20 @@ def run_phase(
         print(f"Resuming from {resume_path}")
         if ckpt is None:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        # Handle vocab size mismatch (e.g. FITB tokens added after checkpoint)
+        ckpt_vocab = ckpt["model_state_dict"].get("embedding.weight")
+        if ckpt_vocab is not None and ckpt_vocab.shape[0] != config.vocab_size:
+            print(f"  Vocab size mismatch: checkpoint={ckpt_vocab.shape[0]}, "
+                  f"current={config.vocab_size}. Resizing embeddings after load.")
+
         incompat = model.load_state_dict(
             ckpt["model_state_dict"], strict=False
         )
+
+        # Resize embeddings if vocab changed (preserves loaded weights)
+        if ckpt_vocab is not None and ckpt_vocab.shape[0] != config.vocab_size:
+            model.resize_token_embeddings(config.vocab_size)
+
         if incompat.missing_keys:
             print(f"  Missing keys on resume: {len(incompat.missing_keys)}")
         if incompat.unexpected_keys:
@@ -648,7 +665,7 @@ def run_phase(
             # Phase toggles
             "pm_enabled", "em_enabled",
             # Architecture
-            "R", "B_blocks", "C", "D_col", "D_mem", "D_pcm",
+            "R", "B_blocks", "C", "D_col", "D_pcm",
             "ffn_expansion",
             # Memory dimensions
             "r", "M", "k_ret", "C_em",
@@ -1037,10 +1054,12 @@ def main():
     print(f"Device: {device}")
 
     tokenizer = get_tokenizer(settings["tokenizer"])
+    fitb_ids = add_fitb_tokens(tokenizer)
     special_ids = get_special_token_ids(tokenizer)
-    vocab_size = tokenizer.vocab_size
+    vocab_size = len(tokenizer)
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     print(f"Tokenizer: {settings['tokenizer']} (vocab={vocab_size}, eot={eot_id})")
+    print(f"FITB tokens: fitb_id={fitb_ids['fitb_id']}, null_id={fitb_ids['null_id']}")
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     tier = str(settings["tier"]).lower()

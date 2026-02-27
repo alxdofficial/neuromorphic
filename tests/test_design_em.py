@@ -15,13 +15,13 @@ class TestEpisodicMemory:
     def test_initialize(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         assert not em.is_initialized()
 
         em.initialize(BS, torch.device("cpu"), torch.float32)
         assert em.is_initialized()
-        assert em.em_K.shape == (BS, B, cfg.M, cfg.D_mem)
-        assert em.em_V.shape == (BS, B, cfg.M, cfg.D_mem)
+        assert em.em_K.shape == (BS, B, cfg.M, cfg.D_col)
+        assert em.em_V.shape == (BS, B, cfg.M, cfg.D_col)
         assert em.em_S.shape == (BS, B, cfg.M)
         assert em.em_age.shape == (BS, B, cfg.M)
 
@@ -29,33 +29,33 @@ class TestEpisodicMemory:
         """Reading from empty EM should not crash."""
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
-        q = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, 4, B, cfg.C, cfg.D_col)
         y = em.read(q)
         assert y.shape == q.shape
 
     def test_read_with_content(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_K = unit_normalize(torch.randn(BS, B, cfg.M, cfg.D_mem))
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_mem)
+        em.em_K = unit_normalize(torch.randn(BS, B, cfg.M, cfg.D_col))
+        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_col)
         em.em_S = torch.ones(BS, B, cfg.M)
 
-        q = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, 4, B, cfg.C, cfg.D_col)
         y = em.read(q)
         assert y.shape == q.shape
 
     def test_novelty_scoring(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
-        q_nov = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)
+        q_nov = torch.randn(BS, 4, B, cfg.C, cfg.D_col)
         surprise = torch.rand(BS, 4, B, cfg.C)
         w_nov = torch.rand(BS, 4, B, cfg.C)
 
@@ -67,12 +67,12 @@ class TestEpisodicMemory:
     def test_write_updates_strength(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         C_em = cfg.C_em
-        cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D_mem))
-        cand_V = torch.randn(BS, B, C_em, cfg.D_mem)
+        cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D_col))
+        cand_V = torch.randn(BS, B, C_em, cfg.D_col)
         cand_scores = torch.rand(BS, B, C_em) + 0.1
 
         g_em = torch.full((BS, B), 0.5)
@@ -88,14 +88,14 @@ class TestEpisodicMemory:
     def test_budget_enforcement(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         # Write many times to fill up
         C_em = cfg.C_em
         for _ in range(20):
-            cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D_mem))
-            cand_V = torch.randn(BS, B, C_em, cfg.D_mem)
+            cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D_col))
+            cand_V = torch.randn(BS, B, C_em, cfg.D_col)
             cand_scores = torch.rand(BS, B, C_em) + 0.5
             g_em = torch.ones(BS, B)
             tau = torch.ones(BS, B)
@@ -107,7 +107,7 @@ class TestEpisodicMemory:
     def test_age_tick(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
         em.em_S = torch.ones(BS, B, cfg.M)  # activate all slots
 
@@ -117,10 +117,10 @@ class TestEpisodicMemory:
     def test_reset_states(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_mem)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_mem)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_col)
+        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_col)
         em.em_S = torch.ones(BS, B, cfg.M)
         em.em_age = torch.ones(BS, B, cfg.M) * 100
 
@@ -143,7 +143,7 @@ class TestEMNeuromodulator:
 
         novelty_mean = torch.rand(BS)
         em_usage = torch.rand(BS)
-        content = torch.randn(BS, cfg.D_mem)
+        content = torch.randn(BS, cfg.D_col)
 
         g_em, tau, decay = neuromod(novelty_mean, em_usage, content)
         assert g_em.shape == (BS,)

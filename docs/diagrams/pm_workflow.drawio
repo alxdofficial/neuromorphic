@@ -22,22 +22,15 @@
           <mxGeometry x="80" y="110" width="150" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="r_proj_up" value="W_pm_up&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;D_col → D_mem&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="80" y="165" width="150" height="35" as="geometry"/>
+        <mxCell id="r_q" value="q = view_5d(x_col)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, B, C, D_col] — free view&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="165" width="200" height="35" as="geometry"/>
         </mxCell>
-        <mxCell id="re1" style="endArrow=block;endFill=1;" edge="1" source="r_input" target="r_proj_up" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-
-        <mxCell id="r_q" value="q = W_pm_up(x_col)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="80" y="220" width="150" height="35" as="geometry"/>
-        </mxCell>
-        <mxCell id="re2" style="endArrow=block;endFill=1;" edge="1" source="r_proj_up" target="r_q" parent="1">
+        <mxCell id="re1" style="endArrow=block;endFill=1;" edge="1" source="r_input" target="r_q" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
         <!-- PM State -->
-        <mxCell id="pm_state" value="&lt;b&gt;PM State&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_K [BS, r, D_mem] (unit-norm)&lt;br&gt;pm_V [BS, r, D_mem]&lt;br&gt;pm_a [BS, r] (strengths)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="pm_state" value="&lt;b&gt;PM State&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_K [BS, B, r, D_col] (unit-norm)&lt;br&gt;pm_V [BS, B, r, D_col]&lt;br&gt;pm_a [BS, B, r] (strengths)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="300" y="130" width="180" height="65" as="geometry"/>
         </mxCell>
 
@@ -53,7 +46,7 @@
         </mxCell>
 
         <!-- Weighted + Modulation -->
-        <mxCell id="r_weighted" value="weighted = scores × pm_a&lt;br&gt;modulation = weighted @ pm_V&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="r_weighted" value="weighted = scores × pm_a&lt;br&gt;modulation = weighted @ pm_V&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, B, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="140" y="280" width="200" height="50" as="geometry"/>
         </mxCell>
         <mxCell id="re4" style="endArrow=block;endFill=1;" edge="1" source="r_scores" target="r_weighted" parent="1">
@@ -61,7 +54,7 @@
         </mxCell>
 
         <!-- Holographic output -->
-        <mxCell id="r_holo" value="y = q ⊙ modulation (holographic)&lt;br&gt;x_col += W_pm_down(y)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="r_holo" value="y = q ⊙ modulation (holographic)&lt;br&gt;x_col += reshape_g(y)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, G, D_col] — no projection&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="140" y="345" width="215" height="35" as="geometry"/>
         </mxCell>
         <mxCell id="re5" style="endArrow=block;endFill=1;" edge="1" source="r_weighted" target="r_holo" parent="1">
@@ -80,10 +73,10 @@
           <mxGeometry x="650" y="110" width="170" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="e_kcand" value="k_cand = norm(W_k_pre(x_out))&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem] — what to store&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="e_kcand" value="k_cand = norm(k_pre) from W_post_fused&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, B, C, D_col] — what to store&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="550" y="165" width="220" height="35" as="geometry"/>
         </mxCell>
-        <mxCell id="e_vcand" value="v_cand = W_v_post(x_out)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_mem] — modulation pattern&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="e_vcand" value="v_cand = v_post from W_post_fused&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, B, C, D_col] — modulation pattern&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="790" y="165" width="220" height="35" as="geometry"/>
         </mxCell>
         <mxCell id="ee1" style="endArrow=block;endFill=1;" edge="1" source="e_xout" target="e_kcand" parent="1">
@@ -110,7 +103,7 @@
         </mxCell>
 
         <!-- Aggregation -->
-        <mxCell id="e_agg" value="&lt;b&gt;Aggregate across N×C&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gated_routed = gate × route_w&lt;br&gt;elig_K = Σ_{n,c} gated_routed × k_cand → [BS, r, D_mem]&lt;br&gt;elig_V = Σ_{n,c} gated_routed × v_cand → [BS, r, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="e_agg" value="&lt;b&gt;Aggregate across N×C&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gated_routed = gate × route_w&lt;br&gt;elig_K = Σ_{n,c} gated_routed × k_cand → [BS, B, r, D_col]&lt;br&gt;elig_V = Σ_{n,c} gated_routed × v_cand → [BS, B, r, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="600" y="340" width="380" height="55" as="geometry"/>
         </mxCell>
         <mxCell id="ee4" style="endArrow=block;endFill=1;" edge="1" source="e_route" target="e_agg" parent="1">
@@ -134,7 +127,7 @@
         </mxCell>
 
         <!-- Neuromodulator -->
-        <mxCell id="c_neuromod_in" value="Neuromod inputs (detached):&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;elig_summary = ‖elig_K‖.mean() [BS]&lt;br&gt;pm_usage = Σ pm_a [BS]&lt;br&gt;content_emb = mean(elig_K) [BS, D_mem]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="c_neuromod_in" value="Neuromod inputs (detached):&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;elig_summary = ‖elig_K‖.mean() [BS]&lt;br&gt;pm_usage = Σ pm_a [BS]&lt;br&gt;content_emb = mean(elig_K) [BS, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="160" y="535" width="240" height="65" as="geometry"/>
         </mxCell>
 

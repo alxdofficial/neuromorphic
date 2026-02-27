@@ -66,9 +66,9 @@ class TestReset:
         model, cfg = _init_model("A")
         B = cfg.B_blocks
 
-        # Give PM some content (state is [BS, B, r, D_mem])
+        # Give PM some content (state is [BS, B, r, D_col])
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         # Mask: reset stream 0 (all its B blocks), keep stream 1
@@ -89,8 +89,8 @@ class TestEMReset:
         B = cfg.B_blocks
 
         em = model.em
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_mem)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_mem)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_col)
+        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_col)
         em.em_S = torch.ones(BS, B, cfg.M)
         em.em_age = torch.ones(BS, B, cfg.M) * 50
 
@@ -149,7 +149,7 @@ class TestSaveLoad:
         load_runtime_state(model2, state)
 
         # r=8 state should be unchanged (mismatched shapes skipped)
-        assert model2.pm.pm_K.shape[2] == 8  # [BS, B, r, D_mem]
+        assert model2.pm.pm_K.shape[2] == 8  # [BS, B, r, D_col]
         assert torch.equal(model2.pm.pm_K, pm_K_before)
 
     def test_save_uses_stable_path_keys(self):

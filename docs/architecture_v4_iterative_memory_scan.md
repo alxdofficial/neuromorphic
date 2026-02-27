@@ -65,9 +65,8 @@ Each column group operates on D_col dimensions. After processing, fan_in back to
 - **PM** — procedural memory: Hebbian holographic slots (basal ganglia)
 - **EM** — episodic memory: key-value episode buffer (hippocampus)
 
-PM/EM state is batched: `[BS*B, r, D_mem]` / `[BS*B, M, D_mem]`. Columns reshape
-to memory space `[BS*B, N*C, D_mem]` for reads, then back to `[BS, N, G, D_mem]`.
-D_mem is decoupled from D_col; columns project up/down between them.
+PM/EM state is batched: `[BS, B, r, D_col]` / `[BS, B, M, D_col]`. Columns
+operate directly in D_col space — no projection needed for memory reads/writes.
 
 ### How It Works (High Level)
 
@@ -81,7 +80,7 @@ For r = 1..R passes:
   2. PM/EM UPDATE (neuromodulators commit eligibility, write novel episodes)
      - next pass reads the UPDATED PM/EM
 
-After R passes: decode from final representations → next-token loss
+After R passes: decode from final representations → loss (FITB or NTP)
 Carry PM/EM state to next segment.
 ```
 
@@ -91,69 +90,77 @@ Step 2 is the only sequential-across-passes part (R times per segment).
 ### Forward Pass: R Iterative Passes
 
 ```python
-def forward_segment(self, input_ids, reset_mask=None):
+def forward_segment(self, input_ids, reset_mask=None, fitb_mask=None):
     """Process N tokens through R refinement passes.
 
-    input_ids:  [BS, N]     — segment of token IDs
+    input_ids:  [BS, N]     — token IDs (may have <FITB> at masked positions)
     reset_mask: [BS] bool   — streams to reset PM/EM (doc boundary)
+    fitb_mask:  [BS, N] bool — FITB masked positions (None = NTP path)
 
-    Returns: (logits [BS, N, vocab], aux_loss scalar)
-    PM/EM state is mutated in-place (instance attributes on each block).
+    Returns:
+        NTP:  (logits [BS, N, vocab], aux_loss scalar)
+        FITB: (per_pass_logits list[R × [BS,N,vocab]], aux_loss scalar)
+    PM/EM state is mutated in-place.
     """
-    if reset_mask is not None and reset_mask.any():
-        self._reset_memory(reset_mask)  # zero PM/EM for masked streams
+    if reset_mask is not None:
+        self._reset_memory(reset_mask)
 
-    x = embed(input_ids) + pos_embed(positions)  # [BS, N, D]
+    is_fitb = fitb_mask is not None
+    sequence = input_ids          # FITB: has <FITB> at masked positions
+    original_ids = input_ids
 
-    # Project to column space: [BS, N, D] → [BS, N, B_blocks, C, D_col]
-    x_blocks = fan_out(x).view(BS, N, B_blocks, C, D_col)
+    x = embed(sequence) + pos_embed(positions)       # [BS, N, D]
+    x_cols = fan_out(x).view(BS, N, G, D_col)        # G = B*C groups
 
-    z_hat_prev = [None] * B_blocks  # per-block PCM state
-    lam = sigmoid(lambda_logit)     # learnable mixing parameter
+    z_hat_prev = None
+    lam = sigmoid(lambda_logit)
 
     for r in range(R):
-        block_outputs = []
-        z_hat_new = []
+        # FITB: re-embed from updated sequence (r > 0)
+        if is_fitb and r > 0:
+            x_fresh = embed(sequence) + pos_embed(positions)
+            x_cols_fresh = fan_out(x_fresh).view(BS, N, G, D_col)
+            x_cols = (1 - lam) * x_out + lam * x_cols_fresh
 
-        for b, block in enumerate(self.blocks):
-            x_b = x_blocks[:, :, b]  # [BS, N, C, D_col]
+        # Single batched call — all G groups, all N tokens
+        x_out, z, z_hat, surprise, elig_info, nov_info = \
+            columns.forward(x_cols, pm, em, z_hat_prev)
 
-            # --- STEP 1: COLUMN FORWARD (all C columns × N tokens) ---
-            x_out, z, z_hat, pcm_loss, elig, em_cands = \
-                block.forward_pass(x_b, z_hat_prev[b])
+        # PCM prediction loss (cross-pass)
+        if pcm_enabled and z_hat_prev is not None:
+            aux_loss += columns.pcm.prediction_loss(z_hat_prev, z) * pcm_pred_weight
 
-            aux_loss += pcm_loss * pcm_pred_weight
+        # PM eligibility routing + commit, EM novelty + write
+        _process_and_commit(elig_info, nov_info, x_out)
 
-            # --- STEP 2: PM/EM UPDATE (between passes) ---
-            block.commit_and_write(elig, em_cands)
-
-            block_outputs.append(x_out)
-            z_hat_new.append(z_hat)
-
-        x_new = stack(block_outputs, dim=2)  # [BS, N, B, C, D_col]
-
-        # Damped mixing
-        if r > 0:
-            x_blocks = (1 - lam) * x_blocks + lam * x_new
+        if is_fitb:
+            # Per-pass logits (fan_in + ln_final + lm_head run R times)
+            logits_r = lm_head(ln_final(fan_in(x_out.reshape(BS, N, -1))))
+            per_pass_logits.append(logits_r)
+            # Re-embed: argmax predictions replace <FITB> for next pass
+            if r < R - 1:
+                with no_grad():
+                    sequence = where(fitb_mask, logits_r.argmax(-1), original_ids)
         else:
-            x_blocks = x_new
+            # NTP: damped mixing  x^r = (1-λ)x^{r-1} + λ·column_output^r
+            x_cols = x_out if r == 0 else (1 - lam) * x_cols + lam * x_out
 
-        z_hat_prev = z_hat_new
+        z_hat_prev = z_hat
 
-    # Project back: [BS, N, B*C*D_col] → [BS, N, D]
-    x = fan_in(x_blocks.reshape(BS, N, -1))
-    logits = lm_head(ln_final(x))  # [BS, N, vocab]
+    if is_fitb:
+        return per_pass_logits, aux_loss
 
+    # NTP: single decode from final mixed representation
+    logits = lm_head(ln_final(fan_in(x_cols.reshape(BS, N, -1))))
     return logits, aux_loss
 ```
 
 ### Per-Block Column Forward (The Parallel Core)
 
-In code, this is split across two classes:
-- **`CorticalColumnGroup.forward`**: column-level ops (PM/EM reads, PCM, FFN,
-  eligibility candidates, novelty candidates). Operates on `[BS, N, C, D_col]`.
-- **`ColumnBlock.forward_pass`**: calls `CorticalColumnGroup.forward`, then
-  aggregates PM eligibility across N×C positions and selects top EM candidates.
+In code, this is a single `CorticalColumnGroup.forward` call: column-level ops
+(PM/EM reads, PCM, FFN, fused post-processing for eligibility + novelty
+candidates). Operates on `[BS, N, G, D_col]` where G = B*C. PM eligibility
+routing and EM candidate selection happen in `model._process_and_commit`.
 
 Conceptually, for one block:
 
@@ -170,15 +177,15 @@ def block_forward_pass(x_block, pm_state, em_state, z_hat_prev):
     """
     # --- CorticalColumnGroup.forward ---
 
-    # 1. PM holographic read (project up to D_mem, modulate, project back)
-    q_pm = W_pm_up(x_block)                             # [BS,N,C,D_mem]
+    # 1. PM holographic read (direct in D_col space)
+    q_pm = x_block.view(BS, N, B, C, D_col)             # free view
     y_pm = pm_state.read(q_pm)                           # holographic
-    x_block = x_block + W_pm_down(y_pm)                  # residual
+    x_block = x_block + y_pm.reshape(BS, N, G, D_col)   # residual
 
-    # 2. EM top-k read (project up, retrieve, cross-attend, project back)
-    q_em = W_em_up(x_block)                              # [BS,N,C,D_mem]
+    # 2. EM top-k read (direct in D_col space)
+    q_em = x_block.view(BS, N, B, C, D_col)             # free view
     y_em = em_state.read(q_em)                           # top-k retrieval
-    x_block = x_block + W_em_down(y_em)                  # residual
+    x_block = x_block + y_em.reshape(BS, N, G, D_col)   # residual
 
     # 3. PCM: encode, surprise, gain
     z = PCM.encode(x_block)                              # [BS,N,C,D_pcm]
@@ -196,22 +203,21 @@ def block_forward_pass(x_block, pm_state, em_state, z_hat_prev):
     # 5. PCM hypothesis
     z_hat = PCM.predict(z)                               # [BS,N,C,D_pcm]
 
-    # 6. PM eligibility candidates
-    k_cand = normalize(W_k_pre(x_out))                  # [BS,N,C,D_mem]
-    v_cand = W_v_post(x_out)                             # [BS,N,C,D_mem]
-    gate = (surprise / scale).clamp(0, 1)                # [BS,N,C]
-
-    # 7. EM novelty candidates
-    q_nov = normalize(W_k_cand(x_out))                  # [BS,N,C,D_mem]
-    v_nov = W_v_cand(x_out)                              # [BS,N,C,D_mem]
-    w_nov = sigmoid(W_nov(x_out))                        # [BS,N,C]
+    # 6-7. Fused post-processing (W_post_fused: D_col → 4*D_col + 1)
+    proj = W_post_fused(x_out)                           # [BS,N,G,4*D_col+1]
+    k_pre, v_post, k_cand_raw, v_cand, nov_raw = split(proj, [D_col]*4 + [1])
+    k_cand = normalize(k_pre)                            # [BS,N,B,C,D_col]
+    v_cand = v_post                                      # [BS,N,B,C,D_col]
+    gate = (surprise / scale).clamp(0, 1)                # [BS,N,B,C]
+    q_nov = normalize(k_cand_raw)                        # [BS,N,B,C,D_col]
+    w_nov = sigmoid(nov_raw)                             # [BS,N,B,C]
 
     # --- ColumnBlock.forward_pass (aggregation) ---
 
     # 8. PM eligibility aggregation across N×C
     route_w = softmax(k_cand @ pm_K.T / tau)             # [BS,N,C,r]
     gated = gate * route_w                               # [BS,N,C,r]
-    elig_K = einsum('bncr, bncd -> brd', gated, k_cand)  # [BS,r,D_mem]
+    elig_K = einsum('bncr, bncd -> brd', gated, k_cand)  # [BS,r,D_col]
     elig_V = einsum('bncr, bncd -> brd', gated, v_cand)
 
     # 9. EM candidate selection (top-C_cand across N×C by novelty)
@@ -242,10 +248,9 @@ PM holographic read: the input **flows through** stored patterns. Output depends
 on both input AND stored pattern multiplicatively:
 
 ```
-q = W_pm_up(x_col)                              # [D_col] → [D_mem]
+q = x_col                                        # [D_col] — direct, no projection
 scores = normalize(q) @ pm_K.T                   # [r_slots]
-y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D_mem]
-y_pm_out = W_pm_down(y_pm)                       # [D_mem] → [D_col]
+y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D_col]
 ```
 
 Mathematically: `y_d = x_d * [W @ x]_d` — quadratic in x. The stored pattern
@@ -261,11 +266,11 @@ completely different output. This is why PM is "procedural memory": it encodes
 ### EM Read (Key-Value Retrieval)
 
 ```
-q = W_em_up(x_col)                              # [D_col] → [D_mem]
+q = x_col                                        # [D_col] — direct, no projection
 scores = q @ em_K.T                              # [M_slots]
-top_k = topk(scores, k=4)                       # sparse retrieval
-y_em = cross_attention(q, em_K[top_k], em_V[top_k])  # [D_mem]
-y_em_out = W_em_down(y_em)                       # [D_mem] → [D_col]
+top_k_mask = scores >= topk(scores, k).min       # gather-free top-k
+attn = softmax(masked(scores, top_k_mask))       # [M_slots]
+y_em = attn @ em_V                               # [D_col]
 ```
 
 Standard key-value store with sparse top-k retrieval. EM stores "facts" and
@@ -358,8 +363,8 @@ learning. Each pass is a mini perception-and-commit cycle.
 |-----------|----------------|------|
 | Column FFN | Same pass's contribution to loss | Direct through decode |
 | PCM encode/hypothesis | L_pred (auxiliary) + downstream surprise | Same segment |
-| PM read projections | Same pass's loss through PM read | Direct |
-| EM read projections | Same pass's loss through EM read | Direct |
+| PM read (holographic) | Same pass's loss through PM modulation | Direct |
+| EM read (top-k) | Same pass's loss through EM retrieval | Direct |
 | PM neuromodulator | **Next pass's** loss through committed PM state | Pass r → r+1 |
 | EM neuromodulator | **Next pass's** loss through written EM state | Pass r → r+1 |
 | Eligibility projections | **Next pass's** loss through committed eligibility | Pass r → r+1 |
@@ -385,20 +390,29 @@ segment.
 
 ## Correctness Analysis
 
-### 1. Causality
+### 1. Within-Segment: Bidirectional (No Causal Mask)
 
-Causality is maintained at two levels:
-- **Across segments**: PM/EM state at segment k reflects only tokens from
-  segments 0..k-1 and the current segment's completed passes.
-- **Across passes**: PM/EM at pass r reflects all N tokens from passes 1..r-1.
-  All tokens within pass r see the same PM/EM_r (no within-pass ordering).
+Within a single pass, there is no causal ordering — all N positions are equivalent
+(modulo positional encoding). All tokens within pass r see the same PM/EM state,
+and PM/EM updates between passes let every token's information flow to every other
+token through the memory bottleneck.
 
-Within a single pass, there is no causal ordering — all positions are equivalent
-(modulo positional encoding).
+This is **explicitly bidirectional by design**, which is why we use FITB (masked
+token prediction) rather than next-token prediction as the training objective. See
+the Training Objective section.
+
+**Across segments**: PM/EM state at segment k reflects only tokens from
+segments 0..k-1 and the current segment's completed passes — cross-segment
+context is strictly causal.
+
+**Across passes**: PM/EM at pass r reflects all N tokens from passes 0..r-1.
+All tokens within pass r see the same PM/EM_r.
 
 ### 2. Train/Inference Equivalence
 
-**Training**: process N tokens simultaneously for R passes, decode all.
+**Training (FITB)**: mask ~30% of N tokens, process all N through R passes, decode
+at each pass.
+**Training (NTP, backward compat)**: process N tokens through R passes, decode once.
 **Inference**: process one token at a time for R passes, decode.
 
 Equivalent because no cross-token operations within a pass. At inference, PM/EM
@@ -422,21 +436,20 @@ indirect access to each other through memory. "Depth" emerges.
 ### Column Dimensions
 
 ```
-# Tier A example (~100M params)
+# Tier A example (~83M params)
 D = 768           # embedding / model dimension
 B_blocks = 6      # memory blocks (PM/EM state batched as BS*B)
 C = 4             # columns per block → G = B*C = 24 groups total
-D_col = 384       # column width
-D_mem = 384       # PM/EM slot dimension (decoupled from D_col)
+D_col = 384       # column width (also PM/EM dimension — unified)
 D_pcm = 64        # PCM encoding dimension
 
 Fan-out:  D → G × D_col = 768 → 9216  (12x)
 Fan-in:   G × D_col → D = 9216 → 768
 
 # Tier presets (see config.py):
-# Tier A (~100M):  D=768  B=6  C=4  G=24  Dcol=384  Dmem=384
-# Tier B (~400M):  D=1536 B=8  C=8  G=64  Dcol=448  Dmem=640
-# Tier C (~1.05B): D=2048 B=12 C=8  G=96  Dcol=640  Dmem=768
+# Tier A (~83M):   D=768  B=6  C=4  G=24  Dcol=384
+# Tier B (~428M):  D=1536 B=8  C=8  G=64  Dcol=576
+# Tier C (~1.07B): D=2048 B=12 C=8  G=96  Dcol=768
 ```
 
 ### Segment Length
@@ -472,7 +485,7 @@ from the processed subset's eligibility/novelty.
 ### Scaling: Blocks of Columns
 
 ```
-Block b: C columns share PM_b (r_slots × D_mem) + EM_b (M_slots × D_mem)
+Block b: C columns share PM_b (r_slots × D_col) + EM_b (M_slots × D_col)
 ```
 
 Total columns = B_blocks × C. Each block's PM/EM can specialize. Analogous
@@ -495,8 +508,8 @@ Compare:
 ### Compute
 
 Per pass: O(N × B_blocks × C × D_col²) for column FFNs
-        + O(N × B_blocks × r × D_mem) for PM reads
-        + O(N × B_blocks × k × D_mem) for EM reads
+        + O(N × B_blocks × r × D_col) for PM reads
+        + O(N × B_blocks × k × D_col) for EM reads
 Total: R × above
 
 ### Memory
@@ -507,11 +520,48 @@ Inference: O(PM + EM + B × D_pcm) — **constant**.
 
 ## Training
 
-### Loss
+### Training Objective: FITB (Fill-In-The-Blank)
 
-    L = (1/N) Σ_t CE(decode(x^R_t), token_{t+1}) + α * L_pred
+The architecture's R-pass iterative refinement is fundamentally bidirectional: all
+N tokens share PM/EM state that gets updated between passes, so every token can
+see information from every other token through memory after pass r=0. Rather than
+forcing causal masking on this naturally bidirectional architecture, we use FITB
+(masked token prediction) as the training objective.
 
-where L_pred = Σ_r MSE(z_hat^r, z^{r+1}.detach()) averaged over passes.
+**FITB R-pass loop:**
+1. Mask ~30% of tokens with `<FITB>` token (random or span masking)
+2. For each pass r=0..R-1:
+   a. Re-embed from updated sequence (r > 0 only): damped mix of previous
+      pass's column output with freshly re-embedded predictions
+   b. Column processing (PM read, EM read, FFN, PCM — unchanged)
+   c. fan_in + ln_final + lm_head → logits_r for this pass
+   d. PM/EM update (including FITB positions — model should know what it predicted)
+   e. Re-embed: argmax(logits_r) replaces `<FITB>` positions for next pass (no grad)
+
+**Damped mixing (FITB vs NTP):**
+- NTP:  `x_cols = (1-λ)*x_cols_prev + λ*x_out` — old input blended with new column output
+- FITB: `x_cols = (1-λ)*x_out_prev + λ*x_cols_fresh` — previous column output blended
+  with fresh re-embedding. In both cases, λ weights the "new information."
+
+**Per-pass loss** (each pass independently produces logits and CE loss):
+
+    L = (1/(R*M)) Σ_r Σ_{m∈masked} CE(logits_r_m, original_token_m) + α * L_pred
+
+where M = number of masked positions, targets are original tokens at masked
+positions (NOT shifted-by-1), and L_pred = Σ_r MSE(z_hat^r, z^{r+1}.detach()).
+
+**Gradient flow:** Cross-pass gradients flow through `x_out` in the damped mixing
+formula (pass r's logits depend on pass r-1's column output). The only blocked
+gradient path is the argmax re-embedding (non-differentiable, wrapped in no_grad).
+This means later-pass losses can influence earlier-pass parameters.
+
+Uniform loss weighting across passes (later-pass upweighting is a future option).
+
+**Config fields:** `mask_rate` (0.3), `span_mask_prob` (0.5), `span_mask_mean_len` (3),
+`fitb_id` and `null_id` (set from tokenizer at runtime).
+
+**Backward compatibility:** `fitb_mask=None` in `forward_segment()` triggers the
+original NTP path. `mask_rate=0.0` disables FITB in the trainer.
 
 ### TBPTT Chunks
 
@@ -541,14 +591,14 @@ and PCM z_hat reset at doc boundaries. The distillation cycle:
 Each token, each pass, each column accumulates eligibility:
 
 ```
-# Project to D_mem for compatibility with PM slots
-k_cand = normalize(W_k_pre(x_col))         # → [D_mem]
-v_cand = W_v_post(x_col)                   # → [D_mem]
+# Fused post-processing produces candidates in D_col space directly
+k_cand = normalize(k_pre)                  # [D_col] — from W_post_fused
+v_cand = v_post                            # [D_col]
 gate = (surprise / 5.0).clamp(0, 1)        # third factor
 route_w = softmax(pm_K @ k_cand / tau)     # [r_slots] — which slot?
 
 # Accumulate across all N tokens in this pass
-elig_K += gate * route_w ⊗ k_cand          # [r_slots, D_mem]
+elig_K += gate * route_w ⊗ k_cand          # [r_slots, D_col]
 elig_V += gate * route_w ⊗ v_cand
 ```
 

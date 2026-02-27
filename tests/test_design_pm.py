@@ -15,29 +15,29 @@ class TestProceduralMemory:
     def test_initialize(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         assert not pm.is_initialized()
 
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         assert pm.is_initialized()
-        assert pm.pm_K.shape == (BS, B, cfg.r, cfg.D_mem)
-        assert pm.pm_V.shape == (BS, B, cfg.r, cfg.D_mem)
+        assert pm.pm_K.shape == (BS, B, cfg.r, cfg.D_col)
+        assert pm.pm_V.shape == (BS, B, cfg.r, cfg.D_col)
         assert pm.pm_a.shape == (BS, B, cfg.r)
 
     def test_holographic_read(self):
         """Holographic read: output depends on input (not just retrieval)."""
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
         # Populate with random content
-        pm.pm_K = unit_normalize(torch.randn(BS, B, cfg.r, cfg.D_mem))
-        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = unit_normalize(torch.randn(BS, B, cfg.r, cfg.D_col))
+        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
-        q1 = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)
-        q2 = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)
+        q1 = torch.randn(BS, 4, B, cfg.C, cfg.D_col)
+        q2 = torch.randn(BS, 4, B, cfg.C, cfg.D_col)
 
         y1 = pm.read(q1)
         y2 = pm.read(q2)
@@ -48,13 +48,13 @@ class TestProceduralMemory:
     def test_commit_increases_strength(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
         a_before = pm.pm_a.sum().item()
 
-        elig_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
-        elig_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        elig_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        elig_V = torch.randn(BS, B, cfg.r, cfg.D_col)
         g = torch.full((BS, B), 0.5)
         slot_logits = torch.randn(BS, B, cfg.r)
         tau = torch.ones(BS, B)
@@ -67,7 +67,7 @@ class TestProceduralMemory:
     def test_base_decay(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
@@ -80,15 +80,15 @@ class TestProceduralMemory:
     def test_budget_enforcement(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
         # Force over budget
         pm.pm_a = torch.full((BS, B, cfg.r), cfg.a_max)
 
         # Commit with high write strength
-        elig_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
-        elig_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        elig_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        elig_V = torch.randn(BS, B, cfg.r, cfg.D_col)
         g = torch.ones(BS, B)
         slot_logits = torch.zeros(BS, B, cfg.r)
         tau = torch.ones(BS, B)
@@ -101,9 +101,9 @@ class TestProceduralMemory:
     def test_reset_content(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         # Reset first stream only
@@ -123,7 +123,7 @@ class TestPMNeuromodulator:
 
         elig_summary = torch.rand(BS)
         pm_usage = torch.rand(BS)
-        content = torch.randn(BS, cfg.D_mem)
+        content = torch.randn(BS, cfg.D_col)
 
         g, slot_logits, tau = neuromod(elig_summary, pm_usage, content)
         assert g.shape == (BS,)

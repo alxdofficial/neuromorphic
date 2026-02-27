@@ -1,7 +1,7 @@
 """
 Procedural Memory (v4) — holographic modulation slots.
 
-Per-block (B_blocks instances, batched as BS,B dim). Operates in D_mem space.
+Per-block (B_blocks instances, batched as BS,B dim). Operates in D_col space.
 Read: holographic modulation. Write: neuromodulated EMA commit.
 """
 
@@ -18,16 +18,16 @@ class ProceduralMemory(nn.Module, StateMixin):
     """Holographic procedural memory with eligibility-based commit.
 
     State:
-        pm_K: [BS, B, r, D_mem] — key bank (unit-normalized)
-        pm_V: [BS, B, r, D_mem] — value bank (modulation patterns)
+        pm_K: [BS, B, r, D_col] — key bank (unit-normalized)
+        pm_V: [BS, B, r, D_col] — value bank (modulation patterns)
         pm_a: [BS, B, r] — slot strengths (bounded)
     """
 
     _state_tensor_names = ["pm_K", "pm_V", "pm_a"]
 
-    def __init__(self, D_mem: int, r_slots: int, config: ModelConfig):
+    def __init__(self, dim: int, r_slots: int, config: ModelConfig):
         super().__init__()
-        self.D_mem = D_mem
+        self.dim = dim
         self.r = r_slots
         self.B = config.B_blocks
         self.a_max = config.a_max
@@ -42,25 +42,25 @@ class ProceduralMemory(nn.Module, StateMixin):
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
         """Pre-allocate state tensors."""
-        self.pm_K = torch.zeros(BS, self.B, self.r, self.D_mem, device=device, dtype=dtype)
-        self.pm_V = torch.zeros(BS, self.B, self.r, self.D_mem, device=device, dtype=dtype)
+        self.pm_K = torch.zeros(BS, self.B, self.r, self.dim, device=device, dtype=dtype)
+        self.pm_V = torch.zeros(BS, self.B, self.r, self.dim, device=device, dtype=dtype)
         self.pm_a = torch.zeros(BS, self.B, self.r, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.pm_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Holographic read. q: [BS, N, B, C, D_mem] -> [BS, N, B, C, D_mem].
+        """Holographic read. q: [BS, N, B, C, D_col] -> [BS, N, B, C, D_col].
 
         scores = normalize(q) @ pm_K.T
         weighted = scores * pm_a
         modulation = einsum(weighted, pm_V)
         y = q * modulation  (holographic)
         """
-        # q: [BS, N, B, C, D_mem], pm_K: [BS, B, r, D_mem]
+        # q: [BS, N, B, C, D_col], pm_K: [BS, B, r, D_col]
         q_norm = unit_normalize(q)
 
-        # scores: contract over D_mem, broadcast over N,C
+        # scores: contract over D_col, broadcast over N,C
         scores = torch.einsum("snbcd, sbrd -> snbcr", q_norm, self.pm_K)
 
         # Weight by slot strength: pm_a [BS, B, r] -> broadcast [BS, 1, B, 1, r]
@@ -76,7 +76,7 @@ class ProceduralMemory(nn.Module, StateMixin):
                g: Tensor, slot_logits: Tensor, tau: Tensor):
         """EMA commit of aggregated eligibility.
 
-        elig_K, elig_V: [BS, B, r, D_mem] — aggregated across N*C
+        elig_K, elig_V: [BS, B, r, D_col] — aggregated across N*C
         g: [BS, B] — write strength
         slot_logits: [BS, B, r] — slot selection bias
         tau: [BS, B] — softmax temperature
@@ -140,7 +140,7 @@ class PMNeuromodulator(nn.Module):
             n_content = config.content_proj_dim
             n_features = n_scalar + n_content
 
-            self.content_proj = nn.Linear(config.D_mem, n_content)
+            self.content_proj = nn.Linear(config.D_col, n_content)
             self.backbone = nn.Sequential(
                 nn.Linear(n_features, H),
                 nn.ReLU(),
@@ -158,7 +158,7 @@ class PMNeuromodulator(nn.Module):
         """
         elig_summary: [BSB] — eligibility magnitude (flattened BS*B)
         pm_usage: [BSB] — sum(pm_a)
-        content_emb: [BSB, D_mem] — mean eligibility key (optional)
+        content_emb: [BSB, D_col] — mean eligibility key (optional)
         """
         if not self.pm_enabled:
             BS = elig_summary.shape[0]

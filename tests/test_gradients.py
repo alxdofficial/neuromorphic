@@ -115,9 +115,9 @@ class TestGradientFlow:
 
         total_loss.backward()
 
-        # PM projection weights should get gradient
+        # PM post-processing weights should get gradient
         col = model.columns
-        assert col.W_pm_up.weight.grad is not None
+        assert col.W_post_fused.weight.grad is not None
 
     def test_gradient_through_em_read(self):
         """EM read should be differentiable."""
@@ -139,7 +139,7 @@ class TestGradientFlow:
         total_loss.backward()
 
         col = model.columns
-        assert col.W_em_up.weight.grad is not None
+        assert col.W_post_fused.weight.grad is not None
 
     def test_lambda_logit_gradient(self):
         """Damped mixing parameter should get gradient."""

@@ -148,7 +148,7 @@ class MetricsCollector:
     def _collect_pm_stats(self, record: dict):
         """Read PM state tensors and compute summary stats.
 
-        v4: single PM with state [BS*B, r, D_mem].
+        v4: single PM with state [BS*B, r, D_col].
         """
         if not self.config.pm_enabled:
             return

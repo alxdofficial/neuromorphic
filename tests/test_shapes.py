@@ -77,25 +77,25 @@ class TestProceduralMemory:
     def test_read_shape(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
-        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_col)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
-        q = torch.randn(BS, 4, B, cfg.C, cfg.D_mem)  # [BS, N, B, C, D_mem]
+        q = torch.randn(BS, 4, B, cfg.C, cfg.D_col)  # [BS, N, B, C, D_col]
         y = pm.read(q)
         assert y.shape == q.shape
 
     def test_commit(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
-        elig_K = torch.randn(BS, B, cfg.r, cfg.D_mem)
-        elig_V = torch.randn(BS, B, cfg.r, cfg.D_mem)
+        elig_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        elig_V = torch.randn(BS, B, cfg.r, cfg.D_col)
         g = torch.full((BS, B), 0.5)
         slot_logits = torch.randn(BS, B, cfg.r)
         tau = torch.ones(BS, B)
@@ -107,28 +107,28 @@ class TestProceduralMemory:
 
 class TestEpisodicMemory:
     def test_read_shape(self):
-        """EM read with 5D input [BS, N, B, C, D_mem]."""
+        """EM read with 5D input [BS, N, B, C, D_col]."""
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_mem)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_col)
         em.em_S = torch.ones(BS, B, cfg.M)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
         y = em.read(q)
         assert y.shape == q.shape
 
     def test_novelty_score_shape(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
         surprise = torch.rand(BS, N, B, cfg.C)
         w_nov = torch.rand(BS, N, B, cfg.C)
 
@@ -138,17 +138,17 @@ class TestEpisodicMemory:
     def test_select_top_candidates(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
-        v = torch.randn(BS, N, B, cfg.C, cfg.D_mem)
+        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
+        v = torch.randn(BS, N, B, cfg.C, cfg.D_col)
         novelty = torch.rand(BS, N, B, cfg.C)
 
         cand_K, cand_V, cand_scores = em.select_top_candidates(q, v, novelty, cfg.C_em)
-        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D_mem)
-        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D_mem)
+        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D_col)
+        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D_col)
         assert cand_scores.shape == (BS, B, cfg.C_em)
 
 
@@ -158,8 +158,8 @@ class TestColumnGroup:
         G = cfg.B_blocks * cfg.C
         B = cfg.B_blocks
         col = CorticalColumnGroup(cfg)
-        pm = ProceduralMemory(cfg.D_mem, cfg.r, cfg)
-        em = EpisodicMemory(cfg.D_mem, cfg.M, cfg)
+        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
+        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
@@ -172,11 +172,11 @@ class TestColumnGroup:
         assert surprise.shape == (BS, cfg.N, G)
 
         k_cand, v_cand, gate = elig_info
-        assert k_cand.shape == (BS, cfg.N, B, cfg.C, cfg.D_mem)
+        assert k_cand.shape == (BS, cfg.N, B, cfg.C, cfg.D_col)
         assert gate.shape == (BS, cfg.N, B, cfg.C)
 
         q_nov, v_nov, w_nov, surp = nov_info
-        assert q_nov.shape == (BS, cfg.N, B, cfg.C, cfg.D_mem)
+        assert q_nov.shape == (BS, cfg.N, B, cfg.C, cfg.D_col)
         assert w_nov.shape == (BS, cfg.N, B, cfg.C)
 
 

@@ -4,6 +4,7 @@ from .tokenizer import (
     get_tokenizer,
     get_special_token_ids,
     tokenize_document,
+    add_fitb_tokens,
     TOKENIZER_PRESETS,
     DEFAULT_TOKENIZER,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "get_tokenizer",
     "get_special_token_ids",
     "tokenize_document",
+    "add_fitb_tokens",
     "TOKENIZER_PRESETS",
     "DEFAULT_TOKENIZER",
     # Streaming

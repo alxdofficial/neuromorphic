@@ -113,3 +113,23 @@ class TestTrainChunk:
         metrics = trainer.train_chunk(batch)
         assert metrics["loss"] > 0
         assert trainer.override_prev_token is None  # consumed
+
+
+class TestFITBTrainChunk:
+    """FITB path through TBPTTTrainer."""
+
+    def test_fitb_forward_backward(self):
+        cfg = make_tiny_config(vocab_size=VOCAB, mask_rate=0.3, fitb_id=63, null_id=62)
+        trainer = _make_trainer(config=cfg)
+        batch = _make_batch(cfg)
+        metrics = trainer.train_chunk(batch)
+        assert metrics["loss"] > 0
+        assert metrics["valid_tokens"] > 0
+
+    def test_fitb_gradient_update(self):
+        cfg = make_tiny_config(vocab_size=VOCAB, mask_rate=0.3, fitb_id=63, null_id=62)
+        trainer = _make_trainer(config=cfg)
+        batch = _make_batch(cfg)
+        p_before = trainer.model.embedding.weight.data.clone()
+        trainer.train_chunk(batch)
+        assert not torch.allclose(p_before, trainer.model.embedding.weight.data)
