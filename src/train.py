@@ -685,6 +685,7 @@ def run_phase(
                     print("  Scheduler state incompatible; reinitializing.")
             else:
                 print("  Fresh LR scheduler for new phase.")
+        runtime_state_loaded = False
         if "runtime_state" in ckpt:
             # Initialize state tensors so load_state_runtime can shape-check.
             model.initialize_states(bs, device)
@@ -692,9 +693,11 @@ def run_phase(
             if phase_changed:
                 print("  Phase transition: loading compatible runtime state (shape-safe).")
             load_runtime_state(model, ckpt["runtime_state"])
+            runtime_state_loaded = True
         start_step = ckpt.get("step", 0)
     else:
         start_step = 0
+        runtime_state_loaded = False
 
     # Phase transitions and auto mode always train the full step budget.
     # Only same-phase single-phase resume continues from the checkpoint step.
@@ -774,6 +777,11 @@ def run_phase(
     )
     # Continuous step numbering for JSONL in auto mode
     trainer.global_step = (global_step_offset + start_step) if is_auto else start_step
+
+    # If runtime state was loaded, mark states as initialized so train_chunk()
+    # doesn't reinitialize and wipe the loaded PM/EM state.
+    if runtime_state_loaded:
+        trainer._states_initialized = True
 
     # Restore last prev_token to prevent false doc-boundary reset on resume
     if resume_path and ckpt.get("last_prev_token") is not None:

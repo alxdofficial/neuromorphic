@@ -61,13 +61,16 @@ class EpisodicMemory(nn.Module, StateMixin):
         BS = q.shape[0]
         prefix_shape = q.shape[:-1]  # [BS, N, C]
         D = q.shape[-1]
+        state_dtype = self.em_K.dtype
 
         # Flatten to [BS, N*C, D_mem] for retrieval
         q_flat = q.reshape(BS, -1, D)  # [BS, N*C, D_mem]
         NC = q_flat.shape[1]
 
-        # Scores against all slots
-        scores = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BS, N*C, M]
+        # Scores against all slots (cast q to state dtype for einsum)
+        scores = torch.einsum(
+            "bnd, bmd -> bnm", q_flat.to(state_dtype), self.em_K
+        )  # [BS, N*C, M]
 
         # Mask inactive slots (S == 0)
         active_mask = (self.em_S > 0).unsqueeze(1)  # [BS, 1, M]
@@ -84,13 +87,19 @@ class EpisodicMemory(nn.Module, StateMixin):
         K_top = torch.gather(em_K_expanded, 2, topk_idx_expanded)  # [BS, N*C, k, D]
         V_top = torch.gather(em_V_expanded, 2, topk_idx_expanded)
 
-        # Cross-attention
+        # Cross-attention (W_q_cross is fp32, so feed it q_flat in original dtype)
         q_cross = self.W_q_cross(q_flat)  # [BS, N*C, D_mem]
-        attn_logits = torch.einsum("bnd, bnkd -> bnk", q_cross, K_top)  # [BS, N*C, k]
+        # K_top is in state dtype; cast q_cross for einsum, then cast back
+        attn_logits = torch.einsum(
+            "bnd, bnkd -> bnk", q_cross.to(state_dtype), K_top
+        )  # [BS, N*C, k]
         attn_logits = attn_logits + topk_scores  # add retrieval score as bias
-        attn_weights = F.softmax(attn_logits, dim=-1)  # [BS, N*C, k]
-        out = torch.einsum("bnk, bnkd -> bnd", attn_weights, V_top)  # [BS, N*C, D_mem]
-        out = self.W_o_cross(out)
+        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [BS, N*C, k]
+        out = torch.einsum(
+            "bnk, bnkd -> bnd", attn_weights.to(state_dtype), V_top
+        )  # [BS, N*C, D_mem]
+        # W_o_cross is fp32, cast out back to q's dtype
+        out = self.W_o_cross(out.to(q.dtype))
 
         # Reshape back to prefix shape
         return out.reshape(*prefix_shape, D)
@@ -103,7 +112,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         BS = q_nov.shape[0]
         prefix_shape = q_nov.shape[:-1]
-        q_flat = q_nov.reshape(BS, -1, self.D_mem)  # [BS, N*C, D_mem]
+        q_flat = q_nov.reshape(BS, -1, self.D_mem).to(self.em_K.dtype)
 
         # Max cosine similarity against em_K
         if self.em_S is not None and (self.em_S > 0).any():
@@ -158,9 +167,10 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Score candidates against all slots for slot selection
         cand_K_norm = unit_normalize(cand_K)
+        # Cast to state dtype for einsum (state may be bf16 on CUDA)
         slot_scores = torch.einsum(
-            "bcd, bmd -> bcm", cand_K_norm, self.em_K
-        )  # [BS, C_cand, M]
+            "bcd, bmd -> bcm", cand_K_norm.to(self.em_K.dtype), self.em_K
+        ).to(cand_K.dtype)  # [BS, C_cand, M]
 
         # Weakness bias: prefer weaker slots
         weakness = -self.em_S.unsqueeze(1)  # [BS, 1, M]

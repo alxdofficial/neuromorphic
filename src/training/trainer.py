@@ -167,7 +167,9 @@ class TBPTTTrainer:
                     f"segment [{seg_start}, {seg_end})."
                 )
 
-            chunk_loss = chunk_loss + ce_loss + aux_loss
+            # aux_loss is mean-reduced (per-token), ce_loss is sum-reduced.
+            # Scale aux to sum-reduction so both are divided by valid_count equally.
+            chunk_loss = chunk_loss + ce_loss + aux_loss * seg_valid
             valid_count = valid_count + seg_valid
             seg_count += 1
 

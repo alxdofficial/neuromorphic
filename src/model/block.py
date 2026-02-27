@@ -51,8 +51,9 @@ class ColumnBlock(nn.Module):
             # Route eligibility to PM slots
             k_norm = unit_normalize(k_cand)
             # pm_K: [BS, r, D_mem], k_norm: [BS, N, C, D_mem]
+            # Cast to state dtype for einsum compatibility (state may be bf16)
             route_scores = torch.einsum(
-                "bncd, brd -> bncr", k_norm, self.pm.pm_K
+                "bncd, brd -> bncr", k_norm.to(self.pm.pm_K.dtype), self.pm.pm_K
             )  # [BS, N, C, r]
             route_w = torch.softmax(
                 route_scores / self.config.tau_route_pm, dim=-1

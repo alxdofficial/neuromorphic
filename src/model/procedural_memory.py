@@ -57,6 +57,9 @@ class ProceduralMemory(nn.Module, StateMixin):
         y = q * modulation  (holographic)
         """
         # q: [BS, N, C, D_mem], pm_K: [BS, r, D_mem]
+        # Cast q to state dtype (state may be bf16 on CUDA while q is fp32 outside autocast)
+        orig_dtype = q.dtype
+        q = q.to(self.pm_K.dtype)
         q_norm = unit_normalize(q)
 
         # Expand pm_K for batch matmul: [BS, r, D_mem] -> broadcast over N,C
@@ -73,7 +76,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         modulation = torch.einsum("...r, brd -> ...d", weighted, self.pm_V)  # [BS,N,C,D_mem]
 
         # Holographic: element-wise multiply
-        return q * modulation
+        return (q * modulation).to(orig_dtype)
 
     def commit(self, elig_K: Tensor, elig_V: Tensor,
                g: Tensor, slot_logits: Tensor, tau: Tensor):
@@ -128,6 +131,7 @@ class PMNeuromodulator(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.pm_enabled = config.pm_enabled
+        self.n_slots = config.r
         self.default_g = config.g_pm_default
         self.tau_floor = config.tau_pm_floor
         self.tau_ceil = config.tau_pm_ceil
@@ -164,7 +168,7 @@ class PMNeuromodulator(nn.Module):
             device = elig_summary.device
             return (
                 torch.full((BS,), self.default_g, device=device),
-                torch.zeros(BS, 8, device=device),  # slot_logits
+                torch.zeros(BS, self.n_slots, device=device),  # slot_logits
                 torch.full((BS,), self.default_tau, device=device),
             )
 
