@@ -57,9 +57,6 @@ class ProceduralMemory(nn.Module, StateMixin):
         y = q * modulation  (holographic)
         """
         # q: [BS, N, C, D_mem], pm_K: [BS, r, D_mem]
-        # Cast q to state dtype (state may be bf16 on CUDA while q is fp32 outside autocast)
-        orig_dtype = q.dtype
-        q = q.to(self.pm_K.dtype)
         q_norm = unit_normalize(q)
 
         # Expand pm_K for batch matmul: [BS, r, D_mem] -> broadcast over N,C
@@ -76,7 +73,7 @@ class ProceduralMemory(nn.Module, StateMixin):
         modulation = torch.einsum("...r, brd -> ...d", weighted, self.pm_V)  # [BS,N,C,D_mem]
 
         # Holographic: element-wise multiply
-        return (q * modulation).to(orig_dtype)
+        return q * modulation
 
     def commit(self, elig_K: Tensor, elig_V: Tensor,
                g: Tensor, slot_logits: Tensor, tau: Tensor):
@@ -115,10 +112,10 @@ class ProceduralMemory(nn.Module, StateMixin):
         if self.pm_K is None:
             return
         expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
-        self.pm_K = self.pm_K * (~expanded).to(self.pm_K.dtype)
-        self.pm_V = self.pm_V * (~expanded).to(self.pm_V.dtype)
+        self.pm_K = self.pm_K * ~expanded
+        self.pm_V = self.pm_V * ~expanded
         expanded_a = mask.unsqueeze(-1)  # [BS, 1]
-        self.pm_a = self.pm_a * (~expanded_a).to(self.pm_a.dtype)
+        self.pm_a = self.pm_a * ~expanded_a
 
 
 class PMNeuromodulator(nn.Module):

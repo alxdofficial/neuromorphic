@@ -592,6 +592,8 @@ def run_phase(
 
     # Model
     model = NeuromorphicLM(config).to(device)
+    if device.type == "cuda":
+        model = model.to(torch.bfloat16)
     param_count = model.param_count()
     print(f"Parameters: {param_count:,} ({param_count / 1e6:.1f}M)")
 

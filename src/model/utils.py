@@ -86,7 +86,7 @@ class StateMixin:
                 expanded = mask
                 for _ in range(t.dim() - 1):
                     expanded = expanded.unsqueeze(-1)
-                setattr(self, name, t * (~expanded).to(t.dtype))
+                setattr(self, name, t * ~expanded)
 
     def state_dict_runtime(self) -> Dict[str, Optional[Tensor]]:
         """Serialize runtime state for checkpointing."""

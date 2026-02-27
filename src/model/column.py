@@ -122,7 +122,7 @@ class CorticalColumnGroup(nn.Module):
         Returns: x_out, z, z_hat, surprise, elig_info, novelty_info
         """
         # 1. PM read (holographic, in D_mem space)
-        if self.config.pm_enabled and pm_state.is_initialized():
+        if self.config.pm_enabled:
             q_pm = self.W_pm_up(x_col)                     # [BS,N,G,D_mem]
             q_pm_b = self._to_mem_space(q_pm)               # [BS*B,N*C,D_mem]
             y_pm_b = pm_state.read(q_pm_b)                  # [BS*B,N*C,D_mem]
@@ -130,7 +130,7 @@ class CorticalColumnGroup(nn.Module):
             x_col = x_col + self.W_pm_down(y_pm)            # residual
 
         # 2. EM read (top-k retrieval)
-        if self.config.em_enabled and em_state.is_initialized():
+        if self.config.em_enabled:
             q_em = self.W_em_up(x_col)                      # [BS,N,G,D_mem]
             q_em_b = self._to_mem_space(q_em)                # [BS*B,N*C,D_mem]
             y_em_b = em_state.read(q_em_b)                   # [BS*B,N*C,D_mem]

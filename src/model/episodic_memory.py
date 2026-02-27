@@ -58,9 +58,13 @@ class EpisodicMemory(nn.Module, StateMixin):
         return self.em_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Top-k retrieval + cross-attention.
+        """Top-k retrieval + cross-attention (gather-free).
 
         q: [BS*B, N*C, D_mem] -> [BS*B, N*C, D_mem]
+
+        Uses masked dense attention against all M slots instead of
+        topk+gather. Softmax masking ensures only top-k contribute.
+        Eliminates expensive GatherBackward and ExpandBackward in backward.
 
         Cross-attention projections are per-block (GroupedLinear(B, ...)),
         so we reshape to [BS, NC, B, D] for those ops, then back to [BS*B, NC, D].
@@ -68,51 +72,47 @@ class EpisodicMemory(nn.Module, StateMixin):
         BSB = q.shape[0]
         prefix_shape = q.shape[:-1]  # [BS*B, N*C]
         D = q.shape[-1]
-        state_dtype = self.em_K.dtype
         BS = BSB // self.B
 
         # Flatten to [BSB, NC, D_mem] for retrieval
         q_flat = q.reshape(BSB, -1, D)  # [BSB, NC, D_mem]
         NC = q_flat.shape[1]
 
-        # Scores against all slots (cast q to state dtype for einsum)
+        # Dense retrieval scores against all M slots
         scores = torch.einsum(
-            "bnd, bmd -> bnm", q_flat.to(state_dtype), self.em_K
+            "bnd, bmd -> bnm", q_flat, self.em_K
         )  # [BSB, NC, M]
 
         # Mask inactive slots (S == 0)
         active_mask = (self.em_S > 0).unsqueeze(1)  # [BSB, 1, M]
         scores = scores.masked_fill(~active_mask, -1e9)
 
-        # Top-k retrieval
+        # Top-k mask (no gather — just mask non-topk to -inf)
         k = min(self.k_ret, self.M)
-        topk_scores, topk_idx = scores.topk(k, dim=-1)  # [BSB, NC, k]
-
-        # Gather top-k keys and values
-        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [BSB, NC, k, D]
-        em_K_expanded = self.em_K.unsqueeze(1).expand(-1, NC, -1, -1)  # [BSB, NC, M, D]
-        em_V_expanded = self.em_V.unsqueeze(1).expand(-1, NC, -1, -1)
-        K_top = torch.gather(em_K_expanded, 2, topk_idx_expanded)  # [BSB, NC, k, D]
-        V_top = torch.gather(em_V_expanded, 2, topk_idx_expanded)
+        topk_vals, _ = scores.topk(k, dim=-1)  # [BSB, NC, k]
+        threshold = topk_vals[..., -1:].detach()  # [BSB, NC, 1]
+        topk_mask = scores >= threshold  # [BSB, NC, M]
 
         # Cross-attention with per-block GroupedLinear projections
-        # Reshape: [BSB, NC, D] -> [BS, B, NC, D] -> [BS, NC, B, D]
         q_grouped = q_flat.view(BS, self.B, NC, D).permute(0, 2, 1, 3)
         q_cross = self.W_q_cross(q_grouped)  # [BS, NC, B, D]
         q_cross = q_cross.permute(0, 2, 1, 3).reshape(BSB, NC, D)  # [BSB, NC, D]
 
-        # K_top is in state dtype; cast q_cross for einsum, then cast back
+        # Dense cross-attention logits against all M slots, masked to top-k
         attn_logits = torch.einsum(
-            "bnd, bnkd -> bnk", q_cross.to(state_dtype), K_top
-        )  # [BSB, NC, k]
-        attn_logits = attn_logits + topk_scores  # add retrieval score as bias
-        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [BSB, NC, k]
+            "bnd, bmd -> bnm", q_cross, self.em_K
+        )  # [BSB, NC, M]
+        attn_logits = attn_logits + scores
+        attn_logits = attn_logits.masked_fill(~topk_mask, -1e9)
+        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [BSB, NC, M]
+
+        # Weighted sum from all slots (only top-k have nonzero weight)
         out = torch.einsum(
-            "bnk, bnkd -> bnd", attn_weights.to(state_dtype), V_top
+            "bnm, bmd -> bnd", attn_weights, self.em_V
         )  # [BSB, NC, D_mem]
 
         # Output projection with per-block GroupedLinear
-        out_grouped = out.to(q.dtype).view(BS, self.B, NC, D).permute(0, 2, 1, 3)
+        out_grouped = out.view(BS, self.B, NC, D).permute(0, 2, 1, 3)
         out = self.W_o_cross(out_grouped)  # [BS, NC, B, D]
         out = out.permute(0, 2, 1, 3).reshape(BSB, NC, D)  # [BSB, NC, D]
 
@@ -127,17 +127,14 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         BSB = q_nov.shape[0]
         prefix_shape = q_nov.shape[:-1]
-        q_flat = q_nov.reshape(BSB, -1, self.D_mem).to(self.em_K.dtype)
+        q_flat = q_nov.reshape(BSB, -1, self.D_mem)
 
-        # Max cosine similarity against em_K
-        if self.em_S is not None and (self.em_S > 0).any():
-            sim = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BSB, NC, M]
-            active_mask = (self.em_S > 0).unsqueeze(1)
-            sim = sim.masked_fill(~active_mask, -1.0)
-            max_sim = sim.max(dim=-1).values  # [BSB, NC]
-            max_sim = max_sim.reshape(*prefix_shape)
-        else:
-            max_sim = torch.zeros(prefix_shape, device=q_nov.device, dtype=q_nov.dtype)
+        # Max cosine similarity against em_K (no branch — masking handles empty memory)
+        sim = torch.einsum("bnd, bmd -> bnm", q_flat, self.em_K)  # [BSB, NC, M]
+        active_mask = (self.em_S > 0).unsqueeze(1)  # [BSB, 1, M]
+        sim = sim.masked_fill(~active_mask, -1.0)
+        max_sim = sim.max(dim=-1).values.clamp(min=0.0)  # [BSB, NC]
+        max_sim = max_sim.reshape(*prefix_shape)
 
         novelty = w_nov * surprise + (1 - w_nov) * (1 - max_sim)
         return novelty
@@ -182,10 +179,9 @@ class EpisodicMemory(nn.Module, StateMixin):
 
         # Score candidates against all slots for slot selection
         cand_K_norm = unit_normalize(cand_K)
-        # Cast to state dtype for einsum (state may be bf16 on CUDA)
         slot_scores = torch.einsum(
-            "bcd, bmd -> bcm", cand_K_norm.to(self.em_K.dtype), self.em_K
-        ).to(cand_K.dtype)  # [BSB, C_cand, M]
+            "bcd, bmd -> bcm", cand_K_norm, self.em_K
+        )  # [BSB, C_cand, M]
 
         # Weakness bias: prefer weaker slots
         weakness = -self.em_S.unsqueeze(1)  # [BSB, 1, M]
@@ -245,8 +241,8 @@ class EpisodicMemory(nn.Module, StateMixin):
         if self.em_S is None:
             return
         expanded = mask.unsqueeze(-1)  # [BSB, 1]
-        self.em_S = self.em_S * (~expanded).to(self.em_S.dtype)
-        self.em_age = self.em_age * (~expanded).to(self.em_age.dtype)
+        self.em_S = self.em_S * ~expanded
+        self.em_age = self.em_age * ~expanded
 
 
 class EMNeuromodulator(nn.Module):

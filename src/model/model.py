@@ -71,7 +71,7 @@ class NeuromorphicLM(nn.Module):
 
         Returns: (logits [BS, N, vocab], aux_loss scalar)
         """
-        if reset_mask is not None and reset_mask.any():
+        if reset_mask is not None:
             self._reset_memory(reset_mask)
 
         BS, N = input_ids.shape
@@ -138,10 +138,10 @@ class NeuromorphicLM(nn.Module):
         v_cand_m = self.columns._to_mem_space(v_cand)    # [BSB, N*C, D_mem]
         gate_m = self.columns._to_mem_space(gate)         # [BSB, N*C]
 
-        if self.config.pm_enabled and self.pm.is_initialized():
+        if self.config.pm_enabled:
             k_norm = unit_normalize(k_cand_m)
             route_scores = torch.einsum(
-                "bnd, brd -> bnr", k_norm.to(self.pm.pm_K.dtype), self.pm.pm_K
+                "bnd, brd -> bnr", k_norm, self.pm.pm_K
             )  # [BSB, N*C, r]
             route_w = torch.softmax(
                 route_scores / self.config.tau_route_pm, dim=-1
@@ -163,7 +163,7 @@ class NeuromorphicLM(nn.Module):
         w_nov_m = self.columns._to_mem_space(w_nov)       # [BSB, N*C]
         surp_m = self.columns._to_mem_space(surp)          # [BSB, N*C]
 
-        if self.config.em_enabled and self.em.is_initialized():
+        if self.config.em_enabled:
             novelty = self.em.score_novelty(q_nov_m, surp_m, w_nov_m)
             em_cands = self.em.select_top_candidates(
                 q_nov_m, v_nov_m, novelty, self.config.C_em
@@ -176,7 +176,7 @@ class NeuromorphicLM(nn.Module):
             )
 
         # --- PM commit ---
-        if self.config.pm_enabled and self.pm.is_initialized():
+        if self.config.pm_enabled:
             self.pm.base_decay()
             elig_summary = elig_K.norm(dim=-1).mean(dim=-1)  # [BSB]
             pm_usage = self.pm.pm_a.sum(dim=-1)              # [BSB]
@@ -188,7 +188,7 @@ class NeuromorphicLM(nn.Module):
 
         # --- EM write ---
         cand_K, cand_V, cand_scores = em_cands
-        if self.config.em_enabled and self.em.is_initialized():
+        if self.config.em_enabled:
             em_usage = self.em.em_S.sum(dim=-1)              # [BSB]
             novelty_mean = cand_scores.mean(dim=-1)          # [BSB]
             content_emb = cand_K.mean(dim=1)                 # [BSB, D_mem]
