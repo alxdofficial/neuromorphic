@@ -46,7 +46,7 @@ def budget_enforce(strengths: Tensor, budget: float) -> Tensor:
         strengths: [BS, N] scaled so sum <= budget
     """
     total = strengths.sum(dim=-1, keepdim=True)  # [BS, 1]
-    scale = torch.where(total > budget, budget / (total + 1e-8), torch.ones_like(total))
+    scale = (budget / (total + 1e-8)).clamp(max=1.0)
     return strengths * scale
 
 
@@ -71,7 +71,7 @@ class StateMixin:
         for name in self._state_tensor_names:
             t = getattr(self, name, None)
             if t is not None and isinstance(t, Tensor):
-                setattr(self, name, t.detach())
+                t.detach_()
 
     def reset_states(self, mask: Tensor):
         """Zero out runtime state for masked streams.

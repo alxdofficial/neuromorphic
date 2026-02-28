@@ -2,13 +2,14 @@
 NeuromorphicLM (v4) — iterative refinement with cortical columns.
 
 Processes N-token segments through R iterative passes.  All B_blocks * C
-columns process all N tokens in parallel via a single CorticalColumnGroup
+columns process N_C = N//C tokens each via a single CorticalColumnGroup
 with G = B*C groups.  PM/EM state has explicit B dim: [BS, B, ...].
 No Python loop over blocks — only a loop over R refinement passes.
 
-Fan-out: MHA-style free reshape (broadcast D to B blocks, split into C cols).
-Fan-in: mean across blocks + learned D→D projection.
-PM/EM operate at block level in D space (C columns concatenated).
+Fan-out: interleaved token partitioning — column c gets tokens c, c+C, c+2C, ...
+         with feature slice c*D_col:(c+1)*D_col.
+Fan-in: mean across blocks + skip connection with zero-init D_col→D projection.
+PM/EM reads use per-column D_col slices; writes stay at block level D.
 """
 
 import torch
@@ -63,8 +64,14 @@ class NeuromorphicLM(nn.Module):
         self.pm_neuromod = PMNeuromodulator(config.D, config)
         self.em_neuromod = EMNeuromodulator(config.D, config)
 
-        # Fan-in: mean across blocks + D -> D projection
-        self.fan_in = nn.Linear(D, D)
+        # Fan-in: mean across blocks + D_col -> D skip-connection projection
+        # Small-scale init (not zero): gradient must flow through fan_in to column
+        # processing. Zero-init would kill all upstream gradients since
+        # d(loss)/d(x_flat) = W.T @ d(loss)/d(output) = 0 when W = 0.
+        D_col = config.D_col
+        self.fan_in = nn.Linear(D_col, D)
+        nn.init.normal_(self.fan_in.weight, std=0.02)
+        nn.init.zeros_(self.fan_in.bias)
         self.ln_final = nn.LayerNorm(D)
 
         # LM head (optionally tied to embedding)
@@ -78,24 +85,48 @@ class NeuromorphicLM(nn.Module):
         self.lambda_logit = nn.Parameter(torch.tensor(float(init_logit)))
 
     def _to_cols(self, x: Tensor) -> Tensor:
-        """[BS, N, D] -> [BS, N, G, D_col] via broadcast+split (free)."""
+        """[BS, N, D] -> [BS, N_C, G, D_col] via interleaved token partitioning.
+
+        Column c gets tokens c, c+C, c+2C, ... with feature slice c*D_col:(c+1)*D_col.
+        Implemented via diagonal extraction: view [BS, N_C, C, C, D_col] then take
+        diagonal(dim1=2, dim2=3) to select matching token-position/feature-slice pairs.
+        """
         BS, N, D = x.shape
         B, C, D_col = self.config.B_blocks, self.config.C, self.config.D_col
-        # Split D into C columns of D_col, broadcast across B blocks
-        return x.view(BS, N, 1, C, D_col).expand(-1, -1, B, -1, -1).reshape(BS, N, self.B_C, D_col)
+        N_C = N // C
+        # [BS, N_C, tok_group=C, feat_slice=C, D_col]
+        x = x.view(BS, N_C, C, C, D_col)
+        # diagonal selects elements where tok_group == feat_slice -> [BS, N_C, D_col, C]
+        x_diag = torch.diagonal(x, dim1=2, dim2=3)
+        # [BS, N_C, C, D_col] — column c has tokens c,c+C,... with feature slice c
+        x_part = x_diag.permute(0, 1, 3, 2).contiguous()
+        # Replicate across B blocks: [BS, N_C, 1, C, D_col] -> [BS, N_C, B, C, D_col] -> [BS, N_C, G, D_col]
+        return x_part.unsqueeze(2).expand(-1, -1, B, -1, -1).reshape(BS, N_C, B * C, D_col)
 
-    def _from_cols(self, x_cols: Tensor) -> Tensor:
-        """[BS, N, G, D_col] -> [BS, N, D] via mean over blocks + learned projection."""
-        BS, N = x_cols.shape[:2]
+    def _from_cols(self, x_cols: Tensor, x_input: Tensor) -> Tensor:
+        """[BS, N_C, G, D_col] -> [BS, N, D] via mean over blocks + skip connection.
+
+        x_cols: column outputs [BS, N_C, G, D_col]
+        x_input: D-space skip connection [BS, N, D]
+
+        Mean across B blocks -> [BS, N_C, C, D_col], reshape restores original token
+        order (N_C*C = N), then D_col->D projection + skip connection.
+        At init fan_in is small-scale, so output ≈ x_input.
+        """
+        BS = x_cols.shape[0]
+        N_C = x_cols.shape[1]
         B, C, D_col = self.config.B_blocks, self.config.C, self.config.D_col
-        # Reshape to [BS, N, B, C, D_col] -> concat cols [BS, N, B, D] -> mean -> D->D
-        x_blocks = x_cols.view(BS, N, B, C, D_col).reshape(BS, N, B, -1)  # [BS, N, B, D]
-        x = x_blocks.mean(dim=2)  # [BS, N, D]
-        return self.fan_in(x)
+        N = N_C * C
+        # [BS, N_C, B, C, D_col] -> mean across blocks -> [BS, N_C, C, D_col]
+        x_mean = x_cols.view(BS, N_C, B, C, D_col).mean(dim=2)
+        # Reshape restores original token order: (N_C, C) -> N
+        x_flat = x_mean.reshape(BS, N, D_col)
+        return x_input + self.fan_in(x_flat)
 
     def forward_segment(
         self, input_ids: Tensor, reset_mask: Tensor | None = None,
         fitb_mask: Tensor | None = None, target_ids: Tensor | None = None,
+        _override_R: int | None = None,
     ):
         """Process N tokens through R refinement passes.
 
@@ -121,8 +152,9 @@ class NeuromorphicLM(nn.Module):
 
         is_fitb = fitb_mask is not None
         inline_loss = is_fitb and target_ids is not None
+        R_passes = _override_R if _override_R is not None else self.config.R
 
-        # Initial embedding
+        # Initial embedding (D-space, full N tokens)
         sequence = input_ids  # may have <FITB> at masked positions
         original_ids = input_ids
         x = self.embedding(sequence)  # [BS, N, D_embed]
@@ -131,8 +163,11 @@ class NeuromorphicLM(nn.Module):
         positions = torch.arange(N, device=device)
         x = x + self.pos_embedding(positions)
 
-        # Fan-out to column space (free reshape)
-        x_cols = self._to_cols(x)  # [BS, N, G, D_col]
+        # Save D-space representation for skip connection
+        x_input = x
+
+        # Fan-out to column space (interleaved token partitioning)
+        x_cols = self._to_cols(x)  # [BS, N_C, G, D_col]
 
         z_hat_prev = None
         aux_loss = torch.tensor(0.0, device=device)
@@ -143,73 +178,71 @@ class NeuromorphicLM(nn.Module):
             fitb_loss = torch.tensor(0.0, device=device)
             fitb_valid = torch.tensor(0, device=device, dtype=torch.long)
             # Build targets with ignore_index=-100 at non-masked positions
-            static_targets = target_ids.clone()
-            static_targets[~fitb_mask] = -100
-            num_masked = fitb_mask.sum().item()
+            # Use torch.where for compile-friendly static shapes (no boolean indexing)
+            static_targets = torch.where(fitb_mask, target_ids,
+                                         torch.tensor(-100, device=device, dtype=target_ids.dtype))
         elif is_fitb:
             per_pass_logits = []
 
-        for r in range(self.config.R):
+        for r in range(R_passes):
             # FITB: re-embed from updated sequence (r > 0)
             if is_fitb and r > 0:
                 x_fresh = self.embedding(sequence)
                 if self.proj_up is not None:
                     x_fresh = self.proj_up(x_fresh)
                 x_fresh = x_fresh + self.pos_embedding(positions)
+                x_input = x_fresh  # update skip base for re-embedded sequence
                 x_cols_fresh = self._to_cols(x_fresh)
                 x_cols = (1 - lam) * x_out + lam * x_cols_fresh
 
-            # All G columns, all N tokens, one batched call
+            # Single column pass: PCM → PM/EM read → lateral → ffn_pre → cross-block → ffn_post → W_post
             x_out, z, z_hat, surprise, elig_info, nov_info = \
-                self.columns.forward(x_cols, self.pm, self.em, z_hat_prev)
+                self.columns(x_cols, self.pm, self.em, z_hat_prev)
 
             # PCM prediction loss
             if self.config.pcm_enabled and z_hat_prev is not None and z is not None:
                 aux_loss = aux_loss + self.columns.pcm.prediction_loss(z_hat_prev, z) * self.config.pcm_pred_weight
 
-            # PM eligibility routing + commit, EM novelty + write
+            # Single commit per R pass
             self._process_and_commit(elig_info, nov_info, x_out)
 
             if inline_loss:
-                # Static-shape FITB loss: full logits + ignore_index=-100 (Bug 9)
-                if num_masked > 0:
-                    x_out_5d = x_out.view(BS, N, B, C, self.config.D_col)
-                    x_blocks = x_out_5d.reshape(BS, N, B, -1).mean(dim=2)  # [BS, N, D]
-                    x_readout = self.ln_final(self.fan_in(x_blocks))       # [BS, N, D]
-                    if self.proj_down is not None:
-                        x_readout = self.proj_down(x_readout)              # [BS, N, D_embed]
-                    logits_r = self.lm_head(x_readout)                     # [BS, N, vocab]
+                # Static-shape FITB loss via skip-connection readout
+                x_readout = self._from_cols(x_out, x_input)           # [BS, N, D]
+                x_readout = self.ln_final(x_readout)
+                if self.proj_down is not None:
+                    x_readout = self.proj_down(x_readout)              # [BS, N, D_embed]
+                logits_r = self.lm_head(x_readout)                     # [BS, N, vocab]
 
-                    V = logits_r.shape[-1]
-                    loss_r = F.cross_entropy(
-                        logits_r.reshape(-1, V), static_targets.reshape(-1),
-                        ignore_index=-100, reduction='sum',
-                    )
-                    fitb_loss = fitb_loss + loss_r
-                    fitb_valid = fitb_valid + num_masked
+                V = logits_r.shape[-1]
+                loss_r = F.cross_entropy(
+                    logits_r.reshape(-1, V), static_targets.reshape(-1),
+                    ignore_index=-100, reduction='sum',
+                )
+                fitb_loss = fitb_loss + loss_r
+                fitb_valid = fitb_valid + fitb_mask.sum()
 
                 # Re-embed predictions for next pass (static torch.where)
-                if r < self.config.R - 1 and num_masked > 0:
+                if r < R_passes - 1:
                     with torch.no_grad():
                         predicted_ids = logits_r.argmax(dim=-1)  # [BS, N]
                         sequence = torch.where(fitb_mask, predicted_ids, original_ids)
 
             elif is_fitb:
-                # Legacy FITB path (no target_ids): full logits, stored per pass
-                x_out_5d = x_out.view(BS, N, B, C, self.config.D_col)
-                x_blocks = x_out_5d.reshape(BS, N, B, -1).mean(dim=2)  # [BS, N, D]
-                x_readout = self.ln_final(self.fan_in(x_blocks))
+                # Legacy FITB path (no target_ids): full logits via skip-connection
+                x_readout = self._from_cols(x_out, x_input)
+                x_readout = self.ln_final(x_readout)
                 if self.proj_down is not None:
                     x_readout = self.proj_down(x_readout)
                 logits_r = self.lm_head(x_readout)
                 per_pass_logits.append(logits_r)
 
-                if r < self.config.R - 1:
+                if r < R_passes - 1:
                     with torch.no_grad():
                         predicted_ids = logits_r.argmax(dim=-1)
                         sequence = torch.where(fitb_mask, predicted_ids, original_ids)
             else:
-                # NTP path: damped mixing
+                # NTP path: damped mixing (column space)
                 if r > 0:
                     x_cols = (1 - lam) * x_cols + lam * x_out
                 else:
@@ -223,6 +256,8 @@ class NeuromorphicLM(nn.Module):
         if self.config.pm_enabled:
             self.pm.base_decay()
         if self.config.em_enabled:
+            if hasattr(self, '_em_decay_last'):
+                self.em.base_decay(self._em_decay_last)
             self.em.age_tick(N)
 
         if inline_loss:
@@ -230,8 +265,8 @@ class NeuromorphicLM(nn.Module):
         if is_fitb:
             return per_pass_logits, aux_loss
 
-        # NTP path: fan-in + LM head (once)
-        x = self._from_cols(x_cols)     # [BS, N, D]
+        # NTP path: fan-in via skip connection + LM head (once)
+        x = self._from_cols(x_cols, x_input)  # [BS, N, D]
         x = self.ln_final(x)
         if self.proj_down is not None:
             x = self.proj_down(x)       # [BS, N, D_embed]
@@ -246,11 +281,9 @@ class NeuromorphicLM(nn.Module):
     def _process_and_commit(self, elig_info, nov_info, x_out):
         """Route eligibility to PM slots, score EM novelty, then commit/write.
 
-        elig_info: (k_cand, v_cand, gate) — [BS, N, B, C, D_col] or [BS, N, B, C]
+        elig_info: (k_cand, v_cand, gate) — [BS, N_C, B, C, D_col] or [BS, N_C, B, C]
         nov_info: (q_nov, v_nov, w_nov, surprise) — same shapes
-        x_out: [BS, N, G, D_col] (unused directly, info extracted in column)
-
-        Internally concats C columns to block level [BS, N, B, D] for PM/EM ops.
+        x_out: [BS, N_C, G, D_col] (unused directly, info extracted in column)
         """
         k_cand, v_cand, gate = elig_info
         BS, N, B, C, D_col = k_cand.shape
@@ -261,27 +294,26 @@ class NeuromorphicLM(nn.Module):
         v_block = v_cand.reshape(BS, N, B, D)
         gate_block = gate.mean(dim=3)  # [BS, N, B] (average surprise across columns)
 
-        # --- PM eligibility routing (bmm, block level) ---
+        # --- PM eligibility routing (batched matmul, block level) ---
         r = self.config.r
         if self.config.pm_enabled:
             k_norm = unit_normalize(k_block)
-            # route_scores: "snbd, sbrd -> snbr" via bmm
-            kn_flat = k_norm.permute(0, 2, 1, 3).reshape(BS * B, N, D)
-            pmK_flat = self.pm.pm_K.reshape(BS * B, r, D)
-            route_scores = torch.bmm(kn_flat, pmK_flat.transpose(1, 2))  # [BS*B, N, r]
-            route_scores = route_scores.reshape(BS, B, N, r).permute(0, 2, 1, 3)  # [BS, N, B, r]
+            # route_scores via batched matmul (strided views, no copy)
+            k_bn = k_norm.transpose(1, 2)                                       # [BS, B, N, D]
+            route_scores = torch.matmul(k_bn, self.pm.pm_K.transpose(-1, -2))   # [BS, B, N, r]
+            route_scores = route_scores.transpose(1, 2)                          # [BS, N, B, r]
 
             route_w = torch.softmax(
                 route_scores / self.config.tau_route_pm, dim=-1
             )  # [BS, N, B, r]
             gated_routed = gate_block.unsqueeze(-1) * route_w  # [BS, N, B, r]
 
-            # elig_K/V: "snbr, snbd -> sbrd" via bmm (reduction over N)
-            gr_flat = gated_routed.permute(0, 2, 3, 1).reshape(BS * B, r, N)  # [BS*B, r, N]
-            kb_flat = k_block.permute(0, 2, 1, 3).reshape(BS * B, N, D)       # [BS*B, N, D]
-            vb_flat = v_block.permute(0, 2, 1, 3).reshape(BS * B, N, D)       # [BS*B, N, D]
-            elig_K = torch.bmm(gr_flat, kb_flat).reshape(BS, B, r, D)         # [BS, B, r, D]
-            elig_V = torch.bmm(gr_flat, vb_flat).reshape(BS, B, r, D)         # [BS, B, r, D]
+            # elig_K/V via batched matmul (strided views, no copy)
+            gr_bn = gated_routed.permute(0, 2, 3, 1)                            # [BS, B, r, N]
+            k_bn = k_block.transpose(1, 2)                                      # [BS, B, N, D]
+            v_bn = v_block.transpose(1, 2)                                      # [BS, B, N, D]
+            elig_K = torch.matmul(gr_bn, k_bn)                                  # [BS, B, r, D]
+            elig_V = torch.matmul(gr_bn, v_bn)                                  # [BS, B, r, D]
         else:
             elig_K = torch.zeros(
                 BS, B, r, D,
@@ -330,8 +362,9 @@ class NeuromorphicLM(nn.Module):
             ww_pm = ww_pm.reshape(BS, B)
 
             # Bug 2: scale g by eligibility magnitude so pass-0 (surprise=0) barely writes
-            elig_mag = elig_summary / (elig_summary.detach().max().clamp(min=1e-6))  # [BS, B]
-            g = g * elig_mag.detach().clamp(0, 1)
+            # Element-wise normalization avoids global .max() reduction (sync barrier)
+            elig_mag = (elig_summary / (elig_summary.detach() + 1e-6)).clamp(0, 1)  # [BS, B]
+            g = g * elig_mag.detach()
 
             # Bug 3: learned weakness bias on slot_logits (prefer weaker slots)
             weakness_bias = ww_pm.unsqueeze(-1) * self.pm.pm_a.detach()  # [BS, B, r]
@@ -356,9 +389,10 @@ class NeuromorphicLM(nn.Module):
             tau_em = tau_em.reshape(BS, B)
             decay = decay.reshape(BS, B)
             ww_em = ww_em.reshape(BS, B)
-            self.em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay, ww=ww_em)
-            # NOTE: age_tick() is called once per segment (after R loop),
-            # not per pass. See forward_segment().
+            self.em.write(cand_K, cand_V, cand_scores, g_em, tau_em, ww=ww_em)
+            # Stash decay for once-per-segment application (after R loop).
+            # Only the last pass's decay is used — consistent with PM's base_decay().
+            self._em_decay_last = decay
 
     # ------------------------------------------------------------------
     # Embedding resize (for FITB token registration)
@@ -457,6 +491,93 @@ class NeuromorphicLM(nn.Module):
             sequence = torch.cat([sequence, next_id], dim=1)
 
         return sequence
+
+    @torch.no_grad()
+    def generate_segments(self, prompt_ids: Tensor, max_new_tokens: int = 512,
+                          temperature: float = 1.0, top_k: int = 50,
+                          refine_passes: int | None = None) -> Tensor:
+        """Non-autoregressive segment generation via FITB iterative refinement.
+
+        Phase 1: Process prompt through NTP segments to warm PM/EM.
+        Phase 2: Generate N-token chunks with all positions as <FITB>,
+                 R passes refine, sample from last pass's logits.
+
+        prompt_ids: [BS, P] — prompt token ids
+        max_new_tokens: number of tokens to generate (rounded up to multiple of N)
+        temperature: sampling temperature
+        top_k: top-k sampling (0 to disable)
+        refine_passes: override R for generation (None = use config.R)
+
+        Returns: [BS, P + generated_tokens]
+        """
+        if self.config.fitb_id < 0:
+            raise ValueError(
+                "generate_segments requires fitb_id to be set (>= 0). "
+                "Register a <FITB> token in your tokenizer first."
+            )
+
+        N = self.config.N
+        BS = prompt_ids.shape[0]
+        device = prompt_ids.device
+        R = refine_passes if refine_passes is not None else self.config.R
+
+        # Ensure states are initialized
+        if not self.pm.is_initialized() or not self.em.is_initialized():
+            self.initialize_states(BS, device)
+
+        # Phase 1: Process prompt through NTP segments to warm PM/EM
+        P = prompt_ids.shape[1]
+        if P > 0:
+            # Pad prompt to multiple of N
+            pad_len = (N - P % N) % N
+            if pad_len > 0:
+                prompt_padded = F.pad(prompt_ids, (pad_len, 0), value=0)
+            else:
+                prompt_padded = prompt_ids
+
+            n_prompt_segs = prompt_padded.shape[1] // N
+            for seg_idx in range(n_prompt_segs):
+                seg = prompt_padded[:, seg_idx * N : (seg_idx + 1) * N]
+                self.forward_segment(seg)  # NTP path, warms PM/EM
+
+        # Phase 2: Generate N-token chunks via FITB refinement
+        generated = []
+        tokens_remaining = max_new_tokens
+
+        while tokens_remaining > 0:
+            chunk_len = min(N, tokens_remaining)
+            # Start with all <FITB> tokens
+            seg_ids = torch.full((BS, N), self.config.fitb_id,
+                                 device=device, dtype=prompt_ids.dtype)
+            fitb_mask = torch.ones(BS, N, dtype=torch.bool, device=device)
+
+            # If chunk_len < N, only the first chunk_len positions are generated
+            if chunk_len < N:
+                fitb_mask[:, chunk_len:] = False
+                seg_ids[:, chunk_len:] = 0  # padding
+
+            # R refinement passes
+            per_pass_logits, _ = self.forward_segment(
+                seg_ids, fitb_mask=fitb_mask, _override_R=R
+            )
+
+            # Sample from last pass's logits
+            last_logits = per_pass_logits[-1]  # [BS, N, vocab]
+            if temperature != 1.0:
+                last_logits = last_logits / temperature
+            if top_k > 0:
+                topk_vals, _ = last_logits.topk(top_k, dim=-1)
+                last_logits[last_logits < topk_vals[:, :, -1:]] = -float('inf')
+            probs = F.softmax(last_logits, dim=-1)
+            sampled = torch.multinomial(
+                probs.reshape(-1, probs.shape[-1]), 1
+            ).reshape(BS, N)
+
+            generated.append(sampled[:, :chunk_len])
+            tokens_remaining -= chunk_len
+
+        result = torch.cat([prompt_ids] + generated, dim=1)
+        return result
 
     def set_eval_mode(self):
         """Set model to evaluation mode."""

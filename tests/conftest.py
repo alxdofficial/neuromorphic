@@ -19,9 +19,10 @@ from src.model.config import ModelConfig
 # ---------------------------------------------------------------------------
 TINY_DEFAULTS = dict(
     D=64, D_embed=64, B_blocks=2, C=2, D_pcm=16,
-    vocab_size=64, R=2, N=16, K_segments=2,
-    r=4, M=8, ffn_expansion=2,
+    vocab_size=64, R=2, N=16, K_segments=2,  # N=16, C=2 -> N_C=8
+    r=4, M=8, ffn_expansion=2, ffn_depth=1,
     k_ret=2, C_em=4,
+    budget_pm=4.0, budget_em=8.0,
     neuromod_hidden=8, content_proj_dim=4,
     # PCM off by default in tests (dedicated PCM tests enable it explicitly)
     pcm_enabled=False, pcm_pred_weight=0.01,

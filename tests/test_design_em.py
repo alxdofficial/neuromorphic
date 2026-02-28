@@ -77,10 +77,9 @@ class TestEpisodicMemory:
 
         g_em = torch.full((BS, B), 0.5)
         tau = torch.ones(BS, B)
-        decay = torch.full((BS, B), 0.999)
 
         s_before = em.em_S.sum().item()
-        em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+        em.write(cand_K, cand_V, cand_scores, g_em, tau)
         s_after = em.em_S.sum().item()
 
         assert s_after > s_before
@@ -99,8 +98,7 @@ class TestEpisodicMemory:
             cand_scores = torch.rand(BS, B, C_em) + 0.5
             g_em = torch.ones(BS, B)
             tau = torch.ones(BS, B)
-            decay = torch.ones(BS, B)  # no decay
-            em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+            em.write(cand_K, cand_V, cand_scores, g_em, tau)
 
         assert em.em_S.sum(dim=-1).max().item() <= cfg.budget_em + 0.01
 

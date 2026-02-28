@@ -26,8 +26,8 @@ class GroupedLayerNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [..., C, dim]
-        var, mean = torch.var_mean(x, dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / (var + self.eps).sqrt()
+        # Fused kernel for mean/var/normalize; per-group affine applied separately
+        x_norm = F.layer_norm(x, (self.dim,), None, None, self.eps)
         return x_norm * self.weight + self.bias
 
 
@@ -44,7 +44,9 @@ class GroupedLinear(nn.Module):
         self.C = C
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(C, out_features, in_features))
+        # Store weight pre-transposed: [C, in_features, out_features]
+        # so forward() avoids a per-call .transpose(1, 2) on weight
+        self.weight = nn.Parameter(torch.empty(C, in_features, out_features))
         if bias:
             self.bias = nn.Parameter(torch.zeros(C, out_features))
         else:
@@ -53,7 +55,9 @@ class GroupedLinear(nn.Module):
 
     def _reset_parameters(self):
         for c in range(self.C):
-            nn.init.kaiming_uniform_(self.weight[c], a=math.sqrt(5))
+            # kaiming_uniform_ expects [out, in] layout — init on transposed view
+            w_t = self.weight.data[c].t()  # [out_features, in_features] view
+            nn.init.kaiming_uniform_(w_t, a=math.sqrt(5))
         if self.bias is not None:
             fan_in = self.in_features
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
@@ -64,7 +68,7 @@ class GroupedLinear(nn.Module):
         lead = x.shape[:-2]
         x_3d = x.reshape(-1, self.C, self.in_features)   # [B0, C, in]
         x_3d = x_3d.transpose(0, 1)                       # [C, B0, in]
-        out = torch.bmm(x_3d, self.weight.transpose(1, 2))  # [C, B0, out]
+        out = torch.bmm(x_3d, self.weight)                 # [C, B0, out] — no weight.T
         out = out.transpose(0, 1)                          # [B0, C, out]
         out = out.reshape(*lead, self.C, self.out_features)
         if self.bias is not None:

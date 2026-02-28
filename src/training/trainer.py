@@ -28,14 +28,15 @@ def _make_compiled_step(model, config):
 
     @torch.compile(mode="default")
     def _step(seg_ids, reset_mask, seg_targets, loss_mask):
-        logits, aux_loss = model.forward_segment(seg_ids, reset_mask)
-        targets = seg_targets.reshape(-1).clone()
-        targets[~loss_mask.reshape(-1)] = -100
-        ce_loss = F.cross_entropy(
-            logits.reshape(-1, vocab), targets,
-            ignore_index=-100, reduction="sum",
-        )
-        valid_count = loss_mask.sum()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, aux_loss = model.forward_segment(seg_ids, reset_mask)
+            targets = torch.where(loss_mask.reshape(-1), seg_targets.reshape(-1),
+                                  torch.tensor(-100, device=seg_ids.device, dtype=seg_targets.dtype))
+            ce_loss = F.cross_entropy(
+                logits.reshape(-1, vocab), targets,
+                ignore_index=-100, reduction="sum",
+            )
+            valid_count = loss_mask.sum()
         return ce_loss, aux_loss, valid_count
 
     return _step
@@ -45,10 +46,11 @@ def _make_compiled_fitb_step(model, config):
     """Create a compiled FITB train step that fuses forward + inline CE loss."""
     @torch.compile(mode="default")
     def _step(seg_ids_masked, reset_mask, seg_ids_original, fitb_mask):
-        ce_loss, aux_loss, total_valid = model.forward_segment(
-            seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
-            target_ids=seg_ids_original,
-        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            ce_loss, aux_loss, total_valid = model.forward_segment(
+                seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
+                target_ids=seg_ids_original,
+            )
         return ce_loss, aux_loss, total_valid
 
     return _step
@@ -160,8 +162,9 @@ class TBPTTTrainer:
         chunk_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         valid_count = torch.tensor(0, device=self.device, dtype=torch.long)
         total_tokens = BS * T
-        eot_inputs = 0
-        reset_events = 0
+        # Accumulate on GPU to avoid per-segment .item() sync points
+        eot_inputs_t = torch.tensor(0, device=self.device, dtype=torch.long)
+        reset_events_t = torch.tensor(0, device=self.device, dtype=torch.long)
         seg_count = 0
 
         t_start = time.time()
@@ -180,9 +183,9 @@ class TBPTTTrainer:
             else:
                 reset_mask = (input_ids[:, seg_start - 1] == eot_id)
 
-            reset_events += int(reset_mask.sum().item())
+            reset_events_t = reset_events_t + reset_mask.sum()
             is_eot = (seg_ids == eot_id)
-            eot_inputs += int(is_eot.sum().item())
+            eot_inputs_t = eot_inputs_t + is_eot.sum()
 
             if self._is_fitb:
                 # FITB path
@@ -245,6 +248,10 @@ class TBPTTTrainer:
             chunk_loss = chunk_loss + ce_loss + aux_loss * aux_scale
             valid_count = valid_count + seg_valid
             seg_count += 1
+
+        # Sync GPU counters once after all segments
+        eot_inputs = eot_inputs_t.item()
+        reset_events = reset_events_t.item()
 
         # Backward + clip + optimizer step
         avg_loss, reg, grad_norm = self._backward_and_step(chunk_loss, valid_count)

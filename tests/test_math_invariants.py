@@ -374,7 +374,8 @@ class TestPMDecay:
 class TestEMWriteEquations:
     """Verify EM write formulas against hand-computed values.
 
-    v4 write API: write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+    v4 write API: write(cand_K, cand_V, cand_scores, g_em, tau)
+    Decay applied separately via base_decay() once per segment.
     State: [BS, B, M, D]; BS=1, B=1 for simplicity.
     """
 
@@ -386,7 +387,7 @@ class TestEMWriteEquations:
         return em
 
     def test_zero_g_no_key_change(self):
-        """With g_em=0, no writes: em_K/em_V unchanged, em_S only decayed."""
+        """With g_em=0, no writes: em_K/em_V unchanged, em_S unchanged (decay separate)."""
         em = self._make_em(M=2, D=4)
         em.em_K = unit_normalize(torch.randn(1, 1, 2, 4))
         em.em_V = torch.randn(1, 1, 2, 4)
@@ -403,16 +404,20 @@ class TestEMWriteEquations:
 
         g_em = torch.tensor([[0.0]])
         tau = torch.tensor([[1.0]])
-        decay = torch.tensor([[0.9]])
 
-        em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+        em.write(cand_K, cand_V, cand_scores, g_em, tau)
 
-        # With g_em=0, alpha_per_slot = 0, no update (but decay still applies to S)
+        # With g_em=0, alpha_per_slot = 0, no update
         assert torch.allclose(em.em_K, K_before, atol=1e-6), \
             "no-write em_K should be unchanged"
         assert torch.equal(em.em_V, V_before), \
             "no-write em_V should be unchanged"
-        # em_S only decayed
+        # em_S unchanged (decay is now applied separately via base_decay)
+        assert torch.allclose(em.em_S, S_before, atol=1e-5)
+
+        # Decay applied once per segment via base_decay
+        decay = torch.tensor([[0.9]])
+        em.base_decay(decay)
         expected_S = S_before * 0.9
         assert torch.allclose(em.em_S, expected_S, atol=1e-5)
 
@@ -432,9 +437,8 @@ class TestEMWriteEquations:
 
         g_em = torch.tensor([[0.5]])
         tau = torch.tensor([[1.0]])
-        decay = torch.tensor([[1.0]])  # no decay for clarity
 
-        em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+        em.write(cand_K, cand_V, cand_scores, g_em, tau)
 
         # After write with large V candidate, V should not be unit-normalized
         v_norm = em.em_V[0, 0, 0].norm().item()
@@ -454,12 +458,11 @@ class TestEMWriteEquations:
 
         g_em = torch.tensor([[0.5]])
         tau = torch.tensor([[1.0]])
-        decay = torch.tensor([[1.0]])  # no decay
 
         S_before = em.em_S.clone()
-        em.write(cand_K, cand_V, cand_scores, g_em, tau, decay)
+        em.write(cand_K, cand_V, cand_scores, g_em, tau)
 
-        # At least one slot should have higher S
+        # At least one slot should have higher S (no decay in write)
         assert (em.em_S >= S_before - 1e-6).all(), \
             "em_S should not decrease without decay"
 

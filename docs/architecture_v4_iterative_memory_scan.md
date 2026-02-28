@@ -54,7 +54,9 @@ Our resolution: **decouple token processing from memory accumulation.**
 
 **Cortical columns** (narrow, many, independent parallel processors):
 - **PCM** — local predictive coding (per-column cross-pass prediction + surprise)
-- **FFN** — local feature transformation (per-column weights, narrow D_col)
+- **FFN** — two stacks of L residual FFN layers each (ffn_pre + ffn_post,
+  2L total per pass). ffn_pre runs after lateral mixing with PCM gain modulation;
+  ffn_post runs after cross-block mixing without gain.
 - Columns read from shared memory, compute surprise, do "thinking," and
   accumulate eligibility/novelty signals for memory updates.
 
@@ -65,18 +67,24 @@ Each column group operates on D_col dimensions. After processing, fan_in back to
 - **PM** — procedural memory: Hebbian holographic slots (basal ganglia)
 - **EM** — episodic memory: key-value episode buffer (hippocampus)
 
-PM/EM state is batched: `[BS, B, r, D_col]` / `[BS, B, M, D_col]`. Columns
-operate directly in D_col space — no projection needed for memory reads/writes.
+PM/EM state is batched: `[BS, B, r, D]` / `[BS, B, M, D]` (block level in D
+space, C columns concatenated). Columns reshape to/from 5D for memory reads.
 
 ### How It Works (High Level)
 
 ```
 For r = 1..R passes:
-  1. All B columns process all N tokens in PARALLEL
-     - read from PM/EM (same state for all positions this pass)
-     - PCM encodes token → compare with previous pass → surprise
-     - surprise gates PM eligibility accumulation + EM novelty scoring
-     - FFN processes (modulated by surprise)
+  1. All G columns process all N tokens in PARALLEL (single forward call):
+     a. PCM encode → z, surprise, gain (compare with previous pass's prediction)
+     b. PM holographic read (block-level, residual)
+     c. EM top-k retrieval (block-level, residual)
+     d. Lateral mixer [C,C] — local mixing across columns within each block
+     d2. PositionAttention — content-adaptive attention across N_C positions (zero-init residual)
+     e. ffn_pre: L FFN layers (gain-modulated on first layer)
+     f. Cross-block mixer [B,B] — global mixing across blocks
+     g. ffn_post: L FFN layers (no gain)
+     h. PCM predict → z_hat (hypothesis for next pass)
+     i. W_post → eligibility info + novelty info
   2. PM/EM UPDATE (neuromodulators commit eligibility, write novel episodes)
      - next pass reads the UPDATED PM/EM
 
@@ -84,8 +92,16 @@ After R passes: decode from final representations → loss (FITB or NTP)
 Carry PM/EM state to next segment.
 ```
 
-Step 1 is embarrassingly parallel (B × N independent computations).
+Step 1 is embarrassingly parallel (G × N independent computations).
 Step 2 is the only sequential-across-passes part (R times per segment).
+
+**Processing order rationale**: PCM runs first so surprise/gain are available for
+the rest of the pass. Local mixing (lateral) runs before FFN to establish
+within-block context. PositionAttention then distributes lateral-mixed context
+across all N_C positions (content-adaptive, O(N_C² × D_col) per group — negligible
+vs FFN). ffn_pre transforms with gain modulation. Cross-block mixing then shares
+information across blocks. ffn_post refines without gain. Total FFN layers per
+pass = 2L (where L = `ffn_depth`).
 
 ### Forward Pass: R Iterative Passes
 
@@ -155,90 +171,111 @@ def forward_segment(self, input_ids, reset_mask=None, fitb_mask=None):
     return logits, aux_loss
 ```
 
-### Per-Block Column Forward (The Parallel Core)
+### Per-Pass Column Forward (The Parallel Core)
 
-In code, this is a single `CorticalColumnGroup.forward` call: column-level ops
-(PM/EM reads, PCM, FFN, fused post-processing for eligibility + novelty
-candidates). Operates on `[BS, N, G, D_col]` where G = B*C. PM eligibility
-routing and EM candidate selection happen in `model._process_and_commit`.
+In code, this is a single `CorticalColumnGroup.forward` call per R pass.
+All column-level ops (PCM, PM/EM reads, mixers, two FFN stacks, fused
+post-processing) run in one call. Operates on `[BS, N, G, D_col]` where
+G = B*C. PM eligibility routing and EM candidate selection happen in
+`model._process_and_commit`.
 
-Conceptually, for one block:
+Conceptually, for one pass:
 
 ```python
-def block_forward_pass(x_block, pm_state, em_state, z_hat_prev):
-    """One block: all C columns process all N tokens. Embarrassingly parallel.
+def column_forward_pass(x_col, pm_state, em_state, z_hat_prev):
+    """One R-pass: all G columns process all N tokens. Embarrassingly parallel.
 
-    x_block:    [BS, N, C, D_col]     — column representations for this block
-    pm_state:   PM slots for block     — same for all positions this pass
-    em_state:   EM slots for block     — same for all positions this pass
-    z_hat_prev: [BS, N, C, D_pcm]     — PCM predictions from prev pass
+    x_col:      [BS, N, G, D_col]     — column representations
+    pm_state:   PM slots              — same for all positions this pass
+    em_state:   EM slots              — same for all positions this pass
+    z_hat_prev: [BS, N, G, D_pcm]    — PCM predictions from prev pass
 
-    Returns: x_out, z, z_hat, pcm_loss, pm_elig, em_cands
+    Returns: x_out, z, z_hat, surprise, elig_info, novelty_info
     """
-    # --- CorticalColumnGroup.forward ---
-
-    # 1. PM holographic read (direct in D_col space)
-    q_pm = x_block.view(BS, N, B, C, D_col)             # free view
-    y_pm = pm_state.read(q_pm)                           # holographic
-    x_block = x_block + y_pm.reshape(BS, N, G, D_col)   # residual
-
-    # 2. EM top-k read (direct in D_col space)
-    q_em = x_block.view(BS, N, B, C, D_col)             # free view
-    y_em = em_state.read(q_em)                           # top-k retrieval
-    x_block = x_block + y_em.reshape(BS, N, G, D_col)   # residual
-
-    # 3. PCM: encode, surprise, gain
-    z = PCM.encode(x_block)                              # [BS,N,C,D_pcm]
+    # 1. PCM: encode, surprise, gain (FIRST — surprise/gain needed by everything else)
+    z = PCM.encode(x_col)                                # [BS,N,G,D_pcm]
     if z_hat_prev is not None:
         delta = z - z_hat_prev.detach()
-        surprise = norm(delta, dim=-1) / sqrt(D_pcm)     # [BS,N,C]
-        gain = 1 + 0.1 * tanh(W_gain(delta))             # [BS,N,C,D_col]
+        surprise = norm(delta, dim=-1) / sqrt(D_pcm)     # [BS,N,G]
+        gain = 1 + 0.1 * tanh(W_gain(delta))             # [BS,N,G,D_col]
     else:
         surprise = zeros; gain = ones                     # pass 1
 
-    # 4. FFN with gain modulation (gain is per-dimension, not scalar)
-    h = LayerNorm(x_block) * gain                        # element-wise
-    x_out = x_block + ffn_down(gelu(ffn_up(h)))          # residual
+    # 2. PM holographic read (block-level in D space, residual)
+    q_pm = view_5d(x_col).reshape(BS, N, B, D)           # concat C cols
+    y_pm = pm_state.read(q_pm)                            # holographic
+    x_col = x_col + reshape_g(y_pm.view(BS, N, B, C, D_col))
 
-    # 5. PCM hypothesis
-    z_hat = PCM.predict(z)                               # [BS,N,C,D_pcm]
+    # 3. EM top-k read (block-level in D space, residual)
+    q_em = view_5d(x_col).reshape(BS, N, B, D)
+    y_em = em_state.read(q_em)                            # top-k retrieval
+    x_col = x_col + reshape_g(y_em.view(BS, N, B, C, D_col))
 
-    # 6-7. Fused post-processing (W_post_fused: D_col → 4*D_col + 1)
-    proj = W_post_fused(x_out)                           # [BS,N,G,4*D_col+1]
+    # 4. Lateral mixer: [C,C] mixing within each block (local context first)
+    x_col = reshape_g(lateral(view_5d(x_col)))
+
+    # 4b. Position attention: content-adaptive attention across N_C positions
+    #     O(N_C² × D_col) per group — negligible vs FFN. Zero-init → identity at start.
+    if pos_attn is not None:
+        x_col = pos_attn(x_col)            # [BS, N_C, G, D_col]
+
+    # 5. ffn_pre: L residual FFN layers with gain on first layer
+    x_col = ffn_pre(x_col, gain=gain)
+
+    # 6. Cross-block mixer: [B,B] mixing across blocks (global after local FFN)
+    x_col = reshape_g(cross_block(view_5d(x_col)))
+
+    # 7. ffn_post: L residual FFN layers (no gain)
+    x_out = ffn_post(x_col)
+
+    # 8. PCM hypothesis (predict next pass's encoding)
+    z_hat = PCM.predict(z)                                # [BS,N,G,D_pcm]
+
+    # 9. Fused post-processing (W_post_fused: D_col → 4*D_col + 1)
+    proj = W_post_fused(x_out)                            # [BS,N,G,4*D_col+1]
     k_pre, v_post, k_cand_raw, v_cand, nov_raw = split(proj, [D_col]*4 + [1])
-    k_cand = normalize(k_pre)                            # [BS,N,B,C,D_col]
-    v_cand = v_post                                      # [BS,N,B,C,D_col]
-    gate = (surprise / scale).clamp(0, 1)                # [BS,N,B,C]
-    q_nov = normalize(k_cand_raw)                        # [BS,N,B,C,D_col]
-    w_nov = sigmoid(nov_raw)                             # [BS,N,B,C]
+    k_cand = normalize(k_pre)                             # [BS,N,B,C,D_col]
+    gate = (surprise / scale).clamp(0, 1)                 # [BS,N,B,C]
+    q_nov = normalize(k_cand_raw)
+    w_nov = sigmoid(nov_raw)
 
-    # --- ColumnBlock.forward_pass (aggregation) ---
+    elig_info = (k_cand, v_post, gate)
+    novelty_info = (q_nov, v_cand, w_nov, surprise)
 
-    # 8. PM eligibility aggregation across N×C
-    route_w = softmax(k_cand @ pm_K.T / tau)             # [BS,N,C,r]
-    gated = gate * route_w                               # [BS,N,C,r]
-    elig_K = einsum('bncr, bncd -> brd', gated, k_cand)  # [BS,r,D_col]
-    elig_V = einsum('bncr, bncd -> brd', gated, v_cand)
+    return x_out, z, z_hat, surprise, elig_info, novelty_info
+```
 
-    # 9. EM candidate selection (top-C_cand across N×C by novelty)
-    novelty = w_nov * surprise + (1-w_nov) * (1 - max_sim)
-    em_cands = topk(novelty.flatten(N*C), C_cand)
+**Then in `model._process_and_commit`** (once per R pass):
 
-    # 10. PCM prediction loss
-    pcm_loss = MSE(z_hat_prev, z.detach()) if z_hat_prev else 0
+```python
+# PM eligibility routing: concat columns → block level, route to slots
+route_w = softmax(k_norm @ pm_K.T / tau_route)           # [BS,N,B,r]
+gated = gate_block * route_w                              # surprise-gated
+elig_K = bmm(gated, k_block)                              # [BS,B,r,D]
+elig_V = bmm(gated, v_block)
 
-    return x_out, z, z_hat, pcm_loss, (elig_K, elig_V), em_cands
+# EM candidate selection: top-C_cand by novelty across N positions
+novelty = w_nov * surprise + (1-w_nov) * (1 - max_sim)
+em_cands = topk(novelty, C_cand)
+
+# Neuromodulated PM commit + EM write
+pm.commit(elig_K, elig_V, g, slot_logits, tau)
+em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay, ww)
 ```
 
 **CRITICAL**: No cross-token operations inside column forward. Each position
-is fully independent. This is what makes C × N parallelism possible within
-each block. The aggregation step (8-9) sums across positions but doesn't
-affect the per-token output.
+is fully independent. This is what makes G × N parallelism possible. The
+aggregation in `_process_and_commit` sums across positions but doesn't affect
+the per-token output.
 
 **Memory reads ARE attention** — but over memory slots, not over other tokens.
 
-**Ordering matters**: PCM surprise must be computed before eligibility and
-novelty candidates, since surprise gates both.
+**Ordering rationale**: PCM runs first so surprise/gain are available for all
+subsequent steps. Lateral mixing establishes within-block context. PositionAttention
+then distributes this local context across all N_C positions with content-adaptive
+attention. FFN pre-processes with gain. Cross-block mixing shares information
+globally after local processing. FFN post-processes without gain. Two FFN stacks
+(ffn_pre + ffn_post) with L layers each give 2L total FFN layers per pass.
 
 ### PM Holographic Read (Why "Holographic")
 
@@ -248,9 +285,10 @@ PM holographic read: the input **flows through** stored patterns. Output depends
 on both input AND stored pattern multiplicatively:
 
 ```
-q = x_col                                        # [D_col] — direct, no projection
+q = concat_cols(x_col)                           # [D] — C columns concatenated to block level
 scores = normalize(q) @ pm_K.T                   # [r_slots]
-y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D_col]
+y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D]
+y_pm_cols = split_to_cols(y_pm)                  # back to [C, D_col]
 ```
 
 Mathematically: `y_d = x_d * [W @ x]_d` — quadratic in x. The stored pattern
@@ -266,11 +304,12 @@ completely different output. This is why PM is "procedural memory": it encodes
 ### EM Read (Key-Value Retrieval)
 
 ```
-q = x_col                                        # [D_col] — direct, no projection
+q = concat_cols(x_col)                           # [D] — C columns concatenated to block level
 scores = q @ em_K.T                              # [M_slots]
 top_k_mask = scores >= topk(scores, k).min       # gather-free top-k
 attn = softmax(masked(scores, top_k_mask))       # [M_slots]
-y_em = attn @ em_V                               # [D_col]
+y_em = attn @ em_V                               # [D]
+y_em_cols = split_to_cols(y_em)                  # back to [C, D_col]
 ```
 
 Standard key-value store with sparse top-k retrieval. EM stores "facts" and
@@ -337,9 +376,14 @@ The bottleneck is deliberate: it forces the model to compress and prioritize,
 like biological memory. Not every token's information survives — only what the
 neuromodulators decide is worth committing.
 
-**Remaining limitation**: within a single pass, all positions see the same PM/EM.
-Position ordering within a pass comes only from positional encoding. The causal
-ordering emerges across passes as PM/EM accumulate.
+**PositionAttention**: In addition to memory-mediated context, PositionAttention
+provides direct content-adaptive attention across N_C positions within each pass.
+Each of G groups independently attends over N_C positions with O(N_C² × D_col)
+compute — negligible vs FFN. This gives tokens direct access to each other's
+representations within a pass, complementing the PM/EM bottleneck path.
+
+Within a single pass, all positions still see the same PM/EM state. PositionAttention
+adds direct cross-position mixing that PM/EM alone cannot provide.
 
 ## Gradient Flow
 
@@ -361,7 +405,7 @@ learning. Each pass is a mini perception-and-commit cycle.
 
 | Component | Gradient source | Path |
 |-----------|----------------|------|
-| Column FFN | Same pass's contribution to loss | Direct through decode |
+| Column FFN (ffn_pre + ffn_post) | Same pass's contribution to loss | Direct through decode |
 | PCM encode/hypothesis | L_pred (auxiliary) + downstream surprise | Same segment |
 | PM read (holographic) | Same pass's loss through PM modulation | Direct |
 | EM read (top-k) | Same pass's loss through EM retrieval | Direct |
@@ -413,7 +457,8 @@ All tokens within pass r see the same PM/EM_r.
 **Training (FITB)**: mask ~30% of N tokens, process all N through R passes, decode
 at each pass.
 **Training (NTP, backward compat)**: process N tokens through R passes, decode once.
-**Inference**: process one token at a time for R passes, decode.
+**Inference (autoregressive)**: process one token at a time for R passes, decode.
+**Inference (non-autoregressive)**: generate N tokens at once via FITB refinement.
 
 Equivalent because no cross-token operations within a pass. At inference, PM/EM
 still update after each pass (single token's eligibility/novelty may or may not
@@ -421,6 +466,26 @@ trigger commits — the neuromodulator decides).
 
 Inference memory: PM + EM + per-column PCM z_hat + eligibility accumulators.
 **Constant**, does not grow with sequence length.
+
+### Non-Autoregressive Segment Generation
+
+`generate_segments()` exploits the architecture's bidirectional nature for fast inference:
+
+1. **Phase 1 (Prompt)**: Process prompt through NTP segments to warm PM/EM
+2. **Phase 2 (Generate)**: Generate N-token chunks, all positions start as `<FITB>`,
+   R passes refine, sample from last pass's logits
+
+Throughput: N/R tokens per forward pass vs 1 for autoregressive `generate()`.
+For N=512, R=4: **128x** throughput improvement per forward pass.
+
+```
+Autoregressive:  [tok] → R passes → 1 token    → O(R×N) per token
+Non-autoregressive: [<FITB>×N] → R passes → N tokens → O(R) per N tokens
+```
+
+Quality tradeoff: non-autoregressive generation lacks left-to-right causal
+ordering within a segment. Quality depends on how well PM/EM carry context
+from prompt segments and how effectively R-pass refinement resolves ambiguity.
 
 ### 3. What R=1 Is
 
@@ -436,20 +501,23 @@ indirect access to each other through memory. "Depth" emerges.
 ### Column Dimensions
 
 ```
-# Tier A example (~83M params)
-D = 768           # embedding / model dimension
+# Tier A example (~96M params)
+D = 2048          # internal model width
+D_embed = 384     # embedding / LM head width (decoupled from D)
 B_blocks = 6      # memory blocks (PM/EM state batched as BS*B)
 C = 4             # columns per block → G = B*C = 24 groups total
-D_col = 384       # column width (also PM/EM dimension — unified)
+D_col = 512       # = D // C. Column width (also PM/EM dimension — unified)
 D_pcm = 64        # PCM encoding dimension
+ffn_depth = 1     # L = 1 → 2 total FFN layers per pass (1 pre + 1 post)
+R = 2             # refinement passes
 
-Fan-out:  D → G × D_col = 768 → 9216  (12x)
-Fan-in:   G × D_col → D = 9216 → 768
+Fan-out:  D → G × D_col = 2048 → 12288  (6x)
+Fan-in:   G × D_col → D = 12288 → 2048
 
 # Tier presets (see config.py):
-# Tier A (~83M):   D=768  B=6  C=4  G=24  Dcol=384
-# Tier B (~428M):  D=1536 B=8  C=8  G=64  Dcol=576
-# Tier C (~1.07B): D=2048 B=12 C=8  G=96  Dcol=768
+# Tier A (~96M):   D=2048 D_embed=384 B=6  C=4  G=24  Dcol=512  R=2  L=1
+# Tier B (~390M):  D=3072 D_embed=512 B=12 C=4  G=48  Dcol=768  R=4
+# Tier C (~894M):  D=4096 D_embed=768 B=16 C=4  G=64  Dcol=1024 R=6
 ```
 
 ### Segment Length
@@ -495,21 +563,21 @@ to different brain regions maintaining different types of memories.
 
 ### Serial Depth
 
-Per pass: O(1) — all B × N computations are parallel.
+Per pass: O(2L) FFN layers — all G × N computations are parallel within each layer.
 PM/EM commit between passes: O(1) (small, not N-dependent).
-Total: O(R).
+Total: O(R × 2L).
 
 Compare:
 - Current (v1):       O(K×P) = 8×32 = **256 steps**
 - Transformer (L=6):  O(L) = **6 steps** (but O(N²) compute per step)
 - Mamba (L=6):        O(L×N) (sequential scan per layer)
-- **v4 (R=6)**:       O(R) = **6 steps** (and O(N×D²) compute per step)
+- **v4 (R=2, L=1)**:  O(R×2L) = **4 steps** (and O(N×D²) compute per step)
 
 ### Compute
 
-Per pass: O(N × B_blocks × C × D_col²) for column FFNs
-        + O(N × B_blocks × r × D_col) for PM reads
-        + O(N × B_blocks × k × D_col) for EM reads
+Per pass: O(N × G × 2L × D_col²) for column FFNs (2 stacks × L layers)
+        + O(N × B_blocks × r × D) for PM reads
+        + O(N × B_blocks × k × D) for EM reads
 Total: R × above
 
 ### Memory
@@ -644,12 +712,16 @@ not refinement depth. PM/EM *commits and writes* still happen between passes.
 
 | Component | Where | When | Parallel? |
 |-----------|-------|------|-----------|
-| PM holographic read | Column | Every token, every pass | Yes (B×N) |
-| EM top-k read | Column | Every token, every pass | Yes (B×N) |
-| PCM encode + surprise | Column | Every token, every pass | Yes (B×N) |
-| FFN | Column | Every token, every pass | Yes (B×N) |
-| PM eligibility accumulate | Column | Every token, every pass | Yes (B×N) |
-| EM novelty score | Column | Every token, every pass | Yes (B×N) |
+| PCM encode + surprise | Column | Every token, every pass | Yes (G×N) |
+| PM holographic read | Column | Every token, every pass | Yes (G×N) |
+| EM top-k read | Column | Every token, every pass | Yes (G×N) |
+| Lateral mixer [C,C] | Column | Every token, every pass | Yes (G×N) |
+| PositionAttention [N_C,N_C] | Column | Every token, every pass | Yes (G groups) |
+| ffn_pre (L layers, gain) | Column | Every token, every pass | Yes (G×N) |
+| Cross-block mixer [B,B] | Column | Every token, every pass | Yes (G×N) |
+| ffn_post (L layers) | Column | Every token, every pass | Yes (G×N) |
+| PM eligibility accumulate | Column | Every token, every pass | Yes (G×N) |
+| EM novelty score | Column | Every token, every pass | Yes (G×N) |
 | PM neuromod commit | Between passes | Once per pass | Small |
 | EM neuromod write | Between passes | Once per pass | Small |
 | PM base decay | After R loop | Once per segment | Tiny |
@@ -694,8 +766,10 @@ not refinement depth. PM/EM *commits and writes* still happen between passes.
 3. **Eligibility reset between passes**: Currently reset after each commit. Could
    carry eligibility across passes (exponential decay) for multi-pass patterns.
 
-4. **Within-segment context**: Is memory-mediated context (R hops through PM/EM)
-   sufficient? Or do we need direct token interaction? Empirical.
+4. **Within-segment context**: ~~Is memory-mediated context (R hops through PM/EM)
+   sufficient?~~ **Addressed**: PositionAttention adds direct content-adaptive
+   cross-position mixing (O(N_C² × D_col) per group). Zero-init preserves
+   existing training dynamics; empirical evaluation will show the benefit.
 
 5. **Block/column scaling**: How many blocks × columns per block?
 

@@ -153,11 +153,7 @@ class TestGradientFlow:
         assert model.lambda_logit.grad.abs() > 0
 
     def test_lateral_mixer_gradient(self):
-        """LateralMixer W_out should receive gradients (zero-init residual).
-
-        W_q/W_k/W_v get zero grads at init because W_out is zero-init;
-        once W_out updates, gradients flow through to Q/K/V projections.
-        """
+        """LateralMixer mix param should receive gradients (zero-init residual)."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
 
@@ -165,13 +161,38 @@ class TestGradientFlow:
         loss.backward()
 
         lateral = model.columns.lateral
-        # W_out gets gradient directly (grad = input^T @ output_grad)
-        assert lateral.W_out.weight.grad is not None
-        assert lateral.W_out.weight.grad.abs().sum() > 0
-        # W_q/W_k/W_v have grad=0 at init (blocked by zero W_out) — expected
-        for name in ["W_q", "W_k", "W_v"]:
-            w = getattr(lateral, name).weight
-            assert w.grad is not None, f"No gradient for lateral.{name}"
+        assert lateral.mix.grad is not None
+        assert lateral.mix.grad.abs().sum() > 0
+
+    def test_cross_block_mixer_gradient(self):
+        """CrossBlockMixer cross_mix param should receive gradients."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        cross_block = model.columns.cross_block
+        assert cross_block.cross_mix.grad is not None
+        assert cross_block.cross_mix.grad.abs().sum() > 0
+
+    def test_stacked_ffn_gradient(self):
+        """All FFN layers in ffn_pre and ffn_post should receive gradients."""
+        cfg = make_tiny_config(ffn_depth=3)
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        for stack_name in ("ffn_pre", "ffn_post"):
+            stack = getattr(model.columns, stack_name)
+            for i in range(3):
+                up_w = stack.ups[i].weight
+                down_w = stack.downs[i].weight
+                assert up_w.grad is not None, f"No gradient for {stack_name}.ups[{i}]"
+                assert up_w.grad.abs().sum() > 0, f"Zero gradient for {stack_name}.ups[{i}]"
+                assert down_w.grad is not None, f"No gradient for {stack_name}.downs[{i}]"
+                assert down_w.grad.abs().sum() > 0, f"Zero gradient for {stack_name}.downs[{i}]"
 
     def test_proj_up_down_gradient(self):
         """proj_up/proj_down should receive gradients when D_embed != D."""
@@ -185,3 +206,78 @@ class TestGradientFlow:
         assert model.proj_up.weight.grad.abs().sum() > 0
         assert model.proj_down.weight.grad is not None
         assert model.proj_down.weight.grad.abs().sum() > 0
+
+    def test_position_attention_gradient(self):
+        """PositionAttention Q/K/V/out_proj should all receive nonzero gradients.
+
+        out_proj is zero-init, so Q/K/V get zero gradient at exact init (gradient
+        blocked by zero weight). We perturb out_proj slightly to simulate the state
+        after a few training steps, then verify gradient flows through all projections.
+        """
+        cfg = make_tiny_config()  # pos_attn enabled by default (D_col//4 = 8)
+        assert cfg.position_attn_dim > 0
+        model = NeuromorphicLM(cfg)
+
+        # Perturb out_proj so gradient flows through Q/K/V
+        pa = model.columns.pos_attn
+        assert pa is not None
+        with torch.no_grad():
+            pa.out_proj.weight.add_(torch.randn_like(pa.out_proj.weight) * 0.01)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        for name in ["q_proj", "k_proj", "v_proj", "out_proj"]:
+            proj = getattr(pa, name)
+            assert proj.weight.grad is not None, f"No gradient for pos_attn.{name}"
+            assert proj.weight.grad.abs().sum() > 0, f"Zero gradient for pos_attn.{name}"
+
+    def test_fan_in_gradient(self):
+        """fan_in (zero-init D_col->D skip projection) should receive gradients."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        assert model.fan_in.weight.grad is not None
+        assert model.fan_in.weight.grad.abs().sum() > 0
+        assert model.fan_in.bias.grad is not None
+
+    def test_skip_connection_gradient(self):
+        """Gradient should flow through the skip connection path."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        # embedding gets gradient through both the skip path (x_input)
+        # and the column processing path (via fan_in)
+        assert model.embedding.weight.grad is not None
+        assert model.embedding.weight.grad.abs().sum() > 0
+
+    def test_gradient_through_read_sliced(self):
+        """read_sliced should be differentiable (PM + EM)."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        # Run 2 segments so PM/EM have content from first
+        model.initialize_states(BS, torch.device("cpu"))
+        N = cfg.N
+        total_loss = torch.tensor(0.0)
+
+        for seg in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, N))
+            target_ids = torch.randint(0, VOCAB, (BS, N))
+            reset_mask = torch.zeros(BS, dtype=torch.bool)
+            logits, aux_loss = model.forward_segment(input_ids, reset_mask)
+            ce_loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+            total_loss = total_loss + ce_loss + aux_loss
+
+        total_loss.backward()
+
+        # Column W_post_fused should get gradient through read_sliced path
+        col = model.columns
+        assert col.W_post_fused.weight.grad is not None
+        assert col.W_post_fused.weight.grad.abs().sum() > 0

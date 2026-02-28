@@ -75,6 +75,22 @@ class TestConfigValidation:
             cfg = ModelConfig(D=128, D_embed=-2, C=4)
             cfg.validate()
 
+    def test_position_attn_dim_auto_derives(self):
+        cfg = make_tiny_config()  # D=64, C=2 -> D_col=32
+        assert cfg.position_attn_dim == 8  # 32 // 4
+
+    def test_position_attn_dim_explicit_zero_disables(self):
+        cfg = make_tiny_config(position_attn_dim=0)
+        assert cfg.position_attn_dim == 0
+
+    def test_position_attn_dim_explicit_value(self):
+        cfg = make_tiny_config(position_attn_dim=16)
+        assert cfg.position_attn_dim == 16
+
+    def test_position_attn_dim_invalid_negative(self):
+        with pytest.raises(ValueError, match="position_attn_dim"):
+            make_tiny_config(position_attn_dim=-5)
+
 
 class TestTierPresets:
     def test_tier_a(self):
@@ -83,8 +99,11 @@ class TestTierPresets:
         assert cfg.D == 2048
         assert cfg.D_embed == 384
         assert cfg.B_blocks == 6
-        assert cfg.C == 4
-        assert cfg.D_col == 512  # D=2048 // C=4
+        assert cfg.C == 16
+        assert cfg.D_col == 128  # D=2048 // C=16
+        assert cfg.R == 4
+        assert cfg.ffn_depth == 3
+        assert cfg.ffn_expansion == 4
 
     def test_tier_b(self):
         cfg = ModelConfig.tier_b()
@@ -92,6 +111,8 @@ class TestTierPresets:
         assert cfg.D == 3072
         assert cfg.D_embed == 512
         assert cfg.B_blocks == 12
+        assert cfg.C == 16
+        assert cfg.R == 6
 
     def test_tier_c(self):
         cfg = ModelConfig.tier_c()
@@ -99,6 +120,8 @@ class TestTierPresets:
         assert cfg.D == 4096
         assert cfg.D_embed == 768
         assert cfg.B_blocks == 16
+        assert cfg.C == 16
+        assert cfg.R == 8
 
     def test_tier_overrides(self):
         cfg = ModelConfig.tier_a(R=6, N=256)

@@ -55,27 +55,57 @@ class ProceduralMemory(nn.Module, StateMixin):
 
         scores = normalize(q) @ pm_K.T
         weighted = scores * pm_a
-        modulation = bmm(weighted, pm_V)
+        modulation = weighted @ pm_V
         y = q * modulation  (holographic)
         """
         # q: [BS, N, B, D], pm_K: [BS, B, r, D]
-        BS, N, B, D = q.shape
         q_norm = unit_normalize(q)
 
-        # scores via bmm: fuse (BS,B) as batch dim
-        q_flat = q_norm.permute(0, 2, 1, 3).reshape(BS * B, N, D)   # [BS*B, N, D]
-        K_flat = self.pm_K.reshape(BS * B, self.r, D)                # [BS*B, r, D]
-        scores = torch.bmm(q_flat, K_flat.transpose(1, 2))           # [BS*B, N, r]
-        scores = scores.reshape(BS, B, N, self.r).permute(0, 2, 1, 3)  # [BS, N, B, r]
+        # scores via batched matmul (strided views, no copy)
+        q_bn = q_norm.transpose(1, 2)                              # [BS, B, N, D]
+        scores = torch.matmul(q_bn, self.pm_K.transpose(-1, -2))   # [BS, B, N, r]
+        scores = scores.transpose(1, 2)                             # [BS, N, B, r]
 
         # Weight by slot strength: pm_a [BS, B, r] -> broadcast [BS, 1, B, r]
         weighted = scores * self.pm_a[:, None, :, :]
 
-        # Modulation via bmm
-        V_flat = self.pm_V.reshape(BS * B, self.r, D)                # [BS*B, r, D]
-        weighted_flat = weighted.permute(0, 2, 1, 3).reshape(BS * B, N, self.r)
-        mod_flat = torch.bmm(weighted_flat, V_flat)                   # [BS*B, N, D]
-        modulation = mod_flat.reshape(BS, B, N, D).permute(0, 2, 1, 3)  # [BS, N, B, D]
+        # Modulation via batched matmul (strided views, no copy)
+        weighted_bn = weighted.transpose(1, 2)                      # [BS, B, N, r]
+        modulation = torch.matmul(weighted_bn, self.pm_V)           # [BS, B, N, D]
+        modulation = modulation.transpose(1, 2)                     # [BS, N, B, D]
+
+        # Holographic: element-wise multiply
+        return q * modulation
+
+    def read_sliced(self, q: Tensor) -> Tensor:
+        """Holographic read with per-column D_col slices.
+
+        q: [BS, N_C, B, C, D_col] -> [BS, N_C, B, C, D_col]
+
+        PM state [BS, B, r, D] is viewed as [BS, B, r, C, D_col] and the
+        holographic read operates independently per column at D_col width.
+        """
+        BS, N_C, B, C, D_col = q.shape
+
+        # View state as [BS, B, r, C, D_col] -> permute to [BS, B, C, r, D_col]
+        K = self.pm_K.view(BS, B, self.r, C, D_col).permute(0, 1, 3, 2, 4)
+        V = self.pm_V.view(BS, B, self.r, C, D_col).permute(0, 1, 3, 2, 4)
+
+        # Query: [BS, N_C, B, C, D_col] -> [BS, B, C, N_C, D_col]
+        q_norm = unit_normalize(q)
+        q_r = q_norm.permute(0, 2, 3, 1, 4)
+
+        # Scores: [BS, B, C, N_C, D_col] @ [BS, B, C, D_col, r] -> [BS, B, C, N_C, r]
+        scores = torch.matmul(q_r, K.transpose(-1, -2))
+
+        # Weight by slot strength: pm_a [BS, B, r] -> [BS, B, 1, 1, r]
+        weighted = scores * self.pm_a[:, :, None, None, :]
+
+        # Modulation: [BS, B, C, N_C, r] @ [BS, B, C, r, D_col] -> [BS, B, C, N_C, D_col]
+        modulation = torch.matmul(weighted, V)
+
+        # Back to [BS, N_C, B, C, D_col]
+        modulation = modulation.permute(0, 3, 1, 2, 4)
 
         # Holographic: element-wise multiply
         return q * modulation
@@ -95,7 +125,8 @@ class ProceduralMemory(nn.Module, StateMixin):
         # Alpha = g * slot_weights
         alpha = (g.unsqueeze(-1) * slot_weights).unsqueeze(-1)  # [BS, B, r, 1]
 
-        # EMA update
+        # EMA update (reassignment: pm_K/V/a are saved for backward by pm.read(),
+        # so in-place ops would invalidate autograd's saved tensor versions)
         elig_K_norm = unit_normalize(elig_K)
         elig_V_norm = unit_normalize(elig_V)
         self.pm_K = (1 - alpha) * self.pm_K + alpha * elig_K_norm
@@ -108,7 +139,10 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.pm_a = budget_enforce(self.pm_a, self.budget)
 
     def base_decay(self):
-        """pm_a *= decay (called before commit)."""
+        """pm_a *= decay (called after R loop, before backward).
+
+        Must use reassignment: pm_a is saved for backward by pm.read().
+        """
         if self.pm_a is not None:
             self.pm_a = self.pm_a * self.decay
 
