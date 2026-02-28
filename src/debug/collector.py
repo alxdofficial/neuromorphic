@@ -224,17 +224,20 @@ class MetricsCollector:
     def _collect_grad_norms(self, record: dict):
         """Per-module gradient norms after backward.
 
-        v4 structure: model.embedding, model.lm_head, model.fan_out, model.fan_in,
+        v4 structure: model.embedding, model.lm_head, model.fan_in,
         model.columns, model.pm, model.em, model.pm_neuromod, model.em_neuromod
         """
         module_groups = {
             "embedding": [self.model.embedding],
             "lm_head": [self.model.lm_head],
-            "fan_out": [self.model.fan_out],
             "fan_in": [self.model.fan_in],
             "columns": [self.model.columns],
         }
+        if self.model.proj_up is not None:
+            module_groups["proj_up"] = [self.model.proj_up]
+            module_groups["proj_down"] = [self.model.proj_down]
         if self.config.pm_enabled:
+            module_groups["pm"] = [self.model.pm]
             module_groups["pm_neuromod"] = [self.model.pm_neuromod]
         if self.config.em_enabled:
             module_groups["em"] = [self.model.em]

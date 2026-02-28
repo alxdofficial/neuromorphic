@@ -153,6 +153,19 @@ def create_gpt2(bs, seq_len, vocab):
     return model, fwd
 
 
+def create_mamba_130m(bs, seq_len, vocab):
+    from mamba_ssm import MambaLMHeadModel
+    from mamba_ssm.models.config_mamba import MambaConfig
+    cfg = MambaConfig(
+        d_model=768, n_layer=24, vocab_size=vocab,
+    )
+    model = MambaLMHeadModel(cfg).to(DEVICE).to(torch.bfloat16)
+
+    def fwd(m, ids):
+        return m(ids).logits
+    return model, fwd
+
+
 # ---------------------------------------------------------------------------
 # Batch size sweep for neuromorphic FITB
 # ---------------------------------------------------------------------------
@@ -394,6 +407,11 @@ def main():
             baselines.append(("GPT2-124M", create_gpt2))
         except ImportError:
             print("  GPT2: skipped (no transformers)")
+        try:
+            from mamba_ssm import MambaLMHeadModel
+            baselines.append(("Mamba-130M", create_mamba_130m))
+        except ImportError:
+            print("  Mamba: skipped (no mamba_ssm)")
 
         for name, factory in baselines:
             print(f"\n  {name}:")

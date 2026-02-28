@@ -563,6 +563,7 @@ def run_phase(
     # Config
     config = _build_config(tier, phase_name, settings)
     config.vocab_size = len(tokenizer)
+    config.validate()
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     config.eot_id = eot_id
 
