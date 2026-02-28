@@ -69,13 +69,13 @@ from PM/EM.
 - **Eligibility traces**: Per-token accumulation gated by surprise (third factor).
   Pre-synaptic (k_cand) and Hebbian post-synaptic (v_cand = pre × post) signals,
   with slot-specific routing weights.
-- **Commit**: Neuromodulator MLP at periodic boundaries produces (p_commit, lambda,
-  g, slot_logits, tau). Continuous softmax slot selection + soft EMA update.
+- **Commit**: Neuromodulator MLP at periodic boundaries produces (g, slot_logits,
+  tau, ww). Continuous softmax slot selection + soft EMA update. Learned weakness
+  weight (ww) biases toward weaker slots.
 - **Sacred**: Differentiable eligibility traces (nn.Linear), surprise gating,
   neuromodulator trained by main loss, slot-specific routing, budget enforcement +
   unit normalization, lifelong persistence.
-- **Negotiable**: Number of slots r, eligibility decay rho, routing temperature,
-  EMA vs hard overwrite.
+- **Negotiable**: Number of slots r, routing temperature, EMA vs hard overwrite.
 - **v4**: Slow-changing partition (updated at periodic boundaries). Column accumulates
   eligibility per-token; neuromodulator decides commits at boundaries. The commit
   itself is affine (EMA blend).

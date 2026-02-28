@@ -22,9 +22,9 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="C"):
             make_tiny_config(C=0)
 
-    def test_invalid_D_col(self):
-        with pytest.raises(ValueError, match="D_col"):
-            make_tiny_config(D_col=0)
+    def test_invalid_D_not_divisible_by_C(self):
+        with pytest.raises(ValueError, match="divisible"):
+            make_tiny_config(D=65, C=2)
 
     def test_invalid_D_pcm_when_enabled(self):
         with pytest.raises(ValueError, match="D_pcm"):
@@ -60,27 +60,45 @@ class TestConfigValidation:
         assert cfg.null_id == 62
         assert cfg.mask_rate == 0.0
 
+    def test_D_embed_defaults_to_D(self):
+        cfg = ModelConfig(D=128, C=4)
+        cfg.validate()
+        assert cfg.D_embed == 128
+
+    def test_D_embed_explicit(self):
+        cfg = ModelConfig(D=128, D_embed=64, C=4)
+        cfg.validate()
+        assert cfg.D_embed == 64
+
+    def test_invalid_D_embed(self):
+        with pytest.raises(ValueError, match="D_embed"):
+            cfg = ModelConfig(D=128, D_embed=-2, C=4)
+            cfg.validate()
+
 
 class TestTierPresets:
     def test_tier_a(self):
         cfg = ModelConfig.tier_a()
         cfg.validate()
-        assert cfg.D == 768
+        assert cfg.D == 2048
+        assert cfg.D_embed == 384
         assert cfg.B_blocks == 6
         assert cfg.C == 4
-        assert cfg.D_col == 384
+        assert cfg.D_col == 512  # D=2048 // C=4
 
     def test_tier_b(self):
         cfg = ModelConfig.tier_b()
         cfg.validate()
-        assert cfg.D == 1536
-        assert cfg.B_blocks == 8
+        assert cfg.D == 3072
+        assert cfg.D_embed == 512
+        assert cfg.B_blocks == 12
 
     def test_tier_c(self):
         cfg = ModelConfig.tier_c()
         cfg.validate()
-        assert cfg.D == 2048
-        assert cfg.B_blocks == 12
+        assert cfg.D == 4096
+        assert cfg.D_embed == 768
+        assert cfg.B_blocks == 16
 
     def test_tier_overrides(self):
         cfg = ModelConfig.tier_a(R=6, N=256)

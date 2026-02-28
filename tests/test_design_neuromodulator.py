@@ -14,13 +14,13 @@ BS = 2
 class TestPMNeuromodulatorBehavior:
     def test_differentiable(self):
         cfg = make_tiny_config()
-        neuromod = PMNeuromodulator(cfg)
+        neuromod = PMNeuromodulator(cfg.D, cfg)
 
         elig = torch.randn(BS, requires_grad=True)
         usage = torch.randn(BS, requires_grad=True)
-        g, slot_logits, tau = neuromod(elig, usage)
+        g, slot_logits, tau, ww = neuromod(elig, usage)
 
-        loss = g.sum() + slot_logits.sum() + tau.sum()
+        loss = g.sum() + slot_logits.sum() + tau.sum() + ww.sum()
         loss.backward()
 
         assert elig.grad is not None
@@ -30,13 +30,13 @@ class TestPMNeuromodulatorBehavior:
 class TestEMNeuromodulatorBehavior:
     def test_differentiable(self):
         cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg)
+        neuromod = EMNeuromodulator(cfg.D, cfg)
 
         novelty = torch.randn(BS, requires_grad=True)
         usage = torch.randn(BS, requires_grad=True)
-        g_em, tau, decay = neuromod(novelty, usage)
+        g_em, tau, decay, ww = neuromod(novelty, usage)
 
-        loss = g_em.sum() + tau.sum() + decay.sum()
+        loss = g_em.sum() + tau.sum() + decay.sum() + ww.sum()
         loss.backward()
 
         assert novelty.grad is not None

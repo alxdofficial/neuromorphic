@@ -9,7 +9,7 @@ from tests.conftest import make_tiny_config, forward_one_segment
 
 from src.model.model import NeuromorphicLM
 from src.model.predictive_coding import GroupedLinear, GroupedLayerNorm, CrossPassPCM
-from src.model.column import CorticalColumnGroup
+from src.model.column import CorticalColumnGroup, LateralMixer
 from src.model.procedural_memory import ProceduralMemory
 from src.model.episodic_memory import EpisodicMemory
 
@@ -77,25 +77,25 @@ class TestProceduralMemory:
     def test_read_shape(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
-        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D_col)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
+        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
-        q = torch.randn(BS, 4, B, cfg.C, cfg.D_col)  # [BS, N, B, C, D_col]
+        q = torch.randn(BS, 4, B, cfg.D)  # [BS, N, B, D]
         y = pm.read(q)
         assert y.shape == q.shape
 
     def test_commit(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
-        elig_K = torch.randn(BS, B, cfg.r, cfg.D_col)
-        elig_V = torch.randn(BS, B, cfg.r, cfg.D_col)
+        elig_K = torch.randn(BS, B, cfg.r, cfg.D)
+        elig_V = torch.randn(BS, B, cfg.r, cfg.D)
         g = torch.full((BS, B), 0.5)
         slot_logits = torch.randn(BS, B, cfg.r)
         tau = torch.ones(BS, B)
@@ -107,49 +107,68 @@ class TestProceduralMemory:
 
 class TestEpisodicMemory:
     def test_read_shape(self):
-        """EM read with 5D input [BS, N, B, C, D_col]."""
+        """EM read with 4D input [BS, N, B, D]."""
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
         # Set some content
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_col)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
         em.em_S = torch.ones(BS, B, cfg.M)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
+        q = torch.randn(BS, N, B, cfg.D)
         y = em.read(q)
         assert y.shape == q.shape
 
     def test_novelty_score_shape(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
-        surprise = torch.rand(BS, N, B, cfg.C)
-        w_nov = torch.rand(BS, N, B, cfg.C)
+        q = torch.randn(BS, N, B, cfg.D)
+        surprise = torch.rand(BS, N, B)
+        w_nov = torch.rand(BS, N, B)
 
         novelty = em.score_novelty(q, surprise, w_nov)
-        assert novelty.shape == (BS, N, B, cfg.C)
+        assert novelty.shape == (BS, N, B)
 
     def test_select_top_candidates(self):
         cfg = make_tiny_config()
         B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
+        em = EpisodicMemory(cfg.D, cfg.M, cfg)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
         N = 4
-        q = torch.randn(BS, N, B, cfg.C, cfg.D_col)
-        v = torch.randn(BS, N, B, cfg.C, cfg.D_col)
-        novelty = torch.rand(BS, N, B, cfg.C)
+        q = torch.randn(BS, N, B, cfg.D)
+        v = torch.randn(BS, N, B, cfg.D)
+        novelty = torch.rand(BS, N, B)
 
         cand_K, cand_V, cand_scores = em.select_top_candidates(q, v, novelty, cfg.C_em)
-        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D_col)
-        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D_col)
+        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D)
+        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D)
         assert cand_scores.shape == (BS, B, cfg.C_em)
+
+
+class TestLateralMixer:
+    def test_shape(self):
+        D_col = 16
+        mixer = LateralMixer(D_col)
+        B, C = 2, 3
+        x = torch.randn(BS, 4, B, C, D_col)
+        y = mixer(x)
+        assert y.shape == x.shape
+
+    def test_residual_identity_at_init(self):
+        """W_out is zero-init, so output should equal input at init."""
+        D_col = 16
+        mixer = LateralMixer(D_col)
+        B, C = 2, 3
+        x = torch.randn(BS, 4, B, C, D_col)
+        y = mixer(x)
+        assert torch.allclose(y, x, atol=1e-5)
 
 
 class TestColumnGroup:
@@ -158,8 +177,8 @@ class TestColumnGroup:
         G = cfg.B_blocks * cfg.C
         B = cfg.B_blocks
         col = CorticalColumnGroup(cfg)
-        pm = ProceduralMemory(cfg.D_col, cfg.r, cfg)
-        em = EpisodicMemory(cfg.D_col, cfg.M, cfg)
+        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
+        em = EpisodicMemory(cfg.D, cfg.M, cfg)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
@@ -225,3 +244,24 @@ class TestFullModel:
         count = model.param_count()
         assert count > 0
         assert isinstance(count, int)
+
+    def test_d_embed_decoupled_forward(self):
+        """D_embed != D should produce correct output shape."""
+        cfg = make_tiny_config(D=64, D_embed=32)
+        model = NeuromorphicLM(cfg)
+        logits, aux_loss = forward_one_segment(model, BS=BS, vocab=VOCAB)
+        assert logits.shape == (BS, cfg.N, VOCAB)
+
+    def test_d_embed_equal_d_no_proj(self):
+        """When D_embed == D, proj_up/proj_down should be None."""
+        cfg = make_tiny_config(D=64, D_embed=64)
+        model = NeuromorphicLM(cfg)
+        assert model.proj_up is None
+        assert model.proj_down is None
+
+    def test_d_embed_decoupled_has_proj(self):
+        """When D_embed != D, proj_up/proj_down should exist."""
+        cfg = make_tiny_config(D=64, D_embed=32)
+        model = NeuromorphicLM(cfg)
+        assert model.proj_up is not None
+        assert model.proj_down is not None

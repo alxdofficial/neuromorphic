@@ -30,12 +30,11 @@ TIER_C = dict(
 DEFAULTS = dict(
     # PM
     r=8,
-    rho=0.95,
     a_max=3.0,
     budget_pm=4.0,
     decay_pm=0.999,
     tau_pm=1.0,
-    weakness_weight_pm=0.5,
+    ww_pm_default=0.5,
     pm_readout_ffn=True,
     # EM
     M=256,
@@ -43,7 +42,7 @@ DEFAULTS = dict(
     k_ret=4,
     C_em=8,
     tau_em=1.0,
-    weakness_weight_em=0.5,
+    ww_em_default=0.5,
     S_max=3.0,
     budget_em=8.0,
     decay_em=0.999,

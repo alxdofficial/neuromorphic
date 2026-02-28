@@ -1,8 +1,9 @@
 """
 Procedural Memory (v4) — holographic modulation slots.
 
-Per-block (B_blocks instances, batched as BS,B dim). Operates in D_col space.
-Read: holographic modulation. Write: neuromodulated EMA commit.
+Per-block (B_blocks instances, batched as BS,B dim). Operates in D space
+(block level: C columns concatenated). Read: holographic modulation.
+Write: neuromodulated EMA commit.
 """
 
 import torch
@@ -18,8 +19,8 @@ class ProceduralMemory(nn.Module, StateMixin):
     """Holographic procedural memory with eligibility-based commit.
 
     State:
-        pm_K: [BS, B, r, D_col] — key bank (unit-normalized)
-        pm_V: [BS, B, r, D_col] — value bank (modulation patterns)
+        pm_K: [BS, B, r, D] — key bank (unit-normalized)
+        pm_V: [BS, B, r, D] — value bank (modulation patterns)
         pm_a: [BS, B, r] — slot strengths (bounded)
     """
 
@@ -50,24 +51,31 @@ class ProceduralMemory(nn.Module, StateMixin):
         return self.pm_K is not None
 
     def read(self, q: Tensor) -> Tensor:
-        """Holographic read. q: [BS, N, B, C, D_col] -> [BS, N, B, C, D_col].
+        """Holographic read. q: [BS, N, B, D] -> [BS, N, B, D].
 
         scores = normalize(q) @ pm_K.T
         weighted = scores * pm_a
-        modulation = einsum(weighted, pm_V)
+        modulation = bmm(weighted, pm_V)
         y = q * modulation  (holographic)
         """
-        # q: [BS, N, B, C, D_col], pm_K: [BS, B, r, D_col]
+        # q: [BS, N, B, D], pm_K: [BS, B, r, D]
+        BS, N, B, D = q.shape
         q_norm = unit_normalize(q)
 
-        # scores: contract over D_col, broadcast over N,C
-        scores = torch.einsum("snbcd, sbrd -> snbcr", q_norm, self.pm_K)
+        # scores via bmm: fuse (BS,B) as batch dim
+        q_flat = q_norm.permute(0, 2, 1, 3).reshape(BS * B, N, D)   # [BS*B, N, D]
+        K_flat = self.pm_K.reshape(BS * B, self.r, D)                # [BS*B, r, D]
+        scores = torch.bmm(q_flat, K_flat.transpose(1, 2))           # [BS*B, N, r]
+        scores = scores.reshape(BS, B, N, self.r).permute(0, 2, 1, 3)  # [BS, N, B, r]
 
-        # Weight by slot strength: pm_a [BS, B, r] -> broadcast [BS, 1, B, 1, r]
-        weighted = scores * self.pm_a[:, None, :, None, :]
+        # Weight by slot strength: pm_a [BS, B, r] -> broadcast [BS, 1, B, r]
+        weighted = scores * self.pm_a[:, None, :, :]
 
-        # Modulation
-        modulation = torch.einsum("snbcr, sbrd -> snbcd", weighted, self.pm_V)
+        # Modulation via bmm
+        V_flat = self.pm_V.reshape(BS * B, self.r, D)                # [BS*B, r, D]
+        weighted_flat = weighted.permute(0, 2, 1, 3).reshape(BS * B, N, self.r)
+        mod_flat = torch.bmm(weighted_flat, V_flat)                   # [BS*B, N, D]
+        modulation = mod_flat.reshape(BS, B, N, D).permute(0, 2, 1, 3)  # [BS, N, B, D]
 
         # Holographic: element-wise multiply
         return q * modulation
@@ -76,7 +84,7 @@ class ProceduralMemory(nn.Module, StateMixin):
                g: Tensor, slot_logits: Tensor, tau: Tensor):
         """EMA commit of aggregated eligibility.
 
-        elig_K, elig_V: [BS, B, r, D_col] — aggregated across N*C
+        elig_K, elig_V: [BS, B, r, D] — aggregated across N positions
         g: [BS, B] — write strength
         slot_logits: [BS, B, r] — slot selection bias
         tau: [BS, B] — softmax temperature
@@ -122,10 +130,10 @@ class PMNeuromodulator(nn.Module):
     """Neuromodulator for PM commit decisions.
 
     Produces fully differentiable outputs for all commit parameters.
-    Returns: g [BS*B], slot_logits [BS*B, r], tau [BS*B]
+    Returns: g [BS*B], slot_logits [BS*B, r], tau [BS*B], ww [BS*B]
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, D_mem: int, config: ModelConfig):
         super().__init__()
         self.pm_enabled = config.pm_enabled
         self.n_slots = config.r
@@ -133,6 +141,9 @@ class PMNeuromodulator(nn.Module):
         self.tau_floor = config.tau_pm_floor
         self.tau_ceil = config.tau_pm_ceil
         self.default_tau = config.tau_pm
+        self.default_ww = config.ww_pm_default
+        self.ww_floor = config.ww_pm_floor
+        self.ww_ceil = config.ww_pm_ceil
 
         if self.pm_enabled:
             H = config.neuromod_hidden
@@ -140,7 +151,7 @@ class PMNeuromodulator(nn.Module):
             n_content = config.content_proj_dim
             n_features = n_scalar + n_content
 
-            self.content_proj = nn.Linear(config.D_col, n_content)
+            self.content_proj = nn.Linear(D_mem, n_content)
             self.backbone = nn.Sequential(
                 nn.Linear(n_features, H),
                 nn.ReLU(),
@@ -148,10 +159,19 @@ class PMNeuromodulator(nn.Module):
             self.g_head = nn.Linear(H, 1)
             self.slot_head = nn.Linear(H, config.r)
             self.tau_head = nn.Linear(H, 1)
+            self.ww_head = nn.Linear(H, 1)
 
             nn.init.zeros_(self.backbone[0].bias)
             nn.init.normal_(self.content_proj.weight, std=0.01)
             nn.init.zeros_(self.content_proj.bias)
+
+            # Bias init: sigmoid(bias) = (default - floor) / (ceil - floor)
+            _ww_range = self.ww_ceil - self.ww_floor
+            if _ww_range > 0:
+                _target_sigmoid = (self.default_ww - self.ww_floor) / _ww_range
+                _target_sigmoid = max(1e-4, min(1 - 1e-4, _target_sigmoid))
+                import math
+                self.ww_head.bias.data.fill_(math.log(_target_sigmoid / (1 - _target_sigmoid)))
 
     def forward(self, elig_summary: Tensor, pm_usage: Tensor,
                 content_emb: Tensor | None = None):
@@ -159,6 +179,8 @@ class PMNeuromodulator(nn.Module):
         elig_summary: [BSB] — eligibility magnitude (flattened BS*B)
         pm_usage: [BSB] — sum(pm_a)
         content_emb: [BSB, D_col] — mean eligibility key (optional)
+
+        Returns: g [BSB], slot_logits [BSB, r], tau [BSB], ww [BSB]
         """
         if not self.pm_enabled:
             BS = elig_summary.shape[0]
@@ -167,6 +189,7 @@ class PMNeuromodulator(nn.Module):
                 torch.full((BS,), self.default_g, device=device),
                 torch.zeros(BS, self.n_slots, device=device),  # slot_logits
                 torch.full((BS,), self.default_tau, device=device),
+                torch.full((BS,), self.default_ww, device=device),
             )
 
         features = [elig_summary.unsqueeze(-1), pm_usage.unsqueeze(-1)]
@@ -185,5 +208,7 @@ class PMNeuromodulator(nn.Module):
         slot_logits = self.slot_head(h)
         tau_raw = self.tau_head(h).squeeze(-1)
         tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * torch.sigmoid(tau_raw)
+        ww_raw = self.ww_head(h).squeeze(-1)
+        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * torch.sigmoid(ww_raw)
 
-        return g, slot_logits, tau
+        return g, slot_logits, tau, ww

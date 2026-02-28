@@ -18,7 +18,7 @@ from src.model.config import ModelConfig
 # Tiny defaults — all architectural constraints preserved, ~1000x cheaper
 # ---------------------------------------------------------------------------
 TINY_DEFAULTS = dict(
-    D=64, B_blocks=2, C=2, D_col=32, D_pcm=16,
+    D=64, D_embed=64, B_blocks=2, C=2, D_pcm=16,
     vocab_size=64, R=2, N=16, K_segments=2,
     r=4, M=8, ffn_expansion=2,
     k_ret=2, C_em=4,

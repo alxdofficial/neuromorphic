@@ -605,7 +605,9 @@ elig_V += gate * route_w ⊗ v_cand
 At the end of each pass, the neuromodulator decides how much to commit:
 
 ```
-(g, slot_logits, tau) = PM_neuromodulator(elig_summary)
+(g, slot_logits, tau, ww) = PM_neuromodulator(elig_summary)
+g *= elig_mag / max(elig_mag)              # scale by eligibility magnitude (pass-0 → g≈0)
+slot_logits -= ww * pm_a                   # learned weakness bias (prefer weaker slots)
 slot_weights = softmax(slot_logits / tau)   # which slots to update
 pm_K = (1 - g * slot_weights) * pm_K + g * slot_weights * elig_K
 pm_V = (1 - g * slot_weights) * pm_V + g * slot_weights * elig_V
@@ -625,9 +627,9 @@ Top-C candidates (highest novelty) are buffered per pass. At the end of each
 pass, the neuromodulator decides writes:
 
 ```
-(g_em, tau, decay) = EM_neuromodulator(novelty_mean, em_usage, content)
-slot_scores = candidates @ em_K.T / tau   # soft slot selection
-slot_weights = softmax(slot_scores)
+(g_em, tau, decay, ww) = EM_neuromodulator(novelty_mean, em_usage, content)
+slot_scores = candidates @ em_K.T + ww * weakness  # learned weakness bias
+slot_weights = softmax(slot_scores / tau)
 em_K[slot] = (1 - g_em * slot_weights) * em_K[slot] + g_em * slot_weights * candidate_K
 em_V[slot] = (1 - g_em * slot_weights) * em_V[slot] + g_em * slot_weights * candidate_V
 em_S *= decay                             # strength decay before write

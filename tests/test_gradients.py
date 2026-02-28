@@ -59,7 +59,7 @@ class TestGradientFlow:
         loss.backward()
 
         # Check key structural parameters
-        for name in ["embedding.weight", "fan_out.weight", "fan_in.weight",
+        for name in ["embedding.weight", "fan_in.weight",
                       "lm_head.weight", "lambda_logit"]:
             parts = name.split(".")
             obj = model
@@ -151,3 +151,37 @@ class TestGradientFlow:
 
         assert model.lambda_logit.grad is not None
         assert model.lambda_logit.grad.abs() > 0
+
+    def test_lateral_mixer_gradient(self):
+        """LateralMixer W_out should receive gradients (zero-init residual).
+
+        W_q/W_k/W_v get zero grads at init because W_out is zero-init;
+        once W_out updates, gradients flow through to Q/K/V projections.
+        """
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        lateral = model.columns.lateral
+        # W_out gets gradient directly (grad = input^T @ output_grad)
+        assert lateral.W_out.weight.grad is not None
+        assert lateral.W_out.weight.grad.abs().sum() > 0
+        # W_q/W_k/W_v have grad=0 at init (blocked by zero W_out) — expected
+        for name in ["W_q", "W_k", "W_v"]:
+            w = getattr(lateral, name).weight
+            assert w.grad is not None, f"No gradient for lateral.{name}"
+
+    def test_proj_up_down_gradient(self):
+        """proj_up/proj_down should receive gradients when D_embed != D."""
+        cfg = make_tiny_config(D=64, D_embed=32)
+        model = NeuromorphicLM(cfg)
+
+        loss = _compute_loss(model)
+        loss.backward()
+
+        assert model.proj_up.weight.grad is not None
+        assert model.proj_up.weight.grad.abs().sum() > 0
+        assert model.proj_down.weight.grad is not None
+        assert model.proj_down.weight.grad.abs().sum() > 0

@@ -129,7 +129,7 @@ def generate_text_sample_plot(
 
     # Reset model memory state for clean generation
     reset_mask = torch.ones(BS, dtype=torch.bool, device=device)
-    model.reset_at_doc_boundary(reset_mask)
+    model._reset_memory(reset_mask)
 
     try:
         generated = model.generate(

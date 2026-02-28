@@ -40,7 +40,7 @@ class TestEndToEnd:
 
         # Check gradients exist on key params
         assert model.embedding.weight.grad is not None
-        assert model.fan_out.weight.grad is not None
+        assert model.fan_in.weight.grad is not None
 
     def test_state_persistence_across_segments(self):
         """PM/EM state should persist across segments."""
@@ -84,9 +84,9 @@ class TestEndToEnd:
 
         B = cfg.B_blocks
 
-        # Set some PM content (state is [BS, B, r, D_col])
+        # Set some PM content (state is [BS, B, r, D])
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         a_before = pm.pm_a.sum().item()
@@ -108,7 +108,7 @@ class TestEndToEnd:
 
         # Set large PM content
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col) * 10
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D) * 10
         pm.pm_a = torch.ones(BS, B, cfg.r) * 5.0
         a_before = pm.pm_a.sum().item()
 
@@ -132,7 +132,7 @@ class TestEndToEnd:
 
         # Set some PM content
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         a_before = pm.pm_a.sum().item()
@@ -168,3 +168,79 @@ class TestEndToEnd:
         cfg = make_tiny_config(tie_embeddings=False)
         model = NeuromorphicLM(cfg)
         assert model.lm_head.weight is not model.embedding.weight
+
+    def test_d_embed_decoupled_forward_backward(self):
+        """D_embed != D should work end-to-end with backward."""
+        cfg = make_tiny_config(D=64, D_embed=32)
+        model = NeuromorphicLM(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+
+        input_ids = torch.randint(0, VOCAB, (BS, cfg.N))
+        target_ids = torch.randint(0, VOCAB, (BS, cfg.N))
+        logits, aux = model.forward_segment(input_ids)
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1))
+        (loss + aux).backward()
+
+        assert model.embedding.weight.grad is not None
+        assert model.proj_up.weight.grad is not None
+        assert model.proj_down.weight.grad is not None
+
+    def test_d_embed_tied_embeddings(self):
+        """Tied embeddings should work with D_embed != D."""
+        cfg = make_tiny_config(D=64, D_embed=32, tie_embeddings=True)
+        model = NeuromorphicLM(cfg)
+        assert model.lm_head.weight is model.embedding.weight
+        assert model.embedding.weight.shape == (VOCAB, 32)
+
+    def test_d_embed_decoupled_multi_segment(self):
+        """D_embed decoupled should work across multiple segments."""
+        cfg = make_tiny_config(D=64, D_embed=32)
+        model = NeuromorphicLM(cfg)
+        results = forward_k_segments(model, K=3, BS=BS)
+        assert len(results) == 3
+        for logits, aux in results:
+            assert logits.shape == (BS, cfg.N, VOCAB)
+
+    def test_generate_shape(self):
+        """generate() should produce [BS, P + max_new_tokens] output."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+        model.set_eval_mode()
+
+        prompt = torch.randint(0, VOCAB, (BS, 5))
+        out = model.generate(prompt, max_new_tokens=10, temperature=1.0, top_k=10)
+        assert out.shape == (BS, 15)
+
+    def test_generate_preserves_prompt(self):
+        """generate() output should start with the prompt."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+        model.set_eval_mode()
+
+        prompt = torch.randint(0, VOCAB, (BS, 5))
+        out = model.generate(prompt, max_new_tokens=3, temperature=1.0, top_k=10)
+        assert torch.equal(out[:, :5], prompt)
+
+    def test_fitb_inline_static_shapes(self):
+        """FITB inline path should produce valid loss without nonzero()."""
+        cfg = make_tiny_config()
+        model = NeuromorphicLM(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+
+        N = cfg.N
+        input_ids = torch.randint(0, VOCAB, (BS, N))
+        target_ids = input_ids.clone()
+        fitb_mask = torch.rand(BS, N) < 0.3
+        # Ensure at least one masked position
+        fitb_mask[0, 0] = True
+        input_ids_masked = input_ids.clone()
+        input_ids_masked[fitb_mask] = cfg.fitb_id
+
+        fitb_loss, aux_loss, fitb_valid = model.forward_segment(
+            input_ids_masked, fitb_mask=fitb_mask, target_ids=target_ids,
+        )
+        assert fitb_loss.shape == ()
+        assert fitb_valid.item() > 0
+        assert torch.isfinite(fitb_loss)

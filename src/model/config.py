@@ -11,11 +11,12 @@ from dataclasses import dataclass
 @dataclass
 class ModelConfig:
     # Architecture — v4 iterative refinement
-    D: int = 512              # model width (embedding dim)
+    D: int = 512              # model width (internal)
+    D_embed: int = -1         # embedding dim (defaults to D in validate())
     R: int = 4                # iterative refinement passes
     B_blocks: int = 4         # memory blocks
     C: int = 4                # columns per block
-    D_col: int = 256          # column width (also PM/EM dimension)
+    D_col: int = -1            # derived: D // C (set in validate())
     D_pcm: int = 64           # PCM encoding dim
     N: int = 128              # segment length
     K_segments: int = 2       # TBPTT chunk = K segments
@@ -26,14 +27,15 @@ class ModelConfig:
 
     # Procedural Memory (single instance, batched as BS*B)
     r: int = 8                # PM slots
-    rho: float = 0.95         # eligibility decay
     a_max: float = 3.0        # max strength per slot
     budget_pm: float = 4.0    # sum(pm_a) budget per stream
     decay_pm: float = 0.999   # per-pass strength decay
     tau_pm: float = 1.0       # softmax temperature (default for PM slot selection)
     tau_pm_floor: float = 0.05
     tau_pm_ceil: float = 5.0
-    weakness_weight_pm: float = 0.5
+    ww_pm_default: float = 0.5
+    ww_pm_floor: float = 0.0
+    ww_pm_ceil: float = 2.0
     tau_route_pm: float = 1.0
     surprise_scale: float = 5.0
     g_pm_default: float = 0.5
@@ -41,9 +43,9 @@ class ModelConfig:
     # Episodic Memory (single instance, batched as BS*B)
     M: int = 64               # EM capacity per bank
     k_ret: int = 4            # retrieval count
-    C_em: int = 8             # candidates per pass (top-C_em across N*C)
+    C_em: int = 8             # candidates per pass (top-C_em across N positions)
     tau_em: float = 1.0
-    weakness_weight_em: float = 0.5
+    ww_em_default: float = 0.5
     S_max: float = 3.0
     budget_em: float = 8.0
     decay_em: float = 0.999
@@ -95,14 +97,21 @@ class ModelConfig:
         """Check config validity. Call before model construction."""
         if self.D <= 0:
             raise ValueError(f"D ({self.D}) must be positive.")
+        # Derive D_embed (defaults to D when not explicitly set)
+        if self.D_embed == -1:
+            self.D_embed = self.D
+        if self.D_embed <= 0:
+            raise ValueError(f"D_embed ({self.D_embed}) must be positive.")
         if self.R < 1:
             raise ValueError(f"R ({self.R}) must be >= 1.")
         if self.B_blocks < 1:
             raise ValueError(f"B_blocks ({self.B_blocks}) must be >= 1.")
         if self.C < 1:
             raise ValueError(f"C ({self.C}) must be >= 1.")
-        if self.D_col <= 0:
-            raise ValueError(f"D_col ({self.D_col}) must be positive.")
+        if self.D % self.C != 0:
+            raise ValueError(f"D ({self.D}) must be divisible by C ({self.C}).")
+        # Derive D_col from D and C (MHA-style split)
+        self.D_col = self.D // self.C
         if self.D_pcm <= 0 and self.pcm_enabled:
             raise ValueError(f"D_pcm ({self.D_pcm}) must be positive when pcm_enabled.")
         if self.N < 1:
@@ -152,9 +161,9 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Dev tier (~100M). Matches Pythia-70M / Mamba-130M scale."""
+        """Dev tier (~104M). Matches Pythia-70M / Mamba-130M scale."""
         defaults = dict(
-            D=768, B_blocks=6, C=4, D_col=384,
+            D=2048, D_embed=384, B_blocks=6, C=4,
             D_pcm=64, R=4, N=128, r=8, M=64,
         )
         defaults.update(overrides)
@@ -162,9 +171,9 @@ class ModelConfig:
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Research tier (~400M). Matches Pythia-410M / Mamba-370M."""
+        """Research tier (~390M). Matches Pythia-410M / Mamba-370M."""
         defaults = dict(
-            D=1536, B_blocks=8, C=8, D_col=576,
+            D=3072, D_embed=512, B_blocks=12, C=4,
             D_pcm=96, R=4, N=128, r=16, M=128,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,
@@ -174,9 +183,9 @@ class ModelConfig:
 
     @classmethod
     def tier_c(cls, **overrides) -> "ModelConfig":
-        """1B-class tier (~1.05B). Matches Pythia-1B / TinyLlama-1.1B / Mamba-790M."""
+        """1B-class tier (~894M). Matches Pythia-1B / TinyLlama-1.1B / Mamba-790M."""
         defaults = dict(
-            D=2048, B_blocks=12, C=8, D_col=768,
+            D=4096, D_embed=768, B_blocks=16, C=4,
             D_pcm=128, R=6, N=128, r=16, M=256,
             k_ret=8, C_em=16,
             neuromod_hidden=64, content_proj_dim=16,

@@ -66,9 +66,9 @@ class TestReset:
         model, cfg = _init_model("A")
         B = cfg.B_blocks
 
-        # Give PM some content (state is [BS, B, r, D_col])
+        # Give PM some content (state is [BS, B, r, D])
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D_col)
+        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
         pm.pm_a = torch.ones(BS, B, cfg.r)
 
         # Mask: reset stream 0 (all its B blocks), keep stream 1
@@ -83,14 +83,14 @@ class TestReset:
 
 
 class TestEMReset:
-    def test_em_reset_only_zeros_strengths(self):
-        """EM reset: em_S zeroed for masked. em_K/em_V UNCHANGED."""
+    def test_em_reset_zeros_all_state(self):
+        """EM reset: em_S, em_age, em_K, em_V all zeroed for masked (Bug 4)."""
         model, cfg = _init_model("A")
         B = cfg.B_blocks
 
         em = model.em
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D_col)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D_col)
+        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
+        em.em_V = torch.randn(BS, B, cfg.M, cfg.D)
         em.em_S = torch.ones(BS, B, cfg.M)
         em.em_age = torch.ones(BS, B, cfg.M) * 50
 
@@ -100,13 +100,15 @@ class TestEMReset:
         mask = torch.tensor([True, False])
         model._reset_memory(mask)
 
-        assert torch.equal(em.em_K, em_K_before), "em_K should be unchanged"
-        assert torch.equal(em.em_V, em_V_before), "em_V should be unchanged"
-        # Stream 0's blocks should be zeroed
+        # Stream 0: everything zeroed
         assert (em.em_S[0] == 0).all(), "em_S should be zeroed for masked"
         assert (em.em_age[0] == 0).all(), "em_age should be zeroed for masked"
+        assert (em.em_K[0] == 0).all(), "em_K should be zeroed for masked"
+        assert (em.em_V[0] == 0).all(), "em_V should be zeroed for masked"
         # Stream 1 preserved
         assert (em.em_S[1] > 0).all(), "em_S should be preserved for unmasked"
+        assert torch.equal(em.em_K[1], em_K_before[1]), "em_K[1] should be preserved"
+        assert torch.equal(em.em_V[1], em_V_before[1]), "em_V[1] should be preserved"
 
 
 class TestSaveLoad:
@@ -149,7 +151,7 @@ class TestSaveLoad:
         load_runtime_state(model2, state)
 
         # r=8 state should be unchanged (mismatched shapes skipped)
-        assert model2.pm.pm_K.shape[2] == 8  # [BS, B, r, D_col]
+        assert model2.pm.pm_K.shape[2] == 8  # [BS, B, r, D]
         assert torch.equal(model2.pm.pm_K, pm_K_before)
 
     def test_save_uses_stable_path_keys(self):

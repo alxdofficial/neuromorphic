@@ -61,7 +61,12 @@ class GroupedLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [..., C, in_features] -> [..., C, out_features]
-        out = torch.einsum("...ci, coi -> ...co", x, self.weight)
+        lead = x.shape[:-2]
+        x_3d = x.reshape(-1, self.C, self.in_features)   # [B0, C, in]
+        x_3d = x_3d.transpose(0, 1)                       # [C, B0, in]
+        out = torch.bmm(x_3d, self.weight.transpose(1, 2))  # [C, B0, out]
+        out = out.transpose(0, 1)                          # [B0, C, out]
+        out = out.reshape(*lead, self.C, self.out_features)
         if self.bias is not None:
             out = out + self.bias
         return out

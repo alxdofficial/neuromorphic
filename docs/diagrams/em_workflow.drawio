@@ -128,15 +128,15 @@
           <mxGeometry x="160" y="500" width="260" height="60" as="geometry"/>
         </mxCell>
 
-        <mxCell id="w_neuromod" value="&lt;b&gt;EMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;MLP: features → backbone(ReLU)&lt;br&gt;→ g_head (sigmoid scaled) → g_em [BS]&lt;br&gt;→ tau_head (sigmoid scaled) → τ [BS]&lt;br&gt;→ decay_head (sigmoid scaled) → decay [BS]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
-          <mxGeometry x="480" y="495" width="260" height="80" as="geometry"/>
+        <mxCell id="w_neuromod" value="&lt;b&gt;EMNeuromodulator&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;MLP: features → backbone(ReLU)&lt;br&gt;→ g_head (sigmoid scaled) → g_em [BS]&lt;br&gt;→ tau_head (sigmoid scaled) → τ [BS]&lt;br&gt;→ decay_head (sigmoid scaled) → decay [BS]&lt;br&gt;→ ww_head (sigmoid scaled) → ww [BS]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="480" y="495" width="260" height="90" as="geometry"/>
         </mxCell>
         <mxCell id="we1" style="endArrow=block;endFill=1;" edge="1" source="w_neuromod_in" target="w_neuromod" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
         <!-- Slot selection -->
-        <mxCell id="w_slots" value="1. Slot Selection&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;slot_scores = cand_K_norm @ em_K.T + weakness_bias&lt;br&gt;slot_weights = softmax(slot_scores / τ) [BS, C_em, M]&lt;br&gt;α_per_slot = Σ_cand (g_em × cand_weight × slot_weights) [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="w_slots" value="1. Slot Selection&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;slot_scores = cand_K_norm @ em_K.T + ww × (−em_S)&lt;br&gt;slot_weights = softmax(slot_scores / τ) [BS, C_em, M]&lt;br&gt;α_per_slot = Σ_cand (g_em × cand_weight × slot_weights) [BS, M]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="160" y="590" width="370" height="60" as="geometry"/>
         </mxCell>
         <mxCell id="we2" style="endArrow=block;endFill=1;" edge="1" source="w_neuromod" target="w_slots" parent="1">
