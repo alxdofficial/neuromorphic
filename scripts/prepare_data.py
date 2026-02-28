@@ -31,6 +31,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -78,7 +79,11 @@ def stream_and_save(
     text_column: str = "text",
     label: str = "",
 ) -> dict:
-    """Stream a HF dataset, count tokens, save as parquet when target reached.
+    """Stream a HF dataset, count tokens, save as parquet + tokenized shard.
+
+    Saves both raw text (.parquet) and pre-tokenized binary (.bin) for fast
+    training. The .bin shard is a flat uint16 array of token IDs with EOS
+    tokens between documents — ready for memory-mapped streaming.
 
     Returns metadata dict with token/example counts.
     """
@@ -89,10 +94,19 @@ def stream_and_save(
     print(f"  Output: {out_path}")
     print(f"{'='*60}")
 
+    eos_id = tokenizer.eos_token_id
+    vocab_size = len(tokenizer)
+    if vocab_size > 65535:
+        raise ValueError(
+            f"Vocab size {vocab_size} exceeds uint16 range. "
+            f"Token shards require vocab_size <= 65535."
+        )
+
     ds = load_dataset(hf_path, split=split, streaming=True)
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
 
     texts = []
+    all_token_ids = []  # collected for .bin shard
     total_tokens = 0
     skipped = 0
     t0 = time.time()
@@ -103,9 +117,11 @@ def stream_and_save(
             skipped += 1
             continue
 
-        n_tok = len(tokenizer.encode(text, add_special_tokens=False))
+        tokens = tokenizer.encode(text, add_special_tokens=False)
         texts.append(text)
-        total_tokens += n_tok
+        all_token_ids.extend(tokens)
+        all_token_ids.append(eos_id)
+        total_tokens += len(tokens)
 
         if (i + 1) % PROGRESS_INTERVAL == 0:
             elapsed = time.time() - t0
@@ -125,13 +141,21 @@ def stream_and_save(
     elapsed = time.time() - t0
     print(f"\n  Done: {len(texts):,} examples, {total_tokens:,} tokens in {elapsed:.0f}s")
 
-    # Save as parquet
+    # Save as parquet (raw text, for inspection/re-tokenization)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table({"text": texts})
     pq.write_table(table, out_path, compression="zstd")
 
     file_size = out_path.stat().st_size
     print(f"  Saved: {out_path} ({file_size / 1e9:.2f} GB)")
+
+    # Save pre-tokenized shard (.bin) for fast training
+    shard_path = out_path.with_suffix(".bin")
+    shard_tokens = len(all_token_ids)
+    token_array = np.array(all_token_ids, dtype=np.uint16)
+    token_array.tofile(shard_path)
+    shard_size = shard_path.stat().st_size
+    print(f"  Shard: {shard_path} ({shard_size / 1e9:.2f} GB, {shard_tokens:,} tokens)")
 
     return {
         "examples": len(texts),
@@ -141,6 +165,9 @@ def stream_and_save(
         "elapsed_s": round(elapsed, 1),
         "seed": seed,
         "split": split,
+        "shard_file": str(shard_path),
+        "shard_tokens": shard_tokens,
+        "shard_bytes": shard_size,
     }
 
 

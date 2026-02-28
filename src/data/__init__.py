@@ -11,6 +11,7 @@ from .tokenizer import (
 from .streaming import (
     PersistentStreamDataset,
     MixedStreamDataset,
+    TokenShardDataset,
     StreamBatch,
     create_dataloader,
 )
@@ -31,6 +32,7 @@ __all__ = [
     # Streaming
     "PersistentStreamDataset",
     "MixedStreamDataset",
+    "TokenShardDataset",
     "StreamBatch",
     "create_dataloader",
     # Debug

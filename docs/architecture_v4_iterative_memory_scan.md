@@ -501,30 +501,36 @@ indirect access to each other through memory. "Depth" emerges.
 ### Column Dimensions
 
 ```
-# Tier A example (~96M params)
+# Tier A example (~105M params)
 D = 2048          # internal model width
 D_embed = 384     # embedding / LM head width (decoupled from D)
 B_blocks = 6      # memory blocks (PM/EM state batched as BS*B)
-C = 4             # columns per block → G = B*C = 24 groups total
-D_col = 512       # = D // C. Column width (also PM/EM dimension — unified)
+C = 16            # columns per block → G = B*C = 96 groups total
+D_col = 128       # = D // C. Column width (also PM/EM slice width)
 D_pcm = 64        # PCM encoding dimension
-ffn_depth = 1     # L = 1 → 2 total FFN layers per pass (1 pre + 1 post)
-R = 2             # refinement passes
+ffn_depth = 3     # L = 3 → 6 total FFN layers per pass (3 pre + 3 post)
+ffn_expansion = 4 # FFN hidden dim = D_col * ffn_expansion = 512
+R = 4             # refinement passes
+N = 512           # segment length → N_C = N // C = 32 tokens per column
 
 Fan-out:  D → G × D_col = 2048 → 12288  (6x)
 Fan-in:   G × D_col → D = 12288 → 2048
 
-# Tier presets (see config.py):
-# Tier A (~96M):   D=2048 D_embed=384 B=6  C=4  G=24  Dcol=512  R=2  L=1
-# Tier B (~390M):  D=3072 D_embed=512 B=12 C=4  G=48  Dcol=768  R=4
-# Tier C (~894M):  D=4096 D_embed=768 B=16 C=4  G=64  Dcol=1024 R=6
+# Tier presets (see config.py, C=16, N=512 uniform):
+# Tier A (~105M): D=2048 D_embed=384 B=6  C=16 G=96  Dcol=128 R=4  L=3
+#   r=32, M=256, k_ret=16, C_em=32
+# Tier B (~406M): D=3072 D_embed=512 B=12 C=16 G=192 Dcol=192 R=6  L=3
+#   r=64, M=512, k_ret=32, C_em=64
+# Tier C (~944M): D=4096 D_embed=768 B=16 C=16 G=256 Dcol=256 R=8  L=3
+#   r=128, M=1024, k_ret=64, C_em=128
 ```
 
 ### Segment Length
 
-Segment length N determines how many tokens contribute to each round of R
-PM/EM updates. N=128 means each pass sees 128 tokens of eligibility/novelty
-before committing. Shorter N = more frequent cross-segment updates.
+Segment length N=512 determines how many tokens contribute to each round of R
+PM/EM updates. N_C = N // C = 32 tokens per column per pass. Each pass sees
+N tokens of eligibility/novelty before committing. Shorter N = more frequent
+cross-segment updates.
 
 ### Damped Pass-to-Pass Mixing
 
@@ -571,7 +577,7 @@ Compare:
 - Current (v1):       O(K×P) = 8×32 = **256 steps**
 - Transformer (L=6):  O(L) = **6 steps** (but O(N²) compute per step)
 - Mamba (L=6):        O(L×N) (sequential scan per layer)
-- **v4 (R=2, L=1)**:  O(R×2L) = **4 steps** (and O(N×D²) compute per step)
+- **v4 (R=4, L=3)**:  O(R×2L) = **24 steps** (and O(N×D²) compute per step)
 
 ### Compute
 
@@ -674,7 +680,7 @@ At the end of each pass, the neuromodulator decides how much to commit:
 
 ```
 (g, slot_logits, tau, ww) = PM_neuromodulator(elig_summary)
-g *= elig_mag / max(elig_mag)              # scale by eligibility magnitude (pass-0 → g≈0)
+g *= elig_mag / (elig_mag.detach() + eps)   # scale by eligibility magnitude (pass-0 → g≈0)
 slot_logits -= ww * pm_a                   # learned weakness bias (prefer weaker slots)
 slot_weights = softmax(slot_logits / tau)   # which slots to update
 pm_K = (1 - g * slot_weights) * pm_K + g * slot_weights * elig_K
@@ -700,7 +706,8 @@ slot_scores = candidates @ em_K.T + ww * weakness  # learned weakness bias
 slot_weights = softmax(slot_scores / tau)
 em_K[slot] = (1 - g_em * slot_weights) * em_K[slot] + g_em * slot_weights * candidate_K
 em_V[slot] = (1 - g_em * slot_weights) * em_V[slot] + g_em * slot_weights * candidate_V
-em_S *= decay                             # strength decay before write
+# Note: strength decay (em_S *= decay) runs once per segment via em.base_decay(),
+# NOT per pass. See "Note on decay/aging timing" below.
 ```
 
 **Note on decay/aging timing:** `pm.base_decay()` and `em.age_tick(N)` run
@@ -726,6 +733,59 @@ not refinement depth. PM/EM *commits and writes* still happen between passes.
 | EM neuromod write | Between passes | Once per pass | Small |
 | PM base decay | After R loop | Once per segment | Tiny |
 | EM age tick | After R loop | Once per segment | Tiny |
+
+## Inference: Non-Autoregressive Generation
+
+The architecture supports two generation modes:
+
+### `generate()` — Autoregressive (NTP)
+
+Standard sliding-window autoregressive generation. O(R×N) per new token.
+Slow — included for completeness, not recommended.
+
+### `generate_segments()` — Non-Autoregressive (FITB)
+
+Generates N-token chunks at once via FITB iterative refinement:
+
+1. **Phase 1 (prompt warmup):** Process prompt tokens through NTP segments to warm PM/EM.
+2. **Phase 2 (chunk generation):** For each N-token chunk:
+   - Initialize all positions as `<FITB>` tokens
+   - Run R refinement passes (standard FITB forward)
+   - Sample from last pass's logits (temperature + top-k)
+   - Append sampled tokens to output
+
+Throughput: N/R tokens per forward pass vs 1 for autoregressive. At Tier A
+(R=4, N=512): ~128 tokens per forward pass, benchmarked at **68.9k tok/s**.
+
+## Performance
+
+### Activation Checkpointing
+
+Controlled via `config.gradient_checkpointing` (default: False). When enabled:
+
+- **FFN stacks** (ffn_pre, ffn_post): checkpoints each of the L FFN layers
+  individually via `grad_checkpoint(_layer, x, idx, gain)`. This is the
+  dominant memory consumer (2 stacks × L=3 layers × D_col × ffn_expansion).
+- **PositionAttention**: checkpoints the full attention computation (Q/K/V
+  projections, bmm, softmax, out_proj) as a single unit.
+
+Recomputes activations during backward to save VRAM. Enables larger batch
+sizes at the cost of ~30% more compute.
+
+### Pre-Tokenized Data Pipeline
+
+For production training, use pre-tokenized `.bin` shards instead of
+on-the-fly tokenization:
+
+1. Run `scripts/prepare_data.py` — produces both `.parquet` (text) and `.bin`
+   (uint16 token IDs with EOS separators) files.
+2. `create_dataloader()` automatically detects `.bin` shards alongside parquet
+   files and uses `TokenShardDataset` (memory-mapped, pinned memory, prefetch
+   thread) instead of `PersistentStreamDataset` (on-the-fly tokenization).
+
+Benefits: eliminates tokenization CPU overhead, uses OS page cache for I/O,
+pinned memory for non-blocking CPU→GPU transfer, background prefetch thread
+overlaps data loading with GPU computation.
 
 ## Prototyping Plan
 

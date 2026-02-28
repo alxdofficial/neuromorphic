@@ -8,7 +8,7 @@ No Python loop over blocks — only a loop over R refinement passes.
 
 Fan-out: interleaved token partitioning — column c gets tokens c, c+C, c+2C, ...
          with feature slice c*D_col:(c+1)*D_col.
-Fan-in: mean across blocks + skip connection with zero-init D_col→D projection.
+Fan-in: mean across blocks + skip connection with small-scale-init D_col→D projection.
 PM/EM reads use per-column D_col slices; writes stay at block level D.
 """
 
@@ -467,8 +467,13 @@ class NeuromorphicLM(nn.Module):
         Returns: [BS, P + max_new_tokens]
         """
         N = self.config.N
+        BS = prompt_ids.shape[0]
         device = prompt_ids.device
         sequence = prompt_ids
+
+        # Ensure states are initialized
+        if not self.pm.is_initialized() or not self.em.is_initialized():
+            self.initialize_states(BS, device)
 
         for _ in range(max_new_tokens):
             # Take last N tokens as context window

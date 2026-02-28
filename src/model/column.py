@@ -70,12 +70,13 @@ class PositionAttention(nn.Module):
     Input/output: [BS, N_C, G, D_col]
     """
 
-    def __init__(self, G: int, D_col: int, D_attn: int):
+    def __init__(self, G: int, D_col: int, D_attn: int, grad_ckpt: bool = False):
         super().__init__()
         self.G = G
         self.D_col = D_col
         self.D_attn = D_attn
         self.scale = D_attn ** -0.5
+        self._grad_ckpt = grad_ckpt
 
         self.norm = GroupedLayerNorm(G, D_col)
         self.q_proj = GroupedLinear(G, D_col, D_attn)
@@ -87,8 +88,8 @@ class PositionAttention(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """x: [BS, N_C, G, D_col] -> [BS, N_C, G, D_col]"""
+    def _attention(self, x: Tensor) -> Tensor:
+        """Core attention computation (checkpointable)."""
         BS, N_C, G, D_col = x.shape
         h = self.norm(x)
         q = self.q_proj(h)   # [BS, N_C, G, D_attn]
@@ -107,8 +108,15 @@ class PositionAttention(nn.Module):
 
         # Reshape back to [BS, N_C, G, D_col]
         out = out.reshape(BS, G, N_C, D_col).permute(0, 2, 1, 3)
+        return self.out_proj(out)
 
-        return x + self.out_proj(out)
+    def forward(self, x: Tensor) -> Tensor:
+        """x: [BS, N_C, G, D_col] -> [BS, N_C, G, D_col]"""
+        if self._grad_ckpt and x.requires_grad:
+            out = grad_checkpoint(self._attention, x, use_reentrant=False)
+        else:
+            out = self._attention(x)
+        return x + out
 
 
 class FFNStack(nn.Module):
@@ -176,7 +184,8 @@ class CorticalColumnGroup(nn.Module):
 
         # Position attention: content-adaptive attention across N_C positions
         if config.position_attn_dim > 0:
-            self.pos_attn = PositionAttention(G, D_col, config.position_attn_dim)
+            self.pos_attn = PositionAttention(G, D_col, config.position_attn_dim,
+                                              config.gradient_checkpointing)
         else:
             self.pos_attn = None
 

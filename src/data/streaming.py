@@ -7,13 +7,19 @@ Key design:
 - State (hidden, PM, EM, eligibility) persists across TBPTT chunks
 - Different streams hit document boundaries at different positions
 
+Two dataset backends:
+- TokenShardDataset: pre-tokenized .bin shards (fast, recommended)
+- PersistentStreamDataset: on-the-fly tokenization from text (fallback)
+
 This is fundamentally different from transformer data loading where
 each batch item is an independent sequence.
 """
 
 import logging
 import os
+import threading
 import time
+from queue import Queue
 
 import torch
 from torch.utils.data import IterableDataset, DataLoader
@@ -68,6 +74,161 @@ class StreamBatch:
     input_ids: torch.Tensor      # [BS, T] - input tokens
     target_ids: torch.Tensor     # [BS, T] - target tokens (shifted by 1)
     prev_token: torch.Tensor     # [BS] - last token from previous chunk (for reset detection)
+
+
+class _PrefetchIter:
+    """Background thread that pre-fills a queue of batches for async overlap."""
+
+    def __init__(self, gen: Iterator, prefetch: int = 2):
+        self._queue: Queue = Queue(maxsize=prefetch)
+        self._gen = gen
+        self._thread = threading.Thread(target=self._fill, daemon=True)
+        self._thread.start()
+
+    def _fill(self):
+        try:
+            for item in self._gen:
+                self._queue.put(item)
+        except Exception as e:
+            self._queue.put(e)
+        finally:
+            self._queue.put(None)  # sentinel
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get()
+        if item is None:
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class TokenShardDataset(IterableDataset):
+    """Pre-tokenized shard dataset with pinned memory and prefetch.
+
+    Reads from a memory-mapped .bin file of uint16 token IDs (produced by
+    prepare_data.py). BS streams read from evenly-spaced offsets with
+    wrap-around. Eliminates tokenization overhead and uses pinned memory
+    for non-blocking CPU→GPU transfer.
+
+    Usage:
+        dataset = TokenShardDataset(
+            shard_path="data/pile/pile_train.bin",
+            eos_token_id=2,
+            batch_size=16,
+            seq_length=1024,
+        )
+        for batch in dataset:
+            batch.input_ids  # [BS, T], pinned memory
+    """
+
+    def __init__(
+        self,
+        shard_path: str,
+        eos_token_id: int,
+        batch_size: int = 16,
+        seq_length: int = 256,
+        seed: int = 42,
+        max_steps: Optional[int] = None,
+        prefetch: int = 2,
+    ):
+        self.shard_path = shard_path
+        self.eos_token_id = eos_token_id
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.seed = seed
+        self.max_steps = max_steps
+        self.prefetch = prefetch
+
+        # Memory-map the shard (read-only, OS page cache handles prefetch)
+        self.tokens = np.memmap(shard_path, dtype=np.uint16, mode="r")
+        self.shard_len = len(self.tokens)
+
+        if self.shard_len < seq_length + 1:
+            raise ValueError(
+                f"Shard has {self.shard_len} tokens, need at least {seq_length + 1}"
+            )
+
+        self.step_count = 0
+        self.prev_tokens: Optional[torch.Tensor] = None
+        # Compat with PersistentStreamDataset monitoring
+        self.stream_restarts_total = 0
+        self.stream_restarts_last_batch = 0
+        self.streams_exhausted_last_batch = 0
+
+    def _generate(self) -> Iterator[StreamBatch]:
+        """Core generation loop (wrapped by prefetch thread)."""
+        BS = self.batch_size
+        T = self.seq_length
+        shard_len = self.shard_len
+        chunk_size = T + 1  # need +1 for target shift
+
+        # Distribute streams evenly across shard with seed-based jitter
+        rng = np.random.RandomState(self.seed)
+        stride = shard_len // BS
+        positions = np.array(
+            [(i * stride + rng.randint(0, max(stride, 1))) % shard_len for i in range(BS)],
+            dtype=np.int64,
+        )
+
+        # Initialize prev_tokens to EOS (triggers reset on first chunk)
+        self.prev_tokens = torch.full((BS,), self.eos_token_id, dtype=torch.long)
+        self.step_count = 0
+
+        # Pre-allocate pinned buffer for async CPU→GPU transfer
+        use_pin = torch.cuda.is_available()
+        buf = torch.empty(BS, chunk_size, dtype=torch.long, pin_memory=use_pin)
+
+        while True:
+            if self.max_steps is not None and self.step_count >= self.max_steps:
+                break
+
+            # Fill buffer from memory-mapped array
+            for i in range(BS):
+                pos = int(positions[i])
+                end = pos + chunk_size
+                if end <= shard_len:
+                    chunk = self.tokens[pos:end]
+                else:
+                    # Wrap around shard boundary
+                    chunk = np.concatenate([
+                        self.tokens[pos:],
+                        self.tokens[: end - shard_len],
+                    ])
+                buf[i] = torch.from_numpy(chunk.astype(np.int64))
+                positions[i] = end % shard_len
+
+            batch = StreamBatch(
+                input_ids=buf[:, :-1].clone(),
+                target_ids=buf[:, 1:].clone(),
+                prev_token=self.prev_tokens.clone(),
+            )
+
+            # Update prev_tokens for next chunk (last input token)
+            self.prev_tokens = buf[:, -2].clone()
+            self.step_count += 1
+
+            yield batch
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        if self.prefetch > 0:
+            return _PrefetchIter(self._generate(), prefetch=self.prefetch)
+        return self._generate()
+
+    def reset(self):
+        """Reset dataset state."""
+        self.step_count = 0
+        self.prev_tokens = None
+
+    def monitor_stats(self) -> dict:
+        return {
+            "stream_restarts_total": 0,
+            "stream_restarts_last_batch": 0,
+            "streams_exhausted_last_batch": 0,
+        }
 
 
 _MAX_RETRIES = 10
@@ -600,6 +761,19 @@ class _DatasetIterator:
         return {}
 
 
+def _find_shard(config) -> Optional[str]:
+    """Check if a pre-tokenized .bin shard exists alongside the parquet file."""
+    path = config.hf_path
+    if not os.path.exists(path):
+        return None
+    base, ext = os.path.splitext(path)
+    if ext.lower() in (".parquet", ".jsonl", ".csv"):
+        shard_path = base + ".bin"
+        if os.path.exists(shard_path):
+            return shard_path
+    return None
+
+
 def create_dataloader(
     phase: str,
     tokenizer: PreTrainedTokenizerFast,
@@ -610,6 +784,9 @@ def create_dataloader(
 ) -> Iterator[StreamBatch]:
     """
     Create a dataloader for a training phase.
+
+    Automatically uses pre-tokenized .bin shards when available (faster).
+    Falls back to on-the-fly tokenization from text otherwise.
 
     Args:
         phase: Training phase ("A", "B", "C", etc.)
@@ -630,7 +807,21 @@ def create_dataloader(
     phase_cfg = PHASE_CONFIGS[phase]
     configs = [DATASET_CONFIGS[name] for name in phase_cfg.datasets]
 
+    # Single dataset: try pre-tokenized shard first
     if len(configs) == 1:
+        shard_path = _find_shard(configs[0])
+        if shard_path is not None:
+            logger.info("Using pre-tokenized shard: %s", shard_path)
+            dataset = TokenShardDataset(
+                shard_path=shard_path,
+                eos_token_id=tokenizer.eos_token_id,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                seed=seed,
+                max_steps=max_steps,
+            )
+            return _DatasetIterator(dataset)
+
         dataset = PersistentStreamDataset(
             dataset_config=configs[0],
             tokenizer=tokenizer,
