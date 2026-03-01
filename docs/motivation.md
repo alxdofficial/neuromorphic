@@ -27,10 +27,10 @@ each with different persistence, update rules, and biological analogues. The fun
 innovation: **separating WHAT to remember from HOW LONG to remember it**, enabling
 lifelong learning without catastrophic forgetting.
 
-The model maintains constant-memory state that evolves during use — no growing KV
-cache, no retraining. It processes all tokens in a segment simultaneously via
-parallel cortical columns, with memory updated between segments
-(see `architecture_v4_iterative_memory_scan.md` for the full v4 design).
+The model processes tokens causally through parallel cortical columns using affine scan
+recurrence (fast neocortical stream), with structured memory operations between segments
+(slow hippocampal stream). See `architecture_v4_iterative_memory_scan.md` for the full
+v5 design.
 
 ---
 
@@ -38,23 +38,33 @@ parallel cortical columns, with memory updated between segments
 
 ### Three Memory Systems + Predictive Coding
 
-| Memory System | Brain Analogy | Persistence | Update Mechanism | In v4 |
+| Memory System | Brain Analogy | Persistence | Update Mechanism | In v5 |
 |---------------|---------------|-------------|------------------|-------|
-| **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Column FFN weights |
-| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Hebbian eligibility + neuromodulated commits | Between segments |
-| **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based writes + neuromodulation | Between segments |
+| **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Scan params, projection weights |
+| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Surprise-gated bias shift | Between segments |
+| **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based primitive decomposition + neuromodulation | Between segments |
 
-Plus **Predictive Coding (PCM)** — per-column cross-pass prediction + surprise signal
-(inspired by cortical prediction error). Drives PM eligibility gating and EM novelty.
-PCM measures how much each token's representation changes between refinement passes.
+Plus **Predictive Coding (PCM)** — within-scan prediction of next token's encoding.
+Vector surprise (per-feature prediction error) drives PM eligibility gating and EM
+novelty scoring. Each column predicts what the next token's features will look like;
+the per-dimension error tells the model which features it failed to anticipate.
 
-### Parallel Processing with Memory Between Segments
+### Two-Stream Processing: Fast Scan + Slow Memory
 
-The key architectural insight (v4): **decouple token processing from memory
-accumulation.** All tokens in a segment are processed simultaneously by cortical
-columns (embarrassingly parallel). PM/EM update between segments using accumulated
-outputs. No within-segment sequential scan — cross-segment context comes entirely
-from PM/EM.
+The key architectural insight (v5): **separate fast causal computation from slow
+memory operations.**
+
+- **Fast stream (Stages 1 & 3)**: Affine scan recurrence — causal, parallelizable.
+  Cortical columns process tokens, compute predictions, prepare trail seeds and
+  write candidates. All linear operations that compose into a scan.
+- **Slow stream (Stage 2)**: Non-affine memory operations — batched across all
+  positions. Write-before-read with causal write buffers: per-token deltas are
+  prefix-summed, giving each position causal access to within-segment writes.
+  PM gain modulation with causal bias, EM trail from frozen primitives, segment-end
+  commit. The bio-inspired logic that can't be linearized runs here, once per segment.
+
+This mirrors the brain: neocortex processes quickly and feedforward; hippocampal
+consolidation is slower, periodic, and handles memory formation.
 
 ---
 
@@ -62,90 +72,92 @@ from PM/EM.
 
 ### Procedural Memory (PM) — Basal Ganglia
 
-"Muscle memory" of cognition — learned behavioral patterns, skills, associations.
+"Muscle memory" of cognition — automatic response biases, habitual processing.
 
-- **Read**: Holographic modulation: `y_d = x_d * [W @ x]_d` (quadratic in x). Each
-  slot applies an input-dependent transformation, not fixed vector retrieval.
-- **Eligibility traces**: Per-token accumulation gated by surprise (third factor).
-  Pre-synaptic (k_cand) and Hebbian post-synaptic (v_cand = pre × post) signals,
-  with slot-specific routing weights.
-- **Commit**: Neuromodulator MLP at periodic boundaries produces (g, slot_logits,
-  tau, ww). Continuous softmax slot selection + soft EMA update. Learned weakness
-  weight (ww) biases toward weaker slots.
-- **Sacred**: Differentiable eligibility traces (nn.Linear), surprise gating,
-  neuromodulator trained by main loss, slot-specific routing, budget enforcement +
-  unit normalization, lifelong persistence.
-- **Negotiable**: Number of slots r, routing temperature, EMA vs hard overwrite.
-- **v4**: Slow-changing partition (updated at periodic boundaries). Column accumulates
-  eligibility per-token; neuromodulator decides commits at boundaries. The commit
-  itself is affine (EMA blend).
+- **Read**: Element-wise gain modulation: `y = H ⊙ (1 + pm_bias + cum_pm)`. Coarse,
+  fast, no matmuls — each feature has a frozen bias plus causal write buffer.
+- **Update**: Two paths. Fast: per-token delta `δ_pm = lr_pm · surprise`, prefix-summed
+  to `cum_pm` for within-segment causal feedback. Slow: `pm_bias += Σ_n δ_pm` at
+  segment end. Only adapts on unpredicted features (vector surprise per-feature).
+- **Column-local**: Column c only addresses dims c*D_col:(c+1)*D_col of its bank.
+- **State**: pm_bias [BS, B, D] — one vector per bank. Not parameters — evolves
+  at inference for lifelong adaptation.
+- **Sacred**: Surprise-gated updates, lifelong persistence, per-feature bias.
+- **Negotiable**: Learning rate, decay rate toward neutral.
 
 ### Episodic Memory (EM) — Hippocampus
 
-Specific events, surprising experiences, contextual episodes.
+Dictionary of primitive patterns — atomic building blocks of concepts. Complex
+ideas emerge from composing multiple primitives via trail-based navigation.
 
-- **Retrieval**: Query from input features, score against M slots, top-k
-  selection (k=4), cross-attention aggregation.
-- **Candidate proposal**: Novelty = learned blend of surprise + dissimilarity from
-  existing keys. Top-C highest-novelty candidates buffered.
-- **Write**: Neuromodulator at boundaries produces (g_em, tau, write_weights, decay).
-  Sequential EMA update. g_em near-zero = soft "don't write."
-- **Sacred**: Novelty-based writes, learned novelty weighting (Phase B+), top-k
-  retrieval (can't attend all M slots), query from input-side features, candidate
-  validity masking, per-stream learned decay, neuromodulator trained by main loss.
-- **Negotiable**: Capacity M, dimension D_em, cross-attention vs weighted average.
-- **v4**: Slow-changing partition. Column does novelty scoring per-token; actual
-  writes at periodic boundaries. Budget enforcement + decay prevent unbounded growth.
-  Write is affine (EMA into selected slot).
+- **Read (trail)**: Seed from scan navigates primitive space through iterative
+  refinement (2 steps). At each step: score ALL primitives via softmax (no top-k),
+  compose weighted sum, gate, move seed. Different seed → different trail →
+  different composition. M primitives + continuous seeds = infinite readouts.
+- **Novelty**: Reconstruction error — can existing primitives explain this input?
+  Blended with surprise magnitude.
+- **Write (two paths)**: Fast: `δ_em = novelty · w_cand`, prefix-summed to `cum_em`
+  for within-segment feedback (additive signal to Stage 3). Slow: decompose across
+  primitives via soft routing at segment end, neuromodulator gates EMA write strength.
+  Fully differentiable — no hard selection anywhere.
+- **Column-local**: Column c only addresses its D_col slice of the bank's EM.
+- **State**: em_K, em_V [BS, B, M, D] — primitives are state, not parameters.
+  Evolve at inference for lifelong learning.
+- **Sacred**: Trail-based composition, soft activation (no top-k), novelty-based
+  writes, neuromodulator trained by main loss, primitive decomposition.
+- **Negotiable**: Number of primitives M, trail steps, temperature τ, noise σ.
 
 ### Predictive Coding Module (PCM) — Cortical Prediction Error
 
-Per-column local prediction and surprise computation.
+Per-column within-scan prediction and surprise computation.
 
-- **z_hat**: EMA prediction of next token's representation.
-- **Surprise**: RMS-normalized prediction error `||delta||/sqrt(D_pc)` (~1.0 scale).
-- **FFN gain**: `1 + 0.1 * tanh(W_gain(delta))` — bounded [0.9, 1.1] modulation.
-- **v4**: Cross-pass prediction (not in scan carry). Each column predicts what the
-  token's encoding will look like next pass. Surprise gates PM/EM updates.
+- **z_hat**: Prediction of next token's encoding (linear projection of scan state).
+- **Vector surprise**: Elementwise prediction error `delta = z_hat_{t-1} - z_t`,
+  D_col dimensions. Each feature dimension carries independent surprise.
+- **PCM gain**: `1 + 0.1 * tanh(W_gain(delta))` — bounded [0.9, 1.1] modulation.
+- **v5**: Within-scan prediction (token t predicts t+1), not cross-pass.
+  Surprise gates memory updates per-feature.
 
 ---
 
 ## How Learning During Use Works
 
-### Eligibility Traces: "What Could Be Learned"
+### PM Update: "Adapt My Biases"
 
-Every token produces a candidate learning signal based on local activity (pre-synaptic
-input, post-synaptic hidden state). This signal accumulates in eligibility traces —
-a buffer of "potential updates" that does NOT automatically change memory. The third
-factor (surprise) gates whether activity is eligible at all.
+Surprise from PCM drives per-feature bias shifts via **two write paths**:
+- **Fast (within segment)**: Each token computes `δ_pm = lr_pm · surprise`.
+  Prefix sum gives `cum_pm` — causal accumulation. PM read uses
+  `H ⊙ (1 + pm_bias + cum_pm)`, so later tokens benefit from earlier surprise.
+- **Slow (segment end)**: `pm_bias += Σ_n δ_pm`. Bias persists to next segment.
+  Automatic, habitual adaptation with no explicit routing.
 
-### Neuromodulators: "Should We Actually Store It?"
+### EM Write: "Two Paths — Fast Buffer + Slow Decomposition"
 
-Neuromodulator MLPs output low-dimensional control signals that decide:
-- **when** to commit (write event timing)
-- **how strongly** to write (gating strength)
-- **how much** to decay old memory
-- **where** to store (slot selection via softmax)
+**Fast path**: Write candidates from the scan are gated by novelty and
+prefix-summed: `cum_em = cumsum(novelty · w_cand)`. This raw, unstructured
+signal goes to Stage 3 alongside the trail read, providing within-segment
+feedback and cross-column mixing. Same-segment gradient flows through.
 
-Crucially, neuromodulators are **trained by the main CE loss** — gradient flows through:
-commit → memory state → future reads → logits → loss. No RL, no counterfactual
-rollouts, single optimizer. The model learns to write only when it improves future
-predictions.
+**Slow path**: At segment end, write candidates are decomposed across existing
+primitives via soft routing. The neuromodulator MLP controls write strength
+(`g_em`). Crucially, neuromodulators are **trained by the main CE loss** —
+gradient flows through: write → primitive update → future trail reads → logits
+→ loss. No RL, no counterfactual rollouts, single optimizer.
 
 ### Lifelong Learning: Memory Distillation
 
 **Phase A**: All systems active, state resets at doc boundaries. Controllers learn
 when to be selective.
 
-**Phase B**: Lifelong mode — PM/EM persist across documents. Only eligibility traces
-and recurrent state reset at boundaries. The distillation cycle:
+**Phase B**: Lifelong mode — PM/EM persist across documents. Only scan hidden states
+reset at boundaries. The distillation cycle:
 
-1. New domain → surprise spikes
-2. PM eligibility accumulates patterns (gated by surprise)
-3. PM neuromodulator commits strong patterns to slots
-4. EM writes surprising episodes
-5. Over time, slow weights learn domain patterns → surprise drops
-6. Result: slow weights = general knowledge; PM/EM = domain-specific skills/episodes
+1. New domain → surprise spikes (PCM prediction errors)
+2. PM bias shifts to compensate for persistent surprises
+3. EM primitives update: new concepts decomposed and stored
+4. Over time, slow weights learn domain patterns → surprise drops
+5. Result: slow weights = general knowledge; PM bias = domain-specific habits;
+   EM primitives = domain-specific concepts
 
 ---
 
@@ -158,10 +170,11 @@ and recurrent state reset at boundaries. The distillation cycle:
 - Online PM/EM updates vs retraining required
 
 ### vs SSMs (Mamba, RWKV)
-- SSMs use sequential scan with flat state; we use parallel processing + structured memory
-- SSMs compress everything into flat state; we separate memory by function + timescale
+- SSMs use flat state; we use structured memory with distinct systems
+- SSMs compress everything into hidden state; we separate memory by function + timescale
 - No explicit lifelong learning mechanism in SSMs
 - No neuromodulation, no eligibility traces, no surprise gating in SSMs
+- We use simple linear recurrence (simpler than SSM) — bio-inspired memory is the key addition
 
 ### vs RAG
 - Memory is inside the model, not external
@@ -174,24 +187,23 @@ and recurrent state reset at boundaries. The distillation cycle:
 ## Non-Negotiable (Sacred) Design Principles
 
 1. Three memory systems with distinct timescales (genetic/PM/EM) + PCM
-2. Differentiable eligibility traces (nn.Linear projections trained by backprop)
-3. Neuromodulators trained by main loss (no RL, single optimizer, single loss)
-4. Surprise gating on eligibility (third factor)
-5. Novelty-based EM writes (surprise + dissimilarity)
-6. Budget enforcement + unit normalization (prevents drift)
-7. Lifelong persistence with soft resets
-8. Fixed memory capacity O(1) per token at inference
-9. Per-stream state isolation (no cross-stream mixing)
-10. Parallel token processing (columns) decoupled from memory accumulation (between segments)
+2. EM as primitive dictionary with trail-based compositional read
+3. PM as coarse bias vector with surprise-gated updates
+4. Neuromodulators trained by main loss (no RL, single optimizer, single loss)
+5. Vector surprise (per-feature prediction error) drives memory updates
+6. Novelty-based EM writes (surprise + reconstruction error)
+7. Budget enforcement + unit normalization (prevents drift)
+8. Lifelong persistence — memory is state, not parameters
+9. Fixed memory capacity O(1) per token at inference
+10. Causal token processing (scan recurrence) with memory between segments
+11. Causal write buffers (prefix sums) for within-segment memory feedback
 
 ## Negotiable — Implementation Details
 
-- Architecture dimensions (D, B, r, M, D_em, D_h)
-- Number of iterative passes R
-- Segment length N (= PM/EM boundary interval)
+- Architecture dimensions (D, B, C, M, D_embed)
+- Segment length N (= memory update interval)
+- Number of scan layers per stage
 - Hyperparameters (decay rates, temperatures, budgets)
-- Shared vs per-pass column weights
-- Token subsampling schedule across passes
 
 ---
 
@@ -209,7 +221,7 @@ Validation perplexity improves during training. Baseline competence established.
 - Long adaptation runs don't destabilize base performance
 - Commit/write rates stay sparse and bounded
 
-### Hardware story: Constant memory, parallel compute
+### Hardware story: Constant memory, efficient compute
 - O(1) inference memory (no growing KV cache)
-- O(R) serial depth (fully parallel within each pass, no scan)
-- Slot-based memory → hardware-friendly dot products + weighted sums
+- O(log N) serial depth (parallel-scan, no quadratic attention)
+- Scan kernels for GPU throughput + batched memory ops

@@ -1,30 +1,49 @@
-# Architecture v4: Iterative Refinement with Cortical Columns
+# Architecture v5: Scan-Memory-Scan with Cortical Columns
+
+> **Previous versions**: v4 (iterative R-loop refinement) preserved on `v4-iterative-backup` branch.
+> v1 preserved on `v1-legacy` branch.
 
 ## The Core Insight
 
-We process all tokens in a segment **simultaneously** through R iterative passes.
-Each pass, every cortical column reads from shared memory (PM/EM), processes its
-token, and produces a richer representation. **After each pass, PM/EM update** —
-absorbing what the columns found surprising or novel. The next pass reads the
-updated memory, giving every token indirect access to what other tokens contributed.
+The brain processes sensory input through two interleaved systems:
 
-PCM measures **cross-pass surprise**: how much did this token's representation
-change now that memory is richer? High surprise = updated memory significantly
-changed understanding of this token = worth further commitment.
+1. **Fast neocortical stream** — feedforward, massively parallel, processes each
+   input near-instantly. Cortical columns extract features, predict upcoming input,
+   and prepare eligibility signals for memory.
 
-R passes = R rounds of both **perception and memory update**, all within one
-segment of N tokens. Each pass sees richer PM/EM because previous passes
-committed their findings.
+2. **Slow memory stream** — hippocampal/thalamic pattern completion, slower,
+   asynchronous. Reads from and writes to structured memory stores based on what
+   the fast stream found surprising or novel.
 
-There is **no within-segment sequential scan**. All tokens in a pass see the
-same PM/EM state. Within-segment order comes from positional encoding.
-Within-segment *context* comes from PM/EM updates between passes — each pass's
-commits are visible to the next pass's reads. Over R passes, information flows
-between tokens through the PM/EM bottleneck.
+We implement this as a **three-stage cycle** per segment of N tokens:
 
-If prototyping reveals that direct within-segment causal context is necessary,
-a small learned recurrent state can be added to a per-token scan carry. But we
-start without it.
+```
+Stage 1: FAST SCAN (affine, parallel via parallel-scan)
+  → Process N tokens causally through C narrow cortical columns
+  → Each column maintains a recurrent state via linear recurrence
+  → Produces: EM trail seeds, write candidates, surprise vectors, column states
+
+Stage 2: MEMORY OPS (non-affine, batched across all N positions)
+  → Proposed writes computed first (per-token, parallel, from frozen memory)
+  → Prefix sums of write deltas (causal accumulation, O(N))
+  → PM read with causal bias (frozen + prefix-summed surprise)
+  → EM trail read from frozen primitives (compositional, long-term)
+  → End of segment: actual structured commit to memory state
+
+Stage 3: INTEGRATION SCAN (affine, parallel via parallel-scan)
+  → Second causal scan integrates PM read + EM trail + EM write buffer
+  → Write buffer (prefix sum of write candidates) provides within-segment
+    new information and cross-column mixing
+  → Produces final predictions (NTP logits)
+```
+
+**Key properties:**
+- **Causal within segments** (scans are causal recurrences)
+- **Causal across segments** (memory state flows forward)
+- **Causal write buffers** (prefix-summed writes visible within segment)
+- **Parallel within segments** (parallel-scan algorithm, memory ops batched)
+- **No R-loop** — single cycle replaces R iterative passes
+- **NTP training** — causal scans naturally support next-token prediction
 
 ## Why This Architecture Exists
 
@@ -32,615 +51,694 @@ We face a fundamental tension:
 
 1. **Softmax attention**: KV cache grows linearly with context length, and
    O(N²) compute per layer during prefill — too expensive for lifelong learning
-2. **SSMs / affine recurrence**: our bio-inspired memory updates (Hebbian PM,
+2. **Linear recurrence / affine scans**: our bio-inspired memory updates (Hebbian PM,
    episodic EM) involve non-affine decisions (thresholds, similarity matching,
-   slot selection) — can't naively parallelize
-3. **Sequential processing**: O(N) serial depth — underutilizes GPU
+   slot selection) — can't naively parallelize within a scan
+3. **Pure sequential processing**: O(N) serial depth — underutilizes GPU
 
-Our resolution: **decouple token processing from memory accumulation.**
+Our resolution: **separate affine computation from non-affine memory operations.**
 
-- **Token processing** (cortical columns): embarrassingly parallel over B × N.
-  Each column reads memory, processes one token, outputs features. No
-  cross-token operations. No sequential dependency.
-- **Memory accumulation** (PM/EM updates): happens between passes. Hebbian
-  eligibility, novelty scoring, neuromodulated commits — all the complex
-  bio-inspired logic runs here, unconstrained by parallelism.
-- **Cross-pass refinement** (PCM + PM/EM): R passes let each token's
-  representation and the shared memory improve iteratively together.
+- **Stages 1 & 3** (affine scans): causal, parallelizable via chunked parallel-scan.
+  All column processing, PCM prediction, eligibility computation —
+  everything that can be expressed as `h_t = a_t ⊙ h_{t-1} + b_t` goes here.
+- **Stage 2** (memory ops): non-affine but batched. PM gain modulation, EM trail
+  composition, novelty scoring, neuromodulated primitive writes — all the bio-inspired
+  logic runs here. Not scan-friendly, but runs once per segment across all N
+  positions in parallel.
+
+**Biological motivation:** The neocortex processes quickly and mostly feedforward.
+The hippocampal loop is slower, asynchronous, and handles consolidation. Our
+three-stage cycle mirrors this: fast processing → memory interaction → integration.
 
 ## Architecture
 
 ### Components
 
-**Cortical columns** (narrow, many, independent parallel processors):
-- **PCM** — local predictive coding (per-column cross-pass prediction + surprise)
-- **FFN** — two stacks of L residual FFN layers each (ffn_pre + ffn_post,
-  2L total per pass). ffn_pre runs after lateral mixing with PCM gain modulation;
-  ffn_post runs after cross-block mixing without gain.
-- Columns read from shared memory, compute surprise, do "thinking," and
-  accumulate eligibility/novelty signals for memory updates.
+**Cortical columns** (narrow, many, process independently):
+- C columns, each operating on a D_col = D/C feature slice of every token
+- At each timestep, all C columns process the same token's embedding, each
+  seeing its own D_col-wide feature slice
+- Each column maintains a recurrent state h_c,t via element-wise linear recurrence
+  (`h_t = a_t ⊙ h_{t-1} + b_t`) — columns are **independent** within the scan
+- **PCM** — predictive coding within the scan (predict next token's encoding,
+  compute vector surprise)
+- No separate FFN — the scan's input/output projections serve this role
+- Columns produce trail seeds and write candidates as linear projections of
+  their scan state
 
-Input shape: `[BS, N, D]` → fan_out → `[BS, N, G, D_col]` where G = B_blocks × C.
-Each column group operates on D_col dimensions. After processing, fan_in back to D.
+**Shared memory systems** (B independent banks, addressed by column slices):
+- **PM** — procedural memory: learned bias vector per bank (basal ganglia).
+  Element-wise gain modulation — fast, automatic, coarse.
+- **EM** — episodic memory: dictionary of M primitive patterns (hippocampus).
+  Trail-based compositional read — seed navigates primitive space.
+- B memory banks. Each bank is addressed by the columns assigned to it.
+- Column c in block b addresses only dims `c*D_col:(c+1)*D_col` of bank b's
+  memory — pure dimension slicing, no routing, no gather/scatter.
+- PM state shape: `[BS, B, D]` (one bias vector per bank)
+- EM state shape: `[BS, B, M, D]` where D = C × D_col (M primitives per bank)
 
-**Shared memory systems** (single instance each, batched across B_blocks):
-- **PM** — procedural memory: Hebbian holographic slots (basal ganglia)
-- **EM** — episodic memory: key-value episode buffer (hippocampus)
-
-PM/EM state is batched: `[BS, B, r, D]` / `[BS, B, M, D]` (block level in D
-space, C columns concatenated). Columns reshape to/from 5D for memory reads.
+**No within-scan lateral mixing**:
+- Columns are **independent** within each scan — element-wise A, no cross-column
+  coupling. This mirrors cortical biology where columns process independently
+  and mix through downstream convergence zones.
+- Cross-column integration happens through **memory** (Stage 2): all columns
+  read from and write to shared memory banks, which serve as the binding
+  mechanism — analogous to thalamic/hippocampal hubs in the brain.
 
 ### How It Works (High Level)
 
 ```
-For r = 1..R passes:
-  1. All G columns process all N tokens in PARALLEL (single forward call):
-     a. PCM encode → z, surprise, gain (compare with previous pass's prediction)
-     b. PM holographic read (block-level, residual)
-     c. EM top-k retrieval (block-level, residual)
-     d. Lateral mixer [C,C] — local mixing across columns within each block
-     d2. PositionAttention — content-adaptive attention across N_C positions (zero-init residual)
-     e. ffn_pre: L FFN layers (gain-modulated on first layer)
-     f. Cross-block mixer [B,B] — global mixing across blocks
-     g. ffn_post: L FFN layers (no gain)
-     h. PCM predict → z_hat (hypothesis for next pass)
-     i. W_post → eligibility info + novelty info
-  2. PM/EM UPDATE (neuromodulators commit eligibility, write novel episodes)
-     - next pass reads the UPDATED PM/EM
+For each segment of N tokens:
 
-After R passes: decode from final representations → loss (FITB or NTP)
-Carry PM/EM state to next segment.
+  STAGE 1 — Fast Scan (causal, parallel via parallel-scan):
+    For t = 1..N (parallelized):
+      h_t = a_t ⊙ h_{t-1} + b_t               # element-wise recurrence per column
+      seed_t = W_seed · H_t                     # EM trail seed
+      w_cand_t = W_w · H_t                      # write candidate
+      z_hat_t = W_pcm · H_t                     # PCM prediction
+      surprise_t = z_hat_{t-1} - encode(X_t)    # vector surprise (D_col)
+
+  STAGE 2 — Memory Operations (parallel across N positions):
+    # 1. Proposed writes (per-token, parallel, from frozen memory):
+    For each bank b = 1..B:
+      delta_pm_t = lr_pm · surprise_t            # per-token PM bias delta
+      delta_em_t = novelty_t · w_cand_t          # per-token EM write delta
+
+    # 2. Prefix sums (causal accumulation, O(N)):
+      cum_pm_t = Σ_{i≤t} delta_pm_i             # inclusive, causal for NTP
+      cum_em_t = Σ_{i≤t} delta_em_i
+
+    # 3. Reads (from frozen memory + causal write buffers):
+      pm_read = H[:, b] ⊙ (1 + pm_bias_b + cum_pm)  # PM: causal gain mod
+      em_read = EM_b.trail_read(seed[:, b])           # EM: trail from frozen
+
+    # 4. End of segment: actual structured commit
+      PM_b.commit(delta_pm)                      # bias update
+      EM_b.commit(w_cand, novelty)               # decompose across primitives
+
+  STAGE 3 — Integration Scan (causal, parallel via parallel-scan):
+    For t = 1..N (parallelized):
+      input_t = pm_read_t + em_read_t + cum_em_t # frozen reads + write buffer
+      h'_t = a'_t ⊙ h'_{t-1} + b'_t             # scan on input_t
+      logits_t = LM_head(H'_t)
+
+  Carry memory state to next segment.
 ```
 
-Step 1 is embarrassingly parallel (G × N independent computations).
-Step 2 is the only sequential-across-passes part (R times per segment).
+Stage 1 and Stage 3 are embarrassingly parallel via parallel-scan algorithms.
+Stage 2 is a fixed-cost batch operation (all N positions independent).
 
-**Processing order rationale**: PCM runs first so surprise/gain are available for
-the rest of the pass. Local mixing (lateral) runs before FFN to establish
-within-block context. PositionAttention then distributes lateral-mixed context
-across all N_C positions (content-adaptive, O(N_C² × D_col) per group — negligible
-vs FFN). ffn_pre transforms with gain modulation. Cross-block mixing then shares
-information across blocks. ffn_post refines without gain. Total FFN layers per
-pass = 2L (where L = `ffn_depth`).
+### Stage 1: Fast Scan (The Neocortical Stream)
 
-### Forward Pass: R Iterative Passes
+All C columns process every token, each seeing its D_col = D/C feature slice.
+The scan is causal — token t's state depends on tokens 1..t-1.
 
 ```python
-def forward_segment(self, input_ids, reset_mask=None, fitb_mask=None):
-    """Process N tokens through R refinement passes.
+def fast_scan(self, input_ids):
+    """Stage 1: Causal affine scan through all N tokens.
 
-    input_ids:  [BS, N]     — token IDs (may have <FITB> at masked positions)
-    reset_mask: [BS] bool   — streams to reset PM/EM (doc boundary)
-    fitb_mask:  [BS, N] bool — FITB masked positions (None = NTP path)
+    Produces column states, trail seeds, write candidates, and surprise.
+    Parallelized via chunked parallel-scan (à la Mamba).
 
     Returns:
-        NTP:  (logits [BS, N, vocab], aux_loss scalar)
-        FITB: (per_pass_logits list[R × [BS,N,vocab]], aux_loss scalar)
-    PM/EM state is mutated in-place.
+        H:        [BS, N, C, D_col]    — column hidden states
+        seed:     [BS, N, B, D]        — EM trail seeds (per bank)
+        w_cand:   [BS, N, B, D]        — write candidates (per bank)
+        surprise: [BS, N, C, D_col]    — vector surprise signals
     """
-    if reset_mask is not None:
-        self._reset_memory(reset_mask)
+    x = embed(input_ids)             # [BS, N, D_embed]
+    x = proj_up(x)                   # [BS, N, D]
+    x = x + pos_embed                # [BS, N, D]
 
-    is_fitb = fitb_mask is not None
-    sequence = input_ids          # FITB: has <FITB> at masked positions
-    original_ids = input_ids
+    # Each column gets its D_col slice: column c sees x[..., c*D_col:(c+1)*D_col]
+    # Element-wise linear recurrence: h_t = a_t ⊙ h_{t-1} + b_t
+    # a_t, b_t are input-dependent linear projections
+    # Columns are independent — no cross-column mixing in scan
 
-    x = embed(sequence) + pos_embed(positions)       # [BS, N, D]
-    x_cols = fan_out(x).view(BS, N, G, D_col)        # G = B*C groups
+    H = parallel_scan(x)             # [BS, N, C, D_col]
 
-    z_hat_prev = None
-    lam = sigmoid(lambda_logit)
+    # Linear projections from column states
+    seed = W_seed(H)                 # [BS, N, B, D] — EM trail starting points
+    w_cand = W_w(H)                  # [BS, N, B, D] — write candidates per bank
+    z_hat = W_pcm(H)                 # [BS, N, C, D_col] — PCM prediction
 
-    for r in range(R):
-        # FITB: re-embed from updated sequence (r > 0)
-        if is_fitb and r > 0:
-            x_fresh = embed(sequence) + pos_embed(positions)
-            x_cols_fresh = fan_out(x_fresh).view(BS, N, G, D_col)
-            x_cols = (1 - lam) * x_out + lam * x_cols_fresh
+    # Vector surprise: elementwise prediction error
+    z = pcm_encode(x)                # [BS, N, C, D_col] — current encoding
+    surprise = z_hat_prev - z        # [BS, N, C, D_col] — VECTOR, not scalar
+    # z_hat_prev is the prediction from token t-1 (carried in scan state)
 
-        # Single batched call — all G groups, all N tokens
-        x_out, z, z_hat, surprise, elig_info, nov_info = \
-            columns.forward(x_cols, pm, em, z_hat_prev)
-
-        # PCM prediction loss (cross-pass)
-        if pcm_enabled and z_hat_prev is not None:
-            aux_loss += columns.pcm.prediction_loss(z_hat_prev, z) * pcm_pred_weight
-
-        # PM eligibility routing + commit, EM novelty + write
-        _process_and_commit(elig_info, nov_info, x_out)
-
-        if is_fitb:
-            # Per-pass logits (fan_in + ln_final + lm_head run R times)
-            logits_r = lm_head(ln_final(fan_in(x_out.reshape(BS, N, -1))))
-            per_pass_logits.append(logits_r)
-            # Re-embed: argmax predictions replace <FITB> for next pass
-            if r < R - 1:
-                with no_grad():
-                    sequence = where(fitb_mask, logits_r.argmax(-1), original_ids)
-        else:
-            # NTP: damped mixing  x^r = (1-λ)x^{r-1} + λ·column_output^r
-            x_cols = x_out if r == 0 else (1 - lam) * x_cols + lam * x_out
-
-        z_hat_prev = z_hat
-
-    if is_fitb:
-        return per_pass_logits, aux_loss
-
-    # NTP: single decode from final mixed representation
-    logits = lm_head(ln_final(fan_in(x_cols.reshape(BS, N, -1))))
-    return logits, aux_loss
+    return H, seed, w_cand, surprise
 ```
 
-### Per-Pass Column Forward (The Parallel Core)
+**What's in the scan state:** Each column c maintains a hidden state h_c ∈ R^D_col.
+The full scan state is H ∈ R^{C × D_col} = R^D. Because A is element-wise (no
+cross-column mixing), this is C independent scans — each column evolves its own D_col
+state. Cross-column integration happens through shared memory in Stage 2.
 
-In code, this is a single `CorticalColumnGroup.forward` call per R pass.
-All column-level ops (PCM, PM/EM reads, mixers, two FFN stacks, fused
-post-processing) run in one call. Operates on `[BS, N, G, D_col]` where
-G = B*C. PM eligibility routing and EM candidate selection happen in
-`model._process_and_commit`.
+**No separate FFN:** The scan's input-dependent projections (computing a_t, b_t from
+the input) serve the same role as FFN layers — nonlinear feature transformation. Adding
+a separate FFN would be redundant.
 
-Conceptually, for one pass:
+**PCM in the scan:** The prediction z_hat_t and encoding z_t are linear functions of H_t,
+so they can be folded into the scan as additional output projections. Surprise is the
+elementwise difference between consecutive predictions and encodings — also linear.
+
+### Stage 2: Memory Operations (The Hippocampal Loop)
+
+Memory reads use the **frozen** segment-start state. Proposed writes are computed
+per-token in parallel, then **prefix-summed** to provide causal within-segment
+write signals. The actual structured commit happens at segment end.
 
 ```python
-def column_forward_pass(x_col, pm_state, em_state, z_hat_prev):
-    """One R-pass: all G columns process all N tokens. Embarrassingly parallel.
+def memory_ops(self, H, seed, w_cand, surprise):
+    """Stage 2: Write-then-read with causal write buffers.
 
-    x_col:      [BS, N, G, D_col]     — column representations
-    pm_state:   PM slots              — same for all positions this pass
-    em_state:   EM slots              — same for all positions this pass
-    z_hat_prev: [BS, N, G, D_pcm]    — PCM predictions from prev pass
+    1. Compute proposed writes per-token (parallel, from frozen memory)
+    2. Prefix sum write deltas (causal accumulation)
+    3. PM read uses causal bias (frozen + prefix-summed surprise)
+    4. EM trail reads from frozen primitives (long-term knowledge)
+    5. End of segment: actual structured commit to memory
 
-    Returns: x_out, z, z_hat, surprise, elig_info, novelty_info
+    Returns:
+        pm_reads:  [BS, N, B, D]  — PM gain reads (with causal bias)
+        em_reads:  [BS, N, B, D]  — EM trail reads (from frozen)
+        cum_em:    [BS, N, B, D]  — EM write buffer (within-segment new info)
     """
-    # 1. PCM: encode, surprise, gain (FIRST — surprise/gain needed by everything else)
-    z = PCM.encode(x_col)                                # [BS,N,G,D_pcm]
-    if z_hat_prev is not None:
-        delta = z - z_hat_prev.detach()
-        surprise = norm(delta, dim=-1) / sqrt(D_pcm)     # [BS,N,G]
-        gain = 1 + 0.1 * tanh(W_gain(delta))             # [BS,N,G,D_col]
-    else:
-        surprise = zeros; gain = ones                     # pass 1
+    pm_reads, em_reads, cum_ems = [], [], []
 
-    # 2. PM holographic read (block-level in D space, residual)
-    q_pm = view_5d(x_col).reshape(BS, N, B, D)           # concat C cols
-    y_pm = pm_state.read(q_pm)                            # holographic
-    x_col = x_col + reshape_g(y_pm.view(BS, N, B, C, D_col))
+    for b in range(B):
+        # --- 1. PROPOSED WRITES (per-token, parallel, from frozen memory) ---
+        # PM write delta: surprise-driven bias shift
+        delta_pm = lr_pm * surprise[:, :, b]       # [BS, N, D] — per-token
 
-    # 3. EM top-k read (block-level in D space, residual)
-    q_em = view_5d(x_col).reshape(BS, N, B, D)
-    y_em = em_state.read(q_em)                            # top-k retrieval
-    x_col = x_col + reshape_g(y_em.view(BS, N, B, C, D_col))
+        # EM write delta: novelty-weighted write candidate
+        novelty = compute_novelty(w_cand[:, :, b], surprise, em_K[b], em_V[b])
+        delta_em = novelty * w_cand[:, :, b]       # [BS, N, D] — per-token
 
-    # 4. Lateral mixer: [C,C] mixing within each block (local context first)
-    x_col = reshape_g(lateral(view_5d(x_col)))
+        # --- 2. PREFIX SUMS (causal accumulation, O(N)) ---
+        cum_pm = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
+        cum_em = cumsum(delta_em, dim=seq)         # [BS, N, D] — inclusive
+        # Token t sees writes from tokens 0..t (inclusive — causal for NTP)
 
-    # 4b. Position attention: content-adaptive attention across N_C positions
-    #     O(N_C² × D_col) per group — negligible vs FFN. Zero-init → identity at start.
-    if pos_attn is not None:
-        x_col = pos_attn(x_col)            # [BS, N_C, G, D_col]
+        # --- 3. PM READ with causal bias (write-before-read) ---
+        pm_read = H[:, :, b] * (1 + pm_bias[b] + cum_pm)  # [BS, N, D]
+        # pm_bias[b] is frozen from previous segment
+        # cum_pm adds per-token causal bias adaptation
 
-    # 5. ffn_pre: L residual FFN layers with gain on first layer
-    x_col = ffn_pre(x_col, gain=gain)
+        # --- 4. EM TRAIL READ from frozen primitives ---
+        s = seed[:, :, b]                          # [BS, N, D] — trail start
+        if training:
+            s = s + σ[b] * randn_like(s)           # noise for exploration
 
-    # 6. Cross-block mixer: [B,B] mixing across blocks (global after local FFN)
-    x_col = reshape_g(cross_block(view_5d(x_col)))
+        y = s
+        for step in range(n_steps):                # n_steps = 2
+            attn = softmax(y @ em_K[b].T / τ[b])   # [BS, N, M] — all primitives
+            delta = attn @ em_V[b]                  # [BS, N, D] — composition
+            gate = sigmoid(W_gate(cat(y, delta)))   # [BS, N, D] — learned gate
+            y = y + gate * delta                    # seed moves
 
-    # 7. ffn_post: L residual FFN layers (no gain)
-    x_out = ffn_post(x_col)
+        em_read = y - s                             # [BS, N, D] — net contribution
 
-    # 8. PCM hypothesis (predict next pass's encoding)
-    z_hat = PCM.predict(z)                                # [BS,N,G,D_pcm]
+        pm_reads.append(pm_read)
+        em_reads.append(em_read)
+        cum_ems.append(cum_em)                      # write buffer for Stage 3
 
-    # 9. Fused post-processing (W_post_fused: D_col → 4*D_col + 1)
-    proj = W_post_fused(x_out)                            # [BS,N,G,4*D_col+1]
-    k_pre, v_post, k_cand_raw, v_cand, nov_raw = split(proj, [D_col]*4 + [1])
-    k_cand = normalize(k_pre)                             # [BS,N,B,C,D_col]
-    gate = (surprise / scale).clamp(0, 1)                 # [BS,N,B,C]
-    q_nov = normalize(k_cand_raw)
-    w_nov = sigmoid(nov_raw)
+        # --- 5. SEGMENT-END COMMIT (actual structured write) ---
+        # PM: apply total bias shift (sum over ALL N tokens)
+        pm_bias[b] += delta_pm.sum(dim=seq)         # [BS, D] — aggregate
 
-    elig_info = (k_cand, v_post, gate)
-    novelty_info = (q_nov, v_cand, w_nov, surprise)
+        # EM: full decomposition write (routing, neuromodulator, EMA)
+        route = softmax(normalize(w_cand[:, :, b]) @ em_K[b].T / τ_w)
+        update_K = sum_n(novelty * route * w_cand[:, :, b])
+        update_V = sum_n(novelty * route * w_cand[:, :, b])
+        g_em = em_neuromodulator(novelty_mean, usage)
+        α = g_em * route_aggregated
+        em_K[b] = (1 - α) * em_K[b] + α * normalize(update_K)
+        em_V[b] = (1 - α) * em_V[b] + α * update_V
 
-    return x_out, z, z_hat, surprise, elig_info, novelty_info
+    return stack(pm_reads), stack(em_reads), stack(cum_ems)
 ```
 
-**Then in `model._process_and_commit`** (once per R pass):
+**Column-local memory addressing:** PM bias bank b has shape `[BS, D]`.
+EM bank b has shape `[BS, M, D]`. Column c reads/writes only its slice
+`[..., c*D_col:(c+1)*D_col]`. This means:
+- No routing decisions — pure dimension indexing
+- GPU-friendly — contiguous memory access patterns
+- Surprise, seeds, and candidates are all dimension-specific
+- Each column independently contributes to its slice of the bank's memory
+
+**Two write paths — fast and slow:**
+- **Fast path (within-segment):** Per-token write deltas are prefix-summed to
+  produce causal write buffers. PM's `cum_pm` modifies the gain formula directly
+  (write-before-read). EM's `cum_em` flows into Stage 3 as an additive signal.
+  These provide immediate within-segment feedback — token t sees what tokens
+  0..t wrote. Gradient flows from THIS segment's loss.
+- **Slow path (cross-segment):** The actual structured commit (PM bias aggregate,
+  EM routing + neuromodulator + EMA) happens at segment end and updates the
+  frozen state for the next segment. This is the long-term memory path.
+
+**Why frozen reads + prefix sums (not per-token memory updates):** Updating the
+actual EM primitives per-token would require storing per-position memory states
+([N, M, D] — too expensive) and sequential trail reads. Instead, the trail reads
+from frozen primitives (batchable), and the prefix-summed write buffer carries
+the within-segment new information as a simple D-dimensional signal. This is
+equivalent in effect: token t gets frozen long-term knowledge (trail) + causal
+recent writes (prefix sum).
+
+**State vs parameters:** The primitives (em_K, em_V) and bias (pm_bias) are
+**state**, not parameters. Parameters (W_seed, W_gate, neuromodulator, τ, σ)
+are frozen after training. State evolves at inference — this is lifelong learning.
+
+### Stage 3: Integration Scan (Context Fusion)
+
+A second causal scan integrates memory reads with column states.
 
 ```python
-# PM eligibility routing: concat columns → block level, route to slots
-route_w = softmax(k_norm @ pm_K.T / tau_route)           # [BS,N,B,r]
-gated = gate_block * route_w                              # surprise-gated
-elig_K = bmm(gated, k_block)                              # [BS,B,r,D]
-elig_V = bmm(gated, v_block)
+def integration_scan(self, H, pm_reads, em_reads, cum_em):
+    """Stage 3: Second causal scan with memory context + write buffers.
 
-# EM candidate selection: top-C_cand by novelty across N positions
-novelty = w_nov * surprise + (1-w_nov) * (1 - max_sim)
-em_cands = topk(novelty, C_cand)
+    Three signals contribute:
+    - pm_reads:  PM gain modulation (includes causal bias via cum_pm)
+    - em_reads:  EM trail from frozen primitives (long-term knowledge)
+    - cum_em:    EM write buffer (within-segment new information)
 
-# Neuromodulated PM commit + EM write
-pm.commit(elig_K, elig_V, g, slot_logits, tau)
-em.write(cand_K, cand_V, cand_scores, g_em, tau_em, decay, ww)
+    Returns:
+        logits: [BS, N, vocab]
+    """
+    # Additive integration: PM read + EM trail + EM write buffer
+    # Each column c takes its D_col slice of each signal
+    integrated = pm_reads_per_col + em_reads_per_col + cum_em_per_col
+
+    # Second scan: h'_t = a'_t ⊙ h'_{t-1} + b'_t (element-wise, independent columns)
+    H_prime = parallel_scan_2(integrated)        # [BS, N, C, D_col]
+
+    # Project to model dim and decode
+    out = proj_down(H_prime.reshape(BS, N, D))   # [BS, N, D_embed]
+    logits = lm_head(out)                         # [BS, N, vocab]
+
+    return logits
 ```
 
-**CRITICAL**: No cross-token operations inside column forward. Each position
-is fully independent. This is what makes G × N parallelism possible. The
-aggregation in `_process_and_commit` sums across positions but doesn't affect
-the per-token output.
+**Why two scans?** The first scan processes raw input and produces
+seeds/candidates before seeing any memory context. The second scan has
+access to both memory reads AND causal write buffers — it integrates
+long-term knowledge (EM trail), habitual bias (PM gain), and recent
+within-segment writes (write buffer) with the causally ordered token stream.
 
-**Memory reads ARE attention** — but over memory slots, not over other tokens.
+**Write buffer as cross-column mixer:** `cum_em_t` is a D-dimensional signal
+(from `w_cand = W_w(H)`, which projects across all columns). When added to
+Stage 3's input, it provides within-segment cross-column information — token t
+at column c sees what columns 0..C-1 wrote at positions 0..t. This partially
+fills the cross-column mixing role alongside the cross-segment memory reads.
 
-**Ordering rationale**: PCM runs first so surprise/gain are available for all
-subsequent steps. Lateral mixing establishes within-block context. PositionAttention
-then distributes this local context across all N_C positions with content-adaptive
-attention. FFN pre-processes with gain. Cross-block mixing shares information
-globally after local processing. FFN post-processes without gain. Two FFN stacks
-(ffn_pre + ffn_post) with L layers each give 2L total FFN layers per pass.
+## Predictive Coding: Vector Surprise
 
-### PM Holographic Read (Why "Holographic")
+### PCM in the Scan
 
-Standard memory: query → retrieve stored vector. Output is independent of input.
-
-PM holographic read: the input **flows through** stored patterns. Output depends
-on both input AND stored pattern multiplicatively:
-
-```
-q = concat_cols(x_col)                           # [D] — C columns concatenated to block level
-scores = normalize(q) @ pm_K.T                   # [r_slots]
-y_pm = sum_i(pm_a_i * scores_i * q * pm_V_i)    # [D]
-y_pm_cols = split_to_cols(y_pm)                  # back to [C, D_col]
-```
-
-Mathematically: `y_d = x_d * [W @ x]_d` — quadratic in x. The stored pattern
-**modulates** the input rather than replacing it. Like a hologram: the stored
-pattern is an interference pattern, the input is the reference beam, you need
-both to reconstruct the output.
-
-This makes PM a **learned transformation** — each slot stores a "skill" (how to
-process inputs), not a "fact" (a fixed vector). Same slot, different input →
-completely different output. This is why PM is "procedural memory": it encodes
-*how to process*, not *what was seen*.
-
-### EM Read (Key-Value Retrieval)
+PCM operates within the first scan. Each column predicts what the **next
+token's** encoding will look like. Surprise is the vector difference between
+the prediction and the actual encoding.
 
 ```
-q = concat_cols(x_col)                           # [D] — C columns concatenated to block level
-scores = q @ em_K.T                              # [M_slots]
-top_k_mask = scores >= topk(scores, k).min       # gather-free top-k
-attn = softmax(masked(scores, top_k_mask))       # [M_slots]
-y_em = attn @ em_V                               # [D]
-y_em_cols = split_to_cols(y_em)                  # back to [C, D_col]
+Token t-1: column state H_{t-1} → z_hat_{t-1} = W_pcm · H_{t-1}  (prediction)
+Token t:   column input X_t → z_t = W_enc · X_t                    (actual encoding)
+           surprise_t = z_hat_{t-1} - z_t                           (VECTOR, D_col dims)
 ```
 
-Standard key-value store with sparse top-k retrieval. EM stores "facts" and
-"episodes" — specific things that were seen. The output IS a stored vector
-(weighted combination of retrieved values), independent of the query beyond
-selection. This is the fundamental difference from PM.
+**Vector surprise** (not scalar): Each dimension of D_col carries its own
+surprise signal. The model was wrong about feature 3 but correct about feature
+7 — memory writes can be modulated per-feature. This is richer than a scalar
+`||z_hat - z||` because:
+- Memory writes are dimension-specific (column c writes to its D_col slice)
+- Surprise naturally has the same dimensionality as the write candidates
+- PM bias shifts and EM writes operate per-dimension: "I was wrong about THESE
+  features, adapt bias and store corrections for THOSE features"
 
-### Cross-Pass PCM (Predictive Coding)
+### What Surprise Means in v5
 
-PCM predicts what each token's representation will look like in the **next pass**
-(after PM/EM have updated and the column re-processes with richer memory).
+"Based on the causal context so far, I predicted the next token's features
+would look like z_hat. The actual features were z. The per-feature error tells
+me which aspects of this token I failed to anticipate — those aspects are
+informationally dense and worth writing to memory."
 
-```
-Pass 1: column encodes token → z^1. Predicts z_hat^1.
-         No surprise yet (no previous prediction to compare against).
-         PM/EM update with unmodulated eligibility/novelty.
+This is pure within-scan prediction (token t predicts token t+1), not
+cross-pass prediction like v4. The surprise signal is available immediately
+as part of the scan computation.
 
-Pass 2: column encodes token → z^2 (now reading UPDATED PM/EM).
-         Surprise = ||z^2 - z_hat^1||.
-         "Did the PM/EM update change my understanding of this token?"
-         Predicts z_hat^2.
-         PM/EM update with surprise-modulated eligibility/novelty.
-...
-Pass R: column encodes token → z^R. Surprise = ||z^R - z_hat^{R-1}||.
-         Final PM/EM update. Decode.
-```
+### PCM Optimization
 
-**What surprise means in v4**: "now that memory has been updated (other tokens
-committed their findings), did my understanding of THIS token change?" High
-surprise = this token's meaning depends heavily on context that wasn't in
-memory before = it's informationally dense.
+1. **Auxiliary prediction loss**: `L_pred = MSE(z_hat_t, z_{t+1}.detach())`
+   Gradient flows to the prediction network but not the encoding target.
+2. **Downstream (within-segment)**: surprise → delta_pm (prefix-summed into PM
+   gain) + novelty → delta_em (prefix-summed into write buffer) → Stage 3 → loss.
+   PCM encoder gets same-segment gradient through both write buffer paths.
+3. **Downstream (cross-segment)**: surprise → novelty → structured EM commit →
+   next segment's trail reads → loss. PCM encoder learns what's worth predicting.
 
-**PCM optimization**: trained by both:
-1. Auxiliary prediction loss: `L_pred = MSE(z_hat^r, z^{r+1}.detach())`
-2. Downstream: surprise → PM eligibility gating → PM commits → next pass's
-   PM reads → loss. All within the same segment's forward pass.
+## Memory System Details
 
-## Within-Segment Context via PM/EM Updates
+### PM: Procedural Bias (Gain Modulation)
 
-Although there is no direct token-to-token communication, tokens gain indirect
-access to each other through **PM/EM updates between passes**:
+PM is a **single bias vector per bank** — coarse, automatic, fast. It modulates
+the signal by scaling features up or down based on learned habits.
 
 ```
-Pass 1: all tokens process with PM/EM_0 (from previous segment).
-         Token 42 is surprising → high eligibility → committed to PM.
-         Token 99 is novel → written to EM.
-         → PM/EM_1
+# State: one bias vector per bank
+pm_bias [BS, B, D]                           # D = C × D_col
 
-Pass 2: all tokens process with PM/EM_1.
-         Token 7 now reads PM and retrieves what token 42 committed.
-         Token 50 now reads EM and retrieves token 99's episode.
-         Their representations change → new surprise → new commits.
-         → PM/EM_2
+# Per-token write delta (Stage 2, parallel):
+delta_pm_t = lr_pm * surprise_t              # [BS, N, D] — per-token, per-feature
 
-...and so on for R passes.
+# Prefix sum (causal accumulation):
+cum_pm_t = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
+
+# Read with causal bias (write-before-read):
+y_pm = H[:, :, b] * (1 + pm_bias[b] + cum_pm)  # [BS, N, D]
+# Token t's gain reflects surprise from tokens 0..t — no lag
+
+# Segment-end commit:
+pm_bias[b] += delta_pm.sum(dim=seq)          # [BS, D] — total shift
 ```
 
-This is **memory-mediated within-segment context**. Information flows between
-tokens through the PM/EM bottleneck, not through direct attention. Each pass
-adds one hop of indirect communication. After R passes, information has had
-R opportunities to propagate between tokens via memory.
+**Why this is coarse:** One vector, not slots. No routing, no selection. Every
+feature dimension has a single learned bias. This captures automatic response
+tendencies (basal ganglia habits) — "I always up-weight feature 7 and
+down-weight feature 12." Surprise-gating ensures it only adapts on
+unpredicted features.
 
-The bottleneck is deliberate: it forces the model to compress and prioritize,
-like biological memory. Not every token's information survives — only what the
-neuromodulators decide is worth committing.
+**Causal within-segment adaptation:** Unlike the cross-segment-only design,
+the prefix-summed write delta gives PM immediate effect. If feature 7 is
+consistently surprising in the first 100 tokens, token 101 already sees an
+amplified bias for that feature — within the same segment.
 
-**PositionAttention**: In addition to memory-mediated context, PositionAttention
-provides direct content-adaptive attention across N_C positions within each pass.
-Each of G groups independently attends over N_C positions with O(N_C² × D_col)
-compute — negligible vs FFN. This gives tokens direct access to each other's
-representations within a pass, complementing the PM/EM bottleneck path.
+**Biologically:** Basal ganglia procedural memory is fast, automatic, habitual.
+Not compositional, not explicit — just learned biases in processing.
 
-Within a single pass, all positions still see the same PM/EM state. PositionAttention
-adds direct cross-position mixing that PM/EM alone cannot provide.
+### EM: Primitive Dictionary with Trail-Based Composition
+
+EM stores M **primitive patterns** — atomic building blocks of concepts. Reading
+is done via a **trail**: a seed vector navigates primitive space through
+iterative refinement. The output is a composition of activated primitives.
+
+**State:**
+```
+em_K   [BS, B, M, D]     — primitive keys (unit-norm): "what triggers this"
+em_V   [BS, B, M, D]     — primitive values: "what this contributes"
+em_S   [BS, B, M]        — strengths (0 = inactive)
+em_age [BS, B, M]        — age tracking for decay
+```
+
+**Read (trail-based pattern completion):**
+```
+# Seed from Stage 1 scan (the starting point for the trail)
+seed = W_seed(H)                             # [BS, N, B, D]
+if training:
+    seed = seed + σ * randn_like(seed)       # noise for exploration (σ learned)
+
+# Trail: iterative refinement through primitive space (n_steps = 2)
+y = seed
+for step in range(n_steps):
+    scores = y @ em_K[b].T                   # [BS, N, M] — score ALL primitives
+    scores[em_S == 0] = -inf                 # mask inactive
+    attn = softmax(scores / τ)               # sparse activation (τ learned)
+    delta = attn @ em_V[b]                   # [BS, N, D] — primitive composition
+    gate = sigmoid(W_gate(cat(y, delta)))    # [BS, N, D] — learned step gate
+    y = y + gate * delta                     # seed moves through space
+
+y_em = y - seed                              # [BS, N, D] — net memory contribution
+```
+
+**What this does:** Step 1 activates primitives near the seed (e.g., "animal",
+"outdoor"). The push shifts the query, so step 2 activates different primitives
+(e.g., "running", "park"). The final position encodes "dog running in park" —
+something no single primitive stores. The primitives are a fixed coordinate
+system; the seed is a program that navigates it.
+
+**Combinatorial capacity:** M primitives with continuous seeds → infinite
+possible readouts. The memory is O(M × D) but the output space is continuous.
+
+**Novelty scoring:**
+```
+# Can existing primitives explain this input?
+attn = softmax(normalize(w_cand) @ em_K[b].T / τ)
+reconstruction = attn @ em_V[b]
+recon_error = ||w_cand - reconstruction||    # [BS, N, B] — unexplained signal
+
+# Novelty = surprise magnitude + reconstruction error
+w_nov = sigmoid(W_nov(H))                   # [BS, N, B] — learned blend
+novelty = w_nov * ||surprise|| + (1 - w_nov) * recon_error
+```
+
+**Write (decompose across primitives):**
+```
+# Soft routing: which primitives should absorb this signal?
+route = softmax(normalize(w_cand) @ em_K[b].T / τ_w)  # [BS, N, M]
+
+# Aggregate across N tokens, weighted by novelty
+update_K = sum_n(novelty * route * k_cand)   # [BS, B, M, D]
+update_V = sum_n(novelty * route * v_cand)   # [BS, B, M, D]
+
+# Neuromodulated commit (fully differentiable, no hard selection)
+g_em = em_neuromodulator(novelty_mean, usage)  # scalar gate
+α = g_em * route_aggregated                    # [BS, B, M] per-primitive
+em_K[b] = (1 - α) * em_K[b] + α * normalize(update_K)
+em_V[b] = (1 - α) * em_V[b] + α * update_V
+em_S[b] = clamp(em_S[b] + α.sum(token_dim), 0, s_max)
+```
+
+**Writes decompose, not store:** Each write signal is spread across multiple
+primitives based on soft routing. Existing primitives that partially match
+absorb their share. Over time, primitives self-organize: frequently useful
+ones strengthen, redundant ones decay, and the dictionary covers the input
+distribution efficiently.
+
+**Write buffer (within-segment path):**
+```
+# Per-token write delta (Stage 2, parallel):
+delta_em_t = novelty_t * w_cand_t              # [BS, N, D] — per-token
+
+# Prefix sum (causal accumulation):
+cum_em_t = cumsum(delta_em, dim=seq)           # [BS, N, D] — inclusive
+
+# Added to Stage 3 input alongside trail read:
+stage3_input_t = pm_read_t + em_trail_read_t + cum_em_t
+```
+
+**Two write paths:** The prefix-summed `cum_em` provides immediate within-segment
+feedback — token t sees what tokens 0..t wrote (fast path, raw D-vector, same-segment
+gradient). The structured decomposition commit updates the actual primitives for the
+next segment's trail reads (slow path, M-primitive routing, cross-segment TBPTT).
+This mirrors the brain: hippocampal fast encoding (immediate trace) vs. slow
+consolidation (structured long-term storage).
+
+### Memory Decay and Aging
+
+`pm_bias` decays toward zero (slow drift back to neutral). `em.age_tick(N)`
+increments ages and applies strength decay — both run **once per segment**
+after writes. Memory state then carries to the next segment.
+
+### Budget Enforcement
+
+EM primitives compete for limited budget. When total strength exceeds the
+budget, the weakest (lowest em_S) primitives are soft-pruned. This prevents
+unbounded growth and forces the dictionary to keep only useful primitives.
+
+## Column-Local Memory Addressing
+
+A key simplification in v5: columns address memory by dimension slicing.
+
+```
+Memory bank b:
+  pm_bias [BS, D]        where D = C × D_col
+  em_K    [BS, M, D]
+  em_V    [BS, M, D]
+
+Column c of block b addresses:
+  pm_bias[:, c*D_col : (c+1)*D_col]
+  em_K[:, :, c*D_col : (c+1)*D_col]
+  em_V[:, :, c*D_col : (c+1)*D_col]
+```
+
+This means:
+- **No routing logic** — column c always addresses the same slice
+- **Surprise is dimension-specific** — column c's surprise only affects its slice
+- **Reads are independent** across columns — no coordination needed
+- **GPU-friendly** — contiguous memory access within each column's slice
+- **Biologically motivated** — cortical columns in the brain don't have bandwidth
+  to address the entire memory cortex at once; they connect to local regions
+
+All columns within a block contribute to the same bank's memory, but each
+column only modifies its own feature slice. The full bank stores the
+concatenation of all column contributions.
 
 ## Gradient Flow
 
-### Within-Segment (Pass-to-Pass)
+### Within-Segment (direct — no TBPTT needed)
 
 ```
-loss → decode → x^R → column_R(x^{R-1}, PM/EM_{R-1})
-  → PM.read → PM/EM_{R-1}
-  → pm_commit(PM/EM_{R-2}, elig_{R-1}, neuromod_{R-1})
-  → neuromodulator_{R-1} gets gradient!
-  → elig_{R-1} → column_{R-1} outputs → ...back to pass 1
+loss → logits → Stage 3 scan →
+  → cum_em (write buffer):
+      → delta_em = novelty · w_cand → novelty params, W_w, Stage 1 scan
+      (gradient through prefix sum is a suffix sum — linear, stable)
+  → pm_read (causal gain):
+      → cum_pm → delta_pm = lr_pm · surprise → lr_pm, PCM params
+      → pm_bias (frozen) gets gradient through gain modulation
+  → em_trail (frozen primitives):
+      → through trail steps → softmax → em_K, em_V, W_gate, W_seed, τ, σ
+  → Stage 1 scan → column projection params, PCM params
 ```
 
-The neuromodulator at pass r gets gradient from pass r+1's loss contribution,
-**within the same segment**. No multi-segment TBPTT needed for neuromodulator
-learning. Each pass is a mini perception-and-commit cycle.
+**Major improvement over pre-write-buffer design:** Write parameters (W_w,
+novelty scoring, lr_pm) now get gradient from THIS segment's loss through the
+prefix-summed write buffers. Previously, writes only got gradient via
+cross-segment TBPTT.
+
+### Cross-Segment (requires TBPTT)
+
+The **structured commit** (EM decomposition write with neuromodulator) still
+only affects the next segment's frozen memory reads:
+
+```
+TBPTT chunk = K segments (e.g., K=2-4)
+Segment 1: 3 stages → memory committed → carry to segment 2
+Segment 2: 3 stages → loss flows back through trail reads → segment 1's commit
+```
+
+K=2 is likely sufficient (one segment of lookahead).
 
 ### What Gets Gradient From Where
 
 | Component | Gradient source | Path |
 |-----------|----------------|------|
-| Column FFN (ffn_pre + ffn_post) | Same pass's contribution to loss | Direct through decode |
-| PCM encode/hypothesis | L_pred (auxiliary) + downstream surprise | Same segment |
-| PM read (holographic) | Same pass's loss through PM modulation | Direct |
-| EM read (top-k) | Same pass's loss through EM retrieval | Direct |
-| PM neuromodulator | **Next pass's** loss through committed PM state | Pass r → r+1 |
-| EM neuromodulator | **Next pass's** loss through written EM state | Pass r → r+1 |
-| Eligibility projections | **Next pass's** loss through committed eligibility | Pass r → r+1 |
-
-All gradient paths are within the same segment's forward/backward pass. The
-computation graph spans R passes of column processing + R-1 PM/EM commits.
-
-### Cross-Segment Gradient
-
-For the neuromodulator at the **final pass** (pass R), gradient comes from the
-**next segment** — the committed PM/EM_R is read by the next segment's columns.
-This requires TBPTT chunks spanning at least 2 segments:
-
-```
-TBPTT chunk = K segments (e.g., K=2-4)
-Segment 1: R passes → PM/EM updated R times → carry to segment 2
-Segment 2: R passes → loss flows back through PM/EM → segment 1's final commit
-```
-
-K=2 is likely sufficient (the final pass's neuromodulator only needs 1 segment
-of lookahead). Internal passes (1..R-1) get gradient from within their own
-segment.
+| Scan params (a, b projections) | Same segment's NTP loss | Direct through both scans |
+| PCM encode/predict | L_pred (auxiliary) + downstream | Same segment |
+| PM bias (pm_bias) | Same segment's loss through gain modulation | Direct, smooth |
+| PM lr_pm | Same segment's loss through cum_pm → gain | Through prefix sum (linear) |
+| EM trail params (W_seed, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
+| EM primitives (em_K, em_V) | Same segment's loss through trail read | Through softmax attention |
+| Write candidate proj (W_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
+| Novelty scoring | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
+| EM neuromodulator | **Next segment's** loss through committed primitives | Cross-segment TBPTT |
+| EM commit routing | **Next segment's** loss through committed em_K/em_V | Cross-segment TBPTT |
 
 ## Correctness Analysis
 
-### 1. Within-Segment: Bidirectional (No Causal Mask)
+### 1. Within-Segment: Causal (NTP)
 
-Within a single pass, there is no causal ordering — all N positions are equivalent
-(modulo positional encoding). All tokens within pass r see the same PM/EM state,
-and PM/EM updates between passes let every token's information flow to every other
-token through the memory bottleneck.
+Both scans are causal recurrences — token t only sees tokens 1..t-1 through the
+hidden state. This naturally supports next-token prediction (NTP).
 
-This is **explicitly bidirectional by design**, which is why we use FITB (masked
-token prediction) rather than next-token prediction as the training objective. See
-the Training Objective section.
+Memory reads in Stage 2 are from the **segment-start** state (frozen). Write
+buffers use **inclusive prefix sums** (`cum_t = Σ_{i≤t} delta_i`). Since
+`logits_t` predicts `token_{t+1}` and is allowed to depend on tokens 0..t,
+the inclusive prefix sum is causal. Both `delta_pm_t` and `delta_em_t` depend
+on tokens 0..t (through the causal Stage 1 scan), so `cum_t` at position t
+depends on tokens 0..t — matching the NTP causality requirement.
 
-**Across segments**: PM/EM state at segment k reflects only tokens from
-segments 0..k-1 and the current segment's completed passes — cross-segment
-context is strictly causal.
+### 2. Cross-Segment: Causal
 
-**Across passes**: PM/EM at pass r reflects all N tokens from passes 0..r-1.
-All tokens within pass r see the same PM/EM_r.
+Memory state at segment k reflects only tokens from segments 0..k-1. Writes from
+segment k are committed at the end and only visible to segment k+1.
 
-### 2. Train/Inference Equivalence
+### 3. Train/Inference Equivalence
 
-**Training (FITB)**: mask ~30% of N tokens, process all N through R passes, decode
-at each pass.
-**Training (NTP, backward compat)**: process N tokens through R passes, decode once.
-**Inference (autoregressive)**: process one token at a time for R passes, decode.
-**Inference (non-autoregressive)**: generate N tokens at once via FITB refinement.
+**Training**: Process N-token segments through 3 stages, NTP loss on all positions.
+**Inference**: Process tokens through 3 stages. Can be done:
+- Segment-at-a-time: process N tokens, get N predictions (most efficient)
+- Token-at-a-time: update scan state per token, defer memory ops to segment
+  boundaries (streaming mode)
 
-Equivalent because no cross-token operations within a pass. At inference, PM/EM
-still update after each pass (single token's eligibility/novelty may or may not
-trigger commits — the neuromodulator decides).
-
-Inference memory: PM + EM + per-column PCM z_hat + eligibility accumulators.
+Inference memory: scan states (C × D_col per scan × 2 scans) + PM + EM.
 **Constant**, does not grow with sequence length.
-
-### Non-Autoregressive Segment Generation
-
-`generate_segments()` exploits the architecture's bidirectional nature for fast inference:
-
-1. **Phase 1 (Prompt)**: Process prompt through NTP segments to warm PM/EM
-2. **Phase 2 (Generate)**: Generate N-token chunks, all positions start as `<FITB>`,
-   R passes refine, sample from last pass's logits
-
-Throughput: N/R tokens per forward pass vs 1 for autoregressive `generate()`.
-For N=512, R=4: **128x** throughput improvement per forward pass.
-
-```
-Autoregressive:  [tok] → R passes → 1 token    → O(R×N) per token
-Non-autoregressive: [<FITB>×N] → R passes → N tokens → O(R) per N tokens
-```
-
-Quality tradeoff: non-autoregressive generation lacks left-to-right causal
-ordering within a segment. Quality depends on how well PM/EM carry context
-from prompt segments and how effectively R-pass refinement resolves ambiguity.
-
-### 3. What R=1 Is
-
-R=1: single pass. No cross-pass surprise (no previous prediction). No PM/EM
-update within the segment (only carries forward to next segment). This is a
-**feedforward model with memory reads** — similar to retrieval-augmented generation.
-
-R=2+: cross-pass surprise kicks in. PM/EM update between passes. Tokens gain
-indirect access to each other through memory. "Depth" emerges.
 
 ## Practical Design Decisions
 
 ### Column Dimensions
 
 ```
-# Tier A example (~105M params)
+# Tier A example (target ~105M params)
 D = 2048          # internal model width
-D_embed = 384     # embedding / LM head width (decoupled from D)
-B_blocks = 6      # memory blocks (PM/EM state batched as BS*B)
-C = 16            # columns per block → G = B*C = 96 groups total
-D_col = 128       # = D // C. Column width (also PM/EM slice width)
-D_pcm = 64        # PCM encoding dimension
-ffn_depth = 3     # L = 3 → 6 total FFN layers per pass (3 pre + 3 post)
-ffn_expansion = 4 # FFN hidden dim = D_col * ffn_expansion = 512
-R = 4             # refinement passes
-N = 512           # segment length → N_C = N // C = 32 tokens per column
-
-Fan-out:  D → G × D_col = 2048 → 12288  (6x)
-Fan-in:   G × D_col → D = 12288 → 2048
-
-# Tier presets (see config.py, C=16, N=512 uniform):
-# Tier A (~105M): D=2048 D_embed=384 B=6  C=16 G=96  Dcol=128 R=4  L=3
-#   r=32, M=256, k_ret=16, C_em=32
-# Tier B (~406M): D=3072 D_embed=512 B=12 C=16 G=192 Dcol=192 R=6  L=3
-#   r=64, M=512, k_ret=32, C_em=64
-# Tier C (~944M): D=4096 D_embed=768 B=16 C=16 G=256 Dcol=256 R=8  L=3
-#   r=128, M=1024, k_ret=64, C_em=128
+D_embed = 384     # embedding / LM head width
+B = 6             # memory banks
+C = 16            # columns per bank
+D_col = 128       # = D / C — column width
+N = 512           # segment length
 ```
+
+Tier presets need recalculation for scan-based architecture.
+Scan parameters (layer count, state expansion) affect param count
+differently than the R-loop FFN stacks. Anchor on Mamba-130M for comparison.
 
 ### Segment Length
 
-Segment length N=512 determines how many tokens contribute to each round of R
-PM/EM updates. N_C = N // C = 32 tokens per column per pass. Each pass sees
-N tokens of eligibility/novelty before committing. Shorter N = more frequent
-cross-segment updates.
+Segment length N determines:
+- How many tokens contribute to each round of memory updates
+- Parallel-scan granularity (longer = more parallelism)
+- Memory update frequency (shorter = more frequent writes)
 
-### Damped Pass-to-Pass Mixing
+### Lateral Mixing
 
-    x^r = (1 - λ) * x^{r-1} + λ * column_output^r
+**Resolved:** No within-scan lateral mixing. Element-wise A means each column
+evolves independently. Cross-column integration happens through:
+1. **Cross-segment:** Shared memory bank reads (EM trail, PM gain) — all columns
+   in a block read/write the same bank.
+2. **Within-segment:** The EM write buffer (`cum_em`) is a D-wide projection of
+   column states (`w_cand = W_w(H)`), mixing across all columns. When added to
+   Stage 3's input, it provides within-segment cross-column information.
+3. **Input/output:** `proj_up` and `proj_down` mix across all D dimensions.
 
-λ can be learned or per-pass schedule. Start with λ=0.5.
+This keeps the scan simple (standard element-wise prefix scan) while the
+memory systems and write buffers handle the binding role.
 
-### Token Subsampling
-
-Earlier passes can process subsets of tokens:
-
-```
-Pass 1: process 25% of tokens (strided)
-Pass 2: process 50%
-...
-Pass R: process ALL tokens, decode, take loss
-```
-
-Skipped tokens retain their representation unchanged. PM/EM still update
-from the processed subset's eligibility/novelty.
-
-**Edge cases:**
-- Deterministic schedule at inference (strided). Random only during training.
-- Per-pass auxiliary loss to prevent "early passes don't matter" collapse.
-
-### Scaling: Blocks of Columns
+### Scaling: Memory Banks
 
 ```
-Block b: C columns share PM_b (r_slots × D_col) + EM_b (M_slots × D_col)
+Bank b: C columns share PM_b (D) + EM_b (M × D)
 ```
 
-Total columns = B_blocks × C. Each block's PM/EM can specialize. Analogous
-to different brain regions maintaining different types of memories.
+Total banks = B. Each bank's memory can specialize — analogous to different
+brain regions maintaining different types of memories.
 
 ## Complexity
 
 ### Serial Depth
 
-Per pass: O(2L) FFN layers — all G × N computations are parallel within each layer.
-PM/EM commit between passes: O(1) (small, not N-dependent).
-Total: O(R × 2L).
+Per segment: O(N) for each scan (parallelized to O(log N) with parallel-scan)
+             + O(1) for memory ops (fixed cost, not N-dependent)
+Total: O(log N) work depth (assuming parallel-scan).
 
 Compare:
-- Current (v1):       O(K×P) = 8×32 = **256 steps**
 - Transformer (L=6):  O(L) = **6 steps** (but O(N²) compute per step)
-- Mamba (L=6):        O(L×N) (sequential scan per layer)
-- **v4 (R=4, L=3)**:  O(R×2L) = **24 steps** (and O(N×D²) compute per step)
+- Mamba (L=24):       O(L × log N) with parallel-scan
+- **v5 (2 scans)**:   O(2 × log N) + O(1) memory ops
 
 ### Compute
 
-Per pass: O(N × G × 2L × D_col²) for column FFNs (2 stacks × L layers)
-        + O(N × B_blocks × r × D) for PM reads
-        + O(N × B_blocks × k × D) for EM reads
-Total: R × above
+Per segment:
+- Stage 1: O(N × D²) for scan (same as one Mamba layer)
+- Stage 2: O(N × B × (D + M×D)) for PM/EM reads + writes + O(N×D) prefix sums
+- Stage 3: O(N × D²) for second scan
+- Total: ~2 Mamba layers + memory ops per segment
 
 ### Memory
 
-Training: O(R × N × D) for intermediate representations.
-With gradient checkpointing: O(N × D) + recompute per pass.
-Inference: O(PM + EM + B × D_pcm) — **constant**.
+Training: O(N × D) for scan states + O(N × D) for activations.
+Inference: O(D) scan states + O(B × (r + M) × D) memory — **constant**.
 
 ## Training
 
-### Training Objective: FITB (Fill-In-The-Blank)
+### Training Objective: NTP (Next-Token Prediction)
 
-The architecture's R-pass iterative refinement is fundamentally bidirectional: all
-N tokens share PM/EM state that gets updated between passes, so every token can
-see information from every other token through memory after pass r=0. Rather than
-forcing causal masking on this naturally bidirectional architecture, we use FITB
-(masked token prediction) as the training objective.
+Causal scans naturally produce autoregressive predictions. Standard cross-entropy
+loss on all positions:
 
-**FITB R-pass loop:**
-1. Mask ~30% of tokens with `<FITB>` token (random or span masking)
-2. For each pass r=0..R-1:
-   a. Re-embed from updated sequence (r > 0 only): damped mix of previous
-      pass's column output with freshly re-embedded predictions
-   b. Column processing (PM read, EM read, FFN, PCM — unchanged)
-   c. fan_in + ln_final + lm_head → logits_r for this pass
-   d. PM/EM update (including FITB positions — model should know what it predicted)
-   e. Re-embed: argmax(logits_r) replaces `<FITB>` positions for next pass (no grad)
+    L = (1/N) Σ_t CE(logits_t, token_{t+1}) + α · L_pred
 
-**Damped mixing (FITB vs NTP):**
-- NTP:  `x_cols = (1-λ)*x_cols_prev + λ*x_out` — old input blended with new column output
-- FITB: `x_cols = (1-λ)*x_out_prev + λ*x_cols_fresh` — previous column output blended
-  with fresh re-embedding. In both cases, λ weights the "new information."
-
-**Per-pass loss** (each pass independently produces logits and CE loss):
-
-    L = (1/(R*M)) Σ_r Σ_{m∈masked} CE(logits_r_m, original_token_m) + α * L_pred
-
-where M = number of masked positions, targets are original tokens at masked
-positions (NOT shifted-by-1), and L_pred = Σ_r MSE(z_hat^r, z^{r+1}.detach()).
-
-**Gradient flow:** Cross-pass gradients flow through `x_out` in the damped mixing
-formula (pass r's logits depend on pass r-1's column output). The only blocked
-gradient path is the argmax re-embedding (non-differentiable, wrapped in no_grad).
-This means later-pass losses can influence earlier-pass parameters.
-
-Uniform loss weighting across passes (later-pass upweighting is a future option).
-
-**Config fields:** `mask_rate` (0.3), `span_mask_prob` (0.5), `span_mask_mean_len` (3),
-`fitb_id` and `null_id` (set from tokenizer at runtime).
-
-**Backward compatibility:** `fitb_mask=None` in `forward_segment()` triggers the
-original NTP path. `mask_rate=0.0` disables FITB in the trainer.
+where L_pred is the PCM auxiliary prediction loss.
 
 ### TBPTT Chunks
 
-Process K segments per chunk (K=2-4). Backprop through all K × R passes.
-PM/EM state detached at chunk boundaries.
+Process K segments per chunk (K=2-4). Memory state detached at chunk boundaries.
 
 ### Phase A: Per-Document Learning
 
@@ -648,193 +746,162 @@ PM/EM reset at document boundaries. Neuromodulators learn when to commit.
 
 ### Phase B: Lifelong Adaptation
 
-PM/EM persist across documents within a stream. Only eligibility accumulators
-and PCM z_hat reset at doc boundaries. The distillation cycle:
+PM/EM persist across documents. Only scan hidden states reset at doc boundaries.
+The distillation cycle:
 
-1. New domain → surprise spikes (PCM cross-pass surprise)
-2. PM eligibility accumulates (gated by surprise)
-3. PM neuromodulator commits at each pass boundary
-4. EM writes novel episodes at each pass boundary
+1. New domain → surprise spikes (PCM prediction errors)
+2. PM bias shifts to compensate (driven by surprise mean)
+3. EM primitives update via neuromodulated decomposition
+4. New concepts decomposed and stored across primitives
 5. Over time, slow weights learn domain → surprise drops
 6. Slow weights = general; PM/EM = domain-specific
 
-## Memory System Learning Mechanisms
+## Inference
 
-### PM Eligibility Accumulation
+### Streaming Generation
 
-Each token, each pass, each column accumulates eligibility:
+Process tokens in N-token segments. Each segment:
+1. Run 3-stage cycle
+2. Emit N token predictions
+3. Carry scan states + memory to next segment
 
-```
-# Fused post-processing produces candidates in D_col space directly
-k_cand = normalize(k_pre)                  # [D_col] — from W_post_fused
-v_cand = v_post                            # [D_col]
-gate = (surprise / 5.0).clamp(0, 1)        # third factor
-route_w = softmax(pm_K @ k_cand / tau)     # [r_slots] — which slot?
+Throughput: N tokens per forward pass (no R multiplier).
 
-# Accumulate across all N tokens in this pass
-elig_K += gate * route_w ⊗ k_cand          # [r_slots, D_col]
-elig_V += gate * route_w ⊗ v_cand
-```
+### Token-by-Token Mode
 
-At the end of each pass, the neuromodulator decides how much to commit:
+For interactive use: update scan states per token, run memory ops at segment
+boundaries. Latency per token = one scan step (no quadratic attention).
 
-```
-(g, slot_logits, tau, ww) = PM_neuromodulator(elig_summary)
-g *= elig_mag / (elig_mag.detach() + eps)   # scale by eligibility magnitude (pass-0 → g≈0)
-slot_logits -= ww * pm_a                   # learned weakness bias (prefer weaker slots)
-slot_weights = softmax(slot_logits / tau)   # which slots to update
-pm_K = (1 - g * slot_weights) * pm_K + g * slot_weights * elig_K
-pm_V = (1 - g * slot_weights) * pm_V + g * slot_weights * elig_V
-```
+## Design Decisions (Resolved)
 
-Eligibility accumulators reset after each commit (each pass gets fresh traces).
+1. **Scan formulation** → Simple linear recurrence (`h_t = a_t ⊙ h_{t-1} + b_t`).
+   No SSM. Memory systems handle the role SSM's expanded state was designed for.
 
-### EM Novelty Accumulation
+2. **Lateral mixing** → Element-wise A, independent columns. No within-scan mixing.
+   Memory is the cross-column integration mechanism (biologically: thalamic hub).
 
-Each token, each pass, each column scores novelty:
+3. **FFN** → No separate FFN. The scan's input-dependent projections (computing
+   a_t, b_t) serve the same nonlinear transformation role.
 
-```
-novelty = w_nov * surprise + (1 - w_nov) * (1 - max_cosine_sim(q, em_K))
-```
+4. **Scan layers** → Equal depth per stage. Target 12 layers Stage 1 + 12 layers
+   Stage 3 = 24 total for ~130M param model (anchored to Mamba-130M).
 
-Top-C candidates (highest novelty) are buffered per pass. At the end of each
-pass, the neuromodulator decides writes:
+5. **Memory integration** → Additive. `Stage3_input = pm_read + em_trail + cum_em`.
+   Parameter-free, gradient-friendly, degrades gracefully when memory is empty.
 
-```
-(g_em, tau, decay, ww) = EM_neuromodulator(novelty_mean, em_usage, content)
-slot_scores = candidates @ em_K.T + ww * weakness  # learned weakness bias
-slot_weights = softmax(slot_scores / tau)
-em_K[slot] = (1 - g_em * slot_weights) * em_K[slot] + g_em * slot_weights * candidate_K
-em_V[slot] = (1 - g_em * slot_weights) * em_V[slot] + g_em * slot_weights * candidate_V
-# Note: strength decay (em_S *= decay) runs once per segment via em.base_decay(),
-# NOT per pass. See "Note on decay/aging timing" below.
-```
+6. **CrossBlockMixer** → Dropped. v4 artifact. In v5, memory reads already provide
+   cross-bank integration, and scan provides cross-position context.
 
-**Note on decay/aging timing:** `pm.base_decay()` and `em.age_tick(N)` run
-**once per segment** (after all R passes), not per pass. Passes are refinement
-steps at the same time index — decay/aging should reflect elapsed segments,
-not refinement depth. PM/EM *commits and writes* still happen between passes.
+7. **PM** → Simplified to bias vector with element-wise gain modulation.
+   Coarse, fast, automatic — distinct from EM's rich compositional read.
 
-### Summary
+8. **EM** → Trail-based primitive composition. Dictionary of M primitives,
+   seed from scan navigates via iterative refinement (2 steps). Soft writes
+   decompose across primitives. Clean differentiable credit assignment.
 
-| Component | Where | When | Parallel? |
-|-----------|-------|------|-----------|
-| PCM encode + surprise | Column | Every token, every pass | Yes (G×N) |
-| PM holographic read | Column | Every token, every pass | Yes (G×N) |
-| EM top-k read | Column | Every token, every pass | Yes (G×N) |
-| Lateral mixer [C,C] | Column | Every token, every pass | Yes (G×N) |
-| PositionAttention [N_C,N_C] | Column | Every token, every pass | Yes (G groups) |
-| ffn_pre (L layers, gain) | Column | Every token, every pass | Yes (G×N) |
-| Cross-block mixer [B,B] | Column | Every token, every pass | Yes (G×N) |
-| ffn_post (L layers) | Column | Every token, every pass | Yes (G×N) |
-| PM eligibility accumulate | Column | Every token, every pass | Yes (G×N) |
-| EM novelty score | Column | Every token, every pass | Yes (G×N) |
-| PM neuromod commit | Between passes | Once per pass | Small |
-| EM neuromod write | Between passes | Once per pass | Small |
-| PM base decay | After R loop | Once per segment | Tiny |
-| EM age tick | After R loop | Once per segment | Tiny |
+9. **PositionAttention** → No. Scan handles cross-position causally. No attention
+   mechanisms — keeps compute O(N) not O(N²).
 
-## Inference: Non-Autoregressive Generation
+10. **Implementation** → Custom prefix scan. No external dependency (no mamba-ssm).
+    Standard element-wise parallel-scan is simple to implement.
 
-The architecture supports two generation modes:
+11. **Causal write buffers** → Prefix-summed write deltas provide within-segment
+    feedback. PM cum_pm goes inside gain formula (write-before-read). EM cum_em
+    is additive in Stage 3. Inclusive prefix sum (i≤t) — causal for NTP. Write
+    params get same-segment gradient. Structured commit still happens at segment
+    end for long-term memory (cross-segment TBPTT for neuromodulator).
 
-### `generate()` — Autoregressive (NTP)
+### Implementation Clarifications
 
-Standard sliding-window autoregressive generation. O(R×N) per new token.
-Slow — included for completeness, not recommended.
+These resolve ambiguities in the pseudocode above for actual PyTorch implementation.
 
-### `generate_segments()` — Non-Autoregressive (FITB)
+**Bank-column mapping (H ↔ memory):**
+H is `[BS, N, C, D_col]` (column-indexed). Memory is `[BS, B, ...]` (bank-indexed).
+For bank b's operations: `H_bank = H.reshape(BS, N, D)`. All B banks share the
+same column states — different banks hold different memory but modulate the same H.
+Similarly, `surprise.reshape(BS, N, D)` for bank-level delta computation.
+Stage 2 returns `[BS, N, B, D]` signals; Stage 3 sums over B and reshapes to
+`[BS, N, C, D_col]` for the integration scan.
 
-Generates N-token chunks at once via FITB iterative refinement:
+**Pseudocode indexing notation:**
+`em_K[b]` means `em_K[:, b]` (index the B dimension, keep batch). `pm_bias[b]`
+means `pm_bias[:, b]`, shape `[BS, D]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
+(same for all banks — bank index selects memory, not column states).
 
-1. **Phase 1 (prompt warmup):** Process prompt tokens through NTP segments to warm PM/EM.
-2. **Phase 2 (chunk generation):** For each N-token chunk:
-   - Initialize all positions as `<FITB>` tokens
-   - Run R refinement passes (standard FITB forward)
-   - Sample from last pass's logits (temperature + top-k)
-   - Append sampled tokens to output
+**W_gate is element-wise (not a matrix):**
+`gate = sigmoid(w1 * y + w2 * delta + bias)` where w1, w2 are learned `[D]`
+vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
 
-Throughput: N/R tokens per forward pass vs 1 for autoregressive. At Tier A
-(R=4, N=512): ~128 tokens per forward pass, benchmarked at **68.9k tok/s**.
+**w_cand serves as both routing key and write content:**
+No separate k_cand/v_cand projections. In the EM write: `route` uses normalized
+w_cand as the routing key, and w_cand is also the value being decomposed across
+primitives. Simplifies Stage 1 (one projection instead of three).
 
-## Performance
+**lr_pm is a scalar nn.Parameter per bank:**
+Shape: `[B]`, parameterized as `softplus(raw_lr_pm)` to stay positive. Gets
+gradient from this segment's loss through `cum_pm → gain modulation → logits`.
 
-### Activation Checkpointing
+**em_K/em_V and pm_bias: state in computation graph:**
+These are plain tensors, NOT nn.Parameter. But they are NOT detached within a
+TBPTT chunk — gradient flows through them via the EMA commit chain from the
+previous segment. "Frozen within segment" means their values don't change during
+the forward pass, but they participate in the computation graph. At TBPTT chunk
+boundaries, `detach_states()` breaks the gradient chain.
 
-Controlled via `config.gradient_checkpointing` (default: False). When enabled:
+**Scan layer structure:**
+Each scan layer: fused input projection `[D_col → E]` producing (a, b) where
+E = expansion factor × D_col. For E = 2 × D_col: `proj(x) → [a_raw, b_raw]`,
+then `a = sigmoid(a_raw)` (decay gate ∈ [0,1]), `b = silu(b_raw)` (input gate).
+Each layer has: proj_in `[D_col, E]` + proj_out `[E, D_col]` + LayerNorm.
+Param count per layer: ~2 × D_col × E ≈ 4 × D_col². With D_col=128, that's
+~66K params/layer × 24 layers = ~1.6M (scan params only). Remaining params
+in proj_up/down, W_seed, W_w, W_pcm, W_enc, lm_head, and memory params.
 
-- **FFN stacks** (ffn_pre, ffn_post): checkpoints each of the L FFN layers
-  individually via `grad_checkpoint(_layer, x, idx, gain)`. This is the
-  dominant memory consumer (2 stacks × L=3 layers × D_col × ffn_expansion).
-- **PositionAttention**: checkpoints the full attention computation (Q/K/V
-  projections, bmm, softmax, out_proj) as a single unit.
+**Stage 3 a'_t derivation:**
+Same structure as Stage 1. `a'_t` and `b'_t` are derived from the integrated
+signal (pm_read + em_trail + cum_em) via learned projections (separate from
+Stage 1's projections).
 
-Recomputes activations during backward to save VRAM. Enables larger batch
-sizes at the cost of ~30% more compute.
+**z_hat carry (PCM surprise):**
+z_hat is computed post-scan as `W_pcm(H)`, not carried in scan state. Surprise
+is a shifted comparison: `surprise[:, 1:] = z_hat[:, :-1] - z[:, 1:]`. Position
+0 has zero surprise (no prior prediction). This avoids enlarging the scan state.
 
-### Pre-Tokenized Data Pipeline
+**route_aggregated in EM commit:**
+`route_aggregated = route.mean(dim=seq_dim)` — average routing weight per
+primitive across all N tokens. Shape: `[BS, B, M]`. Used to scale the EMA
+learning rate per primitive.
 
-For production training, use pre-tokenized `.bin` shards instead of
-on-the-fly tokenization:
+**PCM gain modulation:**
+Applied to H before Stage 2: `H = H * (1 + 0.1 * tanh(W_gain(surprise)))`.
+Bounded [0.9, 1.1]. W_gain is `[D_col, D_col]` per column. Slight
+amplification of surprising features, suppression of predicted features.
 
-1. Run `scripts/prepare_data.py` — produces both `.parquet` (text) and `.bin`
-   (uint16 token IDs with EOS separators) files.
-2. `create_dataloader()` automatically detects `.bin` shards alongside parquet
-   files and uses `TokenShardDataset` (memory-mapped, pinned memory, prefetch
-   thread) instead of `PersistentStreamDataset` (on-the-fly tokenization).
+### Remaining Open
 
-Benefits: eliminates tokenization CPU overhead, uses OS page cache for I/O,
-pinned memory for non-blocking CPU→GPU transfer, background prefetch thread
-overlaps data loading with GPU computation.
+- **Tier presets**: Need recalculation for scan architecture. Anchor on Mamba-130M
+  total param count for fair comparison. Scan params (layer count, state expansion)
+  differ from v4's FFN stacks.
 
-## Prototyping Plan
+## Comparison: v4 → v5
 
-### Prototype 0: Columns + PCM only (no PM/EM)
-
-- B columns with FFN + PCM, R passes, no memory reads or updates
-- Goal: can R-pass refinement with cross-pass surprise learn language at all?
-
-### Prototype 1: Add PM/EM reads (frozen)
-
-- PM/EM initialized, frozen (no updates between passes)
-- Goal: does reading from structured memory improve perplexity?
-
-### Prototype 2: Full system
-
-- PM/EM updated between passes via neuromodulators
-- Full Hebbian eligibility + novelty writes
-- Goal: demonstrate the iterative perception + memory update loop
-
-### Prototype 2.5: Optional within-segment scan
-
-- Add small recurrent scan state if within-pass token context proves necessary
-- Goal: handle local syntactic tasks that pure PM/EM can't cover
-
-### Measure
-
-1. tokens/sec at fixed batch and N
-2. peak training memory (GB)
-3. validation loss vs baseline (RWKV-small or tiny transformer)
-
-## Open Questions
-
-1. **Optimal R**: Start R=4-6. Per-pass auxiliary loss for ablation.
-
-2. **Shared vs per-pass column weights**: Shared = true iterative refinement.
-   Separate = more capacity. Hybrid possible.
-
-3. **Eligibility reset between passes**: Currently reset after each commit. Could
-   carry eligibility across passes (exponential decay) for multi-pass patterns.
-
-4. **Within-segment context**: ~~Is memory-mediated context (R hops through PM/EM)
-   sufficient?~~ **Addressed**: PositionAttention adds direct content-adaptive
-   cross-position mixing (O(N_C² × D_col) per group). Zero-init preserves
-   existing training dynamics; empirical evaluation will show the benefit.
-
-5. **Block/column scaling**: How many blocks × columns per block?
-
-6. **PCM prediction target**: Predict next pass's encoding, final pass's encoding,
-   or contrastive loss?
-
-7. **Pass 1 (no surprise)**: What should gate eligibility/novelty in pass 1? Options:
-   a) No gating (accumulate everything), b) Use a fixed prior, c) Skip accumulation.
+| Aspect | v4 (Iterative) | v5 (Scan-Memory-Scan) |
+|--------|---------------|----------------------|
+| Token processing | R passes, all positions parallel | 2 causal scans, parallel-scan |
+| Cross-token context | Memory-mediated (R hops) | Scan recurrence (causal) + memory |
+| Training objective | FITB (masked prediction) | NTP (next-token prediction) |
+| Token partitioning | Interleaved (column c gets tokens c, c+C, ...) | All columns see every token (D_col slices) |
+| Fan-out/fan-in | Required (D ↔ G×D_col) | Not needed (columns = D_col slices of D) |
+| Memory within segment | Updates R times (between passes) | Frozen reads + causal write buffers (prefix sum) |
+| Surprise | Scalar (cross-pass: ‖z^r - z_hat^{r-1}‖) | Vector (within-scan: z_hat_{t-1} - z_t) |
+| Memory addressing | Block-level D, sliced per column | Column-local D_col slices of bank |
+| Serial depth | O(R × 2L) FFN layers | O(L × log N) parallel-scan |
+| PM | Holographic slots (r slots, routing) | Bias vector (1 vector, gain mod) |
+| EM read | Top-k retrieval (hard selection) | Trail-based composition (soft, iterative) |
+| EM write | Store full vector in one slot | Decompose across primitives (soft routing) |
+| EM capacity | M independent facts | M primitives → ∞ compositions (continuous seeds) |
+| Credit assignment | Through top-k mask (sparse grad) | Through softmax (trail) + prefix sum (writes) |
+| Write gradient | Cross-segment only (TBPTT) | Same-segment (write buffer) + cross-segment (commit) |
+| Memory state vs params | State (PM slots, EM slots) | State (pm_bias, em_K/V primitives) |
+| GPU utilization | ~7.4% (narrow bmm, R-loop) | Expected much higher (scan kernels) |
+| Compute per token | ~79M FLOPs (Tier A) | ~2× scan layer + trail + PM gain |

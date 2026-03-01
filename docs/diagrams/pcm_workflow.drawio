@@ -1,143 +1,117 @@
-<mxfile host="app.diagrams.net" modified="2026-02-27" type="device">
-  <diagram name="Cross-Pass PCM Workflow" id="pcm-workflow">
+<mxfile host="app.diagrams.net" modified="2026-02-28" type="device">
+  <diagram name="PCM Workflow (v5 Scan)" id="pcm-workflow">
     <mxGraphModel dx="1200" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="900" math="0" shadow="0">
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
 
         <!-- Title -->
-        <mxCell id="title" value="&lt;b&gt;Cross-Pass Predictive Coding (PCM) — Workflow&lt;/b&gt;" style="text;html=1;align=center;fontSize=16;" vertex="1" parent="1">
-          <mxGeometry x="250" y="10" width="450" height="30" as="geometry"/>
+        <mxCell id="title" value="&lt;b&gt;Predictive Coding (PCM) — v5 Within-Scan Workflow&lt;/b&gt;" style="text;html=1;align=center;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="500" height="30" as="geometry"/>
         </mxCell>
 
-        <!-- ==================== PASS r SECTION ==================== -->
-        <mxCell id="pass_r" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;verticalAlign=top;" vertex="1" parent="1">
-          <mxGeometry x="50" y="60" width="480" height="500" as="geometry"/>
+        <!-- ==================== SCAN CONTEXT ==================== -->
+        <mxCell id="scan_ctx" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4472C4;dashed=1;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="50" y="60" width="500" height="520" as="geometry"/>
         </mxCell>
-        <mxCell id="pass_r_title" value="&lt;b&gt;Pass r&lt;/b&gt; (current)" style="text;html=1;align=left;fontSize=13;" vertex="1" parent="1">
-          <mxGeometry x="60" y="65" width="150" height="25" as="geometry"/>
-        </mxCell>
-
-        <!-- Input from previous pass -->
-        <mxCell id="zhat_prev" value="z_hat_prev (from pass r−1)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, G, D_pcm]&lt;br&gt;None on pass 1&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="80" y="100" width="200" height="45" as="geometry"/>
+        <mxCell id="scan_title" value="&lt;b&gt;Stage 1: Fast Scan&lt;/b&gt; (within scan recurrence)" style="text;html=1;align=left;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="60" y="65" width="350" height="25" as="geometry"/>
         </mxCell>
 
-        <!-- x_col input -->
-        <mxCell id="xcol" value="x_col (column input, before PM/EM)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, G, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="310" y="100" width="195" height="35" as="geometry"/>
+        <!-- Token t-1 -->
+        <mxCell id="tok_prev" value="Token t−1 (previous step)" style="text;html=1;align=left;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="100" width="200" height="20" as="geometry"/>
         </mxCell>
 
-        <!-- Encode -->
-        <mxCell id="encode" value="&lt;b&gt;PCM Encode (step 1 of pass)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;z = GroupedLinear(GroupedLayerNorm(x_col))&lt;br&gt;[BS, N, G, D_pcm]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="300" y="170" width="230" height="45" as="geometry"/>
+        <mxCell id="h_prev" value="H_{t-1} (column states)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, C, D_col] — from scan recurrence&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="130" width="220" height="35" as="geometry"/>
         </mxCell>
-        <mxCell id="pe1" style="endArrow=block;endFill=1;" edge="1" source="xcol" target="encode" parent="1">
+
+        <mxCell id="zhat_prev" value="z_hat_{t-1} = W_pcm · H_{t-1}&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, C, D_col] — PREDICTION of next token&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="80" y="185" width="250" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="pe1" style="endArrow=block;endFill=1;" edge="1" source="h_prev" target="zhat_prev" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- Surprise computation -->
-        <mxCell id="surprise_box" value="&lt;b&gt;Compute Surprise&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;delta = z − z_hat_prev.detach()&lt;br&gt;surprise = ‖delta‖ / √D_pcm&lt;br&gt;[BS, N, G]&lt;br&gt;&lt;br&gt;If pass 1 (z_hat_prev = None):&lt;br&gt;surprise = 0, delta = 0&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="100" y="170" width="180" height="100" as="geometry"/>
-        </mxCell>
-        <mxCell id="pe2" style="endArrow=block;endFill=1;" edge="1" source="zhat_prev" target="surprise_box" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="pe3" style="endArrow=block;endFill=1;" edge="1" source="encode" target="surprise_box" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
+        <!-- Token t -->
+        <mxCell id="tok_cur" value="Token t (current step)" style="text;html=1;align=left;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="245" width="200" height="20" as="geometry"/>
         </mxCell>
 
-        <!-- Gain modulation -->
-        <mxCell id="gain" value="&lt;b&gt;FFN Gain Modulation&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gain = 1 + 0.1 · tanh(W_gain(delta))&lt;br&gt;[BS, N, G, D_col]&lt;br&gt;W_gain: D_pcm → D_col (zero-init)&lt;br&gt;gain starts at 1.0 (no effect)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="80" y="300" width="230" height="70" as="geometry"/>
+        <mxCell id="x_t" value="X_t (token embedding slice)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, C, D_col] — column c gets its D_col slice&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="275" width="250" height="35" as="geometry"/>
         </mxCell>
-        <mxCell id="pe4" style="endArrow=block;endFill=1;" edge="1" source="surprise_box" target="gain" parent="1">
+
+        <mxCell id="z_t" value="z_t = W_enc · X_t&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, C, D_col] — ACTUAL encoding&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="80" y="330" width="200" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="pe2" style="endArrow=block;endFill=1;" edge="1" source="x_t" target="z_t" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- FFN -->
-        <mxCell id="ffn" value="ffn_pre (gain-modulated, L layers)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gain applied on first layer only&lt;br&gt;After lateral mixer, before cross-block mixer&lt;br&gt;Then ffn_post (L layers, no gain) after cross-block&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="80" y="400" width="260" height="55" as="geometry"/>
+        <!-- Vector Surprise -->
+        <mxCell id="surprise" value="&lt;b&gt;Vector Surprise&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;surprise_t = z_hat_{t-1} − z_t&lt;br&gt;[BS, C, D_col] — per-feature error&lt;br&gt;&lt;br&gt;Each dimension independently says:&lt;br&gt;&quot;I was wrong about THIS feature by THIS much&quot;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="80" y="390" width="280" height="80" as="geometry"/>
         </mxCell>
-        <mxCell id="pe5" style="endArrow=block;endFill=1;" edge="1" source="gain" target="ffn" parent="1">
+        <mxCell id="pe3" style="endArrow=block;endFill=1;strokeColor=#9673a6;" edge="1" source="zhat_prev" target="surprise" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="pe4" style="endArrow=block;endFill=1;strokeColor=#9673a6;" edge="1" source="z_t" target="surprise" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- Predict -->
-        <mxCell id="predict" value="&lt;b&gt;PCM Predict&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;z_hat = hyp_down(gelu(hyp_up(z)))&lt;br&gt;[BS, N, G, D_pcm]&lt;br&gt;Hypothesis: what will z look like next pass?&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="310" y="240" width="210" height="60" as="geometry"/>
+        <!-- Gain -->
+        <mxCell id="gain" value="Gain Modulation (from surprise)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gain = 1 + 0.1 · tanh(W_gain(surprise))&lt;br&gt;[BS, C, D_col] — bounded [0.9, 1.1]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="80" y="490" width="280" height="45" as="geometry"/>
         </mxCell>
-        <mxCell id="pe6" style="endArrow=block;endFill=1;" edge="1" source="encode" target="predict" parent="1">
+        <mxCell id="pe5" style="endArrow=block;endFill=1;" edge="1" source="surprise" target="gain" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- Surprise outputs -->
-        <mxCell id="surp_out1" value="surprise → PM elig gate&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gate = (surprise/scale).clamp(0,1)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
-          <mxGeometry x="80" y="475" width="200" height="35" as="geometry"/>
+        <!-- ==================== OUTPUTS ==================== -->
+        <mxCell id="out_container" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#82b366;dashed=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="580" y="60" width="460" height="260" as="geometry"/>
         </mxCell>
-        <mxCell id="surp_out2" value="surprise → EM novelty&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;w · surprise + (1−w) · dissim&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
-          <mxGeometry x="310" y="475" width="200" height="35" as="geometry"/>
+        <mxCell id="out_title" value="&lt;b&gt;Surprise Outputs → Stage 2&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="590" y="65" width="250" height="25" as="geometry"/>
         </mxCell>
-        <mxCell id="pe7" style="endArrow=block;endFill=1;dashed=1;strokeColor=#82b366;" edge="1" source="ffn" target="surp_out1" parent="1">
+
+        <mxCell id="out_pm" value="→ PM Bias Update&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_bias += lr_pm · surprise_mean&lt;br&gt;Column c's surprise only gates its D_col slice&lt;br&gt;Features well-predicted → no bias shift&lt;br&gt;Features surprising → bias drifts to compensate&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="600" y="100" width="280" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="out_em" value="→ EM Novelty Scoring&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;||surprise|| contributes to novelty score&lt;br&gt;novelty = w · ||surprise|| + (1−w) · recon_error&lt;br&gt;High novelty → decompose across primitives&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="600" y="195" width="280" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows to outputs -->
+        <mxCell id="pe6" style="endArrow=block;endFill=1;dashed=1;strokeColor=#82b366;" edge="1" source="surprise" target="out_pm" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="pe8" style="endArrow=block;endFill=1;dashed=1;strokeColor=#82b366;" edge="1" source="ffn" target="surp_out2" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-
-        <!-- ==================== PASS r+1 SECTION ==================== -->
-        <mxCell id="pass_r1" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;verticalAlign=top;" vertex="1" parent="1">
-          <mxGeometry x="580" y="60" width="450" height="310" as="geometry"/>
-        </mxCell>
-        <mxCell id="pass_r1_title" value="&lt;b&gt;Pass r+1&lt;/b&gt; (next pass)" style="text;html=1;align=left;fontSize=13;" vertex="1" parent="1">
-          <mxGeometry x="590" y="65" width="180" height="25" as="geometry"/>
-        </mxCell>
-
-        <mxCell id="xcol_next" value="x_col (updated by damped mixing)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;PM/EM state updated by pass r's commits&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="620" y="100" width="250" height="35" as="geometry"/>
-        </mxCell>
-
-        <mxCell id="encode_next" value="z^{r+1} = PCM.encode(x_col)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, G, D_pcm]&lt;br&gt;Encoding now reflects updated PM/EM&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="620" y="165" width="250" height="50" as="geometry"/>
-        </mxCell>
-        <mxCell id="pe9" style="endArrow=block;endFill=1;" edge="1" source="xcol_next" target="encode_next" parent="1">
+        <mxCell id="pe7" style="endArrow=block;endFill=1;dashed=1;strokeColor=#82b366;" edge="1" source="surprise" target="out_em" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <mxCell id="surprise_next" value="surprise^{r+1} = ‖z^{r+1} − z_hat^r‖ / √D_pcm&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Did pass r's memory updates change understanding?&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="600" y="240" width="310" height="40" as="geometry"/>
-        </mxCell>
-        <mxCell id="pe10" style="endArrow=block;endFill=1;" edge="1" source="encode_next" target="surprise_next" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-
-        <!-- z_hat flows to next pass -->
-        <mxCell id="zhat_flow" style="endArrow=block;endFill=1;strokeColor=#9673a6;strokeWidth=2;" edge="1" source="predict" target="surprise_next" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="zhat_label" value="&lt;font style=&quot;font-size:9px;color:#9673a6;&quot;&gt;z_hat^r becomes&lt;br&gt;z_hat_prev for pass r+1&lt;/font&gt;" style="text;html=1;align=center;" vertex="1" parent="1">
-          <mxGeometry x="510" y="240" width="120" height="30" as="geometry"/>
-        </mxCell>
-
-        <!-- ==================== LOSS SECTION ==================== -->
+        <!-- ==================== LOSS ==================== -->
         <mxCell id="loss_container" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;verticalAlign=top;" vertex="1" parent="1">
-          <mxGeometry x="580" y="400" width="450" height="160" as="geometry"/>
+          <mxGeometry x="580" y="350" width="460" height="230" as="geometry"/>
         </mxCell>
         <mxCell id="loss_title" value="&lt;b&gt;PCM Optimization&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;" vertex="1" parent="1">
-          <mxGeometry x="590" y="405" width="150" height="25" as="geometry"/>
+          <mxGeometry x="590" y="355" width="150" height="25" as="geometry"/>
         </mxCell>
 
-        <mxCell id="pred_loss" value="&lt;b&gt;Prediction Loss (auxiliary)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;L_pred = MSE(z_hat^r, z^{r+1}.detach())&lt;br&gt;&lt;br&gt;Gradient flows to z_hat (predict network)&lt;br&gt;but NOT to z^{r+1} (target is detached)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="610" y="440" width="280" height="70" as="geometry"/>
+        <mxCell id="pred_loss" value="&lt;b&gt;Prediction Loss (auxiliary)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;L_pred = MSE(z_hat_t, z_{t+1}.detach())&lt;br&gt;&lt;br&gt;Gradient flows to prediction network (W_pcm)&lt;br&gt;but NOT to encoding target (detached)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="610" y="395" width="280" height="70" as="geometry"/>
         </mxCell>
 
-        <mxCell id="downstream" value="&lt;b&gt;Downstream (implicit)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;surprise → PM elig gate → PM commits&lt;br&gt;→ next pass reads → loss&lt;br&gt;PCM encoder learns what matters&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="610" y="520" width="280" height="55" as="geometry"/>
+        <mxCell id="downstream" value="&lt;b&gt;Downstream (implicit)&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;surprise → PM bias shift, EM novelty gate&lt;br&gt;→ next segment reads → loss&lt;br&gt;PCM encoder learns what features matter&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="610" y="480" width="280" height="55" as="geometry"/>
         </mxCell>
 
-        <!-- Key insight box -->
-        <mxCell id="insight" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;What Surprise Means&lt;/b&gt;&lt;br&gt;&lt;br&gt;&quot;Now that memory was updated&lt;br&gt;(other tokens committed their findings),&lt;br&gt;did my understanding of THIS token change?&quot;&lt;br&gt;&lt;br&gt;High surprise = informationally dense&lt;br&gt;= worth committing to PM/EM&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
-          <mxGeometry x="600" y="310" width="260" height="120" as="geometry"/>
+        <!-- Key insight -->
+        <mxCell id="insight" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;What Vector Surprise Means&lt;/b&gt;&lt;br&gt;&lt;br&gt;&quot;Based on causal context so far,&lt;br&gt;I predicted the next token's features.&lt;br&gt;The per-dimension error tells me&lt;br&gt;WHICH features I failed to anticipate&lt;br&gt;— those are worth writing to memory.&quot;&lt;br&gt;&lt;br&gt;v5 change: vector (D_col dims),&lt;br&gt;not scalar ‖delta‖.&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="580" y="610" width="250" height="150" as="geometry"/>
         </mxCell>
 
       </root>
