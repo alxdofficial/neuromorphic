@@ -217,7 +217,7 @@ class MetricsCollector:
         """Per-module gradient norms after backward.
 
         v5 structure: embedding, lm_head, stage1, stage3, pm, em, em_neuromod,
-        W_seed, W_w, pcm, W_nov.
+        W_seed_w, pcm, W_nov.
         """
         module_groups = {
             "embedding": [self.model.embedding],

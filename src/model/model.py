@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 from .scan import ScanLayer
@@ -55,9 +56,8 @@ class NeuromorphicLM(nn.Module):
             ScanLayer(C, D_col, expansion) for _ in range(L)
         ])
 
-        # Stage 1 projections (shared across banks)
-        self.W_seed = GroupedLinear(C, D_col, D_col)   # EM trail seed
-        self.W_w = GroupedLinear(C, D_col, D_col)      # write candidate
+        # Stage 1 projections (shared across banks) — fused into single matmul
+        self.W_seed_w = GroupedLinear(C, D_col, 2 * D_col)  # -> (seed, w_cand)
 
         # PCM (within-scan prediction)
         if config.pcm_enabled:
@@ -124,7 +124,10 @@ class NeuromorphicLM(nn.Module):
 
         H = x_col
         for layer in self.stage1:
-            H, _ = layer(H)                         # [BS, N, C, D_col]
+            if self.config.gradient_checkpointing and self.training:
+                H, _ = checkpoint(layer, H, use_reentrant=False)
+            else:
+                H, _ = layer(H)                     # [BS, N, C, D_col]
 
         # PCM: within-scan prediction and vector surprise
         # Applied BEFORE projections so seed/w_cand benefit from gain signal
@@ -137,23 +140,28 @@ class NeuromorphicLM(nn.Module):
         else:
             surp_flat = torch.zeros(BS, N, D, device=device, dtype=x.dtype)
 
-        # Projections from gain-modulated scan states
-        seed = self.W_seed(H).reshape(BS, N, D)     # [BS, N, D]
-        w_cand = self.W_w(H).reshape(BS, N, D)      # [BS, N, D]
+        # Projections from gain-modulated scan states (fused single matmul)
+        sw = self.W_seed_w(H)                          # [BS, N, C, 2*D_col]
+        seed_col, w_col = sw.chunk(2, dim=-1)          # each [BS, N, C, D_col]
+        seed = seed_col.reshape(BS, N, D)              # [BS, N, D]
+        w_cand = w_col.reshape(BS, N, D)               # [BS, N, D]
 
         # --- Stage 2: Memory Ops ---
         H_flat = H.reshape(BS, N, D)
-        pm_reads, em_reads, cum_ems = self._memory_ops(
+        pm_deltas, em_reads, cum_ems = self._memory_ops(
             H_flat, seed, w_cand, surp_flat
         )
 
         # --- Stage 3: Integration Scan ---
-        # Sum over banks: [BS, N, B, D] -> [BS, N, D]
-        integrated = pm_reads.sum(2) + em_reads.sum(2) + cum_ems.sum(2)
+        # Baseline H_flat added once + bank-summed memory deltas
+        integrated = H_flat + pm_deltas.sum(2) + em_reads.sum(2) + cum_ems.sum(2)
         H_prime = integrated.view(BS, N, C, D_col)
 
         for layer in self.stage3:
-            H_prime, _ = layer(H_prime)
+            if self.config.gradient_checkpointing and self.training:
+                H_prime, _ = checkpoint(layer, H_prime, use_reentrant=False)
+            else:
+                H_prime, _ = layer(H_prime)
 
         # Output
         out = H_prime.reshape(BS, N, D)
@@ -170,6 +178,8 @@ class NeuromorphicLM(nn.Module):
         """Stage 2: Write-before-read with causal prefix sums.
 
         All bank operations are vectorized — no per-bank Python loop.
+        PM returns delta only (no baseline H) — baseline is added once
+        in forward_segment's integration step.
 
         Args:
             H_flat: [BS, N, D] — column states (flat)
@@ -178,11 +188,12 @@ class NeuromorphicLM(nn.Module):
             surprise: [BS, N, D] — vector surprise
 
         Returns:
-            pm_reads: [BS, N, B, D]
-            em_reads: [BS, N, B, D]
-            cum_ems: [BS, N, B, D]
+            pm_deltas: [BS, N, B, D] — PM modulation deltas (no baseline)
+            em_reads: [BS, N, B, D] — EM trail reads
+            cum_ems: [BS, N, B, D] — EM causal write buffers
         """
         BS, N, D = H_flat.shape
+        B = self.config.B
 
         # 1. PM write deltas and prefix sums (all banks)
         delta_pm = self.pm.compute_deltas(surprise)       # [BS, N, B, D]
@@ -196,22 +207,22 @@ class NeuromorphicLM(nn.Module):
             )                                              # [BS, N, B]
             delta_em = self.em.compute_write_deltas(novelty, w_cand)  # [BS, N, B, D]
         else:
-            novelty = torch.zeros(BS, N, self.config.B, device=H_flat.device, dtype=H_flat.dtype)
-            delta_em = torch.zeros(BS, N, self.config.B, D, device=H_flat.device, dtype=H_flat.dtype)
+            novelty = torch.zeros(BS, N, B, device=H_flat.device, dtype=H_flat.dtype)
+            delta_em = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
 
         cum_em = torch.cumsum(delta_em, dim=1)            # [BS, N, B, D]
 
-        # 3. PM read (causal gain, all banks)
+        # 3. PM read — delta only (baseline H added once in forward_segment)
         if self.config.pm_enabled:
-            pm_reads = self.pm.read_all(H_flat, cum_pm)   # [BS, N, B, D]
+            pm_deltas = self.pm.read_all(H_flat, cum_pm)  # [BS, N, B, D]
         else:
-            pm_reads = H_flat.unsqueeze(2).expand(BS, N, self.config.B, D)
+            pm_deltas = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
 
         # 4. EM trail read (all banks, from frozen primitives)
         if self.config.em_enabled:
             em_reads = self.em.trail_read_all(seed)       # [BS, N, B, D]
         else:
-            em_reads = torch.zeros(BS, N, self.config.B, D, device=H_flat.device, dtype=H_flat.dtype)
+            em_reads = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
 
         # 5. Segment-end commits (all banks)
         if self.config.pm_enabled:
@@ -226,7 +237,7 @@ class NeuromorphicLM(nn.Module):
             self.em.commit_all(w_cand, novelty, g_em)
             self.em.base_decay()
 
-        return pm_reads, em_reads, cum_em
+        return pm_deltas, em_reads, cum_em
 
     # ------------------------------------------------------------------
     # State management

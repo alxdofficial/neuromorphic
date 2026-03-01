@@ -74,8 +74,9 @@ consolidation is slower, periodic, and handles memory formation.
 
 "Muscle memory" of cognition — automatic response biases, habitual processing.
 
-- **Read**: Element-wise gain modulation: `y = H ⊙ (1 + pm_bias + cum_pm)`. Coarse,
+- **Read**: Element-wise delta modulation: `delta = H ⊙ (pm_bias + cum_pm)`. Coarse,
   fast, no matmuls — each feature has a frozen bias plus causal write buffer.
+  Baseline H is added once in Stage 3 integration (not per-bank).
 - **Update**: Two paths. Fast: per-token delta `δ_pm = lr_pm · surprise`, prefix-summed
   to `cum_pm` for within-segment causal feedback. Slow: `pm_bias += Σ_n δ_pm` at
   segment end. Only adapts on unpredicted features (vector surprise per-feature).
@@ -127,7 +128,7 @@ Per-column within-scan prediction and surprise computation.
 Surprise from PCM drives per-feature bias shifts via **two write paths**:
 - **Fast (within segment)**: Each token computes `δ_pm = lr_pm · surprise`.
   Prefix sum gives `cum_pm` — causal accumulation. PM read uses
-  `H ⊙ (1 + pm_bias + cum_pm)`, so later tokens benefit from earlier surprise.
+  `H ⊙ (pm_bias + cum_pm)`, so later tokens benefit from earlier surprise.
 - **Slow (segment end)**: `pm_bias += Σ_n δ_pm`. Bias persists to next segment.
   Automatic, habitual adaptation with no explicit routing.
 

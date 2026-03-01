@@ -135,18 +135,16 @@ class TestGradientFlow:
             param = getattr(em, name)
             assert param.grad is not None, f"No gradient for em.{name}"
 
-    def test_w_seed_w_w_gradient(self):
-        """W_seed and W_w projections should get gradients (need 2 segments for EM)."""
+    def test_w_seed_w_gradient(self):
+        """Fused W_seed_w projection should get gradients (need 2 segments for EM)."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
 
         loss = _compute_loss(model, n_segments=2)
         loss.backward()
 
-        assert model.W_seed.weight.grad is not None
-        assert model.W_seed.weight.grad.abs().sum() > 0
-        assert model.W_w.weight.grad is not None
-        assert model.W_w.weight.grad.abs().sum() > 0
+        assert model.W_seed_w.weight.grad is not None
+        assert model.W_seed_w.weight.grad.abs().sum() > 0
 
     def test_proj_up_down_gradient(self):
         """proj_up/proj_down should receive gradients when D_embed != D."""

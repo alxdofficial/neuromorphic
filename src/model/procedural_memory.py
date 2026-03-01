@@ -1,7 +1,8 @@
 """
 Procedural Memory (v5) — bias vector with causal write buffers.
 
-Per-bank bias vector. Read: gain modulation y = H * (1 + pm_bias + cum_pm).
+Per-bank bias vector. Read returns delta only: y = H * (pm_bias + cum_pm).
+The baseline H is added once in the model, not per-bank.
 Write: surprise-driven bias shifts with prefix-sum causal buffer.
 Commit: segment-end bias aggregate with decay.
 """
@@ -62,19 +63,22 @@ class ProceduralMemory(nn.Module, StateMixin):
         return lr * surprise.unsqueeze(2)  # [BS, N, B, D]
 
     def read_all(self, H_flat: Tensor, cum_pm: Tensor) -> Tensor:
-        """PM gain read with causal bias for all banks at once.
+        """PM delta read for all banks: returns H * (pm_bias + cum_pm).
+
+        Returns only the modulation delta. The baseline H is added once
+        in the model's integration step (not per-bank).
 
         Args:
             H_flat: [BS, N, D] — column states reshaped to flat D
             cum_pm: [BS, N, B, D] — prefix-summed write deltas for all banks
 
         Returns:
-            pm_read: [BS, N, B, D] — gain-modulated output for all banks
+            pm_delta: [BS, N, B, D] — per-bank PM modulation (no baseline)
         """
         # pm_bias: [BS, B, D] -> [BS, 1, B, D]
         bias = self.pm_bias.unsqueeze(1)
         # H_flat: [BS, N, D] -> [BS, N, 1, D]
-        return H_flat.unsqueeze(2) * (1.0 + bias + cum_pm)
+        return H_flat.unsqueeze(2) * (bias + cum_pm)
 
     def commit(self, delta_pm_sum: Tensor):
         """Segment-end commit for all banks: pm_bias += sum of deltas, then decay.

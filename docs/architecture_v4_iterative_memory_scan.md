@@ -113,8 +113,7 @@ For each segment of N tokens:
   STAGE 1 — Fast Scan (causal, parallel via parallel-scan):
     For t = 1..N (parallelized):
       h_t = a_t ⊙ h_{t-1} + b_t               # element-wise recurrence per column
-      seed_t = W_seed · H_t                     # EM trail seed
-      w_cand_t = W_w · H_t                      # write candidate
+      [seed_t, w_cand_t] = W_seed_w · H_t         # fused seed + write candidate
       z_hat_t = W_pcm · H_t                     # PCM prediction
       surprise_t = z_hat_{t-1} - encode(X_t)    # vector surprise (D_col)
 
@@ -129,7 +128,7 @@ For each segment of N tokens:
       cum_em_t = Σ_{i≤t} delta_em_i
 
     # 3. Reads (from frozen memory + causal write buffers):
-      pm_read = H[:, b] ⊙ (1 + pm_bias_b + cum_pm)  # PM: causal gain mod
+      pm_delta = H[:, b] ⊙ (pm_bias_b + cum_pm)       # PM: delta-only modulation
       em_read = EM_b.trail_read(seed[:, b])           # EM: trail from frozen
 
     # 4. End of segment: actual structured commit
@@ -138,7 +137,7 @@ For each segment of N tokens:
 
   STAGE 3 — Integration Scan (causal, parallel via parallel-scan):
     For t = 1..N (parallelized):
-      input_t = pm_read_t + em_read_t + cum_em_t # frozen reads + write buffer
+      input_t = H_t + Σ_b(pm_delta_t) + Σ_b(em_read_t) + Σ_b(cum_em_t)  # baseline + deltas
       h'_t = a'_t ⊙ h'_{t-1} + b'_t             # scan on input_t
       logits_t = LM_head(H'_t)
 
@@ -186,8 +185,9 @@ def fast_scan(self, input_ids):
     # Linear projections from gain-modulated column states
     # Shared across banks — each bank receives the same seed/w_cand
     # but addresses its own memory partition (specialization emerges from memory content)
-    seed = W_seed(H)                 # [BS, N, D] — EM trail starting points
-    w_cand = W_w(H)                  # [BS, N, D] — write candidates
+    # Fused projection: single matmul, split output
+    sw = W_seed_w(H)                 # [BS, N, C, 2*D_col]
+    seed, w_cand = split(sw)         # each [BS, N, D] — shared across banks
 
     return H, seed, w_cand, surprise
 ```
@@ -250,10 +250,11 @@ def memory_ops(self, H, seed, w_cand, surprise):
         cum_em = cumsum(delta_em, dim=seq)         # [BS, N, D] — inclusive
         # Token t sees writes from tokens 0..t (inclusive — causal for NTP)
 
-        # --- 3. PM READ with causal bias (write-before-read) ---
-        pm_read = H[:, :, b] * (1 + pm_bias[b] + cum_pm)  # [BS, N, D]
+        # --- 3. PM READ — delta only (write-before-read) ---
+        pm_delta = H[:, :, b] * (pm_bias[b] + cum_pm)     # [BS, N, D]
         # pm_bias[b] is frozen from previous segment
         # cum_pm adds per-token causal bias adaptation
+        # Baseline H is added ONCE in Stage 3 integration (not per-bank)
 
         # --- 4. EM TRAIL READ from frozen primitives ---
         s = seed[:, :, b]                          # [BS, N, D] — trail start
@@ -316,7 +317,7 @@ equivalent in effect: token t gets frozen long-term knowledge (trail) + causal
 recent writes (prefix sum).
 
 **State vs parameters:** The primitives (em_K, em_V) and bias (pm_bias) are
-**state**, not parameters. Parameters (W_seed, W_gate, neuromodulator, τ, σ)
+**state**, not parameters. Parameters (W_seed_w, W_gate, neuromodulator, τ, σ)
 are frozen after training. State evolves at inference — this is lifelong learning.
 
 ### Stage 3: Integration Scan (Context Fusion)
@@ -324,20 +325,21 @@ are frozen after training. State evolves at inference — this is lifelong learn
 A second causal scan integrates memory reads with column states.
 
 ```python
-def integration_scan(self, H, pm_reads, em_reads, cum_em):
+def integration_scan(self, H, pm_deltas, em_reads, cum_em):
     """Stage 3: Second causal scan with memory context + write buffers.
 
-    Three signals contribute:
-    - pm_reads:  PM gain modulation (includes causal bias via cum_pm)
-    - em_reads:  EM trail from frozen primitives (long-term knowledge)
-    - cum_em:    EM write buffer (within-segment new information)
+    Four signals contribute (additive):
+    - H:          baseline column states (added once, not per-bank)
+    - pm_deltas:  PM modulation deltas (H * (pm_bias + cum_pm), summed over banks)
+    - em_reads:   EM trail from frozen primitives (long-term knowledge)
+    - cum_em:     EM write buffer (within-segment new information)
 
     Returns:
         logits: [BS, N, vocab]
     """
-    # Additive integration: PM read + EM trail + EM write buffer
+    # Additive integration: baseline + PM delta + EM trail + EM write buffer
     # Each column c takes its D_col slice of each signal
-    integrated = pm_reads_per_col + em_reads_per_col + cum_em_per_col
+    integrated = H + pm_deltas_summed + em_reads_summed + cum_em_summed
 
     # Second scan: h'_t = a'_t ⊙ h'_{t-1} + b'_t (element-wise, independent columns)
     H_prime = parallel_scan_2(integrated)        # [BS, N, C, D_col]
@@ -356,10 +358,11 @@ long-term knowledge (EM trail), habitual bias (PM gain), and recent
 within-segment writes (write buffer) with the causally ordered token stream.
 
 **Write buffer as cross-column mixer:** `cum_em_t` is a D-dimensional signal
-(from `w_cand = W_w(H)`, which projects across all columns). When added to
-Stage 3's input, it provides within-segment cross-column information — token t
-at column c sees what columns 0..C-1 wrote at positions 0..t. This partially
-fills the cross-column mixing role alongside the cross-segment memory reads.
+(from the w_cand output of `W_seed_w(H)`, which projects across all columns).
+When added to Stage 3's input, it provides within-segment cross-column
+information — token t at column c sees what columns 0..C-1 wrote at positions
+0..t. This partially fills the cross-column mixing role alongside the
+cross-segment memory reads.
 
 ## Predictive Coding: Vector Surprise
 
@@ -422,9 +425,9 @@ delta_pm_t = lr_pm * surprise_t              # [BS, N, D] — per-token, per-fea
 # Prefix sum (causal accumulation):
 cum_pm_t = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
 
-# Read with causal bias (write-before-read):
-y_pm = H[:, :, b] * (1 + pm_bias[b] + cum_pm)  # [BS, N, D]
-# Token t's gain reflects surprise from tokens 0..t — no lag
+# Read — delta only (baseline H added once in Stage 3):
+delta_pm = H[:, :, b] * (pm_bias[b] + cum_pm)   # [BS, N, D]
+# Token t's modulation reflects surprise from tokens 0..t — no lag
 
 # Segment-end commit:
 pm_bias[b] += delta_pm.sum(dim=seq)          # [BS, D] — total shift
@@ -461,7 +464,7 @@ em_age [BS, B, M]        — age tracking for decay
 **Read (trail-based pattern completion):**
 ```
 # Seed from Stage 1 scan (the starting point for the trail)
-seed = W_seed(H)                             # [BS, N, D] (shared across banks)
+[seed, w_cand] = W_seed_w(H)                # [BS, N, D] each (shared across banks)
 if training:
     seed = seed + σ * randn_like(seed)       # noise for exploration (σ learned)
 
@@ -588,17 +591,17 @@ concatenation of all column contributions.
 ```
 loss → logits → Stage 3 scan →
   → cum_em (write buffer):
-      → delta_em = novelty · w_cand → novelty params, W_w, Stage 1 scan
+      → delta_em = novelty · w_cand → novelty params, W_seed_w, Stage 1 scan
       (gradient through prefix sum is a suffix sum — linear, stable)
   → pm_read (causal gain):
       → cum_pm → delta_pm = lr_pm · surprise → lr_pm, PCM params
       → pm_bias (frozen) gets gradient through gain modulation
   → em_trail (frozen primitives):
-      → through trail steps → softmax → em_K, em_V, W_gate, W_seed, τ, σ
+      → through trail steps → softmax → em_K, em_V, W_gate, W_seed_w, τ, σ
   → Stage 1 scan → column projection params, PCM params
 ```
 
-**Major improvement over pre-write-buffer design:** Write parameters (W_w,
+**Major improvement over pre-write-buffer design:** Write parameters (W_seed_w,
 novelty scoring, lr_pm) now get gradient from THIS segment's loss through the
 prefix-summed write buffers. Previously, writes only got gradient via
 cross-segment TBPTT.
@@ -624,9 +627,9 @@ K=2 is likely sufficient (one segment of lookahead).
 | PCM encode/predict | L_pred (auxiliary) + downstream | Same segment |
 | PM bias (pm_bias) | Same segment's loss through gain modulation | Direct, smooth |
 | PM lr_pm | Same segment's loss through cum_pm → gain | Through prefix sum (linear) |
-| EM trail params (W_seed, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
+| EM trail params (W_seed_w, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
 | EM primitives (em_K, em_V) | Same segment's loss through trail read | Through softmax attention |
-| Write candidate proj (W_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
+| Write candidate proj (W_seed_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
 | Novelty scoring (W_nov) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
 | EM neuromodulator | **Next segment's** loss through committed primitives | Cross-segment TBPTT |
 | EM commit routing | **Next segment's** loss through committed em_K/em_V | Cross-segment TBPTT |
@@ -693,8 +696,8 @@ evolves independently. Cross-column integration happens through:
 1. **Cross-segment:** Shared memory bank reads (EM trail, PM gain) — all columns
    in a block read/write the same bank.
 2. **Within-segment:** The EM write buffer (`cum_em`) is a D-wide projection of
-   column states (`w_cand = W_w(H)`), mixing across all columns. When added to
-   Stage 3's input, it provides within-segment cross-column information.
+   column states (w_cand from `W_seed_w(H)`), mixing across all columns. When
+   added to Stage 3's input, it provides within-segment cross-column information.
 3. **Input/output:** `proj_up` and `proj_down` mix across all D dimensions.
 
 This keeps the scan simple (standard element-wise prefix scan) while the
@@ -842,11 +845,12 @@ means `pm_bias[:, b]`, shape `[BS, D]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
 `gate = sigmoid(w1 * y + w2 * delta + bias)` where w1, w2 are learned `[D]`
 vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
 
-**Seed and w_cand are shared across banks:**
-`W_seed` and `W_w` each produce a single `[BS, N, D]` tensor, not per-bank.
-All B banks receive the same seed and write candidate. Bank specialization
-emerges from the differing memory content (em_K, em_V, pm_bias) in each bank,
-not from the inputs. This halves the Stage 1 projection parameters.
+**Seed and w_cand are shared across banks (fused projection):**
+`W_seed_w` is a single fused GroupedLinear producing `[BS, N, C, 2*D_col]`,
+split via `chunk(2)` into seed and w_cand — each `[BS, N, D]`. All B banks
+receive the same seed and write candidate. Bank specialization emerges from
+the differing memory content (em_K, em_V, pm_bias) in each bank, not from the
+inputs.
 
 **w_cand serves as both routing key and write content:**
 No separate k_cand/v_cand projections. In the EM write: `route` uses normalized
@@ -871,7 +875,7 @@ then `a = sigmoid(a_raw)` (decay gate ∈ [0,1]), `b = silu(b_raw)` (input gate)
 Each layer has: proj_in `[D_col, E]` + proj_out `[E, D_col]` + LayerNorm.
 Param count per layer: ~2 × D_col × E ≈ 4 × D_col². With D_col=128, that's
 ~66K params/layer × 24 layers = ~1.6M (scan params only). Remaining params
-in proj_up/down, W_seed, W_w, W_pcm, W_enc, lm_head, and memory params.
+in proj_up/down, W_seed_w, W_pcm, W_enc, lm_head, and memory params.
 
 **Stage 3 a'_t derivation:**
 Same structure as Stage 1. `a'_t` and `b'_t` are derived from the integrated
