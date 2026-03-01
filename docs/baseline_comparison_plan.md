@@ -455,7 +455,7 @@ Target: a b c d e
 - Compare lifelong mode vs reset-at-boundary mode
 - Compare against transformer with same context window
 
-**Already implemented:** `src/training/eval_lifelong.py`
+**Status:** Needs v5 reimplementation (v4 version removed).
 
 #### 6.3.2 Cross-Document Fact Recall
 

@@ -169,6 +169,8 @@ class NeuromorphicLM(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Stage 2: Write-before-read with causal prefix sums.
 
+        All bank operations are vectorized — no per-bank Python loop.
+
         Args:
             H_flat: [BS, N, D] — column states (flat)
             seed: [BS, N, D] — EM trail seeds
@@ -180,72 +182,51 @@ class NeuromorphicLM(nn.Module):
             em_reads: [BS, N, B, D]
             cum_ems: [BS, N, B, D]
         """
-        B = self.config.B
         BS, N, D = H_flat.shape
 
-        pm_reads_list = []
-        em_reads_list = []
-        cum_ems_list = []
+        # 1. PM write deltas and prefix sums (all banks)
+        delta_pm = self.pm.compute_deltas(surprise)       # [BS, N, B, D]
+        cum_pm = torch.cumsum(delta_pm, dim=1)            # [BS, N, B, D]
 
-        # Compute PM deltas (shared across banks via lr_pm broadcasting)
-        delta_pm_all = self.pm.compute_deltas(surprise)  # [BS, N, B, D]
-
-        # Learned novelty blend: w_nov ∈ [0,1] per bank
-        w_nov = torch.sigmoid(self.W_nov(H_flat))  # [BS, N, B]
-
-        for b in range(B):
-            # 1. PM write deltas and prefix sum
-            delta_pm_b = delta_pm_all[:, :, b]           # [BS, N, D]
-            cum_pm_b = torch.cumsum(delta_pm_b, dim=1)   # [BS, N, D]
-
-            # 2. EM novelty and write deltas
-            if self.config.em_enabled:
-                novelty_b = self.em.compute_novelty(
-                    w_cand, surprise, b, w_nov=w_nov[:, :, b]
-                )
-                delta_em_b = self.em.compute_write_deltas(novelty_b, w_cand)
-            else:
-                novelty_b = torch.zeros(BS, N, device=H_flat.device, dtype=H_flat.dtype)
-                delta_em_b = torch.zeros_like(H_flat)
-
-            cum_em_b = torch.cumsum(delta_em_b, dim=1)   # [BS, N, D]
-
-            # 3. PM read (causal gain)
-            if self.config.pm_enabled:
-                pm_read_b = self.pm.read(H_flat, cum_pm_b, b)
-            else:
-                pm_read_b = H_flat  # pass-through
-
-            # 4. EM trail read (from frozen primitives)
-            if self.config.em_enabled:
-                em_read_b = self.em.trail_read(seed, b)
-            else:
-                em_read_b = torch.zeros_like(H_flat)
-
-            pm_reads_list.append(pm_read_b)
-            em_reads_list.append(em_read_b)
-            cum_ems_list.append(cum_em_b)
-
-            # 5. Segment-end commit
-            if self.config.pm_enabled:
-                self.pm.commit_bank(delta_pm_b.sum(dim=1), b)
-
-            if self.config.em_enabled:
-                g_em = self.em_neuromod(
-                    novelty_b.mean(dim=1).detach(),
-                    self.em.usage(b).detach(),
-                )
-                self.em.commit(w_cand, novelty_b, g_em, b)
-
-        # Per-segment memory maintenance
+        # 2. EM novelty and write deltas (all banks)
         if self.config.em_enabled:
+            w_nov = torch.sigmoid(self.W_nov(H_flat))     # [BS, N, B]
+            novelty = self.em.compute_novelty_all(
+                w_cand, surprise, w_nov=w_nov
+            )                                              # [BS, N, B]
+            delta_em = self.em.compute_write_deltas(novelty, w_cand)  # [BS, N, B, D]
+        else:
+            novelty = torch.zeros(BS, N, self.config.B, device=H_flat.device, dtype=H_flat.dtype)
+            delta_em = torch.zeros(BS, N, self.config.B, D, device=H_flat.device, dtype=H_flat.dtype)
+
+        cum_em = torch.cumsum(delta_em, dim=1)            # [BS, N, B, D]
+
+        # 3. PM read (causal gain, all banks)
+        if self.config.pm_enabled:
+            pm_reads = self.pm.read_all(H_flat, cum_pm)   # [BS, N, B, D]
+        else:
+            pm_reads = H_flat.unsqueeze(2).expand(BS, N, self.config.B, D)
+
+        # 4. EM trail read (all banks, from frozen primitives)
+        if self.config.em_enabled:
+            em_reads = self.em.trail_read_all(seed)       # [BS, N, B, D]
+        else:
+            em_reads = torch.zeros(BS, N, self.config.B, D, device=H_flat.device, dtype=H_flat.dtype)
+
+        # 5. Segment-end commits (all banks)
+        if self.config.pm_enabled:
+            self.pm.commit(delta_pm.sum(dim=1))           # delta_pm_sum: [BS, B, D]
+
+        if self.config.em_enabled:
+            # novelty: [BS, N, B] -> mean over N -> [BS, B]
+            g_em = self.em_neuromod(
+                novelty.mean(dim=1).detach(),
+                self.em.usage_all().detach(),
+            )                                              # [BS, B]
+            self.em.commit_all(w_cand, novelty, g_em)
             self.em.base_decay()
 
-        return (
-            torch.stack(pm_reads_list, dim=2),   # [BS, N, B, D]
-            torch.stack(em_reads_list, dim=2),   # [BS, N, B, D]
-            torch.stack(cum_ems_list, dim=2),    # [BS, N, B, D]
-        )
+        return pm_reads, em_reads, cum_em
 
     # ------------------------------------------------------------------
     # State management

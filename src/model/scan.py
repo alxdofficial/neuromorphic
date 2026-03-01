@@ -36,11 +36,11 @@ def sequential_scan(a: Tensor, b: Tensor, h0: Tensor | None = None) -> Tensor:
     else:
         h = h0
 
-    outputs = []
+    out = torch.empty(BS, N, C, E, device=device, dtype=dtype)
     for t in range(N):
         h = a[:, t] * h + b[:, t]
-        outputs.append(h)
-    return torch.stack(outputs, dim=1)  # [BS, N, C, E]
+        out[:, t] = h
+    return out  # [BS, N, C, E]
 
 
 class ScanLayer(nn.Module):

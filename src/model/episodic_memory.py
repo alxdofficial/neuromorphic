@@ -4,6 +4,8 @@ Episodic Memory (v5) — trail-based primitive dictionary.
 Single instance (batched across B banks via BS,B dims).
 Read: trail-based composition (seed navigates primitive space).
 Write: novelty-scored soft-routing decomposition with neuromodulated EMA.
+
+All bank operations are vectorized — no per-bank Python loops.
 """
 
 import torch
@@ -62,163 +64,169 @@ class EpisodicMemory(nn.Module, StateMixin):
     def is_initialized(self) -> bool:
         return self.em_K is not None
 
-    def trail_read(self, seed: Tensor, b: int) -> Tensor:
-        """Trail-based read: seed navigates primitive space.
+    def trail_read_all(self, seed: Tensor) -> Tensor:
+        """Trail-based read for all banks simultaneously.
 
         Args:
-            seed: [BS, N, D] — trail starting point
-            b: bank index
+            seed: [BS, N, D] — trail starting point (shared across banks)
 
         Returns:
-            y_em: [BS, N, D] — net memory contribution (y - seed)
+            y_em: [BS, N, B, D] — net memory contribution (y - seed) per bank
         """
-        s = seed  # [BS, N, D]
+        BS, N, D = seed.shape
+        B = self.B
+
+        # Expand seed to [BS, B, N, D]
+        s = seed.unsqueeze(1).expand(BS, B, N, D)
         if self.training:
-            sigma = F.softplus(self.raw_sigma[b])
+            # sigma: [B] -> [1, B, 1, 1]
+            sigma = F.softplus(self.raw_sigma)[None, :, None, None]
             s = s + sigma * torch.randn_like(s)
 
         y = s
-        tau = F.softplus(self.raw_tau[b]) + 0.1
+        # tau: [B] -> [1, B, 1, 1]
+        tau = (F.softplus(self.raw_tau) + 0.1)[None, :, None, None]
 
-        # Check if any primitives are active (avoid NaN from softmax over all -inf)
-        any_active = (self.em_S[:, b] > 0).any(dim=-1)  # [BS]
-        if not any_active.any():
-            return torch.zeros_like(seed)
+        # active mask: [BS, B, 1, M] — broadcasts over N
+        active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
 
         for step in range(self.n_steps):
-            # Score all primitives: [BS, N, D] @ [BS, M, D].T -> [BS, N, M]
-            scores = torch.matmul(y, self.em_K[:, b].transpose(-2, -1)) / tau
-            # Mask inactive primitives
-            active = (self.em_S[:, b] > 0).unsqueeze(1)  # [BS, 1, M]
+            # scores: [BS, B, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+            scores = torch.matmul(y, self.em_K.transpose(-2, -1)) / tau
             scores = scores.masked_fill(~active, float('-inf'))
-            attn = F.softmax(scores, dim=-1)               # [BS, N, M]
-            # Replace NaN from all-inactive rows with zeros
+            attn = F.softmax(scores, dim=-1)         # [BS, B, N, M]
             attn = attn.nan_to_num(0.0)
-            delta = torch.matmul(attn, self.em_V[:, b])    # [BS, N, D]
+            # delta: [BS, B, N, M] @ [BS, B, M, D] -> [BS, B, N, D]
+            delta = torch.matmul(attn, self.em_V)
 
-            # Element-wise gate (no matmul — O(D) not O(D^2))
-            gate = torch.sigmoid(self.w1[b] * y + self.w2[b] * delta + self.gate_bias[b])
+            # Element-wise gate: w1, w2, gate_bias are [B, D] -> [1, B, 1, D]
+            w1 = self.w1[None, :, None, :]
+            w2 = self.w2[None, :, None, :]
+            gb = self.gate_bias[None, :, None, :]
+            gate = torch.sigmoid(w1 * y + w2 * delta + gb)
             y = y + gate * delta
 
-        return y - s  # [BS, N, D]
+        # result: [BS, B, N, D] -> [BS, N, B, D]
+        return (y - s).permute(0, 2, 1, 3)
 
-    def compute_novelty(
-        self, w_cand: Tensor, surprise: Tensor, b: int,
+    def compute_novelty_all(
+        self, w_cand: Tensor, surprise: Tensor,
         w_nov: Tensor | None = None,
     ) -> Tensor:
-        """Compute novelty score for bank b.
+        """Compute novelty score for all banks simultaneously.
 
         Novelty = w_nov * ||surprise|| + (1 - w_nov) * recon_error.
 
         Args:
             w_cand: [BS, N, D] — write candidates
             surprise: [BS, N, D] — vector surprise
-            b: bank index
-            w_nov: [BS, N] — learned blend weight ∈ [0,1] (default: 0.5)
+            w_nov: [BS, N, B] — learned blend weight in [0,1] (default: 0.5)
 
         Returns:
-            novelty: [BS, N] — scalar novelty per token
+            novelty: [BS, N, B] — scalar novelty per token per bank
         """
-        tau = F.softplus(self.raw_tau[b]) + 0.1
+        BS, N, D = w_cand.shape
+        B = self.B
 
-        # Reconstruction error: how well can existing primitives explain w_cand?
-        w_norm = unit_normalize(w_cand)
-        scores = torch.matmul(w_norm, self.em_K[:, b].transpose(-2, -1)) / tau
-        active = (self.em_S[:, b] > 0).unsqueeze(1)
+        # tau: [B] -> [1, B, 1, 1]
+        tau = (F.softplus(self.raw_tau) + 0.1)[None, :, None, None]
+
+        # w_norm: [BS, N, D] -> [BS, 1, N, D] for broadcasting against [BS, B, M, D]
+        w_norm = unit_normalize(w_cand).unsqueeze(1)
+        # scores: [BS, 1, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+        scores = torch.matmul(w_norm, self.em_K.transpose(-2, -1)) / tau
+        active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
         scores = scores.masked_fill(~active, float('-inf'))
-        attn = F.softmax(scores, dim=-1)                   # [BS, N, M]
-        attn = attn.nan_to_num(0.0)  # handle empty memory
-        reconstruction = torch.matmul(attn, self.em_V[:, b])  # [BS, N, D]
-        recon_error = (w_cand - reconstruction).norm(dim=-1)   # [BS, N]
+        attn = F.softmax(scores, dim=-1)       # [BS, B, N, M]
+        attn = attn.nan_to_num(0.0)
+        # reconstruction: [BS, B, N, M] @ [BS, B, M, D] -> [BS, B, N, D]
+        reconstruction = torch.matmul(attn, self.em_V)
+        # recon_error: [BS, B, N]
+        recon_error = (w_cand.unsqueeze(1) - reconstruction).norm(dim=-1)
 
-        # Surprise magnitude
-        surp_mag = surprise.norm(dim=-1)  # [BS, N]
+        # Surprise magnitude: [BS, N] -> [BS, 1, N]
+        surp_mag = surprise.norm(dim=-1).unsqueeze(1)  # [BS, 1, N]
 
-        # Learned blend (defaults to 0.5 if w_nov not provided)
+        # Blend: w_nov [BS, N, B] -> [BS, B, N]
         if w_nov is None:
-            w_nov = 0.5
-        novelty = w_nov * surp_mag + (1 - w_nov) * recon_error
-        return novelty
+            novelty = 0.5 * surp_mag + 0.5 * recon_error  # [BS, B, N]
+        else:
+            w = w_nov.permute(0, 2, 1)  # [BS, B, N]
+            novelty = w * surp_mag + (1 - w) * recon_error
+
+        # Return as [BS, N, B]
+        return novelty.permute(0, 2, 1)
 
     def compute_write_deltas(self, novelty: Tensor, w_cand: Tensor) -> Tensor:
-        """Per-token EM write delta: novelty * w_cand.
+        """Per-token EM write delta: novelty * w_cand, for all banks.
 
         Args:
-            novelty: [BS, N] — scalar novelty per token
+            novelty: [BS, N, B] — scalar novelty per token per bank
             w_cand: [BS, N, D] — write candidates
 
         Returns:
-            delta_em: [BS, N, D] — per-token write delta
+            delta_em: [BS, N, B, D] — per-token write delta
         """
-        return novelty.unsqueeze(-1) * w_cand  # [BS, N, D]
+        return novelty.unsqueeze(-1) * w_cand.unsqueeze(2)  # [BS, N, B, D]
 
-    def commit(self, w_cand: Tensor, novelty: Tensor, g_em: Tensor, b: int):
-        """Segment-end structured write for bank b.
+    def commit_all(self, w_cand: Tensor, novelty: Tensor, g_em: Tensor):
+        """Segment-end structured write for all banks simultaneously.
 
         Soft routing -> aggregate -> neuromodulated EMA.
 
         Args:
-            w_cand: [BS, N, D] — write candidates
-            novelty: [BS, N] — novelty scores
-            g_em: [BS] — neuromodulated write gate
-            b: bank index
+            w_cand: [BS, N, D] — write candidates (shared across banks)
+            novelty: [BS, N, B] — novelty scores
+            g_em: [BS, B] — neuromodulated write gate per bank
         """
-        tau_w = F.softplus(self.raw_tau_w[b]) + 0.1
+        BS, N, D = w_cand.shape
+        B = self.B
+        M = self.M
+
+        # tau_w: [B] -> [1, B, 1, 1]
+        tau_w = (F.softplus(self.raw_tau_w) + 0.1)[None, :, None, None]
 
         # Soft routing: which primitives absorb this signal?
-        w_norm = unit_normalize(w_cand)
-        any_active = (self.em_S[:, b] > 0).any(dim=-1)  # [BS]
-
-        if any_active.any():
-            route_scores = torch.matmul(w_norm, self.em_K[:, b].transpose(-2, -1)) / tau_w
-            active = (self.em_S[:, b] > 0).unsqueeze(1)
-            route_scores = route_scores.masked_fill(~active, float('-inf'))
-            route = F.softmax(route_scores, dim=-1)  # [BS, N, M]
-            route = route.nan_to_num(1.0 / self.M)  # uniform for streams with no active
-        else:
-            # No active primitives anywhere — use uniform routing
-            route = torch.full(
-                (w_cand.shape[0], w_cand.shape[1], self.M),
-                1.0 / self.M, device=w_cand.device, dtype=w_cand.dtype
-            )
+        # w_norm: [BS, 1, N, D]
+        w_norm = unit_normalize(w_cand).unsqueeze(1)
+        # route_scores: [BS, 1, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+        route_scores = torch.matmul(w_norm, self.em_K.transpose(-2, -1)) / tau_w
+        active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
+        route_scores = route_scores.masked_fill(~active, float('-inf'))
+        route = F.softmax(route_scores, dim=-1)  # [BS, B, N, M]
+        route = route.nan_to_num(1.0 / M)
 
         # Aggregate across N tokens, weighted by novelty
-        # novelty: [BS, N] -> [BS, N, 1], route: [BS, N, M]
-        weighted_route = novelty.unsqueeze(-1) * route  # [BS, N, M]
-        route_agg = weighted_route.mean(dim=1)           # [BS, M]
+        # novelty: [BS, N, B] -> [BS, B, N, 1]
+        nov = novelty.permute(0, 2, 1).unsqueeze(-1)
+        weighted_route = nov * route               # [BS, B, N, M]
+        route_agg = weighted_route.mean(dim=2)     # [BS, B, M]
 
-        # Aggregated updates: [BS, M, D]
-        # [BS, M, N] @ [BS, N, D] -> [BS, M, D]
-        update_K = torch.bmm(weighted_route.transpose(1, 2), w_norm)
-        update_V = torch.bmm(weighted_route.transpose(1, 2), w_cand)
+        # Aggregated updates: [BS, B, M, N] @ [BS, B, N, D] -> [BS, B, M, D]
+        # w_norm: [BS, 1, N, D], w_cand: [BS, 1, N, D] — broadcast across B
+        w_norm_b = w_norm.expand(BS, B, N, D)
+        w_cand_b = w_cand.unsqueeze(1).expand(BS, B, N, D)
+        update_K = torch.matmul(weighted_route.transpose(2, 3), w_norm_b)  # [BS, B, M, D]
+        update_V = torch.matmul(weighted_route.transpose(2, 3), w_cand_b)  # [BS, B, M, D]
 
         # Normalize updates per primitive
-        denom = weighted_route.sum(dim=1).unsqueeze(-1).clamp(min=1e-8)  # [BS, M, 1]
+        denom = weighted_route.sum(dim=2).unsqueeze(-1).clamp(min=1e-8)  # [BS, B, M, 1]
         update_K = update_K / denom
         update_V = update_V / denom
 
         # Neuromodulated EMA: alpha = g_em * route_agg (per-primitive)
-        alpha = (g_em.unsqueeze(-1) * route_agg).clamp(max=1.0)  # [BS, M]
-        alpha_exp = alpha.unsqueeze(-1)  # [BS, M, 1]
+        # g_em: [BS, B] -> [BS, B, 1], route_agg: [BS, B, M]
+        alpha = (g_em.unsqueeze(-1) * route_agg).clamp(max=1.0)  # [BS, B, M]
+        alpha_exp = alpha.unsqueeze(-1)  # [BS, B, M, 1]
 
-        # EMA update (reassignment for autograd)
-        new_K = self.em_K.clone()
-        new_V = self.em_V.clone()
-        new_S = self.em_S.clone()
-        new_age = self.em_age.clone()
-
-        new_K[:, b] = (1 - alpha_exp) * self.em_K[:, b] + alpha_exp * unit_normalize(update_K)
-        new_V[:, b] = (1 - alpha_exp) * self.em_V[:, b] + alpha_exp * update_V
-        new_S[:, b] = (self.em_S[:, b] + alpha).clamp(0, self.S_max)
-        new_age[:, b] = self.em_age[:, b] * (1 - alpha)
-
-        self.em_K = new_K
-        self.em_V = new_V
-        self.em_S = new_S
-        self.em_age = new_age
+        # EMA update — arithmetic ops create new tensors for autograd, no clone needed
+        self.em_K = (1 - alpha_exp) * self.em_K + alpha_exp * unit_normalize(update_K)
+        self.em_V = (1 - alpha_exp) * self.em_V + alpha_exp * update_V
+        self.em_S = (self.em_S + alpha).clamp(0, self.S_max)
+        self.em_age = self.em_age * (1 - alpha)
 
         # Budget enforcement
-        self.em_S = budget_enforce(self.em_S.view(-1, self.M), self.budget).view_as(self.em_S)
+        self.em_S = budget_enforce(self.em_S.view(-1, M), self.budget).view_as(self.em_S)
 
     def base_decay(self):
         """Apply strength decay and age tick once per segment."""
@@ -228,11 +236,11 @@ class EpisodicMemory(nn.Module, StateMixin):
             active = (self.em_S > 0).to(self.em_age.dtype)
             self.em_age = self.em_age + active
 
-    def usage(self, b: int) -> Tensor:
-        """Usage fraction for bank b. Returns [BS]."""
+    def usage_all(self) -> Tensor:
+        """Usage fraction for all banks. Returns [BS, B]."""
         if self.em_S is None:
             return torch.tensor(0.0)
-        return self.em_S[:, b].sum(dim=-1)  # [BS]
+        return self.em_S.sum(dim=-1)  # [BS, B]
 
     def reset_states(self, mask: Tensor):
         """Full reset for masked streams. mask: [BS] bool."""
@@ -250,6 +258,7 @@ class EMNeuromodulator(nn.Module):
     """Simplified neuromodulator for EM write decisions.
 
     Takes novelty_mean and usage, produces g_em scalar per bank.
+    Batched across all banks simultaneously.
     """
 
     def __init__(self, hidden: int = 32, g_floor: float = 0.001, g_ceil: float = 0.95):
@@ -266,16 +275,17 @@ class EMNeuromodulator(nn.Module):
         nn.init.zeros_(self.backbone[0].bias)
 
     def forward(self, novelty_mean: Tensor, usage: Tensor) -> Tensor:
-        """Produce write gate g_em.
+        """Produce write gate g_em for all banks at once.
 
         Args:
-            novelty_mean: [BS] — mean novelty across tokens
-            usage: [BS] — EM usage (sum of strengths)
+            novelty_mean: [BS, B] — mean novelty across tokens, per bank
+            usage: [BS, B] — EM usage (sum of strengths) per bank
 
         Returns:
-            g_em: [BS] — write gate ∈ [g_floor, g_ceil]
+            g_em: [BS, B] — write gate in [g_floor, g_ceil]
         """
-        features = torch.stack([novelty_mean, usage], dim=-1)  # [BS, 2]
-        h = self.backbone(features)
-        g_raw = self.g_head(h).squeeze(-1)
+        # features: [BS, B, 2]
+        features = torch.stack([novelty_mean, usage], dim=-1)
+        h = self.backbone(features)       # [BS, B, hidden]
+        g_raw = self.g_head(h).squeeze(-1)  # [BS, B]
         return self.g_floor + (self.g_ceil - self.g_floor) * torch.sigmoid(g_raw)

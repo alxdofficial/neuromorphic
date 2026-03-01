@@ -223,6 +223,10 @@ class TokenShardDataset(IterableDataset):
         self.step_count = 0
         self.prev_tokens = None
 
+    def reset_streams(self):
+        """Alias for reset() — compatibility with PersistentStreamDataset interface."""
+        self.reset()
+
     def monitor_stats(self) -> dict:
         return {
             "stream_restarts_total": 0,

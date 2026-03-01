@@ -103,7 +103,11 @@ class TBPTTTrainer:
             em = self.model.em
             if em.em_S is not None:
                 total = em.em_S.detach().sum().item()
+                # em_S: [BS, B, M] — budget is per-stream, cap = budget * BS * B
                 cap = em.budget * em.em_S.shape[0] * em.em_S.shape[1]
+                # Note: budget_enforce operates per flattened [BS*B*M] stream,
+                # so utilization is total strength / (budget * num_streams)
+                # where num_streams = BS * B (each has M primitives).
                 if cap > 0:
                     em_util = total / cap
 

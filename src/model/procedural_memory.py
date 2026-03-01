@@ -61,32 +61,29 @@ class ProceduralMemory(nn.Module, StateMixin):
         # surprise: [BS, N, D] -> [BS, N, 1, D]
         return lr * surprise.unsqueeze(2)  # [BS, N, B, D]
 
-    def read(self, H_flat: Tensor, cum_pm_b: Tensor, b: int) -> Tensor:
-        """PM gain read with causal bias for bank b.
+    def read_all(self, H_flat: Tensor, cum_pm: Tensor) -> Tensor:
+        """PM gain read with causal bias for all banks at once.
 
         Args:
             H_flat: [BS, N, D] — column states reshaped to flat D
-            cum_pm_b: [BS, N, D] — prefix-summed write deltas for bank b
-            b: bank index
+            cum_pm: [BS, N, B, D] — prefix-summed write deltas for all banks
 
         Returns:
-            pm_read: [BS, N, D] — gain-modulated output
+            pm_read: [BS, N, B, D] — gain-modulated output for all banks
         """
-        # pm_bias[:, b]: [BS, D] -> [BS, 1, D]
-        bias = self.pm_bias[:, b].unsqueeze(1)
-        return H_flat * (1.0 + bias + cum_pm_b)
+        # pm_bias: [BS, B, D] -> [BS, 1, B, D]
+        bias = self.pm_bias.unsqueeze(1)
+        # H_flat: [BS, N, D] -> [BS, N, 1, D]
+        return H_flat.unsqueeze(2) * (1.0 + bias + cum_pm)
 
-    def commit_bank(self, delta_pm_sum: Tensor, b: int):
-        """Segment-end commit for bank b: pm_bias += sum of deltas, then decay.
+    def commit(self, delta_pm_sum: Tensor):
+        """Segment-end commit for all banks: pm_bias += sum of deltas, then decay.
 
         Args:
-            delta_pm_sum: [BS, D] — sum of per-token deltas across N positions
-            b: bank index
+            delta_pm_sum: [BS, B, D] — sum of per-token deltas across N positions
         """
-        # Reassignment (not in-place) to preserve autograd graph
-        new_bias = self.pm_bias.clone()
-        new_bias[:, b] = (self.pm_bias[:, b] + delta_pm_sum) * self.decay_pm
-        self.pm_bias = new_bias
+        # Arithmetic ops create new tensors for autograd — no clone needed
+        self.pm_bias = (self.pm_bias + delta_pm_sum) * self.decay_pm
 
     def reset_states(self, mask: Tensor):
         """Zero bias for masked streams (doc boundary, non-lifelong).

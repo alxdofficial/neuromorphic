@@ -35,48 +35,49 @@ class TestProceduralMemory:
         deltas = pm.compute_deltas(surprise)
         assert deltas.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_read_shape(self):
+    def test_read_all_shape(self):
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         H_flat = torch.randn(BS, 8, cfg.D)
-        cum_pm = torch.randn(BS, 8, cfg.D)
-        y = pm.read(H_flat, cum_pm, b=0)
-        assert y.shape == (BS, 8, cfg.D)
+        cum_pm = torch.randn(BS, 8, cfg.B, cfg.D)
+        y = pm.read_all(H_flat, cum_pm)
+        assert y.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_read_gain_modulation(self):
+    def test_read_all_gain_modulation(self):
         """Read applies gain: y = H * (1 + pm_bias + cum_pm)."""
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        # Zero bias + zero cum_pm -> gain = 1, output = H
+        # Zero bias + zero cum_pm -> gain = 1, output = H (per bank)
         H_flat = torch.randn(BS, 8, cfg.D)
-        cum_pm = torch.zeros(BS, 8, cfg.D)
-        y = pm.read(H_flat, cum_pm, b=0)
-        assert torch.allclose(y, H_flat)
+        cum_pm = torch.zeros(BS, 8, cfg.B, cfg.D)
+        y = pm.read_all(H_flat, cum_pm)
+        # Each bank should equal H_flat
+        for b in range(cfg.B):
+            assert torch.allclose(y[:, :, b], H_flat)
 
-    def test_read_with_bias(self):
+    def test_read_all_with_bias(self):
         """Non-zero bias changes output."""
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         pm.pm_bias = torch.randn(BS, cfg.B, cfg.D)
         H_flat = torch.randn(BS, 8, cfg.D)
-        cum_pm = torch.zeros(BS, 8, cfg.D)
-        y = pm.read(H_flat, cum_pm, b=0)
-        assert not torch.allclose(y, H_flat)
+        cum_pm = torch.zeros(BS, 8, cfg.B, cfg.D)
+        y = pm.read_all(H_flat, cum_pm)
+        # Bank 0 should differ from H_flat
+        assert not torch.allclose(y[:, :, 0], H_flat)
 
-    def test_commit_bank(self):
+    def test_commit(self):
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        delta_sum = torch.randn(BS, cfg.D)
+        delta_sum = torch.randn(BS, cfg.B, cfg.D)
         bias_before = pm.pm_bias.clone()
-        pm.commit_bank(delta_sum, b=0)
-        # Bias should have changed for bank 0
-        assert not torch.allclose(pm.pm_bias[:, 0], bias_before[:, 0])
-        # Other banks unchanged
-        assert torch.allclose(pm.pm_bias[:, 1], bias_before[:, 1])
+        pm.commit(delta_sum)
+        # All banks should have changed
+        assert not torch.allclose(pm.pm_bias, bias_before)
 
     def test_commit_applies_decay(self):
         """After commit, bias = (bias + delta) * decay."""
@@ -84,11 +85,11 @@ class TestProceduralMemory:
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         pm.pm_bias = torch.ones(BS, cfg.B, cfg.D) * 2.0
-        delta_sum = torch.ones(BS, cfg.D)
-        pm.commit_bank(delta_sum, b=0)
+        delta_sum = torch.ones(BS, cfg.B, cfg.D)
+        pm.commit(delta_sum)
         expected = (2.0 + 1.0) * cfg.decay_pm
-        assert torch.allclose(pm.pm_bias[:, 0],
-                              torch.full_like(pm.pm_bias[:, 0], expected),
+        assert torch.allclose(pm.pm_bias,
+                              torch.full_like(pm.pm_bias, expected),
                               atol=1e-5)
 
     def test_reset_states(self):

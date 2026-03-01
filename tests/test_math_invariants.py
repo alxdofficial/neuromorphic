@@ -208,15 +208,15 @@ class TestPMCommitEquations:
     """Verify PM commit update formula: bias = (bias + delta) * decay."""
 
     def test_commit_equation(self):
-        """pm_bias[b] = (pm_bias[b] + delta_sum) * decay_pm."""
+        """pm_bias = (pm_bias + delta_sum) * decay_pm."""
         from src.model.procedural_memory import ProceduralMemory
         pm = ProceduralMemory(B=1, D=4, decay_pm=0.9)
         pm.initialize(1, torch.device("cpu"), torch.float32)
 
         pm.pm_bias = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
-        delta_sum = torch.tensor([[0.5, -0.5, 0.0, 1.0]])
+        delta_sum = torch.tensor([[[0.5, -0.5, 0.0, 1.0]]])  # [BS=1, B=1, D=4]
 
-        pm.commit_bank(delta_sum, b=0)
+        pm.commit(delta_sum)
 
         expected = (torch.tensor([1.0, 2.0, 3.0, 4.0]) +
                     torch.tensor([0.5, -0.5, 0.0, 1.0])) * 0.9
@@ -229,8 +229,8 @@ class TestPMCommitEquations:
         pm.initialize(1, torch.device("cpu"), torch.float32)
 
         pm.pm_bias = torch.tensor([[[2.0, 2.0, 2.0, 2.0]]])
-        delta_sum = torch.zeros(1, 4)
+        delta_sum = torch.zeros(1, 1, 4)  # [BS=1, B=1, D=4]
 
-        pm.commit_bank(delta_sum, b=0)
+        pm.commit(delta_sum)
         expected = torch.full((4,), 2.0 * 0.9)
         assert torch.allclose(pm.pm_bias[0, 0], expected, atol=1e-5)

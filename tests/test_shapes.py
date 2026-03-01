@@ -164,24 +164,24 @@ class TestProceduralMemory:
         deltas = pm.compute_deltas(surprise)
         assert deltas.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_read_shape(self):
+    def test_read_all_shape(self):
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         H_flat = torch.randn(BS, 8, cfg.D)
-        cum_pm = torch.randn(BS, 8, cfg.D)
-        y = pm.read(H_flat, cum_pm, b=0)
-        assert y.shape == (BS, 8, cfg.D)
+        cum_pm = torch.randn(BS, 8, cfg.B, cfg.D)
+        y = pm.read_all(H_flat, cum_pm)
+        assert y.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_commit_bank(self):
+    def test_commit(self):
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        delta_sum = torch.randn(BS, cfg.D)
+        delta_sum = torch.randn(BS, cfg.B, cfg.D)
         bias_before = pm.pm_bias.clone()
-        pm.commit_bank(delta_sum, b=0)
+        pm.commit(delta_sum)
         # Bias should have changed
-        assert not torch.allclose(pm.pm_bias[:, 0], bias_before[:, 0])
+        assert not torch.allclose(pm.pm_bias, bias_before)
 
 
 class TestEpisodicMemory:
@@ -196,7 +196,7 @@ class TestEpisodicMemory:
         assert em.em_S.shape == (BS, cfg.B, cfg.M)
         assert em.em_age.shape == (BS, cfg.B, cfg.M)
 
-    def test_trail_read_shape(self):
+    def test_trail_read_all_shape(self):
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
@@ -205,55 +205,57 @@ class TestEpisodicMemory:
         em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
         em.em_S = torch.ones(BS, cfg.B, cfg.M)
         seed = torch.randn(BS, 8, cfg.D)
-        y = em.trail_read(seed, b=0)
-        assert y.shape == (BS, 8, cfg.D)
+        y = em.trail_read_all(seed)
+        assert y.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_trail_read_empty_memory(self):
+    def test_trail_read_all_empty_memory(self):
         """Trail read from empty memory should not crash."""
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
         seed = torch.randn(BS, 8, cfg.D)
-        y = em.trail_read(seed, b=0)
-        assert y.shape == (BS, 8, cfg.D)
+        y = em.trail_read_all(seed)
+        assert y.shape == (BS, 8, cfg.B, cfg.D)
         assert torch.isfinite(y).all()
 
-    def test_compute_novelty_shape(self):
+    def test_compute_novelty_all_shape(self):
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
         w_cand = torch.randn(BS, 8, cfg.D)
         surprise = torch.randn(BS, 8, cfg.D)
-        novelty = em.compute_novelty(w_cand, surprise, b=0)
-        assert novelty.shape == (BS, 8)
+        novelty = em.compute_novelty_all(w_cand, surprise)
+        assert novelty.shape == (BS, 8, cfg.B)
 
     def test_compute_write_deltas_shape(self):
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
-        novelty = torch.rand(BS, 8)
+        novelty = torch.rand(BS, 8, cfg.B)
         w_cand = torch.randn(BS, 8, cfg.D)
         deltas = em.compute_write_deltas(novelty, w_cand)
-        assert deltas.shape == (BS, 8, cfg.D)
+        assert deltas.shape == (BS, 8, cfg.B, cfg.D)
 
-    def test_usage_shape(self):
+    def test_usage_all_shape(self):
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        u = em.usage(b=0)
-        assert u.shape == (BS,)
+        u = em.usage_all()
+        assert u.shape == (BS, cfg.B)
 
 
 class TestEMNeuromodulator:
     def test_output_shape(self):
+        B = 2
         neuromod = EMNeuromodulator(hidden=8)
-        novelty_mean = torch.rand(BS)
-        usage = torch.rand(BS)
+        novelty_mean = torch.rand(BS, B)
+        usage = torch.rand(BS, B)
         g = neuromod(novelty_mean, usage)
-        assert g.shape == (BS,)
+        assert g.shape == (BS, B)
 
     def test_g_bounded(self):
+        B = 2
         neuromod = EMNeuromodulator(hidden=8)
-        g = neuromod(torch.rand(BS), torch.rand(BS))
+        g = neuromod(torch.rand(BS, B), torch.rand(BS, B))
         assert (g >= 0.001).all()
         assert (g <= 0.95).all()
 

@@ -71,7 +71,7 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 1_000,             # ~8M tokens: WM + PM backbone warmup (brief head start)
+    "A": 1_000,             # ~8M tokens: scan + PM backbone warmup (brief head start)
     "B": 91_000,            # ~1.49B tokens @ BS=64 (was 182K @ BS=32)
     "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
@@ -443,11 +443,14 @@ def _get_device() -> torch.device:
 
 
 def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelConfig:
-    tier_fn = {
+    tier_fns = {
         "a": ModelConfig.tier_a,
         "b": ModelConfig.tier_b,
-        "c": ModelConfig.tier_c,
-    }[tier]
+        "tiny": ModelConfig.tier_tiny,
+    }
+    if tier not in tier_fns:
+        raise ValueError(f"Unknown tier {tier!r}. Available: {list(tier_fns)}")
+    tier_fn = tier_fns[tier]
     config = tier_fn()
     config.set_phase(phase)
     if settings is not None:
@@ -674,10 +677,10 @@ def run_phase(
             # Phase toggles
             "pm_enabled", "em_enabled",
             # Architecture
-            "R", "B_blocks", "C", "D_col", "D_pcm",
-            "ffn_expansion",
+            "D", "B", "C", "D_col", "D_embed",
+            "L_scan", "scan_expansion",
             # Memory dimensions
-            "r", "M", "k_ret", "C_em",
+            "M", "n_trail_steps",
             # Lifelong mode
             "lifelong_mode",
         )
