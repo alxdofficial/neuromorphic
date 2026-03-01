@@ -10,7 +10,6 @@ import pytest
 
 from tests.conftest import make_tiny_config
 from src.model.model import NeuromorphicLM
-from src.training.masking import generate_fitb_mask
 from src.metrics.efficiency import (
     EfficiencyReport,
     compute_avg_bytes_per_token,
@@ -36,9 +35,9 @@ requires_cuda = pytest.mark.skipif(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_model_and_fwd(R=2):
+def _make_model_and_fwd():
     """Create tiny neuromorphic model + forward fn for testing."""
-    cfg = make_tiny_config(R=R, use_compile=False)
+    cfg = make_tiny_config(use_compile=False)
     model = NeuromorphicLM(cfg)
     model.initialize_states(BS, torch.device("cpu"))
 
@@ -67,20 +66,6 @@ class TestFlops:
         result = measure_flops_per_token(model, input_ids, fwd)
         assert result["total_flops"] > 0
         assert result["flops_per_token"] > 0
-
-    def test_flops_scales_with_R(self):
-        """R=4 should use roughly 2x the FLOPs of R=2."""
-        input_ids = torch.randint(0, VOCAB, (BS, 16))
-
-        model_r2, fwd_r2 = _make_model_and_fwd(R=2)
-        flops_r2 = measure_flops_per_token(model_r2, input_ids, fwd_r2)
-
-        model_r4, fwd_r4 = _make_model_and_fwd(R=4)
-        flops_r4 = measure_flops_per_token(model_r4, input_ids, fwd_r4)
-
-        ratio = flops_r4["total_flops"] / flops_r2["total_flops"]
-        # Expect ~2x, allow 1.5x-2.5x (embedding/LM head are shared overhead)
-        assert 1.5 <= ratio <= 2.5, f"R=4/R=2 ratio = {ratio:.2f}, expected ~2.0"
 
     def test_flops_simple_linear(self):
         """nn.Linear(D, D) should yield 2*D*D FLOPs per element."""
@@ -274,7 +259,7 @@ class TestSaveJson:
 @requires_cuda
 class TestTrainingThroughputCUDA:
     def test_positive_throughput(self):
-        cfg = make_tiny_config(R=2, use_compile=False)
+        cfg = make_tiny_config(use_compile=False)
         model = NeuromorphicLM(cfg).to("cuda").to(torch.bfloat16)
         model.initialize_states(BS, torch.device("cuda"))
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -299,7 +284,7 @@ class TestTrainingThroughputCUDA:
 @requires_cuda
 class TestInferenceThroughputCUDA:
     def test_positive_throughput(self):
-        cfg = make_tiny_config(R=2, use_compile=False)
+        cfg = make_tiny_config(use_compile=False)
         model = NeuromorphicLM(cfg).to("cuda").to(torch.bfloat16)
         model.initialize_states(BS, torch.device("cuda"))
 
@@ -322,7 +307,7 @@ class TestInferenceThroughputCUDA:
 @requires_cuda
 class TestVRAMBreakdownCUDA:
     def test_sums_approximately(self):
-        cfg = make_tiny_config(R=2, use_compile=False)
+        cfg = make_tiny_config(use_compile=False)
         model = NeuromorphicLM(cfg).to("cuda").to(torch.bfloat16)
         model.initialize_states(BS, torch.device("cuda"))
 
@@ -345,55 +330,11 @@ class TestVRAMBreakdownCUDA:
         )
 
 
-# ---------------------------------------------------------------------------
-# CPU tests — FITB step_fn through measure_training_throughput
-# ---------------------------------------------------------------------------
-
-class TestFITBThroughput:
-    def test_step_fn_runs(self):
-        """Custom step_fn (FITB path) works with measure_training_throughput."""
-        cfg = make_tiny_config(R=2, use_compile=False, mask_rate=0.3,
-                               fitb_id=63, null_id=62)
-        model = NeuromorphicLM(cfg)
-        BS_local = 2
-        N = cfg.N
-        vocab = cfg.vocab_size
-        device = torch.device("cpu")
-
-        model.initialize_states(BS_local, device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-        input_ids = torch.randint(0, vocab, (BS_local, N), device=device)
-
-        def step_fn():
-            optimizer.zero_grad()
-            # Generate FITB mask + replace masked tokens
-            fitb_mask = generate_fitb_mask(
-                BS_local, N, cfg.mask_rate, cfg.span_mask_prob,
-                cfg.span_mask_mean_len, device,
-            )
-            ids_masked = input_ids.clone()
-            ids_masked[fitb_mask] = cfg.fitb_id
-            ce_loss, aux, valid = model.forward_segment(
-                ids_masked, fitb_mask=fitb_mask, target_ids=input_ids,
-            )
-            loss = ce_loss / valid.float().clamp(min=1) + aux
-            loss.backward()
-            optimizer.step()
-            model.detach_states()
-
-        result = measure_training_throughput(
-            model, forward_fn=None, optimizer=optimizer,
-            bs=BS_local, seq_len=N, vocab=vocab, device=device,
-            warmup=1, measure=2, step_fn=step_fn,
-        )
-        assert result["tok_per_sec"] > 0
-        assert result["ms_per_step"] > 0
-
+class TestPredTokPerSecField:
     def test_predicted_tok_per_sec_field(self):
         """EfficiencyReport.predicted_tok_per_sec defaults to 0 and is settable."""
         r = EfficiencyReport(
-            model_name="test-fitb", param_count=100,
+            model_name="test", param_count=100,
             train_tok_per_sec=1000.0, infer_tok_per_sec=0.0,
             flops_per_token_fwd=0, peak_vram_train_gb=0.0,
             vram_weights_gb=0.0, vram_optimizer_gb=0.0,
@@ -426,7 +367,7 @@ class TestFormatTablePredTok:
                 device_name="cpu",
             ),
             EfficiencyReport(
-                model_name="Neuro-FITB", param_count=200_000,
+                model_name="Neuro", param_count=200_000,
                 train_tok_per_sec=800.0, infer_tok_per_sec=1600.0,
                 flops_per_token_fwd=900_000, peak_vram_train_gb=2.0,
                 vram_weights_gb=0.6, vram_optimizer_gb=0.6,

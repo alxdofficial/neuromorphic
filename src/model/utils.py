@@ -63,7 +63,7 @@ class StateMixin:
     """
 
     # Subclasses should set this to a list of attribute names that are
-    # runtime state tensors (e.g. ["pm_K", "pm_V", "pm_a"]).
+    # runtime state tensors (e.g. ["pm_bias"] or ["em_K", "em_V", "em_S", "em_age"]).
     _state_tensor_names: list = []
 
     def detach_states(self):

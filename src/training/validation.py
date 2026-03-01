@@ -1,8 +1,8 @@
 """
-Validation utilities for neuromorphic LM (v4).
+Validation utilities for neuromorphic LM (v5).
 
 Lightweight held-out evaluation loop: masked cross-entropy/perplexity
-without optimizer updates.
+without optimizer updates. NTP only.
 """
 
 from typing import Iterator, Optional
@@ -15,16 +15,14 @@ from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
 from ..model.state import save_runtime_state, load_runtime_state
 from ..model.utils import runtime_state_dtype
-from .loss import batched_cross_entropy, fitb_cross_entropy
-from .masking import generate_fitb_mask, apply_special_token_protection
+from .loss import batched_cross_entropy
 
 
 def _clear_runtime_for_validation(model: NeuromorphicLM, batch_size: int,
                                   device: torch.device):
     """Hard-reset runtime state so validation starts from a clean slate."""
-    # PM/EM state has explicit B dim: [BS, B, ...]
     mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-    model.pm.reset_content(mask)
+    model.pm.reset_states(mask)
     model.em.reset_states(mask)
     model.detach_states()
 
@@ -68,8 +66,6 @@ def evaluate_validation(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
         )
 
-        is_fitb = config.mask_rate > 0 and config.fitb_id >= 0
-
         for _ in range(num_steps):
             try:
                 batch = next(dataloader)
@@ -99,54 +95,20 @@ def evaluate_validation(
                 eot_inputs += int(is_eot.sum().item())
                 resets += int(reset_mask.sum().item())
 
-                if is_fitb:
-                    seg_N = seg_ids.shape[1]
-                    fitb_mask = generate_fitb_mask(
-                        BS, seg_N, config.mask_rate,
-                        config.span_mask_prob,
-                        config.span_mask_mean_len,
-                        device,
-                    )
-                    fitb_mask = apply_special_token_protection(
-                        fitb_mask, seg_ids, eot_id, config.null_id,
-                    )
-                    seg_ids_masked = seg_ids.clone()
-                    seg_ids_masked[fitb_mask] = config.fitb_id
+                with amp_ctx:
+                    logits, _ = model.forward_segment(seg_ids, reset_mask)
 
-                    with amp_ctx:
-                        per_pass_logits, _ = model.forward_segment(
-                            seg_ids_masked, reset_mask, fitb_mask=fitb_mask
-                        )
+                if not torch.isfinite(logits).all():
+                    raise RuntimeError("Non-finite logits during validation.")
 
-                    # Use final-pass logits for perplexity
-                    final_logits = per_pass_logits[-1]
-                    if not torch.isfinite(final_logits).all():
-                        raise RuntimeError("Non-finite logits during FITB validation.")
-
-                    # CE only at masked positions (final pass only for val metric)
-                    flat_mask = fitb_mask.reshape(-1)
-                    flat_targets = seg_ids.reshape(-1).clone()
-                    flat_targets[~flat_mask] = -100
-                    seg_loss = F.cross_entropy(
-                        final_logits.reshape(-1, final_logits.shape[-1]),
-                        flat_targets, ignore_index=-100, reduction="sum",
-                    )
-                    seg_valid = flat_mask.sum()
+                if config.reset_on_doc_boundary:
+                    loss_mask = ~is_eot
                 else:
-                    with amp_ctx:
-                        logits, _ = model.forward_segment(seg_ids, reset_mask)
+                    loss_mask = torch.ones_like(is_eot)
 
-                    if not torch.isfinite(logits).all():
-                        raise RuntimeError("Non-finite logits during validation.")
-
-                    if config.reset_on_doc_boundary:
-                        loss_mask = ~is_eot
-                    else:
-                        loss_mask = torch.ones_like(is_eot)
-
-                    seg_loss, seg_valid = batched_cross_entropy(
-                        logits, seg_targets, loss_mask
-                    )
+                seg_loss, seg_valid = batched_cross_entropy(
+                    logits, seg_targets, loss_mask
+                )
 
                 total_loss += float(seg_loss.item())
                 valid_count += int(seg_valid.item()) if torch.is_tensor(seg_valid) else int(seg_valid)

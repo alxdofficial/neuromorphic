@@ -1,4 +1,4 @@
-"""State management tests (v4) — NEVER change.
+"""State management tests (v5) — NEVER change.
 
 If these fail, there's a state corruption bug.
 """
@@ -18,7 +18,7 @@ BS = 2
 
 
 def _init_model(phase="A", **kw):
-    """Create and warm up a tiny v4 model."""
+    """Create and warm up a tiny v5 model."""
     cfg = make_tiny_config(**kw)
     cfg.set_phase(phase)
     model = NeuromorphicLM(cfg)
@@ -64,35 +64,31 @@ class TestDetach:
 class TestReset:
     def test_reset_zeros_masked_pm(self):
         model, cfg = _init_model("A")
-        B = cfg.B_blocks
 
-        # Give PM some content (state is [BS, B, r, D])
+        # Give PM some content
         pm = model.pm
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
-        pm.pm_a = torch.ones(BS, B, cfg.r)
+        pm.pm_bias = torch.randn(BS, cfg.B, cfg.D)
 
-        # Mask: reset stream 0 (all its B blocks), keep stream 1
+        # Mask: reset stream 0, keep stream 1
         mask = torch.tensor([True, False])
         model._reset_memory(mask)
 
-        # Stream 0's blocks should be zeroed
-        assert (pm.pm_K[0] == 0).all(), "masked stream pm_K should be zero"
-        assert (pm.pm_a[0] == 0).all(), "masked stream pm_a should be zero"
+        # Stream 0 should be zeroed
+        assert (pm.pm_bias[0] == 0).all(), "masked stream pm_bias should be zero"
         # Stream 1 should be preserved
-        assert pm.pm_K[1].abs().sum() > 0, "unmasked stream should be preserved"
+        assert pm.pm_bias[1].abs().sum() > 0, "unmasked stream should be preserved"
 
 
 class TestEMReset:
     def test_em_reset_zeros_all_state(self):
-        """EM reset: em_S, em_age, em_K, em_V all zeroed for masked (Bug 4)."""
+        """EM reset: em_S, em_age, em_K, em_V all zeroed for masked."""
         model, cfg = _init_model("A")
-        B = cfg.B_blocks
 
         em = model.em
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_S = torch.ones(BS, B, cfg.M)
-        em.em_age = torch.ones(BS, B, cfg.M) * 50
+        em.em_K = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_S = torch.ones(BS, cfg.B, cfg.M)
+        em.em_age = torch.ones(BS, cfg.B, cfg.M) * 50
 
         em_K_before = em.em_K.clone()
         em_V_before = em.em_V.clone()
@@ -132,7 +128,7 @@ class TestSaveLoad:
                         f"{path}.{name}: values differ after load"
 
     def test_load_skips_shape_mismatched_tensors(self):
-        cfg1 = make_tiny_config(r=4)
+        cfg1 = make_tiny_config(M=4)
         cfg1.set_phase("A")
         model1 = NeuromorphicLM(cfg1)
         model1.initialize_states(BS, torch.device("cpu"))
@@ -140,19 +136,19 @@ class TestSaveLoad:
         model1.forward_segment(input_ids)
         state = save_runtime_state(model1)
 
-        cfg2 = make_tiny_config(r=8)
+        cfg2 = make_tiny_config(M=16)
         cfg2.set_phase("A")
         model2 = NeuromorphicLM(cfg2)
         model2.initialize_states(BS, torch.device("cpu"))
 
-        # Snapshot PM state before load
-        pm_K_before = model2.pm.pm_K.clone()
+        # Snapshot EM state before load
+        em_K_before = model2.em.em_K.clone()
 
         load_runtime_state(model2, state)
 
-        # r=8 state should be unchanged (mismatched shapes skipped)
-        assert model2.pm.pm_K.shape[2] == 8  # [BS, B, r, D]
-        assert torch.equal(model2.pm.pm_K, pm_K_before)
+        # M=16 state should be unchanged (mismatched shapes skipped)
+        assert model2.em.em_K.shape[2] == 16  # [BS, B, M, D]
+        assert torch.equal(model2.em.em_K, em_K_before)
 
     def test_save_uses_stable_path_keys(self):
         model, cfg = _init_model("A")
@@ -167,7 +163,7 @@ class TestWalkModelTree:
         model, cfg = _init_model("A")
         mixins = list(_walk_state_mixins(model))
 
-        # Single PM and single EM (batched across B_blocks)
+        # Single PM and single EM
         pm_count = sum(1 for _, m in mixins if type(m).__name__ == "ProceduralMemory")
         em_count = sum(1 for _, m in mixins if type(m).__name__ == "EpisodicMemory")
         assert pm_count == 1

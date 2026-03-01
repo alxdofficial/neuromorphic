@@ -1,4 +1,4 @@
-"""Tensor shape contracts (v4) — NEVER change.
+"""Tensor shape contracts (v5) — NEVER change.
 
 If these fail, an interface changed (real bug).
 """
@@ -9,10 +9,10 @@ import pytest
 from tests.conftest import make_tiny_config, forward_one_segment
 
 from src.model.model import NeuromorphicLM
-from src.model.predictive_coding import GroupedLinear, GroupedLayerNorm, CrossPassPCM
-from src.model.column import CorticalColumnGroup, LateralMixer, CrossBlockMixer, FFNStack, PositionAttention
+from src.model.scan import ScanLayer, sequential_scan
+from src.model.predictive_coding import GroupedLinear, GroupedLayerNorm, WithinScanPCM
 from src.model.procedural_memory import ProceduralMemory
-from src.model.episodic_memory import EpisodicMemory
+from src.model.episodic_memory import EpisodicMemory, EMNeuromodulator
 
 
 BS = 2
@@ -41,328 +41,221 @@ class TestGroupedLayerNorm:
         assert y.shape == x.shape
 
 
-class TestCrossPassPCM:
-    def test_encode_shape(self):
-        C, D_col, D_pcm = 2, 16, 8
-        pcm = CrossPassPCM(C, D_col, D_pcm)
+class TestSequentialScan:
+    def test_shape(self):
+        a = torch.rand(BS, 8, 3, 16)
+        b = torch.randn(BS, 8, 3, 16)
+        h = sequential_scan(a, b)
+        assert h.shape == (BS, 8, 3, 16)
+
+    def test_with_h0(self):
+        a = torch.rand(BS, 8, 3, 16)
+        b = torch.randn(BS, 8, 3, 16)
+        h0 = torch.randn(BS, 3, 16)
+        h = sequential_scan(a, b, h0)
+        assert h.shape == (BS, 8, 3, 16)
+
+    def test_manual_loop(self):
+        """sequential_scan should match manual loop."""
+        torch.manual_seed(42)
+        a = torch.rand(1, 4, 2, 8)
+        b = torch.randn(1, 4, 2, 8)
+        h = sequential_scan(a, b)
+
+        # Manual
+        h_manual = torch.zeros(1, 2, 8)
+        for t in range(4):
+            h_manual = a[0, t] * h_manual + b[0, t]
+            assert torch.allclose(h[0, t], h_manual, atol=1e-5)
+
+
+class TestScanLayer:
+    def test_shape(self):
+        C, D_col, expansion = 3, 8, 2
+        layer = ScanLayer(C, D_col, expansion)
+        x = torch.randn(BS, 8, C, D_col)
+        out, h_last = layer(x)
+        assert out.shape == x.shape
+        assert h_last.shape == (BS, C, D_col * expansion)
+
+    def test_with_h_prev(self):
+        C, D_col, expansion = 3, 8, 2
+        E = D_col * expansion
+        layer = ScanLayer(C, D_col, expansion)
+        x = torch.randn(BS, 8, C, D_col)
+        h_prev = torch.randn(BS, C, E)
+        out, h_last = layer(x, h_prev)
+        assert out.shape == x.shape
+        assert h_last.shape == (BS, C, E)
+
+    def test_residual_connection(self):
+        """Output should differ from input (not zero) but include residual."""
+        C, D_col, expansion = 2, 4, 2
+        layer = ScanLayer(C, D_col, expansion)
         x = torch.randn(BS, 4, C, D_col)
-        z = pcm.encode(x)
-        assert z.shape == (BS, 4, C, D_pcm)
+        out, _ = layer(x)
+        # Should not be identical to input (scan adds something)
+        # but also not wildly different (residual connection)
+        diff = (out - x).abs().mean()
+        assert diff > 0  # not identity
 
-    def test_predict_shape(self):
-        C, D_col, D_pcm = 2, 16, 8
-        pcm = CrossPassPCM(C, D_col, D_pcm)
-        z = torch.randn(BS, 4, C, D_pcm)
-        z_hat = pcm.predict(z)
-        assert z_hat.shape == (BS, 4, C, D_pcm)
 
-    def test_surprise_shape(self):
-        C, D_col, D_pcm = 2, 16, 8
-        pcm = CrossPassPCM(C, D_col, D_pcm)
-        z = torch.randn(BS, 4, C, D_pcm)
-        z_hat = torch.randn(BS, 4, C, D_pcm)
-        surprise, delta = pcm.compute_surprise(z, z_hat)
-        assert surprise.shape == (BS, 4, C)
-        assert delta.shape == (BS, 4, C, D_pcm)
+class TestWithinScanPCM:
+    def test_compute_surprise_shape(self):
+        C, D_col = 2, 16
+        pcm = WithinScanPCM(C, D_col)
+        H = torch.randn(BS, 8, C, D_col)
+        x_col = torch.randn(BS, 8, C, D_col)
+        surprise, z_hat, z = pcm.compute_surprise(H, x_col)
+        assert surprise.shape == (BS, 8, C, D_col)
+        assert z_hat.shape == (BS, 8, C, D_col)
+        assert z.shape == (BS, 8, C, D_col)
 
-    def test_surprise_none_prev(self):
-        C, D_col, D_pcm = 2, 16, 8
-        pcm = CrossPassPCM(C, D_col, D_pcm)
-        z = torch.randn(BS, 4, C, D_pcm)
-        surprise, delta = pcm.compute_surprise(z, None)
-        assert surprise.shape == (BS, 4, C)
-        assert (surprise == 0).all()
+    def test_surprise_zero_at_position_zero(self):
+        C, D_col = 2, 16
+        pcm = WithinScanPCM(C, D_col)
+        H = torch.randn(BS, 8, C, D_col)
+        x_col = torch.randn(BS, 8, C, D_col)
+        surprise, _, _ = pcm.compute_surprise(H, x_col)
+        assert (surprise[:, 0] == 0).all()
+
+    def test_apply_gain_shape(self):
+        C, D_col = 2, 16
+        pcm = WithinScanPCM(C, D_col)
+        H = torch.randn(BS, 8, C, D_col)
+        surprise = torch.randn(BS, 8, C, D_col)
+        H_mod = pcm.apply_gain(H, surprise)
+        assert H_mod.shape == H.shape
+
+    def test_gain_bounded_at_init(self):
+        """W_gain zero-init means gain = 1.0 at init."""
+        C, D_col = 2, 16
+        pcm = WithinScanPCM(C, D_col)
+        H = torch.randn(BS, 8, C, D_col)
+        surprise = torch.randn(BS, 8, C, D_col)
+        H_mod = pcm.apply_gain(H, surprise)
+        # At init, W_gain=0 so gain = 1 + 0.1*tanh(0) = 1.0
+        assert torch.allclose(H_mod, H, atol=1e-5)
+
+    def test_prediction_loss(self):
+        C, D_col = 2, 16
+        pcm = WithinScanPCM(C, D_col)
+        z_hat = torch.randn(BS, 8, C, D_col)
+        z = torch.randn(BS, 8, C, D_col)
+        loss = pcm.prediction_loss(z_hat, z)
+        assert loss.shape == ()
+        assert loss.item() >= 0
 
 
 class TestProceduralMemory:
+    def test_initialize(self):
+        cfg = make_tiny_config()
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
+        assert not pm.is_initialized()
+        pm.initialize(BS, torch.device("cpu"), torch.float32)
+        assert pm.is_initialized()
+        assert pm.pm_bias.shape == (BS, cfg.B, cfg.D)
+
+    def test_compute_deltas_shape(self):
+        cfg = make_tiny_config()
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
+        pm.initialize(BS, torch.device("cpu"), torch.float32)
+        surprise = torch.randn(BS, 8, cfg.D)
+        deltas = pm.compute_deltas(surprise)
+        assert deltas.shape == (BS, 8, cfg.B, cfg.D)
+
     def test_read_shape(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        # Set some content
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
-        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D)
-        pm.pm_a = torch.ones(BS, B, cfg.r)
+        H_flat = torch.randn(BS, 8, cfg.D)
+        cum_pm = torch.randn(BS, 8, cfg.D)
+        y = pm.read(H_flat, cum_pm, b=0)
+        assert y.shape == (BS, 8, cfg.D)
 
-        q = torch.randn(BS, 4, B, cfg.D)  # [BS, N, B, D]
-        y = pm.read(q)
-        assert y.shape == q.shape
-
-    def test_commit(self):
+    def test_commit_bank(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-
-        elig_K = torch.randn(BS, B, cfg.r, cfg.D)
-        elig_V = torch.randn(BS, B, cfg.r, cfg.D)
-        g = torch.full((BS, B), 0.5)
-        slot_logits = torch.randn(BS, B, cfg.r)
-        tau = torch.ones(BS, B)
-
-        pm.commit(elig_K, elig_V, g, slot_logits, tau)
-        assert pm.pm_a is not None
-        assert pm.pm_a.sum() > 0
+        delta_sum = torch.randn(BS, cfg.D)
+        bias_before = pm.pm_bias.clone()
+        pm.commit_bank(delta_sum, b=0)
+        # Bias should have changed
+        assert not torch.allclose(pm.pm_bias[:, 0], bias_before[:, 0])
 
 
 class TestEpisodicMemory:
-    def test_read_shape(self):
-        """EM read with 4D input [BS, N, B, D]."""
+    def test_initialize(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
+        assert not em.is_initialized()
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        # Set some content
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_S = torch.ones(BS, B, cfg.M)
+        assert em.is_initialized()
+        assert em.em_K.shape == (BS, cfg.B, cfg.M, cfg.D)
+        assert em.em_V.shape == (BS, cfg.B, cfg.M, cfg.D)
+        assert em.em_S.shape == (BS, cfg.B, cfg.M)
+        assert em.em_age.shape == (BS, cfg.B, cfg.M)
 
-        N = 4
-        q = torch.randn(BS, N, B, cfg.D)
-        y = em.read(q)
-        assert y.shape == q.shape
-
-    def test_novelty_score_shape(self):
+    def test_trail_read_shape(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        # Need some active primitives for trail to work
+        em.em_K = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_S = torch.ones(BS, cfg.B, cfg.M)
+        seed = torch.randn(BS, 8, cfg.D)
+        y = em.trail_read(seed, b=0)
+        assert y.shape == (BS, 8, cfg.D)
 
-        N = 4
-        q = torch.randn(BS, N, B, cfg.D)
-        surprise = torch.rand(BS, N, B)
-        w_nov = torch.rand(BS, N, B)
-
-        novelty = em.score_novelty(q, surprise, w_nov)
-        assert novelty.shape == (BS, N, B)
-
-    def test_select_top_candidates(self):
+    def test_trail_read_empty_memory(self):
+        """Trail read from empty memory should not crash."""
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        seed = torch.randn(BS, 8, cfg.D)
+        y = em.trail_read(seed, b=0)
+        assert y.shape == (BS, 8, cfg.D)
+        assert torch.isfinite(y).all()
 
-        N = 4
-        q = torch.randn(BS, N, B, cfg.D)
-        v = torch.randn(BS, N, B, cfg.D)
-        novelty = torch.rand(BS, N, B)
-
-        cand_K, cand_V, cand_scores = em.select_top_candidates(q, v, novelty, cfg.C_em)
-        assert cand_K.shape == (BS, B, cfg.C_em, cfg.D)
-        assert cand_V.shape == (BS, B, cfg.C_em, cfg.D)
-        assert cand_scores.shape == (BS, B, cfg.C_em)
-
-
-class TestLateralMixer:
-    def test_shape(self):
-        D_col = 16
-        C = 3
-        mixer = LateralMixer(C)
-        B = 2
-        x = torch.randn(BS, 4, B, C, D_col)
-        y = mixer(x)
-        assert y.shape == x.shape
-
-    def test_residual_identity_at_init(self):
-        """mix is zero-init, so output should equal input at init."""
-        D_col = 16
-        C = 3
-        mixer = LateralMixer(C)
-        B = 2
-        x = torch.randn(BS, 4, B, C, D_col)
-        y = mixer(x)
-        assert torch.allclose(y, x, atol=1e-5)
-
-
-class TestCrossBlockMixer:
-    def test_shape(self):
-        D_col = 16
-        B = 3
-        C = 2
-        mixer = CrossBlockMixer(B)
-        x = torch.randn(BS, 4, B, C, D_col)
-        y = mixer(x)
-        assert y.shape == x.shape
-
-    def test_residual_identity_at_init(self):
-        """cross_mix is zero-init, so output should equal input at init."""
-        D_col = 16
-        B = 3
-        C = 2
-        mixer = CrossBlockMixer(B)
-        x = torch.randn(BS, 4, B, C, D_col)
-        y = mixer(x)
-        assert torch.allclose(y, x, atol=1e-5)
-
-
-class TestPositionAttention:
-    def test_shape(self):
-        G, D_col, D_attn = 4, 16, 8
-        N_C = 8
-        pa = PositionAttention(G, D_col, D_attn)
-        x = torch.randn(BS, N_C, G, D_col)
-        y = pa(x)
-        assert y.shape == (BS, N_C, G, D_col)
-
-    def test_residual_identity_at_init(self):
-        """out_proj is zero-init, so output should equal input at init."""
-        G, D_col, D_attn = 4, 16, 8
-        N_C = 8
-        pa = PositionAttention(G, D_col, D_attn)
-        x = torch.randn(BS, N_C, G, D_col)
-        y = pa(x)
-        assert torch.allclose(y, x, atol=1e-5)
-
-    def test_disabled_when_dim_zero(self):
-        """position_attn_dim=0 should result in pos_attn=None on column group."""
-        cfg = make_tiny_config(position_attn_dim=0)
-        col = CorticalColumnGroup(cfg)
-        assert col.pos_attn is None
-
-    def test_config_auto_derives(self):
-        """position_attn_dim=-1 should auto-derive to D_col // 4."""
-        cfg = make_tiny_config()  # D=64, C=2 -> D_col=32
-        assert cfg.position_attn_dim == 8  # 32 // 4
-
-    def test_column_with_pos_attn(self):
-        """Full column forward shape preserved with PositionAttention."""
+    def test_compute_novelty_shape(self):
         cfg = make_tiny_config()
-        assert cfg.position_attn_dim > 0
-        G = cfg.B_blocks * cfg.C
-        col = CorticalColumnGroup(cfg)
-        assert col.pos_attn is not None
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        w_cand = torch.randn(BS, 8, cfg.D)
+        surprise = torch.randn(BS, 8, cfg.D)
+        novelty = em.compute_novelty(w_cand, surprise, b=0)
+        assert novelty.shape == (BS, 8)
 
-        x = torch.randn(BS, cfg.N_C, G, cfg.D_col)
-        x_out, z, z_hat, surprise, elig_info, nov_info = col.forward(x, pm, em, None)
-        assert x_out.shape == (BS, cfg.N_C, G, cfg.D_col)
+    def test_compute_write_deltas_shape(self):
+        cfg = make_tiny_config()
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
+        novelty = torch.rand(BS, 8)
+        w_cand = torch.randn(BS, 8, cfg.D)
+        deltas = em.compute_write_deltas(novelty, w_cand)
+        assert deltas.shape == (BS, 8, cfg.D)
 
-
-class TestColumnGroup:
-    def test_forward_shape(self):
-        cfg = make_tiny_config(pcm_enabled=True)
-        G = cfg.B_blocks * cfg.C
-        B = cfg.B_blocks
-        col = CorticalColumnGroup(cfg)
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
+    def test_usage_shape(self):
+        cfg = make_tiny_config()
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-
-        x = torch.randn(BS, cfg.N, G, cfg.D_col)
-        x_out, z, z_hat, surprise, elig_info, nov_info = col.forward(x, pm, em, None)
-
-        assert x_out.shape == (BS, cfg.N, G, cfg.D_col)
-        assert z.shape == (BS, cfg.N, G, cfg.D_pcm)
-        assert z_hat.shape == (BS, cfg.N, G, cfg.D_pcm)
-        assert surprise.shape == (BS, cfg.N, G)
-
-        k_cand, v_cand, gate = elig_info
-        assert k_cand.shape == (BS, cfg.N, B, cfg.C, cfg.D_col)
-        assert gate.shape == (BS, cfg.N, B, cfg.C)
-
-        q_nov, v_nov, w_nov, surp = nov_info
-        assert q_nov.shape == (BS, cfg.N, B, cfg.C, cfg.D_col)
-        assert w_nov.shape == (BS, cfg.N, B, cfg.C)
+        u = em.usage(b=0)
+        assert u.shape == (BS,)
 
 
-class TestSingleLoopModel:
-    def test_single_loop_forward_shape(self):
-        """Full model with ffn_depth=2 (2L=4 total FFN layers) produces correct output shape."""
-        cfg = make_tiny_config(ffn_depth=2)
-        model = NeuromorphicLM(cfg)
-        logits, aux_loss = forward_one_segment(model, BS=BS, vocab=VOCAB)
-        assert logits.shape == (BS, cfg.N, VOCAB)
+class TestEMNeuromodulator:
+    def test_output_shape(self):
+        neuromod = EMNeuromodulator(hidden=8)
+        novelty_mean = torch.rand(BS)
+        usage = torch.rand(BS)
+        g = neuromod(novelty_mean, usage)
+        assert g.shape == (BS,)
 
-    def test_single_loop_with_pcm(self):
-        """Single-loop model with PCM produces correct output."""
-        cfg = make_tiny_config(pcm_enabled=True, ffn_depth=2)
-        model = NeuromorphicLM(cfg)
-        logits, aux_loss = forward_one_segment(model, BS=BS, vocab=VOCAB)
-        assert logits.shape == (BS, cfg.N, VOCAB)
-
-    def test_single_loop_multi_segment(self):
-        """Single-loop model works across multiple segments."""
-        cfg = make_tiny_config(ffn_depth=2)
-        model = NeuromorphicLM(cfg)
-        model.initialize_states(BS, torch.device("cpu"))
-
-        N = cfg.N
-        for seg in range(3):
-            input_ids = torch.randint(0, VOCAB, (BS, N))
-            reset_mask = torch.zeros(BS, dtype=torch.bool)
-            logits, aux_loss = model.forward_segment(input_ids, reset_mask)
-            assert logits.shape == (BS, N, VOCAB)
-
-    def test_single_loop_gradients(self):
-        """All FFN layers in ffn_pre and ffn_post get gradients."""
-        cfg = make_tiny_config(ffn_depth=3)
-        model = NeuromorphicLM(cfg)
-        model.initialize_states(BS, torch.device("cpu"))
-
-        input_ids = torch.randint(0, VOCAB, (BS, cfg.N))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.N))
-        reset_mask = torch.zeros(BS, dtype=torch.bool)
-        logits, aux_loss = model.forward_segment(input_ids, reset_mask)
-        loss = F.cross_entropy(logits.reshape(-1, VOCAB), target_ids.reshape(-1)) + aux_loss
-        loss.backward()
-
-        for stack_name in ("ffn_pre", "ffn_post"):
-            stack = getattr(model.columns, stack_name)
-            for i in range(3):
-                up_w = stack.ups[i].weight
-                down_w = stack.downs[i].weight
-                assert up_w.grad is not None, f"No gradient for {stack_name}.ups[{i}]"
-                assert up_w.grad.abs().sum() > 0, f"Zero gradient for {stack_name}.ups[{i}]"
-                assert down_w.grad is not None, f"No gradient for {stack_name}.downs[{i}]"
-                assert down_w.grad.abs().sum() > 0, f"Zero gradient for {stack_name}.downs[{i}]"
-
-
-class TestFFNStack:
-    def test_ffnstack_shape(self):
-        """FFNStack produces correct output shape."""
-        G, D_col, D_hidden, L = 4, 16, 32, 3
-        stack = FFNStack(G, D_col, D_hidden, L)
-        x = torch.randn(BS, 8, G, D_col)
-        y = stack(x)
-        assert y.shape == x.shape
-
-    def test_ffnstack_with_gain(self):
-        """FFNStack applies gain on first layer only."""
-        G, D_col, D_hidden, L = 4, 16, 32, 2
-        stack = FFNStack(G, D_col, D_hidden, L)
-        x = torch.randn(BS, 8, G, D_col)
-        gain = torch.ones(BS, 8, G, D_col) * 1.5
-        y = stack(x, gain=gain)
-        assert y.shape == x.shape
-
-    def test_column_has_ffn_pre_post(self):
-        """CorticalColumnGroup should have ffn_pre and ffn_post FFNStack instances."""
-        cfg = make_tiny_config(ffn_depth=3)
-        col = CorticalColumnGroup(cfg)
-        assert isinstance(col.ffn_pre, FFNStack)
-        assert isinstance(col.ffn_post, FFNStack)
-        assert col.ffn_pre.L == 3
-        assert col.ffn_post.L == 3
-        assert len(col.ffn_pre.ups) == 3
-        assert len(col.ffn_post.ups) == 3
-
-    def test_forward_shape_depth4(self):
-        """Column with depth=4 (2*4=8 total FFN layers) produces correct output shape."""
-        cfg = make_tiny_config(pcm_enabled=True, ffn_depth=4)
-        G = cfg.B_blocks * cfg.C
-        col = CorticalColumnGroup(cfg)
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
-        em.initialize(BS, torch.device("cpu"), torch.float32)
-
-        x = torch.randn(BS, cfg.N, G, cfg.D_col)
-        x_out, z, z_hat, surprise, elig_info, nov_info = col.forward(x, pm, em, None)
-        assert x_out.shape == (BS, cfg.N, G, cfg.D_col)
+    def test_g_bounded(self):
+        neuromod = EMNeuromodulator(hidden=8)
+        g = neuromod(torch.rand(BS), torch.rand(BS))
+        assert (g >= 0.001).all()
+        assert (g <= 0.95).all()
 
 
 class TestFullModel:
@@ -370,7 +263,6 @@ class TestFullModel:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         logits, aux_loss = forward_one_segment(model, BS=BS, vocab=VOCAB)
-
         assert logits.shape == (BS, cfg.N, VOCAB)
         assert aux_loss.shape == ()
 
@@ -378,14 +270,14 @@ class TestFullModel:
         cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
         logits, aux_loss = forward_one_segment(model, BS=BS, vocab=VOCAB)
-
         assert logits.shape == (BS, cfg.N, VOCAB)
+        # PCM should contribute to aux_loss
+        assert aux_loss.item() >= 0
 
     def test_multi_segment(self):
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-
         N = cfg.N
         for seg in range(3):
             input_ids = torch.randint(0, VOCAB, (BS, N))
@@ -397,7 +289,6 @@ class TestFullModel:
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-
         N = cfg.N
         input_ids = torch.randint(0, VOCAB, (BS, N))
         reset_mask = torch.ones(BS, dtype=torch.bool)  # reset all
@@ -432,92 +323,9 @@ class TestFullModel:
         assert model.proj_up is not None
         assert model.proj_down is not None
 
-
-class TestInterleavedPartitioning:
-    def test_to_cols_shape(self):
-        """_to_cols produces [BS, N_C, G, D_col] from [BS, N, D]."""
-        cfg = make_tiny_config()
+    def test_stage_layer_counts(self):
+        """Model should have L_scan layers in each stage."""
+        cfg = make_tiny_config(L_scan=3)
         model = NeuromorphicLM(cfg)
-        x = torch.randn(BS, cfg.N, cfg.D)
-        x_cols = model._to_cols(x)
-        assert x_cols.shape == (BS, cfg.N_C, cfg.B_blocks * cfg.C, cfg.D_col)
-
-    def test_from_cols_shape(self):
-        """_from_cols produces [BS, N, D] from [BS, N_C, G, D_col] + skip."""
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        G = cfg.B_blocks * cfg.C
-        x_cols = torch.randn(BS, cfg.N_C, G, cfg.D_col)
-        x_input = torch.randn(BS, cfg.N, cfg.D)
-        x_out = model._from_cols(x_cols, x_input)
-        assert x_out.shape == (BS, cfg.N, cfg.D)
-
-    def test_roundtrip_approx_at_init(self):
-        """At init, fan_in is small so _from_cols(_to_cols(x), x) ≈ x."""
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        x = torch.randn(BS, cfg.N, cfg.D)
-        x_cols = model._to_cols(x)
-        x_rt = model._from_cols(x_cols, x)
-        # fan_in has small-scale init (std=0.02), so residual is small
-        residual = (x_rt - x).abs().mean()
-        assert residual < 1.0  # small but not exactly zero
-
-    def test_n_c_config(self):
-        """N_C is correctly derived as N // C."""
-        cfg = make_tiny_config(N=16, C=2)
-        assert cfg.N_C == 8
-        cfg = make_tiny_config(N=16, C=4)
-        assert cfg.N_C == 4
-
-    def test_n_mod_c_validation(self):
-        """Config should reject N not divisible by C."""
-        with pytest.raises(ValueError, match="divisible by C"):
-            make_tiny_config(N=15, C=2)
-
-    def test_fan_in_small_init(self):
-        """fan_in weight should be small-scale, bias zero."""
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        assert model.fan_in.weight.abs().mean() < 0.1  # small-scale
-        assert model.fan_in.weight.abs().sum() > 0  # not zero (for gradient flow)
-        assert (model.fan_in.bias == 0).all()
-
-    def test_fan_in_dimensions(self):
-        """fan_in should be Linear(D_col, D)."""
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        assert model.fan_in.in_features == cfg.D_col
-        assert model.fan_in.out_features == cfg.D
-
-
-class TestReadSliced:
-    def test_pm_read_sliced_shape(self):
-        """PM read_sliced with 5D input [BS, N_C, B, C, D_col]."""
-        cfg = make_tiny_config()
-        B, C, D_col = cfg.B_blocks, cfg.C, cfg.D_col
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
-        pm.pm_K = torch.randn(BS, B, cfg.r, cfg.D)
-        pm.pm_V = torch.randn(BS, B, cfg.r, cfg.D)
-        pm.pm_a = torch.ones(BS, B, cfg.r)
-
-        N_C = 4
-        q = torch.randn(BS, N_C, B, C, D_col)
-        y = pm.read_sliced(q)
-        assert y.shape == (BS, N_C, B, C, D_col)
-
-    def test_em_read_sliced_shape(self):
-        """EM read_sliced with 5D input [BS, N_C, B, C, D_col]."""
-        cfg = make_tiny_config()
-        B, C, D_col = cfg.B_blocks, cfg.C, cfg.D_col
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
-        em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_S = torch.ones(BS, B, cfg.M)
-
-        N_C = 4
-        q = torch.randn(BS, N_C, B, C, D_col)
-        y = em.read_sliced(q)
-        assert y.shape == (BS, N_C, B, C, D_col)
+        assert len(model.stage1) == 3
+        assert len(model.stage3) == 3

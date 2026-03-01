@@ -9,8 +9,6 @@ import torch.nn.functional as F
 
 from src.model.utils import unit_normalize, budget_enforce
 from src.model.model import NeuromorphicLM
-from src.model.procedural_memory import ProceduralMemory
-from src.model.episodic_memory import EpisodicMemory
 from src.training.loss import online_cross_entropy
 from tests.conftest import make_tiny_config, forward_one_segment, forward_k_segments
 
@@ -77,32 +75,24 @@ class TestBudgetEnforce:
 
 
 # ============================================================================
-# PM key normalization
+# PM bias finite after operations
 # ============================================================================
 
-class TestPMNormalization:
-    def test_pm_keys_unit_normalized_after_init(self):
-        """After init, pm_K is all zeros — norm check skips zero rows."""
+class TestPMBiasInvariants:
+    def test_pm_bias_finite_after_init(self):
+        """After init, pm_bias is zeros."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-        pm = model.pm
-        # After init, pm_K is zeros — no norm constraint on zero vectors
-        assert torch.isfinite(pm.pm_K).all()
+        assert torch.isfinite(model.pm.pm_bias).all()
+        assert model.pm.pm_bias.abs().sum() == 0
 
-    def test_pm_keys_unit_normalized_after_commit(self):
-        """After forward_segment (which includes PM commit), pm_K should
-        be unit-normalized for any non-zero rows."""
+    def test_pm_bias_finite_after_commits(self):
+        """After forward_segment (which includes PM commit), pm_bias should be finite."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
-        # Forward multiple segments to trigger commits
         results = forward_k_segments(model, K=3, BS=BS)
-        pm = model.pm
-        # Non-zero rows should be unit-normalized
-        norms = pm.pm_K.norm(dim=-1)
-        nonzero = norms > 1e-6
-        if nonzero.any():
-            assert torch.allclose(norms[nonzero], torch.ones_like(norms[nonzero]), atol=1e-4)
+        assert torch.isfinite(model.pm.pm_bias).all()
 
 
 # ============================================================================
@@ -110,7 +100,7 @@ class TestPMNormalization:
 # ============================================================================
 
 class TestEMNormalization:
-    def test_em_keys_unit_normalized_after_init(self):
+    def test_em_keys_finite_after_init(self):
         """After init, em_K is zeros — check finite."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
@@ -118,36 +108,11 @@ class TestEMNormalization:
         assert torch.isfinite(model.em.em_K).all()
 
     def test_em_keys_finite_after_write(self):
-        """After forward_segment (which includes EM write), em_K should
-        be finite and have norm <= 1.0 (EMA of unit vectors)."""
+        """After forward_segment (which includes EM write), em_K should be finite."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
         assert torch.isfinite(model.em.em_K).all()
-        norms = model.em.em_K.norm(dim=-1)
-        # EMA of unit vectors has norm <= 1.0
-        assert (norms <= 1.0 + 1e-4).all()
-
-
-# ============================================================================
-# PM strength bounds
-# ============================================================================
-
-class TestPMStrengthBounds:
-    def test_pm_strengths_bounded_by_a_max(self):
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        # Forward multiple segments to accumulate PM commits
-        results = forward_k_segments(model, K=4, BS=BS)
-        assert (model.pm.pm_a <= cfg.a_max + 1e-5).all()
-        assert (model.pm.pm_a >= -1e-5).all()
-
-    def test_pm_strengths_bounded_by_budget(self):
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        results = forward_k_segments(model, K=4, BS=BS)
-        total = model.pm.pm_a.sum(dim=-1)
-        assert (total <= cfg.budget_pm + 1e-5).all()
 
 
 # ============================================================================
@@ -188,9 +153,7 @@ class TestNoNaN:
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
 
-        assert torch.isfinite(model.pm.pm_K).all()
-        assert torch.isfinite(model.pm.pm_V).all()
-        assert torch.isfinite(model.pm.pm_a).all()
+        assert torch.isfinite(model.pm.pm_bias).all()
         assert torch.isfinite(model.em.em_K).all()
         assert torch.isfinite(model.em.em_V).all()
         assert torch.isfinite(model.em.em_S).all()
@@ -238,281 +201,36 @@ class TestOnlineCrossEntropy:
 
 
 # ============================================================================
-# PM commit: direct state manipulation tests
+# PM commit: bias update verification
 # ============================================================================
 
 class TestPMCommitEquations:
-    """Verify PM commit update formulas against hand-computed expected values.
+    """Verify PM commit update formula: bias = (bias + delta) * decay."""
 
-    v4 commit API: commit(elig_K, elig_V, g, slot_logits, tau)
-    All state set manually for deterministic testing.
-    State: [BS, B, r, D]; BS=1, B=1 for simplicity.
-    """
-
-    def _make_pm(self, r=2, D=4):
-        cfg = make_tiny_config(r=r, D=D, C=1, B_blocks=1,
-                               tau_pm=1.0, tau_pm_floor=0.5, tau_pm_ceil=2.0,
-                               a_max=10.0, budget_pm=20.0, decay_pm=0.9)
-        pm = ProceduralMemory(D, r, cfg)
-        return pm
-
-    def test_ema_key_update(self):
-        """pm_K = (1-alpha) * pm_K + alpha * unit_normalize(elig_K)"""
-        pm = self._make_pm(r=2, D=4)
-
-        # Inject known state (BS=1, B=1)
-        pm.pm_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0],
-                                                  [0.0, 1.0, 0.0, 0.0]]]]))
-        pm.pm_V = unit_normalize(torch.tensor([[[[0.0, 0.0, 1.0, 0.0],
-                                                  [0.0, 0.0, 0.0, 1.0]]]]))
-        pm.pm_a = torch.tensor([[[1.0, 0.0]]])
-
-        # Eligibility input (already aggregated across N*C)
-        elig_K = torch.tensor([[[[0.0, 2.0, 0.0, 0.0],
-                                  [0.0, 0.0, 2.0, 0.0]]]])  # [1,1,2,4]
-        elig_V = torch.tensor([[[[1.0, 1.0, 0.0, 0.0],
-                                  [0.0, 0.0, 1.0, 1.0]]]])  # [1,1,2,4]
-
-        g = torch.tensor([[0.5]])          # [BS=1, B=1]
-        slot_logits = torch.tensor([[[0.0, 0.0]]])  # equal → softmax = [0.5, 0.5]
-        tau = torch.tensor([[1.0]])
-
-        # softmax([0,0]/1) = [0.5, 0.5]
-        # alpha = g * slot_weights = 0.5 * [0.5, 0.5] = [0.25, 0.25]
-        alpha_val = 0.25
-
-        pm_K_before = pm.pm_K.clone()
-
-        pm.commit(elig_K, elig_V, g, slot_logits, tau)
-
-        # Key EMA slot 0: (1-0.25)*[1,0,0,0] + 0.25*normalize([0,2,0,0])
-        # normalize([0,2,0,0]) = [0,1,0,0]
-        expected_K0 = (1 - alpha_val) * torch.tensor([1.0, 0.0, 0.0, 0.0]) + \
-                       alpha_val * torch.tensor([0.0, 1.0, 0.0, 0.0])
-        assert torch.allclose(pm.pm_K[0, 0, 0], expected_K0, atol=1e-4), \
-            f"pm_K slot 0: {pm.pm_K[0,0,0]} != {expected_K0}"
-
-    def test_strength_update(self):
-        """pm_a = clamp(pm_a + alpha, 0, a_max) then budget_enforce."""
-        pm = self._make_pm(r=2, D=4)
-        pm.pm_K = unit_normalize(torch.randn(1, 1, 2, 4))
-        pm.pm_V = unit_normalize(torch.randn(1, 1, 2, 4))
-        pm.pm_a = torch.tensor([[[2.0, 1.0]]])
-
-        elig_K = torch.randn(1, 1, 2, 4)
-        elig_V = torch.randn(1, 1, 2, 4)
-        g = torch.tensor([[0.6]])
-        slot_logits = torch.tensor([[[0.0, 0.0]]])
-        tau = torch.tensor([[1.0]])
-
-        # alpha = 0.6 * [0.5, 0.5] = [0.3, 0.3]
-        alpha_val = 0.3
-        a_before = pm.pm_a.clone()
-
-        pm.commit(elig_K, elig_V, g, slot_logits, tau)
-
-        # pm_a = clamp(a_before + alpha, 0, a_max)
-        expected_a = (a_before + alpha_val).clamp(0, 10.0)
-        assert torch.allclose(pm.pm_a, expected_a, atol=1e-4)
-
-    def test_zero_g_no_key_change(self):
-        """With g=0, alpha=0 everywhere: pm_K/pm_V should not change."""
-        pm = self._make_pm(r=2, D=4)
-        pm.pm_K = unit_normalize(torch.randn(1, 1, 2, 4))
-        pm.pm_V = unit_normalize(torch.randn(1, 1, 2, 4))
-        pm.pm_a = torch.tensor([[[2.0, 1.0]]])
-
-        K_before = pm.pm_K.clone()
-        V_before = pm.pm_V.clone()
-        a_before = pm.pm_a.clone()
-
-        elig_K = torch.randn(1, 1, 2, 4)
-        elig_V = torch.randn(1, 1, 2, 4)
-        g = torch.tensor([[0.0]])
-        slot_logits = torch.tensor([[[0.0, 0.0]]])
-        tau = torch.tensor([[1.0]])
-
-        pm.commit(elig_K, elig_V, g, slot_logits, tau)
-
-        # With g=0: alpha=0, so EMA is identity
-        assert torch.allclose(pm.pm_K, K_before, atol=1e-6)
-        assert torch.allclose(pm.pm_V, V_before, atol=1e-6)
-        # pm_a should be unchanged (+ 0)
-        assert torch.allclose(pm.pm_a, a_before, atol=1e-6)
-
-
-# ============================================================================
-# PM decay
-# ============================================================================
-
-class TestPMDecay:
-    def test_base_decay_reduces_strengths(self):
-        """base_decay: pm_a *= decay."""
-        cfg = make_tiny_config(decay_pm=0.9)
-        B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
-        pm.pm_a = torch.tensor([[[2.0, 1.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0]],
-                                 [[3.0, 0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]])
-
-        before = pm.pm_a.clone()
-        pm.base_decay()
-        after = pm.pm_a
-
-        mask = before > 1e-8
-        if mask.any():
-            assert (after[mask] < before[mask]).all()
-
-        expected = before * 0.9
-        assert torch.allclose(after, expected, atol=1e-6)
-
-
-# ============================================================================
-# EM write: direct state manipulation tests
-# ============================================================================
-
-class TestEMWriteEquations:
-    """Verify EM write formulas against hand-computed values.
-
-    v4 write API: write(cand_K, cand_V, cand_scores, g_em, tau)
-    Decay applied separately via base_decay() once per segment.
-    State: [BS, B, M, D]; BS=1, B=1 for simplicity.
-    """
-
-    def _make_em(self, M=4, D=4):
-        cfg = make_tiny_config(M=M, D=D, C=1, C_em=1, B_blocks=1,
-                               tau_em=1.0, S_max=10.0, budget_em=40.0,
-                               decay_em=0.9)
-        em = EpisodicMemory(D, M, cfg)
-        return em
-
-    def test_zero_g_no_key_change(self):
-        """With g_em=0, no writes: em_K/em_V unchanged, em_S unchanged (decay separate)."""
-        em = self._make_em(M=2, D=4)
-        em.em_K = unit_normalize(torch.randn(1, 1, 2, 4))
-        em.em_V = torch.randn(1, 1, 2, 4)
-        em.em_S = torch.tensor([[[1.0, 0.5]]])
-        em.em_age = torch.zeros(1, 1, 2)
-
-        K_before = em.em_K.clone()
-        V_before = em.em_V.clone()
-        S_before = em.em_S.clone()
-
-        cand_K = unit_normalize(torch.randn(1, 1, 1, 4))
-        cand_V = torch.randn(1, 1, 1, 4)
-        cand_scores = torch.tensor([[[0.8]]])
-
-        g_em = torch.tensor([[0.0]])
-        tau = torch.tensor([[1.0]])
-
-        em.write(cand_K, cand_V, cand_scores, g_em, tau)
-
-        # With g_em=0, alpha_per_slot = 0, no update
-        assert torch.allclose(em.em_K, K_before, atol=1e-6), \
-            "no-write em_K should be unchanged"
-        assert torch.equal(em.em_V, V_before), \
-            "no-write em_V should be unchanged"
-        # em_S unchanged (decay is now applied separately via base_decay)
-        assert torch.allclose(em.em_S, S_before, atol=1e-5)
-
-        # Decay applied once per segment via base_decay
-        decay = torch.tensor([[0.9]])
-        em.base_decay(decay)
-        expected_S = S_before * 0.9
-        assert torch.allclose(em.em_S, expected_S, atol=1e-5)
-
-    def test_em_value_not_normalized(self):
-        """em_V EMA update must NOT unit-normalize (unlike em_K)."""
-        em = self._make_em(M=2, D=4)
-        em.em_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0],
-                                                  [0.0, 1.0, 0.0, 0.0]]]]))
-        em.em_V = torch.tensor([[[[10.0, 0.0, 0.0, 0.0],
-                                   [0.0, 0.0, 1.0, 0.0]]]])
-        em.em_S = torch.tensor([[[1.0, 0.5]]])
-        em.em_age = torch.zeros(1, 1, 2)
-
-        cand_K = unit_normalize(torch.tensor([[[[1.0, 0.0, 0.0, 0.0]]]]))
-        cand_V = torch.tensor([[[[0.0, 20.0, 0.0, 0.0]]]])
-        cand_scores = torch.tensor([[[0.5]]])
-
-        g_em = torch.tensor([[0.5]])
-        tau = torch.tensor([[1.0]])
-
-        em.write(cand_K, cand_V, cand_scores, g_em, tau)
-
-        # After write with large V candidate, V should not be unit-normalized
-        v_norm = em.em_V[0, 0, 0].norm().item()
-        assert v_norm > 1.5, f"em_V should NOT be unit-normalized, but norm={v_norm}"
-
-    def test_strength_increases_after_write(self):
-        """Writing should increase em_S for targeted slots."""
-        em = self._make_em(M=2, D=4)
-        em.em_K = unit_normalize(torch.randn(1, 1, 2, 4))
-        em.em_V = torch.randn(1, 1, 2, 4)
-        em.em_S = torch.tensor([[[0.5, 0.5]]])
-        em.em_age = torch.zeros(1, 1, 2)
-
-        cand_K = unit_normalize(torch.randn(1, 1, 1, 4))
-        cand_V = torch.randn(1, 1, 1, 4)
-        cand_scores = torch.tensor([[[0.8]]])
-
-        g_em = torch.tensor([[0.5]])
-        tau = torch.tensor([[1.0]])
-
-        S_before = em.em_S.clone()
-        em.write(cand_K, cand_V, cand_scores, g_em, tau)
-
-        # At least one slot should have higher S (no decay in write)
-        assert (em.em_S >= S_before - 1e-6).all(), \
-            "em_S should not decrease without decay"
-
-
-# ============================================================================
-# Damped mixing parameter
-# ============================================================================
-
-class TestDampedMixing:
-    def test_lambda_logit_bounded_after_sigmoid(self):
-        """lambda = sigmoid(lambda_logit) must be in [0, 1]."""
-        cfg = make_tiny_config()
-        model = NeuromorphicLM(cfg)
-        lam = torch.sigmoid(model.lambda_logit)
-        assert lam.item() >= 0.0 and lam.item() <= 1.0
-
-    def test_lambda_initialized_near_config(self):
-        """lambda should be initialized near config.lambda_mix."""
-        cfg = make_tiny_config(lambda_mix=0.5)
-        model = NeuromorphicLM(cfg)
-        lam = torch.sigmoid(model.lambda_logit).item()
-        assert abs(lam - 0.5) < 0.01
-
-
-# ============================================================================
-# Holographic read properties
-# ============================================================================
-
-class TestHolographicReadProperties:
-    def test_zero_strength_gives_zero_output(self):
-        """With pm_a=0, PM read output should be zero (no modulation)."""
-        cfg = make_tiny_config()
-        B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
+    def test_commit_equation(self):
+        """pm_bias[b] = (pm_bias[b] + delta_sum) * decay_pm."""
+        from src.model.procedural_memory import ProceduralMemory
+        pm = ProceduralMemory(B=1, D=4, decay_pm=0.9)
         pm.initialize(1, torch.device("cpu"), torch.float32)
-        # pm_a is already 0 after init
 
-        q = torch.randn(1, cfg.N, B, cfg.D)
-        out = pm.read(q)
+        pm.pm_bias = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+        delta_sum = torch.tensor([[0.5, -0.5, 0.0, 1.0]])
 
-        # holographic: y = q * modulation. With pm_a=0, modulation=0, so y=0
-        assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
+        pm.commit_bank(delta_sum, b=0)
 
-    def test_read_output_shape(self):
-        """PM read should preserve input shape."""
-        cfg = make_tiny_config()
-        B = cfg.B_blocks
-        pm = ProceduralMemory(cfg.D, cfg.r, cfg)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
+        expected = (torch.tensor([1.0, 2.0, 3.0, 4.0]) +
+                    torch.tensor([0.5, -0.5, 0.0, 1.0])) * 0.9
+        assert torch.allclose(pm.pm_bias[0, 0], expected, atol=1e-5)
 
-        q = torch.randn(BS, cfg.N, B, cfg.D)
-        out = pm.read(q)
-        assert out.shape == q.shape
+    def test_zero_delta_only_decays(self):
+        """With zero delta, commit only decays bias."""
+        from src.model.procedural_memory import ProceduralMemory
+        pm = ProceduralMemory(B=1, D=4, decay_pm=0.9)
+        pm.initialize(1, torch.device("cpu"), torch.float32)
+
+        pm.pm_bias = torch.tensor([[[2.0, 2.0, 2.0, 2.0]]])
+        delta_sum = torch.zeros(1, 4)
+
+        pm.commit_bank(delta_sum, b=0)
+        expected = torch.full((4,), 2.0 * 0.9)
+        assert torch.allclose(pm.pm_bias[0, 0], expected, atol=1e-5)

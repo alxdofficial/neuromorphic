@@ -1,8 +1,9 @@
 """
-Cross-pass Predictive Coding Module (v4).
+Predictive Coding (v5) — Within-scan PCM + grouped utilities.
 
-Per-column via grouped ops. Predicts what each token's encoding will look
-like next pass. Surprise = how much memory update changed understanding.
+GroupedLinear and GroupedLayerNorm are general utilities used throughout.
+WithinScanPCM: within-scan prediction (predict next token's encoding,
+compute vector surprise). Replaces v4's CrossPassPCM.
 """
 
 import math
@@ -26,7 +27,6 @@ class GroupedLayerNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [..., C, dim]
-        # Fused kernel for mean/var/normalize; per-group affine applied separately
         x_norm = F.layer_norm(x, (self.dim,), None, None, self.eps)
         return x_norm * self.weight + self.bias
 
@@ -34,7 +34,7 @@ class GroupedLayerNorm(nn.Module):
 class GroupedLinear(nn.Module):
     """Batched linear for C independent column groups.
 
-    Weight: [C, out_features, in_features]
+    Weight: [C, in_features, out_features] (pre-transposed)
     Input:  [..., C, in_features]
     Output: [..., C, out_features]
     """
@@ -45,7 +45,6 @@ class GroupedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         # Store weight pre-transposed: [C, in_features, out_features]
-        # so forward() avoids a per-call .transpose(1, 2) on weight
         self.weight = nn.Parameter(torch.empty(C, in_features, out_features))
         if bias:
             self.bias = nn.Parameter(torch.zeros(C, out_features))
@@ -55,7 +54,7 @@ class GroupedLinear(nn.Module):
 
     def _reset_parameters(self):
         for c in range(self.C):
-            # kaiming_uniform_ expects [out, in] layout — init on transposed view
+            # kaiming_uniform_ expects [out, in] layout
             w_t = self.weight.data[c].t()  # [out_features, in_features] view
             nn.init.kaiming_uniform_(w_t, a=math.sqrt(5))
         if self.bias is not None:
@@ -66,55 +65,76 @@ class GroupedLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         # x: [..., C, in_features] -> [..., C, out_features]
         lead = x.shape[:-2]
-        x_3d = x.reshape(-1, self.C, self.in_features)   # [B0, C, in]
-        x_3d = x_3d.transpose(0, 1)                       # [C, B0, in]
-        out = torch.bmm(x_3d, self.weight)                 # [C, B0, out] — no weight.T
-        out = out.transpose(0, 1)                          # [B0, C, out]
+        x_3d = x.reshape(-1, self.C, self.in_features)    # [B0, C, in]
+        x_3d = x_3d.transpose(0, 1)                        # [C, B0, in]
+        out = torch.bmm(x_3d, self.weight)                  # [C, B0, out]
+        out = out.transpose(0, 1)                           # [B0, C, out]
         out = out.reshape(*lead, self.C, self.out_features)
         if self.bias is not None:
             out = out + self.bias
         return out
 
 
-class CrossPassPCM(nn.Module):
-    """Cross-pass predictive coding.
+class WithinScanPCM(nn.Module):
+    """Within-scan predictive coding.
 
-    Predicts what each token's encoding will look like next pass.
-    Surprise = how much memory update changed understanding.
+    Predicts next token's encoding from current scan state.
+    Surprise = z_hat_{t-1} - z_t (vector, D_col dims).
+
+    Per-column via grouped ops.
     """
 
-    def __init__(self, C: int, D_col: int, D_pcm: int):
+    def __init__(self, C: int, D_col: int):
         super().__init__()
         self.C = C
         self.D_col = D_col
-        self.D_pcm = D_pcm
-        self.inv_sqrt_D = 1.0 / math.sqrt(D_pcm)
 
-        self.encoder_norm = GroupedLayerNorm(C, D_col)
-        self.encoder = GroupedLinear(C, D_col, D_pcm)
-        self.hyp_up = GroupedLinear(C, D_pcm, D_pcm * 2)
-        self.hyp_down = GroupedLinear(C, D_pcm * 2, D_pcm)
+        self.W_enc = GroupedLinear(C, D_col, D_col)
+        self.W_pcm = GroupedLinear(C, D_col, D_col)
+        self.W_gain = GroupedLinear(C, D_col, D_col)
 
-    def encode(self, x_col: Tensor) -> Tensor:
-        """x_col: [BS,N,C,D_col] -> z: [BS,N,C,D_pcm]"""
-        return self.encoder(self.encoder_norm(x_col))
+        # Zero-init W_gain so gain starts at 1.0
+        nn.init.zeros_(self.W_gain.weight)
+        if self.W_gain.bias is not None:
+            nn.init.zeros_(self.W_gain.bias)
 
-    def predict(self, z: Tensor) -> Tensor:
-        """z: [BS,N,C,D_pcm] -> z_hat: [BS,N,C,D_pcm]"""
-        return self.hyp_down(F.gelu(self.hyp_up(z)))
+    def compute_surprise(self, H: Tensor, x_col: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute vector surprise and PCM prediction.
 
-    def compute_surprise(self, z: Tensor, z_hat_prev: Tensor | None):
-        """Returns (surprise [BS,N,C], delta [BS,N,C,D_pcm])"""
-        if z_hat_prev is None:
-            surprise = torch.zeros(
-                z.shape[:-1], device=z.device, dtype=z.dtype
-            )
-            delta = torch.zeros_like(z)
-            return surprise, delta
-        delta = z - z_hat_prev.detach()
-        surprise = delta.norm(dim=-1) * self.inv_sqrt_D
-        return surprise, delta
+        Args:
+            H: [BS, N, C, D_col] — scan hidden states
+            x_col: [BS, N, C, D_col] — column input (pre-scan)
 
-    def prediction_loss(self, z_hat: Tensor, z_next: Tensor) -> Tensor:
-        """L_pred = MSE(z_hat, z_next.detach()) averaged."""
-        return F.mse_loss(z_hat, z_next.detach())
+        Returns:
+            surprise: [BS, N, C, D_col] — vector surprise (zero at position 0)
+            z_hat: [BS, N, C, D_col] — prediction for next token
+            z: [BS, N, C, D_col] — encoding of current token
+        """
+        z = self.W_enc(x_col)       # [BS, N, C, D_col]
+        z_hat = self.W_pcm(H)       # [BS, N, C, D_col]
+
+        # surprise_t = z_hat_{t-1} - z_t (shifted comparison)
+        surprise = torch.zeros_like(z)
+        surprise[:, 1:] = z_hat[:, :-1] - z[:, 1:]
+
+        return surprise, z_hat, z
+
+    def apply_gain(self, H: Tensor, surprise: Tensor) -> Tensor:
+        """PCM gain modulation: bounded [0.9, 1.1].
+
+        Args:
+            H: [BS, N, C, D_col] — scan hidden states
+            surprise: [BS, N, C, D_col] — vector surprise
+
+        Returns:
+            H_mod: [BS, N, C, D_col] — gain-modulated states
+        """
+        gain = 1.0 + 0.1 * torch.tanh(self.W_gain(surprise))
+        return H * gain
+
+    def prediction_loss(self, z_hat: Tensor, z: Tensor) -> Tensor:
+        """Auxiliary prediction loss: MSE(z_hat_t, z_{t+1}.detach()).
+
+        Uses shifted comparison: z_hat[:, :-1] vs z[:, 1:].
+        """
+        return F.mse_loss(z_hat[:, :-1], z[:, 1:].detach())

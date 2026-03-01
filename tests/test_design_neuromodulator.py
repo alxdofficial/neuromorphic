@@ -1,43 +1,36 @@
-"""Neuromodulator behavior tests (v4)."""
+"""Neuromodulator behavior tests (v5) — EMNeuromodulator only."""
 
 import pytest
 import torch
-from tests.conftest import make_tiny_config
 
-from src.model.procedural_memory import PMNeuromodulator
 from src.model.episodic_memory import EMNeuromodulator
 
 
 BS = 2
 
 
-class TestPMNeuromodulatorBehavior:
-    def test_differentiable(self):
-        cfg = make_tiny_config()
-        neuromod = PMNeuromodulator(cfg.D, cfg)
-
-        elig = torch.randn(BS, requires_grad=True)
-        usage = torch.randn(BS, requires_grad=True)
-        g, slot_logits, tau, ww = neuromod(elig, usage)
-
-        loss = g.sum() + slot_logits.sum() + tau.sum() + ww.sum()
-        loss.backward()
-
-        assert elig.grad is not None
-        assert usage.grad is not None
-
-
 class TestEMNeuromodulatorBehavior:
     def test_differentiable(self):
-        cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg.D, cfg)
+        neuromod = EMNeuromodulator(hidden=8)
 
         novelty = torch.randn(BS, requires_grad=True)
         usage = torch.randn(BS, requires_grad=True)
-        g_em, tau, decay, ww = neuromod(novelty, usage)
+        g = neuromod(novelty, usage)
 
-        loss = g_em.sum() + tau.sum() + decay.sum() + ww.sum()
+        loss = g.sum()
         loss.backward()
 
         assert novelty.grad is not None
         assert usage.grad is not None
+
+    def test_g_bounded(self):
+        neuromod = EMNeuromodulator(hidden=8)
+        g = neuromod(torch.rand(BS), torch.rand(BS))
+        assert (g >= 0.001).all()
+        assert (g <= 0.95).all()
+
+    def test_custom_bounds(self):
+        neuromod = EMNeuromodulator(hidden=8, g_floor=0.01, g_ceil=0.5)
+        g = neuromod(torch.rand(BS), torch.rand(BS))
+        assert (g >= 0.01).all()
+        assert (g <= 0.5).all()

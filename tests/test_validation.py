@@ -1,4 +1,4 @@
-"""Unit tests for validation loop (v4)."""
+"""Unit tests for validation loop (v5)."""
 
 import pytest
 import torch
@@ -58,7 +58,7 @@ class TestValidation:
         model.detach_states()
 
         # Snapshot PM state before validation
-        pm_K_before = model.pm.pm_K.clone()
+        pm_bias_before = model.pm.pm_bias.clone()
 
         dataloader = _make_val_batches(cfg)
         evaluate_validation(
@@ -70,7 +70,7 @@ class TestValidation:
         )
 
         # PM state should be restored
-        assert torch.equal(model.pm.pm_K, pm_K_before)
+        assert torch.equal(model.pm.pm_bias, pm_bias_before)
 
     def test_validation_ablation(self):
         """Should work with pm/em disabled."""

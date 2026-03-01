@@ -7,12 +7,9 @@ Usage:
 Outputs to snapshot_dir/:
     config.json         — model configuration
     param_summary.json  — per-parameter name, shape, norm, grad_norm
-    gate_weights.pt     — gate_a/gate_b weight matrices per layer
     embedding_norms.pt  — per-token embedding norms
-    pm_state/           — pm_K, pm_V, pm_a per block/layer
-    em_state/           — em_K, em_V, em_S per block
-    wm_state.pt         — wm_K, wm_V, wm_valid, wm_ptr
-    hidden_states.pt    — per-layer h tensors
+    pm_state/           — pm_bias
+    em_state/           — em_K, em_V, em_S, em_age
 """
 
 import json
@@ -85,15 +82,15 @@ def main():
         json.dump(param_summary, f, indent=2)
     print(f"  param_summary.json ({len(param_summary)} params)")
 
-    # 3. Gate weights
-    gate_tensors = {}
+    # 3. Scan layer weights (proj_in contains decay/gate parameters)
+    scan_tensors = {}
     for name, tensor in state_dict.items():
-        if "gate_a" in name or "gate_b" in name or "gate_ab" in name:
-            gate_tensors[name] = tensor
-    if gate_tensors:
-        gate_path = os.path.join(output_dir, "gate_weights.pt")
-        torch.save(gate_tensors, gate_path)
-        print(f"  gate_weights.pt ({len(gate_tensors)} tensors)")
+        if "stage1." in name or "stage3." in name:
+            scan_tensors[name] = tensor
+    if scan_tensors:
+        scan_path = os.path.join(output_dir, "scan_weights.pt")
+        torch.save(scan_tensors, scan_path)
+        print(f"  scan_weights.pt ({len(scan_tensors)} tensors)")
 
     # 4. Embedding norms
     emb_keys = [k for k in state_dict if "embedding" in k and "weight" in k]
@@ -110,13 +107,13 @@ def main():
     pm_tensors = {}
     if model is not None:
         pm = model.pm
-        for k in ["pm_K", "pm_V", "pm_a"]:
+        for k in ["pm_bias"]:
             t = getattr(pm, k, None)
             if t is not None:
                 pm_tensors[f"pm.{k}"] = t.detach().cpu()
     else:
         for name, tensor in state_dict.items():
-            if any(k in name for k in ["pm_K", "pm_V", "pm_a"]):
+            if "pm_bias" in name:
                 pm_tensors[name] = tensor
     if pm_tensors:
         torch.save(pm_tensors, os.path.join(pm_dir, "pm_all.pt"))
@@ -128,21 +125,17 @@ def main():
     em_tensors = {}
     if model is not None:
         em = model.em
-        for k in ["em_K", "em_V", "em_S"]:
+        for k in ["em_K", "em_V", "em_S", "em_age"]:
             t = getattr(em, k, None)
             if t is not None:
                 em_tensors[f"em.{k}"] = t.detach().cpu()
     else:
         for name, tensor in state_dict.items():
-            if any(k in name for k in ["em_K", "em_V", "em_S"]):
+            if any(k in name for k in ["em_K", "em_V", "em_S", "em_age"]):
                 em_tensors[name] = tensor
     if em_tensors:
         torch.save(em_tensors, os.path.join(em_dir, "em_all.pt"))
         print(f"  em_state/ ({len(em_tensors)} tensors)")
-
-    # 7. WM state (removed in v4)
-
-    # 8. Hidden states (v4: no per-layer hidden states)
 
     print(f"\nSnapshot saved to: {output_dir}")
 

@@ -1,5 +1,5 @@
 """
-Loss utilities for neuromorphic LM training (v4).
+Loss utilities for neuromorphic LM training (v5).
 
 Online cross-entropy (never materializes [BS, T, vocab]) and regularizers.
 """
@@ -81,41 +81,8 @@ def compute_loss_and_surprise(
     return loss, valid_count, token_surprise
 
 
-def fitb_cross_entropy(per_pass_logits: list[Tensor], targets: Tensor,
-                       fitb_mask: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-pass CE over FITB positions. Sum-reduced across passes.
-
-    Args:
-        per_pass_logits: list of R tensors [BS, N, vocab]
-        targets: [BS, N] — original (unmasked) token IDs
-        fitb_mask: [BS, N] bool — True at masked positions
-
-    Returns:
-        total_loss: scalar — sum of CE over all passes and masked positions
-        total_valid: scalar tensor — total valid predictions (R * num_masked)
-    """
-    device = targets.device
-    total_loss = torch.tensor(0.0, device=device)
-    total_valid = torch.tensor(0, device=device, dtype=torch.long)
-
-    flat_mask = fitb_mask.reshape(-1)
-    flat_targets = targets.reshape(-1).clone()
-    flat_targets[~flat_mask] = -100
-
-    for logits_r in per_pass_logits:
-        BS_N, V = logits_r.reshape(-1, logits_r.shape[-1]).shape
-        loss_r = F.cross_entropy(
-            logits_r.reshape(-1, V), flat_targets,
-            ignore_index=-100, reduction="sum",
-        )
-        total_loss = total_loss + loss_r
-        total_valid = total_valid + flat_mask.sum()
-
-    return total_loss, total_valid
-
-
 def compute_regularizers(model) -> Tensor:
-    """Compute PM budget penalty, EM budget penalty.
+    """Compute PM bias norm penalty, EM budget penalty.
 
     Returns scalar regularization loss.
     """
@@ -123,15 +90,16 @@ def compute_regularizers(model) -> Tensor:
 
     if model.config.pm_enabled:
         pm = model.pm
-        if pm.pm_a is not None:
-            usage = pm.pm_a.sum(dim=-1)  # [BS*B]
-            excess = F.relu(usage - model.config.budget_pm * 0.9)
+        if pm.pm_bias is not None:
+            # Penalize large PM bias norms
+            bias_norm = pm.pm_bias.norm(dim=-1)  # [BS, B]
+            excess = F.relu(bias_norm - model.config.budget_pm * 0.9)
             reg = reg + excess.mean() * 0.01
 
     if model.config.em_enabled:
         em = model.em
         if em.em_S is not None:
-            usage = em.em_S.sum(dim=-1)  # [BS*B]
+            usage = em.em_S.sum(dim=-1)  # [BS, B]
             excess = F.relu(usage - model.config.budget_em * 0.9)
             reg = reg + excess.mean() * 0.01
 

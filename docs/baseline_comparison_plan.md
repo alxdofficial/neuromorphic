@@ -1,8 +1,12 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM (v4), iterative refinement with cortical columns, Procedural Memory (PM), Episodic Memory (EM), and cross-pass predictive coding (PCM). Three tiers: Tier A (~100M, D=768) for RTX 4090 development, Tier B (~400M, D=1536) for research, and Tier C (~1.05B, D=2048) for cloud GPU training.
+**Target model:** Neuromorphic LM (v5), scan-memory-scan architecture with cortical columns, Procedural Memory (PM), Episodic Memory (EM), and within-scan predictive coding (PCM). Three tiers: Tier A (~100M) for RTX 4090 development, Tier B (~400M) for research, and Tier C (~1B) for cloud GPU training. NTP training objective (causal scan), affine scan backbone. See `architecture_v4_iterative_memory_scan.md` for the current v5 design.
 
-**Date:** 2026-02-23
+**Date:** 2026-02-28 (updated from 2026-02-23)
+
+> **Note:** Evaluation methodology below is architecture-agnostic and applies to v5.
+> Key change from v4: model now uses NTP (not FITB), causal scans (not R-loop),
+> and Mamba is the primary structural baseline (shared scan backbone).
 
 ---
 
@@ -386,7 +390,7 @@ Input:  a b c d e [SEP] ?
 Target: a b c d e
 ```
 
-**Why critical:** Tests raw memory capacity. Our EM (top-k retrieval with cross-attention) and PM (holographic read) should provide copying ability via memory persistence. Mamba and pure recurrent models struggle with this.
+**Why critical:** Tests raw memory capacity. Our EM (trail-based composition) and PM (bias-vector gain modulation) should provide copying ability via memory persistence. Mamba and pure recurrent models struggle with this.
 
 **Protocol:**
 - Vary copy length (32, 64, 128, 256, 512)
@@ -399,7 +403,7 @@ Target: a b c d e
 
 **Setup:** A B ... A ? (model should output B, pattern completion)
 
-**Why critical:** Tests the formation of induction-head-like circuits. PM should be able to store A→B associations; EM can retrieve the specific episode. The question is whether iterative refinement + memory can match transformer induction heads.
+**Why critical:** Tests the formation of induction-head-like circuits. PM should be able to store A→B associations via bias accumulation; EM can retrieve the specific episode via trail-based composition. The question is whether scan + memory can match transformer induction heads.
 
 **Source:** Olsson et al., "In-context Learning and Induction Heads," Transformer Circuits, 2022.
 
@@ -491,12 +495,11 @@ These are not benchmarks but diagnostic analyses to include in the paper:
 
 | Analysis | What it shows |
 |----------|--------------|
-| PM slot activation heatmap | Which PM slots are active, how activation distributes across blocks |
-| PM commit rate over training | How often and where PM commits happen |
+| PM bias norm over training | How PM bias evolves across training |
+| PM lr_pm effective rate | Learning rate adaptation for surprise-driven updates |
 | EM write rate and novelty distribution | Whether EM learns to be selective |
-| EM retrieval similarity histogram | Quality of EM retrievals |
-| PCM surprise distribution over passes | How surprise modulates refinement |
-| Cross-pass representation change | How much representations evolve across R passes |
+| EM trail composition quality | Quality of trail-based memory reads |
+| PCM surprise distribution | How surprise drives write signals |
 | Memory state norm trajectories | Stability of PM/EM state over long sequences |
 
 ---
@@ -512,11 +515,11 @@ The most important experiments for proving the architecture works. Each ablation
 | Ablation | Config change | What it tests |
 |----------|--------------|---------------|
 | **Full model** | All enabled | Baseline |
-| **No PM** | `pm_enabled=False` (zero pm_a) | Value of procedural memory |
-| **No EM** | `em_enabled=False` (skip retrieval/writes) | Value of episodic memory |
-| **No PM + No EM** | Both off | Value of memory systems vs bare columns |
-| **No PCM** | `pcm_enabled=False` | Value of cross-pass predictive coding |
-| **No Surprise Modulation** | Fixed surprise=1.0 | Value of neuromodulation |
+| **No PM** | `pm_enabled=False` (zero pm_bias) | Value of procedural memory |
+| **No EM** | `em_enabled=False` (skip trail reads/writes) | Value of episodic memory |
+| **No PM + No EM** | Both off | Value of memory systems vs bare scans |
+| **No PCM** | `pcm_enabled=False` | Value of within-scan predictive coding |
+| **No Surprise Modulation** | Fixed surprise=0 | Value of neuromodulation |
 
 **Protocol for each ablation:**
 - Train from scratch with identical data, hyperparameters, and random seed
@@ -528,12 +531,12 @@ The most important experiments for proving the architecture works. Each ablation
 
 | Ablation | Config change | What it tests |
 |----------|--------------|---------------|
-| PM r=2 | Reduce PM slots | PM capacity sensitivity |
-| PM r=16 | Increase PM slots | Scaling returns |
-| EM M=32 | Reduce EM capacity | EM capacity sensitivity |
-| EM M=256 | Increase EM capacity | Scaling returns |
-| R=2 | Fewer refinement passes | Depth/compute tradeoff |
-| R=6 | More refinement passes | Scaling returns |
+| EM M=32 | Reduce EM primitives | EM capacity sensitivity |
+| EM M=256 | Increase EM primitives | Scaling returns |
+| L_scan=6 | Fewer scan layers per stage | Depth/compute tradeoff |
+| L_scan=18 | More scan layers per stage | Scaling returns |
+| B=2 | Fewer memory banks | Bank specialization value |
+| B=8 | More memory banks | Scaling returns |
 
 #### 7.1.3 Phase-Wise Ablations (Neuromodulation)
 

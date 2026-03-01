@@ -25,7 +25,7 @@ from typing import Any
 
 from .model import ModelConfig, NeuromorphicLM
 from .model.state import save_runtime_state, load_runtime_state
-from .data import PHASE_CONFIGS, create_dataloader, get_special_token_ids, get_tokenizer, add_fitb_tokens
+from .data import PHASE_CONFIGS, create_dataloader, get_special_token_ids, get_tokenizer
 from .training import TBPTTTrainer, evaluate_validation
 from .debug import MetricsCollector
 
@@ -567,12 +567,6 @@ def run_phase(
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     config.eot_id = eot_id
 
-    # FITB token IDs (always set — mask_rate controls whether FITB is active)
-    fitb_vocab = tokenizer.get_vocab()
-    if "<FITB>" in fitb_vocab:
-        config.fitb_id = fitb_vocab["<FITB>"]
-        config.null_id = fitb_vocab["<NULL>"]
-
     train_data_phase = _resolve_data_phase(phase_name, settings.get("data_phase", DATA_PHASE))
     val_data_phase = _resolve_data_phase(phase_name, settings.get("val_data_phase", VAL_DATA_PHASE))
     tokens_per_step = bs * config.T
@@ -582,7 +576,7 @@ def run_phase(
     target_tokens = max_steps_total * tokens_per_step
 
     print(f"Tier: {tier.upper()} | Phase: {phase_name} | "
-          f"D={config.D}, R={config.R}, B_blocks={config.B_blocks}, C={config.C}, D_col={config.D_col}")
+          f"D={config.D}, B={config.B}, C={config.C}, D_col={config.D_col}, L_scan={config.L_scan}")
     print(f"BS={bs}, T={config.T}, N={config.N}, K_segments={config.K_segments}")
     print(f"PM={config.pm_enabled}, EM={config.em_enabled}")
     print(
@@ -641,7 +635,7 @@ def run_phase(
         print(f"Resuming from {resume_path}")
         if ckpt is None:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        # Handle vocab size mismatch (e.g. FITB tokens added after checkpoint).
+        # Handle vocab size mismatch (e.g. tokenizer changed after checkpoint).
         # Pop mismatched embedding/lm_head keys from state dict so
         # load_state_dict doesn't raise on shape mismatch, then manually
         # copy the overlapping rows into the (already correctly-sized) model.
@@ -1069,12 +1063,10 @@ def main():
     print(f"Device: {device}")
 
     tokenizer = get_tokenizer(settings["tokenizer"])
-    fitb_ids = add_fitb_tokens(tokenizer)
     special_ids = get_special_token_ids(tokenizer)
     vocab_size = len(tokenizer)
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     print(f"Tokenizer: {settings['tokenizer']} (vocab={vocab_size}, eot={eot_id})")
-    print(f"FITB tokens: fitb_id={fitb_ids['fitb_id']}, null_id={fitb_ids['null_id']}")
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     tier = str(settings["tier"]).lower()

@@ -1,10 +1,9 @@
 """
-Episodic Memory (v4) — fixed-size per-stream vector store.
+Episodic Memory (v5) — trail-based primitive dictionary.
 
-Single instance (batched across B_blocks via BS,B dims).
-Operates in D space (block level: C columns concatenated).
-Read: top-k retrieval (direct dot-product, no projections).
-Write: novelty-scored EMA.
+Single instance (batched across B banks via BS,B dims).
+Read: trail-based composition (seed navigates primitive space).
+Write: novelty-scored soft-routing decomposition with neuromodulated EMA.
 """
 
 import torch
@@ -12,30 +11,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import ModelConfig
 from .utils import StateMixin, unit_normalize, budget_enforce
 
 
 class EpisodicMemory(nn.Module, StateMixin):
-    """Fixed-size episodic memory with top-k retrieval and novelty-based writes.
+    """EM primitive dictionary with trail-based read and soft-routing write.
 
-    State (with explicit B dim):
-        em_K: [BS, B, M, D] — keys (unit-normalized)
-        em_V: [BS, B, M, D] — values
-        em_S: [BS, B, M] — strengths (bounded)
-        em_age: [BS, B, M] — tokens since last write
+    State:
+        em_K: [BS, B, M, D] — primitive keys (unit-normalized)
+        em_V: [BS, B, M, D] — primitive values
+        em_S: [BS, B, M] — strengths (0 = inactive)
+        em_age: [BS, B, M] — segments since last write
     """
 
     _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
 
-    def __init__(self, dim: int, M_slots: int, config: ModelConfig):
+    def __init__(self, B: int, M: int, D: int, n_steps: int = 2,
+                 S_max: float = 3.0, budget: float = 32.0,
+                 decay: float = 0.999):
         super().__init__()
-        self.dim = dim
-        self.M = M_slots
-        self.k_ret = config.k_ret
-        self.S_max = config.S_max
-        self.budget = config.budget_em
-        self.B = config.B_blocks
+        self.B = B
+        self.M = M
+        self.D = D
+        self.n_steps = n_steps
+        self.S_max = S_max
+        self.budget = budget
+        self.decay = decay
+
+        # Trail parameters (per bank)
+        self.w1 = nn.Parameter(torch.randn(B, D) * 0.02)
+        self.w2 = nn.Parameter(torch.randn(B, D) * 0.02)
+        self.gate_bias = nn.Parameter(torch.zeros(B, D))
+        self.raw_tau = nn.Parameter(torch.zeros(B))        # softplus -> temperature
+        self.raw_sigma = nn.Parameter(torch.full([B], -2.0))  # softplus -> noise std
+        self.raw_tau_w = nn.Parameter(torch.zeros(B))      # write temperature
 
         # State (lazily allocated)
         self.em_K: Tensor | None = None
@@ -44,221 +53,189 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_age: Tensor | None = None
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
-        self.em_K = torch.zeros(BS, self.B, self.M, self.dim, device=device, dtype=dtype)
-        self.em_V = torch.zeros(BS, self.B, self.M, self.dim, device=device, dtype=dtype)
+        """Pre-allocate state tensors."""
+        self.em_K = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
+        self.em_V = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
         self.em_S = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
         self.em_age = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.em_K is not None
 
-    def read(self, q: Tensor) -> Tensor:
-        """Top-k retrieval (gather-free, no projections).
+    def trail_read(self, seed: Tensor, b: int) -> Tensor:
+        """Trail-based read: seed navigates primitive space.
 
-        q: [BS, N, B, D] -> [BS, N, B, D]
+        Args:
+            seed: [BS, N, D] — trail starting point
+            b: bank index
+
+        Returns:
+            y_em: [BS, N, D] — net memory contribution (y - seed)
         """
-        BS, N, B, D = q.shape
+        s = seed  # [BS, N, D]
+        if self.training:
+            sigma = F.softplus(self.raw_sigma[b])
+            s = s + sigma * torch.randn_like(s)
 
-        # Dense scores via batched matmul (strided views, no copy)
-        q_bn = q.transpose(1, 2)                                   # [BS, B, N, D]
-        scores = torch.matmul(q_bn, self.em_K.transpose(-1, -2))   # [BS, B, N, M]
-        scores = scores.transpose(1, 2)                             # [BS, N, B, M]
+        y = s
+        tau = F.softplus(self.raw_tau[b]) + 0.1
 
-        # Mask inactive slots
-        active_mask = (self.em_S > 0)[:, None, :, :]  # [BS, 1, B, M]
-        scores = scores.masked_fill(~active_mask, -1e9)
+        # Check if any primitives are active (avoid NaN from softmax over all -inf)
+        any_active = (self.em_S[:, b] > 0).any(dim=-1)  # [BS]
+        if not any_active.any():
+            return torch.zeros_like(seed)
 
-        # Top-k mask (gather-free)
-        k = min(self.k_ret, self.M)
-        topk_vals, _ = scores.topk(k, dim=-1)           # [BS, N, B, k]
-        threshold = topk_vals[..., -1:].detach()         # [BS, N, B, 1]
-        topk_mask = scores >= threshold                  # [BS, N, B, M]
+        for step in range(self.n_steps):
+            # Score all primitives: [BS, N, D] @ [BS, M, D].T -> [BS, N, M]
+            scores = torch.matmul(y, self.em_K[:, b].transpose(-2, -1)) / tau
+            # Mask inactive primitives
+            active = (self.em_S[:, b] > 0).unsqueeze(1)  # [BS, 1, M]
+            scores = scores.masked_fill(~active, float('-inf'))
+            attn = F.softmax(scores, dim=-1)               # [BS, N, M]
+            # Replace NaN from all-inactive rows with zeros
+            attn = attn.nan_to_num(0.0)
+            delta = torch.matmul(attn, self.em_V[:, b])    # [BS, N, D]
 
-        # Masked softmax attention (bf16 — M is small)
-        attn_logits = scores.masked_fill(~topk_mask, -1e9)
-        attn_weights = F.softmax(attn_logits, dim=-1)    # [BS, N, B, M]
+            # Element-wise gate (no matmul — O(D) not O(D^2))
+            gate = torch.sigmoid(self.w1[b] * y + self.w2[b] * delta + self.gate_bias[b])
+            y = y + gate * delta
 
-        # Weighted sum via batched matmul (strided views, no copy)
-        attn_bn = attn_weights.transpose(1, 2)                     # [BS, B, N, M]
-        out = torch.matmul(attn_bn, self.em_V)                     # [BS, B, N, D]
-        out = out.transpose(1, 2)                                   # [BS, N, B, D]
+        return y - s  # [BS, N, D]
 
-        return out
+    def compute_novelty(
+        self, w_cand: Tensor, surprise: Tensor, b: int,
+        w_nov: Tensor | None = None,
+    ) -> Tensor:
+        """Compute novelty score for bank b.
 
-    def read_sliced(self, q: Tensor) -> Tensor:
-        """Top-k retrieval with per-column D_col slices.
+        Novelty = w_nov * ||surprise|| + (1 - w_nov) * recon_error.
 
-        q: [BS, N_C, B, C, D_col] -> [BS, N_C, B, C, D_col]
+        Args:
+            w_cand: [BS, N, D] — write candidates
+            surprise: [BS, N, D] — vector surprise
+            b: bank index
+            w_nov: [BS, N] — learned blend weight ∈ [0,1] (default: 0.5)
 
-        EM state [BS, B, M, D] is viewed as [BS, B, M, C, D_col] and
-        retrieval operates independently per column at D_col width.
+        Returns:
+            novelty: [BS, N] — scalar novelty per token
         """
-        BS, N_C, B, C, D_col = q.shape
+        tau = F.softplus(self.raw_tau[b]) + 0.1
 
-        # View state as [BS, B, M, C, D_col] -> permute to [BS, B, C, M, D_col]
-        K = self.em_K.view(BS, B, self.M, C, D_col).permute(0, 1, 3, 2, 4)
-        V = self.em_V.view(BS, B, self.M, C, D_col).permute(0, 1, 3, 2, 4)
+        # Reconstruction error: how well can existing primitives explain w_cand?
+        w_norm = unit_normalize(w_cand)
+        scores = torch.matmul(w_norm, self.em_K[:, b].transpose(-2, -1)) / tau
+        active = (self.em_S[:, b] > 0).unsqueeze(1)
+        scores = scores.masked_fill(~active, float('-inf'))
+        attn = F.softmax(scores, dim=-1)                   # [BS, N, M]
+        attn = attn.nan_to_num(0.0)  # handle empty memory
+        reconstruction = torch.matmul(attn, self.em_V[:, b])  # [BS, N, D]
+        recon_error = (w_cand - reconstruction).norm(dim=-1)   # [BS, N]
 
-        # Query: [BS, N_C, B, C, D_col] -> [BS, B, C, N_C, D_col]
-        q_r = q.permute(0, 2, 3, 1, 4)
+        # Surprise magnitude
+        surp_mag = surprise.norm(dim=-1)  # [BS, N]
 
-        # Scores: [BS, B, C, N_C, D_col] @ [BS, B, C, D_col, M] -> [BS, B, C, N_C, M]
-        scores = torch.matmul(q_r, K.transpose(-1, -2))
-
-        # Mask inactive slots: em_S [BS, B, M] -> [BS, B, 1, 1, M]
-        active_mask = (self.em_S > 0)[:, :, None, None, :]
-        scores = scores.masked_fill(~active_mask, -1e9)
-
-        # Top-k mask (gather-free)
-        k = min(self.k_ret, self.M)
-        topk_vals, _ = scores.topk(k, dim=-1)           # [BS, B, C, N_C, k]
-        threshold = topk_vals[..., -1:].detach()         # [BS, B, C, N_C, 1]
-        topk_mask = scores >= threshold                  # [BS, B, C, N_C, M]
-
-        # Masked softmax attention
-        attn_logits = scores.masked_fill(~topk_mask, -1e9)
-        attn_weights = F.softmax(attn_logits, dim=-1)    # [BS, B, C, N_C, M]
-
-        # Weighted sum: [BS, B, C, N_C, M] @ [BS, B, C, M, D_col] -> [BS, B, C, N_C, D_col]
-        out = torch.matmul(attn_weights, V)
-
-        # Back to [BS, N_C, B, C, D_col]
-        return out.permute(0, 3, 1, 2, 4)
-
-    def score_novelty(self, q_nov: Tensor, surprise: Tensor, w_nov: Tensor) -> Tensor:
-        """Score novelty for candidate selection.
-
-        q_nov: [BS, N, B, D], surprise: [BS, N, B], w_nov: [BS, N, B]
-        Returns: novelty [BS, N, B]
-        """
-        # Max cosine similarity against em_K via batched matmul (no copy)
-        q_bn = q_nov.transpose(1, 2)                               # [BS, B, N, D]
-        sim = torch.matmul(q_bn, self.em_K.transpose(-1, -2))      # [BS, B, N, M]
-        sim = sim.transpose(1, 2)                                   # [BS, N, B, M]
-
-        active_mask = (self.em_S > 0)[:, None, :, :]  # [BS, 1, B, M]
-        sim = sim.masked_fill(~active_mask, -1.0)
-        max_sim = sim.max(dim=-1).values.clamp(min=0.0)  # [BS, N, B]
-
-        novelty = w_nov * surprise + (1 - w_nov) * (1 - max_sim)
+        # Learned blend (defaults to 0.5 if w_nov not provided)
+        if w_nov is None:
+            w_nov = 0.5
+        novelty = w_nov * surp_mag + (1 - w_nov) * recon_error
         return novelty
 
-    def select_top_candidates(self, q_nov: Tensor, v_nov: Tensor,
-                               novelty: Tensor, C_cand: int):
-        """Select top-C_cand candidates across all N positions per (BS, B).
+    def compute_write_deltas(self, novelty: Tensor, w_cand: Tensor) -> Tensor:
+        """Per-token EM write delta: novelty * w_cand.
 
-        q_nov, v_nov: [BS, N, B, D]
-        novelty: [BS, N, B]
-        Returns: (cand_K, cand_V, cand_scores) each [BS, B, C_cand, D] or [BS, B, C_cand]
+        Args:
+            novelty: [BS, N] — scalar novelty per token
+            w_cand: [BS, N, D] — write candidates
+
+        Returns:
+            delta_em: [BS, N, D] — per-token write delta
         """
-        BS, N, B, D = q_nov.shape
+        return novelty.unsqueeze(-1) * w_cand  # [BS, N, D]
 
-        # Permute novelty to [BS, B, N]
-        nov_flat = novelty.permute(0, 2, 1)  # [BS, B, N]
+    def commit(self, w_cand: Tensor, novelty: Tensor, g_em: Tensor, b: int):
+        """Segment-end structured write for bank b.
 
-        C_cand = min(C_cand, N)
-        topk_scores, topk_idx = nov_flat.topk(C_cand, dim=-1)  # [BS, B, C_cand]
+        Soft routing -> aggregate -> neuromodulated EMA.
 
-        # Gather via torch.gather (compile-friendly, no advanced indexing)
-        # Permute to [BS, B, N, D] so gather dim=2 selects positions
-        q_bn = q_nov.transpose(1, 2)  # [BS, B, N, D]
-        v_bn = v_nov.transpose(1, 2)  # [BS, B, N, D]
-        idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [BS, B, C_cand, D]
-        cand_K = torch.gather(q_bn, 2, idx_exp)  # [BS, B, C_cand, D]
-        cand_V = torch.gather(v_bn, 2, idx_exp)  # [BS, B, C_cand, D]
-
-        return cand_K, cand_V, topk_scores
-
-    def write(self, cand_K: Tensor, cand_V: Tensor, cand_scores: Tensor,
-              g_em: Tensor, tau: Tensor, ww: Tensor | None = None):
-        """Write candidates to EM via EMA.
-
-        cand_K: [BS, B, C_cand, D]
-        cand_V: [BS, B, C_cand, D]
-        cand_scores: [BS, B, C_cand]
-        g_em: [BS, B]
-        tau: [BS, B]
-        ww: [BS, B] — learned weakness weight (None falls back to 0.5)
+        Args:
+            w_cand: [BS, N, D] — write candidates
+            novelty: [BS, N] — novelty scores
+            g_em: [BS] — neuromodulated write gate
+            b: bank index
         """
-        BS, B, C_cand, D = cand_K.shape
+        tau_w = F.softplus(self.raw_tau_w[b]) + 0.1
 
-        # Score candidates against all slots via batched matmul (no copy)
-        cand_K_norm = unit_normalize(cand_K)
-        # [BS, B, C_cand, D] @ [BS, B, D, M] → [BS, B, C_cand, M]
-        slot_scores = torch.matmul(cand_K_norm, self.em_K.transpose(-1, -2))
+        # Soft routing: which primitives absorb this signal?
+        w_norm = unit_normalize(w_cand)
+        any_active = (self.em_S[:, b] > 0).any(dim=-1)  # [BS]
 
-        # Weakness bias: prefer weaker slots (learned weight)
-        weakness = -self.em_S.unsqueeze(2)  # [BS, B, 1, M]
-        if ww is not None:
-            slot_scores = slot_scores + ww.reshape(BS, B, 1, 1) * weakness
+        if any_active.any():
+            route_scores = torch.matmul(w_norm, self.em_K[:, b].transpose(-2, -1)) / tau_w
+            active = (self.em_S[:, b] > 0).unsqueeze(1)
+            route_scores = route_scores.masked_fill(~active, float('-inf'))
+            route = F.softmax(route_scores, dim=-1)  # [BS, N, M]
+            route = route.nan_to_num(1.0 / self.M)  # uniform for streams with no active
         else:
-            slot_scores = slot_scores + 0.5 * weakness
+            # No active primitives anywhere — use uniform routing
+            route = torch.full(
+                (w_cand.shape[0], w_cand.shape[1], self.M),
+                1.0 / self.M, device=w_cand.device, dtype=w_cand.dtype
+            )
 
-        # Softmax slot selection
-        slot_weights = F.softmax(
-            slot_scores / tau.reshape(BS, B, 1, 1).clamp(min=0.01), dim=-1
-        )  # [BS, B, C_cand, M]
+        # Aggregate across N tokens, weighted by novelty
+        # novelty: [BS, N] -> [BS, N, 1], route: [BS, N, M]
+        weighted_route = novelty.unsqueeze(-1) * route  # [BS, N, M]
+        route_agg = weighted_route.mean(dim=1)           # [BS, M]
 
-        # Write strength per candidate
-        cand_weight = cand_scores / (cand_scores.sum(dim=-1, keepdim=True) + 1e-8)
-        alpha = g_em.reshape(BS, B, 1, 1) * cand_weight.unsqueeze(-1) * slot_weights  # [BS, B, C_cand, M]
+        # Aggregated updates: [BS, M, D]
+        # [BS, M, N] @ [BS, N, D] -> [BS, M, D]
+        update_K = torch.bmm(weighted_route.transpose(1, 2), w_norm)
+        update_V = torch.bmm(weighted_route.transpose(1, 2), w_cand)
 
-        # Sum across candidates for each slot
-        alpha_per_slot = alpha.sum(dim=2)  # [BS, B, M]
+        # Normalize updates per primitive
+        denom = weighted_route.sum(dim=1).unsqueeze(-1).clamp(min=1e-8)  # [BS, M, 1]
+        update_K = update_K / denom
+        update_V = update_V / denom
 
-        # Weighted candidate blend per slot via batched matmul (no copy)
-        # [BS, B, C_cand, M] → transpose → [BS, B, M, C_cand] @ [BS, B, C_cand, D]
-        alpha_t = alpha.transpose(2, 3)                             # [BS, B, M, C_cand]
-        blended_K = torch.matmul(alpha_t, cand_K_norm)             # [BS, B, M, D]
-        blended_V = torch.matmul(alpha_t, cand_V)                  # [BS, B, M, D]
+        # Neuromodulated EMA: alpha = g_em * route_agg (per-primitive)
+        alpha = (g_em.unsqueeze(-1) * route_agg).clamp(max=1.0)  # [BS, M]
+        alpha_exp = alpha.unsqueeze(-1)  # [BS, M, 1]
 
-        # Normalize by alpha
-        denom = alpha_per_slot.unsqueeze(-1).clamp(min=1e-8)
-        blended_K = blended_K / denom
-        blended_V = blended_V / denom
+        # EMA update (reassignment for autograd)
+        new_K = self.em_K.clone()
+        new_V = self.em_V.clone()
+        new_S = self.em_S.clone()
+        new_age = self.em_age.clone()
 
-        # EMA update (em_K/V: reassignment required — saved for backward by em.read())
-        update_mask = (alpha_per_slot > 1e-8).unsqueeze(-1)  # [BS, B, M, 1]
-        alpha_exp = alpha_per_slot.unsqueeze(-1).clamp(max=1.0)
+        new_K[:, b] = (1 - alpha_exp) * self.em_K[:, b] + alpha_exp * unit_normalize(update_K)
+        new_V[:, b] = (1 - alpha_exp) * self.em_V[:, b] + alpha_exp * update_V
+        new_S[:, b] = (self.em_S[:, b] + alpha).clamp(0, self.S_max)
+        new_age[:, b] = self.em_age[:, b] * (1 - alpha)
 
-        new_K = (1 - alpha_exp) * self.em_K + alpha_exp * unit_normalize(blended_K)
-        new_V = (1 - alpha_exp) * self.em_V + alpha_exp * blended_V
+        self.em_K = new_K
+        self.em_V = new_V
+        self.em_S = new_S
+        self.em_age = new_age
 
-        self.em_K = torch.where(update_mask, new_K, self.em_K)
-        self.em_V = torch.where(update_mask, new_V, self.em_V)
+        # Budget enforcement
+        self.em_S = budget_enforce(self.em_S.view(-1, self.M), self.budget).view_as(self.em_S)
 
-        # Strength update (reassignment: alpha_per_slot carries grad through neuromod params)
-        self.em_S = (self.em_S + alpha_per_slot).clamp(0, self.S_max)
-
-        # Age reset for updated slots
-        self.em_age = self.em_age * (1 - alpha_per_slot)
-
-        # Budget enforcement (per-stream-per-block: last dim is M)
-        self.em_S = budget_enforce(self.em_S, self.budget)
-
-    def base_decay(self, decay: Tensor):
-        """Apply strength decay once per segment (called after R loop).
-
-        decay: [BS, B] — neuromodulated decay factor.
-        Must use reassignment: em_S is saved for backward by em.read().
-        """
+    def base_decay(self):
+        """Apply strength decay and age tick once per segment."""
         if self.em_S is not None:
-            self.em_S = self.em_S * decay.unsqueeze(-1)
-
-    def age_tick(self, n_tokens: int):
-        """Increment age of active slots."""
+            self.em_S = self.em_S * self.decay
         if self.em_age is not None:
             active = (self.em_S > 0).to(self.em_age.dtype)
-            self.em_age = self.em_age + n_tokens * active
+            self.em_age = self.em_age + active
+
+    def usage(self, b: int) -> Tensor:
+        """Usage fraction for bank b. Returns [BS]."""
+        if self.em_S is None:
+            return torch.tensor(0.0)
+        return self.em_S[:, b].sum(dim=-1)  # [BS]
 
     def reset_states(self, mask: Tensor):
-        """Full reset: zero S, age, K, and V for masked streams.
-
-        Clears K/V to prevent stale keys from influencing write() slot
-        selection via cosine similarity (Bug 4).
-
-        mask: [BS] bool.
-        """
+        """Full reset for masked streams. mask: [BS] bool."""
         if self.em_S is None:
             return
         expanded = mask[:, None, None]           # [BS, 1, 1]
@@ -270,97 +247,35 @@ class EpisodicMemory(nn.Module, StateMixin):
 
 
 class EMNeuromodulator(nn.Module):
-    """Neuromodulator for EM write decisions.
+    """Simplified neuromodulator for EM write decisions.
 
-    Returns: g_em [BSB], tau [BSB], decay [BSB], ww [BSB]
-    (operates on flattened BS*B vectors from model.py)
+    Takes novelty_mean and usage, produces g_em scalar per bank.
     """
 
-    def __init__(self, D_mem: int, config: ModelConfig):
+    def __init__(self, hidden: int = 32, g_floor: float = 0.001, g_ceil: float = 0.95):
         super().__init__()
-        self.em_enabled = config.em_enabled
-        self.default_g = config.g_em_default
-        self.default_tau = config.tau_em
-        self.default_decay = config.decay_em
-        self.default_ww = config.ww_em_default
-        self.g_em_floor = config.g_em_floor
-        self.g_em_ceil = config.g_em_ceil
-        self.tau_floor = config.tau_em_floor
-        self.tau_ceil = config.tau_em_ceil
-        self.ww_floor = config.ww_em_floor
-        self.ww_ceil = config.ww_em_ceil
-        self.decay_floor = config.decay_em_floor
-        self.decay_ceil = config.decay_em_ceil
+        self.g_floor = g_floor
+        self.g_ceil = g_ceil
 
-        if self.em_enabled:
-            H = config.neuromod_hidden
-            n_scalar = 2  # novelty_mean, em_usage
-            n_content = config.content_proj_dim
-            n_features = n_scalar + n_content
+        # Input: novelty_mean + usage = 2 features
+        self.backbone = nn.Sequential(
+            nn.Linear(2, hidden),
+            nn.ReLU(),
+        )
+        self.g_head = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.backbone[0].bias)
 
-            self.content_proj = nn.Linear(D_mem, n_content)
-            self.backbone = nn.Sequential(
-                nn.Linear(n_features, H),
-                nn.ReLU(),
-            )
-            self.g_head = nn.Linear(H, 1)
-            self.tau_head = nn.Linear(H, 1)
-            self.decay_head = nn.Linear(H, 1)
-            self.ww_head = nn.Linear(H, 1)
+    def forward(self, novelty_mean: Tensor, usage: Tensor) -> Tensor:
+        """Produce write gate g_em.
 
-            nn.init.zeros_(self.backbone[0].bias)
-            nn.init.normal_(self.content_proj.weight, std=0.01)
-            nn.init.zeros_(self.content_proj.bias)
+        Args:
+            novelty_mean: [BS] — mean novelty across tokens
+            usage: [BS] — EM usage (sum of strengths)
 
-            # Bias init: sigmoid(bias) = (default - floor) / (ceil - floor)
-            _ww_range = self.ww_ceil - self.ww_floor
-            if _ww_range > 0:
-                _target_sigmoid = (self.default_ww - self.ww_floor) / _ww_range
-                _target_sigmoid = max(1e-4, min(1 - 1e-4, _target_sigmoid))
-                import math
-                self.ww_head.bias.data.fill_(math.log(_target_sigmoid / (1 - _target_sigmoid)))
-
-    def forward(self, novelty_mean: Tensor, em_usage: Tensor,
-                content_emb: Tensor | None = None):
+        Returns:
+            g_em: [BS] — write gate ∈ [g_floor, g_ceil]
         """
-        novelty_mean: [BSB]
-        em_usage: [BSB]
-        content_emb: [BSB, D] (optional)
-
-        Returns: g_em [BSB], tau [BSB], decay [BSB], ww [BSB]
-        """
-        if not self.em_enabled:
-            BSB = novelty_mean.shape[0]
-            device = novelty_mean.device
-            return (
-                torch.full((BSB,), self.default_g, device=device),
-                torch.full((BSB,), self.default_tau, device=device),
-                torch.full((BSB,), self.default_decay, device=device),
-                torch.full((BSB,), self.default_ww, device=device),
-            )
-
-        features = [novelty_mean.unsqueeze(-1), em_usage.unsqueeze(-1)]
-        if content_emb is not None:
-            features.append(self.content_proj(content_emb))
-        else:
-            features.append(torch.zeros(
-                novelty_mean.shape[0], self.content_proj.out_features,
-                device=novelty_mean.device, dtype=novelty_mean.dtype,
-            ))
-
-        x = torch.cat(features, dim=-1)
-        h = self.backbone(x)
-
+        features = torch.stack([novelty_mean, usage], dim=-1)  # [BS, 2]
+        h = self.backbone(features)
         g_raw = self.g_head(h).squeeze(-1)
-        g_em = self.g_em_floor + (self.g_em_ceil - self.g_em_floor) * torch.sigmoid(g_raw)
-
-        tau_raw = self.tau_head(h).squeeze(-1)
-        tau = self.tau_floor + (self.tau_ceil - self.tau_floor) * torch.sigmoid(tau_raw)
-
-        decay_raw = self.decay_head(h).squeeze(-1)
-        decay = self.decay_floor + (self.decay_ceil - self.decay_floor) * torch.sigmoid(decay_raw)
-
-        ww_raw = self.ww_head(h).squeeze(-1)
-        ww = self.ww_floor + (self.ww_ceil - self.ww_floor) * torch.sigmoid(ww_raw)
-
-        return g_em, tau, decay, ww
+        return self.g_floor + (self.g_ceil - self.g_floor) * torch.sigmoid(g_raw)

@@ -1,4 +1,4 @@
-"""Episodic Memory tests (v4)."""
+"""Episodic Memory tests (v5) — trail-based primitive dictionary."""
 
 import pytest
 import torch
@@ -14,162 +14,158 @@ BS = 2
 class TestEpisodicMemory:
     def test_initialize(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         assert not em.is_initialized()
 
         em.initialize(BS, torch.device("cpu"), torch.float32)
         assert em.is_initialized()
-        assert em.em_K.shape == (BS, B, cfg.M, cfg.D)
-        assert em.em_V.shape == (BS, B, cfg.M, cfg.D)
-        assert em.em_S.shape == (BS, B, cfg.M)
-        assert em.em_age.shape == (BS, B, cfg.M)
+        assert em.em_K.shape == (BS, cfg.B, cfg.M, cfg.D)
+        assert em.em_V.shape == (BS, cfg.B, cfg.M, cfg.D)
+        assert em.em_S.shape == (BS, cfg.B, cfg.M)
+        assert em.em_age.shape == (BS, cfg.B, cfg.M)
 
-    def test_read_empty(self):
-        """Reading from empty EM should not crash."""
+    def test_trail_read_empty(self):
+        """Trail read from empty memory should not crash."""
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        seed = torch.randn(BS, 8, cfg.D)
+        y = em.trail_read(seed, b=0)
+        assert y.shape == (BS, 8, cfg.D)
+        assert torch.isfinite(y).all()
 
-        q = torch.randn(BS, 4, B, cfg.D)
-        y = em.read(q)
-        assert y.shape == q.shape
-
-    def test_read_with_content(self):
+    def test_trail_read_with_content(self):
+        """Trail read with active primitives should produce non-zero output."""
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_K = unit_normalize(torch.randn(BS, B, cfg.M, cfg.D))
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_S = torch.ones(BS, B, cfg.M)
+        em.em_K = unit_normalize(torch.randn(BS, cfg.B, cfg.M, cfg.D))
+        em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_S = torch.ones(BS, cfg.B, cfg.M)
+        seed = torch.randn(BS, 8, cfg.D)
+        y = em.trail_read(seed, b=0)
+        assert y.shape == (BS, 8, cfg.D)
+        # With content, trail should produce non-zero contribution
+        assert y.abs().sum() > 0
 
-        q = torch.randn(BS, 4, B, cfg.D)
-        y = em.read(q)
-        assert y.shape == q.shape
-
-    def test_novelty_scoring(self):
+    def test_compute_novelty_shape(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        w_cand = torch.randn(BS, 8, cfg.D)
+        surprise = torch.randn(BS, 8, cfg.D)
+        novelty = em.compute_novelty(w_cand, surprise, b=0)
+        assert novelty.shape == (BS, 8)
 
-        q_nov = torch.randn(BS, 4, B, cfg.D)
-        surprise = torch.rand(BS, 4, B)
-        w_nov = torch.rand(BS, 4, B)
-
-        novelty = em.score_novelty(q_nov, surprise, w_nov)
-        assert novelty.shape == (BS, 4, B)
-        # Novelty should be non-negative
+    def test_compute_novelty_nonnegative(self):
+        """Novelty should be non-negative."""
+        cfg = make_tiny_config()
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
+        w_cand = torch.randn(BS, 8, cfg.D)
+        surprise = torch.randn(BS, 8, cfg.D)
+        novelty = em.compute_novelty(w_cand, surprise, b=0)
         assert (novelty >= -0.01).all()
 
-    def test_write_updates_strength(self):
+    def test_compute_write_deltas_shape(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
+        novelty = torch.rand(BS, 8)
+        w_cand = torch.randn(BS, 8, cfg.D)
+        deltas = em.compute_write_deltas(novelty, w_cand)
+        assert deltas.shape == (BS, 8, cfg.D)
+
+    def test_commit_updates_state(self):
+        """Commit should change em_S (strength increases)."""
+        cfg = make_tiny_config()
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
 
-        C_em = cfg.C_em
-        cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D))
-        cand_V = torch.randn(BS, B, C_em, cfg.D)
-        cand_scores = torch.rand(BS, B, C_em) + 0.1
+        w_cand = torch.randn(BS, 8, cfg.D)
+        novelty = torch.rand(BS, 8) + 0.1
+        g_em = torch.full((BS,), 0.5)
 
-        g_em = torch.full((BS, B), 0.5)
-        tau = torch.ones(BS, B)
+        S_before = em.em_S.sum().item()
+        em.commit(w_cand, novelty, g_em, b=0)
+        S_after = em.em_S.sum().item()
+        assert S_after > S_before
 
-        s_before = em.em_S.sum().item()
-        em.write(cand_K, cand_V, cand_scores, g_em, tau)
-        s_after = em.em_S.sum().item()
-
-        assert s_after > s_before
-
-    def test_budget_enforcement(self):
+    def test_base_decay(self):
+        """base_decay should reduce strengths."""
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
+        em.em_S = torch.ones(BS, cfg.B, cfg.M)
 
-        # Write many times to fill up
-        C_em = cfg.C_em
-        for _ in range(20):
-            cand_K = unit_normalize(torch.randn(BS, B, C_em, cfg.D))
-            cand_V = torch.randn(BS, B, C_em, cfg.D)
-            cand_scores = torch.rand(BS, B, C_em) + 0.5
-            g_em = torch.ones(BS, B)
-            tau = torch.ones(BS, B)
-            em.write(cand_K, cand_V, cand_scores, g_em, tau)
+        S_before = em.em_S.sum().item()
+        em.base_decay()
+        S_after = em.em_S.sum().item()
+        assert S_after < S_before
 
-        assert em.em_S.sum(dim=-1).max().item() <= cfg.budget_em + 0.01
-
-    def test_age_tick(self):
+    def test_usage_shape(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_S = torch.ones(BS, B, cfg.M)  # activate all slots
-
-        em.age_tick(10)
-        assert em.em_age.min().item() == 10.0
+        u = em.usage(b=0)
+        assert u.shape == (BS,)
 
     def test_reset_states(self):
         cfg = make_tiny_config()
-        B = cfg.B_blocks
-        em = EpisodicMemory(cfg.D, cfg.M, cfg)
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
-        em.em_K = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_V = torch.randn(BS, B, cfg.M, cfg.D)
-        em.em_S = torch.ones(BS, B, cfg.M)
-        em.em_age = torch.ones(BS, B, cfg.M) * 100
+        em.em_K = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
+        em.em_S = torch.ones(BS, cfg.B, cfg.M)
+        em.em_age = torch.ones(BS, cfg.B, cfg.M) * 100
 
         mask = torch.tensor([True, False])
         em.reset_states(mask)
 
-        # S, age, K, V should be zeroed for masked stream (Bug 4)
+        # Stream 0 zeroed
         assert em.em_S[0].sum() == 0
         assert em.em_age[0].sum() == 0
         assert em.em_K[0].abs().sum() == 0
         assert em.em_V[0].abs().sum() == 0
-        # But not for unmasked
+        # Stream 1 preserved
         assert em.em_S[1].sum() > 0
         assert em.em_K[1].abs().sum() > 0
 
+    def test_budget_enforcement(self):
+        """After many commits, strength should not exceed budget."""
+        cfg = make_tiny_config()
+        em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps,
+                            budget=cfg.budget_em)
+        em.initialize(BS, torch.device("cpu"), torch.float32)
+
+        for _ in range(20):
+            w_cand = torch.randn(BS, 8, cfg.D)
+            novelty = torch.rand(BS, 8) + 0.5
+            g_em = torch.ones(BS)
+            em.commit(w_cand, novelty, g_em, b=0)
+
+        # Budget should be enforced
+        assert em.em_S.sum(dim=-1).max().item() <= cfg.budget_em + 0.01
+
 
 class TestEMNeuromodulator:
-    def test_output_shapes(self):
-        cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg.D, cfg)
-
+    def test_output_shape(self):
+        neuromod = EMNeuromodulator(hidden=8)
         novelty_mean = torch.rand(BS)
-        em_usage = torch.rand(BS)
-        content = torch.randn(BS, cfg.D)
-
-        g_em, tau, decay, ww = neuromod(novelty_mean, em_usage, content)
-        assert g_em.shape == (BS,)
-        assert tau.shape == (BS,)
-        assert decay.shape == (BS,)
-        assert ww.shape == (BS,)
+        usage = torch.rand(BS)
+        g = neuromod(novelty_mean, usage)
+        assert g.shape == (BS,)
 
     def test_g_bounded(self):
-        cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg.D, cfg)
+        neuromod = EMNeuromodulator(hidden=8)
+        g = neuromod(torch.rand(BS), torch.rand(BS))
+        assert (g >= 0.001).all()
+        assert (g <= 0.95).all()
 
-        g_em, _, _, _ = neuromod(torch.rand(BS), torch.rand(BS))
-        assert (g_em >= cfg.g_em_floor).all()
-        assert (g_em <= cfg.g_em_ceil).all()
-
-    def test_decay_bounded(self):
-        cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg.D, cfg)
-
-        _, _, decay, _ = neuromod(torch.rand(BS), torch.rand(BS))
-        assert (decay >= cfg.decay_em_floor).all()
-        assert (decay <= cfg.decay_em_ceil).all()
-
-    def test_ww_bounded(self):
-        cfg = make_tiny_config()
-        neuromod = EMNeuromodulator(cfg.D, cfg)
-
-        _, _, _, ww = neuromod(torch.rand(BS), torch.rand(BS))
-        assert (ww >= cfg.ww_em_floor).all()
-        assert (ww <= cfg.ww_em_ceil).all()
+    def test_differentiable(self):
+        neuromod = EMNeuromodulator(hidden=8)
+        novelty = torch.randn(BS, requires_grad=True)
+        usage = torch.randn(BS, requires_grad=True)
+        g = neuromod(novelty, usage)
+        g.sum().backward()
+        assert novelty.grad is not None
+        assert usage.grad is not None

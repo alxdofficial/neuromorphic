@@ -161,9 +161,9 @@ def fast_scan(self, input_ids):
     Parallelized via chunked parallel-scan (à la Mamba).
 
     Returns:
-        H:        [BS, N, C, D_col]    — column hidden states
-        seed:     [BS, N, B, D]        — EM trail seeds (per bank)
-        w_cand:   [BS, N, B, D]        — write candidates (per bank)
+        H:        [BS, N, C, D_col]    — column hidden states (gain-modulated)
+        seed:     [BS, N, D]           — EM trail seeds (shared across banks)
+        w_cand:   [BS, N, D]           — write candidates (shared across banks)
         surprise: [BS, N, C, D_col]    — vector surprise signals
     """
     x = embed(input_ids)             # [BS, N, D_embed]
@@ -177,15 +177,17 @@ def fast_scan(self, input_ids):
 
     H = parallel_scan(x)             # [BS, N, C, D_col]
 
-    # Linear projections from column states
-    seed = W_seed(H)                 # [BS, N, B, D] — EM trail starting points
-    w_cand = W_w(H)                  # [BS, N, B, D] — write candidates per bank
-    z_hat = W_pcm(H)                 # [BS, N, C, D_col] — PCM prediction
-
-    # Vector surprise: elementwise prediction error
+    # PCM: prediction, surprise, and gain modulation (applied BEFORE projections)
     z = pcm_encode(x)                # [BS, N, C, D_col] — current encoding
+    z_hat = W_pcm(H)                 # [BS, N, C, D_col] — PCM prediction
     surprise = z_hat_prev - z        # [BS, N, C, D_col] — VECTOR, not scalar
-    # z_hat_prev is the prediction from token t-1 (carried in scan state)
+    H = H * (1 + 0.1 * tanh(W_gain(surprise)))  # PCM gain modulation
+
+    # Linear projections from gain-modulated column states
+    # Shared across banks — each bank receives the same seed/w_cand
+    # but addresses its own memory partition (specialization emerges from memory content)
+    seed = W_seed(H)                 # [BS, N, D] — EM trail starting points
+    w_cand = W_w(H)                  # [BS, N, D] — write candidates
 
     return H, seed, w_cand, surprise
 ```
@@ -194,6 +196,11 @@ def fast_scan(self, input_ids):
 The full scan state is H ∈ R^{C × D_col} = R^D. Because A is element-wise (no
 cross-column mixing), this is C independent scans — each column evolves its own D_col
 state. Cross-column integration happens through shared memory in Stage 2.
+
+**Scan carry across segments:** Currently, scan hidden states are reset to zero at each
+segment boundary (h_0 = 0). Cross-segment context is carried entirely through memory
+state (PM bias and EM primitives). Scan carry can be added later if needed — storing
+per-layer h_last as runtime state and passing it as h_prev to the next segment.
 
 **No separate FFN:** The scan's input-dependent projections (computing a_t, b_t from
 the input) serve the same role as FFN layers — nonlinear feature transformation. Adding
@@ -226,14 +233,17 @@ def memory_ops(self, H, seed, w_cand, surprise):
     """
     pm_reads, em_reads, cum_ems = [], [], []
 
+    # Learned novelty blend weight
+    w_nov = sigmoid(W_nov(H))                      # [BS, N, B] — per-bank blend
+
     for b in range(B):
         # --- 1. PROPOSED WRITES (per-token, parallel, from frozen memory) ---
         # PM write delta: surprise-driven bias shift
-        delta_pm = lr_pm * surprise[:, :, b]       # [BS, N, D] — per-token
+        delta_pm = lr_pm[b] * surprise              # [BS, N, D] — per-token
 
-        # EM write delta: novelty-weighted write candidate
-        novelty = compute_novelty(w_cand[:, :, b], surprise, em_K[b], em_V[b])
-        delta_em = novelty * w_cand[:, :, b]       # [BS, N, D] — per-token
+        # EM write delta: novelty-weighted write candidate (shared seed/w_cand)
+        novelty = compute_novelty(w_cand, surprise, em_K[b], em_V[b], w_nov[:, :, b])
+        delta_em = novelty * w_cand                  # [BS, N, D] — per-token
 
         # --- 2. PREFIX SUMS (causal accumulation, O(N)) ---
         cum_pm = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
@@ -268,9 +278,9 @@ def memory_ops(self, H, seed, w_cand, surprise):
         pm_bias[b] += delta_pm.sum(dim=seq)         # [BS, D] — aggregate
 
         # EM: full decomposition write (routing, neuromodulator, EMA)
-        route = softmax(normalize(w_cand[:, :, b]) @ em_K[b].T / τ_w)
-        update_K = sum_n(novelty * route * w_cand[:, :, b])
-        update_V = sum_n(novelty * route * w_cand[:, :, b])
+        route = softmax(normalize(w_cand) @ em_K[b].T / τ_w)  # shared w_cand
+        update_K = sum_n(novelty * route * w_cand)
+        update_V = sum_n(novelty * route * w_cand)
         g_em = em_neuromodulator(novelty_mean, usage)
         α = g_em * route_aggregated
         em_K[b] = (1 - α) * em_K[b] + α * normalize(update_K)
@@ -451,7 +461,7 @@ em_age [BS, B, M]        — age tracking for decay
 **Read (trail-based pattern completion):**
 ```
 # Seed from Stage 1 scan (the starting point for the trail)
-seed = W_seed(H)                             # [BS, N, B, D]
+seed = W_seed(H)                             # [BS, N, D] (shared across banks)
 if training:
     seed = seed + σ * randn_like(seed)       # noise for exploration (σ learned)
 
@@ -482,7 +492,7 @@ possible readouts. The memory is O(M × D) but the output space is continuous.
 # Can existing primitives explain this input?
 attn = softmax(normalize(w_cand) @ em_K[b].T / τ)
 reconstruction = attn @ em_V[b]
-recon_error = ||w_cand - reconstruction||    # [BS, N, B] — unexplained signal
+recon_error = ||w_cand - reconstruction||    # [BS, N] — unexplained signal
 
 # Novelty = surprise magnitude + reconstruction error
 w_nov = sigmoid(W_nov(H))                   # [BS, N, B] — learned blend
@@ -617,7 +627,7 @@ K=2 is likely sufficient (one segment of lookahead).
 | EM trail params (W_seed, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
 | EM primitives (em_K, em_V) | Same segment's loss through trail read | Through softmax attention |
 | Write candidate proj (W_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
-| Novelty scoring | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
+| Novelty scoring (W_nov) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
 | EM neuromodulator | **Next segment's** loss through committed primitives | Cross-segment TBPTT |
 | EM commit routing | **Next segment's** loss through committed em_K/em_V | Cross-segment TBPTT |
 
@@ -763,7 +773,7 @@ The distillation cycle:
 Process tokens in N-token segments. Each segment:
 1. Run 3-stage cycle
 2. Emit N token predictions
-3. Carry scan states + memory to next segment
+3. Carry memory state to next segment (scan state currently resets per segment)
 
 Throughput: N tokens per forward pass (no R multiplier).
 
@@ -831,6 +841,12 @@ means `pm_bias[:, b]`, shape `[BS, D]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
 **W_gate is element-wise (not a matrix):**
 `gate = sigmoid(w1 * y + w2 * delta + bias)` where w1, w2 are learned `[D]`
 vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
+
+**Seed and w_cand are shared across banks:**
+`W_seed` and `W_w` each produce a single `[BS, N, D]` tensor, not per-bank.
+All B banks receive the same seed and write candidate. Bank specialization
+emerges from the differing memory content (em_K, em_V, pm_bias) in each bank,
+not from the inputs. This halves the Stage 1 projection parameters.
 
 **w_cand serves as both routing key and write content:**
 No separate k_cand/v_cand projections. In the EM write: `route` uses normalized

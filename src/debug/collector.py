@@ -148,18 +148,17 @@ class MetricsCollector:
     def _collect_pm_stats(self, record: dict):
         """Read PM state tensors and compute summary stats.
 
-        v4: single PM with state [BS*B, r, D_col].
+        v5: single PM with bias state [BS, B, D].
         """
         if not self.config.pm_enabled:
             return
         pm = self.model.pm
-        if pm.pm_a is None:
+        if pm.pm_bias is None:
             return
-        pm_a = pm.pm_a.detach()  # [BS*B, r]
-        record["pm_a_mean"] = pm_a.mean().item()
-        record["pm_a_max"] = pm_a.max().item()
-        record["pm_a_sum"] = pm_a.sum(dim=-1).mean().item()
-        record["pm_nonzero"] = (pm_a > 0.01).float().mean().item()
+        pm_bias = pm.pm_bias.detach()  # [BS, B, D]
+        record["pm_bias_norm"] = pm_bias.norm().item()
+        record["pm_bias_mean"] = pm_bias.mean().item()
+        record["pm_bias_max"] = pm_bias.abs().max().item()
 
     def _collect_em_stats(self, record: dict):
         """Read EM state tensors and compute summary stats."""
@@ -196,17 +195,10 @@ class MetricsCollector:
     def _collect_lifelong_stats(self, record: dict):
         """Collect cross-document memory persistence stats (Phase B)."""
         pm = self.model.pm
-        if pm.pm_a is not None:
-            pm_a = pm.pm_a.detach()
-            pm_nonzero = (pm_a > 0.01).float().sum().item()
-            pm_slots = pm_a.numel()
-            pm_budget_total = pm_a.sum().item()
-            pm_budget_cap = pm.budget * pm_a.shape[0]
-
-            if pm_slots > 0:
-                record["pm_persistence"] = pm_nonzero / pm_slots
-            if pm_budget_cap > 0:
-                record["pm_budget_util"] = pm_budget_total / pm_budget_cap
+        if pm.pm_bias is not None:
+            pm_bias = pm.pm_bias.detach()
+            record["pm_bias_norm_lifelong"] = pm_bias.norm().item()
+            record["pm_bias_nonzero"] = (pm_bias.abs() > 0.01).float().mean().item()
 
         em = self.model.em
         if em.em_S is not None:
@@ -224,21 +216,22 @@ class MetricsCollector:
     def _collect_grad_norms(self, record: dict):
         """Per-module gradient norms after backward.
 
-        v4 structure: model.embedding, model.lm_head, model.fan_in,
-        model.columns, model.pm, model.em, model.pm_neuromod, model.em_neuromod
+        v5 structure: embedding, lm_head, stage1, stage3, pm, em, em_neuromod,
+        W_seed, W_w, pcm, W_nov.
         """
         module_groups = {
             "embedding": [self.model.embedding],
             "lm_head": [self.model.lm_head],
-            "fan_in": [self.model.fan_in],
-            "columns": [self.model.columns],
+            "stage1": [self.model.stage1],
+            "stage3": [self.model.stage3],
         }
         if self.model.proj_up is not None:
             module_groups["proj_up"] = [self.model.proj_up]
             module_groups["proj_down"] = [self.model.proj_down]
+        if self.model.pcm is not None:
+            module_groups["pcm"] = [self.model.pcm]
         if self.config.pm_enabled:
             module_groups["pm"] = [self.model.pm]
-            module_groups["pm_neuromod"] = [self.model.pm_neuromod]
         if self.config.em_enabled:
             module_groups["em"] = [self.model.em]
             module_groups["em_neuromod"] = [self.model.em_neuromod]

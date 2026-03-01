@@ -1,8 +1,9 @@
 """
-TBPTTTrainer (v4) — main training loop for neuromorphic LM.
+TBPTTTrainer (v5) — main training loop for neuromorphic LM.
 
 Processes TBPTT chunks as K segments of N tokens. PM/EM updates happen
 inside model.forward_segment(), so no external span_ops needed.
+NTP only — no FITB path.
 """
 
 import math
@@ -18,8 +19,7 @@ from typing import Iterator, Optional, Callable, TYPE_CHECKING
 from ..data.streaming import StreamBatch
 from ..model.config import ModelConfig
 from ..model.model import NeuromorphicLM
-from .loss import batched_cross_entropy, compute_loss_and_surprise, compute_regularizers, fitb_cross_entropy
-from .masking import generate_fitb_mask, apply_special_token_protection
+from .loss import batched_cross_entropy, compute_regularizers
 
 
 def _make_compiled_step(model, config):
@@ -38,20 +38,6 @@ def _make_compiled_step(model, config):
             )
             valid_count = loss_mask.sum()
         return ce_loss, aux_loss, valid_count
-
-    return _step
-
-
-def _make_compiled_fitb_step(model, config):
-    """Create a compiled FITB train step that fuses forward + inline CE loss."""
-    @torch.compile(mode="default")
-    def _step(seg_ids_masked, reset_mask, seg_ids_original, fitb_mask):
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            ce_loss, aux_loss, total_valid = model.forward_segment(
-                seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
-                target_ids=seg_ids_original,
-            )
-        return ce_loss, aux_loss, total_valid
 
     return _step
 
@@ -96,13 +82,8 @@ class TBPTTTrainer:
         self._states_initialized = False
         self._compile_requested = config.use_compile and device.type == "cuda"
         self._compiled_step = None
-        self._compiled_fitb_step = None
-        self._is_fitb = config.mask_rate > 0 and config.fitb_id >= 0
         if self._compile_requested:
-            if self._is_fitb:
-                self._compiled_fitb_step = _make_compiled_fitb_step(model, config)
-            else:
-                self._compiled_step = _make_compiled_step(model, config)
+            self._compiled_step = _make_compiled_step(model, config)
 
     def _memory_budget_utils(self) -> tuple:
         """Global PM/EM budget utilization fractions in [0, 1]."""
@@ -111,10 +92,10 @@ class TBPTTTrainer:
 
         if self.config.pm_enabled:
             pm = self.model.pm
-            if pm.pm_a is not None:
-                total = pm.pm_a.detach().sum().item()
-                # pm_a is [BS, B, r] — budget applies per (batch, block) stream
-                cap = pm.budget * pm.pm_a.shape[0] * pm.pm_a.shape[1]
+            if pm.pm_bias is not None:
+                # PM budget: norm of bias across D
+                total = pm.pm_bias.detach().abs().sum().item()
+                cap = self.config.budget_pm * pm.pm_bias.shape[0] * pm.pm_bias.shape[1]
                 if cap > 0:
                     pm_util = total / cap
 
@@ -122,7 +103,6 @@ class TBPTTTrainer:
             em = self.model.em
             if em.em_S is not None:
                 total = em.em_S.detach().sum().item()
-                # em_S is [BS, B, M] — budget applies per (batch, block) stream
                 cap = em.budget * em.em_S.shape[0] * em.em_S.shape[1]
                 if cap > 0:
                     em_util = total / cap
@@ -162,7 +142,6 @@ class TBPTTTrainer:
         chunk_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         valid_count = torch.tensor(0, device=self.device, dtype=torch.long)
         total_tokens = BS * T
-        # Accumulate on GPU to avoid per-segment .item() sync points
         eot_inputs_t = torch.tensor(0, device=self.device, dtype=torch.long)
         reset_events_t = torch.tensor(0, device=self.device, dtype=torch.long)
         seg_count = 0
@@ -187,49 +166,20 @@ class TBPTTTrainer:
             is_eot = (seg_ids == eot_id)
             eot_inputs_t = eot_inputs_t + is_eot.sum()
 
-            if self._is_fitb:
-                # FITB path
-                seg_N = seg_ids.shape[1]
-                fitb_mask = generate_fitb_mask(
-                    BS, seg_N, self.config.mask_rate,
-                    self.config.span_mask_prob,
-                    self.config.span_mask_mean_len,
-                    self.device,
-                )
-                fitb_mask = apply_special_token_protection(
-                    fitb_mask, seg_ids, eot_id,
-                    self.config.null_id,
-                )
-                seg_ids_masked = seg_ids.clone()
-                seg_ids_masked[fitb_mask] = self.config.fitb_id
-
-                if self._compiled_fitb_step is not None:
-                    ce_loss, aux_loss, seg_valid = self._compiled_fitb_step(
-                        seg_ids_masked, reset_mask, seg_ids, fitb_mask
-                    )
-                else:
-                    with amp_ctx:
-                        ce_loss, aux_loss, seg_valid = self.model.forward_segment(
-                            seg_ids_masked, reset_mask, fitb_mask=fitb_mask,
-                            target_ids=seg_ids,
-                        )
+            # NTP path
+            if self.config.reset_on_doc_boundary:
+                loss_mask = ~is_eot
             else:
-                # NTP path
-                # Loss masking: skip EOT positions
-                if self.config.reset_on_doc_boundary:
-                    loss_mask = ~is_eot
-                else:
-                    loss_mask = torch.ones_like(is_eot)
+                loss_mask = torch.ones_like(is_eot)
 
-                # Forward + loss (compiled step fuses both on CUDA)
-                if self._compiled_step is not None:
-                    ce_loss, aux_loss, seg_valid = self._compiled_step(
-                        seg_ids, reset_mask, seg_targets, loss_mask
-                    )
-                else:
-                    with amp_ctx:
-                        logits, aux_loss = self.model.forward_segment(seg_ids, reset_mask)
-                    ce_loss, seg_valid = batched_cross_entropy(logits, seg_targets, loss_mask)
+            if self._compiled_step is not None:
+                ce_loss, aux_loss, seg_valid = self._compiled_step(
+                    seg_ids, reset_mask, seg_targets, loss_mask
+                )
+            else:
+                with amp_ctx:
+                    logits, aux_loss = self.model.forward_segment(seg_ids, reset_mask)
+                ce_loss, seg_valid = batched_cross_entropy(logits, seg_targets, loss_mask)
 
             if self.fail_fast and not torch.isfinite(ce_loss):
                 raise RuntimeError(
@@ -237,15 +187,7 @@ class TBPTTTrainer:
                     f"segment [{seg_start}, {seg_end})."
                 )
 
-            # aux_loss is mean-reduced (per-token), ce_loss is sum-reduced.
-            # Scale aux to sum-reduction so both are divided by valid_count equally.
-            # For FITB: seg_valid = R * N_masked (total predictions across passes),
-            # but aux_loss should scale by token count, not R * token count.
-            if self._is_fitb:
-                aux_scale = fitb_mask.sum()
-            else:
-                aux_scale = seg_valid
-            chunk_loss = chunk_loss + ce_loss + aux_loss * aux_scale
+            chunk_loss = chunk_loss + ce_loss + aux_loss * seg_valid
             valid_count = valid_count + seg_valid
             seg_count += 1
 

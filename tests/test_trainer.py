@@ -1,4 +1,4 @@
-"""Unit tests for TBPTTTrainer (v4)."""
+"""Unit tests for TBPTTTrainer (v5)."""
 
 import pytest
 import torch
@@ -73,8 +73,8 @@ class TestTrainChunk:
         batch = _make_batch(trainer.config)
         trainer.train_chunk(batch)
 
-        if trainer.model.pm.pm_K is not None:
-            assert trainer.model.pm.pm_K.grad_fn is None
+        if trainer.model.pm.pm_bias is not None:
+            assert trainer.model.pm.pm_bias.grad_fn is None
 
     def test_multi_segment_chunk(self):
         """Chunk should process K_segments * N tokens."""
@@ -113,23 +113,3 @@ class TestTrainChunk:
         metrics = trainer.train_chunk(batch)
         assert metrics["loss"] > 0
         assert trainer.override_prev_token is None  # consumed
-
-
-class TestFITBTrainChunk:
-    """FITB path through TBPTTTrainer."""
-
-    def test_fitb_forward_backward(self):
-        cfg = make_tiny_config(vocab_size=VOCAB, mask_rate=0.3, fitb_id=63, null_id=62)
-        trainer = _make_trainer(config=cfg)
-        batch = _make_batch(cfg)
-        metrics = trainer.train_chunk(batch)
-        assert metrics["loss"] > 0
-        assert metrics["valid_tokens"] > 0
-
-    def test_fitb_gradient_update(self):
-        cfg = make_tiny_config(vocab_size=VOCAB, mask_rate=0.3, fitb_id=63, null_id=62)
-        trainer = _make_trainer(config=cfg)
-        batch = _make_batch(cfg)
-        p_before = trainer.model.embedding.weight.data.clone()
-        trainer.train_chunk(batch)
-        assert not torch.allclose(p_before, trainer.model.embedding.weight.data)

@@ -1,6 +1,14 @@
 # Future Directions: Neuromorphic AI Brain-Core
 
-> **Note (2026-02-27):** This document was written for the **v2 architecture** (scan-based recurrence + WM/PM/EM). The current architecture is **v4** (iterative refinement with cortical columns, no WM, no scan). See `architecture_v4_iterative_memory_scan.md` for the current design. Many directions below remain relevant; architecture-specific details (WM, scan, tier sizes) are outdated.
+> **Note (2026-03-01):** This document was written for the **v2 architecture** (scan-based recurrence + WM/PM/EM). The current architecture is **v5** (scan-memory-scan with causal write buffers). Key differences from v2:
+> - WM (working memory) is removed — scan recurrence replaces it
+> - PM is now a simple bias vector with gain modulation (not holographic slots)
+> - EM uses trail-based composition (not top-k retrieval)
+> - PCM uses within-scan vector surprise (not cross-pass scalar surprise)
+> - No separate FFN — scan projections serve this role
+> - No R-loop — single three-stage cycle per segment
+>
+> See `architecture_v4_iterative_memory_scan.md` for the current v5 design. The high-level principles (bounded state, online adaptation, selective plasticity) carry forward. Architecture-specific details (WM, tier sizes, GLA) are outdated.
 
 This document summarizes the architectural conclusions, insights, and forward-looking directions. It is intended as a **strategic roadmap**, not an implementation spec.
 

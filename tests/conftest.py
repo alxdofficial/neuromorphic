@@ -1,4 +1,4 @@
-"""Shared fixtures for the neuromorphic LM test suite (v4).
+"""Shared fixtures for the neuromorphic LM test suite (v5).
 
 Provides a tiny model config (~1000x cheaper than tier_a) that preserves
 all architectural constraints while running in milliseconds on CPU.
@@ -18,18 +18,13 @@ from src.model.config import ModelConfig
 # Tiny defaults — all architectural constraints preserved, ~1000x cheaper
 # ---------------------------------------------------------------------------
 TINY_DEFAULTS = dict(
-    D=64, D_embed=64, B_blocks=2, C=2, D_pcm=16,
-    vocab_size=64, R=2, N=16, K_segments=2,  # N=16, C=2 -> N_C=8
-    r=4, M=8, ffn_expansion=2, ffn_depth=1,
-    k_ret=2, C_em=4,
+    D=64, D_embed=64, B=2, C=2,
+    vocab_size=64, N=16, K_segments=2,
+    M=8, L_scan=2, scan_expansion=2, n_trail_steps=2,
     budget_pm=4.0, budget_em=8.0,
-    neuromod_hidden=8, content_proj_dim=4,
-    # PCM off by default in tests (dedicated PCM tests enable it explicitly)
+    neuromod_hidden=8,
     pcm_enabled=False, pcm_pred_weight=0.01,
-    # FITB tokens (within tiny vocab)
-    fitb_id=63, null_id=62,
-    # FITB off by default (dedicated FITB tests enable it explicitly)
-    mask_rate=0.0,
+    pm_enabled=True, em_enabled=True,
 )
 
 
@@ -59,28 +54,6 @@ def forward_one_segment(model, BS=2, vocab=64, N=None):
     model.initialize_states(BS, torch.device("cpu"))
     logits, aux_loss = model.forward_segment(input_ids, reset_mask)
     return logits, aux_loss
-
-
-def forward_one_segment_fitb(model, BS=2, vocab=64, N=None, mask_rate=0.3):
-    """Forward one FITB segment through the model.
-
-    Returns (per_pass_logits list[R × [BS,N,vocab]], aux_loss, fitb_mask).
-    """
-    if N is None:
-        N = model.config.N
-    input_ids = torch.randint(0, vocab, (BS, N))
-    reset_mask = torch.zeros(BS, dtype=torch.bool)
-    fitb_mask = torch.rand(BS, N) < mask_rate
-
-    # Replace masked positions with fitb_id
-    input_ids_masked = input_ids.clone()
-    input_ids_masked[fitb_mask] = model.config.fitb_id
-
-    model.initialize_states(BS, torch.device("cpu"))
-    per_pass_logits, aux_loss = model.forward_segment(
-        input_ids_masked, reset_mask, fitb_mask=fitb_mask
-    )
-    return per_pass_logits, aux_loss, fitb_mask
 
 
 def forward_k_segments(model, K=None, BS=2, vocab=64):

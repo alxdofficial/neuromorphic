@@ -57,7 +57,7 @@ class EfficiencyReport:
     batch_size: int
     seq_len: int
     device_name: str
-    predicted_tok_per_sec: float = 0.0  # mask_rate * R * raw tok/s (FITB effective rate)
+    predicted_tok_per_sec: float = 0.0  # predicted effective tok/s for generation
     bpb: float | None = None
     ms_per_step_train: float = 0.0
     ms_per_step_infer: float = 0.0
