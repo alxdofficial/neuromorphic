@@ -24,7 +24,7 @@
         </mxCell>
 
         <!-- Seed -->
-        <mxCell id="r_seed" value="seed = W_seed · H (from Stage 1 scan)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, B, D] — starting point for trail&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="r_seed" value="[seed, w_cand] = W_seed_w · H (from Stage 1 scan)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, D] each — fused projection, chunk(2) split&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="80" y="245" width="230" height="35" as="geometry"/>
         </mxCell>
 
@@ -206,7 +206,7 @@
         </mxCell>
 
         <!-- ==================== TWO PATHS NOTE ==================== -->
-        <mxCell id="paths_note" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Two Write Paths — Fast &amp; Slow&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;Fast (within segment):&lt;/b&gt;&lt;br&gt;• δ_em = novelty · w_cand (per-token)&lt;br&gt;• cum_em = cumsum(δ_em) → Stage 3&lt;br&gt;• Raw, unstructured, immediate feedback&lt;br&gt;• Same-segment gradient for W_w, novelty&lt;br&gt;• Provides cross-column mixing (D-wide)&lt;br&gt;&lt;br&gt;&lt;b&gt;Slow (segment end):&lt;/b&gt;&lt;br&gt;• Structured routing into M primitives&lt;br&gt;• Neuromodulated EMA update&lt;br&gt;• Compressed, organized, persistent&lt;br&gt;• Cross-segment gradient (TBPTT)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
+        <mxCell id="paths_note" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Two Write Paths — Fast &amp; Slow&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;Fast (within segment):&lt;/b&gt;&lt;br&gt;• δ_em = novelty · w_cand (per-token)&lt;br&gt;• cum_em = cumsum(δ_em) → Stage 3&lt;br&gt;• Raw, unstructured, immediate feedback&lt;br&gt;• Same-segment gradient for W_seed_w, novelty&lt;br&gt;• Provides cross-column mixing (D-wide)&lt;br&gt;&lt;br&gt;&lt;b&gt;Slow (segment end):&lt;/b&gt;&lt;br&gt;• Structured routing into M primitives&lt;br&gt;• Neuromodulated EMA update&lt;br&gt;• Compressed, organized, persistent&lt;br&gt;• Cross-segment gradient (TBPTT)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
           <mxGeometry x="560" y="620" width="240" height="210" as="geometry"/>
         </mxCell>
 

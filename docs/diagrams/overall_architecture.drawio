@@ -57,11 +57,11 @@
           <mxGeometry x="450" y="350" width="170" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="scan_q" value="seed (EM trail starts)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed · H → [BS, N, B, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="scan_q" value="seed (EM trail starts)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w · H → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="450" y="400" width="200" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="scan_w" value="w_cand (write candidates)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_w · H → [BS, N, B, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="scan_w" value="w_cand (write candidates)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w · H → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="450" y="445" width="200" height="35" as="geometry"/>
         </mxCell>
 
@@ -102,7 +102,7 @@
         </mxCell>
 
         <!-- PM Read (with causal bias) -->
-        <mxCell id="pm_read" value="&lt;b&gt;PM Gain Modulation&lt;/b&gt; (causal)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;y_pm = H ⊙ (1 + pm_bias + cum_pm)&lt;br&gt;Frozen bias + within-segment updates&lt;br&gt;[BS, N, D] per bank&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="pm_read" value="&lt;b&gt;PM Delta Modulation&lt;/b&gt; (causal)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;delta_pm = H ⊙ (pm_bias + cum_pm)&lt;br&gt;Frozen bias + within-segment updates&lt;br&gt;[BS, N, B, D] — baseline H added once in Stage 3&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="130" y="740" width="230" height="55" as="geometry"/>
         </mxCell>
 
@@ -112,7 +112,7 @@
         </mxCell>
 
         <!-- Three signals to Stage 3 -->
-        <mxCell id="mem_reads" value="Three signals → Stage 3: pm_read + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: long-term bias (frozen + causal buffer)&lt;br&gt;em_read: long-term compositional (trail from frozen primitives)&lt;br&gt;cum_em: within-segment new info (prefix-summed write candidates)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="mem_reads" value="Four signals → Stage 3: H + pm_delta + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: long-term bias (frozen + causal buffer)&lt;br&gt;em_read: long-term compositional (trail from frozen primitives)&lt;br&gt;cum_em: within-segment new info (prefix-summed write candidates)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="130" y="820" width="400" height="60" as="geometry"/>
         </mxCell>
         <mxCell id="e_mr1" style="endArrow=block;endFill=1;" edge="1" source="pm_read" target="mem_reads" parent="1">
@@ -189,7 +189,7 @@
         </mxCell>
 
         <!-- Integration scan -->
-        <mxCell id="scan2" value="Integration Scan (element-wise)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h'_t = a'_t ⊙ h'_{t-1} + b'_t&lt;br&gt;Input: pm_read + em_read + cum_em (three signals, additive)&lt;br&gt;Columns independent&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="scan2" value="Integration Scan (element-wise)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h'_t = a'_t ⊙ h'_{t-1} + b'_t&lt;br&gt;Input: H + pm_delta + em_read + cum_em (four signals, additive)&lt;br&gt;Columns independent&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="200" y="1015" width="300" height="50" as="geometry"/>
         </mxCell>
 
