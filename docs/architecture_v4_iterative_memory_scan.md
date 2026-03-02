@@ -308,10 +308,10 @@ def integration_scan(self, H, pm_deltas, em_reads, cum_em):
     integrated = H + pm_deltas_summed + em_reads_summed + cum_em_summed
 
     # Second scan: h'_t = a'_t ⊙ h'_{t-1} + b'_t (element-wise, independent columns)
-    H_prime = parallel_scan_2(integrated)        # [BS, N, C, D_col]
+    H_prime = parallel_scan_2(integrated)        # [BS, N, D]
 
-    # Project to model dim and decode
-    out = proj_down(H_prime.reshape(BS, N, D))   # [BS, N, D_embed]
+    # Project to embed dim and decode
+    out = proj_down(H_prime)                     # [BS, N, D_embed]
     logits = lm_head(out)                         # [BS, N, vocab]
 
     return logits
@@ -434,7 +434,7 @@ em_age [BS, B, M]        — age tracking for decay
 if training:
     seed = seed + σ * randn_like(seed)       # noise for exploration (σ learned)
 
-# Trail: iterative refinement through primitive space (n_steps = 2)
+# Trail: iterative refinement through primitive space (n_steps = 3)
 y = seed
 for step in range(n_steps):
     scores = y @ em_K[b].T                   # [BS, N, M] — score ALL primitives
@@ -788,13 +788,10 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 These resolve ambiguities in the pseudocode above for actual PyTorch implementation.
 
 **Bank-column mapping (H ↔ memory):**
-H is `[BS, N, C, D_col]` (column-indexed). Memory is `[BS, B, ...]` (bank-indexed).
-For bank b's operations: `H_bank = H.reshape(BS, N, D)`. All B banks share the
-same column states — different banks hold different memory but modulate the same H.
-Similarly, `surprise.reshape(BS, N, D)` for bank-level delta computation.
+H is `[BS, N, D]` (dense). Memory is `[BS, B, ...]` (bank-indexed).
+All B banks share the same H — different banks hold different memory but modulate the same H.
 Stage 2 returns `[BS, N, D]` signals (bank-sum computed via fused algebra,
-never materializing `[BS, N, B, D]`); Stage 3 reshapes to `[BS, N, C, D_col]`
-for the integration scan.
+never materializing `[BS, N, B, D]`). Stage 3 operates on dense `[BS, N, D]` tensors directly.
 
 **Pseudocode indexing notation:**
 `em_K[b]` means `em_K[:, b]` (index the B dimension, keep batch). `pm_bias[b]`

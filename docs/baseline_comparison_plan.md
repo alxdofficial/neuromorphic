@@ -439,7 +439,7 @@ Target: a b c d e
 
 **Setup:** Like copy task but with distractors. Model must selectively recall only specific items based on a cue.
 
-**Why critical:** Tests whether EM can selectively retrieve relevant information while ignoring noise -- exactly what top-k retrieval with learned novelty scoring should enable.
+**Why critical:** Tests whether EM can selectively retrieve relevant information while ignoring noise -- exactly what trail-based soft composition with learned novelty scoring should enable.
 
 ### 6.3 Cross-Document Knowledge Retention (Phase C / Lifelong)
 
@@ -677,7 +677,7 @@ These are the experiments needed to convincingly demonstrate the architecture:
 A paper proving this architecture "makes sense" should follow this structure:
 
 1. **Motivation:** Biological inspiration, memory system decomposition (PM/EM parallel to human memory), iterative refinement
-2. **Architecture:** Full description with diagrams (cortical columns, R-pass refinement, PCM)
+2. **Architecture:** Full description with diagrams (scan-memory-scan, cortical columns, PCM)
 3. **Language Modeling:** Perplexity results showing competitive or superior performance vs Pythia/Mamba at matched scale
 4. **Ablation Studies:** Each component contributes; removing any one hurts
 5. **Memory-Specific Tasks:** MQAR, needle-in-haystack showing where memory systems excel
@@ -692,10 +692,10 @@ A paper proving this architecture "makes sense" should follow this structure:
 |-------|----------------|
 | "PM improves pattern learning" | PM-on vs PM-off perplexity gap; PM utilization analysis |
 | "EM enables episodic retrieval" | MQAR accuracy; needle-in-haystack; EM-on vs EM-off on PG19 |
-| "PCM enables cross-pass refinement" | PCM-on vs PCM-off perplexity; surprise distribution analysis |
+| "PCM enables within-scan prediction" | PCM-on vs PCM-off perplexity; surprise distribution analysis |
 | "Memory systems compose" | Full model > any single component ablation |
 | "Architecture scales" | Perplexity at 3 model sizes tracks or beats baseline scaling |
-| "Iterative refinement is practical" | Training throughput within 2x of transformer baseline |
+| "Scan-memory-scan is practical" | Training throughput within 2x of transformer baseline |
 
 ---
 

@@ -42,7 +42,7 @@ the most expensive component runs twice.
 
 Replace GroupedLinear(C=16, D_col=128) with nn.Linear(D=2048).
 
-- **How**: ScanLayer uses nn.Linear + nn.LayerNorm. Scan functions take 3D [BS,N,E]
+- **How**: ScanLayer uses nn.Linear + RMSNorm. Scan functions take 3D [BS,N,E]
   tensors. All 4D [BS,N,C,D_col] reshaping eliminated from model.py.
 - **Param count**: Identical (d_inner=1024 matches current per-column E=1024).
 - **GPU gain**: Matmul efficiency 23% → ~80-100%. HGRN batch drops from BS*C=192 to BS=12.
@@ -143,6 +143,8 @@ Fewer scan layers but each is more expressive.
 
 ### C1. Scan Tensor Layout Fix
 
+**Status: N/A — superseded by A1 (dense scan)**
+
 Eliminate permute/copy overhead in fused_scan path.
 
 - **How**: Change ScanLayer internal layout to [BS,C,N,D_col] (C before N) so the
@@ -165,6 +167,8 @@ Fuse norm→proj→activation→scan→proj→residual into a single custom Trit
 - **Estimated speedup**: 1.3-2x per scan layer if done well.
 
 ### C3. RMSNorm + Fused Epilogues
+
+**Status: DONE**
 
 Replace LayerNorm with RMSNorm, fuse bias+activation into single ops.
 

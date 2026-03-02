@@ -184,14 +184,12 @@ Tested various tier_a configurations (all compiled, max BS that fits):
 Longer segments win because the HGRN Triton kernel amortizes overhead better
 over longer sequences.
 
-## Identified Optimization Opportunities (not yet implemented)
+## Identified Optimization Opportunities (partially stale — review before acting)
 
-### 1. Scan tensor layout change (~5% estimated)
-The fused_scan path permutes [BS,N,C,E] → [BS,C,N,E] → [BS*C,N,E] before calling
-HGRN, then permutes back. This triggers a full tensor copy each direction.
-Microbenchmark: 1.29ms (with permute) vs 0.43ms (pre-permuted layout) — 3× faster
-input preparation. At 12 layers, this is ~10ms saved (5% of 193ms forward pass).
-Requires changing ScanLayer to use [BS,C,N,D_col] internal layout.
+### 1. ~~Scan tensor layout change~~ **[RESOLVED — superseded by dense scan (A1)]**
+The fused_scan path previously permuted [BS,N,C,E] → [BS,C,N,E] → [BS*C,N,E] before
+calling HGRN, then permuted back. This is no longer relevant: the dense scan (C=1)
+operates on [BS,N,E] directly, eliminating all permute/reshape overhead.
 
 ### 2. MoE-style column partitioning (architecture change)
 Instead of 16 narrow columns each processing all tokens, use fewer wide "expert"
@@ -201,7 +199,7 @@ Tradeoff: loses "all columns see every token" property; memory system becomes
 sole cross-column communication mechanism.
 
 ### 3. Custom Triton kernels for element-wise fusion
-Fuse chains of element-wise ops (e.g., scan's LN→proj→silu→scan→proj→residual)
+Fuse chains of element-wise ops (e.g., scan's norm→proj→silu→scan→proj→residual)
 into single kernels to reduce memory bandwidth. Estimated difficulty: high.
 Expected gain: up to 10-15% if element-wise overhead (44% of CUDA time) can be
 halved.
