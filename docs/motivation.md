@@ -95,7 +95,7 @@ Dictionary of primitive patterns — atomic building blocks of concepts. Complex
 ideas emerge from composing multiple primitives via trail-based navigation.
 
 - **Read (trail)**: Seed from scan navigates primitive space through iterative
-  refinement (2 steps). At each step: score ALL primitives via softmax (no top-k),
+  refinement (3 steps). At each step: score ALL primitives via softmax (no top-k),
   compose weighted sum, gate, move seed. Different seed → different trail →
   different composition. M primitives + continuous seeds = infinite readouts.
 - **Novelty**: Reconstruction error — can existing primitives explain this input?
@@ -165,6 +165,65 @@ reset at boundaries. The distillation cycle:
 
 ---
 
+## Genuine Novelties — What No Other Architecture Does
+
+These are the ideas that, to our knowledge, do not exist together in any published
+model. Each is individually motivated by neuroscience; their combination is the
+architecture's core contribution.
+
+### 1. Trail-Based Compositional Memory Read
+EM stores M atomic primitives. Reading is **not** top-k retrieval — it's an iterative
+navigation: a seed vector takes multiple steps through primitive space, composing a
+weighted mixture at each step via softmax attention + gated movement. Different seeds
+produce different compositions from the same primitives. This gives combinatorial
+capacity (M primitives → infinite readouts) from finite memory.
+
+**Why novel**: Standard memory-augmented networks (NTM, DNC, MemoryNet) use single-step
+attention or top-k retrieval. Trail-based composition is closer to how hippocampal
+replay chains memories together.
+
+### 2. Vector Surprise as the Universal Learning Signal
+PCM predicts the next token's representation per-feature-group. The prediction error
+is a **vector** (D_col dimensions), not a scalar. This per-feature surprise drives:
+- PM bias updates (adapt features that were surprising)
+- EM novelty scoring (blended with reconstruction error)
+- PCM gain modulation (amplify/dampen features before memory ops)
+
+**Why novel**: Most prediction-error-driven systems (curiosity, surprise-based gating)
+use scalar surprise. Vector surprise lets the model know *which features* were
+unexpected, enabling selective, per-feature plasticity.
+
+### 3. Causal Write Buffers via Prefix Sums
+Within a segment, memory writes are prefix-summed so token t sees the accumulated
+effect of writes from tokens 0..t. This preserves strict NTP causality while giving
+within-segment memory feedback — the model can "learn and use" within a single segment.
+
+**Why novel**: Most memory systems either batch writes at sequence boundaries (no
+within-sequence feedback) or violate causality. Prefix-sum write buffers solve both.
+
+### 4. Neuromodulator-Gated Memory Writes Trained by Main Loss
+EM write gates (`g_em`) are produced by a small MLP that takes novelty and usage as
+input. Crucially, the neuromodulator is trained end-to-end by the **main CE loss** —
+gradient flows: write → primitive update → future trail reads → logits → loss.
+No RL reward, no auxiliary objective, single optimizer.
+
+**Why novel**: Most gated-write systems use heuristics or auxiliary losses. End-to-end
+gradient through the write gate teaches the model *when writing helps prediction*.
+
+### 5. Dual-Path Memory (Fast Buffer + Slow Decomposition)
+Each memory system has two write paths:
+- **Fast**: Simple per-token delta, prefix-summed for causal within-segment feedback
+- **Slow**: Structured commit at segment end (PM: bias accumulation; EM: soft-routing
+  decomposition into primitives with neuromodulated EMA)
+
+The fast path provides gradients and within-segment utility; the slow path builds
+durable, structured memory representations.
+
+**Why novel**: No other model separates within-segment approximation from structured
+cross-segment writes. This decouples gradient flow from memory organization.
+
+---
+
 ## What Makes This Fundamentally Different
 
 ### vs Transformers
@@ -188,26 +247,56 @@ reset at boundaries. The distillation cycle:
 
 ---
 
-## Non-Negotiable (Sacred) Design Principles
+## Sacred Design Principles (Non-Negotiable)
 
-1. Three memory systems with distinct timescales (genetic/PM/EM) + PCM
-2. EM as primitive dictionary with trail-based compositional read
-3. PM as coarse bias vector with surprise-gated updates
-4. Neuromodulators trained by main loss (no RL, single optimizer, single loss)
-5. Vector surprise (per-feature prediction error) drives memory updates
-6. Novelty-based EM writes (surprise + reconstruction error)
-7. Budget enforcement + unit normalization (prevents drift)
-8. Lifelong persistence — memory is state, not parameters
-9. Fixed memory capacity O(1) per token at inference
-10. Causal token processing (scan recurrence) with memory between segments
-11. Causal write buffers (prefix sums) for within-segment memory feedback
+These define the architecture's identity. Any change that violates these is a different
+model, not an optimization. Grouped by category:
+
+### Memory Architecture
+1. **Three memory timescales**: Genetic (slow weights, permanent after training),
+   Procedural (PM, bias that persists across documents), Episodic (EM, primitives
+   that persist across documents). Each has distinct function and update rules.
+2. **Memory is state, not parameters**: PM bias and EM primitives are runtime tensors
+   that evolve at inference. They are not learned weights — they are what the model
+   remembers from experience.
+3. **O(1) memory per token at inference**: Fixed capacity (B banks × M primitives for
+   EM, B bias vectors for PM). No unbounded growth. Bounded by budgets.
+
+### Memory Operations
+4. **Trail-based compositional EM read**: Iterative seed navigation through primitive
+   space. No top-k, no hard selection — full softmax over all primitives at each step.
+   Combinatorial capacity from finite storage.
+5. **Surprise-gated PM updates**: PM adapts only on unpredicted features. Vector
+   surprise (per-feature prediction error from PCM) determines which features shift.
+6. **Novelty-based EM writes**: EM stores what is both surprising AND not already
+   representable by existing primitives (surprise + reconstruction error blend).
+7. **Neuromodulators trained by main loss**: Write gates are MLPs trained end-to-end
+   by cross-entropy loss. No RL, no auxiliary objective. Single optimizer, single loss.
+
+### Causality and Compute
+8. **Causal token processing**: Scan recurrence ensures token t cannot see token t+1.
+   Autoregressive (NTP), not bidirectional.
+9. **Causal write buffers**: Prefix sums of per-token memory deltas. Token t's memory
+   read includes writes from 0..t (inclusive). Strict NTP causality within segments.
+10. **Write-before-read ordering**: Within a segment, PM/EM writes are computed before
+    reads — the causal buffer ensures reads reflect all prior writes.
+
+### Plasticity Control
+11. **Budget enforcement**: PM norm budgets and EM strength budgets prevent unbounded
+    drift. Memory stays bounded regardless of deployment duration.
+12. **Vector surprise**: Per-feature prediction error (D_col dimensions), not scalar.
+    Enables selective, per-feature plasticity — only surprising features trigger updates.
 
 ## Negotiable — Implementation Details
 
-- Architecture dimensions (D, B, C, M, D_embed)
+- Architecture dimensions (D, B, C, M, D_embed, d_inner)
 - Segment length N (= memory update interval)
-- Number of scan layers per stage
-- Hyperparameters (decay rates, temperatures, budgets)
+- Number of scan layers per stage, scan depth asymmetry
+- Trail steps count, number of banks
+- Hyperparameters (decay rates, temperatures, budgets, learning rates)
+- Norm type (RMSNorm vs LayerNorm), activation functions
+- Dense vs grouped scan (currently dense for GPU efficiency)
+- Specific kernel implementations (HGRN, Triton, etc.)
 
 ---
 

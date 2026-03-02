@@ -768,7 +768,7 @@ boundaries. Latency per token = one scan step (no quadratic attention).
    Coarse, fast, automatic — distinct from EM's rich compositional read.
 
 8. **EM** → Trail-based primitive composition. Dictionary of M primitives,
-   seed from scan navigates via iterative refinement (2 steps). Soft writes
+   seed from scan navigates via iterative refinement (3 steps). Soft writes
    decompose across primitives. Clean differentiable credit assignment.
 
 9. **PositionAttention** → No. Scan handles cross-position causally. No attention

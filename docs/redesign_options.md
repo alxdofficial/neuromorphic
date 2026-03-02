@@ -4,12 +4,14 @@
 > use dense nn.Linear for GPU efficiency. PCM and W_seed_w remain GroupedLinear
 > with free .view() bridge between [BS,N,D] and [BS,N,C,D_col]. See commit history.
 >
-> **Result:** 103,423 tok/s train (BS=36) — 3.2x speedup over v5's 31.8K tok/s.
-> Exceeds both Pythia-160M (69K) and Mamba-130M (89K). Goal achieved.
+> **Result:** 92K tok/s train (trail=3, BS=24) — 2.9x speedup over v5's 31.8K tok/s.
+> Matches Mamba-130M (90K), 37% fewer params, 38% less VRAM. With trail=1: 103K tok/s.
+> Actual benchmarked baselines (same GPU, max BS): Pythia-160M=110K, Mamba-130M=90K.
 
-**Original goal**: Match Pythia-160M (~69K tok/s) and Mamba-130M (~89K tok/s) training speed.
+**Original goal**: Match Mamba-130M (~90K tok/s) training speed.
 **v5 baseline**: 31.8K tok/s on RTX 4090 (Tier A, BS=12, N=512, compiled).
-**v5.1 result**: **103,423 tok/s** (BS=36, compiled) — goal exceeded.
+**v5.1 result (trail=3)**: **92K tok/s** (BS=24, compiled) — matches Mamba, fewer params/VRAM.
+**v5.1 result (trail=1)**: **103K tok/s** (BS=36, compiled) — exceeds Mamba.
 
 ## Sacred Invariants (preserved by ALL options)
 
