@@ -30,7 +30,7 @@ def _rand_batch(bs, t, vocab, device):
     prev = torch.zeros(bs, dtype=torch.long, device=device)
     return StreamBatch(input_ids=x, target_ids=y, prev_token=prev)
 
-cfg = ModelConfig.tier_a(T=256, use_compile=True)
+cfg = ModelConfig.tier_a(N=256, use_compile=True)
 cfg.set_phase("B")
 cfg.vocab_size = 32000
 cfg.eot_id = 2
@@ -104,7 +104,7 @@ def main() -> None:
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-    print(f"Config: tier_a (D=768, L=8, B=2), Phase B, T=256, compiled")
+    print(f"Config: tier_a (D=2048, C=16, B=6, L_scan=12), Phase B, N=256, compiled")
     print(f"Warmup: {args.warmup} steps, Timed: {args.steps} steps")
     print(f"(Each BS runs in a separate process — ~6 min compile warmup each)")
     print()

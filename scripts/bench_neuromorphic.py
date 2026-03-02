@@ -127,10 +127,13 @@ def measure_throughput(model, input_ids, vocab, warmup=5, measure=30):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     model.train()
 
-    # Warmup
-    print(f"    Warmup ({warmup} steps)...", flush=True)
+    # Warmup (step 1 triggers torch.compile tracing — can take 5-10 min)
     for i in range(warmup):
+        t0 = time.perf_counter()
         train_step(model, optimizer, input_ids, vocab)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        print(f"    Warmup step {i+1}/{warmup}: {dt:.1f}s", flush=True)
 
     # Measure
     print(f"    Measuring ({measure} steps)...", flush=True)
@@ -216,17 +219,18 @@ def main():
               flush=True)
         max_bs = find_max_bs(seq_len, vocab, args.tier)
     print(f"Max training BS: {max_bs}", flush=True)
+    compile_bs = max_bs
 
     # Phase 2: Training throughput (with compile)
-    print(f"\n--- Phase 2: Training throughput (BS={max_bs}, compile={use_compile}) ---",
+    print(f"\n--- Phase 2: Training throughput (BS={compile_bs}, compile={use_compile}) ---",
           flush=True)
     gc.collect()
     torch.cuda.empty_cache()
 
     model, config = make_model(
-        max_bs, seq_len, vocab, tier=args.tier, compile_model=use_compile
+        compile_bs, seq_len, vocab, tier=args.tier, compile_model=use_compile
     )
-    input_ids = torch.randint(0, vocab, (max_bs, seq_len), device=DEVICE)
+    input_ids = torch.randint(0, vocab, (compile_bs, seq_len), device=DEVICE)
 
     tok_s, ms_step, peak_vram = measure_throughput(
         model, input_ids, vocab, warmup=args.warmup, measure=args.measure
@@ -236,7 +240,7 @@ def main():
     print(f"  Peak VRAM: {peak_vram:.2f} GB", flush=True)
 
     # Phase 3: Inference throughput
-    print(f"\n--- Phase 3: Inference throughput (BS={max_bs}) ---", flush=True)
+    print(f"\n--- Phase 3: Inference throughput (BS={compile_bs}) ---", flush=True)
     infer_tok_s, infer_ms = measure_inference(
         model, input_ids, vocab, warmup=args.warmup, measure=args.measure
     )
@@ -251,7 +255,7 @@ def main():
 
     # Weights only
     torch.cuda.reset_peak_memory_stats(DEVICE)
-    model, _ = make_model(max_bs, seq_len, vocab, tier=args.tier, compile_model=False)
+    model, _ = make_model(compile_bs, seq_len, vocab, tier=args.tier, compile_model=False)
     weights_gb = torch.cuda.memory_allocated(DEVICE) / 1e9
 
     # After optimizer step

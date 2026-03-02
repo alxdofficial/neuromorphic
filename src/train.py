@@ -35,9 +35,8 @@ from .debug import MetricsCollector
 # ============================================================================
 
 # -- Model tier --
-TIER = "a"          # ~85M params, D=768, L=8, B=2
-# TIER = "b"        # ~103M params, competitive
-# TIER = "c"        # ~107M params, strong
+TIER = "a"          # D=2048, D_embed=384, C=16, L_scan=6, exp=8, B=4, M=384
+# TIER = "b"        # D=3072, D_embed=512, C=16, L_scan=16, B=12
 
 # -- Training phase --
 PHASE = "A"         # PM + EM + PCM (all systems)
@@ -73,7 +72,6 @@ USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
     "A": 1_000,             # ~8M tokens: scan + PM backbone warmup (brief head start)
     "B": 91_000,            # ~1.49B tokens @ BS=64 (was 182K @ BS=32)
-    "C": 0,                 # disabled: lifelong needs long-context data to be useful
 }
 # Total A+B ≈ 1.5B tokens (matches baseline budget)
 
@@ -128,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--phase", type=str, default=None,
                        help="Single phase to run (A or B)")
     p.add_argument("--tier", type=str, default=None,
-                   choices=["a", "b", "c"],
+                   choices=["a", "b"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")

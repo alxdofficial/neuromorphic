@@ -22,7 +22,6 @@ class TestEpisodicMemory:
         assert em.em_K.shape == (BS, cfg.B, cfg.M, cfg.D)
         assert em.em_V.shape == (BS, cfg.B, cfg.M, cfg.D)
         assert em.em_S.shape == (BS, cfg.B, cfg.M)
-        assert em.em_age.shape == (BS, cfg.B, cfg.M)
 
     def test_trail_read_all_empty(self):
         """Trail read from empty memory should not crash."""
@@ -31,7 +30,7 @@ class TestEpisodicMemory:
         em.initialize(BS, torch.device("cpu"), torch.float32)
         seed = torch.randn(BS, 8, cfg.D)
         y = em.trail_read_all(seed)
-        assert y.shape == (BS, 8, cfg.B, cfg.D)
+        assert y.shape == (BS, 8, cfg.D)
         assert torch.isfinite(y).all()
 
     def test_trail_read_all_with_content(self):
@@ -44,7 +43,7 @@ class TestEpisodicMemory:
         em.em_S = torch.ones(BS, cfg.B, cfg.M)
         seed = torch.randn(BS, 8, cfg.D)
         y = em.trail_read_all(seed)
-        assert y.shape == (BS, 8, cfg.B, cfg.D)
+        assert y.shape == (BS, 8, cfg.D)
         # With content, trail should produce non-zero contribution
         assert y.abs().sum() > 0
 
@@ -116,14 +115,12 @@ class TestEpisodicMemory:
         em.em_K = torch.randn(BS, cfg.B, cfg.M, cfg.D)
         em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
         em.em_S = torch.ones(BS, cfg.B, cfg.M)
-        em.em_age = torch.ones(BS, cfg.B, cfg.M) * 100
 
         mask = torch.tensor([True, False])
         em.reset_states(mask)
 
         # Stream 0 zeroed
         assert em.em_S[0].sum() == 0
-        assert em.em_age[0].sum() == 0
         assert em.em_K[0].abs().sum() == 0
         assert em.em_V[0].abs().sum() == 0
         # Stream 1 preserved

@@ -1,9 +1,9 @@
-"""Scaling experiment — throughput vs parameter count.
+"""Scaling experiment — throughput vs parameter count (v5).
 
-For each neuromorphic (B, L) config with D=768 fixed, finds the maximum batch
-size before OOM and measures tokens/sec at that batch size.  Does the same for
-Pythia-160M and Mamba-130M baselines.  Produces an annotated scatter plot of
-parameter count vs throughput.
+For each neuromorphic (B, L_scan) config, finds the maximum batch size before
+OOM and measures tokens/sec at that batch size.  Does the same for Pythia-160M
+and Mamba-130M baselines.  Produces an annotated scatter plot of parameter count
+vs throughput.
 
 Each (model, batch_size) combination runs in a **separate subprocess** so that
 torch.compile graph limits and OOM recovery work cleanly.
@@ -23,7 +23,7 @@ import time
 import torch
 
 # ---------------------------------------------------------------------------
-# Neuromorphic worker — runs one (B, L, BS) config in a subprocess
+# Neuromorphic worker — runs one (B, L_scan, BS) config in a subprocess
 # ---------------------------------------------------------------------------
 
 _NEURO_WORKER = textwrap.dedent(r'''
@@ -37,7 +37,7 @@ bs      = int(sys.argv[1])
 warmup  = int(sys.argv[2])
 steps   = int(sys.argv[3])
 B       = int(sys.argv[4])
-L       = int(sys.argv[5])
+L_scan  = int(sys.argv[5])
 
 device = torch.device("cuda")
 torch.set_float32_matmul_precision("high")
@@ -48,11 +48,8 @@ def _rand_batch(bs, t, vocab, device):
     prev = torch.zeros(bs, dtype=torch.long, device=device)
     return StreamBatch(input_ids=x, target_ids=y, prev_token=prev)
 
-cfg = ModelConfig(D=768, L=L, B=B, T=256, use_compile=True,
-                  D_wm=192, n_heads_wm=6, pm_readout_ffn=False)
+cfg = ModelConfig.tier_a(N=256, B=B, L_scan=L_scan, use_compile=True)
 cfg.set_phase("B")
-cfg.vocab_size = 32000
-cfg.eot_id = 2
 
 model = NeuromorphicLM(cfg).to(device)
 params = sum(p.numel() for p in model.parameters())
@@ -187,18 +184,18 @@ def _parse_json_output(stdout: str) -> dict:
     raise RuntimeError(f"No JSON in output:\n{stdout[-500:]}")
 
 
-def _run_neuro(B: int, L: int, bs: int, warmup: int, steps: int) -> dict | None:
+def _run_neuro(B: int, L_scan: int, bs: int, warmup: int, steps: int) -> dict | None:
     """Run neuromorphic worker. Returns result dict or None on OOM."""
     result = subprocess.run(
         [sys.executable, "-c", _NEURO_WORKER,
-         str(bs), str(warmup), str(steps), str(B), str(L)],
+         str(bs), str(warmup), str(steps), str(B), str(L_scan)],
         capture_output=True, text=True, timeout=TIMEOUT,
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "OutOfMemoryError" in stderr or "CUDA out of memory" in stderr:
             return None
-        raise RuntimeError(f"Neuro B={B} L={L} BS={bs} failed:\n{stderr[-500:]}")
+        raise RuntimeError(f"Neuro B={B} L_scan={L_scan} BS={bs} failed:\n{stderr[-500:]}")
     return _parse_json_output(result.stdout)
 
 
@@ -268,9 +265,9 @@ def make_plot(neuro_results: list[dict], baseline_results: list[dict],
         xs = [r["params"] for r in neuro_results]
         ys = [r["tok_per_s"] for r in neuro_results]
         ax.scatter(xs, ys, c="royalblue", marker="o", s=80, zorder=5,
-                   label="Neuromorphic (D=768)")
+                   label="Neuromorphic (tier_a base)")
         for r in neuro_results:
-            label_text = f"B={r['B']}, L={r['L']}, D_h={r['D_h']}\nBS={r['bs']}"
+            label_text = f"B={r['B']}, L={r['L_scan']}\nBS={r['bs']}"
             ax.annotate(label_text, (r["params"], r["tok_per_s"]),
                         textcoords="offset points", xytext=(8, 5),
                         fontsize=7, color="royalblue")
@@ -290,7 +287,7 @@ def make_plot(neuro_results: list[dict], baseline_results: list[dict],
     ax.set_xscale("log")
     ax.set_xlabel("Parameter Count", fontsize=12)
     ax.set_ylabel("Tokens / sec", fontsize=12)
-    ax.set_title("Scaling Experiment — RTX 4090, D=768, T=256, Phase B",
+    ax.set_title("Scaling Experiment — RTX 4090, tier_a base, N=256, Phase B",
                  fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
@@ -325,30 +322,28 @@ def main() -> None:
     print()
 
     # ------------------------------------------------------------------
-    # Neuromorphic configs: D=768, all valid (B, L) combos
+    # Neuromorphic configs: tier_a base (D=2048, C=16), sweep (B, L_scan)
     # ------------------------------------------------------------------
-    D = 768
-    B_values = [b for b in [1, 2, 3, 4, 6, 8] if D % b == 0]
-    L_values = [1, 2, 4, 8, 12]
+    B_values = [2, 4, 6, 8]
+    L_values = [4, 8, 12]
 
     neuro_results = []
     total_combos = len(B_values) * len(L_values)
     combo_idx = 0
 
     for B in B_values:
-        for L in L_values:
+        for L_scan in L_values:
             combo_idx += 1
-            D_h = D // B
-            print(f"=== [{combo_idx}/{total_combos}] Neuromorphic B={B}, L={L}, "
-                  f"D_h={D_h} ===")
+            print(f"=== [{combo_idx}/{total_combos}] Neuromorphic B={B}, "
+                  f"L_scan={L_scan} ===")
             t_start = time.time()
 
-            def run_fn(bs, _B=B, _L=L):
+            def run_fn(bs, _B=B, _L=L_scan):
                 return _run_neuro(_B, _L, bs, args.warmup, args.steps)
 
             try:
                 result = find_max_bs(run_fn, args.warmup, args.steps,
-                                     f"B={B} L={L}")
+                                     f"B={B} L_scan={L_scan}")
             except Exception as e:
                 print(f"  SKIPPED (error: {e})")
                 continue
@@ -359,8 +354,7 @@ def main() -> None:
                 continue
 
             result["B"] = B
-            result["L"] = L
-            result["D_h"] = D_h
+            result["L_scan"] = L_scan
             result["model"] = "neuromorphic"
             neuro_results.append(result)
             print(f"  Best: BS={result['bs']}, {result['tok_per_s']} tok/s, "
@@ -407,8 +401,8 @@ def main() -> None:
             "torch": torch.__version__,
         },
         "settings": {
-            "D": D,
-            "T": 256,
+            "base": "tier_a",
+            "N": 256,
             "warmup": args.warmup,
             "steps": args.steps,
         },
@@ -434,7 +428,7 @@ def main() -> None:
     print(f"{'Model':<25} {'Params':>10} {'BS':>5} {'tok/s':>10} {'VRAM GB':>8}")
     print("-" * 72)
     for r in sorted(neuro_results, key=lambda x: x["params"]):
-        tag = f"neuro B={r['B']} L={r['L']}"
+        tag = f"neuro B={r['B']} L={r['L_scan']}"
         print(f"{tag:<25} {r['params']:>10,} {r['bs']:>5} "
               f"{r['tok_per_s']:>10,} {r['peak_vram_gb']:>8.2f}")
     for r in baseline_results:

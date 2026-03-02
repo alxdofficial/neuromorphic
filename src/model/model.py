@@ -53,7 +53,7 @@ class NeuromorphicLM(nn.Module):
 
         # Stage 1: L_scan layers
         self.stage1 = nn.ModuleList([
-            ScanLayer(C, D_col, expansion) for _ in range(L)
+            ScanLayer(C, D_col, expansion, config.dropout) for _ in range(L)
         ])
 
         # Stage 1 projections (shared across banks) — fused into single matmul
@@ -83,7 +83,7 @@ class NeuromorphicLM(nn.Module):
 
         # Stage 3: L_scan layers
         self.stage3 = nn.ModuleList([
-            ScanLayer(C, D_col, expansion) for _ in range(L)
+            ScanLayer(C, D_col, expansion, config.dropout) for _ in range(L)
         ])
 
         # Output
@@ -94,12 +94,15 @@ class NeuromorphicLM(nn.Module):
 
     def forward_segment(
         self, input_ids: Tensor, reset_mask: Tensor | None = None,
+        commit: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Process one N-token segment through the three-stage cycle.
 
         Args:
             input_ids: [BS, N]
             reset_mask: [BS] bool — streams to reset PM/EM before processing
+            commit: whether to commit memory updates at segment end
+                    (False for inference with overlapping windows)
 
         Returns:
             logits: [BS, N, vocab]
@@ -146,15 +149,15 @@ class NeuromorphicLM(nn.Module):
         seed = seed_col.reshape(BS, N, D)              # [BS, N, D]
         w_cand = w_col.reshape(BS, N, D)               # [BS, N, D]
 
-        # --- Stage 2: Memory Ops ---
+        # --- Stage 2: Memory Ops (fused algebra — no [BS,N,B,D] tensors) ---
         H_flat = H.reshape(BS, N, D)
-        pm_deltas, em_reads, cum_ems = self._memory_ops(
-            H_flat, seed, w_cand, surp_flat
+        pm_read_sum, em_read_sum, cum_em_sum = self._memory_ops(
+            H_flat, seed, w_cand, surp_flat, commit=commit
         )
 
         # --- Stage 3: Integration Scan ---
-        # Baseline H_flat added once + bank-summed memory deltas
-        integrated = H_flat + pm_deltas.sum(2) + em_reads.sum(2) + cum_ems.sum(2)
+        # Baseline H_flat added once + bank-summed memory deltas (already [BS,N,D])
+        integrated = H_flat + pm_read_sum + em_read_sum + cum_em_sum
         H_prime = integrated.view(BS, N, C, D_col)
 
         for layer in self.stage3:
@@ -173,71 +176,78 @@ class NeuromorphicLM(nn.Module):
         return logits, aux_loss
 
     def _memory_ops(
-        self, H_flat: Tensor, seed: Tensor, w_cand: Tensor, surprise: Tensor
+        self, H_flat: Tensor, seed: Tensor, w_cand: Tensor, surprise: Tensor,
+        commit: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Stage 2: Write-before-read with causal prefix sums.
+        """Stage 2: Write-before-read with causal prefix sums (fused algebra).
 
-        All bank operations are vectorized — no per-bank Python loop.
-        PM returns delta only (no baseline H) — baseline is added once
-        in forward_segment's integration step.
+        Algebraic fusion: the sum over B banks is computed without ever
+        materializing [BS, N, B, D] tensors.  PM deltas and EM write buffers
+        share surprise/w_cand across banks (differing only by a per-bank
+        scalar), so the bank-sum collapses to scalar sums of per-bank factors.
 
         Args:
             H_flat: [BS, N, D] — column states (flat)
             seed: [BS, N, D] — EM trail seeds
             w_cand: [BS, N, D] — write candidates
             surprise: [BS, N, D] — vector surprise
+            commit: whether to commit memory updates at segment end
 
         Returns:
-            pm_deltas: [BS, N, B, D] — PM modulation deltas (no baseline)
-            em_reads: [BS, N, B, D] — EM trail reads
-            cum_ems: [BS, N, B, D] — EM causal write buffers
+            pm_read_sum: [BS, N, D] — PM modulation deltas, summed over B
+            em_read_sum: [BS, N, D] — EM trail reads, summed over B
+            cum_em_sum:  [BS, N, D] — EM causal write buffers, summed over B
         """
         BS, N, D = H_flat.shape
         B = self.config.B
 
-        # 1. PM write deltas and prefix sums (all banks)
-        delta_pm = self.pm.compute_deltas(surprise)       # [BS, N, B, D]
-        cum_pm = torch.cumsum(delta_pm, dim=1)            # [BS, N, B, D]
+        # 1. PM: fused read sum — no [BS, N, B, D]
+        #    sum_b[H * (bias_b + cumsum(lr_b * surprise))]
+        #    = H * (bias.sum(B) + lr.sum() * cumsum(surprise))
+        if self.config.pm_enabled:
+            lr_pm = self.pm.lr_pm                                     # [B]
+            bias_sum = self.pm.pm_bias.sum(dim=1, keepdim=True)       # [BS, 1, D]
+            cum_surprise = torch.cumsum(surprise, dim=1)              # [BS, N, D]
+            pm_read_sum = H_flat * (bias_sum + lr_pm.sum() * cum_surprise)
+        else:
+            pm_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
 
-        # 2. EM novelty and write deltas (all banks)
+        # 2. EM novelty (still returns [BS, N, B] — needed for commit)
         if self.config.em_enabled:
-            w_nov = torch.sigmoid(self.W_nov(H_flat))     # [BS, N, B]
+            w_nov = torch.sigmoid(self.W_nov(H_flat))                 # [BS, N, B]
             novelty = self.em.compute_novelty_all(
-                w_cand, surprise, w_nov=w_nov
-            )                                              # [BS, N, B]
-            delta_em = self.em.compute_write_deltas(novelty, w_cand)  # [BS, N, B, D]
+                w_cand, surprise, w_nov=w_nov,
+            )                                                          # [BS, N, B]
+            # Write buffer sum: fused — no [BS, N, B, D]
+            #   sum_b[cumsum(novelty_b * w_cand)] = cumsum(novelty.sum(B) * w_cand)
+            nov_sum = novelty.sum(dim=2, keepdim=True)                # [BS, N, 1]
+            cum_em_sum = torch.cumsum(nov_sum * w_cand, dim=1)        # [BS, N, D]
         else:
             novelty = torch.zeros(BS, N, B, device=H_flat.device, dtype=H_flat.dtype)
-            delta_em = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
+            cum_em_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
 
-        cum_em = torch.cumsum(delta_em, dim=1)            # [BS, N, B, D]
-
-        # 3. PM read — delta only (baseline H added once in forward_segment)
-        if self.config.pm_enabled:
-            pm_deltas = self.pm.read_all(H_flat, cum_pm)  # [BS, N, B, D]
-        else:
-            pm_deltas = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
-
-        # 4. EM trail read (all banks, from frozen primitives)
+        # 3. EM trail read (returns [BS, N, D] — summed over B internally)
         if self.config.em_enabled:
-            em_reads = self.em.trail_read_all(seed)       # [BS, N, B, D]
+            em_read_sum = self.em.trail_read_all(seed)                # [BS, N, D]
         else:
-            em_reads = torch.zeros(BS, N, B, D, device=H_flat.device, dtype=H_flat.dtype)
+            em_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
 
-        # 5. Segment-end commits (all banks)
-        if self.config.pm_enabled:
-            self.pm.commit(delta_pm.sum(dim=1))           # delta_pm_sum: [BS, B, D]
+        # 4. Segment-end commits — skipped for commit=False (inference)
+        if commit:
+            if self.config.pm_enabled:
+                # cum_surprise[:, -1] == surprise.sum(1) — reuse existing cumsum
+                pm_commit = self.pm.lr_pm[None, :, None] * cum_surprise[:, -1].unsqueeze(1)
+                self.pm.commit(pm_commit)
 
-        if self.config.em_enabled:
-            # novelty: [BS, N, B] -> mean over N -> [BS, B]
-            g_em = self.em_neuromod(
-                novelty.mean(dim=1).detach(),
-                self.em.usage_all().detach(),
-            )                                              # [BS, B]
-            self.em.commit_all(w_cand, novelty, g_em)
-            self.em.base_decay()
+            if self.config.em_enabled:
+                g_em = self.em_neuromod(
+                    novelty.mean(dim=1).detach(),
+                    self.em.usage_all().detach(),
+                )                                                      # [BS, B]
+                self.em.commit_all(w_cand, novelty, g_em)
+                self.em.base_decay()
 
-        return pm_deltas, em_reads, cum_em
+        return pm_read_sum, em_read_sum, cum_em_sum
 
     # ------------------------------------------------------------------
     # State management
@@ -267,7 +277,10 @@ class NeuromorphicLM(nn.Module):
     @torch.no_grad()
     def generate(self, prompt_ids: Tensor, max_new_tokens: int = 50,
                  temperature: float = 1.0, top_k: int = 50) -> Tensor:
-        """Simple autoregressive generation using N-token windows.
+        """Autoregressive generation with proper memory handling.
+
+        Prefill: non-overlapping N-token segments with memory commits.
+        Decode: sliding window with commit=False (memory frozen after prefill).
 
         prompt_ids: [BS, P]
         Returns: [BS, P + max_new_tokens]
@@ -275,19 +288,34 @@ class NeuromorphicLM(nn.Module):
         N = self.config.N
         BS = prompt_ids.shape[0]
         device = prompt_ids.device
-        sequence = prompt_ids
 
         if not self.pm.is_initialized() or not self.em.is_initialized():
             self.initialize_states(BS, device)
 
-        for _ in range(max_new_tokens):
-            ctx = sequence[:, -N:]
-            pad_len = N - ctx.shape[1]
-            if pad_len > 0:
-                ctx = F.pad(ctx, (pad_len, 0), value=0)
+        # --- Prefill: non-overlapping segments WITH memory commits ---
+        P = prompt_ids.shape[1]
+        logits = None
+        for seg_start in range(0, P, N):
+            seg = prompt_ids[:, seg_start:min(seg_start + N, P)]
+            actual_len = seg.shape[1]
+            if actual_len < N:
+                seg = F.pad(seg, (0, N - actual_len), value=0)
+            logits, _ = self.forward_segment(seg)
 
-            logits, _ = self.forward_segment(ctx)
-            next_logits = logits[:, -1, :]
+        # Position of last real prompt token in the last segment
+        last_pos = ((P - 1) % N) if P > 0 else 0
+
+        # --- Decode: sliding window WITHOUT memory commits ---
+        sequence = prompt_ids
+        for i in range(max_new_tokens):
+            if i == 0:
+                next_logits = logits[:, last_pos, :]
+            else:
+                ctx = sequence[:, -N:]
+                if ctx.shape[1] < N:
+                    ctx = F.pad(ctx, (N - ctx.shape[1], 0), value=0)
+                logits, _ = self.forward_segment(ctx, commit=False)
+                next_logits = logits[:, -1, :]
 
             if temperature != 1.0:
                 next_logits = next_logits / temperature

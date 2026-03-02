@@ -24,10 +24,10 @@ Stage 1: FAST SCAN (affine, parallel via parallel-scan)
   → Produces: EM trail seeds, write candidates, surprise vectors, column states
 
 Stage 2: MEMORY OPS (non-affine, batched across all N positions)
-  → Proposed writes computed first (per-token, parallel, from frozen memory)
-  → Prefix sums of write deltas (causal accumulation, O(N))
-  → PM read with causal bias (frozen + prefix-summed surprise)
-  → EM trail read from frozen primitives (compositional, long-term)
+  → Fused algebra: bank-sum computed without materializing [BS,N,B,D]
+  → PM: H * (bias.sum(B) + lr.sum() * cumsum(surprise))  — [BS,N,D]
+  → EM write buffer: cumsum(novelty.sum(B) * w_cand)      — [BS,N,D]
+  → EM trail read from frozen primitives, summed over B    — [BS,N,D]
   → End of segment: actual structured commit to memory state
 
 Stage 3: INTEGRATION SCAN (affine, parallel via parallel-scan)
@@ -137,7 +137,7 @@ For each segment of N tokens:
 
   STAGE 3 — Integration Scan (causal, parallel via parallel-scan):
     For t = 1..N (parallelized):
-      input_t = H_t + Σ_b(pm_delta_t) + Σ_b(em_read_t) + Σ_b(cum_em_t)  # baseline + deltas
+      input_t = H_t + pm_read_sum_t + em_read_sum_t + cum_em_sum_t  # baseline + fused sums
       h'_t = a'_t ⊙ h'_{t-1} + b'_t             # scan on input_t
       logits_t = LM_head(H'_t)
 
@@ -218,76 +218,47 @@ write signals. The actual structured commit happens at segment end.
 
 ```python
 def memory_ops(self, H, seed, w_cand, surprise):
-    """Stage 2: Write-then-read with causal write buffers.
+    """Stage 2: Write-then-read with fused algebra.
 
-    1. Compute proposed writes per-token (parallel, from frozen memory)
-    2. Prefix sum write deltas (causal accumulation)
-    3. PM read uses causal bias (frozen + prefix-summed surprise)
-    4. EM trail reads from frozen primitives (long-term knowledge)
-    5. End of segment: actual structured commit to memory
+    Algebraic fusion: the sum over B banks is computed without
+    materializing [BS, N, B, D] tensors.  PM deltas and EM write buffers
+    share surprise/w_cand across banks (differing only by a per-bank
+    scalar factor), so the bank-sum collapses to scalar sums.
 
     Returns:
-        pm_reads:  [BS, N, B, D]  — PM gain reads (with causal bias)
-        em_reads:  [BS, N, B, D]  — EM trail reads (from frozen)
-        cum_em:    [BS, N, B, D]  — EM write buffer (within-segment new info)
+        pm_read_sum:  [BS, N, D]  — PM gain reads, summed over B
+        em_read_sum:  [BS, N, D]  — EM trail reads, summed over B
+        cum_em_sum:   [BS, N, D]  — EM write buffer, summed over B
     """
-    pm_reads, em_reads, cum_ems = [], [], []
 
-    # Learned novelty blend weight
-    w_nov = sigmoid(W_nov(H))                      # [BS, N, B] — per-bank blend
+    # --- PM: fused read sum (no [BS, N, B, D]) ---
+    # sum_b[H * (bias_b + cumsum(lr_b * surprise))]
+    #   = H * (bias.sum(B) + lr.sum() * cumsum(surprise))
+    cum_surprise = cumsum(surprise, dim=seq)           # [BS, N, D]
+    pm_read_sum = H * (pm_bias.sum(B) + lr_pm.sum() * cum_surprise)  # [BS, N, D]
 
-    for b in range(B):
-        # --- 1. PROPOSED WRITES (per-token, parallel, from frozen memory) ---
-        # PM write delta: surprise-driven bias shift
-        delta_pm = lr_pm[b] * surprise              # [BS, N, D] — per-token
+    # --- EM novelty (still [BS, N, B] — needed for commit) ---
+    w_nov = sigmoid(W_nov(H))                          # [BS, N, B]
+    novelty = compute_novelty_all(w_cand, surprise, w_nov)  # [BS, N, B]
 
-        # EM write delta: novelty-weighted write candidate (shared seed/w_cand)
-        novelty = compute_novelty(w_cand, surprise, em_K[b], em_V[b], w_nov[:, :, b])
-        delta_em = novelty * w_cand                  # [BS, N, D] — per-token
+    # --- EM write buffer: fused sum (no [BS, N, B, D]) ---
+    # sum_b[cumsum(novelty_b * w_cand)] = cumsum(novelty.sum(B) * w_cand)
+    nov_sum = novelty.sum(dim=B, keepdim=True)         # [BS, N, 1]
+    cum_em_sum = cumsum(nov_sum * w_cand, dim=seq)     # [BS, N, D]
 
-        # --- 2. PREFIX SUMS (causal accumulation, O(N)) ---
-        cum_pm = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
-        cum_em = cumsum(delta_em, dim=seq)         # [BS, N, D] — inclusive
-        # Token t sees writes from tokens 0..t (inclusive — causal for NTP)
+    # --- EM trail read (summed over B internally) ---
+    em_read_sum = trail_read_all(seed)                 # [BS, N, D]
 
-        # --- 3. PM READ — delta only (write-before-read) ---
-        pm_delta = H[:, :, b] * (pm_bias[b] + cum_pm)     # [BS, N, D]
-        # pm_bias[b] is frozen from previous segment
-        # cum_pm adds per-token causal bias adaptation
-        # Baseline H is added ONCE in Stage 3 integration (not per-bank)
+    # --- SEGMENT-END COMMIT ---
+    # PM: lr * surprise.sum(N) — direct [BS, B, D], no [BS,N,B,D]
+    pm_commit = lr_pm[None, :, None] * surprise.sum(N).unsqueeze(1)
+    pm_bias += pm_commit; pm_bias *= decay
 
-        # --- 4. EM TRAIL READ from frozen primitives ---
-        s = seed[:, :, b]                          # [BS, N, D] — trail start
-        if training:
-            s = s + σ[b] * randn_like(s)           # noise for exploration
+    # EM: full decomposition write (unchanged)
+    g_em = em_neuromodulator(novelty.mean(N), usage)
+    em.commit_all(w_cand, novelty, g_em)
 
-        y = s
-        for step in range(n_steps):                # n_steps = 2
-            attn = softmax(y @ em_K[b].T / τ[b])   # [BS, N, M] — all primitives
-            delta = attn @ em_V[b]                  # [BS, N, D] — composition
-            gate = sigmoid(W_gate(cat(y, delta)))   # [BS, N, D] — learned gate
-            y = y + gate * delta                    # seed moves
-
-        em_read = y - s                             # [BS, N, D] — net contribution
-
-        pm_reads.append(pm_read)
-        em_reads.append(em_read)
-        cum_ems.append(cum_em)                      # write buffer for Stage 3
-
-        # --- 5. SEGMENT-END COMMIT (actual structured write) ---
-        # PM: apply total bias shift (sum over ALL N tokens)
-        pm_bias[b] += delta_pm.sum(dim=seq)         # [BS, D] — aggregate
-
-        # EM: full decomposition write (routing, neuromodulator, EMA)
-        route = softmax(normalize(w_cand) @ em_K[b].T / τ_w)  # shared w_cand
-        update_K = sum_n(novelty * route * w_cand)
-        update_V = sum_n(novelty * route * w_cand)
-        g_em = em_neuromodulator(novelty_mean, usage)
-        α = g_em * route_aggregated
-        em_K[b] = (1 - α) * em_K[b] + α * normalize(update_K)
-        em_V[b] = (1 - α) * em_V[b] + α * update_V
-
-    return stack(pm_reads), stack(em_reads), stack(cum_ems)
+    return pm_read_sum, em_read_sum, cum_em_sum
 ```
 
 **Column-local memory addressing:** PM bias bank b has shape `[BS, D]`.
@@ -672,7 +643,7 @@ Inference memory: scan states (C × D_col per scan × 2 scans) + PM + EM.
 # Tier A example (target ~105M params)
 D = 2048          # internal model width
 D_embed = 384     # embedding / LM head width
-B = 6             # memory banks
+B = 4             # memory banks
 C = 16            # columns per bank
 D_col = 128       # = D / C — column width
 N = 512           # segment length
@@ -833,8 +804,9 @@ H is `[BS, N, C, D_col]` (column-indexed). Memory is `[BS, B, ...]` (bank-indexe
 For bank b's operations: `H_bank = H.reshape(BS, N, D)`. All B banks share the
 same column states — different banks hold different memory but modulate the same H.
 Similarly, `surprise.reshape(BS, N, D)` for bank-level delta computation.
-Stage 2 returns `[BS, N, B, D]` signals; Stage 3 sums over B and reshapes to
-`[BS, N, C, D_col]` for the integration scan.
+Stage 2 returns `[BS, N, D]` signals (bank-sum computed via fused algebra,
+never materializing `[BS, N, B, D]`); Stage 3 reshapes to `[BS, N, C, D_col]`
+for the integration scan.
 
 **Pseudocode indexing notation:**
 `em_K[b]` means `em_K[:, b]` (index the B dimension, keep batch). `pm_bias[b]`

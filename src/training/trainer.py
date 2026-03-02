@@ -143,11 +143,11 @@ class TBPTTTrainer:
         else:
             prev_token = batch.prev_token.to(self.device)
 
-        chunk_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        chunk_loss = None  # set on first segment to avoid requires_grad leaf
         valid_count = torch.tensor(0, device=self.device, dtype=torch.long)
         total_tokens = BS * T
-        eot_inputs_t = torch.tensor(0, device=self.device, dtype=torch.long)
-        reset_events_t = torch.tensor(0, device=self.device, dtype=torch.long)
+        eot_inputs = 0   # CPU counters — no GPU sync needed
+        reset_events = 0
         seg_count = 0
 
         t_start = time.time()
@@ -166,9 +166,9 @@ class TBPTTTrainer:
             else:
                 reset_mask = (input_ids[:, seg_start - 1] == eot_id)
 
-            reset_events_t = reset_events_t + reset_mask.sum()
+            reset_events += reset_mask.sum().item()
             is_eot = (seg_ids == eot_id)
-            eot_inputs_t = eot_inputs_t + is_eot.sum()
+            eot_inputs += is_eot.sum().item()
 
             # NTP path
             if self.config.reset_on_doc_boundary:
@@ -191,13 +191,10 @@ class TBPTTTrainer:
                     f"segment [{seg_start}, {seg_end})."
                 )
 
-            chunk_loss = chunk_loss + ce_loss + aux_loss * seg_valid
+            seg_loss = ce_loss + aux_loss * seg_valid
+            chunk_loss = seg_loss if chunk_loss is None else chunk_loss + seg_loss
             valid_count = valid_count + seg_valid
             seg_count += 1
-
-        # Sync GPU counters once after all segments
-        eot_inputs = eot_inputs_t.item()
-        reset_events = reset_events_t.item()
 
         # Backward + clip + optimizer step
         avg_loss, reg, grad_norm = self._backward_and_step(chunk_loss, valid_count)
@@ -240,8 +237,7 @@ class TBPTTTrainer:
 
         if not math.isfinite(grad_norm):
             self.optimizer.zero_grad()
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # Don't step scheduler — skipping optimizer means LR should not advance
             self._nan_steps = getattr(self, '_nan_steps', 0) + 1
             tqdm.write(
                 f"WARNING: Non-finite gradient norm at step {self.global_step} "
@@ -282,11 +278,9 @@ class TBPTTTrainer:
         else:
             pm_budget_util, em_budget_util = None, None
 
-        _scalars = torch.stack([avg_loss.detach(), reg.detach(),
-                                torch.exp(avg_loss.detach())]).cpu()
-        _loss_f = _scalars[0].item()
-        _reg_f = _scalars[1].item()
-        _ppl_f = min(_scalars[2].item(), 1e6)
+        _loss_f = avg_loss.detach().item()
+        _reg_f = reg.detach().item()
+        _ppl_f = min(math.exp(_loss_f), 1e6)
 
         step_metrics = {
             "loss": _loss_f,

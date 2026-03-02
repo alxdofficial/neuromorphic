@@ -26,7 +26,6 @@ def main():
 
     model = NeuromorphicLM(config).to(device)
     model.initialize_states(BS, device)
-    model.compile_for_training()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
@@ -79,7 +78,8 @@ def main():
     print(f"\nAverage: {avg:.4f}s/step = {tok_per_step/avg:.0f} tok/s")
     print(f"Peak VRAM during training: {vram_peak:.2f} GB")
     print(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
-    print(f"Config: D={config.D}, L={config.L}, B={config.B}, T={config.T}, P={config.P}")
+    print(f"Config: D={config.D}, D_embed={config.D_embed}, C={config.C}, "
+          f"L_scan={config.L_scan}, B={config.B}, T={config.T}")
 
     # PyTorch profiler
     print(f"\nRunning PyTorch profiler ({args.steps} steps)...")

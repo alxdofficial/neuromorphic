@@ -9,7 +9,7 @@ import pytest
 from tests.conftest import make_tiny_config, forward_one_segment
 
 from src.model.model import NeuromorphicLM
-from src.model.scan import ScanLayer, sequential_scan
+from src.model.scan import ScanLayer, sequential_scan, parallel_scan, fused_scan
 from src.model.predictive_coding import GroupedLinear, GroupedLayerNorm, WithinScanPCM
 from src.model.procedural_memory import ProceduralMemory
 from src.model.episodic_memory import EpisodicMemory, EMNeuromodulator
@@ -67,6 +67,72 @@ class TestSequentialScan:
         for t in range(4):
             h_manual = a[0, t] * h_manual + b[0, t]
             assert torch.allclose(h[0, t], h_manual, atol=1e-5)
+
+
+class TestParallelScan:
+    @pytest.mark.parametrize("N", [1, 2, 3, 4, 16, 64, 128, 255, 256, 512])
+    def test_matches_sequential(self, N):
+        """parallel_scan must match sequential_scan for all N."""
+        torch.manual_seed(42)
+        C, E = 4, 32
+        a = torch.sigmoid(torch.randn(BS, N, C, E))
+        b = torch.randn(BS, N, C, E)
+        h0 = torch.randn(BS, C, E)
+        ref = sequential_scan(a, b, h0)
+        out = parallel_scan(a, b, h0)
+        assert torch.allclose(ref, out, atol=1e-4), (
+            f"N={N}: max diff {(ref - out).abs().max().item():.2e}"
+        )
+
+    def test_no_h0(self):
+        """parallel_scan without h0 should match sequential_scan."""
+        torch.manual_seed(0)
+        a = torch.sigmoid(torch.randn(BS, 64, 4, 32))
+        b = torch.randn(BS, 64, 4, 32)
+        ref = sequential_scan(a, b)
+        out = parallel_scan(a, b)
+        assert torch.allclose(ref, out, atol=1e-4)
+
+    def test_gradient_flow(self):
+        """Gradients should flow through parallel_scan."""
+        a_raw = torch.randn(BS, 16, 2, 8, requires_grad=True)
+        b = torch.randn(BS, 16, 2, 8, requires_grad=True)
+        h0 = torch.randn(BS, 2, 8, requires_grad=True)
+        a = torch.sigmoid(a_raw)
+        out = parallel_scan(a, b, h0)
+        loss = out.sum()
+        loss.backward()
+        assert a_raw.grad is not None and a_raw.grad.shape == a_raw.shape
+        assert b.grad is not None and b.grad.shape == b.shape
+        assert h0.grad is not None and h0.grad.shape == h0.shape
+
+
+class TestFusedScan:
+    @pytest.mark.parametrize("N", [1, 16, 64, 255, 256, 512])
+    def test_matches_sequential(self, N):
+        """fused_scan must match sequential_scan for all N."""
+        torch.manual_seed(42)
+        C, E = 4, 32
+        a_raw = torch.randn(BS, N, C, E)
+        b = torch.randn(BS, N, C, E)
+        h0 = torch.randn(BS, C, E)
+        ref = sequential_scan(torch.sigmoid(a_raw), b, h0)
+        out = fused_scan(a_raw, b, h0)
+        assert torch.allclose(ref, out, atol=1e-5), (
+            f"N={N}: max diff {(ref - out).abs().max().item():.2e}"
+        )
+
+    def test_gradient_flow(self):
+        """Gradients should flow through fused_scan."""
+        a_raw = torch.randn(BS, 16, 2, 8, requires_grad=True)
+        b = torch.randn(BS, 16, 2, 8, requires_grad=True)
+        h0 = torch.randn(BS, 2, 8, requires_grad=True)
+        out = fused_scan(a_raw, b, h0)
+        loss = out.sum()
+        loss.backward()
+        assert a_raw.grad is not None and a_raw.grad.shape == a_raw.shape
+        assert b.grad is not None and b.grad.shape == b.shape
+        assert h0.grad is not None and h0.grad.shape == h0.shape
 
 
 class TestScanLayer:
@@ -194,7 +260,6 @@ class TestEpisodicMemory:
         assert em.em_K.shape == (BS, cfg.B, cfg.M, cfg.D)
         assert em.em_V.shape == (BS, cfg.B, cfg.M, cfg.D)
         assert em.em_S.shape == (BS, cfg.B, cfg.M)
-        assert em.em_age.shape == (BS, cfg.B, cfg.M)
 
     def test_trail_read_all_shape(self):
         cfg = make_tiny_config()
@@ -206,7 +271,7 @@ class TestEpisodicMemory:
         em.em_S = torch.ones(BS, cfg.B, cfg.M)
         seed = torch.randn(BS, 8, cfg.D)
         y = em.trail_read_all(seed)
-        assert y.shape == (BS, 8, cfg.B, cfg.D)
+        assert y.shape == (BS, 8, cfg.D)
 
     def test_trail_read_all_empty_memory(self):
         """Trail read from empty memory should not crash."""
@@ -215,7 +280,7 @@ class TestEpisodicMemory:
         em.initialize(BS, torch.device("cpu"), torch.float32)
         seed = torch.randn(BS, 8, cfg.D)
         y = em.trail_read_all(seed)
-        assert y.shape == (BS, 8, cfg.B, cfg.D)
+        assert y.shape == (BS, 8, cfg.D)
         assert torch.isfinite(y).all()
 
     def test_compute_novelty_all_shape(self):

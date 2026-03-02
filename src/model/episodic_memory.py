@@ -23,10 +23,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         em_K: [BS, B, M, D] — primitive keys (unit-normalized)
         em_V: [BS, B, M, D] — primitive values
         em_S: [BS, B, M] — strengths (0 = inactive)
-        em_age: [BS, B, M] — segments since last write
     """
 
-    _state_tensor_names = ["em_K", "em_V", "em_S", "em_age"]
+    _state_tensor_names = ["em_K", "em_V", "em_S"]
 
     def __init__(self, B: int, M: int, D: int, n_steps: int = 2,
                  S_max: float = 3.0, budget: float = 32.0,
@@ -41,10 +40,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.decay = decay
 
         # Trail parameters (per bank)
-        self.w1 = nn.Parameter(torch.randn(B, D) * 0.02)
-        self.w2 = nn.Parameter(torch.randn(B, D) * 0.02)
-        self.gate_bias = nn.Parameter(torch.zeros(B, D))
-        self.raw_tau = nn.Parameter(torch.zeros(B))        # softplus -> temperature
+        self.gate_alpha = nn.Parameter(torch.randn(B) * 0.02)  # scalar gate scale
+        self.gate_bias = nn.Parameter(torch.zeros(B))           # scalar gate bias
+        self.raw_tau = nn.Parameter(torch.zeros(B))             # softplus -> temperature
         self.raw_sigma = nn.Parameter(torch.full([B], -2.0))  # softplus -> noise std
         self.raw_tau_w = nn.Parameter(torch.zeros(B))      # write temperature
 
@@ -52,14 +50,12 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_K: Tensor | None = None
         self.em_V: Tensor | None = None
         self.em_S: Tensor | None = None
-        self.em_age: Tensor | None = None
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
         """Pre-allocate state tensors."""
         self.em_K = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
         self.em_V = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
         self.em_S = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
-        self.em_age = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.em_K is not None
@@ -71,7 +67,7 @@ class EpisodicMemory(nn.Module, StateMixin):
             seed: [BS, N, D] — trail starting point (shared across banks)
 
         Returns:
-            y_em: [BS, N, B, D] — net memory contribution (y - seed) per bank
+            y_em: [BS, N, D] — net memory contribution (y - seed), summed over banks
         """
         BS, N, D = seed.shape
         B = self.B
@@ -90,6 +86,10 @@ class EpisodicMemory(nn.Module, StateMixin):
         # active mask: [BS, B, 1, M] — broadcasts over N
         active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
 
+        # Pre-compute gate params: [B] -> [1, B, 1, 1]
+        g_alpha = self.gate_alpha[None, :, None, None]
+        g_bias = self.gate_bias[None, :, None, None]
+
         for step in range(self.n_steps):
             # scores: [BS, B, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
             scores = torch.matmul(y, self.em_K.transpose(-2, -1)) / tau
@@ -99,15 +99,13 @@ class EpisodicMemory(nn.Module, StateMixin):
             # delta: [BS, B, N, M] @ [BS, B, M, D] -> [BS, B, N, D]
             delta = torch.matmul(attn, self.em_V)
 
-            # Element-wise gate: w1, w2, gate_bias are [B, D] -> [1, B, 1, D]
-            w1 = self.w1[None, :, None, :]
-            w2 = self.w2[None, :, None, :]
-            gb = self.gate_bias[None, :, None, :]
-            gate = torch.sigmoid(w1 * y + w2 * delta + gb)
+            # Scalar gate: dot-product similarity -> sigmoid -> scale delta
+            dot = (y * delta).sum(dim=-1, keepdim=True) / D  # [BS, B, N, 1]
+            gate = torch.sigmoid(g_alpha * dot + g_bias)      # [BS, B, N, 1]
             y = y + gate * delta
 
-        # result: [BS, B, N, D] -> [BS, N, B, D]
-        return (y - s).permute(0, 2, 1, 3)
+        # result: [BS, B, N, D] -> sum over B (dim 1) -> [BS, N, D]
+        return (y - s).sum(dim=1)
 
     def compute_novelty_all(
         self, w_cand: Tensor, surprise: Tensor,
@@ -200,7 +198,8 @@ class EpisodicMemory(nn.Module, StateMixin):
         # novelty: [BS, N, B] -> [BS, B, N, 1]
         nov = novelty.permute(0, 2, 1).unsqueeze(-1)
         weighted_route = nov * route               # [BS, B, N, M]
-        route_agg = weighted_route.mean(dim=2)     # [BS, B, M]
+        wr_sum = weighted_route.sum(dim=2)         # [BS, B, M]
+        route_agg = wr_sum * (1.0 / N)            # [BS, B, M] — mean without extra reduction
 
         # Aggregated updates: [BS, B, M, N] @ [BS, B, N, D] -> [BS, B, M, D]
         # w_norm: [BS, 1, N, D], w_cand: [BS, 1, N, D] — broadcast across B
@@ -210,7 +209,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         update_V = torch.matmul(weighted_route.transpose(2, 3), w_cand_b)  # [BS, B, M, D]
 
         # Normalize updates per primitive
-        denom = weighted_route.sum(dim=2).unsqueeze(-1).clamp(min=1e-8)  # [BS, B, M, 1]
+        denom = wr_sum.unsqueeze(-1).clamp(min=1e-8)  # [BS, B, M, 1]
         update_K = update_K / denom
         update_V = update_V / denom
 
@@ -223,18 +222,14 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_K = (1 - alpha_exp) * self.em_K + alpha_exp * unit_normalize(update_K)
         self.em_V = (1 - alpha_exp) * self.em_V + alpha_exp * update_V
         self.em_S = (self.em_S + alpha).clamp(0, self.S_max)
-        self.em_age = self.em_age * (1 - alpha)
 
         # Budget enforcement
         self.em_S = budget_enforce(self.em_S.view(-1, M), self.budget).view_as(self.em_S)
 
     def base_decay(self):
-        """Apply strength decay and age tick once per segment."""
+        """Apply strength decay once per segment."""
         if self.em_S is not None:
             self.em_S = self.em_S * self.decay
-        if self.em_age is not None:
-            active = (self.em_S > 0).to(self.em_age.dtype)
-            self.em_age = self.em_age + active
 
     def usage_all(self) -> Tensor:
         """Usage fraction for all banks. Returns [BS, B]."""
@@ -249,7 +244,6 @@ class EpisodicMemory(nn.Module, StateMixin):
         expanded = mask[:, None, None]           # [BS, 1, 1]
         expanded_kv = mask[:, None, None, None]  # [BS, 1, 1, 1]
         self.em_S = self.em_S * ~expanded
-        self.em_age = self.em_age * ~expanded
         self.em_K = self.em_K * ~expanded_kv
         self.em_V = self.em_V * ~expanded_kv
 

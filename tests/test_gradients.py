@@ -131,7 +131,7 @@ class TestGradientFlow:
         total_loss.backward()
 
         em = model.em
-        for name in ["w1", "w2", "gate_bias", "raw_tau", "raw_sigma"]:
+        for name in ["gate_alpha", "gate_bias", "raw_tau", "raw_sigma"]:
             param = getattr(em, name)
             assert param.grad is not None, f"No gradient for em.{name}"
 

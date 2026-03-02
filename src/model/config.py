@@ -128,9 +128,9 @@ class ModelConfig:
     def tier_a(cls, **overrides) -> "ModelConfig":
         """Dev tier (~130M). Matches Mamba-130M scale."""
         defaults = dict(
-            D=2048, D_embed=384, B=6, C=16,
-            N=512, L_scan=12, scan_expansion=4,
-            M=256, n_trail_steps=2,
+            D=2048, D_embed=384, B=4, C=16,
+            N=512, L_scan=6, scan_expansion=8,
+            M=384, n_trail_steps=1,
             budget_pm=16, budget_em=32,
         )
         defaults.update(overrides)

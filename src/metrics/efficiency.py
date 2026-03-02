@@ -74,7 +74,7 @@ def measure_flops_per_token(
     """Count forward-pass FLOPs using torch.utils.flop_counter.FlopCounterMode.
 
     For the neuromorphic model, forward_fn should call forward_segment which
-    includes all R passes — the counter sees them all.
+    includes all three stages — the counter sees them all.
 
     Must run with use_compile=False (compiled ops fuse ATen ops that the
     counter hooks into).

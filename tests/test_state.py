@@ -81,14 +81,13 @@ class TestReset:
 
 class TestEMReset:
     def test_em_reset_zeros_all_state(self):
-        """EM reset: em_S, em_age, em_K, em_V all zeroed for masked."""
+        """EM reset: em_S, em_K, em_V all zeroed for masked."""
         model, cfg = _init_model("A")
 
         em = model.em
         em.em_K = torch.randn(BS, cfg.B, cfg.M, cfg.D)
         em.em_V = torch.randn(BS, cfg.B, cfg.M, cfg.D)
         em.em_S = torch.ones(BS, cfg.B, cfg.M)
-        em.em_age = torch.ones(BS, cfg.B, cfg.M) * 50
 
         em_K_before = em.em_K.clone()
         em_V_before = em.em_V.clone()
@@ -98,7 +97,6 @@ class TestEMReset:
 
         # Stream 0: everything zeroed
         assert (em.em_S[0] == 0).all(), "em_S should be zeroed for masked"
-        assert (em.em_age[0] == 0).all(), "em_age should be zeroed for masked"
         assert (em.em_K[0] == 0).all(), "em_K should be zeroed for masked"
         assert (em.em_V[0] == 0).all(), "em_V should be zeroed for masked"
         # Stream 1 preserved
