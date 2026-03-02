@@ -7,8 +7,8 @@ update this file. If not, the code has a regression.
 # ---------------------------------------------------------------------------
 # Tier defaults (from ModelConfig.tier_a/b classmethods)
 # ---------------------------------------------------------------------------
-TIER_A = dict(D=2048, D_embed=384, B=4, C=16, L_scan=6, M=384, scan_expansion=8)
-TIER_B = dict(D=3072, D_embed=512, B=12, C=16, L_scan=16, M=512, scan_expansion=4)
+TIER_A = dict(D=2048, D_embed=384, B=4, C=16, L_scan=6, M=384, scan_expansion=8, d_inner=1024)
+TIER_B = dict(D=3072, D_embed=512, B=12, C=16, L_scan=16, M=512, scan_expansion=4, d_inner=768)
 
 # ---------------------------------------------------------------------------
 # Default hyperparameters (from ModelConfig dataclass defaults)

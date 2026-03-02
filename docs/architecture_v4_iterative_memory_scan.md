@@ -1,4 +1,4 @@
-# Architecture v5: Scan-Memory-Scan with Cortical Columns
+# Architecture v5.1: Scan-Memory-Scan — Dense Scan + Grouped PCM
 
 > **Previous versions**: v4 (iterative R-loop refinement) preserved on `v4-iterative-backup` branch.
 > v1 preserved on `v1-legacy` branch.
@@ -18,10 +18,10 @@ The brain processes sensory input through two interleaved systems:
 We implement this as a **three-stage cycle** per segment of N tokens:
 
 ```
-Stage 1: FAST SCAN (affine, parallel via parallel-scan)
-  → Process N tokens causally through C narrow cortical columns
-  → Each column maintains a recurrent state via linear recurrence
-  → Produces: EM trail seeds, write candidates, surprise vectors, column states
+Stage 1: FAST SCAN (dense nn.Linear, parallel via parallel-scan)
+  → Process N tokens causally through dense [BS,N,D] scan layers
+  → PCM operates on grouped [BS,N,C,D_col] view for per-feature-group surprise
+  → Produces: EM trail seeds, write candidates, surprise vectors, scan states
 
 Stage 2: MEMORY OPS (non-affine, batched across all N positions)
   → Fused algebra: bank-sum computed without materializing [BS,N,B,D]
@@ -30,10 +30,10 @@ Stage 2: MEMORY OPS (non-affine, batched across all N positions)
   → EM trail read from frozen primitives, summed over B    — [BS,N,D]
   → End of segment: actual structured commit to memory state
 
-Stage 3: INTEGRATION SCAN (affine, parallel via parallel-scan)
-  → Second causal scan integrates PM read + EM trail + EM write buffer
+Stage 3: INTEGRATION SCAN (dense nn.Linear, parallel via parallel-scan)
+  → Second dense causal scan integrates PM read + EM trail + EM write buffer
   → Write buffer (prefix sum of write candidates) provides within-segment
-    new information and cross-column mixing
+    new information
   → Produces final predictions (NTP logits)
 ```
 
@@ -74,17 +74,16 @@ three-stage cycle mirrors this: fast processing → memory interaction → integ
 
 ### Components
 
-**Cortical columns** (narrow, many, process independently):
-- C columns, each operating on a D_col = D/C feature slice of every token
-- At each timestep, all C columns process the same token's embedding, each
-  seeing its own D_col-wide feature slice
-- Each column maintains a recurrent state h_c,t via element-wise linear recurrence
-  (`h_t = a_t ⊙ h_{t-1} + b_t`) — columns are **independent** within the scan
-- **PCM** — predictive coding within the scan (predict next token's encoding,
-  compute vector surprise)
+**Scan layers** (dense, full D mixing):
+- Dense nn.Linear projections for GPU matmul efficiency
+- Element-wise linear recurrence: `h_t = a_t ⊙ h_{t-1} + b_t` on d_inner dims
 - No separate FFN — the scan's input/output projections serve this role
-- Columns produce trail seeds and write candidates as linear projections of
-  their scan state
+
+**Feature groups** (C groups of D_col, for PCM and memory addressing):
+- C = D / D_col feature groups, used by PCM and W_seed_w (GroupedLinear)
+- Free .view() between [BS,N,D] and [BS,N,C,D_col] (contiguous memory)
+- **PCM** — per-group predictive coding (predict next token's encoding per group)
+- Trail seeds and write candidates produced per-group via GroupedLinear
 
 **Shared memory systems** (B independent banks, addressed by column slices):
 - **PM** — procedural memory: learned bias vector per bank (basal ganglia).
@@ -97,13 +96,12 @@ three-stage cycle mirrors this: fast processing → memory interaction → integ
 - PM state shape: `[BS, B, D]` (one bias vector per bank)
 - EM state shape: `[BS, B, M, D]` where D = C × D_col (M primitives per bank)
 
-**No within-scan lateral mixing**:
-- Columns are **independent** within each scan — element-wise A, no cross-column
-  coupling. This mirrors cortical biology where columns process independently
-  and mix through downstream convergence zones.
-- Cross-column integration happens through **memory** (Stage 2): all columns
-  read from and write to shared memory banks, which serve as the binding
-  mechanism — analogous to thalamic/hippocampal hubs in the brain.
+**Dense scan, grouped PCM/projections** (v5.1):
+- Scan layers use dense nn.Linear — all D features mix freely for GPU efficiency.
+- PCM and W_seed_w operate on grouped [BS,N,C,D_col] views (free reshape) so
+  surprise and memory-facing signals remain per-feature-group.
+- Cross-feature-group integration in scans, per-feature-group structure in
+  prediction and memory addressing.
 
 ### How It Works (High Level)
 
@@ -147,55 +145,52 @@ For each segment of N tokens:
 Stage 1 and Stage 3 are embarrassingly parallel via parallel-scan algorithms.
 Stage 2 is a fixed-cost batch operation (all N positions independent).
 
-### Stage 1: Fast Scan (The Neocortical Stream)
+### Stage 1: Fast Scan (Dense + Grouped PCM)
 
-All C columns process every token, each seeing its D_col = D/C feature slice.
-The scan is causal — token t's state depends on tokens 1..t-1.
+Scan layers are fully dense (nn.Linear) for GPU efficiency — all D features
+mix freely in each layer. PCM operates on a grouped [BS,N,C,D_col] view
+(free reshape) so surprise/prediction remains per-feature-group.
 
 ```python
 def fast_scan(self, input_ids):
-    """Stage 1: Causal affine scan through all N tokens.
+    """Stage 1: Dense causal scan through all N tokens.
 
-    Produces column states, trail seeds, write candidates, and surprise.
-    Parallelized via chunked parallel-scan (à la Mamba).
+    Scan is dense [BS,N,D]. PCM and W_seed_w use grouped [BS,N,C,D_col] views.
+    The view between shapes is free (contiguous memory, same layout).
 
     Returns:
-        H:        [BS, N, C, D_col]    — column hidden states (gain-modulated)
+        H:        [BS, N, D]           — scan hidden states (gain-modulated)
         seed:     [BS, N, D]           — EM trail seeds (shared across banks)
         w_cand:   [BS, N, D]           — write candidates (shared across banks)
-        surprise: [BS, N, C, D_col]    — vector surprise signals
+        surprise: [BS, N, D]           — vector surprise signals
     """
     x = embed(input_ids)             # [BS, N, D_embed]
     x = proj_up(x)                   # [BS, N, D]
     x = x + pos_embed                # [BS, N, D]
 
-    # Each column gets its D_col slice: column c sees x[..., c*D_col:(c+1)*D_col]
-    # Element-wise linear recurrence: h_t = a_t ⊙ h_{t-1} + b_t
-    # a_t, b_t are input-dependent linear projections
-    # Columns are independent — no cross-column mixing in scan
+    # Dense scan: nn.Linear projections, full D mixing
+    H = dense_scan(x)               # [BS, N, D]
 
-    H = parallel_scan(x)             # [BS, N, C, D_col]
+    # PCM: view as grouped for per-feature-group surprise
+    H_col = H.view(BS, N, C, D_col)             # free view
+    x_col = x.view(BS, N, C, D_col)             # free view
+    surprise_col = pcm.compute_surprise(H_col, x_col)
+    H_col = pcm.apply_gain(H_col, surprise_col)
+    H = H_col.view(BS, N, D)                    # back to dense (free)
+    surprise = surprise_col.reshape(BS, N, D)
 
-    # PCM: prediction, surprise, and gain modulation (applied BEFORE projections)
-    z = pcm_encode(x)                # [BS, N, C, D_col] — current encoding
-    z_hat = W_pcm(H)                 # [BS, N, C, D_col] — PCM prediction
-    surprise = z_hat_prev - z        # [BS, N, C, D_col] — VECTOR, not scalar
-    H = H * (1 + 0.1 * tanh(W_gain(surprise)))  # PCM gain modulation
-
-    # Linear projections from gain-modulated column states
-    # Shared across banks — each bank receives the same seed/w_cand
-    # but addresses its own memory partition (specialization emerges from memory content)
-    # Fused projection: single matmul, split output
-    sw = W_seed_w(H)                 # [BS, N, C, 2*D_col]
-    seed, w_cand = split(sw)         # each [BS, N, D] — shared across banks
+    # Grouped projections (per-feature-group seeds + write candidates)
+    H_col = H.view(BS, N, C, D_col)             # free view
+    sw = W_seed_w(H_col)            # [BS, N, C, 2*D_col] — GroupedLinear
+    seed, w_cand = split(sw)        # each [BS, N, D] — shared across banks
 
     return H, seed, w_cand, surprise
 ```
 
-**What's in the scan state:** Each column c maintains a hidden state h_c ∈ R^D_col.
-The full scan state is H ∈ R^{C × D_col} = R^D. Because A is element-wise (no
-cross-column mixing), this is C independent scans — each column evolves its own D_col
-state. Cross-column integration happens through shared memory in Stage 2.
+**Dense scan, grouped PCM:** The scan mixes all D features freely via nn.Linear
+for maximum GPU matmul efficiency (~80-100% vs 23% with grouped). PCM retains
+per-feature-group structure via free .view() reshaping — surprise at column c
+is based on predicting that column's D_col features, not all D.
 
 **Scan carry across segments:** Currently, scan hidden states are reset to zero at each
 segment boundary (h_0 = 0). Cross-segment context is carried entirely through memory
@@ -660,19 +655,12 @@ Segment length N determines:
 - Parallel-scan granularity (longer = more parallelism)
 - Memory update frequency (shorter = more frequent writes)
 
-### Lateral Mixing
+### Feature Mixing
 
-**Resolved:** No within-scan lateral mixing. Element-wise A means each column
-evolves independently. Cross-column integration happens through:
-1. **Cross-segment:** Shared memory bank reads (EM trail, PM gain) — all columns
-   in a block read/write the same bank.
-2. **Within-segment:** The EM write buffer (`cum_em`) is a D-wide projection of
-   column states (w_cand from `W_seed_w(H)`), mixing across all columns. When
-   added to Stage 3's input, it provides within-segment cross-column information.
-3. **Input/output:** `proj_up` and `proj_down` mix across all D dimensions.
-
-This keeps the scan simple (standard element-wise prefix scan) while the
-memory systems and write buffers handle the binding role.
+**v5.1:** Dense scan layers (nn.Linear) mix all D features freely for GPU
+efficiency. PCM and W_seed_w retain grouped structure via free .view() reshaping.
+This gives full-rank matmuls (~80-100% GPU efficiency vs 23% with grouped) while
+preserving per-feature-group surprise and memory-facing signals.
 
 ### Scaling: Memory Banks
 
@@ -761,8 +749,8 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 1. **Scan formulation** → Simple linear recurrence (`h_t = a_t ⊙ h_{t-1} + b_t`).
    No SSM. Memory systems handle the role SSM's expanded state was designed for.
 
-2. **Lateral mixing** → Element-wise A, independent columns. No within-scan mixing.
-   Memory is the cross-column integration mechanism (biologically: thalamic hub).
+2. **Scan mixing** → Dense nn.Linear projections mix all D features (v5.1). PCM
+   and W_seed_w use grouped views for per-feature-group structure.
 
 3. **FFN** → No separate FFN. The scan's input-dependent projections (computing
    a_t, b_t) serve the same nonlinear transformation role.
@@ -817,9 +805,10 @@ means `pm_bias[:, b]`, shape `[BS, D]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
 `gate = sigmoid(w1 * y + w2 * delta + bias)` where w1, w2 are learned `[D]`
 vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
 
-**Seed and w_cand are shared across banks (fused projection):**
-`W_seed_w` is a single fused GroupedLinear producing `[BS, N, C, 2*D_col]`,
-split via `chunk(2)` into seed and w_cand — each `[BS, N, D]`. All B banks
+**Seed and w_cand are shared across banks (grouped projection):**
+`W_seed_w` is a GroupedLinear(C, D_col, 2*D_col) producing `[BS, N, C, 2*D_col]`,
+split via `chunk(2)` into seed and w_cand — each `[BS, N, D]`. The grouped
+structure keeps these memory-facing signals per-feature-group. All B banks
 receive the same seed and write candidate. Bank specialization emerges from
 the differing memory content (em_K, em_V, pm_bias) in each bank, not from the
 inputs.
@@ -840,14 +829,13 @@ previous segment. "Frozen within segment" means their values don't change during
 the forward pass, but they participate in the computation graph. At TBPTT chunk
 boundaries, `detach_states()` breaks the gradient chain.
 
-**Scan layer structure:**
-Each scan layer: fused input projection `[D_col → E]` producing (a, b) where
-E = expansion factor × D_col. For E = 2 × D_col: `proj(x) → [a_raw, b_raw]`,
-then `a = sigmoid(a_raw)` (decay gate ∈ [0,1]), `b = silu(b_raw)` (input gate).
-Each layer has: proj_in `[D_col, E]` + proj_out `[E, D_col]` + LayerNorm.
-Param count per layer: ~2 × D_col × E ≈ 4 × D_col². With D_col=128, that's
-~66K params/layer × 24 layers = ~1.6M (scan params only). Remaining params
-in proj_up/down, W_seed_w, W_pcm, W_enc, lm_head, and memory params.
+**Scan layer structure (v5.1 — dense):**
+Each scan layer: dense nn.Linear input projection `[D → 2*d_inner]` producing
+(a_raw, b_raw), then `a = sigmoid(a_raw)` (decay gate ∈ [0,1]),
+`b = silu(b_raw)` (input gate). Output projection `[d_inner → D]` + RMSNorm(D).
+Param count per layer: D×2*d_inner + d_inner×D + biases ≈ 4×D×d_inner.
+With D=2048, d_inner=1024: ~6.3M params/layer × 12 layers = ~75.6M (scan params).
+Remaining params in proj_up/down, W_seed_w, W_pcm, W_enc, lm_head, and memory params.
 
 **Stage 3 a'_t derivation:**
 Same structure as Stage 1. `a'_t` and `b'_t` are derived from the integrated

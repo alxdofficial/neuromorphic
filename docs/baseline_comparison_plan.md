@@ -1,10 +1,10 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM (v5), scan-memory-scan architecture with cortical columns, Procedural Memory (PM), Episodic Memory (EM), and within-scan predictive coding (PCM). Three tiers: Tier A (~100M) for RTX 4090 development, Tier B (~400M) for research, and Tier C (~1B) for cloud GPU training. NTP training objective (causal scan), affine scan backbone. See `architecture_v4_iterative_memory_scan.md` for the current v5 design.
+**Target model:** Neuromorphic LM (v5.1), scan-memory-scan architecture with dense scan layers (nn.Linear) and grouped PCM/W_seed_w, Procedural Memory (PM), Episodic Memory (EM), and grouped predictive coding (PCM). Three tiers: Tier A (~100M) for RTX 4090 development, Tier B (~400M) for research, and Tier C (~1B) for cloud GPU training. NTP training objective (causal scan), affine scan backbone. See `architecture_v4_iterative_memory_scan.md` for the current v5.1 design.
 
 **Date:** 2026-02-28 (updated from 2026-02-23)
 
-> **Note:** Evaluation methodology below is architecture-agnostic and applies to v5.
+> **Note:** Evaluation methodology below is architecture-agnostic and applies to v5.1.
 > Key change from v4: model now uses NTP (not FITB), causal scans (not R-loop),
 > and Mamba is the primary structural baseline (shared scan backbone).
 

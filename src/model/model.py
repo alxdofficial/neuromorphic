@@ -1,13 +1,14 @@
 """
-NeuromorphicLM (v5) — scan-memory-scan with cortical columns.
+NeuromorphicLM (v5.1) — scan-memory-scan, dense scan + grouped PCM.
 
 Three-stage cycle per segment of N tokens:
-  Stage 1: Fast causal scan (C independent columns, element-wise recurrence)
+  Stage 1: Fast causal scan (dense nn.Linear projections)
   Stage 2: Memory ops (write-before-read with causal prefix sums)
-  Stage 3: Integration scan (second causal scan integrating memory reads)
+  Stage 3: Integration scan (dense, integrating memory reads)
 
-All C columns process every token. Each column sees a D_col = D/C feature slice.
-B memory banks, each addressed by column D_col slices.
+Scan layers are fully dense for GPU efficiency. PCM and W_seed_w remain
+grouped (per-feature-group) via free .view() reshaping between [BS,N,D]
+and [BS,N,C,D_col].
 NTP training — causal scans are inherently autoregressive.
 """
 
@@ -39,7 +40,7 @@ class NeuromorphicLM(nn.Module):
         D_col = config.D_col
         D_embed = config.D_embed
         L = config.L_scan
-        expansion = config.scan_expansion
+        d_inner = config.d_inner
 
         # Embedding + position
         self.embedding = nn.Embedding(config.vocab_size, D_embed)
@@ -51,15 +52,15 @@ class NeuromorphicLM(nn.Module):
             self.proj_down = None
         self.pos_embed = nn.Parameter(torch.randn(config.N, D) * 0.02)
 
-        # Stage 1: L_scan layers
+        # Stage 1: L_scan dense layers — [BS, N, D] throughout
         self.stage1 = nn.ModuleList([
-            ScanLayer(C, D_col, expansion, config.dropout) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout) for _ in range(L)
         ])
 
-        # Stage 1 projections (shared across banks) — fused into single matmul
+        # Projections: grouped (per-feature-group seeds + write candidates)
         self.W_seed_w = GroupedLinear(C, D_col, 2 * D_col)  # -> (seed, w_cand)
 
-        # PCM (within-scan prediction)
+        # PCM (within-scan prediction) — grouped, operates on [BS, N, C, D_col]
         if config.pcm_enabled:
             self.pcm = WithinScanPCM(C, D_col)
         else:
@@ -81,9 +82,9 @@ class NeuromorphicLM(nn.Module):
             hidden=config.neuromod_hidden,
         )
 
-        # Stage 3: L_scan layers
+        # Stage 3: L_scan dense layers — [BS, N, D] throughout
         self.stage3 = nn.ModuleList([
-            ScanLayer(C, D_col, expansion, config.dropout) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout) for _ in range(L)
         ])
 
         # Output
@@ -117,57 +118,56 @@ class NeuromorphicLM(nn.Module):
         D = self.config.D
         device = input_ids.device
 
-        # --- Stage 1: Fast Scan ---
+        # --- Stage 1: Dense Scan — [BS, N, D] throughout ---
         x = self.embedding(input_ids)               # [BS, N, D_embed]
         if self.proj_up is not None:
             x = self.proj_up(x)                     # [BS, N, D]
         x = x + self.pos_embed[:N]                  # [BS, N, D]
 
-        x_col = x.view(BS, N, C, D_col)            # [BS, N, C, D_col]
-
-        H = x_col
+        H = x
         for layer in self.stage1:
             if self.config.gradient_checkpointing and self.training:
                 H, _ = checkpoint(layer, H, use_reentrant=False)
             else:
-                H, _ = layer(H)                     # [BS, N, C, D_col]
+                H, _ = layer(H)                     # [BS, N, D]
 
-        # PCM: within-scan prediction and vector surprise
-        # Applied BEFORE projections so seed/w_cand benefit from gain signal
+        # PCM: view as grouped for per-feature-group surprise
         aux_loss = torch.tensor(0.0, device=device)
         if self.pcm is not None:
-            surprise, z_hat, z = self.pcm.compute_surprise(H, x_col)
-            H = self.pcm.apply_gain(H, surprise)
+            H_col = H.view(BS, N, C, D_col)             # free view
+            x_col = x.view(BS, N, C, D_col)             # free view
+            surprise_col, z_hat, z = self.pcm.compute_surprise(H_col, x_col)
+            H_col = self.pcm.apply_gain(H_col, surprise_col)
+            H = H_col.view(BS, N, D)                    # back to dense (free)
             aux_loss = self.pcm.prediction_loss(z_hat, z) * self.config.pcm_pred_weight
-            surp_flat = surprise.reshape(BS, N, D)
+            surprise = surprise_col.reshape(BS, N, D)
         else:
-            surp_flat = torch.zeros(BS, N, D, device=device, dtype=x.dtype)
+            surprise = torch.zeros(BS, N, D, device=device, dtype=x.dtype)
 
-        # Projections from gain-modulated scan states (fused single matmul)
-        sw = self.W_seed_w(H)                          # [BS, N, C, 2*D_col]
-        seed_col, w_col = sw.chunk(2, dim=-1)          # each [BS, N, C, D_col]
-        seed = seed_col.reshape(BS, N, D)              # [BS, N, D]
-        w_cand = w_col.reshape(BS, N, D)               # [BS, N, D]
+        # Projections — grouped (per-feature-group seeds + write candidates)
+        H_col = H.view(BS, N, C, D_col)                 # free view
+        sw = self.W_seed_w(H_col)                        # [BS, N, C, 2*D_col]
+        seed_col, w_col = sw.chunk(2, dim=-1)            # each [BS, N, C, D_col]
+        seed = seed_col.reshape(BS, N, D)                # [BS, N, D]
+        w_cand = w_col.reshape(BS, N, D)                 # [BS, N, D]
 
         # --- Stage 2: Memory Ops (fused algebra — no [BS,N,B,D] tensors) ---
-        H_flat = H.reshape(BS, N, D)
         pm_read_sum, em_read_sum, cum_em_sum = self._memory_ops(
-            H_flat, seed, w_cand, surp_flat, commit=commit
+            H, seed, w_cand, surprise, commit=commit
         )
 
-        # --- Stage 3: Integration Scan ---
-        # Baseline H_flat added once + bank-summed memory deltas (already [BS,N,D])
-        integrated = H_flat + pm_read_sum + em_read_sum + cum_em_sum
-        H_prime = integrated.view(BS, N, C, D_col)
+        # --- Stage 3: Dense Integration Scan — [BS, N, D] throughout ---
+        integrated = H + pm_read_sum + em_read_sum + cum_em_sum
+        H_prime = integrated
 
         for layer in self.stage3:
             if self.config.gradient_checkpointing and self.training:
                 H_prime, _ = checkpoint(layer, H_prime, use_reentrant=False)
             else:
-                H_prime, _ = layer(H_prime)
+                H_prime, _ = layer(H_prime)          # [BS, N, D]
 
         # Output
-        out = H_prime.reshape(BS, N, D)
+        out = H_prime
         if self.proj_down is not None:
             out = self.proj_down(out)                # [BS, N, D_embed]
         out = self.ln_final(out)

@@ -43,27 +43,27 @@ class TestGroupedLayerNorm:
 
 class TestSequentialScan:
     def test_shape(self):
-        a = torch.rand(BS, 8, 3, 16)
-        b = torch.randn(BS, 8, 3, 16)
+        a = torch.rand(BS, 8, 48)
+        b = torch.randn(BS, 8, 48)
         h = sequential_scan(a, b)
-        assert h.shape == (BS, 8, 3, 16)
+        assert h.shape == (BS, 8, 48)
 
     def test_with_h0(self):
-        a = torch.rand(BS, 8, 3, 16)
-        b = torch.randn(BS, 8, 3, 16)
-        h0 = torch.randn(BS, 3, 16)
+        a = torch.rand(BS, 8, 48)
+        b = torch.randn(BS, 8, 48)
+        h0 = torch.randn(BS, 48)
         h = sequential_scan(a, b, h0)
-        assert h.shape == (BS, 8, 3, 16)
+        assert h.shape == (BS, 8, 48)
 
     def test_manual_loop(self):
         """sequential_scan should match manual loop."""
         torch.manual_seed(42)
-        a = torch.rand(1, 4, 2, 8)
-        b = torch.randn(1, 4, 2, 8)
+        a = torch.rand(1, 4, 16)
+        b = torch.randn(1, 4, 16)
         h = sequential_scan(a, b)
 
         # Manual
-        h_manual = torch.zeros(1, 2, 8)
+        h_manual = torch.zeros(1, 16)
         for t in range(4):
             h_manual = a[0, t] * h_manual + b[0, t]
             assert torch.allclose(h[0, t], h_manual, atol=1e-5)
@@ -74,10 +74,10 @@ class TestParallelScan:
     def test_matches_sequential(self, N):
         """parallel_scan must match sequential_scan for all N."""
         torch.manual_seed(42)
-        C, E = 4, 32
-        a = torch.sigmoid(torch.randn(BS, N, C, E))
-        b = torch.randn(BS, N, C, E)
-        h0 = torch.randn(BS, C, E)
+        E = 128
+        a = torch.sigmoid(torch.randn(BS, N, E))
+        b = torch.randn(BS, N, E)
+        h0 = torch.randn(BS, E)
         ref = sequential_scan(a, b, h0)
         out = parallel_scan(a, b, h0)
         assert torch.allclose(ref, out, atol=1e-4), (
@@ -87,17 +87,17 @@ class TestParallelScan:
     def test_no_h0(self):
         """parallel_scan without h0 should match sequential_scan."""
         torch.manual_seed(0)
-        a = torch.sigmoid(torch.randn(BS, 64, 4, 32))
-        b = torch.randn(BS, 64, 4, 32)
+        a = torch.sigmoid(torch.randn(BS, 64, 128))
+        b = torch.randn(BS, 64, 128)
         ref = sequential_scan(a, b)
         out = parallel_scan(a, b)
         assert torch.allclose(ref, out, atol=1e-4)
 
     def test_gradient_flow(self):
         """Gradients should flow through parallel_scan."""
-        a_raw = torch.randn(BS, 16, 2, 8, requires_grad=True)
-        b = torch.randn(BS, 16, 2, 8, requires_grad=True)
-        h0 = torch.randn(BS, 2, 8, requires_grad=True)
+        a_raw = torch.randn(BS, 16, 16, requires_grad=True)
+        b = torch.randn(BS, 16, 16, requires_grad=True)
+        h0 = torch.randn(BS, 16, requires_grad=True)
         a = torch.sigmoid(a_raw)
         out = parallel_scan(a, b, h0)
         loss = out.sum()
@@ -112,10 +112,10 @@ class TestFusedScan:
     def test_matches_sequential(self, N):
         """fused_scan must match sequential_scan for all N."""
         torch.manual_seed(42)
-        C, E = 4, 32
-        a_raw = torch.randn(BS, N, C, E)
-        b = torch.randn(BS, N, C, E)
-        h0 = torch.randn(BS, C, E)
+        E = 128
+        a_raw = torch.randn(BS, N, E)
+        b = torch.randn(BS, N, E)
+        h0 = torch.randn(BS, E)
         ref = sequential_scan(torch.sigmoid(a_raw), b, h0)
         out = fused_scan(a_raw, b, h0)
         assert torch.allclose(ref, out, atol=1e-5), (
@@ -124,9 +124,9 @@ class TestFusedScan:
 
     def test_gradient_flow(self):
         """Gradients should flow through fused_scan."""
-        a_raw = torch.randn(BS, 16, 2, 8, requires_grad=True)
-        b = torch.randn(BS, 16, 2, 8, requires_grad=True)
-        h0 = torch.randn(BS, 2, 8, requires_grad=True)
+        a_raw = torch.randn(BS, 16, 16, requires_grad=True)
+        b = torch.randn(BS, 16, 16, requires_grad=True)
+        h0 = torch.randn(BS, 16, requires_grad=True)
         out = fused_scan(a_raw, b, h0)
         loss = out.sum()
         loss.backward()
@@ -137,28 +137,27 @@ class TestFusedScan:
 
 class TestScanLayer:
     def test_shape(self):
-        C, D_col, expansion = 3, 8, 2
-        layer = ScanLayer(C, D_col, expansion)
-        x = torch.randn(BS, 8, C, D_col)
+        D, d_inner = 24, 48
+        layer = ScanLayer(D, d_inner)
+        x = torch.randn(BS, 8, D)
         out, h_last = layer(x)
         assert out.shape == x.shape
-        assert h_last.shape == (BS, C, D_col * expansion)
+        assert h_last.shape == (BS, d_inner)
 
     def test_with_h_prev(self):
-        C, D_col, expansion = 3, 8, 2
-        E = D_col * expansion
-        layer = ScanLayer(C, D_col, expansion)
-        x = torch.randn(BS, 8, C, D_col)
-        h_prev = torch.randn(BS, C, E)
+        D, d_inner = 24, 48
+        layer = ScanLayer(D, d_inner)
+        x = torch.randn(BS, 8, D)
+        h_prev = torch.randn(BS, d_inner)
         out, h_last = layer(x, h_prev)
         assert out.shape == x.shape
-        assert h_last.shape == (BS, C, E)
+        assert h_last.shape == (BS, d_inner)
 
     def test_residual_connection(self):
         """Output should differ from input (not zero) but include residual."""
-        C, D_col, expansion = 2, 4, 2
-        layer = ScanLayer(C, D_col, expansion)
-        x = torch.randn(BS, 4, C, D_col)
+        D, d_inner = 8, 16
+        layer = ScanLayer(D, d_inner)
+        x = torch.randn(BS, 4, D)
         out, _ = layer(x)
         # Should not be identical to input (scan adds something)
         # but also not wildly different (residual connection)

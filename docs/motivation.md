@@ -27,10 +27,11 @@ each with different persistence, update rules, and biological analogues. The fun
 innovation: **separating WHAT to remember from HOW LONG to remember it**, enabling
 lifelong learning without catastrophic forgetting.
 
-The model processes tokens causally through parallel cortical columns using affine scan
-recurrence (fast neocortical stream), with structured memory operations between segments
-(slow hippocampal stream). See `architecture_v4_iterative_memory_scan.md` for the full
-v5 design.
+The model processes tokens causally through dense scan layers (nn.Linear projections, full
+feature mixing) with structured memory operations between segments (slow hippocampal
+stream). Predictive coding and memory projections remain grouped (per-feature-group
+surprise via free `.view()` from dense tensors). See
+`architecture_v4_iterative_memory_scan.md` for the full v5.1 design.
 
 ---
 
@@ -38,25 +39,27 @@ v5 design.
 
 ### Three Memory Systems + Predictive Coding
 
-| Memory System | Brain Analogy | Persistence | Update Mechanism | In v5 |
-|---------------|---------------|-------------|------------------|-------|
+| Memory System | Brain Analogy | Persistence | Update Mechanism | In v5.1 |
+|---------------|---------------|-------------|------------------|---------|
 | **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Scan params, projection weights |
 | **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Surprise-gated bias shift | Between segments |
 | **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based primitive decomposition + neuromodulation | Between segments |
 
-Plus **Predictive Coding (PCM)** — within-scan prediction of next token's encoding.
-Vector surprise (per-feature prediction error) drives PM eligibility gating and EM
-novelty scoring. Each column predicts what the next token's features will look like;
-the per-dimension error tells the model which features it failed to anticipate.
+Plus **Predictive Coding (PCM)** — grouped prediction of next token's encoding.
+Vector surprise (per-feature-group prediction error) drives PM eligibility gating and EM
+novelty scoring. Each feature group predicts what the next token's features will look
+like; the per-dimension error tells the model which features it failed to anticipate.
+PCM operates on a grouped view [BS,N,C,D_col] of the dense scan output (free `.view()`).
 
 ### Two-Stream Processing: Fast Scan + Slow Memory
 
-The key architectural insight (v5): **separate fast causal computation from slow
+The key architectural insight (v5.1): **separate fast causal computation from slow
 memory operations.**
 
-- **Fast stream (Stages 1 & 3)**: Affine scan recurrence — causal, parallelizable.
-  Cortical columns process tokens, compute predictions, prepare trail seeds and
-  write candidates. All linear operations that compose into a scan.
+- **Fast stream (Stages 1 & 3)**: Dense affine scan recurrence — causal, parallelizable.
+  nn.Linear projections with full feature mixing process tokens. Grouped PCM computes
+  predictions, grouped W_seed_w prepares trail seeds and write candidates. All linear
+  operations that compose into a scan.
 - **Slow stream (Stage 2)**: Non-affine memory operations — batched across all
   positions. Write-before-read with causal write buffers: per-token deltas are
   prefix-summed, giving each position causal access to within-segment writes.
@@ -116,8 +119,8 @@ Per-column within-scan prediction and surprise computation.
 - **Vector surprise**: Elementwise prediction error `delta = z_hat_{t-1} - z_t`,
   D_col dimensions. Each feature dimension carries independent surprise.
 - **PCM gain**: `1 + 0.1 * tanh(W_gain(delta))` — bounded [0.9, 1.1] modulation.
-- **v5**: Within-scan prediction (token t predicts t+1), not cross-pass.
-  Surprise gates memory updates per-feature.
+- **v5.1**: Grouped prediction (token t predicts t+1) on `.view(BS,N,C,D_col)`, not
+  cross-pass. Surprise gates memory updates per-feature-group.
 
 ---
 

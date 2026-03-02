@@ -6,8 +6,8 @@
         <mxCell id="1" parent="0"/>
 
         <!-- Title -->
-        <mxCell id="title" value="&lt;b&gt;NeuromorphicLM v5 — Scan-Memory-Scan Forward Pass&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;fontSize=16;" vertex="1" parent="1">
-          <mxGeometry x="320" y="10" width="500" height="30" as="geometry"/>
+        <mxCell id="title" value="&lt;b&gt;NeuromorphicLM v5.1 — Dense Scan + Grouped PCM Forward Pass&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="320" y="10" width="560" height="30" as="geometry"/>
         </mxCell>
 
         <!-- Input -->
@@ -23,50 +23,45 @@
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- Column slicing note -->
-        <mxCell id="col_slice" value="Column Slicing (free view, no params)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Column c sees x[..., c·D_col : (c+1)·D_col]&lt;br&gt;[BS, N, D] → C views of [BS, N, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="330" y="200" width="440" height="45" as="geometry"/>
-        </mxCell>
-        <mxCell id="e2" style="endArrow=block;endFill=1;" edge="1" source="embed" target="col_slice" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
+        <!-- Note: dense [BS,N,D] flows into Stage 1 scan -->
+        <!-- Grouped view [BS,N,C,D_col] used only for PCM and W_seed_w (free .view()) -->
 
         <!-- ==================== STAGE 1 ==================== -->
         <mxCell id="stage1" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4472C4;dashed=1;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
           <mxGeometry x="100" y="280" width="900" height="280" as="geometry"/>
         </mxCell>
-        <mxCell id="stage1_label" value="&lt;b&gt;Stage 1: Fast Scan&lt;/b&gt; (Neocortical Stream)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Causal affine recurrence — parallelized via chunked parallel-scan&lt;br&gt;All C columns process every token, each seeing D_col features&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="stage1_label" value="&lt;b&gt;Stage 1: Fast Scan&lt;/b&gt; (Neocortical Stream)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Causal affine recurrence — parallelized via HGRN Triton kernel&lt;br&gt;Dense nn.Linear projections [BS, N, D] — full feature mixing&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="110" y="285" width="500" height="50" as="geometry"/>
         </mxCell>
-        <mxCell id="e3" style="endArrow=block;endFill=1;" edge="1" source="col_slice" target="stage1" parent="1">
+        <mxCell id="e3" style="endArrow=block;endFill=1;" edge="1" source="embed" target="stage1" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
         <!-- Scan recurrence -->
-        <mxCell id="scan1" value="Linear Recurrence (element-wise)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h_t = a_t ⊙ h_{t-1} + b_t&lt;br&gt;Per column: h_c,t ∈ R^{D_col}&lt;br&gt;Columns independent — no lateral mixing&lt;br&gt;a_t, b_t = input-dependent projections&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="scan1" value="Dense Linear Recurrence&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h_t = a_t ⊙ h_{t-1} + b_t&lt;br&gt;h_t ∈ R^{d_inner} — dense (nn.Linear projections)&lt;br&gt;a_t, b_t from proj_in: [BS, N, D] → [BS, N, 2·d_inner]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="130" y="350" width="270" height="65" as="geometry"/>
         </mxCell>
 
         <!-- PCM encode + surprise -->
-        <mxCell id="pcm_scan" value="PCM Encode + Vector Surprise&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;z = W_enc · X_t, z_hat = W_pcm · H_t&lt;br&gt;surprise_t = z_hat_{t-1} − z_t&lt;br&gt;[BS, N, C, D_col] — per-feature error&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="130" y="475" width="270" height="55" as="geometry"/>
+        <mxCell id="pcm_scan" value="PCM Encode + Vector Surprise (grouped view)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;H viewed as [BS, N, C, D_col] for grouped PCM&lt;br&gt;z = W_enc · X_col, z_hat = W_pcm · H_col&lt;br&gt;surprise_t = z_hat_{t-1} − z_t — per-feature-group error&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="130" y="475" width="290" height="55" as="geometry"/>
         </mxCell>
 
         <!-- Scan outputs -->
-        <mxCell id="scan_h" value="H (column states)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="scan_h" value="H (scan output)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, D] — dense&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="450" y="350" width="170" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="scan_q" value="seed (EM trail starts)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w · H → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="450" y="400" width="200" height="35" as="geometry"/>
+        <mxCell id="scan_q" value="seed (EM trail starts)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w (GroupedLinear) · H_col → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="450" y="400" width="260" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="scan_w" value="w_cand (write candidates)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w · H → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="450" y="445" width="200" height="35" as="geometry"/>
+        <mxCell id="scan_w" value="w_cand (write candidates)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;W_seed_w (GroupedLinear) · H_col → chunk → [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="450" y="445" width="260" height="35" as="geometry"/>
         </mxCell>
 
-        <mxCell id="scan_surp" value="surprise (vector)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, C, D_col] — per-feature&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="450" y="495" width="200" height="35" as="geometry"/>
+        <mxCell id="scan_surp" value="surprise (vector)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;[BS, N, D] (from grouped PCM, reshaped)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="450" y="495" width="230" height="35" as="geometry"/>
         </mxCell>
 
         <!-- Arrows from scan to outputs -->
@@ -184,12 +179,12 @@
         <mxCell id="stage3" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4472C4;dashed=1;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
           <mxGeometry x="100" y="950" width="900" height="200" as="geometry"/>
         </mxCell>
-        <mxCell id="stage3_label" value="&lt;b&gt;Stage 3: Integration Scan&lt;/b&gt; (Context Fusion)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Second causal scan — integrates memory reads with column states&lt;br&gt;Parallelized via chunked parallel-scan&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="stage3_label" value="&lt;b&gt;Stage 3: Integration Scan&lt;/b&gt; (Context Fusion)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Second dense causal scan — integrates memory reads with scan states&lt;br&gt;Dense nn.Linear projections [BS, N, D] — parallelized via HGRN kernel&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="110" y="955" width="500" height="45" as="geometry"/>
         </mxCell>
 
         <!-- Integration scan -->
-        <mxCell id="scan2" value="Integration Scan (element-wise)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h'_t = a'_t ⊙ h'_{t-1} + b'_t&lt;br&gt;Input: H + pm_delta + em_read + cum_em (four signals, additive)&lt;br&gt;Columns independent&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="scan2" value="Dense Integration Scan&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;h'_t = a'_t ⊙ h'_{t-1} + b'_t&lt;br&gt;Input: H + pm_delta + em_read + cum_em (four signals, additive)&lt;br&gt;Dense nn.Linear — full feature mixing&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
           <mxGeometry x="200" y="1015" width="300" height="50" as="geometry"/>
         </mxCell>
 
@@ -252,8 +247,8 @@
           <mxGeometry x="1050" y="260" width="200" height="160" as="geometry"/>
         </mxCell>
 
-        <mxCell id="note2" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Column-Local Addressing&lt;/b&gt;&lt;br&gt;Column c of bank b addresses:&lt;br&gt;dims c·D_col : (c+1)·D_col&lt;br&gt;Pure dimension slice — no routing&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
-          <mxGeometry x="1050" y="410" width="180" height="80" as="geometry"/>
+        <mxCell id="note2" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Dense Scan + Grouped PCM/W_seed_w&lt;/b&gt;&lt;br&gt;Scan layers: dense nn.Linear [BS,N,D]&lt;br&gt;PCM + W_seed_w: GroupedLinear&lt;br&gt;on free .view(BS,N,C,D_col)&lt;br&gt;Surprise remains per-feature-group&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="410" width="200" height="90" as="geometry"/>
         </mxCell>
 
       </root>

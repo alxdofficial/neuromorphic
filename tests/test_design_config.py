@@ -81,6 +81,7 @@ class TestTierPresets:
         assert cfg.D_col == 128  # D=2048 // C=16
         assert cfg.L_scan == 6
         assert cfg.scan_expansion == 8
+        assert cfg.d_inner == 1024
 
     def test_tier_b(self):
         cfg = ModelConfig.tier_b()
@@ -90,6 +91,7 @@ class TestTierPresets:
         assert cfg.B == 12
         assert cfg.C == 16
         assert cfg.L_scan == 16
+        assert cfg.d_inner == 768
 
     def test_tier_tiny(self):
         cfg = ModelConfig.tier_tiny()
@@ -98,6 +100,7 @@ class TestTierPresets:
         assert cfg.B == 2
         assert cfg.C == 2
         assert cfg.L_scan == 2
+        assert cfg.d_inner == 64
 
     def test_tier_overrides(self):
         cfg = ModelConfig.tier_a(L_scan=8, N=256)

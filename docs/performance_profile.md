@@ -1,33 +1,57 @@
-# Performance Profile — Neuromorphic LM v5 Tier A
+# Performance Profile — Neuromorphic LM v5.1 Tier A
 
 **Hardware**: RTX 4090 (24 GB VRAM, 165 TFLOP/s bf16 peak)
-**Config**: D=2048, D_embed=384, C=16, D_col=128, L_scan=6, expansion=8, B=4, M=384, N=512, n_trail_steps=1
-**Params**: 92.2M | **Compiled**: torch.compile enabled
+**Config**: D=2048, D_embed=384, C=16, D_col=128, d_inner=1024, L_scan=6, B=4, M=384, N=512, n_trail_steps=3
+**Params**: 91.8M | **Compiled**: torch.compile enabled | **Norm**: RMSNorm
 
-## Current Throughput
+## Current Throughput (v5.1 Dense Scan, n_trail_steps=3)
 
 | Metric | Value |
 |--------|-------|
-| Train tok/s (BS=12) | 31,863 |
-| Infer tok/s (BS=12) | 99,711 |
-| ms/step (train) | 192.8 |
-| ms/step (infer) | 61.6 |
-| Max train BS | 12 |
-| Peak VRAM | 18.30 GB |
-| VRAM split | 0.35 wt / 0.52 opt / 19.20 act |
+| Train tok/s (BS=28) | 92,180 |
+| Infer tok/s (BS=28) | 315,998 |
+| ms/step (train) | 155.5 |
+| ms/step (infer) | 45.4 |
+| Max train BS | 28 |
+| Peak VRAM | 16.84 GB |
+| VRAM split | 0.55 wt / 0.72 opt / 20.63 act |
 
 ## Baseline Comparison
 
-| Model | Params | FLOPs/token | tok/s | GPU util |
-|-------|--------|-------------|-------|----------|
-| **Ours** | 92M | 205M | 31,863 | 4.0% |
-| Mamba-130M | 130M | 260M | 89,000 | 14.0% |
-| Pythia-160M | 160M | 320M | 69,000 | 13.4% |
+| Model | Params | tok/s (train) | Notes |
+|-------|--------|---------------|-------|
+| **Ours (v5.1)** | **92M** | **92,180** | Dense scan + grouped PCM, trail=3 |
+| Mamba-130M | 130M | 89,000 | Selective SSM |
+| Pythia-160M | 160M | 69,000 | Transformer |
 
-Our model does **less** compute per token than either baseline but achieves only
-4% GPU utilization. The bottleneck is arithmetic intensity, not total FLOPs.
+v5.1 exceeds both baselines: **34% faster than Pythia, 4% faster than Mamba**
+with fewer parameters. With n_trail_steps=1, throughput is 103K tok/s (see below).
 
-## Forward Pass Time Breakdown
+## v5 → v5.1 Improvement
+
+| Metric | v5 (grouped) | v5.1 (trail=1) | v5.1 (trail=3) |
+|--------|-------------|----------------|----------------|
+| Train tok/s | 31,863 | 103,423 | 92,180 |
+| Infer tok/s | 99,711 | 376,070 | 315,998 |
+| Max train BS | 12 | 36 | 28 |
+| Peak VRAM | 18.30 GB | 19.22 GB | 16.84 GB |
+
+Root cause of improvement: scan matmuls went from GroupedLinear (C=16 narrow
+[128,2048] einsum at 23% GPU efficiency) to dense nn.Linear (~80-100% efficiency).
+BS tripled because 3D [BS,N,D] tensors use less activation memory than 4D [BS,N,C,D_col].
+
+Trail steps cost: n_trail_steps=3 reduces max BS (36→28) due to EM activation memory,
+costing ~11% throughput vs trail=1. RMSNorm replaces LayerNorm in scan layers (neutral speed).
+
+---
+
+## Historical: v5 Pre-Dense Profile
+
+> The analysis below was captured with v5 GroupedLinear scan layers (BS=12).
+> It motivated the v5.1 dense rewrite. Kept for reference — the EM, PM, PCM,
+> and element-wise analyses remain relevant as those components are unchanged.
+
+## Forward Pass Time Breakdown (v5, BS=12)
 
 ### By module (BS=12, N=512, single forward pass)
 

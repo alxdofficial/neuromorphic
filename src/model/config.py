@@ -20,6 +20,7 @@ class ModelConfig:
     K_segments: int = 2       # TBPTT chunk = K segments
     L_scan: int = 12          # scan layers per stage (24 total)
     scan_expansion: int = 4   # E = scan_expansion * D_col per layer
+    d_inner: int = -1         # scan hidden dim (derived in validate if -1)
     vocab_size: int = 32000   # set from tokenizer at runtime
     eot_id: int = 2           # set from tokenizer at runtime
 
@@ -85,6 +86,11 @@ class ModelConfig:
             raise ValueError(f"L_scan ({self.L_scan}) must be >= 1.")
         if self.scan_expansion < 1:
             raise ValueError(f"scan_expansion ({self.scan_expansion}) must be >= 1.")
+        # Derive d_inner (scan hidden dim) — backward compat when not set
+        if self.d_inner == -1:
+            self.d_inner = self.D_col * self.scan_expansion
+        if self.d_inner < 1:
+            raise ValueError(f"d_inner ({self.d_inner}) must be >= 1.")
         if self.M < 1:
             raise ValueError(f"M ({self.M}) must be >= 1 (EM capacity).")
         if self.n_trail_steps < 1:
@@ -116,7 +122,7 @@ class ModelConfig:
         defaults = dict(
             D=64, D_embed=64, B=2, C=2,
             vocab_size=64, N=16, K_segments=2,
-            M=8, L_scan=2, scan_expansion=2, n_trail_steps=2,
+            M=8, L_scan=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
             budget_pm=4.0, budget_em=8.0,
             neuromod_hidden=8,
             pcm_enabled=True, pm_enabled=True, em_enabled=True,
@@ -129,8 +135,8 @@ class ModelConfig:
         """Dev tier (~130M). Matches Mamba-130M scale."""
         defaults = dict(
             D=2048, D_embed=384, B=4, C=16,
-            N=512, L_scan=6, scan_expansion=8,
-            M=384, n_trail_steps=1,
+            N=512, L_scan=6, scan_expansion=8, d_inner=1024,
+            M=384, n_trail_steps=3,
             budget_pm=16, budget_em=32,
         )
         defaults.update(overrides)
@@ -141,7 +147,7 @@ class ModelConfig:
         """Research tier (~400M). Matches Mamba-370M scale."""
         defaults = dict(
             D=3072, D_embed=512, B=12, C=16,
-            N=512, L_scan=16, scan_expansion=4,
+            N=512, L_scan=16, scan_expansion=4, d_inner=768,
             M=512, n_trail_steps=2,
             budget_pm=32, budget_em=64,
             neuromod_hidden=64,
