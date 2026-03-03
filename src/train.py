@@ -52,9 +52,14 @@ TOKENIZER = "tinyllama"
 # TOKENIZER = "smollm"
 
 # -- Batch size (persistent streams) --
-BS = 24             # Tier A (compile): max no-compile=28, compile tracing needs headroom
-# BS = 16           # Tier B default
-# BS = 8            # Tier C default
+BS = 12             # Tier A: K_segments=8 doubles activation memory vs K_segments=2
+# BS = 6            # Tier B default
+# BS = 4            # Tier C default
+
+# -- Memory horizon --
+K_SEGMENTS = 8      # TBPTT chunk = K_segments * N tokens (8 × 512 = 4096)
+                    # Longer horizon = stronger gradient signal for PM/EM neuromodulators
+GRADIENT_CHECKPOINTING = True  # halves scan activation memory; enables K_segments=8
 
 # -- Seeds --
 TRAIN_SEED = 42
@@ -70,10 +75,12 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 1_000,             # ~25M tokens @ BS=24, N=512 (optional warmup)
-    "B": 61_000,            # ~1.5B tokens @ BS=24, N=512
+    "A": 15_250,            # 750M tokens @ BS=12, K_segments=8, N=512 (49,152 tok/step)
+    "B": 15_250,            # 750M tokens — same budget, lifelong mode
 }
-# Phase B only: 61K × 24 × 1024 ≈ 1.5B tokens (matches fair comparison budget)
+# Total A+B: 30,500 × 49,152 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
+# Phase A: PM/EM reset at doc boundaries — memory systems learn basic function
+# Phase B: PM/EM persist across all docs — lifelong accumulation
 
 # -- Regularization --
 WEIGHT_DECAY = 0.01
@@ -444,6 +451,7 @@ def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelC
     tier_fns = {
         "a": ModelConfig.tier_a,
         "b": ModelConfig.tier_b,
+        "c": ModelConfig.tier_c,
         "tiny": ModelConfig.tier_tiny,
     }
     if tier not in tier_fns:
@@ -451,6 +459,9 @@ def _build_config(tier: str, phase: str, settings: dict | None = None) -> ModelC
     tier_fn = tier_fns[tier]
     config = tier_fn()
     config.set_phase(phase)
+    # Memory horizon and activation memory settings
+    config.K_segments = K_SEGMENTS
+    config.gradient_checkpointing = GRADIENT_CHECKPOINTING
     if settings is not None:
         if settings.get("use_compile") is not None:
             config.use_compile = settings["use_compile"]
