@@ -52,7 +52,7 @@ TOKENIZER = "tinyllama"
 # TOKENIZER = "smollm"
 
 # -- Batch size (persistent streams) --
-BS = 12             # Tier A: K_segments=8 doubles activation memory vs K_segments=2
+BS = 36             # Tier A: max no-compile=40 (grad_ckpt), compile headroom → 36
 # BS = 6            # Tier B default
 # BS = 4            # Tier C default
 
@@ -75,10 +75,10 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 15_250,            # 750M tokens @ BS=12, K_segments=8, N=512 (49,152 tok/step)
-    "B": 15_250,            # 750M tokens — same budget, lifelong mode
+    "A": 10_200,            # 750M tokens @ BS=36, K_segments=8, N=512 (147,456 tok/step)
+    "B": 10_200,            # 750M tokens — same budget, lifelong mode
 }
-# Total A+B: 30,500 × 49,152 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
+# Total A+B: 20,400 × 147,456 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
 # Phase A: PM/EM reset at doc boundaries — memory systems learn basic function
 # Phase B: PM/EM persist across all docs — lifelong accumulation
 
