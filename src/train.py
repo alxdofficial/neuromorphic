@@ -52,13 +52,13 @@ TOKENIZER = "tinyllama"
 # TOKENIZER = "smollm"
 
 # -- Batch size (persistent streams) --
-BS = 36             # Tier A: max no-compile=40 (grad_ckpt), compile headroom → 36
+BS = 16             # Tier A: K_segments=4, grad_ckpt — same tok/step as K=8 BS=8, better GPU util
 # BS = 6            # Tier B default
 # BS = 4            # Tier C default
 
 # -- Memory horizon --
-K_SEGMENTS = 8      # TBPTT chunk = K_segments * N tokens (8 × 512 = 4096)
-                    # Longer horizon = stronger gradient signal for PM/EM neuromodulators
+K_SEGMENTS = 4      # TBPTT chunk = K_segments * N tokens (4 × 512 = 2048)
+                    # 2048-token gradient horizon for PM/EM neuromodulators; fits larger BS than K=8
 GRADIENT_CHECKPOINTING = True  # halves scan activation memory; enables K_segments=8
 
 # -- Seeds --
@@ -75,10 +75,10 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 10_200,            # 750M tokens @ BS=36, K_segments=8, N=512 (147,456 tok/step)
-    "B": 10_200,            # 750M tokens — same budget, lifelong mode
+    "A": 22_900,            # 750M tokens @ BS=16, K_segments=4, N=512 (32,768 tok/step)
+    "B": 22_900,            # 750M tokens — same budget, lifelong mode
 }
-# Total A+B: 20,400 × 147,456 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
+# Total A+B: 45,800 × 32,768 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
 # Phase A: PM/EM reset at doc boundaries — memory systems learn basic function
 # Phase B: PM/EM persist across all docs — lifelong accumulation
 
