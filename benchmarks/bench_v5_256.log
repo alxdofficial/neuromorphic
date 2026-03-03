@@ -1,0 +1,31 @@
+======================================================================
+Neuromorphic v5 Benchmark — Tier A
+GPU: NVIDIA GeForce RTX 4090
+seq_len=256, vocab=32000, compile=True
+Parameters: 91,796,767 (91.8M)
+Config: D=2048, D_embed=384, B=6, C=16, L_scan=12, M=256
+
+--- Phase 1: Finding max training batch size (no compile) ---
+  Trying BS=4... OK
+  Trying BS=8... OK
+  Trying BS=16... OK
+  Trying BS=32... OOM
+  Refine BS=24... OOM
+  Refine BS=19... OK
+  Refine BS=21... OK
+  Refine BS=22... OK
+  Refine BS=23... OK
+Max training BS: 20
+
+--- Phase 2: Training throughput (BS=20, compile=True) ---
+    Warmup step 1/5: 585.6s
+    Warmup step 2/5: 1120.5s
+    Warmup step 3/5: 2.9s
+    Warmup step 4/5: 2.9s
+    Warmup step 5/5: 2.9s
+    Measuring (30 steps)...
+  Training: 1,765 tok/s
+  ms/step:  2901.5
+  Peak VRAM: 16.36 GB
+
+--- Phase 3: Inference throughput (BS=20) ---

@@ -36,7 +36,7 @@ from .debug import MetricsCollector
 
 # -- Model tier --
 TIER = "a"          # D=2048, D_embed=384, C=16, L_scan=6, exp=8, B=4, M=384
-# TIER = "b"        # D=3072, D_embed=512, C=16, L_scan=16, B=12
+# TIER = "b"        # D=3072, D_embed=512, C=16, L_scan=12, B=6, d_inner=1024 (~251M)
 
 # -- Training phase --
 PHASE = "A"         # PM + EM + PCM (all systems)
@@ -52,7 +52,7 @@ TOKENIZER = "tinyllama"
 # TOKENIZER = "smollm"
 
 # -- Batch size (persistent streams) --
-BS = 32             # Tier A default
+BS = 24             # Tier A (compile): max no-compile=28, compile tracing needs headroom
 # BS = 16           # Tier B default
 # BS = 8            # Tier C default
 
@@ -70,10 +70,10 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 1_000,             # ~8M tokens: scan + PM backbone warmup (brief head start)
-    "B": 91_000,            # ~1.49B tokens @ BS=64 (was 182K @ BS=32)
+    "A": 1_000,             # ~25M tokens @ BS=24, N=512 (optional warmup)
+    "B": 61_000,            # ~1.5B tokens @ BS=24, N=512
 }
-# Total A+B ≈ 1.5B tokens (matches baseline budget)
+# Phase B only: 61K × 24 × 1024 ≈ 1.5B tokens (matches fair comparison budget)
 
 # -- Regularization --
 WEIGHT_DECAY = 0.01
@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--phase", type=str, default=None,
                        help="Single phase to run (A or B)")
     p.add_argument("--tier", type=str, default=None,
-                   choices=["a", "b"],
+                   choices=["a", "b", "c"],
                    help="Model size tier")
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path to resume from")
