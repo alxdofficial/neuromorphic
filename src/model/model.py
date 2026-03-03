@@ -181,8 +181,10 @@ class NeuromorphicLM(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Stage 2: Memory read/write operations.
 
-        PM: Hebbian fast-weight read (bank-summed, no [BS,N,B,D]).
-        EM: Write-before-read with causal prefix sums (fused algebra).
+        PM: Hebbian fast-weight read (bank-summed).
+        EM: Rich fast path — per-token neuromodulated correction, prefix-summed.
+            Mirrors slow path logic: g_t * (w_cand - reconstruction) captures
+            what's truly novel, weighted by learned write gate.
 
         Args:
             H_flat: [BS, N, D] — column states (flat)
@@ -206,19 +208,28 @@ class NeuromorphicLM(nn.Module):
             pm_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
             pm_pre = None
 
-        # 2. EM novelty (still returns [BS, N, B] — needed for commit)
+        # 2. EM novelty + per-token neuromodulator
         if self.config.em_enabled:
             w_nov = torch.sigmoid(self.W_nov(H_flat))                 # [BS, N, B]
             novelty = self.em.compute_novelty_all(
                 w_cand, surprise, w_nov=w_nov,
             )                                                          # [BS, N, B]
-            # Write buffer sum: fused — no [BS, N, B, D]
-            #   sum_b[cumsum(novelty_b * w_cand)] = cumsum(novelty.sum(B) * w_cand)
-            nov_sum = novelty.sum(dim=2, keepdim=True)                # [BS, N, 1]
-            cum_em_sum = torch.cumsum(nov_sum * w_cand, dim=1)        # [BS, N, D]
+
+            # Per-token neuromodulator: g_em_t[t] = MLP(novelty[t], usage)
+            usage = self.em.usage_all()                                # [BS, B]
+            usage_t = usage.unsqueeze(1).expand(BS, N, B)              # [BS, N, B]
+            g_em_t = self.em_neuromod(novelty, usage_t)                # [BS, N, B]
+
+            # Neuromodulated write buffer: per-token gate × novelty × w_cand
+            #   Old: cumsum(novelty.sum(B) * w_cand) — no learned gating
+            #   New: cumsum((g_t * novelty).sum(B) * w_cand) — neuromod per-token
+            #   g_em_t learns when to amplify/suppress writes from (novelty, usage)
+            gated_nov = (g_em_t * novelty).sum(dim=2, keepdim=True)    # [BS, N, 1]
+            cum_em_sum = torch.cumsum(gated_nov * w_cand, dim=1)       # [BS, N, D]
         else:
             novelty = torch.zeros(BS, N, B, device=H_flat.device, dtype=H_flat.dtype)
             cum_em_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
+            g_em_t = None
 
         # 3. EM trail read (returns [BS, N, D] — summed over B internally)
         if self.config.em_enabled:
@@ -232,10 +243,8 @@ class NeuromorphicLM(nn.Module):
                 self.pm.commit(pm_pre, surprise, budget=self.config.budget_pm)
 
             if self.config.em_enabled:
-                g_em = self.em_neuromod(
-                    novelty.mean(dim=1),
-                    self.em.usage_all(),
-                )                                                      # [BS, B]
+                # Segment-level gate: mean of per-token gates
+                g_em = g_em_t.mean(dim=1)                              # [BS, B]
                 self.em.commit_all(w_cand, novelty, g_em)
                 self.em.base_decay()
 

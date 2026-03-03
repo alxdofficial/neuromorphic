@@ -70,8 +70,8 @@
         </mxCell>
 
         <!-- Memory state (right side of Stage 1) -->
-        <mxCell id="mem_state" value="&lt;b&gt;Memory State&lt;/b&gt; (from prev segment)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;PM: pm_bias [BS, B, D]&lt;br&gt;EM: em_K, em_V, em_S [BS, B, M, D]&lt;br&gt;Static within segment&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;" vertex="1" parent="1">
-          <mxGeometry x="720" y="350" width="250" height="65" as="geometry"/>
+        <mxCell id="mem_state" value="&lt;b&gt;Memory State&lt;/b&gt; (from prev segment)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;PM: W_pm [BS, B, D_pm, D_pm] (Hebbian fast-weight)&lt;br&gt;EM: em_K, em_V, em_S [BS, B, M, D]&lt;br&gt;Static within segment&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="720" y="350" width="260" height="65" as="geometry"/>
         </mxCell>
 
         <!-- ==================== STAGE 2 ==================== -->
@@ -84,21 +84,21 @@
         </mxCell>
 
         <!-- Write Deltas (per-token, parallel) -->
-        <mxCell id="write_deltas" value="&lt;b&gt;Per-Token Write Deltas&lt;/b&gt; (parallel, from frozen state)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;δ_pm = lr_pm · surprise — [BS, N, D]&lt;br&gt;δ_em = novelty · w_cand — [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="130" y="665" width="260" height="50" as="geometry"/>
+        <mxCell id="write_deltas" value="&lt;b&gt;Per-Token EM Write Deltas&lt;/b&gt; (parallel, from frozen state)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;g_em_t = MLP(novelty, usage) — per-token neuromod [BS, N, B]&lt;br&gt;δ_em = (g_em_t · novelty).sum(B) · w_cand — [BS, N, D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="130" y="665" width="280" height="50" as="geometry"/>
         </mxCell>
 
         <!-- Prefix Sums -->
-        <mxCell id="prefix_sums" value="&lt;b&gt;Causal Prefix Sums&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;cum_pm = cumsum(δ_pm, dim=seq) — [BS, N, D]&lt;br&gt;cum_em = cumsum(δ_em, dim=seq) — [BS, N, D]&lt;br&gt;Position t sees writes from tokens 0..t (inclusive, causal for NTP)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="420" y="665" width="310" height="55" as="geometry"/>
+        <mxCell id="prefix_sums" value="&lt;b&gt;Causal Prefix Sum&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;cum_em = cumsum(δ_em, dim=seq) — [BS, N, D]&lt;br&gt;Position t sees neuromodulated writes from 0..t (causal for NTP)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="440" y="665" width="290" height="55" as="geometry"/>
         </mxCell>
         <mxCell id="e_dp" style="endArrow=block;endFill=1;" edge="1" source="write_deltas" target="prefix_sums" parent="1">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
         <!-- PM Read (with causal bias) -->
-        <mxCell id="pm_read" value="&lt;b&gt;PM Delta Modulation&lt;/b&gt; (causal)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;delta_pm = H ⊙ (pm_bias + cum_pm)&lt;br&gt;Frozen bias + within-segment updates&lt;br&gt;[BS, N, B, D] — baseline H added once in Stage 3&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="130" y="740" width="230" height="55" as="geometry"/>
+        <mxCell id="pm_read" value="&lt;b&gt;PM Fast-Weight Read&lt;/b&gt; (bank-summed)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pre = proj_in(H) → post = (Σ_b W_b) @ pre → proj_out&lt;br&gt;Hebbian fast-weight transform (frozen within segment)&lt;br&gt;[BS, N, D] — bank-summed, no [BS,N,B,D]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="130" y="740" width="240" height="55" as="geometry"/>
         </mxCell>
 
         <!-- EM Read (from frozen) -->
@@ -107,7 +107,7 @@
         </mxCell>
 
         <!-- Three signals to Stage 3 -->
-        <mxCell id="mem_reads" value="Four signals → Stage 3: H + pm_delta + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: long-term bias (frozen + causal buffer)&lt;br&gt;em_read: long-term compositional (trail from frozen primitives)&lt;br&gt;cum_em: within-segment new info (prefix-summed write candidates)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="mem_reads" value="Four signals → Stage 3: H + pm_read + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: Hebbian fast-weight transform (frozen W_pm, bank-summed)&lt;br&gt;em_read: trail-based composition (frozen primitives)&lt;br&gt;cum_em: neuromodulated within-segment writes (prefix-summed)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="130" y="820" width="400" height="60" as="geometry"/>
         </mxCell>
         <mxCell id="e_mr1" style="endArrow=block;endFill=1;" edge="1" source="pm_read" target="mem_reads" parent="1">
@@ -120,14 +120,11 @@
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- Arrows: prefix sums to PM read (causal bias) -->
-        <mxCell id="e_ps_pm" style="endArrow=block;endFill=1;dashed=1;strokeColor=#d6b656;" edge="1" source="prefix_sums" target="pm_read" parent="1">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
+        <!-- PM reads from frozen state, no within-segment buffer (Hebbian commit only) -->
 
         <!-- Segment-End Commit -->
-        <mxCell id="pm_commit" value="&lt;b&gt;PM Segment-End Commit&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_bias += Σ_n δ_pm (sum of all deltas)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="640" y="740" width="200" height="40" as="geometry"/>
+        <mxCell id="pm_commit" value="&lt;b&gt;PM Segment-End Commit&lt;/b&gt; (Hebbian)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;G = (1/N) Σ_t σ(‖surp_t‖) · pre_t⊗pre_tᵀ&lt;br&gt;W_b ← W_b @ (decay·I + β_b·G) + Frobenius clip&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="640" y="740" width="230" height="50" as="geometry"/>
         </mxCell>
 
         <mxCell id="em_write" value="&lt;b&gt;EM Segment-End Commit&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Soft routing → neuromod → EMA&lt;br&gt;Structured decomposition into primitives&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
@@ -146,8 +143,8 @@
         </mxCell>
 
         <!-- Decay/age -->
-        <mxCell id="decay_age" value="Decay + Age Tick&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_bias decay → 0, em.age_tick(N)&lt;br&gt;Once per segment (not per token)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="855" y="830" width="150" height="45" as="geometry"/>
+        <mxCell id="decay_age" value="Decay + Budget&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;PM: Frobenius norm clip on W_pm&lt;br&gt;EM: em_S decay + budget_enforce&lt;br&gt;Once per segment (not per token)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="855" y="830" width="155" height="55" as="geometry"/>
         </mxCell>
 
         <!-- Arrows from Stage 1 outputs to Stage 2 -->
@@ -243,7 +240,7 @@
         </mxCell>
 
         <!-- Notes -->
-        <mxCell id="note1" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Key Properties&lt;/b&gt;&lt;br&gt;• Causal within segment (scan)&lt;br&gt;• Causal across segments (memory)&lt;br&gt;• Causal write buffers (prefix sums)&lt;br&gt;• Two write paths: fast (same seg) + slow (commit)&lt;br&gt;• Write-before-read (cum_pm in gain)&lt;br&gt;• Three signals to Stage 3&lt;br&gt;• No R-loop — single cycle&lt;br&gt;• NTP training (not FITB)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
+        <mxCell id="note1" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Key Properties&lt;/b&gt;&lt;br&gt;• Causal within segment (scan)&lt;br&gt;• Causal across segments (memory)&lt;br&gt;• Causal write buffer (prefix sum of cum_em)&lt;br&gt;• EM two paths: fast (neuromod) + slow (commit)&lt;br&gt;• PM Hebbian: single commit per segment&lt;br&gt;• Four signals to Stage 3&lt;br&gt;• No R-loop — single cycle&lt;br&gt;• NTP training (not FITB)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
           <mxGeometry x="1050" y="260" width="200" height="160" as="geometry"/>
         </mxCell>
 

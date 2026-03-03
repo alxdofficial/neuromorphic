@@ -101,9 +101,11 @@ ideas emerge from composing multiple primitives via trail-based navigation.
   different composition. M primitives + continuous seeds = infinite readouts.
 - **Novelty**: Reconstruction error — can existing primitives explain this input?
   Blended with surprise magnitude.
-- **Write (two paths)**: Fast: `δ_em = novelty · w_cand`, prefix-summed to `cum_em`
-  for within-segment feedback (additive signal to Stage 3). Slow: decompose across
-  primitives via soft routing at segment end, neuromodulator gates EMA write strength.
+- **Write (two paths)**: Fast: `δ_em = (g_em_t · novelty) · w_cand`, where `g_em_t` is
+  a per-token neuromodulator gate. Prefix-summed to `cum_em` for within-segment
+  feedback (additive signal to Stage 3). The neuromod gets same-segment gradient.
+  Slow: decompose across primitives via soft routing at segment end, neuromodulator
+  gates EMA write strength (cross-segment gradient via TBPTT).
   Fully differentiable — no hard selection anywhere.
 - **Column-local**: Column c only addresses its D_col slice of the bank's EM.
 - **State**: em_K, em_V [BS, B, M, D] — primitives are state, not parameters.
@@ -215,23 +217,30 @@ No RL reward, no auxiliary objective, single optimizer.
 **Why novel**: Most gated-write systems use heuristics or auxiliary losses. End-to-end
 gradient through the write gate teaches the model *when writing helps prediction*.
 
-### 5. Dual-Path EM + Hebbian PM (Fast Buffer + Slow Decomposition)
-EM uses two write paths; PM uses a single Hebbian path:
-- **EM fast path**: `cum_em = cumsum(novelty · w_cand)` — per-token write candidates
-  prefix-summed for causal within-segment feedback. Token t sees the cumulative effect
-  of writes from positions 0..t. Same-segment gradients flow through.
+### 5. Dual-Path EM + Hebbian PM (Rich Fast Path + Slow Decomposition)
+EM uses two write paths with a shared per-token neuromodulator; PM uses a single
+Hebbian path:
+- **EM fast path**: `cum_em = cumsum((g_em_t * novelty).sum(B) * w_cand)` — per-token
+  neuromodulator `g_em_t = MLP(novelty, usage)` gates write candidates before
+  prefix-summing for causal within-segment feedback. Token t sees the cumulative effect
+  of neuromodulated writes from positions 0..t. Same-segment gradient flows to the
+  neuromodulator MLP, teaching it when writes help prediction.
 - **EM slow path**: At segment end, write candidates decomposed across existing
-  primitives via soft routing with neuromodulated EMA write strength.
+  primitives via soft routing. Segment-level gate `g_em = mean(g_em_t)` reuses
+  per-token gates for neuromodulated EMA write strength.
 - **PM Hebbian path**: Single commit at segment end — eligibility G accumulates across
   the segment, then `W_b ← W_b @ (decay·I + β_b·G)`. Matches the slower timescale of
   procedural learning (habits need reinforcement across many segments, not immediate feedback).
 
-The EM fast path provides within-segment gradient flow and utility; the slow paths
-build durable, structured memory representations.
+The EM fast path provides within-segment gradient flow (including to the neuromodulator)
+and learned write selectivity; the slow paths build durable, structured memory
+representations.
 
-**Why novel**: No other model separates within-segment approximation from structured
-cross-segment writes for episodic memory, while separately using Hebbian fast-weight
-plasticity for procedural memory. This decouples gradient flow from memory organization.
+**Why novel**: No other model uses a shared neuromodulator across within-segment
+prefix-summed writes and structured cross-segment commits, while separately using
+Hebbian fast-weight plasticity for procedural memory. The fast path's neuromodulator
+receives same-segment gradient (via CE loss → Stage 3 → cum_em → g_em_t → MLP),
+teaching write selectivity without RL or auxiliary losses.
 
 ---
 
