@@ -65,18 +65,19 @@ class TestReset:
     def test_reset_zeros_masked_pm(self):
         model, cfg = _init_model("A")
 
-        # Give PM some content
+        # Give PM some content (non-identity W)
         pm = model.pm
-        pm.pm_bias = torch.randn(BS, cfg.B, cfg.D)
+        pm.W_pm = torch.randn(BS, cfg.B, cfg.D_pm, cfg.D_pm)
 
         # Mask: reset stream 0, keep stream 1
         mask = torch.tensor([True, False])
         model._reset_memory(mask)
 
-        # Stream 0 should be zeroed
-        assert (pm.pm_bias[0] == 0).all(), "masked stream pm_bias should be zero"
-        # Stream 1 should be preserved
-        assert pm.pm_bias[1].abs().sum() > 0, "unmasked stream should be preserved"
+        # Stream 0 should be reset to (1/B)*I
+        eye = torch.eye(cfg.D_pm) * (1.0 / cfg.B)
+        assert torch.allclose(pm.W_pm[0, 0], eye), "masked stream W_pm should be (1/B)*I"
+        # Stream 1 should be preserved (not identity)
+        assert not torch.allclose(pm.W_pm[1, 0], eye, atol=0.01), "unmasked stream should be preserved"
 
 
 class TestEMReset:

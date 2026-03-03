@@ -31,7 +31,7 @@ The model processes tokens causally through dense scan layers (nn.Linear project
 feature mixing) with structured memory operations between segments (slow hippocampal
 stream). Predictive coding and memory projections remain grouped (per-feature-group
 surprise via free `.view()` from dense tensors). See
-`architecture_v4_iterative_memory_scan.md` for the full v5.1 design.
+`architecture_v4_iterative_memory_scan.md` for the full v6 design.
 
 ---
 
@@ -39,10 +39,10 @@ surprise via free `.view()` from dense tensors). See
 
 ### Three Memory Systems + Predictive Coding
 
-| Memory System | Brain Analogy | Persistence | Update Mechanism | In v5.1 |
-|---------------|---------------|-------------|------------------|---------|
+| Memory System | Brain Analogy | Persistence | Update Mechanism | In v6 |
+|---------------|---------------|-------------|------------------|-------|
 | **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Scan params, projection weights |
-| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Surprise-gated bias shift | Between segments |
+| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Hebbian fast-weight learning | Between segments |
 | **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based primitive decomposition + neuromodulation | Between segments |
 
 Plus **Predictive Coding (PCM)** — grouped prediction of next token's encoding.
@@ -75,19 +75,20 @@ consolidation is slower, periodic, and handles memory formation.
 
 ### Procedural Memory (PM) — Basal Ganglia
 
-"Muscle memory" of cognition — automatic response biases, habitual processing.
+"Muscle memory" of cognition — habitual associative transformations, automatic pattern recall.
 
-- **Read**: Element-wise delta modulation: `delta = H ⊙ (pm_bias + cum_pm)`. Coarse,
-  fast, no matmuls — each feature has a frozen bias plus causal write buffer.
-  Baseline H is added once in Stage 3 integration (not per-bank).
-- **Update**: Two paths. Fast: per-token delta `δ_pm = lr_pm · surprise`, prefix-summed
-  to `cum_pm` for within-segment causal feedback. Slow: `pm_bias += Σ_n δ_pm` at
-  segment end. Only adapts on unpredicted features (vector surprise per-feature).
-- **Column-local**: Column c only addresses dims c*D_col:(c+1)*D_col of its bank.
-- **State**: pm_bias [BS, B, D] — one vector per bank. Not parameters — evolves
-  at inference for lifelong adaptation.
-- **Sacred**: Surprise-gated updates, lifelong persistence, per-feature bias.
-- **Negotiable**: Learning rate, decay rate toward neutral.
+- **Read**: `pre = proj_in(H)` projects to D_pm-dim pre-synaptic space [BS,N,D_pm].
+  Apply bank-summed fast-weight: `post = pre @ W_sum.T` where `W_sum = Σ_b W_b [BS,D_pm,D_pm]`.
+  Project back via `proj_out` to [BS,N,D]. A full learned linear transform — not element-wise bias.
+- **Write (Hebbian)**: At segment end, compute eligibility G = (1/N)·Σ_t σ(‖surp_t‖)·pre_t⊗pre_tᵀ
+  (surprise-gated pre-synaptic autocorrelation). Commit: `W_b ← W_b @ (decay·I + β_b·G)`.
+  One batched right-multiply per bank. High-surprise tokens drive larger weight changes.
+- **Bank plasticity**: Each bank has a learned scalar β_b (via softplus). Banks specialize:
+  fast β = recent-context habits; slow β = deep long-term associations.
+- **State**: W_pm [BS, B, D_pm, D_pm] — fast-weight matrices per bank. Not parameters —
+  evolves at inference for lifelong adaptation. ~512KB total (BS=16, B=4, D_pm=64).
+- **Sacred**: Surprise-gated writes, lifelong persistence, Hebbian rule.
+- **Negotiable**: D_pm, bank count, decay rate, Frobenius budget.
 
 ### Episodic Memory (EM) — Hippocampus
 
@@ -126,14 +127,18 @@ Per-column within-scan prediction and surprise computation.
 
 ## How Learning During Use Works
 
-### PM Update: "Adapt My Biases"
+### PM Write: "Reinforce Associations"
 
-Surprise from PCM drives per-feature bias shifts via **two write paths**:
-- **Fast (within segment)**: Each token computes `δ_pm = lr_pm · surprise`.
-  Prefix sum gives `cum_pm` — causal accumulation. PM read uses
-  `H ⊙ (pm_bias + cum_pm)`, so later tokens benefit from earlier surprise.
-- **Slow (segment end)**: `pm_bias += Σ_n δ_pm`. Bias persists to next segment.
-  Automatic, habitual adaptation with no explicit routing.
+Surprise from PCM drives Hebbian weight updates at segment boundaries (single path):
+- **Eligibility accumulation**: Each token contributes surprise magnitude σ(‖surp_t‖)
+  and pre-synaptic activity `pre_t = proj_in(H_t)` to an eligibility matrix
+  G = (1/N)·Σ_t σ(‖surp_t‖)·pre_t⊗pre_tᵀ across the segment.
+- **Commit (segment end)**: `W_b ← W_b @ (decay·I + β_b·G)` — one right-multiply
+  per bank. Features that co-activated under surprise have their associations reinforced.
+  Frobenius norm budget prevents unbounded growth across lifelong use.
+- **No within-segment fast path**: Unlike EM, PM writes take effect from the next segment.
+  This matches the slower timescale of procedural learning — habits form across many
+  segments, not within a single one.
 
 ### EM Write: "Two Paths — Fast Buffer + Slow Decomposition"
 
@@ -210,17 +215,23 @@ No RL reward, no auxiliary objective, single optimizer.
 **Why novel**: Most gated-write systems use heuristics or auxiliary losses. End-to-end
 gradient through the write gate teaches the model *when writing helps prediction*.
 
-### 5. Dual-Path Memory (Fast Buffer + Slow Decomposition)
-Each memory system has two write paths:
-- **Fast**: Simple per-token delta, prefix-summed for causal within-segment feedback
-- **Slow**: Structured commit at segment end (PM: bias accumulation; EM: soft-routing
-  decomposition into primitives with neuromodulated EMA)
+### 5. Dual-Path EM + Hebbian PM (Fast Buffer + Slow Decomposition)
+EM uses two write paths; PM uses a single Hebbian path:
+- **EM fast path**: `cum_em = cumsum(novelty · w_cand)` — per-token write candidates
+  prefix-summed for causal within-segment feedback. Token t sees the cumulative effect
+  of writes from positions 0..t. Same-segment gradients flow through.
+- **EM slow path**: At segment end, write candidates decomposed across existing
+  primitives via soft routing with neuromodulated EMA write strength.
+- **PM Hebbian path**: Single commit at segment end — eligibility G accumulates across
+  the segment, then `W_b ← W_b @ (decay·I + β_b·G)`. Matches the slower timescale of
+  procedural learning (habits need reinforcement across many segments, not immediate feedback).
 
-The fast path provides gradients and within-segment utility; the slow path builds
-durable, structured memory representations.
+The EM fast path provides within-segment gradient flow and utility; the slow paths
+build durable, structured memory representations.
 
 **Why novel**: No other model separates within-segment approximation from structured
-cross-segment writes. This decouples gradient flow from memory organization.
+cross-segment writes for episodic memory, while separately using Hebbian fast-weight
+plasticity for procedural memory. This decouples gradient flow from memory organization.
 
 ---
 
@@ -256,11 +267,11 @@ model, not an optimization. Grouped by category:
 1. **Three memory timescales**: Genetic (slow weights, permanent after training),
    Procedural (PM, bias that persists across documents), Episodic (EM, primitives
    that persist across documents). Each has distinct function and update rules.
-2. **Memory is state, not parameters**: PM bias and EM primitives are runtime tensors
-   that evolve at inference. They are not learned weights — they are what the model
-   remembers from experience.
+2. **Memory is state, not parameters**: PM fast-weight matrices (W_pm) and EM primitives
+   are runtime tensors that evolve at inference. They are not learned weights — they are
+   what the model remembers from experience.
 3. **O(1) memory per token at inference**: Fixed capacity (B banks × M primitives for
-   EM, B bias vectors for PM). No unbounded growth. Bounded by budgets.
+   EM, B × D_pm² fast-weight matrices for PM). No unbounded growth. Bounded by budgets.
 
 ### Memory Operations
 4. **Trail-based compositional EM read**: Iterative seed navigation through primitive

@@ -1,10 +1,10 @@
 # Baseline Comparison & Evaluation Plan for Neuromorphic LM
 
-**Target model:** Neuromorphic LM (v5.1), scan-memory-scan architecture with dense scan layers (nn.Linear) and grouped PCM/W_seed_w, Procedural Memory (PM), Episodic Memory (EM), and grouped predictive coding (PCM). Three tiers: Tier A (~100M) for RTX 4090 development, Tier B (~400M) for research, and Tier C (~1B) for cloud GPU training. NTP training objective (causal scan), affine scan backbone. See `architecture_v4_iterative_memory_scan.md` for the current v5.1 design.
+**Target model:** Neuromorphic LM (v6), scan-memory-scan architecture with dense scan layers (nn.Linear), Hebbian PM fast-weight matrices, grouped PCM/W_seed_w, and Episodic Memory (EM). Three tiers: Tier A (~92M) for RTX 4090 development, Tier B (~251M) for research, and Tier C (~844M) for cloud GPU training. NTP training objective (causal scan), affine scan backbone. See `architecture_v4_iterative_memory_scan.md` for the current v6 design.
 
 **Date:** 2026-02-28 (updated from 2026-02-23)
 
-> **Note:** Evaluation methodology below is architecture-agnostic and applies to v5.1.
+> **Note:** Evaluation methodology below is architecture-agnostic and applies to v6.
 > Key change from v4: model now uses NTP (not FITB), causal scans (not R-loop),
 > and Mamba is the primary structural baseline (shared scan backbone).
 
@@ -36,7 +36,7 @@ The gold standard for small-model research. All models trained on the Pile (dedu
 | **Pythia-160M** | 160M | 85M | 12 | 768 | 12 | ~300B (1.5 epochs) |
 | **Pythia-410M** | 410M | 302M | 24 | 1024 | 16 | ~300B (1.5 epochs) |
 
-**Why ideal:** Closest parameter-matched transformer baselines. Pythia-70M (~100M) brackets our Tier A (~100M); Pythia-410M brackets our Tier B (~400M). Reproducible, extensively benchmarked, public weights, public training data.
+**Why ideal:** Closest parameter-matched transformer baselines. Pythia-70M (~100M) brackets our Tier A (~100M); Pythia-410M brackets our Tier B (~251M). Reproducible, extensively benchmarked, public weights, public training data.
 
 **Published zero-shot benchmarks (from Pythia paper, Table 4, lm-eval-harness):**
 
@@ -233,6 +233,32 @@ Relevant as a state-of-the-art reference for recurrent models with memory update
 
 **Source:** Kimi Team, "Kimi Linear: An Expressive, Efficient Attention Architecture," Technical Report, 2025.
 
+### 2.7 Qwen3.5-0.8B (Alibaba, March 2026) -- PRIMARY TIER C BASELINE
+
+Hybrid recurrent model at 0.8B scale. Released March 2, 2026. Uses Gated DeltaNet as the primary sequence mixer (3:1 DeltaNet-to-attention layer ratio), making it the most comparable recent recurrent baseline at our Tier C (~844M) scale.
+
+| Model | Params | Architecture | Context | MMLU-Redux |
+|-------|--------|-------------|---------|------------|
+| **Qwen3.5-0.8B** | ~800M | Gated DeltaNet hybrid | 262K tokens | 48.5% |
+
+**Key properties:**
+- DeltaNet IS the sequence mixer (replaces most attention layers, not a supplement)
+- Delta rule: error-correcting write (`W ← W + η(v - Wk)kᵀ`), resets at doc boundaries
+- Not lifelong: state resets between sequences — does not persist memory across documents
+- 262K context window via long-context training (not inference-time state)
+
+**Why a critical comparison:** Most comparable recurrent model to Tier C at time of writing.
+Direct comparison reveals whether Hebbian PM + EM + PCM (our approach) is competitive
+with pure delta-rule recurrence at matched scale. Key distinction: Qwen3.5-0.8B's
+DeltaNet layer is the backbone; our PM is a supplementary memory system alongside dense scans.
+
+**Note on pretrained weights:** Pretrained Qwen3.5-0.8B is the primary comparison target
+for Tier C (trained on ~1T+ tokens). For fair comparison, also train a Qwen3.5-0.8B
+baseline from scratch on the same 1.5B token budget — pretrained weights serve as
+"upper bound" reference.
+
+**Source:** Qwen Team, Alibaba, Technical Report, March 2026.
+
 ---
 
 ## 3. Memory-Augmented Models
@@ -284,7 +310,7 @@ Addresses SSM weakness in in-context retrieval by mixing training objectives (st
 
 ## 4. Consolidated Benchmark Table
 
-Best available zero-shot numbers for models nearest to our Tier A (~100M), Tier B (~400M), and Tier C (~1.05B) parameter scales. All numbers from published papers using lm-evaluation-harness unless noted.
+Best available zero-shot numbers for models nearest to our Tier A (~92M), Tier B (~251M), and Tier C (~844M) parameter scales. All numbers from published papers using lm-evaluation-harness unless noted.
 
 | Model | Params | Type | HellaSwag | PIQA | ARC-E | ARC-C | WinoGrande | LAMBADA (acc) |
 |-------|--------|------|-----------|------|-------|-------|------------|---------------|
@@ -300,15 +326,16 @@ Best available zero-shot numbers for models nearest to our Tier A (~100M), Tier 
 | **SmolLM-360M** | 360M | Transformer | ~54% | ~73% | ~59% | ~36% | ~55% | -- |
 | **Mamba-370M** | 370M | SSM | ~35% | ~68% | ~55% | ~26% | ~52% | -- |
 | **RWKV-4 430M** | 430M | Linear RNN | ~33% | ~68% | -- | -- | -- | ~59% |
+| **Qwen3.5-0.8B** | ~800M | DeltaNet hybrid | -- | -- | -- | -- | -- | -- |
 
 *xLSTM-125M benchmarks estimated from SlimPajama scaling curves in the xLSTM paper; exact zero-shot numbers not individually reported.
 
 **Important caveats:**
 - SmolLM numbers appear higher due to 600B training tokens of curated data vs ~300B for Pythia/Mamba on less filtered data
 - Benchmark numbers vary by lm-eval-harness version and prompt format
-- At Tier A (~100M): Pythia-70M (70M), Mamba-130M (130M), SmolLM-135M (135M)
-- At Tier B (~400M): Mamba-370M (370M), SmolLM-360M (360M), Pythia-410M (410M)
-- At Tier C (~1.05B): Mamba-790M (790M), Pythia-1B (1,011M), TinyLlama-1.1B (1,100M)
+- At Tier A (~92M): Pythia-70M (70M), Mamba-130M (130M), SmolLM-135M (135M)
+- At Tier B (~251M): Mamba-370M (370M), SmolLM-360M (360M), Pythia-410M (410M)
+- At Tier C (~844M): Mamba-790M (790M), Pythia-1B (1,011M), TinyLlama-1.1B (1,100M), Qwen3.5-0.8B
 
 ---
 
@@ -342,7 +369,7 @@ Use lm-evaluation-harness (EleutherAI) for reproducibility. These are the standa
 | **BoolQ** | Yes/no QA | acc | Weakly |
 | **OpenBookQA** | Open-book science | acc_norm | Weakly |
 
-**Recommendation for Tier A (~100M):** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale). **At Tier C (~1.05B):** All benchmarks become more discriminating; report the full suite including HellaSwag and WinoGrande.
+**Recommendation for Tier A (~100M):** Focus on PIQA, ARC-Easy, LAMBADA (most signal). Report HellaSwag and ARC-Challenge for completeness but expect near-random. Skip WinoGrande (saturated at random for this scale). **At Tier C (~844M):** All benchmarks become more discriminating; report the full suite including HellaSwag and WinoGrande.
 
 ### 5.3 Token-Level and Efficiency Metrics
 
@@ -495,8 +522,8 @@ These are not benchmarks but diagnostic analyses to include in the paper:
 
 | Analysis | What it shows |
 |----------|--------------|
-| PM bias norm over training | How PM bias evolves across training |
-| PM lr_pm effective rate | Learning rate adaptation for surprise-driven updates |
+| PM fast-weight Frobenius norm | How W_pm magnitude evolves across training |
+| PM raw_beta effective plasticity | Per-bank plasticity rate β_b over time |
 | EM write rate and novelty distribution | Whether EM learns to be selective |
 | EM trail composition quality | Quality of trail-based memory reads |
 | PCM surprise distribution | How surprise drives write signals |
@@ -515,7 +542,7 @@ The most important experiments for proving the architecture works. Each ablation
 | Ablation | Config change | What it tests |
 |----------|--------------|---------------|
 | **Full model** | All enabled | Baseline |
-| **No PM** | `pm_enabled=False` (zero pm_bias) | Value of procedural memory |
+| **No PM** | `pm_enabled=False` (skip PM read/write) | Value of procedural memory |
 | **No EM** | `em_enabled=False` (skip trail reads/writes) | Value of episodic memory |
 | **No PM + No EM** | Both off | Value of memory systems vs bare scans |
 | **No PCM** | `pcm_enabled=False` | Value of within-scan predictive coding |
@@ -577,9 +604,9 @@ Train at 3-4 model sizes with matched parameter counts:
 
 | Tier | Our model | Pythia | Mamba | Other |
 |------|-----------|--------|-------|-------|
-| ~100M | Tier A (D=768, B=6, C=4, G=24) | Pythia-70M | Mamba-130M | SmolLM-135M |
-| ~400M | Tier B (D=1536, B=8, C=8, G=64) | Pythia-410M | Mamba-370M | SmolLM-360M |
-| **~1B** | **Tier C (D=2048, B=12, C=8, G=96)** | **Pythia-1B** | **Mamba-790M** | **TinyLlama-1.1B** |
+| ~92M | Tier A (D=2048, B=4, C=16, L=6, d_inner=1024) | Pythia-70M / Pythia-160M | Mamba-130M | SmolLM-135M |
+| ~251M | Tier B (D=3072, B=6, C=16, L=12, d_inner=1024) | Pythia-410M | Mamba-370M | SmolLM-360M |
+| **~844M** | **Tier C (D=4096, B=8, C=16, L=16, d_inner=2048)** | **Pythia-1B** | **Mamba-790M** | **Qwen3.5-0.8B / TinyLlama-1.1B** |
 
 **Plot:** Validation loss vs parameter count for each architecture family. If our curve is below baselines, the architecture is more parameter-efficient.
 
@@ -617,11 +644,11 @@ Following best practices from Mamba (2023), Griffin (2024), xLSTM (2024):
 | Pythia-70M | 70M | 96 | 61K | 6e-4 | 6e-5 | 1% (610 steps) |
 | Mamba-130M | 130M | 64 | 91K | 6e-4 | 6e-5 | 1% (910 steps) |
 
-**Tier C (~1.05B) comparison on A100 80GB:**
+**Tier C (~844M) comparison on A100 80GB:**
 
 | Model | Params | BS | Steps (est.) | LR | GPU |
 |-------|--------|----|-------|-----|-----|
-| Neuromorphic C | 1,047M | 8 | ~730K | 1.5e-4 | A100 80GB |
+| Neuromorphic C | ~844M | 8 | ~730K | 1.5e-4 | A100 80GB |
 | Pythia-1B | 1,011M | 32 | ~183K | 3e-4 | A100 80GB |
 | Mamba-790M | 790M | 16 | ~366K | 3e-4 | A100 80GB |
 
@@ -652,7 +679,7 @@ Batch sizes are per-model optimal for each GPU. Different BS is acceptable becau
 These are the experiments needed to convincingly demonstrate the architecture:
 
 #### Priority 1: Core Claims (must have)
-1. **Perplexity on WikiText-103 and Pile validation** at Tier A (~100M) vs Pythia-70M/Mamba-130M, and Tier C (~1.05B) vs Pythia-1B/Mamba-790M
+1. **Perplexity on WikiText-103 and Pile validation** at Tier A (~92M) vs Pythia-70M/Mamba-130M, and Tier C (~844M) vs Pythia-1B/Mamba-790M/Qwen3.5-0.8B
 2. **Component ablation table** (full, no-PM, no-EM, bare columns) on WikiText-103
 3. **PG19 perplexity vs position curve** showing memory advantage at long distances
 4. **MQAR accuracy** at varying sequence lengths showing EM advantage
@@ -725,6 +752,7 @@ A paper proving this architecture "makes sense" should follow this structure:
 - **GSA:** Zhang et al., "Gated Slot Attention for Efficient Linear-Time Sequence Modeling," NeurIPS 2024
 - **Kimi Linear:** Kimi Team, "Kimi Linear: An Expressive, Efficient Attention Architecture," 2025
 - **DeltaNet:** Yang et al., "Parallelizing Linear Transformers with the Delta Rule," ICML 2024
+- **Qwen3.5-0.8B:** Qwen Team, Alibaba, Technical Report, March 2026
 
 ### Benchmarks & Evaluation
 - **MQAR / Zoology:** Arora et al., "Zoology: Measuring and Improving Recall in Efficient Language Models," ICLR 2024

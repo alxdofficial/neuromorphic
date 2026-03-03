@@ -88,10 +88,20 @@ class TestTierPresets:
         cfg.validate()
         assert cfg.D == 3072
         assert cfg.D_embed == 512
-        assert cfg.B == 12
+        assert cfg.B == 6
+        assert cfg.C == 16
+        assert cfg.L_scan == 12
+        assert cfg.d_inner == 1024
+
+    def test_tier_c(self):
+        cfg = ModelConfig.tier_c()
+        cfg.validate()
+        assert cfg.D == 4096
+        assert cfg.D_embed == 768
+        assert cfg.B == 8
         assert cfg.C == 16
         assert cfg.L_scan == 16
-        assert cfg.d_inner == 768
+        assert cfg.d_inner == 2048
 
     def test_tier_tiny(self):
         cfg = ModelConfig.tier_tiny()

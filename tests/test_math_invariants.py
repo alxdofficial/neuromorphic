@@ -78,21 +78,20 @@ class TestBudgetEnforce:
 # PM bias finite after operations
 # ============================================================================
 
-class TestPMBiasInvariants:
-    def test_pm_bias_finite_after_init(self):
-        """After init, pm_bias is zeros."""
+class TestPMStateInvariants:
+    def test_pm_W_finite_after_init(self):
+        """After init, W_pm should be near (1/B)*I."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-        assert torch.isfinite(model.pm.pm_bias).all()
-        assert model.pm.pm_bias.abs().sum() == 0
+        assert torch.isfinite(model.pm.W_pm).all()
 
-    def test_pm_bias_finite_after_commits(self):
-        """After forward_segment (which includes PM commit), pm_bias should be finite."""
+    def test_pm_W_finite_after_commits(self):
+        """After forward_segment (which includes PM commit), W_pm should be finite."""
         cfg = make_tiny_config()
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
-        assert torch.isfinite(model.pm.pm_bias).all()
+        assert torch.isfinite(model.pm.W_pm).all()
 
 
 # ============================================================================
@@ -153,7 +152,7 @@ class TestNoNaN:
         model = NeuromorphicLM(cfg)
         results = forward_k_segments(model, K=3, BS=BS)
 
-        assert torch.isfinite(model.pm.pm_bias).all()
+        assert torch.isfinite(model.pm.W_pm).all()
         assert torch.isfinite(model.em.em_K).all()
         assert torch.isfinite(model.em.em_V).all()
         assert torch.isfinite(model.em.em_S).all()
@@ -205,32 +204,32 @@ class TestOnlineCrossEntropy:
 # ============================================================================
 
 class TestPMCommitEquations:
-    """Verify PM commit update formula: bias = (bias + delta) * decay."""
+    """Verify PM Hebbian commit: W = W @ (decay·I + β·G), then budget clip."""
 
-    def test_commit_equation(self):
-        """pm_bias = (pm_bias + delta_sum) * decay_pm."""
+    def test_commit_updates_W(self):
+        """Commit with non-zero surprise should change W_pm."""
         from src.model.procedural_memory import ProceduralMemory
-        pm = ProceduralMemory(B=1, D=4, decay_pm=0.9)
+        pm = ProceduralMemory(B=1, D=8, D_pm=4, decay=0.9)
         pm.initialize(1, torch.device("cpu"), torch.float32)
 
-        pm.pm_bias = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
-        delta_sum = torch.tensor([[[0.5, -0.5, 0.0, 1.0]]])  # [BS=1, B=1, D=4]
+        H = torch.randn(1, 4, 8)
+        _, pre = pm.read(H)
+        surprise = torch.randn(1, 4, 8) * 3.0
+        W_before = pm.W_pm.clone()
+        pm.commit(pre, surprise, budget=100.0)
+        assert not torch.allclose(pm.W_pm, W_before)
 
-        pm.commit(delta_sum)
-
-        expected = (torch.tensor([1.0, 2.0, 3.0, 4.0]) +
-                    torch.tensor([0.5, -0.5, 0.0, 1.0])) * 0.9
-        assert torch.allclose(pm.pm_bias[0, 0], expected, atol=1e-5)
-
-    def test_zero_delta_only_decays(self):
-        """With zero delta, commit only decays bias."""
+    def test_commit_budget_enforcement(self):
+        """Frobenius norm per bank should not exceed budget after commit."""
         from src.model.procedural_memory import ProceduralMemory
-        pm = ProceduralMemory(B=1, D=4, decay_pm=0.9)
+        pm = ProceduralMemory(B=1, D=8, D_pm=4, decay=0.9)
         pm.initialize(1, torch.device("cpu"), torch.float32)
+        pm.W_pm = torch.ones(1, 1, 4, 4) * 100.0  # huge W
 
-        pm.pm_bias = torch.tensor([[[2.0, 2.0, 2.0, 2.0]]])
-        delta_sum = torch.zeros(1, 1, 4)  # [BS=1, B=1, D=4]
+        H = torch.randn(1, 4, 8)
+        _, pre = pm.read(H)
+        surprise = torch.randn(1, 4, 8)
+        pm.commit(pre, surprise, budget=5.0)
 
-        pm.commit(delta_sum)
-        expected = torch.full((4,), 2.0 * 0.9)
-        assert torch.allclose(pm.pm_bias[0, 0], expected, atol=1e-5)
+        frob = pm.W_pm.flatten(-2).norm(dim=-1)
+        assert torch.allclose(frob, torch.tensor([[5.0]]), atol=1e-4)

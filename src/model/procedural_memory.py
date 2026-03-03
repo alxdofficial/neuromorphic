@@ -1,10 +1,13 @@
 """
-Procedural Memory (v5) — bias vector with causal write buffers.
+Procedural Memory (v6) — Hebbian fast-weight network.
 
-Per-bank bias vector. Read returns delta only: y = H * (pm_bias + cum_pm).
-The baseline H is added once in the model, not per-bank.
-Write: surprise-driven bias shifts with prefix-sum causal buffer.
-Commit: segment-end bias aggregate with decay.
+Per-bank weight matrix as runtime state. Read: input→matmul→output.
+Write: surprise-gated Hebbian correlation (pre⊗post reinforcement).
+Commit: efficient right-multiply factorization (1 batched matmul).
+
+Key design: PM is a learned TRANSFORM, not a prediction loop (that's PCM).
+Banks differ by plasticity rate (beta_b), giving multiple timescales.
+Read is bank-summed via W.sum(B) — no [BS,N,B,D] intermediate.
 """
 
 import torch
@@ -12,89 +15,137 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .utils import StateMixin, runtime_state_dtype
+from .utils import StateMixin
 
 
 class ProceduralMemory(nn.Module, StateMixin):
-    """PM bias vector with causal write buffers.
+    """Hebbian fast-weight network with per-bank weight matrices.
 
     State:
-        pm_bias: [BS, B, D] — bias vector per bank
+        W_pm: [BS, B, D_pm, D_pm] — per-bank fast weight matrix
+
+    Read:
+        pre = proj_in(H)                   # [BS, N, D_pm]
+        post = (Σ_b W_b) @ pre             # [BS, N, D_pm] — bank sum fused
+        pm_read = proj_out(post)            # [BS, N, D]
+
+    Write (Hebbian, surprise-gated):
+        G = (1/N) · Σ_t σ(‖surp_t‖) · pre_t ⊗ pre_t^T   # gated autocorrelation
+        W_b ← W_b @ (decay·I + β_b·G)                     # 1 batched matmul
+        clip Frobenius norm to budget
     """
 
-    _state_tensor_names = ["pm_bias"]
+    _state_tensor_names = ["W_pm"]
 
-    def __init__(self, B: int, D: int, decay_pm: float = 0.999):
+    def __init__(self, B: int, D: int, D_pm: int = 64, decay: float = 0.999):
         super().__init__()
         self.B = B
         self.D = D
-        self.decay_pm = decay_pm
+        self.D_pm = D_pm
+        self.decay = decay
 
-        # Learned per-bank learning rate: softplus(raw) -> always positive
-        self.raw_lr_pm = nn.Parameter(torch.full([B], -2.0))
+        # Fixed projections: D ↔ D_pm
+        self.proj_in = nn.Linear(D, D_pm)
+        self.proj_out = nn.Linear(D_pm, D)
+
+        # Per-bank plasticity rate: softplus(raw) → always positive
+        self.raw_beta = nn.Parameter(torch.full([B], -3.0))
 
         # State (lazily allocated)
-        self.pm_bias: Tensor | None = None
+        self.W_pm: Tensor | None = None
 
     @property
-    def lr_pm(self) -> Tensor:
-        """Per-bank learning rate [B], always positive."""
-        return F.softplus(self.raw_lr_pm)
+    def beta(self) -> Tensor:
+        """Per-bank plasticity rate [B], always positive."""
+        return F.softplus(self.raw_beta)
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
-        """Pre-allocate state tensors."""
-        self.pm_bias = torch.zeros(BS, self.B, self.D, device=device, dtype=dtype)
+        """Pre-allocate W_pm as (1/B)·I + small noise.
+
+        This ensures the initial read is approximately identity (passes
+        information through), and each bank starts with slightly different
+        weights so they can specialize.
+        """
+        D_pm = self.D_pm
+        eye = torch.eye(D_pm, device=device, dtype=dtype)
+        noise = torch.randn(BS, self.B, D_pm, D_pm, device=device, dtype=dtype) * 0.01
+        self.W_pm = eye * (1.0 / self.B) + noise
 
     def is_initialized(self) -> bool:
-        return self.pm_bias is not None
+        return self.W_pm is not None
 
-    def compute_deltas(self, surprise: Tensor) -> Tensor:
-        """Per-token PM deltas.
+    def read(self, H: Tensor) -> tuple[Tensor, Tensor]:
+        """Read from PM: project H through bank-summed fast weights.
 
         Args:
-            surprise: [BS, N, D] — vector surprise (flat, all banks share same surprise)
+            H: [BS, N, D] — scan output
 
         Returns:
-            delta_pm: [BS, N, B, D] — per-token bias deltas
+            pm_read: [BS, N, D] — PM contribution to integration
+            pre: [BS, N, D_pm] — projected input (saved for commit)
         """
-        # lr_pm: [B] -> [1, 1, B, 1]
-        lr = self.lr_pm[None, None, :, None]
-        # surprise: [BS, N, D] -> [BS, N, 1, D]
-        return lr * surprise.unsqueeze(2)  # [BS, N, B, D]
+        pre = self.proj_in(H)                            # [BS, N, D_pm]
+        W_sum = self.W_pm.sum(dim=1)                     # [BS, D_pm, D_pm]
+        post = torch.matmul(pre, W_sum.transpose(-1, -2))  # [BS, N, D_pm]
+        pm_read = self.proj_out(post)                    # [BS, N, D]
+        return pm_read, pre
 
-    def read_all(self, H_flat: Tensor, cum_pm: Tensor) -> Tensor:
-        """PM delta read for all banks: returns H * (pm_bias + cum_pm).
+    def commit(self, pre: Tensor, surprise: Tensor, budget: float = 16.0):
+        """Segment-end Hebbian update of W_pm.
 
-        Returns only the modulation delta. The baseline H is added once
-        in the model's integration step (not per-bank).
+        Efficient factorization:
+            post_bt = W_b @ pre_t  →  ΔW_b = β_b · Σ_t s_t · post_bt ⊗ pre_t^T
+            = β_b · W_b @ (Σ_t s_t · pre_t ⊗ pre_t^T)
+            = β_b · W_b @ G
+
+        So: W_b_new = decay · W_b + β_b · W_b @ G = W_b @ (decay·I + β_b·G)
+        Single batched matmul for all banks.
 
         Args:
-            H_flat: [BS, N, D] — column states reshaped to flat D
-            cum_pm: [BS, N, B, D] — prefix-summed write deltas for all banks
-
-        Returns:
-            pm_delta: [BS, N, B, D] — per-bank PM modulation (no baseline)
+            pre: [BS, N, D_pm] — projected inputs (from read)
+            surprise: [BS, N, D] — vector surprise from PCM
+            budget: max Frobenius norm per bank
         """
-        # pm_bias: [BS, B, D] -> [BS, 1, B, D]
-        bias = self.pm_bias.unsqueeze(1)
-        # H_flat: [BS, N, D] -> [BS, N, 1, D]
-        return H_flat.unsqueeze(2) * (bias + cum_pm)
+        BS, N, D_pm = pre.shape
 
-    def commit(self, delta_pm_sum: Tensor):
-        """Segment-end commit for all banks: pm_bias += sum of deltas, then decay.
+        # Surprise gate: σ(‖surprise‖) ∈ [0, 1] per token
+        surp_mag = surprise.norm(dim=-1)                  # [BS, N]
+        s = torch.sigmoid(surp_mag)                       # [BS, N]
 
-        Args:
-            delta_pm_sum: [BS, B, D] — sum of per-token deltas across N positions
-        """
-        # Arithmetic ops create new tensors for autograd — no clone needed
-        self.pm_bias = (self.pm_bias + delta_pm_sum) * self.decay_pm
+        # Gated autocorrelation: G = (1/N) · Σ_t s_t · pre_t ⊗ pre_t^T
+        # Efficient: G = (1/N) · (√s · pre)^T @ (√s · pre)
+        s_sqrt = s.unsqueeze(-1).sqrt()                   # [BS, N, 1]
+        weighted = s_sqrt * pre                           # [BS, N, D_pm]
+        G = torch.matmul(
+            weighted.transpose(-1, -2), weighted          # [BS, D_pm, D_pm]
+        ) * (1.0 / N)
+
+        # Per-bank transform: T_b = decay·I + β_b·G
+        beta = self.beta                                  # [B]
+        eye = torch.eye(D_pm, device=pre.device, dtype=pre.dtype)
+        # G: [BS, 1, D_pm, D_pm], beta: [1, B, 1, 1]
+        T = self.decay * eye + beta[None, :, None, None] * G.unsqueeze(1)
+
+        # Update: W_b = W_b @ T_b  (batched matmul)
+        self.W_pm = torch.matmul(self.W_pm, T)           # [BS, B, D_pm, D_pm]
+
+        # Budget enforcement: Frobenius norm per bank
+        # norm over last two dims (the D_pm × D_pm matrix)
+        frob = self.W_pm.flatten(-2).norm(dim=-1, keepdim=True)  # [BS, B, 1]
+        frob = frob.unsqueeze(-1).clamp(min=1e-8)        # [BS, B, 1, 1]
+        scale = (budget / frob).clamp(max=1.0)
+        self.W_pm = self.W_pm * scale
 
     def reset_states(self, mask: Tensor):
-        """Zero bias for masked streams (doc boundary, non-lifelong).
+        """Reset W_pm to (1/B)·I for masked streams.
 
-        mask: [BS] bool.
+        mask: [BS] bool — True for streams to reset.
         """
-        if self.pm_bias is None:
+        if self.W_pm is None:
             return
-        expanded = mask[:, None, None]  # [BS, 1, 1]
-        self.pm_bias = self.pm_bias * ~expanded
+        D_pm = self.D_pm
+        eye = torch.eye(D_pm, device=self.W_pm.device, dtype=self.W_pm.dtype)
+        fresh = eye * (1.0 / self.B)
+        # mask: [BS] → [BS, 1, 1, 1]
+        expanded = mask[:, None, None, None]
+        self.W_pm = torch.where(expanded, fresh, self.W_pm)

@@ -230,15 +230,17 @@ def main():
 
     t_start = time.time()
 
-    # --- Validation set (from Pile validation split, different seed) ---
+    # --- Validation set (different seed slice of train split) ---
+    # The Pile deduplicated only has a 'train' split.
+    # We use a different shuffle seed so val examples are distinct from train.
     val_meta = stream_and_save(
         hf_path=PILE_PATH,
         target_tokens=val_tokens,
         out_path=out_dir / "pile_val.parquet",
         tokenizer=tokenizer,
         seed=VAL_SEED,
-        split="validation",
-        label="The Pile (validation, seed=1337)",
+        split="train",
+        label="The Pile (validation slice, seed=1337)",
     )
     manifest["datasets"]["pile_val"] = val_meta
 

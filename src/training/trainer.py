@@ -92,10 +92,11 @@ class TBPTTTrainer:
 
         if self.config.pm_enabled:
             pm = self.model.pm
-            if pm.pm_bias is not None:
-                # PM budget: norm of bias across D
-                total = pm.pm_bias.detach().abs().sum().item()
-                cap = self.config.budget_pm * pm.pm_bias.shape[0] * pm.pm_bias.shape[1]
+            if pm.W_pm is not None:
+                # PM budget: Frobenius norm of fast-weight matrices
+                frob = pm.W_pm.detach().flatten(-2).norm(dim=-1)  # [BS, B]
+                total = frob.sum().item()
+                cap = self.config.budget_pm * pm.W_pm.shape[0] * pm.W_pm.shape[1]
                 if cap > 0:
                     pm_util = total / cap
 
@@ -280,7 +281,7 @@ class TBPTTTrainer:
 
         _loss_f = avg_loss.detach().item()
         _reg_f = reg.detach().item()
-        _ppl_f = min(math.exp(_loss_f), 1e6)
+        _ppl_f = min(math.exp(min(_loss_f, 20.0)), 1e6)
 
         step_metrics = {
             "loss": _loss_f,

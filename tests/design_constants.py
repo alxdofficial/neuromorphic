@@ -53,6 +53,6 @@ PHASE_TOGGLES = {
 # State tensor names per class (v5)
 # ---------------------------------------------------------------------------
 STATE_TENSOR_NAMES = {
-    "ProceduralMemory": ["pm_bias"],
+    "ProceduralMemory": ["W_pm"],
     "EpisodicMemory": ["em_K", "em_V", "em_S"],
 }

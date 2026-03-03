@@ -215,38 +215,31 @@ class TestWithinScanPCM:
 class TestProceduralMemory:
     def test_initialize(self):
         cfg = make_tiny_config()
-        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.D_pm, cfg.decay_pm)
         assert not pm.is_initialized()
         pm.initialize(BS, torch.device("cpu"), torch.float32)
         assert pm.is_initialized()
-        assert pm.pm_bias.shape == (BS, cfg.B, cfg.D)
+        assert pm.W_pm.shape == (BS, cfg.B, cfg.D_pm, cfg.D_pm)
 
-    def test_compute_deltas_shape(self):
+    def test_read_shape(self):
         cfg = make_tiny_config()
-        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.D_pm, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        surprise = torch.randn(BS, 8, cfg.D)
-        deltas = pm.compute_deltas(surprise)
-        assert deltas.shape == (BS, 8, cfg.B, cfg.D)
-
-    def test_read_all_shape(self):
-        cfg = make_tiny_config()
-        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
-        pm.initialize(BS, torch.device("cpu"), torch.float32)
-        H_flat = torch.randn(BS, 8, cfg.D)
-        cum_pm = torch.randn(BS, 8, cfg.B, cfg.D)
-        y = pm.read_all(H_flat, cum_pm)
-        assert y.shape == (BS, 8, cfg.B, cfg.D)
+        H = torch.randn(BS, 8, cfg.D)
+        pm_read, pre = pm.read(H)
+        assert pm_read.shape == (BS, 8, cfg.D)
+        assert pre.shape == (BS, 8, cfg.D_pm)
 
     def test_commit(self):
         cfg = make_tiny_config()
-        pm = ProceduralMemory(cfg.B, cfg.D, cfg.decay_pm)
+        pm = ProceduralMemory(cfg.B, cfg.D, cfg.D_pm, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
-        delta_sum = torch.randn(BS, cfg.B, cfg.D)
-        bias_before = pm.pm_bias.clone()
-        pm.commit(delta_sum)
-        # Bias should have changed
-        assert not torch.allclose(pm.pm_bias, bias_before)
+        H = torch.randn(BS, 8, cfg.D)
+        _, pre = pm.read(H)
+        surprise = torch.randn(BS, 8, cfg.D)
+        W_before = pm.W_pm.clone()
+        pm.commit(pre, surprise, budget=cfg.budget_pm)
+        assert not torch.allclose(pm.W_pm, W_before)
 
 
 class TestEpisodicMemory:

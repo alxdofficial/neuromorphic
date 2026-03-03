@@ -8,7 +8,7 @@ Outputs to snapshot_dir/:
     config.json         — model configuration
     param_summary.json  — per-parameter name, shape, norm, grad_norm
     embedding_norms.pt  — per-token embedding norms
-    pm_state/           — pm_bias
+    pm_state/           — W_pm
     em_state/           — em_K, em_V, em_S
 """
 
@@ -107,13 +107,13 @@ def main():
     pm_tensors = {}
     if model is not None:
         pm = model.pm
-        for k in ["pm_bias"]:
+        for k in ["W_pm"]:
             t = getattr(pm, k, None)
             if t is not None:
                 pm_tensors[f"pm.{k}"] = t.detach().cpu()
     else:
         for name, tensor in state_dict.items():
-            if "pm_bias" in name:
+            if "W_pm" in name:
                 pm_tensors[name] = tensor
     if pm_tensors:
         torch.save(pm_tensors, os.path.join(pm_dir, "pm_all.pt"))

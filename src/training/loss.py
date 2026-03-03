@@ -90,17 +90,18 @@ def compute_regularizers(model) -> Tensor:
 
     if model.config.pm_enabled:
         pm = model.pm
-        if pm.pm_bias is not None:
-            # Penalize large PM bias norms
-            bias_norm = pm.pm_bias.norm(dim=-1)  # [BS, B]
-            excess = F.relu(bias_norm - model.config.budget_pm * 0.9)
-            reg = reg + excess.mean() * 0.01
+        if pm.W_pm is not None:
+            # Penalize large PM fast-weight norms (hard clipping in commit is primary;
+            # this soft penalty provides gradient signal to reduce beta if W grows too large)
+            frob_norm = pm.W_pm.flatten(-2).norm(dim=-1)  # [BS, B]
+            excess = F.relu(frob_norm - model.config.budget_pm * 0.5)
+            reg = reg + excess.mean()
 
     if model.config.em_enabled:
         em = model.em
         if em.em_S is not None:
             usage = em.em_S.sum(dim=-1)  # [BS, B]
             excess = F.relu(usage - model.config.budget_em * 0.9)
-            reg = reg + excess.mean() * 0.01
+            reg = reg + excess.mean()
 
     return reg

@@ -148,17 +148,18 @@ class MetricsCollector:
     def _collect_pm_stats(self, record: dict):
         """Read PM state tensors and compute summary stats.
 
-        v5: single PM with bias state [BS, B, D].
+        v6: Hebbian fast-weight W_pm [BS, B, D_pm, D_pm].
         """
         if not self.config.pm_enabled:
             return
         pm = self.model.pm
-        if pm.pm_bias is None:
+        if pm.W_pm is None:
             return
-        pm_bias = pm.pm_bias.detach()  # [BS, B, D]
-        record["pm_bias_norm"] = pm_bias.norm().item()
-        record["pm_bias_mean"] = pm_bias.mean().item()
-        record["pm_bias_max"] = pm_bias.abs().max().item()
+        W = pm.W_pm.detach()  # [BS, B, D_pm, D_pm]
+        frob = W.flatten(-2).norm(dim=-1)  # [BS, B]
+        record["pm_W_frob_mean"] = frob.mean().item()
+        record["pm_W_frob_max"] = frob.max().item()
+        record["pm_W_max"] = W.abs().max().item()
 
     def _collect_em_stats(self, record: dict):
         """Read EM state tensors and compute summary stats."""
@@ -195,10 +196,15 @@ class MetricsCollector:
     def _collect_lifelong_stats(self, record: dict):
         """Collect cross-document memory persistence stats (Phase B)."""
         pm = self.model.pm
-        if pm.pm_bias is not None:
-            pm_bias = pm.pm_bias.detach()
-            record["pm_bias_norm_lifelong"] = pm_bias.norm().item()
-            record["pm_bias_nonzero"] = (pm_bias.abs() > 0.01).float().mean().item()
+        if pm.W_pm is not None:
+            W = pm.W_pm.detach()
+            frob = W.flatten(-2).norm(dim=-1)  # [BS, B]
+            record["pm_W_frob_lifelong"] = frob.mean().item()
+            # Deviation from identity: how much has PM learned?
+            D_pm = W.shape[-1]
+            eye = torch.eye(D_pm, device=W.device, dtype=W.dtype) * (1.0 / pm.B)
+            deviation = (W - eye).flatten(-2).norm(dim=-1)
+            record["pm_W_deviation"] = deviation.mean().item()
 
         em = self.model.em
         if em.em_S is not None:

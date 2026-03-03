@@ -1,4 +1,4 @@
-# Architecture v5.1: Scan-Memory-Scan — Dense Scan + Grouped PCM
+# Architecture v6: Scan-Memory-Scan — Dense Scan + Hebbian PM + Grouped PCM
 
 > **Previous versions**: v4 (iterative R-loop refinement) preserved on `v4-iterative-backup` branch.
 > v1 preserved on `v1-legacy` branch.
@@ -85,15 +85,14 @@ three-stage cycle mirrors this: fast processing → memory interaction → integ
 - **PCM** — per-group predictive coding (predict next token's encoding per group)
 - Trail seeds and write candidates produced per-group via GroupedLinear
 
-**Shared memory systems** (B independent banks, addressed by column slices):
-- **PM** — procedural memory: learned bias vector per bank (basal ganglia).
-  Element-wise gain modulation — fast, automatic, coarse.
+**Shared memory systems** (B independent banks):
+- **PM** — procedural memory: Hebbian fast-weight network (basal ganglia / habit system).
+  State = W_pm [BS, B, D_pm, D_pm] per bank. Read: proj_in(H) → (Σ_b W_b) @ pre → proj_out.
+  Write: surprise-gated Hebbian autocorrelation. Per-bank β gives multiple timescales.
 - **EM** — episodic memory: dictionary of M primitive patterns (hippocampus).
   Trail-based compositional read — seed navigates primitive space.
-- B memory banks. Each bank is addressed by the columns assigned to it.
-- Column c in block b addresses only dims `c*D_col:(c+1)*D_col` of bank b's
-  memory — pure dimension slicing, no routing, no gather/scatter.
-- PM state shape: `[BS, B, D]` (one bias vector per bank)
+- B memory banks. Banks are independent; PM banks differ by plasticity rate β_b.
+- PM state shape: `[BS, B, D_pm, D_pm]` (fast-weight matrix per bank)
 - EM state shape: `[BS, B, M, D]` where D = C × D_col (M primitives per bank)
 
 **Dense scan, grouped PCM/projections** (v5.1):
@@ -116,22 +115,21 @@ For each segment of N tokens:
       surprise_t = z_hat_{t-1} - encode(X_t)    # vector surprise (D_col)
 
   STAGE 2 — Memory Operations (parallel across N positions):
-    # 1. Proposed writes (per-token, parallel, from frozen memory):
-    For each bank b = 1..B:
-      delta_pm_t = lr_pm · surprise_t            # per-token PM bias delta
-      delta_em_t = novelty_t · w_cand_t          # per-token EM write delta
+    # 1. PM: Hebbian fast-weight read (bank-summed, no [BS,N,B,D])
+      pre = proj_in(H)                           # [BS, N, D_pm]
+      pm_read = proj_out((Σ_b W_b) @ pre)        # [BS, N, D]
 
-    # 2. Prefix sums (causal accumulation, O(N)):
-      cum_pm_t = Σ_{i≤t} delta_pm_i             # inclusive, causal for NTP
-      cum_em_t = Σ_{i≤t} delta_em_i
+    # 2. EM novelty + causal write buffer
+      novelty_t = compute_novelty(w_cand_t, surprise_t)
+      cum_em_t = Σ_{i≤t} novelty_i · w_cand_i   # prefix sum, causal
 
-    # 3. Reads (from frozen memory + causal write buffers):
-      pm_delta = H[:, b] ⊙ (pm_bias_b + cum_pm)       # PM: delta-only modulation
-      em_read = EM_b.trail_read(seed[:, b])           # EM: trail from frozen
+    # 3. EM trail read (from frozen primitives, summed over B)
+      em_read = trail_read_all(seed)             # [BS, N, D]
 
-    # 4. End of segment: actual structured commit
-      PM_b.commit(delta_pm)                      # bias update
-      EM_b.commit(w_cand, novelty)               # decompose across primitives
+    # 4. End of segment: structured commit
+      G = (1/N) Σ_t σ(‖surp_t‖) · pre_t⊗pre_tᵀ  # PM: gated autocorrelation
+      W_b = W_b @ (decay·I + β_b·G)               # PM: Hebbian update per bank
+      EM_b.commit(w_cand, novelty)                 # EM: decompose across primitives
 
   STAGE 3 — Integration Scan (causal, parallel via parallel-scan):
     For t = 1..N (parallelized):
@@ -226,11 +224,10 @@ def memory_ops(self, H, seed, w_cand, surprise):
         cum_em_sum:   [BS, N, D]  — EM write buffer, summed over B
     """
 
-    # --- PM: fused read sum (no [BS, N, B, D]) ---
-    # sum_b[H * (bias_b + cumsum(lr_b * surprise))]
-    #   = H * (bias.sum(B) + lr.sum() * cumsum(surprise))
-    cum_surprise = cumsum(surprise, dim=seq)           # [BS, N, D]
-    pm_read_sum = H * (pm_bias.sum(B) + lr_pm.sum() * cum_surprise)  # [BS, N, D]
+    # --- PM: Hebbian fast-weight read (bank-summed, no [BS, N, B, D]) ---
+    pre = proj_in(H)                                   # [BS, N, D_pm]
+    W_sum = W_pm.sum(dim=B)                            # [BS, D_pm, D_pm]
+    pm_read_sum = proj_out(pre @ W_sum.T)              # [BS, N, D]
 
     # --- EM novelty (still [BS, N, B] — needed for commit) ---
     w_nov = sigmoid(W_nov(H))                          # [BS, N, B]
@@ -245,9 +242,11 @@ def memory_ops(self, H, seed, w_cand, surprise):
     em_read_sum = trail_read_all(seed)                 # [BS, N, D]
 
     # --- SEGMENT-END COMMIT ---
-    # PM: lr * surprise.sum(N) — direct [BS, B, D], no [BS,N,B,D]
-    pm_commit = lr_pm[None, :, None] * surprise.sum(N).unsqueeze(1)
-    pm_bias += pm_commit; pm_bias *= decay
+    # PM: Hebbian — G = (1/N) Σ_t σ(‖surp_t‖) · pre_t⊗pre_tᵀ
+    s = sigmoid(surprise.norm(dim=-1))                 # [BS, N]
+    G = (sqrt(s)*pre).T @ (sqrt(s)*pre) / N            # [BS, D_pm, D_pm]
+    T = decay * I + beta[:, None, None] * G            # [BS, B, D_pm, D_pm]
+    W_pm = W_pm @ T                                    # batched matmul, per bank
 
     # EM: full decomposition write (unchanged)
     g_em = em_neuromodulator(novelty.mean(N), usage)
@@ -256,18 +255,19 @@ def memory_ops(self, H, seed, w_cand, surprise):
     return pm_read_sum, em_read_sum, cum_em_sum
 ```
 
-**Column-local memory addressing:** PM bias bank b has shape `[BS, D]`.
-EM bank b has shape `[BS, M, D]`. Column c reads/writes only its slice
-`[..., c*D_col:(c+1)*D_col]`. This means:
+**Memory addressing:** PM fast-weight bank b has state `[BS, D_pm, D_pm]`
+(projected via fixed `proj_in/proj_out`). EM bank b has shape `[BS, M, D]`.
+Column c reads/writes only its slice `[..., c*D_col:(c+1)*D_col]` of EM. This means:
 - No routing decisions — pure dimension indexing
 - GPU-friendly — contiguous memory access patterns
 - Surprise, seeds, and candidates are all dimension-specific
 - Each column independently contributes to its slice of the bank's memory
 
 **Two write paths — fast and slow:**
-- **Fast path (within-segment):** Per-token write deltas are prefix-summed to
-  produce causal write buffers. PM's `cum_pm` modifies the gain formula directly
-  (write-before-read). EM's `cum_em` flows into Stage 3 as an additive signal.
+- **Fast path (within-segment):** EM write candidates are gated by novelty and
+  prefix-summed to `cum_em`. This flows into Stage 3 as an additive signal
+  (write-before-read for EM). PM has no within-segment write buffer — its update
+  is purely at segment end via the Hebbian commit.
   These provide immediate within-segment feedback — token t sees what tokens
   0..t wrote. Gradient flows from THIS segment's loss.
 - **Slow path (cross-segment):** The actual structured commit (PM bias aggregate,
@@ -282,30 +282,29 @@ the within-segment new information as a simple D-dimensional signal. This is
 equivalent in effect: token t gets frozen long-term knowledge (trail) + causal
 recent writes (prefix sum).
 
-**State vs parameters:** The primitives (em_K, em_V) and bias (pm_bias) are
-**state**, not parameters. Parameters (W_seed_w, W_gate, neuromodulator, τ, σ)
-are frozen after training. State evolves at inference — this is lifelong learning.
+**State vs parameters:** The fast-weight matrices (W_pm) and EM primitives (em_K, em_V) are
+**state**, not parameters. Parameters (proj_in, proj_out, raw_beta, W_seed_w, W_gate,
+neuromodulator, τ, σ) are frozen after training. State evolves at inference — this is lifelong learning.
 
 ### Stage 3: Integration Scan (Context Fusion)
 
 A second causal scan integrates memory reads with column states.
 
 ```python
-def integration_scan(self, H, pm_deltas, em_reads, cum_em):
+def integration_scan(self, H, pm_read, em_reads, cum_em):
     """Stage 3: Second causal scan with memory context + write buffers.
 
     Four signals contribute (additive):
-    - H:          baseline column states (added once, not per-bank)
-    - pm_deltas:  PM modulation deltas (H * (pm_bias + cum_pm), summed over banks)
-    - em_reads:   EM trail from frozen primitives (long-term knowledge)
-    - cum_em:     EM write buffer (within-segment new information)
+    - H:        baseline scan states [BS, N, D]
+    - pm_read:  PM fast-weight read — (Σ_b W_b) @ pre → proj_out [BS, N, D]
+    - em_reads: EM trail from frozen primitives (long-term knowledge) [BS, N, D]
+    - cum_em:   EM write buffer (within-segment new information) [BS, N, D]
 
     Returns:
         logits: [BS, N, vocab]
     """
-    # Additive integration: baseline + PM delta + EM trail + EM write buffer
-    # Each column c takes its D_col slice of each signal
-    integrated = H + pm_deltas_summed + em_reads_summed + cum_em_summed
+    # Additive integration: baseline + PM read + EM trail + EM write buffer
+    integrated = H + pm_read + em_reads_summed + cum_em_summed
 
     # Second scan: h'_t = a'_t ⊙ h'_{t-1} + b'_t (element-wise, independent columns)
     H_prime = parallel_scan_2(integrated)        # [BS, N, D]
@@ -368,50 +367,53 @@ as part of the scan computation.
 
 1. **Auxiliary prediction loss**: `L_pred = MSE(z_hat_t, z_{t+1}.detach())`
    Gradient flows to the prediction network but not the encoding target.
-2. **Downstream (within-segment)**: surprise → delta_pm (prefix-summed into PM
-   gain) + novelty → delta_em (prefix-summed into write buffer) → Stage 3 → loss.
-   PCM encoder gets same-segment gradient through both write buffer paths.
+2. **Downstream (within-segment)**: surprise magnitude gates PM eligibility (G accumulates
+   across segment) + novelty → delta_em (prefix-summed into write buffer) → Stage 3 → loss.
+   PCM encoder gets same-segment gradient through the EM write buffer path.
+   PM proj_in/proj_out get same-segment gradient through pm_read.
 3. **Downstream (cross-segment)**: surprise → novelty → structured EM commit →
    next segment's trail reads → loss. PCM encoder learns what's worth predicting.
 
 ## Memory System Details
 
-### PM: Procedural Bias (Gain Modulation)
+### PM: Procedural Memory — Hebbian Fast-Weight Network
 
-PM is a **single bias vector per bank** — coarse, automatic, fast. It modulates
-the signal by scaling features up or down based on learned habits.
+PM is a **per-bank fast-weight matrix** — a small neural network whose weights
+ARE the state, updated by Hebbian learning. Learned associations accumulate
+over many segments; the matrix gradually encodes habitual input→output transforms.
 
 ```
-# State: one bias vector per bank
-pm_bias [BS, B, D]                           # D = C × D_col
+# State: one weight matrix per bank
+W_pm [BS, B, D_pm, D_pm]                    # evolves at inference
 
-# Per-token write delta (Stage 2, parallel):
-delta_pm_t = lr_pm * surprise_t              # [BS, N, D] — per-token, per-feature
+# Read (bank-summed — no [BS, N, B, D] intermediate):
+pre = proj_in(H)                             # [BS, N, D_pm]
+post = (Σ_b W_b) @ pre                      # [BS, N, D_pm]  — single matmul
+pm_read = proj_out(post)                     # [BS, N, D]
 
-# Prefix sum (causal accumulation):
-cum_pm_t = cumsum(delta_pm, dim=seq)         # [BS, N, D] — inclusive
-
-# Read — delta only (baseline H added once in Stage 3):
-delta_pm = H[:, :, b] * (pm_bias[b] + cum_pm)   # [BS, N, D]
-# Token t's modulation reflects surprise from tokens 0..t — no lag
-
-# Segment-end commit:
-pm_bias[b] += delta_pm.sum(dim=seq)          # [BS, D] — total shift
+# Segment-end commit (Hebbian autocorrelation, 1 batched matmul):
+s_t = sigmoid(‖surprise_t‖)                 # gate: high surprise → more learning
+G = (1/N) Σ_t s_t · pre_t⊗pre_tᵀ           # [BS, D_pm, D_pm]
+W_b ← W_b @ (decay·I + β_b·G)               # per-bank update, β_b differs per bank
+clip Frobenius norm to budget_pm
 ```
 
-**Why this is coarse:** One vector, not slots. No routing, no selection. Every
-feature dimension has a single learned bias. This captures automatic response
-tendencies (basal ganglia habits) — "I always up-weight feature 7 and
-down-weight feature 12." Surprise-gating ensures it only adapts on
-unpredicted features.
+**Why a matrix, not a vector:** A matrix encodes input→output transforms —
+"when I see pattern A, produce pattern B." A bias vector can only shift
+all inputs uniformly. The matrix version learns conditional associations.
 
-**Causal within-segment adaptation:** Unlike the cross-segment-only design,
-the prefix-summed write delta gives PM immediate effect. If feature 7 is
-consistently surprising in the first 100 tokens, token 101 already sees an
-amplified bias for that feature — within the same segment.
+**Why Hebbian (not delta rule):** PM reinforces frequent co-occurrences
+(`post ⊗ pre`). It doesn't try to correct prediction errors — that's PCM's job.
+PM's role is to strengthen associations that fire together repeatedly.
 
-**Biologically:** Basal ganglia procedural memory is fast, automatic, habitual.
-Not compositional, not explicit — just learned biases in processing.
+**Multiple timescales via banks:** Each bank has its own β_b (plasticity rate).
+Fast-updating bank ≈ recent context habits. Slow-updating bank ≈ deep long-term
+habits. The bank-summed read blends all timescales transparently.
+
+**Compute cost:** ~84M ops/segment — 0.24% of one scan layer. Truly negligible.
+
+**Biologically:** Basal ganglia procedural memory — "muscle memory" of cognition.
+Automatic, habitual, fast to read, slowly reinforced by repetition.
 
 ### EM: Primitive Dictionary with Trail-Based Composition
 
@@ -512,8 +514,9 @@ consolidation (structured long-term storage).
 
 ### Memory Decay and Aging
 
-`pm_bias` decays toward zero (slow drift back to neutral). `em.age_tick(N)`
-increments ages and applies strength decay — both run **once per segment**
+W_pm decays toward (1/B)·I via the `decay` factor in each Hebbian commit
+(`W_b ← W_b @ (decay·I + β_b·G)` — when G≈0, this is just W_b · decay).
+`em.age_tick(N)` increments ages and applies strength decay — both run **once per segment**
 after writes. Memory state then carries to the next segment.
 
 ### Budget Enforcement
@@ -522,33 +525,31 @@ EM primitives compete for limited budget. When total strength exceeds the
 budget, the weakest (lowest em_S) primitives are soft-pruned. This prevents
 unbounded growth and forces the dictionary to keep only useful primitives.
 
-## Column-Local Memory Addressing
+## Column-Local EM Addressing
 
-A key simplification in v5: columns address memory by dimension slicing.
+EM primitives use column-local dimension slicing for structured access.
 
 ```
-Memory bank b:
-  pm_bias [BS, D]        where D = C × D_col
-  em_K    [BS, M, D]
+EM bank b:
+  em_K    [BS, M, D]     where D = C × D_col
   em_V    [BS, M, D]
 
-Column c of block b addresses:
-  pm_bias[:, c*D_col : (c+1)*D_col]
+Column c of bank b addresses:
   em_K[:, :, c*D_col : (c+1)*D_col]
   em_V[:, :, c*D_col : (c+1)*D_col]
 ```
 
 This means:
-- **No routing logic** — column c always addresses the same slice
-- **Surprise is dimension-specific** — column c's surprise only affects its slice
+- **No routing logic** — column c always addresses the same D_col slice of EM
+- **Surprise is dimension-specific** — column c's surprise only affects its EM slice
 - **Reads are independent** across columns — no coordination needed
 - **GPU-friendly** — contiguous memory access within each column's slice
-- **Biologically motivated** — cortical columns in the brain don't have bandwidth
-  to address the entire memory cortex at once; they connect to local regions
+- **Biologically motivated** — cortical columns connect to local memory regions
 
-All columns within a block contribute to the same bank's memory, but each
-column only modifies its own feature slice. The full bank stores the
-concatenation of all column contributions.
+PM is **not** column-local. PM operates as a bank-level transform on the full D-dimensional
+state: `pre = proj_in(H)` [D_pm], `post = (Σ_b W_b) @ pre` — the bank sum fuses all B
+banks without column partitioning. Bank specialization emerges from per-bank β, not
+from column assignment.
 
 ## Gradient Flow
 
@@ -559,18 +560,18 @@ loss → logits → Stage 3 scan →
   → cum_em (write buffer):
       → delta_em = novelty · w_cand → novelty params, W_seed_w, Stage 1 scan
       (gradient through prefix sum is a suffix sum — linear, stable)
-  → pm_read (causal gain):
-      → cum_pm → delta_pm = lr_pm · surprise → lr_pm, PCM params
-      → pm_bias (frozen) gets gradient through gain modulation
+  → pm_read (fast-weight):
+      → proj_out → W_sum = Σ_b W_pm[b] → proj_in → PCM surprise (via prev segment)
+      (W_pm itself is state — gradient for raw_beta flows cross-segment)
   → em_trail (frozen primitives):
       → through trail steps → softmax → em_K, em_V, W_gate, W_seed_w, τ, σ
-  → Stage 1 scan → column projection params, PCM params
+  → Stage 1 scan → projection params, PCM params
 ```
 
-**Major improvement over pre-write-buffer design:** Write parameters (W_seed_w,
-novelty scoring, lr_pm) now get gradient from THIS segment's loss through the
-prefix-summed write buffers. Previously, writes only got gradient via
-cross-segment TBPTT.
+**Note on PM gradient:** PM `proj_in`, `proj_out` get same-segment gradients through
+`pm_read`. But `raw_beta` (plasticity rates) only gets gradient cross-segment:
+`raw_beta → commit → W_pm updated → next segment's read → logits → loss`.
+This requires K≥2 segments in the TBPTT chunk for raw_beta to receive gradients.
 
 ### Cross-Segment (requires TBPTT)
 
@@ -591,8 +592,8 @@ K=2 is likely sufficient (one segment of lookahead).
 |-----------|----------------|------|
 | Scan params (a, b projections) | Same segment's NTP loss | Direct through both scans |
 | PCM encode/predict | L_pred (auxiliary) + downstream | Same segment |
-| PM bias (pm_bias) | Same segment's loss through gain modulation | Direct, smooth |
-| PM lr_pm | Same segment's loss through cum_pm → gain | Through prefix sum (linear) |
+| PM proj_in / proj_out | Same segment's loss through pm_read | Direct, smooth |
+| PM raw_beta | **Next segment's** loss through committed W_pm → read | Cross-segment TBPTT |
 | EM trail params (W_seed_w, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
 | EM primitives (em_K, em_V) | Same segment's loss through trail read | Through softmax attention |
 | Write candidate proj (W_seed_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
@@ -610,9 +611,10 @@ hidden state. This naturally supports next-token prediction (NTP).
 Memory reads in Stage 2 are from the **segment-start** state (frozen). Write
 buffers use **inclusive prefix sums** (`cum_t = Σ_{i≤t} delta_i`). Since
 `logits_t` predicts `token_{t+1}` and is allowed to depend on tokens 0..t,
-the inclusive prefix sum is causal. Both `delta_pm_t` and `delta_em_t` depend
-on tokens 0..t (through the causal Stage 1 scan), so `cum_t` at position t
-depends on tokens 0..t — matching the NTP causality requirement.
+the inclusive prefix sum is causal. `delta_em_t` depends on tokens 0..t
+(through the causal Stage 1 scan), so `cum_em_t` at position t depends on
+tokens 0..t — matching the NTP causality requirement. PM has no per-token
+write buffer; pm_read is constant within the segment (from frozen W_pm).
 
 ### 2. Cross-Segment: Causal
 
@@ -777,11 +779,11 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 10. **Implementation** → Custom prefix scan. No external dependency (no mamba-ssm).
     Standard element-wise parallel-scan is simple to implement.
 
-11. **Causal write buffers** → Prefix-summed write deltas provide within-segment
-    feedback. PM cum_pm goes inside gain formula (write-before-read). EM cum_em
-    is additive in Stage 3. Inclusive prefix sum (i≤t) — causal for NTP. Write
-    params get same-segment gradient. Structured commit still happens at segment
-    end for long-term memory (cross-segment TBPTT for neuromodulator).
+11. **Causal write buffers (EM)** → EM prefix-summed write deltas (`cum_em = cumsum(novelty · w_cand)`)
+    provide within-segment feedback via Stage 3 additive integration. Inclusive prefix sum
+    (i≤t) — causal for NTP. Write params (W_seed_w, novelty scoring) get same-segment gradient.
+    PM has no within-segment write buffer — Hebbian commit at segment end only.
+    EM structured commit still happens at segment end (cross-segment TBPTT for neuromodulator).
 
 ### Implementation Clarifications
 
@@ -794,8 +796,8 @@ Stage 2 returns `[BS, N, D]` signals (bank-sum computed via fused algebra,
 never materializing `[BS, N, B, D]`). Stage 3 operates on dense `[BS, N, D]` tensors directly.
 
 **Pseudocode indexing notation:**
-`em_K[b]` means `em_K[:, b]` (index the B dimension, keep batch). `pm_bias[b]`
-means `pm_bias[:, b]`, shape `[BS, D]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
+`em_K[b]` means `em_K[:, b]` (index the B dimension, keep batch). `W_pm[b]`
+means `W_pm[:, b]`, shape `[BS, D_pm, D_pm]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
 (same for all banks — bank index selects memory, not column states).
 
 **W_gate is element-wise (not a matrix):**
@@ -807,7 +809,7 @@ vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
 split via `chunk(2)` into seed and w_cand — each `[BS, N, D]`. The grouped
 structure keeps these memory-facing signals per-feature-group. All B banks
 receive the same seed and write candidate. Bank specialization emerges from
-the differing memory content (em_K, em_V, pm_bias) in each bank, not from the
+the differing memory content (em_K, em_V, W_pm) in each bank, not from the
 inputs.
 
 **w_cand serves as both routing key and write content:**
@@ -815,13 +817,16 @@ No separate k_cand/v_cand projections. In the EM write: `route` uses normalized
 w_cand as the routing key, and w_cand is also the value being decomposed across
 primitives. Simplifies Stage 1 (one projection instead of three).
 
-**lr_pm is a scalar nn.Parameter per bank:**
-Shape: `[B]`, parameterized as `softplus(raw_lr_pm)` to stay positive. Gets
-gradient from this segment's loss through `cum_pm → gain modulation → logits`.
+**PM trained parameters:**
+- `proj_in`: Linear(D, D_pm) — fixed projection into fast-weight space
+- `proj_out`: Linear(D_pm, D) — fixed projection back to model space
+- `raw_beta`: `[B]` per-bank plasticity rates, parameterized as `softplus(raw_beta)`.
+  Gets gradient over multiple segments: commit uses beta → W_pm updated →
+  next segment's read → logits → loss.
 
-**em_K/em_V and pm_bias: state in computation graph:**
+**em_K/em_V and W_pm: state in computation graph:**
 These are plain tensors, NOT nn.Parameter. But they are NOT detached within a
-TBPTT chunk — gradient flows through them via the EMA commit chain from the
+TBPTT chunk — gradient flows through them via the commit chain from the
 previous segment. "Frozen within segment" means their values don't change during
 the forward pass, but they participate in the computation graph. At TBPTT chunk
 boundaries, `detach_states()` breaks the gradient chain.
@@ -860,6 +865,92 @@ amplification of surprising features, suppression of predicted features.
   total param count for fair comparison. Scan params (layer count, state expansion)
   differ from v4's FFN stacks.
 
+## Configuration Reference
+
+### Hyperparameter Glossary
+
+| Symbol | Config field | Meaning |
+|--------|-------------|---------|
+| **D** | `D` | Model width — the main hidden dimension used throughout |
+| **D_embed** | `D_embed` | Embedding/unembedding dimension (may differ from D via proj_up/proj_down) |
+| **C** | `C` | Number of cortical columns (feature groups). PCM and W_seed_w operate per-group |
+| **D_col** | `D_col` | Column width = D / C. Derived, not set directly |
+| **B** | `B` | Memory banks — PM and EM each have B independent banks. Different β_b per bank → multiple timescales |
+| **N** | `N` | Segment length in tokens. One cycle of Stage 1 → 2 → 3 processes N tokens |
+| **K_segments** | `K_segments` | TBPTT chunk = K_segments × N tokens. Activations from all K segments stored for backward |
+| **L_scan** | `L_scan` | Scan layers per stage (Stage 1 and Stage 3 each have L_scan layers). Total = 2 × L_scan |
+| **scan_expansion** | `scan_expansion` | Used to derive d_inner when d_inner = -1: d_inner = D_col × scan_expansion |
+| **d_inner** | `d_inner` | Scan recurrence hidden dim per layer. Set explicitly in tier presets |
+| **M** | `M` | EM capacity — number of primitive patterns per bank |
+| **D_pm** | `D_pm` | PM fast-weight matrix dimension. PM state = W_pm [BS, B, D_pm, D_pm] |
+| **n_trail_steps** | `n_trail_steps` | EM trail iteration depth for compositional read |
+| **decay_pm** | `decay_pm` | Per-segment multiplicative decay for W_pm (default 0.999) |
+| **decay_em** | `decay_em` | Per-segment multiplicative decay for em_S strengths (default 0.999) |
+| **budget_pm** | `budget_pm` | Max Frobenius norm per PM bank — hard clip after each commit |
+| **budget_em** | `budget_em` | Max sum(em_S) per stream — soft scale after each commit |
+| **S_max** | `S_max` | Max individual primitive strength before clamping |
+| **neuromod_hidden** | `neuromod_hidden` | Hidden dim of the EM neuromodulator MLP |
+| **pcm_pred_weight** | `pcm_pred_weight` | Weight of the PCM auxiliary loss in total loss |
+
+### Tier Comparison
+
+| | **Tier A** | **Tier B** | **Tier C** |
+|---|---|---|---|
+| **Total params** | **92M** | **251M** | **844M** |
+| D (model width) | 2048 | 3072 | 4096 |
+| D_embed | 384 | 512 | 768 |
+| C (columns) | 16 | 16 | 16 |
+| D_col = D/C | 128 | 192 | 256 |
+| B (banks) | 4 | 6 | 8 |
+| L_scan (per stage) | 6 | 12 | 16 |
+| d_inner | 1024 | 1024 | 2048 |
+| d_inner / D_col | 8× | 5.3× | 8× |
+| M (EM slots/bank) | 384 | 512 | 768 |
+| D_pm (PM matrix) | 64 | 64 | 64 |
+| n_trail_steps | 3 | 2 | 3 |
+| **Stage1+Stage3** | 75.6M | 226.7M | 755.5M |
+| **PM state** (BS=16) | 512 KB | 1.5 MB | 512 KB |
+| **EM state** (BS=16) | ~150 MB | ~600 MB | ~600 MB |
+| **Comparable to** | Mamba-130M, Pythia-160M | Mamba-370M, Pythia-410M | Qwen3.5-0.8B, Mamba-1.4B |
+
+**Parameter breakdown (Tier A, 92M):**
+
+| Module | Params | % |
+|--------|--------|---|
+| stage1 (scan layers) | 37.8M | 41% |
+| stage3 (scan layers) | 37.8M | 41% |
+| embedding | 12.3M | 13% |
+| lm_head (tied) | (shared) | — |
+| pcm | 0.8M | 1% |
+| proj_up / proj_down | 0.8M each | 2% |
+| W_seed_w | 0.5M | <1% |
+| pm (proj_in/out + beta) | 0.26M | <1% |
+| em_neuromod + W_nov | <0.1M | <1% |
+| pm W_pm state (BS=16) | 0.13M | (runtime, not trained) |
+| em K/V/S state (BS=16) | ~38M | (runtime, not trained) |
+
+> Note: PM and EM state tensors (W_pm, em_K/V/S) are **runtime state**, not trained parameters.
+> They evolve during inference and are checkpointed but do not receive gradient updates directly —
+> only the projection weights and hypernetwork parameters (beta, neuromodulator) are trained.
+
+### State vs Parameters
+
+This architecture has two distinct categories of "weights":
+
+**Trained parameters** (fixed after training, identical across all streams):
+- Scan layer weights (proj_in, proj_out, RMSNorm)
+- PCM weights, W_seed_w, W_nov
+- PM projection weights (proj_in, proj_out) and per-bank β (plasticity rate)
+- EM neuromodulator MLP
+
+**Runtime state** (stream-specific, evolves during inference, checkpointed):
+- `W_pm [BS, B, D_pm, D_pm]` — PM fast-weight matrix, updated by Hebbian rule
+- `em_K [BS, B, M, D]` — EM primitive keys
+- `em_V [BS, B, M, D]` — EM primitive values
+- `em_S [BS, B, M]` — EM primitive strengths
+
+The scan's recurrent hidden state `h` is also runtime state but is not checkpointed (it's ephemeral within a segment).
+
 ## Comparison: v4 → v5
 
 | Aspect | v4 (Iterative) | v5 (Scan-Memory-Scan) |
@@ -873,12 +964,12 @@ amplification of surprising features, suppression of predicted features.
 | Surprise | Scalar (cross-pass: ‖z^r - z_hat^{r-1}‖) | Vector (within-scan: z_hat_{t-1} - z_t) |
 | Memory addressing | Block-level D, sliced per column | Column-local D_col slices of bank |
 | Serial depth | O(R × 2L) FFN layers | O(L × log N) parallel-scan |
-| PM | Holographic slots (r slots, routing) | Bias vector (1 vector, gain mod) |
+| PM | Holographic slots (r slots, routing) | Fast-weight matrices (Hebbian, per-bank β) |
 | EM read | Top-k retrieval (hard selection) | Trail-based composition (soft, iterative) |
 | EM write | Store full vector in one slot | Decompose across primitives (soft routing) |
 | EM capacity | M independent facts | M primitives → ∞ compositions (continuous seeds) |
 | Credit assignment | Through top-k mask (sparse grad) | Through softmax (trail) + prefix sum (writes) |
 | Write gradient | Cross-segment only (TBPTT) | Same-segment (write buffer) + cross-segment (commit) |
-| Memory state vs params | State (PM slots, EM slots) | State (pm_bias, em_K/V primitives) |
+| Memory state vs params | State (PM slots, EM slots) | State (W_pm fast-weights, em_K/V primitives) |
 | GPU utilization | ~7.4% (narrow bmm, R-loop) | Expected much higher (scan kernels) |
 | Compute per token | ~79M FLOPs (Tier A) | ~2× scan layer + trail + PM gain |

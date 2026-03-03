@@ -100,16 +100,20 @@ class TestGradientFlow:
         assert pcm.W_pcm.weight.grad is not None
         assert pcm.W_pcm.weight.grad.abs().sum() > 0
 
-    def test_pm_lr_gradient(self):
-        """PM learning rate (raw_lr_pm) should get gradient (needs PCM for surprise)."""
+    def test_pm_beta_gradient(self):
+        """PM plasticity rate (raw_beta) should get gradient.
+
+        Needs 2 segments: segment 1 commits with beta → W_pm updated,
+        segment 2 reads from updated W_pm → loss depends on beta.
+        """
         cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
 
-        loss = _compute_loss(model)
+        loss = _compute_loss(model, n_segments=2)
         loss.backward()
 
-        assert model.pm.raw_lr_pm.grad is not None
-        assert model.pm.raw_lr_pm.grad.abs().sum() > 0
+        assert model.pm.raw_beta.grad is not None
+        assert model.pm.raw_beta.grad.abs().sum() > 0
 
     def test_em_trail_params_gradient(self):
         """EM trail parameters (w1, w2, gate_bias, tau, sigma) should get gradients."""

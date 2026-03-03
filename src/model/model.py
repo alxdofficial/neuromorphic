@@ -72,7 +72,7 @@ class NeuromorphicLM(nn.Module):
         nn.init.zeros_(self.W_nov.bias)
 
         # Stage 2: Memory systems
-        self.pm = ProceduralMemory(B, D, config.decay_pm)
+        self.pm = ProceduralMemory(B, D, config.D_pm, config.decay_pm)
         self.em = EpisodicMemory(
             B, config.M, D, config.n_trail_steps,
             S_max=config.S_max, budget=config.budget_em,
@@ -179,12 +179,10 @@ class NeuromorphicLM(nn.Module):
         self, H_flat: Tensor, seed: Tensor, w_cand: Tensor, surprise: Tensor,
         commit: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Stage 2: Write-before-read with causal prefix sums (fused algebra).
+        """Stage 2: Memory read/write operations.
 
-        Algebraic fusion: the sum over B banks is computed without ever
-        materializing [BS, N, B, D] tensors.  PM deltas and EM write buffers
-        share surprise/w_cand across banks (differing only by a per-bank
-        scalar), so the bank-sum collapses to scalar sums of per-bank factors.
+        PM: Hebbian fast-weight read (bank-summed, no [BS,N,B,D]).
+        EM: Write-before-read with causal prefix sums (fused algebra).
 
         Args:
             H_flat: [BS, N, D] — column states (flat)
@@ -194,23 +192,19 @@ class NeuromorphicLM(nn.Module):
             commit: whether to commit memory updates at segment end
 
         Returns:
-            pm_read_sum: [BS, N, D] — PM modulation deltas, summed over B
+            pm_read_sum: [BS, N, D] — PM fast-weight read, bank-summed
             em_read_sum: [BS, N, D] — EM trail reads, summed over B
             cum_em_sum:  [BS, N, D] — EM causal write buffers, summed over B
         """
         BS, N, D = H_flat.shape
         B = self.config.B
 
-        # 1. PM: fused read sum — no [BS, N, B, D]
-        #    sum_b[H * (bias_b + cumsum(lr_b * surprise))]
-        #    = H * (bias.sum(B) + lr.sum() * cumsum(surprise))
+        # 1. PM: Hebbian fast-weight read (bank-summed via W.sum(B))
         if self.config.pm_enabled:
-            lr_pm = self.pm.lr_pm                                     # [B]
-            bias_sum = self.pm.pm_bias.sum(dim=1, keepdim=True)       # [BS, 1, D]
-            cum_surprise = torch.cumsum(surprise, dim=1)              # [BS, N, D]
-            pm_read_sum = H_flat * (bias_sum + lr_pm.sum() * cum_surprise)
+            pm_read_sum, pm_pre = self.pm.read(H_flat)                # [BS, N, D], [BS, N, D_pm]
         else:
             pm_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
+            pm_pre = None
 
         # 2. EM novelty (still returns [BS, N, B] — needed for commit)
         if self.config.em_enabled:
@@ -234,15 +228,13 @@ class NeuromorphicLM(nn.Module):
 
         # 4. Segment-end commits — skipped for commit=False (inference)
         if commit:
-            if self.config.pm_enabled:
-                # cum_surprise[:, -1] == surprise.sum(1) — reuse existing cumsum
-                pm_commit = self.pm.lr_pm[None, :, None] * cum_surprise[:, -1].unsqueeze(1)
-                self.pm.commit(pm_commit)
+            if self.config.pm_enabled and pm_pre is not None:
+                self.pm.commit(pm_pre, surprise, budget=self.config.budget_pm)
 
             if self.config.em_enabled:
                 g_em = self.em_neuromod(
-                    novelty.mean(dim=1).detach(),
-                    self.em.usage_all().detach(),
+                    novelty.mean(dim=1),
+                    self.em.usage_all(),
                 )                                                      # [BS, B]
                 self.em.commit_all(w_cand, novelty, g_em)
                 self.em.base_decay()

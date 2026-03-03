@@ -52,10 +52,16 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.em_S: Tensor | None = None
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
-        """Pre-allocate state tensors."""
-        self.em_K = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
+        """Pre-allocate state tensors.
+
+        em_K initialized with small random unit vectors so primitives have distinct
+        directions from the start. em_S initialized to a small positive value so all
+        primitives are active (avoiding the cold-start masking dead zone where
+        em_S=0 means all attention scores are -inf).
+        """
+        self.em_K = unit_normalize(torch.randn(BS, self.B, self.M, self.D, device=device, dtype=dtype))
         self.em_V = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
-        self.em_S = torch.zeros(BS, self.B, self.M, device=device, dtype=dtype)
+        self.em_S = torch.full((BS, self.B, self.M), 0.1, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.em_K is not None

@@ -47,15 +47,15 @@ class TestEndToEnd:
         model.initialize_states(BS, torch.device("cpu"))
 
         pm = model.pm
-        bias_before = pm.pm_bias.clone()
+        W_before = pm.W_pm.clone()
 
         # Forward 2 segments (PM gets committed between)
         for _ in range(2):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.N))
             model.forward_segment(input_ids)
 
-        # After commits, pm_bias should have changed
-        assert not torch.allclose(pm.pm_bias, bias_before, atol=1e-8)
+        # After commits, W_pm should have changed
+        assert not torch.allclose(pm.W_pm, W_before, atol=1e-8)
 
     def test_detach_states(self):
         cfg = make_tiny_config()
@@ -68,8 +68,8 @@ class TestEndToEnd:
         model.detach_states()
 
         # After detach, states should not have grad_fn
-        if model.pm.pm_bias is not None:
-            assert model.pm.pm_bias.grad_fn is None
+        if model.pm.W_pm is not None:
+            assert model.pm.W_pm.grad_fn is None
         if model.em.em_K is not None:
             assert model.em.em_K.grad_fn is None
 
@@ -79,16 +79,18 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        # Set some PM content
+        # Set some PM content (non-identity W)
         pm = model.pm
-        pm.pm_bias = torch.randn(BS, cfg.B, cfg.D)
-        bias_before = pm.pm_bias.abs().sum().item()
+        pm.W_pm = torch.randn(BS, cfg.B, cfg.D_pm, cfg.D_pm)
 
         # Test _reset_memory directly
         reset_mask = torch.ones(BS, dtype=torch.bool)
         model._reset_memory(reset_mask)
 
-        assert pm.pm_bias.abs().sum() == 0
+        # After reset, W_pm should be (1/B)*I for all streams
+        eye = torch.eye(cfg.D_pm) * (1.0 / cfg.B)
+        for b in range(BS):
+            assert torch.allclose(pm.W_pm[b, 0], eye)
 
     def test_doc_boundary_reset_via_forward(self):
         """Forward with reset_mask should start from clean state."""
@@ -98,16 +100,17 @@ class TestEndToEnd:
 
         # Set large PM content
         pm = model.pm
-        pm.pm_bias = torch.randn(BS, cfg.B, cfg.D) * 10
-        bias_before = pm.pm_bias.abs().sum().item()
+        pm.W_pm = torch.randn(BS, cfg.B, cfg.D_pm, cfg.D_pm) * 10
+        W_norm_before = pm.W_pm.flatten(-2).norm(dim=-1).sum().item()
 
-        # Forward with reset — commits start from zeroed state
+        # Forward with reset — commits start from (1/B)*I state
         input_ids = torch.randint(0, VOCAB, (BS, cfg.N))
         reset_mask = torch.ones(BS, dtype=torch.bool)
         model.forward_segment(input_ids, reset_mask)
 
-        # pm_bias should be much smaller (fresh commits only)
-        assert pm.pm_bias.abs().sum().item() < bias_before
+        # W_pm should be much smaller (near identity + small Hebbian update)
+        W_norm_after = pm.W_pm.flatten(-2).norm(dim=-1).sum().item()
+        assert W_norm_after < W_norm_before
 
     def test_lifelong_mode_preserves_memory(self):
         """In lifelong mode, doc boundary should not reset PM/EM."""
@@ -116,18 +119,19 @@ class TestEndToEnd:
         model = NeuromorphicLM(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        # Set some PM content
+        # Set some PM content (non-identity W)
         pm = model.pm
-        pm.pm_bias = torch.randn(BS, cfg.B, cfg.D)
-        bias_before = pm.pm_bias.abs().sum().item()
+        pm.W_pm = torch.randn(BS, cfg.B, cfg.D_pm, cfg.D_pm) * 2.0
+        W_before = pm.W_pm.clone()
 
         # Forward with reset mask (should be ignored in lifelong)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.N))
         reset_mask = torch.ones(BS, dtype=torch.bool)
         model.forward_segment(input_ids, reset_mask)
 
-        # pm_bias may change from commits but should NOT be zeroed
-        assert pm.pm_bias.abs().sum().item() > 0
+        # W_pm should NOT be reset to identity (lifelong preserves state)
+        eye = torch.eye(cfg.D_pm) * (1.0 / cfg.B)
+        assert not torch.allclose(pm.W_pm[0, 0], eye, atol=0.1)
 
     def test_pcm_enabled(self):
         cfg = make_tiny_config(pcm_enabled=True)

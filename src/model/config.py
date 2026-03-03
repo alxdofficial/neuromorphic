@@ -24,9 +24,10 @@ class ModelConfig:
     vocab_size: int = 32000   # set from tokenizer at runtime
     eot_id: int = 2           # set from tokenizer at runtime
 
-    # Procedural Memory (bias vector per bank)
-    budget_pm: float = 16.0   # PM bias norm budget per stream
-    decay_pm: float = 0.999   # per-segment bias decay
+    # Procedural Memory (Hebbian fast-weight network)
+    D_pm: int = 64            # PM fast-weight matrix dimension
+    budget_pm: float = 16.0   # PM Frobenius norm budget per bank
+    decay_pm: float = 0.999   # per-segment weight decay
 
     # Episodic Memory (primitive dictionary per bank)
     M: int = 256              # EM capacity (primitives) per bank
@@ -91,6 +92,8 @@ class ModelConfig:
             self.d_inner = self.D_col * self.scan_expansion
         if self.d_inner < 1:
             raise ValueError(f"d_inner ({self.d_inner}) must be >= 1.")
+        if self.D_pm < 1:
+            raise ValueError(f"D_pm ({self.D_pm}) must be >= 1.")
         if self.M < 1:
             raise ValueError(f"M ({self.M}) must be >= 1 (EM capacity).")
         if self.n_trail_steps < 1:
@@ -120,7 +123,7 @@ class ModelConfig:
     def tier_tiny(cls, **overrides) -> "ModelConfig":
         """Test tier (~tiny). For unit tests only."""
         defaults = dict(
-            D=64, D_embed=64, B=2, C=2,
+            D=64, D_embed=64, B=2, C=2, D_pm=16,
             vocab_size=64, N=16, K_segments=2,
             M=8, L_scan=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
             budget_pm=4.0, budget_em=8.0,
@@ -134,7 +137,7 @@ class ModelConfig:
     def tier_a(cls, **overrides) -> "ModelConfig":
         """Dev tier (~130M). Matches Mamba-130M scale."""
         defaults = dict(
-            D=2048, D_embed=384, B=4, C=16,
+            D=2048, D_embed=384, B=4, C=16, D_pm=64,
             N=512, L_scan=6, scan_expansion=8, d_inner=1024,
             M=384, n_trail_steps=3,
             budget_pm=16, budget_em=32,
@@ -144,11 +147,24 @@ class ModelConfig:
 
     @classmethod
     def tier_b(cls, **overrides) -> "ModelConfig":
-        """Research tier (~400M). Matches Mamba-370M scale."""
+        """Research tier (~250M). Matches Mamba-370M scale."""
         defaults = dict(
-            D=3072, D_embed=512, B=12, C=16,
-            N=512, L_scan=16, scan_expansion=4, d_inner=768,
+            D=3072, D_embed=512, B=6, C=16, D_pm=64,
+            N=512, L_scan=12, scan_expansion=4, d_inner=1024,
             M=512, n_trail_steps=2,
+            budget_pm=32, budget_em=64,
+            neuromod_hidden=64,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def tier_c(cls, **overrides) -> "ModelConfig":
+        """Large tier (~844M). Matches Qwen3.5-0.8B / Mamba-1.4B scale."""
+        defaults = dict(
+            D=4096, D_embed=768, B=8, C=16, D_pm=64,
+            N=512, L_scan=16, scan_expansion=8, d_inner=2048,
+            M=768, n_trail_steps=3,
             budget_pm=32, budget_em=64,
             neuromod_hidden=64,
         )

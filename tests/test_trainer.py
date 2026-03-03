@@ -73,8 +73,8 @@ class TestTrainChunk:
         batch = _make_batch(trainer.config)
         trainer.train_chunk(batch)
 
-        if trainer.model.pm.pm_bias is not None:
-            assert trainer.model.pm.pm_bias.grad_fn is None
+        if trainer.model.pm.W_pm is not None:
+            assert trainer.model.pm.W_pm.grad_fn is None
 
     def test_multi_segment_chunk(self):
         """Chunk should process K_segments * N tokens."""
