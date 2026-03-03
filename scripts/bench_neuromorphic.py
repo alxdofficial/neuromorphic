@@ -6,9 +6,13 @@ Measures:
   3. Inference throughput at max BS (with torch.compile)
   4. VRAM breakdown
 
+With --k-segments K, the benchmark simulates the real TBPTT training loop:
+K forward passes accumulated into one backward, matching actual trainer memory
+and compute cost.
+
 Usage:
   python scripts/bench_neuromorphic.py --tier a
-  python scripts/bench_neuromorphic.py --tier a --seq-len 128
+  python scripts/bench_neuromorphic.py --tier a --k-segments 8 --grad-checkpointing
 """
 
 import os
@@ -50,35 +54,49 @@ def make_model(bs, seq_len, vocab, tier="a", compile_model=False,
     return model, config
 
 
-def train_step(model, optimizer, input_ids, vocab):
-    """Full forward + backward + optimizer step."""
+def train_step(model, optimizer, input_ids, vocab, k_segments=1):
+    """Full TBPTT step: K forward passes accumulated into one backward.
+
+    input_ids: [BS, T] where T = k_segments * N
+    Matches real trainer: accumulate K segment losses, one backward, detach.
+    """
+    BS, T = input_ids.shape
+    N = T // k_segments
+
     optimizer.zero_grad()
+    chunk_loss = None
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        logits, aux_loss = model.forward_segment(input_ids)
-        loss = nn.functional.cross_entropy(
-            logits[:, :-1].reshape(-1, vocab).float(),
-            input_ids[:, 1:].reshape(-1),
-        ) + aux_loss
-    loss.backward()
+        for seg in range(k_segments):
+            seg_ids = input_ids[:, seg * N:(seg + 1) * N]
+            logits, aux_loss = model.forward_segment(seg_ids)
+            seg_loss = nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, vocab).float(),
+                seg_ids[:, 1:].reshape(-1),
+            ) + aux_loss
+            chunk_loss = seg_loss if chunk_loss is None else chunk_loss + seg_loss
+
+    chunk_loss.backward()
     optimizer.step()
     model.detach_states()
-    return loss.item()
+    return chunk_loss.item()
 
 
 def try_train_step(bs, seq_len, vocab, tier, grad_checkpointing=False, k_segments=1):
-    """Try a full training step at given batch size. Returns True if it fits."""
+    """Try a full TBPTT step at given batch size. Returns True if it fits."""
     gc.collect()
     torch.cuda.empty_cache()
+    T = seq_len * k_segments
     try:
         model, config = make_model(bs, seq_len, vocab, tier=tier, compile_model=False,
                                    grad_checkpointing=grad_checkpointing,
                                    k_segments=k_segments)
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        input_ids = torch.randint(0, vocab, (bs, seq_len), device=DEVICE)
+        input_ids = torch.randint(0, vocab, (bs, T), device=DEVICE)
 
-        train_step(model, optimizer, input_ids, vocab)
-        train_step(model, optimizer, input_ids, vocab)
+        train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
+        train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
         torch.cuda.synchronize()
 
         del model, optimizer, input_ids
@@ -130,16 +148,16 @@ def find_max_bs(seq_len, vocab, tier, grad_checkpointing=False, k_segments=1):
     return best
 
 
-def measure_throughput(model, input_ids, vocab, warmup=5, measure=30):
+def measure_throughput(model, input_ids, vocab, k_segments=1, warmup=5, measure=30):
     """Measure training throughput (tok/s) with proper CUDA timing."""
-    bs, seq_len = input_ids.shape
+    bs, T = input_ids.shape
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     model.train()
 
     # Warmup (step 1 triggers torch.compile tracing — can take 5-10 min)
     for i in range(warmup):
         t0 = time.perf_counter()
-        train_step(model, optimizer, input_ids, vocab)
+        train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         print(f"    Warmup step {i+1}/{warmup}: {dt:.1f}s", flush=True)
@@ -150,11 +168,11 @@ def measure_throughput(model, input_ids, vocab, warmup=5, measure=30):
     torch.cuda.reset_peak_memory_stats(DEVICE)
     start = time.perf_counter()
     for i in range(measure):
-        train_step(model, optimizer, input_ids, vocab)
+        train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
-    tokens = bs * seq_len * measure
+    tokens = bs * T * measure
     tok_s = tokens / elapsed
     ms_per_step = elapsed / measure * 1000
     peak_vram = torch.cuda.max_memory_allocated(DEVICE) / 1e9
@@ -163,8 +181,8 @@ def measure_throughput(model, input_ids, vocab, warmup=5, measure=30):
 
 
 def measure_inference(model, input_ids, vocab, warmup=5, measure=50):
-    """Measure inference throughput (forward only, no grad)."""
-    bs, seq_len = input_ids.shape
+    """Measure inference throughput (single segment, forward only, no grad)."""
+    bs, N = input_ids.shape
     model.set_eval_mode()
 
     # Warmup
@@ -183,13 +201,13 @@ def measure_inference(model, input_ids, vocab, warmup=5, measure=50):
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
-    tokens = bs * seq_len * measure
+    tokens = bs * N * measure
     return tokens / elapsed, elapsed / measure * 1000
 
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark neuromorphic v5 model")
-    parser.add_argument("--tier", choices=["a", "b"], default="a")
+    parser.add_argument("--tier", choices=["a", "b", "c"], default="a")
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--vocab", type=int, default=32000)
     parser.add_argument("--warmup", type=int, default=5)
@@ -199,9 +217,9 @@ def main():
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--grad-checkpointing", action="store_true",
-                        help="Enable gradient checkpointing (halves activation memory)")
+                        help="Enable gradient checkpointing (halves scan activation memory)")
     parser.add_argument("--k-segments", type=int, default=1,
-                        help="Segments per TBPTT step (affects activation memory, not tok/s directly)")
+                        help="TBPTT segments per step — simulates real training loop memory/compute")
     args = parser.parse_args()
 
     seq_len = args.seq_len
@@ -209,11 +227,12 @@ def main():
     use_compile = not args.no_compile
     grad_checkpointing = args.grad_checkpointing
     k_segments = args.k_segments
+    T = seq_len * k_segments
 
     print(f"=" * 70, flush=True)
     print(f"Neuromorphic v5 Benchmark — Tier {args.tier.upper()}", flush=True)
     print(f"GPU: {torch.cuda.get_device_name()}", flush=True)
-    print(f"seq_len={seq_len}, vocab={vocab}, compile={use_compile}, "
+    print(f"N={seq_len}, T={T}, vocab={vocab}, compile={use_compile}, "
           f"grad_ckpt={grad_checkpointing}, k_segments={k_segments}", flush=True)
 
     # Param count
@@ -238,7 +257,7 @@ def main():
         max_bs = find_max_bs(seq_len, vocab, args.tier,
                              grad_checkpointing=grad_checkpointing,
                              k_segments=k_segments)
-    print(f"Max training BS: {max_bs}", flush=True)
+    print(f"Max training BS: {max_bs}  (tok/step = {max_bs * T:,})", flush=True)
     compile_bs = max_bs
 
     # Phase 2: Training throughput (with compile)
@@ -251,26 +270,29 @@ def main():
         compile_bs, seq_len, vocab, tier=args.tier, compile_model=use_compile,
         grad_checkpointing=grad_checkpointing, k_segments=k_segments
     )
-    input_ids = torch.randint(0, vocab, (compile_bs, seq_len), device=DEVICE)
+    input_ids = torch.randint(0, vocab, (compile_bs, T), device=DEVICE)
 
     tok_s, ms_step, peak_vram = measure_throughput(
-        model, input_ids, vocab, warmup=args.warmup, measure=args.measure
+        model, input_ids, vocab, k_segments=k_segments,
+        warmup=args.warmup, measure=args.measure
     )
     print(f"  Training: {tok_s:,.0f} tok/s", flush=True)
-    print(f"  ms/step:  {ms_step:.1f}", flush=True)
+    print(f"  ms/step:  {ms_step:.1f}  ({compile_bs * T:,} tok/step)", flush=True)
     print(f"  Peak VRAM: {peak_vram:.2f} GB", flush=True)
 
-    # Phase 3: Inference throughput
-    print(f"\n--- Phase 3: Inference throughput (BS={compile_bs}) ---", flush=True)
+    # Phase 3: Inference throughput (single segment)
+    infer_ids = torch.randint(0, vocab, (compile_bs, seq_len), device=DEVICE)
+    print(f"\n--- Phase 3: Inference throughput (BS={compile_bs}, single segment) ---",
+          flush=True)
     infer_tok_s, infer_ms = measure_inference(
-        model, input_ids, vocab, warmup=args.warmup, measure=args.measure
+        model, infer_ids, vocab, warmup=args.warmup, measure=args.measure
     )
     print(f"  Inference: {infer_tok_s:,.0f} tok/s", flush=True)
     print(f"  ms/step:   {infer_ms:.1f}", flush=True)
 
     # Phase 4: VRAM breakdown
     print(f"\n--- Phase 4: VRAM breakdown ---", flush=True)
-    del model, input_ids
+    del model, input_ids, infer_ids
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -283,8 +305,8 @@ def main():
     # After optimizer step
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    input_ids = torch.randint(0, vocab, (max_bs, seq_len), device=DEVICE)
-    train_step(model, optimizer, input_ids, vocab)
+    input_ids = torch.randint(0, vocab, (max_bs, T), device=DEVICE)
+    train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
     optimizer.zero_grad(set_to_none=True)
     gc.collect()
     torch.cuda.empty_cache()
@@ -293,7 +315,7 @@ def main():
 
     # Peak during training
     torch.cuda.reset_peak_memory_stats(DEVICE)
-    train_step(model, optimizer, input_ids, vocab)
+    train_step(model, optimizer, input_ids, vocab, k_segments=k_segments)
     torch.cuda.synchronize()
     peak_gb = torch.cuda.max_memory_allocated(DEVICE) / 1e9
     activations_gb = max(peak_gb - after_opt_gb, 0)
@@ -307,9 +329,9 @@ def main():
     print(f"\n{'=' * 70}", flush=True)
     print(f"SUMMARY — Neuromorphic v5 Tier {args.tier.upper()}", flush=True)
     print(f"  Params:        {param_count/1e6:.1f}M", flush=True)
-    print(f"  Max train BS:  {max_bs}", flush=True)
-    print(f"  Train tok/s:   {tok_s:,.0f} (compile={use_compile})", flush=True)
-    print(f"  Infer tok/s:   {infer_tok_s:,.0f}", flush=True)
+    print(f"  Max train BS:  {max_bs}  (tok/step = {max_bs * T:,})", flush=True)
+    print(f"  Train tok/s:   {tok_s:,.0f} (compile={use_compile}, K={k_segments})", flush=True)
+    print(f"  Infer tok/s:   {infer_tok_s:,.0f} (single segment)", flush=True)
     print(f"  ms/step:       {ms_step:.1f} (train), {infer_ms:.1f} (infer)", flush=True)
     print(f"  Peak VRAM:     {peak_vram:.2f} GB", flush=True)
     print(f"  VRAM split:    {weights_gb:.2f} wt / {optimizer_gb:.2f} opt / "
