@@ -31,10 +31,13 @@ DEVICE = torch.device("cuda")
 torch.set_float32_matmul_precision("high")
 
 
-def make_model(bs, seq_len, vocab, tier="a", compile_model=False):
+def make_model(bs, seq_len, vocab, tier="a", compile_model=False,
+               grad_checkpointing=False, k_segments=1):
     """Create neuromorphic model, move to GPU, initialize states."""
-    tier_fn = {"a": ModelConfig.tier_a, "b": ModelConfig.tier_b}
-    config = tier_fn[tier](vocab_size=vocab, N=seq_len, use_compile=False)
+    tier_fn = {"a": ModelConfig.tier_a, "b": ModelConfig.tier_b, "c": ModelConfig.tier_c}
+    config = tier_fn[tier](vocab_size=vocab, N=seq_len, use_compile=False,
+                           gradient_checkpointing=grad_checkpointing,
+                           K_segments=k_segments)
     config.validate()
     model = NeuromorphicLM(config).to(DEVICE).to(torch.bfloat16)
     model.initialize_states(bs, DEVICE)
@@ -62,12 +65,14 @@ def train_step(model, optimizer, input_ids, vocab):
     return loss.item()
 
 
-def try_train_step(bs, seq_len, vocab, tier):
+def try_train_step(bs, seq_len, vocab, tier, grad_checkpointing=False, k_segments=1):
     """Try a full training step at given batch size. Returns True if it fits."""
     gc.collect()
     torch.cuda.empty_cache()
     try:
-        model, config = make_model(bs, seq_len, vocab, tier=tier, compile_model=False)
+        model, config = make_model(bs, seq_len, vocab, tier=tier, compile_model=False,
+                                   grad_checkpointing=grad_checkpointing,
+                                   k_segments=k_segments)
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
         input_ids = torch.randint(0, vocab, (bs, seq_len), device=DEVICE)
@@ -88,12 +93,14 @@ def try_train_step(bs, seq_len, vocab, tier):
         raise
 
 
-def find_max_bs(seq_len, vocab, tier):
+def find_max_bs(seq_len, vocab, tier, grad_checkpointing=False, k_segments=1):
     """Binary search for max training batch size."""
     lo, hi = 4, 4
     while hi <= 512:
         print(f"  Trying BS={hi}...", end=" ", flush=True)
-        if try_train_step(hi, seq_len, vocab, tier):
+        if try_train_step(hi, seq_len, vocab, tier,
+                          grad_checkpointing=grad_checkpointing,
+                          k_segments=k_segments):
             print("OK", flush=True)
             lo = hi
             hi *= 2
@@ -107,7 +114,9 @@ def find_max_bs(seq_len, vocab, tier):
     while lo <= hi:
         mid = (lo + hi) // 2
         print(f"  Refine BS={mid}...", end=" ", flush=True)
-        if try_train_step(mid, seq_len, vocab, tier):
+        if try_train_step(mid, seq_len, vocab, tier,
+                          grad_checkpointing=grad_checkpointing,
+                          k_segments=k_segments):
             print("OK", flush=True)
             best = mid
             lo = mid + 1
@@ -189,19 +198,28 @@ def main():
                         help="Override batch size (0=auto find max)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
+    parser.add_argument("--grad-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (halves activation memory)")
+    parser.add_argument("--k-segments", type=int, default=1,
+                        help="Segments per TBPTT step (affects activation memory, not tok/s directly)")
     args = parser.parse_args()
 
     seq_len = args.seq_len
     vocab = args.vocab
     use_compile = not args.no_compile
+    grad_checkpointing = args.grad_checkpointing
+    k_segments = args.k_segments
 
     print(f"=" * 70, flush=True)
     print(f"Neuromorphic v5 Benchmark — Tier {args.tier.upper()}", flush=True)
     print(f"GPU: {torch.cuda.get_device_name()}", flush=True)
-    print(f"seq_len={seq_len}, vocab={vocab}, compile={use_compile}", flush=True)
+    print(f"seq_len={seq_len}, vocab={vocab}, compile={use_compile}, "
+          f"grad_ckpt={grad_checkpointing}, k_segments={k_segments}", flush=True)
 
     # Param count
-    model_tmp, config = make_model(1, seq_len, vocab, tier=args.tier, compile_model=False)
+    model_tmp, config = make_model(1, seq_len, vocab, tier=args.tier, compile_model=False,
+                                   grad_checkpointing=grad_checkpointing,
+                                   k_segments=k_segments)
     param_count = sum(p.numel() for p in model_tmp.parameters() if p.requires_grad)
     print(f"Parameters: {param_count:,} ({param_count/1e6:.1f}M)", flush=True)
     print(f"Config: D={config.D}, D_embed={config.D_embed}, B={config.B}, "
@@ -217,7 +235,9 @@ def main():
     else:
         print(f"\n--- Phase 1: Finding max training batch size (no compile) ---",
               flush=True)
-        max_bs = find_max_bs(seq_len, vocab, args.tier)
+        max_bs = find_max_bs(seq_len, vocab, args.tier,
+                             grad_checkpointing=grad_checkpointing,
+                             k_segments=k_segments)
     print(f"Max training BS: {max_bs}", flush=True)
     compile_bs = max_bs
 
@@ -228,7 +248,8 @@ def main():
     torch.cuda.empty_cache()
 
     model, config = make_model(
-        compile_bs, seq_len, vocab, tier=args.tier, compile_model=use_compile
+        compile_bs, seq_len, vocab, tier=args.tier, compile_model=use_compile,
+        grad_checkpointing=grad_checkpointing, k_segments=k_segments
     )
     input_ids = torch.randint(0, vocab, (compile_bs, seq_len), device=DEVICE)
 
@@ -255,7 +276,8 @@ def main():
 
     # Weights only
     torch.cuda.reset_peak_memory_stats(DEVICE)
-    model, _ = make_model(compile_bs, seq_len, vocab, tier=args.tier, compile_model=False)
+    model, _ = make_model(compile_bs, seq_len, vocab, tier=args.tier, compile_model=False,
+                          grad_checkpointing=grad_checkpointing, k_segments=k_segments)
     weights_gb = torch.cuda.memory_allocated(DEVICE) / 1e9
 
     # After optimizer step
