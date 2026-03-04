@@ -1,11 +1,13 @@
 """
 Plot EM (Episodic Memory) diagnostics: slot strengths, budget utilization,
-write rate, novelty, nonzero slots.
+write strength, novelty, nonzero slots, activation norms.
+
+v6: Collector writes global keys (not per-bank/block).
 
 Usage:
-    python -m src.debug.plot_em
+    python -m src.debug.plot_em [metrics.jsonl] [output.png]
 
-Diagnoses: EM never writing? Novelty too low? Budget full?
+Diagnoses: EM never writing? Novelty too low? Budget full? Signal dead?
 """
 
 import json
@@ -34,15 +36,6 @@ def load_full_records(path: str) -> list[dict]:
     return records
 
 
-def find_keys(records, pattern):
-    keys = set()
-    for r in records:
-        for k in r:
-            if k.startswith(pattern):
-                keys.add(k)
-    return sorted(keys)
-
-
 def main():
     path = METRICS_FILE
     if len(sys.argv) > 1:
@@ -57,94 +50,92 @@ def main():
     steps = [r.get("step", i) for i, r in enumerate(records)]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("Episodic Memory Diagnostics", fontsize=14)
+    fig.suptitle("Episodic Memory Diagnostics (v6)", fontsize=14)
 
-    em_keys = find_keys(records, "em_b")
-
-    # EM strength means
+    # (0,0) EM slot strengths (mean/max)
     ax = axes[0, 0]
-    s_mean_keys = [k for k in em_keys if k.endswith("_S_mean")]
-    for key in s_mean_keys:
-        label = key.replace("em_", "").replace("_S_mean", "")
+    for key, label, color in [
+        ("em_S_mean", "S mean", "tab:blue"),
+        ("em_S_max", "S max", "tab:red"),
+    ]:
         vals = [r.get(key, nan) for r in records]
-        ax.plot(steps, vals, alpha=0.7, label=label)
+        if any(v is not None and v == v for v in vals):
+            ax.plot(steps, vals, alpha=0.8, label=label, color=color)
     ax.set_xlabel("step")
-    ax.set_ylabel("em_S mean")
-    ax.set_title("EM Slot Strengths (mean)")
+    ax.set_ylabel("em_S")
+    ax.set_title("EM Slot Strengths")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # EM budget utilization
+    # (0,1) EM budget utilization (sum of strengths)
     ax = axes[0, 1]
-    s_sum_keys = [k for k in em_keys if k.endswith("_S_sum")]
-    for key in s_sum_keys:
-        label = key.replace("em_", "").replace("_S_sum", "")
-        vals = [r.get(key, nan) for r in records]
-        ax.plot(steps, vals, alpha=0.7, label=label)
+    vals = [r.get("em_S_sum", nan) for r in records]
+    if any(v is not None and v == v for v in vals):
+        ax.plot(steps, vals, alpha=0.8, color="tab:green")
     ax.set_xlabel("step")
     ax.set_ylabel("sum(em_S)")
     ax.set_title("EM Budget Utilization")
-    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Write rate
+    # (0,2) Write strength (g_em) and novelty
     ax = axes[0, 2]
-    wr_keys = find_keys(records, "em_g_em_mean_")
-    for key in wr_keys:
-        label = key.replace("em_g_em_mean_", "block ")
+    for key, label, color in [
+        ("em_g_em_mean", "g_em (write gate)", "tab:orange"),
+        ("em_novelty_mean", "novelty", "tab:purple"),
+    ]:
         vals = [r.get(key, nan) for r in records]
-        ax.plot(steps, vals, alpha=0.7, label=label)
+        if any(v is not None and v == v for v in vals):
+            ax.plot(steps, vals, alpha=0.8, label=label, color=color)
     ax.set_xlabel("step")
-    ax.set_ylabel("mean g_em")
-    ax.set_title("EM Write Strength (g_em)")
+    ax.set_ylabel("value")
+    ax.set_title("EM Write Strength & Novelty")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(-0.05, 1.05)
 
-    # Novelty mean
+    # (1,0) EM nonzero slots
     ax = axes[1, 0]
-    nov_keys = find_keys(records, "em_novelty_mean_")
-    for key in nov_keys:
-        label = key.replace("em_novelty_mean_", "block ")
-        vals = [r.get(key, nan) for r in records]
-        ax.plot(steps, vals, alpha=0.7, label=label)
-    ax.set_xlabel("step")
-    ax.set_ylabel("novelty")
-    ax.set_title("EM Candidate Novelty (mean)")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # Nonzero slots
-    ax = axes[1, 1]
-    nz_keys = [k for k in em_keys if k.endswith("_nonzero")]
-    for key in nz_keys:
-        label = key.replace("em_", "").replace("_nonzero", "")
-        vals = [r.get(key, nan) for r in records]
-        ax.plot(steps, vals, alpha=0.7, label=label)
+    vals = [r.get("em_nonzero", nan) for r in records]
+    if any(v is not None and v == v for v in vals):
+        ax.plot(steps, vals, alpha=0.8, color="tab:blue")
     ax.set_xlabel("step")
     ax.set_ylabel("fraction nonzero")
-    ax.set_title("EM Nonzero Slots")
-    ax.legend(fontsize=8)
+    ax.set_title("EM Nonzero Slots (S > 0.01)")
     ax.grid(True, alpha=0.3)
     ax.set_ylim(-0.05, 1.05)
 
-    # Strength histogram (last record)
-    ax = axes[1, 2]
-    s_max_keys = [k for k in em_keys if k.endswith("_S_max")]
-    if s_max_keys and records:
-        last = records[-1]
-        maxes = [last.get(k, 0) for k in s_max_keys]
-        means = [last.get(k.replace("_S_max", "_S_mean"), 0) for k in s_max_keys]
-        x_pos = range(len(s_max_keys))
-        labels = [k.replace("em_", "").replace("_S_max", "") for k in s_max_keys]
-        ax.bar(x_pos, maxes, alpha=0.5, label="max", color="red")
-        ax.bar(x_pos, means, alpha=0.7, label="mean", color="blue")
-        ax.set_xticks(list(x_pos))
-        ax.set_xticklabels(labels, rotation=45, fontsize=8)
-        ax.set_ylabel("em_S value")
-        ax.set_title("EM Strengths (last step)")
-        ax.legend()
+    # (1,1) EM activation norms at integration point
+    ax = axes[1, 1]
+    for key, label, color in [
+        ("act_norm_em", "em_trail", "tab:orange"),
+        ("act_norm_cum_em", "cum_em", "tab:green"),
+        ("act_norm_H", "H (reference)", "tab:gray"),
+    ]:
+        vals = [r.get(key, nan) for r in records]
+        if any(v is not None and v == v for v in vals):
+            ax.plot(steps, vals, alpha=0.7, label=label, color=color)
+    ax.set_xlabel("step")
+    ax.set_ylabel("activation norm")
+    ax.set_title("EM Signals at Integration Point")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax.set_yscale("log")
+
+    # (1,2) EM gradient norms
+    ax = axes[1, 2]
+    for key, label, color in [
+        ("gnorm_em", "em", "tab:blue"),
+        ("gnorm_em_neuromod", "em_neuromod", "tab:orange"),
+        ("gnorm_W_nov", "W_nov", "tab:green"),
+    ]:
+        vals = [r.get(key, nan) for r in records]
+        if any(v is not None and v == v for v in vals):
+            ax.plot(steps, vals, alpha=0.8, label=label, color=color)
+    ax.set_xlabel("step")
+    ax.set_ylabel("gradient norm")
+    ax.set_title("EM Gradient Norms")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale("log")
 
     plt.tight_layout()
     out = OUTPUT_FILE

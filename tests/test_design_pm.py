@@ -48,15 +48,17 @@ class TestProceduralMemory:
         assert pm_read.shape == (BS, 8, cfg.D)
         assert pre.shape == (BS, 8, cfg.D_pm)
 
-    def test_read_nonzero_at_init(self):
-        """Near-identity W should produce non-zero reads."""
+    def test_read_zero_at_init(self):
+        """Zero-init proj_out means PM starts silent (residual branch = 0)."""
         cfg = make_tiny_config()
         pm = ProceduralMemory(cfg.B, cfg.D, cfg.D_pm, cfg.decay_pm)
         pm.initialize(BS, torch.device("cpu"), torch.float32)
 
         H = torch.randn(BS, 8, cfg.D)
-        pm_read, _ = pm.read(H)
-        assert pm_read.abs().sum() > 0
+        pm_read, pre = pm.read(H)
+        assert pm_read.abs().sum() == 0
+        # But pre (proj_in output) should be nonzero — gradients can flow
+        assert pre.abs().sum() > 0
 
     def test_commit_changes_weights(self):
         cfg = make_tiny_config()

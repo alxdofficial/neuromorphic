@@ -221,7 +221,7 @@ class TBPTTTrainer:
             avg_loss = chunk_loss / max(valid_count, 1)
 
         reg = compute_regularizers(self.model)
-        total_loss = avg_loss + reg
+        total_loss = avg_loss + reg * self.config.reg_weight
 
         if self.fail_fast and not torch.isfinite(total_loss.detach()):
             raise RuntimeError(

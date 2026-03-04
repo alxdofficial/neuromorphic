@@ -12,6 +12,8 @@ and [BS,N,C,D_col].
 NTP training — causal scans are inherently autoregressive.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -184,6 +186,8 @@ class NeuromorphicLM(nn.Module):
             out = self.proj_down(out)                # [BS, N, D_embed]
         out = self.ln_final(out)
         logits = self.lm_head(out)                   # [BS, N, vocab]
+        # Scale logits for tied embeddings: std ≈ √D_embed at init → normalize to ~1
+        logits = logits * (self.config.D_embed ** -0.5)
 
         return logits, aux_loss
 

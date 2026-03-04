@@ -316,7 +316,9 @@ def integration_scan(self, H, pm_read, em_reads, cum_em):
 
     # Project to embed dim and decode
     out = proj_down(H_prime)                     # [BS, N, D_embed]
-    logits = lm_head(out)                         # [BS, N, vocab]
+    logits = lm_head(out) * D_embed**-0.5        # [BS, N, vocab]
+    # Logit scaling: tied embeddings → logit std ≈ √D_embed at init.
+    # 1/√D_embed brings std to ~1, so CE ≈ ln(vocab) at init (random baseline).
 
     return logits
 ```
@@ -833,7 +835,11 @@ primitives. Simplifies Stage 1 (one projection instead of three).
 
 **PM trained parameters:**
 - `proj_in`: Linear(D, D_pm) — fixed projection into fast-weight space
-- `proj_out`: Linear(D_pm, D) — fixed projection back to model space
+- `proj_out`: Linear(D_pm, D) — **zero-initialized** (weight and bias). PM starts
+  silent (residual branch = 0 at init), gradually learns to contribute. Standard
+  "residual branch starts at zero" pattern (GPT-2, etc.). Consequence: `proj_in`
+  and `raw_beta` get zero gradient at init (blocked by zero proj_out weight);
+  gradients flow once proj_out learns non-zero weights from Stage 3.
 - `raw_beta`: `[B]` per-bank plasticity rates, parameterized as `softplus(raw_beta)`.
   Gets gradient over multiple segments: commit uses beta → W_pm updated →
   next segment's read → logits → loss.

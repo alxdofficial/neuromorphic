@@ -105,9 +105,14 @@ class TestGradientFlow:
 
         Needs 2 segments: segment 1 commits with beta → W_pm updated,
         segment 2 reads from updated W_pm → loss depends on beta.
+        proj_out is zero-init in prod (PM starts silent), so we give it
+        small weights here to test that the gradient mechanism works.
         """
         cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
+        # Unblock gradient flow through proj_out (zero-init blocks it)
+        with torch.no_grad():
+            model.pm.proj_out.weight.normal_(std=0.01)
 
         loss = _compute_loss(model, n_segments=2)
         loss.backward()

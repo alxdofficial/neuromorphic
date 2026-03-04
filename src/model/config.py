@@ -41,9 +41,10 @@ class ModelConfig:
 
     # Predictive Coding Module (within-scan, per column)
     pcm_enabled: bool = True
-    pcm_pred_weight: float = 0.01
+    pcm_pred_weight: float = 0.1
 
     # Regularization
+    reg_weight: float = 0.1    # scale for PM/EM regularization loss
     dropout: float = 0.1
     tie_embeddings: bool = True
 

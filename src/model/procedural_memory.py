@@ -47,6 +47,9 @@ class ProceduralMemory(nn.Module, StateMixin):
         # Fixed projections: D ↔ D_pm
         self.proj_in = nn.Linear(D, D_pm)
         self.proj_out = nn.Linear(D_pm, D)
+        # Zero-init so PM starts silent (residual branch = 0 at init)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
 
         # Per-bank plasticity rate: softplus(raw) → always positive
         self.raw_beta = nn.Parameter(torch.full([B], -3.0))
