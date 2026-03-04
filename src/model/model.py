@@ -156,6 +156,18 @@ class NeuromorphicLM(nn.Module):
             H, seed, w_cand, surprise, commit=commit
         )
 
+        # Debug: activation magnitudes at integration point
+        if not self.training or not torch.is_grad_enabled():
+            pass  # skip in eval/no-grad
+        else:
+            with torch.no_grad():
+                self._dbg_act_norms = {
+                    "H": H.norm().item(),
+                    "pm": pm_read_sum.norm().item(),
+                    "em": em_read_sum.norm().item(),
+                    "cum_em": cum_em_sum.norm().item(),
+                }
+
         # --- Stage 3: Dense Integration Scan — [BS, N, D] throughout ---
         integrated = H + pm_read_sum + em_read_sum + cum_em_sum
         H_prime = integrated
@@ -225,7 +237,9 @@ class NeuromorphicLM(nn.Module):
             #   New: cumsum((g_t * novelty).sum(B) * w_cand) — neuromod per-token
             #   g_em_t learns when to amplify/suppress writes from (novelty, usage)
             gated_nov = (g_em_t * novelty).sum(dim=2, keepdim=True)    # [BS, N, 1]
-            cum_em_sum = torch.cumsum(gated_nov * w_cand, dim=1)       # [BS, N, D]
+            cum_em_sum = torch.cumsum(gated_nov * w_cand, dim=1) / torch.arange(
+                1, N + 1, device=H_flat.device, dtype=H_flat.dtype
+            ).view(1, N, 1)                                              # [BS, N, D]
         else:
             novelty = torch.zeros(BS, N, B, device=H_flat.device, dtype=H_flat.dtype)
             cum_em_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)

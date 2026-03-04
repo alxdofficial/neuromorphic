@@ -5,6 +5,7 @@ Lightweight held-out evaluation loop: masked cross-entropy/perplexity
 without optimizer updates. NTP only.
 """
 
+import math
 from typing import Iterator, Optional
 
 import torch
@@ -125,7 +126,7 @@ def evaluate_validation(
 
     if valid_count > 0:
         avg_loss = total_loss / valid_count
-        ppl = min(float(torch.exp(torch.tensor(avg_loss)).item()), 1e6)
+        ppl = math.exp(avg_loss) if avg_loss < 30.0 else float("inf")
     else:
         avg_loss = float("inf")
         ppl = float("inf")

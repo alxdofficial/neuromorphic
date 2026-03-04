@@ -79,7 +79,7 @@
           <mxGeometry x="100" y="600" width="900" height="310" as="geometry"/>
         </mxCell>
         <!-- Stage 2: write-before-read with causal prefix sums -->
-        <mxCell id="stage2_label" value="&lt;b&gt;Stage 2: Memory Operations&lt;/b&gt; (Hippocampal Loop)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Write-before-read with causal write buffers (prefix sums) — batched across N&lt;br&gt;Column c addresses dims c·D_col:(c+1)·D_col of bank b&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="stage2_label" value="&lt;b&gt;Stage 2: Memory Operations&lt;/b&gt; (Hippocampal Loop)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Write-before-read with causal write buffers (cumulative means) — batched across N&lt;br&gt;Column c addresses dims c·D_col:(c+1)·D_col of bank b&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="110" y="605" width="550" height="50" as="geometry"/>
         </mxCell>
 
@@ -89,7 +89,7 @@
         </mxCell>
 
         <!-- Prefix Sums -->
-        <mxCell id="prefix_sums" value="&lt;b&gt;Causal Prefix Sum&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;cum_em = cumsum(δ_em, dim=seq) — [BS, N, D]&lt;br&gt;Position t sees neuromodulated writes from 0..t (causal for NTP)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+        <mxCell id="prefix_sums" value="&lt;b&gt;Causal Cumulative Mean&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;cum_em = cumsum(δ_em) / arange(1..N) — [BS, N, D]&lt;br&gt;Running avg of neuromodulated writes 0..t (causal, bounded)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
           <mxGeometry x="440" y="665" width="290" height="55" as="geometry"/>
         </mxCell>
         <mxCell id="e_dp" style="endArrow=block;endFill=1;" edge="1" source="write_deltas" target="prefix_sums" parent="1">
@@ -107,7 +107,7 @@
         </mxCell>
 
         <!-- Three signals to Stage 3 -->
-        <mxCell id="mem_reads" value="Four signals → Stage 3: H + pm_read + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: Hebbian fast-weight transform (frozen W_pm, bank-summed)&lt;br&gt;em_read: trail-based composition (frozen primitives)&lt;br&gt;cum_em: neuromodulated within-segment writes (prefix-summed)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="mem_reads" value="Four signals → Stage 3: H + pm_read + em_read + cum_em&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;pm_read: Hebbian fast-weight transform (frozen W_pm, bank-summed)&lt;br&gt;em_read: trail-based composition (frozen primitives)&lt;br&gt;cum_em: neuromodulated within-segment writes (cumulative mean)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="130" y="820" width="400" height="60" as="geometry"/>
         </mxCell>
         <mxCell id="e_mr1" style="endArrow=block;endFill=1;" edge="1" source="pm_read" target="mem_reads" parent="1">
@@ -240,7 +240,7 @@
         </mxCell>
 
         <!-- Notes -->
-        <mxCell id="note1" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Key Properties&lt;/b&gt;&lt;br&gt;• Causal within segment (scan)&lt;br&gt;• Causal across segments (memory)&lt;br&gt;• Causal write buffer (prefix sum of cum_em)&lt;br&gt;• EM two paths: fast (neuromod) + slow (commit)&lt;br&gt;• PM Hebbian: single commit per segment&lt;br&gt;• Four signals to Stage 3&lt;br&gt;• No R-loop — single cycle&lt;br&gt;• NTP training (not FITB)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
+        <mxCell id="note1" value="&lt;font style=&quot;font-size:10px&quot;&gt;&lt;b&gt;Key Properties&lt;/b&gt;&lt;br&gt;• Causal within segment (scan)&lt;br&gt;• Causal across segments (memory)&lt;br&gt;• Causal write buffer (cumulative mean of cum_em)&lt;br&gt;• EM two paths: fast (neuromod) + slow (commit)&lt;br&gt;• PM Hebbian: single commit per segment&lt;br&gt;• Four signals to Stage 3&lt;br&gt;• No R-loop — single cycle&lt;br&gt;• NTP training (not FITB)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;fillColor=none;strokeColor=#999999;rounded=1;" vertex="1" parent="1">
           <mxGeometry x="1050" y="260" width="200" height="160" as="geometry"/>
         </mxCell>
 

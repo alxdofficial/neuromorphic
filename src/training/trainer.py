@@ -281,7 +281,7 @@ class TBPTTTrainer:
 
         _loss_f = avg_loss.detach().item()
         _reg_f = reg.detach().item()
-        _ppl_f = min(math.exp(min(_loss_f, 20.0)), 1e6)
+        _ppl_f = math.exp(_loss_f) if _loss_f < 30.0 else float("inf")
 
         step_metrics = {
             "loss": _loss_f,

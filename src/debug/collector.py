@@ -59,7 +59,7 @@ class MetricsCollector:
             "step": step,
             "mode": mode,
             "loss": loss,
-            "ppl": min(ppl, 1e6),
+            "ppl": ppl,
             "lr": lr,
             "tok_s": tok_s,
             "grad_norm": grad_norm,
@@ -86,6 +86,9 @@ class MetricsCollector:
 
         # Per-module gradient norms
         self._collect_grad_norms(record)
+
+        # Activation magnitudes at integration point
+        self._collect_activation_norms(record)
 
         # Flush accumulated commit/write rates
         self._flush_rates(record)
@@ -222,18 +225,23 @@ class MetricsCollector:
     def _collect_grad_norms(self, record: dict):
         """Per-module gradient norms after backward.
 
-        v5 structure: embedding, lm_head, stage1, stage3, pm, em, em_neuromod,
-        W_seed_w, pcm, W_nov.
+        v6 structure: embedding, lm_head, per-layer stage1/stage3, pm, em,
+        em_neuromod, W_seed_w, pcm, W_nov.
         """
         module_groups = {
             "embedding": [self.model.embedding],
             "lm_head": [self.model.lm_head],
-            "stage1": [self.model.stage1],
-            "stage3": [self.model.stage3],
         }
+        # Per-layer stage1/stage3 for depth-resolved diagnostics
+        for i, layer in enumerate(self.model.stage1):
+            module_groups[f"stage1_L{i}"] = [layer]
+        for i, layer in enumerate(self.model.stage3):
+            module_groups[f"stage3_L{i}"] = [layer]
         if self.model.proj_up is not None:
             module_groups["proj_up"] = [self.model.proj_up]
             module_groups["proj_down"] = [self.model.proj_down]
+        module_groups["W_seed_w"] = [self.model.W_seed_w]
+        module_groups["W_nov"] = [self.model.W_nov]
         if self.model.pcm is not None:
             module_groups["pcm"] = [self.model.pcm]
         if self.config.pm_enabled:
@@ -249,6 +257,14 @@ class MetricsCollector:
                     if p.grad is not None:
                         total_norm_sq += p.grad.detach().norm().item() ** 2
             record[f"gnorm_{name}"] = math.sqrt(total_norm_sq)
+
+    def _collect_activation_norms(self, record: dict):
+        """Read debug activation norms stored by forward_segment."""
+        norms = getattr(self.model, "_dbg_act_norms", None)
+        if norms is None:
+            return
+        for key, val in norms.items():
+            record[f"act_norm_{key}"] = val
 
     def _write(self, record: dict):
         """Write a single JSON line."""

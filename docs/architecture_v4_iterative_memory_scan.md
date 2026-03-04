@@ -26,22 +26,23 @@ Stage 1: FAST SCAN (dense nn.Linear, parallel via parallel-scan)
 Stage 2: MEMORY OPS (non-affine, batched across all N positions)
   → Fused algebra: bank-sum computed without materializing [BS,N,B,D]
   → PM: Hebbian fast-weight read (bank-summed)              — [BS,N,D]
-  → EM write buffer: cumsum((g_em_t * novelty).sum(B) * w_cand) — [BS,N,D]
+  → EM write buffer: cummean((g_em_t * novelty).sum(B) * w_cand) — [BS,N,D]
+    cumulative mean (cumsum / position) — bounded regardless of N
     where g_em_t = per-token neuromodulator gate from (novelty, usage)
   → EM trail read from frozen primitives, summed over B    — [BS,N,D]
   → End of segment: actual structured commit to memory state
 
 Stage 3: INTEGRATION SCAN (dense nn.Linear, parallel via parallel-scan)
   → Second dense causal scan integrates PM read + EM trail + EM write buffer
-  → Write buffer (prefix sum of write candidates) provides within-segment
-    new information
+  → Write buffer (cumulative mean of write candidates) provides within-segment
+    new information (bounded magnitude regardless of N)
   → Produces final predictions (NTP logits)
 ```
 
 **Key properties:**
 - **Causal within segments** (scans are causal recurrences)
 - **Causal across segments** (memory state flows forward)
-- **Causal write buffers** (prefix-summed writes visible within segment)
+- **Causal write buffers** (cumulative-mean writes visible within segment)
 - **Parallel within segments** (parallel-scan algorithm, memory ops batched)
 - **No R-loop** — single cycle replaces R iterative passes
 - **NTP training** — causal scans naturally support next-token prediction
@@ -122,7 +123,7 @@ For each segment of N tokens:
 
     # 2. EM novelty + causal write buffer
       novelty_t = compute_novelty(w_cand_t, surprise_t)
-      cum_em_t = Σ_{i≤t} novelty_i · w_cand_i   # prefix sum, causal
+      cum_em_t = (1/t) Σ_{i≤t} novelty_i · w_cand_i  # cumulative mean, causal
 
     # 3. EM trail read (from frozen primitives, summed over B)
       em_read = trail_read_all(seed)             # [BS, N, D]
@@ -207,8 +208,8 @@ elementwise difference between consecutive predictions and encodings — also li
 ### Stage 2: Memory Operations (The Hippocampal Loop)
 
 Memory reads use the **frozen** segment-start state. Proposed writes are computed
-per-token in parallel, then **prefix-summed** to provide causal within-segment
-write signals. The actual structured commit happens at segment end.
+per-token in parallel, then **cumulative-averaged** to provide causal within-segment
+write signals (bounded magnitude regardless of N). The actual structured commit happens at segment end.
 
 ```python
 def memory_ops(self, H, seed, w_cand, surprise):
@@ -238,7 +239,7 @@ def memory_ops(self, H, seed, w_cand, surprise):
     usage = em.usage_all()                                   # [BS, B]
     g_em_t = neuromod(novelty, usage.expand(BS, N, B))       # [BS, N, B] — per-token gate
     gated_nov = (g_em_t * novelty).sum(dim=B, keepdim=True)  # [BS, N, 1]
-    cum_em_sum = cumsum(gated_nov * w_cand, dim=seq)         # [BS, N, D]
+    cum_em_sum = cumsum(gated_nov * w_cand, dim=seq) / arange(1..N)  # [BS, N, D] cumulative mean
 
     # --- EM trail read (summed over B internally) ---
     em_read_sum = trail_read_all(seed)                 # [BS, N, D]
@@ -267,7 +268,7 @@ Column c reads/writes only its slice `[..., c*D_col:(c+1)*D_col]` of EM. This me
 
 **Two write paths — fast and slow:**
 - **Fast path (within-segment):** EM write candidates are gated by the per-token
-  neuromodulator (g_em_t × novelty) and prefix-summed to `cum_em`. The neuromodulator
+  neuromodulator (g_em_t × novelty) and cumulative-averaged to `cum_em`. The neuromodulator
   learns when to amplify/suppress writes based on (novelty, usage) per token.
   This flows into Stage 3 as an additive signal (write-before-read for EM).
   PM has no within-segment write buffer — its update is purely at segment end
@@ -278,13 +279,13 @@ Column c reads/writes only its slice `[..., c*D_col:(c+1)*D_col]` of EM. This me
   EM routing + neuromodulator + EMA) happens at segment end and updates the
   frozen state for the next segment. This is the long-term memory path.
 
-**Why frozen reads + prefix sums (not per-token memory updates):** Updating the
+**Why frozen reads + cumulative mean (not per-token memory updates):** Updating the
 actual EM primitives per-token would require storing per-position memory states
 ([N, M, D] — too expensive) and sequential trail reads. Instead, the trail reads
-from frozen primitives (batchable), and the prefix-summed write buffer carries
-the within-segment new information as a simple D-dimensional signal. This is
+from frozen primitives (batchable), and the cumulative-mean write buffer carries
+the within-segment new information as a bounded D-dimensional signal. This is
 equivalent in effect: token t gets frozen long-term knowledge (trail) + causal
-recent writes (prefix sum).
+recent writes (running average).
 
 **State vs parameters:** The fast-weight matrices (W_pm) and EM primitives (em_K, em_V) are
 **state**, not parameters. Parameters (proj_in, proj_out, raw_beta, W_seed_w, W_gate,
@@ -372,7 +373,7 @@ as part of the scan computation.
 1. **Auxiliary prediction loss**: `L_pred = MSE(z_hat_t, z_{t+1}.detach())`
    Gradient flows to the prediction network but not the encoding target.
 2. **Downstream (within-segment)**: surprise magnitude gates PM eligibility (G accumulates
-   across segment) + novelty → delta_em (prefix-summed into write buffer) → Stage 3 → loss.
+   across segment) + novelty → delta_em (cumulative-averaged into write buffer) → Stage 3 → loss.
    PCM encoder gets same-segment gradient through the EM write buffer path.
    PM proj_in/proj_out get same-segment gradient through pm_read.
 3. **Downstream (cross-segment)**: surprise → novelty → structured EM commit →
@@ -503,16 +504,17 @@ distribution efficiently.
 g_em_t = neuromod(novelty_t, usage)            # [BS, N, B] — per-token gate
 delta_em_t = (g_em_t * novelty_t).sum(B) * w_cand_t  # [BS, N, D] — gated
 
-# Prefix sum (causal accumulation):
-cum_em_t = cumsum(delta_em, dim=seq)           # [BS, N, D] — inclusive
+# Cumulative mean (causal, bounded):
+cum_em_t = cumsum(delta_em, dim=seq) / arange(1..N)  # [BS, N, D]
+# Running average of neuromodulated writes — bounded regardless of N
 
 # Added to Stage 3 input alongside trail read:
 stage3_input_t = pm_read_t + em_trail_read_t + cum_em_t
 ```
 
-**Two write paths:** The prefix-summed `cum_em` provides immediate within-segment
-feedback — token t sees what tokens 0..t wrote (fast path, neuromodulated D-vector,
-same-segment gradient). The per-token neuromodulator learns when to write from
+**Two write paths:** The cumulative-mean `cum_em` provides immediate within-segment
+feedback — token t sees the running average of what tokens 0..t wrote (fast path,
+neuromodulated D-vector, same-segment gradient, bounded magnitude regardless of N). The per-token neuromodulator learns when to write from
 (novelty, usage), trained end-to-end by the main CE loss through the fast path.
 The structured decomposition commit updates the actual primitives for the
 next segment's trail reads (slow path, M-primitive routing, cross-segment TBPTT).
@@ -564,10 +566,10 @@ from column assignment.
 
 ```
 loss → logits → Stage 3 scan →
-  → cum_em (write buffer):
+  → cum_em (write buffer, cumulative mean):
       → delta_em = (g_em_t · novelty).sum(B) · w_cand
       → g_em_t: neuromod MLP (same-segment gradient!), novelty params, W_seed_w, Stage 1 scan
-      (gradient through prefix sum is a suffix sum — linear, stable)
+      (gradient through cumulative mean is scaled suffix sum — linear, stable)
   → pm_read (fast-weight):
       → proj_out → W_sum = Σ_b W_pm[b] → proj_in → PCM surprise (via prev segment)
       (W_pm itself is state — gradient for raw_beta flows cross-segment)
@@ -604,8 +606,8 @@ K=2 is likely sufficient (one segment of lookahead).
 | PM raw_beta | **Next segment's** loss through committed W_pm → read | Cross-segment TBPTT |
 | EM trail params (W_seed_w, W_gate, τ, σ) | Same segment's loss through trail | Through softmax, differentiable |
 | EM primitives (em_K, em_V) | Same segment's loss through trail read | Through softmax attention |
-| Write candidate proj (W_seed_w) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
-| Novelty scoring (W_nov) | Same segment's loss through cum_em (write buffer) | Through prefix sum (linear) |
+| Write candidate proj (W_seed_w) | Same segment's loss through cum_em (write buffer) | Through cumulative mean (linear) |
+| Novelty scoring (W_nov) | Same segment's loss through cum_em (write buffer) | Through cumulative mean (linear) |
 | EM neuromodulator | **Same segment** (fast path) + **next segment** (commit) | Fast path: direct; commit: TBPTT |
 | EM commit routing | **Next segment's** loss through committed em_K/em_V | Cross-segment TBPTT |
 
@@ -617,11 +619,12 @@ Both scans are causal recurrences — token t only sees tokens 1..t-1 through th
 hidden state. This naturally supports next-token prediction (NTP).
 
 Memory reads in Stage 2 are from the **segment-start** state (frozen). Write
-buffers use **inclusive prefix sums** (`cum_t = Σ_{i≤t} delta_i`). Since
-`logits_t` predicts `token_{t+1}` and is allowed to depend on tokens 0..t,
-the inclusive prefix sum is causal. `delta_em_t` depends on tokens 0..t
+buffers use **inclusive cumulative means** (`cum_t = (1/t) Σ_{i≤t} delta_i`).
+Since `logits_t` predicts `token_{t+1}` and is allowed to depend on tokens 0..t,
+the inclusive cumulative mean is causal. `delta_em_t` depends on tokens 0..t
 (through the causal Stage 1 scan), so `cum_em_t` at position t depends on
-tokens 0..t — matching the NTP causality requirement. PM has no per-token
+tokens 0..t — matching the NTP causality requirement. The 1/t normalization
+ensures bounded magnitude regardless of sequence length N. PM has no per-token
 write buffer; pm_read is constant within the segment (from frozen W_pm).
 
 ### 2. Cross-Segment: Causal
@@ -787,10 +790,11 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 10. **Implementation** → Custom prefix scan. No external dependency (no mamba-ssm).
     Standard element-wise parallel-scan is simple to implement.
 
-11. **Causal write buffers (EM)** → EM prefix-summed write deltas
-    (`cum_em = cumsum((g_em_t * novelty).sum(B) * w_cand)`) provide within-segment
+11. **Causal write buffers (EM)** → EM cumulative-mean write deltas
+    (`cum_em = cummean((g_em_t * novelty).sum(B) * w_cand)`) provide within-segment
     feedback via Stage 3 additive integration. Per-token neuromodulator g_em_t learns
-    when to write from (novelty, usage). Inclusive prefix sum (i≤t) — causal for NTP.
+    when to write from (novelty, usage). Inclusive cumulative mean (i≤t) — causal for
+    NTP and bounded regardless of N.
     Write params (W_seed_w, novelty scoring, neuromodulator) all get same-segment gradient.
     PM has no within-segment write buffer — Hebbian commit at segment end only.
     EM structured commit still happens at segment end (cross-segment TBPTT).
