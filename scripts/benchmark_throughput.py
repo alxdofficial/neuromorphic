@@ -41,6 +41,7 @@ VOCAB = 32000
 WARMUP_STEPS = 5
 BENCH_STEPS = 20
 SEQ_LENGTHS = [1024, 2048]
+NEURO_GRAD_CKPT = False
 
 # Batch sizes to try (descending). We pick the largest that doesn't OOM.
 BS_CANDIDATES = [64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1]
@@ -133,7 +134,8 @@ def _cleanup():
 # Model creation
 # ---------------------------------------------------------------------------
 
-def create_neuromorphic(tier: str, seq_len: int, device: torch.device):
+def create_neuromorphic(tier: str, seq_len: int, device: torch.device,
+                        grad_ckpt: bool = False):
     """Create neuromorphic model for given tier."""
     from src.model.config import ModelConfig
     from src.model.model import NeuromorphicLM
@@ -148,6 +150,7 @@ def create_neuromorphic(tier: str, seq_len: int, device: torch.device):
     cfg.vocab_size = VOCAB
     cfg.eot_id = 2
     cfg.use_compile = False  # we handle compile separately
+    cfg.gradient_checkpointing = grad_ckpt
 
     model = NeuromorphicLM(cfg).to(device)
     return model, cfg
@@ -274,7 +277,7 @@ def find_max_bs(
         optimizer = None
         try:
             if is_neuro:
-                model, cfg = create_neuromorphic(tier, seq_len, device)
+                model, cfg = create_neuromorphic(tier, seq_len, device, NEURO_GRAD_CKPT)
                 # No compile — eager mode for fast probing
                 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
             else:
@@ -343,6 +346,7 @@ def bench_model(
         if is_neuro:
             use_compile = True
             model_type = "neuromorphic"
+            use_grad_ckpt = NEURO_GRAD_CKPT
         else:
             cfg_spec_path = os.path.join(os.path.dirname(__file__),
                             "..", "auxiliary_repos", "baselines", "eval_scripts")
@@ -354,7 +358,7 @@ def bench_model(
 
         # --- Quick param count ---
         if is_neuro:
-            tmp_model, _ = create_neuromorphic(tier, seq_len, torch.device("cpu"))
+            tmp_model, _ = create_neuromorphic(tier, seq_len, torch.device("cpu"), NEURO_GRAD_CKPT)
         else:
             tmp_model, _, _ = create_baseline(model_name, torch.device("cpu"))
         n_params = sum(p.numel() for p in tmp_model.parameters())
@@ -381,7 +385,7 @@ def bench_model(
         log(f"  Creating fresh model for benchmark...")
 
         if is_neuro:
-            model, cfg = create_neuromorphic(tier, seq_len, device)
+            model, cfg = create_neuromorphic(tier, seq_len, device, NEURO_GRAD_CKPT)
             if use_compile:
                 log(f"  Compiling (first step will be slow)...")
                 model = torch.compile(model)
@@ -559,7 +563,7 @@ def print_results_table(results: list[BenchResult]):
 # ---------------------------------------------------------------------------
 
 def main():
-    global WARMUP_STEPS, BENCH_STEPS  # noqa: PLW0603
+    global WARMUP_STEPS, BENCH_STEPS, NEURO_GRAD_CKPT  # noqa: PLW0603
 
     parser = argparse.ArgumentParser(
         description="Benchmark training throughput across all models"
@@ -593,10 +597,15 @@ def main():
         "--json", type=str, default="",
         help="Save results to JSON file"
     )
+    parser.add_argument(
+        "--neuro-grad-ckpt", action="store_true",
+        help="Enable gradient checkpointing for neuromorphic model"
+    )
     args = parser.parse_args()
 
     WARMUP_STEPS = args.warmup
     BENCH_STEPS = args.steps
+    NEURO_GRAD_CKPT = args.neuro_grad_ckpt
 
     if not torch.cuda.is_available():
         print("ERROR: CUDA required for benchmarking.", flush=True)
