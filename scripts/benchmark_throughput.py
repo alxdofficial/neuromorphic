@@ -292,7 +292,7 @@ def find_max_bs(
                 del x, y
 
             peak = torch.cuda.max_memory_allocated() / 1e9
-            log(f"  BS={bs} OK (eager, peak {peak:.1f}GB)")
+            log(f"  BS={bs} OK (peak {peak:.1f}GB)")
             found_bs = bs
 
             _cleanup_model(model)
@@ -313,16 +313,6 @@ def find_max_bs(
     if found_bs is None:
         log("  All batch sizes OOM! Returning BS=1 as fallback.", "ERR")
         return 1
-
-    # torch.compile uses extra memory for kernel caches and intermediates.
-    # Step down one level from the eager-mode max as safety margin.
-    use_compile = is_neuro or (model_type in COMPILE_TYPES)
-    if use_compile and found_bs > 1:
-        idx = BS_CANDIDATES.index(found_bs)
-        if idx + 1 < len(BS_CANDIDATES):
-            safe_bs = BS_CANDIDATES[idx + 1]
-            log(f"  Compile safety margin: {found_bs} -> {safe_bs}")
-            return safe_bs
 
     return found_bs
 
