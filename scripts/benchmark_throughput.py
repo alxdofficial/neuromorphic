@@ -52,9 +52,9 @@ GRAD_CKPT_TYPES = {"gpt2", "gpt_neox", "llama"}
 COMPILE_TYPES = {"gpt2", "gpt_neox", "llama"}
 
 TIER_MODELS = {
-    "A": ["neuromorphic-a", "gpt2-small", "pythia-160m", "mamba-130m"],
-    "B": ["neuromorphic-b", "gpt2-medium", "pythia-410m", "mamba-370m"],
-    "C": ["neuromorphic-c", "pythia-1b", "tinyllama-1b", "mamba-1.4b"],
+    "A": ["neuromorphic-a", "gpt2-small", "pythia-160m"],
+    "B": ["neuromorphic-b", "gpt2-medium", "pythia-410m"],
+    "C": ["neuromorphic-c", "pythia-1b", "tinyllama-1b"],
 }
 
 
