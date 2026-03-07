@@ -29,7 +29,7 @@ class EpisodicMemory(nn.Module, StateMixin):
 
     def __init__(self, B: int, M: int, D: int, n_steps: int = 2,
                  S_max: float = 3.0, budget: float = 32.0,
-                 decay: float = 0.999):
+                 decay: float = 0.999, topk: int = 0):
         super().__init__()
         self.B = B
         self.M = M
@@ -38,6 +38,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.S_max = S_max
         self.budget = budget
         self.decay = decay
+        self.topk = topk if topk > 0 else M  # 0 means all (no top-k)
 
         # Trail parameters (per bank)
         self.gate_alpha = nn.Parameter(torch.randn(B) * 0.02)  # scalar gate scale
@@ -61,7 +62,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         self.em_K = unit_normalize(torch.randn(BS, self.B, self.M, self.D, device=device, dtype=dtype))
         self.em_V = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
-        self.em_S = torch.full((BS, self.B, self.M), 0.1, device=device, dtype=dtype)
+        self.em_S = torch.full((BS, self.B, self.M), 0.01, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
         return self.em_K is not None
@@ -197,8 +198,17 @@ class EpisodicMemory(nn.Module, StateMixin):
         route_scores = torch.matmul(w_norm, self.em_K.transpose(-2, -1)) / tau_w
         active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
         route_scores = route_scores.masked_fill(~active, float('-inf'))
+
+        # Top-k: concentrate writes on k most-similar primitives
+        k = min(self.topk, M)
+        if k < M:
+            _, topk_idx = route_scores.topk(k, dim=-1)
+            topk_mask = torch.zeros_like(route_scores, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_idx, True)
+            route_scores = route_scores.masked_fill(~topk_mask, float('-inf'))
+
         route = F.softmax(route_scores, dim=-1)  # [BS, B, N, M]
-        route = route.nan_to_num(1.0 / M)
+        route = route.nan_to_num(0.0)
 
         # Aggregate across N tokens, weighted by novelty
         # novelty: [BS, N, B] -> [BS, B, N, 1]
@@ -244,14 +254,32 @@ class EpisodicMemory(nn.Module, StateMixin):
         return self.em_S.sum(dim=-1)  # [BS, B]
 
     def reset_states(self, mask: Tensor):
-        """Full reset for masked streams. mask: [BS] bool."""
+        """Re-initialize EM for masked streams (doc boundary).
+
+        Must re-initialize to same state as initialize(), NOT zero —
+        em_S=0 makes primitives permanently inactive (active mask = False,
+        no routing, no writes, no recovery).
+
+        mask: [BS] bool — True for streams to reset.
+        """
         if self.em_S is None:
             return
+        device = self.em_S.device
+        dtype = self.em_S.dtype
+
+        # Fresh state matching initialize()
+        fresh_K = unit_normalize(torch.randn(
+            1, self.B, self.M, self.D, device=device, dtype=dtype))
+        fresh_V = torch.zeros(
+            1, self.B, self.M, self.D, device=device, dtype=dtype)
+        fresh_S = torch.full(
+            (1, self.B, self.M), 0.01, device=device, dtype=dtype)
+
         expanded = mask[:, None, None]           # [BS, 1, 1]
         expanded_kv = mask[:, None, None, None]  # [BS, 1, 1, 1]
-        self.em_S = self.em_S * ~expanded
-        self.em_K = self.em_K * ~expanded_kv
-        self.em_V = self.em_V * ~expanded_kv
+        self.em_S = torch.where(expanded, fresh_S, self.em_S)
+        self.em_K = torch.where(expanded_kv, fresh_K, self.em_K)
+        self.em_V = torch.where(expanded_kv, fresh_V, self.em_V)
 
 
 class EMNeuromodulator(nn.Module):
@@ -273,6 +301,8 @@ class EMNeuromodulator(nn.Module):
         )
         self.g_head = nn.Linear(hidden, 1)
         nn.init.zeros_(self.backbone[0].bias)
+        nn.init.zeros_(self.g_head.weight)
+        nn.init.zeros_(self.g_head.bias)
 
     def forward(self, novelty_mean: Tensor, usage: Tensor) -> Tensor:
         """Produce write gate g_em for all banks at once.

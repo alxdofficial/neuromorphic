@@ -28,14 +28,12 @@ PLOT_SCRIPTS = [
     "plot_training",
     "plot_pm",
     "plot_em",
-    "plot_gates",
-    "plot_wm",
     "plot_gradients",
 ]
 
 
 def generate_phase_plots(metrics_file: str, phase: str, save_dir: str):
-    """Run all 6 existing plot scripts after a phase completes.
+    """Run all existing plot scripts after a phase completes.
 
     Note: plots are cumulative (all phases up through the named phase),
     because the underlying scripts read the full JSONL without filtering.

@@ -75,10 +75,9 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 22_900,            # 750M tokens @ BS=16, K_segments=4, N=512 (32,768 tok/step)
-    "B": 22_900,            # 750M tokens — same budget, lifelong mode
+    "A": 30_517,            # 1.5B tokens @ BS=24, K_segments=4, N=512 (49,152 tok/step)
+    "B": 15_258,            # 750M tokens — same budget, lifelong mode
 }
-# Total A+B: 45,800 × 32,768 ≈ 1.5B tokens (50/50 split, matches fair comparison budget)
 # Phase A: PM/EM reset at doc boundaries — memory systems learn basic function
 # Phase B: PM/EM persist across all docs — lifelong accumulation
 

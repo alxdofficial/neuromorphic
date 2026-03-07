@@ -67,11 +67,11 @@ class StateMixin:
     _state_tensor_names: list = []
 
     def detach_states(self):
-        """Detach all runtime state tensors in-place (TBPTT boundary)."""
+        """Detach all runtime state tensors (TBPTT boundary)."""
         for name in self._state_tensor_names:
             t = getattr(self, name, None)
             if t is not None and isinstance(t, Tensor):
-                t.detach_()
+                setattr(self, name, t.detach())
 
     def reset_states(self, mask: Tensor):
         """Zero out runtime state for masked streams.

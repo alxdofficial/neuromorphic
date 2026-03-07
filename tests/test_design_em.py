@@ -109,6 +109,7 @@ class TestEpisodicMemory:
         assert u.shape == (BS, cfg.B)
 
     def test_reset_states(self):
+        """Reset should re-initialize (not zero) — em_S=0 kills primitives permanently."""
         cfg = make_tiny_config()
         em = EpisodicMemory(cfg.B, cfg.M, cfg.D, cfg.n_trail_steps)
         em.initialize(BS, torch.device("cpu"), torch.float32)
@@ -119,10 +120,12 @@ class TestEpisodicMemory:
         mask = torch.tensor([True, False])
         em.reset_states(mask)
 
-        # Stream 0 zeroed
-        assert em.em_S[0].sum() == 0
-        assert em.em_K[0].abs().sum() == 0
-        assert em.em_V[0].abs().sum() == 0
+        # Stream 0 re-initialized (not zeroed — zeroing kills EM permanently)
+        assert torch.allclose(em.em_S[0], torch.full_like(em.em_S[0], 0.01))
+        assert em.em_V[0].abs().sum() == 0  # values reset to zero
+        # Keys should be unit-normalized random (not zero)
+        norms = em.em_K[0].norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
         # Stream 1 preserved
         assert em.em_S[1].sum() > 0
         assert em.em_K[1].abs().sum() > 0

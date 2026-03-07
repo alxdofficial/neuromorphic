@@ -75,7 +75,7 @@ class TestTierPresets:
         cfg = ModelConfig.tier_a()
         cfg.validate()
         assert cfg.D == 2048
-        assert cfg.D_embed == 384
+        assert cfg.D_embed == 768
         assert cfg.B == 4
         assert cfg.C == 16
         assert cfg.D_col == 128  # D=2048 // C=16
@@ -87,7 +87,7 @@ class TestTierPresets:
         cfg = ModelConfig.tier_b()
         cfg.validate()
         assert cfg.D == 3072
-        assert cfg.D_embed == 512
+        assert cfg.D_embed == 1024
         assert cfg.B == 6
         assert cfg.C == 16
         assert cfg.L_scan == 12
@@ -97,7 +97,7 @@ class TestTierPresets:
         cfg = ModelConfig.tier_c()
         cfg.validate()
         assert cfg.D == 4096
-        assert cfg.D_embed == 768
+        assert cfg.D_embed == 2048
         assert cfg.B == 8
         assert cfg.C == 16
         assert cfg.L_scan == 16

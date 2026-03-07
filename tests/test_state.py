@@ -82,7 +82,11 @@ class TestReset:
 
 class TestEMReset:
     def test_em_reset_zeros_all_state(self):
-        """EM reset: em_S, em_K, em_V all zeroed for masked."""
+        """EM reset: re-initialized (not zeroed) for masked streams.
+
+        Zeroing em_S kills primitives permanently (active mask = False,
+        no routing, no writes, no recovery). Must re-initialize to fresh state.
+        """
         model, cfg = _init_model("A")
 
         em = model.em
@@ -96,10 +100,14 @@ class TestEMReset:
         mask = torch.tensor([True, False])
         model._reset_memory(mask)
 
-        # Stream 0: everything zeroed
-        assert (em.em_S[0] == 0).all(), "em_S should be zeroed for masked"
-        assert (em.em_K[0] == 0).all(), "em_K should be zeroed for masked"
+        # Stream 0: re-initialized to fresh state (not zeroed)
+        assert torch.allclose(em.em_S[0], torch.full_like(em.em_S[0], 0.01)), \
+            "em_S should be re-initialized to 0.01 for masked"
         assert (em.em_V[0] == 0).all(), "em_V should be zeroed for masked"
+        # Keys should be unit-normalized (not zero)
+        norms = em.em_K[0].norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4), \
+            "em_K should be unit-normalized random for masked"
         # Stream 1 preserved
         assert (em.em_S[1] > 0).all(), "em_S should be preserved for unmasked"
         assert torch.equal(em.em_K[1], em_K_before[1]), "em_K[1] should be preserved"

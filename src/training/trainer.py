@@ -319,7 +319,7 @@ class TBPTTTrainer:
                     "nan_grad_steps": getattr(self, '_nan_steps', 0),
                 }
                 self.collector.log_full(
-                    self.global_step, {}, basic, extras=extras, mode="train",
+                    self.global_step, basic, extras=extras, mode="train",
                 )
             else:
                 self.collector.log_basic(

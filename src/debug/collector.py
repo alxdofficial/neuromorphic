@@ -3,7 +3,8 @@ MetricsCollector — collects training metrics and saves to JSONL.
 
 Two-tier collection:
   - Basic (every step): loss, ppl, lr, throughput, grad_norm, reg — ~8 floats
-  - Full (every N steps): PM/EM state, per-module grad norms, plasticity warnings
+  - Full (every N steps): PM/EM state, memory write stats, per-module grad norms,
+    activation norms, health checks
 """
 
 import json
@@ -11,6 +12,7 @@ import math
 import os
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 from ..model.model import NeuromorphicLM
 from ..model.config import ModelConfig
@@ -36,14 +38,12 @@ class MetricsCollector:
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        # PM commit rate accumulators
-        self._pm_commit_accum: list = []  # [(total, count)]
-        # EM write rate accumulators
-        self._em_write_accum: list = []  # [(count, novelty_sum, g_sum)]
-
         self._file = open(output_path, "a")
         self._writes_since_flush = 0
         self._flush_every = 50  # flush to disk every N writes
+
+        # Health check state
+        self._health_warned = set()  # track which warnings have fired
 
     def should_collect_full(self, step: int) -> bool:
         """Whether this step requires full collection."""
@@ -70,7 +70,7 @@ class MetricsCollector:
             record.update(extras)
         self._write(record)
 
-    def log_full(self, step: int, gate_stats: dict, basic: dict,
+    def log_full(self, step: int, basic: dict,
                  extras: dict = None, mode: str = "train"):
         """Write a full metrics line merging basic + memory + grad stats."""
         record = dict(basic)
@@ -80,9 +80,12 @@ class MetricsCollector:
         if extras:
             record.update(extras)
 
-        # Memory subsystem stats (read directly from model state)
+        # Memory subsystem state (read directly from model)
         self._collect_pm_stats(record)
         self._collect_em_stats(record)
+
+        # Memory write diagnostics (from model's _dbg_memory_stats)
+        self._collect_memory_write_stats(record)
 
         # Per-module gradient norms
         self._collect_grad_norms(record)
@@ -90,63 +93,14 @@ class MetricsCollector:
         # Activation magnitudes at integration point
         self._collect_activation_norms(record)
 
-        # Flush accumulated commit/write rates
-        self._flush_rates(record)
-
-        # Global summaries and warning signals
-        self._collect_plasticity_summary(record)
+        # Health checks — print warnings for dead subsystems
+        self._check_health(step, record)
 
         # Lifelong persistence stats (Phase B)
         if self.config.lifelong_mode:
             self._collect_lifelong_stats(record)
 
         self._write(record)
-
-    def record_pm_commit(self, p_commit: Tensor):
-        """Accumulate PM commit strength across passes within a chunk.
-
-        p_commit is a continuous [BSB] tensor (0-1), not a binary mask.
-        """
-        self._pm_commit_accum.append(
-            (p_commit.float().mean().detach(), 1)
-        )
-
-    def record_em_write(self, novelty_mean: Tensor | float, g_em_mean: Tensor | float):
-        """Accumulate EM write stats across passes within a chunk."""
-        if torch.is_tensor(novelty_mean):
-            novelty = novelty_mean.detach()
-        else:
-            novelty = torch.tensor(float(novelty_mean))
-        if torch.is_tensor(g_em_mean):
-            g_em = g_em_mean.detach()
-        else:
-            g_em = torch.tensor(float(g_em_mean))
-
-        self._em_write_accum.append((1, novelty, g_em))
-
-    def _flush_rates(self, record: dict):
-        """Flush accumulated commit/write rates into the record."""
-        if self._pm_commit_accum:
-            total = sum(t.item() if torch.is_tensor(t) else t for t, _ in self._pm_commit_accum)
-            count = sum(c for _, c in self._pm_commit_accum)
-            if count > 0:
-                record["pm_commit_rate"] = total / count
-        self._pm_commit_accum.clear()
-
-        if self._em_write_accum:
-            count = sum(c for c, _, _ in self._em_write_accum)
-            if count > 0:
-                nov_total = sum(
-                    n.item() if torch.is_tensor(n) else n
-                    for _, n, _ in self._em_write_accum
-                )
-                g_total = sum(
-                    g.item() if torch.is_tensor(g) else g
-                    for _, _, g in self._em_write_accum
-                )
-                record["em_novelty_mean"] = nov_total / count
-                record["em_g_em_mean"] = g_total / count
-        self._em_write_accum.clear()
 
     def _collect_pm_stats(self, record: dict):
         """Read PM state tensors and compute summary stats.
@@ -171,30 +125,76 @@ class MetricsCollector:
         em = self.model.em
         if em.em_S is None:
             return
-        em_S = em.em_S.detach()  # [BS*B, M]
+        em_S = em.em_S.detach()  # [BS, B, M]
         record["em_S_mean"] = em_S.mean().item()
         record["em_S_max"] = em_S.max().item()
         record["em_S_sum"] = em_S.sum(dim=-1).mean().item()
         record["em_nonzero"] = (em_S > 0.01).float().mean().item()
 
-    def _collect_plasticity_summary(self, record: dict):
-        """Global PM/EM summaries with warning flags."""
-        pm_commit = record.get("pm_commit_rate")
-        em_write = record.get("em_g_em_mean")
+    def _collect_memory_write_stats(self, record: dict):
+        """Read memory write diagnostics saved by model._memory_ops.
 
-        record["warn_commit_collapse"] = float(
-            pm_commit is not None and pm_commit < 1e-3
-        )
-        record["warn_write_collapse"] = float(
-            em_write is not None and em_write < 1e-3
-        )
+        These are snapshot values from the last segment in the TBPTT chunk:
+        - em_novelty_mean: mean novelty across all tokens/banks
+        - em_g_em_mean: mean neuromodulator write gate
+        - pm_surprise_gate_mean: mean sigmoid(||surprise||) — PM write strength
+        """
+        stats = getattr(self.model, "_dbg_memory_stats", None)
+        if stats is None:
+            return
+        for key, val in stats.items():
+            record[key] = val
 
-        pm_budget = record.get("pm_budget_util_global")
-        em_budget = record.get("em_budget_util_global")
-        record["warn_budget_saturation"] = float(
-            (pm_budget is not None and pm_budget > 0.98)
-            or (em_budget is not None and em_budget > 0.98)
-        )
+    def _check_health(self, step: int, record: dict):
+        """Print warnings to stdout when memory subsystems are dead.
+
+        Only warns once per issue to avoid spam. Checks fire after step 100
+        to allow warmup.
+        """
+        if step < 100:
+            return
+
+        # EM dead: no active primitives
+        em_nonzero = record.get("em_nonzero")
+        if em_nonzero is not None and em_nonzero < 0.01:
+            if "em_dead" not in self._health_warned:
+                self._health_warned.add("em_dead")
+                tqdm.write(
+                    f"\n*** HEALTH WARNING (step {step}): EM IS DEAD ***\n"
+                    f"    em_nonzero={em_nonzero:.4f} (fraction of slots with S > 0.01)\n"
+                    f"    em_S_mean={record.get('em_S_mean', '?')}\n"
+                    f"    Likely cause: reset_states zeroing em_S, or writes not keeping up with decay.\n"
+                )
+
+        # EM write gate collapsed
+        em_g = record.get("em_g_em_mean")
+        if em_g is not None and em_g < 1e-3:
+            if "em_write_collapsed" not in self._health_warned:
+                self._health_warned.add("em_write_collapsed")
+                tqdm.write(
+                    f"\n*** HEALTH WARNING (step {step}): EM write gate collapsed ***\n"
+                    f"    em_g_em_mean={em_g:.6f}\n"
+                    f"    Neuromodulator is suppressing all writes.\n"
+                )
+
+        # PM signal dead (after sufficient training)
+        if step > 1000:
+            act_pm = record.get("act_norm_pm")
+            act_h = record.get("act_norm_H")
+            if act_pm is not None and act_h is not None and act_h > 0:
+                ratio = act_pm / act_h
+                if ratio < 1e-6:
+                    if "pm_signal_dead" not in self._health_warned:
+                        self._health_warned.add("pm_signal_dead")
+                        tqdm.write(
+                            f"\n*** HEALTH WARNING (step {step}): PM signal dead ***\n"
+                            f"    pm/H ratio={ratio:.2e}\n"
+                            f"    PM is not contributing to the output.\n"
+                        )
+
+        # EM recovered — clear warning
+        if em_nonzero is not None and em_nonzero > 0.1:
+            self._health_warned.discard("em_dead")
 
     def _collect_lifelong_stats(self, record: dict):
         """Collect cross-document memory persistence stats (Phase B)."""

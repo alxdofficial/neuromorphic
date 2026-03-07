@@ -55,8 +55,9 @@ class NeuromorphicLM(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(config.N, D) * 0.02)
 
         # Stage 1: L_scan dense layers — [BS, N, D] throughout
+        n_total = 2 * L  # depth scaling counts both stages
         self.stage1 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout, n_layers=n_total) for _ in range(L)
         ])
 
         # Projections: grouped (per-feature-group seeds + write candidates)
@@ -78,7 +79,7 @@ class NeuromorphicLM(nn.Module):
         self.em = EpisodicMemory(
             B, config.M, D, config.n_trail_steps,
             S_max=config.S_max, budget=config.budget_em,
-            decay=config.decay_em,
+            decay=config.decay_em, topk=config.em_topk,
         )
         self.em_neuromod = EMNeuromodulator(
             hidden=config.neuromod_hidden,
@@ -86,7 +87,7 @@ class NeuromorphicLM(nn.Module):
 
         # Stage 3: L_scan dense layers — [BS, N, D] throughout
         self.stage3 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout, n_layers=n_total) for _ in range(L)
         ])
 
         # Output
@@ -127,11 +128,14 @@ class NeuromorphicLM(nn.Module):
         x = x + self.pos_embed[:N]                  # [BS, N, D]
 
         H = x
-        for layer in self.stage1:
+        for i, layer in enumerate(self.stage1):
+            carry = self._s1_carries[i] if hasattr(self, '_s1_carries') else None
             if self.config.gradient_checkpointing and self.training:
-                H, _ = checkpoint(layer, H, use_reentrant=False)
+                H, h_last = checkpoint(layer, H, carry, use_reentrant=False)
             else:
-                H, _ = layer(H)                     # [BS, N, D]
+                H, h_last = layer(H, carry)          # [BS, N, D]
+            if hasattr(self, '_s1_carries'):
+                self._s1_carries[i] = h_last
 
         # PCM: view as grouped for per-feature-group surprise
         aux_loss = torch.tensor(0.0, device=device)
@@ -154,14 +158,14 @@ class NeuromorphicLM(nn.Module):
         w_cand = w_col.reshape(BS, N, D)                 # [BS, N, D]
 
         # --- Stage 2: Memory Ops (fused algebra — no [BS,N,B,D] tensors) ---
-        pm_read_sum, em_read_sum, cum_em_sum = self._memory_ops(
+        pm_read_sum, em_read_sum, cum_em_sum, novelty, g_em_t = self._memory_ops(
             H, seed, w_cand, surprise, commit=commit
         )
 
-        # Debug: activation magnitudes at integration point
-        if not self.training or not torch.is_grad_enabled():
-            pass  # skip in eval/no-grad
-        else:
+        # Debug: activation + memory write diagnostics
+        # Collected here (outside _memory_ops) because torch.compile graph-breaks
+        # at commit boundaries — this section runs in eager mode reliably.
+        if self.training and torch.is_grad_enabled() and not torch.compiler.is_compiling():
             with torch.no_grad():
                 self._dbg_act_norms = {
                     "H": H.norm().item(),
@@ -169,16 +173,28 @@ class NeuromorphicLM(nn.Module):
                     "em": em_read_sum.norm().item(),
                     "cum_em": cum_em_sum.norm().item(),
                 }
+                stats = {}
+                if novelty is not None:
+                    stats["em_novelty_mean"] = novelty.mean().item()
+                if g_em_t is not None:
+                    stats["em_g_em_mean"] = g_em_t.mean().item()
+                if self.config.pm_enabled:
+                    s_gate = torch.sigmoid(surprise.norm(dim=-1))
+                    stats["pm_surprise_gate_mean"] = s_gate.mean().item()
+                self._dbg_memory_stats = stats
 
         # --- Stage 3: Dense Integration Scan — [BS, N, D] throughout ---
         integrated = H + pm_read_sum + em_read_sum + cum_em_sum
         H_prime = integrated
 
-        for layer in self.stage3:
+        for i, layer in enumerate(self.stage3):
+            carry = self._s3_carries[i] if hasattr(self, '_s3_carries') else None
             if self.config.gradient_checkpointing and self.training:
-                H_prime, _ = checkpoint(layer, H_prime, use_reentrant=False)
+                H_prime, h_last = checkpoint(layer, H_prime, carry, use_reentrant=False)
             else:
-                H_prime, _ = layer(H_prime)          # [BS, N, D]
+                H_prime, h_last = layer(H_prime, carry)  # [BS, N, D]
+            if hasattr(self, '_s3_carries'):
+                self._s3_carries[i] = h_last
 
         # Output
         out = H_prime
@@ -194,7 +210,7 @@ class NeuromorphicLM(nn.Module):
     def _memory_ops(
         self, H_flat: Tensor, seed: Tensor, w_cand: Tensor, surprise: Tensor,
         commit: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
         """Stage 2: Memory read/write operations.
 
         PM: Hebbian fast-weight read (bank-summed).
@@ -213,6 +229,8 @@ class NeuromorphicLM(nn.Module):
             pm_read_sum: [BS, N, D] — PM fast-weight read, bank-summed
             em_read_sum: [BS, N, D] — EM trail reads, summed over B
             cum_em_sum:  [BS, N, D] — EM causal write buffers, summed over B
+            novelty: [BS, N, B] or None — novelty scores (for debug)
+            g_em_t: [BS, N, B] or None — per-token write gates (for debug)
         """
         BS, N, D = H_flat.shape
         B = self.config.B
@@ -245,7 +263,7 @@ class NeuromorphicLM(nn.Module):
                 1, N + 1, device=H_flat.device, dtype=H_flat.dtype
             ).view(1, N, 1)                                              # [BS, N, D]
         else:
-            novelty = torch.zeros(BS, N, B, device=H_flat.device, dtype=H_flat.dtype)
+            novelty = None
             cum_em_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
             g_em_t = None
 
@@ -260,34 +278,48 @@ class NeuromorphicLM(nn.Module):
             if self.config.pm_enabled and pm_pre is not None:
                 self.pm.commit(pm_pre, surprise, budget=self.config.budget_pm)
 
-            if self.config.em_enabled:
+            if self.config.em_enabled and g_em_t is not None:
+                # Decay existing strengths before adding new writes
+                self.em.base_decay()
                 # Segment-level gate: mean of per-token gates
                 g_em = g_em_t.mean(dim=1)                              # [BS, B]
                 self.em.commit_all(w_cand, novelty, g_em)
-                self.em.base_decay()
 
-        return pm_read_sum, em_read_sum, cum_em_sum
+        return pm_read_sum, em_read_sum, cum_em_sum, novelty, g_em_t
 
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
 
     def _reset_memory(self, mask: Tensor):
-        """Reset PM/EM for masked streams at doc boundary."""
+        """Reset PM/EM and scan carries for masked streams at doc boundary."""
         if not self.config.lifelong_mode:
             self.pm.reset_states(mask)
             self.em.reset_states(mask)
+            if hasattr(self, '_s1_carries'):
+                mask_f = (~mask).to(dtype=torch.float32).unsqueeze(-1)  # [BS, 1]
+                for i, h in enumerate(self._s1_carries):
+                    if h is not None:
+                        self._s1_carries[i] = h * mask_f
+                for i, h in enumerate(self._s3_carries):
+                    if h is not None:
+                        self._s3_carries[i] = h * mask_f
 
     def initialize_states(self, BS: int, device: torch.device):
         """Pre-allocate runtime state tensors."""
         dtype = runtime_state_dtype(device)
         self.pm.initialize(BS, device, dtype)
         self.em.initialize(BS, device, dtype)
+        self._s1_carries = [None] * len(self.stage1)
+        self._s3_carries = [None] * len(self.stage3)
 
     def detach_states(self):
-        """TBPTT boundary: detach all PM/EM state."""
+        """TBPTT boundary: detach all PM/EM and scan carry state."""
         self.pm.detach_states()
         self.em.detach_states()
+        if hasattr(self, '_s1_carries'):
+            self._s1_carries = [h.detach() if h is not None else None for h in self._s1_carries]
+            self._s3_carries = [h.detach() if h is not None else None for h in self._s3_carries]
 
     def param_count(self) -> int:
         """Total trainable parameters."""

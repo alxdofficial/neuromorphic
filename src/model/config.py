@@ -33,8 +33,9 @@ class ModelConfig:
     M: int = 256              # EM capacity (primitives) per bank
     n_trail_steps: int = 2    # trail iteration count
     S_max: float = 3.0        # max primitive strength
-    budget_em: float = 32.0   # sum(em_S) budget per stream
+    budget_em: float = 32.0   # sum(em_S) budget per (stream, bank)
     decay_em: float = 0.999   # per-segment strength decay
+    em_topk: int = 8          # top-k routing for EM writes (0 = all)
 
     # Neuromodulator architecture
     neuromod_hidden: int = 32
@@ -136,9 +137,9 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Dev tier (~130M). Matches Mamba-130M scale."""
+        """Dev tier (~106M). Matches Mamba-130M scale."""
         defaults = dict(
-            D=2048, D_embed=384, B=4, C=16, D_pm=64,
+            D=2048, D_embed=768, B=4, C=16, D_pm=64,
             N=512, L_scan=6, scan_expansion=8, d_inner=1024,
             M=384, n_trail_steps=3,
             budget_pm=16, budget_em=32,
@@ -150,7 +151,7 @@ class ModelConfig:
     def tier_b(cls, **overrides) -> "ModelConfig":
         """Research tier (~250M). Matches Mamba-370M scale."""
         defaults = dict(
-            D=3072, D_embed=512, B=6, C=16, D_pm=64,
+            D=3072, D_embed=1024, B=6, C=16, D_pm=64,
             N=512, L_scan=12, scan_expansion=4, d_inner=1024,
             M=512, n_trail_steps=2,
             budget_pm=32, budget_em=64,
@@ -163,7 +164,7 @@ class ModelConfig:
     def tier_c(cls, **overrides) -> "ModelConfig":
         """Large tier (~844M). Matches Qwen3.5-0.8B / Mamba-1.4B scale."""
         defaults = dict(
-            D=4096, D_embed=768, B=8, C=16, D_pm=64,
+            D=4096, D_embed=2048, B=8, C=16, D_pm=64,
             N=512, L_scan=16, scan_expansion=8, d_inner=2048,
             M=768, n_trail_steps=3,
             budget_pm=32, budget_em=64,

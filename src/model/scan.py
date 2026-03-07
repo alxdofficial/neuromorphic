@@ -141,7 +141,8 @@ class ScanLayer(nn.Module):
     Dense projections (nn.Linear) for GPU efficiency.
     """
 
-    def __init__(self, D: int, d_inner: int, dropout: float = 0.0):
+    def __init__(self, D: int, d_inner: int, dropout: float = 0.0,
+                 n_layers: int = 1):
         super().__init__()
         self.D = D
         self.d_inner = d_inner
@@ -150,6 +151,11 @@ class ScanLayer(nn.Module):
         self.proj_in = nn.Linear(D, 2 * d_inner)
         self.proj_out = nn.Linear(d_inner, D)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # GPT-2 style depth scaling: each residual branch contributes 1/√(2*n_layers)
+        if n_layers > 1:
+            with torch.no_grad():
+                self.proj_out.weight.mul_(1.0 / math.sqrt(2 * n_layers))
 
     def forward(self, x: Tensor, h_prev: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Forward pass.

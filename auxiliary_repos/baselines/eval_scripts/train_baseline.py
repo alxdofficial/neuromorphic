@@ -58,29 +58,35 @@ from transformers import (
 # ============================================================================
 
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-SEQ_LENGTH = 256  # Must match our T=256
+SEQ_LENGTH = 2048  # Match neuromorphic T=2048 (K_segments=4 x N=512)
 TOKEN_BUDGET = 1_500_000_000  # 1.5B tokens (matches neuromorphic training)
 GRAD_ACCUM = 1
 
-# Per-model optimal batch sizes (RTX 4090 24GB, bf16)
-# Tier B/C models need smaller BS due to VRAM; adjust if using A100.
+# Per-model optimal batch sizes (RTX 4090 24GB, bf16, SEQ_LENGTH=2048)
+# Transformer attention is O(T^2) so needs much smaller BS at T=2048.
+# SSM/recurrent models are O(T) so scale linearly.
 MODEL_OPTIMAL_BS = {
-    # Tier A (~100M)
-    "gpt2-small": 96,
-    "pythia-160m": 96,
-    "mamba-130m": 64,
-    "rwkv7-168m": 16,
+    # Tier A (~100M) — empirically determined on RTX 4090, T=2048, bf16
+    # Transformers use gradient_checkpointing + torch.compile
+    "gpt2-small": 24,      # grad_ckpt + compile: 12GB, 95K tok/s
+    "pythia-160m": 24,     # grad_ckpt + compile: 12GB, 95K tok/s
+    "mamba-130m": 10,      # no grad_ckpt: 20GB, 59K tok/s
+    "rwkv7-168m": 4,       # conservative estimate
     # Tier B (~400M)
-    "gpt2-medium": 32,
-    "pythia-410m": 32,
-    "mamba-370m": 32,
-    "rwkv7-421m": 32,
+    "gpt2-medium": 8,
+    "pythia-410m": 8,
+    "mamba-370m": 4,
+    "rwkv7-421m": 4,
     # Tier C (~1B)
-    "pythia-1b": 8,
-    "tinyllama-1b": 8,
-    "mamba-1.4b": 8,
-    "rwkv7-1.5b": 8,
+    "pythia-1b": 4,
+    "tinyllama-1b": 4,
+    "mamba-1.4b": 2,
+    "rwkv7-1.5b": 2,
 }
+
+# Models that benefit from gradient checkpointing at T=2048
+# (transformers with O(T^2) attention OOM without it)
+GRADIENT_CHECKPOINT_MODELS = {"gpt2", "gpt_neox", "llama"}
 
 # Dataset — The Pile (local pre-downloaded parquet files)
 # Run `python scripts/prepare_data.py` first to create these.
@@ -519,6 +525,12 @@ def create_model(model_name: str, device: str) -> AutoModelForCausalLM:
 
     model = model.to(device)
 
+    # Gradient checkpointing for transformer models at T=2048
+    # (O(T^2) attention OOMs without it on RTX 4090)
+    if model_type in GRADIENT_CHECKPOINT_MODELS:
+        print("  Enabling gradient checkpointing...")
+        model.gradient_checkpointing_enable()
+
     # torch.compile for transformer architectures
     # (Mamba's selective scan and RWKV's custom kernels don't compile cleanly)
     if model_type in ("gpt2", "gpt_neox", "llama"):
@@ -613,7 +625,7 @@ def train(
         "min_lr": MIN_LR,
         "warmup_steps": warmup_steps,
         "tokenizer": TOKENIZER_NAME,
-        "data_mix": "fineweb-edu(0.6)+dclm(0.4)",
+        "data_mix": "the-pile-deduplicated",
         "tokens_per_step": batch_size * SEQ_LENGTH,
         "total_tokens": max_steps * batch_size * SEQ_LENGTH,
     }
