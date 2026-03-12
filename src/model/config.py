@@ -37,6 +37,9 @@ class ModelConfig:
     decay_em: float = 0.999   # per-segment strength decay
     em_topk: int = 8          # top-k routing for EM writes (0 = all)
 
+    # Scan layer options
+    glu_output: bool = False      # SwiGLU output projection on scan layers
+
     # Neuromodulator architecture
     neuromod_hidden: int = 32
 
@@ -137,12 +140,13 @@ class ModelConfig:
 
     @classmethod
     def tier_a(cls, **overrides) -> "ModelConfig":
-        """Dev tier (~106M). Matches Mamba-130M scale."""
+        """Dev tier (~130M). Matches GPT2-small/Pythia-160M scale."""
         defaults = dict(
             D=2048, D_embed=768, B=4, C=16, D_pm=64,
             N=512, L_scan=6, scan_expansion=8, d_inner=1024,
             M=384, n_trail_steps=3,
             budget_pm=16, budget_em=32,
+            glu_output=True,
         )
         defaults.update(overrides)
         return cls(**defaults)

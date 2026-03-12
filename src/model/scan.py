@@ -139,17 +139,26 @@ class ScanLayer(nn.Module):
 
     Pre-norm residual: out = x + proj_out(scan(norm(x)))
     Dense projections (nn.Linear) for GPU efficiency.
+
+    When glu_output=True, proj_out produces 2*D and applies SwiGLU gating:
+        [gate, up] = proj_out(h)
+        out = silu(gate) * up
+    This adds nonlinear feature mixing without extra sequential depth.
     """
 
     def __init__(self, D: int, d_inner: int, dropout: float = 0.0,
-                 n_layers: int = 1):
+                 n_layers: int = 1, glu_output: bool = False):
         super().__init__()
         self.D = D
         self.d_inner = d_inner
+        self.glu_output = glu_output
 
         self.norm = RMSNorm(D)
         self.proj_in = nn.Linear(D, 2 * d_inner)
-        self.proj_out = nn.Linear(d_inner, D)
+        if glu_output:
+            self.proj_out = nn.Linear(d_inner, 2 * D)
+        else:
+            self.proj_out = nn.Linear(d_inner, D)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # GPT-2 style depth scaling: each residual branch contributes 1/√(2*n_layers)
@@ -172,4 +181,10 @@ class ScanLayer(nn.Module):
         ab = self.proj_in(self.norm(x))        # [BS, N, 2*d_inner]
         a_raw, b_raw = ab.chunk(2, dim=-1)
         h = fused_scan(a_raw, F.silu(b_raw), h_prev)  # [BS, N, d_inner]
-        return self.drop(self.proj_out(h)) + residual, h[:, -1]
+        if self.glu_output:
+            gate_up = self.proj_out(h)             # [BS, N, 2*D]
+            gate, up = gate_up.chunk(2, dim=-1)    # each [BS, N, D]
+            out = F.silu(gate) * up                # [BS, N, D]
+        else:
+            out = self.proj_out(h)                 # [BS, N, D]
+        return self.drop(out) + residual, h[:, -1]

@@ -57,7 +57,8 @@ class NeuromorphicLM(nn.Module):
         # Stage 1: L_scan dense layers — [BS, N, D] throughout
         n_total = 2 * L  # depth scaling counts both stages
         self.stage1 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout, n_layers=n_total) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
+                      glu_output=config.glu_output) for _ in range(L)
         ])
 
         # Projections: grouped (per-feature-group seeds + write candidates)
@@ -87,7 +88,8 @@ class NeuromorphicLM(nn.Module):
 
         # Stage 3: L_scan dense layers — [BS, N, D] throughout
         self.stage3 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout, n_layers=n_total) for _ in range(L)
+            ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
+                      glu_output=config.glu_output) for _ in range(L)
         ])
 
         # Output
