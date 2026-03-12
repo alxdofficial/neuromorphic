@@ -65,20 +65,21 @@ def _find_latest_ckpt(run_dir):
 
 _LATEST_RUN = _find_latest_run()
 OUR_CKPT = _find_latest_ckpt(_LATEST_RUN)
-_BASELINE_OUT = ROOT / "auxiliary_repos/baselines/eval_scripts/outputs"
-PYTHIA_CKPT_DIR = _BASELINE_OUT / "baseline_pythia_160m/checkpoints"
-MAMBA_CKPT_DIR = _BASELINE_OUT / "baseline_mamba_130m/checkpoints"
+
+# Baseline outputs live under ROOT/outputs/
+PYTHIA_CKPT_DIR = ROOT / "outputs/baseline_pythia_160m/checkpoints"
+GPT2_CKPT_DIR = ROOT / "outputs/baseline_gpt2_small/checkpoints"
 
 # Training logs
 OUR_METRICS = [_LATEST_RUN / "metrics.jsonl"] if _LATEST_RUN else []
-PYTHIA_METRICS = _BASELINE_OUT / "baseline_pythia_160m/metrics.jsonl"
-MAMBA_METRICS = _BASELINE_OUT / "baseline_mamba_130m/metrics.jsonl"
+PYTHIA_METRICS = ROOT / "outputs/baseline_pythia_160m/metrics.jsonl"
+GPT2_METRICS = ROOT / "outputs/baseline_gpt2_small/metrics.jsonl"
 
 OUTPUT_DIR = ROOT / "outputs/comparison"
 
-OUR_PARAMS = 85.1e6
+OUR_PARAMS = 91.8e6
 PYTHIA_PARAMS = 134.2e6
-MAMBA_PARAMS = 115.1e6
+GPT2_PARAMS = 124.4e6
 
 
 # ===========================================================================
@@ -86,18 +87,20 @@ MAMBA_PARAMS = 115.1e6
 # ===========================================================================
 
 def load_our_model():
-    """Load neuromorphic model from checkpoint."""
-    from src.model.config import ModelConfig
+    """Load neuromorphic model from checkpoint (config stored in ckpt)."""
     from src.model.model import NeuromorphicLM
 
-    config = ModelConfig.tier_a()
-    config.set_phase("B")
-    model = NeuromorphicLM(config).to(dtype=torch.bfloat16, device=DEVICE)
     if OUR_CKPT is None or not OUR_CKPT.exists():
         raise FileNotFoundError(f"No checkpoint found. Latest run: {_LATEST_RUN}")
     ckpt = torch.load(str(OUR_CKPT), map_location=DEVICE, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    config = ckpt["config"]
+    model = NeuromorphicLM(config).to(dtype=torch.bfloat16, device=DEVICE)
+    state = ckpt["model_state_dict"]
+    # torch.compile saves keys with "_orig_mod." prefix — strip it
+    state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    model.load_state_dict(state, strict=False)
     model.requires_grad_(False)
+    print(f"    Loaded neuromorphic from {OUR_CKPT.name} (step {ckpt.get('step', '?')})")
     return model
 
 
@@ -126,22 +129,24 @@ def load_pythia(ckpt_dir=None):
     return model
 
 
-def load_mamba(ckpt_dir=None):
-    """Load from-scratch Mamba from training checkpoint."""
-    from transformers import MambaConfig, MambaForCausalLM
+def load_gpt2(ckpt_dir=None):
+    """Load from-scratch GPT2-small from training checkpoint."""
+    from transformers import GPT2Config, GPT2LMHeadModel
 
-    ckpt_dir = ckpt_dir or MAMBA_CKPT_DIR
-    config = MambaConfig(
-        vocab_size=32000, hidden_size=768, num_hidden_layers=24,
-        state_size=16, expand=2, conv_kernel=4,
-        use_bias=False, use_conv_bias=True,
+    ckpt_dir = ckpt_dir or GPT2_CKPT_DIR
+    config = GPT2Config(
+        vocab_size=32000, n_embd=768, n_layer=12, n_head=12,
+        n_positions=2048, activation_function="gelu_new",
+        resid_pdrop=0.1, embd_pdrop=0.1, attn_pdrop=0.1,
     )
-    model = MambaForCausalLM(config).to(DEVICE)
+    model = GPT2LMHeadModel(config).to(DEVICE)
 
     ckpt_path = Path(ckpt_dir) / "latest.pt"
     if ckpt_path.exists():
         ckpt = torch.load(str(ckpt_path), map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        state = ckpt["model_state_dict"]
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        model.load_state_dict(state)
         print(f"    Loaded weights from {ckpt_path.name} (step {ckpt.get('step', '?')})")
     model.requires_grad_(False)
     return model
@@ -199,7 +204,7 @@ def compute_training_curves():
     # --- Baselines ---
     for name, path, params in [
         ("pythia", PYTHIA_METRICS, PYTHIA_PARAMS),
-        ("mamba", MAMBA_METRICS, MAMBA_PARAMS),
+        ("gpt2", GPT2_METRICS, GPT2_PARAMS),
     ]:
         records = []
         if not path.exists():
@@ -319,9 +324,8 @@ def benchmark_inference():
     torch.cuda.empty_cache()
 
     # --- Baselines ---
-    # Mamba needs bf16 (fp16 causes NaN with selective scan)
-    for model_name, loader_fn in [("pythia", load_pythia), ("mamba", load_mamba)]:
-        amp_dtype = torch.bfloat16 if "mamba" in model_name else torch.float16
+    for model_name, loader_fn in [("pythia", load_pythia), ("gpt2", load_gpt2)]:
+        amp_dtype = torch.bfloat16
         print(f"\n  Loading {model_name} baseline...")
         try:
             model = loader_fn()
@@ -474,8 +478,8 @@ def measure_pg19_position_ppl():
     torch.cuda.empty_cache()
 
     # --- Baselines ---
-    for model_name, loader_fn in [("pythia", load_pythia), ("mamba", load_mamba)]:
-        amp_dtype = torch.bfloat16 if "mamba" in model_name else torch.float16
+    for model_name, loader_fn in [("pythia", load_pythia), ("gpt2", load_gpt2)]:
+        amp_dtype = torch.bfloat16
         print(f"\n  Measuring {model_name} baseline...")
         try:
             model = loader_fn()
@@ -575,39 +579,47 @@ def measure_wikitext2_ppl():
 
     results = {}
 
-    # --- Our model (using forward_span for efficient chunk processing) ---
-    SPAN = 256
+    # --- Our model (using forward_segment with N-token chunks) ---
     print("\n  Measuring neuromorphic model...")
     our_model = load_our_model()
+    SEG_LEN = our_model.config.N  # segment length from config
+
+    # Initialize memory state
+    our_model.initialize_states(1, torch.device(DEVICE))
 
     total_loss = 0.0
     n_scored = 0
-    token_t = torch.tensor([tokens_list], dtype=torch.long, device=DEVICE)  # [1, N]
-    no_reset = torch.tensor([False], dtype=torch.bool, device=DEVICE)
+    token_t = torch.tensor([tokens_list], dtype=torch.long, device=DEVICE)  # [1, T]
     reset_mask = torch.tensor([True], dtype=torch.bool, device=DEVICE)
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for start in range(0, len(tokens_list), SPAN):
-            end = min(start + SPAN, len(tokens_list))
-            rmask = reset_mask if start == 0 else no_reset
-            logits_span = our_model.forward_span(
-                token_t[:, start:end], rmask
-            )[0].float()  # [1, P, vocab]
+        for start in range(0, len(tokens_list), SEG_LEN):
+            end = min(start + SEG_LEN, len(tokens_list))
+            chunk = token_t[:, start:end]
+            # Pad last chunk to SEG_LEN if needed
+            if chunk.shape[1] < SEG_LEN:
+                pad = torch.zeros(1, SEG_LEN - chunk.shape[1], dtype=torch.long, device=DEVICE)
+                chunk = torch.cat([chunk, pad], dim=1)
+            rmask = reset_mask if start == 0 else None
+            logits, _ = our_model.forward_segment(chunk, reset_mask=rmask)
+            logits = logits.float()  # [1, SEG_LEN, vocab]
 
-            # Score: logits[j] predicts token at position start+j+1
-            for j in range(logits_span.shape[1] - 1):
+            actual_len = min(end - start, SEG_LEN)
+            for j in range(actual_len - 1):
+                if start + j + 1 >= len(tokens_list):
+                    break
                 target = token_t[0, start + j + 1:start + j + 2]
                 loss = F.cross_entropy(
-                    logits_span[0, j:j + 1], target
+                    logits[0, j:j + 1], target
                 ).item()
                 if not math.isnan(loss):
                     total_loss += loss
                     n_scored += 1
 
-            if n_scored > 0 and (start + SPAN) % 10000 < SPAN:
+            if n_scored > 0 and (start + SEG_LEN) % 10000 < SEG_LEN:
                 avg = total_loss / n_scored
                 print(
-                    f"    {min(start + SPAN, len(tokens_list))}"
+                    f"    {min(start + SEG_LEN, len(tokens_list))}"
                     f"/{len(tokens_list)} tokens,"
                     f" running ppl={math.exp(avg):.1f}"
                 )
@@ -628,8 +640,8 @@ def measure_wikitext2_ppl():
     stride = 256
     max_length = 1024
 
-    for model_name, loader_fn in [("pythia", load_pythia), ("mamba", load_mamba)]:
-        amp_dtype = torch.bfloat16 if "mamba" in model_name else torch.float16
+    for model_name, loader_fn in [("pythia", load_pythia), ("gpt2", load_gpt2)]:
+        amp_dtype = torch.bfloat16
         print(f"\n  Measuring {model_name} baseline...")
         try:
             model = loader_fn()
@@ -701,8 +713,10 @@ def main():
     print(f"Output directory: {OUTPUT_DIR}")
 
     compute_training_curves()
-    benchmark_inference()
-    measure_pg19_position_ppl()
+    # Skip inference benchmark and PG19 — forward_span removed in v6,
+    # and PG19 dataset is deprecated on HuggingFace.
+    # benchmark_inference()
+    # measure_pg19_position_ppl()
     measure_wikitext2_ppl()
 
     print("\n" + "=" * 60)
