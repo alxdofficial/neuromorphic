@@ -107,7 +107,6 @@ def main():
     ax = axes[1, 1]
     for key, label, color in [
         ("act_norm_em", "em_trail", "tab:orange"),
-        ("act_norm_cum_em", "cum_em", "tab:green"),
         ("act_norm_H", "H (reference)", "tab:gray"),
     ]:
         vals = [r.get(key, nan) for r in records]
@@ -125,7 +124,6 @@ def main():
     for key, label, color in [
         ("gnorm_em", "em", "tab:blue"),
         ("gnorm_em_neuromod", "em_neuromod", "tab:orange"),
-        ("gnorm_W_nov", "W_nov", "tab:green"),
     ]:
         vals = [r.get(key, nan) for r in records]
         if any(v is not None and v == v for v in vals):

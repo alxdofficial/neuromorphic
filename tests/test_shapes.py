@@ -382,9 +382,8 @@ class TestFullModel:
         assert model.proj_up is not None
         assert model.proj_down is not None
 
-    def test_stage_layer_counts(self):
-        """Model should have L_scan layers in each stage."""
-        cfg = make_tiny_config(L_scan=3)
+    def test_layer_count(self):
+        """Model should have L_total layers in single stack."""
+        cfg = make_tiny_config(L_total=6, L_mem=3)
         model = NeuromorphicLM(cfg)
-        assert len(model.stage1) == 3
-        assert len(model.stage3) == 3
+        assert len(model.layers) == 6

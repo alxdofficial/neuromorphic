@@ -1,5 +1,5 @@
 """
-TBPTTTrainer (v5) — main training loop for neuromorphic LM.
+TBPTTTrainer (v7) — main training loop for neuromorphic LM.
 
 Processes TBPTT chunks as K segments of N tokens. PM/EM updates happen
 inside model.forward_segment(), so no external span_ops needed.

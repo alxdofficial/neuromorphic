@@ -45,7 +45,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.n_steps = n_steps
         self.S_max = S_max
         self.budget = budget
-        self.topk = topk if topk > 0 else M  # 0 means all (no top-k)
+        self.topk = topk  # 0 means all (no top-k)
 
         # Latent compression: D → D_mem for memory storage
         if self.D_mem != D:
@@ -241,13 +241,14 @@ class EpisodicMemory(nn.Module, StateMixin):
         active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
         route_scores = route_scores.masked_fill(~active, float('-inf'))
 
-        # Top-k: concentrate writes on k most-similar primitives
-        k = min(self.topk, M)
-        if k < M:
-            _, topk_idx = route_scores.topk(k, dim=-1)
-            topk_mask = torch.zeros_like(route_scores, dtype=torch.bool)
-            topk_mask.scatter_(-1, topk_idx, True)
-            route_scores = route_scores.masked_fill(~topk_mask, float('-inf'))
+        # Top-k: concentrate writes on k most-similar primitives (0 = all)
+        if self.topk > 0:
+            k = min(self.topk, M)
+            if k < M:
+                _, topk_idx = route_scores.topk(k, dim=-1)
+                topk_mask = torch.zeros_like(route_scores, dtype=torch.bool)
+                topk_mask.scatter_(-1, topk_idx, True)
+                route_scores = route_scores.masked_fill(~topk_mask, float('-inf'))
 
         route = F.softmax(route_scores, dim=-1)  # [BS, B, N, M]
         route = route.nan_to_num(0.0)

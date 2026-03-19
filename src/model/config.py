@@ -1,5 +1,5 @@
 """
-Model configuration for the Neuromorphic LM (v5: scan-memory-scan).
+Model configuration for the Neuromorphic LM (v6: single scan stack).
 
 Single dataclass holding all hyperparameters. Phase toggles control which
 memory systems are active. Tier presets provide size configurations.
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    # Architecture — v5 scan-memory-scan
+    # Architecture — v6 single scan stack
     D: int = 512              # model width (internal)
     D_embed: int = -1         # embedding dim (defaults to D in validate())
     B: int = 4                # memory banks
@@ -18,8 +18,8 @@ class ModelConfig:
     D_col: int = -1           # derived: D // C (set in validate())
     N: int = 512              # segment length
     K_segments: int = 2       # TBPTT chunk = K segments
-    L_scan: int = 12          # scan layers per stage (stage1 + stage3)
-    L_scan_s3: int = -1       # stage3 layers (-1 = same as L_scan)
+    L_total: int = 12         # total layers in single scan stack
+    L_mem: int = 6            # memory injection point (reads after this layer index)
     scan_expansion: int = 4   # E = scan_expansion * D_col per layer
     d_inner: int = -1         # scan hidden dim (derived in validate if -1)
     vocab_size: int = 32000   # set from tokenizer at runtime
@@ -37,7 +37,7 @@ class ModelConfig:
     S_max: float = 3.0        # max primitive strength
     budget_em: float = 32.0   # sum(em_S) budget per (stream, bank)
     decay_em: float = 0.999   # per-segment strength decay
-    em_topk: int = 8          # top-k routing for EM writes (0 = all)
+    em_topk: int = 0          # top-k routing for EM writes (0 = all)
 
     # Scan layer options
     glu_output: bool = False      # SwiGLU output projection on scan layers
@@ -90,12 +90,10 @@ class ModelConfig:
             raise ValueError(f"N ({self.N}) must be >= 1.")
         if self.K_segments < 1:
             raise ValueError(f"K_segments ({self.K_segments}) must be >= 1.")
-        if self.L_scan < 1:
-            raise ValueError(f"L_scan ({self.L_scan}) must be >= 1.")
-        if self.L_scan_s3 == -1:
-            self.L_scan_s3 = self.L_scan
-        if self.L_scan_s3 < 1:
-            raise ValueError(f"L_scan_s3 ({self.L_scan_s3}) must be >= 1.")
+        if self.L_total < 1:
+            raise ValueError(f"L_total ({self.L_total}) must be >= 1.")
+        if self.L_mem < 0 or self.L_mem >= self.L_total:
+            raise ValueError(f"L_mem ({self.L_mem}) must be in [0, L_total-1).")
         if self.scan_expansion < 1:
             raise ValueError(f"scan_expansion ({self.scan_expansion}) must be >= 1.")
         # Derive d_inner (scan hidden dim) — backward compat when not set
@@ -140,7 +138,7 @@ class ModelConfig:
         defaults = dict(
             D=64, D_embed=64, B=2, C=2, D_pm=16,
             vocab_size=64, N=16, K_segments=2,
-            M=8, L_scan=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
+            M=8, L_total=4, L_mem=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
             budget_pm=4.0, budget_em=8.0,
             neuromod_hidden=8,
             pcm_enabled=True, pm_enabled=True, em_enabled=True,
@@ -153,10 +151,11 @@ class ModelConfig:
         """Dev tier (~130M). Matches GPT2-small/Pythia-160M scale."""
         defaults = dict(
             D=2048, D_embed=768, B=4, C=16, D_pm=64,
-            N=512, L_scan=6, scan_expansion=8, d_inner=1024,
+            N=128, K_segments=16, L_total=10, L_mem=5,
+            scan_expansion=8, d_inner=1024,
             M=384, D_mem=512, n_trail_steps=3,
             budget_pm=16, budget_em=32,
-            glu_output=True,
+            glu_output=True, em_topk=0,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -166,10 +165,11 @@ class ModelConfig:
         """Research tier (~250M). Matches Mamba-370M scale."""
         defaults = dict(
             D=3072, D_embed=1024, B=6, C=16, D_pm=64,
-            N=512, L_scan=12, scan_expansion=4, d_inner=1024,
+            N=128, K_segments=16, L_total=20, L_mem=10,
+            scan_expansion=4, d_inner=1024,
             M=512, n_trail_steps=2,
             budget_pm=32, budget_em=64,
-            neuromod_hidden=64,
+            neuromod_hidden=64, em_topk=0,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -179,10 +179,11 @@ class ModelConfig:
         """Large tier (~844M). Matches Qwen3.5-0.8B / Mamba-1.4B scale."""
         defaults = dict(
             D=4096, D_embed=2048, B=8, C=16, D_pm=64,
-            N=512, L_scan=16, scan_expansion=8, d_inner=2048,
+            N=128, K_segments=16, L_total=28, L_mem=14,
+            scan_expansion=8, d_inner=2048,
             M=768, n_trail_steps=3,
             budget_pm=32, budget_em=64,
-            neuromod_hidden=64,
+            neuromod_hidden=64, em_topk=0,
         )
         defaults.update(overrides)
         return cls(**defaults)

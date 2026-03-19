@@ -51,21 +51,19 @@ novelty scoring. Each feature group predicts what the next token's features will
 like; the per-dimension error tells the model which features it failed to anticipate.
 PCM operates on a grouped view [BS,N,C,D_col] of the dense scan output (free `.view()`).
 
-### Two-Stream Processing: Fast Scan + Slow Memory
+### Single Scan Stack with Memory Injection
 
-The key architectural insight (v5.1): **separate fast causal computation from slow
-memory operations.**
+The key architectural insight: **memory reads are just additive residuals** that can be
+injected between scan layers — no separate stage needed.
 
-- **Fast stream (Stages 1 & 3)**: Dense affine scan recurrence — causal, parallelizable.
-  nn.Linear projections with full feature mixing process tokens. Grouped PCM computes
-  predictions, grouped W_seed_w prepares trail seeds and write candidates. All linear
-  operations that compose into a scan.
-- **Slow stream (Stage 2)**: Non-affine memory operations — batched across all
-  positions. Write-before-read with causal write buffers: per-token deltas are
-  cumulative-averaged, giving each position causal access to within-segment writes
-  with bounded magnitude regardless of N.
-  PM gain modulation with causal bias, EM trail from frozen primitives, segment-end
-  commit. The bio-inspired logic that can't be linearized runs here, once per segment.
+- **Pre-memory layers** (layers 0..L_mem-1): Dense affine scan recurrence — causal,
+  parallelizable. nn.Linear projections with full feature mixing. Grouped PCM computes
+  predictions, grouped W_seed_w prepares trail seeds and write candidates.
+- **Memory injection** at layer L_mem: PM fast-weight read + EM trail read, additive.
+- **Post-memory layers** (layers L_mem..L_total-1): Integrate memory context with
+  the encoded representation.
+- **Segment-end commits**: PM Hebbian update + EM neuromodulated decomposition write.
+  No within-segment writes — N=128 segments make commits frequent enough.
 
 This mirrors the brain: neocortex processes quickly and feedforward; hippocampal
 consolidation is slower, periodic, and handles memory formation.
@@ -100,13 +98,10 @@ ideas emerge from composing multiple primitives via trail-based navigation.
   refinement (3 steps). At each step: score ALL primitives via softmax (no top-k),
   compose weighted sum, gate, move seed. Different seed → different trail →
   different composition. M primitives + continuous seeds = infinite readouts.
-- **Novelty**: Reconstruction error — can existing primitives explain this input?
-  Blended with surprise magnitude.
-- **Write (two paths)**: Fast: `δ_em = (g_em_t · novelty) · w_cand`, where `g_em_t` is
-  a per-token neuromodulator gate. Cumulative-averaged to `cum_em` for within-segment
-  feedback (additive signal to Stage 3, bounded). The neuromod gets same-segment gradient.
-  Slow: decompose across primitives via soft routing at segment end, neuromodulator
-  gates EMA write strength (cross-segment gradient via TBPTT).
+- **Novelty**: Write candidate energy + surprise magnitude.
+- **Write (segment-end)**: Decompose across primitives via full softmax routing.
+  Neuromodulator MLP runs once at segment end on (mean_novelty, usage) → g_em.
+  Neuromodulated EMA write strength (cross-segment gradient via TBPTT).
   Fully differentiable — no hard selection anywhere.
 - **Compressed latent space**: EM operates in a learned D_mem latent space with projections in/out, not column-local.
 - **State**: em_K, em_V [BS, B, M, D_mem] — primitives are state, not parameters.
@@ -201,16 +196,7 @@ is a **vector** (D_col dimensions), not a scalar. This per-feature surprise driv
 use scalar surprise. Vector surprise lets the model know *which features* were
 unexpected, enabling selective, per-feature plasticity.
 
-### 3. Causal Write Buffers via Prefix Sums
-Within a segment, memory writes are cumulative-averaged so token t sees the running
-average of writes from tokens 0..t. This preserves strict NTP causality while giving
-within-segment memory feedback — the model can "learn and use" within a single segment.
-The cumulative mean (cumsum / position) keeps magnitude bounded regardless of N.
-
-**Why novel**: Most memory systems either batch writes at sequence boundaries (no
-within-sequence feedback) or violate causality. Cumulative-mean write buffers solve both.
-
-### 4. Neuromodulator-Gated Memory Writes Trained by Main Loss
+### 3. Neuromodulator-Gated Memory Writes Trained by Main Loss
 EM write gates (`g_em`) are produced by a small MLP that takes novelty and usage as
 input. Crucially, the neuromodulator is trained end-to-end by the **main CE loss** —
 gradient flows: write → primitive update → future trail reads → logits → loss.
@@ -219,30 +205,17 @@ No RL reward, no auxiliary objective, single optimizer.
 **Why novel**: Most gated-write systems use heuristics or auxiliary losses. End-to-end
 gradient through the write gate teaches the model *when writing helps prediction*.
 
-### 5. Dual-Path EM + Hebbian PM (Rich Fast Path + Slow Decomposition)
-EM uses two write paths with a shared per-token neuromodulator; PM uses a single
-Hebbian path:
-- **EM fast path**: `cum_em = cummean((g_em_t * novelty).sum(B) * w_cand)` — per-token
-  neuromodulator `g_em_t = MLP(novelty, usage)` gates write candidates before
-  cumulative-averaging for causal within-segment feedback. Token t sees the running
-  average of neuromodulated writes from positions 0..t (bounded regardless of N). Same-segment gradient flows to the
-  neuromodulator MLP, teaching it when writes help prediction.
-- **EM slow path**: At segment end, write candidates decomposed across existing
-  primitives via soft routing. Segment-level gate `g_em = mean(g_em_t)` reuses
-  per-token gates for neuromodulated EMA write strength.
-- **PM Hebbian path**: Single commit at segment end — eligibility G accumulates across
-  the segment, then `W_b ← W_b @ (decay·I + β_b·G)`. Matches the slower timescale of
-  procedural learning (habits need reinforcement across many segments, not immediate feedback).
+### 4. Separate Hebbian PM + Neuromodulated EM
+Two memory systems with distinct update rules:
+- **PM (Hebbian)**: Surprise-gated autocorrelation. `W_b ← W_b @ (decay·I + β_b·G)`.
+  Reinforces co-occurring patterns. Multiple timescales via per-bank plasticity β_b.
+- **EM (neuromodulated decomposition)**: Write candidates decomposed across primitives
+  via full softmax routing. Segment-level neuromodulator `g_em = MLP(mean_novelty, usage)`
+  controls write strength. Gradient flows cross-segment: commit → em_K/V → trail read → loss.
 
-The EM fast path provides within-segment gradient flow (including to the neuromodulator)
-and learned write selectivity; the slow paths build durable, structured memory
-representations.
-
-**Why novel**: No other model uses a shared neuromodulator across within-segment
-cumulative-averaged writes and structured cross-segment commits, while separately using
-Hebbian fast-weight plasticity for procedural memory. The fast path's neuromodulator
-receives same-segment gradient (via CE loss → Stage 3 → cum_em → g_em_t → MLP),
-teaching write selectivity without RL or auxiliary losses.
+**Why novel**: Combining Hebbian fast-weight plasticity for procedural habits with
+neuromodulated primitive decomposition for episodic storage, both trained end-to-end
+by the main CE loss through cross-segment TBPTT.
 
 ---
 
@@ -298,23 +271,20 @@ model, not an optimization. Grouped by category:
 ### Causality and Compute
 8. **Causal token processing**: Scan recurrence ensures token t cannot see token t+1.
    Autoregressive (NTP), not bidirectional.
-9. **Causal write buffers**: Cumulative means of per-token memory deltas. Token t's
-   memory read includes the running average of writes from 0..t (inclusive). Strict NTP
-   causality within segments, bounded magnitude regardless of N.
-10. **Write-before-read ordering**: Within a segment, PM/EM writes are computed before
-    reads — the causal buffer ensures reads reflect all prior writes.
+9. **Segment-end commits**: Memory writes happen once at segment end. Reads use
+   frozen segment-start state. This ensures strict causal ordering across segments.
 
 ### Plasticity Control
-11. **Budget enforcement**: PM norm budgets and EM strength budgets prevent unbounded
+10. **Budget enforcement**: PM norm budgets and EM strength budgets prevent unbounded
     drift. Memory stays bounded regardless of deployment duration.
-12. **Vector surprise**: Per-feature prediction error (D_col dimensions), not scalar.
+11. **Vector surprise**: Per-feature prediction error (D_col dimensions), not scalar.
     Enables selective, per-feature plasticity — only surprising features trigger updates.
 
 ## Negotiable — Implementation Details
 
 - Architecture dimensions (D, B, C, M, D_embed, d_inner)
 - Segment length N (= memory update interval)
-- Number of scan layers per stage, scan depth asymmetry
+- Total scan layers L_total, memory injection point L_mem
 - Trail steps count, number of banks
 - Hyperparameters (decay rates, temperatures, budgets, learning rates)
 - Norm type (RMSNorm vs LayerNorm), activation functions

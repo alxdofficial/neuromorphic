@@ -79,7 +79,7 @@ def main():
     print(f"Peak VRAM during training: {vram_peak:.2f} GB")
     print(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
     print(f"Config: D={config.D}, D_embed={config.D_embed}, C={config.C}, "
-          f"L_scan={config.L_scan}, B={config.B}, T={config.T}")
+          f"L_total={config.L_total}, L_mem={config.L_mem}, B={config.B}, T={config.T}")
 
     # PyTorch profiler
     print(f"\nRunning PyTorch profiler ({args.steps} steps)...")

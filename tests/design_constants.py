@@ -1,4 +1,4 @@
-"""Design-specific expected values (v5) — the ONE file to update when the design changes.
+"""Design-specific expected values (v6) — the ONE file to update when the design changes.
 
 If a design test fails, look here first. If the design changed intentionally,
 update this file. If not, the code has a regression.
@@ -7,8 +7,8 @@ update this file. If not, the code has a regression.
 # ---------------------------------------------------------------------------
 # Tier defaults (from ModelConfig.tier_a/b classmethods)
 # ---------------------------------------------------------------------------
-TIER_A = dict(D=2048, D_embed=384, B=4, C=16, L_scan=6, M=384, scan_expansion=8, d_inner=1024)
-TIER_B = dict(D=3072, D_embed=512, B=12, C=16, L_scan=16, M=512, scan_expansion=4, d_inner=768)
+TIER_A = dict(D=2048, D_embed=768, B=4, C=16, L_total=10, L_mem=5, M=384, scan_expansion=8, d_inner=1024)
+TIER_B = dict(D=3072, D_embed=1024, B=6, C=16, L_total=20, L_mem=10, M=512, scan_expansion=4, d_inner=1024)
 
 # ---------------------------------------------------------------------------
 # Default hyperparameters (from ModelConfig dataclass defaults)
@@ -23,12 +23,13 @@ DEFAULTS = dict(
     S_max=3.0,
     budget_em=8.0,
     decay_em=0.999,
+    em_topk=0,
     g_em_floor=0.001,
     g_em_ceil=0.95,
     # Training
     N=512,
-    K_segments=1,
-    use_compile=False,
+    K_segments=2,
+    use_compile=True,
     # Regularization
     dropout=0.1,
     tie_embeddings=True,

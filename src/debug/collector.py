@@ -132,7 +132,7 @@ class MetricsCollector:
         record["em_nonzero"] = (em_S > 0.01).float().mean().item()
 
     def _collect_memory_write_stats(self, record: dict):
-        """Read memory write diagnostics saved by model._memory_ops.
+        """Read memory write diagnostics saved by forward_segment.
 
         These are snapshot values from the last segment in the TBPTT chunk:
         - em_novelty_mean: mean novelty across all tokens/banks
@@ -225,23 +225,20 @@ class MetricsCollector:
     def _collect_grad_norms(self, record: dict):
         """Per-module gradient norms after backward.
 
-        v6 structure: embedding, lm_head, per-layer stage1/stage3, pm, em,
-        em_neuromod, W_seed_w, pcm, W_nov.
+        v6 structure: embedding, lm_head, per-layer scan layers, pm, em,
+        em_neuromod, W_seed_w, pcm.
         """
         module_groups = {
             "embedding": [self.model.embedding],
             "lm_head": [self.model.lm_head],
         }
-        # Per-layer stage1/stage3 for depth-resolved diagnostics
-        for i, layer in enumerate(self.model.stage1):
-            module_groups[f"stage1_L{i}"] = [layer]
-        for i, layer in enumerate(self.model.stage3):
-            module_groups[f"stage3_L{i}"] = [layer]
+        # Per-layer scan layers for depth-resolved diagnostics
+        for i, layer in enumerate(self.model.layers):
+            module_groups[f"layer_L{i}"] = [layer]
         if self.model.proj_up is not None:
             module_groups["proj_up"] = [self.model.proj_up]
             module_groups["proj_down"] = [self.model.proj_down]
         module_groups["W_seed_w"] = [self.model.W_seed_w]
-        module_groups["W_nov"] = [self.model.W_nov]
         if self.model.pcm is not None:
             module_groups["pcm"] = [self.model.pcm]
         if self.config.pm_enabled:

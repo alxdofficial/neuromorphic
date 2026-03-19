@@ -242,7 +242,7 @@ def main():
     param_count = sum(p.numel() for p in model_tmp.parameters() if p.requires_grad)
     print(f"Parameters: {param_count:,} ({param_count/1e6:.1f}M)", flush=True)
     print(f"Config: D={config.D}, D_embed={config.D_embed}, B={config.B}, "
-          f"C={config.C}, L_scan={config.L_scan}, M={config.M}", flush=True)
+          f"C={config.C}, L_total={config.L_total}, L_mem={config.L_mem}, M={config.M}", flush=True)
     del model_tmp
     gc.collect()
     torch.cuda.empty_cache()

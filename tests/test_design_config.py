@@ -26,9 +26,9 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="N"):
             make_tiny_config(N=0)
 
-    def test_invalid_L_scan(self):
-        with pytest.raises(ValueError, match="L_scan"):
-            make_tiny_config(L_scan=0)
+    def test_invalid_L_total(self):
+        with pytest.raises(ValueError, match="L_total"):
+            make_tiny_config(L_total=0)
 
     def test_invalid_scan_expansion(self):
         with pytest.raises(ValueError, match="scan_expansion"):
@@ -79,7 +79,8 @@ class TestTierPresets:
         assert cfg.B == 4
         assert cfg.C == 16
         assert cfg.D_col == 128  # D=2048 // C=16
-        assert cfg.L_scan == 6
+        assert cfg.L_total == 10
+        assert cfg.L_mem == 5
         assert cfg.scan_expansion == 8
         assert cfg.d_inner == 1024
 
@@ -90,7 +91,8 @@ class TestTierPresets:
         assert cfg.D_embed == 1024
         assert cfg.B == 6
         assert cfg.C == 16
-        assert cfg.L_scan == 12
+        assert cfg.L_total == 20
+        assert cfg.L_mem == 10
         assert cfg.d_inner == 1024
 
     def test_tier_c(self):
@@ -100,7 +102,8 @@ class TestTierPresets:
         assert cfg.D_embed == 2048
         assert cfg.B == 8
         assert cfg.C == 16
-        assert cfg.L_scan == 16
+        assert cfg.L_total == 28
+        assert cfg.L_mem == 14
         assert cfg.d_inner == 2048
 
     def test_tier_tiny(self):
@@ -109,13 +112,15 @@ class TestTierPresets:
         assert cfg.D == 64
         assert cfg.B == 2
         assert cfg.C == 2
-        assert cfg.L_scan == 2
+        assert cfg.L_total == 4
+        assert cfg.L_mem == 2
         assert cfg.d_inner == 64
 
     def test_tier_overrides(self):
-        cfg = ModelConfig.tier_a(L_scan=8, N=256)
+        cfg = ModelConfig.tier_a(L_total=12, L_mem=6, N=256)
         cfg.validate()
-        assert cfg.L_scan == 8
+        assert cfg.L_total == 12
+        assert cfg.L_mem == 6
         assert cfg.N == 256
 
 

@@ -1,18 +1,19 @@
 """
-NeuromorphicLM (v5.1) — scan-memory-scan, dense scan + grouped PCM.
+NeuromorphicLM (v7) — single scan stack, dense scan + grouped PCM.
 
-Three-stage cycle per segment of N tokens:
-  Stage 1: Fast causal scan (dense nn.Linear projections)
-  Stage 2: Memory ops (write-before-read with causal prefix sums)
-  Stage 3: Integration scan (dense, integrating memory reads)
+Single scan stack per segment of N tokens:
+  layers[0..L_mem-1]: build representation (H)
+  PCM: compute surprise; W_seed_w: produce seed + w_cand
+  PM read + EM trail read → additive injection
+  layers[L_mem..L_total-1]: integrate with memory context
+  output head → logits
 
+Memory commits happen once at segment end (no within-segment writes).
 Scan layers are fully dense for GPU efficiency. PCM and W_seed_w remain
 grouped (per-feature-group) via free .view() reshaping between [BS,N,D]
 and [BS,N,C,D_col].
 NTP training — causal scans are inherently autoregressive.
 """
-
-import math
 
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ from .utils import runtime_state_dtype
 
 
 class NeuromorphicLM(nn.Module):
-    """v5: Scan-memory-scan with cortical columns."""
+    """v7: Single scan stack with memory injection at L_mem."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -41,7 +42,7 @@ class NeuromorphicLM(nn.Module):
         D = config.D
         D_col = config.D_col
         D_embed = config.D_embed
-        L = config.L_scan
+        L_total = config.L_total
         d_inner = config.d_inner
 
         # Embedding + position
@@ -54,12 +55,10 @@ class NeuromorphicLM(nn.Module):
             self.proj_down = None
         self.pos_embed = nn.Parameter(torch.randn(config.N, D) * 0.02)
 
-        # Stage 1: L_scan dense layers — [BS, N, D] throughout
-        L_s3 = config.L_scan_s3
-        n_total = L + L_s3  # depth scaling counts both stages
-        self.stage1 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
-                      glu_output=config.glu_output) for _ in range(L)
+        # Single scan stack: L_total dense layers — [BS, N, D] throughout
+        self.layers = nn.ModuleList([
+            ScanLayer(D, d_inner, config.dropout, n_layers=L_total,
+                      glu_output=config.glu_output) for _ in range(L_total)
         ])
 
         # Projections: grouped (per-feature-group seeds + write candidates)
@@ -71,12 +70,7 @@ class NeuromorphicLM(nn.Module):
         else:
             self.pcm = None
 
-        # Novelty blend weight: produces per-bank blend for surprise vs recon_error
-        self.W_nov = nn.Linear(D, B)
-        nn.init.zeros_(self.W_nov.weight)
-        nn.init.zeros_(self.W_nov.bias)
-
-        # Stage 2: Memory systems
+        # Memory systems
         self.pm = ProceduralMemory(B, D, config.D_pm, config.decay_pm)
         self.em = EpisodicMemory(
             B, config.M, D, config.n_trail_steps,
@@ -86,12 +80,6 @@ class NeuromorphicLM(nn.Module):
         self.em_neuromod = EMNeuromodulator(
             hidden=config.neuromod_hidden,
         )
-
-        # Stage 3: integration scan — may be shallower than stage 1
-        self.stage3 = nn.ModuleList([
-            ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
-                      glu_output=config.glu_output) for _ in range(L_s3)
-        ])
 
         # Output
         self.ln_final = nn.LayerNorm(D_embed)
@@ -103,7 +91,7 @@ class NeuromorphicLM(nn.Module):
         self, input_ids: Tensor, reset_mask: Tensor | None = None,
         commit: bool = True,
     ) -> tuple[Tensor, Tensor]:
-        """Process one N-token segment through the three-stage cycle.
+        """Process one N-token segment through single scan stack + memory.
 
         Args:
             input_ids: [BS, N]
@@ -122,25 +110,28 @@ class NeuromorphicLM(nn.Module):
         C = self.config.C
         D_col = self.config.D_col
         D = self.config.D
+        L_mem = self.config.L_mem
         device = input_ids.device
 
-        # --- Stage 1: Dense Scan — [BS, N, D] throughout ---
+        # --- Embedding ---
         x = self.embedding(input_ids)               # [BS, N, D_embed]
         if self.proj_up is not None:
             x = self.proj_up(x)                     # [BS, N, D]
         x = x + self.pos_embed[:N]                  # [BS, N, D]
 
+        # --- Pre-memory layers: layers[0..L_mem-1] ---
         H = x
-        for i, layer in enumerate(self.stage1):
-            carry = self._s1_carries[i] if hasattr(self, '_s1_carries') else None
+        for i in range(L_mem):
+            layer = self.layers[i]
+            carry = self._carries[i] if hasattr(self, '_carries') else None
             if self.config.gradient_checkpointing and self.training:
                 H, h_last = checkpoint(layer, H, carry, use_reentrant=False)
             else:
                 H, h_last = layer(H, carry)          # [BS, N, D]
-            if hasattr(self, '_s1_carries'):
-                self._s1_carries[i] = h_last
+            if hasattr(self, '_carries'):
+                self._carries[i] = h_last
 
-        # PCM: view as grouped for per-feature-group surprise
+        # --- PCM: view as grouped for per-feature-group surprise ---
         aux_loss = torch.tensor(0.0, device=device)
         if self.pcm is not None:
             H_col = H.view(BS, N, C, D_col)             # free view
@@ -153,54 +144,50 @@ class NeuromorphicLM(nn.Module):
         else:
             surprise = torch.zeros(BS, N, D, device=device, dtype=x.dtype)
 
-        # Projections — grouped (per-feature-group seeds + write candidates)
+        # --- Projections — grouped (per-feature-group seeds + write candidates) ---
         H_col = H.view(BS, N, C, D_col)                 # free view
         sw = self.W_seed_w(H_col)                        # [BS, N, C, 2*D_col]
         seed_col, w_col = sw.chunk(2, dim=-1)            # each [BS, N, C, D_col]
         seed = seed_col.reshape(BS, N, D)                # [BS, N, D]
         w_cand = w_col.reshape(BS, N, D)                 # [BS, N, D]
 
-        # --- Stage 2: Memory Ops (fused algebra — no [BS,N,B,D] tensors) ---
-        pm_read_sum, em_read_sum, cum_em_sum, novelty, g_em_t = self._memory_ops(
-            H, seed, w_cand, surprise, commit=commit
-        )
+        # --- Memory reads (read-only, no within-segment writes) ---
+        pm_read_sum, em_read_sum, pm_pre = self._memory_reads(H, seed)
 
-        # Debug: activation + memory write diagnostics
-        # Collected here (outside _memory_ops) because torch.compile graph-breaks
-        # at commit boundaries — this section runs in eager mode reliably.
+        # Debug: activation + memory diagnostics
         if self.training and torch.is_grad_enabled() and not torch.compiler.is_compiling():
             with torch.no_grad():
                 self._dbg_act_norms = {
                     "H": H.norm().item(),
                     "pm": pm_read_sum.norm().item(),
                     "em": em_read_sum.norm().item(),
-                    "cum_em": cum_em_sum.norm().item(),
                 }
                 stats = {}
-                if novelty is not None:
-                    stats["em_novelty_mean"] = novelty.mean().item()
-                if g_em_t is not None:
-                    stats["em_g_em_mean"] = g_em_t.mean().item()
                 if self.config.pm_enabled:
                     s_gate = torch.sigmoid(surprise.norm(dim=-1))
                     stats["pm_surprise_gate_mean"] = s_gate.mean().item()
                 self._dbg_memory_stats = stats
 
-        # --- Stage 3: Dense Integration Scan — [BS, N, D] throughout ---
-        integrated = H + pm_read_sum + em_read_sum + cum_em_sum
-        H_prime = integrated
+        # --- Additive memory injection ---
+        H = H + pm_read_sum + em_read_sum
 
-        for i, layer in enumerate(self.stage3):
-            carry = self._s3_carries[i] if hasattr(self, '_s3_carries') else None
+        # --- Post-memory layers: layers[L_mem..L_total-1] ---
+        for i in range(L_mem, self.config.L_total):
+            layer = self.layers[i]
+            carry = self._carries[i] if hasattr(self, '_carries') else None
             if self.config.gradient_checkpointing and self.training:
-                H_prime, h_last = checkpoint(layer, H_prime, carry, use_reentrant=False)
+                H, h_last = checkpoint(layer, H, carry, use_reentrant=False)
             else:
-                H_prime, h_last = layer(H_prime, carry)  # [BS, N, D]
-            if hasattr(self, '_s3_carries'):
-                self._s3_carries[i] = h_last
+                H, h_last = layer(H, carry)          # [BS, N, D]
+            if hasattr(self, '_carries'):
+                self._carries[i] = h_last
 
-        # Output
-        out = H_prime
+        # --- Segment-end memory commits ---
+        if commit:
+            self._memory_commits(pm_pre, surprise, w_cand)
+
+        # --- Output ---
+        out = H
         if self.proj_down is not None:
             out = self.proj_down(out)                # [BS, N, D_embed]
         out = self.ln_final(out)
@@ -210,85 +197,80 @@ class NeuromorphicLM(nn.Module):
 
         return logits, aux_loss
 
-    def _memory_ops(
-        self, H_flat: Tensor, seed: Tensor, w_cand: Tensor, surprise: Tensor,
-        commit: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
-        """Stage 2: Memory read/write operations.
-
-        PM: Hebbian fast-weight read (bank-summed).
-        EM: Rich fast path — per-token neuromodulated correction, prefix-summed.
-            Mirrors slow path logic: g_t * (w_cand - reconstruction) captures
-            what's truly novel, weighted by learned write gate.
+    def _memory_reads(
+        self, H: Tensor, seed: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """Read-only memory operations at the injection point.
 
         Args:
-            H_flat: [BS, N, D] — column states (flat)
+            H: [BS, N, D] — representation after pre-memory layers
             seed: [BS, N, D] — EM trail seeds
-            w_cand: [BS, N, D] — write candidates
-            surprise: [BS, N, D] — vector surprise
-            commit: whether to commit memory updates at segment end
 
         Returns:
             pm_read_sum: [BS, N, D] — PM fast-weight read, bank-summed
             em_read_sum: [BS, N, D] — EM trail reads, summed over B
-            cum_em_sum:  [BS, N, D] — EM causal write buffers, summed over B
-            novelty: [BS, N, B] or None — novelty scores (for debug)
-            g_em_t: [BS, N, B] or None — per-token write gates (for debug)
+            pm_pre: [BS, N, D_pm] or None — PM pre-activations (for commit)
         """
-        BS, N, D = H_flat.shape
-        B = self.config.B
+        BS, N, D = H.shape
 
-        # 1. PM: Hebbian fast-weight read (bank-summed via W.sum(B))
+        # PM: Hebbian fast-weight read (bank-summed via W.sum(B))
         if self.config.pm_enabled:
-            pm_read_sum, pm_pre = self.pm.read(H_flat)                # [BS, N, D], [BS, N, D_pm]
+            pm_read_sum, pm_pre = self.pm.read(H)        # [BS, N, D], [BS, N, D_pm]
         else:
-            pm_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
+            pm_read_sum = torch.zeros(BS, N, D, device=H.device, dtype=H.dtype)
             pm_pre = None
 
-        # 2. EM novelty + per-token neuromodulator
+        # EM trail read (returns [BS, N, D] — summed over B internally)
         if self.config.em_enabled:
-            w_nov = torch.sigmoid(self.W_nov(H_flat))                 # [BS, N, B]
-            novelty = self.em.compute_novelty_all(
-                w_cand, surprise, w_nov=w_nov,
-            )                                                          # [BS, N, B]
-
-            # Per-token neuromodulator: g_em_t[t] = MLP(novelty[t], usage)
-            usage = self.em.usage_all()                                # [BS, B]
-            usage_t = usage.unsqueeze(1).expand(BS, N, B)              # [BS, N, B]
-            g_em_t = self.em_neuromod(novelty, usage_t)                # [BS, N, B]
-
-            # Neuromodulated write buffer: per-token gate × novelty × w_cand
-            #   Old: cumsum(novelty.sum(B) * w_cand) — no learned gating
-            #   New: cumsum((g_t * novelty).sum(B) * w_cand) — neuromod per-token
-            #   g_em_t learns when to amplify/suppress writes from (novelty, usage)
-            gated_nov = (g_em_t * novelty).sum(dim=2, keepdim=True)    # [BS, N, 1]
-            cum_em_sum = torch.cumsum(gated_nov * w_cand, dim=1) / torch.arange(
-                1, N + 1, device=H_flat.device, dtype=H_flat.dtype
-            ).view(1, N, 1)                                              # [BS, N, D]
+            em_read_sum = self.em.trail_read_all(seed)    # [BS, N, D]
         else:
-            novelty = None
-            cum_em_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
-            g_em_t = None
+            em_read_sum = torch.zeros(BS, N, D, device=H.device, dtype=H.dtype)
 
-        # 3. EM trail read (returns [BS, N, D] — summed over B internally)
+        return pm_read_sum, em_read_sum, pm_pre
+
+    def _memory_commits(
+        self, pm_pre: Tensor | None, surprise: Tensor, w_cand: Tensor,
+    ):
+        """Segment-end memory commits (PM Hebbian + EM neuromodulated).
+
+        Args:
+            pm_pre: [BS, N, D_pm] or None — PM pre-activations
+            surprise: [BS, N, D] — vector surprise from PCM
+            w_cand: [BS, N, D] — write candidates
+        """
+        # PM commit: Hebbian update
+        if self.config.pm_enabled and pm_pre is not None:
+            self.pm.commit(pm_pre, surprise, budget=self.config.budget_pm)
+
+        # EM commit: novelty from surprise norm, neuromodulator at segment level
         if self.config.em_enabled:
-            em_read_sum = self.em.trail_read_all(seed)                # [BS, N, D]
-        else:
-            em_read_sum = torch.zeros(BS, N, D, device=H_flat.device, dtype=H_flat.dtype)
+            BS = w_cand.shape[0]
+            B = self.config.B
 
-        # 4. Segment-end commits — skipped for commit=False (inference)
-        if commit:
-            if self.config.pm_enabled and pm_pre is not None:
-                self.pm.commit(pm_pre, surprise, budget=self.config.budget_pm)
+            # Novelty = write candidate energy + surprise magnitude
+            # w_cand.norm() ensures non-zero writes even without PCM (surprise=0)
+            # surprise.norm() adds discriminative gating when PCM is active
+            novelty = (w_cand.norm(dim=-1, keepdim=True)
+                       + surprise.norm(dim=-1, keepdim=True)).expand(BS, -1, B)  # [BS, N, B]
 
-            if self.config.em_enabled and g_em_t is not None:
-                # Decay existing strengths before adding new writes
-                self.em.base_decay()
-                # Segment-level gate: mean of per-token gates
-                g_em = g_em_t.mean(dim=1)                              # [BS, B]
-                self.em.commit_all(w_cand, novelty, g_em)
+            # Decay existing strengths before computing usage — ensures
+            # raw_decay gets gradient through: decay → em_S → usage → neuromod → g_em → alpha → em_K/V
+            self.em.base_decay()
 
-        return pm_read_sum, em_read_sum, cum_em_sum, novelty, g_em_t
+            # Segment-level neuromodulator: mean novelty + usage → g_em [BS, B]
+            mean_novelty = novelty.mean(dim=1)                    # [BS, B]
+            usage = self.em.usage_all()                            # [BS, B]
+            g_em = self.em_neuromod(mean_novelty, usage)           # [BS, B]
+
+            # Debug stats
+            if self.training and torch.is_grad_enabled() and not torch.compiler.is_compiling():
+                with torch.no_grad():
+                    if not hasattr(self, '_dbg_memory_stats'):
+                        self._dbg_memory_stats = {}
+                    self._dbg_memory_stats["em_novelty_mean"] = novelty.mean().item()
+                    self._dbg_memory_stats["em_g_em_mean"] = g_em.mean().item()
+
+            self.em.commit_all(w_cand, novelty, g_em)
 
     # ------------------------------------------------------------------
     # State management
@@ -299,30 +281,25 @@ class NeuromorphicLM(nn.Module):
         if not self.config.lifelong_mode:
             self.pm.reset_states(mask)
             self.em.reset_states(mask)
-            if hasattr(self, '_s1_carries'):
+            if hasattr(self, '_carries'):
                 mask_f = (~mask).to(dtype=torch.float32).unsqueeze(-1)  # [BS, 1]
-                for i, h in enumerate(self._s1_carries):
+                for i, h in enumerate(self._carries):
                     if h is not None:
-                        self._s1_carries[i] = h * mask_f
-                for i, h in enumerate(self._s3_carries):
-                    if h is not None:
-                        self._s3_carries[i] = h * mask_f
+                        self._carries[i] = h * mask_f
 
     def initialize_states(self, BS: int, device: torch.device):
         """Pre-allocate runtime state tensors."""
         dtype = runtime_state_dtype(device)
         self.pm.initialize(BS, device, dtype)
         self.em.initialize(BS, device, dtype)
-        self._s1_carries = [None] * len(self.stage1)
-        self._s3_carries = [None] * len(self.stage3)
+        self._carries = [None] * len(self.layers)
 
     def detach_states(self):
         """TBPTT boundary: detach all PM/EM and scan carry state."""
         self.pm.detach_states()
         self.em.detach_states()
-        if hasattr(self, '_s1_carries'):
-            self._s1_carries = [h.detach() if h is not None else None for h in self._s1_carries]
-            self._s3_carries = [h.detach() if h is not None else None for h in self._s3_carries]
+        if hasattr(self, '_carries'):
+            self._carries = [h.detach() if h is not None else None for h in self._carries]
 
     def param_count(self) -> int:
         """Total trainable parameters."""

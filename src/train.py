@@ -35,8 +35,8 @@ from .debug import MetricsCollector
 # ============================================================================
 
 # -- Model tier --
-TIER = "a"          # D=2048, D_embed=384, C=16, L_scan=6, exp=8, B=4, M=384
-# TIER = "b"        # D=3072, D_embed=512, C=16, L_scan=12, B=6, d_inner=1024 (~251M)
+TIER = "a"          # D=2048, D_embed=768, C=16, L_total=10, L_mem=5, exp=8, B=4, M=384
+# TIER = "b"        # D=3072, D_embed=1024, C=16, L_total=20, L_mem=10, B=6, d_inner=1024 (~251M)
 
 # -- Training phase --
 PHASE = "A"         # PM + EM + PCM (all systems)
@@ -52,14 +52,14 @@ TOKENIZER = "tinyllama"
 # TOKENIZER = "smollm"
 
 # -- Batch size (persistent streams) --
-BS = 16             # Tier A: K_segments=4, grad_ckpt — same tok/step as K=8 BS=8, better GPU util
+BS = 16             # Tier A: K_segments=16, N=128, grad_ckpt
 # BS = 6            # Tier B default
 # BS = 4            # Tier C default
 
 # -- Memory horizon --
-K_SEGMENTS = 4      # TBPTT chunk = K_segments * N tokens (4 × 512 = 2048)
-                    # 2048-token gradient horizon for PM/EM neuromodulators; fits larger BS than K=8
-GRADIENT_CHECKPOINTING = True  # halves scan activation memory; enables K_segments=8
+K_SEGMENTS = 16     # TBPTT chunk = K_segments * N tokens (16 × 128 = 2048)
+                    # 2048-token gradient horizon for PM/EM neuromodulators
+GRADIENT_CHECKPOINTING = True  # halves scan activation memory
 
 # -- Seeds --
 TRAIN_SEED = 42
@@ -75,7 +75,7 @@ MAX_STEPS = None            # absolute step target; e.g. 5000
 MAX_TOKENS = None           # token budget; converted via BS*T
 USE_PHASE_DEFAULT_STEPS = True
 PHASE_DEFAULT_STEPS = {
-    "A": 30_517,            # 1.5B tokens @ BS=24, K_segments=4, N=512 (49,152 tok/step)
+    "A": 30_517,            # 1.5B tokens @ BS=16, K_segments=16, N=128 (32,768 tok/step)
     "B": 15_258,            # 750M tokens — same budget, lifelong mode
 }
 # Phase A: PM/EM reset at doc boundaries — memory systems learn basic function
@@ -587,7 +587,7 @@ def run_phase(
     target_tokens = max_steps_total * tokens_per_step
 
     print(f"Tier: {tier.upper()} | Phase: {phase_name} | "
-          f"D={config.D}, B={config.B}, C={config.C}, D_col={config.D_col}, L_scan={config.L_scan}")
+          f"D={config.D}, B={config.B}, C={config.C}, D_col={config.D_col}, L_total={config.L_total}, L_mem={config.L_mem}")
     print(f"BS={bs}, T={config.T}, N={config.N}, K_segments={config.K_segments}")
     print(f"PM={config.pm_enabled}, EM={config.em_enabled}")
     print(
@@ -686,7 +686,7 @@ def run_phase(
             "pm_enabled", "em_enabled",
             # Architecture
             "D", "B", "C", "D_col", "D_embed",
-            "L_scan", "scan_expansion",
+            "L_total", "L_mem", "scan_expansion",
             # Memory dimensions
             "M", "n_trail_steps",
             # Lifelong mode

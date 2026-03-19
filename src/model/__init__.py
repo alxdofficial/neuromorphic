@@ -1,4 +1,4 @@
-# Neuromorphic LM model architecture (v5 — scan-memory-scan)
+# Neuromorphic LM model architecture (v7 — single scan stack)
 from .config import ModelConfig
 from .model import NeuromorphicLM
 from .state import detach_all, reset_all, save_runtime_state, load_runtime_state

@@ -1,4 +1,4 @@
-# Training utilities for neuromorphic LM (v5 — NTP only)
+# Training utilities for neuromorphic LM (v7 — NTP only)
 from .trainer import TBPTTTrainer
 from .loss import online_cross_entropy, compute_regularizers
 from .validation import evaluate_validation

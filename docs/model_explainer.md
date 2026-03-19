@@ -12,17 +12,17 @@ maintains separate memory structures that persist indefinitely across the input
 stream.
 
 ```
-               ┌──────────────────────────────────────────────┐
-Tokens ──► Embed ──► Stage 1 Scan ──► PCM ──► Memory Ops ──► Stage 3 Scan ──► Logits
-               │       (encode)      (surprise)  (PM+EM read)  (integrate)      │
-               └──────────────────────────────────────────────┘
-                                                  │
-                                        at segment end:
-                                        PM commit (Hebbian)
-                                        EM commit (neuromod EMA)
+               ┌──────────────────────────────────────────────────────┐
+Tokens ──► Embed ──► Pre-Memory Scan ──► PCM ──► Memory Reads ──► Post-Memory Scan ──► Logits
+               │      (layers 0..4)    (surprise) (PM+EM read)    (layers 5..9)         │
+               └──────────────────────────────────────────────────────┘
+                                                    │
+                                          at segment end:
+                                          PM commit (Hebbian)
+                                          EM commit (neuromod EMA)
 ```
 
-The model processes text in fixed segments of N=512 tokens. Within each segment,
+The model processes text in fixed segments of N=128 tokens. Within each segment,
 everything is causal (token t never sees token t+1). At the end of each segment,
 memory systems update their persistent state based on what was seen. This state
 then influences the next segment's processing.
@@ -53,9 +53,9 @@ For Tier A: `D_embed=768`, projected up to `D=2048` (wide internal
 representation). The same embedding table is reused as the output layer
 (tied embeddings).
 
-### 2. Stage 1: Causal Scan (Encoding)
+### 2. Pre-Memory Layers (layers 0 through L_mem-1)
 
-Six scan layers process the sequence. Each layer applies a causal linear
+Five scan layers process the sequence. Each layer applies a causal linear
 recurrence — a lightweight alternative to attention:
 
 ```
@@ -80,7 +80,7 @@ return out + x                       # residual
 The SwiGLU output gate lets each layer perform nonlinear feature mixing on the
 scan output before adding it back to the residual stream.
 
-After six layers, `H [BS, N, D]` is a contextual encoding where each position
+After five layers, `H [BS, N, D]` is a contextual encoding where each position
 has accumulated information from all preceding tokens in the segment.
 
 On GPU, the scan dispatches to a fused Triton kernel (from the FLA library)
@@ -88,8 +88,8 @@ that computes the entire recurrence in a single pass.
 
 ### 3. PCM: Predictive Coding (Surprise Computation)
 
-Before entering memory operations, the model computes *surprise* — how much
-each token deviates from what the scan state predicted.
+Before memory injection, the model computes *surprise* — how much each token
+deviates from what the scan state predicted.
 
 The D-dimensional hidden state is viewed as C=16 independent "cortical columns"
 of D_col=128 dimensions each (a free reshape, no computation). Within each
@@ -117,9 +117,9 @@ Well-predicted tokens are slightly suppressed; surprising tokens are amplified.
 PCM also contributes an auxiliary loss (MSE between prediction and reality) that
 trains the scan layers to be better predictors.
 
-### 4. Stage 2: Memory Operations
+### 4. Memory Injection
 
-Three signals are computed from the encoded tokens and fed to Stage 3:
+Two signals are read from memory and added to the representation:
 
 #### PM Read (Procedural Memory)
 
@@ -159,42 +159,33 @@ This is more expressive than a single attention lookup — the trail can compose
 information from multiple primitives by visiting them in sequence, building up
 a composite retrieval.
 
-#### EM Write Buffer (Causal Cumulative Mean)
-
-The model also computes a running average of what's been novel so far in the
-segment:
+#### Additive Injection
 
 ```
-cum_em_t = (1/t) · Σ_{s=1}^{t} (gate_s · novelty_s · w_cand_s)
+H = H + pm_read + em_trail_read
 ```
 
-This gives the integration scan real-time awareness of novel content, without
-waiting for the segment-end commit. The division by position keeps it bounded.
+The enriched representation then flows into the post-memory layers.
 
-**Novelty** combines two signals: PCM surprise magnitude (how unexpected was
-this token?) and EM reconstruction error (how poorly can existing primitives
-reproduce this content?). A learned blend weight `W_nov` balances these two
-components.
+### 5. Post-Memory Layers (layers L_mem through L_total-1)
 
-A **neuromodulator** MLP takes (novelty, memory usage) and outputs a per-token
-write gate `g_em ∈ [0.001, 0.95]`. This solves the resource allocation problem:
-when memory is nearly full or content isn't novel, suppress writes. When
-something genuinely new appears and capacity is available, amplify writes.
+Five more scan layers process the memory-enriched signal. Their job is to
+integrate long-term knowledge (EM trail), habitual patterns (PM read), and
+the baseline encoding (H) into a coherent representation for prediction.
 
-### 5. Stage 3: Integration Scan
+### 6. Segment-End Commits
 
-Four signals are combined additively at each token position:
+After logits are computed, memory state is updated once for the entire segment:
 
-```
-integrated = H + pm_read + em_trail_read + cum_em_write_buffer
-```
+**PM commit:** Surprise-gated Hebbian update — features that co-activated during
+surprising events have their associations reinforced in the fast-weight matrix.
 
-Then six more scan layers process this combined signal. Stage 3's job is to
-integrate long-term knowledge (EM), habitual patterns (PM), within-segment
-novelty (write buffer), and the baseline encoding (H) into a coherent
-representation for prediction.
+**EM commit:** Write candidates are decomposed across primitives via soft routing,
+weighted by novelty (`w_cand.norm() + surprise.norm()`). A neuromodulator MLP
+takes `(mean_novelty, usage)` and produces a per-bank write gate `g_em`. This
+controls how strongly new content overwrites existing primitives.
 
-### 6. Output
+### 7. Output
 
 ```
 out    = proj_down(H_prime)     # D=2048 → D_embed=768
@@ -226,24 +217,16 @@ backpropagation.
 2. Build gated autocorrelation matrix:
    `G = (1/N) · Σ_t s_t · pre_t ⊗ pre_t^T`
 
-   This captures which input dimensions co-activate during surprising events.
-   Implemented efficiently as a single batched outer product:
-   `G = (√s · pre)^T @ (√s · pre) / N`.
-
 3. Update via right-multiply:
    `W_b = W_b @ (decay · I + β_b · G)`
+   Each bank has its own plasticity rate β_b. Fast banks adapt quickly;
+   slow banks encode deeper habits.
 
-   Each bank has its own plasticity rate β_b (learned, always positive via
-   softplus). Fast banks adapt quickly to recent patterns; slow banks encode
-   deeper habits. The decay (0.999) ensures old associations gradually fade.
-
-4. Budget enforcement: clip Frobenius norm of each bank's matrix to prevent
-   unbounded growth.
+4. Budget enforcement: clip Frobenius norm to prevent unbounded growth.
 
 **Why banks matter.** All banks are summed at read time, so they jointly produce
 one output. But because they update at different rates, they capture patterns at
-different timescales. Bank 1 might rapidly track the current paragraph's style
-while Bank 4 slowly accumulates document-level patterns.
+different timescales.
 
 ### Episodic Memory (EM)
 
@@ -252,32 +235,28 @@ Keys `em_K [BS, B, M, D_mem]` encode *what* was stored (unit-normalized directio
 vectors). Values `em_V [BS, B, M, D_mem]` encode the *content*. Strengths
 `em_S [BS, B, M]` track how established each primitive is.
 
-**How it reads.** Trail navigation (described above) — an iterative attention
-process that composes multiple primitives into a single retrieval. EM operates
-in a compressed latent space of D_mem=512 dimensions (for Tier A). Inputs are
-projected from D into D_mem before trail navigation, and the result is projected
-back to D afterward. This latent compression reduces EM state size while
-preserving retrieval quality. The trail approach lets the model build complex
-responses from simple stored parts.
+**How it reads.** Trail navigation — an iterative attention process that composes
+multiple primitives into a single retrieval. EM operates in a compressed latent
+space of D_mem=512 dimensions (for Tier A).
 
 **How it writes (segment-end commit).**
 
-1. Soft-route the segment's write candidates to primitives via attention.
-2. Aggregate routes weighted by per-token novelty.
-3. Update via neuromodulated EMA:
+1. Compute novelty: `w_cand.norm() + surprise.norm()` per token.
+2. Soft-route write candidates to primitives via full softmax attention.
+3. Aggregate routes weighted by per-token novelty.
+4. Neuromodulator produces segment-level gate: `g_em = MLP(mean_novelty, usage)`.
+5. Update via neuromodulated EMA:
    ```
    α = clamp(g_em · route_aggregate)
    em_K = (1 - α) · em_K + α · normalize(new_key)
    em_V = (1 - α) · em_V + α · new_value
    em_S = clamp(em_S + α, max=S_max)
    ```
-4. Between commits: `em_S *= 0.999` (base decay). Primitives that are never
+6. Between commits: `em_S *= decay` (base decay). Primitives that are never
    refreshed gradually decay and become available for reuse.
 
 **Key design choice:** EM reads use the state from *before* the current segment
-(frozen). Writes happen after. This ensures causal ordering: you retrieve based
-on what you knew before seeing the current segment, then update memory with what
-you just learned.
+(frozen). Writes happen after. This ensures causal ordering.
 
 ### Predictive Coding Module (PCM)
 
@@ -285,24 +264,11 @@ you just learned.
 It doesn't store anything — it generates a real-time surprise signal that drives
 the other two memory systems.
 
-**The prediction loop:**
-```
-At time t, the scan state H_t reflects tokens 0..t.
-PCM predicts: "given what I've seen through t, token t+1's encoding should be z_hat_t"
-At time t+1: actual encoding is z_{t+1}
-Surprise = z_hat_t - z_{t+1}   (vector, 128 dims per column)
-```
-
 **What surprise does:**
 - Modulates scan output via learned gain (amplify surprising tokens)
 - Gates PM Hebbian plasticity (surprise magnitude → sigmoid → write strength)
-- Contributes to EM novelty (blended with reconstruction error)
+- Contributes to EM novelty (added to write candidate energy)
 - Provides auxiliary training loss (MSE) that improves predictive ability
-
-PCM operates on grouped "cortical columns" — 16 independent groups of 128
-dimensions. This means surprise is computed per feature group, not globally.
-Different columns can be surprised by different aspects of the input
-simultaneously.
 
 ---
 
@@ -312,14 +278,14 @@ simultaneously.
 
 The model trains on persistent streams — continuous concatenations of documents
 processed by BS=16 parallel reading heads. Each training step processes a TBPTT
-chunk of K=4 segments × N=512 tokens = 2048 tokens per stream.
+chunk of K=16 segments × N=128 tokens = 2048 tokens per stream.
 
 ```
 Chunk [2048 tokens]
-├── Segment 1 [512 tok]: forward → loss₁, PM/EM commit
-├── Segment 2 [512 tok]: forward → loss₂, PM/EM commit
-├── Segment 3 [512 tok]: forward → loss₃, PM/EM commit
-└── Segment 4 [512 tok]: forward → loss₄, PM/EM commit
+├── Segment  1 [128 tok]: forward → loss₁, PM/EM commit
+├── Segment  2 [128 tok]: forward → loss₂, PM/EM commit
+├── ...
+└── Segment 16 [128 tok]: forward → loss₁₆, PM/EM commit
                                      ↓
                               sum losses / valid_count
                               + regularizer × 0.1
@@ -329,8 +295,7 @@ Chunk [2048 tokens]
 
 Within a chunk, gradients flow through memory states across all K segments.
 At the TBPTT boundary, memory values are preserved but their gradient history is
-severed (`detach_()`). This limits the gradient horizon to K segments while
-allowing memory state to accumulate indefinitely.
+severed (`detach_()`).
 
 ### Loss Function
 
@@ -344,46 +309,38 @@ where:
   reg_weight      = 0.1
 ```
 
-EOT tokens are excluded from the CE loss to prevent the model from learning
-to predict across document boundaries.
-
 ### Document Boundaries
 
 When an `<|endoftext|>` token is detected at the start of a segment, PM and
-EM states are reset for that stream (in Phase A). This means each document gets
-fresh memory. In Phase B (lifelong mode), no reset occurs — memory accumulates
-across documents.
+EM states are reset for that stream (in Phase A). In Phase B (lifelong mode),
+no reset occurs — memory accumulates across documents.
 
 ### What Gets Optimized
 
 | Component | Parameters | Updated by |
 |-----------|-----------|------------|
 | Embedding + pos_embed | Token vectors, position bias | Backprop (every step) |
-| Scan layers (×12) | proj_in, proj_out, RMSNorm | Backprop (every step) |
+| Scan layers (×10) | proj_in, proj_out, RMSNorm | Backprop (every step) |
 | PCM | W_enc, W_pcm, W_gain | Backprop (every step) |
 | PM projections | proj_in, proj_out | Backprop (every step) |
 | PM plasticity rates | raw_beta (per bank) | Backprop (multi-segment chain) |
 | EM trail params | gate_alpha, gate_bias, tau, sigma, tau_w | Backprop (multi-segment chain) |
-| Neuromodulator | MLP weights | Backprop (every step) |
-| W_seed_w, W_nov | Grouped projections, novelty blend | Backprop (every step) |
+| Neuromodulator | MLP weights | Backprop (multi-segment chain) |
+| W_seed_w | Grouped projections | Backprop (multi-segment chain) |
 | **PM fast weights** | W_pm [BS, B, D_pm, D_pm] | **Hebbian commit** (not backprop) |
 | **EM primitives** | em_K, em_V, em_S | **Neuromodulated EMA commit** (not backprop) |
 
 The crucial distinction: PM and EM *states* (W_pm, em_K/V/S) are updated by
 their own learning rules (Hebbian correlation, EMA), not by the optimizer.
-Backprop trains the *parameters* that control these learning rules (plasticity
-rates, trail parameters, neuromodulator weights). The memory systems learn how
-to learn.
+Backprop trains the *parameters* that control these learning rules. The memory
+systems learn how to learn.
 
 ---
 
 ## Scale and Efficiency
 
-**Tier A (dev tier):** 133M parameters, 2048 internal width, 12 scan layers.
-
-On an RTX 4090: ~89K tok/s training throughput at BS=8 (T=2048) with `torch.compile`.
-The scan recurrence is O(N) per layer (vs O(N²) for attention), making it
-efficient on long segments.
+**Tier A (dev tier):** ~116M parameters, 2048 internal width, 10 scan layers
+(5 pre-memory + 5 post-memory), N=128 segments, K=16 TBPTT chunks.
 
 PM and EM are computationally negligible — PM read is one 64×64 matmul
 (~84M ops, 0.24% of a single scan layer). EM state is O(1) per token regardless

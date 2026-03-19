@@ -60,11 +60,14 @@ def main():
     all_gnorm_keys = find_keys(records, "gnorm_")
 
     # Classify gnorm keys
+    layer_keys = sorted([k for k in all_gnorm_keys if re.match(r"gnorm_layer_L\d+$", k)],
+                        key=lambda k: int(re.search(r"\d+$", k).group()))
+    # Legacy keys for backward compat with old metrics files
     stage1_layer_keys = sorted([k for k in all_gnorm_keys if re.match(r"gnorm_stage1_L\d+$", k)],
                                key=lambda k: int(re.search(r"\d+$", k).group()))
     stage3_layer_keys = sorted([k for k in all_gnorm_keys if re.match(r"gnorm_stage3_L\d+$", k)],
                                key=lambda k: int(re.search(r"\d+$", k).group()))
-    per_layer_keys = set(stage1_layer_keys + stage3_layer_keys)
+    per_layer_keys = set(layer_keys + stage1_layer_keys + stage3_layer_keys)
 
     # Legacy block keys (pre-v6)
     block_keys = sorted([k for k in all_gnorm_keys if re.match(r"gnorm_block_\d+$", k)])
@@ -92,9 +95,9 @@ def main():
     ax.grid(True, alpha=0.3)
     ax.set_yscale("log")
 
-    # (0,1) Per-layer heatmap (stage1 + stage3, last record)
+    # (0,1) Per-layer heatmap (all layers, last record)
     ax = axes[0, 1]
-    all_layer_keys = stage1_layer_keys + stage3_layer_keys
+    all_layer_keys = layer_keys or (stage1_layer_keys + stage3_layer_keys)
     if all_layer_keys and records:
         last = records[-1]
         labels = [k.replace("gnorm_", "") for k in all_layer_keys]
@@ -142,16 +145,15 @@ def main():
         ax.set_title("Activation Norms (no data)")
         ax.grid(True, alpha=0.3)
 
-    # (1,1) Memory signal ratios (pm/H, em/H, cum_em/H) over time
+    # (1,1) Memory signal ratios (pm/H, em/H) over time
     ax = axes[1, 1]
     has_ratio_data = ("act_norm_H" in act_keys and
-                      any(k in act_keys for k in ["act_norm_pm", "act_norm_em", "act_norm_cum_em"]))
+                      any(k in act_keys for k in ["act_norm_pm", "act_norm_em"]))
     if has_ratio_data:
         h_vals = np.array([r.get("act_norm_H", nan) for r in records])
         for mem_key, label, color in [
             ("act_norm_pm", "pm/H", "tab:blue"),
             ("act_norm_em", "em/H", "tab:orange"),
-            ("act_norm_cum_em", "cum_em/H", "tab:green"),
         ]:
             if mem_key in act_keys:
                 mem_vals = np.array([r.get(mem_key, nan) for r in records])
@@ -169,38 +171,40 @@ def main():
         ax.set_title("Memory Signal Ratios (no data)")
         ax.grid(True, alpha=0.3)
 
-    # (2,0) Stage1 per-layer over time (line plot)
+    # (2,0) Per-layer over time (line plot) — pre-memory layers
     ax = axes[2, 0]
-    if stage1_layer_keys:
-        for key in stage1_layer_keys:
+    pre_mem_keys = [k for k in all_layer_keys if k in layer_keys[:len(layer_keys)//2]] or stage1_layer_keys
+    if pre_mem_keys:
+        for key in pre_mem_keys:
             label = key.replace("gnorm_", "")
             vals = [r.get(key, nan) for r in records]
             ax.plot(steps, vals, alpha=0.7, label=label)
         ax.set_xlabel("step")
         ax.set_ylabel("gradient norm")
-        ax.set_title("Stage1 Per-Layer Grad Norms")
+        ax.set_title("Pre-Memory Per-Layer Grad Norms")
         ax.legend(fontsize=6, ncol=2)
         ax.grid(True, alpha=0.3)
         ax.set_yscale("log")
     else:
-        ax.set_title("Stage1 Per-Layer (no data)")
+        ax.set_title("Pre-Memory Per-Layer (no data)")
         ax.grid(True, alpha=0.3)
 
-    # (2,1) Stage3 per-layer over time (line plot)
+    # (2,1) Per-layer over time (line plot) — post-memory layers
     ax = axes[2, 1]
-    if stage3_layer_keys:
-        for key in stage3_layer_keys:
+    post_mem_keys = [k for k in all_layer_keys if k in layer_keys[len(layer_keys)//2:]] or stage3_layer_keys
+    if post_mem_keys:
+        for key in post_mem_keys:
             label = key.replace("gnorm_", "")
             vals = [r.get(key, nan) for r in records]
             ax.plot(steps, vals, alpha=0.7, label=label)
         ax.set_xlabel("step")
         ax.set_ylabel("gradient norm")
-        ax.set_title("Stage3 Per-Layer Grad Norms")
+        ax.set_title("Post-Memory Per-Layer Grad Norms")
         ax.legend(fontsize=6, ncol=2)
         ax.grid(True, alpha=0.3)
         ax.set_yscale("log")
     else:
-        ax.set_title("Stage3 Per-Layer (no data)")
+        ax.set_title("Post-Memory Per-Layer (no data)")
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()

@@ -104,7 +104,7 @@ def main() -> None:
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-    print(f"Config: tier_a (D=2048, C=16, B=6, L_scan=12), Phase B, N=256, compiled")
+    print(f"Config: tier_a (D=2048, C=16, B=4, L_total=10, L_mem=5), Phase B, N=128, compiled")
     print(f"Warmup: {args.warmup} steps, Timed: {args.steps} steps")
     print(f"(Each BS runs in a separate process — ~6 min compile warmup each)")
     print()

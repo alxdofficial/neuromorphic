@@ -1,4 +1,4 @@
-"""Gradient flow tests (v5) — NEVER change.
+"""Gradient flow tests (v6) — NEVER change.
 
 If these fail, there's a dead gradient bug.
 """
@@ -66,31 +66,33 @@ class TestGradientFlow:
             assert obj.grad.abs().sum() > 0, f"Zero gradient for {name}"
 
     def test_scan_layer_gradients(self):
-        """All scan layers in both stages should get gradients."""
-        cfg = make_tiny_config(L_scan=3)
+        """All scan layers should get gradients."""
+        cfg = make_tiny_config(L_total=6, L_mem=3)
         model = NeuromorphicLM(cfg)
 
         loss = _compute_loss(model)
         loss.backward()
 
-        for stage_name in ("stage1", "stage3"):
-            stage = getattr(model, stage_name)
-            for i, layer in enumerate(stage):
-                assert layer.proj_in.weight.grad is not None, \
-                    f"No gradient for {stage_name}[{i}].proj_in"
-                assert layer.proj_in.weight.grad.abs().sum() > 0, \
-                    f"Zero gradient for {stage_name}[{i}].proj_in"
-                assert layer.proj_out.weight.grad is not None, \
-                    f"No gradient for {stage_name}[{i}].proj_out"
-                assert layer.proj_out.weight.grad.abs().sum() > 0, \
-                    f"Zero gradient for {stage_name}[{i}].proj_out"
+        for i, layer in enumerate(model.layers):
+            assert layer.proj_in.weight.grad is not None, \
+                f"No gradient for layers[{i}].proj_in"
+            assert layer.proj_in.weight.grad.abs().sum() > 0, \
+                f"Zero gradient for layers[{i}].proj_in"
+            assert layer.proj_out.weight.grad is not None, \
+                f"No gradient for layers[{i}].proj_out"
+            assert layer.proj_out.weight.grad.abs().sum() > 0, \
+                f"Zero gradient for layers[{i}].proj_out"
 
     def test_gradient_with_pcm(self):
-        """PCM parameters should get gradients when enabled."""
+        """PCM parameters should get gradients when enabled.
+
+        Needs 2 segments: W_enc gradient flows through surprise → commit (seg1)
+        → EM state → trail_read (seg2) → loss.
+        """
         cfg = make_tiny_config(pcm_enabled=True)
         model = NeuromorphicLM(cfg)
 
-        loss = _compute_loss(model)
+        loss = _compute_loss(model, n_segments=2)
         loss.backward()
 
         pcm = model.pcm

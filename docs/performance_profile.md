@@ -1,10 +1,14 @@
-# Performance Profile — Neuromorphic LM v5.1 Tier A
+# Performance Profile — Neuromorphic LM Tier A
+
+> **Note**: These benchmarks are from the v5.1 era (3-stage scan-memory-scan, N=512).
+> The current architecture (v7, single scan stack, N=128) has not been re-benchmarked yet.
+> Results below are historical reference only.
 
 **Hardware**: RTX 4090 (24 GB VRAM, 165 TFLOP/s bf16 peak)
-**Config**: D=2048, D_embed=384, C=16, D_col=128, d_inner=1024, L_scan=6, B=4, M=384, N=512, n_trail_steps=3
+**Config (v5.1)**: D=2048, D_embed=384, C=16, D_col=128, d_inner=1024, L_scan=6+6, B=4, M=384, N=512, n_trail_steps=3
 **Params**: 91.8M | **Compiled**: torch.compile enabled | **Norm**: RMSNorm
 
-## Current Throughput (v5.1 Dense Scan, n_trail_steps=3)
+## Historical Throughput (v5.1 Dense Scan, n_trail_steps=3)
 
 | Metric | Value |
 |--------|-------|

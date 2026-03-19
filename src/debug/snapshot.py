@@ -85,7 +85,7 @@ def main():
     # 3. Scan layer weights (proj_in contains decay/gate parameters)
     scan_tensors = {}
     for name, tensor in state_dict.items():
-        if "stage1." in name or "stage3." in name:
+        if "layers." in name:
             scan_tensors[name] = tensor
     if scan_tensors:
         scan_path = os.path.join(output_dir, "scan_weights.pt")

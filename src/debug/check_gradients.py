@@ -25,14 +25,12 @@ from ..model.model import NeuromorphicLM
 
 # Subsystem classification by parameter name prefix
 GROUPS = [
-    ("stage1", "stage1."),
-    ("stage3", "stage3."),
+    ("layers", "layers."),
     ("pm", "pm."),
     ("em_neuromod", "em_neuromod."),
     ("em", "em."),
     ("pcm", "pcm."),
     ("W_seed_w", "W_seed_w."),
-    ("W_nov", "W_nov."),
     ("embedding", "embedding."),
     ("lm_head", "lm_head."),
     ("proj_up", "proj_up."),
@@ -120,7 +118,7 @@ def main():
         print(f"\n  Segment {seg_idx + 1}:")
         if act_norms:
             h_norm = act_norms.get("H", 0)
-            for key in ["H", "pm", "em", "cum_em"]:
+            for key in ["H", "pm", "em"]:
                 val = act_norms.get(key, 0)
                 ratio = val / h_norm if h_norm > 0 else float("nan")
                 flag = ""

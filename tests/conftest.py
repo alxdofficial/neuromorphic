@@ -1,4 +1,4 @@
-"""Shared fixtures for the neuromorphic LM test suite (v5).
+"""Shared fixtures for the neuromorphic LM test suite (v6).
 
 Provides a tiny model config (~1000x cheaper than tier_a) that preserves
 all architectural constraints while running in milliseconds on CPU.
@@ -20,7 +20,7 @@ from src.model.config import ModelConfig
 TINY_DEFAULTS = dict(
     D=64, D_embed=64, B=2, C=2, D_pm=16,
     vocab_size=64, N=16, K_segments=2,
-    M=8, L_scan=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
+    M=8, L_total=4, L_mem=2, scan_expansion=2, d_inner=64, n_trail_steps=2,
     budget_pm=4.0, budget_em=8.0,
     neuromod_hidden=8,
     pcm_enabled=False, pcm_pred_weight=0.01,
