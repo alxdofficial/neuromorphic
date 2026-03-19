@@ -55,7 +55,8 @@ class NeuromorphicLM(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(config.N, D) * 0.02)
 
         # Stage 1: L_scan dense layers — [BS, N, D] throughout
-        n_total = 2 * L  # depth scaling counts both stages
+        L_s3 = config.L_scan_s3
+        n_total = L + L_s3  # depth scaling counts both stages
         self.stage1 = nn.ModuleList([
             ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
                       glu_output=config.glu_output) for _ in range(L)
@@ -79,17 +80,17 @@ class NeuromorphicLM(nn.Module):
         self.pm = ProceduralMemory(B, D, config.D_pm, config.decay_pm)
         self.em = EpisodicMemory(
             B, config.M, D, config.n_trail_steps,
-            S_max=config.S_max, budget=config.budget_em,
+            D_mem=config.D_mem, S_max=config.S_max, budget=config.budget_em,
             decay=config.decay_em, topk=config.em_topk,
         )
         self.em_neuromod = EMNeuromodulator(
             hidden=config.neuromod_hidden,
         )
 
-        # Stage 3: L_scan dense layers — [BS, N, D] throughout
+        # Stage 3: integration scan — may be shallower than stage 1
         self.stage3 = nn.ModuleList([
             ScanLayer(D, d_inner, config.dropout, n_layers=n_total,
-                      glu_output=config.glu_output) for _ in range(L)
+                      glu_output=config.glu_output) for _ in range(L_s3)
         ])
 
         # Output

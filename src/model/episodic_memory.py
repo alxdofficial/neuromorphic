@@ -28,17 +28,29 @@ class EpisodicMemory(nn.Module, StateMixin):
     _state_tensor_names = ["em_K", "em_V", "em_S"]
 
     def __init__(self, B: int, M: int, D: int, n_steps: int = 2,
-                 S_max: float = 3.0, budget: float = 32.0,
+                 D_mem: int = 0, S_max: float = 3.0, budget: float = 32.0,
                  decay: float = 0.999, topk: int = 0):
         super().__init__()
         self.B = B
         self.M = M
         self.D = D
+        self.D_mem = D_mem if D_mem > 0 else D
         self.n_steps = n_steps
         self.S_max = S_max
         self.budget = budget
         self.decay = decay
         self.topk = topk if topk > 0 else M  # 0 means all (no top-k)
+
+        # Latent compression: D → D_mem for memory storage
+        if self.D_mem != D:
+            self.mem_proj_in = nn.Linear(D, self.D_mem)
+            self.mem_proj_out = nn.Linear(self.D_mem, D)
+            # Zero-init so EM trail starts silent
+            nn.init.zeros_(self.mem_proj_out.weight)
+            nn.init.zeros_(self.mem_proj_out.bias)
+        else:
+            self.mem_proj_in = None
+            self.mem_proj_out = None
 
         # Trail parameters (per bank)
         self.gate_alpha = nn.Parameter(torch.randn(B) * 0.02)  # scalar gate scale
@@ -59,9 +71,12 @@ class EpisodicMemory(nn.Module, StateMixin):
         directions from the start. em_S initialized to a small positive value so all
         primitives are active (avoiding the cold-start masking dead zone where
         em_S=0 means all attention scores are -inf).
+
+        State uses D_mem dimensions (compressed latent space if D_mem < D).
         """
-        self.em_K = unit_normalize(torch.randn(BS, self.B, self.M, self.D, device=device, dtype=dtype))
-        self.em_V = torch.zeros(BS, self.B, self.M, self.D, device=device, dtype=dtype)
+        D_mem = self.D_mem
+        self.em_K = unit_normalize(torch.randn(BS, self.B, self.M, D_mem, device=device, dtype=dtype))
+        self.em_V = torch.zeros(BS, self.B, self.M, D_mem, device=device, dtype=dtype)
         self.em_S = torch.full((BS, self.B, self.M), 0.01, device=device, dtype=dtype)
 
     def is_initialized(self) -> bool:
@@ -78,9 +93,13 @@ class EpisodicMemory(nn.Module, StateMixin):
         """
         BS, N, D = seed.shape
         B = self.B
+        D_mem = self.D_mem
 
-        # Expand seed to [BS, B, N, D]
-        s = seed.unsqueeze(1).expand(BS, B, N, D)
+        # Project to memory latent space
+        seed_mem = self.mem_proj_in(seed) if self.mem_proj_in is not None else seed
+
+        # Expand seed to [BS, B, N, D_mem]
+        s = seed_mem.unsqueeze(1).expand(BS, B, N, D_mem)
         if self.training:
             # sigma: [B] -> [1, B, 1, 1]
             sigma = F.softplus(self.raw_sigma)[None, :, None, None]
@@ -98,21 +117,26 @@ class EpisodicMemory(nn.Module, StateMixin):
         g_bias = self.gate_bias[None, :, None, None]
 
         for step in range(self.n_steps):
-            # scores: [BS, B, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+            # scores: [BS, B, N, D_mem] @ [BS, B, D_mem, M] -> [BS, B, N, M]
             scores = torch.matmul(y, self.em_K.transpose(-2, -1)) / tau
             scores = scores.masked_fill(~active, float('-inf'))
             attn = F.softmax(scores, dim=-1)         # [BS, B, N, M]
             attn = attn.nan_to_num(0.0)
-            # delta: [BS, B, N, M] @ [BS, B, M, D] -> [BS, B, N, D]
+            # delta: [BS, B, N, M] @ [BS, B, M, D_mem] -> [BS, B, N, D_mem]
             delta = torch.matmul(attn, self.em_V)
 
             # Scalar gate: dot-product similarity -> sigmoid -> scale delta
-            dot = (y * delta).sum(dim=-1, keepdim=True) / D  # [BS, B, N, 1]
-            gate = torch.sigmoid(g_alpha * dot + g_bias)      # [BS, B, N, 1]
+            dot = (y * delta).sum(dim=-1, keepdim=True) / D_mem  # [BS, B, N, 1]
+            gate = torch.sigmoid(g_alpha * dot + g_bias)          # [BS, B, N, 1]
             y = y + gate * delta
 
-        # result: [BS, B, N, D] -> sum over B (dim 1) -> [BS, N, D]
-        return (y - s).sum(dim=1)
+        # result: [BS, B, N, D_mem] -> sum over B -> [BS, N, D_mem]
+        result = (y - s).sum(dim=1)
+
+        # Project back to model dimension
+        if self.mem_proj_out is not None:
+            result = self.mem_proj_out(result)  # [BS, N, D]
+        return result
 
     def compute_novelty_all(
         self, w_cand: Tensor, surprise: Tensor,
@@ -121,6 +145,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         """Compute novelty score for all banks simultaneously.
 
         Novelty = w_nov * ||surprise|| + (1 - w_nov) * recon_error.
+        Scores and reconstruction computed in D_mem latent space.
 
         Args:
             w_cand: [BS, N, D] — write candidates
@@ -133,21 +158,24 @@ class EpisodicMemory(nn.Module, StateMixin):
         BS, N, D = w_cand.shape
         B = self.B
 
+        # Project to memory latent space
+        w_cand_mem = self.mem_proj_in(w_cand) if self.mem_proj_in is not None else w_cand
+
         # tau: [B] -> [1, B, 1, 1]
         tau = (F.softplus(self.raw_tau) + 0.1)[None, :, None, None]
 
-        # w_norm: [BS, N, D] -> [BS, 1, N, D] for broadcasting against [BS, B, M, D]
-        w_norm = unit_normalize(w_cand).unsqueeze(1)
-        # scores: [BS, 1, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+        # w_norm: [BS, N, D_mem] -> [BS, 1, N, D_mem]
+        w_norm = unit_normalize(w_cand_mem).unsqueeze(1)
+        # scores: [BS, 1, N, D_mem] @ [BS, B, D_mem, M] -> [BS, B, N, M]
         scores = torch.matmul(w_norm, self.em_K.transpose(-2, -1)) / tau
         active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
         scores = scores.masked_fill(~active, float('-inf'))
         attn = F.softmax(scores, dim=-1)       # [BS, B, N, M]
         attn = attn.nan_to_num(0.0)
-        # reconstruction: [BS, B, N, M] @ [BS, B, M, D] -> [BS, B, N, D]
+        # reconstruction: [BS, B, N, M] @ [BS, B, M, D_mem] -> [BS, B, N, D_mem]
         reconstruction = torch.matmul(attn, self.em_V)
-        # recon_error: [BS, B, N]
-        recon_error = (w_cand.unsqueeze(1) - reconstruction).norm(dim=-1)
+        # recon_error in D_mem space: [BS, B, N]
+        recon_error = (w_cand_mem.unsqueeze(1) - reconstruction).norm(dim=-1)
 
         # Surprise magnitude: [BS, N] -> [BS, 1, N]
         surp_mag = surprise.norm(dim=-1).unsqueeze(1)  # [BS, 1, N]
@@ -178,6 +206,7 @@ class EpisodicMemory(nn.Module, StateMixin):
         """Segment-end structured write for all banks simultaneously.
 
         Soft routing -> aggregate -> neuromodulated EMA.
+        All operations in D_mem latent space.
 
         Args:
             w_cand: [BS, N, D] — write candidates (shared across banks)
@@ -187,14 +216,18 @@ class EpisodicMemory(nn.Module, StateMixin):
         BS, N, D = w_cand.shape
         B = self.B
         M = self.M
+        D_mem = self.D_mem
+
+        # Project to memory latent space
+        w_cand_mem = self.mem_proj_in(w_cand) if self.mem_proj_in is not None else w_cand
 
         # tau_w: [B] -> [1, B, 1, 1]
         tau_w = (F.softplus(self.raw_tau_w) + 0.1)[None, :, None, None]
 
         # Soft routing: which primitives absorb this signal?
-        # w_norm: [BS, 1, N, D]
-        w_norm = unit_normalize(w_cand).unsqueeze(1)
-        # route_scores: [BS, 1, N, D] @ [BS, B, D, M] -> [BS, B, N, M]
+        # w_norm: [BS, 1, N, D_mem]
+        w_norm = unit_normalize(w_cand_mem).unsqueeze(1)
+        # route_scores: [BS, 1, N, D_mem] @ [BS, B, D_mem, M] -> [BS, B, N, M]
         route_scores = torch.matmul(w_norm, self.em_K.transpose(-2, -1)) / tau_w
         active = (self.em_S > 0).unsqueeze(2)  # [BS, B, 1, M]
         route_scores = route_scores.masked_fill(~active, float('-inf'))
@@ -217,12 +250,11 @@ class EpisodicMemory(nn.Module, StateMixin):
         wr_sum = weighted_route.sum(dim=2)         # [BS, B, M]
         route_agg = wr_sum * (1.0 / N)            # [BS, B, M] — mean without extra reduction
 
-        # Aggregated updates: [BS, B, M, N] @ [BS, B, N, D] -> [BS, B, M, D]
-        # w_norm: [BS, 1, N, D], w_cand: [BS, 1, N, D] — broadcast across B
-        w_norm_b = w_norm.expand(BS, B, N, D)
-        w_cand_b = w_cand.unsqueeze(1).expand(BS, B, N, D)
-        update_K = torch.matmul(weighted_route.transpose(2, 3), w_norm_b)  # [BS, B, M, D]
-        update_V = torch.matmul(weighted_route.transpose(2, 3), w_cand_b)  # [BS, B, M, D]
+        # Aggregated updates in D_mem space: [BS, B, M, N] @ [BS, B, N, D_mem]
+        w_norm_b = w_norm.expand(BS, B, N, D_mem)
+        w_cand_b = w_cand_mem.unsqueeze(1).expand(BS, B, N, D_mem)
+        update_K = torch.matmul(weighted_route.transpose(2, 3), w_norm_b)  # [BS, B, M, D_mem]
+        update_V = torch.matmul(weighted_route.transpose(2, 3), w_cand_b)  # [BS, B, M, D_mem]
 
         # Normalize updates per primitive
         denom = wr_sum.unsqueeze(-1).clamp(min=1e-8)  # [BS, B, M, 1]
@@ -266,12 +298,13 @@ class EpisodicMemory(nn.Module, StateMixin):
             return
         device = self.em_S.device
         dtype = self.em_S.dtype
+        D_mem = self.D_mem
 
-        # Fresh state matching initialize()
+        # Fresh state matching initialize() — uses D_mem
         fresh_K = unit_normalize(torch.randn(
-            1, self.B, self.M, self.D, device=device, dtype=dtype))
+            1, self.B, self.M, D_mem, device=device, dtype=dtype))
         fresh_V = torch.zeros(
-            1, self.B, self.M, self.D, device=device, dtype=dtype)
+            1, self.B, self.M, D_mem, device=device, dtype=dtype)
         fresh_S = torch.full(
             (1, self.B, self.M), 0.01, device=device, dtype=dtype)
 

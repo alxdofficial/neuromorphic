@@ -18,7 +18,8 @@ class ModelConfig:
     D_col: int = -1           # derived: D // C (set in validate())
     N: int = 512              # segment length
     K_segments: int = 2       # TBPTT chunk = K segments
-    L_scan: int = 12          # scan layers per stage (24 total)
+    L_scan: int = 12          # scan layers per stage (stage1 + stage3)
+    L_scan_s3: int = -1       # stage3 layers (-1 = same as L_scan)
     scan_expansion: int = 4   # E = scan_expansion * D_col per layer
     d_inner: int = -1         # scan hidden dim (derived in validate if -1)
     vocab_size: int = 32000   # set from tokenizer at runtime
@@ -31,6 +32,7 @@ class ModelConfig:
 
     # Episodic Memory (primitive dictionary per bank)
     M: int = 256              # EM capacity (primitives) per bank
+    D_mem: int = -1           # EM latent dim (-1 = use D, no compression)
     n_trail_steps: int = 2    # trail iteration count
     S_max: float = 3.0        # max primitive strength
     budget_em: float = 32.0   # sum(em_S) budget per (stream, bank)
@@ -90,6 +92,10 @@ class ModelConfig:
             raise ValueError(f"K_segments ({self.K_segments}) must be >= 1.")
         if self.L_scan < 1:
             raise ValueError(f"L_scan ({self.L_scan}) must be >= 1.")
+        if self.L_scan_s3 == -1:
+            self.L_scan_s3 = self.L_scan
+        if self.L_scan_s3 < 1:
+            raise ValueError(f"L_scan_s3 ({self.L_scan_s3}) must be >= 1.")
         if self.scan_expansion < 1:
             raise ValueError(f"scan_expansion ({self.scan_expansion}) must be >= 1.")
         # Derive d_inner (scan hidden dim) — backward compat when not set
@@ -101,6 +107,10 @@ class ModelConfig:
             raise ValueError(f"D_pm ({self.D_pm}) must be >= 1.")
         if self.M < 1:
             raise ValueError(f"M ({self.M}) must be >= 1 (EM capacity).")
+        if self.D_mem == -1:
+            self.D_mem = self.D
+        if self.D_mem < 1:
+            raise ValueError(f"D_mem ({self.D_mem}) must be >= 1.")
         if self.n_trail_steps < 1:
             raise ValueError(f"n_trail_steps ({self.n_trail_steps}) must be >= 1.")
 
@@ -144,7 +154,7 @@ class ModelConfig:
         defaults = dict(
             D=2048, D_embed=768, B=4, C=16, D_pm=64,
             N=512, L_scan=6, scan_expansion=8, d_inner=1024,
-            M=384, n_trail_steps=3,
+            M=384, D_mem=512, n_trail_steps=3,
             budget_pm=16, budget_em=32,
             glu_output=True,
         )
