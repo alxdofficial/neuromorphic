@@ -49,8 +49,8 @@ token_ids [BS, N]  →  embedding lookup  →  + positional  →  x [BS, N, D]
                        [BS, N, D_embed]      bias             (after proj_up if D_embed ≠ D)
 ```
 
-For Tier A: `D_embed=384` (compact embeddings), projected up to `D=2048` (wide
-internal representation). The same embedding table is reused as the output layer
+For Tier A: `D_embed=768`, projected up to `D=2048` (wide internal
+representation). The same embedding table is reused as the output layer
 (tied embeddings).
 
 ### 2. Stage 1: Causal Scan (Encoding)
@@ -66,11 +66,19 @@ where `a` is a decay gate (how much to remember) and `b` is the input signal.
 Both are projected from the input via a single linear layer. The recurrence runs
 left-to-right, so each position's output depends only on preceding tokens.
 
-Each layer follows a pre-norm residual pattern:
+Each layer follows a pre-norm residual pattern with a SwiGLU output projection:
 
 ```
-H_out = H_in + proj_out(scan(RMSNorm(H_in)))
+ab       = proj_in(RMSNorm(x))       # [BS, N, 2*d_inner]
+a, b     = chunk(ab)
+h        = scan(sigmoid(a), silu(b))  # [BS, N, d_inner]
+[gate, up] = proj_out(h)             # [BS, N, 2*D]
+out      = silu(gate) * up           # [BS, N, D]  — SwiGLU gating
+return out + x                       # residual
 ```
+
+The SwiGLU output gate lets each layer perform nonlinear feature mixing on the
+scan output before adding it back to the residual stream.
 
 After six layers, `H [BS, N, D]` is a contextual encoding where each position
 has accumulated information from all preceding tokens in the segment.
@@ -189,7 +197,7 @@ representation for prediction.
 ### 6. Output
 
 ```
-out    = proj_down(H_prime)     # D=2048 → D_embed=384
+out    = proj_down(H_prime)     # D=2048 → D_embed=768
 out    = LayerNorm(out)
 logits = lm_head(out) · D_embed^{-0.5}
 ```
@@ -240,13 +248,17 @@ while Bank 4 slowly accumulates document-level patterns.
 ### Episodic Memory (EM)
 
 **What it is.** A dictionary of M=384 key-value primitives per bank.
-Keys `em_K [BS, B, M, D]` encode *what* was stored (unit-normalized direction
-vectors). Values `em_V [BS, B, M, D]` encode the *content*. Strengths
+Keys `em_K [BS, B, M, D_mem]` encode *what* was stored (unit-normalized direction
+vectors). Values `em_V [BS, B, M, D_mem]` encode the *content*. Strengths
 `em_S [BS, B, M]` track how established each primitive is.
 
 **How it reads.** Trail navigation (described above) — an iterative attention
-process that composes multiple primitives into a single retrieval. The trail
-approach lets the model build complex responses from simple stored parts.
+process that composes multiple primitives into a single retrieval. EM operates
+in a compressed latent space of D_mem=512 dimensions (for Tier A). Inputs are
+projected from D into D_mem before trail navigation, and the result is projected
+back to D afterward. This latent compression reduces EM state size while
+preserving retrieval quality. The trail approach lets the model build complex
+responses from simple stored parts.
 
 **How it writes (segment-end commit).**
 
@@ -367,9 +379,9 @@ to learn.
 
 ## Scale and Efficiency
 
-**Tier A (dev tier):** 92M parameters, 2048 internal width, 12 scan layers.
+**Tier A (dev tier):** 133M parameters, 2048 internal width, 12 scan layers.
 
-On an RTX 4090: ~65K tok/s training throughput at BS=16 with `torch.compile`.
+On an RTX 4090: ~89K tok/s training throughput at BS=8 (T=2048) with `torch.compile`.
 The scan recurrence is O(N) per layer (vs O(N²) for attention), making it
 efficient on long segments.
 

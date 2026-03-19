@@ -79,7 +79,7 @@ three-stage cycle mirrors this: fast processing → memory interaction → integ
 **Scan layers** (dense, full D mixing):
 - Dense nn.Linear projections for GPU matmul efficiency
 - Element-wise linear recurrence: `h_t = a_t ⊙ h_{t-1} + b_t` on d_inner dims
-- No separate FFN — the scan's input/output projections serve this role
+- Optional SwiGLU output projection for nonlinear feature mixing (glu_output=True by default in Tier A): proj_out produces [d_inner → 2*D], split into gate+up, output = silu(gate)*up
 
 **Feature groups** (C groups of D_col, for PCM and memory addressing):
 - C = D / D_col feature groups, used by PCM and W_seed_w (GroupedLinear)
@@ -95,7 +95,7 @@ three-stage cycle mirrors this: fast processing → memory interaction → integ
   Trail-based compositional read — seed navigates primitive space.
 - B memory banks. Banks are independent; PM banks differ by plasticity rate β_b.
 - PM state shape: `[BS, B, D_pm, D_pm]` (fast-weight matrix per bank)
-- EM state shape: `[BS, B, M, D]` where D = C × D_col (M primitives per bank)
+- EM state shape: `[BS, B, M, D_mem]` where D_mem is a compressed latent dimension (512 for Tier A). Learned projections `mem_proj_in` (D→D_mem) and `mem_proj_out` (D_mem→D) inside EpisodicMemory.
 
 **Dense scan, grouped PCM/projections** (v5.1):
 - Scan layers use dense nn.Linear — all D features mix freely for GPU efficiency.
@@ -192,14 +192,15 @@ for maximum GPU matmul efficiency (~80-100% vs 23% with grouped). PCM retains
 per-feature-group structure via free .view() reshaping — surprise at column c
 is based on predicting that column's D_col features, not all D.
 
-**Scan carry across segments:** Currently, scan hidden states are reset to zero at each
-segment boundary (h_0 = 0). Cross-segment context is carried entirely through memory
-state (PM bias and EM primitives). Scan carry can be added later if needed — storing
-per-layer h_last as runtime state and passing it as h_prev to the next segment.
+**Scan carry across segments:** Scan hidden states are carried across segment boundaries
+via `_s1_carries` (Stage 1) and `_s3_carries` (Stage 3) lists in model.py. Each stores
+per-layer h_last as runtime state and passes it as h_prev to the next segment. This means
+cross-segment context flows through both memory state (PM, EM) and scan recurrence.
 
-**No separate FFN:** The scan's input-dependent projections (computing a_t, b_t from
-the input) serve the same role as FFN layers — nonlinear feature transformation. Adding
-a separate FFN would be redundant.
+**GLU output projection:** When glu_output=True (default in Tier A), each scan layer's
+output projection produces 2*D features, split into gate and up branches, combined as
+`output = silu(gate) * up`. This SwiGLU provides nonlinear feature mixing within each
+scan layer, filling the role a separate FFN would otherwise serve.
 
 **PCM in the scan:** The prediction z_hat_t and encoding z_t are linear functions of H_t,
 so they can be folded into the scan as additional output projections. Surprise is the
@@ -259,12 +260,12 @@ def memory_ops(self, H, seed, w_cand, surprise):
 ```
 
 **Memory addressing:** PM fast-weight bank b has state `[BS, D_pm, D_pm]`
-(projected via fixed `proj_in/proj_out`). EM bank b has shape `[BS, M, D]`.
-Column c reads/writes only its slice `[..., c*D_col:(c+1)*D_col]` of EM. This means:
-- No routing decisions — pure dimension indexing
-- GPU-friendly — contiguous memory access patterns
-- Surprise, seeds, and candidates are all dimension-specific
-- Each column independently contributes to its slice of the bank's memory
+(projected via fixed `proj_in/proj_out`). EM bank b has shape `[BS, M, D_mem]`
+where D_mem is a compressed latent dimension. EM operates on full D tensors projected
+to D_mem via learned `mem_proj_in` (D→D_mem) and back via `mem_proj_out` (D_mem→D).
+- No column-local slicing — EM addresses the full compressed representation
+- GPU-friendly — dense matmuls in the compressed D_mem space
+- Compression reduces EM state size (D_mem << D)
 
 **Two write paths — fast and slow:**
 - **Fast path (within-segment):** EM write candidates are gated by the per-token
@@ -354,10 +355,9 @@ Token t:   column input X_t → z_t = W_enc · X_t                    (actual en
 surprise signal. The model was wrong about feature 3 but correct about feature
 7 — memory writes can be modulated per-feature. This is richer than a scalar
 `||z_hat - z||` because:
-- Memory writes are dimension-specific (column c writes to its D_col slice)
 - Surprise naturally has the same dimensionality as the write candidates
-- PM bias shifts and EM writes operate per-dimension: "I was wrong about THESE
-  features, adapt bias and store corrections for THOSE features"
+- PM and EM writes are modulated by surprise magnitude per-feature: "I was wrong
+  about THESE features, adapt and store corrections for THOSE features"
 
 ### What Surprise Means in v5
 
@@ -428,12 +428,12 @@ EM stores M **primitive patterns** — atomic building blocks of concepts. Readi
 is done via a **trail**: a seed vector navigates primitive space through
 iterative refinement. The output is a composition of activated primitives.
 
-**State:**
+**State (in compressed latent space D_mem):**
 ```
-em_K   [BS, B, M, D]     — primitive keys (unit-norm): "what triggers this"
-em_V   [BS, B, M, D]     — primitive values: "what this contributes"
-em_S   [BS, B, M]        — strengths (0 = inactive)
-em_age [BS, B, M]        — age tracking for decay
+em_K   [BS, B, M, D_mem]  — primitive keys (unit-norm): "what triggers this"
+em_V   [BS, B, M, D_mem]  — primitive values: "what this contributes"
+em_S   [BS, B, M]         — strengths (0 = inactive)
+em_age [BS, B, M]         — age tracking for decay
 ```
 
 **Read (trail-based pattern completion):**
@@ -443,17 +443,21 @@ em_age [BS, B, M]        — age tracking for decay
 if training:
     seed = seed + σ * randn_like(seed)       # noise for exploration (σ learned)
 
+# Project to compressed latent space
+seed_mem = mem_proj_in(seed)                 # [BS, N, D_mem]
+
 # Trail: iterative refinement through primitive space (n_steps = 3)
-y = seed
+y = seed_mem
 for step in range(n_steps):
     scores = y @ em_K[b].T                   # [BS, N, M] — score ALL primitives
     scores[em_S == 0] = -inf                 # mask inactive
     attn = softmax(scores / τ)               # sparse activation (τ learned)
-    delta = attn @ em_V[b]                   # [BS, N, D] — primitive composition
-    gate = sigmoid(W_gate(cat(y, delta)))    # [BS, N, D] — learned step gate
+    delta = attn @ em_V[b]                   # [BS, N, D_mem] — primitive composition
+    dot = (y * delta).sum(-1, keepdim=True) / D_mem  # scalar similarity
+    gate = sigmoid(g_alpha * dot + g_bias)   # [BS, N, 1] — scalar step gate
     y = y + gate * delta                     # seed moves through space
 
-y_em = y - seed                              # [BS, N, D] — net memory contribution
+y_em = mem_proj_out(y - seed_mem)            # [BS, N, D] — projected back to model width
 ```
 
 **What this does:** Step 1 activates primitives near the seed (e.g., "animal",
@@ -463,14 +467,17 @@ something no single primitive stores. The primitives are a fixed coordinate
 system; the seed is a program that navigates it.
 
 **Combinatorial capacity:** M primitives with continuous seeds → infinite
-possible readouts. The memory is O(M × D) but the output space is continuous.
+possible readouts. The memory is O(M × D_mem) but the output space is continuous.
 
 **Novelty scoring:**
 ```
+# Project to compressed latent space
+w_cand_mem = mem_proj_in(w_cand)             # [BS, N, D_mem]
+
 # Can existing primitives explain this input?
-attn = softmax(normalize(w_cand) @ em_K[b].T / τ)
+attn = softmax(normalize(w_cand_mem) @ em_K[b].T / τ)
 reconstruction = attn @ em_V[b]
-recon_error = ||w_cand - reconstruction||    # [BS, N] — unexplained signal
+recon_error = ||w_cand_mem - reconstruction||  # [BS, N] — unexplained signal
 
 # Novelty = surprise magnitude + reconstruction error
 w_nov = sigmoid(W_nov(H))                   # [BS, N, B] — learned blend
@@ -479,12 +486,15 @@ novelty = w_nov * ||surprise|| + (1 - w_nov) * recon_error
 
 **Write (decompose across primitives):**
 ```
+# Project to compressed latent space
+w_cand_mem = mem_proj_in(w_cand)             # [BS, N, D_mem]
+
 # Soft routing: which primitives should absorb this signal?
-route = softmax(normalize(w_cand) @ em_K[b].T / τ_w)  # [BS, N, M]
+route = softmax(normalize(w_cand_mem) @ em_K[b].T / τ_w)  # [BS, N, M]
 
 # Aggregate across N tokens, weighted by novelty
-update_K = sum_n(novelty * route * k_cand)   # [BS, B, M, D]
-update_V = sum_n(novelty * route * v_cand)   # [BS, B, M, D]
+update_K = sum_n(novelty * route * k_cand)   # [BS, B, M, D_mem]
+update_V = sum_n(novelty * route * v_cand)   # [BS, B, M, D_mem]
 
 # Neuromodulated commit (fully differentiable, no hard selection)
 g_em = em_neuromodulator(novelty_mean, usage)  # scalar gate
@@ -536,31 +546,17 @@ EM primitives compete for limited budget. When total strength exceeds the
 budget, the weakest (lowest em_S) primitives are soft-pruned. This prevents
 unbounded growth and forces the dictionary to keep only useful primitives.
 
-## Column-Local EM Addressing
+## EM Latent Compression
 
-EM primitives use column-local dimension slicing for structured access.
+EM operates in a compressed latent space D_mem (512 for Tier A) rather than the full
+model width D. Learned projections `mem_proj_in` (D→D_mem) and `mem_proj_out` (D_mem→D)
+inside EpisodicMemory handle the mapping. This reduces EM state from `[BS, B, M, D]` to
+`[BS, B, M, D_mem]`, significantly cutting memory footprint while preserving representational
+capacity through the learned compression.
 
-```
-EM bank b:
-  em_K    [BS, M, D]     where D = C × D_col
-  em_V    [BS, M, D]
-
-Column c of bank b addresses:
-  em_K[:, :, c*D_col : (c+1)*D_col]
-  em_V[:, :, c*D_col : (c+1)*D_col]
-```
-
-This means:
-- **No routing logic** — column c always addresses the same D_col slice of EM
-- **Surprise is dimension-specific** — column c's surprise only affects its EM slice
-- **Reads are independent** across columns — no coordination needed
-- **GPU-friendly** — contiguous memory access within each column's slice
-- **Biologically motivated** — cortical columns connect to local memory regions
-
-PM is **not** column-local. PM operates as a bank-level transform on the full D-dimensional
-state: `pre = proj_in(H)` [D_pm], `post = (Σ_b W_b) @ pre` — the bank sum fuses all B
-banks without column partitioning. Bank specialization emerges from per-bank β, not
-from column assignment.
+Both PM and EM operate on the full representation (not column-local). PM operates as a
+bank-level transform: `pre = proj_in(H)` [D_pm], `post = (Σ_b W_b) @ pre` — the bank
+sum fuses all B banks. Bank specialization emerges from per-bank β, not from column assignment.
 
 ## Gradient Flow
 
@@ -680,7 +676,7 @@ preserving per-feature-group surprise and memory-facing signals.
 ### Scaling: Memory Banks
 
 ```
-Bank b: C columns share PM_b (D) + EM_b (M × D)
+Bank b: PM_b (D_pm × D_pm) + EM_b (M × D_mem)
 ```
 
 Total banks = B. Each bank's memory can specialize — analogous to different
@@ -710,7 +706,7 @@ Per segment:
 ### Memory
 
 Training: O(N × D) for scan states + O(N × D) for activations.
-Inference: O(D) scan states + O(B × (r + M) × D) memory — **constant**.
+Inference: O(D) scan states + O(B × (D_pm² + M × D_mem)) memory — **constant**.
 
 ## Training
 
@@ -750,7 +746,7 @@ The distillation cycle:
 Process tokens in N-token segments. Each segment:
 1. Run 3-stage cycle
 2. Emit N token predictions
-3. Carry memory state to next segment (scan state currently resets per segment)
+3. Carry memory state and scan carries to next segment
 
 Throughput: N tokens per forward pass (no R multiplier).
 
@@ -767,11 +763,12 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 2. **Scan mixing** → Dense nn.Linear projections mix all D features (v5.1). PCM
    and W_seed_w use grouped views for per-feature-group structure.
 
-3. **FFN** → No separate FFN. The scan's input-dependent projections (computing
-   a_t, b_t) serve the same nonlinear transformation role.
+3. **FFN** → GLU output projection provides nonlinear feature mixing within each
+   scan layer. When glu_output=True (default in Tier A), proj_out produces 2*D,
+   split into gate+up, combined via SwiGLU: `output = silu(gate) * up`.
 
-4. **Scan layers** → Equal depth per stage. Target 12 layers Stage 1 + 12 layers
-   Stage 3 = 24 total for ~130M param model (anchored to Mamba-130M).
+4. **Scan layers** → Stage depths are configurable via L_scan (Stage 1) and
+   L_scan_s3 (Stage 3). Tier A uses 6+6=12 total layers.
 
 5. **Memory integration** → Additive. `Stage3_input = pm_read + em_trail + cum_em`.
    Parameter-free, gradient-friendly, degrades gracefully when memory is empty.
@@ -779,8 +776,9 @@ boundaries. Latency per token = one scan step (no quadratic attention).
 6. **CrossBlockMixer** → Dropped. v4 artifact. In v5, memory reads already provide
    cross-bank integration, and scan provides cross-position context.
 
-7. **PM** → Simplified to bias vector with element-wise gain modulation.
-   Coarse, fast, automatic — distinct from EM's rich compositional read.
+7. **PM** → Hebbian fast-weight matrix (D_pm × D_pm per bank). Learns
+   input→output transforms via surprise-gated autocorrelation. Multiple
+   timescales via per-bank plasticity β_b. Distinct from EM's compositional read.
 
 8. **EM** → Trail-based primitive composition. Dictionary of M primitives,
    seed from scan navigates via iterative refinement (3 steps). Soft writes
@@ -816,9 +814,11 @@ never materializing `[BS, N, B, D]`). Stage 3 operates on dense `[BS, N, D]` ten
 means `W_pm[:, b]`, shape `[BS, D_pm, D_pm]`. `H[:, :, b]` means `H.reshape(BS, N, D)`
 (same for all banks — bank index selects memory, not column states).
 
-**W_gate is element-wise (not a matrix):**
-`gate = sigmoid(w1 * y + w2 * delta + bias)` where w1, w2 are learned `[D]`
-vectors. No matmul — O(D) not O(D²). Per-bank or shared across banks.
+**W_gate is a scalar gate (dot-product similarity):**
+`dot = (y * delta).sum(-1, keepdim=True) / D_mem` — scalar dot-product similarity.
+`gate = sigmoid(g_alpha * dot + g_bias)` where `g_alpha` and `g_bias` are learned scalars.
+The gate is a scalar per position (not element-wise), controlling how much of
+delta to incorporate at each trail step.
 
 **Seed and w_cand are shared across banks (grouped projection):**
 `W_seed_w` is a GroupedLinear(C, D_col, 2*D_col) producing `[BS, N, C, 2*D_col]`,
@@ -851,13 +851,15 @@ previous segment. "Frozen within segment" means their values don't change during
 the forward pass, but they participate in the computation graph. At TBPTT chunk
 boundaries, `detach_states()` breaks the gradient chain.
 
-**Scan layer structure (v5.1 — dense):**
+**Scan layer structure (v5.1 — dense, with GLU output):**
 Each scan layer: dense nn.Linear input projection `[D → 2*d_inner]` producing
-(a_raw, b_raw), then `a = sigmoid(a_raw)` (decay gate ∈ [0,1]),
-`b = silu(b_raw)` (input gate). Output projection `[d_inner → D]` + RMSNorm(D).
-Param count per layer: D×2*d_inner + d_inner×D + biases ≈ 4×D×d_inner.
-With D=2048, d_inner=1024: ~6.3M params/layer × 12 layers = ~75.6M (scan params).
-Remaining params in proj_up/down, W_seed_w, W_pcm, W_enc, lm_head, and memory params.
+(a_raw, b_raw), then `a = sigmoid(a_raw)` (decay gate in [0,1]),
+`b = silu(b_raw)` (input gate). When glu_output=True (default Tier A), output
+projection is `[d_inner → 2*D]`, split into gate and up, combined as
+`output = silu(gate) * up` (SwiGLU). Otherwise output projection is `[d_inner → D]`.
+RMSNorm(D) follows. Param count per layer with GLU: D*2*d_inner + d_inner*2*D + biases
+approx 8*D*d_inner. With D=2048, d_inner=1024: ~8.4M params/layer. Without GLU: ~6.3M/layer.
+Remaining params in proj_up/down, W_seed_w, W_pcm, W_enc, lm_head, EM projections, and memory params.
 
 **Stage 3 a'_t derivation:**
 Same structure as Stage 1. `a'_t` and `b'_t` are derived from the integrated
@@ -893,12 +895,14 @@ amplification of surprising features, suppression of predicted features.
 |--------|-------------|---------|
 | **D** | `D` | Model width — the main hidden dimension used throughout |
 | **D_embed** | `D_embed` | Embedding/unembedding dimension (may differ from D via proj_up/proj_down) |
+| **D_mem** | `D_mem` | EM latent compression dimension. EM state is [BS, B, M, D_mem]. Learned projections mem_proj_in/out map D↔D_mem |
 | **C** | `C` | Number of cortical columns (feature groups). PCM and W_seed_w operate per-group |
 | **D_col** | `D_col` | Column width = D / C. Derived, not set directly |
 | **B** | `B` | Memory banks — PM and EM each have B independent banks. Different β_b per bank → multiple timescales |
 | **N** | `N` | Segment length in tokens. One cycle of Stage 1 → 2 → 3 processes N tokens |
 | **K_segments** | `K_segments` | TBPTT chunk = K_segments × N tokens. Activations from all K segments stored for backward |
-| **L_scan** | `L_scan` | Scan layers per stage (Stage 1 and Stage 3 each have L_scan layers). Total = 2 × L_scan |
+| **L_scan** | `L_scan` | Scan layers for Stage 1 |
+| **L_scan_s3** | `L_scan_s3` | Scan layers for Stage 3. If not set, defaults to L_scan. Total layers = L_scan + L_scan_s3 |
 | **scan_expansion** | `scan_expansion` | Used to derive d_inner when d_inner = -1: d_inner = D_col × scan_expansion |
 | **d_inner** | `d_inner` | Scan recurrence hidden dim per layer. Set explicitly in tier presets |
 | **M** | `M` | EM capacity — number of primitive patterns per bank |
@@ -911,43 +915,48 @@ amplification of surprising features, suppression of predicted features.
 | **S_max** | `S_max` | Max individual primitive strength before clamping |
 | **neuromod_hidden** | `neuromod_hidden` | Hidden dim of the EM neuromodulator MLP |
 | **pcm_pred_weight** | `pcm_pred_weight` | Weight of the PCM auxiliary loss in total loss |
+| **glu_output** | `glu_output` | If True, scan layer proj_out produces 2*D (SwiGLU: silu(gate)*up). Default True in Tier A |
 
 ### Tier Comparison
 
 | | **Tier A** | **Tier B** | **Tier C** |
 |---|---|---|---|
-| **Total params** | **92M** | **251M** | **844M** |
+| **Total params** | **~133M** | **251M** | **844M** |
 | D (model width) | 2048 | 3072 | 4096 |
-| D_embed | 384 | 512 | 768 |
+| D_embed | 768 | 512 | 768 |
+| D_mem (EM latent) | 512 | 512 | 1024 |
 | C (columns) | 16 | 16 | 16 |
 | D_col = D/C | 128 | 192 | 256 |
 | B (banks) | 4 | 6 | 8 |
-| L_scan (per stage) | 6 | 12 | 16 |
+| L_scan (Stage 1) | 6 | 12 | 16 |
+| L_scan_s3 (Stage 3) | 6 | 12 | 16 |
 | d_inner | 1024 | 1024 | 2048 |
-| d_inner / D_col | 8× | 5.3× | 8× |
+| d_inner / D_col | 8x | 5.3x | 8x |
+| glu_output | True | True | True |
 | M (EM slots/bank) | 384 | 512 | 768 |
 | D_pm (PM matrix) | 64 | 64 | 64 |
 | n_trail_steps | 3 | 2 | 3 |
-| **Stage1+Stage3** | 75.6M | 226.7M | 755.5M |
+| **Stage1+Stage3** | ~100M | 226.7M | 755.5M |
 | **PM state** (BS=16) | 512 KB | 1.5 MB | 512 KB |
-| **EM state** (BS=16) | ~150 MB | ~600 MB | ~600 MB |
+| **EM state** (BS=16) | ~75 MB (D_mem=512) | ~300 MB (D_mem=512) | ~600 MB (D_mem=1024) |
 | **Comparable to** | Mamba-130M, Pythia-160M | Mamba-370M, Pythia-410M | Qwen3.5-0.8B, Mamba-1.4B |
 
-**Parameter breakdown (Tier A, 92M):**
+**Parameter breakdown (Tier A, ~133M):**
 
 | Module | Params | % |
 |--------|--------|---|
-| stage1 (scan layers) | 37.8M | 41% |
-| stage3 (scan layers) | 37.8M | 41% |
-| embedding | 12.3M | 13% |
+| stage1 (scan layers, GLU) | ~50M | 38% |
+| stage3 (scan layers, GLU) | ~50M | 38% |
+| embedding | 24.6M (32000 x 768) | 18% |
 | lm_head (tied) | (shared) | — |
-| pcm | 0.8M | 1% |
-| proj_up / proj_down | 0.8M each | 2% |
+| pcm | 0.8M | <1% |
+| proj_up / proj_down | 1.6M each | 2% |
 | W_seed_w | 0.5M | <1% |
 | pm (proj_in/out + beta) | 0.26M | <1% |
+| EM projections (mem_proj_in/out) | 2.1M | 2% |
 | em_neuromod + W_nov | <0.1M | <1% |
 | pm W_pm state (BS=16) | 0.13M | (runtime, not trained) |
-| em K/V/S state (BS=16) | ~38M | (runtime, not trained) |
+| em K/V/S state (BS=16) | ~19M (D_mem=512) | (runtime, not trained) |
 
 > Note: PM and EM state tensors (W_pm, em_K/V/S) are **runtime state**, not trained parameters.
 > They evolve during inference and are checkpointed but do not receive gradient updates directly —
@@ -965,8 +974,8 @@ This architecture has two distinct categories of "weights":
 
 **Runtime state** (stream-specific, evolves during inference, checkpointed):
 - `W_pm [BS, B, D_pm, D_pm]` — PM fast-weight matrix, updated by Hebbian rule
-- `em_K [BS, B, M, D]` — EM primitive keys
-- `em_V [BS, B, M, D]` — EM primitive values
+- `em_K [BS, B, M, D_mem]` — EM primitive keys (in compressed latent space)
+- `em_V [BS, B, M, D_mem]` — EM primitive values (in compressed latent space)
 - `em_S [BS, B, M]` — EM primitive strengths
 
 The scan's recurrent hidden state `h` is also runtime state but is not checkpointed (it's ephemeral within a segment).
@@ -982,7 +991,7 @@ The scan's recurrent hidden state `h` is also runtime state but is not checkpoin
 | Fan-out/fan-in | Required (D ↔ G×D_col) | Not needed (columns = D_col slices of D) |
 | Memory within segment | Updates R times (between passes) | Frozen reads + causal write buffers (prefix sum) |
 | Surprise | Scalar (cross-pass: ‖z^r - z_hat^{r-1}‖) | Vector (within-scan: z_hat_{t-1} - z_t) |
-| Memory addressing | Block-level D, sliced per column | Column-local D_col slices of bank |
+| Memory addressing | Block-level D, sliced per column | Full D projected to compressed D_mem latent |
 | Serial depth | O(R × 2L) FFN layers | O(L × log N) parallel-scan |
 | PM | Holographic slots (r slots, routing) | Fast-weight matrices (Hebbian, per-bank β) |
 | EM read | Top-k retrieval (hard selection) | Trail-based composition (soft, iterative) |

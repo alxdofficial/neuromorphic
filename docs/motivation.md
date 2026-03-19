@@ -108,8 +108,8 @@ ideas emerge from composing multiple primitives via trail-based navigation.
   Slow: decompose across primitives via soft routing at segment end, neuromodulator
   gates EMA write strength (cross-segment gradient via TBPTT).
   Fully differentiable — no hard selection anywhere.
-- **Column-local**: Column c only addresses its D_col slice of the bank's EM.
-- **State**: em_K, em_V [BS, B, M, D] — primitives are state, not parameters.
+- **Compressed latent space**: EM operates in a learned D_mem latent space with projections in/out, not column-local.
+- **State**: em_K, em_V [BS, B, M, D_mem] — primitives are state, not parameters.
   Evolve at inference for lifelong learning.
 - **Sacred**: Trail-based composition, soft activation (no top-k), novelty-based
   writes, neuromodulator trained by main loss, primitive decomposition.
