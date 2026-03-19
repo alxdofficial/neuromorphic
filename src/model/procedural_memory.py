@@ -10,12 +10,19 @@ Banks differ by plasticity rate (beta_b), giving multiple timescales.
 Read is bank-summed via W.sum(B) — no [BS,N,B,D] intermediate.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 from .utils import StateMixin
+
+
+def _logit(p: float) -> float:
+    """Inverse sigmoid: logit(p) = log(p / (1-p))."""
+    return math.log(p / (1.0 - p))
 
 
 class ProceduralMemory(nn.Module, StateMixin):
@@ -42,7 +49,6 @@ class ProceduralMemory(nn.Module, StateMixin):
         self.B = B
         self.D = D
         self.D_pm = D_pm
-        self.decay = decay
 
         # Fixed projections: D ↔ D_pm
         self.proj_in = nn.Linear(D, D_pm)
@@ -54,6 +60,14 @@ class ProceduralMemory(nn.Module, StateMixin):
         # Per-bank plasticity rate: softplus(raw) → always positive
         self.raw_beta = nn.Parameter(torch.full([B], -3.0))
 
+        # Per-bank decay rate: sigmoid(raw) → in (0, 1), init to target decay
+        self.raw_decay = nn.Parameter(torch.full([B], _logit(decay)))
+
+        # Surprise gate sensitivity: sigmoid(scale * ||surp|| + bias)
+        # Init: scale=1, bias=0 → recovers original sigmoid(||surp||)
+        self.surp_scale = nn.Parameter(torch.ones(1))
+        self.surp_bias = nn.Parameter(torch.zeros(1))
+
         # State (lazily allocated)
         self.W_pm: Tensor | None = None
 
@@ -61,6 +75,11 @@ class ProceduralMemory(nn.Module, StateMixin):
     def beta(self) -> Tensor:
         """Per-bank plasticity rate [B], always positive."""
         return F.softplus(self.raw_beta)
+
+    @property
+    def decay(self) -> Tensor:
+        """Per-bank decay rate [B], in (0, 1)."""
+        return torch.sigmoid(self.raw_decay)
 
     def initialize(self, BS: int, device: torch.device, dtype: torch.dtype):
         """Pre-allocate W_pm as (1/B)·I + small noise.
@@ -111,9 +130,10 @@ class ProceduralMemory(nn.Module, StateMixin):
         """
         BS, N, D_pm = pre.shape
 
-        # Surprise gate: σ(‖surprise‖) ∈ [0, 1] per token
+        # Surprise gate: σ(scale · ‖surprise‖ + bias) ∈ [0, 1] per token
+        # Learnable scale/bias let the model control sensitivity threshold
         surp_mag = surprise.norm(dim=-1)                  # [BS, N]
-        s = torch.sigmoid(surp_mag)                       # [BS, N]
+        s = torch.sigmoid(self.surp_scale * surp_mag + self.surp_bias)  # [BS, N]
 
         # Gated autocorrelation: G = (1/N) · Σ_t s_t · pre_t ⊗ pre_t^T
         # Efficient: G = (1/N) · (√s · pre)^T @ (√s · pre)
@@ -123,11 +143,12 @@ class ProceduralMemory(nn.Module, StateMixin):
             weighted.transpose(-1, -2), weighted          # [BS, D_pm, D_pm]
         ) * (1.0 / N)
 
-        # Per-bank transform: T_b = decay·I + β_b·G
+        # Per-bank transform: T_b = decay_b·I + β_b·G
         beta = self.beta                                  # [B]
+        decay = self.decay                                # [B]
         eye = torch.eye(D_pm, device=pre.device, dtype=pre.dtype)
-        # G: [BS, 1, D_pm, D_pm], beta: [1, B, 1, 1]
-        T = self.decay * eye + beta[None, :, None, None] * G.unsqueeze(1)
+        # decay: [1, B, 1, 1], G: [BS, 1, D_pm, D_pm], beta: [1, B, 1, 1]
+        T = decay[None, :, None, None] * eye + beta[None, :, None, None] * G.unsqueeze(1)
 
         # Update: W_b = W_b @ T_b  (batched matmul)
         self.W_pm = torch.matmul(self.W_pm, T)           # [BS, B, D_pm, D_pm]

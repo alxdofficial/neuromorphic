@@ -8,12 +8,19 @@ Write: novelty-scored soft-routing decomposition with neuromodulated EMA.
 All bank operations are vectorized — no per-bank Python loops.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 from .utils import StateMixin, unit_normalize, budget_enforce
+
+
+def _logit(p: float) -> float:
+    """Inverse sigmoid: logit(p) = log(p / (1-p))."""
+    return math.log(p / (1.0 - p))
 
 
 class EpisodicMemory(nn.Module, StateMixin):
@@ -38,7 +45,6 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.n_steps = n_steps
         self.S_max = S_max
         self.budget = budget
-        self.decay = decay
         self.topk = topk if topk > 0 else M  # 0 means all (no top-k)
 
         # Latent compression: D → D_mem for memory storage
@@ -58,6 +64,9 @@ class EpisodicMemory(nn.Module, StateMixin):
         self.raw_tau = nn.Parameter(torch.zeros(B))             # softplus -> temperature
         self.raw_sigma = nn.Parameter(torch.full([B], -2.0))  # softplus -> noise std
         self.raw_tau_w = nn.Parameter(torch.zeros(B))      # write temperature
+
+        # Per-bank strength decay: sigmoid(raw) → in (0, 1)
+        self.raw_decay = nn.Parameter(torch.full([B], _logit(decay)))
 
         # State (lazily allocated)
         self.em_K: Tensor | None = None
@@ -274,10 +283,16 @@ class EpisodicMemory(nn.Module, StateMixin):
         # Budget enforcement
         self.em_S = budget_enforce(self.em_S.view(-1, M), self.budget).view_as(self.em_S)
 
+    @property
+    def decay(self) -> Tensor:
+        """Per-bank decay rate [B], in (0, 1)."""
+        return torch.sigmoid(self.raw_decay)
+
     def base_decay(self):
-        """Apply strength decay once per segment."""
+        """Apply per-bank strength decay once per segment."""
         if self.em_S is not None:
-            self.em_S = self.em_S * self.decay
+            # decay: [B] → [1, B, 1] to broadcast over [BS, B, M]
+            self.em_S = self.em_S * self.decay[None, :, None]
 
     def usage_all(self) -> Tensor:
         """Usage fraction for all banks. Returns [BS, B]."""
