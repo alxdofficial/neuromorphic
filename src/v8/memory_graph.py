@@ -135,25 +135,14 @@ class MemoryGraph:
         D = self.config.D_mem
         max_conn = self.config.max_connections
 
-        # 1. Inject CC signals into port neurons' activation buffer
-        # cc_port_idx: [C], cc_signals: [BS, C, D_mem]
+        # 1. Inject CC signals into port neurons' prev_output so they're
+        #    visible to connected neurons in this step's gather
         for c in range(self.config.C):
-            self.activations[:, self.cc_port_idx[c]] += cc_signals[:, c]
+            self.prev_output[:, self.cc_port_idx[c]] = (
+                self.prev_output[:, self.cc_port_idx[c]] + cc_signals[:, c]
+            )
 
         # 2. Gather inputs: each neuron sums prev_output of connected neurons
-        # conn_indices: [N, max_conn] → gather from prev_output [BS, N, D]
-        # Expand for gather: [BS, N, max_conn, D]
-        idx = self.conn_indices.unsqueeze(0).unsqueeze(-1).expand(
-            BS, N, max_conn, D
-        )  # [BS, N, max_conn, D]
-        gathered = torch.gather(
-            self.prev_output.unsqueeze(2).expand(BS, N, max_conn, D),
-            dim=1,
-            index=idx.clamp(max=N - 1),
-        )  # Nah, this doesn't work with gather on dim=1
-
-        # Simpler: index prev_output with conn_indices
-        # prev_output: [BS, N, D], conn_indices: [N, max_conn]
         flat_idx = self.conn_indices.reshape(-1)  # [N * max_conn]
         gathered_flat = self.prev_output[:, flat_idx]  # [BS, N*max_conn, D]
         gathered = gathered_flat.reshape(BS, N, max_conn, D)
@@ -177,9 +166,9 @@ class MemoryGraph:
         self.usage_count = self._ema_decay * self.usage_count + alpha * (output_mag > 0.01).float()
 
         # 4. Route: divide output among connections by energy thresholds
-        # Lower threshold = easier to send = higher weight
+        #    Energy conservation: route_weights sum to 1, so total outbound
+        #    magnitude = output magnitude (softmax + renormalize guarantees this)
         route_logits = -self.thresholds / max(self.config.mem_temperature, 1e-6)
-        # Mask invalid connections
         route_logits = route_logits.masked_fill(~self.conn_mask.unsqueeze(0), float('-inf'))
 
         route_weights = F.softmax(route_logits, dim=-1)  # [BS, N, max_conn]
@@ -191,36 +180,22 @@ class MemoryGraph:
             topk_vals, _ = route_weights.topk(k_keep, dim=-1)
             threshold = topk_vals[:, :, -1:]  # [BS, N, 1]
             route_weights = route_weights * (route_weights >= threshold).float()
-            # Renormalize
             route_sum = route_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             route_weights = route_weights / route_sum
 
-        # Energy conservation: output magnitude is preserved
-        output_norm = outputs.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [BS, N, 1]
-        output_dir = outputs / output_norm  # [BS, N, D] unit direction
-
-        # Scatter: for each neuron i, for each connection j:
-        #   activations[conn_indices[i,j]] += route_weights[i,j] * output_norm[i] * output_dir[i]
-        # = route_weights[i,j] * outputs[i]
+        # Scatter: route_weights[i,j] * outputs[i] → activations[conn[i,j]]
         weighted = route_weights.unsqueeze(-1) * outputs.unsqueeze(2)  # [BS, N, max_conn, D]
 
-        # Reset activations buffer, then scatter-add
         self.activations.zero_()
         flat_idx = self.conn_indices.reshape(-1)  # [N * max_conn]
-        # Expand to [BS, N*max_conn, D]
         weighted_flat = weighted.reshape(BS, N * max_conn, D)
-        # Scatter add into activations
         idx_expanded = flat_idx.unsqueeze(0).unsqueeze(-1).expand(BS, -1, D)
         self.activations.scatter_add_(1, idx_expanded, weighted_flat)
 
-        # Re-inject CC signals (they were added before routing, add again for readout)
-        # Actually, CC ports read from activations AFTER routing
-        # So CC signals from this step are part of the activation buffer
+        # 5. Read CC port activations for return signal (clone to avoid aliasing)
+        mem_signals = self.activations[:, self.cc_port_idx].clone()  # [BS, C, D]
 
-        # 5. Read CC port activations for return signal
-        mem_signals = self.activations[:, self.cc_port_idx]  # [BS, C, D]
-
-        # 6. Swap buffers
+        # 6. Swap: prev_output = this step's MLP outputs (for next step's gather)
         self.prev_output = outputs.clone()
 
         return mem_signals

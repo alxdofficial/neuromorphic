@@ -121,7 +121,9 @@ class V8Model(nn.Module):
         ppo_buffer = None
         if collect_ppo:
             n_envs = BS * N_neurons
-            n_actions = T // action_every
+            # Neuromod fires at t=0, action_every, 2*action_every, ...
+            # Use ceiling to handle T not divisible by action_every
+            n_actions = (T + action_every - 1) // action_every
             ppo_buffer = PPORolloutBuffer(
                 n_actions, n_envs,
                 self._neuromod_obs_dim, self.neuromod.act_dim,
@@ -133,8 +135,16 @@ class V8Model(nn.Module):
         action_step = 0
 
         for t in range(T):
+            # Doc boundary: reset BEFORE stepping so EOT token gets fresh memory
+            if not self.config.lifelong_mode and t > 0:
+                eot_mask = (input_ids[:, t - 1] == self.config.eot_id)
+                if eot_mask.any():
+                    self._mem_graph.reset_streams(eot_mask)
+
             # Step memory graph with CC signal for this token
-            mem_out = self._mem_graph.step(cc_signals_all[:, t])  # [BS, C, D_mem]
+            # Disable autocast: memory graph operates in float32
+            with torch.autocast(device_type=device.type, enabled=False):
+                mem_out = self._mem_graph.step(cc_signals_all[:, t])  # [BS, C, D_mem]
             mem_signals[:, t] = mem_out
 
             # Neuromodulator acts every action_every tokens
@@ -158,11 +168,13 @@ class V8Model(nn.Module):
                         obs_flat
                     )
 
-                # Apply actions to memory graph
+                # Clamp actions before applying to memory graph
+                max_act = self.config.max_action_magnitude
+                clamped_action = action.clamp(-max_act, max_act)
                 D_mem_act = self.config.D_mem
                 max_conn = self.config.max_connections
-                delta_prim = action[:, :D_mem_act].reshape(BS, N_neurons, D_mem_act)
-                delta_thresh = action[:, D_mem_act:].reshape(BS, N_neurons, max_conn)
+                delta_prim = clamped_action[:, :D_mem_act].reshape(BS, N_neurons, D_mem_act)
+                delta_thresh = clamped_action[:, D_mem_act:].reshape(BS, N_neurons, max_conn)
                 self._mem_graph.apply_actions(delta_prim, delta_thresh)
 
                 # Store experience (reward filled in later)
@@ -178,11 +190,7 @@ class V8Model(nn.Module):
 
                 prev_cc_surprise = mean_surp
 
-            # Doc boundary: reset mid-chunk if token is EOT
-            if not self.config.lifelong_mode:
-                eot_mask = (input_ids[:, t] == self.config.eot_id)
-                if eot_mask.any():
-                    self._mem_graph.reset_streams(eot_mask)
+            # (doc boundary reset moved to top of loop — fires before step)
 
         # ==========================================
         # Pass 2: Post-memory scan (parallel)
@@ -196,14 +204,14 @@ class V8Model(nn.Module):
         if target_ids is not None and ppo_buffer is not None and action_step > 0:
             with torch.no_grad():
                 # Per-token CE loss [BS, T]
-                log_probs = -torch.nn.functional.cross_entropy(
+                per_token_ce = torch.nn.functional.cross_entropy(
                     logits.detach().reshape(-1, self.config.vocab_size),
                     target_ids.reshape(-1),
                     reduction='none',
                 ).reshape(BS, T)
 
-                # Reward = negative loss (higher is better)
-                rewards = -log_probs  # [BS, T]
+                # Reward = negative loss (lower CE = higher reward)
+                rewards = -per_token_ce  # [BS, T]
 
                 # Aggregate rewards per action step (mean over action_every tokens)
                 # and per block (each block's reward = mean of its CC's tokens)

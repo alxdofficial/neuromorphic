@@ -38,8 +38,9 @@ class Neuromodulator(nn.Module):
         self.thresh_head = nn.Linear(hidden, max_conn)
 
         # Separate log_std per action group (state-independent)
-        self.prim_logstd = nn.Parameter(torch.full((1, D_mem), -1.0))
-        self.thresh_logstd = nn.Parameter(torch.full((1, max_conn), -1.0))
+        # Init std ≈ 0.05 (logstd=-3.0) so clamp at ±0.1 is rarely triggered
+        self.prim_logstd = nn.Parameter(torch.full((1, D_mem), -3.0))
+        self.thresh_logstd = nn.Parameter(torch.full((1, max_conn), -3.0))
 
         # Critic: separate network (same depth as actor)
         critic_layers = []
@@ -102,9 +103,8 @@ class Neuromodulator(nn.Module):
         if action is None:
             action = dist.sample()
 
-        # Clip actions to max magnitude
-        action = action.clamp(-self.max_action, self.max_action)
-
+        # Compute log_prob on the raw (unclamped) action for correct gradients.
+        # Clamping happens downstream when applying to the memory graph.
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         value = self.critic(obs).squeeze(-1)

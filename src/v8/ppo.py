@@ -110,7 +110,11 @@ class PPORolloutBuffer:
 
     def get_minibatches(self, minibatch_size: int):
         """Flatten [T, N_envs] → [T*N_envs] and yield random minibatches."""
+        assert self.advantages is not None, \
+            "compute_returns() must be called before get_minibatches()"
         T = self.step
+        if T == 0:
+            return  # empty buffer, yield nothing
         batch_size = T * self.num_envs
         indices = torch.randperm(batch_size, device=self.device)
 
