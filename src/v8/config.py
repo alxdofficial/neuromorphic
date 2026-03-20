@@ -122,13 +122,13 @@ class V8Config:
     @classmethod
     def tier_a(cls, **overrides) -> "V8Config":
         defaults = dict(
-            D=2048, D_embed=768, C=16, L_total=8, L_mem=4,
+            D=2048, D_embed=768, C=16, L_total=7, L_mem=4,
             d_inner=1024, glu_output=True, T=2048,
             # Memory graph: 8 blocks × 1024 neurons, D_mem=D_cc=128
             N_blocks=8, M_per_block=1024,
             K_intra=128, K_inter=32,
             pcm_hidden=256,
-            neuromod_hidden=1024, neuromod_layers=3,
+            neuromod_hidden=2048, neuromod_layers=3,
         )
         defaults.update(overrides)
         return cls(**defaults)
