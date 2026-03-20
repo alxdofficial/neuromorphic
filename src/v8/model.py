@@ -33,9 +33,10 @@ class V8Model(nn.Module):
         # Neuromodulator (trained by PPO, has its own optimizer)
         # Created eagerly so it's in the module tree for .parameters(), .to(), etc.
         self._mem_graph = None  # initialized lazily per BS/device
-        # Placeholder obs_dim — will be corrected on first _ensure_memory
-        _approx_obs_dim = config.D_mem * 3 + 2 + config.D_cc
-        self.neuromod = Neuromodulator(config, _approx_obs_dim)
+        # obs_dim: D_mem*3 (prim+mean_in+mean_out) + 2 (usage+entropy) + D_cc (surprise)
+        # Since D_mem = D_cc: obs_dim = D_cc * 4 + 2
+        obs_dim = config.D_cc * 4 + 2
+        self.neuromod = Neuromodulator(config, obs_dim)
 
     def _ensure_memory(self, BS: int, device: torch.device,
                        dtype: torch.dtype = torch.float32):
@@ -52,17 +53,12 @@ class V8Model(nn.Module):
         return self._mem_graph
 
     def get_ppo_params(self):
-        """All parameters trained by PPO (neuromod + mem_proj_in + W_mod).
+        """All parameters trained by PPO (neuromodulator only).
 
-        Returns list of param dicts for the PPO optimizer.
+        W_mod (memory graph modulation MLP) is a plain tensor, not yet
+        included in any optimizer — flagged as open issue.
         """
-        params = list(self.neuromod.parameters())
-        # mem_proj_in: detached from LM graph, trained by PPO
-        for proj in self.lm.mem_proj_in:
-            params.extend(proj.parameters())
-        # W_mod: plain tensors in memory graph, need manual optimization
-        # (handled separately via apply_wmod_grads or included here if converted)
-        return params
+        return list(self.neuromod.parameters())
 
     def forward_chunk(
         self,
@@ -123,9 +119,9 @@ class V8Model(nn.Module):
         if reset_mask is not None and reset_mask.any():
             self._mem_graph.reset_streams(reset_mask)
 
-        # Build per-token CC→memory signals (detach from LM graph)
-        cc_signals_all = self.lm.build_cc_signals(H, surprise)
-        cc_signals_all = cc_signals_all.detach().float()
+        # CC→memory signals: raw H sliced into per-CC columns (D_mem = D_cc)
+        # No projection needed. Detach since memory graph is the environment.
+        cc_signals_all = H.detach().view(BS, T, C, D_mem).float()
 
         # ==========================================
         # Memory loop: step graph per token

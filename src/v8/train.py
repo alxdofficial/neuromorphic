@@ -131,14 +131,12 @@ def main():
         print("Compiling model...")
         model.lm = torch.compile(model.lm)
 
-    # LM Optimizer — exclude biases, norms, and mem_proj_in (trained by PPO)
+    # LM Optimizer — exclude biases and norms from weight decay
     decay_params = []
     no_decay_params = []
     for name, param in model.lm.named_parameters():
         if not param.requires_grad:
             continue
-        if "mem_proj_in" in name:
-            continue  # trained by PPO, not LM optimizer
         if param.ndim <= 1 or name.endswith(".bias"):
             no_decay_params.append(param)
         else:

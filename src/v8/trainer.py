@@ -56,15 +56,8 @@ class V8Trainer:
 
     def _ensure_ppo(self):
         if self.ppo_trainer is None and self.model.neuromod is not None:
-            # Include mem_proj_in params in PPO optimizer
-            # (they're detached from LM graph, trained only through PPO)
-            extra_params = list(self.model.get_ppo_params())
-            # Filter out neuromod params (already included by PPOTrainer)
-            neuromod_param_ids = {id(p) for p in self.model.neuromod.parameters()}
-            extra_params = [p for p in extra_params if id(p) not in neuromod_param_ids]
             self.ppo_trainer = PPOTrainer(
                 self.model.neuromod, self.config, self.device,
-                extra_params=extra_params,
             )
 
     def train_chunk(self, batch) -> dict:

@@ -98,14 +98,10 @@ class TestV8Gradients:
         ) + result["aux_loss"]
         loss.backward()
 
-        # Check key LM params have gradients
-        # mem_proj_in is excluded: its output is detached before entering
-        # the memory graph (trained by PPO, not backprop)
+        # Check all LM params have gradients (no projections to exclude now)
         no_grad = []
         for name, param in model.lm.named_parameters():
             if param.requires_grad and param.grad is None:
-                if "mem_proj_in" in name:
-                    continue  # expected: trained by PPO
                 no_grad.append(name)
         assert len(no_grad) == 0, f"LM params with no gradient: {no_grad}"
 
@@ -128,8 +124,8 @@ class TestV8Gradients:
             assert layer.proj_in.weight.grad.abs().sum() > 0, \
                 f"Zero gradient for layers[{i}].proj_in"
 
-    def test_mem_proj_gradient(self):
-        """Memory projection layers should get gradient (through mem_gate)."""
+    def test_mem_gate_gradient(self):
+        """Memory gate should get gradient through post-memory scan."""
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
@@ -142,11 +138,7 @@ class TestV8Gradients:
         )
         loss.backward()
 
-        # mem_proj_out starts zero-init, so gradient may be zero initially
-        # But mem_gate should have gradient
         assert model.lm.mem_gate.grad is not None
-        # mem_proj_in is detached (goes to memory env), so no LM gradient
-        # This is expected — mem_proj_in is trained indirectly through PPO
 
     def test_memory_not_in_autograd(self):
         """Memory graph tensors should not require grad."""

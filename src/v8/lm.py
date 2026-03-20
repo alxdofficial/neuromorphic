@@ -1,8 +1,13 @@
-"""V8 Language Model — scan stack + per-CC PCM + memory interface.
+"""V8 Language Model — scan stack + per-CC PCM.
 
 Full-D scan layers provide the language model backbone. Per-CC PCM modules
 compute surprise independently per column. Memory signals are injected
 additively at the L_mem boundary.
+
+CC↔memory interface requires no projections: D_mem = D_cc by design.
+The CC's raw activity at L_mem IS the memory input. The memory graph's
+raw output IS the CC's memory signal. The memory gate controls how much
+the CC listens to memory.
 
 The LM is split into two phases for the memory loop:
   forward_pre_memory():  layers[0..L_mem-1] + PCM → H, surprise
@@ -21,7 +26,7 @@ from .config import V8Config
 
 
 class V8LM(nn.Module):
-    """Language model with per-CC memory interface."""
+    """Language model with direct CC↔memory interface (no projections)."""
 
     def __init__(self, config: V8Config):
         super().__init__()
@@ -32,7 +37,6 @@ class V8LM(nn.Module):
         D_embed = config.D_embed
         D_cc = config.D_cc
         C = config.C
-        D_mem = config.D_mem
 
         # Embedding + positional encoding (sized to T)
         self.embedding = nn.Embedding(config.vocab_size, D_embed)
@@ -59,30 +63,9 @@ class V8LM(nn.Module):
         else:
             self.pcm_modules = None
 
-        # Per-CC memory interface (2-layer MLPs for richer projection)
-        proj_h = config.mem_proj_hidden
-        # CC→memory: project (H_slice concat surprise_slice) → D_mem
-        self.mem_proj_in = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(D_cc + D_cc, proj_h),
-                nn.SiLU(),
-                nn.Linear(proj_h, D_mem),
-            ) for _ in range(C)
-        ])
-        # Memory→CC: project D_mem → D_cc
-        self.mem_proj_out = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(D_mem, proj_h),
-                nn.SiLU(),
-                nn.Linear(proj_h, D_cc),
-            ) for _ in range(C)
-        ])
-        # Zero-init last layer of mem_proj_out so memory starts silent
-        for proj in self.mem_proj_out:
-            nn.init.zeros_(proj[-1].weight)
-            nn.init.zeros_(proj[-1].bias)
-
-        # Learnable memory gate per CC (sigmoid(0) = 0.5 at init)
+        # Memory gate per CC (sigmoid(0) = 0.5 at init)
+        # This is the only CC↔memory interface parameter.
+        # No projections needed since D_mem = D_cc.
         self.mem_gate = nn.Parameter(torch.zeros(C))
 
         # Output head
@@ -112,10 +95,10 @@ class V8LM(nn.Module):
         D = self.config.D
 
         # Embed
-        x = self.embedding(input_ids)           # [BS, T, D_embed]
+        x = self.embedding(input_ids)
         if self.proj_up is not None:
-            x = self.proj_up(x)                 # [BS, T, D]
-        x = x + self.pos_embed[:T]              # [BS, T, D]
+            x = self.proj_up(x)
+        x = x + self.pos_embed[:T]
 
         # Pre-memory scan layers
         H = x
@@ -136,68 +119,37 @@ class V8LM(nn.Module):
             surprise_list = []
             gain_modulated = []
             for c in range(C):
-                h_c = H_cols[:, :, c]            # [BS, T, D_cc]
-                x_c = x_cols[:, :, c]            # [BS, T, D_cc]
+                h_c = H_cols[:, :, c]
+                x_c = x_cols[:, :, c]
                 surp, z_hat, z = self.pcm_modules[c].compute_surprise(h_c, x_c)
                 h_c = self.pcm_modules[c].apply_gain(h_c, surp)
                 aux_loss = aux_loss + self.pcm_modules[c].prediction_loss(z_hat, z)
                 surprise_list.append(surp)
                 gain_modulated.append(h_c)
-            # Rebuild H from gain-modulated columns (no in-place modification)
             H = torch.stack(gain_modulated, dim=2).reshape(BS, T, D)
-            surprise = torch.stack(surprise_list, dim=2)  # [BS, T, C, D_cc]
+            surprise = torch.stack(surprise_list, dim=2)
             aux_loss = aux_loss / C * self.config.pcm_pred_weight
         else:
             surprise = torch.zeros(BS, T, C, D_cc, device=H.device, dtype=H.dtype)
 
         return H, x, surprise, aux_loss
 
-    def build_cc_signals(self, H: Tensor, surprise: Tensor) -> Tensor:
-        """Build per-CC signals for the memory graph.
-
-        Args:
-            H: [BS, T, D] — hidden states
-            surprise: [BS, T, C, D_cc] — per-CC surprise
-
-        Returns:
-            cc_signals: [BS, T, C, D_mem] — projected CC→memory signals
-        """
-        BS, T, D = H.shape
-        C = self.config.C
-        D_cc = self.config.D_cc
-
-        H_cols = H.view(BS, T, C, D_cc)
-        signals = []
-        for c in range(C):
-            combined = torch.cat([H_cols[:, :, c], surprise[:, :, c]], dim=-1)
-            sig = self.mem_proj_in[c](combined)  # [BS, T, D_mem]
-            signals.append(sig)
-        return torch.stack(signals, dim=2)  # [BS, T, C, D_mem]
-
     def forward_post_memory(self, H: Tensor, mem_signals: Tensor) -> Tensor:
         """Pass 2: memory injection + post-memory scan + output.
 
         Args:
             H: [BS, T, D] — hidden states from pre-memory pass
-            mem_signals: [BS, T, C, D_mem] — memory signals per position per CC
+            mem_signals: [BS, T, C, D_cc] — memory signals (D_mem = D_cc)
 
         Returns:
             logits: [BS, T, vocab]
         """
         BS, T, D = H.shape
         C = self.config.C
-        D_cc = self.config.D_cc
 
-        # Project memory signals → D_cc per CC, then reshape to D
-        mem_projected_list = []
-        for c in range(C):
-            mem_projected_list.append(
-                self.mem_proj_out[c](mem_signals[:, :, c])  # [BS, T, D_cc]
-            )
-        mem_projected = torch.stack(mem_projected_list, dim=2)  # [BS, T, C, D_cc]
-
+        # Direct injection: gate * mem_signals, reshaped to D
         gate = torch.sigmoid(self.mem_gate)  # [C]
-        mem_contribution = gate[None, None, :, None] * mem_projected  # [BS, T, C, D_cc]
+        mem_contribution = gate[None, None, :, None] * mem_signals  # [BS, T, C, D_cc]
         H = H + mem_contribution.reshape(BS, T, D)
 
         # Post-memory scan layers

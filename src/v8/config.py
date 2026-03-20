@@ -9,7 +9,7 @@ class V8Config:
     D: int = 2048
     D_embed: int = 768
     C: int = 16                  # cortical columns (= memory blocks)
-    D_cc: int = -1               # derived: D // C
+    D_cc: int = -1               # derived: D // C = neuron dim
     L_total: int = 10            # total scan layers
     L_mem: int = 5               # memory injection point
     d_inner: int = 1024
@@ -25,16 +25,13 @@ class V8Config:
     pcm_hidden: int = 256        # hidden dim for per-CC PCM
 
     # Memory Graph
+    # D_mem = D_cc always (neurons match CC width, no projections needed)
     N_neurons: int = 4096        # total neurons (C * M_per_block)
     M_per_block: int = 256       # neurons per block
-    D_mem: int = 256             # primitive vector dimension
     inter_block_k: int = 32      # sparse connections per neuron to other blocks
     mem_temperature: float = 1.0 # routing softmax temperature
     mem_sparsity: float = 0.5    # fraction of connections zeroed in routing
     mem_mod_hidden: int = 512    # W_mod MLP hidden dim (inside memory graph)
-
-    # Memory interface (CC ↔ memory projections)
-    mem_proj_hidden: int = 512   # hidden dim for mem_proj_in/out MLPs
 
     # Neuromodulator
     neuromod_hidden: int = 1024
@@ -60,6 +57,11 @@ class V8Config:
 
     # Regularization
     reg_weight: float = 0.1
+
+    @property
+    def D_mem(self) -> int:
+        """Neuron primitive dim = CC dim. Always equal."""
+        return self.D_cc if self.D_cc > 0 else self.D // self.C
 
     @property
     def max_connections(self) -> int:
@@ -93,8 +95,6 @@ class V8Config:
                 f"N_neurons ({self.N_neurons}) must equal C * M_per_block "
                 f"({self.C} * {self.M_per_block} = {self.C * self.M_per_block})."
             )
-        if self.D_mem < 1:
-            raise ValueError(f"D_mem ({self.D_mem}) must be >= 1.")
         if self.T < 1:
             raise ValueError(f"T ({self.T}) must be >= 1.")
         if self.action_every < 1:
@@ -105,11 +105,10 @@ class V8Config:
         defaults = dict(
             D=2048, D_embed=768, C=16, L_total=8, L_mem=4,
             d_inner=1024, glu_output=True, T=2048,
-            # Memory graph: 4096 neurons, D_mem=256
-            N_neurons=4096, M_per_block=256, D_mem=256,
+            # Memory graph: 4096 neurons, D_mem=D_cc=128 (derived)
+            N_neurons=4096, M_per_block=256,
             inter_block_k=32, mem_mod_hidden=512,
-            # Beefier memory interface + neuromodulator
-            mem_proj_hidden=512, pcm_hidden=256,
+            pcm_hidden=256,
             neuromod_hidden=1024, neuromod_layers=3,
         )
         defaults.update(overrides)
@@ -121,9 +120,9 @@ class V8Config:
         defaults = dict(
             D=64, D_embed=64, C=4, L_total=4, L_mem=2,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
-            N_neurons=32, M_per_block=8, D_mem=16,
+            N_neurons=32, M_per_block=8,
             inter_block_k=4, mem_mod_hidden=32,
-            mem_proj_hidden=32, pcm_hidden=32,
+            pcm_hidden=32,
             neuromod_hidden=32, neuromod_layers=2,
             action_every=4, ppo_minibatch=16,
         )
