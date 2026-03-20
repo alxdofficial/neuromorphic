@@ -260,24 +260,26 @@ class V8Model(nn.Module):
                     window_mask = reward_mask[:, r_start:r_end]
                     valid = window_mask.sum(dim=1).clamp(min=1.0)
 
-                    # Per-CC reward: reshape tokens into [BS, C, tokens_per_CC]
-                    # Each CC processes D_cc of D, so per-CC reward approximation:
-                    # use the mean reward across the window per stream, then
-                    # weight by per-CC surprise magnitude for block-level credit
+                    # Per-stream base reward
                     per_stream_reward = window_rewards.sum(dim=1) / valid  # [BS]
 
-                    # Per-CC surprise in the window → block-level weighting
+                    # Per-CC surprise → per-block weighting
+                    # Average CC surprises within each block
                     window_surp = surprise[:, r_start:r_end].detach()  # [BS, win, C, D_cc]
                     cc_surp_mag = window_surp.norm(dim=-1).mean(dim=1)  # [BS, C]
-                    # Normalize so weights sum to C (preserves reward scale)
-                    cc_weights = cc_surp_mag / (cc_surp_mag.mean(dim=1, keepdim=True) + 1e-8)
+                    N_blocks = self.config.N_blocks
+                    ccs_pb = self.config.CCs_per_block
+                    # [BS, C] → [BS, N_blocks, ccs_pb] → mean → [BS, N_blocks]
+                    block_surp = cc_surp_mag.view(BS, N_blocks, ccs_pb).mean(dim=2)
+                    block_weights = block_surp / (block_surp.mean(dim=1, keepdim=True) + 1e-8)
 
-                    # Per-block reward: base reward × CC weight
-                    block_rewards = per_stream_reward.unsqueeze(1) * cc_weights  # [BS, C]
+                    # Per-block reward
+                    block_rewards = per_stream_reward.unsqueeze(1) * block_weights  # [BS, N_blocks]
 
                     # Expand to per-neuron: each neuron in block gets its block's reward
+                    M = self.config.M_per_block
                     neuron_rewards = block_rewards.unsqueeze(2).expand(
-                        BS, C, M
+                        BS, N_blocks, M
                     ).reshape(BS * N_neurons)
 
                     ppo_buffer.rewards[step_idx] = neuron_rewards

@@ -39,40 +39,42 @@ We replicate the principles that matter for language modeling:
 │  Two-pass forward:                                             │
 │    Pass 1: layers[0..3] + PCM → H [BS,T,D], surprise          │
 │    Pass 2: layers[4..7] with memory injection → logits         │
-│  Trained by backprop. 109M params.                             │
+│  Trained by backprop. ~99M params.                             │
 └────────────────────┬────────────────────┬──────────────────────┘
-                     │ CC signals         │ memory signals
-                     │ (H_slice+surprise  │ (per CC, D_mem=256)
-                     │  → 2-layer MLP     │
-                     │  → D_mem=256)      │
+                     │ raw H_slice        │ raw mem_signal
+                     │ (D_cc=128, no      │ (D_mem=D_cc=128,
+                     │  projection)       │  gated by mem_gate)
                      ▼                    │
 ┌───────────────────────────────────────────────────────────────┐
 │                    NEURAL MEMORY GRAPH                          │
-│  4096 neurons in 16 blocks × 256 per block                    │
-│  D_mem=256 primitive vectors, 288 connections per neuron       │
-│  (256 intra-block + 32 inter-block)                            │
+│  8192 neurons in 8 blocks × 1024 per block                    │
+│  D_mem = D_cc = 128 (no projections between CC and memory)    │
+│  160 connections per neuron (128 random intra + 32 inter)      │
+│  2 CCs per block (16 CCs / 8 blocks)                          │
 │                                                                │
-│  Each token: receive → modulate (2-layer W_mod) → route        │
+│  Each token: receive → modulate: silu(input * primitive) → route│
+│  No learned weights in memory — neuromod controls everything   │
+│  Per-neuron temperature (routing sharpness) + decay (persistence)│
 │  Energy-conserving: output magnitude = sum of outbound signals │
-│  Sparsity: bottom 50% of routing weights zeroed                │
 │                                                                │
 │  NOT in autograd. Runs with torch.no_grad().                   │
-│  ~17 MB state per stream. W_mod: 394K params (RL-trained).     │
+│  ~18 MB state per stream. Zero trainable params.               │
 └────────────────────┬───────────────────────────────────────────┘
                      │ neuron observations
                      ▼
 ┌───────────────────────────────────────────────────────────────┐
 │                    NEUROMODULATOR                               │
-│  PPO actor-critic, shared across all 4096 neurons              │
-│  Actor: 3-layer MLP (898→1024→1024→1024 → action heads)       │
+│  PPO actor-critic, shared across all 8192 neurons              │
+│  Actor: 3-layer MLP (obs→1024→1024→1024 → action heads)       │
 │  Critic: 3-layer MLP (same dims → scalar value)               │
 │  Actions every 8 tokens: delta_primitive + delta_thresholds    │
+│    + delta_temperature + delta_decay (290 dims per neuron)     │
 │  Reward: per-token CE loss (block-level, gamma=0.99)           │
-│  6.6M params. Trained by PPO.                                  │
+│  ~8M params. Trained by PPO.                                   │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-**Total trained params: 115.4M** (67.2M scan + 24.6M embedding + 16.3M memory-related + 6.6M neuromod)
+**Total trained params: ~107M** (67.2M scan + 24.6M embedding + 4.2M pos + 3.1M proj + 2.4M PCM + ~8M neuromod)
 
 ---
 
@@ -88,41 +90,47 @@ and causal token processing. Memory is an add-on, not a dependency.
 2. **Memory loop**: per-token CC↔memory signal exchange (sequential, cheap, no_grad)
 3. **Pass 2** (`forward_post_memory`): inject memory → layers[L_mem..L_total-1] → proj_down → logits
 
-**Per-CC interface:**
-- `mem_proj_in[c]`: 2-layer MLP `(D_cc+D_cc → 512 → D_mem)` — projects H_slice + surprise into memory signal
-- `mem_proj_out[c]`: 2-layer MLP `(D_mem → 512 → D_cc)` — projects memory signal back to CC width. Zero-initialized last layer.
+**CC↔memory interface — no projections:**
+- D_mem = D_cc = 128 by design. No projections needed.
+- CC→memory: raw `H_slice[:, t, c]` (D_cc=128) sent directly to port neuron
+- Memory→CC: raw `mem_signal[:, :, c]` (D_mem=128) gated by `mem_gate[c]`
 - `mem_gate[c]`: learnable scalar, starts at sigmoid(0)=0.5
 - `pcm_modules[c]`: `SingleColumnPCM(D_cc, hidden=256)` — independent weights per CC
 
 ### Neural Memory Graph — `src/v8/memory_graph.py`
 
-4096 neurons organized in 16 blocks of 256. Each neuron has:
-- `primitive [D_mem=256]`: stored information
-- `thresholds [288]`: energy costs for each connection (256 intra + 32 inter)
-- `activation [D_mem]`: current step accumulation buffer
+8192 neurons in 8 blocks of 1024. Blocks are independent of CC count
+(16 CCs / 8 blocks = 2 CCs per block). Each neuron has:
+- `primitive [D_mem=128]`: stored information, gating what neuron responds to
+- `thresholds [160]`: energy costs per connection (128 random intra + 32 inter)
+- `temperature [1]`: per-neuron routing sharpness (neuromod-controlled)
+- `decay [1]`: per-neuron activation persistence (neuromod-controlled)
 
 **Per-token step:**
-1. **Inject** CC signals into block port neurons (neuron 0 of each block)
+1. **Inject** CC signals into port neurons (2 ports per block, one per CC)
 2. **Gather** inputs from connected neurons' previous outputs (double-buffered)
-3. **Modulate**: `output = silu(W_mod2 @ silu(W_mod1 @ [input; primitive]))` — 2-layer shared MLP
-4. **Route**: softmax(-thresholds/temp) → zero bottom 50% → renormalize → scatter (energy-conserving)
+3. **Modulate**: `output = silu(input * primitive)` — element-wise, no learned weights
+4. **Route**: softmax(-thresholds / neuron_temperature) → sparsify → scatter (energy-conserving)
 5. **Read** port neuron activations → return to CCs
+6. **Decay**: `prev_output = sigmoid(decay) * old + (1-sigmoid(decay)) * outputs`
 
-**Connectivity**: fully connected within block, 32 random inter-block connections per neuron. Fixed topology (not learned).
+**Connectivity**: random sparse within block (K_intra=128 of 1024), random sparse across blocks (K_inter=32). Fixed topology at init.
+
+**No learned weights in memory graph.** All behavior controlled by neuromodulator through primitives, thresholds, temperature, and decay.
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
-Shared PPO actor-critic across all neurons.
+Shared PPO actor-critic across all 8192 neurons.
 
-**Observation** per neuron (898 dims): primitive + mean_input + mean_output + usage + routing_entropy + CC_surprise
-**Action** per neuron (544 dims): delta_primitive[256] + delta_thresholds[288]
+**Observation** per neuron (516 dims): primitive + mean_input + mean_output + usage + temperature + decay + routing_entropy + CC_surprise
+**Action** per neuron (290 dims): delta_primitive[128] + delta_thresholds[160] + delta_temperature[1] + delta_decay[1]
 **Architecture**: separate 3-layer actor/critic, hidden=1024, Tanh activations
 
 ### PPO Training — `src/v8/ppo.py`
 
-- Rollout buffer: `[T//8, BS×4096, ...]` — 256 action steps × 65K parallel environments
-- GAE: gamma=0.99, lambda=0.95. `0.99^256 ≈ 0.08` credit propagation across full chunk
-- Reward: negative per-token CE loss, averaged per block per action interval
+- Rollout buffer: `[T//8, BS×8192, ...]` — 256 action steps × 65K+ parallel environments
+- GAE: gamma=0.99, lambda=0.95, with dones mask at doc boundaries
+- Reward: negative per-token CE loss, weighted by per-block surprise, shifted by action_every
 - Update: 4 epochs, minibatch=512, clip=0.2, entropy coef=0.003
 
 ---
@@ -153,50 +161,70 @@ python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
 |-----------|-------|
 | D | 2048 |
 | D_embed | 768 |
-| C (cortical columns / blocks) | 16 |
-| D_cc | 128 |
+| C (cortical columns) | 16 |
+| D_cc = D_mem | 128 |
 | L_total (scan layers) | 8 |
 | L_mem (injection point) | 4 |
 | d_inner | 1024 |
-| N_neurons | 4096 |
-| M_per_block | 256 |
-| D_mem | 256 |
-| inter_block_k | 32 |
+| N_blocks | 8 |
+| M_per_block | 1024 |
+| N_neurons (total) | 8192 |
+| K_intra (random within block) | 128 |
+| K_inter (random across blocks) | 32 |
+| CCs per block | 2 |
 | neuromod_hidden | 1024 |
 | neuromod_layers | 3 |
 | action_every | 8 tokens |
+| action_dims per neuron | 290 |
 | T | 2048 |
-| **Total trained params** | **115.4M** |
+| **Total trained params** | **~107M** |
 
 **Param breakdown:**
 
-| Component | Params | % |
-|-----------|--------|---|
-| Scan layers (8 shared) | 67.2M | 58.3% |
-| Embedding (tied) | 24.6M | 21.3% |
-| Positional embedding [2048, 2048] | 4.2M | 3.6% |
-| mem_proj_in (2-layer MLP × 16) | 4.2M | 3.6% |
-| proj_up + proj_down | 3.1M | 2.7% |
-| mem_proj_out (2-layer MLP × 16) | 3.2M | 2.8% |
-| PCM (16 independent, hidden=256) | 2.4M | 2.1% |
-| Neuromodulator (actor+critic) | 6.6M | 5.7% |
+| Component | Params | % | Trained by |
+|-----------|--------|---|------------|
+| Scan layers (8 shared) | 67.2M | 62.7% | Backprop |
+| Embedding (tied) | 24.6M | 22.9% | Backprop |
+| Positional embedding [2048, 2048] | 4.2M | 3.9% | Backprop |
+| proj_up + proj_down | 3.1M | 2.9% | Backprop |
+| PCM (16 independent, hidden=256) | 2.4M | 2.2% | Backprop |
+| mem_gate (16 scalars) | 16 | <0.01% | Backprop |
+| Neuromodulator (actor+critic) | ~8M | 5.3% | PPO |
+
+**Memory graph state** (per stream, not trained params): ~18 MB
+- Zero trainable parameters in memory graph
+- All behavior controlled by neuromodulator through primitives, thresholds, temperature, decay
+
+---
+
+## Design Decisions
+
+1. **D_mem = D_cc always.** No projections between CC and memory. The CC's raw
+   hidden state is the memory input. Memory's raw output is the CC's signal.
+   Eliminates untrained projection layers.
+
+2. **Blocks independent of CCs.** 8 blocks × 1024 neurons, 16 CCs → 2 CCs per
+   block. Blocks are local neighborhoods of neurons; CCs are slices of the LM.
+   The mapping is fixed (each CC has a home block).
+
+3. **No learned weights in memory.** Neuron modulation is `silu(input * primitive)`.
+   The neuromodulator (PPO) controls everything: what neurons store (primitives),
+   where signals route (thresholds), how sharply (temperature), how persistently
+   (decay). Replaces explicit Hebbian learning, W_mod MLPs, etc.
+
+4. **Random sparse connectivity.** 128 random intra-block + 32 inter-block
+   connections per neuron. Uniform max_connections keeps tensors rectangular
+   for GPU efficiency. Fixed topology at init.
 
 ---
 
 ## Open Questions
 
-1. **mem_proj_in training**: currently detached from LM autograd (goes into memory env).
-   Should be trained by PPO alongside W_mod, or given a separate gradient path.
-
-2. **Memory graph as CUDA kernel**: current implementation is pure PyTorch with
+1. **Memory graph as CUDA kernel**: current implementation is pure PyTorch with
    `torch.no_grad()`. Custom Triton/CUDA kernel would reduce per-step overhead.
 
-3. **Lifelong mode**: memory graph state persists across TBPTT boundaries by default.
+2. **Lifelong mode**: memory graph state persists across TBPTT boundaries by default.
    Doc boundary resets via EOT detection. Phase B disables resets.
-
-4. **W_mod training**: the shared modulation MLP inside the memory graph is
-   stored as plain tensors (not nn.Parameter). Needs to be included in PPO
-   updates alongside the neuromodulator.
 
 ---
 

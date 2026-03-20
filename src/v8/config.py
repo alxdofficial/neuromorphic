@@ -8,7 +8,7 @@ class V8Config:
     # Scan Stack (Language Model)
     D: int = 2048
     D_embed: int = 768
-    C: int = 16                  # cortical columns (= memory blocks)
+    C: int = 16                  # cortical columns
     D_cc: int = -1               # derived: D // C = neuron dim
     L_total: int = 10            # total scan layers
     L_mem: int = 5               # memory injection point
@@ -25,11 +25,12 @@ class V8Config:
     pcm_hidden: int = 256        # hidden dim for per-CC PCM
 
     # Memory Graph
-    # D_mem = D_cc always (neurons match CC width, no projections needed)
-    N_neurons: int = 4096        # total neurons (C * M_per_block)
-    M_per_block: int = 256       # neurons per block
-    inter_block_k: int = 32      # sparse connections per neuron to other blocks
-    mem_temperature: float = 1.0 # routing softmax temperature
+    # D_mem = D_cc always (neurons match CC width)
+    N_blocks: int = 8            # memory blocks (independent from C)
+    M_per_block: int = 1024      # neurons per block
+    K_intra: int = 128           # random connections within block
+    K_inter: int = 32            # random connections to other blocks
+    mem_temperature: float = 1.0 # global default routing temperature
     mem_sparsity: float = 0.5    # fraction of connections zeroed in routing
 
     # Neuromodulator
@@ -63,9 +64,19 @@ class V8Config:
         return self.D_cc if self.D_cc > 0 else self.D // self.C
 
     @property
+    def N_neurons(self) -> int:
+        """Total neurons across all blocks."""
+        return self.N_blocks * self.M_per_block
+
+    @property
     def max_connections(self) -> int:
         """Max connections per neuron (intra-block + inter-block)."""
-        return self.M_per_block + self.inter_block_k
+        return self.K_intra + self.K_inter
+
+    @property
+    def CCs_per_block(self) -> int:
+        """Number of cortical columns attached to each block."""
+        return self.C // self.N_blocks
 
     @property
     def actions_per_chunk(self) -> int:
@@ -89,10 +100,19 @@ class V8Config:
             raise ValueError(f"L_mem ({self.L_mem}) must be in [0, L_total).")
         if self.d_inner < 1:
             raise ValueError(f"d_inner ({self.d_inner}) must be >= 1.")
-        if self.N_neurons != self.C * self.M_per_block:
+        if self.N_blocks < 1:
+            raise ValueError(f"N_blocks ({self.N_blocks}) must be >= 1.")
+        if self.C % self.N_blocks != 0:
             raise ValueError(
-                f"N_neurons ({self.N_neurons}) must equal C * M_per_block "
-                f"({self.C} * {self.M_per_block} = {self.C * self.M_per_block})."
+                f"C ({self.C}) must be divisible by N_blocks ({self.N_blocks})."
+            )
+        if self.M_per_block < 1:
+            raise ValueError(f"M_per_block ({self.M_per_block}) must be >= 1.")
+        if self.K_intra < 1:
+            raise ValueError(f"K_intra ({self.K_intra}) must be >= 1.")
+        if self.K_intra > self.M_per_block:
+            raise ValueError(
+                f"K_intra ({self.K_intra}) must be <= M_per_block ({self.M_per_block})."
             )
         if self.T < 1:
             raise ValueError(f"T ({self.T}) must be >= 1.")
@@ -104,9 +124,9 @@ class V8Config:
         defaults = dict(
             D=2048, D_embed=768, C=16, L_total=8, L_mem=4,
             d_inner=1024, glu_output=True, T=2048,
-            # Memory graph: 4096 neurons, D_mem=D_cc=128 (derived)
-            N_neurons=4096, M_per_block=256,
-            inter_block_k=32,
+            # Memory graph: 8 blocks × 1024 neurons, D_mem=D_cc=128
+            N_blocks=8, M_per_block=1024,
+            K_intra=128, K_inter=32,
             pcm_hidden=256,
             neuromod_hidden=1024, neuromod_layers=3,
         )
@@ -119,8 +139,8 @@ class V8Config:
         defaults = dict(
             D=64, D_embed=64, C=4, L_total=4, L_mem=2,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
-            N_neurons=32, M_per_block=8,
-            inter_block_k=4,
+            N_blocks=2, M_per_block=8,
+            K_intra=4, K_inter=2,
             pcm_hidden=32,
             neuromod_hidden=32, neuromod_layers=2,
             action_every=4, ppo_minibatch=16,
