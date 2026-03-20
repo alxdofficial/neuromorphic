@@ -33,9 +33,9 @@ class V8Model(nn.Module):
         # Neuromodulator (trained by PPO, has its own optimizer)
         # Created eagerly so it's in the module tree for .parameters(), .to(), etc.
         self._mem_graph = None  # initialized lazily per BS/device
-        # obs_dim: D_mem*3 (prim+mean_in+mean_out) + 2 (usage+entropy) + D_cc (surprise)
-        # Since D_mem = D_cc: obs_dim = D_cc * 4 + 2
-        obs_dim = config.D_cc * 4 + 2
+        # obs_dim: D_mem*3 (prim+mean_in+mean_out) + 4 (usage+temp+decay+entropy) + D_cc (surprise)
+        # Since D_mem = D_cc: obs_dim = D_cc * 4 + 4
+        obs_dim = config.D_cc * 4 + 4
         self.neuromod = Neuromodulator(config, obs_dim)
 
     def _ensure_memory(self, BS: int, device: torch.device,
@@ -188,10 +188,16 @@ class V8Model(nn.Module):
                 clamped = action.clamp(-max_act, max_act)
                 D_mem_act = self.config.D_mem
                 max_conn = self.config.max_connections
-                self._mem_graph.apply_actions(
-                    clamped[:, :D_mem_act].reshape(BS, N_neurons, D_mem_act),
-                    clamped[:, D_mem_act:].reshape(BS, N_neurons, max_conn),
-                )
+                # Parse action: [D_mem | max_conn | 1 (temp) | 1 (decay)]
+                idx = 0
+                d_prim = clamped[:, idx:idx + D_mem_act].reshape(BS, N_neurons, D_mem_act)
+                idx += D_mem_act
+                d_thresh = clamped[:, idx:idx + max_conn].reshape(BS, N_neurons, max_conn)
+                idx += max_conn
+                d_temp = clamped[:, idx].reshape(BS, N_neurons)
+                idx += 1
+                d_decay = clamped[:, idx].reshape(BS, N_neurons)
+                self._mem_graph.apply_actions(d_prim, d_thresh, d_temp, d_decay)
 
                 # Record done flag: did any stream reset during this action window?
                 if did_reset is not None:

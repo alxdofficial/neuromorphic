@@ -88,6 +88,8 @@ class MemoryGraph:
         # --- State (allocated on initialize) ---
         self.primitives = None   # [BS, N_neurons, D_mem]
         self.thresholds = None   # [BS, N_neurons, max_conn]
+        self.temperature = None  # [BS, N_neurons] — per-neuron routing sharpness
+        self.decay = None        # [BS, N_neurons] — per-neuron activation persistence
         self.activations = None  # [BS, N_neurons, D_mem]
         self.prev_output = None  # [BS, N_neurons, D_mem]
 
@@ -106,6 +108,8 @@ class MemoryGraph:
 
         self.primitives = torch.randn(BS, N, D, device=dev, dtype=dt) * 0.1
         self.thresholds = torch.zeros(BS, N, max_conn, device=dev, dtype=dt)
+        self.temperature = torch.ones(BS, N, device=dev, dtype=dt)   # start at 1.0 (neutral)
+        self.decay = torch.zeros(BS, N, device=dev, dtype=dt)        # start at 0.0 (fully reactive)
         self.activations = torch.zeros(BS, N, D, device=dev, dtype=dt)
         self.prev_output = torch.zeros(BS, N, D, device=dev, dtype=dt)
 
@@ -161,9 +165,10 @@ class MemoryGraph:
         self.usage_count = self._ema_decay * self.usage_count + alpha * (output_mag > 0.01).float()
 
         # 4. Route: divide output among connections by energy thresholds
-        #    Energy conservation: route_weights sum to 1, so total outbound
-        #    magnitude = output magnitude (softmax + renormalize guarantees this)
-        route_logits = -self.thresholds / max(self.config.mem_temperature, 1e-6)
+        #    Per-neuron temperature controls routing sharpness
+        #    Energy conservation: route_weights sum to 1
+        neuron_temp = self.temperature.unsqueeze(-1).clamp(min=0.01)  # [BS, N, 1]
+        route_logits = -self.thresholds / neuron_temp
         route_logits = route_logits.masked_fill(~self.conn_mask.unsqueeze(0), float('-inf'))
 
         route_weights = F.softmax(route_logits, dim=-1)  # [BS, N, max_conn]
@@ -190,21 +195,29 @@ class MemoryGraph:
         # 5. Read CC port activations for return signal (clone to avoid aliasing)
         mem_signals = self.activations[:, self.cc_port_idx].clone()  # [BS, C, D]
 
-        # 6. Swap: prev_output = this step's MLP outputs (for next step's gather)
-        self.prev_output = outputs.clone()
+        # 6. Swap with decay: persistent neurons carry forward prev_output
+        #    decay=0 → fully reactive (current behavior)
+        #    decay=1 → fully persistent (ignores new output)
+        d = torch.sigmoid(self.decay).unsqueeze(-1)  # [BS, N, 1], in (0, 1)
+        self.prev_output = d * self.prev_output + (1 - d) * outputs
 
         return mem_signals
 
     @torch.no_grad()
-    def apply_actions(self, delta_primitives: Tensor, delta_thresholds: Tensor):
+    def apply_actions(self, delta_primitives: Tensor, delta_thresholds: Tensor,
+                      delta_temperature: Tensor, delta_decay: Tensor):
         """Apply neuromodulator actions to neuron state.
 
         Args:
-            delta_primitives:  [BS, N_neurons, D_mem]
-            delta_thresholds:  [BS, N_neurons, max_conn]
+            delta_primitives:   [BS, N_neurons, D_mem]
+            delta_thresholds:   [BS, N_neurons, max_conn]
+            delta_temperature:  [BS, N_neurons]
+            delta_decay:        [BS, N_neurons]
         """
         self.primitives = self.primitives + delta_primitives
         self.thresholds = self.thresholds + delta_thresholds
+        self.temperature = self.temperature + delta_temperature
+        self.decay = self.decay + delta_decay
 
     @torch.no_grad()
     def get_neuron_obs(self, cc_surprise: Tensor | None = None) -> Tensor:
@@ -222,14 +235,17 @@ class MemoryGraph:
         C = self.config.C
 
         parts = [
-            self.primitives,      # [BS, N, D_mem]
-            self.mean_input,      # [BS, N, D_mem]
-            self.mean_output,     # [BS, N, D_mem]
-            self.usage_count.unsqueeze(-1),  # [BS, N, 1]
+            self.primitives,                    # [BS, N, D_mem]
+            self.mean_input,                    # [BS, N, D_mem]
+            self.mean_output,                   # [BS, N, D_mem]
+            self.usage_count.unsqueeze(-1),     # [BS, N, 1]
+            self.temperature.unsqueeze(-1),     # [BS, N, 1]
+            torch.sigmoid(self.decay).unsqueeze(-1),  # [BS, N, 1]
         ]
 
         # Routing entropy: how spread out is each neuron's routing?
-        route_logits = -self.thresholds / max(self.config.mem_temperature, 1e-6)
+        neuron_temp = self.temperature.unsqueeze(-1).clamp(min=0.01)
+        route_logits = -self.thresholds / neuron_temp
         route_logits = route_logits.masked_fill(~self.conn_mask.unsqueeze(0), float('-inf'))
         route_probs = F.softmax(route_logits, dim=-1).nan_to_num(0.0)
         entropy = -(route_probs * (route_probs + 1e-8).log()).sum(dim=-1, keepdim=True)
@@ -252,8 +268,9 @@ class MemoryGraph:
     @property
     def obs_dim(self) -> int:
         """Observation dimension for neuromodulator."""
-        # D_mem*3 (prim + mean_in + mean_out) + 1 (usage) + 1 (entropy) + D_cc (surprise)
-        return self.config.D_mem * 3 + 2 + self.config.D_cc
+        # D_mem*3 (prim + mean_in + mean_out) + 1 (usage) + 1 (temp) + 1 (decay)
+        # + 1 (entropy) + D_cc (surprise)
+        return self.config.D_mem * 3 + 4 + self.config.D_cc
 
     @torch.no_grad()
     def reset_streams(self, mask: Tensor):
@@ -283,3 +300,7 @@ class MemoryGraph:
                                         torch.zeros_like(self.mean_output), self.mean_output)
         self.usage_count = torch.where(m2.expand_as(self.usage_count),
                                         torch.zeros_like(self.usage_count), self.usage_count)
+        self.temperature = torch.where(m2.expand_as(self.temperature),
+                                        torch.ones_like(self.temperature), self.temperature)
+        self.decay = torch.where(m2.expand_as(self.decay),
+                                  torch.zeros_like(self.decay), self.decay)

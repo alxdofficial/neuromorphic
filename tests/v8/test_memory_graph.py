@@ -85,7 +85,9 @@ class TestMemoryGraphActions:
         prim_before = mg.primitives.clone()
         delta_p = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
         delta_t = torch.randn(BS, cfg.N_neurons, cfg.max_connections) * 0.01
-        mg.apply_actions(delta_p, delta_t)
+        delta_temp = torch.randn(BS, cfg.N_neurons) * 0.01
+        delta_decay = torch.randn(BS, cfg.N_neurons) * 0.01
+        mg.apply_actions(delta_p, delta_t, delta_temp, delta_decay)
         assert not torch.allclose(mg.primitives, prim_before)
 
     def test_get_neuron_obs(self):

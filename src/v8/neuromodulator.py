@@ -36,11 +36,15 @@ class Neuromodulator(nn.Module):
         self.actor_backbone = nn.Sequential(*actor_layers)
         self.prim_head = nn.Linear(hidden, D_mem)
         self.thresh_head = nn.Linear(hidden, max_conn)
+        self.temp_head = nn.Linear(hidden, 1)    # per-neuron routing temperature
+        self.decay_head = nn.Linear(hidden, 1)   # per-neuron activation persistence
 
         # Separate log_std per action group (state-independent)
         # Init std ≈ 0.05 (logstd=-3.0) so clamp at ±0.1 is rarely triggered
         self.prim_logstd = nn.Parameter(torch.full((1, D_mem), -3.0))
         self.thresh_logstd = nn.Parameter(torch.full((1, max_conn), -3.0))
+        self.temp_logstd = nn.Parameter(torch.full((1, 1), -3.0))
+        self.decay_logstd = nn.Parameter(torch.full((1, 1), -3.0))
 
         # Critic: separate network (same depth as actor)
         critic_layers = []
@@ -54,14 +58,13 @@ class Neuromodulator(nn.Module):
         self.max_action = config.max_action_magnitude
 
         # Zero-init output heads for stable start
-        nn.init.zeros_(self.prim_head.weight)
-        nn.init.zeros_(self.prim_head.bias)
-        nn.init.zeros_(self.thresh_head.weight)
-        nn.init.zeros_(self.thresh_head.bias)
+        for head in [self.prim_head, self.thresh_head, self.temp_head, self.decay_head]:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
 
     @property
     def act_dim(self) -> int:
-        return self.config.D_mem + self.config.max_connections
+        return self.config.D_mem + self.config.max_connections + 2  # +temp +decay
 
     def get_value(self, obs: Tensor) -> Tensor:
         """Compute value estimate.
@@ -91,11 +94,15 @@ class Neuromodulator(nn.Module):
         h = self.actor_backbone(obs)
         prim_mean = self.prim_head(h)
         thresh_mean = self.thresh_head(h)
+        temp_mean = self.temp_head(h)
+        decay_mean = self.decay_head(h)
 
-        mean = torch.cat([prim_mean, thresh_mean], dim=-1)
+        mean = torch.cat([prim_mean, thresh_mean, temp_mean, decay_mean], dim=-1)
         logstd = torch.cat([
             self.prim_logstd.expand_as(prim_mean),
             self.thresh_logstd.expand_as(thresh_mean),
+            self.temp_logstd.expand_as(temp_mean),
+            self.decay_logstd.expand_as(decay_mean),
         ], dim=-1)
         std = logstd.exp()
 
