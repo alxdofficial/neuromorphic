@@ -27,12 +27,13 @@ class Neuromodulator(nn.Module):
         hidden = config.neuromod_hidden
 
         # Actor: backbone → two heads (primitive deltas + threshold deltas)
-        self.actor_backbone = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-        )
+        # Build N-layer backbone
+        actor_layers = []
+        in_dim = obs_dim
+        for _ in range(config.neuromod_layers):
+            actor_layers.extend([nn.Linear(in_dim, hidden), nn.Tanh()])
+            in_dim = hidden
+        self.actor_backbone = nn.Sequential(*actor_layers)
         self.prim_head = nn.Linear(hidden, D_mem)
         self.thresh_head = nn.Linear(hidden, max_conn)
 
@@ -40,14 +41,14 @@ class Neuromodulator(nn.Module):
         self.prim_logstd = nn.Parameter(torch.full((1, D_mem), -1.0))
         self.thresh_logstd = nn.Parameter(torch.full((1, max_conn), -1.0))
 
-        # Critic: separate network (no shared trunk with actor)
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, 1),
-        )
+        # Critic: separate network (same depth as actor)
+        critic_layers = []
+        in_dim = obs_dim
+        for _ in range(config.neuromod_layers):
+            critic_layers.extend([nn.Linear(in_dim, hidden), nn.Tanh()])
+            in_dim = hidden
+        critic_layers.append(nn.Linear(hidden, 1))
+        self.critic = nn.Sequential(*critic_layers)
 
         self.max_action = config.max_action_magnitude
 

@@ -33,6 +33,7 @@ class V8Trainer:
         max_grad_norm: float = 1.0,
         log_interval: int = 50,
         collector=None,
+        use_memory: bool = True,
     ):
         self.model = model
         self.lm_optimizer = lm_optimizer
@@ -44,6 +45,7 @@ class V8Trainer:
         self.log_interval = log_interval
         self.collector = collector
         self.global_step = 0
+        self.use_memory = use_memory
 
         self._states_initialized = False
         self.use_amp = device.type == "cuda"
@@ -96,7 +98,9 @@ class V8Trainer:
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
-                reset_mask=reset_mask, collect_ppo=True,
+                reset_mask=reset_mask,
+                collect_ppo=self.use_memory,
+                use_memory=self.use_memory,
             )
 
         logits = result["logits"]

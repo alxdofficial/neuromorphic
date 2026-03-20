@@ -54,24 +54,33 @@ class V8LM(nn.Module):
         # Per-CC PCM (independent weights per column)
         if config.pcm_enabled:
             self.pcm_modules = nn.ModuleList([
-                SingleColumnPCM(D_cc) for _ in range(C)
+                SingleColumnPCM(D_cc, hidden=config.pcm_hidden) for _ in range(C)
             ])
         else:
             self.pcm_modules = None
 
-        # Per-CC memory interface
+        # Per-CC memory interface (2-layer MLPs for richer projection)
+        proj_h = config.mem_proj_hidden
         # CC→memory: project (H_slice concat surprise_slice) → D_mem
         self.mem_proj_in = nn.ModuleList([
-            nn.Linear(D_cc + D_cc, D_mem) for _ in range(C)
+            nn.Sequential(
+                nn.Linear(D_cc + D_cc, proj_h),
+                nn.SiLU(),
+                nn.Linear(proj_h, D_mem),
+            ) for _ in range(C)
         ])
         # Memory→CC: project D_mem → D_cc
         self.mem_proj_out = nn.ModuleList([
-            nn.Linear(D_mem, D_cc) for _ in range(C)
+            nn.Sequential(
+                nn.Linear(D_mem, proj_h),
+                nn.SiLU(),
+                nn.Linear(proj_h, D_cc),
+            ) for _ in range(C)
         ])
-        # Zero-init mem_proj_out so memory starts silent
+        # Zero-init last layer of mem_proj_out so memory starts silent
         for proj in self.mem_proj_out:
-            nn.init.zeros_(proj.weight)
-            nn.init.zeros_(proj.bias)
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
 
         # Learnable memory gate per CC (sigmoid(0) = 0.5 at init)
         self.mem_gate = nn.Parameter(torch.zeros(C))

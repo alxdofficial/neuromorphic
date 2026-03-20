@@ -81,11 +81,13 @@ class MemoryGraph:
         # CC port neurons: first neuron of each block
         self.cc_port_idx = torch.arange(C, device=device) * M  # [C]
 
-        # --- Shared modulation function ---
-        # W_mod: [2*D_mem, D_mem] — shared across all neurons
-        # Trained by PPO (not backprop), so stored here as a plain tensor
-        self.W_mod = torch.randn(2 * D, D, device=device, dtype=dtype) * 0.02
-        self.b_mod = torch.zeros(D, device=device, dtype=dtype)
+        # --- Shared modulation function (2-layer MLP) ---
+        # Trained by PPO (not backprop), stored as plain tensors
+        mod_hidden = config.mem_mod_hidden
+        self.W_mod1 = torch.randn(2 * D, mod_hidden, device=device, dtype=dtype) * 0.02
+        self.b_mod1 = torch.zeros(mod_hidden, device=device, dtype=dtype)
+        self.W_mod2 = torch.randn(mod_hidden, D, device=device, dtype=dtype) * 0.02
+        self.b_mod2 = torch.zeros(D, device=device, dtype=dtype)
 
         # --- State (allocated on initialize) ---
         self.primitives = None   # [BS, N_neurons, D_mem]
@@ -162,9 +164,10 @@ class MemoryGraph:
 
         inputs = gathered.sum(dim=2)  # [BS, N, D]
 
-        # 3. Modulate: output = silu(W_mod @ [input; primitive] + b_mod)
+        # 3. Modulate: 2-layer MLP on [input; primitive]
         combined = torch.cat([inputs, self.primitives], dim=-1)  # [BS, N, 2*D]
-        outputs = F.silu(combined @ self.W_mod + self.b_mod)     # [BS, N, D]
+        hidden = F.silu(combined @ self.W_mod1 + self.b_mod1)    # [BS, N, mod_hidden]
+        outputs = F.silu(hidden @ self.W_mod2 + self.b_mod2)     # [BS, N, D]
 
         # Update running stats
         alpha = 1.0 - self._ema_decay

@@ -57,6 +57,7 @@ class V8Model(nn.Module):
         target_ids: Tensor | None = None,
         reset_mask: Tensor | None = None,
         collect_ppo: bool = True,
+        use_memory: bool = True,
     ) -> dict:
         """Process a full T-token chunk with per-token memory access.
 
@@ -65,6 +66,7 @@ class V8Model(nn.Module):
             target_ids: [BS, T] or None — for per-token reward computation
             reset_mask: [BS] bool — reset memory for these streams
             collect_ppo: whether to collect PPO experience
+            use_memory: if False, skip memory graph entirely (LM-only baseline)
 
         Returns:
             dict with keys:
@@ -81,17 +83,28 @@ class V8Model(nn.Module):
         device = input_ids.device
         dtype = next(self.lm.parameters()).dtype
 
-        self._ensure_memory(BS, device, torch.float32)
-
-        # Reset memory for streams at doc boundaries
-        if reset_mask is not None and reset_mask.any():
-            self._mem_graph.reset_streams(reset_mask)
-
         # ==========================================
         # Pass 1: Pre-memory scan + PCM (parallel)
         # ==========================================
         H, x, surprise, aux_loss = self.lm.forward_pre_memory(input_ids)
         # H: [BS, T, D], surprise: [BS, T, C, D_cc]
+
+        # --- No-memory fast path: skip graph entirely ---
+        if not use_memory:
+            mem_signals = torch.zeros(BS, T, C, D_mem, device=device, dtype=dtype)
+            logits = self.lm.forward_post_memory(H, mem_signals)
+            return {
+                "logits": logits,
+                "aux_loss": aux_loss,
+                "ppo_buffer": None,
+                "surprise": surprise.detach(),
+            }
+
+        # --- Memory path ---
+        self._ensure_memory(BS, device, torch.float32)
+
+        if reset_mask is not None and reset_mask.any():
+            self._mem_graph.reset_streams(reset_mask)
 
         # Build per-token CC→memory signals
         cc_signals_all = self.lm.build_cc_signals(H, surprise)

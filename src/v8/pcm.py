@@ -15,13 +15,25 @@ class SingleColumnPCM(nn.Module):
 
     Predicts next token's encoding from current scan state.
     Surprise = z_hat_{t-1} - z_t (vector, D_cc dims).
+
+    Uses a hidden layer for richer encoding/prediction when hidden > 0.
     """
 
-    def __init__(self, D_cc: int):
+    def __init__(self, D_cc: int, hidden: int = 0):
         super().__init__()
         self.D_cc = D_cc
-        self.W_enc = nn.Linear(D_cc, D_cc)
-        self.W_pcm = nn.Linear(D_cc, D_cc)
+
+        if hidden > 0:
+            self.W_enc = nn.Sequential(
+                nn.Linear(D_cc, hidden), nn.SiLU(), nn.Linear(hidden, D_cc),
+            )
+            self.W_pcm = nn.Sequential(
+                nn.Linear(D_cc, hidden), nn.SiLU(), nn.Linear(hidden, D_cc),
+            )
+        else:
+            self.W_enc = nn.Linear(D_cc, D_cc)
+            self.W_pcm = nn.Linear(D_cc, D_cc)
+
         self.W_gain = nn.Linear(D_cc, D_cc)
 
         # Zero-init W_gain so gain starts at 1.0
