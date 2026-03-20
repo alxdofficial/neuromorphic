@@ -22,292 +22,173 @@ Modern LLMs are powerful but structurally limited:
 
 ## What We're Building
 
-A **brain-inspired sequence model** that decomposes memory into three distinct systems,
-each with different persistence, update rules, and biological analogues. The fundamental
-innovation: **separating WHAT to remember from HOW LONG to remember it**, enabling
-lifelong learning without catastrophic forgetting.
+A **brain-inspired sequence model** with three components:
 
-The model processes tokens causally through dense scan layers (nn.Linear projections, full
-feature mixing) with structured memory operations between segments (slow hippocampal
-stream). Predictive coding and memory projections remain grouped (per-feature-group
-surprise via free `.view()` from dense tensors). See
-`architecture_v4_iterative_memory_scan.md` for the full v6 design.
+- **Cortical Columns (CCs)**: The language model. Dense scan layers with per-column
+  predictive coding. Process tokens causally, produce surprise signals. Trained by
+  backprop. See `docs/architecture_v8_neural_memory_graph.md`.
+
+- **Neural Memory Graph**: A persistent network of neurons outside the autograd graph.
+  Neurons have stored information (primitives) and energy-conserving routing. Signal
+  flows continuously — every token. Memory IS the pattern of activation and connectivity,
+  not a database that gets queried.
+
+- **Neuromodulator**: An RL-trained policy (PPO) that modifies neuron primitives and
+  routing thresholds. Substitutes for the billions of years of evolution that shaped
+  the brain's neuromodulatory systems.
 
 ---
 
 ## Core Philosophy
 
-### Three Memory Systems + Predictive Coding
+### The Brain's Memory Is Not a Database
 
-| Memory System | Brain Analogy | Persistence | Update Mechanism | In v6 |
-|---------------|---------------|-------------|------------------|-------|
-| **Genetic** (slow weights) | DNA / evolutionary | Permanent after training | Backprop | Scan params, projection weights |
-| **Procedural Memory (PM)** | Basal ganglia | Across documents (lifelong) | Hebbian fast-weight learning | Between segments |
-| **Episodic Memory (EM)** | Hippocampus | Across documents (lifelong) | Novelty-based primitive decomposition + neuromodulation | Between segments |
+The human brain doesn't do "memory read" and "memory write" operations. There is no
+cosine similarity lookup, no discrete read/write schedule. Instead:
 
-Plus **Predictive Coding (PCM)** — grouped prediction of next token's encoding.
-Vector surprise (per-feature-group prediction error) drives PM eligibility gating and EM
-novelty scoring. Each feature group predicts what the next token's features will look
-like; the per-dimension error tells the model which features it failed to anticipate.
-PCM operates on a grouped view [BS,N,C,D_col] of the dense scan output (free `.view()`).
+- **Neurons constantly fire and receive signals.** Memory IS the pattern of activity
+  that emerges from connection weights. Recall is pattern completion — a partial input
+  activates connected neurons, which activate others, until the full pattern emerges.
 
-### Single Scan Stack with Memory Injection
+- **Plasticity is continuous and local.** When two neurons co-activate, their connection
+  strengthens (Hebbian learning). Neuromodulators (dopamine, acetylcholine) gate HOW MUCH
+  connections change — they signal "this is important, learn more."
 
-The key architectural insight: **memory reads are just additive residuals** that can be
-injected between scan layers — no separate stage needed.
+- **The cortical column is universal.** The same 6-layer circuit handles vision, language,
+  motor control — everywhere in the neocortex. Specialization comes from connectivity
+  and input, not different hardware.
 
-- **Pre-memory layers** (layers 0..L_mem-1): Dense affine scan recurrence — causal,
-  parallelizable. nn.Linear projections with full feature mixing. Grouped PCM computes
-  predictions, grouped W_seed_w prepares trail seeds and write candidates.
-- **Memory injection** at layer L_mem: PM fast-weight read + EM trail read, additive.
-- **Post-memory layers** (layers L_mem..L_total-1): Integrate memory context with
-  the encoded representation.
-- **Segment-end commits**: PM Hebbian update + EM neuromodulated decomposition write.
-  No within-segment writes — N=128 segments make commits frequent enough.
+### What We Take from the Brain
 
-This mirrors the brain: neocortex processes quickly and feedforward; hippocampal
-consolidation is slower, periodic, and handles memory formation.
+| Principle | Brain | Our Model |
+|-----------|-------|-----------|
+| Universal compute unit | Cortical column (same everywhere) | CC: scan + PCM (shared scan weights) |
+| Memory as activation | Neurons firing through weighted connections | Neural memory graph: primitives + routing |
+| Neuromodulated plasticity | Dopamine/ACh gate learning rate | PPO-trained policy modifies neuron state |
+| Energy conservation | Finite metabolic budget per neuron | Output magnitude divided among connections |
+| Predictive coding | Cortical prediction error signals | PCM: vector surprise per feature group |
 
----
+### What We Don't Take from the Brain
 
-## Memory Systems in Detail
+- Spiking dynamics → continuous activations
+- Exact cortical layers → scan recurrence + PCM
+- Axonal delays, glial cells → ignored
+- Specific neurotransmitters → single learned neuromodulator
 
-### Procedural Memory (PM) — Basal Ganglia
+### Temporal Patterns Compressed into Vectors
 
-"Muscle memory" of cognition — habitual associative transformations, automatic pattern recall.
-
-- **Read**: `pre = proj_in(H)` projects to D_pm-dim pre-synaptic space [BS,N,D_pm].
-  Apply bank-summed fast-weight: `post = pre @ W_sum.T` where `W_sum = Σ_b W_b [BS,D_pm,D_pm]`.
-  Project back via `proj_out` to [BS,N,D]. A full learned linear transform — not element-wise bias.
-- **Write (Hebbian)**: At segment end, compute eligibility G = (1/N)·Σ_t σ(‖surp_t‖)·pre_t⊗pre_tᵀ
-  (surprise-gated pre-synaptic autocorrelation). Commit: `W_b ← W_b @ (decay·I + β_b·G)`.
-  One batched right-multiply per bank. High-surprise tokens drive larger weight changes.
-- **Bank plasticity**: Each bank has a learned scalar β_b (via softplus). Banks specialize:
-  fast β = recent-context habits; slow β = deep long-term associations.
-- **State**: W_pm [BS, B, D_pm, D_pm] — fast-weight matrices per bank. Not parameters —
-  evolves at inference for lifelong adaptation. ~512KB total (BS=16, B=4, D_pm=64).
-- **Sacred**: Surprise-gated writes, lifelong persistence, Hebbian rule.
-- **Negotiable**: D_pm, bank count, decay rate, Frobenius budget.
-
-### Episodic Memory (EM) — Hippocampus
-
-Dictionary of primitive patterns — atomic building blocks of concepts. Complex
-ideas emerge from composing multiple primitives via trail-based navigation.
-
-- **Read (trail)**: Seed from scan navigates primitive space through iterative
-  refinement (3 steps). At each step: score ALL primitives via softmax (no top-k),
-  compose weighted sum, gate, move seed. Different seed → different trail →
-  different composition. M primitives + continuous seeds = infinite readouts.
-- **Novelty**: Write candidate energy + surprise magnitude.
-- **Write (segment-end)**: Decompose across primitives via full softmax routing.
-  Neuromodulator MLP runs once at segment end on (mean_novelty, usage) → g_em.
-  Neuromodulated EMA write strength (cross-segment gradient via TBPTT).
-  Fully differentiable — no hard selection anywhere.
-- **Compressed latent space**: EM operates in a learned D_mem latent space with projections in/out, not column-local.
-- **State**: em_K, em_V [BS, B, M, D_mem] — primitives are state, not parameters.
-  Evolve at inference for lifelong learning.
-- **Sacred**: Trail-based composition, soft activation (no top-k), novelty-based
-  writes, neuromodulator trained by main loss, primitive decomposition.
-- **Negotiable**: Number of primitives M, trail steps, temperature τ, noise σ.
-
-### Predictive Coding Module (PCM) — Cortical Prediction Error
-
-Per-column within-scan prediction and surprise computation.
-
-- **z_hat**: Prediction of next token's encoding (linear projection of scan state).
-- **Vector surprise**: Elementwise prediction error `delta = z_hat_{t-1} - z_t`,
-  D_col dimensions. Each feature dimension carries independent surprise.
-- **PCM gain**: `1 + 0.1 * tanh(W_gain(delta))` — bounded [0.9, 1.1] modulation.
-- **v5.1**: Grouped prediction (token t predicts t+1) on `.view(BS,N,C,D_col)`, not
-  cross-pass. Surprise gates memory updates per-feature-group.
+The brain's expressiveness comes from temporal patterns — spikes, oscillations, burst
+timing. Simulating this is computationally impractical. We collapse it: a D_mem=256
+float vector at one timestep represents what the brain would express as a low-dimensional
+signal evolving over many milliseconds. The capacity is sufficient to encode all meaningful
+temporal patterns in a neural population's short time window.
 
 ---
 
-## How Learning During Use Works
+## How It Works (v8)
 
-### PM Write: "Reinforce Associations"
+### Two-Pass Scan with Memory Loop
 
-Surprise from PCM drives Hebbian weight updates at segment boundaries (single path):
-- **Eligibility accumulation**: Each token contributes surprise magnitude σ(‖surp_t‖)
-  and pre-synaptic activity `pre_t = proj_in(H_t)` to an eligibility matrix
-  G = (1/N)·Σ_t σ(‖surp_t‖)·pre_t⊗pre_tᵀ across the segment.
-- **Commit (segment end)**: `W_b ← W_b @ (decay·I + β_b·G)` — one right-multiply
-  per bank. Features that co-activated under surprise have their associations reinforced.
-  Frobenius norm budget prevents unbounded growth across lifelong use.
-- **No within-segment fast path**: Unlike EM, PM writes take effect from the next segment.
-  This matches the slower timescale of procedural learning — habits form across many
-  segments, not within a single one.
+```
+Pass 1: Pre-memory scan layers (parallel over T=2048 tokens)
+         → Build representation H, compute per-CC surprise
 
-### EM Write: "Two Paths — Fast Buffer + Slow Decomposition"
+Memory loop: For each token (sequential, cheap, no_grad):
+  CC → memory: inject (H_slice + surprise) into memory graph
+  Memory graph step: all neurons receive → modulate → route
+  Memory → CC: read signals from block port neurons
 
-**Fast path**: Write candidates from the scan are gated by novelty and
-cumulative-averaged: `cum_em = cummean(novelty · w_cand)`. This raw, unstructured
-signal goes to Stage 3 alongside the trail read, providing within-segment
-feedback and cross-column mixing. Same-segment gradient flows through.
+Pass 2: Post-memory scan layers (parallel over T=2048 tokens)
+         → Integrate memory signals → logits
+```
 
-**Slow path**: At segment end, write candidates are decomposed across existing
-primitives via soft routing. The neuromodulator MLP controls write strength
-(`g_em`). Crucially, neuromodulators are **trained by the main CE loss** —
-gradient flows through: write → primitive update → future trail reads → logits
-→ loss. No RL, no counterfactual rollouts, single optimizer.
+Scans run at full GPU efficiency over all T tokens. The memory loop is cheap
+(no autograd, SIMD across neurons). One backward pass, one PPO update per chunk.
 
-### Lifelong Learning: Memory Distillation
+### Neuromodulator as RL Agent
 
-**Phase A**: All systems active, state resets at doc boundaries. Controllers learn
-when to be selective.
+The neuromodulator observes each neuron's state (primitive, recent activity,
+routing entropy, CC surprise) and outputs modifications to primitives and
+thresholds. Trained via PPO with per-token language modeling loss as reward.
 
-**Phase B**: Lifelong mode — PM/EM persist across documents. Only scan hidden states
-reset at boundaries. The distillation cycle:
+This replaces the brain's neuromodulatory system, which was shaped by billions
+of years of evolution. We compress this into an RL training loop.
 
-1. New domain → surprise spikes (PCM prediction errors)
-2. PM bias shifts to compensate for persistent surprises
-3. EM primitives update: new concepts decomposed and stored
-4. Over time, slow weights learn domain patterns → surprise drops
-5. Result: slow weights = general knowledge; PM bias = domain-specific habits;
-   EM primitives = domain-specific concepts
+### Lifelong Learning
+
+**Phase A**: Memory resets at document boundaries. CCs and neuromodulator learn
+basic language ability and write selectivity.
+
+**Phase B**: Memory persists across documents. The neuromodulator learns to
+maintain useful memories and forget stale ones. The scan (slow weights) encodes
+general language knowledge; memory adapts to specific context.
 
 ---
 
-## Genuine Novelties — What No Other Architecture Does
+## Genuine Novelties
 
-These are the ideas that, to our knowledge, do not exist together in any published
-model. Each is individually motivated by neuroscience; their combination is the
-architecture's core contribution.
+### 1. Memory as Continuous Signal Flow
+Memory is not a database with read/write operations. It is a persistent neuron
+graph where recall IS activation pattern completion. No cosine similarity, no
+explicit queries — just signal propagation through weighted connections.
 
-### 1. Trail-Based Compositional Memory Read
-EM stores M atomic primitives. Reading is **not** top-k retrieval — it's an iterative
-navigation: a seed vector takes multiple steps through primitive space, composing a
-weighted mixture at each step via softmax attention + gated movement. Different seeds
-produce different compositions from the same primitives. This gives combinatorial
-capacity (M primitives → infinite readouts) from finite memory.
+### 2. RL-Trained Plasticity (Not Backprop Through Memory)
+Memory learning is controlled by a PPO-trained neuromodulator, not by backprop
+through memory state. Memory is an environment, the neuromodulator is the agent.
+This decouples memory from the autograd graph, solving the throughput problem of
+differentiable memory systems.
 
-**Why novel**: Standard memory-augmented networks (NTM, DNC, MemoryNet) use single-step
-attention or top-k retrieval. Trail-based composition is closer to how hippocampal
-replay chains memories together.
+### 3. Vector Surprise as Universal Learning Signal
+PCM predicts next token's representation per-feature-group. The vector prediction
+error (D_cc=128 dims per column) feeds into memory as part of the CC signal,
+telling the memory graph which features were unexpected.
 
-### 2. Vector Surprise as the Universal Learning Signal
-PCM predicts the next token's representation per-feature-group. The prediction error
-is a **vector** (D_col dimensions), not a scalar. This per-feature surprise drives:
-- PM bias updates (adapt features that were surprising)
-- EM novelty scoring (blended with reconstruction error)
-- PCM gain modulation (amplify/dampen features before memory ops)
-
-**Why novel**: Most prediction-error-driven systems (curiosity, surprise-based gating)
-use scalar surprise. Vector surprise lets the model know *which features* were
-unexpected, enabling selective, per-feature plasticity.
-
-### 3. Neuromodulator-Gated Memory Writes Trained by Main Loss
-EM write gates (`g_em`) are produced by a small MLP that takes novelty and usage as
-input. Crucially, the neuromodulator is trained end-to-end by the **main CE loss** —
-gradient flows: write → primitive update → future trail reads → logits → loss.
-No RL reward, no auxiliary objective, single optimizer.
-
-**Why novel**: Most gated-write systems use heuristics or auxiliary losses. End-to-end
-gradient through the write gate teaches the model *when writing helps prediction*.
-
-### 4. Separate Hebbian PM + Neuromodulated EM
-Two memory systems with distinct update rules:
-- **PM (Hebbian)**: Surprise-gated autocorrelation. `W_b ← W_b @ (decay·I + β_b·G)`.
-  Reinforces co-occurring patterns. Multiple timescales via per-bank plasticity β_b.
-- **EM (neuromodulated decomposition)**: Write candidates decomposed across primitives
-  via full softmax routing. Segment-level neuromodulator `g_em = MLP(mean_novelty, usage)`
-  controls write strength. Gradient flows cross-segment: commit → em_K/V → trail read → loss.
-
-**Why novel**: Combining Hebbian fast-weight plasticity for procedural habits with
-neuromodulated primitive decomposition for episodic storage, both trained end-to-end
-by the main CE loss through cross-segment TBPTT.
+### 4. Energy-Conserving Routing
+Neuron output magnitude is divided among connections proportionally to learned
+thresholds. Natural sparsity emerges without top-k or budget mechanisms. The
+neuromodulator learns to adjust thresholds to route information effectively.
 
 ---
 
 ## What Makes This Fundamentally Different
 
 ### vs Transformers
-- Transformers ask "how much can we cache?" — we ask "what should we remember?"
 - Fixed memory footprint vs O(N) KV cache growth
-- Functional memory separation vs single KV cache
-- Online PM/EM updates vs retraining required
+- Memory adapts at inference vs frozen weights
+- O(N) compute vs O(N²) attention
 
 ### vs SSMs (Mamba, RWKV)
-- SSMs use flat state; we use structured memory with distinct systems
-- SSMs compress everything into hidden state; we separate memory by function + timescale
-- No explicit lifelong learning mechanism in SSMs
-- No neuromodulation, no eligibility traces, no surprise gating in SSMs
-- We use simple linear recurrence (simpler than SSM) — bio-inspired memory is the key addition
+- Structured persistent memory vs flat hidden state
+- RL-trained plasticity vs no explicit learning mechanism
+- Per-CC memory channels vs single state vector
 
 ### vs RAG
-- Memory is inside the model, not external
-- Updates are automatic (neuromodulated), not manually triggered
-- Knowledge integrates into computation, not just retrieved text
-- Compression and generalization, not verbatim storage
+- Memory inside the model, not external
+- Continuous automatic updates, not manually triggered
+- Compressed/generalized knowledge, not verbatim storage
+
+### vs Differentiable Memory (NTM, DNC)
+- Memory outside autograd — no gradient-through-memory bottleneck
+- RL-trained write policy — learns from outcome, not gradient signal
+- Continuous signal flow — not discrete read/write operations
 
 ---
 
-## Sacred Design Principles (Non-Negotiable)
+## Success Criteria
 
-These define the architecture's identity. Any change that violates these is a different
-model, not an optimization. Grouped by category:
+### Core: Language modeling works
+Loss decreases during training. CCs produce coherent predictions without memory.
 
-### Memory Architecture
-1. **Three memory timescales**: Genetic (slow weights, permanent after training),
-   Procedural (PM, bias that persists across documents), Episodic (EM, primitives
-   that persist across documents). Each has distinct function and update rules.
-2. **Memory is state, not parameters**: PM fast-weight matrices (W_pm) and EM primitives
-   are runtime tensors that evolve at inference. They are not learned weights — they are
-   what the model remembers from experience.
-3. **O(1) memory per token at inference**: Fixed capacity (B banks × M primitives for
-   EM, B × D_pm² fast-weight matrices for PM). No unbounded growth. Bounded by budgets.
+### Memory helps: Lower loss with memory than without
+The memory-enabled model outperforms the no-memory baseline on the same data.
 
-### Memory Operations
-4. **Trail-based compositional EM read**: Iterative seed navigation through primitive
-   space. No top-k, no hard selection — full softmax over all primitives at each step.
-   Combinatorial capacity from finite storage.
-5. **Surprise-gated PM updates**: PM adapts only on unpredicted features. Vector
-   surprise (per-feature prediction error from PCM) determines which features shift.
-6. **Novelty-based EM writes**: EM stores what is both surprising AND not already
-   representable by existing primitives (surprise + reconstruction error blend).
-7. **Neuromodulators trained by main loss**: Write gates are MLPs trained end-to-end
-   by cross-entropy loss. No RL, no auxiliary objective. Single optimizer, single loss.
+### Neuromodulator learns: Non-random plasticity policy
+PPO converges. Actions correlate with context. KL divergence stays bounded.
 
-### Causality and Compute
-8. **Causal token processing**: Scan recurrence ensures token t cannot see token t+1.
-   Autoregressive (NTP), not bidirectional.
-9. **Segment-end commits**: Memory writes happen once at segment end. Reads use
-   frozen segment-start state. This ensures strict causal ordering across segments.
+### Lifelong: Memory accumulates useful context
+In Phase B, long-document perplexity improves as memory accumulates context.
+Memory neurons develop specialization (diverse primitives, structured routing).
 
-### Plasticity Control
-10. **Budget enforcement**: PM norm budgets and EM strength budgets prevent unbounded
-    drift. Memory stays bounded regardless of deployment duration.
-11. **Vector surprise**: Per-feature prediction error (D_col dimensions), not scalar.
-    Enables selective, per-feature plasticity — only surprising features trigger updates.
-
-## Negotiable — Implementation Details
-
-- Architecture dimensions (D, B, C, M, D_embed, d_inner)
-- Segment length N (= memory update interval)
-- Total scan layers L_total, memory injection point L_mem
-- Trail steps count, number of banks
-- Hyperparameters (decay rates, temperatures, budgets, learning rates)
-- Norm type (RMSNorm vs LayerNorm), activation functions
-- Dense vs grouped scan (currently dense for GPU efficiency)
-- Specific kernel implementations (HGRN, Triton, etc.)
-
----
-
-## What Success Looks Like
-
-### Core: The model learns language normally
-Validation perplexity improves during training. Baseline competence established.
-
-### Adaptation: The model gets better as you use it
-- PM: repeated patterns → fewer mistakes within-session
-- EM: facts seen once → retrieved accurately later
-- Controllers: learned write selectivity outperforms heuristics
-
-### Stability: Core competence is preserved
-- Long adaptation runs don't destabilize base performance
-- Commit/write rates stay sparse and bounded
-
-### Hardware story: Constant memory, efficient compute
-- O(1) inference memory (no growing KV cache)
-- O(log N) serial depth (parallel-scan, no quadratic attention)
-- Scan kernels for GPU throughput + batched memory ops
+### Hardware: Efficient
+Memory graph adds <10% overhead vs no-memory baseline. Throughput competitive
+with Pythia-160M / Mamba-130M at similar param count.
