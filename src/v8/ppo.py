@@ -65,6 +65,7 @@ class PPORolloutBuffer:
         self.actions = torch.zeros(num_steps, num_envs, act_dim, device=device)
         self.logprobs = torch.zeros(num_steps, num_envs, device=device)
         self.rewards = torch.zeros(num_steps, num_envs, device=device)
+        self.dones = torch.zeros(num_steps, num_envs, device=device)
         self.values = torch.zeros(num_steps, num_envs, device=device)
 
         self.advantages = None
@@ -72,15 +73,18 @@ class PPORolloutBuffer:
         self.step = 0
 
     def add(self, obs: Tensor, action: Tensor, logprob: Tensor,
-            reward: Tensor, value: Tensor):
+            reward: Tensor, value: Tensor, done: Tensor | None = None):
         """Add one timestep of experience.
 
         All tensors: [N_envs, ...] or [N_envs].
+        done: [N_envs] float — 1.0 if environment reset at this step.
         """
         self.obs[self.step] = obs
         self.actions[self.step] = action
         self.logprobs[self.step] = logprob
         self.rewards[self.step] = reward
+        if done is not None:
+            self.dones[self.step] = done
         self.values[self.step] = value
         self.step += 1
 
@@ -98,11 +102,13 @@ class PPORolloutBuffer:
         for t in reversed(range(T)):
             if t == T - 1:
                 nextvalue = next_value
+                next_nonterminal = 1.0  # no done after last step
             else:
                 nextvalue = self.values[t + 1]
+                next_nonterminal = 1.0 - self.dones[t + 1]
 
-            delta = self.rewards[t] + gamma * nextvalue - self.values[t]
-            advantages[t] = delta + gamma * gae_lambda * lastgaelam
+            delta = self.rewards[t] + gamma * nextvalue * next_nonterminal - self.values[t]
+            advantages[t] = delta + gamma * gae_lambda * next_nonterminal * lastgaelam
             lastgaelam = advantages[t]
 
         self.advantages = advantages[:T]
@@ -141,15 +147,26 @@ class PPORolloutBuffer:
 
 
 class PPOTrainer:
-    """Trains the neuromodulator via PPO."""
+    """Trains the neuromodulator + mem_proj_in via PPO."""
 
     def __init__(self, neuromod: Neuromodulator, config: V8Config,
-                 device: torch.device):
+                 device: torch.device,
+                 extra_params: list | None = None):
+        """
+        Args:
+            neuromod: the neuromodulator module
+            config: V8Config
+            device: torch device
+            extra_params: additional params to optimize (e.g., mem_proj_in)
+        """
         self.neuromod = neuromod
         self.config = config
         self.device = device
+        all_params = list(neuromod.parameters())
+        if extra_params:
+            all_params.extend(extra_params)
         self.optimizer = torch.optim.Adam(
-            neuromod.parameters(), lr=config.ppo_lr, eps=1e-5,
+            all_params, lr=config.ppo_lr, eps=1e-5,
         )
         self.reward_rms = RunningMeanStd(device=device)
 

@@ -131,12 +131,14 @@ def main():
         print("Compiling model...")
         model.lm = torch.compile(model.lm)
 
-    # LM Optimizer — exclude biases and norms from weight decay
+    # LM Optimizer — exclude biases, norms, and mem_proj_in (trained by PPO)
     decay_params = []
     no_decay_params = []
     for name, param in model.lm.named_parameters():
         if not param.requires_grad:
             continue
+        if "mem_proj_in" in name:
+            continue  # trained by PPO, not LM optimizer
         if param.ndim <= 1 or name.endswith(".bias"):
             no_decay_params.append(param)
         else:
@@ -173,6 +175,7 @@ def main():
     )
 
     # Trainer
+    trainer_use_memory = not args.no_memory
     trainer = V8Trainer(
         model=model,
         lm_optimizer=lm_optimizer,
@@ -184,9 +187,6 @@ def main():
         log_interval=args.log_interval,
         use_memory=trainer_use_memory,
     )
-
-    # Pass no_memory flag to trainer
-    trainer_use_memory = not args.no_memory
 
     # Output dir
     run_id = time.strftime("%Y%m%d_%H%M%S")
