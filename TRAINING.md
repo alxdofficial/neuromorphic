@@ -12,23 +12,23 @@ python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
 
 ### Architecture
 
-Two-pass scan stack (8 layers, D=2048) with per-token memory access:
-- **Pass 1**: Pre-memory scan + per-CC PCM → H, surprise (parallel over T=2048)
+Single-pass scan stack (7 layers, D=2048) with per-token memory access:
+- **Scan**: all 7 layers + per-CC PCM → H, surprise (parallel over T=2048, once)
 - **Memory loop**: step memory graph per token, neuromodulator acts every 8 tokens
-- **Pass 2**: Post-memory scan with injected memory signals → logits (parallel)
-- **PPO update**: train neuromodulator on collected experience at chunk end
+- **Output**: logits = output_head(H + gate * mem_signal) — cheap, position-wise
+- **RL update**: sample K=4 trajectories, compare losses, policy gradient
 
 ### Config (Tier A)
 
 | | Value |
 |---|---|
-| Total params | 115.4M |
-| Scan layers | 8 (shared, full D=2048) |
-| Memory neurons | 4096 (16 blocks × 256) |
-| D_mem | 256 |
-| Neuromodulator | 3-layer MLP, 6.6M params |
+| Total params | ~113M |
+| Scan layers | 7 (shared, full D=2048, single pass) |
+| Memory neurons | 8192 (8 blocks × 1024) |
+| D_mem = D_cc | 128 |
+| Neuromodulator | 3-layer MLP hidden=2048, ~19.5M params (actor only) |
 | T (chunk) | 2048 tokens |
-| PPO | gamma=0.99, actions every 8 tokens |
+| RL | sampling-based, K=4 trajectories, actions every 8 tokens |
 
 ### CLI Options
 

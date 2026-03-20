@@ -1,22 +1,22 @@
-"""V8Model — top-level model wiring CCs + Memory Graph + Neuromodulator.
+"""V8Model — single-pass scan + memory graph + sampling-based RL.
 
 Training flow per chunk (T=2048 tokens):
-  Pass 1: Pre-memory scan + PCM over all T tokens (parallel, full D)
-  Memory loop: step memory graph per token, neuromod acts every action_every
-  Pass 2: Post-memory scan over all T tokens with injected memory signals
-  LM loss backward through CCs only
-  PPO update on neuromodulator using collected experience
+  1. Full scan + PCM over all T tokens (parallel, once)           ← expensive, shared
+  2. Sample K neuromodulator action trajectories
+  3. For each sample k: run memory loop + cheap output head       ← cheap per sample
+  4. Compare losses across samples → advantage → policy gradient
+  No critic, no value function, no GAE.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .config import V8Config
 from .lm import V8LM
 from .memory_graph import MemoryGraph
 from .neuromodulator import Neuromodulator
-from .ppo import PPORolloutBuffer
 
 
 class V8Model(nn.Module):
@@ -30,17 +30,13 @@ class V8Model(nn.Module):
         # Language model (in autograd graph)
         self.lm = V8LM(config)
 
-        # Neuromodulator (trained by PPO, has its own optimizer)
-        # Created eagerly so it's in the module tree for .parameters(), .to(), etc.
-        self._mem_graph = None  # initialized lazily per BS/device
-        # obs_dim: D_mem*3 (prim+mean_in+mean_out) + 4 (usage+temp+decay+entropy) + D_cc (surprise)
-        # Since D_mem = D_cc: obs_dim = D_cc * 4 + 4
-        obs_dim = config.D_cc * 4 + 4
+        # Neuromodulator (actor only — no critic needed for sampling-based RL)
+        self._mem_graph = None
+        obs_dim = config.D_cc * 4 + 4  # D_mem*3 + usage + temp + decay + entropy + D_cc surprise
         self.neuromod = Neuromodulator(config, obs_dim)
 
     def _ensure_memory(self, BS: int, device: torch.device,
                        dtype: torch.dtype = torch.float32):
-        """Lazily initialize memory graph."""
         if (self._mem_graph is not None
                 and self._mem_graph.is_initialized()
                 and self._mem_graph.primitives.shape[0] == BS):
@@ -52,37 +48,31 @@ class V8Model(nn.Module):
     def memory(self) -> MemoryGraph:
         return self._mem_graph
 
-    def get_ppo_params(self):
-        """All parameters trained by PPO (neuromodulator only).
-
-        W_mod (memory graph modulation MLP) is a plain tensor, not yet
-        included in any optimizer — flagged as open issue.
-        """
-        return list(self.neuromod.parameters())
-
     def forward_chunk(
         self,
         input_ids: Tensor,
         target_ids: Tensor | None = None,
         reset_mask: Tensor | None = None,
-        collect_ppo: bool = True,
         use_memory: bool = True,
+        n_samples: int = 1,
     ) -> dict:
-        """Process a full T-token chunk with per-token memory access.
+        """Process a full T-token chunk.
+
+        Single scan pass (shared), then K memory+output samples for RL.
 
         Args:
             input_ids:  [BS, T]
-            target_ids: [BS, T] or None — for per-token reward computation
-            reset_mask: [BS] bool — reset memory + scan carries for these streams
-            collect_ppo: whether to collect PPO experience
-            use_memory: if False, skip memory graph entirely (LM-only baseline)
+            target_ids: [BS, T] or None
+            reset_mask: [BS] bool
+            use_memory: if False, skip memory (LM-only baseline)
+            n_samples:  number of action trajectories to sample for RL
 
         Returns:
-            dict with keys:
-                logits:     [BS, T, vocab]
+            dict with:
+                logits:     [BS, T, vocab] — from best sample (or no-memory)
                 aux_loss:   scalar (PCM)
-                ppo_buffer: PPORolloutBuffer or None
                 surprise:   [BS, T, C, D_cc] (detached)
+                rl_data:    dict with sample losses + actions for policy update, or None
         """
         BS, T = input_ids.shape
         C = self.config.C
@@ -93,24 +83,24 @@ class V8Model(nn.Module):
         device = input_ids.device
         dtype = next(self.lm.parameters()).dtype
 
-        # Reset scan carries at doc boundaries (applies to both memory and no-memory)
+        # Reset scan carries at doc boundaries
         if reset_mask is not None and reset_mask.any():
             self._reset_carries(reset_mask)
 
         # ==========================================
-        # Pass 1: Pre-memory scan + PCM (parallel)
+        # Full scan + PCM (once, shared across all samples)
         # ==========================================
-        H, x, surprise, aux_loss = self.lm.forward_pre_memory(input_ids)
+        H, x, surprise, aux_loss = self.lm.forward_scan(input_ids)
+        # H: [BS, T, D], surprise: [BS, T, C, D_cc]
 
         # --- No-memory fast path ---
         if not use_memory:
-            mem_signals = torch.zeros(BS, T, C, D_mem, device=device, dtype=dtype)
-            logits = self.lm.forward_post_memory(H, mem_signals)
+            logits = self.lm.forward_output(H, mem_signals=None)
             return {
                 "logits": logits,
                 "aux_loss": aux_loss,
-                "ppo_buffer": None,
                 "surprise": surprise.detach(),
+                "rl_data": None,
             }
 
         # --- Memory path ---
@@ -119,45 +109,110 @@ class V8Model(nn.Module):
         if reset_mask is not None and reset_mask.any():
             self._mem_graph.reset_streams(reset_mask)
 
-        # CC→memory signals: raw H sliced into per-CC columns (D_mem = D_cc)
-        # No projection needed. Detach since memory graph is the environment.
+        # CC→memory signals: raw H sliced into per-CC columns
         cc_signals_all = H.detach().view(BS, T, C, D_mem).float()
 
-        # ==========================================
-        # Memory loop: step graph per token
-        # ==========================================
-        mem_signals = torch.zeros(BS, T, C, D_mem, device=device)
-        N_neurons = self.config.N_neurons
+        # Precompute EOT positions
+        eot_at = (input_ids == eot_id)
 
-        # PPO experience buffer
-        ppo_buffer = None
-        if collect_ppo:
-            n_envs = BS * N_neurons
-            n_actions = (T + action_every - 1) // action_every
-            ppo_buffer = PPORolloutBuffer(
-                n_actions, n_envs,
-                self._mem_graph.obs_dim, self.neuromod.act_dim,
-                device,
+        # ==========================================
+        # Sample K action trajectories
+        # ==========================================
+        # Save memory graph state so we can restore between samples
+        saved_state = self._save_mem_state()
+
+        sample_logits = []
+        sample_losses = []
+        sample_log_probs = []  # sum of log_probs across all actions in trajectory
+
+        for k in range(n_samples):
+            # Restore memory to start-of-chunk state for each sample
+            if k > 0:
+                self._restore_mem_state(saved_state)
+
+            # Run memory loop for this sample
+            mem_signals, traj_log_prob = self._run_memory_trajectory(
+                cc_signals_all, surprise, eot_at, BS, T, C, D_mem, D_cc,
+                action_every, device,
             )
 
+            # Cheap output: end-injection + output head
+            logits_k = self.lm.forward_output(H, mem_signals.to(dtype))
+            sample_logits.append(logits_k)
+            sample_log_probs.append(traj_log_prob)
+
+            # Compute loss for this sample if targets available
+            if target_ids is not None:
+                with torch.no_grad():
+                    # Mask EOT from reward
+                    per_token_ce = F.cross_entropy(
+                        logits_k.detach().reshape(-1, self.config.vocab_size),
+                        target_ids.reshape(-1),
+                        reduction='none',
+                    ).reshape(BS, T)
+                    reward_mask = (~eot_at).float()
+                    masked_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
+                    sample_losses.append(masked_loss)
+
+        # ==========================================
+        # Compute RL data for policy update
+        # ==========================================
+        rl_data = None
+        if target_ids is not None and n_samples > 1:
+            # Advantage: sample loss vs mean loss (lower loss = higher advantage)
+            losses = torch.stack(sample_losses)  # [K]
+            mean_loss = losses.mean()
+            # Advantage = negative (loss - mean_loss) → better-than-average samples get positive advantage
+            advantages = -(losses - mean_loss)  # [K]
+            # Normalize
+            adv_std = advantages.std().clamp(min=1e-8)
+            advantages = advantages / adv_std
+
+            rl_data = {
+                "log_probs": sample_log_probs,     # list of K tensors
+                "advantages": advantages,           # [K]
+                "losses": losses.detach(),           # [K]
+                "mean_loss": mean_loss.item(),
+            }
+
+        # Use the best sample's logits for LM loss (or first if no targets)
+        if sample_losses:
+            best_idx = torch.stack(sample_losses).argmin().item()
+            best_logits = sample_logits[best_idx]
+            # Also restore memory state to the best trajectory's end state
+            # (For now, use the last trajectory's state — restoring per-sample is complex)
+        else:
+            best_logits = sample_logits[0]
+
+        return {
+            "logits": best_logits,
+            "aux_loss": aux_loss,
+            "surprise": surprise.detach(),
+            "rl_data": rl_data,
+        }
+
+    def _run_memory_trajectory(
+        self, cc_signals_all, surprise, eot_at,
+        BS, T, C, D_mem, D_cc, action_every, device,
+    ) -> tuple[Tensor, Tensor]:
+        """Run one memory trajectory with sampled neuromod actions.
+
+        Returns:
+            mem_signals: [BS, T, C, D_mem]
+            traj_log_prob: scalar — sum of log_probs for all actions in trajectory
+        """
+        N_neurons = self.config.N_neurons
+        mem_signals = torch.zeros(BS, T, C, D_mem, device=device)
+        traj_log_prob = torch.tensor(0.0, device=device)
         prev_cc_surprise = torch.zeros(BS, C, D_cc, device=device)
-        action_step = 0
-
-        # Precompute per-token EOT mask for reward masking and doc resets
-        eot_at = (input_ids == eot_id)  # [BS, T]
-
-        # Track which action steps had a doc boundary reset (for GAE dones)
-        action_dones = []  # list of [BS * N_neurons] tensors
 
         for t in range(T):
-            # Doc boundary: reset if PREVIOUS token was EOT
-            did_reset = None
+            # Doc boundary: reset if previous token was EOT
             if not self.config.lifelong_mode and t > 0:
-                eot_prev = eot_at[:, t - 1]  # [BS]
+                eot_prev = eot_at[:, t - 1]
                 if eot_prev.any():
                     self._mem_graph.reset_streams(eot_prev)
                     self._reset_carries(eot_prev)
-                    did_reset = eot_prev
 
             # Step memory graph
             with torch.autocast(device_type=device.type, enabled=False):
@@ -165,8 +220,7 @@ class V8Model(nn.Module):
             mem_signals[:, t] = mem_out
 
             # Neuromodulator acts every action_every tokens
-            if t % action_every == 0 and collect_ppo:
-                # Surprise context for observation
+            if t % action_every == 0:
                 if t > 0:
                     recent_surp = surprise[:, max(0, t - action_every):t].detach()
                     mean_surp = recent_surp.mean(dim=1)
@@ -178,20 +232,17 @@ class V8Model(nn.Module):
                 )
                 obs_flat = obs.reshape(BS * N_neurons, -1)
 
-                with torch.no_grad():
-                    action, logprob, _, value = self.neuromod.get_action_and_value(
-                        obs_flat
-                    )
+                # Sample action from policy
+                action, logprob, _, _ = self.neuromod.get_action_and_value(obs_flat)
+                traj_log_prob = traj_log_prob + logprob.sum()
 
-                # Clamp and apply actions to memory graph
+                # Clamp and apply
                 max_act = self.config.max_action_magnitude
                 clamped = action.clamp(-max_act, max_act)
-                D_mem_act = self.config.D_mem
-                max_conn = self.config.max_connections
-                # Parse action: [D_mem | max_conn | 1 (temp) | 1 (decay)]
                 idx = 0
-                d_prim = clamped[:, idx:idx + D_mem_act].reshape(BS, N_neurons, D_mem_act)
-                idx += D_mem_act
+                d_prim = clamped[:, idx:idx + D_mem].reshape(BS, N_neurons, D_mem)
+                idx += D_mem
+                max_conn = self.config.max_connections
                 d_thresh = clamped[:, idx:idx + max_conn].reshape(BS, N_neurons, max_conn)
                 idx += max_conn
                 d_temp = clamped[:, idx].reshape(BS, N_neurons)
@@ -199,129 +250,54 @@ class V8Model(nn.Module):
                 d_decay = clamped[:, idx].reshape(BS, N_neurons)
                 self._mem_graph.apply_actions(d_prim, d_thresh, d_temp, d_decay)
 
-                # Record done flag: did any stream reset during this action window?
-                if did_reset is not None:
-                    M = self.config.M_per_block
-                    done_per_neuron = did_reset.unsqueeze(1).expand(BS, N_neurons).reshape(
-                        BS * N_neurons
-                    ).float()
-                else:
-                    done_per_neuron = torch.zeros(BS * N_neurons, device=device)
-                action_dones.append(done_per_neuron)
-
-                ppo_buffer.add(
-                    obs=obs_flat,
-                    action=action,
-                    logprob=logprob,
-                    reward=torch.zeros(BS * N_neurons, device=device),
-                    value=value,
-                    done=done_per_neuron,
-                )
-                action_step += 1
                 prev_cc_surprise = mean_surp
 
-        # ==========================================
-        # Pass 2: Post-memory scan (parallel)
-        # ==========================================
-        logits = self.lm.forward_post_memory(H, mem_signals.to(dtype))
+        return mem_signals, traj_log_prob
 
-        # ==========================================
-        # Compute per-token rewards for PPO
-        # ==========================================
-        if target_ids is not None and ppo_buffer is not None and action_step > 0:
-            with torch.no_grad():
-                per_token_ce = torch.nn.functional.cross_entropy(
-                    logits.detach().reshape(-1, self.config.vocab_size),
-                    target_ids.reshape(-1),
-                    reduction='none',
-                ).reshape(BS, T)
-
-                # Mask EOT positions: don't reward/penalize cross-doc predictions
-                reward_mask = (~eot_at).float()  # [BS, T]
-                rewards = -per_token_ce * reward_mask  # [BS, T]
-
-                # Aggregate: per action step, per CC (block-level credit)
-                # Action at step_idx acted at token t_act = step_idx * action_every
-                # Reward window = [t_act + action_every, t_act + 2*action_every)
-                # (shifted by action_every: action can only influence NEXT window)
-                M = self.config.M_per_block
-                for step_idx in range(action_step):
-                    # Reward from the NEXT window (action at t can't influence t)
-                    r_start = (step_idx + 1) * action_every
-                    r_end = min(r_start + action_every, T)
-                    if r_start >= T:
-                        # Last action has no future tokens in this chunk
-                        ppo_buffer.rewards[step_idx] = torch.zeros(
-                            BS * N_neurons, device=device
-                        )
-                        continue
-
-                    window_rewards = rewards[:, r_start:r_end]  # [BS, r_end-r_start]
-                    window_mask = reward_mask[:, r_start:r_end]
-                    valid = window_mask.sum(dim=1).clamp(min=1.0)
-
-                    # Per-stream base reward
-                    per_stream_reward = window_rewards.sum(dim=1) / valid  # [BS]
-
-                    # Per-CC surprise → per-block weighting
-                    # Average CC surprises within each block
-                    window_surp = surprise[:, r_start:r_end].detach()  # [BS, win, C, D_cc]
-                    cc_surp_mag = window_surp.norm(dim=-1).mean(dim=1)  # [BS, C]
-                    N_blocks = self.config.N_blocks
-                    ccs_pb = self.config.CCs_per_block
-                    # [BS, C] → [BS, N_blocks, ccs_pb] → mean → [BS, N_blocks]
-                    block_surp = cc_surp_mag.view(BS, N_blocks, ccs_pb).mean(dim=2)
-                    block_weights = block_surp / (block_surp.mean(dim=1, keepdim=True) + 1e-8)
-
-                    # Per-block reward
-                    block_rewards = per_stream_reward.unsqueeze(1) * block_weights  # [BS, N_blocks]
-
-                    # Expand to per-neuron: each neuron in block gets its block's reward
-                    M = self.config.M_per_block
-                    neuron_rewards = block_rewards.unsqueeze(2).expand(
-                        BS, N_blocks, M
-                    ).reshape(BS * N_neurons)
-
-                    ppo_buffer.rewards[step_idx] = neuron_rewards
-
-                # Bootstrap value for GAE
-                final_obs = self._mem_graph.get_neuron_obs(
-                    cc_surprise=prev_cc_surprise.float()
-                ).reshape(BS * N_neurons, -1)
-                with torch.no_grad():
-                    next_value = self.neuromod.get_value(final_obs)
-                ppo_buffer.compute_returns(
-                    next_value,
-                    gamma=self.config.ppo_gamma,
-                    gae_lambda=self.config.ppo_lambda,
-                )
-
+    def _save_mem_state(self) -> dict:
+        """Save memory graph state for restoring between samples."""
+        mg = self._mem_graph
         return {
-            "logits": logits,
-            "aux_loss": aux_loss,
-            "ppo_buffer": ppo_buffer,
-            "surprise": surprise.detach(),
+            'primitives': mg.primitives.clone(),
+            'thresholds': mg.thresholds.clone(),
+            'temperature': mg.temperature.clone(),
+            'decay': mg.decay.clone(),
+            'activations': mg.activations.clone(),
+            'prev_output': mg.prev_output.clone(),
+            'mean_input': mg.mean_input.clone(),
+            'mean_output': mg.mean_output.clone(),
+            'usage_count': mg.usage_count.clone(),
         }
+
+    def _restore_mem_state(self, state: dict):
+        """Restore memory graph state from saved snapshot."""
+        mg = self._mem_graph
+        mg.primitives = state['primitives'].clone()
+        mg.thresholds = state['thresholds'].clone()
+        mg.temperature = state['temperature'].clone()
+        mg.decay = state['decay'].clone()
+        mg.activations = state['activations'].clone()
+        mg.prev_output = state['prev_output'].clone()
+        mg.mean_input = state['mean_input'].clone()
+        mg.mean_output = state['mean_output'].clone()
+        mg.usage_count = state['usage_count'].clone()
 
     def _reset_carries(self, mask: Tensor):
         """Reset scan carries for masked streams."""
         if hasattr(self.lm, '_carries'):
-            mask_f = (~mask).to(dtype=torch.float32).unsqueeze(-1)  # [BS, 1]
+            mask_f = (~mask).to(dtype=torch.float32).unsqueeze(-1)
             for i, h in enumerate(self.lm._carries):
                 if h is not None:
                     self.lm._carries[i] = h * mask_f
 
     def initialize_states(self, BS: int, device: torch.device):
-        """Initialize all state (carries + memory)."""
         self.lm.initialize_carries()
         self._ensure_memory(BS, device, torch.float32)
 
     def detach_states(self):
-        """TBPTT boundary: detach scan carries. Memory persists without detach."""
         self.lm.detach_carries()
 
     def param_count(self) -> int:
-        """Total trained parameters (LM + neuromodulator)."""
         total = self.lm.param_count()
         total += sum(p.numel() for p in self.neuromod.parameters()
                      if p.requires_grad)

@@ -22,7 +22,7 @@ We replicate the principles that matter for language modeling:
    memory graph is a persistent network of neurons outside autograd.
 
 3. **Plasticity is local and neuromodulated.** How much synapses change is gated
-   by neuromodulators. We substitute RL (PPO) training for the neuromodulator.
+   by neuromodulators. We substitute RL training for the neuromodulator.
 
 4. **Energy conservation constrains signal routing.** Output magnitude is divided
    among connections proportionally, creating natural sparsity.
@@ -34,16 +34,15 @@ We replicate the principles that matter for language modeling:
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │                    CORTICAL COLUMNS (V8LM)                     │
-│  Full-D scan stack: 8 layers (shared), D=2048, d_inner=1024   │
+│  Full-D scan stack: 7 layers (shared), D=2048, d_inner=1024   │
 │  16 per-CC PCMs (independent weights, D_cc=128, hidden=256)   │
-│  Two-pass forward:                                             │
-│    Pass 1: layers[0..3] + PCM → H [BS,T,D], surprise          │
-│    Pass 2: layers[4..7] with memory injection → logits         │
-│  Trained by backprop. ~99M params.                             │
+│  Single-pass: all layers → PCM → H + surprise (parallel, once) │
+│  End-injection: logits = output_head(H + gate * mem_signal)    │
+│  Trained by backprop. ~93M params.                             │
 └────────────────────┬────────────────────┬──────────────────────┘
                      │ raw H_slice        │ raw mem_signal
-                     │ (D_cc=128, no      │ (D_mem=D_cc=128,
-                     │  projection)       │  gated by mem_gate)
+                     │ (D_cc=128)         │ (D_mem=D_cc=128,
+                     │                    │  gated by mem_gate)
                      ▼                    │
 ┌───────────────────────────────────────────────────────────────┐
 │                    NEURAL MEMORY GRAPH                          │
@@ -58,23 +57,23 @@ We replicate the principles that matter for language modeling:
 │  Energy-conserving: output magnitude = sum of outbound signals │
 │                                                                │
 │  NOT in autograd. Runs with torch.no_grad().                   │
-│  ~18 MB state per stream. Zero trainable params.               │
+│  ~26 MB state per stream. Zero trainable params.               │
 └────────────────────┬───────────────────────────────────────────┘
                      │ neuron observations
                      ▼
 ┌───────────────────────────────────────────────────────────────┐
 │                    NEUROMODULATOR                               │
-│  PPO actor-critic, shared across all 8192 neurons              │
-│  Actor: 3-layer MLP (obs→1024→1024→1024 → action heads)       │
-│  Critic: 3-layer MLP (same dims → scalar value)               │
+│  Sampling-based RL, shared policy across all 8192 neurons      │
+│  Policy: 3-layer MLP (obs→2048→2048→2048 → action heads)      │
+│  No critic — advantage from comparing K sampled trajectories   │
 │  Actions every 8 tokens: delta_primitive + delta_thresholds    │
 │    + delta_temperature + delta_decay (290 dims per neuron)     │
-│  Reward: per-token CE loss (block-level, gamma=0.99)           │
-│  ~8M params. Trained by PPO.                                   │
+│  K=4 trajectory samples per chunk, REINFORCE with baselines    │
+│  ~10M params (actor only). Trained by policy gradient.         │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-**Total trained params: ~107M** (67.2M scan + 24.6M embedding + 4.2M pos + 3.1M proj + 2.4M PCM + ~8M neuromod)
+**Total trained params: ~113M** (58.8M scan + 24.6M embed + 4.2M pos + 3.1M proj + 2.4M PCM + ~19.5M neuromod)
 
 ---
 
@@ -85,10 +84,10 @@ We replicate the principles that matter for language modeling:
 Full-D scan stack, same architecture as v7. Provides all cross-column mixing
 and causal token processing. Memory is an add-on, not a dependency.
 
-**Two-pass forward:**
-1. **Pass 1** (`forward_pre_memory`): Embed → pos_embed[0..T] → layers[0..L_mem-1] → PCM per-CC → H, surprise
+**Single-pass forward:**
+1. **Scan** (`forward_scan`): Embed → pos_embed[0..T] → ALL scan layers → PCM per-CC → H, surprise
 2. **Memory loop**: per-token CC↔memory signal exchange (sequential, cheap, no_grad)
-3. **Pass 2** (`forward_post_memory`): inject memory → layers[L_mem..L_total-1] → proj_down → logits
+3. **Output** (`forward_output`): logits = output_head(H + gate * mem_signal) — cheap, per-sample
 
 **CC↔memory interface — no projections:**
 - D_mem = D_cc = 128 by design. No projections needed.
@@ -120,18 +119,21 @@ and causal token processing. Memory is an add-on, not a dependency.
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
-Shared PPO actor-critic across all 8192 neurons.
+Shared policy network across all 8192 neurons. No critic.
 
 **Observation** per neuron (516 dims): primitive + mean_input + mean_output + usage + temperature + decay + routing_entropy + CC_surprise
 **Action** per neuron (290 dims): delta_primitive[128] + delta_thresholds[160] + delta_temperature[1] + delta_decay[1]
-**Architecture**: separate 3-layer actor/critic, hidden=1024, Tanh activations
+**Architecture**: 3-layer MLP, hidden=2048, Tanh activations. ~19.5M params.
 
-### PPO Training — `src/v8/ppo.py`
+### Sampling-Based RL Training
 
-- Rollout buffer: `[T//8, BS×8192, ...]` — 256 action steps × 65K+ parallel environments
-- GAE: gamma=0.99, lambda=0.95, with dones mask at doc boundaries
-- Reward: negative per-token CE loss, weighted by per-block surprise, shifted by action_every
-- Update: 4 epochs, minibatch=512, clip=0.2, entropy coef=0.003
+No PPO, no critic, no GAE. Instead:
+1. Scan runs once (shared across all samples)
+2. Sample K=4 neuromodulator action trajectories through the memory graph
+3. For each sample: run memory loop + cheap output head → per-sample CE loss
+4. Advantage = -(loss_k - mean_loss) / std — relative ranking across samples
+5. Policy gradient: increase probability of better-than-average trajectories
+6. The scan (95%+ of compute) is shared; each sample adds only the memory loop + output head
 
 ---
 
@@ -141,15 +143,16 @@ Shared PPO actor-critic across all 8192 neurons.
 # Full v8 with memory
 python -u -m src.v8.train --bs 8 --steps 10000 --compile
 
-# LM-only baseline (no memory graph, no PPO)
+# LM-only baseline (no memory graph, no RL)
 python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
 ```
 
 **Per step:**
-1. Forward: Pass 1 (parallel) → memory loop (sequential, cheap) → Pass 2 (parallel)
-2. LM loss backward through CCs only
-3. PPO update on neuromodulator using collected experience
-4. Detach scan carries. Memory graph state persists.
+1. Full scan over T tokens (parallel, once — shared across all samples)
+2. Sample K=4 neuromod trajectories: memory loop + cheap output head each
+3. LM loss backward through CCs (best sample's logits)
+4. Neuromod policy gradient from advantage across K samples
+5. Detach scan carries. Memory graph state persists.
 
 **Data**: The Pile, same pipeline as v7. T=2048 tokens per chunk, BS=8.
 
@@ -163,8 +166,7 @@ python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
 | D_embed | 768 |
 | C (cortical columns) | 16 |
 | D_cc = D_mem | 128 |
-| L_total (scan layers) | 8 |
-| L_mem (injection point) | 4 |
+| L_total (scan layers, single pass) | 7 |
 | d_inner | 1024 |
 | N_blocks | 8 |
 | M_per_block | 1024 |
@@ -172,24 +174,25 @@ python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
 | K_intra (random within block) | 128 |
 | K_inter (random across blocks) | 32 |
 | CCs per block | 2 |
-| neuromod_hidden | 1024 |
+| neuromod_hidden | 2048 |
 | neuromod_layers | 3 |
 | action_every | 8 tokens |
 | action_dims per neuron | 290 |
+| n_samples (RL trajectories) | 4 |
 | T | 2048 |
-| **Total trained params** | **~107M** |
+| **Total trained params** | **~113M** |
 
 **Param breakdown:**
 
 | Component | Params | % | Trained by |
 |-----------|--------|---|------------|
-| Scan layers (8 shared) | 67.2M | 62.7% | Backprop |
-| Embedding (tied) | 24.6M | 22.9% | Backprop |
-| Positional embedding [2048, 2048] | 4.2M | 3.9% | Backprop |
-| proj_up + proj_down | 3.1M | 2.9% | Backprop |
-| PCM (16 independent, hidden=256) | 2.4M | 2.2% | Backprop |
+| Scan layers (7 shared) | 58.8M | 52% | Backprop |
+| Embedding (tied) | 24.6M | 22% | Backprop |
+| Positional embedding [2048, 2048] | 4.2M | 3.7% | Backprop |
+| proj_up + proj_down | 3.1M | 2.7% | Backprop |
+| PCM (16 independent, hidden=256) | 2.4M | 2.1% | Backprop |
 | mem_gate (16 scalars) | 16 | <0.01% | Backprop |
-| Neuromodulator (actor+critic) | ~8M | 5.3% | PPO |
+| Neuromodulator (actor only) | 19.5M | 17% | Sampling RL |
 
 **Memory graph state** (per stream, not trained params): ~18 MB
 - Zero trainable parameters in memory graph
@@ -208,7 +211,7 @@ python -u -m src.v8.train --bs 8 --steps 10000 --compile --no-memory
    The mapping is fixed (each CC has a home block).
 
 3. **No learned weights in memory.** Neuron modulation is `silu(input * primitive)`.
-   The neuromodulator (PPO) controls everything: what neurons store (primitives),
+   The neuromodulator (RL) controls everything: what neurons store (primitives),
    where signals route (thresholds), how sharply (temperature), how persistently
    (decay). Replaces explicit Hebbian learning, W_mod MLPs, etc.
 
@@ -238,13 +241,13 @@ src/v8/
 ├── pcm.py                 # SingleColumnPCM (per-CC, independent weights)
 ├── memory_graph.py        # MemoryGraph (no autograd, SIMD-parallel)
 ├── lm.py                  # V8LM (scan stack + PCM + memory interface)
-├── neuromodulator.py      # PPO actor-critic for plasticity control
-├── ppo.py                 # PPORolloutBuffer, GAE, PPOTrainer
-├── model.py               # V8Model (top-level wiring)
-├── trainer.py             # V8Trainer (joint LM + PPO training loop)
+├── neuromodulator.py      # Policy network for plasticity control (no critic)
+├── ppo.py                 # PPORolloutBuffer, GAE (legacy, may be removed)
+├── model.py               # V8Model (top-level wiring, sampling RL)
+├── trainer.py             # V8Trainer (joint LM + sampling RL training loop)
 └── train.py               # Training entry point with CLI
 
 tests/v8/
 ├── test_memory_graph.py   # Graph step, routing, energy conservation
-└── test_integration.py    # Full forward + backward + PPO
+└── test_integration.py    # Full forward + backward + RL
 ```

@@ -1,17 +1,14 @@
-"""V8 Language Model — scan stack + per-CC PCM.
+"""V8 Language Model — single-pass scan stack + per-CC PCM + end-injection.
 
-Full-D scan layers provide the language model backbone. Per-CC PCM modules
-compute surprise independently per column. Memory signals are injected
-additively at the L_mem boundary.
+All scan layers run once over T tokens (parallel). PCM computes surprise.
+Memory signals are injected as a position-wise additive residual at the end,
+right before the output head. No two-pass split.
 
-CC↔memory interface requires no projections: D_mem = D_cc by design.
-The CC's raw activity at L_mem IS the memory input. The memory graph's
-raw output IS the CC's memory signal. The memory gate controls how much
-the CC listens to memory.
+CC→memory: raw H_slice[t] (D_cc=128) — the scan's causal representation
+Memory→CC: raw mem_signal[t] (D_mem=D_cc=128) — gated, added to H
 
-The LM is split into two phases for the memory loop:
-  forward_pre_memory():  layers[0..L_mem-1] + PCM → H, surprise
-  forward_post_memory(): memory injection + layers[L_mem..L_total-1] → logits
+The scan is shared across CCs. Memory signals come from the memory graph
+which runs per-token sequentially (outside autograd).
 """
 
 import torch
@@ -26,7 +23,7 @@ from .config import V8Config
 
 
 class V8LM(nn.Module):
-    """Language model with direct CC↔memory interface (no projections)."""
+    """Language model: single-pass scan + PCM + end-injection of memory."""
 
     def __init__(self, config: V8Config):
         super().__init__()
@@ -48,7 +45,7 @@ class V8LM(nn.Module):
             self.proj_down = None
         self.pos_embed = nn.Parameter(torch.randn(config.T, D) * 0.02)
 
-        # Full-D scan layers (shared across all CCs and positions)
+        # Full-D scan layers — ALL layers run in one pass
         self.layers = nn.ModuleList([
             ScanLayer(D, config.d_inner, config.dropout,
                       n_layers=config.L_total, glu_output=config.glu_output)
@@ -64,8 +61,6 @@ class V8LM(nn.Module):
             self.pcm_modules = None
 
         # Memory gate per CC (sigmoid(0) = 0.5 at init)
-        # This is the only CC↔memory interface parameter.
-        # No projections needed since D_mem = D_cc.
         self.mem_gate = nn.Parameter(torch.zeros(C))
 
         # Output head
@@ -77,15 +72,15 @@ class V8LM(nn.Module):
         # Scan carries
         self._carries = [None] * config.L_total
 
-    def forward_pre_memory(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Pass 1: embed + pre-memory scan + PCM.
+    def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Full scan + PCM. Runs once, shared across memory samples.
 
         Args:
             input_ids: [BS, T]
 
         Returns:
-            H: [BS, T, D] — hidden states after pre-memory layers
-            x: [BS, T, D] — embedded input (for PCM)
+            H: [BS, T, D] — hidden states after ALL scan layers
+            x: [BS, T, D] — embedded input (for PCM reference)
             surprise: [BS, T, C, D_cc] — per-CC surprise
             aux_loss: scalar — PCM prediction loss
         """
@@ -100,9 +95,9 @@ class V8LM(nn.Module):
             x = self.proj_up(x)
         x = x + self.pos_embed[:T]
 
-        # Pre-memory scan layers
+        # ALL scan layers in one pass
         H = x
-        for i in range(self.config.L_mem):
+        for i in range(self.config.L_total):
             carry = self._carries[i]
             if self.config.gradient_checkpointing and self.training:
                 H, h_last = grad_checkpoint(self.layers[i], H, carry,
@@ -111,7 +106,7 @@ class V8LM(nn.Module):
                 H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
-        # Per-CC PCM
+        # Per-CC PCM (after scan — surprise reflects full scan context)
         aux_loss = torch.tensor(0.0, device=H.device)
         if self.pcm_modules is not None:
             H_cols = H.view(BS, T, C, D_cc)
@@ -134,35 +129,23 @@ class V8LM(nn.Module):
 
         return H, x, surprise, aux_loss
 
-    def forward_post_memory(self, H: Tensor, mem_signals: Tensor) -> Tensor:
-        """Pass 2: memory injection + post-memory scan + output.
+    def forward_output(self, H: Tensor, mem_signals: Tensor | None = None) -> Tensor:
+        """End-injection of memory + output head. Cheap, per-sample.
 
         Args:
-            H: [BS, T, D] — hidden states from pre-memory pass
-            mem_signals: [BS, T, C, D_cc] — memory signals (D_mem = D_cc)
+            H: [BS, T, D] — scan output (shared across samples)
+            mem_signals: [BS, T, C, D_cc] or None — memory signals to inject
 
         Returns:
             logits: [BS, T, vocab]
         """
         BS, T, D = H.shape
-        C = self.config.C
 
-        # Direct injection: gate * mem_signals, reshaped to D
-        gate = torch.sigmoid(self.mem_gate)  # [C]
-        mem_contribution = gate[None, None, :, None] * mem_signals  # [BS, T, C, D_cc]
-        H = H + mem_contribution.reshape(BS, T, D)
+        if mem_signals is not None:
+            gate = torch.sigmoid(self.mem_gate)  # [C]
+            mem_contribution = gate[None, None, :, None] * mem_signals
+            H = H + mem_contribution.reshape(BS, T, D)
 
-        # Post-memory scan layers
-        for i in range(self.config.L_mem, self.config.L_total):
-            carry = self._carries[i]
-            if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry,
-                                            use_reentrant=False)
-            else:
-                H, h_last = self.layers[i](H, carry)
-            self._carries[i] = h_last
-
-        # Output
         out = H
         if self.proj_down is not None:
             out = self.proj_down(out)

@@ -29,7 +29,7 @@ class TestV8ModelForward:
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids, target_ids=target_ids, n_samples=2)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
         assert result["aux_loss"].shape == ()
         assert result["surprise"].shape == (BS, cfg.T, cfg.C, cfg.D_cc)
@@ -44,16 +44,15 @@ class TestV8ModelForward:
         result = model.forward_chunk(input_ids, target_ids=target_ids)
         assert torch.isfinite(result["logits"]).all()
 
-    def test_forward_without_targets(self):
-        """Should work without target_ids (no PPO rewards computed)."""
+    def test_forward_no_memory(self):
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, collect_ppo=False)
+        result = model.forward_chunk(input_ids, use_memory=False)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
-        assert result["ppo_buffer"] is None
+        assert result["rl_data"] is None
 
     def test_forward_with_reset(self):
         cfg = make_tiny()
@@ -68,19 +67,19 @@ class TestV8ModelForward:
         )
         assert torch.isfinite(result["logits"]).all()
 
-    def test_ppo_buffer_populated(self):
+    def test_rl_data_populated(self):
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        buf = result["ppo_buffer"]
-        assert buf is not None
-        expected_actions = cfg.T // cfg.action_every
-        assert buf.step == expected_actions
-        assert buf.advantages is not None  # GAE should have been computed
+        result = model.forward_chunk(input_ids, target_ids=target_ids, n_samples=3)
+        rl = result["rl_data"]
+        assert rl is not None
+        assert len(rl["log_probs"]) == 3
+        assert rl["advantages"].shape == (3,)
+        assert rl["losses"].shape == (3,)
 
 
 class TestV8Gradients:
@@ -98,7 +97,6 @@ class TestV8Gradients:
         ) + result["aux_loss"]
         loss.backward()
 
-        # Check all LM params have gradients (no projections to exclude now)
         no_grad = []
         for name, param in model.lm.named_parameters():
             if param.requires_grad and param.grad is None:
@@ -125,7 +123,6 @@ class TestV8Gradients:
                 f"Zero gradient for layers[{i}].proj_in"
 
     def test_mem_gate_gradient(self):
-        """Memory gate should get gradient through post-memory scan."""
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
@@ -141,7 +138,6 @@ class TestV8Gradients:
         assert model.lm.mem_gate.grad is not None
 
     def test_memory_not_in_autograd(self):
-        """Memory graph tensors should not require grad."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))

@@ -64,6 +64,8 @@ def parse_args():
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--grad-ckpt", action="store_true", default=False,
                    help="Enable gradient checkpointing")
+    p.add_argument("--n-samples", type=int, default=4,
+                   help="Number of neuromod action trajectories to sample (default 4)")
     return p.parse_args()
 
 
@@ -106,8 +108,8 @@ def main():
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  PPO: gamma={config.ppo_gamma}, lambda={config.ppo_lambda}, "
-          f"epochs={config.ppo_epochs}")
+    print(f"  RL: sampling-based, n_samples={args.n_samples}, "
+          f"action_every={config.action_every}")
 
     # Model
     model = V8Model(config)
@@ -152,6 +154,11 @@ def main():
         fused=(device.type == "cuda"),
     )
 
+    # Neuromodulator optimizer (separate, no weight decay)
+    neuromod_optimizer = torch.optim.Adam(
+        model.neuromod.parameters(), lr=config.ppo_lr, eps=1e-5,
+    )
+
     # LR scheduler: warmup + cosine decay
     def lr_lambda(step):
         if step < args.warmup:
@@ -174,9 +181,11 @@ def main():
 
     # Trainer
     trainer_use_memory = not args.no_memory
+    n_samples = args.n_samples if trainer_use_memory else 1
     trainer = V8Trainer(
         model=model,
         lm_optimizer=lm_optimizer,
+        neuromod_optimizer=neuromod_optimizer,
         scheduler=scheduler,
         dataloader=dataloader,
         config=config,
@@ -184,6 +193,7 @@ def main():
         max_grad_norm=MAX_GRAD_NORM,
         log_interval=args.log_interval,
         use_memory=trainer_use_memory,
+        n_samples=n_samples,
     )
 
     # Output dir

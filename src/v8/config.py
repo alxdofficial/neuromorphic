@@ -10,8 +10,7 @@ class V8Config:
     D_embed: int = 768
     C: int = 16                  # cortical columns
     D_cc: int = -1               # derived: D // C = neuron dim
-    L_total: int = 10            # total scan layers
-    L_mem: int = 5               # memory injection point
+    L_total: int = 10            # total scan layers (single pass, no split)
     d_inner: int = 1024
     glu_output: bool = True
     vocab_size: int = 32000
@@ -96,8 +95,6 @@ class V8Config:
         self.D_cc = self.D // self.C
         if self.L_total < 1:
             raise ValueError(f"L_total ({self.L_total}) must be >= 1.")
-        if self.L_mem < 0 or self.L_mem >= self.L_total:
-            raise ValueError(f"L_mem ({self.L_mem}) must be in [0, L_total).")
         if self.d_inner < 1:
             raise ValueError(f"d_inner ({self.d_inner}) must be >= 1.")
         if self.N_blocks < 1:
@@ -122,7 +119,7 @@ class V8Config:
     @classmethod
     def tier_a(cls, **overrides) -> "V8Config":
         defaults = dict(
-            D=2048, D_embed=768, C=16, L_total=7, L_mem=4,
+            D=2048, D_embed=768, C=16, L_total=7,
             d_inner=1024, glu_output=True, T=2048,
             # Memory graph: 8 blocks × 1024 neurons, D_mem=D_cc=128
             N_blocks=8, M_per_block=1024,
@@ -137,7 +134,7 @@ class V8Config:
     def tier_tiny(cls, **overrides) -> "V8Config":
         """Tiny config for unit tests."""
         defaults = dict(
-            D=64, D_embed=64, C=4, L_total=4, L_mem=2,
+            D=64, D_embed=64, C=4, L_total=4,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
             N_blocks=2, M_per_block=8,
             K_intra=4, K_inter=2,

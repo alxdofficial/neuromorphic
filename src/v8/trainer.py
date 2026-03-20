@@ -1,9 +1,12 @@
-"""V8 Trainer — joint LM training + PPO neuromodulator training.
+"""V8 Trainer — joint LM training + sampling-based RL for neuromodulator.
 
 Each step:
-1. Forward full T-token chunk through V8Model (LM loss + PPO experience)
-2. Backward LM loss → update CC params (Adam)
-3. PPO update on collected experience → update neuromodulator (PPO-Adam)
+1. Full scan over T tokens (once, shared)
+2. Sample K neuromodulator action trajectories through memory graph
+3. Compare per-sample CE loss → advantage → policy gradient
+4. LM backward on best sample's logits
+5. Neuromod backward on weighted log-probs
+No critic, no value function, no GAE.
 """
 
 import time
@@ -16,7 +19,6 @@ from tqdm import tqdm
 
 from .config import V8Config
 from .model import V8Model
-from .ppo import PPOTrainer
 
 
 class V8Trainer:
@@ -26,6 +28,7 @@ class V8Trainer:
         self,
         model: V8Model,
         lm_optimizer: torch.optim.Optimizer,
+        neuromod_optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler | None,
         dataloader,
         config: V8Config,
@@ -34,9 +37,11 @@ class V8Trainer:
         log_interval: int = 50,
         collector=None,
         use_memory: bool = True,
+        n_samples: int = 4,
     ):
         self.model = model
         self.lm_optimizer = lm_optimizer
+        self.neuromod_optimizer = neuromod_optimizer
         self.scheduler = scheduler
         self.dataloader = dataloader
         self.config = config
@@ -46,29 +51,16 @@ class V8Trainer:
         self.collector = collector
         self.global_step = 0
         self.use_memory = use_memory
+        self.n_samples = n_samples
 
         self._states_initialized = False
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
 
-        # PPO trainer for neuromodulator
-        self.ppo_trainer = None  # initialized after model.initialize_states
-
-    def _ensure_ppo(self):
-        if self.ppo_trainer is None and self.model.neuromod is not None:
-            self.ppo_trainer = PPOTrainer(
-                self.model.neuromod, self.config, self.device,
-            )
-
     def train_chunk(self, batch) -> dict:
-        """Process one T-token chunk: LM forward + backward + PPO update.
+        """Process one T-token chunk.
 
-        Args:
-            batch: StreamBatch with input_ids [BS, T], target_ids [BS, T],
-                   prev_token [BS]
-
-        Returns:
-            dict with training metrics
+        Returns dict with training metrics.
         """
         self.model.train()
         BS = batch.input_ids.shape[0]
@@ -77,7 +69,6 @@ class V8Trainer:
         if not self._states_initialized:
             self.model.initialize_states(BS, self.device)
             self._states_initialized = True
-            self._ensure_ppo()
 
         input_ids = batch.input_ids.to(self.device)
         target_ids = batch.target_ids.to(self.device)
@@ -88,33 +79,32 @@ class V8Trainer:
 
         t_start = time.time()
 
-        # ==========================================
-        # Forward: full T-token chunk
-        # ==========================================
         amp_ctx = torch.autocast(
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp,
         )
+
+        # ==========================================
+        # Forward: single scan + K memory samples
+        # ==========================================
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
                 reset_mask=reset_mask,
-                collect_ppo=self.use_memory,
                 use_memory=self.use_memory,
+                n_samples=self.n_samples if self.use_memory else 1,
             )
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
-        ppo_buffer = result["ppo_buffer"]
+        rl_data = result["rl_data"]
 
         # ==========================================
         # LM loss + backward
         # ==========================================
-        # Mask EOT tokens from loss
         is_eot = (input_ids == eot_id)
         loss_mask = ~is_eot
 
-        # Per-token CE
         ce_per_token = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size),
             target_ids.reshape(-1),
@@ -125,10 +115,10 @@ class V8Trainer:
         valid_count = valid_mask.sum().clamp(min=1.0)
         ce_loss = (ce_per_token * valid_mask).sum() / valid_count
 
-        total_loss = ce_loss + aux_loss
+        lm_loss = ce_loss + aux_loss
 
         self.lm_optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
+        lm_loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(
             self.model.lm.parameters(), self.max_grad_norm
         ).item()
@@ -137,11 +127,35 @@ class V8Trainer:
             self.scheduler.step()
 
         # ==========================================
-        # PPO update (neuromodulator)
+        # Neuromodulator policy gradient (sampling-based)
         # ==========================================
-        ppo_metrics = {}
-        if self.ppo_trainer is not None and ppo_buffer is not None and ppo_buffer.step > 0:
-            ppo_metrics = self.ppo_trainer.update(ppo_buffer)
+        rl_metrics = {}
+        if rl_data is not None and self.n_samples > 1:
+            # Policy gradient: Σ_k advantage_k * log_prob_k
+            advantages = rl_data["advantages"]  # [K]
+            log_probs = rl_data["log_probs"]    # list of K tensors
+
+            # Weighted log-prob loss (REINFORCE-style with relative advantage)
+            policy_loss = torch.tensor(0.0, device=self.device)
+            for k in range(len(log_probs)):
+                policy_loss = policy_loss - advantages[k] * log_probs[k]
+            policy_loss = policy_loss / len(log_probs)
+
+            self.neuromod_optimizer.zero_grad(set_to_none=True)
+            policy_loss.backward()
+            nm_grad_norm = nn.utils.clip_grad_norm_(
+                self.model.neuromod.parameters(), self.max_grad_norm
+            ).item()
+            self.neuromod_optimizer.step()
+
+            rl_metrics = {
+                "rl_policy_loss": policy_loss.item(),
+                "rl_mean_loss": rl_data["mean_loss"],
+                "rl_best_loss": rl_data["losses"].min().item(),
+                "rl_worst_loss": rl_data["losses"].max().item(),
+                "rl_advantage_std": advantages.std().item(),
+                "rl_nm_grad_norm": nm_grad_norm,
+            }
 
         # ==========================================
         # TBPTT boundary
@@ -151,7 +165,6 @@ class V8Trainer:
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed
 
-        # Build metrics
         loss_val = ce_loss.item()
         ppl = min(torch.exp(ce_loss.detach()).item(), 1e6)
         lr = self.lm_optimizer.param_groups[0]["lr"]
@@ -164,14 +177,13 @@ class V8Trainer:
             "tok_s": tok_per_s,
             "grad_norm": grad_norm,
             "elapsed": elapsed,
-            **ppo_metrics,
+            **rl_metrics,
         }
 
         self.global_step += 1
         return metrics
 
     def train_epoch(self, max_steps: int, step_callback=None) -> list[dict]:
-        """Train for max_steps, yielding metrics per step."""
         all_metrics = []
         pbar = tqdm(total=max_steps, desc="v8 train", unit="step")
 
