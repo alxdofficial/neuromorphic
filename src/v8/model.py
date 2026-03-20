@@ -123,7 +123,8 @@ class V8Model(nn.Module):
 
         sample_logits = []
         sample_losses = []
-        sample_log_probs = []  # sum of log_probs across all actions in trajectory
+        sample_log_probs = []  # mean of log_probs across all actions in trajectory
+        sample_end_states = []  # per-sample memory end state for best restoration
 
         for k in range(n_samples):
             # Restore memory to start-of-chunk state for each sample
@@ -136,6 +137,9 @@ class V8Model(nn.Module):
                 action_every, device,
             )
 
+            # Save this sample's end state
+            sample_end_states.append(self._save_mem_state())
+
             # Cheap output: end-injection + output head
             logits_k = self.lm.forward_output(H, mem_signals.to(dtype))
             sample_logits.append(logits_k)
@@ -144,7 +148,6 @@ class V8Model(nn.Module):
             # Compute loss for this sample if targets available
             if target_ids is not None:
                 with torch.no_grad():
-                    # Mask EOT from reward
                     per_token_ce = F.cross_entropy(
                         logits_k.detach().reshape(-1, self.config.vocab_size),
                         target_ids.reshape(-1),
@@ -175,14 +178,15 @@ class V8Model(nn.Module):
                 "mean_loss": mean_loss.item(),
             }
 
-        # Use the best sample's logits for LM loss (or first if no targets)
+        # Use the best sample's logits for LM loss and restore its memory state
         if sample_losses:
             best_idx = torch.stack(sample_losses).argmin().item()
             best_logits = sample_logits[best_idx]
-            # Also restore memory state to the best trajectory's end state
-            # (For now, use the last trajectory's state — restoring per-sample is complex)
+            self._restore_mem_state(sample_end_states[best_idx])
         else:
             best_logits = sample_logits[0]
+            if sample_end_states:
+                self._restore_mem_state(sample_end_states[0])
 
         return {
             "logits": best_logits,
@@ -199,7 +203,7 @@ class V8Model(nn.Module):
 
         Returns:
             mem_signals: [BS, T, C, D_mem]
-            traj_log_prob: scalar — sum of log_probs for all actions in trajectory
+            traj_log_prob: scalar — mean of log_probs for all actions in trajectory
         """
         N_neurons = self.config.N_neurons
         mem_signals = torch.zeros(BS, T, C, D_mem, device=device)
@@ -207,12 +211,12 @@ class V8Model(nn.Module):
         prev_cc_surprise = torch.zeros(BS, C, D_cc, device=device)
 
         for t in range(T):
-            # Doc boundary: reset if previous token was EOT
+            # Doc boundary: reset memory graph if previous token was EOT
+            # (scan carries are NOT reset here — scan already completed)
             if not self.config.lifelong_mode and t > 0:
                 eot_prev = eot_at[:, t - 1]
                 if eot_prev.any():
                     self._mem_graph.reset_streams(eot_prev)
-                    self._reset_carries(eot_prev)
 
             # Step memory graph
             with torch.autocast(device_type=device.type, enabled=False):
@@ -232,9 +236,9 @@ class V8Model(nn.Module):
                 )
                 obs_flat = obs.reshape(BS * N_neurons, -1)
 
-                # Sample action from policy
+                # Sample action from policy (use sample(), not rsample() — REINFORCE)
                 action, logprob, _, _ = self.neuromod.get_action_and_value(obs_flat)
-                traj_log_prob = traj_log_prob + logprob.sum()
+                traj_log_prob = traj_log_prob + logprob.mean()
 
                 # Clamp and apply
                 max_act = self.config.max_action_magnitude

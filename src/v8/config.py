@@ -38,15 +38,8 @@ class V8Config:
     action_every: int = 8        # act every N tokens
     max_action_magnitude: float = 0.1
 
-    # PPO
-    ppo_gamma: float = 0.99
-    ppo_lambda: float = 0.95
-    ppo_clip: float = 0.2
-    ppo_epochs: int = 4
-    ppo_minibatch: int = 512
-    ppo_lr: float = 3e-4
-    ppo_ent_coef: float = 0.003
-    ppo_vf_coef: float = 0.5
+    # Neuromodulator RL
+    neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
 
     # Training
     T: int = 2048                # full chunk length
@@ -140,7 +133,7 @@ class V8Config:
             K_intra=4, K_inter=2,
             pcm_hidden=32,
             neuromod_hidden=32, neuromod_layers=2,
-            action_every=4, ppo_minibatch=16,
+            action_every=4,
         )
         defaults.update(overrides)
         return cls(**defaults)

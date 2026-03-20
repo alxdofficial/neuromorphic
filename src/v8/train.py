@@ -7,7 +7,7 @@ Usage:
     python -m src.v8.train --no-memory             # LM-only baseline (no memory graph)
     python -m src.v8.train --no-compile            # disable torch.compile
 
-Trains the v8 model with joint LM backprop + PPO neuromodulator updates.
+Trains the v8 model with joint LM backprop + sampling-based RL for neuromodulator.
 """
 
 import argparse
@@ -156,7 +156,7 @@ def main():
 
     # Neuromodulator optimizer (separate, no weight decay)
     neuromod_optimizer = torch.optim.Adam(
-        model.neuromod.parameters(), lr=config.ppo_lr, eps=1e-5,
+        model.neuromod.parameters(), lr=config.neuromod_lr, eps=1e-5,
     )
 
     # LR scheduler: warmup + cosine decay
@@ -227,16 +227,16 @@ def main():
 
         # Print periodic summary
         if trainer.global_step % args.log_interval == 0:
-            ppo_str = ""
-            if "ppo_policy_loss" in metrics:
-                ppo_str = (f" | ppo_loss={metrics['ppo_policy_loss']:.4f}"
-                           f" kl={metrics.get('ppo_approx_kl', 0):.4f}")
+            rl_str = ""
+            if "rl_policy_loss" in metrics:
+                rl_str = (f" | rl_loss={metrics['rl_policy_loss']:.4f}"
+                          f" adv_std={metrics.get('rl_advantage_std', 0):.4f}")
             print(f"  step {trainer.global_step:5d} | "
                   f"loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | "
                   f"tok/s={metrics['tok_s']/1e3:.1f}K | "
                   f"lr={metrics['lr']:.2e}"
-                  f"{ppo_str}")
+                  f"{rl_str}")
 
         # Save checkpoint
         if args.save_interval > 0 and trainer.global_step % args.save_interval == 0:
@@ -245,6 +245,7 @@ def main():
                 "model_state_dict": model.lm.state_dict(),
                 "neuromod_state_dict": model.neuromod.state_dict(),
                 "optimizer_state_dict": lm_optimizer.state_dict(),
+                "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": trainer.global_step,
                 "config": config,

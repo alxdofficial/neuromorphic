@@ -120,7 +120,7 @@ class MemoryGraph:
         self.primitives = torch.randn(BS, N, D, device=dev, dtype=dt) * 0.1
         self.thresholds = torch.zeros(BS, N, max_conn, device=dev, dtype=dt)
         self.temperature = torch.ones(BS, N, device=dev, dtype=dt)
-        self.decay = torch.zeros(BS, N, device=dev, dtype=dt)
+        self.decay = torch.full((BS, N), -2.0, device=dev, dtype=dt)  # sigmoid(-2)≈0.12, mostly reactive
         self.activations = torch.zeros(BS, N, D, device=dev, dtype=dt)
         self.prev_output = torch.zeros(BS, N, D, device=dev, dtype=dt)
 
@@ -146,13 +146,16 @@ class MemoryGraph:
         D = self.config.D_mem
         max_conn = self.config.max_connections
 
-        # 1. Inject CC signals into port neurons' prev_output
+        # 1. Save pre-inject prev_output for decay (avoid CC signal bleed)
+        prev_output_for_decay = self.prev_output.clone()
+
+        # 2. Inject CC signals into port neurons' prev_output (for gather)
         for c in range(self.config.C):
             self.prev_output[:, self.cc_port_idx[c]] = (
                 self.prev_output[:, self.cc_port_idx[c]] + cc_signals[:, c]
             )
 
-        # 2. Gather inputs: each neuron sums prev_output of connected neurons
+        # 3. Gather inputs: each neuron sums prev_output of connected neurons
         flat_idx = self.conn_indices.reshape(-1)
         gathered_flat = self.prev_output[:, flat_idx]
         gathered = gathered_flat.reshape(BS, N, max_conn, D)
@@ -201,9 +204,9 @@ class MemoryGraph:
         # 5. Read CC port activations (clone to avoid aliasing)
         mem_signals = self.activations[:, self.cc_port_idx].clone()
 
-        # 6. Swap with decay
+        # 7. Swap with decay (use pre-inject prev_output to avoid CC signal bleed)
         d = torch.sigmoid(self.decay).unsqueeze(-1)
-        self.prev_output = d * self.prev_output + (1 - d) * outputs
+        self.prev_output = d * prev_output_for_decay + (1 - d) * outputs
 
         return mem_signals
 
@@ -220,7 +223,7 @@ class MemoryGraph:
         """
         self.primitives = self.primitives + delta_primitives
         self.thresholds = self.thresholds + delta_thresholds
-        self.temperature = self.temperature + delta_temperature
+        self.temperature = (self.temperature + delta_temperature).clamp(min=0.01)
         self.decay = self.decay + delta_decay
 
     @torch.no_grad()
@@ -299,4 +302,4 @@ class MemoryGraph:
         self.mean_output = torch.where(m3, torch.zeros_like(self.mean_output[0:1]), self.mean_output)
         self.usage_count = torch.where(m2, torch.zeros_like(self.usage_count[0:1]), self.usage_count)
         self.temperature = torch.where(m2, torch.ones_like(self.temperature[0:1]), self.temperature)
-        self.decay = torch.where(m2, torch.zeros_like(self.decay[0:1]), self.decay)
+        self.decay = torch.where(m2, torch.full_like(self.decay[0:1], -2.0), self.decay)
