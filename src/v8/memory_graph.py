@@ -81,13 +81,9 @@ class MemoryGraph:
         # CC port neurons: first neuron of each block
         self.cc_port_idx = torch.arange(C, device=device) * M  # [C]
 
-        # --- Shared modulation function (2-layer MLP) ---
-        # Trained by PPO (not backprop), stored as plain tensors
-        mod_hidden = config.mem_mod_hidden
-        self.W_mod1 = torch.randn(2 * D, mod_hidden, device=device, dtype=dtype) * 0.02
-        self.b_mod1 = torch.zeros(mod_hidden, device=device, dtype=dtype)
-        self.W_mod2 = torch.randn(mod_hidden, D, device=device, dtype=dtype) * 0.02
-        self.b_mod2 = torch.zeros(D, device=device, dtype=dtype)
+        # No learned weights in the memory graph.
+        # Neuron modulation is element-wise: output = silu(input * primitive).
+        # The neuromodulator controls behavior entirely through primitives + thresholds.
 
         # --- State (allocated on initialize) ---
         self.primitives = None   # [BS, N_neurons, D_mem]
@@ -153,10 +149,9 @@ class MemoryGraph:
 
         inputs = gathered.sum(dim=2)  # [BS, N, D]
 
-        # 3. Modulate: 2-layer MLP on [input; primitive]
-        combined = torch.cat([inputs, self.primitives], dim=-1)  # [BS, N, 2*D]
-        hidden = F.silu(combined @ self.W_mod1 + self.b_mod1)    # [BS, N, mod_hidden]
-        outputs = F.silu(hidden @ self.W_mod2 + self.b_mod2)     # [BS, N, D]
+        # 3. Modulate: element-wise gating by primitive (no learned weights)
+        #    primitive acts as a per-feature gate on the input signal
+        outputs = F.silu(inputs * self.primitives)  # [BS, N, D]
 
         # Update running stats
         alpha = 1.0 - self._ema_decay

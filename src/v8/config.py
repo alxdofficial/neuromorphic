@@ -31,7 +31,6 @@ class V8Config:
     inter_block_k: int = 32      # sparse connections per neuron to other blocks
     mem_temperature: float = 1.0 # routing softmax temperature
     mem_sparsity: float = 0.5    # fraction of connections zeroed in routing
-    mem_mod_hidden: int = 512    # W_mod MLP hidden dim (inside memory graph)
 
     # Neuromodulator
     neuromod_hidden: int = 1024
@@ -107,7 +106,7 @@ class V8Config:
             d_inner=1024, glu_output=True, T=2048,
             # Memory graph: 4096 neurons, D_mem=D_cc=128 (derived)
             N_neurons=4096, M_per_block=256,
-            inter_block_k=32, mem_mod_hidden=512,
+            inter_block_k=32,
             pcm_hidden=256,
             neuromod_hidden=1024, neuromod_layers=3,
         )
@@ -121,7 +120,7 @@ class V8Config:
             D=64, D_embed=64, C=4, L_total=4, L_mem=2,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
             N_neurons=32, M_per_block=8,
-            inter_block_k=4, mem_mod_hidden=32,
+            inter_block_k=4,
             pcm_hidden=32,
             neuromod_hidden=32, neuromod_layers=2,
             action_every=4, ppo_minibatch=16,
