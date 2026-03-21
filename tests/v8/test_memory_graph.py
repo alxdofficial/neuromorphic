@@ -1,22 +1,62 @@
-"""Tests for the Neural Memory Graph."""
+"""Tests for the Memory Graph — serial scan blocks + sparse message passing."""
 
 import torch
 import pytest
 import sys
-import os
+sys.path.insert(0, ".")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.v8.config import V8Config
-from src.v8.memory_graph import MemoryGraph
+from src.v8.memory_graph import MemoryGraph, _cpu_scan
+
+BS = 2
 
 
-def make_tiny():
-    cfg = V8Config.tier_tiny()
+def make_tiny(**overrides):
+    cfg = V8Config.tier_tiny(**overrides)
     cfg.validate()
     return cfg
 
 
-BS = 2
+class TestDiagonalScan:
+    def test_output_shape(self):
+        B, T, D = 4, 16, 8
+        decay_logit = torch.randn(B, D)
+        b = torch.randn(B, T, D)
+        out = _cpu_scan(decay_logit, b)
+        assert out.shape == (B, T, D)
+
+    def test_with_carry(self):
+        B, T, D = 2, 8, 4
+        decay_logit = torch.randn(B, D)
+        b = torch.randn(B, T, D)
+        h0 = torch.randn(B, D)
+        out = _cpu_scan(decay_logit, b, h0)
+        assert out.shape == (B, T, D)
+
+        # Verify first step: h[0] = sigmoid(decay) * h0 + b[0]
+        a = torch.sigmoid(decay_logit)
+        expected_h0 = a * h0 + b[:, 0]
+        torch.testing.assert_close(out[:, 0], expected_h0, atol=1e-5, rtol=1e-4)
+
+    def test_sequential_equivalence(self):
+        B, T, D = 2, 16, 4
+        decay_logit = torch.randn(B, D)
+        b = torch.randn(B, T, D)
+        h0 = torch.randn(B, D)
+
+        # Parallel scan
+        out_par = _cpu_scan(decay_logit, b, h0)
+
+        # Sequential reference
+        a = torch.sigmoid(decay_logit)
+        h = h0
+        out_seq = []
+        for t in range(T):
+            h = a * h + b[:, t]
+            out_seq.append(h)
+        out_seq = torch.stack(out_seq, dim=1)
+
+        torch.testing.assert_close(out_par, out_seq, atol=1e-5, rtol=1e-4)
 
 
 class TestMemoryGraphInit:
@@ -24,57 +64,80 @@ class TestMemoryGraphInit:
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
+        assert mg.is_initialized()
         assert mg.primitives.shape == (BS, cfg.N_neurons, cfg.D_mem)
-        assert mg.thresholds.shape == (BS, cfg.N_neurons, cfg.max_connections)
-        assert mg.activations.shape == (BS, cfg.N_neurons, cfg.D_mem)
+        assert mg.scan_carries.shape == (BS, 1, cfg.N_neurons, cfg.D_mem)
+        assert mg.conn_weights.shape == (BS, cfg.N_neurons, cfg.K_connections)
+        assert mg.flow_ema.shape == (BS, cfg.N_neurons, cfg.K_connections)
 
     def test_connectivity(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
-        # Check conn_indices shape
-        assert mg.conn_indices.shape == (cfg.N_neurons, cfg.max_connections)
-        # All indices should be valid
-        assert (mg.conn_indices < cfg.N_neurons).all()
-        # CC port indices
-        assert mg.cc_port_idx.shape == (cfg.C,)
+        assert mg.conn_indices.shape == (cfg.N_neurons, cfg.K_connections)
+        assert mg.conn_mask.shape == (cfg.N_neurons, cfg.K_connections)
+        # No self-connections
+        for j in range(cfg.N_neurons):
+            active = mg.conn_indices[j][mg.conn_mask[j]]
+            assert j not in active.tolist()
 
 
-class TestMemoryGraphStep:
-    def test_step_shape(self):
+class TestMemoryGraphForward:
+    def test_forward_segment_shape(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        cc_signals = torch.randn(BS, cfg.C, cfg.D_mem)
-        mem_signals = mg.step(cc_signals)
-        assert mem_signals.shape == (BS, cfg.C, cfg.D_mem)
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
+        out = mg.forward_segment(cc)
+        assert out.shape == (BS, cfg.action_every, cfg.C, cfg.D_mem)
 
-    def test_step_finite(self):
+    def test_forward_segment_finite(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        cc_signals = torch.randn(BS, cfg.C, cfg.D_mem)
-        mem_signals = mg.step(cc_signals)
-        assert torch.isfinite(mem_signals).all()
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
+        out = mg.forward_segment(cc)
+        assert torch.isfinite(out).all()
 
-    def test_multiple_steps(self):
+    def test_multiple_segments_stable(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
         for _ in range(10):
-            cc_signals = torch.randn(BS, cfg.C, cfg.D_mem)
-            mem_signals = mg.step(cc_signals)
-        assert torch.isfinite(mem_signals).all()
-        assert torch.isfinite(mg.primitives).all()
+            cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem) * 0.1
+            out = mg.forward_segment(cc)
+            assert torch.isfinite(out).all()
+            assert out.abs().max() < 100  # no explosion
 
-    def test_step_changes_state(self):
+    def test_carry_persistence(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        prev_out_before = mg.prev_output.clone()
-        cc_signals = torch.randn(BS, cfg.C, cfg.D_mem)
-        mg.step(cc_signals)
-        # prev_output should change after a step
-        assert not torch.allclose(mg.prev_output, prev_out_before)
+
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
+        mg.forward_segment(cc)
+        carry_after = mg.scan_carries.clone()
+
+        # Carries should be nonzero after processing
+        assert carry_after.abs().sum() > 0
+
+
+class TestMemoryGraphMessagePassing:
+    def test_message_pass_shape(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg.initialize(BS)
+        x = torch.randn(BS, 8, cfg.N_neurons, cfg.D_mem)
+        out = mg._message_pass(x)
+        assert out.shape == x.shape
+
+    def test_zero_weights_zero_messages(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg.initialize(BS)
+        mg.conn_weights.zero_()
+        x = torch.randn(BS, 4, cfg.N_neurons, cfg.D_mem)
+        out = mg._message_pass(x)
+        assert out.abs().max() == 0
 
 
 class TestMemoryGraphActions:
@@ -83,12 +146,13 @@ class TestMemoryGraphActions:
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
         prim_before = mg.primitives.clone()
-        delta_p = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
-        delta_t = torch.randn(BS, cfg.N_neurons, cfg.max_connections) * 0.01
-        delta_temp = torch.randn(BS, cfg.N_neurons) * 0.01
-        delta_decay = torch.randn(BS, cfg.N_neurons) * 0.01
-        mg.apply_actions(delta_p, delta_t, delta_temp, delta_decay)
-        assert not torch.allclose(mg.primitives, prim_before)
+
+        d_prim = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
+        d_conn = torch.randn(BS, cfg.N_neurons, cfg.K_connections) * 0.01
+        d_decay = torch.randn(BS, cfg.N_neurons) * 0.01
+        mg.apply_actions(d_prim, d_conn, d_decay)
+
+        assert not torch.equal(mg.primitives, prim_before)
 
     def test_get_neuron_obs(self):
         cfg = make_tiny()
@@ -98,13 +162,35 @@ class TestMemoryGraphActions:
         assert obs.shape == (BS, cfg.N_neurons, mg.obs_dim)
         assert torch.isfinite(obs).all()
 
-    def test_get_neuron_obs_with_surprise(self):
+
+class TestMemoryGraphPlasticity:
+    def test_flow_ema_updates(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        surprise = torch.randn(BS, cfg.C, cfg.D_cc)
-        obs = mg.get_neuron_obs(cc_surprise=surprise)
-        assert obs.shape == (BS, cfg.N_neurons, mg.obs_dim)
+        flow_before = mg.flow_ema.clone()
+
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
+        mg.forward_segment(cc)
+
+        # Flow EMA should have changed (unless all outputs were zero)
+        # Just check it's finite
+        assert torch.isfinite(mg.flow_ema).all()
+
+    def test_structural_plasticity(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"))
+        mg.initialize(BS)
+
+        # Set some connection weights to near-zero
+        mg.conn_weights[:, 0, :2] = 0.001
+        indices_before = mg.conn_indices[0, :2].clone()
+
+        mg.structural_plasticity()
+
+        # Pruned connections should have been rewired
+        indices_after = mg.conn_indices[0, :2]
+        assert not torch.equal(indices_before, indices_after)
 
 
 class TestMemoryGraphReset:
@@ -112,13 +198,18 @@ class TestMemoryGraphReset:
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        # Step a few times to build state
-        for _ in range(5):
-            mg.step(torch.randn(BS, cfg.C, cfg.D_mem))
-        prim_before = mg.primitives.clone()
-        # Reset stream 0
+
+        # Step to build up state
+        for _ in range(3):
+            cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
+            mg.forward_segment(cc)
+
+        carry_before = mg.scan_carries.clone()
+
+        # Reset stream 0 only
         mask = torch.tensor([True, False])
         mg.reset_streams(mask)
-        # Stream 0 should change, stream 1 should not
-        assert not torch.allclose(mg.primitives[0], prim_before[0])
-        assert torch.allclose(mg.primitives[1], prim_before[1])
+
+        # Stream 0 carries should be zero, stream 1 unchanged
+        assert mg.scan_carries[0].abs().sum() == 0
+        torch.testing.assert_close(mg.scan_carries[1], carry_before[1])

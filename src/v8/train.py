@@ -64,8 +64,6 @@ def parse_args():
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--grad-ckpt", action="store_true", default=False,
                    help="Enable gradient checkpointing")
-    p.add_argument("--n-samples", type=int, default=4,
-                   help="Number of neuromod action trajectories to sample (default 4)")
     return p.parse_args()
 
 
@@ -103,12 +101,12 @@ def main():
     tokens_per_step = bs * T
     print(f"\nConfig: D={config.D}, C={config.C}, D_cc={config.D_cc}")
     print(f"  Scan: L_total={config.L_total}, d_inner={config.d_inner} (single pass, end-injection)")
-    print(f"  Memory: {config.N_neurons} neurons, {config.C} blocks × {config.M_per_block}, "
+    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
           f"D_mem={config.D_mem}")
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: sampling-based, n_samples={args.n_samples}, "
+    print(f"  RL: REINFORCE with running baseline, "
           f"action_every={config.action_every}")
 
     # Model
@@ -132,6 +130,7 @@ def main():
     if config.use_compile and device.type == "cuda":
         print("Compiling model...")
         model.lm = torch.compile(model.lm)
+        model.neuromod = torch.compile(model.neuromod)
 
     # LM Optimizer — exclude biases and norms from weight decay
     decay_params = []
@@ -181,7 +180,6 @@ def main():
 
     # Trainer
     trainer_use_memory = not args.no_memory
-    n_samples = args.n_samples if trainer_use_memory else 1
     trainer = V8Trainer(
         model=model,
         lm_optimizer=lm_optimizer,
@@ -193,7 +191,6 @@ def main():
         max_grad_norm=MAX_GRAD_NORM,
         log_interval=args.log_interval,
         use_memory=trainer_use_memory,
-        n_samples=n_samples,
     )
 
     # Output dir
@@ -229,8 +226,9 @@ def main():
         if trainer.global_step % args.log_interval == 0:
             rl_str = ""
             if "rl_policy_loss" in metrics:
-                rl_str = (f" | rl_loss={metrics['rl_policy_loss']:.4f}"
-                          f" adv_std={metrics.get('rl_advantage_std', 0):.4f}")
+                rl_str = (f" | rl={metrics['rl_policy_loss']:.4f}"
+                          f" adv={metrics.get('rl_adv_mean', 0):.4f}"
+                          f"±{metrics.get('rl_adv_std', 0):.4f}")
             print(f"  step {trainer.global_step:5d} | "
                   f"loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | "

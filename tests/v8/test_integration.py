@@ -29,7 +29,7 @@ class TestV8ModelForward:
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids, n_samples=2)
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
         assert result["aux_loss"].shape == ()
         assert result["surprise"].shape == (BS, cfg.T, cfg.C, cfg.D_cc)
@@ -74,12 +74,52 @@ class TestV8ModelForward:
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids, n_samples=3)
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
         rl = result["rl_data"]
         assert rl is not None
-        assert len(rl["log_probs"]) == 3
-        assert rl["advantages"].shape == (3,)
-        assert rl["losses"].shape == (3,)
+        n_segments = cfg.T // cfg.action_every
+        assert len(rl["actions"]) == n_segments
+        assert len(rl["obs"]) == n_segments
+        assert rl["advantages"].shape == (BS, n_segments)
+        assert rl["seg_losses"].shape == (BS, n_segments)
+        assert isinstance(rl["loss"], float)
+
+    def test_per_segment_advantages(self):
+        """Each segment should get its own advantage value."""
+        cfg = make_tiny()
+        model = V8Model(cfg)
+        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        model.initialize_states(BS, torch.device("cpu"))
+
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        adv = result["rl_data"]["advantages"]  # [BS, n_segments]
+        n_segments = cfg.T // cfg.action_every
+
+        # Advantages should be finite
+        assert torch.isfinite(adv).all()
+        # Batch-mean baseline → mean advantage across batch is near zero per step
+        assert adv.mean(dim=0).abs().max() < 1e-4
+
+    def test_replay_produces_gradients(self):
+        """Replay should produce gradients for neuromod parameters."""
+        cfg = make_tiny()
+        model = V8Model(cfg)
+        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        model.initialize_states(BS, torch.device("cpu"))
+
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        rl_data = result["rl_data"]
+
+        model.replay_for_neuromod_grads(rl_data, amp_enabled=False)
+
+        has_grad = False
+        for p in model.neuromod.parameters():
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                has_grad = True
+                break
+        assert has_grad, "Neuromod should have gradients after replay"
 
 
 class TestV8Gradients:
@@ -142,7 +182,7 @@ class TestV8Gradients:
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
         assert not model.memory.primitives.requires_grad
-        assert not model.memory.thresholds.requires_grad
+        assert not model.memory.conn_weights.requires_grad
 
 
 class TestV8ParamCount:

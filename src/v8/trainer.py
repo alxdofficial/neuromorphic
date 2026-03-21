@@ -1,12 +1,12 @@
-"""V8 Trainer — joint LM training + sampling-based RL for neuromodulator.
+"""V8 Trainer — joint LM training + per-segment RL for neuromodulator.
 
 Each step:
 1. Full scan over T tokens (once, shared)
-2. Sample K neuromodulator action trajectories through memory graph
-3. Compare per-sample CE loss → advantage → policy gradient
-4. LM backward on best sample's logits
-5. Neuromod backward on weighted log-probs
-No critic, no value function, no GAE.
+2. Segmented memory processing: neuromod acts → scan → message pass (8 segments)
+3. Per-segment CE loss → discounted returns → batch-mean baseline → advantages
+4. LM backward on logits
+5. Neuromod backward on per-segment-weighted log-probs
+No critic, no value function. Dense per-segment rewards with discounted returns.
 """
 
 import time
@@ -37,7 +37,6 @@ class V8Trainer:
         log_interval: int = 50,
         collector=None,
         use_memory: bool = True,
-        n_samples: int = 4,
     ):
         self.model = model
         self.lm_optimizer = lm_optimizer
@@ -51,7 +50,6 @@ class V8Trainer:
         self.collector = collector
         self.global_step = 0
         self.use_memory = use_memory
-        self.n_samples = n_samples
 
         self._states_initialized = False
         self.use_amp = device.type == "cuda"
@@ -85,14 +83,13 @@ class V8Trainer:
         )
 
         # ==========================================
-        # Forward: single scan + K memory samples
+        # Forward: single scan + segmented memory
         # ==========================================
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
                 reset_mask=reset_mask,
                 use_memory=self.use_memory,
-                n_samples=self.n_samples if self.use_memory else 1,
             )
 
         logits = result["logits"]
@@ -127,33 +124,31 @@ class V8Trainer:
             self.scheduler.step()
 
         # ==========================================
-        # Neuromodulator policy gradient (sampling-based)
+        # Neuromodulator policy gradient (running baseline)
         # ==========================================
         rl_metrics = {}
-        if rl_data is not None and self.n_samples > 1:
-            # Policy gradient: Σ_k advantage_k * log_prob_k
-            advantages = rl_data["advantages"]  # [K]
-            log_probs = rl_data["log_probs"]    # list of K tensors
-
-            # Weighted log-prob loss (REINFORCE-style with relative advantage)
-            policy_loss = torch.tensor(0.0, device=self.device)
-            for k in range(len(log_probs)):
-                policy_loss = policy_loss - advantages[k] * log_probs[k]
-            policy_loss = policy_loss / len(log_probs)
-
+        if rl_data is not None:
             self.neuromod_optimizer.zero_grad(set_to_none=True)
-            policy_loss.backward()
+
+            policy_loss_val = self.model.replay_for_neuromod_grads(
+                rl_data,
+                amp_enabled=self.use_amp,
+                amp_dtype=self.amp_dtype,
+            )
+
             nm_grad_norm = nn.utils.clip_grad_norm_(
                 self.model.neuromod.parameters(), self.max_grad_norm
             ).item()
             self.neuromod_optimizer.step()
 
+            adv = rl_data["advantages"]  # [BS, n_segments]
             rl_metrics = {
-                "rl_policy_loss": policy_loss.item(),
-                "rl_mean_loss": rl_data["mean_loss"],
-                "rl_best_loss": rl_data["losses"].min().item(),
-                "rl_worst_loss": rl_data["losses"].max().item(),
-                "rl_advantage_std": advantages.std().item(),
+                "rl_policy_loss": policy_loss_val,
+                "rl_loss": rl_data["loss"],
+                "rl_adv_mean": adv.mean().item(),
+                "rl_adv_std": adv.std().item(),
+                "rl_seg_loss_first": rl_data["seg_losses"][:, 0].mean().item(),
+                "rl_seg_loss_last": rl_data["seg_losses"][:, -1].mean().item(),
                 "rl_nm_grad_norm": nm_grad_norm,
             }
 

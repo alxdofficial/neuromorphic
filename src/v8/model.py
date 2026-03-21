@@ -1,11 +1,14 @@
-"""V8Model — single-pass scan + memory graph + sampling-based RL.
+"""V8Model — single-pass scan + segmented memory + per-segment RL.
 
 Training flow per chunk (T=2048 tokens):
-  1. Full scan + PCM over all T tokens (parallel, once)           ← expensive, shared
-  2. Sample K neuromodulator action trajectories
-  3. For each sample k: run memory loop + cheap output head       ← cheap per sample
-  4. Compare losses across samples → advantage → policy gradient
-  No critic, no value function, no GAE.
+  1. Full scan + PCM over all T tokens (parallel, once)
+  2. Process T in segments of action_every=256 tokens (8 segments):
+     - Neuromod observes memory state → samples action → applies
+     - Memory forward_segment (parallel scan + message pass, fast)
+  3. Compute per-segment CE losses
+  4. Discounted returns G_t = sum gamma^k * r_{t+k}, batch-mean baseline
+  5. Replay: evaluate log_prob per segment with correct obs, weight by A_t
+  One trajectory per chunk. Per-segment credit assignment.
 """
 
 import torch
@@ -27,16 +30,17 @@ class V8Model(nn.Module):
         config.validate()
         self.config = config
 
-        # Language model (in autograd graph)
         self.lm = V8LM(config)
 
-        # Neuromodulator (actor only — no critic needed for sampling-based RL)
         self._mem_graph = None
-        obs_dim = config.D_cc * 4 + 4  # D_mem*3 + usage + temp + decay + entropy + D_cc surprise
+        obs_dim = config.D_mem * 3 + 7  # prim+mean_in+mean_out + usage+decay+entropy + 4 plasticity
         self.neuromod = Neuromodulator(config, obs_dim)
 
+        # RL discount factor for per-segment returns
+        self._rl_gamma = 0.99
+
     def _ensure_memory(self, BS: int, device: torch.device,
-                       dtype: torch.dtype = torch.float32):
+                       dtype: torch.dtype = torch.bfloat16):
         if (self._mem_graph is not None
                 and self._mem_graph.is_initialized()
                 and self._mem_graph.primitives.shape[0] == BS):
@@ -54,30 +58,15 @@ class V8Model(nn.Module):
         target_ids: Tensor | None = None,
         reset_mask: Tensor | None = None,
         use_memory: bool = True,
-        n_samples: int = 1,
     ) -> dict:
         """Process a full T-token chunk.
 
-        Single scan pass (shared), then K memory+output samples for RL.
-
-        Args:
-            input_ids:  [BS, T]
-            target_ids: [BS, T] or None
-            reset_mask: [BS] bool
-            use_memory: if False, skip memory (LM-only baseline)
-            n_samples:  number of action trajectories to sample for RL
-
-        Returns:
-            dict with:
-                logits:     [BS, T, vocab] — from best sample (or no-memory)
-                aux_loss:   scalar (PCM)
-                surprise:   [BS, T, C, D_cc] (detached)
-                rl_data:    dict with sample losses + actions for policy update, or None
+        Single scan pass, then segmented memory processing with neuromod
+        acting every action_every tokens. One trajectory, running baseline.
         """
         BS, T = input_ids.shape
         C = self.config.C
         D_mem = self.config.D_mem
-        D_cc = self.config.D_cc
         action_every = self.config.action_every
         eot_id = self.config.eot_id
         device = input_ids.device
@@ -88,10 +77,9 @@ class V8Model(nn.Module):
             self._reset_carries(reset_mask)
 
         # ==========================================
-        # Full scan + PCM (once, shared across all samples)
+        # Full scan + PCM (once)
         # ==========================================
         H, x, surprise, aux_loss = self.lm.forward_scan(input_ids)
-        # H: [BS, T, D], surprise: [BS, T, C, D_cc]
 
         # --- No-memory fast path ---
         if not use_memory:
@@ -104,199 +92,206 @@ class V8Model(nn.Module):
             }
 
         # --- Memory path ---
-        self._ensure_memory(BS, device, torch.float32)
+        self._ensure_memory(BS, device, dtype)
 
         if reset_mask is not None and reset_mask.any():
             self._mem_graph.reset_streams(reset_mask)
 
-        # CC→memory signals: raw H sliced into per-CC columns
-        cc_signals_all = H.detach().view(BS, T, C, D_mem).float()
-
-        # Precompute EOT positions
+        cc_signals_all = H.detach().view(BS, T, C, D_mem)
         eot_at = (input_ids == eot_id)
 
         # ==========================================
-        # Sample K action trajectories
+        # Segmented memory processing with neuromod
         # ==========================================
-        # Save memory graph state so we can restore between samples
-        saved_state = self._save_mem_state()
+        n_segments = T // action_every
+        N_neurons = self.config.N_neurons
 
-        sample_logits = []
-        sample_losses = []
-        sample_log_probs = []  # mean of log_probs across all actions in trajectory
-        sample_end_states = []  # per-sample memory end state for best restoration
+        # Pre-slice CC signals and pre-compute EOT masks for all segments
+        cc_segments = cc_signals_all.view(BS, n_segments, action_every, C, D_mem)
+        eot_masks = None
+        if not self.config.lifelong_mode:
+            # Build all EOT masks at once: shifted eot_at → [BS, n_segments, action_every]
+            # EOT mask at position t means the PREVIOUS token was EOT
+            eot_shifted = torch.zeros(BS, T, dtype=torch.bool, device=device)
+            eot_shifted[:, 1:] = eot_at[:, :-1]
+            eot_masks = eot_shifted.view(BS, n_segments, action_every)
 
-        for k in range(n_samples):
-            # Restore memory to start-of-chunk state for each sample
-            if k > 0:
-                self._restore_mem_state(saved_state)
+        mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
+        actions = []
+        obs_list = []  # store per-segment obs for accurate replay
 
-            # Run memory loop for this sample
-            mem_signals, traj_log_prob = self._run_memory_trajectory(
-                cc_signals_all, surprise, eot_at, BS, T, C, D_mem, D_cc,
-                action_every, device,
-            )
+        for seg in range(n_segments):
+            # 1. Neuromod observes and acts
+            obs = self._mem_graph.get_neuron_obs()  # [BS, N, obs_dim]
+            obs_flat = obs.reshape(BS * N_neurons, -1)
 
-            # Save this sample's end state
-            sample_end_states.append(self._save_mem_state())
+            with torch.no_grad():
+                action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
 
-            # Cheap output: end-injection + output head
-            logits_k = self.lm.forward_output(H, mem_signals.to(dtype))
-            sample_logits.append(logits_k)
-            sample_log_probs.append(traj_log_prob)
+            obs_list.append(obs_flat.detach())
+            actions.append(action.detach())
+            self._apply_neuromod_action(action, BS)
 
-            # Compute loss for this sample if targets available
-            if target_ids is not None:
-                with torch.no_grad():
-                    per_token_ce = F.cross_entropy(
-                        logits_k.detach().reshape(-1, self.config.vocab_size),
-                        target_ids.reshape(-1),
-                        reduction='none',
-                    ).reshape(BS, T)
-                    reward_mask = (~eot_at).float()
-                    masked_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
-                    sample_losses.append(masked_loss)
+            # 2. Run parallel scan for this segment
+            seg_cc = cc_segments[:, seg]  # [BS, action_every, C, D_mem]
+            eot_mask = eot_masks[:, seg] if eot_masks is not None else None
+            seg_out = self._mem_graph.forward_segment(seg_cc, eot_mask=eot_mask)
+            t0 = seg * action_every
+            mem_out[:, t0:t0 + action_every] = seg_out
+
+        mem_signals = mem_out
 
         # ==========================================
-        # Compute RL data for policy update
+        # Compute logits (once, with autograd for LM backward)
+        # ==========================================
+        logits = self.lm.forward_output(H, mem_signals)
+
+        # ==========================================
+        # Per-segment RL: dense rewards + discounted returns
         # ==========================================
         rl_data = None
-        if target_ids is not None and n_samples > 1:
-            # Advantage: sample loss vs mean loss (lower loss = higher advantage)
-            losses = torch.stack(sample_losses)  # [K]
-            mean_loss = losses.mean()
-            # Advantage = negative (loss - mean_loss) → better-than-average samples get positive advantage
-            advantages = -(losses - mean_loss)  # [K]
-            # Normalize
-            adv_std = advantages.std().clamp(min=1e-8)
-            advantages = advantages / adv_std
+        if target_ids is not None:
+            reward_mask = (~eot_at).to(dtype=dtype)
+            with torch.no_grad():
+                per_token_ce = F.cross_entropy(
+                    logits.detach().reshape(-1, self.config.vocab_size),
+                    target_ids.reshape(-1),
+                    reduction='none',
+                ).reshape(BS, T)
+
+                # Per-segment CE losses: [BS, n_segments]
+                seg_ce = per_token_ce.view(BS, n_segments, action_every)
+                seg_mask = reward_mask.view(BS, n_segments, action_every)
+                seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
+
+                # Per-segment rewards (negative loss = reward)
+                seg_rewards = -seg_losses  # [BS, n_segments]
+
+                # Discounted returns: G_t = r_t + gamma*r_{t+1} + ... + gamma^(H-1-t)*r_{H-1}
+                gamma = self._rl_gamma
+                returns = torch.zeros_like(seg_rewards)  # [BS, n_segments]
+                returns[:, -1] = seg_rewards[:, -1]
+                for t in range(n_segments - 2, -1, -1):
+                    returns[:, t] = seg_rewards[:, t] + gamma * returns[:, t + 1]
+
+                # Batch-mean baseline per step: [n_segments]
+                baseline = returns.mean(dim=0)
+
+                # Per-step advantage: [BS, n_segments]
+                advantages = returns - baseline.unsqueeze(0)
+
+            # Chunk-level loss for logging
+            chunk_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
+            loss_val = chunk_loss.item()
 
             rl_data = {
-                "log_probs": sample_log_probs,     # list of K tensors
-                "advantages": advantages,           # [K]
-                "losses": losses.detach(),           # [K]
-                "mean_loss": mean_loss.item(),
+                "obs": obs_list,              # list of n_segments [BS*N, obs_dim] tensors
+                "actions": actions,           # list of n_segments [BS*N, act_dim] tensors
+                "advantages": advantages,     # [BS, n_segments]
+                "seg_losses": seg_losses.detach(),  # [BS, n_segments] for logging
+                "loss": loss_val,             # scalar chunk loss for logging
             }
 
-        # Use the best sample's logits for LM loss and restore its memory state
-        if sample_losses:
-            best_idx = torch.stack(sample_losses).argmin().item()
-            best_logits = sample_logits[best_idx]
-            self._restore_mem_state(sample_end_states[best_idx])
-        else:
-            best_logits = sample_logits[0]
-            if sample_end_states:
-                self._restore_mem_state(sample_end_states[0])
-
         return {
-            "logits": best_logits,
+            "logits": logits,
             "aux_loss": aux_loss,
             "surprise": surprise.detach(),
             "rl_data": rl_data,
         }
 
-    def _run_memory_trajectory(
-        self, cc_signals_all, surprise, eot_at,
-        BS, T, C, D_mem, D_cc, action_every, device,
-    ) -> tuple[Tensor, Tensor]:
-        """Run one memory trajectory with sampled neuromod actions.
+    def replay_for_neuromod_grads(
+        self, rl_data: dict,
+        amp_enabled: bool = True,
+        amp_dtype: torch.dtype = torch.bfloat16,
+    ) -> float:
+        """Compute policy gradient via replay with per-segment advantages.
+
+        Uses stored per-segment obs for accurate log_prob evaluation.
+        Each segment's actions are weighted by its own advantage.
 
         Returns:
-            mem_signals: [BS, T, C, D_mem]
-            traj_log_prob: scalar — mean of log_probs for all actions in trajectory
+            policy_loss_val: scalar loss value for logging
         """
+        obs_list = rl_data["obs"]          # list of n_seg [BS*N, obs_dim]
+        actions = rl_data["actions"]       # list of n_seg [BS*N, act_dim]
+        advantages = rl_data["advantages"] # [BS, n_segments]
+
         N_neurons = self.config.N_neurons
-        mem_signals = torch.zeros(BS, T, C, D_mem, device=device)
-        traj_log_prob = torch.tensor(0.0, device=device)
-        prev_cc_surprise = torch.zeros(BS, C, D_cc, device=device)
+        BS = actions[0].shape[0] // N_neurons
+        device = actions[0].device
+        n_segments = len(actions)
 
-        for t in range(T):
-            # Doc boundary: reset memory graph if previous token was EOT
-            # (scan carries are NOT reset here — scan already completed)
-            if not self.config.lifelong_mode and t > 0:
-                eot_prev = eot_at[:, t - 1]
-                if eot_prev.any():
-                    self._mem_graph.reset_streams(eot_prev)
+        # Batch all segments into single tensors for one forward pass
+        all_obs = torch.stack(obs_list)        # [n_seg, BS*N, obs_dim]
+        all_actions = torch.stack(actions)      # [n_seg, BS*N, act_dim]
+        flat_obs = all_obs.reshape(-1, all_obs.shape[-1])
+        flat_actions = all_actions.reshape(-1, all_actions.shape[-1])
 
-            # Step memory graph
-            with torch.autocast(device_type=device.type, enabled=False):
-                mem_out = self._mem_graph.step(cc_signals_all[:, t])
-            mem_signals[:, t] = mem_out
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=amp_enabled):
+            _, log_prob, _, _ = self.neuromod.get_action_and_value(
+                flat_obs, action=flat_actions,
+            )
 
-            # Neuromodulator acts every action_every tokens
-            if t % action_every == 0:
-                if t > 0:
-                    recent_surp = surprise[:, max(0, t - action_every):t].detach()
-                    mean_surp = recent_surp.mean(dim=1)
-                else:
-                    mean_surp = prev_cc_surprise
+        # log_prob: [n_seg * BS * N] — reshape to [n_seg, BS, N]
+        log_prob = log_prob.reshape(n_segments, BS, N_neurons)
 
-                obs = self._mem_graph.get_neuron_obs(
-                    cc_surprise=mean_surp.float()
-                )
-                obs_flat = obs.reshape(BS * N_neurons, -1)
+        # Per-segment advantage: [BS, n_seg] → [n_seg, BS, 1] for broadcasting
+        adv = advantages.T.unsqueeze(-1)  # [n_seg, BS, 1]
 
-                # Sample action from policy (use sample(), not rsample() — REINFORCE)
-                action, logprob, _, _ = self.neuromod.get_action_and_value(obs_flat)
-                traj_log_prob = traj_log_prob + logprob.mean()
+        # Weighted policy loss: each segment's log_probs weighted by its advantage
+        # Mean over all (segment, batch, neuron) elements
+        policy_loss = -(adv * log_prob).mean()
+        policy_loss.backward()
 
-                # Clamp and apply
-                max_act = self.config.max_action_magnitude
-                clamped = action.clamp(-max_act, max_act)
-                idx = 0
-                d_prim = clamped[:, idx:idx + D_mem].reshape(BS, N_neurons, D_mem)
-                idx += D_mem
-                max_conn = self.config.max_connections
-                d_thresh = clamped[:, idx:idx + max_conn].reshape(BS, N_neurons, max_conn)
-                idx += max_conn
-                d_temp = clamped[:, idx].reshape(BS, N_neurons)
-                idx += 1
-                d_decay = clamped[:, idx].reshape(BS, N_neurons)
-                self._mem_graph.apply_actions(d_prim, d_thresh, d_temp, d_decay)
+        return policy_loss.item()
 
-                prev_cc_surprise = mean_surp
+    def _apply_neuromod_action(self, action: Tensor, BS: int):
+        """Clamp and apply a neuromod action to the memory graph."""
+        N = self.config.N_neurons
+        D_mem = self.config.D_mem
+        K_conn = self.config.K_connections
+        max_act = self.config.max_action_magnitude
 
-        return mem_signals, traj_log_prob
+        clamped = action.clamp(-max_act, max_act).reshape(BS, N, -1)
+        idx = 0
+        d_prim = clamped[:, :, idx:idx + D_mem]
+        idx += D_mem
+        d_conn = clamped[:, :, idx:idx + K_conn]
+        idx += K_conn
+        d_decay = clamped[:, :, idx]
+        self._mem_graph.apply_actions(d_prim, d_conn, d_decay)
 
     def _save_mem_state(self) -> dict:
-        """Save memory graph state for restoring between samples."""
         mg = self._mem_graph
         return {
             'primitives': mg.primitives.clone(),
-            'thresholds': mg.thresholds.clone(),
-            'temperature': mg.temperature.clone(),
-            'decay': mg.decay.clone(),
-            'activations': mg.activations.clone(),
-            'prev_output': mg.prev_output.clone(),
+            'decay_logit': mg.decay_logit.clone(),
+            'conn_weights': mg.conn_weights.clone(),
+            'scan_carries': mg.scan_carries.clone(),
             'mean_input': mg.mean_input.clone(),
             'mean_output': mg.mean_output.clone(),
             'usage_count': mg.usage_count.clone(),
+            'flow_ema': mg.flow_ema.clone(),
+            'corr_ema': mg.corr_ema.clone(),
         }
 
     def _restore_mem_state(self, state: dict):
-        """Restore memory graph state from saved snapshot."""
         mg = self._mem_graph
-        mg.primitives = state['primitives'].clone()
-        mg.thresholds = state['thresholds'].clone()
-        mg.temperature = state['temperature'].clone()
-        mg.decay = state['decay'].clone()
-        mg.activations = state['activations'].clone()
-        mg.prev_output = state['prev_output'].clone()
-        mg.mean_input = state['mean_input'].clone()
-        mg.mean_output = state['mean_output'].clone()
-        mg.usage_count = state['usage_count'].clone()
+        for key, val in state.items():
+            setattr(mg, key, val.clone())
 
     def _reset_carries(self, mask: Tensor):
-        """Reset scan carries for masked streams."""
         if hasattr(self.lm, '_carries'):
-            mask_f = (~mask).to(dtype=torch.float32).unsqueeze(-1)
             for i, h in enumerate(self.lm._carries):
                 if h is not None:
+                    mask_f = (~mask).to(dtype=h.dtype).unsqueeze(-1)
                     self.lm._carries[i] = h * mask_f
 
     def initialize_states(self, BS: int, device: torch.device):
         self.lm.initialize_carries()
-        self._ensure_memory(BS, device, torch.float32)
+        lm_dtype = next(self.lm.parameters()).dtype
+        self._ensure_memory(BS, device, lm_dtype)
 
     def detach_states(self):
         self.lm.detach_carries()
