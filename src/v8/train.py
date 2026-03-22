@@ -22,6 +22,7 @@ import torch.nn as nn
 from .config import V8Config
 from .model import V8Model
 from .trainer import V8Trainer
+from .diagnostics import V8Diagnostics
 from ..data import create_dataloader, get_tokenizer, get_special_token_ids
 
 # ============================================================================
@@ -64,6 +65,10 @@ def parse_args():
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--grad-ckpt", action="store_true", default=False,
                    help="Enable gradient checkpointing")
+    p.add_argument("--keep-checkpoints", type=int, default=3,
+                   help="Keep only the last N checkpoints (0=keep all)")
+    p.add_argument("--snapshot-interval", type=int, default=1000,
+                   help="Memory graph snapshot interval (0=disabled)")
     return p.parse_args()
 
 
@@ -206,52 +211,79 @@ def main():
         json.dump({k: v for k, v in config.__dict__.items()
                    if not k.startswith("_")}, f, indent=2, default=str)
 
+    # Diagnostics
+    diag = V8Diagnostics(model, save_dir, snapshot_every=args.snapshot_interval)
+    saved_checkpoints = []  # track for rotation
+
     print(f"\nOutputs: {save_dir}")
     print(f"Metrics: {metrics_path}")
+    print(f"Snapshots: every {args.snapshot_interval} steps")
+    print(f"Checkpoints: every {args.save_interval} steps (keep last {args.keep_checkpoints})")
     print(f"\nStarting training ({args.steps} steps)...")
     print("=" * 60)
 
     # Training loop
     def on_step(metrics):
+        step = trainer.global_step
+
+        # Extend with memory graph diagnostics (cheap)
+        metrics = diag.extend_metrics(metrics, step)
+
         # Log to JSONL
-        record = {"step": trainer.global_step, **metrics}
+        record = {"step": step, **metrics}
         metrics_file.write(json.dumps(
             {k: round(v, 6) if isinstance(v, float) else v
              for k, v in record.items()}
         ) + "\n")
-        if trainer.global_step % 10 == 0:
+        if step % 10 == 0:
             metrics_file.flush()
 
         # Print periodic summary
-        if trainer.global_step % args.log_interval == 0:
+        if step % args.log_interval == 0:
             rl_str = ""
             if "rl_policy_loss" in metrics:
                 rl_str = (f" | rl={metrics['rl_policy_loss']:.4f}"
                           f" adv={metrics.get('rl_adv_mean', 0):.4f}"
                           f"±{metrics.get('rl_adv_std', 0):.4f}")
-            print(f"  step {trainer.global_step:5d} | "
+            mem_str = ""
+            if "mem_h_norm" in metrics:
+                mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
+                           f" prim_div={metrics.get('mem_prim_std', 0):.4f}")
+            print(f"  step {step:5d} | "
                   f"loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | "
                   f"tok/s={metrics['tok_s']/1e3:.1f}K | "
                   f"lr={metrics['lr']:.2e}"
-                  f"{rl_str}")
+                  f"{rl_str}{mem_str}")
 
-        # Save checkpoint
-        if args.save_interval > 0 and trainer.global_step % args.save_interval == 0:
-            ckpt_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
+        # Memory graph snapshot (moderate cost, periodic)
+        diag.maybe_snapshot(step)
+
+        # Save checkpoint with rotation
+        if args.save_interval > 0 and step % args.save_interval == 0:
+            ckpt_path = os.path.join(save_dir, f"v8_step{step}.pt")
             ckpt = {
                 "model_state_dict": model.lm.state_dict(),
                 "neuromod_state_dict": model.neuromod.state_dict(),
                 "optimizer_state_dict": lm_optimizer.state_dict(),
                 "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "step": trainer.global_step,
+                "step": step,
                 "config": config,
             }
             if model.memory is not None and model.memory.is_initialized():
                 ckpt["memory_graph_state"] = model.memory.state_dict()
             torch.save(ckpt, ckpt_path)
+            saved_checkpoints.append(ckpt_path)
             print(f"  Saved: {ckpt_path}")
+
+            # Rotate: keep only last N checkpoints
+            if args.keep_checkpoints > 0:
+                while len(saved_checkpoints) > args.keep_checkpoints:
+                    old = saved_checkpoints.pop(0)
+                    if os.path.exists(old):
+                        os.remove(old)
+                        print(f"  Removed old: {old}")
 
     all_metrics = trainer.train_epoch(args.steps, step_callback=on_step)
 
