@@ -68,9 +68,9 @@ class V8Trainer:
             self.model.initialize_states(BS, self.device)
             self._states_initialized = True
 
-        input_ids = batch.input_ids.to(self.device)
-        target_ids = batch.target_ids.to(self.device)
-        prev_token = batch.prev_token.to(self.device)
+        input_ids = batch.input_ids.to(self.device, non_blocking=True)
+        target_ids = batch.target_ids.to(self.device, non_blocking=True)
+        prev_token = batch.prev_token.to(self.device, non_blocking=True)
 
         eot_id = self.config.eot_id
         reset_mask = (prev_token == eot_id)
