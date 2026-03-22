@@ -98,7 +98,7 @@ class V8Model(nn.Module):
         # --- Memory path ---
         self._ensure_memory(BS, device, dtype)
 
-        if reset_mask is not None and reset_mask.any():
+        if not self.config.lifelong_mode and reset_mask is not None and reset_mask.any():
             self._mem_graph.reset_streams(reset_mask)
 
         cc_signals_all = H.detach().view(BS, T, C, D_mem)

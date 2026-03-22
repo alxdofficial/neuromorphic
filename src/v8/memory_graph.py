@@ -611,3 +611,29 @@ class MemoryGraph:
         m2 = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
         self.h = self.h * (~m2).to(dtype=self.dtype)
         self.prev_messages = self.prev_messages * (~m2).to(dtype=self.dtype)
+
+    def state_dict(self) -> dict:
+        """Export full memory graph state for checkpointing."""
+        state = {
+            'primitives': self.primitives,
+            'decay_logit': self.decay_logit,
+            'conn_weights': self.conn_weights,
+            'conn_indices': self.conn_indices,
+            'conn_mask': self.conn_mask,
+            'h': self.h,
+            'prev_messages': self.prev_messages,
+            'mean_input': self.mean_input,
+            'mean_output': self.mean_output,
+            'usage_count': self.usage_count,
+            'flow_ema': self.flow_ema,
+            'corr_ema': self.corr_ema,
+        }
+        return state
+
+    def load_state_dict(self, state: dict):
+        """Restore memory graph state from checkpoint."""
+        for key, val in state.items():
+            setattr(self, key, val)
+        self._adjacency_dirty = True
+        if self._triton_ready:
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()

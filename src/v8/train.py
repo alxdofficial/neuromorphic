@@ -239,7 +239,7 @@ def main():
         # Save checkpoint
         if args.save_interval > 0 and trainer.global_step % args.save_interval == 0:
             ckpt_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
-            torch.save({
+            ckpt = {
                 "model_state_dict": model.lm.state_dict(),
                 "neuromod_state_dict": model.neuromod.state_dict(),
                 "optimizer_state_dict": lm_optimizer.state_dict(),
@@ -247,21 +247,27 @@ def main():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": trainer.global_step,
                 "config": config,
-            }, ckpt_path)
+            }
+            if model.memory is not None and model.memory.is_initialized():
+                ckpt["memory_graph_state"] = model.memory.state_dict()
+            torch.save(ckpt, ckpt_path)
             print(f"  Saved: {ckpt_path}")
 
     all_metrics = trainer.train_epoch(args.steps, step_callback=on_step)
 
     # Final checkpoint
     final_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
-    torch.save({
+    final_ckpt = {
         "model_state_dict": model.lm.state_dict(),
         "neuromod_state_dict": model.neuromod.state_dict(),
         "optimizer_state_dict": lm_optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step": trainer.global_step,
         "config": config,
-    }, final_path)
+    }
+    if model.memory is not None and model.memory.is_initialized():
+        final_ckpt["memory_graph_state"] = model.memory.state_dict()
+    torch.save(final_ckpt, final_path)
 
     metrics_file.close()
 
