@@ -106,7 +106,7 @@ def main():
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: REINFORCE with running baseline, "
+    print(f"  RL: per-segment REINFORCE, discounted returns, "
           f"action_every={config.action_every}")
 
     # Model

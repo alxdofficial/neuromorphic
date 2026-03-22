@@ -1,8 +1,8 @@
 """Neuromodulator — policy network for memory graph plasticity.
 
 Shared MLP across all neurons. Observes neuron state + plasticity metrics,
-outputs modifications to primitives, connection weights, temperature, and decay.
-Trained by sampling-based RL (REINFORCE / GRPO, no critic needed).
+outputs modifications to primitives, connection weights, and decay.
+Trained by per-segment REINFORCE with discounted returns.
 """
 
 import torch
@@ -18,7 +18,7 @@ class Neuromodulator(nn.Module):
 
     Shared across all neurons — each neuron's observation is processed
     independently through the same network (parameter sharing).
-    No critic — advantage is computed by comparing K sampled trajectories.
+    No critic — per-segment advantages from discounted returns with batch-mean baseline.
     """
 
     def __init__(self, config: V8Config, obs_dim: int):

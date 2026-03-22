@@ -124,7 +124,7 @@ class V8Trainer:
             self.scheduler.step()
 
         # ==========================================
-        # Neuromodulator policy gradient (running baseline)
+        # Neuromodulator policy gradient (per-segment REINFORCE)
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:

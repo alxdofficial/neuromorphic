@@ -66,7 +66,8 @@ class TestMemoryGraphInit:
         mg.initialize(BS)
         assert mg.is_initialized()
         assert mg.primitives.shape == (BS, cfg.N_neurons, cfg.D_mem)
-        assert mg.scan_carries.shape == (BS, 1, cfg.N_neurons, cfg.D_mem)
+        assert mg.h.shape == (BS, cfg.N_neurons, cfg.D_mem)
+        assert mg.prev_messages.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.conn_weights.shape == (BS, cfg.N_neurons, cfg.K_connections)
         assert mg.flow_ema.shape == (BS, cfg.N_neurons, cfg.K_connections)
 
@@ -108,17 +109,17 @@ class TestMemoryGraphForward:
             assert torch.isfinite(out).all()
             assert out.abs().max() < 100  # no explosion
 
-    def test_carry_persistence(self):
+    def test_state_persistence(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
 
         cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
         mg.forward_segment(cc)
-        carry_after = mg.scan_carries.clone()
 
-        # Carries should be nonzero after processing
-        assert carry_after.abs().sum() > 0
+        # Internal state and messages should be nonzero after processing
+        assert mg.h.abs().sum() > 0
+        assert mg.prev_messages.abs().sum() > 0
 
 
 class TestMemoryGraphMessagePassing:
@@ -204,12 +205,21 @@ class TestMemoryGraphReset:
             cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
             mg.forward_segment(cc)
 
-        carry_before = mg.scan_carries.clone()
+        h_before = mg.h.clone()
+        msg_before = mg.prev_messages.clone()
+        prim_before = mg.primitives.clone()
+        conn_before = mg.conn_weights.clone()
 
         # Reset stream 0 only
         mask = torch.tensor([True, False])
         mg.reset_streams(mask)
 
-        # Stream 0 carries should be zero, stream 1 unchanged
-        assert mg.scan_carries[0].abs().sum() == 0
-        torch.testing.assert_close(mg.scan_carries[1], carry_before[1])
+        # Dynamic state: stream 0 zeroed, stream 1 unchanged
+        assert mg.h[0].abs().sum() == 0
+        assert mg.prev_messages[0].abs().sum() == 0
+        torch.testing.assert_close(mg.h[1], h_before[1])
+        torch.testing.assert_close(mg.prev_messages[1], msg_before[1])
+
+        # Structural state: preserved for ALL streams (including stream 0)
+        torch.testing.assert_close(mg.primitives, prim_before)
+        torch.testing.assert_close(mg.conn_weights, conn_before)

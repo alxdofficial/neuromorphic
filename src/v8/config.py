@@ -26,11 +26,11 @@ class V8Config:
     # Memory Graph — diagonal scan + sparse graph message passing
     # D_mem = D_cc always (neurons match CC width)
     N_mem_neurons: int = 1024    # total neurons
-    K_connections: int = 80      # sparse connections per neuron
+    K_connections: int = 96      # sparse presynaptic connections per neuron
 
     # Plasticity
     plasticity_ema_decay: float = 0.99
-    structural_plasticity_every: int = 100  # segments between prune-regrow
+    structural_plasticity_every: int = 4    # segments between prune-regrow (twice per chunk)
     prune_threshold: float = 0.01
 
     # Neuromodulator
@@ -94,14 +94,18 @@ class V8Config:
             raise ValueError(f"T ({self.T}) must be >= 1.")
         if self.action_every < 1:
             raise ValueError(f"action_every ({self.action_every}) must be >= 1.")
+        if self.T % self.action_every != 0:
+            raise ValueError(
+                f"T ({self.T}) must be divisible by action_every ({self.action_every})."
+            )
 
     @classmethod
     def tier_a(cls, **overrides) -> "V8Config":
         defaults = dict(
             D=2048, D_embed=768, C=16, L_total=7,
             d_inner=1024, glu_output=True, T=2048,
-            # Memory: 1024 neurons, 80 connections
-            N_mem_neurons=1024, K_connections=80,
+            # Memory: 1024 neurons, 96 presynaptic connections
+            N_mem_neurons=1024, K_connections=96,
             pcm_hidden=256,
             neuromod_hidden=2048, neuromod_layers=3,
         )

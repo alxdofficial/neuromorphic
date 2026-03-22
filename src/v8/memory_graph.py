@@ -1,17 +1,19 @@
-"""Memory Graph — diagonal scan + sparse graph message passing.
+"""Memory Graph — per-token recurrence with inter-neuron message passing.
 
-Per segment (action_every tokens):
-  1. Diagonal parallel scan: h[t] = decay * h[t-1] + (1-decay) * gate[t] * u[t]
-  2. Sparse graph message passing: x = silu(A_graph @ x)
+At each token timestep within a segment:
+  1. Receive: received = A @ prev_messages (+ CC signal for ports)
+  2. Integrate: h = decay * h + (1-decay) * received
+  3. Message: prev_messages = tanh(h * primitives)
 
-All temporal operations are parallelized via FLA HGRN kernel (CUDA)
-or associative scan (CPU fallback).
+Neurons exchange messages at every timestep, allowing multi-hop
+propagation through the graph within a single segment.
 
 State (persistent across chunks, outside autograd):
-  primitives: [BS, N, D_mem] — per-neuron gating values
+  primitives: [BS, N, D_mem] — per-neuron message modulation
   decay_logit: [BS, N] — per-neuron decay (pre-sigmoid)
   conn_weights: [BS, N, K_conn] — connection weights
-  scan_carries: [BS, 1, N, D_mem] — scan carry
+  h: [BS, N, D_mem] — internal state (temporal memory)
+  prev_messages: [BS, N, D_mem] — last outgoing messages
 
 Plasticity metrics:
   flow_ema: [BS, N, K_conn] — EMA of signal flow magnitude
@@ -92,13 +94,13 @@ def _cpu_scan(decay_logit: Tensor, b: Tensor,
 
 
 class MemoryGraph:
-    """Diagonal-scan memory graph with sparse message passing.
+    """Per-token recurrent memory graph with sparse message passing.
 
-    Architecture per segment:
-        CC signals → inject into port neurons
-        → diagonal scan (parallel via FLA HGRN kernel)
-        → silu(sparse_graph_message_pass)
-        → read port neurons → mem_signals
+    Architecture per token within a segment:
+        1. received = A @ prev_messages (+ CC signal for ports)
+        2. h = decay * h + (1-decay) * received
+        3. prev_messages = tanh(h * primitives)
+    After full segment → read port neuron messages → mem_signals
     """
 
     def __init__(self, config: V8Config, device: torch.device,
@@ -142,8 +144,8 @@ class MemoryGraph:
         K_conn = self.config.K_connections
 
         # Per-neuron parameters (neuromodulator-controlled)
-        # Primitives gate CC input: u = cc_signals * primitives
-        # Init near 1.0 so signals pass through at full strength
+        # Primitives modulate outgoing messages: message = tanh(h * primitives)
+        # Init near 1.0 so messages ≈ tanh(h) at start
         self.primitives = 1.0 + torch.randn(
             BS, N, D, device=self.device, dtype=self.dtype) * 0.02
         # Decay: sigmoid(0) = 0.5 — neutral starting point (50% carry)
@@ -151,13 +153,15 @@ class MemoryGraph:
             BS, N, device=self.device, dtype=self.dtype)
 
         # Connection weights (neuromodulator-controlled)
-        # Positive init so message passing has net signal (not zero-mean cancellation)
+        # Positive init so message routing has net signal
         self.conn_weights = torch.rand(
             BS, N, K_conn, device=self.device, dtype=self.dtype) * 0.2
 
-        # Scan carry (single block)
-        self.scan_carries = torch.zeros(
-            BS, 1, N, D, device=self.device, dtype=self.dtype)
+        # Persistent neuron state
+        self.h = torch.zeros(
+            BS, N, D, device=self.device, dtype=self.dtype)         # internal state
+        self.prev_messages = torch.zeros(
+            BS, N, D, device=self.device, dtype=self.dtype)         # last outgoing messages
 
         # Running stats
         self.mean_input = torch.zeros(
@@ -182,72 +186,88 @@ class MemoryGraph:
     @torch.no_grad()
     def forward_segment(self, cc_signals: Tensor,
                         eot_mask: Tensor | None = None) -> Tensor:
-        """Process a segment of tokens: one diagonal scan + message passing.
+        """Process a segment of tokens with per-token neuron dynamics.
 
-        Single block: scan over T_seg tokens (parallel via FLA), then one
-        round of graph message passing for inter-neuron communication.
+        At each timestep, each neuron:
+          1. Receives presynaptic messages: received = A @ prev_messages
+             Port neurons also receive CC signals from the LM.
+          2. Integrates stimuli into state: h = decay * h + (1-decay) * received
+          3. Computes outgoing message: message = tanh(h * primitives)
+
+        Signals propagate through the graph at every token step.
 
         Args:
             cc_signals: [BS, T_seg, C, D_mem] — CC signals for this segment
             eot_mask: [BS, T_seg] bool — True at positions where previous token
-                      was EOT. Scan carry is killed at these positions.
+                      was EOT. State is killed at these positions.
 
         Returns:
-            mem_signals: [BS, T_seg, C, D_mem] — memory output signals
+            mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
         BS, T_seg, C, D = cc_signals.shape
         N = self.config.N_neurons
 
-        # Build input: inject CC signals into port neurons (first C neurons)
-        u = torch.zeros(BS, T_seg, N, D, device=self.device, dtype=self.dtype)
-        u[:, :, :C] = cc_signals
+        # Pre-compute constants
+        decay = torch.sigmoid(self.decay_logit).unsqueeze(-1)  # [BS, N, 1]
+        one_minus_decay = 1.0 - decay                          # [BS, N, 1]
+        A = self._build_adjacency()                            # [BS, N, N]
+        use_f32_bmm = not A.is_cuda and A.dtype == torch.bfloat16
 
-        # Modulate with primitives
-        u = u * self.primitives.unsqueeze(1)
-
-        # Update mean_input stat
+        # Update mean_input stat (CC signal mean, computed outside loop)
         alpha = 0.05
-        self.mean_input = (1 - alpha) * self.mean_input + alpha * u.mean(dim=1)
+        mean_cc = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
+        mean_cc[:, :C] = cc_signals.mean(dim=1)
+        self.mean_input = (1 - alpha) * self.mean_input + alpha * mean_cc
 
-        # Build per-token decay_logit for EOT boundaries
+        # Pre-check EOT positions (one sync, avoid per-step GPU→CPU transfer)
+        has_eot = None
         if eot_mask is not None and eot_mask.any():
-            dl = self.decay_logit.unsqueeze(1).expand(BS, T_seg, N).clone()
-            eot_expanded = eot_mask.unsqueeze(-1).expand(BS, T_seg, N)
-            dl.masked_fill_(eot_expanded, -30.0)
-            decay_logit_t = dl
-        else:
-            decay_logit_t = None
+            has_eot = eot_mask.any(dim=0).tolist()  # [T_seg] bools
 
-        # 1. Compute scan input
-        use_fla = _HAS_FLA and u.is_cuda
-        scan_input = torch.sigmoid(u) * u  # gate * u
-        if not use_fla:
-            decay = torch.sigmoid(self.decay_logit)
-            one_minus_decay = (1.0 - decay).unsqueeze(1).unsqueeze(-1)
-            scan_input = one_minus_decay * scan_input
-        del u
+        # Per-token sequential loop
+        h = self.h                          # [BS, N, D] — internal state
+        prev_msg = self.prev_messages       # [BS, N, D] — last outgoing messages
+        output = torch.empty(BS, T_seg, C, D, device=self.device, dtype=self.dtype)
 
-        # 2. Diagonal parallel scan (single block)
-        carry = self.scan_carries[:, 0]
-        dl = decay_logit_t if decay_logit_t is not None else self.decay_logit
-        x, new_carry = self._chunked_scan(
-            dl, scan_input, carry, chunk_size=N, use_fla=use_fla)
-        self.scan_carries[:, 0] = new_carry
-        del scan_input
+        for t in range(T_seg):
+            # 1. Receive: route presynaptic messages through graph
+            if use_f32_bmm:
+                received = torch.bmm(A.float(), prev_msg.float()).to(self.dtype)
+            else:
+                received = torch.bmm(A, prev_msg)       # [BS, N, D]
 
-        # 3. Message passing for inter-neuron communication
-        x = self._message_pass(x)
-        x = F.silu(x)
-        self._update_plasticity_metrics(x)
+            # Port neurons also receive external CC signal from LM
+            received[:, :C] = received[:, :C] + cc_signals[:, t]
+
+            # 2. Integrate: blend internal state with incoming stimuli
+            if has_eot is not None and has_eot[t]:
+                # EOT: kill state for affected batch elements
+                eot_t = eot_mask[:, t].view(BS, 1, 1).to(dtype=h.dtype)
+                d_t = decay * (1.0 - eot_t)       # 0 at EOT
+                omd_t = 1.0 - d_t                  # 1 at EOT
+                h = d_t * h + omd_t * received
+            else:
+                h = decay * h + one_minus_decay * received
+
+            # 3. Compute outgoing message
+            prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
+
+            # Store port neuron messages for LM
+            output[:, t] = prev_msg[:, :C]
+
+        # Update persistent state
+        self.h = h
+        self.prev_messages = prev_msg
+
+        # Update plasticity metrics (uses last timestep's messages)
+        self._update_plasticity_metrics_from_messages(prev_msg)
 
         # Update running stats
-        self.mean_output = (1 - alpha) * self.mean_output + alpha * x.mean(dim=1)
+        self.mean_output = (1 - alpha) * self.mean_output + alpha * prev_msg
         self.usage_count = (1 - alpha) * self.usage_count + alpha * (
-            x.mean(dim=1).norm(dim=-1) > 0.01).to(dtype=self.dtype)
+            prev_msg.norm(dim=-1) > 0.01).to(dtype=self.dtype)
 
-        # Read port neurons
-        mem_signals = x[:, :, self.cc_port_idx]
-        return mem_signals
+        return output
 
     def _chunked_scan(self, decay_logit: Tensor, scan_input: Tensor,
                       carry: Tensor, chunk_size: int = 256,
@@ -370,23 +390,23 @@ class MemoryGraph:
         # Reshape back: [BS, T, N, D]
         return y_flat.reshape(BS, N, T, D).permute(0, 2, 1, 3)
 
-    def _update_plasticity_metrics(self, x: Tensor):
-        """Update flow and correlation EMAs from message passing.
+    def _update_plasticity_metrics_from_messages(self, messages: Tensor):
+        """Update flow and correlation EMAs from neuron messages.
 
-        Uses last timestep only — cheap single-step gather on [BS, N, D].
+        Args:
+            messages: [BS, N, D] — outgoing messages (last timestep)
         """
         ema_decay = self.config.plasticity_ema_decay
-        x_last = x[:, -1]  # [BS, N, D]
 
-        # Gather neighbor activations for last timestep only
-        x_neighbors = x_last[:, self.conn_indices]  # [BS, N, K_conn, D]
+        # Gather presynaptic neuron messages
+        neighbor_msg = messages[:, self.conn_indices]  # [BS, N, K_conn, D]
         w = self.conn_weights.unsqueeze(-1)  # [BS, N, K_conn, 1]
 
-        flow = (w * x_neighbors).abs().mean(dim=-1)  # [BS, N, K_conn]
+        flow = (w * neighbor_msg).abs().mean(dim=-1)  # [BS, N, K_conn]
         self.flow_ema = ema_decay * self.flow_ema + (1 - ema_decay) * flow
 
-        x_target = x_last.unsqueeze(2).expand_as(x_neighbors)  # [BS, N, K_conn, D]
-        corr = (x_target * x_neighbors).mean(dim=-1)  # [BS, N, K_conn]
+        my_msg = messages.unsqueeze(2).expand_as(neighbor_msg)  # [BS, N, K_conn, D]
+        corr = (my_msg * neighbor_msg).mean(dim=-1)  # [BS, N, K_conn]
         self.corr_ema = ema_decay * self.corr_ema + (1 - ema_decay) * corr
 
     @torch.no_grad()
@@ -437,9 +457,9 @@ class MemoryGraph:
                     if new_target not in existing:
                         self.conn_indices[j, k] = new_target
                         existing.add(new_target)
-                        self.conn_weights[:, j, k] = torch.randn(
+                        self.conn_weights[:, j, k] = torch.rand(
                             self.conn_weights.shape[0],
-                            device=self.device, dtype=self.dtype) * 0.1
+                            device=self.device, dtype=self.dtype) * 0.2
                         self.flow_ema[:, j, k] = 0
                         self.corr_ema[:, j, k] = 0
                         break
@@ -490,19 +510,10 @@ class MemoryGraph:
         if not mask.any():
             return
 
-        self._adjacency_dirty = True
-        m = mask.unsqueeze(-1)    # [BS, 1]
-        m2 = m.unsqueeze(-1)      # [BS, 1, 1]
-        m3 = m2.unsqueeze(-1)     # [BS, 1, 1, 1]
-
-        self.primitives = self.primitives * (~m2).to(dtype=self.dtype) + \
-            (1.0 + torch.randn_like(self.primitives) * 0.02) * m2.to(dtype=self.dtype)
-        self.decay_logit = self.decay_logit * (~m).to(dtype=self.dtype)
-        self.conn_weights = self.conn_weights * (~m2).to(dtype=self.dtype) + \
-            torch.rand_like(self.conn_weights) * 0.2 * m2.to(dtype=self.dtype)
-        self.scan_carries = self.scan_carries * (~m3).to(dtype=self.dtype)
-        self.mean_input = self.mean_input * (~m2).to(dtype=self.dtype)
-        self.mean_output = self.mean_output * (~m2).to(dtype=self.dtype)
-        self.usage_count = self.usage_count * (~m).to(dtype=self.dtype)
-        self.flow_ema = self.flow_ema * (~m2).to(dtype=self.dtype)
-        self.corr_ema = self.corr_ema * (~m2).to(dtype=self.dtype)
+        # Only reset dynamic state (h, prev_messages) at document boundaries.
+        # Structural state (primitives, conn_weights, decay, plasticity metrics)
+        # is preserved — these represent learned neuron types and routing that
+        # the neuromodulator built up over training.
+        m2 = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+        self.h = self.h * (~m2).to(dtype=self.dtype)
+        self.prev_messages = self.prev_messages * (~m2).to(dtype=self.dtype)

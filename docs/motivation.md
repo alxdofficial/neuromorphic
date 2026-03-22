@@ -12,7 +12,7 @@ Modern LLMs are powerful but structurally limited:
    into the model's computations, adapt behavior continuously, or compress and
    generalize experience.
 
-3. **Transformers are expensive for long context** — O(N²) attention makes lifelong
+3. **Transformers are expensive for long context** — O(N^2) attention makes lifelong
    learning impractical. If we want AI embedded everywhere and eventually in silicon,
    we need O(1) memory that scales as state, not as quadratic attention.
 
@@ -28,14 +28,14 @@ A **brain-inspired sequence model** with three components:
   predictive coding. Process tokens causally, produce surprise signals. Trained by
   backprop. See `docs/architecture_v8_neural_memory_graph.md`.
 
-- **Neural Memory Graph**: A persistent network of neurons outside the autograd graph.
-  Neurons have stored information (primitives) and energy-conserving routing. Signal
-  flows continuously — every token. Memory IS the pattern of activation and connectivity,
-  not a database that gets queried.
+- **Neural Memory Graph**: A persistent network of 1024 neurons outside the autograd
+  graph. At every token, neurons receive presynaptic messages, integrate them with
+  internal state, and broadcast outgoing messages modulated by their primitives.
+  Memory IS the pattern of activation and connectivity flowing through the graph.
 
-- **Neuromodulator**: An RL-trained policy (PPO) that modifies neuron primitives and
-  routing thresholds. Substitutes for the billions of years of evolution that shaped
-  the brain's neuromodulatory systems.
+- **Neuromodulator**: An RL-trained policy (per-segment REINFORCE with discounted
+  returns) that modifies neuron primitives, connection weights, and decay. Substitutes
+  for the billions of years of evolution that shaped the brain's neuromodulatory systems.
 
 ---
 
@@ -63,22 +63,23 @@ cosine similarity lookup, no discrete read/write schedule. Instead:
 | Principle | Brain | Our Model |
 |-----------|-------|-----------|
 | Universal compute unit | Cortical column (same everywhere) | CC: scan + PCM (shared scan weights) |
-| Memory as activation | Neurons firing through weighted connections | Neural memory graph: primitives + routing |
-| Neuromodulated plasticity | Dopamine/ACh gate learning rate | PPO-trained policy modifies neuron state |
-| Energy conservation | Finite metabolic budget per neuron | Output magnitude divided among connections |
+| Memory as activation | Neurons firing through weighted connections | Neural memory graph: h + messages through A |
+| Per-token dynamics | Neurons fire and exchange signals continuously | Sequential loop: receive -> integrate -> message |
+| Neuromodulated plasticity | Dopamine/ACh gate learning rate | RL-trained policy modifies neuron state |
+| Stable signal propagation | Balanced excitation/inhibition | Mean-normalized message passing |
 | Predictive coding | Cortical prediction error signals | PCM: vector surprise per feature group |
 
 ### What We Don't Take from the Brain
 
-- Spiking dynamics → continuous activations
-- Exact cortical layers → scan recurrence + PCM
-- Axonal delays, glial cells → ignored
-- Specific neurotransmitters → single learned neuromodulator
+- Spiking dynamics -> continuous activations (D=128 vector per neuron)
+- Exact cortical layers -> scan recurrence + PCM
+- Axonal delays, glial cells -> ignored
+- Specific neurotransmitters -> single learned neuromodulator
 
 ### Temporal Patterns Compressed into Vectors
 
 The brain's expressiveness comes from temporal patterns — spikes, oscillations, burst
-timing. Simulating this is computationally impractical. We collapse it: a D_mem=256
+timing. Simulating this is computationally impractical. We collapse it: a D_mem=128
 float vector at one timestep represents what the brain would express as a low-dimensional
 signal evolving over many milliseconds. The capacity is sufficient to encode all meaningful
 temporal patterns in a neural population's short time window.
@@ -87,29 +88,34 @@ temporal patterns in a neural population's short time window.
 
 ## How It Works (v8)
 
-### Two-Pass Scan with Memory Loop
+### Single-Pass Scan + Per-Token Memory Graph
 
 ```
-Pass 1: Pre-memory scan layers (parallel over T=2048 tokens)
-         → Build representation H, compute per-CC surprise
+Scan: All scan layers over T=2048 tokens (parallel, once)
+      -> Build representation H, compute per-CC surprise
 
-Memory loop: For each token (sequential, cheap, no_grad):
-  CC → memory: inject (H_slice + surprise) into memory graph
-  Memory graph step: all neurons receive → modulate → route
-  Memory → CC: read signals from block port neurons
+Memory: Per-token neuron dynamics (sequential, every token):
+  For each token:
+    1. RECEIVE: each neuron gets weighted sum of presynaptic messages
+       Port neurons also get CC signal from the LM
+    2. INTEGRATE: h = decay * h + (1-decay) * received
+    3. MESSAGE: message = tanh(h * primitives)
+  Port neuron messages -> mem_signals
 
-Pass 2: Post-memory scan layers (parallel over T=2048 tokens)
-         → Integrate memory signals → logits
+Output: logits = output_head(H + gate * mem_signals)
 ```
 
-Scans run at full GPU efficiency over all T tokens. The memory loop is cheap
-(no autograd, SIMD across neurons). One backward pass, one PPO update per chunk.
+The LM scan runs at full GPU efficiency. Memory runs a sequential per-token loop
+with one bmm per token for message routing. Signals propagate through the graph
+hop-by-hop — K tokens = K hops of inter-neuron communication.
 
 ### Neuromodulator as RL Agent
 
-The neuromodulator observes each neuron's state (primitive, recent activity,
-routing entropy, CC surprise) and outputs modifications to primitives and
-thresholds. Trained via PPO with per-token language modeling loss as reward.
+The neuromodulator observes each neuron's state (primitive, activity stats,
+routing entropy, plasticity metrics) and outputs modifications to primitives,
+connection weights, and decay. Trained via per-segment REINFORCE with discounted
+returns — each of 8 segments gets its own reward, enabling per-action credit
+assignment.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.
@@ -130,23 +136,32 @@ general language knowledge; memory adapts to specific context.
 ### 1. Memory as Continuous Signal Flow
 Memory is not a database with read/write operations. It is a persistent neuron
 graph where recall IS activation pattern completion. No cosine similarity, no
-explicit queries — just signal propagation through weighted connections.
+explicit queries — just signal propagation through weighted connections at every
+token step.
 
 ### 2. RL-Trained Plasticity (Not Backprop Through Memory)
-Memory learning is controlled by a PPO-trained neuromodulator, not by backprop
-through memory state. Memory is an environment, the neuromodulator is the agent.
-This decouples memory from the autograd graph, solving the throughput problem of
-differentiable memory systems.
+Memory learning is controlled by a REINFORCE-trained neuromodulator, not by
+backprop through memory state. Memory is an environment, the neuromodulator is the
+agent. This decouples memory from the autograd graph, solving the throughput problem
+of differentiable memory systems.
 
-### 3. Vector Surprise as Universal Learning Signal
+### 3. Per-Token Neuron Dynamics
+Each neuron receives, integrates, and messages at every token. Signals propagate
+through the graph hop-by-hop. This is fundamentally different from attention-based
+memory (discrete read/write) or SSM memory (flat hidden state). The graph structure
+gives memory spatial organization — neurons develop specialization through
+neuromodulator-driven plasticity.
+
+### 4. Vector Surprise as Universal Learning Signal
 PCM predicts next token's representation per-feature-group. The vector prediction
 error (D_cc=128 dims per column) feeds into memory as part of the CC signal,
 telling the memory graph which features were unexpected.
 
-### 4. Energy-Conserving Routing
-Neuron output magnitude is divided among connections proportionally to learned
-thresholds. Natural sparsity emerges without top-k or budget mechanisms. The
-neuromodulator learns to adjust thresholds to route information effectively.
+### 5. Stable Signal Propagation via Graph Structure
+Sparse graph message passing (mean-normalized) provides inter-neuron communication
+without signal explosion. Structural plasticity (prune dead connections, regrow
+random) reshapes the graph over time, driven by flow and co-activation metrics
+that the neuromodulator observes and responds to.
 
 ---
 
@@ -155,12 +170,12 @@ neuromodulator learns to adjust thresholds to route information effectively.
 ### vs Transformers
 - Fixed memory footprint vs O(N) KV cache growth
 - Memory adapts at inference vs frozen weights
-- O(N) compute vs O(N²) attention
+- O(N) compute vs O(N^2) attention
 
 ### vs SSMs (Mamba, RWKV)
 - Structured persistent memory vs flat hidden state
 - RL-trained plasticity vs no explicit learning mechanism
-- Per-CC memory channels vs single state vector
+- Per-neuron, per-token dynamics vs single state vector
 
 ### vs RAG
 - Memory inside the model, not external
@@ -183,12 +198,12 @@ Loss decreases during training. CCs produce coherent predictions without memory.
 The memory-enabled model outperforms the no-memory baseline on the same data.
 
 ### Neuromodulator learns: Non-random plasticity policy
-PPO converges. Actions correlate with context. KL divergence stays bounded.
+RL converges. Actions correlate with context. Policy loss decreases.
 
 ### Lifelong: Memory accumulates useful context
 In Phase B, long-document perplexity improves as memory accumulates context.
 Memory neurons develop specialization (diverse primitives, structured routing).
 
 ### Hardware: Efficient
-Memory graph adds <10% overhead vs no-memory baseline. Throughput competitive
-with Pythia-160M / Mamba-130M at similar param count.
+Memory graph adds ~50% overhead vs no-memory baseline. Throughput ~42K tok/s
+with memory at BS=4 on RTX 4090.

@@ -1,10 +1,10 @@
-"""V8Model — single-pass scan + segmented memory + per-segment RL.
+"""V8Model — single-pass scan + per-token memory graph + per-segment RL.
 
 Training flow per chunk (T=2048 tokens):
   1. Full scan + PCM over all T tokens (parallel, once)
   2. Process T in segments of action_every=256 tokens (8 segments):
      - Neuromod observes memory state → samples action → applies
-     - Memory forward_segment (parallel scan + message pass, fast)
+     - Per-token neuron loop (receive → integrate → message)
   3. Compute per-segment CE losses
   4. Discounted returns G_t = sum gamma^k * r_{t+k}, batch-mean baseline
   5. Replay: evaluate log_prob per segment with correct obs, weight by A_t
@@ -39,6 +39,9 @@ class V8Model(nn.Module):
         # RL discount factor for per-segment returns
         self._rl_gamma = 0.99
 
+        # Structural plasticity counter (segments processed)
+        self._segment_counter = 0
+
     def _ensure_memory(self, BS: int, device: torch.device,
                        dtype: torch.dtype = torch.bfloat16):
         if (self._mem_graph is not None
@@ -62,7 +65,8 @@ class V8Model(nn.Module):
         """Process a full T-token chunk.
 
         Single scan pass, then segmented memory processing with neuromod
-        acting every action_every tokens. One trajectory, running baseline.
+        acting every action_every tokens. Per-segment REINFORCE with
+        discounted returns and batch-mean baseline.
         """
         BS, T = input_ids.shape
         C = self.config.C
@@ -132,12 +136,18 @@ class V8Model(nn.Module):
             actions.append(action.detach())
             self._apply_neuromod_action(action, BS)
 
-            # 2. Run parallel scan for this segment
+            # 2. Run memory graph for this segment
             seg_cc = cc_segments[:, seg]  # [BS, action_every, C, D_mem]
             eot_mask = eot_masks[:, seg] if eot_masks is not None else None
             seg_out = self._mem_graph.forward_segment(seg_cc, eot_mask=eot_mask)
             t0 = seg * action_every
             mem_out[:, t0:t0 + action_every] = seg_out
+
+            # 3. Structural plasticity at configured cadence
+            self._segment_counter += 1
+            sp_every = self.config.structural_plasticity_every
+            if sp_every > 0 and self._segment_counter % sp_every == 0:
+                self._mem_graph.structural_plasticity()
 
         mem_signals = mem_out
 
@@ -180,9 +190,9 @@ class V8Model(nn.Module):
                 # Per-step advantage: [BS, n_segments]
                 advantages = returns - baseline.unsqueeze(0)
 
-            # Chunk-level loss for logging
-            chunk_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
-            loss_val = chunk_loss.item()
+                # Chunk-level loss for logging
+                chunk_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
+                loss_val = chunk_loss.item()
 
             rl_data = {
                 "obs": obs_list,              # list of n_segments [BS*N, obs_dim] tensors
@@ -268,18 +278,23 @@ class V8Model(nn.Module):
             'primitives': mg.primitives.clone(),
             'decay_logit': mg.decay_logit.clone(),
             'conn_weights': mg.conn_weights.clone(),
-            'scan_carries': mg.scan_carries.clone(),
+            'h': mg.h.clone(),
+            'prev_messages': mg.prev_messages.clone(),
             'mean_input': mg.mean_input.clone(),
             'mean_output': mg.mean_output.clone(),
             'usage_count': mg.usage_count.clone(),
             'flow_ema': mg.flow_ema.clone(),
             'corr_ema': mg.corr_ema.clone(),
+            '_adjacency_dirty': mg._adjacency_dirty,
         }
 
     def _restore_mem_state(self, state: dict):
         mg = self._mem_graph
         for key, val in state.items():
-            setattr(mg, key, val.clone())
+            if isinstance(val, torch.Tensor):
+                setattr(mg, key, val.clone())
+            else:
+                setattr(mg, key, val)
 
     def _reset_carries(self, mask: Tensor):
         if hasattr(self.lm, '_carries'):
