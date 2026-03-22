@@ -32,6 +32,13 @@ try:
 except ImportError:
     _HAS_FLA = False
 
+try:
+    import triton
+    from .triton_kernels import memory_graph_step_kernel, prepare_sparse_weights_kernel
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 def _fla_scan(decay_logit: Tensor, x: Tensor,
               h0: Tensor | None = None) -> Tensor:
@@ -181,6 +188,17 @@ class MemoryGraph:
         self._adjacency_dirty = True
         self._adjacency_cache = None
 
+        # Triton kernel buffers (allocated once, reused)
+        if _HAS_TRITON and self.device.type == 'cuda':
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
+            self._conn_w_norm = torch.zeros(
+                BS, N, K_conn, device=self.device, dtype=self.dtype)
+            self._decay_f32 = torch.zeros(
+                BS, N, device=self.device, dtype=torch.float32)
+            self._triton_ready = True
+        else:
+            self._triton_ready = False
+
         self._initialized = True
 
     @torch.no_grad()
@@ -188,13 +206,8 @@ class MemoryGraph:
                         eot_mask: Tensor | None = None) -> Tensor:
         """Process a segment of tokens with per-token neuron dynamics.
 
-        At each timestep, each neuron:
-          1. Receives presynaptic messages: received = A @ prev_messages
-             Port neurons also receive CC signals from the LM.
-          2. Integrates stimuli into state: h = decay * h + (1-decay) * received
-          3. Computes outgoing message: message = tanh(h * primitives)
-
-        Signals propagate through the graph at every token step.
+        Dispatches to Triton kernel on CUDA, Python fallback on CPU.
+        Both produce identical results — Python version is the reference.
 
         Args:
             cc_signals: [BS, T_seg, C, D_mem] — CC signals for this segment
@@ -203,6 +216,22 @@ class MemoryGraph:
 
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
+        """
+        if self._triton_ready and cc_signals.is_cuda:
+            return self._forward_segment_triton(cc_signals, eot_mask)
+        return self._forward_segment_python(cc_signals, eot_mask)
+
+    def _forward_segment_python(self, cc_signals: Tensor,
+                                eot_mask: Tensor | None = None) -> Tensor:
+        """Python reference implementation of per-token neuron dynamics.
+
+        At each timestep, each neuron:
+          1. Receives presynaptic messages: received = A @ prev_messages
+             Port neurons also receive CC signals from the LM.
+          2. Integrates stimuli into state: h = decay * h + (1-decay) * received
+          3. Computes outgoing message: message = tanh(h * primitives)
+
+        This is the readable reference. The Triton version must match exactly.
         """
         BS, T_seg, C, D = cc_signals.shape
         N = self.config.N_neurons
@@ -259,15 +288,74 @@ class MemoryGraph:
         self.h = h
         self.prev_messages = prev_msg
 
-        # Update plasticity metrics (uses last timestep's messages)
-        self._update_plasticity_metrics_from_messages(prev_msg)
+        self._post_segment_stats(prev_msg)
+        return output
 
-        # Update running stats
+    def _forward_segment_triton(self, cc_signals: Tensor,
+                                eot_mask: Tensor | None = None) -> Tensor:
+        """Triton-accelerated per-token neuron dynamics.
+
+        Fuses sparse gather + integration + tanh + port output into one kernel
+        per token step. Uses sparse conn_indices instead of dense [N,N] adjacency.
+        """
+        BS, T_seg, C, D = cc_signals.shape
+        N = self.config.N_neurons
+        K = self.config.K_connections
+
+        # Pre-compute normalized sparse weights (once per segment)
+        if self._adjacency_dirty:
+            BLOCK_K = triton.next_power_of_2(K)
+            prepare_sparse_weights_kernel[(BS, N)](
+                self.conn_weights, self.conn_mask,
+                self._conn_w_norm,
+                N=N, K=K, BLOCK_K=BLOCK_K,
+            )
+            self._adjacency_dirty = False
+
+        # Pre-compute decay as float32
+        self._decay_f32.copy_(torch.sigmoid(self.decay_logit))
+
+        # EOT flags as float32 [BS, T_seg]
+        if eot_mask is not None:
+            eot_flags = eot_mask.to(dtype=torch.float32).contiguous()
+        else:
+            eot_flags = torch.zeros(BS, T_seg, device=self.device, dtype=torch.float32)
+
+        # Update mean_input stat
+        alpha = 0.05
+        mean_cc = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
+        mean_cc[:, :C] = cc_signals.mean(dim=1)
+        self.mean_input = (1 - alpha) * self.mean_input + alpha * mean_cc
+
+        # Ensure cc_signals is contiguous for pointer arithmetic in kernel
+        cc_signals = cc_signals.contiguous()
+
+        # Allocate output
+        output = torch.empty(BS, T_seg, C, D, device=self.device, dtype=self.dtype)
+
+        # h and prev_messages are modified in-place by the kernel
+        grid = (BS, N)
+
+        for t in range(T_seg):
+            memory_graph_step_kernel[grid](
+                self.h, self.prev_messages,
+                self._conn_idx_i32, self._conn_w_norm,
+                self._decay_f32, self.primitives,
+                cc_signals, eot_flags, output,
+                t,
+                BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
+            )
+
+        self._post_segment_stats(self.prev_messages)
+        return output
+
+    def _post_segment_stats(self, prev_msg: Tensor):
+        """Update plasticity metrics and running stats after a segment."""
+        alpha = 0.05
+        self._update_plasticity_metrics_from_messages(prev_msg)
         self.mean_output = (1 - alpha) * self.mean_output + alpha * prev_msg
         self.usage_count = (1 - alpha) * self.usage_count + alpha * (
             prev_msg.norm(dim=-1) > 0.01).to(dtype=self.dtype)
-
-        return output
 
     def _chunked_scan(self, decay_logit: Tensor, scan_input: Tensor,
                       carry: Tensor, chunk_size: int = 256,
@@ -442,6 +530,7 @@ class MemoryGraph:
             return
 
         self._adjacency_dirty = True
+        rewired = False
         for j in range(N):
             weak_j = weak[j].nonzero(as_tuple=True)[0]
             if len(weak_j) == 0:
@@ -462,7 +551,12 @@ class MemoryGraph:
                             device=self.device, dtype=self.dtype) * 0.2
                         self.flow_ema[:, j, k] = 0
                         self.corr_ema[:, j, k] = 0
+                        rewired = True
                         break
+
+        # Update int32 indices for Triton kernel
+        if rewired and self._triton_ready:
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
     @torch.no_grad()
     def get_neuron_obs(self) -> Tensor:
