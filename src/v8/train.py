@@ -285,6 +285,35 @@ def main():
                         os.remove(old)
                         print(f"  Removed old: {old}")
 
+        # Auto-generate plots periodically (at snapshot interval and checkpoint saves)
+        should_plot = (
+            (args.snapshot_interval > 0 and step % args.snapshot_interval == 0) or
+            (args.save_interval > 0 and step % args.save_interval == 0) or
+            step == 50  # early plot for sanity check
+        )
+        if should_plot:
+            try:
+                from scripts.plot_training import (
+                    load_metrics as _load_m, plot_training_curves,
+                    plot_rl_curves, plot_memory_health, plot_connectivity_snapshot,
+                )
+                plot_dir = os.path.join(save_dir, "plots")
+                os.makedirs(plot_dir, exist_ok=True)
+                _records = _load_m(metrics_path)
+                plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
+                plot_rl_curves(_records, os.path.join(plot_dir, "rl_curves.png"))
+                plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
+                # Latest snapshot connectivity
+                snap_dir = os.path.join(save_dir, "snapshots")
+                if os.path.exists(snap_dir):
+                    snaps = sorted(os.listdir(snap_dir))
+                    if snaps:
+                        latest_snap = os.path.join(snap_dir, snaps[-1])
+                        plot_connectivity_snapshot(
+                            latest_snap, os.path.join(plot_dir, "connectivity_latest.png"))
+            except Exception as e:
+                print(f"  Plot generation failed: {e}")
+
     all_metrics = trainer.train_epoch(args.steps, step_callback=on_step)
 
     # Final checkpoint
