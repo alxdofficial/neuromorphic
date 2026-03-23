@@ -257,6 +257,10 @@ class TestNeuronDynamicsReference:
         BS, T_seg, C, D = cc_signals.shape
         N = mg.config.N_neurons
 
+        # Normalize CC signals (same as forward_segment does)
+        cc_norm = cc_signals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cc_signals = cc_signals / cc_norm
+
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay
         A = mg._build_adjacency()
@@ -384,6 +388,8 @@ class TestNeuronDynamicsReference:
         mg.prev_messages = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.1
 
         cc = torch.randn(BS, 1, cfg.C, cfg.D_mem)
+        # Normalize CC (same as forward_segment does)
+        cc_normed = cc / cc.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
         A = mg._build_adjacency()
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)
@@ -391,7 +397,7 @@ class TestNeuronDynamicsReference:
         # Manual single step
         received = torch.bmm(A, mg.prev_messages)
         graph_msg_at_port = received[:, :cfg.C].clone()
-        received[:, :cfg.C] += cc[:, 0]
+        received[:, :cfg.C] += cc_normed[:, 0]
 
         h_expected = decay * mg.h + (1 - decay) * received
         msg_expected = torch.tanh(h_expected * mg.primitives)

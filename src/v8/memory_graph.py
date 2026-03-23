@@ -172,9 +172,10 @@ class MemoryGraph:
 
         # Per-neuron parameters (neuromodulator-controlled)
         # Primitives modulate outgoing messages: message = tanh(h * primitives)
-        # L2-normalized per neuron (unit direction vector). Init with small noise for symmetry breaking.
+        # RMS-normalized per neuron (per-dim scale ≈ 1). Init near 1.0 with noise for symmetry breaking.
         prim_raw = 1.0 + torch.randn(BS, N, D, device=self.device, dtype=self.dtype) * 0.02
-        self.primitives = prim_raw / prim_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        rms = (prim_raw ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        self.primitives = prim_raw / rms
         # Decay: sigmoid(0) = 0.5 — neutral starting point (50% carry)
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
@@ -249,6 +250,11 @@ class MemoryGraph:
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
+        # Normalize CC signals to unit norm per port neuron per token
+        # Prevents port neurons from overwhelming internal graph dynamics
+        cc_norm = cc_signals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cc_signals = cc_signals / cc_norm
+
         if self._triton_ready and cc_signals.is_cuda:
             return self._forward_segment_triton(cc_signals, eot_mask,
                                                 update_co_activation)
@@ -513,10 +519,10 @@ class MemoryGraph:
         self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Primitives: L2-normalize per neuron (controls message direction, not magnitude)
-        # message = tanh(h * prim); with ||prim||=1, saturation depends only on h magnitude
-        prim_norm = self.primitives.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.primitives = (self.primitives / prim_norm).to(self.dtype)
+        # Primitives: RMS-normalize per neuron (per-dim scale ≈ 1)
+        # Keeps h * prim at same scale as h, preventing signal attenuation per hop
+        rms = (self.primitives ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        self.primitives = (self.primitives / rms).to(self.dtype)
 
         # Connection weights: L1-normalize per neuron (routing distribution sums to 1)
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
