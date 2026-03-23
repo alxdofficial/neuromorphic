@@ -133,12 +133,28 @@ class MemoryGraph:
 
         self.conn_indices = conn_indices  # [N, K_conn]
         self.conn_mask = conn_mask        # [N, K_conn]
+        self._sort_conn_indices()  # sort for cache locality in sparse gather
 
         # CC port assignment: first C neurons are CC ports
         self.cc_port_idx = torch.arange(config.C, device=device)
 
         # State tensors (set in initialize())
         self._initialized = False
+
+    def _sort_conn_indices(self):
+        """Sort conn_indices per neuron for cache-friendly sparse gather.
+
+        Sorting by source index clusters memory accesses during the gather
+        step, improving L2 cache reuse. conn_weights and conn_mask are
+        reordered to match.
+        """
+        sorted_idx, order = self.conn_indices.sort(dim=-1)  # [N, K]
+        self.conn_indices = sorted_idx
+        self.conn_mask = self.conn_mask.gather(1, order)
+        # Reorder conn_weights [BS, N, K] if initialized
+        if hasattr(self, 'conn_weights') and self.conn_weights is not None:
+            order_expanded = order.unsqueeze(0).expand_as(self.conn_weights)
+            self.conn_weights = self.conn_weights.gather(2, order_expanded)
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -210,7 +226,8 @@ class MemoryGraph:
 
     @torch.no_grad()
     def forward_segment(self, cc_signals: Tensor,
-                        eot_mask: Tensor | None = None) -> Tensor:
+                        eot_mask: Tensor | None = None,
+                        update_co_activation: bool = True) -> Tensor:
         """Process a segment of tokens with per-token neuron dynamics.
 
         Dispatches to Triton kernel on CUDA, Python fallback on CPU.
@@ -220,16 +237,21 @@ class MemoryGraph:
             cc_signals: [BS, T_seg, C, D_mem] — CC signals for this segment
             eot_mask: [BS, T_seg] bool — True at positions where previous token
                       was EOT. State is killed at these positions.
+            update_co_activation: if True, compute phi bmm for structural plasticity.
+                Only needed on segments immediately before plasticity runs.
 
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
         if self._triton_ready and cc_signals.is_cuda:
-            return self._forward_segment_triton(cc_signals, eot_mask)
-        return self._forward_segment_python(cc_signals, eot_mask)
+            return self._forward_segment_triton(cc_signals, eot_mask,
+                                                update_co_activation)
+        return self._forward_segment_python(cc_signals, eot_mask,
+                                            update_co_activation)
 
     def _forward_segment_python(self, cc_signals: Tensor,
-                                eot_mask: Tensor | None = None) -> Tensor:
+                                eot_mask: Tensor | None = None,
+                                update_co_activation: bool = True) -> Tensor:
         """Python reference implementation of per-token neuron dynamics.
 
         At each timestep, each neuron:
@@ -311,11 +333,13 @@ class MemoryGraph:
         self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * (received_accum / T_seg)
         self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * (msg_accum / T_seg)
 
-        self._post_segment_stats(prev_msg, act_trace)
+        self._post_segment_stats(prev_msg, act_trace,
+                                 update_co_activation=update_co_activation)
         return output
 
     def _forward_segment_triton(self, cc_signals: Tensor,
-                                eot_mask: Tensor | None = None) -> Tensor:
+                                eot_mask: Tensor | None = None,
+                                update_co_activation: bool = True) -> Tensor:
         """Triton-accelerated per-token neuron dynamics.
 
         Fuses sparse gather + integration + tanh + port output into one kernel
@@ -325,15 +349,21 @@ class MemoryGraph:
         N = self.config.N_neurons
         K = self.config.K_connections
 
-        # Pre-compute normalized sparse weights (once per segment)
-        if self._adjacency_dirty:
+        # Use conn_weights directly if mask is all-active (common case: K < N)
+        # This skips the prepare_sparse_weights_kernel entirely
+        if self.conn_mask.all():
+            conn_w_for_kernel = self.conn_weights
+        elif self._adjacency_dirty:
             BLOCK_K = triton.next_power_of_2(K)
             prepare_sparse_weights_kernel[(BS, N)](
                 self.conn_weights, self.conn_mask,
                 self._conn_w_norm,
                 N=N, K=K, BLOCK_K=BLOCK_K,
             )
+            conn_w_for_kernel = self._conn_w_norm
             self._adjacency_dirty = False
+        else:
+            conn_w_for_kernel = self._conn_w_norm
 
         # Pre-compute decay as float32
         self._decay_f32.copy_(torch.sigmoid(self.decay_logit))
@@ -347,26 +377,24 @@ class MemoryGraph:
         # Ensure cc_signals is contiguous for pointer arithmetic in kernel
         cc_signals = cc_signals.contiguous()
 
-        # Allocate output
         output = torch.empty(BS, T_seg, C, D, device=self.device, dtype=self.dtype)
 
         # h and prev_messages are modified in-place by the kernel
         grid = (BS, N)
 
-        # Track activation magnitudes for firing/co-activation (after each kernel step)
+        # Activation trace: norm computed inside kernel (fused, no extra kernel launch)
         act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
 
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
-                self._conn_idx_i32, self._conn_w_norm,
+                self._conn_idx_i32, conn_w_for_kernel,
                 self._decay_f32, self.primitives,
                 cc_signals, eot_flags, output,
+                act_trace,
                 t,
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
-            # Read activation magnitude from updated prev_messages (avoid dtype cast)
-            act_trace[:, t] = self.prev_messages.norm(dim=-1).float()
 
         # Update running stats (Triton path: use final messages as proxy for mean_output,
         # and use h as proxy for mean_input since h ≈ received after low-decay integration)
@@ -374,15 +402,18 @@ class MemoryGraph:
         self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * self.prev_messages
         self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * self.h
 
-        self._post_segment_stats(self.prev_messages, act_trace)
+        self._post_segment_stats(self.prev_messages, act_trace,
+                                 update_co_activation=update_co_activation)
         return output
 
-    def _post_segment_stats(self, prev_msg: Tensor, act_trace: Tensor = None):
-        """Update firing stats and co-activation after a segment.
+    def _post_segment_stats(self, prev_msg: Tensor, act_trace: Tensor = None,
+                            update_co_activation: bool = True):
+        """Update firing stats and optionally co-activation after a segment.
 
         Args:
             prev_msg: [BS, N, D] — final messages
             act_trace: [BS, T_seg, N] float32 — activation magnitudes per token
+            update_co_activation: if False, skip the phi bmm (only needed before plasticity)
         """
         if act_trace is None:
             return
@@ -404,19 +435,19 @@ class MemoryGraph:
         seg_fire_rate = fired.mean(dim=1)  # [BS, N]
         self.firing_rate = (1 - stats_alpha) * self.firing_rate + stats_alpha * seg_fire_rate
 
+        # Co-activation phi: only compute when needed (before structural plasticity)
+        if not update_co_activation:
+            return
+
         # Co-activation: phi coefficient (binary Pearson) between all neuron pairs
-        # Compute once per segment via bmm
         p_i = fired.mean(dim=1, keepdim=True)  # [BS, 1, N] — firing probability
-        # Center the firing indicators
         fired_centered = fired - p_i  # [BS, T_seg, N]
-        # Variance per neuron
         var_i = (p_i * (1 - p_i)).squeeze(1).clamp(min=1e-8)  # [BS, N]
         # Covariance via bmm: [BS, N, T] @ [BS, T, N] / T = [BS, N, N]
         cov = torch.bmm(
             fired_centered.transpose(1, 2),
             fired_centered,
         ) / T_seg  # [BS, N, N]
-        # Normalize to phi: cov / sqrt(var_i * var_j)
         std_i = var_i.sqrt().unsqueeze(2)   # [BS, N, 1]
         std_j = var_i.sqrt().unsqueeze(1)   # [BS, 1, N]
         phi = cov / (std_i * std_j).clamp(min=1e-8)  # [BS, N, N]
@@ -556,13 +587,12 @@ class MemoryGraph:
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
         self.conn_weights = self.conn_weights / w_abs_sum
 
+        # Re-sort for cache locality after topology change
+        self._sort_conn_indices()
+
         self._adjacency_dirty = True
         if self._triton_ready:
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
-
-            # Update int32 indices for Triton kernel
-            if self._triton_ready:
-                self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
     @torch.no_grad()
     def get_neuron_obs(self) -> Tensor:

@@ -144,16 +144,22 @@ class V8Model(nn.Module):
             self._apply_neuromod_action(action, BS)
 
             # 2. Run memory graph for this segment
+            # Only compute co-activation phi when plasticity will run next
+            self._segment_counter += 1
+            sp_every = self.config.structural_plasticity_every
+            needs_phi = (sp_every > 0
+                         and self._segment_counter % sp_every == 0)
+
             seg_cc = cc_segments[:, seg]
             eot_mask = eot_masks[:, seg] if eot_masks is not None else None
-            seg_out = self._mem_graph.forward_segment(seg_cc, eot_mask=eot_mask)
+            seg_out = self._mem_graph.forward_segment(
+                seg_cc, eot_mask=eot_mask,
+                update_co_activation=needs_phi)
             t0 = seg * action_every
             mem_out[:, t0:t0 + action_every] = seg_out
 
             # 3. Structural plasticity at configured cadence
-            self._segment_counter += 1
-            sp_every = self.config.structural_plasticity_every
-            if sp_every > 0 and self._segment_counter % sp_every == 0:
+            if needs_phi:
                 self._mem_graph.structural_plasticity()
 
         mem_signals = mem_out

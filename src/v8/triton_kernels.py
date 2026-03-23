@@ -31,6 +31,9 @@ def memory_graph_step_kernel(
     eot_flags_ptr,      # [BS, T_seg] float32 — 1.0 at EOT, 0.0 otherwise
     output_ptr,         # [BS, T_seg, C, D] bf16 — port neuron messages
 
+    # Activation trace (fused norm output)
+    act_trace_ptr,      # [BS, T_seg, N] float32 — message norm per neuron per token
+
     # Current token step
     t_step,             # int — which token in the segment
 
@@ -45,6 +48,7 @@ def memory_graph_step_kernel(
     """One step of neuron dynamics for all neurons in one batch element.
 
     Each program handles one (batch, neuron) pair, processing all D dims.
+    Also computes message L2 norm and writes to act_trace (fused, no extra kernel).
     """
     b = tl.program_id(0)
     n = tl.program_id(1)
@@ -83,6 +87,10 @@ def memory_graph_step_kernel(
     # --- Store results (in-place) ---
     tl.store(h_ptr + (b * N + n) * D + d, h_new.to(tl.bfloat16))
     tl.store(prev_msg_ptr + (b * N + n) * D + d, msg.to(tl.bfloat16))
+
+    # --- Fused message norm → act_trace (eliminates separate .norm() kernel) ---
+    msg_norm = tl.sqrt(tl.sum(msg * msg))
+    tl.store(act_trace_ptr + b * T_seg * N + t_step * N + n, msg_norm)
 
     # --- Write port neuron output ---
     if n < C:
