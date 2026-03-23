@@ -1,14 +1,12 @@
-"""V8 Language Model — single-pass scan stack + per-CC PCM + end-injection.
+"""V8 Language Model — split-scan with mid-scan memory injection.
 
-All scan layers run once over T tokens (parallel). PCM computes surprise.
-Memory signals are injected as a position-wise additive residual at the end,
-right before the output head. No two-pass split.
+Lower scan layers (0..split-1) produce H_mid. Memory graph reads H_mid
+per-token and produces mem_signals. Memory is injected into H_mid, then
+upper scan layers (split..L-1) process the memory-enriched representation.
 
-CC→memory: raw H_slice[t] (D_cc=128) — the scan's causal representation
-Memory→CC: raw mem_signal[t] (D_mem=D_cc=128) — gated, added to H
-
-The scan is shared across CCs. Memory signals come from the memory graph
-which runs per-token sequentially (outside autograd).
+CC→memory: H_mid sliced per CC (D_cc=128) — lower scan's representation
+Memory→CC: port neuron messages (D_mem=D_cc=128) — gated, added to H_mid
+Upper scan layers see memory-enriched input and learn to use it.
 """
 
 import torch
@@ -23,7 +21,7 @@ from .config import V8Config
 
 
 class V8LM(nn.Module):
-    """Language model: single-pass scan + PCM + end-injection of memory."""
+    """Language model: split-scan + mid-scan memory injection + PCM."""
 
     def __init__(self, config: V8Config):
         super().__init__()
@@ -45,7 +43,7 @@ class V8LM(nn.Module):
             self.proj_down = None
         self.pos_embed = nn.Parameter(torch.randn(config.T, D) * 0.02)
 
-        # Full-D scan layers — ALL layers run in one pass
+        # Scan layers — split into lower and upper
         self.layers = nn.ModuleList([
             ScanLayer(D, config.d_inner, config.dropout,
                       n_layers=config.L_total, glu_output=config.glu_output)
@@ -72,22 +70,18 @@ class V8LM(nn.Module):
         # Scan carries
         self._carries = [None] * config.L_total
 
-    def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Full scan + PCM. Runs once, shared across memory samples.
+    def forward_scan_lower(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Lower scan layers (0..split-1). Produces H_mid for memory graph.
 
         Args:
             input_ids: [BS, T]
 
         Returns:
-            H: [BS, T, D] — hidden states after ALL scan layers
-            x: [BS, T, D] — embedded input (for PCM reference)
-            surprise: [BS, T, C, D_cc] — per-CC surprise
-            aux_loss: scalar — PCM prediction loss
+            H_mid: [BS, T, D] — hidden states after lower scan layers (WITH autograd)
+            x: [BS, T, D] — embedded input (for PCM reference later)
         """
         BS, T = input_ids.shape
-        C = self.config.C
-        D_cc = self.config.D_cc
-        D = self.config.D
+        split = self.config.scan_split_at
 
         # Embed
         x = self.embedding(input_ids)
@@ -95,9 +89,9 @@ class V8LM(nn.Module):
             x = self.proj_up(x)
         x = x + self.pos_embed[:T]
 
-        # ALL scan layers in one pass
+        # Lower scan layers
         H = x
-        for i in range(self.config.L_total):
+        for i in range(split):
             carry = self._carries[i]
             if self.config.gradient_checkpointing and self.training:
                 H, h_last = grad_checkpoint(self.layers[i], H, carry,
@@ -106,7 +100,38 @@ class V8LM(nn.Module):
                 H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
-        # Per-CC PCM (after scan — surprise reflects full scan context)
+        return H, x
+
+    def forward_scan_upper(self, H_enriched: Tensor, x: Tensor
+                           ) -> tuple[Tensor, Tensor, Tensor]:
+        """Upper scan layers (split..L-1) + PCM on memory-enriched input.
+
+        Args:
+            H_enriched: [BS, T, D] — H_mid + gated memory signals
+            x: [BS, T, D] — embedded input (for PCM)
+
+        Returns:
+            H: [BS, T, D] — hidden states after all upper scan layers + PCM
+            surprise: [BS, T, C, D_cc]
+            aux_loss: scalar
+        """
+        BS, T, D = H_enriched.shape
+        C = self.config.C
+        D_cc = self.config.D_cc
+        split = self.config.scan_split_at
+
+        # Upper scan layers
+        H = H_enriched
+        for i in range(split, self.config.L_total):
+            carry = self._carries[i]
+            if self.config.gradient_checkpointing and self.training:
+                H, h_last = grad_checkpoint(self.layers[i], H, carry,
+                                            use_reentrant=False)
+            else:
+                H, h_last = self.layers[i](H, carry)
+            self._carries[i] = h_last
+
+        # Per-CC PCM (after upper scan — surprise reflects full context + memory)
         aux_loss = torch.tensor(0.0, device=H.device)
         if self.pcm_modules is not None:
             H_cols = H.view(BS, T, C, D_cc)
@@ -127,32 +152,44 @@ class V8LM(nn.Module):
         else:
             surprise = torch.zeros(BS, T, C, D_cc, device=H.device, dtype=H.dtype)
 
-        return H, x, surprise, aux_loss
+        return H, surprise, aux_loss
 
-    def forward_output(self, H: Tensor, mem_signals: Tensor | None = None) -> Tensor:
-        """End-injection of memory + output head. Cheap, per-sample.
+    def inject_memory(self, H_mid: Tensor, mem_signals: Tensor) -> Tensor:
+        """Add gated memory signals to H_mid.
 
         Args:
-            H: [BS, T, D] — scan output (shared across samples)
-            mem_signals: [BS, T, C, D_cc] or None — memory signals to inject
+            H_mid: [BS, T, D] — lower scan output (with autograd)
+            mem_signals: [BS, T, C, D_cc] — port neuron messages (detached)
+
+        Returns:
+            H_enriched: [BS, T, D] — memory-enriched hidden states
+        """
+        gate = torch.sigmoid(self.mem_gate)  # [C]
+        mem_contribution = gate[None, None, :, None] * mem_signals
+        return H_mid + mem_contribution.reshape(H_mid.shape)
+
+    def forward_output(self, H: Tensor) -> Tensor:
+        """Output head only (memory injection happens mid-scan now).
+
+        Args:
+            H: [BS, T, D] — final hidden states after upper scan + PCM
 
         Returns:
             logits: [BS, T, vocab]
         """
-        BS, T, D = H.shape
-
-        if mem_signals is not None:
-            gate = torch.sigmoid(self.mem_gate)  # [C]
-            mem_contribution = gate[None, None, :, None] * mem_signals
-            H = H + mem_contribution.reshape(BS, T, D)
-
         out = H
         if self.proj_down is not None:
             out = self.proj_down(out)
         out = self.ln_final(out)
         logits = self.lm_head(out) * (self.config.D_embed ** -0.5)
-
         return logits
+
+    # --- Legacy: full scan for no-memory path ---
+    def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Full scan + PCM (no memory). Used only for no-memory baseline."""
+        H_mid, x = self.forward_scan_lower(input_ids)
+        H, surprise, aux_loss = self.forward_scan_upper(H_mid, x)
+        return H, x, surprise, aux_loss
 
     def initialize_carries(self):
         self._carries = [None] * self.config.L_total

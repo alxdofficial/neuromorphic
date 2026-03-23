@@ -10,7 +10,8 @@ class V8Config:
     D_embed: int = 768
     C: int = 16                  # cortical columns
     D_cc: int = -1               # derived: D // C = neuron dim
-    L_total: int = 10            # total scan layers (single pass, no split)
+    L_total: int = 10            # total scan layers
+    scan_split_at: int = 4       # layers 0..split-1 = lower, split..L-1 = upper
     d_inner: int = 1024
     glu_output: bool = True
     vocab_size: int = 32000
@@ -91,6 +92,10 @@ class V8Config:
                 f"K_connections ({self.K_connections}) must be <= "
                 f"N_mem_neurons ({self.N_mem_neurons})."
             )
+        if self.scan_split_at < 1 or self.scan_split_at >= self.L_total:
+            raise ValueError(
+                f"scan_split_at ({self.scan_split_at}) must be in [1, L_total-1={self.L_total-1}]."
+            )
         if self.T < 1:
             raise ValueError(f"T ({self.T}) must be >= 1.")
         if self.action_every < 1:
@@ -117,7 +122,7 @@ class V8Config:
     def tier_tiny(cls, **overrides) -> "V8Config":
         """Tiny config for unit tests."""
         defaults = dict(
-            D=64, D_embed=64, C=4, L_total=4,
+            D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
             N_mem_neurons=16, K_connections=6,
             pcm_hidden=32,

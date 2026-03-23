@@ -1,14 +1,14 @@
-"""V8Model — single-pass scan + per-token memory graph + per-segment RL.
+"""V8Model — split-scan + per-token memory graph + per-segment RL.
 
 Training flow per chunk (T=2048 tokens):
-  1. Full scan + PCM over all T tokens (parallel, once)
-  2. Process T in segments of action_every=256 tokens (8 segments):
-     - Neuromod observes memory state → samples action → applies
-     - Per-token neuron loop (receive → integrate → message)
-  3. Compute per-segment CE losses
-  4. Discounted returns G_t = sum gamma^k * r_{t+k}, batch-mean baseline
-  5. Replay: evaluate log_prob per segment with correct obs, weight by A_t
-  One trajectory per chunk. Per-segment credit assignment.
+  1. Lower scan (layers 0-3) over T tokens (parallel)
+  2. Memory graph: per-token receive → integrate → message (sequential)
+     Neuromod acts every 256 tokens (8 segments)
+  3. Inject: H_enriched = H_mid + gate * mem_signals
+  4. Upper scan (layers 4-6) + PCM over T tokens (parallel)
+  5. Per-segment CE losses, discounted returns, batch-mean baseline
+  6. Replay: log_prob per segment with stored obs, weight by A_t
+  Memory is injected MID-SCAN — upper layers see memory-enriched input.
 """
 
 import torch
@@ -62,14 +62,19 @@ class V8Model(nn.Module):
         reset_mask: Tensor | None = None,
         use_memory: bool = True,
     ) -> dict:
-        """Process a full T-token chunk.
+        """Process a full T-token chunk with split-scan memory injection.
 
-        Single scan pass, then segmented memory processing with neuromod
-        acting every action_every tokens. Per-segment REINFORCE with
-        discounted returns and batch-mean baseline.
+        1. Lower scan (layers 0..split-1) → H_mid (parallel over T)
+        2. Memory graph: per-token receive → integrate → message (sequential)
+        3. Inject: H_enriched = H_mid + gate * mem_signals
+        4. Upper scan (layers split..L-1) + PCM (parallel over T)
+        5. Output head → logits
+
+        The upper scan layers see memory-enriched representations.
         """
         BS, T = input_ids.shape
         C = self.config.C
+        D = self.config.D
         D_mem = self.config.D_mem
         action_every = self.config.action_every
         eot_id = self.config.eot_id
@@ -81,13 +86,14 @@ class V8Model(nn.Module):
             self._reset_carries(reset_mask)
 
         # ==========================================
-        # Full scan + PCM (once)
+        # Lower scan (layers 0..split-1)
         # ==========================================
-        H, x, surprise, aux_loss = self.lm.forward_scan(input_ids)
+        H_mid, x = self.lm.forward_scan_lower(input_ids)
 
         # --- No-memory fast path ---
         if not use_memory:
-            logits = self.lm.forward_output(H, mem_signals=None)
+            H, surprise, aux_loss = self.lm.forward_scan_upper(H_mid, x)
+            logits = self.lm.forward_output(H)
             return {
                 "logits": logits,
                 "aux_loss": aux_loss,
@@ -95,18 +101,18 @@ class V8Model(nn.Module):
                 "rl_data": None,
             }
 
-        # --- Memory path ---
+        # ==========================================
+        # Memory graph: per-token processing
+        # ==========================================
         self._ensure_memory(BS, device, dtype)
 
         if not self.config.lifelong_mode and reset_mask is not None and reset_mask.any():
             self._mem_graph.reset_streams(reset_mask)
 
-        cc_signals_all = H.detach().view(BS, T, C, D_mem)
+        # CC signals from lower scan (detached for memory graph input)
+        cc_signals_all = H_mid.detach().view(BS, T, C, D_mem)
         eot_at = (input_ids == eot_id)
 
-        # ==========================================
-        # Segmented memory processing with neuromod
-        # ==========================================
         n_segments = T // action_every
         N_neurons = self.config.N_neurons
 
@@ -114,19 +120,17 @@ class V8Model(nn.Module):
         cc_segments = cc_signals_all.view(BS, n_segments, action_every, C, D_mem)
         eot_masks = None
         if not self.config.lifelong_mode:
-            # Build all EOT masks at once: shifted eot_at → [BS, n_segments, action_every]
-            # EOT mask at position t means the PREVIOUS token was EOT
             eot_shifted = torch.zeros(BS, T, dtype=torch.bool, device=device)
             eot_shifted[:, 1:] = eot_at[:, :-1]
             eot_masks = eot_shifted.view(BS, n_segments, action_every)
 
         mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
         actions = []
-        obs_list = []  # store per-segment obs for accurate replay
+        obs_list = []
 
         for seg in range(n_segments):
             # 1. Neuromod observes and acts
-            obs = self._mem_graph.get_neuron_obs()  # [BS, N, obs_dim]
+            obs = self._mem_graph.get_neuron_obs()
             obs_flat = obs.reshape(BS * N_neurons, -1)
 
             with torch.no_grad():
@@ -137,7 +141,7 @@ class V8Model(nn.Module):
             self._apply_neuromod_action(action, BS)
 
             # 2. Run memory graph for this segment
-            seg_cc = cc_segments[:, seg]  # [BS, action_every, C, D_mem]
+            seg_cc = cc_segments[:, seg]
             eot_mask = eot_masks[:, seg] if eot_masks is not None else None
             seg_out = self._mem_graph.forward_segment(seg_cc, eot_mask=eot_mask)
             t0 = seg * action_every
@@ -152,9 +156,15 @@ class V8Model(nn.Module):
         mem_signals = mem_out
 
         # ==========================================
-        # Compute logits (once, with autograd for LM backward)
+        # Inject memory into H_mid, then upper scan
         # ==========================================
-        logits = self.lm.forward_output(H, mem_signals)
+        H_enriched = self.lm.inject_memory(H_mid, mem_signals)
+        H, surprise, aux_loss = self.lm.forward_scan_upper(H_enriched, x)
+
+        # ==========================================
+        # Output head
+        # ==========================================
+        logits = self.lm.forward_output(H)
 
         # ==========================================
         # Per-segment RL: dense rewards + discounted returns
