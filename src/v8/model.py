@@ -249,20 +249,22 @@ class V8Model(nn.Module):
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype,
                             enabled=amp_enabled):
-            _, log_prob, _, _ = self.neuromod.get_action_and_value(
+            _, log_prob, entropy, _ = self.neuromod.get_action_and_value(
                 flat_obs, action=flat_actions,
             )
 
         # log_prob: [n_seg * BS * N] — reshape to [n_seg, BS, N]
         log_prob = log_prob.reshape(n_segments, BS, N_neurons)
+        entropy = entropy.reshape(n_segments, BS, N_neurons)
 
         # Per-segment advantage: [BS, n_seg] → [n_seg, BS, 1] for broadcasting
         adv = advantages.T.unsqueeze(-1)  # [n_seg, BS, 1]
 
-        # Weighted policy loss: each segment's log_probs weighted by its advantage
-        # Mean over all (segment, batch, neuron) elements
+        # Weighted policy loss + entropy bonus to prevent std collapse
         policy_loss = -(adv * log_prob).mean()
-        policy_loss.backward()
+        entropy_bonus = -0.01 * entropy.mean()  # encourage exploration
+        total_loss = policy_loss + entropy_bonus
+        total_loss.backward()
 
         return policy_loss.item()
 
@@ -284,27 +286,15 @@ class V8Model(nn.Module):
 
     def _save_mem_state(self) -> dict:
         mg = self._mem_graph
-        return {
-            'primitives': mg.primitives.clone(),
-            'decay_logit': mg.decay_logit.clone(),
-            'conn_weights': mg.conn_weights.clone(),
-            'h': mg.h.clone(),
-            'prev_messages': mg.prev_messages.clone(),
-            'mean_input': mg.mean_input.clone(),
-            'mean_output': mg.mean_output.clone(),
-            'usage_count': mg.usage_count.clone(),
-            'flow_ema': mg.flow_ema.clone(),
-            'corr_ema': mg.corr_ema.clone(),
-            '_adjacency_dirty': mg._adjacency_dirty,
-        }
+        state = mg.state_dict()
+        return {k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in state.items()}
 
     def _restore_mem_state(self, state: dict):
         mg = self._mem_graph
-        for key, val in state.items():
-            if isinstance(val, torch.Tensor):
-                setattr(mg, key, val.clone())
-            else:
-                setattr(mg, key, val)
+        restored = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                    for k, v in state.items()}
+        mg.load_state_dict(restored)
 
     def _reset_carries(self, mask: Tensor):
         if hasattr(self.lm, '_carries'):

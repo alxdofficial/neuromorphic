@@ -250,11 +250,8 @@ class MemoryGraph:
         A = self._build_adjacency()                            # [BS, N, N]
         use_f32_bmm = not A.is_cuda and A.dtype == torch.bfloat16
 
-        # Update mean_input stat (CC signal mean, computed outside loop)
-        alpha = 0.05
-        mean_cc = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
-        mean_cc[:, :C] = cc_signals.mean(dim=1)
-        self.mean_input = (1 - alpha) * self.mean_input + alpha * mean_cc
+        ema_alpha = self.config.plasticity_ema_decay
+        stats_alpha = 1.0 - ema_alpha  # 0.01 — how fast running stats update
 
         # Pre-check EOT positions (one sync, avoid per-step GPU→CPU transfer)
         has_eot = None
@@ -268,6 +265,9 @@ class MemoryGraph:
 
         # Track activation magnitudes for firing threshold
         act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
+        # Accumulate received signals for mean_input (all neurons, not just ports)
+        received_accum = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
+        msg_accum = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
 
         for t in range(T_seg):
             # 1. Receive: route presynaptic messages through graph
@@ -292,8 +292,10 @@ class MemoryGraph:
             # 3. Compute outgoing message
             prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
 
-            # Track activation magnitude
+            # Track activation magnitude and accumulate for stats
             act_trace[:, t] = prev_msg.float().norm(dim=-1)
+            received_accum += received
+            msg_accum += prev_msg
 
             # Store port neuron messages for LM
             output[:, t] = prev_msg[:, :C]
@@ -301,6 +303,10 @@ class MemoryGraph:
         # Update persistent state
         self.h = h
         self.prev_messages = prev_msg
+
+        # Update running stats with segment means (all neurons, not just ports)
+        self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * (received_accum / T_seg)
+        self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * (msg_accum / T_seg)
 
         self._post_segment_stats(prev_msg, act_trace)
         return output
@@ -335,12 +341,6 @@ class MemoryGraph:
         else:
             eot_flags = torch.zeros(BS, T_seg, device=self.device, dtype=torch.float32)
 
-        # Update mean_input stat
-        alpha = 0.05
-        mean_cc = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
-        mean_cc[:, :C] = cc_signals.mean(dim=1)
-        self.mean_input = (1 - alpha) * self.mean_input + alpha * mean_cc
-
         # Ensure cc_signals is contiguous for pointer arithmetic in kernel
         cc_signals = cc_signals.contiguous()
 
@@ -349,6 +349,9 @@ class MemoryGraph:
 
         # h and prev_messages are modified in-place by the kernel
         grid = (BS, N)
+
+        # Track activation magnitudes for firing/co-activation (after each kernel step)
+        act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
 
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
@@ -359,33 +362,36 @@ class MemoryGraph:
                 t,
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
+            # Read activation magnitude from updated prev_messages
+            act_trace[:, t] = self.prev_messages.float().norm(dim=-1)
 
-        self._post_segment_stats(self.prev_messages)
+        # Update running stats (Triton path: use final messages as proxy for mean_output,
+        # and use h as proxy for mean_input since h ≈ received after low-decay integration)
+        stats_alpha = 1.0 - self.config.plasticity_ema_decay
+        self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * self.prev_messages
+        self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * self.h
+
+        self._post_segment_stats(self.prev_messages, act_trace)
         return output
 
     def _post_segment_stats(self, prev_msg: Tensor, act_trace: Tensor = None):
-        """Update plasticity metrics, firing stats, and co-activation after a segment.
+        """Update firing stats and co-activation after a segment.
 
         Args:
             prev_msg: [BS, N, D] — final messages
             act_trace: [BS, T_seg, N] float32 — activation magnitudes per token
-                       (None when called from Triton path, which handles stats separately)
         """
-        alpha = 0.05
-
-        # Running output stats
-        self.mean_output = (1 - alpha) * self.mean_output + alpha * prev_msg
-
         if act_trace is None:
             return
 
+        stats_alpha = 1.0 - self.config.plasticity_ema_decay  # 0.01
         BS, T_seg, N = act_trace.shape
 
         # Update adaptive firing threshold (per-neuron mean + std of activation)
         seg_mean = act_trace.mean(dim=1)  # [BS, N]
         seg_std = act_trace.std(dim=1, correction=0)  # [BS, N]
-        self.activation_ema = (1 - alpha) * self.activation_ema + alpha * seg_mean
-        self.activation_std_ema = (1 - alpha) * self.activation_std_ema + alpha * seg_std
+        self.activation_ema = (1 - stats_alpha) * self.activation_ema + stats_alpha * seg_mean
+        self.activation_std_ema = (1 - stats_alpha) * self.activation_std_ema + stats_alpha * seg_std
 
         # Binary firing: activation > (mean + std) per neuron
         threshold = (self.activation_ema + self.activation_std_ema).unsqueeze(1)  # [BS, 1, N]
@@ -393,7 +399,7 @@ class MemoryGraph:
 
         # Update firing rate
         seg_fire_rate = fired.mean(dim=1)  # [BS, N]
-        self.firing_rate = (1 - alpha) * self.firing_rate + alpha * seg_fire_rate
+        self.firing_rate = (1 - stats_alpha) * self.firing_rate + stats_alpha * seg_fire_rate
 
         # Co-activation: phi coefficient (binary Pearson) between all neuron pairs
         # Compute once per segment via bmm
@@ -416,71 +422,6 @@ class MemoryGraph:
         phi_mean = phi.mean(dim=0).float()  # [N, N]
         ca_decay = self.config.co_activation_ema_decay
         self.co_activation_ema = ca_decay * self.co_activation_ema + (1 - ca_decay) * phi_mean
-
-    def _chunked_scan(self, decay_logit: Tensor, scan_input: Tensor,
-                      carry: Tensor, chunk_size: int = 256,
-                      use_fla: bool = False,
-                      ) -> tuple[Tensor, Tensor]:
-        """Run diagonal scan chunked over neurons.
-
-        Args:
-            decay_logit: [BS, N] (constant) or [BS, T, N] (time-varying for EOT)
-            scan_input: [BS, T, N, D] — gate*u for FLA, (1-decay)*gate*u for CPU
-            carry: [BS, N, D]
-            use_fla: if True, use FLA HGRN kernel (CUDA only)
-
-        Returns:
-            output: [BS, T, N, D]
-            new_carry: [BS, N, D]
-        """
-        BS, T, N, D = scan_input.shape
-        time_varying = decay_logit.dim() == 3  # [BS, T, N] vs [BS, N]
-        outputs = []
-        carries = []
-
-        for n0 in range(0, N, chunk_size):
-            n1 = min(n0 + chunk_size, N)
-            nc = n1 - n0
-
-            # Reshape input: [BS, T, nc, D] → [BS*nc, T, D]
-            chunk = scan_input[:, :, n0:n1].permute(0, 2, 1, 3).reshape(BS * nc, T, D)
-            h0_chunk = carry[:, n0:n1].reshape(BS * nc, D)
-
-            if time_varying:
-                # [BS, T, nc] → [BS*nc, T] → expand to [BS*nc, T, D]
-                dl_chunk = decay_logit[:, :, n0:n1].permute(0, 2, 1).reshape(BS * nc, T)
-                dl_chunk = dl_chunk.unsqueeze(-1).expand(BS * nc, T, D)
-
-                if use_fla:
-                    # Time-varying decay: FLA needs [B, T, D] gate
-                    g = F.logsigmoid(dl_chunk)
-                    out, _ = fused_recurrent_hgrn(chunk, g, initial_state=h0_chunk)
-                else:
-                    # CPU: pre-scale already done, use time-varying a
-                    a = torch.sigmoid(dl_chunk)
-                    # Sequential fallback for time-varying (parallel scan needs constant a)
-                    h = h0_chunk
-                    outs = []
-                    for t in range(T):
-                        h = a[:, t] * h + chunk[:, t]
-                        outs.append(h)
-                    out = torch.stack(outs, dim=1)
-            else:
-                # Constant decay — fast path
-                dl_chunk = decay_logit[:, n0:n1].reshape(BS * nc)
-                dl_chunk = dl_chunk.unsqueeze(-1).expand(BS * nc, D)
-
-                if use_fla:
-                    out = _fla_scan(dl_chunk, chunk, h0_chunk)
-                else:
-                    out = _cpu_scan(dl_chunk, chunk, h0_chunk)
-
-            # Reshape back: [BS*nc, T, D] → [BS, T, nc, D]
-            out = out.reshape(BS, nc, T, D).permute(0, 2, 1, 3)
-            outputs.append(out)
-            carries.append(out[:, -1])
-
-        return torch.cat(outputs, dim=2), torch.cat(carries, dim=1)
 
     def _build_adjacency(self) -> Tensor:
         """Build dense adjacency matrix from sparse connectivity.
@@ -508,35 +449,6 @@ class MemoryGraph:
         self._adjacency_cache = A
         self._adjacency_dirty = False
         return A
-
-    def _message_pass(self, x: Tensor) -> Tensor:
-        """Sparse graph message passing via dense matmul.
-
-        Builds a [BS, N, N] adjacency matrix and uses bmm for efficiency.
-        One matmul replaces 256 gather operations.
-
-        Args:
-            x: [BS, T, N, D]
-
-        Returns:
-            messages: [BS, T, N, D]
-        """
-        BS, T, N, D = x.shape
-
-        A = self._build_adjacency()  # [BS, N, N] — ~2MB, tiny
-
-        # Reshape for batched matmul: [BS, N, T*D]
-        x_flat = x.permute(0, 2, 1, 3).reshape(BS, N, T * D)
-
-        # Single bmm: [BS, N, N] @ [BS, N, T*D] → [BS, N, T*D]
-        # Use float32 for bmm on CPU (bf16 bmm not supported on CPU)
-        if not x_flat.is_cuda and x_flat.dtype == torch.bfloat16:
-            y_flat = torch.bmm(A.float(), x_flat.float()).to(self.dtype)
-        else:
-            y_flat = torch.bmm(A, x_flat)
-
-        # Reshape back: [BS, T, N, D]
-        return y_flat.reshape(BS, N, T, D).permute(0, 2, 1, 3)
 
     @torch.no_grad()
     def apply_actions(self, delta_primitives: Tensor,

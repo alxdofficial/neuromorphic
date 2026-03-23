@@ -173,6 +173,17 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
 
+    # Neuromod LR schedule: same warmup, cosine decay to 10% of initial
+    def neuromod_lr_lambda(step):
+        if step < args.warmup:
+            return step / max(args.warmup, 1)
+        progress = (step - args.warmup) / max(args.steps - args.warmup, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return 0.1 + 0.9 * cosine  # decays to 10% of initial LR
+
+    neuromod_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        neuromod_optimizer, neuromod_lr_lambda)
+
     # Data
     dataloader = create_dataloader(
         phase="A",
@@ -196,6 +207,7 @@ def main():
         max_grad_norm=MAX_GRAD_NORM,
         log_interval=args.log_interval,
         use_memory=trainer_use_memory,
+        neuromod_scheduler=neuromod_scheduler,
     )
 
     # Output dir
@@ -322,6 +334,7 @@ def main():
         "model_state_dict": model.lm.state_dict(),
         "neuromod_state_dict": model.neuromod.state_dict(),
         "optimizer_state_dict": lm_optimizer.state_dict(),
+        "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step": trainer.global_step,
         "config": config,

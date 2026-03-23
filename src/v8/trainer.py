@@ -37,6 +37,7 @@ class V8Trainer:
         log_interval: int = 50,
         collector=None,
         use_memory: bool = True,
+        neuromod_scheduler=None,
     ):
         self.model = model
         self.lm_optimizer = lm_optimizer
@@ -50,6 +51,7 @@ class V8Trainer:
         self.collector = collector
         self.global_step = 0
         self.use_memory = use_memory
+        self.neuromod_scheduler = neuromod_scheduler
 
         self._states_initialized = False
         self.use_amp = device.type == "cuda"
@@ -140,6 +142,8 @@ class V8Trainer:
                 self.model.neuromod.parameters(), self.max_grad_norm
             ).item()
             self.neuromod_optimizer.step()
+            if self.neuromod_scheduler is not None:
+                self.neuromod_scheduler.step()
 
             adv = rl_data["advantages"]  # [BS, n_segments]
             rl_metrics = {

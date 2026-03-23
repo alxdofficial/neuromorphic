@@ -50,9 +50,6 @@ class V8Config:
     use_compile: bool = True
     lifelong_mode: bool = False
 
-    # Regularization
-    reg_weight: float = 0.1
-
     @property
     def D_mem(self) -> int:
         """Neuron primitive dim = CC dim. Always equal."""

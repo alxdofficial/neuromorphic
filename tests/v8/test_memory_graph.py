@@ -135,25 +135,6 @@ class TestMemoryGraphForward:
         assert mg.prev_messages.abs().sum() > 0
 
 
-class TestMemoryGraphMessagePassing:
-    def test_message_pass_shape(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
-        mg.initialize(BS)
-        x = torch.randn(BS, 8, cfg.N_neurons, cfg.D_mem)
-        out = mg._message_pass(x)
-        assert out.shape == x.shape
-
-    def test_zero_weights_zero_messages(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
-        mg.initialize(BS)
-        mg.conn_weights.zero_()
-        x = torch.randn(BS, 4, cfg.N_neurons, cfg.D_mem)
-        out = mg._message_pass(x)
-        assert out.abs().max() == 0
-
-
 class TestMemoryGraphActions:
     def test_apply_actions(self):
         cfg = make_tiny()
