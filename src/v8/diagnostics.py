@@ -107,6 +107,10 @@ class V8Diagnostics:
             snapshot["adj_row_norms"] = A.norm(dim=-1).mean(dim=0).cpu()  # [N]
             snapshot["adj_sparsity"] = (A.abs() < 1e-6).float().mean().item()
 
+            # Co-activation matrix [N, N] and primitives [N, D] for PCA
+            snapshot["co_activation"] = mg.co_activation_ema.cpu().float()
+            snapshot["primitives_mean"] = mg.primitives.mean(dim=0).cpu()  # [N, D]
+
             snapshot["step"] = step
             snapshot["config"] = {
                 "N": mg.config.N_neurons,
