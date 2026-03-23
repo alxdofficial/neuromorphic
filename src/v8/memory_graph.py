@@ -500,14 +500,14 @@ class MemoryGraph:
             delta_conn_weights: [BS, N, K_conn]
             delta_decay: [BS, N]
         """
-        self.primitives = self.primitives + delta_primitives
-        self.conn_weights = self.conn_weights + delta_conn_weights
-        self.decay_logit = self.decay_logit + delta_decay
+        self.primitives = (self.primitives + delta_primitives).to(self.dtype)
+        self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
+        self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
         # Energy conservation: L1-normalize connection weights per neuron
         # The neuromod controls the distribution, not the total magnitude
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.conn_weights = self.conn_weights / w_abs_sum
+        self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
 
         self._adjacency_dirty = True
 
@@ -589,7 +589,7 @@ class MemoryGraph:
 
         # Re-normalize weights after topology change
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.conn_weights = self.conn_weights / w_abs_sum
+        self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
 
         # Re-sort for cache locality after topology change
         self._sort_conn_indices()
