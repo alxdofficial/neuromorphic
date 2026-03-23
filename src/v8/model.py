@@ -86,13 +86,13 @@ class V8Model(nn.Module):
             self._reset_carries(reset_mask)
 
         # ==========================================
-        # Lower scan (layers 0..split-1)
+        # Lower scan (layers 0..split-1) + PCM
         # ==========================================
-        H_mid, x = self.lm.forward_scan_lower(input_ids)
+        H_mid, x, surprise, aux_loss = self.lm.forward_scan_lower(input_ids)
 
         # --- No-memory fast path ---
         if not use_memory:
-            H, surprise, aux_loss = self.lm.forward_scan_upper(H_mid, x)
+            H = self.lm.forward_scan_upper(H_mid)
             logits = self.lm.forward_output(H)
             return {
                 "logits": logits,
@@ -159,7 +159,7 @@ class V8Model(nn.Module):
         # Inject memory into H_mid, then upper scan
         # ==========================================
         H_enriched = self.lm.inject_memory(H_mid, mem_signals)
-        H, surprise, aux_loss = self.lm.forward_scan_upper(H_enriched, x)
+        H = self.lm.forward_scan_upper(H_enriched)
 
         # ==========================================
         # Output head

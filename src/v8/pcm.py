@@ -36,9 +36,13 @@ class SingleColumnPCM(nn.Module):
 
         self.W_gain = nn.Linear(D_cc, D_cc)
 
-        # Zero-init W_gain so gain starts at 1.0
+        # Zero-init W_gain so gain starts at sigmoid(0)*2 = 1.0
         nn.init.zeros_(self.W_gain.weight)
         nn.init.zeros_(self.W_gain.bias)
+
+        # Learnable gain scale: starts at 2.0 (range [0, 2] at init)
+        # Can grow during training to allow stronger modulation
+        self.gain_scale = nn.Parameter(torch.tensor(2.0))
 
     def compute_surprise(self, H: Tensor, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Compute vector surprise and PCM prediction.
@@ -59,8 +63,13 @@ class SingleColumnPCM(nn.Module):
         return surprise, z_hat, z
 
     def apply_gain(self, H: Tensor, surprise: Tensor) -> Tensor:
-        """PCM gain modulation: bounded [0.9, 1.1]."""
-        gain = 1.0 + 0.1 * torch.tanh(self.W_gain(surprise))
+        """PCM gain modulation: learnable range.
+
+        gain = sigmoid(W_gain(surprise)) * gain_scale
+        At init: sigmoid(0) * 2.0 = 1.0 (no modulation).
+        The network learns how much surprise should amplify/suppress.
+        """
+        gain = torch.sigmoid(self.W_gain(surprise)) * self.gain_scale
         return H * gain
 
     def prediction_loss(self, z_hat: Tensor, z: Tensor) -> Tensor:

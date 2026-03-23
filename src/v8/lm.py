@@ -70,17 +70,26 @@ class V8LM(nn.Module):
         # Scan carries
         self._carries = [None] * config.L_total
 
-    def forward_scan_lower(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
-        """Lower scan layers (0..split-1). Produces H_mid for memory graph.
+    def forward_scan_lower(self, input_ids: Tensor
+                           ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Lower scan layers (0..split-1) + PCM. Produces H_mid for memory graph.
+
+        PCM runs at the split point so the memory graph reads gain-modulated
+        representations — surprising tokens produce stronger CC signals.
 
         Args:
             input_ids: [BS, T]
 
         Returns:
-            H_mid: [BS, T, D] — hidden states after lower scan layers (WITH autograd)
-            x: [BS, T, D] — embedded input (for PCM reference later)
+            H_mid: [BS, T, D] — hidden states after lower scan + PCM gain (WITH autograd)
+            x: [BS, T, D] — embedded input
+            surprise: [BS, T, C, D_cc] — per-CC surprise vectors
+            aux_loss: scalar — PCM prediction loss
         """
         BS, T = input_ids.shape
+        C = self.config.C
+        D_cc = self.config.D_cc
+        D = self.config.D
         split = self.config.scan_split_at
 
         # Embed
@@ -100,38 +109,7 @@ class V8LM(nn.Module):
                 H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
-        return H, x
-
-    def forward_scan_upper(self, H_enriched: Tensor, x: Tensor
-                           ) -> tuple[Tensor, Tensor, Tensor]:
-        """Upper scan layers (split..L-1) + PCM on memory-enriched input.
-
-        Args:
-            H_enriched: [BS, T, D] — H_mid + gated memory signals
-            x: [BS, T, D] — embedded input (for PCM)
-
-        Returns:
-            H: [BS, T, D] — hidden states after all upper scan layers + PCM
-            surprise: [BS, T, C, D_cc]
-            aux_loss: scalar
-        """
-        BS, T, D = H_enriched.shape
-        C = self.config.C
-        D_cc = self.config.D_cc
-        split = self.config.scan_split_at
-
-        # Upper scan layers
-        H = H_enriched
-        for i in range(split, self.config.L_total):
-            carry = self._carries[i]
-            if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry,
-                                            use_reentrant=False)
-            else:
-                H, h_last = self.layers[i](H, carry)
-            self._carries[i] = h_last
-
-        # Per-CC PCM (after upper scan — surprise reflects full context + memory)
+        # PCM at the split point — surprise modulates H_mid before memory reads it
         aux_loss = torch.tensor(0.0, device=H.device)
         if self.pcm_modules is not None:
             H_cols = H.view(BS, T, C, D_cc)
@@ -152,7 +130,30 @@ class V8LM(nn.Module):
         else:
             surprise = torch.zeros(BS, T, C, D_cc, device=H.device, dtype=H.dtype)
 
-        return H, surprise, aux_loss
+        return H, x, surprise, aux_loss
+
+    def forward_scan_upper(self, H_enriched: Tensor) -> Tensor:
+        """Upper scan layers (split..L-1) on memory-enriched input.
+
+        Args:
+            H_enriched: [BS, T, D] — H_mid + gated memory signals
+
+        Returns:
+            H: [BS, T, D] — hidden states after upper scan layers
+        """
+        split = self.config.scan_split_at
+
+        H = H_enriched
+        for i in range(split, self.config.L_total):
+            carry = self._carries[i]
+            if self.config.gradient_checkpointing and self.training:
+                H, h_last = grad_checkpoint(self.layers[i], H, carry,
+                                            use_reentrant=False)
+            else:
+                H, h_last = self.layers[i](H, carry)
+            self._carries[i] = h_last
+
+        return H
 
     def inject_memory(self, H_mid: Tensor, mem_signals: Tensor) -> Tensor:
         """Add gated memory signals to H_mid.
@@ -187,8 +188,8 @@ class V8LM(nn.Module):
     # --- Legacy: full scan for no-memory path ---
     def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Full scan + PCM (no memory). Used only for no-memory baseline."""
-        H_mid, x = self.forward_scan_lower(input_ids)
-        H, surprise, aux_loss = self.forward_scan_upper(H_mid, x)
+        H_mid, x, surprise, aux_loss = self.forward_scan_lower(input_ids)
+        H = self.forward_scan_upper(H_mid)
         return H, x, surprise, aux_loss
 
     def initialize_carries(self):
