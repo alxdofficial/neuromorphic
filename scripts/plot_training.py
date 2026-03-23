@@ -96,15 +96,22 @@ def get_steps(records, key):
     return [r["step"] for r in records if key in r]
 
 
-def _plot_line(ax, steps, vals, color, label=None, raw_alpha=0.15):
+def _plot_line(ax, steps, vals, color, label=None):
     """Plot raw + smoothed line with good visibility."""
     arr = np.array(vals)
-    ax.plot(steps, arr, alpha=raw_alpha, color=color, linewidth=0.5)
-    if len(arr) > 100:
+    if len(arr) > 200:
+        # Enough data: faint raw + bold smooth
+        ax.plot(steps, arr, alpha=0.2, color=color, linewidth=0.5)
         s = smooth(arr)
+        ax.plot(steps[:len(s)], s, color=color, linewidth=2.5, label=label)
+    elif len(arr) > 50:
+        # Medium data: lighter raw + thinner smooth
+        ax.plot(steps, arr, alpha=0.3, color=color, linewidth=0.8)
+        s = smooth(arr, window=max(len(arr) // 8, 3))
         ax.plot(steps[:len(s)], s, color=color, linewidth=2.0, label=label)
-    elif label:
-        ax.plot(steps, arr, color=color, linewidth=1.5, alpha=0.8, label=label)
+    else:
+        # Few points: just draw the line directly, fully visible
+        ax.plot(steps, arr, color=color, linewidth=2.0, alpha=0.9, label=label)
 
 
 def _setup_ax(ax, title, ylabel=None, xlabel="Step"):
