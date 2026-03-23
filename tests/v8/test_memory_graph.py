@@ -74,6 +74,15 @@ class TestMemoryGraphInit:
         assert mg.prev_messages.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.conn_weights.shape == (BS, cfg.N_neurons, cfg.K_connections)
         assert mg.flow_ema.shape == (BS, cfg.N_neurons, cfg.K_connections)
+        assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
+
+    def test_conn_weights_l1_normalized(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"))
+        mg.initialize(BS)
+        # Each neuron's conn_weights should sum to 1.0 in abs value
+        l1 = mg.conn_weights.abs().sum(dim=-1)  # [BS, N]
+        torch.testing.assert_close(l1, torch.ones_like(l1), atol=1e-2, rtol=1e-2)
 
     def test_connectivity(self):
         cfg = make_tiny()
@@ -183,19 +192,29 @@ class TestMemoryGraphPlasticity:
         assert torch.isfinite(mg.flow_ema).all()
 
     def test_structural_plasticity(self):
+        """Co-activation-based plasticity: anti-correlated connections get pruned."""
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
 
-        # Set some connection weights to near-zero
-        mg.conn_weights[:, 0, :2] = 0.001
-        indices_before = mg.conn_indices[0, :2].clone()
+        N = cfg.N_neurons
+        # Set up co-activation matrix with some anti-correlated pairs
+        mg.co_activation_ema = torch.randn(N, N) * 0.1
+        # Make neuron 0's connection to conn_indices[0, 0] strongly anti-correlated
+        target = mg.conn_indices[0, 0].item()
+        mg.co_activation_ema[0, target] = -0.5
 
+        indices_before = mg.conn_indices[0, 0].clone()
         mg.structural_plasticity()
 
-        # Pruned connections should have been rewired
-        indices_after = mg.conn_indices[0, :2]
-        assert not torch.equal(indices_before, indices_after)
+        # The anti-correlated connection should have been rewired
+        indices_after = mg.conn_indices[0, 0]
+        assert indices_before != indices_after, \
+            "Anti-correlated connection should be pruned and rewired"
+
+        # Weights should still be L1-normalized after plasticity
+        l1 = mg.conn_weights.abs().sum(dim=-1)
+        torch.testing.assert_close(l1, torch.ones_like(l1), atol=1e-2, rtol=1e-2)
 
 
 class TestMemoryGraphReset:
@@ -444,7 +463,11 @@ class TestNeuronDynamicsReference:
             "Different primitives should produce different outputs"
 
     def test_decay_controls_persistence(self):
-        """Verify high decay retains state, low decay forgets quickly."""
+        """Verify high decay retains state, low decay forgets quickly.
+
+        Isolate decay effect by zeroing connection weights so only
+        CC input → port neuron → decay dynamics are tested.
+        """
         cfg = make_tiny()
         mg_high = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg_high.initialize(BS)
@@ -455,26 +478,31 @@ class TestNeuronDynamicsReference:
         mg_low.h = mg_high.h.clone()
         mg_low.prev_messages = mg_high.prev_messages.clone()
         mg_low.primitives = mg_high.primitives.clone()
-        mg_low.conn_weights = mg_high.conn_weights.clone()
         mg_low.conn_indices = mg_high.conn_indices.clone()
         mg_low.conn_mask = mg_high.conn_mask.clone()
+
+        # Zero connectivity so only direct CC input matters (no graph circulation)
+        mg_high.conn_weights = torch.zeros_like(mg_high.conn_weights)
+        mg_low.conn_weights = torch.zeros_like(mg_low.conn_weights)
+        mg_high._adjacency_dirty = True
+        mg_low._adjacency_dirty = True
 
         # Set decay: high=0.99 (sigmoid(4.6)≈0.99), low=0.01 (sigmoid(-4.6)≈0.01)
         mg_high.decay_logit.fill_(4.6)
         mg_low.decay_logit.fill_(-4.6)
 
-        # Inject signal then run with zero input
-        cc_signal = torch.randn(BS, 1, cfg.C, cfg.D_mem)
+        # Inject strong signal into port neurons
+        cc_signal = torch.ones(BS, 1, cfg.C, cfg.D_mem) * 2.0
         mg_high.forward_segment(cc_signal)
         mg_low.forward_segment(cc_signal.clone())
 
-        # Now run with zero input for several steps
+        # Now run with zero input — only decay matters
         cc_zero = torch.zeros(BS, cfg.action_every, cfg.C, cfg.D_mem)
         mg_high.forward_segment(cc_zero)
         mg_low.forward_segment(cc_zero.clone())
 
-        # High decay should retain more state
-        high_state_mag = mg_high.h.abs().mean().item()
-        low_state_mag = mg_low.h.abs().mean().item()
-        assert high_state_mag > low_state_mag * 2, \
-            f"High decay ({high_state_mag:.4f}) should retain much more than low ({low_state_mag:.4f})"
+        # Compare port neuron state only (non-port neurons get no signal with zero weights)
+        high_port_mag = mg_high.h[:, :cfg.C].abs().mean().item()
+        low_port_mag = mg_low.h[:, :cfg.C].abs().mean().item()
+        assert high_port_mag > low_port_mag * 2, \
+            f"High decay ({high_port_mag:.4f}) should retain much more than low ({low_port_mag:.4f})"

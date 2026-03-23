@@ -30,14 +30,15 @@ class V8Config:
 
     # Plasticity
     plasticity_ema_decay: float = 0.99
+    co_activation_ema_decay: float = 0.995  # slow EMA for co-activation matrix
     structural_plasticity_every: int = 4    # segments between prune-regrow (twice per chunk)
-    prune_threshold: float = 0.01
+    plasticity_exploration_frac: float = 0.2  # fraction of regrowth that's random
 
     # Neuromodulator
     neuromod_hidden: int = 1024
     neuromod_layers: int = 3
     action_every: int = 256      # act every N tokens (8 segments per T=2048 chunk)
-    max_action_magnitude: float = 0.3
+    max_action_magnitude: float = 1.0  # generous — L1 normalization bounds the effect
 
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer

@@ -51,25 +51,27 @@ class V8Diagnostics:
             prim_std = mg.primitives.std(dim=1).mean().item()
             metrics["mem_prim_std"] = round(prim_std, 6)
 
-            # Connection weight stats
+            # Connection weight stats (L1-normalized, so sum |w| = 1 per neuron)
             cw = mg.conn_weights
             metrics["mem_cw_mean"] = round(cw.mean().item(), 6)
             metrics["mem_cw_std"] = round(cw.std().item(), 6)
-            metrics["mem_cw_near_zero"] = round(
-                (cw.abs() < mg.config.prune_threshold).float().mean().item(), 4)
+            metrics["mem_cw_max"] = round(cw.abs().max().item(), 6)
 
             # Decay distribution
             decay = torch.sigmoid(mg.decay_logit)
             metrics["mem_decay_mean"] = round(decay.mean().item(), 4)
             metrics["mem_decay_std"] = round(decay.std().item(), 4)
 
-            # Plasticity metrics
+            # Firing rate and plasticity
+            metrics["mem_firing_rate"] = round(mg.firing_rate.mean().item(), 4)
             metrics["mem_flow_mean"] = round(mg.flow_ema.mean().item(), 6)
             metrics["mem_corr_mean"] = round(mg.corr_ema.mean().item(), 6)
 
-            # Usage (fraction of neurons with nonzero activity)
-            metrics["mem_usage_frac"] = round(
-                (mg.usage_count > 0.01).float().mean().item(), 4)
+            # Co-activation stats (phi coefficient matrix)
+            phi = mg.co_activation_ema
+            metrics["mem_phi_mean"] = round(phi.mean().item(), 6)
+            metrics["mem_phi_pos_frac"] = round((phi > 0).float().mean().item(), 4)
+            metrics["mem_phi_neg_frac"] = round((phi < 0).float().mean().item(), 4)
 
         return metrics
 
@@ -95,7 +97,7 @@ class V8Diagnostics:
             snapshot["h_norm_per_neuron"] = mg.h.norm(dim=-1).mean(dim=0).cpu()
             snapshot["msg_norm_per_neuron"] = mg.prev_messages.norm(dim=-1).mean(dim=0).cpu()
             snapshot["decay_per_neuron"] = torch.sigmoid(mg.decay_logit).mean(dim=0).cpu()
-            snapshot["usage_per_neuron"] = mg.usage_count.mean(dim=0).cpu()
+            snapshot["firing_rate_per_neuron"] = mg.firing_rate.mean(dim=0).cpu()
 
             # Connection weight distribution per neuron [N, K]
             snapshot["cw_per_neuron"] = mg.conn_weights.mean(dim=0).cpu()

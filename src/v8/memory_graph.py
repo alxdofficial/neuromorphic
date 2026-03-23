@@ -159,10 +159,10 @@ class MemoryGraph:
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
 
-        # Connection weights (neuromodulator-controlled)
-        # Positive init so message routing has net signal
-        self.conn_weights = torch.rand(
-            BS, N, K_conn, device=self.device, dtype=self.dtype) * 0.2
+        # Connection weights (neuromodulator-controlled, L1-normalized per neuron)
+        # Init uniform positive, then L1-normalize so sum |w| = 1 per neuron
+        raw_w = torch.rand(BS, N, K_conn, device=self.device, dtype=self.dtype) + 0.01
+        self.conn_weights = raw_w / raw_w.abs().sum(dim=-1, keepdim=True)
 
         # Persistent neuron state
         self.h = torch.zeros(
@@ -175,10 +175,21 @@ class MemoryGraph:
             BS, N, D, device=self.device, dtype=self.dtype)
         self.mean_output = torch.zeros(
             BS, N, D, device=self.device, dtype=self.dtype)
-        self.usage_count = torch.zeros(
+
+        # Adaptive firing threshold stats (per neuron)
+        self.activation_ema = torch.zeros(
+            BS, N, device=self.device, dtype=self.dtype)
+        self.activation_std_ema = torch.ones(
+            BS, N, device=self.device, dtype=self.dtype) * 0.1  # small positive init
+        self.firing_rate = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
 
-        # Plasticity metrics
+        # Co-activation matrix (batch-averaged, for structural plasticity)
+        # [N, N] — not per-batch, topology is shared
+        self.co_activation_ema = torch.zeros(
+            N, N, device=self.device, dtype=torch.float32)
+
+        # Per-connection plasticity metrics
         self.flow_ema = torch.zeros(
             BS, N, K_conn, device=self.device, dtype=self.dtype)
         self.corr_ema = torch.zeros(
@@ -231,7 +242,11 @@ class MemoryGraph:
           2. Integrates stimuli into state: h = decay * h + (1-decay) * received
           3. Computes outgoing message: message = tanh(h * primitives)
 
-        This is the readable reference. The Triton version must match exactly.
+        Also tracks per-token activation magnitudes for firing threshold
+        and co-activation computation.
+
+        This is the readable reference. The Triton version must match
+        the neuron dynamics exactly (firing/plasticity stats are Python-only).
         """
         BS, T_seg, C, D = cc_signals.shape
         N = self.config.N_neurons
@@ -258,6 +273,9 @@ class MemoryGraph:
         prev_msg = self.prev_messages       # [BS, N, D] — last outgoing messages
         output = torch.empty(BS, T_seg, C, D, device=self.device, dtype=self.dtype)
 
+        # Track activation magnitudes for firing threshold
+        act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
+
         for t in range(T_seg):
             # 1. Receive: route presynaptic messages through graph
             if use_f32_bmm:
@@ -281,6 +299,9 @@ class MemoryGraph:
             # 3. Compute outgoing message
             prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
 
+            # Track activation magnitude
+            act_trace[:, t] = prev_msg.float().norm(dim=-1)
+
             # Store port neuron messages for LM
             output[:, t] = prev_msg[:, :C]
 
@@ -288,7 +309,7 @@ class MemoryGraph:
         self.h = h
         self.prev_messages = prev_msg
 
-        self._post_segment_stats(prev_msg)
+        self._post_segment_stats(prev_msg, act_trace)
         return output
 
     def _forward_segment_triton(self, cc_signals: Tensor,
@@ -349,13 +370,62 @@ class MemoryGraph:
         self._post_segment_stats(self.prev_messages)
         return output
 
-    def _post_segment_stats(self, prev_msg: Tensor):
-        """Update plasticity metrics and running stats after a segment."""
+    def _post_segment_stats(self, prev_msg: Tensor, act_trace: Tensor = None):
+        """Update plasticity metrics, firing stats, and co-activation after a segment.
+
+        Args:
+            prev_msg: [BS, N, D] — final messages
+            act_trace: [BS, T_seg, N] float32 — activation magnitudes per token
+                       (None when called from Triton path, which handles stats separately)
+        """
         alpha = 0.05
+
+        # Per-connection flow/correlation (from final messages)
         self._update_plasticity_metrics_from_messages(prev_msg)
+
+        # Running output stats
         self.mean_output = (1 - alpha) * self.mean_output + alpha * prev_msg
-        self.usage_count = (1 - alpha) * self.usage_count + alpha * (
-            prev_msg.norm(dim=-1) > 0.01).to(dtype=self.dtype)
+
+        if act_trace is None:
+            return
+
+        BS, T_seg, N = act_trace.shape
+
+        # Update adaptive firing threshold (per-neuron mean + std of activation)
+        seg_mean = act_trace.mean(dim=1)  # [BS, N]
+        seg_std = act_trace.std(dim=1, correction=0)  # [BS, N]
+        self.activation_ema = (1 - alpha) * self.activation_ema + alpha * seg_mean
+        self.activation_std_ema = (1 - alpha) * self.activation_std_ema + alpha * seg_std
+
+        # Binary firing: activation > (mean + std) per neuron
+        threshold = (self.activation_ema + self.activation_std_ema).unsqueeze(1)  # [BS, 1, N]
+        fired = (act_trace > threshold).float()  # [BS, T_seg, N]
+
+        # Update firing rate
+        seg_fire_rate = fired.mean(dim=1)  # [BS, N]
+        self.firing_rate = (1 - alpha) * self.firing_rate + alpha * seg_fire_rate
+
+        # Co-activation: phi coefficient (binary Pearson) between all neuron pairs
+        # Compute once per segment via bmm
+        p_i = fired.mean(dim=1, keepdim=True)  # [BS, 1, N] — firing probability
+        # Center the firing indicators
+        fired_centered = fired - p_i  # [BS, T_seg, N]
+        # Variance per neuron
+        var_i = (p_i * (1 - p_i)).squeeze(1).clamp(min=1e-8)  # [BS, N]
+        # Covariance via bmm: [BS, N, T] @ [BS, T, N] / T = [BS, N, N]
+        cov = torch.bmm(
+            fired_centered.transpose(1, 2),
+            fired_centered,
+        ) / T_seg  # [BS, N, N]
+        # Normalize to phi: cov / sqrt(var_i * var_j)
+        std_i = var_i.sqrt().unsqueeze(2)   # [BS, N, 1]
+        std_j = var_i.sqrt().unsqueeze(1)   # [BS, 1, N]
+        phi = cov / (std_i * std_j).clamp(min=1e-8)  # [BS, N, N]
+
+        # Average across batch, update EMA (co_activation_ema is [N, N], not per-batch)
+        phi_mean = phi.mean(dim=0).float()  # [N, N]
+        ca_decay = self.config.co_activation_ema_decay
+        self.co_activation_ema = ca_decay * self.co_activation_ema + (1 - ca_decay) * phi_mean
 
     def _chunked_scan(self, decay_logit: Tensor, scan_input: Tensor,
                       carry: Tensor, chunk_size: int = 256,
@@ -425,10 +495,12 @@ class MemoryGraph:
     def _build_adjacency(self) -> Tensor:
         """Build dense adjacency matrix from sparse connectivity.
 
-        Uses a dirty flag to avoid rebuilding when conn_weights haven't changed.
+        Weights are already L1-normalized (sum |w| = 1 per neuron), so no
+        additional mean-normalization is needed. The adjacency scatters the
+        raw L1-normalized weights.
 
         Returns:
-            A: [BS, N, N] — dense weighted adjacency, mean-normalized
+            A: [BS, N, N] — dense weighted adjacency (L1-normalized rows)
         """
         if not self._adjacency_dirty and self._adjacency_cache is not None:
             return self._adjacency_cache
@@ -438,12 +510,10 @@ class MemoryGraph:
         K_conn = self.config.K_connections
 
         w_masked = self.conn_weights * self.conn_mask.unsqueeze(0).to(dtype=self.dtype)
-        n_active = self.conn_mask.sum(dim=-1).clamp(min=1).to(dtype=self.dtype)  # [N]
-        w_norm = w_masked / n_active.unsqueeze(0).unsqueeze(-1)  # [BS, N, K_conn]
 
         A = torch.zeros(BS, N, N, device=self.device, dtype=self.dtype)
         idx = self.conn_indices.unsqueeze(0).expand(BS, N, K_conn)
-        A.scatter_add_(2, idx, w_norm)
+        A.scatter_add_(2, idx, w_masked)
 
         self._adjacency_cache = A
         self._adjacency_dirty = False
@@ -503,6 +573,9 @@ class MemoryGraph:
                       delta_decay: Tensor):
         """Apply neuromodulator actions to neuron/connection state.
 
+        After applying deltas, L1-normalize conn_weights per neuron
+        (energy conservation: fixed routing budget of 1.0).
+
         Args:
             delta_primitives: [BS, N, D_mem]
             delta_conn_weights: [BS, N, K_conn]
@@ -511,52 +584,92 @@ class MemoryGraph:
         self.primitives = self.primitives + delta_primitives
         self.conn_weights = self.conn_weights + delta_conn_weights
         self.decay_logit = self.decay_logit + delta_decay
+
+        # Energy conservation: L1-normalize connection weights per neuron
+        # The neuromod controls the distribution, not the total magnitude
+        w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        self.conn_weights = self.conn_weights / w_abs_sum
+
         self._adjacency_dirty = True
 
     @torch.no_grad()
     def structural_plasticity(self):
-        """Prune dead connections and regrow random new ones.
+        """Autonomous co-activation-based structural plasticity.
 
-        Connections with |weight| < threshold are pruned and randomly rewired.
+        Prune: connections where the two neurons are anti-correlated (phi < 0).
+        Grow: connect to non-connected neurons with highest co-activation (phi > 0).
+        80% correlation-guided, 20% random exploration.
+
+        Uses the co_activation_ema matrix (updated in _post_segment_stats).
+        All thresholds are relative (phi < 0 is a natural boundary, not a magic number).
         """
         N = self.config.N_neurons
-        threshold = self.config.prune_threshold
+        K_conn = self.config.K_connections
+        explore_frac = self.config.plasticity_exploration_frac
+        phi = self.co_activation_ema  # [N, N]
 
-        # Find weak connections (averaged across batch)
-        mean_weight = self.conn_weights.abs().mean(dim=0)  # [N, K_conn]
-        weak = mean_weight < threshold  # [N, K_conn]
-
-        if not weak.any():
+        # Skip if co-activation hasn't been measured yet
+        if phi.abs().max() < 1e-10:
             return
 
         self._adjacency_dirty = True
         rewired = False
+
         for j in range(N):
-            weak_j = weak[j].nonzero(as_tuple=True)[0]
-            if len(weak_j) == 0:
+            existing_indices = self.conn_indices[j]  # [K_conn]
+            existing_set = set(existing_indices.tolist())
+            existing_set.add(j)  # no self-connections
+
+            # Get phi values for existing connections
+            conn_phi = phi[j, existing_indices]  # [K_conn]
+
+            # Find anti-correlated connections (phi < 0) — candidates for pruning
+            anti_corr = (conn_phi < 0).nonzero(as_tuple=True)[0]
+            if len(anti_corr) == 0:
                 continue
 
-            existing = set(self.conn_indices[j].tolist())
-            existing.add(j)
+            # Prune the most anti-correlated connection (lowest phi)
+            worst_k = anti_corr[conn_phi[anti_corr].argmin()].item()
 
-            for k in weak_j:
+            # Choose replacement: correlation-guided or random
+            if torch.rand(1).item() < explore_frac:
+                # Random exploration
                 for _ in range(10):
-                    new_target = torch.randint(0, N, (1,),
-                                               device=self.device).item()
-                    if new_target not in existing:
-                        self.conn_indices[j, k] = new_target
-                        existing.add(new_target)
-                        self.conn_weights[:, j, k] = torch.rand(
-                            self.conn_weights.shape[0],
-                            device=self.device, dtype=self.dtype) * 0.2
-                        self.flow_ema[:, j, k] = 0
-                        self.corr_ema[:, j, k] = 0
-                        rewired = True
+                    new_target = torch.randint(0, N, (1,), device=self.device).item()
+                    if new_target not in existing_set:
                         break
+                else:
+                    continue  # couldn't find a non-existing target
+            else:
+                # Correlation-guided: find best non-connected neuron
+                phi_j = phi[j].clone()  # [N]
+                # Mask out existing connections and self
+                for idx in existing_set:
+                    phi_j[idx] = -float('inf')
+                new_target = phi_j.argmax().item()
+                if phi_j[new_target] <= 0:
+                    # No positive-correlation candidates, skip
+                    continue
 
-        # Update int32 indices for Triton kernel
-        if rewired and self._triton_ready:
-            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
+            # Rewire
+            self.conn_indices[j, worst_k] = new_target
+            existing_set.add(new_target)
+
+            # Init new weight to median of this neuron's current |weights|
+            median_w = self.conn_weights[:, j].abs().median(dim=-1).values  # [BS]
+            self.conn_weights[:, j, worst_k] = median_w
+            self.flow_ema[:, j, worst_k] = 0
+            self.corr_ema[:, j, worst_k] = 0
+            rewired = True
+
+        if rewired:
+            # Re-normalize weights after topology change
+            w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            self.conn_weights = self.conn_weights / w_abs_sum
+
+            # Update int32 indices for Triton kernel
+            if self._triton_ready:
+                self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
     @torch.no_grad()
     def get_neuron_obs(self) -> Tensor:
@@ -569,15 +682,14 @@ class MemoryGraph:
             self.primitives,                              # [BS, N, D_mem]
             self.mean_input,                              # [BS, N, D_mem]
             self.mean_output,                             # [BS, N, D_mem]
-            self.usage_count.unsqueeze(-1),               # [BS, N, 1]
+            self.firing_rate.unsqueeze(-1),               # [BS, N, 1]
             torch.sigmoid(self.decay_logit).unsqueeze(-1),# [BS, N, 1]
         ]
 
-        # Routing entropy from connection weights
+        # Routing entropy from connection weights (L1-normalized, so w_abs sums to 1)
         w_abs = self.conn_weights.abs()
-        w_norm = w_abs / w_abs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         eps = torch.tensor(1e-4, dtype=self.dtype, device=self.device)
-        entropy = -(w_norm * (w_norm + eps).log()).sum(dim=-1, keepdim=True)
+        entropy = -(w_abs * (w_abs + eps).log()).sum(dim=-1, keepdim=True)
         parts.append(entropy)  # [BS, N, 1]
 
         # Plasticity metrics (use correction=0 for population std, avoids NaN)
@@ -591,7 +703,7 @@ class MemoryGraph:
     @property
     def obs_dim(self) -> int:
         """Observation dimension for neuromodulator."""
-        # D_mem*3 + 2 (usage,decay) + 1 (entropy) + 4 (plasticity metrics)
+        # D_mem*3 + 2 (firing_rate, decay) + 1 (entropy) + 4 (plasticity metrics)
         return self.config.D_mem * 3 + 7
 
     @torch.no_grad()
@@ -604,13 +716,20 @@ class MemoryGraph:
         if not mask.any():
             return
 
-        # Only reset dynamic state (h, prev_messages) at document boundaries.
-        # Structural state (primitives, conn_weights, decay, plasticity metrics)
-        # is preserved — these represent learned neuron types and routing that
-        # the neuromodulator built up over training.
-        m2 = mask.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
-        self.h = self.h * (~m2).to(dtype=self.dtype)
-        self.prev_messages = self.prev_messages * (~m2).to(dtype=self.dtype)
+        # Only reset dynamic state at document boundaries.
+        # Structural state (primitives, conn_weights, decay, plasticity metrics,
+        # co_activation_ema) is preserved.
+        m1 = mask.unsqueeze(-1).to(dtype=self.dtype)    # [BS, 1]
+        m2 = m1.unsqueeze(-1)                            # [BS, 1, 1]
+        keep1 = 1.0 - m1                                 # [BS, 1]
+        keep2 = 1.0 - m2                                 # [BS, 1, 1]
+
+        self.h = self.h * keep2
+        self.prev_messages = self.prev_messages * keep2
+        # Reset firing stats for reset streams (they'll rebuild quickly)
+        self.activation_ema = self.activation_ema * keep1
+        self.activation_std_ema = self.activation_std_ema * keep1 + m1 * 0.1
+        self.firing_rate = self.firing_rate * keep1
 
     def state_dict(self) -> dict:
         """Export full memory graph state for checkpointing."""
@@ -624,7 +743,10 @@ class MemoryGraph:
             'prev_messages': self.prev_messages,
             'mean_input': self.mean_input,
             'mean_output': self.mean_output,
-            'usage_count': self.usage_count,
+            'activation_ema': self.activation_ema,
+            'activation_std_ema': self.activation_std_ema,
+            'firing_rate': self.firing_rate,
+            'co_activation_ema': self.co_activation_ema,
             'flow_ema': self.flow_ema,
             'corr_ema': self.corr_ema,
         }

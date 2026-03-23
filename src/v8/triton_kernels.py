@@ -92,17 +92,17 @@ def memory_graph_step_kernel(
 
 @triton.jit
 def prepare_sparse_weights_kernel(
-    conn_weights_ptr,   # [BS, N, K] bf16 — raw weights
+    conn_weights_ptr,   # [BS, N, K] bf16 — L1-normalized weights
     conn_mask_ptr,      # [N, K] bool — active connections
-    conn_w_norm_ptr,    # [BS, N, K] bf16 — output: normalized weights
+    conn_w_norm_ptr,    # [BS, N, K] bf16 — output: masked weights
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Mean-normalize connection weights by active connection count.
+    """Apply connection mask to L1-normalized weights.
 
-    Replaces _build_adjacency() — produces sparse normalized weights
-    instead of a dense [N,N] adjacency matrix.
+    Weights are already L1-normalized (sum |w| = 1 per neuron).
+    This just masks inactive connections (rare — only when K > N-1).
     """
     b = tl.program_id(0)
     n = tl.program_id(1)
@@ -113,8 +113,5 @@ def prepare_sparse_weights_kernel(
     m = tl.load(conn_mask_ptr + n * K + k, mask=mask_k, other=0).to(tl.float32)
 
     w_masked = w.to(tl.float32) * m
-    n_active = tl.sum(m, axis=0)
-    n_active = tl.maximum(n_active, 1.0)
-    w_norm = w_masked / n_active
 
-    tl.store(conn_w_norm_ptr + (b * N + n) * K + k, w_norm.to(tl.bfloat16), mask=mask_k)
+    tl.store(conn_w_norm_ptr + (b * N + n) * K + k, w_masked.to(tl.bfloat16), mask=mask_k)
