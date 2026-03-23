@@ -64,6 +64,7 @@ class V8Model(nn.Module):
         target_ids: Tensor | None = None,
         reset_mask: Tensor | None = None,
         use_memory: bool = True,
+        has_reset: bool = False,
     ) -> dict:
         """Process a full T-token chunk with split-scan memory injection.
 
@@ -84,8 +85,8 @@ class V8Model(nn.Module):
         device = input_ids.device
         dtype = next(self.lm.parameters()).dtype
 
-        # Reset scan carries at doc boundaries
-        if reset_mask is not None and reset_mask.any():
+        # Reset scan carries at doc boundaries (has_reset pre-computed on CPU)
+        if has_reset and reset_mask is not None:
             self._reset_carries(reset_mask)
 
         # ==========================================
@@ -109,7 +110,7 @@ class V8Model(nn.Module):
         # ==========================================
         self._ensure_memory(BS, device, dtype)
 
-        if not self.config.lifelong_mode and reset_mask is not None and reset_mask.any():
+        if not self.config.lifelong_mode and has_reset and reset_mask is not None:
             self._mem_graph.reset_streams(reset_mask)
 
         # CC signals from lower scan (detached for memory graph input)
@@ -176,36 +177,16 @@ class V8Model(nn.Module):
         logits = self.lm.forward_output(H)
 
         # ==========================================
-        # Per-segment RL data collection (rewards computed here, returns computed later)
+        # Collect RL data (CE computed once in trainer, passed back here)
         # ==========================================
         rl_data = None
-        if target_ids is not None:
-            reward_mask = (~eot_at).to(dtype=dtype)
-            with torch.no_grad():
-                per_token_ce = F.cross_entropy(
-                    logits.detach().reshape(-1, self.config.vocab_size),
-                    target_ids.reshape(-1),
-                    reduction='none',
-                ).reshape(BS, T)
-
-                # Per-segment CE losses: [BS, n_segments]
-                seg_ce = per_token_ce.view(BS, n_segments, action_every)
-                seg_mask = reward_mask.view(BS, n_segments, action_every)
-                seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
-
-                # Per-segment rewards (negative loss = reward)
-                seg_rewards = -seg_losses  # [BS, n_segments]
-
-                # Chunk-level loss for logging
-                chunk_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
-                loss_val = chunk_loss.item()
-
+        if use_memory:
             rl_data = {
                 "obs": obs_list,              # list of n_segments [BS*N, obs_dim] tensors
                 "actions": actions,           # list of n_segments [BS*N, act_dim] tensors
-                "seg_rewards": seg_rewards,   # [BS, n_segments]
-                "seg_losses": seg_losses.detach(),  # [BS, n_segments] for logging
-                "loss": loss_val,             # scalar chunk loss for logging
+                "eot_at": eot_at,             # [BS, T] for reward masking
+                "n_segments": n_segments,
+                "action_every": action_every,
             }
 
         return {

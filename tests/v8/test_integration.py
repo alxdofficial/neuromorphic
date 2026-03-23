@@ -80,9 +80,10 @@ class TestV8ModelForward:
         n_segments = cfg.T // cfg.action_every
         assert len(rl["actions"]) == n_segments
         assert len(rl["obs"]) == n_segments
-        assert rl["seg_rewards"].shape == (BS, n_segments)
-        assert rl["seg_losses"].shape == (BS, n_segments)
-        assert isinstance(rl["loss"], float)
+        # seg_rewards/seg_losses are now computed by the trainer, not forward_chunk
+        assert rl["n_segments"] == n_segments
+        assert rl["action_every"] == cfg.action_every
+        assert rl["eot_at"].shape == (BS, cfg.T)
 
     def test_compute_rl_advantages(self):
         """compute_rl_advantages should produce valid advantages from collected chunks."""
@@ -91,13 +92,28 @@ class TestV8ModelForward:
         model.initialize_states(BS, torch.device("cpu"))
         n_segments = cfg.T // cfg.action_every
 
-        # Collect 2 chunks
+        # Collect 2 chunks, simulating trainer's CE → reward derivation
         collected = []
         for _ in range(2):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
-            collected.append(result["rl_data"])
+            rl = result["rl_data"]
+            # Derive rewards from CE (same as trainer does)
+            logits = result["logits"]
+            with torch.no_grad():
+                ce = F.cross_entropy(
+                    logits.detach().reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none',
+                ).reshape(BS, cfg.T)
+                mask = (~rl["eot_at"]).float()
+                seg_ce = ce.view(BS, n_segments, cfg.action_every)
+                seg_mask = mask.view(BS, n_segments, cfg.action_every)
+                seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                rl["seg_rewards"] = -seg_losses
+                rl["seg_losses"] = seg_losses
+                rl["loss"] = ce.mean().item()
+            collected.append(rl)
 
         combined = model.compute_rl_advantages(collected)
         total_seg = n_segments * 2
@@ -115,13 +131,27 @@ class TestV8ModelForward:
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        # Collect and compute advantages
+        # Collect and compute advantages (simulate trainer's CE → reward step)
         collected = []
+        n_segments = cfg.T // cfg.action_every
         for _ in range(cfg.rl_collect_chunks):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
-            collected.append(result["rl_data"])
+            rl = result["rl_data"]
+            with torch.no_grad():
+                ce = F.cross_entropy(
+                    result["logits"].detach().reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none',
+                ).reshape(BS, cfg.T)
+                mask = (~rl["eot_at"]).float()
+                seg_ce = ce.view(BS, n_segments, cfg.action_every)
+                seg_mask = mask.view(BS, n_segments, cfg.action_every)
+                seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                rl["seg_rewards"] = -seg_losses
+                rl["seg_losses"] = seg_losses
+                rl["loss"] = ce.mean().item()
+            collected.append(rl)
 
         combined = model.compute_rl_advantages(collected)
         model.replay_for_neuromod_grads(combined, amp_enabled=False)

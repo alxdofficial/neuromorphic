@@ -9,6 +9,7 @@ Each step:
    with learned value baseline, then neuromod backward
 """
 
+import math
 import time
 
 import torch
@@ -76,10 +77,11 @@ class V8Trainer:
 
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
-        prev_token = batch.prev_token.to(self.device, non_blocking=True)
 
+        # Compute reset_mask on CPU first (avoids GPU-CPU sync from .any())
         eot_id = self.config.eot_id
-        reset_mask = (prev_token == eot_id)
+        has_reset = (batch.prev_token == eot_id).any().item()  # CPU check, no sync
+        reset_mask = batch.prev_token.to(self.device, non_blocking=True) == eot_id
 
         t_start = time.time()
 
@@ -96,6 +98,7 @@ class V8Trainer:
                 input_ids, target_ids=target_ids,
                 reset_mask=reset_mask,
                 use_memory=self.use_memory,
+                has_reset=has_reset,
             )
 
         logits = result["logits"]
@@ -103,18 +106,16 @@ class V8Trainer:
         rl_data = result["rl_data"]
 
         # ==========================================
-        # LM loss + backward
+        # CE loss (computed ONCE, used for both LM backward and RL rewards)
         # ==========================================
-        is_eot = (input_ids == eot_id)
-        loss_mask = ~is_eot
-
         ce_per_token = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size),
             target_ids.reshape(-1),
             reduction='none',
         ).reshape(BS, T)
 
-        valid_mask = loss_mask.float()
+        is_eot = (input_ids == eot_id)
+        valid_mask = (~is_eot).float()
         valid_count = valid_mask.sum().clamp(min=1.0)
         ce_loss = (ce_per_token * valid_mask).sum() / valid_count
 
@@ -130,17 +131,32 @@ class V8Trainer:
             self.scheduler.step()
 
         # ==========================================
-        # Neuromodulator: accumulate RL data, update every N chunks
+        # Neuromodulator: derive RL rewards from the same CE, accumulate
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:
+            # Compute per-segment rewards from the shared per-token CE
+            with torch.no_grad():
+                n_segments = rl_data["n_segments"]
+                action_every = rl_data["action_every"]
+                eot_at = rl_data["eot_at"]
+                reward_mask = (~eot_at).to(dtype=ce_per_token.dtype)
+
+                seg_ce = ce_per_token.detach().view(BS, n_segments, action_every)
+                seg_mask = reward_mask.view(BS, n_segments, action_every)
+                seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
+                seg_rewards = -seg_losses
+
+            rl_data["seg_rewards"] = seg_rewards
+            rl_data["seg_losses"] = seg_losses.detach()
+            rl_data["loss"] = ce_loss.item()
             self._rl_buffer.append(rl_data)
 
-            # Per-chunk logging (always available)
+            # Per-chunk logging
             rl_metrics = {
                 "rl_loss": rl_data["loss"],
-                "rl_seg_loss_first": rl_data["seg_losses"][:, 0].mean().item(),
-                "rl_seg_loss_last": rl_data["seg_losses"][:, -1].mean().item(),
+                "rl_seg_loss_first": seg_losses[:, 0].mean().item(),
+                "rl_seg_loss_last": seg_losses[:, -1].mean().item(),
             }
 
             # Update neuromod when buffer is full
@@ -209,7 +225,7 @@ class V8Trainer:
         tok_per_s = BS * T / elapsed
 
         loss_val = ce_loss.item()
-        ppl = min(torch.exp(ce_loss.detach()).item(), 1e6)
+        ppl = min(math.exp(loss_val), 1e6)  # compute on CPU, avoid extra GPU kernel
         lr = self.lm_optimizer.param_groups[0]["lr"]
 
         nm_lr = (self.neuromod_optimizer.param_groups[0]["lr"]

@@ -134,11 +134,15 @@ def main():
     if args.no_memory:
         print("\n*** MEMORY DISABLED — LM-only baseline ***")
 
-    # Compile
+    # Compile individual methods (not the module — we call named methods, not forward())
     if config.use_compile and device.type == "cuda":
-        print("Compiling model...")
-        model.lm = torch.compile(model.lm)
-        model.neuromod = torch.compile(model.neuromod)
+        print("Compiling model methods...")
+        model.lm.forward_scan_lower = torch.compile(model.lm.forward_scan_lower)
+        model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
+        model.lm.forward_output = torch.compile(model.lm.forward_output)
+        model.neuromod.get_action_and_value = torch.compile(
+            model.neuromod.get_action_and_value)
+        model.neuromod.get_value = torch.compile(model.neuromod.get_value)
 
     # LM Optimizer — exclude biases and norms from weight decay
     decay_params = []

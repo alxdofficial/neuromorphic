@@ -206,6 +206,7 @@ class MemoryGraph:
 
         # Plasticity tracking
         self._plasticity_rewires = 0  # cumulative rewired connections
+        self._co_activation_ready = False  # set True after first phi update
 
         # Cached adjacency matrix (rebuilt when conn_weights change)
         self._adjacency_dirty = True
@@ -456,6 +457,7 @@ class MemoryGraph:
         phi_mean = phi.mean(dim=0).float()  # [N, N]
         ca_decay = self.config.co_activation_ema_decay
         self.co_activation_ema = ca_decay * self.co_activation_ema + (1 - ca_decay) * phi_mean
+        self._co_activation_ready = True
 
     def _build_adjacency(self) -> Tensor:
         """Build dense adjacency matrix from sparse connectivity.
@@ -526,8 +528,8 @@ class MemoryGraph:
         explore_frac = self.config.plasticity_exploration_frac
         phi = self.co_activation_ema  # [N, N]
 
-        # Skip if co-activation hasn't been measured yet
-        if phi.abs().max() < 1e-10:
+        # Skip if co-activation hasn't been measured yet (use flag, no GPU sync)
+        if not self._co_activation_ready:
             return
 
         # For each neuron, get phi values of its existing connections
@@ -540,11 +542,13 @@ class MemoryGraph:
 
         # Only prune neurons that have at least one anti-correlated connection
         prune_mask = worst_phi < 0  # [N] bool
-        if not prune_mask.any():
+        prune_neurons = prune_mask.nonzero(as_tuple=True)[0]  # indices of neurons to rewire
+
+        # No neurons to prune — let vectorized ops handle empty tensors
+        if prune_neurons.shape[0] == 0:
             return
 
-        n_prune = prune_mask.sum().item()
-        prune_neurons = prune_mask.nonzero(as_tuple=True)[0]  # indices of neurons to rewire
+        n_prune = prune_neurons.shape[0]
 
         # Build mask of existing connections for pruning neurons [n_prune, N]
         existing_mask = torch.zeros(n_prune, N, dtype=torch.bool, device=self.device)
@@ -630,9 +634,7 @@ class MemoryGraph:
         Args:
             mask: [BS] bool — True for elements to reset
         """
-        if not mask.any():
-            return
-
+        # Caller pre-checks has_reset on CPU — no GPU sync needed here.
         # Only reset dynamic state at document boundaries.
         # Structural state (primitives, conn_weights, decay, plasticity metrics,
         # co_activation_ema) is preserved.

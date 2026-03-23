@@ -4,9 +4,9 @@
 Automatically finds max batch size, then measures throughput.
 
 Usage:
-    python scripts/benchmark_v8.py                     # full v8 with memory, K=4
+    python scripts/benchmark_v8.py                     # full v8 with memory
     python scripts/benchmark_v8.py --no-memory         # LM-only baseline
-    python scripts/benchmark_v8.py --k 2 --no-compile  # fewer samples, no compile
+    python scripts/benchmark_v8.py --no-compile        # disable torch.compile
     python scripts/benchmark_v8.py --bs 4              # force batch size (skip auto)
 """
 
@@ -35,6 +35,16 @@ def cleanup():
         torch.cuda.reset_peak_memory_stats()
 
 
+def compile_model(model):
+    """Compile individual methods (not module-level — we call named methods, not forward())."""
+    model.lm.forward_scan_lower = torch.compile(model.lm.forward_scan_lower)
+    model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
+    model.lm.forward_output = torch.compile(model.lm.forward_output)
+    model.neuromod.get_action_and_value = torch.compile(
+        model.neuromod.get_action_and_value)
+    model.neuromod.get_value = torch.compile(model.neuromod.get_value)
+
+
 def make_batch(bs, T, device):
     return StreamBatch(
         input_ids=torch.randint(0, 32000, (bs, T), device=device),
@@ -43,7 +53,7 @@ def make_batch(bs, T, device):
     )
 
 
-def try_bs(model, cfg, device, bs, use_memory, compile_model):
+def try_bs(model, cfg, device, bs, use_memory, use_compile):
     """Try a batch size. Returns True if it fits, False if OOM."""
     cleanup()
     try:
@@ -118,7 +128,8 @@ def main():
     p.add_argument("--bs", type=int, default=None, help="Force batch size (skip auto)")
     p.add_argument("--no-memory", action="store_true")
     p.add_argument("--no-compile", action="store_true")
-    p.add_argument("--no-grad-ckpt", action="store_true")
+    p.add_argument("--grad-ckpt", action="store_true",
+                   help="Enable gradient checkpointing (off by default, matching training)")
     args = p.parse_args()
 
     torch.set_float32_matmul_precision("high")
@@ -131,14 +142,14 @@ def main():
 
     cfg = V8Config.tier_a(
         vocab_size=32000,
-        gradient_checkpointing=not args.no_grad_ckpt,
+        gradient_checkpointing=args.grad_ckpt,
     )
     cfg.validate()
 
     print(f"GPU: {gpu} ({vram_total:.1f}GB)")
     print(f"Config: D={cfg.D}, L={cfg.L_total}, neurons={cfg.N_neurons}")
     print(f"T={cfg.T}, memory={'ON' if use_memory else 'OFF'}, "
-          f"compile={use_compile}, grad_ckpt={not args.no_grad_ckpt}")
+          f"compile={use_compile}, grad_ckpt={args.grad_ckpt}")
 
     model = V8Model(cfg).to(device).to(torch.bfloat16)
     params = model.param_count()
@@ -146,8 +157,7 @@ def main():
 
     if use_compile:
         print("Compiling...", flush=True)
-        model.lm = torch.compile(model.lm)
-        model.neuromod = torch.compile(model.neuromod)
+        compile_model(model)
 
     # Find max BS
     if args.bs is not None:
@@ -157,13 +167,11 @@ def main():
         print("Finding max batch size...", flush=True)
         bs = 1
         for candidate in BS_CANDIDATES:
-            # Recreate model for each try — OOM can corrupt state
             del model
             cleanup()
             model = V8Model(cfg).to(device).to(torch.bfloat16)
             if use_compile:
-                model.lm = torch.compile(model.lm)
-                model.neuromod = torch.compile(model.neuromod)
+                compile_model(model)
             if try_bs(model, cfg, device, candidate, use_memory, use_compile):
                 bs = candidate
                 break
@@ -175,8 +183,7 @@ def main():
     model = V8Model(cfg).to(device).to(torch.bfloat16)
     if use_compile:
         print("Compiling...", flush=True)
-        model.lm = torch.compile(model.lm)
-        model.neuromod = torch.compile(model.neuromod)
+        compile_model(model)
 
     # Benchmark
     print(f"\nBenchmarking BS={bs}...", flush=True)
