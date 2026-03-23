@@ -200,8 +200,8 @@ feature computation mechanism.
 to our structural plasticity. Both: start with random sparse connectivity, prune
 low-magnitude connections, regrow randomly. Key differences: SET operates on model weights
 during training; our plasticity operates on memory graph connections during inference. SET
-prunes by magnitude alone; our pruning is driven by the neuromodulator. We track flow EMA
-and co-activation correlation as utility metrics that SET lacks.
+prunes by magnitude alone; our pruning is driven by co-activation statistics (phi
+coefficient). We track temporal co-firing patterns and prune anti-correlated connections.
 
 **RigL** (Evci et al., 2020) improves SET with gradient-guided regrowth (activate
 connections with largest gradient on absent weights). More informed than random regrowth
@@ -239,7 +239,7 @@ within autograd; ours are fixed dynamics modulated by RL.
 |--------|-------------------|----------------------|
 | Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Full per-neuron RL control: primitives, weights, decay, topology |
 | Per-neuron RL neuromodulation (225 dims × 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron actions, non-differentiable, controls structure not just plasticity rate |
-| RL-driven structural plasticity | SET/RigL (magnitude/gradient pruning) | Neuromod drives weights → prune threshold, informed by flow/correlation metrics |
+| Co-activation structural plasticity | SET/RigL (magnitude/gradient pruning) | Phi coefficient (binary Pearson) drives prune/grow, no magic thresholds |
 | Memory as RL environment (not differentiable module) | All of Category 2 is differentiable | Explicit design choice: memory outside autograd |
 | Per-column predictive coding in scan-based LM | Rao & Ballard (visual cortex theory) | Applied as architectural component in a language model |
 | Scan backbone + persistent neuron graph | Mamba/HGRN (scan only, no graph memory) | Complementary memory system with different dynamics |

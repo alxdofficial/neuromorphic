@@ -3,34 +3,39 @@
 ## v8 (Neural Memory Graph) — Current
 
 ```bash
-# Full v8: scan stack + per-token memory graph + RL neuromodulator
-python -u -m src.v8.train --bs 8 --steps 10000
+# Full v8: split-scan + per-token memory graph + RL neuromodulator
+python -u -m src.v8.train --bs 12 --steps 61035
 
 # LM-only baseline: scan stack only, no memory
-python -u -m src.v8.train --bs 8 --steps 10000 --no-memory
+python -u -m src.v8.train --bs 12 --steps 61035 --no-memory
 ```
 
 ### Architecture
 
-Single-pass scan stack (7 layers, D=2048) with per-token memory graph:
-- **Scan**: all 7 layers + per-CC PCM -> H, surprise (parallel over T=2048, once)
+Split-scan with mid-scan memory injection:
+- **Lower scan**: layers 0-3 + per-CC PCM (surprise + gain modulation)
 - **Memory**: 8 segments of 256 tokens, per-token neuron loop (receive -> integrate -> message)
-- **Output**: logits = output_head(H + gate * mem_signal) — cheap, position-wise
-- **RL**: per-segment REINFORCE with discounted returns, batch-mean baseline
+- **Inject**: H_enriched = H_mid + gate * mem_signals (mid-scan, not end)
+- **Upper scan**: layers 4-6 on memory-enriched representations
+- **Output**: proj_down -> LayerNorm -> lm_head
+- **RL**: per-segment REINFORCE with discounted returns, entropy bonus, LR schedule
 
 ### Config (Tier A)
 
 | | Value |
 |---|---|
 | Total params | ~103M |
-| Scan layers | 7 (shared, full D=2048, single pass) |
-| Memory neurons | 1024, 96 presynaptic connections each |
+| Lower scan | layers 0-3 (D=2048, d_inner=1024) |
+| Upper scan | layers 4-6 |
+| PCM | at split point, learnable gain_scale |
+| Memory neurons | 1024, 96 presynaptic connections, L1-normalized weights |
 | action_every | 256 tokens (8 segments per chunk) |
 | D_mem = D_cc | 128 |
-| Neuromodulator | 3-layer MLP hidden=2048, ~10M params (actor only) |
+| Neuromodulator | 3-layer MLP hidden=2048, obs=387, act=225 |
 | T (chunk) | 2048 tokens |
-| RL | Per-segment REINFORCE, discounted returns (gamma=0.99), 8 actions/chunk |
-| Throughput | ~42K tok/s with memory, ~85K without (RTX 4090, BS=4) |
+| RL | Per-segment REINFORCE, gamma=0.99, entropy bonus 0.01 |
+| Neuromod LR | 3e-4 with warmup + cosine decay to 10% |
+| Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
 
 ### CLI Options
 
@@ -44,32 +49,37 @@ Single-pass scan stack (7 layers, D=2048) with per-token memory graph:
 --lr FLOAT         # Learning rate (default 3e-4)
 --save-dir PATH    # Output directory (default outputs/v8)
 --save-interval N  # Checkpoint interval (default 5000)
+--keep-checkpoints N  # Keep only last N checkpoints (default 3)
+--snapshot-interval N # Memory graph snapshot interval (default 1000)
 ```
 
 ### Outputs
 
 All outputs go to `outputs/v8/<run_id>/`:
-- `v8_step{N}.pt` — checkpoints
-- `metrics.jsonl` — per-step metrics (loss, ppl, tok/s, RL stats)
+- `v8_step{N}.pt` — checkpoints (LM + neuromod + memory graph state)
+- `metrics.jsonl` — per-step metrics (loss, ppl, tok/s, RL, memory graph health)
 - `config.json` — run configuration
+- `plots/` — auto-generated training curves, RL curves, memory health
+- `snapshots/` — periodic memory graph state dumps (~1.4MB each)
 
----
-
-## v7 (Single Scan Stack) — Previous
+### Analysis
 
 ```bash
-python -u -m src.train --tier a --phase A --bs 16 --compile
+# Plot training curves from metrics
+python -m scripts.plot_training outputs/v8/<run_id>/
+
+# Deep per-token memory analysis from checkpoint
+python -m scripts.analyze_memory outputs/v8/<run_id>/v8_step*.pt
 ```
 
 ---
 
 ## Data Pipeline
 
-Download The Pile locally before training:
+The Pile via HuggingFace streaming or pre-tokenized .bin shards:
 
 ```bash
 python scripts/prepare_data.py --tokens 12B --seed 42
-cat data/pile/manifest.json
 ```
 
 ## General Notes

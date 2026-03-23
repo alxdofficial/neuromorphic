@@ -66,7 +66,7 @@ cosine similarity lookup, no discrete read/write schedule. Instead:
 | Memory as activation | Neurons firing through weighted connections | Neural memory graph: h + messages through A |
 | Per-token dynamics | Neurons fire and exchange signals continuously | Sequential loop: receive -> integrate -> message |
 | Neuromodulated plasticity | Dopamine/ACh gate learning rate | RL-trained policy modifies neuron state |
-| Stable signal propagation | Balanced excitation/inhibition | Mean-normalized message passing |
+| Stable signal propagation | Balanced excitation/inhibition | L1-normalized connection weights (energy conservation) |
 | Predictive coding | Cortical prediction error signals | PCM: vector surprise per feature group |
 
 ### What We Don't Take from the Brain
@@ -88,34 +88,36 @@ temporal patterns in a neural population's short time window.
 
 ## How It Works (v8)
 
-### Single-Pass Scan + Per-Token Memory Graph
+### Split-Scan + Per-Token Memory Graph
 
 ```
-Scan: All scan layers over T=2048 tokens (parallel, once)
-      -> Build representation H, compute per-CC surprise
+Lower scan: layers 0-3 over T=2048 tokens (parallel)
+PCM: surprise + learnable gain modulation (at split point)
 
 Memory: Per-token neuron dynamics (sequential, every token):
   For each token:
     1. RECEIVE: each neuron gets weighted sum of presynaptic messages
-       Port neurons also get CC signal from the LM
+       Port neurons also get CC signal from the LM (gain-modulated)
     2. INTEGRATE: h = decay * h + (1-decay) * received
     3. MESSAGE: message = tanh(h * primitives)
   Port neuron messages -> mem_signals
 
-Output: logits = output_head(H + gate * mem_signals)
+Inject: H_enriched = H_mid + gate * mem_signals (mid-scan)
+Upper scan: layers 4-6 over H_enriched (parallel)
+Output: logits = output_head(H_final)
 ```
 
-The LM scan runs at full GPU efficiency. Memory runs a sequential per-token loop
-with one bmm per token for message routing. Signals propagate through the graph
+The scan is split so upper layers see memory-enriched representations. Memory
+runs a sequential per-token loop with one bmm per token. Signals propagate
 hop-by-hop — K tokens = K hops of inter-neuron communication.
 
 ### Neuromodulator as RL Agent
 
-The neuromodulator observes each neuron's state (primitive, activity stats,
-routing entropy, plasticity metrics) and outputs modifications to primitives,
-connection weights, and decay. Trained via per-segment REINFORCE with discounted
-returns — each of 8 segments gets its own reward, enabling per-action credit
-assignment.
+The neuromodulator observes each neuron's state (primitive, mean activity,
+firing rate, decay, routing entropy) and outputs modifications to primitives,
+connection weight distribution, and decay. Trained via per-segment REINFORCE
+with discounted returns and entropy bonus — each of 8 segments gets its own
+reward. Neuromod LR decays alongside the LM LR.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.
@@ -158,10 +160,10 @@ error (D_cc=128 dims per column) feeds into memory as part of the CC signal,
 telling the memory graph which features were unexpected.
 
 ### 5. Stable Signal Propagation via Graph Structure
-Sparse graph message passing (mean-normalized) provides inter-neuron communication
-without signal explosion. Structural plasticity (prune dead connections, regrow
-random) reshapes the graph over time, driven by flow and co-activation metrics
-that the neuromodulator observes and responds to.
+L1-normalized connection weights (energy conservation) bound signal propagation.
+Structural plasticity (co-activation-based prune + regrow) reshapes the graph
+over time. Anti-correlated connections are pruned; new connections form toward
+neurons with high temporal co-firing (phi coefficient).
 
 ---
 
@@ -205,5 +207,5 @@ In Phase B, long-document perplexity improves as memory accumulates context.
 Memory neurons develop specialization (diverse primitives, structured routing).
 
 ### Hardware: Efficient
-Memory graph adds ~50% overhead vs no-memory baseline. Throughput ~42K tok/s
-with memory at BS=4 on RTX 4090.
+Memory graph roughly halves throughput vs no-memory baseline. ~44K tok/s
+with memory vs ~85K without (RTX 4090, BS=12).

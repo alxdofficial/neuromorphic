@@ -1,13 +1,13 @@
 """V8Model — split-scan + per-token memory graph + per-segment RL.
 
 Training flow per chunk (T=2048 tokens):
-  1. Lower scan (layers 0-3) over T tokens (parallel)
+  1. Lower scan (layers 0-3) + PCM (parallel over T)
   2. Memory graph: per-token receive → integrate → message (sequential)
      Neuromod acts every 256 tokens (8 segments)
   3. Inject: H_enriched = H_mid + gate * mem_signals
-  4. Upper scan (layers 4-6) + PCM over T tokens (parallel)
+  4. Upper scan (layers 4-6) over memory-enriched H (parallel)
   5. Per-segment CE losses, discounted returns, batch-mean baseline
-  6. Replay: log_prob per segment with stored obs, weight by A_t
+  6. Replay: log_prob with entropy bonus, per-step advantages
   Memory is injected MID-SCAN — upper layers see memory-enriched input.
 """
 

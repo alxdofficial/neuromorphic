@@ -56,7 +56,7 @@ The LM reads port neurons' messages at every token as `mem_signals`.
 ### The Neuromodulator (RL Agent)
 
 Every 256 tokens (8 times per 2048-token chunk):
-- Observes all 1024 neurons (391 dims each: primitives, mean activity, decay, entropy, plasticity)
+- Observes all 1024 neurons (387 dims each: primitives, mean activity, decay, entropy, plasticity)
 - Outputs per-neuron actions (225 dims: delta_primitives[128] + delta_conn_weights[96] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
@@ -145,7 +145,7 @@ adds parameters and compute.
 **Q4: Is the action space right?**
 Each action is 225 continuous dims per neuron × 1024 neurons = 230,400 total action
 dimensions per step. The policy outputs are sampled from a Gaussian with learned std.
-The action is clamped to ±0.3. Questions:
+The action is clamped to ±1.0 (L1 normalization bounds the effect). Questions:
 - Is 128 dims of delta_primitives too many? Could a lower-rank action suffice?
 - Should conn_weight deltas be per-connection (96 dims) or could we use a shared
   scaling factor (1 dim) to reduce the action space?
@@ -187,17 +187,16 @@ structured, but communicates with the LM through only 16 port neurons.
 
 ### Problem 4: Structural Plasticity — Is It Meaningful?
 
-**Current design**: Every 4 segments (~1024 tokens), connections with |weight| < 0.01
-are pruned and randomly rewired. The neuromod drives weights toward zero for useless
-connections.
+**Current design**: Every 4 segments (~1024 tokens), co-activation-based plasticity runs.
+Connections with negative phi (anti-correlated firing patterns) are pruned. New connections
+form toward the highest-phi unconnected neuron (80%) or random (20%). Connection weights
+are L1-normalized (energy conservation). Vectorized — no Python loop over neurons.
 
-**Concerns**:
-- With random rewiring, there's no guarantee the new connection is better than the old one
-- The prune threshold (0.01) is relative to init scale (0.2), meaning a connection must
-  be pushed to <5% of its init value to be pruned
-- Pruning happens based on batch-averaged weights — individual batch elements can't have
-  different graph topologies
-- The neuromod can only see aggregate plasticity metrics (mean/std/min flow, mean corr)
+**Remaining concerns**:
+- The co-activation EMA (decay=0.995) takes ~200 segments to converge, so early plasticity
+  decisions are based on noisy phi estimates
+- Graph topology is shared across batch elements — can't specialize per document
+- Random exploration (20% of regrowth) may not be enough to discover useful long-range connections
   — it doesn't know WHICH specific connections are useful
 
 ### Problem 5: Document Boundary Semantics

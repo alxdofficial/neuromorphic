@@ -107,5 +107,6 @@ connections get pruned automatically.
 
 ### 8. obs_dim Impact
 
-Replace `usage_count` with `firing_rate` in obs — same shape [BS, N, 1]. obs_dim
-stays at 391. No neuromod architecture change.
+Replace `usage_count` with `firing_rate` in obs. Also removed flow/corr metrics
+(4 dims). obs_dim is now D_mem*3 + 3 = 387 (was 391). Neuromod input layer
+resized accordingly.

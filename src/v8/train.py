@@ -105,7 +105,7 @@ def main():
     T = config.T
     tokens_per_step = bs * T
     print(f"\nConfig: D={config.D}, C={config.C}, D_cc={config.D_cc}")
-    print(f"  Scan: L_total={config.L_total}, d_inner={config.d_inner} (single pass, end-injection)")
+    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, d_inner={config.d_inner}")
     print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
           f"D_mem={config.D_mem}")
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
