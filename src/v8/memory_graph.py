@@ -293,7 +293,7 @@ class MemoryGraph:
             prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
 
             # Track activation magnitude and accumulate for stats
-            act_trace[:, t] = prev_msg.float().norm(dim=-1)
+            act_trace[:, t] = prev_msg.norm(dim=-1).float()
             received_accum += received
             msg_accum += prev_msg
 
@@ -362,8 +362,8 @@ class MemoryGraph:
                 t,
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
-            # Read activation magnitude from updated prev_messages
-            act_trace[:, t] = self.prev_messages.float().norm(dim=-1)
+            # Read activation magnitude from updated prev_messages (avoid dtype cast)
+            act_trace[:, t] = self.prev_messages.norm(dim=-1).float()
 
         # Update running stats (Triton path: use final messages as proxy for mean_output,
         # and use h as proxy for mean_input since h ≈ received after low-decay integration)
@@ -484,6 +484,7 @@ class MemoryGraph:
         80% correlation-guided, 20% random exploration.
 
         Uses the co_activation_ema matrix (updated in _post_segment_stats).
+        Fully vectorized — no Python loop over neurons.
         All thresholds are relative (phi < 0 is a natural boundary, not a magic number).
         """
         N = self.config.N_neurons
@@ -495,58 +496,63 @@ class MemoryGraph:
         if phi.abs().max() < 1e-10:
             return
 
+        # For each neuron, get phi values of its existing connections
+        # conn_indices: [N, K] — gather from phi: [N, N]
+        conn_phi = phi[torch.arange(N, device=self.device).unsqueeze(1),
+                       self.conn_indices]  # [N, K]
+
+        # Find the worst (most anti-correlated) connection per neuron
+        worst_phi, worst_k = conn_phi.min(dim=-1)  # [N], [N]
+
+        # Only prune neurons that have at least one anti-correlated connection
+        prune_mask = worst_phi < 0  # [N] bool
+        if not prune_mask.any():
+            return
+
+        n_prune = prune_mask.sum().item()
+        prune_neurons = prune_mask.nonzero(as_tuple=True)[0]  # indices of neurons to rewire
+
+        # Build mask of existing connections for pruning neurons [n_prune, N]
+        existing_mask = torch.zeros(n_prune, N, dtype=torch.bool, device=self.device)
+        # Scatter existing connections into mask
+        prune_conn_idx = self.conn_indices[prune_neurons]  # [n_prune, K]
+        existing_mask.scatter_(1, prune_conn_idx, True)
+        # Also mask self-connections
+        existing_mask[torch.arange(n_prune, device=self.device), prune_neurons] = True
+
+        # Choose new targets: correlation-guided (best unconnected phi) or random
+        # Mask phi for pruning neurons: [n_prune, N]
+        phi_masked = phi[prune_neurons].clone()  # [n_prune, N]
+        phi_masked[existing_mask] = -float('inf')
+
+        # Best unconnected neuron per pruning neuron
+        best_targets = phi_masked.argmax(dim=-1)  # [n_prune]
+        best_phi = phi_masked[torch.arange(n_prune, device=self.device), best_targets]
+
+        # Random targets for exploration fraction
+        random_targets = torch.randint(0, N, (n_prune,), device=self.device)
+        use_random = torch.rand(n_prune, device=self.device) < explore_frac
+
+        # Fall back to random if no positive-correlation candidate
+        use_random = use_random | (best_phi <= 0)
+
+        new_targets = torch.where(use_random, random_targets, best_targets)
+
+        # Apply rewiring
+        worst_k_for_prune = worst_k[prune_neurons]  # [n_prune]
+        self.conn_indices[prune_neurons, worst_k_for_prune] = new_targets
+
+        # Init new weights to median of each neuron's current |weights|
+        median_w = self.conn_weights[:, prune_neurons].abs().median(dim=-1).values  # [BS, n_prune]
+        self.conn_weights[:, prune_neurons, worst_k_for_prune] = median_w
+
+        # Re-normalize weights after topology change
+        w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        self.conn_weights = self.conn_weights / w_abs_sum
+
         self._adjacency_dirty = True
-        rewired = False
-
-        for j in range(N):
-            existing_indices = self.conn_indices[j]  # [K_conn]
-            existing_set = set(existing_indices.tolist())
-            existing_set.add(j)  # no self-connections
-
-            # Get phi values for existing connections
-            conn_phi = phi[j, existing_indices]  # [K_conn]
-
-            # Find anti-correlated connections (phi < 0) — candidates for pruning
-            anti_corr = (conn_phi < 0).nonzero(as_tuple=True)[0]
-            if len(anti_corr) == 0:
-                continue
-
-            # Prune the most anti-correlated connection (lowest phi)
-            worst_k = anti_corr[conn_phi[anti_corr].argmin()].item()
-
-            # Choose replacement: correlation-guided or random
-            if torch.rand(1).item() < explore_frac:
-                # Random exploration
-                for _ in range(10):
-                    new_target = torch.randint(0, N, (1,), device=self.device).item()
-                    if new_target not in existing_set:
-                        break
-                else:
-                    continue  # couldn't find a non-existing target
-            else:
-                # Correlation-guided: find best non-connected neuron
-                phi_j = phi[j].clone()  # [N]
-                # Mask out existing connections and self
-                for idx in existing_set:
-                    phi_j[idx] = -float('inf')
-                new_target = phi_j.argmax().item()
-                if phi_j[new_target] <= 0:
-                    # No positive-correlation candidates, skip
-                    continue
-
-            # Rewire
-            self.conn_indices[j, worst_k] = new_target
-            existing_set.add(new_target)
-
-            # Init new weight to median of this neuron's current |weights|
-            median_w = self.conn_weights[:, j].abs().median(dim=-1).values  # [BS]
-            self.conn_weights[:, j, worst_k] = median_w
-            rewired = True
-
-        if rewired:
-            # Re-normalize weights after topology change
-            w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            self.conn_weights = self.conn_weights / w_abs_sum
+        if self._triton_ready:
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
             # Update int32 indices for Triton kernel
             if self._triton_ready:
