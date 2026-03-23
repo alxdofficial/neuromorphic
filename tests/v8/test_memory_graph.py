@@ -73,7 +73,7 @@ class TestMemoryGraphInit:
         assert mg.h.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.prev_messages.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.conn_weights.shape == (BS, cfg.N_neurons, cfg.K_connections)
-        assert mg.flow_ema.shape == (BS, cfg.N_neurons, cfg.K_connections)
+        assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
         assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
 
     def test_conn_weights_l1_normalized(self):
@@ -178,18 +178,18 @@ class TestMemoryGraphActions:
 
 
 class TestMemoryGraphPlasticity:
-    def test_flow_ema_updates(self):
+    def test_co_activation_updates(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        flow_before = mg.flow_ema.clone()
+        phi_before = mg.co_activation_ema.clone()
 
         cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
         mg.forward_segment(cc)
 
-        # Flow EMA should have changed (unless all outputs were zero)
-        # Just check it's finite
-        assert torch.isfinite(mg.flow_ema).all()
+        # Co-activation matrix should have changed after a segment
+        assert torch.isfinite(mg.co_activation_ema).all()
+        assert not torch.equal(mg.co_activation_ema, phi_before)
 
     def test_structural_plasticity(self):
         """Co-activation-based plasticity: anti-correlated connections get pruned."""

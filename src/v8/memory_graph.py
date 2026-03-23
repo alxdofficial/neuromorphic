@@ -16,8 +16,7 @@ State (persistent across chunks, outside autograd):
   prev_messages: [BS, N, D_mem] — last outgoing messages
 
 Plasticity metrics:
-  flow_ema: [BS, N, K_conn] — EMA of signal flow magnitude
-  corr_ema: [BS, N, K_conn] — EMA of co-activation correlation
+  co_activation_ema: [N, N] — phi coefficient matrix for structural plasticity
 """
 
 import torch
@@ -188,12 +187,6 @@ class MemoryGraph:
         # [N, N] — not per-batch, topology is shared
         self.co_activation_ema = torch.zeros(
             N, N, device=self.device, dtype=torch.float32)
-
-        # Per-connection plasticity metrics
-        self.flow_ema = torch.zeros(
-            BS, N, K_conn, device=self.device, dtype=self.dtype)
-        self.corr_ema = torch.zeros(
-            BS, N, K_conn, device=self.device, dtype=self.dtype)
 
         # Cached adjacency matrix (rebuilt when conn_weights change)
         self._adjacency_dirty = True
@@ -380,9 +373,6 @@ class MemoryGraph:
         """
         alpha = 0.05
 
-        # Per-connection flow/correlation (from final messages)
-        self._update_plasticity_metrics_from_messages(prev_msg)
-
         # Running output stats
         self.mean_output = (1 - alpha) * self.mean_output + alpha * prev_msg
 
@@ -548,25 +538,6 @@ class MemoryGraph:
         # Reshape back: [BS, T, N, D]
         return y_flat.reshape(BS, N, T, D).permute(0, 2, 1, 3)
 
-    def _update_plasticity_metrics_from_messages(self, messages: Tensor):
-        """Update flow and correlation EMAs from neuron messages.
-
-        Args:
-            messages: [BS, N, D] — outgoing messages (last timestep)
-        """
-        ema_decay = self.config.plasticity_ema_decay
-
-        # Gather presynaptic neuron messages
-        neighbor_msg = messages[:, self.conn_indices]  # [BS, N, K_conn, D]
-        w = self.conn_weights.unsqueeze(-1)  # [BS, N, K_conn, 1]
-
-        flow = (w * neighbor_msg).abs().mean(dim=-1)  # [BS, N, K_conn]
-        self.flow_ema = ema_decay * self.flow_ema + (1 - ema_decay) * flow
-
-        my_msg = messages.unsqueeze(2).expand_as(neighbor_msg)  # [BS, N, K_conn, D]
-        corr = (my_msg * neighbor_msg).mean(dim=-1)  # [BS, N, K_conn]
-        self.corr_ema = ema_decay * self.corr_ema + (1 - ema_decay) * corr
-
     @torch.no_grad()
     def apply_actions(self, delta_primitives: Tensor,
                       delta_conn_weights: Tensor,
@@ -658,8 +629,6 @@ class MemoryGraph:
             # Init new weight to median of this neuron's current |weights|
             median_w = self.conn_weights[:, j].abs().median(dim=-1).values  # [BS]
             self.conn_weights[:, j, worst_k] = median_w
-            self.flow_ema[:, j, worst_k] = 0
-            self.corr_ema[:, j, worst_k] = 0
             rewired = True
 
         if rewired:
@@ -692,19 +661,13 @@ class MemoryGraph:
         entropy = -(w_abs * (w_abs + eps).log()).sum(dim=-1, keepdim=True)
         parts.append(entropy)  # [BS, N, 1]
 
-        # Plasticity metrics (use correction=0 for population std, avoids NaN)
-        parts.append(self.flow_ema.mean(dim=-1, keepdim=True))                     # [BS, N, 1]
-        parts.append(self.flow_ema.std(dim=-1, keepdim=True, correction=0))        # [BS, N, 1]
-        parts.append(self.corr_ema.mean(dim=-1, keepdim=True))                     # [BS, N, 1]
-        parts.append(self.flow_ema.min(dim=-1, keepdim=True)[0])                   # [BS, N, 1]
-
         return torch.cat(parts, dim=-1)
 
     @property
     def obs_dim(self) -> int:
         """Observation dimension for neuromodulator."""
-        # D_mem*3 + 2 (firing_rate, decay) + 1 (entropy) + 4 (plasticity metrics)
-        return self.config.D_mem * 3 + 7
+        # D_mem*3 + 2 (firing_rate, decay) + 1 (entropy)
+        return self.config.D_mem * 3 + 3
 
     @torch.no_grad()
     def reset_streams(self, mask: Tensor):
@@ -747,8 +710,6 @@ class MemoryGraph:
             'activation_std_ema': self.activation_std_ema,
             'firing_rate': self.firing_rate,
             'co_activation_ema': self.co_activation_ema,
-            'flow_ema': self.flow_ema,
-            'corr_ema': self.corr_ema,
         }
         return state
 

@@ -33,7 +33,7 @@ class V8Model(nn.Module):
         self.lm = V8LM(config)
 
         self._mem_graph = None
-        obs_dim = config.D_mem * 3 + 7  # prim+mean_in+mean_out + usage+decay+entropy + 4 plasticity
+        obs_dim = config.D_mem * 3 + 3  # prim+mean_in+mean_out + firing_rate+decay+entropy
         self.neuromod = Neuromodulator(config, obs_dim)
 
         # RL discount factor for per-segment returns

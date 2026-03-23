@@ -62,10 +62,8 @@ class V8Diagnostics:
             metrics["mem_decay_mean"] = round(decay.mean().item(), 4)
             metrics["mem_decay_std"] = round(decay.std().item(), 4)
 
-            # Firing rate and plasticity
+            # Firing rate
             metrics["mem_firing_rate"] = round(mg.firing_rate.mean().item(), 4)
-            metrics["mem_flow_mean"] = round(mg.flow_ema.mean().item(), 6)
-            metrics["mem_corr_mean"] = round(mg.corr_ema.mean().item(), 6)
 
             # Co-activation stats (phi coefficient matrix)
             phi = mg.co_activation_ema
@@ -101,9 +99,6 @@ class V8Diagnostics:
 
             # Connection weight distribution per neuron [N, K]
             snapshot["cw_per_neuron"] = mg.conn_weights.mean(dim=0).cpu()
-            snapshot["flow_per_neuron"] = mg.flow_ema.mean(dim=0).cpu()
-            snapshot["corr_per_neuron"] = mg.corr_ema.mean(dim=0).cpu()
-
             # Connectivity structure [N, K] — topology doesn't change often
             snapshot["conn_indices"] = mg.conn_indices.cpu()
 
