@@ -34,6 +34,7 @@ class V8Config:
     co_activation_ema_decay: float = 0.995  # slow EMA for co-activation matrix
     structural_plasticity_every: int = 4    # segments between prune-regrow (twice per chunk)
     plasticity_exploration_frac: float = 0.2  # fraction of regrowth that's random
+    activation_std_init: float = 0.1         # initial activation_std_ema (firing threshold warmup)
 
     # Neuromodulator
     neuromod_hidden: int = 1024
@@ -43,6 +44,11 @@ class V8Config:
 
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
+    neuromod_logstd_init: float = -2.0  # initial log_std for policy (exp(-2)≈0.135)
+    rl_collect_chunks: int = 2   # chunks to collect before RL update (longer horizon)
+    rl_gamma: float = 0.99       # discount factor for returns
+    rl_entropy_coef: float = 0.01  # entropy bonus coefficient
+    rl_value_hidden: int = 256   # value function hidden dim
 
     # Training
     T: int = 2048                # full chunk length

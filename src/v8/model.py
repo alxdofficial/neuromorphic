@@ -1,4 +1,4 @@
-"""V8Model — split-scan + per-token memory graph + per-segment RL.
+"""V8Model — split-scan + per-token memory graph + RL neuromodulator.
 
 Training flow per chunk (T=2048 tokens):
   1. Lower scan (layers 0-3) + PCM (parallel over T)
@@ -6,9 +6,13 @@ Training flow per chunk (T=2048 tokens):
      Neuromod acts every 256 tokens (8 segments)
   3. Inject: H_enriched = H_mid + gate * mem_signals
   4. Upper scan (layers 4-6) over memory-enriched H (parallel)
-  5. Per-segment CE losses, discounted returns, batch-mean baseline
-  6. Replay: log_prob with entropy bonus, per-step advantages
-  Memory is injected MID-SCAN — upper layers see memory-enriched input.
+  5. Per-segment CE losses → rewards collected
+
+RL update (every rl_collect_chunks chunks):
+  6. Concatenate segment data across collected chunks
+  7. Discounted returns with value bootstrap at end
+  8. Advantages = returns - V(global_state) (learned value baseline)
+  9. Policy gradient + value function MSE loss
 """
 
 import torch
@@ -33,11 +37,10 @@ class V8Model(nn.Module):
         self.lm = V8LM(config)
 
         self._mem_graph = None
-        obs_dim = config.D_mem * 3 + 3  # prim+mean_in+mean_out + firing_rate+decay+entropy
+        # obs_dim derived from config (matches MemoryGraph.obs_dim property)
+        obs_dim = config.D_mem * 3 + 3  # prim + mean_in + mean_out + firing_rate + decay + entropy
         self.neuromod = Neuromodulator(config, obs_dim)
-
-        # RL discount factor for per-segment returns
-        self._rl_gamma = 0.99
+        self._obs_dim = obs_dim
 
         # Structural plasticity counter (segments processed)
         self._segment_counter = 0
@@ -167,7 +170,7 @@ class V8Model(nn.Module):
         logits = self.lm.forward_output(H)
 
         # ==========================================
-        # Per-segment RL: dense rewards + discounted returns
+        # Per-segment RL data collection (rewards computed here, returns computed later)
         # ==========================================
         rl_data = None
         if target_ids is not None:
@@ -187,19 +190,6 @@ class V8Model(nn.Module):
                 # Per-segment rewards (negative loss = reward)
                 seg_rewards = -seg_losses  # [BS, n_segments]
 
-                # Discounted returns: G_t = r_t + gamma*r_{t+1} + ... + gamma^(H-1-t)*r_{H-1}
-                gamma = self._rl_gamma
-                returns = torch.zeros_like(seg_rewards)  # [BS, n_segments]
-                returns[:, -1] = seg_rewards[:, -1]
-                for t in range(n_segments - 2, -1, -1):
-                    returns[:, t] = seg_rewards[:, t] + gamma * returns[:, t + 1]
-
-                # Batch-mean baseline per step: [n_segments]
-                baseline = returns.mean(dim=0)
-
-                # Per-step advantage: [BS, n_segments]
-                advantages = returns - baseline.unsqueeze(0)
-
                 # Chunk-level loss for logging
                 chunk_loss = (per_token_ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
                 loss_val = chunk_loss.item()
@@ -207,7 +197,7 @@ class V8Model(nn.Module):
             rl_data = {
                 "obs": obs_list,              # list of n_segments [BS*N, obs_dim] tensors
                 "actions": actions,           # list of n_segments [BS*N, act_dim] tensors
-                "advantages": advantages,     # [BS, n_segments]
+                "seg_rewards": seg_rewards,   # [BS, n_segments]
                 "seg_losses": seg_losses.detach(),  # [BS, n_segments] for logging
                 "loss": loss_val,             # scalar chunk loss for logging
             }
@@ -219,29 +209,107 @@ class V8Model(nn.Module):
             "rl_data": rl_data,
         }
 
+    def compute_rl_advantages(
+        self, collected_rl_data: list[dict],
+    ) -> dict:
+        """Compute returns and advantages across collected chunks.
+
+        Concatenates segment data from multiple chunks, computes discounted
+        returns with value function bootstrap at the end, and uses the learned
+        value function as baseline for advantages.
+
+        Args:
+            collected_rl_data: list of per-chunk rl_data dicts
+
+        Returns:
+            Combined rl_data dict with obs, actions, advantages, and global_obs
+            ready for replay_for_neuromod_grads.
+        """
+        # Concatenate across chunks
+        all_obs = []
+        all_actions = []
+        all_seg_rewards = []
+        all_global_obs = []
+
+        N_neurons = self.config.N_neurons
+
+        for chunk_data in collected_rl_data:
+            all_obs.extend(chunk_data["obs"])         # each is [BS*N, obs_dim]
+            all_actions.extend(chunk_data["actions"])  # each is [BS*N, act_dim]
+            all_seg_rewards.append(chunk_data["seg_rewards"])  # [BS, n_seg]
+
+            # Compute global obs (mean-pooled across neurons) for each segment
+            for obs_t in chunk_data["obs"]:
+                BS = obs_t.shape[0] // N_neurons
+                global_t = obs_t.reshape(BS, N_neurons, -1).mean(dim=1)  # [BS, obs_dim]
+                all_global_obs.append(global_t)
+
+        # seg_rewards: [BS, total_segments]
+        seg_rewards = torch.cat(all_seg_rewards, dim=1)
+        BS = seg_rewards.shape[0]
+        total_segments = seg_rewards.shape[1]
+        device = seg_rewards.device
+        gamma = self.config.rl_gamma
+
+        # Global obs for value function: [total_segments, BS, obs_dim]
+        global_obs_stack = torch.stack(all_global_obs)  # [total_seg, BS, obs_dim]
+
+        with torch.no_grad():
+            # Value predictions at each segment: [total_seg, BS]
+            global_obs_flat = global_obs_stack.reshape(-1, global_obs_stack.shape[-1])
+            # Cast to model dtype (obs may be bf16/f32 depending on autocast)
+            v_dtype = next(self.neuromod.value_net.parameters()).dtype
+            values_flat = self.neuromod.get_value(global_obs_flat.to(v_dtype))
+            values = values_flat.reshape(total_segments, BS).T  # [BS, total_seg]
+
+            # Bootstrap: value of state after the last segment
+            # Use the value at the last segment as an approximation
+            # (ideally we'd have the next state, but the last value is close)
+            v_bootstrap = values[:, -1]  # [BS]
+
+            # Discounted returns with value bootstrap at the end
+            returns = torch.zeros_like(seg_rewards)  # [BS, total_segments]
+            returns[:, -1] = seg_rewards[:, -1] + gamma * v_bootstrap
+            for t in range(total_segments - 2, -1, -1):
+                returns[:, t] = seg_rewards[:, t] + gamma * returns[:, t + 1]
+
+            # Advantages: return - value baseline
+            advantages = returns - values
+
+        return {
+            "obs": all_obs,                    # list of total_seg [BS*N, obs_dim]
+            "actions": all_actions,            # list of total_seg [BS*N, act_dim]
+            "advantages": advantages,          # [BS, total_segments]
+            "returns": returns,                # [BS, total_segments] for value training
+            "global_obs": global_obs_stack,    # [total_seg, BS, obs_dim] for value training
+        }
+
     def replay_for_neuromod_grads(
         self, rl_data: dict,
         amp_enabled: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
-    ) -> float:
-        """Compute policy gradient via replay with per-segment advantages.
+    ) -> dict:
+        """Compute policy gradient + value loss via replay.
 
         Uses stored per-segment obs for accurate log_prob evaluation.
         Each segment's actions are weighted by its own advantage.
+        Also trains the value function on observed returns.
 
         Returns:
-            policy_loss_val: scalar loss value for logging
+            dict with policy_loss, value_loss, entropy for logging
         """
         obs_list = rl_data["obs"]          # list of n_seg [BS*N, obs_dim]
         actions = rl_data["actions"]       # list of n_seg [BS*N, act_dim]
         advantages = rl_data["advantages"] # [BS, n_segments]
+        returns = rl_data["returns"]       # [BS, n_segments]
+        global_obs = rl_data["global_obs"] # [n_seg, BS, obs_dim]
 
         N_neurons = self.config.N_neurons
         BS = actions[0].shape[0] // N_neurons
         device = actions[0].device
         n_segments = len(actions)
 
-        # Batch all segments into single tensors for one forward pass
+        # ---- Policy gradient ----
         all_obs = torch.stack(obs_list)        # [n_seg, BS*N, obs_dim]
         all_actions = torch.stack(actions)      # [n_seg, BS*N, act_dim]
         flat_obs = all_obs.reshape(-1, all_obs.shape[-1])
@@ -260,13 +328,27 @@ class V8Model(nn.Module):
         # Per-segment advantage: [BS, n_seg] → [n_seg, BS, 1] for broadcasting
         adv = advantages.T.unsqueeze(-1)  # [n_seg, BS, 1]
 
-        # Weighted policy loss + entropy bonus to prevent std collapse
+        # Weighted policy loss + entropy bonus
         policy_loss = -(adv * log_prob).mean()
-        entropy_bonus = -0.01 * entropy.mean()  # encourage exploration
-        total_loss = policy_loss + entropy_bonus
+        entropy_bonus = -self.config.rl_entropy_coef * entropy.mean()
+
+        # ---- Value function loss ----
+        global_obs_flat = global_obs.reshape(-1, global_obs.shape[-1])  # [n_seg*BS, obs_dim]
+        v_dtype = next(self.neuromod.value_net.parameters()).dtype
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=amp_enabled):
+            v_pred = self.neuromod.get_value(global_obs_flat.to(v_dtype))  # [n_seg*BS]
+        v_pred = v_pred.reshape(n_segments, BS).T  # [BS, n_seg]
+        value_loss = 0.5 * (v_pred - returns).pow(2).mean()
+
+        total_loss = policy_loss + entropy_bonus + value_loss
         total_loss.backward()
 
-        return policy_loss.item()
+        return {
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "entropy": entropy.mean().item(),
+        }
 
     def _apply_neuromod_action(self, action: Tensor, BS: int):
         """Clamp and apply a neuromod action to the memory graph."""

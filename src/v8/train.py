@@ -111,8 +111,9 @@ def main():
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: per-segment REINFORCE, discounted returns, "
-          f"action_every={config.action_every}")
+    print(f"  RL: REINFORCE + learned value baseline, "
+          f"collect={config.rl_collect_chunks} chunks, "
+          f"action_every={config.action_every}, gamma={config.rl_gamma}")
 
     # Model
     model = V8Model(config)
@@ -173,13 +174,14 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
 
-    # Neuromod LR schedule: same warmup, cosine decay to 10% of initial
+    # Neuromod LR schedule: same warmup, cosine decay to same floor ratio as LM
+    neuromod_lr_floor = LR_MIN / args.lr  # same ratio as LM schedule
     def neuromod_lr_lambda(step):
         if step < args.warmup:
             return step / max(args.warmup, 1)
         progress = (step - args.warmup) / max(args.steps - args.warmup, 1)
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-        return 0.1 + 0.9 * cosine  # decays to 10% of initial LR
+        return neuromod_lr_floor + (1.0 - neuromod_lr_floor) * cosine
 
     neuromod_scheduler = torch.optim.lr_scheduler.LambdaLR(
         neuromod_optimizer, neuromod_lr_lambda)
@@ -255,6 +257,7 @@ def main():
             rl_str = ""
             if "rl_policy_loss" in metrics:
                 rl_str = (f" | rl={metrics['rl_policy_loss']:.4f}"
+                          f" v={metrics.get('rl_value_loss', 0):.4f}"
                           f" adv={metrics.get('rl_adv_mean', 0):.4f}"
                           f"±{metrics.get('rl_adv_std', 0):.4f}")
             mem_str = ""

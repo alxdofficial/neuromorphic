@@ -179,7 +179,7 @@ class MemoryGraph:
         self.activation_ema = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
         self.activation_std_ema = torch.ones(
-            BS, N, device=self.device, dtype=self.dtype) * 0.1  # small positive init
+            BS, N, device=self.device, dtype=self.dtype) * self.config.activation_std_init
         self.firing_rate = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
 
@@ -187,6 +187,9 @@ class MemoryGraph:
         # [N, N] — not per-batch, topology is shared
         self.co_activation_ema = torch.zeros(
             N, N, device=self.device, dtype=torch.float32)
+
+        # Plasticity tracking
+        self._plasticity_rewires = 0  # cumulative rewired connections
 
         # Cached adjacency matrix (rebuilt when conn_weights change)
         self._adjacency_dirty = True
@@ -546,6 +549,9 @@ class MemoryGraph:
         median_w = self.conn_weights[:, prune_neurons].abs().median(dim=-1).values  # [BS, n_prune]
         self.conn_weights[:, prune_neurons, worst_k_for_prune] = median_w
 
+        # Track cumulative rewires
+        self._plasticity_rewires += n_prune
+
         # Re-normalize weights after topology change
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
         self.conn_weights = self.conn_weights / w_abs_sum
@@ -575,7 +581,7 @@ class MemoryGraph:
 
         # Routing entropy from connection weights (L1-normalized, so w_abs sums to 1)
         w_abs = self.conn_weights.abs()
-        eps = torch.tensor(1e-4, dtype=self.dtype, device=self.device)
+        eps = torch.tensor(1e-8, dtype=self.dtype, device=self.device)
         entropy = -(w_abs * (w_abs + eps).log()).sum(dim=-1, keepdim=True)
         parts.append(entropy)  # [BS, N, 1]
 
@@ -609,7 +615,7 @@ class MemoryGraph:
         self.prev_messages = self.prev_messages * keep2
         # Reset firing stats for reset streams (they'll rebuild quickly)
         self.activation_ema = self.activation_ema * keep1
-        self.activation_std_ema = self.activation_std_ema * keep1 + m1 * 0.1
+        self.activation_std_ema = self.activation_std_ema * keep1 + m1 * self.config.activation_std_init
         self.firing_rate = self.firing_rate * keep1
 
     def state_dict(self) -> dict:

@@ -52,12 +52,13 @@
                   v
 +---------------------------------------------------------------+
 |                    NEUROMODULATOR                              |
-|  Per-segment REINFORCE + entropy bonus                        |
-|  Policy: 3-layer MLP (387->2048->2048->2048 -> action heads) |
-|  Batch-mean baseline, per-step advantages, LR schedule        |
+|  Multi-chunk REINFORCE + learned V(s) baseline + entropy      |
+|  Actor: 3-layer MLP (387->2048->2048->2048 -> action heads)  |
+|  Critic: MLP (obs_dim->256->256->1), ~165K params             |
+|  Collects 2 chunks (16 segments) before RL update             |
 |  8 actions per chunk (every 256 tokens):                      |
 |    delta_primitive[128] + delta_conn_weights[96] + decay[1]   |
-|  ~10M params (actor only). Trained by policy gradient.        |
+|  ~10M params (actor + critic). Trained by policy gradient.    |
 +---------------------------------------------------------------+
 ```
 
@@ -145,7 +146,7 @@ Per-column predictive coding with learnable gain modulation:
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
-Shared policy network across all 1024 neurons. No critic.
+Shared policy network across all 1024 neurons. Learned value function baseline (critic).
 
 **Observation** per neuron (387 dims):
 - primitive[128] + mean_input[128] + mean_output[128]
@@ -155,18 +156,23 @@ Shared policy network across all 1024 neurons. No critic.
 - delta_primitive[128] + delta_conn_weights[96] + delta_decay[1]
 - Actions clamped to [-1.0, 1.0], then conn_weights L1-renormalized
 
-**Architecture**: 3-layer MLP, hidden=2048, Tanh activations. ~10M params.
+**Architecture**:
+- Actor: 3-layer MLP (387->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
+- Critic: small MLP (obs_dim -> 256 -> 256 -> 1), ~165K params. Takes mean-pooled neuron
+  observations as global state. Outputs V(global_state) used as advantage baseline.
 
 ### RL Training
 
-Per-segment REINFORCE with discounted returns, entropy bonus, and LR schedule:
+Multi-chunk REINFORCE with learned value baseline, entropy bonus, and LR schedule:
 1. Lower scan (layers 0-3) + PCM (parallel over T=2048)
-2. 8 segments: neuromod observes -> acts -> per-token memory loop (256 tokens)
-3. Per-segment CE loss -> discounted returns (gamma=0.99)
-4. Batch-mean baseline per step -> per-step advantages
-5. Replay: log_prob with stored per-segment obs, weighted by advantages
-6. Entropy bonus (0.01) prevents exploration collapse
-7. Neuromod LR: warmup + cosine decay to 10% of initial
+2. 8 segments per chunk: neuromod observes -> acts -> per-token memory loop (256 tokens)
+3. Per-segment CE loss as reward, collected across `rl_collect_chunks=2` chunks (16 segments)
+4. Discounted returns (gamma=0.99) computed over the full collection window
+5. Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(final_state)`
+6. Learned value function baseline: `advantage = returns - V(state)` (critic trained with MSE)
+7. Replay: log_prob with stored per-segment obs, weighted by advantages
+8. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
+9. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
 
 ---
 
@@ -182,9 +188,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
 2. 8 segments of 256 tokens: neuromod -> per-token neuron loop
 3. Inject memory into H_mid, upper scan (layers 4-6, parallel)
 4. LM loss backward (gradients flow through upper + lower scan + mem_gate)
-5. Neuromod replay: per-step advantages + entropy bonus, backward
-6. Structural plasticity check (every 4 segments, vectorized)
-7. Detach scan carries. Memory graph state persists.
+5. RL data collected across rl_collect_chunks=2 chunks (16 segments total)
+6. On RL update step: compute discounted returns over collection window,
+   value bootstrap at boundary, train critic (MSE), compute advantages,
+   neuromod replay with per-step advantages + entropy bonus, backward
+7. Structural plasticity check (every 4 segments, vectorized)
+8. Detach scan carries. Memory graph state persists.
 
 ---
 
@@ -207,7 +216,7 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
 | obs_dim per neuron | 387 |
 | act_dim per neuron | 225 |
 | max_action_magnitude | 1.0 (L1 normalization bounds effect) |
-| RL | Per-segment REINFORCE, discounted returns, entropy bonus |
+| RL | Multi-chunk REINFORCE (2 chunks), learned V(s) baseline, entropy bonus |
 | T | 2048 |
 | Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
 | **Total trained params** | **~103M** |
@@ -241,10 +250,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
    before memory reads it. Surprising tokens get amplified. gain_scale is
    learnable (starts at 2.0, giving gain=1.0 at init).
 
-7. **Per-segment RL with entropy bonus.** Each of 8 segments gets its own CE
-   loss as reward. Discounted returns (gamma=0.99) credit early actions for
-   downstream improvements. Entropy bonus prevents exploration collapse.
-   Neuromod LR decays alongside LM LR.
+7. **Multi-chunk RL with learned value baseline.** Per-segment CE loss as reward,
+   collected across 2 chunks (16 segments) before computing returns and updating.
+   Discounted returns (gamma=0.99) span the full collection window, with value
+   bootstrap at the boundary. Learned V(global_state) critic replaces batch-mean
+   baseline for advantage computation. Entropy bonus prevents exploration collapse.
+   Neuromod LR decays alongside LM LR, floor derived from LR_MIN/LR ratio.
 
 ---
 
@@ -257,8 +268,8 @@ src/v8/
 +-- memory_graph.py        # MemoryGraph (per-token + Triton kernel + plasticity)
 +-- triton_kernels.py      # Fused sparse-gather step kernel
 +-- lm.py                  # V8LM (split-scan + PCM + memory interface)
-+-- neuromodulator.py      # Policy network (no critic)
-+-- model.py               # V8Model (top-level wiring, per-segment RL)
++-- neuromodulator.py      # Policy network + learned value critic
++-- model.py               # V8Model (top-level wiring, multi-chunk RL)
 +-- trainer.py             # V8Trainer (joint LM + RL training loop)
 +-- train.py               # Training entry point with CLI
 +-- diagnostics.py         # Per-step metrics + periodic snapshots

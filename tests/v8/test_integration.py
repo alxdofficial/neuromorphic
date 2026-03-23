@@ -80,46 +80,70 @@ class TestV8ModelForward:
         n_segments = cfg.T // cfg.action_every
         assert len(rl["actions"]) == n_segments
         assert len(rl["obs"]) == n_segments
-        assert rl["advantages"].shape == (BS, n_segments)
+        assert rl["seg_rewards"].shape == (BS, n_segments)
         assert rl["seg_losses"].shape == (BS, n_segments)
         assert isinstance(rl["loss"], float)
 
-    def test_per_segment_advantages(self):
-        """Each segment should get its own advantage value."""
+    def test_compute_rl_advantages(self):
+        """compute_rl_advantages should produce valid advantages from collected chunks."""
         cfg = make_tiny()
         model = V8Model(cfg)
-        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
-
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        adv = result["rl_data"]["advantages"]  # [BS, n_segments]
         n_segments = cfg.T // cfg.action_every
 
+        # Collect 2 chunks
+        collected = []
+        for _ in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            result = model.forward_chunk(input_ids, target_ids=target_ids)
+            collected.append(result["rl_data"])
+
+        combined = model.compute_rl_advantages(collected)
+        total_seg = n_segments * 2
+        assert combined["advantages"].shape == (BS, total_seg)
+        assert combined["returns"].shape == (BS, total_seg)
+        assert len(combined["obs"]) == total_seg
+        assert len(combined["actions"]) == total_seg
+        assert combined["global_obs"].shape[0] == total_seg
         # Advantages should be finite
-        assert torch.isfinite(adv).all()
-        # Batch-mean baseline → mean advantage across batch is near zero per step
-        assert adv.mean(dim=0).abs().max() < 1e-4
+        assert torch.isfinite(combined["advantages"]).all()
 
     def test_replay_produces_gradients(self):
-        """Replay should produce gradients for neuromod parameters."""
+        """Replay should produce gradients for neuromod (policy + value)."""
         cfg = make_tiny()
         model = V8Model(cfg)
-        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS, torch.device("cpu"))
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        rl_data = result["rl_data"]
+        # Collect and compute advantages
+        collected = []
+        for _ in range(cfg.rl_collect_chunks):
+            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            result = model.forward_chunk(input_ids, target_ids=target_ids)
+            collected.append(result["rl_data"])
 
-        model.replay_for_neuromod_grads(rl_data, amp_enabled=False)
+        combined = model.compute_rl_advantages(collected)
+        model.replay_for_neuromod_grads(combined, amp_enabled=False)
 
-        has_grad = False
-        for p in model.neuromod.parameters():
+        # Action heads should have gradients (policy gradient)
+        # Note: backbone gets zero grad on first step due to zero-init heads,
+        # self-corrects after first optimizer step.
+        has_policy_grad = False
+        for name, p in model.neuromod.named_parameters():
+            if "head" in name or "logstd" in name:
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    has_policy_grad = True
+                    break
+        assert has_policy_grad, "Policy heads should have gradients after replay"
+
+        # Value function should have gradients
+        has_value_grad = False
+        for p in model.neuromod.value_net.parameters():
             if p.grad is not None and p.grad.abs().sum() > 0:
-                has_grad = True
+                has_value_grad = True
                 break
-        assert has_grad, "Neuromod should have gradients after replay"
+        assert has_value_grad, "Value function should have gradients after replay"
 
 
 class TestV8Gradients:

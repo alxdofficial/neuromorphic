@@ -32,7 +32,7 @@ class V8Diagnostics:
         os.makedirs(self.snapshot_dir, exist_ok=True)
 
     def extend_metrics(self, metrics: dict, step: int) -> dict:
-        """Add memory graph stats to the per-step metrics dict.
+        """Add memory graph + LM coupling stats to the per-step metrics dict.
 
         Cheap operations only — reductions on existing tensors.
         Does NOT create new tensors or run forward passes.
@@ -42,7 +42,7 @@ class V8Diagnostics:
             return metrics
 
         with torch.no_grad():
-            # Neuron state magnitudes
+            # === Memory graph state ===
             metrics["mem_h_norm"] = round(mg.h.norm().item(), 4)
             metrics["mem_h_mean_abs"] = round(mg.h.abs().mean().item(), 6)
             metrics["mem_msg_norm"] = round(mg.prev_messages.norm().item(), 4)
@@ -56,20 +56,62 @@ class V8Diagnostics:
             metrics["mem_cw_mean"] = round(cw.mean().item(), 6)
             metrics["mem_cw_std"] = round(cw.std().item(), 6)
             metrics["mem_cw_max"] = round(cw.abs().max().item(), 6)
+            # Dead connections: fraction with |w| < 0.001 (1/10th of uniform 1/96≈0.01)
+            metrics["mem_cw_near_zero"] = round(
+                (cw.abs() < 0.001).float().mean().item(), 4)
 
             # Decay distribution
             decay = torch.sigmoid(mg.decay_logit)
             metrics["mem_decay_mean"] = round(decay.mean().item(), 4)
             metrics["mem_decay_std"] = round(decay.std().item(), 4)
 
-            # Firing rate
-            metrics["mem_firing_rate"] = round(mg.firing_rate.mean().item(), 4)
+            # Firing rate (all neurons + port vs non-port split)
+            C = self.model.config.C
+            fr = mg.firing_rate  # [BS, N]
+            metrics["mem_firing_rate"] = round(fr.mean().item(), 4)
+            metrics["mem_firing_rate_port"] = round(fr[:, :C].mean().item(), 4)
+            metrics["mem_firing_rate_nonport"] = round(fr[:, C:].mean().item(), 4)
+
+            # Dead neurons: fraction with firing_rate < 0.01
+            metrics["mem_usage_frac"] = round(
+                (fr.mean(dim=0) > 0.01).float().mean().item(), 4)
 
             # Co-activation stats (phi coefficient matrix)
             phi = mg.co_activation_ema
             metrics["mem_phi_mean"] = round(phi.mean().item(), 6)
             metrics["mem_phi_pos_frac"] = round((phi > 0).float().mean().item(), 4)
             metrics["mem_phi_neg_frac"] = round((phi < 0).float().mean().item(), 4)
+
+            # Plasticity counter (cumulative rewires)
+            if hasattr(mg, '_plasticity_rewires'):
+                metrics["mem_plasticity_rewires"] = mg._plasticity_rewires
+
+            # tanh saturation: fraction of |tanh(h * prim)| > 0.95
+            msg_abs = mg.prev_messages.abs()
+            metrics["mem_tanh_saturated"] = round(
+                (msg_abs > 0.95).float().mean().item(), 4)
+
+            # === LM coupling ===
+            lm = self.model.lm
+
+            # Memory gate: sigmoid(mem_gate) per CC — critical coupling signal
+            gate = torch.sigmoid(lm.mem_gate)  # [C]
+            metrics["mem_gate_mean"] = round(gate.mean().item(), 4)
+            metrics["mem_gate_min"] = round(gate.min().item(), 4)
+            metrics["mem_gate_max"] = round(gate.max().item(), 4)
+
+            # PCM gain_scale per CC
+            if hasattr(lm, 'pcm') and hasattr(lm.pcm, 'gain_scale'):
+                metrics["pcm_gain_scale"] = round(lm.pcm.gain_scale.item(), 4)
+
+            # === Neuromod policy stats ===
+            nm = self.model.neuromod
+            metrics["nm_logstd_prim"] = round(nm.prim_logstd.mean().item(), 4)
+            metrics["nm_logstd_conn"] = round(nm.conn_weight_logstd.mean().item(), 4)
+            metrics["nm_logstd_decay"] = round(nm.decay_logstd.mean().item(), 4)
+
+            # Neuromod LR (if optimizer is accessible)
+            # (logged separately in trainer — this is just a fallback)
 
         return metrics
 

@@ -2,7 +2,8 @@
 
 Shared MLP across all neurons. Observes neuron state + plasticity metrics,
 outputs modifications to primitives, connection weights, and decay.
-Trained by per-segment REINFORCE with discounted returns.
+Trained by REINFORCE with learned value baseline.
+Collects across multiple chunks for longer reward horizon.
 """
 
 import torch
@@ -18,17 +19,18 @@ class Neuromodulator(nn.Module):
 
     Shared across all neurons — each neuron's observation is processed
     independently through the same network (parameter sharing).
-    No critic — per-segment advantages from discounted returns with batch-mean baseline.
+    Learned value function on pooled global state for baseline.
     """
 
     def __init__(self, config: V8Config, obs_dim: int):
         super().__init__()
         self.config = config
+        self.obs_dim = obs_dim
         D_mem = config.D_mem
         K_conn = config.K_connections
         hidden = config.neuromod_hidden
 
-        # Policy backbone
+        # Policy backbone (per-neuron)
         layers = []
         in_dim = obs_dim
         for _ in range(config.neuromod_layers):
@@ -42,10 +44,10 @@ class Neuromodulator(nn.Module):
         self.decay_head = nn.Linear(hidden, 1)
 
         # Per-group log_std (state-independent)
-        # Init at -2.0 → std ≈ 0.135, enough exploration for 8 actions/chunk
-        self.prim_logstd = nn.Parameter(torch.full((1, D_mem), -2.0))
-        self.conn_weight_logstd = nn.Parameter(torch.full((1, K_conn), -2.0))
-        self.decay_logstd = nn.Parameter(torch.full((1, 1), -2.0))
+        logstd_init = config.neuromod_logstd_init
+        self.prim_logstd = nn.Parameter(torch.full((1, D_mem), logstd_init))
+        self.conn_weight_logstd = nn.Parameter(torch.full((1, K_conn), logstd_init))
+        self.decay_logstd = nn.Parameter(torch.full((1, 1), logstd_init))
 
         self.max_action = config.max_action_magnitude
 
@@ -53,6 +55,17 @@ class Neuromodulator(nn.Module):
         for head in [self.prim_head, self.conn_weight_head, self.decay_head]:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+
+        # Value function: pooled global obs → scalar
+        # Separate small MLP (not shared with policy backbone)
+        v_hidden = config.rl_value_hidden
+        self.value_net = nn.Sequential(
+            nn.Linear(obs_dim, v_hidden),
+            nn.Tanh(),
+            nn.Linear(v_hidden, v_hidden),
+            nn.Tanh(),
+            nn.Linear(v_hidden, 1),
+        )
 
     @property
     def act_dim(self) -> int:
@@ -64,14 +77,14 @@ class Neuromodulator(nn.Module):
         """Sample action (or evaluate given action).
 
         Args:
-            obs:    [*, obs_dim]
+            obs:    [*, obs_dim] — per-neuron observations
             action: [*, act_dim] or None — if None, sample from policy
 
         Returns:
             action:   [*, act_dim]
             log_prob: [*]
             entropy:  [*]
-            value:    None (no critic)
+            value:    None (use get_value for value estimates)
         """
         h = self.backbone(obs)
         prim_mean = self.prim_head(h)
@@ -96,3 +109,14 @@ class Neuromodulator(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
 
         return action, log_prob, entropy, None
+
+    def get_value(self, global_obs: Tensor) -> Tensor:
+        """Predict expected return from pooled global memory state.
+
+        Args:
+            global_obs: [BS, obs_dim] — mean-pooled across all neurons
+
+        Returns:
+            value: [BS] — predicted return
+        """
+        return self.value_net(global_obs).squeeze(-1)

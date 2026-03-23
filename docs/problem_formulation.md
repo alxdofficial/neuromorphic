@@ -60,7 +60,9 @@ Every 256 tokens (8 times per 2048-token chunk):
 - Outputs per-neuron actions (225 dims: delta_primitives[128] + delta_conn_weights[96] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
-**RL training**: Per-segment REINFORCE with discounted returns (gamma=0.99) and batch-mean baseline.
+**RL training**: Multi-chunk REINFORCE with discounted returns (gamma=0.99), learned V(s)
+baseline, value bootstrap at collection boundary, and entropy bonus. RL data collected
+across 2 chunks (16 segments) before computing returns and updating.
 
 ---
 
@@ -108,14 +110,20 @@ The reward is the CE loss on the next 256 tokens.
 
 **What we currently do**:
 - Per-segment CE loss as reward (8 rewards per chunk)
-- Discounted returns: G_t = r_t + 0.99*r_{t+1} + ... (credit early actions for later gains)
-- Batch-mean baseline: baseline_t = mean across batch of G_t (zero parameters)
-- Per-step advantages: A_t = G_t - baseline_t
+- Multi-chunk collection: rewards gathered across `rl_collect_chunks=2` chunks (16 segments)
+  before computing returns and updating
+- Discounted returns: G_t = r_t + 0.99*r_{t+1} + ... over the full collection window
+- Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(final_state)`
+- Learned value function baseline: V(global_state) critic (~165K params, MLP on mean-pooled
+  neuron observations), trained with MSE on observed returns
+- Per-step advantages: A_t = G_t - V(state_t)
 
 **What works**:
-- Each of the 8 actions gets its own advantage (not a single scalar for the whole chunk)
+- Each of the 16 actions (across 2 chunks) gets its own advantage
+- Multi-chunk collection gives the RL agent visibility into cross-chunk effects
 - Discounting credits early structural changes for downstream improvements
-- Batch-mean baseline centers advantages at zero per step
+- Value bootstrap gives credit for structural changes that pay off beyond the collection window
+- Learned V(s) baseline adapts to state-dependent reward variance
 
 **Open questions**:
 
@@ -136,11 +144,14 @@ tokens of text. The CE loss on those 256 tokens is the reward. But:
 - Should we weight later tokens more heavily in the segment reward?
 
 **Q3: Can the neuromod distinguish "my action helped" from "this text was easy"?**
-The batch-mean baseline subtracts the average return across batch elements. This helps
-when different batch elements see different text. But within a batch element, the
-baseline can't distinguish whether low loss came from a good neuromod action or from
-inherently predictable text. A learned value function (critic) would help here but
-adds parameters and compute.
+**Partially addressed.** The learned V(global_state) critic replaces the old batch-mean
+baseline. V(s) takes mean-pooled neuron observations as input and learns to predict
+expected returns conditioned on the current memory graph state. This means advantages
+reflect how much better/worse the actual return was compared to what the critic expected
+*given the current state* — not just the batch average. The critic can learn that certain
+graph configurations lead to predictably low loss (easy text patterns), reducing spurious
+advantage signal. Remaining concern: the critic sees neuron state but not the text
+content, so it can't fully account for text difficulty variation within similar graph states.
 
 **Q4: Is the action space right?**
 Each action is 225 continuous dims per neuron × 1024 neurons = 230,400 total action
@@ -153,11 +164,14 @@ The action is clamped to ±1.0 (L1 normalization bounds the effect). Questions:
   differentiate neuron roles?
 
 **Q5: Reward horizon — should discounting go beyond one chunk?**
-Currently gamma=0.99 with H=8 steps. The effective horizon is ~100 steps before
-discounting to <37%. But the neuromod only sees 8 steps per chunk, then a new chunk
-starts (potentially different text, but same graph state). Cross-chunk effects of
-neuromod actions are invisible to the current RL setup. A structural change that pays
-off 5 chunks later gets zero credit.
+**Partially addressed.** Multi-chunk RL collection (`rl_collect_chunks=2`) now gathers
+16 segments (2 chunks) of rewards before computing returns. Discounted returns span the
+full collection window, so cross-chunk effects within the 2-chunk window are captured.
+Value bootstrap at the collection boundary (`returns[:, -1] = reward[-1] + gamma * V(final_state)`)
+gives partial credit for structural changes that pay off beyond the window. Remaining
+concern: the effective horizon is still limited by the collection window size and the
+accuracy of the value function bootstrap. A structural change that pays off 5+ chunks
+later still gets attenuated credit, though the bootstrap provides some signal.
 
 ### Problem 3: Memory Graph Signal Dynamics — Does It Actually Help?
 
@@ -228,13 +242,13 @@ also partially decay at document boundaries to prevent overfitting to recent doc
 | LM scan layers | Working, well-understood | High |
 | Memory graph per-token dynamics | Implemented, correct | High |
 | Throughput | 42K tok/s, 50% overhead | Acceptable |
-| Per-segment RL rewards | Implemented | Medium — informative enough? |
-| Credit assignment | Per-step advantages | Medium — indirect reward signal |
+| Multi-chunk RL rewards | Implemented (2 chunks, 16 segments) | Medium — informative enough? |
+| Credit assignment | Learned V(s) baseline + value bootstrap | Medium-High — addresses batch-mean limitations |
 | Primitives as message modulation | Implemented | Medium — do neurons differentiate? |
 | Structural plasticity | Implemented | Low — random rewiring meaningful? |
 | Memory actually helping LM | Not yet proven | Unknown — need training run |
 | Scale mismatch (CC vs graph signals) | Known issue | Needs investigation |
-| Cross-chunk RL credit | Not captured | Known gap |
+| Cross-chunk RL credit | Partially captured (2-chunk window + bootstrap) | Improved |
 
 ## Next Steps
 
