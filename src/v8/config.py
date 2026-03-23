@@ -40,7 +40,9 @@ class V8Config:
     neuromod_hidden: int = 1024
     neuromod_layers: int = 3
     action_every: int = 256      # act every N tokens (8 segments per T=2048 chunk)
-    max_action_magnitude: float = 1.0  # generous — L1 normalization bounds the effect
+    max_action_magnitude: float = 1.0  # generous — normalization bounds the effect
+    decay_min: float = 0.1      # floor on sigmoid(decay_logit) — prevents stateless neurons
+    decay_max: float = 0.7      # ceiling — prevents unbounded h accumulation
 
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer

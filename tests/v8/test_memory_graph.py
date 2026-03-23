@@ -165,8 +165,9 @@ class TestMemoryGraphPlasticity:
         mg.initialize(BS)
         phi_before = mg.co_activation_ema.clone()
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
-        mg.forward_segment(cc)
+        # Strong CC signals to ensure neurons fire above threshold
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem) * 5.0
+        mg.forward_segment(cc, update_co_activation=True)
 
         # Co-activation matrix should have changed after a segment
         assert torch.isfinite(mg.co_activation_ema).all()

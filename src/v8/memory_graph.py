@@ -115,6 +115,11 @@ class MemoryGraph:
         self.device = device
         self.dtype = dtype
 
+        # Precompute decay logit bounds from config
+        import math
+        self._logit_min = math.log(config.decay_min / (1 - config.decay_min))
+        self._logit_max = math.log(config.decay_max / (1 - config.decay_max))
+
         N = config.N_neurons
         K_conn = config.K_connections
 
@@ -167,9 +172,9 @@ class MemoryGraph:
 
         # Per-neuron parameters (neuromodulator-controlled)
         # Primitives modulate outgoing messages: message = tanh(h * primitives)
-        # Init near 1.0 so messages ≈ tanh(h) at start
-        self.primitives = 1.0 + torch.randn(
-            BS, N, D, device=self.device, dtype=self.dtype) * 0.02
+        # L2-normalized per neuron (unit direction vector). Init with small noise for symmetry breaking.
+        prim_raw = 1.0 + torch.randn(BS, N, D, device=self.device, dtype=self.dtype) * 0.02
+        self.primitives = prim_raw / prim_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         # Decay: sigmoid(0) = 0.5 — neutral starting point (50% carry)
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
@@ -492,8 +497,12 @@ class MemoryGraph:
                       delta_decay: Tensor):
         """Apply neuromodulator actions to neuron/connection state.
 
-        After applying deltas, L1-normalize conn_weights per neuron
-        (energy conservation: fixed routing budget of 1.0).
+        Normalization after applying deltas:
+        - primitives: L2-normalized per neuron (direction only, unit magnitude)
+        - conn_weights: L1-normalized per neuron (routing distribution, sums to 1)
+        - decay: clamped to [decay_min, decay_max] via logit bounds
+
+        The neuromod controls direction/distribution, not magnitude.
 
         Args:
             delta_primitives: [BS, N, D_mem]
@@ -504,10 +513,18 @@ class MemoryGraph:
         self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Energy conservation: L1-normalize connection weights per neuron
-        # The neuromod controls the distribution, not the total magnitude
+        # Primitives: L2-normalize per neuron (controls message direction, not magnitude)
+        # message = tanh(h * prim); with ||prim||=1, saturation depends only on h magnitude
+        prim_norm = self.primitives.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        self.primitives = (self.primitives / prim_norm).to(self.dtype)
+
+        # Connection weights: L1-normalize per neuron (routing distribution sums to 1)
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
         self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
+
+        # Decay: clamp logit so sigmoid stays in [decay_min, decay_max]
+        # Prevents both stateless collapse (→0) and unbounded h accumulation (→1)
+        self.decay_logit = self.decay_logit.clamp(self._logit_min, self._logit_max)
 
         self._adjacency_dirty = True
 
