@@ -122,6 +122,34 @@ class V8Config:
         return cls(**defaults)
 
     @classmethod
+    def tier_b(cls, **overrides) -> "V8Config":
+        """~300M params. Wider + deeper LM, 2K neurons.
+        C=24 so D_mem=128 (power of 2 for Triton kernel)."""
+        defaults = dict(
+            D=3072, D_embed=1024, C=24, L_total=12, scan_split_at=6,
+            d_inner=1536, glu_output=True, T=2048,
+            N_mem_neurons=2048, K_connections=96,
+            pcm_hidden=256,
+            neuromod_hidden=2048, neuromod_layers=3,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def tier_c(cls, **overrides) -> "V8Config":
+        """~1B params. Large LM, 4K neurons.
+        C=16 so D_mem=256 (power of 2 for Triton kernel)."""
+        defaults = dict(
+            D=4096, D_embed=1024, C=16, L_total=28, scan_split_at=14,
+            d_inner=2048, glu_output=True, T=2048,
+            N_mem_neurons=4096, K_connections=128,
+            pcm_hidden=512,
+            neuromod_hidden=2048, neuromod_layers=3,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def tier_tiny(cls, **overrides) -> "V8Config":
         """Tiny config for unit tests."""
         defaults = dict(

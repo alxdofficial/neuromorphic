@@ -1,9 +1,40 @@
 # V8 Training Profiling Results
 
-Profiled on RTX 4090 (24GB), BS=8, T=2048, no compile, gradient checkpointing enabled.
-20 warmup steps, 10 measured steps in steady state. Date: 2026-03-23.
+All measurements on RTX 4090 (24GB), T=2048, torch.compile enabled on LM methods,
+gradient checkpointing OFF. 10 warmup + 10 measured steps in steady state.
 
-## Step Timing
+## Tier Scaling Summary
+
+| Tier | Params | D | L | N_neurons | K | D_mem | BS | w/ memory | w/o memory | Overhead | VRAM |
+|------|--------|---|---|-----------|---|-------|-----|-----------|------------|----------|------|
+| A | 103M | 2048 | 7 | 1024 | 96 | 128 | 12 | 57.8K tok/s | 154.2K tok/s | 167% | 13.9GB |
+| B | 285M | 3072 | 12 | 2048 | 96 | 128 | 8 | 25.9K tok/s | 58.5K tok/s | 126% | 16.3GB |
+| C | 1.01B | 4096 | 28 | 4096 | 128 | 256 | 2 | 7.2K tok/s | 15.2K tok/s | 110% | 16.0GB |
+
+### Observations
+
+- Memory graph overhead ranges from 110-167% across tiers
+- At tier C (1B), the memory graph roughly doubles training time
+- LM-only throughput scales as expected: 154K → 58K → 15K as params increase
+- Tier C fits on a single 4090 but only at BS=2 (needs multi-GPU for practical training)
+- D_mem=256 at tier C (vs 128 at A/B) makes the per-token kernel 4× more expensive per neuron
+
+### Memory Graph Cost Scaling
+
+The per-token sparse gather cost is `O(N × K × D_mem)`:
+
+| Tier | N × K × D_mem | Relative to A |
+|------|---------------|---------------|
+| A | 1024 × 96 × 128 = 12.6M | 1.0× |
+| B | 2048 × 96 × 128 = 25.2M | 2.0× |
+| C | 4096 × 128 × 256 = 134.2M | 10.7× |
+
+Tier C's memory graph is 10.7× more expensive per token than tier A, mainly due to
+the wider D_mem (256 vs 128) and more neurons (4096 vs 1024).
+
+## Tier A Detailed Profiling
+
+### Step Timing (BS=8, compiled)
 
 | Step Type | Time | Throughput |
 |-----------|------|-----------|
@@ -11,77 +42,89 @@ Profiled on RTX 4090 (24GB), BS=8, T=2048, no compile, gradient checkpointing en
 | Update step (with RL replay) | 384ms | 42.6K tok/s |
 | Average (alternating) | 346ms | 47.4K tok/s |
 
-RL updates happen every 2 chunks (`rl_collect_chunks=2`). Collect steps are ~20% faster
-because they skip the neuromod replay + optimizer step.
+RL updates happen every 2 chunks (`rl_collect_chunks=2`). Collect steps are ~20% faster.
 
-## CUDA Time Breakdown (per step average, 10 steps)
+### CUDA Time Breakdown (compiled, 10 steps)
 
-| Component | CUDA Time | % of Total | Notes |
-|-----------|-----------|------------|-------|
-| Memory graph Triton kernel | 130ms | 38.4% | 2048 kernel launches/step (256/seg × 8 segs) |
-| LM forward matmuls (mm + addmm) | 89ms | 26.4% | Scan layers, projections, output head |
-| LM backward (cutlass GEMM) | 69ms | 20.2% | Gradient computation for all LM params |
-| Element-wise (mul + add) | 40ms | 11.9% | Gates, activations, residuals, optimizer |
-| Dtype copies (copy_) | 17ms | 4.9% | bf16 ↔ f32 conversions |
+| Component | CUDA Time | % of Total | Per Step |
+|-----------|-----------|------------|----------|
+| Memory graph Triton kernel | 1,304ms | 46.1% | 130ms |
+| aten::mm (compiled matmuls) | 748ms | 26.4% | 75ms |
+| cutlass GEMM (backward) | 255ms | 9.0% | 26ms |
+| CompiledFunction (fused fwd+bwd) | 1,043ms | 36.9% | 104ms |
+| aten::addmm (linear layers) | 149ms | 5.3% | 15ms |
+| Total CUDA | 2,829ms | | 283ms |
 
-Total CUDA time per step: ~338ms (the rest is CPU overhead, kernel launch latency).
+With torch.compile enabled, the memory graph kernel is the dominant cost at **46%**.
+Before compile, it was 38% (LM was uncompiled and slower).
 
 ### Memory Graph Internal
 
-The 130ms memory graph time breaks down as:
-- **Triton kernel compute**: ~126ms (the sparse gather + integrate + tanh loop)
+The 130ms memory graph time per step (8 segments × 256 tokens):
+- **Triton kernel compute**: ~126ms (sparse gather + integrate + tanh, fused with norm)
 - **Post-segment stats**: ~4ms (firing threshold, co-activation phi on plasticity segments)
 
-Each Triton kernel launch processes grid (BS=8, N=1024) = 8192 programs.
-Per-token kernel time: ~63μs. Per-segment (256 tokens): ~16ms.
+Each kernel launch: grid (BS, N) programs. Per-token: ~63μs.
 
-## Batch Size Scaling
+## Batch Size Scaling (Tier A, compiled)
 
-| BS | ms/step | K tok/s | VRAM | Scaling efficiency |
-|----|---------|---------|------|--------------------|
-| 4 | ~220ms | ~37K | ~5GB | (baseline) |
-| 8 | 346ms | 47.4K | 7.7GB | 1.28x throughput for 2x batch |
-| 12 | 562ms | 43.7K | 11.2GB | 1.18x throughput for 3x batch |
+| BS | ms/step | K tok/s | VRAM |
+|----|---------|---------|------|
+| 8 | 298ms | 54.9K | 9.5GB |
+| 12 | 425ms | 57.8K | 13.9GB |
 
-Throughput does NOT scale linearly with batch size. At BS=8, the GPU is already
-compute-bound on both the memory graph kernel and LM matmuls. Increasing batch size
-adds proportional work with no idle GPU cycles to absorb it.
+Throughput barely improves from BS=8 to BS=12 (+5%). The GPU is compute-bound
+at BS=8 — both the memory graph kernel and LM matmuls saturate the SMs.
 
-## Why Throughput Doesn't Scale with Batch Size
+## torch.compile Impact
 
-Two factors:
+Compiling individual LM methods (forward_scan_lower, forward_scan_upper,
+forward_output) and neuromod methods (get_action_and_value, get_value):
 
-1. **Memory graph**: The Triton kernel grid is (BS, N). At BS=8, that's 8192 programs.
-   Each program does a K=96 sparse gather over D=128 dimensions — significant register
-   usage. The GPU's SMs are already occupied. BS=12 adds 50% more programs that queue
-   behind the existing ones.
+| Config | Before (broken compile) | After (method compile) | Improvement |
+|--------|------------------------|----------------------|-------------|
+| BS=8 | 43.3K tok/s | 54.9K tok/s | **+27%** |
+| VRAM | 7.7GB | 9.5GB | +1.8GB |
 
-2. **LM matmuls**: The scan layers and projections are large matmuls that already
-   saturate tensor cores at BS=8. Larger batch means larger matmuls, but throughput
-   is already near peak for the given shapes.
+The prior `torch.compile(model.lm)` was completely inert because V8LM has no
+`forward()` method — all calls go through named methods. Compiling the individual
+methods fixes this.
 
-## Optimization Opportunities (implemented)
+## Implemented Optimizations
 
 | Optimization | Savings | Status |
 |-------------|---------|--------|
+| torch.compile on individual LM/neuromod methods | 27% total throughput | Done |
 | Fuse .norm() into Triton kernel | ~14ms/chunk | Done |
 | Skip phi bmm on non-plasticity segments | ~5ms/chunk | Done |
 | Sort conn_indices for cache locality | Minor | Done |
-| Skip prepare_sparse_weights_kernel (all-active mask) | ~1ms/chunk | Done |
+| Skip prepare_sparse_weights when mask all-active | ~1ms/chunk | Done |
+| Eliminate GPU-CPU sync points (reset_mask, ppl, etc.) | Reduced pipeline stalls | Done |
+| Remove duplicate CE computation | ~0.5ms/step | Done |
+| Fix benchmark grad_ckpt polarity (was inverted) | Accurate benchmarks | Done |
 
 ## Remaining Optimization Opportunities
 
 | Optimization | Estimated Savings | Complexity | Design Change? |
 |-------------|-------------------|------------|---------------|
-| CUDA graph capture of 256-step loop | ~10-20% on kernel time | Medium | No |
-| K-step analytical scan (K=4) | ~75% fewer kernel launches | High | Yes — reduces propagation resolution |
-| Decouple D_mem from D_cc (projection) | Reduces kernel register pressure | Medium | Yes — adds projection layers |
+| CUDA graph capture of 256-step loop | ~8% total | Medium | No |
+| K-step message passing (K=4) | ~35% total | Medium | Yes — slower propagation |
+| Decouple D_mem from D_cc (projection) | Reduces kernel cost at scale | Medium | Yes — adds projection layers |
 | Multi-GPU DDP | Linear scaling with GPU count | Medium | No |
 
-## Key Insight
+## Key Insights
 
-The memory graph (38%) and LM (46%) are comparable costs. The sequential kernel loop
-is a significant contributor but not an overwhelming bottleneck. Both components would
-need to speed up for batch size scaling to improve. The most impactful single change
-would be multi-GPU data parallelism (linear throughput scaling without code changes
-to the model).
+1. The memory graph sequential loop (46% of CUDA time at tier A) is the single
+   largest cost after compile optimization.
+
+2. Memory overhead increases with model scale: 167% at tier A, but the ratio
+   improves at tier C (110%) because the LM itself becomes the dominant cost
+   at larger scales.
+
+3. The practical scaling path is multi-GPU DDP — memory graph state is per-rank
+   (no cross-GPU communication needed), just all-reduce LM gradients.
+
+4. D_mem scaling is the key driver of memory graph cost. Tier C's D_mem=256
+   makes the kernel 10× more expensive per token than tier A's D_mem=128.
+   Decoupling D_mem from D_cc via a projection layer would allow the LM to
+   scale width while keeping memory graph cost constant.
