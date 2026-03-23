@@ -69,6 +69,8 @@ def parse_args():
                    help="Keep only the last N checkpoints (0=keep all)")
     p.add_argument("--snapshot-interval", type=int, default=1000,
                    help="Memory graph snapshot interval (0=disabled)")
+    p.add_argument("--plot-interval", type=int, default=500,
+                   help="Plot generation interval (0=only at snapshots/checkpoints)")
     return p.parse_args()
 
 
@@ -300,8 +302,9 @@ def main():
                         os.remove(old)
                         print(f"  Removed old: {old}")
 
-        # Auto-generate plots periodically (at snapshot interval and checkpoint saves)
+        # Auto-generate plots periodically
         should_plot = (
+            (args.plot_interval > 0 and step % args.plot_interval == 0) or
             (args.snapshot_interval > 0 and step % args.snapshot_interval == 0) or
             (args.save_interval > 0 and step % args.save_interval == 0) or
             step == 50  # early plot for sanity check
@@ -311,6 +314,7 @@ def main():
                 from scripts.plot_training import (
                     load_metrics as _load_m, plot_training_curves,
                     plot_rl_curves, plot_memory_health, plot_connectivity_snapshot,
+                    plot_neuron_graph,
                 )
                 plot_dir = os.path.join(save_dir, "plots")
                 os.makedirs(plot_dir, exist_ok=True)
@@ -318,7 +322,7 @@ def main():
                 plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
                 plot_rl_curves(_records, os.path.join(plot_dir, "rl_curves.png"))
                 plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
-                # Latest snapshot connectivity
+                # Latest snapshot: connectivity + neuron graph
                 snap_dir = os.path.join(save_dir, "snapshots")
                 if os.path.exists(snap_dir):
                     snaps = sorted(os.listdir(snap_dir))
@@ -326,6 +330,8 @@ def main():
                         latest_snap = os.path.join(snap_dir, snaps[-1])
                         plot_connectivity_snapshot(
                             latest_snap, os.path.join(plot_dir, "connectivity_latest.png"))
+                        plot_neuron_graph(
+                            latest_snap, os.path.join(plot_dir, "neuron_graph_latest.png"))
             except Exception as e:
                 print(f"  Plot generation failed: {e}")
 
