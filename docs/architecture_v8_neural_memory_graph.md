@@ -168,7 +168,7 @@ Multi-chunk REINFORCE with learned value baseline, entropy bonus, and LR schedul
 2. 8 segments per chunk: neuromod observes -> acts -> per-token memory loop (256 tokens)
 3. Per-segment CE loss as reward, collected across `rl_collect_chunks=2` chunks (16 segments)
 4. Discounted returns (gamma=0.99) computed over the full collection window
-5. Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(final_state)`
+5. Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(last_obs)`
 6. Learned value function baseline: `advantage = returns - V(state)` (critic trained with MSE)
 7. Replay: log_prob with stored per-segment obs, weighted by advantages
 8. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
@@ -266,7 +266,7 @@ src/v8/
 +-- config.py              # V8Config dataclass + tier presets
 +-- pcm.py                 # SingleColumnPCM (learnable gain, per-CC)
 +-- memory_graph.py        # MemoryGraph (per-token + Triton kernel + plasticity)
-+-- triton_kernels.py      # Fused sparse-gather step kernel
++-- triton_kernels.py      # Fused sparse-gather + integrate + tanh + norm step kernel
 +-- lm.py                  # V8LM (split-scan + PCM + memory interface)
 +-- neuromodulator.py      # Policy network + learned value critic
 +-- model.py               # V8Model (top-level wiring, multi-chunk RL)

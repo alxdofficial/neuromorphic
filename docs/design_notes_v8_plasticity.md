@@ -35,7 +35,9 @@ fired = activation > threshold                     # binary
 ```
 
 - `activation_ema`: EMA of activation magnitude (tracks neuron's baseline)
-- `activation_std_ema`: EMA of activation std (tracks neuron's variability)
+- `activation_std_ema`: EMA of activation std (tracks neuron's variability),
+  initialized to `activation_std_init` (config, default 0.1) to prevent
+  zero threshold during warmup
 - "Firing" = significantly above that neuron's own average
 - No magic numbers — everything relative to neuron's own statistics
 - Roughly 15-20% firing rate per neuron (one std above mean)

@@ -29,7 +29,7 @@ The LM is a standard scan-based sequence model:
 - Per-column predictive coding modules (16 independent PCMs)
 - Memory injection: `logits = output_head(H + gate * mem_signals)`
 - ~93M trainable parameters
-- Throughput: ~85K tok/s without memory (RTX 4090, BS=4)
+- Throughput: ~85K tok/s without memory (RTX 4090, BS=12)
 
 This part is well-understood and works. The scan layers are fully parallel over T=2048
 tokens. No issues here.
