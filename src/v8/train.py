@@ -71,6 +71,10 @@ def parse_args():
                    help="Memory graph snapshot interval (0=disabled)")
     p.add_argument("--plot-interval", type=int, default=500,
                    help="Plot generation interval (0=only at snapshots/checkpoints)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume from checkpoint path (loads LM + neuromod + optimizer state)")
+    p.add_argument("--freeze-lower", action="store_true", default=False,
+                   help="Freeze lower scan layers + embedding + output head (for memory finetuning)")
     return p.parse_args()
 
 
@@ -124,11 +128,49 @@ def main():
     else:
         model = model.to(device)
 
+    # Resume from checkpoint
+    start_step = 0
+    if args.resume:
+        print(f"\nResuming from: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.lm.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if "neuromod_state_dict" in ckpt:
+            model.neuromod.load_state_dict(ckpt["neuromod_state_dict"], strict=False)
+        start_step = ckpt.get("step", 0)
+        print(f"  Loaded LM + neuromod from step {start_step}")
+        del ckpt
+
     lm_params = model.lm.param_count()
     total_params = model.param_count()
     print(f"\nParameters: {total_params:,} ({total_params/1e6:.1f}M)")
     print(f"  LM: {lm_params:,} ({lm_params/1e6:.1f}M)")
     print(f"  Neuromod: {total_params - lm_params:,} ({(total_params-lm_params)/1e6:.1f}M)")
+
+    # Freeze lower scan + embedding + output head (for memory finetuning phase)
+    if args.freeze_lower:
+        frozen_count = 0
+        for name, param in model.lm.named_parameters():
+            # Freeze: embedding, proj_up, lower scan layers (0..split-1), lm_head, ln_final
+            # Trainable: upper scan layers (split..L-1), mem_gate, PCM, proj_down
+            is_lower_layer = False
+            if "layers." in name:
+                layer_idx = int(name.split("layers.")[1].split(".")[0])
+                is_lower_layer = layer_idx < config.scan_split_at
+
+            should_freeze = (
+                "embedding" in name or
+                "proj_up" in name or
+                "lm_head" in name or
+                "ln_final" in name or
+                is_lower_layer
+            )
+            if should_freeze:
+                param.requires_grad = False
+                frozen_count += param.numel()
+
+        trainable = sum(p.numel() for p in model.lm.parameters() if p.requires_grad)
+        print(f"\n*** FREEZE-LOWER: frozen {frozen_count:,} LM params, "
+              f"{trainable:,} trainable ***")
 
     # Disable memory if requested (LM-only baseline)
     if args.no_memory:
@@ -180,6 +222,23 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
 
+    # Resume optimizer state if available
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if "optimizer_state_dict" in ckpt and not args.freeze_lower:
+            try:
+                lm_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print(f"  Loaded LM optimizer state")
+            except Exception as e:
+                print(f"  Could not load LM optimizer state: {e}")
+        if "scheduler_state_dict" in ckpt and not args.freeze_lower:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                print(f"  Loaded LR scheduler state")
+            except Exception:
+                pass
+        del ckpt
+
     # Neuromod LR schedule: same warmup, cosine decay to same floor ratio as LM
     neuromod_lr_floor = LR_MIN / args.lr  # same ratio as LM schedule
     def neuromod_lr_lambda(step):
@@ -217,6 +276,9 @@ def main():
         use_memory=trainer_use_memory,
         neuromod_scheduler=neuromod_scheduler,
     )
+
+    # Set start step for resumed training
+    trainer.global_step = start_step
 
     # Output dir
     run_id = time.strftime("%Y%m%d_%H%M%S")
