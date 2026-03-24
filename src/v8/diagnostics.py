@@ -108,7 +108,7 @@ class V8Diagnostics:
             # === Neuromod policy stats ===
             nm = self.model.neuromod
             metrics["nm_logstd_prim"] = round(nm.prim_logstd.mean().item(), 4)
-            metrics["nm_logstd_conn"] = round(nm.conn_weight_logstd.mean().item(), 4)
+            metrics["nm_logstd_key"] = round(nm.key_logstd.mean().item(), 4)
             metrics["nm_logstd_decay"] = round(nm.decay_logstd.mean().item(), 4)
 
             # Neuromod LR (if optimizer is accessible)
@@ -144,11 +144,6 @@ class V8Diagnostics:
             snapshot["key_per_neuron"] = mg.key.mean(dim=0).cpu()
             # Connectivity structure [N, K] — topology doesn't change often
             snapshot["conn_indices"] = mg.conn_indices.cpu()
-
-            # Adjacency matrix summary (not the full N×N, just stats)
-            A = mg._build_adjacency()
-            snapshot["adj_row_norms"] = A.norm(dim=-1).mean(dim=0).cpu()  # [N]
-            snapshot["adj_sparsity"] = (A.abs() < 1e-6).float().mean().item()
 
             # Co-activation matrix [N, N] and primitives [N, D] for PCA
             snapshot["co_activation"] = mg.co_activation_ema.cpu().float()

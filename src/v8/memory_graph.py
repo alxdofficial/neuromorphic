@@ -9,9 +9,9 @@ Neurons exchange messages at every timestep, allowing multi-hop
 propagation through the graph within a single segment.
 
 State (persistent across chunks, outside autograd):
-  primitives: [BS, N, D_mem] — per-neuron message modulation
+  primitives: [BS, N, D_mem] — per-neuron message modulation (RMS-normalized)
+  key: [BS, N, D_mem] — per-neuron routing selectivity (L2-normalized)
   decay_logit: [BS, N] — per-neuron decay (pre-sigmoid)
-  conn_weights: [BS, N, K_conn] — connection weights
   h: [BS, N, D_mem] — internal state (temporal memory)
   prev_messages: [BS, N, D_mem] — last outgoing messages
 
@@ -33,7 +33,7 @@ except ImportError:
 
 try:
     import triton
-    from .triton_kernels import memory_graph_step_kernel, prepare_sparse_weights_kernel
+    from .triton_kernels import memory_graph_step_kernel
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -167,17 +167,6 @@ class MemoryGraph:
         A.scatter_add_(2, idx, self._routing_weights)
         return A
 
-    def _rebuild_conn_mask_dense(self, BS: int):
-        """Build dense [BS, N, N] additive mask for softmax routing.
-
-        0 for connected pairs, -1e4 for unconnected. Used with baddbmm
-        to fuse mask + similarity computation in one call.
-        """
-        N = self.config.N_neurons
-        mask = torch.full((N, N), -1e4, device=self.device, dtype=self.dtype)
-        mask.scatter_(1, self.conn_indices, 0.0)
-        self._conn_mask_dense = mask.unsqueeze(0).expand(BS, N, N).contiguous()
-
     @torch.no_grad()
     def _compute_routing_weights(self):
         """Compute softmax routing weights from key × neighbor messages.
@@ -248,7 +237,6 @@ class MemoryGraph:
         # Plasticity tracking
         self._plasticity_rewires = 0  # cumulative rewired connections
         self._co_activation_ready = False  # set True after first phi update
-        self._conn_mask_dense = None  # rebuilt on first forward / after plasticity
 
         # Triton kernel buffers (allocated once, reused)
         if _HAS_TRITON and self.device.type == 'cuda':
@@ -481,33 +469,6 @@ class MemoryGraph:
         self.co_activation_ema = ca_decay * self.co_activation_ema + (1 - ca_decay) * phi_mean
         self._co_activation_ready = True
 
-    def _build_adjacency(self) -> Tensor:
-        """Build dense adjacency matrix from sparse connectivity.
-
-        Weights are already L1-normalized (sum |w| = 1 per neuron), so no
-        additional mean-normalization is needed. The adjacency scatters the
-        raw L1-normalized weights.
-
-        Returns:
-            A: [BS, N, N] — dense weighted adjacency (L1-normalized rows)
-        """
-        if not self._adjacency_dirty and self._adjacency_cache is not None:
-            return self._adjacency_cache
-
-        BS = self.conn_weights.shape[0]
-        N = self.config.N_neurons
-        K_conn = self.config.K_connections
-
-        w_masked = self.conn_weights * self.conn_mask.unsqueeze(0).to(dtype=self.dtype)
-
-        A = torch.zeros(BS, N, N, device=self.device, dtype=self.dtype)
-        idx = self.conn_indices.unsqueeze(0).expand(BS, N, K_conn)
-        A.scatter_add_(2, idx, w_masked)
-
-        self._adjacency_cache = A
-        self._adjacency_dirty = False
-        return A
-
     @torch.no_grad()
     def apply_actions(self, delta_primitives: Tensor,
                       delta_key: Tensor,
@@ -650,7 +611,7 @@ class MemoryGraph:
         """
         # Caller pre-checks has_reset on CPU — no GPU sync needed here.
         # Only reset dynamic state at document boundaries.
-        # Structural state (primitives, conn_weights, decay, plasticity metrics,
+        # Structural state (primitives, key, decay, plasticity metrics,
         # co_activation_ema) is preserved.
         m1 = mask.unsqueeze(-1).to(dtype=self.dtype)    # [BS, 1]
         m2 = m1.unsqueeze(-1)                            # [BS, 1, 1]
@@ -682,6 +643,5 @@ class MemoryGraph:
         """Restore memory graph state from checkpoint."""
         for key, val in state.items():
             setattr(self, key, val)
-        self._adjacency_dirty = True
         if self._triton_ready:
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
