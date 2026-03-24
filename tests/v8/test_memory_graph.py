@@ -261,23 +261,21 @@ class TestNeuronDynamicsReference:
 
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay
-        K_conn = mg.config.K_connections
 
-        # L2-normalize key for cosine sim
-        key_norm = mg.key / mg.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        # Dense connectivity mask for baddbmm routing
+        mask = torch.full((N, N), -1e4, device=mg.device, dtype=mg.dtype)
+        mask.scatter_(1, mg.conn_indices, 0.0)
+        conn_mask_dense = mask.unsqueeze(0).expand(BS, N, N)
 
         h = mg.h.clone()
         prev_msg = mg.prev_messages.clone()
         output = torch.empty(BS, T_seg, C, D)
 
         for t in range(T_seg):
-            # 1. Receive: key-based softmax routing
-            neighbor_msgs = prev_msg[:, mg.conn_indices]  # [BS, N, K, D]
-            neighbor_norm = neighbor_msgs / neighbor_msgs.norm(
-                dim=-1, keepdim=True).clamp(min=1e-8)
-            sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)
-            weights = torch.softmax(sim, dim=-1)
-            received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
+            # 1. Receive: key-based softmax routing (dense baddbmm approach)
+            sim = torch.baddbmm(conn_mask_dense, mg.key, prev_msg.transpose(1, 2))
+            A_soft = torch.softmax(sim, dim=-1)
+            received = torch.bmm(A_soft, prev_msg)
             received[:, :C] = received[:, :C] + cc_signals[:, t]
 
             # 2. Integrate
@@ -395,14 +393,15 @@ class TestNeuronDynamicsReference:
 
         cc = torch.randn(BS, 1, cfg.C, cfg.D_mem)
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)
+        N = cfg.N_neurons
 
-        # Manual single step with key-based routing
-        key_norm = mg.key / mg.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        neighbor_msgs = mg.prev_messages[:, mg.conn_indices]
-        neighbor_norm = neighbor_msgs / neighbor_msgs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)
-        weights = torch.softmax(sim, dim=-1)
-        received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
+        # Manual single step with dense baddbmm routing
+        mask = torch.full((N, N), -1e4, device=mg.device, dtype=mg.dtype)
+        mask.scatter_(1, mg.conn_indices, 0.0)
+        conn_mask = mask.unsqueeze(0).expand(BS, N, N)
+        sim = torch.baddbmm(conn_mask, mg.key, mg.prev_messages.transpose(1, 2))
+        A_soft = torch.softmax(sim, dim=-1)
+        received = torch.bmm(A_soft, mg.prev_messages)
         received[:, :cfg.C] += cc[:, 0]
 
         h_expected = decay * mg.h + (1 - decay) * received

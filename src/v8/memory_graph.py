@@ -151,6 +151,17 @@ class MemoryGraph:
         self.conn_indices = sorted_idx
         self.conn_mask = self.conn_mask.gather(1, order)
 
+    def _rebuild_conn_mask_dense(self, BS: int):
+        """Build dense [BS, N, N] additive mask for softmax routing.
+
+        0 for connected pairs, -1e4 for unconnected. Used with baddbmm
+        to fuse mask + similarity computation in one call.
+        """
+        N = self.config.N_neurons
+        mask = torch.full((N, N), -1e4, device=self.device, dtype=self.dtype)
+        mask.scatter_(1, self.conn_indices, 0.0)
+        self._conn_mask_dense = mask.unsqueeze(0).expand(BS, N, N).contiguous()
+
     def is_initialized(self) -> bool:
         return self._initialized
 
@@ -199,16 +210,11 @@ class MemoryGraph:
         # Plasticity tracking
         self._plasticity_rewires = 0  # cumulative rewired connections
         self._co_activation_ready = False  # set True after first phi update
-
-        # Cached adjacency matrix (rebuilt when conn_weights change)
-        self._adjacency_dirty = True
-        self._adjacency_cache = None
+        self._conn_mask_dense = None  # rebuilt on first forward / after plasticity
 
         # Triton kernel buffers (allocated once, reused)
         if _HAS_TRITON and self.device.type == 'cuda':
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
-            self._conn_w_norm = torch.zeros(
-                BS, N, K_conn, device=self.device, dtype=self.dtype)
             self._decay_f32 = torch.zeros(
                 BS, N, device=self.device, dtype=torch.float32)
             self._triton_ready = True
@@ -236,8 +242,7 @@ class MemoryGraph:
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
-        # Key-based softmax routing uses Python path (Triton kernel not yet updated)
-        # TODO: write Triton kernel for key-based routing
+        # Dense baddbmm path is faster than Triton 3-pass kernel for key routing
         if False and self._triton_ready and cc_signals.is_cuda:
             return self._forward_segment_triton(cc_signals, eot_mask,
                                                 update_co_activation)
@@ -279,8 +284,11 @@ class MemoryGraph:
         if eot_mask is not None and eot_mask.any():
             has_eot = eot_mask.any(dim=0).tolist()  # [T_seg] bools
 
-        # Pre-compute L2-normalized key for cosine similarity
-        key_norm = self.key / self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [BS, N, D]
+        # Dense connectivity mask: 0 for connected, -inf for unconnected
+        # Precomputed once per segment (topology is static within segment)
+        if not hasattr(self, '_conn_mask_dense') or self._conn_mask_dense is None:
+            self._rebuild_conn_mask_dense(BS)
+        conn_mask_dense = self._conn_mask_dense  # [BS, N, N]
 
         # Per-token sequential loop
         h = self.h                          # [BS, N, D] — internal state
@@ -294,24 +302,15 @@ class MemoryGraph:
         msg_accum = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
 
         for t in range(T_seg):
-            # 1. Receive: key-based content routing (lock-and-key mechanism)
-            # Gather neighbor messages: [BS, N, K, D]
-            neighbor_msgs = prev_msg[:, self.conn_indices]  # [BS, N, K, D]
+            # 1. Receive: key-based content routing via dense ops
+            # baddbmm: mask + key @ msg^T in one fused call → [BS, N, N]
+            sim = torch.baddbmm(conn_mask_dense, self.key, prev_msg.transpose(1, 2))
 
-            # L2-normalize neighbor messages for cosine similarity
-            neighbor_norm = neighbor_msgs / neighbor_msgs.norm(
-                dim=-1, keepdim=True).clamp(min=1e-8)
+            # Softmax over neighbors (masked positions are -inf → 0 weight)
+            A_soft = torch.softmax(sim, dim=-1)  # [BS, N, N]
 
-            # Cosine similarity: my_key · neighbor_msg for each of K neighbors
-            # key_norm: [BS, N, D] → [BS, N, 1, D]
-            # neighbor_norm: [BS, N, K, D]
-            sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)  # [BS, N, K]
-
-            # Softmax over K neighbors → routing weights (sum to 1, content-dependent)
-            weights = torch.softmax(sim, dim=-1)  # [BS, N, K]
-
-            # Weighted sum of neighbor messages
-            received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)  # [BS, N, D]
+            # Weighted sum of all messages (unconnected get 0 weight from softmax)
+            received = torch.bmm(A_soft, prev_msg)  # [BS, N, D]
 
             # Port neurons also receive external CC signal from LM
             received[:, :C] = received[:, :C] + cc_signals[:, t]
@@ -353,33 +352,22 @@ class MemoryGraph:
     def _forward_segment_triton(self, cc_signals: Tensor,
                                 eot_mask: Tensor | None = None,
                                 update_co_activation: bool = True) -> Tensor:
-        """Triton-accelerated per-token neuron dynamics.
+        """Triton-accelerated per-token neuron dynamics with key-based routing.
 
-        Fuses sparse gather + integration + tanh + port output into one kernel
-        per token step. Uses sparse conn_indices instead of dense [N,N] adjacency.
+        Fuses per-token step into one kernel: cosine sim + softmax over K neighbors,
+        weighted sum, integration, tanh, act_trace norm. No materialized [BS,N,K,D].
+        Three passes over K neighbors per program, all in registers.
         """
         BS, T_seg, C, D = cc_signals.shape
         N = self.config.N_neurons
         K = self.config.K_connections
 
-        # Use conn_weights directly if mask is all-active (common case: K < N)
-        # This skips the prepare_sparse_weights_kernel entirely
-        if self.conn_mask.all():
-            conn_w_for_kernel = self.conn_weights
-        elif self._adjacency_dirty:
-            BLOCK_K = triton.next_power_of_2(K)
-            prepare_sparse_weights_kernel[(BS, N)](
-                self.conn_weights, self.conn_mask,
-                self._conn_w_norm,
-                N=N, K=K, BLOCK_K=BLOCK_K,
-            )
-            conn_w_for_kernel = self._conn_w_norm
-            self._adjacency_dirty = False
-        else:
-            conn_w_for_kernel = self._conn_w_norm
-
         # Pre-compute decay as float32
         self._decay_f32.copy_(torch.sigmoid(self.decay_logit))
+
+        # Ensure key is L2-normalized and contiguous
+        key_norm = self.key / self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        key_norm = key_norm.contiguous()
 
         # EOT flags as float32 [BS, T_seg]
         if eot_mask is not None:
@@ -387,22 +375,16 @@ class MemoryGraph:
         else:
             eot_flags = torch.zeros(BS, T_seg, device=self.device, dtype=torch.float32)
 
-        # Ensure cc_signals is contiguous for pointer arithmetic in kernel
         cc_signals = cc_signals.contiguous()
-
         output = torch.empty(BS, T_seg, C, D, device=self.device, dtype=self.dtype)
-
-        # h and prev_messages are modified in-place by the kernel
         grid = (BS, N)
-
-        # Activation trace: norm computed inside kernel (fused, no extra kernel launch)
         act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
 
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
-                self._conn_idx_i32, conn_w_for_kernel,
-                self._decay_f32, self.primitives,
+                self._conn_idx_i32,
+                self._decay_f32, self.primitives, key_norm,
                 cc_signals, eot_flags, output,
                 act_trace,
                 t,
@@ -596,6 +578,9 @@ class MemoryGraph:
 
         # Re-sort for cache locality after topology change
         self._sort_conn_indices()
+
+        # Invalidate dense mask (rebuilt on next forward)
+        self._conn_mask_dense = None
 
         if self._triton_ready:
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
