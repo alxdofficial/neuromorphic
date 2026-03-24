@@ -76,20 +76,26 @@ class V8Diagnostics:
             metrics["mem_usage_frac"] = round(
                 (fr.mean(dim=0) > 0.01).float().mean().item(), 4)
 
-            # Co-activation stats (phi coefficient matrix)
-            phi = mg.co_activation_ema
-            metrics["mem_phi_mean"] = round(phi.mean().item(), 6)
-            metrics["mem_phi_pos_frac"] = round((phi > 0).float().mean().item(), 4)
-            metrics["mem_phi_neg_frac"] = round((phi < 0).float().mean().item(), 4)
-
             # Plasticity counter (cumulative rewires)
             if hasattr(mg, '_plasticity_rewires'):
                 metrics["mem_plasticity_rewires"] = mg._plasticity_rewires
 
-            # Message magnitude (no tanh — messages are h * prim, RMS ≈ 1)
+            # tanh saturation: fraction of |msg| > 0.95
+            msg_abs = mg.prev_messages.abs()
+            metrics["mem_tanh_saturated"] = round(
+                (msg_abs > 0.95).float().mean().item(), 4)
+            # Message magnitude stats
             msg_rms = (mg.prev_messages ** 2).mean(dim=-1).sqrt()
             metrics["mem_msg_rms_mean"] = round(msg_rms.mean().item(), 4)
-            metrics["mem_msg_rms_max"] = round(msg_rms.max().item(), 4)
+            metrics["mem_msg_rms_std"] = round(msg_rms.std().item(), 4)
+
+            # Co-activation signal quality
+            phi = mg.co_activation_ema
+            metrics["mem_phi_mean"] = round(phi.mean().item(), 6)
+            metrics["mem_phi_std"] = round(phi.std().item(), 6)
+            metrics["mem_phi_pos_frac"] = round((phi > 0).float().mean().item(), 4)
+            metrics["mem_phi_neg_frac"] = round((phi < 0).float().mean().item(), 4)
+            metrics["mem_phi_abs_max"] = round(phi.abs().max().item(), 4)
 
             # === LM coupling ===
             lm = self.model.lm

@@ -115,11 +115,6 @@ class MemoryGraph:
         self.device = device
         self.dtype = dtype
 
-        # Precompute decay logit bounds from config
-        import math
-        self._logit_min = math.log(config.decay_min / (1 - config.decay_min))
-        self._logit_max = math.log(config.decay_max / (1 - config.decay_max))
-
         N = config.N_neurons
         K_conn = config.K_connections
 
@@ -172,7 +167,8 @@ class MemoryGraph:
 
         # Per-neuron parameters (neuromodulator-controlled)
         # Primitives modulate outgoing messages: message = tanh(h * primitives)
-        # RMS-normalized per neuron (per-dim scale ≈ 1). Init near 1.0 with noise for symmetry breaking.
+        # RMS-normalized (per-dim ≈ 1). With h self-bounded by convex combination and
+        # tanh on messages, h*prim stays in tanh's linear regime (h per-dim < 1).
         prim_raw = 1.0 + torch.randn(BS, N, D, device=self.device, dtype=self.dtype) * 0.02
         rms = (prim_raw ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = prim_raw / rms
@@ -266,8 +262,9 @@ class MemoryGraph:
           1. Receives presynaptic messages: received = A @ prev_messages
              Port neurons also receive CC signals from the LM.
           2. Integrates stimuli into state: h = decay * h + (1-decay) * received
-          3. RMSNorm on h (bounds state, eliminates port/internal gap)
-          4. Computes outgoing message: message = h * primitives (no tanh)
+             (convex combination — h is self-bounding regardless of decay)
+          3. Computes outgoing message: message = tanh(h * primitives)
+             (L2-normed primitives keep h*prim in tanh's linear regime)
 
         Also tracks per-token activation magnitudes for firing threshold
         and co-activation computation.
@@ -323,12 +320,9 @@ class MemoryGraph:
             else:
                 h = decay * h + one_minus_decay * received
 
-            # 3. RMSNorm on h: bounds state, eliminates port/internal gap
-            h_rms = (h ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
-            h = h / h_rms
-
-            # 4. Compute outgoing message (no tanh — RMSNorm already bounds h)
-            prev_msg = h * self.primitives   # [BS, N, D]
+            # 3. Compute outgoing message
+            # tanh bounds messages; L2-normed primitives keep h*prim in linear regime
+            prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
 
             # Track activation magnitude and accumulate for stats
             act_trace[:, t] = prev_msg.norm(dim=-1).float()
@@ -520,7 +514,8 @@ class MemoryGraph:
         self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Primitives: RMS-normalize per neuron (message scale = h scale ≈ 1)
+        # Primitives: RMS-normalize per neuron (per-dim ≈ 1)
+        # Neuromod controls direction; magnitude preserved at RMS=1
         rms = (self.primitives ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = (self.primitives / rms).to(self.dtype)
 
@@ -528,7 +523,7 @@ class MemoryGraph:
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
         self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
 
-        # Decay: no clamp — RMSNorm on h prevents accumulation at any decay value
+        # Decay: no clamp — convex combination h = d*h + (1-d)*received is self-bounding
 
         self._adjacency_dirty = True
 

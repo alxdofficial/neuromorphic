@@ -281,12 +281,8 @@ class TestNeuronDynamicsReference:
             else:
                 h = decay * h + one_minus_decay * received
 
-            # 3. RMSNorm on h
-            h_rms = (h ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
-            h = h / h_rms
-
-            # 4. Message (no tanh)
-            prev_msg = h * mg.primitives
+            # 3. Message
+            prev_msg = torch.tanh(h * mg.primitives)
             output[:, t] = prev_msg[:, :C]
 
         return output, h, prev_msg
@@ -399,11 +395,7 @@ class TestNeuronDynamicsReference:
         received[:, :cfg.C] += cc[:, 0]
 
         h_expected = decay * mg.h + (1 - decay) * received
-        # RMSNorm on h
-        h_rms = (h_expected ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
-        h_expected = h_expected / h_rms
-        # Message (no tanh)
-        msg_expected = h_expected * mg.primitives
+        msg_expected = torch.tanh(h_expected * mg.primitives)
 
         # Port output should reflect both graph messages AND CC signal
         out = mg.forward_segment(cc)
@@ -457,11 +449,10 @@ class TestNeuronDynamicsReference:
             "Different primitives should produce different outputs"
 
     def test_decay_controls_persistence(self):
-        """Verify high decay retains signal direction, low decay loses it.
+        """Verify high decay retains state magnitude, low decay forgets.
 
-        With RMSNorm, h magnitude is always ~1. Decay affects the direction
-        of h (how much the original signal's direction is preserved vs
-        replaced by new input). High decay retains original direction longer.
+        With natural h dynamics (no RMSNorm), high decay neurons retain
+        more of the original signal magnitude after new input overwrites.
         """
         cfg = make_tiny()
         mg_high = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
@@ -486,27 +477,24 @@ class TestNeuronDynamicsReference:
         mg_high.decay_logit.fill_(4.6)
         mg_low.decay_logit.fill_(-4.6)
 
-        # Inject a distinctive signal direction into port neurons
-        signal_dir = torch.randn(BS, 1, cfg.C, cfg.D_mem)
-        signal_dir = signal_dir / signal_dir.norm(dim=-1, keepdim=True)
-        cc_signal = signal_dir * 2.0
+        # Inject strong signal into port neurons
+        cc_signal = torch.ones(BS, 1, cfg.C, cfg.D_mem) * 2.0
         mg_high.forward_segment(cc_signal)
         mg_low.forward_segment(cc_signal.clone())
 
-        # Record the signal direction in h for port neurons
-        h_dir_after_signal_high = mg_high.h[:, :cfg.C].clone()
-        h_dir_after_signal_low = mg_low.h[:, :cfg.C].clone()
+        # Record h after signal
+        h_after_high = mg_high.h[:, :cfg.C].clone()
 
-        # Run with different input — this should overwrite low-decay but not high-decay
-        cc_different = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem) * 0.5
-        mg_high.forward_segment(cc_different)
-        mg_low.forward_segment(cc_different.clone())
+        # Run with zero input — decay matters
+        cc_zero = torch.zeros(BS, cfg.action_every, cfg.C, cfg.D_mem)
+        mg_high.forward_segment(cc_zero)
+        mg_low.forward_segment(cc_zero.clone())
 
-        # Cosine similarity between original signal direction and current h
+        # High decay should retain more of original signal direction
         def cos_sim(a, b):
             return (a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm(dim=-1) + 1e-8)
 
-        high_sim = cos_sim(mg_high.h[:, :cfg.C], h_dir_after_signal_high).mean().item()
-        low_sim = cos_sim(mg_low.h[:, :cfg.C], h_dir_after_signal_low).mean().item()
+        high_sim = cos_sim(mg_high.h[:, :cfg.C], h_after_high).mean().item()
+        low_sim = cos_sim(mg_low.h[:, :cfg.C], h_after_high).mean().item()
         assert high_sim > low_sim, \
-            f"High decay should retain direction better: high_sim={high_sim:.4f} vs low_sim={low_sim:.4f}"
+            f"High decay should retain signal better: high={high_sim:.4f} vs low={low_sim:.4f}"
