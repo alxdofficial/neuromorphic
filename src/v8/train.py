@@ -76,7 +76,9 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None,
                    help="Resume from checkpoint path (loads LM + neuromod + optimizer state)")
     p.add_argument("--freeze-lower", action="store_true", default=False,
-                   help="Freeze lower scan layers + embedding + output head (for memory finetuning)")
+                   help="Freeze lower scan layers + embedding + output head (upper scan + gate trainable)")
+    p.add_argument("--freeze-lm", action="store_true", default=False,
+                   help="Freeze entire LM (all layers + gate). Only neuromod trains.")
     p.add_argument("--action-every", type=int, default=None,
                    help="Override action_every (segment length). Default: from config (256)")
     return p.parse_args()
@@ -158,8 +160,17 @@ def main():
     print(f"  LM: {lm_params:,} ({lm_params/1e6:.1f}M)")
     print(f"  Neuromod: {total_params - lm_params:,} ({(total_params-lm_params)/1e6:.1f}M)")
 
-    # Freeze lower scan + embedding + output head (for memory finetuning phase)
-    if args.freeze_lower:
+    # Freeze entire LM (Phase 2: only neuromod trains)
+    if args.freeze_lm:
+        frozen_count = 0
+        for param in model.lm.parameters():
+            param.requires_grad = False
+            frozen_count += param.numel()
+        print(f"\n*** FREEZE-LM: frozen ALL {frozen_count:,} LM params. "
+              f"Only neuromod trains. ***")
+
+    # Freeze lower scan + embedding + output head (alternative: upper scan + gate stay trainable)
+    elif args.freeze_lower:
         frozen_count = 0
         for name, param in model.lm.named_parameters():
             # Freeze: embedding, proj_up, lower scan layers (0..split-1), lm_head, ln_final
