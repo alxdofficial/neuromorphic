@@ -301,9 +301,6 @@ class MemoryGraph:
         decay = torch.sigmoid(self.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay                          # [BS, N, 1]
 
-        ema_alpha = self.config.plasticity_ema_decay
-        stats_alpha = 1.0 - ema_alpha  # 0.01 — how fast running stats update
-
         # Pre-check EOT positions (one sync, avoid per-step GPU→CPU transfer)
         has_eot = None
         if eot_mask is not None and eot_mask.any():
@@ -362,9 +359,9 @@ class MemoryGraph:
         self.h = h
         self.prev_messages = prev_msg
 
-        # Update running stats with segment means (all neurons, not just ports)
-        self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * (received_accum / T_seg)
-        self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * (msg_accum / T_seg)
+        # Store previous segment's means (no EMA blur — fresh each segment)
+        self.mean_input = received_accum / T_seg
+        self.mean_output = msg_accum / T_seg
 
         self._post_segment_stats(prev_msg, act_trace,
                                  update_co_activation=update_co_activation)
@@ -411,11 +408,11 @@ class MemoryGraph:
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
 
-        # Update running stats (Triton path: use final messages as proxy for mean_output,
-        # and use h as proxy for mean_input since h ≈ received after low-decay integration)
-        stats_alpha = 1.0 - self.config.plasticity_ema_decay
-        self.mean_output = (1 - stats_alpha) * self.mean_output + stats_alpha * self.prev_messages
-        self.mean_input = (1 - stats_alpha) * self.mean_input + stats_alpha * self.h
+        # Store final state as segment summary (Triton path can't accumulate per-token)
+        # These are the most recent values, not a segment mean — slight inconsistency
+        # with Python path but still fresh per-segment, no EMA blur
+        self.mean_output = self.prev_messages.clone()
+        self.mean_input = self.h.clone()
 
         self._post_segment_stats(self.prev_messages, act_trace,
                                  update_co_activation=update_co_activation)
