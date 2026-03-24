@@ -57,6 +57,7 @@ class V8Config:
     gradient_checkpointing: bool = False
     use_compile: bool = True
     lifelong_mode: bool = False
+    grad_window: int = 4         # backprop window for memory graph (detach every K steps)
 
     @property
     def D_mem(self) -> int:
