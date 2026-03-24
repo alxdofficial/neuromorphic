@@ -34,7 +34,6 @@ class V8Config:
     co_activation_ema_decay: float = 0.995  # slow EMA for co-activation matrix
     structural_plasticity_every: int = 4    # segments between prune-regrow (twice per chunk)
     plasticity_exploration_frac: float = 0.2  # fraction of regrowth that's random
-    activation_std_init: float = 0.1         # initial activation_std_ema (firing threshold warmup)
 
     # Neuromodulator
     neuromod_hidden: int = 1024
@@ -57,7 +56,6 @@ class V8Config:
     gradient_checkpointing: bool = False
     use_compile: bool = True
     lifelong_mode: bool = False
-    grad_window: int = 4         # backprop window for memory graph (detach every K steps)
 
     @property
     def D_mem(self) -> int:

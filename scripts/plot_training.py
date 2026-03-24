@@ -223,8 +223,8 @@ def plot_rl_curves(records, output_path):
         if s:
             _plot_line(ax, s, get_field(all_records, "nm_logstd_prim"), C_PRIM,
                        "primitives")
-            _plot_line(ax, s, get_field(all_records, "nm_logstd_conn"), C_CW,
-                       "conn_weights")
+            _plot_line(ax, s, get_field(all_records, "nm_logstd_key"), C_CW,
+                       "key")
             _plot_line(ax, s, get_field(all_records, "nm_logstd_decay"), C_DECAY,
                        "decay")
             ax.legend()
@@ -310,16 +310,16 @@ def plot_memory_health(records, output_path):
                    C_SAT)
         _setup_ax(ax, "tanh Saturation", "fraction |msg| > 0.95")
 
-        # Row 3: Connectivity, usage, plasticity
+        # Row 3: Key/primitive diversity, usage, plasticity
         ax = axes[2, 0]
         _plot_line(ax, steps,
-                   [r.get("mem_cw_std", 0) for r in mem_records],
-                   C_CW, "weight std")
+                   [r.get("mem_key_diversity", 0) for r in mem_records],
+                   C_CW, "key diversity")
         _plot_line(ax, steps,
-                   [r.get("mem_cw_near_zero", 0) for r in mem_records],
-                   C_GRAD, "near-zero frac")
+                   [r.get("mem_prim_std", 0) for r in mem_records],
+                   C_PRIM, "prim diversity")
         ax.legend()
-        _setup_ax(ax, "Connection Weights", "value")
+        _setup_ax(ax, "Key & Primitive Diversity")
 
         ax = axes[2, 1]
         _plot_line(ax, steps,
@@ -380,13 +380,17 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
         ax.set_ylim(0, 1)
         _setup_ax(ax, "Decay per Neuron", xlabel="Neuron ID")
 
-        # Connection weight heatmap
+        # Key vector heatmap (first 64 neurons)
         ax = axes[1, 0]
-        cw = snap["cw_per_neuron"][:64].numpy()
-        im = ax.imshow(cw, aspect='auto', cmap='RdBu_r', vmin=-0.5, vmax=0.5)
-        plt.colorbar(im, ax=ax)
-        _setup_ax(ax, f"Connection Weights (neurons 0-63)",
-                  ylabel="Neuron ID", xlabel=f"Connection (K={K})")
+        if "key_per_neuron" in snap:
+            key_data = snap["key_per_neuron"][:64].numpy()
+            im = ax.imshow(key_data, aspect='auto', cmap='RdBu_r')
+            plt.colorbar(im, ax=ax)
+            _setup_ax(ax, "Key Vectors (neurons 0-63)",
+                      ylabel="Neuron ID", xlabel="Dimension")
+        else:
+            ax.text(0.5, 0.5, "No key data", ha='center', va='center')
+            _setup_ax(ax, "Key Vectors")
 
         # Fan-in histogram
         ax = axes[1, 1]
@@ -426,7 +430,6 @@ def plot_neuron_graph(snapshot_path, output_path):
     K = cfg["K"]
 
     conn_idx = snap["conn_indices"].numpy()    # [N, K]
-    cw = snap["cw_per_neuron"].numpy()         # [N, K] batch-averaged weights
     h_norm = snap["h_norm_per_neuron"].numpy()  # [N]
     # Handle both old (usage_per_neuron) and new (firing_rate_per_neuron) formats
     if "firing_rate_per_neuron" in snap:
@@ -441,22 +444,16 @@ def plot_neuron_graph(snapshot_path, output_path):
     G.add_nodes_from(range(N))
 
     all_edges = []
-    all_weights = []
     for dst in range(N):
         for k_idx in range(K):
             src = int(conn_idx[dst, k_idx])
-            w = float(cw[dst, k_idx])
             all_edges.append((src, dst))
-            all_weights.append(w)
 
-    all_weights = np.array(all_weights)
-
-    # Only draw top edges by |weight| to keep plot readable
-    # With N=1024 × K=96 = 98K edges, show top ~5K (top 5%)
-    n_draw = min(len(all_weights), max(N * 5, 5000))
-    top_idx = np.argsort(np.abs(all_weights))[-n_draw:]
-    draw_edges = [all_edges[i] for i in top_idx]
-    draw_weights = all_weights[top_idx]
+    # Random subset of edges (routing weights are dynamic, not in snapshot)
+    n_draw = min(len(all_edges), max(N * 5, 5000))
+    rng = np.random.RandomState(42)
+    draw_idx = rng.choice(len(all_edges), n_draw, replace=False)
+    draw_edges = [all_edges[i] for i in draw_idx]
 
     for src, dst in draw_edges:
         G.add_edge(src, dst)
@@ -464,7 +461,7 @@ def plot_neuron_graph(snapshot_path, output_path):
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(1, 1, figsize=(24, 24))
         fig.suptitle(
-            f"Neuron Graph ({N} neurons, top {n_draw} edges by |weight|, "
+            f"Neuron Graph ({N} neurons, {n_draw} sampled edges, "
             f"step {snap['step']})",
             fontsize=16, fontweight="bold")
 
@@ -478,16 +475,8 @@ def plot_neuron_graph(snapshot_path, output_path):
         port_nodes = list(range(C))
         internal_nodes = list(range(C, N))
 
-        # Edge colors by weight
-        w_abs_max = max(np.abs(draw_weights).max(), 1e-6)
-        edge_colors = []
-        for w in draw_weights:
-            intensity = min(abs(w) / w_abs_max, 1.0)
-            alpha = 0.05 + 0.4 * intensity
-            if w >= 0:
-                edge_colors.append((*plt.cm.Reds(0.3 + 0.7 * intensity)[:3], alpha))
-            else:
-                edge_colors.append((*plt.cm.Blues(0.3 + 0.7 * intensity)[:3], alpha))
+        # Uniform edge color (no weights to visualize)
+        edge_colors = [(0.5, 0.5, 0.5, 0.1)] * len(draw_edges)
 
         # Draw edges
         nx.draw_networkx_edges(
@@ -533,10 +522,8 @@ def plot_neuron_graph(snapshot_path, output_path):
                 label=f'Port neurons (0-{C-1})')
         ax.plot([], [], 'o', color='#888', markersize=4,
                 label='Internal neurons (size=firing rate)')
-        ax.plot([], [], '-', color='#d93025', alpha=0.6, linewidth=2,
-                label='Positive weight')
-        ax.plot([], [], '-', color='#1a73e8', alpha=0.6, linewidth=2,
-                label='Negative weight')
+        ax.plot([], [], '-', color='#888', alpha=0.3, linewidth=1,
+                label='Connection')
         ax.legend(loc='upper left', fontsize=10, framealpha=0.9)
 
         ax.axis('off')

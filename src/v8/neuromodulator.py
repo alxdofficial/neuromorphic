@@ -1,7 +1,7 @@
 """Neuromodulator — policy network for memory graph plasticity.
 
 Shared MLP across all neurons. Observes neuron state + plasticity metrics,
-outputs modifications to primitives, connection weights, and decay.
+outputs modifications to primitives, routing keys, and decay.
 Trained by REINFORCE with learned value baseline.
 Collects across multiple chunks for longer reward horizon.
 """
@@ -27,7 +27,6 @@ class Neuromodulator(nn.Module):
         self.config = config
         self.obs_dim = obs_dim
         D_mem = config.D_mem
-        K_conn = config.K_connections
         hidden = config.neuromod_hidden
 
         # Policy backbone (per-neuron)

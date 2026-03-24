@@ -569,9 +569,6 @@ class MemoryGraph:
         # Re-sort for cache locality after topology change
         self._sort_conn_indices()
 
-        # Invalidate dense mask (rebuilt on next forward)
-        self._conn_mask_dense = None
-
         if self._triton_ready:
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
