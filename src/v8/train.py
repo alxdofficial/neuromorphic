@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--tokenizer", type=str, default=TOKENIZER)
     p.add_argument("--no-memory", action="store_true",
                    help="Disable memory graph (LM-only baseline)")
+    p.add_argument("--no-neuromod", action="store_true",
+                   help="Memory ON but neuromod OFF (Phase 1: LM + frozen memory graph)")
     p.add_argument("--compile", action="store_true", default=None)
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--grad-ckpt", action="store_true", default=False,
@@ -175,6 +177,8 @@ def main():
     # Disable memory if requested (LM-only baseline)
     if args.no_memory:
         print("\n*** MEMORY DISABLED — LM-only baseline ***")
+    elif args.no_neuromod:
+        print("\n*** NEUROMOD DISABLED — Phase 1: LM + frozen memory graph ***")
 
     # Compile individual methods (not the module — we call named methods, not forward())
     if config.use_compile and device.type == "cuda":
@@ -274,6 +278,7 @@ def main():
         max_grad_norm=MAX_GRAD_NORM,
         log_interval=args.log_interval,
         use_memory=trainer_use_memory,
+        use_neuromod=not args.no_neuromod,
         neuromod_scheduler=neuromod_scheduler,
     )
 

@@ -65,6 +65,7 @@ class V8Model(nn.Module):
         reset_mask: Tensor | None = None,
         use_memory: bool = True,
         has_reset: bool = False,
+        use_neuromod: bool = True,
     ) -> dict:
         """Process a full T-token chunk with split-scan memory injection.
 
@@ -133,16 +134,17 @@ class V8Model(nn.Module):
         obs_list = []
 
         for seg in range(n_segments):
-            # 1. Neuromod observes and acts
-            obs = self._mem_graph.get_neuron_obs()
-            obs_flat = obs.reshape(BS * N_neurons, -1)
+            # 1. Neuromod observes and acts (skip if disabled)
+            if use_neuromod:
+                obs = self._mem_graph.get_neuron_obs()
+                obs_flat = obs.reshape(BS * N_neurons, -1)
 
-            with torch.no_grad():
-                action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
+                with torch.no_grad():
+                    action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
 
-            obs_list.append(obs_flat.detach())
-            actions.append(action.detach())
-            self._apply_neuromod_action(action, BS)
+                obs_list.append(obs_flat.detach())
+                actions.append(action.detach())
+                self._apply_neuromod_action(action, BS)
 
             # 2. Run memory graph for this segment
             # Only compute co-activation phi when plasticity will run next
@@ -180,7 +182,7 @@ class V8Model(nn.Module):
         # Collect RL data (CE computed once in trainer, passed back here)
         # ==========================================
         rl_data = None
-        if use_memory:
+        if use_memory and use_neuromod:
             rl_data = {
                 "obs": obs_list,              # list of n_segments [BS*N, obs_dim] tensors
                 "actions": actions,           # list of n_segments [BS*N, act_dim] tensors

@@ -38,6 +38,7 @@ class V8Trainer:
         log_interval: int = 50,
         collector=None,
         use_memory: bool = True,
+        use_neuromod: bool = True,
         neuromod_scheduler=None,
     ):
         self.model = model
@@ -52,6 +53,7 @@ class V8Trainer:
         self.collector = collector
         self.global_step = 0
         self.use_memory = use_memory
+        self.use_neuromod = use_neuromod
         self.neuromod_scheduler = neuromod_scheduler
 
         self._states_initialized = False
@@ -99,6 +101,7 @@ class V8Trainer:
                 reset_mask=reset_mask,
                 use_memory=self.use_memory,
                 has_reset=has_reset,
+                use_neuromod=self.use_neuromod,
             )
 
         logits = result["logits"]
