@@ -51,10 +51,8 @@ class Neuromodulator(nn.Module):
 
         self.max_action = config.max_action_magnitude
 
-        # Zero-init heads for stable start
-        for head in [self.prim_head, self.conn_weight_head, self.decay_head]:
-            nn.init.zeros_(head.weight)
-            nn.init.zeros_(head.bias)
+        # Heads use default Kaiming init — nonzero from step 1 so
+        # backbone gets gradients immediately (no zero-init trap)
 
         # Value function: pooled global obs → scalar
         # Separate small MLP (not shared with policy backbone)
