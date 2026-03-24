@@ -86,10 +86,10 @@ class V8Diagnostics:
             if hasattr(mg, '_plasticity_rewires'):
                 metrics["mem_plasticity_rewires"] = mg._plasticity_rewires
 
-            # tanh saturation: fraction of |tanh(h * prim)| > 0.95
-            msg_abs = mg.prev_messages.abs()
-            metrics["mem_tanh_saturated"] = round(
-                (msg_abs > 0.95).float().mean().item(), 4)
+            # Message magnitude (no tanh — messages are h * prim, RMS ≈ 1)
+            msg_rms = (mg.prev_messages ** 2).mean(dim=-1).sqrt()
+            metrics["mem_msg_rms_mean"] = round(msg_rms.mean().item(), 4)
+            metrics["mem_msg_rms_max"] = round(msg_rms.max().item(), 4)
 
             # === LM coupling ===
             lm = self.model.lm

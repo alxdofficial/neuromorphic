@@ -250,11 +250,7 @@ class MemoryGraph:
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
-        # Normalize CC signals to unit norm per port neuron per token
-        # Prevents port neurons from overwhelming internal graph dynamics
-        cc_norm = cc_signals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        cc_signals = cc_signals / cc_norm
-
+        # CC signals enter raw — RMSNorm on h absorbs any scale difference
         if self._triton_ready and cc_signals.is_cuda:
             return self._forward_segment_triton(cc_signals, eot_mask,
                                                 update_co_activation)
@@ -270,7 +266,8 @@ class MemoryGraph:
           1. Receives presynaptic messages: received = A @ prev_messages
              Port neurons also receive CC signals from the LM.
           2. Integrates stimuli into state: h = decay * h + (1-decay) * received
-          3. Computes outgoing message: message = tanh(h * primitives)
+          3. RMSNorm on h (bounds state, eliminates port/internal gap)
+          4. Computes outgoing message: message = h * primitives (no tanh)
 
         Also tracks per-token activation magnitudes for firing threshold
         and co-activation computation.
@@ -326,8 +323,12 @@ class MemoryGraph:
             else:
                 h = decay * h + one_minus_decay * received
 
-            # 3. Compute outgoing message
-            prev_msg = torch.tanh(h * self.primitives)   # [BS, N, D]
+            # 3. RMSNorm on h: bounds state, eliminates port/internal gap
+            h_rms = (h ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+            h = h / h_rms
+
+            # 4. Compute outgoing message (no tanh — RMSNorm already bounds h)
+            prev_msg = h * self.primitives   # [BS, N, D]
 
             # Track activation magnitude and accumulate for stats
             act_trace[:, t] = prev_msg.norm(dim=-1).float()
@@ -519,18 +520,15 @@ class MemoryGraph:
         self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Primitives: RMS-normalize per neuron (per-dim scale ≈ 1)
-        # Keeps h * prim at same scale as h, preventing signal attenuation per hop
+        # Primitives: RMS-normalize per neuron (message scale = h scale ≈ 1)
         rms = (self.primitives ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = (self.primitives / rms).to(self.dtype)
 
-        # Connection weights: L1-normalize per neuron (routing distribution sums to 1)
+        # Connection weights: L1-normalize per neuron (routing distribution)
         w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
         self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
 
-        # Decay: clamp logit so sigmoid stays in [decay_min, decay_max]
-        # Prevents both stateless collapse (→0) and unbounded h accumulation (→1)
-        self.decay_logit = self.decay_logit.clamp(self._logit_min, self._logit_max)
+        # Decay: no clamp — RMSNorm on h prevents accumulation at any decay value
 
         self._adjacency_dirty = True
 

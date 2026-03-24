@@ -257,9 +257,7 @@ class TestNeuronDynamicsReference:
         BS, T_seg, C, D = cc_signals.shape
         N = mg.config.N_neurons
 
-        # Normalize CC signals (same as forward_segment does)
-        cc_norm = cc_signals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        cc_signals = cc_signals / cc_norm
+        # CC signals enter raw (no normalization — RMSNorm on h absorbs scale)
 
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay
@@ -283,8 +281,12 @@ class TestNeuronDynamicsReference:
             else:
                 h = decay * h + one_minus_decay * received
 
-            # 3. Message
-            prev_msg = torch.tanh(h * mg.primitives)
+            # 3. RMSNorm on h
+            h_rms = (h ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+            h = h / h_rms
+
+            # 4. Message (no tanh)
+            prev_msg = h * mg.primitives
             output[:, t] = prev_msg[:, :C]
 
         return output, h, prev_msg
@@ -388,19 +390,20 @@ class TestNeuronDynamicsReference:
         mg.prev_messages = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.1
 
         cc = torch.randn(BS, 1, cfg.C, cfg.D_mem)
-        # Normalize CC (same as forward_segment does)
-        cc_normed = cc / cc.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-
         A = mg._build_adjacency()
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)
 
-        # Manual single step
+        # Manual single step (CC enters raw, no normalization)
         received = torch.bmm(A, mg.prev_messages)
         graph_msg_at_port = received[:, :cfg.C].clone()
-        received[:, :cfg.C] += cc_normed[:, 0]
+        received[:, :cfg.C] += cc[:, 0]
 
         h_expected = decay * mg.h + (1 - decay) * received
-        msg_expected = torch.tanh(h_expected * mg.primitives)
+        # RMSNorm on h
+        h_rms = (h_expected ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        h_expected = h_expected / h_rms
+        # Message (no tanh)
+        msg_expected = h_expected * mg.primitives
 
         # Port output should reflect both graph messages AND CC signal
         out = mg.forward_segment(cc)
@@ -454,10 +457,11 @@ class TestNeuronDynamicsReference:
             "Different primitives should produce different outputs"
 
     def test_decay_controls_persistence(self):
-        """Verify high decay retains state, low decay forgets quickly.
+        """Verify high decay retains signal direction, low decay loses it.
 
-        Isolate decay effect by zeroing connection weights so only
-        CC input → port neuron → decay dynamics are tested.
+        With RMSNorm, h magnitude is always ~1. Decay affects the direction
+        of h (how much the original signal's direction is preserved vs
+        replaced by new input). High decay retains original direction longer.
         """
         cfg = make_tiny()
         mg_high = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
@@ -472,28 +476,37 @@ class TestNeuronDynamicsReference:
         mg_low.conn_indices = mg_high.conn_indices.clone()
         mg_low.conn_mask = mg_high.conn_mask.clone()
 
-        # Zero connectivity so only direct CC input matters (no graph circulation)
+        # Zero connectivity so only direct CC input matters
         mg_high.conn_weights = torch.zeros_like(mg_high.conn_weights)
         mg_low.conn_weights = torch.zeros_like(mg_low.conn_weights)
         mg_high._adjacency_dirty = True
         mg_low._adjacency_dirty = True
 
-        # Set decay: high=0.99 (sigmoid(4.6)≈0.99), low=0.01 (sigmoid(-4.6)≈0.01)
+        # Set decay: high=0.99, low=0.01
         mg_high.decay_logit.fill_(4.6)
         mg_low.decay_logit.fill_(-4.6)
 
-        # Inject strong signal into port neurons
-        cc_signal = torch.ones(BS, 1, cfg.C, cfg.D_mem) * 2.0
+        # Inject a distinctive signal direction into port neurons
+        signal_dir = torch.randn(BS, 1, cfg.C, cfg.D_mem)
+        signal_dir = signal_dir / signal_dir.norm(dim=-1, keepdim=True)
+        cc_signal = signal_dir * 2.0
         mg_high.forward_segment(cc_signal)
         mg_low.forward_segment(cc_signal.clone())
 
-        # Now run with zero input — only decay matters
-        cc_zero = torch.zeros(BS, cfg.action_every, cfg.C, cfg.D_mem)
-        mg_high.forward_segment(cc_zero)
-        mg_low.forward_segment(cc_zero.clone())
+        # Record the signal direction in h for port neurons
+        h_dir_after_signal_high = mg_high.h[:, :cfg.C].clone()
+        h_dir_after_signal_low = mg_low.h[:, :cfg.C].clone()
 
-        # Compare port neuron state only (non-port neurons get no signal with zero weights)
-        high_port_mag = mg_high.h[:, :cfg.C].abs().mean().item()
-        low_port_mag = mg_low.h[:, :cfg.C].abs().mean().item()
-        assert high_port_mag > low_port_mag * 2, \
-            f"High decay ({high_port_mag:.4f}) should retain much more than low ({low_port_mag:.4f})"
+        # Run with different input — this should overwrite low-decay but not high-decay
+        cc_different = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem) * 0.5
+        mg_high.forward_segment(cc_different)
+        mg_low.forward_segment(cc_different.clone())
+
+        # Cosine similarity between original signal direction and current h
+        def cos_sim(a, b):
+            return (a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm(dim=-1) + 1e-8)
+
+        high_sim = cos_sim(mg_high.h[:, :cfg.C], h_dir_after_signal_high).mean().item()
+        low_sim = cos_sim(mg_low.h[:, :cfg.C], h_dir_after_signal_low).mean().item()
+        assert high_sim > low_sim, \
+            f"High decay should retain direction better: high_sim={high_sim:.4f} vs low_sim={low_sim:.4f}"

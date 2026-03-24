@@ -48,7 +48,8 @@ def memory_graph_step_kernel(
     """One step of neuron dynamics for all neurons in one batch element.
 
     Each program handles one (batch, neuron) pair, processing all D dims.
-    Also computes message L2 norm and writes to act_trace (fused, no extra kernel).
+    Includes RMSNorm on h (bounds state), no tanh (RMSNorm sufficient).
+    Fuses message L2 norm into act_trace (no extra kernel).
     """
     b = tl.program_id(0)
     n = tl.program_id(1)
@@ -81,14 +82,18 @@ def memory_graph_step_kernel(
     # --- Temporal integration ---
     h_new = eff_decay * h_val + eff_omd * received
 
-    # --- Compute outgoing message ---
-    msg = libdevice.tanh(h_new * prim)
+    # --- RMSNorm on h: bounds state, eliminates port/internal gap ---
+    h_rms = tl.sqrt(tl.sum(h_new * h_new) / D + 1e-8)
+    h_new = h_new / h_rms
+
+    # --- Compute outgoing message (no tanh — RMSNorm already bounds h) ---
+    msg = h_new * prim
 
     # --- Store results (in-place) ---
     tl.store(h_ptr + (b * N + n) * D + d, h_new.to(tl.bfloat16))
     tl.store(prev_msg_ptr + (b * N + n) * D + d, msg.to(tl.bfloat16))
 
-    # --- Fused message norm → act_trace (eliminates separate .norm() kernel) ---
+    # --- Fused message norm → act_trace ---
     msg_norm = tl.sqrt(tl.sum(msg * msg))
     tl.store(act_trace_ptr + b * T_seg * N + t_step * N + n, msg_norm)
 
