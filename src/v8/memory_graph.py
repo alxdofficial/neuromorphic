@@ -151,6 +151,22 @@ class MemoryGraph:
         self.conn_indices = sorted_idx
         self.conn_mask = self.conn_mask.gather(1, order)
 
+    @torch.no_grad()
+    def _build_routing_adjacency(self) -> Tensor:
+        """Build dense [BS, N, N] adjacency from precomputed routing weights.
+
+        Scatters the [BS, N, K] softmax weights into a dense matrix for bmm.
+        Used by the Python path. Triton path uses sparse weights directly.
+        """
+        BS = self._routing_weights.shape[0]
+        N = self.config.N_neurons
+        K = self.config.K_connections
+
+        A = torch.zeros(BS, N, N, device=self.device, dtype=self.dtype)
+        idx = self.conn_indices.unsqueeze(0).expand(BS, N, K)
+        A.scatter_add_(2, idx, self._routing_weights)
+        return A
+
     def _rebuild_conn_mask_dense(self, BS: int):
         """Build dense [BS, N, N] additive mask for softmax routing.
 
@@ -161,6 +177,28 @@ class MemoryGraph:
         mask = torch.full((N, N), -1e4, device=self.device, dtype=self.dtype)
         mask.scatter_(1, self.conn_indices, 0.0)
         self._conn_mask_dense = mask.unsqueeze(0).expand(BS, N, N).contiguous()
+
+    @torch.no_grad()
+    def _compute_routing_weights(self):
+        """Compute softmax routing weights from key × neighbor messages.
+
+        Called once per segment. Produces [BS, N, K] scalar weights used
+        by the fast sparse Triton kernel for the entire segment.
+        """
+        BS = self.prev_messages.shape[0]
+        N = self.config.N_neurons
+        K = self.config.K_connections
+
+        # Gather neighbor messages: [BS, N, K, D]
+        neighbor_msgs = self.prev_messages[:, self.conn_indices]
+
+        # Raw dot product: key[n] · neighbor_msg[k] for each connection
+        # key: [BS, N, D] → [BS, N, 1, D]
+        # neighbor_msgs: [BS, N, K, D]
+        sim = (self.key.unsqueeze(2) * neighbor_msgs).sum(dim=-1)  # [BS, N, K]
+
+        # Softmax → routing weights (sum to 1 per neuron)
+        self._routing_weights = torch.softmax(sim, dim=-1).to(self.dtype)  # [BS, N, K]
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -242,8 +280,8 @@ class MemoryGraph:
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
-        # Dense baddbmm path is faster than Triton 3-pass kernel for key routing
-        if False and self._triton_ready and cc_signals.is_cuda:
+        # Triton kernel uses precomputed scalar routing weights (same speed as old kernel)
+        if self._triton_ready and cc_signals.is_cuda:
             return self._forward_segment_triton(cc_signals, eot_mask,
                                                 update_co_activation)
         return self._forward_segment_python(cc_signals, eot_mask,
@@ -274,7 +312,6 @@ class MemoryGraph:
         # Pre-compute constants
         decay = torch.sigmoid(self.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay                          # [BS, N, 1]
-        K_conn = self.config.K_connections
 
         ema_alpha = self.config.plasticity_ema_decay
         stats_alpha = 1.0 - ema_alpha  # 0.01 — how fast running stats update
@@ -284,11 +321,11 @@ class MemoryGraph:
         if eot_mask is not None and eot_mask.any():
             has_eot = eot_mask.any(dim=0).tolist()  # [T_seg] bools
 
-        # Dense connectivity mask: 0 for connected, -inf for unconnected
-        # Precomputed once per segment (topology is static within segment)
-        if not hasattr(self, '_conn_mask_dense') or self._conn_mask_dense is None:
-            self._rebuild_conn_mask_dense(BS)
-        conn_mask_dense = self._conn_mask_dense  # [BS, N, N]
+        # Compute routing weights from key × neighbor messages (once per segment)
+        self._compute_routing_weights()
+        # Build dense adjacency from sparse routing weights for bmm
+        A = self._build_routing_adjacency()  # [BS, N, N]
+        use_f32_bmm = not A.is_cuda and A.dtype == torch.bfloat16
 
         # Per-token sequential loop
         h = self.h                          # [BS, N, D] — internal state
@@ -302,15 +339,11 @@ class MemoryGraph:
         msg_accum = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
 
         for t in range(T_seg):
-            # 1. Receive: key-based content routing via dense ops
-            # baddbmm: mask + key @ msg^T in one fused call → [BS, N, N]
-            sim = torch.baddbmm(conn_mask_dense, self.key, prev_msg.transpose(1, 2))
-
-            # Softmax over neighbors (masked positions are -inf → 0 weight)
-            A_soft = torch.softmax(sim, dim=-1)  # [BS, N, N]
-
-            # Weighted sum of all messages (unconnected get 0 weight from softmax)
-            received = torch.bmm(A_soft, prev_msg)  # [BS, N, D]
+            # 1. Receive: sparse weighted sum using precomputed routing weights
+            if use_f32_bmm:
+                received = torch.bmm(A.float(), prev_msg.float()).to(self.dtype)
+            else:
+                received = torch.bmm(A, prev_msg)  # [BS, N, D]
 
             # Port neurons also receive external CC signal from LM
             received[:, :C] = received[:, :C] + cc_signals[:, t]
@@ -352,22 +385,21 @@ class MemoryGraph:
     def _forward_segment_triton(self, cc_signals: Tensor,
                                 eot_mask: Tensor | None = None,
                                 update_co_activation: bool = True) -> Tensor:
-        """Triton-accelerated per-token neuron dynamics with key-based routing.
+        """Triton-accelerated per-token neuron dynamics with precomputed routing.
 
-        Fuses per-token step into one kernel: cosine sim + softmax over K neighbors,
-        weighted sum, integration, tanh, act_trace norm. No materialized [BS,N,K,D].
-        Three passes over K neighbors per program, all in registers.
+        Routing weights computed once per segment from key × neighbor messages.
+        Then the fast sparse kernel runs for all T_seg tokens using those weights.
         """
         BS, T_seg, C, D = cc_signals.shape
         N = self.config.N_neurons
         K = self.config.K_connections
 
+        # Compute routing weights once per segment from key × neighbor messages
+        self._compute_routing_weights()
+        routing_w = self._routing_weights.contiguous()  # [BS, N, K]
+
         # Pre-compute decay as float32
         self._decay_f32.copy_(torch.sigmoid(self.decay_logit))
-
-        # Ensure key is L2-normalized and contiguous
-        key_norm = self.key / self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        key_norm = key_norm.contiguous()
 
         # EOT flags as float32 [BS, T_seg]
         if eot_mask is not None:
@@ -383,8 +415,8 @@ class MemoryGraph:
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
-                self._conn_idx_i32,
-                self._decay_f32, self.primitives, key_norm,
+                self._conn_idx_i32, routing_w,
+                self._decay_f32, self.primitives,
                 cc_signals, eot_flags, output,
                 act_trace,
                 t,

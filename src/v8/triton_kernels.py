@@ -1,15 +1,15 @@
 """Triton kernels for memory graph per-token neuron dynamics.
 
 Fuses the per-token loop body into a single kernel launch per token step:
-  - Key-based softmax routing: cosine sim + softmax over K neighbors
-  - Weighted sum of neighbor messages (no materialized [BS,N,K,D] tensor)
+  - Sparse gather from K presynaptic neighbors using precomputed scalar weights
   - Temporal integration: h = decay * h + (1-decay) * received
   - Message: tanh(h * primitives)
   - Fused message norm → act_trace
 
-Two passes over K neighbors per program (all in registers):
-  Pass 1: compute cosine similarities → softmax weights
-  Pass 2: weighted sum of neighbor messages
+Routing weights are computed once per segment from key × neighbor messages
+(softmax over K neighbors). The kernel uses these fixed scalar weights
+for all tokens in the segment — same structure as the original fixed-weight
+kernel, full speed.
 
 Python fallback in memory_graph.py remains the source of truth for correctness.
 """
@@ -27,11 +27,11 @@ def memory_graph_step_kernel(
 
     # Sparse connectivity (read-only)
     conn_idx_ptr,       # [N, K] int32 — presynaptic neuron indices
+    conn_w_ptr,         # [BS, N, K] bf16 — precomputed softmax routing weights
 
     # Per-neuron constants (read-only within segment)
     decay_ptr,          # [BS, N] float32 — pre-computed sigmoid(decay_logit)
     primitives_ptr,     # [BS, N, D] bf16
-    key_ptr,            # [BS, N, D] bf16 — L2-normalized key vectors
 
     # Per-token inputs/outputs
     cc_signals_ptr,     # [BS, T_seg, C, D] bf16 — full segment CC signals
@@ -52,12 +52,10 @@ def memory_graph_step_kernel(
     C: tl.constexpr,
     T_seg: tl.constexpr,
 ):
-    """One step of neuron dynamics with key-based softmax routing.
+    """One step of neuron dynamics with precomputed routing weights.
 
     Each program handles one (batch, neuron) pair, processing all D dims.
-    Two passes over K neighbors (all in registers, no materialization):
-      Pass 1: cosine similarity → softmax weights
-      Pass 2: weighted sum of neighbor messages
+    Routing weights computed once per segment from key-based softmax.
     """
     b = tl.program_id(0)
     n = tl.program_id(1)
@@ -72,35 +70,14 @@ def memory_graph_step_kernel(
     prim = tl.load(primitives_ptr + (b * N + n) * D + d).to(tl.float32)
     h_val = tl.load(h_ptr + (b * N + n) * D + d).to(tl.float32)
 
-    # Load this neuron's key (already L2-normalized)
-    key = tl.load(key_ptr + (b * N + n) * D + d).to(tl.float32)
-
-    # === Pass 1: Compute cosine similarities, find max (online) ===
-    max_sim = tl.full([], value=-float('inf'), dtype=tl.float32)
-    sum_exp = tl.zeros([], dtype=tl.float32)
-
-    for k in range(K):
-        src = tl.load(conn_idx_ptr + n * K + k)
-        msg_k = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
-        dot = tl.sum(key * msg_k)
-        msg_norm = tl.sqrt(tl.sum(msg_k * msg_k) + 1e-8)
-        sim_k = dot / msg_norm
-        # Online softmax: update max and sum_exp in one pass
-        new_max = tl.maximum(max_sim, sim_k)
-        sum_exp = sum_exp * libdevice.exp(max_sim - new_max) + libdevice.exp(sim_k - new_max)
-        max_sim = new_max
-
-    # === Pass 2: weighted sum with softmax weights ===
+    # --- Sparse gather: received = sum_k w[k] * prev_msg[src[k], :] ---
     received = tl.zeros([D], dtype=tl.float32)
 
     for k in range(K):
         src = tl.load(conn_idx_ptr + n * K + k)
-        msg_k = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
-        dot = tl.sum(key * msg_k)
-        msg_norm = tl.sqrt(tl.sum(msg_k * msg_k) + 1e-8)
-        sim_k = dot / msg_norm
-        w_k = libdevice.exp(sim_k - max_sim) / sum_exp
-        received += w_k * msg_k
+        w = tl.load(conn_w_ptr + (b * N + n) * K + k).to(tl.float32)
+        val = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
+        received += w * val
 
     # --- CC signal injection (port neurons only) ---
     if n < C:
