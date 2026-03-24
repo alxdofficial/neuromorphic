@@ -340,19 +340,25 @@ class V8Model(nn.Module):
         }
 
     def _apply_neuromod_action(self, action: Tensor, BS: int):
-        """Clamp and apply a neuromod action to the memory graph."""
+        """Apply neuromod action to the memory graph.
+
+        Primitives and key are direct predictions (not deltas) — the neuromod
+        outputs what the new values should be. Decay is still additive delta.
+        """
         N = self.config.N_neurons
         D_mem = self.config.D_mem
         max_act = self.config.max_action_magnitude
 
-        clamped = action.clamp(-max_act, max_act).reshape(BS, N, -1)
+        raw = action.reshape(BS, N, -1)
         idx = 0
-        d_prim = clamped[:, :, idx:idx + D_mem]
+        # Primitives and key: direct prediction (no clamp — normalization handles scale)
+        new_prim = raw[:, :, idx:idx + D_mem]
         idx += D_mem
-        d_key = clamped[:, :, idx:idx + D_mem]
+        new_key = raw[:, :, idx:idx + D_mem]
         idx += D_mem
-        d_decay = clamped[:, :, idx]
-        self._mem_graph.apply_actions(d_prim, d_key, d_decay)
+        # Decay: additive delta (clamped)
+        d_decay = raw[:, :, idx].clamp(-max_act, max_act)
+        self._mem_graph.apply_actions(new_prim, new_key, d_decay)
 
     def _save_mem_state(self) -> dict:
         mg = self._mem_graph

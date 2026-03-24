@@ -467,30 +467,36 @@ class MemoryGraph:
         self._co_activation_ready = True
 
     @torch.no_grad()
-    def apply_actions(self, delta_primitives: Tensor,
-                      delta_key: Tensor,
+    def apply_actions(self, new_primitives: Tensor,
+                      new_key: Tensor,
                       delta_decay: Tensor):
         """Apply neuromodulator actions to neuron state.
 
-        Normalization after applying deltas:
-        - primitives: RMS-normalized per neuron (per-dim ≈ 1, controls broadcast direction)
-        - key: L2-normalized per neuron (unit vector, controls what to listen for)
-        - decay: free (convex combination self-bounds h)
+        Direct assignment (not additive delta): the neuromod outputs the new
+        values for primitives and key. This avoids action erasure where
+        additive deltas get normalized away.
+
+        Normalization:
+        - primitives: RMS-normalized per neuron (per-dim ≈ 1)
+        - key: L2-normalized per neuron (unit vector)
+        - decay: additive delta (free, convex combination self-bounds h)
 
         Args:
-            delta_primitives: [BS, N, D_mem]
-            delta_key: [BS, N, D_mem]
-            delta_decay: [BS, N]
+            new_primitives: [BS, N, D_mem] — new primitive directions
+            new_key: [BS, N, D_mem] — new key directions
+            delta_decay: [BS, N] — additive decay logit adjustment
         """
-        self.primitives = (self.primitives + delta_primitives).to(self.dtype)
-        self.key = (self.key + delta_key).to(self.dtype)
+        # Direct assignment for primitives and key (neuromod predicts new values)
+        self.primitives = new_primitives.to(self.dtype)
+        self.key = new_key.to(self.dtype)
+
+        # Decay remains additive (scalar, no normalization to erase it)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Primitives: RMS-normalize (per-dim ≈ 1, controls message content)
+        # Normalize directions
         rms = (self.primitives ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = (self.primitives / rms).to(self.dtype)
 
-        # Key: L2-normalize (unit direction vector, controls routing selectivity)
         key_norm = self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         self.key = (self.key / key_norm).to(self.dtype)
 

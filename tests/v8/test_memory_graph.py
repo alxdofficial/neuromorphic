@@ -143,13 +143,20 @@ class TestMemoryGraphActions:
         prim_before = mg.primitives.clone()
         key_before = mg.key.clone()
 
-        d_prim = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
-        d_key = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
+        # Direct assignment: new_prim and new_key replace current values
+        new_prim = torch.randn(BS, cfg.N_neurons, cfg.D_mem)
+        new_key = torch.randn(BS, cfg.N_neurons, cfg.D_mem)
         d_decay = torch.randn(BS, cfg.N_neurons) * 0.01
-        mg.apply_actions(d_prim, d_key, d_decay)
+        mg.apply_actions(new_prim, new_key, d_decay)
 
         assert not torch.equal(mg.primitives, prim_before)
         assert not torch.equal(mg.key, key_before)
+        # Primitives should be RMS-normalized
+        rms = (mg.primitives ** 2).mean(dim=-1).sqrt()
+        torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-2, rtol=1e-2)
+        # Key should be L2-normalized
+        l2 = mg.key.norm(dim=-1)
+        torch.testing.assert_close(l2, torch.ones_like(l2), atol=1e-2, rtol=1e-2)
 
     def test_get_neuron_obs(self):
         cfg = make_tiny()
