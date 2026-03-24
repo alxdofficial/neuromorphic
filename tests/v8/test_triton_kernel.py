@@ -49,8 +49,6 @@ def make_paired_graphs(cfg, dtype=torch.float32):
     mg_tr.conn_mask = mg_py.conn_mask.clone()
     mg_tr.mean_input = mg_py.mean_input.clone()
     mg_tr.mean_output = mg_py.mean_output.clone()
-    mg_tr.activation_ema = mg_py.activation_ema.clone()
-    mg_tr.activation_std_ema = mg_py.activation_std_ema.clone()
     mg_tr.firing_rate = mg_py.firing_rate.clone()
     mg_tr._adjacency_dirty = True
 

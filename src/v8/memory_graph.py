@@ -193,11 +193,7 @@ class MemoryGraph:
         self.mean_output = torch.zeros(
             BS, N, D, device=self.device, dtype=self.dtype)
 
-        # Adaptive firing threshold stats (per neuron)
-        self.activation_ema = torch.zeros(
-            BS, N, device=self.device, dtype=self.dtype)
-        self.activation_std_ema = torch.ones(
-            BS, N, device=self.device, dtype=self.dtype) * self.config.activation_std_init
+        # Firing stats (per neuron)
         self.firing_rate = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
 
@@ -425,21 +421,17 @@ class MemoryGraph:
         if act_trace is None:
             return
 
-        stats_alpha = 1.0 - self.config.plasticity_ema_decay  # 0.01
         BS, T_seg, N = act_trace.shape
+        stats_alpha = 1.0 - self.config.plasticity_ema_decay  # 0.01
 
-        # Update adaptive firing threshold (per-neuron mean + std of activation)
-        seg_mean = act_trace.mean(dim=1)  # [BS, N]
-        seg_std = act_trace.std(dim=1, correction=0)  # [BS, N]
-        self.activation_ema = (1 - stats_alpha) * self.activation_ema + stats_alpha * seg_mean
-        self.activation_std_ema = (1 - stats_alpha) * self.activation_std_ema + stats_alpha * seg_std
-
-        # Binary firing: activation > (mean + std) per neuron
-        threshold = (self.activation_ema + self.activation_std_ema).unsqueeze(1)  # [BS, 1, N]
+        # Binary firing: per-neuron 75th percentile within this segment
+        # No EMA lag, adapts instantly to any activation scale
+        threshold = torch.quantile(
+            act_trace.float(), 0.75, dim=1, keepdim=True)  # [BS, 1, N]
         fired = (act_trace > threshold).float()  # [BS, T_seg, N]
 
-        # Update firing rate
-        seg_fire_rate = fired.mean(dim=1)  # [BS, N]
+        # Update firing rate EMA
+        seg_fire_rate = fired.mean(dim=1)  # [BS, N] — ~0.25 by construction
         self.firing_rate = (1 - stats_alpha) * self.firing_rate + stats_alpha * seg_fire_rate
 
         # Co-activation phi: only compute when needed (before structural plasticity)
@@ -661,9 +653,6 @@ class MemoryGraph:
 
         self.h = self.h * keep2
         self.prev_messages = self.prev_messages * keep2
-        # Reset firing stats for reset streams (they'll rebuild quickly)
-        self.activation_ema = self.activation_ema * keep1
-        self.activation_std_ema = self.activation_std_ema * keep1 + m1 * self.config.activation_std_init
         self.firing_rate = self.firing_rate * keep1
 
     def state_dict(self) -> dict:
@@ -678,8 +667,6 @@ class MemoryGraph:
             'prev_messages': self.prev_messages,
             'mean_input': self.mean_input,
             'mean_output': self.mean_output,
-            'activation_ema': self.activation_ema,
-            'activation_std_ema': self.activation_std_ema,
             'firing_rate': self.firing_rate,
             'co_activation_ema': self.co_activation_ema,
         }
