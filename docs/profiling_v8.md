@@ -3,6 +3,13 @@
 All measurements on RTX 4090 (24GB), T=2048, torch.compile enabled on LM methods,
 gradient checkpointing OFF. 10 warmup + 10 measured steps in steady state.
 
+> **Note**: These profiling numbers predate the switch from fixed L1-normalized
+> conn_weights to key-based softmax routing. The Triton kernel structure is
+> unchanged (it still uses precomputed scalar routing weights per neighbor),
+> so per-token kernel cost is similar. The main difference is a small per-segment
+> overhead for computing softmax(key . neighbor_messages) routing weights before
+> the token loop begins.
+
 ## Tier Scaling Summary
 
 | Tier | Params | D | L | N_neurons | K | D_mem | BS | w/ memory | w/o memory | Overhead | VRAM |

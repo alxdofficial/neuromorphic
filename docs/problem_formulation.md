@@ -16,8 +16,8 @@ system has three components that operate at different levels:
    persistent memory that evolves with every token but is NOT trained by backprop.
 
 3. **Neuromodulator**: An RL-trained policy network (~10M params) that observes every
-   neuron's state and adjusts primitives (what neurons broadcast), connection weights
-   (routing), and decay (temporal persistence) every 256 tokens. This is the "meta"
+   neuron's state and adjusts primitives (what neurons broadcast), routing keys
+   (what neurons listen for), and decay (temporal persistence) every 256 tokens. This is the "meta"
    system — it learns HOW to configure the memory graph.
 
 ## Current Architecture in Detail
@@ -41,7 +41,7 @@ tokens. No issues here.
 - `prev_messages` [128 dims] — last outgoing message
 - `primitives` [128 dims] — modulates outgoing messages (neuromod-controlled)
 - `decay` — state persistence (neuromod-controlled)
-- 96 connection weights — presynaptic routing (neuromod-controlled)
+- `key` [128 dims] — routing selectivity, L2-normalized (neuromod-controlled)
 
 **Per-token dynamics (sequential, every token):**
 ```
@@ -56,8 +56,8 @@ The LM reads port neurons' messages at every token as `mem_signals`.
 ### The Neuromodulator (RL Agent)
 
 Every 256 tokens (8 times per 2048-token chunk):
-- Observes all 1024 neurons (387 dims each: primitives, mean activity, decay, entropy, plasticity)
-- Outputs per-neuron actions (225 dims: delta_primitives[128] + delta_conn_weights[96] + delta_decay[1])
+- Observes all 1024 neurons (514 dims each: primitives, key, mean input, mean output, firing rate, decay)
+- Outputs per-neuron actions (257 dims: delta_primitives[128] + delta_key[128] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
 **RL training**: Multi-chunk REINFORCE with discounted returns (gamma=0.99), learned V(s)
@@ -105,7 +105,7 @@ longer T will make it worse (cost scales as O(T × N²)).
 ### Problem 2: RL Credit Assignment — Which Actions Mattered?
 
 **The setup**: The neuromodulator takes 8 actions per chunk (one every 256 tokens).
-Each action modifies primitives, connection weights, and decay for all 1024 neurons.
+Each action modifies primitives, routing keys, and decay for all 1024 neurons.
 The reward is the CE loss on the next 256 tokens.
 
 **What we currently do**:
@@ -154,12 +154,12 @@ advantage signal. Remaining concern: the critic sees neuron state but not the te
 content, so it can't fully account for text difficulty variation within similar graph states.
 
 **Q4: Is the action space right?**
-Each action is 225 continuous dims per neuron × 1024 neurons = 230,400 total action
+Each action is 257 continuous dims per neuron x 1024 neurons = 263,168 total action
 dimensions per step. The policy outputs are sampled from a Gaussian with learned std.
-The action is clamped to ±1.0 (L1 normalization bounds the effect). Questions:
+The action is clamped to +/-1.0 (RMS/L2 normalization bounds the effect). Questions:
 - Is 128 dims of delta_primitives too many? Could a lower-rank action suffice?
-- Should conn_weight deltas be per-connection (96 dims) or could we use a shared
-  scaling factor (1 dim) to reduce the action space?
+- Is 128 dims of delta_key too many? The key controls routing selectivity via
+  softmax(key . neighbor_messages) — could a lower-rank perturbation suffice?
 - The same MLP is applied to all neurons — is the obs sufficient for the MLP to
   differentiate neuron roles?
 
@@ -203,8 +203,9 @@ structured, but communicates with the LM through only 16 port neurons.
 
 **Current design**: Every 4 segments (~1024 tokens), co-activation-based plasticity runs.
 Connections with negative phi (anti-correlated firing patterns) are pruned. New connections
-form toward the highest-phi unconnected neuron (80%) or random (20%). Connection weights
-are L1-normalized (energy conservation). Vectorized — no Python loop over neurons.
+form toward the highest-phi unconnected neuron (80%) or random (20%). Routing weights
+are softmax over key-neighbor similarity (sum to 1 by construction). Vectorized — no
+Python loop over neurons.
 
 **Remaining concerns**:
 - The co-activation EMA (decay=0.995) takes ~200 segments to converge, so early plasticity
@@ -217,8 +218,8 @@ are L1-normalized (energy conservation). Vectorized — no Python loop over neur
 
 **Current behavior**: At document boundaries (EOT token):
 - Within a chunk: decay is set to 0 for that token position (h ← received, no carry)
-- At chunk boundaries: only h and prev_messages are zeroed; primitives, conn_weights,
-  decay, and plasticity metrics persist
+- At chunk boundaries: only h, prev_messages, and firing_rate are zeroed; primitives,
+  key, decay, and plasticity metrics persist
 
 **This means**: The graph's structural configuration (what neurons broadcast, how signals
 route, how persistent each neuron's memory is) persists across documents. Only the
@@ -230,7 +231,7 @@ neuromodulator learns to build a graph configuration that's useful across many d
 At inference, the graph starts with a well-configured structure and quickly adapts its
 dynamic state to the new document.
 
-**Open question**: Is this the right split? Should some structural state (conn_weights)
+**Open question**: Is this the right split? Should some structural state (key)
 also partially decay at document boundaries to prevent overfitting to recent documents?
 
 ---
@@ -253,7 +254,7 @@ also partially decay at document boundaries to prevent overfitting to recent doc
 ## Next Steps
 
 1. **Long training run** to see if memory helps (lower loss than no-memory baseline)
-2. **Monitor neuromod behavior**: do primitives diversify? do conn_weights develop structure?
+2. **Monitor neuromod behavior**: do primitives diversify? do routing keys develop structure?
 3. **Ablation**: memory graph with random (untrained) neuromod — does RL matter?
 4. **Scale investigation**: does the 16-port bottleneck limit memory usefulness?
 5. **Speed optimization**: sub-segment message passing, custom kernels

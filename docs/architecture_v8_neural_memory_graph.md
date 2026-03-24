@@ -2,7 +2,7 @@
 
 > **Status**: Implemented. Training entry point: `python -m src.v8.train`
 > **Code**: `src/v8/`
-> **Branch**: `v7-single-scan-stack`
+> **Branch**: `main`
 
 ## Design Philosophy
 
@@ -13,8 +13,8 @@
    network of neurons outside autograd. Signals propagate hop-by-hop at every token.
 
 3. **Plasticity is local and neuromodulated.** The neuromodulator (RL) controls
-   primitives, connection weight distribution, and decay. Structural plasticity
-   (prune/regrow) is autonomous, driven by co-activation statistics.
+   primitives, routing keys, and decay. Structural plasticity (prune/regrow)
+   is autonomous, driven by co-activation statistics.
 
 4. **Per-token neuron dynamics.** Each neuron receives presynaptic messages,
    integrates with internal state, broadcasts a message — at every token.
@@ -48,16 +48,16 @@
 |  Output head: proj_down -> LayerNorm -> lm_head               |
 |  Trained by backprop. ~93M params.                            |
 +-----------------+---------------------------------------------+
-                  | neuron observations (387 dims per neuron)
+                  | neuron observations (514 dims per neuron)
                   v
 +---------------------------------------------------------------+
 |                    NEUROMODULATOR                              |
 |  Multi-chunk REINFORCE + learned V(s) baseline + entropy      |
-|  Actor: 3-layer MLP (387->2048->2048->2048 -> action heads)  |
+|  Actor: 3-layer MLP (514->2048->2048->2048 -> action heads)  |
 |  Critic: MLP (obs_dim->256->256->1), ~165K params             |
 |  Collects 2 chunks (16 segments) before RL update             |
 |  8 actions per chunk (every 256 tokens):                      |
-|    delta_primitive[128] + delta_conn_weights[96] + decay[1]   |
+|    delta_primitive[128] + delta_key[128] + decay[1]           |
 |  ~10M params (actor + critic). Trained by policy gradient.    |
 +---------------------------------------------------------------+
 ```
@@ -106,9 +106,9 @@ Per-column predictive coding with learnable gain modulation:
 1024 neurons with 96 presynaptic connections each. Each neuron has:
 - `h [128]`: internal state — persistent across tokens/chunks
 - `prev_messages [128]`: last outgoing message
-- `primitives [128]`: modulates outgoing messages (neuromod-controlled)
+- `primitives [128]`: modulates outgoing messages, RMS-normalized (neuromod-controlled)
+- `key [128]`: routing selectivity, L2-normalized (neuromod-controlled)
 - `decay_logit [1]`: state persistence (neuromod-controlled)
-- `conn_weights [96]`: presynaptic routing, L1-normalized (neuromod-controlled)
 
 **Per-token neuron dynamics (sequential loop, every token):**
 
@@ -120,16 +120,18 @@ Per-column predictive coding with learnable gain modulation:
 4. OUTPUT: mem_signals[:, t] = prev_messages[:, :C]  (port neurons)
 ```
 
-**Adjacency matrix** `A [BS, N, N]`:
-- Built from sparse `conn_indices` + L1-normalized `conn_weights`
-- L1 normalization: `sum |w| = 1` per neuron (energy conservation)
-- Neuromod controls the distribution, not the magnitude
-- Cached with dirty flag, rebuilt only when conn_weights change
+**Key-based softmax routing:**
+- Each neuron has a `key` vector (L2-normalized, 128 dims)
+- At the start of each segment, compute: `sim = cosine_sim(key, neighbor_messages)`
+- Routing weights: `softmax(sim)` over K=96 neighbors per neuron
+- These scalar routing weights are used for all tokens in the segment
+- The neuromodulator controls routing selectivity via `delta_key`
+- The Triton kernel uses precomputed scalar routing weights (same structure as old fixed-weight kernel)
 
-**Binary firing + adaptive threshold:**
+**Binary firing + percentile threshold:**
 - `activation = message.norm()` per neuron per token
-- `fired = activation > (activation_ema + activation_std_ema)`
-- All relative to the neuron's own statistics, no magic numbers
+- `fired = activation > 75th percentile(activation)` within the segment
+- No per-neuron EMA tracking needed — percentile computed per segment
 - `firing_rate` tracked as EMA for neuromod observation
 
 **Co-activation structural plasticity** (every 4 segments, vectorized):
@@ -141,23 +143,23 @@ Per-column predictive coding with learnable gain modulation:
 - No magic number thresholds — phi < 0 is a natural boundary
 
 **Document boundary resets** (`reset_streams`):
-- Zeros: h, prev_messages, activation_ema, activation_std_ema, firing_rate
-- Preserves: primitives, conn_weights, decay, co_activation_ema, connectivity
+- Zeros: h, prev_messages, firing_rate
+- Preserves: primitives, key, decay, co_activation_ema, connectivity
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
 Shared policy network across all 1024 neurons. Learned value function baseline (critic).
 
-**Observation** per neuron (387 dims):
-- primitive[128] + mean_input[128] + mean_output[128]
-- firing_rate[1] + decay[1] + routing_entropy[1]
+**Observation** per neuron (514 dims):
+- primitive[128] + key[128] + mean_input[128] + mean_output[128]
+- firing_rate[1] + decay[1]
 
-**Action** per neuron (225 dims):
-- delta_primitive[128] + delta_conn_weights[96] + delta_decay[1]
-- Actions clamped to [-1.0, 1.0], then conn_weights L1-renormalized
+**Action** per neuron (257 dims):
+- delta_primitive[128] + delta_key[128] + delta_decay[1]
+- Actions clamped to [-1.0, 1.0], then primitives RMS-normalized, key L2-normalized
 
 **Architecture**:
-- Actor: 3-layer MLP (387->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
+- Actor: 3-layer MLP (514->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
 - Critic: small MLP (obs_dim -> 256 -> 256 -> 1), ~165K params. Takes mean-pooled neuron
   observations as global state. Outputs V(global_state) used as advantage baseline.
 
@@ -179,8 +181,9 @@ Multi-chunk REINFORCE with learned value baseline, entropy bonus, and LR schedul
 ## Training — `src/v8/train.py`
 
 ```bash
-python -u -m src.v8.train --bs 12 --steps 61035 --no-compile
-python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
+python -u -m src.v8.train --bs 12 --steps 61035 --no-compile              # Phase 2: with neuromod
+python -u -m src.v8.train --bs 12 --steps 61035 --no-compile --no-neuromod # Phase 1: LM only
+python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # baseline (no memory)
 ```
 
 **Per step:**
@@ -213,9 +216,9 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
 | action_every | 256 tokens (8 segments per chunk) |
 | neuromod_hidden | 2048 |
 | neuromod_layers | 3 |
-| obs_dim per neuron | 387 |
-| act_dim per neuron | 225 |
-| max_action_magnitude | 1.0 (L1 normalization bounds effect) |
+| obs_dim per neuron | 514 |
+| act_dim per neuron | 257 |
+| max_action_magnitude | 1.0 (RMS/L2 normalization bounds effect) |
 | RL | Multi-chunk REINFORCE (2 chunks), learned V(s) baseline, entropy bonus |
 | T | 2048 |
 | Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
@@ -233,13 +236,14 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory  # baseline
    non-parallelizable (nonlinear recurrence + inter-neuron coupling). Signals
    propagate hop-by-hop through the graph.
 
-3. **L1-normalized connection weights (energy conservation).** Each neuron's
-   weights sum to 1.0 in absolute value. The neuromod controls the distribution,
-   not the magnitude. Strengthening one connection weakens others.
+3. **Key-based softmax routing.** Each neuron has a learned key vector
+   (L2-normalized). Routing weights are `softmax(key . neighbor_messages)`,
+   computed once per segment. The neuromod controls routing selectivity
+   via delta_key. Content-based attention over presynaptic neighbors.
 
 4. **Primitives modulate outgoing messages.** `message = tanh(h * primitives)`.
-   All 1024 neurons use their primitives. Decay controls persistence. Connection
-   weights control routing. Clean separation of concerns.
+   All 1024 neurons use their RMS-normalized primitives. Decay controls
+   persistence. Keys control routing. Clean separation of concerns.
 
 5. **Co-activation-based structural plasticity.** Phi coefficient matrix tracks
    temporal co-firing patterns. Anti-correlated connections pruned (phi < 0).

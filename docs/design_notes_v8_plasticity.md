@@ -2,45 +2,38 @@
 
 ## Changes Summary
 
-### 1. Energy-Conserving Connection Weights
+### 1. Connection Weight Routing (Historical -> Key-Based Softmax)
 
-**Problem**: conn_weights grew unbounded (±16), no normalization on absolute values.
+**Historical**: conn_weights were L1-normalized per neuron after every `apply_actions`,
+giving each neuron a fixed routing budget of 1.0. The neuromod controlled the
+*distribution* of routing, not the total magnitude.
 
-**Fix**: L1-normalize conn_weights per neuron after every `apply_actions`. Each neuron
-has a fixed routing budget of 1.0:
+**Current (replaced)**: conn_weights have been replaced by **key-based softmax routing**.
+Each neuron has a `key` vector (L2-normalized, 128 dims). Routing weights are computed
+as `softmax(cosine_sim(key, neighbor_messages))` over K=96 neighbors, once per segment.
+Weights sum to 1 by construction (softmax). The neuromod controls routing selectivity
+via `delta_key` — adjusting what each neuron "listens for" in its neighbors' messages.
+This is content-based attention over presynaptic neighbors rather than fixed weight
+distribution.
 
-```
-sum_k |conn_weights[n, k]| = 1.0  for every neuron n
-```
-
-The neuromod controls the *distribution* of routing, not the total magnitude.
-Strengthening one connection weakens others — like biological synaptic competition.
-
-**Consequence**: Remove mean-normalization from `_build_adjacency` (no longer needed).
-The L1 normalization IS the normalization. Adjacency scatters raw L1-normalized weights.
-
-With all-positive equal weights: each = 1/96, received = average of neighbors.
-With non-uniform weights: received emphasizes some neighbors, total still bounded.
-
-### 2. Binary Firing + Adaptive Threshold
+### 2. Binary Firing + Percentile Threshold
 
 **Problem**: usage_count used magic `norm > 0.01` threshold.
 
-**Fix**: Per-neuron adaptive firing threshold based on the neuron's own statistics.
+**Previous fix**: Per-neuron adaptive threshold using activation_ema + activation_std_ema.
+
+**Current**: Percentile-based firing threshold (75th percentile within each segment).
 
 ```
-activation = prev_messages.norm(dim=-1)           # scalar per neuron per token
-threshold = activation_ema + activation_std_ema    # one std above mean
-fired = activation > threshold                     # binary
+activation = prev_messages.norm(dim=-1)                    # scalar per neuron per token
+threshold = activation.quantile(0.75, dim=time_dim)        # 75th percentile
+fired = activation > threshold                              # binary
 ```
 
-- `activation_ema`: EMA of activation magnitude (tracks neuron's baseline)
-- `activation_std_ema`: EMA of activation std (tracks neuron's variability),
-  initialized to `activation_std_init` (config, default 0.1) to prevent
-  zero threshold during warmup
-- "Firing" = significantly above that neuron's own average
-- No magic numbers — everything relative to neuron's own statistics
-- Roughly 15-20% firing rate per neuron (one std above mean)
+- No per-neuron EMA tracking needed — threshold computed from the segment's own data
+- "Firing" = activation in the top 25% for that neuron within the segment
+- Roughly 25% firing rate by construction
+- Simpler than the EMA approach — no activation_ema or activation_std_ema state
 
 ### 3. Co-Activation-Based Structural Plasticity
 
@@ -76,10 +69,10 @@ threshold at 0, not a magic number.
 | Old | New | Rationale |
 |-----|-----|-----------|
 | `usage_count: norm > 0.01` | Firing rate from binary threshold | Relative to neuron's own stats |
-| `max_action_magnitude = 0.3` | `1.0` | L1 normalization bounds the effect |
+| `max_action_magnitude = 0.3` | `1.0` | RMS/L2 normalization bounds the effect |
 | `regrown weight = rand * 0.2` | `median(neuron_abs_weights)` | Matches current scale |
 | `prune_threshold = 0.01` | `phi < 0` | Relative, biologically meaningful |
-| `mean_norm in adjacency` | Removed (L1 handles it) | No double normalization |
+| `mean_norm in adjacency` | Removed (softmax handles it) | No double normalization |
 
 ### 5. Decay — Left Alone For Now
 
@@ -90,25 +83,29 @@ we can revisit.
 
 ### 6. Separation of Concerns
 
-**Neuromod controls**: primitives (what neurons say), conn_weights distribution
-(routing allocation), decay (temporal persistence). These are fast, per-segment
-adjustments.
+**Neuromod controls**: primitives (what neurons say), routing keys (what neurons
+listen for), decay (temporal persistence). These are fast, per-segment adjustments.
 
 **Plasticity controls**: which connections exist (topology). This is slow,
 autonomous, driven by observed co-activation patterns. The neuromod doesn't
 directly control topology — it controls routing strength, and weak/anti-correlated
 connections get pruned automatically.
 
-### 7. New State Tensors
+### 7. State Tensors
 
-- `activation_ema` [BS, N] — running mean of activation magnitude
-- `activation_std_ema` [BS, N] — running std of activation magnitude
 - `co_activation_ema` [N, N] — batch-averaged phi coefficient matrix (NOT per-batch,
   topology is shared across batch)
 - `firing_rate` [BS, N] — EMA of per-neuron firing rate (replaces usage_count in obs)
+- `mean_input` [BS, N, D_mem] — per-segment mean of received signals
+- `mean_output` [BS, N, D_mem] — per-segment mean of outgoing messages
+
+Note: `activation_ema` and `activation_std_ema` have been removed — the percentile-based
+firing threshold no longer needs per-neuron EMA tracking.
 
 ### 8. obs_dim Impact
 
-Replace `usage_count` with `firing_rate` in obs. Also removed flow/corr metrics
-(4 dims). obs_dim is now D_mem*3 + 3 = 387 (was 391). Neuromod input layer
-resized accordingly.
+obs_dim is now D_mem*4 + 2 = 514:
+- primitive[128] + key[128] + mean_input[128] + mean_output[128] + firing_rate[1] + decay[1]
+
+Previous value was D_mem*3 + 3 = 387 (before key was added and routing_entropy removed).
+Neuromod input layer resized accordingly.

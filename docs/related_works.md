@@ -64,9 +64,9 @@ but Kanerva is differentiable and was applied to image generation.
 to learn discrete memory addressing in a Neural Turing Machine. Our model extends this
 principle dramatically: instead of RL controlling only where to read/write, our
 neuromodulator controls ALL aspects of memory behavior — neuron primitives (what neurons
-broadcast), connection weights (routing), decay (temporal persistence), and structural
-plasticity (which connections exist). Our RL agent acts on 1024 neurons simultaneously
-with 225-dimensional per-neuron actions, far beyond RL-NTM's scope.
+broadcast), routing keys (what neurons listen for), decay (temporal persistence), and
+structural plasticity (which connections exist). Our RL agent acts on 1024 neurons
+simultaneously with 257-dimensional per-neuron actions, far beyond RL-NTM's scope.
 
 **Learning to Reinforcement Learn** (Wang et al., 2016) trains an LSTM via RL such that
 the recurrent dynamics themselves implement a learned RL algorithm. Our neuromodulator is
@@ -97,12 +97,12 @@ ours is active (the neuromodulator decides how much to change each weight).
 **Backpropamine** (Miconi et al., 2019) is the closest prior work to our neuromodulation
 approach. It adds a network-generated neuromodulatory signal M(t) that gates plasticity:
 `w_plastic += M(t) * alpha * pre * post`. Critical differences:
-1. Backpropamine's neuromodulator is a scalar signal; ours outputs 225-dim per-neuron
+1. Backpropamine's neuromodulator is a scalar signal; ours outputs 257-dim per-neuron
    actions for 1024 neurons
 2. Backpropamine is fully differentiable; ours is trained by REINFORCE
 3. Backpropamine modulates Hebbian update rates; our neuromodulator directly sets
-   primitives, weights, and decay — controlling what neurons represent, not just how
-   fast they learn
+   primitives, routing keys, and decay — controlling what neurons represent, not just
+   how fast they learn
 4. Our neuromodulator simultaneously controls graph topology through structural plasticity
 
 ---
@@ -237,8 +237,8 @@ within autograd; ours are fixed dynamics modulated by RL.
 
 | Aspect | Closest Prior Work | What We Do Differently |
 |--------|-------------------|----------------------|
-| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Full per-neuron RL control: primitives, weights, decay, topology |
-| Per-neuron RL neuromodulation (225 dims × 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron actions, non-differentiable, controls structure not just plasticity rate |
+| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Full per-neuron RL control: primitives, routing keys, decay, topology |
+| Per-neuron RL neuromodulation (257 dims × 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron actions, non-differentiable, controls structure not just plasticity rate |
 | Co-activation structural plasticity | SET/RigL (magnitude/gradient pruning) | Phi coefficient (binary Pearson) drives prune/grow, no magic thresholds |
 | Memory as RL environment (not differentiable module) | All of Category 2 is differentiable | Explicit design choice: memory outside autograd |
 | Per-column predictive coding in scan-based LM | Rao & Ballard (visual cortex theory) | Applied as architectural component in a language model |

@@ -34,7 +34,7 @@ A **brain-inspired sequence model** with three components:
   Memory IS the pattern of activation and connectivity flowing through the graph.
 
 - **Neuromodulator**: An RL-trained policy (REINFORCE with learned value baseline)
-  that modifies neuron primitives, connection weights, and decay. Collects across
+  that modifies neuron primitives, routing keys, and decay. Collects across
   multiple chunks for longer reward horizon. Substitutes for the billions of years
   of evolution that shaped the brain's neuromodulatory systems.
 
@@ -67,7 +67,7 @@ cosine similarity lookup, no discrete read/write schedule. Instead:
 | Memory as activation | Neurons firing through weighted connections | Neural memory graph: h + messages through A |
 | Per-token dynamics | Neurons fire and exchange signals continuously | Sequential loop: receive -> integrate -> message |
 | Neuromodulated plasticity | Dopamine/ACh gate learning rate | RL-trained policy modifies neuron state |
-| Stable signal propagation | Balanced excitation/inhibition | L1-normalized connection weights (energy conservation) |
+| Stable signal propagation | Balanced excitation/inhibition | Key-based softmax routing (weights sum to 1) |
 | Predictive coding | Cortical prediction error signals | PCM: vector surprise per feature group |
 
 ### What We Don't Take from the Brain
@@ -114,9 +114,9 @@ hop-by-hop — K tokens = K hops of inter-neuron communication.
 
 ### Neuromodulator as RL Agent
 
-The neuromodulator observes each neuron's state (primitive, mean activity,
-firing rate, decay, routing entropy) and outputs modifications to primitives,
-connection weight distribution, and decay. Trained via REINFORCE with a learned
+The neuromodulator observes each neuron's state (primitive, key, mean input,
+mean output, firing rate, decay) and outputs modifications to primitives,
+routing keys, and decay. Trained via REINFORCE with a learned
 value function baseline (V(global_state) → scalar). Collects across 2 chunks
 (16 segments) before updating for longer reward horizon. Value bootstrap at
 collection boundary gives credit for structural changes that pay off beyond
@@ -163,8 +163,8 @@ error (D_cc=128 dims per column) feeds into memory as part of the CC signal,
 telling the memory graph which features were unexpected.
 
 ### 5. Stable Signal Propagation via Graph Structure
-L1-normalized connection weights (energy conservation) bound signal propagation.
-Structural plasticity (co-activation-based prune + regrow) reshapes the graph
+Key-based softmax routing (weights sum to 1 by construction) bounds signal
+propagation. Structural plasticity (co-activation-based prune + regrow) reshapes the graph
 over time. Anti-correlated connections are pruned; new connections form toward
 neurons with high temporal co-firing (phi coefficient).
 
