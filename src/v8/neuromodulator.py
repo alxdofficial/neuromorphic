@@ -40,13 +40,13 @@ class Neuromodulator(nn.Module):
 
         # Action heads
         self.prim_head = nn.Linear(hidden, D_mem)
-        self.conn_weight_head = nn.Linear(hidden, K_conn)
+        self.key_head = nn.Linear(hidden, D_mem)
         self.decay_head = nn.Linear(hidden, 1)
 
         # Per-group log_std (state-independent)
         logstd_init = config.neuromod_logstd_init
         self.prim_logstd = nn.Parameter(torch.full((1, D_mem), logstd_init))
-        self.conn_weight_logstd = nn.Parameter(torch.full((1, K_conn), logstd_init))
+        self.key_logstd = nn.Parameter(torch.full((1, D_mem), logstd_init))
         self.decay_logstd = nn.Parameter(torch.full((1, 1), logstd_init))
 
         self.max_action = config.max_action_magnitude
@@ -67,7 +67,7 @@ class Neuromodulator(nn.Module):
 
     @property
     def act_dim(self) -> int:
-        return self.config.D_mem + self.config.K_connections + 1
+        return self.config.D_mem * 2 + 1  # prim + key + decay
 
     def get_action_and_value(
         self, obs: Tensor, action: Tensor | None = None,
@@ -86,13 +86,13 @@ class Neuromodulator(nn.Module):
         """
         h = self.backbone(obs)
         prim_mean = self.prim_head(h)
-        conn_mean = self.conn_weight_head(h)
+        key_mean = self.key_head(h)
         decay_mean = self.decay_head(h)
 
-        mean = torch.cat([prim_mean, conn_mean, decay_mean], dim=-1)
+        mean = torch.cat([prim_mean, key_mean, decay_mean], dim=-1)
         logstd = torch.cat([
             self.prim_logstd.expand_as(prim_mean),
-            self.conn_weight_logstd.expand_as(conn_mean),
+            self.key_logstd.expand_as(key_mean),
             self.decay_logstd.expand_as(decay_mean),
         ], dim=-1)
         std = logstd.exp().clamp(min=1e-6)

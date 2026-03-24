@@ -51,14 +51,9 @@ class V8Diagnostics:
             prim_std = mg.primitives.std(dim=1).mean().item()
             metrics["mem_prim_std"] = round(prim_std, 6)
 
-            # Connection weight stats (L1-normalized, so sum |w| = 1 per neuron)
-            cw = mg.conn_weights
-            metrics["mem_cw_mean"] = round(cw.mean().item(), 6)
-            metrics["mem_cw_std"] = round(cw.std().item(), 6)
-            metrics["mem_cw_max"] = round(cw.abs().max().item(), 6)
-            # Dead connections: fraction with |w| < 0.001 (1/10th of uniform 1/96≈0.01)
-            metrics["mem_cw_near_zero"] = round(
-                (cw.abs() < 0.001).float().mean().item(), 4)
+            # Key stats (L2-normalized, unit direction vectors)
+            key_div = mg.key.std(dim=1).mean().item()  # diversity across neurons
+            metrics["mem_key_diversity"] = round(key_div, 6)
 
             # Decay distribution
             decay = torch.sigmoid(mg.decay_logit)
@@ -146,7 +141,7 @@ class V8Diagnostics:
             snapshot["firing_rate_per_neuron"] = mg.firing_rate.mean(dim=0).cpu()
 
             # Connection weight distribution per neuron [N, K]
-            snapshot["cw_per_neuron"] = mg.conn_weights.mean(dim=0).cpu()
+            snapshot["key_per_neuron"] = mg.key.mean(dim=0).cpu()
             # Connectivity structure [N, K] — topology doesn't change often
             snapshot["conn_indices"] = mg.conn_indices.cpu()
 

@@ -38,7 +38,7 @@ class V8Model(nn.Module):
 
         self._mem_graph = None
         # obs_dim derived from config (matches MemoryGraph.obs_dim property)
-        obs_dim = config.D_mem * 3 + 3  # prim + mean_in + mean_out + firing_rate + decay + entropy
+        obs_dim = config.D_mem * 4 + 2  # prim + key + mean_in + mean_out + firing_rate + decay
         self.neuromod = Neuromodulator(config, obs_dim)
         self._obs_dim = obs_dim
 
@@ -343,17 +343,16 @@ class V8Model(nn.Module):
         """Clamp and apply a neuromod action to the memory graph."""
         N = self.config.N_neurons
         D_mem = self.config.D_mem
-        K_conn = self.config.K_connections
         max_act = self.config.max_action_magnitude
 
         clamped = action.clamp(-max_act, max_act).reshape(BS, N, -1)
         idx = 0
         d_prim = clamped[:, :, idx:idx + D_mem]
         idx += D_mem
-        d_conn = clamped[:, :, idx:idx + K_conn]
-        idx += K_conn
+        d_key = clamped[:, :, idx:idx + D_mem]
+        idx += D_mem
         d_decay = clamped[:, :, idx]
-        self._mem_graph.apply_actions(d_prim, d_conn, d_decay)
+        self._mem_graph.apply_actions(d_prim, d_key, d_decay)
 
     def _save_mem_state(self) -> dict:
         mg = self._mem_graph

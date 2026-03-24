@@ -236,7 +236,7 @@ class TestV8Gradients:
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
         assert not model.memory.primitives.requires_grad
-        assert not model.memory.conn_weights.requires_grad
+        assert not model.memory.key.requires_grad
 
 
 class TestV8ParamCount:

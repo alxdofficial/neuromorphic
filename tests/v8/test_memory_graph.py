@@ -72,17 +72,17 @@ class TestMemoryGraphInit:
         assert mg.primitives.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.h.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.prev_messages.shape == (BS, cfg.N_neurons, cfg.D_mem)
-        assert mg.conn_weights.shape == (BS, cfg.N_neurons, cfg.K_connections)
+        assert mg.key.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
         assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
 
-    def test_conn_weights_l1_normalized(self):
+    def test_key_l2_normalized(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        # Each neuron's conn_weights should sum to 1.0 in abs value
-        l1 = mg.conn_weights.abs().sum(dim=-1)  # [BS, N]
-        torch.testing.assert_close(l1, torch.ones_like(l1), atol=1e-2, rtol=1e-2)
+        # Each neuron's key should be L2-normalized (unit vector)
+        l2 = mg.key.norm(dim=-1)  # [BS, N]
+        torch.testing.assert_close(l2, torch.ones_like(l2), atol=1e-2, rtol=1e-2)
 
     def test_connectivity(self):
         cfg = make_tiny()
@@ -141,13 +141,15 @@ class TestMemoryGraphActions:
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
         prim_before = mg.primitives.clone()
+        key_before = mg.key.clone()
 
         d_prim = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
-        d_conn = torch.randn(BS, cfg.N_neurons, cfg.K_connections) * 0.01
+        d_key = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.01
         d_decay = torch.randn(BS, cfg.N_neurons) * 0.01
-        mg.apply_actions(d_prim, d_conn, d_decay)
+        mg.apply_actions(d_prim, d_key, d_decay)
 
         assert not torch.equal(mg.primitives, prim_before)
+        assert not torch.equal(mg.key, key_before)
 
     def test_get_neuron_obs(self):
         cfg = make_tiny()
@@ -197,9 +199,9 @@ class TestMemoryGraphPlasticity:
             not torch.equal(indices_before, indices_after), \
             "Anti-correlated connection should be pruned and rewired"
 
-        # Weights should still be L1-normalized after plasticity
-        l1 = mg.conn_weights.abs().sum(dim=-1)
-        torch.testing.assert_close(l1, torch.ones_like(l1), atol=1e-2, rtol=1e-2)
+        # Key should still be L2-normalized after plasticity
+        l2 = mg.key.norm(dim=-1)
+        torch.testing.assert_close(l2, torch.ones_like(l2), atol=1e-2, rtol=1e-2)
 
 
 class TestMemoryGraphReset:
@@ -216,7 +218,7 @@ class TestMemoryGraphReset:
         h_before = mg.h.clone()
         msg_before = mg.prev_messages.clone()
         prim_before = mg.primitives.clone()
-        conn_before = mg.conn_weights.clone()
+        key_before = mg.key.clone()
 
         # Reset stream 0 only
         mask = torch.tensor([True, False])
@@ -230,7 +232,7 @@ class TestMemoryGraphReset:
 
         # Structural state: preserved for ALL streams (including stream 0)
         torch.testing.assert_close(mg.primitives, prim_before)
-        torch.testing.assert_close(mg.conn_weights, conn_before)
+        torch.testing.assert_close(mg.key, key_before)
 
 
 class TestNeuronDynamicsReference:
@@ -257,19 +259,25 @@ class TestNeuronDynamicsReference:
         BS, T_seg, C, D = cc_signals.shape
         N = mg.config.N_neurons
 
-        # CC signals enter raw (no normalization — RMSNorm on h absorbs scale)
-
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay
-        A = mg._build_adjacency()
+        K_conn = mg.config.K_connections
+
+        # L2-normalize key for cosine sim
+        key_norm = mg.key / mg.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
         h = mg.h.clone()
         prev_msg = mg.prev_messages.clone()
         output = torch.empty(BS, T_seg, C, D)
 
         for t in range(T_seg):
-            # 1. Receive
-            received = torch.bmm(A, prev_msg)
+            # 1. Receive: key-based softmax routing
+            neighbor_msgs = prev_msg[:, mg.conn_indices]  # [BS, N, K, D]
+            neighbor_norm = neighbor_msgs / neighbor_msgs.norm(
+                dim=-1, keepdim=True).clamp(min=1e-8)
+            sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)
+            weights = torch.softmax(sim, dim=-1)
+            received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
             received[:, :C] = received[:, :C] + cc_signals[:, t]
 
             # 2. Integrate
@@ -334,7 +342,7 @@ class TestNeuronDynamicsReference:
         mg_actual.prev_messages = mg_ref.prev_messages.clone()
         mg_actual.primitives = mg_ref.primitives.clone()
         mg_actual.decay_logit = mg_ref.decay_logit.clone()
-        mg_actual.conn_weights = mg_ref.conn_weights.clone()
+        mg_actual.key = mg_ref.key.clone()
         mg_actual.conn_indices = mg_ref.conn_indices.clone()
         mg_actual.conn_mask = mg_ref.conn_mask.clone()
         mg_actual._adjacency_dirty = True
@@ -386,12 +394,15 @@ class TestNeuronDynamicsReference:
         mg.prev_messages = torch.randn(BS, cfg.N_neurons, cfg.D_mem) * 0.1
 
         cc = torch.randn(BS, 1, cfg.C, cfg.D_mem)
-        A = mg._build_adjacency()
         decay = torch.sigmoid(mg.decay_logit).unsqueeze(-1)
 
-        # Manual single step (CC enters raw, no normalization)
-        received = torch.bmm(A, mg.prev_messages)
-        graph_msg_at_port = received[:, :cfg.C].clone()
+        # Manual single step with key-based routing
+        key_norm = mg.key / mg.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        neighbor_msgs = mg.prev_messages[:, mg.conn_indices]
+        neighbor_norm = neighbor_msgs / neighbor_msgs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)
+        weights = torch.softmax(sim, dim=-1)
+        received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
         received[:, :cfg.C] += cc[:, 0]
 
         h_expected = decay * mg.h + (1 - decay) * received
@@ -434,7 +445,7 @@ class TestNeuronDynamicsReference:
         mg2.h = mg1.h.clone()
         mg2.prev_messages = mg1.prev_messages.clone()
         mg2.decay_logit = mg1.decay_logit.clone()
-        mg2.conn_weights = mg1.conn_weights.clone()
+        mg2.key = mg1.key.clone()
         mg2.conn_indices = mg1.conn_indices.clone()
         mg2.conn_mask = mg1.conn_mask.clone()
 
@@ -468,8 +479,9 @@ class TestNeuronDynamicsReference:
         mg_low.conn_mask = mg_high.conn_mask.clone()
 
         # Zero connectivity so only direct CC input matters
-        mg_high.conn_weights = torch.zeros_like(mg_high.conn_weights)
-        mg_low.conn_weights = torch.zeros_like(mg_low.conn_weights)
+        # Set key to zero to suppress neighbor influence
+        mg_high.key = torch.zeros_like(mg_high.key)
+        mg_low.key = torch.zeros_like(mg_low.key)
         mg_high._adjacency_dirty = True
         mg_low._adjacency_dirty = True
 

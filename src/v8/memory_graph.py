@@ -145,16 +145,11 @@ class MemoryGraph:
         """Sort conn_indices per neuron for cache-friendly sparse gather.
 
         Sorting by source index clusters memory accesses during the gather
-        step, improving L2 cache reuse. conn_weights and conn_mask are
-        reordered to match.
+        step, improving L2 cache reuse.
         """
         sorted_idx, order = self.conn_indices.sort(dim=-1)  # [N, K]
         self.conn_indices = sorted_idx
         self.conn_mask = self.conn_mask.gather(1, order)
-        # Reorder conn_weights [BS, N, K] if initialized
-        if hasattr(self, 'conn_weights') and self.conn_weights is not None:
-            order_expanded = order.unsqueeze(0).expand_as(self.conn_weights)
-            self.conn_weights = self.conn_weights.gather(2, order_expanded)
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -166,20 +161,19 @@ class MemoryGraph:
         K_conn = self.config.K_connections
 
         # Per-neuron parameters (neuromodulator-controlled)
-        # Primitives modulate outgoing messages: message = tanh(h * primitives)
-        # RMS-normalized (per-dim ≈ 1). With h self-bounded by convex combination and
-        # tanh on messages, h*prim stays in tanh's linear regime (h per-dim < 1).
+        # Primitives: what the neuron broadcasts. RMS-normalized (per-dim ≈ 1).
         prim_raw = 1.0 + torch.randn(BS, N, D, device=self.device, dtype=self.dtype) * 0.02
         rms = (prim_raw ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = prim_raw / rms
+
+        # Key: what the neuron listens for. L2-normalized (unit direction vector).
+        # Connection weight = softmax(cosine_sim(neighbor_msg, my_key)) — content-based routing.
+        key_raw = torch.randn(BS, N, D, device=self.device, dtype=self.dtype)
+        self.key = key_raw / key_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
         # Decay: sigmoid(0) = 0.5 — neutral starting point (50% carry)
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
-
-        # Connection weights (neuromodulator-controlled, L1-normalized per neuron)
-        # Init uniform positive, then L1-normalize so sum |w| = 1 per neuron
-        raw_w = torch.rand(BS, N, K_conn, device=self.device, dtype=self.dtype) + 0.01
-        self.conn_weights = raw_w / raw_w.abs().sum(dim=-1, keepdim=True)
 
         # Persistent neuron state
         self.h = torch.zeros(
@@ -242,8 +236,9 @@ class MemoryGraph:
         Returns:
             mem_signals: [BS, T_seg, C, D_mem] — port neuron messages
         """
-        # CC signals enter raw — RMSNorm on h absorbs any scale difference
-        if self._triton_ready and cc_signals.is_cuda:
+        # Key-based softmax routing uses Python path (Triton kernel not yet updated)
+        # TODO: write Triton kernel for key-based routing
+        if False and self._triton_ready and cc_signals.is_cuda:
             return self._forward_segment_triton(cc_signals, eot_mask,
                                                 update_co_activation)
         return self._forward_segment_python(cc_signals, eot_mask,
@@ -274,8 +269,7 @@ class MemoryGraph:
         # Pre-compute constants
         decay = torch.sigmoid(self.decay_logit).unsqueeze(-1)  # [BS, N, 1]
         one_minus_decay = 1.0 - decay                          # [BS, N, 1]
-        A = self._build_adjacency()                            # [BS, N, N]
-        use_f32_bmm = not A.is_cuda and A.dtype == torch.bfloat16
+        K_conn = self.config.K_connections
 
         ema_alpha = self.config.plasticity_ema_decay
         stats_alpha = 1.0 - ema_alpha  # 0.01 — how fast running stats update
@@ -284,6 +278,9 @@ class MemoryGraph:
         has_eot = None
         if eot_mask is not None and eot_mask.any():
             has_eot = eot_mask.any(dim=0).tolist()  # [T_seg] bools
+
+        # Pre-compute L2-normalized key for cosine similarity
+        key_norm = self.key / self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [BS, N, D]
 
         # Per-token sequential loop
         h = self.h                          # [BS, N, D] — internal state
@@ -297,11 +294,24 @@ class MemoryGraph:
         msg_accum = torch.zeros(BS, N, D, device=self.device, dtype=self.dtype)
 
         for t in range(T_seg):
-            # 1. Receive: route presynaptic messages through graph
-            if use_f32_bmm:
-                received = torch.bmm(A.float(), prev_msg.float()).to(self.dtype)
-            else:
-                received = torch.bmm(A, prev_msg)       # [BS, N, D]
+            # 1. Receive: key-based content routing (lock-and-key mechanism)
+            # Gather neighbor messages: [BS, N, K, D]
+            neighbor_msgs = prev_msg[:, self.conn_indices]  # [BS, N, K, D]
+
+            # L2-normalize neighbor messages for cosine similarity
+            neighbor_norm = neighbor_msgs / neighbor_msgs.norm(
+                dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # Cosine similarity: my_key · neighbor_msg for each of K neighbors
+            # key_norm: [BS, N, D] → [BS, N, 1, D]
+            # neighbor_norm: [BS, N, K, D]
+            sim = (key_norm.unsqueeze(2) * neighbor_norm).sum(dim=-1)  # [BS, N, K]
+
+            # Softmax over K neighbors → routing weights (sum to 1, content-dependent)
+            weights = torch.softmax(sim, dim=-1)  # [BS, N, K]
+
+            # Weighted sum of neighbor messages
+            received = (weights.unsqueeze(-1) * neighbor_msgs).sum(dim=2)  # [BS, N, D]
 
             # Port neurons also receive external CC signal from LM
             received[:, :C] = received[:, :C] + cc_signals[:, t]
@@ -486,38 +496,31 @@ class MemoryGraph:
 
     @torch.no_grad()
     def apply_actions(self, delta_primitives: Tensor,
-                      delta_conn_weights: Tensor,
+                      delta_key: Tensor,
                       delta_decay: Tensor):
-        """Apply neuromodulator actions to neuron/connection state.
+        """Apply neuromodulator actions to neuron state.
 
         Normalization after applying deltas:
-        - primitives: L2-normalized per neuron (direction only, unit magnitude)
-        - conn_weights: L1-normalized per neuron (routing distribution, sums to 1)
-        - decay: clamped to [decay_min, decay_max] via logit bounds
-
-        The neuromod controls direction/distribution, not magnitude.
+        - primitives: RMS-normalized per neuron (per-dim ≈ 1, controls broadcast direction)
+        - key: L2-normalized per neuron (unit vector, controls what to listen for)
+        - decay: free (convex combination self-bounds h)
 
         Args:
             delta_primitives: [BS, N, D_mem]
-            delta_conn_weights: [BS, N, K_conn]
+            delta_key: [BS, N, D_mem]
             delta_decay: [BS, N]
         """
         self.primitives = (self.primitives + delta_primitives).to(self.dtype)
-        self.conn_weights = (self.conn_weights + delta_conn_weights).to(self.dtype)
+        self.key = (self.key + delta_key).to(self.dtype)
         self.decay_logit = (self.decay_logit + delta_decay).to(self.dtype)
 
-        # Primitives: RMS-normalize per neuron (per-dim ≈ 1)
-        # Neuromod controls direction; magnitude preserved at RMS=1
+        # Primitives: RMS-normalize (per-dim ≈ 1, controls message content)
         rms = (self.primitives ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = (self.primitives / rms).to(self.dtype)
 
-        # Connection weights: L1-normalize per neuron (routing distribution)
-        w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
-
-        # Decay: no clamp — convex combination h = d*h + (1-d)*received is self-bounding
-
-        self._adjacency_dirty = True
+        # Key: L2-normalize (unit direction vector, controls routing selectivity)
+        key_norm = self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        self.key = (self.key / key_norm).to(self.dtype)
 
     @torch.no_grad()
     def structural_plasticity(self):
@@ -588,21 +591,12 @@ class MemoryGraph:
         worst_k_for_prune = worst_k[prune_neurons]  # [n_prune]
         self.conn_indices[prune_neurons, worst_k_for_prune] = new_targets
 
-        # Init new weights to median of each neuron's current |weights|
-        median_w = self.conn_weights[:, prune_neurons].abs().median(dim=-1).values  # [BS, n_prune]
-        self.conn_weights[:, prune_neurons, worst_k_for_prune] = median_w
-
         # Track cumulative rewires
         self._plasticity_rewires += n_prune
-
-        # Re-normalize weights after topology change
-        w_abs_sum = self.conn_weights.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.conn_weights = (self.conn_weights / w_abs_sum).to(self.dtype)
 
         # Re-sort for cache locality after topology change
         self._sort_conn_indices()
 
-        self._adjacency_dirty = True
         if self._triton_ready:
             self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
 
@@ -615,25 +609,20 @@ class MemoryGraph:
         """
         parts = [
             self.primitives,                              # [BS, N, D_mem]
+            self.key,                                     # [BS, N, D_mem]
             self.mean_input,                              # [BS, N, D_mem]
             self.mean_output,                             # [BS, N, D_mem]
             self.firing_rate.unsqueeze(-1),               # [BS, N, 1]
             torch.sigmoid(self.decay_logit).unsqueeze(-1),# [BS, N, 1]
         ]
 
-        # Routing entropy from connection weights (L1-normalized, so w_abs sums to 1)
-        w_abs = self.conn_weights.abs()
-        eps = torch.tensor(1e-8, dtype=self.dtype, device=self.device)
-        entropy = -(w_abs * (w_abs + eps).log()).sum(dim=-1, keepdim=True)
-        parts.append(entropy)  # [BS, N, 1]
-
         return torch.cat(parts, dim=-1)
 
     @property
     def obs_dim(self) -> int:
         """Observation dimension for neuromodulator."""
-        # D_mem*3 + 2 (firing_rate, decay) + 1 (entropy)
-        return self.config.D_mem * 3 + 3
+        # D_mem*4 (prim + key + mean_in + mean_out) + 2 (firing_rate + decay)
+        return self.config.D_mem * 4 + 2
 
     @torch.no_grad()
     def reset_streams(self, mask: Tensor):
@@ -659,8 +648,8 @@ class MemoryGraph:
         """Export full memory graph state for checkpointing."""
         state = {
             'primitives': self.primitives,
+            'key': self.key,
             'decay_logit': self.decay_logit,
-            'conn_weights': self.conn_weights,
             'conn_indices': self.conn_indices,
             'conn_mask': self.conn_mask,
             'h': self.h,
