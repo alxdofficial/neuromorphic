@@ -138,6 +138,12 @@ def main():
         model.lm.load_state_dict(ckpt["model_state_dict"], strict=False)
         if "neuromod_state_dict" in ckpt:
             model.neuromod.load_state_dict(ckpt["neuromod_state_dict"], strict=False)
+        if "memory_graph_state" in ckpt:
+            # Defer memory graph restore — need BS from first batch
+            _pending_mg_state = ckpt["memory_graph_state"]
+            print(f"  Memory graph state found in checkpoint (will restore on first batch)")
+        else:
+            _pending_mg_state = None
         start_step = ckpt.get("step", 0)
         print(f"  Loaded LM + neuromod from step {start_step}")
         del ckpt
@@ -284,6 +290,15 @@ def main():
 
     # Set start step for resumed training
     trainer.global_step = start_step
+
+    # Restore memory graph state if resuming
+    _pending_mg_state = locals().get('_pending_mg_state', None)
+    if _pending_mg_state is not None:
+        model.initialize_states(bs, device)
+        model.memory.load_state_dict(_pending_mg_state)
+        trainer._states_initialized = True
+        print(f"  Restored memory graph state")
+        del _pending_mg_state
 
     # Output dir
     run_id = time.strftime("%Y%m%d_%H%M%S")
