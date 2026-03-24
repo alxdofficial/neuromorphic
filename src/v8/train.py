@@ -77,6 +77,8 @@ def parse_args():
                    help="Resume from checkpoint path (loads LM + neuromod + optimizer state)")
     p.add_argument("--freeze-lower", action="store_true", default=False,
                    help="Freeze lower scan layers + embedding + output head (for memory finetuning)")
+    p.add_argument("--action-every", type=int, default=None,
+                   help="Override action_every (segment length). Default: from config (256)")
     return p.parse_args()
 
 
@@ -107,6 +109,8 @@ def main():
     if args.compile is not None:
         config.use_compile = args.compile
     config.gradient_checkpointing = args.grad_ckpt
+    if args.action_every is not None:
+        config.action_every = args.action_every
     config.validate()
 
     bs = args.bs
