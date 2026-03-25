@@ -236,15 +236,20 @@ class V8Model(nn.Module):
         # Save memory graph state (to restore after scoring)
         mg_state = mg.state_dict()
 
-        # Use pre-forward carries (saved before this chunk's upper scan)
         split = self.config.scan_split_at
         L = self.config.L_total
+
+        # Save post-forward carries (current state after real forward ran).
+        # These must be restored at the end so the next chunk sees correct state.
+        post_carries = [self.lm._carries[i].clone()
+                        if self.lm._carries[i] is not None else None
+                        for i in range(split, L)]
+
+        # Use pre-forward carries for scoring (saved before this chunk's upper scan)
+        # so each trajectory starts from the same carry state the real forward started from.
         pre_carries = rl_data.get("pre_upper_carries")
         if pre_carries is None:
-            # Fallback: use current carries (less accurate but won't crash)
-            pre_carries = [self.lm._carries[i].clone()
-                           if self.lm._carries[i] is not None else None
-                           for i in range(split, L)]
+            pre_carries = post_carries  # fallback (less accurate)
 
         nm_dtype = next(self.neuromod.parameters()).dtype
         act_dim = self.neuromod.act_dim
@@ -323,9 +328,9 @@ class V8Model(nn.Module):
 
             del mem_out, logits, H, H_enriched, ce
 
-        # Restore real state
+        # Restore real state (post-forward carries, not pre-forward)
         mg.load_state_dict({k: v.clone() for k, v in mg_state.items()})
-        for i, c in enumerate(pre_carries):
+        for i, c in enumerate(post_carries):
             self.lm._carries[split + i] = c
 
         # Z-score normalize trajectory losses
@@ -432,18 +437,6 @@ class V8Model(nn.Module):
         idx += D_mem
         d_decay = clamped[:, :, idx]
         self._mem_graph.apply_actions(d_prim, d_key, d_decay)
-
-    def _save_mem_state(self) -> dict:
-        mg = self._mem_graph
-        state = mg.state_dict()
-        return {k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in state.items()}
-
-    def _restore_mem_state(self, state: dict):
-        mg = self._mem_graph
-        restored = {k: v.clone() if isinstance(v, torch.Tensor) else v
-                    for k, v in state.items()}
-        mg.load_state_dict(restored)
 
     def _reset_carries(self, mask: Tensor):
         if hasattr(self.lm, '_carries'):
