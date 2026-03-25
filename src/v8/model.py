@@ -178,14 +178,14 @@ class V8Model(nn.Module):
             # 4. Apply ALL neuromod actions
             self._apply_neuromod_action(action, BS)
 
-            # 5. Save pre-segment dynamic state
+            # 5. Save actioned values for K neurons (to restore after counterfactual)
+            actioned_prim_k = mg.primitives[:, k_idx].clone()
+            actioned_key_k = mg.key[:, k_idx].clone()
+            actioned_decay_k = mg.decay_logit[:, k_idx].clone()
+
+            # 6. Save pre-segment dynamic state
             pre_h = mg.h.clone()
             pre_msg = mg.prev_messages.clone()
-
-            # Save actioned params (to restore after counterfactual)
-            actioned_prim = mg.primitives.clone()
-            actioned_key = mg.key.clone()
-            actioned_decay = mg.decay_logit.clone()
 
             # --- REAL trajectory ---
             seg_out_A = mg.forward_segment(
@@ -201,26 +201,27 @@ class V8Model(nn.Module):
             post_mean_out = mg.mean_output.clone()
 
             # --- COUNTERFACTUAL trajectory ---
-            # Restore pre-segment state
+            # Restore pre-segment dynamic state
             mg.h = pre_h
             mg.prev_messages = pre_msg
 
-            # Revert K neurons to pre-action values
+            # Revert only K neurons to pre-action values
             mg.primitives[:, k_idx] = saved_prim_k
             mg.key[:, k_idx] = saved_key_k
             mg.decay_logit[:, k_idx] = saved_decay_k
 
             seg_out_B = mg.forward_segment(
                 seg_cc, eot_mask=eot_mask,
-                update_co_activation=False)  # no plasticity stats for counterfactual
+                update_co_activation=False)
             mem_out_B[:, t0:t0 + action_every] = seg_out_B
 
             # --- Restore real trajectory state ---
             mg.h = post_h
             mg.prev_messages = post_msg
-            mg.primitives = actioned_prim
-            mg.key = actioned_key
-            mg.decay_logit = actioned_decay
+            # Restore only K neurons' actioned values (others unchanged)
+            mg.primitives[:, k_idx] = actioned_prim_k
+            mg.key[:, k_idx] = actioned_key_k
+            mg.decay_logit[:, k_idx] = actioned_decay_k
             mg.firing_rate = post_firing
             mg.mean_input = post_mean_in
             mg.mean_output = post_mean_out
