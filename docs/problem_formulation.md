@@ -17,7 +17,7 @@ system has three components that operate at different levels:
 
 3. **Neuromodulator**: An RL-trained policy network (~10M params) that observes every
    neuron's state and adjusts primitives (what neurons broadcast), routing keys
-   (what neurons listen for), and decay (temporal persistence) every 256 tokens. This is the "meta"
+   (what neurons listen for), and decay (temporal persistence) every 128 tokens. This is the "meta"
    system — it learns HOW to configure the memory graph.
 
 ## Current Architecture in Detail
@@ -29,7 +29,7 @@ The LM is a standard scan-based sequence model:
 - Per-column predictive coding modules (16 independent PCMs)
 - Memory injection: `H_enriched = H_mid + gate * mem_signals` (mid-scan, before upper layers)
 - ~93M trainable parameters
-- Throughput: ~85K tok/s without memory (RTX 4090, BS=12)
+- Throughput: ~154K tok/s without memory (RTX 4090, BS=8, compiled)
 
 This part is well-understood and works. The scan layers are fully parallel over T=2048
 tokens. No issues here.
@@ -55,14 +55,14 @@ The LM reads port neurons' messages at every token as `mem_signals`.
 
 ### The Neuromodulator (RL Agent)
 
-Every 256 tokens (8 times per 2048-token chunk):
+Every 128 tokens (16 times per 2048-token chunk):
 - Observes all 1024 neurons (514 dims each: primitives, key, mean input, mean output, firing rate, decay)
-- Outputs per-neuron actions (257 dims: new_primitive[128] + new_key[128] + delta_decay[1])
+- Outputs per-neuron additive deltas (257 dims: delta_primitive[128] + delta_key[128] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
-**RL training**: REINFORCE with counterfactual baseline (revert K=96 random neurons per
-segment, re-run memory graph, compare loss). No value function or critic. RL data collected
-across 4 chunks (32 segments) before computing advantages and updating.
+**RL training**: GRPO trajectory scoring (8 trajectories for K=96 neurons, ranked by CE loss)
++ GAE (lambda=0.95) over all segments. No value function or critic. RL data collected
+across 4 chunks (64 segments) before computing advantages and updating.
 
 ---
 
@@ -79,9 +79,9 @@ nonlinearity (tanh) and inter-neuron coupling (A @ messages) break all paralleli
 At BS=4, that's ~2 GFLOP per token × 2048 tokens = ~4 TFLOP per chunk. The sequential
 loop adds Python overhead on top. Total memory path: ~100ms per chunk.
 
-**Result**: 42K tok/s with memory vs 85K tok/s without. The memory graph is a 50%
-throughput tax. For a research model this is acceptable, but scaling to larger N or
-longer T will make it worse (cost scales as O(T × N²)).
+**Result**: ~53K tok/s collect steps with memory (Triton kernel), ~154K without. With
+GRPO scoring every 4 chunks, average ~16K tok/s. For a research model this is acceptable,
+but scaling to larger N or longer T will make it worse (cost scales as O(T × N × K)).
 
 **Why this can't be trivially parallelized**:
 - The recurrence `h[t] = f(h[t-1], A @ messages[t-1])` has a nonlinear dependency on
@@ -104,22 +104,24 @@ longer T will make it worse (cost scales as O(T × N²)).
 
 ### Problem 2: RL Credit Assignment — Which Actions Mattered?
 
-**The setup**: The neuromodulator takes 8 actions per chunk (one every 256 tokens).
-Each action modifies primitives, routing keys, and decay for all 1024 neurons.
-The reward is the CE loss on the next 256 tokens.
+**The setup**: The neuromodulator takes 16 actions per chunk (one every 128 tokens).
+Each action modifies primitives, routing keys, and decay for all 1024 neurons via
+additive deltas. The reward is the CE loss on the next 128 tokens.
 
 **What we currently do**:
-- Per-segment CE loss as reward (8 rewards per chunk)
-- Multi-chunk collection: rewards gathered across `rl_collect_chunks=4` chunks (32 segments)
+- Per-segment CE loss as reward (16 rewards per chunk)
+- Multi-chunk collection: rewards gathered across `rl_collect_chunks=4` chunks (64 segments)
   before computing advantages and updating
-- Counterfactual baseline: revert K=96 random neurons per segment to their pre-action state,
-  re-run the memory graph, compare loss. Advantage = actual_loss - counterfactual_loss
-- No value function, no critic — the counterfactual provides a per-segment advantage directly
+- GRPO trajectory scoring: sample 8 alternative trajectories for K=96 neurons on the last
+  chunk's text. Each trajectory runs per-segment observe → sample → apply (mirrors real
+  forward). Rank by CE loss, z-score normalize → per-trajectory advantages.
+- GAE (lambda=0.95) over all 64 segments with batch-mean baseline
+- No value function, no critic
 
 **What works**:
-- Each of the 32 actions (across 4 chunks) gets its own advantage
+- Each of the 64 actions (across 4 chunks) gets its own GAE advantage
+- GRPO provides trajectory-level credit assignment for sampled neurons
 - Multi-chunk collection gives the RL agent visibility into cross-chunk effects
-- Counterfactual baseline directly measures each action's causal effect (not just correlation)
 - No critic to train — avoids the explained-variance=0 failure mode seen in earlier runs
 
 **Open questions**:
@@ -133,20 +135,20 @@ to learn that certain structural configurations help the LM predict better, with
 direct gradient signal telling it which configurations are good.
 
 **Q2: Is per-segment reward the right granularity?**
-256 tokens per segment. The neuromod adjusts the graph, then the graph processes 256
-tokens of text. The CE loss on those 256 tokens is the reward. But:
+128 tokens per segment. The neuromod adjusts the graph, then the graph processes 128
+tokens of text. The CE loss on those 128 tokens is the reward. But:
 - The first ~10 tokens after an action barely reflect the structural change (signals
   haven't propagated far through the graph yet)
 - The last tokens in the segment fully reflect the changed graph state
 - Should we weight later tokens more heavily in the segment reward?
 
 **Q3: Can the neuromod distinguish "my action helped" from "this text was easy"?**
-**Addressed by counterfactual baseline.** The counterfactual reverts K=96 random neurons
-per segment to their pre-action state and re-runs the memory graph. The advantage is the
-difference between actual loss and counterfactual loss — this directly measures the causal
-effect of the neuromod's actions, controlling for text difficulty. If the text was easy,
-both actual and counterfactual runs produce low loss, so the advantage is near zero.
-Remaining concern: the counterfactual costs ~2x the memory graph compute per segment.
+**Addressed by GRPO trajectory scoring.** GRPO samples 8 alternative trajectories with
+different stochastic actions on the same text, then ranks by CE loss. The z-score
+normalization cancels out text difficulty — all trajectories see the same text, so
+the advantage reflects action quality, not text ease. Each trajectory runs per-segment
+observe → sample → apply, mirroring real deployment. Cost: 8 extra memory graph +
+upper scan runs every 4 chunks.
 
 **Q4: Is the action space right?**
 Each action is 257 continuous dims per neuron x 1024 neurons = 263,168 total action
@@ -160,11 +162,11 @@ The action is clamped to +/-1.0 (RMS/L2 normalization bounds the effect). Questi
 
 **Q5: Reward horizon — should collection go beyond 4 chunks?**
 **Partially addressed.** Multi-chunk RL collection (`rl_collect_chunks=4`) now gathers
-32 segments (4 chunks) of rewards before computing advantages. The counterfactual baseline
-measures causal effect per segment, so cross-chunk effects within the 4-chunk window are
-captured via the policy gradient over the full collection window. Remaining concern: the
-effective horizon is still limited by the collection window size. A structural change
-that pays off 5+ chunks later still gets attenuated credit.
+64 segments (4 chunks) of rewards before computing GAE advantages. GRPO scores trajectories
+on the last chunk only (8 trajectories). Cross-chunk effects within the 4-chunk window are
+captured via GAE over the full collection window. Remaining concern: the effective horizon
+is still limited by the collection window size. A structural change that pays off 5+ chunks
+later still gets attenuated credit.
 
 ### Problem 3: Memory Graph Signal Dynamics — Does It Actually Help?
 
@@ -235,14 +237,14 @@ also partially decay at document boundaries to prevent overfitting to recent doc
 |--------|--------|------------|
 | LM scan layers | Working, well-understood | High |
 | Memory graph per-token dynamics | Implemented, correct | High |
-| Throughput | 42K tok/s, 50% overhead | Acceptable |
-| Multi-chunk RL rewards | Implemented (4 chunks, 32 segments) | Medium — informative enough? |
-| Credit assignment | Counterfactual baseline (K=96 neurons reverted) | Medium-High — measures causal effect directly |
+| Throughput | ~53K collect, ~16K avg with GRPO | Acceptable |
+| Multi-chunk RL rewards | Implemented (4 chunks, 64 segments) | Medium — informative enough? |
+| Credit assignment | GRPO (8 trajectories, K=96 neurons) + GAE | Medium-High — trajectory ranking controls for text difficulty |
 | Primitives as message modulation | Implemented | Medium — do neurons differentiate? |
 | Structural plasticity | Implemented | Low — random rewiring meaningful? |
 | Memory actually helping LM | Not yet proven | Unknown — need training run |
 | Scale mismatch (CC vs graph signals) | Known issue | Needs investigation |
-| Cross-chunk RL credit | Partially captured (4-chunk window, counterfactual) | Improved |
+| Cross-chunk RL credit | GAE over 64 segments (4-chunk window) | Improved |
 
 ## Next Steps
 

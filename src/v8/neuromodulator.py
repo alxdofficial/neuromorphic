@@ -5,12 +5,15 @@ outputs new primitives, routing keys, and decay delta.
 Trained by REINFORCE with counterfactual baseline (no learned value function).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions import Normal
 
 from .config import V8Config
+
+_LOG_2PI = math.log(2 * math.pi)
 
 
 class Neuromodulator(nn.Module):
@@ -86,12 +89,13 @@ class Neuromodulator(nn.Module):
         mean = mean.nan_to_num(0.0)
         std = std.nan_to_num(1e-2)
 
-        dist = Normal(mean, std)
         if action is None:
-            action = dist.sample()
+            action = mean + std * torch.randn_like(mean)
 
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        # Direct Gaussian log-prob and entropy (avoids Normal object overhead)
+        var = std * std
+        log_prob = (-0.5 * ((action - mean) ** 2 / var + _LOG_2PI) - logstd).sum(dim=-1)
+        entropy = (0.5 * (1.0 + _LOG_2PI) + logstd).sum(dim=-1)
 
         return action, log_prob, entropy, None
 

@@ -125,9 +125,9 @@ def main():
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: REINFORCE + counterfactual baseline (K={config.rl_counterfactual_k}), "
+    print(f"  RL: GRPO (K={config.rl_counterfactual_k}, N_traj={config.rl_counterfactual_n}), "
           f"collect={config.rl_collect_chunks} chunks, "
-          f"action_every={config.action_every}, gamma={config.rl_gamma}")
+          f"action_every={config.action_every}")
 
     # Model
     model = V8Model(config)
@@ -365,11 +365,9 @@ def main():
         # Print periodic summary
         if step % args.log_interval == 0:
             rl_str = ""
-            if "rl_policy_loss" in metrics:
-                rl_str = (f" | rl={metrics['rl_policy_loss']:.4f}"
-                          f" cf={metrics.get('rl_cf_adv', 0):.4f}"
-                          f" adv={metrics.get('rl_adv_mean', 0):.4f}"
-                          f"±{metrics.get('rl_adv_std', 0):.4f}")
+            if "rl_grpo_loss" in metrics:
+                rl_str = (f" | grpo={metrics['rl_grpo_loss']:.4f}"
+                          f" traj_std={metrics.get('rl_traj_adv_std', 0):.4f}")
             mem_str = ""
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"

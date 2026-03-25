@@ -171,13 +171,10 @@ class V8Trainer:
                 scoring = self.model.score_trajectories(
                     last_rl_data, target_ids)
 
-                # GAE advantages + GRPO scoring
-                combined = self.model.compute_grpo_advantages(
-                    scoring, self._rl_buffer)
-
-                # Replay with both GAE and GRPO gradients
+                # GRPO-only replay (no GAE — only scored neurons get gradient)
+                replay_data = self.model.prepare_grpo_replay(scoring)
                 rl_losses = self.model.replay_for_neuromod_grads(
-                    combined,
+                    replay_data,
                     amp_enabled=self.use_amp,
                     amp_dtype=self.amp_dtype,
                 )
@@ -187,18 +184,14 @@ class V8Trainer:
                 ).item()
                 self.neuromod_optimizer.step()
 
-                adv = combined["advantages"]
+                traj_advs = scoring["trajectory_advantages"]
                 rl_metrics.update({
-                    "rl_policy_loss": rl_losses["policy_loss"],
-                    "rl_grpo_loss": rl_losses.get("grpo_loss", 0),
+                    "rl_grpo_loss": rl_losses["grpo_loss"],
                     "rl_entropy": rl_losses["entropy"],
-                    "rl_adv_mean": adv.mean().item(),
-                    "rl_adv_std": adv.std().item(),
                     "rl_nm_grad_norm": nm_grad_norm,
-                    "rl_traj_loss_best": min(
-                        scoring["trajectory_advantages"].tolist()),
-                    "rl_traj_loss_worst": max(
-                        scoring["trajectory_advantages"].tolist()),
+                    "rl_traj_adv_std": traj_advs.std().item(),
+                    "rl_traj_loss_best": traj_advs.max().item(),
+                    "rl_traj_loss_worst": traj_advs.min().item(),
                 })
 
                 self._rl_buffer = []

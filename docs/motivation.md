@@ -33,10 +33,10 @@ A **brain-inspired sequence model** with three components:
   internal state, and broadcast outgoing messages modulated by their primitives.
   Memory IS the pattern of activation and connectivity flowing through the graph.
 
-- **Neuromodulator**: An RL-trained policy (REINFORCE with counterfactual baseline)
-  that assigns new neuron primitives, routing keys, and adjusts decay. Collects across
-  4 chunks (32 segments) for longer reward horizon. Substitutes for the billions of years
-  of evolution that shaped the brain's neuromodulatory systems.
+- **Neuromodulator**: An RL-trained policy (GRPO trajectory scoring + GAE)
+  that adjusts neuron primitives, routing keys, and decay via additive deltas. Collects
+  across 4 chunks (64 segments) for longer reward horizon. Substitutes for the billions
+  of years of evolution that shaped the brain's neuromodulatory systems.
 
 ---
 
@@ -115,12 +115,12 @@ hop-by-hop — K tokens = K hops of inter-neuron communication.
 ### Neuromodulator as RL Agent
 
 The neuromodulator observes each neuron's state (primitive, key, mean input,
-mean output, firing rate, decay) and outputs new values for primitives and
-routing keys, plus a delta for decay (direct assignment, not additive deltas).
-Trained via REINFORCE with a counterfactual baseline: revert K=96 random
-neurons per segment to pre-action state, re-run the memory graph, compare
-loss. No value function or critic. Collects across 4 chunks (32 segments)
-before updating. Neuromod LR decays alongside the LM LR.
+mean output, firing rate, decay) and outputs additive deltas for primitives,
+routing keys, and decay. Trained via GRPO trajectory scoring: sample 8
+alternative trajectories for K=96 neurons on the last chunk, rank by CE loss,
+encourage best trajectories. GAE (lambda=0.95) provides advantages over
+all 64 segments (4 chunks). No value function or critic. Neuromod LR decays
+alongside the LM LR.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.
@@ -210,5 +210,5 @@ In Phase B, long-document perplexity improves as memory accumulates context.
 Memory neurons develop specialization (diverse primitives, structured routing).
 
 ### Hardware: Efficient
-Memory graph roughly halves throughput vs no-memory baseline. ~44K tok/s
-with memory vs ~85K without (RTX 4090, BS=12).
+Collect steps (no GRPO scoring): ~53K tok/s with memory. Average with GRPO
+scoring every 4 chunks: ~16K tok/s (RTX 4090, BS=8).

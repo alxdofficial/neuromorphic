@@ -51,9 +51,9 @@ the wider D_mem (256 vs 128) and more neurons (4096 vs 1024).
 
 RL updates happen every 4 chunks (`rl_collect_chunks=4`). Collect steps are ~20% faster.
 
-> **Note**: The counterfactual baseline (reverting K=96 neurons and re-running the memory
-> graph) adds approximately 2x the memory graph cost per segment during Phase 2. This
-> brings Phase 2 throughput to ~27K tok/s (vs ~68K tok/s in Phase 1 without neuromod).
+> **Note**: GRPO trajectory scoring (8 trajectories on the last chunk) runs every 4 chunks
+> in Phase 2. Collect steps: ~53K tok/s. GRPO scoring steps: ~5K tok/s. Average: ~16K tok/s.
+> Phase 1 (no neuromod): ~68K tok/s.
 
 ### CUDA Time Breakdown (compiled, 10 steps)
 
@@ -71,7 +71,7 @@ Before compile, it was 38% (LM was uncompiled and slower).
 
 ### Memory Graph Internal
 
-The 130ms memory graph time per step (8 segments × 256 tokens):
+The 130ms memory graph time per step (16 segments × 128 tokens):
 - **Triton kernel compute**: ~126ms (sparse gather + integrate + tanh, fused with norm)
 - **Post-segment stats**: ~4ms (firing threshold, co-activation phi on plasticity segments)
 

@@ -107,12 +107,24 @@ class V8Diagnostics:
 
             # === Neuromod policy stats ===
             nm = self.model.neuromod
-            metrics["nm_logstd_prim"] = round(nm.prim_logstd.mean().item(), 4)
-            metrics["nm_logstd_key"] = round(nm.key_logstd.mean().item(), 4)
-            metrics["nm_logstd_decay"] = round(nm.decay_logstd.mean().item(), 4)
+            metrics["nm_logstd_prim"] = round(nm.prim_logstd.mean().item(), 8)
+            metrics["nm_logstd_key"] = round(nm.key_logstd.mean().item(), 8)
+            metrics["nm_logstd_decay"] = round(nm.decay_logstd.mean().item(), 8)
 
-            # Neuromod LR (if optimizer is accessible)
-            # (logged separately in trainer — this is just a fallback)
+            # Action magnitude stats (from policy mean — how large are actions?)
+            # Sample a dummy obs to check policy output scale
+            if mg.h is not None and mg.h.shape[0] > 0:
+                obs = mg.get_neuron_obs()[:1]  # [1, N, obs_dim] — single batch
+                obs_flat = obs.reshape(-1, obs.shape[-1])
+                nm_dtype = next(nm.parameters()).dtype
+                with torch.no_grad():
+                    action, _, _, _ = nm.get_action_and_value(obs_flat.to(nm_dtype))
+                act_abs = action.abs()
+                metrics["nm_action_mean_abs"] = round(act_abs.mean().item(), 4)
+                metrics["nm_action_max"] = round(act_abs.max().item(), 4)
+                max_act = self.model.config.max_action_magnitude
+                metrics["nm_action_clip_frac"] = round(
+                    (act_abs > max_act * 0.99).float().mean().item(), 4)
 
         return metrics
 

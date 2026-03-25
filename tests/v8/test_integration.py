@@ -135,8 +135,8 @@ class TestV8ModelForward:
 
         # Score trajectories on last chunk
         scoring = model.score_trajectories(collected[-1], target_ids)
-        combined = model.compute_grpo_advantages(scoring, collected)
-        model.replay_for_neuromod_grads(combined, amp_enabled=False)
+        replay_data = model.prepare_grpo_replay(scoring)
+        model.replay_for_neuromod_grads(replay_data, amp_enabled=False)
 
         has_policy_grad = False
         for name, p in model.neuromod.named_parameters():

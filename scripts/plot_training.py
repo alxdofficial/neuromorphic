@@ -6,7 +6,7 @@ Usage:
 
 Produces:
     <run_dir>/plots/training_curves.png     — loss, ppl, LR, throughput
-    <run_dir>/plots/rl_curves.png           — RL policy loss, value, advantages, exploration
+    <run_dir>/plots/rl_curves.png           — RL policy loss, GRPO, advantages, exploration
     <run_dir>/plots/memory_health.png       — memory graph state, coupling, plasticity
     <run_dir>/plots/memory_connectivity.png — (from snapshot) neuron graph visualization
 """
@@ -32,28 +32,28 @@ STYLE = {
     "axes.facecolor": "white",
     "axes.edgecolor": "#bbb",
     "axes.labelcolor": "#333",
-    "axes.titlesize": 11,
-    "axes.labelsize": 9,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
     "xtick.color": "#555",
     "ytick.color": "#555",
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
     "grid.color": "#ddd",
     "grid.alpha": 0.7,
     "text.color": "#222",
-    "legend.fontsize": 8,
+    "legend.fontsize": 9,
     "legend.facecolor": "white",
     "legend.edgecolor": "#ccc",
 }
 
-# Colors that read well on white
+# Colors — high contrast on white, distinguishable pairs
 C_LOSS = "#1a73e8"
 C_PPL = "#d93025"
 C_LR = "#188038"
 C_LR2 = "#e37400"
 C_TPUT = "#7b1fa2"
 C_RL = "#e37400"
-C_VAL = "#0d904f"
+C_GRPO = "#1a73e8"
 C_ADV = "#1a73e8"
 C_ENT = "#c2185b"
 C_GRAD = "#616161"
@@ -64,8 +64,10 @@ C_FIRE = "#188038"
 C_FIRE2 = "#0d904f"
 C_PHI = "#7b1fa2"
 C_USAGE = "#1a73e8"
-C_CW = "#e37400"
+C_KEY = "#e37400"
 C_SAT = "#c2185b"
+C_TRAJ_BEST = "#188038"
+C_TRAJ_WORST = "#d93025"
 
 
 def load_metrics(path):
@@ -96,26 +98,23 @@ def get_steps(records, key):
     return [r["step"] for r in records if key in r]
 
 
-def _plot_line(ax, steps, vals, color, label=None):
+def _plot_line(ax, steps, vals, color, label=None, linewidth=2.5):
     """Plot raw + smoothed line with good visibility."""
     arr = np.array(vals)
     if len(arr) > 200:
-        # Enough data: faint raw + bold smooth
-        ax.plot(steps, arr, alpha=0.2, color=color, linewidth=0.5)
+        ax.plot(steps, arr, alpha=0.15, color=color, linewidth=0.5)
         s = smooth(arr)
-        ax.plot(steps[:len(s)], s, color=color, linewidth=2.5, label=label)
+        ax.plot(steps[:len(s)], s, color=color, linewidth=linewidth, label=label)
     elif len(arr) > 50:
-        # Medium data: lighter raw + thinner smooth
-        ax.plot(steps, arr, alpha=0.3, color=color, linewidth=0.8)
+        ax.plot(steps, arr, alpha=0.25, color=color, linewidth=0.8)
         s = smooth(arr, window=max(len(arr) // 8, 3))
-        ax.plot(steps[:len(s)], s, color=color, linewidth=2.0, label=label)
+        ax.plot(steps[:len(s)], s, color=color, linewidth=linewidth, label=label)
     else:
-        # Few points: just draw the line directly, fully visible
-        ax.plot(steps, arr, color=color, linewidth=2.0, alpha=0.9, label=label)
+        ax.plot(steps, arr, color=color, linewidth=linewidth, alpha=0.9, label=label)
 
 
 def _setup_ax(ax, title, ylabel=None, xlabel="Step"):
-    ax.set_title(title, fontweight="bold")
+    ax.set_title(title, fontweight="bold", pad=8)
     if ylabel:
         ax.set_ylabel(ylabel)
     ax.set_xlabel(xlabel)
@@ -130,7 +129,7 @@ def plot_training_curves(records, output_path):
     """Loss, PPL, LR (both), throughput."""
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        fig.suptitle("Training Curves", fontsize=16, fontweight="bold", color="white")
+        fig.suptitle("Training Curves", fontsize=16, fontweight="bold")
 
         # Loss
         ax = axes[0, 0]
@@ -155,20 +154,27 @@ def plot_training_curves(records, output_path):
         nm_lr = get_field(records, "nm_lr")
         nm_lr_steps = get_steps(records, "nm_lr")
         if lr_steps:
-            ax.plot(lr_steps, lr, color=C_LR, linewidth=1.5, label="LM")
+            ax.plot(lr_steps, lr, color=C_LR, linewidth=2.0, label="LM")
         if nm_lr_steps:
-            ax.plot(nm_lr_steps, nm_lr, color=C_LR2, linewidth=1.5,
+            ax.plot(nm_lr_steps, nm_lr, color=C_LR2, linewidth=2.0,
                     linestyle="--", label="Neuromod")
         ax.legend()
         _setup_ax(ax, "Learning Rate Schedule", "LR")
 
-        # Throughput
+        # Throughput (smoothed only — raw alternates between collect/RL steps)
         ax = axes[1, 1]
         tok_s = get_field(records, "tok_s")
         tok_steps = get_steps(records, "tok_s")
         if tok_steps:
-            tok_k = [t / 1000 for t in tok_s]
-            _plot_line(ax, tok_steps, tok_k, C_TPUT)
+            tok_k = np.array([t / 1000 for t in tok_s])
+            if len(tok_k) > 100:
+                # Wide window to average out collect/RL alternation
+                s = smooth(tok_k, window=min(100, len(tok_k) // 4))
+                ax.plot(tok_steps[:len(s)], s, color=C_TPUT, linewidth=2.5,
+                        label="avg")
+                ax.legend()
+            else:
+                ax.plot(tok_steps, tok_k, color=C_TPUT, linewidth=2.0)
             _setup_ax(ax, "Throughput", "K tok/s")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -178,55 +184,53 @@ def plot_training_curves(records, output_path):
 
 
 def plot_rl_curves(records, output_path):
-    """RL policy loss, value loss, advantages, exploration, explained variance."""
-    rl_records = [r for r in records if "rl_policy_loss" in r]
+    """GRPO loss, trajectory spread, exploration, entropy."""
+    rl_records = [r for r in records if "rl_grpo_loss" in r]
     if not rl_records:
         print("  No RL data found, skipping rl_curves")
         return
 
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle("RL / Neuromodulator", fontsize=16, fontweight="bold", color="white")
+        fig.suptitle("RL / Neuromodulator", fontsize=16, fontweight="bold")
 
         steps = [r["step"] for r in rl_records]
 
-        # Policy loss
+        # GRPO loss
         ax = axes[0, 0]
-        vals = [r["rl_policy_loss"] for r in rl_records]
-        _plot_line(ax, steps, vals, C_RL)
-        _setup_ax(ax, "Policy Loss")
+        vals = [r["rl_grpo_loss"] for r in rl_records]
+        _plot_line(ax, steps, vals, C_GRPO)
+        _setup_ax(ax, "GRPO Loss")
 
-        # Value loss
+        # Trajectory spread (best vs worst)
         ax = axes[0, 1]
-        vals = [r.get("rl_value_loss", 0) for r in rl_records]
-        _plot_line(ax, steps, vals, C_VAL)
-        _setup_ax(ax, "Value Loss (critic)")
+        has_traj = [r for r in rl_records if "rl_traj_loss_best" in r]
+        if has_traj:
+            t_steps = [r["step"] for r in has_traj]
+            best = [r["rl_traj_loss_best"] for r in has_traj]
+            worst = [r["rl_traj_loss_worst"] for r in has_traj]
+            _plot_line(ax, t_steps, best, C_TRAJ_BEST, "best trajectory")
+            _plot_line(ax, t_steps, worst, C_TRAJ_WORST, "worst trajectory")
+            ax.legend()
+        _setup_ax(ax, "GRPO Trajectory Spread", "z-score advantage")
 
-        # Explained variance
+        # Trajectory advantage std (signal strength)
         ax = axes[0, 2]
-        vals = [r.get("rl_explained_var", 0) for r in rl_records]
+        vals = [r.get("rl_traj_adv_std", 0) for r in rl_records]
         _plot_line(ax, steps, vals, C_ADV)
-        ax.axhline(y=0, color="#666", linestyle="--", linewidth=0.8)
-        ax.axhline(y=1, color="#666", linestyle="--", linewidth=0.8)
-        _setup_ax(ax, "Value Explained Variance", "EV (0=useless, 1=perfect)")
-
-        # Advantage std (signal strength)
-        ax = axes[1, 0]
-        vals = [r.get("rl_adv_std", 0) for r in rl_records]
-        _plot_line(ax, steps, vals, C_ADV)
-        _setup_ax(ax, "Advantage Std (signal strength)")
+        _setup_ax(ax, "Trajectory Adv Std (signal strength)")
 
         # Exploration: logstd values
         ax = axes[1, 1]
-        all_records = records  # logstds are logged every step
+        all_records = records
         s = get_steps(all_records, "nm_logstd_prim")
         if s:
             _plot_line(ax, s, get_field(all_records, "nm_logstd_prim"), C_PRIM,
-                       "primitives")
-            _plot_line(ax, s, get_field(all_records, "nm_logstd_key"), C_CW,
-                       "key")
+                       "primitives", linewidth=2.5)
+            _plot_line(ax, s, get_field(all_records, "nm_logstd_key"), C_KEY,
+                       "key", linewidth=2.5)
             _plot_line(ax, s, get_field(all_records, "nm_logstd_decay"), C_DECAY,
-                       "decay")
+                       "decay", linewidth=2.0)
             ax.legend()
         _setup_ax(ax, "Policy Log-Std (exploration)", "log_std")
 
@@ -251,8 +255,7 @@ def plot_memory_health(records, output_path):
 
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(3, 3, figsize=(18, 14))
-        fig.suptitle("Memory Graph Health", fontsize=16, fontweight="bold",
-                     color="white")
+        fig.suptitle("Memory Graph Health", fontsize=16, fontweight="bold")
 
         steps = [r["step"] for r in mem_records]
 
@@ -261,7 +264,7 @@ def plot_memory_health(records, output_path):
         _plot_line(ax, steps, [r.get("mem_h_norm", 0) for r in mem_records],
                    C_PRIM, "h norm")
         _plot_line(ax, steps, [r.get("mem_msg_norm", 0) for r in mem_records],
-                   C_CW, "msg norm")
+                   C_KEY, "msg norm")
         ax.legend()
         _setup_ax(ax, "State Norms", "L2 norm")
 
@@ -271,9 +274,9 @@ def plot_memory_health(records, output_path):
                    C_GATE, "mean")
         vals_min = [r.get("mem_gate_min", 0.5) for r in mem_records]
         vals_max = [r.get("mem_gate_max", 0.5) for r in mem_records]
-        ax.fill_between(steps, vals_min, vals_max, alpha=0.2, color=C_GATE)
+        ax.fill_between(steps, vals_min, vals_max, alpha=0.15, color=C_GATE)
         ax.set_ylim(-0.05, 1.05)
-        ax.axhline(y=0.5, color="#666", linestyle="--", linewidth=0.8)
+        ax.axhline(y=0.5, color="#999", linestyle="--", linewidth=0.8)
         _setup_ax(ax, "Memory Gate (sigmoid)", "gate value")
 
         ax = axes[0, 2]
@@ -290,7 +293,7 @@ def plot_memory_health(records, output_path):
         mean_arr = np.array([r.get("mem_decay_mean", 0) for r in mem_records])
         std_arr = np.array(vals_std)
         ax.fill_between(steps, mean_arr - std_arr, mean_arr + std_arr,
-                        alpha=0.15, color=C_DECAY)
+                        alpha=0.12, color=C_DECAY)
         ax.set_ylim(-0.05, 1.05)
         _setup_ax(ax, "Decay (higher = longer memory)", "sigmoid(decay_logit)")
 
@@ -314,7 +317,7 @@ def plot_memory_health(records, output_path):
         ax = axes[2, 0]
         _plot_line(ax, steps,
                    [r.get("mem_key_diversity", 0) for r in mem_records],
-                   C_CW, "key diversity")
+                   C_KEY, "key diversity")
         _plot_line(ax, steps,
                    [r.get("mem_prim_std", 0) for r in mem_records],
                    C_PRIM, "prim diversity")
@@ -334,7 +337,7 @@ def plot_memory_health(records, output_path):
 
         ax = axes[2, 2]
         rewires = [r.get("mem_plasticity_rewires", 0) for r in mem_records]
-        ax.plot(steps, rewires, color=C_PHI, linewidth=1.5)
+        ax.plot(steps, rewires, color=C_PHI, linewidth=2.0)
         _setup_ax(ax, "Cumulative Plasticity Rewires", "total rewires")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -357,7 +360,7 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         fig.suptitle(f"Memory Graph Snapshot (step {snap['step']})",
-                     fontsize=16, fontweight="bold", color="white")
+                     fontsize=16, fontweight="bold")
 
         x = np.arange(N)
 
@@ -366,7 +369,7 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
         h_norm = snap["h_norm_per_neuron"].numpy()
         msg_norm = snap["msg_norm_per_neuron"].numpy()
         ax.bar(x, h_norm, alpha=0.7, label="h norm", width=1.0, color=C_PRIM)
-        ax.bar(x, msg_norm, alpha=0.5, label="msg norm", width=1.0, color=C_CW)
+        ax.bar(x, msg_norm, alpha=0.5, label="msg norm", width=1.0, color=C_KEY)
         ax.axvline(x=C - 0.5, color='red', linestyle='--', alpha=0.7,
                    label=f"port neurons (0-{C-1})")
         ax.legend()
@@ -572,7 +575,6 @@ def main():
     if snap_step is None and os.path.exists(snap_dir):
         available = sorted(os.listdir(snap_dir))
         if available:
-            # Parse step from filename "step_001000.pt"
             latest = available[-1]
             try:
                 snap_step = int(latest.split("_")[1].split(".")[0])

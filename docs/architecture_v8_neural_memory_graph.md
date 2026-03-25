@@ -52,12 +52,12 @@
                   v
 +---------------------------------------------------------------+
 |                    NEUROMODULATOR                              |
-|  REINFORCE + counterfactual baseline (K=96 neurons reverted)  |
+|  GRPO trajectory scoring (8 trajectories, K=96 neurons)       |
 |  Actor: 3-layer MLP (514->2048->2048->2048 -> action heads)  |
-|  No critic/value function — counterfactual advantage only     |
-|  Collects 4 chunks (32 segments) before RL update             |
-|  8 actions per chunk (every 256 tokens):                      |
-|    new_primitive[128] + new_key[128] + delta_decay[1]         |
+|  GAE advantages + GRPO ranking (no value function)            |
+|  Collects 4 chunks (64 segments) before RL update             |
+|  16 actions per chunk (every 128 tokens):                     |
+|    delta_primitive[128] + delta_key[128] + delta_decay[1]     |
 |  ~10M params (actor). Trained by policy gradient.             |
 +---------------------------------------------------------------+
 ```
@@ -156,25 +156,26 @@ Shared policy network across all 1024 neurons. Counterfactual baseline (no criti
 
 **Action** per neuron (257 dims):
 - new_primitive[128] + new_key[128] + delta_decay[1]
-- Primitives and keys are directly assigned (not additive deltas), then RMS-normalized / L2-normalized
+- Additive deltas for primitives, keys, and decay, then RMS-normalized / L2-normalized
 
 **Architecture**:
 - Actor: 3-layer MLP (514->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
-- No critic/value function. Advantage is computed via counterfactual baseline: revert K=96
-  random neurons to their pre-action state, re-run the memory graph, compare loss.
+- No critic/value function. Advantage via GRPO trajectory scoring + GAE.
 
 ### RL Training
 
-REINFORCE with counterfactual baseline, entropy bonus, and LR schedule:
+GRPO trajectory scoring + GAE advantages, entropy bonus, and LR schedule:
 1. Lower scan (layers 0-3) + PCM (parallel over T=2048)
-2. 8 segments per chunk: neuromod observes -> acts -> per-token memory loop (256 tokens)
-3. Per-segment CE loss as reward, collected across `rl_collect_chunks=4` chunks (32 segments)
-4. Counterfactual baseline: revert K=96 random neurons per segment, re-run memory graph,
-   compare loss. Advantage = actual_loss - counterfactual_loss (no value function needed)
-5. Replay: log_prob with stored per-segment obs, weighted by advantages
-6. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
-7. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
-8. Mini-batch replay over segments (not one big batch)
+2. 16 segments per chunk: neuromod observes -> acts -> per-token memory loop (128 tokens)
+3. Per-segment CE loss as reward, collected across `rl_collect_chunks=4` chunks (64 segments)
+4. GRPO scoring (every 4 chunks): sample 8 alternative trajectories for K=96 neurons on the
+   last chunk's text. Each trajectory: observe → sample → apply per segment (mirrors real forward).
+   Rank by CE loss, z-score normalize → per-trajectory advantages.
+5. GAE (lambda=0.95) over all 64 segments with batch-mean baseline
+6. Replay: GAE policy gradient (batched 8 segments at a time) + GRPO encouragement of
+   best-scoring trajectories' actions
+7. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
+8. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
 
 ---
 
@@ -188,13 +189,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 
 **Per step:**
 1. Lower scan (layers 0-3) + PCM at split point (parallel)
-2. 8 segments of 256 tokens: neuromod -> per-token neuron loop
+2. 16 segments of 128 tokens: neuromod observes → acts → per-token neuron loop
 3. Inject memory into H_mid, upper scan (layers 4-6, parallel)
 4. LM loss backward (gradients flow through upper + lower scan + mem_gate)
-5. RL data collected across rl_collect_chunks=4 chunks (32 segments total)
-6. On RL update step: compute counterfactual advantages (revert K=96 neurons,
-   re-run memory graph, compare loss), neuromod replay with mini-batch
-   per-segment advantages + entropy bonus, backward
+5. RL data collected across rl_collect_chunks=4 chunks (64 segments total)
+6. On RL update step: GRPO scoring (8 trajectories on last chunk), GAE advantages
+   over all 64 segments, replay for neuromod gradients + entropy bonus
 7. Structural plasticity check (every 4 segments, vectorized)
 8. Detach scan carries. Memory graph state persists.
 
@@ -213,15 +213,15 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 | d_inner | 1024 |
 | N_mem_neurons | 1024 |
 | K_connections | 96 |
-| action_every | 256 tokens (8 segments per chunk) |
+| action_every | 128 tokens (16 segments per chunk) |
 | neuromod_hidden | 2048 |
 | neuromod_layers | 3 |
 | obs_dim per neuron | 514 |
 | act_dim per neuron | 257 |
 | max_action_magnitude | 1.0 (RMS/L2 normalization bounds effect) |
-| RL | REINFORCE (4 chunks), counterfactual baseline (K=96), entropy bonus |
+| RL | GRPO (8 trajectories, K=96 neurons) + GAE (4 chunks), entropy bonus |
 | T | 2048 |
-| Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
+| Throughput | ~53K tok/s collect, ~16K avg with GRPO (RTX 4090, BS=8) |
 | **Total trained params** | **~103M** |
 
 ---
@@ -255,12 +255,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
    before memory reads it. Surprising tokens get amplified. gain_scale is
    learnable (starts at 2.0, giving gain=1.0 at init).
 
-7. **REINFORCE with counterfactual baseline.** Per-segment CE loss as reward,
-   collected across 4 chunks (32 segments) before computing advantages and updating.
-   Counterfactual baseline: revert K=96 random neurons per segment to pre-action
-   state, re-run memory graph, compare loss. No value function or critic needed.
-   Entropy bonus prevents exploration collapse. Neuromod LR decays alongside LM LR,
-   floor derived from LR_MIN/LR ratio.
+7. **GRPO trajectory scoring + GAE.** Per-segment CE loss as reward, collected
+   across 4 chunks (64 segments) before computing advantages and updating.
+   GRPO: sample 8 alternative trajectories for K=96 neurons, each with per-segment
+   observe → sample → apply (mirrors real forward). Rank by CE loss. GAE (lambda=0.95)
+   over all segments with batch-mean baseline. No value function or critic needed.
+   Entropy bonus prevents exploration collapse. Neuromod LR decays alongside LM LR.
 
 ---
 

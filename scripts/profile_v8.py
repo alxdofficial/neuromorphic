@@ -122,17 +122,27 @@ def main():
     print(f"  Current allocated: {current:.2f} GB")
     print(f"  Reserved:          {reserved:.2f} GB")
 
-    # Count kernel launches
+    # Count kernel launches (key_averages uses self_cuda_time_total)
     events = prof.key_averages()
-    total_cuda_time = sum(e.cuda_time_total for e in events if e.cuda_time_total > 0)
-    n_kernels = sum(e.count for e in events if e.cuda_time_total > 0)
+
+    def cuda_time(e):
+        for attr in ('self_cuda_time_total', 'cuda_time_total', 'device_time_total'):
+            v = getattr(e, attr, None)
+            if v is not None:
+                return v
+        return 0
+
+    total_cuda_time = sum(cuda_time(e) for e in events)
+    n_kernels = sum(e.count for e in events if cuda_time(e) > 0)
     print(f"\n  Total CUDA kernel launches: {n_kernels}")
     print(f"  Total CUDA time: {total_cuda_time/1e3:.1f}ms")
 
     # BMM specifically
-    bmm_events = [e for e in events if 'bmm' in e.key.lower() or 'batch_matmul' in e.key.lower() or 'gemm' in e.key.lower()]
-    if bmm_events:
-        bmm_time = sum(e.cuda_time_total for e in bmm_events)
+    bmm_events = [e for e in events
+                  if 'bmm' in e.key.lower() or 'batch_matmul' in e.key.lower()
+                  or 'gemm' in e.key.lower()]
+    if bmm_events and total_cuda_time > 0:
+        bmm_time = sum(cuda_time(e) for e in bmm_events)
         bmm_calls = sum(e.count for e in bmm_events)
         print(f"\n  BMM/GEMM kernels: {bmm_calls} calls, {bmm_time/1e3:.1f}ms total "
               f"({bmm_time/total_cuda_time*100:.0f}% of CUDA time)")

@@ -38,7 +38,7 @@ class V8Config:
     # Neuromodulator
     neuromod_hidden: int = 1024
     neuromod_layers: int = 3
-    action_every: int = 256      # act every N tokens (8 segments per T=2048 chunk)
+    action_every: int = 128      # act every N tokens (16 segments per T=2048 chunk)
     max_action_magnitude: float = 1.0  # generous — normalization bounds the effect
     # No decay clamp needed: h = d*h + (1-d)*received is a convex combination,
     # so h is bounded by received scale regardless of decay.
@@ -47,11 +47,9 @@ class V8Config:
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
     neuromod_logstd_init: float = -2.0  # initial log_std for policy (exp(-2)≈0.135)
     rl_collect_chunks: int = 4   # chunks to collect before RL update (longer horizon)
-    rl_gamma: float = 0.99       # discount factor for returns
-    rl_gae_lambda: float = 0.95  # GAE lambda for advantage estimation
     rl_entropy_coef: float = 0.01  # entropy bonus coefficient
     rl_counterfactual_k: int = 96   # neurons to evaluate per counterfactual trajectory
-    rl_counterfactual_n: int = 16   # number of sampled trajectories for GRPO scoring
+    rl_counterfactual_n: int = 8    # number of sampled trajectories for GRPO scoring
 
     # Training
     T: int = 2048                # full chunk length

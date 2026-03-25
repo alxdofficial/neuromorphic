@@ -107,10 +107,12 @@ When checking on a training run, look at these in order:
 
 | Metric | Healthy Range | What It Means | Red Flags |
 |--------|---------------|---------------|-----------|
-| `rl_policy_loss` | Decreasing (slowly) | REINFORCE policy gradient loss | Increasing = policy diverging |
+| `rl_policy_loss` | Decreasing (slowly) | GAE policy gradient loss | Increasing = policy diverging |
+| `rl_grpo_loss` | Nonzero when updating | GRPO trajectory encouragement loss | Always zero = GRPO not finding signal |
 | `rl_adv_mean` | Near 0 (baseline is good) | Mean advantage | Large magnitude = bad baseline |
 | `rl_adv_std` | > 0 (signal exists) | Advantage signal strength | Decreasing = RL losing signal |
-| `rl_cf_adv` | Informative (nonzero) | Counterfactual advantage (actual - counterfactual loss) | Always zero = counterfactual not measuring effect |
+| `rl_traj_loss_best` | Spread from worst | Best trajectory z-score | Same as worst = no trajectory differentiation |
+| `rl_traj_loss_worst` | Spread from best | Worst trajectory z-score | Same as best = no trajectory differentiation |
 | `rl_nm_grad_norm` | Stable, < 10000 | Neuromod gradient norm | Spikes > 100K = instability |
 | `rl_entropy` | Should not collapse to 0 | Policy entropy (exploration) | Zero = deterministic policy (no exploration) |
 | `nm_logstd_prim` | Should evolve from init (-2.0) | Primitive action exploration rate | Frozen at init = not learning |
@@ -155,7 +157,7 @@ Phase 2 as neuromod differentiates neurons.
 
 ### Pattern 4: RL Not Learning
 
-**Symptoms:** `rl_cf_adv` always near 0, `nm_logstd_*` frozen at -2.0, entropy constant.
+**Symptoms:** `rl_traj_loss_best` ≈ `rl_traj_loss_worst` (no trajectory differentiation), `nm_logstd_*` frozen at -2.0, entropy constant.
 
 **Cause:** Neuromod actions have no measurable effect on loss. Could be:
 - Normalizations erasing action effects (was the issue in the first 1.5B run)
@@ -207,7 +209,8 @@ and acceptable. The adaptive firing threshold handles it.
 ### Phase 2 (Frozen LM, neuromod active)
 
 **What to watch:**
-- `rl_cf_adv` — is the counterfactual measuring a causal effect?
+- `rl_traj_loss_best` vs `rl_traj_loss_worst` — are GRPO trajectories differentiable?
+- `rl_grpo_loss` — is GRPO producing gradient signal?
 - `nm_logstd_*` — are exploration rates adapting?
 - `mem_gate_mean` — should already be at a non-0.5 value from Phase 1
 - `loss` — should improve from Phase 1 endpoint
@@ -215,7 +218,7 @@ and acceptable. The adaptive firing threshold handles it.
 - `mem_phi_neg_frac` — should become nonzero as neurons differentiate
 
 **What indicates success:**
-- `rl_cf_adv` nonzero and informative (counterfactual detects action effects)
+- `rl_traj_loss_best` and `rl_traj_loss_worst` clearly separated (GRPO finds signal)
 - Loss improves beyond Phase 1 endpoint
 - `nm_logstd_*` moves from init (exploration is adapting)
 - Neurons develop diverse decay values and primitive directions
@@ -275,7 +278,7 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 python -m src.v8.train --bs 8 --steps 30517 --no-neuromod
 
 # Phase 2: Frozen LM + neuromod (resume from Phase 1 checkpoint)
-# Throughput: ~27K tok/s (counterfactual baseline costs ~2x memory graph)
+# Throughput: ~16K tok/s avg (53K collect, ~5K on GRPO scoring steps)
 python -m src.v8.train --bs 8 --steps 61035 --resume outputs/v8/<run>/v8_step30517.pt --freeze-lm
 
 # No-memory baseline
@@ -296,7 +299,7 @@ python -c "import json; r=[json.loads(l) for l in open('outputs/v8/<run>/metrics
 | `--resume` | none | Resume from checkpoint path |
 | `--freeze-lower` | off | Freeze lower scan layers (0-3) |
 | `--freeze-lm` | off | Phase 2: freeze entire LM (lower + upper scan + embed + output head), only neuromod trains |
-| `--action-every` | 256 | Segment length override (tokens per neuromod action) |
+| `--action-every` | 128 | Segment length override (tokens per neuromod action) |
 | `--plot-interval` | 500 | Steps between auto-generated plots |
 | `--log-interval` | 10 | Steps between metric logging |
 | `--no-compile` | off | Disable torch.compile |
