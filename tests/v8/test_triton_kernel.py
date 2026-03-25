@@ -50,7 +50,6 @@ def make_paired_graphs(cfg, dtype=torch.float32):
     mg_tr.mean_input = mg_py.mean_input.clone()
     mg_tr.mean_output = mg_py.mean_output.clone()
     mg_tr.firing_rate = mg_py.firing_rate.clone()
-    mg_tr._adjacency_dirty = True
 
     # Re-init Triton buffers with the copied indices
     if mg_tr._triton_ready:

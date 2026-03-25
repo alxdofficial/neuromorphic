@@ -85,80 +85,89 @@ class TestV8ModelForward:
         assert rl["action_every"] == cfg.action_every
         assert rl["eot_at"].shape == (BS, cfg.T)
 
-    def test_compute_rl_advantages(self):
-        """compute_rl_advantages should produce valid advantages from collected chunks."""
+    def test_counterfactual_advantages(self):
+        """Counterfactual advantages should be per-neuron and finite."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
         n_segments = cfg.T // cfg.action_every
+        N = cfg.N_neurons
 
-        # Collect 2 chunks, simulating trainer's CE → reward derivation
+        # Collect chunks with neuromod enabled (produces logits_B)
         collected = []
         for _ in range(2):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
             rl = result["rl_data"]
-            # Derive rewards from CE (same as trainer does)
-            logits = result["logits"]
+            assert rl is not None, "rl_data should be populated with neuromod"
+            assert rl["logits_B"] is not None, "Counterfactual logits should exist"
+
+            # Derive rewards (same as trainer)
             with torch.no_grad():
-                ce = F.cross_entropy(
-                    logits.detach().reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none',
-                ).reshape(BS, cfg.T)
+                logits_A = result["logits"]
+                logits_B = rl["logits_B"]
                 mask = (~rl["eot_at"]).float()
-                seg_ce = ce.view(BS, n_segments, cfg.action_every)
+
+                ce_A = F.cross_entropy(logits_A.detach().reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
+                ce_B = F.cross_entropy(logits_B.reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
+
                 seg_mask = mask.view(BS, n_segments, cfg.action_every)
-                seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-                rl["seg_rewards"] = -seg_losses
-                rl["seg_losses"] = seg_losses
-                rl["loss"] = ce.mean().item()
+                seg_ce_A = ce_A.view(BS, n_segments, cfg.action_every)
+                seg_ce_B = ce_B.view(BS, n_segments, cfg.action_every)
+                seg_losses_A = (seg_ce_A * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                seg_losses_B = (seg_ce_B * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+
+                rl["seg_rewards"] = -seg_losses_A
+                rl["seg_rewards_cf"] = -seg_losses_B
+                rl["loss"] = ce_A.mean().item()
             collected.append(rl)
 
-        combined = model.compute_rl_advantages(collected)
+        combined = model.compute_counterfactual_advantages(collected)
         total_seg = n_segments * 2
-        assert combined["advantages"].shape == (BS, total_seg)
-        assert combined["returns"].shape == (BS, total_seg)
+        # Per-neuron advantages
+        assert combined["advantages"].shape == (BS, total_seg, N)
+        assert torch.isfinite(combined["advantages"]).all()
         assert len(combined["obs"]) == total_seg
         assert len(combined["actions"]) == total_seg
-        assert combined["global_obs"].shape[0] == total_seg
-        # Advantages should be finite
-        assert torch.isfinite(combined["advantages"]).all()
 
     def test_replay_produces_gradients(self):
-        """Replay should produce gradients for neuromod (policy + value)."""
+        """Replay should produce gradients for neuromod policy."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
-
-        # Collect and compute advantages (simulate trainer's CE → reward step)
-        collected = []
         n_segments = cfg.T // cfg.action_every
+        N = cfg.N_neurons
+
+        collected = []
         for _ in range(cfg.rl_collect_chunks):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
             rl = result["rl_data"]
             with torch.no_grad():
-                ce = F.cross_entropy(
-                    result["logits"].detach().reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none',
-                ).reshape(BS, cfg.T)
+                logits_A = result["logits"]
+                logits_B = rl["logits_B"]
                 mask = (~rl["eot_at"]).float()
-                seg_ce = ce.view(BS, n_segments, cfg.action_every)
+                ce_A = F.cross_entropy(logits_A.detach().reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
+                ce_B = F.cross_entropy(logits_B.reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
                 seg_mask = mask.view(BS, n_segments, cfg.action_every)
-                seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-                rl["seg_rewards"] = -seg_losses
-                rl["seg_losses"] = seg_losses
-                rl["loss"] = ce.mean().item()
+                seg_ce_A = ce_A.view(BS, n_segments, cfg.action_every)
+                seg_ce_B = ce_B.view(BS, n_segments, cfg.action_every)
+                seg_losses_A = (seg_ce_A * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                seg_losses_B = (seg_ce_B * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                rl["seg_rewards"] = -seg_losses_A
+                rl["seg_rewards_cf"] = -seg_losses_B
+                rl["loss"] = ce_A.mean().item()
             collected.append(rl)
 
-        combined = model.compute_rl_advantages(collected)
+        combined = model.compute_counterfactual_advantages(collected)
         model.replay_for_neuromod_grads(combined, amp_enabled=False)
 
-        # Action heads should have gradients (policy gradient)
-        # Note: backbone gets zero grad on first step due to zero-init heads,
-        # self-corrects after first optimizer step.
         has_policy_grad = False
         for name, p in model.neuromod.named_parameters():
             if "head" in name or "logstd" in name:
@@ -166,14 +175,6 @@ class TestV8ModelForward:
                     has_policy_grad = True
                     break
         assert has_policy_grad, "Policy heads should have gradients after replay"
-
-        # Value function should have gradients
-        has_value_grad = False
-        for p in model.neuromod.value_net.parameters():
-            if p.grad is not None and p.grad.abs().sum() > 0:
-                has_value_grad = True
-                break
-        assert has_value_grad, "Value function should have gradients after replay"
 
 
 class TestV8Gradients:

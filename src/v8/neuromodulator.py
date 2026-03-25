@@ -1,9 +1,8 @@
 """Neuromodulator — policy network for memory graph plasticity.
 
 Shared MLP across all neurons. Observes neuron state + plasticity metrics,
-outputs modifications to primitives, routing keys, and decay.
-Trained by REINFORCE with learned value baseline.
-Collects across multiple chunks for longer reward horizon.
+outputs new primitives, routing keys, and decay delta.
+Trained by REINFORCE with counterfactual baseline (no learned value function).
 """
 
 import torch
@@ -19,7 +18,7 @@ class Neuromodulator(nn.Module):
 
     Shared across all neurons — each neuron's observation is processed
     independently through the same network (parameter sharing).
-    Learned value function on pooled global state for baseline.
+    Counterfactual baseline (no learned value function).
     """
 
     def __init__(self, config: V8Config, obs_dim: int):
@@ -53,17 +52,6 @@ class Neuromodulator(nn.Module):
         # Heads use default Kaiming init — nonzero from step 1 so
         # backbone gets gradients immediately (no zero-init trap)
 
-        # Value function: pooled global obs → scalar
-        # Separate small MLP (not shared with policy backbone)
-        v_hidden = config.rl_value_hidden
-        self.value_net = nn.Sequential(
-            nn.Linear(obs_dim, v_hidden),
-            nn.Tanh(),
-            nn.Linear(v_hidden, v_hidden),
-            nn.Tanh(),
-            nn.Linear(v_hidden, 1),
-        )
-
     @property
     def act_dim(self) -> int:
         return self.config.D_mem * 2 + 1  # prim + key + decay
@@ -81,7 +69,7 @@ class Neuromodulator(nn.Module):
             action:   [*, act_dim]
             log_prob: [*]
             entropy:  [*]
-            value:    None (use get_value for value estimates)
+            value:    None (no learned value function)
         """
         h = self.backbone(obs)
         prim_mean = self.prim_head(h)
@@ -107,13 +95,3 @@ class Neuromodulator(nn.Module):
 
         return action, log_prob, entropy, None
 
-    def get_value(self, global_obs: Tensor) -> Tensor:
-        """Predict expected return from pooled global memory state.
-
-        Args:
-            global_obs: [BS, obs_dim] — mean-pooled across all neurons
-
-        Returns:
-            value: [BS] — predicted return
-        """
-        return self.value_net(global_obs).squeeze(-1)

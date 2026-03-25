@@ -1,12 +1,11 @@
 """V8 Trainer — joint LM training + RL for neuromodulator.
 
 Each step:
-1. Full scan over T tokens (once, shared)
-2. Segmented memory processing: neuromod acts → graph dynamics (8 segments)
-3. Per-segment CE loss → rewards collected
+1. Full scan over T tokens (lower scan shared, upper scan for real + counterfactual)
+2. Segmented memory processing: neuromod acts + counterfactual (K neurons reverted)
+3. Per-segment CE loss for real and counterfactual paths
 4. LM backward on logits (every chunk)
-5. Every rl_collect_chunks chunks: compute returns across full window
-   with learned value baseline, then neuromod backward
+5. Every rl_collect_chunks chunks: counterfactual + GAE advantages, neuromod backward
 """
 
 import math
@@ -138,7 +137,7 @@ class V8Trainer:
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:
-            # Compute per-segment rewards from the shared per-token CE
+            # Compute per-segment rewards from real and counterfactual CE
             with torch.no_grad():
                 n_segments = rl_data["n_segments"]
                 action_every = rl_data["action_every"]
@@ -150,26 +149,38 @@ class V8Trainer:
                 seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
                 seg_rewards = -seg_losses
 
+                # Counterfactual CE (from logits_B)
+                logits_B = rl_data["logits_B"]
+                ce_cf = F.cross_entropy(
+                    logits_B.reshape(-1, self.config.vocab_size),
+                    target_ids.reshape(-1),
+                    reduction='none',
+                ).reshape(BS, T)
+                seg_ce_cf = ce_cf.view(BS, n_segments, action_every)
+                seg_losses_cf = (seg_ce_cf * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
+                seg_rewards_cf = -seg_losses_cf
+
             rl_data["seg_rewards"] = seg_rewards
-            rl_data["seg_losses"] = seg_losses.detach()
+            rl_data["seg_rewards_cf"] = seg_rewards_cf
             rl_data["loss"] = ce_loss.item()
             self._rl_buffer.append(rl_data)
 
             # Per-chunk logging
+            cf_adv = (seg_losses_cf - seg_losses).mean().item()
             rl_metrics = {
                 "rl_loss": rl_data["loss"],
                 "rl_seg_loss_first": seg_losses[:, 0].mean().item(),
                 "rl_seg_loss_last": seg_losses[:, -1].mean().item(),
+                "rl_cf_adv": cf_adv,
             }
 
             # Update neuromod when buffer is full
             if len(self._rl_buffer) >= self.rl_collect_chunks:
                 self.neuromod_optimizer.zero_grad(set_to_none=True)
 
-                # Compute returns + advantages across all collected chunks
-                combined = self.model.compute_rl_advantages(self._rl_buffer)
+                combined = self.model.compute_counterfactual_advantages(
+                    self._rl_buffer)
 
-                # Policy gradient + value function update
                 rl_losses = self.model.replay_for_neuromod_grads(
                     combined,
                     amp_enabled=self.use_amp,
@@ -182,32 +193,11 @@ class V8Trainer:
                 self.neuromod_optimizer.step()
 
                 adv = combined["advantages"]
-                returns = combined["returns"]
-
-                # Value function explained variance: 1 - Var(returns-V) / Var(returns)
-                # Higher = better baseline (1.0 = perfect, 0.0 = useless)
-                with torch.no_grad():
-                    global_obs_flat = combined["global_obs"].reshape(
-                        -1, combined["global_obs"].shape[-1])
-                    v_dtype = next(self.model.neuromod.value_net.parameters()).dtype
-                    v_pred = self.model.neuromod.get_value(
-                        global_obs_flat.to(v_dtype))
-                    n_seg = combined["global_obs"].shape[0]
-                    v_pred = v_pred.reshape(n_seg, -1).T  # [BS, n_seg]
-                    var_returns = returns.var()
-                    explained_var = (
-                        1.0 - (returns - v_pred).var() / var_returns.clamp(min=1e-8)
-                    ).item()
-
                 rl_metrics.update({
                     "rl_policy_loss": rl_losses["policy_loss"],
-                    "rl_value_loss": rl_losses["value_loss"],
                     "rl_entropy": rl_losses["entropy"],
                     "rl_adv_mean": adv.mean().item(),
                     "rl_adv_std": adv.std().item(),
-                    "rl_returns_mean": returns.mean().item(),
-                    "rl_returns_std": returns.std().item(),
-                    "rl_explained_var": round(explained_var, 4),
                     "rl_nm_grad_norm": nm_grad_norm,
                 })
 

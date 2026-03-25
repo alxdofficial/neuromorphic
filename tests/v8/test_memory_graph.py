@@ -354,7 +354,6 @@ class TestNeuronDynamicsReference:
         mg_actual.key = mg_ref.key.clone()
         mg_actual.conn_indices = mg_ref.conn_indices.clone()
         mg_actual.conn_mask = mg_ref.conn_mask.clone()
-        mg_actual._adjacency_dirty = True
 
         # Run 3 segments
         for _ in range(3):
@@ -493,8 +492,6 @@ class TestNeuronDynamicsReference:
         # Set key to zero to suppress neighbor influence
         mg_high.key = torch.zeros_like(mg_high.key)
         mg_low.key = torch.zeros_like(mg_low.key)
-        mg_high._adjacency_dirty = True
-        mg_low._adjacency_dirty = True
 
         # Set decay: high=0.99, low=0.01
         mg_high.decay_logit.fill_(4.6)

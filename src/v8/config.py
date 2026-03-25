@@ -46,10 +46,11 @@ class V8Config:
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
     neuromod_logstd_init: float = -2.0  # initial log_std for policy (exp(-2)≈0.135)
-    rl_collect_chunks: int = 2   # chunks to collect before RL update (longer horizon)
+    rl_collect_chunks: int = 4   # chunks to collect before RL update (longer horizon)
     rl_gamma: float = 0.99       # discount factor for returns
+    rl_gae_lambda: float = 0.95  # GAE lambda for advantage estimation
     rl_entropy_coef: float = 0.01  # entropy bonus coefficient
-    rl_value_hidden: int = 256   # value function hidden dim
+    rl_counterfactual_k: int = 96  # neurons to evaluate counterfactually per segment
 
     # Training
     T: int = 2048                # full chunk length

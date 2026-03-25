@@ -125,7 +125,7 @@ def main():
     print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
           f"action_every={config.action_every}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: REINFORCE + learned value baseline, "
+    print(f"  RL: REINFORCE + counterfactual baseline (K={config.rl_counterfactual_k}), "
           f"collect={config.rl_collect_chunks} chunks, "
           f"action_every={config.action_every}, gamma={config.rl_gamma}")
 
@@ -209,7 +209,6 @@ def main():
         model.lm.forward_output = torch.compile(model.lm.forward_output)
         model.neuromod.get_action_and_value = torch.compile(
             model.neuromod.get_action_and_value)
-        model.neuromod.get_value = torch.compile(model.neuromod.get_value)
 
     # LM Optimizer — exclude biases and norms from weight decay
     decay_params = []
@@ -360,7 +359,7 @@ def main():
             rl_str = ""
             if "rl_policy_loss" in metrics:
                 rl_str = (f" | rl={metrics['rl_policy_loss']:.4f}"
-                          f" v={metrics.get('rl_value_loss', 0):.4f}"
+                          f" cf={metrics.get('rl_cf_adv', 0):.4f}"
                           f" adv={metrics.get('rl_adv_mean', 0):.4f}"
                           f"±{metrics.get('rl_adv_std', 0):.4f}")
             mem_str = ""
