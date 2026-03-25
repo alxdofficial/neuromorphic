@@ -45,7 +45,7 @@ class V8Config:
 
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
-    neuromod_logstd_init: float = -2.0  # initial log_std for policy (exp(-2)≈0.135)
+    neuromod_logstd_init: float = -0.5  # initial log_std for policy (exp(-0.5)≈0.6)
     rl_collect_chunks: int = 4   # chunks to collect before RL update (longer horizon)
     rl_entropy_coef: float = 0.01  # entropy bonus coefficient
     rl_counterfactual_k: int = 96   # neurons to evaluate per counterfactual trajectory
