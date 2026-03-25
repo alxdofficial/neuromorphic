@@ -123,14 +123,17 @@ class V8Trainer:
 
         lm_loss = ce_loss + aux_loss
 
-        self.lm_optimizer.zero_grad(set_to_none=True)
-        lm_loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(
-            self.model.lm.parameters(), self.max_grad_norm
-        ).item()
-        self.lm_optimizer.step()
-        if self.scheduler is not None:
-            self.scheduler.step()
+        # LM backward + optimizer step (skip when LM is fully frozen)
+        grad_norm = 0.0
+        if lm_loss.requires_grad:
+            self.lm_optimizer.zero_grad(set_to_none=True)
+            lm_loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.model.lm.parameters(), self.max_grad_norm
+            ).item()
+            self.lm_optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
         # ==========================================
         # Neuromodulator: derive RL rewards from the same CE, accumulate
@@ -163,6 +166,8 @@ class V8Trainer:
             rl_data["seg_rewards"] = seg_rewards
             rl_data["seg_rewards_cf"] = seg_rewards_cf
             rl_data["loss"] = ce_loss.item()
+            # Drop logits_B to free ~1GB per chunk
+            del rl_data["logits_B"]
             self._rl_buffer.append(rl_data)
 
             # Per-chunk logging
