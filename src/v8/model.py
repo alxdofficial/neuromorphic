@@ -344,10 +344,14 @@ class V8Model(nn.Module):
                 BS, total_segments, N).clone()  # [BS, total_seg, N]
 
             # Override counterfactual neurons with their direct advantage
+            # Normalize CF advantages to match GAE scale
+            gae_std = gae_advantages.std().clamp(min=1e-8)
             for seg_idx, k_idx in enumerate(all_k_indices):
                 # cf_advantage: positive = real better than counterfactual = actions helped
                 cf_adv = seg_rewards[:, seg_idx] - cf_rewards[:, seg_idx]  # [BS]
-                advantages[:, seg_idx, k_idx] = cf_adv.unsqueeze(-1).expand(
+                # Scale CF advantages to have similar magnitude as GAE advantages
+                cf_adv_normalized = cf_adv / cf_adv.abs().mean().clamp(min=1e-8) * gae_std
+                advantages[:, seg_idx, k_idx] = cf_adv_normalized.unsqueeze(-1).expand(
                     BS, len(k_idx))
 
         return {

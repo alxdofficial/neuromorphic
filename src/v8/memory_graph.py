@@ -397,6 +397,10 @@ class MemoryGraph:
         grid = (BS, N)
         act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
 
+        # Save start-of-segment state for averaging
+        h_start = self.h.clone()
+        msg_start = self.prev_messages.clone()
+
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
@@ -408,11 +412,9 @@ class MemoryGraph:
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
 
-        # Store final state as segment summary (Triton path can't accumulate per-token)
-        # These are the most recent values, not a segment mean — slight inconsistency
-        # with Python path but still fresh per-segment, no EMA blur
-        self.mean_output = self.prev_messages.clone()
-        self.mean_input = self.h.clone()
+        # Approximate segment mean as average of start and end states
+        self.mean_input = (h_start + self.h) * 0.5
+        self.mean_output = (msg_start + self.prev_messages) * 0.5
 
         self._post_segment_stats(self.prev_messages, act_trace,
                                  update_co_activation=update_co_activation)

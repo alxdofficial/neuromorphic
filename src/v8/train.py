@@ -249,18 +249,26 @@ def main():
     # Resume optimizer state if available
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        if "optimizer_state_dict" in ckpt and not args.freeze_lower:
+        lm_frozen = args.freeze_lower or args.freeze_lm
+        if "optimizer_state_dict" in ckpt and not lm_frozen:
             try:
                 lm_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 print(f"  Loaded LM optimizer state")
             except Exception as e:
                 print(f"  Could not load LM optimizer state: {e}")
-        if "scheduler_state_dict" in ckpt and not args.freeze_lower:
+        if "scheduler_state_dict" in ckpt and not lm_frozen:
             try:
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 print(f"  Loaded LR scheduler state")
             except Exception:
                 pass
+        if "neuromod_optimizer_state_dict" in ckpt:
+            try:
+                neuromod_optimizer.load_state_dict(
+                    ckpt["neuromod_optimizer_state_dict"])
+                print(f"  Loaded neuromod optimizer state")
+            except Exception as e:
+                print(f"  Could not load neuromod optimizer state: {e}")
         del ckpt
 
     # Neuromod LR schedule: same warmup, cosine decay to same floor ratio as LM
