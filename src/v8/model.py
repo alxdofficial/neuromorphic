@@ -357,12 +357,26 @@ class V8Model(nn.Module):
                     batch_obs, action=batch_act)
 
             grpo_loss = -(traj_adv * log_prob.mean())
-            ent_bonus = -self.config.rl_entropy_coef * entropy.mean()
-            ((grpo_loss + ent_bonus) / n_positive).backward()
+            (grpo_loss / n_positive).backward()
 
             grpo_loss_val += grpo_loss.item()
             total_entropy += entropy.mean().item()
             n_replayed += 1
+
+        # Always apply entropy bonus (even when all trajectories tied).
+        # This ensures logstd gets gradient to increase exploration,
+        # which will eventually break ties and produce GRPO signal.
+        if traj_obs and traj_obs[0]:
+            ent_obs = torch.cat(traj_obs[0], dim=0)
+            ent_act = torch.cat(traj_actions[0], dim=0)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=amp_enabled):
+                _, _, entropy, _ = self.neuromod.get_action_and_value(
+                    ent_obs, action=ent_act)
+            ent_loss = -self.config.rl_entropy_coef * entropy.mean()
+            ent_loss.backward()
+            if n_replayed == 0:
+                total_entropy = entropy.mean().item()
 
         return {
             "grpo_loss": grpo_loss_val / max(n_replayed, 1),
