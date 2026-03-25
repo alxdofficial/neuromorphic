@@ -103,7 +103,8 @@ approach. It adds a network-generated neuromodulatory signal M(t) that gates pla
 3. Backpropamine modulates Hebbian update rates; our neuromodulator directly sets
    primitives, routing keys, and decay — controlling what neurons represent, not just
    how fast they learn
-4. Our neuromodulator simultaneously controls graph topology through structural plasticity
+4. Graph topology is controlled by autonomous structural plasticity (co-activation-based),
+   not by the neuromodulator
 
 ---
 
@@ -210,7 +211,8 @@ making random regrowth a necessary choice.
 
 **Lottery Ticket Hypothesis** (Frankle & Carlin, 2018) finds sparse subnetworks post-hoc
 from dense networks. Our model starts sparse and evolves topology continuously, driven by
-the neuromodulator. Shared insight: sparse networks can be as expressive as dense ones.
+autonomous co-activation-based plasticity. Shared insight: sparse networks can be as
+expressive as dense ones.
 
 ---
 
@@ -237,7 +239,7 @@ within autograd; ours are fixed dynamics modulated by RL.
 
 | Aspect | Closest Prior Work | What We Do Differently |
 |--------|-------------------|----------------------|
-| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Full per-neuron RL control: primitives, routing keys, decay, topology |
+| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Per-neuron RL control: primitives, routing keys, decay; autonomous topology via co-activation |
 | Per-neuron RL neuromodulation (257 dims × 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron actions, non-differentiable, controls structure not just plasticity rate |
 | Co-activation structural plasticity | SET/RigL (magnitude/gradient pruning) | Phi coefficient (binary Pearson) drives prune/grow, no magic thresholds |
 | Memory as RL environment (not differentiable module) | All of Category 2 is differentiable | Explicit design choice: memory outside autograd |
@@ -247,5 +249,5 @@ within autograd; ours are fixed dynamics modulated by RL.
 
 The combination of these elements — a scan-based LM backbone, a persistent non-differentiable
 neuron graph with per-token message passing, RL-trained neuromodulation controlling all
-aspects of neuron behavior, structural plasticity driven by utility metrics, and per-column
+aspects of neuron behavior, autonomous structural plasticity driven by co-activation statistics, and per-column
 predictive coding — does not appear in any single prior system.

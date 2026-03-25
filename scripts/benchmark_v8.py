@@ -42,7 +42,6 @@ def compile_model(model):
     model.lm.forward_output = torch.compile(model.lm.forward_output)
     model.neuromod.get_action_and_value = torch.compile(
         model.neuromod.get_action_and_value)
-    model.neuromod.get_value = torch.compile(model.neuromod.get_value)
 
 
 def make_batch(bs, T, device):

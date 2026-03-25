@@ -27,7 +27,7 @@ system has three components that operate at different levels:
 The LM is a standard scan-based sequence model:
 - Embedding → 7 scan layers (h[t] = a*h[t-1] + b[t], parallelizable via FLA kernel)
 - Per-column predictive coding modules (16 independent PCMs)
-- Memory injection: `logits = output_head(H + gate * mem_signals)`
+- Memory injection: `H_enriched = H_mid + gate * mem_signals` (mid-scan, before upper layers)
 - ~93M trainable parameters
 - Throughput: ~85K tok/s without memory (RTX 4090, BS=12)
 
@@ -57,12 +57,12 @@ The LM reads port neurons' messages at every token as `mem_signals`.
 
 Every 256 tokens (8 times per 2048-token chunk):
 - Observes all 1024 neurons (514 dims each: primitives, key, mean input, mean output, firing rate, decay)
-- Outputs per-neuron actions (257 dims: delta_primitives[128] + delta_key[128] + delta_decay[1])
+- Outputs per-neuron actions (257 dims: new_primitive[128] + new_key[128] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
-**RL training**: Multi-chunk REINFORCE with discounted returns (gamma=0.99), learned V(s)
-baseline, value bootstrap at collection boundary, and entropy bonus. RL data collected
-across 2 chunks (16 segments) before computing returns and updating.
+**RL training**: REINFORCE with counterfactual baseline (revert K=96 random neurons per
+segment, re-run memory graph, compare loss). No value function or critic. RL data collected
+across 4 chunks (32 segments) before computing advantages and updating.
 
 ---
 
@@ -110,20 +110,17 @@ The reward is the CE loss on the next 256 tokens.
 
 **What we currently do**:
 - Per-segment CE loss as reward (8 rewards per chunk)
-- Multi-chunk collection: rewards gathered across `rl_collect_chunks=2` chunks (16 segments)
-  before computing returns and updating
-- Discounted returns: G_t = r_t + 0.99*r_{t+1} + ... over the full collection window
-- Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(final_state)`
-- Learned value function baseline: V(global_state) critic (~165K params, MLP on mean-pooled
-  neuron observations), trained with MSE on observed returns
-- Per-step advantages: A_t = G_t - V(state_t)
+- Multi-chunk collection: rewards gathered across `rl_collect_chunks=4` chunks (32 segments)
+  before computing advantages and updating
+- Counterfactual baseline: revert K=96 random neurons per segment to their pre-action state,
+  re-run the memory graph, compare loss. Advantage = actual_loss - counterfactual_loss
+- No value function, no critic — the counterfactual provides a per-segment advantage directly
 
 **What works**:
-- Each of the 16 actions (across 2 chunks) gets its own advantage
+- Each of the 32 actions (across 4 chunks) gets its own advantage
 - Multi-chunk collection gives the RL agent visibility into cross-chunk effects
-- Discounting credits early structural changes for downstream improvements
-- Value bootstrap gives credit for structural changes that pay off beyond the collection window
-- Learned V(s) baseline adapts to state-dependent reward variance
+- Counterfactual baseline directly measures each action's causal effect (not just correlation)
+- No critic to train — avoids the explained-variance=0 failure mode seen in earlier runs
 
 **Open questions**:
 
@@ -144,34 +141,30 @@ tokens of text. The CE loss on those 256 tokens is the reward. But:
 - Should we weight later tokens more heavily in the segment reward?
 
 **Q3: Can the neuromod distinguish "my action helped" from "this text was easy"?**
-**Partially addressed.** The learned V(global_state) critic replaces the old batch-mean
-baseline. V(s) takes mean-pooled neuron observations as input and learns to predict
-expected returns conditioned on the current memory graph state. This means advantages
-reflect how much better/worse the actual return was compared to what the critic expected
-*given the current state* — not just the batch average. The critic can learn that certain
-graph configurations lead to predictably low loss (easy text patterns), reducing spurious
-advantage signal. Remaining concern: the critic sees neuron state but not the text
-content, so it can't fully account for text difficulty variation within similar graph states.
+**Addressed by counterfactual baseline.** The counterfactual reverts K=96 random neurons
+per segment to their pre-action state and re-runs the memory graph. The advantage is the
+difference between actual loss and counterfactual loss — this directly measures the causal
+effect of the neuromod's actions, controlling for text difficulty. If the text was easy,
+both actual and counterfactual runs produce low loss, so the advantage is near zero.
+Remaining concern: the counterfactual costs ~2x the memory graph compute per segment.
 
 **Q4: Is the action space right?**
 Each action is 257 continuous dims per neuron x 1024 neurons = 263,168 total action
 dimensions per step. The policy outputs are sampled from a Gaussian with learned std.
 The action is clamped to +/-1.0 (RMS/L2 normalization bounds the effect). Questions:
-- Is 128 dims of delta_primitives too many? Could a lower-rank action suffice?
-- Is 128 dims of delta_key too many? The key controls routing selectivity via
-  softmax(key . neighbor_messages) — could a lower-rank perturbation suffice?
+- Is 128 dims of new_primitive too many? Could a lower-rank action suffice?
+- Is 128 dims of new_key too many? The key controls routing selectivity via
+  softmax(key . neighbor_messages) — could a lower-rank action suffice?
 - The same MLP is applied to all neurons — is the obs sufficient for the MLP to
   differentiate neuron roles?
 
-**Q5: Reward horizon — should discounting go beyond one chunk?**
-**Partially addressed.** Multi-chunk RL collection (`rl_collect_chunks=2`) now gathers
-16 segments (2 chunks) of rewards before computing returns. Discounted returns span the
-full collection window, so cross-chunk effects within the 2-chunk window are captured.
-Value bootstrap at the collection boundary (`returns[:, -1] = reward[-1] + gamma * V(final_state)`)
-gives partial credit for structural changes that pay off beyond the window. Remaining
-concern: the effective horizon is still limited by the collection window size and the
-accuracy of the value function bootstrap. A structural change that pays off 5+ chunks
-later still gets attenuated credit, though the bootstrap provides some signal.
+**Q5: Reward horizon — should collection go beyond 4 chunks?**
+**Partially addressed.** Multi-chunk RL collection (`rl_collect_chunks=4`) now gathers
+32 segments (4 chunks) of rewards before computing advantages. The counterfactual baseline
+measures causal effect per segment, so cross-chunk effects within the 4-chunk window are
+captured via the policy gradient over the full collection window. Remaining concern: the
+effective horizon is still limited by the collection window size. A structural change
+that pays off 5+ chunks later still gets attenuated credit.
 
 ### Problem 3: Memory Graph Signal Dynamics — Does It Actually Help?
 
@@ -194,7 +187,7 @@ structured, but communicates with the LM through only 16 port neurons.
   16 × 128 = 2048 dims of port messages. The memory graph's internal state (131K dims)
   can only influence the LM through this narrow interface.
 - The memory contribution is gated by `mem_gate` (starts at sigmoid(0)=0.5) and added
-  to H before the output head. If the LM learns to ignore memory (gate → 0), the
+  to H_mid before the upper scan. If the LM learns to ignore memory (gate → 0), the
   neuromod gets no reward signal and can't learn.
 - The CC signal enters port neurons as a raw additive input. Scale mismatch: CC signals
   are O(1), neighbor messages are O(0.2). Port neurons are dominated by the LM signal.
@@ -243,13 +236,13 @@ also partially decay at document boundaries to prevent overfitting to recent doc
 | LM scan layers | Working, well-understood | High |
 | Memory graph per-token dynamics | Implemented, correct | High |
 | Throughput | 42K tok/s, 50% overhead | Acceptable |
-| Multi-chunk RL rewards | Implemented (2 chunks, 16 segments) | Medium — informative enough? |
-| Credit assignment | Learned V(s) baseline + value bootstrap | Medium-High — addresses batch-mean limitations |
+| Multi-chunk RL rewards | Implemented (4 chunks, 32 segments) | Medium — informative enough? |
+| Credit assignment | Counterfactual baseline (K=96 neurons reverted) | Medium-High — measures causal effect directly |
 | Primitives as message modulation | Implemented | Medium — do neurons differentiate? |
 | Structural plasticity | Implemented | Low — random rewiring meaningful? |
 | Memory actually helping LM | Not yet proven | Unknown — need training run |
 | Scale mismatch (CC vs graph signals) | Known issue | Needs investigation |
-| Cross-chunk RL credit | Partially captured (2-chunk window + bootstrap) | Improved |
+| Cross-chunk RL credit | Partially captured (4-chunk window, counterfactual) | Improved |
 
 ## Next Steps
 

@@ -33,9 +33,9 @@ A **brain-inspired sequence model** with three components:
   internal state, and broadcast outgoing messages modulated by their primitives.
   Memory IS the pattern of activation and connectivity flowing through the graph.
 
-- **Neuromodulator**: An RL-trained policy (REINFORCE with learned value baseline)
-  that modifies neuron primitives, routing keys, and decay. Collects across
-  multiple chunks for longer reward horizon. Substitutes for the billions of years
+- **Neuromodulator**: An RL-trained policy (REINFORCE with counterfactual baseline)
+  that assigns new neuron primitives, routing keys, and adjusts decay. Collects across
+  4 chunks (32 segments) for longer reward horizon. Substitutes for the billions of years
   of evolution that shaped the brain's neuromodulatory systems.
 
 ---
@@ -115,12 +115,12 @@ hop-by-hop — K tokens = K hops of inter-neuron communication.
 ### Neuromodulator as RL Agent
 
 The neuromodulator observes each neuron's state (primitive, key, mean input,
-mean output, firing rate, decay) and outputs modifications to primitives,
-routing keys, and decay. Trained via REINFORCE with a learned
-value function baseline (V(global_state) → scalar). Collects across 2 chunks
-(16 segments) before updating for longer reward horizon. Value bootstrap at
-collection boundary gives credit for structural changes that pay off beyond
-the current window. Neuromod LR decays alongside the LM LR.
+mean output, firing rate, decay) and outputs new values for primitives and
+routing keys, plus a delta for decay (direct assignment, not additive deltas).
+Trained via REINFORCE with a counterfactual baseline: revert K=96 random
+neurons per segment to pre-action state, re-run the memory graph, compare
+loss. No value function or critic. Collects across 4 chunks (32 segments)
+before updating. Neuromod LR decays alongside the LM LR.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.

@@ -52,13 +52,13 @@
                   v
 +---------------------------------------------------------------+
 |                    NEUROMODULATOR                              |
-|  Multi-chunk REINFORCE + learned V(s) baseline + entropy      |
+|  REINFORCE + counterfactual baseline (K=96 neurons reverted)  |
 |  Actor: 3-layer MLP (514->2048->2048->2048 -> action heads)  |
-|  Critic: MLP (obs_dim->256->256->1), ~165K params             |
-|  Collects 2 chunks (16 segments) before RL update             |
+|  No critic/value function — counterfactual advantage only     |
+|  Collects 4 chunks (32 segments) before RL update             |
 |  8 actions per chunk (every 256 tokens):                      |
-|    delta_primitive[128] + delta_key[128] + decay[1]           |
-|  ~10M params (actor + critic). Trained by policy gradient.    |
+|    new_primitive[128] + new_key[128] + delta_decay[1]         |
+|  ~10M params (actor). Trained by policy gradient.             |
 +---------------------------------------------------------------+
 ```
 
@@ -122,10 +122,10 @@ Per-column predictive coding with learnable gain modulation:
 
 **Key-based softmax routing:**
 - Each neuron has a `key` vector (L2-normalized, 128 dims)
-- At the start of each segment, compute: `sim = cosine_sim(key, neighbor_messages)`
+- At the start of each segment, compute: `sim = key . neighbor_messages` (raw dot product)
 - Routing weights: `softmax(sim)` over K=96 neighbors per neuron
 - These scalar routing weights are used for all tokens in the segment
-- The neuromodulator controls routing selectivity via `delta_key`
+- The neuromodulator controls routing selectivity by assigning new key values
 - The Triton kernel uses precomputed scalar routing weights (same structure as old fixed-weight kernel)
 
 **Binary firing + percentile threshold:**
@@ -139,7 +139,7 @@ Per-column predictive coding with learnable gain modulation:
 - `co_activation_ema [N, N]`: slow EMA of phi matrix
 - Prune: existing connections where phi < 0 (anti-correlated)
 - Grow: 80% toward highest-phi unconnected neuron, 20% random
-- Regrown weight: median of neuron's current |weights|
+- Regrown connections are topology-only (no persistent edge weights)
 - No magic number thresholds — phi < 0 is a natural boundary
 
 **Document boundary resets** (`reset_streams`):
@@ -148,33 +148,33 @@ Per-column predictive coding with learnable gain modulation:
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
-Shared policy network across all 1024 neurons. Learned value function baseline (critic).
+Shared policy network across all 1024 neurons. Counterfactual baseline (no critic).
 
 **Observation** per neuron (514 dims):
 - primitive[128] + key[128] + mean_input[128] + mean_output[128]
 - firing_rate[1] + decay[1]
 
 **Action** per neuron (257 dims):
-- delta_primitive[128] + delta_key[128] + delta_decay[1]
-- Actions clamped to [-1.0, 1.0], then primitives RMS-normalized, key L2-normalized
+- new_primitive[128] + new_key[128] + delta_decay[1]
+- Primitives and keys are directly assigned (not additive deltas), then RMS-normalized / L2-normalized
 
 **Architecture**:
 - Actor: 3-layer MLP (514->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
-- Critic: small MLP (obs_dim -> 256 -> 256 -> 1), ~165K params. Takes mean-pooled neuron
-  observations as global state. Outputs V(global_state) used as advantage baseline.
+- No critic/value function. Advantage is computed via counterfactual baseline: revert K=96
+  random neurons to their pre-action state, re-run the memory graph, compare loss.
 
 ### RL Training
 
-Multi-chunk REINFORCE with learned value baseline, entropy bonus, and LR schedule:
+REINFORCE with counterfactual baseline, entropy bonus, and LR schedule:
 1. Lower scan (layers 0-3) + PCM (parallel over T=2048)
 2. 8 segments per chunk: neuromod observes -> acts -> per-token memory loop (256 tokens)
-3. Per-segment CE loss as reward, collected across `rl_collect_chunks=2` chunks (16 segments)
-4. Discounted returns (gamma=0.99) computed over the full collection window
-5. Value bootstrap at collection boundary: `returns[:, -1] = reward[-1] + gamma * V(last_obs)`
-6. Learned value function baseline: `advantage = returns - V(state)` (critic trained with MSE)
-7. Replay: log_prob with stored per-segment obs, weighted by advantages
-8. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
-9. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
+3. Per-segment CE loss as reward, collected across `rl_collect_chunks=4` chunks (32 segments)
+4. Counterfactual baseline: revert K=96 random neurons per segment, re-run memory graph,
+   compare loss. Advantage = actual_loss - counterfactual_loss (no value function needed)
+5. Replay: log_prob with stored per-segment obs, weighted by advantages
+6. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
+7. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
+8. Mini-batch replay over segments (not one big batch)
 
 ---
 
@@ -191,10 +191,10 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 2. 8 segments of 256 tokens: neuromod -> per-token neuron loop
 3. Inject memory into H_mid, upper scan (layers 4-6, parallel)
 4. LM loss backward (gradients flow through upper + lower scan + mem_gate)
-5. RL data collected across rl_collect_chunks=2 chunks (16 segments total)
-6. On RL update step: compute discounted returns over collection window,
-   value bootstrap at boundary, train critic (MSE), compute advantages,
-   neuromod replay with per-step advantages + entropy bonus, backward
+5. RL data collected across rl_collect_chunks=4 chunks (32 segments total)
+6. On RL update step: compute counterfactual advantages (revert K=96 neurons,
+   re-run memory graph, compare loss), neuromod replay with mini-batch
+   per-segment advantages + entropy bonus, backward
 7. Structural plasticity check (every 4 segments, vectorized)
 8. Detach scan carries. Memory graph state persists.
 
@@ -219,7 +219,7 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 | obs_dim per neuron | 514 |
 | act_dim per neuron | 257 |
 | max_action_magnitude | 1.0 (RMS/L2 normalization bounds effect) |
-| RL | Multi-chunk REINFORCE (2 chunks), learned V(s) baseline, entropy bonus |
+| RL | REINFORCE (4 chunks), counterfactual baseline (K=96), entropy bonus |
 | T | 2048 |
 | Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
 | **Total trained params** | **~103M** |
@@ -237,9 +237,10 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
    propagate hop-by-hop through the graph.
 
 3. **Key-based softmax routing.** Each neuron has a learned key vector
-   (L2-normalized). Routing weights are `softmax(key . neighbor_messages)`,
-   computed once per segment. The neuromod controls routing selectivity
-   via delta_key. Content-based attention over presynaptic neighbors.
+   (L2-normalized). Routing weights are `softmax(key . neighbor_messages)`
+   (raw dot product), computed once per segment. The neuromod controls
+   routing selectivity by assigning new key values. Content-based attention
+   over presynaptic neighbors.
 
 4. **Primitives modulate outgoing messages.** `message = tanh(h * primitives)`.
    All 1024 neurons use their RMS-normalized primitives. Decay controls
@@ -254,12 +255,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
    before memory reads it. Surprising tokens get amplified. gain_scale is
    learnable (starts at 2.0, giving gain=1.0 at init).
 
-7. **Multi-chunk RL with learned value baseline.** Per-segment CE loss as reward,
-   collected across 2 chunks (16 segments) before computing returns and updating.
-   Discounted returns (gamma=0.99) span the full collection window, with value
-   bootstrap at the boundary. Learned V(global_state) critic replaces batch-mean
-   baseline for advantage computation. Entropy bonus prevents exploration collapse.
-   Neuromod LR decays alongside LM LR, floor derived from LR_MIN/LR ratio.
+7. **REINFORCE with counterfactual baseline.** Per-segment CE loss as reward,
+   collected across 4 chunks (32 segments) before computing advantages and updating.
+   Counterfactual baseline: revert K=96 random neurons per segment to pre-action
+   state, re-run memory graph, compare loss. No value function or critic needed.
+   Entropy bonus prevents exploration collapse. Neuromod LR decays alongside LM LR,
+   floor derived from LR_MIN/LR ratio.
 
 ---
 
@@ -272,7 +273,7 @@ src/v8/
 +-- memory_graph.py        # MemoryGraph (per-token + Triton kernel + plasticity)
 +-- triton_kernels.py      # Fused sparse-gather + integrate + tanh + norm step kernel
 +-- lm.py                  # V8LM (split-scan + PCM + memory interface)
-+-- neuromodulator.py      # Policy network + learned value critic
++-- neuromodulator.py      # Policy network (no critic)
 +-- model.py               # V8Model (top-level wiring, multi-chunk RL)
 +-- trainer.py             # V8Trainer (joint LM + RL training loop)
 +-- train.py               # Training entry point with CLI
@@ -282,7 +283,7 @@ scripts/
 +-- benchmark_v8.py        # Throughput + VRAM benchmarking
 +-- profile_v8.py          # torch.profiler breakdown
 +-- plot_training.py       # Training curves + memory health plots
-+-- analyze_memory.py      # Deep per-token memory analysis
++-- analyze_memory.py      # Deep per-token memory analysis (STALE — references removed APIs)
 +-- find_max_bs.py         # Max batch size finder + leak check
 
 tests/v8/

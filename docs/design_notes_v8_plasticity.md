@@ -10,10 +10,10 @@ giving each neuron a fixed routing budget of 1.0. The neuromod controlled the
 
 **Current (replaced)**: conn_weights have been replaced by **key-based softmax routing**.
 Each neuron has a `key` vector (L2-normalized, 128 dims). Routing weights are computed
-as `softmax(cosine_sim(key, neighbor_messages))` over K=96 neighbors, once per segment.
-Weights sum to 1 by construction (softmax). The neuromod controls routing selectivity
-via `delta_key` — adjusting what each neuron "listens for" in its neighbors' messages.
-This is content-based attention over presynaptic neighbors rather than fixed weight
+as `softmax(key . neighbor_messages)` (raw dot product, not cosine similarity) over K=96
+neighbors, once per segment. Weights sum to 1 by construction (softmax). The neuromod
+controls routing selectivity by assigning new key values (direct assignment, not additive
+deltas). This is content-based attention over presynaptic neighbors rather than fixed weight
 distribution.
 
 ### 2. Binary Firing + Percentile Threshold
@@ -61,8 +61,8 @@ threshold at 0, not a magic number.
 **Growth**: Per neuron, form connection to non-connected neuron with highest phi > 0.
 80% correlation-guided, 20% random (exploration).
 
-**Regrown weight**: Initialize to median of that neuron's current |weight| distribution
-(matches existing scale, no magic number).
+**Regrown connections**: Topology-only rewiring — new connections have no persistent edge
+weights. Routing is entirely determined by key-based softmax (no explicit edge weights).
 
 ### 4. Other Magic Number Fixes
 
@@ -70,7 +70,7 @@ threshold at 0, not a magic number.
 |-----|-----|-----------|
 | `usage_count: norm > 0.01` | Firing rate from binary threshold | Relative to neuron's own stats |
 | `max_action_magnitude = 0.3` | `1.0` | RMS/L2 normalization bounds the effect |
-| `regrown weight = rand * 0.2` | `median(neuron_abs_weights)` | Matches current scale |
+| `regrown weight = rand * 0.2` | Topology-only (no edge weights) | Routing via key-based softmax |
 | `prune_threshold = 0.01` | `phi < 0` | Relative, biologically meaningful |
 | `mean_norm in adjacency` | Removed (softmax handles it) | No double normalization |
 
@@ -83,13 +83,14 @@ we can revisit.
 
 ### 6. Separation of Concerns
 
-**Neuromod controls**: primitives (what neurons say), routing keys (what neurons
-listen for), decay (temporal persistence). These are fast, per-segment adjustments.
+**Neuromod controls**: primitives (what neurons say — direct assignment of new values),
+routing keys (what neurons listen for — direct assignment of new values), decay
+(temporal persistence — additive delta). These are fast, per-segment adjustments.
 
 **Plasticity controls**: which connections exist (topology). This is slow,
 autonomous, driven by observed co-activation patterns. The neuromod doesn't
-directly control topology — it controls routing strength, and weak/anti-correlated
-connections get pruned automatically.
+directly control topology — topology rewiring is autonomous based on co-activation
+statistics. Anti-correlated connections get pruned automatically.
 
 ### 7. State Tensors
 

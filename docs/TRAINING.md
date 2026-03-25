@@ -108,12 +108,9 @@ When checking on a training run, look at these in order:
 | Metric | Healthy Range | What It Means | Red Flags |
 |--------|---------------|---------------|-----------|
 | `rl_policy_loss` | Decreasing (slowly) | REINFORCE policy gradient loss | Increasing = policy diverging |
-| `rl_value_loss` | Decreasing | Value function MSE on returns | Increasing = critic failing |
-| `rl_explained_var` | Moving toward 1.0 (0 = useless, 1 = perfect) | Value function prediction quality | Stuck at 0 = critic not learning |
 | `rl_adv_mean` | Near 0 (baseline is good) | Mean advantage | Large magnitude = bad baseline |
 | `rl_adv_std` | > 0 (signal exists) | Advantage signal strength | Decreasing = RL losing signal |
-| `rl_returns_mean` | Tracks negative loss | Mean discounted return | Should improve with loss |
-| `rl_returns_std` | > 0 | Return variation across batch | Zero = no variation to learn from |
+| `rl_cf_adv` | Informative (nonzero) | Counterfactual advantage (actual - counterfactual loss) | Always zero = counterfactual not measuring effect |
 | `rl_nm_grad_norm` | Stable, < 10000 | Neuromod gradient norm | Spikes > 100K = instability |
 | `rl_entropy` | Should not collapse to 0 | Policy entropy (exploration) | Zero = deterministic policy (no exploration) |
 | `nm_logstd_prim` | Should evolve from init (-2.0) | Primitive action exploration rate | Frozen at init = not learning |
@@ -158,7 +155,7 @@ Phase 2 as neuromod differentiates neurons.
 
 ### Pattern 4: RL Not Learning
 
-**Symptoms:** `rl_explained_var` = 0, `nm_logstd_*` frozen at -2.0, entropy constant.
+**Symptoms:** `rl_cf_adv` always near 0, `nm_logstd_*` frozen at -2.0, entropy constant.
 
 **Cause:** Neuromod actions have no measurable effect on loss. Could be:
 - Normalizations erasing action effects (was the issue in the first 1.5B run)
@@ -210,7 +207,7 @@ and acceptable. The adaptive firing threshold handles it.
 ### Phase 2 (Frozen LM, neuromod active)
 
 **What to watch:**
-- `rl_explained_var` — is the value function learning?
+- `rl_cf_adv` — is the counterfactual measuring a causal effect?
 - `nm_logstd_*` — are exploration rates adapting?
 - `mem_gate_mean` — should already be at a non-0.5 value from Phase 1
 - `loss` — should improve from Phase 1 endpoint
@@ -218,7 +215,7 @@ and acceptable. The adaptive firing threshold handles it.
 - `mem_phi_neg_frac` — should become nonzero as neurons differentiate
 
 **What indicates success:**
-- `rl_explained_var` > 0.1 (critic predicts returns better than constant)
+- `rl_cf_adv` nonzero and informative (counterfactual detects action effects)
 - Loss improves beyond Phase 1 endpoint
 - `nm_logstd_*` moves from init (exploration is adapting)
 - Neurons develop diverse decay values and primitive directions
@@ -247,8 +244,7 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 
 **rl_curves.png** (Phase 2 only):
 - Policy Loss — RL loss, should decrease slowly
-- Value Loss — critic MSE, should decrease
-- Explained Variance — 0 to 1, most important RL health metric
+- Counterfactual Advantage — causal effect of neuromod actions
 - Advantage Std — signal strength, should not collapse to 0
 - Policy Log-Std — exploration rates per action group
 - Neuromod Gradient Norm — stability indicator
@@ -279,7 +275,8 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 python -m src.v8.train --bs 8 --steps 30517 --no-neuromod
 
 # Phase 2: Frozen LM + neuromod (resume from Phase 1 checkpoint)
-python -m src.v8.train --bs 8 --steps 61035 --resume outputs/v8/<run>/v8_step30517.pt --freeze-lower
+# Throughput: ~27K tok/s (counterfactual baseline costs ~2x memory graph)
+python -m src.v8.train --bs 8 --steps 61035 --resume outputs/v8/<run>/v8_step30517.pt --freeze-lm
 
 # No-memory baseline
 python -m src.v8.train --bs 12 --steps 30517 --no-memory
@@ -287,3 +284,19 @@ python -m src.v8.train --bs 12 --steps 30517 --no-memory
 # Check training health
 python -c "import json; r=[json.loads(l) for l in open('outputs/v8/<run>/metrics.jsonl')]; print(f'step {r[-1][\"step\"]}: loss={r[-1][\"loss\"]:.3f} gate={r[-1].get(\"mem_gate_mean\",\"?\")} h_norm={r[-1].get(\"mem_h_norm\",\"?\")}')"
 ```
+
+### All CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bs` | 8 | Batch size |
+| `--steps` | 30517 | Total training steps |
+| `--no-neuromod` | off | Phase 1: disable neuromodulator, train LM + frozen memory graph |
+| `--no-memory` | off | No-memory baseline (pure LM) |
+| `--resume` | none | Resume from checkpoint path |
+| `--freeze-lower` | off | Freeze lower scan layers (0-3) |
+| `--freeze-lm` | off | Phase 2: freeze entire LM (lower + upper scan + embed + output head), only neuromod trains |
+| `--action-every` | 256 | Segment length override (tokens per neuromod action) |
+| `--plot-interval` | 500 | Steps between auto-generated plots |
+| `--log-interval` | 10 | Steps between metric logging |
+| `--no-compile` | off | Disable torch.compile |

@@ -49,7 +49,11 @@ the wider D_mem (256 vs 128) and more neurons (4096 vs 1024).
 | Update step (with RL replay) | 384ms | 42.6K tok/s |
 | Average (alternating) | 346ms | 47.4K tok/s |
 
-RL updates happen every 2 chunks (`rl_collect_chunks=2`). Collect steps are ~20% faster.
+RL updates happen every 4 chunks (`rl_collect_chunks=4`). Collect steps are ~20% faster.
+
+> **Note**: The counterfactual baseline (reverting K=96 neurons and re-running the memory
+> graph) adds approximately 2x the memory graph cost per segment during Phase 2. This
+> brings Phase 2 throughput to ~27K tok/s (vs ~68K tok/s in Phase 1 without neuromod).
 
 ### CUDA Time Breakdown (compiled, 10 steps)
 
@@ -86,7 +90,7 @@ at BS=8 — both the memory graph kernel and LM matmuls saturate the SMs.
 ## torch.compile Impact
 
 Compiling individual LM methods (forward_scan_lower, forward_scan_upper,
-forward_output) and neuromod methods (get_action_and_value, get_value):
+forward_output) and neuromod methods (get_action):
 
 | Config | Before (broken compile) | After (method compile) | Improvement |
 |--------|------------------------|----------------------|-------------|
