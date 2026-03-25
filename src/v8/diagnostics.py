@@ -145,9 +145,14 @@ class V8Diagnostics:
             # Connectivity structure [N, K] — topology doesn't change often
             snapshot["conn_indices"] = mg.conn_indices.cpu()
 
-            # Co-activation matrix [N, N] and primitives [N, D] for PCA
+            # Co-activation matrix [N, N] and primitives [N, D]
             snapshot["co_activation"] = mg.co_activation_ema.cpu().float()
             snapshot["primitives_mean"] = mg.primitives.mean(dim=0).cpu()  # [N, D]
+            snapshot["key_mean"] = mg.key.mean(dim=0).cpu()  # [N, D]
+
+            # Routing weights (if computed) [N, K] — batch-averaged
+            if hasattr(mg, '_routing_weights') and mg._routing_weights is not None:
+                snapshot["routing_weights"] = mg._routing_weights.mean(dim=0).cpu()
 
             snapshot["step"] = step
             snapshot["config"] = {

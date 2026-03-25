@@ -410,14 +410,19 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
 
 
 def plot_neuron_graph(snapshot_path, output_path):
-    """Visualize the full neuron graph as a network.
+    """Visualize neurons using UMAP on primitives with routing weight edges.
 
-    All neurons shown. Node color = activation magnitude, node size = firing rate.
-    Only the top edges by |weight| are drawn to keep the plot readable.
-    Edge color: red = positive weight, blue = negative weight, intensity = magnitude.
-    Port neurons drawn as larger squares with red border.
+    Layout: UMAP projection of primitive vectors (neurons with similar
+    broadcast directions cluster together).
+    Node color: activation (h_norm). Node size: firing rate.
+    Edge color: routing weight intensity (if available in snapshot).
+    Port neurons: larger squares with red border.
     """
-    import networkx as nx
+    try:
+        import umap
+    except ImportError:
+        print("  UMAP not installed (pip install umap-learn), skipping neuron graph")
+        return
 
     snap = torch.load(snapshot_path, map_location="cpu", weights_only=False)
     for k, v in snap.items():
@@ -429,92 +434,88 @@ def plot_neuron_graph(snapshot_path, output_path):
     C = cfg["C"]
     K = cfg["K"]
 
-    conn_idx = snap["conn_indices"].numpy()    # [N, K]
+    conn_idx = snap["conn_indices"].numpy()  # [N, K]
     h_norm = snap["h_norm_per_neuron"].numpy()  # [N]
-    # Handle both old (usage_per_neuron) and new (firing_rate_per_neuron) formats
+
     if "firing_rate_per_neuron" in snap:
         firing = snap["firing_rate_per_neuron"].numpy()
     elif "usage_per_neuron" in snap:
         firing = snap["usage_per_neuron"].numpy()
     else:
-        firing = np.ones(N) * 0.1  # fallback
+        firing = np.ones(N) * 0.1
 
-    # Build full graph
-    G = nx.DiGraph()
-    G.add_nodes_from(range(N))
+    # UMAP on primitives — neurons with similar broadcast directions cluster
+    primitives = snap["primitives_mean"].numpy()  # [N, D]
+    reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.3,
+                        random_state=42, metric='cosine')
+    coords = reducer.fit_transform(primitives)  # [N, 2]
 
+    # Routing weights (if available)
+    has_routing = "routing_weights" in snap
+    routing_w = snap["routing_weights"].numpy() if has_routing else None  # [N, K]
+
+    # Build edges with weights
     all_edges = []
+    all_weights = []
     for dst in range(N):
         for k_idx in range(K):
             src = int(conn_idx[dst, k_idx])
+            w = float(routing_w[dst, k_idx]) if has_routing else 1.0 / K
             all_edges.append((src, dst))
+            all_weights.append(w)
+    all_weights = np.array(all_weights)
 
-    # Random subset of edges (routing weights are dynamic, not in snapshot)
+    # Draw top edges by weight (strongest routing connections)
     n_draw = min(len(all_edges), max(N * 5, 5000))
-    rng = np.random.RandomState(42)
-    draw_idx = rng.choice(len(all_edges), n_draw, replace=False)
-    draw_edges = [all_edges[i] for i in draw_idx]
-
-    for src, dst in draw_edges:
-        G.add_edge(src, dst)
+    if has_routing:
+        top_idx = np.argsort(all_weights)[-n_draw:]
+    else:
+        rng = np.random.RandomState(42)
+        top_idx = rng.choice(len(all_edges), n_draw, replace=False)
+    draw_edges = [all_edges[i] for i in top_idx]
+    draw_weights = all_weights[top_idx]
 
     with plt.rc_context(STYLE):
-        fig, ax = plt.subplots(1, 1, figsize=(24, 24))
-        fig.suptitle(
-            f"Neuron Graph ({N} neurons, {n_draw} sampled edges, "
-            f"step {snap['step']})",
-            fontsize=16, fontweight="bold")
+        fig, ax = plt.subplots(1, 1, figsize=(20, 20))
+        title = f"Neuron Graph — UMAP on Primitives ({N} neurons, step {snap['step']})"
+        if has_routing:
+            title += f", top {n_draw} edges by routing weight"
+        fig.suptitle(title, fontsize=14, fontweight="bold")
 
-        # Layout: spring with more space
-        pos = nx.spring_layout(G, k=3.0 / np.sqrt(N), iterations=80, seed=42)
+        # Draw edges with weight-based color/alpha
+        w_max = max(draw_weights.max(), 1e-6)
+        for (src, dst), w in zip(draw_edges, draw_weights):
+            intensity = min(w / w_max, 1.0)
+            alpha = 0.02 + 0.3 * intensity
+            ax.plot([coords[src, 0], coords[dst, 0]],
+                    [coords[src, 1], coords[dst, 1]],
+                    color=(0.3, 0.3, 0.7, alpha), linewidth=0.3)
 
-        # Node sizes: scale by firing rate
-        node_sizes = 8 + 60 * firing  # small base, bigger = more active
+        # Node sizes
+        node_sizes = 5 + 40 * firing
 
-        # Separate port vs non-port
-        port_nodes = list(range(C))
-        internal_nodes = list(range(C, N))
+        # Internal neurons
+        internal = np.arange(C, N)
+        sc = ax.scatter(coords[internal, 0], coords[internal, 1],
+                        c=h_norm[internal], s=node_sizes[internal],
+                        cmap='viridis', vmin=0, vmax=max(h_norm.max(), 1e-6),
+                        edgecolors='none', zorder=3)
 
-        # Uniform edge color (no weights to visualize)
-        edge_colors = [(0.5, 0.5, 0.5, 0.1)] * len(draw_edges)
+        # Port neurons (larger, square marker, red edge)
+        ports = np.arange(C)
+        ax.scatter(coords[ports, 0], coords[ports, 1],
+                   c=h_norm[ports], s=node_sizes[ports] * 4,
+                   cmap='viridis', vmin=0, vmax=max(h_norm.max(), 1e-6),
+                   marker='s', edgecolors='#d93025', linewidths=1.5, zorder=4)
 
-        # Draw edges
-        nx.draw_networkx_edges(
-            G, pos, edgelist=draw_edges, edge_color=edge_colors,
-            width=0.3, arrows=False, ax=ax)
+        # Port labels
+        for i in range(C):
+            ax.annotate(f'P{i}', (coords[i, 0], coords[i, 1]),
+                        fontsize=6, fontweight='bold', color='#333',
+                        ha='center', va='bottom', zorder=5)
 
-        # Draw internal neurons
-        if internal_nodes:
-            nx.draw_networkx_nodes(
-                G, pos, nodelist=internal_nodes,
-                node_color=h_norm[C:N],
-                node_size=node_sizes[C:N],
-                cmap=plt.cm.viridis, vmin=0,
-                vmax=max(h_norm.max(), 1e-6),
-                edgecolors="none", ax=ax)
-
-        # Draw port neurons (larger, square, red border)
-        if port_nodes:
-            nx.draw_networkx_nodes(
-                G, pos, nodelist=port_nodes,
-                node_color=h_norm[:C],
-                node_size=node_sizes[:C] * 4,
-                node_shape="s",
-                cmap=plt.cm.viridis, vmin=0,
-                vmax=max(h_norm.max(), 1e-6),
-                edgecolors="#d93025", linewidths=1.5, ax=ax)
-
-        # Port neuron labels
-        port_labels = {i: f"P{i}" for i in port_nodes}
-        nx.draw_networkx_labels(G, pos, port_labels, font_size=6,
-                                font_color="#333", font_weight="bold", ax=ax)
-
-        # Colorbar for node activation
-        sm = plt.cm.ScalarMappable(
-            cmap=plt.cm.viridis,
-            norm=plt.Normalize(vmin=0, vmax=max(h_norm.max(), 1e-6)))
-        sm.set_array([])
-        cbar = plt.colorbar(sm, ax=ax, shrink=0.3, pad=0.01)
+        # Colorbar
+        cbar = plt.colorbar(sc, ax=ax, shrink=0.3, pad=0.02)
         cbar.set_label("Activation (h norm)", fontsize=9)
 
         # Legend
@@ -522,11 +523,15 @@ def plot_neuron_graph(snapshot_path, output_path):
                 label=f'Port neurons (0-{C-1})')
         ax.plot([], [], 'o', color='#888', markersize=4,
                 label='Internal neurons (size=firing rate)')
-        ax.plot([], [], '-', color='#888', alpha=0.3, linewidth=1,
-                label='Connection')
+        if has_routing:
+            ax.plot([], [], '-', color=(0.3, 0.3, 0.7, 0.5), linewidth=1,
+                    label='Routing weight (stronger = brighter)')
         ax.legend(loc='upper left', fontsize=10, framealpha=0.9)
 
-        ax.axis('off')
+        ax.set_xlabel("UMAP 1 (primitive direction)", fontsize=10)
+        ax.set_ylabel("UMAP 2 (primitive direction)", fontsize=10)
+        ax.grid(True, alpha=0.2)
+
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
         plt.close()
