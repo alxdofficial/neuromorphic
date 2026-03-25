@@ -85,6 +85,35 @@ class TestV8ModelForward:
         assert rl["action_every"] == cfg.action_every
         assert rl["eot_at"].shape == (BS, cfg.T)
 
+    def _derive_cf_rewards(self, model, result, target_ids, cfg):
+        """Helper: derive real and counterfactual rewards from forward result."""
+        rl = result["rl_data"]
+        n_segments = cfg.T // cfg.action_every
+        N_cf = cfg.rl_counterfactual_n
+
+        with torch.no_grad():
+            logits_A = result["logits"]
+            mask = (~rl["eot_at"]).float()
+            ce_A = F.cross_entropy(logits_A.detach().reshape(-1, VOCAB),
+                target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
+            seg_mask = mask.view(BS, n_segments, cfg.action_every)
+            seg_ce_A = ce_A.view(BS, n_segments, cfg.action_every)
+            seg_losses_A = (seg_ce_A * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+            rl["seg_rewards"] = -seg_losses_A
+
+            all_cf_rewards = []
+            for logits_B in rl["logits_Bs"]:
+                ce_B = F.cross_entropy(logits_B.reshape(-1, VOCAB),
+                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
+                seg_ce_B = ce_B.view(BS, n_segments, cfg.action_every)
+                seg_losses_B = (seg_ce_B * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+                all_cf_rewards.append(-seg_losses_B)
+
+            rl["all_seg_rewards_cf"] = all_cf_rewards
+            rl["loss"] = ce_A.mean().item()
+            del rl["logits_Bs"]
+        return rl
+
     def test_counterfactual_advantages(self):
         """Counterfactual advantages should be per-neuron and finite."""
         cfg = make_tiny()
@@ -93,41 +122,18 @@ class TestV8ModelForward:
         n_segments = cfg.T // cfg.action_every
         N = cfg.N_neurons
 
-        # Collect chunks with neuromod enabled (produces logits_B)
         collected = []
         for _ in range(2):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
-            rl = result["rl_data"]
-            assert rl is not None, "rl_data should be populated with neuromod"
-            assert rl["logits_B"] is not None, "Counterfactual logits should exist"
-
-            # Derive rewards (same as trainer)
-            with torch.no_grad():
-                logits_A = result["logits"]
-                logits_B = rl["logits_B"]
-                mask = (~rl["eot_at"]).float()
-
-                ce_A = F.cross_entropy(logits_A.detach().reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
-                ce_B = F.cross_entropy(logits_B.reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
-
-                seg_mask = mask.view(BS, n_segments, cfg.action_every)
-                seg_ce_A = ce_A.view(BS, n_segments, cfg.action_every)
-                seg_ce_B = ce_B.view(BS, n_segments, cfg.action_every)
-                seg_losses_A = (seg_ce_A * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-                seg_losses_B = (seg_ce_B * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-
-                rl["seg_rewards"] = -seg_losses_A
-                rl["seg_rewards_cf"] = -seg_losses_B
-                rl["loss"] = ce_A.mean().item()
+            assert result["rl_data"] is not None
+            assert len(result["rl_data"]["logits_Bs"]) == cfg.rl_counterfactual_n
+            rl = self._derive_cf_rewards(model, result, target_ids, cfg)
             collected.append(rl)
 
         combined = model.compute_counterfactual_advantages(collected)
         total_seg = n_segments * 2
-        # Per-neuron advantages
         assert combined["advantages"].shape == (BS, total_seg, N)
         assert torch.isfinite(combined["advantages"]).all()
         assert len(combined["obs"]) == total_seg
@@ -139,30 +145,13 @@ class TestV8ModelForward:
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
         n_segments = cfg.T // cfg.action_every
-        N = cfg.N_neurons
 
         collected = []
         for _ in range(cfg.rl_collect_chunks):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
-            rl = result["rl_data"]
-            with torch.no_grad():
-                logits_A = result["logits"]
-                logits_B = rl["logits_B"]
-                mask = (~rl["eot_at"]).float()
-                ce_A = F.cross_entropy(logits_A.detach().reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
-                ce_B = F.cross_entropy(logits_B.reshape(-1, VOCAB),
-                    target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
-                seg_mask = mask.view(BS, n_segments, cfg.action_every)
-                seg_ce_A = ce_A.view(BS, n_segments, cfg.action_every)
-                seg_ce_B = ce_B.view(BS, n_segments, cfg.action_every)
-                seg_losses_A = (seg_ce_A * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-                seg_losses_B = (seg_ce_B * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-                rl["seg_rewards"] = -seg_losses_A
-                rl["seg_rewards_cf"] = -seg_losses_B
-                rl["loss"] = ce_A.mean().item()
+            rl = self._derive_cf_rewards(model, result, target_ids, cfg)
             collected.append(rl)
 
         combined = model.compute_counterfactual_advantages(collected)

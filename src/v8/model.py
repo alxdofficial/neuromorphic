@@ -129,11 +129,15 @@ class V8Model(nn.Module):
             eot_masks = eot_shifted.view(BS, n_segments, action_every)
 
         mem_out_A = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
-        mem_out_B = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype) if use_neuromod else None
+        N_cf = self.config.rl_counterfactual_n if use_neuromod else 0
+        K = self.config.rl_counterfactual_k
+        # N_cf counterfactual trajectories, each with different K neurons reverted
+        mem_out_Bs = [torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
+                      for _ in range(N_cf)] if use_neuromod else []
         actions = []
         obs_list = []
+        # k_indices_list: list of (N_cf lists of k_idx) per segment
         k_indices_list = []
-        K = self.config.rl_counterfactual_k
         mg = self._mem_graph
 
         for seg in range(n_segments):
@@ -147,7 +151,6 @@ class V8Model(nn.Module):
                          and self._segment_counter % sp_every == 0)
 
             if not use_neuromod:
-                # Phase 1: no neuromod, just run memory graph
                 seg_out = mg.forward_segment(
                     seg_cc, eot_mask=eot_mask,
                     update_co_activation=needs_phi)
@@ -156,7 +159,7 @@ class V8Model(nn.Module):
                     mg.structural_plasticity()
                 continue
 
-            # --- Phase 2: Neuromod + counterfactual ---
+            # --- Phase 2: Neuromod + multiple counterfactual trajectories ---
 
             # 1. Observe and sample action
             obs = mg.get_neuron_obs()
@@ -166,24 +169,18 @@ class V8Model(nn.Module):
             obs_list.append(obs_flat.detach())
             actions.append(action.detach())
 
-            # 2. Pick K random neurons for counterfactual evaluation
-            k_idx = torch.randperm(N_neurons, device=device)[:K]
-            k_indices_list.append(k_idx)
+            # 2. Save full pre-action state for all neurons
+            saved_prim = mg.primitives.clone()
+            saved_key = mg.key.clone()
+            saved_decay = mg.decay_logit.clone()
 
-            # 3. Save pre-action state for K neurons
-            saved_prim_k = mg.primitives[:, k_idx].clone()
-            saved_key_k = mg.key[:, k_idx].clone()
-            saved_decay_k = mg.decay_logit[:, k_idx].clone()
-
-            # 4. Apply ALL neuromod actions
+            # 3. Apply ALL neuromod actions
             self._apply_neuromod_action(action, BS)
 
-            # 5. Save actioned values for K neurons (to restore after counterfactual)
-            actioned_prim_k = mg.primitives[:, k_idx].clone()
-            actioned_key_k = mg.key[:, k_idx].clone()
-            actioned_decay_k = mg.decay_logit[:, k_idx].clone()
-
-            # 6. Save pre-segment dynamic state
+            # 4. Save actioned state and pre-segment dynamic state
+            actioned_prim = mg.primitives.clone()
+            actioned_key = mg.key.clone()
+            actioned_decay = mg.decay_logit.clone()
             pre_h = mg.h.clone()
             pre_msg = mg.prev_messages.clone()
 
@@ -200,28 +197,38 @@ class V8Model(nn.Module):
             post_mean_in = mg.mean_input.clone()
             post_mean_out = mg.mean_output.clone()
 
-            # --- COUNTERFACTUAL trajectory ---
-            # Restore pre-segment dynamic state
-            mg.h = pre_h
-            mg.prev_messages = pre_msg
+            # --- N_cf COUNTERFACTUAL trajectories ---
+            seg_k_indices = []
+            for cf_i in range(N_cf):
+                # Pick different K neurons for each trajectory
+                k_idx = torch.randperm(N_neurons, device=device)[:K]
+                seg_k_indices.append(k_idx)
 
-            # Revert only K neurons to pre-action values
-            mg.primitives[:, k_idx] = saved_prim_k
-            mg.key[:, k_idx] = saved_key_k
-            mg.decay_logit[:, k_idx] = saved_decay_k
+                # Restore pre-segment dynamic state
+                mg.h = pre_h.clone()
+                mg.prev_messages = pre_msg.clone()
 
-            seg_out_B = mg.forward_segment(
-                seg_cc, eot_mask=eot_mask,
-                update_co_activation=False)
-            mem_out_B[:, t0:t0 + action_every] = seg_out_B
+                # Start from actioned state, revert K neurons to pre-action
+                mg.primitives = actioned_prim.clone()
+                mg.key = actioned_key.clone()
+                mg.decay_logit = actioned_decay.clone()
+                mg.primitives[:, k_idx] = saved_prim[:, k_idx]
+                mg.key[:, k_idx] = saved_key[:, k_idx]
+                mg.decay_logit[:, k_idx] = saved_decay[:, k_idx]
+
+                seg_out_B = mg.forward_segment(
+                    seg_cc, eot_mask=eot_mask,
+                    update_co_activation=False)
+                mem_out_Bs[cf_i][:, t0:t0 + action_every] = seg_out_B
+
+            k_indices_list.append(seg_k_indices)
 
             # --- Restore real trajectory state ---
             mg.h = post_h
             mg.prev_messages = post_msg
-            # Restore only K neurons' actioned values (others unchanged)
-            mg.primitives[:, k_idx] = actioned_prim_k
-            mg.key[:, k_idx] = actioned_key_k
-            mg.decay_logit[:, k_idx] = actioned_decay_k
+            mg.primitives = actioned_prim
+            mg.key = actioned_key
+            mg.decay_logit = actioned_decay
             mg.firing_rate = post_firing
             mg.mean_input = post_mean_in
             mg.mean_output = post_mean_out
@@ -248,22 +255,24 @@ class V8Model(nn.Module):
         H_A = self.lm.forward_scan_upper(H_enriched_A)
         logits_A = self.lm.forward_output(H_A)
 
-        # Counterfactual path (Phase 2 only)
-        logits_B = None
+        # Counterfactual paths (Phase 2 only — N_cf trajectories)
+        logits_Bs = []
         if use_neuromod:
-            # Save post-real carries (to restore after counterfactual)
             post_real_carries = [self.lm._carries[i].clone()
                                  if self.lm._carries[i] is not None else None
                                  for i in range(split, L)]
 
-            # Restore pre-upper carries for counterfactual scan
-            for i, c in enumerate(pre_upper_carries):
-                self.lm._carries[split + i] = c
-
             with torch.no_grad():
-                H_enriched_B = self.lm.inject_memory(H_mid.detach(), mem_out_B)
-                H_B = self.lm.forward_scan_upper(H_enriched_B)
-                logits_B = self.lm.forward_output(H_B)
+                H_mid_det = H_mid.detach()
+                for cf_i in range(N_cf):
+                    # Restore pre-upper carries for each counterfactual
+                    for i, c in enumerate(pre_upper_carries):
+                        self.lm._carries[split + i] = c.clone() if c is not None else None
+
+                    H_enriched_B = self.lm.inject_memory(H_mid_det, mem_out_Bs[cf_i])
+                    H_B = self.lm.forward_scan_upper(H_enriched_B)
+                    logits_B = self.lm.forward_output(H_B)
+                    logits_Bs.append(logits_B)
 
             # Restore real carries for continuation
             for i, c in enumerate(post_real_carries):
@@ -280,8 +289,8 @@ class V8Model(nn.Module):
                 "eot_at": eot_at,
                 "n_segments": n_segments,
                 "action_every": action_every,
-                "k_indices": k_indices_list,
-                "logits_B": logits_B,
+                "k_indices": k_indices_list,  # list of (N_cf lists of k_idx) per seg
+                "logits_Bs": logits_Bs,       # list of N_cf logit tensors
             }
 
         return {
@@ -309,30 +318,38 @@ class V8Model(nn.Module):
         all_obs = []
         all_actions = []
         all_seg_rewards = []
-        all_cf_rewards = []
+        # all_cf_data: list of (list of N_cf [BS, n_seg] tensors) per chunk
+        all_cf_data = []
+        # all_k_indices: list of (list of N_cf k_idx tensors) per segment
         all_k_indices = []
 
         N = self.config.N_neurons
+        N_cf = self.config.rl_counterfactual_n
 
         for chunk_data in collected_rl_data:
             all_obs.extend(chunk_data["obs"])
             all_actions.extend(chunk_data["actions"])
             all_seg_rewards.append(chunk_data["seg_rewards"])
-            all_cf_rewards.append(chunk_data["seg_rewards_cf"])
+            all_cf_data.append(chunk_data["all_seg_rewards_cf"])
             all_k_indices.extend(chunk_data["k_indices"])
 
         seg_rewards = torch.cat(all_seg_rewards, dim=1)  # [BS, total_seg]
-        cf_rewards = torch.cat(all_cf_rewards, dim=1)    # [BS, total_seg]
         BS = seg_rewards.shape[0]
         total_segments = seg_rewards.shape[1]
         device = seg_rewards.device
         gamma = self.config.rl_gamma
         lam = self.config.rl_gae_lambda
 
+        # Concatenate CF rewards: [N_cf][BS, total_seg]
+        cf_rewards_per_traj = []
+        for cf_i in range(N_cf):
+            cf_chunks = [chunk_cf[cf_i] for chunk_cf in all_cf_data]
+            cf_rewards_per_traj.append(torch.cat(cf_chunks, dim=1))
+
         with torch.no_grad():
             # --- GAE for batch-mean baseline (all neurons) ---
-            baseline = seg_rewards.mean(dim=0, keepdim=True)  # [1, total_seg]
-            deltas = seg_rewards - baseline  # [BS, total_seg]
+            baseline = seg_rewards.mean(dim=0, keepdim=True)
+            deltas = seg_rewards - baseline
 
             gae_advantages = torch.zeros_like(deltas)
             gae = torch.zeros(BS, device=device, dtype=deltas.dtype)
@@ -342,18 +359,19 @@ class V8Model(nn.Module):
 
             # --- Per-neuron advantages [BS, total_seg, N] ---
             advantages = gae_advantages.unsqueeze(-1).expand(
-                BS, total_segments, N).clone()  # [BS, total_seg, N]
+                BS, total_segments, N).clone()
 
             # Override counterfactual neurons with their direct advantage
-            # Normalize CF advantages to match GAE scale
             gae_std = gae_advantages.std().clamp(min=1e-8)
-            for seg_idx, k_idx in enumerate(all_k_indices):
-                # cf_advantage: positive = real better than counterfactual = actions helped
-                cf_adv = seg_rewards[:, seg_idx] - cf_rewards[:, seg_idx]  # [BS]
-                # Scale CF advantages to have similar magnitude as GAE advantages
-                cf_adv_normalized = cf_adv / cf_adv.abs().mean().clamp(min=1e-8) * gae_std
-                advantages[:, seg_idx, k_idx] = cf_adv_normalized.unsqueeze(-1).expand(
-                    BS, len(k_idx))
+            for seg_idx, seg_k_list in enumerate(all_k_indices):
+                # seg_k_list: list of N_cf k_idx tensors for this segment
+                for cf_i, k_idx in enumerate(seg_k_list):
+                    cf_r = cf_rewards_per_traj[cf_i][:, seg_idx]  # [BS]
+                    real_r = seg_rewards[:, seg_idx]  # [BS]
+                    cf_adv = real_r - cf_r  # positive = actions helped
+                    cf_adv_norm = cf_adv / cf_adv.abs().mean().clamp(min=1e-8) * gae_std
+                    advantages[:, seg_idx, k_idx] = cf_adv_norm.unsqueeze(-1).expand(
+                        BS, len(k_idx))
 
         return {
             "obs": all_obs,

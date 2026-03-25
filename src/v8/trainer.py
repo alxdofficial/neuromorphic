@@ -140,7 +140,7 @@ class V8Trainer:
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:
-            # Compute per-segment rewards from real and counterfactual CE
+            # Compute per-segment rewards from real and N_cf counterfactual CEs
             with torch.no_grad():
                 n_segments = rl_data["n_segments"]
                 action_every = rl_data["action_every"]
@@ -152,26 +152,30 @@ class V8Trainer:
                 seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
                 seg_rewards = -seg_losses
 
-                # Counterfactual CE (from logits_B)
-                logits_B = rl_data["logits_B"]
-                ce_cf = F.cross_entropy(
-                    logits_B.reshape(-1, self.config.vocab_size),
-                    target_ids.reshape(-1),
-                    reduction='none',
-                ).reshape(BS, T)
-                seg_ce_cf = ce_cf.view(BS, n_segments, action_every)
-                seg_losses_cf = (seg_ce_cf * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
-                seg_rewards_cf = -seg_losses_cf
+                # N_cf counterfactual CEs → per-trajectory seg_rewards
+                all_seg_rewards_cf = []
+                for logits_B in rl_data["logits_Bs"]:
+                    ce_cf = F.cross_entropy(
+                        logits_B.reshape(-1, self.config.vocab_size),
+                        target_ids.reshape(-1),
+                        reduction='none',
+                    ).reshape(BS, T)
+                    seg_ce_cf = ce_cf.view(BS, n_segments, action_every)
+                    seg_losses_cf = (seg_ce_cf * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
+                    all_seg_rewards_cf.append(-seg_losses_cf)
 
             rl_data["seg_rewards"] = seg_rewards
-            rl_data["seg_rewards_cf"] = seg_rewards_cf
+            rl_data["all_seg_rewards_cf"] = all_seg_rewards_cf  # list of N_cf [BS, n_seg]
             rl_data["loss"] = ce_loss.item()
-            # Drop logits_B to free ~1GB per chunk
-            del rl_data["logits_B"]
+            # Drop logits to free memory
+            del rl_data["logits_Bs"]
             self._rl_buffer.append(rl_data)
 
-            # Per-chunk logging
-            cf_adv = (seg_losses_cf - seg_losses).mean().item()
+            # Per-chunk logging (average CF advantage across trajectories)
+            avg_cf_adv = sum(
+                ((-r) - seg_losses).mean().item() for r in all_seg_rewards_cf
+            ) / len(all_seg_rewards_cf)
+            cf_adv = avg_cf_adv
             rl_metrics = {
                 "rl_loss": rl_data["loss"],
                 "rl_seg_loss_first": seg_losses[:, 0].mean().item(),
