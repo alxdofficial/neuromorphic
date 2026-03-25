@@ -54,8 +54,9 @@
 |                    NEUROMODULATOR                              |
 |  GRPO trajectory scoring (8 trajectories, K=96 neurons)       |
 |  Actor: 3-layer MLP (514->2048->2048->2048 -> action heads)  |
-|  GAE advantages + GRPO ranking (no value function)            |
-|  Collects 4 chunks (64 segments) before RL update             |
+|  Scores ALL 4 collected chunks per trajectory (no value fn)   |
+|  Only K neurons get actions, non-K get zero delta             |
+|  Best trajectory's state persists after scoring               |
 |  16 actions per chunk (every 128 tokens):                     |
 |    delta_primitive[128] + delta_key[128] + delta_decay[1]     |
 |  ~10M params (actor). Trained by policy gradient.             |
@@ -95,7 +96,10 @@
 
 ### PCM — `src/v8/pcm.py`
 
-Per-column predictive coding with learnable gain modulation:
+Per-column predictive coding with learnable gain modulation. Both encoding and
+prediction condition on scan hidden state H AND input token x:
+- `z_t = W_enc(cat(H_t, x_t))` — current position's full-context encoding
+- `z_hat_t = W_pcm(cat(H_t, x_t))` — prediction of next position's encoding
 - `surprise = z_hat[t-1] - z[t]` (prediction error vector, 128 dims)
 - `gain = sigmoid(W_gain(surprise)) * gain_scale`
 - `gain_scale`: learnable parameter, init 2.0 (starts at gain=1.0, can grow)
@@ -142,13 +146,14 @@ Per-column predictive coding with learnable gain modulation:
 - Regrown connections are topology-only (no persistent edge weights)
 - No magic number thresholds — phi < 0 is a natural boundary
 
-**Document boundary resets** (`reset_streams`):
-- Zeros: h, prev_messages, firing_rate
-- Preserves: primitives, key, decay, co_activation_ema, connectivity
+**Document boundaries**: Memory graph is fully persistent — no resets at doc
+boundaries. The graph learns to handle document transitions through abrupt
+CC signal changes (since the LM scan carries DO reset). Only LM scan carries
+reset at doc boundaries.
 
 ### Neuromodulator — `src/v8/neuromodulator.py`
 
-Shared policy network across all 1024 neurons. Counterfactual baseline (no critic).
+Shared policy network across all 1024 neurons. GRPO scoring (no critic/value function).
 
 **Observation** per neuron (514 dims):
 - primitive[128] + key[128] + mean_input[128] + mean_output[128]
@@ -160,22 +165,24 @@ Shared policy network across all 1024 neurons. Counterfactual baseline (no criti
 
 **Architecture**:
 - Actor: 3-layer MLP (514->2048->2048->2048 -> action heads), Tanh activations. ~10M params.
-- No critic/value function. Advantage via GRPO trajectory scoring + GAE.
+- No critic/value function. Advantage via GRPO trajectory scoring (z-score normalized).
 
 ### RL Training
 
-GRPO trajectory scoring + GAE advantages, entropy bonus, and LR schedule:
+GRPO trajectory scoring across all collected chunks, entropy bonus, LR schedule:
 1. Lower scan (layers 0-3) + PCM (parallel over T=2048)
 2. 16 segments per chunk: neuromod observes -> acts -> per-token memory loop (128 tokens)
-3. Per-segment CE loss as reward, collected across `rl_collect_chunks=4` chunks (64 segments)
-4. GRPO scoring (every 4 chunks): sample 8 alternative trajectories for K=96 neurons on the
-   last chunk's text. Each trajectory: observe → sample → apply per segment (mirrors real forward).
-   Rank by CE loss, z-score normalize → per-trajectory advantages.
-5. GAE (lambda=0.95) over all 64 segments with batch-mean baseline
-6. Replay: GAE policy gradient (batched 8 segments at a time) + GRPO encouragement of
-   best-scoring trajectories' actions
-7. Entropy bonus (rl_entropy_coef=0.01) prevents exploration collapse
-8. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio
+3. RL data collected across `rl_collect_chunks=4` chunks. MG state saved at start of window.
+4. GRPO scoring (every 4 chunks): Choose K=96 neurons (fixed for all trajectories/chunks).
+   Sample 8 trajectories. For each: replay ALL 4 chunks sequentially — only K neurons get
+   stochastic actions, non-K get zero delta. Score = mean CE across all 4 chunks.
+   Z-score normalize → per-trajectory advantages.
+5. Best trajectory's final MG state + upper scan carries persist as the real state
+   (best-of-N selection — free performance boost from selection pressure alone).
+6. Replay: for each above-average trajectory, forward K-neuron obs/actions through
+   policy (with grad) → log_prob weighted by advantage → policy gradient.
+7. Entropy bonus (rl_entropy_coef=0.01) always applied, prevents exploration collapse.
+8. Neuromod LR: warmup + cosine decay, floor derived from LR_MIN/LR ratio.
 
 ---
 
@@ -193,8 +200,9 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 3. Inject memory into H_mid, upper scan (layers 4-6, parallel)
 4. LM loss backward (gradients flow through upper + lower scan + mem_gate)
 5. RL data collected across rl_collect_chunks=4 chunks (64 segments total)
-6. On RL update step: GRPO scoring (8 trajectories on last chunk), GAE advantages
-   over all 64 segments, replay for neuromod gradients + entropy bonus
+6. On RL update step: GRPO scoring (8 trajectories across all 4 chunks, K=96 neurons
+   with zero delta for non-K), replay for neuromod gradients + entropy bonus.
+   Best trajectory's state persists.
 7. Structural plasticity check (every 4 segments, vectorized)
 8. Detach scan carries. Memory graph state persists.
 
@@ -219,7 +227,7 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
 | obs_dim per neuron | 514 |
 | act_dim per neuron | 257 |
 | max_action_magnitude | 1.0 (RMS/L2 normalization bounds effect) |
-| RL | GRPO (8 trajectories, K=96 neurons) + GAE (4 chunks), entropy bonus |
+| RL | GRPO (8 trajectories, K=96 neurons, all 4 chunks scored, best state persists) |
 | T | 2048 |
 | Throughput | ~53K tok/s collect, ~16K avg with GRPO (RTX 4090, BS=8) |
 | **Total trained params** | **~103M** |
@@ -255,12 +263,12 @@ python -u -m src.v8.train --bs 12 --steps 61035 --no-memory                # bas
    before memory reads it. Surprising tokens get amplified. gain_scale is
    learnable (starts at 2.0, giving gain=1.0 at init).
 
-7. **GRPO trajectory scoring + GAE.** Per-segment CE loss as reward, collected
-   across 4 chunks (64 segments) before computing advantages and updating.
-   GRPO: sample 8 alternative trajectories for K=96 neurons, each with per-segment
-   observe → sample → apply (mirrors real forward). Rank by CE loss. GAE (lambda=0.95)
-   over all segments with batch-mean baseline. No value function or critic needed.
-   Entropy bonus prevents exploration collapse. Neuromod LR decays alongside LM LR.
+7. **GRPO trajectory scoring across all chunks.** Collect 4 chunks of RL data,
+   then score 8 trajectories across ALL 4 chunks (64 segments total). Only K=96
+   neurons get stochastic actions; non-K get zero delta (clean credit assignment).
+   Rank by total CE, z-score normalize → advantages. Best trajectory's final MG
+   state + upper carries persist. No value function or critic needed. Entropy bonus
+   prevents exploration collapse. Neuromod LR decays alongside LM LR.
 
 ---
 

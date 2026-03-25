@@ -277,6 +277,13 @@ def main():
                 print(f"  Loaded neuromod optimizer state")
             except Exception as e:
                 print(f"  Could not load neuromod optimizer state: {e}")
+        if "neuromod_scheduler_state_dict" in ckpt:
+            try:
+                neuromod_scheduler.load_state_dict(
+                    ckpt["neuromod_scheduler_state_dict"])
+                print(f"  Loaded neuromod scheduler state")
+            except Exception:
+                pass
         del ckpt
 
     # Neuromod LR schedule: same warmup, cosine decay to same floor ratio as LM
@@ -399,6 +406,7 @@ def main():
                 "optimizer_state_dict": lm_optimizer.state_dict(),
                 "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "neuromod_scheduler_state_dict": neuromod_scheduler.state_dict(),
                 "step": step,
                 "config": config,
             }
@@ -459,6 +467,7 @@ def main():
         "optimizer_state_dict": lm_optimizer.state_dict(),
         "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
+        "neuromod_scheduler_state_dict": neuromod_scheduler.state_dict(),
         "step": trainer.global_step,
         "config": config,
     }

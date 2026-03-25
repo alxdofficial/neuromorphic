@@ -78,41 +78,33 @@ class TestV8ModelForward:
         rl = result["rl_data"]
         assert rl is not None
         n_segments = cfg.T // cfg.action_every
-        assert len(rl["actions"]) == n_segments
-        assert len(rl["obs"]) == n_segments
-        # seg_rewards/seg_losses are now computed by the trainer, not forward_chunk
         assert rl["n_segments"] == n_segments
         assert rl["action_every"] == cfg.action_every
         assert rl["eot_at"].shape == (BS, cfg.T)
-
-    def _derive_rewards(self, result, target_ids, cfg):
-        """Helper: derive segment rewards from forward result."""
-        rl = result["rl_data"]
-        n_segments = cfg.T // cfg.action_every
-        with torch.no_grad():
-            logits = result["logits"]
-            mask = (~rl["eot_at"]).float()
-            ce = F.cross_entropy(logits.detach().reshape(-1, VOCAB),
-                target_ids.reshape(-1), reduction='none').reshape(BS, cfg.T)
-            seg_mask = mask.view(BS, n_segments, cfg.action_every)
-            seg_ce = ce.view(BS, n_segments, cfg.action_every)
-            seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
-            rl["seg_rewards"] = -seg_losses
-            rl["loss"] = ce.mean().item()
-        return rl
+        assert rl["cc_segments"].shape == (BS, n_segments, cfg.action_every,
+                                           cfg.C, cfg.D_cc)
+        assert rl["H_mid"].shape == (BS, cfg.T, cfg.D)
 
     def test_grpo_scoring(self):
-        """GRPO trajectory scoring should produce ranked advantages."""
+        """GRPO trajectory scoring across collected chunks."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        rl = self._derive_rewards(result, target_ids, cfg)
+        # Save MG state before collection
+        pre_mg_state = {k: v.clone() for k, v in model.memory.state_dict().items()}
 
-        scoring = model.score_trajectories(rl, target_ids)
+        # Collect 2 chunks into buffer
+        rl_buffer = []
+        for _ in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            result = model.forward_chunk(input_ids, target_ids=target_ids)
+            rl = result["rl_data"]
+            rl["target_ids"] = target_ids
+            rl_buffer.append(rl)
+
+        scoring = model.score_trajectories(rl_buffer, pre_mg_state)
         expected_k = min(cfg.rl_counterfactual_k, cfg.N_neurons)
         assert scoring["k_neurons"].shape[0] == expected_k
         assert scoring["trajectory_advantages"].shape[0] == cfg.rl_counterfactual_n
@@ -126,16 +118,18 @@ class TestV8ModelForward:
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
 
-        collected = []
+        pre_mg_state = {k: v.clone() for k, v in model.memory.state_dict().items()}
+
+        rl_buffer = []
         for _ in range(cfg.rl_collect_chunks):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
             result = model.forward_chunk(input_ids, target_ids=target_ids)
-            rl = self._derive_rewards(result, target_ids, cfg)
-            collected.append(rl)
+            rl = result["rl_data"]
+            rl["target_ids"] = target_ids
+            rl_buffer.append(rl)
 
-        # Score trajectories on last chunk
-        scoring = model.score_trajectories(collected[-1], target_ids)
+        scoring = model.score_trajectories(rl_buffer, pre_mg_state)
         replay_data = model.prepare_grpo_replay(scoring)
         model.replay_for_neuromod_grads(replay_data, amp_enabled=False)
 
@@ -146,6 +140,61 @@ class TestV8ModelForward:
                     has_policy_grad = True
                     break
         assert has_policy_grad, "Policy heads should have gradients after replay"
+
+    def test_best_trajectory_state_persists(self):
+        """After scoring, memory graph should be in best trajectory's state."""
+        cfg = make_tiny()
+        model = V8Model(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+
+        pre_mg_state = {k: v.clone() for k, v in model.memory.state_dict().items()}
+
+        rl_buffer = []
+        for _ in range(2):
+            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+            result = model.forward_chunk(input_ids, target_ids=target_ids)
+            rl = result["rl_data"]
+            rl["target_ids"] = target_ids
+            rl_buffer.append(rl)
+
+        # State before scoring
+        h_before = model.memory.h.clone()
+
+        scoring = model.score_trajectories(rl_buffer, pre_mg_state)
+
+        # State after scoring should differ from both pre-scoring and pre-collection
+        # (it's the best trajectory's final state)
+        h_after = model.memory.h
+        assert not torch.equal(h_after, pre_mg_state["h"]), \
+            "MG state should not be restored to pre-collection (should be best trajectory)"
+
+    def test_memory_persists_across_doc_boundaries(self):
+        """Memory graph should NOT reset at document boundaries."""
+        cfg = make_tiny()
+        model = V8Model(cfg)
+        model.initialize_states(BS, torch.device("cpu"))
+
+        # Run a chunk to build up memory state
+        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        model.forward_chunk(input_ids, use_neuromod=False)
+        h_before = model.memory.h.clone()
+        assert h_before.abs().sum() > 0, "Should have nonzero state"
+
+        # Simulate doc boundary: reset_mask=True for batch 0
+        input_ids2 = torch.randint(0, VOCAB, (BS, cfg.T))
+        reset_mask = torch.tensor([True, False])
+        model.forward_chunk(input_ids2, reset_mask=reset_mask,
+                            has_reset=True, use_neuromod=False)
+
+        # Memory graph should NOT have been zeroed for batch 0
+        # (it persists across doc boundaries)
+        h_after = model.memory.h
+        # Both batch elements should have nonzero state
+        assert h_after[0].abs().sum() > 0, \
+            "Memory should persist across doc boundaries (batch 0)"
+        assert h_after[1].abs().sum() > 0, \
+            "Memory should persist across doc boundaries (batch 1)"
 
 
 class TestV8Gradients:

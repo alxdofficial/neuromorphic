@@ -5,6 +5,7 @@ Fuses the per-token loop body into a single kernel launch per token step:
   - Temporal integration: h = decay * h + (1-decay) * received
   - Message: tanh(h * primitives)
   - Fused message norm → act_trace
+  - Accumulate received and msg into f32 running sums for mean_input/mean_output
 
 Routing weights are computed once per segment from key × neighbor messages
 (softmax over K neighbors). The kernel uses these fixed scalar weights
@@ -40,6 +41,10 @@ def memory_graph_step_kernel(
 
     # Activation trace (fused norm output)
     act_trace_ptr,      # [BS, T_seg, N] float32 — message norm per neuron per token
+
+    # Running accumulators for mean_input / mean_output (f32, read-modify-write)
+    recv_accum_ptr,     # [BS, N, D] float32 — sum of received signals across segment
+    msg_accum_ptr,      # [BS, N, D] float32 — sum of outgoing messages across segment
 
     # Current token step
     t_step,             # int — which token in the segment
@@ -98,6 +103,13 @@ def memory_graph_step_kernel(
     # --- Fused message norm → act_trace ---
     msg_norm = tl.sqrt(tl.sum(msg * msg))
     tl.store(act_trace_ptr + b * T_seg * N + t_step * N + n, msg_norm)
+
+    # --- Accumulate received and msg for mean_input / mean_output ---
+    accum_offset = (b * N + n) * D + d
+    old_recv = tl.load(recv_accum_ptr + accum_offset)
+    tl.store(recv_accum_ptr + accum_offset, old_recv + received)
+    old_msg = tl.load(msg_accum_ptr + accum_offset)
+    tl.store(msg_accum_ptr + accum_offset, old_msg + msg)
 
     # --- Write port neuron output ---
     if n < C:

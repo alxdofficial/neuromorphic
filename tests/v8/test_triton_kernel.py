@@ -150,6 +150,23 @@ class TestTritonEquivalence:
 
         torch.testing.assert_close(out_tr, out_py, atol=1e-2, rtol=1e-2)
 
+    def test_mean_input_output_equivalence(self):
+        """Triton mean_input/mean_output should match Python reference."""
+        cfg = make_tiny()
+        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+
+        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda") * 0.5
+
+        mg_py._forward_segment_python(cc.clone())
+        mg_tr._forward_segment_triton(cc.clone())
+
+        # mean_input: average of received signals per neuron across segment
+        torch.testing.assert_close(mg_tr.mean_input, mg_py.mean_input,
+                                   atol=2e-2, rtol=2e-2)
+        # mean_output: average of outgoing messages per neuron across segment
+        torch.testing.assert_close(mg_tr.mean_output, mg_py.mean_output,
+                                   atol=2e-2, rtol=2e-2)
+
     def test_dispatch_uses_triton_on_cuda(self):
         """forward_segment dispatches to Triton when on CUDA."""
         cfg = make_tiny()

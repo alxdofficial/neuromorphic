@@ -397,9 +397,9 @@ class MemoryGraph:
         grid = (BS, N)
         act_trace = torch.empty(BS, T_seg, N, device=self.device, dtype=torch.float32)
 
-        # Save start-of-segment state for averaging
-        h_start = self.h.clone()
-        msg_start = self.prev_messages.clone()
+        # f32 accumulators for true mean_input / mean_output
+        recv_accum = torch.zeros(BS, N, D, device=self.device, dtype=torch.float32)
+        msg_accum = torch.zeros(BS, N, D, device=self.device, dtype=torch.float32)
 
         for t in range(T_seg):
             memory_graph_step_kernel[grid](
@@ -408,13 +408,14 @@ class MemoryGraph:
                 self._decay_f32, self.primitives,
                 cc_signals, eot_flags, output,
                 act_trace,
+                recv_accum, msg_accum,
                 t,
                 BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
             )
 
-        # Approximate segment mean as average of start and end states
-        self.mean_input = (h_start + self.h) * 0.5
-        self.mean_output = (msg_start + self.prev_messages) * 0.5
+        # True segment means from accumulated values
+        self.mean_input = (recv_accum / T_seg).to(self.dtype)
+        self.mean_output = (msg_accum / T_seg).to(self.dtype)
 
         self._post_segment_stats(self.prev_messages, act_trace,
                                  update_co_activation=update_co_activation)

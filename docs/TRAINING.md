@@ -107,17 +107,15 @@ When checking on a training run, look at these in order:
 
 | Metric | Healthy Range | What It Means | Red Flags |
 |--------|---------------|---------------|-----------|
-| `rl_policy_loss` | Decreasing (slowly) | GAE policy gradient loss | Increasing = policy diverging |
-| `rl_grpo_loss` | Nonzero when updating | GRPO trajectory encouragement loss | Always zero = GRPO not finding signal |
-| `rl_adv_mean` | Near 0 (baseline is good) | Mean advantage | Large magnitude = bad baseline |
-| `rl_adv_std` | > 0 (signal exists) | Advantage signal strength | Decreasing = RL losing signal |
-| `rl_traj_loss_best` | Spread from worst | Best trajectory z-score | Same as worst = no trajectory differentiation |
-| `rl_traj_loss_worst` | Spread from best | Worst trajectory z-score | Same as best = no trajectory differentiation |
+| `rl_grpo_loss` | Nonzero when updating | GRPO policy gradient loss | Always zero = no trajectory differentiation |
+| `rl_traj_adv_std` | > 0 (signal exists) | Trajectory advantage spread | Zero = all trajectories tied |
+| `rl_traj_loss_best` | Spread from worst | Best trajectory z-score | Same as worst = no differentiation |
+| `rl_traj_loss_worst` | Spread from best | Worst trajectory z-score | Same as best = no differentiation |
 | `rl_nm_grad_norm` | Stable, < 10000 | Neuromod gradient norm | Spikes > 100K = instability |
 | `rl_entropy` | Should not collapse to 0 | Policy entropy (exploration) | Zero = deterministic policy (no exploration) |
-| `nm_logstd_prim` | Should evolve from init (-2.0) | Primitive action exploration rate | Frozen at init = not learning |
-| `nm_logstd_key` | Should evolve from init (-2.0) | Key action exploration rate | Frozen at init = not learning |
-| `nm_logstd_decay` | Should evolve from init (-2.0) | Decay action exploration rate | Frozen at init = not learning |
+| `nm_logstd_prim` | Should evolve from init (-0.5) | Primitive action exploration rate | Frozen at init = not learning |
+| `nm_logstd_key` | Should evolve from init (-0.5) | Key action exploration rate | Frozen at init = not learning |
+| `nm_logstd_decay` | Should evolve from init (-0.5) | Decay action exploration rate | Frozen at init = not learning |
 
 ---
 
@@ -157,7 +155,7 @@ Phase 2 as neuromod differentiates neurons.
 
 ### Pattern 4: RL Not Learning
 
-**Symptoms:** `rl_traj_loss_best` ≈ `rl_traj_loss_worst` (no trajectory differentiation), `nm_logstd_*` frozen at -2.0, entropy constant.
+**Symptoms:** `rl_traj_loss_best` ≈ `rl_traj_loss_worst` (no trajectory differentiation), `nm_logstd_*` frozen at -0.5, entropy constant.
 
 **Cause:** Neuromod actions have no measurable effect on loss. Could be:
 - Normalizations erasing action effects (was the issue in the first 1.5B run)
@@ -246,9 +244,9 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 - Throughput — should be stable
 
 **rl_curves.png** (Phase 2 only):
-- Policy Loss — RL loss, should decrease slowly
-- Counterfactual Advantage — causal effect of neuromod actions
-- Advantage Std — signal strength, should not collapse to 0
+- GRPO Loss — policy gradient loss, should decrease slowly
+- Trajectory Spread — best vs worst trajectory z-score advantages
+- Trajectory Adv Std — signal strength, should not collapse to 0
 - Policy Log-Std — exploration rates per action group
 - Neuromod Gradient Norm — stability indicator
 

@@ -51,9 +51,9 @@ the wider D_mem (256 vs 128) and more neurons (4096 vs 1024).
 
 RL updates happen every 4 chunks (`rl_collect_chunks=4`). Collect steps are ~20% faster.
 
-> **Note**: GRPO trajectory scoring (8 trajectories on the last chunk) runs every 4 chunks
-> in Phase 2. Collect steps: ~53K tok/s. GRPO scoring steps: ~5K tok/s. Average: ~16K tok/s.
-> Phase 1 (no neuromod): ~68K tok/s.
+> **Note**: GRPO trajectory scoring (8 trajectories across all 4 collected chunks) runs every
+> 4 chunks in Phase 2. Collect steps: ~53K tok/s. GRPO scoring steps are slower (8 traj × 4
+> chunks of memory graph + upper scan). Phase 1 (no neuromod): ~68K tok/s.
 
 ### CUDA Time Breakdown (compiled, 10 steps)
 

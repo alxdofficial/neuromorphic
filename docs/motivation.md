@@ -33,10 +33,11 @@ A **brain-inspired sequence model** with three components:
   internal state, and broadcast outgoing messages modulated by their primitives.
   Memory IS the pattern of activation and connectivity flowing through the graph.
 
-- **Neuromodulator**: An RL-trained policy (GRPO trajectory scoring + GAE)
-  that adjusts neuron primitives, routing keys, and decay via additive deltas. Collects
-  across 4 chunks (64 segments) for longer reward horizon. Substitutes for the billions
-  of years of evolution that shaped the brain's neuromodulatory systems.
+- **Neuromodulator**: An RL-trained policy (GRPO trajectory scoring, no value function)
+  that adjusts neuron primitives, routing keys, and decay via additive deltas. Scores
+  trajectories across all 4 collected chunks for long-range credit assignment. Only K=96
+  neurons get actions per RL step; best trajectory's state persists. Substitutes for the
+  billions of years of evolution that shaped the brain's neuromodulatory systems.
 
 ---
 
@@ -116,23 +117,22 @@ hop-by-hop — K tokens = K hops of inter-neuron communication.
 
 The neuromodulator observes each neuron's state (primitive, key, mean input,
 mean output, firing rate, decay) and outputs additive deltas for primitives,
-routing keys, and decay. Trained via GRPO trajectory scoring: sample 8
-alternative trajectories for K=96 neurons on the last chunk, rank by CE loss,
-encourage best trajectories. GAE (lambda=0.95) provides advantages over
-all 64 segments (4 chunks). No value function or critic. Neuromod LR decays
-alongside the LM LR.
+routing keys, and decay. Trained via GRPO trajectory scoring: choose K=96
+neurons, sample 8 trajectories across ALL 4 collected chunks, rank by total CE,
+z-score normalize, encourage above-average trajectories. Non-K neurons get zero
+delta for clean credit assignment. Best trajectory's state persists. No value
+function or critic. Neuromod LR decays alongside the LM LR.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.
 
 ### Lifelong Learning
 
-**Phase A**: Memory resets at document boundaries. CCs and neuromodulator learn
-basic language ability and write selectivity.
-
-**Phase B**: Memory persists across documents. The neuromodulator learns to
-maintain useful memories and forget stale ones. The scan (slow weights) encodes
-general language knowledge; memory adapts to specific context.
+Memory is fully persistent across documents from the start. The memory graph
+learns what document transitions look like through CC signal changes (scan
+carries reset at doc boundaries, causing abrupt H_mid shifts). The neuromodulator
+learns to maintain useful memories and forget stale ones. The scan (slow weights)
+encodes general language knowledge; memory adapts to specific context.
 
 ---
 

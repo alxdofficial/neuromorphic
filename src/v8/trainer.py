@@ -1,11 +1,10 @@
 """V8 Trainer — joint LM training + RL for neuromodulator.
 
 Each step:
-1. Full scan over T tokens (lower scan shared, upper scan for real + counterfactual)
-2. Segmented memory processing: neuromod acts + counterfactual (K neurons reverted)
-3. Per-segment CE loss for real and counterfactual paths
-4. LM backward on logits (every chunk)
-5. Every rl_collect_chunks chunks: counterfactual + GAE advantages, neuromod backward
+1. Full scan over T tokens (lower scan + PCM + memory graph + upper scan)
+2. LM backward on logits (every chunk)
+3. Every rl_collect_chunks chunks: GRPO scoring across ALL collected chunks,
+   then neuromod backward on above-average trajectories
 """
 
 import math
@@ -62,6 +61,7 @@ class V8Trainer:
         # RL collection buffer: accumulate across chunks before updating neuromod
         self.rl_collect_chunks = config.rl_collect_chunks
         self._rl_buffer: list[dict] = []
+        self._rl_pre_mg_state: dict | None = None  # MG state at start of collection window
 
     def train_chunk(self, batch) -> dict:
         """Process one T-token chunk.
@@ -83,6 +83,16 @@ class V8Trainer:
         eot_id = self.config.eot_id
         has_reset = (batch.prev_token == eot_id).any().item()  # CPU check, no sync
         reset_mask = batch.prev_token.to(self.device, non_blocking=True) == eot_id
+
+        # Save MG state BEFORE forward_chunk if starting a new collection window.
+        # Must happen before forward modifies the memory graph via neuromod actions.
+        if (self.use_memory and self.use_neuromod
+                and len(self._rl_buffer) == 0):
+            mg = self.model.memory
+            if mg is not None and mg.is_initialized():
+                self._rl_pre_mg_state = {
+                    k: v.clone() for k, v in mg.state_dict().items()
+                }
 
         t_start = time.time()
 
@@ -140,7 +150,7 @@ class V8Trainer:
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:
-            # Compute per-segment rewards from CE
+            # Compute per-segment rewards from CE (for logging only)
             with torch.no_grad():
                 n_segments = rl_data["n_segments"]
                 action_every = rl_data["action_every"]
@@ -150,10 +160,10 @@ class V8Trainer:
                 seg_ce = ce_per_token.detach().view(BS, n_segments, action_every)
                 seg_mask = reward_mask.view(BS, n_segments, action_every)
                 seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
-                seg_rewards = -seg_losses
 
-            rl_data["seg_rewards"] = seg_rewards
             rl_data["loss"] = ce_loss.item()
+            rl_data["target_ids"] = target_ids.detach()
+
             self._rl_buffer.append(rl_data)
 
             rl_metrics = {
@@ -166,12 +176,11 @@ class V8Trainer:
             if len(self._rl_buffer) >= self.rl_collect_chunks:
                 self.neuromod_optimizer.zero_grad(set_to_none=True)
 
-                # GRPO scoring: sample N trajectories, rank by loss
-                last_rl_data = self._rl_buffer[-1]
+                # GRPO scoring: replay ALL collected chunks with N trajectories
                 scoring = self.model.score_trajectories(
-                    last_rl_data, target_ids)
+                    self._rl_buffer, self._rl_pre_mg_state)
 
-                # GRPO-only replay (no GAE — only scored neurons get gradient)
+                # GRPO-only replay (only scored K neurons get gradient)
                 replay_data = self.model.prepare_grpo_replay(scoring)
                 rl_losses = self.model.replay_for_neuromod_grads(
                     replay_data,
@@ -195,6 +204,7 @@ class V8Trainer:
                 })
 
                 self._rl_buffer = []
+                self._rl_pre_mg_state = None
 
             # Step neuromod scheduler every chunk (not just on RL updates)
             # so the LR schedule tracks global training progress

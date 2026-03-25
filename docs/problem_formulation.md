@@ -60,9 +60,9 @@ Every 128 tokens (16 times per 2048-token chunk):
 - Outputs per-neuron additive deltas (257 dims: delta_primitive[128] + delta_key[128] + delta_decay[1])
 - Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
 
-**RL training**: GRPO trajectory scoring (8 trajectories for K=96 neurons, ranked by CE loss)
-+ GAE (lambda=0.95) over all segments. No value function or critic. RL data collected
-across 4 chunks (64 segments) before computing advantages and updating.
+**RL training**: GRPO trajectory scoring (8 trajectories for K=96 neurons, scored across
+ALL 4 collected chunks, ranked by CE loss). Non-K neurons get zero delta. Best
+trajectory's final state persists. No value function or critic.
 
 ---
 
@@ -109,19 +109,18 @@ Each action modifies primitives, routing keys, and decay for all 1024 neurons vi
 additive deltas. The reward is the CE loss on the next 128 tokens.
 
 **What we currently do**:
-- Per-segment CE loss as reward (16 rewards per chunk)
-- Multi-chunk collection: rewards gathered across `rl_collect_chunks=4` chunks (64 segments)
-  before computing advantages and updating
-- GRPO trajectory scoring: sample 8 alternative trajectories for K=96 neurons on the last
-  chunk's text. Each trajectory runs per-segment observe → sample → apply (mirrors real
-  forward). Rank by CE loss, z-score normalize → per-trajectory advantages.
-- GAE (lambda=0.95) over all 64 segments with batch-mean baseline
+- Collect RL data across `rl_collect_chunks=4` chunks. Save MG state at start of window.
+- Choose K=96 neurons (fixed for all trajectories and all chunks in the RL step)
+- GRPO trajectory scoring: sample 8 trajectories, each replaying ALL 4 chunks sequentially.
+  Only K neurons get stochastic actions, non-K get zero delta. Score = mean CE across all
+  4 chunks. Z-score normalize → per-trajectory advantages.
+- Best trajectory's final MG state + upper scan carries persist (best-of-N state selection)
 - No value function, no critic
 
 **What works**:
-- Each of the 64 actions (across 4 chunks) gets its own GAE advantage
-- GRPO provides trajectory-level credit assignment for sampled neurons
-- Multi-chunk collection gives the RL agent visibility into cross-chunk effects
+- Multi-chunk scoring captures long-range effects (64 segments of compounding memory changes)
+- Zero delta for non-K: loss differences are 100% attributable to K neurons' actions
+- Best-of-N state selection: free performance boost before neuromod learns anything
 - No critic to train — avoids the explained-variance=0 failure mode seen in earlier runs
 
 **Open questions**:
@@ -161,12 +160,11 @@ The action is clamped to +/-1.0 (RMS/L2 normalization bounds the effect). Questi
   differentiate neuron roles?
 
 **Q5: Reward horizon — should collection go beyond 4 chunks?**
-**Partially addressed.** Multi-chunk RL collection (`rl_collect_chunks=4`) now gathers
-64 segments (4 chunks) of rewards before computing GAE advantages. GRPO scores trajectories
-on the last chunk only (8 trajectories). Cross-chunk effects within the 4-chunk window are
-captured via GAE over the full collection window. Remaining concern: the effective horizon
-is still limited by the collection window size. A structural change that pays off 5+ chunks
-later still gets attenuated credit.
+**Addressed.** GRPO now scores trajectories across ALL 4 collected chunks (not just the
+last one). Each trajectory replays all 64 segments sequentially, with memory graph and upper
+scan carries evolving naturally. The total CE across all 4 chunks determines the trajectory's
+score. Remaining concern: the effective horizon is still limited by the collection window
+size. A structural change that pays off 5+ chunks later still gets attenuated credit.
 
 ### Problem 3: Memory Graph Signal Dynamics — Does It Actually Help?
 
@@ -209,25 +207,23 @@ Python loop over neurons.
 - Random exploration (20% of regrowth) may not be enough to discover useful long-range connections
   — it doesn't know WHICH specific connections are useful
 
-### Problem 5: Document Boundary Semantics
+### Problem 5: Document Boundary Semantics — RESOLVED
 
-**Current behavior**: At document boundaries (EOT token):
-- Within a chunk: decay is set to 0 for that token position (h ← received, no carry)
-- At chunk boundaries: only h, prev_messages, and firing_rate are zeroed; primitives,
-  key, decay, and plasticity metrics persist
+**Current behavior**: The memory graph is fully persistent — NO resets at document
+boundaries. Only the LM scan carries reset at doc boundaries. The memory graph's
+h, prev_messages, primitives, key, decay, and co_activation all persist across docs.
 
-**This means**: The graph's structural configuration (what neurons broadcast, how signals
-route, how persistent each neuron's memory is) persists across documents. Only the
-dynamic state (what neurons are currently "thinking about") resets.
+**The design intent**: The whole point of the memory graph is long-horizon storage.
+Understanding what document boundaries or session boundaries look like is something
+the memory graph should *learn* from the data, not have manually erased. The graph
+sees document transitions implicitly through abrupt CC signal changes (since the LM
+scan carries reset, H_mid changes character at boundaries).
 
-**The design intent**: Primitives and weights represent learned "concept atoms" and
-routing patterns. These should accumulate over training and across documents. The
-neuromodulator learns to build a graph configuration that's useful across many documents.
-At inference, the graph starts with a well-configured structure and quickly adapts its
-dynamic state to the new document.
-
-**Open question**: Is this the right split? Should some structural state (key)
-also partially decay at document boundaries to prevent overfitting to recent documents?
+**Why this is better than partial resets**: Any manual reset policy (zero h at doc
+boundaries, partially decay key, etc.) bakes in assumptions about what information
+should persist. The memory graph should discover these boundaries organically. If a
+neuron's state from a previous document is useful, it should be retained. If it's
+not, the decay mechanism and new incoming signals will naturally overwrite it.
 
 ---
 
@@ -239,12 +235,12 @@ also partially decay at document boundaries to prevent overfitting to recent doc
 | Memory graph per-token dynamics | Implemented, correct | High |
 | Throughput | ~53K collect, ~16K avg with GRPO | Acceptable |
 | Multi-chunk RL rewards | Implemented (4 chunks, 64 segments) | Medium — informative enough? |
-| Credit assignment | GRPO (8 trajectories, K=96 neurons) + GAE | Medium-High — trajectory ranking controls for text difficulty |
+| Credit assignment | GRPO (8 traj, K=96, all 4 chunks, zero non-K, best state persists) | Medium-High — trajectory ranking controls for text difficulty |
 | Primitives as message modulation | Implemented | Medium — do neurons differentiate? |
 | Structural plasticity | Implemented | Low — random rewiring meaningful? |
 | Memory actually helping LM | Not yet proven | Unknown — need training run |
 | Scale mismatch (CC vs graph signals) | Known issue | Needs investigation |
-| Cross-chunk RL credit | GAE over 64 segments (4-chunk window) | Improved |
+| Cross-chunk RL credit | GRPO scores all 4 chunks per trajectory | Addressed |
 
 ## Next Steps
 
