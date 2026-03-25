@@ -51,7 +51,7 @@ class V8Config:
     rl_gae_lambda: float = 0.95  # GAE lambda for advantage estimation
     rl_entropy_coef: float = 0.01  # entropy bonus coefficient
     rl_counterfactual_k: int = 96   # neurons to evaluate per counterfactual trajectory
-    rl_counterfactual_n: int = 32   # number of sampled trajectories for GRPO scoring
+    rl_counterfactual_n: int = 16   # number of sampled trajectories for GRPO scoring
 
     # Training
     T: int = 2048                # full chunk length
