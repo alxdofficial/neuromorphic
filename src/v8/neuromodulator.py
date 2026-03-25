@@ -1,8 +1,8 @@
 """Neuromodulator — policy network for memory graph plasticity.
 
 Shared MLP across all neurons. Observes neuron state + plasticity metrics,
-outputs new primitives, routing keys, and decay delta.
-Trained by REINFORCE with counterfactual baseline (no learned value function).
+outputs additive deltas for primitives, routing keys, and decay.
+Trained by GRPO trajectory scoring (no learned value function).
 """
 
 import math
@@ -21,7 +21,7 @@ class Neuromodulator(nn.Module):
 
     Shared across all neurons — each neuron's observation is processed
     independently through the same network (parameter sharing).
-    Counterfactual baseline (no learned value function).
+    GRPO trajectory scoring (no learned value function).
     """
 
     def __init__(self, config: V8Config, obs_dim: int):

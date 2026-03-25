@@ -116,7 +116,8 @@ class TestV8ModelForward:
         expected_k = min(cfg.rl_counterfactual_k, cfg.N_neurons)
         assert scoring["k_neurons"].shape[0] == expected_k
         assert scoring["trajectory_advantages"].shape[0] == cfg.rl_counterfactual_n
-        assert len(scoring["trajectory_actions"]) == cfg.rl_counterfactual_n
+        assert len(scoring["trajectory_k_actions"]) == cfg.rl_counterfactual_n
+        assert len(scoring["trajectory_k_obs"]) == cfg.rl_counterfactual_n
         assert torch.isfinite(scoring["trajectory_advantages"]).all()
 
     def test_replay_produces_gradients(self):
