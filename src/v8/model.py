@@ -128,16 +128,9 @@ class V8Model(nn.Module):
             eot_shifted[:, 1:] = eot_at[:, :-1]
             eot_masks = eot_shifted.view(BS, n_segments, action_every)
 
-        mem_out_A = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
-        N_cf = self.config.rl_counterfactual_n if use_neuromod else 0
-        K = self.config.rl_counterfactual_k
-        # N_cf counterfactual trajectories, each with different K neurons reverted
-        mem_out_Bs = [torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
-                      for _ in range(N_cf)] if use_neuromod else []
+        mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
         actions = []
         obs_list = []
-        # k_indices_list: list of (N_cf lists of k_idx) per segment
-        k_indices_list = []
         mg = self._mem_graph
 
         for seg in range(n_segments):
@@ -150,136 +143,34 @@ class V8Model(nn.Module):
             needs_phi = (sp_every > 0
                          and self._segment_counter % sp_every == 0)
 
-            if not use_neuromod:
-                seg_out = mg.forward_segment(
-                    seg_cc, eot_mask=eot_mask,
-                    update_co_activation=needs_phi)
-                mem_out_A[:, t0:t0 + action_every] = seg_out
-                if needs_phi:
-                    mg.structural_plasticity()
-                continue
+            # Neuromod observes and acts (if enabled)
+            if use_neuromod:
+                obs = mg.get_neuron_obs()
+                obs_flat = obs.reshape(BS * N_neurons, -1)
+                with torch.no_grad():
+                    action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
+                obs_list.append(obs_flat.detach())
+                actions.append(action.detach())
+                self._apply_neuromod_action(action, BS)
 
-            # --- Phase 2: Neuromod + multiple counterfactual trajectories ---
-
-            # 1. Observe and sample action
-            obs = mg.get_neuron_obs()
-            obs_flat = obs.reshape(BS * N_neurons, -1)
-            with torch.no_grad():
-                action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
-            obs_list.append(obs_flat.detach())
-            actions.append(action.detach())
-
-            # 2. Save full pre-action state for all neurons
-            saved_prim = mg.primitives.clone()
-            saved_key = mg.key.clone()
-            saved_decay = mg.decay_logit.clone()
-
-            # 3. Apply ALL neuromod actions
-            self._apply_neuromod_action(action, BS)
-
-            # 4. Save actioned state and pre-segment dynamic state
-            actioned_prim = mg.primitives.clone()
-            actioned_key = mg.key.clone()
-            actioned_decay = mg.decay_logit.clone()
-            pre_h = mg.h.clone()
-            pre_msg = mg.prev_messages.clone()
-
-            # --- REAL trajectory ---
-            seg_out_A = mg.forward_segment(
+            # Run memory graph
+            seg_out = mg.forward_segment(
                 seg_cc, eot_mask=eot_mask,
                 update_co_activation=needs_phi)
-            mem_out_A[:, t0:t0 + action_every] = seg_out_A
+            mem_out[:, t0:t0 + action_every] = seg_out
 
-            # Save post-segment state
-            post_h = mg.h.clone()
-            post_msg = mg.prev_messages.clone()
-            post_firing = mg.firing_rate.clone()
-            post_mean_in = mg.mean_input.clone()
-            post_mean_out = mg.mean_output.clone()
-
-            # --- N_cf COUNTERFACTUAL trajectories ---
-            seg_k_indices = []
-            for cf_i in range(N_cf):
-                # Pick different K neurons for each trajectory
-                k_idx = torch.randperm(N_neurons, device=device)[:K]
-                seg_k_indices.append(k_idx)
-
-                # Restore pre-segment dynamic state
-                mg.h = pre_h.clone()
-                mg.prev_messages = pre_msg.clone()
-
-                # Start from actioned state, revert K neurons to pre-action
-                mg.primitives = actioned_prim.clone()
-                mg.key = actioned_key.clone()
-                mg.decay_logit = actioned_decay.clone()
-                mg.primitives[:, k_idx] = saved_prim[:, k_idx]
-                mg.key[:, k_idx] = saved_key[:, k_idx]
-                mg.decay_logit[:, k_idx] = saved_decay[:, k_idx]
-
-                seg_out_B = mg.forward_segment(
-                    seg_cc, eot_mask=eot_mask,
-                    update_co_activation=False)
-                mem_out_Bs[cf_i][:, t0:t0 + action_every] = seg_out_B
-
-            k_indices_list.append(seg_k_indices)
-
-            # --- Restore real trajectory state ---
-            mg.h = post_h
-            mg.prev_messages = post_msg
-            mg.primitives = actioned_prim
-            mg.key = actioned_key
-            mg.decay_logit = actioned_decay
-            mg.firing_rate = post_firing
-            mg.mean_input = post_mean_in
-            mg.mean_output = post_mean_out
-
-            # Structural plasticity (real trajectory only)
             if needs_phi:
                 mg.structural_plasticity()
 
         # ==========================================
-        # Real + counterfactual upper scan paths
+        # Upper scan + output
         # ==========================================
-        split = self.config.scan_split_at
-        L = self.config.L_total
-
-        # Save upper-scan carries BEFORE the real scan (for counterfactual)
-        pre_upper_carries = None
-        if use_neuromod:
-            pre_upper_carries = [self.lm._carries[i].clone()
-                                 if self.lm._carries[i] is not None else None
-                                 for i in range(split, L)]
-
-        # Real path
-        H_enriched_A = self.lm.inject_memory(H_mid, mem_out_A)
-        H_A = self.lm.forward_scan_upper(H_enriched_A)
-        logits_A = self.lm.forward_output(H_A)
-
-        # Counterfactual paths (Phase 2 only — N_cf trajectories)
-        logits_Bs = []
-        if use_neuromod:
-            post_real_carries = [self.lm._carries[i].clone()
-                                 if self.lm._carries[i] is not None else None
-                                 for i in range(split, L)]
-
-            with torch.no_grad():
-                H_mid_det = H_mid.detach()
-                for cf_i in range(N_cf):
-                    # Restore pre-upper carries for each counterfactual
-                    for i, c in enumerate(pre_upper_carries):
-                        self.lm._carries[split + i] = c.clone() if c is not None else None
-
-                    H_enriched_B = self.lm.inject_memory(H_mid_det, mem_out_Bs[cf_i])
-                    H_B = self.lm.forward_scan_upper(H_enriched_B)
-                    logits_B = self.lm.forward_output(H_B)
-                    logits_Bs.append(logits_B)
-
-            # Restore real carries for continuation
-            for i, c in enumerate(post_real_carries):
-                self.lm._carries[split + i] = c
+        H_enriched = self.lm.inject_memory(H_mid, mem_out)
+        H = self.lm.forward_scan_upper(H_enriched)
+        logits = self.lm.forward_output(H)
 
         # ==========================================
-        # Collect RL data
+        # Collect RL data (scoring happens at RL update time, not here)
         # ==========================================
         rl_data = None
         if use_memory and use_neuromod:
@@ -289,94 +180,185 @@ class V8Model(nn.Module):
                 "eot_at": eot_at,
                 "n_segments": n_segments,
                 "action_every": action_every,
-                "k_indices": k_indices_list,  # list of (N_cf lists of k_idx) per seg
-                "logits_Bs": logits_Bs,       # list of N_cf logit tensors
+                "cc_segments": cc_segments.detach(),
+                "eot_masks": eot_masks,
+                "H_mid": H_mid.detach(),
             }
 
         return {
-            "logits": logits_A,
+            "logits": logits,
             "aux_loss": aux_loss,
             "surprise": surprise.detach(),
             "rl_data": rl_data,
         }
 
-    def compute_counterfactual_advantages(
-        self, collected_rl_data: list[dict],
-    ) -> dict:
-        """Compute per-neuron advantages using counterfactual baseline + GAE.
+    @torch.no_grad()
+    def score_trajectories(self, rl_data: dict, target_ids: Tensor) -> dict:
+        """GRPO-style trajectory scoring for neuromod credit assignment.
 
-        For K counterfactual neurons per segment: advantage = loss_cf - loss_real
-        (positive means their actions helped — reverting them hurts).
-        For other neurons: GAE with batch-mean baseline.
+        Picks K neurons, samples N trajectories with different actions for
+        those neurons (same text, same other neurons). Scores each by CE loss.
+        Returns per-neuron advantages based on ranking.
 
         Args:
-            collected_rl_data: list of per-chunk rl_data dicts
+            rl_data: from the most recent chunk's forward_chunk
+            target_ids: [BS, T] target token IDs for CE computation
 
         Returns:
-            Combined rl_data dict with obs, actions, and per-neuron advantages.
+            dict with k_neurons, trajectory_losses, trajectory_actions, obs
+        """
+        BS = target_ids.shape[0]
+        T = self.config.T
+        N = self.config.N_neurons
+        C = self.config.C
+        D_mem = self.config.D_mem
+        K = self.config.rl_counterfactual_k
+        N_traj = self.config.rl_counterfactual_n
+        action_every = rl_data["action_every"]
+        n_segments = rl_data["n_segments"]
+        cc_segments = rl_data["cc_segments"]  # [BS, n_seg, action_every, C, D_mem]
+        eot_masks = rl_data["eot_masks"]
+        H_mid = rl_data["H_mid"]  # [BS, T, D]
+        device = target_ids.device
+        dtype = H_mid.dtype
+        mg = self._mem_graph
+
+        # Pick K neurons for this scoring round (same across all trajectories)
+        K = min(K, N)  # handle tiny configs where N < K
+        k_neurons = torch.randperm(N, device=device)[:K]
+
+        # Save current memory graph state (to restore after scoring)
+        mg_state = mg.state_dict()
+
+        # Save upper scan carries
+        split = self.config.scan_split_at
+        L = self.config.L_total
+        saved_carries = [self.lm._carries[i].clone()
+                         if self.lm._carries[i] is not None else None
+                         for i in range(split, L)]
+
+        # Get observation for the K neurons (from start of last segment)
+        obs = rl_data["obs"][-1]  # [BS*N, obs_dim] from last segment
+
+        # Sample N trajectories with different actions for K neurons
+        trajectory_losses = []  # [N_traj] list of scalar losses
+        trajectory_actions = []  # [N_traj] list of [BS*N, act_dim]
+
+        eot_id = self.config.eot_id
+        eot_at = rl_data["eot_at"]
+        reward_mask = (~eot_at).to(dtype=dtype)
+        seg_mask = reward_mask.view(BS, n_segments, action_every)
+
+        for traj_i in range(N_traj):
+            # Restore memory graph to pre-scoring state
+            mg.load_state_dict({k: v.clone() for k, v in mg_state.items()})
+
+            # Sample fresh actions for ALL neurons
+            action, _, _, _ = self.neuromod.get_action_and_value(obs)
+            trajectory_actions.append(action.detach())
+
+            # Run full chunk with these actions
+            mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
+            for seg in range(n_segments):
+                # Apply actions (only K neurons get varied actions;
+                # other neurons keep the same action across trajectories
+                # since the policy is deterministic given obs, but the
+                # stochastic sampling gives different actions each time)
+                self._apply_neuromod_action(action, BS)
+
+                seg_cc = cc_segments[:, seg]
+                eot_mask = eot_masks[:, seg] if eot_masks is not None else None
+                seg_out = mg.forward_segment(seg_cc, eot_mask=eot_mask,
+                                             update_co_activation=False)
+                t0 = seg * action_every
+                mem_out[:, t0:t0 + action_every] = seg_out
+
+            # Upper scan + CE (restore carries each time)
+            for i, c in enumerate(saved_carries):
+                self.lm._carries[split + i] = c.clone() if c is not None else None
+
+            H_enriched = self.lm.inject_memory(H_mid, mem_out)
+            H = self.lm.forward_scan_upper(H_enriched)
+            logits = self.lm.forward_output(H)
+
+            # Per-segment losses
+            ce = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                target_ids.reshape(-1),
+                reduction='none',
+            ).reshape(BS, T)
+            seg_ce = ce.view(BS, n_segments, action_every)
+            seg_losses = (seg_ce * seg_mask).sum(-1) / seg_mask.sum(-1).clamp(min=1)
+            trajectory_losses.append(seg_losses.mean().item())  # scalar loss
+
+            del mem_out, logits, H, H_enriched, ce
+
+        # Restore memory graph and carries to real state
+        mg.load_state_dict({k: v.clone() for k, v in mg_state.items()})
+        for i, c in enumerate(saved_carries):
+            self.lm._carries[split + i] = c
+
+        # Rank trajectories — lower loss = better
+        losses_t = torch.tensor(trajectory_losses, device=device)
+        # GRPO advantage: z-score normalization across trajectories
+        adv_per_traj = -(losses_t - losses_t.mean()) / losses_t.std().clamp(min=1e-8)
+        # Positive = better than average trajectory
+
+        return {
+            "k_neurons": k_neurons,                # [K] — which neurons were varied
+            "trajectory_advantages": adv_per_traj,  # [N_traj] — per-trajectory advantage
+            "trajectory_actions": trajectory_actions,  # [N_traj] list of [BS*N, act_dim]
+            "obs": obs,                             # [BS*N, obs_dim]
+        }
+
+    def compute_grpo_advantages(self, scoring_result: dict,
+                                collected_rl_data: list[dict]) -> dict:
+        """Combine GRPO scoring with GAE for non-scored neurons.
+
+        Args:
+            scoring_result: from score_trajectories
+            collected_rl_data: list of per-chunk rl_data dicts (for GAE)
+
+        Returns:
+            Combined rl_data with per-neuron advantages for replay.
         """
         all_obs = []
         all_actions = []
         all_seg_rewards = []
-        # all_cf_data: list of (list of N_cf [BS, n_seg] tensors) per chunk
-        all_cf_data = []
-        # all_k_indices: list of (list of N_cf k_idx tensors) per segment
-        all_k_indices = []
 
         N = self.config.N_neurons
-        N_cf = self.config.rl_counterfactual_n
 
         for chunk_data in collected_rl_data:
             all_obs.extend(chunk_data["obs"])
             all_actions.extend(chunk_data["actions"])
             all_seg_rewards.append(chunk_data["seg_rewards"])
-            all_cf_data.append(chunk_data["all_seg_rewards_cf"])
-            all_k_indices.extend(chunk_data["k_indices"])
 
-        seg_rewards = torch.cat(all_seg_rewards, dim=1)  # [BS, total_seg]
+        seg_rewards = torch.cat(all_seg_rewards, dim=1)
         BS = seg_rewards.shape[0]
         total_segments = seg_rewards.shape[1]
         device = seg_rewards.device
         gamma = self.config.rl_gamma
         lam = self.config.rl_gae_lambda
 
-        # Concatenate CF rewards: [N_cf][BS, total_seg]
-        cf_rewards_per_traj = []
-        for cf_i in range(N_cf):
-            cf_chunks = [chunk_cf[cf_i] for chunk_cf in all_cf_data]
-            cf_rewards_per_traj.append(torch.cat(cf_chunks, dim=1))
-
         with torch.no_grad():
-            # --- GAE for batch-mean baseline (all neurons) ---
+            # GAE for all neurons (batch-mean baseline)
             baseline = seg_rewards.mean(dim=0, keepdim=True)
             deltas = seg_rewards - baseline
-
             gae_advantages = torch.zeros_like(deltas)
             gae = torch.zeros(BS, device=device, dtype=deltas.dtype)
             for t in range(total_segments - 1, -1, -1):
                 gae = deltas[:, t] + gamma * lam * gae
                 gae_advantages[:, t] = gae
 
-            # --- Per-neuron advantages [BS, total_seg, N] ---
+            # Per-neuron advantages [BS, total_seg, N]
             advantages = gae_advantages.unsqueeze(-1).expand(
                 BS, total_segments, N).clone()
-
-            # Override counterfactual neurons with their direct advantage
-            gae_std = gae_advantages.std().clamp(min=1e-8)
-            for seg_idx, seg_k_list in enumerate(all_k_indices):
-                # seg_k_list: list of N_cf k_idx tensors for this segment
-                for cf_i, k_idx in enumerate(seg_k_list):
-                    cf_r = cf_rewards_per_traj[cf_i][:, seg_idx]  # [BS]
-                    real_r = seg_rewards[:, seg_idx]  # [BS]
-                    cf_adv = real_r - cf_r  # positive = actions helped
-                    cf_adv_norm = cf_adv / cf_adv.abs().mean().clamp(min=1e-8) * gae_std
-                    advantages[:, seg_idx, k_idx] = cf_adv_norm.unsqueeze(-1).expand(
-                        BS, len(k_idx))
 
         return {
             "obs": all_obs,
             "actions": all_actions,
-            "advantages": advantages,  # [BS, total_segments, N]
+            "advantages": advantages,
+            "scoring": scoring_result,  # passed through for GRPO replay
         }
 
     def replay_for_neuromod_grads(
@@ -384,60 +366,76 @@ class V8Model(nn.Module):
         amp_enabled: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
     ) -> dict:
-        """Compute policy gradient via replay with per-neuron advantages.
+        """Compute policy gradient from GAE + GRPO scoring.
 
-        Uses counterfactual advantages for evaluated neurons and GAE
-        batch-mean advantages for others. No learned value function.
+        Two gradient sources:
+        1. GAE replay: standard REINFORCE on collected trajectories
+        2. GRPO replay: encourage actions from best-scoring trajectories
 
         Returns:
-            dict with policy_loss and entropy for logging
+            dict with policy_loss, grpo_loss, entropy for logging
         """
-        obs_list = rl_data["obs"]          # list of n_seg [BS*N, obs_dim]
-        actions = rl_data["actions"]       # list of n_seg [BS*N, act_dim]
-        advantages = rl_data["advantages"] # [BS, n_segments, N]
+        obs_list = rl_data["obs"]
+        actions = rl_data["actions"]
+        advantages = rl_data["advantages"]  # [BS, n_segments, N]
+        scoring = rl_data.get("scoring")    # from score_trajectories
 
         N_neurons = self.config.N_neurons
         BS = actions[0].shape[0] // N_neurons
         device = actions[0].device
         n_segments = len(actions)
 
-        # Process replay in mini-batches to avoid OOM
-        # (with action_every=64 and rl_collect_chunks=4, total rows = 128*BS*N ≈ 1M)
+        # --- GAE replay (per-segment mini-batches) ---
         adv = advantages.permute(1, 0, 2)  # [n_seg, BS, N]
-
         total_policy_loss = 0.0
         total_entropy = 0.0
-        n_total = 0
 
-        # Process one segment at a time (each is BS*N rows)
         for seg_i in range(n_segments):
-            seg_obs = obs_list[seg_i]       # [BS*N, obs_dim]
-            seg_act = actions[seg_i]        # [BS*N, act_dim]
-            seg_adv = adv[seg_i]            # [BS, N]
+            seg_obs = obs_list[seg_i]
+            seg_act = actions[seg_i]
+            seg_adv = adv[seg_i]
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=amp_enabled):
                 _, log_prob, entropy, _ = self.neuromod.get_action_and_value(
                     seg_obs, action=seg_act)
 
-            # [BS*N] → [BS, N]
             log_prob = log_prob.reshape(BS, N_neurons)
             entropy = entropy.reshape(BS, N_neurons)
 
             seg_loss = -(seg_adv * log_prob).mean()
             seg_entropy = entropy.mean()
             seg_total = seg_loss - self.config.rl_entropy_coef * seg_entropy
-
-            # Accumulate gradients (backward on each mini-batch)
             (seg_total / n_segments).backward()
 
             total_policy_loss += seg_loss.item()
             total_entropy += seg_entropy.item()
-            n_total += 1
+
+        # --- GRPO replay: encourage best trajectories' actions ---
+        grpo_loss_val = 0.0
+        if scoring is not None:
+            traj_advs = scoring["trajectory_advantages"]  # [N_traj]
+            traj_actions = scoring["trajectory_actions"]   # list of [BS*N, act_dim]
+            obs = scoring["obs"]                           # [BS*N, obs_dim]
+
+            # Replay each trajectory weighted by its advantage
+            for traj_i, traj_adv in enumerate(traj_advs):
+                if traj_adv.item() <= 0:
+                    continue  # only encourage better-than-average trajectories
+
+                with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                    enabled=amp_enabled):
+                    _, log_prob, _, _ = self.neuromod.get_action_and_value(
+                        obs, action=traj_actions[traj_i])
+
+                grpo_loss = -(traj_adv * log_prob.mean())
+                (grpo_loss / max(1, (traj_advs > 0).sum().item())).backward()
+                grpo_loss_val += grpo_loss.item()
 
         return {
-            "policy_loss": total_policy_loss / max(n_total, 1),
-            "entropy": total_entropy / max(n_total, 1),
+            "policy_loss": total_policy_loss / max(n_segments, 1),
+            "grpo_loss": grpo_loss_val,
+            "entropy": total_entropy / max(n_segments, 1),
         }
 
     def _apply_neuromod_action(self, action: Tensor, BS: int):

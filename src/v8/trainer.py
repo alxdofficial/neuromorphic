@@ -140,7 +140,7 @@ class V8Trainer:
         # ==========================================
         rl_metrics = {}
         if rl_data is not None:
-            # Compute per-segment rewards from real and N_cf counterfactual CEs
+            # Compute per-segment rewards from CE
             with torch.no_grad():
                 n_segments = rl_data["n_segments"]
                 action_every = rl_data["action_every"]
@@ -152,44 +152,30 @@ class V8Trainer:
                 seg_losses = (seg_ce * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
                 seg_rewards = -seg_losses
 
-                # N_cf counterfactual CEs → per-trajectory seg_rewards
-                all_seg_rewards_cf = []
-                for logits_B in rl_data["logits_Bs"]:
-                    ce_cf = F.cross_entropy(
-                        logits_B.reshape(-1, self.config.vocab_size),
-                        target_ids.reshape(-1),
-                        reduction='none',
-                    ).reshape(BS, T)
-                    seg_ce_cf = ce_cf.view(BS, n_segments, action_every)
-                    seg_losses_cf = (seg_ce_cf * seg_mask).sum(dim=-1) / seg_mask.sum(dim=-1).clamp(min=1)
-                    all_seg_rewards_cf.append(-seg_losses_cf)
-
             rl_data["seg_rewards"] = seg_rewards
-            rl_data["all_seg_rewards_cf"] = all_seg_rewards_cf  # list of N_cf [BS, n_seg]
             rl_data["loss"] = ce_loss.item()
-            # Drop logits to free memory
-            del rl_data["logits_Bs"]
             self._rl_buffer.append(rl_data)
 
-            # Per-chunk logging (average CF advantage across trajectories)
-            avg_cf_adv = sum(
-                ((-r) - seg_losses).mean().item() for r in all_seg_rewards_cf
-            ) / len(all_seg_rewards_cf)
-            cf_adv = avg_cf_adv
             rl_metrics = {
                 "rl_loss": rl_data["loss"],
                 "rl_seg_loss_first": seg_losses[:, 0].mean().item(),
                 "rl_seg_loss_last": seg_losses[:, -1].mean().item(),
-                "rl_cf_adv": cf_adv,
             }
 
             # Update neuromod when buffer is full
             if len(self._rl_buffer) >= self.rl_collect_chunks:
                 self.neuromod_optimizer.zero_grad(set_to_none=True)
 
-                combined = self.model.compute_counterfactual_advantages(
-                    self._rl_buffer)
+                # GRPO scoring: sample N trajectories, rank by loss
+                last_rl_data = self._rl_buffer[-1]
+                scoring = self.model.score_trajectories(
+                    last_rl_data, target_ids)
 
+                # GAE advantages + GRPO scoring
+                combined = self.model.compute_grpo_advantages(
+                    scoring, self._rl_buffer)
+
+                # Replay with both GAE and GRPO gradients
                 rl_losses = self.model.replay_for_neuromod_grads(
                     combined,
                     amp_enabled=self.use_amp,
@@ -204,13 +190,17 @@ class V8Trainer:
                 adv = combined["advantages"]
                 rl_metrics.update({
                     "rl_policy_loss": rl_losses["policy_loss"],
+                    "rl_grpo_loss": rl_losses.get("grpo_loss", 0),
                     "rl_entropy": rl_losses["entropy"],
                     "rl_adv_mean": adv.mean().item(),
                     "rl_adv_std": adv.std().item(),
                     "rl_nm_grad_norm": nm_grad_norm,
+                    "rl_traj_loss_best": min(
+                        scoring["trajectory_advantages"].tolist()),
+                    "rl_traj_loss_worst": max(
+                        scoring["trajectory_advantages"].tolist()),
                 })
 
-                # Clear buffer
                 self._rl_buffer = []
 
             # Step neuromod scheduler every chunk (not just on RL updates)
