@@ -144,6 +144,14 @@ def main():
         model.lm.load_state_dict(ckpt["model_state_dict"], strict=False)
         if "neuromod_state_dict" in ckpt:
             model.neuromod.load_state_dict(ckpt["neuromod_state_dict"], strict=False)
+            # In Phase 2 (--freeze-lm), reset logstd to config init so
+            # exploration isn't locked to Phase 1's (untrained) values
+            if args.freeze_lm:
+                init_val = config.neuromod_logstd_init
+                model.neuromod.prim_logstd.data.fill_(init_val)
+                model.neuromod.key_logstd.data.fill_(init_val)
+                model.neuromod.decay_logstd.data.fill_(init_val)
+                print(f"  Reset logstd to {init_val} (config init for Phase 2)")
         if "memory_graph_state" in ckpt:
             # Defer memory graph restore — need BS from first batch
             _pending_mg_state = ckpt["memory_graph_state"]
