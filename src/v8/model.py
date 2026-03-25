@@ -278,9 +278,10 @@ class V8Model(nn.Module):
             H = self.lm.forward_scan_upper(H_enriched)
             logits = self.lm.forward_output(H)
 
-            # Per-segment losses
+            # Per-segment losses (float32 for precision — bf16 rounds away
+            # the small differences between trajectories)
             ce = F.cross_entropy(
-                logits.reshape(-1, self.config.vocab_size),
+                logits.float().reshape(-1, self.config.vocab_size),
                 target_ids.reshape(-1),
                 reduction='none',
             ).reshape(BS, T)
@@ -297,7 +298,13 @@ class V8Model(nn.Module):
 
         # Rank trajectories — lower loss = better (already on GPU)
         # GRPO advantage: z-score normalization across trajectories
-        adv_per_traj = -(trajectory_losses - trajectory_losses.mean()) / trajectory_losses.std().clamp(min=1e-8)
+        tl_std = trajectory_losses.std()
+        if tl_std < 1e-6:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"GRPO: all trajectories tied (std={tl_std.item():.2e}, "
+                f"losses={trajectory_losses.tolist()})")
+        adv_per_traj = -(trajectory_losses - trajectory_losses.mean()) / tl_std.clamp(min=1e-8)
         # Positive = better than average trajectory
 
         return {
