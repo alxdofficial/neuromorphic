@@ -116,19 +116,37 @@ class V8LM(nn.Module):
             x_cols = x.view(BS, T, C, D_cc)
             surprise_list = []
             gain_modulated = []
+            per_cc_pred_loss = []
             for c in range(C):
                 h_c = H_cols[:, :, c]
                 x_c = x_cols[:, :, c]
                 surp, z_hat, z = self.pcm_modules[c].compute_surprise(h_c, x_c)
                 h_c = self.pcm_modules[c].apply_gain(h_c, surp)
-                aux_loss = aux_loss + self.pcm_modules[c].prediction_loss(z_hat, z)
+                ploss = self.pcm_modules[c].prediction_loss(z_hat, z)
+                aux_loss = aux_loss + ploss
+                per_cc_pred_loss.append(ploss.item())
                 surprise_list.append(surp)
                 gain_modulated.append(h_c)
             H = torch.stack(gain_modulated, dim=2).reshape(BS, T, D)
             surprise = torch.stack(surprise_list, dim=2)
             aux_loss = aux_loss / C * self.config.pcm_pred_weight
+
+            # Cache lightweight PCM stats for diagnostics (no tensors retained)
+            surp_all = surprise.detach()
+            surp_norms = surp_all.norm(dim=-1)  # [BS, T, C]
+            gain_vals = torch.stack(
+                [self.pcm_modules[c].gain_scale.detach() for c in range(C)])
+            self._pcm_stats = {
+                "surprise_mean": surp_norms.mean().item(),
+                "surprise_std": surp_norms.std().item(),
+                "surprise_max": surp_norms.max().item(),
+                "surprise_per_cc": surp_norms.mean(dim=(0, 1)).tolist(),  # [C]
+                "pred_loss_per_cc": per_cc_pred_loss,  # [C]
+                "gain_scale_per_cc": gain_vals.tolist(),  # [C]
+            }
         else:
             surprise = torch.zeros(BS, T, C, D_cc, device=H.device, dtype=H.dtype)
+            self._pcm_stats = None
 
         return H, x, surprise, aux_loss
 

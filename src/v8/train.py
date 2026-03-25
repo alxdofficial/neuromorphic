@@ -435,8 +435,8 @@ def main():
             try:
                 from scripts.plot_training import (
                     load_metrics as _load_m, plot_training_curves,
-                    plot_rl_curves, plot_memory_health, plot_connectivity_snapshot,
-                    plot_neuron_graph,
+                    plot_rl_curves, plot_memory_health, plot_pcm_health,
+                    plot_connectivity_snapshot, plot_neuron_graph,
                 )
                 plot_dir = os.path.join(save_dir, "plots")
                 os.makedirs(plot_dir, exist_ok=True)
@@ -444,6 +444,7 @@ def main():
                 plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
                 plot_rl_curves(_records, os.path.join(plot_dir, "rl_curves.png"))
                 plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
+                plot_pcm_health(_records, os.path.join(plot_dir, "pcm_health.png"))
                 # Latest snapshot: connectivity + neuron graph
                 snap_dir = os.path.join(save_dir, "snapshots")
                 if os.path.exists(snap_dir):

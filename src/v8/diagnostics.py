@@ -101,9 +101,26 @@ class V8Diagnostics:
             metrics["mem_gate_min"] = round(gate.min().item(), 4)
             metrics["mem_gate_max"] = round(gate.max().item(), 4)
 
-            # PCM gain_scale per CC
-            if hasattr(lm, 'pcm') and hasattr(lm.pcm, 'gain_scale'):
-                metrics["pcm_gain_scale"] = round(lm.pcm.gain_scale.item(), 4)
+            # === PCM diagnostics (from cached forward stats) ===
+            pcm_stats = getattr(lm, '_pcm_stats', None)
+            if pcm_stats is not None:
+                metrics["pcm_surprise_mean"] = round(pcm_stats["surprise_mean"], 4)
+                metrics["pcm_surprise_std"] = round(pcm_stats["surprise_std"], 4)
+                metrics["pcm_surprise_max"] = round(pcm_stats["surprise_max"], 4)
+                # Per-CC breakdown (min/max/spread across columns)
+                per_cc_surp = pcm_stats["surprise_per_cc"]
+                metrics["pcm_surprise_cc_min"] = round(min(per_cc_surp), 4)
+                metrics["pcm_surprise_cc_max"] = round(max(per_cc_surp), 4)
+                per_cc_loss = pcm_stats["pred_loss_per_cc"]
+                metrics["pcm_pred_loss_mean"] = round(
+                    sum(per_cc_loss) / len(per_cc_loss), 6)
+                metrics["pcm_pred_loss_min"] = round(min(per_cc_loss), 6)
+                metrics["pcm_pred_loss_max"] = round(max(per_cc_loss), 6)
+                gain_scales = pcm_stats["gain_scale_per_cc"]
+                metrics["pcm_gain_scale_mean"] = round(
+                    sum(gain_scales) / len(gain_scales), 4)
+                metrics["pcm_gain_scale_min"] = round(min(gain_scales), 4)
+                metrics["pcm_gain_scale_max"] = round(max(gain_scales), 4)
 
             # === Neuromod policy stats ===
             nm = self.model.neuromod

@@ -220,6 +220,12 @@ def plot_rl_curves(records, output_path):
         _plot_line(ax, steps, vals, C_ADV)
         _setup_ax(ax, "Trajectory Adv Std (signal strength)")
 
+        # Entropy
+        ax = axes[1, 0]
+        vals = [r.get("rl_entropy", 0) for r in rl_records]
+        _plot_line(ax, steps, vals, C_ENT)
+        _setup_ax(ax, "Policy Entropy", "entropy")
+
         # Exploration: logstd values
         ax = axes[1, 1]
         all_records = records
@@ -339,6 +345,70 @@ def plot_memory_health(records, output_path):
         rewires = [r.get("mem_plasticity_rewires", 0) for r in mem_records]
         ax.plot(steps, rewires, color=C_PHI, linewidth=2.0)
         _setup_ax(ax, "Cumulative Plasticity Rewires", "total rewires")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
+        plt.close()
+        print(f"  Saved: {output_path}")
+
+
+def plot_pcm_health(records, output_path):
+    """PCM surprise, prediction loss, gain modulation across CCs."""
+    pcm_records = [r for r in records if "pcm_surprise_mean" in r]
+    if not pcm_records:
+        print("  No PCM metrics found, skipping pcm_health")
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle("PCM Health", fontsize=16, fontweight="bold")
+
+        steps = [r["step"] for r in pcm_records]
+
+        # Surprise magnitude
+        ax = axes[0, 0]
+        _plot_line(ax, steps,
+                   [r["pcm_surprise_mean"] for r in pcm_records],
+                   C_PRIM, "mean")
+        _plot_line(ax, steps,
+                   [r["pcm_surprise_max"] for r in pcm_records],
+                   C_DECAY, "max")
+        ax.legend()
+        _setup_ax(ax, "Surprise Magnitude (L2 norm)", "norm")
+
+        # Surprise spread across CCs
+        ax = axes[0, 1]
+        _plot_line(ax, steps,
+                   [r.get("pcm_surprise_cc_min", 0) for r in pcm_records],
+                   C_FIRE, "CC min")
+        _plot_line(ax, steps,
+                   [r.get("pcm_surprise_cc_max", 0) for r in pcm_records],
+                   C_DECAY, "CC max")
+        ax.legend()
+        _setup_ax(ax, "Surprise per CC (min/max)", "norm")
+
+        # Prediction loss per CC
+        ax = axes[1, 0]
+        _plot_line(ax, steps,
+                   [r.get("pcm_pred_loss_mean", 0) for r in pcm_records],
+                   C_LOSS, "mean")
+        vals_min = [r.get("pcm_pred_loss_min", 0) for r in pcm_records]
+        vals_max = [r.get("pcm_pred_loss_max", 0) for r in pcm_records]
+        ax.fill_between(steps, vals_min, vals_max, alpha=0.15, color=C_LOSS)
+        _setup_ax(ax, "PCM Prediction Loss (per CC range)", "MSE")
+
+        # Gain scale per CC
+        ax = axes[1, 1]
+        _plot_line(ax, steps,
+                   [r.get("pcm_gain_scale_mean", 2.0) for r in pcm_records],
+                   C_GATE, "mean")
+        vals_min = [r.get("pcm_gain_scale_min", 2.0) for r in pcm_records]
+        vals_max = [r.get("pcm_gain_scale_max", 2.0) for r in pcm_records]
+        ax.fill_between(steps, vals_min, vals_max, alpha=0.15, color=C_GATE)
+        ax.axhline(y=2.0, color="#999", linestyle="--", linewidth=0.8,
+                   label="init (2.0)")
+        ax.legend()
+        _setup_ax(ax, "Gain Scale per CC", "scale")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
