@@ -240,6 +240,10 @@ class V8Model(nn.Module):
         # Get observation for the K neurons (from start of last segment)
         obs = rl_data["obs"][-1]  # [BS*N, obs_dim] from last segment
 
+        # Cast obs to neuromod dtype
+        nm_dtype = next(self.neuromod.parameters()).dtype
+        obs = obs.to(nm_dtype)
+
         # Sample N trajectories with different actions for K neurons
         trajectory_losses = []  # [N_traj] list of scalar losses
         trajectory_actions = []  # [N_traj] list of [BS*N, act_dim]
