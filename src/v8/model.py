@@ -382,35 +382,43 @@ class V8Model(nn.Module):
         device = actions[0].device
         n_segments = len(actions)
 
-        # Batch all segments for one forward pass
-        all_obs = torch.stack(obs_list)        # [n_seg, BS*N, obs_dim]
-        all_actions = torch.stack(actions)      # [n_seg, BS*N, act_dim]
-        flat_obs = all_obs.reshape(-1, all_obs.shape[-1])
-        flat_actions = all_actions.reshape(-1, all_actions.shape[-1])
-
-        with torch.autocast(device_type=device.type, dtype=amp_dtype,
-                            enabled=amp_enabled):
-            _, log_prob, entropy, _ = self.neuromod.get_action_and_value(
-                flat_obs, action=flat_actions,
-            )
-
-        # [n_seg * BS * N] → [n_seg, BS, N]
-        log_prob = log_prob.reshape(n_segments, BS, N_neurons)
-        entropy = entropy.reshape(n_segments, BS, N_neurons)
-
-        # Per-neuron advantage: [BS, n_seg, N] → [n_seg, BS, N]
+        # Process replay in mini-batches to avoid OOM
+        # (with action_every=64 and rl_collect_chunks=4, total rows = 128*BS*N ≈ 1M)
         adv = advantages.permute(1, 0, 2)  # [n_seg, BS, N]
 
-        # Weighted policy loss + entropy bonus
-        policy_loss = -(adv * log_prob).mean()
-        entropy_bonus = -self.config.rl_entropy_coef * entropy.mean()
+        total_policy_loss = 0.0
+        total_entropy = 0.0
+        n_total = 0
 
-        total_loss = policy_loss + entropy_bonus
-        total_loss.backward()
+        # Process one segment at a time (each is BS*N rows)
+        for seg_i in range(n_segments):
+            seg_obs = obs_list[seg_i]       # [BS*N, obs_dim]
+            seg_act = actions[seg_i]        # [BS*N, act_dim]
+            seg_adv = adv[seg_i]            # [BS, N]
+
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=amp_enabled):
+                _, log_prob, entropy, _ = self.neuromod.get_action_and_value(
+                    seg_obs, action=seg_act)
+
+            # [BS*N] → [BS, N]
+            log_prob = log_prob.reshape(BS, N_neurons)
+            entropy = entropy.reshape(BS, N_neurons)
+
+            seg_loss = -(seg_adv * log_prob).mean()
+            seg_entropy = entropy.mean()
+            seg_total = seg_loss - self.config.rl_entropy_coef * seg_entropy
+
+            # Accumulate gradients (backward on each mini-batch)
+            (seg_total / n_segments).backward()
+
+            total_policy_loss += seg_loss.item()
+            total_entropy += seg_entropy.item()
+            n_total += 1
 
         return {
-            "policy_loss": policy_loss.item(),
-            "entropy": entropy.mean().item(),
+            "policy_loss": total_policy_loss / max(n_total, 1),
+            "entropy": total_entropy / max(n_total, 1),
         }
 
     def _apply_neuromod_action(self, action: Tensor, BS: int):
