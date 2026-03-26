@@ -4,8 +4,12 @@ Lower scan layers (0..split-1) produce H_mid. Memory graph reads H_mid
 per-token and produces mem_signals. Memory is injected into H_mid, then
 upper scan layers (split..L-1) process the memory-enriched representation.
 
-CC→memory: H_mid sliced per CC (D_cc=128) — lower scan's representation
-Memory→CC: port neuron messages (D_mem=D_cc=128) — gated, added to H_mid
+PCM computes surprise at the split point. Surprise is passed as a side
+input to the first upper scan layer, influencing both its gate and input
+additively. No multiplicative gain modulation.
+
+CC->memory: H_mid sliced per CC (D_cc=128) -- lower scan's representation
+Memory->CC: port neuron messages (D_mem=D_cc=128) -- gated, added to H_mid
 Upper scan layers see memory-enriched input and learn to use it.
 """
 
@@ -16,7 +20,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from ..model.scan import ScanLayer, RMSNorm
-from .pcm import SingleColumnPCM
+from .pcm import BatchedPCM
 from .config import V8Config
 
 
@@ -44,19 +48,22 @@ class V8LM(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(config.T, D) * 0.02)
 
         # Scan layers — split into lower and upper
-        self.layers = nn.ModuleList([
-            ScanLayer(D, config.d_inner, config.dropout,
-                      n_layers=config.L_total, glu_output=config.glu_output)
-            for _ in range(config.L_total)
-        ])
+        split = config.scan_split_at
+        self.layers = nn.ModuleList()
+        for i in range(config.L_total):
+            # First upper scan layer gets side_dim=D for PCM surprise input
+            side_dim = D if (i == split and config.pcm_enabled) else 0
+            self.layers.append(
+                ScanLayer(D, config.d_inner, config.dropout,
+                          n_layers=config.L_total, glu_output=config.glu_output,
+                          side_dim=side_dim)
+            )
 
-        # Per-CC PCM (independent weights per column)
+        # Batched PCM across all columns
         if config.pcm_enabled:
-            self.pcm_modules = nn.ModuleList([
-                SingleColumnPCM(D_cc, hidden=config.pcm_hidden) for _ in range(C)
-            ])
+            self.pcm = BatchedPCM(C, D_cc, hidden=config.pcm_hidden)
         else:
-            self.pcm_modules = None
+            self.pcm = None
 
         # Memory gate per CC (sigmoid(0) = 0.5 at init)
         self.mem_gate = nn.Parameter(torch.zeros(C))
@@ -74,16 +81,17 @@ class V8LM(nn.Module):
                            ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Lower scan layers (0..split-1) + PCM. Produces H_mid for memory graph.
 
-        PCM runs at the split point so the memory graph reads gain-modulated
-        representations — surprising tokens produce stronger CC signals.
+        PCM computes surprise at the split point. H_mid passes through
+        unchanged (no gain modulation). Surprise is returned separately
+        for the upper scan to use as a side input.
 
         Args:
             input_ids: [BS, T]
 
         Returns:
-            H_mid: [BS, T, D] — hidden states after lower scan + PCM gain (WITH autograd)
+            H_mid: [BS, T, D] — hidden states after lower scan (WITH autograd)
+            surprise: [BS, T, D] — per-CC surprise stacked to full D (WITH autograd)
             x: [BS, T, D] — embedded input
-            surprise: [BS, T, C, D_cc] — per-CC surprise vectors
             aux_loss: scalar — PCM prediction loss
         """
         BS, T = input_ids.shape
@@ -109,52 +117,44 @@ class V8LM(nn.Module):
                 H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
-        # PCM at the split point — surprise modulates H_mid before memory reads it
+        # PCM at the split point — compute surprise, no gain modulation
         aux_loss = torch.tensor(0.0, device=H.device)
-        if self.pcm_modules is not None:
+        if self.pcm is not None:
             H_cols = H.view(BS, T, C, D_cc)
             x_cols = x.view(BS, T, C, D_cc)
-            surprise_list = []
-            gain_modulated = []
-            per_cc_pred_loss = []
-            for c in range(C):
-                h_c = H_cols[:, :, c]
-                x_c = x_cols[:, :, c]
-                surp, z_hat, z = self.pcm_modules[c].compute_surprise(h_c, x_c)
-                h_c = self.pcm_modules[c].apply_gain(h_c, surp)
-                ploss = self.pcm_modules[c].prediction_loss(z_hat, z)
-                aux_loss = aux_loss + ploss
-                per_cc_pred_loss.append(ploss.item())
-                surprise_list.append(surp)
-                gain_modulated.append(h_c)
-            H = torch.stack(gain_modulated, dim=2).reshape(BS, T, D)
-            surprise = torch.stack(surprise_list, dim=2)
-            aux_loss = aux_loss / C * self.config.pcm_pred_weight
+            surprise, z_hat, z, pred_loss, per_cc_pred_loss = self.pcm(H_cols, x_cols)
+            aux_loss = pred_loss * self.config.pcm_pred_weight
 
             # Cache lightweight PCM stats for diagnostics (no tensors retained)
-            surp_all = surprise.detach()
-            surp_norms = surp_all.norm(dim=-1)  # [BS, T, C]
-            gain_vals = torch.stack(
-                [self.pcm_modules[c].gain_scale.detach() for c in range(C)])
+            surp_norms = surprise.detach().norm(dim=-1)  # [BS, T, C]
             self._pcm_stats = {
                 "surprise_mean": surp_norms.mean().item(),
                 "surprise_std": surp_norms.std().item(),
                 "surprise_max": surp_norms.max().item(),
                 "surprise_per_cc": surp_norms.mean(dim=(0, 1)).tolist(),  # [C]
                 "pred_loss_per_cc": per_cc_pred_loss,  # [C]
-                "gain_scale_per_cc": gain_vals.tolist(),  # [C]
             }
+
+            # Reshape to [BS, T, D] for upper scan side input
+            surprise_flat = surprise.reshape(BS, T, D)
         else:
-            surprise = torch.zeros(BS, T, C, D_cc, device=H.device, dtype=H.dtype)
+            surprise_flat = torch.zeros(BS, T, D, device=H.device, dtype=H.dtype)
             self._pcm_stats = None
 
-        return H, x, surprise, aux_loss
+        # H passes through unchanged — no gain modulation
+        return H, surprise_flat, x, aux_loss
 
-    def forward_scan_upper(self, H_enriched: Tensor) -> Tensor:
+    def forward_scan_upper(self, H_enriched: Tensor,
+                           surprise: Tensor | None = None) -> Tensor:
         """Upper scan layers (split..L-1) on memory-enriched input.
+
+        The first upper layer receives surprise as a side input, which
+        additively influences its gate and scan input. Subsequent layers
+        see the result through normal residual connections.
 
         Args:
             H_enriched: [BS, T, D] — H_mid + gated memory signals
+            surprise: [BS, T, D] or None — PCM surprise (side input to first upper layer)
 
         Returns:
             H: [BS, T, D] — hidden states after upper scan layers
@@ -164,11 +164,13 @@ class V8LM(nn.Module):
         H = H_enriched
         for i in range(split, self.config.L_total):
             carry = self._carries[i]
+            # Only the first upper layer gets surprise as side input
+            side = surprise if i == split else None
             if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry,
+                H, h_last = grad_checkpoint(self.layers[i], H, carry, side,
                                             use_reentrant=False)
             else:
-                H, h_last = self.layers[i](H, carry)
+                H, h_last = self.layers[i](H, carry, side_input=side)
             self._carries[i] = h_last
 
         return H
@@ -206,9 +208,9 @@ class V8LM(nn.Module):
     # --- Legacy: full scan for no-memory path ---
     def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Full scan + PCM (no memory). Used only for no-memory baseline."""
-        H_mid, x, surprise, aux_loss = self.forward_scan_lower(input_ids)
-        H = self.forward_scan_upper(H_mid)
-        return H, x, surprise, aux_loss
+        H_mid, surprise, x, aux_loss = self.forward_scan_lower(input_ids)
+        H = self.forward_scan_upper(H_mid, surprise=surprise)
+        return H, surprise, x, aux_loss
 
     def initialize_carries(self):
         self._carries = [None] * self.config.L_total

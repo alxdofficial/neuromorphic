@@ -4,10 +4,10 @@ All measurements on RTX 4090 (24GB), T=2048, torch.compile enabled on LM methods
 gradient checkpointing OFF. 10 warmup + 10 measured steps in steady state.
 
 > **Note**: These profiling numbers predate the switch from fixed L1-normalized
-> conn_weights to key-based softmax routing. The Triton kernel structure is
+> conn_weights to key-based sigmoid routing. The Triton kernel structure is
 > unchanged (it still uses precomputed scalar routing weights per neighbor),
 > so per-token kernel cost is similar. The main difference is a small per-segment
-> overhead for computing softmax(key . neighbor_messages) routing weights before
+> overhead for computing sigmoid(key . neighbor_messages) routing weights before
 > the token loop begins.
 
 ## Tier Scaling Summary
@@ -51,9 +51,10 @@ the wider D_mem (256 vs 128) and more neurons (4096 vs 1024).
 
 RL updates happen every 4 chunks (`rl_collect_chunks=4`). Collect steps are ~20% faster.
 
-> **Note**: GRPO trajectory scoring (8 trajectories across all 4 collected chunks) runs every
-> 4 chunks in Phase 2. Collect steps: ~53K tok/s. GRPO scoring steps are slower (8 traj × 4
-> chunks of memory graph + upper scan). Phase 1 (no neuromod): ~68K tok/s.
+> **Note**: After the switch to 2-dim actions (gate + decay_target) and 2×512 neuromod
+> backbone, Phase 2 throughput improved significantly: ~87K tok/s (5× faster than the old
+> neuromod with 257-dim actions and 3×2048 backbone). Phase 1 (no neuromod): ~64K tok/s.
+> No memory baseline: ~161K tok/s.
 
 ### CUDA Time Breakdown (compiled, 10 steps)
 

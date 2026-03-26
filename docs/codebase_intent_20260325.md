@@ -51,13 +51,16 @@ learnable positional embedding `pos_embed[T, D]`. Tied weights:
 **Lower scan** (`forward_scan_lower`): Embed → layers 0-3 → PCM at split point.
 Returns `H_mid[BS, T, D]` (with autograd) + surprise + aux_loss.
 
-**PCM** (`src/v8/pcm.py`): Per-CC predictive coding. Both encoding and prediction
-condition on scan hidden state H AND input embedding x:
-- `z_t = W_enc(cat(H_t, x_t))` — current position's encoding
-- `z_hat_t = W_pcm(cat(H_t, x_t))` — prediction of next position's encoding
+**PCM** (`src/v8/pcm.py`): Batched predictive coding (BatchedPCM) processing all
+C=16 columns in parallel via `torch.bmm`. RMSNorm on inputs. Both encoding and
+prediction condition on scan hidden state H AND input embedding x:
+- `input_norm = RMSNorm(2*D_cc)` applied to `cat(H_t, x_t)` before projections
+- `z_t = W_enc(input_norm(cat(H_t, x_t)))` — current position's encoding
+- `z_hat_t = W_pcm(input_norm(cat(H_t, x_t)))` — prediction of next position's encoding
 - `surprise = z_hat_{t-1} - z_t` — how unexpected this position's representation is
-- Gain modulation: `H *= sigmoid(W_gain(surprise)) * gain_scale`
-  (gain_scale starts at 2.0, W_gain zero-init → gain=1.0 at init)
+- No gain modulation — H_mid passes through unchanged to memory graph
+- Surprise is passed as a side input to the first upper scan layer
+  (additive to `proj_in` output via zero-init `proj_side`)
 - Aux loss: `MSE(z_hat[:-1], z[1:].detach())` × `pcm_pred_weight` (0.1)
 
 **Memory injection** (`inject_memory`):
@@ -78,22 +81,25 @@ A persistent graph of 1024 neurons with 96 sparse presynaptic connections each.
 NOT an nn.Module — state tensors are outside autograd.
 
 **State per neuron** (all `[BS, N, D_mem]` unless noted):
-- `primitives`: what the neuron broadcasts (RMS-normalized, per-dim ≈ 1)
-- `key`: what it listens for (L2-normalized unit vector)
+- `primitives`: what the neuron broadcasts (neuromod-controlled)
+- `key`: what it listens for (neuromod-controlled)
 - `decay_logit` `[BS, N]`: temporal persistence (sigmoid(0)=0.5 at init)
 - `h`: internal state (temporal memory)
 - `prev_messages`: last outgoing messages
 - `mean_input`, `mean_output`: per-neuron segment averages
-- `firing_rate` `[BS, N]`: EMA of activation rate
+- `msg_magnitude` `[BS, N]`: EMA of mean message norm per neuron
 - `co_activation_ema` `[N, N]`: phi coefficient matrix (shared across batch)
 
 **Connectivity**: `conn_indices[N, K=96]` — random sparse graph, sorted per neuron
 for cache-friendly gather. No self-connections. First C=16 neurons are CC ports.
 
 **Per-token dynamics** (`forward_segment`): Computed once per segment:
-routing weights = `softmax(key · neighbor_messages)` over K=96 connections.
+routing weights = `sigmoid(key · neighbor_messages)` per connection (independently gated [0, 1]).
 Then for each token t:
-1. **Receive**: `received = A @ prev_messages` (dense bmm from sparse routing weights).
+1. **Receive (dendritic tree)**: 3-level nonlinear gather (no trainable params):
+   Level 0: 8 branches of 12 connections each → tanh
+   Level 1: 2 groups of 4 branches → tanh
+   Level 2: soma averages groups → received
    Port neurons add CC signal: `received[:,:C] += cc_signals[:,t]`
 2. **Integrate**: `h = decay × h + (1-decay) × received` (convex combination)
 3. **Message**: `prev_messages = tanh(h × primitives)`
@@ -105,12 +111,14 @@ graph learns to handle document transitions through changes in CC signal
 character (since the LM scan carries DO reset at doc boundaries, H_mid changes
 abruptly, which the memory graph observes through CC input).
 
-**Triton kernel** (`src/v8/triton_kernels.py`): Same dynamics, one kernel launch
-per token step. Grid = (BS, N), each program handles all D dims for one neuron.
-Fuses sparse gather + integration + tanh + message norm.
+**Triton kernels** (`src/v8/triton_kernels.py`): Two kernels:
+- `memory_graph_routing_kernel`: computes sigmoid routing weights inline (no
+  [BS,N,K,D] temp tensor)
+- `memory_graph_step_kernel`: dendritic tree step (3-level gather + integrate + tanh)
+Grid = (BS, N), each program handles all D dims for one neuron.
 
 **Firing stats**: Binary firing at 75th percentile within each segment (no EMA
-lag). Firing rate updated via EMA (decay=0.99).
+lag). `msg_magnitude` tracked as EMA of mean message norm per neuron.
 
 **Co-activation** (`_post_segment_stats`): Phi coefficient matrix between all
 neuron pairs, computed from binary firing patterns. Batch-averaged, updated
@@ -123,16 +131,17 @@ via slow EMA (decay=0.995). Only computed when structural plasticity is due.
 
 ### 2.3 Neuromodulator (`src/v8/neuromodulator.py`)
 
-RL-trained policy that modifies neuron primitives, key, and decay.
-Shared MLP across all neurons (parameter sharing).
+RL-trained policy that outputs a gate (controls Hebbian plasticity direction)
+and a decay target per neuron. Shared MLP across all neurons (parameter sharing).
 
-**Architecture**: `neuromod_layers` × (Linear → Tanh) backbone.
-Three action heads: `prim_head(→D_mem)`, `key_head(→D_mem)`, `decay_head(→1)`.
-Total act_dim = `D_mem × 2 + 1 = 257`.
+**Architecture**: 2 layers of 512 hidden, Tanh activations. Zero-init heads.
+Two action heads: `gate_head(→1)` and `decay_head(→1)`. Total act_dim = 2.
 
-**Log-std**: Three learnable parameters (state-independent):
-`prim_logstd[1, D_mem]`, `key_logstd[1, D_mem]`, `decay_logstd[1, 1]`.
-Init: -0.5 (std ≈ 0.6).
+**Observation** (`get_neuron_obs`): `[primitives, key, mean_input, mean_output,
+msg_magnitude, sigmoid(decay), trace_prim_norm, trace_key_norm]`
+= obs_dim = D_mem×4 + 4 = 516.
+
+**Action**: gate[1] (tanh'd to [-1,1]) + decay_target[1] per neuron.
 
 **Sampling**: `action = mean + std × randn()`. For replay (action provided):
 compute log_prob of that action under current policy.
@@ -143,12 +152,18 @@ log_prob = sum(-0.5 × ((a-μ)²/σ² + log2π) - logstd)
 entropy = sum(0.5 × (1 + log2π) + logstd)
 ```
 
-**Observation** (`get_neuron_obs`): `[primitives, key, mean_input, mean_output,
-firing_rate, sigmoid(decay)]` = obs_dim = D_mem×4 + 2 = 514.
+### 2.4 Three-Factor Learning (Hebbian + RL gating)
 
-**Apply actions** (`apply_actions`): Additive deltas, clamped to ±max_action (1.0).
-After: RMS-normalize primitives, L2-normalize key. No decay clamp needed
-(convex combination self-bounds h).
+**Eligibility traces** (accumulated via EMA, decay=0.95 per segment):
+- `trace_prim = 0.95 * trace_prim + 0.05 * h` ("shift primitives toward what I encode")
+- `trace_key = 0.95 * trace_key + 0.05 * mean_input` ("shift key toward what I receive")
+
+**Gated plasticity** (`apply_gated_plasticity`, applied after each segment):
+- `primitives += hebbian_lr * gate * normalize(trace_prim)`, then RMS-normalize
+- `key += hebbian_lr * gate * normalize(trace_key)`, then L2-normalize
+- `decay_logit = 0.9 * decay_logit + 0.1 * decay_target`
+- gate > 0: consolidate Hebbian update. gate < 0: reverse (explore). gate ~ 0: maintain.
+- Normalization is SAFE because neuromod only controls 1-dim gate (not 128-dim direction)
 
 ---
 
@@ -157,12 +172,14 @@ After: RMS-normalize primitives, L2-normalize key. No decay clamp needed
 Per chunk (T=2048 tokens):
 
 1. **Reset scan carries** at doc boundaries (LM only, not memory graph)
-2. **Lower scan + PCM** → `H_mid[BS, T, D]` with autograd
+2. **Lower scan + PCM** → `H_mid[BS, T, D]` (unchanged) + surprise, with autograd
 3. **No-memory fast path**: if disabled, upper scan + output → return
 4. **CC signals** = `H_mid.detach().view(BS, T, C, D_mem)` (detached — no gradient from memory into lower scan)
 5. **Segment loop** (16 segments of 128 tokens):
-   - Neuromod: observe → sample action (no_grad) → apply to memory graph
-   - `mg.forward_segment(seg_cc)` → `[BS, 128, C, D_mem]`
+   - `mg.forward_segment(seg_cc)` → `[BS, 128, C, D_mem]` (dendritic tree dynamics)
+   - `mg.compute_eligibility_traces()` (EMA update of traces from h and mean_input)
+   - Neuromod: observe → sample gate & decay_target (no_grad)
+   - `mg.apply_gated_plasticity(gate, decay_target)` (Hebbian update gated by neuromod)
    - Structural plasticity if due
 6. **Inject memory**: `H_enriched = H_mid + gate × mem_out`
 7. **Upper scan** → H
@@ -193,9 +210,10 @@ Scores N=8 trajectories across ALL collected chunks (not just the last one):
    - Restore upper scan carries to chunk 0's pre-forward state
    - For each of 4 chunks:
      - For each of 16 segments:
-       - Observe all neurons → sample stochastic action from policy
-       - **Only K neurons get actions, non-K get zero delta**
-       - Apply action → run memory graph segment
+       - Run memory graph segment → compute eligibility traces
+       - Observe all neurons → sample stochastic gate & decay_target from policy
+       - **Only K neurons get actions, non-K get gate=0 + current decay_logit as target**
+       - Apply gated plasticity
      - Inject memory → upper scan → output → float32 CE (masked by EOT)
    - trajectory_loss = mean CE across all 4 chunks
 3. **Z-score normalize** trajectory losses → advantages
@@ -204,14 +222,14 @@ Scores N=8 trajectories across ALL collected chunks (not just the last one):
 
 **Why this design**:
 - Scoring across 4 chunks (64 segments) captures long-range memory effects
-- Zero delta for non-K neurons: any loss difference is 100% attributable to K neurons
+- gate=0 for non-K neurons (no plasticity): any loss difference is 100% attributable to K neurons
 - Fixed K throughout: evaluating a coherent strategy, not a patchwork
 - Best-of-N state selection: free performance boost from selection pressure alone
 
 ### 4.3 Policy Gradient (`replay_for_neuromod_grads`)
 
 For each trajectory with positive advantage:
-1. Batch all segments' K-neuron obs and actions (across all 4 chunks)
+1. Batch all segments' K-neuron obs and actions (gate + decay_target, across all 4 chunks)
 2. Forward through neuromod (WITH grad) to compute log_prob
 3. `grpo_loss = -(advantage × mean_log_prob)`
 4. `entropy_bonus = -entropy_coef × mean_entropy`
@@ -236,7 +254,7 @@ advantage, and adjusts logstd based on how far good actions were from the mean.
 - `--resume`: loads LM + neuromod + optimizer. If `--freeze-lm`, resets logstd
   to config init (-0.5) so exploration isn't locked to Phase 1 values.
 - Compiles individual methods: `forward_scan_lower`, `forward_scan_upper`,
-  `forward_output`, `neuromod.get_action_and_value`
+  `forward_output`, `neuromod.get_action`
 
 ### 5.2 Optimizers
 
@@ -271,7 +289,7 @@ Memory graph state includes: primitives, key, decay_logit, connectivity
   firing rates (port vs non-port), dead neuron fraction, tanh saturation,
   phi stats (mean, std, pos/neg fractions)
 - LM coupling: mem_gate values per CC
-- Neuromod: logstd values (8 decimal places), action magnitude stats
+- Neuromod: logstd values (8 decimal places), gate stats
 
 ### Periodic snapshots:
 - Per-neuron: norms, decay, firing rate
@@ -285,8 +303,8 @@ Memory graph state includes: primitives, key, decay_logit, connectivity
 - **Training curves**: loss, PPL (log), LR schedules, throughput (smoothed)
 - **RL curves**: GRPO loss, trajectory spread (best/worst z-score), advantage
   std, logstd per group, neuromod grad norm
-- **Memory health**: state norms, gate, primitive diversity, decay, firing
-  rates, saturation, key/prim diversity, usage, plasticity rewires
+- **Memory health**: state norms, gate, primitive diversity, decay, msg
+  magnitude, saturation, key/prim diversity, usage, plasticity rewires
 - **Connectivity snapshot**: per-neuron bars, key heatmap, fan-in histogram
 - **Neuron graph**: UMAP on primitives, edges by routing weight
 
@@ -310,7 +328,8 @@ Memory graph state includes: primitives, key, decay_logit, connectivity
    just the raw token identity.
 
 5. **GRPO with spatial specificity**: Only K=96 of 1024 neurons get varied
-   actions; non-K get zero delta. Credit assignment is spatially specific.
+   gate+decay_target actions; non-K get gate=0 (no plasticity). Credit
+   assignment is spatially specific.
 
 6. **Multi-chunk scoring horizon**: Score across all 4 collected chunks (64
    neuromod actions per trajectory) to capture long-range memory effects.

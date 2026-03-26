@@ -148,8 +148,7 @@ def main():
             # exploration isn't locked to Phase 1's (untrained) values
             if args.freeze_lm:
                 init_val = config.neuromod_logstd_init
-                model.neuromod.prim_logstd.data.fill_(init_val)
-                model.neuromod.key_logstd.data.fill_(init_val)
+                model.neuromod.gate_logstd.data.fill_(init_val)
                 model.neuromod.decay_logstd.data.fill_(init_val)
                 print(f"  Reset logstd to {init_val} (config init for Phase 2)")
         if "memory_graph_state" in ckpt:

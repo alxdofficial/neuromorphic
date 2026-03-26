@@ -305,13 +305,13 @@ def plot_memory_health(records, output_path):
 
         ax = axes[1, 1]
         _plot_line(ax, steps,
-                   [r.get("mem_firing_rate_port", 0) for r in mem_records],
+                   [r.get("mem_msg_mag_port", 0) for r in mem_records],
                    C_FIRE, "port neurons")
         _plot_line(ax, steps,
-                   [r.get("mem_firing_rate_nonport", 0) for r in mem_records],
+                   [r.get("mem_msg_mag_nonport", 0) for r in mem_records],
                    C_FIRE2, "internal neurons")
         ax.legend()
-        _setup_ax(ax, "Firing Rate (port vs internal)", "rate")
+        _setup_ax(ax, "Message Magnitude (port vs internal)", "magnitude")
 
         ax = axes[1, 2]
         _plot_line(ax, steps,
@@ -353,7 +353,7 @@ def plot_memory_health(records, output_path):
 
 
 def plot_pcm_health(records, output_path):
-    """PCM surprise, prediction loss, gain modulation across CCs."""
+    """PCM surprise, prediction loss, and aux_loss contribution."""
     pcm_records = [r for r in records if "pcm_surprise_mean" in r]
     if not pcm_records:
         print("  No PCM metrics found, skipping pcm_health")
@@ -397,18 +397,12 @@ def plot_pcm_health(records, output_path):
         ax.fill_between(steps, vals_min, vals_max, alpha=0.15, color=C_LOSS)
         _setup_ax(ax, "PCM Prediction Loss (per CC range)", "MSE")
 
-        # Gain scale per CC
+        # Aux loss (PCM contribution to total loss)
         ax = axes[1, 1]
         _plot_line(ax, steps,
-                   [r.get("pcm_gain_scale_mean", 2.0) for r in pcm_records],
-                   C_GATE, "mean")
-        vals_min = [r.get("pcm_gain_scale_min", 2.0) for r in pcm_records]
-        vals_max = [r.get("pcm_gain_scale_max", 2.0) for r in pcm_records]
-        ax.fill_between(steps, vals_min, vals_max, alpha=0.15, color=C_GATE)
-        ax.axhline(y=2.0, color="#999", linestyle="--", linewidth=0.8,
-                   label="init (2.0)")
-        ax.legend()
-        _setup_ax(ax, "Gain Scale per CC", "scale")
+                   [r.get("aux_loss", 0) for r in pcm_records],
+                   C_GATE, "aux_loss")
+        _setup_ax(ax, "PCM Aux Loss (weighted)", "loss")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
@@ -510,10 +504,10 @@ def plot_neuron_graph(snapshot_path, output_path):
     conn_idx = snap["conn_indices"].numpy()  # [N, K]
     h_norm = snap["h_norm_per_neuron"].numpy()  # [N]
 
-    if "firing_rate_per_neuron" in snap:
+    if "msg_magnitude_per_neuron" in snap:
+        firing = snap["msg_magnitude_per_neuron"].numpy()
+    elif "firing_rate_per_neuron" in snap:
         firing = snap["firing_rate_per_neuron"].numpy()
-    elif "usage_per_neuron" in snap:
-        firing = snap["usage_per_neuron"].numpy()
     else:
         firing = np.ones(N) * 0.1
 

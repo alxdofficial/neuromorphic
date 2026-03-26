@@ -32,7 +32,7 @@ class TestV8ModelForward:
         result = model.forward_chunk(input_ids, target_ids=target_ids)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
         assert result["aux_loss"].shape == ()
-        assert result["surprise"].shape == (BS, cfg.T, cfg.C, cfg.D_cc)
+        assert result["surprise"].shape == (BS, cfg.T, cfg.D)
 
     def test_forward_chunk_finite(self):
         cfg = make_tiny()

@@ -33,7 +33,7 @@ prediction then anticipates how the model's understanding will change
 at the next position. Surprise measures the gap between expectation
 and reality in representation space.
 
-**Status**: To be implemented.
+**Status**: DONE. BatchedPCM now processes all C=16 columns in parallel via torch.bmm.
 
 ---
 
@@ -70,37 +70,39 @@ which is correct. The bug is Triton using the wrong quantities.
 
 ### 3. Routing weight scope — confirmed correct
 
-Each neuron's softmax routing is over its K=96 connected neighbors only:
+Each neuron's sigmoid routing is over its K=96 connected neighbors only:
 ```python
 neighbor_msgs = self.prev_messages[:, self.conn_indices]  # [BS, N, K=96, D]
 sim = (key.unsqueeze(2) * neighbor_msgs).sum(dim=-1)      # [BS, N, K]
-routing_weights = softmax(sim, dim=-1)                      # [BS, N, K]
+routing_weights = sigmoid(sim)                              # [BS, N, K]
 ```
 
-A neuron never attends to neurons it's not connected to. The weights
-sum to 1 across the K connections only. This is the intended design:
-each neuron has a fixed set of presynaptic partners, and the routing
-weights determine how much it listens to each one within that fixed set.
+Each connection is independently gated [0, 1] — strong connections don't suppress
+weak ones (unlike softmax which normalized weights to sum to 1, diluting signal
+when few connections carried useful information). A neuron never attends to neurons
+it's not connected to. Each neuron has a fixed set of presynaptic partners, and the
+sigmoid gating determines how much it listens to each one independently.
 
 **Status**: Correct, no change needed.
 
 ---
 
-### 4. PCM surprise integration into memory graph — confirmed correct
+### 4. PCM surprise integration — updated design
 
 The flow is:
 1. Lower scan -> H_mid
-2. PCM applies gain modulation: `H_mid *= sigmoid(W_gain(surprise)) * gain_scale`
-3. CC signals = `H_mid.detach()` sliced per CC -> memory graph input
+2. PCM computes surprise vector (with RMSNorm on inputs)
+3. H_mid passes through unchanged — CC signals = `H_mid.detach()` sliced per CC -> memory graph input
+4. Surprise is passed as a side input to the first upper scan layer
+   (additive to `proj_in` output via zero-init `proj_side`)
 
-Surprising tokens produce amplified CC signals into the memory graph.
-The memory graph never sees the surprise vector directly — it sees its
-effect through stronger/weaker CC input amplitude. This is the intended
-design: PCM modulates the *amplitude* of the signal entering the
-memory graph, not the signal content.
+The previous design used multiplicative gain modulation (`H_mid *= sigmoid(W_gain(surprise)) * gain_scale`)
+which was removed. The new design keeps H_mid clean for the memory graph and instead
+lets the upper scan layers directly observe surprise as an additive side signal.
+The first upper ScanLayer has an optional `side_dim` parameter and `proj_side` projection
+(zero-initialized so the layer starts as if surprise were absent).
 
-**Status**: Correct, no change needed. (Will improve further with PCM
-rework in issue #1 — better surprise means better gain modulation.)
+**Status**: Updated — gain modulation replaced with surprise-as-side-input.
 
 ---
 
@@ -141,23 +143,14 @@ for stability. Keep 80/20 and phi < 0 threshold. Optionally add a warmup
 
 ---
 
-### 6. Memory graph reset at doc boundaries — confirmed correct
+### 6. Memory graph doc boundary handling — no reset
 
-Reset is **per-batch-element only**:
-```python
-def reset_streams(self, mask: Tensor):
-    # mask: [BS] — True for batch elements hitting a doc boundary
-    self.h = self.h * keep2          # only masked batch elements zeroed
-    self.prev_messages = self.prev_messages * keep2
-    self.firing_rate = self.firing_rate * keep1
-```
+`reset_streams()` has been removed from MemoryGraph. The memory graph is
+fully persistent across document boundaries — no resets at all. The graph
+learns to handle document transitions through abrupt CC signal changes
+(since the LM scan carries DO reset at doc boundaries).
 
-If batch element 0 hits a doc boundary but element 1 doesn't, only
-element 0's dynamic state (h, prev_messages, firing_rate) gets zeroed.
-Element 1 continues uninterrupted. Structural state (primitives, key,
-decay, connectivity, co_activation) is never reset for any element.
-
-**Status**: Correct, no change needed.
+**Status**: Confirmed — reset_streams removed, no doc boundary reset needed.
 
 ---
 
@@ -194,7 +187,7 @@ flaw.
 - K=96 neurons chosen once, **fixed for all 4 chunks**
 - All 8 trajectories scored **across all 4 chunks** (total score =
   cumulative CE over the full 4-chunk horizon)
-- Non-K neurons get **no actions at all** (zero delta, not baseline)
+- Non-K neurons get **gate=0 (no plasticity) + current decay_logit as target (no drift)**
 - Same K neurons throughout the RL step
 
 **Why this is better**:
@@ -203,9 +196,9 @@ flaw.
    actions per trajectory. Memory modifications compound over time.
    Scoring over 4 chunks captures long-range effects that 1 chunk misses.
 
-2. *Cleaner credit assignment*: Zero delta for non-K neurons means any
+2. *Cleaner credit assignment*: gate=0 for non-K neurons means any
    loss difference between trajectories is 100% attributable to the K
-   neurons' actions. No noise from other neurons' baseline actions.
+   neurons' actions. No plasticity noise from other neurons.
 
 3. *Consistent K neurons*: Same K neurons throughout means you're
    evaluating a coherent strategy for those neurons, not a patchwork.
@@ -215,12 +208,12 @@ flaw.
 - During the 4 collection chunks, run the real forward normally
   (all neurons act as usual)
 - At scoring time: replay all 4 chunks x 8 trajectories. In each
-  trajectory, only K neurons get stochastic actions, non-K get zero delta
+  trajectory, only K neurons get stochastic gate+decay_target, non-K get gate=0
 - Score = total CE across all 4 chunks for each trajectory
 - More expensive (8 trajectories x 4 chunks instead of 8 x 1), but
   4x more compute for much better signal quality is worth it
 
-**Status**: To be reimplemented.
+**Status**: DONE. Multi-chunk scoring with gate=0 for non-K neurons implemented.
 
 ---
 
@@ -288,7 +281,7 @@ memory configuration.
 scan carries from the best trajectory during scoring, then apply them
 at the end instead of restoring the original state.
 
-**Status**: To be implemented.
+**Status**: DONE. Best trajectory's MG state + upper scan carries persist after scoring.
 
 ---
 

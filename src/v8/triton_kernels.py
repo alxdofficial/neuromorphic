@@ -1,17 +1,15 @@
 """Triton kernels for memory graph per-token neuron dynamics.
 
-Fuses the per-token loop body into a single kernel launch per token step:
-  - Sparse gather from K presynaptic neighbors using precomputed scalar weights
-  - Temporal integration: h = decay * h + (1-decay) * received
-  - Message: tanh(h * primitives)
-  - Fused message norm → act_trace
-  - Accumulate received and msg into f32 running sums for mean_input/mean_output
+Two kernels:
+  1. memory_graph_routing_kernel — computes sigmoid routing weights inline
+     from key × neighbor_messages (replaces Python-side _compute_routing_weights)
+  2. memory_graph_step_kernel — single token step with dendritic tree gather
 
-Routing weights are computed once per segment from key × neighbor messages
-(softmax over K neighbors). The kernel uses these fixed scalar weights
-for all tokens in the segment — same structure as the original fixed-weight
-kernel, full speed.
+Together these eliminate the 200MB temporary [BS, N, K, D] tensor from the
+Python-side routing computation. The step kernel is launched T_seg times
+per segment (128 times at Tier A).
 
+Dendritic tree: branch → tanh → group → tanh → soma at each token.
 Python fallback in memory_graph.py remains the source of truth for correctness.
 """
 
@@ -21,52 +19,79 @@ from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
+def memory_graph_routing_kernel(
+    prev_msg_ptr,       # [BS, N, D] bf16
+    key_ptr,            # [BS, N, D] bf16
+    conn_idx_ptr,       # [N, K] int32
+    conn_w_ptr,         # [BS, N, K] bf16 — output
+    BS: tl.constexpr, N: tl.constexpr, D: tl.constexpr, K: tl.constexpr,
+):
+    """Compute sigmoid routing weights from key × neighbor messages.
+
+    Each connection independently gated — no normalization across connections.
+    """
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d = tl.arange(0, D)
+
+    key_val = tl.load(key_ptr + (b * N + n) * D + d).to(tl.float32)
+
+    for k_idx in range(K):
+        src = tl.load(conn_idx_ptr + n * K + k_idx)
+        neighbor_msg = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
+        dot = tl.sum(key_val * neighbor_msg)
+        # Sigmoid: each connection independently gated [0, 1]
+        w = 1.0 / (1.0 + tl.exp(-dot))
+        tl.store(conn_w_ptr + (b * N + n) * K + k_idx, w)
+
+
+@triton.jit
 def memory_graph_step_kernel(
     # Persistent state (read+write in-place)
     h_ptr,              # [BS, N, D] bf16
     prev_msg_ptr,       # [BS, N, D] bf16
 
     # Sparse connectivity (read-only)
-    conn_idx_ptr,       # [N, K] int32 — presynaptic neuron indices
-    conn_w_ptr,         # [BS, N, K] bf16 — precomputed softmax routing weights
+    conn_idx_ptr,       # [N, K] int32
+    conn_w_ptr,         # [BS, N, K] bf16
 
-    # Per-neuron constants (read-only within segment)
-    decay_ptr,          # [BS, N] float32 — pre-computed sigmoid(decay_logit)
+    # Per-neuron constants
+    decay_ptr,          # [BS, N] float32
     primitives_ptr,     # [BS, N, D] bf16
 
     # Per-token inputs/outputs
-    cc_signals_ptr,     # [BS, T_seg, C, D] bf16 — full segment CC signals
-    eot_flags_ptr,      # [BS, T_seg] float32 — 1.0 at EOT, 0.0 otherwise
-    output_ptr,         # [BS, T_seg, C, D] bf16 — port neuron messages
+    cc_signals_ptr,     # [BS, T_seg, C, D] bf16
+    eot_flags_ptr,      # [BS, T_seg] float32
+    output_ptr,         # [BS, T_seg, C, D] bf16
 
-    # Activation trace (fused norm output)
-    act_trace_ptr,      # [BS, T_seg, N] float32 — message norm per neuron per token
+    # Scalar accumulators (f32, always active)
+    recv_accum_ptr,     # [BS, N, D] float32
+    msg_accum_ptr,      # [BS, N, D] float32
+    msg_mag_accum_ptr,  # [BS, N] float32 — accumulated message norm
 
-    # Running accumulators for mean_input / mean_output (f32, read-modify-write)
-    recv_accum_ptr,     # [BS, N, D] float32 — sum of received signals across segment
-    msg_accum_ptr,      # [BS, N, D] float32 — sum of outgoing messages across segment
+    # Optional: per-token activation trace (only for co-activation segments)
+    act_trace_ptr,      # [BS, T_seg, N] float32 OR null (0)
 
     # Current token step
-    t_step,             # int — which token in the segment
+    t_step,
 
     # Dimensions
-    BS: tl.constexpr,
-    N: tl.constexpr,
-    D: tl.constexpr,
-    K: tl.constexpr,
-    C: tl.constexpr,
-    T_seg: tl.constexpr,
-):
-    """One step of neuron dynamics with precomputed routing weights.
+    BS: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
+    K: tl.constexpr, C: tl.constexpr, T_seg: tl.constexpr,
 
-    Each program handles one (batch, neuron) pair, processing all D dims.
-    Routing weights computed once per segment from key-based softmax.
-    """
+    # Dendritic tree structure
+    BRANCH_SIZE: tl.constexpr,
+    BRANCHES_PER_GROUP: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+
+    # Whether to write act_trace
+    WRITE_ACT_TRACE: tl.constexpr,
+):
+    """One step of neuron dynamics with dendritic tree gather."""
     b = tl.program_id(0)
     n = tl.program_id(1)
     d = tl.arange(0, D)
 
-    # --- Load per-neuron constants ---
     decay_val = tl.load(decay_ptr + b * N + n).to(tl.float32)
     eot_val = tl.load(eot_flags_ptr + b * T_seg + t_step).to(tl.float32)
     eff_decay = decay_val * (1.0 - eot_val)
@@ -75,16 +100,25 @@ def memory_graph_step_kernel(
     prim = tl.load(primitives_ptr + (b * N + n) * D + d).to(tl.float32)
     h_val = tl.load(h_ptr + (b * N + n) * D + d).to(tl.float32)
 
-    # --- Sparse gather: received = sum_k w[k] * prev_msg[src[k], :] ---
-    received = tl.zeros([D], dtype=tl.float32)
+    # --- Dendritic tree gather ---
+    soma = tl.zeros([D], dtype=tl.float32)
+    conn_base = 0
+    for g in range(N_GROUPS):
+        group_acc = tl.zeros([D], dtype=tl.float32)
+        for br in range(BRANCHES_PER_GROUP):
+            branch_acc = tl.zeros([D], dtype=tl.float32)
+            for k in range(BRANCH_SIZE):
+                idx = conn_base + k
+                src = tl.load(conn_idx_ptr + n * K + idx)
+                w = tl.load(conn_w_ptr + (b * N + n) * K + idx).to(tl.float32)
+                val = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
+                branch_acc += w * val
+            group_acc += libdevice.tanh(branch_acc)
+            conn_base += BRANCH_SIZE
+        soma += libdevice.tanh(group_acc)
+    received = soma * (1.0 / N_GROUPS)
 
-    for k in range(K):
-        src = tl.load(conn_idx_ptr + n * K + k)
-        w = tl.load(conn_w_ptr + (b * N + n) * K + k).to(tl.float32)
-        val = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
-        received += w * val
-
-    # --- CC signal injection (port neurons only) ---
+    # --- CC signal injection ---
     if n < C:
         cc_offset = b * T_seg * C * D + t_step * C * D + n * D + d
         cc = tl.load(cc_signals_ptr + cc_offset).to(tl.float32)
@@ -96,13 +130,21 @@ def memory_graph_step_kernel(
     # --- Compute outgoing message ---
     msg = libdevice.tanh(h_new * prim)
 
-    # --- Store results (in-place) ---
+    # --- Store results ---
     tl.store(h_ptr + (b * N + n) * D + d, h_new.to(tl.bfloat16))
     tl.store(prev_msg_ptr + (b * N + n) * D + d, msg.to(tl.bfloat16))
 
-    # --- Fused message norm → act_trace ---
+    # --- Message norm (always accumulated, optionally written to trace) ---
     msg_norm = tl.sqrt(tl.sum(msg * msg))
-    tl.store(act_trace_ptr + b * T_seg * N + t_step * N + n, msg_norm)
+
+    # Accumulate into msg_mag_accum (scalar per neuron)
+    mag_offset = b * N + n
+    old_mag = tl.load(msg_mag_accum_ptr + mag_offset)
+    tl.store(msg_mag_accum_ptr + mag_offset, old_mag + msg_norm)
+
+    # Optionally write per-token trace (only for co-activation segments)
+    if WRITE_ACT_TRACE:
+        tl.store(act_trace_ptr + b * T_seg * N + t_step * N + n, msg_norm)
 
     # --- Accumulate received and msg for mean_input / mean_output ---
     accum_offset = (b * N + n) * D + d

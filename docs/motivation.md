@@ -34,10 +34,12 @@ A **brain-inspired sequence model** with three components:
   Memory IS the pattern of activation and connectivity flowing through the graph.
 
 - **Neuromodulator**: An RL-trained policy (GRPO trajectory scoring, no value function)
-  that adjusts neuron primitives, routing keys, and decay via additive deltas. Scores
-  trajectories across all 4 collected chunks for long-range credit assignment. Only K=96
-  neurons get actions per RL step; best trajectory's state persists. Substitutes for the
-  billions of years of evolution that shaped the brain's neuromodulatory systems.
+  that gates Hebbian plasticity and controls decay. Three-factor learning: eligibility
+  traces accumulate what neurons encode/receive, the neuromod outputs a gate (consolidate
+  vs reverse) and decay target per neuron. Scores trajectories across all 4 collected
+  chunks for long-range credit assignment. Only K=96 neurons get actions per RL step;
+  best trajectory's state persists. Substitutes for the billions of years of evolution
+  that shaped the brain's neuromodulatory systems.
 
 ---
 
@@ -67,8 +69,8 @@ cosine similarity lookup, no discrete read/write schedule. Instead:
 | Universal compute unit | Cortical column (same everywhere) | CC: scan + PCM (shared scan weights) |
 | Memory as activation | Neurons firing through weighted connections | Neural memory graph: h + messages through A |
 | Per-token dynamics | Neurons fire and exchange signals continuously | Sequential loop: receive -> integrate -> message |
-| Neuromodulated plasticity | Dopamine/ACh gate learning rate | RL-trained policy modifies neuron state |
-| Stable signal propagation | Balanced excitation/inhibition | Key-based softmax routing (weights sum to 1) |
+| Neuromodulated plasticity | Dopamine/ACh gate learning rate | RL-trained gate controls Hebbian trace consolidation |
+| Stable signal propagation | Balanced excitation/inhibition | Key-based sigmoid routing (independent per-connection gating [0, 1]) |
 | Predictive coding | Cortical prediction error signals | PCM: vector surprise per feature group |
 
 ### What We Don't Take from the Brain
@@ -94,12 +96,13 @@ temporal patterns in a neural population's short time window.
 
 ```
 Lower scan: layers 0-3 over T=2048 tokens (parallel)
-PCM: surprise + learnable gain modulation (at split point)
+PCM: surprise computed at split point (side input to upper scan)
 
 Memory: Per-token neuron dynamics (sequential, every token):
   For each token:
-    1. RECEIVE: each neuron gets weighted sum of presynaptic messages
-       Port neurons also get CC signal from the LM (gain-modulated)
+    1. RECEIVE (dendritic tree): 3-level nonlinear gather
+       (8 branches of 12 -> tanh, 2 groups of 4 -> tanh, soma avg)
+       Port neurons also get CC signal from H_mid (unchanged)
     2. INTEGRATE: h = decay * h + (1-decay) * received
     3. MESSAGE: message = tanh(h * primitives)
   Port neuron messages -> mem_signals
@@ -116,12 +119,14 @@ hop-by-hop — K tokens = K hops of inter-neuron communication.
 ### Neuromodulator as RL Agent
 
 The neuromodulator observes each neuron's state (primitive, key, mean input,
-mean output, firing rate, decay) and outputs additive deltas for primitives,
-routing keys, and decay. Trained via GRPO trajectory scoring: choose K=96
-neurons, sample 8 trajectories across ALL 4 collected chunks, rank by total CE,
-z-score normalize, encourage above-average trajectories. Non-K neurons get zero
-delta for clean credit assignment. Best trajectory's state persists. No value
-function or critic. Neuromod LR decays alongside the LM LR.
+mean output, msg_magnitude, decay, trace norms) and outputs a gate (tanh'd to
+[-1,1]) and decay target per neuron. Gate > 0 consolidates Hebbian eligibility
+traces; gate < 0 reverses them (exploration); gate ~ 0 maintains. Trained via
+GRPO trajectory scoring: choose K=96 neurons, sample 8 trajectories across ALL
+4 collected chunks, rank by total CE, z-score normalize, encourage above-average
+trajectories. Non-K neurons get gate=0 (no plasticity) for clean credit
+assignment. Best trajectory's state persists. No value function or critic.
+Neuromod LR decays alongside the LM LR.
 
 This replaces the brain's neuromodulatory system, which was shaped by billions
 of years of evolution. We compress this into an RL training loop.
@@ -145,10 +150,11 @@ explicit queries — just signal propagation through weighted connections at eve
 token step.
 
 ### 2. RL-Trained Plasticity (Not Backprop Through Memory)
-Memory learning is controlled by a REINFORCE-trained neuromodulator, not by
-backprop through memory state. Memory is an environment, the neuromodulator is the
-agent. This decouples memory from the autograd graph, solving the throughput problem
-of differentiable memory systems.
+Memory learning uses three-factor learning: Hebbian eligibility traces accumulate
+local statistics, and an RL-trained neuromodulator (GRPO) gates whether to consolidate
+or reverse those traces. Memory is an environment, the neuromodulator is the agent.
+This decouples memory from the autograd graph, solving the throughput problem of
+differentiable memory systems.
 
 ### 3. Per-Token Neuron Dynamics
 Each neuron receives, integrates, and messages at every token. Signals propagate
@@ -163,10 +169,11 @@ error (D_cc=128 dims per column) feeds into memory as part of the CC signal,
 telling the memory graph which features were unexpected.
 
 ### 5. Stable Signal Propagation via Graph Structure
-Key-based softmax routing (weights sum to 1 by construction) bounds signal
-propagation. Structural plasticity (co-activation-based prune + regrow) reshapes the graph
-over time. Anti-correlated connections are pruned; new connections form toward
-neurons with high temporal co-firing (phi coefficient).
+Key-based sigmoid routing (each connection independently gated [0, 1]) controls signal
+propagation without normalization — strong connections don't suppress weak ones, matching
+biological synaptic independence. Structural plasticity (co-activation-based prune + regrow)
+reshapes the graph over time. Anti-correlated connections are pruned; new connections form
+toward neurons with high temporal co-firing (phi coefficient).
 
 ---
 
@@ -210,5 +217,5 @@ In Phase B, long-document perplexity improves as memory accumulates context.
 Memory neurons develop specialization (diverse primitives, structured routing).
 
 ### Hardware: Efficient
-Collect steps (no GRPO scoring): ~53K tok/s with memory. Average with GRPO
-scoring every 4 chunks: ~16K tok/s (RTX 4090, BS=8).
+Phase 1 (memory, no neuromod): ~64K tok/s. Phase 2 (memory + neuromod, frozen
+LM): ~87K tok/s. No memory baseline: ~161K tok/s.

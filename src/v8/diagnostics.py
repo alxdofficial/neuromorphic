@@ -60,16 +60,16 @@ class V8Diagnostics:
             metrics["mem_decay_mean"] = round(decay.mean().item(), 4)
             metrics["mem_decay_std"] = round(decay.std().item(), 4)
 
-            # Firing rate (all neurons + port vs non-port split)
+            # Message magnitude (all neurons + port vs non-port split)
             C = self.model.config.C
-            fr = mg.firing_rate  # [BS, N]
-            metrics["mem_firing_rate"] = round(fr.mean().item(), 4)
-            metrics["mem_firing_rate_port"] = round(fr[:, :C].mean().item(), 4)
-            metrics["mem_firing_rate_nonport"] = round(fr[:, C:].mean().item(), 4)
+            mm = mg.msg_magnitude  # [BS, N]
+            metrics["mem_msg_mag_mean"] = round(mm.mean().item(), 4)
+            metrics["mem_msg_mag_port"] = round(mm[:, :C].mean().item(), 4)
+            metrics["mem_msg_mag_nonport"] = round(mm[:, C:].mean().item(), 4)
 
-            # Dead neurons: fraction with firing_rate < 0.01
+            # Active neurons: fraction with msg_magnitude > 0.01
             metrics["mem_usage_frac"] = round(
-                (fr.mean(dim=0) > 0.01).float().mean().item(), 4)
+                (mm.mean(dim=0) > 0.01).float().mean().item(), 4)
 
             # Plasticity counter (cumulative rewires)
             if hasattr(mg, '_plasticity_rewires'):
@@ -116,32 +116,28 @@ class V8Diagnostics:
                     sum(per_cc_loss) / len(per_cc_loss), 6)
                 metrics["pcm_pred_loss_min"] = round(min(per_cc_loss), 6)
                 metrics["pcm_pred_loss_max"] = round(max(per_cc_loss), 6)
-                gain_scales = pcm_stats["gain_scale_per_cc"]
-                metrics["pcm_gain_scale_mean"] = round(
-                    sum(gain_scales) / len(gain_scales), 4)
-                metrics["pcm_gain_scale_min"] = round(min(gain_scales), 4)
-                metrics["pcm_gain_scale_max"] = round(max(gain_scales), 4)
 
             # === Neuromod policy stats ===
             nm = self.model.neuromod
-            metrics["nm_logstd_prim"] = round(nm.prim_logstd.mean().item(), 8)
-            metrics["nm_logstd_key"] = round(nm.key_logstd.mean().item(), 8)
+            metrics["nm_logstd_gate"] = round(nm.gate_logstd.mean().item(), 8)
             metrics["nm_logstd_decay"] = round(nm.decay_logstd.mean().item(), 8)
 
-            # Action magnitude stats (from policy mean — how large are actions?)
-            # Sample a dummy obs to check policy output scale
+            # Eligibility trace stats
+            metrics["nm_trace_prim_norm"] = round(
+                mg.trace_prim.norm(dim=-1).mean().item(), 4)
+            metrics["nm_trace_key_norm"] = round(
+                mg.trace_key.norm(dim=-1).mean().item(), 4)
+
+            # Action stats (gate + decay_target from a sample forward)
             if mg.h is not None and mg.h.shape[0] > 0:
-                obs = mg.get_neuron_obs()[:1]  # [1, N, obs_dim] — single batch
+                obs = mg.get_neuron_obs()[:1]
                 obs_flat = obs.reshape(-1, obs.shape[-1])
                 nm_dtype = next(nm.parameters()).dtype
                 with torch.no_grad():
                     action, _, _, _ = nm.get_action_and_value(obs_flat.to(nm_dtype))
-                act_abs = action.abs()
-                metrics["nm_action_mean_abs"] = round(act_abs.mean().item(), 4)
-                metrics["nm_action_max"] = round(act_abs.max().item(), 4)
-                max_act = self.model.config.max_action_magnitude
-                metrics["nm_action_clip_frac"] = round(
-                    (act_abs > max_act * 0.99).float().mean().item(), 4)
+                gate = action[:, 0]
+                metrics["nm_gate_mean"] = round(gate.mean().item(), 4)
+                metrics["nm_gate_std"] = round(gate.std().item(), 4)
 
         return metrics
 
@@ -167,7 +163,7 @@ class V8Diagnostics:
             snapshot["h_norm_per_neuron"] = mg.h.norm(dim=-1).mean(dim=0).cpu()
             snapshot["msg_norm_per_neuron"] = mg.prev_messages.norm(dim=-1).mean(dim=0).cpu()
             snapshot["decay_per_neuron"] = torch.sigmoid(mg.decay_logit).mean(dim=0).cpu()
-            snapshot["firing_rate_per_neuron"] = mg.firing_rate.mean(dim=0).cpu()
+            snapshot["msg_magnitude_per_neuron"] = mg.msg_magnitude.mean(dim=0).cpu()
 
             # Connection weight distribution per neuron [N, K]
             snapshot["key_per_neuron"] = mg.key.mean(dim=0).cpu()

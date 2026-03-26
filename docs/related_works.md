@@ -63,14 +63,16 @@ but Kanerva is differentiable and was applied to image generation.
 **RL-NTM** (Zaremba & Sutskever, 2015) is the most direct ancestor — it uses REINFORCE
 to learn discrete memory addressing in a Neural Turing Machine. Our model extends this
 principle dramatically: instead of RL controlling only where to read/write, our
-neuromodulator controls ALL aspects of memory behavior — neuron primitives (what neurons
-broadcast), routing keys (what neurons listen for), decay (temporal persistence), and
-structural plasticity (which connections exist). Our RL agent acts on 1024 neurons
-simultaneously with 257-dimensional per-neuron actions, far beyond RL-NTM's scope.
+neuromodulator gates Hebbian plasticity (which controls neuron primitives and routing
+keys) and controls decay (temporal persistence), while structural plasticity (which
+connections exist) is autonomous. Our RL agent acts on 1024 neurons simultaneously
+with 2-dimensional per-neuron actions (gate + decay_target), using three-factor
+learning where eligibility traces provide the update direction and the neuromod
+controls whether to consolidate or reverse.
 
 **Learning to Reinforcement Learn** (Wang et al., 2016) trains an LSTM via RL such that
 the recurrent dynamics themselves implement a learned RL algorithm. Our neuromodulator is
-analogous — it is learning a memory management policy via REINFORCE. If the policy
+analogous — it is learning a memory management policy via GRPO. If the policy
 generalizes, it constitutes a learned rule for memory management.
 
 **Hebbian Meta-Learning** (Najarro & Risi, 2020) searches for synapse-specific Hebbian
@@ -97,12 +99,12 @@ ours is active (the neuromodulator decides how much to change each weight).
 **Backpropamine** (Miconi et al., 2019) is the closest prior work to our neuromodulation
 approach. It adds a network-generated neuromodulatory signal M(t) that gates plasticity:
 `w_plastic += M(t) * alpha * pre * post`. Critical differences:
-1. Backpropamine's neuromodulator is a scalar signal; ours outputs 257-dim per-neuron
-   actions for 1024 neurons
-2. Backpropamine is fully differentiable; ours is trained by REINFORCE
-3. Backpropamine modulates Hebbian update rates; our neuromodulator directly sets
-   primitives, routing keys, and decay — controlling what neurons represent, not just
-   how fast they learn
+1. Backpropamine's neuromodulator is a scalar signal; ours outputs per-neuron
+   gate + decay_target (2-dim) for 1024 neurons
+2. Backpropamine is fully differentiable; ours is trained by GRPO (REINFORCE variant)
+3. Backpropamine modulates Hebbian update rates; our neuromodulator gates Hebbian trace
+   consolidation direction (positive gate = consolidate, negative = reverse) and sets
+   decay targets — controlling consolidation direction and temporal persistence
 4. Graph topology is controlled by autonomous structural plasticity (co-activation-based),
    not by the neuromodulator
 
@@ -239,8 +241,8 @@ within autograd; ours are fixed dynamics modulated by RL.
 
 | Aspect | Closest Prior Work | What We Do Differently |
 |--------|-------------------|----------------------|
-| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Per-neuron RL control: primitives, routing keys, decay; autonomous topology via co-activation |
-| Per-neuron RL neuromodulation (257 dims × 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron actions, non-differentiable, controls structure not just plasticity rate |
+| Non-differentiable neuron graph as LM memory | RL-NTM (discrete addressing only) | Three-factor learning: Hebbian traces gated by RL neuromod; autonomous topology via co-activation |
+| Per-neuron RL neuromodulation (gate + decay, 1024 neurons) | Backpropamine (scalar signal, differentiable) | Per-neuron gate controls Hebbian consolidation direction, non-differentiable |
 | Co-activation structural plasticity | SET/RigL (magnitude/gradient pruning) | Phi coefficient (binary Pearson) drives prune/grow, no magic thresholds |
 | Memory as RL environment (not differentiable module) | All of Category 2 is differentiable | Explicit design choice: memory outside autograd |
 | Per-column predictive coding in scan-based LM | Rao & Ballard (visual cortex theory) | Applied as architectural component in a language model |

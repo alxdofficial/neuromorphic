@@ -144,10 +144,15 @@ class ScanLayer(nn.Module):
         [gate, up] = proj_out(h)
         out = silu(gate) * up
     This adds nonlinear feature mixing without extra sequential depth.
+
+    Optional side_dim: if > 0, creates a proj_side linear that maps a side
+    input (e.g. PCM surprise) into the gate/input space additively. Zero-init
+    so the layer starts as if no side input exists.
     """
 
     def __init__(self, D: int, d_inner: int, dropout: float = 0.0,
-                 n_layers: int = 1, glu_output: bool = False):
+                 n_layers: int = 1, glu_output: bool = False,
+                 side_dim: int = 0):
         super().__init__()
         self.D = D
         self.d_inner = d_inner
@@ -161,17 +166,28 @@ class ScanLayer(nn.Module):
             self.proj_out = nn.Linear(d_inner, D)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+        # Side input projection (e.g. PCM surprise → scan gate/input)
+        if side_dim > 0:
+            self.proj_side = nn.Linear(side_dim, 2 * d_inner)
+            # Zero-init: no effect at start, learned during training
+            nn.init.zeros_(self.proj_side.weight)
+            nn.init.zeros_(self.proj_side.bias)
+        else:
+            self.proj_side = None
+
         # GPT-2 style depth scaling: each residual branch contributes 1/√(2*n_layers)
         if n_layers > 1:
             with torch.no_grad():
                 self.proj_out.weight.mul_(1.0 / math.sqrt(2 * n_layers))
 
-    def forward(self, x: Tensor, h_prev: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, h_prev: Tensor | None = None,
+                side_input: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Forward pass.
 
         Args:
             x: [BS, N, D]
             h_prev: [BS, d_inner] or None — carry from previous segment
+            side_input: [BS, N, side_dim] or None — additional signal (e.g. surprise)
 
         Returns:
             out: [BS, N, D] — output (with residual)
@@ -179,6 +195,8 @@ class ScanLayer(nn.Module):
         """
         residual = x
         ab = self.proj_in(self.norm(x))        # [BS, N, 2*d_inner]
+        if side_input is not None and self.proj_side is not None:
+            ab = ab + self.proj_side(side_input)
         a_raw, b_raw = ab.chunk(2, dim=-1)
         h = fused_scan(a_raw, F.silu(b_raw), h_prev)  # [BS, N, d_inner]
         if self.glu_output:

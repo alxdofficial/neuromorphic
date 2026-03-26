@@ -41,7 +41,7 @@ When checking on a training run, look at these in order:
 | `mem_msg_rms_mean` | 0.01-0.5 (in tanh linear regime) | Average per-neuron message RMS | Near 1.0 = saturated, near 0 = dead |
 | `mem_msg_rms_std` | Nonzero (variation is good) | Variation of message RMS across neurons | Zero = all neurons identical |
 | `mem_tanh_saturated` | < 5% | Fraction of message dims near ±1 | > 20% = h too large or primitives wrong |
-| `mem_prim_std` | Stable (from init noise) | Primitive diversity across neurons | Exploding = no RMS normalization |
+| `mem_prim_std` | Stable (from init noise) | Primitive diversity across neurons | Exploding = neuromod action scale too large |
 | `mem_key_diversity` | Nonzero | Key vector diversity across neurons | Zero = all keys identical (bad routing) |
 
 ### Memory Gate (critical coupling signal)
@@ -75,10 +75,10 @@ When checking on a training run, look at these in order:
 
 | Metric | Healthy Range | What It Means | Red Flags |
 |--------|---------------|---------------|-----------|
-| `mem_firing_rate` | 0.2-0.3 (by construction, ~25% from percentile) | Overall firing rate | 0 = dead, 1 = always firing |
-| `mem_firing_rate_port` | Similar to nonport | Port neuron firing rate | Much higher/lower than internal = scale mismatch |
-| `mem_firing_rate_nonport` | Similar to port | Internal neuron firing rate | Zero = internal neurons dead |
-| `mem_usage_frac` | > 0.9 (most neurons active) | Fraction of neurons with firing_rate > 0.01 | < 0.5 = many dead neurons |
+| `mem_msg_mag_mean` | > 0 (varies across neurons) | Mean message magnitude | 0 = silent neurons, very high = saturation |
+| `mem_msg_mag_port` | Similar to nonport | Port neuron message magnitude | Much higher/lower than internal = scale mismatch |
+| `mem_msg_mag_nonport` | Similar to port | Internal neuron message magnitude | Zero = internal neurons dead |
+| `mem_usage_frac` | > 0.9 (most neurons active) | Fraction of neurons with msg_magnitude > 0.01 | < 0.5 = many dead neurons |
 
 ### Co-activation (Plasticity Signal)
 
@@ -101,7 +101,7 @@ When checking on a training run, look at these in order:
 
 | Metric | Healthy Range | What It Means | Red Flags |
 |--------|---------------|---------------|-----------|
-| `pcm_gain_scale` | Should evolve from init (2.0) | Learnable surprise modulation scale | Stuck at init = PCM not learning |
+| `aux_loss` trend | Decreasing | PCM prediction improving | Flat = PCM not learning |
 
 ### RL / Neuromod Metrics (Phase 2 only, every rl_collect_chunks steps)
 
@@ -113,9 +113,8 @@ When checking on a training run, look at these in order:
 | `rl_traj_loss_worst` | Spread from best | Worst trajectory z-score | Same as best = no differentiation |
 | `rl_nm_grad_norm` | Stable, < 10000 | Neuromod gradient norm | Spikes > 100K = instability |
 | `rl_entropy` | Should not collapse to 0 | Policy entropy (exploration) | Zero = deterministic policy (no exploration) |
-| `nm_logstd_prim` | Should evolve from init (-0.5) | Primitive action exploration rate | Frozen at init = not learning |
-| `nm_logstd_key` | Should evolve from init (-0.5) | Key action exploration rate | Frozen at init = not learning |
-| `nm_logstd_decay` | Should evolve from init (-0.5) | Decay action exploration rate | Frozen at init = not learning |
+| `nm_logstd_gate` | Should evolve from init (-0.5) | Gate action exploration rate | Frozen at init = not learning |
+| `nm_logstd_decay` | Should evolve from init (-0.5) | Decay target exploration rate | Frozen at init = not learning |
 
 ---
 
@@ -136,10 +135,13 @@ after Phase 2 neuromod training, the memory graph isn't producing useful signals
 **Symptoms:** `mem_prim_std` or `mem_key_diversity` grows unbounded, `mem_tanh_saturated`
 increases toward 1.0.
 
-**Cause:** Neuromod pushes primitive/key magnitudes up, normalization not applied.
+**Cause:** Hebbian traces shift primitive/key magnitudes without bound.
 
-**Fix:** Check that `apply_actions()` applies RMS normalization on primitives
-and L2 normalization on key after every neuromod action.
+**Fix:** `apply_gated_plasticity()` RMS-normalizes primitives and L2-normalizes
+keys after each update. This is safe because the neuromod only controls the
+1-dim gate (not the 128-dim direction). Monitor `mem_prim_std` and
+`mem_tanh_saturated` — moderate growth is fine; extreme saturation means
+the hebbian_lr may need reducing.
 
 ### Pattern 3: All Neurons Positively Correlated
 
@@ -157,10 +159,10 @@ Phase 2 as neuromod differentiates neurons.
 
 **Symptoms:** `rl_traj_loss_best` ≈ `rl_traj_loss_worst` (no trajectory differentiation), `nm_logstd_*` frozen at -0.5, entropy constant.
 
-**Cause:** Neuromod actions have no measurable effect on loss. Could be:
-- Normalizations erasing action effects (was the issue in the first 1.5B run)
-- LM not using memory (gate stuck → actions don't reach the loss)
-- Action space too large for the reward signal
+**Cause:** Neuromod gate+decay actions have no measurable effect on loss. Could be:
+- LM not using memory (mem_gate stuck → gated plasticity doesn't reach the loss)
+- Hebbian traces too small (traces haven't accumulated meaningful directions)
+- hebbian_lr too small for the gate to produce visible loss differences
 
 **Fix:** Ensure Phase 1 trains the LM to use memory first, then Phase 2
 neuromod has a loss-sensitive system to optimize.
@@ -175,14 +177,14 @@ If it does, check that decay_logit isn't somehow producing decay > 1.0
 
 ### Pattern 6: Port/Internal Gap
 
-**Symptoms:** `mem_firing_rate_port` >> `mem_firing_rate_nonport`, or h_norm
+**Symptoms:** `mem_msg_mag_port` >> `mem_msg_mag_nonport`, or h_norm
 dominated by port neurons in connectivity snapshot.
 
 **Cause:** CC signals enter at a much larger scale than internal graph messages.
 The percentile-based firing should handle moderate gaps. Extreme gaps
-(100×+) indicate CC normalization issues.
+(100x+) indicate CC normalization issues.
 
-**Current state:** With tanh + RMS primitives, a ~16× gap is expected
+**Current state:** With tanh on messages, a moderate gap is expected
 and acceptable. The adaptive firing threshold handles it.
 
 ---
@@ -196,7 +198,7 @@ and acceptable. The adaptive firing threshold handles it.
 - `mem_gate_mean` — is the LM learning to use memory?
 - `mem_h_norm`, `mem_tanh_saturated` — are dynamics stable?
 - `mem_plasticity_rewires` — is topology evolving?
-- `mem_firing_rate_port` vs `_nonport` — balanced activity?
+- `mem_msg_mag_port` vs `_nonport` — balanced activity?
 
 **What's expected to be bad:**
 - `phi_pos_frac` = 1.0 (all positive correlation — no neuromod to differentiate)
@@ -209,7 +211,7 @@ and acceptable. The adaptive firing threshold handles it.
 **What to watch:**
 - `rl_traj_loss_best` vs `rl_traj_loss_worst` — are GRPO trajectories differentiable?
 - `rl_grpo_loss` — is GRPO producing gradient signal?
-- `nm_logstd_*` — are exploration rates adapting?
+- `nm_logstd_gate`, `nm_logstd_decay` — are exploration rates adapting?
 - `mem_gate_mean` — should already be at a non-0.5 value from Phase 1
 - `loss` — should improve from Phase 1 endpoint
 - `mem_decay_mean/std` — neuromod should differentiate neurons
@@ -218,7 +220,7 @@ and acceptable. The adaptive firing threshold handles it.
 **What indicates success:**
 - `rl_traj_loss_best` and `rl_traj_loss_worst` clearly separated (GRPO finds signal)
 - Loss improves beyond Phase 1 endpoint
-- `nm_logstd_*` moves from init (exploration is adapting)
+- `nm_logstd_gate`/`nm_logstd_decay` move from init (exploration is adapting)
 - Neurons develop diverse decay values and primitive directions
 
 ---
@@ -247,7 +249,7 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 - GRPO Loss — policy gradient loss, should decrease slowly
 - Trajectory Spread — best vs worst trajectory z-score advantages
 - Trajectory Adv Std — signal strength, should not collapse to 0
-- Policy Log-Std — exploration rates per action group
+- Policy Log-Std — exploration rates (gate, decay)
 - Neuromod Gradient Norm — stability indicator
 
 **memory_health.png:**
@@ -276,7 +278,7 @@ Plots are auto-generated during training every `--plot-interval` steps (default 
 python -m src.v8.train --bs 8 --steps 30517 --no-neuromod
 
 # Phase 2: Frozen LM + neuromod (resume from Phase 1 checkpoint)
-# Throughput: ~16K tok/s avg (53K collect, ~5K on GRPO scoring steps)
+# Throughput: ~87K tok/s (faster than Phase 1 because LM is frozen)
 python -m src.v8.train --bs 8 --steps 61035 --resume outputs/v8/<run>/v8_step30517.pt --freeze-lm
 
 # No-memory baseline

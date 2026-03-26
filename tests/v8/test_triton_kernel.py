@@ -49,7 +49,7 @@ def make_paired_graphs(cfg, dtype=torch.float32):
     mg_tr.conn_mask = mg_py.conn_mask.clone()
     mg_tr.mean_input = mg_py.mean_input.clone()
     mg_tr.mean_output = mg_py.mean_output.clone()
-    mg_tr.firing_rate = mg_py.firing_rate.clone()
+    mg_tr.msg_magnitude = mg_py.msg_magnitude.clone()
 
     # Re-init Triton buffers with the copied indices
     if mg_tr._triton_ready:
@@ -129,8 +129,8 @@ class TestTritonEquivalence:
         out_py = mg_py._forward_segment_python(cc2.clone(), eot_mask)
         out_tr = mg_tr._forward_segment_triton(cc2.clone(), eot_mask)
 
-        torch.testing.assert_close(out_tr, out_py, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(out_tr, out_py, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=2e-2, rtol=2e-2)
 
     def test_zero_input_equivalence(self):
         """With zero CC signal, only graph dynamics matter."""

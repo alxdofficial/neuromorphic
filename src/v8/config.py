@@ -28,6 +28,7 @@ class V8Config:
     # D_mem = D_cc always (neurons match CC width)
     N_mem_neurons: int = 1024    # total neurons
     K_connections: int = 96      # sparse presynaptic connections per neuron
+    dendrite_branch_size: int = 12  # connections per dendritic branch (0 = flat, no tree)
 
     # Plasticity
     plasticity_ema_decay: float = 0.99
@@ -35,13 +36,13 @@ class V8Config:
     structural_plasticity_every: int = 4    # segments between prune-regrow (twice per chunk)
     plasticity_exploration_frac: float = 0.2  # fraction of regrowth that's random
 
-    # Neuromodulator
-    neuromod_hidden: int = 1024
-    neuromod_layers: int = 3
+    # Neuromodulator — gates Hebbian eligibility traces + controls decay
+    neuromod_hidden: int = 512
+    neuromod_layers: int = 2
     action_every: int = 128      # act every N tokens (16 segments per T=2048 chunk)
-    max_action_magnitude: float = 1.0  # generous — normalization bounds the effect
-    # No decay clamp needed: h = d*h + (1-d)*received is a convex combination,
-    # so h is bounded by received scale regardless of decay.
+    memory_update_stride: int = 1 # neuron dynamics step every N tokens (>1 for larger N)
+    hebbian_lr: float = 0.01     # local learning rate for gated Hebbian updates
+    trace_decay: float = 0.95    # EMA decay for eligibility traces (~14 segment half-life)
 
     # Neuromodulator RL
     neuromod_lr: float = 3e-4    # learning rate for neuromod optimizer
@@ -55,7 +56,6 @@ class V8Config:
     T: int = 2048                # full chunk length
     gradient_checkpointing: bool = False
     use_compile: bool = True
-    lifelong_mode: bool = False
 
     @property
     def D_mem(self) -> int:
@@ -117,7 +117,7 @@ class V8Config:
             # Memory: 1024 neurons, 96 presynaptic connections
             N_mem_neurons=1024, K_connections=96,
             pcm_hidden=256,
-            neuromod_hidden=2048, neuromod_layers=3,
+            neuromod_hidden=512, neuromod_layers=2,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -131,7 +131,7 @@ class V8Config:
             d_inner=1536, glu_output=True, T=2048,
             N_mem_neurons=2048, K_connections=96,
             pcm_hidden=256,
-            neuromod_hidden=2048, neuromod_layers=3,
+            neuromod_hidden=512, neuromod_layers=2,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -145,7 +145,7 @@ class V8Config:
             d_inner=2048, glu_output=True, T=2048,
             N_mem_neurons=4096, K_connections=128,
             pcm_hidden=512,
-            neuromod_hidden=2048, neuromod_layers=3,
+            neuromod_hidden=512, neuromod_layers=2,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -157,9 +157,11 @@ class V8Config:
             D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=64, T=32,
             N_mem_neurons=16, K_connections=6,
+            dendrite_branch_size=3,
             pcm_hidden=32,
             neuromod_hidden=32, neuromod_layers=2,
             action_every=8,
+            memory_update_stride=2,
         )
         defaults.update(overrides)
         return cls(**defaults)

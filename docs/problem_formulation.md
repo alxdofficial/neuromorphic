@@ -15,10 +15,12 @@ system has three components that operate at different levels:
    neurons" interface with the LM's cortical columns. This is the "slow" system —
    persistent memory that evolves with every token but is NOT trained by backprop.
 
-3. **Neuromodulator**: An RL-trained policy network (~10M params) that observes every
-   neuron's state and adjusts primitives (what neurons broadcast), routing keys
-   (what neurons listen for), and decay (temporal persistence) every 128 tokens. This is the "meta"
-   system — it learns HOW to configure the memory graph.
+3. **Neuromodulator**: An RL-trained policy network (2-layer MLP, 512 hidden) that
+   observes every neuron's state and outputs a gate (controls Hebbian plasticity
+   direction) and decay target every 128 tokens. Three-factor learning: eligibility
+   traces accumulate what neurons encode/receive, the gate controls whether to
+   consolidate or reverse. This is the "meta" system — it learns HOW to configure
+   the memory graph.
 
 ## Current Architecture in Detail
 
@@ -29,7 +31,7 @@ The LM is a standard scan-based sequence model:
 - Per-column predictive coding modules (16 independent PCMs)
 - Memory injection: `H_enriched = H_mid + gate * mem_signals` (mid-scan, before upper layers)
 - ~93M trainable parameters
-- Throughput: ~154K tok/s without memory (RTX 4090, BS=8, compiled)
+- Throughput: ~161K tok/s without memory (RTX 4090, compiled)
 
 This part is well-understood and works. The scan layers are fully parallel over T=2048
 tokens. No issues here.
@@ -41,11 +43,14 @@ tokens. No issues here.
 - `prev_messages` [128 dims] — last outgoing message
 - `primitives` [128 dims] — modulates outgoing messages (neuromod-controlled)
 - `decay` — state persistence (neuromod-controlled)
-- `key` [128 dims] — routing selectivity, L2-normalized (neuromod-controlled)
+- `key` [128 dims] — routing selectivity (neuromod-controlled)
 
 **Per-token dynamics (sequential, every token):**
 ```
-1. received = A @ prev_messages              # weighted sum of presynaptic messages
+1. Dendritic tree gather (3 levels, no trainable params):
+   Level 0: 8 branches of 12 connections each -> tanh
+   Level 1: 2 groups of 4 branches -> tanh
+   Level 2: soma averages groups -> received
    received[:, :16] += cc_signals[:, t]      # port neurons also get LM signal
 2. h = decay * h + (1-decay) * received      # temporal integration
 3. prev_messages = tanh(h * primitives)       # compute outgoing message
@@ -56,13 +61,15 @@ The LM reads port neurons' messages at every token as `mem_signals`.
 ### The Neuromodulator (RL Agent)
 
 Every 128 tokens (16 times per 2048-token chunk):
-- Observes all 1024 neurons (514 dims each: primitives, key, mean input, mean output, firing rate, decay)
-- Outputs per-neuron additive deltas (257 dims: delta_primitive[128] + delta_key[128] + delta_decay[1])
-- Shared 3-layer MLP (hidden=2048, ~10M params) applied to each neuron independently
+- Observes all 1024 neurons (516 dims each: primitives, key, mean input, mean output, msg_magnitude, decay, trace_prim_norm, trace_key_norm)
+- Outputs per-neuron gate (tanh'd to [-1,1]) + decay_target (act_dim=2)
+- Shared 2-layer MLP (hidden=512) applied to each neuron independently
+- Gate controls Hebbian trace consolidation: primitives += hebbian_lr * gate * normalize(trace_prim), keys similarly
 
 **RL training**: GRPO trajectory scoring (8 trajectories for K=96 neurons, scored across
-ALL 4 collected chunks, ranked by CE loss). Non-K neurons get zero delta. Best
-trajectory's final state persists. No value function or critic.
+ALL 4 collected chunks, ranked by CE loss). Non-K neurons get gate=0 (no plasticity) +
+current decay_logit as target (no drift). Best trajectory's final state persists. No
+value function or critic.
 
 ---
 
@@ -79,8 +86,8 @@ nonlinearity (tanh) and inter-neuron coupling (A @ messages) break all paralleli
 At BS=4, that's ~2 GFLOP per token × 2048 tokens = ~4 TFLOP per chunk. The sequential
 loop adds Python overhead on top. Total memory path: ~100ms per chunk.
 
-**Result**: ~53K tok/s collect steps with memory (Triton kernel), ~154K without. With
-GRPO scoring every 4 chunks, average ~16K tok/s. For a research model this is acceptable,
+**Result**: ~64K tok/s Phase 1 (memory, no neuromod), ~87K tok/s Phase 2 (memory +
+neuromod, frozen LM), ~161K without memory. For a research model this is acceptable,
 but scaling to larger N or longer T will make it worse (cost scales as O(T × N × K)).
 
 **Why this can't be trivially parallelized**:
@@ -105,15 +112,17 @@ but scaling to larger N or longer T will make it worse (cost scales as O(T × N 
 ### Problem 2: RL Credit Assignment — Which Actions Mattered?
 
 **The setup**: The neuromodulator takes 16 actions per chunk (one every 128 tokens).
-Each action modifies primitives, routing keys, and decay for all 1024 neurons via
-additive deltas. The reward is the CE loss on the next 128 tokens.
+Each action outputs a gate (controls Hebbian plasticity direction) and decay_target
+per neuron. The gate modulates eligibility trace application; the reward is the CE
+loss across all collected chunks.
 
 **What we currently do**:
 - Collect RL data across `rl_collect_chunks=4` chunks. Save MG state at start of window.
 - Choose K=96 neurons (fixed for all trajectories and all chunks in the RL step)
 - GRPO trajectory scoring: sample 8 trajectories, each replaying ALL 4 chunks sequentially.
-  Only K neurons get stochastic actions, non-K get zero delta. Score = mean CE across all
-  4 chunks. Z-score normalize → per-trajectory advantages.
+  Only K neurons get stochastic gate+decay_target, non-K get gate=0 (no plasticity) +
+  current decay_logit as target (no drift). Score = mean CE across all 4 chunks.
+  Z-score normalize → per-trajectory advantages.
 - Best trajectory's final MG state + upper scan carries persist (best-of-N state selection)
 - No value function, no critic
 
@@ -126,12 +135,13 @@ additive deltas. The reward is the CE loss on the next 128 tokens.
 **Open questions**:
 
 **Q1: Is the reward signal informative enough?**
-The reward is negative CE loss on the NEXT segment's tokens. But the neuromod's action
-affects the memory graph's structural configuration (primitives, weights, decay) — it
-doesn't directly predict tokens. The mapping from "adjust neuron 500's primitives by
-delta" to "segment CE loss decreases by 0.01" is extremely indirect. The neuromod has
-to learn that certain structural configurations help the LM predict better, without any
-direct gradient signal telling it which configurations are good.
+The reward is negative CE loss on the NEXT segment's tokens. But the neuromod's gate
+controls Hebbian plasticity direction (consolidate vs reverse eligibility traces) —
+the mapping from "set neuron 500's gate to +0.8" to "segment CE loss decreases by 0.01"
+is indirect. However, the 2-dim action space (gate + decay_target) is much simpler than
+the old 257-dim action space, and the Hebbian traces provide biologically meaningful
+update directions. The neuromod only needs to learn WHEN to consolidate vs explore,
+not WHAT direction to update in.
 
 **Q2: Is per-segment reward the right granularity?**
 128 tokens per segment. The neuromod adjusts the graph, then the graph processes 128
@@ -150,12 +160,12 @@ observe → sample → apply, mirroring real deployment. Cost: 8 extra memory gr
 upper scan runs every 4 chunks.
 
 **Q4: Is the action space right?**
-Each action is 257 continuous dims per neuron x 1024 neurons = 263,168 total action
-dimensions per step. The policy outputs are sampled from a Gaussian with learned std.
-The action is clamped to +/-1.0 (RMS/L2 normalization bounds the effect). Questions:
-- Is 128 dims of new_primitive too many? Could a lower-rank action suffice?
-- Is 128 dims of new_key too many? The key controls routing selectivity via
-  softmax(key . neighbor_messages) — could a lower-rank action suffice?
+Each action is 2 continuous dims per neuron (gate + decay_target) x 1024 neurons = 2,048
+total action dimensions per step. The gate is tanh'd to [-1,1], decay_target is blended
+into decay_logit. The Hebbian trace directions are determined locally (from h and
+mean_input), not by the neuromod — the neuromod only controls the scalar gate magnitude
+and sign. Questions:
+- Is hebbian_lr=0.01 the right scale for the gated updates?
 - The same MLP is applied to all neurons — is the obs sufficient for the MLP to
   differentiate neuron roles?
 
@@ -197,8 +207,8 @@ structured, but communicates with the LM through only 16 port neurons.
 **Current design**: Every 4 segments (~1024 tokens), co-activation-based plasticity runs.
 Connections with negative phi (anti-correlated firing patterns) are pruned. New connections
 form toward the highest-phi unconnected neuron (80%) or random (20%). Routing weights
-are softmax over key-neighbor similarity (sum to 1 by construction). Vectorized — no
-Python loop over neurons.
+are sigmoid over key-neighbor similarity (each connection independently gated [0, 1]).
+Vectorized — no Python loop over neurons.
 
 **Remaining concerns**:
 - The co-activation EMA (decay=0.995) takes ~200 segments to converge, so early plasticity
@@ -233,7 +243,7 @@ not, the decay mechanism and new incoming signals will naturally overwrite it.
 |--------|--------|------------|
 | LM scan layers | Working, well-understood | High |
 | Memory graph per-token dynamics | Implemented, correct | High |
-| Throughput | ~53K collect, ~16K avg with GRPO | Acceptable |
+| Throughput | ~64K Phase 1, ~87K Phase 2, ~161K no memory | Acceptable |
 | Multi-chunk RL rewards | Implemented (4 chunks, 64 segments) | Medium — informative enough? |
 | Credit assignment | GRPO (8 traj, K=96, all 4 chunks, zero non-K, best state persists) | Medium-High — trajectory ranking controls for text difficulty |
 | Primitives as message modulation | Implemented | Medium — do neurons differentiate? |

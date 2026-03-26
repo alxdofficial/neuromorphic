@@ -36,7 +36,7 @@ class V8Model(nn.Module):
 
         self._mem_graph = None
         # obs_dim derived from config (matches MemoryGraph.obs_dim property)
-        obs_dim = config.D_mem * 4 + 2  # prim + key + mean_in + mean_out + firing_rate + decay
+        obs_dim = config.D_mem * 4 + 4  # prim + key + mean_in + mean_out + msg_mag + decay + trace_norms
         self.neuromod = Neuromodulator(config, obs_dim)
         self._obs_dim = obs_dim
 
@@ -90,11 +90,11 @@ class V8Model(nn.Module):
         # ==========================================
         # Lower scan (layers 0..split-1) + PCM
         # ==========================================
-        H_mid, x, surprise, aux_loss = self.lm.forward_scan_lower(input_ids)
+        H_mid, surprise, x, aux_loss = self.lm.forward_scan_lower(input_ids)
 
         # --- No-memory fast path ---
         if not use_memory:
-            H = self.lm.forward_scan_upper(H_mid)
+            H = self.lm.forward_scan_upper(H_mid, surprise=surprise)
             logits = self.lm.forward_output(H)
             return {
                 "logits": logits,
@@ -139,19 +139,20 @@ class V8Model(nn.Module):
             needs_phi = (sp_every > 0
                          and self._segment_counter % sp_every == 0)
 
-            # Neuromod observes and acts (if enabled)
-            if use_neuromod:
-                obs = mg.get_neuron_obs()
-                obs_flat = obs.reshape(BS * N_neurons, -1)
-                with torch.no_grad():
-                    action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
-                self._apply_neuromod_action(action, BS)
-
             # Run memory graph (no eot_mask — memory persists across docs)
             seg_out = mg.forward_segment(
                 seg_cc, eot_mask=None,
                 update_co_activation=needs_phi)
             mem_out[:, t0:t0 + action_every] = seg_out
+
+            # Neuromod: compute traces from this segment, then gate them
+            if use_neuromod:
+                mg.compute_eligibility_traces()
+                obs = mg.get_neuron_obs()
+                obs_flat = obs.reshape(BS * N_neurons, -1)
+                with torch.no_grad():
+                    action, _, _, _ = self.neuromod.get_action_and_value(obs_flat)
+                self._apply_neuromod_action(action, BS)
 
             if needs_phi:
                 mg.structural_plasticity()
@@ -160,7 +161,7 @@ class V8Model(nn.Module):
         # Upper scan + output
         # ==========================================
         H_enriched = self.lm.inject_memory(H_mid, mem_out)
-        H = self.lm.forward_scan_upper(H_enriched)
+        H = self.lm.forward_scan_upper(H_enriched, surprise=surprise)
         logits = self.lm.forward_output(H)
 
         # ==========================================
@@ -174,6 +175,7 @@ class V8Model(nn.Module):
                 "action_every": action_every,
                 "cc_segments": cc_segments.detach(),
                 "H_mid": H_mid.detach(),
+                "surprise": surprise.detach(),
                 "pre_upper_carries": pre_upper_carries,
             }
 
@@ -263,17 +265,28 @@ class V8Model(nn.Module):
                 chunk = rl_buffer[chunk_idx]
                 cc_segments = chunk["cc_segments"]
                 H_mid = chunk["H_mid"]
+                chunk_surprise = chunk["surprise"]
                 target_ids = chunk["target_ids"]
                 eot_at = chunk["eot_at"]
 
                 mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
 
                 for seg in range(n_segments):
+                    seg_cc = cc_segments[:, seg]
+                    seg_out = mg.forward_segment(
+                        seg_cc, eot_mask=None, update_co_activation=False)
+                    t0 = seg * action_every
+                    mem_out[:, t0:t0 + action_every] = seg_out
+
+                    # Compute traces from this segment, then gate
+                    mg.compute_eligibility_traces()
                     seg_obs = mg.get_neuron_obs().reshape(BS * N, -1).to(nm_dtype)
                     action, _, _, _ = self.neuromod.get_action_and_value(seg_obs)
 
-                    # Only K neurons get actions, non-K get zero delta
+                    # Only K neurons get actions, non-K get zero gate + current decay
+                    # (zero gate = no plasticity; current decay = no drift)
                     full_action = torch.zeros_like(action)
+                    full_action[:, 1] = mg.decay_logit.reshape(-1)  # preserve decay for non-K
                     full_action[k_idx_flat] = action[k_idx_flat]
 
                     # Store K neurons' obs and actions for replay
@@ -282,16 +295,10 @@ class V8Model(nn.Module):
 
                     self._apply_neuromod_action(full_action, BS)
 
-                    seg_cc = cc_segments[:, seg]
-                    seg_out = mg.forward_segment(
-                        seg_cc, eot_mask=None, update_co_activation=False)
-                    t0 = seg * action_every
-                    mem_out[:, t0:t0 + action_every] = seg_out
-
                 # Upper scan + CE for this chunk
                 # (upper scan carries evolve naturally across chunks within a trajectory)
                 H_enriched = self.lm.inject_memory(H_mid, mem_out)
-                H = self.lm.forward_scan_upper(H_enriched)
+                H = self.lm.forward_scan_upper(H_enriched, surprise=chunk_surprise)
                 logits = self.lm.forward_output(H)
 
                 # Float32 CE, masked by EOT positions
@@ -420,19 +427,12 @@ class V8Model(nn.Module):
         }
 
     def _apply_neuromod_action(self, action: Tensor, BS: int):
-        """Clamp and apply additive neuromod action to the memory graph."""
+        """Extract gate and decay_target from neuromod output, apply gated plasticity."""
         N = self.config.N_neurons
-        D_mem = self.config.D_mem
-        max_act = self.config.max_action_magnitude
-
-        clamped = action.clamp(-max_act, max_act).reshape(BS, N, -1)
-        idx = 0
-        d_prim = clamped[:, :, idx:idx + D_mem]
-        idx += D_mem
-        d_key = clamped[:, :, idx:idx + D_mem]
-        idx += D_mem
-        d_decay = clamped[:, :, idx]
-        self._mem_graph.apply_actions(d_prim, d_key, d_decay)
+        action = action.reshape(BS, N, 2)
+        gate = action[:, :, 0].tanh()   # [BS, N] — clamp to [-1, 1]
+        decay_target = action[:, :, 1]  # [BS, N] — unbounded (sigmoid in memory graph)
+        self._mem_graph.apply_gated_plasticity(gate, decay_target)
 
     def _reset_carries(self, mask: Tensor):
         if hasattr(self.lm, '_carries'):

@@ -3,22 +3,26 @@
 ## v8 (Neural Memory Graph) — Current
 
 ```bash
-# Full v8: split-scan + per-token memory graph + RL neuromodulator
-python -u -m src.v8.train --bs 12 --steps 61035
+# Phase 1: LM + frozen memory graph (no neuromod)
+python -u -m src.v8.train --bs 8 --steps 30517 --no-neuromod
+
+# Phase 2: Frozen LM + neuromod (resume from Phase 1)
+python -u -m src.v8.train --bs 8 --steps 61035 --resume outputs/v8/<run>/v8_step30517.pt --freeze-lm
 
 # LM-only baseline: scan stack only, no memory
-python -u -m src.v8.train --bs 12 --steps 61035 --no-memory
+python -u -m src.v8.train --bs 12 --steps 30517 --no-memory
 ```
 
 ### Architecture
 
-Split-scan with mid-scan memory injection:
-- **Lower scan**: layers 0-3 + per-CC PCM (surprise + gain modulation)
-- **Memory**: 8 segments of 256 tokens, per-token neuron loop (receive -> integrate -> message)
-- **Inject**: H_enriched = H_mid + gate * mem_signals (mid-scan, not end)
-- **Upper scan**: layers 4-6 on memory-enriched representations
+Split-scan with mid-scan memory injection + three-factor learning:
+- **Lower scan**: layers 0-3 + BatchedPCM (bmm across all C=16 columns, RMSNorm, surprise as side input)
+- **Memory**: 16 segments of 128 tokens, per-token dendritic tree neuron loop
+- **Inject**: H_enriched = H_mid + sigmoid(gate) * mem_signals (mid-scan, not end)
+- **Upper scan**: layers 4-6 on memory-enriched representations (surprise as side input to first layer)
 - **Output**: proj_down -> LayerNorm -> lm_head
-- **RL**: per-segment REINFORCE with discounted returns, entropy bonus, LR schedule
+- **RL**: GRPO trajectory scoring (8 trajectories, K=96 neurons, scored across 4 chunks)
+- **Plasticity**: Three-factor learning (Hebbian eligibility traces gated by neuromod)
 
 ### Config (Tier A)
 
@@ -27,30 +31,35 @@ Split-scan with mid-scan memory injection:
 | Total params | ~103M |
 | Lower scan | layers 0-3 (D=2048, d_inner=1024) |
 | Upper scan | layers 4-6 |
-| PCM | at split point, learnable gain_scale |
-| Memory neurons | 1024, 96 presynaptic connections, L1-normalized weights |
-| action_every | 256 tokens (8 segments per chunk) |
+| PCM | BatchedPCM at split point (bmm, RMSNorm, no gain modulation) |
+| Memory neurons | 1024, 96 presynaptic connections, key-based sigmoid routing |
+| Dendritic tree | 3 levels: 8 branches of 12, 2 groups of 4, soma avg |
+| action_every | 128 tokens (16 segments per chunk) |
 | D_mem = D_cc | 128 |
-| Neuromodulator | 3-layer MLP hidden=2048, obs=387, act=225 |
+| Neuromodulator | 2-layer MLP hidden=512, obs=516, act=2 (gate + decay_target) |
+| hebbian_lr | 0.01, trace_decay=0.95 |
 | T (chunk) | 2048 tokens |
-| RL | Per-segment REINFORCE, gamma=0.99, entropy bonus 0.01 |
-| Neuromod LR | 3e-4 with warmup + cosine decay to 10% |
-| Throughput | ~44K tok/s with memory, ~85K without (RTX 4090, BS=12) |
+| RL | GRPO (8 trajectories, K=96 neurons, 4 chunks, best state persists) |
+| Neuromod LR | 3e-4 with warmup + cosine decay |
+| Throughput | ~64K Phase 1, ~87K Phase 2, ~161K no memory (RTX 4090) |
 
 ### CLI Options
 
 ```bash
 --bs N             # Batch size (default 8)
 --steps N          # Training steps (default 10000)
---compile          # Enable torch.compile
---no-compile       # Disable torch.compile
+--no-neuromod      # Phase 1: disable neuromodulator, train LM + frozen memory
 --no-memory        # LM-only baseline (no memory graph, no RL)
---grad-ckpt        # Enable gradient checkpointing
+--freeze-lm        # Phase 2: freeze LM, only neuromod trains via GRPO
+--resume PATH      # Resume from checkpoint
+--no-compile       # Disable torch.compile
 --lr FLOAT         # Learning rate (default 3e-4)
 --save-dir PATH    # Output directory (default outputs/v8)
 --save-interval N  # Checkpoint interval (default 5000)
 --keep-checkpoints N  # Keep only last N checkpoints (default 3)
 --snapshot-interval N # Memory graph snapshot interval (default 1000)
+--plot-interval N  # Steps between auto-generated plots (default 500)
+--log-interval N   # Steps between metric logging (default 10)
 ```
 
 ### Outputs
