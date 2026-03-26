@@ -137,7 +137,8 @@ class MemoryGraph:
         self.primitives = prim_raw / rms
 
         key_raw = torch.randn(BS, N, D, device=self.device, dtype=self.dtype)
-        self.key = key_raw / key_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        key_rms = key_raw.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        self.key = key_raw / key_rms
 
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
@@ -515,10 +516,10 @@ class MemoryGraph:
         rms = self.primitives.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = (self.primitives / rms).to(self.dtype)
 
-        # Gated Hebbian update on key + L2 normalize
+        # Gated Hebbian update on key + RMS normalize
         self.key = self.key + lr * g * key_dir
-        key_norm = self.key.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        self.key = (self.key / key_norm).to(self.dtype)
+        key_rms = self.key.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        self.key = (self.key / key_rms).to(self.dtype)
 
         # Decay: blend toward target
         alpha = 0.1

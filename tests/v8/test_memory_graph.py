@@ -33,13 +33,13 @@ class TestMemoryGraphInit:
         assert mg.key.shape == (BS, cfg.N_neurons, cfg.D_mem)
         assert mg.co_activation_ema.shape == (cfg.N_neurons, cfg.N_neurons)
 
-    def test_key_l2_normalized(self):
+    def test_key_rms_normalized(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize(BS)
-        # Each neuron's key should be L2-normalized (unit vector)
-        l2 = mg.key.norm(dim=-1)  # [BS, N]
-        torch.testing.assert_close(l2, torch.ones_like(l2), atol=1e-2, rtol=1e-2)
+        # Each neuron's key should be RMS-normalized (per-dim ≈ 1)
+        rms = mg.key.pow(2).mean(dim=-1).sqrt()  # [BS, N]
+        torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-2, rtol=1e-2)
 
     def test_connectivity(self):
         cfg = make_tiny()
