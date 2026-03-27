@@ -103,7 +103,7 @@ class V8Config:
     def tier_a(cls, **overrides) -> "V8Config":
         defaults = dict(
             D=2048, D_embed=768, C=16, L_total=5, scan_split_at=3,
-            d_inner=1024, glu_output=True, T=2048,
+            d_inner=768, glu_output=True, T=2048,
             # Memory: 1024 neurons, 96 presynaptic connections
             N_mem_neurons=1024, K_connections=96,
             pcm_hidden=256,
