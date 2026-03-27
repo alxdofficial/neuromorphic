@@ -106,6 +106,11 @@ class V8Config:
             raise ValueError(
                 f"T ({self.T}) must be divisible by action_every ({self.action_every})."
             )
+        if self.memory_update_stride > 1 and self.action_every % self.memory_update_stride != 0:
+            raise ValueError(
+                f"action_every ({self.action_every}) must be divisible by "
+                f"memory_update_stride ({self.memory_update_stride})."
+            )
 
     @classmethod
     def tier_a(cls, **overrides) -> "V8Config":

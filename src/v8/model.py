@@ -189,11 +189,13 @@ class V8Model(nn.Module):
                 target_ids = chunk["target_ids"]
                 eot_at = chunk["eot_at"]
 
-                # Restore per-chunk upper carries
-                chunk_carries = chunk.get("pre_upper_carries")
-                if chunk_carries is not None:
-                    for i, c in enumerate(chunk_carries):
-                        self.lm._carries[split + i] = c.clone() if c is not None else None
+                # Restore upper carries only for the FIRST chunk of each trajectory.
+                # Subsequent chunks let carries flow naturally (persistence).
+                if chunk_idx == 0:
+                    chunk_carries = chunk.get("pre_upper_carries")
+                    if chunk_carries is not None:
+                        for i, c in enumerate(chunk_carries):
+                            self.lm._carries[split + i] = c.clone() if c is not None else None
 
                 # Memory forward
                 C_mem = mg.C_mem
@@ -239,7 +241,7 @@ class V8Model(nn.Module):
         log_half = math.log(N_traj / 2.0 + 1)
         utilities = torch.clamp(log_half - torch.log(ranks), min=0)
         utilities = utilities / utilities.sum().clamp(min=1e-8) - 1.0 / N_traj
-        advantages = -utilities  # negate because lower rank = lower loss = positive advantage
+        advantages = utilities  # positive for low-loss (good) trajectories
 
         # Restore best trajectory state
         for name, val in best_mg_params.items():

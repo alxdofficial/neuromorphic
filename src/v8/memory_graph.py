@@ -283,7 +283,9 @@ class MemoryGraph(nn.Module):
                 msg_accum += prev_msg
 
             # Weighted readout: prev_msg [BS, N, D] → [BS, C_mem, D]
-            output[:, t] = torch.einsum('cn,bnd->bcd', readout_weights, prev_msg.float()).to(cc_signals.dtype)
+            # Normalize by N so output scale doesn't grow with neuron count
+            output[:, t] = torch.einsum('cn,bnd->bcd', readout_weights / float(N),
+                                        prev_msg.float()).to(cc_signals.dtype)
 
         self._post_segment_update(h, prev_msg, received_accum, msg_accum, T_seg)
         return output
@@ -371,8 +373,10 @@ class MemoryGraph(nn.Module):
                 msg_all[:, s::stride] = msg_all[:, ::stride]
 
         # Batched readout from msg_all: one einsum for all T
+        # Normalize by N so output scale doesn't grow with neuron count
         readout_weights = torch.sigmoid(self.readout_w.float())  # [C_mem, N]
-        output = torch.einsum('cn,btnd->btcd', readout_weights,
+        N_float = float(self.config.N_neurons)
+        output = torch.einsum('cn,btnd->btcd', readout_weights / N_float,
                               msg_all.float()).to(cc_signals.dtype)
 
         n_steps = max(T_seg // stride, 1)

@@ -62,7 +62,8 @@ class V8Trainer:
         T = batch.input_ids.shape[1]
 
         if not self._states_initialized:
-            self.model.initialize_states(BS, self.device)
+            if not self.model._states_initialized:
+                self.model.initialize_states(BS, self.device)
             self._states_initialized = True
 
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
@@ -81,7 +82,12 @@ class V8Trainer:
                 self._es_pre_mg_params = {
                     k: v.clone() for k, v in mg.get_es_params().items()}
 
-        # Snapshot upper carries BEFORE forward (for ES replay)
+        # Apply doc boundary resets BEFORE snapshotting carries (so replay
+        # gets the post-reset state, matching what forward_chunk will see)
+        if has_reset and reset_mask is not None and self.use_memory:
+            self.model._reset_carries(reset_mask)
+
+        # Snapshot upper carries AFTER reset (for ES replay)
         pre_upper_carries = None
         if self.use_memory:
             split = self.config.scan_split_at
@@ -97,13 +103,13 @@ class V8Trainer:
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp)
 
-        # Forward
+        # Forward (reset already applied above for carry snapshotting)
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
                 reset_mask=reset_mask,
                 use_memory=self.use_memory,
-                has_reset=has_reset)
+                has_reset=False)
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
