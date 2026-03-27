@@ -1,5 +1,13 @@
 # V8 Codebase Intent — 2026-03-25
 
+> **WARNING: This document describes the OLD v8 RL/GRPO architecture.**
+> The current code (as of 2026-03-27) uses:
+> - 5 scan layers (split at 3), not 7 (split at 4)
+> - ES (Evolution Strategies) instead of RL/GRPO for memory graph training
+> - Broadcast inject/readout (all neurons participate in I/O) instead of port neurons
+> - Per-neuron modulator MLP + dendritic FC weights
+> - See TRAINING.md and the ES code in model.py for the current design.
+
 Complete description of how the v8 neuromorphic language model works,
 from data loading through training, RL, checkpointing, and diagnostics.
 Written after the design review sweep that fixed PCM, RL trajectory
