@@ -152,12 +152,16 @@ class V8Model(nn.Module):
 
         # Score each trajectory
         trajectory_losses = torch.empty(N_traj, device=device)
-        pre_upper_carries = first.get("pre_upper_carries")
+
 
         best_traj_idx = 0
         best_traj_loss = float('inf')
-        best_mg_state = None
-        best_upper_carries = None
+        best_mg_state = {k: v.clone() for k, v in pre_mg_state.items()}
+        best_mg_params = {name: val.clone() for name, val in pre_mg_params.items()}
+        first_carries = first.get("pre_upper_carries")
+        best_upper_carries = [
+            c.clone() if c is not None else None
+            for c in first_carries] if first_carries is not None else None
 
         for traj_i in range(N_traj):
             # Restore params + state
@@ -165,21 +169,25 @@ class V8Model(nn.Module):
                 getattr(mg, name).data.copy_(val)
             mg.load_runtime_state({k: v.clone() for k, v in pre_mg_state.items()})
 
-            if pre_upper_carries is not None:
-                for i, c in enumerate(pre_upper_carries):
-                    self.lm._carries[split + i] = c.clone() if c is not None else None
+
 
             # Apply perturbation
             mg.apply_es_perturbation(k_neurons, all_noise[traj_i], sigma)
 
             # Replay all chunks
             traj_total_loss = 0.0
-            for chunk in es_buffer:
+            for chunk_idx, chunk in enumerate(es_buffer):
                 cc_segments = chunk["cc_segments"]
                 H_mid = chunk["H_mid"]
                 surprise = chunk["surprise"]
                 target_ids = chunk["target_ids"]
                 eot_at = chunk["eot_at"]
+
+                # Restore per-chunk upper carries
+                chunk_carries = chunk.get("pre_upper_carries")
+                if chunk_carries is not None:
+                    for i, c in enumerate(chunk_carries):
+                        self.lm._carries[split + i] = c.clone() if c is not None else None
 
                 # Memory forward
                 mem_out = torch.empty(BS, self.config.T, self.config.C, self.config.D_mem,

@@ -24,6 +24,13 @@ from torch import Tensor
 
 from .config import V8Config
 
+try:
+    import triton
+    from .triton_kernels import memory_graph_routing_kernel, memory_graph_step_kernel
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 class MemoryGraph(nn.Module):
     """Memory graph with per-neuron modulators + dendritic FC, trained by ES.
@@ -149,9 +156,9 @@ class MemoryGraph(nn.Module):
             self.key.unsqueeze(0).expand(BS, -1, -1).float(),
         ], dim=-1)
 
-        x = torch.einsum('bnd,ndh->bnh', mod_input, self.fc1_w) + self.fc1_b
+        x = torch.einsum('bnd,ndh->bnh', mod_input, self.fc1_w.float()) + self.fc1_b.float()
         x = torch.tanh(x)
-        out = torch.einsum('bnh,nho->bno', x, self.fc2_w) + self.fc2_b
+        out = torch.einsum('bnh,nho->bno', x, self.fc2_w.float()) + self.fc2_b.float()
 
         gate_prim = torch.tanh(out[..., 0:1])
         gate_key = torch.tanh(out[..., 1:2])
@@ -269,7 +276,7 @@ class MemoryGraph(nn.Module):
     # ================================================================
 
     def get_es_params(self) -> dict[str, Tensor]:
-        """Get all ES-trainable parameter tensors."""
+        """Get all ES-trainable parameter tensors (per-neuron params only)."""
         params = {
             'primitives': self.primitives.data,
             'key': self.key.data,
@@ -278,7 +285,6 @@ class MemoryGraph(nn.Module):
             'fc1_b': self.fc1_b.data,
             'fc2_w': self.fc2_w.data,
             'fc2_b': self.fc2_b.data,
-            'mod_lr_logit': self.mod_lr_logit.data,
         }
         if self.use_dendritic_tree:
             params['dendrite_branch_w'] = self.dendrite_branch_w.data
@@ -308,10 +314,7 @@ class MemoryGraph(nn.Module):
         K_idx = neuron_ids
         for name, eps in noise.items():
             param = getattr(self, name)
-            if name in ('mod_lr_logit',):
-                param.data += sigma * eps  # scalar param
-            else:
-                param.data[K_idx] += sigma * eps
+            param.data[K_idx] += sigma * eps
 
     def apply_es_update(self, neuron_ids: Tensor,
                         weighted_noise: dict[str, Tensor], lr: float):
@@ -319,10 +322,7 @@ class MemoryGraph(nn.Module):
         K_idx = neuron_ids
         for name, update in weighted_noise.items():
             param = getattr(self, name)
-            if name in ('mod_lr_logit',):
-                param.data += lr * update
-            else:
-                param.data[K_idx] += lr * update
+            param.data[K_idx] += lr * update
 
     def detach_states(self):
         pass  # States are never on compute graph

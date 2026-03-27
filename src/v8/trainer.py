@@ -81,6 +81,16 @@ class V8Trainer:
                 self._es_pre_mg_params = {
                     k: v.clone() for k, v in mg.get_es_params().items()}
 
+        # Snapshot upper carries BEFORE forward (for ES replay)
+        pre_upper_carries = None
+        if self.use_memory:
+            split = self.config.scan_split_at
+            L = self.config.L_total
+            pre_upper_carries = [
+                self.model.lm._carries[split + i].clone()
+                if self.model.lm._carries[split + i] is not None else None
+                for i in range(L - split)]
+
         t_start = time.time()
 
         amp_ctx = torch.autocast(
@@ -124,12 +134,6 @@ class V8Trainer:
         es_metrics = {}
         if self.use_memory:
             eot_at = (input_ids == eot_id)
-            split = self.config.scan_split_at
-            L = self.config.L_total
-            pre_upper_carries = [
-                self.model.lm._carries[split + i].clone()
-                if self.model.lm._carries[split + i] is not None else None
-                for i in range(L - split)]
 
             self._es_buffer.append({
                 "cc_segments": result["cc_segments"],
