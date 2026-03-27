@@ -65,8 +65,8 @@ class TestInit:
         mg = MemoryGraph(cfg, torch.device("cpu"))
         N = cfg.N_neurons
         D, H, K = cfg.D_mem, cfg.neuron_hidden, cfg.K_connections
-        # W1 input is 3D (h, trace_h, trace_received) — MLP runs once per segment
-        expected_per_neuron = K + 1 + 3*D*H + H + H*D + D + H*3 + 3
+        # W1 input is 4D (h, received, trace_h, trace_received) — per-token MLP
+        expected_per_neuron = K + 1 + 4*D*H + H + H*D + D + H*3 + 3
         neuron_params = (mg.w_conn.numel() + mg.decay_logit.numel() +
                         mg.W1.numel() + mg.b1.numel() +
                         mg.W_msg.numel() + mg.b_msg.numel() +
