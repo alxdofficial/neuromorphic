@@ -107,7 +107,7 @@ class V8Config:
             # Memory: 1024 neurons, 96 presynaptic connections
             N_mem_neurons=1024, K_connections=96,
             pcm_hidden=256,
-            modulator_hidden=64,
+            modulator_hidden=16,
         )
         defaults.update(overrides)
         return cls(**defaults)

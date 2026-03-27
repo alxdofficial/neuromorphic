@@ -113,9 +113,10 @@ class V8Diagnostics:
                 metrics["pcm_pred_loss_max"] = round(max(per_cc_loss), 6)
 
             # === Per-neuron modulator stats ===
-            # Run modulator on current h to get gate/decay_mod
+            # Run modulator on current h to get gate/decay_mod (first batch element)
             if mg.h is not None and mg.h.shape[0] > 0:
-                gate_p, gate_k, decay_mod = mg._modulator_forward(mg.h[:1])
+                gate_p, gate_k, decay_mod = mg._modulator_forward(mg.h[:1, :],
+                    _trace_prim=mg.trace_prim[:1], _trace_key=mg.trace_key[:1])
                 metrics["mem_mod_gate_prim_mean"] = round(gate_p.mean().item(), 4)
                 metrics["mem_mod_gate_prim_std"] = round(gate_p.std().item(), 4)
                 metrics["mem_mod_gate_key_mean"] = round(gate_k.mean().item(), 4)
@@ -173,7 +174,8 @@ class V8Diagnostics:
 
             # Modulator gate distribution
             if mg.h is not None and mg.h.shape[0] > 0:
-                gate_p, gate_k, decay_mod = mg._modulator_forward(mg.h[:1])
+                gate_p, gate_k, decay_mod = mg._modulator_forward(
+                    mg.h[:1], _trace_prim=mg.trace_prim[:1], _trace_key=mg.trace_key[:1])
                 snapshot["mod_gate_prim"] = gate_p[0].cpu()  # [N, 1]
                 snapshot["mod_gate_key"] = gate_k[0].cpu()
                 snapshot["mod_decay_mod"] = decay_mod[0].cpu()

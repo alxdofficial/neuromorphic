@@ -97,6 +97,7 @@ class V8Model(nn.Module):
         for seg in range(n_segments):
             h_detached = h.detach()  # TBPTT cut
             seg_cc = cc_segments[:, seg]  # [BS, action_every, C, D_mem]
+
             seg_out, h = self.memory.forward_segment(seg_cc, h_detached)
             mem_out_list.append(seg_out)
 

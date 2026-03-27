@@ -183,102 +183,76 @@ def plot_training_curves(records, output_path):
         print(f"  Saved: {output_path}")
 
 
-def plot_rl_curves(records, output_path):
-    """GRPO loss, trajectory spread, exploration, entropy, gate distribution."""
-    rl_records = [r for r in records if "rl_grpo_loss" in r]
-    if not rl_records:
-        print("  No RL data found, skipping rl_curves")
+def plot_modulator_health(records, output_path):
+    """Per-neuron modulator: gates, decay modulation, traces, gradient norm."""
+    mod_records = [r for r in records if "mem_mod_gate_prim_mean" in r]
+    if not mod_records:
+        print("  No modulator data found, skipping modulator_health")
         return
 
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
-        fig.suptitle("RL / Neuromodulator", fontsize=16, fontweight="bold")
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle("Per-Neuron Modulator Health", fontsize=16, fontweight="bold")
 
-        steps = [r["step"] for r in rl_records]
+        steps = [r["step"] for r in mod_records]
 
-        # GRPO loss
+        # Gate prim: mean +/- std
         ax = axes[0, 0]
-        vals = [r["rl_grpo_loss"] for r in rl_records]
-        _plot_line(ax, steps, vals, C_GRPO)
-        _setup_ax(ax, "GRPO Loss")
+        gate_mean = np.array([r["mem_mod_gate_prim_mean"] for r in mod_records])
+        gate_std = np.array([r.get("mem_mod_gate_prim_std", 0) for r in mod_records])
+        _plot_line(ax, steps, gate_mean, C_GATE, "prim gate mean")
+        ax.fill_between(steps, gate_mean - gate_std, gate_mean + gate_std,
+                        alpha=0.15, color=C_GATE)
+        # Also plot key gate
+        key_gate = np.array([r.get("mem_mod_gate_key_mean", 0) for r in mod_records])
+        _plot_line(ax, steps, key_gate, C_KEY, "key gate mean")
+        ax.axhline(y=0, color="#999", linestyle="--", linewidth=0.8)
+        ax.legend()
+        _setup_ax(ax, "Modulator Gate Output", "gate [-1, 1]")
 
-        # Trajectory spread (best vs worst)
+        # Decay modulation
         ax = axes[0, 1]
-        has_traj = [r for r in rl_records if "rl_traj_loss_best" in r]
-        if has_traj:
-            t_steps = [r["step"] for r in has_traj]
-            best = [r["rl_traj_loss_best"] for r in has_traj]
-            worst = [r["rl_traj_loss_worst"] for r in has_traj]
-            _plot_line(ax, t_steps, best, C_TRAJ_BEST, "best trajectory")
-            _plot_line(ax, t_steps, worst, C_TRAJ_WORST, "worst trajectory")
-            ax.legend()
-        _setup_ax(ax, "GRPO Trajectory Spread", "z-score advantage")
+        dm_mean = [r.get("mem_mod_decay_mod_mean", 0) for r in mod_records]
+        dm_std = [r.get("mem_mod_decay_mod_std", 0) for r in mod_records]
+        _plot_line(ax, steps, dm_mean, C_DECAY, "mean")
+        _plot_line(ax, steps, dm_std, C_ENT, "std")
+        ax.legend()
+        _setup_ax(ax, "Decay Modulation", "decay_mod")
 
-        # Entropy
+        # Modulation learning rate
         ax = axes[0, 2]
-        vals = [r.get("rl_entropy", 0) for r in rl_records]
-        _plot_line(ax, steps, vals, C_ENT)
-        _setup_ax(ax, "Policy Entropy", "entropy")
-
-        # Exploration: logstd values (gate + decay)
-        ax = axes[1, 0]
-        s = get_steps(records, "nm_logstd_gate")
-        if s:
-            _plot_line(ax, s, get_field(records, "nm_logstd_gate"), C_GATE,
-                       "gate", linewidth=2.5)
-            _plot_line(ax, s, get_field(records, "nm_logstd_decay"), C_DECAY,
-                       "decay", linewidth=2.5)
-            ax.legend()
-        _setup_ax(ax, "Policy Log-Std (exploration)", "log_std")
-
-        # Gate distribution: mean ± std
-        ax = axes[1, 1]
-        s = get_steps(records, "nm_gate_mean")
-        if s:
-            gate_mean = np.array(get_field(records, "nm_gate_mean"))
-            gate_std = np.array(get_field(records, "nm_gate_std"))
-            _plot_line(ax, s, gate_mean, C_GATE, "gate mean")
-            ax.fill_between(s, gate_mean - gate_std, gate_mean + gate_std,
-                            alpha=0.15, color=C_GATE)
-            ax.axhline(y=0, color="#999", linestyle="--", linewidth=0.8)
-        _setup_ax(ax, "Neuromod Gate (mean \u00b1 std)", "gate value")
-
-        # Neuromod grad norm
-        ax = axes[1, 2]
-        vals = [r.get("rl_nm_grad_norm", 0) for r in rl_records]
-        _plot_line(ax, steps, vals, C_GRAD)
-        _setup_ax(ax, "Neuromod Gradient Norm")
+        mod_lr = [r.get("mem_mod_lr", 0) for r in mod_records]
+        _plot_line(ax, steps, mod_lr, C_TPUT)
+        _setup_ax(ax, "Modulation Step Size", "sigmoid(mod_lr_logit)")
 
         # Trace norms
-        ax = axes[2, 0]
-        s = get_steps(records, "nm_trace_prim_norm")
+        ax = axes[1, 0]
+        s = get_steps(mod_records, "mem_trace_prim_norm")
         if s:
-            _plot_line(ax, s, get_field(records, "nm_trace_prim_norm"), C_PRIM,
-                       "trace_prim")
-            _plot_line(ax, s, get_field(records, "nm_trace_key_norm"), C_KEY,
-                       "trace_key")
+            _plot_line(ax, s, get_field(mod_records, "mem_trace_prim_norm"),
+                       C_PRIM, "trace_prim")
+            _plot_line(ax, s, get_field(mod_records, "mem_trace_key_norm"),
+                       C_KEY, "trace_key")
             ax.legend()
         _setup_ax(ax, "Eligibility Trace Norms", "L2 norm")
 
-        # LM grad norm (important for joint training)
-        ax = axes[2, 1]
+        # Gradient norm
+        ax = axes[1, 1]
         s = get_steps(records, "grad_norm")
         if s:
-            vals = get_field(records, "grad_norm")
-            _plot_line(ax, s, vals, C_LOSS, "LM grad")
-        # Overlay neuromod grad on same plot for comparison
-        if rl_records:
-            nm_vals = [r.get("rl_nm_grad_norm", 0) for r in rl_records]
-            _plot_line(ax, steps, nm_vals, C_GATE, "neuromod grad")
-        ax.legend()
-        _setup_ax(ax, "Gradient Norms (LM vs Neuromod)")
+            _plot_line(ax, s, get_field(records, "grad_norm"), C_LOSS)
+        _setup_ax(ax, "Gradient Norm (all params)")
 
-        # Decay diversity (std of decay across neurons)
-        ax = axes[2, 2]
-        s = get_steps(records, "mem_decay_std")
+        # Drift from init (prim + key)
+        ax = axes[1, 2]
+        s = get_steps(mod_records, "mem_prim_drift")
         if s:
-            _plot_line(ax, s, get_field(records, "mem_decay_std"), C_DECAY)
-        _setup_ax(ax, "Decay Diversity", "std across neurons")
+            _plot_line(ax, s, get_field(mod_records, "mem_prim_drift"),
+                       C_PRIM, "prim drift")
+            _plot_line(ax, s, get_field(mod_records, "mem_key_drift"),
+                       C_KEY, "key drift")
+            ax.legend()
+        _setup_ax(ax, "Parameter Drift from Init", "L2 distance")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
