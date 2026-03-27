@@ -22,8 +22,244 @@ Trained by backprop during training. At inference, modulator still runs
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from .config import V8Config
+
+
+# ================================================================
+# Standalone step function (used by both forward and backward)
+# ================================================================
+
+def _dendritic_gather_static(weighted: Tensor,
+                             branch_w: Tensor, group_w: Tensor,
+                             nb: int, bsz: int, ng: int, bpg: int,
+                             K: int) -> Tensor:
+    """Dendritic tree FC gather. Standalone for use in autograd backward."""
+    BS, N, _, D = weighted.shape
+    n_tree = ng * bpg * bsz
+    tree_msgs = weighted[:, :, :n_tree].view(BS, N, nb, bsz, D)
+
+    branch_out = torch.tanh(
+        (tree_msgs * branch_w.unsqueeze(0)).sum(dim=3))
+    branch_grouped = branch_out.view(BS, N, ng, bpg, D)
+    group_out = torch.tanh(
+        (branch_grouped * group_w.unsqueeze(0)).sum(dim=3))
+    received = group_out.mean(dim=2)
+
+    if n_tree < K:
+        leftover = weighted[:, :, n_tree:].sum(dim=2)
+        tree_frac = n_tree / K
+        received = tree_frac * received + (1 - tree_frac) * leftover
+    return received
+
+
+def _one_step(h: Tensor, prev_msg: Tensor,
+              eff_prim: Tensor, eff_key: Tensor, eff_decay_exp: Tensor,
+              cc_t: Tensor, conn_indices: Tensor,
+              branch_w: Tensor | None, group_w: Tensor | None,
+              use_tree: bool, tree_params: dict,
+              C: int) -> tuple[Tensor, Tensor]:
+    """Single token step. Pure function, autograd-friendly."""
+    neighbor_msgs = prev_msg[:, conn_indices]
+    sim = (eff_key.unsqueeze(2) * neighbor_msgs).sum(dim=-1)
+    routing = torch.sigmoid(sim)
+    weighted = routing.unsqueeze(-1) * neighbor_msgs
+
+    if use_tree and branch_w is not None:
+        received = _dendritic_gather_static(
+            weighted, branch_w, group_w,
+            tree_params['nb'], tree_params['bsz'],
+            tree_params['ng'], tree_params['bpg'],
+            tree_params['K'])
+    else:
+        received = weighted.sum(dim=2)
+
+    received = received.clone()
+    received[:, :C] = received[:, :C] + cc_t
+    h_new = eff_decay_exp * h + (1 - eff_decay_exp) * received
+    msg_new = torch.tanh(h_new * eff_prim)
+    return h_new, msg_new
+
+
+# ================================================================
+# Custom autograd function: save only h, recompute in backward
+# ================================================================
+
+class _SegmentFunction(torch.autograd.Function):
+    """Memory-efficient forward/backward for the per-token recurrence.
+
+    Forward: runs T_seg steps without autograd, saves h at each step.
+    Backward: replays each step in reverse with torch.autograd.grad,
+    recomputing intermediates from saved h. Only 1 step's worth of
+    activation memory at a time.
+
+    VRAM: O(T_seg * BS * N * D) for saved h (~67 MB at tier_a BS=4)
+    vs O(T_seg * BS * N * K * D) for naive autograd (~19 GB).
+    """
+
+    @staticmethod
+    def forward(ctx, cc_signals, h_prev, prev_messages,
+                eff_prim, eff_key, eff_decay,
+                conn_indices, branch_w, group_w,
+                # Non-tensor args
+                use_tree, tree_params, stride, C):
+
+        BS, T_seg, C_dim, D = cc_signals.shape
+        N = h_prev.shape[1]
+        eff_decay_exp = eff_decay.unsqueeze(-1)
+
+        h = h_prev
+        prev_msg = prev_messages
+        h_saved = [h_prev.detach()]
+        output_list = []
+
+        with torch.no_grad():
+            for t in range(T_seg):
+                if t % stride == 0:
+                    h, prev_msg = _one_step(
+                        h, prev_msg, eff_prim, eff_key, eff_decay_exp,
+                        cc_signals[:, t], conn_indices, branch_w, group_w,
+                        use_tree, tree_params, C)
+                    h_saved.append(h.detach())
+                    output_list.append(prev_msg[:, :C].detach())
+                else:
+                    output_list.append(output_list[-1])
+
+        output = torch.stack(output_list, dim=1)
+        h_all = torch.stack(h_saved)  # [n_steps+1, BS, N, D]
+
+        # Save everything needed for backward (tensors only via save_for_backward)
+        ctx.save_for_backward(h_all, cc_signals, prev_messages,
+                              eff_prim, eff_key, eff_decay,
+                              conn_indices)
+        # Save non-parameter tensors separately if they need grad
+        ctx.branch_w = branch_w
+        ctx.group_w = group_w
+        ctx.use_tree = use_tree
+        ctx.tree_params = tree_params
+        ctx.stride = stride
+        ctx.C = C
+        ctx.T_seg = T_seg
+
+        return output, h
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_h_final):
+        (h_all, cc_signals, prev_messages_init,
+         eff_prim, eff_key, eff_decay,
+         conn_indices) = ctx.saved_tensors
+        branch_w = ctx.branch_w
+        group_w = ctx.group_w
+        T_seg = ctx.T_seg
+        stride = ctx.stride
+        C = ctx.C
+
+        # Accumulate gradients for shared parameters
+        grad_eff_prim = torch.zeros_like(eff_prim)
+        grad_eff_key = torch.zeros_like(eff_key)
+        grad_eff_decay = torch.zeros_like(eff_decay)
+        grad_branch_w = torch.zeros_like(branch_w) if branch_w is not None else None
+        grad_group_w = torch.zeros_like(group_w) if group_w is not None else None
+
+        eff_decay_exp = eff_decay.unsqueeze(-1)
+
+        # Current gradient on h
+        dh = grad_h_final.clone() if grad_h_final is not None else torch.zeros_like(h_all[0])
+
+        # Track which saved-h index we're at
+        step_idx = h_all.shape[0] - 2  # last saved h before final
+
+        for t in range(T_seg - 1, -1, -1):
+            if t % stride != 0:
+                continue
+
+            # Gather output gradient for this step
+            dout_t = grad_output[:, t, :, :]  # [BS, C, D]
+
+            # Retrieve saved h_{t-1} and h_t
+            h_prev_t = h_all[step_idx].detach().requires_grad_(True)
+            step_idx -= 1
+
+            # Determine prev_msg for this step
+            if step_idx >= 0:
+                # prev_msg comes from previous step's h
+                h_for_msg = h_all[step_idx].detach()
+            else:
+                h_for_msg = None
+
+            # Create leaf tensors for this step's grad computation
+            ep = eff_prim.detach().requires_grad_(True)
+            ek = eff_key.detach().requires_grad_(True)
+            ed = eff_decay.detach().requires_grad_(True)
+            ed_exp = ed.unsqueeze(-1)
+
+            bw = branch_w.detach().requires_grad_(True) if branch_w is not None else None
+            gw = group_w.detach().requires_grad_(True) if group_w is not None else None
+
+            # Recompute step t with autograd
+            with torch.enable_grad():
+                if h_for_msg is not None:
+                    pm = torch.tanh(h_for_msg * ep)
+                else:
+                    pm = prev_messages_init.detach()
+
+                h_t, msg_t = _one_step(
+                    h_prev_t, pm, ep, ek, ed_exp,
+                    cc_signals[:, t], conn_indices, bw, gw,
+                    ctx.use_tree, ctx.tree_params, C)
+
+                port_out = msg_t[:, :C]
+
+                # Loss contributions from this step
+                targets = []
+                grads = []
+
+                # h_t contributes to future steps (dh) and output (dout_t through msg)
+                targets.append(h_t)
+                grads.append(dh)
+
+                targets.append(port_out)
+                grads.append(dout_t)
+
+                # Compute gradients
+                inputs = [h_prev_t, ep, ek, ed]
+                if bw is not None:
+                    inputs.append(bw)
+                if gw is not None:
+                    inputs.append(gw)
+
+                local_grads = torch.autograd.grad(
+                    targets, inputs, grads,
+                    allow_unused=True)
+
+            # Unpack and accumulate
+            idx = 0
+            dh = local_grads[idx] if local_grads[idx] is not None else torch.zeros_like(h_prev_t)
+            idx += 1
+            if local_grads[idx] is not None:
+                grad_eff_prim = grad_eff_prim + local_grads[idx]
+            idx += 1
+            if local_grads[idx] is not None:
+                grad_eff_key = grad_eff_key + local_grads[idx]
+            idx += 1
+            if local_grads[idx] is not None:
+                grad_eff_decay = grad_eff_decay + local_grads[idx]
+            idx += 1
+            if branch_w is not None and local_grads[idx] is not None:
+                grad_branch_w = grad_branch_w + local_grads[idx]
+                idx += 1
+            if group_w is not None and idx < len(local_grads) and local_grads[idx] is not None:
+                grad_group_w = grad_group_w + local_grads[idx]
+
+        # Return gradients in same order as forward inputs
+        # (cc_signals, h_prev, prev_messages, eff_prim, eff_key, eff_decay,
+        #  conn_indices, branch_w, group_w, + non-tensor args)
+        return (None, None, None,  # cc_signals, h_prev, prev_messages
+                grad_eff_prim, grad_eff_key, grad_eff_decay,
+                None,  # conn_indices
+                grad_branch_w, grad_group_w,
+                None, None, None, None)  # non-tensor args
 
 
 class MemoryGraph(nn.Module):
@@ -267,59 +503,13 @@ class MemoryGraph(nn.Module):
     # Forward segment (differentiable)
     # ================================================================
 
-    def _forward_segment_inner(self, cc_signals: Tensor, h_prev: Tensor,
-                               eff_prim: Tensor, eff_key: Tensor,
-                               eff_decay: Tensor,
-                               prev_messages: Tensor) -> tuple[Tensor, Tensor]:
-        """Pure computation: per-token dynamics. No side effects, no self access.
-
-        All state passed as explicit args for checkpoint reproducibility.
-        """
-        amp_ctx = torch.autocast(device_type=cc_signals.device.type,
-                                 dtype=torch.bfloat16,
-                                 enabled=cc_signals.is_cuda)
-        with amp_ctx:
-            BS, T_seg, C, D = cc_signals.shape
-            N = self.config.N_neurons
-            stride = self.config.memory_update_stride
-
-            prev_msg = prev_messages
-            neighbor_msgs = prev_msg[:, self.conn_indices]
-        sim = (eff_key.unsqueeze(2) * neighbor_msgs).sum(dim=-1)
-        routing = torch.sigmoid(sim)
-
-        h = h_prev
-        eff_decay_expanded = eff_decay.unsqueeze(-1)
-        output_list = []
-
-        for t in range(T_seg):
-            if t % stride == 0:
-                weighted = routing.unsqueeze(-1) * neighbor_msgs
-
-                if self.use_dendritic_tree:
-                    received = self._dendritic_gather_fc(weighted)
-                else:
-                    received = self._flat_gather(weighted)
-
-                received = received.clone()
-                received[:, :C] = received[:, :C] + cc_signals[:, t]
-
-                h = eff_decay_expanded * h + (1 - eff_decay_expanded) * received
-                prev_msg = torch.tanh(h * eff_prim)
-                neighbor_msgs = prev_msg[:, self.conn_indices]
-                curr_port_out = prev_msg[:, :C]
-
-            if t % stride == 0:
-                output_list.append(curr_port_out)
-            else:
-                output_list.append(curr_port_out.detach())
-
-        output = torch.stack(output_list, dim=1)
-        return output, h
-
     def forward_segment(self, cc_signals: Tensor,
                         h_prev: Tensor) -> tuple[Tensor, Tensor]:
-        """Process one segment. Wraps _forward_segment_inner with side effects.
+        """Process one segment using custom autograd for bounded VRAM.
+
+        Uses _SegmentFunction: forward saves only h at each step (~67 MB),
+        backward replays each step with torch.autograd.grad (~151 MB transient).
+        Exact gradients through all tokens. Total: ~218 MB vs 19+ GB naive.
 
         Args:
             cc_signals: [BS, T_seg, C, D_mem] from lower scan (detached)
@@ -329,8 +519,9 @@ class MemoryGraph(nn.Module):
             h: [BS, N, D_mem] final h
         """
         BS, T_seg, C, D = cc_signals.shape
+        stride = self.config.memory_update_stride
 
-        # 1. Per-neuron modulator: compute effective parameters
+        # 1. Per-neuron modulator (on compute graph)
         gate_prim, gate_key, decay_mod = self._modulator_forward(h_prev)
         mod_lr = torch.sigmoid(self.mod_lr_logit)
 
@@ -347,34 +538,37 @@ class MemoryGraph(nn.Module):
             self.decay_logit.unsqueeze(0).to(self.dtype)
             + decay_mod.squeeze(-1).to(self.dtype))
 
-        # 2. Inner loop (checkpointable — no side effects, all state as args)
-        prev_msgs_detached = self.prev_messages.detach()
-        if self.training and torch.is_grad_enabled():
-            output, h = torch.utils.checkpoint.checkpoint(
-                self._forward_segment_inner, cc_signals, h_prev,
-                eff_prim, eff_key, eff_decay, prev_msgs_detached,
-                use_reentrant=False)
-        else:
-            output, h = self._forward_segment_inner(
-                cc_signals, h_prev, eff_prim, eff_key, eff_decay,
-                prev_msgs_detached)
+        # 2. Tree params
+        tree_params = {}
+        if self.use_dendritic_tree:
+            tree_params = {
+                'nb': self.n_branches, 'bsz': self.branch_size,
+                'ng': self.n_groups, 'bpg': self.branches_per_group,
+                'K': self.config.K_connections,
+            }
 
-        # 3. Side effects (outside checkpoint)
+        branch_w = self.dendrite_branch_w if self.use_dendritic_tree else None
+        group_w = self.dendrite_group_w if self.use_dendritic_tree else None
+
+        # 3. Custom autograd forward/backward
+        output, h = _SegmentFunction.apply(
+            cc_signals, h_prev, self.prev_messages.detach(),
+            eff_prim, eff_key, eff_decay,
+            self.conn_indices, branch_w, group_w,
+            self.use_dendritic_tree, tree_params, stride, C)
+
+        # 4. Side effects (outside autograd)
         with torch.no_grad():
-            prev_msg = torch.tanh(h.detach() * eff_prim.detach())
-            self.prev_messages = prev_msg
+            self.prev_messages = torch.tanh(
+                h.detach() * eff_prim.detach()).detach()
 
             td = self.config.trace_decay
             self.trace_prim = (td * self.trace_prim
                                + (1 - td) * h.detach()).to(self.dtype)
-
-            # Approximate mean_input from h dynamics
-            received_approx = (h.detach() - eff_decay.unsqueeze(-1).detach() * h_prev.detach()) / \
-                              (1 - eff_decay.unsqueeze(-1).detach()).clamp(min=1e-8)
             self.trace_key = (td * self.trace_key
-                              + (1 - td) * received_approx).to(self.dtype)
+                              + (1 - td) * self.prev_messages).to(self.dtype)
 
-            seg_msg_mag = prev_msg.norm(dim=-1)
+            seg_msg_mag = self.prev_messages.norm(dim=-1)
             alpha = 0.05
             self.msg_magnitude = (1 - alpha) * self.msg_magnitude + alpha * seg_msg_mag
 

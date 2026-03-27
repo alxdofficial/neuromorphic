@@ -108,6 +108,7 @@ class V8Config:
             N_mem_neurons=1024, K_connections=96,
             pcm_hidden=256,
             modulator_hidden=16,
+            action_every=128,
         )
         defaults.update(overrides)
         return cls(**defaults)
