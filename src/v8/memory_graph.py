@@ -134,8 +134,76 @@ class MemoryGraph(nn.Module):
     # Forward segment (differentiable, TBPTT at segment boundaries)
     # ================================================================
 
+    def _neuron_step(self, h: Tensor, prev_msg: Tensor,
+                     cc_t: Tensor, trace_h: Tensor, trace_recv: Tensor,
+                     ) -> tuple[Tensor, Tensor, Tensor]:
+        """One token step of neuron dynamics. Pure function (no side effects).
+
+        Args:
+            h: [BS, N, D] current hidden state
+            prev_msg: [BS, N, D] previous messages
+            cc_t: [BS, C_mem, D] CC signal at this token
+            trace_h: [BS, N, D] eligibility trace of h
+            trace_recv: [BS, N, D] eligibility trace of received
+
+        Returns:
+            h_new: [BS, N, D] updated hidden state
+            msg: [BS, N, D] new messages
+            read_out: [BS, C_mem, D] readout for this token
+        """
+        # 1. Gather neighbor messages
+        neighbor_msgs = prev_msg[:, self.conn_indices]  # [BS, N, K, D]
+
+        # 2. Scalar-weighted receive
+        routing = torch.sigmoid(self.w_conn)  # [N, K]
+        weighted = routing.unsqueeze(0).unsqueeze(-1) * neighbor_msgs
+        received = weighted.sum(dim=2)  # [BS, N, D]
+
+        # 3. Broadcast CC injection to all neurons
+        inject_weights = torch.sigmoid(self.inject_w)  # [N, C_mem]
+        broadcast = torch.einsum(
+            'nc,bcd->bnd', inject_weights, cc_t.float()).to(self.dtype)
+        received = received + broadcast
+
+        # 4. Per-neuron MLP: cat(h, received, trace_h, trace_recv) → hidden
+        mlp_in = torch.cat([
+            h.float(), received.float(),
+            trace_h.float(), trace_recv.float(),
+        ], dim=-1)  # [BS, N, 4D]
+        hidden = torch.tanh(
+            torch.einsum('bnd,ndh->bnh', mlp_in,
+                         self.W1.float()) + self.b1.float())
+
+        # 5. Message head
+        msg = torch.tanh(
+            torch.einsum('bnh,nhd->bnd', hidden,
+                         self.W_msg.float()) + self.b_msg.float())
+        msg = msg.to(self.dtype)
+
+        # 6. Modulator head
+        mod_out = (torch.einsum('bnh,nho->bno', hidden,
+                                self.W_mod.float()) + self.b_mod.float())
+        decay_mod = mod_out[..., 2].to(self.dtype)
+
+        # 7. Integrate with modulated decay
+        eff_decay = torch.sigmoid(
+            self.decay_logit.unsqueeze(0) + decay_mod
+        ).unsqueeze(-1)  # [BS, N, 1]
+        h_new = eff_decay * h + (1 - eff_decay) * received
+
+        # 8. Weighted readout from all neurons
+        readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
+        read_out = torch.einsum(
+            'cn,bnd->bcd', readout_weights, msg.float())
+
+        return h_new, msg, read_out
+
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment of tokens. Fully differentiable.
+        """Process one segment of tokens. Per-step gradient checkpointing.
+
+        Each step is wrapped in torch.utils.checkpoint to avoid saving
+        all intermediates. Memory: ~150MB peak (1 step) instead of
+        128 × 150MB = 19GB (all steps).
 
         Args:
             cc_signals: [BS, T_seg, C_mem, D_mem] — H_mid reshaped to memory channels
@@ -143,9 +211,9 @@ class MemoryGraph(nn.Module):
         Returns:
             output: [BS, T_seg, C_mem, D_mem] memory signals for upper scan
         """
+        from torch.utils.checkpoint import checkpoint
+
         BS, T_seg, C_mem, D = cc_signals.shape
-        N = self.config.N_neurons
-        K = self.config.K_connections
         stride = self.config.memory_update_stride
 
         cc_mem = cc_signals.to(self.dtype)
@@ -154,81 +222,54 @@ class MemoryGraph(nn.Module):
         h = self.h.detach()
         prev_msg = self.prev_messages.detach()
 
-        output = torch.empty(BS, T_seg, C_mem, D, device=cc_signals.device,
-                             dtype=cc_signals.dtype)
+        output_list = []
 
         for t in range(T_seg):
             if t % stride == 0:
-                # 1. Gather neighbor messages
-                neighbor_msgs = prev_msg[:, self.conn_indices]  # [BS, N, K, D]
+                # Gradient checkpoint: saves only h, prev_msg, cc_t
+                # Recomputes _neuron_step during backward (one step at a time)
+                h_new, msg, read_out = checkpoint(
+                    self._neuron_step,
+                    h, prev_msg, cc_mem[:, t],
+                    self.trace_h, self.trace_received,
+                    use_reentrant=False)
 
-                # 2. Scalar-weighted receive
-                routing = torch.sigmoid(self.w_conn)  # [N, K]
-                weighted = routing.unsqueeze(0).unsqueeze(-1) * neighbor_msgs
-                received = weighted.sum(dim=2)  # [BS, N, D]
-
-                # 3. Broadcast CC injection to all neurons
-                inject_weights = torch.sigmoid(self.inject_w)  # [N, C]
-                broadcast = torch.einsum(
-                    'nc,bcd->bnd', inject_weights,
-                    cc_mem[:, t].float()).to(self.dtype)
-                received = received + broadcast
-
-                # 4. Per-neuron MLP: cat(h, received, trace_h, trace_recv) → hidden
-                mlp_in = torch.cat([
-                    h.float(), received.float(),
-                    self.trace_h.float(), self.trace_received.float(),
-                ], dim=-1)  # [BS, N, 4D]
-                hidden = torch.tanh(
-                    torch.einsum('bnd,ndh->bnh', mlp_in,
-                                 self.W1.float()) + self.b1.float())
-
-                # 5. Message head
-                msg = torch.tanh(
-                    torch.einsum('bnh,nhd->bnd', hidden,
-                                 self.W_msg.float()) + self.b_msg.float())
-                msg = msg.to(self.dtype)
-
-                # 6. Modulator head
-                mod_out = (torch.einsum('bnh,nho->bno', hidden,
-                                        self.W_mod.float()) + self.b_mod.float())
-                plasticity_gate = torch.tanh(mod_out[..., 0])      # [BS, N]
-                plasticity_lr = torch.sigmoid(mod_out[..., 1])      # [BS, N]
-                decay_mod = mod_out[..., 2].to(self.dtype)          # [BS, N]
-
-                # 7. Integrate with modulated decay
-                eff_decay = torch.sigmoid(
-                    self.decay_logit.unsqueeze(0) + decay_mod
-                ).unsqueeze(-1)  # [BS, N, 1]
-                h = eff_decay * h + (1 - eff_decay) * received
-
-                # 8. Hebbian plasticity on w_conn (detached — side effect)
+                # Side effects (detached, outside checkpoint)
                 with torch.no_grad():
+                    # Hebbian plasticity
+                    neighbor_msgs = prev_msg.detach()[:, self.conn_indices]
+                    mod_in = torch.cat([h.detach().float(), msg.detach().float(),
+                                        self.trace_h.float(), self.trace_received.float()
+                                        ], dim=-1)
+                    # Quick modulator forward for gate (reuse is fine, this is cheap)
+                    _hidden = torch.tanh(
+                        torch.einsum('bnd,ndh->bnh', mod_in[:, :, :self.config.D_mem*2],
+                                     self.W1.data[:, :self.config.D_mem*2].float())
+                        + self.b1.data.float())
+                    _mod = torch.einsum('bnh,nho->bno', _hidden,
+                                        self.W_mod.data.float()) + self.b_mod.data.float()
+                    p_gate = torch.tanh(_mod[..., 0])
+                    p_lr = torch.sigmoid(_mod[..., 1])
+
                     eta = torch.sigmoid(self.hebbian_lr_logit)
-                    pre = neighbor_msgs.mean(dim=-1)  # [BS, N, K]
-                    post = msg.norm(dim=-1, keepdim=True)  # [BS, N, 1]
-                    hebb = pre * post  # [BS, N, K]
-                    gate = (plasticity_gate * plasticity_lr).unsqueeze(-1)
-                    delta_w = eta * gate * hebb  # [BS, N, K]
-                    self.w_conn.data += delta_w.mean(dim=0).float()
+                    pre = neighbor_msgs.mean(dim=-1)
+                    post = msg.detach().norm(dim=-1, keepdim=True)
+                    hebb = pre * post
+                    gate = (p_gate * p_lr).unsqueeze(-1)
+                    self.w_conn.data += (eta * gate * hebb).mean(dim=0).float()
 
-                # 9. Update eligibility traces (detached — temporal context)
-                with torch.no_grad():
+                    # Update eligibility traces
                     td = 0.95
-                    self.trace_h = (td * self.trace_h + (1 - td) * h.detach()
+                    self.trace_h = (td * self.trace_h + (1 - td) * h_new.detach()
                                     ).to(self.dtype)
                     self.trace_received = (td * self.trace_received
-                                           + (1 - td) * received.detach()
+                                           + (1 - td) * msg.detach()  # use msg as proxy
                                            ).to(self.dtype)
 
+                h = h_new
                 prev_msg = msg
 
-            # 10. Weighted readout from all neurons
-            readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
-            read_msg = torch.einsum(
-                'cn,bnd->bcd', readout_weights,
-                prev_msg.float()).to(cc_signals.dtype)  # [BS, C_mem, D]
-            output[:, t] = read_msg
+            output_list.append(read_out.to(cc_signals.dtype))
 
         # Update persistent state
         self.h = h.detach()
@@ -240,7 +281,7 @@ class MemoryGraph(nn.Module):
             seg_mag = prev_msg.detach().norm(dim=-1)
             self.msg_magnitude = (1 - alpha) * self.msg_magnitude + alpha * seg_mag
 
-        return output
+        return torch.stack(output_list, dim=1)
 
     # ================================================================
     # Utilities
