@@ -1,5 +1,11 @@
 # Design Notes: Energy Conservation + Autonomous Plasticity
 
+> **NOTE (v9):** This document describes v8's autonomous plasticity design
+> (co-activation, structural plasticity, RL-gated Hebbian). In v9, these are
+> replaced by: per-neuron dendritic FC layers (learned weights replace structural
+> plasticity), per-neuron modulator MLP (backprop replaces RL gating), and
+> end-to-end differentiable training. Kept for historical context.
+
 ## Changes Summary
 
 ### 1. Connection Weight Routing (Historical -> Key-Based Sigmoid)
