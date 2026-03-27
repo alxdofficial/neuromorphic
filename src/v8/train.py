@@ -1,5 +1,4 @@
-"""
-Entry point for v8 Neural Memory Graph training.
+"""Entry point for v8/v9 training.
 
 Usage:
     python -m src.v8.train                        # defaults
@@ -7,7 +6,7 @@ Usage:
     python -m src.v8.train --no-memory             # LM-only baseline (no memory graph)
     python -m src.v8.train --no-compile            # disable torch.compile
 
-Trains the v8 model with joint LM backprop + sampling-based RL for neuromodulator.
+End-to-end backprop: LM + differentiable memory graph trained jointly.
 """
 
 import argparse
@@ -49,7 +48,7 @@ SAVE_DIR = "outputs/v8"
 # ============================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="v8 Neural Memory Graph training")
+    p = argparse.ArgumentParser(description="v8/v9 training")
     p.add_argument("--bs", type=int, default=BS)
     p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--steps", type=int, default=MAX_STEPS)
@@ -61,8 +60,6 @@ def parse_args():
     p.add_argument("--tokenizer", type=str, default=TOKENIZER)
     p.add_argument("--no-memory", action="store_true",
                    help="Disable memory graph (LM-only baseline)")
-    p.add_argument("--no-neuromod", action="store_true",
-                   help="Memory ON but neuromod OFF (Phase 1: LM + frozen memory graph)")
     p.add_argument("--compile", action="store_true", default=None)
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--grad-ckpt", action="store_true", default=False,
@@ -72,15 +69,11 @@ def parse_args():
     p.add_argument("--snapshot-interval", type=int, default=1000,
                    help="Memory graph snapshot interval (0=disabled)")
     p.add_argument("--plot-interval", type=int, default=500,
-                   help="Plot generation interval (0=only at snapshots/checkpoints)")
+                   help="Plot generation interval")
     p.add_argument("--resume", type=str, default=None,
-                   help="Resume from checkpoint path (loads LM + neuromod + optimizer state)")
-    p.add_argument("--freeze-lower", action="store_true", default=False,
-                   help="Freeze lower scan layers + embedding + output head (upper scan + gate trainable)")
-    p.add_argument("--freeze-lm", action="store_true", default=False,
-                   help="Freeze entire LM (all layers + gate). Only neuromod trains.")
-    p.add_argument("--action-every", type=int, default=None,
-                   help="Override action_every (segment length). Default: from config (256)")
+                   help="Resume from checkpoint path")
+    p.add_argument("--mem-lr-scale", type=float, default=0.3,
+                   help="Memory graph LR = LM_LR * this scale (default 0.3)")
     return p.parse_args()
 
 
@@ -111,31 +104,30 @@ def main():
     if args.compile is not None:
         config.use_compile = args.compile
     config.gradient_checkpointing = args.grad_ckpt
-    if args.action_every is not None:
-        config.action_every = args.action_every
     config.validate()
 
     bs = args.bs
     T = config.T
     tokens_per_step = bs * T
     print(f"\nConfig: D={config.D}, C={config.C}, D_cc={config.D_cc}")
-    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, d_inner={config.d_inner}")
+    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, "
+          f"d_inner={config.d_inner}")
     print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
           f"D_mem={config.D_mem}")
-    print(f"  Neuromod: hidden={config.neuromod_hidden}, layers={config.neuromod_layers}, "
-          f"action_every={config.action_every}")
+    print(f"  Modulator: hidden={config.modulator_hidden}")
     print(f"  Training: BS={bs}, T={T}, tokens/step={tokens_per_step:,}")
-    print(f"  RL: GRPO (K={config.rl_counterfactual_k}, N_traj={config.rl_counterfactual_n}), "
-          f"collect={config.rl_collect_chunks} chunks, "
-          f"action_every={config.action_every}")
+    print(f"  Segments: {config.segments_per_chunk} per chunk, "
+          f"{config.action_every} tokens each")
 
     # Model
     model = V8Model(config)
     if device.type == "cuda":
         model = model.to(device).to(torch.bfloat16)
-        # Keep neuromod in float32 — RL gradients are tiny and get
-        # rounded away in bf16 (precision ~0.004 near typical values)
-        model.neuromod = model.neuromod.float()
+        # Keep memory graph modulator params in float32 for precision
+        for name, param in model.memory.named_parameters():
+            if 'fc1' in name or 'fc2' in name or 'mod_lr' in name:
+                param.data = param.data.float()
+
     else:
         model = model.to(device)
 
@@ -144,106 +136,51 @@ def main():
     if args.resume:
         print(f"\nResuming from: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.lm.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if "neuromod_state_dict" in ckpt:
-            model.neuromod.load_state_dict(ckpt["neuromod_state_dict"], strict=False)
-            # In Phase 2 (--freeze-lm), reset logstd to config init so
-            # exploration isn't locked to Phase 1's (untrained) values
-            if args.freeze_lm:
-                init_val = config.neuromod_logstd_init
-                model.neuromod.gate_logstd.data.fill_(init_val)
-                model.neuromod.decay_logstd.data.fill_(init_val)
-                print(f"  Reset logstd to {init_val} (config init for Phase 2)")
-        if "memory_graph_state" in ckpt:
-            # Defer memory graph restore — need BS from first batch
-            _pending_mg_state = ckpt["memory_graph_state"]
-            print(f"  Memory graph state found in checkpoint (will restore on first batch)")
-        else:
-            _pending_mg_state = None
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_step = ckpt.get("step", 0)
-        print(f"  Loaded LM + neuromod from step {start_step}")
+        print(f"  Loaded model from step {start_step}")
+        if "memory_runtime_state" in ckpt:
+            model.memory.load_runtime_state(ckpt["memory_runtime_state"])
+            model._states_initialized = True
+            print(f"  Restored memory graph runtime state")
         del ckpt
 
-    lm_params = model.lm.param_count()
     total_params = model.param_count()
+    lm_params = model.lm_param_count()
+    mem_params = model.memory_param_count()
     print(f"\nParameters: {total_params:,} ({total_params/1e6:.1f}M)")
     print(f"  LM: {lm_params:,} ({lm_params/1e6:.1f}M)")
-    print(f"  Neuromod: {total_params - lm_params:,} ({(total_params-lm_params)/1e6:.1f}M)")
+    print(f"  Memory graph: {mem_params:,} ({mem_params/1e6:.1f}M)")
 
-    # Freeze entire LM (Phase 2: only neuromod trains)
-    if args.freeze_lm:
-        frozen_count = 0
-        for param in model.lm.parameters():
-            param.requires_grad = False
-            frozen_count += param.numel()
-        print(f"\n*** FREEZE-LM: frozen ALL {frozen_count:,} LM params. "
-              f"Only neuromod trains. ***")
-
-    # Freeze lower scan + embedding + output head (alternative: upper scan + gate stay trainable)
-    elif args.freeze_lower:
-        frozen_count = 0
-        for name, param in model.lm.named_parameters():
-            # Freeze: embedding, proj_up, lower scan layers (0..split-1), lm_head, ln_final
-            # Trainable: upper scan layers (split..L-1), mem_gate, PCM, proj_down
-            is_lower_layer = False
-            if "layers." in name:
-                layer_idx = int(name.split("layers.")[1].split(".")[0])
-                is_lower_layer = layer_idx < config.scan_split_at
-
-            should_freeze = (
-                "embedding" in name or
-                "proj_up" in name or
-                "lm_head" in name or
-                "ln_final" in name or
-                is_lower_layer
-            )
-            if should_freeze:
-                param.requires_grad = False
-                frozen_count += param.numel()
-
-        trainable = sum(p.numel() for p in model.lm.parameters() if p.requires_grad)
-        print(f"\n*** FREEZE-LOWER: frozen {frozen_count:,} LM params, "
-              f"{trainable:,} trainable ***")
-
-    # Disable memory if requested (LM-only baseline)
-    if args.no_memory:
-        print("\n*** MEMORY DISABLED — LM-only baseline ***")
-    elif args.no_neuromod:
-        print("\n*** NEUROMOD DISABLED — Phase 1: LM + frozen memory graph ***")
-
-    # Compile individual methods (not the module — we call named methods, not forward())
+    # Compile
     if config.use_compile and device.type == "cuda":
         print("Compiling model methods...")
         model.lm.forward_scan_lower = torch.compile(model.lm.forward_scan_lower)
         model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
         model.lm.forward_output = torch.compile(model.lm.forward_output)
-        model.neuromod.get_action_and_value = torch.compile(
-            model.neuromod.get_action_and_value)
 
-    # LM Optimizer — exclude biases and norms from weight decay
-    decay_params = []
-    no_decay_params = []
+    # Single optimizer with param groups
+    lm_decay_params = []
+    lm_no_decay_params = []
     for name, param in model.lm.named_parameters():
         if not param.requires_grad:
             continue
         if param.ndim <= 1 or name.endswith(".bias"):
-            no_decay_params.append(param)
+            lm_no_decay_params.append(param)
         else:
-            decay_params.append(param)
+            lm_decay_params.append(param)
 
-    lm_optimizer = torch.optim.AdamW(
+    mem_params_list = [p for p in model.memory.parameters() if p.requires_grad]
+    mem_lr = args.lr * args.mem_lr_scale
+
+    optimizer = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": WEIGHT_DECAY},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": lm_decay_params, "weight_decay": WEIGHT_DECAY, "lr": args.lr},
+            {"params": lm_no_decay_params, "weight_decay": 0.0, "lr": args.lr},
+            {"params": mem_params_list, "weight_decay": 0.0, "lr": mem_lr},
         ],
-        lr=args.lr,
         betas=(0.9, 0.95),
         fused=(device.type == "cuda"),
-    )
-
-    # Neuromodulator optimizer (separate, no weight decay)
-    neuromod_optimizer = torch.optim.Adam(
-        model.neuromod.parameters(), lr=config.neuromod_lr, eps=1e-5,
     )
 
     # LR scheduler: warmup + cosine decay
@@ -254,51 +191,24 @@ def main():
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return LR_MIN / args.lr + (1.0 - LR_MIN / args.lr) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Resume optimizer state if available
+    # Resume optimizer state
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        lm_frozen = args.freeze_lower or args.freeze_lm
-        if "optimizer_state_dict" in ckpt and not lm_frozen:
+        if "optimizer_state_dict" in ckpt:
             try:
-                lm_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                print(f"  Loaded LM optimizer state")
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print(f"  Loaded optimizer state")
             except Exception as e:
-                print(f"  Could not load LM optimizer state: {e}")
-        if "scheduler_state_dict" in ckpt and not lm_frozen:
+                print(f"  Could not load optimizer state: {e}")
+        if "scheduler_state_dict" in ckpt:
             try:
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                print(f"  Loaded LR scheduler state")
-            except Exception:
-                pass
-        if "neuromod_optimizer_state_dict" in ckpt:
-            try:
-                neuromod_optimizer.load_state_dict(
-                    ckpt["neuromod_optimizer_state_dict"])
-                print(f"  Loaded neuromod optimizer state")
-            except Exception as e:
-                print(f"  Could not load neuromod optimizer state: {e}")
-        if "neuromod_scheduler_state_dict" in ckpt:
-            try:
-                neuromod_scheduler.load_state_dict(
-                    ckpt["neuromod_scheduler_state_dict"])
-                print(f"  Loaded neuromod scheduler state")
+                print(f"  Loaded scheduler state")
             except Exception:
                 pass
         del ckpt
-
-    # Neuromod LR schedule: same warmup, cosine decay to same floor ratio as LM
-    neuromod_lr_floor = LR_MIN / args.lr  # same ratio as LM schedule
-    def neuromod_lr_lambda(step):
-        if step < args.warmup:
-            return step / max(args.warmup, 1)
-        progress = (step - args.warmup) / max(args.steps - args.warmup, 1)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-        return neuromod_lr_floor + (1.0 - neuromod_lr_floor) * cosine
-
-    neuromod_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        neuromod_optimizer, neuromod_lr_lambda)
 
     # Data
     dataloader = create_dataloader(
@@ -311,33 +221,18 @@ def main():
     )
 
     # Trainer
-    trainer_use_memory = not args.no_memory
     trainer = V8Trainer(
         model=model,
-        lm_optimizer=lm_optimizer,
-        neuromod_optimizer=neuromod_optimizer,
+        optimizer=optimizer,
         scheduler=scheduler,
         dataloader=dataloader,
         config=config,
         device=device,
         max_grad_norm=MAX_GRAD_NORM,
         log_interval=args.log_interval,
-        use_memory=trainer_use_memory,
-        use_neuromod=not args.no_neuromod,
-        neuromod_scheduler=neuromod_scheduler,
+        use_memory=not args.no_memory,
     )
-
-    # Set start step for resumed training
     trainer.global_step = start_step
-
-    # Restore memory graph state if resuming
-    _pending_mg_state = locals().get('_pending_mg_state', None)
-    if _pending_mg_state is not None:
-        model.initialize_states(bs, device)
-        model.memory.load_state_dict(_pending_mg_state)
-        trainer._states_initialized = True
-        print(f"  Restored memory graph state")
-        del _pending_mg_state
 
     # Output dir
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -354,12 +249,13 @@ def main():
 
     # Diagnostics
     diag = V8Diagnostics(model, save_dir, snapshot_every=args.snapshot_interval)
-    saved_checkpoints = []  # track for rotation
+    saved_checkpoints = []
 
     print(f"\nOutputs: {save_dir}")
     print(f"Metrics: {metrics_path}")
     print(f"Snapshots: every {args.snapshot_interval} steps")
     print(f"Checkpoints: every {args.save_interval} steps (keep last {args.keep_checkpoints})")
+    print(f"Memory graph LR: {mem_lr:.2e} ({args.mem_lr_scale}x LM LR)")
     print(f"\nStarting training ({args.steps} steps)...")
     print("=" * 60)
 
@@ -367,10 +263,8 @@ def main():
     def on_step(metrics):
         step = trainer.global_step
 
-        # Extend with memory graph diagnostics (cheap)
         metrics = diag.extend_metrics(metrics, step)
 
-        # Log to JSONL
         record = {"step": step, **metrics}
         metrics_file.write(json.dumps(
             {k: round(v, 6) if isinstance(v, float) else v
@@ -379,46 +273,36 @@ def main():
         if step % 10 == 0:
             metrics_file.flush()
 
-        # Print periodic summary
         if step % args.log_interval == 0:
-            rl_str = ""
-            if "rl_grpo_loss" in metrics:
-                rl_str = (f" | grpo={metrics['rl_grpo_loss']:.4f}"
-                          f" traj_std={metrics.get('rl_traj_adv_std', 0):.4f}")
             mem_str = ""
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
-                           f" prim_div={metrics.get('mem_prim_std', 0):.4f}")
+                           f" prim_drift={metrics.get('mem_prim_drift', 0):.4f}"
+                           f" gate={metrics.get('mem_mod_gate_mean', 0):.4f}")
             print(f"  step {step:5d} | "
                   f"loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | "
                   f"tok/s={metrics['tok_s']/1e3:.1f}K | "
                   f"lr={metrics['lr']:.2e}"
-                  f"{rl_str}{mem_str}")
+                  f"{mem_str}")
 
-        # Memory graph snapshot (moderate cost, periodic)
         diag.maybe_snapshot(step)
 
-        # Save checkpoint with rotation
         if args.save_interval > 0 and step % args.save_interval == 0:
             ckpt_path = os.path.join(save_dir, f"v8_step{step}.pt")
             ckpt = {
-                "model_state_dict": model.lm.state_dict(),
-                "neuromod_state_dict": model.neuromod.state_dict(),
-                "optimizer_state_dict": lm_optimizer.state_dict(),
-                "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "neuromod_scheduler_state_dict": neuromod_scheduler.state_dict(),
                 "step": step,
                 "config": config,
             }
             if model.memory is not None and model.memory.is_initialized():
-                ckpt["memory_graph_state"] = model.memory.state_dict()
+                ckpt["memory_runtime_state"] = model.memory.runtime_state_dict()
             torch.save(ckpt, ckpt_path)
             saved_checkpoints.append(ckpt_path)
             print(f"  Saved: {ckpt_path}")
 
-            # Rotate: keep only last N checkpoints
             if args.keep_checkpoints > 0:
                 while len(saved_checkpoints) > args.keep_checkpoints:
                     old = saved_checkpoints.pop(0)
@@ -426,28 +310,25 @@ def main():
                         os.remove(old)
                         print(f"  Removed old: {old}")
 
-        # Auto-generate plots periodically
         should_plot = (
             (args.plot_interval > 0 and step % args.plot_interval == 0) or
             (args.snapshot_interval > 0 and step % args.snapshot_interval == 0) or
             (args.save_interval > 0 and step % args.save_interval == 0) or
-            step == 50  # early plot for sanity check
+            step == 50
         )
         if should_plot:
             try:
                 from scripts.plot_training import (
                     load_metrics as _load_m, plot_training_curves,
-                    plot_rl_curves, plot_memory_health, plot_pcm_health,
+                    plot_memory_health, plot_pcm_health,
                     plot_connectivity_snapshot, plot_neuron_graph,
                 )
                 plot_dir = os.path.join(save_dir, "plots")
                 os.makedirs(plot_dir, exist_ok=True)
                 _records = _load_m(metrics_path)
                 plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
-                plot_rl_curves(_records, os.path.join(plot_dir, "rl_curves.png"))
                 plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
                 plot_pcm_health(_records, os.path.join(plot_dir, "pcm_health.png"))
-                # Latest snapshot: connectivity + neuron graph
                 snap_dir = os.path.join(save_dir, "snapshots")
                 if os.path.exists(snap_dir):
                     snaps = sorted(os.listdir(snap_dir))
@@ -465,17 +346,14 @@ def main():
     # Final checkpoint
     final_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
     final_ckpt = {
-        "model_state_dict": model.lm.state_dict(),
-        "neuromod_state_dict": model.neuromod.state_dict(),
-        "optimizer_state_dict": lm_optimizer.state_dict(),
-        "neuromod_optimizer_state_dict": neuromod_optimizer.state_dict(),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "neuromod_scheduler_state_dict": neuromod_scheduler.state_dict(),
         "step": trainer.global_step,
         "config": config,
     }
     if model.memory is not None and model.memory.is_initialized():
-        final_ckpt["memory_graph_state"] = model.memory.state_dict()
+        final_ckpt["memory_runtime_state"] = model.memory.runtime_state_dict()
     torch.save(final_ckpt, final_path)
 
     metrics_file.close()

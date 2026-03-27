@@ -1,7 +1,8 @@
 """Tests for Triton kernel equivalence with Python reference implementation.
 
-Compares _forward_segment_triton vs _forward_segment_python on CUDA
-to verify the Triton kernel produces numerically equivalent results.
+v9 NOTE: Triton kernels are temporarily unused — the differentiable forward
+uses Python loops. These tests are skipped until Phase 2 (custom autograd
+Triton kernels). The old tests reference the v8 non-differentiable API.
 """
 
 import torch
@@ -9,8 +10,8 @@ import pytest
 import sys
 sys.path.insert(0, ".")
 
-from src.v8.config import V8Config
-from src.v8.memory_graph import MemoryGraph
+pytest.skip("v9: Triton kernels not yet updated for differentiable forward",
+            allow_module_level=True)
 
 BS = 2
 
