@@ -42,6 +42,13 @@ class V8Config:
     action_every: int = 128      # segment length (tokens per memory graph forward)
     memory_update_stride: int = 1 # neuron dynamics step every N tokens (>1 for larger N)
 
+    # Evolution Strategies (for memory graph params)
+    es_collect_chunks: int = 4    # chunks to collect before ES update
+    es_n_trajectories: int = 8    # number of perturbed trajectories
+    es_k_neurons: int = 96        # neurons to perturb per ES step
+    es_sigma: float = 0.01        # perturbation noise scale
+    es_lr: float = 0.01           # ES learning rate
+
     # Training
     T: int = 2048                # full chunk length
     gradient_checkpointing: bool = False
