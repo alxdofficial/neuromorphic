@@ -1,5 +1,10 @@
 # Problem Formulation: Neural Memory Graph for Language Modeling
 
+> **NOTE (2026-03-27):** This doc was written for v8 (RL/GRPO, 7 layers, port neurons).
+> Current code (v9-ES): 5 layers split at 3, ES replaces GRPO, broadcast I/O replaces
+> port neurons, per-neuron modulator MLP + dendritic FC. The open problems in sections
+> 1-3 are still relevant. Section on neuromodulator/GRPO is historical.
+
 ## What We Are Building
 
 A language model augmented with a persistent, brain-inspired memory graph. The

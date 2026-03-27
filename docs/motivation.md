@@ -1,5 +1,11 @@
 # Motivation & Design Philosophy — Neuromorphic Language Model
 
+> **NOTE (2026-03-27):** This doc was written for v8 (RL/GRPO neuromodulator).
+> Current code (v9-ES) replaces RL with Evolution Strategies, replaces port
+> neurons with broadcast inject/readout, uses 5 scan layers (not 7), and
+> has per-neuron modulator MLP + dendritic FC trained by ES.
+> The core philosophy (memory as signal flow, not database) still applies.
+
 ## Why This Exists
 
 Modern LLMs are powerful but structurally limited:
