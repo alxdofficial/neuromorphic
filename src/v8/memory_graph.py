@@ -310,18 +310,19 @@ class MemoryGraph(nn.Module):
 
         # Precompute broadcast inject for all timesteps: [BS, T_seg, N, D]
         inject_weights = torch.sigmoid(self.inject_w)  # [N, C_mem]
-        inject_bc = torch.einsum('nc,btcd->btnd', inject_weights, cc_signals.float()).to(self.dtype).contiguous()
-
-        # (1-decay) factor for additive correction after kernel
-        omd = (1.0 - eff_decay).unsqueeze(-1).to(self.dtype)  # [BS, N, 1]
+        inject_bc = torch.einsum('nc,btcd->btnd', inject_weights,
+                                 cc_signals.float()).to(self.dtype).contiguous()
 
         recv_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
         msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
         msg_mag_accum = torch.zeros(BS, N, device=cc_signals.device, dtype=torch.float32)
 
+        # Buffer for per-step messages (for readout)
+        msg_all = torch.empty(BS, T_seg, N, D, device=cc_signals.device, dtype=self.dtype)
+
         grid = (BS, N)
 
-        # Routing kernel: eff_key x prev_messages -> routing weights
+        # Routing kernel
         routing_w = torch.empty(BS, N, K, device=cc_signals.device, dtype=self.dtype)
         memory_graph_routing_kernel[grid](
             self.prev_messages, eff_key_c,
@@ -340,54 +341,41 @@ class MemoryGraph(nn.Module):
             branch_size = K
             branches_per_group = 1
             n_groups = 1
-            branch_w = eff_prim_c  # dummy ptr (not accessed)
+            branch_w = eff_prim_c
             group_w = eff_prim_c
             use_fc = 0
 
-        # Dummy pointers for disabled kernel features
         act_trace = msg_mag_accum
-        dummy_cc = cc_signals   # kernel won't read (C=0)
-        dummy_out = cc_signals  # kernel won't write (C=0)
 
         for t in range(0, T_seg, stride):
-            # Kernel: dendritic gather + integration + messaging (no CC inject)
+            # Kernel: dendritic gather + broadcast inject + integration + messaging
+            # inject_bc passed as cc_signals_ptr, msg_all as output_ptr
+            # C=1 enables the inject/output code paths in the kernel
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
                 self._conn_idx_i32, routing_w,
                 eff_decay_f32, eff_prim_c,
                 branch_w, group_w,
-                dummy_cc, dummy_out,
+                inject_bc, msg_all,
                 recv_accum, msg_accum, msg_mag_accum,
                 act_trace,
                 t,
-                BS=BS, N=N, D=D, K=K, C=0, T_seg=T_seg,
+                BS=BS, N=N, D=D, K=K, C=1, T_seg=T_seg,
                 BRANCH_SIZE=branch_size,
                 BRANCHES_PER_GROUP=branches_per_group,
                 N_GROUPS=n_groups,
                 WRITE_ACT_TRACE=0,
                 USE_DENDRITE_FC=use_fc)
 
-            # Correct h and prev_messages for broadcast CC inject.
-            # Kernel computed: h_k = decay*h_old + (1-decay)*received_neighbors
-            # We want:        h   = decay*h_old + (1-decay)*(received_neighbors + inject_bc)
-            #                     = h_k + (1-decay)*inject_bc
-            self.h = self.h + omd * inject_bc[:, t]
-            self.prev_messages = torch.tanh(self.h * eff_prim_c)
+        # Fill held output slots for stride > 1
+        if stride > 1:
+            for s in range(1, stride):
+                msg_all[:, s::stride] = msg_all[:, ::stride]
 
-        # Weighted readout from prev_messages -> output [BS, T_seg, C_mem, D]
+        # Batched readout from msg_all: one einsum for all T
         readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
-        output = torch.empty(BS, T_seg, C_mem, D, device=cc_signals.device, dtype=self.dtype)
-
-        # The kernel updates h/prev_messages in-place so we only have the final
-        # state.  Fill all slots with the final readout (matching Python-path
-        # stride>1 hold behaviour — the old Triton path did the same).
-        final_readout = torch.einsum(
-            'cn,bnd->bcd', readout_weights, self.prev_messages.float()
-        ).to(cc_signals.dtype)
-        output[:] = final_readout.unsqueeze(1)
-
-        # Fill held output slots for stride > 1 is already handled above
-        # (all slots get the same readout).
+        output = torch.einsum('cn,btnd->btcd', readout_weights,
+                              msg_all.float()).to(cc_signals.dtype)
 
         n_steps = max(T_seg // stride, 1)
         self._post_segment_update(

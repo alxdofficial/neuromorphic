@@ -136,9 +136,9 @@ def memory_graph_step_kernel(
         soma += libdevice.tanh(group_acc)
     received = soma * (1.0 / N_GROUPS)
 
-    # --- CC signal injection ---
-    if n < C:
-        cc_offset = b * T_seg * C * D + t_step * C * D + n * D + d
+    # --- Broadcast CC injection (precomputed inject_bc: [BS, T_seg, N, D]) ---
+    if C > 0:
+        cc_offset = b * T_seg * N * D + t_step * N * D + n * D + d
         cc = tl.load(cc_signals_ptr + cc_offset).to(tl.float32)
         received += cc
 
@@ -171,7 +171,7 @@ def memory_graph_step_kernel(
     old_msg = tl.load(msg_accum_ptr + accum_offset)
     tl.store(msg_accum_ptr + accum_offset, old_msg + msg)
 
-    # --- Write port neuron output ---
-    if n < C:
-        out_offset = b * T_seg * C * D + t_step * C * D + n * D + d
+    # --- Write msg to per-step buffer for readout (all neurons) ---
+    if C > 0:
+        out_offset = b * T_seg * N * D + t_step * N * D + n * D + d
         tl.store(output_ptr + out_offset, msg.to(tl.bfloat16))
