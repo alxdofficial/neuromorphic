@@ -307,7 +307,7 @@ class MemoryGraph(nn.Module):
         cc_signals = cc_signals.contiguous()
 
         # Precompute broadcast inject for all timesteps: [BS, T_seg, N, D]
-        inject_weights = torch.sigmoid(self.inject_w)  # [N, C_mem]
+        inject_weights = torch.sigmoid(self.inject_w.float())  # [N, C_mem] float32
         inject_bc = torch.einsum('nc,btcd->btnd', inject_weights,
                                  cc_signals.float()).to(self.dtype).contiguous()
 
@@ -371,7 +371,7 @@ class MemoryGraph(nn.Module):
                 msg_all[:, s::stride] = msg_all[:, ::stride]
 
         # Batched readout from msg_all: one einsum for all T
-        readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
+        readout_weights = torch.sigmoid(self.readout_w.float())  # [C_mem, N]
         output = torch.einsum('cn,btnd->btcd', readout_weights,
                               msg_all.float()).to(cc_signals.dtype)
 
