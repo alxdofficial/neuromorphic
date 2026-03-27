@@ -123,27 +123,29 @@ def main():
     model = V8Model(config)
     if device.type == "cuda":
         model = model.to(device).to(torch.bfloat16)
-        # Keep memory graph modulator params in float32 for precision
-        for name, param in model.memory.named_parameters():
-            if 'fc1' in name or 'fc2' in name or 'mod_lr' in name:
-                param.data = param.data.float()
-
     else:
         model = model.to(device)
 
     # Resume from checkpoint
     start_step = 0
+    _resume_ckpt = None
     if args.resume:
         print(f"\nResuming from: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        start_step = ckpt.get("step", 0)
+        _resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(_resume_ckpt["model_state_dict"], strict=False)
+        start_step = _resume_ckpt.get("step", 0)
         print(f"  Loaded model from step {start_step}")
-        if "memory_runtime_state" in ckpt:
-            model.memory.load_runtime_state(ckpt["memory_runtime_state"])
+        if "memory_runtime_state" in _resume_ckpt:
+            model.memory.load_runtime_state(_resume_ckpt["memory_runtime_state"])
             model._states_initialized = True
             print(f"  Restored memory graph runtime state")
-        del ckpt
+
+    # Promote modulator params to float32 AFTER load_state_dict
+    # (bf16 precision rounds away small RL-like gradients)
+    if device.type == "cuda":
+        for name, param in model.memory.named_parameters():
+            if 'fc1' in name or 'fc2' in name or 'mod_lr' in name:
+                param.data = param.data.float()
 
     total_params = model.param_count()
     lm_params = model.lm_param_count()
@@ -193,22 +195,21 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Resume optimizer state
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        if "optimizer_state_dict" in ckpt:
+    # Resume optimizer/scheduler state (reuse checkpoint loaded earlier)
+    if _resume_ckpt is not None:
+        if "optimizer_state_dict" in _resume_ckpt:
             try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                optimizer.load_state_dict(_resume_ckpt["optimizer_state_dict"])
                 print(f"  Loaded optimizer state")
             except Exception as e:
                 print(f"  Could not load optimizer state: {e}")
-        if "scheduler_state_dict" in ckpt:
+        if "scheduler_state_dict" in _resume_ckpt:
             try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                scheduler.load_state_dict(_resume_ckpt["scheduler_state_dict"])
                 print(f"  Loaded scheduler state")
             except Exception:
                 pass
-        del ckpt
+        del _resume_ckpt
 
     # Data
     dataloader = create_dataloader(
@@ -278,7 +279,7 @@ def main():
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
                            f" prim_drift={metrics.get('mem_prim_drift', 0):.4f}"
-                           f" gate={metrics.get('mem_mod_gate_mean', 0):.4f}")
+                           f" gate={metrics.get('mem_mod_gate_prim_mean', 0):.4f}")
             print(f"  step {step:5d} | "
                   f"loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | "

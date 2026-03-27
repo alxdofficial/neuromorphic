@@ -329,8 +329,14 @@ class MemoryGraph(nn.Module):
                 received_accum = received_accum + received.detach()
                 msg_accum = msg_accum + prev_msg.detach()
 
-            # Port neuron output
-            output_list.append(prev_msg[:, :C])
+                # Port output (gradient only from update steps)
+                curr_port_out = prev_msg[:, :C]
+
+            # Non-update steps: detached copy (no gradient inflation)
+            if t % stride == 0:
+                output_list.append(curr_port_out)
+            else:
+                output_list.append(curr_port_out.detach())
 
         output = torch.stack(output_list, dim=1)  # [BS, T_seg, C, D]
 
@@ -367,8 +373,6 @@ class MemoryGraph(nn.Module):
             'prev_messages': self.prev_messages,
             'trace_prim': self.trace_prim,
             'trace_key': self.trace_key,
-            'conn_indices': self.conn_indices,
-            'conn_mask': self.conn_mask,
             'mean_input': self.mean_input,
             'mean_output': self.mean_output,
             'msg_magnitude': self.msg_magnitude,
@@ -376,7 +380,9 @@ class MemoryGraph(nn.Module):
 
     def load_runtime_state(self, state: dict):
         """Restore per-batch runtime state from checkpoint."""
+        buffer_names = {name for name, _ in self.named_buffers()}
+        param_names = {name for name, _ in self.named_parameters()}
         for key, val in state.items():
-            if hasattr(self, key):
+            if key not in buffer_names and key not in param_names and hasattr(self, key):
                 setattr(self, key, val)
         self._initialized = True

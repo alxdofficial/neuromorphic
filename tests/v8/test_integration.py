@@ -62,7 +62,8 @@ class TestV8ModelForward:
         model.initialize_states(BS, torch.device("cpu"))
 
         result = model.forward_chunk(
-            input_ids, target_ids=target_ids, reset_mask=reset_mask
+            input_ids, target_ids=target_ids,
+            reset_mask=reset_mask, has_reset=True
         )
         assert torch.isfinite(result["logits"]).all()
 
