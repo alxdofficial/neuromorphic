@@ -30,9 +30,9 @@ class V8Diagnostics:
         self.snapshot_dir = os.path.join(save_dir, "snapshots")
         self.snapshot_every = snapshot_every
         os.makedirs(self.snapshot_dir, exist_ok=True)
-        # Snapshot of initial primitives/keys for tracking drift
-        self._init_primitives = None
+        # Snapshot of initial params for tracking drift
         self._init_keys = None
+        self._init_msg_w1 = None
 
     def extend_metrics(self, metrics: dict, step: int) -> dict:
         """Add memory graph stats to the per-step metrics dict."""
@@ -46,24 +46,19 @@ class V8Diagnostics:
             metrics["mem_h_mean_abs"] = round(mg.h.abs().mean().item(), 6)
             metrics["mem_msg_norm"] = round(mg.prev_messages.norm().item(), 4)
 
-            # Primitive diversity (std across neurons — higher = more specialized)
-            prim = mg.primitives.data  # [N, D] nn.Parameter
-            prim_std = prim.std(dim=0).mean().item()  # std across neurons per dim
-            metrics["mem_prim_std"] = round(prim_std, 6)
-
             # Key diversity
             key = mg.key.data  # [N, D]
             key_div = key.std(dim=0).mean().item()
             metrics["mem_key_diversity"] = round(key_div, 6)
 
-            # Drift from init
-            if self._init_primitives is None:
-                self._init_primitives = prim.clone()
+            # Drift from init (track key + message MLP weights)
+            if self._init_keys is None:
                 self._init_keys = key.clone()
-            prim_drift = (prim - self._init_primitives).norm(dim=-1).mean().item()
+                self._init_msg_w1 = mg.msg_w1.data.clone()
             key_drift = (key - self._init_keys).norm(dim=-1).mean().item()
-            metrics["mem_prim_drift"] = round(prim_drift, 6)
+            msg_drift = (mg.msg_w1.data - self._init_msg_w1).norm(dim=(1, 2)).mean().item()
             metrics["mem_key_drift"] = round(key_drift, 6)
+            metrics["mem_msg_mlp_drift"] = round(msg_drift, 6)
 
             # Decay distribution
             decay = torch.sigmoid(mg.decay_logit.data)  # [N]
@@ -166,7 +161,7 @@ class V8Diagnostics:
             snapshot["decay_per_neuron"] = torch.sigmoid(mg.decay_logit.data).cpu()
 
             # Learned parameter snapshots
-            snapshot["primitives_mean"] = mg.primitives.data.cpu()  # [N, D]
+            snapshot["msg_w1_mean"] = mg.msg_w1.data.cpu()  # [N, D, H]
             snapshot["key_per_neuron"] = mg.key.data.cpu()  # [N, D]
 
             # Connectivity

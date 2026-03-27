@@ -183,14 +183,12 @@ class TestES:
                 "pre_upper_carries": None,
             })
 
-        prim_before = model.memory.primitives.data.clone()
+        key_before = model.memory.key.data.clone()
         scoring = model.score_es_trajectories(es_buffer, pre_state, pre_params)
         model.apply_es_gradient(scoring)
 
         # Params for K neurons should have changed
         k = scoring["k_neurons"]
-        # At least some change expected (unless all advantages are 0)
-        # With random data, advantages should have nonzero std
 
 
 class TestParamCount:

@@ -221,7 +221,7 @@ def main():
             mem_str = ""
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
-                           f" prim_drift={metrics.get('mem_prim_drift', 0):.4f}"
+                           f" key_drift={metrics.get('mem_key_drift', 0):.4f}"
                            f" gate={metrics.get('mem_mod_gate_prim_mean', 0):.4f}")
             print(f"  step {step:5d} | loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | tok/s={metrics['tok_s']/1e3:.1f}K | "

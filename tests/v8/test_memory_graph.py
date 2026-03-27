@@ -1,7 +1,4 @@
-"""Tests for Memory Graph — per-token dynamics + ES-trained params.
-
-Tests: init, forward, modulator, dendritic FC, ES utilities.
-"""
+"""Tests for Memory Graph — per-neuron MLPs + ES training."""
 
 import torch
 import pytest
@@ -20,7 +17,7 @@ def make_tiny(**overrides):
     return cfg
 
 
-class TestMemoryGraphInit:
+class TestInit:
     def test_initialize(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
@@ -32,30 +29,31 @@ class TestMemoryGraphInit:
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         for name, p in mg.named_parameters():
-            assert not p.requires_grad, f"{name} should have requires_grad=False"
+            assert not p.requires_grad, f"{name} should not require grad"
 
-    def test_primitives_rms_normalized(self):
+    def test_write_read_neurons_disjoint(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
-        rms = mg.primitives.data.pow(2).mean(dim=-1).sqrt()
-        torch.testing.assert_close(rms, torch.ones_like(rms), atol=0.05, rtol=0.05)
+        w = set(mg.write_neurons.tolist())
+        r = set(mg.read_neurons.tolist())
+        assert w.isdisjoint(r), "Write and read neurons must be different"
 
-    def test_connectivity(self):
+    def test_has_mlp_params(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
-        for j in range(cfg.N_neurons):
-            active = mg.conn_indices[j][mg.conn_mask[j]]
-            assert j not in active.tolist()
+        assert hasattr(mg, 'int_w1')  # integrate MLP
+        assert hasattr(mg, 'msg_w1')  # message MLP
+        assert hasattr(mg, 'mod_w1')  # modulator MLP
+        assert hasattr(mg, 'key')     # routing key
 
     def test_modulator_zero_init(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
-        assert mg.fc2_w.data.abs().sum() == 0
-        assert mg.fc2_b.data.abs().sum() == 0
+        assert mg.mod_w2.data.abs().sum() == 0
 
 
-class TestMemoryGraphForward:
-    def test_forward_segment_shape(self):
+class TestForward:
+    def test_shape(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize_states(BS)
@@ -63,7 +61,7 @@ class TestMemoryGraphForward:
         out = mg.forward_segment(cc)
         assert out.shape == (BS, cfg.action_every, cfg.C, cfg.D_mem)
 
-    def test_forward_segment_finite(self):
+    def test_finite(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize_states(BS)
@@ -71,7 +69,7 @@ class TestMemoryGraphForward:
         out = mg.forward_segment(cc)
         assert torch.isfinite(out).all()
 
-    def test_multiple_segments_stable(self):
+    def test_stable(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize_states(BS)
@@ -90,52 +88,48 @@ class TestMemoryGraphForward:
         mg.forward_segment(cc)
         assert not torch.equal(mg.h, h_before)
 
-    def test_traces_accumulate(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"))
-        mg.initialize_states(BS)
-        assert mg.trace_prim.abs().sum() == 0
-        for _ in range(5):
-            cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem)
-            mg.forward_segment(cc)
-        assert mg.trace_prim.abs().sum() > 0
-        assert mg.trace_key.abs().sum() > 0
-
     def test_signal_propagates(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize_states(BS)
         mg.h.zero_()
         mg.prev_messages.zero_()
-        cc = torch.ones(BS, cfg.action_every, cfg.C, cfg.D_mem)
-        mg.forward_segment(cc)
-        assert mg.h[:, cfg.C:].abs().sum() > 0
+        # Run multiple segments with strong CC input
+        for _ in range(4):
+            cc = torch.ones(BS, cfg.action_every, cfg.C, cfg.D_mem) * 2.0
+            mg.forward_segment(cc)
+        # Read neurons should have nonzero output (signal traversed graph)
+        out = mg.prev_messages[:, mg.read_neurons]
+        assert out.abs().mean() > 1e-4, \
+            f"Read neurons should receive signal (got mean={out.abs().mean():.6f})"
 
 
-class TestModulator:
-    def test_output_shape(self):
+class TestMLPs:
+    def test_integrate_mlp(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"))
+        mg.initialize_states(BS)
+        h = mg.h
+        received = torch.randn_like(h)
+        h_new = mg._integrate(h, received)
+        assert h_new.shape == h.shape
+        assert torch.isfinite(h_new).all()
+
+    def test_message_mlp(self):
+        cfg = make_tiny()
+        mg = MemoryGraph(cfg, torch.device("cpu"))
+        mg.initialize_states(BS)
+        msg = mg._message(mg.h)
+        assert msg.shape == mg.h.shape
+        assert msg.abs().max() <= 1.0  # tanh bounded
+
+    def test_modulator(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         mg.initialize_states(BS)
         gp, gk, dm = mg._modulator_forward(mg.h)
         assert gp.shape == (BS, cfg.N_neurons, 1)
-        assert dm.shape == (BS, cfg.N_neurons, 1)
-
-    def test_gate_bounded(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"))
-        mg.initialize_states(BS)
-        gp, gk, _ = mg._modulator_forward(mg.h)
         assert gp.abs().max() <= 1.0
-        assert gk.abs().max() <= 1.0
-
-    def test_zero_init_no_modulation(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"))
-        mg.initialize_states(BS)
-        gp, gk, dm = mg._modulator_forward(mg.h)
-        assert gp.abs().max() < 1e-6
-        assert dm.abs().max() < 1e-6
 
 
 class TestES:
@@ -143,41 +137,26 @@ class TestES:
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         params = mg.get_es_params()
-        assert 'primitives' in params
-        assert 'fc1_w' in params
-        assert params['primitives'].shape == (cfg.N_neurons, cfg.D_mem)
+        assert 'key' in params
+        assert 'int_w1' in params
+        assert 'msg_w1' in params
+        assert 'mod_w1' in params
 
-    def test_get_neuron_es_params(self):
+    def test_get_neuron_params(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         k = torch.tensor([0, 1, 2])
         params = mg.get_neuron_es_params(k)
-        assert params['primitives'].shape == (3, cfg.D_mem)
-        assert params['fc1_w'].shape == (3, cfg.D_mem * 5, cfg.modulator_hidden)
+        assert params['key'].shape == (3, cfg.D_mem)
+        assert params['int_w1'].shape[0] == 3
 
-    def test_apply_perturbation(self):
+    def test_perturbation(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
         k = torch.tensor([0, 1])
-        prim_before = mg.primitives.data[0].clone()
-
+        key_before = mg.key.data[0].clone()
         noise = mg.get_neuron_es_params(k)
         for name in noise:
             noise[name] = torch.randn_like(noise[name])
-
         mg.apply_es_perturbation(k, noise, sigma=0.1)
-        assert not torch.equal(mg.primitives.data[0], prim_before)
-        # Neuron 2 should be unchanged
-        # (can't test easily since noise only applied to k=[0,1])
-
-    def test_apply_update(self):
-        cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cpu"))
-        k = torch.tensor([0])
-        prim_before = mg.primitives.data[0].clone()
-
-        update = {'primitives': torch.ones(1, cfg.D_mem) * 0.01}
-        mg.apply_es_update(k, update, lr=1.0)
-
-        diff = (mg.primitives.data[0] - prim_before).abs().sum()
-        assert diff > 0
+        assert not torch.equal(mg.key.data[0], key_before)

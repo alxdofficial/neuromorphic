@@ -171,7 +171,8 @@ def memory_graph_step_kernel(
     old_msg = tl.load(msg_accum_ptr + accum_offset)
     tl.store(msg_accum_ptr + accum_offset, old_msg + msg)
 
-    # --- Write port neuron output ---
-    if n < C:
-        out_offset = b * T_seg * C * D + t_step * C * D + n * D + d
+    # --- Write read-neuron output (neurons C..2C-1 → output slot 0..C-1) ---
+    if n >= C and n < 2 * C:
+        read_idx = n - C  # map neuron C+i to output slot i
+        out_offset = b * T_seg * C * D + t_step * C * D + read_idx * D + d
         tl.store(output_ptr + out_offset, msg.to(tl.bfloat16))
