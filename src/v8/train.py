@@ -59,6 +59,8 @@ def parse_args():
     p.add_argument("--snapshot-interval", type=int, default=1000)
     p.add_argument("--plot-interval", type=int, default=500)
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--es-warmup", type=int, default=None,
+                   help="Steps before ES starts (default: from config)")
     return p.parse_args()
 
 
@@ -82,6 +84,8 @@ def main():
     config.eot_id = eot_id
     if args.compile is not None:
         config.use_compile = args.compile
+    if args.es_warmup is not None:
+        config.es_warmup = args.es_warmup
     config.validate()
 
     bs = args.bs

@@ -46,8 +46,9 @@ class V8Config:
     es_collect_chunks: int = 4    # chunks to collect before ES update
     es_n_trajectories: int = 8    # number of perturbed trajectories
     es_k_neurons: int = 96        # neurons to perturb per ES step
-    es_sigma: float = 0.01        # perturbation noise scale
+    es_sigma: float = 0.05        # perturbation noise scale
     es_lr: float = 0.01           # ES learning rate
+    es_warmup: int = 2000         # steps before ES starts (LM learns to use memory first)
 
     # Training
     T: int = 2048                # full chunk length

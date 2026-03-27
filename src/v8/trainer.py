@@ -130,9 +130,10 @@ class V8Trainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        # Collect ES data
+        # Collect ES data (skip during warmup)
         es_metrics = {}
-        if self.use_memory:
+        es_active = self.use_memory and self.global_step >= self.config.es_warmup
+        if es_active:
             eot_at = (input_ids == eot_id)
 
             self._es_buffer.append({

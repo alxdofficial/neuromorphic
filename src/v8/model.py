@@ -136,11 +136,11 @@ class V8Model(nn.Module):
         # Get current K-neuron param shapes for noise generation
         k_params = mg.get_neuron_es_params(k_neurons)
 
-        # Per-param-type σ scaling: σ_effective = σ * param_rms
-        # So larger-magnitude params get proportionally larger perturbations
+        # Per-param-type σ scaling: σ_effective = σ * max(param_rms, 0.1)
+        # Floor at 0.1 so zero-init params (fc2_w, fc2_b) still get perturbed
         param_scales = {}
         for name, param in k_params.items():
-            rms = param.pow(2).mean().sqrt().clamp(min=1e-6).item()
+            rms = param.pow(2).mean().sqrt().clamp(min=0.1).item()
             param_scales[name] = rms
 
         # Generate noise for all trajectories (antithetic: +ε and -ε)
