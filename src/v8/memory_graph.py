@@ -224,7 +224,9 @@ class NeuronRecurrence(torch.autograd.Function):
         h_all = torch.empty(BS, T_seg, N, D, device=device, dtype=dtype)
         msg_all = torch.empty(BS, T_seg, N, D, device=device, dtype=dtype)
 
-        use_triton = _HAS_TRITON and h.is_cuda
+        # Triton kernels are slower for per-neuron MLP (scalar extraction overhead).
+        # Use Python forward with GPU-optimized einsum instead.
+        use_triton = False  # _HAS_TRITON and h.is_cuda
 
         if use_triton:
             # Make contiguous copies for kernel
@@ -482,8 +484,8 @@ def _triton_recurrence_bwd(h_all, msg_all, inject_bc,
     d_W_mod = torch.zeros_like(W_mod, dtype=torch.float32)
     d_b_mod = torch.zeros_like(b_mod, dtype=torch.float32)
     d_inject_bc = torch.zeros_like(inject_bc, dtype=torch.float32)
-    d_prev_msg = torch.zeros(BS, N, D, device=device, dtype=h_all.dtype)
 
+    from .triton_kernels import _next_pow2
     grid = (BS, N)
     neuron_bwd_kernel[grid](
         h_all.contiguous(), msg_all.contiguous(), inject_bc.contiguous(),
@@ -491,9 +493,11 @@ def _triton_recurrence_bwd(h_all, msg_all, inject_bc,
         trace_h, trace_recv, conn_indices,
         d_msg_all.contiguous(),
         d_w_conn, d_decay_logit, d_W1, d_b1, d_W_msg, d_b_msg,
-        d_W_mod, d_b_mod, d_inject_bc, d_prev_msg,
+        d_W_mod, d_b_mod, d_inject_bc,
         BS=BS, N=N, D=D, K=K, H=H,
         T_SEG=T_seg, MLP_IN=4*D,
+        BLOCK_D=_next_pow2(D), BLOCK_K=_next_pow2(K),
+        BLOCK_H=_next_pow2(H),
     )
 
     return {
