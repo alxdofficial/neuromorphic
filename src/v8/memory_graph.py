@@ -108,7 +108,13 @@ class MemoryGraph(nn.Module):
         self.fc2_b = nn.Parameter(torch.zeros(N, 3, device=device), requires_grad=False)
         self.mod_lr_logit = nn.Parameter(torch.tensor(-2.0, device=device), requires_grad=False)
 
-        self.register_buffer('cc_port_idx', torch.arange(config.C, device=device))
+        # Broadcast inject/readout weights (replace port neuron I/O)
+        C_mem = config.D // config.D_mem
+        self.C_mem = C_mem
+        self.inject_w = nn.Parameter(torch.zeros(N, C_mem, device=device), requires_grad=False)
+        nn.init.uniform_(self.inject_w, -1.0, 1.0)
+        self.readout_w = nn.Parameter(torch.zeros(C_mem, N, device=device), requires_grad=False)
+        nn.init.uniform_(self.readout_w, -1.0, 1.0)
 
         # Triton kernel buffers
         if _HAS_TRITON and device.type == 'cuda':
@@ -242,16 +248,19 @@ class MemoryGraph(nn.Module):
 
     def _forward_segment_python(self, cc_signals, eff_prim, eff_key, eff_decay):
         """Python reference implementation."""
-        BS, T_seg, C, D = cc_signals.shape
+        BS, T_seg, C_mem, D = cc_signals.shape
         N = self.config.N_neurons
         stride = self.config.memory_update_stride
         eff_decay_exp = eff_decay.unsqueeze(-1)
 
         h = self.h
         prev_msg = self.prev_messages
-        output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
+        output = torch.empty(BS, T_seg, C_mem, D, device=cc_signals.device, dtype=self.dtype)
         received_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=self.dtype)
         msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=self.dtype)
+
+        inject_weights = torch.sigmoid(self.inject_w)    # [N, C_mem]
+        readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
 
         for t in range(T_seg):
             if t % stride == 0:
@@ -265,20 +274,30 @@ class MemoryGraph(nn.Module):
                 else:
                     received = weighted.sum(dim=2)
 
-                received[:, :C] = received[:, :C] + cc_signals[:, t]
+                # Broadcast inject: cc_signals [BS, C_mem, D] → all N neurons
+                broadcast = torch.einsum('nc,bcd->bnd', inject_weights, cc_signals[:, t].float()).to(self.dtype)
+                received = received + broadcast
                 h = eff_decay_exp * h + (1 - eff_decay_exp) * received
                 prev_msg = torch.tanh(h * eff_prim)
                 received_accum += received
                 msg_accum += prev_msg
 
-            output[:, t] = prev_msg[:, :C]
+            # Weighted readout: prev_msg [BS, N, D] → [BS, C_mem, D]
+            output[:, t] = torch.einsum('cn,bnd->bcd', readout_weights, prev_msg.float()).to(cc_signals.dtype)
 
         self._post_segment_update(h, prev_msg, received_accum, msg_accum, T_seg)
         return output
 
     def _forward_segment_triton(self, cc_signals, eff_prim, eff_key, eff_decay):
-        """Triton-accelerated per-token dynamics with dendritic FC."""
-        BS, T_seg, C, D = cc_signals.shape
+        """Triton-accelerated per-token dynamics with dendritic FC.
+
+        CC inject/readout are done outside the Triton kernel via broadcast
+        einsum (inject_w / readout_w).  The kernel runs with C=0 so its
+        internal ``if n < C`` guards for port-neuron inject/output are
+        never triggered.  After each kernel step we correct h and
+        prev_messages to include the broadcast CC contribution.
+        """
+        BS, T_seg, C_mem, D = cc_signals.shape
         N = self.config.N_neurons
         K = self.config.K_connections
         stride = self.config.memory_update_stride
@@ -289,14 +308,20 @@ class MemoryGraph(nn.Module):
         eff_key_c = eff_key.contiguous()
         cc_signals = cc_signals.contiguous()
 
-        output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
+        # Precompute broadcast inject for all timesteps: [BS, T_seg, N, D]
+        inject_weights = torch.sigmoid(self.inject_w)  # [N, C_mem]
+        inject_bc = torch.einsum('nc,btcd->btnd', inject_weights, cc_signals.float()).to(self.dtype).contiguous()
+
+        # (1-decay) factor for additive correction after kernel
+        omd = (1.0 - eff_decay).unsqueeze(-1).to(self.dtype)  # [BS, N, 1]
+
         recv_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
         msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
         msg_mag_accum = torch.zeros(BS, N, device=cc_signals.device, dtype=torch.float32)
 
         grid = (BS, N)
 
-        # Routing kernel: eff_key × prev_messages → routing weights
+        # Routing kernel: eff_key x prev_messages -> routing weights
         routing_w = torch.empty(BS, N, K, device=cc_signals.device, dtype=self.dtype)
         memory_graph_routing_kernel[grid](
             self.prev_messages, eff_key_c,
@@ -319,30 +344,50 @@ class MemoryGraph(nn.Module):
             group_w = eff_prim_c
             use_fc = 0
 
-        # Dummy act_trace (not needed for ES)
-        act_trace = msg_mag_accum  # reuse as dummy ptr
+        # Dummy pointers for disabled kernel features
+        act_trace = msg_mag_accum
+        dummy_cc = cc_signals   # kernel won't read (C=0)
+        dummy_out = cc_signals  # kernel won't write (C=0)
 
         for t in range(0, T_seg, stride):
+            # Kernel: dendritic gather + integration + messaging (no CC inject)
             memory_graph_step_kernel[grid](
                 self.h, self.prev_messages,
                 self._conn_idx_i32, routing_w,
                 eff_decay_f32, eff_prim_c,
                 branch_w, group_w,
-                cc_signals, output,
+                dummy_cc, dummy_out,
                 recv_accum, msg_accum, msg_mag_accum,
                 act_trace,
                 t,
-                BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
+                BS=BS, N=N, D=D, K=K, C=0, T_seg=T_seg,
                 BRANCH_SIZE=branch_size,
                 BRANCHES_PER_GROUP=branches_per_group,
                 N_GROUPS=n_groups,
                 WRITE_ACT_TRACE=0,
                 USE_DENDRITE_FC=use_fc)
 
-        # Fill held output slots
-        if stride > 1:
-            for s in range(1, stride):
-                output[:, s::stride] = output[:, ::stride]
+            # Correct h and prev_messages for broadcast CC inject.
+            # Kernel computed: h_k = decay*h_old + (1-decay)*received_neighbors
+            # We want:        h   = decay*h_old + (1-decay)*(received_neighbors + inject_bc)
+            #                     = h_k + (1-decay)*inject_bc
+            self.h = self.h + omd * inject_bc[:, t]
+            self.prev_messages = torch.tanh(self.h * eff_prim_c)
+
+        # Weighted readout from prev_messages -> output [BS, T_seg, C_mem, D]
+        readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
+        output = torch.empty(BS, T_seg, C_mem, D, device=cc_signals.device, dtype=self.dtype)
+
+        # The kernel updates h/prev_messages in-place so we only have the final
+        # state.  Fill all slots with the final readout (matching Python-path
+        # stride>1 hold behaviour — the old Triton path did the same).
+        final_readout = torch.einsum(
+            'cn,bnd->bcd', readout_weights, self.prev_messages.float()
+        ).to(cc_signals.dtype)
+        output[:] = final_readout.unsqueeze(1)
+
+        # Fill held output slots for stride > 1 is already handled above
+        # (all slots get the same readout).
 
         n_steps = max(T_seg // stride, 1)
         self._post_segment_update(
@@ -389,11 +434,16 @@ class MemoryGraph(nn.Module):
             'fc1_b': self.fc1_b.data,
             'fc2_w': self.fc2_w.data,
             'fc2_b': self.fc2_b.data,
+            'inject_w': self.inject_w.data,
+            'readout_w': self.readout_w.data,
         }
         if self.use_dendritic_tree:
             params['dendrite_branch_w'] = self.dendrite_branch_w.data
             params['dendrite_group_w'] = self.dendrite_group_w.data
         return params
+
+    # Names of params where the neuron axis is dim 1 (not dim 0)
+    _NEURON_DIM1_PARAMS = frozenset({'readout_w'})
 
     def get_neuron_es_params(self, neuron_ids: Tensor) -> dict[str, Tensor]:
         """Get ES params for a subset of neurons (for sparse ES)."""
@@ -406,6 +456,8 @@ class MemoryGraph(nn.Module):
             'fc1_b': self.fc1_b.data[K_idx],
             'fc2_w': self.fc2_w.data[K_idx],
             'fc2_b': self.fc2_b.data[K_idx],
+            'inject_w': self.inject_w.data[K_idx],
+            'readout_w': self.readout_w.data[:, K_idx],
         }
         if self.use_dendritic_tree:
             params['dendrite_branch_w'] = self.dendrite_branch_w.data[K_idx]
@@ -418,7 +470,10 @@ class MemoryGraph(nn.Module):
         K_idx = neuron_ids
         for name, eps in noise.items():
             param = getattr(self, name)
-            param.data[K_idx] += sigma * eps
+            if name in self._NEURON_DIM1_PARAMS:
+                param.data[:, K_idx] += sigma * eps
+            else:
+                param.data[K_idx] += sigma * eps
 
     def apply_es_update(self, neuron_ids: Tensor,
                         weighted_noise: dict[str, Tensor], lr: float):
@@ -426,7 +481,10 @@ class MemoryGraph(nn.Module):
         K_idx = neuron_ids
         for name, update in weighted_noise.items():
             param = getattr(self, name)
-            param.data[K_idx] += lr * update
+            if name in self._NEURON_DIM1_PARAMS:
+                param.data[:, K_idx] += lr * update
+            else:
+                param.data[K_idx] += lr * update
 
     def detach_states(self):
         pass  # States are never on compute graph
