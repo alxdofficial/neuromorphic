@@ -66,7 +66,7 @@ class TestMemoryGraphInit:
     def test_modulator_params_exist(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"))
-        assert mg.fc1_w.shape == (cfg.N_neurons, cfg.D_mem, cfg.modulator_hidden)
+        assert mg.fc1_w.shape == (cfg.N_neurons, cfg.D_mem * 5, cfg.modulator_hidden)
         assert mg.fc2_w.shape == (cfg.N_neurons, cfg.modulator_hidden, 3)
         # fc2 should be zero-init (no-op at start)
         assert mg.fc2_w.data.abs().sum() == 0

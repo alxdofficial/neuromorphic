@@ -107,11 +107,13 @@ class MemoryGraph(nn.Module):
             self.dendrite_group_w = nn.Parameter(
                 torch.full((N, ng, bpg, D), 1.0 / bpg))
 
-        # Per-neuron modulator MLP: h → (gate_prim, gate_key, decay_mod)
+        # Per-neuron modulator MLP: [h, trace_prim, trace_key, primitives, key] → 3
         hidden = config.modulator_hidden
+        mod_input_dim = D * 5  # h + trace_prim + trace_key + primitives + key
+        self._mod_input_dim = mod_input_dim
         # Xavier init for fc1, zero init for fc2 (starts as no-op)
-        fc1_w = torch.randn(N, D, hidden) * (2.0 / (D + hidden)) ** 0.5
-        self.fc1_w = nn.Parameter(fc1_w)            # [N, D_mem, hidden]
+        fc1_w = torch.randn(N, mod_input_dim, hidden) * (2.0 / (mod_input_dim + hidden)) ** 0.5
+        self.fc1_w = nn.Parameter(fc1_w)            # [N, mod_input_dim, hidden]
         self.fc1_b = nn.Parameter(torch.zeros(N, hidden))  # [N, hidden]
         self.fc2_w = nn.Parameter(torch.zeros(N, hidden, 3))  # [N, hidden, 3]
         self.fc2_b = nn.Parameter(torch.zeros(N, 3))           # [N, 3]
@@ -165,7 +167,7 @@ class MemoryGraph(nn.Module):
     # ================================================================
 
     def _modulator_forward(self, h: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Per-neuron MLP: h → (gate_prim, gate_key, decay_mod).
+        """Per-neuron MLP: [h, trace_prim, trace_key, primitives, key] → 3.
 
         Each neuron has its own weights. Implemented via einsum for
         batched per-neuron matmul.
@@ -177,8 +179,19 @@ class MemoryGraph(nn.Module):
             gate_key:  [BS, N, 1] in [-1, 1]
             decay_mod: [BS, N, 1] unbounded
         """
-        # fc1: [BS, N, D] @ [N, D, H] → [BS, N, H]
-        x = torch.einsum('bnd,ndh->bnh', h.float(), self.fc1_w) + self.fc1_b
+        BS = h.shape[0]
+        # Concatenate all inputs the modulator needs to see
+        # traces are detached (running stats), primitives/key are nn.Parameters
+        mod_input = torch.cat([
+            h.float(),
+            self.trace_prim.float(),
+            self.trace_key.float(),
+            self.primitives.unsqueeze(0).expand(BS, -1, -1).float(),
+            self.key.unsqueeze(0).expand(BS, -1, -1).float(),
+        ], dim=-1)  # [BS, N, D_mem * 5]
+
+        # fc1: [BS, N, D*5] @ [N, D*5, H] → [BS, N, H]
+        x = torch.einsum('bnd,ndh->bnh', mod_input, self.fc1_w) + self.fc1_b
         x = torch.tanh(x)
         # fc2: [BS, N, H] @ [N, H, 3] → [BS, N, 3]
         out = torch.einsum('bnh,nho->bno', x, self.fc2_w) + self.fc2_b
