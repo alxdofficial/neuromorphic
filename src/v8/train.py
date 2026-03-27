@@ -252,12 +252,14 @@ def main():
             try:
                 from scripts.plot_training import (
                     load_metrics as _load_m, plot_training_curves,
-                    plot_modulator_health, plot_memory_health, plot_pcm_health,
+                    plot_es_health, plot_modulator_health,
+                    plot_memory_health, plot_pcm_health,
                     plot_connectivity_snapshot, plot_neuron_graph)
                 plot_dir = os.path.join(save_dir, "plots")
                 os.makedirs(plot_dir, exist_ok=True)
                 _records = _load_m(metrics_path)
                 plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
+                plot_es_health(_records, os.path.join(plot_dir, "es_health.png"))
                 plot_modulator_health(_records, os.path.join(plot_dir, "modulator_health.png"))
                 plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
                 plot_pcm_health(_records, os.path.join(plot_dir, "pcm_health.png"))

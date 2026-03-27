@@ -153,11 +153,15 @@ class V8Trainer:
 
                 self.model.apply_es_gradient(scoring)
 
+                adv = scoring["advantages"]
+                tl = scoring["trajectory_losses"]
                 es_metrics = {
-                    "es_adv_std": scoring["advantages"].std().item(),
-                    "es_loss_best": scoring["trajectory_losses"].min().item(),
-                    "es_loss_worst": scoring["trajectory_losses"].max().item(),
-                    "es_loss_mean": scoring["trajectory_losses"].mean().item(),
+                    "es_adv_std": adv.std().item(),
+                    "es_adv_max": adv.max().item(),
+                    "es_loss_best": tl.min().item(),
+                    "es_loss_worst": tl.max().item(),
+                    "es_loss_mean": tl.mean().item(),
+                    "es_loss_spread": (tl.max() - tl.min()).item(),
                     "es_best_traj": scoring["best_traj_idx"],
                 }
 

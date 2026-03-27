@@ -183,6 +183,78 @@ def plot_training_curves(records, output_path):
         print(f"  Saved: {output_path}")
 
 
+def plot_es_health(records, output_path):
+    """Evolution Strategies training health."""
+    es_records = [r for r in records if "es_loss_mean" in r]
+    if not es_records:
+        print("  No ES data found, skipping es_health")
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle("ES Training Health", fontsize=16, fontweight="bold")
+
+        steps = [r["step"] for r in es_records]
+
+        # Trajectory loss spread (best vs worst)
+        ax = axes[0, 0]
+        _plot_line(ax, steps, [r["es_loss_best"] for r in es_records],
+                   C_TRAJ_BEST, "best trajectory")
+        _plot_line(ax, steps, [r["es_loss_worst"] for r in es_records],
+                   C_TRAJ_WORST, "worst trajectory")
+        _plot_line(ax, steps, [r["es_loss_mean"] for r in es_records],
+                   C_LOSS, "mean")
+        ax.legend()
+        _setup_ax(ax, "ES Trajectory Losses", "CE loss")
+
+        # Loss spread (signal strength — should be nonzero)
+        ax = axes[0, 1]
+        _plot_line(ax, steps, [r["es_loss_spread"] for r in es_records], C_ADV)
+        _setup_ax(ax, "ES Loss Spread (best-worst)", "spread")
+
+        # Advantage std (should be ~1 for z-score, varies for rank-based)
+        ax = axes[0, 2]
+        _plot_line(ax, steps, [r["es_adv_std"] for r in es_records], C_GATE)
+        _setup_ax(ax, "ES Advantage Std", "std")
+
+        # Prim drift (cumulative ES effect)
+        ax = axes[1, 0]
+        all_with_drift = [r for r in records if "mem_prim_drift" in r]
+        if all_with_drift:
+            s = [r["step"] for r in all_with_drift]
+            _plot_line(ax, s, [r["mem_prim_drift"] for r in all_with_drift],
+                       C_PRIM, "prim drift")
+            _plot_line(ax, s, [r["mem_key_drift"] for r in all_with_drift],
+                       C_KEY, "key drift")
+            ax.legend()
+        _setup_ax(ax, "Parameter Drift from Init", "L2 distance")
+
+        # Decay diversity (ES should diversify neurons)
+        ax = axes[1, 1]
+        all_decay = [r for r in records if "mem_decay_std" in r]
+        if all_decay:
+            s = [r["step"] for r in all_decay]
+            _plot_line(ax, s, [r["mem_decay_std"] for r in all_decay], C_DECAY)
+        _setup_ax(ax, "Decay Diversity (std)", "std")
+
+        # LM loss vs ES loss (are they tracking?)
+        ax = axes[1, 2]
+        all_loss = [r for r in records if "loss" in r]
+        if all_loss:
+            s = [r["step"] for r in all_loss]
+            _plot_line(ax, s, [r["loss"] for r in all_loss], C_LOSS, "LM loss")
+        if es_records:
+            _plot_line(ax, steps, [r["es_loss_mean"] for r in es_records],
+                       C_GATE, "ES replay loss")
+        ax.legend()
+        _setup_ax(ax, "LM Loss vs ES Replay Loss")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
+        plt.close()
+        print(f"  Saved: {output_path}")
+
+
 def plot_modulator_health(records, output_path):
     """Per-neuron modulator: gates, decay modulation, traces, gradient norm."""
     mod_records = [r for r in records if "mem_mod_gate_prim_mean" in r]
