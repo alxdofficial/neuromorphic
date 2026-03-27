@@ -55,13 +55,16 @@ def memory_graph_step_kernel(
     conn_idx_ptr,       # [N, K] int32
     conn_w_ptr,         # [BS, N, K] bf16
 
-    # Per-neuron constants
+    # Per-neuron effective params (modulated, computed before loop)
     decay_ptr,          # [BS, N] float32
     primitives_ptr,     # [BS, N, D] bf16
 
+    # Per-neuron dendritic FC weights (optional, None-safe via USE_DENDRITE_FC)
+    branch_w_ptr,       # [N, NB, BS_SIZE, D] bf16  (NB = n_branches)
+    group_w_ptr,        # [N, NG, BPG, D] bf16
+
     # Per-token inputs/outputs
     cc_signals_ptr,     # [BS, T_seg, C, D] bf16
-    eot_flags_ptr,      # [BS, T_seg] float32
     output_ptr,         # [BS, T_seg, C, D] bf16
 
     # Scalar accumulators (f32, always active)
@@ -86,6 +89,8 @@ def memory_graph_step_kernel(
 
     # Whether to write act_trace
     WRITE_ACT_TRACE: tl.constexpr,
+    # Whether to use per-neuron FC weights in dendritic tree
+    USE_DENDRITE_FC: tl.constexpr,
 ):
     """One step of neuron dynamics with dendritic tree gather."""
     b = tl.program_id(0)
@@ -93,16 +98,17 @@ def memory_graph_step_kernel(
     d = tl.arange(0, D)
 
     decay_val = tl.load(decay_ptr + b * N + n).to(tl.float32)
-    eot_val = tl.load(eot_flags_ptr + b * T_seg + t_step).to(tl.float32)
-    eff_decay = decay_val * (1.0 - eot_val)
+    eff_decay = decay_val
     eff_omd = 1.0 - eff_decay
 
     prim = tl.load(primitives_ptr + (b * N + n) * D + d).to(tl.float32)
     h_val = tl.load(h_ptr + (b * N + n) * D + d).to(tl.float32)
 
-    # --- Dendritic tree gather ---
+    # --- Dendritic tree gather (with optional per-neuron FC weights) ---
+    NB = N_GROUPS * BRANCHES_PER_GROUP  # total branches
     soma = tl.zeros([D], dtype=tl.float32)
     conn_base = 0
+    br_global = 0
     for g in range(N_GROUPS):
         group_acc = tl.zeros([D], dtype=tl.float32)
         for br in range(BRANCHES_PER_GROUP):
@@ -112,9 +118,21 @@ def memory_graph_step_kernel(
                 src = tl.load(conn_idx_ptr + n * K + idx)
                 w = tl.load(conn_w_ptr + (b * N + n) * K + idx).to(tl.float32)
                 val = tl.load(prev_msg_ptr + (b * N + src) * D + d).to(tl.float32)
-                branch_acc += w * val
-            group_acc += libdevice.tanh(branch_acc)
+                if USE_DENDRITE_FC:
+                    # branch_w: [N, NB, BRANCH_SIZE, D]
+                    bw = tl.load(branch_w_ptr + ((n * NB + br_global) * BRANCH_SIZE + k) * D + d).to(tl.float32)
+                    branch_acc += w * val * bw
+                else:
+                    branch_acc += w * val
+            tanh_branch = libdevice.tanh(branch_acc)
+            if USE_DENDRITE_FC:
+                # group_w: [N, NG, BPG, D]
+                gw = tl.load(group_w_ptr + ((n * N_GROUPS + g) * BRANCHES_PER_GROUP + br) * D + d).to(tl.float32)
+                group_acc += tanh_branch * gw
+            else:
+                group_acc += tanh_branch
             conn_base += BRANCH_SIZE
+            br_global += 1
         soma += libdevice.tanh(group_acc)
     received = soma * (1.0 / N_GROUPS)
 

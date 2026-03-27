@@ -109,6 +109,14 @@ class MemoryGraph(nn.Module):
         self.mod_lr_logit = nn.Parameter(torch.tensor(-2.0, device=device), requires_grad=False)
 
         self.register_buffer('cc_port_idx', torch.arange(config.C, device=device))
+
+        # Triton kernel buffers
+        if _HAS_TRITON and device.type == 'cuda':
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
+            self._triton_ready = True
+        else:
+            self._triton_ready = False
+
         self._initialized = False
 
     def _rms_init(self, N: int, D: int, device: torch.device) -> Tensor:
@@ -134,6 +142,14 @@ class MemoryGraph(nn.Module):
         self.mean_input = torch.zeros(BS, N, D, device=device, dtype=dtype)
         self.mean_output = torch.zeros(BS, N, D, device=device, dtype=dtype)
         self.msg_magnitude = torch.zeros(BS, N, device=device, dtype=dtype)
+
+        # Refresh Triton buffers after potential device change
+        if _HAS_TRITON and device.type == 'cuda':
+            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
+            self._triton_ready = True
+        else:
+            self._triton_ready = False
+
         self._initialized = True
 
     # ================================================================
@@ -196,17 +212,8 @@ class MemoryGraph(nn.Module):
     # ================================================================
 
     @torch.no_grad()
-    def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment. No autograd — fast.
-
-        Returns:
-            output: [BS, T_seg, C, D_mem] port neuron messages
-        """
-        BS, T_seg, C, D = cc_signals.shape
-        N = self.config.N_neurons
-        stride = self.config.memory_update_stride
-
-        # Per-neuron modulator: compute effective parameters
+    def _compute_effective_params(self):
+        """Compute modulated effective parameters (once per segment)."""
         gate_prim, gate_key, decay_mod = self._modulator_forward(self.h)
         mod_lr = torch.sigmoid(self.mod_lr_logit)
 
@@ -222,9 +229,24 @@ class MemoryGraph(nn.Module):
         eff_decay = torch.sigmoid(
             self.decay_logit.unsqueeze(0).to(self.dtype)
             + decay_mod.squeeze(-1).to(self.dtype))
+        return eff_prim, eff_key, eff_decay
+
+    @torch.no_grad()
+    def forward_segment(self, cc_signals: Tensor) -> Tensor:
+        """Process one segment. Dispatches to Triton on CUDA."""
+        eff_prim, eff_key, eff_decay = self._compute_effective_params()
+
+        if self._triton_ready and cc_signals.is_cuda:
+            return self._forward_segment_triton(cc_signals, eff_prim, eff_key, eff_decay)
+        return self._forward_segment_python(cc_signals, eff_prim, eff_key, eff_decay)
+
+    def _forward_segment_python(self, cc_signals, eff_prim, eff_key, eff_decay):
+        """Python reference implementation."""
+        BS, T_seg, C, D = cc_signals.shape
+        N = self.config.N_neurons
+        stride = self.config.memory_update_stride
         eff_decay_exp = eff_decay.unsqueeze(-1)
 
-        # Per-token dynamics
         h = self.h
         prev_msg = self.prev_messages
         output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
@@ -246,30 +268,112 @@ class MemoryGraph(nn.Module):
                 received[:, :C] = received[:, :C] + cc_signals[:, t]
                 h = eff_decay_exp * h + (1 - eff_decay_exp) * received
                 prev_msg = torch.tanh(h * eff_prim)
-
                 received_accum += received
                 msg_accum += prev_msg
 
             output[:, t] = prev_msg[:, :C]
 
-        # Update state
+        self._post_segment_update(h, prev_msg, received_accum, msg_accum, T_seg)
+        return output
+
+    def _forward_segment_triton(self, cc_signals, eff_prim, eff_key, eff_decay):
+        """Triton-accelerated per-token dynamics with dendritic FC."""
+        BS, T_seg, C, D = cc_signals.shape
+        N = self.config.N_neurons
+        K = self.config.K_connections
+        stride = self.config.memory_update_stride
+
+        # Prepare eff_decay as f32 [BS, N] for kernel
+        eff_decay_f32 = eff_decay.float().contiguous()
+        eff_prim_c = eff_prim.contiguous()
+        eff_key_c = eff_key.contiguous()
+        cc_signals = cc_signals.contiguous()
+
+        output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
+        recv_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
+        msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
+        msg_mag_accum = torch.zeros(BS, N, device=cc_signals.device, dtype=torch.float32)
+
+        grid = (BS, N)
+
+        # Routing kernel: eff_key × prev_messages → routing weights
+        routing_w = torch.empty(BS, N, K, device=cc_signals.device, dtype=self.dtype)
+        memory_graph_routing_kernel[grid](
+            self.prev_messages, eff_key_c,
+            self._conn_idx_i32, routing_w,
+            BS=BS, N=N, D=D, K=K)
+
+        # Dendritic tree params
+        if self.use_dendritic_tree:
+            branch_size = self.branch_size
+            branches_per_group = self.branches_per_group
+            n_groups = self.n_groups
+            branch_w = self.dendrite_branch_w.contiguous()
+            group_w = self.dendrite_group_w.contiguous()
+            use_fc = 1
+        else:
+            branch_size = K
+            branches_per_group = 1
+            n_groups = 1
+            branch_w = eff_prim_c  # dummy ptr (not accessed)
+            group_w = eff_prim_c
+            use_fc = 0
+
+        # Dummy act_trace (not needed for ES)
+        act_trace = msg_mag_accum  # reuse as dummy ptr
+
+        for t in range(0, T_seg, stride):
+            memory_graph_step_kernel[grid](
+                self.h, self.prev_messages,
+                self._conn_idx_i32, routing_w,
+                eff_decay_f32, eff_prim_c,
+                branch_w, group_w,
+                cc_signals, output,
+                recv_accum, msg_accum, msg_mag_accum,
+                act_trace,
+                t,
+                BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
+                BRANCH_SIZE=branch_size,
+                BRANCHES_PER_GROUP=branches_per_group,
+                N_GROUPS=n_groups,
+                WRITE_ACT_TRACE=0,
+                USE_DENDRITE_FC=use_fc)
+
+        # Fill held output slots
+        if stride > 1:
+            for s in range(1, stride):
+                output[:, s::stride] = output[:, ::stride]
+
+        n_steps = max(T_seg // stride, 1)
+        self._post_segment_update(
+            self.h, self.prev_messages,
+            (recv_accum / n_steps).to(self.dtype),
+            (msg_accum / n_steps).to(self.dtype),
+            T_seg, skip_mean=True)
+        return output
+
+    def _post_segment_update(self, h, prev_msg, received_accum, msg_accum,
+                             T_seg, skip_mean=False):
+        """Update persistent state after a segment."""
+        stride = self.config.memory_update_stride
         self.h = h
         self.prev_messages = prev_msg
-        n_steps = max(T_seg // stride, 1)
-        self.mean_input = received_accum / n_steps
-        self.mean_output = msg_accum / n_steps
 
-        # Traces
+        if not skip_mean:
+            n_steps = max(T_seg // stride, 1)
+            self.mean_input = received_accum / n_steps
+            self.mean_output = msg_accum / n_steps
+        else:
+            self.mean_input = received_accum
+            self.mean_output = msg_accum
+
         td = self.config.trace_decay
         self.trace_prim = (td * self.trace_prim + (1 - td) * h).to(self.dtype)
         self.trace_key = (td * self.trace_key + (1 - td) * self.mean_input).to(self.dtype)
 
-        # Message magnitude
         alpha = 0.05
         seg_mag = prev_msg.norm(dim=-1)
         self.msg_magnitude = (1 - alpha) * self.msg_magnitude + alpha * seg_mag
-
-        return output
 
     # ================================================================
     # ES utilities
