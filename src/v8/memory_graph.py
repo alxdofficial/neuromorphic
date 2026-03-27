@@ -1,21 +1,24 @@
-"""Memory Graph — per-token recurrence with inter-neuron message passing.
+"""Memory Graph — lightweight hippocampal neurons, trained by backprop.
 
-v9-ES: No-grad forward (fast, ~64K tok/s) + Evolution Strategies for params.
-Per-neuron modulators + dendritic FC layers (from v9), trained by ES not backprop.
+v9.1: Many simple neurons (N=8192, D=16) instead of few complex ones.
+Each neuron is a tiny agent with ~4K per-neuron params:
+  - Scalar connection weights w_conn [K] (synaptic strengths)
+  - Decay logit [1] (temporal persistence)
+  - Per-neuron MLP: cat(h, received, trace_h, trace_recv) → hidden
+      → msg head + modulator head
 
-At each token timestep within a segment:
-  1. Receive: dendritic FC gather from K neighbors (+ CC signal for ports)
-  2. Integrate: h = decay * h + (1-decay) * received
-  3. Message: prev_messages = tanh(h * effective_primitives)
+The modulator sees eligibility traces (EMAs of h and received) giving
+it temporal context: what the neuron has been experiencing, not just
+the current instant. This lets it make strategic plasticity decisions.
 
-Per-neuron modulator (runs at segment start, no grad):
-  modulator(h, traces, primitives, key) → gate_prim, gate_key, decay_mod
-  effective_prim = primitives + mod_lr * gate_prim * normalize(trace_prim)
-  effective_key = key + mod_lr * gate_key * normalize(trace_key)
-  effective_decay = sigmoid(decay_logit + decay_mod)
+The modulator head produces plasticity signals (three-factor learning):
+  - plasticity_gate: consolidate (+1) vs reverse (-1) Hebbian update
+  - plasticity_lr: how much to learn right now
+  - decay_mod: adjust forgetting rate
 
-All memory graph params updated by ES (not backprop). The modulator is
-active at inference for adaptation without any training signal.
+Hebbian plasticity on w_conn runs during training AND inference.
+All params requires_grad=True — trained end-to-end by backprop.
+Interface to LM via learned projections (D_cc ↔ D_mem).
 """
 
 import torch
@@ -24,26 +27,22 @@ from torch import Tensor
 
 from .config import V8Config
 
-try:
-    import triton
-    from .triton_kernels import memory_graph_routing_kernel, memory_graph_step_kernel
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
-
 
 class MemoryGraph(nn.Module):
-    """Memory graph with per-neuron modulators + dendritic FC, trained by ES.
+    """Hippocampal memory graph with lightweight per-neuron MLPs.
 
-    nn.Parameters (requires_grad=False, updated by ES):
-        primitives, key, decay_logit — base neuron properties
-        dendrite_branch_w, dendrite_group_w — per-neuron dendritic FC
-        fc1_w, fc1_b, fc2_w, fc2_b — per-neuron modulator MLP
-        mod_lr_logit — learnable modulation step size
+    Per-neuron params (~4K each, requires_grad=True):
+        w_conn [K] — scalar synaptic weights per connection
+        decay_logit [1] — base temporal persistence
+        W1 [4D, H], b1 [H] — hidden layer (input: h, received, trace_h, trace_recv)
+        W_msg [H, D], b_msg [D] — message head
+        W_mod [H, 3], b_mod [3] — modulator head
 
     State tensors (per-batch, not learned):
-        h, prev_messages — neuron hidden state
-        trace_prim, trace_key — eligibility traces
+        h [BS, N, D] — neuron hidden states
+        prev_messages [BS, N, D] — last outgoing messages
+        trace_h [BS, N, D] — EMA of h (what neuron has been encoding)
+        trace_received [BS, N, D] — EMA of received (what neuron has been hearing)
     """
 
     def __init__(self, config: V8Config, device: torch.device,
@@ -53,389 +52,211 @@ class MemoryGraph(nn.Module):
         self.dtype = dtype
 
         N = config.N_neurons
-        K_conn = config.K_connections
+        K = config.K_connections
         D = config.D_mem
+        H = config.neuron_hidden
+        C_mem = config.D // config.D_mem  # 2048 // 16 = 128 memory channels
+        self.C_mem = C_mem
 
-        # Fixed topology
+        # ============================================================
+        # Fixed sparse topology
+        # ============================================================
         all_idx = torch.arange(N, device=device)
         scores = torch.rand(N, N, device=device)
         scores[all_idx, all_idx] = -float('inf')
-        K_actual = min(K_conn, N - 1)
-        conn_indices = torch.zeros(N, K_conn, dtype=torch.long, device=device)
-        conn_mask = torch.ones(N, K_conn, dtype=torch.bool, device=device)
+        K_actual = min(K, N - 1)
+        conn_indices = torch.zeros(N, K, dtype=torch.long, device=device)
         conn_indices[:, :K_actual] = scores.topk(K_actual, dim=1).indices
-        if K_actual < K_conn:
-            conn_mask[:, K_actual:] = False
-        sorted_idx, order = conn_indices.sort(dim=-1)
+        sorted_idx, _ = conn_indices.sort(dim=-1)
         self.register_buffer('conn_indices', sorted_idx)
-        self.register_buffer('conn_mask', conn_mask.gather(1, order))
 
-        # Dendritic tree structure
-        branch_size = config.dendrite_branch_size
-        if branch_size > 0 and K_conn >= branch_size:
-            self.n_branches = K_conn // branch_size
-            self.branch_size = branch_size
-            self.branches_per_group = min(4, self.n_branches)
-            self.n_groups = max(1, self.n_branches // self.branches_per_group)
-            self.branches_per_group = self.n_branches // self.n_groups
-            self.use_dendritic_tree = True
-        else:
-            self.use_dendritic_tree = False
+        # Broadcast inject/readout: every neuron participates in I/O
+        # inject_w [N, C_mem]: how much each neuron listens to each memory channel
+        self.inject_w = nn.Parameter(torch.zeros(N, C_mem))
+        nn.init.uniform_(self.inject_w, -1.0, 1.0)
+        # readout_w [C_mem, N]: how each memory channel reads from neurons
+        self.readout_w = nn.Parameter(torch.zeros(C_mem, N))
+        nn.init.uniform_(self.readout_w, -1.0, 1.0)
 
-        # ================================================================
-        # Learned parameters (ES-updated, requires_grad=False)
-        # ================================================================
-        self.primitives = nn.Parameter(self._rms_init(N, D, device), requires_grad=False)
-        self.key = nn.Parameter(self._rms_init(N, D, device), requires_grad=False)
-        self.decay_logit = nn.Parameter(torch.zeros(N, device=device), requires_grad=False)
+        # ============================================================
+        # Per-neuron parameters (~2.5K params each)
+        # ============================================================
 
-        # Per-neuron dendritic FC
-        if self.use_dendritic_tree:
-            nb, bs = self.n_branches, self.branch_size
-            ng, bpg = self.n_groups, self.branches_per_group
-            self.dendrite_branch_w = nn.Parameter(
-                torch.full((N, nb, bs, D), 1.0 / bs, device=device), requires_grad=False)
-            self.dendrite_group_w = nn.Parameter(
-                torch.full((N, ng, bpg, D), 1.0 / bpg, device=device), requires_grad=False)
+        # Scalar synaptic weights [N, K]
+        self.w_conn = nn.Parameter(torch.zeros(N, K))
+        nn.init.uniform_(self.w_conn, -0.5, 0.5)
 
-        # Per-neuron modulator MLP
-        hidden = config.modulator_hidden
-        mod_input_dim = D * 5  # h + trace_prim + trace_key + primitives + key
-        fc1_w = torch.randn(N, mod_input_dim, hidden, device=device) * (2.0 / (mod_input_dim + hidden)) ** 0.5
-        self.fc1_w = nn.Parameter(fc1_w, requires_grad=False)
-        self.fc1_b = nn.Parameter(torch.zeros(N, hidden, device=device), requires_grad=False)
-        self.fc2_w = nn.Parameter(torch.zeros(N, hidden, 3, device=device), requires_grad=False)
-        self.fc2_b = nn.Parameter(torch.zeros(N, 3, device=device), requires_grad=False)
-        self.mod_lr_logit = nn.Parameter(torch.tensor(-2.0, device=device), requires_grad=False)
+        # Base decay [N]
+        self.decay_logit = nn.Parameter(torch.zeros(N))
 
-        self.register_buffer('cc_port_idx', torch.arange(config.C, device=device))
+        # Per-neuron MLP: hidden layer [4D → H]
+        # Input: cat(h, received, trace_h, trace_received)
+        self.W1 = nn.Parameter(torch.empty(N, 4 * D, H))
+        self.b1 = nn.Parameter(torch.zeros(N, H))
+        nn.init.kaiming_uniform_(self.W1, nonlinearity='tanh')
 
-        # Triton kernel buffers
-        if _HAS_TRITON and device.type == 'cuda':
-            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
-            self._triton_ready = True
-        else:
-            self._triton_ready = False
+        # Message head [H → D]
+        self.W_msg = nn.Parameter(torch.empty(N, H, D))
+        self.b_msg = nn.Parameter(torch.zeros(N, D))
+        # Small init so messages start near zero
+        nn.init.kaiming_uniform_(self.W_msg, nonlinearity='tanh')
+        self.W_msg.data.mul_(0.1)
+
+        # Modulator head [H → 3] (gate, lr, decay_mod)
+        self.W_mod = nn.Parameter(torch.zeros(N, H, 3))
+        self.b_mod = nn.Parameter(torch.zeros(N, 3))
+        # Zero-init: modulator starts as no-op
+
+        # Hebbian learning rate (meta-parameter, learned by backprop)
+        self.hebbian_lr_logit = nn.Parameter(
+            torch.tensor(-4.0))  # sigmoid(-4) ≈ 0.018
 
         self._initialized = False
-
-    def _rms_init(self, N: int, D: int, device: torch.device) -> Tensor:
-        raw = torch.randn(N, D, device=device)
-        rms = raw.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
-        return raw / rms
 
     def is_initialized(self) -> bool:
         return self._initialized
 
     def initialize_states(self, BS: int):
-        device = self.primitives.device
-        N, D = self.config.N_neurons, self.config.D_mem
+        device = self.w_conn.device
+        N = self.config.N_neurons
+        D = self.config.D_mem
         dtype = self.dtype
 
-        self.h = torch.randn(BS, N, D, device=device, dtype=dtype) * 0.1
-        self.prev_messages = torch.tanh(
-            self.h * self.primitives.unsqueeze(0).to(dtype))
-
-        self.trace_prim = torch.zeros(BS, N, D, device=device, dtype=dtype)
-        self.trace_key = torch.zeros(BS, N, D, device=device, dtype=dtype)
-
-        self.mean_input = torch.zeros(BS, N, D, device=device, dtype=dtype)
-        self.mean_output = torch.zeros(BS, N, D, device=device, dtype=dtype)
+        self.h = torch.randn(BS, N, D, device=device, dtype=dtype) * 0.01
+        self.prev_messages = torch.zeros(BS, N, D, device=device, dtype=dtype)
+        self.trace_h = torch.zeros(BS, N, D, device=device, dtype=dtype)
+        self.trace_received = torch.zeros(BS, N, D, device=device, dtype=dtype)
         self.msg_magnitude = torch.zeros(BS, N, device=device, dtype=dtype)
-
-        # Refresh Triton buffers after potential device change
-        if _HAS_TRITON and device.type == 'cuda':
-            self._conn_idx_i32 = self.conn_indices.to(torch.int32).contiguous()
-            self._triton_ready = True
-        else:
-            self._triton_ready = False
 
         self._initialized = True
 
     # ================================================================
-    # Per-neuron modulator
+    # Forward segment (differentiable, TBPTT at segment boundaries)
     # ================================================================
 
-    @torch.no_grad()
-    def _modulator_forward(self, h: Tensor,
-                           _trace_prim: Tensor | None = None,
-                           _trace_key: Tensor | None = None,
-                           ) -> tuple[Tensor, Tensor, Tensor]:
-        """Per-neuron MLP: [h, trace_prim, trace_key, prim, key] → 3 scalars."""
-        BS = h.shape[0]
-        tp = _trace_prim if _trace_prim is not None else self.trace_prim
-        tk = _trace_key if _trace_key is not None else self.trace_key
-
-        mod_input = torch.cat([
-            h.float(), tp.float(), tk.float(),
-            self.primitives.unsqueeze(0).expand(BS, -1, -1).float(),
-            self.key.unsqueeze(0).expand(BS, -1, -1).float(),
-        ], dim=-1)
-
-        x = torch.einsum('bnd,ndh->bnh', mod_input, self.fc1_w.float()) + self.fc1_b.float()
-        x = torch.tanh(x)
-        out = torch.einsum('bnh,nho->bno', x, self.fc2_w.float()) + self.fc2_b.float()
-
-        gate_prim = torch.tanh(out[..., 0:1])
-        gate_key = torch.tanh(out[..., 1:2])
-        decay_mod = out[..., 2:3]
-        return gate_prim, gate_key, decay_mod
-
-    # ================================================================
-    # Dendritic gather
-    # ================================================================
-
-    def _dendritic_gather_fc(self, weighted: Tensor) -> Tensor:
-        """Dendritic tree with per-neuron FC at branch and group levels."""
-        BS, N, _, D = weighted.shape
-        K = self.config.K_connections
-        bsz, bpg = self.branch_size, self.branches_per_group
-        ng, nb = self.n_groups, self.n_branches
-
-        n_tree = ng * bpg * bsz
-        tree_msgs = weighted[:, :, :n_tree].view(BS, N, nb, bsz, D)
-        branch_out = torch.tanh(
-            (tree_msgs * self.dendrite_branch_w.unsqueeze(0)).sum(dim=3))
-        branch_grouped = branch_out.view(BS, N, ng, bpg, D)
-        group_out = torch.tanh(
-            (branch_grouped * self.dendrite_group_w.unsqueeze(0)).sum(dim=3))
-        received = group_out.mean(dim=2)
-
-        if n_tree < K:
-            leftover = weighted[:, :, n_tree:].sum(dim=2)
-            tree_frac = n_tree / K
-            received = tree_frac * received + (1 - tree_frac) * leftover
-        return received
-
-    # ================================================================
-    # Forward segment (no grad — fast)
-    # ================================================================
-
-    @torch.no_grad()
-    def _compute_effective_params(self):
-        """Compute modulated effective parameters (once per segment)."""
-        gate_prim, gate_key, decay_mod = self._modulator_forward(self.h)
-        mod_lr = torch.sigmoid(self.mod_lr_logit)
-
-        trace_prim_dir = self.trace_prim / self.trace_prim.norm(
-            dim=-1, keepdim=True).clamp(min=1e-8)
-        trace_key_dir = self.trace_key / self.trace_key.norm(
-            dim=-1, keepdim=True).clamp(min=1e-8)
-
-        eff_prim = (self.primitives.unsqueeze(0).to(self.dtype)
-                    + mod_lr * gate_prim.to(self.dtype) * trace_prim_dir)
-        eff_key = (self.key.unsqueeze(0).to(self.dtype)
-                   + mod_lr * gate_key.to(self.dtype) * trace_key_dir)
-        eff_decay = torch.sigmoid(
-            self.decay_logit.unsqueeze(0).to(self.dtype)
-            + decay_mod.squeeze(-1).to(self.dtype))
-        return eff_prim, eff_key, eff_decay
-
-    @torch.no_grad()
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment. Dispatches to Triton on CUDA."""
-        eff_prim, eff_key, eff_decay = self._compute_effective_params()
+        """Process one segment of tokens. Fully differentiable.
 
-        if self._triton_ready and cc_signals.is_cuda:
-            return self._forward_segment_triton(cc_signals, eff_prim, eff_key, eff_decay)
-        return self._forward_segment_python(cc_signals, eff_prim, eff_key, eff_decay)
+        Args:
+            cc_signals: [BS, T_seg, C_mem, D_mem] — H_mid reshaped to memory channels
 
-    def _forward_segment_python(self, cc_signals, eff_prim, eff_key, eff_decay):
-        """Python reference implementation."""
-        BS, T_seg, C, D = cc_signals.shape
+        Returns:
+            output: [BS, T_seg, C_mem, D_mem] memory signals for upper scan
+        """
+        BS, T_seg, C_mem, D = cc_signals.shape
         N = self.config.N_neurons
+        K = self.config.K_connections
         stride = self.config.memory_update_stride
-        eff_decay_exp = eff_decay.unsqueeze(-1)
 
-        h = self.h
-        prev_msg = self.prev_messages
-        output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
-        received_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=self.dtype)
-        msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=self.dtype)
+        cc_mem = cc_signals.to(self.dtype)
+
+        # Detach h at segment boundary (TBPTT)
+        h = self.h.detach()
+        prev_msg = self.prev_messages.detach()
+
+        output = torch.empty(BS, T_seg, C_mem, D, device=cc_signals.device,
+                             dtype=cc_signals.dtype)
 
         for t in range(T_seg):
             if t % stride == 0:
-                neighbor_msgs = prev_msg[:, self.conn_indices]
-                sim = (eff_key.unsqueeze(2) * neighbor_msgs).sum(dim=-1)
-                routing = torch.sigmoid(sim)
-                weighted = routing.unsqueeze(-1) * neighbor_msgs
+                # 1. Gather neighbor messages
+                neighbor_msgs = prev_msg[:, self.conn_indices]  # [BS, N, K, D]
 
-                if self.use_dendritic_tree:
-                    received = self._dendritic_gather_fc(weighted)
-                else:
-                    received = weighted.sum(dim=2)
+                # 2. Scalar-weighted receive
+                routing = torch.sigmoid(self.w_conn)  # [N, K]
+                weighted = routing.unsqueeze(0).unsqueeze(-1) * neighbor_msgs
+                received = weighted.sum(dim=2)  # [BS, N, D]
 
-                received[:, :C] = received[:, :C] + cc_signals[:, t]
-                h = eff_decay_exp * h + (1 - eff_decay_exp) * received
-                prev_msg = torch.tanh(h * eff_prim)
-                received_accum += received
-                msg_accum += prev_msg
+                # 3. Broadcast CC injection to all neurons
+                inject_weights = torch.sigmoid(self.inject_w)  # [N, C]
+                broadcast = torch.einsum(
+                    'nc,bcd->bnd', inject_weights,
+                    cc_mem[:, t].float()).to(self.dtype)
+                received = received + broadcast
 
-            output[:, t] = prev_msg[:, :C]
+                # 4. Per-neuron MLP: cat(h, received, trace_h, trace_recv) → hidden
+                mlp_in = torch.cat([
+                    h.float(), received.float(),
+                    self.trace_h.float(), self.trace_received.float(),
+                ], dim=-1)  # [BS, N, 4D]
+                hidden = torch.tanh(
+                    torch.einsum('bnd,ndh->bnh', mlp_in,
+                                 self.W1.float()) + self.b1.float())
 
-        self._post_segment_update(h, prev_msg, received_accum, msg_accum, T_seg)
+                # 5. Message head
+                msg = torch.tanh(
+                    torch.einsum('bnh,nhd->bnd', hidden,
+                                 self.W_msg.float()) + self.b_msg.float())
+                msg = msg.to(self.dtype)
+
+                # 6. Modulator head
+                mod_out = (torch.einsum('bnh,nho->bno', hidden,
+                                        self.W_mod.float()) + self.b_mod.float())
+                plasticity_gate = torch.tanh(mod_out[..., 0])      # [BS, N]
+                plasticity_lr = torch.sigmoid(mod_out[..., 1])      # [BS, N]
+                decay_mod = mod_out[..., 2].to(self.dtype)          # [BS, N]
+
+                # 7. Integrate with modulated decay
+                eff_decay = torch.sigmoid(
+                    self.decay_logit.unsqueeze(0) + decay_mod
+                ).unsqueeze(-1)  # [BS, N, 1]
+                h = eff_decay * h + (1 - eff_decay) * received
+
+                # 8. Hebbian plasticity on w_conn (detached — side effect)
+                with torch.no_grad():
+                    eta = torch.sigmoid(self.hebbian_lr_logit)
+                    pre = neighbor_msgs.mean(dim=-1)  # [BS, N, K]
+                    post = msg.norm(dim=-1, keepdim=True)  # [BS, N, 1]
+                    hebb = pre * post  # [BS, N, K]
+                    gate = (plasticity_gate * plasticity_lr).unsqueeze(-1)
+                    delta_w = eta * gate * hebb  # [BS, N, K]
+                    self.w_conn.data += delta_w.mean(dim=0).float()
+
+                # 9. Update eligibility traces (detached — temporal context)
+                with torch.no_grad():
+                    td = 0.95
+                    self.trace_h = (td * self.trace_h + (1 - td) * h.detach()
+                                    ).to(self.dtype)
+                    self.trace_received = (td * self.trace_received
+                                           + (1 - td) * received.detach()
+                                           ).to(self.dtype)
+
+                prev_msg = msg
+
+            # 10. Weighted readout from all neurons
+            readout_weights = torch.sigmoid(self.readout_w)  # [C_mem, N]
+            read_msg = torch.einsum(
+                'cn,bnd->bcd', readout_weights,
+                prev_msg.float()).to(cc_signals.dtype)  # [BS, C_mem, D]
+            output[:, t] = read_msg
+
+        # Update persistent state
+        self.h = h.detach()
+        self.prev_messages = prev_msg.detach()
+
+        # Track message magnitude for diagnostics
+        with torch.no_grad():
+            alpha = 0.05
+            seg_mag = prev_msg.detach().norm(dim=-1)
+            self.msg_magnitude = (1 - alpha) * self.msg_magnitude + alpha * seg_mag
+
         return output
 
-    def _forward_segment_triton(self, cc_signals, eff_prim, eff_key, eff_decay):
-        """Triton-accelerated per-token dynamics with dendritic FC."""
-        BS, T_seg, C, D = cc_signals.shape
-        N = self.config.N_neurons
-        K = self.config.K_connections
-        stride = self.config.memory_update_stride
-
-        # Prepare eff_decay as f32 [BS, N] for kernel
-        eff_decay_f32 = eff_decay.float().contiguous()
-        eff_prim_c = eff_prim.contiguous()
-        eff_key_c = eff_key.contiguous()
-        cc_signals = cc_signals.contiguous()
-
-        output = torch.empty(BS, T_seg, C, D, device=cc_signals.device, dtype=self.dtype)
-        recv_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
-        msg_accum = torch.zeros(BS, N, D, device=cc_signals.device, dtype=torch.float32)
-        msg_mag_accum = torch.zeros(BS, N, device=cc_signals.device, dtype=torch.float32)
-
-        grid = (BS, N)
-
-        # Routing kernel: eff_key × prev_messages → routing weights
-        routing_w = torch.empty(BS, N, K, device=cc_signals.device, dtype=self.dtype)
-        memory_graph_routing_kernel[grid](
-            self.prev_messages, eff_key_c,
-            self._conn_idx_i32, routing_w,
-            BS=BS, N=N, D=D, K=K)
-
-        # Dendritic tree params
-        if self.use_dendritic_tree:
-            branch_size = self.branch_size
-            branches_per_group = self.branches_per_group
-            n_groups = self.n_groups
-            branch_w = self.dendrite_branch_w.contiguous()
-            group_w = self.dendrite_group_w.contiguous()
-            use_fc = 1
-        else:
-            branch_size = K
-            branches_per_group = 1
-            n_groups = 1
-            branch_w = eff_prim_c  # dummy ptr (not accessed)
-            group_w = eff_prim_c
-            use_fc = 0
-
-        # Dummy act_trace (not needed for ES)
-        act_trace = msg_mag_accum  # reuse as dummy ptr
-
-        for t in range(0, T_seg, stride):
-            memory_graph_step_kernel[grid](
-                self.h, self.prev_messages,
-                self._conn_idx_i32, routing_w,
-                eff_decay_f32, eff_prim_c,
-                branch_w, group_w,
-                cc_signals, output,
-                recv_accum, msg_accum, msg_mag_accum,
-                act_trace,
-                t,
-                BS=BS, N=N, D=D, K=K, C=C, T_seg=T_seg,
-                BRANCH_SIZE=branch_size,
-                BRANCHES_PER_GROUP=branches_per_group,
-                N_GROUPS=n_groups,
-                WRITE_ACT_TRACE=0,
-                USE_DENDRITE_FC=use_fc)
-
-        # Fill held output slots
-        if stride > 1:
-            for s in range(1, stride):
-                output[:, s::stride] = output[:, ::stride]
-
-        n_steps = max(T_seg // stride, 1)
-        self._post_segment_update(
-            self.h, self.prev_messages,
-            (recv_accum / n_steps).to(self.dtype),
-            (msg_accum / n_steps).to(self.dtype),
-            T_seg, skip_mean=True)
-        return output
-
-    def _post_segment_update(self, h, prev_msg, received_accum, msg_accum,
-                             T_seg, skip_mean=False):
-        """Update persistent state after a segment."""
-        stride = self.config.memory_update_stride
-        self.h = h
-        self.prev_messages = prev_msg
-
-        if not skip_mean:
-            n_steps = max(T_seg // stride, 1)
-            self.mean_input = received_accum / n_steps
-            self.mean_output = msg_accum / n_steps
-        else:
-            self.mean_input = received_accum
-            self.mean_output = msg_accum
-
-        td = self.config.trace_decay
-        self.trace_prim = (td * self.trace_prim + (1 - td) * h).to(self.dtype)
-        self.trace_key = (td * self.trace_key + (1 - td) * self.mean_input).to(self.dtype)
-
-        alpha = 0.05
-        seg_mag = prev_msg.norm(dim=-1)
-        self.msg_magnitude = (1 - alpha) * self.msg_magnitude + alpha * seg_mag
-
     # ================================================================
-    # ES utilities
+    # Utilities
     # ================================================================
-
-    def get_es_params(self) -> dict[str, Tensor]:
-        """Get all ES-trainable parameter tensors (per-neuron params only)."""
-        params = {
-            'primitives': self.primitives.data,
-            'key': self.key.data,
-            'decay_logit': self.decay_logit.data,
-            'fc1_w': self.fc1_w.data,
-            'fc1_b': self.fc1_b.data,
-            'fc2_w': self.fc2_w.data,
-            'fc2_b': self.fc2_b.data,
-        }
-        if self.use_dendritic_tree:
-            params['dendrite_branch_w'] = self.dendrite_branch_w.data
-            params['dendrite_group_w'] = self.dendrite_group_w.data
-        return params
-
-    def get_neuron_es_params(self, neuron_ids: Tensor) -> dict[str, Tensor]:
-        """Get ES params for a subset of neurons (for sparse ES)."""
-        K_idx = neuron_ids  # [K]
-        params = {
-            'primitives': self.primitives.data[K_idx],
-            'key': self.key.data[K_idx],
-            'decay_logit': self.decay_logit.data[K_idx],
-            'fc1_w': self.fc1_w.data[K_idx],
-            'fc1_b': self.fc1_b.data[K_idx],
-            'fc2_w': self.fc2_w.data[K_idx],
-            'fc2_b': self.fc2_b.data[K_idx],
-        }
-        if self.use_dendritic_tree:
-            params['dendrite_branch_w'] = self.dendrite_branch_w.data[K_idx]
-            params['dendrite_group_w'] = self.dendrite_group_w.data[K_idx]
-        return params
-
-    def apply_es_perturbation(self, neuron_ids: Tensor,
-                              noise: dict[str, Tensor], sigma: float):
-        """Add scaled noise to K neurons' parameters."""
-        K_idx = neuron_ids
-        for name, eps in noise.items():
-            param = getattr(self, name)
-            param.data[K_idx] += sigma * eps
-
-    def apply_es_update(self, neuron_ids: Tensor,
-                        weighted_noise: dict[str, Tensor], lr: float):
-        """Apply ES gradient estimate to K neurons' parameters."""
-        K_idx = neuron_ids
-        for name, update in weighted_noise.items():
-            param = getattr(self, name)
-            param.data[K_idx] += lr * update
 
     def detach_states(self):
-        pass  # States are never on compute graph
+        """Detach persistent states from compute graph."""
+        self.h = self.h.detach()
+        self.prev_messages = self.prev_messages.detach()
 
     def runtime_state_dict(self) -> dict:
         return {
-            'h': self.h, 'prev_messages': self.prev_messages,
-            'trace_prim': self.trace_prim, 'trace_key': self.trace_key,
-            'mean_input': self.mean_input, 'mean_output': self.mean_output,
+            'h': self.h,
+            'prev_messages': self.prev_messages,
+            'trace_h': self.trace_h,
+            'trace_received': self.trace_received,
             'msg_magnitude': self.msg_magnitude,
         }
 

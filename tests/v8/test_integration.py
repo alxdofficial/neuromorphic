@@ -1,4 +1,4 @@
-"""Integration tests for v8/v9 model (LM backprop + ES memory)."""
+"""Integration tests for v9.1 model (LM backprop + differentiable memory)."""
 
 import torch
 import torch.nn.functional as F
@@ -78,10 +78,10 @@ class TestForward:
         input_ids2 = torch.randint(0, VOCAB, (BS, cfg.T))
         reset_mask = torch.tensor([True, False])
         model.forward_chunk(input_ids2, reset_mask=reset_mask, has_reset=True)
-        assert model.memory.h[0].abs().sum() > 0  # memory NOT reset
+        assert model.memory.h[0].abs().sum() > 0
 
 
-class TestLMGradients:
+class TestGradients:
     def test_lm_params_get_gradient(self):
         cfg = make_tiny()
         model = V8Model(cfg)
@@ -112,8 +112,8 @@ class TestLMGradients:
         loss.backward()
         assert model.lm.mem_gate.grad is not None
 
-    def test_memory_params_no_grad(self):
-        """Memory graph params should NOT get gradients (ES-trained)."""
+    def test_memory_params_get_gradient(self):
+        """Memory graph params SHOULD get gradients (differentiable training)."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
@@ -125,72 +125,24 @@ class TestLMGradients:
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
         loss.backward()
 
-        for name, p in model.memory.named_parameters():
-            assert p.grad is None, f"Memory param {name} should not have grad"
+        assert model.memory.W_msg.grad is not None, "W_msg should have grad"
+        assert model.memory.W1.grad is not None, "W1 should have grad"
+        assert model.memory.readout_w.grad is not None, \
+            "readout_w should have grad"
 
-
-class TestES:
-    def test_score_trajectories(self):
+    def test_w_conn_gets_gradient(self):
+        """Connection weights should get gradients through routing."""
         cfg = make_tiny()
         model = V8Model(cfg)
         model.initialize_states(BS, torch.device("cpu"))
+        input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
+        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
 
-        # Collect chunks
-        pre_state = {k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
-        pre_params = {k: v.clone() for k, v in model.memory.get_es_params().items()}
-
-        es_buffer = []
-        for _ in range(2):
-            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            result = model.forward_chunk(input_ids, target_ids=target_ids)
-            eot_at = (input_ids == cfg.eot_id)
-            es_buffer.append({
-                "cc_segments": result["cc_segments"],
-                "H_mid": result["H_mid"],
-                "surprise": result["surprise"],
-                "target_ids": target_ids,
-                "eot_at": eot_at,
-                "pre_upper_carries": None,
-            })
-
-        scoring = model.score_es_trajectories(es_buffer, pre_state, pre_params)
-
-        assert scoring["k_neurons"].shape[0] == min(cfg.es_k_neurons, cfg.N_neurons)
-        assert scoring["advantages"].shape[0] == cfg.es_n_trajectories
-        assert len(scoring["noise"]) == cfg.es_n_trajectories
-        assert torch.isfinite(scoring["advantages"]).all()
-
-    def test_apply_gradient(self):
-        cfg = make_tiny()
-        model = V8Model(cfg)
-        model.initialize_states(BS, torch.device("cpu"))
-
-        pre_state = {k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
-        pre_params = {k: v.clone() for k, v in model.memory.get_es_params().items()}
-
-        es_buffer = []
-        for _ in range(2):
-            input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            result = model.forward_chunk(input_ids, target_ids=target_ids)
-            es_buffer.append({
-                "cc_segments": result["cc_segments"],
-                "H_mid": result["H_mid"],
-                "surprise": result["surprise"],
-                "target_ids": target_ids,
-                "eot_at": (input_ids == cfg.eot_id),
-                "pre_upper_carries": None,
-            })
-
-        prim_before = model.memory.primitives.data.clone()
-        scoring = model.score_es_trajectories(es_buffer, pre_state, pre_params)
-        model.apply_es_gradient(scoring)
-
-        # Params for K neurons should have changed
-        k = scoring["k_neurons"]
-        # At least some change expected (unless all advantages are 0)
-        # With random data, advantages should have nonzero std
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        loss = F.cross_entropy(
+            result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
+        loss.backward()
+        assert model.memory.w_conn.grad is not None, "w_conn should have grad"
 
 
 class TestParamCount:

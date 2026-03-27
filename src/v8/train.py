@@ -1,11 +1,12 @@
-"""Entry point for v8/v9 training.
+"""Entry point for v8/v9.1 training.
 
 Usage:
-    python -m src.v8.train                        # defaults (LM backprop + ES memory)
+    python -m src.v8.train                        # defaults (LM + memory, backprop)
     python -m src.v8.train --no-memory             # LM-only baseline
     python -m src.v8.train --no-compile            # disable torch.compile
 
-LM trained by backprop. Memory graph trained by Evolution Strategies.
+Single optimizer trains both LM and memory graph.
+Memory graph params use a lower learning rate (mem_lr_scale × LM LR).
 """
 
 import argparse
@@ -42,7 +43,7 @@ SAVE_DIR = "outputs/v8"
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="v8/v9 training (LM backprop + ES memory)")
+    p = argparse.ArgumentParser(description="v9.1 training (LM + memory, backprop)")
     p.add_argument("--bs", type=int, default=BS)
     p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--steps", type=int, default=MAX_STEPS)
@@ -59,8 +60,8 @@ def parse_args():
     p.add_argument("--snapshot-interval", type=int, default=1000)
     p.add_argument("--plot-interval", type=int, default=500)
     p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--es-warmup", type=int, default=None,
-                   help="Steps before ES starts (default: from config)")
+    p.add_argument("--mem-lr-scale", type=float, default=None,
+                   help="Memory param LR = this * LM LR (default: from config)")
     return p.parse_args()
 
 
@@ -84,18 +85,17 @@ def main():
     config.eot_id = eot_id
     if args.compile is not None:
         config.use_compile = args.compile
-    if args.es_warmup is not None:
-        config.es_warmup = args.es_warmup
+    if args.mem_lr_scale is not None:
+        config.mem_lr_scale = args.mem_lr_scale
     config.validate()
 
     bs = args.bs
     T = config.T
     print(f"\nConfig: D={config.D}, C={config.C}, D_cc={config.D_cc}")
     print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, d_inner={config.d_inner}")
-    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections")
-    print(f"  ES: K={config.es_k_neurons}, N_traj={config.es_n_trajectories}, "
-          f"σ={config.es_sigma}, lr={config.es_lr}, collect={config.es_collect_chunks}")
-    print(f"  Training: BS={bs}, T={T}")
+    print(f"  Memory: {config.N_neurons} neurons, D_mem={config.D_mem}, K={config.K_connections}")
+    print(f"  Neuron MLP: hidden={config.neuron_hidden}")
+    print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
     # Model
     model = V8Model(config)
@@ -119,7 +119,7 @@ def main():
     mem_params = model.memory_param_count()
     print(f"\nParameters: {model.param_count():,} total")
     print(f"  LM (backprop): {lm_params:,} ({lm_params/1e6:.1f}M)")
-    print(f"  Memory (ES): {mem_params:,} ({mem_params/1e6:.1f}M)")
+    print(f"  Memory (backprop): {mem_params:,} ({mem_params/1e6:.1f}M)")
 
     # Compile
     if config.use_compile and device.type == "cuda":
@@ -128,20 +128,24 @@ def main():
         model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
         model.lm.forward_output = torch.compile(model.lm.forward_output)
 
-    # LM optimizer (memory graph params have requires_grad=False, excluded automatically)
-    decay_params = []
-    no_decay_params = []
+    # Single optimizer with param groups
+    lm_decay = []
+    lm_no_decay = []
     for name, param in model.lm.named_parameters():
         if not param.requires_grad:
             continue
         if param.ndim <= 1 or name.endswith(".bias"):
-            no_decay_params.append(param)
+            lm_no_decay.append(param)
         else:
-            decay_params.append(param)
+            lm_decay.append(param)
 
-    lm_optimizer = torch.optim.AdamW(
-        [{"params": decay_params, "weight_decay": WEIGHT_DECAY},
-         {"params": no_decay_params, "weight_decay": 0.0}],
+    mem_params_list = [p for p in model.memory.parameters() if p.requires_grad]
+    mem_lr = args.lr * config.mem_lr_scale
+
+    optimizer = torch.optim.AdamW(
+        [{"params": lm_decay, "weight_decay": WEIGHT_DECAY},
+         {"params": lm_no_decay, "weight_decay": 0.0},
+         {"params": mem_params_list, "weight_decay": 0.0, "lr": mem_lr}],
         lr=args.lr, betas=(0.9, 0.95),
         fused=(device.type == "cuda"))
 
@@ -152,14 +156,14 @@ def main():
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return LR_MIN / args.lr + (1.0 - LR_MIN / args.lr) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume optimizer
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         if "optimizer_state_dict" in ckpt:
             try:
-                lm_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 print(f"  Loaded optimizer state")
             except Exception as e:
                 print(f"  Could not load optimizer: {e}")
@@ -177,7 +181,7 @@ def main():
 
     # Trainer
     trainer = V8Trainer(
-        model=model, lm_optimizer=lm_optimizer, scheduler=scheduler,
+        model=model, optimizer=optimizer, scheduler=scheduler,
         dataloader=dataloader, config=config, device=device,
         max_grad_norm=MAX_GRAD_NORM, log_interval=args.log_interval,
         use_memory=not args.no_memory)
@@ -214,18 +218,16 @@ def main():
             metrics_file.flush()
 
         if step % args.log_interval == 0:
-            es_str = ""
-            if "es_loss_mean" in metrics:
-                es_str = (f" | es_mean={metrics['es_loss_mean']:.4f}"
-                          f" best={metrics['es_loss_best']:.4f}")
             mem_str = ""
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
-                           f" prim_drift={metrics.get('mem_prim_drift', 0):.4f}"
-                           f" gate={metrics.get('mem_mod_gate_prim_mean', 0):.4f}")
+                           f" w_conn={metrics.get('mem_w_conn_mean', 0):.3f}"
+                           f" hebb={metrics.get('mem_hebbian_lr', 0):.4f}")
             print(f"  step {step:5d} | loss={metrics['loss']:.4f} | "
                   f"ppl={metrics['ppl']:.1f} | tok/s={metrics['tok_s']/1e3:.1f}K | "
-                  f"lr={metrics['lr']:.2e}{es_str}{mem_str}")
+                  f"lr={metrics['lr']:.2e} | "
+                  f"gnorm_lm={metrics['lm_grad_norm']:.2f} "
+                  f"gnorm_mem={metrics['mem_grad_norm']:.2f}{mem_str}")
 
         diag.maybe_snapshot(step)
 
@@ -233,7 +235,7 @@ def main():
             ckpt_path = os.path.join(save_dir, f"v8_step{step}.pt")
             ckpt = {
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": lm_optimizer.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": step, "config": config,
             }
@@ -256,15 +258,11 @@ def main():
             try:
                 from scripts.plot_training import (
                     load_metrics as _load_m, plot_training_curves,
-                    plot_es_health, plot_modulator_health,
-                    plot_memory_health, plot_pcm_health,
-                    plot_connectivity_snapshot, plot_neuron_graph)
+                    plot_memory_health, plot_pcm_health)
                 plot_dir = os.path.join(save_dir, "plots")
                 os.makedirs(plot_dir, exist_ok=True)
                 _records = _load_m(metrics_path)
                 plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
-                plot_es_health(_records, os.path.join(plot_dir, "es_health.png"))
-                plot_modulator_health(_records, os.path.join(plot_dir, "modulator_health.png"))
                 plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
                 plot_pcm_health(_records, os.path.join(plot_dir, "pcm_health.png"))
             except Exception as e:
@@ -275,7 +273,7 @@ def main():
     final_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
     torch.save({
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": lm_optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step": trainer.global_step, "config": config,
         "memory_runtime_state": model.memory.runtime_state_dict()
