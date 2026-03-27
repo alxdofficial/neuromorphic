@@ -136,16 +136,22 @@ class V8Model(nn.Module):
         # Get current K-neuron param shapes for noise generation
         k_params = mg.get_neuron_es_params(k_neurons)
 
+        # Per-param-type σ scaling: σ_effective = σ * param_rms
+        # So larger-magnitude params get proportionally larger perturbations
+        param_scales = {}
+        for name, param in k_params.items():
+            rms = param.pow(2).mean().sqrt().clamp(min=1e-6).item()
+            param_scales[name] = rms
+
         # Generate noise for all trajectories (antithetic: +ε and -ε)
         all_noise = []
         for traj_i in range(N_traj):
             noise = {}
             if traj_i % 2 == 0:
-                # Fresh noise
                 for name, param in k_params.items():
-                    noise[name] = torch.randn_like(param)
+                    # Scale noise by param RMS so perturbation is proportional
+                    noise[name] = torch.randn_like(param) * param_scales[name]
             else:
-                # Antithetic (negate previous)
                 prev_noise = all_noise[-1]
                 noise = {name: -eps for name, eps in prev_noise.items()}
             all_noise.append(noise)
@@ -225,9 +231,14 @@ class V8Model(nn.Module):
                     if self.lm._carries[split + i] is not None else None
                     for i in range(L - split)]
 
-        # Z-score advantages (lower loss = higher advantage)
-        tl_std = trajectory_losses.std().clamp(min=1e-8)
-        advantages = -(trajectory_losses - trajectory_losses.mean()) / tl_std
+        # Rank-based fitness shaping (robust to outliers and σ scaling)
+        # Utility: u_i = max(0, log(N/2 + 1) - log(rank_i)) then normalize
+        import math
+        ranks = trajectory_losses.argsort().argsort().float() + 1  # 1-indexed ranks (lower loss = rank 1)
+        log_half = math.log(N_traj / 2.0 + 1)
+        utilities = torch.clamp(log_half - torch.log(ranks), min=0)
+        utilities = utilities / utilities.sum().clamp(min=1e-8) - 1.0 / N_traj
+        advantages = -utilities  # negate because lower rank = lower loss = positive advantage
 
         # Restore best trajectory state
         for name, val in best_mg_params.items():
