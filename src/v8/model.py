@@ -196,7 +196,8 @@ class V8Model(nn.Module):
                         self.lm._carries[split + i] = c.clone() if c is not None else None
 
                 # Memory forward
-                mem_out = torch.empty(BS, self.config.T, self.config.C, self.config.D_mem,
+                C_mem = mg.C_mem
+                mem_out = torch.empty(BS, self.config.T, C_mem, self.config.D_mem,
                                       device=device, dtype=dtype)
                 for seg in range(n_segments):
                     seg_out = mg.forward_segment(cc_segments[:, seg])

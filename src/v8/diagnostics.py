@@ -71,15 +71,22 @@ class V8Diagnostics:
             metrics["mem_decay_std"] = round(decay.std().item(), 4)
 
             # Message magnitude
-            C = self.model.config.C
             mm = mg.msg_magnitude  # [BS, N]
             metrics["mem_msg_mag_mean"] = round(mm.mean().item(), 4)
-            metrics["mem_msg_mag_port"] = round(mm[:, :C].mean().item(), 4)
-            metrics["mem_msg_mag_nonport"] = round(mm[:, C:].mean().item(), 4)
+            metrics["mem_msg_mag_std"] = round(mm.std().item(), 4)
+            metrics["mem_msg_mag_max"] = round(mm.max().item(), 4)
 
             # Active neurons
             metrics["mem_usage_frac"] = round(
                 (mm.mean(dim=0) > 0.01).float().mean().item(), 4)
+
+            # Inject/readout weight stats
+            inject_w = torch.sigmoid(mg.inject_w.data)  # [N, C_mem]
+            readout_w = torch.sigmoid(mg.readout_w.data)  # [C_mem, N]
+            metrics["mem_inject_mean"] = round(inject_w.mean().item(), 4)
+            metrics["mem_inject_std"] = round(inject_w.std().item(), 4)
+            metrics["mem_readout_mean"] = round(readout_w.mean().item(), 4)
+            metrics["mem_readout_std"] = round(readout_w.std().item(), 4)
 
             # tanh saturation
             msg_abs = mg.prev_messages.abs()

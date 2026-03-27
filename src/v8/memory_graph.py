@@ -291,11 +291,9 @@ class MemoryGraph(nn.Module):
     def _forward_segment_triton(self, cc_signals, eff_prim, eff_key, eff_decay):
         """Triton-accelerated per-token dynamics with dendritic FC.
 
-        CC inject/readout are done outside the Triton kernel via broadcast
-        einsum (inject_w / readout_w).  The kernel runs with C=0 so its
-        internal ``if n < C`` guards for port-neuron inject/output are
-        never triggered.  After each kernel step we correct h and
-        prev_messages to include the broadcast CC contribution.
+        Inject broadcast precomputed as [BS, T_seg, N, D], passed to kernel.
+        Per-step messages saved to msg_all buffer inside kernel.
+        Readout computed as single batched einsum after all T steps.
         """
         BS, T_seg, C_mem, D = cc_signals.shape
         N = self.config.N_neurons
