@@ -132,8 +132,10 @@ class MemoryGraph:
         K_conn = self.config.K_connections
 
         # Per-neuron parameters (neuromodulator-controlled)
-        prim_raw = 1.0 + torch.randn(BS, N, D, device=self.device, dtype=self.dtype) * 0.02
-        rms = (prim_raw ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        # Random directions, RMS-normalized — diverse from the start so
+        # messages differ across neurons and routing can differentiate
+        prim_raw = torch.randn(BS, N, D, device=self.device, dtype=self.dtype)
+        rms = prim_raw.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
         self.primitives = prim_raw / rms
 
         key_raw = torch.randn(BS, N, D, device=self.device, dtype=self.dtype)
@@ -143,11 +145,12 @@ class MemoryGraph:
         self.decay_logit = torch.zeros(
             BS, N, device=self.device, dtype=self.dtype)
 
-        # Persistent neuron state
-        self.h = torch.zeros(
-            BS, N, D, device=self.device, dtype=self.dtype)
-        self.prev_messages = torch.zeros(
-            BS, N, D, device=self.device, dtype=self.dtype)
+        # Persistent neuron state — small random init so first messages
+        # aren't all zero (preserves primitive diversity from step 1)
+        self.h = torch.randn(
+            BS, N, D, device=self.device, dtype=self.dtype) * 0.1
+        self.prev_messages = torch.tanh(
+            self.h * self.primitives)
 
         # Running stats
         self.mean_input = torch.zeros(

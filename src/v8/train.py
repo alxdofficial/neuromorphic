@@ -133,6 +133,9 @@ def main():
     model = V8Model(config)
     if device.type == "cuda":
         model = model.to(device).to(torch.bfloat16)
+        # Keep neuromod in float32 — RL gradients are tiny and get
+        # rounded away in bf16 (precision ~0.004 near typical values)
+        model.neuromod = model.neuromod.float()
     else:
         model = model.to(device)
 

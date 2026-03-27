@@ -184,14 +184,14 @@ def plot_training_curves(records, output_path):
 
 
 def plot_rl_curves(records, output_path):
-    """GRPO loss, trajectory spread, exploration, entropy."""
+    """GRPO loss, trajectory spread, exploration, entropy, gate distribution."""
     rl_records = [r for r in records if "rl_grpo_loss" in r]
     if not rl_records:
         print("  No RL data found, skipping rl_curves")
         return
 
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
         fig.suptitle("RL / Neuromodulator", fontsize=16, fontweight="bold")
 
         steps = [r["step"] for r in rl_records]
@@ -214,37 +214,71 @@ def plot_rl_curves(records, output_path):
             ax.legend()
         _setup_ax(ax, "GRPO Trajectory Spread", "z-score advantage")
 
-        # Trajectory advantage std (signal strength)
-        ax = axes[0, 2]
-        vals = [r.get("rl_traj_adv_std", 0) for r in rl_records]
-        _plot_line(ax, steps, vals, C_ADV)
-        _setup_ax(ax, "Trajectory Adv Std (signal strength)")
-
         # Entropy
-        ax = axes[1, 0]
+        ax = axes[0, 2]
         vals = [r.get("rl_entropy", 0) for r in rl_records]
         _plot_line(ax, steps, vals, C_ENT)
         _setup_ax(ax, "Policy Entropy", "entropy")
 
-        # Exploration: logstd values
-        ax = axes[1, 1]
-        all_records = records
-        s = get_steps(all_records, "nm_logstd_prim")
+        # Exploration: logstd values (gate + decay)
+        ax = axes[1, 0]
+        s = get_steps(records, "nm_logstd_gate")
         if s:
-            _plot_line(ax, s, get_field(all_records, "nm_logstd_prim"), C_PRIM,
-                       "primitives", linewidth=2.5)
-            _plot_line(ax, s, get_field(all_records, "nm_logstd_key"), C_KEY,
-                       "key", linewidth=2.5)
-            _plot_line(ax, s, get_field(all_records, "nm_logstd_decay"), C_DECAY,
-                       "decay", linewidth=2.0)
+            _plot_line(ax, s, get_field(records, "nm_logstd_gate"), C_GATE,
+                       "gate", linewidth=2.5)
+            _plot_line(ax, s, get_field(records, "nm_logstd_decay"), C_DECAY,
+                       "decay", linewidth=2.5)
             ax.legend()
         _setup_ax(ax, "Policy Log-Std (exploration)", "log_std")
+
+        # Gate distribution: mean ± std
+        ax = axes[1, 1]
+        s = get_steps(records, "nm_gate_mean")
+        if s:
+            gate_mean = np.array(get_field(records, "nm_gate_mean"))
+            gate_std = np.array(get_field(records, "nm_gate_std"))
+            _plot_line(ax, s, gate_mean, C_GATE, "gate mean")
+            ax.fill_between(s, gate_mean - gate_std, gate_mean + gate_std,
+                            alpha=0.15, color=C_GATE)
+            ax.axhline(y=0, color="#999", linestyle="--", linewidth=0.8)
+        _setup_ax(ax, "Neuromod Gate (mean \u00b1 std)", "gate value")
 
         # Neuromod grad norm
         ax = axes[1, 2]
         vals = [r.get("rl_nm_grad_norm", 0) for r in rl_records]
         _plot_line(ax, steps, vals, C_GRAD)
         _setup_ax(ax, "Neuromod Gradient Norm")
+
+        # Trace norms
+        ax = axes[2, 0]
+        s = get_steps(records, "nm_trace_prim_norm")
+        if s:
+            _plot_line(ax, s, get_field(records, "nm_trace_prim_norm"), C_PRIM,
+                       "trace_prim")
+            _plot_line(ax, s, get_field(records, "nm_trace_key_norm"), C_KEY,
+                       "trace_key")
+            ax.legend()
+        _setup_ax(ax, "Eligibility Trace Norms", "L2 norm")
+
+        # LM grad norm (important for joint training)
+        ax = axes[2, 1]
+        s = get_steps(records, "grad_norm")
+        if s:
+            vals = get_field(records, "grad_norm")
+            _plot_line(ax, s, vals, C_LOSS, "LM grad")
+        # Overlay neuromod grad on same plot for comparison
+        if rl_records:
+            nm_vals = [r.get("rl_nm_grad_norm", 0) for r in rl_records]
+            _plot_line(ax, steps, nm_vals, C_GATE, "neuromod grad")
+        ax.legend()
+        _setup_ax(ax, "Gradient Norms (LM vs Neuromod)")
+
+        # Decay diversity (std of decay across neurons)
+        ax = axes[2, 2]
+        s = get_steps(records, "mem_decay_std")
+        if s:
+            _plot_line(ax, s, get_field(records, "mem_decay_std"), C_DECAY)
+        _setup_ax(ax, "Decay Diversity", "std across neurons")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor())
@@ -319,16 +353,20 @@ def plot_memory_health(records, output_path):
                    C_SAT)
         _setup_ax(ax, "tanh Saturation", "fraction |msg| > 0.95")
 
-        # Row 3: Key/primitive diversity, usage, plasticity
+        # Row 3: Drift from init, usage, plasticity
         ax = axes[2, 0]
-        _plot_line(ax, steps,
-                   [r.get("mem_key_diversity", 0) for r in mem_records],
-                   C_KEY, "key diversity")
-        _plot_line(ax, steps,
-                   [r.get("mem_prim_std", 0) for r in mem_records],
-                   C_PRIM, "prim diversity")
-        ax.legend()
-        _setup_ax(ax, "Key & Primitive Diversity")
+        s_drift = get_steps(mem_records, "mem_prim_drift")
+        if s_drift:
+            _plot_line(ax, s_drift,
+                       [r.get("mem_prim_drift", 0) for r in mem_records
+                        if "mem_prim_drift" in r],
+                       C_PRIM, "prim drift")
+            _plot_line(ax, s_drift,
+                       [r.get("mem_key_drift", 0) for r in mem_records
+                        if "mem_key_drift" in r],
+                       C_KEY, "key drift")
+            ax.legend()
+        _setup_ax(ax, "Drift from Init (neuromod effect)", "L2 distance")
 
         ax = axes[2, 1]
         _plot_line(ax, steps,
@@ -422,7 +460,7 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
     K = cfg["K"]
 
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
         fig.suptitle(f"Memory Graph Snapshot (step {snap['step']})",
                      fontsize=16, fontweight="bold")
 
@@ -447,8 +485,30 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
         ax.set_ylim(0, 1)
         _setup_ax(ax, "Decay per Neuron", xlabel="Neuron ID")
 
-        # Key vector heatmap (first 64 neurons)
+        # Message magnitude per neuron
+        ax = axes[0, 2]
+        if "msg_magnitude_per_neuron" in snap:
+            msg_mag = snap["msg_magnitude_per_neuron"].numpy()
+            ax.bar(x, msg_mag, width=1.0, alpha=0.7, color=C_FIRE)
+            ax.axvline(x=C - 0.5, color='red', linestyle='--', alpha=0.7,
+                       label="port neurons")
+            ax.legend()
+        _setup_ax(ax, "Message Magnitude per Neuron", xlabel="Neuron ID")
+
+        # Primitives heatmap (first 64 neurons)
         ax = axes[1, 0]
+        if "primitives_mean" in snap:
+            prim_data = snap["primitives_mean"][:64].numpy()
+            im = ax.imshow(prim_data, aspect='auto', cmap='RdBu_r')
+            plt.colorbar(im, ax=ax)
+            _setup_ax(ax, "Primitive Vectors (neurons 0-63)",
+                      ylabel="Neuron ID", xlabel="Dimension")
+        else:
+            ax.text(0.5, 0.5, "No primitive data", ha='center', va='center')
+            _setup_ax(ax, "Primitive Vectors")
+
+        # Key vector heatmap (first 64 neurons)
+        ax = axes[1, 1]
         if "key_per_neuron" in snap:
             key_data = snap["key_per_neuron"][:64].numpy()
             im = ax.imshow(key_data, aspect='auto', cmap='RdBu_r')
@@ -460,7 +520,7 @@ def plot_connectivity_snapshot(snapshot_path, output_path):
             _setup_ax(ax, "Key Vectors")
 
         # Fan-in histogram
-        ax = axes[1, 1]
+        ax = axes[1, 2]
         conn_idx = snap["conn_indices"].numpy()
         fan_in = np.bincount(conn_idx.flatten(), minlength=N)
         ax.bar(x, fan_in, width=1.0, alpha=0.7, color=C_USAGE)

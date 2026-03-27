@@ -30,6 +30,9 @@ class V8Diagnostics:
         self.snapshot_dir = os.path.join(save_dir, "snapshots")
         self.snapshot_every = snapshot_every
         os.makedirs(self.snapshot_dir, exist_ok=True)
+        # Snapshot of initial primitives/keys for tracking drift
+        self._init_primitives = None
+        self._init_keys = None
 
     def extend_metrics(self, metrics: dict, step: int) -> dict:
         """Add memory graph + LM coupling stats to the per-step metrics dict.
@@ -51,9 +54,18 @@ class V8Diagnostics:
             prim_std = mg.primitives.std(dim=1).mean().item()
             metrics["mem_prim_std"] = round(prim_std, 6)
 
-            # Key stats (L2-normalized, unit direction vectors)
+            # Key stats (RMS-normalized, unit direction vectors)
             key_div = mg.key.std(dim=1).mean().item()  # diversity across neurons
             metrics["mem_key_diversity"] = round(key_div, 6)
+
+            # Drift from init — tracks whether neuromod is actually changing primitives/keys
+            if self._init_primitives is None:
+                self._init_primitives = mg.primitives.clone()
+                self._init_keys = mg.key.clone()
+            prim_drift = (mg.primitives - self._init_primitives).norm(dim=-1).mean().item()
+            key_drift = (mg.key - self._init_keys).norm(dim=-1).mean().item()
+            metrics["mem_prim_drift"] = round(prim_drift, 6)
+            metrics["mem_key_drift"] = round(key_drift, 6)
 
             # Decay distribution
             decay = torch.sigmoid(mg.decay_logit)
