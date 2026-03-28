@@ -248,8 +248,8 @@ class TestInjectReadout:
         out = mg.readout(msgs)
         assert out.shape == (BS, cfg.action_every, cfg.D)
 
-    def test_readout_averages_replicas(self):
-        """Readout should average neurons within each slice."""
+    def test_readout_scales_replicas(self):
+        """Readout should use 1/sqrt(N_per_slice) scaling."""
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
@@ -260,12 +260,14 @@ class TestInjectReadout:
             msgs[:, :, i, :] = 1.0
 
         out = mg.readout(msgs)
+        # sum=nps, scaled by 1/sqrt(nps)
+        expected = nps ** 0.5
         torch.testing.assert_close(
             out[:, 0, :cfg.D_neuron],
-            torch.ones(BS, cfg.D_neuron))
+            torch.full((BS, cfg.D_neuron), expected))
 
     def test_inject_readout_roundtrip(self):
-        """inject → readout should recover the original signal."""
+        """inject → readout should recover the original signal (scaled by sqrt(N_per_slice))."""
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
@@ -273,7 +275,9 @@ class TestInjectReadout:
         cc = torch.randn(BS, 1, cfg.D)
         inject_bc = mg.inject(cc)
         recovered = mg.readout(inject_bc)
-        torch.testing.assert_close(recovered, cc)
+        # Readout uses 1/sqrt(N) scaling, so recovered = cc * sqrt(N_per_slice)
+        expected = cc * (cfg.N_per_slice ** 0.5)
+        torch.testing.assert_close(recovered, expected)
 
 
 class TestStructuralPlasticity:

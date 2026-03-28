@@ -98,10 +98,12 @@ class MemoryGraph(nn.Module):
             torch.randn(N, H_mod, mod_input_dim, device=device) *
             (2.0 / (mod_input_dim + H_mod)) ** 0.5)
         self.mod_b1 = nn.Parameter(torch.zeros(N, H_mod, device=device))
+        # All weight matrices use Xavier/Glorot: std = sqrt(2 / (fan_in + fan_out))
+        # This ensures signals neither vanish nor explode through the network.
         self.mod_w2 = nn.Parameter(
-            torch.randn(N, H_mod, mod_output_dim, device=device) * 0.01)
-        self.mod_b2 = nn.Parameter(
-            torch.randn(N, mod_output_dim, device=device) * 0.01)
+            torch.randn(N, H_mod, mod_output_dim, device=device) *
+            (2.0 / (H_mod + mod_output_dim)) ** 0.5)
+        self.mod_b2 = nn.Parameter(torch.zeros(N, mod_output_dim, device=device))
 
         # --- Per-step state update MLP ---
         # Input: cat(input_vec[D], h[D], decay[1]) = 2D+1
@@ -113,7 +115,8 @@ class MemoryGraph(nn.Module):
             (2.0 / (state_in + H_state)) ** 0.5)
         self.state_b1 = nn.Parameter(torch.zeros(N, H_state, device=device))
         self.state_w2 = nn.Parameter(
-            torch.randn(N, H_state, D, device=device) * 0.01)
+            torch.randn(N, H_state, D, device=device) *
+            (2.0 / (H_state + D)) ** 0.5)
         self.state_b2 = nn.Parameter(torch.zeros(N, D, device=device))
 
         # --- Per-step message MLP ---
@@ -125,12 +128,14 @@ class MemoryGraph(nn.Module):
             (2.0 / (2 * D + H_msg)) ** 0.5)
         self.msg_b1 = nn.Parameter(torch.zeros(N, H_msg, device=device))
         self.msg_w2 = nn.Parameter(
-            torch.randn(N, H_msg, D, device=device) * 0.01)
+            torch.randn(N, H_msg, D, device=device) *
+            (2.0 / (H_msg + D)) ** 0.5)
         self.msg_b2 = nn.Parameter(torch.zeros(N, D, device=device))
 
         # --- Neuron ID embedding ---
+        # Scale similar to positional embeddings in transformers
         self.neuron_id = nn.Parameter(
-            torch.randn(N, D, device=device) * 0.02)
+            torch.randn(N, D, device=device) * (1.0 / D ** 0.5))
 
         # --- Dendritic FC weights ---
         if self.use_dendritic_tree:
@@ -334,7 +339,10 @@ class MemoryGraph(nn.Module):
         ).reshape(BS, T_seg, self.config.N_neurons, self.config.D_neuron)
 
     def readout(self, msg_all: Tensor) -> Tensor:
-        """All neuron messages → LM hidden dim by averaging replicas.
+        """All neuron messages → LM hidden dim by 1/sqrt(N_per_slice) scaling.
+
+        Uses sum/sqrt(N) instead of mean (sum/N) to preserve gradient magnitude.
+        This was a key lesson from v8: 1/N readout kills gradients.
 
         Args:
             msg_all: [BS, T_seg, N, D_neuron]
@@ -345,8 +353,9 @@ class MemoryGraph(nn.Module):
         BS, T_seg = msg_all.shape[:2]
         grouped = msg_all.view(
             BS, T_seg, self.C_mem, self.N_per_slice, self.config.D_neuron)
-        averaged = grouped.mean(dim=3)
-        return averaged.reshape(BS, T_seg, self.config.D)
+        # sum / sqrt(N_per_slice) instead of mean (sum / N_per_slice)
+        scaled = grouped.sum(dim=3) * (self.N_per_slice ** -0.5)
+        return scaled.reshape(BS, T_seg, self.config.D)
 
     # ================================================================
     # Forward segment (differentiable)

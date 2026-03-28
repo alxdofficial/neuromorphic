@@ -45,6 +45,14 @@ class V8Diagnostics:
             metrics["mem_usage_frac"] = round(
                 (mm.mean(dim=0) > 0.01).float().mean().item(), 4)
 
+            # Neuron diversity — are neurons differentiating?
+            # Std of per-neuron h norms (high = diverse, low = homogeneous)
+            h_per_neuron = mg.h.norm(dim=-1).mean(dim=0)  # [N]
+            metrics["mem_h_diversity"] = round(h_per_neuron.std().item(), 4)
+            # Std of per-neuron message norms
+            msg_per_neuron = mg.prev_messages.norm(dim=-1).mean(dim=0)  # [N]
+            metrics["mem_msg_diversity"] = round(msg_per_neuron.std().item(), 4)
+
             # Hebbian traces
             metrics["mem_hebbian_mean"] = round(mg.hebbian_traces.mean().item(), 4)
             metrics["mem_hebbian_std"] = round(mg.hebbian_traces.std().item(), 4)

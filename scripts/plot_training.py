@@ -159,7 +159,7 @@ def plot_training_curves(records, output_path):
 
 def plot_memory_health(records, output_path):
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+        fig, axes = plt.subplots(4, 3, figsize=(18, 18))
         fig.suptitle("Memory Graph Health", fontsize=14, fontweight="bold")
 
         # mem_gate
@@ -240,6 +240,26 @@ def plot_memory_health(records, output_path):
                 plot_line(axes[2, 2], v2, C["pcm"], "std", linestyle="--")
             axes[2, 2].legend()
             setup(axes[2, 2], "PCM Surprise", "prediction error")
+
+        # Row 4: Neuron diversity + neuron ID + plasticity
+        v = get(records, "mem_h_diversity")
+        if v:
+            plot_line(axes[3, 0], v, C["state"], "h diversity")
+            v2 = get(records, "mem_msg_diversity")
+            if v2:
+                plot_line(axes[3, 0], v2, C["msg"], "msg diversity")
+            axes[3, 0].legend()
+            setup(axes[3, 0], "Neuron Diversity (std of per-neuron norms)")
+
+        v = get(records, "neuron_id_norm")
+        if v:
+            plot_line(axes[3, 1], v, C["nid"])
+            setup(axes[3, 1], "Neuron ID Norm", "L2")
+
+        v = get(records, "plasticity_swaps")
+        if v:
+            plot_line(axes[3, 2], v, C["conn"])
+            setup(axes[3, 2], "Plasticity Swaps per Chunk")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)

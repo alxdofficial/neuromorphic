@@ -238,6 +238,24 @@ def main():
 
         diag.maybe_snapshot(step)
 
+        # Auto-plot every 250 steps
+        if step % 250 == 0 and step > 0:
+            try:
+                from scripts.plot_training import (
+                    load_metrics, plot_training_curves,
+                    plot_memory_health, plot_gradient_health)
+                plots_dir = os.path.join(save_dir, "plots")
+                os.makedirs(plots_dir, exist_ok=True)
+                records = load_metrics(metrics_path)
+                plot_training_curves(records,
+                                     os.path.join(plots_dir, "training_curves.png"))
+                plot_memory_health(records,
+                                   os.path.join(plots_dir, "memory_health.png"))
+                plot_gradient_health(records,
+                                     os.path.join(plots_dir, "gradient_health.png"))
+            except Exception as e:
+                print(f"  Plot failed: {e}")
+
         if args.save_interval > 0 and step % args.save_interval == 0:
             ckpt_path = os.path.join(save_dir, f"v9_step{step}.pt")
             ckpt = {
