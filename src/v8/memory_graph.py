@@ -1,24 +1,24 @@
-"""Memory Graph — differentiable per-token recurrence (v9-backprop).
+"""Memory Graph — differentiable 2-pass neuron simulation (v9-backprop).
 
-N=4096 neurons, D_neuron=32, K=128 connections. Trained by backprop.
+N=512 neurons, D_neuron=256, K=32 connections. Trained end-to-end by backprop.
 
-Per-step dynamics (64 steps per segment at stride=2):
-  1. Gather neighbor messages via conn_indices, weight by sigmoid(w_conn)
-  2. Dendritic tree integration (branch→tanh→group→tanh→soma)
-  3. Add CC signal inject (deterministic: neuron n gets H_mid slice n%C_mem)
-  4. State MLP: cat(input_vec, h) → Linear → tanh → Linear → tanh → h_new
-  5. Message MLP: cat(h_new, primitive) → Linear → tanh → Linear → tanh → msg
-  6. Add learnable neuron ID embedding
-  7. Accumulate hebbian trace: |msg| * sigmoid(w_conn)
+2-pass simulation per segment (T tokens):
+  Pass 1: ONE gather (frozen initial messages) → T steps of MLP dynamics
+  Pass 2: ONE gather (from Pass 1 end state) → T steps refined
 
-Segment-boundary modulator (runs FIRST each segment):
+Per-step dynamics (within each pass, frozen inter-neuron messages):
+  1. input_vec = frozen_received + inject[t]  (inject varies per token)
+  2. State MLP: cat(input_vec, h, decay) → tanh → linear → tanh → h_new
+  3. Message MLP: cat(h_new, primitive) → tanh → linear → tanh → msg
+  4. msg = msg + neuron_id
+
+Segment-boundary modulator (runs FIRST, once per segment):
   mod(hebbian_traces, h, decay, primitive) → new w_conn, decay, primitive
 
 Inject: H_mid [BS,T,D] → replicate → [BS,T,N,D_neuron]. No parameters.
-Readout: msgs [BS,T,N,D_neuron] → reshape → mean over replicas → [BS,T,D].
+Readout: msgs [BS,T,N,D_neuron] → mean over replicas → [BS,T,D].
 
-Structural plasticity: at chunk boundaries, rewire connections based on
-pairwise co-activation correlation. Non-differentiable.
+Structural plasticity: at chunk boundaries, rewire weakest connections.
 """
 
 import torch
@@ -411,7 +411,6 @@ class MemoryGraph(nn.Module):
         T_seg = cc_signals.shape[1]
         N = self.config.N_neurons
         K = self.config.K_connections
-        stride = self.config.memory_update_stride
 
         # TBPTT: detach state at segment boundary
         h = self.h.detach()
@@ -427,16 +426,14 @@ class MemoryGraph(nn.Module):
         w_conn_sig = torch.sigmoid(w_conn)      # [BS, N, K]
         decay = torch.sigmoid(decay_logit)       # [BS, N]
 
-        # Inject: replicate H_mid → per-neuron signals at stride positions
-        inject_bc = self.inject(cc_signals)
-        inject_steps = inject_bc[:, ::stride]
-        n_steps = inject_steps.shape[1]
+        # Inject: replicate H_mid → per-neuron signals
+        inject_all = self.inject(cc_signals)  # [BS, T_seg, N, D]
 
         # 2-pass simulation: freeze inter-neuron messages per pass,
         # run all steps with frozen messages + varying inject.
         # Pass 1: gather from initial prev_msg → run all steps
         # Pass 2: gather from Pass 1 end state → run all steps (refined)
-        # Only 2 gathers instead of 128, massive speedup.
+        # Only 2 gathers instead of T_seg, massive speedup.
         n_passes = 2
         total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
 
@@ -446,8 +443,8 @@ class MemoryGraph(nn.Module):
 
             # Run all T steps with frozen received + varying inject
             msgs = []
-            for t in range(n_steps):
-                input_vec = received + inject_steps[:, t]
+            for t in range(T_seg):
+                input_vec = received + inject_all[:, t]
                 h = self._state_mlp(input_vec, h, decay)
                 msg = self._msg_mlp(h, primitives)
                 msg = msg + self.neuron_id
@@ -459,14 +456,8 @@ class MemoryGraph(nn.Module):
                     msg_mag = msg.norm(dim=-1, keepdim=True)
                     total_hebbian = total_hebbian + msg_mag * w_conn_sig
 
-        # Stack messages from last pass: [BS, n_steps, N, D]
-        msg_all_steps = torch.stack(msgs, dim=1)
-
-        # If stride > 1, repeat to fill all T_seg positions
-        if stride > 1:
-            msg_all = msg_all_steps.repeat_interleave(stride, dim=1)[:, :T_seg]
-        else:
-            msg_all = msg_all_steps
+        # Stack messages from last pass: [BS, T_seg, N, D]
+        msg_all = torch.stack(msgs, dim=1)
 
         # Readout: average replicas → [BS, T_seg, D_lm]
         mem_out = self.readout(msg_all)
@@ -480,7 +471,7 @@ class MemoryGraph(nn.Module):
             self.decay_logit = decay_logit.detach()
 
             # Hebbian traces: per-segment average
-            self.hebbian_traces = (total_hebbian / max(n_steps, 1)).to(self.dtype)
+            self.hebbian_traces = (total_hebbian / max(T_seg, 1)).to(self.dtype)
 
             # Structural plasticity accumulation
             if (self.config.structural_plasticity and

@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
 
 from ..model.scan import ScanLayer, RMSNorm
 from .pcm import BatchedPCM
@@ -117,11 +117,7 @@ class V8LM(nn.Module):
         H = x
         for i in range(split):
             carry = self._carries[i]
-            if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry,
-                                            use_reentrant=False)
-            else:
-                H, h_last = self.layers[i](H, carry)
+            H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
         # PCM at the split point — predict next hidden state, compute surprise
@@ -174,11 +170,7 @@ class V8LM(nn.Module):
 
         for i in range(split, self.config.L_total):
             carry = self._carries[i]
-            if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry,
-                                            use_reentrant=False)
-            else:
-                H, h_last = self.layers[i](H, carry)
+            H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
         return H

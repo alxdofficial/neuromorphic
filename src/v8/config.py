@@ -1,4 +1,4 @@
-"""v9-backprop configuration — Differentiable Memory Graph."""
+"""v9-backprop configuration — Differentiable Memory Graph with 2-pass simulation."""
 
 from dataclasses import dataclass
 
@@ -10,9 +10,9 @@ class V8Config:
     D_embed: int = 768
     C: int = 16                  # cortical columns
     D_cc: int = -1               # derived: D // C
-    L_total: int = 5             # total scan layers
-    scan_split_at: int = 3       # layers 0..split-1 = lower, split..L-1 = upper
-    d_inner: int = 1024
+    L_total: int = 4             # total scan layers
+    scan_split_at: int = 2       # layers 0..split-1 = lower, split..L-1 = upper
+    d_inner: int = 580
     glu_output: bool = True
     vocab_size: int = 32000
     eot_id: int = 2
@@ -25,13 +25,13 @@ class V8Config:
     pcm_hidden: int = 256
 
     # Memory Graph — differentiable, trained by backprop
-    N_mem_neurons: int = 4096    # total neurons
-    D_neuron: int = 32           # per-neuron state dimension
-    K_connections: int = 128     # sparse presynaptic connections per neuron
+    N_mem_neurons: int = 512     # total neurons
+    D_neuron: int = 256          # per-neuron state dimension
+    K_connections: int = 32      # sparse presynaptic connections per neuron
     dendrite_branch_size: int = 16
 
     # Per-neuron MLPs
-    neuromod_hidden: int = 16    # hidden dim for segment-boundary modulator
+    neuromod_hidden: int = 80    # hidden dim for segment-boundary modulator
     state_mlp_hidden: int = 24   # hidden dim for per-step state update MLP
     msg_mlp_hidden: int = 24     # hidden dim for per-step message MLP
 
@@ -40,14 +40,13 @@ class V8Config:
     plasticity_n_swap: int = 8   # connections swapped per neuron per rewire
 
     # Segment / training
-    action_every: int = 128      # segment length
-    memory_update_stride: int = 1 # neuron dynamics every token (1:1 with sequence)
+    T: int = 128                 # tokens per chunk = segment length
     mem_lr_scale: float = 0.3    # memory param LR = base_LR * mem_lr_scale
 
-    # Training
-    T: int = 2048
-    gradient_checkpointing: bool = False
-    use_compile: bool = True
+    @property
+    def action_every(self) -> int:
+        """Segment length = T (one segment per chunk)."""
+        return self.T
 
     @property
     def D_mem(self) -> int:
@@ -69,7 +68,7 @@ class V8Config:
 
     @property
     def segments_per_chunk(self) -> int:
-        return self.T // self.action_every
+        return 1
 
     def validate(self):
         if self.D <= 0:
@@ -109,17 +108,6 @@ class V8Config:
                 f"[1, L_total-1={self.L_total-1}].")
         if self.T < 1:
             raise ValueError(f"T ({self.T}) must be >= 1.")
-        if self.action_every < 1:
-            raise ValueError(f"action_every ({self.action_every}) must be >= 1.")
-        if self.T % self.action_every != 0:
-            raise ValueError(
-                f"T ({self.T}) must be divisible by action_every ({self.action_every}).")
-        if self.memory_update_stride < 1:
-            raise ValueError(f"memory_update_stride must be >= 1.")
-        if self.action_every % self.memory_update_stride != 0:
-            raise ValueError(
-                f"action_every ({self.action_every}) must be divisible by "
-                f"memory_update_stride ({self.memory_update_stride}).")
         if self.dendrite_branch_size > self.K_connections:
             raise ValueError(
                 f"dendrite_branch_size ({self.dendrite_branch_size}) must be <= "
@@ -134,8 +122,6 @@ class V8Config:
             dendrite_branch_size=16,
             pcm_hidden=256,
             neuromod_hidden=80, state_mlp_hidden=24, msg_mlp_hidden=24,
-            action_every=128,
-            memory_update_stride=1,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -145,13 +131,11 @@ class V8Config:
         """Tiny config for unit tests."""
         defaults = dict(
             D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
-            d_inner=64, glu_output=False, vocab_size=64, T=32,
+            d_inner=64, glu_output=False, vocab_size=64, T=8,
             N_mem_neurons=32, D_neuron=16, K_connections=8,
             dendrite_branch_size=4,
             pcm_hidden=32,
             neuromod_hidden=16, state_mlp_hidden=16, msg_mlp_hidden=16,
-            action_every=8,
-            memory_update_stride=1,
             structural_plasticity=False,
         )
         defaults.update(overrides)

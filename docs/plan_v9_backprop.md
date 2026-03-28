@@ -1,216 +1,210 @@
-# v9-backprop — Fully Differentiable Memory Graph
+# v9-backprop — Differentiable Memory Graph with 2-Pass Simulation
 
 **Branch**: `v9-backprop`
 **Updated**: 2026-03-28
-**Target**: 40K+ tok/s on RTX 4090, BS=8, T=2048
 
 ---
 
-## Architecture Overview
+## Overview
+
+A neuromorphic memory graph augments a split-scan language model. 512 neurons with
+256-dimensional state vectors communicate through 32 sparse connections each. A
+per-neuron modulator MLP predicts connection weights, decay rates, and message
+primitives once per segment. The neuron dynamics run for T steps per segment with
+full backprop, using a 2-pass optimization that reduces inter-neuron gathers from
+T to 2.
+
+**110M params** (LM 52M + Memory 58M). **24.8K tok/s** at BS=48 on RTX 4090.
+
+---
+
+## The Neuron Model (Sequential Mental Image)
+
+Imagine 512 neurons arranged in a graph. Each neuron has:
+- A **hidden state** h [256 dims] — what the neuron "knows"
+- An **outgoing message** msg [256 dims] — what it broadcasts to neighbors
+- **32 incoming connections** to other neurons, each with a learned weight
+
+Every token step, each neuron:
+
+```
+1. LISTEN:   Read 32 neighbors' messages, weight by connection strengths,
+             reduce through dendritic tree → received [256]
+2. INJECT:   Add the LM's hidden state for this token → input_vec [256]
+3. THINK:    State MLP updates hidden state: h_new = MLP(input_vec, h_old, decay)
+4. SPEAK:    Message MLP generates outgoing message: msg = MLP(h_new, primitives)
+5. IDENTIFY: Add learnable neuron ID to message
+6. RECORD:   Track hebbian correlation (how active am I × connection strength)
+```
+
+After all T steps, the neurons' messages are read out and injected into the LM's
+upper scan layers. This is the "true" sequential simulation — each step, every
+neuron sees its neighbors' latest messages.
+
+---
+
+## The 2-Pass Optimization
+
+The sequential simulation requires one **gather** (reading 32 neighbors' messages)
+per step. At T=128, that's 128 gathers — the dominant cost.
+
+The key insight: **inter-neuron messages change slowly** relative to the inject
+signal (which changes every token). We can freeze the messages for an entire pass
+and still get a good approximation.
+
+### Pass 1: Approximate Trajectory
+
+```
+1. GATHER ONCE: Read all neighbors' messages from initial state
+2. FREEZE: Use this same "received" for all T=128 steps
+3. RUN: Each step, neurons update h and msg using frozen received + varying inject[t]
+4. RESULT: Approximate trajectory — neurons responded to LM input but not to each other
+```
+
+**What this gets right:** Each neuron's response to the LM input (inject) at every
+token position. The state MLP and message MLP process 128 different inject signals.
+
+**What this misses:** Neuron A fires strongly at step 5 → Neuron B (connected to A)
+should react at step 6. But B is reading A's initial message, not step 5's message.
+
+### Pass 2: Refined Trajectory
+
+```
+1. GATHER ONCE: Read all neighbors' messages from Pass 1's FINAL state
+2. FREEZE: Use this updated "received" for all T=128 steps
+3. RUN: Same dynamics again, but now with better inter-neuron messages
+4. RESULT: Refined trajectory — accounts for how neurons influenced each other
+```
+
+**What this fixes:** Neuron B now sees that A ended up in a high-activity state
+(from Pass 1). This is a first-order correction — B knows A was active, though
+it doesn't know exactly when during the 128 steps A became active.
+
+**What remains approximate:** Second-order effects — A's reaction to B's reaction
+to A. With sparse connectivity (K=32 out of N=512 = 6%), these higher-order
+interactions are small.
+
+### Cost Comparison
+
+```
+Sequential: 128 gathers + 128 MLP steps = slow (gathers dominate)
+2-Pass:     2 gathers   + 256 MLP steps = fast (gathers negligible, MLPs dominate)
+```
+
+The 2-pass approach trades gather compute (expensive, scattered memory access) for
+MLP compute (efficient, regular batched matmuls). The quality tradeoff is mild:
+neurons see their neighbors' end-of-pass state rather than per-step state.
+
+---
+
+## Architecture
 
 ```
 Input → Embedding → proj_up (768→2048)
-  → LOWER SCAN (2 layers)
-  → PCM: predict H_{t+1} directly, surprise = H_hat - H_actual
-  → MEMORY GRAPH (differentiable, 16 segments × 64 steps)
-      Segment boundary: modulator(hebbian, h, decay, prim) → new w_conn, decay, prim
-      Per step: gather → weight → dendritic_tree → inject → state_MLP → msg_MLP → +neuron_id
-      After all segments: structural plasticity rewires connections
+  → LOWER SCAN (2 layers, d_inner=580)
+  → PCM: predict H_{t+1} directly, surprise = predicted − actual
+  → MEMORY GRAPH (2-pass, T steps per pass)
+      Modulator: predict w_conn, decay, primitives (once per segment)
+      Pass 1: frozen gather → T MLP steps → approximate trajectory
+      Pass 2: updated gather → T MLP steps → refined trajectory
+      Readout: average replicas → mem_out [BS, T, D]
   → Split-point MLP: H_combined = H_mid + MLP(cat(H_mid, surprise))
-  → INJECT: H_enriched = H_combined + gate * mem_readout
+  → INJECT: H_enriched = H_combined + sigmoid(gate) × mem_out
   → UPPER SCAN (2 layers)
   → proj_down (2048→768) → ln_final → lm_head → logits
 ```
 
-**Total: 114M params** (53M LM + 61M memory)
+---
+
+## Config (Tier A)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| D | 2048 | LM hidden dimension |
+| D_embed | 768 | Embedding dimension |
+| L_total | 4 | Scan layers (2 lower + 2 upper) |
+| d_inner | 580 | Scan layer inner dimension |
+| N_mem_neurons | 512 | Number of neurons |
+| D_neuron | 256 | Per-neuron state dimension |
+| K_connections | 32 | Sparse connections per neuron |
+| neuromod_hidden | 80 | Modulator MLP hidden dimension |
+| state_mlp_hidden | 24 | State update MLP hidden dimension |
+| msg_mlp_hidden | 24 | Message MLP hidden dimension |
+| T | 128 | Tokens per chunk (= segment length) |
+| Total params | 110M | LM=52M, Memory=58M |
 
 ---
 
-## LM (Split-Scan)
-
-- **D=2048**, D_embed=768, C=16 cortical columns, D_cc=128
-- **4 scan layers** (split at 2): 2 lower + 2 upper
-- **d_inner=512**, GLU output
-- **PCM** at split point: single predictor MLP, `H_hat_{t+1} = pred(norm(H_t))`
-  - Surprise = `H_hat_{t-1} - H_t`
-  - Loss = MSE(prediction, actual.detach())
-  - No encoder — predicts scan hidden state directly (avoids degenerate collapse)
-- **Split-point MLP**: `H + MLP(cat(H, surprise))` — residual, zero-init final layer
-  - Linear(4096, 512) → SiLU → Linear(512, 2048)
-- **mem_gate** [C=16]: per-column sigmoid gate for memory readout
-
----
-
-## Memory Graph
-
-### Topology
-- **N=4096 neurons**, D_neuron=32, **K=128 connections** per neuron
-- Fixed sparse topology (conn_indices [N, K]), rewired by structural plasticity
-- **Dendritic tree**: 8 branches × 16 synapses, 2 groups × 4 branches
-  - branch→tanh→group→tanh→mean
-
-### I/O (zero parameters)
-- **Inject**: H_mid [BS,T,2048] → view [BS,T,64,32] → replicate 64× → [BS,T,4096,32]
-  - Each of 64 slices shared by 64 neurons. No learned weights.
-- **Readout**: msgs [BS,T,4096,32] → view [BS,T,64,64,32] → mean(dim=3) → [BS,T,2048]
-  - Average 64 neuron replicas per slice. No learned weights.
-
-### Per-Step Dynamics (64 steps per segment at stride=2)
+## Parameter Budget
 
 ```
-1. GATHER:      neighbor_msgs = prev_msg[:, conn_indices]           → [BS, N, K, D]
-2. WEIGHT:      weighted = sigmoid(w_conn) * neighbor_msgs           → [BS, N, K, D]
-3. DENDRITIC:   received = dendritic_tree(weighted, branch_w, group_w) → [BS, N, D]
-4. INJECT:      input_vec = received + cc_slice                      → [BS, N, D]
-5. STATE MLP:   h_new = state_mlp(cat(input_vec, h))                 → [BS, N, D]
-                Linear(64,24) → tanh → Linear(24,32) → tanh
-6. MSG MLP:     msg = msg_mlp(cat(h_new, primitive))                 → [BS, N, D]
-                Linear(64,24) → tanh → Linear(24,32) → tanh
-7. NEURON ID:   msg = msg + neuron_id                                → [BS, N, D]
-8. HEBBIAN:     trace_k += |msg| * sigmoid(w_conn_k)                 → [BS, N, K]
-```
+LM:                                          52M
+  Embedding (32K × 768):                     24.6M
+  proj_up/down (768↔2048):                   3.1M
+  pos_embed (128 × 2048):                    0.3M
+  4 scan layers (d_inner=580):               19.0M
+  PCM:                                       1.0M
+  split_mlp:                                 3.5M
+  mem_gate [16]:                             ~0
 
-### Segment-Boundary Modulator (runs FIRST, once per segment)
-
-```
-Input:  cat(hebbian_traces[K=128], h[D=32], decay[1], primitive[D=32]) → [193]
-Hidden: Linear(193, 16) → tanh                                        → [16]
-Output: Linear(16, 161) → split                                       → [161]
-
-new_w_conn      = output[..., :128]        → [BS, N, K=128]
-new_decay_logit = output[..., 128]         → [BS, N]
-new_primitives  = output[..., 129:]        → [BS, N, D=32]
-```
-
-Runs before the token loop so we observe modulator effects during the segment.
-
-### Structural Plasticity (chunk boundary, non-differentiable)
-
-- Accumulate pairwise co-activation: `co_act += outer(msg_mag_per_neuron)` per segment
-- At chunk end: for each neuron, swap 8 weakest connections with 8 strongest non-connected
-- K stays fixed at 128, conn_indices re-sorted after swaps
-- N² = 16M entries (~64MB f32)
-
----
-
-## nn.Parameters
-
-| Parameter | Shape | Count | Purpose |
-|-----------|-------|-------|---------|
-| **Modulator** | | **23.6M** | |
-| mod_w1 | [4096, 193, 16] | 12.6M | Input→hidden |
-| mod_b1 | [4096, 16] | 0.07M | |
-| mod_w2 | [4096, 16, 161] | 10.6M | Hidden→output |
-| mod_b2 | [4096, 161] | 0.3M | |
-| **State MLP** | | **9.6M** | |
-| state_w1 | [4096, 64, 24] | 6.3M | Input→hidden |
-| state_b1 | [4096, 24] | 0.1M | |
-| state_w2 | [4096, 24, 32] | 3.1M | Hidden→output |
-| state_b2 | [4096, 32] | 0.1M | |
-| **Message MLP** | | **9.6M** | |
-| msg_w1 | [4096, 64, 24] | 6.3M | Input→hidden |
-| msg_b1 | [4096, 24] | 0.1M | |
-| msg_w2 | [4096, 24, 32] | 3.1M | Hidden→output |
-| msg_b2 | [4096, 32] | 0.1M | |
-| **Dendrite** | | **17.8M** | |
-| branch_w | [4096, 8, 16, 32] | 16.8M | Per-branch FC |
-| group_w | [4096, 2, 4, 32] | 1.0M | Per-group FC |
-| **Other** | | **0.1M** | |
-| neuron_id | [4096, 32] | 0.1M | Learnable ID |
-
-**Total memory: 61M params**
-
-### Runtime State (NOT learned, per batch)
-
-| Tensor | Shape | Purpose |
-|--------|-------|---------|
-| h | [BS, N, 32] | Neuron hidden state |
-| prev_messages | [BS, N, 32] | Last outgoing messages |
-| w_conn | [BS, N, 128] | Synaptic weights (set by modulator) |
-| primitives_state | [BS, N, 32] | Message modulation (set by modulator) |
-| decay_logit | [BS, N] | Leak rate (set by modulator) |
-| hebbian_traces | [BS, N, 128] | Per-segment avg of |msg| × σ(w_conn) |
-| co_activation | [N, N] | Pairwise co-fire for structural plasticity |
-
----
-
-## Training
-
-- **Single optimizer** (AdamW), 4 param groups:
-  - LM decay/no-decay at base LR
-  - Memory decay/no-decay at 0.3× base LR
-- **Memory params in f32** (tiny gradients round to zero in bf16)
-- **TBPTT**: detach h, prev_msg at segment boundaries
-- **Gradient checkpointing**: 8-step groups within each segment
-- **Loss**: CE + pcm_pred_weight × PCM prediction loss
-
-### Gradient Flow
-```
-CE loss → logits → upper scan → inject_memory(gate)
-  → readout(mean over replicas) → msg_all
-  → msg_MLP(msg_w1, msg_w2) → state_MLP(state_w1, state_w2)
-  → dendritic_gather(branch_w, group_w, w_conn_sig)
-  → sigmoid(w_conn) ← modulator(mod_w1, mod_w2) ← [hebbian, h, decay, prim]
+Memory:                                      58M
+  Modulator (mod_w1/w2 per neuron):          7.5M
+  State MLP (state_w1/w2 per neuron):        9.6M
+  Message MLP (msg_w1/w2 per neuron):        9.6M
+  Dendritic tree (branch_w + group_w):       4.5M
+  Neuron ID [512, 256]:                      0.1M
 ```
 
 ---
 
-## Triton Kernel
+## Gradient Flow
 
-**Fused dendritic gather** — forward + backward kernels:
-- Fuses gather + weight + dendritic tree into one kernel per step
-- Eliminates [BS, N, K, D] intermediate (~512MB at tier_a)
-- Grid: (BS, N), one program per (batch, neuron)
-- Backward: recomputes forward intermediates, atomic adds for shared grads
-- Wrapped in `torch.autograd.Function` with Python fallback
+```
+CE loss → logits → upper scan → inject_memory(gate) → readout(mean over replicas)
+  → msgs[T steps, pass 2] → msg_MLP(msg_w1, msg_w2)
+  → state_MLP(state_w1, state_w2)
+  → input_vec = frozen_received + inject[t]
+  → frozen_received ← gather(prev_msg, w_conn_sig)
+  → w_conn_sig = sigmoid(w_conn)
+  → w_conn ← modulator MLP(mod_w1, mod_w2) ← [hebbian, h, decay, primitives]
+```
 
-The per-neuron MLPs (state, message) use PyTorch batched einsums (already fast).
-
----
-
-## Throughput Analysis (2026-03-28)
-
-Current: **2.1K tok/s** on RTX 4090, BS=8, T=2048.
-
-| Component | Time/step | % |
-|-----------|-----------|---|
-| Fused gather (Triton) | 0.59ms | 81% |
-| State MLP (einsum) | 0.07ms | 10% |
-| Message MLP (einsum) | 0.07ms | 10% |
-| **Total per step** | **0.73ms** | |
-
-64 steps × 16 segments × fwd+bwd with checkpointing = ~8.3s/chunk.
-LM alone: 0.088s (186K tok/s). Memory is 99% of compute.
-
-**Bottleneck**: 128 random memory reads per neuron per step × 4096 neurons × 8 batch.
-The gather is I/O bound — Triton eliminates the intermediate tensor but can't avoid the reads.
-
-**Target: 40K tok/s** → need ~410ms/chunk → ~26ms/segment (fwd+bwd).
-
-### Optimization paths:
-1. **Fuse entire step** into one Triton kernel (gather + MLPs + hebbian). Eliminates per-step kernel launch overhead and intermediate tensors.
-2. **torch.compile** on the step loop — could auto-fuse the Python loop.
-3. **Increase stride**: 2→4 halves steps (32 instead of 64). Quality impact unknown.
-4. **Persistent kernel**: One launch processes all 64 steps with barriers.
+All memory graph parameters get gradients through this chain. The modulator's
+gradient comes through w_conn/decay/primitives which affect all T steps in both
+passes.
 
 ---
 
-## Key Design Decisions
+## Hebbian Traces and Structural Plasticity
 
-| Decision | Rationale |
-|----------|-----------|
-| PCM predicts H_{t+1} directly | Encoder+predictor both learned → degenerate collapse |
-| Split-point MLP instead of side_input | Surprise modulates the representation, not just the gate |
-| State MLP replaces leaky integration | More expressive — can fully rewrite state, not just blend |
-| Message MLP replaces tanh(h×prim) | Richer message generation with nonlinear interaction |
-| tanh at all MLP outputs | Bounded activations prevent explosion over 64 steps |
-| Neuron ID embedding | Breaks symmetry — neurons develop unique identities |
-| Hebbian traces → modulator | Modulator sees per-connection activity, enables credit assignment |
-| Modulator runs FIRST | Observe effects during segment (not after) |
-| Structural plasticity | Topology adapts to learned patterns; K fixed at 128 |
-| D_neuron=32 (not 16) | D=16 killed Triton perf (v9.1 lesson), richer representations |
-| K=128 (not 96) | More connections per neuron for richer communication |
-| Memory params in f32 | bf16 gradients round to zero for modulator/MLP params |
+**Hebbian traces** [N, K] track per-connection correlation during the last pass:
+```
+For each step: trace[k] += |msg| × sigmoid(w_conn[k])
+```
+High trace = neuron fired strongly AND connection weight was high = this connection
+was useful. The modulator reads hebbian traces at the next segment to decide
+updated connection weights.
+
+**Structural plasticity** runs between chunks (after backward):
+- Track co-activation: which neuron pairs fire together
+- Weakest connections (lowest hebbian) get replaced by random new connections
+- K stays fixed at 32 per neuron
+- Non-differentiable topology change
+
+---
+
+## Performance
+
+```
+RTX 4090 (25GB VRAM):
+  BS=32: 21.4K tok/s, 14.6GB
+  BS=48: 24.8K tok/s, 21.8GB
+
+Memory segment (BS=48):
+  Forward:  82ms  (2 gathers: 0.3ms, 256 MLP steps: ~67ms, overhead: ~15ms)
+  Backward: 102ms (2.0× forward)
+  LM:       28ms
+```
 
 ---
 
@@ -218,15 +212,11 @@ The gather is I/O bound — Triton eliminates the intermediate tensor but can't 
 
 | File | Purpose |
 |------|---------|
-| `src/v8/config.py` | Configuration (tier_a, tier_tiny) |
-| `src/v8/memory_graph.py` | MemoryGraph: neurons, modulator, MLPs, dendrites, plasticity |
-| `src/v8/model.py` | V8Model: LM + memory integration |
-| `src/v8/lm.py` | V8LM: split-scan, PCM, split_mlp, inject_memory |
-| `src/v8/pcm.py` | BatchedPCM: predict H_{t+1}, compute surprise |
-| `src/v8/triton_kernels.py` | Fused dendritic gather (Triton fwd+bwd + autograd.Function) |
-| `src/v8/trainer.py` | Training loop: single optimizer, joint backward |
-| `src/v8/train.py` | Entry point: param groups, f32 conversion, LR schedule |
-| `src/v8/diagnostics.py` | Per-step metrics + periodic snapshots |
-| `tests/v8/test_memory_graph.py` | 27 tests: init, forward, gradient flow, plasticity |
-| `tests/v8/test_integration.py` | 10 tests: end-to-end model, gradient flow |
-| `tests/v8/test_triton_kernel.py` | 7 tests: Triton vs Python reference (GPU only) |
+| `src/v8/config.py` | Configuration |
+| `src/v8/memory_graph.py` | 2-pass neuron simulation, modulator, dendrites, plasticity |
+| `src/v8/model.py` | LM + memory integration |
+| `src/v8/lm.py` | Split-scan LM, PCM, split_mlp, inject_memory |
+| `src/v8/pcm.py` | Predictive coding: predict H_{t+1} |
+| `src/v8/trainer.py` | Training loop |
+| `src/v8/train.py` | Entry point, optimizer setup |
+| `src/v8/diagnostics.py` | Metrics and snapshots |

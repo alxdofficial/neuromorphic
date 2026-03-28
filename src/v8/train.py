@@ -51,13 +51,9 @@ def parse_args():
     p.add_argument("--tokenizer", type=str, default=TOKENIZER)
     p.add_argument("--no-memory", action="store_true",
                    help="Disable memory graph (LM-only baseline)")
-    p.add_argument("--compile", action="store_true", default=None)
-    p.add_argument("--no-compile", dest="compile", action="store_false")
-    p.add_argument("--grad-ckpt", action="store_true", default=False)
     p.add_argument("--keep-checkpoints", type=int, default=3)
     p.add_argument("--snapshot-interval", type=int, default=1000)
     p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--action-every", type=int, default=None)
     return p.parse_args()
 
 
@@ -81,24 +77,15 @@ def main():
     config = V8Config.tier_a()
     config.vocab_size = vocab_size
     config.eot_id = eot_id
-    if args.compile is not None:
-        config.use_compile = args.compile
-    config.gradient_checkpointing = args.grad_ckpt
-    if args.action_every is not None:
-        config.action_every = args.action_every
     config.validate()
 
     bs = args.bs
     T = config.T
     print(f"\nConfig: D={config.D}, D_neuron={config.D_neuron}, C={config.C}")
-    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}")
-    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
-          f"D_neuron={config.D_neuron}, C_mem={config.C_mem}, "
-          f"N_per_slice={config.N_per_slice}")
-    print(f"  MLPs: mod_h={config.neuromod_hidden}, state_h={config.state_mlp_hidden}, "
-          f"msg_h={config.msg_mlp_hidden}")
-    print(f"  Segments: action_every={config.action_every}, "
-          f"stride={config.memory_update_stride}, "
+    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, d_inner={config.d_inner}")
+    print(f"  Memory: {config.N_neurons} neurons, K={config.K_connections}, "
+          f"D_neuron={config.D_neuron}, 2-pass simulation")
+    print(f"  Modulator: hidden={config.neuromod_hidden}, "
           f"plasticity={'on' if config.structural_plasticity else 'off'}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
@@ -133,13 +120,6 @@ def main():
 
     if args.no_memory:
         print("\n*** MEMORY DISABLED — LM-only baseline ***")
-
-    # Compile
-    if config.use_compile and device.type == "cuda":
-        print("Compiling model methods...")
-        model.lm.forward_scan_lower = torch.compile(model.lm.forward_scan_lower)
-        model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
-        model.lm.forward_output = torch.compile(model.lm.forward_output)
 
     # Optimizer — LM + memory param groups
     lm_decay, lm_no_decay = [], []
