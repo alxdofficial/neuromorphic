@@ -73,9 +73,19 @@ class V8Diagnostics:
 
             # Gradient norms (from last backward, if available)
             if mg.mod_w1.grad is not None:
-                metrics["mem_grad_norm"] = round(
-                    sum(p.grad.norm().item() ** 2
-                        for p in mg.parameters() if p.grad is not None) ** 0.5, 6)
+                mem_grad = sum(p.grad.norm().item() ** 2
+                               for p in mg.parameters() if p.grad is not None) ** 0.5
+                metrics["mem_grad_norm"] = round(mem_grad, 6)
+
+                # Per-component gradient norms for debugging
+                metrics["grad_mod_w1"] = round(mg.mod_w1.grad.norm().item(), 6)
+                metrics["grad_mod_w2"] = round(mg.mod_w2.grad.norm().item(), 6)
+                metrics["grad_state_w2"] = round(mg.state_w2.grad.norm().item(), 6)
+                metrics["grad_msg_w2"] = round(mg.msg_w2.grad.norm().item(), 6)
+                metrics["grad_neuron_id"] = round(mg.neuron_id.grad.norm().item(), 6)
+                if mg.use_dendritic_tree:
+                    metrics["grad_dendrite"] = round(
+                        mg.dendrite_branch_w.grad.norm().item(), 6)
 
             # Structural plasticity
             if hasattr(mg, '_last_rewire_swaps'):
