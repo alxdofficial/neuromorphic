@@ -429,86 +429,38 @@ class MemoryGraph(nn.Module):
         # Inject: replicate H_mid → per-neuron signals
         inject_all = self.inject(cc_signals)  # [BS, T_seg, N, D]
 
-        # 3-phase 2-pass simulation.
-        # Each pass has:
-        #   Phase 1: Gather (parallel) — read frozen neighbor messages
-        #   Phase 2: Affine scan (sequential but element-wise only, ~4ms)
-        #            V[t] = decay * V[t-1] + (1-decay) * (received + inject[t])
-        #   Phase 3: Nonlinear MLP (parallel across T) — transform all states at once
-        #            h[t] = state_MLP(V[t], V[t-1], decay)
-        #            msg[t] = msg_MLP(h[t], primitives) + neuron_id
-        #
-        # Phase 2 captures temporal dynamics (leaky integration with varying inject).
-        # Phase 3 adds nonlinear expressiveness (per-neuron MLPs).
-        # All T steps of Phase 3 run in parallel because V[t] and V[t-1] are
-        # both known from Phase 2.
-
-        D = self.config.D_neuron
+        # 2-pass simulation: freeze inter-neuron messages per pass,
+        # run all steps with frozen messages + varying inject.
+        # Pass 1: gather from initial prev_msg → run all steps
+        # Pass 2: gather from Pass 1 end state → run all steps (refined)
+        # Only 2 gathers instead of T_seg, massive speedup.
         n_passes = 2
         total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
-        decay_exp = decay.unsqueeze(-1)  # [BS, N, 1] for broadcasting with D
 
         for pass_idx in range(n_passes):
-            # Phase 1: ONE gather — freeze inter-neuron messages
+            # ONE gather per pass — freeze inter-neuron messages
             received = self._fused_gather(prev_msg, w_conn_sig)  # [BS, N, D]
 
-            # Phase 2 + 3 fused in chunks (readout accumulated per chunk):
-            readout_chunks = []
-            # Process C steps at a time. For each chunk:
-            #   - Run C affine scan steps (element-wise, sequential within chunk)
-            #   - Apply nonlinear MLP to all C states in parallel
-            # This avoids storing the full [BS, T, N, D] trajectory.
-            phase_chunk = 16
-            h_chunks = []
-            msg_chunks = []
-            V_t = h  # carry from previous pass/segment
+            # Run all T steps with frozen received + varying inject
+            msgs = []
+            for t in range(T_seg):
+                input_vec = received + inject_all[:, t]
+                h = self._state_mlp(input_vec, h, decay)
+                msg = self._msg_mlp(h, primitives)
+                msg = msg + self.neuron_id
+                prev_msg = msg
+                msgs.append(msg)
 
-            for c_start in range(0, T_seg, phase_chunk):
-                c_end = min(c_start + phase_chunk, T_seg)
-                C = c_end - c_start
-
-                # Phase 2: affine scan for C steps
-                V_chunk = []
-                V_prev_chunk = [V_t]  # V[t-1] for the first step
-                for t in range(c_start, c_end):
-                    V_t = decay_exp * V_t + (1.0 - decay_exp) * (
-                        received + inject_all[:, t])
-                    V_chunk.append(V_t)
-                    if t < c_end - 1:
-                        V_prev_chunk.append(V_t)
-
-                V_chunk = torch.stack(V_chunk, dim=1)        # [BS, C, N, D]
-                V_prev_chunk = torch.stack(V_prev_chunk, dim=1)  # [BS, C, N, D]
-
-                # Phase 3: nonlinear MLP on all C steps in parallel
-                BC = BS * C
-                h_chunk = self._state_mlp(
-                    V_chunk.reshape(BC, N, D),
-                    V_prev_chunk.reshape(BC, N, D),
-                    decay.unsqueeze(1).expand(-1, C, -1).reshape(BC, N))
-                msg_chunk = self._msg_mlp(
-                    h_chunk,
-                    primitives.unsqueeze(1).expand(-1, C, -1, -1).reshape(BC, N, D)
-                ) + self.neuron_id
-
-                # Readout per chunk: [BS, C, N, D] → [BS, C, D_lm]
-                readout_chunk = self.readout(msg_chunk.reshape(BS, C, N, D))
-                readout_chunks.append(readout_chunk)
-
-                # Hebbian per chunk (only on last pass)
+                # Hebbian (only on last pass)
                 if pass_idx == n_passes - 1:
-                    with torch.no_grad():
-                        mc = msg_chunk.reshape(BS, C, N, D).detach()
-                        mag = mc.norm(dim=-1, keepdim=True)  # [BS, C, N, 1]
-                        total_hebbian = total_hebbian + (
-                            mag * w_conn_sig.unsqueeze(1)).sum(dim=1)
+                    msg_mag = msg.norm(dim=-1, keepdim=True)
+                    total_hebbian = total_hebbian + msg_mag * w_conn_sig
 
-            # Update state for next pass (last step of last chunk)
-            h = h_chunk.reshape(BS, -1, N, D)[:, -1]
-            prev_msg = msg_chunk.reshape(BS, -1, N, D)[:, -1]
+        # Stack messages from last pass: [BS, T_seg, N, D]
+        msg_all = torch.stack(msgs, dim=1)
 
-        # Readout from last pass: [BS, T_seg, D_lm]
-        mem_out = torch.cat(readout_chunks, dim=1)
+        # Readout: average replicas → [BS, T_seg, D_lm]
+        mem_out = self.readout(msg_all)
 
         # Update persistent state (detached, for next segment)
         with torch.no_grad():
