@@ -815,6 +815,19 @@ def create_dataloader(
     if len(configs) == 1:
         shard_path = _find_shard(configs[0])
         if shard_path is not None:
+            # Shards are tokenizer-specific (prepare_data.py hardcodes TinyLlama).
+            # Reject if runtime tokenizer vocab doesn't match.
+            import numpy as np
+            shard_mm = np.memmap(shard_path, dtype=np.uint16, mode='r')
+            shard_max_id = int(shard_mm[:min(len(shard_mm), 1_000_000)].max())
+            del shard_mm
+            if shard_max_id >= tokenizer.vocab_size:
+                raise ValueError(
+                    f"Pre-tokenized shard {shard_path} contains token id "
+                    f"{shard_max_id} but tokenizer vocab_size is "
+                    f"{tokenizer.vocab_size}. The shard was likely created "
+                    f"with a different tokenizer. Delete the .bin shard or "
+                    f"use the matching tokenizer.")
             logger.info("Using pre-tokenized shard: %s", shard_path)
             dataset = TokenShardDataset(
                 shard_path=shard_path,

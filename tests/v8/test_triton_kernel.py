@@ -1,8 +1,7 @@
-"""Tests for Triton kernel equivalence with Python reference implementation.
+"""Tests for v9-backprop Triton kernels.
 
-v9 NOTE: Triton kernels are temporarily unused — the differentiable forward
-uses Python loops. These tests are skipped until Phase 2 (custom autograd
-Triton kernels). The old tests reference the v8 non-differentiable API.
+Tests the fused dendritic gather kernel (forward + backward) against
+the Python reference implementation.
 """
 
 import torch
@@ -10,16 +9,7 @@ import pytest
 import sys
 sys.path.insert(0, ".")
 
-pytest.skip("v9: Triton kernels not yet updated for differentiable forward",
-            allow_module_level=True)
-
-BS = 2
-
-# Skip all tests if no CUDA
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA required for Triton kernel tests"
-)
+from src.v8.config import V8Config
 
 
 def make_tiny(**overrides):
@@ -28,176 +18,428 @@ def make_tiny(**overrides):
     return cfg
 
 
-def make_paired_graphs(cfg, dtype=torch.float32):
-    """Create two MemoryGraphs with identical state — one for Python, one for Triton."""
-    device = torch.device("cuda")
-
-    mg_py = MemoryGraph(cfg, device, dtype=dtype)
-    mg_py.initialize(BS)
-    # Force Python path
-    mg_py._triton_ready = False
-
-    mg_tr = MemoryGraph(cfg, device, dtype=dtype)
-    mg_tr.initialize(BS)
-
-    # Copy identical state
-    mg_tr.h = mg_py.h.clone()
-    mg_tr.prev_messages = mg_py.prev_messages.clone()
-    mg_tr.primitives = mg_py.primitives.clone()
-    mg_tr.decay_logit = mg_py.decay_logit.clone()
-    mg_tr.key = mg_py.key.clone()
-    mg_tr.conn_indices = mg_py.conn_indices.clone()
-    mg_tr.conn_mask = mg_py.conn_mask.clone()
-    mg_tr.mean_input = mg_py.mean_input.clone()
-    mg_tr.mean_output = mg_py.mean_output.clone()
-    mg_tr.msg_magnitude = mg_py.msg_magnitude.clone()
-
-    # Re-init Triton buffers with the copied indices
-    if mg_tr._triton_ready:
-        mg_tr._conn_idx_i32 = mg_tr.conn_indices.to(torch.int32).contiguous()
-
-    return mg_py, mg_tr
+# Skip all tests if no CUDA or no Triton
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Triton requires CUDA"
+)
 
 
-class TestTritonEquivalence:
-    """Verify Triton kernel produces same output as Python reference."""
+def _try_import_triton():
+    try:
+        from src.v8.triton_kernels import fused_dendritic_gather
+        return fused_dendritic_gather
+    except ImportError:
+        pytest.skip("Triton not available")
 
-    def test_single_segment_f32(self):
-        """Float32 equivalence.
 
-        Tolerance is 1e-2 because sparse gather (Triton) and dense bmm (Python)
-        accumulate in different orders, producing different floating point rounding.
-        Both are correct — just different reduction trees.
-        """
+def _python_dendritic_gather(prev_msg, conn_indices, w_conn_sig,
+                              branch_w, group_w, cfg):
+    """Python reference: gather + weight + dendritic tree."""
+    neighbor_msgs = prev_msg[:, conn_indices]  # [BS, N, K, D]
+    weighted = w_conn_sig.unsqueeze(-1) * neighbor_msgs
+
+    BS, N, K, D = weighted.shape
+    bsz = cfg.dendrite_branch_size
+    nb = K // bsz
+    bpg = min(4, nb)
+    ng = max(1, nb // bpg)
+    bpg = nb // ng
+    n_tree = ng * bpg * bsz
+
+    tree_msgs = weighted[:, :, :n_tree].view(BS, N, nb, bsz, D)
+    branch_out = torch.tanh(
+        (tree_msgs * branch_w.unsqueeze(0)).sum(dim=3))
+    branch_grouped = branch_out.view(BS, N, ng, bpg, D)
+    group_out = torch.tanh(
+        (branch_grouped * group_w.unsqueeze(0)).sum(dim=3))
+    received = group_out.mean(dim=2)
+
+    if n_tree < K:
+        leftover = weighted[:, :, n_tree:].sum(dim=2)
+        tree_frac = n_tree / K
+        received = tree_frac * received + (1 - tree_frac) * leftover
+    return received
+
+
+def _make_test_tensors(cfg, BS=2, device='cuda'):
+    """Create test tensors matching memory graph structure."""
+    N = cfg.N_neurons
+    K = cfg.K_connections
+    D = cfg.D_neuron
+
+    prev_msg = torch.randn(BS, N, D, device=device, dtype=torch.float32)
+    w_conn_sig = torch.sigmoid(torch.randn(BS, N, K, device=device))
+
+    # Random connectivity
+    all_idx = torch.arange(N, device=device)
+    scores = torch.rand(N, N, device=device)
+    scores[all_idx, all_idx] = -float('inf')
+    K_actual = min(K, N - 1)
+    conn_indices = torch.zeros(N, K, dtype=torch.long, device=device)
+    conn_indices[:, :K_actual] = scores.topk(K_actual, dim=1).indices
+    conn_indices, _ = conn_indices.sort(dim=-1)
+
+    # Dendritic tree weights
+    bsz = cfg.dendrite_branch_size
+    nb = K // bsz
+    bpg = min(4, nb)
+    ng = max(1, nb // bpg)
+    bpg = nb // ng
+
+    branch_w = torch.randn(N, nb, bsz, D, device=device) * 0.1
+    group_w = torch.randn(N, ng, bpg, D, device=device) * 0.1
+
+    return prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng
+
+
+class TestFusedDendriticGatherForward:
+    def test_output_shape(self):
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda")
+        received = fused_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            branch_w, group_w, bsz, bpg, ng,
+            use_dendrite=True)
 
-        out_py = mg_py._forward_segment_python(cc.clone())
-        out_tr = mg_tr._forward_segment_triton(cc.clone())
+        assert received.shape == (BS, cfg.N_neurons, cfg.D_neuron)
 
-        torch.testing.assert_close(out_tr, out_py, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(mg_tr.prev_messages, mg_py.prev_messages,
-                                   atol=1e-2, rtol=1e-2)
-
-    def test_single_segment_bf16(self):
-        """BFloat16 equivalence — looser tolerance."""
+    def test_matches_python_reference(self):
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.bfloat16)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem,
-                         device="cuda", dtype=torch.bfloat16)
+        triton_out = fused_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            branch_w, group_w, bsz, bpg, ng,
+            use_dendrite=True)
 
-        out_py = mg_py._forward_segment_python(cc.clone())
-        out_tr = mg_tr._forward_segment_triton(cc.clone())
+        python_out = _python_dendritic_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            branch_w, group_w, cfg)
 
-        torch.testing.assert_close(out_tr, out_py, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(triton_out, python_out, atol=1e-4, rtol=1e-4)
 
-    def test_multi_segment_state_carry(self):
-        """State carries correctly across multiple segments."""
+    def test_no_dendrite_matches_reference(self):
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        for _ in range(3):
-            cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda") * 0.3
-            out_py = mg_py._forward_segment_python(cc.clone())
-            out_tr = mg_tr._forward_segment_triton(cc.clone())
+        triton_out = fused_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            None, None, 1, 1, 1,
+            use_dendrite=False)
 
-            torch.testing.assert_close(out_tr, out_py, atol=2e-2, rtol=2e-2)
+        # Python reference: simple weighted sum
+        neighbor_msgs = prev_msg[:, conn_indices]
+        python_out = (w_conn_sig.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
 
-        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(mg_tr.prev_messages, mg_py.prev_messages,
-                                   atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(triton_out, python_out, atol=1e-4, rtol=1e-4)
 
-    def test_eot_handling(self):
-        """EOT mask produces same state reset in both paths."""
+    def test_output_finite(self):
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        # Build up state
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda") * 0.5
-        mg_py._forward_segment_python(cc.clone())
-        mg_tr._forward_segment_triton(cc.clone())
+        received = fused_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            branch_w, group_w, bsz, bpg, ng,
+            use_dendrite=True)
 
-        # Now with EOT at position 2 for batch 0
-        cc2 = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda") * 0.5
-        eot_mask = torch.zeros(BS, cfg.action_every, dtype=torch.bool, device="cuda")
-        eot_mask[0, 2] = True
+        assert torch.isfinite(received).all()
 
-        out_py = mg_py._forward_segment_python(cc2.clone(), eot_mask)
-        out_tr = mg_tr._forward_segment_triton(cc2.clone(), eot_mask)
 
-        torch.testing.assert_close(out_tr, out_py, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(mg_tr.h, mg_py.h, atol=2e-2, rtol=2e-2)
-
-    def test_zero_input_equivalence(self):
-        """With zero CC signal, only graph dynamics matter."""
+class TestFusedDendriticGatherBackward:
+    def test_backward_runs(self):
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        # Set nonzero initial state
-        mg_py.h = torch.randn_like(mg_py.h) * 0.5
-        mg_py.prev_messages = torch.randn_like(mg_py.prev_messages) * 0.3
-        mg_tr.h = mg_py.h.clone()
-        mg_tr.prev_messages = mg_py.prev_messages.clone()
+        prev_msg.requires_grad_(True)
+        w_conn_sig.requires_grad_(True)
+        branch_w.requires_grad_(True)
+        group_w.requires_grad_(True)
 
-        cc = torch.zeros(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda")
+        received = fused_gather(
+            prev_msg, conn_indices, w_conn_sig,
+            branch_w, group_w, bsz, bpg, ng,
+            use_dendrite=True)
 
-        out_py = mg_py._forward_segment_python(cc.clone())
-        out_tr = mg_tr._forward_segment_triton(cc.clone())
+        loss = received.sum()
+        loss.backward()
 
-        torch.testing.assert_close(out_tr, out_py, atol=1e-2, rtol=1e-2)
+        assert prev_msg.grad is not None
+        assert w_conn_sig.grad is not None
+        assert branch_w.grad is not None
+        assert group_w.grad is not None
 
-    def test_mean_input_output_equivalence(self):
-        """Triton mean_input/mean_output should match Python reference."""
+    def test_grad_matches_python(self):
+        """Triton backward gradients should match Python autograd."""
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg_py, mg_tr = make_paired_graphs(cfg, dtype=torch.float32)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda") * 0.5
+        # Python reference with autograd
+        pm_py = prev_msg.clone().detach().requires_grad_(True)
+        wc_py = w_conn_sig.clone().detach().requires_grad_(True)
+        bw_py = branch_w.clone().detach().requires_grad_(True)
+        gw_py = group_w.clone().detach().requires_grad_(True)
 
-        mg_py._forward_segment_python(cc.clone())
-        mg_tr._forward_segment_triton(cc.clone())
+        py_out = _python_dendritic_gather(
+            pm_py, conn_indices, wc_py, bw_py, gw_py, cfg)
+        py_out.sum().backward()
 
-        # mean_input: average of received signals per neuron across segment
-        torch.testing.assert_close(mg_tr.mean_input, mg_py.mean_input,
-                                   atol=2e-2, rtol=2e-2)
-        # mean_output: average of outgoing messages per neuron across segment
-        torch.testing.assert_close(mg_tr.mean_output, mg_py.mean_output,
-                                   atol=2e-2, rtol=2e-2)
+        # Triton
+        pm_tr = prev_msg.clone().detach().requires_grad_(True)
+        wc_tr = w_conn_sig.clone().detach().requires_grad_(True)
+        bw_tr = branch_w.clone().detach().requires_grad_(True)
+        gw_tr = group_w.clone().detach().requires_grad_(True)
 
-    def test_dispatch_uses_triton_on_cuda(self):
-        """forward_segment dispatches to Triton when on CUDA."""
+        tr_out = fused_gather(
+            pm_tr, conn_indices, wc_tr,
+            bw_tr, gw_tr, bsz, bpg, ng,
+            use_dendrite=True)
+        tr_out.sum().backward()
+
+        # Compare gradients
+        torch.testing.assert_close(
+            wc_tr.grad, wc_py.grad, atol=1e-3, rtol=1e-3,
+            msg="w_conn_sig grad mismatch")
+        torch.testing.assert_close(
+            bw_tr.grad, bw_py.grad, atol=1e-3, rtol=1e-3,
+            msg="branch_w grad mismatch")
+        torch.testing.assert_close(
+            gw_tr.grad, gw_py.grad, atol=1e-3, rtol=1e-3,
+            msg="group_w grad mismatch")
+        torch.testing.assert_close(
+            pm_tr.grad, pm_py.grad, atol=1e-3, rtol=1e-3,
+            msg="prev_msg grad mismatch")
+
+    def test_no_dendrite_grad_matches(self):
+        """Backward without dendritic tree should match Python."""
+        fused_gather = _try_import_triton()
         cfg = make_tiny()
-        mg = MemoryGraph(cfg, torch.device("cuda"), dtype=torch.float32)
-        mg.initialize(BS)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
 
-        assert mg._triton_ready, "Triton should be ready on CUDA"
+        # Python reference
+        pm_py = prev_msg.clone().detach().requires_grad_(True)
+        wc_py = w_conn_sig.clone().detach().requires_grad_(True)
+        neighbor_msgs = pm_py[:, conn_indices]
+        py_out = (wc_py.unsqueeze(-1) * neighbor_msgs).sum(dim=2)
+        py_out.sum().backward()
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem, device="cuda")
-        out = mg.forward_segment(cc)
-        assert out.shape == (BS, cfg.action_every, cfg.C, cfg.D_mem)
-        assert torch.isfinite(out).all()
+        # Triton
+        pm_tr = prev_msg.clone().detach().requires_grad_(True)
+        wc_tr = w_conn_sig.clone().detach().requires_grad_(True)
+        tr_out = fused_gather(
+            pm_tr, conn_indices, wc_tr,
+            None, None, 1, 1, 1,
+            use_dendrite=False)
+        tr_out.sum().backward()
+
+        torch.testing.assert_close(
+            wc_tr.grad, wc_py.grad, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            pm_tr.grad, pm_py.grad, atol=1e-3, rtol=1e-3)
+
+    def test_grad_matches_with_leftover(self):
+        """K not divisible by branch_size → leftover connections.
+        Backward must scale tree portion by tree_frac."""
+        fused_gather = _try_import_triton()
+        # K=10, branch_size=4 → 2 branches, 1 group, 2 leftover connections
+        cfg = make_tiny(K_connections=10, dendrite_branch_size=4,
+                        N_mem_neurons=16)
+        BS = 2
+        tensors = _make_test_tensors(cfg, BS)
+        prev_msg, conn_indices, w_conn_sig, branch_w, group_w, bsz, bpg, ng = tensors
+
+        # Python reference
+        pm_py = prev_msg.clone().detach().requires_grad_(True)
+        wc_py = w_conn_sig.clone().detach().requires_grad_(True)
+        bw_py = branch_w.clone().detach().requires_grad_(True)
+        gw_py = group_w.clone().detach().requires_grad_(True)
+        py_out = _python_dendritic_gather(
+            pm_py, conn_indices, wc_py, bw_py, gw_py, cfg)
+        py_out.sum().backward()
+
+        # Triton
+        pm_tr = prev_msg.clone().detach().requires_grad_(True)
+        wc_tr = w_conn_sig.clone().detach().requires_grad_(True)
+        bw_tr = branch_w.clone().detach().requires_grad_(True)
+        gw_tr = group_w.clone().detach().requires_grad_(True)
+        tr_out = fused_gather(
+            pm_tr, conn_indices, wc_tr,
+            bw_tr, gw_tr, bsz, bpg, ng,
+            use_dendrite=True)
+        tr_out.sum().backward()
+
+        torch.testing.assert_close(
+            tr_out, py_out, atol=1e-4, rtol=1e-4,
+            msg="forward mismatch with leftover")
+        torch.testing.assert_close(
+            wc_tr.grad, wc_py.grad, atol=1e-3, rtol=1e-3,
+            msg="w_conn_sig grad mismatch with leftover")
+        torch.testing.assert_close(
+            bw_tr.grad, bw_py.grad, atol=1e-3, rtol=1e-3,
+            msg="branch_w grad mismatch with leftover")
+        torch.testing.assert_close(
+            gw_tr.grad, gw_py.grad, atol=1e-3, rtol=1e-3,
+            msg="group_w grad mismatch with leftover")
+        torch.testing.assert_close(
+            pm_tr.grad, pm_py.grad, atol=1e-3, rtol=1e-3,
+            msg="prev_msg grad mismatch with leftover")
 
 
-class TestTritonTierA:
-    """Test with Tier A dimensions (N=1024, K=96, D=128) to catch scaling issues."""
+class TestFusedNeuronStep:
+    """Test the fully fused step kernel against Python reference."""
 
-    def test_tier_a_dimensions(self):
-        """Run one segment at full Tier A scale."""
-        cfg = V8Config.tier_a(vocab_size=32000, T=256, action_every=256)
-        cfg.validate()
-        device = torch.device("cuda")
+    def _try_import(self):
+        try:
+            from src.v8.triton_kernels import fused_neuron_step
+            return fused_neuron_step
+        except ImportError:
+            pytest.skip("Triton not available")
 
-        mg = MemoryGraph(cfg, device, dtype=torch.bfloat16)
-        mg.initialize(BS)
+    def _python_step(self, h, prev_msg, inject, conn_indices, w_conn_sig,
+                     decay, primitives, neuron_id,
+                     branch_w, group_w, state_w1, state_b1, state_w2, state_b2,
+                     msg_w1, msg_b1, msg_w2, msg_b2, hebbian, cfg):
+        """Python reference for one step."""
+        BS, N, D = h.shape
+        K = conn_indices.shape[1]
 
-        cc = torch.randn(BS, cfg.action_every, cfg.C, cfg.D_mem,
-                         device=device, dtype=torch.bfloat16) * 0.1
-        out = mg.forward_segment(cc)
+        # Gather + weight + dendritic
+        neighbor_msgs = prev_msg[:, conn_indices]
+        weighted = w_conn_sig.unsqueeze(-1) * neighbor_msgs
 
-        assert out.shape == (BS, cfg.action_every, cfg.C, cfg.D_mem)
-        assert torch.isfinite(out).all()
-        assert mg.h.abs().sum() > 0
+        bsz = cfg.dendrite_branch_size
+        nb = K // bsz
+        bpg = min(4, nb)
+        ng = max(1, nb // bpg)
+        bpg = nb // ng
+        n_tree = ng * bpg * bsz
+
+        tree_msgs = weighted[:, :, :n_tree].view(BS, N, nb, bsz, D)
+        branch_out = torch.tanh(
+            (tree_msgs * branch_w.unsqueeze(0)).sum(dim=3))
+        branch_grouped = branch_out.view(BS, N, ng, bpg, D)
+        group_out = torch.tanh(
+            (branch_grouped * group_w.unsqueeze(0)).sum(dim=3))
+        received = group_out.mean(dim=2)
+        if n_tree < K:
+            leftover = weighted[:, :, n_tree:].sum(dim=2)
+            tf = n_tree / K
+            received = tf * received + (1 - tf) * leftover
+
+        input_vec = received + inject
+
+        # State MLP (w1 transposed: [N, H, I])
+        x_s = torch.cat([input_vec, h, decay.unsqueeze(-1)], dim=-1)
+        sh = torch.einsum('bni,nhi->bnh', x_s, state_w1) + state_b1
+        sh = torch.tanh(sh)
+        h_new = torch.einsum('bnh,nhd->bnd', sh, state_w2) + state_b2
+        h_new = torch.tanh(h_new)
+
+        # Message MLP (w1 transposed: [N, H, I])
+        x_m = torch.cat([h_new, primitives], dim=-1)
+        mh = torch.einsum('bni,nhi->bnh', x_m, msg_w1) + msg_b1
+        mh = torch.tanh(mh)
+        msg = torch.einsum('bnh,nhd->bnd', mh, msg_w2) + msg_b2
+        msg = torch.tanh(msg)
+
+        # Neuron ID
+        msg = msg + neuron_id
+
+        # Hebbian
+        msg_mag = msg.norm(dim=-1, keepdim=True)
+        hebbian_new = hebbian + msg_mag * w_conn_sig
+
+        return h_new, msg, hebbian_new
+
+    def test_fused_step_matches_python(self):
+        fused_step = self._try_import()
+        cfg = make_tiny()
+        BS = 2
+        N, D, K = cfg.N_neurons, cfg.D_neuron, cfg.K_connections
+        H_S, H_M = cfg.state_mlp_hidden, cfg.msg_mlp_hidden
+        device = 'cuda'
+
+        # Create random tensors
+        h = torch.randn(BS, N, D, device=device)
+        prev_msg = torch.randn(BS, N, D, device=device)
+        inject = torch.randn(BS, N, D, device=device)
+        w_conn_sig = torch.sigmoid(torch.randn(BS, N, K, device=device))
+        decay = torch.sigmoid(torch.randn(BS, N, device=device))
+        primitives = torch.randn(BS, N, D, device=device)
+        neuron_id = torch.randn(N, D, device=device) * 0.02
+
+        # Connectivity
+        all_idx = torch.arange(N, device=device)
+        scores = torch.rand(N, N, device=device)
+        scores[all_idx, all_idx] = -float('inf')
+        K_actual = min(K, N - 1)
+        conn_indices = torch.zeros(N, K, dtype=torch.long, device=device)
+        conn_indices[:, :K_actual] = scores.topk(K_actual, dim=1).indices
+        conn_indices, _ = conn_indices.sort(dim=-1)
+
+        # Dendritic weights
+        bsz = cfg.dendrite_branch_size
+        nb = K // bsz
+        bpg = min(4, nb)
+        ng = max(1, nb // bpg)
+        bpg = nb // ng
+        branch_w = torch.randn(N, nb, bsz, D, device=device) * 0.1
+        group_w = torch.randn(N, ng, bpg, D, device=device) * 0.1
+
+        # MLP weights — w1 transposed: [N, H, I] for contiguous Triton access
+        state_in = 2 * D + 1
+        state_w1 = torch.randn(N, H_S, state_in, device=device) * 0.1
+        state_b1 = torch.randn(N, H_S, device=device) * 0.01
+        state_w2 = torch.randn(N, H_S, D, device=device) * 0.1
+        state_b2 = torch.randn(N, D, device=device) * 0.01
+        msg_w1 = torch.randn(N, H_M, 2*D, device=device) * 0.1
+        msg_b1 = torch.randn(N, H_M, device=device) * 0.01
+        msg_w2 = torch.randn(N, H_M, D, device=device) * 0.1
+        msg_b2 = torch.randn(N, D, device=device) * 0.01
+
+        # Python reference
+        heb_py = torch.zeros(BS, N, K, device=device)
+        h_py, msg_py, heb_py = self._python_step(
+            h, prev_msg, inject, conn_indices, w_conn_sig,
+            decay, primitives, neuron_id,
+            branch_w, group_w,
+            state_w1, state_b1, state_w2, state_b2,
+            msg_w1, msg_b1, msg_w2, msg_b2, heb_py, cfg)
+
+        # Triton
+        heb_tr = torch.zeros(BS, N, K, device=device)
+        h_tr, msg_tr = fused_step(
+            h, prev_msg, inject, conn_indices, w_conn_sig,
+            decay, primitives, neuron_id,
+            branch_w, group_w,
+            state_w1, state_b1, state_w2, state_b2,
+            msg_w1, msg_b1, msg_w2, msg_b2,
+            heb_tr, bsz, bpg, ng, True)
+
+        torch.testing.assert_close(h_tr, h_py, atol=1e-3, rtol=1e-3,
+                                   msg="h mismatch")
+        torch.testing.assert_close(msg_tr, msg_py, atol=1e-3, rtol=1e-3,
+                                   msg="msg mismatch")
+        torch.testing.assert_close(heb_tr, heb_py, atol=1e-3, rtol=1e-3,
+                                   msg="hebbian mismatch")

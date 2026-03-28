@@ -1,14 +1,14 @@
-"""V8/v9 Model — split-scan LM + memory graph (ES-trained).
+"""v9-backprop Model — split-scan LM + differentiable memory graph.
 
 Training flow per chunk:
   1. Lower scan + PCM → H_mid, surprise  (backprop)
-  2. Memory graph: per-token dynamics     (no grad, fast)
+  2. Memory graph: per-token dynamics     (backprop through modulator + dendrites)
+     - Modulator predicts w_conn, decay, primitives (once per segment)
+     - Token loop: gather → weight → dendritic tree → inject → integrate → message
+     - Readout: average neuron replicas → D_lm
   3. Inject + upper scan → logits         (backprop)
 
-ES update (every es_collect_chunks chunks):
-  - Perturb K neurons' params with Gaussian noise
-  - Replay chunks with N trajectories, score by CE loss
-  - Update params toward good perturbations
+Single optimizer trains LM + memory graph jointly.
 """
 
 import torch
@@ -22,7 +22,7 @@ from .memory_graph import MemoryGraph
 
 
 class V8Model(nn.Module):
-    """Top-level model: LM (backprop) + Memory Graph (ES)."""
+    """Top-level model: LM + differentiable Memory Graph."""
 
     def __init__(self, config: V8Config):
         super().__init__()
@@ -41,10 +41,9 @@ class V8Model(nn.Module):
         use_memory: bool = True,
         has_reset: bool = False,
     ) -> dict:
-        """Process one chunk. LM by backprop, memory graph no-grad."""
+        """Process one chunk. Everything trained by backprop."""
         BS, T = input_ids.shape
-        C = self.config.C
-        D_mem = self.config.D_mem
+        D = self.config.D
         action_every = self.config.action_every
         device = input_ids.device
         dtype = next(self.lm.parameters()).dtype
@@ -61,23 +60,35 @@ class V8Model(nn.Module):
             return {"logits": logits, "aux_loss": aux_loss,
                     "surprise": surprise.detach()}
 
-        # Memory graph (no grad)
+        # Memory graph (differentiable through modulator + dendrites)
         if not self._states_initialized:
             self.memory.initialize_states(BS)
             self._states_initialized = True
 
-        cc_all = H_mid.detach().view(BS, T, C, D_mem)
+        # Detach H_mid for memory graph input — lower scan gets its own
+        # gradient path through the CE loss, memory graph provides a second
+        # gradient channel through inject_memory
+        cc_all = H_mid.detach()  # [BS, T, D]
         n_segments = T // action_every
-        cc_segments = cc_all.view(BS, n_segments, action_every, C, D_mem)
-        mem_out = torch.empty(BS, T, C, D_mem, device=device, dtype=dtype)
 
+        mem_out_segs = []
         for seg in range(n_segments):
-            seg_out = self.memory.forward_segment(cc_segments[:, seg])
             t0 = seg * action_every
-            mem_out[:, t0:t0 + action_every] = seg_out
+            t1 = t0 + action_every
+            seg_cc = cc_all[:, t0:t1]  # [BS, T_seg, D]
+
+            # Memory forward (on compute graph through modulator/dendrites)
+            seg_out = self.memory.forward_segment(seg_cc)  # [BS, T_seg, D]
+            mem_out_segs.append(seg_out)
+
+        mem_out = torch.cat(mem_out_segs, dim=1)  # [BS, T, D]
+
+        # Reshape mem_out to match inject_memory expectations [BS, T, C, D_cc]
+        # Cast to LM dtype (modulator computes in f32, LM is bf16)
+        mem_signals = mem_out.to(dtype).view(BS, T, self.config.C, self.config.D_cc)
 
         # Upper scan + output (with grad)
-        H_enriched = self.lm.inject_memory(H_mid, mem_out)
+        H_enriched = self.lm.inject_memory(H_mid, mem_signals)
         H = self.lm.forward_scan_upper(H_enriched, surprise=surprise)
         logits = self.lm.forward_output(H)
 
@@ -85,206 +96,7 @@ class V8Model(nn.Module):
             "logits": logits,
             "aux_loss": aux_loss,
             "surprise": surprise.detach(),
-            "cc_segments": cc_segments.detach(),
-            "H_mid": H_mid.detach(),
         }
-
-    # ================================================================
-    # ES trajectory scoring
-    # ================================================================
-
-    @torch.no_grad()
-    def score_es_trajectories(
-        self,
-        es_buffer: list[dict],
-        pre_mg_state: dict,
-        pre_mg_params: dict,
-    ) -> dict:
-        """Score N trajectories with perturbed K neurons.
-
-        For each trajectory: perturb K neurons' params → replay all chunks
-        → score by CE loss → z-score normalize → advantages.
-
-        Args:
-            es_buffer: list of {cc_segments, H_mid, surprise, target_ids, eot_at,
-                                pre_upper_carries} from collected chunks
-            pre_mg_state: runtime state before collection window
-            pre_mg_params: ES params before collection window
-
-        Returns:
-            dict with k_neurons, advantages, noise vectors, best state
-        """
-        N = self.config.N_neurons
-        K = min(self.config.es_k_neurons, N)
-        N_traj = self.config.es_n_trajectories
-        sigma = self.config.es_sigma
-        split = self.config.scan_split_at
-        L = self.config.L_total
-        mg = self.memory
-
-        first = es_buffer[0]
-        BS = first["H_mid"].shape[0]
-        device = first["H_mid"].device
-        dtype = first["H_mid"].dtype
-        n_chunks = len(es_buffer)
-        n_segments = first["cc_segments"].shape[1]
-        action_every = self.config.action_every
-
-        # Choose K neurons
-        k_neurons = torch.randperm(N, device=device)[:K]
-
-        # Get current K-neuron param shapes for noise generation
-        k_params = mg.get_neuron_es_params(k_neurons)
-
-        # Per-param-type σ scaling: σ_effective = σ * max(param_rms, 0.1)
-        # Floor at 0.1 so zero-init params (fc2_w, fc2_b) still get perturbed
-        param_scales = {}
-        for name, param in k_params.items():
-            rms = param.pow(2).mean().sqrt().clamp(min=0.1).item()
-            param_scales[name] = rms
-
-        # Generate noise for all trajectories (antithetic: +ε and -ε)
-        all_noise = []
-        for traj_i in range(N_traj):
-            noise = {}
-            if traj_i % 2 == 0:
-                for name, param in k_params.items():
-                    # Scale noise by param RMS so perturbation is proportional
-                    noise[name] = torch.randn_like(param) * param_scales[name]
-            else:
-                prev_noise = all_noise[-1]
-                noise = {name: -eps for name, eps in prev_noise.items()}
-            all_noise.append(noise)
-
-        # Score each trajectory
-        trajectory_losses = torch.empty(N_traj, device=device)
-
-
-        best_traj_idx = 0
-        best_traj_loss = float('inf')
-        best_mg_state = {k: v.clone() for k, v in pre_mg_state.items()}
-        best_mg_params = {name: val.clone() for name, val in pre_mg_params.items()}
-        first_carries = first.get("pre_upper_carries")
-        best_upper_carries = [
-            c.clone() if c is not None else None
-            for c in first_carries] if first_carries is not None else None
-
-        for traj_i in range(N_traj):
-            # Restore params + state
-            for name, val in pre_mg_params.items():
-                getattr(mg, name).data.copy_(val)
-            mg.load_runtime_state({k: v.clone() for k, v in pre_mg_state.items()})
-
-
-
-            # Apply perturbation
-            mg.apply_es_perturbation(k_neurons, all_noise[traj_i], sigma)
-
-            # Replay all chunks
-            traj_total_loss = 0.0
-            for chunk_idx, chunk in enumerate(es_buffer):
-                cc_segments = chunk["cc_segments"]
-                H_mid = chunk["H_mid"]
-                surprise = chunk["surprise"]
-                target_ids = chunk["target_ids"]
-                eot_at = chunk["eot_at"]
-
-                # Restore upper carries only for the FIRST chunk of each trajectory.
-                # Subsequent chunks let carries flow naturally (persistence).
-                if chunk_idx == 0:
-                    chunk_carries = chunk.get("pre_upper_carries")
-                    if chunk_carries is not None:
-                        for i, c in enumerate(chunk_carries):
-                            self.lm._carries[split + i] = c.clone() if c is not None else None
-
-                # Memory forward
-                C_mem = mg.C_mem
-                mem_out = torch.empty(BS, self.config.T, C_mem, self.config.D_mem,
-                                      device=device, dtype=dtype)
-                for seg in range(n_segments):
-                    seg_out = mg.forward_segment(cc_segments[:, seg])
-                    t0 = seg * action_every
-                    mem_out[:, t0:t0 + action_every] = seg_out
-
-                # Upper scan + CE
-                H_enriched = self.lm.inject_memory(H_mid, mem_out)
-                H = self.lm.forward_scan_upper(H_enriched, surprise=surprise)
-                logits = self.lm.forward_output(H)
-
-                reward_mask = (~eot_at).to(dtype=dtype)
-                ce = F.cross_entropy(
-                    logits.float().reshape(-1, self.config.vocab_size),
-                    target_ids.reshape(-1), reduction='none'
-                ).reshape(BS, self.config.T)
-                chunk_loss = (ce * reward_mask).sum() / reward_mask.sum().clamp(min=1)
-                traj_total_loss += chunk_loss.item()
-
-            avg_loss = traj_total_loss / n_chunks
-            trajectory_losses[traj_i] = avg_loss
-
-            if traj_total_loss < best_traj_loss:
-                best_traj_loss = traj_total_loss
-                best_traj_idx = traj_i
-                best_mg_state = mg.runtime_state_dict()
-                best_mg_state = {k: v.clone() for k, v in best_mg_state.items()}
-                best_mg_params = {name: getattr(mg, name).data.clone()
-                                  for name in pre_mg_params}
-                best_upper_carries = [
-                    self.lm._carries[split + i].clone()
-                    if self.lm._carries[split + i] is not None else None
-                    for i in range(L - split)]
-
-        # Rank-based fitness shaping (robust to outliers and σ scaling)
-        # Utility: u_i = max(0, log(N/2 + 1) - log(rank_i)) then normalize
-        import math
-        ranks = trajectory_losses.argsort().argsort().float() + 1  # 1-indexed ranks (lower loss = rank 1)
-        log_half = math.log(N_traj / 2.0 + 1)
-        utilities = torch.clamp(log_half - torch.log(ranks), min=0)
-        utilities = utilities / utilities.sum().clamp(min=1e-8) - 1.0 / N_traj
-        advantages = utilities  # positive for low-loss (good) trajectories
-
-        # Restore best trajectory state
-        for name, val in best_mg_params.items():
-            getattr(mg, name).data.copy_(val)
-        mg.load_runtime_state(best_mg_state)
-        for i, c in enumerate(best_upper_carries):
-            self.lm._carries[split + i] = c
-
-        return {
-            "k_neurons": k_neurons,
-            "advantages": advantages,
-            "noise": all_noise,
-            "trajectory_losses": trajectory_losses,
-            "best_traj_idx": best_traj_idx,
-        }
-
-    def apply_es_gradient(self, scoring: dict):
-        """Apply ES update: move params toward good perturbations.
-
-        θ += lr / (N * σ) * Σ_i advantage_i * ε_i
-        """
-        advantages = scoring["advantages"]  # [N_traj]
-        noise_list = scoring["noise"]       # [N_traj] of {name: Tensor}
-        k_neurons = scoring["k_neurons"]    # [K]
-        N_traj = len(noise_list)
-        sigma = self.config.es_sigma
-        lr = self.config.es_lr
-
-        # Compute weighted noise: Σ advantage_i * ε_i
-        weighted_noise = {}
-        for traj_i, noise in enumerate(noise_list):
-            adv = advantages[traj_i].item()
-            for name, eps in noise.items():
-                if name not in weighted_noise:
-                    weighted_noise[name] = torch.zeros_like(eps)
-                weighted_noise[name] += adv * eps
-
-        # Scale by 1 / (N_traj * σ)
-        scale = lr / (N_traj * sigma)
-        for name in weighted_noise:
-            weighted_noise[name] *= scale
-
-        self.memory.apply_es_update(k_neurons, weighted_noise, lr=1.0)
 
     # ================================================================
     # Utilities
@@ -304,6 +116,10 @@ class V8Model(nn.Module):
 
     def detach_states(self):
         self.lm.detach_carries()
+        self.memory.detach_states()
+        # Structural plasticity runs between chunks (after backward)
+        if hasattr(self.memory, 'rewire_connections'):
+            self.memory.rewire_connections()
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())

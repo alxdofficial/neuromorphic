@@ -4,13 +4,13 @@ Lower scan layers (0..split-1) produce H_mid. Memory graph reads H_mid
 per-token and produces mem_signals. Memory is injected into H_mid, then
 upper scan layers (split..L-1) process the memory-enriched representation.
 
-PCM computes surprise at the split point. Surprise is passed as a side
-input to the first upper scan layer, influencing both its gate and input
-additively. No multiplicative gain modulation.
+PCM computes surprise at the split point by predicting the next scan
+hidden state. A split-point MLP combines H_mid and surprise into a
+unified representation before the upper scan.
 
-CC->memory: H_mid sliced per CC (D_cc=128) -- lower scan's representation
-Memory->CC: port neuron messages (D_mem=D_cc=128) -- gated, added to H_mid
-Upper scan layers see memory-enriched input and learn to use it.
+CC->memory: H_mid replicated per neuron (D_neuron=32 slices)
+Memory->CC: neuron messages averaged over replicas, gated, added to H_mid
+Upper scan layers see memory-enriched + surprise-modulated input.
 """
 
 import torch
@@ -51,19 +51,26 @@ class V8LM(nn.Module):
         split = config.scan_split_at
         self.layers = nn.ModuleList()
         for i in range(config.L_total):
-            # First upper scan layer gets side_dim=D for PCM surprise input
-            side_dim = D if (i == split and config.pcm_enabled) else 0
             self.layers.append(
                 ScanLayer(D, config.d_inner, config.dropout,
-                          n_layers=config.L_total, glu_output=config.glu_output,
-                          side_dim=side_dim)
+                          n_layers=config.L_total, glu_output=config.glu_output)
             )
 
         # Batched PCM across all columns
         if config.pcm_enabled:
             self.pcm = BatchedPCM(C, D_cc, hidden=config.pcm_hidden)
+            # Split-point MLP: combines H_mid + surprise before upper scan
+            self.split_mlp = nn.Sequential(
+                nn.Linear(2 * D, config.d_inner),
+                nn.SiLU(),
+                nn.Linear(config.d_inner, D),
+            )
+            # Zero-init final layer: starts as identity-like (H passes through)
+            nn.init.zeros_(self.split_mlp[2].weight)
+            nn.init.zeros_(self.split_mlp[2].bias)
         else:
             self.pcm = None
+            self.split_mlp = None
 
         # Memory gate per CC (sigmoid(0) = 0.5 at init)
         self.mem_gate = nn.Parameter(torch.zeros(C))
@@ -117,12 +124,11 @@ class V8LM(nn.Module):
                 H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
-        # PCM at the split point — compute surprise, no gain modulation
+        # PCM at the split point — predict next hidden state, compute surprise
         aux_loss = torch.tensor(0.0, device=H.device)
         if self.pcm is not None:
             H_cols = H.view(BS, T, C, D_cc)
-            x_cols = x.view(BS, T, C, D_cc)
-            surprise, z_hat, z, pred_loss, per_cc_pred_loss = self.pcm(H_cols, x_cols)
+            surprise, H_hat, pred_loss, per_cc_pred_loss = self.pcm(H_cols)
             aux_loss = pred_loss * self.config.pcm_pred_weight
 
             # Cache lightweight PCM stats for diagnostics (no tensors retained)
@@ -135,7 +141,7 @@ class V8LM(nn.Module):
                 "pred_loss_per_cc": per_cc_pred_loss,  # [C]
             }
 
-            # Reshape to [BS, T, D] for upper scan side input
+            # Reshape to [BS, T, D] for split-point MLP
             surprise_flat = surprise.reshape(BS, T, D)
         else:
             surprise_flat = torch.zeros(BS, T, D, device=H.device, dtype=H.dtype)
@@ -148,13 +154,12 @@ class V8LM(nn.Module):
                            surprise: Tensor | None = None) -> Tensor:
         """Upper scan layers (split..L-1) on memory-enriched input.
 
-        The first upper layer receives surprise as a side input, which
-        additively influences its gate and scan input. Subsequent layers
-        see the result through normal residual connections.
+        Surprise is mixed into the representation via split_mlp before
+        the upper scan layers process it. No side_input mechanism.
 
         Args:
             H_enriched: [BS, T, D] — H_mid + gated memory signals
-            surprise: [BS, T, D] or None — PCM surprise (side input to first upper layer)
+            surprise: [BS, T, D] or None — PCM surprise
 
         Returns:
             H: [BS, T, D] — hidden states after upper scan layers
@@ -162,15 +167,18 @@ class V8LM(nn.Module):
         split = self.config.scan_split_at
 
         H = H_enriched
+
+        # Mix surprise at split point via MLP (residual, zero-init at start)
+        if surprise is not None and self.split_mlp is not None:
+            H = H + self.split_mlp(torch.cat([H, surprise], dim=-1))
+
         for i in range(split, self.config.L_total):
             carry = self._carries[i]
-            # Only the first upper layer gets surprise as side input
-            side = surprise if i == split else None
             if self.config.gradient_checkpointing and self.training:
-                H, h_last = grad_checkpoint(self.layers[i], H, carry, side,
+                H, h_last = grad_checkpoint(self.layers[i], H, carry,
                                             use_reentrant=False)
             else:
-                H, h_last = self.layers[i](H, carry, side_input=side)
+                H, h_last = self.layers[i](H, carry)
             self._carries[i] = h_last
 
         return H
@@ -187,7 +195,8 @@ class V8LM(nn.Module):
         """
         gate = torch.sigmoid(self.mem_gate)  # [C]
         mem_contribution = gate[None, None, :, None] * mem_signals
-        return H_mid + mem_contribution.reshape(H_mid.shape)
+        # Ensure output matches H_mid dtype (gate may be f32 for precision)
+        return H_mid + mem_contribution.reshape(H_mid.shape).to(H_mid.dtype)
 
     def forward_output(self, H: Tensor) -> Tensor:
         """Output head only (memory injection happens mid-scan now).

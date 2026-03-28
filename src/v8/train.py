@@ -1,11 +1,11 @@
-"""Entry point for v8/v9 training.
+"""
+Entry point for v9-backprop training.
 
 Usage:
-    python -m src.v8.train                        # defaults (LM backprop + ES memory)
+    python -m src.v8.train                        # defaults
+    python -m src.v8.train --bs 8 --steps 5000    # override
     python -m src.v8.train --no-memory             # LM-only baseline
     python -m src.v8.train --no-compile            # disable torch.compile
-
-LM trained by backprop. Memory graph trained by Evolution Strategies.
 """
 
 import argparse
@@ -23,10 +23,7 @@ from .trainer import V8Trainer
 from .diagnostics import V8Diagnostics
 from ..data import create_dataloader, get_tokenizer, get_special_token_ids
 
-# ============================================================================
 # Defaults
-# ============================================================================
-
 BS = 8
 LR = 3e-4
 LR_MIN = 3e-5
@@ -42,7 +39,7 @@ SAVE_DIR = "outputs/v8"
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="v8/v9 training (LM backprop + ES memory)")
+    p = argparse.ArgumentParser(description="v9-backprop training")
     p.add_argument("--bs", type=int, default=BS)
     p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--steps", type=int, default=MAX_STEPS)
@@ -52,15 +49,15 @@ def parse_args():
     p.add_argument("--save-interval", type=int, default=SAVE_INTERVAL)
     p.add_argument("--log-interval", type=int, default=LOG_INTERVAL)
     p.add_argument("--tokenizer", type=str, default=TOKENIZER)
-    p.add_argument("--no-memory", action="store_true")
+    p.add_argument("--no-memory", action="store_true",
+                   help="Disable memory graph (LM-only baseline)")
     p.add_argument("--compile", action="store_true", default=None)
     p.add_argument("--no-compile", dest="compile", action="store_false")
+    p.add_argument("--grad-ckpt", action="store_true", default=False)
     p.add_argument("--keep-checkpoints", type=int, default=3)
     p.add_argument("--snapshot-interval", type=int, default=1000)
-    p.add_argument("--plot-interval", type=int, default=500)
     p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--es-warmup", type=int, default=None,
-                   help="Steps before ES starts (default: from config)")
+    p.add_argument("--action-every", type=int, default=None)
     return p.parse_args()
 
 
@@ -73,53 +70,69 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.set_float32_matmul_precision("high")
 
+    # Tokenizer
     tokenizer = get_tokenizer(args.tokenizer)
     special_ids = get_special_token_ids(tokenizer)
     vocab_size = len(tokenizer)
     eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
     print(f"Tokenizer: {args.tokenizer} (vocab={vocab_size}, eot={eot_id})")
 
+    # Config
     config = V8Config.tier_a()
     config.vocab_size = vocab_size
     config.eot_id = eot_id
     if args.compile is not None:
         config.use_compile = args.compile
-    if args.es_warmup is not None:
-        config.es_warmup = args.es_warmup
+    config.gradient_checkpointing = args.grad_ckpt
+    if args.action_every is not None:
+        config.action_every = args.action_every
     config.validate()
 
     bs = args.bs
     T = config.T
-    print(f"\nConfig: D={config.D}, C={config.C}, D_cc={config.D_cc}")
-    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, d_inner={config.d_inner}")
-    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections")
-    print(f"  ES: K={config.es_k_neurons}, N_traj={config.es_n_trajectories}, "
-          f"σ={config.es_sigma}, lr={config.es_lr}, collect={config.es_collect_chunks}")
-    print(f"  Training: BS={bs}, T={T}")
+    print(f"\nConfig: D={config.D}, D_neuron={config.D_neuron}, C={config.C}")
+    print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}")
+    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
+          f"D_neuron={config.D_neuron}, C_mem={config.C_mem}, "
+          f"N_per_slice={config.N_per_slice}")
+    print(f"  MLPs: mod_h={config.neuromod_hidden}, state_h={config.state_mlp_hidden}, "
+          f"msg_h={config.msg_mlp_hidden}")
+    print(f"  Segments: action_every={config.action_every}, "
+          f"stride={config.memory_update_stride}, "
+          f"plasticity={'on' if config.structural_plasticity else 'off'}")
+    print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
-    # Model
+    # Model — everything in bf16, optimizer keeps f32 master weights
     model = V8Model(config)
     if device.type == "cuda":
         model = model.to(device).to(torch.bfloat16)
+    else:
+        model = model.to(device)
 
     # Resume
     start_step = 0
+    _pending_mg_state = None
     if args.resume:
         print(f"\nResuming from: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model.lm.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if "memory_params" in ckpt:
+            model.memory.load_state_dict(ckpt["memory_params"], strict=False)
+        if "memory_state" in ckpt:
+            _pending_mg_state = ckpt["memory_state"]
+            print(f"  Memory state found (will restore on first batch)")
         start_step = ckpt.get("step", 0)
-        print(f"  Loaded model from step {start_step}")
-        if "memory_runtime_state" in ckpt:
-            model.memory.load_runtime_state(ckpt["memory_runtime_state"])
-            model._states_initialized = True
-        del ckpt
+        print(f"  Loaded from step {start_step}")
 
     lm_params = model.lm_param_count()
     mem_params = model.memory_param_count()
-    print(f"\nParameters: {model.param_count():,} total")
-    print(f"  LM (backprop): {lm_params:,} ({lm_params/1e6:.1f}M)")
-    print(f"  Memory (ES): {mem_params:,} ({mem_params/1e6:.1f}M)")
+    total_params = model.param_count()
+    print(f"\nParameters: {total_params:,} ({total_params/1e6:.1f}M)")
+    print(f"  LM: {lm_params:,} ({lm_params/1e6:.1f}M)")
+    print(f"  Memory: {mem_params:,} ({mem_params/1e6:.1f}M)")
+
+    if args.no_memory:
+        print("\n*** MEMORY DISABLED — LM-only baseline ***")
 
     # Compile
     if config.use_compile and device.type == "cuda":
@@ -128,23 +141,34 @@ def main():
         model.lm.forward_scan_upper = torch.compile(model.lm.forward_scan_upper)
         model.lm.forward_output = torch.compile(model.lm.forward_output)
 
-    # LM optimizer (memory graph params have requires_grad=False, excluded automatically)
-    decay_params = []
-    no_decay_params = []
+    # Optimizer — LM + memory param groups
+    lm_decay, lm_no_decay = [], []
     for name, param in model.lm.named_parameters():
         if not param.requires_grad:
             continue
         if param.ndim <= 1 or name.endswith(".bias"):
-            no_decay_params.append(param)
+            lm_no_decay.append(param)
         else:
-            decay_params.append(param)
+            lm_decay.append(param)
 
-    lm_optimizer = torch.optim.AdamW(
-        [{"params": decay_params, "weight_decay": WEIGHT_DECAY},
-         {"params": no_decay_params, "weight_decay": 0.0}],
-        lr=args.lr, betas=(0.9, 0.95),
-        fused=(device.type == "cuda"))
+    mem_lr = args.lr * config.mem_lr_scale
+    mem_decay, mem_no_decay = [], []
+    for name, param in model.memory.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith(".bias"):
+            mem_no_decay.append(param)
+        else:
+            mem_decay.append(param)
 
+    optimizer = torch.optim.AdamW([
+        {"params": lm_decay, "weight_decay": WEIGHT_DECAY, "lr": args.lr},
+        {"params": lm_no_decay, "weight_decay": 0.0, "lr": args.lr},
+        {"params": mem_decay, "weight_decay": WEIGHT_DECAY * 0.1, "lr": mem_lr},
+        {"params": mem_no_decay, "weight_decay": 0.0, "lr": mem_lr},
+    ], betas=(0.9, 0.95), fused=(device.type == "cuda"))
+
+    # LR scheduler
     def lr_lambda(step):
         if step < args.warmup:
             return step / max(args.warmup, 1)
@@ -152,14 +176,14 @@ def main():
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return LR_MIN / args.lr + (1.0 - LR_MIN / args.lr) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(lm_optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume optimizer
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         if "optimizer_state_dict" in ckpt:
             try:
-                lm_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 print(f"  Loaded optimizer state")
             except Exception as e:
                 print(f"  Could not load optimizer: {e}")
@@ -177,11 +201,19 @@ def main():
 
     # Trainer
     trainer = V8Trainer(
-        model=model, lm_optimizer=lm_optimizer, scheduler=scheduler,
+        model=model, optimizer=optimizer, scheduler=scheduler,
         dataloader=dataloader, config=config, device=device,
         max_grad_norm=MAX_GRAD_NORM, log_interval=args.log_interval,
         use_memory=not args.no_memory)
+
     trainer.global_step = start_step
+
+    # Restore memory state
+    if _pending_mg_state is not None:
+        model.initialize_states(bs, device)
+        model.memory.load_runtime_state(_pending_mg_state)
+        trainer._states_initialized = True
+        print(f"  Restored memory state")
 
     # Output dir
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -199,7 +231,7 @@ def main():
     saved_checkpoints = []
 
     print(f"\nOutputs: {save_dir}")
-    print(f"\nStarting training ({args.steps} steps)...")
+    print(f"Starting training ({args.steps} steps)...")
     print("=" * 60)
 
     def on_step(metrics):
@@ -214,77 +246,61 @@ def main():
             metrics_file.flush()
 
         if step % args.log_interval == 0:
-            es_str = ""
-            if "es_loss_mean" in metrics:
-                es_str = (f" | es_mean={metrics['es_loss_mean']:.4f}"
-                          f" best={metrics['es_loss_best']:.4f}")
             mem_str = ""
             if "mem_h_norm" in metrics:
                 mem_str = (f" | h={metrics['mem_h_norm']:.1f}"
-                           f" prim_drift={metrics.get('mem_prim_drift', 0):.4f}"
-                           f" gate={metrics.get('mem_mod_gate_prim_mean', 0):.4f}")
-            print(f"  step {step:5d} | loss={metrics['loss']:.4f} | "
-                  f"ppl={metrics['ppl']:.1f} | tok/s={metrics['tok_s']/1e3:.1f}K | "
-                  f"lr={metrics['lr']:.2e}{es_str}{mem_str}")
+                           f" mg={metrics.get('mem_grad_norm', 0):.3f}")
+            print(f"  step {step:5d} | "
+                  f"loss={metrics['loss']:.4f} | "
+                  f"ppl={metrics['ppl']:.1f} | "
+                  f"tok/s={metrics['tok_s']/1e3:.1f}K | "
+                  f"lr={metrics['lr']:.2e}"
+                  f"{mem_str}")
 
         diag.maybe_snapshot(step)
 
         if args.save_interval > 0 and step % args.save_interval == 0:
-            ckpt_path = os.path.join(save_dir, f"v8_step{step}.pt")
+            ckpt_path = os.path.join(save_dir, f"v9_step{step}.pt")
             ckpt = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": lm_optimizer.state_dict(),
+                "model_state_dict": model.lm.state_dict(),
+                "memory_params": model.memory.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": step, "config": config,
             }
-            if model.memory is not None and model.memory.is_initialized():
-                ckpt["memory_runtime_state"] = model.memory.runtime_state_dict()
+            if model.memory.is_initialized():
+                ckpt["memory_state"] = {
+                    k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
             torch.save(ckpt, ckpt_path)
             saved_checkpoints.append(ckpt_path)
             print(f"  Saved: {ckpt_path}")
+
             if args.keep_checkpoints > 0:
                 while len(saved_checkpoints) > args.keep_checkpoints:
                     old = saved_checkpoints.pop(0)
                     if os.path.exists(old):
                         os.remove(old)
 
-        should_plot = (
-            (args.plot_interval > 0 and step % args.plot_interval == 0) or
-            (args.save_interval > 0 and step % args.save_interval == 0) or
-            step == 50)
-        if should_plot:
-            try:
-                from scripts.plot_training import (
-                    load_metrics as _load_m, plot_training_curves,
-                    plot_es_health, plot_modulator_health,
-                    plot_memory_health, plot_pcm_health,
-                    plot_connectivity_snapshot, plot_neuron_graph)
-                plot_dir = os.path.join(save_dir, "plots")
-                os.makedirs(plot_dir, exist_ok=True)
-                _records = _load_m(metrics_path)
-                plot_training_curves(_records, os.path.join(plot_dir, "training_curves.png"))
-                plot_es_health(_records, os.path.join(plot_dir, "es_health.png"))
-                plot_modulator_health(_records, os.path.join(plot_dir, "modulator_health.png"))
-                plot_memory_health(_records, os.path.join(plot_dir, "memory_health.png"))
-                plot_pcm_health(_records, os.path.join(plot_dir, "pcm_health.png"))
-            except Exception as e:
-                print(f"  Plot failed: {e}")
-
     all_metrics = trainer.train_epoch(args.steps, step_callback=on_step)
 
-    final_path = os.path.join(save_dir, f"v8_step{trainer.global_step}.pt")
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": lm_optimizer.state_dict(),
+    # Final checkpoint
+    final_path = os.path.join(save_dir, f"v9_step{trainer.global_step}.pt")
+    final_ckpt = {
+        "model_state_dict": model.lm.state_dict(),
+        "memory_params": model.memory.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step": trainer.global_step, "config": config,
-        "memory_runtime_state": model.memory.runtime_state_dict()
-            if model.memory.is_initialized() else None,
-    }, final_path)
-
+    }
+    if model.memory.is_initialized():
+        final_ckpt["memory_state"] = {
+            k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
+    torch.save(final_ckpt, final_path)
     metrics_file.close()
+
     if all_metrics:
-        print(f"\nDone. Final loss: {all_metrics[-1]['loss']:.4f}")
+        final = all_metrics[-1]
+        print(f"\nDone. Final loss: {final['loss']:.4f}, ppl: {final['ppl']:.1f}")
     print(f"Checkpoint: {final_path}")
 
 
