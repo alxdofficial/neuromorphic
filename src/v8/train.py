@@ -35,7 +35,7 @@ SEED = 42
 TOKENIZER = "tinyllama"
 LOG_INTERVAL = 50
 SAVE_INTERVAL = 5000
-SAVE_DIR = "outputs/v8"
+SAVE_DIR = "outputs/v9"
 
 
 def parse_args():
