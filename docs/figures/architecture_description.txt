@@ -1,11 +1,27 @@
-The Neural Memory Graph architecture has three components operating at different levels:
+NOTE (2026-03-28): This file described the old v8 architecture (RL neuromod, port neurons,
+7 layers, 1024 neurons). It is now outdated.
 
-1. Language Model (Cortical Columns): A scan-based (linear recurrence) LM with 7 layers split into lower (layers 0-3) and upper (layers 4-6) groups, with model dimension D=2048 split across C=16 cortical columns. Input tokens are embedded, projected up to D, then processed by the lower scan layers to produce H_mid. Per-column Predictive Coding Modules (PCM) compute surprise from full context (H, x) with RMSNorm on inputs. Surprise is passed as a side input to the first upper scan layer (additive to proj_in via zero-init proj_side), rather than modulating H_mid.
+Current architecture (v9-backprop, branch v9-backprop):
 
-2. Neural Memory Graph: A persistent network of 1024 neurons with sparse random connectivity (96 presynaptic connections each, key-based sigmoid routing). At every token, each neuron: (a) receives messages through a 3-level dendritic tree (8 branches of 12 connections -> tanh, 2 groups of 4 branches -> tanh, soma averages groups -> received; no trainable params), (b) integrates them with internal state via exponential decay, and (c) emits a new message through tanh(h * primitives). 16 port neurons interface with the LM - they receive CC signals from H_mid and their outgoing messages become the memory signal. The memory graph is fully persistent across document boundaries. The memory graph runs a sequential per-token loop with custom Triton kernels (routing kernel + dendritic tree step kernel).
+1. Language Model (Cortical Columns): Split-scan with 4 layers (split at 2), D=2048,
+   d_inner=580, GLU output. Lower scan produces H_mid. PCM computes surprise at the
+   split point. Split-point MLP combines H_mid + surprise before upper scan. ~52M params.
 
-3. Neuromodulator: An RL-trained policy network (2-layer MLP, 512 hidden, zero-init heads) that observes all 1024 neurons' states every 128 tokens (516 dims per neuron: primitives, key, mean input, mean output, msg magnitude, decay, trace_prim_norm, trace_key_norm) and outputs per-neuron gate (tanh'd to [-1,1]) + decay_target (act_dim=2). Three-factor learning: eligibility traces (EMA decay=0.95) accumulate what neurons encode/receive; gate controls whether to consolidate or reverse Hebbian updates; primitives are RMS-normalized and keys L2-normalized after each update. Trained via GRPO trajectory scoring: choose K=96 neurons, sample 8 trajectories across all 4 collected chunks, non-K neurons get gate=0 (no plasticity) + current decay_logit as target (no drift), rank by total CE loss, z-score normalize. Best trajectory's final state persists. No value function or critic.
+2. Neural Memory Graph: 512 neurons, D_neuron=256, K=32 connections. Trained end-to-end
+   by backprop (differentiable). 2-pass simulation per segment (T=128):
+   - Pass 1: ONE gather (frozen initial messages) -> T steps of MLP dynamics
+   - Pass 2: ONE gather (from Pass 1 end state) -> T steps refined
+   Per-step: state MLP (hidden=24) + message MLP (hidden=24) + neuron_id embedding.
+   Segment-boundary modulator MLP (hidden=80) predicts w_conn, decay, primitives.
+   Dendritic tree for hierarchical neighbor signal integration.
+   Structural plasticity: rewire weakest connections at chunk boundaries.
+   ~58M params.
 
-Data flow: input tokens -> embedding -> proj_up -> lower scan (layers 0-3) -> PCM computes surprise -> H_mid (unchanged). Memory graph reads H_mid through 16 port neurons, processes per-token dynamics, outputs port neuron messages. Injection: H_enriched = H_mid + sigmoid(gate) * mem_signals. Upper scan (layers 4-6) processes H_enriched, with PCM surprise as side input to the first upper layer. Output: proj_down -> layer_norm -> lm_head -> logits.
+3. I/O: Deterministic inject (replicate H_mid per neuron), parameter-free readout
+   (average replicas). No port neurons.
 
-The key design principle is that memory is an environment, not a differentiable module. The memory graph is outside autograd - no gradients flow through it. The neuromodulator learns to configure the memory graph via RL, while the LM learns to use memory signals via backprop through the injection gate.
+Data flow: tokens -> embedding -> lower scan (2 layers) -> H_mid -> inject into memory
+graph -> readout mem_signals -> H_enriched = H_mid + sigmoid(gate) * mem_signals ->
+upper scan (2 layers) -> output head -> logits.
+
+Total: ~110M params, ~24.8K tok/s at BS=48 on RTX 4090.

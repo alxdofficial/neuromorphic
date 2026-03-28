@@ -1,9 +1,11 @@
 # Problem Formulation: Neural Memory Graph for Language Modeling
 
-> **NOTE (2026-03-27):** This doc was written for v8 (RL/GRPO, 7 layers, port neurons).
-> Current code (v9-ES): 5 layers split at 3, ES replaces GRPO, broadcast I/O replaces
-> port neurons, per-neuron modulator MLP + dendritic FC. The open problems in sections
-> 1-3 are still relevant. Section on neuromodulator/GRPO is historical.
+> **NOTE (2026-03-28):** This doc was written for v8 (RL/GRPO, 7 layers, port neurons).
+> Current code (v9-backprop, branch `v9-backprop`) trains memory end-to-end by backprop.
+> N=512 neurons, D_neuron=256, K=32, 4 scan layers split at 2, d_inner=580, 2-pass
+> simulation, 110M params (LM=52M, Mem=58M), ~24.8K tok/s. No RL, no ES, no port
+> neurons, no GRPO. The open problems in sections 1-3 are still broadly relevant.
+> Sections on neuromodulator/GRPO are historical.
 
 ## What We Are Building
 

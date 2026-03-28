@@ -1,4 +1,4 @@
-# Neuromorphic LM v8 — Neural Memory Graph + Cortical Columns
+# Neuromorphic LM v9-backprop — Differentiable Memory Graph + Cortical Columns
 from .config import V8Config
 from .model import V8Model
 

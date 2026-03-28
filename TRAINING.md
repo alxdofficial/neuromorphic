@@ -10,7 +10,7 @@ python -u -m src.v8.train --bs 48 --steps 30000
 python -u -m src.v8.train --bs 48 --steps 30000 --no-memory
 
 # Resume from checkpoint
-python -u -m src.v8.train --bs 48 --steps 60000 --resume outputs/v8/<run>/v8_step30000.pt
+python -u -m src.v8.train --bs 48 --steps 60000 --resume outputs/v9/<run>/v9_step30000.pt
 ```
 
 ### Architecture
@@ -50,7 +50,7 @@ Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
 --lr FLOAT         # Learning rate (default 3e-4)
 --no-memory        # LM-only baseline (no memory graph)
 --resume PATH      # Resume from checkpoint
---save-dir PATH    # Output directory (default outputs/v8)
+--save-dir PATH    # Output directory (default outputs/v9)
 --save-interval N  # Checkpoint interval (default 5000)
 --keep-checkpoints N  # Keep only last N checkpoints (default 3)
 --snapshot-interval N # Memory graph snapshot interval (default 1000)
@@ -59,8 +59,8 @@ Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
 
 ### Outputs
 
-All outputs go to `outputs/v8/<run_id>/`:
-- `v8_step{N}.pt` — checkpoints (LM + memory params + runtime state)
+All outputs go to `outputs/v9/<run_id>/`:
+- `v9_step{N}.pt` — checkpoints (LM + memory params + runtime state)
 - `metrics.jsonl` — per-step metrics (loss, ppl, tok/s, memory health)
 - `config.json` — run configuration
 - `snapshots/` — periodic memory graph state dumps

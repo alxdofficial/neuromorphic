@@ -1,9 +1,10 @@
 # Motivation & Design Philosophy — Neuromorphic Language Model
 
-> **NOTE (2026-03-27):** This doc was written for v8 (RL/GRPO neuromodulator).
-> Current code (v9-ES) replaces RL with Evolution Strategies, replaces port
-> neurons with broadcast inject/readout, uses 5 scan layers (not 7), and
-> has per-neuron modulator MLP + dendritic FC trained by ES.
+> **NOTE (2026-03-28):** This doc was written for v8 (RL/GRPO neuromodulator).
+> Current code (v9-backprop, branch `v9-backprop`) trains the memory graph
+> end-to-end by backprop. N=512 neurons, D_neuron=256, K=32, 4 scan layers
+> split at 2, d_inner=580, 2-pass simulation, 110M params (LM=52M, Mem=58M),
+> ~24.8K tok/s. No RL, no ES, no port neurons, no GRPO, no neuromod.
 > The core philosophy (memory as signal flow, not database) still applies.
 
 ## Why This Exists

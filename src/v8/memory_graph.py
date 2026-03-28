@@ -30,7 +30,6 @@ from .config import V8Config
 # Try to import Triton kernels
 try:
     from .triton_kernels import fused_dendritic_gather as _triton_gather
-    from .triton_kernels import fused_neuron_step as _triton_step
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -353,53 +352,11 @@ class MemoryGraph(nn.Module):
     # Forward segment (differentiable)
     # ================================================================
 
-    def _step_group(self, h: Tensor, prev_msg: Tensor,
-                    inject_group: Tensor, w_conn_sig: Tensor,
-                    decay: Tensor, primitives: Tensor,
-                    neuron_id: Tensor,
-                    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Run a group of token steps. Pure function for gradient checkpointing.
-
-        Args:
-            decay: [BS, N] — sigmoid(decay_logit), fed into state MLP
-
-        Returns:
-            h: [BS, N, D] — final hidden state
-            prev_msg: [BS, N, D] — final messages
-            msgs: [BS, G, N, D] — messages at each step
-            hebbian_accum: [BS, N, K] — accumulated hebbian traces
-        """
-        G = inject_group.shape[1]
-        BS, N, K = w_conn_sig.shape
-        msgs = []
-        hebbian_accum = torch.zeros(BS, N, K, device=h.device,
-                                    dtype=h.dtype)
-
-        for g in range(G):
-            # 1-3. Fused gather + weight + dendritic tree (Triton on CUDA)
-            received = self._fused_gather(prev_msg, w_conn_sig)
-            # 4. Add CC signal inject
-            input_vec = received + inject_group[:, g]
-            # 5. State MLP (decay provides persistence signal)
-            h = self._state_mlp(input_vec, h, decay)
-            # 6. Message MLP
-            msg = self._msg_mlp(h, primitives)
-            # 7. Add neuron ID embedding
-            msg = msg + neuron_id
-            prev_msg = msg
-            msgs.append(msg)
-
-            # 8. Hebbian trace: |msg| * sigmoid(w_conn)
-            msg_mag = msg.norm(dim=-1, keepdim=True)  # [BS, N, 1]
-            hebbian_accum = hebbian_accum + msg_mag * w_conn_sig
-
-        return h, prev_msg, torch.stack(msgs, dim=1), hebbian_accum
-
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
         """Process one segment of tokens. Differentiable through modulator + MLPs.
 
-        Uses gradient checkpointing to limit VRAM: the token loop is split into
-        groups, each checkpointed.
+        2-pass simulation: each pass does ONE gather (frozen inter-neuron messages)
+        then runs all T steps with the state and message MLPs.
 
         Args:
             cc_signals: [BS, T_seg, D_lm] — detached H_mid for this segment

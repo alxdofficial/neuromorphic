@@ -5,7 +5,6 @@ Usage:
     python -m src.v8.train                        # defaults
     python -m src.v8.train --bs 8 --steps 5000    # override
     python -m src.v8.train --no-memory             # LM-only baseline
-    python -m src.v8.train --no-compile            # disable torch.compile
 """
 
 import argparse

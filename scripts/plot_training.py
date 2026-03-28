@@ -1,12 +1,17 @@
-"""Plot v8 training curves and memory graph diagnostics.
+"""Plot training curves and memory graph diagnostics.
+
+NOTE (2026-03-28): This script needs updating for v9-backprop. Several panels
+reference metrics that no longer exist (nm_lr, rl_curves, port neuron firing,
+ES trajectory metrics, GRPO). The training_curves and basic memory_health
+panels still work. The RL/ES/modulator panels will be skipped gracefully if
+the metrics are absent.
 
 Usage:
-    python -m scripts.plot_training outputs/v8/<run_id>/
-    python -m scripts.plot_training outputs/v8/<run_id>/ --snapshot 5000
+    python -m scripts.plot_training outputs/v9/<run_id>/
+    python -m scripts.plot_training outputs/v9/<run_id>/ --snapshot 5000
 
 Produces:
     <run_dir>/plots/training_curves.png     — loss, ppl, LR, throughput
-    <run_dir>/plots/rl_curves.png           — RL policy loss, GRPO, advantages, exploration
     <run_dir>/plots/memory_health.png       — memory graph state, coupling, plasticity
     <run_dir>/plots/memory_connectivity.png — (from snapshot) neuron graph visualization
 """

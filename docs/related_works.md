@@ -1,5 +1,12 @@
 # Related Works
 
+> **NOTE (2026-03-28):** This doc was written for v8 (RL/GRPO, port neurons, non-
+> differentiable memory graph). Current code (v9-backprop, branch `v9-backprop`)
+> trains the memory graph end-to-end by backprop. N=512 neurons, D_neuron=256,
+> K=32, 4 scan layers split at 2, 110M params, ~24.8K tok/s. No RL, no ES, no
+> port neurons, no GRPO. The memory graph is now differentiable. References to
+> "non-differentiable memory", "RL-controlled", and "neuromodulator" are historical.
+
 A survey of prior work related to the Neural Memory Graph architecture, organized
 by category. For each work, we note what it does, how it relates to our model, and
 what distinguishes our approach.

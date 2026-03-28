@@ -8,7 +8,7 @@ PCM computes surprise at the split point by predicting the next scan
 hidden state. A split-point MLP combines H_mid and surprise into a
 unified representation before the upper scan.
 
-CC->memory: H_mid replicated per neuron (D_neuron=32 slices)
+CC->memory: H_mid replicated per neuron (D_neuron=256, C_mem = D // D_neuron = 2048 // 256 = 8 slices)
 Memory->CC: neuron messages averaged over replicas, gated, added to H_mid
 Upper scan layers see memory-enriched + surprise-modulated input.
 """
@@ -180,7 +180,7 @@ class V8LM(nn.Module):
 
         Args:
             H_mid: [BS, T, D] — lower scan output (with autograd)
-            mem_signals: [BS, T, C, D_cc] — port neuron messages (detached)
+            mem_signals: [BS, T, C, D_cc] — neuron messages (carry gradients)
 
         Returns:
             H_enriched: [BS, T, D] — memory-enriched hidden states
