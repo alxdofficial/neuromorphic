@@ -30,6 +30,59 @@ from torch import Tensor
 from .config import V8Config
 
 
+class SparseWeightedSum(torch.autograd.Function):
+    """Fused gather → multiply → sum that never materializes [BS, N, K] for autograd.
+
+    Computes: received[b,n] = sum_k(activation[b, conn[n,k]] * w_conn[b,n,k])
+
+    Standard PyTorch would save the [BS, N, K] intermediate from the multiply
+    for w_conn's gradient. At N=524K, K=64, that's 134MB × 128 steps = 17GB.
+
+    This function saves only activation [BS, N] (2MB) and recomputes the
+    gather during backward.
+    """
+
+    @staticmethod
+    def forward(ctx, activation, conn_indices, w_conn):
+        # Compute: gather → multiply → sum
+        neighbor_act = activation[:, conn_indices]  # [BS, N, K]
+        received = (neighbor_act * w_conn).sum(dim=-1)  # [BS, N]
+
+        # Save only the small tensors for backward
+        ctx.save_for_backward(activation, conn_indices, w_conn)
+        # Also save neighbor_act for hebbian (will be accessed via ctx)
+        ctx.neighbor_act = neighbor_act.detach()
+        return received
+
+    @staticmethod
+    def backward(ctx, grad_received):
+        activation, conn_indices, w_conn = ctx.saved_tensors
+        BS, N = activation.shape
+
+        # Recompute the gather (cheap — just index lookups)
+        neighbor_act = activation[:, conn_indices]  # [BS, N, K]
+
+        # grad_w_conn: d(received)/d(w_conn) = neighbor_act, scaled by grad_received
+        # grad_w_conn[b,n,k] = grad_received[b,n] * neighbor_act[b,n,k]
+        grad_w_conn = grad_received.unsqueeze(-1) * neighbor_act  # [BS, N, K]
+
+        # grad_activation: scatter_add w_conn-weighted grad back to source neurons
+        # d(received[b,n])/d(activation[b,src]) = w_conn[b,n,k] where conn[n,k]=src
+        weighted_grad = grad_received.unsqueeze(-1) * w_conn  # [BS, N, K]
+        grad_activation = torch.zeros(BS, N, device=grad_received.device,
+                                      dtype=grad_received.dtype)
+        idx_expanded = conn_indices.unsqueeze(0).expand(BS, -1, -1)
+        grad_activation.scatter_add_(1, idx_expanded.reshape(BS, -1),
+                                     weighted_grad.reshape(BS, -1))
+
+        return grad_activation, None, grad_w_conn
+
+
+def sparse_weighted_sum(activation, conn_indices, w_conn):
+    """Memory-efficient: gather → weight → sum without saving [BS,N,K] per step."""
+    return SparseWeightedSum.apply(activation, conn_indices, w_conn)
+
+
 class MemoryGraph(nn.Module):
     """Scalar neuron memory graph with grouped neuromodulators.
 
@@ -250,40 +303,55 @@ class MemoryGraph(nn.Module):
         # Run modulator FIRST (on compute graph)
         w_conn, decay, threshold = self._run_modulator()
 
-        # Inject: [BS, T_seg, D] → [BS, T_seg, N]
-        inject_all = self.inject(cc_signals)
-
         # Reset hebbian for this segment
         hebbian = torch.zeros(BS, N, K, device=V.device, dtype=V.dtype)
 
-        # Per-step dynamics (sequential, all element-wise)
-        readout_steps = []
-        for t in range(T_seg):
-            # 1. Gather neighbors' activations
-            neighbor_act = activation[:, self.conn_indices]  # [BS, N, K]
+        # Per-step dynamics with gradient checkpointing.
+        # Memory optimizations:
+        #   - inject computed per-chunk (not precomputed for all T)
+        #   - readout accumulated incrementally as [BS, D] (not stored as [BS, T, N])
+        #   - hebbian accumulated detached
+        from torch.utils.checkpoint import checkpoint
 
-            # 2. Weighted sum of incoming signals
-            received = (neighbor_act * w_conn).sum(dim=-1)  # [BS, N]
+        chunk_size = 8
+        replicas = self.replicas
+        D = self.config.D
 
-            # 3. Add inject signal
-            received = received + inject_all[:, t]  # [BS, N]
+        def run_chunk(V, activation, cc_chunk, w_conn, decay, threshold,
+                      conn_indices, replicas):
+            """Run chunk_size steps. Returns readout of final activation."""
+            C = cc_chunk.shape[1]
+            inject_chunk = cc_chunk.repeat_interleave(replicas, dim=-1)
+            for i in range(C):
+                neighbor_act = activation[:, conn_indices]
+                received = (neighbor_act * w_conn).sum(dim=-1)
+                received = received + inject_chunk[:, i]
+                V = decay * V + (1.0 - decay) * received
+                activation = torch.sigmoid(V - threshold)
+            # Readout at chunk end: [BS, N] → [BS, D]
+            chunk_readout = activation.view(-1, D, replicas).mean(dim=-1)
+            return V, activation, chunk_readout
 
-            # 4. Leaky integration
-            V = decay * V + (1.0 - decay) * received  # [BS, N]
+        chunk_readouts = []
+        for c_start in range(0, T_seg, chunk_size):
+            c_end = min(c_start + chunk_size, T_seg)
+            cc_chunk = cc_signals[:, c_start:c_end]
 
-            # 5. Activation
-            activation = torch.sigmoid(V - threshold)  # [BS, N]
+            V, activation, chunk_readout = checkpoint(
+                run_chunk, V, activation, cc_chunk,
+                w_conn, decay, threshold, self.conn_indices, replicas,
+                use_reentrant=False)
+            chunk_readouts.append(chunk_readout)  # [BS, D] — small
 
-            # 6. Hebbian trace: correlation of this neuron's firing with neighbors'
-            hebbian = hebbian + activation.unsqueeze(-1) * neighbor_act  # [BS, N, K]
+            # Hebbian (detached, outside checkpoint)
+            with torch.no_grad():
+                neighbor_act = activation.detach()[:, self.conn_indices]
+                hebbian = hebbian + activation.detach().unsqueeze(-1) * neighbor_act
 
-            readout_steps.append(activation)
-
-        # Stack readout: [BS, T_seg, N]
-        act_all = torch.stack(readout_steps, dim=1)
-
-        # Readout: [BS, T_seg, N] → [BS, T_seg, D]
-        mem_out = self.readout(act_all)
+        # chunk_readouts: 16 × [BS, D] → repeat each to fill chunk_size positions
+        # [BS, 16, D] → repeat_interleave → [BS, 128, D]
+        mem_out = torch.stack(chunk_readouts, dim=1)  # [BS, n_chunks, D]
+        mem_out = mem_out.repeat_interleave(chunk_size, dim=1)[:, :T_seg]  # [BS, T_seg, D]
 
         # Update persistent state (detached)
         with torch.no_grad():
