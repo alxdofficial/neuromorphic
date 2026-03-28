@@ -90,15 +90,12 @@ def main():
 
     bs = args.bs
     T = config.T
-    print(f"\nConfig: D={config.D}, D_neuron={config.D_neuron}, C={config.C}")
+    print(f"\nConfig: D={config.D}, C={config.C}")
     print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}")
-    print(f"  Memory: {config.N_neurons} neurons, {config.K_connections} connections, "
-          f"D_neuron={config.D_neuron}, C_mem={config.C_mem}, "
-          f"N_per_slice={config.N_per_slice}")
-    print(f"  MLPs: mod_h={config.neuromod_hidden}, state_h={config.state_mlp_hidden}, "
-          f"msg_h={config.msg_mlp_hidden}")
-    print(f"  Segments: action_every={config.action_every}, "
-          f"stride={config.memory_update_stride}, "
+    print(f"  Memory: {config.N_neurons} scalar neurons, K={config.K_connections}, "
+          f"{config.n_groups} groups × {config.group_size}, "
+          f"{config.replicas_per_dim} replicas/dim")
+    print(f"  Modulator: hidden={config.neuromod_hidden}, "
           f"plasticity={'on' if config.structural_plasticity else 'off'}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 

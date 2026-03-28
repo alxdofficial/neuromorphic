@@ -1,4 +1,4 @@
-"""Integration tests for v9-backprop model."""
+"""Integration tests for v10 model."""
 
 import torch
 import pytest
@@ -23,10 +23,9 @@ class TestV8ModelForward:
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS)
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
         assert torch.isfinite(result["logits"]).all()
 
@@ -34,24 +33,20 @@ class TestV8ModelForward:
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         model.initialize_states(BS)
 
-        result = model.forward_chunk(input_ids, target_ids=target_ids,
-                                     use_memory=False)
+        result = model.forward_chunk(input_ids, use_memory=False)
         assert result["logits"].shape == (BS, cfg.T, VOCAB)
 
     def test_forward_with_reset(self):
         cfg = make_tiny()
         model = V8Model(cfg)
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         reset_mask = torch.tensor([True, False])
         model.initialize_states(BS)
 
         result = model.forward_chunk(
-            input_ids, target_ids=target_ids, reset_mask=reset_mask,
-            has_reset=True)
+            input_ids, reset_mask=reset_mask, has_reset=True)
         assert torch.isfinite(result["logits"]).all()
 
     def test_multiple_chunks(self):
@@ -61,8 +56,7 @@ class TestV8ModelForward:
 
         for _ in range(3):
             input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-            result = model.forward_chunk(input_ids, target_ids=target_ids)
+            result = model.forward_chunk(input_ids)
             model.detach_states()
             assert torch.isfinite(result["logits"]).all()
 
@@ -75,21 +69,21 @@ class TestGradientFlow:
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
 
         import torch.nn.functional as F
         loss = F.cross_entropy(
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
         loss.backward()
 
-    def test_memory_params_get_grad(self):
+    def test_modulator_gets_grad(self):
         cfg = make_tiny()
         model = V8Model(cfg).float()
         model.initialize_states(BS)
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
 
         import torch.nn.functional as F
         loss = F.cross_entropy(
@@ -97,27 +91,9 @@ class TestGradientFlow:
         loss.backward()
 
         mg = model.memory
-        # Modulator
         assert mg.mod_w1.grad is not None, "mod_w1 should have grad"
         assert mg.mod_w1.grad.norm() > 0, "mod_w1 grad should be nonzero"
         assert mg.mod_w2.grad is not None, "mod_w2 should have grad"
-
-        # State MLP
-        assert mg.state_w1.grad is not None, "state_w1 should have grad"
-        assert mg.state_w1.grad.norm() > 0, "state_w1 grad should be nonzero"
-
-        # Message MLP
-        assert mg.msg_w1.grad is not None, "msg_w1 should have grad"
-        assert mg.msg_w1.grad.norm() > 0, "msg_w1 grad should be nonzero"
-
-        # Neuron ID
-        assert mg.neuron_id.grad is not None, "neuron_id should have grad"
-        assert mg.neuron_id.grad.norm() > 0, "neuron_id grad should be nonzero"
-
-        # Dendritic weights
-        if mg.use_dendritic_tree:
-            assert mg.dendrite_branch_w.grad is not None
-            assert mg.dendrite_group_w.grad is not None
 
     def test_lm_params_get_grad(self):
         cfg = make_tiny()
@@ -126,7 +102,7 @@ class TestGradientFlow:
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
 
         import torch.nn.functional as F
         loss = F.cross_entropy(
@@ -146,7 +122,7 @@ class TestGradientFlow:
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
 
         import torch.nn.functional as F
         loss = F.cross_entropy(
@@ -159,7 +135,6 @@ class TestGradientFlow:
                     assert p.grad is not None, "split_mlp param should have grad"
 
     def test_mem_gate_moves(self):
-        """mem_gate should change after optimizer step."""
         cfg = make_tiny()
         model = V8Model(cfg).float()
         model.initialize_states(BS)
@@ -168,7 +143,7 @@ class TestGradientFlow:
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        result = model.forward_chunk(input_ids)
 
         import torch.nn.functional as F
         loss = F.cross_entropy(
@@ -194,5 +169,5 @@ class TestParamCounts:
         assert total > 0
         assert lm > 0
         assert mem > 0
-        # Memory params should include modulator + state_mlp + msg_mlp + neuron_id + dendrites
-        assert mem > cfg.N_neurons * cfg.neuromod_hidden
+        # Memory params = modulator only
+        assert mem == sum(p.numel() for p in model.memory.parameters())
