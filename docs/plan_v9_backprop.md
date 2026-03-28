@@ -138,21 +138,24 @@ Input → Embedding → proj_up (768→2048)
 ## Parameter Budget
 
 ```
-LM:                                          52M
+LM:                                          55M
   Embedding (32K × 768):                     24.6M
   proj_up/down (768↔2048):                   3.1M
   pos_embed (128 × 2048):                    0.3M
-  4 scan layers (d_inner=580):               19.0M
-  PCM:                                       1.0M
-  split_mlp:                                 3.5M
-  mem_mlp (2D→d_inner→D, zero-init):        3.5M
+  4 scan layers (d_inner=580, GLU):          19.0M
+  PCM (16 columns):                          1.1M
+  split_mlp (2D→d_inner→D):                 3.6M
+  mem_mlp (2D→d_inner→D, small-init):       3.6M
+  ln_final + lm_head (tied):                 ~0
 
 Memory:                                      58M
-  Modulator (mod_w1/w2 per neuron):          7.5M
-  State MLP (state_w1/w2 per neuron):        9.6M
-  Message MLP (msg_w1/w2 per neuron):        9.6M
+  Modulator [N,H=80,I=545]→[N,H,O=289]:     34.3M
+  State MLP [N,H=24,I=513]→[N,H,D=256]:     9.6M
+  Message MLP [N,H=24,I=512]→[N,H,D=256]:   9.6M
   Dendritic tree (branch_w + group_w):       4.5M
   Neuron ID [512, 256]:                      0.1M
+
+Grand total:                                 113M
 ```
 
 ---

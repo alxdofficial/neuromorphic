@@ -203,9 +203,8 @@ structured, but communicates with the LM through only 16 port neurons.
 - The 16 port neurons are a severe bottleneck: 2048 dims of LM state compressed to
   16 × 128 = 2048 dims of port messages. The memory graph's internal state (131K dims)
   can only influence the LM through this narrow interface.
-- The memory contribution is gated by `mem_gate` (starts at sigmoid(0)=0.5) and added
-  to H_mid before the upper scan. If the LM learns to ignore memory (gate → 0), the
-  neuromod gets no reward signal and can't learn.
+- (OUTDATED — v9-backprop uses mem_mlp, a residual MLP that learns to integrate
+  H_mid + memory readout. No scalar gate. Gradients flow directly to memory graph.)
 - The CC signal enters port neurons as a raw additive input. Scale mismatch: CC signals
   are O(1), neighbor messages are O(0.2). Port neurons are dominated by the LM signal.
 

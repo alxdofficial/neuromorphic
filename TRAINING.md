@@ -24,14 +24,14 @@ Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
   - Per-neuron state MLP + message MLP: update hidden state and generate messages
   - Dendritic tree: hierarchical integration of neighbor signals
   - Structural plasticity: rewire weakest connections between chunks
-- **Inject**: H_enriched = H_mid + sigmoid(gate) × mem_readout
+- **Inject**: H_enriched = H_mid + mem_mlp(cat(H_mid, mem_readout))  [residual MLP, small-init]
 - **Upper scan**: 2 layers on memory-enriched representations
 
 ### Config (Tier A)
 
 | | Value |
 |---|---|
-| Total params | 110M (LM=52M, Memory=58M) |
+| Total params | 113M (LM=55M, Memory=58M) |
 | Lower scan | 2 layers (D=2048, d_inner=580) |
 | Upper scan | 2 layers |
 | Memory neurons | 512, D=256, K=32 connections |
