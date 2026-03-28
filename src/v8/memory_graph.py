@@ -318,19 +318,21 @@ class MemoryGraph(nn.Module):
         D = self.config.D
 
         def run_chunk(V, activation, cc_chunk, w_conn, decay, threshold,
-                      conn_indices, replicas):
-            """Run chunk_size steps. Returns readout of final activation."""
+                      conn_indices, replicas, D):
+            """Run chunk_size steps. Returns per-step readout [BS, C, D]."""
             C = cc_chunk.shape[1]
             inject_chunk = cc_chunk.repeat_interleave(replicas, dim=-1)
+            step_readouts = []
             for i in range(C):
                 neighbor_act = activation[:, conn_indices]
                 received = (neighbor_act * w_conn).sum(dim=-1)
                 received = received + inject_chunk[:, i]
                 V = decay * V + (1.0 - decay) * received
                 activation = torch.sigmoid(V - threshold)
-            # Readout at chunk end: [BS, N] → [BS, D]
-            chunk_readout = activation.view(-1, D, replicas).mean(dim=-1)
-            return V, activation, chunk_readout
+                # Per-step readout: [BS, N] → [BS, D] (tiny)
+                step_readouts.append(
+                    activation.view(-1, D, replicas).mean(dim=-1))
+            return V, activation, torch.stack(step_readouts, dim=1)
 
         chunk_readouts = []
         for c_start in range(0, T_seg, chunk_size):
@@ -339,19 +341,17 @@ class MemoryGraph(nn.Module):
 
             V, activation, chunk_readout = checkpoint(
                 run_chunk, V, activation, cc_chunk,
-                w_conn, decay, threshold, self.conn_indices, replicas,
+                w_conn, decay, threshold, self.conn_indices, replicas, D,
                 use_reentrant=False)
-            chunk_readouts.append(chunk_readout)  # [BS, D] — small
+            chunk_readouts.append(chunk_readout)  # [BS, chunk_size, D]
 
             # Hebbian (detached, outside checkpoint)
             with torch.no_grad():
                 neighbor_act = activation.detach()[:, self.conn_indices]
                 hebbian = hebbian + activation.detach().unsqueeze(-1) * neighbor_act
 
-        # chunk_readouts: 16 × [BS, D] → repeat each to fill chunk_size positions
-        # [BS, 16, D] → repeat_interleave → [BS, 128, D]
-        mem_out = torch.stack(chunk_readouts, dim=1)  # [BS, n_chunks, D]
-        mem_out = mem_out.repeat_interleave(chunk_size, dim=1)[:, :T_seg]  # [BS, T_seg, D]
+        # [BS, T_seg, D] — per-token readout
+        mem_out = torch.cat(chunk_readouts, dim=1)  # [BS, T_seg, D]
 
         # Update persistent state (detached)
         with torch.no_grad():
