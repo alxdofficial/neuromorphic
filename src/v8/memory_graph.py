@@ -306,52 +306,49 @@ class MemoryGraph(nn.Module):
         # Reset hebbian for this segment
         hebbian = torch.zeros(BS, N, K, device=V.device, dtype=V.dtype)
 
-        # Per-step dynamics with gradient checkpointing.
-        # Memory optimizations:
-        #   - inject computed per-chunk (not precomputed for all T)
-        #   - readout accumulated incrementally as [BS, D] (not stored as [BS, T, N])
-        #   - hebbian accumulated detached
-        from torch.utils.checkpoint import checkpoint
-
-        chunk_size = 8
+        # Multi-pass parallel neuron simulation.
+        # Instead of 128 sequential gather-integrate-activate steps:
+        #   Pass 1: one gather (frozen messages) + scan → approximate trajectory
+        #   Pass 2: one gather from Pass 1 end state + scan → refined trajectory
+        # Each pass does ONE gather + one sequential element-wise scan.
+        # Total: 2 gathers instead of 128.
         replicas = self.replicas
         D = self.config.D
+        n_passes = 2
 
-        def run_chunk(V, activation, cc_chunk, w_conn, decay, threshold,
-                      conn_indices, replicas, D):
-            """Run chunk_size steps. Returns per-step readout [BS, C, D]."""
-            C = cc_chunk.shape[1]
-            inject_chunk = cc_chunk.repeat_interleave(replicas, dim=-1)
-            step_readouts = []
-            for i in range(C):
-                neighbor_act = activation[:, conn_indices]
-                received = (neighbor_act * w_conn).sum(dim=-1)
-                received = received + inject_chunk[:, i]
-                V = decay * V + (1.0 - decay) * received
-                activation = torch.sigmoid(V - threshold)
-                # Per-step readout: [BS, N] → [BS, D] (tiny)
-                step_readouts.append(
-                    activation.view(-1, D, replicas).mean(dim=-1))
-            return V, activation, torch.stack(step_readouts, dim=1)
+        # Precompute inject for all T: [BS, T, D] → [BS, T, N]
+        inject_all = cc_signals.repeat_interleave(replicas, dim=-1)
 
-        chunk_readouts = []
-        for c_start in range(0, T_seg, chunk_size):
-            c_end = min(c_start + chunk_size, T_seg)
-            cc_chunk = cc_signals[:, c_start:c_end]
+        for pass_idx in range(n_passes):
+            # Phase 1: ONE gather from current activation state
+            neighbor_act = activation[:, self.conn_indices]  # [BS, N, K]
+            received_frozen = (neighbor_act * w_conn).sum(dim=-1)  # [BS, N]
 
-            V, activation, chunk_readout = checkpoint(
-                run_chunk, V, activation, cc_chunk,
-                w_conn, decay, threshold, self.conn_indices, replicas, D,
-                use_reentrant=False)
-            chunk_readouts.append(chunk_readout)  # [BS, chunk_size, D]
+            # Phase 2: Evolve all T steps with frozen messages + varying inject
+            # V[t] = decay * V[t-1] + (1-decay) * (received_frozen + inject[t])
+            V_pass = V.clone()
+            act_steps = []
+            for t in range(T_seg):
+                V_pass = decay * V_pass + (1.0 - decay) * (
+                    received_frozen + inject_all[:, t])
+                act_t = torch.sigmoid(V_pass - threshold)
+                act_steps.append(act_t)
 
-            # Hebbian (detached, outside checkpoint)
-            with torch.no_grad():
-                neighbor_act = activation.detach()[:, self.conn_indices]
-                hebbian = hebbian + activation.detach().unsqueeze(-1) * neighbor_act
+            # Update state for next pass
+            activation = act_steps[-1]  # use final activation for next gather
+            V = V_pass
 
-        # [BS, T_seg, D] — per-token readout
-        mem_out = torch.cat(chunk_readouts, dim=1)  # [BS, T_seg, D]
+        # Stack trajectory: [BS, T, N]
+        act_trajectory = torch.stack(act_steps, dim=1)
+
+        # Readout: [BS, T, N] → [BS, T, D]
+        mem_out = act_trajectory.view(BS, T_seg, D, replicas).mean(dim=-1)
+
+        # Hebbian (detached, from final trajectory)
+        with torch.no_grad():
+            final_act = activation.detach()
+            neighbor_act_h = final_act[:, self.conn_indices]
+            hebbian = final_act.unsqueeze(-1) * neighbor_act_h
 
         # Update persistent state (detached)
         with torch.no_grad():
