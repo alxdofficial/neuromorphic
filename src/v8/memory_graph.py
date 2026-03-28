@@ -432,18 +432,35 @@ class MemoryGraph(nn.Module):
         inject_steps = inject_bc[:, ::stride]
         n_steps = inject_steps.shape[1]
 
-        # Run all steps in one group (no gradient checkpointing — VRAM is sufficient)
-        msg_groups = []
-        total_hebbian = torch.zeros(BS, N, K, device=h.device,
-                                    dtype=h.dtype)
+        # 2-pass simulation: freeze inter-neuron messages per pass,
+        # run all steps with frozen messages + varying inject.
+        # Pass 1: gather from initial prev_msg → run all steps
+        # Pass 2: gather from Pass 1 end state → run all steps (refined)
+        # Only 2 gathers instead of 128, massive speedup.
+        n_passes = 2
+        total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
 
-        h, prev_msg, all_msgs, total_hebbian = self._step_group(
-            h, prev_msg, inject_steps,
-            w_conn_sig, decay, primitives, self.neuron_id)
-        msg_groups.append(all_msgs)
+        for pass_idx in range(n_passes):
+            # ONE gather per pass — freeze inter-neuron messages
+            received = self._fused_gather(prev_msg, w_conn_sig)  # [BS, N, D]
 
-        # Concatenate all step messages: [BS, n_steps, N, D]
-        msg_all_steps = torch.cat(msg_groups, dim=1)
+            # Run all T steps with frozen received + varying inject
+            msgs = []
+            for t in range(n_steps):
+                input_vec = received + inject_steps[:, t]
+                h = self._state_mlp(input_vec, h, decay)
+                msg = self._msg_mlp(h, primitives)
+                msg = msg + self.neuron_id
+                prev_msg = msg
+                msgs.append(msg)
+
+                # Hebbian (only on last pass)
+                if pass_idx == n_passes - 1:
+                    msg_mag = msg.norm(dim=-1, keepdim=True)
+                    total_hebbian = total_hebbian + msg_mag * w_conn_sig
+
+        # Stack messages from last pass: [BS, n_steps, N, D]
+        msg_all_steps = torch.stack(msgs, dim=1)
 
         # If stride > 1, repeat to fill all T_seg positions
         if stride > 1:
