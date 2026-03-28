@@ -162,16 +162,16 @@ def plot_memory_health(records, output_path):
         fig, axes = plt.subplots(4, 3, figsize=(18, 18))
         fig.suptitle("Memory Graph Health", fontsize=14, fontweight="bold")
 
-        # mem_gate
-        v = get(records, "mem_gate_mean")
-        if v:
-            plot_line(axes[0, 0], v, C["gate"], "mean")
-            v_min = get(records, "mem_gate_min")
-            v_max = get(records, "mem_gate_max")
-            if v_min and v_max:
-                axes[0, 0].fill_between(range(len(v_min)),
-                                         v_min, v_max, alpha=0.2, color=C["gate"])
-            setup(axes[0, 0], "Memory Gate", "sigmoid(gate)")
+        # mem_mlp norms
+        v1 = get(records, "mem_mlp_w1_norm")
+        v2 = get(records, "mem_mlp_w2_norm")
+        if v1:
+            plot_line(axes[0, 0], v1, C["gate"], "w1")
+        if v2:
+            plot_line(axes[0, 0], v2, C["conn"], "w2 (zero-init)")
+        if v1 or v2:
+            axes[0, 0].legend()
+            setup(axes[0, 0], "Memory MLP Norms", "weight norm")
 
         # w_conn
         v = get(records, "mem_w_conn_mean")

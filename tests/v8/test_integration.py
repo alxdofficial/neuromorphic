@@ -133,7 +133,7 @@ class TestGradientFlow:
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
         loss.backward()
 
-        assert model.lm.mem_gate.grad is not None
+        assert any(p.grad is not None for p in model.lm.mem_mlp.parameters())
         for i, layer in enumerate(model.lm.layers):
             has_grad = any(p.grad is not None and p.grad.norm() > 0
                           for p in layer.parameters())
@@ -158,13 +158,11 @@ class TestGradientFlow:
                 if p.requires_grad:
                     assert p.grad is not None, "split_mlp param should have grad"
 
-    def test_mem_gate_moves(self):
-        """mem_gate should change after optimizer step."""
+    def test_mem_mlp_gets_grad(self):
+        """mem_mlp should get gradients from memory path."""
         cfg = make_tiny()
         model = V8Model(cfg).float()
         model.initialize_states(BS)
-
-        gate_before = model.lm.mem_gate.data.clone()
 
         input_ids = torch.randint(0, VOCAB, (BS, cfg.T))
         target_ids = torch.randint(0, VOCAB, (BS, cfg.T))
@@ -173,15 +171,12 @@ class TestGradientFlow:
         import torch.nn.functional as F
         loss = F.cross_entropy(
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
 
-        gate_after = model.lm.mem_gate.data
-        assert not torch.equal(gate_before, gate_after), \
-            "mem_gate should change after optimizer step"
+        for name, p in model.lm.mem_mlp.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"mem_mlp.{name} should have grad"
+                assert p.grad.norm() > 0, f"mem_mlp.{name} grad should be nonzero"
 
 
 class TestParamCounts:

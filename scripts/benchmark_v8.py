@@ -119,7 +119,7 @@ def main():
     model = V8Model(cfg).to(device).to(torch.bfloat16)
     for p_param in model.memory.parameters():
         p_param.data = p_param.data.float()
-    model.lm.mem_gate.data = model.lm.mem_gate.data.float()
+    # mem_mlp stays in model dtype (bf16)
     model.train()
 
     use_memory = not args.no_memory

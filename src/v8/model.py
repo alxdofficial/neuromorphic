@@ -83,12 +83,8 @@ class V8Model(nn.Module):
 
         mem_out = torch.cat(mem_out_segs, dim=1)  # [BS, T, D]
 
-        # Reshape mem_out to match inject_memory expectations [BS, T, C, D_cc]
-        # Cast to LM dtype (modulator computes in f32, LM is bf16)
-        mem_signals = mem_out.to(dtype).view(BS, T, self.config.C, self.config.D_cc)
-
         # Upper scan + output (with grad)
-        H_enriched = self.lm.inject_memory(H_mid, mem_signals)
+        H_enriched = self.lm.inject_memory(H_mid, mem_out)
         H = self.lm.forward_scan_upper(H_enriched, surprise=surprise)
         logits = self.lm.forward_output(H)
 

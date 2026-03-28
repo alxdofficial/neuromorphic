@@ -9,7 +9,7 @@ hidden state. A split-point MLP combines H_mid and surprise into a
 unified representation before the upper scan.
 
 CC->memory: H_mid replicated per neuron (D_neuron=256, C_mem = D // D_neuron = 2048 // 256 = 8 slices)
-Memory->CC: neuron messages averaged over replicas, gated, added to H_mid
+Memory->CC: neuron messages averaged over replicas, combined via MLP, added to H_mid
 Upper scan layers see memory-enriched + surprise-modulated input.
 """
 
@@ -72,8 +72,17 @@ class V8LM(nn.Module):
             self.pcm = None
             self.split_mlp = None
 
-        # Memory gate per CC (sigmoid(0) = 0.5 at init)
-        self.mem_gate = nn.Parameter(torch.zeros(C))
+        # Memory injection MLP: combines H_mid + mem_readout → residual update
+        # Small init on final layer: starts near-identity (small residual)
+        # but allows gradients to flow to memory graph immediately.
+        # (Zero-init would block all gradient to memory since dL/d_mem = dL/d_H × w2 = 0)
+        self.mem_mlp = nn.Sequential(
+            nn.Linear(2 * D, config.d_inner),
+            nn.SiLU(),
+            nn.Linear(config.d_inner, D),
+        )
+        nn.init.normal_(self.mem_mlp[2].weight, std=0.01)
+        nn.init.zeros_(self.mem_mlp[2].bias)
 
         # Output head
         self.ln_final = nn.LayerNorm(D_embed)
@@ -176,19 +185,20 @@ class V8LM(nn.Module):
         return H
 
     def inject_memory(self, H_mid: Tensor, mem_signals: Tensor) -> Tensor:
-        """Add gated memory signals to H_mid.
+        """Combine H_mid and memory readout via learned MLP (residual).
+
+        Zero-init final layer: starts as identity (H_mid passes through),
+        learns to integrate memory signal as training progresses.
 
         Args:
             H_mid: [BS, T, D] — lower scan output (with autograd)
-            mem_signals: [BS, T, C, D_cc] — neuron messages (carry gradients)
+            mem_signals: [BS, T, D] — memory readout (carry gradients)
 
         Returns:
             H_enriched: [BS, T, D] — memory-enriched hidden states
         """
-        gate = torch.sigmoid(self.mem_gate)  # [C]
-        mem_contribution = gate[None, None, :, None] * mem_signals
-        # Ensure output matches H_mid dtype (gate may be f32 for precision)
-        return H_mid + mem_contribution.reshape(H_mid.shape).to(H_mid.dtype)
+        mem_flat = mem_signals.to(H_mid.dtype)
+        return H_mid + self.mem_mlp(torch.cat([H_mid, mem_flat], dim=-1))
 
     def forward_output(self, H: Tensor) -> Tensor:
         """Output head only (memory injection happens mid-scan now).

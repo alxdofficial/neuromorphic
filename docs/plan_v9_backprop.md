@@ -109,7 +109,7 @@ Input → Embedding → proj_up (768→2048)
       Pass 2: updated gather → T MLP steps → refined trajectory
       Readout: average replicas → mem_out [BS, T, D]
   → Split-point MLP: H_combined = H_mid + MLP(cat(H_mid, surprise))
-  → INJECT: H_enriched = H_combined + sigmoid(gate) × mem_out
+  → INJECT: H_enriched = H_mid + mem_mlp(cat(H_mid, mem_out))  [zero-init residual]
   → UPPER SCAN (2 layers)
   → proj_down (2048→768) → ln_final → lm_head → logits
 ```
@@ -145,7 +145,7 @@ LM:                                          52M
   4 scan layers (d_inner=580):               19.0M
   PCM:                                       1.0M
   split_mlp:                                 3.5M
-  mem_gate [16]:                             ~0
+  mem_mlp (2D→d_inner→D, zero-init):        3.5M
 
 Memory:                                      58M
   Modulator (mod_w1/w2 per neuron):          7.5M
@@ -160,7 +160,7 @@ Memory:                                      58M
 ## Gradient Flow
 
 ```
-CE loss → logits → upper scan → inject_memory(gate) → readout(mean over replicas)
+CE loss → logits → upper scan → inject_memory(mem_mlp) → readout(mean over replicas)
   → msgs[T steps, pass 2] → msg_MLP(msg_w1, msg_w2)
   → state_MLP(state_w1, state_w2)
   → input_vec = frozen_received + inject[t]
