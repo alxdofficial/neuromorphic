@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--keep-checkpoints", type=int, default=3)
     p.add_argument("--snapshot-interval", type=int, default=1000)
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--d-inner", type=int, default=None,
+                   help="Override d_inner (for param-matched baselines)")
     return p.parse_args()
 
 
@@ -78,6 +80,8 @@ def main():
     config = V8Config.tier_a()
     config.vocab_size = vocab_size
     config.eot_id = eot_id
+    if args.d_inner is not None:
+        config.d_inner = args.d_inner
     config.validate()
 
     bs = args.bs
