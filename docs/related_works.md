@@ -969,7 +969,7 @@ cells), placing us in a biologically relevant scale.
 | Dendritic tree in a memory graph | Dendritic Neuron Model (classification only) | Hierarchical dendritic integration of K=32 neighbor messages within a persistent memory graph for language modeling |
 | Hebbian traces as modulator input | Backpropamine (scalar signal), NACA (expectation-based) | Hebbian traces computed locally, fed to a backprop-trained segment-boundary modulator that restructures connection parameters |
 | Structural plasticity in a differentiable system | SET/RigL (magnitude/gradient on model weights) | Phi-correlation-based rewiring of memory graph connections at segment boundaries, trained within overall backprop framework |
-| Dynamic predictive coding for LM | Jiang & Rao 2023 (visual cortex theory) | PCM predicts H_{t+1} directly; prediction error drives memory integration in a scan-based language model |
+| Dynamic predictive coding for LM | Jiang & Rao 2023 (visual cortex theory) | PCM predicts transitions (H[t+1]-H[t]); RMSNorm'd prediction error drives memory integration in a scan-based language model |
 | Split-scan LM + persistent neuron graph | Mamba/HGRN (scan only), Titans (differentiable meta-learning) | Complementary memory system with biological neuron dynamics, separate from the LM's recurrent state |
 | Per-neuron leaky integration with learned decay | Liquid Time-Constant Networks (single neuron model) | 512 neurons with heterogeneous decay rates modulated at segment boundaries, enabling multi-timescale memory |
 | Biologically-motivated components trained by backprop | Bio-plausible methods (sacrifice performance), Standard DNNs (sacrifice biology) | Practical hybrid: backprop for training efficiency, bio-inspired architecture for memory capabilities |

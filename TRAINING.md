@@ -41,7 +41,7 @@ Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
 | Dendritic tree | 2 branches × 16 synapses |
 | Segment length | T=128 tokens (1 segment per chunk) |
 | Simulation | 2-pass (2 gathers + 256 MLP steps) |
-| Throughput | 24.8K tok/s at BS=48 on RTX 4090 |
+| Throughput | ~24K tok/s at BS=48 on RTX 4090 |
 
 ### CLI Options
 

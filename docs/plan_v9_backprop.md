@@ -14,7 +14,7 @@ primitives once per segment. The neuron dynamics run for T steps per segment wit
 full backprop, using a 2-pass optimization that reduces inter-neuron gathers from
 T to 2.
 
-**110M params** (LM 52M + Memory 58M). **24.8K tok/s** at BS=48 on RTX 4090.
+**110M params** (LM 52M + Memory 58M). **~24K tok/s** at BS=48 on RTX 4090.
 
 ---
 
@@ -201,9 +201,9 @@ updated connection weights.
 ## Performance
 
 ```
-RTX 4090 (25GB VRAM):
-  BS=32: 21.4K tok/s, 14.6GB
-  BS=48: 24.8K tok/s, 21.8GB
+RTX 4090 (24GB VRAM):
+  BS=32: 20.3K tok/s, 12.7GB
+  BS=48: ~24K tok/s, 18.8GB
 
 Memory segment (BS=48):
   Forward:  82ms  (2 gathers: 0.3ms, 256 MLP steps: ~67ms, overhead: ~15ms)
