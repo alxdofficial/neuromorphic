@@ -51,11 +51,31 @@ class V8Model(nn.Module):
         if has_reset and reset_mask is not None:
             self._reset_carries(reset_mask)
 
+        # Build per-position reset mask for internal document boundaries.
+        # If input_ids[b, t] == eot_id, the NEXT position (t+1) should
+        # start with a fresh recurrent state.  Position 0 is covered by
+        # the chunk-boundary reset above.
+        eot_id = self.config.eot_id
+        eos_positions = (input_ids == eot_id)  # [BS, T]
+        has_internal_eos = eos_positions.any().item()
+        if has_internal_eos:
+            # Shift right: reset at t+1 when input_ids[t] == eot_id.
+            # Position 0 gets False (already handled by chunk-boundary reset).
+            internal_reset = torch.zeros_like(eos_positions)
+            internal_reset[:, 1:] = eos_positions[:, :-1]
+            # Also include chunk-boundary resets at position 0
+            if has_reset and reset_mask is not None:
+                internal_reset[:, 0] = internal_reset[:, 0] | reset_mask
+        else:
+            internal_reset = None
+
         # Lower scan + PCM (with grad)
-        H_mid, surprise, x, aux_loss = self.lm.forward_scan_lower(input_ids)
+        H_mid, surprise, x, aux_loss = self.lm.forward_scan_lower(
+            input_ids, reset_mask=internal_reset)
 
         if not use_memory:
-            H = self.lm.forward_scan_upper(H_mid, surprise=surprise)
+            H = self.lm.forward_scan_upper(
+                H_mid, surprise=surprise, reset_mask=internal_reset)
             logits = self.lm.forward_output(H)
             return {"logits": logits, "aux_loss": aux_loss,
                     "surprise": surprise.detach()}
@@ -64,6 +84,14 @@ class V8Model(nn.Module):
         if not self._states_initialized:
             self.memory.initialize_states(BS)
             self._states_initialized = True
+
+        # Reset memory state for batch elements that hit a document
+        # boundary anywhere in the chunk.  Memory is long-range state,
+        # but carrying it across documents would leak context.
+        if has_internal_eos:
+            batch_has_eos = eos_positions.any(dim=1)  # [BS]
+            if batch_has_eos.any():
+                self._reset_memory_states(batch_has_eos)
 
         # Detach H_mid for memory graph input — lower scan gets its own
         # gradient path through the CE loss, memory graph provides a second
@@ -85,7 +113,8 @@ class V8Model(nn.Module):
 
         # Upper scan + output (with grad)
         H_enriched = self.lm.inject_memory(H_mid, mem_out)
-        H = self.lm.forward_scan_upper(H_enriched, surprise=surprise)
+        H = self.lm.forward_scan_upper(
+            H_enriched, surprise=surprise, reset_mask=internal_reset)
         logits = self.lm.forward_output(H)
 
         return {
@@ -104,6 +133,27 @@ class V8Model(nn.Module):
                 if h is not None:
                     mask_f = (~mask).to(dtype=h.dtype).unsqueeze(-1)
                     self.lm._carries[i] = h * mask_f
+
+    def _reset_memory_states(self, mask: Tensor):
+        """Zero memory graph runtime state for batch elements where mask is True.
+
+        Args:
+            mask: [BS] bool — True for batch elements to reset.
+        """
+        mg = self.memory
+        if not mg._initialized:
+            return
+        # mask_f: [BS, 1, 1] keep-mask (1 = keep, 0 = reset)
+        keep = (~mask).to(dtype=mg.h.dtype)
+        keep_3d = keep.unsqueeze(-1).unsqueeze(-1)  # [BS, 1, 1]
+        keep_2d = keep.unsqueeze(-1)  # [BS, 1]
+        with torch.no_grad():
+            mg.h = mg.h * keep_3d
+            mg.prev_messages = mg.prev_messages * keep_3d
+            mg.w_conn = mg.w_conn * keep_3d
+            mg.primitives_state = mg.primitives_state * keep_3d
+            mg.decay_logit = mg.decay_logit * keep_2d
+            mg.hebbian_traces = mg.hebbian_traces * keep_3d
 
     def initialize_states(self, BS: int, device: torch.device = None):
         self.lm.initialize_carries()

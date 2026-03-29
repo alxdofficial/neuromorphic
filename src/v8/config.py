@@ -38,6 +38,8 @@ class V8Config:
     # Structural plasticity
     structural_plasticity: bool = True
     plasticity_n_swap: int = 8   # connections swapped per neuron per rewire
+    plasticity_exploration_frac: float = 0.2  # fraction of regrowth that's random
+    co_activation_ema_decay: float = 0.995    # slow EMA for phi matrix
 
     # Segment / training
     T: int = 128                 # tokens per chunk = segment length

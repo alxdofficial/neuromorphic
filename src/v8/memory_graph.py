@@ -176,11 +176,11 @@ class MemoryGraph(nn.Module):
         # Hebbian traces (per-segment average of |msg| * sigmoid(w_conn))
         self.hebbian_traces = torch.zeros(BS, N, K, device=device, dtype=dt)
 
-        # Structural plasticity
+        # Structural plasticity — phi correlation matrix (EMA-smoothed)
         if self.config.structural_plasticity:
-            self.co_activation = torch.zeros(N, N, device=device,
-                                             dtype=torch.float32)
-            self._plasticity_segment_count = 0
+            self.co_activation_ema = torch.zeros(N, N, device=device,
+                                                  dtype=torch.float32)
+            self._co_activation_ready = False
 
         # Diagnostics
         self.msg_magnitude = torch.zeros(BS, N, device=device, dtype=dt)
@@ -442,13 +442,13 @@ class MemoryGraph(nn.Module):
             # Hebbian traces: per-segment average
             self.hebbian_traces = (total_hebbian / max(T_seg, 1)).to(self.dtype)
 
-            # Structural plasticity accumulation
+            # Structural plasticity: phi correlation from per-step activity
             if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation')):
-                msg_mag = prev_msg.detach().float().norm(dim=-1)  # [BS, N]
-                mag_mean = msg_mag.mean(dim=0)  # [N]
-                self.co_activation += torch.outer(mag_mean, mag_mean)
-                self._plasticity_segment_count += 1
+                    hasattr(self, 'co_activation_ema')):
+                # act_trace: [BS, T_seg, N] — per-step message norms
+                act_trace = torch.stack(
+                    [m.detach().float().norm(dim=-1) for m in msgs], dim=1)
+                self._update_phi(act_trace)
 
             # Diagnostics
             alpha = 0.05
@@ -463,62 +463,104 @@ class MemoryGraph(nn.Module):
     # Structural plasticity
     # ================================================================
 
+    @torch.no_grad()
+    def _update_phi(self, act_trace: Tensor):
+        """Compute Pearson phi from per-step activity traces, EMA-smooth.
+
+        Args:
+            act_trace: [BS, T_seg, N] — per-step message norms from last pass
+        """
+        BS, T_seg, N = act_trace.shape
+
+        # Binary firing: 1 if above 75th percentile (per batch element)
+        threshold = torch.quantile(
+            act_trace, 0.75, dim=1, keepdim=True)  # [BS, 1, N]
+        fired = (act_trace > threshold).float()       # [BS, T_seg, N]
+
+        # Pearson correlation (phi coefficient)
+        p_i = fired.mean(dim=1, keepdim=True)         # [BS, 1, N]
+        fired_centered = fired - p_i                   # [BS, T_seg, N]
+        var_i = (p_i * (1 - p_i)).squeeze(1).clamp(min=1e-8)  # [BS, N]
+        cov = torch.bmm(
+            fired_centered.transpose(1, 2),
+            fired_centered,
+        ) / T_seg                                      # [BS, N, N]
+        std_i = var_i.sqrt().unsqueeze(2)              # [BS, N, 1]
+        std_j = var_i.sqrt().unsqueeze(1)              # [BS, 1, N]
+        phi = cov / (std_i * std_j).clamp(min=1e-8)   # [BS, N, N]
+
+        # Average over batch, EMA update
+        phi_mean = phi.mean(dim=0)  # [N, N]
+        ca_decay = self.config.co_activation_ema_decay
+        self.co_activation_ema = (
+            ca_decay * self.co_activation_ema + (1 - ca_decay) * phi_mean)
+        self._co_activation_ready = True
+
     def rewire_connections(self):
-        """Structural plasticity: prune weak connections, create strong ones.
+        """Phi-based structural plasticity: prune anti-correlated, grow
+        toward highest correlation. 20% random exploration.
 
         Called at chunk boundaries. Non-differentiable.
-        Modifies conn_indices buffer in-place.
         """
         if not self.config.structural_plasticity:
             return
-        if not hasattr(self, 'co_activation'):
+        if not hasattr(self, 'co_activation_ema'):
             return
-        if self._plasticity_segment_count == 0:
+        if not self._co_activation_ready:
             return
 
         N = self.config.N_neurons
         K = self.config.K_connections
         n_swap = min(self.config.plasticity_n_swap, K)
-
-        # Normalize co-activation by number of segments
-        co_act = self.co_activation / self._plasticity_segment_count
-        co_act.fill_diagonal_(0.0)  # no self-connections
+        explore_frac = self.config.plasticity_exploration_frac
+        phi = self.co_activation_ema
+        device = phi.device
 
         conn = self.conn_indices  # [N, K]
 
         with torch.no_grad():
+            total_swaps = 0
             for n in range(N):
                 current_neighbors = conn[n]  # [K]
+                conn_phi = phi[n, current_neighbors]  # [K]
 
-                # Strength of current connections
-                current_strength = co_act[n, current_neighbors]  # [K]
+                # Prune: find the worst connection (most anti-correlated)
+                worst_phi, worst_k = conn_phi.min(dim=-1)
+                if worst_phi >= 0:
+                    continue  # no anti-correlated connections to prune
 
-                # Find weakest current connections
-                _, weakest_idx = current_strength.topk(n_swap, largest=False)
-
-                # Mask out current connections
-                mask = torch.ones(N, device=co_act.device, dtype=torch.bool)
+                # Mask out current connections + self
+                mask = torch.ones(N, device=device, dtype=torch.bool)
                 mask[current_neighbors] = False
                 mask[n] = False
 
-                # Find strongest non-connected neurons
-                candidates = co_act[n].clone()
-                candidates[~mask] = -float('inf')
-                _, strongest_new = candidates.topk(n_swap, largest=True)
+                # Best candidate by correlation
+                phi_masked = phi[n].clone()
+                phi_masked[~mask] = -float('inf')
+                best_target = phi_masked.argmax()
+                best_phi_val = phi_masked[best_target]
 
-                # Swap
-                conn[n, weakest_idx] = strongest_new
+                # Random candidate
+                valid_indices = mask.nonzero(as_tuple=True)[0]
+                if valid_indices.shape[0] == 0:
+                    continue
+                rand_idx = torch.randint(valid_indices.shape[0], (1,),
+                                         device=device)
+                random_target = valid_indices[rand_idx.item()]
+
+                # 20% exploration or when best candidate isn't positive
+                use_random = (torch.rand(1, device=device).item()
+                              < explore_frac) or (best_phi_val <= 0)
+                new_target = random_target if use_random else best_target
+
+                conn[n, worst_k] = new_target
+                total_swaps += 1
 
             # Re-sort for efficient gather
             sorted_idx, _ = conn.sort(dim=-1)
             self.conn_indices.copy_(sorted_idx)
 
-        # Store for diagnostics
-        self._last_rewire_swaps = n_swap * N
-
-        # Reset accumulator
-        self.co_activation.zero_()
-        self._plasticity_segment_count = 0
+        self._last_rewire_swaps = total_swaps
 
     # ================================================================
     # State management
@@ -540,9 +582,9 @@ class MemoryGraph(nn.Module):
             'msg_magnitude': self.msg_magnitude,
         }
         if (self.config.structural_plasticity and
-                hasattr(self, 'co_activation')):
-            state['co_activation'] = self.co_activation
-            state['_plasticity_segment_count'] = self._plasticity_segment_count
+                hasattr(self, 'co_activation_ema')):
+            state['co_activation_ema'] = self.co_activation_ema
+            state['_co_activation_ready'] = self._co_activation_ready
         return state
 
     def load_runtime_state(self, state: dict):

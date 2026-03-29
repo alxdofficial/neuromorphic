@@ -94,7 +94,8 @@ class V8LM(nn.Module):
         # Scan carries
         self._carries = [None] * config.L_total
 
-    def forward_scan_lower(self, input_ids: Tensor
+    def forward_scan_lower(self, input_ids: Tensor,
+                           reset_mask: Tensor | None = None,
                            ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Lower scan layers (0..split-1) + PCM. Produces H_mid for memory graph.
 
@@ -104,6 +105,9 @@ class V8LM(nn.Module):
 
         Args:
             input_ids: [BS, T]
+            reset_mask: [BS, T] bool or None — True at positions where
+                the recurrent state should be reset (internal document
+                boundaries).
 
         Returns:
             H_mid: [BS, T, D] — hidden states after lower scan (WITH autograd)
@@ -127,7 +131,7 @@ class V8LM(nn.Module):
         H = x
         for i in range(split):
             carry = self._carries[i]
-            H, h_last = self.layers[i](H, carry)
+            H, h_last = self.layers[i](H, carry, reset_mask=reset_mask)
             self._carries[i] = h_last
 
         # PCM at the split point — predict next hidden state, compute surprise
@@ -157,7 +161,8 @@ class V8LM(nn.Module):
         return H, surprise_flat, x, aux_loss
 
     def forward_scan_upper(self, H_enriched: Tensor,
-                           surprise: Tensor | None = None) -> Tensor:
+                           surprise: Tensor | None = None,
+                           reset_mask: Tensor | None = None) -> Tensor:
         """Upper scan layers (split..L-1) on memory-enriched input.
 
         Surprise is mixed into the representation via split_mlp before
@@ -166,6 +171,9 @@ class V8LM(nn.Module):
         Args:
             H_enriched: [BS, T, D] — H_mid + gated memory signals
             surprise: [BS, T, D] or None — PCM surprise
+            reset_mask: [BS, T] bool or None — True at positions where
+                the recurrent state should be reset (internal document
+                boundaries).
 
         Returns:
             H: [BS, T, D] — hidden states after upper scan layers
@@ -180,7 +188,7 @@ class V8LM(nn.Module):
 
         for i in range(split, self.config.L_total):
             carry = self._carries[i]
-            H, h_last = self.layers[i](H, carry)
+            H, h_last = self.layers[i](H, carry, reset_mask=reset_mask)
             self._carries[i] = h_last
 
         return H
@@ -218,10 +226,14 @@ class V8LM(nn.Module):
         return logits
 
     # --- Legacy: full scan for no-memory path ---
-    def forward_scan(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward_scan(self, input_ids: Tensor,
+                     reset_mask: Tensor | None = None,
+                     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Full scan + PCM (no memory). Used only for no-memory baseline."""
-        H_mid, surprise, x, aux_loss = self.forward_scan_lower(input_ids)
-        H = self.forward_scan_upper(H_mid, surprise=surprise)
+        H_mid, surprise, x, aux_loss = self.forward_scan_lower(
+            input_ids, reset_mask=reset_mask)
+        H = self.forward_scan_upper(H_mid, surprise=surprise,
+                                    reset_mask=reset_mask)
         return H, surprise, x, aux_loss
 
     def initialize_carries(self):

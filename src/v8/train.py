@@ -11,6 +11,8 @@ import argparse
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 
 import torch
@@ -98,6 +100,7 @@ def main():
     # Resume
     start_step = 0
     _pending_mg_state = None
+    _pending_dl_state = None
     if args.resume:
         print(f"\nResuming from: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -107,6 +110,9 @@ def main():
         if "memory_state" in ckpt:
             _pending_mg_state = ckpt["memory_state"]
             print(f"  Memory state found (will restore on first batch)")
+        if "dataloader_state" in ckpt:
+            _pending_dl_state = ckpt["dataloader_state"]
+            print(f"  Dataloader state found (will restore dataset position)")
         start_step = ckpt.get("step", 0)
         print(f"  Loaded from step {start_step}")
 
@@ -173,10 +179,18 @@ def main():
                 pass
         del ckpt
 
-    # Data
+    # Data — on resume, only need enough batches for the remaining steps
+    remaining_steps = args.steps - start_step
     dataloader = create_dataloader(
         phase="A", tokenizer=tokenizer, batch_size=bs,
-        seq_length=T, seed=args.seed, max_steps=args.steps)
+        seq_length=T, seed=args.seed, max_steps=remaining_steps)
+
+    # Restore dataloader position so resumed training continues where it
+    # left off instead of replaying earlier data.
+    if _pending_dl_state is not None:
+        if hasattr(dataloader, "load_state_dict"):
+            dataloader.load_state_dict(_pending_dl_state)
+            print(f"  Restored dataloader position")
 
     # Trainer
     trainer = V8Trainer(
@@ -208,9 +222,14 @@ def main():
 
     diag = V8Diagnostics(model, save_dir, snapshot_every=args.snapshot_interval)
     saved_checkpoints = []
+    _plot_proc = None  # Track async plot subprocess to avoid pile-up
 
     print(f"\nOutputs: {save_dir}")
-    print(f"Starting training ({args.steps} steps)...")
+    if start_step > 0:
+        print(f"Resuming from step {start_step}, "
+              f"{remaining_steps} steps remaining (target: {args.steps})...")
+    else:
+        print(f"Starting training ({args.steps} steps)...")
     print("=" * 60)
 
     def on_step(metrics):
@@ -238,23 +257,22 @@ def main():
 
         diag.maybe_snapshot(step)
 
-        # Auto-plot every 250 steps
+        # Auto-plot every 250 steps (async subprocess to avoid blocking training)
+        nonlocal _plot_proc
         if step % 250 == 0 and step > 0:
-            try:
-                from scripts.plot_training import (
-                    load_metrics, plot_training_curves,
-                    plot_memory_health, plot_gradient_health)
-                plots_dir = os.path.join(save_dir, "plots")
-                os.makedirs(plots_dir, exist_ok=True)
-                records = load_metrics(metrics_path)
-                plot_training_curves(records,
-                                     os.path.join(plots_dir, "training_curves.png"))
-                plot_memory_health(records,
-                                   os.path.join(plots_dir, "memory_health.png"))
-                plot_gradient_health(records,
-                                     os.path.join(plots_dir, "gradient_health.png"))
-            except Exception as e:
-                print(f"  Plot failed: {e}")
+            # Skip if previous plot is still running
+            if _plot_proc is not None and _plot_proc.poll() is None:
+                pass  # previous plot still in progress, skip this one
+            else:
+                try:
+                    metrics_file.flush()  # ensure data is on disk for subprocess
+                    _plot_proc = subprocess.Popen(
+                        [sys.executable, "-m", "scripts.plot_training", save_dir],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    print(f"  Plot launch failed: {e}")
 
         if args.save_interval > 0 and step % args.save_interval == 0:
             ckpt_path = os.path.join(save_dir, f"v9_step{step}.pt")
@@ -268,6 +286,9 @@ def main():
             if model.memory.is_initialized():
                 ckpt["memory_state"] = {
                     k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
+            # Save dataset position using the trainer's step (not the
+            # dataset's internal counter, which may be ahead due to prefetch).
+            ckpt["dataloader_state"] = {"step_count": step}
             torch.save(ckpt, ckpt_path)
             saved_checkpoints.append(ckpt_path)
             print(f"  Saved: {ckpt_path}")
@@ -278,7 +299,7 @@ def main():
                     if os.path.exists(old):
                         os.remove(old)
 
-    all_metrics = trainer.train_epoch(args.steps, step_callback=on_step)
+    all_metrics = trainer.train_epoch(remaining_steps, step_callback=on_step)
 
     # Final checkpoint
     final_path = os.path.join(save_dir, f"v9_step{trainer.global_step}.pt")
@@ -292,6 +313,7 @@ def main():
     if model.memory.is_initialized():
         final_ckpt["memory_state"] = {
             k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
+    final_ckpt["dataloader_state"] = {"step_count": trainer.global_step}
     torch.save(final_ckpt, final_path)
     metrics_file.close()
 

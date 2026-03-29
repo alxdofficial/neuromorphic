@@ -154,10 +154,36 @@ class TokenShardDataset(IterableDataset):
 
         self.step_count = 0
         self.prev_tokens: Optional[torch.Tensor] = None
+        self._resume_step: int = 0  # step offset for resume
         # Compat with PersistentStreamDataset monitoring
         self.stream_restarts_total = 0
         self.stream_restarts_last_batch = 0
         self.streams_exhausted_last_batch = 0
+
+    def state_dict(self) -> dict:
+        """Return serialisable snapshot for checkpointing.
+
+        The dataset position is fully determined by ``step_count`` and the
+        constructor ``seed`` — positions can be recomputed arithmetically on
+        resume, so only the step counter is strictly needed.
+
+        .. note::
+           When prefetch > 0, ``step_count`` may be slightly ahead of the
+           training loop's actual progress.  Callers that need an exact
+           match (e.g. checkpoint saves) should use the trainer's step
+           counter instead.
+        """
+        return {
+            "step_count": self.step_count,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore dataset position from a checkpoint.
+
+        Sets a resume offset so that ``_generate`` fast-forwards positions
+        arithmetically (no wasted iteration).
+        """
+        self._resume_step = state.get("step_count", 0)
 
     def _generate(self) -> Iterator[StreamBatch]:
         """Core generation loop (wrapped by prefetch thread)."""
@@ -174,8 +200,17 @@ class TokenShardDataset(IterableDataset):
             dtype=np.int64,
         )
 
-        # Initialize prev_tokens to EOS (triggers reset on first chunk)
+        # Fast-forward positions if resuming from a checkpoint.  Positions
+        # advance by chunk_size each step, so we can skip ahead arithmetically.
+        resume_step = self._resume_step
+        if resume_step > 0:
+            positions = (positions + resume_step * chunk_size) % shard_len
+            self._resume_step = 0  # consumed
+
+        # Initialize prev_tokens to EOS (triggers reset on first chunk).
         self.prev_tokens = torch.full((BS,), self.eos_token_id, dtype=torch.long)
+        # step_count tracks batches yielded in this session (starts at 0,
+        # compared against max_steps which is the remaining step count).
         self.step_count = 0
 
         # Pre-allocate pinned buffer for async CPU→GPU transfer
@@ -403,6 +438,7 @@ class PersistentStreamDataset(IterableDataset):
         self.streams: Optional[List[DocumentStream]] = None
         self.prev_tokens: Optional[torch.Tensor] = None
         self.step_count = 0
+        self._resume_step = 0
         self.stream_restarts_total = 0
         self.stream_restarts_last_batch = 0
         self.streams_exhausted_last_batch = 0
@@ -454,6 +490,25 @@ class PersistentStreamDataset(IterableDataset):
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
 
+    def state_dict(self) -> dict:
+        """Return serialisable snapshot for checkpointing.
+
+        For streaming HF datasets exact iterator positions cannot be saved.
+        We store ``step_count`` so that on resume we can fast-forward by
+        consuming and discarding that many batches.
+        """
+        return {
+            "step_count": self.step_count,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore dataset position from a checkpoint.
+
+        Stores ``_resume_step`` so that ``__iter__`` can fast-forward past
+        already-seen data.
+        """
+        self._resume_step = state.get("step_count", 0)
+
     def __iter__(self) -> Iterator[StreamBatch]:
         """
         Iterate over batches of tokens.
@@ -463,6 +518,30 @@ class PersistentStreamDataset(IterableDataset):
         """
         if self.streams is None:
             self._init_streams()
+
+        # Fast-forward past already-consumed batches on resume.
+        resume_step = getattr(self, "_resume_step", 0)
+        if resume_step > 0:
+            logger.info(
+                "Fast-forwarding PersistentStreamDataset: consuming %d batches",
+                resume_step,
+            )
+            _ff_count = 0
+            while _ff_count < resume_step:
+                # Consume one batch worth of tokens from each stream
+                for i, stream in enumerate(self.streams):
+                    needed = self.seq_length + 1
+                    tokens = stream.get_tokens(needed)
+                    if len(tokens) < needed and stream.is_exhausted():
+                        self._stream_restarts[i] += 1
+                        self.stream_restarts_total += 1
+                        self.streams[i] = self._make_stream(i)
+                        self.streams[i].get_tokens(needed - len(tokens))
+                _ff_count += 1
+            self._resume_step = 0
+            # Reset step_count so it tracks batches yielded this session
+            # (compared against max_steps = remaining steps).
+            self.step_count = 0
 
         while True:
             if self.max_steps is not None and self.step_count >= self.max_steps:
@@ -747,22 +826,47 @@ class MixedStreamDataset(IterableDataset):
 
 
 class _DatasetIterator:
-    """Iterator wrapper that exposes underlying dataset monitor stats."""
+    """Iterator wrapper that exposes underlying dataset monitor stats.
+
+    Iteration is deferred until the first ``__next__`` call so that
+    ``load_state_dict`` can be called after construction but before any
+    data is consumed.
+    """
 
     def __init__(self, dataset: IterableDataset):
         self.dataset = dataset
-        self._it = iter(dataset)
+        self._it: Optional[Iterator] = None  # deferred
+
+    def _ensure_iter(self):
+        if self._it is None:
+            self._it = iter(self.dataset)
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self._ensure_iter()
         return next(self._it)
 
     def monitor_stats(self) -> dict:
         if hasattr(self.dataset, "monitor_stats"):
             return self.dataset.monitor_stats()
         return {}
+
+    def state_dict(self) -> dict:
+        """Proxy to underlying dataset's state_dict for checkpointing."""
+        if hasattr(self.dataset, "state_dict"):
+            return self.dataset.state_dict()
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Proxy to underlying dataset's load_state_dict for resume.
+
+        Must be called **before** the first ``__next__`` so that the
+        dataset can fast-forward positions when iteration starts.
+        """
+        if hasattr(self.dataset, "load_state_dict"):
+            self.dataset.load_state_dict(state)
 
 
 def _find_shard(config) -> Optional[str]:

@@ -181,13 +181,18 @@ class ScanLayer(nn.Module):
                 self.proj_out.weight.mul_(1.0 / math.sqrt(2 * n_layers))
 
     def forward(self, x: Tensor, h_prev: Tensor | None = None,
-                side_input: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                side_input: Tensor | None = None,
+                reset_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Forward pass.
 
         Args:
             x: [BS, N, D]
             h_prev: [BS, d_inner] or None — carry from previous segment
             side_input: [BS, N, side_dim] or None — additional signal (e.g. surprise)
+            reset_mask: [BS, N] bool or None — True at positions where the
+                recurrent state should be reset (document boundaries within a
+                chunk).  At reset positions the decay gate is forced to 0 so
+                h_t = b_t (fresh start from input only).
 
         Returns:
             out: [BS, N, D] — output (with residual)
@@ -198,6 +203,15 @@ class ScanLayer(nn.Module):
         if side_input is not None and self.proj_side is not None:
             ab = ab + self.proj_side(side_input)
         a_raw, b_raw = ab.chunk(2, dim=-1)
+
+        # Force decay gate to ~0 at document boundary positions so that
+        # h_t = b_t (no carry from the previous document).
+        if reset_mask is not None:
+            # reset_mask: [BS, T] bool → [BS, T, 1] float mask
+            gate_kill = reset_mask.unsqueeze(-1).to(dtype=a_raw.dtype)
+            # Where gate_kill==1, push a_raw to -1e18 → sigmoid ≈ 0
+            a_raw = a_raw - gate_kill * 1e18
+
         h = fused_scan(a_raw, F.silu(b_raw), h_prev)  # [BS, N, d_inner]
         if self.glu_output:
             gate_up = self.proj_out(h)             # [BS, N, 2*D]
