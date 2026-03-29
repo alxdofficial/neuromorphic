@@ -182,9 +182,13 @@ class V8LM(nn.Module):
 
         H = H_enriched
 
-        # Mix surprise at split point via MLP (residual, zero-init at start)
+        # Mix surprise at split point via MLP (residual, depth-scaled init)
+        # RMSNorm on surprise prevents unbounded growth — the PCM prediction
+        # error grows as H_mid evolves faster than the PCM can track.
         if surprise is not None and self.split_mlp is not None:
-            H = H + self.split_mlp(torch.cat([H, surprise], dim=-1))
+            surp_rms = surprise.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
+            surprise_normed = surprise * surp_rms
+            H = H + self.split_mlp(torch.cat([H, surprise_normed], dim=-1))
 
         for i in range(split, self.config.L_total):
             carry = self._carries[i]
