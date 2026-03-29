@@ -415,9 +415,10 @@ class MemoryGraph(nn.Module):
                 # Only collect outputs on last pass
                 if pass_idx == n_passes - 1:
                     readouts.append(self._readout_single(msg))
-                    msg_mag = msg.norm(dim=-1, keepdim=True)
-                    total_hebbian = total_hebbian + msg_mag * w_conn_sig
-                    act_norms.append(msg.detach().float().norm(dim=-1))
+                    with torch.no_grad():
+                        msg_mag = msg.detach().norm(dim=-1, keepdim=True)
+                        total_hebbian += msg_mag * w_conn_sig.detach()
+                        act_norms.append(msg_mag.squeeze(-1).float())
 
         # Stack readouts: [BS, T_seg, D_lm] (not [BS, T_seg, N, D])
         mem_out = torch.stack(readouts, dim=1)
