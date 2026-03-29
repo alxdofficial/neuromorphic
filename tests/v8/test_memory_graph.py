@@ -282,7 +282,7 @@ class TestInjectReadout:
 
 class TestStructuralPlasticity:
     def test_rewire_changes_connections(self):
-        cfg = make_tiny(structural_plasticity=True, plasticity_n_swap=2)
+        cfg = make_tiny(structural_plasticity=True, plasticity_pct=0.1)
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
 
@@ -298,7 +298,7 @@ class TestStructuralPlasticity:
         assert changed, "rewire_connections should change some connections"
 
     def test_rewire_preserves_k(self):
-        cfg = make_tiny(structural_plasticity=True, plasticity_n_swap=2)
+        cfg = make_tiny(structural_plasticity=True, plasticity_pct=0.1)
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
 
@@ -310,7 +310,7 @@ class TestStructuralPlasticity:
         assert mg.conn_indices.shape == (cfg.N_neurons, cfg.K_connections)
 
     def test_rewire_no_self_connections(self):
-        cfg = make_tiny(structural_plasticity=True, plasticity_n_swap=2)
+        cfg = make_tiny(structural_plasticity=True, plasticity_pct=0.1)
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
 

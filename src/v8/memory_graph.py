@@ -496,10 +496,14 @@ class MemoryGraph(nn.Module):
         self._co_activation_ready = True
 
     def rewire_connections(self):
-        """Structural plasticity: swap weakest connections for strongest.
+        """Structural plasticity: globally prune/grow connections by phi rank.
 
-        Uses phi correlation for ranking, 20% random exploration.
-        Always swaps n_swap connections per neuron — doesn't gate on phi < 0.
+        Prunes the bottom plasticity_pct% of existing connections (lowest phi)
+        and creates new connections for the top plasticity_pct% of unconnected
+        pairs (highest phi). 20% of new connections are random (exploration).
+        Number of swaps varies per neuron — well-connected neurons may keep
+        all their connections while poorly-connected ones lose several.
+
         Called at chunk boundaries. Non-differentiable.
         """
         if not self.config.structural_plasticity:
@@ -511,50 +515,55 @@ class MemoryGraph(nn.Module):
 
         N = self.config.N_neurons
         K = self.config.K_connections
-        n_swap = min(self.config.plasticity_n_swap, K)
         explore_frac = self.config.plasticity_exploration_frac
         phi = self.co_activation_ema
         phi.fill_diagonal_(0.0)
         device = phi.device
-
         conn = self.conn_indices  # [N, K]
 
+        total_conns = N * K
+        n_prune = max(1, int(total_conns * self.config.plasticity_pct))
+
         with torch.no_grad():
-            for n in range(N):
-                current_neighbors = conn[n]  # [K]
-                conn_phi = phi[n, current_neighbors]  # [K]
+            # Gather phi for all existing connections: [N, K]
+            conn_phi = phi[
+                torch.arange(N, device=device).unsqueeze(1), conn]
 
-                # Find n_swap weakest current connections
-                _, weakest_idx = conn_phi.topk(n_swap, largest=False)
+            # Flatten and find the globally weakest connections
+            flat_phi = conn_phi.reshape(-1)  # [N*K]
+            _, prune_flat_idx = flat_phi.topk(n_prune, largest=False)
 
-                # Mask out current connections + self
-                mask = torch.ones(N, device=device, dtype=torch.bool)
-                mask[current_neighbors] = False
-                mask[n] = False
+            # Convert flat indices to (neuron, slot) pairs
+            prune_n = prune_flat_idx // K
+            prune_k = prune_flat_idx % K
 
-                # Find n_swap strongest non-connected neurons
-                candidates = phi[n].clone()
-                candidates[~mask] = -float('inf')
-                _, strongest_new = candidates.topk(n_swap, largest=True)
+            # Build mask of all current connections: [N, N] bool
+            conn_mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+            conn_mask.scatter_(1, conn, True)
+            conn_mask.fill_diagonal_(True)  # no self-connections
 
-                # 20% exploration: replace some with random targets
-                valid_indices = mask.nonzero(as_tuple=True)[0]
-                if valid_indices.shape[0] >= n_swap:
-                    rand_perm = torch.randperm(
-                        valid_indices.shape[0], device=device)[:n_swap]
-                    random_targets = valid_indices[rand_perm]
-                    use_random = torch.rand(
-                        n_swap, device=device) < explore_frac
-                    strongest_new = torch.where(
-                        use_random, random_targets, strongest_new)
+            # Find globally strongest UNCONNECTED pairs
+            phi_candidates = phi.clone()
+            phi_candidates[conn_mask] = -float('inf')
+            flat_candidates = phi_candidates.reshape(-1)  # [N*N]
+            _, grow_flat_idx = flat_candidates.topk(n_prune, largest=True)
 
-                conn[n, weakest_idx] = strongest_new
+            # Convert to (source_neuron, target_neuron) pairs
+            grow_target = grow_flat_idx % N
+
+            # 20% exploration: replace some targets with random
+            rand_targets = torch.randint(0, N, (n_prune,), device=device)
+            use_random = torch.rand(n_prune, device=device) < explore_frac
+            grow_target = torch.where(use_random, rand_targets, grow_target)
+
+            # Apply: replace pruned connections with new targets
+            conn[prune_n, prune_k] = grow_target
 
             # Re-sort for efficient gather
             sorted_idx, _ = conn.sort(dim=-1)
             self.conn_indices.copy_(sorted_idx)
 
-        self._last_rewire_swaps = n_swap * N
+        self._last_rewire_swaps = n_prune
 
     # ================================================================
     # State management
