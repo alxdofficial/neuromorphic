@@ -102,13 +102,14 @@ neurons see their neighbors' end-of-pass state rather than per-step state.
 ```
 Input → Embedding → proj_up (768→2048)
   → LOWER SCAN (2 layers, d_inner=580)
-  → PCM: predict H_{t+1} directly, surprise = predicted − actual
+  → PCM: predict transitions (H[t+1]-H[t]), surprise = predicted_delta − actual_delta
   → MEMORY GRAPH (2-pass, T steps per pass)
       Modulator: predict w_conn, decay, primitives (once per segment)
       Pass 1: frozen gather → T MLP steps → approximate trajectory
       Pass 2: updated gather → T MLP steps → refined trajectory
-      Readout: average replicas → mem_out [BS, T, D]
-  → Split-point MLP: H_combined = H_mid + MLP(cat(H_mid, surprise))
+      State MLP: h = decay * h_prev + (1-decay) * tanh(MLP(input, h_prev))
+      Readout: per-step → mem_out [BS, T, D] (no [BS,T,N,D] materialized)
+  → Split-point MLP: H = H + split_mlp(cat(H, RMSNorm(surprise)))
   → INJECT: H_enriched = H_mid + mem_scale * mem_out  [learnable per-dim scale]
   → UPPER SCAN (2 layers)
   → proj_down (2048→768) → ln_final → lm_head → logits
@@ -155,7 +156,7 @@ Memory:                                      58M
   Dendritic tree (branch_w + group_w):       4.5M
   Neuron ID [512, 256]:                      0.1M
 
-Grand total:                                 113M
+Grand total:                                 ~110M
 ```
 
 ---
@@ -163,10 +164,11 @@ Grand total:                                 113M
 ## Gradient Flow
 
 ```
-CE loss → logits → upper scan → inject_memory(mem_scale) → readout(sum / √N)
+CE loss → logits → upper scan → inject_memory(mem_scale × readout)
+  → readout_single(msg) per step [no [BS,T,N,D] materialized]
   → msgs[T steps, pass 2] → msg_MLP(msg_w1, msg_w2)
-  → state_MLP(state_w1, state_w2)
-  → input_vec = frozen_received + inject[t]
+  → state_MLP: h = decay * h_prev + (1-decay) * tanh(MLP(input, h_prev))
+  → input_vec = frozen_received + inject_single[t]
   → frozen_received ← gather(prev_msg, w_conn_sig)
   → w_conn_sig = sigmoid(w_conn)
   → w_conn ← modulator MLP(mod_w1, mod_w2) ← [hebbian, h, decay, primitives]

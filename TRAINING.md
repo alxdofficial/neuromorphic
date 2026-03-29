@@ -17,13 +17,14 @@ python -u -m src.v8.train --bs 48 --steps 60000 --resume outputs/v9/<run>/v9_ste
 
 Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
 - **Lower scan**: 2 layers (D=2048, d_inner=580, GLU)
-- **PCM**: Predicts H_{t+1} directly. Surprise mixed via split-point MLP.
+- **PCM**: Dynamic predictive coding — predicts transitions (H[t+1]-H[t]), RMSNorm on surprise.
 - **Memory graph**: 512 neurons, D_neuron=256, K=32 connections
   - 2-pass simulation: freeze inter-neuron messages, run T MLP steps per pass
   - Per-neuron modulator MLP (hidden=80): predicts w_conn, decay, primitives
-  - Per-neuron state MLP + message MLP: update hidden state and generate messages
+  - State MLP with structural decay: h = decay * h_prev + (1-decay) * tanh(MLP(input, h))
+  - Message MLP: generates per-neuron messages
   - Dendritic tree: hierarchical integration of neighbor signals
-  - Structural plasticity: rewire weakest connections between chunks
+  - Phi-based structural plasticity: Pearson correlation, anti-correlation pruning, 20% exploration
 - **Inject**: H_enriched = H_mid + mem_scale * mem_readout  [learnable per-dim scale]
 - **Upper scan**: 2 layers on memory-enriched representations
 
