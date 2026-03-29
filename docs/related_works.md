@@ -2,8 +2,8 @@
 
 > **NOTE (2026-03-29):** Comprehensive literature survey for v9-backprop (branch
 > `v9-backprop`). The memory graph is now differentiable and trained end-to-end by
-> backprop. N=512 neurons, D_neuron=256, K=32, 4 scan layers split at 2, ~113M
-> params, ~24.8K tok/s. No RL, no ES. Per-neuron MLPs (state, message, modulator),
+> backprop. N=512 neurons, D_neuron=256, K=32, 4 scan layers split at 2, ~110M
+> params, ~27K tok/s. No RL, no ES. Per-neuron MLPs (state, message, modulator),
 > dendritic tree, Hebbian traces, structural plasticity, dynamic predictive coding.
 
 A survey of prior work related to the Neuromorphic Language Model architecture,
