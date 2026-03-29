@@ -109,7 +109,7 @@ Input → Embedding → proj_up (768→2048)
       Pass 2: updated gather → T MLP steps → refined trajectory
       Readout: average replicas → mem_out [BS, T, D]
   → Split-point MLP: H_combined = H_mid + MLP(cat(H_mid, surprise))
-  → INJECT: H_enriched = H_mid + mem_mlp(cat(H_mid, mem_out))  [zero-init residual]
+  → INJECT: H_enriched = H_mid + mem_scale * mem_out  [learnable per-dim scale]
   → UPPER SCAN (2 layers)
   → proj_down (2048→768) → ln_final → lm_head → logits
 ```
@@ -144,8 +144,8 @@ LM:                                          55M
   pos_embed (128 × 2048):                    0.3M
   4 scan layers (d_inner=580, GLU):          19.0M
   PCM (16 columns):                          1.1M
-  split_mlp (2D→d_inner→D):                 3.6M
-  mem_mlp (2D→d_inner→D, small-init):       3.6M
+  split_mlp (2D→d_inner→D, depth-scaled):    3.6M
+  mem_scale [D] (learnable per-dim scale):   ~0
   ln_final + lm_head (tied):                 ~0
 
 Memory:                                      58M
@@ -163,7 +163,7 @@ Grand total:                                 113M
 ## Gradient Flow
 
 ```
-CE loss → logits → upper scan → inject_memory(mem_mlp) → readout(mean over replicas)
+CE loss → logits → upper scan → inject_memory(mem_scale) → readout(sum / √N)
   → msgs[T steps, pass 2] → msg_MLP(msg_w1, msg_w2)
   → state_MLP(state_w1, state_w2)
   → input_vec = frozen_received + inject[t]

@@ -58,12 +58,12 @@ class V8Diagnostics:
             metrics["mem_hebbian_std"] = round(mg.hebbian_traces.std().item(), 4)
             metrics["mem_hebbian_max"] = round(mg.hebbian_traces.max().item(), 4)
 
-            # LM coupling — mem_mlp weight norms
+            # LM coupling — mem_scale stats
             lm = self.model.lm
-            metrics["mem_mlp_w1_norm"] = round(
-                lm.mem_mlp[0].weight.norm().item(), 4)
-            metrics["mem_mlp_w2_norm"] = round(
-                lm.mem_mlp[2].weight.norm().item(), 4)
+            metrics["mem_scale_mean"] = round(
+                lm.mem_scale.data.mean().item(), 4)
+            metrics["mem_scale_std"] = round(
+                lm.mem_scale.data.std().item(), 4)
 
             # Modulator param stats
             metrics["mod_w1_norm"] = round(mg.mod_w1.norm().item(), 4)

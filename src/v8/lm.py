@@ -13,6 +13,8 @@ Memory->CC: neuron messages averaged over replicas, combined via MLP, added to H
 Upper scan layers see memory-enriched + surprise-modulated input.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,24 +67,23 @@ class V8LM(nn.Module):
                 nn.SiLU(),
                 nn.Linear(config.d_inner, D),
             )
-            # Zero-init final layer: starts as identity-like (H passes through)
-            nn.init.zeros_(self.split_mlp[2].weight)
-            nn.init.zeros_(self.split_mlp[2].bias)
+            # Depth-scaled init: same pattern as scan layer proj_out.
+            # Kaiming (default) × 1/sqrt(2*L) — small residual at start,
+            # but nonzero so gradients flow to w1 and to surprise/PCM.
+            with torch.no_grad():
+                self.split_mlp[2].weight.mul_(1.0 / math.sqrt(2 * config.L_total))
         else:
             self.pcm = None
             self.split_mlp = None
 
-        # Memory injection MLP: combines H_mid + mem_readout → residual update
-        # Small init on final layer: starts near-identity (small residual)
-        # but allows gradients to flow to memory graph immediately.
-        # (Zero-init would block all gradient to memory since dL/d_mem = dL/d_H × w2 = 0)
-        self.mem_mlp = nn.Sequential(
-            nn.Linear(2 * D, config.d_inner),
-            nn.SiLU(),
-            nn.Linear(config.d_inner, D),
-        )
-        nn.init.normal_(self.mem_mlp[2].weight, std=0.01)
-        nn.init.zeros_(self.mem_mlp[2].bias)
+        # Memory injection: learnable per-dim scale, no MLP.
+        # Direct addition avoids backward attenuation from MLP weights.
+        # Scale initialized to balance magnitudes: readout ~0.078/elem,
+        # H_mid ~0.46/elem, so start at ~6 to match.
+        C_mem = D // config.D_neuron
+        N_per_slice = config.N_mem_neurons // C_mem
+        init_scale = N_per_slice ** 0.5  # undo the 1/sqrt(N) in readout
+        self.mem_scale = nn.Parameter(torch.full((D,), init_scale))
 
         # Output head
         self.ln_final = nn.LayerNorm(D_embed)
@@ -185,10 +186,11 @@ class V8LM(nn.Module):
         return H
 
     def inject_memory(self, H_mid: Tensor, mem_signals: Tensor) -> Tensor:
-        """Combine H_mid and memory readout via learned MLP (residual).
+        """Add scaled memory readout to H_mid.
 
-        Zero-init final layer: starts as identity (H_mid passes through),
-        learns to integrate memory signal as training progresses.
+        Direct addition with learnable per-dim scale — no MLP in the
+        gradient path. Gradient flows to memory with no attenuation
+        beyond the scale factor itself.
 
         Args:
             H_mid: [BS, T, D] — lower scan output (with autograd)
@@ -197,8 +199,7 @@ class V8LM(nn.Module):
         Returns:
             H_enriched: [BS, T, D] — memory-enriched hidden states
         """
-        mem_flat = mem_signals.to(H_mid.dtype)
-        return H_mid + self.mem_mlp(torch.cat([H_mid, mem_flat], dim=-1))
+        return H_mid + self.mem_scale * mem_signals.to(H_mid.dtype)
 
     def forward_output(self, H: Tensor) -> Tensor:
         """Output head only (memory injection happens mid-scan now).

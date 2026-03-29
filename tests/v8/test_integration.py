@@ -133,7 +133,7 @@ class TestGradientFlow:
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
         loss.backward()
 
-        assert any(p.grad is not None for p in model.lm.mem_mlp.parameters())
+        assert model.lm.mem_scale.grad is not None
         for i, layer in enumerate(model.lm.layers):
             has_grad = any(p.grad is not None and p.grad.norm() > 0
                           for p in layer.parameters())
@@ -158,8 +158,8 @@ class TestGradientFlow:
                 if p.requires_grad:
                     assert p.grad is not None, "split_mlp param should have grad"
 
-    def test_mem_mlp_gets_grad(self):
-        """mem_mlp should get gradients from memory path."""
+    def test_mem_scale_gets_grad(self):
+        """mem_scale should get gradients from memory path."""
         cfg = make_tiny()
         model = V8Model(cfg).float()
         model.initialize_states(BS)
@@ -173,10 +173,8 @@ class TestGradientFlow:
             result["logits"].reshape(-1, VOCAB), target_ids.reshape(-1))
         loss.backward()
 
-        for name, p in model.lm.mem_mlp.named_parameters():
-            if p.requires_grad:
-                assert p.grad is not None, f"mem_mlp.{name} should have grad"
-                assert p.grad.norm() > 0, f"mem_mlp.{name} grad should be nonzero"
+        assert model.lm.mem_scale.grad is not None, "mem_scale should have grad"
+        assert model.lm.mem_scale.grad.norm() > 0, "mem_scale grad should be nonzero"
 
 
 class TestParamCounts:

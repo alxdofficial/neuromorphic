@@ -141,10 +141,13 @@ class MemoryGraph(nn.Module):
         if self.use_dendritic_tree:
             nb, bs = self.n_branches, self.branch_size
             ng, bpg = self.n_groups, self.branches_per_group
+            # Mean = uniform average, noise breaks symmetry across branches/dims
             self.dendrite_branch_w = nn.Parameter(
-                torch.full((N, nb, bs, D), 1.0 / bs, device=device))
+                torch.full((N, nb, bs, D), 1.0 / bs, device=device)
+                + torch.randn(N, nb, bs, D, device=device) * (0.1 / bs))
             self.dendrite_group_w = nn.Parameter(
-                torch.full((N, ng, bpg, D), 1.0 / bpg, device=device))
+                torch.full((N, ng, bpg, D), 1.0 / bpg, device=device)
+                + torch.randn(N, ng, bpg, D, device=device) * (0.1 / bpg))
 
         # Inject/readout constants
         self.C_mem = config.C_mem

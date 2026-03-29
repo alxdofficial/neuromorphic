@@ -162,16 +162,16 @@ def plot_memory_health(records, output_path):
         fig, axes = plt.subplots(4, 3, figsize=(18, 18))
         fig.suptitle("Memory Graph Health", fontsize=14, fontweight="bold")
 
-        # mem_mlp norms
-        v1 = get(records, "mem_mlp_w1_norm")
-        v2 = get(records, "mem_mlp_w2_norm")
+        # mem_scale stats
+        v1 = get(records, "mem_scale_mean")
+        v2 = get(records, "mem_scale_std")
         if v1:
-            plot_line(axes[0, 0], v1, C["gate"], "w1")
+            plot_line(axes[0, 0], v1, C["gate"], "mean")
         if v2:
-            plot_line(axes[0, 0], v2, C["conn"], "w2 (zero-init)")
+            plot_line(axes[0, 0], v2, C["conn"], "std")
         if v1 or v2:
             axes[0, 0].legend()
-            setup(axes[0, 0], "Memory MLP Norms", "weight norm")
+            setup(axes[0, 0], "Memory Scale", "scale value")
 
         # w_conn
         v = get(records, "mem_w_conn_mean")
