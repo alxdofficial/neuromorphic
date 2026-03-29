@@ -107,9 +107,9 @@ class MemoryGraph(nn.Module):
         self.mod_b2 = nn.Parameter(torch.zeros(N, mod_output_dim, device=device))
 
         # --- Per-step state update MLP ---
-        # Input: cat(input_vec[D], h[D], decay[1]) = 2D+1
+        # Input: cat(input_vec[D], h[D]) = 2D (decay is structural, not concatenated)
         # w1 layout: [N, H, I] (transposed for contiguous Triton access)
-        state_in = 2 * D + 1
+        state_in = 2 * D
         H_state = config.state_mlp_hidden
         self.state_w1 = nn.Parameter(
             torch.randn(N, H_state, state_in, device=device) *
@@ -233,14 +233,17 @@ class MemoryGraph(nn.Module):
 
     def _state_mlp(self, input_vec: Tensor, h_prev: Tensor,
                    decay: Tensor) -> Tensor:
-        """Per-neuron state update: cat(input, h_prev, decay) → h_new.
+        """Per-neuron state update with structural decay (leaky integration).
 
-        decay (sigmoid of decay_logit) gives the MLP a persistence signal.
-        Architecture: Linear → tanh → Linear → tanh (bounded output).
+        h_new = decay * h_prev + (1 - decay) * tanh(MLP(input_vec, h_prev))
+
+        Decay is used structurally as a leak rate, not as an MLP input.
+        This bounds h naturally (convex combination of h_prev and tanh output),
+        gives the modulator direct control over persistence, and provides
+        a residual gradient path through the decay multiplication.
         """
         dt = self.state_w1.dtype
-        x = torch.cat([input_vec.to(dt), h_prev.to(dt),
-                        decay.to(dt).unsqueeze(-1)], dim=-1)  # [BS, N, 2D+1]
+        x = torch.cat([input_vec.to(dt), h_prev.to(dt)], dim=-1)  # [BS, N, 2D]
         hidden = torch.einsum(
             'bni,nhi->bnh', x, self.state_w1
         ) + self.state_b1
@@ -248,7 +251,9 @@ class MemoryGraph(nn.Module):
         out = torch.einsum(
             'bnh,nhd->bnd', hidden, self.state_w2
         ) + self.state_b2
-        return torch.tanh(out)
+        update = torch.tanh(out)
+        d = decay.to(dt).unsqueeze(-1)  # [BS, N, 1]
+        return d * h_prev.to(dt) + (1 - d) * update
 
     def _msg_mlp(self, h_new: Tensor, primitives: Tensor) -> Tensor:
         """Per-neuron message generation: cat(h_new, primitive) → msg.
