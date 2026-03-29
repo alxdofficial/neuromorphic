@@ -326,39 +326,29 @@ class MemoryGraph(nn.Module):
     # Inject / Readout (parameter-free)
     # ================================================================
 
-    def inject(self, H_mid_seg: Tensor) -> Tensor:
-        """H_mid segment → per-neuron CC signals by replication.
+    def _inject_single(self, H_mid_t: Tensor) -> Tensor:
+        """Single-token inject: [BS, D_lm] → [BS, N, D_neuron].
 
-        Args:
-            H_mid_seg: [BS, T_seg, D_lm] — detached LM hidden states
-
-        Returns:
-            inject_bc: [BS, T_seg, N, D_neuron]
+        Avoids materializing the full [BS, T, N, D] tensor (saves ~1.6 GB
+        at BS=48). Called per-step inside the token loop.
         """
-        BS, T_seg, D_lm = H_mid_seg.shape
-        slices = H_mid_seg.view(BS, T_seg, self.C_mem, self.config.D_neuron)
-        return slices.unsqueeze(3).expand(
-            -1, -1, -1, self.N_per_slice, -1
-        ).reshape(BS, T_seg, self.config.N_neurons, self.config.D_neuron)
+        BS = H_mid_t.shape[0]
+        slices = H_mid_t.view(BS, self.C_mem, self.config.D_neuron)
+        return slices.unsqueeze(2).expand(
+            -1, -1, self.N_per_slice, -1
+        ).reshape(BS, self.config.N_neurons, self.config.D_neuron)
 
-    def readout(self, msg_all: Tensor) -> Tensor:
-        """All neuron messages → LM hidden dim by 1/sqrt(N_per_slice) scaling.
+    def _readout_single(self, msg: Tensor) -> Tensor:
+        """Single-token readout: [BS, N, D_neuron] → [BS, D_lm].
 
-        Uses sum/sqrt(N) instead of mean (sum/N) to preserve gradient magnitude.
-        This was a key lesson from v8: 1/N readout kills gradients.
-
-        Args:
-            msg_all: [BS, T_seg, N, D_neuron]
-
-        Returns:
-            mem_out: [BS, T_seg, D_lm]
+        Avoids materializing the full [BS, T, N, D] msg_all tensor
+        (saves ~1.6 GB at BS=48). Called per-step inside the token loop.
         """
-        BS, T_seg = msg_all.shape[:2]
-        grouped = msg_all.view(
-            BS, T_seg, self.C_mem, self.N_per_slice, self.config.D_neuron)
-        # sum / sqrt(N_per_slice) instead of mean (sum / N_per_slice)
-        scaled = grouped.sum(dim=3) * (self.N_per_slice ** -0.5)
-        return scaled.reshape(BS, T_seg, self.config.D)
+        BS = msg.shape[0]
+        grouped = msg.view(
+            BS, self.C_mem, self.N_per_slice, self.config.D_neuron)
+        scaled = grouped.sum(dim=2) * (self.N_per_slice ** -0.5)
+        return scaled.reshape(BS, self.config.D)
 
     # ================================================================
     # Forward segment (differentiable)
@@ -395,41 +385,42 @@ class MemoryGraph(nn.Module):
         w_conn_sig = torch.sigmoid(w_conn)      # [BS, N, K]
         decay = torch.sigmoid(decay_logit)       # [BS, N]
 
-        # Inject: replicate H_mid → per-neuron signals
-        inject_all = self.inject(cc_signals)  # [BS, T_seg, N, D]
-
         # 2-pass simulation: freeze inter-neuron messages per pass,
         # run all steps with frozen messages + varying inject.
         # Pass 1: gather from initial prev_msg → run all steps
         # Pass 2: gather from Pass 1 end state → run all steps (refined)
         # Only 2 gathers instead of T_seg, massive speedup.
+        #
+        # Memory optimization: inject and readout are computed per-step
+        # to avoid materializing [BS, T, N, D] transients (~1.6 GB each).
         n_passes = 2
+        D_lm = self.config.D
         total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
 
         for pass_idx in range(n_passes):
             # ONE gather per pass — freeze inter-neuron messages
             received = self._fused_gather(prev_msg, w_conn_sig)  # [BS, N, D]
 
-            # Run all T steps with frozen received + varying inject
-            msgs = []
+            # Per-step: inject on the fly, readout incrementally
+            readouts = []
+            act_norms = []  # for phi plasticity (only norms, not full msgs)
             for t in range(T_seg):
-                input_vec = received + inject_all[:, t]
+                inject_t = self._inject_single(cc_signals[:, t])
+                input_vec = received + inject_t
                 h = self._state_mlp(input_vec, h, decay)
                 msg = self._msg_mlp(h, primitives)
                 msg = msg + self.neuron_id
                 prev_msg = msg
-                msgs.append(msg)
 
-                # Hebbian (only on last pass)
+                # Only collect outputs on last pass
                 if pass_idx == n_passes - 1:
+                    readouts.append(self._readout_single(msg))
                     msg_mag = msg.norm(dim=-1, keepdim=True)
                     total_hebbian = total_hebbian + msg_mag * w_conn_sig
+                    act_norms.append(msg.detach().float().norm(dim=-1))
 
-        # Stack messages from last pass: [BS, T_seg, N, D]
-        msg_all = torch.stack(msgs, dim=1)
-
-        # Readout: average replicas → [BS, T_seg, D_lm]
-        mem_out = self.readout(msg_all)
+        # Stack readouts: [BS, T_seg, D_lm] (not [BS, T_seg, N, D])
+        mem_out = torch.stack(readouts, dim=1)
 
         # Update persistent state (detached, for next segment)
         with torch.no_grad():
@@ -444,10 +435,8 @@ class MemoryGraph(nn.Module):
 
             # Structural plasticity: phi correlation from per-step activity
             if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation_ema')):
-                # act_trace: [BS, T_seg, N] — per-step message norms
-                act_trace = torch.stack(
-                    [m.detach().float().norm(dim=-1) for m in msgs], dim=1)
+                    hasattr(self, 'co_activation_ema') and act_norms):
+                act_trace = torch.stack(act_norms, dim=1)  # [BS, T_seg, N]
                 self._update_phi(act_trace)
 
             # Diagnostics

@@ -219,34 +219,34 @@ class TestMemoryGraphForward:
 
 
 class TestInjectReadout:
-    def test_inject_shape(self):
+    def test_inject_single_shape(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
-        cc = torch.randn(BS, cfg.action_every, cfg.D)
-        inject_bc = mg.inject(cc)
-        assert inject_bc.shape == (BS, cfg.action_every, cfg.N_neurons, cfg.D_neuron)
+        cc_t = torch.randn(BS, cfg.D)
+        inject_t = mg._inject_single(cc_t)
+        assert inject_t.shape == (BS, cfg.N_neurons, cfg.D_neuron)
 
     def test_inject_replication(self):
         """Each group of N_per_slice neurons should get the same slice."""
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
-        cc = torch.randn(BS, 1, cfg.D)
-        inject_bc = mg.inject(cc)
+        cc_t = torch.randn(BS, cfg.D)
+        inject_t = mg._inject_single(cc_t)
 
         nps = cfg.N_per_slice
         if nps > 1:
-            torch.testing.assert_close(inject_bc[:, 0, 0], inject_bc[:, 0, 1])
-            assert inject_bc.shape[2] == cfg.N_neurons
+            torch.testing.assert_close(inject_t[:, 0], inject_t[:, 1])
+            assert inject_t.shape[1] == cfg.N_neurons
 
-    def test_readout_shape(self):
+    def test_readout_single_shape(self):
         cfg = make_tiny()
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
-        msgs = torch.randn(BS, cfg.action_every, cfg.N_neurons, cfg.D_neuron)
-        out = mg.readout(msgs)
-        assert out.shape == (BS, cfg.action_every, cfg.D)
+        msg = torch.randn(BS, cfg.N_neurons, cfg.D_neuron)
+        out = mg._readout_single(msg)
+        assert out.shape == (BS, cfg.D)
 
     def test_readout_scales_replicas(self):
         """Readout should use 1/sqrt(N_per_slice) scaling."""
@@ -254,16 +254,16 @@ class TestInjectReadout:
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
 
-        msgs = torch.zeros(BS, 1, cfg.N_neurons, cfg.D_neuron)
+        msg = torch.zeros(BS, cfg.N_neurons, cfg.D_neuron)
         nps = cfg.N_per_slice
         for i in range(nps):
-            msgs[:, :, i, :] = 1.0
+            msg[:, i, :] = 1.0
 
-        out = mg.readout(msgs)
+        out = mg._readout_single(msg)
         # sum=nps, scaled by 1/sqrt(nps)
         expected = nps ** 0.5
         torch.testing.assert_close(
-            out[:, 0, :cfg.D_neuron],
+            out[:, :cfg.D_neuron],
             torch.full((BS, cfg.D_neuron), expected))
 
     def test_inject_readout_roundtrip(self):
@@ -272,11 +272,11 @@ class TestInjectReadout:
         mg = MemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         mg.initialize_states(BS)
 
-        cc = torch.randn(BS, 1, cfg.D)
-        inject_bc = mg.inject(cc)
-        recovered = mg.readout(inject_bc)
+        cc_t = torch.randn(BS, cfg.D)
+        inject_t = mg._inject_single(cc_t)
+        recovered = mg._readout_single(inject_t)
         # Readout uses 1/sqrt(N) scaling, so recovered = cc * sqrt(N_per_slice)
-        expected = cc * (cfg.N_per_slice ** 0.5)
+        expected = cc_t * (cfg.N_per_slice ** 0.5)
         torch.testing.assert_close(recovered, expected)
 
 
