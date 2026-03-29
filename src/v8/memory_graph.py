@@ -30,6 +30,7 @@ from .config import V8Config
 # Try to import Triton kernels
 try:
     from .triton_kernels import fused_dendritic_gather as _triton_gather
+    from .triton_kernels import fused_neuron_step as _triton_step
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -393,17 +394,20 @@ class MemoryGraph(nn.Module):
         #
         # Memory optimization: inject and readout are computed per-step
         # to avoid materializing [BS, T, N, D] transients (~1.6 GB each).
-        n_passes = 2
         D_lm = self.config.D
         total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
 
+        # 2-pass simulation: freeze inter-neuron messages per pass,
+        # run all steps with frozen messages + varying inject.
+        # Both passes stay on the autograd graph — pass 2's gradient flows
+        # back through pass 1's prev_msg to the modulator.
+        n_passes = 2
+
         for pass_idx in range(n_passes):
-            # ONE gather per pass — freeze inter-neuron messages
             received = self._fused_gather(prev_msg, w_conn_sig)  # [BS, N, D]
 
-            # Per-step: inject on the fly, readout incrementally
             readouts = []
-            act_norms = []  # for phi plasticity (only norms, not full msgs)
+            act_norms = []
             for t in range(T_seg):
                 inject_t = self._inject_single(cc_signals[:, t])
                 input_vec = received + inject_t
