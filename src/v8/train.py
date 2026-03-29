@@ -285,7 +285,8 @@ def main():
             }
             if model.memory.is_initialized():
                 ckpt["memory_state"] = {
-                    k: v.clone() for k, v in model.memory.runtime_state_dict().items()}
+                    k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in model.memory.runtime_state_dict().items()}
             # Save dataset position using the trainer's step (not the
             # dataset's internal counter, which may be ahead due to prefetch).
             ckpt["dataloader_state"] = {"step_count": step}
