@@ -496,9 +496,10 @@ class MemoryGraph(nn.Module):
         self._co_activation_ready = True
 
     def rewire_connections(self):
-        """Phi-based structural plasticity: prune anti-correlated, grow
-        toward highest correlation. 20% random exploration.
+        """Structural plasticity: swap weakest connections for strongest.
 
+        Uses phi correlation for ranking, 20% random exploration.
+        Always swaps n_swap connections per neuron — doesn't gate on phi < 0.
         Called at chunk boundaries. Non-differentiable.
         """
         if not self.config.structural_plasticity:
@@ -513,53 +514,47 @@ class MemoryGraph(nn.Module):
         n_swap = min(self.config.plasticity_n_swap, K)
         explore_frac = self.config.plasticity_exploration_frac
         phi = self.co_activation_ema
+        phi.fill_diagonal_(0.0)
         device = phi.device
 
         conn = self.conn_indices  # [N, K]
 
         with torch.no_grad():
-            total_swaps = 0
             for n in range(N):
                 current_neighbors = conn[n]  # [K]
                 conn_phi = phi[n, current_neighbors]  # [K]
 
-                # Prune: find the worst connection (most anti-correlated)
-                worst_phi, worst_k = conn_phi.min(dim=-1)
-                if worst_phi >= 0:
-                    continue  # no anti-correlated connections to prune
+                # Find n_swap weakest current connections
+                _, weakest_idx = conn_phi.topk(n_swap, largest=False)
 
                 # Mask out current connections + self
                 mask = torch.ones(N, device=device, dtype=torch.bool)
                 mask[current_neighbors] = False
                 mask[n] = False
 
-                # Best candidate by correlation
-                phi_masked = phi[n].clone()
-                phi_masked[~mask] = -float('inf')
-                best_target = phi_masked.argmax()
-                best_phi_val = phi_masked[best_target]
+                # Find n_swap strongest non-connected neurons
+                candidates = phi[n].clone()
+                candidates[~mask] = -float('inf')
+                _, strongest_new = candidates.topk(n_swap, largest=True)
 
-                # Random candidate
+                # 20% exploration: replace some with random targets
                 valid_indices = mask.nonzero(as_tuple=True)[0]
-                if valid_indices.shape[0] == 0:
-                    continue
-                rand_idx = torch.randint(valid_indices.shape[0], (1,),
-                                         device=device)
-                random_target = valid_indices[rand_idx.item()]
+                if valid_indices.shape[0] >= n_swap:
+                    rand_perm = torch.randperm(
+                        valid_indices.shape[0], device=device)[:n_swap]
+                    random_targets = valid_indices[rand_perm]
+                    use_random = torch.rand(
+                        n_swap, device=device) < explore_frac
+                    strongest_new = torch.where(
+                        use_random, random_targets, strongest_new)
 
-                # 20% exploration or when best candidate isn't positive
-                use_random = (torch.rand(1, device=device).item()
-                              < explore_frac) or (best_phi_val <= 0)
-                new_target = random_target if use_random else best_target
-
-                conn[n, worst_k] = new_target
-                total_swaps += 1
+                conn[n, weakest_idx] = strongest_new
 
             # Re-sort for efficient gather
             sorted_idx, _ = conn.sort(dim=-1)
             self.conn_indices.copy_(sorted_idx)
 
-        self._last_rewire_swaps = total_swaps
+        self._last_rewire_swaps = n_swap * N
 
     # ================================================================
     # State management
