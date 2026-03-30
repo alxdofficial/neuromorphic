@@ -40,22 +40,11 @@ class V10Model(nn.Module):
         if config.tie_embeddings:
             self.decoder.lm_head.weight = self.lm.embedding.weight
 
-        # Memory graph imported lazily (may not be created yet by agent)
-        self._memory = None
-        self._states_initialized = False
+        # Create memory graph eagerly (not lazily) so .to() works properly
+        from .memory_graph import MemoryGraph
+        self.memory = MemoryGraph(config, device=torch.device('cpu'))
 
-    @property
-    def memory(self):
-        if self._memory is None:
-            from .memory_graph import MemoryGraph
-            self._memory = MemoryGraph(
-                self.config,
-                device=next(self.parameters()).device,
-            )
-            # Move to same device/dtype as model
-            device = next(self.parameters()).device
-            self._memory = self._memory.to(device)
-        return self._memory
+        self._states_initialized = False
 
     def forward_chunk(
         self,
@@ -69,45 +58,79 @@ class V10Model(nn.Module):
         Args:
             input_ids: [BS, T]
             target_ids: [BS, T] (unused here, for API compat)
-            reset_mask: [BS, T] bool — document boundaries
+            reset_mask: [BS] or [BS, T] bool — document boundaries
             use_memory: if False, skip memory graph (baseline mode)
 
         Returns:
             dict with 'logits', 'aux_loss'
         """
         BS, T = input_ids.shape
+        device = input_ids.device
+        eot_id = self.config.eot_id
 
-        # Detect internal EOS for reset
-        if reset_mask is None:
-            eos_positions = (input_ids == self.config.eot_id)
-            internal_reset = torch.zeros_like(eos_positions)
-            internal_reset[:, 1:] = eos_positions[:, :-1]
-            if eos_positions.any():
-                reset_mask = internal_reset
+        # Build internal reset mask: [BS, T] bool
+        # Merge chunk-boundary reset (from caller) with internal EOS detection
+        eos_positions = (input_ids == eot_id)
+        internal_reset = torch.zeros(BS, T, dtype=torch.bool, device=device)
+        internal_reset[:, 1:] = eos_positions[:, :-1]
+
+        # Merge with caller-provided reset_mask
+        if reset_mask is not None:
+            if reset_mask.dim() == 1:
+                # [BS] → mark position 0 for reset
+                internal_reset[:, 0] |= reset_mask
+            else:
+                # [BS, T] → merge
+                internal_reset |= reset_mask
+
+        scan_reset = internal_reset if internal_reset.any() else None
 
         # 1. Lower scan + PCM → H_inject
-        H_inject, aux_loss = self.lm(input_ids, reset_mask=reset_mask)
+        H_inject, aux_loss = self.lm(input_ids, reset_mask=scan_reset)
 
         if not use_memory:
             # Baseline: decoder gets H_inject directly as word_states
-            # Reshape to [BS, T, num_words, D_scan] by repeating
             word_states = H_inject.unsqueeze(2).expand(
                 -1, -1, self.config.num_words, -1)
             logits = self.decoder(word_states)
             return {"logits": logits, "aux_loss": aux_loss}
 
         # 2. Memory graph simulation
-        mg = self.memory
         if not self._states_initialized:
-            mg.initialize_states(BS)
+            self.memory.initialize_states(BS)
             self._states_initialized = True
 
-        word_states = mg.forward_segment(H_inject)  # [BS, T, num_words, D_scan]
+        # Reset memory state for batch elements with EOS
+        if eos_positions.any():
+            self._reset_memory_for_eos(eos_positions)
+
+        word_states = self.memory.forward_segment(H_inject)
 
         # 3. Decoder → logits
-        logits = self.decoder(word_states)
+        # Build decoder reset mask for document boundaries
+        # The decoder's self-attention should not attend across EOS
+        logits = self.decoder(word_states, reset_mask=internal_reset)
 
         return {"logits": logits, "aux_loss": aux_loss}
+
+    def _reset_memory_for_eos(self, eos_positions: Tensor):
+        """Reset memory state for batch elements containing EOS.
+
+        Args:
+            eos_positions: [BS, T] bool — True where input_ids == eot_id
+        """
+        # Any batch element with an EOS gets its memory reset
+        has_eos = eos_positions.any(dim=1)  # [BS]
+        if not has_eos.any():
+            return
+
+        mg = self.memory
+        mask = has_eos.to(dtype=mg.h.dtype).unsqueeze(-1)  # [BS, 1]
+
+        with torch.no_grad():
+            # Zero out h and messages for batch elements with EOS
+            mg.h = mg.h * (1 - mask.unsqueeze(-1))
+            mg.messages = mg.messages * (1 - mask.unsqueeze(-1))
 
     def initialize_states(self, BS: int):
         """Initialize all runtime state."""

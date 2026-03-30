@@ -65,7 +65,8 @@ class V10Trainer:
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
 
         eot_id = self.config.eot_id
-        reset_mask = batch.prev_token.to(self.device, non_blocking=True) == eot_id
+        # Chunk-boundary reset: [BS] bool — True if previous chunk ended with EOS
+        chunk_reset = (batch.prev_token.to(self.device, non_blocking=True) == eot_id)
 
         t_start = time.time()
 
@@ -77,7 +78,7 @@ class V10Trainer:
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
-                reset_mask=reset_mask,
+                reset_mask=chunk_reset,
                 use_memory=self.use_memory)
 
         logits = result["logits"]

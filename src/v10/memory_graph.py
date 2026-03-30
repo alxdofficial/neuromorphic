@@ -503,6 +503,19 @@ class MemoryGraph(nn.Module):
             use_random = torch.rand(n_prune, device=device) < explore_frac
             grow_target = torch.where(use_random, rand_targets, grow_target)
 
+            # Prevent self-connections and duplicate edges
+            for i in range(n_prune):
+                n_idx = prune_n[i].item()
+                target = grow_target[i].item()
+                # No self-connections
+                if target == n_idx:
+                    target = (target + 1) % N
+                # No duplicates: check if target already exists in this neuron's connections
+                existing = conn[n_idx].tolist()
+                while target in existing or target == n_idx:
+                    target = (target + 1) % N
+                grow_target[i] = target
+
             # Apply: replace pruned connections with new targets
             conn[prune_n, prune_k] = grow_target
 

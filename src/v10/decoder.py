@@ -150,6 +150,35 @@ def _build_causal_mask(T: int, device: torch.device) -> Tensor:
     return torch.tril(torch.ones(T, T, dtype=torch.bool, device=device))
 
 
+def _apply_doc_boundary_mask(
+    causal_mask: Tensor, reset_mask: Tensor,
+) -> Tensor:
+    """Block self-attention across document boundaries.
+
+    At positions where reset_mask is True, no earlier position should be
+    visible. This prevents information leaking from a previous document
+    to the current one within a chunk.
+
+    Args:
+        causal_mask: [T, T] bool — base causal mask
+        reset_mask: [BS, T] bool — True at document boundary positions
+
+    Returns:
+        masked: [T, T] bool — causal mask with doc boundaries applied
+        (uses the union of all batch elements' boundaries for simplicity)
+    """
+    T = causal_mask.shape[0]
+    # Find any-batch boundary positions
+    any_reset = reset_mask.any(dim=0)  # [T]
+    # Build segment IDs: increment at each boundary
+    seg_ids = any_reset.long().cumsum(dim=0)  # [T]
+    # Positions can only attend to same-segment or earlier visible positions
+    # same_segment[i, j] = True if seg_ids[i] == seg_ids[j]
+    same_segment = seg_ids.unsqueeze(0) == seg_ids.unsqueeze(1)  # [T, T]
+    # Allow attention only within same document segment AND causal
+    return causal_mask & same_segment
+
+
 def _build_sliding_window_cross_mask(
     T: int, num_words: int, W: int, device: torch.device,
 ) -> Tensor:
@@ -235,12 +264,15 @@ class SlidingWindowDecoder(nn.Module):
         if tie_embeddings is not None:
             self.lm_head.weight = tie_embeddings
 
-    def forward(self, word_states: Tensor) -> Tensor:
+    def forward(self, word_states: Tensor,
+                reset_mask: Tensor | None = None) -> Tensor:
         """
         Args:
             word_states: [BS, T, num_words, D_scan]
                 Memory graph neuron states grouped into words,
                 collected at every simulation step.
+            reset_mask: [BS, T] bool — True at document boundaries.
+                Self-attention is blocked across these boundaries.
 
         Returns:
             logits: [BS, T, vocab_size]
@@ -258,6 +290,11 @@ class SlidingWindowDecoder(nn.Module):
 
         # Build masks (once, reused across layers)
         causal_mask = _build_causal_mask(T, device)
+
+        # Block self-attention across document boundaries within a chunk
+        if reset_mask is not None and reset_mask.any():
+            causal_mask = _apply_doc_boundary_mask(causal_mask, reset_mask)
+
         cross_mask = _build_sliding_window_cross_mask(
             T, num_words, self.W_sliding, device)
 
