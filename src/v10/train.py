@@ -140,10 +140,14 @@ def main():
         print("\n*** MEMORY DISABLED -- LM-only baseline ***")
 
     # Optimizer -- three param groups: lm, memory, decoder
+    # Track param ids to avoid duplicates (tied embeddings)
+    seen_ids = set()
+
     lm_decay, lm_no_decay = [], []
     for name, param in model.lm.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in seen_ids:
             continue
+        seen_ids.add(id(param))
         if param.ndim <= 1 or name.endswith(".bias"):
             lm_no_decay.append(param)
         else:
@@ -152,8 +156,9 @@ def main():
     mem_lr = args.lr * config.mem_lr_scale
     mem_decay, mem_no_decay = [], []
     for name, param in model.memory.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in seen_ids:
             continue
+        seen_ids.add(id(param))
         if param.ndim <= 1 or name.endswith(".bias"):
             mem_no_decay.append(param)
         else:
@@ -161,8 +166,9 @@ def main():
 
     dec_decay, dec_no_decay = [], []
     for name, param in model.decoder.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in seen_ids:
             continue
+        seen_ids.add(id(param))
         if param.ndim <= 1 or name.endswith(".bias"):
             dec_no_decay.append(param)
         else:

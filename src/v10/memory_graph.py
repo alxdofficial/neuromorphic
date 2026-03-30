@@ -364,11 +364,19 @@ class MemoryGraph(nn.Module):
             inject_t = self._inject_single(
                 cc_signals[:, t].to(self.dtype))
 
-            # Run one neuron step
-            h, msgs, w_conn, decay, identity = self.neuron_step(
-                h=h, msgs=msgs, inject=inject_t,
-                identity=identity, edge_index=edge_index,
-                w_conn=w_conn, hebbian=hebbian,
+            # Run one neuron step with gradient checkpointing
+            # Recomputes forward during backward instead of saving
+            # all MLP activations (saves ~18 GB at BS=2, N=4096, T=128)
+            def _step_fn(h_, msgs_, inject_, identity_, w_conn_, hebbian_):
+                return self.neuron_step(
+                    h=h_, msgs=msgs_, inject=inject_,
+                    identity=identity_, edge_index=edge_index,
+                    w_conn=w_conn_, hebbian=hebbian_,
+                )
+
+            h, msgs, w_conn, decay, identity = torch.utils.checkpoint.checkpoint(
+                _step_fn, h, msgs, inject_t, identity, w_conn, hebbian,
+                use_reentrant=False,
             )
 
             # Update hebbian traces (detached from autograd)
@@ -414,30 +422,35 @@ class MemoryGraph(nn.Module):
     def _update_phi(self, act_trace: Tensor):
         """Compute Pearson phi from per-step activity traces, EMA-smooth.
 
+        Loops over batch elements to avoid [BS, N, N] intermediate
+        (would be 3 GB at BS=48, N=4096). Each iteration is [N, N] = 64 MB.
+
         Args:
             act_trace: [BS, T_seg, N] -- per-step message norms
         """
         BS, T_seg, N = act_trace.shape
+        device = act_trace.device
 
-        # Binary firing: 1 if above 75th percentile (per batch element)
-        threshold = torch.quantile(
-            act_trace, 0.75, dim=1, keepdim=True)  # [BS, 1, N]
-        fired = (act_trace > threshold).float()       # [BS, T_seg, N]
+        phi_accum = torch.zeros(N, N, device=device, dtype=torch.float32)
 
-        # Pearson correlation (phi coefficient)
-        p_i = fired.mean(dim=1, keepdim=True)         # [BS, 1, N]
-        fired_centered = fired - p_i                   # [BS, T_seg, N]
-        var_i = (p_i * (1 - p_i)).squeeze(1).clamp(min=1e-8)  # [BS, N]
-        cov = torch.bmm(
-            fired_centered.transpose(1, 2),
-            fired_centered,
-        ) / T_seg                                      # [BS, N, N]
-        std_i = var_i.sqrt().unsqueeze(2)              # [BS, N, 1]
-        std_j = var_i.sqrt().unsqueeze(1)              # [BS, 1, N]
-        phi = cov / (std_i * std_j).clamp(min=1e-8)   # [BS, N, N]
+        for b in range(BS):
+            trace_b = act_trace[b]  # [T_seg, N]
 
-        # Average over batch, EMA update
-        phi_mean = phi.mean(dim=0)  # [N, N]
+            # Binary firing: 1 if above 75th percentile
+            threshold = torch.quantile(trace_b, 0.75, dim=0, keepdim=True)
+            fired = (trace_b > threshold).float()  # [T_seg, N]
+
+            # Pearson correlation
+            p_i = fired.mean(dim=0, keepdim=True)       # [1, N]
+            fired_centered = fired - p_i                  # [T_seg, N]
+            var_i = (p_i * (1 - p_i)).squeeze(0).clamp(min=1e-8)  # [N]
+            cov = (fired_centered.T @ fired_centered) / T_seg  # [N, N]
+            std_i = var_i.sqrt().unsqueeze(1)            # [N, 1]
+            std_j = var_i.sqrt().unsqueeze(0)            # [1, N]
+            phi_accum += cov / (std_i * std_j).clamp(min=1e-8)
+
+        phi_mean = phi_accum / BS
+
         ca_decay = self.config.co_activation_ema_decay
         self.co_activation_ema = (
             ca_decay * self.co_activation_ema
