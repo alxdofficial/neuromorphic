@@ -41,24 +41,22 @@ Tokens → Embedding → Lower Scan (sensory cortex, small, fast)
                           |
                     Memory Graph (sequential, 1 step/token)
                     N=4096 neurons, D=32, K sparse connections
-                    Shared MLPs, rolling window of activations
+                    Shared MLPs conditioned on neuron identity
                           |
-                    Group neurons into "words":
-                    64 neurons × 32 dims = 2048-dim word
-                    4096/64 = 64 words
-                          |
-                    Perceiver: compress W=16 timesteps → 1 vec/word
-                    → 64 memory words [64, D_scan]
+                    Collect word_states at every step
+                    word_states: [T, 64 words, D_scan]
                           |
                     Upper Decoder (frontal cortex)
-                    Causal cross-attention to 64 memory words
-                    Few layers with FFN
-                    → logits [BS, 1, vocab]   (one token at a time)
+                    Runs ONCE after full segment simulation
+                    All T tokens in parallel (standard causal training)
+                    Self-attention (causal mask)
+                    Cross-attention to word_states (causal sliding window, W=16)
+                    → logits [BS, T, vocab]
 ```
 
 The memory graph is the ONLY path from input to output. No H_mid skip connection
-to the decoder. This forces the memory to carry all information — short-term
-context comes from the rolling window of recent activations, not from a bypass.
+to the decoder. Short-term context comes from the sliding window of word_states
+(last W=16 timesteps visible per token).
 
 ---
 
@@ -66,12 +64,12 @@ context comes from the rolling window of recent activations, not from a bypass.
 
 Each token t triggers one simulation step. All neurons execute simultaneously
 (parallel matrix ops via shared weights). Messages from the CURRENT step's
-neighbors are used (true sequential, not frozen multi-pass).
+neighbors are used (true sequential, no frozen multi-pass).
 
 ### Step 1: MODULATE (shared modulator MLP)
 
-Runs first so its effects on connection weights and identity are visible
-to the loss through the subsequent gather/update/message ops.
+Runs first so its effects on connection weights, decay, and identity are
+visible to the loss through the subsequent gather/update/message ops.
 
 ```
 Input:  cat(hebbian[n], h[n], identity[n])     — [N, K + D + D_id]
@@ -83,7 +81,7 @@ identity[n] += identity_delta[n]
 The modulator adjusts:
 - **w_conn**: scalar connection strengths (sigmoid → [0,1] for gather weighting)
 - **decay**: per-neuron persistence rate (sigmoid → [0,1] for leaky integration)
-- **identity**: the neuron's learned embedding (allows identity to evolve during a segment)
+- **identity**: the neuron's learned embedding (evolves during a segment)
 
 The modulator does NOT write to h — state only changes through the receive→update path.
 
@@ -94,7 +92,7 @@ neighbor_msgs = messages[conn_indices[n]]       — [N, K, D]
 received[n] = sum_k(sigmoid(w_conn[n,k]) * neighbor_msgs[k])  — [N, D]
 ```
 
-Sparse index lookup + weighted sum. O(N×K×D). Same as v9.
+Sparse index lookup + weighted sum via PyG's `propagate()`. O(N×K×D).
 
 ### Step 3: UPDATE STATE (shared state MLP + structural decay)
 
@@ -107,8 +105,7 @@ h[n] = decay[n] * h[n] + (1 - decay[n]) * update
 ```
 
 Structural decay (leaky integration) bounds h naturally. The modulator
-controls persistence per-neuron through decay. tanh on the update ensures
-the new contribution is bounded.
+controls persistence per-neuron through decay.
 
 ### Step 4: PRODUCE MESSAGE (shared message MLP)
 
@@ -119,96 +116,69 @@ Output: msg[n]                     — [N, D]
 msg[n] = tanh(shared_msg_MLP(input))
 ```
 
-### Step 5: STORE (detached, circular buffer)
+### Step 5: COLLECT WORD STATE (on autograd graph)
+
+Group neuron states into words and store for the decoder:
 
 ```
-rolling_window[n, ptr % W] = h[n].detach()
-ptr += 1
+word_states[t] = h.view(num_words, neurons_per_word * D)  — [64, 2048]
 ```
 
-The window persists across segments. Never reset. W=16 (stores last 16
-token steps). Detached so the decoder's gradient doesn't flow backward
-through the entire window history — only the current step's computation
-is on the autograd graph.
-
-### Step 6: READOUT + STORE for decoder
-
-The current step's readout (on the autograd graph, not detached) is computed
-and stored for the decoder to consume:
-
-```
-readout[t] = current neuron states grouped into words
-```
-
----
-
-## Rolling Window and Perceiver
-
-### Window Structure
-
-```
-rolling_window: [N, W, D]   — circular buffer, W=16
-```
-
-At each token t, the window contains the last W neuron state snapshots
-(detached). This is the "short-term memory" — recent activation history
-that the decoder cross-attends to.
-
-### Grouping into Words
-
-Neurons are grouped into fixed "words" (determined at initialization, never
-changed — like physical neuron locations in the brain):
-
-```
-N=4096 neurons, D=32, D_scan=2048
-Neurons per word: D_scan / D = 64
-Number of words: N / 64 = 64
-
-word[w, t] = concat(h[w*64 : (w+1)*64, t])   — [2048]
-```
-
-Each word is a 2048-dim vector formed by concatenating 64 neurons' 32-dim states.
-
-### Perceiver Compression
-
-For each word, compress its W=16 timestep history into one vector:
-
-```
-word_history[w]: [W, D_scan]     — 16 timesteps of this word
-learned_query:   [1, D_scan]     — one learnable query per word (or shared)
-output[w] = cross_attention(query=learned_query, kv=word_history[w])  — [D_scan]
-```
-
-This produces 64 memory words, each D_scan-dim, summarizing the recent
-temporal trajectory of that neuron group.
+All T word_states are collected on the autograd graph. The decoder receives
+`word_states: [T, 64, D_scan]` and cross-attends with causal sliding window.
 
 ---
 
 ## Upper Decoder (Frontal Cortex)
 
-Causal, autoregressive. Predicts one token at a time.
+Runs ONCE after the memory graph simulates all T steps. Processes all T
+tokens in parallel using standard causal training.
 
 ### Input
 
-At token position t, the decoder receives:
-- 64 memory words from the perceiver (each [D_scan])
-- Its own previous hidden state / token embedding (for autoregressive context)
+- **Queries**: token position embeddings or a learned sequence [T, D_dec]
+- **KV for cross-attention**: word_states [T, 64, D_scan] with causal sliding window mask
+
+### Causal Sliding Window Cross-Attention
+
+Token t can only attend to word_states from steps `[max(0, t-W+1), ..., t]`.
+This is implemented as a mask on the cross-attention:
+
+```
+mask[t, s] = True   if max(0, t-W+1) <= s <= t
+             False  otherwise
+```
+
+W=16 means each token sees the last 16 timesteps of memory word evolution.
+This preserves causality (no future information leaks) and captures temporal
+patterns in neuron activity.
 
 ### Architecture
 
 ```
 For each layer (L_decoder layers):
-  self_attention(causal)       — attend to previous decoder states
-  cross_attention              — attend to 64 memory words
-  FFN                          — feed-forward processing
+  RMSNorm → self_attention(causal)          — attend to previous decoder states
+  RMSNorm → cross_attention(sliding_window) — attend to word_states
+  RMSNorm → FFN                             — feed-forward processing
 ```
 
 ### Output
 
-Final layer → linear projection → logits [vocab_size]
+Final layer → RMSNorm → linear projection → logits [BS, T, vocab_size]
 
-No separate lm_head — the decoder IS the language model head. Its job is
-to read from memory and predict the next token.
+No separate lm_head — the decoder IS the language model head.
+
+### Cross-Chunk Context
+
+At the start of a new chunk, the decoder has no self-attention history
+(carries are not stored for the decoder). However, the memory graph's h
+and messages persist across chunks, and the first W=16 word_states in
+the new chunk reflect memory from the previous chunk's final states.
+
+Optionally: carry the last W=16 word_states from the previous chunk
+as prefix KV for the decoder's cross-attention. This gives the decoder
+immediate access to previous-chunk memory at token 0. Cost: [W, 64, D_scan]
+≈ 4 MB, fixed.
 
 ---
 
@@ -238,15 +208,15 @@ Same replication scheme as v9. Each group of 64 neurons sees the same
 ### No explicit readout to H_mid
 
 The memory graph does NOT feed back into a residual stream. Instead,
-the decoder directly cross-attends to the memory words. This eliminates
-the readout scaling / gradient attenuation issues from v9.
+the decoder directly cross-attends to word_states with a sliding window.
+This eliminates readout scaling / gradient attenuation issues from v9.
 
 ---
 
 ## Structural Plasticity
 
 Same as v9-backprop:
-- Phi correlation: Pearson coefficient from binary firing patterns (75th percentile threshold)
+- Phi correlation: Pearson coefficient from binary firing patterns (75th percentile)
 - EMA-smoothed co-activation matrix [N, N]
 - Global percentile prune/grow: bottom 2% pruned, top 2% created
 - 20% random exploration
@@ -255,128 +225,113 @@ Same as v9-backprop:
 
 ---
 
+## Memory Budget
+
+### Per-segment tensors (recomputed each segment, not stored across chunks)
+
+```
+word_states: [T, 64, D_scan] = [128, 64, 2048] × bf16    ≈ 32 MB
+decoder KV cache: [L_dec, T, D_dec] × bf16                ≈ small
+```
+
+### Persistent state (carried across chunks)
+
+```
+h:            [BS, N, D]     = [48, 4096, 32] × bf16      ≈ 12 MB
+messages:     [BS, N, D]     = [48, 4096, 32] × bf16      ≈ 12 MB
+identity:     [N, D_id]      = [4096, 32] × f32           ≈ 0.5 MB
+w_conn:       [BS, N, K]     = [48, 4096, 32] × bf16      ≈ 12 MB
+hebbian:      [BS, N, K]     = [48, 4096, 32] × bf16      ≈ 12 MB
+co_act_ema:   [N, N]         = [4096, 4096] × f32         ≈ 64 MB
+cross-chunk word carry: [W, 64, D_scan] × bf16            ≈ 4 MB
+```
+
+Total persistent: ~117 MB (fixed, does not grow with training)
+
+---
+
 ## Gradient Flow Analysis
 
-### Why this design has better gradient flow than v9:
+### Gradient path (improved vs v9)
 
-**v9 bottleneck chain:**
 ```
-loss → upper_scan → mem_scale → readout(avg) → msgs → MLPs → modulator
-                                    ↑
-                              19.6× MLP attenuation (removed)
-                              0.125× readout scaling
-                              high-dim dot product (gather backward)
-```
-
-**v10 gradient path:**
-```
-loss → decoder → cross_attention → memory words → perceiver → neuron states
-                                                                    ↑
-                                              direct gradient to h[n] at current step
-                                              → state_MLP (shared, large)
-                                              → received → gather → w_conn → modulator
+loss → decoder logits
+  → decoder cross_attention → word_states[t] (on graph)
+  → h[n] at step t (grouped into words)
+  → state_MLP(received, inject, h_prev, identity)   — shared, large matmul
+  → received → gather(msgs, w_conn_sig)              — sparse scatter backward
+  → w_conn → modulator(hebbian, h, identity)         — shared modulator
 ```
 
-Key improvements:
-1. **No readout averaging** — decoder attends to individual words, preserving spatial patterns
-2. **No mem_scale/mem_mlp bottleneck** — cross-attention provides direct gradient
-3. **Shared MLPs are larger** — bigger hidden dim = better gradient flow per step
-4. **Sequential (not frozen 2-pass)** — true message propagation, simpler gradient graph
+### Key improvements over v9:
+- **No readout averaging** — cross-attention attends to word patterns directly
+- **No mem_scale/mem_mlp bottleneck** — cross-attention provides direct gradient to h
+- **Shared MLPs = large matmuls** — GPU-efficient, better gradient flow
+- **Every timestep gets gradient** — decoder attends to all T word_states, each step's h gets gradient through its word_state contribution
+- **Sequential (not frozen 2-pass)** — simpler gradient graph
 
-### Potential gradient concerns:
-
-1. **128 sequential steps** with shared weights — gradient to early steps flows
-   through 128 MLP applications. With shared weights, each step's gradient
-   contribution to the weights is independent (doesn't need to flow through
-   the chain). Same as any RNN with shared weights — the per-step gradient
-   sums over all timesteps.
-
-2. **Decoder cross-attention to memory words** — the gradient from the decoder
-   reaches the current step's neuron states directly through the perceiver.
-   It does NOT flow backward through the rolling window (detached). So the
-   gradient signal is fresh each step, not attenuated by history.
-
-3. **Modulator gradient** — still goes through the gather backward
-   (high-dimensional dot product issue from v9). But with larger shared MLPs
-   and more neurons, the signal is stronger. And the modulator has more
-   leverage (4096 neurons to differentiate vs 512).
-
-4. **tanh saturation** — state and message MLPs output tanh. With shared
-   weights and proper initialization (Xavier with gain for tanh), saturation
-   should be minimal. Monitor during training.
+### Gradient concerns:
+- **Gather backward dot product** — same high-dim orthogonality issue as v9 for w_conn gradient. Mitigated by larger shared MLPs.
+- **128 sequential steps** — shared weights get summed gradient from all T steps (standard RNN behavior). No vanishing through the chain since each step's word_state provides independent gradient.
+- **tanh saturation** — monitor during training. Xavier init with tanh gain.
 
 ---
 
 ## Normalization and Magnitude Balancing
 
 ### Inject magnitude
-
-H_mid ≈ 0.46/elem (from v9 measurements). After slicing to D=32, each
-inject signal is a 32-dim vector with ≈0.46/elem. The received signal
-from neighbors will be smaller (messages are tanh-bounded, ≈0.1-0.3/elem
-weighted by sigmoid w_conn ≈ 0.5). So inject dominates initially — same
-as v9. This is acceptable: it means neurons are primarily driven by the
-LM signal early in training, with inter-neuron communication growing
-as the graph learns.
+- H_mid ≈ 0.46/elem → sliced to D=32 chunks, same scale per element
+- Received from neighbors: tanh-bounded msgs (≈0.1-0.3) × sigmoid w_conn (≈0.5) → smaller
+- Inject dominates initially — neurons driven by LM signal, inter-neuron communication grows
 
 ### Neuron state magnitude
-
-tanh bounds each element to [-1, 1]. With D=32, the max norm is sqrt(32)
-≈ 5.66. No explosion possible.
+- tanh bounds each element to [-1, 1]
+- With structural decay: h stays within [-1, 1] (convex combination)
+- D=32 → max norm = sqrt(32) ≈ 5.66
 
 ### Word magnitude
-
-Each word = concat of 64 neuron states. If each neuron has RMS ≈ 0.3/elem,
-the word has RMS ≈ 0.3/elem and norm ≈ 0.3 × sqrt(2048) ≈ 13.6.
-
-### Perceiver output magnitude
-
-The perceiver cross-attention should produce outputs at similar scale to
-the word inputs. Standard attention normalization (1/sqrt(d_k)) handles this.
+- Each word = concat of 64 neurons × 32 dims = 2048-dim vector
+- RMS ≈ 0.3/elem, norm ≈ 0.3 × sqrt(2048) ≈ 13.6
+- Decoder's RMSNorm before cross-attention handles scale
 
 ### Decoder normalization
+- Pre-norm (RMSNorm before each attention/FFN), standard transformer practice
+- Cross-attention uses 1/sqrt(d_k) scaling
 
-Each decoder layer should use pre-norm (RMSNorm before attention/FFN),
-same as standard transformer practice. This keeps activations stable
-across layers.
-
-### Identity vector initialization
-
-Xavier init, same scale as neuron_id in v9: randn × 1/sqrt(D_id).
-D_id=32 → ≈0.18/elem. Small enough not to dominate, large enough to
-differentiate neurons.
+### Identity initialization
+- randn × 1/sqrt(D_id) → ≈0.18/elem
+- Small enough not to dominate, large enough to differentiate neurons
 
 ---
 
 ## Parameter Budget (Target: ~110M)
 
 ```
-Lower Scan:                                    ~25M
+Lower Scan:                                    ~27M
   Embedding (32K × 768):                       24.6M
-  proj_up (768 → D_scan):                      TBD (depends on D_scan)
-  2 scan layers:                                TBD
+  proj_up (768 → D_scan):                      ~1.6M
+  2 scan layers (d_inner TBD):                  TBD
 
-Memory Graph:                                  ~45M
-  Shared state MLP:                             TBD
+Memory Graph:                                  ~40M
+  Shared state MLP (large H):                   TBD
   Shared message MLP:                           TBD
   Shared modulator MLP:                         TBD
   Neuron identity [4096, 32]:                   0.13M
-  Perceiver (per-word compression):             TBD
   PCM:                                          ~1M
 
-Upper Decoder:                                 ~40M
+Upper Decoder:                                 ~43M
   L layers of:
     Self-attention (causal):                    TBD
-    Cross-attention (to 64 memory words):       TBD
+    Cross-attention (sliding window):           TBD
     FFN:                                        TBD
-  Final projection → vocab:                     TBD
+  Final projection → vocab (32K):               TBD
 
 Total:                                         ~110M
 ```
 
-Exact param allocation TBD after prototyping. The memory graph shared MLPs
-will be small (~2-5M). The bulk of memory-related params go to the perceiver
-and decoder cross-attention.
+Memory graph is ~40M — roughly equal to lower scan + decoder combined.
+Shared MLPs can be sized flexibly. Decoder should be relatively small
+(2-4 layers) since the memory graph does the heavy processing.
 
 ---
 
@@ -385,10 +340,10 @@ and decoder cross-attention.
 ### Phase 1: Backprop (current)
 
 Standard next-token prediction. Backprop through:
-- Decoder → perceiver → current step neuron states → shared MLPs → modulator
+- Decoder → word_states → current step neuron states → shared MLPs → modulator
 - PCM aux_loss (transition prediction)
 
-Rolling window is detached — no gradient through history.
+word_states are on the autograd graph (gradient flows to each step's h).
 TBPTT at segment boundaries (detach h, messages, identity).
 
 ### Phase 2: GRPO (future)
@@ -398,31 +353,31 @@ TBPTT at segment boundaries (detach h, messages, identity).
 3. Retrace forward with grad
 4. GRPO policy gradient update on modulator / plasticity decisions
 
-This enables the modulator to learn strategic decisions (when to consolidate,
-when to explore, what to remember) that can't be captured by per-token
-backprop alone.
-
 ---
 
 ## Key Design Principles
 
 1. **Memory is patterns, not states** — information lives in which neurons
-   co-activate and how activity evolves. The rolling window + perceiver
-   captures temporal trajectories, not just snapshots.
+   co-activate and how activity evolves. The sliding window cross-attention
+   captures temporal trajectories across word_states.
 
 2. **No skip connection around memory** — forces the model to use memory.
-   Short-term context comes from the rolling window, not an H_mid bypass.
+   Short-term context comes from the sliding window, not an H_mid bypass.
 
 3. **Shared weights, many neurons** — GNN-style parameter efficiency.
-   Scale by adding neurons, not per-neuron params.
+   Scale by adding neurons (N) or making shared MLPs bigger (H).
 
 4. **Sequential simulation** — true message propagation, one step per token.
    Information travels one hop per step, 128 hops per segment.
 
-5. **Two-timescale learning** — backprop trains shared weights (fast),
+5. **Decoder runs ONCE** — all T tokens in parallel with causal masking.
+   Cross-attention to word_states with sliding window preserves causality.
+   No per-token decoder calls, no perceiver.
+
+6. **Two-timescale learning** — backprop trains shared weights (fast),
    phi-correlation plasticity rewires topology (slow).
 
-6. **Sensory → Memory → Frontal** — biologically-inspired hierarchy.
+7. **Sensory → Memory → Frontal** — biologically-inspired hierarchy.
    Lower scan (sensory processing), memory graph (hippocampal-like),
    decoder (frontal cortex / decision making).
 
@@ -430,59 +385,45 @@ backprop alone.
 
 ## Implementation: PyTorch Geometric
 
-Using PyG (torch-geometric 2.7.0) for message passing. This gives us
-optimized sparse scatter/gather kernels and a clean `MessagePassing` API
-that scales to large N without custom Triton kernels.
+Using PyG (torch-geometric 2.7.0) for message passing. Optimized sparse
+scatter/gather kernels that scale to large N without custom Triton.
 
 ### NeuronLayer (extends MessagePassing)
 
 ```python
 class NeuronLayer(MessagePassing):
     def __init__(self, D, D_id, K, H_state, H_msg, H_mod):
-        super().__init__(aggr='add')  # sum aggregation
-
-        # Shared MLPs (one set for ALL neurons)
-        self.state_mlp = MLP(3*D + D_id, H_state, D)  # received+inject+h+id → update
-        self.msg_mlp = MLP(D + D_id, H_msg, D)         # h+id → msg
-        self.mod_mlp = MLP(K + D + D_id, H_mod, K + 1 + D_id)  # hebb+h+id → w_conn+decay+id_delta
+        super().__init__(aggr='add')
+        self.state_mlp = MLP(3*D + D_id, H_state, D)
+        self.msg_mlp = MLP(D + D_id, H_msg, D)
+        self.mod_mlp = MLP(K + D + D_id, H_mod, K + 1 + D_id)
 
     def forward(self, h, msgs, inject, identity, edge_index, w_conn, hebbian):
         # 1. Modulate
         w_conn, decay, id_delta = self.modulate(h, identity, hebbian, w_conn)
         identity = identity + id_delta
-
-        # 2. Gather (PyG message passing with edge weights)
+        # 2. Gather
         received = self.propagate(edge_index, x=msgs, edge_weight=sigmoid(w_conn))
-
-        # 3. Update state (structural decay)
+        # 3. Update state
         update = tanh(self.state_mlp(cat(received, inject, h, identity)))
         h = decay * h + (1 - decay) * update
-
         # 4. Message
         msgs = tanh(self.msg_mlp(cat(h, identity)))
-
         return h, msgs, w_conn, decay, identity
 ```
 
-PyG's `propagate()` handles the sparse gather + weighted sum + scatter
-efficiently using CUDA-optimized kernels. No custom Triton needed.
-
 ### Edge Index Format
 
-PyG uses COO format: `edge_index [2, num_edges]` where `edge_index[0]`
-is source, `edge_index[1]` is target. For our graph:
-
 ```python
-# Convert conn_indices [N, K] → edge_index [2, N*K]
-src = conn_indices.reshape(-1)                                    # [N*K]
-tgt = torch.arange(N).unsqueeze(1).expand(-1, K).reshape(-1)     # [N*K]
-edge_index = torch.stack([src, tgt])                              # [2, N*K]
+# conn_indices [N, K] → edge_index [2, N*K] (COO format)
+src = conn_indices.reshape(-1)
+tgt = torch.arange(N).unsqueeze(1).expand(-1, K).reshape(-1)
+edge_index = torch.stack([src, tgt])
 ```
 
 ### Plasticity Rewiring
 
-When `conn_indices` changes (plasticity), we rebuild `edge_index`.
-This is O(N*K) and happens once per chunk — negligible cost.
+When conn_indices changes, rebuild edge_index. O(N*K), once per chunk.
 
 ---
 
