@@ -121,11 +121,19 @@ msg[n] = tanh(shared_msg_MLP(input))
 Group neuron states into words and store for the decoder:
 
 ```
-word_states[t] = h.view(num_words, neurons_per_word * D)  — [64, 2048]
+word_states[t] = h.reshape(BS, num_words, neurons_per_word * D).clone()  — [BS, 64, 2048]
 ```
 
-All T word_states are collected on the autograd graph. The decoder receives
-`word_states: [T, 64, D_scan]` and cross-attends with causal sliding window.
+**Must clone, not view** — h gets overwritten at step t+1. All T word_states
+are collected on the autograd graph. After simulation, stack into
+`word_states: [BS, T, 64, D_scan]`.
+
+**Memory note:** word_states is [48, 128, 64, 2048] in bf16 ≈ 1.6 GB. To reduce:
+- Use gradient checkpointing (recompute during backward from saved h)
+- Or store every Kth step (e.g., K=4 → 32 snapshots, 400 MB)
+- Or reduce D_scan by using a projection before storing
+
+For prototype: store all T steps, optimize if VRAM is tight.
 
 ---
 
@@ -136,8 +144,13 @@ tokens in parallel using standard causal training.
 
 ### Input
 
-- **Queries**: token position embeddings or a learned sequence [T, D_dec]
-- **KV for cross-attention**: word_states [T, 64, D_scan] with causal sliding window mask
+- **Queries**: `proj(word_states[t])` — projected from D_scan to D_dec
+  - No token embeddings enter the decoder. All information comes from memory.
+  - At position 0 of a new segment, word_states[0] reflects memory graph state
+    after processing the first inject. For cross-chunk context, optionally
+    prepend carried word_states from the previous segment.
+- **KV for self-attention**: previous decoder states [0..t-1] (causal)
+- **KV for cross-attention**: word_states with causal sliding window mask
 
 ### Causal Sliding Window Cross-Attention
 
@@ -153,9 +166,15 @@ W=16 means each token sees the last 16 timesteps of memory word evolution.
 This preserves causality (no future information leaks) and captures temporal
 patterns in neuron activity.
 
+Note: the cross-attention KV dimension is D_scan (2048) while the query
+dimension is D_dec (potentially smaller). Projection layers in the
+cross-attention handle the dimension mismatch.
+
 ### Architecture
 
 ```
+query_proj: Linear(D_scan, D_dec)   — project word_states to decoder dim
+
 For each layer (L_decoder layers):
   RMSNorm → self_attention(causal)          — attend to previous decoder states
   RMSNorm → cross_attention(sliding_window) — attend to word_states
@@ -203,7 +222,8 @@ inject[n] = slices[slice_of_neuron_n]          — replicated within each group
 ```
 
 Same replication scheme as v9. Each group of 64 neurons sees the same
-32-dim inject signal.
+32-dim inject signal. **Inject is computed per-step inside the simulation
+loop** (not pre-materialized as [BS, T, N, D]) to avoid a 768 MB tensor.
 
 ### No explicit readout to H_mid
 
