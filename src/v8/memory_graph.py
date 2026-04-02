@@ -202,24 +202,24 @@ class MemoryGraph(nn.Module):
         K = self.config.K_connections
         D = self.config.D_neuron
 
-        dt = self.mod_w1.dtype
+        idt = h.dtype  # bf16 (runtime state dtype)
         mod_input = torch.cat([
-            hebbian_traces.to(dt),      # [BS, N, K]
-            h.to(dt),                    # [BS, N, D]
-            decay_logit.to(dt).unsqueeze(-1),  # [BS, N, 1]
-            primitives.to(dt),           # [BS, N, D]
+            hebbian_traces,             # [BS, N, K]
+            h,                          # [BS, N, D]
+            decay_logit.unsqueeze(-1),  # [BS, N, 1]
+            primitives,                 # [BS, N, D]
         ], dim=-1)  # [BS, N, K+2D+1]
 
-        # Per-neuron MLP: einsum over neuron dim
-        # w1 layout: [N, H, I] (transposed for Triton contiguous access)
+        # Per-neuron MLP: cast weights to input dtype (bf16) for einsum.
+        # Gradients flow through the cast back to f32 parameters.
         hidden = torch.einsum(
-            'bni,nhi->bnh', mod_input, self.mod_w1
-        ) + self.mod_b1  # [BS, N, H]
+            'bni,nhi->bnh', mod_input, self.mod_w1.to(idt)
+        ) + self.mod_b1.to(idt)  # [BS, N, H]
         hidden = torch.tanh(hidden)
 
         output = torch.einsum(
-            'bnh,nho->bno', hidden, self.mod_w2
-        ) + self.mod_b2  # [BS, N, K+1+D]
+            'bnh,nho->bno', hidden, self.mod_w2.to(idt)
+        ) + self.mod_b2.to(idt)  # [BS, N, K+1+D]
 
         new_w_conn = output[..., :K]              # [BS, N, K]
         new_decay_logit = output[..., K]           # [BS, N]
@@ -242,33 +242,33 @@ class MemoryGraph(nn.Module):
         gives the modulator direct control over persistence, and provides
         a residual gradient path through the decay multiplication.
         """
-        dt = self.state_w1.dtype
-        x = torch.cat([input_vec.to(dt), h_prev.to(dt)], dim=-1)  # [BS, N, 2D]
+        idt = input_vec.dtype  # bf16 (runtime state dtype)
+        x = torch.cat([input_vec, h_prev], dim=-1)  # [BS, N, 2D]
         hidden = torch.einsum(
-            'bni,nhi->bnh', x, self.state_w1
-        ) + self.state_b1
+            'bni,nhi->bnh', x, self.state_w1.to(idt)
+        ) + self.state_b1.to(idt)
         hidden = torch.tanh(hidden)
         out = torch.einsum(
-            'bnh,nhd->bnd', hidden, self.state_w2
-        ) + self.state_b2
+            'bnh,nhd->bnd', hidden, self.state_w2.to(idt)
+        ) + self.state_b2.to(idt)
         update = torch.tanh(out)
-        d = decay.to(dt).unsqueeze(-1)  # [BS, N, 1]
-        return d * h_prev.to(dt) + (1 - d) * update
+        d = decay.unsqueeze(-1)  # [BS, N, 1]
+        return d * h_prev + (1 - d) * update
 
     def _msg_mlp(self, h_new: Tensor, primitives: Tensor) -> Tensor:
         """Per-neuron message generation: cat(h_new, primitive) → msg.
 
         Architecture: Linear → tanh → Linear → tanh (bounded output).
         """
-        dt = self.msg_w1.dtype
-        x = torch.cat([h_new.to(dt), primitives.to(dt)], dim=-1)  # [BS, N, 2D]
+        idt = h_new.dtype
+        x = torch.cat([h_new, primitives], dim=-1)  # [BS, N, 2D]
         hidden = torch.einsum(
-            'bni,nhi->bnh', x, self.msg_w1
-        ) + self.msg_b1
+            'bni,nhi->bnh', x, self.msg_w1.to(idt)
+        ) + self.msg_b1.to(idt)
         hidden = torch.tanh(hidden)
         out = torch.einsum(
-            'bnh,nhd->bnd', hidden, self.msg_w2
-        ) + self.msg_b2
+            'bnh,nhd->bnd', hidden, self.msg_w2.to(idt)
+        ) + self.msg_b2.to(idt)
         return torch.tanh(out)
 
     # ================================================================

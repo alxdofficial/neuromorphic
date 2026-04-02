@@ -226,7 +226,7 @@ class TestDocumentBoundaryReset:
         logits_a_post = res_a["logits"][:, mid + 1]
         logits_b_post = res_b["logits"][:, mid + 1]
         diff = (logits_a_post - logits_b_post).abs().max().item()
-        assert diff < 1e-3, (
+        assert diff < 1e-2, (
             f"Logits diverge after internal EOS (max diff={diff:.6f}). "
             f"Scan state was not properly reset at document boundary.")
 

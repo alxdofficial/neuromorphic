@@ -121,7 +121,7 @@ class V8Config:
             D=2048, D_embed=768, C=16, L_total=4, scan_split_at=2,
             d_inner=580, glu_output=True, T=128,
             N_mem_neurons=512, D_neuron=256, K_connections=32,
-            dendrite_branch_size=16,
+            dendrite_branch_size=0,
             pcm_hidden=256,
             neuromod_hidden=80, state_mlp_hidden=24, msg_mlp_hidden=24,
         )

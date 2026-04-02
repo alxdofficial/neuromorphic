@@ -94,12 +94,10 @@ def main():
           f"plasticity={'on' if config.structural_plasticity else 'off'}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
-    # Model — everything in bf16, optimizer keeps f32 master weights
-    model = V8Model(config)
-    if device.type == "cuda":
-        model = model.to(device).to(torch.bfloat16)
-    else:
-        model = model.to(device)
+    # Model — params stay f32, autocast handles bf16 compute in forward/backward.
+    # PyTorch AdamW does NOT maintain f32 master weights for bf16 params,
+    # so converting params to bf16 causes small updates to be rounded away.
+    model = V8Model(config).to(device)
 
     # Resume
     start_step = 0

@@ -381,11 +381,13 @@ class FusedDendriticGather(torch.autograd.Function):
             USE_DENDRITE=ctx.use_dendrite,
         )
 
-        # Cast grads to match input dtype, return
-        grad_branch_out = grad_branch_w.to(out_dtype) if ctx.use_dendrite else None
-        grad_group_out = grad_group_w.to(out_dtype) if ctx.use_dendrite else None
+        # Cast grads to match each input's dtype — prev_msg/w_conn_sig may be
+        # bf16 runtime tensors, but branch_w/group_w are f32 Parameters.
+        # Returning f32 grads for f32 params avoids needless bf16 quantization.
+        grad_branch_out = grad_branch_w.to(branch_w.dtype) if ctx.use_dendrite else None
+        grad_group_out = grad_group_w.to(group_w.dtype) if ctx.use_dendrite else None
 
-        return (grad_prev_msg.to(out_dtype), None, grad_w_conn_sig.to(out_dtype),
+        return (grad_prev_msg.to(prev_msg.dtype), None, grad_w_conn_sig.to(w_conn_sig.dtype),
                 grad_branch_out, grad_group_out,
                 None, None, None, None, None, None, None, None)
 
