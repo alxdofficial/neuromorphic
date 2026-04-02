@@ -326,6 +326,24 @@ def _reference_cell_forward(
     R = config.R_rounds
     alpha = config.alpha
 
+    # Cast everything to a common dtype (f32 for backward precision)
+    dt = torch.float32
+    h = h.to(dt)
+    msg = msg.to(dt)
+    w_conn_sig = w_conn_sig.to(dt)
+    decay = decay.to(dt)
+    primitives = primitives.to(dt)
+    neuron_id = neuron_id.to(dt)
+    cc_signals = cc_signals.to(dt)
+    state_w1 = state_w1.to(dt)
+    state_b1 = state_b1.to(dt)
+    state_w2 = state_w2.to(dt)
+    state_b2 = state_b2.to(dt)
+    msg_w1 = msg_w1.to(dt)
+    msg_b1 = msg_b1.to(dt)
+    msg_w2 = msg_w2.to(dt)
+    msg_b2 = msg_b2.to(dt)
+
     d_val = decay.unsqueeze(-1)  # [BS, NC, C, 1]
     omd = 1 - d_val
 
@@ -339,28 +357,24 @@ def _reference_cell_forward(
     w_prim_m = msg_w1[:, D:2*D]
     w_id_m = msg_w1[:, 2*D:]
 
-    nid = neuron_id  # [NC, C, D]
+    nid = neuron_id
 
-    readouts = []
-    for t in range(T):
-        inject_raw = cc_signals[:, t].view(BS, NC, D)  # [BS, NC, D]
-
+    def _one_token_step(h_in, msg_in, inject_raw):
+        """Process one token: R rounds of message passing."""
+        h_t, msg_t = h_in, msg_in
         for r in range(R):
-            # Gather
-            batch_idx = torch.arange(BS, device=h.device)[:, None, None, None]
-            cell_idx = torch.arange(NC, device=h.device)[None, :, None, None]
+            batch_idx = torch.arange(BS, device=h_t.device)[:, None, None, None]
+            cell_idx = torch.arange(NC, device=h_t.device)[None, :, None, None]
             conn_exp = conn_indices.unsqueeze(0).expand(BS, -1, -1, -1)
-            neighbor_msgs = msg[batch_idx, cell_idx, conn_exp]
+            neighbor_msgs = msg_t[batch_idx, cell_idx, conn_exp]
             received = (w_conn_sig.unsqueeze(-1) * neighbor_msgs).sum(dim=3)
 
-            # Inject to port neurons
             inject_addend = torch.zeros_like(received)
             inject_signal = inject_raw.unsqueeze(2).expand(-1, -1, alpha, -1)
             idx = inject_indices.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, D)
             inject_addend.scatter_(2, idx, inject_signal)
             input_vec = received + inject_addend
 
-            # State MLP
             hidden = (
                 F.linear(input_vec, w_in_s) +
                 F.linear(primitives, w_prim_s) +
@@ -369,22 +383,27 @@ def _reference_cell_forward(
                 state_b1
             )
             update = torch.tanh(F.linear(torch.tanh(hidden), state_w2, state_b2))
-            h = d_val * h + omd * update
+            h_t = d_val * h_t + omd * update
 
-            # Msg MLP
             hidden_m = (
-                F.linear(h, w_h_m) +
+                F.linear(h_t, w_h_m) +
                 F.linear(primitives, w_prim_m) +
                 F.linear(nid, w_id_m).unsqueeze(0) +
                 msg_b1
             )
-            msg = torch.tanh(F.linear(torch.tanh(hidden_m), msg_w2, msg_b2)) + nid
+            msg_t = torch.tanh(F.linear(torch.tanh(hidden_m), msg_w2, msg_b2)) + nid
 
-        # Readout
         idx_r = readout_indices.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, D)
-        readout_msgs = torch.gather(msg, 2, idx_r)  # [BS, NC, alpha, D]
-        averaged = readout_msgs.mean(dim=2)  # [BS, NC, D]
-        readouts.append(averaged.reshape(BS, NC * D))
+        readout_msgs = torch.gather(msg_t, 2, idx_r)
+        averaged = readout_msgs.mean(dim=2)
+        return h_t, msg_t, averaged.reshape(BS, NC * D)
+
+    readouts = []
+    for t in range(T):
+        inject_raw = cc_signals[:, t].view(BS, NC, D)
+        h, msg, readout_t = torch.utils.checkpoint.checkpoint(
+            _one_token_step, h, msg, inject_raw, use_reentrant=False)
+        readouts.append(readout_t)
 
     mem_out = torch.stack(readouts, dim=1)  # [BS, T, D_lm]
     return h, msg, mem_out

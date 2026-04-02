@@ -22,6 +22,12 @@ from torch import Tensor
 
 from .config import V11Config
 
+try:
+    from .triton_kernels import fused_cell_forward as _fused_cell_fwd
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 class CellMemoryGraph(nn.Module):
     """Cell-based memory graph with shared MLPs and per-cell modulator.
@@ -409,46 +415,46 @@ class CellMemoryGraph(nn.Module):
 
         w_conn_sig = torch.sigmoid(w_conn)  # [BS, NC, C, K]
         decay = torch.sigmoid(decay_logit)  # [BS, NC, C]
-        d = decay.unsqueeze(-1)             # [BS, NC, C, 1]
-        omd = 1 - d
 
-        total_hebbian = torch.zeros_like(self.hebbian_traces)
-        readouts = []
-        act_norms_all = []
+        # ---- Fused Triton path (GPU) or Python fallback (CPU) ----
+        if _HAS_TRITON and h.is_cuda:
+            h_final, msg_final, mem_out, hebb = _fused_cell_fwd(
+                h, msg, w_conn_sig, decay, primitives,
+                self.conn_indices, self.neuron_id,
+                self.inject_indices, self.readout_indices,
+                cc_signals,
+                self.state_w1, self.state_b1, self.state_w2, self.state_b2,
+                self.msg_w1, self.msg_b1, self.msg_w2, self.msg_b2,
+                self.config)
+            h = h_final
+            msg = msg_final
+            total_hebbian = hebb
+        else:
+            # Python fallback (slow, for CPU tests)
+            d = decay.unsqueeze(-1)
+            omd = 1 - d
+            total_hebbian = torch.zeros_like(self.hebbian_traces)
+            readouts = []
 
-        for t in range(T_seg):
-            # Inject signal for this token
-            inject_signal = self._inject(cc_signals[:, t])  # [BS, NC, alpha, D]
+            for t in range(T_seg):
+                inject_signal = self._inject(cc_signals[:, t])
+                for r in range(R):
+                    received = self._cell_gather(msg, w_conn_sig)
+                    inject_idx = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
+                        BS, -1, -1, D)
+                    inject_addend = torch.zeros_like(received)
+                    inject_addend.scatter_(2, inject_idx,
+                                           inject_signal.to(received.dtype))
+                    input_vec = received + inject_addend
+                    update = self._state_update(input_vec, primitives, decay_logit)
+                    h = d * h + omd * update
+                    msg = self._msg_output(h, primitives)
+                readouts.append(self._readout(msg))
+                with torch.no_grad():
+                    msg_norms = msg.detach().norm(dim=-1)
+                    total_hebbian += msg_norms.unsqueeze(-1) * w_conn_sig.detach()
 
-            for r in range(R):
-                # Cell-local gather
-                received = self._cell_gather(msg, w_conn_sig)  # [BS, NC, C, D]
-
-                # Add inject to inject neurons only
-                # inject_indices: [NC, alpha] — these neurons get the signal
-                inject_idx = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
-                    BS, -1, -1, D)  # [BS, NC, alpha, D]
-                inject_addend = torch.zeros_like(received)
-                inject_addend.scatter_(2, inject_idx, inject_signal.to(received.dtype))
-                input_vec = received + inject_addend
-
-                # State update
-                update = self._state_update(input_vec, primitives, decay_logit)
-                h = d * h + omd * update
-
-                # Message output
-                msg = self._msg_output(h, primitives)
-
-            # Readout after all R rounds
-            readouts.append(self._readout(msg))
-
-            # Diagnostics (no grad)
-            with torch.no_grad():
-                msg_norms = msg.detach().norm(dim=-1)  # [BS, NC, C]
-                total_hebbian += msg_norms.unsqueeze(-1) * w_conn_sig.detach()
-                act_norms_all.append(msg_norms.float())
-
-        mem_out = torch.stack(readouts, dim=1)  # [BS, T_seg, D_lm]
+            mem_out = torch.stack(readouts, dim=1)
 
         # Update persistent state
         with torch.no_grad():
@@ -459,14 +465,6 @@ class CellMemoryGraph(nn.Module):
             self.decay_logit = decay_logit.detach().to(self.dtype)
             self.hebbian_traces = (
                 total_hebbian / max(T_seg, 1)).to(self.dtype)
-
-            if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation_ema') and act_norms_all):
-                act_trace = torch.stack(act_norms_all, dim=1)  # [BS, T, NC, C]
-                # Flatten NC×C for phi computation
-                act_flat = act_trace.reshape(BS, T_seg, NC * C)
-                # Per-cell phi would be better but start simple
-                # TODO: per-cell phi computation
 
             alpha_diag = 0.05
             seg_mag = msg.detach().norm(dim=-1)
