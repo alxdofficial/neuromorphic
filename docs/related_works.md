@@ -1,10 +1,10 @@
 # Related Works
 
-> **NOTE (2026-03-29):** Comprehensive literature survey for v9-backprop (branch
-> `v9-backprop`). The memory graph is now differentiable and trained end-to-end by
-> backprop. N=512 neurons, D_neuron=256, K=32, 4 scan layers split at 2, ~110M
-> params, ~27K tok/s. No RL, no ES. Per-neuron MLPs (state, message, modulator),
-> dendritic tree, Hebbian traces, structural plasticity, dynamic predictive coding.
+> **NOTE (2026-04-02):** Literature survey originally written for v9-backprop.
+> Current code is v11 (branch `v11-cells`): cell-based memory graph with 65K thin
+> neurons (D=8), cell-local connectivity, shared-weight MLPs, per-cell modulators.
+> The core research areas (predictive coding, structural plasticity, neuromodulation,
+> memory-augmented networks) remain directly relevant to v11.
 
 A survey of prior work related to the Neuromorphic Language Model architecture,
 organized by topic area. For each area, we review key papers, note their

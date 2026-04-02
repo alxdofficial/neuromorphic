@@ -1,5 +1,5 @@
-# Neuromorphic LM v9-backprop — Differentiable Memory Graph + Cortical Columns
+# V8 LM components reused by v11 (scan layers, PCM, inject_memory)
 from .config import V8Config
-from .model import V8Model
+from .lm import V8LM
 
-__all__ = ["V8Config", "V8Model"]
+__all__ = ["V8Config", "V8LM"]
