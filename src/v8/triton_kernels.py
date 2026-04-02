@@ -676,3 +676,263 @@ def fused_neuron_step(h, prev_msg, inject_signal, conn_indices,
     )
 
     return h_out, msg_out
+
+
+# ============================================================================
+# Fused shared-weight memory pass kernel — forward only
+# ============================================================================
+
+@triton.jit
+def fused_shared_memory_pass_kernel(
+    received_ptr,          # [BS, N, D] bf16/f32
+    cc_ptr,                # [BS, T_SEG, D_LM] bf16/f32
+    h0_ptr,                # [BS, N, D] bf16/f32
+    decay_logit_ptr,       # [BS, N] bf16/f32
+    primitives_ptr,        # [BS, N, D] bf16/f32
+    neuron_id_ptr,         # [N, D] bf16/f32
+    state_w1_ptr,          # [H_STATE, 3D+1] bf16/f32
+    state_b1_ptr,          # [H_STATE] bf16/f32
+    state_w2_t_ptr,        # [H_STATE, D] bf16/f32
+    state_b2_ptr,          # [D] bf16/f32
+    msg_w1_ptr,            # [H_MSG, 3D] bf16/f32
+    msg_b1_ptr,            # [H_MSG] bf16/f32
+    msg_w2_t_ptr,          # [H_MSG, D] bf16/f32
+    msg_b2_ptr,            # [D] bf16/f32
+    h_last_ptr,            # [BS, N, D] bf16/f32
+    msg_last_ptr,          # [BS, N, D] bf16/f32
+    mem_out_ptr,           # [BS, T_SEG, D_LM] f32
+    msg_norm_mean_ptr,     # [BS, N] f32
+    act_trace_ptr,         # [BS, T_SEG, N] f32
+    BS: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    T_SEG: tl.constexpr,
+    D_LM: tl.constexpr,
+    N_PER_SLICE: tl.constexpr,
+    H_STATE: tl.constexpr,
+    H_MSG: tl.constexpr,
+    WRITE_READOUT: tl.constexpr,
+):
+    """Fused no-dendrite shared-weight memory pass.
+
+    One program handles one (batch, neuron) lane and loops over all tokens.
+    This avoids materializing [BS, N, T, D] intermediates on the forward path.
+    """
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d = tl.arange(0, D)
+
+    bn_offset = (b * N + n) * D
+    c = n // N_PER_SLICE
+    scale = 1.0 / tl.sqrt(tl.full([], N_PER_SLICE, tl.float32))
+
+    received = tl.load(received_ptr + bn_offset + d).to(tl.float32)
+    h_val = tl.load(h0_ptr + bn_offset + d).to(tl.float32)
+    prim = tl.load(primitives_ptr + bn_offset + d).to(tl.float32)
+    nid = tl.load(neuron_id_ptr + n * D + d).to(tl.float32)
+    decay_logit = tl.load(decay_logit_ptr + b * N + n).to(tl.float32)
+    decay = 1.0 / (1.0 + tl.exp(-decay_logit))
+
+    norm_sum = tl.full([], 0.0, tl.float32)
+    msg = nid
+
+    for t in range(T_SEG):
+        cc_offset = (b * T_SEG + t) * D_LM + c * D
+        inject = tl.load(cc_ptr + cc_offset + d).to(tl.float32)
+        input_vec = received + inject
+
+        h_new_acc = tl.load(state_b2_ptr + d).to(tl.float32)
+        for hid in range(H_STATE):
+            state_row = hid * (3 * D + 1)
+            w_in = tl.load(state_w1_ptr + state_row + d).to(tl.float32)
+            w_prim = tl.load(state_w1_ptr + state_row + D + d).to(tl.float32)
+            w_id = tl.load(state_w1_ptr + state_row + 2 * D + d).to(tl.float32)
+            w_decay = tl.load(state_w1_ptr + state_row + 3 * D).to(tl.float32)
+            bias1 = tl.load(state_b1_ptr + hid).to(tl.float32)
+
+            hidden_val = (
+                tl.sum(input_vec * w_in) +
+                tl.sum(prim * w_prim) +
+                tl.sum(nid * w_id) +
+                decay_logit * w_decay +
+                bias1
+            )
+            hidden_val = libdevice.tanh(hidden_val)
+            w2_row = tl.load(state_w2_t_ptr + hid * D + d).to(tl.float32)
+            h_new_acc += hidden_val * w2_row
+
+        update = libdevice.tanh(h_new_acc)
+        h_val = decay * h_val + (1.0 - decay) * update
+
+        msg_acc = tl.load(msg_b2_ptr + d).to(tl.float32)
+        for hid in range(H_MSG):
+            msg_row = hid * (3 * D)
+            w_h = tl.load(msg_w1_ptr + msg_row + d).to(tl.float32)
+            w_prim = tl.load(msg_w1_ptr + msg_row + D + d).to(tl.float32)
+            w_id = tl.load(msg_w1_ptr + msg_row + 2 * D + d).to(tl.float32)
+            bias1 = tl.load(msg_b1_ptr + hid).to(tl.float32)
+
+            hidden_val = (
+                tl.sum(h_val * w_h) +
+                tl.sum(prim * w_prim) +
+                tl.sum(nid * w_id) +
+                bias1
+            )
+            hidden_val = libdevice.tanh(hidden_val)
+            w2_row = tl.load(msg_w2_t_ptr + hid * D + d).to(tl.float32)
+            msg_acc += hidden_val * w2_row
+
+        msg = libdevice.tanh(msg_acc) + nid
+
+        if WRITE_READOUT:
+            mem_offset = (b * T_SEG + t) * D_LM + c * D
+            tl.atomic_add(mem_out_ptr + mem_offset + d, msg * scale)
+            msg_norm = tl.sqrt(tl.sum(msg * msg))
+            tl.store(act_trace_ptr + (b * T_SEG + t) * N + n, msg_norm)
+            norm_sum += msg_norm
+
+    tl.store(h_last_ptr + bn_offset + d, h_val)
+    tl.store(msg_last_ptr + bn_offset + d, msg)
+    if WRITE_READOUT:
+        tl.store(msg_norm_mean_ptr + b * N + n, norm_sum / T_SEG)
+    else:
+        tl.store(msg_norm_mean_ptr + b * N + n, 0.0)
+
+
+def fused_shared_memory_pass_forward(
+    received,
+    cc_signals,
+    h0,
+    decay_logit,
+    primitives,
+    neuron_id,
+    state_w1,
+    state_b1,
+    state_w2_t,
+    state_b2,
+    msg_w1,
+    msg_b1,
+    msg_w2_t,
+    msg_b2,
+    n_per_slice,
+    write_readout,
+):
+    """Forward-only fused shared-weight memory pass.
+
+    This targets the live no-dendrite memory path. Gradients are handled by a
+    higher-level autograd wrapper that recomputes the reference PyTorch path.
+    """
+    BS, N, D = received.shape
+    T_SEG = cc_signals.shape[1]
+    D_LM = cc_signals.shape[2]
+
+    h_last = torch.empty_like(h0)
+    msg_last = torch.empty_like(h0)
+    mem_out = torch.zeros(
+        BS, T_SEG, D_LM, device=received.device, dtype=torch.float32)
+    msg_norm_mean = torch.zeros(
+        BS, N, device=received.device, dtype=torch.float32)
+    act_trace = torch.empty(
+        BS, T_SEG, N, device=received.device, dtype=torch.float32)
+
+    grid = (BS, N)
+    fused_shared_memory_pass_kernel[grid](
+        received.contiguous(),
+        cc_signals.contiguous(),
+        h0.contiguous(),
+        decay_logit.contiguous(),
+        primitives.contiguous(),
+        neuron_id.contiguous(),
+        state_w1.contiguous(),
+        state_b1.contiguous(),
+        state_w2_t.contiguous(),
+        state_b2.contiguous(),
+        msg_w1.contiguous(),
+        msg_b1.contiguous(),
+        msg_w2_t.contiguous(),
+        msg_b2.contiguous(),
+        h_last,
+        msg_last,
+        mem_out,
+        msg_norm_mean,
+        act_trace,
+        BS=BS,
+        N=N,
+        D=D,
+        T_SEG=T_SEG,
+        D_LM=D_LM,
+        N_PER_SLICE=n_per_slice,
+        H_STATE=state_b1.shape[0],
+        H_MSG=msg_b1.shape[0],
+        WRITE_READOUT=write_readout,
+    )
+
+    return h_last, msg_last, mem_out, msg_norm_mean, act_trace
+
+
+# ============================================================================
+# Fused message readout reduction — forward only
+# ============================================================================
+
+
+@triton.jit
+def fused_msg_readout_kernel(
+    msg_ptr,              # [BS, C_MEM, N_PER_SLICE, T_CHUNK, D]
+    mem_out_ptr,          # [BS, T_CHUNK, D_LM] bf16/f32
+    BS: tl.constexpr,
+    C_MEM: tl.constexpr,
+    N_PER_SLICE: tl.constexpr,
+    T_CHUNK: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Reduce message chunk over replica neurons into LM-width readout."""
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    c_blk = tl.program_id(2)
+
+    n_d_blocks = tl.cdiv(D, BLOCK_D)
+    c = c_blk // n_d_blocks
+    d_blk = c_blk % n_d_blocks
+    offs_d = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offs_d < D
+
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    scale = 1.0 / tl.sqrt(tl.full([], N_PER_SLICE, tl.float32))
+
+    for nps in range(N_PER_SLICE):
+        msg_offset = (((b * C_MEM + c) * N_PER_SLICE + nps) * T_CHUNK + t) * D
+        acc += tl.load(msg_ptr + msg_offset + offs_d, mask=mask, other=0.0).to(tl.float32)
+
+    out_offset = ((b * T_CHUNK + t) * C_MEM + c) * D
+    tl.store(mem_out_ptr + out_offset + offs_d, acc * scale, mask=mask)
+
+
+def fused_msg_readout_forward(msg_chunk, n_per_slice):
+    """Forward-only fused readout for one message chunk.
+
+    Args:
+        msg_chunk: [BS, C_mem, N_per_slice, T_chunk, D]
+        n_per_slice: replica count per cortical slice
+
+    Returns:
+        mem_out: [BS, T_chunk, D_lm] same dtype as msg_chunk
+    """
+    BS, C_mem, _, T_chunk, D = msg_chunk.shape
+    mem_out = torch.empty(
+        BS, T_chunk, C_mem * D, device=msg_chunk.device, dtype=msg_chunk.dtype)
+
+    block_d = 64
+    grid = (BS, T_chunk, C_mem * triton.cdiv(D, block_d))
+    fused_msg_readout_kernel[grid](
+        msg_chunk.contiguous(),
+        mem_out,
+        BS=BS,
+        C_MEM=C_mem,
+        N_PER_SLICE=n_per_slice,
+        T_CHUNK=T_chunk,
+        D=D,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return mem_out

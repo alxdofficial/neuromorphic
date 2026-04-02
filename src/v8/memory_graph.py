@@ -1,16 +1,19 @@
 """Memory Graph — differentiable 2-pass neuron simulation (v9-backprop).
 
-N=512 neurons, D_neuron=256, K=32 connections. Trained end-to-end by backprop.
+Sparse graph topology and per-neuron segment modulator stay specialized, but
+the hot token-time dynamics use a shared scan-friendly core so the expensive
+work becomes dense GEMMs plus a fused scan over [BS*N, T, D_neuron].
 
 2-pass simulation per segment (T tokens):
   Pass 1: ONE gather (frozen initial messages) → T steps of MLP dynamics
   Pass 2: ONE gather (from Pass 1 end state) → T steps refined
 
-Per-step dynamics (within each pass, frozen inter-neuron messages):
+Per-step dynamics within each pass (frozen inter-neuron messages):
   1. input_vec = frozen_received + inject[t]  (inject varies per token)
-  2. State MLP: cat(input_vec, h, decay) → tanh → linear → tanh → h_new
-  3. Message MLP: cat(h_new, primitive) → tanh → linear → tanh → msg
-  4. msg = msg + neuron_id
+  2. Shared state core predicts update_t from input/primitive/id/decay
+  3. Fused scan applies h_t = decay * h_{t-1} + (1 - decay) * update_t
+  4. Shared message core maps h_t + primitive + id → msg_t
+  5. msg = msg + neuron_id
 
 Segment-boundary modulator (runs FIRST, once per segment):
   mod(hebbian_traces, h, decay, primitive) → new w_conn, decay, primitive
@@ -23,26 +26,216 @@ Structural plasticity: at chunk boundaries, rewire weakest connections.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch import Tensor
 
+from ..model.scan import fused_scan
 from .config import V8Config
 
 # Try to import Triton kernels
 try:
     from .triton_kernels import fused_dendritic_gather as _triton_gather
-    from .triton_kernels import fused_neuron_step as _triton_step
+    from .triton_kernels import fused_shared_memory_pass_forward as _triton_shared_pass
+    from .triton_kernels import fused_msg_readout_forward as _triton_msg_readout
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
+    _triton_shared_pass = None
+    _triton_msg_readout = None
+
+
+def _reference_shared_memory_pass(
+    received: Tensor,
+    cc_signals: Tensor,
+    h0: Tensor,
+    decay_logit: Tensor,
+    primitives: Tensor,
+    neuron_id: Tensor,
+    state_w1: Tensor,
+    state_b1: Tensor,
+    state_w2: Tensor,
+    state_b2: Tensor,
+    msg_w1: Tensor,
+    msg_b1: Tensor,
+    msg_w2: Tensor,
+    msg_b2: Tensor,
+    n_per_slice: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """PyTorch reference for one shared-weight memory pass."""
+    BS, N, D = received.shape
+    T_seg = cc_signals.shape[1]
+    D_lm = cc_signals.shape[2]
+    C_mem = D_lm // D
+
+    dt = received.dtype
+    received_g = received.reshape(BS, C_mem, n_per_slice, D).to(dt)
+    primitives_g = primitives.reshape(BS, C_mem, n_per_slice, D).to(dt)
+    inject_grouped = cc_signals.reshape(BS, T_seg, C_mem, D).permute(0, 2, 1, 3)
+    inject_grouped = inject_grouped.unsqueeze(2).expand(-1, -1, n_per_slice, -1, -1).to(dt)
+    h0_flat = h0.reshape(BS * N, D).to(dt)
+    decay_logit = decay_logit.to(dt)
+    neuron_id_g = neuron_id.to(dt).reshape(C_mem, n_per_slice, D)
+
+    w_in = state_w1[:, :D].to(dt)
+    w_prim = state_w1[:, D:2 * D].to(dt)
+    w_id = state_w1[:, 2 * D:3 * D].to(dt)
+    w_decay = state_w1[:, 3 * D:].to(dt)
+    state_b1 = state_b1.to(dt)
+    state_w2 = state_w2.to(dt)
+    state_b2 = state_b2.to(dt)
+
+    base_hidden = (
+        F.linear(received_g, w_in).unsqueeze(3) +
+        F.linear(primitives_g, w_prim).unsqueeze(3) +
+        F.linear(neuron_id_g, w_id).unsqueeze(0).unsqueeze(3) +
+        F.linear(decay_logit.reshape(BS, C_mem, n_per_slice, 1), w_decay).unsqueeze(3) +
+        state_b1.view(1, 1, 1, 1, -1)
+    )
+    hidden = torch.tanh(base_hidden + F.linear(inject_grouped, w_in))
+    update = torch.tanh(F.linear(hidden, state_w2, state_b2))
+
+    decay = torch.sigmoid(decay_logit).reshape(BS * N, 1, 1)
+    b_flat = (1 - decay) * update.reshape(BS * N, T_seg, D)
+    a_raw = decay_logit.reshape(BS * N, 1, 1).expand(-1, T_seg, D)
+    h_seq = fused_scan(a_raw, b_flat, h0_flat).reshape(BS, C_mem, n_per_slice, T_seg, D)
+
+    msg_w_h = msg_w1[:, :D].to(dt)
+    msg_w_prim = msg_w1[:, D:2 * D].to(dt)
+    msg_w_id = msg_w1[:, 2 * D:].to(dt)
+    msg_b1 = msg_b1.to(dt)
+    msg_w2 = msg_w2.to(dt)
+    msg_b2 = msg_b2.to(dt)
+    base_msg_hidden = (
+        F.linear(primitives_g, msg_w_prim).unsqueeze(3) +
+        F.linear(neuron_id_g, msg_w_id).unsqueeze(0).unsqueeze(3) +
+        msg_b1.view(1, 1, 1, 1, -1)
+    )
+    msg_hidden = torch.tanh(base_msg_hidden + F.linear(h_seq, msg_w_h))
+    msg_seq = torch.tanh(F.linear(msg_hidden, msg_w2, msg_b2))
+    msg_seq = msg_seq + neuron_id_g.view(1, C_mem, n_per_slice, 1, D)
+
+    h_last = h_seq[:, :, :, -1, :].reshape(BS, N, D)
+    msg_last = msg_seq[:, :, :, -1, :].reshape(BS, N, D)
+    mem_out = msg_seq.sum(dim=2) * (n_per_slice ** -0.5)
+    mem_out = mem_out.permute(0, 2, 1, 3).reshape(BS, T_seg, D_lm).to(torch.float32)
+    return h_last, msg_last, mem_out
+
+
+class _FusedSharedMemoryPassFn(torch.autograd.Function):
+    """Autograd wrapper: Triton forward, PyTorch recompute backward."""
+
+    @staticmethod
+    def forward(ctx, received, cc_signals, h0, decay_logit, primitives,
+                neuron_id, state_w1, state_b1, state_w2, state_b2,
+                msg_w1, msg_b1, msg_w2, msg_b2, n_per_slice, write_readout):
+        dt = received.dtype
+        h_last, msg_last, mem_out, msg_norm_mean, act_trace = _triton_shared_pass(
+            received,
+            cc_signals,
+            h0,
+            decay_logit,
+            primitives,
+            neuron_id.to(dt),
+            state_w1.to(dt),
+            state_b1.to(dt),
+            state_w2.t().contiguous().to(dt),
+            state_b2.to(dt),
+            msg_w1.to(dt),
+            msg_b1.to(dt),
+            msg_w2.t().contiguous().to(dt),
+            msg_b2.to(dt),
+            n_per_slice,
+            write_readout,
+        )
+
+        ctx.save_for_backward(
+            received, cc_signals, h0, decay_logit, primitives, neuron_id,
+            state_w1, state_b1, state_w2, state_b2,
+            msg_w1, msg_b1, msg_w2, msg_b2,
+        )
+        ctx.n_per_slice = n_per_slice
+        ctx.write_readout = write_readout
+        return h_last, msg_last, mem_out, msg_norm_mean, act_trace
+
+    @staticmethod
+    def backward(ctx, grad_h_last, grad_msg_last, grad_mem_out,
+                 grad_msg_norm_mean, grad_act_trace):
+        saved = ctx.saved_tensors
+        (received, cc_signals, h0, decay_logit, primitives, neuron_id,
+         state_w1, state_b1, state_w2, state_b2,
+         msg_w1, msg_b1, msg_w2, msg_b2) = saved
+
+        inputs = [
+            received.detach().requires_grad_(ctx.needs_input_grad[0]),
+            cc_signals.detach().requires_grad_(ctx.needs_input_grad[1]),
+            h0.detach().requires_grad_(ctx.needs_input_grad[2]),
+            decay_logit.detach().requires_grad_(ctx.needs_input_grad[3]),
+            primitives.detach().requires_grad_(ctx.needs_input_grad[4]),
+            neuron_id.detach().requires_grad_(ctx.needs_input_grad[5]),
+            state_w1.detach().requires_grad_(ctx.needs_input_grad[6]),
+            state_b1.detach().requires_grad_(ctx.needs_input_grad[7]),
+            state_w2.detach().requires_grad_(ctx.needs_input_grad[8]),
+            state_b2.detach().requires_grad_(ctx.needs_input_grad[9]),
+            msg_w1.detach().requires_grad_(ctx.needs_input_grad[10]),
+            msg_b1.detach().requires_grad_(ctx.needs_input_grad[11]),
+            msg_w2.detach().requires_grad_(ctx.needs_input_grad[12]),
+            msg_b2.detach().requires_grad_(ctx.needs_input_grad[13]),
+        ]
+
+        with torch.enable_grad():
+            ref_h_last, ref_msg_last, ref_mem_out = _reference_shared_memory_pass(
+                *inputs, ctx.n_per_slice
+            )
+
+        grad_outputs = (
+            grad_h_last.to(ref_h_last.dtype),
+            grad_msg_last.to(ref_msg_last.dtype),
+            grad_mem_out.to(ref_mem_out.dtype),
+        )
+        grad_input_indices = [
+            i for i, tensor in enumerate(inputs) if tensor.requires_grad
+        ]
+        grad_input_tensors = [inputs[i] for i in grad_input_indices]
+        computed_grads = torch.autograd.grad(
+            outputs=(ref_h_last, ref_msg_last, ref_mem_out),
+            inputs=grad_input_tensors,
+            grad_outputs=grad_outputs,
+            allow_unused=True,
+        )
+        grads = [None] * len(inputs)
+        for idx, grad in zip(grad_input_indices, computed_grads):
+            grads[idx] = grad
+
+        return (*grads, None, None)
+
+
+class _FusedMsgReadoutFn(torch.autograd.Function):
+    """Autograd wrapper: Triton readout forward, analytic backward."""
+
+    @staticmethod
+    def forward(ctx, msg_chunk: Tensor, n_per_slice: int):
+        ctx.msg_shape = tuple(msg_chunk.shape)
+        ctx.msg_dtype = msg_chunk.dtype
+        ctx.n_per_slice = n_per_slice
+        return _triton_msg_readout(msg_chunk, n_per_slice)
+
+    @staticmethod
+    def backward(ctx, grad_mem_out: Tensor):
+        BS, C_mem, N_per_slice, T_chunk, D = ctx.msg_shape
+        scale = ctx.n_per_slice ** -0.5
+        grad = grad_mem_out.reshape(BS, T_chunk, C_mem, D).permute(0, 2, 1, 3)
+        grad = grad.unsqueeze(2).expand(-1, -1, N_per_slice, -1, -1)
+        return (grad.to(ctx.msg_dtype) * scale).contiguous(), None
 
 
 class MemoryGraph(nn.Module):
-    """Differentiable memory graph with per-neuron modulator + MLPs.
+    """Differentiable memory graph with per-neuron modulator + shared scan core.
 
     nn.Parameters (requires_grad=True, trained by backprop):
         mod_w1, mod_b1, mod_w2, mod_b2 — segment-boundary modulator
-        state_w1, state_b1, state_w2, state_b2 — per-step state update MLP
-        msg_w1, msg_b1, msg_w2, msg_b2 — per-step message MLP
+        state_w1, state_b1, state_w2, state_b2 — per-step state core
+        msg_w1, msg_b1, msg_w2, msg_b2 — per-step message core
         neuron_id — learnable per-neuron identity embedding
         dendrite_branch_w, dendrite_group_w — dendritic tree FC weights
 
@@ -106,32 +299,31 @@ class MemoryGraph(nn.Module):
             (2.0 / (H_mod + mod_output_dim)) ** 0.5)
         self.mod_b2 = nn.Parameter(torch.zeros(N, mod_output_dim, device=device))
 
-        # --- Per-step state update MLP ---
-        # Input: cat(input_vec[D], h[D]) = 2D (decay is structural, not concatenated)
-        # w1 layout: [N, H, I] (transposed for contiguous Triton access)
-        state_in = 2 * D
+        # --- Per-step state update core (shared weights, scan-friendly) ---
+        # Input contributions: input_vec[D] + primitive[D] + neuron_id[D] + decay[1]
+        # state_w1 keeps the historical name for tests/diagnostics.
+        state_in = 3 * D + 1
         H_state = config.state_mlp_hidden
         self.state_w1 = nn.Parameter(
-            torch.randn(N, H_state, state_in, device=device) *
+            torch.randn(H_state, state_in, device=device) *
             (2.0 / (state_in + H_state)) ** 0.5)
-        self.state_b1 = nn.Parameter(torch.zeros(N, H_state, device=device))
+        self.state_b1 = nn.Parameter(torch.zeros(H_state, device=device))
         self.state_w2 = nn.Parameter(
-            torch.randn(N, H_state, D, device=device) *
+            torch.randn(D, H_state, device=device) *
             (2.0 / (H_state + D)) ** 0.5)
-        self.state_b2 = nn.Parameter(torch.zeros(N, D, device=device))
+        self.state_b2 = nn.Parameter(torch.zeros(D, device=device))
 
-        # --- Per-step message MLP ---
-        # Input: cat(h_new[D], primitive[D]) = 2D
-        # w1 layout: [N, H, I] (transposed)
+        # --- Per-step message core (shared weights, identity-conditioned) ---
+        # Input contributions: h_new[D] + primitive[D] + neuron_id[D]
         H_msg = config.msg_mlp_hidden
         self.msg_w1 = nn.Parameter(
-            torch.randn(N, H_msg, 2 * D, device=device) *
-            (2.0 / (2 * D + H_msg)) ** 0.5)
-        self.msg_b1 = nn.Parameter(torch.zeros(N, H_msg, device=device))
+            torch.randn(H_msg, 3 * D, device=device) *
+            (2.0 / (3 * D + H_msg)) ** 0.5)
+        self.msg_b1 = nn.Parameter(torch.zeros(H_msg, device=device))
         self.msg_w2 = nn.Parameter(
-            torch.randn(N, H_msg, D, device=device) *
+            torch.randn(D, H_msg, device=device) *
             (2.0 / (H_msg + D)) ** 0.5)
-        self.msg_b2 = nn.Parameter(torch.zeros(N, D, device=device))
+        self.msg_b2 = nn.Parameter(torch.zeros(D, device=device))
 
         # --- Neuron ID embedding ---
         # Scale similar to positional embeddings in transformers
@@ -232,44 +424,59 @@ class MemoryGraph(nn.Module):
     # ================================================================
 
     def _state_mlp(self, input_vec: Tensor, h_prev: Tensor,
-                   decay: Tensor) -> Tensor:
-        """Per-neuron state update with structural decay (leaky integration).
+                   decay: Tensor, primitives: Tensor | None = None) -> Tensor:
+        """Single-step wrapper around the shared scan-friendly state core."""
+        D = self.config.D_neuron
+        dt = input_vec.dtype
+        if primitives is None:
+            primitives = torch.zeros_like(input_vec)
 
-        h_new = decay * h_prev + (1 - decay) * tanh(MLP(input_vec, h_prev))
+        state_w1 = self.state_w1.to(dt)
+        state_w2 = self.state_w2.to(dt)
+        state_b1 = self.state_b1.to(dt)
+        state_b2 = self.state_b2.to(dt)
+        neuron_id = self.neuron_id.to(dt)
 
-        Decay is used structurally as a leak rate, not as an MLP input.
-        This bounds h naturally (convex combination of h_prev and tanh output),
-        gives the modulator direct control over persistence, and provides
-        a residual gradient path through the decay multiplication.
-        """
-        idt = input_vec.dtype  # bf16 (runtime state dtype)
-        x = torch.cat([input_vec, h_prev], dim=-1)  # [BS, N, 2D]
-        hidden = torch.einsum(
-            'bni,nhi->bnh', x, self.state_w1.to(idt)
-        ) + self.state_b1.to(idt)
-        hidden = torch.tanh(hidden)
-        out = torch.einsum(
-            'bnh,nhd->bnd', hidden, self.state_w2.to(idt)
-        ) + self.state_b2.to(idt)
-        update = torch.tanh(out)
-        d = decay.unsqueeze(-1)  # [BS, N, 1]
+        w_in = state_w1[:, :D]
+        w_prim = state_w1[:, D:2 * D]
+        w_id = state_w1[:, 2 * D:3 * D]
+        w_decay = state_w1[:, 3 * D:]
+
+        hidden = (
+            F.linear(input_vec, w_in) +
+            F.linear(primitives, w_prim) +
+            F.linear(neuron_id, w_id).unsqueeze(0) +
+            F.linear(decay.unsqueeze(-1), w_decay) +
+            state_b1
+        )
+        update = torch.tanh(
+            F.linear(torch.tanh(hidden), state_w2, state_b2)
+        )
+        d = decay.unsqueeze(-1)
         return d * h_prev + (1 - d) * update
 
     def _msg_mlp(self, h_new: Tensor, primitives: Tensor) -> Tensor:
-        """Per-neuron message generation: cat(h_new, primitive) → msg.
+        """Single-step wrapper around the shared identity-conditioned msg core."""
+        D = self.config.D_neuron
+        dt = h_new.dtype
+        msg_w1 = self.msg_w1.to(dt)
+        msg_w2 = self.msg_w2.to(dt)
+        msg_b1 = self.msg_b1.to(dt)
+        msg_b2 = self.msg_b2.to(dt)
+        neuron_id = self.neuron_id.to(dt)
 
-        Architecture: Linear → tanh → Linear → tanh (bounded output).
-        """
-        idt = h_new.dtype
-        x = torch.cat([h_new, primitives], dim=-1)  # [BS, N, 2D]
-        hidden = torch.einsum(
-            'bni,nhi->bnh', x, self.msg_w1.to(idt)
-        ) + self.msg_b1.to(idt)
-        hidden = torch.tanh(hidden)
-        out = torch.einsum(
-            'bnh,nhd->bnd', hidden, self.msg_w2.to(idt)
-        ) + self.msg_b2.to(idt)
-        return torch.tanh(out)
+        w_h = msg_w1[:, :D]
+        w_prim = msg_w1[:, D:2 * D]
+        w_id = msg_w1[:, 2 * D:]
+        hidden = (
+            F.linear(h_new, w_h) +
+            F.linear(primitives, w_prim) +
+            F.linear(neuron_id, w_id).unsqueeze(0) +
+            msg_b1
+        )
+        return torch.tanh(
+            F.linear(torch.tanh(hidden), msg_w2, msg_b2)
+        )
 
     # ================================================================
     # Dendritic gather
@@ -344,6 +551,13 @@ class MemoryGraph(nn.Module):
             -1, -1, self.N_per_slice, -1
         ).reshape(BS, self.config.N_neurons, self.config.D_neuron)
 
+    def _inject_grouped(self, H_mid: Tensor) -> Tensor:
+        """All-token inject as a grouped view: [BS, C_mem, Nps, T, D_neuron]."""
+        BS, T_seg, _ = H_mid.shape
+        grouped = H_mid.view(BS, T_seg, self.C_mem, self.config.D_neuron)
+        grouped = grouped.permute(0, 2, 1, 3)  # [BS, C_mem, T, D_neuron]
+        return grouped.unsqueeze(2).expand(-1, -1, self.N_per_slice, -1, -1)
+
     def _readout_single(self, msg: Tensor) -> Tensor:
         """Single-token readout: [BS, N, D_neuron] → [BS, D_lm].
 
@@ -356,15 +570,258 @@ class MemoryGraph(nn.Module):
         scaled = grouped.sum(dim=2) * (self.N_per_slice ** -0.5)
         return scaled.reshape(BS, self.config.D)
 
+    def _readout_all(self, msg_seq: Tensor) -> Tensor:
+        """Vectorized readout: [BS, C_mem, Nps, T, D_neuron] → [BS, T, D_lm]."""
+        BS, _, _, T_seg, _ = msg_seq.shape
+        scaled = msg_seq.sum(dim=2) * (self.N_per_slice ** -0.5)
+        return scaled.permute(0, 2, 1, 3).reshape(BS, T_seg, self.config.D)
+
+    def _run_state_scan(
+        self,
+        received: Tensor,
+        inject_grouped: Tensor,
+        h0: Tensor,
+        decay_logit: Tensor,
+        primitives: Tensor,
+    ) -> Tensor:
+        """Run one pass of the shared state core with fused scan.
+
+        Args:
+            received: [BS, N, D]
+            inject_grouped: [BS, C_mem, Nps, T, D]
+            h0: [BS, N, D]
+            decay_logit: [BS, N]
+            primitives: [BS, N, D]
+
+        Returns:
+            h_seq: [BS, C_mem, Nps, T, D]
+        """
+        BS, _, _, T_seg, D = inject_grouped.shape
+        H_state = self.config.state_mlp_hidden
+        B_flat = BS * self.config.N_neurons
+        dt = received.dtype
+
+        received_g = received.reshape(BS, self.C_mem, self.N_per_slice, D).to(dt)
+        primitives_g = primitives.reshape(BS, self.C_mem, self.N_per_slice, D).to(dt)
+        inject_grouped = inject_grouped.to(dt)
+        h0_flat = h0.to(dt).reshape(B_flat, D)
+        decay_logit = decay_logit.to(dt)
+
+        state_w1 = self.state_w1.to(dt)
+        state_w2 = self.state_w2.to(dt)
+        state_b1 = self.state_b1.to(dt)
+        state_b2 = self.state_b2.to(dt)
+        neuron_id = self.neuron_id.to(dt).view(self.C_mem, self.N_per_slice, D)
+
+        w_in = state_w1[:, :D]
+        w_prim = state_w1[:, D:2 * D]
+        w_id = state_w1[:, 2 * D:3 * D]
+        w_decay = state_w1[:, 3 * D:]
+
+        base_hidden = (
+            F.linear(received_g, w_in).unsqueeze(3) +
+            F.linear(primitives_g, w_prim).unsqueeze(3) +
+            F.linear(neuron_id, w_id).unsqueeze(0).unsqueeze(3) +
+            F.linear(
+                decay_logit.reshape(BS, self.C_mem, self.N_per_slice, 1),
+                w_decay,
+            ).unsqueeze(3) +
+            state_b1.view(1, 1, 1, 1, H_state)
+        )
+
+        inject_hidden = F.linear(inject_grouped, w_in)
+        hidden = torch.tanh(base_hidden + inject_hidden)
+        update = torch.tanh(F.linear(hidden, state_w2, state_b2))
+
+        decay = torch.sigmoid(decay_logit).reshape(B_flat, 1, 1)
+        b_flat = (1 - decay) * update.reshape(B_flat, T_seg, D)
+        a_raw = decay_logit.reshape(B_flat, 1, 1).expand(-1, T_seg, D)
+        h_seq = self._scan_in_chunks(a_raw, b_flat, h0_flat)
+        return h_seq.view(BS, self.C_mem, self.N_per_slice, T_seg, D)
+
+    def _run_msg_core(self, h_seq: Tensor, primitives: Tensor) -> Tensor:
+        """Vectorized message core over a full pass.
+
+        Args:
+            h_seq: [BS, C_mem, Nps, T, D]
+            primitives: [BS, N, D]
+
+        Returns:
+            msg_seq: [BS, C_mem, Nps, T, D]
+        """
+        BS, _, _, _, D = h_seq.shape
+        H_msg = self.config.msg_mlp_hidden
+        dt = h_seq.dtype
+        primitives_g = primitives.reshape(BS, self.C_mem, self.N_per_slice, D).to(dt)
+
+        msg_w1 = self.msg_w1.to(dt)
+        msg_w2 = self.msg_w2.to(dt)
+        msg_b1 = self.msg_b1.to(dt)
+        msg_b2 = self.msg_b2.to(dt)
+        neuron_id = self.neuron_id.to(dt).view(self.C_mem, self.N_per_slice, D)
+
+        w_h = msg_w1[:, :D]
+        w_prim = msg_w1[:, D:2 * D]
+        w_id = msg_w1[:, 2 * D:]
+
+        base_hidden = (
+            F.linear(primitives_g, w_prim).unsqueeze(3) +
+            F.linear(neuron_id, w_id).unsqueeze(0).unsqueeze(3) +
+            msg_b1.view(1, 1, 1, 1, H_msg)
+        )
+        hidden = torch.tanh(base_hidden + F.linear(h_seq, w_h))
+        msg = torch.tanh(F.linear(hidden, msg_w2, msg_b2))
+        return msg + neuron_id.view(1, self.C_mem, self.N_per_slice, 1, D)
+
+    def _run_msg_core_last(self, h_last: Tensor, primitives: Tensor) -> Tensor:
+        """Message core on the final scan state only.
+
+        Args:
+            h_last: [BS, C_mem, Nps, D]
+            primitives: [BS, N, D]
+
+        Returns:
+            msg_last: [BS, C_mem, Nps, D]
+        """
+        BS, _, _, D = h_last.shape
+        H_msg = self.config.msg_mlp_hidden
+        dt = h_last.dtype
+        primitives_g = primitives.reshape(BS, self.C_mem, self.N_per_slice, D).to(dt)
+
+        msg_w1 = self.msg_w1.to(dt)
+        msg_w2 = self.msg_w2.to(dt)
+        msg_b1 = self.msg_b1.to(dt)
+        msg_b2 = self.msg_b2.to(dt)
+        neuron_id = self.neuron_id.to(dt).view(self.C_mem, self.N_per_slice, D)
+
+        w_h = msg_w1[:, :D]
+        w_prim = msg_w1[:, D:2 * D]
+        w_id = msg_w1[:, 2 * D:]
+
+        base_hidden = (
+            F.linear(primitives_g, w_prim) +
+            F.linear(neuron_id, w_id).unsqueeze(0) +
+            msg_b1.view(1, 1, 1, H_msg)
+        )
+        hidden = torch.tanh(base_hidden + F.linear(h_last, w_h))
+        msg = torch.tanh(F.linear(hidden, msg_w2, msg_b2))
+        return msg + neuron_id.view(1, self.C_mem, self.N_per_slice, D)
+
+    def _readout_chunk(self, msg_chunk: Tensor, use_triton: bool) -> Tensor:
+        """Read out one message chunk to [BS, T_chunk, D_lm]."""
+        if use_triton:
+            return _FusedMsgReadoutFn.apply(msg_chunk, self.N_per_slice)
+        return self._readout_all(msg_chunk)
+
+    def _scan_in_chunks(self, a_raw: Tensor, b: Tensor, h0: Tensor) -> Tensor:
+        """Run fused scan in manageable flattened-batch chunks."""
+        B_flat = a_raw.shape[0]
+        if not a_raw.is_cuda or B_flat <= 16384:
+            return fused_scan(a_raw, b, h0)
+
+        outs = []
+        for start in range(0, B_flat, 16384):
+            end = min(start + 16384, B_flat)
+            outs.append(fused_scan(a_raw[start:end], b[start:end], h0[start:end]))
+        return torch.cat(outs, dim=0)
+
+    def _run_pass_core(
+        self,
+        received: Tensor,
+        inject_grouped: Tensor,
+        h: Tensor,
+        decay_logit: Tensor,
+        primitives: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Run one memory pass and return only the recurrent carry."""
+        BS = h.shape[0]
+        N = self.config.N_neurons
+        D = self.config.D_neuron
+        h_seq = self._run_state_scan(received, inject_grouped, h, decay_logit, primitives)
+        h_last = h_seq[:, :, :, -1, :].reshape(BS, N, D)
+        msg_last = self._run_msg_core_last(h_seq[:, :, :, -1, :], primitives)
+        prev_msg = msg_last.reshape(BS, N, D)
+        return h_last, prev_msg
+
+    def _run_pass_with_readout(
+        self,
+        received: Tensor,
+        inject_grouped: Tensor,
+        h: Tensor,
+        decay_logit: Tensor,
+        primitives: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run one memory pass and keep the final-token readout/activity."""
+        BS = h.shape[0]
+        T_seg = inject_grouped.shape[3]
+        N = self.config.N_neurons
+        D = self.config.D_neuron
+        h_seq = self._run_state_scan(received, inject_grouped, h, decay_logit, primitives)
+        msg_seq = self._run_msg_core(h_seq, primitives)
+        h_last = h_seq[:, :, :, -1, :].reshape(BS, N, D)
+        prev_msg = msg_seq[:, :, :, -1, :].reshape(BS, N, D)
+        mem_out = self._readout_all(msg_seq)
+        act_trace = msg_seq.norm(dim=-1).permute(0, 3, 1, 2).reshape(BS, T_seg, N)
+        msg_norm_mean = act_trace.mean(dim=1)
+        return h_last, prev_msg, mem_out, act_trace, msg_norm_mean
+
+    def _run_pass_with_readout_chunked(
+        self,
+        received: Tensor,
+        inject_grouped: Tensor,
+        h: Tensor,
+        decay_logit: Tensor,
+        primitives: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run one pass with chunked message core and fused Triton readout."""
+        BS = h.shape[0]
+        T_seg = inject_grouped.shape[3]
+        N = self.config.N_neurons
+        D = self.config.D_neuron
+        h_seq = self._run_state_scan(received, inject_grouped, h, decay_logit, primitives)
+        h_last = h_seq[:, :, :, -1, :].reshape(BS, N, D)
+
+        use_triton = (
+            _HAS_TRITON and
+            _triton_msg_readout is not None and
+            h_seq.is_cuda
+        )
+        chunk_len = min(32, T_seg)
+        mem_out_chunks = []
+        act_chunks = []
+        msg_norm_sum = torch.zeros(BS, N, device=h_seq.device, dtype=torch.float32)
+        prev_msg = None
+
+        for start in range(0, T_seg, chunk_len):
+            end = min(start + chunk_len, T_seg)
+            h_chunk = h_seq[:, :, :, start:end, :]
+            msg_chunk = self._run_msg_core(h_chunk, primitives)
+            mem_out_chunks.append(self._readout_chunk(msg_chunk, use_triton))
+
+            with torch.no_grad():
+                act_chunk = msg_chunk.norm(dim=-1).permute(0, 3, 1, 2)
+                act_chunk = act_chunk.reshape(BS, end - start, N).float()
+                msg_norm_sum += act_chunk.sum(dim=1)
+                if self.config.structural_plasticity:
+                    act_chunks.append(act_chunk)
+
+            if end == T_seg:
+                prev_msg = msg_chunk[:, :, :, -1, :].reshape(BS, N, D)
+
+        mem_out = torch.cat(mem_out_chunks, dim=1)
+        if self.config.structural_plasticity:
+            act_trace = torch.cat(act_chunks, dim=1)
+        else:
+            act_trace = torch.empty(BS, 0, N, device=h_seq.device, dtype=torch.float32)
+        msg_norm_mean = msg_norm_sum / max(T_seg, 1)
+        return h_last, prev_msg, mem_out, act_trace, msg_norm_mean
+
     # ================================================================
     # Forward segment (differentiable)
     # ================================================================
 
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment of tokens. Differentiable through modulator + MLPs.
-
-        2-pass simulation: each pass does ONE gather (frozen inter-neuron messages)
-        then runs all T steps with the state and message MLPs.
+        """Process one segment of tokens with 2-pass sparse gather + scan core.
 
         Args:
             cc_signals: [BS, T_seg, D_lm] — detached H_mid for this segment
@@ -378,8 +835,9 @@ class MemoryGraph(nn.Module):
         K = self.config.K_connections
 
         # TBPTT: detach state at segment boundary
-        h = self.h.detach()
-        prev_msg = self.prev_messages.detach()
+        h = self.h.detach().to(self.dtype)
+        prev_msg = self.prev_messages.detach().to(self.dtype)
+        cc_signals = cc_signals.to(h.dtype)
 
         # Run modulator FIRST (on compute graph — this is what backprop trains)
         w_conn, decay_logit, primitives = self._run_modulator(
@@ -387,66 +845,72 @@ class MemoryGraph(nn.Module):
             self.decay_logit.detach(),
             self.primitives_state.detach())
 
-        # Precompute sigmoid (on graph through w_conn/decay_logit)
+        # Precompute sigmoid (on graph through w_conn)
         w_conn_sig = torch.sigmoid(w_conn)      # [BS, N, K]
-        decay = torch.sigmoid(decay_logit)       # [BS, N]
 
-        # 2-pass simulation: freeze inter-neuron messages per pass,
-        # run all steps with frozen messages + varying inject.
-        # Pass 1: gather from initial prev_msg → run all steps
-        # Pass 2: gather from Pass 1 end state → run all steps (refined)
-        # Only 2 gathers instead of T_seg, massive speedup.
-        #
-        # Memory optimization: inject and readout are computed per-step
-        # to avoid materializing [BS, T, N, D] transients (~1.6 GB each).
-        D_lm = self.config.D
-        total_hebbian = torch.zeros(BS, N, K, device=h.device, dtype=h.dtype)
+        inject_grouped = self._inject_grouped(cc_signals)
+        act_trace = None
+        mem_out = None
+        use_triton_readout = (
+            self.config.experimental_triton_pass and
+            _HAS_TRITON and
+            _triton_msg_readout is not None and
+            prev_msg.is_cuda
+        )
+        use_checkpoint = (
+            self.training and inject_grouped.is_cuda and BS * N > 16384
+        )
 
-        # 2-pass simulation: freeze inter-neuron messages per pass,
-        # run all steps with frozen messages + varying inject.
         # Both passes stay on the autograd graph — pass 2's gradient flows
-        # back through pass 1's prev_msg to the modulator.
+        # back through pass 1's prev_msg to the modulator through prev_msg.
         n_passes = 2
 
         for pass_idx in range(n_passes):
             received = self._fused_gather(prev_msg, w_conn_sig)  # [BS, N, D]
 
-            readouts = []
-            act_norms = []
-            for t in range(T_seg):
-                inject_t = self._inject_single(cc_signals[:, t])
-                input_vec = received + inject_t
-                h = self._state_mlp(input_vec, h, decay)
-                msg = self._msg_mlp(h, primitives)
-                msg = msg + self.neuron_id
-                prev_msg = msg
-
-                # Only collect outputs on last pass
-                if pass_idx == n_passes - 1:
-                    readouts.append(self._readout_single(msg))
-                    with torch.no_grad():
-                        msg_mag = msg.detach().norm(dim=-1, keepdim=True)
-                        total_hebbian += msg_mag * w_conn_sig.detach()
-                        act_norms.append(msg_mag.squeeze(-1).float())
-
-        # Stack readouts: [BS, T_seg, D_lm] (not [BS, T_seg, N, D])
-        mem_out = torch.stack(readouts, dim=1)
+            if pass_idx == n_passes - 1:
+                pass_fn = (
+                    self._run_pass_with_readout_chunked
+                    if use_triton_readout else
+                    self._run_pass_with_readout
+                )
+                if use_checkpoint:
+                    h, prev_msg, mem_out, act_trace, msg_norm_mean = checkpoint(
+                        pass_fn,
+                        received, inject_grouped, h, decay_logit, primitives,
+                        use_reentrant=False,
+                    )
+                else:
+                    h, prev_msg, mem_out, act_trace, msg_norm_mean = pass_fn(
+                        received, inject_grouped, h, decay_logit, primitives)
+                with torch.no_grad():
+                    total_hebbian = msg_norm_mean.unsqueeze(-1) * w_conn_sig.detach()
+            else:
+                if use_checkpoint:
+                    h, prev_msg = checkpoint(
+                        self._run_pass_core,
+                        received, inject_grouped, h, decay_logit, primitives,
+                        use_reentrant=False,
+                    )
+                else:
+                    h, prev_msg = self._run_pass_core(
+                        received, inject_grouped, h, decay_logit, primitives)
 
         # Update persistent state (detached, for next segment)
         with torch.no_grad():
-            self.h = h.detach()
-            self.prev_messages = prev_msg.detach()
-            self.w_conn = w_conn.detach()
-            self.primitives_state = primitives.detach()
-            self.decay_logit = decay_logit.detach()
+            self.h = h.detach().to(self.dtype)
+            self.prev_messages = prev_msg.detach().to(self.dtype)
+            self.w_conn = w_conn.detach().to(self.dtype)
+            self.primitives_state = primitives.detach().to(self.dtype)
+            self.decay_logit = decay_logit.detach().to(self.dtype)
 
             # Hebbian traces: per-segment average
-            self.hebbian_traces = (total_hebbian / max(T_seg, 1)).to(self.dtype)
+            self.hebbian_traces = total_hebbian.to(self.dtype)
 
             # Structural plasticity: phi correlation from per-step activity
             if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation_ema') and act_norms):
-                act_trace = torch.stack(act_norms, dim=1)  # [BS, T_seg, N]
+                    hasattr(self, 'co_activation_ema') and act_trace is not None and
+                    act_trace.numel() > 0):
                 self._update_phi(act_trace)
 
             # Diagnostics
@@ -552,9 +1016,20 @@ class MemoryGraph(nn.Module):
             grow_target = grow_flat_idx % N
 
             # 20% exploration: replace some targets with random
-            rand_targets = torch.randint(0, N, (n_prune,), device=device)
+            rand_targets = torch.randint(0, N - 1, (n_prune,), device=device)
+            rand_targets = rand_targets + (rand_targets >= prune_n).long()
             use_random = torch.rand(n_prune, device=device) < explore_frac
             grow_target = torch.where(use_random, rand_targets, grow_target)
+
+            # grow_target comes from a global ranking over candidate pairs.
+            # Once targets are reassigned into different source rows, re-check
+            # the no-self-connection invariant for the actual destination row.
+            is_self = grow_target == prune_n
+            if is_self.any():
+                repl = torch.randint(0, N - 1, (is_self.sum(),), device=device)
+                repl = repl + (repl >= prune_n[is_self]).long()
+                grow_target = grow_target.clone()
+                grow_target[is_self] = repl
 
             # Apply: replace pruned connections with new targets
             conn[prune_n, prune_k] = grow_target

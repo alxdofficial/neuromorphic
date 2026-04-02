@@ -96,7 +96,7 @@ class V8Model(nn.Module):
         # Detach H_mid for memory graph input — lower scan gets its own
         # gradient path through the CE loss, memory graph provides a second
         # gradient channel through inject_memory
-        cc_all = H_mid.detach()  # [BS, T, D]
+        cc_all = H_mid.detach().to(self.memory.dtype)  # [BS, T, D]
         n_segments = T // action_every
 
         mem_out_segs = []

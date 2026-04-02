@@ -30,10 +30,11 @@ class V8Config:
     K_connections: int = 32      # sparse presynaptic connections per neuron
     dendrite_branch_size: int = 16
 
-    # Per-neuron MLPs
-    neuromod_hidden: int = 80    # hidden dim for segment-boundary modulator
-    state_mlp_hidden: int = 24   # hidden dim for per-step state update MLP
-    msg_mlp_hidden: int = 24     # hidden dim for per-step message MLP
+    # Memory hidden sizes
+    neuromod_hidden: int = 112   # segment-boundary per-neuron modulator
+    state_mlp_hidden: int = 24   # shared per-step state core hidden dim
+    msg_mlp_hidden: int = 24     # shared per-step message core hidden dim
+    experimental_triton_pass: bool = False  # chunked msg-core path + Triton readout reduction
 
     # Structural plasticity
     structural_plasticity: bool = True
@@ -123,7 +124,7 @@ class V8Config:
             N_mem_neurons=512, D_neuron=256, K_connections=32,
             dendrite_branch_size=0,
             pcm_hidden=256,
-            neuromod_hidden=80, state_mlp_hidden=24, msg_mlp_hidden=24,
+            neuromod_hidden=112, state_mlp_hidden=24, msg_mlp_hidden=24,
         )
         defaults.update(overrides)
         return cls(**defaults)
