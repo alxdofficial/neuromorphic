@@ -57,6 +57,7 @@ class V11Config:
     # Segment / training
     T: int = 128                 # tokens per chunk = segment length
     mem_lr_scale: float = 0.3
+    experimental_triton_token_step: bool = False
 
     # ================================================================
     # Derived properties

@@ -23,6 +23,18 @@ from torch import Tensor
 
 from .config import V11Config
 
+try:
+    from .triton_kernels import combined_cell_border_gather as _combined_cell_border_gather
+    _HAS_TRITON_GATHER = True
+except ImportError:
+    _HAS_TRITON_GATHER = False
+
+try:
+    from .triton_kernels import fused_token_step as _fused_token_step
+    _HAS_TRITON_TOKEN_STEP = True
+except ImportError:
+    _HAS_TRITON_TOKEN_STEP = False
+
 
 class CellMemoryGraph(nn.Module):
     """Cell-based memory graph with shared MLPs and per-neuron modulator.
@@ -384,6 +396,37 @@ class CellMemoryGraph(nn.Module):
         decay = torch.sigmoid(decay_logit)
         d = decay.unsqueeze(-1)
         omd = 1 - d
+        dt = h.dtype
+
+        # These terms are constant for the full segment. Precomputing them
+        # removes repeated shared-weight linears from every token/round.
+        nid = self.neuron_id.to(dt)
+        state_w_in = self.state_w1[:, :D].to(dt)
+        state_w_prim = self.state_w1[:, D:2 * D].to(dt)
+        state_w_id = self.state_w1[:, 2 * D:3 * D].to(dt)
+        state_w_decay = self.state_w1[:, 3 * D:].to(dt)
+        state_w2 = self.state_w2.to(dt)
+        state_b1 = self.state_b1.to(dt)
+        state_b2 = self.state_b2.to(dt)
+
+        msg_w_h = self.msg_w1[:, :D].to(dt)
+        msg_w_prim = self.msg_w1[:, D:2 * D].to(dt)
+        msg_w_id = self.msg_w1[:, 2 * D:].to(dt)
+        msg_w2 = self.msg_w2.to(dt)
+        msg_b1 = self.msg_b1.to(dt)
+        msg_b2 = self.msg_b2.to(dt)
+
+        state_const = (
+            F.linear(primitives, state_w_prim) +
+            F.linear(nid, state_w_id).unsqueeze(0) +
+            F.linear(decay_logit.unsqueeze(-1), state_w_decay) +
+            state_b1
+        )
+        msg_const = (
+            F.linear(primitives, msg_w_prim) +
+            F.linear(nid, msg_w_id).unsqueeze(0) +
+            msg_b1
+        )
 
         total_hebbian = torch.zeros_like(self.hebbian_traces)
         readouts = []
@@ -395,36 +438,69 @@ class CellMemoryGraph(nn.Module):
         inject_idx_exp = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
             BS, -1, -1, D)
 
+        use_fused_token_step = (
+            self.config.experimental_triton_token_step and
+            _HAS_TRITON_TOKEN_STEP and h.is_cuda
+        )
+
+        def _state_update_fast(input_vec):
+            hidden = F.linear(input_vec, state_w_in) + state_const
+            return torch.tanh(F.linear(torch.tanh(hidden), state_w2, state_b2))
+
+        def _msg_output_fast(h_val):
+            hidden = F.linear(h_val, msg_w_h) + msg_const
+            return torch.tanh(F.linear(torch.tanh(hidden), msg_w2, msg_b2)) + nid
+
         def _one_token_step(h_in, msg_in, inject_sig):
             """Process one token: R rounds of message passing."""
             h_t, msg_t = h_in, msg_in
             for r in range(R):
-                received = self._cell_gather(msg_t, w_conn_sig)
-                border_received = self._border_gather(msg_t, w_conn_border_sig)
-                received = received.scatter_add(
-                    2, border_idx_exp, border_received.to(received.dtype))
+                if _HAS_TRITON_GATHER and msg_t.is_cuda:
+                    received = _combined_cell_border_gather(
+                        msg_t, w_conn_sig, self.conn_indices,
+                        w_conn_border_sig, self.border_conn_indices,
+                        self.config.alpha,
+                    )
+                else:
+                    received = self._cell_gather(msg_t, w_conn_sig)
+                    border_received = self._border_gather(msg_t, w_conn_border_sig)
+                    received = received.scatter_add(
+                        2, border_idx_exp, border_received.to(received.dtype))
 
                 inject_addend = torch.zeros_like(received)
                 inject_addend.scatter_(2, inject_idx_exp,
                                        inject_sig.to(received.dtype))
                 input_vec = received + inject_addend
 
-                update = self._state_update(input_vec, primitives, decay_logit)
+                update = _state_update_fast(input_vec)
                 h_t = d * h_t + omd * update
-                msg_t = self._msg_output(h_t, primitives)
+                msg_t = _msg_output_fast(h_t)
             return h_t, msg_t
 
-        use_checkpoint = self.training and T_seg > 1
+        use_checkpoint = self.training and T_seg > 1 and not use_fused_token_step
 
         for t in range(T_seg):
-            inject_signal = self._inject(cc_signals[:, t])
+            inject_raw = cc_signals[:, t].reshape(BS, NC, D)
 
-            if use_checkpoint:
-                h, msg = torch.utils.checkpoint.checkpoint(
-                    _one_token_step, h, msg, inject_signal,
-                    use_reentrant=False)
+            if use_fused_token_step:
+                h, msg = _fused_token_step(
+                    h, msg, w_conn_sig, w_conn_border_sig,
+                    decay_logit, primitives,
+                    self.conn_indices, self.border_conn_indices,
+                    self.neuron_id, self.inject_indices,
+                    inject_raw,
+                    self.state_w1, self.state_b1, self.state_w2, self.state_b2,
+                    self.msg_w1, self.msg_b1, self.msg_w2, self.msg_b2,
+                    self.config,
+                )
             else:
-                h, msg = _one_token_step(h, msg, inject_signal)
+                inject_signal = inject_raw.unsqueeze(2).expand(-1, -1, self.config.alpha, -1)
+                if use_checkpoint:
+                    h, msg = torch.utils.checkpoint.checkpoint(
+                        _one_token_step, h, msg, inject_signal,
+                        use_reentrant=False)
+                else:
+                    h, msg = _one_token_step(h, msg, inject_signal)
 
             readouts.append(self._readout(msg))
 

@@ -116,7 +116,7 @@ def cell_forward_kernel(
                            decay_val * w_decay + b1)
                     hidden_val = libdevice.tanh(dot)
 
-                    w2_row = tl.load(sw2_ptr + hid * D + d).to(tl.float32)
+                    w2_row = tl.load(sw2_ptr + d * H_S + hid).to(tl.float32)
                     update_acc += hidden_val * w2_row
 
                 update = libdevice.tanh(update_acc)
@@ -139,7 +139,7 @@ def cell_forward_kernel(
                            tl.sum(nid * w_id) + b1)
                     hidden_val = libdevice.tanh(dot)
 
-                    w2_row = tl.load(mw2_ptr + hid * D + d).to(tl.float32)
+                    w2_row = tl.load(mw2_ptr + d * H_M + hid).to(tl.float32)
                     msg_acc += hidden_val * w2_row
 
                 msg_new = libdevice.tanh(msg_acc) + nid
@@ -422,3 +422,580 @@ def fused_cell_forward(h, msg, w_conn_sig, decay, primitives,
         conn_indices, neuron_id, inject_indices, readout_indices,
         cc_signals, state_w1, state_b1, state_w2, state_b2,
         msg_w1, msg_b1, msg_w2, msg_b2, config)
+
+
+@triton.jit
+def combined_cell_border_gather_fwd_kernel(
+    msg_ptr,
+    w_conn_sig_ptr,
+    conn_idx_ptr,
+    w_conn_border_sig_ptr,
+    border_conn_idx_ptr,
+    out_ptr,
+    NC: tl.constexpr,
+    C: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    K_B: tl.constexpr,
+    ALPHA: tl.constexpr,
+):
+    """Compute one cell's received tensor, including border contributions.
+
+    One program handles one (batch, cell) pair and emits [C, D].
+    This avoids materializing [BS, NC, C, K, D] neighbor tensors.
+    """
+    pid = tl.program_id(0)
+    b = pid // NC
+    cell = pid % NC
+    d = tl.arange(0, D)
+
+    cell_base = (b * NC + cell) * C
+    conn_base = cell * C
+    border_base = (b * NC + cell) * B
+
+    for n in range(C):
+        acc = tl.zeros([D], dtype=tl.float32)
+        edge_base = (cell_base + n) * K
+
+        for k in range(K):
+            src = tl.load(conn_idx_ptr + (conn_base + n) * K + k).to(tl.int32)
+            w = tl.load(w_conn_sig_ptr + edge_base + k).to(tl.float32)
+            src_offset = (cell_base + src) * D + d
+            src_msg = tl.load(msg_ptr + src_offset).to(tl.float32)
+            acc += w * src_msg
+
+        if B > 0 and K_B > 0 and n >= ALPHA and n < (ALPHA + B):
+            border_slot = n - ALPHA
+            border_edge_base = (border_base + border_slot) * K_B
+            for kb in range(K_B):
+                src_border = tl.load(
+                    border_conn_idx_ptr + (cell * B + border_slot) * K_B + kb
+                ).to(tl.int32)
+                remote_cell = src_border // B
+                remote_slot = src_border % B
+                remote_n = ALPHA + remote_slot
+                w_b = tl.load(w_conn_border_sig_ptr + border_edge_base + kb).to(tl.float32)
+                remote_offset = ((b * NC + remote_cell) * C + remote_n) * D + d
+                src_msg = tl.load(msg_ptr + remote_offset).to(tl.float32)
+                acc += w_b * src_msg
+
+        tl.store(out_ptr + (cell_base + n) * D + d, acc)
+
+
+class _CombinedCellBorderGatherFn(torch.autograd.Function):
+    """Fused local+border gather for the live v11 path."""
+
+    @staticmethod
+    def forward(ctx, msg, w_conn_sig, conn_indices,
+                w_conn_border_sig, border_conn_indices, alpha):
+        if not msg.is_cuda:
+            raise RuntimeError("combined gather Triton path requires CUDA tensors")
+
+        msg_c = msg.contiguous()
+        w_conn_sig_c = w_conn_sig.contiguous()
+        conn_indices_c = conn_indices.contiguous()
+        w_conn_border_sig_c = w_conn_border_sig.contiguous()
+        border_conn_indices_c = border_conn_indices.contiguous()
+
+        BS, NC, C, D = msg_c.shape
+        K = w_conn_sig_c.shape[-1]
+        B = w_conn_border_sig_c.shape[2]
+        K_B = w_conn_border_sig_c.shape[3]
+
+        out = torch.empty_like(msg_c)
+        grid = (BS * NC,)
+        combined_cell_border_gather_fwd_kernel[grid](
+            msg_c,
+            w_conn_sig_c,
+            conn_indices_c,
+            w_conn_border_sig_c,
+            border_conn_indices_c,
+            out,
+            NC=NC,
+            C=C,
+            D=D,
+            K=K,
+            B=B,
+            K_B=K_B,
+            ALPHA=alpha,
+        )
+
+        ctx.save_for_backward(
+            msg_c,
+            w_conn_sig_c,
+            conn_indices_c,
+            w_conn_border_sig_c,
+            border_conn_indices_c,
+        )
+        ctx.alpha = alpha
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        msg, w_conn_sig, conn_indices, w_conn_border_sig, border_conn_indices = ctx.saved_tensors
+        alpha = ctx.alpha
+
+        BS, NC, C, D = msg.shape
+        K = w_conn_sig.shape[-1]
+        B = w_conn_border_sig.shape[2]
+        K_B = w_conn_border_sig.shape[3]
+        dt = grad_out.dtype
+
+        grad_out_f = grad_out.float()
+        msg_f = msg.float()
+        w_conn_sig_f = w_conn_sig.float()
+        w_conn_border_sig_f = w_conn_border_sig.float()
+
+        grad_msg = torch.zeros_like(msg_f)
+        grad_w_conn_sig = torch.empty_like(w_conn_sig_f)
+
+        batch_idx = torch.arange(BS, device=msg.device)[:, None, None]
+        cell_idx = torch.arange(NC, device=msg.device)[None, :, None]
+        conn_expanded = conn_indices.unsqueeze(0).expand(BS, -1, -1, -1)
+
+        # Local cell gather backward, streamed over K to avoid a huge [.., K, D] tensor.
+        for k in range(K):
+            src = conn_expanded[..., k]
+            src_msg = msg_f[batch_idx, cell_idx, src]
+            grad_w_conn_sig[..., k] = (grad_out_f * src_msg).sum(dim=-1)
+            src_exp = src.unsqueeze(-1).expand(-1, -1, -1, D)
+            grad_msg.scatter_add_(
+                2, src_exp, grad_out_f * w_conn_sig_f[..., k].unsqueeze(-1)
+            )
+
+        grad_w_conn_border_sig = torch.empty_like(w_conn_border_sig_f)
+        if B > 0 and K_B > 0:
+            border_local_idx = torch.arange(alpha, alpha + B, device=msg.device)
+            border_local_idx = border_local_idx.unsqueeze(0).unsqueeze(0).expand(BS, NC, -1)
+            border_grad = grad_out_f[:, :, alpha:alpha + B, :]
+            border_flat = msg_f[:, :, alpha:alpha + B, :].reshape(BS, NC * B, D)
+            grad_border_flat = torch.zeros(BS, NC * B, D, device=msg.device, dtype=msg_f.dtype)
+            conn_flat = border_conn_indices.reshape(NC * B, K_B)
+            batch_border_idx = torch.arange(BS, device=msg.device)[:, None]
+
+            for kb in range(K_B):
+                src = conn_flat[:, kb]
+                src_msg = border_flat[batch_border_idx, src.unsqueeze(0).expand(BS, -1)]
+                src_msg = src_msg.reshape(BS, NC, B, D)
+                grad_w_conn_border_sig[..., kb] = (border_grad * src_msg).sum(dim=-1)
+
+                contrib = border_grad * w_conn_border_sig_f[..., kb].unsqueeze(-1)
+                grad_border_flat.scatter_add_(
+                    1,
+                    src.unsqueeze(0).unsqueeze(-1).expand(BS, -1, D),
+                    contrib.reshape(BS, NC * B, D),
+                )
+
+            grad_border = grad_border_flat.reshape(BS, NC, B, D)
+            grad_msg[:, :, alpha:alpha + B, :] += grad_border
+        else:
+            grad_w_conn_border_sig.zero_()
+
+        return (
+            grad_msg.to(msg.dtype),
+            grad_w_conn_sig.to(w_conn_sig.dtype),
+            None,
+            grad_w_conn_border_sig.to(w_conn_border_sig.dtype),
+            None,
+            None,
+        )
+
+
+def combined_cell_border_gather(msg, w_conn_sig, conn_indices,
+                                w_conn_border_sig, border_conn_indices,
+                                alpha):
+    """CUDA Triton fused gather for the live cell memory graph."""
+    return _CombinedCellBorderGatherFn.apply(
+        msg, w_conn_sig, conn_indices,
+        w_conn_border_sig, border_conn_indices, alpha,
+    )
+
+
+@triton.jit
+def cell_round_kernel(
+    h_ptr,
+    msg_ptr,
+    w_conn_sig_ptr,
+    w_conn_border_sig_ptr,
+    decay_logit_ptr,
+    prim_ptr,
+    conn_idx_ptr,
+    border_conn_idx_ptr,
+    nid_ptr,
+    inject_idx_ptr,
+    inject_sig_ptr,
+    sw1_ptr, sb1_ptr, sw2_ptr, sb2_ptr,
+    mw1_ptr, mb1_ptr, mw2_ptr, mb2_ptr,
+    h_out_ptr,
+    msg_out_ptr,
+    NC: tl.constexpr,
+    C: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    K_B: tl.constexpr,
+    ALPHA: tl.constexpr,
+    H_S: tl.constexpr,
+    H_M: tl.constexpr,
+    STATE_IN: tl.constexpr,
+    MSG_IN: tl.constexpr,
+):
+    """One synchronous message-passing round for one (batch, cell)."""
+    pid = tl.program_id(0)
+    b = pid // NC
+    cell = pid % NC
+    d = tl.arange(0, D)
+
+    cell_base = (b * NC + cell) * C
+    cell_nid_base = cell * C
+    cell_conn_base = cell * C
+    border_base = (b * NC + cell) * B
+    inject_offset = (b * NC + cell) * D + d
+    inject = tl.load(inject_sig_ptr + inject_offset).to(tl.float32)
+
+    for n in range(C):
+        n_offset = (cell_base + n) * D
+        n_k_offset = (cell_base + n) * K
+
+        received = tl.zeros([D], dtype=tl.float32)
+        for k in range(K):
+            src = tl.load(conn_idx_ptr + (cell_conn_base + n) * K + k).to(tl.int32)
+            w = tl.load(w_conn_sig_ptr + n_k_offset + k).to(tl.float32)
+            src_msg = tl.load(msg_ptr + (cell_base + src) * D + d).to(tl.float32)
+            received += w * src_msg
+
+        if B > 0 and K_B > 0 and n >= ALPHA and n < (ALPHA + B):
+            border_slot = n - ALPHA
+            border_edge_base = (border_base + border_slot) * K_B
+            for kb in range(K_B):
+                src_border = tl.load(
+                    border_conn_idx_ptr + (cell * B + border_slot) * K_B + kb
+                ).to(tl.int32)
+                remote_cell = src_border // B
+                remote_slot = src_border % B
+                remote_n = ALPHA + remote_slot
+                w_b = tl.load(w_conn_border_sig_ptr + border_edge_base + kb).to(tl.float32)
+                src_msg = tl.load(
+                    msg_ptr + ((b * NC + remote_cell) * C + remote_n) * D + d
+                ).to(tl.float32)
+                received += w_b * src_msg
+
+        is_inject = tl.full([], 0, tl.int32)
+        for a in range(ALPHA):
+            idx = tl.load(inject_idx_ptr + cell * ALPHA + a).to(tl.int32)
+            is_inject = tl.where(idx == n, 1, is_inject)
+        input_vec = received + inject * is_inject.to(tl.float32)
+
+        prim = tl.load(prim_ptr + n_offset + d).to(tl.float32)
+        nid = tl.load(nid_ptr + (cell_nid_base + n) * D + d).to(tl.float32)
+        decay_logit_val = tl.load(decay_logit_ptr + cell_base + n).to(tl.float32)
+        decay_val = tl.sigmoid(decay_logit_val)
+        h_prev = tl.load(h_ptr + n_offset + d).to(tl.float32)
+
+        update_acc = tl.load(sb2_ptr + d).to(tl.float32)
+        for hid in range(H_S):
+            row = hid * STATE_IN
+            w_in = tl.load(sw1_ptr + row + d).to(tl.float32)
+            w_prim = tl.load(sw1_ptr + row + D + d).to(tl.float32)
+            w_id = tl.load(sw1_ptr + row + 2 * D + d).to(tl.float32)
+            w_decay = tl.load(sw1_ptr + row + 3 * D).to(tl.float32)
+            b1 = tl.load(sb1_ptr + hid).to(tl.float32)
+
+            dot = (
+                tl.sum(input_vec * w_in) +
+                tl.sum(prim * w_prim) +
+                tl.sum(nid * w_id) +
+                decay_logit_val * w_decay + b1
+            )
+            hidden_val = libdevice.tanh(dot)
+            w2_row = tl.load(sw2_ptr + d * H_S + hid).to(tl.float32)
+            update_acc += hidden_val * w2_row
+
+        update = libdevice.tanh(update_acc)
+        h_new = decay_val * h_prev + (1.0 - decay_val) * update
+
+        msg_acc = tl.load(mb2_ptr + d).to(tl.float32)
+        for hid in range(H_M):
+            row = hid * MSG_IN
+            w_h = tl.load(mw1_ptr + row + d).to(tl.float32)
+            w_prim = tl.load(mw1_ptr + row + D + d).to(tl.float32)
+            w_id = tl.load(mw1_ptr + row + 2 * D + d).to(tl.float32)
+            b1 = tl.load(mb1_ptr + hid).to(tl.float32)
+
+            dot = (
+                tl.sum(h_new * w_h) +
+                tl.sum(prim * w_prim) +
+                tl.sum(nid * w_id) + b1
+            )
+            hidden_val = libdevice.tanh(dot)
+            w2_row = tl.load(mw2_ptr + d * H_M + hid).to(tl.float32)
+            msg_acc += hidden_val * w2_row
+
+        msg_new = libdevice.tanh(msg_acc) + nid
+        tl.store(h_out_ptr + n_offset + d, h_new.to(tl.bfloat16))
+        tl.store(msg_out_ptr + n_offset + d, msg_new.to(tl.bfloat16))
+
+
+def _reference_token_step(
+    h, msg, w_conn_sig, w_conn_border_sig, decay_logit, primitives,
+    neuron_id, inject_signal, conn_indices, border_conn_indices, inject_indices,
+    state_w1, state_b1, state_w2, state_b2,
+    msg_w1, msg_b1, msg_w2, msg_b2, config,
+):
+    import torch.nn.functional as F
+
+    BS = h.shape[0]
+    NC = config.N_cells
+    C = config.C_neurons
+    D = config.D_neuron
+    alpha = config.alpha
+
+    dt = torch.float32
+    h = h.to(dt)
+    msg = msg.to(dt)
+    w_conn_sig = w_conn_sig.to(dt)
+    w_conn_border_sig = w_conn_border_sig.to(dt)
+    decay_logit = decay_logit.to(dt)
+    primitives = primitives.to(dt)
+    neuron_id = neuron_id.to(dt)
+    inject_signal = inject_signal.to(dt)
+    state_w1 = state_w1.to(dt)
+    state_b1 = state_b1.to(dt)
+    state_w2 = state_w2.to(dt)
+    state_b2 = state_b2.to(dt)
+    msg_w1 = msg_w1.to(dt)
+    msg_b1 = msg_b1.to(dt)
+    msg_w2 = msg_w2.to(dt)
+    msg_b2 = msg_b2.to(dt)
+
+    d_val = torch.sigmoid(decay_logit).unsqueeze(-1)
+    omd = 1.0 - d_val
+
+    w_in_s = state_w1[:, :D]
+    w_prim_s = state_w1[:, D:2 * D]
+    w_id_s = state_w1[:, 2 * D:3 * D]
+    w_decay_s = state_w1[:, 3 * D:]
+    w_h_m = msg_w1[:, :D]
+    w_prim_m = msg_w1[:, D:2 * D]
+    w_id_m = msg_w1[:, 2 * D:]
+
+    batch_idx = torch.arange(BS, device=h.device)[:, None, None, None]
+    cell_idx = torch.arange(NC, device=h.device)[None, :, None, None]
+    border_idx = torch.arange(alpha, alpha + config.N_border_per_cell, device=h.device)
+    border_idx = border_idx.unsqueeze(0).unsqueeze(0).expand(BS, NC, -1)
+    inject_idx = inject_indices.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, D)
+
+    for _ in range(config.R_rounds):
+        conn_exp = conn_indices.unsqueeze(0).expand(BS, -1, -1, -1)
+        neighbor_msgs = msg[batch_idx, cell_idx, conn_exp]
+        received = (w_conn_sig.unsqueeze(-1) * neighbor_msgs).sum(dim=3)
+
+        if config.N_border_per_cell > 0 and config.K_border > 0:
+            border_flat = msg[:, :, alpha:alpha + config.N_border_per_cell, :].reshape(
+                BS, NC * config.N_border_per_cell, D
+            )
+            conn_flat = border_conn_indices.reshape(NC * config.N_border_per_cell, config.K_border)
+            border_neighbor = border_flat[
+                torch.arange(BS, device=h.device)[:, None, None],
+                conn_flat.unsqueeze(0).expand(BS, -1, -1),
+            ]
+            border_neighbor = border_neighbor.reshape(
+                BS, NC, config.N_border_per_cell, config.K_border, D
+            )
+            border_received = (w_conn_border_sig.unsqueeze(-1) * border_neighbor).sum(dim=3)
+            received[:, :, alpha:alpha + config.N_border_per_cell, :] += border_received
+
+        inject_addend = torch.zeros_like(received)
+        inject_addend.scatter_(2, inject_idx, inject_signal.unsqueeze(2).expand(-1, -1, alpha, -1))
+        input_vec = received + inject_addend
+
+        hidden = (
+            F.linear(input_vec, w_in_s) +
+            F.linear(primitives, w_prim_s) +
+            F.linear(neuron_id, w_id_s).unsqueeze(0) +
+            F.linear(decay_logit.unsqueeze(-1), w_decay_s) +
+            state_b1
+        )
+        update = torch.tanh(F.linear(torch.tanh(hidden), state_w2, state_b2))
+        h = d_val * h + omd * update
+
+        hidden_m = (
+            F.linear(h, w_h_m) +
+            F.linear(primitives, w_prim_m) +
+            F.linear(neuron_id, w_id_m).unsqueeze(0) +
+            msg_b1
+        )
+        msg = torch.tanh(F.linear(torch.tanh(hidden_m), msg_w2, msg_b2)) + neuron_id
+
+    return h, msg
+
+
+class _FusedTokenStepFn(torch.autograd.Function):
+    """Fused one-token update with sequential rounds inside the op."""
+
+    @staticmethod
+    def forward(ctx, h, msg, w_conn_sig, w_conn_border_sig,
+                decay_logit, primitives,
+                conn_indices, border_conn_indices, neuron_id, inject_indices,
+                inject_signal,
+                state_w1, state_b1, state_w2, state_b2,
+                msg_w1, msg_b1, msg_w2, msg_b2, config):
+        BS, NC, C, D = h.shape
+        K = w_conn_sig.shape[-1]
+        B = w_conn_border_sig.shape[2]
+        K_B = w_conn_border_sig.shape[3]
+
+        h_cur = h.contiguous()
+        msg_cur = msg.contiguous()
+        h_next = torch.empty_like(h_cur)
+        msg_next = torch.empty_like(msg_cur)
+        inject_signal_c = inject_signal.contiguous()
+
+        grid = (BS * NC,)
+        for _ in range(config.R_rounds):
+            cell_round_kernel[grid](
+                h_cur, msg_cur,
+                w_conn_sig.contiguous(),
+                w_conn_border_sig.contiguous(),
+                decay_logit.contiguous(),
+                primitives.contiguous(),
+                conn_indices.contiguous(),
+                border_conn_indices.contiguous(),
+                neuron_id.contiguous().float(),
+                inject_indices.contiguous(),
+                inject_signal_c,
+                state_w1.contiguous().float(),
+                state_b1.contiguous().float(),
+                state_w2.contiguous().float(),
+                state_b2.contiguous().float(),
+                msg_w1.contiguous().float(),
+                msg_b1.contiguous().float(),
+                msg_w2.contiguous().float(),
+                msg_b2.contiguous().float(),
+                h_next,
+                msg_next,
+                NC=NC,
+                C=C,
+                D=D,
+                K=K,
+                B=B,
+                K_B=K_B,
+                ALPHA=config.alpha,
+                H_S=config.state_mlp_hidden,
+                H_M=config.msg_mlp_hidden,
+                STATE_IN=3 * D + 1,
+                MSG_IN=3 * D,
+            )
+            h_cur, h_next = h_next, h_cur
+            msg_cur, msg_next = msg_next, msg_cur
+
+        ctx.save_for_backward(
+            h, msg, w_conn_sig, w_conn_border_sig, decay_logit, primitives,
+            neuron_id, inject_signal,
+            state_w1, state_b1, state_w2, state_b2,
+            msg_w1, msg_b1, msg_w2, msg_b2,
+        )
+        ctx.config = config
+        ctx.conn_indices = conn_indices
+        ctx.border_conn_indices = border_conn_indices
+        ctx.inject_indices = inject_indices
+        return h_cur, msg_cur
+
+    @staticmethod
+    def backward(ctx, grad_h, grad_msg):
+        (h0, msg0, w_conn_sig, w_conn_border_sig, decay_logit, primitives,
+         neuron_id, inject_signal,
+         state_w1, state_b1, state_w2, state_b2,
+         msg_w1, msg_b1, msg_w2, msg_b2) = ctx.saved_tensors
+
+        config = ctx.config
+        conn_indices = ctx.conn_indices
+        border_conn_indices = ctx.border_conn_indices
+        inject_indices = ctx.inject_indices
+
+        inputs = [
+            h0.detach().requires_grad_(True),
+            msg0.detach().requires_grad_(True),
+            w_conn_sig.detach().requires_grad_(True),
+            w_conn_border_sig.detach().requires_grad_(True),
+            decay_logit.detach().requires_grad_(True),
+            primitives.detach().requires_grad_(True),
+            neuron_id.detach().requires_grad_(True),
+            inject_signal.detach(),
+            state_w1.detach().requires_grad_(True),
+            state_b1.detach().requires_grad_(True),
+            state_w2.detach().requires_grad_(True),
+            state_b2.detach().requires_grad_(True),
+            msg_w1.detach().requires_grad_(True),
+            msg_b1.detach().requires_grad_(True),
+            msg_w2.detach().requires_grad_(True),
+            msg_b2.detach().requires_grad_(True),
+        ]
+
+        with torch.enable_grad():
+            h_ref, msg_ref = _reference_token_step(
+                inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
+                inputs[6], inputs[7],
+                conn_indices, border_conn_indices, inject_indices,
+                inputs[8], inputs[9], inputs[10], inputs[11],
+                inputs[12], inputs[13], inputs[14], inputs[15],
+                config,
+            )
+
+        grads = torch.autograd.grad(
+            outputs=(h_ref, msg_ref),
+            inputs=[inp for inp in inputs if inp.requires_grad],
+            grad_outputs=(grad_h.to(h_ref.dtype), grad_msg.to(msg_ref.dtype)),
+            allow_unused=True,
+        )
+
+        grad_iter = iter(grads)
+        result = []
+        for inp in inputs:
+            if inp.requires_grad:
+                result.append(next(grad_iter))
+            else:
+                result.append(None)
+
+        grad_h0 = result[0]
+        grad_msg0 = result[1]
+        grad_w_conn_sig = result[2]
+        grad_w_conn_border_sig = result[3]
+        grad_decay_logit = result[4]
+        grad_primitives = result[5]
+        grad_neuron_id = result[6]
+        grad_state_w1 = result[8]
+        grad_state_b1 = result[9]
+        grad_state_w2 = result[10]
+        grad_state_b2 = result[11]
+        grad_msg_w1 = result[12]
+        grad_msg_b1 = result[13]
+        grad_msg_w2 = result[14]
+        grad_msg_b2 = result[15]
+
+        return (
+            grad_h0, grad_msg0, grad_w_conn_sig, grad_w_conn_border_sig,
+            grad_decay_logit, grad_primitives,
+            None, None, grad_neuron_id, None,
+            None,
+            grad_state_w1, grad_state_b1, grad_state_w2, grad_state_b2,
+            grad_msg_w1, grad_msg_b1, grad_msg_w2, grad_msg_b2,
+            None,
+        )
+
+
+def fused_token_step(
+    h, msg, w_conn_sig, w_conn_border_sig, decay_logit, primitives,
+    conn_indices, border_conn_indices, neuron_id, inject_indices,
+    inject_signal,
+    state_w1, state_b1, state_w2, state_b2,
+    msg_w1, msg_b1, msg_w2, msg_b2, config,
+):
+    return _FusedTokenStepFn.apply(
+        h, msg, w_conn_sig, w_conn_border_sig, decay_logit, primitives,
+        conn_indices, border_conn_indices, neuron_id, inject_indices,
+        inject_signal,
+        state_w1, state_b1, state_w2, state_b2,
+        msg_w1, msg_b1, msg_w2, msg_b2, config,
+    )
