@@ -16,9 +16,9 @@ class TestConfig:
     def test_tier_a_validates(self):
         c = V11Config.tier_a()
         c.validate()
-        assert c.N_total == 65536
+        assert c.N_total == 256 * 124  # 31744
         assert c.N_cells == 256
-        assert c.C_neurons == 256
+        assert c.C_neurons == 124
         assert c.N_inject_per_cell == 4
         assert c.N_readout_per_cell == 4
 
@@ -73,8 +73,8 @@ class TestCellMemoryGraphInit:
         # State and msg MLPs are shared (no N dimension)
         assert mg.state_w1.shape == (cfg.state_mlp_hidden, 3 * cfg.D_neuron + 1)
         assert mg.msg_w1.shape == (cfg.msg_mlp_hidden, 3 * cfg.D_neuron)
-        # Modulator is per-cell
-        assert mg.mod_w1.shape[0] == cfg.N_cells
+        # Modulator is per-neuron
+        assert mg.mod_w1.shape[0] == cfg.N_total
 
     def test_all_params_require_grad(self):
         cfg = make_tiny()

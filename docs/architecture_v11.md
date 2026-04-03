@@ -12,7 +12,7 @@ connect only within their cell. Multiple message-passing rounds per token step
 compensate for thin per-neuron dimensionality. Dedicated inject/readout port
 neurons interface with the language model without signal dilution.
 
-**65,536 total neurons. ~526K memory params. ~52M total (LM dominates).**
+**31,744 total neurons. ~55M memory params (per-neuron modulator). ~107M total.**
 
 ---
 
@@ -49,7 +49,7 @@ Input → Embedding → proj_up (768→2048)
 | L_total | 4 | Scan layers (2 lower + 2 upper) |
 | d_inner | 580 | Scan layer inner dimension |
 | N_cells | 256 | Number of cells (= D / D_neuron) |
-| C_neurons | 256 | Neurons per cell |
+| C_neurons | 124 | Neurons per cell |
 | D_neuron | 8 | Per-neuron state dimension |
 | K_connections | 16 | Cell-local connections per neuron |
 | N_border_per_cell | 4 | Border neurons per cell (inter-cell) |
@@ -58,20 +58,20 @@ Input → Embedding → proj_up (768→2048)
 | alpha | 4 | Inject/readout redundancy factor |
 | state_mlp_hidden | 16 | Shared state MLP hidden dim |
 | msg_mlp_hidden | 16 | Shared message MLP hidden dim |
-| cell_mod_hidden | 32 | Shared modulator hidden dim |
+| cell_mod_hidden | 24 | Per-neuron modulator hidden dim |
 | T | 128 | Tokens per segment |
-| N_total | 65,536 | Total neurons (256 × 256) |
+| N_total | 31,744 | Total neurons (256 × 124) |
 
 ---
 
 ## Cell Structure
 
-Each cell contains 256 neurons with designated roles:
+Each cell contains 124 neurons with designated roles:
 - **4 inject neurons** (indices 0..3): receive LM signal via additive injection
 - **4 border neurons** (indices 4..7): have K_border=4 connections to border
   neurons in OTHER cells, enabling inter-cell information flow
-- **4 readout neurons** (indices 252..255): messages read out to LM
-- **244 interneurons** (indices 8..251): internal computation only
+- **4 readout neurons** (indices 120..123): messages read out to LM
+- **112 interneurons** (indices 8..119): internal computation only
 
 All neurons participate in R rounds of message passing. Every round:
 1. All neurons do intra-cell gather (K=16 cell-local connections)
@@ -200,16 +200,16 @@ Params: [16, 24] + [16] + [8, 16] + [8] = 536
 
 ---
 
-## Shared Modulator (Per-Neuron Input, Shared Weights)
+## Per-Neuron Modulator
 
-A shared-weight modulator MLP that runs **once per segment**. Unlike the
-state/msg MLPs which run every round of every token, the modulator runs
-once per 128 tokens — so even at 65K neurons the cost is negligible.
+Each neuron has its **own modulator MLP weights**. This is the dominant
+parameter block (~55M of 107M total) but runs only **once per segment**
+(every 128 tokens) — so the cost is negligible vs the T×R inner loop.
 
-Each neuron provides its own state as input and receives a personalized
-adjustment. The modulator learns general rules like "if this neuron's
-Hebbian traces are strong on connection k, strengthen it" — applied with
-per-neuron specificity via shared weights.
+Each neuron's modulator learns its own modulation strategy: how to adjust
+its connections, decay, and primitives based on its recent activity. This
+gives the memory graph substantial learning capacity concentrated in the
+slow neuromodulation pathway.
 
 ### Input (per neuron, 41 dims)
 - `hebbian[K=16]`: this neuron's Hebbian traces
@@ -224,26 +224,20 @@ per-neuron specificity via shared weights.
 - `prim_delta[D=8]`: adjustment to this neuron's primitives
 
 ### Implementation
-One `F.linear` call on `[BS × N_total, 41] × [41, 32]` — a single cuBLAS
-GEMM. At BS=32, N_total=65536: `[2M, 41]` input matrix. Takes <1ms.
+Per-neuron einsum: `'bni,nhi->bnh'` on `[BS, N_total, mod_in] × [N_total, H, mod_in]`.
+Runs once per segment. At BS=32, N=31744: a single kernel launch, ~1-2ms.
 
-### Params: [32, 41] + [32] + [25, 32] + [25] ≈ 2.1K
+### Params: [31744, 24, 41] + [31744, 24] + [31744, 24, 29] + [31744, 29] ≈ 55M
 
-### Why shared, not per-cell or per-neuron?
-- **Per-neuron weights** (v9 approach): 65K × 32 × 41 = 85M params. Dominates
-  the entire model. The throughput bottleneck we spent the session fixing.
-- **Per-cell weights** (previous v11 design): 256 × 32 × 41 = 335K params.
-  Gives cells personality but neurons in the same cell get identical adjustments
-  — misses the point of per-neuron modulation.
-- **Shared weights** (current): 2.1K params. Each neuron gets a unique output
-  because its INPUT (hebbian, h, decay, prim, neuron_id) is unique. The shared
-  MLP learns modulation RULES, not per-neuron lookup tables.
+### Why per-neuron?
+The modulator is the memory graph's primary learning capacity. With shared
+state/msg MLPs (~1K params), all the graph's expressiveness comes from:
+1. Per-neuron modulator weights (55M) — each neuron learns its own strategy
+2. Per-neuron identity embeddings (254K) — conditions the shared MLPs
+3. Learned connectivity — structural plasticity reshapes the graph
 
-Biologically: neuromodulators act through shared receptor types (the shared
-weights) but each neuron responds differently based on its own state (the
-per-neuron input). Dopamine doesn't carry neuron-specific instructions — it
-activates D1/D2 receptors identically, but the downstream effect depends on
-each neuron's current activity and receptor distribution.
+The modulator runs once per 128 tokens, so the 55M params cost almost nothing
+in compute. The params are "slow weights" that configure the fast dynamics.
 
 ---
 
@@ -259,13 +253,13 @@ LM:                                             ~51.6M
   split_mlp:                                     3.6M
   mem_scale [2048]:                              ~0
 
-Memory:                                          ~526K
+Memory:                                          ~55.3M
+  Per-neuron modulator (31744 neurons):          55.0M
+  neuron_id [256, 124, 8]:                       254K
   Shared state MLP:                              552
   Shared msg MLP:                                536
-  Shared modulator:                              2.1K
-  neuron_id [65536, 8]:                          524K
 
-Grand total:                                     ~52.1M
+Grand total:                                     ~107M
 ```
 
 ---

@@ -125,25 +125,26 @@ class CellMemoryGraph(nn.Module):
             (2.0 / (H_m + D)) ** 0.5)
         self.msg_b2 = nn.Parameter(torch.zeros(D, device=device))
 
-        # ---- Shared modulator (per-neuron input, shared weights) ----
-        # Takes per-neuron state and produces per-neuron adjustments.
-        # Shared F.linear = one cuBLAS GEMM on [BS*N_total, mod_in].
-        # Runs once per segment — cost is negligible vs T×R inner loop.
+        # ---- Per-neuron modulator ----
+        # Each neuron has its own modulator weights. Runs once per segment
+        # via per-neuron einsum — cost is negligible vs T×R inner loop.
         # Input: hebbian[K] + h[D] + decay[1] + primitives[D] + neuron_id[D]
         mod_in = K + 3 * D + 1
         # Output: w_conn_delta[K] + w_conn_border_delta[K_border] + decay_delta[1] + prim_delta[D]
         K_b = config.K_border
         mod_out = K + K_b + 1 + D
         H_mod = config.cell_mod_hidden
+        N_total = NC * C
 
+        # w1 layout: [N_total, H_mod, mod_in] for per-neuron einsum
         self.mod_w1 = nn.Parameter(
-            torch.randn(H_mod, mod_in, device=device) *
+            torch.randn(N_total, H_mod, mod_in, device=device) *
             (2.0 / (mod_in + H_mod)) ** 0.5)
-        self.mod_b1 = nn.Parameter(torch.zeros(H_mod, device=device))
+        self.mod_b1 = nn.Parameter(torch.zeros(N_total, H_mod, device=device))
         self.mod_w2 = nn.Parameter(
-            torch.randn(mod_out, H_mod, device=device) *
+            torch.randn(N_total, H_mod, mod_out, device=device) *
             (2.0 / (H_mod + mod_out)) ** 0.5)
-        self.mod_b2 = nn.Parameter(torch.zeros(mod_out, device=device))
+        self.mod_b2 = nn.Parameter(torch.zeros(N_total, mod_out, device=device))
 
         # ---- Neuron identity embedding ----
         self.neuron_id = nn.Parameter(
@@ -227,20 +228,21 @@ class CellMemoryGraph(nn.Module):
     def _run_modulator(self, h: Tensor, hebbian_traces: Tensor,
                        decay_logit: Tensor,
                        primitives: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Shared modulator: per-neuron state → per-neuron adjustments.
+        """Per-neuron modulator: each neuron has its own MLP weights.
 
-        Each neuron gets a personalized w_conn, decay, and primitive
-        adjustment based on its own state. Shared weights (one F.linear
-        call on [BS*N_total, mod_in]) — runs once per segment.
+        Runs once per segment via per-neuron einsum. Each neuron gets a
+        personalized w_conn, decay, and primitive adjustment based on its
+        own state AND its own learned modulation weights.
         """
         BS = h.shape[0]
         NC = self.config.N_cells
         C = self.config.C_neurons
         K = self.config.K_connections
         D = self.config.D_neuron
+        N = NC * C
 
         nid = self.neuron_id  # [NC, C, D]
-        wdt = self.mod_w1.dtype
+        idt = h.dtype
 
         # Per-neuron input: cat(hebbian, h, decay, primitives, neuron_id)
         mod_input = torch.cat([
@@ -248,14 +250,24 @@ class CellMemoryGraph(nn.Module):
             h,                                 # [BS, NC, C, D]
             decay_logit.unsqueeze(-1),         # [BS, NC, C, 1]
             primitives,                        # [BS, NC, C, D]
-            nid.unsqueeze(0).expand(BS, -1, -1, -1),  # [BS, NC, C, D]
-        ], dim=-1)  # [BS, NC, C, K+3D+1]
+            nid.to(idt).unsqueeze(0).expand(BS, -1, -1, -1),  # [BS, NC, C, D]
+        ], dim=-1)  # [BS, NC, C, mod_in]
 
-        # Shared F.linear: one GEMM on [BS*NC*C, mod_in]
-        flat = mod_input.reshape(-1, mod_input.shape[-1]).to(wdt)
-        hidden = torch.tanh(F.linear(flat, self.mod_w1, self.mod_b1))
-        output = F.linear(hidden, self.mod_w2, self.mod_b2)
-        output = output.reshape(BS, NC, C, -1).to(h.dtype)
+        # Flatten cell dims for per-neuron einsum: [BS, N, mod_in]
+        flat_input = mod_input.reshape(BS, N, -1)
+
+        # Per-neuron einsum: each neuron has its own W1, b1, W2, b2
+        # mod_w1: [N, H_mod, mod_in], mod_b1: [N, H_mod]
+        hidden = torch.einsum(
+            'bni,nhi->bnh', flat_input, self.mod_w1.to(idt)
+        ) + self.mod_b1.to(idt)
+        hidden = torch.tanh(hidden)
+        output = torch.einsum(
+            'bnh,nho->bno', hidden, self.mod_w2.to(idt)
+        ) + self.mod_b2.to(idt)
+
+        # Reshape back to [BS, NC, C, mod_out]
+        output = output.reshape(BS, NC, C, -1)
 
         # Split into per-neuron adjustments
         K_b = self.config.K_border
