@@ -101,3 +101,46 @@ Options:
 - Compile the ENTIRE forward_segment (not per-step) so the compiler
   can optimize across the loop
 - Accept 6K tok/s with C=64 and train at that speed
+
+### Approach 7: Truncated BPTT within segment (C=64, BS=16)
+- Detach h/msg every bptt_len steps, backprop only through last chunk
+- bptt=8: 5.0K tok/s, 15.5 GB
+- bptt=16: 4.8K tok/s, 15.5 GB
+- bptt=128: 4.7K tok/s, 15.5 GB
+- Minimal improvement — autograd per-step overhead dominates, not graph depth
+
+### Approach 8: C=64 + checkpoint + large BS
+- BS=16: 3.6K tok/s, 2.7 GB
+- BS=32: 3.4K tok/s, 4.9 GB
+- BS=96: 3.2K tok/s, 13.6 GB
+- Ultra-low VRAM enables huge batches, but checkpoint overhead caps at ~3.5K
+
+## Final Summary Table
+
+| Approach | Best tok/s | BS | VRAM | Notes |
+|----------|----------:|---:|-----:|-------|
+| Baseline C=124 | 3,056 | 8 | 7.5 GB | |
+| Checkpointed C=124 | 2,384 | 8 | 2.3 GB | VRAM-efficient |
+| **C=64 no checkpoint** | **5,927** | **16** | **8.6 GB** | **Best throughput** |
+| C=64 checkpointed | 3,642 | 16 | 2.7 GB | VRAM-efficient |
+| C=64 + TBPTT(8) | 4,975 | 16 | 15.5 GB | |
+| D=16 NC=128 | 4,608 | 8 | 6.4 GB | |
+| T=64 | 2,998 | 8 | 4.7 GB | |
+| **Forward-only (no autograd)** | **18,130** | **16** | **~3 GB** | **Compute ceiling** |
+| torch.compile step | 797 | 16 | - | Worse (recompile overhead) |
+
+## Conclusion
+
+**Best honest training throughput: 5.9K tok/s** (C=64, BS=16, no tricks).
+
+The compute ceiling is 18K tok/s (forward-only). Autograd adds 3x overhead.
+No approach we tested breaks through this — torch.compile, checkpointing,
+TBPTT, and larger BS all hit the same per-step autograd overhead wall.
+
+**To reach 20K tok/s, the forward+backward needs a fundamentally different
+approach**: either a custom autograd.Function that runs the T-loop in C++ 
+without per-step Python overhead, or hardware that doesn't have kernel 
+launch overhead (FPGA/neuromorphic chip).
+
+**Practical recommendation**: Train at 5.9K tok/s with C=64, BS=16.
+A 30K step run = 30K × 2048 / 5900 ≈ 2.9 hours. Acceptable.
