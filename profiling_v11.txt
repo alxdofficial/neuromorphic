@@ -1,0 +1,86 @@
+=== V11 Profiling Report (2026-04-03) ===
+
+Config:
+  N_total=31744, N_cells=256, C_neurons=124
+  D_neuron=8, K=16, K_border=4, R_rounds=4, alpha=4
+  H_mod=24, H_state=16, H_msg=16
+  Params: 106.9M (LM=51.6M, Mem=55.3M)
+  Per-neuron modulator: 55M params, runs once/segment via einsum
+  Shared state/msg MLPs: ~1K params, runs T×R=512 times/segment
+
+=== Forward-Only Throughput (Triton cell kernel active) ===
+  BS=4:  578 tok/s,  886ms/step, 1.08 GB
+  BS=8:  616 tok/s, 1663ms/step, 1.40 GB
+  BS=16: 626 tok/s, 3272ms/step, 2.02 GB
+  BS=32: 630 tok/s, 6498ms/step, 3.28 GB
+
+  NOTE: This is catastrophically slow. The LM alone would be ~70K tok/s.
+
+=== Training (forward+backward) ===
+  BROKEN — backward gradient shape mismatch in Triton autograd wrapper.
+  Bug: _FusedCellForwardFnBackward returned invalid gradient at index 11.
+  Got [16, 25] but expected shape compatible with [16] (state_b1 gradient).
+  The gradient tuple ordering in the backward doesn't match the forward args.
+
+=== Root Cause: Triton Kernel Is Wrong Approach for MLP ===
+
+The cell_forward_kernel processes C=124 neurons SEQUENTIALLY per program,
+with each neuron doing H=16 scalar dot products (tl.sum of D=8 elements)
+per MLP layer. Total per program: 124 × 128 × 4 × (16+16) hidden units
+× 8-element dot products = ~30M scalar reductions. Each tl.sum() wastes
+7/8 of the warp (D=8 < warp size 32).
+
+This is the same problem we hit with v9 fused Triton: scalar dot products
+in a sequential loop fundamentally cannot match cuBLAS throughput.
+
+=== What Should Be Done Instead ===
+
+1. DROP THE FUSED TRITON CELL KERNEL for the inner T×R loop.
+
+2. USE THE V9-BACKPROP SCAN PATTERN (Codex's optimization):
+   - Decompose state MLP: base_hidden (constant across T, computed once)
+     + inject_hidden (varies per T, one F.linear call for all T)
+   - fused_scan for temporal integration: h = decay * h + (1-decay) * update
+   - Batch msg MLP: one F.linear call for all T steps
+   - This replaces 512 sequential steps with ~5 cuBLAS GEMM + 1 fused_scan.
+
+3. CELL-LOCAL GATHER via PyTorch advanced indexing:
+   - msg[:, :, conn_indices] on contiguous [BS, NC, C, D] data
+   - Cache-friendly because cell data is contiguous (~1 KB per cell at D=8)
+   - No Triton kernel needed for this
+
+4. PER-NEURON MODULATOR via einsum (already correct, runs once/segment):
+   - einsum('bni,nhi->bnh', [BS, 31744, 45], [31744, 24, 45])
+   - Amortized over 128 tokens — cost is ~5-10ms, acceptable
+
+5. FIX BACKWARD: Either fix the gradient tuple ordering in the Triton
+   autograd wrapper, or (simpler) use the Python reference path with
+   gradient checkpointing. The Python reference already works correctly
+   for gradients — the only issue was VRAM at 65K neurons, which is
+   reduced now at 31K neurons.
+
+=== Expected Throughput After Fix ===
+
+Using the v9 scan pattern (shared F.linear + fused_scan):
+- State MLP: F.linear([BS×N, T, 25]) → one cuBLAS GEMM, ~1ms
+- fused_scan: [BS×N, T, D] → ~0.5ms
+- Msg MLP: F.linear([BS×N, T, 24]) → one cuBLAS GEMM, ~1ms
+- Cell gather: advanced indexing, ~0.5ms
+- Per round: ~3ms. R=4 rounds × ~3ms = 12ms total for memory
+- LM: ~28ms
+- Total: ~40ms → ~10K tok/s at BS=32
+
+With the base/inject decomposition (only inject varies per T):
+- Base computed once, inject F.linear batched over T
+- Expected: ~6-8ms for memory → total ~35ms → ~12K tok/s
+
+The cell-local gather advantage is modest at these sizes because the
+gather is not the bottleneck — the MLP is. The real throughput win from
+cells would come with a properly fused Triton kernel that processes the
+GATHER (not the MLP) in shared memory, while letting cuBLAS handle MLPs.
+
+=== Files to Modify ===
+- src/v11/memory_graph.py: Replace Triton dispatch with v9-style
+  scan pattern (shared F.linear + fused_scan + cell-local gather)
+- src/v11/triton_kernels.py: Can be simplified to just the gather
+  kernel, or removed entirely if PyTorch gather is fast enough
