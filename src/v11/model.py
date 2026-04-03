@@ -4,6 +4,8 @@ Reuses V8LM (scan layers, PCM, inject_memory) unchanged.
 Only the memory graph is replaced with CellMemoryGraph.
 """
 
+import inspect
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -82,15 +84,18 @@ class V11Model(nn.Module):
             action_every = config.action_every
             n_segments = T // action_every
 
-            mem_out_segs = []
-            for seg in range(n_segments):
-                t0 = seg * action_every
-                t1 = t0 + action_every
-                seg_cc = cc_all[:, t0:t1]
-                seg_out = self.memory.forward_segment(seg_cc)
-                mem_out_segs.append(seg_out)
+            if n_segments == 1:
+                mem_out = self.memory.forward_segment(cc_all)
+            else:
+                mem_out_segs = []
+                for seg in range(n_segments):
+                    t0 = seg * action_every
+                    t1 = t0 + action_every
+                    seg_cc = cc_all[:, t0:t1]
+                    seg_out = self.memory.forward_segment(seg_cc)
+                    mem_out_segs.append(seg_out)
 
-            mem_out = torch.cat(mem_out_segs, dim=1)
+                mem_out = torch.cat(mem_out_segs, dim=1)
             H_enriched = self.lm.inject_memory(H_mid, mem_out)
         else:
             H_enriched = H_mid
@@ -136,3 +141,81 @@ class V11Model(nn.Module):
     def memory_param_count(self) -> int:
         return sum(p.numel() for p in self.memory.parameters()
                    if p.requires_grad)
+
+    def optimizer_param_groups(self, lr: float, weight_decay: float) -> list[dict]:
+        """Build AdamW param groups with separate LM/memory learning rates.
+
+        Weight decay follows the common dim-based rule:
+        - tensors with ndim >= 2 use decay
+        - biases / norm scales / scalar params do not
+        """
+        mem_lr = lr * self.config.mem_lr_scale
+        groups = []
+
+        def split_params(module: nn.Module):
+            decay, no_decay = [], []
+            for param in module.parameters():
+                if not param.requires_grad:
+                    continue
+                if param.ndim >= 2:
+                    decay.append(param)
+                else:
+                    no_decay.append(param)
+            return decay, no_decay
+
+        lm_decay, lm_no_decay = split_params(self.lm)
+        mem_decay, mem_no_decay = split_params(self.memory)
+
+        if lm_decay:
+            groups.append({
+                "params": lm_decay,
+                "lr": lr,
+                "weight_decay": weight_decay,
+            })
+        if lm_no_decay:
+            groups.append({
+                "params": lm_no_decay,
+                "lr": lr,
+                "weight_decay": 0.0,
+            })
+        if mem_decay:
+            groups.append({
+                "params": mem_decay,
+                "lr": mem_lr,
+                "weight_decay": weight_decay,
+            })
+        if mem_no_decay:
+            groups.append({
+                "params": mem_no_decay,
+                "lr": mem_lr,
+                "weight_decay": 0.0,
+            })
+
+        return groups
+
+    def make_optimizer(
+        self,
+        lr: float,
+        weight_decay: float = 0.1,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+    ) -> torch.optim.Optimizer:
+        """Create the recommended AdamW optimizer for v11 training.
+
+        Uses fused AdamW on CUDA when the local PyTorch build supports it.
+        """
+        param_groups = self.optimizer_param_groups(lr, weight_decay)
+        opt_kwargs = dict(
+            params=param_groups,
+            betas=betas,
+            eps=eps,
+        )
+        first_param = next(self.parameters(), None)
+        use_fused = (
+            first_param is not None and
+            first_param.is_cuda and
+            "fused" in inspect.signature(torch.optim.AdamW).parameters
+        )
+        if use_fused:
+            opt_kwargs["fused"] = True
+        return torch.optim.AdamW(**opt_kwargs)

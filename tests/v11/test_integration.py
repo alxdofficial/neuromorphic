@@ -78,3 +78,36 @@ class TestV11ModelForward:
             result["logits"].sum().backward()
             model.detach_states()
             model.zero_grad()
+
+    def test_optimizer_param_groups_cover_all_params(self):
+        cfg = make_tiny()
+        model = V11Model(cfg).float()
+        groups = model.optimizer_param_groups(lr=1e-3, weight_decay=0.1)
+
+        grouped = set()
+        for group in groups:
+            for p in group["params"]:
+                pid = id(p)
+                assert pid not in grouped
+                grouped.add(pid)
+
+        expected = {
+            id(p) for p in model.parameters() if p.requires_grad
+        }
+        assert grouped == expected
+
+    def test_optimizer_param_groups_apply_mem_lr_scale(self):
+        cfg = make_tiny(mem_lr_scale=0.25)
+        model = V11Model(cfg).float()
+        lr = 1e-3
+        groups = model.optimizer_param_groups(lr=lr, weight_decay=0.1)
+
+        lm_ids = {id(p) for p in model.lm.parameters() if p.requires_grad}
+        mem_ids = {id(p) for p in model.memory.parameters() if p.requires_grad}
+
+        for group in groups:
+            params = {id(p) for p in group["params"]}
+            if params & lm_ids:
+                assert group["lr"] == pytest.approx(lr)
+            if params & mem_ids:
+                assert group["lr"] == pytest.approx(lr * cfg.mem_lr_scale)
