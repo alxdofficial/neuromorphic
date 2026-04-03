@@ -101,21 +101,24 @@ class CellMemoryGraph(nn.Module):
             (2.0 / (H_m + D)) ** 0.5)
         self.msg_b2 = nn.Parameter(torch.zeros(D, device=device))
 
-        # ---- Per-cell modulator ----
-        # Input: hebb_mean[K] + h_mean[D] + decay_mean[1] + prim_mean[D] + activity[D]
+        # ---- Shared modulator (per-neuron input, shared weights) ----
+        # Takes per-neuron state and produces per-neuron adjustments.
+        # Shared F.linear = one cuBLAS GEMM on [BS*N_total, mod_in].
+        # Runs once per segment — cost is negligible vs T×R inner loop.
+        # Input: hebbian[K] + h[D] + decay[1] + primitives[D] + neuron_id[D]
         mod_in = K + 3 * D + 1
         # Output: w_conn_delta[K] + decay_delta[1] + prim_delta[D]
         mod_out = K + 1 + D
         H_mod = config.cell_mod_hidden
 
         self.mod_w1 = nn.Parameter(
-            torch.randn(NC, H_mod, mod_in, device=device) *
+            torch.randn(H_mod, mod_in, device=device) *
             (2.0 / (mod_in + H_mod)) ** 0.5)
-        self.mod_b1 = nn.Parameter(torch.zeros(NC, H_mod, device=device))
+        self.mod_b1 = nn.Parameter(torch.zeros(H_mod, device=device))
         self.mod_w2 = nn.Parameter(
-            torch.randn(NC, H_mod, mod_out, device=device) *
+            torch.randn(mod_out, H_mod, device=device) *
             (2.0 / (H_mod + mod_out)) ** 0.5)
-        self.mod_b2 = nn.Parameter(torch.zeros(NC, mod_out, device=device))
+        self.mod_b2 = nn.Parameter(torch.zeros(mod_out, device=device))
 
         # ---- Neuron identity embedding ----
         self.neuron_id = nn.Parameter(
@@ -194,45 +197,40 @@ class CellMemoryGraph(nn.Module):
     def _run_modulator(self, h: Tensor, hebbian_traces: Tensor,
                        decay_logit: Tensor,
                        primitives: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Per-cell modulator: aggregated cell stats → w_conn, decay, primitives.
+        """Shared modulator: per-neuron state → per-neuron adjustments.
 
-        Inputs are [BS, NC, C, ...]. Aggregates to [BS, NC, ...] for the
-        per-cell MLP, then broadcasts output back to [BS, NC, C, ...].
+        Each neuron gets a personalized w_conn, decay, and primitive
+        adjustment based on its own state. Shared weights (one F.linear
+        call on [BS*N_total, mod_in]) — runs once per segment.
         """
         BS = h.shape[0]
         NC = self.config.N_cells
+        C = self.config.C_neurons
         K = self.config.K_connections
         D = self.config.D_neuron
-        idt = h.dtype
 
-        # Aggregate per-cell statistics
-        h_mean = h.mean(dim=2)                         # [BS, NC, D]
-        decay_mean = decay_logit.mean(dim=2, keepdim=True)  # [BS, NC, 1]
-        prim_mean = primitives.mean(dim=2)             # [BS, NC, D]
-        hebb_mean = hebbian_traces.mean(dim=2)         # [BS, NC, K]
-        activity = self.msg_magnitude.mean(dim=2).unsqueeze(-1).expand(
-            -1, -1, D)                                  # [BS, NC, D]
+        nid = self.neuron_id  # [NC, C, D]
+        wdt = self.mod_w1.dtype
 
+        # Per-neuron input: cat(hebbian, h, decay, primitives, neuron_id)
         mod_input = torch.cat([
-            hebb_mean, h_mean, decay_mean, prim_mean, activity
-        ], dim=-1)  # [BS, NC, mod_in]
+            hebbian_traces,                    # [BS, NC, C, K]
+            h,                                 # [BS, NC, C, D]
+            decay_logit.unsqueeze(-1),         # [BS, NC, C, 1]
+            primitives,                        # [BS, NC, C, D]
+            nid.unsqueeze(0).expand(BS, -1, -1, -1),  # [BS, NC, C, D]
+        ], dim=-1)  # [BS, NC, C, K+3D+1]
 
-        # Per-cell MLP: einsum over cell dim
-        hidden = torch.einsum(
-            'bci,chi->bch', mod_input, self.mod_w1.to(idt)
-        ) + self.mod_b1.to(idt)
-        hidden = torch.tanh(hidden)
-        output = torch.einsum(
-            'bch,cho->bco', hidden, self.mod_w2.to(idt)
-        ) + self.mod_b2.to(idt)  # [BS, NC, mod_out]
+        # Shared F.linear: one GEMM on [BS*NC*C, mod_in]
+        flat = mod_input.reshape(-1, mod_input.shape[-1]).to(wdt)
+        hidden = torch.tanh(F.linear(flat, self.mod_w1, self.mod_b1))
+        output = F.linear(hidden, self.mod_w2, self.mod_b2)
+        output = output.reshape(BS, NC, C, -1).to(h.dtype)
 
-        # Split and broadcast to all neurons in cell
-        new_w_conn = output[..., :K].unsqueeze(2).expand(
-            -1, -1, self.config.C_neurons, -1)           # [BS, NC, C, K]
-        new_decay = output[..., K].unsqueeze(2).expand(
-            -1, -1, self.config.C_neurons)                # [BS, NC, C]
-        new_prim = output[..., K+1:].unsqueeze(2).expand(
-            -1, -1, self.config.C_neurons, -1)            # [BS, NC, C, D]
+        # Split into per-neuron adjustments
+        new_w_conn = output[..., :K]          # [BS, NC, C, K]
+        new_decay = output[..., K]            # [BS, NC, C]
+        new_prim = output[..., K+1:]          # [BS, NC, C, D]
 
         return new_w_conn, new_decay, new_prim
 

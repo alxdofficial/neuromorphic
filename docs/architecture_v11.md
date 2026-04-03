@@ -12,7 +12,7 @@ connect only within their cell. Multiple message-passing rounds per token step
 compensate for thin per-neuron dimensionality. Dedicated inject/readout port
 neurons interface with the language model without signal dilution.
 
-**65,536 total neurons. ~1.1M memory params. ~52M total (LM dominates).**
+**65,536 total neurons. ~526K memory params. ~52M total (LM dominates).**
 
 ---
 
@@ -56,7 +56,7 @@ Input → Embedding → proj_up (768→2048)
 | alpha | 4 | Inject/readout redundancy factor |
 | state_mlp_hidden | 16 | Shared state MLP hidden dim |
 | msg_mlp_hidden | 16 | Shared message MLP hidden dim |
-| cell_mod_hidden | 32 | Per-cell modulator hidden dim |
+| cell_mod_hidden | 32 | Shared modulator hidden dim |
 | T | 128 | Tokens per segment |
 | N_total | 65,536 | Total neurons (256 × 256) |
 
@@ -151,25 +151,50 @@ Params: [16, 24] + [16] + [8, 16] + [8] = 536
 
 ---
 
-## Per-Cell Modulator
+## Shared Modulator (Per-Neuron Input, Shared Weights)
 
-Each cell has its own modulator MLP that runs **once per segment** (not per
-token). It reads aggregated cell statistics and outputs templates broadcast
-to all neurons in the cell.
+A shared-weight modulator MLP that runs **once per segment**. Unlike the
+state/msg MLPs which run every round of every token, the modulator runs
+once per 128 tokens — so even at 65K neurons the cost is negligible.
 
-### Input (41 dims)
-- `hebb_mean[K=16]`: mean Hebbian trace across neurons
-- `h_mean[D=8]`: mean neuron state
-- `decay_mean[1]`: mean decay logit
-- `prim_mean[D=8]`: mean primitive
-- `activity[D=8]`: mean message magnitude per dim
+Each neuron provides its own state as input and receives a personalized
+adjustment. The modulator learns general rules like "if this neuron's
+Hebbian traces are strong on connection k, strengthen it" — applied with
+per-neuron specificity via shared weights.
 
-### Output (25 dims, broadcast to all neurons)
-- `w_conn_delta[K=16]`: added to each neuron's connection weights
-- `decay_delta[1]`: added to each neuron's decay logit
-- `prim_delta[D=8]`: added to each neuron's primitives
+### Input (per neuron, 41 dims)
+- `hebbian[K=16]`: this neuron's Hebbian traces
+- `h[D=8]`: this neuron's hidden state
+- `decay[1]`: this neuron's current decay logit
+- `primitives[D=8]`: this neuron's current primitives
+- `neuron_id[D=8]`: this neuron's identity embedding
 
-### Params: [256, 32, 41] + [256, 32] + [256, 32, 25] + [256, 25] ≈ 563K
+### Output (per neuron, 25 dims)
+- `w_conn_delta[K=16]`: adjustment to this neuron's connection weights
+- `decay_delta[1]`: adjustment to this neuron's decay logit
+- `prim_delta[D=8]`: adjustment to this neuron's primitives
+
+### Implementation
+One `F.linear` call on `[BS × N_total, 41] × [41, 32]` — a single cuBLAS
+GEMM. At BS=32, N_total=65536: `[2M, 41]` input matrix. Takes <1ms.
+
+### Params: [32, 41] + [32] + [25, 32] + [25] ≈ 2.1K
+
+### Why shared, not per-cell or per-neuron?
+- **Per-neuron weights** (v9 approach): 65K × 32 × 41 = 85M params. Dominates
+  the entire model. The throughput bottleneck we spent the session fixing.
+- **Per-cell weights** (previous v11 design): 256 × 32 × 41 = 335K params.
+  Gives cells personality but neurons in the same cell get identical adjustments
+  — misses the point of per-neuron modulation.
+- **Shared weights** (current): 2.1K params. Each neuron gets a unique output
+  because its INPUT (hebbian, h, decay, prim, neuron_id) is unique. The shared
+  MLP learns modulation RULES, not per-neuron lookup tables.
+
+Biologically: neuromodulators act through shared receptor types (the shared
+weights) but each neuron responds differently based on its own state (the
+per-neuron input). Dopamine doesn't carry neuron-specific instructions — it
+activates D1/D2 receptors identically, but the downstream effect depends on
+each neuron's current activity and receptor distribution.
 
 ---
 
@@ -185,13 +210,13 @@ LM:                                             ~51.6M
   split_mlp:                                     3.6M
   mem_scale [2048]:                              ~0
 
-Memory:                                          ~1.1M
+Memory:                                          ~526K
   Shared state MLP:                              552
   Shared msg MLP:                                536
-  Per-cell modulators (256 cells):               563K
+  Shared modulator:                              2.1K
   neuron_id [65536, 8]:                          524K
 
-Grand total:                                     ~52.7M
+Grand total:                                     ~52.1M
 ```
 
 ---
@@ -222,8 +247,8 @@ CE loss → logits → upper scan → H_enriched = H_mid + mem_scale × readout
   → h from temporal scan: h = decay × h + (1-decay) × update
   → state_MLP(received + inject, primitives, neuron_id, decay)
   → received from cell-local gather with sigmoid(w_conn)
-  → w_conn, decay, primitives from cell modulator
-  → cell modulator MLP(mod_w1, mod_w2) ← cell statistics
+  → w_conn, decay, primitives from shared modulator
+  → modulator MLP(mod_w1, mod_w2) ← per-neuron (hebbian, h, decay, prim, neuron_id)
 ```
 
 All memory parameters receive gradients. TBPTT detaches h and messages at
