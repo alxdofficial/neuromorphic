@@ -49,7 +49,7 @@ class V11Config:
     cell_mod_hidden: int = 32    # per-cell modulator hidden dim
 
     # Structural plasticity (within-cell)
-    structural_plasticity: bool = True
+    structural_plasticity: bool = False
     plasticity_pct: float = 0.02
     plasticity_exploration_frac: float = 0.2
     co_activation_ema_decay: float = 0.995

@@ -21,6 +21,7 @@ class TestConfig:
         assert c.C_neurons == 124
         assert c.N_inject_per_cell == 4
         assert c.N_readout_per_cell == 4
+        assert c.structural_plasticity is False
 
     def test_tier_tiny_validates(self):
         c = make_tiny()
@@ -180,6 +181,45 @@ class TestForwardSegment:
         grad2 = mg.mod_w1.grad.clone()
 
         assert not torch.equal(grad1, grad2)
+
+    def test_update_phi_accepts_bfloat16_activity(self):
+        cfg = make_tiny(structural_plasticity=True)
+        mg = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.bfloat16)
+        mg.initialize_states(BS)
+        act_trace = torch.randn(
+            BS, cfg.T, cfg.N_cells, cfg.C_neurons,
+            dtype=torch.bfloat16
+        )
+        mg._update_phi(act_trace)
+        assert mg._co_activation_ready is True
+        assert torch.isfinite(mg.co_activation_ema).all()
+
+    def test_chunked_round_matches_unchunked(self):
+        cfg = make_tiny(structural_plasticity=False)
+        cc = torch.randn(BS, cfg.T, cfg.D)
+
+        mg_ref = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg_ref.initialize_states(BS)
+
+        mg_chunk = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg_chunk.initialize_states(BS)
+        mg_chunk.load_state_dict(mg_ref.state_dict())
+        runtime = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in mg_ref.runtime_state_dict().items()
+        }
+        mg_chunk.load_runtime_state(runtime)
+
+        mg_ref._cell_chunk_size = lambda *_: cfg.N_cells
+        mg_chunk._cell_chunk_size = lambda *_: 2
+
+        out_ref = mg_ref.forward_segment(cc)
+        out_chunk = mg_chunk.forward_segment(cc)
+
+        assert torch.allclose(out_ref, out_chunk, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(mg_ref.h, mg_chunk.h, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(
+            mg_ref.prev_messages, mg_chunk.prev_messages, atol=1e-5, rtol=1e-5)
 
 
 class TestInjectReadout:

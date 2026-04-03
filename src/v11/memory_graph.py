@@ -359,6 +359,136 @@ class CellMemoryGraph(nn.Module):
         return torch.tanh(F.linear(torch.tanh(hidden), self.msg_w2.to(dt),
                                     self.msg_b2.to(dt))) + nid
 
+    def _cell_chunk_size(self, BS: int, T_seg: int, dtype: torch.dtype) -> int:
+        """Choose a training-friendly cell chunk size for the scan/message path."""
+        NC = self.config.N_cells
+        if NC <= 32:
+            return NC
+        # Empirically, smaller chunks reduce backward/checkpoint overhead more
+        # than the extra Python loop hurts. A 32-cell chunk is the best tested
+        # point on the 4090 for BS in {8, 16, 32}, while still fitting BS=32.
+        return 32
+
+    def _run_round_chunk(
+        self,
+        received_chunk: Tensor,
+        primitives_chunk: Tensor,
+        decay_chunk: Tensor,
+        h_chunk: Tensor,
+        inject_chunk: Tensor,
+        nid_chunk: Tensor,
+        inject_idx_chunk: Tensor,
+        readout_idx_chunk: Tensor,
+        need_readout: bool,
+        need_act_trace: bool,
+        state_w_in: Tensor,
+        state_w_prim: Tensor,
+        state_w_id: Tensor,
+        state_w_decay: Tensor,
+        state_w2: Tensor,
+        state_b1: Tensor,
+        state_b2: Tensor,
+        msg_w_h: Tensor,
+        msg_w_prim: Tensor,
+        msg_w_id: Tensor,
+        msg_w2: Tensor,
+        msg_b1: Tensor,
+        msg_b2: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run one scan round for a contiguous block of cells."""
+        BS, cell_chunk, C, D = received_chunk.shape
+        T_seg = inject_chunk.shape[1]
+        H_state = state_b1.shape[0]
+        alpha = self.config.alpha
+
+        base_hidden = (
+            F.linear(received_chunk, state_w_in) +
+            F.linear(primitives_chunk, state_w_prim) +
+            F.linear(nid_chunk, state_w_id).unsqueeze(0) +
+            F.linear(decay_chunk.unsqueeze(-1), state_w_decay) +
+            state_b1
+        )
+
+        inject_proj = F.linear(inject_chunk, state_w_in)
+        inject_src = inject_proj.unsqueeze(3).expand(-1, -1, -1, alpha, -1)
+        inject_idx_hidden = inject_idx_chunk.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        inject_idx_hidden = inject_idx_hidden.expand(BS, T_seg, -1, -1, H_state)
+
+        hidden_all = base_hidden.unsqueeze(1).expand(BS, T_seg, cell_chunk, C, H_state).clone()
+        hidden_all = hidden_all.scatter_add(3, inject_idx_hidden, inject_src)
+        hidden_all = torch.tanh(hidden_all)
+
+        update_all = torch.tanh(F.linear(hidden_all, state_w2, state_b2))
+
+        B_flat = BS * cell_chunk * C
+        decay_flat = decay_chunk.reshape(B_flat, 1, 1).expand(-1, T_seg, D)
+        omd_flat = (1 - torch.sigmoid(decay_chunk)).unsqueeze(-1).reshape(B_flat, 1, 1)
+        update_seq = update_all.permute(0, 2, 3, 1, 4).reshape(B_flat, T_seg, D)
+        b_flat = omd_flat * update_seq
+        h0_flat = h_chunk.reshape(B_flat, D)
+
+        scan_chunk = 16384
+        if B_flat <= scan_chunk or not h0_flat.is_cuda:
+            h_all_flat = fused_scan(decay_flat, b_flat, h0_flat)
+        else:
+            parts = []
+            for i in range(0, B_flat, scan_chunk):
+                j = min(i + scan_chunk, B_flat)
+                parts.append(fused_scan(
+                    decay_flat[i:j], b_flat[i:j], h0_flat[i:j]))
+            h_all_flat = torch.cat(parts, dim=0)
+
+        h_seq = h_all_flat.reshape(BS, cell_chunk, C, T_seg, D)
+        h_last = h_seq[:, :, :, -1, :]
+
+        base_msg = (
+            F.linear(primitives_chunk, msg_w_prim) +
+            F.linear(nid_chunk, msg_w_id).unsqueeze(0) +
+            msg_b1
+        )
+        nid_full = nid_chunk.unsqueeze(0)
+        msg_hidden_last = torch.tanh(base_msg + F.linear(h_last, msg_w_h))
+        msg_last = torch.tanh(F.linear(msg_hidden_last, msg_w2, msg_b2)) + nid_full
+
+        if need_act_trace:
+            msg_hidden = torch.tanh(
+                base_msg.unsqueeze(3) + F.linear(h_seq, msg_w_h)
+            )
+            msg_seq = (
+                torch.tanh(F.linear(msg_hidden, msg_w2, msg_b2)) +
+                nid_full.unsqueeze(3)
+            )
+            act_chunk = msg_seq.detach().norm(dim=-1).permute(0, 3, 1, 2).float()
+        else:
+            msg_seq = None
+            act_chunk = h_chunk.new_empty((0,), dtype=torch.float32)
+
+        if need_readout:
+            idx_h = readout_idx_chunk.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            idx_h = idx_h.expand(BS, -1, -1, T_seg, D)
+            h_read = torch.gather(h_seq, 2, idx_h)
+
+            H_msg = msg_b1.shape[0]
+            idx_msg = readout_idx_chunk.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, H_msg)
+            base_msg_read = torch.gather(base_msg, 2, idx_msg)
+            nid_read = torch.gather(
+                nid_full.expand(BS, -1, -1, D),
+                2,
+                readout_idx_chunk.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, D),
+            )
+            read_hidden = torch.tanh(
+                base_msg_read.unsqueeze(3) + F.linear(h_read, msg_w_h)
+            )
+            readout_msgs = (
+                torch.tanh(F.linear(read_hidden, msg_w2, msg_b2)) +
+                nid_read.unsqueeze(3)
+            )
+            readout_chunk = readout_msgs.mean(dim=2).permute(0, 2, 1, 3).contiguous()
+        else:
+            readout_chunk = h_chunk.new_empty((0,), dtype=h_chunk.dtype)
+
+        return h_last, msg_last, readout_chunk, act_chunk
+
     # ================================================================
     # Forward segment
     # ================================================================
@@ -416,11 +546,10 @@ class CellMemoryGraph(nn.Module):
         msg_b1 = self.msg_b1.to(dt)
         msg_b2 = self.msg_b2.to(dt)
 
-        # ================================================================
-        # Scan-batched forward: R rounds, each batched over all T tokens
-        # ================================================================
-
-        B_flat = BS * NC * C  # flattened neuron count for fused_scan
+        inject_all = cc_signals.reshape(BS, T_seg, NC, D)
+        cell_chunk = self._cell_chunk_size(BS, T_seg, dt)
+        use_chunk_checkpoint = torch.is_grad_enabled() and cell_chunk < NC
+        act_trace = None
 
         for r in range(R):
             # --- 1. GATHER (one gather, messages frozen for all T) ---
@@ -436,94 +565,70 @@ class CellMemoryGraph(nn.Module):
                 received = received.scatter_add(
                     2, border_idx_exp, border_received.to(received.dtype))
 
-            # --- 2. STATE MLP: base (constant) + inject (varies per T) ---
-            # base_hidden = W_in @ received + W_prim @ prim + W_id @ nid + W_decay @ decay + b1
-            # This is [BS, NC, C, H_state] — same for all T tokens
-            base_hidden = (
-                F.linear(received, state_w_in) +
-                F.linear(primitives, state_w_prim) +
-                F.linear(nid, state_w_id).unsqueeze(0) +
-                F.linear(decay_logit.unsqueeze(-1), state_w_decay) +
-                state_b1
-            )  # [BS, NC, C, H_state]
+            h_chunks = []
+            msg_chunks = []
+            readout_chunks = []
+            act_chunks = [] if self.config.structural_plasticity else None
 
-            # inject_all: [BS, T, NC, D] — the LM signal per token
-            inject_all = cc_signals.reshape(BS, T_seg, NC, D)
+            for c0 in range(0, NC, cell_chunk):
+                c1 = min(c0 + cell_chunk, NC)
+                chunk_args = (
+                    received[:, c0:c1],
+                    primitives[:, c0:c1],
+                    decay_logit[:, c0:c1],
+                    h[:, c0:c1],
+                    inject_all[:, :, c0:c1],
+                    nid[c0:c1],
+                    self.inject_indices[c0:c1],
+                    self.readout_indices[c0:c1],
+                    r == R - 1,
+                    self.config.structural_plasticity and r == R - 1,
+                    state_w_in,
+                    state_w_prim,
+                    state_w_id,
+                    state_w_decay,
+                    state_w2,
+                    state_b1,
+                    state_b2,
+                    msg_w_h,
+                    msg_w_prim,
+                    msg_w_id,
+                    msg_w2,
+                    msg_b1,
+                    msg_b2,
+                )
 
-            # Scatter inject to inject neurons: [BS, T, NC, C, D]
-            # Only inject neurons get the signal, rest get zero
-            inject_full = torch.zeros(BS, T_seg, NC, C, D, device=h.device, dtype=dt)
-            inject_signal = inject_all.unsqueeze(3).expand(-1, -1, -1, alpha, -1)
-            inject_idx_exp = self.inject_indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
-                BS, T_seg, -1, -1, D)  # [BS, T, NC, alpha, D]
-            inject_full.scatter_(3, inject_idx_exp, inject_signal)
+                if use_chunk_checkpoint:
+                    h_chunk, msg_chunk, readout_chunk, act_chunk = (
+                        torch.utils.checkpoint.checkpoint(
+                            self._run_round_chunk,
+                            *chunk_args,
+                            use_reentrant=False,
+                        )
+                    )
+                else:
+                    h_chunk, msg_chunk, readout_chunk, act_chunk = self._run_round_chunk(
+                        *chunk_args
+                    )
 
-            # input_vec per token = received + inject[t]
-            # received is [BS, NC, C, D], inject_full is [BS, T, NC, C, D]
-            # The F.linear only sees input_vec through W_in, and received is constant
-            # So: inject_hidden = W_in @ inject_full  — batched over T
-            inject_hidden = F.linear(
-                inject_full, state_w_in)  # [BS, T, NC, C, H_state]
+                h_chunks.append(h_chunk)
+                msg_chunks.append(msg_chunk)
+                if r == R - 1:
+                    readout_chunks.append(readout_chunk)
+                    if act_chunks is not None:
+                        act_chunks.append(act_chunk)
 
-            # Combine: hidden[t] = tanh(base + inject_hidden[t])
-            hidden_all = torch.tanh(
-                base_hidden.unsqueeze(1) + inject_hidden)  # [BS, T, NC, C, H_state]
-
-            # Layer 2: update[t] = tanh(W2 @ hidden[t] + b2)
-            update_all = torch.tanh(
-                F.linear(hidden_all, state_w2, state_b2))  # [BS, T, NC, C, D]
-
-            # --- 3. FUSED SCAN: h[t] = decay * h[t-1] + (1-decay) * update[t] ---
-            # Reshape for fused_scan: [B_flat, T, D]
-            decay_flat = decay_logit.reshape(B_flat, 1, 1).expand(-1, T_seg, D)
-            omd_flat = (1 - torch.sigmoid(decay_logit)).unsqueeze(-1).reshape(B_flat, 1, 1)
-            b_flat = omd_flat * update_all.reshape(B_flat, T_seg, D)
-            h0_flat = h.reshape(B_flat, D)
-
-            # Chunked scan to avoid FLA grid-size limits
-            CHUNK = 16384
-            if B_flat <= CHUNK or not h0_flat.is_cuda:
-                h_all_flat = fused_scan(decay_flat, b_flat, h0_flat)
-            else:
-                parts = []
-                for i in range(0, B_flat, CHUNK):
-                    j = min(i + CHUNK, B_flat)
-                    parts.append(fused_scan(
-                        decay_flat[i:j], b_flat[i:j], h0_flat[i:j]))
-                h_all_flat = torch.cat(parts, dim=0)
-            h_all = h_all_flat.reshape(BS, NC, C, T_seg, D).permute(
-                0, 3, 1, 2, 4)  # [BS, T, NC, C, D]
-
-            # Update h carry for next round
-            h = h_all[:, -1]  # [BS, NC, C, D]
-
-            # --- 4. MSG MLP: batched over all T ---
-            base_msg = (
-                F.linear(primitives, msg_w_prim) +
-                F.linear(nid, msg_w_id).unsqueeze(0) +
-                msg_b1
-            )  # [BS, NC, C, H_msg]
-
-            msg_hidden = torch.tanh(
-                base_msg.unsqueeze(1) + F.linear(h_all, msg_w_h))  # [BS, T, NC, C, H_msg]
-            msg_all = torch.tanh(
-                F.linear(msg_hidden, msg_w2, msg_b2)) + nid  # [BS, T, NC, C, D]
-
-            # Update msg carry for next round
-            msg = msg_all[:, -1]  # [BS, NC, C, D]
-
-        # --- 5. READOUT: all T at once ---
-        readout_idx = self.readout_indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
-            BS, T_seg, -1, -1, D)  # [BS, T, NC, alpha, D]
-        readout_msgs = torch.gather(msg_all, 3, readout_idx)  # [BS, T, NC, alpha, D]
-        mem_out = readout_msgs.mean(dim=3).reshape(BS, T_seg, NC * D)  # [BS, T, D_lm]
+            h = torch.cat(h_chunks, dim=1)
+            msg = torch.cat(msg_chunks, dim=1)
+            if r == R - 1:
+                mem_out = torch.cat(readout_chunks, dim=2).reshape(BS, T_seg, NC * D)
+                if act_chunks is not None:
+                    act_trace = torch.cat(act_chunks, dim=2)
 
         # --- Diagnostics ---
         with torch.no_grad():
             msg_norms = msg.detach().norm(dim=-1)  # [BS, NC, C]
             total_hebbian = msg_norms.unsqueeze(-1) * w_conn_sig.detach()
-            act_trace = msg_all.detach().norm(dim=-1).permute(
-                0, 1, 2, 3)  # [BS, T, NC, C] already
 
         # Update persistent state
         with torch.no_grad():
@@ -557,6 +662,7 @@ class CellMemoryGraph(nn.Module):
 
         FIX #5: Actually implements the co-activation update.
         """
+        act_trace = act_trace.float()
         BS, T_seg, NC, C = act_trace.shape
 
         for cell in range(NC):
