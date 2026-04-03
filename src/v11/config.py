@@ -166,7 +166,7 @@ class V11Config:
             D=2048, D_embed=768, C=16, L_total=4, scan_split_at=2,
             d_inner=580, glu_output=True, T=128,
             N_cells=256, C_neurons=124, D_neuron=8,
-            K_connections=16, R_rounds=4, alpha=4,
+            K_connections=16, R_rounds=1, alpha=4,
             N_border_per_cell=4, K_border=4,
             pcm_hidden=256,
             cell_mod_hidden=24, state_mlp_hidden=16, msg_mlp_hidden=16,

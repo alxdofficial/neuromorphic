@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import V11Config
+from ..model.scan import fused_scan
 
 try:
     from .triton_kernels import combined_cell_border_gather as _combined_cell_border_gather
@@ -363,10 +364,13 @@ class CellMemoryGraph(nn.Module):
     # ================================================================
 
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment with cell-local + border message passing.
+        """Process one segment via scan-batched cell message passing.
 
-        Uses shared F.linear (cuBLAS GEMM) for MLPs. No fused Triton kernel.
-        Works on both CPU and GPU.
+        With R=1, all T tokens' MLPs are batched into single F.linear calls,
+        and temporal integration uses fused_scan. No Python loop over T.
+
+        For R>1, falls back to a loop over R rounds (each round is scan-batched
+        over T).
         """
         BS = cc_signals.shape[0]
         T_seg = cc_signals.shape[1]
@@ -374,8 +378,8 @@ class CellMemoryGraph(nn.Module):
         C = self.config.C_neurons
         D = self.config.D_neuron
         R = self.config.R_rounds
+        alpha = self.config.alpha
 
-        # FIX #8: Raise if uninitialized
         if not self._initialized:
             raise RuntimeError(
                 "CellMemoryGraph.forward_segment() called before "
@@ -385,7 +389,7 @@ class CellMemoryGraph(nn.Module):
         h = self.h.detach()
         msg = self.prev_messages.detach()
 
-        # Run per-neuron modulator
+        # Run per-neuron modulator (once per segment)
         w_conn, w_conn_border, decay_logit, primitives = self._run_modulator(
             h, self.hebbian_traces.detach(),
             self.decay_logit.detach(),
@@ -393,123 +397,133 @@ class CellMemoryGraph(nn.Module):
 
         w_conn_sig = torch.sigmoid(w_conn)
         w_conn_border_sig = torch.sigmoid(w_conn_border)
-        decay = torch.sigmoid(decay_logit)
-        d = decay.unsqueeze(-1)
-        omd = 1 - d
         dt = h.dtype
 
-        # These terms are constant for the full segment. Precomputing them
-        # removes repeated shared-weight linears from every token/round.
+        # Pre-cast shared weights (avoid repeated .to() calls)
         nid = self.neuron_id.to(dt)
         state_w_in = self.state_w1[:, :D].to(dt)
-        state_w_prim = self.state_w1[:, D:2 * D].to(dt)
-        state_w_id = self.state_w1[:, 2 * D:3 * D].to(dt)
-        state_w_decay = self.state_w1[:, 3 * D:].to(dt)
+        state_w_prim = self.state_w1[:, D:2*D].to(dt)
+        state_w_id = self.state_w1[:, 2*D:3*D].to(dt)
+        state_w_decay = self.state_w1[:, 3*D:].to(dt)
         state_w2 = self.state_w2.to(dt)
         state_b1 = self.state_b1.to(dt)
         state_b2 = self.state_b2.to(dt)
 
         msg_w_h = self.msg_w1[:, :D].to(dt)
-        msg_w_prim = self.msg_w1[:, D:2 * D].to(dt)
-        msg_w_id = self.msg_w1[:, 2 * D:].to(dt)
+        msg_w_prim = self.msg_w1[:, D:2*D].to(dt)
+        msg_w_id = self.msg_w1[:, 2*D:].to(dt)
         msg_w2 = self.msg_w2.to(dt)
         msg_b1 = self.msg_b1.to(dt)
         msg_b2 = self.msg_b2.to(dt)
 
-        state_const = (
-            F.linear(primitives, state_w_prim) +
-            F.linear(nid, state_w_id).unsqueeze(0) +
-            F.linear(decay_logit.unsqueeze(-1), state_w_decay) +
-            state_b1
-        )
-        msg_const = (
-            F.linear(primitives, msg_w_prim) +
-            F.linear(nid, msg_w_id).unsqueeze(0) +
-            msg_b1
-        )
+        # ================================================================
+        # Scan-batched forward: R rounds, each batched over all T tokens
+        # ================================================================
 
-        total_hebbian = torch.zeros_like(self.hebbian_traces)
-        readouts = []
-        act_norms_all = []
+        B_flat = BS * NC * C  # flattened neuron count for fused_scan
 
-        # Pre-expand indices (avoid repeated expand in loop)
-        border_idx_exp = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
-            BS, -1, -1, D)
-        inject_idx_exp = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
-            BS, -1, -1, D)
-
-        use_fused_token_step = (
-            self.config.experimental_triton_token_step and
-            _HAS_TRITON_TOKEN_STEP and h.is_cuda
-        )
-
-        def _state_update_fast(input_vec):
-            hidden = F.linear(input_vec, state_w_in) + state_const
-            return torch.tanh(F.linear(torch.tanh(hidden), state_w2, state_b2))
-
-        def _msg_output_fast(h_val):
-            hidden = F.linear(h_val, msg_w_h) + msg_const
-            return torch.tanh(F.linear(torch.tanh(hidden), msg_w2, msg_b2)) + nid
-
-        def _one_token_step(h_in, msg_in, inject_sig):
-            """Process one token: R rounds of message passing."""
-            h_t, msg_t = h_in, msg_in
-            for r in range(R):
-                if _HAS_TRITON_GATHER and msg_t.is_cuda:
-                    received = _combined_cell_border_gather(
-                        msg_t, w_conn_sig, self.conn_indices,
-                        w_conn_border_sig, self.border_conn_indices,
-                        self.config.alpha,
-                    )
-                else:
-                    received = self._cell_gather(msg_t, w_conn_sig)
-                    border_received = self._border_gather(msg_t, w_conn_border_sig)
-                    received = received.scatter_add(
-                        2, border_idx_exp, border_received.to(received.dtype))
-
-                inject_addend = torch.zeros_like(received)
-                inject_addend.scatter_(2, inject_idx_exp,
-                                       inject_sig.to(received.dtype))
-                input_vec = received + inject_addend
-
-                update = _state_update_fast(input_vec)
-                h_t = d * h_t + omd * update
-                msg_t = _msg_output_fast(h_t)
-            return h_t, msg_t
-
-        use_checkpoint = self.training and T_seg > 1 and not use_fused_token_step
-
-        for t in range(T_seg):
-            inject_raw = cc_signals[:, t].reshape(BS, NC, D)
-
-            if use_fused_token_step:
-                h, msg = _fused_token_step(
-                    h, msg, w_conn_sig, w_conn_border_sig,
-                    decay_logit, primitives,
-                    self.conn_indices, self.border_conn_indices,
-                    self.neuron_id, self.inject_indices,
-                    inject_raw,
-                    self.state_w1, self.state_b1, self.state_w2, self.state_b2,
-                    self.msg_w1, self.msg_b1, self.msg_w2, self.msg_b2,
-                    self.config,
-                )
+        for r in range(R):
+            # --- 1. GATHER (one gather, messages frozen for all T) ---
+            if _HAS_TRITON_GATHER and msg.is_cuda:
+                received = _combined_cell_border_gather(
+                    msg, w_conn_sig, self.conn_indices,
+                    w_conn_border_sig, self.border_conn_indices, alpha)
             else:
-                inject_signal = inject_raw.unsqueeze(2).expand(-1, -1, self.config.alpha, -1)
-                if use_checkpoint:
-                    h, msg = torch.utils.checkpoint.checkpoint(
-                        _one_token_step, h, msg, inject_signal,
-                        use_reentrant=False)
-                else:
-                    h, msg = _one_token_step(h, msg, inject_signal)
+                received = self._cell_gather(msg, w_conn_sig)
+                border_received = self._border_gather(msg, w_conn_border_sig)
+                border_idx_exp = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
+                    BS, -1, -1, D)
+                received = received.scatter_add(
+                    2, border_idx_exp, border_received.to(received.dtype))
 
-            readouts.append(self._readout(msg))
+            # --- 2. STATE MLP: base (constant) + inject (varies per T) ---
+            # base_hidden = W_in @ received + W_prim @ prim + W_id @ nid + W_decay @ decay + b1
+            # This is [BS, NC, C, H_state] — same for all T tokens
+            base_hidden = (
+                F.linear(received, state_w_in) +
+                F.linear(primitives, state_w_prim) +
+                F.linear(nid, state_w_id).unsqueeze(0) +
+                F.linear(decay_logit.unsqueeze(-1), state_w_decay) +
+                state_b1
+            )  # [BS, NC, C, H_state]
 
-            with torch.no_grad():
-                msg_norms = msg.detach().norm(dim=-1)
-                total_hebbian += msg_norms.unsqueeze(-1) * w_conn_sig.detach()
-                act_norms_all.append(msg_norms.float())
+            # inject_all: [BS, T, NC, D] — the LM signal per token
+            inject_all = cc_signals.reshape(BS, T_seg, NC, D)
 
-        mem_out = torch.stack(readouts, dim=1)
+            # Scatter inject to inject neurons: [BS, T, NC, C, D]
+            # Only inject neurons get the signal, rest get zero
+            inject_full = torch.zeros(BS, T_seg, NC, C, D, device=h.device, dtype=dt)
+            inject_signal = inject_all.unsqueeze(3).expand(-1, -1, -1, alpha, -1)
+            inject_idx_exp = self.inject_indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
+                BS, T_seg, -1, -1, D)  # [BS, T, NC, alpha, D]
+            inject_full.scatter_(3, inject_idx_exp, inject_signal)
+
+            # input_vec per token = received + inject[t]
+            # received is [BS, NC, C, D], inject_full is [BS, T, NC, C, D]
+            # The F.linear only sees input_vec through W_in, and received is constant
+            # So: inject_hidden = W_in @ inject_full  — batched over T
+            inject_hidden = F.linear(
+                inject_full, state_w_in)  # [BS, T, NC, C, H_state]
+
+            # Combine: hidden[t] = tanh(base + inject_hidden[t])
+            hidden_all = torch.tanh(
+                base_hidden.unsqueeze(1) + inject_hidden)  # [BS, T, NC, C, H_state]
+
+            # Layer 2: update[t] = tanh(W2 @ hidden[t] + b2)
+            update_all = torch.tanh(
+                F.linear(hidden_all, state_w2, state_b2))  # [BS, T, NC, C, D]
+
+            # --- 3. FUSED SCAN: h[t] = decay * h[t-1] + (1-decay) * update[t] ---
+            # Reshape for fused_scan: [B_flat, T, D]
+            decay_flat = decay_logit.reshape(B_flat, 1, 1).expand(-1, T_seg, D)
+            omd_flat = (1 - torch.sigmoid(decay_logit)).unsqueeze(-1).reshape(B_flat, 1, 1)
+            b_flat = omd_flat * update_all.reshape(B_flat, T_seg, D)
+            h0_flat = h.reshape(B_flat, D)
+
+            # Chunked scan to avoid FLA grid-size limits
+            CHUNK = 16384
+            if B_flat <= CHUNK or not h0_flat.is_cuda:
+                h_all_flat = fused_scan(decay_flat, b_flat, h0_flat)
+            else:
+                parts = []
+                for i in range(0, B_flat, CHUNK):
+                    j = min(i + CHUNK, B_flat)
+                    parts.append(fused_scan(
+                        decay_flat[i:j], b_flat[i:j], h0_flat[i:j]))
+                h_all_flat = torch.cat(parts, dim=0)
+            h_all = h_all_flat.reshape(BS, NC, C, T_seg, D).permute(
+                0, 3, 1, 2, 4)  # [BS, T, NC, C, D]
+
+            # Update h carry for next round
+            h = h_all[:, -1]  # [BS, NC, C, D]
+
+            # --- 4. MSG MLP: batched over all T ---
+            base_msg = (
+                F.linear(primitives, msg_w_prim) +
+                F.linear(nid, msg_w_id).unsqueeze(0) +
+                msg_b1
+            )  # [BS, NC, C, H_msg]
+
+            msg_hidden = torch.tanh(
+                base_msg.unsqueeze(1) + F.linear(h_all, msg_w_h))  # [BS, T, NC, C, H_msg]
+            msg_all = torch.tanh(
+                F.linear(msg_hidden, msg_w2, msg_b2)) + nid  # [BS, T, NC, C, D]
+
+            # Update msg carry for next round
+            msg = msg_all[:, -1]  # [BS, NC, C, D]
+
+        # --- 5. READOUT: all T at once ---
+        readout_idx = self.readout_indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
+            BS, T_seg, -1, -1, D)  # [BS, T, NC, alpha, D]
+        readout_msgs = torch.gather(msg_all, 3, readout_idx)  # [BS, T, NC, alpha, D]
+        mem_out = readout_msgs.mean(dim=3).reshape(BS, T_seg, NC * D)  # [BS, T, D_lm]
+
+        # --- Diagnostics ---
+        with torch.no_grad():
+            msg_norms = msg.detach().norm(dim=-1)  # [BS, NC, C]
+            total_hebbian = msg_norms.unsqueeze(-1) * w_conn_sig.detach()
+            act_trace = msg_all.detach().norm(dim=-1).permute(
+                0, 1, 2, 3)  # [BS, T, NC, C] already
 
         # Update persistent state
         with torch.no_grad():
@@ -519,13 +533,10 @@ class CellMemoryGraph(nn.Module):
             self.w_conn_border = w_conn_border.detach().to(self.dtype)
             self.primitives_state = primitives.detach().to(self.dtype)
             self.decay_logit = decay_logit.detach().to(self.dtype)
-            self.hebbian_traces = (
-                total_hebbian / max(T_seg, 1)).to(self.dtype)
+            self.hebbian_traces = total_hebbian.to(self.dtype)
 
-            # FIX #5: Update co-activation for structural plasticity
             if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation_ema') and act_norms_all):
-                act_trace = torch.stack(act_norms_all, dim=1)  # [BS, T, NC, C]
+                    hasattr(self, 'co_activation_ema') and act_trace is not None):
                 self._update_phi(act_trace)
 
             alpha_diag = 0.05
