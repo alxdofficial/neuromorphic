@@ -364,10 +364,18 @@ class CellMemoryGraph(nn.Module):
         NC = self.config.N_cells
         if NC <= 32:
             return NC
-        # Empirically, smaller chunks reduce backward/checkpoint overhead more
-        # than the extra Python loop hurts. A 32-cell chunk is the best tested
-        # point on the 4090 for BS in {8, 16, 32}, while still fitting BS=32.
+        # Empirically on the 4090:
+        # - BS >= 16 benefits from very small chunks because backward dominates.
+        # - BS ~= 8 prefers a slightly larger chunk to reduce Python overhead.
+        if BS >= 16:
+            return 8
+        if BS >= 8:
+            return 24
         return 32
+
+    def _scan_chunk_size(self, B_flat: int) -> int:
+        """Largest tested fused_scan lane count that avoids Triton launch errors."""
+        return min(B_flat, 32768)
 
     def _run_round_chunk(
         self,
@@ -427,16 +435,15 @@ class CellMemoryGraph(nn.Module):
         b_flat = omd_flat * update_seq
         h0_flat = h_chunk.reshape(B_flat, D)
 
-        scan_chunk = 16384
+        scan_chunk = self._scan_chunk_size(B_flat)
         if B_flat <= scan_chunk or not h0_flat.is_cuda:
             h_all_flat = fused_scan(decay_flat, b_flat, h0_flat)
         else:
-            parts = []
+            h_all_flat = torch.empty_like(b_flat)
             for i in range(0, B_flat, scan_chunk):
                 j = min(i + scan_chunk, B_flat)
-                parts.append(fused_scan(
-                    decay_flat[i:j], b_flat[i:j], h0_flat[i:j]))
-            h_all_flat = torch.cat(parts, dim=0)
+                h_all_flat[i:j] = fused_scan(
+                    decay_flat[i:j], b_flat[i:j], h0_flat[i:j])
 
         h_seq = h_all_flat.reshape(BS, cell_chunk, C, T_seg, D)
         h_last = h_seq[:, :, :, -1, :]
@@ -569,10 +576,16 @@ class CellMemoryGraph(nn.Module):
                 received = received.scatter_add(
                     2, border_idx_exp, border_received.to(received.dtype))
 
-            h_chunks = []
-            msg_chunks = []
-            readout_chunks = []
-            act_chunks = [] if self.config.structural_plasticity else None
+            h_next = torch.empty_like(h)
+            msg_next = torch.empty_like(msg)
+            mem_out_cells = (
+                torch.empty(BS, T_seg, NC, D, device=h.device, dtype=dt)
+                if r == R - 1 else None
+            )
+            act_trace_cells = (
+                torch.empty(BS, T_seg, NC, C, device=h.device, dtype=torch.float32)
+                if self.config.structural_plasticity and r == R - 1 else None
+            )
 
             for c0 in range(0, NC, cell_chunk):
                 c1 = min(c0 + cell_chunk, NC)
@@ -615,19 +628,19 @@ class CellMemoryGraph(nn.Module):
                         *chunk_args
                     )
 
-                h_chunks.append(h_chunk)
-                msg_chunks.append(msg_chunk)
+                h_next[:, c0:c1] = h_chunk
+                msg_next[:, c0:c1] = msg_chunk
                 if r == R - 1:
-                    readout_chunks.append(readout_chunk)
-                    if act_chunks is not None:
-                        act_chunks.append(act_chunk)
+                    mem_out_cells[:, :, c0:c1] = readout_chunk
+                    if act_trace_cells is not None:
+                        act_trace_cells[:, :, c0:c1] = act_chunk
 
-            h = torch.cat(h_chunks, dim=1)
-            msg = torch.cat(msg_chunks, dim=1)
+            h = h_next
+            msg = msg_next
             if r == R - 1:
-                mem_out = torch.cat(readout_chunks, dim=2).reshape(BS, T_seg, NC * D)
-                if act_chunks is not None:
-                    act_trace = torch.cat(act_chunks, dim=2)
+                mem_out = mem_out_cells.reshape(BS, T_seg, NC * D)
+                if act_trace_cells is not None:
+                    act_trace = act_trace_cells
 
         # --- Diagnostics ---
         with torch.no_grad():
