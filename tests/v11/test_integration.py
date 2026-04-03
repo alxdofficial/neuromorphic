@@ -111,3 +111,22 @@ class TestV11ModelForward:
                 assert group["lr"] == pytest.approx(lr)
             if params & mem_ids:
                 assert group["lr"] == pytest.approx(lr * cfg.mem_lr_scale)
+
+    def test_loss_mask_matches_explicit_filtered_ce(self):
+        cfg = make_tiny()
+        model = V11Model(cfg).float()
+        model.initialize_states(BS)
+
+        T = cfg.T
+        input_ids = torch.randint(0, VOCAB, (BS, T))
+        target_ids = torch.randint(0, VOCAB, (BS, T))
+        input_ids[:, ::3] = cfg.eot_id
+
+        result = model.forward_chunk(input_ids, target_ids=target_ids)
+        logits = result["logits"]
+        loss_mask = input_ids != cfg.eot_id
+        expected = torch.nn.functional.cross_entropy(
+            logits[loss_mask].view(-1, logits.shape[-1]),
+            target_ids[loss_mask].view(-1),
+        )
+        torch.testing.assert_close(result["loss"], expected)

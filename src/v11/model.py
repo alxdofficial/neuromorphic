@@ -115,10 +115,14 @@ class V11Model(nn.Module):
             loss_mask = torch.ones_like(target_ids, dtype=torch.bool)
             if eot >= 0:
                 loss_mask = input_ids != eot
-            logits_flat = logits[loss_mask].view(-1, logits.shape[-1])
-            targets_flat = target_ids[loss_mask].view(-1)
-            if logits_flat.numel() > 0:
-                result['loss'] = F_.cross_entropy(logits_flat, targets_flat)
+            if loss_mask.any():
+                ignore_index = -100
+                targets = target_ids.masked_fill(~loss_mask, ignore_index)
+                result['loss'] = F_.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
+                    ignore_index=ignore_index,
+                )
             else:
                 result['loss'] = torch.tensor(0.0, device=logits.device)
 
