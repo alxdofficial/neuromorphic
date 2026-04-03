@@ -68,3 +68,36 @@ The path to 20K tok/s requires eliminating the Python loop:
 
 Reducing C to 64 neurons/cell is the best immediate win: 5.9K tok/s with honest
 full simulation of all neurons, live message propagation, separate inject/readout.
+
+## Additional Experiments (Approach 5-7)
+
+### Approach 5: torch.compile on step function (forward-only)
+- C=64, BS=16, `torch.compile(step, mode='max-autotune')` on MLP step
+- Forward-only with compile: 12.2K tok/s (earlier test, full step compiled)
+- Forward-only with compile in loop: 797 tok/s (WORSE — recompilation overhead)
+- **torch.compile doesn't help in a Python loop** — it needs the full graph
+
+### Approach 6: Raw forward-only (no autograd)
+- C=64, BS=16, `torch.no_grad()`, inline loop
+- **18.1K tok/s, 0.88ms per step** ← THIS IS THE COMPUTE SPEED
+- Proves the GPU can handle the workload. Autograd is the bottleneck.
+
+### Key Finding: Autograd Is the Bottleneck
+
+| Mode | tok/s | Per-step | Ratio |
+|------|------:|---------|-------|
+| Forward only (no autograd) | 18,130 | 0.88ms | 1.0x |
+| Forward with autograd | ~6,000 | ~2.7ms | 3.0x |
+| Forward + backward | ~5,900 | ~2.7ms | 3.1x |
+| Forward + backward + checkpoint | ~2,400 | ~6.7ms | 7.6x |
+
+The GPU compute (gather + 4 F.linear + decay) takes 0.88ms per step.
+PyTorch autograd tracking adds 2x overhead (building the graph).
+Gradient checkpointing adds another 2.5x (recomputing the graph).
+
+**To reach 20K tok/s training, we need to reduce autograd overhead.**
+Options:
+- Custom autograd.Function with manual backward for the T-step loop
+- Compile the ENTIRE forward_segment (not per-step) so the compiler
+  can optimize across the loop
+- Accept 6K tok/s with C=64 and train at that speed
