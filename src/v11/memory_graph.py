@@ -673,13 +673,10 @@ class CellMemoryGraph(nn.Module):
     # ================================================================
 
     def forward_segment(self, cc_signals: Tensor) -> Tensor:
-        """Process one segment via scan-batched cell message passing.
+        """Process one segment via sequential per-token steps.
 
-        With R=1, all T tokens' MLPs are batched into single F.linear calls,
-        and temporal integration uses fused_scan. No Python loop over T.
-
-        For R>1, falls back to a loop over R rounds (each round is scan-batched
-        over T).
+        R=1: each token step gathers LIVE messages from the previous token,
+        giving genuine per-token message propagation without frozen messages.
         """
         BS = cc_signals.shape[0]
         T_seg = cc_signals.shape[1]
@@ -725,17 +722,35 @@ class CellMemoryGraph(nn.Module):
         msg_b1 = self.msg_b1.to(dt)
         msg_b2 = self.msg_b2.to(dt)
 
-        inject_all = cc_signals.reshape(BS, T_seg, NC, D)
-        cell_chunk = self._cell_chunk_size(BS, T_seg, dt)
-        use_chunk_checkpoint = (
-            self.config.checkpoint_chunk_rounds and
-            torch.is_grad_enabled() and
-            cell_chunk < NC
-        )
-        act_trace = None
+        # Pre-compute constants (shared across all T)
+        state_const = (
+            F.linear(primitives, state_w_prim) +
+            F.linear(nid, state_w_id).unsqueeze(0) +
+            F.linear(decay_logit.unsqueeze(-1), state_w_decay) +
+            state_b1
+        )  # [BS, NC, C, H_state]
+        msg_const = (
+            F.linear(primitives, msg_w_prim) +
+            F.linear(nid, msg_w_id).unsqueeze(0) +
+            msg_b1
+        )  # [BS, NC, C, H_msg]
 
-        for r in range(R):
-            # --- 1. GATHER (one gather, messages frozen for all T) ---
+        decay = torch.sigmoid(decay_logit)
+        d = decay.unsqueeze(-1)
+        omd = 1 - d
+
+        border_idx_exp = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
+            BS, -1, -1, D)
+        inject_idx_exp = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
+            BS, -1, -1, D)
+        readout_idx_exp = self.readout_indices.unsqueeze(0).unsqueeze(-1).expand(
+            BS, -1, -1, D)
+
+        readouts = []
+
+        # Sequential per-token loop: live message propagation
+        for t in range(T_seg):
+            # Gather: read LIVE messages from previous token
             if _HAS_TRITON_GATHER and msg.is_cuda:
                 received = _combined_cell_border_gather(
                     msg, w_conn_sig, self.conn_indices,
@@ -743,82 +758,37 @@ class CellMemoryGraph(nn.Module):
             else:
                 received = self._cell_gather(msg, w_conn_sig)
                 border_received = self._border_gather(msg, w_conn_border_sig)
-                border_idx_exp = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
-                    BS, -1, -1, D)
                 received = received.scatter_add(
                     2, border_idx_exp, border_received.to(received.dtype))
 
-            h_next = torch.empty_like(h)
-            msg_next = torch.empty_like(msg)
-            mem_out_cells = (
-                torch.empty(BS, T_seg, NC, D, device=h.device, dtype=dt)
-                if r == R - 1 else None
-            )
-            act_trace_cells = (
-                torch.empty(BS, T_seg, NC, C, device=h.device, dtype=torch.float32)
-                if self.config.structural_plasticity and r == R - 1 else None
-            )
+            # Inject: add LM signal to inject neurons
+            inject_raw = cc_signals[:, t].reshape(BS, NC, D)
+            inject_signal = inject_raw.unsqueeze(2).expand(-1, -1, alpha, -1)
+            inject_addend = torch.zeros_like(received)
+            inject_addend.scatter_(2, inject_idx_exp,
+                                   inject_signal.to(received.dtype))
+            input_vec = received + inject_addend
 
-            for c0 in range(0, NC, cell_chunk):
-                c1 = min(c0 + cell_chunk, NC)
-                chunk_args = (
-                    received[:, c0:c1],
-                    primitives[:, c0:c1],
-                    decay_logit[:, c0:c1],
-                    h[:, c0:c1],
-                    inject_all[:, :, c0:c1],
-                    nid[c0:c1],
-                    r == R - 1,
-                    self.config.structural_plasticity and r == R - 1,
-                    state_w_in,
-                    state_w_prim,
-                    state_w_id,
-                    state_w_decay,
-                    state_w2,
-                    state_b1,
-                    state_b2,
-                    msg_w_h,
-                    msg_w_prim,
-                    msg_w_id,
-                    msg_w2,
-                    msg_b1,
-                    msg_b2,
-                )
+            # State MLP (using pre-computed constants)
+            hidden = torch.tanh(F.linear(input_vec, state_w_in) + state_const)
+            update = torch.tanh(F.linear(hidden, state_w2, state_b2))
+            h = d * h + omd * update
 
-                if use_chunk_checkpoint:
-                    h_chunk, msg_chunk, readout_chunk, act_chunk = (
-                        torch.utils.checkpoint.checkpoint(
-                            self._run_round_chunk,
-                            *chunk_args,
-                            use_reentrant=False,
-                        )
-                    )
-                else:
-                    h_chunk, msg_chunk, readout_chunk, act_chunk = self._run_round_chunk(
-                        *chunk_args
-                    )
+            # Msg MLP (using pre-computed constants)
+            msg_hidden = torch.tanh(F.linear(h, msg_w_h) + msg_const)
+            msg = torch.tanh(F.linear(msg_hidden, msg_w2, msg_b2)) + nid
 
-                h_next[:, c0:c1] = h_chunk
-                msg_next[:, c0:c1] = msg_chunk
-                if r == R - 1:
-                    mem_out_cells[:, :, c0:c1] = readout_chunk
-                    if act_trace_cells is not None:
-                        act_trace_cells[:, :, c0:c1] = act_chunk
+            # Readout
+            readout_msgs = torch.gather(msg, 2, readout_idx_exp)
+            readouts.append(readout_msgs.mean(dim=2).reshape(BS, NC * D))
 
-            h = h_next
-            msg = msg_next
-            if r == R - 1:
-                mem_out = mem_out_cells.reshape(BS, T_seg, NC * D)
-                if act_trace_cells is not None:
-                    act_trace = act_trace_cells
-
-        # --- Diagnostics ---
-        with torch.no_grad():
-            msg_norms = msg.detach().norm(dim=-1)  # [BS, NC, C]
-            total_hebbian = msg_norms.unsqueeze(-1) * w_conn_sig.detach()
+        mem_out = torch.stack(readouts, dim=1)  # [BS, T, D_lm]
 
         # Update persistent state
         with torch.no_grad():
+            msg_norms = msg.detach().norm(dim=-1)
+            total_hebbian = msg_norms.unsqueeze(-1) * w_conn_sig.detach()
+
             self.h = h.detach().to(self.dtype)
             self.prev_messages = msg.detach().to(self.dtype)
             self.w_conn = w_conn.detach().to(self.dtype)
@@ -827,14 +797,9 @@ class CellMemoryGraph(nn.Module):
             self.decay_logit = decay_logit.detach().to(self.dtype)
             self.hebbian_traces = total_hebbian.to(self.dtype)
 
-            if (self.config.structural_plasticity and
-                    hasattr(self, 'co_activation_ema') and act_trace is not None):
-                self._update_phi(act_trace)
-
             alpha_diag = 0.05
-            seg_mag = msg.detach().norm(dim=-1)
             self.msg_magnitude = (
-                (1 - alpha_diag) * self.msg_magnitude + alpha_diag * seg_mag
+                (1 - alpha_diag) * self.msg_magnitude + alpha_diag * msg_norms
             ).to(self.dtype)
 
         return mem_out
