@@ -66,12 +66,36 @@ class CellMemoryGraph(nn.Module):
                 conn[cell, n] = scores.topk(K).indices
         self.register_buffer('conn_indices', conn)
 
-        # ---- Fixed inject/readout neuron indices ----
-        # First alpha neurons per cell = inject, last alpha = readout
+        # ---- Fixed neuron role indices per cell ----
+        # Layout: [inject(alpha) | border(B) | interneurons | readout(alpha)]
+        B = config.N_border_per_cell
         inject_idx = torch.arange(alpha, device=device).unsqueeze(0).expand(NC, -1)
+        border_idx = torch.arange(alpha, alpha + B, device=device).unsqueeze(0).expand(NC, -1)
         readout_idx = torch.arange(C - alpha, C, device=device).unsqueeze(0).expand(NC, -1)
         self.register_buffer('inject_indices', inject_idx)    # [NC, alpha]
+        self.register_buffer('border_indices', border_idx)    # [NC, B]
         self.register_buffer('readout_indices', readout_idx)  # [NC, alpha]
+
+        # ---- Inter-cell border connectivity ----
+        # Each border neuron has K_border connections to border neurons in OTHER cells.
+        # Stored as (cell_idx, border_slot) pairs → flattened global border neuron index.
+        # Total border neurons = NC * B. Each border neuron connects to K_border of them.
+        K_b = config.K_border
+        N_border_total = NC * B
+        border_conn = torch.zeros(NC, B, K_b, dtype=torch.long, device=device)
+        for cell in range(NC):
+            for b in range(B):
+                # Global index of this border neuron: cell * B + b
+                self_global = cell * B + b
+                scores = torch.rand(N_border_total, device=device)
+                # Exclude all border neurons in own cell
+                for own_b in range(B):
+                    scores[cell * B + own_b] = -float('inf')
+                border_conn[cell, b] = scores.topk(K_b).indices
+        self.register_buffer('border_conn_indices', border_conn)  # [NC, B, K_border]
+
+        # Border connection weights (learned via modulator, same as intra-cell w_conn)
+        # Stored separately since they index into a different space
 
         # ================================================================
         # Shared-weight MLPs
@@ -107,8 +131,9 @@ class CellMemoryGraph(nn.Module):
         # Runs once per segment — cost is negligible vs T×R inner loop.
         # Input: hebbian[K] + h[D] + decay[1] + primitives[D] + neuron_id[D]
         mod_in = K + 3 * D + 1
-        # Output: w_conn_delta[K] + decay_delta[1] + prim_delta[D]
-        mod_out = K + 1 + D
+        # Output: w_conn_delta[K] + w_conn_border_delta[K_border] + decay_delta[1] + prim_delta[D]
+        K_b = config.K_border
+        mod_out = K + K_b + 1 + D
         H_mod = config.cell_mod_hidden
 
         self.mod_w1 = nn.Parameter(
@@ -141,12 +166,17 @@ class CellMemoryGraph(nn.Module):
         K = self.config.K_connections
         dt = self.dtype
 
+        B = self.config.N_border_per_cell
+        K_b = self.config.K_border
+
         self.h = torch.randn(BS, NC, C, D, device=device, dtype=dt) * 0.1
         self.prev_messages = torch.zeros(BS, NC, C, D, device=device, dtype=dt)
         self.w_conn = torch.zeros(BS, NC, C, K, device=device, dtype=dt)
+        self.w_conn_border = torch.zeros(BS, NC, B, K_b, device=device, dtype=dt)
         self.decay_logit = torch.zeros(BS, NC, C, device=device, dtype=dt)
         self.primitives_state = torch.zeros(BS, NC, C, D, device=device, dtype=dt)
         self.hebbian_traces = torch.zeros(BS, NC, C, K, device=device, dtype=dt)
+        self.hebbian_traces_border = torch.zeros(BS, NC, B, K_b, device=device, dtype=dt)
         self.msg_magnitude = torch.zeros(BS, NC, C, device=device, dtype=dt)
 
         if self.config.structural_plasticity:
@@ -228,11 +258,20 @@ class CellMemoryGraph(nn.Module):
         output = output.reshape(BS, NC, C, -1).to(h.dtype)
 
         # Split into per-neuron adjustments
-        new_w_conn = output[..., :K]          # [BS, NC, C, K]
-        new_decay = output[..., K]            # [BS, NC, C]
-        new_prim = output[..., K+1:]          # [BS, NC, C, D]
+        K_b = self.config.K_border
+        new_w_conn = output[..., :K]                    # [BS, NC, C, K]
+        new_w_conn_border = output[..., K:K+K_b]        # [BS, NC, C, K_b]
+        new_decay = output[..., K+K_b]                   # [BS, NC, C]
+        new_prim = output[..., K+K_b+1:]                 # [BS, NC, C, D]
 
-        return new_w_conn, new_decay, new_prim
+        # Extract border neurons' border w_conn
+        B = self.config.N_border_per_cell
+        border_idx = self.border_indices  # [NC, B]
+        idx = border_idx.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, K_b)
+        new_w_conn_border_neurons = torch.gather(
+            new_w_conn_border, 2, idx)  # [BS, NC, B, K_b]
+
+        return new_w_conn, new_w_conn_border_neurons, new_decay, new_prim
 
     # ================================================================
     # Inject / Readout with port neurons
@@ -312,6 +351,55 @@ class CellMemoryGraph(nn.Module):
         # Weighted sum
         weighted = w_conn_sig.unsqueeze(-1) * neighbor_msgs  # [BS, NC, C, K, D]
         return weighted.sum(dim=3)  # [BS, NC, C, D]
+
+    # ================================================================
+    # Inter-cell border gather
+    # ================================================================
+
+    def _border_gather(self, msg: Tensor, w_conn_border_sig: Tensor) -> Tensor:
+        """Inter-cell gather: border neurons read from border neurons in other cells.
+
+        Args:
+            msg: [BS, NC, C, D] — current messages (all neurons)
+            w_conn_border_sig: [BS, NC, B, K_border] — sigmoid border weights
+
+        Returns:
+            border_received: [BS, NC, B, D] — weighted sum of remote border messages
+        """
+        BS, NC, C, D = msg.shape
+        B = self.config.N_border_per_cell
+        K_b = self.config.K_border
+
+        # Extract all border neurons' messages into a flat buffer
+        # border_indices: [NC, B] — cell-local indices of border neurons
+        border_local_idx = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
+            BS, -1, -1, D)  # [BS, NC, B, D]
+        border_msgs = torch.gather(msg, 2, border_local_idx)  # [BS, NC, B, D]
+
+        # Flatten to global border buffer: [BS, NC*B, D]
+        border_flat = border_msgs.reshape(BS, NC * B, D)
+
+        # border_conn_indices: [NC, B, K_border] — global indices into [NC*B]
+        conn = self.border_conn_indices.unsqueeze(0).unsqueeze(-1).expand(
+            BS, -1, -1, -1, D)  # [BS, NC, B, K_b, D]
+        conn_flat = conn.reshape(BS, NC * B, K_b, D)
+
+        # Gather from global border buffer
+        # For each border neuron's K_b connections, read the target's message
+        batch_idx = torch.arange(BS, device=msg.device)[:, None, None]
+        conn_indices_flat = self.border_conn_indices.reshape(NC * B, K_b)
+        conn_exp = conn_indices_flat.unsqueeze(0).expand(BS, -1, -1)
+        # [BS, NC*B, K_b, D]
+        neighbor_msgs = border_flat[:, :, None, :].expand(
+            -1, -1, K_b, -1).clone()
+        for k in range(K_b):
+            neighbor_msgs[:, :, k, :] = border_flat[
+                batch_idx.squeeze(-1), conn_exp[:, :, k]]
+
+        # Reshape back to [BS, NC, B, K_b, D] and weight
+        neighbor_msgs = neighbor_msgs.reshape(BS, NC, B, K_b, D)
+        weighted = w_conn_border_sig.unsqueeze(-1) * neighbor_msgs
+        return weighted.sum(dim=3)  # [BS, NC, B, D]
 
     # ================================================================
     # Shared MLPs
@@ -405,14 +493,18 @@ class CellMemoryGraph(nn.Module):
         h = self.h.detach()
         msg = self.prev_messages.detach()
 
-        # Run per-cell modulator
-        w_conn, decay_logit, primitives = self._run_modulator(
+        B = self.config.N_border_per_cell
+        K_b = self.config.K_border
+
+        # Run shared modulator (per-neuron input → per-neuron output)
+        w_conn, w_conn_border, decay_logit, primitives = self._run_modulator(
             h, self.hebbian_traces.detach(),
             self.decay_logit.detach(),
             self.primitives_state.detach())
 
-        w_conn_sig = torch.sigmoid(w_conn)  # [BS, NC, C, K]
-        decay = torch.sigmoid(decay_logit)  # [BS, NC, C]
+        w_conn_sig = torch.sigmoid(w_conn)          # [BS, NC, C, K]
+        w_conn_border_sig = torch.sigmoid(w_conn_border)  # [BS, NC, B, K_b]
+        decay = torch.sigmoid(decay_logit)           # [BS, NC, C]
 
         # ---- Fused Triton path (GPU) or Python fallback (CPU) ----
         if _HAS_TRITON and h.is_cuda:
@@ -436,17 +528,33 @@ class CellMemoryGraph(nn.Module):
 
             for t in range(T_seg):
                 inject_signal = self._inject(cc_signals[:, t])
+
+                # R intra-cell rounds
                 for r in range(R):
                     received = self._cell_gather(msg, w_conn_sig)
+
+                    # Inter-cell border gather: border neurons receive
+                    # from border neurons in other cells
+                    border_received = self._border_gather(
+                        msg, w_conn_border_sig)  # [BS, NC, B, D]
+                    # Add border signal to border neurons' received
+                    border_local = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(
+                        BS, -1, -1, D)
+                    received.scatter_add_(2, border_local,
+                                          border_received.to(received.dtype))
+
+                    # Inject to inject neurons
                     inject_idx = self.inject_indices.unsqueeze(0).unsqueeze(-1).expand(
                         BS, -1, -1, D)
                     inject_addend = torch.zeros_like(received)
                     inject_addend.scatter_(2, inject_idx,
                                            inject_signal.to(received.dtype))
                     input_vec = received + inject_addend
+
                     update = self._state_update(input_vec, primitives, decay_logit)
                     h = d * h + omd * update
                     msg = self._msg_output(h, primitives)
+
                 readouts.append(self._readout(msg))
                 with torch.no_grad():
                     msg_norms = msg.detach().norm(dim=-1)
@@ -459,6 +567,7 @@ class CellMemoryGraph(nn.Module):
             self.h = h.detach().to(self.dtype)
             self.prev_messages = msg.detach().to(self.dtype)
             self.w_conn = w_conn.detach().to(self.dtype)
+            self.w_conn_border = w_conn_border.detach().to(self.dtype)
             self.primitives_state = primitives.detach().to(self.dtype)
             self.decay_logit = decay_logit.detach().to(self.dtype)
             self.hebbian_traces = (

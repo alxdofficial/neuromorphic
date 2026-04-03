@@ -37,6 +37,10 @@ class V11Config:
     R_rounds: int = 4            # message-passing rounds per token step
     alpha: int = 4               # inject/readout redundancy factor
 
+    # Border neurons (inter-cell connectivity)
+    N_border_per_cell: int = 4   # border neurons per cell
+    K_border: int = 4            # inter-cell connections per border neuron
+
     # Shared MLP hidden sizes (H = D for balanced design at small D)
     state_mlp_hidden: int = 16   # shared state core hidden dim
     msg_mlp_hidden: int = 16     # shared message core hidden dim
@@ -67,6 +71,11 @@ class V11Config:
     def N_neurons(self) -> int:
         """Alias for compatibility with v9 interfaces."""
         return self.N_total
+
+    @property
+    def N_border_total(self) -> int:
+        """Total border neurons across all cells."""
+        return self.N_cells * self.N_border_per_cell
 
     @property
     def N_inject_per_cell(self) -> int:
@@ -125,10 +134,15 @@ class V11Config:
             raise ValueError(
                 f"N_cells ({self.N_cells}) must equal D // D_neuron "
                 f"({expected_cells}).")
-        if self.C_neurons < self.alpha * 2 + 1:
+        total_ports = self.alpha * 2 + self.N_border_per_cell
+        if self.C_neurons < total_ports + 1:
             raise ValueError(
-                f"C_neurons ({self.C_neurons}) must be > 2*alpha "
-                f"({2*self.alpha}) to have interneurons.")
+                f"C_neurons ({self.C_neurons}) must be > "
+                f"2*alpha + N_border ({total_ports}) to have interneurons.")
+        if self.K_border > self.N_border_total - self.N_border_per_cell:
+            raise ValueError(
+                f"K_border ({self.K_border}) must be <= total border neurons "
+                f"in other cells ({self.N_border_total - self.N_border_per_cell}).")
         if self.K_connections >= self.C_neurons:
             raise ValueError(
                 f"K_connections ({self.K_connections}) must be < "
@@ -152,6 +166,7 @@ class V11Config:
             d_inner=580, glu_output=True, T=128,
             N_cells=256, C_neurons=256, D_neuron=8,
             K_connections=16, R_rounds=4, alpha=4,
+            N_border_per_cell=4, K_border=4,
             pcm_hidden=256,
             cell_mod_hidden=32, state_mlp_hidden=16, msg_mlp_hidden=16,
         )
@@ -166,6 +181,7 @@ class V11Config:
             d_inner=64, glu_output=False, vocab_size=64, T=8,
             N_cells=8, C_neurons=16, D_neuron=8,
             K_connections=4, R_rounds=2, alpha=2,
+            N_border_per_cell=2, K_border=2,
             pcm_hidden=32,
             cell_mod_hidden=8, state_mlp_hidden=8, msg_mlp_hidden=8,
             structural_plasticity=False,

@@ -52,6 +52,8 @@ Input → Embedding → proj_up (768→2048)
 | C_neurons | 256 | Neurons per cell |
 | D_neuron | 8 | Per-neuron state dimension |
 | K_connections | 16 | Cell-local connections per neuron |
+| N_border_per_cell | 4 | Border neurons per cell (inter-cell) |
+| K_border | 4 | Inter-cell connections per border neuron |
 | R_rounds | 4 | Message-passing rounds per token |
 | alpha | 4 | Inject/readout redundancy factor |
 | state_mlp_hidden | 16 | Shared state MLP hidden dim |
@@ -64,15 +66,21 @@ Input → Embedding → proj_up (768→2048)
 
 ## Cell Structure
 
-Each cell contains 256 neurons:
+Each cell contains 256 neurons with designated roles:
 - **4 inject neurons** (indices 0..3): receive LM signal via additive injection
+- **4 border neurons** (indices 4..7): have K_border=4 connections to border
+  neurons in OTHER cells, enabling inter-cell information flow
 - **4 readout neurons** (indices 252..255): messages read out to LM
-- **248 interneurons** (indices 4..251): internal computation only
+- **244 interneurons** (indices 8..251): internal computation only
 
-All neurons participate in R rounds of message passing. Inject neurons get
-an extra additive signal from the LM. Only readout neurons' messages are
-read out. Information flows from inject → interneurons → readout through
-the cell's sparse connectivity.
+All neurons participate in R rounds of message passing. Every round:
+1. All neurons do intra-cell gather (K=16 cell-local connections)
+2. Border neurons additionally gather from their K_border=4 inter-cell connections
+3. Inject neurons get the additive LM signal
+4. All neurons update state and generate messages
+
+Information flow: LM → inject neurons → interneurons → border neurons ↔
+border neurons in other cells → interneurons → readout neurons → LM.
 
 ### Why Port Neurons?
 
@@ -101,6 +109,47 @@ other neurons in cell c. Connection indices stored as uint8 (0..255).
    contiguous memory, not random global addresses.
 2. **Scalability**: Adding cells scales linearly with no cross-cell coupling.
 3. **Biological**: Cortical connectivity is predominantly local.
+
+---
+
+## Inter-Cell Connectivity (Border Neurons)
+
+Each cell has B=4 **border neurons** that additionally have K_border=4
+connections to border neurons in other cells. These connections are global
+(any border neuron in any cell) and initialized randomly.
+
+### Implementation
+
+All border neurons across all cells form a global pool of NC×B = 1024
+border neurons. Each border neuron's K_border connections index into this
+pool (excluding its own cell's border neurons).
+
+The border gather is a small global memory read per token:
+- 4 border neurons × 4 connections × 8 dims = 128 floats per cell
+- 256 cells × 128 floats × 2 bytes = 65 KB total per token
+- At 1 TB/s bandwidth: <0.001 ms — negligible
+
+### Processing Order (per round)
+
+Border gather happens **simultaneously** with intra-cell gather. Each border
+neuron's received signal is the sum of its intra-cell received (from K=16
+cell-local neighbors) plus its inter-cell received (from K_border=4 remote
+border neurons). Same state MLP, same msg MLP, same modulator — the border
+neuron is just a regular neuron with extra connections reaching outside.
+
+### Structural Plasticity
+
+Border connections are rewirable via co-activation-based structural
+plasticity, using the same mechanism as intra-cell connections. This lets
+the network learn which cross-cell connections are useful and prune/regrow
+them based on Hebbian co-activation.
+
+### Biological Analogy
+
+Layer 2/3 pyramidal neurons in cortex have mostly local synapses plus
+sparse long-range axonal projections to other cortical areas. Same neuron
+type, same integration rule, same plasticity — just some connections reach
+further. Our border neurons follow this pattern exactly.
 
 ---
 
