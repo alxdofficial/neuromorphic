@@ -36,6 +36,7 @@ class V11Config:
     K_connections: int = 16      # cell-local connections per neuron
     R_rounds: int = 4            # message-passing rounds per token step
     alpha: int = 4               # inject/readout redundancy factor
+    share_io_ports: bool = True  # reuse inject ports for readout when desired
 
     # Border neurons (inter-cell connectivity)
     N_border_per_cell: int = 4   # border neurons per cell
@@ -136,11 +137,13 @@ class V11Config:
             raise ValueError(
                 f"N_cells ({self.N_cells}) must equal D // D_neuron "
                 f"({expected_cells}).")
-        total_ports = self.alpha * 2 + self.N_border_per_cell
+        readout_ports = 0 if self.share_io_ports else self.alpha
+        total_ports = self.alpha + readout_ports + self.N_border_per_cell
         if self.C_neurons < total_ports + 1:
             raise ValueError(
                 f"C_neurons ({self.C_neurons}) must be > "
-                f"2*alpha + N_border ({total_ports}) to have interneurons.")
+                f"inject + readout + border ports ({total_ports}) "
+                f"to have interneurons.")
         if self.K_border > self.N_border_total - self.N_border_per_cell:
             raise ValueError(
                 f"K_border ({self.K_border}) must be <= total border neurons "

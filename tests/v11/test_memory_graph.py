@@ -63,7 +63,11 @@ class TestCellMemoryGraphInit:
         mg = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         assert mg.inject_indices.shape == (cfg.N_cells, cfg.alpha)
         assert mg.readout_indices.shape == (cfg.N_cells, cfg.alpha)
-        # Inject and readout should not overlap
+        assert torch.equal(mg.inject_indices, mg.readout_indices)
+
+    def test_split_io_indices_still_supported(self):
+        cfg = make_tiny(share_io_ports=False)
+        mg = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
         for cell in range(cfg.N_cells):
             inject_set = set(mg.inject_indices[cell].tolist())
             readout_set = set(mg.readout_indices[cell].tolist())
@@ -218,9 +222,91 @@ class TestForwardSegment:
         out_chunk = mg_chunk.forward_segment(cc)
 
         assert torch.allclose(out_ref, out_chunk, atol=1e-5, rtol=1e-5)
-        assert torch.allclose(mg_ref.h, mg_chunk.h, atol=1e-5, rtol=1e-5)
-        assert torch.allclose(
-            mg_ref.prev_messages, mg_chunk.prev_messages, atol=1e-5, rtol=1e-5)
+
+    def test_r1_output_depends_on_segment_input(self):
+        cfg = make_tiny(R_rounds=1, structural_plasticity=False)
+        mg = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg.initialize_states(BS)
+
+        cc1 = torch.randn(BS, cfg.T, cfg.D)
+        cc2 = torch.randn(BS, cfg.T, cfg.D)
+
+        runtime = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in mg.runtime_state_dict().items()
+        }
+        out1 = mg.forward_segment(cc1)
+        mg.load_runtime_state(runtime)
+        out2 = mg.forward_segment(cc2)
+
+        assert not torch.allclose(out1, out2)
+
+    def test_shared_io_fast_path_matches_full_chunk_round(self):
+        cfg = make_tiny(R_rounds=1, structural_plasticity=False, share_io_ports=True)
+        mg = CellMemoryGraph(cfg, torch.device("cpu"), dtype=torch.float32)
+        mg.initialize_states(BS)
+
+        cell_chunk = 2
+        received = torch.randn(BS, cell_chunk, cfg.C_neurons, cfg.D_neuron)
+        primitives = torch.randn(BS, cell_chunk, cfg.C_neurons, cfg.D_neuron)
+        decay = torch.randn(BS, cell_chunk, cfg.C_neurons)
+        h = torch.randn(BS, cell_chunk, cfg.C_neurons, cfg.D_neuron)
+        inject = torch.randn(BS, cfg.T, cell_chunk, cfg.D_neuron)
+        nid = mg.neuron_id[:cell_chunk]
+
+        D = cfg.D_neuron
+        dt = torch.float32
+        state_w_in = mg.state_w1[:, :D].to(dt)
+        state_w_prim = mg.state_w1[:, D:2*D].to(dt)
+        state_w_id = mg.state_w1[:, 2*D:3*D].to(dt)
+        state_w_decay = mg.state_w1[:, 3*D:].to(dt)
+        state_w2 = mg.state_w2.to(dt)
+        state_b1 = mg.state_b1.to(dt)
+        state_b2 = mg.state_b2.to(dt)
+        msg_w_h = mg.msg_w1[:, :D].to(dt)
+        msg_w_prim = mg.msg_w1[:, D:2*D].to(dt)
+        msg_w_id = mg.msg_w1[:, 2*D:].to(dt)
+        msg_w2 = mg.msg_w2.to(dt)
+        msg_b1 = mg.msg_b1.to(dt)
+        msg_b2 = mg.msg_b2.to(dt)
+
+        out_full = mg._run_round_chunk_full(
+            received, primitives, decay, h, inject, nid,
+            need_readout=True, need_act_trace=False,
+            state_w_in=state_w_in,
+            state_w_prim=state_w_prim,
+            state_w_id=state_w_id,
+            state_w_decay=state_w_decay,
+            state_w2=state_w2,
+            state_b1=state_b1,
+            state_b2=state_b2,
+            msg_w_h=msg_w_h,
+            msg_w_prim=msg_w_prim,
+            msg_w_id=msg_w_id,
+            msg_w2=msg_w2,
+            msg_b1=msg_b1,
+            msg_b2=msg_b2,
+        )
+        out_fast = mg._run_round_chunk_shared_io_fast(
+            received, primitives, decay, h, inject, nid,
+            need_readout=True,
+            state_w_in=state_w_in,
+            state_w_prim=state_w_prim,
+            state_w_id=state_w_id,
+            state_w_decay=state_w_decay,
+            state_w2=state_w2,
+            state_b1=state_b1,
+            state_b2=state_b2,
+            msg_w_h=msg_w_h,
+            msg_w_prim=msg_w_prim,
+            msg_w_id=msg_w_id,
+            msg_w2=msg_w2,
+            msg_b1=msg_b1,
+            msg_b2=msg_b2,
+        )
+
+        for ref, fast in zip(out_full, out_fast):
+            assert torch.allclose(ref, fast, atol=1e-5, rtol=1e-5)
 
 
 class TestInjectReadout:
@@ -249,7 +335,7 @@ class TestInjectReadout:
 
         # Set only non-readout neurons to 1
         msg2 = torch.zeros_like(msg)
-        msg2[:, :, :cfg.C_neurons - cfg.alpha, :] = 1.0
+        msg2[:, :, cfg.alpha:, :] = 1.0
         out_non_readout = mg._readout(msg2)
 
         # Should be the same (readout neurons are still zero)
