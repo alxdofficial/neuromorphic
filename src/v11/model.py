@@ -72,7 +72,11 @@ class V11Model(nn.Module):
         H_mid, surprise, x, aux_loss = self.lm.forward_scan_lower(
             input_ids, reset_mask=reset_mask)
 
-        if use_memory and self.memory.is_initialized():
+        if use_memory and not self.memory.is_initialized():
+            raise RuntimeError(
+                "use_memory=True but memory is not initialized. "
+                "Call model.initialize_states(BS) first.")
+        if use_memory:
             # Memory graph processes detached H_mid
             cc_all = H_mid.detach().to(self.memory.dtype)
             action_every = config.action_every
