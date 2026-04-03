@@ -548,7 +548,11 @@ class CellMemoryGraph(nn.Module):
 
         inject_all = cc_signals.reshape(BS, T_seg, NC, D)
         cell_chunk = self._cell_chunk_size(BS, T_seg, dt)
-        use_chunk_checkpoint = torch.is_grad_enabled() and cell_chunk < NC
+        use_chunk_checkpoint = (
+            self.config.checkpoint_chunk_rounds and
+            torch.is_grad_enabled() and
+            cell_chunk < NC
+        )
         act_trace = None
 
         for r in range(R):

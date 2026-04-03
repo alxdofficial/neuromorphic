@@ -22,6 +22,7 @@ class TestConfig:
         assert c.N_inject_per_cell == 4
         assert c.N_readout_per_cell == 4
         assert c.structural_plasticity is False
+        assert c.checkpoint_chunk_rounds is False
 
     def test_tier_tiny_validates(self):
         c = make_tiny()

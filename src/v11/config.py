@@ -58,6 +58,7 @@ class V11Config:
     T: int = 128                 # tokens per chunk = segment length
     mem_lr_scale: float = 0.3
     experimental_triton_token_step: bool = False
+    checkpoint_chunk_rounds: bool = False
 
     # ================================================================
     # Derived properties
