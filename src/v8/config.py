@@ -28,13 +28,11 @@ class V8Config:
     N_mem_neurons: int = 512     # total neurons
     D_neuron: int = 256          # per-neuron state dimension
     K_connections: int = 32      # sparse presynaptic connections per neuron
-    dendrite_branch_size: int = 16
 
     # Memory hidden sizes
-    neuromod_hidden: int = 112   # segment-boundary per-neuron modulator
-    state_mlp_hidden: int = 24   # shared per-step state core hidden dim
-    msg_mlp_hidden: int = 24     # shared per-step message core hidden dim
-    experimental_triton_pass: bool = False  # chunked msg-core path + Triton readout reduction
+    neuromod_hidden: int = 112   # per-neuron modulator hidden dim
+    state_mlp_hidden: int = 24   # shared state MLP hidden dim
+    msg_mlp_hidden: int = 24     # shared message MLP hidden dim
 
     # Structural plasticity
     structural_plasticity: bool = True
@@ -111,10 +109,6 @@ class V8Config:
                 f"[1, L_total-1={self.L_total-1}].")
         if self.T < 1:
             raise ValueError(f"T ({self.T}) must be >= 1.")
-        if self.dendrite_branch_size > self.K_connections:
-            raise ValueError(
-                f"dendrite_branch_size ({self.dendrite_branch_size}) must be <= "
-                f"K_connections ({self.K_connections}).")
 
     @classmethod
     def tier_a(cls, **overrides) -> "V8Config":
@@ -122,7 +116,6 @@ class V8Config:
             D=2048, D_embed=768, C=16, L_total=4, scan_split_at=2,
             d_inner=580, glu_output=True, T=128,
             N_mem_neurons=512, D_neuron=256, K_connections=32,
-            dendrite_branch_size=0,
             pcm_hidden=256,
             neuromod_hidden=112, state_mlp_hidden=24, msg_mlp_hidden=24,
         )
@@ -136,7 +129,6 @@ class V8Config:
             D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=64, T=8,
             N_mem_neurons=32, D_neuron=16, K_connections=8,
-            dendrite_branch_size=4,
             pcm_hidden=32,
             neuromod_hidden=16, state_mlp_hidden=16, msg_mlp_hidden=16,
             structural_plasticity=False,

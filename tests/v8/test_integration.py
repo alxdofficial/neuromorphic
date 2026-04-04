@@ -97,27 +97,10 @@ class TestGradientFlow:
         loss.backward()
 
         mg = model.memory
-        # Modulator
-        assert mg.mod_w1.grad is not None, "mod_w1 should have grad"
-        assert mg.mod_w1.grad.norm() > 0, "mod_w1 grad should be nonzero"
-        assert mg.mod_w2.grad is not None, "mod_w2 should have grad"
-
-        # State MLP
-        assert mg.state_w1.grad is not None, "state_w1 should have grad"
-        assert mg.state_w1.grad.norm() > 0, "state_w1 grad should be nonzero"
-
-        # Message MLP
-        assert mg.msg_w1.grad is not None, "msg_w1 should have grad"
-        assert mg.msg_w1.grad.norm() > 0, "msg_w1 grad should be nonzero"
-
-        # Neuron ID
-        assert mg.neuron_id.grad is not None, "neuron_id should have grad"
-        assert mg.neuron_id.grad.norm() > 0, "neuron_id grad should be nonzero"
-
-        # Dendritic weights
-        if mg.use_dendritic_tree:
-            assert mg.dendrite_branch_w.grad is not None
-            assert mg.dendrite_group_w.grad is not None
+        # All memory params should get gradients
+        for name, p in mg.named_parameters():
+            assert p.grad is not None, f"{name} should have grad"
+            assert p.grad.norm() > 0, f"{name} grad should be nonzero"
 
     def test_lm_params_get_grad(self):
         cfg = make_tiny()
