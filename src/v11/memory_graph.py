@@ -136,9 +136,11 @@ class CellMemoryGraph(nn.Module):
             torch.randn(N_total, H_mod, mod_in, device=device) *
             (2.0 / (mod_in + H_mod)) ** 0.5)
         self.mod_b1 = nn.Parameter(torch.zeros(N_total, H_mod, device=device))
+        # Depth-scaled init: W2 starts small so initial deltas ≈ 0.
+        # Modulator begins by preserving previous state, gradually learns adjustments.
         self.mod_w2 = nn.Parameter(
             torch.randn(N_total, H_mod, mod_out, device=device) *
-            (2.0 / (H_mod + mod_out)) ** 0.5)
+            (2.0 / (H_mod + mod_out)) ** 0.5 * 0.01)
         self.mod_b2 = nn.Parameter(torch.zeros(N_total, mod_out, device=device))
 
         # ---- Neuron identity embedding ----
@@ -221,7 +223,13 @@ class CellMemoryGraph(nn.Module):
     # ================================================================
 
     def _run_modulator(self, h, hebbian_traces, decay_logit, primitives):
-        """Per-neuron modulator: each neuron has its own MLP weights."""
+        """Per-neuron modulator: predicts DELTAS added to previous values.
+
+        Delta prediction with depth-scaled init means the modulator starts
+        by preserving previous state (delta ≈ 0) and gradually learns
+        what to adjust. Primitives are RMS-normalized after update to
+        prevent drift/explosion over many segments.
+        """
         BS = h.shape[0]
         NC = self.config.N_cells
         C = self.config.C_neurons
@@ -246,19 +254,30 @@ class CellMemoryGraph(nn.Module):
             'bni,nhi->bnh', flat_input, self.mod_w1.to(idt)
         ) + self.mod_b1.to(idt)
         hidden = torch.tanh(hidden)
-        output = torch.einsum(
+        delta = torch.einsum(
             'bnh,nho->bno', hidden, self.mod_w2.to(idt)
         ) + self.mod_b2.to(idt)
-        output = output.reshape(BS, NC, C, -1)
+        delta = delta.reshape(BS, NC, C, -1)
 
-        new_w_conn = output[..., :K]
-        new_w_conn_border_all = output[..., K:K+K_b]
-        new_decay = output[..., K+K_b]
-        new_prim = output[..., K+K_b+1:]
+        # Split deltas and ADD to previous values (not replace)
+        w_conn_delta = delta[..., :K]
+        w_conn_border_delta = delta[..., K:K+K_b]
+        decay_delta = delta[..., K+K_b]
+        prim_delta = delta[..., K+K_b+1:]
 
-        # Extract border neurons' border w_conn
+        # Apply deltas to previous state
+        new_w_conn = self.w_conn + w_conn_delta
+        new_decay = decay_logit + decay_delta
+
+        # Primitives: add delta then RMS-normalize to prevent drift
+        new_prim = primitives + prim_delta
+        rms = new_prim.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
+        new_prim = new_prim * rms
+
+        # Extract border neurons' border w_conn delta
         idx = self.border_indices.unsqueeze(0).unsqueeze(-1).expand(BS, -1, -1, K_b)
-        new_w_conn_border = torch.gather(new_w_conn_border_all, 2, idx)
+        new_w_conn_border = self.w_conn_border + torch.gather(
+            w_conn_border_delta, 2, idx)
 
         return new_w_conn, new_w_conn_border, new_decay, new_prim
 
