@@ -91,9 +91,6 @@ class V8Diagnostics:
                 metrics["grad_state_w2"] = round(mg.state_w2.grad.norm().item(), 6)
                 metrics["grad_msg_w2"] = round(mg.msg_w2.grad.norm().item(), 6)
                 metrics["grad_neuron_id"] = round(mg.neuron_id.grad.norm().item(), 6)
-                if mg.use_dendritic_tree:
-                    metrics["grad_dendrite"] = round(
-                        mg.dendrite_branch_w.grad.norm().item(), 6)
 
             # Structural plasticity
             if hasattr(mg, '_last_rewire_swaps'):

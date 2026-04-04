@@ -1,4 +1,4 @@
-"""v9-backprop configuration — Differentiable Memory Graph with 2-pass simulation."""
+"""Configuration — Sequential differentiable memory graph + split-scan LM."""
 
 from dataclasses import dataclass
 

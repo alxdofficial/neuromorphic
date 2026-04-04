@@ -280,6 +280,8 @@ class MemoryGraph(nn.Module):
 
         readouts = []
         act_norms = []
+        hebbian_accum = torch.zeros_like(self.hebbian_traces)
+
         for t in range(T_seg):
             received = msg[:, self.conn_indices]  # [BS, N, K, D]
             received = (w_conn_sig.unsqueeze(-1) * received).sum(dim=2)
@@ -302,7 +304,9 @@ class MemoryGraph(nn.Module):
             readouts.append(grouped.mean(dim=2).reshape(BS, self.config.D))
 
             with torch.no_grad():
-                act_norms.append(msg.detach().norm(dim=-1).float())
+                msg_norms_t = msg.detach().norm(dim=-1)
+                hebbian_accum += msg_norms_t.unsqueeze(-1) * w_conn_sig.detach()
+                act_norms.append(msg_norms_t.float())
 
         mem_out = torch.stack(readouts, dim=1)
 
@@ -313,8 +317,9 @@ class MemoryGraph(nn.Module):
             self.w_conn = w_conn.detach().to(self.dtype)
             self.primitives_state = primitives.detach().to(self.dtype)
             self.decay_logit = decay_logit.detach().to(self.dtype)
+            # Hebbian: true per-segment average across all T tokens
             self.hebbian_traces = (
-                msg_norms.unsqueeze(-1) * w_conn_sig.detach() / max(T_seg, 1)
+                hebbian_accum / max(T_seg, 1)
             ).to(self.dtype)
             self.msg_magnitude = (
                 0.95 * self.msg_magnitude + 0.05 * msg_norms
@@ -373,7 +378,10 @@ class MemoryGraph(nn.Module):
             _, grow_idx = phi_cand.reshape(-1).topk(n_prune, largest=True)
             grow_target = grow_idx % N
 
-            rand_t = torch.randint(0, N, (n_prune,), device=device)
+            # Random exploration: sample targets excluding self-connections
+            rand_t = torch.randint(0, N - 1, (n_prune,), device=device)
+            # Shift past self: if rand_t >= prune_n, add 1 to skip self
+            rand_t = rand_t + (rand_t >= prune_n).long()
             use_rand = torch.rand(n_prune, device=device) < self.config.plasticity_exploration_frac
             grow_target = torch.where(use_rand, rand_t, grow_target)
 
