@@ -1,11 +1,4 @@
-"""v9-backprop Trainer — single optimizer, joint LM + memory graph training.
-
-Each step:
-1. Forward: lower scan + memory graph + upper scan → logits
-2. CE loss + aux_loss
-3. Single backward through entire model (LM + memory modulator + dendrites)
-4. Single optimizer step
-"""
+"""Trainer — single optimizer, joint LM + memory graph training."""
 
 import math
 import time
@@ -15,20 +8,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .config import V8Config
-from .model import V8Model
+from .model.config import Config
+from .model.model import Model
 
 
-class V8Trainer:
-    """Training loop: everything by backprop."""
+class Trainer:
 
     def __init__(
         self,
-        model: V8Model,
+        model: Model,
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler | None,
         dataloader,
-        config: V8Config,
+        config: Config,
         device: torch.device,
         max_grad_norm: float = 1.0,
         log_interval: int = 50,
@@ -44,28 +36,14 @@ class V8Trainer:
         self.log_interval = log_interval
         self.global_step = 0
         self.use_memory = use_memory
-
-        self._states_initialized = False
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
 
     def train_chunk(self, batch) -> dict:
-        """Process one chunk. Single forward + backward."""
         self.model.train()
-        BS = batch.input_ids.shape[0]
-        T = batch.input_ids.shape[1]
-
-        if not self._states_initialized:
-            if not self.model._states_initialized:
-                self.model.initialize_states(BS, self.device)
-            self._states_initialized = True
-
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
-
-        eot_id = self.config.eot_id
-        has_reset = (batch.prev_token == eot_id).any().item()
-        reset_mask = batch.prev_token.to(self.device, non_blocking=True) == eot_id
+        BS, T = input_ids.shape
 
         t_start = time.time()
 
@@ -73,18 +51,16 @@ class V8Trainer:
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp)
 
-        # Forward
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
-                reset_mask=reset_mask,
-                use_memory=self.use_memory,
-                has_reset=has_reset)
+                use_memory=self.use_memory)
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
 
-        # CE loss
+        # Masked CE loss (exclude EOT positions)
+        eot_id = self.config.eot_id
         ce_per_token = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size),
             target_ids.reshape(-1), reduction='none'
@@ -96,11 +72,9 @@ class V8Trainer:
         ce_loss = (ce_per_token * valid_mask).sum() / valid_count
         total_loss = ce_loss + aux_loss
 
-        # Single backward + optimizer step
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
 
-        # Separate grad norms for monitoring
         lm_grad_norm = nn.utils.clip_grad_norm_(
             self.model.lm.parameters(), self.max_grad_norm).item()
         mem_grad_norm = nn.utils.clip_grad_norm_(
@@ -110,7 +84,6 @@ class V8Trainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        # TBPTT boundary
         self.model.detach_states()
 
         elapsed = time.time() - t_start
@@ -134,7 +107,7 @@ class V8Trainer:
 
     def train_epoch(self, max_steps: int, step_callback=None) -> list[dict]:
         all_metrics = []
-        pbar = tqdm(total=max_steps, desc="v9 train", unit="step")
+        pbar = tqdm(total=max_steps, desc="train", unit="step")
 
         for step_idx, batch in enumerate(self.dataloader):
             if step_idx >= max_steps:
