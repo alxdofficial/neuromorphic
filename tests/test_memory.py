@@ -5,6 +5,7 @@ import pytest
 
 from src.model.config import Config
 from src.model.memory import MemoryGraph
+from src.model.triton_kernels import hebbian_ema_update
 
 
 def _tiny_config(**kw):
@@ -35,6 +36,56 @@ class TestShapes:
             BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=torch.bfloat16)
         readout = mg._readout(msg)
         assert readout.shape == (BS, config.D)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton receive test")
+    def test_local_receive_matches_eager_on_cuda(self):
+        config = _tiny_config()
+        mg = MemoryGraph(config).cuda()
+        mg.initialize_states(2, torch.device("cuda"))
+        msg = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.D_n,
+            device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w_conn = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.K,
+            device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        received_fused = mg._receive_local(msg, w_conn)
+
+        batch_idx = torch.arange(2, device="cuda")[:, None, None, None]
+        cell_idx = torch.arange(config.N_cells, device="cuda")[None, :, None, None]
+        conn = mg.conn_idx.to("cuda").unsqueeze(0).expand(2, -1, -1, -1)
+        gathered = msg[batch_idx, cell_idx, conn]
+        received_eager = (gathered * torch.sigmoid(w_conn).unsqueeze(-1)).sum(dim=3)
+
+        diff = (received_fused - received_eager).float().abs().max().item()
+        assert diff < 5e-2, f"Fused local receive deviates from eager baseline (max diff={diff})"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton Hebbian test")
+    def test_hebbian_update_matches_eager_on_cuda(self):
+        config = _tiny_config()
+        mg = MemoryGraph(config).cuda()
+        mg.initialize_states(2, torch.device("cuda"))
+        msg_prev = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.D_n,
+            device="cuda", dtype=torch.bfloat16)
+        msg_new = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.D_n,
+            device="cuda", dtype=torch.bfloat16)
+        hebbian = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.K,
+            device="cuda", dtype=torch.bfloat16)
+        decay = 0.995
+
+        hebb_fused = hebbian_ema_update(msg_prev, msg_new, hebbian, mg.conn_idx.to("cuda"), decay)
+
+        batch_idx = torch.arange(2, device="cuda")[:, None, None, None]
+        cell_idx = torch.arange(config.N_cells, device="cuda")[None, :, None, None]
+        conn = mg.conn_idx.to("cuda").unsqueeze(0).expand(2, -1, -1, -1)
+        gathered = msg_prev[batch_idx, cell_idx, conn]
+        hebb_eager = hebbian * decay + (gathered * msg_new.unsqueeze(3)).sum(dim=-1) * (1.0 - decay)
+
+        diff = (hebb_fused - hebb_eager).float().abs().max().item()
+        assert diff < 5e-2, f"Fused Hebbian update deviates from eager baseline (max diff={diff})"
 
 
 class TestModulator:
@@ -136,10 +187,10 @@ class TestHebbian:
         hebbian = mg.hebbian_traces.clone()
         h0 = hebbian.clone()
 
-        gathered = torch.randn(
-            BS, config.N_cells, config.neurons_per_cell, config.K, config.D_n, dtype=dt)
+        msg_prev = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
         msg = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
-        mg._update_hebbian(gathered, msg, hebbian)
+        mg._update_hebbian(msg_prev, msg, hebbian, mg.conn_idx)
 
         assert not torch.equal(hebbian, h0), "Hebbian traces should change after update"
 

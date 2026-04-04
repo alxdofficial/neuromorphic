@@ -9,10 +9,10 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from .config import Config
+from .triton_kernels import hebbian_ema_update, local_receive
 
 
 class MemoryGraph(nn.Module):
@@ -223,23 +223,15 @@ class MemoryGraph(nn.Module):
             border_gate_logit + dborder,
         )
 
-    def _receive_local(self, msg: Tensor, w_conn: Tensor) -> tuple[Tensor, Tensor]:
-        BS = msg.shape[0]
-        device = msg.device
-        batch_idx = torch.arange(BS, device=device)[:, None, None, None]
-        cell_idx = torch.arange(self.N_cells, device=device)[None, :, None, None]
-        conn = self.conn_idx.to(device).unsqueeze(0).expand(BS, -1, -1, -1)
-        gathered = msg[batch_idx, cell_idx, conn]
-        received = (gathered * torch.sigmoid(w_conn).unsqueeze(-1)).sum(dim=3)
-        return received, gathered
+    def _receive_local(self, msg: Tensor, w_conn: Tensor) -> Tensor:
+        return local_receive(msg, w_conn, self.conn_idx)
 
     def _inject(self, received: Tensor, H_aug_t: Tensor, inject_w: Tensor, inject_b: Tensor) -> Tensor:
         cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
         inject = torch.einsum("bni,noi->bno", cell_slice, inject_w)
         inject = inject + inject_b.unsqueeze(0)
         inject = inject.reshape(H_aug_t.shape[0], self.N_cells, self.alpha, self.D_n)
-        received = received.clone()
-        received[:, :, self.input_lo:self.input_hi] += inject.to(received.dtype)
+        received[:, :, self.input_lo:self.input_hi].add_(inject.to(received.dtype))
         return received
 
     def _border_exchange(self, msg: Tensor, border_gate_logit: Tensor) -> Tensor:
@@ -304,16 +296,25 @@ class MemoryGraph(nn.Module):
         return readout.reshape(msg.shape[0], -1)
 
     @staticmethod
-    def _hebbian_next(gathered: Tensor, msg_new: Tensor, hebbian: Tensor, decay: float = 0.995) -> Tensor:
-        post = msg_new.detach().unsqueeze(3)
-        pre = gathered.detach()
-        correlation = (pre * post).sum(dim=-1)
-        return hebbian * decay + correlation * (1.0 - decay)
+    def _hebbian_next(
+        msg_prev: Tensor,
+        msg_new: Tensor,
+        hebbian: Tensor,
+        conn_idx: Tensor,
+        decay: float = 0.995,
+    ) -> Tensor:
+        return hebbian_ema_update(msg_prev, msg_new, hebbian, conn_idx, decay)
 
     @staticmethod
-    def _update_hebbian(gathered: Tensor, msg_new: Tensor, hebbian: Tensor, decay: float = 0.995):
+    def _update_hebbian(
+        msg_prev: Tensor,
+        msg_new: Tensor,
+        hebbian: Tensor,
+        conn_idx: Tensor,
+        decay: float = 0.995,
+    ):
         with torch.no_grad():
-            hebbian.copy_(MemoryGraph._hebbian_next(gathered, msg_new, hebbian, decay))
+            hebbian.copy_(MemoryGraph._hebbian_next(msg_prev, msg_new, hebbian, conn_idx, decay))
 
     def _step(
         self,
@@ -337,7 +338,7 @@ class MemoryGraph(nn.Module):
         mg_w2: Tensor,
         mg_b2: Tensor,
     ):
-        received, gathered = self._receive_local(msg, w_conn)
+        received = self._receive_local(msg, w_conn)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
         received[:, :, self.border_lo:self.border_hi] += self._border_exchange(msg, border_gate_logit)
 
@@ -348,7 +349,7 @@ class MemoryGraph(nn.Module):
             h, identity, cell_context,
             mg_w1, mg_b1, mg_w2, mg_b2)
         readout = self._readout(msg)
-        return h, msg, readout, gathered
+        return h, msg, readout
 
     def _run_block(
         self,
@@ -398,14 +399,15 @@ class MemoryGraph(nn.Module):
                     mod_w1, mod_b1, mod_w2, mod_b2,
                 )
 
-            h, msg, readout, gathered = self._step(
+            msg_prev = msg
+            h, msg, readout = self._step(
                 h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
                 block_H_aug[:, offset], identity,
                 inject_w, inject_b,
                 st_w1, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
             )
-            hebbian = self._hebbian_next(gathered, msg, hebbian, ema_decay)
+            hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx, ema_decay)
             readouts[:, offset] = readout
 
         return h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, readouts
