@@ -1,16 +1,8 @@
-"""Memory Graph — vectorized sparse neuron simulation.
+"""Cell-grid memory graph.
 
-N neurons, each with D_n-dim hidden state and K sparse presynaptic connections.
-One neuron step per token, all neurons processed in parallel via bulk tensor ops.
-
-Per-token step:
-  0. Neuromodulate: per-neuron MLP predicts delta to w_conn, decay, identity
-  1. Receive: gather K neighbor messages, weight by sigmoid(w_conn), sum
-  2. Inject: add LM signal to input port neurons
-  3. State update: shared MLP + structural decay blend
-  4. Emit message: shared MLP + identity residual
-  5. Readout: output port neuron messages → LM dim
-  6. Hebbian trace update (no grad)
+The memory graph is laid out as an 8x8 grid of cells. Each cell owns one
+32-dim LM slice and contains a contiguous block of neurons with mostly
+within-cell connectivity plus fixed directional border exchange.
 """
 
 import math
@@ -28,58 +20,77 @@ class MemoryGraph(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        N = config.N
-        K = config.K
-        D_n = config.D_n
-        self.N = N
-        self.K = K
-        self.D_n = D_n
-        self.C_mem = config.C_mem
-        self.N_port = config.N_port
+        self.D_n = config.D_n
+        self.N_cells = config.N_cells
+        self.C_n = config.neurons_per_cell
+        self.K = config.K
         self.alpha = config.alpha
+        self.border_per_cell = config.border_per_cell
+        self.grid_h = config.grid_h
+        self.grid_w = config.grid_w
 
-        # --- Connectivity (buffer, not learned) ---
-        scores = torch.rand(N, N)
-        scores[torch.arange(N), torch.arange(N)] = -float('inf')
-        _, top_k = scores.topk(K, dim=1)
-        conn_idx, _ = top_k.sort(dim=-1)
-        self.register_buffer('conn_idx', conn_idx)
+        self.input_lo = 0
+        self.input_hi = self.alpha
+        self.output_lo = self.input_hi
+        self.output_hi = self.output_lo + self.alpha
+        self.border_lo = self.output_hi
+        self.border_hi = self.border_lo + self.border_per_cell
 
-        # --- Per-neuron identity embedding ---
-        self.neuron_id = nn.Parameter(torch.randn(N, D_n) * 0.02)
+        conn = torch.empty(self.N_cells, self.C_n, self.K, dtype=torch.long)
+        for cell in range(self.N_cells):
+            for neuron in range(self.C_n):
+                scores = torch.rand(self.C_n)
+                scores[neuron] = -float("inf")
+                conn[cell, neuron] = scores.topk(self.K).indices.sort().values
+        self.register_buffer("conn_idx", conn)
 
-        # --- Shared state MLP: F.linear convention [out, in] ---
-        self.state_w1 = nn.Parameter(torch.empty(config.state_mlp_hidden, config.state_in))
-        self.state_b1 = nn.Parameter(torch.zeros(config.state_mlp_hidden))
-        self.state_w2 = nn.Parameter(torch.empty(D_n, config.state_mlp_hidden))
-        self.state_b2 = nn.Parameter(torch.zeros(D_n))
+        cell_to_group = torch.arange(self.N_cells) % config.mlp_groups
+        self.register_buffer("cell_to_group", cell_to_group)
 
-        nn.init.kaiming_uniform_(self.state_w1, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.state_w2, a=math.sqrt(5))
+        self.neuron_id = nn.Parameter(torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
+
+        G = config.mlp_groups
+        Hs = config.state_mlp_hidden
+        Hm = config.msg_mlp_hidden
+        Hmod = config.cell_mod_hidden
+
+        self.state_w1 = nn.Parameter(torch.empty(G, Hs, config.state_in))
+        self.state_b1 = nn.Parameter(torch.zeros(G, Hs))
+        self.state_w2 = nn.Parameter(torch.empty(G, self.D_n, Hs))
+        self.state_b2 = nn.Parameter(torch.zeros(G, self.D_n))
+
+        self.msg_w1 = nn.Parameter(torch.empty(G, Hm, config.msg_in))
+        self.msg_b1 = nn.Parameter(torch.zeros(G, Hm))
+        self.msg_w2 = nn.Parameter(torch.empty(G, self.D_n, Hm))
+        self.msg_b2 = nn.Parameter(torch.zeros(G, self.D_n))
+
+        self.inject_w = nn.Parameter(torch.empty(G, self.alpha * self.D_n, self.D_n))
+        self.inject_b = nn.Parameter(torch.zeros(G, self.alpha * self.D_n))
+
+        self.mod_w1 = nn.Parameter(torch.empty(self.N_cells, config.mod_in, Hmod))
+        self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
+        self.mod_w2 = nn.Parameter(torch.empty(self.N_cells, Hmod, config.mod_out))
+        self.mod_b2 = nn.Parameter(torch.zeros(self.N_cells, config.mod_out))
+
+        for weight in (
+            self.state_w1, self.state_w2, self.msg_w1, self.msg_w2,
+            self.mod_w1, self.mod_w2,
+        ):
+            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+
+        with torch.no_grad():
+            self.inject_b.zero_()
+            for group in range(G):
+                for port in range(self.alpha):
+                    block = torch.empty(self.D_n, self.D_n)
+                    nn.init.orthogonal_(block)
+                    start = port * self.D_n
+                    end = start + self.D_n
+                    self.inject_w[group, start:end].copy_(block)
+
         with torch.no_grad():
             self.state_w2.mul_(0.1)
-
-        # --- Shared message MLP ---
-        self.msg_w1 = nn.Parameter(torch.empty(config.msg_mlp_hidden, config.msg_in))
-        self.msg_b1 = nn.Parameter(torch.zeros(config.msg_mlp_hidden))
-        self.msg_w2 = nn.Parameter(torch.empty(D_n, config.msg_mlp_hidden))
-        self.msg_b2 = nn.Parameter(torch.zeros(D_n))
-
-        nn.init.kaiming_uniform_(self.msg_w1, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.msg_w2, a=math.sqrt(5))
-        with torch.no_grad():
             self.msg_w2.mul_(0.1)
-
-        # --- Per-neuron neuromodulator ---
-        H_mod = config.neuromod_hidden
-        self.mod_w1 = nn.Parameter(torch.empty(N, config.mod_in, H_mod))
-        self.mod_b1 = nn.Parameter(torch.zeros(N, 1, H_mod))
-        self.mod_w2 = nn.Parameter(torch.empty(N, H_mod, config.mod_out))
-        self.mod_b2 = nn.Parameter(torch.zeros(N, 1, config.mod_out))
-
-        nn.init.kaiming_uniform_(self.mod_w1, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.mod_w2, a=math.sqrt(5))
-        with torch.no_grad():
             self.mod_w2.mul_(0.01)
 
         self._initialized = False
@@ -92,302 +103,451 @@ class MemoryGraph(nn.Module):
     def is_initialized(self) -> bool:
         return self._initialized
 
-    def initialize_states(self, BS: int, device: torch.device):
-        N, D_n, K = self.N, self.D_n, self.K
-        dt = torch.bfloat16
+    @property
+    def identity(self) -> Tensor:
+        if not self._initialized:
+            raise RuntimeError("MemoryGraph identity requested before initialization")
+        return self._identity(self.h.shape[0], self.h.dtype, self.h.device)
 
-        self.h = torch.randn(BS, N, D_n, device=device, dtype=dt) * 0.01
-        self.msg = torch.zeros(BS, N, D_n, device=device, dtype=dt)
-        self.w_conn = torch.zeros(BS, N, K, device=device, dtype=dt)
-        self.identity = self.neuron_id.unsqueeze(0).expand(BS, -1, -1).clone().to(dt)
-        self.decay_logit = torch.zeros(BS, N, device=device, dtype=dt)
-        self.hebbian_traces = torch.zeros(BS, N, K, device=device, dtype=dt)
+    def _identity(self, BS: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.neuron_id.to(device=device, dtype=dtype).unsqueeze(0).expand(BS, -1, -1, -1)
+
+    def initialize_states(self, BS: int, device: torch.device):
+        dt = torch.bfloat16
+        shape = (BS, self.N_cells, self.C_n)
+
+        self.h = torch.randn(*shape, self.D_n, device=device, dtype=dt) * 0.01
+        self.msg = torch.zeros(*shape, self.D_n, device=device, dtype=dt)
+        self.w_conn = torch.zeros(*shape, self.K, device=device, dtype=dt)
+        self.decay_logit = torch.zeros(*shape, device=device, dtype=dt)
+        self.cell_context = torch.zeros(BS, self.N_cells, self.D_n, device=device, dtype=dt)
+        self.border_gate_logit = torch.zeros(
+            BS, self.N_cells, self.border_per_cell, device=device, dtype=dt)
+        self.hebbian_traces = torch.zeros(*shape, self.K, device=device, dtype=dt)
         self._initialized = True
 
     def detach_states(self):
+        if not self._initialized:
+            return
         self.h = self.h.detach()
         self.msg = self.msg.detach()
         self.w_conn = self.w_conn.detach()
-        self.identity = self.identity.detach()
         self.decay_logit = self.decay_logit.detach()
+        self.cell_context = self.cell_context.detach()
+        self.border_gate_logit = self.border_gate_logit.detach()
+
+    def runtime_state_dict(self) -> dict:
+        if not self._initialized:
+            return {"initialized": False}
+        return {
+            "initialized": True,
+            "h": self.h.clone(),
+            "msg": self.msg.clone(),
+            "w_conn": self.w_conn.clone(),
+            "decay_logit": self.decay_logit.clone(),
+            "cell_context": self.cell_context.clone(),
+            "border_gate_logit": self.border_gate_logit.clone(),
+            "hebbian_traces": self.hebbian_traces.clone(),
+        }
+
+    def load_runtime_state(self, state: dict):
+        if not state or not state.get("initialized", False):
+            self._initialized = False
+            return
+        device = self.neuron_id.device
+        self.h = state["h"].to(device)
+        self.msg = state["msg"].to(device)
+        self.w_conn = state["w_conn"].to(device)
+        self.decay_logit = state["decay_logit"].to(device)
+        self.cell_context = state["cell_context"].to(device)
+        self.border_gate_logit = state["border_gate_logit"].to(device)
+        self.hebbian_traces = state["hebbian_traces"].to(device)
+        self._initialized = True
 
     def reset_states(self, mask: Tensor):
-        """Reset state for batch elements where mask is True. mask: [BS] bool."""
+        """Retained for API compatibility; memory is intended to be lifelong."""
         if not self._initialized:
             return
         keep = (~mask).to(self.h.dtype)
+        k4 = keep[:, None, None, None]
         k3 = keep[:, None, None]
-        k2 = keep[:, None]
         with torch.no_grad():
-            self.h = self.h * k3
-            self.msg = self.msg * k3
-            self.w_conn = self.w_conn * k3
-            self.decay_logit = self.decay_logit * k2
-            self.hebbian_traces = self.hebbian_traces * k3
-            reset_id = self.neuron_id.unsqueeze(0).to(self.identity.dtype)
-            r3 = mask.to(self.identity.dtype)[:, None, None]
-            self.identity = self.identity * k3 + reset_id * r3
+            self.h = self.h * k4
+            self.msg = self.msg * k4
+            self.w_conn = self.w_conn * k4
+            self.decay_logit = self.decay_logit * k3
+            self.cell_context = self.cell_context * keep[:, None, None]
+            self.border_gate_logit = self.border_gate_logit * keep[:, None, None]
+            self.hebbian_traces = self.hebbian_traces * k4
 
     # ================================================================
-    # Per-token step components (all vectorized over N neurons)
+    # Per-token step components
     # ================================================================
 
-    def _modulate(self, identity: Tensor, hebbian: Tensor,
-                  w_conn: Tensor, decay_logit: Tensor,
-                  mod_w1: Tensor, mod_b1: Tensor,
-                  mod_w2: Tensor, mod_b2: Tensor,
-                  ) -> tuple[Tensor, Tensor, Tensor]:
-        K, D_n = self.K, self.D_n
+    def _modulate_cells(
+        self,
+        h: Tensor,
+        msg: Tensor,
+        hebbian: Tensor,
+        decay_logit: Tensor,
+        cell_context: Tensor,
+        border_gate_logit: Tensor,
+        w_conn: Tensor,
+        mod_w1: Tensor,
+        mod_b1: Tensor,
+        mod_w2: Tensor,
+        mod_b2: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        h_mean = h.mean(dim=2)
+        msg_mean = msg.mean(dim=2)
+        hebb_mean = hebbian.mean(dim=2)
+        decay_mean = decay_logit.mean(dim=2, keepdim=True)
 
-        mod_input = torch.cat([
-            identity,
-            hebbian,
-            w_conn,
-            decay_logit.unsqueeze(-1),
-        ], dim=-1)
+        mod_input = torch.cat([h_mean, msg_mean, cell_context, hebb_mean, decay_mean], dim=-1)
+        hidden = torch.tanh(torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
+        output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
 
-        x = mod_input.permute(1, 0, 2)
-        hidden = torch.tanh(torch.bmm(x, mod_w1) + mod_b1)
-        output = torch.bmm(hidden, mod_w2) + mod_b2
-        output = output.permute(1, 0, 2)
+        split0 = self.C_n * self.K
+        split1 = split0 + self.C_n
+        split2 = split1 + self.D_n
 
-        dw = output[..., :K]
-        ddecay = output[..., K]
-        didentity = output[..., K + 1:]
+        dw = output[..., :split0].reshape(h.shape[0], self.N_cells, self.C_n, self.K)
+        ddecay = output[..., split0:split1].reshape(h.shape[0], self.N_cells, self.C_n)
+        dctx = output[..., split1:split2]
+        dborder = output[..., split2:split2 + self.border_per_cell]
 
-        return w_conn + dw, decay_logit + ddecay, identity + didentity
+        return (
+            w_conn + dw,
+            decay_logit + ddecay,
+            cell_context + dctx,
+            border_gate_logit + dborder,
+        )
 
-    def _receive(self, msg: Tensor, w_conn: Tensor
-                 ) -> tuple[Tensor, Tensor]:
-        gathered = msg[:, self.conn_idx]
-        w = torch.sigmoid(w_conn).unsqueeze(-1)
-        received = (gathered * w).sum(dim=2)
+    def _receive_local(self, msg: Tensor, w_conn: Tensor) -> tuple[Tensor, Tensor]:
+        BS = msg.shape[0]
+        device = msg.device
+        batch_idx = torch.arange(BS, device=device)[:, None, None, None]
+        cell_idx = torch.arange(self.N_cells, device=device)[None, :, None, None]
+        conn = self.conn_idx.to(device).unsqueeze(0).expand(BS, -1, -1, -1)
+        gathered = msg[batch_idx, cell_idx, conn]
+        received = (gathered * torch.sigmoid(w_conn).unsqueeze(-1)).sum(dim=3)
         return received, gathered
 
-    def _inject(self, received: Tensor, H_aug_t: Tensor) -> Tensor:
-        BS = H_aug_t.shape[0]
-        inject = H_aug_t.reshape(BS, self.C_mem, self.D_n)
-        inject = inject.unsqueeze(2).expand(-1, -1, self.alpha, -1)
-        inject = inject.reshape(BS, self.N_port, self.D_n)
+    def _inject(self, received: Tensor, H_aug_t: Tensor, inject_w: Tensor, inject_b: Tensor) -> Tensor:
+        cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
+        inject = torch.einsum("bni,noi->bno", cell_slice, inject_w)
+        inject = inject + inject_b.unsqueeze(0)
+        inject = inject.reshape(H_aug_t.shape[0], self.N_cells, self.alpha, self.D_n)
+        received = received.clone()
+        received[:, :, self.input_lo:self.input_hi] += inject.to(received.dtype)
+        return received
 
-        inject_full = torch.zeros(
-            BS, self.N, self.D_n, device=received.device, dtype=received.dtype)
-        inject_full[:, :self.N_port] = inject.to(received.dtype)
-        return received + inject_full
+    def _border_exchange(self, msg: Tensor, border_gate_logit: Tensor) -> Tensor:
+        BS = msg.shape[0]
+        border = msg[:, :, self.border_lo:self.border_hi]
+        border = border.reshape(BS, self.grid_h, self.grid_w, self.border_per_cell, self.D_n)
+        incoming = torch.zeros_like(border)
 
-    def _state_update(self, received: Tensor, h: Tensor,
-                      identity: Tensor, decay_logit: Tensor,
-                      w1: Tensor, b1: Tensor,
-                      w2: Tensor, b2: Tensor) -> Tensor:
-        BS = received.shape[0]
+        # 0=north, 1=south, 2=west, 3=east
+        incoming[:, 1:, :, 0] = border[:, :-1, :, 1]
+        incoming[:, :-1, :, 1] = border[:, 1:, :, 0]
+        incoming[:, :, 1:, 2] = border[:, :, :-1, 3]
+        incoming[:, :, :-1, 3] = border[:, :, 1:, 2]
 
-        state_input = torch.cat([
-            received, h, identity, decay_logit.unsqueeze(-1),
-        ], dim=-1)
+        incoming = incoming.reshape(BS, self.N_cells, self.border_per_cell, self.D_n)
+        gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
+        return gate * incoming
 
-        flat = state_input.reshape(-1, state_input.shape[-1])
-        hidden = torch.tanh(F.linear(flat, w1, b1))
-        candidate = torch.tanh(F.linear(hidden, w2, b2))
-        candidate = candidate.reshape(BS, self.N, self.D_n)
-
+    def _state_update(
+        self,
+        received: Tensor,
+        h: Tensor,
+        decay_logit: Tensor,
+        identity: Tensor,
+        cell_context: Tensor,
+        w1: Tensor,
+        b1: Tensor,
+        w2: Tensor,
+        b2: Tensor,
+    ) -> Tensor:
+        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
+        state_input = torch.cat(
+            [received, h, identity, ctx, decay_logit.unsqueeze(-1)], dim=-1)
+        hidden = torch.tanh(
+            torch.einsum("bnci,nhi->bnch", state_input, w1) + b1.unsqueeze(0).unsqueeze(2))
+        candidate = torch.tanh(
+            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
         return decay * h + (1.0 - decay) * candidate
 
-    def _emit_message(self, h: Tensor, identity: Tensor,
-                      w1: Tensor, b1: Tensor,
-                      w2: Tensor, b2: Tensor) -> Tensor:
-        BS = h.shape[0]
-
-        msg_input = torch.cat([h, identity], dim=-1)
-        flat = msg_input.reshape(-1, msg_input.shape[-1])
-        hidden = torch.tanh(F.linear(flat, w1, b1))
-        msg_raw = torch.tanh(F.linear(hidden, w2, b2))
-        msg_new = msg_raw.reshape(BS, self.N, self.D_n)
+    def _emit_message(
+        self,
+        h: Tensor,
+        identity: Tensor,
+        cell_context: Tensor,
+        w1: Tensor,
+        b1: Tensor,
+        w2: Tensor,
+        b2: Tensor,
+    ) -> Tensor:
+        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
+        msg_input = torch.cat([h, identity, ctx], dim=-1)
+        hidden = torch.tanh(
+            torch.einsum("bnci,nhi->bnch", msg_input, w1) + b1.unsqueeze(0).unsqueeze(2))
+        msg_new = torch.tanh(
+            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
         return msg_new + identity
 
     def _readout(self, msg: Tensor) -> Tensor:
-        BS = msg.shape[0]
-        port_msg = msg[:, self.N_port:2 * self.N_port]
-        port_msg = port_msg.reshape(BS, self.C_mem, self.alpha, self.D_n)
-        readout = port_msg.sum(dim=2) * (self.alpha ** -0.5)
-        return readout.reshape(BS, -1)
+        out_ports = msg[:, :, self.output_lo:self.output_hi]
+        readout = out_ports.sum(dim=2) * (self.alpha ** -0.5)
+        return readout.reshape(msg.shape[0], -1)
 
     @staticmethod
-    def _update_hebbian(gathered: Tensor, msg_new: Tensor,
-                        hebbian: Tensor, decay: float = 0.995):
+    def _hebbian_next(gathered: Tensor, msg_new: Tensor, hebbian: Tensor, decay: float = 0.995) -> Tensor:
+        post = msg_new.detach().unsqueeze(3)
+        pre = gathered.detach()
+        correlation = (pre * post).sum(dim=-1)
+        return hebbian * decay + correlation * (1.0 - decay)
+
+    @staticmethod
+    def _update_hebbian(gathered: Tensor, msg_new: Tensor, hebbian: Tensor, decay: float = 0.995):
         with torch.no_grad():
-            post = msg_new.detach().unsqueeze(2)
-            pre = gathered.detach()
-            correlation = (pre * post).sum(dim=-1)
-            hebbian.mul_(decay).add_(correlation, alpha=1.0 - decay)
+            hebbian.copy_(MemoryGraph._hebbian_next(gathered, msg_new, hebbian, decay))
+
+    def _step(
+        self,
+        h: Tensor,
+        msg: Tensor,
+        w_conn: Tensor,
+        decay_logit: Tensor,
+        cell_context: Tensor,
+        border_gate_logit: Tensor,
+        hebbian: Tensor,
+        H_aug_t: Tensor,
+        identity: Tensor,
+        inject_w: Tensor,
+        inject_b: Tensor,
+        st_w1: Tensor,
+        st_b1: Tensor,
+        st_w2: Tensor,
+        st_b2: Tensor,
+        mg_w1: Tensor,
+        mg_b1: Tensor,
+        mg_w2: Tensor,
+        mg_b2: Tensor,
+    ):
+        received, gathered = self._receive_local(msg, w_conn)
+        received = self._inject(received, H_aug_t, inject_w, inject_b)
+        received[:, :, self.border_lo:self.border_hi] += self._border_exchange(msg, border_gate_logit)
+
+        h = self._state_update(
+            received, h, decay_logit, identity, cell_context,
+            st_w1, st_b1, st_w2, st_b2)
+        msg = self._emit_message(
+            h, identity, cell_context,
+            mg_w1, mg_b1, mg_w2, mg_b2)
+        readout = self._readout(msg)
+        return h, msg, readout, gathered
+
+    def _run_block(
+        self,
+        h: Tensor,
+        msg: Tensor,
+        w_conn: Tensor,
+        decay_logit: Tensor,
+        cell_context: Tensor,
+        border_gate_logit: Tensor,
+        hebbian: Tensor,
+        block_H_aug: Tensor,
+        start_t: int,
+        identity: Tensor,
+        inject_w: Tensor,
+        inject_b: Tensor,
+        st_w1: Tensor,
+        st_b1: Tensor,
+        st_w2: Tensor,
+        st_b2: Tensor,
+        mg_w1: Tensor,
+        mg_b1: Tensor,
+        mg_w2: Tensor,
+        mg_b2: Tensor,
+        mod_w1: Tensor,
+        mod_b1: Tensor,
+        mod_w2: Tensor,
+        mod_b2: Tensor,
+        ema_decay: float,
+    ):
+        block_T = block_H_aug.shape[1]
+        readouts = torch.empty(
+            h.shape[0], block_T, self.config.D, device=block_H_aug.device, dtype=h.dtype)
+
+        for offset in range(block_T):
+            t = start_t + offset
+            if t > 0 and (t % self.config.tbptt_block == 0):
+                h = h.detach()
+                msg = msg.detach()
+                w_conn = w_conn.detach()
+                decay_logit = decay_logit.detach()
+                cell_context = cell_context.detach()
+                border_gate_logit = border_gate_logit.detach()
+
+            if t % self.config.modulation_interval == 0:
+                w_conn, decay_logit, cell_context, border_gate_logit = self._modulate_cells(
+                    h, msg, hebbian, decay_logit, cell_context, border_gate_logit, w_conn,
+                    mod_w1, mod_b1, mod_w2, mod_b2,
+                )
+
+            h, msg, readout, gathered = self._step(
+                h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
+                block_H_aug[:, offset], identity,
+                inject_w, inject_b,
+                st_w1, st_b1, st_w2, st_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2,
+            )
+            hebbian = self._hebbian_next(gathered, msg, hebbian, ema_decay)
+            readouts[:, offset] = readout
+
+        return h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, readouts
 
     # ================================================================
     # Main forward
     # ================================================================
 
-    def _step(self, h, msg, w_conn, decay_logit, identity, hebbian,
-              H_aug_t, mod_w1, mod_b1, mod_w2, mod_b2,
-              st_w1, st_b1, st_w2, st_b2,
-              mg_w1, mg_b1, mg_w2, mg_b2):
-        """Single neuron step. Checkpointable — pure function of inputs."""
-        w_conn, decay_logit, identity = self._modulate(
-            identity, hebbian, w_conn, decay_logit,
-            mod_w1, mod_b1, mod_w2, mod_b2)
-
-        received, gathered = self._receive(msg, w_conn)
-        received = self._inject(received, H_aug_t)
-
-        h = self._state_update(received, h, identity, decay_logit,
-                               st_w1, st_b1, st_w2, st_b2)
-        msg = self._emit_message(h, identity,
-                                 mg_w1, mg_b1, mg_w2, mg_b2)
-
-        readout = self._readout(msg)
-        return h, msg, w_conn, decay_logit, identity, readout, gathered
-
     def forward_segment(self, H_aug: Tensor) -> Tensor:
-        """Process T tokens. H_aug: [BS, T, D] (detached from LM).
+        BS, T, _ = H_aug.shape
+        if not self._initialized:
+            self.initialize_states(BS, H_aug.device)
 
-        Per-step detach: each token step detaches recurrent state so the
-        autograd graph for each step is independent. Combined with
-        gradient checkpointing, only one step's intermediates exist at a
-        time during backward, giving constant memory regardless of T.
-        """
-        BS, T, D = H_aug.shape
-        device = H_aug.device
-
-        h = self.h.detach()
-        msg = self.msg.detach()
-        w_conn = self.w_conn.detach()
-        identity = self.identity.detach()
-        decay_logit = self.decay_logit.detach()
+        h = self.h
+        msg = self.msg
+        w_conn = self.w_conn
+        decay_logit = self.decay_logit
+        cell_context = self.cell_context
+        border_gate_logit = self.border_gate_logit
         hebbian = self.hebbian_traces
-
         H_aug = H_aug.to(h.dtype)
 
-        # Pre-cast all weights once
-        dt = h.dtype
-        mod_w1 = self.mod_w1.to(dt)
-        mod_b1 = self.mod_b1.to(dt)
-        mod_w2 = self.mod_w2.to(dt)
-        mod_b2 = self.mod_b2.to(dt)
-        st_w1 = self.state_w1.to(dt)
-        st_b1 = self.state_b1.to(dt)
-        st_w2 = self.state_w2.to(dt)
-        st_b2 = self.state_b2.to(dt)
-        mg_w1 = self.msg_w1.to(dt)
-        mg_b1 = self.msg_b1.to(dt)
-        mg_w2 = self.msg_w2.to(dt)
-        mg_b2 = self.msg_b2.to(dt)
+        identity = self._identity(BS, h.dtype, h.device)
 
+        group_idx = self.cell_to_group
+        st_w1 = self.state_w1[group_idx].to(h.dtype)
+        st_b1 = self.state_b1[group_idx].to(h.dtype)
+        st_w2 = self.state_w2[group_idx].to(h.dtype)
+        st_b2 = self.state_b2[group_idx].to(h.dtype)
+        mg_w1 = self.msg_w1[group_idx].to(h.dtype)
+        mg_b1 = self.msg_b1[group_idx].to(h.dtype)
+        mg_w2 = self.msg_w2[group_idx].to(h.dtype)
+        mg_b2 = self.msg_b2[group_idx].to(h.dtype)
+        inject_w = self.inject_w[group_idx].to(h.dtype)
+        inject_b = self.inject_b[group_idx].to(h.dtype)
+        mod_w1 = self.mod_w1.to(h.dtype)
+        mod_b1 = self.mod_b1.to(h.dtype)
+        mod_w2 = self.mod_w2.to(h.dtype)
+        mod_b2 = self.mod_b2.to(h.dtype)
+
+        readouts = torch.empty(BS, T, self.config.D, device=H_aug.device, dtype=h.dtype)
         ema_decay = self.config.hebbian_ema_decay
-        readouts = []
+        block_size = max(1, self.config.checkpoint_every)
 
-        for t in range(T):
-            H_aug_t = H_aug[:, t]
+        for start_t in range(0, T, block_size):
+            end_t = min(start_t + block_size, T)
+            block_H_aug = H_aug[:, start_t:end_t]
 
-            # Per-step detach: state carries info, not gradient
-            h = h.detach()
-            msg = msg.detach()
-            w_conn = w_conn.detach()
-            decay_logit = decay_logit.detach()
-            identity = identity.detach()
+            run_block = lambda h_, msg_, w_conn_, decay_, ctx_, border_, hebb_: self._run_block(
+                h_, msg_, w_conn_, decay_, ctx_, border_, hebb_,
+                block_H_aug, start_t, identity,
+                inject_w, inject_b,
+                st_w1, st_b1, st_w2, st_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2,
+                mod_w1, mod_b1, mod_w2, mod_b2,
+                ema_decay,
+            )
 
-            # Snapshot hebbian for this step (checkpoint will recompute from
-            # saved inputs, so hebbian must not be modified in-place before
-            # recomputation). Clone is cheap: [BS, N, K] bf16 ≈ 66 MB at BS=48.
-            hebb_snapshot = hebbian.clone()
-
-            if self.training:
-                h, msg, w_conn, decay_logit, identity, readout, gathered = \
+            if self.training and block_size > 1:
+                h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, block_out = (
                     torch.utils.checkpoint.checkpoint(
-                        self._step,
-                        h, msg, w_conn, decay_logit, identity, hebb_snapshot,
-                        H_aug_t, mod_w1, mod_b1, mod_w2, mod_b2,
-                        st_w1, st_b1, st_w2, st_b2,
-                        mg_w1, mg_b1, mg_w2, mg_b2,
+                        run_block,
+                        h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
                         use_reentrant=False,
                     )
+                )
             else:
-                h, msg, w_conn, decay_logit, identity, readout, gathered = \
-                    self._step(
-                        h, msg, w_conn, decay_logit, identity, hebb_snapshot,
-                        H_aug_t, mod_w1, mod_b1, mod_w2, mod_b2,
-                        st_w1, st_b1, st_w2, st_b2,
-                        mg_w1, mg_b1, mg_w2, mg_b2)
+                h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, block_out = (
+                    run_block(h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian)
+                )
 
-            readouts.append(readout)
-            # Update hebbian in-place AFTER checkpoint has saved its snapshot
-            self._update_hebbian(gathered, msg, hebbian, ema_decay)
+            readouts[:, start_t:end_t] = block_out
 
         self.h = h
         self.msg = msg
         self.w_conn = w_conn
-        self.identity = identity
         self.decay_logit = decay_logit
+        self.cell_context = cell_context
+        self.border_gate_logit = border_gate_logit
         self.hebbian_traces = hebbian
 
-        return torch.stack(readouts, dim=1)  # [BS, T, D]
+        return readouts
 
     # ================================================================
     # Structural plasticity
     # ================================================================
 
     def rewire_connections(self):
-        if not self.config.structural_plasticity:
-            return
-        if not self._initialized:
+        if not self.config.structural_plasticity or not self._initialized:
             return
 
-        N, K = self.N, self.K
-        n_swap = max(1, int(N * K * self.config.plasticity_pct))
+        NC, Cn, K = self.N_cells, self.C_n, self.K
+        n_swap = max(1, int(NC * Cn * K * self.config.plasticity_pct))
         explore_frac = self.config.plasticity_exploration_frac
         device = self.conn_idx.device
 
         with torch.no_grad():
-            conn = self.conn_idx
-
             hebb = self.hebbian_traces.mean(dim=0)
             flat_hebb = hebb.reshape(-1)
             _, prune_flat = flat_hebb.topk(n_swap, largest=False)
-            prune_n = prune_flat // K
-            prune_k = prune_flat % K
+            prune_cell = prune_flat // (Cn * K)
+            rem = prune_flat % (Cn * K)
+            prune_n = rem // K
+            prune_k = rem % K
 
-            exists = torch.zeros(N, N, dtype=torch.bool, device=device)
-            row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(conn)
-            exists[row_idx, conn] = True
+            exists = torch.zeros(NC, Cn, Cn, dtype=torch.bool, device=device)
+            row_idx = torch.arange(Cn, device=device)[None, :, None].expand(NC, -1, K)
+            cell_idx = torch.arange(NC, device=device)[:, None, None].expand_as(self.conn_idx)
+            exists[cell_idx, row_idx, self.conn_idx] = True
 
             msg_mag = self.msg.detach().float().norm(dim=-1).mean(dim=0)
-
             n_exploit = n_swap - int(n_swap * explore_frac)
             new_targets = torch.empty(n_swap, dtype=torch.long, device=device)
 
             for i in range(n_swap):
-                n = prune_n[i].item()
+                cell = prune_cell[i].item()
+                neuron = prune_n[i].item()
+                old_target = self.conn_idx[cell, neuron, prune_k[i]]
+                exists[cell, neuron, old_target] = False
 
                 if i < n_exploit:
-                    scores = msg_mag.clone()
-                    scores[exists[n]] = -float('inf')
-                    scores[n] = -float('inf')
-                    best = scores.argmax().item()
-                    new_targets[i] = best
+                    scores = msg_mag[cell].clone()
+                    scores[exists[cell, neuron]] = -float("inf")
+                    scores[neuron] = -float("inf")
+                    target = scores.argmax().item()
                 else:
-                    candidates = (~exists[n]).nonzero(as_tuple=True)[0]
-                    candidates = candidates[candidates != n]
+                    candidates = (~exists[cell, neuron]).nonzero(as_tuple=True)[0]
+                    candidates = candidates[candidates != neuron]
                     if len(candidates) == 0:
-                        new_targets[i] = conn[n, prune_k[i]]
-                        continue
-                    idx = torch.randint(len(candidates), (1,), device=device)
-                    new_targets[i] = candidates[idx]
+                        target = old_target.item()
+                    else:
+                        target = candidates[torch.randint(len(candidates), (1,), device=device)].item()
 
-                exists[n, new_targets[i]] = True
-                exists[n, conn[n, prune_k[i]]] = False
+                new_targets[i] = target
+                exists[cell, neuron, target] = True
 
-            conn[prune_n, prune_k] = new_targets
+            self.conn_idx[prune_cell, prune_n, prune_k] = new_targets
 
-            modified_neurons = prune_n.unique()
-            for n_idx in modified_neurons:
-                conn[n_idx], _ = conn[n_idx].sort()
+            modified_cells = prune_cell.unique()
+            for cell in modified_cells.tolist():
+                for neuron in prune_n[prune_cell == cell].unique().tolist():
+                    self.conn_idx[cell, neuron], _ = self.conn_idx[cell, neuron].sort()
 
-            self.w_conn[:, prune_n, prune_k] = 0
-            self.hebbian_traces[:, prune_n, prune_k] = 0
+            self.w_conn[:, prune_cell, prune_n, prune_k] = 0
+            self.hebbian_traces[:, prune_cell, prune_n, prune_k] = 0

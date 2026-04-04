@@ -43,21 +43,9 @@ class Model(nn.Module):
             self.memory.initialize_states(BS, device)
             self._initialized = True
 
-        # EOS-based resets
-        eos_positions = (input_ids == self.config.eot_id)
-        internal_reset = torch.zeros_like(eos_positions)
-        internal_reset[:, 1:] = eos_positions[:, :-1]
-
-        batch_has_eos = eos_positions.any(dim=1)
-        if batch_has_eos.any():
-            self.memory.reset_states(batch_has_eos)
-            self.lm.reset_carries(batch_has_eos)
-
-        reset_mask = internal_reset if internal_reset.any() else None
-
         # 1. Lower scan + PCM
         H_mid, surprise, aux_loss = self.lm.forward_scan_lower(
-            input_ids, reset_mask=reset_mask)
+            input_ids, reset_mask=None)
 
         # 2. Augment
         H_aug = self.lm.augment(H_mid, surprise)
@@ -70,7 +58,7 @@ class Model(nn.Module):
             H_enriched = H_aug
 
         # 4. Upper scan
-        H = self.lm.forward_scan_upper(H_enriched, reset_mask=reset_mask)
+        H = self.lm.forward_scan_upper(H_enriched, reset_mask=None)
 
         # 5. Output
         logits = self.lm.forward_output(H)
@@ -78,12 +66,16 @@ class Model(nn.Module):
         result = {"logits": logits, "aux_loss": aux_loss}
 
         if target_ids is not None:
-            loss = F.cross_entropy(
+            ce_per_token = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 target_ids.reshape(-1),
-                ignore_index=-100,
-            )
-            result["loss"] = loss + aux_loss
+                reduction="none",
+            ).reshape(BS, T)
+            valid_mask = (input_ids != self.config.eot_id).float()
+            valid_count = valid_mask.sum().clamp(min=1.0)
+            ce_loss = (ce_per_token * valid_mask).sum() / valid_count
+            result["ce_loss"] = ce_loss
+            result["loss"] = ce_loss + aux_loss
 
         return result
 
@@ -97,6 +89,22 @@ class Model(nn.Module):
                 and self._tokens_since_rewire >= self.config.plasticity_interval):
             self.memory.rewire_connections()
             self._tokens_since_rewire = 0
+
+    def runtime_state_dict(self) -> dict:
+        return {
+            "initialized": self._initialized,
+            "tokens_since_rewire": self._tokens_since_rewire,
+            "lm": self.lm.runtime_state_dict(),
+            "memory": self.memory.runtime_state_dict(),
+        }
+
+    def load_runtime_state(self, state: dict):
+        if not state:
+            return
+        self.lm.load_runtime_state(state.get("lm", {}))
+        self.memory.load_runtime_state(state.get("memory", {}))
+        self._initialized = state.get("initialized", self.memory.is_initialized)
+        self._tokens_since_rewire = state.get("tokens_since_rewire", 0)
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())

@@ -2,6 +2,7 @@
 
 import torch
 import pytest
+import torch.nn.functional as F
 
 from src.model.config import Config
 from src.model.model import Model
@@ -84,39 +85,93 @@ class TestTBPTT:
         assert model.memory.h.abs().sum() > 0
 
 
-class TestEOSReset:
-    def test_eos_resets_memory(self):
+class TestPersistence:
+    def test_future_eos_does_not_change_past_logits(self):
         config = _tiny_config()
-        model = Model(config)
+        torch.manual_seed(0)
+        model_a = Model(config).float()
+        torch.manual_seed(0)
+        model_b = Model(config).float()
+        model_b.load_state_dict(model_a.state_dict())
+        model_a.train(False)
+        model_b.train(False)
+
         BS, T = 2, config.T
+        history = torch.randint(3, config.vocab_size, (BS, T))
+        with torch.no_grad():
+            model_a.forward_chunk(history, use_memory=False)
+            model_b.forward_chunk(history, use_memory=False)
 
-        # First chunk: no EOS
-        input_ids = torch.randint(1, config.vocab_size, (BS, T))
-        target_ids = torch.randint(0, config.vocab_size, (BS, T))
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        result["loss"].backward()
-        model.detach_states()
+        tokens_base = torch.randint(3, config.vocab_size, (BS, T))
+        tokens_eos = tokens_base.clone()
+        mid = T // 2
+        tokens_eos[:, mid] = config.eot_id
 
-        h_before = model.memory.h[0].clone()
+        with torch.no_grad():
+            logits_base = model_a.forward_chunk(tokens_base, use_memory=False)["logits"]
+            logits_eos = model_b.forward_chunk(tokens_eos, use_memory=False)["logits"]
 
-        # Second chunk: EOS in batch element 0
-        input_ids2 = input_ids.clone()
-        input_ids2[0, T // 2] = config.eot_id
-        result2 = model.forward_chunk(input_ids2, target_ids=target_ids)
-        # Memory for element 0 should have been reset (h zeroed before forward)
-        # We can't easily check mid-forward, but at least it shouldn't crash
-        result2["loss"].backward()
+        diff = (logits_base[:, :mid] - logits_eos[:, :mid]).abs().max().item()
+        assert diff < 1e-5, (
+            f"Future EOS changed earlier logits (max diff={diff:.6f}); "
+            "model is still eagerly resetting state.")
 
-    def test_init_before_reset(self):
-        """First call with EOS should not crash (init happens before reset)."""
+    def test_previous_eos_does_not_reset_next_chunk(self):
         config = _tiny_config()
-        model = Model(config)
+        torch.manual_seed(0)
+        model_hist = Model(config).float()
+        torch.manual_seed(0)
+        model_fresh = Model(config).float()
+        model_fresh.load_state_dict(model_hist.state_dict())
+        model_hist.train(False)
+        model_fresh.train(False)
+
         BS, T = 2, config.T
+        first_chunk = torch.randint(3, config.vocab_size, (BS, T))
+        first_chunk[:, -1] = config.eot_id
+        second_chunk = torch.randint(3, config.vocab_size, (BS, T))
 
-        input_ids = torch.randint(1, config.vocab_size, (BS, T))
-        input_ids[0, 0] = config.eot_id
-        target_ids = torch.randint(0, config.vocab_size, (BS, T))
+        with torch.no_grad():
+            model_hist.forward_chunk(first_chunk, use_memory=False)
+            model_hist.detach_states()
+            logits_hist = model_hist.forward_chunk(second_chunk, use_memory=False)["logits"]
+            logits_fresh = model_fresh.forward_chunk(second_chunk, use_memory=False)["logits"]
 
-        # Should not crash
-        result = model.forward_chunk(input_ids, target_ids=target_ids)
-        assert result["logits"].shape == (BS, T, config.vocab_size)
+        diff = (logits_hist - logits_fresh).abs().max().item()
+        assert diff > 1e-4, (
+            "Previous chunk ending in EOS unexpectedly reset the next chunk state.")
+
+
+class TestLearningSignal:
+    def test_detached_memory_gradients_still_depend_on_history(self):
+        config = _tiny_config()
+        torch.manual_seed(0)
+        base_model = Model(config).float()
+        base_model.train(False)
+
+        BS, T = 1, config.T
+        last_token = torch.tensor([[7]])
+        last_target = torch.tensor([[11]])
+        hist_a = torch.randint(3, config.vocab_size, (BS, T - 1))
+        hist_b = torch.randint(3, config.vocab_size, (BS, T - 1))
+        seq_a = torch.cat([hist_a, last_token], dim=1)
+        seq_b = torch.cat([hist_b, last_token], dim=1)
+        tgt_a = torch.randint(0, config.vocab_size, (BS, T))
+        tgt_b = torch.randint(0, config.vocab_size, (BS, T))
+        tgt_a[:, -1] = last_target
+        tgt_b[:, -1] = last_target
+
+        def grad_for(seq, tgt):
+            model = Model(config).float()
+            model.load_state_dict(base_model.state_dict())
+            model.train(False)
+            out = model.forward_chunk(seq, target_ids=tgt)
+            loss = F.cross_entropy(out["logits"][:, -1], tgt[:, -1])
+            loss.backward()
+            return model.memory.msg_w1.grad.clone()
+
+        grad_a = grad_for(seq_a, tgt_a)
+        grad_b = grad_for(seq_b, tgt_b)
+        diff = (grad_a - grad_b).abs().max().item()
+        assert diff > 1e-6, (
+            "Detached recurrent state no longer produces history-dependent gradients.")

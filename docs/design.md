@@ -1,180 +1,304 @@
-# Neuromorphic Memory Graph — Design Document
+# Neuromorphic Memory Graph — Cell-Grid Design
 
 ## Goals
 
-1. **Long-context seq2seq performance**: augment a recurrent LM with a structured memory that captures long-range dependencies better than the recurrence alone.
-2. **Inherent information distillation**: the memory graph compresses and organizes information spatially across neurons, rather than storing raw token representations.
-3. **Bounded memory and compute**: the graph has a fixed number of neurons and connections. Memory footprint and per-token compute are constant regardless of context length.
-4. **Context rot mitigation**: structural plasticity and neuromodulation continuously reorganize memory, preventing stale information from degrading performance over long sequences.
-5. **Lifelong learning**: the neuromodulator is designed as a policy that adapts the graph's connectivity, decay, and identity vectors online. Currently trained by backprop; future work will train it via GRPO RL for continual adaptation beyond a single training run.
+1. Preserve the current split-scan LM + PCM architecture.
+2. Keep memory interaction at least once per token.
+3. Make the memory graph materially more GPU-friendly than the current flat global sparse graph.
+4. Keep neuron-level expressivity through identity-conditioned dynamics.
+5. Preserve lifelong memory: no document-boundary resets in the memory graph.
 
 ## Architecture Overview
 
 ```
-tokens → embedding → lower scan → split_mlp(H_mid, PCM_surprise) → H_aug
-                                                                      │
-                                              ┌───────────────────────┤
-                                              ▼                       ▼
-                                        memory graph            upper scan
-                                              │                       │
-                                              └──► combine ──────────►│
-                                                                      ▼
-                                                                  LM head
+tokens → embedding → lower scan → PCM → split_mlp(H_mid, surprise) → H_aug
+                                                                     │
+                                             ┌───────────────────────┤
+                                             ▼                       ▼
+                                       cell-grid memory         upper scan
+                                             │                       │
+                                             └──► combine ──────────►│
+                                                                     ▼
+                                                                 LM head
 ```
 
-The LM is an affine recurrent model (element-wise linear scan with gating: `h_t = sigmoid(a_t) * h_{t-1} + b_t`). The scan stack is split at a midpoint into lower and upper layers. Between them, a Predictive Coding Module (PCM) computes surprise, which is fused with H_mid via a small MLP to produce H_aug. H_aug feeds both the memory graph and the upper scan.
+The language model remains a split recurrent scan stack. The change is entirely
+in the memory system: we replace the current flat `N=8096, K=64` global sparse
+manifold with a cell-grid memory graph laid out for locality.
 
-## LM Scan
+## High-Level Design
 
-- **Type**: causal linear recurrence with element-wise gating
-- **Layers**: L total, split at layer S (layers 0..S-1 = lower, S..L-1 = upper)
-- **Per layer**: pre-norm (RMSNorm) → linear projections → scan → SwiGLU output → residual
-- **Carry**: hidden state h passed across segments (TBPTT with detach at segment boundaries)
+### Core change
 
-## Predictive Coding Module (PCM)
+The memory graph is no longer one globally connected sparse neuron manifold.
+Instead:
 
-Predicts state transitions (deltas) rather than raw states:
-- `delta_hat[t] = pred_MLP(norm(H[t]))` — predicted change
-- `delta_actual[t] = H[t+1] - H[t]` — actual change
-- `surprise[t] = delta_hat[t-1] - delta_actual[t]` — transition prediction error
+- the graph is divided into **64 cells**
+- cells are arranged on an **8 x 8 grid**
+- each cell owns a single `D_n=32` LM slice
+- most connectivity is **strictly within-cell**
+- cross-cell communication happens only through a small set of **border neurons**
+  with fixed grid-local exchange
 
-The surprise signal is combined with H_mid through a split-point MLP:
-- `H_aug = split_mlp(H_mid, surprise)` — produces augmented hidden state
-- H_aug is passed to both the memory graph (as inject signal) and the upper scan
-- Surprise does not enter the upper scan as a separate side input
+This makes memory access patterns much more regular while keeping the graph
+stateful and recurrent at token resolution.
 
-## Memory Graph
+### Why this layout
 
-### Dimensions
+The current flat design is dominated by:
+
+- irregular global gather on `msg[:, conn_idx]`
+- poor cache locality
+- a giant `[BS, N, K, D_n]` intermediate
+- too much logical specialization in the per-neuron modulator
+
+The cell-grid design fixes that by:
+
+- making most reads local to contiguous cell storage
+- replacing arbitrary global sparse exchange with grid-local border exchange
+- moving specialization from per-neuron parameter banks toward
+  cell-conditioned / group-conditioned computation
+
+## LM Side
+
+The LM remains unchanged in structure:
+
+- lower scan produces `H_mid`
+- PCM predicts transitions and emits `surprise`
+- `split_mlp(H_mid, surprise) -> H_aug`
+- memory graph receives `H_aug.detach()`
+- upper scan consumes `H_enriched = H_aug + mem_scale * mem_out`
+
+`H_aug.detach()` remains a deliberate design choice. It keeps lower-scan
+optimization cleaner while still allowing CE gradients to train the entire
+memory graph through `mem_out`.
+
+## Cell-Grid Memory Graph
+
+### Default Dimensions
 
 | Parameter | Symbol | Value |
 |-----------|--------|-------|
-| Neuron hidden dim | D_neuron | 32 |
-| Total neurons | N | 8096 |
-| Connections per neuron | K | 64 |
-| Port multiplier | alpha | 4 |
-| LM hidden dim | D | 2048 |
+| LM hidden dim | `D` | 2048 |
+| Neuron hidden dim | `D_n` | 32 |
+| Cells | `N_cells` | 64 |
+| Grid | `H x W` | 8 x 8 |
+| Neurons per cell | `C_n` | 128 |
+| Total neurons | `N_total` | 8192 |
+| Local neighbors per neuron | `K_local` | 32 |
+| Input ports per cell | `alpha_in` | 4 |
+| Output ports per cell | `alpha_out` | 4 |
+| Border neurons per cell | `B` | 4 |
+| Internal neurons per cell | `C_n - 12` | 116 |
 
-### Port Neurons
+Because `D / D_n = 2048 / 32 = 64`, we assign exactly one cell to each memory
+slice. This gives a simple one-to-one mapping:
 
-Port neurons are the interface between the LM and the memory graph.
-
-- **Input port count**: D * alpha / D_neuron = 2048 * 4 / 32 = 256
-- **Output port count**: 256 (separate neurons from input ports)
-- **Total port neurons**: 512
-- **Internal neurons**: 8096 - 512 = 7584
-
-**Injection** (LM → graph): H_aug [BS, D] is reshaped to [BS, C_mem, D_neuron] where C_mem = D / D_neuron = 64. Each slice is replicated alpha=4 times across the input port neurons in that slice group (n_per_slice = alpha = 4 neurons per slice). Parameter-free — just reshape and expand. The inject signal is added to the received presynaptic messages for input port neurons.
-
-**Readout** (graph → LM): output port neurons emit D_neuron-dim messages. Within each slice group, messages are summed over the alpha replicas and scaled by `1/sqrt(n_per_slice)`: `readout = sum(msgs, dim=replica) * n_per_slice^(-0.5)`. The slice outputs are concatenated back to [BS, D].
-
-**Combination**: `H_enriched = H_aug + mem_scale * readout`, where `mem_scale` is a learnable per-dim scale [D], initialized to `sqrt(n_per_slice)` to cancel the `1/sqrt` in readout (starting near unit magnitude so gradients flow freely from the start).
-
-### Neuron State
-
-Each neuron maintains:
-- **h**: hidden state vector [D_neuron] — the neuron's internal representation
-- **w_conn**: connection weights [K] — scalar weights for each presynaptic neighbor
-- **identity**: learnable embedding [D_neuron] — distinguishes this neuron, updated by modulator
-- **decay**: learnable scalar — controls state persistence (`h = decay * h_old + (1-decay) * update`)
-
-### Connectivity
-
-- Each neuron has K=64 presynaptic connections (neurons it receives messages from)
-- Connections are directed: A listing B as presynaptic does not imply B lists A
-- Initialized randomly, adapted by structural plasticity
-
-### Per-Token Neuron Step
-
-One neuron step executes per token, fully sequential (no multi-pass approximation):
-
-1. **Modulate** (step 0): per-neuron neuromodulator MLP predicts updated w_conn, decay, and identity from current (identity, hebbian_trace, w_conn, decay). Happens first so its effects are visible to backprop gradients.
-
-2. **Receive**: gather messages from K presynaptic neighbors, scale each by its w_conn scalar, combine (sum or weighted sum) into a received vector [D_neuron].
-
-3. **Inject**: input port neurons additionally receive their slice of the LM signal. The inject signal is added to the received message.
-
-4. **State update**: shared state MLP takes (received + injected, h_current) → candidate. New state: `h = decay * h_old + (1 - decay) * tanh(candidate)`.
-
-5. **Emit message**: shared message MLP takes (h_new, identity) → outgoing message [D_neuron]. This message is what presynaptic-neighbor lookups will gather on the next step.
-
-6. **Readout**: output port neurons' messages are collected and reassembled into a D-dim vector for the LM.
-
-7. **Update hebbian traces**: running correlation between received messages from each presynaptic neighbor and this neuron's own outgoing messages.
-
-### MLPs
-
-- **State MLP**: shared weights across all neurons. Identity embedding provides per-neuron differentiation.
-- **Message MLP**: shared weights across all neurons. Same rationale.
-- **Neuromodulator MLP**: **per-neuron weights** (8096 separate small MLPs). This is where model capacity lives. Hidden dim = D_neuron = 32. Input: (identity [32], hebbian_trace [K], w_conn [K], decay [1]) → output: (new_w_conn [K], new_decay [1], new_identity [32]).
-
-### Structural Plasticity
-
-Runs once every 1024 tokens (8 segments). Uses hebbian traces as the signal:
-
-**Pruning** (existing connections): hebbian traces [BS, N, K] are averaged
-across the batch dimension to get a per-connection score. The bottom
-`plasticity_pct` (2%) of all connections globally are pruned.
-
-**Regrowth**: for each pruned slot, a new target is selected:
-- ~80% exploit: the candidate non-connected neuron with the highest estimated
-  affinity. Affinity for a non-connected pair (i, j) is estimated from the
-  average outgoing message magnitudes of both neurons (a lightweight proxy
-  that avoids materializing an [N, N] correlation matrix).
-- ~20% explore: random non-connected, non-self neuron.
-
-After rewiring, the `conn_idx` buffer is updated, and hebbian traces and
-w_conn for rewired connections are reset to zero. A dedup + re-sort pass
-ensures the K-distinct-neighbors invariant is maintained.
-
-### Hebbian Traces
-
-Per-neuron running statistics tracking how messages from each of K presynaptic
-neighbors correlate with this neuron's own outgoing messages. Updated every
-token step (EMA with decay 0.995). Used by:
-- The neuromodulator (as input — sees fresh traces each token step)
-- Structural plasticity (batch-averaged traces used for pruning decisions)
-
-## Segments and Timing
-
-- **Segment**: 128 tokens. One segment = one forward_segment call. TBPTT detaches
-  at segment boundaries.
-- **Neuron step**: one per token (128 per segment). All N neurons processed in
-  parallel via vectorized ops.
-- **Neuromodulator**: runs every token step. Sees the most recent hebbian traces
-  (updated at the end of each token step).
-- **Structural plasticity**: runs once every 1024 tokens (8 segments). Rewires
-  connections based on hebbian trace statistics.
-
-## Gradient Path (Design Decision)
-
-The memory graph receives `H_aug.detach()` — the LM hidden state with surprise
-mixed in, but with the gradient path cut. This is a deliberate choice:
-
-- **Lower scan** learns purely from CE loss through the upper scan path.
-- **Memory graph** learns to produce useful readout given whatever H_aug it
-  receives, trained through `mem_scale * mem_out` flowing back from CE loss.
-- **Rationale**: in v8/v9, coupling memory gradients into the lower scan caused
-  optimization instability (memory gradients fighting scan gradients). Decoupling
-  gives each system a cleaner learning signal.
-
-The memory graph DOES receive gradient signal — it flows through:
 ```
-CE loss → upper scan → H_enriched = H_aug + mem_scale * mem_out
-                                                   │
-                                          mem_scale and mem_out carry grad
-                                          to all memory parameters
+H_aug[BS, 2048] -> reshape [BS, 64, 32] -> one 32-dim slice per cell
 ```
+
+### Cell Layout
+
+Each cell stores neurons in a fixed contiguous order:
+
+1. input port neurons: indices `0..3`
+2. output port neurons: indices `4..7`
+3. border neurons: indices `8..11`
+4. internal neurons: indices `12..127`
+
+This keeps inject/readout/border handling simple and branch-free.
+
+### Runtime State
+
+Each batch element maintains:
+
+- `h[BS, N_cells, C_n, D_n]`
+- `msg[BS, N_cells, C_n, D_n]`
+- `w_local[BS, N_cells, C_n, K_local]`
+- `decay_logit[BS, N_cells, C_n]`
+- `cell_context[BS, N_cells, D_n]`
+- `border_gate_logit[BS, N_cells, B]`
+- `hebbian[BS, N_cells, C_n, K_local]`
+
+The neuron identity vectors are learned parameters:
+
+- `neuron_id[N_cells, C_n, D_n]`
+
+Identity is static learned structure, not a runtime-reset state.
+
+## Connectivity
+
+### Within-cell connectivity
+
+Each neuron chooses `K_local=32` presynaptic neighbors from the same cell only.
+
+- no self-connections
+- no cross-cell random edges
+- structural plasticity rewires only within the cell
+
+The local connection index tensor is:
+
+- `conn_local[N_cells, C_n, K_local]`
+
+### Border exchange
+
+Cross-cell communication is fixed and geometric, not random.
+
+Each cell has 4 border neurons corresponding to:
+
+- north
+- south
+- west
+- east
+
+At each token step, each border neuron receives message input from the matching
+opposite-direction border neuron in the adjacent grid cell:
+
+- north border reads south border from the northern neighbor
+- south border reads north border from the southern neighbor
+- west border reads east border from the western neighbor
+- east border reads west border from the eastern neighbor
+
+Cells on the edge of the grid receive zeros for missing neighbors.
+
+This is far more GPU-friendly than arbitrary cross-manifold sparse edges and
+still allows information to move across the whole grid over time.
+
+## Per-Token Memory Step
+
+For each token `t`:
+
+1. Optionally run the **per-cell modulator** if `t % modulation_interval == 0`
+2. **Local receive**: each neuron gathers `K_local` neighbor messages from its own cell
+3. **Inject**: project the cell’s LM slice into distinct port-specific views and add
+   them to the input port neurons
+4. **Border exchange**: add directional neighbor-cell messages to the 4 border neurons
+5. **State update**: grouped state MLP computes candidate state from
+   `(received, h, neuron_id, cell_context, decay)`
+6. **Temporal blend**: `h = sigmoid(decay) * h + (1 - sigmoid(decay)) * candidate`
+7. **Emit message**: grouped message MLP computes outgoing message from
+   `(h, neuron_id, cell_context)`
+8. **Readout**: collect output port messages from each cell, reduce replicas,
+   and reshape back to `[BS, D]`
+9. **Update Hebbian traces** using local gathered presynaptic messages and new messages
+
+The graph still runs once per token. The design change is about locality and
+parameter organization, not skipping memory interaction.
+
+## Parameterization
+
+### Grouped state and message MLPs
+
+The fast per-token dynamics are no longer one globally shared MLP, and no
+longer a separate MLP bank per neuron.
+
+Instead:
+
+- cells are assigned to a small number of **MLP groups**
+- each group owns one state MLP and one message MLP
+- neuron identity and cell context provide within-group specialization
+
+This gives a better throughput / expressivity tradeoff than either extreme.
+
+Recommended default:
+
+- `mlp_groups = 8`
+- each group serves 8 cells
+
+### Per-cell modulator
+
+The slow adaptation path is **per-cell**, not per-neuron.
+
+Every `modulation_interval` tokens, each cell aggregates:
+
+- mean hidden state
+- mean message state
+- mean Hebbian trace
+- mean decay
+- current cell context
+
+and feeds those statistics into a per-cell MLP that outputs deltas for:
+
+- local connection logits `w_local`
+- per-neuron decay logits
+- `cell_context`
+- border gate logits
+
+This keeps adaptation specialized while avoiding the current per-neuron
+parameter explosion.
+
+## Injection and Readout
+
+### Injection
+
+`H_aug_t[BS, D]` is reshaped to `[BS, N_cells, D_n]`.
+
+For each cell, its 32-dim slice is not copied identically to all input ports.
+Instead, a small grouped inject projection maps
+
+```python
+[BS, N_cells, D_n] -> [BS, N_cells, alpha_in, D_n]
+```
+
+so the 4 input-port neurons receive 4 different learned views of the same cell
+slice.
+
+This keeps the ingress path expressive without giving up locality. It is also
+cheap: the inject projection operates on `[BS, N_cells, D_n]`, not on all
+neurons, so its cost is tiny relative to local gather and state/message updates.
+
+### Readout
+
+For each cell, the 4 output port messages are summed and scaled by
+`1 / sqrt(alpha_out)`, then reshaped back to `[BS, D]`.
+
+Combination remains:
+
+```
+H_enriched = H_aug + mem_scale * mem_out
+```
+
+## Structural Plasticity
+
+Structural plasticity remains slow and local.
+
+- interval: every 1024 tokens by default
+- signal: batch-averaged local Hebbian traces
+- prune: lowest-scoring local connections
+- regrow: only within the same cell
+- invariant: `K_local` distinct presynaptic neighbors per neuron
+
+No global rewiring is allowed in this design.
 
 ## Training
 
-- Single optimizer for all parameters
-- Memory graph parameters at reduced LR (e.g., 0.3x base LR)
-- Memory parameters kept in f32 (small gradients round to zero in bf16)
-- TBPTT within segments, detach at segment boundaries
-- Recurrent carries (scan hidden states + neuron hidden states) passed across segments
-- Gradient checkpointing over the 128-step token loop (required for BS > ~8)
+- single optimizer for LM + memory
+- memory parameters use lower LR scale
+- memory parameters remain in f32
+- memory runtime state in bf16
+- no document-boundary resets in the memory graph
+- chunk boundary only detaches gradients, not state values
+- use **block TBPTT** inside a segment, not detach every token
+- use **block checkpointing** over token ranges instead of checkpointing every step
 
-## Open Questions
+Recommended defaults:
 
-- GRPO RL training for neuromodulator (future work — architecture supports it)
+- `tbptt_block = 8`
+- `checkpoint_every = 8`
+- `modulation_interval = 4`
+
+## Why this design is more GPU-friendly
+
+Compared with the current branch, this plan:
+
+- replaces one giant global sparse gather with many local cell gathers
+- removes arbitrary cross-manifold sparse edges
+- uses fixed directional border exchange implemented with reshape / slice / roll
+- reduces parameter specialization from per-neuron to per-cell or per-group
+- aligns memory layout with the natural LM slice layout
+- enables future fused kernels at the **cell** granularity rather than the
+  entire flat manifold
+
+This is still not as GPU-friendly as a pure dense transformer-style block, but
+it is much better aligned with GPU execution than the current flat sparse graph.

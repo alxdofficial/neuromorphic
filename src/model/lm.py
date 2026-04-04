@@ -133,6 +133,23 @@ class LM(nn.Module):
             if h is not None:
                 self._carries[i] = h.detach()
 
+    def runtime_state_dict(self) -> dict:
+        return {
+            "carries": [
+                h.clone() if h is not None else None
+                for h in self._carries
+            ],
+        }
+
+    def load_runtime_state(self, state: dict):
+        carries = state.get("carries")
+        if carries is None:
+            return
+        self._carries = [
+            h.to(self.pos_embed.device) if h is not None else None
+            for h in carries
+        ]
+
     def reset_carries(self, mask: Tensor):
         """mask: [BS] bool — True for elements to reset."""
         for i, h in enumerate(self._carries):
