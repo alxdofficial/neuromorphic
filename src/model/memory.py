@@ -12,7 +12,12 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import Config
-from .triton_kernels import hebbian_ema_update, local_receive
+from .triton_kernels import (
+    border_exchange_activated,
+    hebbian_ema_update,
+    local_receive,
+    local_receive_activated,
+)
 
 
 class MemoryGraph(nn.Module):
@@ -43,29 +48,40 @@ class MemoryGraph(nn.Module):
                 scores[neuron] = -float("inf")
                 conn[cell, neuron] = scores.topk(self.K).indices.sort().values
         self.register_buffer("conn_idx", conn)
+        conn_idx_i32, src_edge_offsets, src_edge_dst, src_edge_slot = self._build_src_edge_buffers(conn)
+        self.register_buffer("conn_idx_i32", conn_idx_i32, persistent=False)
+        self.register_buffer("src_edge_offsets", src_edge_offsets, persistent=False)
+        self.register_buffer("src_edge_dst", src_edge_dst, persistent=False)
+        self.register_buffer("src_edge_slot", src_edge_slot, persistent=False)
 
         cell_to_group = torch.arange(self.N_cells) % config.mlp_groups
         self.register_buffer("cell_to_group", cell_to_group)
+        self.register_buffer("border_neighbor_cell", self._build_border_neighbor_cells(), persistent=False)
+        self.register_buffer(
+            "border_src_port",
+            torch.tensor([1, 0, 3, 2], dtype=torch.int32),
+            persistent=False,
+        )
 
         self.neuron_id = nn.Parameter(torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
 
-        G = config.mlp_groups
         Hs = config.state_mlp_hidden
         Hm = config.msg_mlp_hidden
         Hmod = config.cell_mod_hidden
 
-        self.state_w1 = nn.Parameter(torch.empty(G, Hs, config.state_in))
-        self.state_b1 = nn.Parameter(torch.zeros(G, Hs))
-        self.state_w2 = nn.Parameter(torch.empty(G, self.D_n, Hs))
-        self.state_b2 = nn.Parameter(torch.zeros(G, self.D_n))
+        self.state_w1 = nn.Parameter(torch.empty(config.mlp_groups, Hs, config.state_in))
+        self.state_b1 = nn.Parameter(torch.zeros(config.mlp_groups, Hs))
+        self.state_w2 = nn.Parameter(torch.empty(config.mlp_groups, self.D_n, Hs))
+        self.state_b2 = nn.Parameter(torch.zeros(config.mlp_groups, self.D_n))
 
-        self.msg_w1 = nn.Parameter(torch.empty(G, Hm, config.msg_in))
-        self.msg_b1 = nn.Parameter(torch.zeros(G, Hm))
-        self.msg_w2 = nn.Parameter(torch.empty(G, self.D_n, Hm))
-        self.msg_b2 = nn.Parameter(torch.zeros(G, self.D_n))
+        self.msg_w1 = nn.Parameter(torch.empty(config.mlp_groups, Hm, config.msg_in))
+        self.msg_b1 = nn.Parameter(torch.zeros(config.mlp_groups, Hm))
+        self.msg_w2 = nn.Parameter(torch.empty(config.mlp_groups, self.D_n, Hm))
+        self.msg_b2 = nn.Parameter(torch.zeros(config.mlp_groups, self.D_n))
 
-        self.inject_w = nn.Parameter(torch.empty(G, self.alpha * self.D_n, self.D_n))
-        self.inject_b = nn.Parameter(torch.zeros(G, self.alpha * self.D_n))
+        self.inject_w = nn.Parameter(
+            torch.empty(config.mlp_groups, self.alpha * self.D_n, self.D_n))
+        self.inject_b = nn.Parameter(torch.zeros(config.mlp_groups, self.alpha * self.D_n))
 
         self.mod_w1 = nn.Parameter(torch.empty(self.N_cells, config.mod_in, Hmod))
         self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
@@ -80,7 +96,7 @@ class MemoryGraph(nn.Module):
 
         with torch.no_grad():
             self.inject_b.zero_()
-            for group in range(G):
+            for group in range(config.mlp_groups):
                 for port in range(self.alpha):
                     block = torch.empty(self.D_n, self.D_n)
                     nn.init.orthogonal_(block)
@@ -94,6 +110,53 @@ class MemoryGraph(nn.Module):
             self.mod_w2.mul_(0.01)
 
         self._initialized = False
+
+    def _rebuild_connectivity_buffers(self):
+        conn_idx_i32, src_edge_offsets, src_edge_dst, src_edge_slot = self._build_src_edge_buffers(
+            self.conn_idx)
+        device = self.conn_idx.device
+        self.conn_idx_i32 = conn_idx_i32.to(device)
+        self.src_edge_offsets = src_edge_offsets.to(device)
+        self.src_edge_dst = src_edge_dst.to(device)
+        self.src_edge_slot = src_edge_slot.to(device)
+
+    @staticmethod
+    def _build_src_edge_buffers(conn_idx: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        conn_cpu = conn_idx.to(device="cpu", dtype=torch.long)
+        nc, cn, k = conn_cpu.shape
+        edge_count = cn * k
+        offsets = torch.zeros(nc, cn + 1, dtype=torch.int32)
+        dst = torch.empty(nc, edge_count, dtype=torch.int32)
+        slot = torch.empty(nc, edge_count, dtype=torch.int32)
+
+        for cell in range(nc):
+            counts = torch.bincount(conn_cpu[cell].reshape(-1), minlength=cn).to(torch.int32)
+            offsets[cell, 1:] = counts.cumsum(dim=0)
+            cursor = offsets[cell, :-1].clone()
+            for dst_idx in range(cn):
+                for slot_idx in range(k):
+                    src_idx = int(conn_cpu[cell, dst_idx, slot_idx].item())
+                    edge_idx = int(cursor[src_idx].item())
+                    dst[cell, edge_idx] = dst_idx
+                    slot[cell, edge_idx] = slot_idx
+                    cursor[src_idx] += 1
+
+        return conn_cpu.to(dtype=torch.int32), offsets, dst, slot
+
+    def _build_border_neighbor_cells(self) -> Tensor:
+        neighbors = torch.full((self.N_cells, self.border_per_cell), -1, dtype=torch.int32)
+        for row in range(self.grid_h):
+            for col in range(self.grid_w):
+                cell = row * self.grid_w + col
+                if row > 0:
+                    neighbors[cell, 0] = (row - 1) * self.grid_w + col
+                if row + 1 < self.grid_h:
+                    neighbors[cell, 1] = (row + 1) * self.grid_w + col
+                if col > 0:
+                    neighbors[cell, 2] = row * self.grid_w + (col - 1)
+                if col + 1 < self.grid_w:
+                    neighbors[cell, 3] = row * self.grid_w + (col + 1)
+        return neighbors
 
     # ================================================================
     # State management
@@ -224,7 +287,24 @@ class MemoryGraph(nn.Module):
         )
 
     def _receive_local(self, msg: Tensor, w_conn: Tensor) -> Tensor:
-        return local_receive(msg, w_conn, self.conn_idx)
+        return local_receive(
+            msg,
+            w_conn,
+            self.conn_idx_i32,
+            self.src_edge_offsets,
+            self.src_edge_dst,
+            self.src_edge_slot,
+        )
+
+    def _receive_local_activated(self, msg: Tensor, w_conn: Tensor) -> Tensor:
+        return local_receive_activated(
+            msg,
+            w_conn,
+            self.conn_idx_i32,
+            self.src_edge_offsets,
+            self.src_edge_dst,
+            self.src_edge_slot,
+        )
 
     def _inject(self, received: Tensor, H_aug_t: Tensor, inject_w: Tensor, inject_b: Tensor) -> Tensor:
         cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
@@ -250,6 +330,15 @@ class MemoryGraph(nn.Module):
         gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
         return gate * incoming
 
+    def _border_exchange_from_gate(self, msg: Tensor, border_gate: Tensor) -> Tensor:
+        border = msg[:, :, self.border_lo:self.border_hi]
+        return border_exchange_activated(
+            border,
+            border_gate,
+            self.border_neighbor_cell,
+            self.border_src_port,
+        )
+
     def _state_update(
         self,
         received: Tensor,
@@ -270,6 +359,26 @@ class MemoryGraph(nn.Module):
         candidate = torch.tanh(
             torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+        return decay * h + (1.0 - decay) * candidate
+
+    def _state_update_from_decay(
+        self,
+        received: Tensor,
+        h: Tensor,
+        decay: Tensor,
+        identity: Tensor,
+        cell_context: Tensor,
+        w1: Tensor,
+        b1: Tensor,
+        w2: Tensor,
+        b2: Tensor,
+    ) -> Tensor:
+        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
+        state_input = torch.cat([received, h, identity, ctx, decay], dim=-1)
+        hidden = torch.tanh(
+            torch.einsum("bnci,nhi->bnch", state_input, w1) + b1.unsqueeze(0).unsqueeze(2))
+        candidate = torch.tanh(
+            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
         return decay * h + (1.0 - decay) * candidate
 
     def _emit_message(
@@ -325,6 +434,9 @@ class MemoryGraph(nn.Module):
         cell_context: Tensor,
         border_gate_logit: Tensor,
         hebbian: Tensor,
+        w_conn_act: Tensor,
+        decay: Tensor,
+        border_gate: Tensor,
         H_aug_t: Tensor,
         identity: Tensor,
         inject_w: Tensor,
@@ -338,12 +450,12 @@ class MemoryGraph(nn.Module):
         mg_w2: Tensor,
         mg_b2: Tensor,
     ):
-        received = self._receive_local(msg, w_conn)
+        received = self._receive_local_activated(msg, w_conn_act)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
-        received[:, :, self.border_lo:self.border_hi] += self._border_exchange(msg, border_gate_logit)
+        received[:, :, self.border_lo:self.border_hi] += self._border_exchange_from_gate(msg, border_gate)
 
-        h = self._state_update(
-            received, h, decay_logit, identity, cell_context,
+        h = self._state_update_from_decay(
+            received, h, decay, identity, cell_context,
             st_w1, st_b1, st_w2, st_b2)
         msg = self._emit_message(
             h, identity, cell_context,
@@ -382,6 +494,9 @@ class MemoryGraph(nn.Module):
         block_T = block_H_aug.shape[1]
         readouts = torch.empty(
             h.shape[0], block_T, self.config.D, device=block_H_aug.device, dtype=h.dtype)
+        w_conn_act = torch.sigmoid(w_conn)
+        decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+        border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
         for offset in range(block_T):
             t = start_t + offset
@@ -392,22 +507,29 @@ class MemoryGraph(nn.Module):
                 decay_logit = decay_logit.detach()
                 cell_context = cell_context.detach()
                 border_gate_logit = border_gate_logit.detach()
+                w_conn_act = torch.sigmoid(w_conn)
+                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+                border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
             if t % self.config.modulation_interval == 0:
                 w_conn, decay_logit, cell_context, border_gate_logit = self._modulate_cells(
                     h, msg, hebbian, decay_logit, cell_context, border_gate_logit, w_conn,
                     mod_w1, mod_b1, mod_w2, mod_b2,
                 )
+                w_conn_act = torch.sigmoid(w_conn)
+                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+                border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
             msg_prev = msg
             h, msg, readout = self._step(
                 h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
+                w_conn_act, decay, border_gate,
                 block_H_aug[:, offset], identity,
                 inject_w, inject_b,
                 st_w1, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
             )
-            hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx, ema_decay)
+            hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx_i32, ema_decay)
             readouts[:, offset] = readout
 
         return h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, readouts
@@ -472,6 +594,8 @@ class MemoryGraph(nn.Module):
                         run_block,
                         h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
                         use_reentrant=False,
+                        preserve_rng_state=False,
+                        determinism_check="none",
                     )
                 )
             else:
@@ -512,6 +636,8 @@ class MemoryGraph(nn.Module):
             rem = prune_flat % (Cn * K)
             prune_n = rem // K
             prune_k = rem % K
+            rewired_mask = torch.zeros(NC, Cn, K, dtype=torch.bool, device=device)
+            rewired_mask[prune_cell, prune_n, prune_k] = True
 
             exists = torch.zeros(NC, Cn, Cn, dtype=torch.bool, device=device)
             row_idx = torch.arange(Cn, device=device)[None, :, None].expand(NC, -1, K)
@@ -549,7 +675,12 @@ class MemoryGraph(nn.Module):
             modified_cells = prune_cell.unique()
             for cell in modified_cells.tolist():
                 for neuron in prune_n[prune_cell == cell].unique().tolist():
-                    self.conn_idx[cell, neuron], _ = self.conn_idx[cell, neuron].sort()
+                    sorted_conn, order = self.conn_idx[cell, neuron].sort()
+                    self.conn_idx[cell, neuron] = sorted_conn
+                    self.w_conn[:, cell, neuron] = self.w_conn[:, cell, neuron][:, order]
+                    self.hebbian_traces[:, cell, neuron] = self.hebbian_traces[:, cell, neuron][:, order]
+                    row_rewired = rewired_mask[cell, neuron][order]
+                    self.w_conn[:, cell, neuron, row_rewired] = 0
+                    self.hebbian_traces[:, cell, neuron, row_rewired] = 0
 
-            self.w_conn[:, prune_cell, prune_n, prune_k] = 0
-            self.hebbian_traces[:, prune_cell, prune_n, prune_k] = 0
+            self._rebuild_connectivity_buffers()

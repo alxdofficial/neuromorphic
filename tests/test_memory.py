@@ -60,6 +60,38 @@ class TestShapes:
         diff = (received_fused - received_eager).float().abs().max().item()
         assert diff < 5e-2, f"Fused local receive deviates from eager baseline (max diff={diff})"
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton receive grad test")
+    def test_local_receive_backward_matches_eager_on_cuda(self):
+        config = _tiny_config()
+        mg = MemoryGraph(config).cuda()
+        mg.initialize_states(2, torch.device("cuda"))
+
+        msg_fused = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.D_n,
+            device="cuda", dtype=torch.float32, requires_grad=True)
+        w_fused = torch.randn(
+            2, config.N_cells, config.neurons_per_cell, config.K,
+            device="cuda", dtype=torch.float32, requires_grad=True)
+        msg_eager = msg_fused.detach().clone().requires_grad_(True)
+        w_eager = w_fused.detach().clone().requires_grad_(True)
+
+        out_fused = mg._receive_local(msg_fused, w_fused)
+        loss_fused = out_fused.square().mean()
+        loss_fused.backward()
+
+        batch_idx = torch.arange(2, device="cuda")[:, None, None, None]
+        cell_idx = torch.arange(config.N_cells, device="cuda")[None, :, None, None]
+        conn = mg.conn_idx.to("cuda").unsqueeze(0).expand(2, -1, -1, -1)
+        gathered = msg_eager[batch_idx, cell_idx, conn]
+        out_eager = (gathered * torch.sigmoid(w_eager).unsqueeze(-1)).sum(dim=3)
+        loss_eager = out_eager.square().mean()
+        loss_eager.backward()
+
+        grad_msg_diff = (msg_fused.grad - msg_eager.grad).abs().max().item()
+        grad_w_diff = (w_fused.grad - w_eager.grad).abs().max().item()
+        assert grad_msg_diff < 1e-4, f"grad_msg mismatch (max diff={grad_msg_diff})"
+        assert grad_w_diff < 1e-4, f"grad_w mismatch (max diff={grad_w_diff})"
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton Hebbian test")
     def test_hebbian_update_matches_eager_on_cuda(self):
         config = _tiny_config()
@@ -177,6 +209,43 @@ class TestStateDecay:
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 
+    def test_cached_decay_matches_raw_state_update(self):
+        mg, config = _make_graph()
+        BS = 2
+        dt = torch.bfloat16
+
+        h = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
+        received = torch.randn_like(h)
+        identity = mg.identity
+        decay_logit = torch.randn(BS, config.N_cells, config.neurons_per_cell, dtype=dt)
+        cell_context = mg.cell_context
+
+        w1 = mg.state_w1[mg.cell_to_group].to(dt)
+        b1 = mg.state_b1[mg.cell_to_group].to(dt)
+        w2 = mg.state_w2[mg.cell_to_group].to(dt)
+        b2 = mg.state_b2[mg.cell_to_group].to(dt)
+
+        raw = mg._state_update(received, h, decay_logit, identity, cell_context, w1, b1, w2, b2)
+        cached = mg._state_update_from_decay(
+            received, h, torch.sigmoid(decay_logit).unsqueeze(-1), identity, cell_context, w1, b1, w2, b2)
+        diff = (raw - cached).float().abs().max().item()
+        assert diff < 5e-3, f"Cached decay path diverged from raw state update (max diff={diff})"
+
+
+class TestBorderExchange:
+    def test_cached_gate_matches_raw_border_exchange(self):
+        mg, config = _make_graph()
+        BS = 2
+        dt = torch.bfloat16
+
+        msg = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
+        border_gate_logit = torch.randn(BS, config.N_cells, config.border_per_cell, dtype=dt)
+
+        raw = mg._border_exchange(msg, border_gate_logit)
+        cached = mg._border_exchange_from_gate(msg, torch.sigmoid(border_gate_logit).unsqueeze(-1))
+        diff = (raw - cached).float().abs().max().item()
+        assert diff < 1e-4, f"Cached border exchange diverged from raw path (max diff={diff})"
+
 
 class TestHebbian:
     def test_per_token_update(self):
@@ -249,6 +318,41 @@ class TestStructuralPlasticity:
                 sorted_row, _ = row.sort()
                 assert torch.equal(row, sorted_row), (
                     f"Cell {cell} neuron {neuron} connections not sorted after rewire")
+
+    def test_connectivity_index_buffer_consistent_after_rewire(self):
+        config = _tiny_config(structural_plasticity=True, plasticity_pct=0.1)
+        mg, _ = _make_graph(config)
+        mg.hebbian_traces = torch.randn_like(mg.hebbian_traces)
+        mg.msg = torch.randn_like(mg.msg)
+        mg.rewire_connections()
+
+        assert torch.equal(mg.conn_idx_i32.cpu(), mg.conn_idx.cpu().to(torch.int32))
+
+        expected_offsets = torch.zeros_like(mg.src_edge_offsets)
+        expected_dst = torch.empty_like(mg.src_edge_dst)
+        expected_slot = torch.empty_like(mg.src_edge_slot)
+        edge_count = config.neurons_per_cell * config.K
+
+        for cell in range(config.N_cells):
+            counts = torch.bincount(
+                mg.conn_idx[cell].reshape(-1).cpu(),
+                minlength=config.neurons_per_cell,
+            ).to(torch.int32)
+            expected_offsets[cell, 1:] = counts.cumsum(dim=0)
+            cursor = expected_offsets[cell, :-1].clone()
+            for dst_idx in range(config.neurons_per_cell):
+                for slot_idx in range(config.K):
+                    src_idx = int(mg.conn_idx[cell, dst_idx, slot_idx].item())
+                    edge_idx = int(cursor[src_idx].item())
+                    expected_dst[cell, edge_idx] = dst_idx
+                    expected_slot[cell, edge_idx] = slot_idx
+                    cursor[src_idx] += 1
+
+            assert int(expected_offsets[cell, -1].item()) == edge_count
+
+        assert torch.equal(mg.src_edge_offsets.cpu(), expected_offsets.cpu())
+        assert torch.equal(mg.src_edge_dst.cpu(), expected_dst.cpu())
+        assert torch.equal(mg.src_edge_slot.cpu(), expected_slot.cpu())
 
 
 class TestGradientFlow:
