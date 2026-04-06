@@ -140,13 +140,13 @@ class Config:
 
     @property
     def state_in(self) -> int:
-        """State MLP input dim: received + h + identity + cell_context + decay."""
-        return 4 * self.D_n + 1
+        """State MLP input dim: received + h (identity/ctx/decay handled elsewhere)."""
+        return 2 * self.D_n
 
     @property
     def msg_in(self) -> int:
-        """Message MLP input dim: h + identity + cell_context."""
-        return 3 * self.D_n
+        """Message MLP input dim: just h (identity/ctx handled by modulator)."""
+        return self.D_n
 
     @property
     def neuromod_hidden(self) -> int:

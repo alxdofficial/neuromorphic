@@ -204,31 +204,14 @@ class TestStateDecay:
         h_orig = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
         received = torch.zeros(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
         identity = mg.identity
-        decay_logit = torch.full((BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt)
-        cell_context = mg.cell_context
+        # Very high decay → h_new ≈ h_old
+        decay = torch.sigmoid(torch.full(
+            (BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt)).unsqueeze(-1)
 
         args = self._get_state_mlp_args(mg, dt)
-        h_new = mg._state_update(received, h_orig, decay_logit, identity, cell_context, *args)
+        h_new = mg._state_update_from_decay(received, h_orig, decay, identity, *args)
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
-
-    def test_cached_decay_matches_raw_state_update(self):
-        mg, config = _make_graph()
-        BS = 2
-        dt = torch.bfloat16
-
-        h = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
-        received = torch.randn_like(h)
-        identity = mg.identity
-        decay_logit = torch.randn(BS, config.N_cells, config.neurons_per_cell, dtype=dt)
-        cell_context = mg.cell_context
-
-        args = self._get_state_mlp_args(mg, dt)
-        raw = mg._state_update(received, h, decay_logit, identity, cell_context, *args)
-        cached = mg._state_update_from_decay(
-            received, h, torch.sigmoid(decay_logit).unsqueeze(-1), identity, cell_context, *args)
-        diff = (raw - cached).float().abs().max().item()
-        assert diff < 0.05, f"Cached decay path diverged from raw state update (max diff={diff})"
 
 
 class TestBorderExchange:

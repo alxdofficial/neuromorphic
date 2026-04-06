@@ -64,6 +64,8 @@ class MemoryGraph(nn.Module):
         )
 
         self.neuron_id = nn.Parameter(torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
+        self.neuron_key = nn.Parameter(torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
+        self.attn_heads = 4  # D_n=32 / 4 = 8 per head
 
         G = config.mlp_groups
         Hs = config.state_mlp_hidden
@@ -277,6 +279,9 @@ class MemoryGraph(nn.Module):
     def _identity(self, BS: int, dtype: torch.dtype, device: torch.device) -> Tensor:
         return self.neuron_id.to(device=device, dtype=dtype).unsqueeze(0).expand(BS, -1, -1, -1)
 
+    def _key(self, BS: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.neuron_key.to(device=device, dtype=dtype).unsqueeze(0).expand(BS, -1, -1, -1)
+
     def initialize_states(self, BS: int, device: torch.device):
         dt = torch.bfloat16
         shape = (BS, self.N_cells, self.C_n)
@@ -403,6 +408,24 @@ class MemoryGraph(nn.Module):
             self.conn_idx,
         )
 
+    def _receive_attention(self, msg: Tensor, identity: Tensor, key: Tensor) -> Tensor:
+        """Within-cell attention: identity=Q, key=K, msg=V.
+
+        Uses F.scaled_dot_product_attention (Flash Attention) for fused fwd+bwd.
+        Each cell is an independent 128-length sequence with 4 heads of dim 8.
+        """
+        BS, NC, Cn, Dn = msg.shape
+        nh = self.attn_heads
+        hd = Dn // nh  # head_dim
+
+        # Reshape to [BS*NC, num_heads, Cn, head_dim]
+        q = identity.reshape(BS * NC, Cn, nh, hd).permute(0, 2, 1, 3)
+        k = key.reshape(BS * NC, Cn, nh, hd).permute(0, 2, 1, 3)
+        v = msg.reshape(BS * NC, Cn, nh, hd).permute(0, 2, 1, 3)
+
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return out.permute(0, 2, 1, 3).reshape(BS, NC, Cn, Dn)
+
     def _inject(self, received: Tensor, H_aug_t: Tensor, inject_w: Tensor, inject_b: Tensor) -> Tensor:
         cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
         inject = torch.einsum("bni,noi->bno", cell_slice, inject_w)
@@ -471,33 +494,15 @@ class MemoryGraph(nn.Module):
         out = out * gs2.unsqueeze(0).unsqueeze(2) + gb2.unsqueeze(0).unsqueeze(2)
         return torch.tanh(out)
 
-    def _state_update(
-        self,
-        received: Tensor,
-        h: Tensor,
-        decay_logit: Tensor,
-        identity: Tensor,
-        cell_context: Tensor,
-        w1, b1, gs1, gb1, w2, b2, gs2, gb2,
-    ) -> Tensor:
-        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
-        state_input = torch.cat(
-            [received, h, identity, ctx, decay_logit.unsqueeze(-1)], dim=-1)
-        candidate = self._grouped_mlp(state_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
-        decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-        return decay * h + (1.0 - decay) * candidate
-
     def _state_update_from_decay(
         self,
         received: Tensor,
         h: Tensor,
         decay: Tensor,
         identity: Tensor,
-        cell_context: Tensor,
         w1, b1, gs1, gb1, w2, b2, gs2, gb2,
     ) -> Tensor:
-        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
-        state_input = torch.cat([received, h, identity, ctx, decay], dim=-1)
+        state_input = torch.cat([received, h], dim=-1)  # [BS, NC, Cn, 2*D_n]
         candidate = self._grouped_mlp(state_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
         return decay * h + (1.0 - decay) * candidate
 
@@ -505,12 +510,9 @@ class MemoryGraph(nn.Module):
         self,
         h: Tensor,
         identity: Tensor,
-        cell_context: Tensor,
         w1, b1, gs1, gb1, w2, b2, gs2, gb2,
     ) -> Tensor:
-        ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
-        msg_input = torch.cat([h, identity, ctx], dim=-1)
-        msg_new = self._grouped_mlp(msg_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
+        msg_new = self._grouped_mlp(h, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
         return msg_new + identity
 
     def _readout(self, msg: Tensor) -> Tensor:
@@ -541,8 +543,7 @@ class MemoryGraph(nn.Module):
 
     def _step(
         self,
-        h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
-        w_conn_act, decay, border_gate,
+        h, msg, w_conn_act, decay, border_gate,
         H_aug_t, identity, inject_w, inject_b,
         st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
         mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
@@ -552,10 +553,10 @@ class MemoryGraph(nn.Module):
         received[:, :, self.border_lo:self.border_hi] += self._border_exchange_from_gate(msg, border_gate)
 
         h = self._state_update_from_decay(
-            received, h, decay, identity, cell_context,
+            received, h, decay, identity,
             st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2)
         msg = self._emit_message(
-            h, identity, cell_context,
+            h, identity,
             mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2)
         readout = self._readout(msg)
         return h, msg, readout
@@ -600,8 +601,7 @@ class MemoryGraph(nn.Module):
 
             msg_prev = msg
             h, msg, readout = self._step(
-                h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
-                w_conn_act, decay, border_gate,
+                h, msg, w_conn_act, decay, border_gate,
                 block_H_aug[:, offset], identity, inject_w, inject_b,
                 st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
                 mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
