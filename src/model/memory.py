@@ -226,17 +226,24 @@ class MemoryGraph(nn.Module):
         return received
 
     def _border_exchange(self, msg, border_gate):
+        """Fixed geometric border exchange using grid reshape + slice shifts."""
         BS = msg.shape[0]
-        border = msg[:, :, self.border_lo:self.border_hi]
-        # Gather from neighbor cells
-        neighbors = self.border_neighbor_cell  # [NC, B]
-        src_ports = self.border_src_port        # [B]
+        border = msg[:, :, self.border_lo:self.border_hi]  # [BS, NC, 4, D_n]
+
+        # Reshape to grid: [BS, H, W, 4, D_n]
+        border = border.reshape(BS, self.grid_h, self.grid_w, self.border_per_cell, self.D_n)
         incoming = torch.zeros_like(border)
-        for port in range(self.border_per_cell):
-            valid = neighbors[:, port] >= 0
-            if valid.any():
-                src_cells = neighbors[valid, port]
-                incoming[:, valid, port] = border[:, src_cells, src_ports[port]]
+
+        # 0=north reads south(1) from cell above, 1=south reads north(0) from cell below
+        # 2=west reads east(3) from cell left, 3=east reads west(2) from cell right
+        if self.grid_h > 1:
+            incoming[:, 1:, :, 0] = border[:, :-1, :, 1]   # north
+            incoming[:, :-1, :, 1] = border[:, 1:, :, 0]    # south
+        if self.grid_w > 1:
+            incoming[:, :, 1:, 2] = border[:, :, :-1, 3]    # west
+            incoming[:, :, :-1, 3] = border[:, :, 1:, 2]     # east
+
+        incoming = incoming.reshape(BS, self.N_cells, self.border_per_cell, self.D_n)
         return border_gate * incoming
 
     def _grouped_mlp(self, x, w1, b1, gs1, gb1, w2, b2, gs2, gb2):
