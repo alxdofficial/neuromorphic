@@ -84,6 +84,45 @@ class TestTBPTT:
         # Memory state should be non-zero
         assert model.memory.h.abs().sum() > 0
 
+    def test_rewire_scheduler_counts_processed_tokens(self):
+        config = _tiny_config(structural_plasticity=True, plasticity_interval=20)
+        model = Model(config)
+        BS, T = 2, config.T
+        input_ids = torch.randint(0, config.vocab_size, (BS, T))
+
+        calls = []
+
+        def fake_rewire():
+            calls.append(model._tokens_since_rewire)
+
+        model.memory.rewire_connections = fake_rewire
+
+        model.forward_chunk(input_ids)
+        model.detach_states()
+        assert calls == []
+        assert model._tokens_since_rewire == BS * T
+
+        model.forward_chunk(input_ids)
+        model.detach_states()
+        assert len(calls) == 1
+        assert calls[0] == 2 * BS * T
+        assert model._tokens_since_rewire == (2 * BS * T - config.plasticity_interval)
+
+    def test_no_memory_chunks_do_not_advance_rewire_scheduler(self):
+        config = _tiny_config(structural_plasticity=True, plasticity_interval=4)
+        model = Model(config)
+        BS, T = 2, config.T
+        input_ids = torch.randint(0, config.vocab_size, (BS, T))
+
+        calls = []
+        model.memory.rewire_connections = lambda: calls.append(True)
+
+        model.forward_chunk(input_ids, use_memory=False)
+        model.detach_states()
+
+        assert calls == []
+        assert model._tokens_since_rewire == 0
+
 
 class TestPersistence:
     def test_future_eos_does_not_change_past_logits(self):

@@ -28,6 +28,7 @@ class Model(nn.Module):
         self.memory = MemoryGraph(config)
         self._initialized = False
         self._tokens_since_rewire = 0
+        self._last_chunk_tokens = 0
 
     def forward_chunk(
         self,
@@ -37,6 +38,7 @@ class Model(nn.Module):
     ) -> dict:
         BS, T = input_ids.shape
         device = input_ids.device
+        self._last_chunk_tokens = BS * T if use_memory else 0
 
         # Initialize memory on first call (MUST come before resets)
         if not self._initialized:
@@ -84,16 +86,17 @@ class Model(nn.Module):
         self.lm.detach_carries()
         self.memory.detach_states()
 
-        self._tokens_since_rewire += self.config.T
-        if (self.config.structural_plasticity
-                and self._tokens_since_rewire >= self.config.plasticity_interval):
-            self.memory.rewire_connections()
-            self._tokens_since_rewire = 0
+        self._tokens_since_rewire += self._last_chunk_tokens
+        if self.config.structural_plasticity:
+            while self._tokens_since_rewire >= self.config.plasticity_interval:
+                self.memory.rewire_connections()
+                self._tokens_since_rewire -= self.config.plasticity_interval
 
     def runtime_state_dict(self) -> dict:
         return {
             "initialized": self._initialized,
             "tokens_since_rewire": self._tokens_since_rewire,
+            "last_chunk_tokens": self._last_chunk_tokens,
             "lm": self.lm.runtime_state_dict(),
             "memory": self.memory.runtime_state_dict(),
         }
@@ -105,6 +108,7 @@ class Model(nn.Module):
         self.memory.load_runtime_state(state.get("memory", {}))
         self._initialized = state.get("initialized", self.memory.is_initialized)
         self._tokens_since_rewire = state.get("tokens_since_rewire", 0)
+        self._last_chunk_tokens = state.get("last_chunk_tokens", 0)
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())

@@ -198,6 +198,7 @@ class MemoryGraph(nn.Module):
         self.decay_logit = self.decay_logit.detach()
         self.cell_context = self.cell_context.detach()
         self.border_gate_logit = self.border_gate_logit.detach()
+        self.hebbian_traces = self.hebbian_traces.detach()
 
     def runtime_state_dict(self) -> dict:
         if not self._initialized:
@@ -290,7 +291,7 @@ class MemoryGraph(nn.Module):
         return local_receive(
             msg,
             w_conn,
-            self.conn_idx_i32,
+            self.conn_idx,
             self.src_edge_offsets,
             self.src_edge_dst,
             self.src_edge_slot,
@@ -300,7 +301,7 @@ class MemoryGraph(nn.Module):
         return local_receive_activated(
             msg,
             w_conn,
-            self.conn_idx_i32,
+            self.conn_idx,
             self.src_edge_offsets,
             self.src_edge_dst,
             self.src_edge_slot,

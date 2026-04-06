@@ -447,6 +447,11 @@ def local_receive_activated(
 
     Falls back to eager PyTorch on CPU or when Triton is unavailable.
     """
+    if msg.is_cuda and w_conn.is_cuda and conn_idx.is_cuda and conn_idx.dtype == torch.long:
+        bs, nc, cn, _ = msg.shape
+        adj = torch.zeros(bs, nc, cn, cn, device=msg.device, dtype=w_conn.dtype)
+        adj.scatter_(3, conn_idx.unsqueeze(0).expand(bs, -1, -1, -1), w_conn)
+        return torch.matmul(adj, msg)
     if (
         _HAS_TRITON
         and msg.is_cuda
