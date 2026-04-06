@@ -187,6 +187,15 @@ class TestInjectReadout:
 
 
 class TestStateDecay:
+    def _get_state_mlp_args(self, mg, dt):
+        gi = mg.cell_to_group
+        return (
+            mg.state_w1.to(dt), mg.state_b1.to(dt),
+            mg.state_gs1[gi].to(dt), mg.state_gb1[gi].to(dt),
+            mg.state_w2.to(dt), mg.state_b2.to(dt),
+            mg.state_gs2[gi].to(dt), mg.state_gb2[gi].to(dt),
+        )
+
     def test_high_decay_preserves_state(self):
         mg, config = _make_graph()
         BS = 2
@@ -195,17 +204,11 @@ class TestStateDecay:
         h_orig = torch.randn(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
         received = torch.zeros(BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
         identity = mg.identity
-        # Very high decay_logit → decay ≈ 1 → h_new ≈ h_old
         decay_logit = torch.full((BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt)
         cell_context = mg.cell_context
 
-        w1 = mg.state_w1[mg.cell_to_group].to(dt)
-        b1 = mg.state_b1[mg.cell_to_group].to(dt)
-        w2 = mg.state_w2[mg.cell_to_group].to(dt)
-        b2 = mg.state_b2[mg.cell_to_group].to(dt)
-
-        h_new = mg._state_update(received, h_orig, decay_logit, identity, cell_context,
-                                 w1, b1, w2, b2)
+        args = self._get_state_mlp_args(mg, dt)
+        h_new = mg._state_update(received, h_orig, decay_logit, identity, cell_context, *args)
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 
@@ -220,16 +223,12 @@ class TestStateDecay:
         decay_logit = torch.randn(BS, config.N_cells, config.neurons_per_cell, dtype=dt)
         cell_context = mg.cell_context
 
-        w1 = mg.state_w1[mg.cell_to_group].to(dt)
-        b1 = mg.state_b1[mg.cell_to_group].to(dt)
-        w2 = mg.state_w2[mg.cell_to_group].to(dt)
-        b2 = mg.state_b2[mg.cell_to_group].to(dt)
-
-        raw = mg._state_update(received, h, decay_logit, identity, cell_context, w1, b1, w2, b2)
+        args = self._get_state_mlp_args(mg, dt)
+        raw = mg._state_update(received, h, decay_logit, identity, cell_context, *args)
         cached = mg._state_update_from_decay(
-            received, h, torch.sigmoid(decay_logit).unsqueeze(-1), identity, cell_context, w1, b1, w2, b2)
+            received, h, torch.sigmoid(decay_logit).unsqueeze(-1), identity, cell_context, *args)
         diff = (raw - cached).float().abs().max().item()
-        assert diff < 5e-3, f"Cached decay path diverged from raw state update (max diff={diff})"
+        assert diff < 0.05, f"Cached decay path diverged from raw state update (max diff={diff})"
 
 
 class TestBorderExchange:

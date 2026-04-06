@@ -65,19 +65,29 @@ class MemoryGraph(nn.Module):
 
         self.neuron_id = nn.Parameter(torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
 
+        G = config.mlp_groups
         Hs = config.state_mlp_hidden
         Hm = config.msg_mlp_hidden
         Hmod = config.cell_mod_hidden
 
-        self.state_w1 = nn.Parameter(torch.empty(config.mlp_groups, Hs, config.state_in))
-        self.state_b1 = nn.Parameter(torch.zeros(config.mlp_groups, Hs))
-        self.state_w2 = nn.Parameter(torch.empty(config.mlp_groups, self.D_n, Hs))
-        self.state_b2 = nn.Parameter(torch.zeros(config.mlp_groups, self.D_n))
+        # Shared weights (one GEMM for all neurons) + per-group scale/bias
+        self.state_w1 = nn.Parameter(torch.empty(Hs, config.state_in))
+        self.state_b1 = nn.Parameter(torch.zeros(Hs))
+        self.state_gs1 = nn.Parameter(torch.ones(G, Hs))   # group scale
+        self.state_gb1 = nn.Parameter(torch.zeros(G, Hs))   # group bias
+        self.state_w2 = nn.Parameter(torch.empty(self.D_n, Hs))
+        self.state_b2 = nn.Parameter(torch.zeros(self.D_n))
+        self.state_gs2 = nn.Parameter(torch.ones(G, self.D_n))
+        self.state_gb2 = nn.Parameter(torch.zeros(G, self.D_n))
 
-        self.msg_w1 = nn.Parameter(torch.empty(config.mlp_groups, Hm, config.msg_in))
-        self.msg_b1 = nn.Parameter(torch.zeros(config.mlp_groups, Hm))
-        self.msg_w2 = nn.Parameter(torch.empty(config.mlp_groups, self.D_n, Hm))
-        self.msg_b2 = nn.Parameter(torch.zeros(config.mlp_groups, self.D_n))
+        self.msg_w1 = nn.Parameter(torch.empty(Hm, config.msg_in))
+        self.msg_b1 = nn.Parameter(torch.zeros(Hm))
+        self.msg_gs1 = nn.Parameter(torch.ones(G, Hm))
+        self.msg_gb1 = nn.Parameter(torch.zeros(G, Hm))
+        self.msg_w2 = nn.Parameter(torch.empty(self.D_n, Hm))
+        self.msg_b2 = nn.Parameter(torch.zeros(self.D_n))
+        self.msg_gs2 = nn.Parameter(torch.ones(G, self.D_n))
+        self.msg_gb2 = nn.Parameter(torch.zeros(G, self.D_n))
 
         self.inject_w = nn.Parameter(
             torch.empty(config.mlp_groups, self.alpha * self.D_n, self.D_n))
@@ -96,7 +106,7 @@ class MemoryGraph(nn.Module):
 
         with torch.no_grad():
             self.inject_b.zero_()
-            for group in range(config.mlp_groups):
+            for group in range(G):
                 for port in range(self.alpha):
                     block = torch.empty(self.D_n, self.D_n)
                     nn.init.orthogonal_(block)
@@ -110,6 +120,16 @@ class MemoryGraph(nn.Module):
             self.mod_w2.mul_(0.01)
 
         self._initialized = False
+        self._compiled = False
+
+    def _maybe_compile(self):
+        """Compile _step with torch.compile if configured and not yet done."""
+        if self._compiled or not self.config.compile_step:
+            return
+        if not torch.cuda.is_available():
+            return
+        self._step = torch.compile(self._step, mode="default", fullgraph=False)
+        self._compiled = True
 
     def _rebuild_connectivity_buffers(self):
         device = self.conn_idx.device
@@ -416,6 +436,41 @@ class MemoryGraph(nn.Module):
             self.border_src_port,
         )
 
+    def _grouped_mlp(
+        self,
+        x: Tensor,
+        w1: Tensor,
+        b1: Tensor,
+        gs1: Tensor,
+        gb1: Tensor,
+        w2: Tensor,
+        b2: Tensor,
+        gs2: Tensor,
+        gb2: Tensor,
+    ) -> Tensor:
+        """Two-layer MLP: flat F.linear + per-group scale/bias conditioning.
+
+        Args:
+            x: [BS, NC, Cn, D_in]
+            w1: [H, D_in], b1: [H] — shared first layer
+            gs1: [NC, H], gb1: [NC, H] — per-cell group scale/bias (pre-indexed by cell_to_group)
+            w2: [D_out, H], b2: [D_out] — shared second layer
+            gs2: [NC, D_out], gb2: [NC, D_out]
+        Returns:
+            [BS, NC, Cn, D_out]
+        """
+        BS, NC, Cn, _ = x.shape
+        flat = x.reshape(-1, x.shape[-1])                     # [BS*NC*Cn, D_in]
+        hidden = torch.nn.functional.linear(flat, w1, b1)      # [BS*NC*Cn, H]
+        hidden = hidden.reshape(BS, NC, Cn, -1)                # [BS, NC, Cn, H]
+        hidden = hidden * gs1.unsqueeze(0).unsqueeze(2) + gb1.unsqueeze(0).unsqueeze(2)
+        hidden = torch.tanh(hidden)
+        flat2 = hidden.reshape(-1, hidden.shape[-1])           # [BS*NC*Cn, H]
+        out = torch.nn.functional.linear(flat2, w2, b2)        # [BS*NC*Cn, D_out]
+        out = out.reshape(BS, NC, Cn, -1)                      # [BS, NC, Cn, D_out]
+        out = out * gs2.unsqueeze(0).unsqueeze(2) + gb2.unsqueeze(0).unsqueeze(2)
+        return torch.tanh(out)
+
     def _state_update(
         self,
         received: Tensor,
@@ -423,18 +478,12 @@ class MemoryGraph(nn.Module):
         decay_logit: Tensor,
         identity: Tensor,
         cell_context: Tensor,
-        w1: Tensor,
-        b1: Tensor,
-        w2: Tensor,
-        b2: Tensor,
+        w1, b1, gs1, gb1, w2, b2, gs2, gb2,
     ) -> Tensor:
         ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
         state_input = torch.cat(
             [received, h, identity, ctx, decay_logit.unsqueeze(-1)], dim=-1)
-        hidden = torch.tanh(
-            torch.einsum("bnci,nhi->bnch", state_input, w1) + b1.unsqueeze(0).unsqueeze(2))
-        candidate = torch.tanh(
-            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
+        candidate = self._grouped_mlp(state_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
         return decay * h + (1.0 - decay) * candidate
 
@@ -445,17 +494,11 @@ class MemoryGraph(nn.Module):
         decay: Tensor,
         identity: Tensor,
         cell_context: Tensor,
-        w1: Tensor,
-        b1: Tensor,
-        w2: Tensor,
-        b2: Tensor,
+        w1, b1, gs1, gb1, w2, b2, gs2, gb2,
     ) -> Tensor:
         ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
         state_input = torch.cat([received, h, identity, ctx, decay], dim=-1)
-        hidden = torch.tanh(
-            torch.einsum("bnci,nhi->bnch", state_input, w1) + b1.unsqueeze(0).unsqueeze(2))
-        candidate = torch.tanh(
-            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
+        candidate = self._grouped_mlp(state_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
         return decay * h + (1.0 - decay) * candidate
 
     def _emit_message(
@@ -463,17 +506,11 @@ class MemoryGraph(nn.Module):
         h: Tensor,
         identity: Tensor,
         cell_context: Tensor,
-        w1: Tensor,
-        b1: Tensor,
-        w2: Tensor,
-        b2: Tensor,
+        w1, b1, gs1, gb1, w2, b2, gs2, gb2,
     ) -> Tensor:
         ctx = cell_context.unsqueeze(2).expand(-1, -1, self.C_n, -1)
         msg_input = torch.cat([h, identity, ctx], dim=-1)
-        hidden = torch.tanh(
-            torch.einsum("bnci,nhi->bnch", msg_input, w1) + b1.unsqueeze(0).unsqueeze(2))
-        msg_new = torch.tanh(
-            torch.einsum("bnch,nih->bnci", hidden, w2) + b2.unsqueeze(0).unsqueeze(2))
+        msg_new = self._grouped_mlp(msg_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
         return msg_new + identity
 
     def _readout(self, msg: Tensor) -> Tensor:
@@ -504,28 +541,11 @@ class MemoryGraph(nn.Module):
 
     def _step(
         self,
-        h: Tensor,
-        msg: Tensor,
-        w_conn: Tensor,
-        decay_logit: Tensor,
-        cell_context: Tensor,
-        border_gate_logit: Tensor,
-        hebbian: Tensor,
-        w_conn_act: Tensor,
-        decay: Tensor,
-        border_gate: Tensor,
-        H_aug_t: Tensor,
-        identity: Tensor,
-        inject_w: Tensor,
-        inject_b: Tensor,
-        st_w1: Tensor,
-        st_b1: Tensor,
-        st_w2: Tensor,
-        st_b2: Tensor,
-        mg_w1: Tensor,
-        mg_b1: Tensor,
-        mg_w2: Tensor,
-        mg_b2: Tensor,
+        h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
+        w_conn_act, decay, border_gate,
+        H_aug_t, identity, inject_w, inject_b,
+        st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
+        mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
     ):
         received = self._receive_local_activated(msg, w_conn_act)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
@@ -533,40 +553,21 @@ class MemoryGraph(nn.Module):
 
         h = self._state_update_from_decay(
             received, h, decay, identity, cell_context,
-            st_w1, st_b1, st_w2, st_b2)
+            st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2)
         msg = self._emit_message(
             h, identity, cell_context,
-            mg_w1, mg_b1, mg_w2, mg_b2)
+            mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2)
         readout = self._readout(msg)
         return h, msg, readout
 
     def _run_block(
         self,
-        h: Tensor,
-        msg: Tensor,
-        w_conn: Tensor,
-        decay_logit: Tensor,
-        cell_context: Tensor,
-        border_gate_logit: Tensor,
-        hebbian: Tensor,
-        block_H_aug: Tensor,
-        start_t: int,
-        identity: Tensor,
-        inject_w: Tensor,
-        inject_b: Tensor,
-        st_w1: Tensor,
-        st_b1: Tensor,
-        st_w2: Tensor,
-        st_b2: Tensor,
-        mg_w1: Tensor,
-        mg_b1: Tensor,
-        mg_w2: Tensor,
-        mg_b2: Tensor,
-        mod_w1: Tensor,
-        mod_b1: Tensor,
-        mod_w2: Tensor,
-        mod_b2: Tensor,
-        ema_decay: float,
+        h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
+        block_H_aug, start_t, identity, inject_w, inject_b,
+        st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
+        mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
+        mod_w1, mod_b1, mod_w2, mod_b2,
+        ema_decay,
     ):
         block_T = block_H_aug.shape[1]
         readouts = torch.empty(
@@ -601,10 +602,9 @@ class MemoryGraph(nn.Module):
             h, msg, readout = self._step(
                 h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian,
                 w_conn_act, decay, border_gate,
-                block_H_aug[:, offset], identity,
-                inject_w, inject_b,
-                st_w1, st_b1, st_w2, st_b2,
-                mg_w1, mg_b1, mg_w2, mg_b2,
+                block_H_aug[:, offset], identity, inject_w, inject_b,
+                st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
+                mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
             )
             hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx, ema_decay)
             readouts[:, offset] = readout
@@ -619,6 +619,7 @@ class MemoryGraph(nn.Module):
         BS, T, _ = H_aug.shape
         if not self._initialized:
             self.initialize_states(BS, H_aug.device)
+        self._maybe_compile()
 
         h = self.h
         msg = self.msg
@@ -632,20 +633,33 @@ class MemoryGraph(nn.Module):
         identity = self._identity(BS, h.dtype, h.device)
 
         group_idx = self.cell_to_group
-        st_w1 = self.state_w1[group_idx].to(h.dtype)
-        st_b1 = self.state_b1[group_idx].to(h.dtype)
-        st_w2 = self.state_w2[group_idx].to(h.dtype)
-        st_b2 = self.state_b2[group_idx].to(h.dtype)
-        mg_w1 = self.msg_w1[group_idx].to(h.dtype)
-        mg_b1 = self.msg_b1[group_idx].to(h.dtype)
-        mg_w2 = self.msg_w2[group_idx].to(h.dtype)
-        mg_b2 = self.msg_b2[group_idx].to(h.dtype)
-        inject_w = self.inject_w[group_idx].to(h.dtype)
-        inject_b = self.inject_b[group_idx].to(h.dtype)
-        mod_w1 = self.mod_w1.to(h.dtype)
-        mod_b1 = self.mod_b1.to(h.dtype)
-        mod_w2 = self.mod_w2.to(h.dtype)
-        mod_b2 = self.mod_b2.to(h.dtype)
+        dt = h.dtype
+        # Shared weights (single GEMM)
+        st_w1 = self.state_w1.to(dt)
+        st_b1 = self.state_b1.to(dt)
+        st_w2 = self.state_w2.to(dt)
+        st_b2 = self.state_b2.to(dt)
+        mg_w1 = self.msg_w1.to(dt)
+        mg_b1 = self.msg_b1.to(dt)
+        mg_w2 = self.msg_w2.to(dt)
+        mg_b2 = self.msg_b2.to(dt)
+        # Per-group scale/bias (pre-indexed by cell)
+        st_gs1 = self.state_gs1[group_idx].to(dt)
+        st_gb1 = self.state_gb1[group_idx].to(dt)
+        st_gs2 = self.state_gs2[group_idx].to(dt)
+        st_gb2 = self.state_gb2[group_idx].to(dt)
+        mg_gs1 = self.msg_gs1[group_idx].to(dt)
+        mg_gb1 = self.msg_gb1[group_idx].to(dt)
+        mg_gs2 = self.msg_gs2[group_idx].to(dt)
+        mg_gb2 = self.msg_gb2[group_idx].to(dt)
+        # Inject (still per-group indexed)
+        inject_w = self.inject_w[group_idx].to(dt)
+        inject_b = self.inject_b[group_idx].to(dt)
+        # Modulator (per-cell)
+        mod_w1 = self.mod_w1.to(dt)
+        mod_b1 = self.mod_b1.to(dt)
+        mod_w2 = self.mod_w2.to(dt)
+        mod_b2 = self.mod_b2.to(dt)
 
         readouts = torch.empty(BS, T, self.config.D, device=H_aug.device, dtype=h.dtype)
         ema_decay = self.config.hebbian_ema_decay
@@ -657,10 +671,9 @@ class MemoryGraph(nn.Module):
 
             run_block = lambda h_, msg_, w_conn_, decay_, ctx_, border_, hebb_: self._run_block(
                 h_, msg_, w_conn_, decay_, ctx_, border_, hebb_,
-                block_H_aug, start_t, identity,
-                inject_w, inject_b,
-                st_w1, st_b1, st_w2, st_b2,
-                mg_w1, mg_b1, mg_w2, mg_b2,
+                block_H_aug, start_t, identity, inject_w, inject_b,
+                st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
+                mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
                 mod_w1, mod_b1, mod_w2, mod_b2,
                 ema_decay,
             )

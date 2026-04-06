@@ -47,6 +47,7 @@ class Config:
     # === Training ===
     T: int = 128  # tokens per segment
     mem_lr_scale: float = 0.3
+    compile_step: bool = True  # torch.compile the per-step function
     tbptt_block: int = 8
     checkpoint_every: int = 8
 
@@ -115,7 +116,7 @@ class Config:
             border_per_cell=4, mlp_groups=4, cell_mod_hidden=16,
             modulation_interval=2, tbptt_block=4, checkpoint_every=4,
             state_mlp_hidden=32, msg_mlp_hidden=32,
-            pcm_hidden=32, structural_plasticity=False,
+            pcm_hidden=32, structural_plasticity=False, compile_step=False,
         )
         defaults.update(kw)
         c = cls(**defaults)
