@@ -13,6 +13,10 @@ def _tiny_config(**kw):
 
 
 class TestForwardBackward:
+    def test_invalid_checkpoint_config_is_rejected(self):
+        with pytest.raises(AssertionError):
+            Config.tier_a(checkpoint_every=4)
+
     def test_basic(self):
         config = _tiny_config()
         model = Model(config)

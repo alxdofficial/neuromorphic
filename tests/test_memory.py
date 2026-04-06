@@ -328,32 +328,6 @@ class TestStructuralPlasticity:
 
         assert torch.equal(mg.conn_idx_i32.cpu(), mg.conn_idx.cpu().to(torch.int32))
 
-        expected_offsets = torch.zeros_like(mg.src_edge_offsets)
-        expected_dst = torch.empty_like(mg.src_edge_dst)
-        expected_slot = torch.empty_like(mg.src_edge_slot)
-        edge_count = config.neurons_per_cell * config.K
-
-        for cell in range(config.N_cells):
-            counts = torch.bincount(
-                mg.conn_idx[cell].reshape(-1).cpu(),
-                minlength=config.neurons_per_cell,
-            ).to(torch.int32)
-            expected_offsets[cell, 1:] = counts.cumsum(dim=0)
-            cursor = expected_offsets[cell, :-1].clone()
-            for dst_idx in range(config.neurons_per_cell):
-                for slot_idx in range(config.K):
-                    src_idx = int(mg.conn_idx[cell, dst_idx, slot_idx].item())
-                    edge_idx = int(cursor[src_idx].item())
-                    expected_dst[cell, edge_idx] = dst_idx
-                    expected_slot[cell, edge_idx] = slot_idx
-                    cursor[src_idx] += 1
-
-            assert int(expected_offsets[cell, -1].item()) == edge_count
-
-        assert torch.equal(mg.src_edge_offsets.cpu(), expected_offsets.cpu())
-        assert torch.equal(mg.src_edge_dst.cpu(), expected_dst.cpu())
-        assert torch.equal(mg.src_edge_slot.cpu(), expected_slot.cpu())
-
 
 class TestGradientFlow:
     def test_grad_reaches_modulator(self):

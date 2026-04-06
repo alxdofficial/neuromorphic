@@ -112,13 +112,8 @@ class MemoryGraph(nn.Module):
         self._initialized = False
 
     def _rebuild_connectivity_buffers(self):
-        conn_idx_i32, src_edge_offsets, src_edge_dst, src_edge_slot = self._build_src_edge_buffers(
-            self.conn_idx)
         device = self.conn_idx.device
-        self.conn_idx_i32 = conn_idx_i32.to(device)
-        self.src_edge_offsets = src_edge_offsets.to(device)
-        self.src_edge_dst = src_edge_dst.to(device)
-        self.src_edge_slot = src_edge_slot.to(device)
+        self.conn_idx_i32 = self.conn_idx.to(device=device, dtype=torch.int32)
 
     @staticmethod
     def _build_src_edge_buffers(conn_idx: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -142,6 +137,93 @@ class MemoryGraph(nn.Module):
                     cursor[src_idx] += 1
 
         return conn_cpu.to(dtype=torch.int32), offsets, dst, slot
+
+    @staticmethod
+    def _plan_rewire_cpu(
+        conn_idx: Tensor,
+        hebb: Tensor,
+        msg_mag: Tensor,
+        n_swap: int,
+        n_exploit: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        conn_cpu = conn_idx.to(device="cpu", dtype=torch.long)
+        hebb_cpu = hebb.to(device="cpu", dtype=torch.float32)
+        msg_mag_cpu = msg_mag.to(device="cpu", dtype=torch.float32)
+
+        nc, cn, k = conn_cpu.shape
+        flat_hebb = hebb_cpu.reshape(-1)
+        _, prune_flat = flat_hebb.topk(n_swap, largest=False)
+        prune_cell = prune_flat // (cn * k)
+        rem = prune_flat % (cn * k)
+        prune_n = rem // k
+        prune_k = rem % k
+
+        rewired_mask = torch.zeros(nc, cn, k, dtype=torch.bool)
+        rewired_mask[prune_cell, prune_n, prune_k] = True
+
+        exists = torch.zeros(nc, cn, cn, dtype=torch.bool)
+        row_idx = torch.arange(cn)[None, :, None].expand(nc, -1, k)
+        cell_idx = torch.arange(nc)[:, None, None].expand_as(conn_cpu)
+        exists[cell_idx, row_idx, conn_cpu] = True
+        exists[prune_cell, prune_n, conn_cpu[prune_cell, prune_n, prune_k]] = False
+
+        row_ids = prune_cell * cn + prune_n
+        sort_idx = row_ids.argsort()
+        row_ids_sorted = row_ids[sort_idx]
+        prune_cell_sorted = prune_cell[sort_idx]
+        prune_n_sorted = prune_n[sort_idx]
+        prune_k_sorted = prune_k[sort_idx]
+        is_exploit_sorted = (sort_idx < n_exploit)
+        sorted_global = sort_idx
+
+        new_targets_sorted = torch.empty(n_swap, dtype=torch.long)
+        unique_rows, counts = row_ids_sorted.unique_consecutive(return_counts=True)
+        offset = 0
+
+        for count in counts.tolist():
+            row_slice = slice(offset, offset + count)
+            cell = int(prune_cell_sorted[row_slice.start].item())
+            neuron = int(prune_n_sorted[row_slice.start].item())
+            row_targets = new_targets_sorted[row_slice]
+
+            allowed = ~exists[cell, neuron]
+            allowed[neuron] = False
+            exploit_mask = is_exploit_sorted[row_slice]
+            n_row_exploit = int(exploit_mask.sum().item())
+
+            if n_row_exploit > 0:
+                scores = msg_mag_cpu[cell].masked_fill(~allowed, -float("inf"))
+                exploit_targets = scores.topk(n_row_exploit).indices
+                row_targets[exploit_mask] = exploit_targets
+                allowed[exploit_targets] = False
+
+            n_row_explore = count - n_row_exploit
+            if n_row_explore > 0:
+                candidates = allowed.nonzero(as_tuple=True)[0]
+                if candidates.numel() < n_row_explore:
+                    fallback = conn_cpu[cell, neuron, prune_k_sorted[row_slice][~exploit_mask]]
+                    explore_targets = fallback
+                elif n_row_explore == 1:
+                    rand_idx = torch.randint(candidates.numel(), (1,))
+                    explore_targets = candidates[rand_idx]
+                else:
+                    explore_targets = candidates[torch.randperm(candidates.numel())[:n_row_explore]]
+                row_targets[~exploit_mask] = explore_targets
+
+            offset += count
+
+        new_targets = torch.empty_like(new_targets_sorted)
+        new_targets[sorted_global] = new_targets_sorted
+        conn_cpu[prune_cell, prune_n, prune_k] = new_targets
+
+        modified_rows = unique_rows
+        row_cell = modified_rows // cn
+        row_neuron = modified_rows % cn
+        sorted_conn, order = conn_cpu[row_cell, row_neuron].sort(dim=-1)
+        conn_cpu[row_cell, row_neuron] = sorted_conn
+        row_rewired = rewired_mask[row_cell, row_neuron].gather(-1, order)
+
+        return conn_cpu, row_cell, row_neuron, order, row_rewired
 
     def _build_border_neighbor_cells(self) -> Tensor:
         neighbors = torch.full((self.N_cells, self.border_per_cell), -1, dtype=torch.int32)
@@ -292,9 +374,6 @@ class MemoryGraph(nn.Module):
             msg,
             w_conn,
             self.conn_idx,
-            self.src_edge_offsets,
-            self.src_edge_dst,
-            self.src_edge_slot,
         )
 
     def _receive_local_activated(self, msg: Tensor, w_conn: Tensor) -> Tensor:
@@ -302,9 +381,6 @@ class MemoryGraph(nn.Module):
             msg,
             w_conn,
             self.conn_idx,
-            self.src_edge_offsets,
-            self.src_edge_dst,
-            self.src_edge_slot,
         )
 
     def _inject(self, received: Tensor, H_aug_t: Tensor, inject_w: Tensor, inject_b: Tensor) -> Tensor:
@@ -530,7 +606,7 @@ class MemoryGraph(nn.Module):
                 st_w1, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
             )
-            hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx_i32, ema_decay)
+            hebbian = self._hebbian_next(msg_prev, msg, hebbian, self.conn_idx, ema_decay)
             readouts[:, offset] = readout
 
         return h, msg, w_conn, decay_logit, cell_context, border_gate_logit, hebbian, readouts
@@ -627,61 +703,36 @@ class MemoryGraph(nn.Module):
         NC, Cn, K = self.N_cells, self.C_n, self.K
         n_swap = max(1, int(NC * Cn * K * self.config.plasticity_pct))
         explore_frac = self.config.plasticity_exploration_frac
+        n_exploit = n_swap - int(n_swap * explore_frac)
         device = self.conn_idx.device
 
         with torch.no_grad():
             hebb = self.hebbian_traces.mean(dim=0)
-            flat_hebb = hebb.reshape(-1)
-            _, prune_flat = flat_hebb.topk(n_swap, largest=False)
-            prune_cell = prune_flat // (Cn * K)
-            rem = prune_flat % (Cn * K)
-            prune_n = rem // K
-            prune_k = rem % K
-            rewired_mask = torch.zeros(NC, Cn, K, dtype=torch.bool, device=device)
-            rewired_mask[prune_cell, prune_n, prune_k] = True
-
-            exists = torch.zeros(NC, Cn, Cn, dtype=torch.bool, device=device)
-            row_idx = torch.arange(Cn, device=device)[None, :, None].expand(NC, -1, K)
-            cell_idx = torch.arange(NC, device=device)[:, None, None].expand_as(self.conn_idx)
-            exists[cell_idx, row_idx, self.conn_idx] = True
-
             msg_mag = self.msg.detach().float().norm(dim=-1).mean(dim=0)
-            n_exploit = n_swap - int(n_swap * explore_frac)
-            new_targets = torch.empty(n_swap, dtype=torch.long, device=device)
+            conn_cpu, row_cell, row_neuron, order_cpu, row_rewired_cpu = self._plan_rewire_cpu(
+                self.conn_idx,
+                hebb,
+                msg_mag,
+                n_swap,
+                n_exploit,
+            )
 
-            for i in range(n_swap):
-                cell = prune_cell[i].item()
-                neuron = prune_n[i].item()
-                old_target = self.conn_idx[cell, neuron, prune_k[i]]
-                exists[cell, neuron, old_target] = False
+            row_cell = row_cell.to(device=device, dtype=torch.long)
+            row_neuron = row_neuron.to(device=device, dtype=torch.long)
+            order = order_cpu.to(device=device, dtype=torch.long)
+            row_rewired = row_rewired_cpu.to(device=device, dtype=torch.bool)
 
-                if i < n_exploit:
-                    scores = msg_mag[cell].clone()
-                    scores[exists[cell, neuron]] = -float("inf")
-                    scores[neuron] = -float("inf")
-                    target = scores.argmax().item()
-                else:
-                    candidates = (~exists[cell, neuron]).nonzero(as_tuple=True)[0]
-                    candidates = candidates[candidates != neuron]
-                    if len(candidates) == 0:
-                        target = old_target.item()
-                    else:
-                        target = candidates[torch.randint(len(candidates), (1,), device=device)].item()
+            old_w = self.w_conn[:, row_cell, row_neuron]
+            old_hebb = self.hebbian_traces[:, row_cell, row_neuron]
+            gather_idx = order.unsqueeze(0).expand(old_w.shape[0], -1, -1)
+            new_w = old_w.gather(-1, gather_idx)
+            new_hebb = old_hebb.gather(-1, gather_idx)
+            rewired_mask = row_rewired.unsqueeze(0).expand_as(new_w)
+            new_w.masked_fill_(rewired_mask, 0)
+            new_hebb.masked_fill_(rewired_mask, 0)
 
-                new_targets[i] = target
-                exists[cell, neuron, target] = True
-
-            self.conn_idx[prune_cell, prune_n, prune_k] = new_targets
-
-            modified_cells = prune_cell.unique()
-            for cell in modified_cells.tolist():
-                for neuron in prune_n[prune_cell == cell].unique().tolist():
-                    sorted_conn, order = self.conn_idx[cell, neuron].sort()
-                    self.conn_idx[cell, neuron] = sorted_conn
-                    self.w_conn[:, cell, neuron] = self.w_conn[:, cell, neuron][:, order]
-                    self.hebbian_traces[:, cell, neuron] = self.hebbian_traces[:, cell, neuron][:, order]
-                    row_rewired = rewired_mask[cell, neuron][order]
-                    self.w_conn[:, cell, neuron, row_rewired] = 0
-                    self.hebbian_traces[:, cell, neuron, row_rewired] = 0
+            self.conn_idx.copy_(conn_cpu.to(device=device, dtype=self.conn_idx.dtype))
+            self.w_conn[:, row_cell, row_neuron] = new_w
+            self.hebbian_traces[:, row_cell, row_neuron] = new_hebb
 
             self._rebuild_connectivity_buffers()

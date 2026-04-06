@@ -90,6 +90,12 @@ class Config:
         assert self.modulation_interval >= 1
         assert self.tbptt_block >= 1
         assert self.checkpoint_every >= 1
+        assert self.checkpoint_every >= self.tbptt_block, (
+            f"checkpoint_every ({self.checkpoint_every}) must be >= "
+            f"tbptt_block ({self.tbptt_block})")
+        assert self.checkpoint_every % self.tbptt_block == 0, (
+            f"checkpoint_every ({self.checkpoint_every}) must be a multiple of "
+            f"tbptt_block ({self.tbptt_block})")
         if self.D_embed == -1:
             self.D_embed = self.D
 
