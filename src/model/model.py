@@ -86,12 +86,6 @@ class Model(nn.Module):
         self.lm.detach_carries()
         self.memory.detach_states()
 
-        self._tokens_since_rewire += self._last_chunk_tokens
-        if self.config.structural_plasticity:
-            while self._tokens_since_rewire >= self.config.plasticity_interval:
-                self.memory.rewire_connections()
-                self._tokens_since_rewire -= self.config.plasticity_interval
-
     def runtime_state_dict(self) -> dict:
         return {
             "initialized": self._initialized,
