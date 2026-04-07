@@ -106,7 +106,6 @@ class TestModulator:
             torch.zeros(BS, mg.N_cells, 1, dtype=dt),   # readout_drift
             torch.zeros(BS, dtype=dt),                   # s_mem_live
             torch.zeros(BS, dtype=dt),                   # s_mem_ema_fast
-            torch.zeros(BS, dtype=dt),                   # s_progress
         )
 
     def test_near_zero_deltas_at_init(self):
@@ -115,9 +114,8 @@ class TestModulator:
         decay_before = mg.decay_logit.clone()
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
-        new_W, new_dec, new_ctx, new_border = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
-            mg.border_gate_logit,
+        new_W, new_dec = mg._modulate_cells(
+            mg.h, mg.msg, mg.W, mg.decay_logit,
             *surp,
             *mod_args)
         dw = (new_W - W_before).float().abs().max().item()
@@ -129,9 +127,9 @@ class TestModulator:
         mg, config = _make_graph()
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
-        new_W, _, _, _ = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
-            mg.border_gate_logit, *surp, *mod_args)
+        new_W, _ = mg._modulate_cells(
+            mg.h, mg.msg, mg.W, mg.decay_logit,
+            *surp, *mod_args)
         assert new_W.shape == mg.W.shape
 
 
@@ -143,9 +141,8 @@ class TestInjectReadout:
         received = torch.zeros(
             BS, config.N_cells, config.neurons_per_cell, config.D_n,
             dtype=torch.bfloat16)
-        gi = mg.cell_to_group
-        inject_w = mg.inject_w[gi].to(torch.bfloat16)
-        inject_b = mg.inject_b[gi].to(torch.bfloat16)
+        inject_w = mg.inject_w.to(torch.bfloat16)
+        inject_b = mg.inject_b.to(torch.bfloat16)
         result = mg._inject(received, H_aug_t, inject_w, inject_b)
 
         assert result[:, :, :config.alpha].abs().sum() > 0
@@ -192,19 +189,6 @@ class TestWDecay:
         expected = (1.0 - config.w_decay_rate) ** config.T
         assert ratio < 1.0, f"W did not decay (ratio={ratio:.4f})"
         assert ratio < expected + 0.01, f"W decayed less than expected ({ratio:.4f} vs {expected:.4f})"
-
-
-class TestBorderExchange:
-    def test_border_exchange_shape(self):
-        mg, config = _make_graph()
-        BS = 2
-        dt = torch.bfloat16
-        msg = torch.randn(
-            BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
-        border_gate = torch.sigmoid(torch.zeros(
-            BS, config.N_cells, config.border_per_cell, dtype=dt)).unsqueeze(-1)
-        result = mg._border_exchange(msg, border_gate)
-        assert result.shape == (BS, config.N_cells, config.border_per_cell, config.D_n)
 
 
 class TestGradientFlow:

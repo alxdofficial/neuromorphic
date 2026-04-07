@@ -71,10 +71,9 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
             decay_mean = torch.sigmoid(mg.decay_logit).float().mean().item()
             s_mem = mg.s_mem_live.float().mean().item()
             s_fast = mg.s_mem_ema_fast.float().mean().item()
-            s_slow = mg.s_mem_ema_slow.float().mean().item()
         else:
             h_norm = msg_norm = W_norm = W_sparsity = W_max = 0
-            decay_mean = s_mem = s_fast = s_slow = 0
+            decay_mean = s_mem = s_fast = 0
 
         # Check for explosions
         flags = []
@@ -100,7 +99,7 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
                   f"lm_gn={lm_grad_norm:.3f} mem_gn={mem_grad_norm:.3f} | "
                   f"h={h_norm:.1f} msg={msg_norm:.1f} W={W_norm:.1f} "
                   f"W_sp={W_sparsity:.2f} W_max={W_max:.3f} "
-                  f"dec={decay_mean:.3f} s_mem={s_mem:.2f} fast={s_fast:.2f} slow={s_slow:.2f} | "
+                  f"dec={decay_mean:.3f} s_mem={s_mem:.2f} fast={s_fast:.2f} | "
                   f"{flag_str}")
 
     print()

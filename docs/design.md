@@ -30,11 +30,11 @@ tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                  │  (2) if t % 4 == 0: modulate cells             │
                  │        sees fresh s_mem_live + EMAs +          │
                  │              readout_drift + cell state        │
-                 │        updates W, decay, context, border       │
+                 │        updates W, decay, context                │
                  │                                                 │
                  │  (3) memory_step(H_mid[t])                     │
                  │        W @ msg (dense bmm)                     │
-                 │        + inject + border exchange              │
+                 │        + inject                                │
                  │        + state MLP + decay blend               │
                  │        + message MLP + identity                │
                  │        → readout[t]                            │
@@ -105,15 +105,13 @@ input_ids[t] ───────┘                                   │
                                                          ▼
                                        s_mem_live(t) = -logit[x_t]
                                                          │
-                             ┌─── EMA (in-block) ────────┴──────┐
-                       s_mem_ema_fast                    s_mem_ema_slow
-                             │                                  │
-                             └───── slow - fast → s_progress ───┘
-                                                                │
+                                  ┌─── EMA (in-block) ───┘
+                            s_mem_ema_fast
+                                  │
 readout[t] ─→ reshape cell ─→ |cell[t] - prev_cell| → readout_drift
-                                                                │
-                                              ┌─────────────────┘
-                                              ▼
+                                  │                            │
+                                  └────────────┬───────────────┘
+                                               ▼
                                         per-cell modulator
                                     (global scalars broadcast,
                                      per-cell readout_drift local)
@@ -123,19 +121,16 @@ readout[t] ─→ reshape cell ─→ |cell[t] - prev_cell| → readout_drift
   unnormalized log-prob of the observed token). Computed inside the
   per-token loop from `prev_readout` (readout at `t-1`) and `input_ids[t]`.
   Lower = memory is confident, higher = memory was surprised.
-- **`s_mem_ema_fast / s_mem_ema_slow`**: EMAs of `s_mem_live`, updated
-  per-token in the compiled block, with decays `gain_ema_fast=0.3` and
-  `gain_ema_slow=0.05` (effective horizons ≈ 3 and 20 tokens).
-- **`s_progress = s_mem_ema_slow - s_mem_ema_fast`**: positive when fast
-  is lower than slow, i.e. memory's short-term prediction error is
-  *below* its long-term average — learning progress. The
-  Schmidhuber-style curiosity signal built from the memory-head loss.
+- **`s_mem_ema_fast`**: short-horizon EMA of `s_mem_live`, updated
+  per-token in the compiled block with `gain_ema_fast=0.3` (≈ 3-token
+  effective horizon). Gives the modulator a smoothed reference next to
+  the spiky live signal.
 - **`readout_drift`**: per-cell local state churn —
   `mean(|readout_cell[t] - readout_cell[t-1]|)` per cell. Updated after
   every memory step. This is the only per-cell surprise channel; the
-  three `s_mem_*` scalars are broadcast to every cell.
+  two `s_mem_*` scalars are broadcast to every cell.
 
-The in-loop computation is `no_grad`, so these four signals are detached
+The in-loop computation is `no_grad`, so these signals are detached
 inputs to the modulator. The training gradient for memory comes from
 `mem_pred_loss` at segment end (see below), not from the in-loop path.
 
@@ -153,7 +148,7 @@ At segment end, the memory head's full CE is computed over all T tokens,
 shifted = concat([prev_readout_at_segment_start, readouts[:, :-1]])  # [BS, T, D]
 
 loss_sum = 0
-for s in range(0, T, block_size):                # block_size = checkpoint_every = 8
+for s in range(0, T, block_size):                # block_size = tbptt_block = 8
     sub_logits = lm.mem_head_logits(shifted[:, s:s+block_size])  # [BS, 8, V]
     loss_sum += F.cross_entropy(
         sub_logits.reshape(-1, V), input_ids[:, s:s+block_size].reshape(-1),
@@ -188,22 +183,17 @@ Gradient flow:
 | Scan recurrence dim | d_inner | 1200 | config.d_inner |
 | Neuron hidden dim | D_n | 256 | config.D_n |
 | Cells | N_cells | 8 | D // D_n |
-| Grid | H × W | 2 × 4 | config.grid_h × grid_w |
 | Neurons per cell | Cn | 32 | config.neurons_per_cell |
 | Total neurons | N | 256 | N_cells × Cn |
 | Ports per cell | alpha | 4 | config.alpha |
-| Border neurons per cell | B | 4 | config.border_per_cell |
-| MLP groups (inject only) | G | 8 | config.mlp_groups |
 | State MLP hidden | Hs | 256 | config.state_mlp_hidden |
 | Msg MLP hidden | Hm | 256 | config.msg_mlp_hidden |
 | Modulator hidden | Hmod | 2048 | config.cell_mod_hidden |
 | Modulation interval | M | 4 | config.modulation_interval |
 | TBPTT block | — | 8 | config.tbptt_block |
-| Checkpoint every | — | 8 | config.checkpoint_every |
 | W decay rate | — | 1e-3 | config.w_decay_rate |
 | mem_pred_weight | — | 0.1 | config.mem_pred_weight |
 | gain_ema_fast | — | 0.3 | config.gain_ema_fast |
-| gain_ema_slow | — | 0.05 | config.gain_ema_slow |
 
 ## Memory Graph
 
@@ -225,23 +215,21 @@ output that produced W via the persistence path ("write now, help later").
 
 Per-cell MLP, runs every `modulation_interval=4` steps.
 
-**Input** `[BS, NC, mod_in = 3*D_n + 6 = 774]`:
+**Input** `[BS, NC, mod_in = 2*D_n + 5 = 517]`:
 ```python
-cat([h_mean, msg_mean, cell_context,       # 3*D_n — per-cell state
+cat([h_mean, msg_mean,                     # 2*D_n — per-cell state
      W_stats, decay_mean,                   # 2     — per-cell stats
      readout_drift,                          # 1     — per-cell local surprise
-     s_mem_live, s_mem_ema_fast, s_progress # 3     — global surprise, broadcast
+     s_mem_live, s_mem_ema_fast,             # 2     — global surprise, broadcast
 ])
 ```
 
 **Hidden**: `[BS, NC, Hmod=2048]` (tanh activation, per-cell einsum)
 
-**Output** `[BS, NC, mod_out=1316]`:
+**Output** `[BS, NC, mod_out=1056]`:
 ```python
 delta_W:      [BS, NC, N*N=1024]  → reshape to [BS, NC, 32, 32]  (direct)
 delta_decay:  [BS, NC, N=32]
-delta_ctx:    [BS, NC, D_n=256]
-delta_border: [BS, NC, B=4]
 ```
 
 ### Cell Layout
@@ -249,20 +237,15 @@ delta_border: [BS, NC, B=4]
 ```
 [0 : 4)      — input port neurons
 [4 : 8)      — output port neurons
-[8 : 12)     — border neurons
-[12 : 32)    — internal neurons
+[8 : 32)    — internal neurons
 ```
 
 ### Inject
 
 H_mid_t `[BS, D=2048]` reshaped to `[BS, NC=8, D_n=256]`, projected
-through per-group `inject_w: [G=8, alpha*D_n, D_n]` with orthogonal
-init, added to input port neuron positions. No surprise augmentation —
-H_mid flows in directly.
-
-### Border Exchange
-
-Grid-reshape + slice shifts (N/S/E/W). Vectorized.
+through per-cell `inject_w: [N_cells=8, alpha*D_n, D_n]`, added to
+input port neuron positions. No surprise augmentation — H_mid flows
+in directly.
 
 ### State Update
 
@@ -295,11 +278,8 @@ h                  : [BS, NC, Cn, D_n]     — neuron hidden states
 msg                : [BS, NC, Cn, D_n]     — neuron messages
 W                  : [BS, NC, Cn, Cn]      — connectivity matrix
 decay_logit        : [BS, NC, Cn]          — per-neuron temporal decay
-cell_context       : [BS, NC, D_n]         — per-cell context
-border_gate_logit  : [BS, NC, B]           — cross-cell gates
 s_mem_live         : [BS]                   — current memory-head surprise
 s_mem_ema_fast     : [BS]                   — fast EMA
-s_mem_ema_slow     : [BS]                   — slow EMA
 prev_readout       : [BS, D]                — last readout (for memory head)
 prev_readout_cell  : [BS, NC, D_n]          — last per-cell readout (for drift)
 ```
@@ -314,12 +294,12 @@ Detached at TBPTT boundaries.
 | neuron_id | [NC=8, Cn=32, D_n=256] | 65K | Per-neuron identity |
 | state_w1/b1/w2/b2 | — | 198K | Shared state MLP |
 | msg_w1/b1/w2/b2 | — | 131K | Shared message MLP |
-| inject_w | [G=8, alpha*D_n, D_n] | 2.1M | Per-group orthogonal init |
-| inject_b | [G=8, alpha*D_n] | 8K | |
-| mod_w1 | [NC=8, 774, 2048] | 12.7M | Per-cell modulator layer 1 |
+| inject_w | [NC=8, alpha*D_n, D_n] | 2.1M | Per-cell, kaiming init |
+| inject_b | [NC=8, alpha*D_n] | 8K | |
+| mod_w1 | [NC=8, 517, 2048] | 8.5M | Per-cell modulator layer 1 |
 | mod_b1 | [NC=8, 2048] | 16K | |
-| mod_w2 | [NC=8, 2048, 1316] | 21.6M | Per-cell modulator layer 2 |
-| mod_b2 | [NC=8, 1316] | 11K | |
+| mod_w2 | [NC=8, 2048, 1056] | 17.3M | Per-cell modulator layer 2 |
+| mod_b2 | [NC=8, 1056] | 8K | |
 | **Memory total** | | **~36.8M** | |
 | **LM total** | | **~67.3M** | |
 | **Grand total** | | **~104.1M** | |
@@ -344,10 +324,13 @@ total_loss = ce_loss + mem_pred_weight * mem_pred_loss
 
 ### Gradient Boundaries
 
-- `H_mid.detach()` before memory: LM lower scan is isolated from the
-  memory path. This means `mem_pred_loss` cannot leak into the LM scan
-  layers — the LM is trained purely by `ce_loss`. Verified: after
-  backward on `aux_loss` alone, `lm.proj_in.weight.grad == 0`.
+- `H_mid.detach()` before memory: the **LM scan layers** are isolated
+  from the memory path. `mem_pred_loss` cannot reach scan-layer weights
+  — verified: after backward on `aux_loss` alone, scan layer grads are
+  zero. Note that `lm_head` is weight-tied to `embedding` and shared
+  with the memory head, so `aux_loss` *does* reach `embedding.weight`
+  and `proj_down`/`ln_final`. This is intended: memory and LM predict
+  into the same vocabulary projection and co-adapt that shared space.
 - `prev_readout_cell`, `s_mem_*` are detached (no_grad EMAs).
 - TBPTT detach every 8 tokens.
 
@@ -365,20 +348,20 @@ total_loss = ce_loss + mem_pred_weight * mem_pred_loss
 
 ### Block structure
 
-- TBPTT: detach all state every `tbptt_block=8` tokens
-- Checkpointing: checkpoint blocks of `checkpoint_every=8` tokens
+- TBPTT: detach all state and unroll the loop every `tbptt_block=8` tokens
+- Optional activation checkpointing on each block (`checkpoint_memory=False`)
 - Modulation: every `modulation_interval=4` tokens
 
 ## Initialization
 
 - **W**: sparse random (K=8 nonzeros per row, value 0.1, no self-connections)
 - **h**: small random (N(0, 0.01))
-- **msg, decay_logit, cell_context, border_gate_logit**: zeros
-- **s_mem_live, s_mem_ema_fast, s_mem_ema_slow**: zeros
+- **msg, decay_logit**: zeros
+- **s_mem_live, s_mem_ema_fast**: zeros
 - **prev_readout, prev_readout_cell**: zeros
 - **mem_scale**: sqrt(alpha) = 2.0
 - **mod_w2**: small init (× 0.01)
-- **inject_w**: per-port orthogonal blocks
+- **inject_w**: kaiming uniform
 
 ## Performance
 
