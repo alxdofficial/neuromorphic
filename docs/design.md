@@ -20,37 +20,53 @@ tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                                        │
                            ┌───────────┘
                            ▼
-                 ┌─── per-token loop (t = 0..T-1) ───┐
-                 │                                     │
-                 │  memory_step(H_mid[t])              │
-                 │     → W @ msg (dense bmm)           │
-                 │     → inject + border exchange      │
-                 │     → state MLP + decay blend       │
-                 │     → message MLP + identity        │
-                 │     → readout[t]                    │
-                 │                                     │
-                 │  (every 4 steps: modulate)          │
-                 │                                     │
-                 └─────────────────────────────────────┘
+                 ┌─── per-token loop (t = 0..T-1) ───────────────┐
+                 │                                                 │
+                 │  (1) live surprise (no_grad)                   │
+                 │        logit = mem_head(prev_readout)[x_t]     │
+                 │        s_mem_live = -logit                     │
+                 │        update s_mem_ema_fast/slow              │
+                 │                                                 │
+                 │  (2) if t % 4 == 0: modulate cells             │
+                 │        sees fresh s_mem_live + EMAs +          │
+                 │              readout_drift + cell state        │
+                 │        updates W, decay, context, border       │
+                 │                                                 │
+                 │  (3) memory_step(H_mid[t])                     │
+                 │        W @ msg (dense bmm)                     │
+                 │        + inject + border exchange              │
+                 │        + state MLP + decay blend               │
+                 │        + message MLP + identity                │
+                 │        → readout[t]                            │
+                 │                                                 │
+                 │  (4) update readout_drift and prev_readout     │
+                 │                                                 │
+                 │  (5) W *= (1 - w_decay_rate)                   │
+                 │                                                 │
+                 └─────────────────────────────────────────────────┘
                            │
                            ▼
          H_enriched = H_mid + mem_scale * readouts
-                           │
-                           ├──→ memory head = lm_head(readouts)
-                           │      → mem_pred_loss (segment-level CE)
-                           │      → live s_mem (per-token, updates EMAs)
                            │
                            ▼
                  upper scan → H_upper[0..T-1]
                            │
                            ▼
                         LM head → logits
+
+At segment end:
+   mem_pred_loss = chunked CE(mem_head(shifted_readouts), input_ids)
+                   — trains memory to carry prediction-useful info
+                   — on the autograd graph, backprops through readouts
 ```
 
-Note: H_enriched uses raw H_mid (no surprise augmentation MLP). Memory
-predicts tokens directly via a weight-tied head. The memory head's CE is
-both the auxiliary training loss *and* the source of the surprise signal
-that drives the modulator.
+Notes:
+- H_enriched uses raw H_mid (no surprise augmentation MLP).
+- The in-loop s_mem computation is `torch.no_grad()` — it's a detached
+  signal fed to the modulator. The training gradient comes from the
+  segment-level mem_pred_loss, which flows through the readouts into
+  memory (modulator, state/msg MLPs, inject) and through the tied
+  lm_head weight.
 
 ## Why the memory-prediction head
 
@@ -77,62 +93,77 @@ backprop through the memory head's CE loss teaches it what to remember.
 
 ## Surprise Pipeline
 
-All signals are scalars per batch sample (or per cell for `readout_drift`).
+All four surprise channels are computed inside the compiled `_run_block`,
+per token, under `torch.no_grad()`. The modulator at the next modulation
+step reads them fresh from within the same compiled graph — there is no
+post-block Python update loop.
 
 ```
-                          ┌─ mem head = lm_head(readout[t-1]) ─┐
-memory readout ───────────┤                                     ├─→ logit[x_t]
-                          └─ (weight-tied projection)           ┘
-                                                                    │
-                                       s_mem_live(t) = -logit[x_t] ─┘
-                                                           │
-                                         ┌──── EMA ────────┴────────┐
-                                   s_mem_ema_fast         s_mem_ema_slow
-                                         │                          │
-                                         └──── slow - fast → s_progress
-                                                                    │
-readout reshape-to-cell → ||readout_cell[t] - prev_readout_cell|| → readout_drift
-                                                                    │
-                                                         ┌──────────┘
+prev_readout[t-1] ──┐
+                    ├──→ mem_head (weight-tied) ──→ logit[x_t]
+input_ids[t] ───────┘                                   │
                                                          ▼
-                                                   per-cell modulator
-                                                   (broadcast 3 global
-                                                    scalars to each cell)
+                                       s_mem_live(t) = -logit[x_t]
+                                                         │
+                             ┌─── EMA (in-block) ────────┴──────┐
+                       s_mem_ema_fast                    s_mem_ema_slow
+                             │                                  │
+                             └───── slow - fast → s_progress ───┘
+                                                                │
+readout[t] ─→ reshape cell ─→ |cell[t] - prev_cell| → readout_drift
+                                                                │
+                                              ┌─────────────────┘
+                                              ▼
+                                        per-cell modulator
+                                    (global scalars broadcast,
+                                     per-cell readout_drift local)
 ```
 
 - **`s_mem_live`**: instant per-token memory-head surprise (negative
-  unnormalized log-prob of the observed token under the memory head).
-  Lower = memory is confident. Higher = memory was surprised.
-- **`s_mem_ema_fast / s_mem_ema_slow`**: EMAs of `s_mem_live`, with decays
-  `gain_ema_fast=0.3` / `gain_ema_slow=0.05` (effective horizons ≈ 3 and 20
-  tokens).
-- **`s_progress = s_mem_ema_slow - s_mem_ema_fast`**: positive when fast is
-  lower than slow, i.e., when memory's short-term prediction error is
-  *below* its long-term average — learning progress. Literally the
-  Schmidhuber-style curiosity signal, constructed from the memory-head
-  loss instead of a separate world model.
+  unnormalized log-prob of the observed token). Computed inside the
+  per-token loop from `prev_readout` (readout at `t-1`) and `input_ids[t]`.
+  Lower = memory is confident, higher = memory was surprised.
+- **`s_mem_ema_fast / s_mem_ema_slow`**: EMAs of `s_mem_live`, updated
+  per-token in the compiled block, with decays `gain_ema_fast=0.3` and
+  `gain_ema_slow=0.05` (effective horizons ≈ 3 and 20 tokens).
+- **`s_progress = s_mem_ema_slow - s_mem_ema_fast`**: positive when fast
+  is lower than slow, i.e. memory's short-term prediction error is
+  *below* its long-term average — learning progress. The
+  Schmidhuber-style curiosity signal built from the memory-head loss.
 - **`readout_drift`**: per-cell local state churn —
-  `mean(|readout_cell[t] - readout_cell[t-1]|)` per cell. Captures how
-  much each cell's output is moving. Updated after every memory step.
+  `mean(|readout_cell[t] - readout_cell[t-1]|)` per cell. Updated after
+  every memory step. This is the only per-cell surprise channel; the
+  three `s_mem_*` scalars are broadcast to every cell.
+
+The in-loop computation is `no_grad`, so these four signals are detached
+inputs to the modulator. The training gradient for memory comes from
+`mem_pred_loss` at segment end (see below), not from the in-loop path.
 
 At inference (no backprop), the modulator continues to take writes driven
 by these signals. No external reward, no RL, no labels needed.
 
 ## Memory-prediction Head Loss
 
-At segment end, the memory head's full CE is computed over all T tokens:
+At segment end, the memory head's full CE is computed over all T tokens,
+**chunked along the time axis** to keep peak VRAM bounded (the full
+`[BS, T, V]` logits tensor is never materialized at once):
 
 ```python
+# Shift readouts: memory head uses readout[t-1] to predict input_ids[t].
 shifted = concat([prev_readout_at_segment_start, readouts[:, :-1]])  # [BS, T, D]
-mem_logits = lm.mem_head_logits(shifted)                              # [BS, T, V]
-mem_pred_loss = F.cross_entropy(mem_logits.reshape(-1, V),
-                                 input_ids.reshape(-1))
+
+loss_sum = 0
+for s in range(0, T, block_size):                # block_size = checkpoint_every = 8
+    sub_logits = lm.mem_head_logits(shifted[:, s:s+block_size])  # [BS, 8, V]
+    loss_sum += F.cross_entropy(
+        sub_logits.reshape(-1, V), input_ids[:, s:s+block_size].reshape(-1),
+        reduction="sum")
+mem_pred_loss = loss_sum / (BS * T)
 ```
 
-The memory head uses `readout[t-1]` to predict the token at position `t`.
-`prev_readout_at_segment_start` carries over from the previous segment,
-so the first token of each segment has a meaningful prediction (no "free"
-loss).
+`prev_readout_at_segment_start` is the previous segment's final readout,
+so the first token of each segment has a meaningful prediction — no
+"free" loss on the first position.
 
 `mem_pred_loss` is added to the total loss with weight `mem_pred_weight=0.1`:
 
@@ -352,10 +383,12 @@ total_loss = ce_loss + mem_pred_weight * mem_pred_loss
 ## Performance
 
 BS=96, tier_a, RTX 4090:
-- 235 ms/step, **52.1K tok/s**, 22.2 GB
+- 235 ms/step, **52.3K tok/s**, 22.3 GB
 - Training time estimates: 0.75B tokens ≈ 4h, 1.5B tokens ≈ 8h
 
 The cost relative to the PCM-based predecessor (57K tok/s) comes from the
-segment-level full-vocab CE on `[BS, T, V]` readout logits. The simplification
-is worth it: no PCM, no split_mlp, no surprise_proj, no detach gymnastics,
-and the surprise signal is principled and interpretable.
+segment-level memory-head CE on `[BS, T, V]` readout logits — chunked
+over time to keep peak VRAM bounded but still the dominant new cost. The
+architectural simplification is worth it: no PCM, no split_mlp, no
+surprise_proj, no detach gymnastics, and the surprise signal is
+principled, interpretable, and genuinely live in the per-token loop.
