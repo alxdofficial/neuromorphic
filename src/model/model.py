@@ -32,6 +32,7 @@ class Model(nn.Module):
         input_ids: Tensor,
         target_ids: Tensor | None = None,
         use_memory: bool = True,
+        prev_token: Tensor | None = None,
     ) -> dict:
         BS, T = input_ids.shape
         device = input_ids.device
@@ -40,12 +41,18 @@ class Model(nn.Module):
             self.memory.initialize_states(BS, device)
             self._initialized = True
 
-        # Build LM reset mask: reset scan carry at positions after EOT tokens.
+        # Build LM reset mask: reset scan carry at positions following EOT tokens.
         # Memory does NOT reset (lifelong). Only the LM scan resets.
+        # prev_token is the last input token from the previous chunk — if it was
+        # EOT, position 0 of this chunk must be reset.
         eos_positions = (input_ids == self.config.eot_id)  # [BS, T]
-        internal_reset = torch.zeros_like(eos_positions)
-        internal_reset[:, 1:] = eos_positions[:, :-1]  # reset at t+1 after EOT
-        reset_mask = internal_reset if internal_reset.any() else None
+        reset_mask = torch.zeros_like(eos_positions)
+        reset_mask[:, 1:] = eos_positions[:, :-1]  # reset at t+1 after in-chunk EOT
+        if prev_token is not None:
+            prev_token = prev_token.to(device)
+            reset_mask[:, 0] = (prev_token == self.config.eot_id)
+        if not reset_mask.any():
+            reset_mask = None
 
         # 1. Lower scan with EOT reset
         H_mid = self.lm.forward_scan_lower(input_ids, reset_mask=reset_mask)

@@ -455,9 +455,10 @@ class MemoryGraph(nn.Module):
                 readout_ema = ema_decay * readout_ema + (1 - ema_decay) * readout_cell.detach()
             prev_readout = readout.detach()
 
-            # Soft W decay
-            with torch.no_grad():
-                W = W * (1.0 - w_decay_rate)
+            # Soft W decay (kept on the autograd graph so loss at later tokens
+            # can train the modulator output that produced W — the "write now,
+            # help later" credit path flows through the persistence of W).
+            W = W * (1.0 - w_decay_rate)
 
         pcm_loss = pcm_loss_accum / max(pcm_count, 1)
         return (h, msg, W, decay_logit, cell_context, border_gate_logit,

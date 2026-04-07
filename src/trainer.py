@@ -43,6 +43,9 @@ class Trainer:
         self.model.train()
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
+        prev_token = getattr(batch, "prev_token", None)
+        if prev_token is not None:
+            prev_token = prev_token.to(self.device, non_blocking=True)
         BS, T = input_ids.shape
 
         t_start = time.time()
@@ -54,7 +57,8 @@ class Trainer:
         with amp_ctx:
             result = self.model.forward_chunk(
                 input_ids, target_ids=target_ids,
-                use_memory=self.use_memory)
+                use_memory=self.use_memory,
+                prev_token=prev_token)
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
