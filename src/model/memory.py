@@ -239,16 +239,21 @@ class MemoryGraph(nn.Module):
         return border_gate * incoming
 
     def _mlp2(self, x, w1, b1, w2, b2):
-        """Two-layer MLP: F.linear → tanh → F.linear → tanh. No group conditioning."""
+        """Two-layer MLP: F.linear → tanh → F.linear → tanh."""
         flat = x.reshape(-1, x.shape[-1])
         hidden = torch.tanh(F.linear(flat, w1, b1))
         out = torch.tanh(F.linear(hidden, w2, b2))
         return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
     def _state_update(self, received, h, decay, one_minus_decay, identity,
-                      w1, b1, w2, b2):
-        state_input = torch.cat([received, h], dim=-1)
-        candidate = self._mlp2(state_input, w1, b1, w2, b2)
+                      w1_recv, w1_h, b1, w2, b2):
+        """State MLP with split first layer — avoids cat([received, h])."""
+        flat_recv = received.reshape(-1, received.shape[-1])
+        flat_h = h.reshape(-1, h.shape[-1])
+        hidden = torch.tanh(
+            F.linear(flat_recv, w1_recv) + F.linear(flat_h, w1_h, b1))
+        candidate = torch.tanh(F.linear(hidden, w2, b2))
+        candidate = candidate.reshape(h.shape)
         return decay * h + one_minus_decay * candidate
 
     def _emit_message(self, h, identity, w1, b1, w2, b2):
@@ -302,7 +307,7 @@ class MemoryGraph(nn.Module):
 
     def _step(self, h, msg, W, decay, one_minus_decay, border_gate,
               H_aug_t, identity, inject_w, inject_b,
-              st_w1, st_b1, st_w2, st_b2,
+              st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
               mg_w1, mg_b1, mg_w2, mg_b2):
         received = self._receive(msg, W)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
@@ -310,7 +315,7 @@ class MemoryGraph(nn.Module):
             msg, border_gate)
 
         h = self._state_update(received, h, decay, one_minus_decay, identity,
-                               st_w1, st_b1, st_w2, st_b2)
+                               st_w1_recv, st_w1_h, st_b1, st_w2, st_b2)
         msg = self._emit_message(h, identity, mg_w1, mg_b1, mg_w2, mg_b2)
         readout = self._readout(msg)
         return h, msg, readout
@@ -318,7 +323,7 @@ class MemoryGraph(nn.Module):
     def _run_block(self, h, msg, W, decay_logit, cell_context,
                    border_gate_logit,
                    block_H_aug, start_t, identity, inject_w, inject_b,
-                   st_w1, st_b1, st_w2, st_b2,
+                   st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate):
         block_T = block_H_aug.shape[1]
@@ -360,7 +365,7 @@ class MemoryGraph(nn.Module):
             h, msg, readout = self._step(
                 h, msg, W, decay, one_minus_decay, border_gate,
                 block_H_aug[:, offset], identity, inject_w, inject_b,
-                st_w1, st_b1, st_w2, st_b2,
+                st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
 
             readouts[:, offset] = readout
@@ -379,6 +384,9 @@ class MemoryGraph(nn.Module):
         BS, T, _ = H_aug.shape
         if not self._initialized:
             self.initialize_states(BS, H_aug.device)
+        if not self._compiled and H_aug.is_cuda:
+            self._step = torch.compile(self._step, mode="default", fullgraph=False)
+            self._compiled = True
 
         h = self.h
         msg = self.msg
@@ -392,7 +400,10 @@ class MemoryGraph(nn.Module):
 
         group_idx = self.cell_to_group
         dt = h.dtype
-        st_w1 = self.state_w1.to(dt)
+        # Split state_w1 into recv and h halves to avoid cat([received, h])
+        st_w1_full = self.state_w1.to(dt)
+        st_w1_recv = st_w1_full[:, :self.D_n].contiguous()
+        st_w1_h = st_w1_full[:, self.D_n:].contiguous()
         st_b1 = self.state_b1.to(dt)
         st_w2 = self.state_w2.to(dt)
         st_b2 = self.state_b2.to(dt)
@@ -418,7 +429,7 @@ class MemoryGraph(nn.Module):
             run_block = lambda h_, msg_, W_, dec_, ctx_, border_: self._run_block(
                 h_, msg_, W_, dec_, ctx_, border_,
                 block_H_aug, start_t, identity, inject_w, inject_b,
-                st_w1, st_b1, st_w2, st_b2,
+                st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate)
 

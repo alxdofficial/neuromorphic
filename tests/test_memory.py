@@ -124,10 +124,10 @@ class TestStateDecay:
             (BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt
         )).unsqueeze(-1)
 
-        args = (
-            mg.state_w1.to(dt), mg.state_b1.to(dt),
-            mg.state_w2.to(dt), mg.state_b2.to(dt),
-        )
+        w1 = mg.state_w1.to(dt)
+        w1_recv = w1[:, :config.D_n].contiguous()
+        w1_h = w1[:, config.D_n:].contiguous()
+        args = (w1_recv, w1_h, mg.state_b1.to(dt), mg.state_w2.to(dt), mg.state_b2.to(dt))
         one_minus_decay = 1.0 - decay
         h_new = mg._state_update(received, h_orig, decay, one_minus_decay, identity, *args)
         diff = (h_new - h_orig).float().abs().max().item()
