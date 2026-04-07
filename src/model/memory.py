@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import Config
+from .pcm import BatchedPCM
 
 
 class MemoryGraph(nn.Module):
@@ -28,6 +29,8 @@ class MemoryGraph(nn.Module):
         self.grid_h = config.grid_h
         self.grid_w = config.grid_w
         self.mod_rank = config.mod_rank
+        self.C = config.C
+        self.D_cc = config.D_cc
 
         self.input_lo = 0
         self.input_hi = self.alpha
@@ -86,6 +89,18 @@ class MemoryGraph(nn.Module):
         self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
         self.mod_w2 = nn.Parameter(torch.empty(self.N_cells, Hmod, config.mod_out))
         self.mod_b2 = nn.Parameter(torch.zeros(self.N_cells, config.mod_out))
+
+        # PCM (interleaved, per-token)
+        if config.pcm_enabled:
+            self.pcm = BatchedPCM(config.C, config.D_cc, hidden=config.pcm_hidden)
+        else:
+            self.pcm = None
+
+        # Surprise projection: compress surprise_ema + readout_ema for modulator
+        proj_dim = config.surprise_proj_dim
+        self.surprise_proj_w = nn.Parameter(torch.empty(proj_dim, 2 * config.D_n))
+        self.surprise_proj_b = nn.Parameter(torch.zeros(proj_dim))
+        nn.init.kaiming_uniform_(self.surprise_proj_w, a=math.sqrt(5))
 
         # Init weights
         for weight in (
@@ -158,6 +173,12 @@ class MemoryGraph(nn.Module):
             W[:, cell].diagonal(dim1=-2, dim2=-1).zero_()
         self.W = W
 
+        # Surprise state (NEW)
+        self.surprise_ema = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
+        self.readout_ema = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
+        self.prev_readout = torch.zeros(BS, self.config.D, device=device, dtype=dt)
+        self.prev_delta_hat = None  # set on first PCM call
+
         self._initialized = True
 
     def detach_states(self):
@@ -169,6 +190,9 @@ class MemoryGraph(nn.Module):
         self.decay_logit = self.decay_logit.detach()
         self.cell_context = self.cell_context.detach()
         self.border_gate_logit = self.border_gate_logit.detach()
+        # surprise_ema, readout_ema, prev_readout are already detached (EMA / no_grad)
+        if self.prev_delta_hat is not None:
+            self.prev_delta_hat = self.prev_delta_hat.detach()
 
     def reset_states(self, mask: Tensor):
         """Retained for API compatibility; memory is intended to be lifelong."""
@@ -266,19 +290,20 @@ class MemoryGraph(nn.Module):
         return readout.reshape(msg.shape[0], -1)
 
     def _modulate_cells(self, h, msg, W, decay_logit, cell_context,
-                        border_gate_logit, mod_w1, mod_b1, mod_w2, mod_b2):
+                        border_gate_logit, surprise_compressed,
+                        mod_w1, mod_b1, mod_w2, mod_b2):
         NC, N, r = self.N_cells, self.C_n, self.mod_rank
         D_n, B = self.D_n, self.border_per_cell
 
         h_mean = h.mean(dim=2)
         msg_mean = msg.mean(dim=2)
-        W_row_norms = W.abs().mean(dim=-1).mean(dim=2)  # [BS, NC] → expand to [BS, NC, N] → mean → [BS, NC]
-        # Actually: W is [BS, NC, N, N], mean over last dim → [BS, NC, N], mean over N → [BS, NC]
-        # But we want per-cell stats. Let's use row-wise L1 mean: [BS, NC, N] → mean → [BS, NC, 1]
         W_stats = W.abs().mean(dim=-1).mean(dim=2, keepdim=True)  # [BS, NC, 1]
         decay_mean = decay_logit.mean(dim=2, keepdim=True)  # [BS, NC, 1]
 
-        mod_input = torch.cat([h_mean, msg_mean, cell_context, W_stats, decay_mean], dim=-1)
+        mod_input = torch.cat([
+            h_mean, msg_mean, cell_context, W_stats, decay_mean,
+            surprise_compressed,  # [BS, NC, proj_dim]
+        ], dim=-1)
         hidden = torch.tanh(
             torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
         output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
@@ -321,22 +346,32 @@ class MemoryGraph(nn.Module):
         return h, msg, readout
 
     def _run_block(self, h, msg, W, decay_logit, cell_context,
-                   border_gate_logit,
-                   block_H_aug, start_t, identity, inject_w, inject_b,
+                   border_gate_logit, surprise_ema, readout_ema,
+                   prev_readout, prev_delta_hat,
+                   block_H_mid, augment_fn,
+                   start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
-                   mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate):
-        block_T = block_H_aug.shape[1]
-        readouts = torch.empty(
-            h.shape[0], block_T, self.config.D,
-            device=block_H_aug.device, dtype=h.dtype)
+                   mod_w1, mod_b1, mod_w2, mod_b2,
+                   surprise_proj_w, surprise_proj_b,
+                   w_decay_rate):
+        block_T = block_H_mid.shape[1]
+        BS = h.shape[0]
+        D = self.config.D
+        C, D_cc = self.C, self.D_cc
+        NC, D_n = self.N_cells, self.D_n
+        readouts = torch.empty(BS, block_T, D, device=block_H_mid.device, dtype=h.dtype)
+        pcm_loss_accum = torch.tensor(0.0, device=block_H_mid.device)
+        pcm_count = 0
 
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
         one_minus_decay = 1.0 - decay
         border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
+        ema_decay = self.config.surprise_ema_decay
 
         for offset in range(block_T):
             t = start_t + offset
+            H_mid_t = block_H_mid[:, offset]  # [BS, D]
 
             # TBPTT detach
             if t > 0 and (t % self.config.tbptt_block == 0):
@@ -350,41 +385,95 @@ class MemoryGraph(nn.Module):
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # Modulate
+            # --- PCM (interleaved) ---
+            if self.pcm is not None:
+                H_mid_cols = H_mid_t.reshape(BS, C, D_cc)
+                prev_readout_cols = prev_readout.reshape(BS, C, D_cc)
+                delta_hat = self.pcm.predict(H_mid_cols, prev_readout_cols)
+
+                if prev_delta_hat is not None and offset > 0:
+                    H_mid_prev_cols = block_H_mid[:, offset - 1].reshape(BS, C, D_cc)
+                    delta_actual = H_mid_cols - H_mid_prev_cols
+                    surprise_t = prev_delta_hat - delta_actual
+                    pcm_loss_accum = pcm_loss_accum + (
+                        prev_delta_hat - delta_actual.detach()).pow(2).mean()
+                    pcm_count += 1
+                else:
+                    surprise_t = torch.zeros(BS, C, D_cc, device=h.device, dtype=h.dtype)
+
+                prev_delta_hat = delta_hat
+
+                # Accumulate surprise EMA
+                surprise_cell = surprise_t.reshape(BS, NC, D_n)
+                with torch.no_grad():
+                    surprise_ema = ema_decay * surprise_ema + (1 - ema_decay) * surprise_cell.detach()
+
+                # Augment H_mid with surprise
+                surprise_flat = surprise_t.reshape(BS, D)
+                H_aug_t = augment_fn(H_mid_t, surprise_flat)
+            else:
+                H_aug_t = H_mid_t
+
+            # --- Modulate (with surprise_compressed) ---
             if t % self.config.modulation_interval == 0:
+                surp_input = torch.cat([
+                    surprise_ema.to(surprise_proj_w.dtype),
+                    readout_ema.to(surprise_proj_w.dtype),
+                ], dim=-1)
+                surprise_compressed = F.linear(
+                    surp_input, surprise_proj_w, surprise_proj_b)
                 W, decay_logit, cell_context, border_gate_logit = \
                     self._modulate_cells(
                         h, msg, W, decay_logit, cell_context,
-                        border_gate_logit,
+                        border_gate_logit, surprise_compressed,
                         mod_w1, mod_b1, mod_w2, mod_b2)
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # Step
+            # --- Memory step ---
             h, msg, readout = self._step(
                 h, msg, W, decay, one_minus_decay, border_gate,
-                block_H_aug[:, offset], identity, inject_w, inject_b,
+                H_aug_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
 
             readouts[:, offset] = readout
 
-            # Soft W decay (outside autograd)
+            # Update readout EMA
+            readout_cell = readout.reshape(BS, NC, D_n)
+            with torch.no_grad():
+                readout_ema = ema_decay * readout_ema + (1 - ema_decay) * readout_cell.detach()
+            prev_readout = readout.detach()
+
+            # Soft W decay
             with torch.no_grad():
                 W = W * (1.0 - w_decay_rate)
 
-        return h, msg, W, decay_logit, cell_context, border_gate_logit, readouts
+        pcm_loss = pcm_loss_accum / max(pcm_count, 1)
+        return (h, msg, W, decay_logit, cell_context, border_gate_logit,
+                surprise_ema, readout_ema, prev_readout, prev_delta_hat,
+                readouts, pcm_loss)
 
     # ================================================================
     # Main forward
     # ================================================================
 
-    def forward_segment(self, H_aug: Tensor) -> Tensor:
-        BS, T, _ = H_aug.shape
+    def forward_segment(self, H_mid: Tensor, augment_fn=None):
+        """Process T tokens with interleaved PCM + memory.
+
+        Args:
+            H_mid: [BS, T, D] — lower scan output (detached from LM graph)
+            augment_fn: callable(H_mid_t, surprise_t) → H_aug_t, or None
+
+        Returns:
+            readouts: [BS, T, D] — memory readout per token
+            pcm_loss: scalar — PCM prediction loss (for aux_loss)
+        """
+        BS, T, _ = H_mid.shape
         if not self._initialized:
-            self.initialize_states(BS, H_aug.device)
-        if not self._compiled and H_aug.is_cuda:
+            self.initialize_states(BS, H_mid.device)
+        if not self._compiled and H_mid.is_cuda:
             self._step = torch.compile(self._step, mode="default", fullgraph=False)
             self._compiled = True
 
@@ -394,13 +483,16 @@ class MemoryGraph(nn.Module):
         decay_logit = self.decay_logit
         cell_context = self.cell_context
         border_gate_logit = self.border_gate_logit
-        H_aug = H_aug.to(h.dtype)
+        surprise_ema = self.surprise_ema
+        readout_ema = self.readout_ema
+        prev_readout = self.prev_readout
+        prev_delta_hat = self.prev_delta_hat
+        H_mid = H_mid.to(h.dtype)
 
         identity = self._identity(BS, h.dtype, h.device)
 
         group_idx = self.cell_to_group
         dt = h.dtype
-        # Split state_w1 into recv and h halves to avoid cat([received, h])
         st_w1_full = self.state_w1.to(dt)
         st_w1_recv = st_w1_full[:, :self.D_n].contiguous()
         st_w1_h = st_w1_full[:, self.D_n:].contiguous()
@@ -417,42 +509,54 @@ class MemoryGraph(nn.Module):
         mod_b1 = self.mod_b1.to(dt)
         mod_w2 = self.mod_w2.to(dt)
         mod_b2 = self.mod_b2.to(dt)
+        surprise_proj_w = self.surprise_proj_w.to(dt)
+        surprise_proj_b = self.surprise_proj_b.to(dt)
 
-        readouts = torch.empty(BS, T, self.config.D, device=H_aug.device, dtype=dt)
+        if augment_fn is None:
+            augment_fn = lambda h_mid_t, surp_t: h_mid_t
+
+        readouts = torch.empty(BS, T, self.config.D, device=H_mid.device, dtype=dt)
         block_size = max(1, self.config.checkpoint_every)
         w_decay_rate = self.config.w_decay_rate
+        total_pcm_loss = torch.tensor(0.0, device=H_mid.device)
 
         for start_t in range(0, T, block_size):
             end_t = min(start_t + block_size, T)
-            block_H_aug = H_aug[:, start_t:end_t]
+            block_H_mid = H_mid[:, start_t:end_t]
 
-            run_block = lambda h_, msg_, W_, dec_, ctx_, border_: self._run_block(
-                h_, msg_, W_, dec_, ctx_, border_,
-                block_H_aug, start_t, identity, inject_w, inject_b,
+            # Note: surprise_ema, readout_ema, prev_readout, prev_delta_hat
+            # are NOT checkpointed — they're detached running stats.
+            # We pass them through but they don't carry gradient.
+            result = self._run_block(
+                h, msg, W, decay_logit, cell_context, border_gate_logit,
+                surprise_ema, readout_ema, prev_readout, prev_delta_hat,
+                block_H_mid, augment_fn,
+                start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
-                mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate)
+                mod_w1, mod_b1, mod_w2, mod_b2,
+                surprise_proj_w, surprise_proj_b,
+                w_decay_rate)
 
-            if self.training and block_size > 1:
-                h, msg, W, decay_logit, cell_context, border_gate_logit, block_out = (
-                    torch.utils.checkpoint.checkpoint(
-                        run_block,
-                        h, msg, W, decay_logit, cell_context, border_gate_logit,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                        determinism_check="none",
-                    ))
-            else:
-                h, msg, W, decay_logit, cell_context, border_gate_logit, block_out = (
-                    run_block(h, msg, W, decay_logit, cell_context, border_gate_logit))
+            (h, msg, W, decay_logit, cell_context, border_gate_logit,
+             surprise_ema, readout_ema, prev_readout, prev_delta_hat,
+             block_out, pcm_loss) = result
 
             readouts[:, start_t:end_t] = block_out
+            total_pcm_loss = total_pcm_loss + pcm_loss
 
+        # Save state
         self.h = h
         self.msg = msg
         self.W = W
         self.decay_logit = decay_logit
         self.cell_context = cell_context
         self.border_gate_logit = border_gate_logit
+        self.surprise_ema = surprise_ema
+        self.readout_ema = readout_ema
+        self.prev_readout = prev_readout
+        self.prev_delta_hat = prev_delta_hat
 
-        return readouts
+        n_blocks = T // block_size
+        avg_pcm_loss = total_pcm_loss / max(n_blocks, 1)
+        return readouts, avg_pcm_loss

@@ -1,11 +1,10 @@
-"""Top-level Model: LM + MemoryGraph.
+"""Top-level Model: LM + MemoryGraph with interleaved PCM.
 
 Training flow per chunk:
-  1. Lower scan + PCM → H_mid, surprise
-  2. Augment: split_mlp(H_mid, surprise) → H_aug
-  3. Memory graph: forward_segment(H_aug.detach()) → mem_out
-  4. Inject: H_aug + mem_scale * mem_out → H_enriched
-  5. Upper scan → logits
+  1. Lower scan → H_mid
+  2. Memory graph (with interleaved PCM): forward_segment(H_mid) → mem_out, pcm_loss
+  3. H_enriched = H_mid + mem_scale * mem_out (note: surprise augmentation happens inside memory)
+  4. Upper scan → logits
 """
 
 import torch
@@ -27,8 +26,6 @@ class Model(nn.Module):
         self.lm = LM(config)
         self.memory = MemoryGraph(config)
         self._initialized = False
-        self._tokens_since_rewire = 0
-        self._last_chunk_tokens = 0
 
     def forward_chunk(
         self,
@@ -38,31 +35,31 @@ class Model(nn.Module):
     ) -> dict:
         BS, T = input_ids.shape
         device = input_ids.device
-        self._last_chunk_tokens = BS * T if use_memory else 0
 
-        # Initialize memory on first call (MUST come before resets)
         if not self._initialized:
             self.memory.initialize_states(BS, device)
             self._initialized = True
 
-        # 1. Lower scan + PCM
-        H_mid, surprise, aux_loss = self.lm.forward_scan_lower(
-            input_ids, reset_mask=None)
+        # 1. Lower scan (PCM is now inside memory loop)
+        H_mid = self.lm.forward_scan_lower(input_ids, reset_mask=None)
 
-        # 2. Augment
-        H_aug = self.lm.augment(H_mid, surprise)
-
-        # 3. Memory graph
+        # 2. Memory graph with interleaved PCM
         if use_memory:
-            mem_out = self.memory.forward_segment(H_aug.detach())
-            H_enriched = self.lm.inject_memory(H_aug, mem_out)
-        else:
-            H_enriched = H_aug
+            # augment_fn: the LM's split_mlp applied per-token inside the memory loop
+            augment_fn = self.lm.augment_single if hasattr(self.lm, 'augment_single') else None
 
-        # 4. Upper scan
+            mem_out, pcm_loss = self.memory.forward_segment(
+                H_mid.detach(), augment_fn=augment_fn)
+            H_enriched = H_mid + self.lm.mem_scale * mem_out.to(H_mid.dtype)
+            aux_loss = self.config.pcm_pred_weight * pcm_loss
+        else:
+            H_enriched = H_mid
+            aux_loss = torch.tensor(0.0, device=device)
+
+        # 3. Upper scan
         H = self.lm.forward_scan_upper(H_enriched, reset_mask=None)
 
-        # 5. Output
+        # 4. Output
         logits = self.lm.forward_output(H)
 
         result = {"logits": logits, "aux_loss": aux_loss}
@@ -89,8 +86,6 @@ class Model(nn.Module):
     def runtime_state_dict(self) -> dict:
         return {
             "initialized": self._initialized,
-            "tokens_since_rewire": self._tokens_since_rewire,
-            "last_chunk_tokens": self._last_chunk_tokens,
             "lm": self.lm.runtime_state_dict(),
             "memory": self.memory.runtime_state_dict(),
         }
@@ -101,8 +96,6 @@ class Model(nn.Module):
         self.lm.load_runtime_state(state.get("lm", {}))
         self.memory.load_runtime_state(state.get("memory", {}))
         self._initialized = state.get("initialized", self.memory.is_initialized)
-        self._tokens_since_rewire = state.get("tokens_since_rewire", 0)
-        self._last_chunk_tokens = state.get("last_chunk_tokens", 0)
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())

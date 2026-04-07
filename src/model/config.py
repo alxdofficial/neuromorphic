@@ -38,6 +38,8 @@ class Config:
     mod_rank: int = 16  # rank of low-rank W updates
     modulation_interval: int = 4
     w_decay_rate: float = 1e-3  # soft sparsity: W *= (1 - rate) each step
+    surprise_proj_dim: int = 64  # compressed surprise dim for modulator input
+    surprise_ema_decay: float = 0.95
 
     # === Training ===
     T: int = 128  # tokens per segment
@@ -105,7 +107,7 @@ class Config:
             border_per_cell=4, mlp_groups=4, cell_mod_hidden=16,
             modulation_interval=2, tbptt_block=4, checkpoint_every=4,
             state_mlp_hidden=32, msg_mlp_hidden=32, mod_rank=4,
-            pcm_hidden=32, w_decay_rate=1e-3,
+            pcm_hidden=32, w_decay_rate=1e-3, surprise_proj_dim=8,
         )
         defaults.update(kw)
         c = cls(**defaults)
@@ -114,8 +116,8 @@ class Config:
 
     @property
     def mod_in(self) -> int:
-        """Per-cell modulator input: h_mean + msg_mean + ctx + W_stats + decay_mean."""
-        return 3 * self.D_n + 1 + 1
+        """Per-cell modulator input: h_mean + msg_mean + ctx + W_stats + decay_mean + surprise_compressed."""
+        return 3 * self.D_n + 1 + 1 + self.surprise_proj_dim
 
     @property
     def mod_out(self) -> int:

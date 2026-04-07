@@ -25,7 +25,7 @@ class TestShapes:
         mg, config = _make_graph()
         BS, T, D = 2, config.T, config.D
         H_aug = torch.randn(BS, T, D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         assert mem_out.shape == (BS, T, D)
 
     def test_readout_shape(self):
@@ -69,9 +69,12 @@ class TestModulator:
         W_before = mg.W.clone()
         decay_before = mg.decay_logit.clone()
 
+        surprise_compressed = torch.zeros(
+            2, config.N_cells, config.surprise_proj_dim, dtype=dt)
         new_W, new_dec, new_ctx, new_border = mg._modulate_cells(
             mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
-            mg.border_gate_logit, mod_w1, mod_b1, mod_w2, mod_b2)
+            mg.border_gate_logit, surprise_compressed,
+            mod_w1, mod_b1, mod_w2, mod_b2)
 
         dw = (new_W - W_before).float().abs().max().item()
         dd = (new_dec - decay_before).float().abs().max().item()
@@ -87,9 +90,12 @@ class TestModulator:
         mod_w2 = mg.mod_w2.to(dt)
         mod_b2 = mg.mod_b2.to(dt)
 
+        surprise_compressed = torch.zeros(
+            2, config.N_cells, config.surprise_proj_dim, dtype=dt)
         new_W, _, _, _ = mg._modulate_cells(
             mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
-            mg.border_gate_logit, mod_w1, mod_b1, mod_w2, mod_b2)
+            mg.border_gate_logit, surprise_compressed,
+            mod_w1, mod_b1, mod_w2, mod_b2)
         assert new_W.shape == mg.W.shape
 
 
@@ -176,7 +182,7 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
 
         H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         loss = mem_out.sum()
         loss.backward()
 
@@ -189,7 +195,7 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
 
         H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         loss = mem_out.sum()
         loss.backward()
 
@@ -205,7 +211,7 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
 
         H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         mem_out.sum().backward()
 
         # The modulator produces delta_W which modifies W.
