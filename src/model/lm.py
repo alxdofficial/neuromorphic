@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .scan import ScanLayer, RMSNorm
-from .pcm import BatchedPCM
 from .config import Config
 
 
@@ -40,18 +39,15 @@ class LM(nn.Module):
                 ScanLayer(D, config.d_inner, config.dropout,
                           n_layers=config.L_total, glu_output=config.glu_output))
 
-        if config.pcm_enabled:
-            self.pcm = BatchedPCM(config.C, config.D_cc, hidden=config.pcm_hidden)
-            self.split_mlp = nn.Sequential(
-                nn.Linear(2 * D, config.d_inner),
-                nn.SiLU(),
-                nn.Linear(config.d_inner, D),
-            )
-            with torch.no_grad():
-                self.split_mlp[2].weight.mul_(1.0 / math.sqrt(2 * config.L_total))
-        else:
-            self.pcm = None
-            self.split_mlp = None
+        # split_mlp: combines H_mid with surprise (called per-token from memory loop)
+        split_h = config.split_mlp_hidden
+        self.split_mlp = nn.Sequential(
+            nn.Linear(2 * D, split_h),
+            nn.SiLU(),
+            nn.Linear(split_h, D),
+        )
+        with torch.no_grad():
+            self.split_mlp[2].weight.mul_(1.0 / math.sqrt(2 * config.L_total))
 
         self.mem_scale = nn.Parameter(
             torch.full((D,), math.sqrt(config.alpha)))
@@ -64,15 +60,12 @@ class LM(nn.Module):
         self._carries = [None] * config.L_total
 
     def forward_scan_lower(self, input_ids: Tensor,
-                           reset_mask: Tensor | None = None,
-                           ) -> tuple[Tensor, Tensor, Tensor]:
-        """Lower scan + PCM.
+                           reset_mask: Tensor | None = None) -> Tensor:
+        """Lower scan only. PCM is now in the memory loop.
 
-        Returns: H_mid [BS,T,D], surprise [BS,T,D], aux_loss scalar.
+        Returns: H_mid [BS, T, D]
         """
         BS, T = input_ids.shape
-        C = self.config.C
-        D_cc = self.config.D_cc
         split = self.config.scan_split_at
 
         x = self.embedding(input_ids)
@@ -85,18 +78,7 @@ class LM(nn.Module):
             H, h_last = self.layers[i](H, self._carries[i], reset_mask=reset_mask)
             self._carries[i] = h_last
 
-        H_mid = H
-
-        aux_loss = torch.tensor(0.0, device=H.device)
-        if self.pcm is not None:
-            H_cols = H_mid.view(BS, T, C, D_cc)
-            surprise_cols, _, pred_loss, _ = self.pcm(H_cols)
-            surprise = surprise_cols.reshape(BS, T, self.config.D)
-            aux_loss = pred_loss * self.config.pcm_pred_weight
-        else:
-            surprise = torch.zeros_like(H_mid)
-
-        return H_mid, surprise, aux_loss
+        return H
 
     def augment(self, H_mid: Tensor, surprise: Tensor) -> Tensor:
         """Combine H_mid and surprise into H_aug."""
@@ -108,6 +90,15 @@ class LM(nn.Module):
         else:
             H_aug = H_mid
         return H_aug
+
+    def augment_single(self, H_mid_t: Tensor, surprise_t: Tensor) -> Tensor:
+        """Per-token augmentation for interleaved PCM. H_mid_t/surprise_t: [BS, D]."""
+        surp_rms = surprise_t.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
+        surprise_normed = surprise_t * surp_rms
+        mlp_input = torch.cat([H_mid_t, surprise_normed], dim=-1)
+        # Cast to f32 for split_mlp (f32 params), then back
+        out = self.split_mlp(mlp_input.float()).to(H_mid_t.dtype)
+        return H_mid_t + out
 
     def inject_memory(self, H_aug: Tensor, mem_out: Tensor) -> Tensor:
         return H_aug + self.mem_scale * mem_out.to(H_aug.dtype)
@@ -132,6 +123,23 @@ class LM(nn.Module):
         for i, h in enumerate(self._carries):
             if h is not None:
                 self._carries[i] = h.detach()
+
+    def runtime_state_dict(self) -> dict:
+        return {
+            "carries": [
+                h.clone() if h is not None else None
+                for h in self._carries
+            ],
+        }
+
+    def load_runtime_state(self, state: dict):
+        carries = state.get("carries")
+        if carries is None:
+            return
+        self._carries = [
+            h.to(self.pos_embed.device) if h is not None else None
+            for h in carries
+        ]
 
     def reset_carries(self, mask: Tensor):
         """mask: [BS] bool — True for elements to reset."""

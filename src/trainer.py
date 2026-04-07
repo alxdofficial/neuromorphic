@@ -58,19 +58,8 @@ class Trainer:
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
-
-        # Masked CE loss (exclude EOT positions)
-        eot_id = self.config.eot_id
-        ce_per_token = F.cross_entropy(
-            logits.reshape(-1, self.config.vocab_size),
-            target_ids.reshape(-1), reduction='none'
-        ).reshape(BS, T)
-
-        is_eot = (input_ids == eot_id)
-        valid_mask = (~is_eot).float()
-        valid_count = valid_mask.sum().clamp(min=1.0)
-        ce_loss = (ce_per_token * valid_mask).sum() / valid_count
-        total_loss = ce_loss + aux_loss
+        ce_loss = result["ce_loss"]
+        total_loss = result["loss"]
 
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()

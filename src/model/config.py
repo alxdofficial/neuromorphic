@@ -10,7 +10,7 @@ class Config:
     D_embed: int = 768
     L_total: int = 4
     scan_split_at: int = 2
-    d_inner: int = 580
+    d_inner: int = 1200
     glu_output: bool = True
     vocab_size: int = 32000
     eot_id: int = 2
@@ -23,31 +23,39 @@ class Config:
     pcm_hidden: int = 256
     C: int = 16  # cortical columns
 
-    # === Memory Graph ===
-    N: int = 8096  # total neurons
-    D_n: int = 32  # neuron hidden dim
-    K: int = 64  # connections per neuron
-    alpha: int = 4  # port multiplier
-    neuromod_hidden: int = 32  # modulator MLP hidden (= D_n)
-    state_mlp_hidden: int = 128
-    msg_mlp_hidden: int = 128
-
-    # === Structural Plasticity ===
-    structural_plasticity: bool = True
-    plasticity_pct: float = 0.02
-    plasticity_exploration_frac: float = 0.2
-    plasticity_interval: int = 1024  # tokens between rewiring
-    hebbian_ema_decay: float = 0.995
+    # === Memory Graph (dense-W) ===
+    D_n: int = 256  # neuron hidden dim
+    alpha: int = 4  # input/output ports per cell
+    grid_h: int = 2
+    grid_w: int = 4
+    neurons_per_cell: int = 32
+    K: int = 8  # initial sparse connections per neuron (for W init only)
+    border_per_cell: int = 4
+    mlp_groups: int = 8
+    cell_mod_hidden: int = 2048
+    state_mlp_hidden: int = 256
+    msg_mlp_hidden: int = 256
+    mod_rank: int = 0  # 0 = direct delta_W output (no low-rank factorization)
+    modulation_interval: int = 4
+    w_decay_rate: float = 1e-3  # soft sparsity: W *= (1 - rate) each step
+    surprise_proj_dim: int = 64  # compressed surprise dim for modulator input
+    surprise_ema_decay: float = 0.95
+    split_mlp_hidden: int = 128  # hidden dim for surprise augmentation MLP
 
     # === Training ===
     T: int = 128  # tokens per segment
     mem_lr_scale: float = 0.3
+    tbptt_block: int = 8
+    checkpoint_every: int = 8
 
     # === Derived (set by validate()) ===
     D_cc: int = -1
     C_mem: int = -1
+    N_cells: int = -1
+    N: int = -1
     N_port: int = -1
     N_internal: int = -1
+    N_internal_per_cell: int = -1
 
     def validate(self):
         assert self.D > 0
@@ -55,15 +63,31 @@ class Config:
         self.D_cc = self.D // self.C
         assert self.D % self.D_n == 0, f"D ({self.D}) must be divisible by D_n ({self.D_n})"
         self.C_mem = self.D // self.D_n
-        self.N_port = self.C_mem * self.alpha
-        assert 2 * self.N_port <= self.N, (
-            f"Need 2*N_port={2 * self.N_port} <= N={self.N}")
-        self.N_internal = self.N - 2 * self.N_port
-        assert self.K < self.N, f"K ({self.K}) must be < N ({self.N})"
+        self.N_cells = self.C_mem
+        assert self.grid_h * self.grid_w == self.N_cells, (
+            f"grid_h*grid_w ({self.grid_h * self.grid_w}) must equal "
+            f"N_cells ({self.N_cells})")
+        min_neurons = 2 * self.alpha + self.border_per_cell + 1
+        assert self.neurons_per_cell >= min_neurons, (
+            f"neurons_per_cell ({self.neurons_per_cell}) must be >= {min_neurons}")
+        self.N = self.N_cells * self.neurons_per_cell
+        self.N_port = self.N_cells * self.alpha
+        self.N_internal_per_cell = (
+            self.neurons_per_cell - 2 * self.alpha - self.border_per_cell)
+        self.N_internal = self.N_cells * self.N_internal_per_cell
         assert self.K >= 1
+        assert self.K <= self.neurons_per_cell
+        assert self.border_per_cell == 4
+        assert self.mlp_groups >= 1
+        assert self.N_cells % self.mlp_groups == 0
         assert self.scan_split_at >= 1
         assert self.scan_split_at < self.L_total
         assert self.T >= 1
+        assert self.modulation_interval >= 1
+        assert self.tbptt_block >= 1
+        assert self.checkpoint_every >= 1
+        assert self.checkpoint_every >= self.tbptt_block
+        assert self.checkpoint_every % self.tbptt_block == 0
         if self.D_embed == -1:
             self.D_embed = self.D
 
@@ -79,9 +103,11 @@ class Config:
         defaults = dict(
             D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=256, T=8,
-            N=128, D_n=8, K=16, alpha=2,
-            neuromod_hidden=8, state_mlp_hidden=32, msg_mlp_hidden=32,
-            pcm_hidden=32, structural_plasticity=False,
+            D_n=8, alpha=2, grid_h=2, grid_w=4, neurons_per_cell=16, K=4,
+            border_per_cell=4, mlp_groups=4, cell_mod_hidden=16,
+            modulation_interval=2, tbptt_block=4, checkpoint_every=4,
+            state_mlp_hidden=32, msg_mlp_hidden=32,
+            pcm_hidden=32, w_decay_rate=1e-3, surprise_proj_dim=8,
         )
         defaults.update(kw)
         c = cls(**defaults)
@@ -90,20 +116,21 @@ class Config:
 
     @property
     def mod_in(self) -> int:
-        """Neuromodulator input dim: identity + hebbian + w_conn + decay."""
-        return self.D_n + self.K + self.K + 1
+        """Per-cell modulator input: h_mean + msg_mean + ctx + W_stats + decay_mean + surprise_compressed."""
+        return 3 * self.D_n + 1 + 1 + self.surprise_proj_dim
 
     @property
     def mod_out(self) -> int:
-        """Neuromodulator output dim: dw_conn + ddecay + didentity."""
-        return self.K + 1 + self.D_n
+        """Per-cell modulator output: delta_W[N*N] + ddecay[N] + dctx[D_n] + dborder[B]."""
+        N = self.neurons_per_cell
+        return N * N + N + self.D_n + self.border_per_cell
 
     @property
     def state_in(self) -> int:
-        """State MLP input dim: received + h + identity + decay."""
-        return 3 * self.D_n + 1
+        """State MLP input dim: received + h."""
+        return 2 * self.D_n
 
     @property
     def msg_in(self) -> int:
-        """Message MLP input dim: h + identity."""
-        return 2 * self.D_n
+        """Message MLP input dim: just h."""
+        return self.D_n

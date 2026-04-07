@@ -135,6 +135,8 @@ def main():
 
     # Resume
     start_step = 0
+    pending_runtime_state = None
+    pending_dataloader_state = None
     if args.resume:
         print(f"\nResuming from: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -149,6 +151,8 @@ def main():
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             except Exception:
                 pass
+        pending_runtime_state = ckpt.get("runtime_state")
+        pending_dataloader_state = ckpt.get("dataloader_state")
         start_step = ckpt.get("step", 0)
         print(f"  Loaded from step {start_step}")
         del ckpt
@@ -157,6 +161,8 @@ def main():
     dataloader = create_dataloader(
         phase="A", tokenizer=tokenizer, batch_size=bs,
         seq_length=T, seed=args.seed, max_steps=remaining_steps)
+    if pending_dataloader_state is not None and hasattr(dataloader, "load_state_dict"):
+        dataloader.load_state_dict(pending_dataloader_state)
 
     trainer = Trainer(
         model=model, optimizer=optimizer, scheduler=scheduler,
@@ -165,6 +171,8 @@ def main():
         use_memory=not args.no_memory,
     )
     trainer.global_step = start_step
+    if pending_runtime_state is not None:
+        model.load_runtime_state(pending_runtime_state)
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -175,6 +183,10 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "runtime_state": model.runtime_state_dict(),
+            "dataloader_state": (
+                dataloader.state_dict() if hasattr(dataloader, "state_dict") else {}
+            ),
             "config": config,
         }, path)
         print(f"  Saved checkpoint: {path}")

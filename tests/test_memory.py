@@ -1,4 +1,4 @@
-"""Memory graph unit tests."""
+"""Memory graph unit tests (dense-W design)."""
 
 import torch
 import pytest
@@ -25,59 +25,95 @@ class TestShapes:
         mg, config = _make_graph()
         BS, T, D = 2, config.T, config.D
         H_aug = torch.randn(BS, T, D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         assert mem_out.shape == (BS, T, D)
 
     def test_readout_shape(self):
         mg, config = _make_graph()
         BS = 2
-        msg = torch.randn(BS, config.N, config.D_n, dtype=torch.bfloat16)
+        msg = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n,
+            dtype=torch.bfloat16)
         readout = mg._readout(msg)
         assert readout.shape == (BS, config.D)
+
+    def test_receive_shape(self):
+        mg, config = _make_graph()
+        BS = 2
+        msg = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n,
+            dtype=torch.bfloat16)
+        W = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.neurons_per_cell,
+            dtype=torch.bfloat16)
+        received = mg._receive(msg, W)
+        assert received.shape == msg.shape
+
+    def test_W_initialized_sparse(self):
+        mg, config = _make_graph()
+        W = mg.W
+        # Each row should have approximately K nonzeros
+        nonzeros_per_row = (W[0, 0].abs() > 0.01).float().sum(dim=-1)
+        assert nonzeros_per_row.mean().item() == pytest.approx(config.K, abs=1)
 
 
 class TestModulator:
     def test_near_zero_deltas_at_init(self):
         mg, config = _make_graph()
-        BS = 2
         dt = torch.bfloat16
-        identity = mg.identity
-        hebbian = mg.hebbian_traces
-        w_conn = mg.w_conn
-        decay_logit = mg.decay_logit
-
         mod_w1 = mg.mod_w1.to(dt)
         mod_b1 = mg.mod_b1.to(dt)
         mod_w2 = mg.mod_w2.to(dt)
         mod_b2 = mg.mod_b2.to(dt)
 
-        new_w, new_dec, new_id = mg._modulate(
-            identity, hebbian, w_conn, decay_logit,
+        W_before = mg.W.clone()
+        decay_before = mg.decay_logit.clone()
+
+        surprise_compressed = torch.zeros(
+            2, config.N_cells, config.surprise_proj_dim, dtype=dt)
+        new_W, new_dec, new_ctx, new_border = mg._modulate_cells(
+            mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
+            mg.border_gate_logit, surprise_compressed,
             mod_w1, mod_b1, mod_w2, mod_b2)
 
-        # Deltas should be near zero due to small init on mod_w2
-        dw = (new_w - w_conn).float().abs().max().item()
-        dd = (new_dec - decay_logit).float().abs().max().item()
-        di = (new_id - identity).float().abs().max().item()
-        assert dw < 0.5, f"dw too large: {dw}"
-        assert dd < 0.5, f"dd too large: {dd}"
-        assert di < 0.5, f"di too large: {di}"
+        dw = (new_W - W_before).float().abs().max().item()
+        dd = (new_dec - decay_before).float().abs().max().item()
+        assert dw < 1.0, f"dW too large: {dw}"
+        assert dd < 1.0, f"ddecay too large: {dd}"
+
+    def test_low_rank_delta_W_shape(self):
+        """Modulator should produce valid W update."""
+        mg, config = _make_graph()
+        dt = torch.bfloat16
+        mod_w1 = mg.mod_w1.to(dt)
+        mod_b1 = mg.mod_b1.to(dt)
+        mod_w2 = mg.mod_w2.to(dt)
+        mod_b2 = mg.mod_b2.to(dt)
+
+        surprise_compressed = torch.zeros(
+            2, config.N_cells, config.surprise_proj_dim, dtype=dt)
+        new_W, _, _, _ = mg._modulate_cells(
+            mg.h, mg.msg, mg.W, mg.decay_logit, mg.cell_context,
+            mg.border_gate_logit, surprise_compressed,
+            mod_w1, mod_b1, mod_w2, mod_b2)
+        assert new_W.shape == mg.W.shape
 
 
 class TestInjectReadout:
     def test_roundtrip(self):
         mg, config = _make_graph()
         BS = 2
-
-        # Inject a known signal
         H_aug_t = torch.randn(BS, config.D, dtype=torch.bfloat16)
-        received = torch.zeros(BS, config.N, config.D_n, dtype=torch.bfloat16)
-        result = mg._inject(received, H_aug_t)
+        received = torch.zeros(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n,
+            dtype=torch.bfloat16)
+        gi = mg.cell_to_group
+        inject_w = mg.inject_w[gi].to(torch.bfloat16)
+        inject_b = mg.inject_b[gi].to(torch.bfloat16)
+        result = mg._inject(received, H_aug_t, inject_w, inject_b)
 
-        # Input port neurons should be nonzero
-        assert result[:, :config.N_port].abs().sum() > 0
-        # Non-port neurons should still be zero
-        assert result[:, 2 * config.N_port:].abs().sum() == 0
+        assert result[:, :, :config.alpha].abs().sum() > 0
+        assert result[:, :, config.alpha:].abs().sum() == 0
 
 
 class TestStateDecay:
@@ -86,91 +122,57 @@ class TestStateDecay:
         BS = 2
         dt = torch.bfloat16
 
-        h_orig = torch.randn(BS, config.N, config.D_n, dtype=dt)
-        received = torch.zeros(BS, config.N, config.D_n, dtype=dt)
-        identity = mg.identity
-        # Very high decay_logit → decay ≈ 1 → h_new ≈ h_old
-        decay_logit = torch.full((BS, config.N), 10.0, dtype=dt)
+        h_orig = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
+        received = torch.zeros_like(h_orig)
+        identity = mg._identity(BS, dt, torch.device("cpu"))
+        decay = torch.sigmoid(torch.full(
+            (BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt
+        )).unsqueeze(-1)
 
         w1 = mg.state_w1.to(dt)
-        b1 = mg.state_b1.to(dt)
-        w2 = mg.state_w2.to(dt)
-        b2 = mg.state_b2.to(dt)
-
-        h_new = mg._state_update(received, h_orig, identity, decay_logit,
-                                 w1, b1, w2, b2)
+        w1_recv = w1[:, :config.D_n].contiguous()
+        w1_h = w1[:, config.D_n:].contiguous()
+        args = (w1_recv, w1_h, mg.state_b1.to(dt), mg.state_w2.to(dt), mg.state_b2.to(dt))
+        one_minus_decay = 1.0 - decay
+        h_new = mg._state_update(received, h_orig, decay, one_minus_decay, identity, *args)
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 
 
-class TestHebbian:
-    def test_per_token_update(self):
+class TestWDecay:
+    def test_soft_sparsity(self):
+        """W entries should decay toward zero when modulator is disabled."""
+        config = _tiny_config(modulation_interval=9999, w_decay_rate=0.05)  # large decay, disable mod
+        mg = MemoryGraph(config)
+        mg.initialize_states(2, torch.device("cpu"))
+        W_before = mg.W.clone()
+
+        BS, T, D = 2, config.T, config.D
+        H_aug = torch.randn(BS, T, D, dtype=torch.bfloat16)
+
+        mg.train(False)
+        with torch.no_grad():
+            mg.forward_segment(H_aug)
+
+        # W should have decayed since modulator didn't add anything
+        ratio = mg.W.float().abs().mean() / W_before.float().abs().mean()
+        expected = (1.0 - config.w_decay_rate) ** config.T
+        assert ratio < 1.0, f"W did not decay (ratio={ratio:.4f})"
+        assert ratio < expected + 0.01, f"W decayed less than expected ({ratio:.4f} vs {expected:.4f})"
+
+
+class TestBorderExchange:
+    def test_border_exchange_shape(self):
         mg, config = _make_graph()
         BS = 2
         dt = torch.bfloat16
-
-        hebbian = mg.hebbian_traces.clone()
-        h0 = hebbian.clone()
-
-        gathered = torch.randn(BS, config.N, config.K, config.D_n, dtype=dt)
-        msg = torch.randn(BS, config.N, config.D_n, dtype=dt)
-        mg._update_hebbian(gathered, msg, hebbian)
-
-        assert not torch.equal(hebbian, h0), "Hebbian traces should change after update"
-
-    def test_modulator_sees_fresh_traces(self):
-        """Run 2 steps, verify modulator at step 2 uses step-1 updated traces."""
-        mg, config = _make_graph()
-        BS, T, D = 2, 2, config.D
-
-        H_aug = torch.randn(BS, T, D, dtype=torch.bfloat16)
-        hebb_before = mg.hebbian_traces.clone()
-        mg.forward_segment(H_aug)
-        hebb_after = mg.hebbian_traces
-
-        # After 2 token steps, hebbian should have changed
-        assert not torch.equal(hebb_before, hebb_after)
-
-
-class TestStructuralPlasticity:
-    def test_connections_change(self):
-        config = _tiny_config(structural_plasticity=True, plasticity_pct=0.1)
-        mg, _ = _make_graph(config)
-        conn_before = mg.conn_idx.clone()
-
-        # Need some nonzero hebbian for pruning to have signal
-        mg.hebbian_traces = torch.randn_like(mg.hebbian_traces)
-        mg.msg = torch.randn_like(mg.msg)
-        mg.rewire_connections()
-
-        changed = (conn_before != mg.conn_idx).any().item()
-        assert changed, "Connections should change after rewire"
-
-    def test_no_duplicates(self):
-        config = _tiny_config(structural_plasticity=True, plasticity_pct=0.1)
-        mg, _ = _make_graph(config)
-        mg.hebbian_traces = torch.randn_like(mg.hebbian_traces)
-        mg.msg = torch.randn_like(mg.msg)
-
-        for _ in range(10):
-            mg.rewire_connections()
-            for n in range(config.N):
-                vals = mg.conn_idx[n].tolist()
-                assert len(vals) == len(set(vals)), (
-                    f"Neuron {n} has duplicate connections: {vals}")
-
-    def test_sorted_after_rewire(self):
-        config = _tiny_config(structural_plasticity=True, plasticity_pct=0.1)
-        mg, _ = _make_graph(config)
-        mg.hebbian_traces = torch.randn_like(mg.hebbian_traces)
-        mg.msg = torch.randn_like(mg.msg)
-
-        mg.rewire_connections()
-        for n in range(config.N):
-            row = mg.conn_idx[n]
-            sorted_row, _ = row.sort()
-            assert torch.equal(row, sorted_row), (
-                f"Neuron {n} connections not sorted after rewire")
+        msg = torch.randn(
+            BS, config.N_cells, config.neurons_per_cell, config.D_n, dtype=dt)
+        border_gate = torch.sigmoid(torch.zeros(
+            BS, config.N_cells, config.border_per_cell, dtype=dt)).unsqueeze(-1)
+        result = mg._border_exchange(msg, border_gate)
+        assert result.shape == (BS, config.N_cells, config.border_per_cell, config.D_n)
 
 
 class TestGradientFlow:
@@ -180,7 +182,7 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
 
         H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         loss = mem_out.sum()
         loss.backward()
 
@@ -193,7 +195,7 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
 
         H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
-        mem_out = mg.forward_segment(H_aug)
+        mem_out, _ = mg.forward_segment(H_aug)
         loss = mem_out.sum()
         loss.backward()
 
@@ -201,3 +203,18 @@ class TestGradientFlow:
         assert mg.msg_w1.grad is not None
         assert mg.state_w1.grad.abs().sum() > 0
         assert mg.msg_w1.grad.abs().sum() > 0
+
+    def test_grad_flows_through_W(self):
+        """Gradient should flow through W to the modulator."""
+        config = _tiny_config()
+        mg = MemoryGraph(config)
+        mg.initialize_states(2, torch.device("cpu"))
+
+        H_aug = torch.randn(2, config.T, config.D, dtype=torch.bfloat16)
+        mem_out, _ = mg.forward_segment(H_aug)
+        mem_out.sum().backward()
+
+        # The modulator produces delta_W which modifies W.
+        # Gradient should flow: loss → readout → msg → h → received = W @ msg → W → delta_W → mod_w2
+        assert mg.mod_w2.grad is not None
+        assert mg.mod_w2.grad.abs().sum() > 0

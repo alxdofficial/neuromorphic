@@ -1,180 +1,300 @@
-# Neuromorphic Memory Graph — Design Document
+# Neuromorphic Memory Graph — Dense-W Design
 
 ## Goals
 
-1. **Long-context seq2seq performance**: augment a recurrent LM with a structured memory that captures long-range dependencies better than the recurrence alone.
-2. **Inherent information distillation**: the memory graph compresses and organizes information spatially across neurons, rather than storing raw token representations.
-3. **Bounded memory and compute**: the graph has a fixed number of neurons and connections. Memory footprint and per-token compute are constant regardless of context length.
-4. **Context rot mitigation**: structural plasticity and neuromodulation continuously reorganize memory, preventing stale information from degrading performance over long sequences.
-5. **Lifelong learning**: the neuromodulator is designed as a policy that adapts the graph's connectivity, decay, and identity vectors online. Currently trained by backprop; future work will train it via GRPO RL for continual adaptation beyond a single training run.
+1. Split-scan LM with interleaved PCM and memory graph.
+2. One memory interaction per token.
+3. GPU-friendly: all hot-path operations are batched matmuls (bmm) or F.linear.
+4. Lifelong learning: neuromodulator continuously adjusts connectivity.
+5. No document-boundary resets in the memory graph.
+6. No discrete structural plasticity — connectivity evolves continuously.
+7. Surprise-driven memory management: PCM surprise feeds into the neuromodulator.
 
 ## Architecture Overview
 
 ```
-tokens → embedding → lower scan → split_mlp(H_mid, PCM_surprise) → H_aug
-                                                                      │
-                                              ┌───────────────────────┤
-                                              ▼                       ▼
-                                        memory graph            upper scan
-                                              │                       │
-                                              └──► combine ──────────►│
-                                                                      ▼
-                                                                  LM head
+tokens → embedding → lower scan → H_mid[0..T-1]  (parallel)
+                                       │
+                           ┌───────────┘
+                           ▼
+                 ┌─── per-token loop (t = 0..T-1) ───┐
+                 │                                     │
+                 │  PCM(H_mid[t], prev_readout)        │
+                 │       → surprise[t]                 │
+                 │       → update surprise_ema          │
+                 │                                     │
+                 │  augment(H_mid[t], surprise[t])     │
+                 │       → H_aug[t]                    │
+                 │                                     │
+                 │  memory_step(H_aug[t])              │
+                 │       → readout[t]                  │
+                 │                                     │
+                 │  H_enriched[t] = H_aug[t]           │
+                 │       + mem_scale * readout[t]      │
+                 │                                     │
+                 │  (every M steps: modulate with      │
+                 │   surprise_compressed as input)      │
+                 │                                     │
+                 └─────────────────────────────────────┘
+                           │
+                           ▼
+                 upper scan → H_upper[0..T-1]  (parallel)
+                           │
+                           ▼
+                        LM head → logits
 ```
 
-The LM is an affine recurrent model (element-wise linear scan with gating: `h_t = sigmoid(a_t) * h_{t-1} + b_t`). The scan stack is split at a midpoint into lower and upper layers. Between them, a Predictive Coding Module (PCM) computes surprise, which is fused with H_mid via a small MLP to produce H_aug. H_aug feeds both the memory graph and the upper scan.
-
-## LM Scan
-
-- **Type**: causal linear recurrence with element-wise gating
-- **Layers**: L total, split at layer S (layers 0..S-1 = lower, S..L-1 = upper)
-- **Per layer**: pre-norm (RMSNorm) → linear projections → scan → SwiGLU output → residual
-- **Carry**: hidden state h passed across segments (TBPTT with detach at segment boundaries)
+The lower and upper scans run in parallel over T. The middle section
+(PCM + memory) runs sequentially per token. The PCM is interleaved
+with the memory graph, receiving the previous step's memory readout
+as context for its predictions.
 
 ## Predictive Coding Module (PCM)
 
-Predicts state transitions (deltas) rather than raw states:
-- `delta_hat[t] = pred_MLP(norm(H[t]))` — predicted change
-- `delta_actual[t] = H[t+1] - H[t]` — actual change
-- `surprise[t] = delta_hat[t-1] - delta_actual[t]` — transition prediction error
+### What it predicts
 
-The surprise signal is combined with H_mid through a split-point MLP:
-- `H_aug = split_mlp(H_mid, surprise)` — produces augmented hidden state
-- H_aug is passed to both the memory graph (as inject signal) and the upper scan
-- Surprise does not enter the upper scan as a separate side input
+The PCM predicts the LM's hidden state transition: `H_mid[t+1] - H_mid[t]`.
+
+**Input**: `H_mid[t]` (current LM state) + `prev_readout` (what memory
+contributed last step). The memory readout gives the PCM context — if
+memory already "knows" about an upcoming transition, the PCM can predict
+it, producing low surprise.
+
+**Output**: `delta_hat[t]` (predicted transition) + `surprise[t]` (prediction
+error = `delta_hat[t-1] - delta_actual[t]`).
+
+**Target**: `H_mid[t+1] - H_mid[t]` — fully determined by the lower scan
+before the memory loop starts. No circularity: surprise[t] affects H_aug[t]
+and the upper scan, but NOT H_mid[t+1].
+
+### PCM loss
+
+Self-supervised: `pred_loss = MSE(delta_hat[t], (H_mid[t+1] - H_mid[t]).detach())`.
+Weighted by `pcm_pred_weight` and added to CE loss as auxiliary loss.
+The PCM trains to predict accurately, independent of how the memory
+uses its surprise signal.
+
+### Surprise flow into memory
+
+```
+PCM outputs surprise[t]           [BS, C, D_cc] = [BS, 16, 128]
+    ↓ reshape to per-cell
+surprise_per_cell[t]              [BS, NC, D_n] = [BS, 8, 256]
+    ↓ EMA accumulation (detached, per step)
+surprise_ema                      [BS, NC, D_n]
+    ↓ also accumulate readout
+readout_ema                       [BS, NC, D_n]
+    ↓ learned projection (at modulation time, ON the CE graph)
+surprise_compressed               [BS, NC, proj_dim=64]
+    ↓ concatenated into modulator input
+modulator decides how to adjust W, decay, context, gates
+```
+
+**surprise_ema** and **readout_ema** are runtime state (EMA, no grad).
+They capture "what's been surprising recently" and "what memory has been
+contributing recently." The temporal smoothing filters noise.
+
+**surprise_proj** is a learned parameter `[proj_dim, 2*D_n]` trained
+end-to-end via CE loss through the modulator. It learns which aspects
+of surprise and readout are useful for memory management decisions.
+The PCM itself (trained by aux_loss) doesn't know about this — clean
+separation between "predict accurately" and "use predictions well."
 
 ## Memory Graph
 
-### Dimensions
+### Layout
 
-| Parameter | Symbol | Value |
-|-----------|--------|-------|
-| Neuron hidden dim | D_neuron | 32 |
-| Total neurons | N | 8096 |
-| Connections per neuron | K | 64 |
-| Port multiplier | alpha | 4 |
+Grid of cells. Each cell contains N neurons with D_n-dim hidden states.
+Connectivity within a cell is a dense N×N weight matrix W.
+
+### Default Dimensions
+
+| Parameter | Symbol | Default |
+|-----------|--------|---------|
 | LM hidden dim | D | 2048 |
+| Neuron hidden dim | D_n | 256 |
+| Cells | N_cells | 8 |
+| Grid | H × W | 2 × 4 |
+| Neurons per cell | N | 32 |
+| Total neurons | N_total | 256 |
+| Input/output ports per cell | alpha | 4 |
+| Border neurons per cell | B | 4 |
+| State MLP hidden | Hs | 256 |
+| Msg MLP hidden | Hm | 256 |
+| Modulator hidden | Hmod | 128 |
+| Modulator rank | r | 16 |
+| Surprise projection dim | proj_dim | 64 |
 
-### Port Neurons
+### Connectivity: Dense W Matrix
 
-Port neurons are the interface between the LM and the memory graph.
+Each cell has a connectivity matrix `W: [BS, NC, N, N]`. Runtime state,
+not a learned parameter. Initialized sparse (K nonzeros per row),
+evolves continuously via the neuromodulator.
 
-- **Input port count**: D * alpha / D_neuron = 2048 * 4 / 32 = 256
-- **Output port count**: 256 (separate neurons from input ports)
-- **Total port neurons**: 512
-- **Internal neurons**: 8096 - 512 = 7584
-
-**Injection** (LM → graph): H_aug [BS, D] is reshaped to [BS, C_mem, D_neuron] where C_mem = D / D_neuron = 64. Each slice is replicated alpha=4 times across the input port neurons in that slice group (n_per_slice = alpha = 4 neurons per slice). Parameter-free — just reshape and expand. The inject signal is added to the received presynaptic messages for input port neurons.
-
-**Readout** (graph → LM): output port neurons emit D_neuron-dim messages. Within each slice group, messages are summed over the alpha replicas and scaled by `1/sqrt(n_per_slice)`: `readout = sum(msgs, dim=replica) * n_per_slice^(-0.5)`. The slice outputs are concatenated back to [BS, D].
-
-**Combination**: `H_enriched = H_aug + mem_scale * readout`, where `mem_scale` is a learnable per-dim scale [D], initialized to `sqrt(n_per_slice)` to cancel the `1/sqrt` in readout (starting near unit magnitude so gradients flow freely from the start).
-
-### Neuron State
-
-Each neuron maintains:
-- **h**: hidden state vector [D_neuron] — the neuron's internal representation
-- **w_conn**: connection weights [K] — scalar weights for each presynaptic neighbor
-- **identity**: learnable embedding [D_neuron] — distinguishes this neuron, updated by modulator
-- **decay**: learnable scalar — controls state persistence (`h = decay * h_old + (1-decay) * update`)
-
-### Connectivity
-
-- Each neuron has K=64 presynaptic connections (neurons it receives messages from)
-- Connections are directed: A listing B as presynaptic does not imply B lists A
-- Initialized randomly, adapted by structural plasticity
-
-### Per-Token Neuron Step
-
-One neuron step executes per token, fully sequential (no multi-pass approximation):
-
-1. **Modulate** (step 0): per-neuron neuromodulator MLP predicts updated w_conn, decay, and identity from current (identity, hebbian_trace, w_conn, decay). Happens first so its effects are visible to backprop gradients.
-
-2. **Receive**: gather messages from K presynaptic neighbors, scale each by its w_conn scalar, combine (sum or weighted sum) into a received vector [D_neuron].
-
-3. **Inject**: input port neurons additionally receive their slice of the LM signal. The inject signal is added to the received message.
-
-4. **State update**: shared state MLP takes (received + injected, h_current) → candidate. New state: `h = decay * h_old + (1 - decay) * tanh(candidate)`.
-
-5. **Emit message**: shared message MLP takes (h_new, identity) → outgoing message [D_neuron]. This message is what presynaptic-neighbor lookups will gather on the next step.
-
-6. **Readout**: output port neurons' messages are collected and reassembled into a D-dim vector for the LM.
-
-7. **Update hebbian traces**: running correlation between received messages from each presynaptic neighbor and this neuron's own outgoing messages.
-
-### MLPs
-
-- **State MLP**: shared weights across all neurons. Identity embedding provides per-neuron differentiation.
-- **Message MLP**: shared weights across all neurons. Same rationale.
-- **Neuromodulator MLP**: **per-neuron weights** (8096 separate small MLPs). This is where model capacity lives. Hidden dim = D_neuron = 32. Input: (identity [32], hebbian_trace [K], w_conn [K], decay [1]) → output: (new_w_conn [K], new_decay [1], new_identity [32]).
-
-### Structural Plasticity
-
-Runs once every 1024 tokens (8 segments). Uses hebbian traces as the signal:
-
-**Pruning** (existing connections): hebbian traces [BS, N, K] are averaged
-across the batch dimension to get a per-connection score. The bottom
-`plasticity_pct` (2%) of all connections globally are pruned.
-
-**Regrowth**: for each pruned slot, a new target is selected:
-- ~80% exploit: the candidate non-connected neuron with the highest estimated
-  affinity. Affinity for a non-connected pair (i, j) is estimated from the
-  average outgoing message magnitudes of both neurons (a lightweight proxy
-  that avoids materializing an [N, N] correlation matrix).
-- ~20% explore: random non-connected, non-self neuron.
-
-After rewiring, the `conn_idx` buffer is updated, and hebbian traces and
-w_conn for rewired connections are reset to zero. A dedup + re-sort pass
-ensures the K-distinct-neighbors invariant is maintained.
-
-### Hebbian Traces
-
-Per-neuron running statistics tracking how messages from each of K presynaptic
-neighbors correlate with this neuron's own outgoing messages. Updated every
-token step (EMA with decay 0.995). Used by:
-- The neuromodulator (as input — sees fresh traces each token step)
-- Structural plasticity (batch-averaged traces used for pruning decisions)
-
-## Segments and Timing
-
-- **Segment**: 128 tokens. One segment = one forward_segment call. TBPTT detaches
-  at segment boundaries.
-- **Neuron step**: one per token (128 per segment). All N neurons processed in
-  parallel via vectorized ops.
-- **Neuromodulator**: runs every token step. Sees the most recent hebbian traces
-  (updated at the end of each token step).
-- **Structural plasticity**: runs once every 1024 tokens (8 segments). Rewires
-  connections based on hebbian trace statistics.
-
-## Gradient Path (Design Decision)
-
-The memory graph receives `H_aug.detach()` — the LM hidden state with surprise
-mixed in, but with the gradient path cut. This is a deliberate choice:
-
-- **Lower scan** learns purely from CE loss through the upper scan path.
-- **Memory graph** learns to produce useful readout given whatever H_aug it
-  receives, trained through `mem_scale * mem_out` flowing back from CE loss.
-- **Rationale**: in v8/v9, coupling memory gradients into the lower scan caused
-  optimization instability (memory gradients fighting scan gradients). Decoupling
-  gives each system a cleaner learning signal.
-
-The memory graph DOES receive gradient signal — it flows through:
+Message passing is a single batched matmul:
+```python
+received = torch.matmul(W, msg)
 ```
-CE loss → upper scan → H_enriched = H_aug + mem_scale * mem_out
-                                                   │
-                                          mem_scale and mem_out carry grad
-                                          to all memory parameters
+
+Soft sparsity via per-step decay:
+```python
+W = W * (1 - w_decay_rate)
+```
+
+### Runtime State
+
+```
+h                : [BS, NC, N, D_n]     — neuron hidden states
+msg              : [BS, NC, N, D_n]     — neuron messages
+W                : [BS, NC, N, N]       — connectivity matrix
+decay_logit      : [BS, NC, N]          — per-neuron temporal decay
+cell_context     : [BS, NC, D_n]        — per-cell context
+border_gate_logit: [BS, NC, B]          — cross-cell exchange gates
+surprise_ema     : [BS, NC, D_n]        — EMA of per-cell surprise (NEW)
+readout_ema      : [BS, NC, D_n]        — EMA of per-cell readout (NEW)
+prev_readout     : [BS, D]              — previous step's readout for PCM (NEW)
+```
+
+### Learned Parameters
+
+```
+neuron_id        : [NC, N, D_n]         — per-neuron identity embedding
+state_w1         : [Hs, 2*D_n]         — shared state MLP (split into recv/h halves)
+state_b1         : [Hs]
+state_w2         : [D_n, Hs]
+state_b2         : [D_n]
+msg_w1/b1/w2/b2  : ...                 — shared message MLP
+mod_w1           : [NC, mod_in, Hmod]   — per-cell modulator
+mod_b1/w2/b2     : ...
+inject_w/b       : [G, ...]            — per-group inject projection
+surprise_proj_w  : [proj_dim, 2*D_n]   — surprise compression (NEW)
+surprise_proj_b  : [proj_dim]          — (NEW)
+mem_scale        : [D]                  — LM-side readout scale
+pcm_w1/b1/w2/b2  : [C, ...]           — PCM prediction MLP (MOVED from LM)
+```
+
+## Per-Token Step (inside memory loop)
+
+### 0. PCM (NEW location — inside the loop)
+
+```python
+# PCM input: current LM state + previous memory readout
+pcm_input = cat([H_mid_cols[t], prev_readout_cols], dim=-1)  # [BS, C, 2*D_cc]
+delta_hat[t] = pcm_mlp(pcm_input)                            # [BS, C, D_cc]
+
+# Surprise (using previous prediction)
+if t > 0:
+    delta_actual = H_mid_cols[t] - H_mid_cols[t-1]
+    surprise[t] = prev_delta_hat - delta_actual
+prev_delta_hat = delta_hat[t]
+
+# Accumulate per-cell surprise (detached EMA)
+surprise_cell = surprise[t].reshape(BS, NC, D_n)
+surprise_ema = 0.95 * surprise_ema + 0.05 * surprise_cell.detach()
+```
+
+### 0b. Augment
+
+```python
+H_aug[t] = H_mid[t] + split_mlp(H_mid[t], surprise[t])
+```
+
+### 1. Receive (dense bmm)
+
+```python
+received = torch.matmul(W, msg)
+```
+
+### 2. Inject
+
+```python
+received[:, :, :alpha] += inject(H_aug[t])
+```
+
+### 3. Border Exchange
+
+```python
+received[:, :, border_lo:border_hi] += border_exchange(msg, border_gate)
+```
+
+### 4. State Update
+
+```python
+h = decay * h + (1-decay) * tanh(mlp(received, h))
+```
+
+### 5. Emit Message
+
+```python
+msg = tanh(mlp(h)) + identity
+```
+
+### 6. Readout
+
+```python
+readout[t] = readout_from_output_ports(msg)
+readout_cell = readout[t].reshape(BS, NC, D_n)
+readout_ema = 0.95 * readout_ema + 0.05 * readout_cell.detach()
+prev_readout = readout[t]
+
+H_enriched[t] = H_aug[t] + mem_scale * readout[t]
+```
+
+### 7. Neuromodulate (every M steps)
+
+```python
+# Compress surprise for modulator (ON the CE graph via surprise_proj)
+surprise_compressed = F.linear(
+    cat([surprise_ema, readout_ema]), surprise_proj_w, surprise_proj_b)
+
+mod_input = cat([h_mean, msg_mean, cell_context, W_stats, decay_mean,
+                 surprise_compressed])
+
+# Modulator predicts low-rank delta_W + deltas
+delta_W = u @ v.T
+W = W + delta_W
+decay_logit += delta_decay
+cell_context += delta_ctx
+border_gate_logit += delta_border
+
+# Soft W decay
+W = W * (1 - w_decay_rate)
 ```
 
 ## Training
 
-- Single optimizer for all parameters
-- Memory graph parameters at reduced LR (e.g., 0.3x base LR)
-- Memory parameters kept in f32 (small gradients round to zero in bf16)
-- TBPTT within segments, detach at segment boundaries
-- Recurrent carries (scan hidden states + neuron hidden states) passed across segments
-- Gradient checkpointing over the 128-step token loop (required for BS > ~8)
+### Losses
 
-## Open Questions
+```
+total_loss = CE_loss + pcm_pred_weight * pcm_pred_loss
+```
 
-- GRPO RL training for neuromodulator (future work — architecture supports it)
+- **CE loss**: trains LM (lower/upper scan, embedding, head, split_mlp, mem_scale)
+  AND memory graph (state/msg MLPs, modulator, inject, surprise_proj)
+- **PCM pred_loss**: trains PCM only (self-supervised transition prediction)
+
+### Gradient boundaries
+
+- `H_mid.detach()` before memory: memory can't backprop into LM lower scan
+- `surprise_ema` and `readout_ema`: detached EMAs, no grad
+- `surprise_proj`: ON the CE graph — learns end-to-end through modulator
+- PCM: trained ONLY by pred_loss, not by CE loss
+
+### What each component learns
+
+| Component | Trained by | Learns to... |
+|-----------|-----------|--------------|
+| PCM | pred_loss (self-supervised) | Predict LM transitions accurately |
+| split_mlp | CE loss | Combine H_mid and surprise usefully |
+| State/Msg MLPs | CE loss (via readout) | Update neuron states and messages |
+| Modulator | CE loss (via readout) | Adjust W, decay, gates based on surprise + state |
+| surprise_proj | CE loss (via modulator) | Select which surprise dims help memory management |
+| W (runtime) | Not trained (modulator adjusts it) | Store connectivity patterns |
+
+## Initialization
+
+- **W**: sparse random (K=8 nonzeros per row, value 0.1)
+- **h, msg**: small random / zeros
+- **decay_logit**: zeros (sigmoid(0) = 0.5)
+- **surprise_ema, readout_ema**: zeros
+- **prev_readout**: zeros

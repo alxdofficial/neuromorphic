@@ -1,11 +1,11 @@
-"""Predictive Coding Module — Dynamic Predictive Coding.
+"""Predictive Coding Module — per-token, memory-aware.
 
-Predicts state TRANSITIONS (deltas) rather than raw states:
-  delta_hat[t] = pred_MLP(norm(H[t]))       — predicted change
-  delta_actual[t] = H[t+1] - H[t]           — actual change
-  surprise[t] = delta_hat[t-1] - delta_actual[t]  — transition prediction error
+Predicts state TRANSITIONS in the LM hidden state, conditioned on both
+the current LM state and the previous memory readout. Runs inside the
+per-token memory loop (not batched over T).
 
-Inspired by Dynamic Predictive Coding (Jiang & Rao 2023).
+  delta_hat[t] = pred_MLP(H_mid[t], prev_readout)
+  surprise[t] = delta_hat[t-1] - (H_mid[t] - H_mid[t-1])
 """
 
 import math
@@ -17,10 +17,10 @@ from torch import Tensor
 
 
 class BatchedPCM(nn.Module):
-    """Dynamic predictive coding for all C cortical columns, batched.
+    """Per-token predictive coding across C cortical columns.
 
-    Predicts transitions (H[t+1] - H[t]) rather than raw H[t+1].
-    Surprise = predicted_delta - actual_delta.
+    Input: H_mid[t] + prev_readout (concatenated per column).
+    Output: delta_hat (predicted transition), used to compute surprise.
     """
 
     def __init__(self, C: int, D_cc: int, hidden: int = 256):
@@ -29,7 +29,7 @@ class BatchedPCM(nn.Module):
             raise ValueError(f"PCM hidden must be > 0, got {hidden}")
         self.C = C
         self.D_cc = D_cc
-        in_dim = D_cc
+        in_dim = 2 * D_cc  # H_mid_col + prev_readout_col
 
         self.norm_weight = nn.Parameter(torch.ones(C, in_dim))
         self.norm_eps = 1e-6
@@ -47,34 +47,30 @@ class BatchedPCM(nn.Module):
             bound = 1.0 / math.sqrt(fan_in)
             nn.init.uniform_(b, -bound, bound)
 
-    def forward(self, H: Tensor
-                ) -> tuple[Tensor, Tensor, Tensor, list[float]]:
-        """
+    def predict(self, H_mid_t: Tensor, prev_readout: Tensor) -> Tensor:
+        """Predict the next transition delta.
+
         Args:
-            H: [BS, T, C, D_cc]
+            H_mid_t:      [BS, C, D_cc] — current LM hidden state (per column)
+            prev_readout:  [BS, C, D_cc] — previous memory readout (per column)
+
         Returns:
-            surprise, delta_hat, pred_loss, per_cc_pred_loss
+            delta_hat: [BS, C, D_cc] — predicted transition
         """
-        BS, T, C, D_cc = H.shape
+        BS = H_mid_t.shape[0]
+        C, D_cc = self.C, self.D_cc
 
-        rms = H.pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
-        normed = H * rms * self.norm_weight
+        # Concatenate LM state + memory readout per column
+        pcm_input = torch.cat([H_mid_t, prev_readout], dim=-1)  # [BS, C, 2*D_cc]
 
-        normed_r = normed.permute(2, 0, 1, 3).reshape(C, BS * T, -1)
+        # RMSNorm
+        rms = pcm_input.pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
+        normed = pcm_input * rms * self.norm_weight  # [BS, C, 2*D_cc]
 
-        p1 = torch.bmm(normed_r, self.pcm_w1) + self.pcm_b1
-        p1 = F.silu(p1)
-        delta_hat_r = torch.bmm(p1, self.pcm_w2) + self.pcm_b2
+        # Per-column MLP: [C, BS, 2*D_cc] → [C, BS, D_cc]
+        dt = normed.dtype
+        normed_r = normed.permute(1, 0, 2)  # [C, BS, 2*D_cc]
+        p1 = F.silu(torch.bmm(normed_r, self.pcm_w1.to(dt)) + self.pcm_b1.to(dt))
+        delta_hat_r = torch.bmm(p1, self.pcm_w2.to(dt)) + self.pcm_b2.to(dt)
 
-        delta_hat = delta_hat_r.reshape(C, BS, T, D_cc).permute(1, 2, 0, 3)
-
-        delta_actual = H[:, 1:] - H[:, :-1]
-
-        surprise = torch.zeros_like(H)
-        surprise[:, 1:] = delta_hat[:, :-1] - delta_actual
-
-        pred_err = (delta_hat[:, :-1] - delta_actual.detach()).pow(2)
-        pred_loss = pred_err.mean()
-        per_cc_pred_loss = pred_err.mean(dim=(0, 1, 3)).tolist()
-
-        return surprise, delta_hat, pred_loss, per_cc_pred_loss
+        return delta_hat_r.permute(1, 0, 2)  # [BS, C, D_cc]
