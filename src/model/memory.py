@@ -28,7 +28,6 @@ class MemoryGraph(nn.Module):
         self.border_per_cell = config.border_per_cell
         self.grid_h = config.grid_h
         self.grid_w = config.grid_w
-        self.mod_rank = config.mod_rank
         self.C = config.C
         self.D_cc = config.D_cc
 
@@ -58,7 +57,6 @@ class MemoryGraph(nn.Module):
         Hm = config.msg_mlp_hidden
         Hmod = config.cell_mod_hidden
         N = self.C_n
-        r = self.mod_rank
 
         # Shared state MLP: input = cat(received, h) = 2*D_n
         self.state_w1 = nn.Parameter(torch.empty(Hs, config.state_in))
@@ -297,7 +295,7 @@ class MemoryGraph(nn.Module):
     def _modulate_cells(self, h, msg, W, decay_logit, cell_context,
                         border_gate_logit, surprise_compressed,
                         mod_w1, mod_b1, mod_w2, mod_b2):
-        NC, N, r = self.N_cells, self.C_n, self.mod_rank
+        NC, N = self.N_cells, self.C_n
         D_n, B = self.D_n, self.border_per_cell
 
         h_mean = h.mean(dim=2)
@@ -313,20 +311,16 @@ class MemoryGraph(nn.Module):
             torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
         output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
 
-        # Unpack: low-rank delta_W (u, v), delta_decay, delta_ctx, delta_border
+        # Unpack: direct delta_W, delta_decay, delta_ctx, delta_border
+        BS = h.shape[0]
         idx = 0
-        u = output[..., idx:idx + N * r].reshape(-1, NC, N, r)
-        idx += N * r
-        v = output[..., idx:idx + N * r].reshape(-1, NC, N, r)
-        idx += N * r
-        delta_decay = output[..., idx:idx + N].reshape(-1, NC, N)
+        delta_W = output[..., idx:idx + N * N].reshape(BS, NC, N, N)
+        idx += N * N
+        delta_decay = output[..., idx:idx + N].reshape(BS, NC, N)
         idx += N
         delta_ctx = output[..., idx:idx + D_n]
         idx += D_n
         delta_border = output[..., idx:idx + B]
-
-        # Low-rank W update
-        delta_W = torch.matmul(u, v.transpose(-1, -2))  # [BS, NC, N, N]
 
         return (
             W + delta_W,

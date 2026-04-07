@@ -10,7 +10,7 @@ class Config:
     D_embed: int = 768
     L_total: int = 4
     scan_split_at: int = 2
-    d_inner: int = 580
+    d_inner: int = 1200
     glu_output: bool = True
     vocab_size: int = 32000
     eot_id: int = 2
@@ -24,18 +24,18 @@ class Config:
     C: int = 16  # cortical columns
 
     # === Memory Graph (dense-W) ===
-    D_n: int = 128  # neuron hidden dim
+    D_n: int = 256  # neuron hidden dim
     alpha: int = 4  # input/output ports per cell
-    grid_h: int = 4
+    grid_h: int = 2
     grid_w: int = 4
-    neurons_per_cell: int = 128
+    neurons_per_cell: int = 32
     K: int = 8  # initial sparse connections per neuron (for W init only)
     border_per_cell: int = 4
     mlp_groups: int = 8
-    cell_mod_hidden: int = 128
+    cell_mod_hidden: int = 2048
     state_mlp_hidden: int = 256
     msg_mlp_hidden: int = 256
-    mod_rank: int = 16  # rank of low-rank W updates
+    mod_rank: int = 0  # 0 = direct delta_W output (no low-rank factorization)
     modulation_interval: int = 4
     w_decay_rate: float = 1e-3  # soft sparsity: W *= (1 - rate) each step
     surprise_proj_dim: int = 64  # compressed surprise dim for modulator input
@@ -84,7 +84,6 @@ class Config:
         assert self.scan_split_at < self.L_total
         assert self.T >= 1
         assert self.modulation_interval >= 1
-        assert self.mod_rank >= 1
         assert self.tbptt_block >= 1
         assert self.checkpoint_every >= 1
         assert self.checkpoint_every >= self.tbptt_block
@@ -107,7 +106,7 @@ class Config:
             D_n=8, alpha=2, grid_h=2, grid_w=4, neurons_per_cell=16, K=4,
             border_per_cell=4, mlp_groups=4, cell_mod_hidden=16,
             modulation_interval=2, tbptt_block=4, checkpoint_every=4,
-            state_mlp_hidden=32, msg_mlp_hidden=32, mod_rank=4,
+            state_mlp_hidden=32, msg_mlp_hidden=32,
             pcm_hidden=32, w_decay_rate=1e-3, surprise_proj_dim=8,
         )
         defaults.update(kw)
@@ -122,9 +121,9 @@ class Config:
 
     @property
     def mod_out(self) -> int:
-        """Per-cell modulator output: u[N*r] + v[N*r] + ddecay[N] + dctx[D_n] + dborder[B]."""
-        N, r = self.neurons_per_cell, self.mod_rank
-        return 2 * N * r + N + self.D_n + self.border_per_cell
+        """Per-cell modulator output: delta_W[N*N] + ddecay[N] + dctx[D_n] + dborder[B]."""
+        N = self.neurons_per_cell
+        return N * N + N + self.D_n + self.border_per_cell
 
     @property
     def state_in(self) -> int:
