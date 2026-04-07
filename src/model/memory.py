@@ -49,12 +49,6 @@ class MemoryGraph(nn.Module):
             self._build_border_neighbor_cells(),
             persistent=False,
         )
-        self.register_buffer(
-            "border_src_port",
-            torch.tensor([1, 0, 3, 2], dtype=torch.long),
-            persistent=False,
-        )
-
         # Per-neuron identity
         self.neuron_id = nn.Parameter(
             torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
@@ -209,6 +203,11 @@ class MemoryGraph(nn.Module):
             "decay_logit": self.decay_logit.clone(),
             "cell_context": self.cell_context.clone(),
             "border_gate_logit": self.border_gate_logit.clone(),
+            "surprise_ema": self.surprise_ema.clone(),
+            "readout_ema": self.readout_ema.clone(),
+            "prev_readout": self.prev_readout.clone(),
+            "prev_delta_hat": (
+                self.prev_delta_hat.clone() if self.prev_delta_hat is not None else None),
         }
 
     def load_runtime_state(self, state: dict):
@@ -222,6 +221,12 @@ class MemoryGraph(nn.Module):
         self.decay_logit = state["decay_logit"].to(device)
         self.cell_context = state["cell_context"].to(device)
         self.border_gate_logit = state["border_gate_logit"].to(device)
+        self.surprise_ema = state.get("surprise_ema", torch.zeros_like(self.h[:, :, 0, :])).to(device)
+        self.readout_ema = state.get("readout_ema", torch.zeros_like(self.h[:, :, 0, :])).to(device)
+        self.prev_readout = state.get("prev_readout", torch.zeros(
+            self.h.shape[0], self.config.D, device=device, dtype=self.h.dtype)).to(device)
+        pdt = state.get("prev_delta_hat")
+        self.prev_delta_hat = pdt.to(device) if pdt is not None else None
         self._initialized = True
 
     # ================================================================
@@ -347,7 +352,7 @@ class MemoryGraph(nn.Module):
 
     def _run_block(self, h, msg, W, decay_logit, cell_context,
                    border_gate_logit, surprise_ema, readout_ema,
-                   prev_readout, prev_delta_hat,
+                   prev_readout, prev_delta_hat, prev_H_mid_cols,
                    block_H_mid, augment_fn,
                    start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
@@ -381,6 +386,8 @@ class MemoryGraph(nn.Module):
                 decay_logit = decay_logit.detach()
                 cell_context = cell_context.detach()
                 border_gate_logit = border_gate_logit.detach()
+                if prev_delta_hat is not None:
+                    prev_delta_hat = prev_delta_hat.detach()
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
@@ -391,24 +398,27 @@ class MemoryGraph(nn.Module):
                 prev_readout_cols = prev_readout.reshape(BS, C, D_cc)
                 delta_hat = self.pcm.predict(H_mid_cols, prev_readout_cols)
 
-                if prev_delta_hat is not None and offset > 0:
-                    H_mid_prev_cols = block_H_mid[:, offset - 1].reshape(BS, C, D_cc)
-                    delta_actual = H_mid_cols - H_mid_prev_cols
-                    surprise_t = prev_delta_hat - delta_actual
+                if prev_delta_hat is not None and prev_H_mid_cols is not None:
+                    delta_actual = H_mid_cols - prev_H_mid_cols
+                    # PCM loss: gradient flows to PCM params only
                     pcm_loss_accum = pcm_loss_accum + (
                         prev_delta_hat - delta_actual.detach()).pow(2).mean()
                     pcm_count += 1
+                    # Surprise for augment: DETACHED from PCM graph
+                    # (CE loss should not reach PCM through this path)
+                    surprise_t = (prev_delta_hat - delta_actual).detach()
                 else:
                     surprise_t = torch.zeros(BS, C, D_cc, device=h.device, dtype=h.dtype)
 
                 prev_delta_hat = delta_hat
+                prev_H_mid_cols = H_mid_cols.detach()
 
-                # Accumulate surprise EMA
+                # Accumulate surprise EMA (no grad)
                 surprise_cell = surprise_t.reshape(BS, NC, D_n)
                 with torch.no_grad():
-                    surprise_ema = ema_decay * surprise_ema + (1 - ema_decay) * surprise_cell.detach()
+                    surprise_ema = ema_decay * surprise_ema + (1 - ema_decay) * surprise_cell
 
-                # Augment H_mid with surprise
+                # Augment H_mid with surprise (surprise is detached)
                 surprise_flat = surprise_t.reshape(BS, D)
                 H_aug_t = augment_fn(H_mid_t, surprise_flat)
             else:
@@ -453,7 +463,7 @@ class MemoryGraph(nn.Module):
         pcm_loss = pcm_loss_accum / max(pcm_count, 1)
         return (h, msg, W, decay_logit, cell_context, border_gate_logit,
                 surprise_ema, readout_ema, prev_readout, prev_delta_hat,
-                readouts, pcm_loss)
+                prev_H_mid_cols, readouts, pcm_loss)
 
     # ================================================================
     # Main forward
@@ -519,17 +529,17 @@ class MemoryGraph(nn.Module):
         block_size = max(1, self.config.checkpoint_every)
         w_decay_rate = self.config.w_decay_rate
         total_pcm_loss = torch.tensor(0.0, device=H_mid.device)
+        prev_H_mid_cols = getattr(self, '_prev_H_mid_cols', None)
+        n_blocks = 0
 
         for start_t in range(0, T, block_size):
             end_t = min(start_t + block_size, T)
             block_H_mid = H_mid[:, start_t:end_t]
 
-            # Note: surprise_ema, readout_ema, prev_readout, prev_delta_hat
-            # are NOT checkpointed — they're detached running stats.
-            # We pass them through but they don't carry gradient.
             result = self._run_block(
                 h, msg, W, decay_logit, cell_context, border_gate_logit,
                 surprise_ema, readout_ema, prev_readout, prev_delta_hat,
+                prev_H_mid_cols,
                 block_H_mid, augment_fn,
                 start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
@@ -540,10 +550,11 @@ class MemoryGraph(nn.Module):
 
             (h, msg, W, decay_logit, cell_context, border_gate_logit,
              surprise_ema, readout_ema, prev_readout, prev_delta_hat,
-             block_out, pcm_loss) = result
+             prev_H_mid_cols, block_out, pcm_loss) = result
 
             readouts[:, start_t:end_t] = block_out
             total_pcm_loss = total_pcm_loss + pcm_loss
+            n_blocks += 1
 
         # Save state
         self.h = h
@@ -556,7 +567,7 @@ class MemoryGraph(nn.Module):
         self.readout_ema = readout_ema
         self.prev_readout = prev_readout
         self.prev_delta_hat = prev_delta_hat
+        self._prev_H_mid_cols = prev_H_mid_cols
 
-        n_blocks = T // block_size
         avg_pcm_loss = total_pcm_loss / max(n_blocks, 1)
         return readouts, avg_pcm_loss

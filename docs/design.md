@@ -275,7 +275,7 @@ total_loss = CE_loss + pcm_pred_weight * pcm_pred_loss
 
 ### Gradient boundaries
 
-- `H_aug.detach()` before memory: memory can't backprop into LM/PCM
+- `H_mid.detach()` before memory: memory can't backprop into LM lower scan
 - `surprise_ema` and `readout_ema`: detached EMAs, no grad
 - `surprise_proj`: ON the CE graph — learns end-to-end through modulator
 - PCM: trained ONLY by pred_loss, not by CE loss
