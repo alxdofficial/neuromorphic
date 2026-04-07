@@ -40,13 +40,19 @@ class Model(nn.Module):
             self.memory.initialize_states(BS, device)
             self._initialized = True
 
-        # 1. Lower scan (PCM is now inside memory loop)
-        H_mid = self.lm.forward_scan_lower(input_ids, reset_mask=None)
+        # Build LM reset mask: reset scan carry at positions after EOT tokens.
+        # Memory does NOT reset (lifelong). Only the LM scan resets.
+        eos_positions = (input_ids == self.config.eot_id)  # [BS, T]
+        internal_reset = torch.zeros_like(eos_positions)
+        internal_reset[:, 1:] = eos_positions[:, :-1]  # reset at t+1 after EOT
+        reset_mask = internal_reset if internal_reset.any() else None
 
-        # 2. Memory graph with interleaved PCM
+        # 1. Lower scan with EOT reset
+        H_mid = self.lm.forward_scan_lower(input_ids, reset_mask=reset_mask)
+
+        # 2. Memory graph with interleaved PCM (no reset — lifelong memory)
         if use_memory:
-            # augment_fn: the LM's split_mlp applied per-token inside the memory loop
-            augment_fn = self.lm.augment_single if hasattr(self.lm, 'augment_single') else None
+            augment_fn = self.lm.augment_single
 
             mem_out, pcm_loss = self.memory.forward_segment(
                 H_mid.detach(), augment_fn=augment_fn)
@@ -56,8 +62,8 @@ class Model(nn.Module):
             H_enriched = H_mid
             aux_loss = torch.tensor(0.0, device=device)
 
-        # 3. Upper scan
-        H = self.lm.forward_scan_upper(H_enriched, reset_mask=None)
+        # 3. Upper scan with EOT reset
+        H = self.lm.forward_scan_upper(H_enriched, reset_mask=reset_mask)
 
         # 4. Output
         logits = self.lm.forward_output(H)

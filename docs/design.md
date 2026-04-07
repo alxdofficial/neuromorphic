@@ -295,8 +295,12 @@ PCM pred_loss trains: PCM only (self-supervised transition prediction).
 
 ### EOT handling
 
-CE loss masked: tokens where `input_ids == eot_id` are excluded from
-the loss computation (valid_mask in model.py).
+- **LM scan**: resets carry at positions following EOT tokens (reset_mask).
+  This prevents the scan from carrying hidden state across unrelated documents.
+- **Memory graph**: does NOT reset at EOT. Memory is lifelong — it persists
+  across document boundaries. This is deliberate: the memory accumulates
+  knowledge over the entire training sequence.
+- **CE loss**: tokens where `input_ids == eot_id` are excluded from the loss.
 
 ### Block structure
 

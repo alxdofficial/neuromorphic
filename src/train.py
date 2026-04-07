@@ -82,7 +82,7 @@ def main():
     print(f"  Memory: {config.N} neurons, K={config.K}, D_n={config.D_n}")
     print(f"  Ports: {config.N_port} input + {config.N_port} output, "
           f"alpha={config.alpha}")
-    print(f"  Modulator: hidden={config.neuromod_hidden}")
+    print(f"  Modulator: hidden={config.cell_mod_hidden}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
     model = Model(config).to(device)

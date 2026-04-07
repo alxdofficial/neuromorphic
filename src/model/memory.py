@@ -206,6 +206,9 @@ class MemoryGraph(nn.Module):
             "prev_readout": self.prev_readout.clone(),
             "prev_delta_hat": (
                 self.prev_delta_hat.clone() if self.prev_delta_hat is not None else None),
+            "_prev_H_mid_cols": (
+                self._prev_H_mid_cols.clone()
+                if getattr(self, '_prev_H_mid_cols', None) is not None else None),
         }
 
     def load_runtime_state(self, state: dict):
@@ -225,6 +228,8 @@ class MemoryGraph(nn.Module):
             self.h.shape[0], self.config.D, device=device, dtype=self.h.dtype)).to(device)
         pdt = state.get("prev_delta_hat")
         self.prev_delta_hat = pdt.to(device) if pdt is not None else None
+        phmc = state.get("_prev_H_mid_cols")
+        self._prev_H_mid_cols = phmc.to(device) if phmc is not None else None
         self._initialized = True
 
     # ================================================================
