@@ -66,22 +66,14 @@ class MemoryGraph(nn.Module):
         # Shared state MLP: input = cat(received, h) = 2*D_n
         self.state_w1 = nn.Parameter(torch.empty(Hs, config.state_in))
         self.state_b1 = nn.Parameter(torch.zeros(Hs))
-        self.state_gs1 = nn.Parameter(torch.ones(G, Hs))
-        self.state_gb1 = nn.Parameter(torch.zeros(G, Hs))
         self.state_w2 = nn.Parameter(torch.empty(self.D_n, Hs))
         self.state_b2 = nn.Parameter(torch.zeros(self.D_n))
-        self.state_gs2 = nn.Parameter(torch.ones(G, self.D_n))
-        self.state_gb2 = nn.Parameter(torch.zeros(G, self.D_n))
 
         # Shared message MLP: input = h = D_n
         self.msg_w1 = nn.Parameter(torch.empty(Hm, config.msg_in))
         self.msg_b1 = nn.Parameter(torch.zeros(Hm))
-        self.msg_gs1 = nn.Parameter(torch.ones(G, Hm))
-        self.msg_gb1 = nn.Parameter(torch.zeros(G, Hm))
         self.msg_w2 = nn.Parameter(torch.empty(self.D_n, Hm))
         self.msg_b2 = nn.Parameter(torch.zeros(self.D_n))
-        self.msg_gs2 = nn.Parameter(torch.ones(G, self.D_n))
-        self.msg_gb2 = nn.Parameter(torch.zeros(G, self.D_n))
 
         # Inject projection (per-group)
         self.inject_w = nn.Parameter(
@@ -246,27 +238,21 @@ class MemoryGraph(nn.Module):
         incoming = incoming.reshape(BS, self.N_cells, self.border_per_cell, self.D_n)
         return border_gate * incoming
 
-    def _grouped_mlp(self, x, w1, b1, gs1, gb1, w2, b2, gs2, gb2):
-        BS, NC, Cn, _ = x.shape
+    def _mlp2(self, x, w1, b1, w2, b2):
+        """Two-layer MLP: F.linear → tanh → F.linear → tanh. No group conditioning."""
         flat = x.reshape(-1, x.shape[-1])
-        hidden = F.linear(flat, w1, b1)
-        hidden = hidden.reshape(BS, NC, Cn, -1)
-        hidden = hidden * gs1.unsqueeze(0).unsqueeze(2) + gb1.unsqueeze(0).unsqueeze(2)
-        hidden = torch.tanh(hidden)
-        flat2 = hidden.reshape(-1, hidden.shape[-1])
-        out = F.linear(flat2, w2, b2)
-        out = out.reshape(BS, NC, Cn, -1)
-        out = out * gs2.unsqueeze(0).unsqueeze(2) + gb2.unsqueeze(0).unsqueeze(2)
-        return torch.tanh(out)
+        hidden = torch.tanh(F.linear(flat, w1, b1))
+        out = torch.tanh(F.linear(hidden, w2, b2))
+        return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
-    def _state_update(self, received, h, decay, identity,
-                      w1, b1, gs1, gb1, w2, b2, gs2, gb2):
+    def _state_update(self, received, h, decay, one_minus_decay, identity,
+                      w1, b1, w2, b2):
         state_input = torch.cat([received, h], dim=-1)
-        candidate = self._grouped_mlp(state_input, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
-        return decay * h + (1.0 - decay) * candidate
+        candidate = self._mlp2(state_input, w1, b1, w2, b2)
+        return decay * h + one_minus_decay * candidate
 
-    def _emit_message(self, h, identity, w1, b1, gs1, gb1, w2, b2, gs2, gb2):
-        msg_new = self._grouped_mlp(h, w1, b1, gs1, gb1, w2, b2, gs2, gb2)
+    def _emit_message(self, h, identity, w1, b1, w2, b2):
+        msg_new = self._mlp2(h, w1, b1, w2, b2)
         return msg_new + identity
 
     def _readout(self, msg):
@@ -314,29 +300,26 @@ class MemoryGraph(nn.Module):
             border_gate_logit + delta_border,
         )
 
-    def _step(self, h, msg, W, decay, border_gate,
+    def _step(self, h, msg, W, decay, one_minus_decay, border_gate,
               H_aug_t, identity, inject_w, inject_b,
-              st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
-              mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2):
+              st_w1, st_b1, st_w2, st_b2,
+              mg_w1, mg_b1, mg_w2, mg_b2):
         received = self._receive(msg, W)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
         received[:, :, self.border_lo:self.border_hi] += self._border_exchange(
             msg, border_gate)
 
-        h = self._state_update(received, h, decay, identity,
-                               st_w1, st_b1, st_gs1, st_gb1,
-                               st_w2, st_b2, st_gs2, st_gb2)
-        msg = self._emit_message(h, identity,
-                                 mg_w1, mg_b1, mg_gs1, mg_gb1,
-                                 mg_w2, mg_b2, mg_gs2, mg_gb2)
+        h = self._state_update(received, h, decay, one_minus_decay, identity,
+                               st_w1, st_b1, st_w2, st_b2)
+        msg = self._emit_message(h, identity, mg_w1, mg_b1, mg_w2, mg_b2)
         readout = self._readout(msg)
         return h, msg, readout
 
     def _run_block(self, h, msg, W, decay_logit, cell_context,
                    border_gate_logit,
                    block_H_aug, start_t, identity, inject_w, inject_b,
-                   st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
-                   mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
+                   st_w1, st_b1, st_w2, st_b2,
+                   mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate):
         block_T = block_H_aug.shape[1]
         readouts = torch.empty(
@@ -344,6 +327,7 @@ class MemoryGraph(nn.Module):
             device=block_H_aug.device, dtype=h.dtype)
 
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+        one_minus_decay = 1.0 - decay
         border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
         for offset in range(block_T):
@@ -358,6 +342,7 @@ class MemoryGraph(nn.Module):
                 cell_context = cell_context.detach()
                 border_gate_logit = border_gate_logit.detach()
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+                one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
             # Modulate
@@ -368,14 +353,15 @@ class MemoryGraph(nn.Module):
                         border_gate_logit,
                         mod_w1, mod_b1, mod_w2, mod_b2)
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+                one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
             # Step
             h, msg, readout = self._step(
-                h, msg, W, decay, border_gate,
+                h, msg, W, decay, one_minus_decay, border_gate,
                 block_H_aug[:, offset], identity, inject_w, inject_b,
-                st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
-                mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2)
+                st_w1, st_b1, st_w2, st_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2)
 
             readouts[:, offset] = readout
 
@@ -414,14 +400,6 @@ class MemoryGraph(nn.Module):
         mg_b1 = self.msg_b1.to(dt)
         mg_w2 = self.msg_w2.to(dt)
         mg_b2 = self.msg_b2.to(dt)
-        st_gs1 = self.state_gs1[group_idx].to(dt)
-        st_gb1 = self.state_gb1[group_idx].to(dt)
-        st_gs2 = self.state_gs2[group_idx].to(dt)
-        st_gb2 = self.state_gb2[group_idx].to(dt)
-        mg_gs1 = self.msg_gs1[group_idx].to(dt)
-        mg_gb1 = self.msg_gb1[group_idx].to(dt)
-        mg_gs2 = self.msg_gs2[group_idx].to(dt)
-        mg_gb2 = self.msg_gb2[group_idx].to(dt)
         inject_w = self.inject_w[group_idx].to(dt)
         inject_b = self.inject_b[group_idx].to(dt)
         mod_w1 = self.mod_w1.to(dt)
@@ -440,8 +418,8 @@ class MemoryGraph(nn.Module):
             run_block = lambda h_, msg_, W_, dec_, ctx_, border_: self._run_block(
                 h_, msg_, W_, dec_, ctx_, border_,
                 block_H_aug, start_t, identity, inject_w, inject_b,
-                st_w1, st_b1, st_gs1, st_gb1, st_w2, st_b2, st_gs2, st_gb2,
-                mg_w1, mg_b1, mg_gs1, mg_gb1, mg_w2, mg_b2, mg_gs2, mg_gb2,
+                st_w1, st_b1, st_w2, st_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2, w_decay_rate)
 
             if self.training and block_size > 1:

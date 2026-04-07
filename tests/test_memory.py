@@ -124,14 +124,12 @@ class TestStateDecay:
             (BS, config.N_cells, config.neurons_per_cell), 10.0, dtype=dt
         )).unsqueeze(-1)
 
-        gi = mg.cell_to_group
         args = (
             mg.state_w1.to(dt), mg.state_b1.to(dt),
-            mg.state_gs1[gi].to(dt), mg.state_gb1[gi].to(dt),
             mg.state_w2.to(dt), mg.state_b2.to(dt),
-            mg.state_gs2[gi].to(dt), mg.state_gb2[gi].to(dt),
         )
-        h_new = mg._state_update(received, h_orig, decay, identity, *args)
+        one_minus_decay = 1.0 - decay
+        h_new = mg._state_update(received, h_orig, decay, one_minus_decay, identity, *args)
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 
