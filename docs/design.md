@@ -112,8 +112,8 @@ readout reshape-to-cell → ||readout_cell[t] - prev_readout_cell|| → readout_
   Schmidhuber-style curiosity signal, constructed from the memory-head
   loss instead of a separate world model.
 - **`readout_drift`**: per-cell local state churn —
-  `||cell_context[t] - prev_readout_cell[t]||`. Captures how much each
-  cell's state is moving.
+  `mean(|readout_cell[t] - readout_cell[t-1]|)` per cell. Captures how
+  much each cell's output is moving. Updated after every memory step.
 
 At inference (no backprop), the modulator continues to take writes driven
 by these signals. No external reward, no RL, no labels needed.

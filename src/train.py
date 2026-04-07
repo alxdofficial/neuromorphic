@@ -76,7 +76,7 @@ def main():
 
     bs = args.bs
     T = config.T
-    print(f"\nConfig: D={config.D}, D_n={config.D_n}, C={config.C}")
+    print(f"\nConfig: D={config.D}, D_n={config.D_n}, N_cells={config.N_cells}")
     print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, "
           f"d_inner={config.d_inner}")
     print(f"  Memory: {config.N} neurons, K={config.K}, D_n={config.D_n}")

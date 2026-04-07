@@ -360,13 +360,21 @@ class MemoryGraph(nn.Module):
     def _run_block(self, h, msg, W, decay_logit, cell_context,
                    border_gate_logit,
                    s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
-                   prev_readout_cell,
-                   block_H_mid,
+                   prev_readout_cell, prev_readout_full,
+                   block_H_mid, block_input_ids,
                    start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2,
-                   w_decay_rate):
+                   lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
+                   w_decay_rate, gain_fast, gain_slow):
+        """Run one block of memory steps with live in-block surprise signals.
+
+        Live surprise: at each step t, use prev_readout_full (readout at t-1) to
+        predict input_ids[t] via the weight-tied memory head. The negative
+        target logit becomes s_mem_live(t); EMAs update per-token. The modulator
+        at the next modulation step sees the fresh signal.
+        """
         block_T = block_H_mid.shape[1]
         BS = h.shape[0]
         D = self.config.D
@@ -376,10 +384,12 @@ class MemoryGraph(nn.Module):
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
         one_minus_decay = 1.0 - decay
         border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
+        readout_drift = torch.zeros(BS, NC, 1, device=h.device, dtype=h.dtype)
 
         for offset in range(block_T):
             t = start_t + offset
             H_mid_t = block_H_mid[:, offset]  # [BS, D]
+            tok_t = block_input_ids[:, offset]  # [BS]
 
             # TBPTT detach
             if t > 0 and (t % self.config.tbptt_block == 0):
@@ -389,18 +399,26 @@ class MemoryGraph(nn.Module):
                 decay_logit = decay_logit.detach()
                 cell_context = cell_context.detach()
                 border_gate_logit = border_gate_logit.detach()
+                prev_readout_full = prev_readout_full.detach()
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # --- Modulate every M tokens using the (previous step's) surprise ---
+            # --- Live memory-head surprise (no_grad — detached signal) ---
+            with torch.no_grad():
+                x = prev_readout_full
+                if proj_down_w is not None:
+                    x = F.linear(x, proj_down_w, proj_down_b)
+                x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
+                target_emb = lm_head_w[tok_t]  # [BS, D_embed]
+                target_logit = (x * target_emb).sum(dim=-1)  # [BS]
+                s_mem_live = (-target_logit).to(h.dtype)
+                s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
+                s_mem_ema_slow = (1 - gain_slow) * s_mem_ema_slow + gain_slow * s_mem_live
+
+            # --- Modulate every M tokens using the FRESH surprise ---
             if t % self.config.modulation_interval == 0:
                 s_progress = s_mem_ema_slow - s_mem_ema_fast
-                # Per-cell local surprise: how much each cell's readout churns
-                # between steps. Computed once at modulation time using the
-                # current h-derived readout-stand-in (cell_context as a stable proxy).
-                readout_drift = (cell_context - prev_readout_cell).pow(2).mean(
-                    dim=-1, keepdim=True).sqrt().to(h.dtype)
                 W, decay_logit, cell_context, border_gate_logit = \
                     self._modulate_cells(
                         h, msg, W, decay_logit, cell_context,
@@ -411,7 +429,7 @@ class MemoryGraph(nn.Module):
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # --- Memory step (H_mid injected directly, no augmentation) ---
+            # --- Memory step ---
             h, msg, readout = self._step(
                 h, msg, W, decay, one_minus_decay, border_gate,
                 H_mid_t, identity, inject_w, inject_b,
@@ -420,16 +438,22 @@ class MemoryGraph(nn.Module):
 
             readouts[:, offset] = readout
 
-            # Update per-cell prev_readout (for drift at next modulation).
-            # Use the memory step's output reshaped to cells.
+            # Update per-cell drift (for next modulation).
             with torch.no_grad():
-                prev_readout_cell = readout.reshape(BS, NC, D_n).detach()
+                new_cell = readout.reshape(BS, NC, D_n)
+                readout_drift = (new_cell - prev_readout_cell).abs().mean(
+                    dim=-1, keepdim=True).to(h.dtype)
+                prev_readout_cell = new_cell.detach()
+
+            # Advance prev_readout_full for next-token memory-head prediction.
+            prev_readout_full = readout.detach()
 
             # Soft W decay (on-graph so later-token loss can train modulator).
             W = W * (1.0 - w_decay_rate)
 
         return (h, msg, W, decay_logit, cell_context, border_gate_logit,
-                prev_readout_cell, readouts)
+                s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
+                prev_readout_cell, prev_readout_full, readouts)
 
     # ================================================================
     # Main forward
@@ -469,8 +493,8 @@ class MemoryGraph(nn.Module):
         s_mem_ema_fast = self.s_mem_ema_fast
         s_mem_ema_slow = self.s_mem_ema_slow
         prev_readout_cell = self.prev_readout_cell
-        prev_readout = self.prev_readout  # full-D, for memory head at segment start
-        segment_start_prev_readout = prev_readout.detach().clone()
+        prev_readout_full = self.prev_readout  # full-D, for memory head at block start
+        segment_start_prev_readout = prev_readout_full.detach().clone()
         H_mid = H_mid.to(h.dtype)
 
         identity = self._identity(BS, h.dtype, h.device)
@@ -493,26 +517,40 @@ class MemoryGraph(nn.Module):
         mod_b1 = self.mod_b1.to(dt)
         mod_w2 = self.mod_w2.to(dt)
         mod_b2 = self.mod_b2.to(dt)
+        # LM head weights for the in-block memory head (bf16 compute copies)
+        lm_head_w = lm.lm_head.weight.to(dt)
+        if lm.proj_down is not None:
+            proj_down_w = lm.proj_down.weight.to(dt)
+            proj_down_b = lm.proj_down.bias.to(dt)
+        else:
+            proj_down_w = None
+            proj_down_b = None
+        ln_final_w = lm.ln_final.weight.to(dt)
+        ln_final_b = lm.ln_final.bias.to(dt)
 
         readouts = torch.empty(BS, T, self.config.D, device=H_mid.device, dtype=dt)
         block_size = max(1, self.config.checkpoint_every)
         w_decay_rate = self.config.w_decay_rate
+        gain_fast = self.config.gain_ema_fast
+        gain_slow = self.config.gain_ema_slow
 
         use_ckpt = self.training and self.config.checkpoint_memory
         for start_t in range(0, T, block_size):
             end_t = min(start_t + block_size, T)
             block_H_mid = H_mid[:, start_t:end_t]
+            block_input_ids = input_ids[:, start_t:end_t]
 
             block_args = (
                 h, msg, W, decay_logit, cell_context, border_gate_logit,
                 s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
-                prev_readout_cell,
-                block_H_mid,
+                prev_readout_cell, prev_readout_full,
+                block_H_mid, block_input_ids,
                 start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2,
-                w_decay_rate)
+                lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
+                w_decay_rate, gain_fast, gain_slow)
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
                     self._run_block, *block_args, use_reentrant=False)
@@ -520,37 +558,10 @@ class MemoryGraph(nn.Module):
                 result = self._run_block(*block_args)
 
             (h, msg, W, decay_logit, cell_context, border_gate_logit,
-             prev_readout_cell, block_out) = result
+             s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
+             prev_readout_cell, prev_readout_full, block_out) = result
 
             readouts[:, start_t:end_t] = block_out
-
-            # --- Update live surprise signals using the memory head ---
-            # Memory head uses readout[t-1] to predict token at position t.
-            # prev_readout carries over readout[start_t - 1] (or previous segment's last).
-            # We build the shifted readout sequence: [prev_readout, block_out[:-1]]
-            with torch.no_grad():
-                shifted = torch.cat([
-                    prev_readout.unsqueeze(1),      # [BS, 1, D]
-                    block_out[:, :-1],              # [BS, block_T-1, D]
-                ], dim=1)
-                # For each token t in block, predict input_ids[t] from shifted[t].
-                block_input_ids = input_ids[:, start_t:end_t]
-                # Flatten for batched lookup
-                flat_shifted = shifted.reshape(-1, self.config.D)
-                flat_targets = block_input_ids.reshape(-1)
-                flat_logits = lm.mem_head_target_logit(flat_shifted, flat_targets)
-                # s_mem_live for the LAST token of the block; updates EMAs along the way
-                flat_logits = flat_logits.reshape(BS, -1)  # [BS, block_T]
-                # Walk per-token EMA updates (cheap: vectorized along T with scan would be
-                # overkill; block is small). Use final values.
-                fast = self.config.gain_ema_fast
-                slow = self.config.gain_ema_slow
-                for i in range(flat_logits.shape[1]):
-                    s_mem_live = (-flat_logits[:, i]).to(dt)
-                    s_mem_ema_fast = (1 - fast) * s_mem_ema_fast + fast * s_mem_live
-                    s_mem_ema_slow = (1 - slow) * s_mem_ema_slow + slow * s_mem_live
-                # Advance prev_readout to last readout in block (for next iteration).
-                prev_readout = block_out[:, -1].detach()
 
         # Save state
         self.h = h
@@ -562,21 +573,31 @@ class MemoryGraph(nn.Module):
         self.s_mem_live = s_mem_live.detach()
         self.s_mem_ema_fast = s_mem_ema_fast.detach()
         self.s_mem_ema_slow = s_mem_ema_slow.detach()
-        self.prev_readout = prev_readout.detach()
+        self.prev_readout = prev_readout_full.detach()
         self.prev_readout_cell = prev_readout_cell.detach()
 
-        # --- Segment-level mem_pred_loss ---
+        # --- Segment-level mem_pred_loss, chunked for VRAM ---
         # Memory head uses readout[t-1] to predict token at position t.
-        # "Readout[-1]" is the previous segment's final readout, saved at entry.
+        # Chunk the time axis to avoid materializing [BS, T, V] all at once.
         shifted_all = torch.cat([
             segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),  # [BS, 1, D]
             readouts[:, :-1],                                             # [BS, T-1, D]
         ], dim=1)  # [BS, T, D]
-        mem_logits = lm.mem_head_logits(shifted_all)  # [BS, T, V]
-        mem_pred_loss = F.cross_entropy(
-            mem_logits.reshape(-1, mem_logits.shape[-1]).float(),
-            input_ids.reshape(-1),
-            reduction="mean",
-        )
+
+        loss_sum = torch.zeros((), device=H_mid.device, dtype=torch.float32)
+        count = 0
+        chunk = block_size  # reuse the same chunk size (8)
+        for s in range(0, T, chunk):
+            e = min(s + chunk, T)
+            sub_readout = shifted_all[:, s:e]
+            sub_target = input_ids[:, s:e]
+            sub_logits = lm.mem_head_logits(sub_readout)  # [BS, chunk, V]
+            loss_sum = loss_sum + F.cross_entropy(
+                sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
+                sub_target.reshape(-1),
+                reduction="sum",
+            )
+            count += sub_target.numel()
+        mem_pred_loss = loss_sum / max(count, 1)
 
         return readouts, mem_pred_loss
