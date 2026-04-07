@@ -47,6 +47,7 @@ class Config:
     mem_lr_scale: float = 0.3
     tbptt_block: int = 8
     checkpoint_every: int = 8
+    checkpoint_memory: bool = False  # activation checkpointing on memory block
 
     # === Derived (set by validate()) ===
     D_cc: int = -1

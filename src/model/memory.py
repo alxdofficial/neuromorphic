@@ -484,7 +484,8 @@ class MemoryGraph(nn.Module):
         if not self._initialized:
             self.initialize_states(BS, H_mid.device)
         if not self._compiled and H_mid.is_cuda:
-            self._step = torch.compile(self._step, mode="default", fullgraph=False)
+            self._run_block = torch.compile(
+                self._run_block, mode="default", fullgraph=False)
             self._compiled = True
 
         h = self.h
@@ -532,11 +533,12 @@ class MemoryGraph(nn.Module):
         prev_H_mid_cols = getattr(self, '_prev_H_mid_cols', None)
         n_blocks = 0
 
+        use_ckpt = self.training and self.config.checkpoint_memory
         for start_t in range(0, T, block_size):
             end_t = min(start_t + block_size, T)
             block_H_mid = H_mid[:, start_t:end_t]
 
-            result = self._run_block(
+            block_args = (
                 h, msg, W, decay_logit, cell_context, border_gate_logit,
                 surprise_ema, readout_ema, prev_readout, prev_delta_hat,
                 prev_H_mid_cols,
@@ -547,6 +549,11 @@ class MemoryGraph(nn.Module):
                 mod_w1, mod_b1, mod_w2, mod_b2,
                 surprise_proj_w, surprise_proj_b,
                 w_decay_rate)
+            if use_ckpt:
+                result = torch.utils.checkpoint.checkpoint(
+                    self._run_block, *block_args, use_reentrant=False)
+            else:
+                result = self._run_block(*block_args)
 
             (h, msg, W, decay_logit, cell_context, border_gate_logit,
              surprise_ema, readout_ema, prev_readout, prev_delta_hat,
