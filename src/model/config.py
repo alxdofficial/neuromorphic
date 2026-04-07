@@ -17,11 +17,10 @@ class Config:
     tie_embeddings: bool = True
     dropout: float = 0.1
 
-    # === PCM ===
-    pcm_enabled: bool = True
-    pcm_pred_weight: float = 0.1
-    pcm_hidden: int = 256
-    C: int = 16  # cortical columns
+    # === Memory-prediction head (weight-tied to lm_head) ===
+    mem_pred_weight: float = 0.1     # weight of mem_pred_loss in total loss
+    gain_ema_fast: float = 0.3        # fast EMA decay for s_mem
+    gain_ema_slow: float = 0.05       # slow EMA decay for s_mem
 
     # === Memory Graph (dense-W) ===
     D_n: int = 256  # neuron hidden dim
@@ -38,9 +37,6 @@ class Config:
     mod_rank: int = 0  # 0 = direct delta_W output (no low-rank factorization)
     modulation_interval: int = 4
     w_decay_rate: float = 1e-3  # soft sparsity: W *= (1 - rate) each step
-    surprise_proj_dim: int = 64  # compressed surprise dim for modulator input
-    surprise_ema_decay: float = 0.95
-    split_mlp_hidden: int = 128  # hidden dim for surprise augmentation MLP
 
     # === Training ===
     T: int = 128  # tokens per segment
@@ -50,7 +46,6 @@ class Config:
     checkpoint_memory: bool = False  # activation checkpointing on memory block
 
     # === Derived (set by validate()) ===
-    D_cc: int = -1
     C_mem: int = -1
     N_cells: int = -1
     N: int = -1
@@ -60,8 +55,6 @@ class Config:
 
     def validate(self):
         assert self.D > 0
-        assert self.D % self.C == 0, f"D ({self.D}) must be divisible by C ({self.C})"
-        self.D_cc = self.D // self.C
         assert self.D % self.D_n == 0, f"D ({self.D}) must be divisible by D_n ({self.D_n})"
         self.C_mem = self.D // self.D_n
         self.N_cells = self.C_mem
@@ -102,13 +95,13 @@ class Config:
     def tier_tiny(cls, **kw) -> "Config":
         """Small config for unit tests."""
         defaults = dict(
-            D=64, D_embed=64, C=4, L_total=4, scan_split_at=2,
+            D=64, D_embed=64, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=256, T=8,
             D_n=8, alpha=2, grid_h=2, grid_w=4, neurons_per_cell=16, K=4,
             border_per_cell=4, mlp_groups=4, cell_mod_hidden=16,
             modulation_interval=2, tbptt_block=4, checkpoint_every=4,
             state_mlp_hidden=32, msg_mlp_hidden=32,
-            pcm_hidden=32, w_decay_rate=1e-3, surprise_proj_dim=8,
+            w_decay_rate=1e-3,
         )
         defaults.update(kw)
         c = cls(**defaults)
@@ -117,8 +110,13 @@ class Config:
 
     @property
     def mod_in(self) -> int:
-        """Per-cell modulator input: h_mean + msg_mean + ctx + W_stats + decay_mean + surprise_compressed."""
-        return 3 * self.D_n + 1 + 1 + self.surprise_proj_dim
+        """Per-cell modulator input:
+        h_mean + msg_mean + ctx   : 3*D_n      (per-cell state)
+        W_stats + decay_mean      : 2          (per-cell stats)
+        readout_drift             : 1          (per-cell local surprise)
+        s_mem + s_mem_ema + s_prog: 3          (global, broadcast to cells)
+        """
+        return 3 * self.D_n + 2 + 1 + 3
 
     @property
     def mod_out(self) -> int:

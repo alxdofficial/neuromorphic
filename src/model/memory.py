@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import Config
-from .pcm import BatchedPCM
 
 
 class MemoryGraph(nn.Module):
@@ -28,8 +27,6 @@ class MemoryGraph(nn.Module):
         self.border_per_cell = config.border_per_cell
         self.grid_h = config.grid_h
         self.grid_w = config.grid_w
-        self.C = config.C
-        self.D_cc = config.D_cc
 
         self.input_lo = 0
         self.input_hi = self.alpha
@@ -81,18 +78,6 @@ class MemoryGraph(nn.Module):
         self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
         self.mod_w2 = nn.Parameter(torch.empty(self.N_cells, Hmod, config.mod_out))
         self.mod_b2 = nn.Parameter(torch.zeros(self.N_cells, config.mod_out))
-
-        # PCM (interleaved, per-token)
-        if config.pcm_enabled:
-            self.pcm = BatchedPCM(config.C, config.D_cc, hidden=config.pcm_hidden)
-        else:
-            self.pcm = None
-
-        # Surprise projection: compress surprise_ema + readout_ema for modulator
-        proj_dim = config.surprise_proj_dim
-        self.surprise_proj_w = nn.Parameter(torch.empty(proj_dim, 2 * config.D_n))
-        self.surprise_proj_b = nn.Parameter(torch.zeros(proj_dim))
-        nn.init.kaiming_uniform_(self.surprise_proj_w, a=math.sqrt(5))
 
         # Init weights
         for weight in (
@@ -165,11 +150,18 @@ class MemoryGraph(nn.Module):
             W[:, cell].diagonal(dim1=-2, dim2=-1).zero_()
         self.W = W
 
-        # Surprise state (NEW)
-        self.surprise_ema = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
-        self.readout_ema = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
+        # Surprise state (scalar per batch — memory-head prediction signal).
+        # s_mem(t) is the NEGATIVE target-logit under the memory head (lower = less
+        # surprised). s_mem_live is what the modulator reads inside the loop; the
+        # fast/slow EMAs track it and their difference is learning progress.
+        self.s_mem_live = torch.zeros(BS, device=device, dtype=dt)
+        self.s_mem_ema_fast = torch.zeros(BS, device=device, dtype=dt)
+        self.s_mem_ema_slow = torch.zeros(BS, device=device, dtype=dt)
+        # Per-cell previous readout — for computing readout_drift (local surprise).
+        self.prev_readout_cell = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
+        # Full D-dim previous readout — fed to the memory head for predicting
+        # the next token (memory head uses readout[t-1] to predict x_t).
         self.prev_readout = torch.zeros(BS, self.config.D, device=device, dtype=dt)
-        self.prev_delta_hat = None  # set on first PCM call
 
         self._initialized = True
 
@@ -182,9 +174,9 @@ class MemoryGraph(nn.Module):
         self.decay_logit = self.decay_logit.detach()
         self.cell_context = self.cell_context.detach()
         self.border_gate_logit = self.border_gate_logit.detach()
-        # surprise_ema, readout_ema, prev_readout are already detached (EMA / no_grad)
-        if self.prev_delta_hat is not None:
-            self.prev_delta_hat = self.prev_delta_hat.detach()
+        self.prev_readout = self.prev_readout.detach()
+        self.prev_readout_cell = self.prev_readout_cell.detach()
+        # s_mem_* are already detached (no_grad EMAs)
 
     def reset_states(self, mask: Tensor):
         """Retained for API compatibility; memory is intended to be lifelong."""
@@ -201,14 +193,11 @@ class MemoryGraph(nn.Module):
             "decay_logit": self.decay_logit.clone(),
             "cell_context": self.cell_context.clone(),
             "border_gate_logit": self.border_gate_logit.clone(),
-            "surprise_ema": self.surprise_ema.clone(),
-            "readout_ema": self.readout_ema.clone(),
+            "s_mem_live": self.s_mem_live.clone(),
+            "s_mem_ema_fast": self.s_mem_ema_fast.clone(),
+            "s_mem_ema_slow": self.s_mem_ema_slow.clone(),
             "prev_readout": self.prev_readout.clone(),
-            "prev_delta_hat": (
-                self.prev_delta_hat.clone() if self.prev_delta_hat is not None else None),
-            "_prev_H_mid_cols": (
-                self._prev_H_mid_cols.clone()
-                if getattr(self, '_prev_H_mid_cols', None) is not None else None),
+            "prev_readout_cell": self.prev_readout_cell.clone(),
         }
 
     def load_runtime_state(self, state: dict):
@@ -222,14 +211,16 @@ class MemoryGraph(nn.Module):
         self.decay_logit = state["decay_logit"].to(device)
         self.cell_context = state["cell_context"].to(device)
         self.border_gate_logit = state["border_gate_logit"].to(device)
-        self.surprise_ema = state.get("surprise_ema", torch.zeros_like(self.h[:, :, 0, :])).to(device)
-        self.readout_ema = state.get("readout_ema", torch.zeros_like(self.h[:, :, 0, :])).to(device)
+        BS = self.h.shape[0]
+        dt = self.h.dtype
+        zero_b = torch.zeros(BS, device=device, dtype=dt)
+        self.s_mem_live = state.get("s_mem_live", zero_b).to(device)
+        self.s_mem_ema_fast = state.get("s_mem_ema_fast", zero_b).to(device)
+        self.s_mem_ema_slow = state.get("s_mem_ema_slow", zero_b).to(device)
         self.prev_readout = state.get("prev_readout", torch.zeros(
-            self.h.shape[0], self.config.D, device=device, dtype=self.h.dtype)).to(device)
-        pdt = state.get("prev_delta_hat")
-        self.prev_delta_hat = pdt.to(device) if pdt is not None else None
-        phmc = state.get("_prev_H_mid_cols")
-        self._prev_H_mid_cols = phmc.to(device) if phmc is not None else None
+            BS, self.config.D, device=device, dtype=dt)).to(device)
+        self.prev_readout_cell = state.get("prev_readout_cell", torch.zeros(
+            BS, self.N_cells, self.D_n, device=device, dtype=dt)).to(device)
         self._initialized = True
 
     # ================================================================
@@ -298,26 +289,43 @@ class MemoryGraph(nn.Module):
         return readout.reshape(msg.shape[0], -1)
 
     def _modulate_cells(self, h, msg, W, decay_logit, cell_context,
-                        border_gate_logit, surprise_compressed,
+                        border_gate_logit,
+                        readout_drift, s_mem_live, s_mem_ema_fast, s_progress,
                         mod_w1, mod_b1, mod_w2, mod_b2):
+        """Per-cell neuromodulator step.
+
+        Surprise inputs:
+          - readout_drift   : [BS, NC, 1] — per-cell local state churn
+          - s_mem_live      : [BS]        — current memory-head negative target-logit
+          - s_mem_ema_fast  : [BS]        — fast EMA of s_mem_live
+          - s_progress      : [BS]        — slow - fast (positive = improving)
+        The three scalars are broadcast to all cells.
+        """
         NC, N = self.N_cells, self.C_n
         D_n, B = self.D_n, self.border_per_cell
+        BS = h.shape[0]
 
         h_mean = h.mean(dim=2)
         msg_mean = msg.mean(dim=2)
         W_stats = W.abs().mean(dim=-1).mean(dim=2, keepdim=True)  # [BS, NC, 1]
         decay_mean = decay_logit.mean(dim=2, keepdim=True)  # [BS, NC, 1]
 
+        # Broadcast global scalars to every cell.
+        s1 = s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(h_mean.dtype)
+        s2 = s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(h_mean.dtype)
+        s3 = s_progress.view(BS, 1, 1).expand(BS, NC, 1).to(h_mean.dtype)
+
         mod_input = torch.cat([
-            h_mean, msg_mean, cell_context, W_stats, decay_mean,
-            surprise_compressed,  # [BS, NC, proj_dim]
+            h_mean, msg_mean, cell_context,    # 3*D_n
+            W_stats, decay_mean,               # 2
+            readout_drift,                      # 1
+            s1, s2, s3,                         # 3
         ], dim=-1)
         hidden = torch.tanh(
             torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
         output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
 
         # Unpack: direct delta_W, delta_decay, delta_ctx, delta_border
-        BS = h.shape[0]
         idx = 0
         delta_W = output[..., idx:idx + N * N].reshape(BS, NC, N, N)
         idx += N * N
@@ -350,28 +358,24 @@ class MemoryGraph(nn.Module):
         return h, msg, readout
 
     def _run_block(self, h, msg, W, decay_logit, cell_context,
-                   border_gate_logit, surprise_ema, readout_ema,
-                   prev_readout, prev_delta_hat, prev_H_mid_cols,
-                   block_H_mid, augment_fn,
+                   border_gate_logit,
+                   s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
+                   prev_readout_cell,
+                   block_H_mid,
                    start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2,
-                   surprise_proj_w, surprise_proj_b,
                    w_decay_rate):
         block_T = block_H_mid.shape[1]
         BS = h.shape[0]
         D = self.config.D
-        C, D_cc = self.C, self.D_cc
         NC, D_n = self.N_cells, self.D_n
         readouts = torch.empty(BS, block_T, D, device=block_H_mid.device, dtype=h.dtype)
-        pcm_loss_accum = torch.tensor(0.0, device=block_H_mid.device)
-        pcm_count = 0
 
         decay = torch.sigmoid(decay_logit).unsqueeze(-1)
         one_minus_decay = 1.0 - decay
         border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
-        ema_decay = self.config.surprise_ema_decay
 
         for offset in range(block_T):
             t = start_t + offset
@@ -385,100 +389,67 @@ class MemoryGraph(nn.Module):
                 decay_logit = decay_logit.detach()
                 cell_context = cell_context.detach()
                 border_gate_logit = border_gate_logit.detach()
-                if prev_delta_hat is not None:
-                    prev_delta_hat = prev_delta_hat.detach()
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # --- PCM (interleaved) ---
-            if self.pcm is not None:
-                H_mid_cols = H_mid_t.reshape(BS, C, D_cc)
-                prev_readout_cols = prev_readout.reshape(BS, C, D_cc)
-                delta_hat = self.pcm.predict(H_mid_cols, prev_readout_cols)
-
-                if prev_delta_hat is not None and prev_H_mid_cols is not None:
-                    delta_actual = H_mid_cols - prev_H_mid_cols
-                    # PCM loss: gradient flows to PCM params only
-                    pcm_loss_accum = pcm_loss_accum + (
-                        prev_delta_hat - delta_actual.detach()).pow(2).mean()
-                    pcm_count += 1
-                    # Surprise for augment: DETACHED from PCM graph
-                    # (CE loss should not reach PCM through this path)
-                    surprise_t = (prev_delta_hat - delta_actual).detach()
-                else:
-                    surprise_t = torch.zeros(BS, C, D_cc, device=h.device, dtype=h.dtype)
-
-                prev_delta_hat = delta_hat
-                prev_H_mid_cols = H_mid_cols.detach()
-
-                # Accumulate surprise EMA (no grad)
-                surprise_cell = surprise_t.reshape(BS, NC, D_n)
-                with torch.no_grad():
-                    surprise_ema = ema_decay * surprise_ema + (1 - ema_decay) * surprise_cell
-
-                # Augment H_mid with surprise (surprise is detached)
-                surprise_flat = surprise_t.reshape(BS, D)
-                H_aug_t = augment_fn(H_mid_t, surprise_flat)
-            else:
-                H_aug_t = H_mid_t
-
-            # --- Modulate (with surprise_compressed) ---
+            # --- Modulate every M tokens using the (previous step's) surprise ---
             if t % self.config.modulation_interval == 0:
-                surp_input = torch.cat([
-                    surprise_ema.to(surprise_proj_w.dtype),
-                    readout_ema.to(surprise_proj_w.dtype),
-                ], dim=-1)
-                surprise_compressed = F.linear(
-                    surp_input, surprise_proj_w, surprise_proj_b)
+                s_progress = s_mem_ema_slow - s_mem_ema_fast
+                # Per-cell local surprise: how much each cell's readout churns
+                # between steps. Computed once at modulation time using the
+                # current h-derived readout-stand-in (cell_context as a stable proxy).
+                readout_drift = (cell_context - prev_readout_cell).pow(2).mean(
+                    dim=-1, keepdim=True).sqrt().to(h.dtype)
                 W, decay_logit, cell_context, border_gate_logit = \
                     self._modulate_cells(
                         h, msg, W, decay_logit, cell_context,
-                        border_gate_logit, surprise_compressed,
+                        border_gate_logit,
+                        readout_drift, s_mem_live, s_mem_ema_fast, s_progress,
                         mod_w1, mod_b1, mod_w2, mod_b2)
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
                 border_gate = torch.sigmoid(border_gate_logit).unsqueeze(-1)
 
-            # --- Memory step ---
+            # --- Memory step (H_mid injected directly, no augmentation) ---
             h, msg, readout = self._step(
                 h, msg, W, decay, one_minus_decay, border_gate,
-                H_aug_t, identity, inject_w, inject_b,
+                H_mid_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
 
             readouts[:, offset] = readout
 
-            # Update readout EMA
-            readout_cell = readout.reshape(BS, NC, D_n)
+            # Update per-cell prev_readout (for drift at next modulation).
+            # Use the memory step's output reshaped to cells.
             with torch.no_grad():
-                readout_ema = ema_decay * readout_ema + (1 - ema_decay) * readout_cell.detach()
-            prev_readout = readout.detach()
+                prev_readout_cell = readout.reshape(BS, NC, D_n).detach()
 
-            # Soft W decay (kept on the autograd graph so loss at later tokens
-            # can train the modulator output that produced W — the "write now,
-            # help later" credit path flows through the persistence of W).
+            # Soft W decay (on-graph so later-token loss can train modulator).
             W = W * (1.0 - w_decay_rate)
 
-        pcm_loss = pcm_loss_accum / max(pcm_count, 1)
         return (h, msg, W, decay_logit, cell_context, border_gate_logit,
-                surprise_ema, readout_ema, prev_readout, prev_delta_hat,
-                prev_H_mid_cols, readouts, pcm_loss)
+                prev_readout_cell, readouts)
 
     # ================================================================
     # Main forward
     # ================================================================
 
-    def forward_segment(self, H_mid: Tensor, augment_fn=None):
-        """Process T tokens with interleaved PCM + memory.
+    def forward_segment(self, H_mid: Tensor, input_ids: Tensor, lm):
+        """Process T tokens through the memory graph.
 
         Args:
-            H_mid: [BS, T, D] — lower scan output (detached from LM graph)
-            augment_fn: callable(H_mid_t, surprise_t) → H_aug_t, or None
+            H_mid: [BS, T, D] — lower-scan output (detached from LM graph)
+            input_ids: [BS, T] — input tokens; used to compute the per-token
+                memory-head target-logit surprise signal, where the memory
+                head uses readout[t-1] to predict the token at position t.
+            lm: LM module — provides mem_head_target_logit and mem_head_logits
+                (weight-tied to the main lm_head).
 
         Returns:
-            readouts: [BS, T, D] — memory readout per token
-            pcm_loss: scalar — PCM prediction loss (for aux_loss)
+            readouts:      [BS, T, D] — memory readout per token
+            mem_pred_loss: scalar      — CE of memory head against input_ids
+                                          (used as auxiliary training loss)
         """
         BS, T, _ = H_mid.shape
         if not self._initialized:
@@ -494,10 +465,12 @@ class MemoryGraph(nn.Module):
         decay_logit = self.decay_logit
         cell_context = self.cell_context
         border_gate_logit = self.border_gate_logit
-        surprise_ema = self.surprise_ema
-        readout_ema = self.readout_ema
-        prev_readout = self.prev_readout
-        prev_delta_hat = self.prev_delta_hat
+        s_mem_live = self.s_mem_live
+        s_mem_ema_fast = self.s_mem_ema_fast
+        s_mem_ema_slow = self.s_mem_ema_slow
+        prev_readout_cell = self.prev_readout_cell
+        prev_readout = self.prev_readout  # full-D, for memory head at segment start
+        segment_start_prev_readout = prev_readout.detach().clone()
         H_mid = H_mid.to(h.dtype)
 
         identity = self._identity(BS, h.dtype, h.device)
@@ -520,18 +493,10 @@ class MemoryGraph(nn.Module):
         mod_b1 = self.mod_b1.to(dt)
         mod_w2 = self.mod_w2.to(dt)
         mod_b2 = self.mod_b2.to(dt)
-        surprise_proj_w = self.surprise_proj_w.to(dt)
-        surprise_proj_b = self.surprise_proj_b.to(dt)
-
-        if augment_fn is None:
-            augment_fn = lambda h_mid_t, surp_t: h_mid_t
 
         readouts = torch.empty(BS, T, self.config.D, device=H_mid.device, dtype=dt)
         block_size = max(1, self.config.checkpoint_every)
         w_decay_rate = self.config.w_decay_rate
-        total_pcm_loss = torch.tensor(0.0, device=H_mid.device)
-        prev_H_mid_cols = getattr(self, '_prev_H_mid_cols', None)
-        n_blocks = 0
 
         use_ckpt = self.training and self.config.checkpoint_memory
         for start_t in range(0, T, block_size):
@@ -540,14 +505,13 @@ class MemoryGraph(nn.Module):
 
             block_args = (
                 h, msg, W, decay_logit, cell_context, border_gate_logit,
-                surprise_ema, readout_ema, prev_readout, prev_delta_hat,
-                prev_H_mid_cols,
-                block_H_mid, augment_fn,
+                s_mem_live, s_mem_ema_fast, s_mem_ema_slow,
+                prev_readout_cell,
+                block_H_mid,
                 start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2,
-                surprise_proj_w, surprise_proj_b,
                 w_decay_rate)
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
@@ -556,12 +520,37 @@ class MemoryGraph(nn.Module):
                 result = self._run_block(*block_args)
 
             (h, msg, W, decay_logit, cell_context, border_gate_logit,
-             surprise_ema, readout_ema, prev_readout, prev_delta_hat,
-             prev_H_mid_cols, block_out, pcm_loss) = result
+             prev_readout_cell, block_out) = result
 
             readouts[:, start_t:end_t] = block_out
-            total_pcm_loss = total_pcm_loss + pcm_loss
-            n_blocks += 1
+
+            # --- Update live surprise signals using the memory head ---
+            # Memory head uses readout[t-1] to predict token at position t.
+            # prev_readout carries over readout[start_t - 1] (or previous segment's last).
+            # We build the shifted readout sequence: [prev_readout, block_out[:-1]]
+            with torch.no_grad():
+                shifted = torch.cat([
+                    prev_readout.unsqueeze(1),      # [BS, 1, D]
+                    block_out[:, :-1],              # [BS, block_T-1, D]
+                ], dim=1)
+                # For each token t in block, predict input_ids[t] from shifted[t].
+                block_input_ids = input_ids[:, start_t:end_t]
+                # Flatten for batched lookup
+                flat_shifted = shifted.reshape(-1, self.config.D)
+                flat_targets = block_input_ids.reshape(-1)
+                flat_logits = lm.mem_head_target_logit(flat_shifted, flat_targets)
+                # s_mem_live for the LAST token of the block; updates EMAs along the way
+                flat_logits = flat_logits.reshape(BS, -1)  # [BS, block_T]
+                # Walk per-token EMA updates (cheap: vectorized along T with scan would be
+                # overkill; block is small). Use final values.
+                fast = self.config.gain_ema_fast
+                slow = self.config.gain_ema_slow
+                for i in range(flat_logits.shape[1]):
+                    s_mem_live = (-flat_logits[:, i]).to(dt)
+                    s_mem_ema_fast = (1 - fast) * s_mem_ema_fast + fast * s_mem_live
+                    s_mem_ema_slow = (1 - slow) * s_mem_ema_slow + slow * s_mem_live
+                # Advance prev_readout to last readout in block (for next iteration).
+                prev_readout = block_out[:, -1].detach()
 
         # Save state
         self.h = h
@@ -570,11 +559,24 @@ class MemoryGraph(nn.Module):
         self.decay_logit = decay_logit
         self.cell_context = cell_context
         self.border_gate_logit = border_gate_logit
-        self.surprise_ema = surprise_ema
-        self.readout_ema = readout_ema
-        self.prev_readout = prev_readout
-        self.prev_delta_hat = prev_delta_hat
-        self._prev_H_mid_cols = prev_H_mid_cols
+        self.s_mem_live = s_mem_live.detach()
+        self.s_mem_ema_fast = s_mem_ema_fast.detach()
+        self.s_mem_ema_slow = s_mem_ema_slow.detach()
+        self.prev_readout = prev_readout.detach()
+        self.prev_readout_cell = prev_readout_cell.detach()
 
-        avg_pcm_loss = total_pcm_loss / max(n_blocks, 1)
-        return readouts, avg_pcm_loss
+        # --- Segment-level mem_pred_loss ---
+        # Memory head uses readout[t-1] to predict token at position t.
+        # "Readout[-1]" is the previous segment's final readout, saved at entry.
+        shifted_all = torch.cat([
+            segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),  # [BS, 1, D]
+            readouts[:, :-1],                                             # [BS, T-1, D]
+        ], dim=1)  # [BS, T, D]
+        mem_logits = lm.mem_head_logits(shifted_all)  # [BS, T, V]
+        mem_pred_loss = F.cross_entropy(
+            mem_logits.reshape(-1, mem_logits.shape[-1]).float(),
+            input_ids.reshape(-1),
+            reduction="mean",
+        )
+
+        return readouts, mem_pred_loss

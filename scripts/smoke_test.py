@@ -69,11 +69,12 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
             W_sparsity = (mg.W.float().abs() < 1e-4).float().mean().item()
             W_max = mg.W.float().abs().max().item()
             decay_mean = torch.sigmoid(mg.decay_logit).float().mean().item()
-            surp_norm = mg.surprise_ema.float().norm().item()
-            read_norm = mg.readout_ema.float().norm().item()
+            s_mem = mg.s_mem_live.float().mean().item()
+            s_fast = mg.s_mem_ema_fast.float().mean().item()
+            s_slow = mg.s_mem_ema_slow.float().mean().item()
         else:
             h_norm = msg_norm = W_norm = W_sparsity = W_max = 0
-            decay_mean = surp_norm = read_norm = 0
+            decay_mean = s_mem = s_fast = s_slow = 0
 
         # Check for explosions
         flags = []
@@ -95,11 +96,11 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
         flag_str = " ".join(flags) if flags else "OK"
 
         if step % 5 == 0 or flags:
-            print(f"[{step:3d}] loss={loss_val:.3f} aux={aux_val:.4f} "
+            print(f"[{step:3d}] loss={loss_val:.3f} mem={aux_val:.4f} "
                   f"lm_gn={lm_grad_norm:.3f} mem_gn={mem_grad_norm:.3f} | "
                   f"h={h_norm:.1f} msg={msg_norm:.1f} W={W_norm:.1f} "
                   f"W_sp={W_sparsity:.2f} W_max={W_max:.3f} "
-                  f"dec={decay_mean:.3f} surp={surp_norm:.2f} read={read_norm:.2f} | "
+                  f"dec={decay_mean:.3f} s_mem={s_mem:.2f} fast={s_fast:.2f} slow={s_slow:.2f} | "
                   f"{flag_str}")
 
     print()
@@ -112,7 +113,7 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
     print(f"NaN detected: {any_nan}")
     print(f"Final h_norm: {h_norm:.1f}")
     print(f"Final W_norm: {W_norm:.1f}, W_max: {W_max:.3f}, W_sparsity: {W_sparsity:.2f}")
-    print(f"Final surprise_ema norm: {surp_norm:.2f}")
+    print(f"Final s_mem: live={s_mem:.2f} fast={s_fast:.2f} slow={s_slow:.2f}")
 
     if any_nan:
         print("\nFAILED: NaN in loss")

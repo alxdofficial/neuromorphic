@@ -1,10 +1,14 @@
-"""Top-level Model: LM + MemoryGraph with interleaved PCM.
+"""Top-level Model: LM + MemoryGraph with weight-tied memory-prediction head.
 
 Training flow per chunk:
   1. Lower scan → H_mid
-  2. Memory graph (with interleaved PCM): forward_segment(H_mid) → mem_out, pcm_loss
-  3. H_enriched = H_mid + mem_scale * mem_out (note: surprise augmentation happens inside memory)
+  2. Memory graph: forward_segment(H_mid, input_ids, lm) → readouts, mem_pred_loss
+     (memory head = lm_head(readout), weight-tied; trains memory to carry
+     information useful for predicting tokens; its per-token CE is also the
+     live surprise signal fed to the modulator.)
+  3. H_enriched = H_mid + mem_scale * readouts
   4. Upper scan → logits
+  5. total_loss = ce_loss + mem_pred_weight * mem_pred_loss
 """
 
 import torch
@@ -57,14 +61,15 @@ class Model(nn.Module):
         # 1. Lower scan with EOT reset
         H_mid = self.lm.forward_scan_lower(input_ids, reset_mask=reset_mask)
 
-        # 2. Memory graph with interleaved PCM (no reset — lifelong memory)
+        # 2. Memory graph (no reset — lifelong memory). The memory head is
+        #    weight-tied to lm_head; its CE loss trains memory to carry info
+        #    useful for predicting tokens, and its per-token value is the
+        #    live surprise signal the modulator uses.
         if use_memory:
-            augment_fn = self.lm.augment_single
-
-            mem_out, pcm_loss = self.memory.forward_segment(
-                H_mid.detach(), augment_fn=augment_fn)
-            H_enriched = H_mid + self.lm.mem_scale * mem_out.to(H_mid.dtype)
-            aux_loss = self.config.pcm_pred_weight * pcm_loss
+            readouts, mem_pred_loss = self.memory.forward_segment(
+                H_mid.detach(), input_ids, self.lm)
+            H_enriched = H_mid + self.lm.mem_scale * readouts.to(H_mid.dtype)
+            aux_loss = self.config.mem_pred_weight * mem_pred_loss
         else:
             H_enriched = H_mid
             aux_loss = torch.tensor(0.0, device=device)

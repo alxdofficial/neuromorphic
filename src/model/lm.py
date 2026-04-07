@@ -1,6 +1,7 @@
-"""Language Model — split-scan with mid-scan memory injection + PCM.
+"""Language Model — split-scan with mid-scan memory injection.
 
-Lower scan layers → PCM surprise → augment → memory graph → upper scan → head.
+Lower scan → memory graph → upper scan → head.
+The LM head is shared as the memory-prediction head via weight tying.
 """
 
 import math
@@ -39,16 +40,6 @@ class LM(nn.Module):
                 ScanLayer(D, config.d_inner, config.dropout,
                           n_layers=config.L_total, glu_output=config.glu_output))
 
-        # split_mlp: combines H_mid with surprise (called per-token from memory loop)
-        split_h = config.split_mlp_hidden
-        self.split_mlp = nn.Sequential(
-            nn.Linear(2 * D, split_h),
-            nn.SiLU(),
-            nn.Linear(split_h, D),
-        )
-        with torch.no_grad():
-            self.split_mlp[2].weight.mul_(1.0 / math.sqrt(2 * config.L_total))
-
         self.mem_scale = nn.Parameter(
             torch.full((D,), math.sqrt(config.alpha)))
 
@@ -61,10 +52,7 @@ class LM(nn.Module):
 
     def forward_scan_lower(self, input_ids: Tensor,
                            reset_mask: Tensor | None = None) -> Tensor:
-        """Lower scan only. PCM is now in the memory loop.
-
-        Returns: H_mid [BS, T, D]
-        """
+        """Lower scan. Returns: H_mid [BS, T, D]"""
         BS, T = input_ids.shape
         split = self.config.scan_split_at
 
@@ -80,28 +68,28 @@ class LM(nn.Module):
 
         return H
 
-    def augment(self, H_mid: Tensor, surprise: Tensor) -> Tensor:
-        """Combine H_mid and surprise into H_aug."""
-        if self.split_mlp is not None:
-            surp_rms = surprise.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
-            surprise_normed = surprise * surp_rms
-            H_aug = H_mid + self.split_mlp(
-                torch.cat([H_mid, surprise_normed], dim=-1))
-        else:
-            H_aug = H_mid
-        return H_aug
+    def mem_head_target_logit(self, readout: Tensor, target: Tensor) -> Tensor:
+        """Unnormalized log-prob at target under the memory head.
 
-    def augment_single(self, H_mid_t: Tensor, surprise_t: Tensor) -> Tensor:
-        """Per-token augmentation for interleaved PCM. H_mid_t/surprise_t: [BS, D]."""
-        surp_rms = surprise_t.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
-        surprise_normed = surprise_t * surp_rms
-        mlp_input = torch.cat([H_mid_t, surprise_normed], dim=-1)
-        # Cast to f32 for split_mlp (f32 params), then back
-        out = self.split_mlp(mlp_input.float()).to(H_mid_t.dtype)
-        return H_mid_t + out
+        Shares proj_down → ln_final → lm_head with the main LM head (weight-tied).
+        readout: [BS, D] → target_logit: [BS] (scalar per sample).
+        Used as the cheap live surprise signal inside the memory loop.
+        """
+        dt = self.lm_head.weight.dtype
+        x = readout.to(dt)
+        if self.proj_down is not None:
+            x = self.proj_down(x)
+        x = self.ln_final(x)  # [BS, D_embed]
+        target_emb = self.lm_head.weight[target]  # [BS, D_embed]
+        return (x * target_emb).sum(dim=-1)  # [BS]
 
-    def inject_memory(self, H_aug: Tensor, mem_out: Tensor) -> Tensor:
-        return H_aug + self.mem_scale * mem_out.to(H_aug.dtype)
+    def mem_head_logits(self, readouts: Tensor) -> Tensor:
+        """Full memory-head logits over a sequence of readouts.
+
+        readouts: [BS, T, D] → logits: [BS, T, V].
+        Used at segment end to compute mem_pred_loss (proper CE).
+        """
+        return self.forward_output(readouts.to(self.lm_head.weight.dtype))
 
     def forward_scan_upper(self, H_enriched: Tensor,
                            reset_mask: Tensor | None = None) -> Tensor:
