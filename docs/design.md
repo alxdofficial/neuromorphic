@@ -7,259 +7,270 @@
 3. GPU-friendly: all hot-path operations are batched matmuls (bmm) or F.linear.
 4. Lifelong learning: neuromodulator continuously adjusts connectivity.
 5. No document-boundary resets in the memory graph.
-6. No discrete structural plasticity — connectivity evolves continuously.
-7. Surprise-driven memory management: PCM surprise feeds into the neuromodulator.
+6. Surprise-driven memory management: PCM surprise feeds into the neuromodulator.
 
 ## Architecture Overview
 
 ```
-tokens → embedding → lower scan → H_mid[0..T-1]  (parallel)
+tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                                        │
                            ┌───────────┘
                            ▼
                  ┌─── per-token loop (t = 0..T-1) ───┐
                  │                                     │
                  │  PCM(H_mid[t], prev_readout)        │
-                 │       → surprise[t]                 │
+                 │       → surprise[t] (detached)      │
                  │       → update surprise_ema          │
                  │                                     │
-                 │  augment(H_mid[t], surprise[t])     │
+                 │  augment_single(H_mid[t], surprise)  │
                  │       → H_aug[t]                    │
+                 │       (split_mlp: Linear(2D,128)    │
+                 │        → SiLU → Linear(128,D))      │
                  │                                     │
                  │  memory_step(H_aug[t])              │
+                 │       → W @ msg (dense bmm)         │
+                 │       → inject + border exchange     │
+                 │       → state MLP + decay blend     │
+                 │       → message MLP + identity      │
                  │       → readout[t]                  │
                  │                                     │
-                 │  H_enriched[t] = H_aug[t]           │
-                 │       + mem_scale * readout[t]      │
+                 │  update readout_ema                  │
                  │                                     │
-                 │  (every M steps: modulate with      │
+                 │  (every 4 steps: modulate with      │
                  │   surprise_compressed as input)      │
                  │                                     │
                  └─────────────────────────────────────┘
                            │
                            ▼
-                 upper scan → H_upper[0..T-1]  (parallel)
+         H_enriched = H_mid + mem_scale * mem_out
+                           │
+                           ▼
+                 upper scan → H_upper[0..T-1]  (parallel, fused_scan)
                            │
                            ▼
                         LM head → logits
 ```
 
-The lower and upper scans run in parallel over T. The middle section
-(PCM + memory) runs sequentially per token. The PCM is interleaved
-with the memory graph, receiving the previous step's memory readout
-as context for its predictions.
+Note: H_enriched is computed from H_mid (not H_aug). The surprise
+augmentation (H_aug) is used only inside the memory loop for the
+inject step. The upper scan sees H_mid + scaled readout.
+
+## Default Dimensions
+
+| Parameter | Symbol | Default | Source |
+|-----------|--------|---------|--------|
+| LM hidden dim | D | 2048 | config.D |
+| Embedding dim | D_embed | 768 | config.D_embed |
+| Scan layers | L_total | 4 | config.L_total |
+| Scan split point | split_at | 2 | config.scan_split_at |
+| Scan recurrence dim | d_inner | 1200 | config.d_inner |
+| Cortical columns (PCM) | C | 16 | config.C |
+| Per-column dim | D_cc | 128 | D // C |
+| Neuron hidden dim | D_n | 256 | config.D_n |
+| Cells | N_cells | 8 | D // D_n |
+| Grid | H × W | 2 × 4 | config.grid_h × grid_w |
+| Neurons per cell | Cn | 32 | config.neurons_per_cell |
+| Total neurons | N | 256 | N_cells × Cn |
+| Ports per cell | alpha | 4 | config.alpha |
+| Border neurons per cell | B | 4 | config.border_per_cell |
+| MLP groups (inject only) | G | 8 | config.mlp_groups |
+| State MLP hidden | Hs | 256 | config.state_mlp_hidden |
+| Msg MLP hidden | Hm | 256 | config.msg_mlp_hidden |
+| Modulator hidden | Hmod | 2048 | config.cell_mod_hidden |
+| Split MLP hidden | — | 128 | config.split_mlp_hidden |
+| Surprise proj dim | proj_dim | 64 | config.surprise_proj_dim |
+| PCM hidden | — | 256 | config.pcm_hidden |
+| Modulation interval | M | 4 | config.modulation_interval |
+| TBPTT block | — | 8 | config.tbptt_block |
+| Checkpoint every | — | 8 | config.checkpoint_every |
+| W decay rate | — | 1e-3 | config.w_decay_rate |
+| Surprise EMA decay | — | 0.95 | config.surprise_ema_decay |
 
 ## Predictive Coding Module (PCM)
 
+### Location
+
+Inside the memory graph's per-token loop (`MemoryGraph._run_block`),
+NOT in the LM. The PCM is owned by `MemoryGraph` as `self.pcm`.
+
 ### What it predicts
 
-The PCM predicts the LM's hidden state transition: `H_mid[t+1] - H_mid[t]`.
+H_mid state transitions: `delta_hat[t] = PCM_MLP(H_mid[t], prev_readout)`.
+Target: `H_mid[t+1] - H_mid[t]` (fixed, from lower scan).
 
-**Input**: `H_mid[t]` (current LM state) + `prev_readout` (what memory
-contributed last step). The memory readout gives the PCM context — if
-memory already "knows" about an upcoming transition, the PCM can predict
-it, producing low surprise.
+### Input
 
-**Output**: `delta_hat[t]` (predicted transition) + `surprise[t]` (prediction
-error = `delta_hat[t-1] - delta_actual[t]`).
+Per cortical column: `cat([H_mid_cols[t], prev_readout_cols], dim=-1)`.
+Shape: `[BS, C=16, 2*D_cc=256]`.
 
-**Target**: `H_mid[t+1] - H_mid[t]` — fully determined by the lower scan
-before the memory loop starts. No circularity: surprise[t] affects H_aug[t]
-and the upper scan, but NOT H_mid[t+1].
+The prev_readout gives the PCM memory context — if memory already
+"knows" about an upcoming transition, the PCM can predict it (low surprise).
+
+### Forward
+
+Per-column RMSNorm on the concatenated input, then per-column MLP:
+`bmm([C, BS, 2*D_cc], [C, 2*D_cc, hidden]) → SiLU → bmm → delta_hat`.
+PCM weights are f32, cast to compute dtype (bf16) inside `predict()`.
+
+### Surprise computation
+
+```python
+if t > 0 and prev_delta_hat is not None:
+    delta_actual = H_mid_cols[t] - H_mid_cols[t-1]
+    surprise_t = (prev_delta_hat - delta_actual).detach()  # no CE grad into PCM
+    pcm_loss += (prev_delta_hat - delta_actual.detach()).pow(2).mean()
+```
+
+The `.detach()` on surprise_t ensures CE loss cannot reach PCM through
+the augment path. The pcm_loss computation keeps PCM gradients flowing.
 
 ### PCM loss
 
-Self-supervised: `pred_loss = MSE(delta_hat[t], (H_mid[t+1] - H_mid[t]).detach())`.
-Weighted by `pcm_pred_weight` and added to CE loss as auxiliary loss.
-The PCM trains to predict accurately, independent of how the memory
-uses its surprise signal.
+Self-supervised: `pcm_pred_loss = MSE(delta_hat, delta_actual.detach())`.
+Added to total loss as `pcm_pred_weight * pcm_pred_loss` (default 0.1).
 
-### Surprise flow into memory
+## Surprise Pipeline
 
 ```
-PCM outputs surprise[t]           [BS, C, D_cc] = [BS, 16, 128]
-    ↓ reshape to per-cell
-surprise_per_cell[t]              [BS, NC, D_n] = [BS, 8, 256]
-    ↓ EMA accumulation (detached, per step)
-surprise_ema                      [BS, NC, D_n]
+PCM outputs surprise_t         [BS, C=16, D_cc=128]    (detached)
+    ↓ reshape (C*D_cc = NC*D_n = 2048)
+surprise_cell                  [BS, NC=8, D_n=256]
+    ↓ EMA accumulation (no_grad, per step)
+surprise_ema                   [BS, NC, D_n]            (runtime state)
     ↓ also accumulate readout
-readout_ema                       [BS, NC, D_n]
-    ↓ learned projection (at modulation time, ON the CE graph)
-surprise_compressed               [BS, NC, proj_dim=64]
+readout_ema                    [BS, NC, D_n]            (runtime state)
+    ↓ at modulation time: learned projection (ON the CE graph)
+    ↓ F.linear(cat([surprise_ema, readout_ema]), surprise_proj_w)
+surprise_compressed            [BS, NC, proj_dim=64]
     ↓ concatenated into modulator input
-modulator decides how to adjust W, decay, context, gates
+modulator adjusts W, decay, context, gates
 ```
 
-**surprise_ema** and **readout_ema** are runtime state (EMA, no grad).
-They capture "what's been surprising recently" and "what memory has been
-contributing recently." The temporal smoothing filters noise.
-
-**surprise_proj** is a learned parameter `[proj_dim, 2*D_n]` trained
-end-to-end via CE loss through the modulator. It learns which aspects
-of surprise and readout are useful for memory management decisions.
-The PCM itself (trained by aux_loss) doesn't know about this — clean
-separation between "predict accurately" and "use predictions well."
+`surprise_proj_w: [proj_dim, 2*D_n]` is trained end-to-end via CE loss
+through the modulator. It learns which aspects of surprise and readout
+history are useful for memory management decisions.
 
 ## Memory Graph
 
-### Layout
-
-Grid of cells. Each cell contains N neurons with D_n-dim hidden states.
-Connectivity within a cell is a dense N×N weight matrix W.
-
-### Default Dimensions
-
-| Parameter | Symbol | Default |
-|-----------|--------|---------|
-| LM hidden dim | D | 2048 |
-| Neuron hidden dim | D_n | 256 |
-| Cells | N_cells | 8 |
-| Grid | H × W | 2 × 4 |
-| Neurons per cell | N | 32 |
-| Total neurons | N_total | 256 |
-| Input/output ports per cell | alpha | 4 |
-| Border neurons per cell | B | 4 |
-| State MLP hidden | Hs | 256 |
-| Msg MLP hidden | Hm | 256 |
-| Modulator hidden | Hmod | 128 |
-| Modulator rank | r | 16 |
-| Surprise projection dim | proj_dim | 64 |
-
 ### Connectivity: Dense W Matrix
 
-Each cell has a connectivity matrix `W: [BS, NC, N, N]`. Runtime state,
-not a learned parameter. Initialized sparse (K nonzeros per row),
-evolves continuously via the neuromodulator.
-
-Message passing is a single batched matmul:
-```python
-received = torch.matmul(W, msg)
-```
-
-Soft sparsity via per-step decay:
-```python
-W = W * (1 - w_decay_rate)
-```
-
-### Runtime State
-
-```
-h                : [BS, NC, N, D_n]     — neuron hidden states
-msg              : [BS, NC, N, D_n]     — neuron messages
-W                : [BS, NC, N, N]       — connectivity matrix
-decay_logit      : [BS, NC, N]          — per-neuron temporal decay
-cell_context     : [BS, NC, D_n]        — per-cell context
-border_gate_logit: [BS, NC, B]          — cross-cell exchange gates
-surprise_ema     : [BS, NC, D_n]        — EMA of per-cell surprise (NEW)
-readout_ema      : [BS, NC, D_n]        — EMA of per-cell readout (NEW)
-prev_readout     : [BS, D]              — previous step's readout for PCM (NEW)
-```
-
-### Learned Parameters
-
-```
-neuron_id        : [NC, N, D_n]         — per-neuron identity embedding
-state_w1         : [Hs, 2*D_n]         — shared state MLP (split into recv/h halves)
-state_b1         : [Hs]
-state_w2         : [D_n, Hs]
-state_b2         : [D_n]
-msg_w1/b1/w2/b2  : ...                 — shared message MLP
-mod_w1           : [NC, mod_in, Hmod]   — per-cell modulator
-mod_b1/w2/b2     : ...
-inject_w/b       : [G, ...]            — per-group inject projection
-surprise_proj_w  : [proj_dim, 2*D_n]   — surprise compression (NEW)
-surprise_proj_b  : [proj_dim]          — (NEW)
-mem_scale        : [D]                  — LM-side readout scale
-pcm_w1/b1/w2/b2  : [C, ...]           — PCM prediction MLP (MOVED from LM)
-```
-
-## Per-Token Step (inside memory loop)
-
-### 0. PCM (NEW location — inside the loop)
+Each cell has `W: [BS, NC, Cn, Cn] = [BS, 8, 32, 32]`. Runtime state
+(not a learned parameter). Initialized sparse (K=8 nonzeros per row),
+evolves via the neuromodulator. Message passing is a single bmm:
 
 ```python
-# PCM input: current LM state + previous memory readout
-pcm_input = cat([H_mid_cols[t], prev_readout_cols], dim=-1)  # [BS, C, 2*D_cc]
-delta_hat[t] = pcm_mlp(pcm_input)                            # [BS, C, D_cc]
-
-# Surprise (using previous prediction)
-if t > 0:
-    delta_actual = H_mid_cols[t] - H_mid_cols[t-1]
-    surprise[t] = prev_delta_hat - delta_actual
-prev_delta_hat = delta_hat[t]
-
-# Accumulate per-cell surprise (detached EMA)
-surprise_cell = surprise[t].reshape(BS, NC, D_n)
-surprise_ema = 0.95 * surprise_ema + 0.05 * surprise_cell.detach()
+received = torch.matmul(W, msg)    # [BS, NC, Cn, D_n]
 ```
 
-### 0b. Augment
+Soft sparsity: `W *= (1 - w_decay_rate)` each step (no_grad).
+
+### Neuromodulator
+
+Per-cell MLP, runs every `modulation_interval=4` steps.
+
+**Input** `[BS, NC, mod_in=834]`:
+```python
+cat([h_mean, msg_mean, cell_context, W_stats, decay_mean, surprise_compressed])
+#    [D_n]   [D_n]     [D_n]        [1]      [1]         [proj_dim=64]
+```
+
+**Hidden**: `[BS, NC, Hmod=2048]` (tanh activation, per-cell einsum)
+
+**Output** `[BS, NC, mod_out=1316]`:
+```python
+delta_W:      [BS, NC, N*N=1024]  → reshape to [BS, NC, 32, 32]  (direct, full resolution)
+delta_decay:  [BS, NC, N=32]
+delta_ctx:    [BS, NC, D_n=256]
+delta_border: [BS, NC, B=4]
+```
+
+The modulator directly outputs all 1024 entries of delta_W — no
+low-rank factorization. With Cn=32, the full W matrix is small enough
+to predict directly.
+
+### Cell Layout
+
+```
+[0 : 4)      — input port neurons
+[4 : 8)      — output port neurons
+[8 : 12)     — border neurons
+[12 : 32)    — internal neurons
+```
+
+### Inject
+
+H_aug_t `[BS, D=2048]` reshaped to `[BS, NC=8, D_n=256]`, projected
+through per-group `inject_w: [G=8, alpha*D_n, D_n]` with orthogonal
+init, added to input port neuron positions.
+
+### Border Exchange
+
+Grid-reshape + slice shifts (N/S/E/W). Vectorized, no Python loops:
+```python
+border = msg[:, :, 8:12].reshape(BS, grid_h, grid_w, 4, D_n)
+incoming[:, 1:, :, 0] = border[:, :-1, :, 1]   # north
+...
+```
+Gated by `sigmoid(border_gate_logit)`.
+
+### State Update
+
+Split first-layer optimization: no `cat([received, h])` tensor allocation.
+```python
+hidden = tanh(F.linear(received, w1_recv) + F.linear(h, w1_h, b1))
+candidate = tanh(F.linear(hidden, w2, b2))
+h_new = decay * h + (1 - decay) * candidate
+```
+Shared weights across all neurons. No group scale/bias.
+
+### Emit Message
 
 ```python
-H_aug[t] = H_mid[t] + split_mlp(H_mid[t], surprise[t])
+msg_new = tanh(MLP(h)) + identity
+```
+Where `identity = neuron_id` (learned, static per neuron).
+
+### Readout
+
+Output port messages (neurons 4-7) summed and scaled by `1/sqrt(alpha)`,
+reshaped to `[BS, D]`.
+
+## Runtime State
+
+```
+h                 : [BS, NC, Cn, D_n]     — neuron hidden states
+msg               : [BS, NC, Cn, D_n]     — neuron messages
+W                 : [BS, NC, Cn, Cn]      — connectivity matrix
+decay_logit       : [BS, NC, Cn]          — per-neuron temporal decay
+cell_context      : [BS, NC, D_n]         — per-cell context
+border_gate_logit : [BS, NC, B]           — cross-cell gates
+surprise_ema      : [BS, NC, D_n]         — EMA of per-cell surprise
+readout_ema       : [BS, NC, D_n]         — EMA of per-cell readout
+prev_readout      : [BS, D]              — last readout for PCM input
+prev_delta_hat    : [BS, C, D_cc] or None — last PCM prediction
 ```
 
-### 1. Receive (dense bmm)
+## Learned Parameters
 
-```python
-received = torch.matmul(W, msg)
-```
-
-### 2. Inject
-
-```python
-received[:, :, :alpha] += inject(H_aug[t])
-```
-
-### 3. Border Exchange
-
-```python
-received[:, :, border_lo:border_hi] += border_exchange(msg, border_gate)
-```
-
-### 4. State Update
-
-```python
-h = decay * h + (1-decay) * tanh(mlp(received, h))
-```
-
-### 5. Emit Message
-
-```python
-msg = tanh(mlp(h)) + identity
-```
-
-### 6. Readout
-
-```python
-readout[t] = readout_from_output_ports(msg)
-readout_cell = readout[t].reshape(BS, NC, D_n)
-readout_ema = 0.95 * readout_ema + 0.05 * readout_cell.detach()
-prev_readout = readout[t]
-
-H_enriched[t] = H_aug[t] + mem_scale * readout[t]
-```
-
-### 7. Neuromodulate (every M steps)
-
-```python
-# Compress surprise for modulator (ON the CE graph via surprise_proj)
-surprise_compressed = F.linear(
-    cat([surprise_ema, readout_ema]), surprise_proj_w, surprise_proj_b)
-
-mod_input = cat([h_mean, msg_mean, cell_context, W_stats, decay_mean,
-                 surprise_compressed])
-
-# Modulator predicts low-rank delta_W + deltas
-delta_W = u @ v.T
-W = W + delta_W
-decay_logit += delta_decay
-cell_context += delta_ctx
-border_gate_logit += delta_border
-
-# Soft W decay
-W = W * (1 - w_decay_rate)
-```
+| Component | Shape | Params | Notes |
+|-----------|-------|--------|-------|
+| neuron_id | [NC=8, Cn=32, D_n=256] | 65K | Per-neuron identity |
+| state_w1 | [Hs=256, 2*D_n=512] | 131K | Shared, split into recv/h halves |
+| state_b1/w2/b2 | — | 66K | Shared state MLP |
+| msg_w1/b1/w2/b2 | — | 131K | Shared message MLP |
+| inject_w | [G=8, alpha*D_n, D_n] | 2.1M | Per-group orthogonal init |
+| inject_b | [G=8, alpha*D_n] | 8K | |
+| mod_w1 | [NC=8, 834, 2048] | 13.7M | Per-cell modulator layer 1 |
+| mod_b1 | [NC=8, 2048] | 16K | |
+| mod_w2 | [NC=8, 2048, 1316] | 21.6M | Per-cell modulator layer 2 |
+| mod_b2 | [NC=8, 1316] | 11K | |
+| surprise_proj_w/b | [64, 512] + [64] | 33K | Surprise compression |
+| PCM (pcm_w1/b1/w2/b2, norm) | — | 1.6M | Per-column prediction MLP |
+| split_mlp | Linear(4096,128)+Linear(128,2048) | 787K | Surprise augmentation |
+| mem_scale | [D=2048] | 2K | Readout scaling |
+| **Memory total** | | **~39.4M** | |
+| **LM total** | | **~68.1M** | |
+| **Grand total** | | **~107.5M** | |
 
 ## Training
 
@@ -269,32 +280,37 @@ W = W * (1 - w_decay_rate)
 total_loss = CE_loss + pcm_pred_weight * pcm_pred_loss
 ```
 
-- **CE loss**: trains LM (lower/upper scan, embedding, head, split_mlp, mem_scale)
-  AND memory graph (state/msg MLPs, modulator, inject, surprise_proj)
-- **PCM pred_loss**: trains PCM only (self-supervised transition prediction)
+CE loss trains: LM (scan layers, embedding, head), split_mlp, mem_scale,
+memory graph (state/msg MLPs, modulator, inject, surprise_proj).
+
+PCM pred_loss trains: PCM only (self-supervised transition prediction).
 
 ### Gradient boundaries
 
-- `H_mid.detach()` before memory: memory can't backprop into LM lower scan
-- `surprise_ema` and `readout_ema`: detached EMAs, no grad
-- `surprise_proj`: ON the CE graph — learns end-to-end through modulator
-- PCM: trained ONLY by pred_loss, not by CE loss
+- `H_mid.detach()` before memory: LM lower scan isolated from memory
+- `surprise_t.detach()` before augment_fn: CE loss cannot reach PCM
+- `surprise_ema/readout_ema`: detached EMAs (no_grad), no gradient
+- `surprise_proj`: ON the CE graph — trained through modulator
+- `prev_delta_hat.detach()` at TBPTT boundaries
 
-### What each component learns
+### EOT handling
 
-| Component | Trained by | Learns to... |
-|-----------|-----------|--------------|
-| PCM | pred_loss (self-supervised) | Predict LM transitions accurately |
-| split_mlp | CE loss | Combine H_mid and surprise usefully |
-| State/Msg MLPs | CE loss (via readout) | Update neuron states and messages |
-| Modulator | CE loss (via readout) | Adjust W, decay, gates based on surprise + state |
-| surprise_proj | CE loss (via modulator) | Select which surprise dims help memory management |
-| W (runtime) | Not trained (modulator adjusts it) | Store connectivity patterns |
+CE loss masked: tokens where `input_ids == eot_id` are excluded from
+the loss computation (valid_mask in model.py).
+
+### Block structure
+
+- TBPTT: detach all state every `tbptt_block=8` tokens
+- Checkpointing: checkpoint blocks of `checkpoint_every=8` tokens
+- Modulation: every `modulation_interval=4` tokens
 
 ## Initialization
 
-- **W**: sparse random (K=8 nonzeros per row, value 0.1)
-- **h, msg**: small random / zeros
-- **decay_logit**: zeros (sigmoid(0) = 0.5)
-- **surprise_ema, readout_ema**: zeros
-- **prev_readout**: zeros
+- **W**: sparse random (K=8 nonzeros per row, value 0.1, no self-connections)
+- **h**: small random (N(0, 0.01))
+- **msg, decay_logit, cell_context, border_gate_logit**: zeros
+- **surprise_ema, readout_ema, prev_readout**: zeros
+- **mem_scale**: sqrt(alpha) = 2.0
+- **split_mlp output layer**: depth-scaled init (× 1/sqrt(2*L_total))
+- **mod_w2**: small init (× 0.01)
+- **inject_w**: per-port orthogonal blocks
