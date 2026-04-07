@@ -40,10 +40,11 @@ class LM(nn.Module):
                           n_layers=config.L_total, glu_output=config.glu_output))
 
         # split_mlp: combines H_mid with surprise (called per-token from memory loop)
+        split_h = config.split_mlp_hidden
         self.split_mlp = nn.Sequential(
-            nn.Linear(2 * D, config.d_inner),
+            nn.Linear(2 * D, split_h),
             nn.SiLU(),
-            nn.Linear(config.d_inner, D),
+            nn.Linear(split_h, D),
         )
         with torch.no_grad():
             self.split_mlp[2].weight.mul_(1.0 / math.sqrt(2 * config.L_total))

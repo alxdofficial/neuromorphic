@@ -40,6 +40,7 @@ class Config:
     w_decay_rate: float = 1e-3  # soft sparsity: W *= (1 - rate) each step
     surprise_proj_dim: int = 64  # compressed surprise dim for modulator input
     surprise_ema_decay: float = 0.95
+    split_mlp_hidden: int = 128  # hidden dim for surprise augmentation MLP
 
     # === Training ===
     T: int = 128  # tokens per segment
