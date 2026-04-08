@@ -51,6 +51,25 @@ class Trainer:
                       model.memory.mod_w2, model.memory.mod_b2):
                 p.requires_grad = False
 
+        # Cache param groups for split grad clipping.
+        #   - LM pool: everything in model.lm
+        #   - Dynamics pool: memory params that are NOT the modulator
+        #   - Modulator pool: the 4 modulator tensors
+        # Each pool gets clipped independently so a spike in the dynamics pool
+        # doesn't starve the modulator (or vice versa) via shared clipping.
+        mod_param_set = {id(p) for p in (
+            model.memory.mod_w1, model.memory.mod_b1,
+            model.memory.mod_w2, model.memory.mod_b2,
+        )}
+        self._mod_params = [
+            model.memory.mod_w1, model.memory.mod_b1,
+            model.memory.mod_w2, model.memory.mod_b2,
+        ]
+        self._dyn_params = [
+            p for p in model.memory.parameters()
+            if id(p) not in mod_param_set
+        ]
+
         # Action collection: snapshot one modulator output per training step.
         self.collect_actions = collect_actions
         self.action_buffer: list[torch.Tensor] = []
@@ -98,12 +117,23 @@ class Trainer:
         # Component grad norms (read BEFORE clip to see the raw signal).
         component_grads = self.model.memory.compute_component_grad_norms()
 
+        # Three independent clip pools so a spike in one pool doesn't drown
+        # the others. Each gets the same max_grad_norm budget.
         lm_grad_norm = nn.utils.clip_grad_norm_(
             self.model.lm.parameters(), self.max_grad_norm).item()
-        mem_grad_norm = nn.utils.clip_grad_norm_(
-            self.model.memory.parameters(), self.max_grad_norm).item()
+        dyn_grad_norm = nn.utils.clip_grad_norm_(
+            self._dyn_params, self.max_grad_norm).item()
+        if self.freeze_modulator:
+            # Modulator params have no grad in this mode; no clip to do.
+            mod_clip_norm = 0.0
+        else:
+            mod_clip_norm = nn.utils.clip_grad_norm_(
+                self._mod_params, self.max_grad_norm).item()
+        # Backward-compat aggregate (sqrt of sum of squares).
+        mem_grad_norm = math.sqrt(dyn_grad_norm ** 2 + mod_clip_norm ** 2)
 
-        # Phase-1 telemetry: per-cell modulator grad norm.
+        # Phase-1 telemetry: per-cell modulator grad norm (POST clip of the
+        # modulator pool — isolated from dynamics spikes now).
         mod_grad_norm = self.model.memory.compute_mod_grad_norm()
 
         self.optimizer.step()
@@ -137,6 +167,8 @@ class Trainer:
             "tok_s": tok_per_s,
             "lm_grad_norm": lm_grad_norm,
             "mem_grad_norm": mem_grad_norm,
+            "dyn_grad_norm": dyn_grad_norm,
+            "mod_clip_norm": mod_clip_norm,
             "mod_grad_norm": mod_grad_norm,
             "mod_action_norm": mod_stats["mod_action_norm"],
             "mod_action_var": mod_stats["mod_action_var"],

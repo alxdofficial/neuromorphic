@@ -30,7 +30,6 @@ class Config:
     # === Tuning knobs (validated empirically — change with care) ===
     mem_pred_weight: float = 0.1   # weight of mem_pred_loss in total loss
     mem_lr_scale: float = 0.3      # memory LR ratio vs LM LR
-    w_decay_rate: float = 1e-3     # per-step soft sparsity on W
     gain_ema_fast: float = 0.3     # ~3-token horizon EMA on memory-head surprise
 
     # === Training ===
@@ -84,7 +83,6 @@ class Config:
             cell_mod_hidden=16,
             modulation_interval=2, tbptt_block=4,
             state_mlp_hidden=32, msg_mlp_hidden=32,
-            w_decay_rate=1e-3,
         )
         defaults.update(kw)
         c = cls(**defaults)

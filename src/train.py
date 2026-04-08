@@ -229,10 +229,11 @@ def main():
                   f"ppl={metrics['ppl']:.1f} "
                   f"tok/s={metrics['tok_s']/1e3:.1f}K "
                   f"lm_gn={metrics['lm_grad_norm']:.2f} "
-                  f"mem_gn={metrics['mem_grad_norm']:.2f} "
-                  f"mod_gn={metrics['mod_grad_norm']:.3f} "
+                  f"dyn_gn={metrics['dyn_grad_norm']:.2f} "
+                  f"mod_gn={metrics['mod_clip_norm']:.3f} "
                   f"a_norm={metrics['mod_action_norm']:.4f} "
-                  f"a_var={metrics['mod_action_var']:.4f}")
+                  f"W={metrics.get('W_norm', 0):.3f} "
+                  f"h={metrics.get('h_norm', 0):.3f}")
         if (
             eval_loader_factory is not None
             and args.eval_interval > 0

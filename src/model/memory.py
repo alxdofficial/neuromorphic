@@ -73,6 +73,10 @@ class MemoryGraph(nn.Module):
 
         with torch.no_grad():
             self.inject_b.zero_()
+            # Small-init output layers so MLPs start near zero output and
+            # the tanh activations run in their linear regime. Combined with
+            # RMSNorm on W at use time, these are the only places where
+            # magnitude management is needed.
             self.state_w2.mul_(0.1)
             self.msg_w2.mul_(0.1)
             self.mod_w2.mul_(0.01)
@@ -343,9 +347,31 @@ class MemoryGraph(nn.Module):
     # Per-step components
     # ================================================================
 
+    @staticmethod
+    def _rmsnorm(x: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
+        """Parameter-free RMSNorm along ``dim`` (last dim only for now).
+
+        Uses torch's native F.rms_norm which is memory-optimized (fused kernel,
+        no full-precision intermediate activations). Only supports normalizing
+        over the last dim; if ``dim != -1`` we move the dim to last, normalize,
+        and move back — but in practice all callers pass dim=-1.
+        """
+        if dim == -1 or dim == x.ndim - 1:
+            return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+        x_moved = x.transpose(dim, -1).contiguous()
+        normed = F.rms_norm(x_moved, normalized_shape=(x_moved.shape[-1],), eps=eps)
+        return normed.transpose(dim, -1).contiguous()
+
     def _receive(self, msg: Tensor, W: Tensor) -> Tensor:
-        """Dense matmul message passing: received = W @ msg."""
-        return torch.matmul(W, msg)  # [BS, NC, N, D_n]
+        """Dense matmul message passing with row-wise RMSNorm on W.
+
+        Raw W is an unbounded accumulator (delta_W is added each modulation),
+        but we normalize each row to unit RMS before the matmul. That keeps
+        ``received`` in a bounded range regardless of how long W has been
+        accumulating, so the gradient through the matmul doesn't blow up.
+        """
+        W_eff = self._rmsnorm(W, dim=-1)   # normalize each row (last dim = n_in)
+        return torch.matmul(W_eff, msg)     # [BS, NC, N, D_n]
 
     def _inject(self, received, H_aug_t, inject_w, inject_b):
         cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
@@ -357,7 +383,7 @@ class MemoryGraph(nn.Module):
         return received
 
     def _mlp2(self, x, w1, b1, w2, b2):
-        """Two-layer MLP: F.linear → tanh → F.linear → tanh."""
+        """Two-layer MLP: Linear → tanh → Linear → tanh."""
         flat = x.reshape(-1, x.shape[-1])
         hidden = torch.tanh(F.linear(flat, w1, b1))
         out = torch.tanh(F.linear(hidden, w2, b2))
@@ -447,7 +473,7 @@ class MemoryGraph(nn.Module):
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                   w_decay_rate, gain_fast):
+                   gain_fast):
         """Run one block of memory steps with live in-block surprise signals.
 
         Live surprise: at each step t, use prev_readout_full (readout at t-1) to
@@ -518,8 +544,9 @@ class MemoryGraph(nn.Module):
             # Advance prev_readout_full for next-token memory-head prediction.
             prev_readout_full = readout.detach()
 
-            # Soft W decay (on-graph so later-token loss can train modulator).
-            W = W * (1.0 - w_decay_rate)
+            # No explicit W decay: we RMSNorm W's rows at every _receive
+            # call, so the raw W is free to drift and the effective (used) W
+            # is always bounded.
 
         return (h, msg, W, decay_logit,
                 s_mem_live, s_mem_ema_fast,
@@ -597,7 +624,6 @@ class MemoryGraph(nn.Module):
 
         readouts = torch.empty(BS, T, self.config.D, device=H_mid.device, dtype=dt)
         block_size = max(1, self.config.tbptt_block)
-        w_decay_rate = self.config.w_decay_rate
         gain_fast = self.config.gain_ema_fast
 
         use_ckpt = self.training and self.config.checkpoint_memory
@@ -616,7 +642,7 @@ class MemoryGraph(nn.Module):
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                w_decay_rate, gain_fast)
+                gain_fast)
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
                     self._run_block, *block_args, use_reentrant=False)
@@ -757,7 +783,6 @@ class MemoryGraph(nn.Module):
         one_minus_decay = 1.0 - decay
 
         gain_fast = self.config.gain_ema_fast
-        w_decay_rate = self.config.w_decay_rate
         mod_interval = self.config.modulation_interval
 
         readouts = torch.empty(BS, T, D, device=H_mid.device, dtype=dt)
@@ -840,7 +865,7 @@ class MemoryGraph(nn.Module):
                 dim=-1, keepdim=True).to(dt)
             prev_readout_cell = new_cell
             prev_readout_full = readout
-            W = W * (1.0 - w_decay_rate)
+            # No explicit W decay; _receive RMSNorms W rows at use time.
 
         # Persist end-of-rollout memory state so the next rollout continues
         # from here (memory is lifelong across rollouts too).

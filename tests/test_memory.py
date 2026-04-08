@@ -173,22 +173,20 @@ class TestStateDecay:
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 
 
-class TestWDecay:
-    def test_soft_sparsity(self):
-        """W entries should decay toward zero when modulator is disabled."""
-        config = _tiny_config(modulation_interval=9999, w_decay_rate=0.05)
+class TestWBoundedness:
+    def test_W_eff_has_unit_row_rms(self):
+        """RMSNorm on W rows should give effective W with unit RMS per row,
+        independent of the raw W magnitude."""
+        config = _tiny_config()
         mg = MemoryGraph(config)
         mg.initialize_states(2, torch.device("cpu"))
-        W_before = mg.W.clone()
-
-        mg.train(False)
-        with torch.no_grad():
-            _run_segment(mg, config, BS=2)
-
-        ratio = mg.W.float().abs().mean() / W_before.float().abs().mean()
-        expected = (1.0 - config.w_decay_rate) ** config.T
-        assert ratio < 1.0, f"W did not decay (ratio={ratio:.4f})"
-        assert ratio < expected + 0.01, f"W decayed less than expected ({ratio:.4f} vs {expected:.4f})"
+        # Blow up raw W to a huge magnitude
+        mg.W = mg.W * 1000.0
+        W_eff = mg._rmsnorm(mg.W, dim=-1).float()
+        row_rms = W_eff.pow(2).mean(dim=-1).sqrt()
+        # Every row should be ~1.0 (bounded away from both zero and infinity)
+        assert (row_rms > 0.9).all() and (row_rms < 1.1).all(), \
+            f"W_eff rows not unit RMS: min={row_rms.min()} max={row_rms.max()}"
 
 
 class TestGradientFlow:
