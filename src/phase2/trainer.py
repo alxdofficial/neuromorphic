@@ -94,9 +94,25 @@ class Phase2Trainer:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _run_lower_scan(self, input_ids: Tensor) -> Tensor:
-        """Run the frozen LM lower scan to produce H_mid."""
-        return self.model.lm.forward_scan_lower(input_ids)
+    def _run_lower_scan(
+        self, input_ids: Tensor, prev_token: Tensor | None = None,
+    ) -> Tensor:
+        """Run the frozen LM lower scan to produce H_mid.
+
+        Mirrors the EOT reset logic in `Model.forward_chunk`: builds a
+        reset_mask from in-batch EOT positions and the optional `prev_token`
+        (last token of previous batch). Without this, LM scan carries bleed
+        across document boundaries during phase 2.
+        """
+        eot_id = self.config.eot_id
+        eos_positions = (input_ids == eot_id)
+        reset_mask = torch.zeros_like(eos_positions)
+        reset_mask[:, 1:] = eos_positions[:, :-1]
+        if prev_token is not None:
+            reset_mask[:, 0] = (prev_token.to(input_ids.device) == eot_id)
+        if not reset_mask.any():
+            reset_mask = None
+        return self.model.lm.forward_scan_lower(input_ids, reset_mask=reset_mask)
 
     @torch.no_grad()
     def _compute_per_token_reward(
@@ -133,25 +149,32 @@ class Phase2Trainer:
     def _windowed_reward(
         self, per_token_reward: Tensor, call_positions: Tensor, window: int,
     ) -> Tensor:
-        """For each modulator call at token t, compute mean reward over [t, t+W].
+        """For each modulator call at token t, compute mean reward over [t+1, t+1+W].
+
+        The +1 shift is because `per_token_reward[t]` is computed from
+        `readout[t-1]`, which is independent of the action taken at modulator
+        call t. The action at t first influences `per_token_reward[t+1]`
+        (via `readout[t]`).
 
         Args:
-            per_token_reward: [BS, T]
-            call_positions: [n_calls] — absolute token index of each call
+            per_token_reward: [BS, T] on-device
+            call_positions: [n_calls] cpu long tensor — absolute token index of each call
             window: reward window W
 
         Returns:
-            rewards: [n_calls, BS] — per-action reward averaged over window
+            rewards: [n_calls, BS] on-device — per-action reward averaged over window
         """
         BS, T = per_token_reward.shape
-        n_calls = call_positions.shape[0]
+        positions = call_positions.tolist()
+        n_calls = len(positions)
         out = torch.empty(n_calls, BS, device=per_token_reward.device, dtype=torch.float32)
-        for i, t in enumerate(call_positions.tolist()):
-            end = min(t + window, T)
-            if end <= t:
+        for i, t in enumerate(positions):
+            start = t + 1
+            end = min(start + window, T)
+            if start >= T:
                 out[i] = 0.0
             else:
-                out[i] = per_token_reward[:, t:end].mean(dim=1)
+                out[i] = per_token_reward[:, start:end].mean(dim=1)
         return out
 
     @torch.no_grad()
@@ -199,14 +222,20 @@ class Phase2Trainer:
         """
         device = self.device
         input_ids = batch.input_ids.to(device, non_blocking=True)
+        prev_token = getattr(batch, "prev_token", None)
         BS, T = input_ids.shape
 
-        # Run lower scan once (LM is frozen and deterministic per batch)
-        H_mid = self._run_lower_scan(input_ids)
+        # Detach LM carries between batches so phase-2 rollouts don't pull in
+        # stale gradient state from a previous batch (no graph in phase 2 anyway,
+        # but this also frees the references).
+        self.model.lm.detach_carries()
 
-        # Snapshot initial memory state
+        # Run lower scan once (LM is frozen and deterministic per batch).
+        # EOT-aware reset mask is built inside _run_lower_scan.
+        H_mid = self._run_lower_scan(input_ids, prev_token=prev_token)
+
+        # Snapshot initial memory state (this implicitly captures prev_readout)
         init_snapshot = self._save_mem_state()
-        init_prev_readout = self.model.memory.prev_readout.clone()
 
         all_mod_inputs = []
         all_codes = []
@@ -217,24 +246,26 @@ class Phase2Trainer:
         for k in range(self.group_size):
             # Reset memory to the start of the batch
             self._restore_mem_state(init_snapshot)
+            # prev_readout for reward computation is the start-of-rollout value
+            init_prev_readout = self.model.memory.prev_readout
 
             result = self.model.memory.forward_segment_phase2(
                 H_mid, input_ids, self.model.lm, self.vqvae,
                 tau=self.tau, sample=True)
 
             readouts = result["readouts"]
-            call_positions = result["call_positions"].to(device)
-            mod_inputs = result["mod_inputs"]         # cpu
-            codes = result["codes"]                    # cpu
+            call_positions = result["call_positions"]   # cpu long tensor
+            mod_inputs = result["mod_inputs"]           # gpu
+            codes = result["codes"]                     # gpu
 
             per_token_reward = self._compute_per_token_reward(
                 readouts, init_prev_readout, input_ids)
             windowed_r = self._windowed_reward(
-                per_token_reward, call_positions, self.reward_window)   # [n_calls, BS]
+                per_token_reward, call_positions, self.reward_window)   # [n_calls, BS] gpu
 
             all_mod_inputs.append(mod_inputs)
             all_codes.append(codes)
-            all_rewards.append(windowed_r.cpu())
+            all_rewards.append(windowed_r)
 
             mean_r = windowed_r.mean().item()
             if mean_r > best_mean_reward:
@@ -286,14 +317,13 @@ class Phase2Trainer:
 
         Memory dynamics, LM, mem_head, decoder — all frozen and off the graph.
         """
-        device = self.device
         K, n_calls, BS, NC, mod_in_dim = rollout_result["mod_inputs"].shape
         num_levels = rollout_result["codes"].shape[-1]
 
-        # Move to device, flatten
-        mod_inputs = rollout_result["mod_inputs"].to(device)   # [K, n_calls, BS, NC, mod_in]
-        codes = rollout_result["codes"].to(device)             # [K, n_calls, BS, NC, L]
-        rewards = rollout_result["rewards"].to(device)         # [K, n_calls, BS]
+        # Records already live on device from forward_segment_phase2
+        mod_inputs = rollout_result["mod_inputs"]    # [K, n_calls, BS, NC, mod_in] f32 gpu
+        codes = rollout_result["codes"]              # [K, n_calls, BS, NC, L] long gpu
+        rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 gpu
 
         # Advantages — broadcast over NC since actions are per-cell
         advantages = self._compute_advantages(rewards)                 # [K, n_calls, BS]
@@ -323,12 +353,11 @@ class Phase2Trainer:
             a_chunk = advantages_flat[start:end]           # [C, NC]
             C = mi_chunk.shape[0]
 
-            # Modulator forward (on-graph)
-            raw_action = self.model.memory._modulator_forward(
-                mi_chunk.to(self.model.memory.mod_w1.dtype))  # [C, NC, mod_out]
+            # Modulator forward (on-graph). mi_chunk is already f32 from the rollout.
+            raw_action = self.model.memory._modulator_forward(mi_chunk)  # [C, NC, mod_out]
 
             # Flatten [C, NC] -> [C*NC] for the VQ encoder
-            action_flat = raw_action.reshape(C * NC, -1).float()
+            action_flat = raw_action.reshape(C * NC, -1)
             action_norm = self.vqvae.normalize(action_flat)
             z = self.vqvae.encoder(action_norm)                # [C*NC, latent]
 

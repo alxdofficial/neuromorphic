@@ -58,14 +58,17 @@ def main():
     config.eot_id = special_ids.get("eos_token_id", tokenizer.eos_token_id)
 
     model = Model(config).to(device)
+    # Load params only — runtime memory state is at phase-1 BS and shape-incompatible
+    # with phase-2 BS. We re-initialize memory fresh at phase-2 BS below.
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if "runtime_state" in ckpt and ckpt["runtime_state"]:
-        model.load_runtime_state(ckpt["runtime_state"])
-    print(f"Loaded model (step={ckpt.get('step', '?')})")
+    # Eval mode disables dropout in scan layers — phase-2 rollouts must be
+    # deterministic given the same input + sampled codes.
+    model.train(False)
+    print(f"Loaded model params (step={ckpt.get('step', '?')})")
 
-    # Initialize memory runtime state if not loaded
-    if not model.memory._initialized:
-        model.memory.initialize_states(args.bs, device)
+    # Fresh memory runtime state at phase-2 BS. Lifelong memory starts from
+    # zeros for phase 2 — this is a deliberate discontinuity, not a bug.
+    model.memory.initialize_states(args.bs, device)
 
     # Load codebook
     print(f"Loading codebook: {args.codebook}")
@@ -84,22 +87,24 @@ def main():
     print(f"  action_dim={cb_config['action_dim']} latent={cb_config['latent_dim']} "
           f"levels={cb_config['num_levels']}x{cb_config['codes_per_level']}")
 
-    # Dataloader
+    # Stages first so we know the max reward window → segment length.
+    stages = [
+        CurriculumStage(reward_window=512, token_budget=args.stage1_tokens),
+        CurriculumStage(reward_window=2048, token_budget=args.stage2_tokens),
+        CurriculumStage(reward_window=4096, token_budget=args.stage3_tokens),
+    ]
+    max_window = max(s.reward_window for s in stages)
+    print(f"Phase 2 segment length T = {max_window} (max curriculum window)")
+
     dataloader = create_dataloader(
         phase="A", tokenizer=tokenizer, batch_size=args.bs,
-        seq_length=config.T, seed=args.seed, max_steps=10**9)
+        seq_length=max_window, seed=args.seed, max_steps=10**9)
 
     trainer = Phase2Trainer(
         model=model, vqvae=vqvae, dataloader=dataloader,
         config=config, device=device,
         group_size=args.group_size, lr=args.lr, tau=args.tau,
     )
-
-    stages = [
-        CurriculumStage(reward_window=512, token_budget=args.stage1_tokens),
-        CurriculumStage(reward_window=2048, token_budget=args.stage2_tokens),
-        CurriculumStage(reward_window=4096, token_budget=args.stage3_tokens),
-    ]
 
     trainer.run_curriculum(stages)
 

@@ -720,25 +720,25 @@ class MemoryGraph(nn.Module):
 
             # Modulate via VQ sampling every M tokens
             if t % mod_interval == 0:
-                # Build mod_input from current state (see _build_mod_input,
-                # inlined here with local variables)
-                h_mean = h.mean(dim=2)
-                msg_mean = msg.mean(dim=2)
-                W_stats = W.abs().mean(dim=-1).mean(dim=2, keepdim=True)
-                decay_mean = decay_logit.mean(dim=2, keepdim=True)
-                s1 = s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
-                s2 = s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
-                mod_input = torch.cat([
+                # Build mod_input in f32 for numerical consistency with the
+                # gradient pass (which also runs the modulator in f32).
+                h_mean = h.float().mean(dim=2)
+                msg_mean = msg.float().mean(dim=2)
+                W_stats = W.float().abs().mean(dim=-1).mean(dim=2, keepdim=True)
+                decay_mean = decay_logit.float().mean(dim=2, keepdim=True)
+                s1 = s_mem_live.float().view(BS, 1, 1).expand(BS, NC, 1)
+                s2 = s_mem_ema_fast.float().view(BS, 1, 1).expand(BS, NC, 1)
+                mod_input_f32 = torch.cat([
                     h_mean, msg_mean,
                     W_stats, decay_mean,
-                    readout_drift,
+                    readout_drift.float(),
                     s1, s2,
-                ], dim=-1)  # [BS, NC, mod_in]
+                ], dim=-1)  # [BS, NC, mod_in] in f32
 
-                raw_action = self._modulator_forward(mod_input)  # [BS, NC, mod_out]
+                raw_action = self._modulator_forward(mod_input_f32)  # f32 out
 
-                # Normalize, encode, sample codes, decode, un-normalize
-                action_flat = raw_action.reshape(BS * NC, -1).float()
+                # Normalize, encode, sample codes, decode, un-normalize (all f32)
+                action_flat = raw_action.reshape(BS * NC, -1)
                 action_norm = vqvae.normalize(action_flat)
                 z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
                 codes = vqvae.rvq.sample_codes(z, tau=tau, sample=sample)  # [BS*NC, L]
@@ -750,7 +750,7 @@ class MemoryGraph(nn.Module):
                 quantized = vqvae.denormalize(quantized_norm)
                 quantized = quantized.reshape(BS, NC, -1).to(dt)
 
-                # Unpack delta_W, delta_decay and apply
+                # Unpack delta_W, delta_decay and apply (cast to bf16 to match state)
                 delta_W = quantized[..., :N * N].reshape(BS, NC, N, N)
                 delta_decay = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
                 W = W + delta_W
@@ -758,10 +758,12 @@ class MemoryGraph(nn.Module):
                 decay = torch.sigmoid(decay_logit).unsqueeze(-1)
                 one_minus_decay = 1.0 - decay
 
-                # Record (mod_input, codes) for later gradient pass
-                mod_input_records.append(mod_input.detach().cpu())
+                # Record on GPU (moving to CPU per-call causes sync overhead).
+                # Caller is responsible for memory pressure; at phase-2 scale
+                # (BS ~8) the total records fit comfortably.
+                mod_input_records.append(mod_input_f32.detach())
                 codes_records.append(
-                    codes.reshape(BS, NC, -1).detach().cpu())
+                    codes.reshape(BS, NC, -1).detach())
                 call_positions.append(t)
 
             # Memory step (same as phase 1)

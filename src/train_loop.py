@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -58,6 +59,13 @@ def run(cmd: list[str]):
         sys.exit(result.returncode)
 
 
+def latest_ckpt(dir_path: str, before: set[str] | None = None) -> str | None:
+    """Return the newest ckpt_*.pt in dir_path, excluding any in `before`."""
+    matches = sorted(glob.glob(os.path.join(dir_path, "ckpt_*.pt")))
+    matches = [m for m in matches if before is None or m not in before]
+    return matches[-1] if matches else None
+
+
 def main():
     args = parse_args()
     os.makedirs(args.work_dir, exist_ok=True)
@@ -65,27 +73,41 @@ def main():
     bootstrap_ckpt = os.path.join(args.work_dir, "bootstrap.pt")
     python = sys.executable
 
+    # Track cumulative phase-1 step counter, since train.py uses --steps as
+    # an ABSOLUTE target (not "more steps"). Each phase-1 launch must pass
+    # target = start_step + steps_to_run.
+    cumulative_step = 0
+
     # ---- Bootstrap ----
     if not args.skip_bootstrap and not os.path.exists(bootstrap_ckpt):
         print(f"\n=========== BOOTSTRAP ({args.bootstrap_tokens:,} tokens) ===========")
         steps = tokens_to_steps(args.bootstrap_tokens, args.bs)
+        before = set(glob.glob(os.path.join(args.work_dir, "ckpt_*.pt")))
         run([
             python, "-m", "src.train",
             "--bs", str(args.bs),
             "--steps", str(steps),
             "--save-dir", args.work_dir,
-            "--save-interval", str(steps),  # only save at end
+            "--save-interval", str(steps),
         ])
-        # The phase-1 trainer saves as ckpt_{step:06d}.pt. Rename/link to bootstrap.
-        latest = os.path.join(args.work_dir, f"ckpt_{steps:06d}.pt")
-        if os.path.exists(latest):
+        latest = latest_ckpt(args.work_dir, before=before)
+        if latest is not None:
             os.rename(latest, bootstrap_ckpt)
             print(f"Bootstrap saved to {bootstrap_ckpt}")
+            cumulative_step = steps
         else:
-            print(f"!!! Expected {latest} not found. Check phase 1 output.")
+            print("!!! Phase 1 produced no checkpoint. Check output.")
             sys.exit(1)
     else:
         print(f"Bootstrap already exists at {bootstrap_ckpt}, skipping.")
+        # Best-effort: load to pick up the cumulative step counter
+        try:
+            import torch
+            ck = torch.load(bootstrap_ckpt, map_location="cpu", weights_only=False)
+            cumulative_step = ck.get("step", 0)
+            del ck
+        except Exception:
+            pass
 
     current_ckpt = bootstrap_ckpt
 
@@ -98,42 +120,54 @@ def main():
         # Phase 1 with frozen modulator (regular steps)
         phase1_main_tokens = args.phase1_tokens_per_cycle - args.action_collection_tokens
         phase1_main_steps = tokens_to_steps(phase1_main_tokens, args.bs)
+        target_step_main = cumulative_step + phase1_main_steps
         phase1_main_ckpt = os.path.join(cycle_dir, "phase1_main.pt")
         print(f"\n--- Cycle {cycle} phase 1 main ({phase1_main_tokens:,} tokens, "
-              f"{phase1_main_steps} steps) ---")
+              f"{phase1_main_steps} new steps, absolute target {target_step_main}) ---")
+        before = set(glob.glob(os.path.join(cycle_dir, "ckpt_*.pt")))
         run([
             python, "-m", "src.train",
             "--bs", str(args.bs),
-            "--steps", str(phase1_main_steps),
+            "--steps", str(target_step_main),
             "--save-dir", cycle_dir,
-            "--save-interval", str(phase1_main_steps),
+            "--save-interval", str(target_step_main),
             "--resume", current_ckpt,
             "--freeze-modulator",
         ])
-        # Move latest ckpt to a stable name
-        latest = os.path.join(cycle_dir, f"ckpt_{phase1_main_steps:06d}.pt")
-        if os.path.exists(latest):
+        latest = latest_ckpt(cycle_dir, before=before)
+        if latest is not None:
             os.rename(latest, phase1_main_ckpt)
+            cumulative_step = target_step_main
+        else:
+            print("!!! Phase 1 main produced no checkpoint.")
+            sys.exit(1)
 
         # Action collection sub-phase (still phase 1 TBPTT, but with collection on)
         ac_steps = tokens_to_steps(args.action_collection_tokens, args.bs)
+        target_step_ac = cumulative_step + ac_steps
         action_db = os.path.join(cycle_dir, "action_database.pt")
         phase1_end_ckpt = os.path.join(cycle_dir, "phase1_end.pt")
-        print(f"\n--- Cycle {cycle} action collection ({ac_steps} steps) ---")
+        print(f"\n--- Cycle {cycle} action collection ({ac_steps} new steps, "
+              f"target {target_step_ac}) ---")
+        before = set(glob.glob(os.path.join(cycle_dir, "ckpt_*.pt")))
         run([
             python, "-m", "src.train",
             "--bs", str(args.bs),
-            "--steps", str(ac_steps),
+            "--steps", str(target_step_ac),
             "--save-dir", cycle_dir,
-            "--save-interval", str(ac_steps),
+            "--save-interval", str(target_step_ac),
             "--resume", phase1_main_ckpt,
             "--freeze-modulator",
             "--collect-actions",
             "--action-db-out", action_db,
         ])
-        latest = os.path.join(cycle_dir, f"ckpt_{ac_steps:06d}.pt")
-        if os.path.exists(latest):
+        latest = latest_ckpt(cycle_dir, before=before)
+        if latest is not None:
             os.rename(latest, phase1_end_ckpt)
+            cumulative_step = target_step_ac
+        else:
+            print("!!! Action collection produced no checkpoint.")
+            sys.exit(1)
 
         # Codebook fit
         codebook_path = os.path.join(cycle_dir, "codebook.pt")

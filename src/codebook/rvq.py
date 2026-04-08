@@ -104,10 +104,17 @@ class ResidualVQ(nn.Module):
         Should be called during training, after `forward`, with the encoder
         output z and the selected codes. Each level's codebook is updated
         based on the residual seen at that level.
+
+        Important: residuals must advance using the *pre-update* codebook
+        entries (those that the codes were originally assigned against). We
+        cache the selected entries before updating to preserve this.
         """
         residual = z.detach()
         for lvl in range(self.num_levels):
             codes_lvl = codes[:, lvl]
+            # Cache the pre-update codebook entries for residual advancement.
+            old_selected = self.codebooks[lvl][codes_lvl].clone()
+
             one_hot = F.one_hot(codes_lvl, self.codes_per_level).to(residual.dtype)
             cluster_size_new = one_hot.sum(0)
             embed_sum_new = one_hot.t() @ residual
@@ -123,9 +130,8 @@ class ResidualVQ(nn.Module):
             new_codes = self.embed_avg[lvl] / smoothed.unsqueeze(1)
             self.codebooks[lvl].copy_(new_codes)
 
-            # advance residual to next level
-            selected = self.codebooks[lvl][codes_lvl]
-            residual = residual - selected
+            # Advance residual using the PRE-update entry, not the post-update one.
+            residual = residual - old_selected
 
     @torch.no_grad()
     def resample_dead_codes(self, z: Tensor):
