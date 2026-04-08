@@ -51,6 +51,9 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config: Config = ckpt["config"]
+    # Preserve the phase-1 step counter so the next cycle's phase 1 resume
+    # continues the LR scheduler and cumulative step tracking correctly.
+    phase1_step = ckpt.get("step", 0)
 
     tokenizer = get_tokenizer(args.tokenizer)
     special_ids = get_special_token_ids(tokenizer)
@@ -100,24 +103,35 @@ def main():
         phase="A", tokenizer=tokenizer, batch_size=args.bs,
         seq_length=max_window, seed=args.seed, max_steps=10**9)
 
+    # Metrics alongside the output checkpoint
+    out_dir = os.path.dirname(args.out) or "."
+    metrics_path = os.path.join(out_dir, "phase2_metrics.jsonl")
+
     trainer = Phase2Trainer(
         model=model, vqvae=vqvae, dataloader=dataloader,
         config=config, device=device,
         group_size=args.group_size, lr=args.lr, tau=args.tau,
+        metrics_path=metrics_path,
     )
 
     trainer.run_curriculum(stages)
 
     # Save
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    # Preserve the phase-1 cumulative step counter so that next cycle's phase 1
+    # resume continues its scheduler correctly. Track phase-2 GRPO step
+    # separately under `phase2_step`. Do NOT save runtime_state: phase 2 memory
+    # state is at phase-2 BS which is incompatible with phase-1 BS, and phase 1
+    # will re-init memory anyway (see Model.forward_chunk BS-mismatch check).
     torch.save({
         "model_state_dict": model.state_dict(),
-        "runtime_state": model.runtime_state_dict(),
         "config": config,
-        "step": trainer.global_step,
+        "step": phase1_step,              # phase-1 step preserved
+        "phase2_step": trainer.global_step,  # phase-2 GRPO step
         "phase": "phase2",
     }, args.out)
-    print(f"Saved phase-2 checkpoint to {args.out}")
+    print(f"Saved phase-2 checkpoint to {args.out} "
+          f"(phase1_step={phase1_step}, phase2_step={trainer.global_step})")
 
 
 if __name__ == "__main__":

@@ -1,29 +1,25 @@
-"""Plot v9-backprop training curves and memory graph diagnostics.
+"""Plot training curves for the current v12 architecture (phase 1 and phase 2).
 
 Usage:
-    python -m scripts.plot_training outputs/v9/<run_id>/
-    python -m scripts.plot_training outputs/v9/<run_id>/ --snapshot 5000
+    # Phase 1 (src.train or cycle phase 1)
+    python -m scripts.plot_training outputs/v12/
 
-Produces:
-    <run_dir>/plots/training_curves.png  — loss, ppl, LR, throughput
-    <run_dir>/plots/memory_health.png    — neuron state, gates, connectivity
-    <run_dir>/plots/gradient_health.png  — per-component gradient norms
-    <run_dir>/plots/memory_snapshot.png  — (from snapshot) per-neuron stats
+    # Phase 2
+    python -m scripts.plot_training outputs/v12/cycle_00/ --phase 2
+
+Expects `{run_dir}/metrics.jsonl` (phase 1) or `{run_dir}/phase2_metrics.jsonl`
+(phase 2). Writes PNG plots into `{run_dir}/plots/`.
 """
 
-import json
-import sys
-import os
 import argparse
+import json
+import os
+import sys
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-
-# ============================================================================
-# Style
-# ============================================================================
 
 STYLE = {
     "figure.facecolor": "white",
@@ -47,20 +43,24 @@ C = {
     "ppl": "#d93025",
     "lr": "#188038",
     "tput": "#7b1fa2",
-    "gate": "#e37400",
-    "decay": "#d93025",
-    "conn": "#1a73e8",
-    "hebb": "#188038",
-    "usage": "#7b1fa2",
-    "prim": "#c2185b",
+    "aux": "#c2185b",
+    "lm_grad": "#1a73e8",
+    "mem_grad": "#d93025",
+    "mod_grad": "#e37400",
     "mod": "#e37400",
     "state": "#1a73e8",
     "msg": "#188038",
-    "nid": "#7b1fa2",
-    "dendrite": "#d93025",
-    "pcm": "#616161",
-    "lm_grad": "#1a73e8",
-    "mem_grad": "#d93025",
+    "inject": "#7b1fa2",
+    "nid": "#c2185b",
+    "h": "#1a73e8",
+    "msg2": "#188038",
+    "W": "#7b1fa2",
+    "decay": "#d93025",
+    "surprise": "#e37400",
+    "drift": "#c2185b",
+    "reward": "#188038",
+    "log_pi": "#1a73e8",
+    "codes": "#7b1fa2",
 }
 
 
@@ -80,25 +80,29 @@ def load_metrics(path):
 def smooth(values, window=50):
     if len(values) < window * 2:
         window = max(len(values) // 4, 1)
+    if window < 2:
+        return np.asarray(values, dtype=float)
     kernel = np.ones(window) / window
-    return np.convolve(values, kernel, mode='valid')
+    return np.convolve(values, kernel, mode="valid")
 
 
 def get(records, key):
-    return [r.get(key) for r in records if key in r]
+    return [r[key] for r in records if key in r and r[key] is not None]
 
 
 def plot_line(ax, vals, color, label=None, **kwargs):
-    arr = np.array(vals)
-    steps = np.arange(len(arr))
-    if len(arr) > 200:
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return
+    steps = np.arange(arr.size)
+    if arr.size > 200:
         ax.plot(steps, arr, alpha=0.15, color=color, linewidth=0.5)
         s = smooth(arr)
-        ax.plot(steps[:len(s)], s, color=color, linewidth=2.0, label=label, **kwargs)
-    elif len(arr) > 50:
+        ax.plot(steps[: len(s)], s, color=color, linewidth=2.0, label=label, **kwargs)
+    elif arr.size > 50:
         ax.plot(steps, arr, alpha=0.25, color=color, linewidth=0.8)
-        s = smooth(arr, window=max(len(arr) // 8, 3))
-        ax.plot(steps[:len(s)], s, color=color, linewidth=2.0, label=label, **kwargs)
+        s = smooth(arr, window=max(arr.size // 8, 3))
+        ax.plot(steps[: len(s)], s, color=color, linewidth=2.0, label=label, **kwargs)
     else:
         ax.plot(steps, arr, color=color, linewidth=1.5, alpha=0.9, label=label, **kwargs)
 
@@ -112,39 +116,35 @@ def setup(ax, title, ylabel=None):
 
 
 # ============================================================================
-# Training curves
+# Phase 1
 # ============================================================================
 
-def plot_training_curves(records, output_path):
+
+def plot_phase1_training(records, output_path):
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        n = len(records)
-        fig.suptitle(f"Training Curves ({n} steps)", fontsize=14, fontweight="bold")
+        fig.suptitle(f"Phase 1 Training ({len(records)} steps)",
+                     fontsize=14, fontweight="bold")
 
-        # Loss
-        loss = get(records, "loss")
-        if loss:
-            plot_line(axes[0, 0], loss, C["loss"])
-            setup(axes[0, 0], "Training Loss", "CE Loss")
+        plot_line(axes[0, 0], get(records, "loss"), C["loss"], "ce_loss")
+        plot_line(axes[0, 0], get(records, "aux_loss"), C["aux"], "mem_pred_loss")
+        axes[0, 0].legend()
+        setup(axes[0, 0], "Losses", "nats")
 
-        # PPL
         ppl = get(records, "ppl")
         if ppl:
             plot_line(axes[0, 1], ppl, C["ppl"])
-            axes[0, 1].set_yscale('log')
+            axes[0, 1].set_yscale("log")
             setup(axes[0, 1], "Perplexity", "PPL (log)")
 
-        # LR
         lr = get(records, "lr")
         if lr:
             axes[1, 0].plot(lr, color=C["lr"], linewidth=2.0)
             setup(axes[1, 0], "Learning Rate", "LR")
 
-        # Throughput
         tok_s = get(records, "tok_s")
         if tok_s:
-            tok_k = [t / 1000 for t in tok_s]
-            plot_line(axes[1, 1], tok_k, C["tput"])
+            plot_line(axes[1, 1], [t / 1000 for t in tok_s], C["tput"])
             setup(axes[1, 1], "Throughput", "K tok/s")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -153,173 +153,96 @@ def plot_training_curves(records, output_path):
         print(f"  Saved: {output_path}")
 
 
-# ============================================================================
-# Memory health
-# ============================================================================
-
-def plot_memory_health(records, output_path):
-    with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(4, 3, figsize=(18, 18))
-        fig.suptitle("Memory Graph Health", fontsize=14, fontweight="bold")
-
-        # mem_scale stats
-        v1 = get(records, "mem_scale_mean")
-        v2 = get(records, "mem_scale_std")
-        if v1:
-            plot_line(axes[0, 0], v1, C["gate"], "mean")
-        if v2:
-            plot_line(axes[0, 0], v2, C["conn"], "std")
-        if v1 or v2:
-            axes[0, 0].legend()
-            setup(axes[0, 0], "Memory Scale", "scale value")
-
-        # w_conn
-        v = get(records, "mem_w_conn_mean")
-        if v:
-            plot_line(axes[0, 1], v, C["conn"], "mean")
-            v2 = get(records, "mem_w_conn_std")
-            if v2:
-                plot_line(axes[0, 1], v2, C["conn"], "std", linestyle="--")
-            axes[0, 1].legend()
-            setup(axes[0, 1], "Connection Weights", "sigmoid(w_conn)")
-
-        # decay
-        v = get(records, "mem_decay_mean")
-        if v:
-            plot_line(axes[0, 2], v, C["decay"], "mean")
-            v2 = get(records, "mem_decay_std")
-            if v2:
-                plot_line(axes[0, 2], v2, C["decay"], "std", linestyle="--")
-            axes[0, 2].legend()
-            setup(axes[0, 2], "Decay Rate", "sigmoid(decay)")
-
-        # hebbian
-        v = get(records, "mem_hebbian_mean")
-        if v:
-            plot_line(axes[1, 0], v, C["hebb"], "mean")
-            v2 = get(records, "mem_hebbian_std")
-            if v2:
-                plot_line(axes[1, 0], v2, C["hebb"], "std", linestyle="--")
-            axes[1, 0].legend()
-            setup(axes[1, 0], "Hebbian Traces", "correlation")
-
-        # neuron usage
-        v = get(records, "mem_usage_frac")
-        if v:
-            plot_line(axes[1, 1], v, C["usage"])
-            setup(axes[1, 1], "Active Neurons", "fraction > 0.01")
-
-        # message magnitude
-        v = get(records, "mem_msg_mag_mean")
-        if v:
-            plot_line(axes[1, 2], v, C["msg"])
-            setup(axes[1, 2], "Message Magnitude", "mean |msg|")
-
-        # h and msg norms
-        v = get(records, "mem_h_norm")
-        if v:
-            plot_line(axes[2, 0], v, C["state"], "h norm")
-            v2 = get(records, "mem_msg_norm")
-            if v2:
-                plot_line(axes[2, 0], v2, C["msg"], "msg norm")
-            axes[2, 0].legend()
-            setup(axes[2, 0], "State / Message Norms", "L2")
-
-        # primitives norm
-        v = get(records, "mem_prim_norm")
-        if v:
-            plot_line(axes[2, 1], v, C["prim"])
-            setup(axes[2, 1], "Primitives Norm", "L2")
-
-        # PCM surprise
-        v = get(records, "pcm_surprise_mean")
-        if v:
-            plot_line(axes[2, 2], v, C["pcm"], "mean")
-            v2 = get(records, "pcm_surprise_std")
-            if v2:
-                plot_line(axes[2, 2], v2, C["pcm"], "std", linestyle="--")
-            axes[2, 2].legend()
-            setup(axes[2, 2], "PCM Surprise", "prediction error")
-
-        # Row 4: Neuron diversity + neuron ID + plasticity
-        v = get(records, "mem_h_diversity")
-        if v:
-            plot_line(axes[3, 0], v, C["state"], "h diversity")
-            v2 = get(records, "mem_msg_diversity")
-            if v2:
-                plot_line(axes[3, 0], v2, C["msg"], "msg diversity")
-            axes[3, 0].legend()
-            setup(axes[3, 0], "Neuron Diversity (std of per-neuron norms)")
-
-        v = get(records, "neuron_id_norm")
-        if v:
-            plot_line(axes[3, 1], v, C["nid"])
-            setup(axes[3, 1], "Neuron ID Norm", "L2")
-
-        v = get(records, "plasticity_swaps")
-        if v:
-            plot_line(axes[3, 2], v, C["conn"])
-            setup(axes[3, 2], "Plasticity Swaps per Chunk")
-
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        print(f"  Saved: {output_path}")
-
-
-# ============================================================================
-# Gradient health
-# ============================================================================
-
-def plot_gradient_health(records, output_path):
+def plot_phase1_gradients(records, output_path):
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        fig.suptitle("Gradient Health", fontsize=14, fontweight="bold")
+        fig.suptitle("Phase 1 Gradient Health", fontsize=14, fontweight="bold")
 
-        # LM vs Memory grad norms
-        lm = get(records, "lm_grad_norm")
-        mem = get(records, "mem_grad_norm")
-        if lm:
-            plot_line(axes[0, 0], lm, C["lm_grad"], "LM")
-        if mem:
-            plot_line(axes[0, 0], mem, C["mem_grad"], "Memory")
+        plot_line(axes[0, 0], get(records, "lm_grad_norm"), C["lm_grad"], "LM")
+        plot_line(axes[0, 0], get(records, "mem_grad_norm"), C["mem_grad"], "Memory")
+        plot_line(axes[0, 0], get(records, "mod_grad_norm"), C["mod_grad"], "Modulator")
         axes[0, 0].legend()
-        setup(axes[0, 0], "Gradient Norms (LM vs Memory)", "L2 norm")
+        setup(axes[0, 0], "Group Gradient Norms (post-clip)", "L2")
 
-        # Per-component memory grads
-        components = [
+        for key, label, color in [
             ("grad_mod_w1", "mod_w1", C["mod"]),
             ("grad_mod_w2", "mod_w2", C["mod"]),
+            ("grad_state_w1", "state_w1", C["state"]),
             ("grad_state_w2", "state_w2", C["state"]),
+            ("grad_msg_w1", "msg_w1", C["msg"]),
             ("grad_msg_w2", "msg_w2", C["msg"]),
+            ("grad_inject_w", "inject_w", C["inject"]),
             ("grad_neuron_id", "neuron_id", C["nid"]),
-            ("grad_dendrite", "dendrite", C["dendrite"]),
-        ]
-        for key, label, color in components:
-            v = get(records, key)
-            if v and any(x > 0 for x in v):
-                plot_line(axes[0, 1], v, color, label)
+        ]:
+            vals = get(records, key)
+            if vals and any(v > 0 for v in vals):
+                ls = "--" if "w2" in key else "-"
+                plot_line(axes[0, 1], vals, color, label, linestyle=ls)
         axes[0, 1].legend(fontsize=7)
-        setup(axes[0, 1], "Per-Component Memory Grads", "L2 norm")
+        setup(axes[0, 1], "Per-Component Memory Grads (pre-clip)", "L2")
 
-        # Weight norms
         for key, label, color in [
             ("mod_w1_norm", "mod_w1", C["mod"]),
             ("mod_w2_norm", "mod_w2", C["mod"]),
-            ("state_mlp_w1_norm", "state_w1", C["state"]),
-            ("msg_mlp_w1_norm", "msg_w1", C["msg"]),
+            ("state_w1_norm", "state_w1", C["state"]),
+            ("state_w2_norm", "state_w2", C["state"]),
+            ("msg_w1_norm", "msg_w1", C["msg"]),
+            ("msg_w2_norm", "msg_w2", C["msg"]),
+            ("inject_w_norm", "inject_w", C["inject"]),
+            ("neuron_id_norm", "neuron_id", C["nid"]),
         ]:
-            v = get(records, key)
-            if v:
-                plot_line(axes[1, 0], v, color, label, linestyle="--" if "w2" in key else "-")
+            vals = get(records, key)
+            if vals:
+                ls = "--" if "w2" in key else "-"
+                plot_line(axes[1, 0], vals, color, label, linestyle=ls)
         axes[1, 0].legend(fontsize=7)
-        setup(axes[1, 0], "Weight Norms", "L2 norm")
+        setup(axes[1, 0], "Weight Norms", "L2")
 
-        # aux_loss (PCM)
-        v = get(records, "aux_loss")
-        if v:
-            plot_line(axes[1, 1], v, C["pcm"])
-            setup(axes[1, 1], "PCM Aux Loss", "MSE")
+        plot_line(axes[1, 1], get(records, "mod_action_norm"), C["mod"], "action_norm")
+        plot_line(axes[1, 1], get(records, "mod_action_var"), C["mod_grad"], "action_var")
+        axes[1, 1].legend()
+        setup(axes[1, 1], "Modulator Action Stats", "magnitude")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"  Saved: {output_path}")
+
+
+def plot_phase1_memory(records, output_path):
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+        fig.suptitle("Phase 1 Memory Health", fontsize=14, fontweight="bold")
+
+        plot_line(axes[0, 0], get(records, "h_norm"), C["h"], "h")
+        plot_line(axes[0, 0], get(records, "msg_norm"), C["msg2"], "msg")
+        axes[0, 0].legend()
+        setup(axes[0, 0], "Per-Element State Norms", "L2 / sqrt(N)")
+
+        plot_line(axes[0, 1], get(records, "h_max"), C["h"], "h_max")
+        plot_line(axes[0, 1], get(records, "msg_max"), C["msg2"], "msg_max")
+        axes[0, 1].legend()
+        setup(axes[0, 1], "State Max |abs|", "magnitude")
+
+        plot_line(axes[1, 0], get(records, "W_norm"), C["W"], "W_norm")
+        plot_line(axes[1, 0], get(records, "W_max"), C["W"], "W_max", linestyle="--")
+        axes[1, 0].legend()
+        setup(axes[1, 0], "W Norm / Max", "magnitude")
+
+        plot_line(axes[1, 1], get(records, "W_sparsity"), C["W"])
+        setup(axes[1, 1], "W Sparsity (|w| < 1e-4)", "fraction")
+
+        plot_line(axes[2, 0], get(records, "decay_mean"), C["decay"], "mean")
+        plot_line(axes[2, 0], get(records, "decay_std"), C["decay"], "std", linestyle="--")
+        axes[2, 0].legend()
+        setup(axes[2, 0], "Decay σ(decay_logit)", "probability")
+
+        plot_line(axes[2, 1], get(records, "s_mem_live"), C["surprise"], "s_mem_live")
+        plot_line(axes[2, 1], get(records, "s_mem_ema_fast"), C["surprise"],
+                  "s_mem_ema_fast", linestyle="--")
+        plot_line(axes[2, 1], get(records, "readout_drift_mean"), C["drift"], "drift")
+        axes[2, 1].legend()
+        setup(axes[2, 1], "Surprise / Drift", "nats / L1")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
@@ -328,62 +251,47 @@ def plot_gradient_health(records, output_path):
 
 
 # ============================================================================
-# Snapshot visualization
+# Phase 2
 # ============================================================================
 
-def plot_snapshot(snap_path, output_path):
-    import torch
-    snap = torch.load(snap_path, map_location="cpu", weights_only=False)
 
+def plot_phase2_grpo(records, output_path):
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        step = snap.get("step", "?")
-        fig.suptitle(f"Memory Snapshot (step {step})", fontsize=14, fontweight="bold")
+        fig.suptitle(f"Phase 2 GRPO ({len(records)} steps)",
+                     fontsize=14, fontweight="bold")
 
-        # Per-neuron h norm
-        v = snap.get("h_norm_per_neuron")
-        if v is not None:
-            axes[0, 0].bar(range(len(v)), v.numpy(), color=C["state"], alpha=0.7)
-            setup(axes[0, 0], "Hidden State Norm per Neuron", "L2")
+        # Policy loss
+        plot_line(axes[0, 0], get(records, "loss"), C["loss"])
+        setup(axes[0, 0], "GRPO Loss", "-(A * log π)")
 
-        # Per-neuron message norm
-        v = snap.get("msg_norm_per_neuron")
-        if v is not None:
-            axes[0, 1].bar(range(len(v)), v.numpy(), color=C["msg"], alpha=0.7)
-            setup(axes[0, 1], "Message Norm per Neuron", "L2")
+        # Reward distribution
+        plot_line(axes[0, 1], get(records, "reward_mean"), C["reward"], "mean")
+        rmin = get(records, "reward_min")
+        rmax = get(records, "reward_max")
+        if rmin and rmax:
+            plot_line(axes[0, 1], rmin, C["reward"], "min", linestyle=":")
+            plot_line(axes[0, 1], rmax, C["reward"], "max", linestyle="--")
+        axes[0, 1].legend()
+        setup(axes[0, 1], "Reward (−windowed CE)", "reward")
 
-        # Per-neuron decay
-        v = snap.get("decay_per_neuron")
-        if v is not None:
-            axes[0, 2].bar(range(len(v)), v.numpy(), color=C["decay"], alpha=0.7)
-            setup(axes[0, 2], "Decay per Neuron", "sigmoid(decay)")
+        # Log pi
+        plot_line(axes[0, 2], get(records, "log_pi_mean"), C["log_pi"])
+        setup(axes[0, 2], "Mean log π", "log-prob")
 
-        # Per-neuron activation magnitude
-        v = snap.get("msg_magnitude_per_neuron")
-        if v is not None:
-            axes[1, 0].bar(range(len(v)), v.numpy(), color=C["usage"], alpha=0.7)
-            setup(axes[1, 0], "Activation Magnitude per Neuron")
+        # Modulator grad norm
+        plot_line(axes[1, 0], get(records, "mod_grad_norm"), C["mod_grad"])
+        setup(axes[1, 0], "Modulator Grad Norm", "L2")
 
-        # w_conn mean per neuron
-        v = snap.get("w_conn_mean_per_neuron")
-        if v is not None:
-            axes[1, 1].bar(range(len(v)), v.numpy(), color=C["conn"], alpha=0.7)
-            setup(axes[1, 1], "Mean Connection Weight per Neuron")
+        # Unique codes used per step
+        plot_line(axes[1, 1], get(records, "n_unique_codes"), C["codes"])
+        setup(axes[1, 1], "Unique Code Tuples / Step", "count")
 
-        # Connectivity visualization (sparse adjacency)
-        conn = snap.get("conn_indices")
-        if conn is not None:
-            N = conn.shape[0]
-            K = conn.shape[1]
-            # Show as sparse matrix
-            img = np.zeros((N, N))
-            for n in range(N):
-                for k in range(K):
-                    img[n, conn[n, k].item()] = 1
-            axes[1, 2].imshow(img, cmap='Blues', aspect='auto', interpolation='nearest')
-            setup(axes[1, 2], f"Connectivity ({N} neurons, K={K})")
-            axes[1, 2].set_xlabel("Target")
-            axes[1, 2].set_ylabel("Source")
+        # Stage window over time
+        windows = get(records, "stage_window")
+        if windows:
+            axes[1, 2].plot(windows, color=C["codes"], linewidth=2.0)
+            setup(axes[1, 2], "Curriculum Window W", "tokens")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
@@ -395,35 +303,37 @@ def plot_snapshot(snap_path, output_path):
 # Main
 # ============================================================================
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Plot v9-backprop training")
-    parser.add_argument("run_dir", help="Path to run directory")
-    parser.add_argument("--snapshot", type=int, default=None,
-                        help="Step number for snapshot visualization")
+    parser = argparse.ArgumentParser(description="Plot training curves (v12)")
+    parser.add_argument("run_dir", help="Run directory containing metrics.jsonl")
+    parser.add_argument("--phase", choices=["1", "2"], default="1")
     args = parser.parse_args()
 
-    metrics_path = os.path.join(args.run_dir, "metrics.jsonl")
+    if args.phase == "1":
+        metrics_path = os.path.join(args.run_dir, "metrics.jsonl")
+    else:
+        metrics_path = os.path.join(args.run_dir, "phase2_metrics.jsonl")
+
     if not os.path.exists(metrics_path):
-        print(f"No metrics found at {metrics_path}")
+        print(f"No metrics at {metrics_path}")
         sys.exit(1)
 
     records = load_metrics(metrics_path)
     print(f"Loaded {len(records)} records from {metrics_path}")
+    if not records:
+        print("  (empty)")
+        sys.exit(0)
 
     plots_dir = os.path.join(args.run_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    plot_training_curves(records, os.path.join(plots_dir, "training_curves.png"))
-    plot_memory_health(records, os.path.join(plots_dir, "memory_health.png"))
-    plot_gradient_health(records, os.path.join(plots_dir, "gradient_health.png"))
-
-    if args.snapshot is not None:
-        snap_path = os.path.join(args.run_dir, "snapshots",
-                                 f"step_{args.snapshot:06d}.pt")
-        if os.path.exists(snap_path):
-            plot_snapshot(snap_path, os.path.join(plots_dir, "memory_snapshot.png"))
-        else:
-            print(f"  Snapshot not found: {snap_path}")
+    if args.phase == "1":
+        plot_phase1_training(records, os.path.join(plots_dir, "phase1_training.png"))
+        plot_phase1_gradients(records, os.path.join(plots_dir, "phase1_gradients.png"))
+        plot_phase1_memory(records, os.path.join(plots_dir, "phase1_memory.png"))
+    else:
+        plot_phase2_grpo(records, os.path.join(plots_dir, "phase2_grpo.png"))
 
 
 if __name__ == "__main__":

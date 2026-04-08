@@ -170,6 +170,7 @@ def main():
     if pending_dataloader_state is not None and hasattr(dataloader, "load_state_dict"):
         dataloader.load_state_dict(pending_dataloader_state)
 
+    metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     trainer = Trainer(
         model=model, optimizer=optimizer, scheduler=scheduler,
         dataloader=dataloader, config=config, device=device,
@@ -177,6 +178,7 @@ def main():
         use_memory=not args.no_memory,
         freeze_modulator=args.freeze_modulator,
         collect_actions=args.collect_actions,
+        metrics_path=metrics_path,
     )
     if args.freeze_modulator:
         print("*** Modulator FROZEN — phase 1 of iterative cycle ***")

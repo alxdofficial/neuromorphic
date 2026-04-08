@@ -1,6 +1,8 @@
 """Trainer — single optimizer, joint LM + memory graph training."""
 
+import json
 import math
+import os
 import time
 
 import torch
@@ -27,6 +29,7 @@ class Trainer:
         use_memory: bool = True,
         freeze_modulator: bool = False,
         collect_actions: bool = False,
+        metrics_path: str | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -51,6 +54,17 @@ class Trainer:
         # Action collection: snapshot one modulator output per training step.
         self.collect_actions = collect_actions
         self.action_buffer: list[torch.Tensor] = []
+
+        # JSONL metrics log. Appended per step. One dict per line.
+        self.metrics_path = metrics_path
+        if metrics_path is not None:
+            os.makedirs(os.path.dirname(metrics_path) or ".", exist_ok=True)
+
+    def _append_metrics(self, metrics: dict):
+        if self.metrics_path is None:
+            return
+        with open(self.metrics_path, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
 
     def train_chunk(self, batch) -> dict:
         self.model.train()
@@ -81,13 +95,15 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
 
+        # Component grad norms (read BEFORE clip to see the raw signal).
+        component_grads = self.model.memory.compute_component_grad_norms()
+
         lm_grad_norm = nn.utils.clip_grad_norm_(
             self.model.lm.parameters(), self.max_grad_norm).item()
         mem_grad_norm = nn.utils.clip_grad_norm_(
             self.model.memory.parameters(), self.max_grad_norm).item()
 
-        # Phase-1 telemetry: per-cell modulator grad norm (read after clip,
-        # before optimizer.step()).
+        # Phase-1 telemetry: per-cell modulator grad norm.
         mod_grad_norm = self.model.memory.compute_mod_grad_norm()
 
         self.optimizer.step()
@@ -96,8 +112,10 @@ class Trainer:
 
         self.model.detach_states()
 
-        # Phase-1 telemetry: snapshot modulator action stats after the step.
+        # Phase-1 telemetry: snapshot modulator action stats + memory health.
         mod_stats = self.model.memory.compute_modulator_stats()
+        mem_health = self.model.memory.compute_memory_health()
+        param_norms = self.model.memory.compute_param_norms()
 
         # Optional action collection for codebook fitting.
         if self.collect_actions:
@@ -111,6 +129,7 @@ class Trainer:
         ppl = min(math.exp(loss_val), 1e6)
 
         metrics = {
+            "step": self.global_step + 1,
             "loss": loss_val,
             "ppl": ppl,
             "aux_loss": aux_loss.item(),
@@ -122,9 +141,14 @@ class Trainer:
             "mod_action_norm": mod_stats["mod_action_norm"],
             "mod_action_var": mod_stats["mod_action_var"],
             "elapsed": elapsed,
+            "frozen_modulator": self.freeze_modulator,
+            **mem_health,
+            **param_norms,
+            **component_grads,
         }
 
         self.global_step += 1
+        self._append_metrics(metrics)
         return metrics
 
     def train_epoch(self, max_steps: int, step_callback=None) -> list[dict]:

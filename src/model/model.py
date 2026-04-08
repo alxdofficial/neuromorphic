@@ -41,9 +41,21 @@ class Model(nn.Module):
         BS, T = input_ids.shape
         device = input_ids.device
 
-        if not self._initialized:
+        # Re-initialize memory state if not yet initialized, OR if the loaded
+        # runtime state has a different batch size than the current batch.
+        # The latter happens when resuming phase 1 from a phase-2 checkpoint
+        # (phase 2 typically runs at smaller BS than phase 1) or vice versa.
+        needs_init = (
+            not self._initialized
+            or not hasattr(self.memory, "h")
+            or self.memory.h.shape[0] != BS
+        )
+        if needs_init:
             self.memory.initialize_states(BS, device)
             self._initialized = True
+            # LM scan carries are also BS-shaped — drop them so the next lower
+            # scan starts fresh at the correct BS.
+            self.lm._carries = [None] * self.config.L_total
 
         # Build LM reset mask: reset scan carry at positions following EOT tokens.
         # Memory does NOT reset (lifelong). Only the LM scan resets.

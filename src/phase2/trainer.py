@@ -10,7 +10,9 @@ See docs/training_strategy.md for the full design.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from dataclasses import dataclass
 
@@ -57,6 +59,7 @@ class Phase2Trainer:
         max_grad_norm: float = 1.0,
         log_interval: int = 10,
         eval_interval: int = 100,
+        metrics_path: str | None = None,
     ):
         self.model = model
         self.vqvae = vqvae
@@ -88,6 +91,17 @@ class Phase2Trainer:
         # Current curriculum stage (set by run_curriculum)
         self.reward_window: int = 0
         self.segment_length: int = 0
+
+        # JSONL metrics log
+        self.metrics_path = metrics_path
+        if metrics_path is not None:
+            os.makedirs(os.path.dirname(metrics_path) or ".", exist_ok=True)
+
+    def _append_metrics(self, metrics: dict):
+        if self.metrics_path is None:
+            return
+        with open(self.metrics_path, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
 
     # ------------------------------------------------------------------
     # Rollout + reward
@@ -378,13 +392,28 @@ class Phase2Trainer:
             self.trainable_params, self.max_grad_norm).item()
         self.optimizer.step()
 
+        # Reward distribution stats over the flattened records
+        rewards_flat = rollout_result["rewards"].float()
+        reward_mean = rewards_flat.mean().item()
+        reward_std = rewards_flat.std().item()
+        reward_min = rewards_flat.min().item()
+        reward_max = rewards_flat.max().item()
+
+        # Codebook usage over the sampled codes (fraction of unique tuples)
+        codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
+        n_unique = torch.unique(codes_flat_all, dim=0).shape[0]
+
         return {
             "loss": total_loss / (M * NC),
             "log_pi_mean": total_log_pi / (M * NC),
-            "mean_reward": rollout_result["mean_reward"],
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "reward_min": reward_min,
+            "reward_max": reward_max,
             "mod_grad_norm": grad_norm,
             "n_chunks": n_chunks,
             "M": M,
+            "n_unique_codes": n_unique,
         }
 
     # ------------------------------------------------------------------
@@ -423,13 +452,26 @@ class Phase2Trainer:
             tokens_seen += step_tokens
             self.global_step += 1
 
+            # Persistent jsonl logging for plotting
+            log_row = {
+                "step": self.global_step,
+                "stage_window": stage.reward_window,
+                "tokens_seen": tokens_seen,
+                "rollout_time": t_rollout,
+                "grad_time": t_grad,
+                **step_metrics,
+            }
+            self._append_metrics(log_row)
+
             if self.global_step % self.log_interval == 0:
                 print(f"[p2 step {self.global_step}] "
                       f"W={stage.reward_window} "
                       f"loss={step_metrics['loss']:.4f} "
-                      f"r={step_metrics['mean_reward']:+.3f} "
+                      f"r={step_metrics['reward_mean']:+.3f}"
+                      f"±{step_metrics['reward_std']:.2f} "
                       f"log_pi={step_metrics['log_pi_mean']:+.2f} "
                       f"mod_gn={step_metrics['mod_grad_norm']:.3f} "
+                      f"codes={step_metrics['n_unique_codes']} "
                       f"records={step_metrics['M']} "
                       f"roll={t_rollout:.1f}s grad={t_grad:.1f}s "
                       f"tokens={tokens_seen:,}/{stage.token_budget:,}")

@@ -278,6 +278,67 @@ class MemoryGraph(nn.Module):
             norms.append(flat.norm(dim=1))   # [NC]
         return torch.stack(norms, dim=0).mean().item()
 
+    @torch.no_grad()
+    def compute_memory_health(self) -> dict:
+        """Snapshot of memory runtime state health. Cheap: scalars only.
+
+        Returns a flat dict suitable for jsonl logging.
+        """
+        if not self._initialized:
+            return {}
+        out = {}
+        h = self.h.float()
+        msg = self.msg.float()
+        W = self.W.float()
+        dl = self.decay_logit.float()
+
+        out["h_norm"] = h.norm().item() / max(h.numel() ** 0.5, 1.0)
+        out["msg_norm"] = msg.norm().item() / max(msg.numel() ** 0.5, 1.0)
+        out["h_max"] = h.abs().max().item()
+        out["msg_max"] = msg.abs().max().item()
+        out["W_norm"] = W.norm().item() / max(W.numel() ** 0.5, 1.0)
+        out["W_max"] = W.abs().max().item()
+        out["W_sparsity"] = (W.abs() < 1e-4).float().mean().item()
+        out["decay_mean"] = torch.sigmoid(dl).mean().item()
+        out["decay_std"] = torch.sigmoid(dl).std().item()
+        out["s_mem_live"] = self.s_mem_live.float().mean().item()
+        out["s_mem_ema_fast"] = self.s_mem_ema_fast.float().mean().item()
+        out["readout_drift_mean"] = self.readout_drift.float().mean().item()
+        return out
+
+    def compute_param_norms(self) -> dict:
+        """L2 norms of key weight tensors (cheap; cpu-synced scalars)."""
+        return {
+            "mod_w1_norm": self.mod_w1.detach().float().norm().item(),
+            "mod_w2_norm": self.mod_w2.detach().float().norm().item(),
+            "state_w1_norm": self.state_w1.detach().float().norm().item(),
+            "state_w2_norm": self.state_w2.detach().float().norm().item(),
+            "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
+            "msg_w2_norm": self.msg_w2.detach().float().norm().item(),
+            "inject_w_norm": self.inject_w.detach().float().norm().item(),
+            "neuron_id_norm": self.neuron_id.detach().float().norm().item(),
+        }
+
+    def compute_component_grad_norms(self) -> dict:
+        """Per-component grad L2 norms for the memory subnetwork.
+
+        Read after backward, before zero_grad. Returns 0 for components with
+        no grad (e.g. when frozen).
+        """
+        out = {}
+        for name, p in (
+            ("grad_mod_w1", self.mod_w1),
+            ("grad_mod_w2", self.mod_w2),
+            ("grad_state_w1", self.state_w1),
+            ("grad_state_w2", self.state_w2),
+            ("grad_msg_w1", self.msg_w1),
+            ("grad_msg_w2", self.msg_w2),
+            ("grad_inject_w", self.inject_w),
+            ("grad_neuron_id", self.neuron_id),
+        ):
+            out[name] = 0.0 if p.grad is None else p.grad.detach().float().norm().item()
+        return out
+
     # ================================================================
     # Per-step components
     # ================================================================
