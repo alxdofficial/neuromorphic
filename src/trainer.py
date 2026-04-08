@@ -25,6 +25,8 @@ class Trainer:
         max_grad_norm: float = 1.0,
         log_interval: int = 50,
         use_memory: bool = True,
+        freeze_modulator: bool = False,
+        collect_actions: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -38,6 +40,17 @@ class Trainer:
         self.use_memory = use_memory
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
+
+        # Cycle-1+: freeze modulator so phase 1 TBPTT doesn't undo phase 2 GRPO.
+        self.freeze_modulator = freeze_modulator
+        if freeze_modulator:
+            for p in (model.memory.mod_w1, model.memory.mod_b1,
+                      model.memory.mod_w2, model.memory.mod_b2):
+                p.requires_grad = False
+
+        # Action collection: snapshot one modulator output per training step.
+        self.collect_actions = collect_actions
+        self.action_buffer: list[torch.Tensor] = []
 
     def train_chunk(self, batch) -> dict:
         self.model.train()
@@ -86,6 +99,12 @@ class Trainer:
         # Phase-1 telemetry: snapshot modulator action stats after the step.
         mod_stats = self.model.memory.compute_modulator_stats()
 
+        # Optional action collection for codebook fitting.
+        if self.collect_actions:
+            action = self.model.memory.collect_modulator_action()
+            if action is not None:
+                self.action_buffer.append(action)
+
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed
         loss_val = ce_loss.item()
@@ -131,3 +150,19 @@ class Trainer:
 
         pbar.close()
         return all_metrics
+
+    def flush_action_database(self, path: str) -> int:
+        """Save collected modulator actions to disk.
+
+        Actions were accumulated per step as [BS, NC, mod_out] float32 cpu tensors.
+        Concatenate along batch, reshape to [N * NC, mod_out] so each cell's
+        per-call output is one sample, and save. Returns the number of samples.
+        """
+        if not self.action_buffer:
+            return 0
+        stacked = torch.cat(self.action_buffer, dim=0)   # [N_steps*BS, NC, mod_out]
+        samples = stacked.reshape(-1, stacked.shape[-1])  # [N*NC, mod_out]
+        torch.save(samples, path)
+        n = samples.shape[0]
+        self.action_buffer.clear()
+        return n

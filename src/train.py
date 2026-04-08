@@ -49,6 +49,12 @@ def parse_args():
                    help="Disable memory graph (LM-only baseline)")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--d-inner", type=int, default=None)
+    p.add_argument("--freeze-modulator", action="store_true",
+                   help="Freeze modulator params (cycle 1+ phase 1)")
+    p.add_argument("--collect-actions", action="store_true",
+                   help="Collect modulator actions to a buffer (for codebook fit)")
+    p.add_argument("--action-db-out", type=str, default=None,
+                   help="Path to save action database when --collect-actions")
     return p.parse_args()
 
 
@@ -169,7 +175,13 @@ def main():
         dataloader=dataloader, config=config, device=device,
         max_grad_norm=MAX_GRAD_NORM, log_interval=args.log_interval,
         use_memory=not args.no_memory,
+        freeze_modulator=args.freeze_modulator,
+        collect_actions=args.collect_actions,
     )
+    if args.freeze_modulator:
+        print("*** Modulator FROZEN — phase 1 of iterative cycle ***")
+    if args.collect_actions:
+        print("*** Action collection ENABLED — will flush to disk ***")
     trainer.global_step = start_step
     if pending_runtime_state is not None:
         model.load_runtime_state(pending_runtime_state)
@@ -208,6 +220,12 @@ def main():
     print(f"\nTraining for {remaining_steps} steps...")
     trainer.train_epoch(remaining_steps, step_callback=step_callback)
     save_checkpoint(trainer.global_step)
+
+    if args.collect_actions and args.action_db_out:
+        os.makedirs(os.path.dirname(args.action_db_out) or ".", exist_ok=True)
+        n = trainer.flush_action_database(args.action_db_out)
+        print(f"Flushed {n:,} action samples to {args.action_db_out}")
+
     print("Done.")
 
 

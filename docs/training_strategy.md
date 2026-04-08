@@ -12,20 +12,38 @@ choose between (a) short TBPTT — fast and stable, but the modulator only learn
 "helps the next ~8 tokens," and (b) long TBPTT — gives the modulator long-horizon
 credit but is slow, memory-intensive, and overkill for the dynamics MLPs.
 
-We resolve it by training in two phases:
+We resolve it with a **bootstrap + iterative cycle** structure:
 
-- **Phase 1 (current)**: TBPTT with `tbptt_block=8`. Trains everything. The
-  modulator gets short-horizon credit, which is enough to bring it to a baseline
-  competence. The dynamics MLPs, lm_head, scan layers all learn their actual jobs.
-- **Phase 2**: Freeze everything except the modulator. Discretize the modulator's
-  action space via Residual VQ-VAE (RVQ) fit on phase-1 actions. Train the
-  modulator with GRPO over the discrete codebook, against a long-horizon windowed
-  reward. The discretization makes per-step policy gradients well-conditioned;
-  the long-horizon reward gives the modulator the credit signal it actually needs.
+- **Bootstrap (one-time, ~200M tokens)**: standard phase 1 TBPTT with all params
+  trainable, including the modulator. This gives the modulator a long stable
+  warmup under the natural `ce_loss + mem_pred_loss` objective before any
+  GRPO machinery comes online. The dynamics co-adapt to the modulator and the
+  modulator settles into a baseline competent policy. This is *only* run once,
+  at the very start, before any codebook fit.
 
-Phase 2 is **not** a replacement for phase 1 — it is a fine-tune of the modulator
-on top of a converged phase-1 model. The phase-1 checkpoint is the anchor and is
-never overwritten. If phase 2 fails or makes things worse, we can revert losslessly.
+- **Iterative cycles (repeat indefinitely)**:
+  - **Phase 1 (~50M tokens, modulator frozen)**: TBPTT trains everything *except*
+    the modulator. The modulator's weights are frozen (`requires_grad=False`)
+    so its long-horizon policy from the previous cycle's phase 2 is preserved
+    exactly. The dynamics MLPs, scan, lm_head co-adapt to whatever the modulator
+    is currently doing.
+  - **Codebook refresh**: collect modulator action snapshots during last steps
+    of phase 1, fit a fresh Residual VQ-VAE (RVQ) on them.
+  - **Phase 2 (~50M tokens, everything frozen except modulator)**: GRPO over
+    discretized action space, with a curriculum-stepped reward window
+    (512 → 2048 → 4096). Discrete categorical log-pi sidesteps the variance hell
+    of high-dim continuous PG; long-horizon reward gives the modulator the
+    credit signal TBPTT structurally cannot provide.
+
+The iterative loop is the answer to "the codebook is a snapshot that bounds
+phase 2's expressivity." By rebuilding the codebook every cycle, the modulator's
+action space is never frozen — each cycle captures the current distribution and
+gives GRPO a fresh, distribution-tracking action vocabulary.
+
+The freeze of the modulator during phase 1 (after bootstrap) is the answer to
+"phase 1's short-horizon TBPTT gradient would undo phase 2's long-horizon GRPO
+work." See the *Critical: modulator is frozen in phase 1 after bootstrap*
+section below for details.
 
 ---
 
@@ -67,31 +85,29 @@ Optional but worth having:
 - A periodic dump of the action distribution (histogram of `delta_W` magnitudes
   per cell) — needed anyway for the codebook fit, so we may as well log it.
 
-### Phase-1 plateau criteria (operator judgment)
+### Phase 1 duration
 
-The user will look at the curves and decide. Rough heuristics:
+- **Bootstrap phase 1**: ~200M tokens (one-time). All params trainable
+  including modulator. This is the warmup before iterative cycles begin.
+- **Cycle phase 1**: ~50M tokens per cycle. Modulator frozen. Dynamics
+  re-adapt to whatever the previous cycle's GRPO modulator looks like.
 
-- `ce_loss` flat (within 2% of min) for ≥ 1000 steps
-- `mem_pred_loss` flat for ≥ 1000 steps
-- `mod_grad_norm` has dropped to < 50% of its phase-1 peak
-- `mod_action_norm` and `mod_action_var` are stable
-
-When all four are satisfied, phase 1 is done. Save a checkpoint as `phase1_anchor.pt`.
+Both use a fixed token budget; the telemetry is for monitoring health, not for
+plateau-triggered switching. When the budget is exhausted, phase 1 ends.
 
 ### What phase 1 does NOT do
 
 - It does not train the modulator on long-horizon credit. The modulator gets
   ~8-token TBPTT credit only.
-- It does not validate the long-horizon hypothesis. We don't know yet if a
-  better long-horizon modulator policy actually helps `mem_pred_loss` over
-  long windows. Phase 2 is the test of that hypothesis.
+- It does not validate the long-horizon hypothesis. That's phase 2's job.
 
 ---
 
-## Codebook fit (between phases)
+## Codebook refresh (between phases, every cycle)
 
-Between phase 1 and phase 2, fit a Residual VQ-VAE on the modulator's recent
-action distribution.
+At the end of every phase 1, fit a fresh Residual VQ-VAE on the modulator's
+current action distribution. The codebook is **not** persistent across cycles —
+each cycle gets its own codebook trained on the current modulator's actions.
 
 ### Action database collection
 
@@ -252,32 +268,31 @@ The **autograd graph is just the modulator forward + the VQ encoder forward +
 the categorical log-probs**. No memory dynamics, no scan layers, no decoder.
 VRAM footprint is small and bounded by `B * N_actions * action_dim`.
 
-### Curriculum schedule (operator-controlled)
+### Curriculum schedule (per cycle)
 
-Reward window W steps through a fixed schedule, advanced manually by the user
-based on training curves:
+Within a single phase 2 run, the reward window steps through a fixed schedule
+of (W, token_budget) stages. Each stage trains for its budget then advances:
 
-| Stage | W (tokens) | Notes |
-|---|---|---|
-| 1 | 256 | Easy credit assignment, modulator finds local patterns |
-| 2 | 512 | First real long-horizon test |
-| 3 | 1024 | Approaching the limit of useful prediction horizon |
-| 4 | 2048 | Match the longest segment we'd realistically train against |
+| Stage | W (tokens) | Token budget per cycle | Notes |
+|---|---|---|---|
+| 1 | 512 | 25M | First real long-horizon test |
+| 2 | 2048 | 15M | Mid-range, where most useful retrieval lives |
+| 3 | 4096 | 10M | Stress test for the longest credit horizon |
 
-The user advances stages manually. Suggested signal: when eval `mem_pred_loss`
-at the current window has been within 2% of its minimum for ≥500 GRPO steps
-**and** the GRPO policy entropy is no longer dropping, advance to the next stage.
+Total phase 2 per cycle: **50M tokens**. Total cycle: **100M tokens** (50M phase
+1 + 50M phase 2). The curriculum is automatic, not operator-advanced — each
+stage runs to its budget then the next stage starts.
 
-If a stage diverges (eval `mem_pred_loss` rises >5% above the phase-1 baseline),
-the user reverts to the previous stage's checkpoint and considers adjusting
-exploration noise, group size, or KL anchor weight.
+The user can monitor and abort if a stage diverges (eval `mem_pred_loss` rises
+significantly above start-of-stage baseline), but the default is to let the
+curriculum run.
 
 ### Phase-2 segment length
 
 Phase 2 rollouts use **segment length T = current curriculum window W**. Phase 1's
 constraint of T=128 came from TBPTT activation memory, which doesn't apply here
-because rollouts are `no_grad`. At W=2048, each rollout processes 2048 tokens of
-memory dynamics with no gradient activations stored — cheap.
+because rollouts are `no_grad`. At W=4096, each rollout processes 4096 tokens of
+memory dynamics with no gradient activations stored.
 
 ### Eval cadence
 
@@ -288,16 +303,121 @@ Every 100 GRPO updates:
 - Compare to phase-1 baseline. If `mem_pred_loss` is meaningfully better → phase 2
   is helping. If it's worse → something is wrong, hard stop.
 
-### Phase-2 stopping criteria
+### Phase-2 stopping criteria (per cycle)
 
-Stop phase 2 when any of:
-- All 4 curriculum stages have plateaued.
-- Eval `mem_pred_loss` has been worse than phase-1 baseline for ≥1000 steps
-  (phase 2 is hurting, not helping).
-- Wall-clock budget exceeded.
+Phase 2 within a cycle ends when:
+- All 3 curriculum stages have completed their token budgets, **OR**
+- Eval `mem_pred_loss` has risen >10% above start-of-cycle baseline (early abort).
 
-The output is `phase2_modulator.pt` — only the modulator params are saved; everything
-else is the unchanged phase-1 checkpoint.
+When phase 2 ends, control returns to the outer loop, which starts the next cycle's
+phase 1 with the post-GRPO modulator weights as the starting point.
+
+## Bootstrap + iterative cycle loop
+
+The full training pipeline is:
+
+```
+state: model weights (LM + memory + modulator)
+
+# === BOOTSTRAP (one-time, ~200M tokens) ===
+# All params trainable, including modulator. No GRPO. No codebook.
+# Just normal phase 1 TBPTT until the modulator and dynamics are well-warmed.
+run_phase_1(model, tokens=200M, freeze_modulator=False)
+save_checkpoint("bootstrap.pt")
+
+# === ITERATIVE CYCLES ===
+for cycle in 0..N_CYCLES:
+    # Phase 1 — train dynamics + LM via TBPTT, modulator FROZEN
+    run_phase_1(model, tokens=50M, freeze_modulator=True)
+
+    # Action collection — capture modulator outputs at end of phase 1
+    actions = collect_actions(model, tokens=2M)
+
+    # Codebook refresh — fit fresh RVQ-VAE on current actions
+    codebook = train_codebook(actions, levels=4, codes_per_level=16)
+
+    # Phase 2 — freeze everything but modulator, GRPO over codes
+    for (W, budget) in [(512, 25M), (2048, 15M), (4096, 10M)]:
+        run_phase_2(model, codebook, reward_window=W, tokens=budget)
+
+    save_checkpoint(f"cycle_{cycle}.pt")
+```
+
+A single cycle is ~100M tokens. At phase-1 throughput of ~50K tok/s and phase-2
+throughput of ~10-20K tok/s effective (depending on K and W), one cycle takes
+roughly 2-4 hours of wall-clock on a 4090. 10 cycles = 1-2 days.
+
+Bootstrap is a separate ~1 hour (~200M tokens at 50K tok/s).
+
+### What persists across cycles, what doesn't
+
+| Item | Persists? | Trainable in bootstrap? | Trainable in cycle phase 1? | Trainable in phase 2? |
+|---|---|---|---|---|
+| LM scan, lm_head, embedding | Yes | Yes | Yes | No (frozen) |
+| State/msg/inject MLPs, neuron_id | Yes | Yes | Yes | No (frozen) |
+| **Modulator weights** | **Yes** | **Yes** | **No (frozen)** | **Yes (GRPO)** |
+| Memory runtime state (h, msg, W, decay_logit) | Yes (lifelong) | Updated | Updated | Updated |
+| Codebook | **No** — refit per cycle | n/a | n/a | Used (frozen) |
+| Phase-2 categorical head state | **No** — distance-based logits stateless | n/a | n/a | n/a |
+| GRPO optimizer state | **No** — fresh per cycle's phase 2 | n/a | n/a | Yes |
+| Phase-1 optimizer state | Yes — reused across cycles | Yes | Yes | n/a |
+
+### Critical: modulator is frozen in phase 1 after bootstrap
+
+There's a structural conflict between the two phases' modulator training signals:
+
+- Phase 1's modulator gradient (via TBPTT, `tbptt_block=8`) optimizes 8-token
+  short-horizon prediction.
+- Phase 2's modulator gradient (via GRPO, windowed reward up to W=4096)
+  optimizes long-horizon prediction.
+
+These objectives are **not the same function**. A modulator policy that's
+optimal for "what helps in 2048 tokens" might actively hurt "what helps in 8
+tokens." Without intervention, each cycle's phase 1 would partially undo the
+previous cycle's phase 2 work — pulling the modulator back toward short-term
+optima that GRPO had moved it away from.
+
+**Mitigation**:
+- **During bootstrap** (~200M tokens, before any cycle): modulator trains
+  normally. This warms it up to baseline competence so that the first codebook
+  fit has a non-degenerate action distribution to learn from.
+- **During every iterative cycle's phase 1**: modulator is **frozen**
+  (`requires_grad=False` on `mod_w1/b1/w2/b2`). Only dynamics MLPs, scan
+  layers, lm_head, and embedding train. The modulator weights from the
+  previous cycle's phase 2 are preserved exactly through phase 1.
+
+After bootstrap, the modulator is **only ever updated by GRPO**. TBPTT cannot
+teach the long-horizon credit assignment the modulator needs, so it shouldn't
+be the modulator's training signal at all once we have a working GRPO loop.
+
+This is philosophically clean: phase 1 in cycles 1+ becomes "dynamics
+fine-tuning under the current modulator policy" — analogous to how RLHF freezes
+the LM during reward model training and only updates during the policy step.
+
+**Soft failure mode that remains**: even with the modulator frozen, the
+dynamics MLPs in cycles 1+ phase 1 are trained against `ce_loss + mem_pred_loss`,
+which depend on modulator outputs. The dynamics can in principle "compensate"
+for modulator behavior changes — e.g. learning to treat the new write pattern
+similarly to the old one, washing out phase 2's long-horizon improvements.
+This is softer than direct modulator regression but real. **Monitoring**:
+track eval `mem_pred_loss` at the 2048-token window at end of each cycle's
+phase 1. If it has degraded significantly from end-of-phase-2, the dynamics
+are washing out the GRPO signal — respond by reducing phase 1's token budget
+in subsequent cycles or by adding the dynamics MLPs to the freeze set in
+cycles 2+.
+
+The "categorical head" question — what happens when the codebook re-indexes
+between cycles? **Answer: nothing.** Because the policy is implemented as
+distance-based logits over the current codebook (`logits[i] = -‖encode(mu) - codebook[i]‖²`),
+there's no learned per-code parameter to re-index. The modulator's continuous
+head doesn't know or care which code is which; it just produces a `mu`, and the
+nearest-code lookup is done against whichever codebook is currently active. When
+the codebook changes between cycles, the policy automatically tracks the new
+codes without any parameter reset.
+
+This is the entire reason we chose distance-based logits over a separate
+classifier head. With a classifier head we'd need Hungarian matching across
+codebook refreshes; with distance-based logits we get free re-indexing.
 
 ---
 
@@ -328,52 +448,65 @@ else is the unchanged phase-1 checkpoint.
 | Dead-code resample | < 1% usage over 100 steps | VQ-BeT recipe |
 | Training epochs | 10-20 | until reconstruction loss plateaus |
 
-### Phase 2
+### Phase 2 (per cycle)
 | Knob | Value | Notes |
 |---|---|---|
 | Frozen | everything except mod_w1/b1/w2/b2 | |
 | `lr` | 1e-4 | lower than phase 1 — fine-tune |
-| GRPO group size K | 32 | minimum for 65K action space without critic |
-| Curriculum W | 256 → 512 → 1024 → 2048 | operator-advanced |
+| GRPO group size K | 8 | start small; scale up if variance too high |
+| Curriculum (W, budget) | (512, 25M), (2048, 15M), (4096, 10M) | automatic, not operator-advanced |
 | Segment length T | = W | rollouts in no_grad |
 | Logits temperature τ | 1.0 | tunable, may need lower if exploration too noisy |
 | Advantage normalization | yes | per-batch mean/std |
-| KL anchor to phase-1 modulator | 0.0 (default off) | enable if codebook drift hurts |
 | Eval cadence | every 100 GRPO updates | |
+
+### Bootstrap + iterative loop
+| Knob | Value | Notes |
+|---|---|---|
+| Bootstrap tokens (one-time) | 200M | normal phase 1, modulator trains |
+| Phase 1 tokens / cycle | 50M | modulator FROZEN |
+| Phase 2 tokens / cycle | 50M | sum of curriculum stage budgets |
+| Action collection tokens | ~2M | last steps of phase 1 |
+| Total tokens / cycle | ~100M | excluding bootstrap |
+| Modulator trains during | Bootstrap (TBPTT) + every phase 2 (GRPO) | never via TBPTT after bootstrap |
+| N cycles | open | run until plateau or budget exhausted |
 
 ---
 
 ## Build order
 
-1. **Phase 1 telemetry** (next concrete task). Add the four new logged metrics
-   plus action histogram dump. No training algorithm changes. Smoke-test on a
-   short run.
+1. **Phase 1 telemetry** ✅. Done in commit 13b17fb. `mod_grad_norm`,
+   `mod_action_norm`, `mod_action_var` printed at every log_interval.
 
-2. **Phase 1 training run.** Train to plateau using the new telemetry. User
-   monitors and decides when to stop. Save `phase1_anchor.pt`.
+2. **Action collection.** Add `MemoryGraph.collect_modulator_action()` and a
+   trainer collection mode. Snapshot one action per training step at end of
+   segment. Flush to a database tensor.
 
-3. **Action database collection.** Add a hook in the modulator forward path
-   that, when enabled, accumulates actions to a buffer. Run the last 2000
-   steps of phase 1 with collection enabled. Save `action_database.pt`.
+3. **RVQ-VAE module + standalone trainer.** `src/codebook/rvq.py` with
+   `ResidualVQ` and `ActionVQVAE`. `scripts/train_codebook.py` loads action
+   database, fits codebook, validates, saves.
 
-4. **RVQ-VAE module + training script.** Standalone trainer that loads
-   `action_database.pt`, fits the RVQ codebook, validates it (usage histogram,
-   reconstruction error, frozen-loop sanity check). Save `codebook_v1.pt`.
+4. **Phase 2 trainer.** `src/phase2/trainer.py` with `Phase2Trainer`.
+   - `MemoryGraph.forward_segment_phase2()` runs the memory loop with
+     VQ sampling and records `(state, codes)` per modulator call.
+   - `rollout()` runs K trajectories batched as one BS=K*BS forward.
+   - `compute_rewards()` computes per-token mem_pred_loss and windows it.
+   - `grpo_step()` does the modulator-only gradient pass over stacked records.
+   - Curriculum loop over (W, budget) stages.
 
-5. **Phase 2 trainer.** New training loop:
-   - Loads `phase1_anchor.pt` and `codebook_v1.pt`.
-   - Freezes all params except modulator.
-   - Implements the GRPO rollout + categorical log-pi gradient pass over codes.
-   - Implements per-action windowed reward with operator-controlled W.
-   - Eval pass every 100 updates.
-   - Save `phase2_modulator.pt`.
+5. **Phase 2 entry point.** `src/train_phase2.py` — CLI that loads a phase 1
+   checkpoint + a codebook, runs `Phase2Trainer` for one cycle's phase 2.
 
-6. **Phase 2 training run.** User monitors curves and advances curriculum
-   manually.
+6. **Outer loop driver.** `src/train_loop.py` — orchestrates the full
+   iterative pipeline: phase 1 → action collection → codebook fit → phase 2 →
+   repeat. Single-process, single-GPU. Each step calls into the existing
+   sub-trainers; no duplication of training logic.
+
+7. **Tests.** `tests/test_rvq.py` for RVQ correctness, `tests/test_phase2.py`
+   for the GRPO gradient flow on a tiny config.
 
 Each step is independently testable. Don't start step N+1 until step N is
-working. If any step turns out infeasible, we revert to the prior checkpoint
-and the project is no worse off than where we started.
+working.
 
 ---
 

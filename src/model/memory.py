@@ -186,20 +186,14 @@ class MemoryGraph(nn.Module):
     # Telemetry (phase-1 plateau detection)
     # ================================================================
 
-    @torch.no_grad()
-    def compute_modulator_stats(self) -> dict:
-        """Snapshot modulator action stats at current state.
+    def _build_mod_input(self) -> Tensor:
+        """Construct modulator input tensor from current runtime state.
 
-        Runs one eager modulator forward (no compile, no_grad) on the live
-        runtime state. Returns mean action magnitude and per-cell variance
-        across the batch — used to monitor whether the modulator is producing
-        diverse, non-degenerate actions during phase 1.
+        Returns: [BS, NC, mod_in] in the runtime dtype.
+        Used by both `compute_modulator_stats` and `collect_modulator_action`.
         """
-        if not self._initialized:
-            return {"mod_action_norm": 0.0, "mod_action_var": 0.0}
-
         BS = self.h.shape[0]
-        NC, N = self.N_cells, self.C_n
+        NC = self.N_cells
         dt = self.h.dtype
 
         h_mean = self.h.mean(dim=2)
@@ -210,39 +204,65 @@ class MemoryGraph(nn.Module):
         s1 = self.s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
         s2 = self.s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
 
-        mod_input = torch.cat([
+        return torch.cat([
             h_mean, msg_mean,
             W_stats, decay_mean,
             self.readout_drift,
             s1, s2,
         ], dim=-1)
 
+    def _modulator_forward(self, mod_input: Tensor) -> Tensor:
+        """Eager modulator MLP forward, returns full output [BS, NC, mod_out]."""
+        dt = mod_input.dtype
         mod_w1 = self.mod_w1.to(dt)
         mod_b1 = self.mod_b1.to(dt)
         mod_w2 = self.mod_w2.to(dt)
         mod_b2 = self.mod_b2.to(dt)
-
         hidden = torch.tanh(
             torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
         output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
+        return output
+
+    @torch.no_grad()
+    def compute_modulator_stats(self) -> dict:
+        """Snapshot modulator action stats at current state. See class docstring."""
+        if not self._initialized:
+            return {"mod_action_norm": 0.0, "mod_action_var": 0.0}
+
+        BS = self.h.shape[0]
+        NC, N = self.N_cells, self.C_n
+
+        mod_input = self._build_mod_input()
+        output = self._modulator_forward(mod_input)
 
         delta_W = output[..., :N * N].reshape(BS, NC, N, N).float()
         delta_decay = output[..., N * N:N * N + N].reshape(BS, NC, N).float()
 
-        # Per-cell action magnitude (mean of |delta_W|, |delta_decay|).
-        dW_mag = delta_W.abs().mean(dim=(2, 3))      # [BS, NC]
-        dD_mag = delta_decay.abs().mean(dim=2)       # [BS, NC]
+        dW_mag = delta_W.abs().mean(dim=(2, 3))
+        dD_mag = delta_decay.abs().mean(dim=2)
         action_norm = ((dW_mag + dD_mag) * 0.5).mean()
 
-        # Per-cell action variance across the batch dim — collapse → low var.
-        dW_var = delta_W.var(dim=0, unbiased=False).mean(dim=(1, 2))   # [NC]
-        dD_var = delta_decay.var(dim=0, unbiased=False).mean(dim=1)    # [NC]
+        dW_var = delta_W.var(dim=0, unbiased=False).mean(dim=(1, 2))
+        dD_var = delta_decay.var(dim=0, unbiased=False).mean(dim=1)
         action_var = ((dW_var + dD_var) * 0.5).mean()
 
         return {
             "mod_action_norm": action_norm.item(),
             "mod_action_var": action_var.item(),
         }
+
+    @torch.no_grad()
+    def collect_modulator_action(self) -> Tensor | None:
+        """Snapshot the full modulator action vector at current runtime state.
+
+        Returns: [BS, NC, mod_out] tensor (concatenation of delta_W and
+        delta_decay flattened per cell), or None if not yet initialized.
+        Used during action database collection between phase 1 and codebook fit.
+        """
+        if not self._initialized:
+            return None
+        mod_input = self._build_mod_input()
+        return self._modulator_forward(mod_input).float().cpu()
 
     def compute_mod_grad_norm(self) -> float:
         """Mean per-cell L2 norm of modulator weight gradients.
@@ -584,3 +604,196 @@ class MemoryGraph(nn.Module):
         mem_pred_loss = loss_sum / max(count, 1)
 
         return readouts, mem_pred_loss
+
+    # ================================================================
+    # Phase 2: VQ-sampled rollout (no_grad)
+    # ================================================================
+
+    @torch.no_grad()
+    def forward_segment_phase2(
+        self,
+        H_mid: Tensor,
+        input_ids: Tensor,
+        lm,
+        vqvae,
+        tau: float = 1.0,
+        sample: bool = True,
+    ) -> dict:
+        """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
+
+        At each modulator call:
+            1. Build mod_input as in phase 1
+            2. Run the modulator to produce raw continuous output
+            3. Encode via vqvae.encoder -> low-dim latent z
+            4. Sample codes from the per-level distance-based categorical
+            5. Reconstruct quantized latent z_q from codes
+            6. Decode z_q via vqvae.decoder -> quantized action
+            7. Unpack into delta_W, delta_decay and apply to memory state
+            8. Record (mod_input, codes, t) for the GRPO gradient pass
+
+        Args:
+            H_mid: [BS, T, D] — lower-scan output from (frozen) LM
+            input_ids: [BS, T]
+            lm: (frozen) LM module — provides lm_head / mem_head weights
+            vqvae: (frozen) ActionVQVAE — provides encoder, rvq, decoder
+            tau: temperature for the distance-based categorical
+            sample: True for multinomial sampling, False for argmax
+
+        Returns:
+            dict with:
+                readouts: [BS, T, D]
+                mod_inputs: [n_calls, BS, NC, mod_in] — state at each modulator call
+                codes: [n_calls, BS, NC, num_levels] — sampled codes
+                call_positions: [n_calls] — token position `t` of each call
+        """
+        assert self._initialized, "memory must be initialized before phase2 rollout"
+
+        BS, T, D = H_mid.shape
+        NC, N = self.N_cells, self.C_n
+        D_n = self.D_n
+        dt = self.h.dtype
+
+        # Per-step LM weights for mem-head surprise (mirrors forward_segment)
+        lm_head_w = lm.lm_head.weight.to(dt)
+        if lm.proj_down is not None:
+            proj_down_w = lm.proj_down.weight.to(dt)
+            proj_down_b = lm.proj_down.bias.to(dt)
+        else:
+            proj_down_w = None
+            proj_down_b = None
+        ln_final_w = lm.ln_final.weight.to(dt)
+        ln_final_b = lm.ln_final.bias.to(dt)
+
+        # Dynamics MLP weight caches
+        st_w1_full = self.state_w1.to(dt)
+        st_w1_recv = st_w1_full[:, :D_n].contiguous()
+        st_w1_h = st_w1_full[:, D_n:].contiguous()
+        st_b1 = self.state_b1.to(dt)
+        st_w2 = self.state_w2.to(dt)
+        st_b2 = self.state_b2.to(dt)
+        mg_w1 = self.msg_w1.to(dt)
+        mg_b1 = self.msg_b1.to(dt)
+        mg_w2 = self.msg_w2.to(dt)
+        mg_b2 = self.msg_b2.to(dt)
+        inject_w = self.inject_w.to(dt)
+        inject_b = self.inject_b.to(dt)
+
+        identity = self._identity(BS, dt, H_mid.device)
+        H_mid = H_mid.to(dt)
+
+        # Live runtime state (cloned so we don't clobber phase-1 state)
+        h = self.h.clone()
+        msg = self.msg.clone()
+        W = self.W.clone()
+        decay_logit = self.decay_logit.clone()
+        s_mem_live = self.s_mem_live.clone()
+        s_mem_ema_fast = self.s_mem_ema_fast.clone()
+        prev_readout_cell = self.prev_readout_cell.clone()
+        prev_readout_full = self.prev_readout.clone()
+        readout_drift = self.readout_drift.clone()
+
+        decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+        one_minus_decay = 1.0 - decay
+
+        gain_fast = self.config.gain_ema_fast
+        w_decay_rate = self.config.w_decay_rate
+        mod_interval = self.config.modulation_interval
+
+        readouts = torch.empty(BS, T, D, device=H_mid.device, dtype=dt)
+        mod_input_records: list[Tensor] = []
+        codes_records: list[Tensor] = []
+        call_positions: list[int] = []
+
+        for t in range(T):
+            H_mid_t = H_mid[:, t]
+            tok_t = input_ids[:, t]
+
+            # Live surprise (same as phase 1)
+            x = prev_readout_full
+            if proj_down_w is not None:
+                x = F.linear(x, proj_down_w, proj_down_b)
+            x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
+            target_emb = lm_head_w[tok_t]
+            target_logit = (x * target_emb).sum(dim=-1)
+            s_mem_live = (-target_logit).to(dt)
+            s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
+
+            # Modulate via VQ sampling every M tokens
+            if t % mod_interval == 0:
+                # Build mod_input from current state (see _build_mod_input,
+                # inlined here with local variables)
+                h_mean = h.mean(dim=2)
+                msg_mean = msg.mean(dim=2)
+                W_stats = W.abs().mean(dim=-1).mean(dim=2, keepdim=True)
+                decay_mean = decay_logit.mean(dim=2, keepdim=True)
+                s1 = s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
+                s2 = s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
+                mod_input = torch.cat([
+                    h_mean, msg_mean,
+                    W_stats, decay_mean,
+                    readout_drift,
+                    s1, s2,
+                ], dim=-1)  # [BS, NC, mod_in]
+
+                raw_action = self._modulator_forward(mod_input)  # [BS, NC, mod_out]
+
+                # Normalize, encode, sample codes, decode, un-normalize
+                action_flat = raw_action.reshape(BS * NC, -1).float()
+                action_norm = vqvae.normalize(action_flat)
+                z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
+                codes = vqvae.rvq.sample_codes(z, tau=tau, sample=sample)  # [BS*NC, L]
+                # Reconstruct z_q from codes
+                z_q = torch.zeros_like(z)
+                for lvl in range(vqvae.rvq.num_levels):
+                    z_q = z_q + vqvae.rvq.codebooks[lvl][codes[:, lvl]]
+                quantized_norm = vqvae.decoder(z_q)              # [BS*NC, action_dim]
+                quantized = vqvae.denormalize(quantized_norm)
+                quantized = quantized.reshape(BS, NC, -1).to(dt)
+
+                # Unpack delta_W, delta_decay and apply
+                delta_W = quantized[..., :N * N].reshape(BS, NC, N, N)
+                delta_decay = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
+                W = W + delta_W
+                decay_logit = decay_logit + delta_decay
+                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
+                one_minus_decay = 1.0 - decay
+
+                # Record (mod_input, codes) for later gradient pass
+                mod_input_records.append(mod_input.detach().cpu())
+                codes_records.append(
+                    codes.reshape(BS, NC, -1).detach().cpu())
+                call_positions.append(t)
+
+            # Memory step (same as phase 1)
+            h, msg, readout = self._step(
+                h, msg, W, decay, one_minus_decay,
+                H_mid_t, identity, inject_w, inject_b,
+                st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2)
+            readouts[:, t] = readout
+
+            new_cell = readout.reshape(BS, NC, D_n)
+            readout_drift = (new_cell - prev_readout_cell).abs().mean(
+                dim=-1, keepdim=True).to(dt)
+            prev_readout_cell = new_cell
+            prev_readout_full = readout
+            W = W * (1.0 - w_decay_rate)
+
+        # Persist end-of-rollout memory state so the next rollout continues
+        # from here (memory is lifelong across rollouts too).
+        self.h = h
+        self.msg = msg
+        self.W = W
+        self.decay_logit = decay_logit
+        self.s_mem_live = s_mem_live
+        self.s_mem_ema_fast = s_mem_ema_fast
+        self.prev_readout_cell = prev_readout_cell
+        self.prev_readout = prev_readout_full
+        self.readout_drift = readout_drift
+
+        return {
+            "readouts": readouts,
+            "mod_inputs": torch.stack(mod_input_records, dim=0),   # [n_calls, BS, NC, mod_in]
+            "codes": torch.stack(codes_records, dim=0),             # [n_calls, BS, NC, L]
+            "call_positions": torch.tensor(call_positions, dtype=torch.long),
+        }
