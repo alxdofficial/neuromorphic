@@ -39,9 +39,11 @@ tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                  │        + message MLP + identity                │
                  │        → readout[t]                            │
                  │                                                 │
-                 │  (4) update readout_drift and prev_readout     │
+                 │  (4) update Hebbian trace, readout_drift,      │
+                 │       prev_readout                              │
                  │                                                 │
-                 │  (5) W *= (1 - w_decay_rate)                   │
+                 │  (5) W is row-RMSNormed at use in (3),          │
+                 │       no explicit decay needed                  │
                  │                                                 │
                  └─────────────────────────────────────────────────┘
                            │
@@ -191,9 +193,9 @@ Gradient flow:
 | Modulator hidden | Hmod | 2048 | config.cell_mod_hidden |
 | Modulation interval | M | 4 | config.modulation_interval |
 | TBPTT block | — | 8 | config.tbptt_block |
-| W decay rate | — | 1e-3 | config.w_decay_rate |
 | mem_pred_weight | — | 0.1 | config.mem_pred_weight |
 | gain_ema_fast | — | 0.3 | config.gain_ema_fast |
+| Hebbian decay (per cell, learnable) | γ | sigmoid(2)≈0.88 init | hebbian_decay_logit |
 
 ## Memory Graph
 
@@ -201,15 +203,21 @@ Gradient flow:
 
 Each cell has `W: [BS, NC, Cn, Cn] = [BS, 8, 32, 32]`. Runtime state
 (not a learned parameter). Initialized sparse (K=8 nonzeros per row),
-evolves via the neuromodulator. Message passing is a single bmm:
+evolves via the neuromodulator. Message passing is a single bmm with
+**row-wise RMSNorm on W** at use time:
 
 ```python
-received = torch.matmul(W, msg)    # [BS, NC, Cn, D_n]
+W_eff = F.rms_norm(W, normalized_shape=(N,))  # unit RMS per row
+received = torch.matmul(W_eff, msg)            # [BS, NC, Cn, D_n]
 ```
 
-Soft sparsity: `W *= (1 - w_decay_rate)` each step. This is *on-graph*
-(no `torch.no_grad()`), so later-token loss can train the modulator
-output that produced W via the persistence path ("write now, help later").
+The raw W is an unbounded accumulator (`W = W + delta_W` per modulator
+call, no explicit decay), but the *effective* W used in the matmul has
+unit row-RMS. This keeps gradients through the matmul self-regulating
+(as ||W_raw|| grows the gradient through the rmsnorm naturally shrinks)
+without needing a magic-number decay rate to bound W. The "write now,
+help later" credit path is preserved because the raw W still
+accumulates additively across modulator calls.
 
 ### Neuromodulator
 

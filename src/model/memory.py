@@ -58,8 +58,8 @@ class MemoryGraph(nn.Module):
             torch.zeros(self.N_cells, self.alpha * self.D_n))
 
         # Per-cell modulator
-        # Input: h_mean + msg_mean + per-neuron norms + decay_mean + drift +
-        #        global surprise + hebbian trace
+        # Input: per-neuron h_norms + msg_norms + decay_mean + drift +
+        #        global surprise + hebbian trace (see Config.mod_in)
         self.mod_w1 = nn.Parameter(torch.empty(self.N_cells, config.mod_in, Hmod))
         self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
         self.mod_w2 = nn.Parameter(torch.empty(self.N_cells, Hmod, config.mod_out))
@@ -436,17 +436,14 @@ class MemoryGraph(nn.Module):
                         mod_w1, mod_b1, mod_w2, mod_b2):
         """Per-cell neuromodulator step.
 
-        Inputs that are NOT redundant given the Hebbian trace + per-neuron
-        magnitudes (see docs/training_strategy.md for the rationale):
-          - h_mean, msg_mean   : average cell state / msg in feature space
-          - h_norms, msg_norms : per-neuron firing magnitudes
-          - decay_mean         : average per-cell leakiness
-          - readout_drift      : per-cell volatility
+        Biologically principled inputs only — rates, correlations, and
+        global neuromodulators. No content peek into the cell.
+          - h_norms, msg_norms        : per-neuron firing magnitudes (rates)
+          - decay_mean                : average per-cell leakiness
+          - readout_drift             : per-cell volatility
           - s_mem_live, s_mem_ema_fast : global surprise (broadcast)
-          - hebbian_flat       : per-pair coactivation history (the biological
-                                  "fire-together-wire-together" signal)
-        Note: W_stats was dropped because the raw W magnitude has no functional
-        effect after RMSNorm on W rows in _receive.
+          - hebbian_flat              : per-pair coactivation history
+                                        (Hebbian "fire-together-wire-together")
         """
         NC, N = self.N_cells, self.C_n
         D_n = self.D_n
@@ -875,8 +872,8 @@ class MemoryGraph(nn.Module):
                 # Build mod_input in f32 for numerical consistency with the
                 # gradient pass (which also runs the modulator in f32). Layout
                 # mirrors phase 1's `_build_mod_input`:
-                #   h_mean, msg_mean, h_norms, msg_norms, decay_mean,
-                #   readout_drift, s_live, s_fast, hebbian_flat
+                #   h_norms, msg_norms, decay_mean, readout_drift,
+                #   s_live, s_fast, hebbian_flat
                 h_norms = h.float().norm(dim=-1)              # [BS, NC, N]
                 msg_norms = msg.float().norm(dim=-1)          # [BS, NC, N]
                 decay_mean = decay_logit.float().mean(dim=2, keepdim=True)
