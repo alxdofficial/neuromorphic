@@ -183,6 +183,82 @@ class MemoryGraph(nn.Module):
         self._initialized = True
 
     # ================================================================
+    # Telemetry (phase-1 plateau detection)
+    # ================================================================
+
+    @torch.no_grad()
+    def compute_modulator_stats(self) -> dict:
+        """Snapshot modulator action stats at current state.
+
+        Runs one eager modulator forward (no compile, no_grad) on the live
+        runtime state. Returns mean action magnitude and per-cell variance
+        across the batch — used to monitor whether the modulator is producing
+        diverse, non-degenerate actions during phase 1.
+        """
+        if not self._initialized:
+            return {"mod_action_norm": 0.0, "mod_action_var": 0.0}
+
+        BS = self.h.shape[0]
+        NC, N = self.N_cells, self.C_n
+        dt = self.h.dtype
+
+        h_mean = self.h.mean(dim=2)
+        msg_mean = self.msg.mean(dim=2)
+        W_stats = self.W.abs().mean(dim=-1).mean(dim=2, keepdim=True)
+        decay_mean = self.decay_logit.mean(dim=2, keepdim=True)
+
+        s1 = self.s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
+        s2 = self.s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
+
+        mod_input = torch.cat([
+            h_mean, msg_mean,
+            W_stats, decay_mean,
+            self.readout_drift,
+            s1, s2,
+        ], dim=-1)
+
+        mod_w1 = self.mod_w1.to(dt)
+        mod_b1 = self.mod_b1.to(dt)
+        mod_w2 = self.mod_w2.to(dt)
+        mod_b2 = self.mod_b2.to(dt)
+
+        hidden = torch.tanh(
+            torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
+        output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
+
+        delta_W = output[..., :N * N].reshape(BS, NC, N, N).float()
+        delta_decay = output[..., N * N:N * N + N].reshape(BS, NC, N).float()
+
+        # Per-cell action magnitude (mean of |delta_W|, |delta_decay|).
+        dW_mag = delta_W.abs().mean(dim=(2, 3))      # [BS, NC]
+        dD_mag = delta_decay.abs().mean(dim=2)       # [BS, NC]
+        action_norm = ((dW_mag + dD_mag) * 0.5).mean()
+
+        # Per-cell action variance across the batch dim — collapse → low var.
+        dW_var = delta_W.var(dim=0, unbiased=False).mean(dim=(1, 2))   # [NC]
+        dD_var = delta_decay.var(dim=0, unbiased=False).mean(dim=1)    # [NC]
+        action_var = ((dW_var + dD_var) * 0.5).mean()
+
+        return {
+            "mod_action_norm": action_norm.item(),
+            "mod_action_var": action_var.item(),
+        }
+
+    def compute_mod_grad_norm(self) -> float:
+        """Mean per-cell L2 norm of modulator weight gradients.
+
+        Read from `.grad` after backward but before zero_grad. Returns 0 if
+        any of the modulator params has no grad yet.
+        """
+        norms = []
+        for p in (self.mod_w1, self.mod_w2):
+            if p.grad is None:
+                return 0.0
+            flat = p.grad.reshape(self.N_cells, -1).float()
+            norms.append(flat.norm(dim=1))   # [NC]
+        return torch.stack(norms, dim=0).mean().item()
+
+    # ================================================================
     # Per-step components
     # ================================================================
 

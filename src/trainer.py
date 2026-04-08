@@ -73,11 +73,18 @@ class Trainer:
         mem_grad_norm = nn.utils.clip_grad_norm_(
             self.model.memory.parameters(), self.max_grad_norm).item()
 
+        # Phase-1 telemetry: per-cell modulator grad norm (read after clip,
+        # before optimizer.step()).
+        mod_grad_norm = self.model.memory.compute_mod_grad_norm()
+
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
 
         self.model.detach_states()
+
+        # Phase-1 telemetry: snapshot modulator action stats after the step.
+        mod_stats = self.model.memory.compute_modulator_stats()
 
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed
@@ -92,6 +99,9 @@ class Trainer:
             "tok_s": tok_per_s,
             "lm_grad_norm": lm_grad_norm,
             "mem_grad_norm": mem_grad_norm,
+            "mod_grad_norm": mod_grad_norm,
+            "mod_action_norm": mod_stats["mod_action_norm"],
+            "mod_action_var": mod_stats["mod_action_var"],
             "elapsed": elapsed,
         }
 
