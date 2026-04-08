@@ -215,14 +215,25 @@ output that produced W via the persistence path ("write now, help later").
 
 Per-cell MLP, runs every `modulation_interval=4` steps.
 
-**Input** `[BS, NC, mod_in = 2*D_n + 5 = 517]`:
+**Input** `[BS, NC, mod_in = 2*N + 4 + N*N = 1092]` for N=32:
+
 ```python
-cat([h_mean, msg_mean,                     # 2*D_n — per-cell state
-     W_stats, decay_mean,                   # 2     — per-cell stats
-     readout_drift,                          # 1     — per-cell local surprise
-     s_mem_live, s_mem_ema_fast,             # 2     — global surprise, broadcast
+cat([h_norms, msg_norms,                  # 2*N    — per-neuron firing rates
+     decay_mean,                          # 1      — per-cell average leakiness
+     readout_drift,                       # 1      — per-cell volatility
+     s_mem_live, s_mem_ema_fast,          # 2      — global surprise (broadcast)
+     hebbian_flat,                        # N*N    — per-pair coactivation history
 ])
 ```
+
+**Biological grounding**: the modulator reads only **rates** (per-neuron
+firing magnitudes), **correlations** (Hebbian co-activation trace), and
+**neuromodulatory signals** (surprise, drift). It does NOT have feature-
+space "X-ray vision" into cell content — biological neuromodulators
+(dopamine, ACh, norepinephrine) gate plasticity from rates and correlations,
+not by reading individual neuron contents. The modulator output is also
+restricted to plasticity controls (`delta_W`, `delta_decay`), never to
+neuron identity vectors — identity is set during bootstrap and frozen.
 
 **Hidden**: `[BS, NC, Hmod=2048]` (tanh activation, per-cell einsum)
 
@@ -231,6 +242,26 @@ cat([h_mean, msg_mean,                     # 2*D_n — per-cell state
 delta_W:      [BS, NC, N*N=1024]  → reshape to [BS, NC, 32, 32]  (direct)
 delta_decay:  [BS, NC, N=32]
 ```
+
+### Hebbian co-activation trace
+
+A runtime state tensor `hebbian: [BS, NC, N, N]` (same shape as W) updated
+after every memory step via:
+
+```python
+hebbian = (1 - γ) * hebbian + γ * (msg @ msg.T)
+```
+
+where `γ = sigmoid(hebbian_decay_logit[cell])` is a **learnable per-cell**
+running-average rate (no magic number — each cell can learn its own
+coactivation timescale). The update is on the autograd graph so the
+modulator's downstream use of `hebbian` provides gradient back to
+`hebbian_decay_logit`.
+
+This is the biological "fire-together, wire-together" signal made
+explicit. The modulator can learn to strengthen `W[i,j]` when
+`hebbian[i,j]` is high, weaken when low — implementing classical Hebbian
+plasticity gated by the global surprise signal.
 
 ### Cell Layout
 
@@ -276,10 +307,12 @@ reshaped to `[BS, D]`.
 ```
 h                  : [BS, NC, Cn, D_n]     — neuron hidden states
 msg                : [BS, NC, Cn, D_n]     — neuron messages
-W                  : [BS, NC, Cn, Cn]      — connectivity matrix
+W                  : [BS, NC, Cn, Cn]      — connectivity matrix (RMSNormed at use)
 decay_logit        : [BS, NC, Cn]          — per-neuron temporal decay
+hebbian            : [BS, NC, Cn, Cn]      — co-activation EMA trace
 s_mem_live         : [BS]                   — current memory-head surprise
 s_mem_ema_fast     : [BS]                   — fast EMA
+readout_drift      : [BS, NC, 1]            — per-cell volatility
 prev_readout       : [BS, D]                — last readout (for memory head)
 prev_readout_cell  : [BS, NC, D_n]          — last per-cell readout (for drift)
 ```
@@ -291,18 +324,19 @@ Detached at TBPTT boundaries.
 
 | Component | Shape | Params | Notes |
 |-----------|-------|--------|-------|
-| neuron_id | [NC=8, Cn=32, D_n=256] | 65K | Per-neuron identity |
+| neuron_id | [NC=8, Cn=32, D_n=256] | 65K | Per-neuron identity (frozen at inference) |
 | state_w1/b1/w2/b2 | — | 198K | Shared state MLP |
 | msg_w1/b1/w2/b2 | — | 131K | Shared message MLP |
 | inject_w | [NC=8, alpha*D_n, D_n] | 2.1M | Per-cell, kaiming init |
 | inject_b | [NC=8, alpha*D_n] | 8K | |
-| mod_w1 | [NC=8, 517, 2048] | 8.5M | Per-cell modulator layer 1 |
+| mod_w1 | [NC=8, 1092, 2048] | 17.9M | Per-cell modulator layer 1 |
 | mod_b1 | [NC=8, 2048] | 16K | |
 | mod_w2 | [NC=8, 2048, 1056] | 17.3M | Per-cell modulator layer 2 |
 | mod_b2 | [NC=8, 1056] | 8K | |
-| **Memory total** | | **~36.8M** | |
+| hebbian_decay_logit | [NC=8] | 8 | Learnable per-cell Hebbian timescale |
+| **Memory total** | | **~37.7M** | |
 | **LM total** | | **~67.3M** | |
-| **Grand total** | | **~104.1M** | |
+| **Grand total** | | **~105.0M** | |
 
 Memory-prediction head adds **zero** parameters (tied to lm_head via
 the embedding).

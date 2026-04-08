@@ -221,6 +221,28 @@ def main():
             "config": config,
         }, path)
         print(f"  Saved checkpoint: {path}")
+        # Also regenerate plots from the current jsonl so the user has an
+        # always-fresh visual after each save. Done in a try/except so a
+        # plotting bug never crashes training.
+        try:
+            from scripts.plot_training import (
+                load_metrics, plot_phase1_training, plot_phase1_gradients,
+                plot_phase1_memory,
+            )
+            metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
+            if os.path.exists(metrics_path):
+                records = load_metrics(metrics_path)
+                if records:
+                    plots_dir = os.path.join(args.save_dir, "plots")
+                    os.makedirs(plots_dir, exist_ok=True)
+                    plot_phase1_training(records,
+                        os.path.join(plots_dir, "phase1_training.png"))
+                    plot_phase1_gradients(records,
+                        os.path.join(plots_dir, "phase1_gradients.png"))
+                    plot_phase1_memory(records,
+                        os.path.join(plots_dir, "phase1_memory.png"))
+        except Exception as e:
+            print(f"  (plot regen failed: {e})")
 
     def step_callback(metrics):
         step = trainer.global_step

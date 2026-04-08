@@ -115,7 +115,7 @@ class TestModulator:
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
         new_W, new_dec = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit,
+            mg.h, mg.msg, mg.W, mg.decay_logit, mg.hebbian,
             *surp,
             *mod_args)
         dw = (new_W - W_before).float().abs().max().item()
@@ -128,7 +128,7 @@ class TestModulator:
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
         new_W, _ = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit,
+            mg.h, mg.msg, mg.W, mg.decay_logit, mg.hebbian,
             *surp, *mod_args)
         assert new_W.shape == mg.W.shape
 

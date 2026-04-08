@@ -91,13 +91,19 @@ class Config:
 
     @property
     def mod_in(self) -> int:
-        """Per-cell modulator input:
-        h_mean + msg_mean         : 2*D_n      (per-cell state)
-        W_stats + decay_mean      : 2          (per-cell stats)
-        readout_drift             : 1          (per-cell local surprise)
-        s_mem_live + s_mem_ema    : 2          (global, broadcast to cells)
+        """Per-cell modulator input.
+
+        Biologically principled: rates + correlations + global modulators only.
+        No feature-space "content" peek (h_mean / msg_mean were dropped).
+
+        h_norms + msg_norms       : 2*N        (per-neuron firing rates)
+        decay_mean                : 1          (per-cell average leakiness)
+        readout_drift             : 1          (per-cell volatility)
+        s_mem_live + s_mem_ema    : 2          (global surprise, broadcast)
+        hebbian_flat              : N*N        (per-pair coactivation history)
         """
-        return 2 * self.D_n + 2 + 1 + 2
+        N = self.neurons_per_cell
+        return 2 * N + 1 + 1 + 2 + N * N
 
     @property
     def mod_out(self) -> int:
