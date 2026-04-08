@@ -120,29 +120,56 @@ def setup(ax, title, ylabel=None):
 # ============================================================================
 
 
+def split_train_eval(records):
+    """Split records by `event` field.
+
+    Train rows have no `event` key; eval rows have `event == 'eval'`.
+    """
+    train_rows = [r for r in records if r.get("event") != "eval"]
+    eval_rows = [r for r in records if r.get("event") == "eval"]
+    return train_rows, eval_rows
+
+
 def plot_phase1_training(records, output_path):
+    train_rows, eval_rows = split_train_eval(records)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        fig.suptitle(f"Phase 1 Training ({len(records)} steps)",
-                     fontsize=14, fontweight="bold")
+        fig.suptitle(
+            f"Phase 1 Training ({len(train_rows)} train / {len(eval_rows)} eval)",
+            fontsize=14, fontweight="bold")
 
-        plot_line(axes[0, 0], get(records, "loss"), C["loss"], "ce_loss")
-        plot_line(axes[0, 0], get(records, "aux_loss"), C["aux"], "mem_pred_loss")
+        plot_line(axes[0, 0], get(train_rows, "loss"), C["loss"], "train ce")
+        plot_line(axes[0, 0], get(train_rows, "aux_loss"), C["aux"],
+                  "train mem_pred")
+        if eval_rows:
+            eval_steps = [r["step"] for r in eval_rows]
+            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
+            eval_aux = [r["eval_aux_loss"] for r in eval_rows]
+            train_steps = [r.get("step", i) for i, r in enumerate(train_rows)]
+            if train_steps:
+                idx_by_step = {s: i for i, s in enumerate(train_steps)}
+                eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
+                axes[0, 0].plot(eval_x, eval_ce, color=C["loss"],
+                                linestyle="none", marker="o", markersize=6,
+                                label="eval ce", alpha=0.9)
+                axes[0, 0].plot(eval_x, eval_aux, color=C["aux"],
+                                linestyle="none", marker="s", markersize=6,
+                                label="eval mem_pred", alpha=0.9)
         axes[0, 0].legend()
-        setup(axes[0, 0], "Losses", "nats")
+        setup(axes[0, 0], "Losses (train vs eval)", "nats")
 
-        ppl = get(records, "ppl")
+        ppl = get(train_rows, "ppl")
         if ppl:
-            plot_line(axes[0, 1], ppl, C["ppl"])
+            plot_line(axes[0, 1], ppl, C["ppl"], "train ppl")
             axes[0, 1].set_yscale("log")
             setup(axes[0, 1], "Perplexity", "PPL (log)")
 
-        lr = get(records, "lr")
+        lr = get(train_rows, "lr")
         if lr:
             axes[1, 0].plot(lr, color=C["lr"], linewidth=2.0)
             setup(axes[1, 0], "Learning Rate", "LR")
 
-        tok_s = get(records, "tok_s")
+        tok_s = get(train_rows, "tok_s")
         if tok_s:
             plot_line(axes[1, 1], [t / 1000 for t in tok_s], C["tput"])
             setup(axes[1, 1], "Throughput", "K tok/s")
@@ -154,6 +181,7 @@ def plot_phase1_training(records, output_path):
 
 
 def plot_phase1_gradients(records, output_path):
+    records, _ = split_train_eval(records)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
         fig.suptitle("Phase 1 Gradient Health", fontsize=14, fontweight="bold")
@@ -210,6 +238,7 @@ def plot_phase1_gradients(records, output_path):
 
 
 def plot_phase1_memory(records, output_path):
+    records, _ = split_train_eval(records)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(3, 2, figsize=(16, 14))
         fig.suptitle("Phase 1 Memory Health", fontsize=14, fontweight="bold")
@@ -256,14 +285,34 @@ def plot_phase1_memory(records, output_path):
 
 
 def plot_phase2_grpo(records, output_path):
+    train_rows, eval_rows = split_train_eval(records)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle(f"Phase 2 GRPO ({len(records)} steps)",
+        fig.suptitle(f"Phase 2 GRPO ({len(train_rows)} train / "
+                     f"{len(eval_rows)} eval)",
                      fontsize=14, fontweight="bold")
 
-        # Policy loss
-        plot_line(axes[0, 0], get(records, "loss"), C["loss"])
-        setup(axes[0, 0], "GRPO Loss", "-(A * log π)")
+        # Policy loss (train only)
+        plot_line(axes[0, 0], get(train_rows, "loss"), C["loss"], "grpo loss")
+        # Overlay eval ce_loss (different scale, on secondary axis could be nice
+        # but simpler: plot on same axis for now)
+        if eval_rows:
+            eval_steps = [r["step"] for r in eval_rows]
+            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
+            eval_aux = [r["eval_aux_loss"] for r in eval_rows]
+            train_steps = [r.get("step", i) for i, r in enumerate(train_rows)]
+            idx_by_step = {s: i for i, s in enumerate(train_steps)}
+            eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
+            ax2 = axes[0, 0].twinx()
+            ax2.plot(eval_x, eval_ce, color=C["aux"], marker="o", markersize=5,
+                     linestyle="--", label="eval ce")
+            ax2.plot(eval_x, eval_aux, color=C["loss"], marker="s", markersize=5,
+                     linestyle=":", label="eval mem_pred")
+            ax2.legend(loc="upper right", fontsize=7)
+            ax2.set_ylabel("eval (nats)")
+        axes[0, 0].legend(loc="upper left", fontsize=7)
+        setup(axes[0, 0], "GRPO Loss + Eval", "-(A * log π)")
+        records = train_rows  # rest of plot uses only train rows
 
         # Reward distribution
         plot_line(axes[0, 1], get(records, "reward_mean"), C["reward"], "mean")

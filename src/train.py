@@ -31,6 +31,8 @@ SEED = 42
 TOKENIZER = "tinyllama"
 LOG_INTERVAL = 50
 SAVE_INTERVAL = 5000
+EVAL_INTERVAL = 500
+EVAL_BATCHES = 8
 SAVE_DIR = "outputs/v12"
 
 
@@ -44,6 +46,9 @@ def parse_args():
     p.add_argument("--save-dir", type=str, default=SAVE_DIR)
     p.add_argument("--save-interval", type=int, default=SAVE_INTERVAL)
     p.add_argument("--log-interval", type=int, default=LOG_INTERVAL)
+    p.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL,
+                   help="Run eval every N steps (0 = disable)")
+    p.add_argument("--eval-batches", type=int, default=EVAL_BATCHES)
     p.add_argument("--tokenizer", type=str, default=TOKENIZER)
     p.add_argument("--no-memory", action="store_true",
                    help="Disable memory graph (LM-only baseline)")
@@ -170,6 +175,18 @@ def main():
     if pending_dataloader_state is not None and hasattr(dataloader, "load_state_dict"):
         dataloader.load_state_dict(pending_dataloader_state)
 
+    # Separate eval dataloader with a different seed so eval data doesn't
+    # overlap (much) with training data. Reconstructed per eval call inside
+    # step_callback so we always start from a fresh iterator.
+    eval_loader_factory = None
+    if args.eval_interval > 0:
+        def _make_eval_loader():
+            return create_dataloader(
+                phase="A", tokenizer=tokenizer, batch_size=bs,
+                seq_length=T, seed=args.seed + 1000,
+                max_steps=args.eval_batches)
+        eval_loader_factory = _make_eval_loader
+
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     trainer = Trainer(
         model=model, optimizer=optimizer, scheduler=scheduler,
@@ -216,6 +233,26 @@ def main():
                   f"mod_gn={metrics['mod_grad_norm']:.3f} "
                   f"a_norm={metrics['mod_action_norm']:.4f} "
                   f"a_var={metrics['mod_action_var']:.4f}")
+        if (
+            eval_loader_factory is not None
+            and args.eval_interval > 0
+            and step > 0
+            and step % args.eval_interval == 0
+        ):
+            eval_metrics = trainer.evaluate(
+                eval_loader_factory(), n_batches=args.eval_batches)
+            print(f"[eval {step}] "
+                  f"ce={eval_metrics['eval_ce_loss']:.3f} "
+                  f"ppl={eval_metrics['eval_ppl']:.1f} "
+                  f"mem_pred={eval_metrics['eval_aux_loss']:.3f} "
+                  f"({eval_metrics['eval_batches']} batches)")
+            # Append to metrics jsonl as a dedicated eval row so plotting can
+            # distinguish train vs eval curves.
+            trainer._append_metrics({
+                "step": step,
+                "event": "eval",
+                **eval_metrics,
+            })
         if step % args.save_interval == 0 and step > 0:
             save_checkpoint(step)
 

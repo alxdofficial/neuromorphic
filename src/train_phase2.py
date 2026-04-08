@@ -38,6 +38,9 @@ def parse_args():
     p.add_argument("--stage1-tokens", type=int, default=25_000_000)
     p.add_argument("--stage2-tokens", type=int, default=15_000_000)
     p.add_argument("--stage3-tokens", type=int, default=10_000_000)
+    p.add_argument("--eval-interval", type=int, default=50,
+                   help="Eval every N GRPO steps (0 = disable)")
+    p.add_argument("--eval-batches", type=int, default=4)
     return p.parse_args()
 
 
@@ -103,6 +106,16 @@ def main():
         phase="A", tokenizer=tokenizer, batch_size=args.bs,
         seq_length=max_window, seed=args.seed, max_steps=10**9)
 
+    # Eval dataloader factory (different seed, shorter)
+    eval_loader_factory = None
+    if args.eval_interval > 0:
+        def _make_eval_loader():
+            return create_dataloader(
+                phase="A", tokenizer=tokenizer, batch_size=args.bs,
+                seq_length=max_window, seed=args.seed + 1000,
+                max_steps=args.eval_batches)
+        eval_loader_factory = _make_eval_loader
+
     # Metrics alongside the output checkpoint
     out_dir = os.path.dirname(args.out) or "."
     metrics_path = os.path.join(out_dir, "phase2_metrics.jsonl")
@@ -112,6 +125,9 @@ def main():
         config=config, device=device,
         group_size=args.group_size, lr=args.lr, tau=args.tau,
         metrics_path=metrics_path,
+        eval_interval=args.eval_interval,
+        eval_batches=args.eval_batches,
+        eval_loader_factory=eval_loader_factory,
     )
 
     trainer.run_curriculum(stages)

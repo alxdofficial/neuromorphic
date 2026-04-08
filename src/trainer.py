@@ -175,6 +175,84 @@ class Trainer:
         pbar.close()
         return all_metrics
 
+    @torch.no_grad()
+    def evaluate(self, eval_loader, n_batches: int = 8) -> dict:
+        """Run a held-out forward-only evaluation pass.
+
+        Uses a fresh memory state (snapshots and restores the current training
+        state around the call) so eval results are independent of the current
+        training memory carry. Model is placed in eval mode so dropout is off.
+        """
+        model = self.model
+        memory = model.memory
+
+        # Snapshot training state so we can restore after eval
+        train_mem_state = (
+            memory.runtime_state_dict() if memory._initialized else None
+        )
+        train_lm_carries = [
+            h.clone() if h is not None else None for h in model.lm._carries
+        ]
+        train_initialized = model._initialized
+        was_training = model.training
+
+        # Reset to fresh memory/LM state for a clean eval run
+        memory._initialized = False
+        model._initialized = False
+        model.lm._carries = [None] * self.config.L_total
+        model.train(False)
+
+        total_ce = 0.0
+        total_aux = 0.0
+        count = 0
+        prev_token = None
+        amp_ctx = torch.autocast(
+            device_type=self.device.type, dtype=self.amp_dtype,
+            enabled=self.use_amp)
+        try:
+            for i, batch in enumerate(eval_loader):
+                if i >= n_batches:
+                    break
+                input_ids = batch.input_ids.to(self.device, non_blocking=True)
+                target_ids = batch.target_ids.to(self.device, non_blocking=True)
+                batch_prev = getattr(batch, "prev_token", None)
+                if batch_prev is not None:
+                    batch_prev = batch_prev.to(self.device, non_blocking=True)
+                with amp_ctx:
+                    result = model.forward_chunk(
+                        input_ids, target_ids=target_ids,
+                        use_memory=self.use_memory,
+                        prev_token=batch_prev if batch_prev is not None else prev_token,
+                    )
+                total_ce += result["ce_loss"].item()
+                total_aux += result["aux_loss"].item()
+                count += 1
+                # Track last-in-batch token for cross-chunk EOT reset
+                prev_token = input_ids[:, -1]
+        finally:
+            # Restore training state regardless of whether eval succeeded
+            if train_mem_state is not None:
+                memory.load_runtime_state(train_mem_state)
+            else:
+                memory._initialized = False
+            model.lm._carries = train_lm_carries
+            model._initialized = train_initialized
+            if was_training:
+                model.train(True)
+
+        if count == 0:
+            return {"eval_ce_loss": 0.0, "eval_aux_loss": 0.0,
+                    "eval_ppl": 0.0, "eval_batches": 0}
+
+        avg_ce = total_ce / count
+        avg_aux = total_aux / count
+        return {
+            "eval_ce_loss": avg_ce,
+            "eval_aux_loss": avg_aux,
+            "eval_ppl": min(math.exp(avg_ce), 1e6),
+            "eval_batches": count,
+        }
+
     def flush_action_database(self, path: str) -> int:
         """Save collected modulator actions to disk.
 

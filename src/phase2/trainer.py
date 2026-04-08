@@ -59,6 +59,8 @@ class Phase2Trainer:
         max_grad_norm: float = 1.0,
         log_interval: int = 10,
         eval_interval: int = 100,
+        eval_loader_factory=None,
+        eval_batches: int = 4,
         metrics_path: str | None = None,
     ):
         self.model = model
@@ -71,6 +73,8 @@ class Phase2Trainer:
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         self.eval_interval = eval_interval
+        self.eval_loader_factory = eval_loader_factory
+        self.eval_batches = eval_batches
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -102,6 +106,81 @@ class Phase2Trainer:
             return
         with open(self.metrics_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
+
+    @torch.no_grad()
+    def evaluate(self, eval_loader, n_batches: int = 4) -> dict:
+        """Held-out eval pass using the CONTINUOUS modulator path.
+
+        Phase 2 trains the modulator via GRPO over discretized VQ actions, but
+        the gradient updates the underlying continuous head. Evaluating with
+        the continuous path (via Model.forward_chunk, which does not use VQ)
+        gives us a stable measurement of the "mean" policy that GRPO is pushing
+        toward. Sampling from the VQ codebook during eval would add noise to
+        the signal we're trying to read.
+
+        Uses a fresh memory state (snapshot + restore around the call) so eval
+        is independent of the current phase-2 rollout memory carry.
+        """
+        model = self.model
+        memory = model.memory
+
+        train_mem_state = (
+            memory.runtime_state_dict() if memory._initialized else None
+        )
+        train_lm_carries = [
+            h.clone() if h is not None else None for h in model.lm._carries
+        ]
+        train_initialized = model._initialized
+        was_training = model.training
+
+        memory._initialized = False
+        model._initialized = False
+        model.lm._carries = [None] * self.config.L_total
+        model.train(False)
+
+        total_ce = 0.0
+        total_aux = 0.0
+        count = 0
+        prev_token = None
+        try:
+            for i, batch in enumerate(eval_loader):
+                if i >= n_batches:
+                    break
+                input_ids = batch.input_ids.to(self.device, non_blocking=True)
+                target_ids = batch.target_ids.to(self.device, non_blocking=True)
+                batch_prev = getattr(batch, "prev_token", None)
+                if batch_prev is not None:
+                    batch_prev = batch_prev.to(self.device, non_blocking=True)
+                result = model.forward_chunk(
+                    input_ids, target_ids=target_ids,
+                    use_memory=True,
+                    prev_token=batch_prev if batch_prev is not None else prev_token,
+                )
+                total_ce += result["ce_loss"].item()
+                total_aux += result["aux_loss"].item()
+                count += 1
+                prev_token = input_ids[:, -1]
+        finally:
+            if train_mem_state is not None:
+                memory.load_runtime_state(train_mem_state)
+            else:
+                memory._initialized = False
+            model.lm._carries = train_lm_carries
+            model._initialized = train_initialized
+            if was_training:
+                model.train(True)
+
+        if count == 0:
+            return {"eval_ce_loss": 0.0, "eval_aux_loss": 0.0,
+                    "eval_ppl": 0.0, "eval_batches": 0}
+        avg_ce = total_ce / count
+        avg_aux = total_aux / count
+        return {
+            "eval_ce_loss": avg_ce,
+            "eval_aux_loss": avg_aux,
+            "eval_ppl": min(math.exp(avg_ce), 1e6),
+            "eval_batches": count,
+        }
 
     # ------------------------------------------------------------------
     # Rollout + reward
@@ -475,6 +554,26 @@ class Phase2Trainer:
                       f"records={step_metrics['M']} "
                       f"roll={t_rollout:.1f}s grad={t_grad:.1f}s "
                       f"tokens={tokens_seen:,}/{stage.token_budget:,}")
+
+            if (
+                self.eval_loader_factory is not None
+                and self.eval_interval > 0
+                and self.global_step > 0
+                and self.global_step % self.eval_interval == 0
+            ):
+                eval_metrics = self.evaluate(
+                    self.eval_loader_factory(), n_batches=self.eval_batches)
+                print(f"[p2 eval {self.global_step}] "
+                      f"ce={eval_metrics['eval_ce_loss']:.3f} "
+                      f"ppl={eval_metrics['eval_ppl']:.1f} "
+                      f"mem_pred={eval_metrics['eval_aux_loss']:.3f} "
+                      f"({eval_metrics['eval_batches']} batches)")
+                self._append_metrics({
+                    "step": self.global_step,
+                    "stage_window": stage.reward_window,
+                    "event": "eval",
+                    **eval_metrics,
+                })
 
         elapsed = time.time() - t_stage_start
         print(f"  stage complete: {tokens_seen:,} tokens in {elapsed:.0f}s")
