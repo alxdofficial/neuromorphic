@@ -35,9 +35,14 @@ def parse_args():
     p.add_argument("--tau", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tokenizer", type=str, default="tinyllama")
-    p.add_argument("--stage1-tokens", type=int, default=25_000_000)
-    p.add_argument("--stage2-tokens", type=int, default=15_000_000)
-    p.add_argument("--stage3-tokens", type=int, default=10_000_000)
+    p.add_argument("--stage1-tokens", type=int, default=10_000_000,
+                   help="Tokens at reward window 512")
+    p.add_argument("--stage2-tokens", type=int, default=10_000_000,
+                   help="Tokens at reward window 1024")
+    p.add_argument("--stage3-tokens", type=int, default=10_000_000,
+                   help="Tokens at reward window 2048")
+    p.add_argument("--stage4-tokens", type=int, default=10_000_000,
+                   help="Tokens at reward window 4096")
     p.add_argument("--eval-interval", type=int, default=50,
                    help="Eval every N GRPO steps (0 = disable)")
     p.add_argument("--eval-batches", type=int, default=4)
@@ -95,9 +100,10 @@ def main():
 
     # Stages first so we know the max reward window → segment length.
     stages = [
-        CurriculumStage(reward_window=512, token_budget=args.stage1_tokens),
-        CurriculumStage(reward_window=2048, token_budget=args.stage2_tokens),
-        CurriculumStage(reward_window=4096, token_budget=args.stage3_tokens),
+        CurriculumStage(reward_window=512,  token_budget=args.stage1_tokens),
+        CurriculumStage(reward_window=1024, token_budget=args.stage2_tokens),
+        CurriculumStage(reward_window=2048, token_budget=args.stage3_tokens),
+        CurriculumStage(reward_window=4096, token_budget=args.stage4_tokens),
     ]
     max_window = max(s.reward_window for s in stages)
     print(f"Phase 2 segment length T = {max_window} (max curriculum window)")

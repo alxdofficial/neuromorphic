@@ -32,8 +32,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--work-dir", required=True,
                    help="Directory for all checkpoints and intermediate files")
-    p.add_argument("--bootstrap-tokens", type=int, default=200_000_000)
-    p.add_argument("--phase1-tokens-per-cycle", type=int, default=50_000_000)
+    p.add_argument("--bootstrap-tokens", type=int, default=500_000_000)
+    p.add_argument("--phase1-tokens-per-cycle", type=int, default=10_000_000,
+                   help="Total phase-1 tokens per cycle (incl. action collection)")
     p.add_argument("--action-collection-tokens", type=int, default=2_000_000)
     p.add_argument("--cycles", type=int, default=5)
     p.add_argument("--bs", type=int, default=96)

@@ -275,13 +275,16 @@ of (W, token_budget) stages. Each stage trains for its budget then advances:
 
 | Stage | W (tokens) | Token budget per cycle | Notes |
 |---|---|---|---|
-| 1 | 512 | 25M | First real long-horizon test |
-| 2 | 2048 | 15M | Mid-range, where most useful retrieval lives |
-| 3 | 4096 | 10M | Stress test for the longest credit horizon |
+| 1 | 512  | 10M | Easy credit horizon to bootstrap GRPO |
+| 2 | 1024 | 10M | Mid-short |
+| 3 | 2048 | 10M | Mid-long |
+| 4 | 4096 | 10M | Stress test for the longest credit horizon |
 
-Total phase 2 per cycle: **50M tokens**. Total cycle: **100M tokens** (50M phase
-1 + 50M phase 2). The curriculum is automatic, not operator-advanced — each
-stage runs to its budget then the next stage starts.
+Total phase 2 per cycle: **40M tokens**. Total cycle: **50M tokens** (10M phase
+1 + 40M phase 2 — assumes the bootstrap was generous enough that each cycle
+needs only minimal phase-1 dynamics re-adaptation). The curriculum is
+automatic, not operator-advanced — each stage runs to its budget then the
+next stage starts.
 
 The user can monitor and abort if a stage diverges (eval `mem_pred_loss` rises
 significantly above start-of-stage baseline), but the default is to let the
@@ -319,16 +322,18 @@ The full training pipeline is:
 ```
 state: model weights (LM + memory + modulator)
 
-# === BOOTSTRAP (one-time, ~200M tokens) ===
+# === BOOTSTRAP (one-time, ~500M tokens) ===
 # All params trainable, including modulator. No GRPO. No codebook.
-# Just normal phase 1 TBPTT until the modulator and dynamics are well-warmed.
-run_phase_1(model, tokens=200M, freeze_modulator=False)
+# Big one-time investment so the dynamics + modulator are well-warmed before
+# cycles start; this lets each cycle's phase-1 stay short.
+run_phase_1(model, tokens=500M, freeze_modulator=False)
 save_checkpoint("bootstrap.pt")
 
 # === ITERATIVE CYCLES ===
 for cycle in 0..N_CYCLES:
     # Phase 1 — train dynamics + LM via TBPTT, modulator FROZEN
-    run_phase_1(model, tokens=50M, freeze_modulator=True)
+    # Short because bootstrap already warmed things up.
+    run_phase_1(model, tokens=8M, freeze_modulator=True)
 
     # Action collection — capture modulator outputs at end of phase 1
     actions = collect_actions(model, tokens=2M)
@@ -337,17 +342,17 @@ for cycle in 0..N_CYCLES:
     codebook = train_codebook(actions, levels=4, codes_per_level=16)
 
     # Phase 2 — freeze everything but modulator, GRPO over codes
-    for (W, budget) in [(512, 25M), (2048, 15M), (4096, 10M)]:
+    for (W, budget) in [(512, 10M), (1024, 10M), (2048, 10M), (4096, 10M)]:
         run_phase_2(model, codebook, reward_window=W, tokens=budget)
 
     save_checkpoint(f"cycle_{cycle}.pt")
 ```
 
-A single cycle is ~100M tokens. At phase-1 throughput of ~50K tok/s and phase-2
+A single cycle is ~50M tokens. At phase-1 throughput of ~50K tok/s and phase-2
 throughput of ~10-20K tok/s effective (depending on K and W), one cycle takes
-roughly 2-4 hours of wall-clock on a 4090. 10 cycles = 1-2 days.
+roughly **45 min – 1.5 hr** of wall-clock on a 4090. 10 cycles = 8-15 hours.
 
-Bootstrap is a separate ~1 hour (~200M tokens at 50K tok/s).
+Bootstrap is a separate ~2.6 hours (~500M tokens at 52K tok/s).
 
 ### What persists across cycles, what doesn't
 
@@ -454,20 +459,20 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 | Frozen | everything except mod_w1/b1/w2/b2 | |
 | `lr` | 1e-4 | lower than phase 1 — fine-tune |
 | GRPO group size K | 8 | start small; scale up if variance too high |
-| Curriculum (W, budget) | (512, 25M), (2048, 15M), (4096, 10M) | automatic, not operator-advanced |
-| Segment length T | = W | rollouts in no_grad |
+| Curriculum (W, budget) | (512, 10M), (1024, 10M), (2048, 10M), (4096, 10M) | automatic |
+| Segment length T | = max curriculum W (4096) | rollouts in no_grad |
 | Logits temperature τ | 1.0 | tunable, may need lower if exploration too noisy |
 | Advantage normalization | yes | per-batch mean/std |
-| Eval cadence | every 100 GRPO updates | |
+| Eval cadence | every 50 GRPO updates | |
 
 ### Bootstrap + iterative loop
 | Knob | Value | Notes |
 |---|---|---|
-| Bootstrap tokens (one-time) | 200M | normal phase 1, modulator trains |
-| Phase 1 tokens / cycle | 50M | modulator FROZEN |
-| Phase 2 tokens / cycle | 50M | sum of curriculum stage budgets |
+| Bootstrap tokens (one-time) | 500M | normal phase 1, modulator trains |
+| Phase 1 tokens / cycle | 10M | modulator FROZEN; short because bootstrap was big |
+| Phase 2 tokens / cycle | 40M | sum of 4 curriculum stage budgets |
 | Action collection tokens | ~2M | last steps of phase 1 |
-| Total tokens / cycle | ~100M | excluding bootstrap |
+| Total tokens / cycle | ~50M | excluding bootstrap |
 | Modulator trains during | Bootstrap (TBPTT) + every phase 2 (GRPO) | never via TBPTT after bootstrap |
 | N cycles | open | run until plateau or budget exhausted |
 
