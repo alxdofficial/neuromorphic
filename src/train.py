@@ -131,7 +131,7 @@ def main():
     optimizer = torch.optim.AdamW([
         {"params": lm_decay, "weight_decay": WEIGHT_DECAY, "lr": args.lr},
         {"params": lm_no_decay, "weight_decay": 0.0, "lr": args.lr},
-        {"params": mem_decay, "weight_decay": WEIGHT_DECAY * 0.1, "lr": mem_lr},
+        {"params": mem_decay, "weight_decay": WEIGHT_DECAY, "lr": mem_lr},
         {"params": mem_no_decay, "weight_decay": 0.0, "lr": mem_lr},
     ], betas=(0.9, 0.95), fused=(device.type == "cuda"))
 

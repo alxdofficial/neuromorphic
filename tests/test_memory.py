@@ -95,9 +95,12 @@ class TestShapes:
 class TestModulator:
     def _mod_args(self, mg, BS):
         dt = torch.bfloat16
+        W_gamma = torch.sigmoid(mg.W_decay_logit).to(dt)
+        decay_gamma = torch.sigmoid(mg.decay_gamma_logit).to(dt)
         return (
             mg.mod_w1.to(dt), mg.mod_b1.to(dt),
             mg.mod_w2.to(dt), mg.mod_b2.to(dt),
+            W_gamma, decay_gamma,
         )
 
     def _surprise_inputs(self, mg, BS):
@@ -108,27 +111,37 @@ class TestModulator:
             torch.zeros(BS, dtype=dt),                   # s_mem_ema_fast
         )
 
-    def test_near_zero_deltas_at_init(self):
+    def test_W_stays_unit_rms_after_update(self):
+        """W is maintained at ~unit per-row RMS by the convex-EMA update
+        regardless of modulator output scale. Same for decay staying in [0,1]."""
         mg, config = _make_graph()
-        W_before = mg.W.clone()
-        decay_before = mg.decay_logit.clone()
+        # Sanity: W init is already unit per-row RMS
+        init_rms = mg.W.float().pow(2).mean(dim=-1).sqrt()
+        assert (init_rms > 0.9).all() and (init_rms < 1.1).all(), \
+            f"W init not unit RMS: min={init_rms.min()} max={init_rms.max()}"
+        # Run one modulator update
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
-        new_W, new_dec = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit, mg.hebbian,
+        new_W, new_decay = mg._modulate_cells(
+            mg.h, mg.msg, mg.W, mg.decay, mg.hebbian,
             *surp,
             *mod_args)
-        dw = (new_W - W_before).float().abs().max().item()
-        dd = (new_dec - decay_before).float().abs().max().item()
-        assert dw < 1.0, f"dW too large: {dw}"
-        assert dd < 1.0, f"ddecay too large: {dd}"
+        # W stays at ~unit per-row RMS
+        new_rms = new_W.float().pow(2).mean(dim=-1).sqrt()
+        assert (new_rms <= 1.01).all(), \
+            f"W exceeds unit per-row RMS: max={new_rms.max()}"
+        assert (new_rms > 0.3).all(), \
+            f"W per-row RMS collapsed: min={new_rms.min()}"
+        # decay stays in [0,1] by construction (convex comb of [0,1] values)
+        assert (new_decay >= 0).all() and (new_decay <= 1).all(), \
+            f"decay out of [0,1]: min={new_decay.min()} max={new_decay.max()}"
 
     def test_delta_W_shape(self):
         mg, config = _make_graph()
         surp = self._surprise_inputs(mg, 2)
         mod_args = self._mod_args(mg, 2)
         new_W, _ = mg._modulate_cells(
-            mg.h, mg.msg, mg.W, mg.decay_logit, mg.hebbian,
+            mg.h, mg.msg, mg.W, mg.decay, mg.hebbian,
             *surp, *mod_args)
         assert new_W.shape == mg.W.shape
 
@@ -174,19 +187,24 @@ class TestStateDecay:
 
 
 class TestWBoundedness:
-    def test_W_eff_has_unit_row_rms(self):
-        """RMSNorm on W rows should give effective W with unit RMS per row,
-        independent of the raw W magnitude."""
+    def test_W_stays_bounded_over_many_updates(self):
+        """Repeated modulator updates must not let W drift — the convex-EMA
+        update keeps per-row RMS bounded by 1 for all time, which is the
+        structural fix for the bf16-overflow bug that the accumulator had."""
         config = _tiny_config()
         mg = MemoryGraph(config)
         mg.initialize_states(2, torch.device("cpu"))
-        # Blow up raw W to a huge magnitude
-        mg.W = mg.W * 1000.0
-        W_eff = mg._rmsnorm(mg.W, dim=-1).float()
-        row_rms = W_eff.pow(2).mean(dim=-1).sqrt()
-        # Every row should be ~1.0 (bounded away from both zero and infinity)
-        assert (row_rms > 0.9).all() and (row_rms < 1.1).all(), \
-            f"W_eff rows not unit RMS: min={row_rms.min()} max={row_rms.max()}"
+        lm = _StubLM(config)
+        # Drive many segments through the memory to stress the update loop.
+        for _ in range(20):
+            H_mid = torch.randn(2, config.T, config.D, dtype=torch.bfloat16) * 3.0
+            input_ids = torch.randint(0, config.vocab_size, (2, config.T))
+            mg.forward_segment(H_mid, input_ids, lm)
+            row_rms = mg.W.float().pow(2).mean(dim=-1).sqrt()
+            assert (row_rms <= 1.05).all(), \
+                f"W per-row RMS exceeded 1: max={row_rms.max().item()}"
+            assert mg.W.float().abs().max().item() < 100.0, \
+                "W grew unreasonably large"
 
 
 class TestGradientFlow:

@@ -57,9 +57,13 @@ class TestPhase2Rollout:
         H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
 
-        # Deterministic (argmax) run twice → same codes
+        # Deterministic (argmax) run twice → same codes. Both runs must start
+        # from identical memory state, so we seed before each initialize_states
+        # (which samples random h and random sparse W permutations).
+        torch.manual_seed(0)
         mg.initialize_states(2, torch.device("cpu"))
         r1 = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, sample=False)
+        torch.manual_seed(0)
         mg.initialize_states(2, torch.device("cpu"))
         r2 = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, sample=False)
         assert (r1["codes"] == r2["codes"]).all(), "argmax should be deterministic"

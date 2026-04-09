@@ -68,7 +68,7 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
             W_norm = mg.W.float().norm().item()
             W_sparsity = (mg.W.float().abs() < 1e-4).float().mean().item()
             W_max = mg.W.float().abs().max().item()
-            decay_mean = torch.sigmoid(mg.decay_logit).float().mean().item()
+            decay_mean = mg.decay.float().mean().item()
             s_mem = mg.s_mem_live.float().mean().item()
             s_fast = mg.s_mem_ema_fast.float().mean().item()
         else:

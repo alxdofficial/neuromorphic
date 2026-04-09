@@ -276,7 +276,7 @@ class Phase2Trainer:
         mem = self.model.memory
         return {
             "h": mem.h.clone(), "msg": mem.msg.clone(), "W": mem.W.clone(),
-            "decay_logit": mem.decay_logit.clone(),
+            "decay": mem.decay.clone(),
             "s_mem_live": mem.s_mem_live.clone(),
             "s_mem_ema_fast": mem.s_mem_ema_fast.clone(),
             "prev_readout": mem.prev_readout.clone(),
@@ -290,7 +290,7 @@ class Phase2Trainer:
         mem.h = snapshot["h"].clone()
         mem.msg = snapshot["msg"].clone()
         mem.W = snapshot["W"].clone()
-        mem.decay_logit = snapshot["decay_logit"].clone()
+        mem.decay = snapshot["decay"].clone()
         mem.s_mem_live = snapshot["s_mem_live"].clone()
         mem.s_mem_ema_fast = snapshot["s_mem_ema_fast"].clone()
         mem.prev_readout = snapshot["prev_readout"].clone()

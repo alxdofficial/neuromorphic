@@ -264,7 +264,7 @@ def plot_phase1_memory(records, output_path):
         plot_line(axes[2, 0], get(records, "decay_mean"), C["decay"], "mean")
         plot_line(axes[2, 0], get(records, "decay_std"), C["decay"], "std", linestyle="--")
         axes[2, 0].legend()
-        setup(axes[2, 0], "Decay σ(decay_logit)", "probability")
+        setup(axes[2, 0], "Decay (persistence gate)", "probability")
 
         plot_line(axes[2, 1], get(records, "s_mem_live"), C["surprise"], "s_mem_live")
         plot_line(axes[2, 1], get(records, "s_mem_ema_fast"), C["surprise"],

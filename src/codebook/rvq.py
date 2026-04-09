@@ -54,7 +54,10 @@ class ResidualVQ(nn.Module):
         self.eps = eps
         self.dead_code_threshold = dead_code_threshold
 
-        codebooks = torch.randn(num_levels, codes_per_level, code_dim) * 0.1
+        # Init with unit-norm random vectors (per-code L2 norm ~1 in
+        # expectation). Principled dimension-scaled init: std = 1/sqrt(d).
+        codebooks = torch.randn(
+            num_levels, codes_per_level, code_dim) * (code_dim ** -0.5)
         self.register_buffer("codebooks", codebooks)
         self.register_buffer(
             "cluster_size", torch.zeros(num_levels, codes_per_level))

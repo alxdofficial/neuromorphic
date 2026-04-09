@@ -30,9 +30,11 @@ class MemoryGraph(nn.Module):
         self.output_lo = self.input_hi
         self.output_hi = self.output_lo + self.alpha
 
-        # Per-neuron identity
+        # Per-neuron identity. Initialized so each neuron's identity vector
+        # has unit expected L2 norm — a principled "fingerprint" scale that
+        # depends only on D_n, no magic constant.
         self.neuron_id = nn.Parameter(
-            torch.randn(self.N_cells, self.C_n, self.D_n) * 0.02)
+            torch.randn(self.N_cells, self.C_n, self.D_n) * (self.D_n ** -0.5))
 
         Hs = config.state_mlp_hidden
         Hm = config.msg_mlp_hidden
@@ -72,22 +74,67 @@ class MemoryGraph(nn.Module):
         # Each cell can learn its own timescale for "fire-together" memory.
         self.hebbian_decay_logit = nn.Parameter(torch.full((self.N_cells,), 2.0))
 
-        # Init weights
-        for weight in (
-            self.state_w1, self.state_w2, self.msg_w1, self.msg_w2,
-            self.mod_w1, self.mod_w2, self.inject_w,
-        ):
-            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        # Learnable per-cell plasticity rate for W. Same convex-EMA pattern as
+        # the Hebbian trace: `W = (1-γ_W) * W + γ_W * rms_norm(delta_W)`.
+        # Because delta_W is RMSNormed per row before the update, W stays at
+        # ~unit per-row RMS by construction — no unbounded accumulator, no
+        # bf16 overflow, no need to renormalize at use time.
+        #
+        # Init at sigmoid(-3) ≈ 0.047 → W integrates over ~20 modulator calls
+        # ≈ 80 tokens. W is a long-term state (the synaptic weight matrix),
+        # so we bias toward slow plasticity rather than 50-50 tracking. The
+        # cell can still learn a faster rate if the loss rewards it. This
+        # also matches the effective plasticity of the (retired) 0.01 init
+        # scale on mod_w2 without reintroducing that magic number.
+        self.W_decay_logit = nn.Parameter(torch.full((self.N_cells,), -3.0))
 
-        with torch.no_grad():
-            self.inject_b.zero_()
-            # Small-init output layers so MLPs start near zero output and
-            # the tanh activations run in their linear regime. Combined with
-            # RMSNorm on W at use time, these are the only places where
-            # magnitude management is needed.
-            self.state_w2.mul_(0.1)
-            self.msg_w2.mul_(0.1)
-            self.mod_w2.mul_(0.01)
+        # Learnable per-cell plasticity rate for the neuron decay (persistence)
+        # gate. Same convex-EMA pattern: `decay = (1-γ_d) * decay + γ_d *
+        # sigmoid(delta_decay_raw)`. The modulator proposes a target
+        # persistence in [0,1] via sigmoid, and the runtime decay state EMAs
+        # toward it, so decay is a convex combination of [0,1] values and
+        # stays in [0,1] by construction.
+        #
+        # Init at sigmoid(-3) ≈ 0.047 for the same reason as W: decay should
+        # reflect a cell's long-run persistence regime, not flip every few
+        # tokens. Learnable — the cell can pick up a faster rate if helpful.
+        self.decay_gamma_logit = nn.Parameter(torch.full((self.N_cells,), -3.0))
+
+        # Init weights — one uniform rule: Xavier/Glorot with the gain that
+        # matches the downstream activation. Tanh layers use 5/3 (Glorot 2010),
+        # linear-output layers use 1.0. PyTorch's `nn.init.xavier_uniform_`
+        # infers fan_in/fan_out correctly for 2D tensors; for 3D per-cell
+        # tensors we compute the bound manually using the true einsum fans.
+        TANH_GAIN = 5.0 / 3.0
+
+        # Shared 2D MLPs — every layer feeds a tanh downstream
+        nn.init.xavier_uniform_(self.state_w1, gain=TANH_GAIN)
+        nn.init.xavier_uniform_(self.state_w2, gain=TANH_GAIN)
+        nn.init.xavier_uniform_(self.msg_w1,   gain=TANH_GAIN)
+        nn.init.xavier_uniform_(self.msg_w2,   gain=TANH_GAIN)
+
+        # Per-cell 3D tensors — PyTorch's fan calculation is wrong for these
+        # (they're einsum-semantics, not conv-semantics). Compute directly.
+        def _xavier_einsum(w: Tensor, fan_in: int, fan_out: int, gain: float):
+            bound = gain * math.sqrt(6.0 / (fan_in + fan_out))
+            with torch.no_grad():
+                w.uniform_(-bound, bound)
+
+        # mod_w1: [NC, mod_in, Hmod], einsum("bni,nih->bnh"), tanh downstream
+        _xavier_einsum(self.mod_w1, fan_in=config.mod_in, fan_out=Hmod,
+                       gain=TANH_GAIN)
+        # mod_w2: [NC, Hmod, mod_out], einsum("bnh,nho->bno"), linear output
+        # (the W portion is RMSNormed, the decay portion is raw — both tolerate
+        # unit-scale init)
+        _xavier_einsum(self.mod_w2, fan_in=Hmod, fan_out=config.mod_out,
+                       gain=1.0)
+        # inject_w: [NC, alpha*D_n, D_n], einsum("bni,noi->bno"), linear
+        _xavier_einsum(self.inject_w, fan_in=self.D_n,
+                       fan_out=self.alpha * self.D_n, gain=1.0)
+
+        # Biases already zero by construction (torch.zeros above). No hand-
+        # scaling of output layers — the uniform Xavier rule is the only
+        # magnitude management the module needs.
 
         self._initialized = False
         self._compiled = False
@@ -110,21 +157,29 @@ class MemoryGraph(nn.Module):
 
         self.h = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.01
         self.msg = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)
-        self.decay_logit = torch.zeros(BS, NC, N, device=device, dtype=dt)
+        # Per-neuron decay gate, stored directly in [0,1]. Init at 0.5
+        # (midrange, unbiased). Updated via convex EMA toward a sigmoid'd
+        # modulator target — see `_modulate_cells`. Because the update is
+        # a convex combination of [0,1] values, decay stays in [0,1] by
+        # construction, with no logit/sigmoid gymnastics at use time.
+        self.decay = torch.full((BS, NC, N), 0.5, device=device, dtype=dt)
         # Hebbian co-activation trace: running EMA of `msg @ msg.T` per cell.
         # Same shape as W. Updated in no_grad inside _step. Provides the
         # modulator with biologically principled "fire-together" structure.
         self.hebbian = torch.zeros(BS, NC, N, N, device=device, dtype=dt)
 
-        # Initialize W as sparse: K random nonzero connections per neuron
+        # Initialize W as sparse: K random nonzero connections per neuron,
+        # then RMSNorm each row so W starts at the unit per-row RMS regime
+        # the modulator EMA update maintains at steady state. The nonzero
+        # value is arbitrary (1.0) since RMSNorm rescales it anyway.
         W = torch.zeros(BS, NC, N, N, device=device, dtype=dt)
         for cell in range(NC):
             for neuron in range(N):
                 neighbors = torch.randperm(N, device=device)[:K_init]
-                W[:, cell, neuron, neighbors] = 0.1
+                W[:, cell, neuron, neighbors] = 1.0
             # Zero out self-connections
             W[:, cell].diagonal(dim1=-2, dim2=-1).zero_()
-        self.W = W
+        self.W = F.rms_norm(W, normalized_shape=(N,))
 
         # Surprise state (scalar per batch — memory-head prediction signal).
         # s_mem(t) is the NEGATIVE target-logit under the memory head (lower =
@@ -150,7 +205,7 @@ class MemoryGraph(nn.Module):
         self.h = self.h.detach()
         self.msg = self.msg.detach()
         self.W = self.W.detach()
-        self.decay_logit = self.decay_logit.detach()
+        self.decay = self.decay.detach()
         self.prev_readout = self.prev_readout.detach()
         self.prev_readout_cell = self.prev_readout_cell.detach()
         self.readout_drift = self.readout_drift.detach()
@@ -169,7 +224,7 @@ class MemoryGraph(nn.Module):
             "h": self.h.clone(),
             "msg": self.msg.clone(),
             "W": self.W.clone(),
-            "decay_logit": self.decay_logit.clone(),
+            "decay": self.decay.clone(),
             "s_mem_live": self.s_mem_live.clone(),
             "s_mem_ema_fast": self.s_mem_ema_fast.clone(),
             "prev_readout": self.prev_readout.clone(),
@@ -186,9 +241,19 @@ class MemoryGraph(nn.Module):
         self.h = state["h"].to(device)
         self.msg = state["msg"].to(device)
         self.W = state["W"].to(device)
-        self.decay_logit = state["decay_logit"].to(device)
         BS = self.h.shape[0]
         dt = self.h.dtype
+        # Back-compat: older checkpoints stored `decay_logit` (unbounded logit
+        # space) instead of `decay` (value in [0,1]). If loading an old
+        # checkpoint, apply sigmoid; otherwise use the new field directly.
+        if "decay" in state:
+            self.decay = state["decay"].to(device)
+        elif "decay_logit" in state:
+            self.decay = torch.sigmoid(
+                state["decay_logit"].to(device).float()).to(dt)
+        else:
+            self.decay = torch.full(
+                (BS, self.N_cells, self.C_n), 0.5, device=device, dtype=dt)
         zero_b = torch.zeros(BS, device=device, dtype=dt)
         self.s_mem_live = state.get("s_mem_live", zero_b).to(device)
         self.s_mem_ema_fast = state.get("s_mem_ema_fast", zero_b).to(device)
@@ -223,7 +288,7 @@ class MemoryGraph(nn.Module):
 
         h_norms = self.h.float().norm(dim=-1).to(dt)                 # [BS, NC, N]
         msg_norms = self.msg.float().norm(dim=-1).to(dt)             # [BS, NC, N]
-        decay_mean = self.decay_logit.mean(dim=2, keepdim=True)      # [BS, NC, 1]
+        decay_mean = self.decay.mean(dim=2, keepdim=True)            # [BS, NC, 1] in [0,1]
         hebbian_flat = self.hebbian.reshape(BS, NC, N * N)           # [BS, NC, N*N]
 
         s1 = self.s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
@@ -316,7 +381,7 @@ class MemoryGraph(nn.Module):
         h = self.h.float()
         msg = self.msg.float()
         W = self.W.float()
-        dl = self.decay_logit.float()
+        decay = self.decay.float()
 
         out["h_norm"] = h.norm().item() / max(h.numel() ** 0.5, 1.0)
         out["msg_norm"] = msg.norm().item() / max(msg.numel() ** 0.5, 1.0)
@@ -325,8 +390,8 @@ class MemoryGraph(nn.Module):
         out["W_norm"] = W.norm().item() / max(W.numel() ** 0.5, 1.0)
         out["W_max"] = W.abs().max().item()
         out["W_sparsity"] = (W.abs() < 1e-4).float().mean().item()
-        out["decay_mean"] = torch.sigmoid(dl).mean().item()
-        out["decay_std"] = torch.sigmoid(dl).std().item()
+        out["decay_mean"] = decay.mean().item()
+        out["decay_std"] = decay.std().item()
         out["s_mem_live"] = self.s_mem_live.float().mean().item()
         out["s_mem_ema_fast"] = self.s_mem_ema_fast.float().mean().item()
         out["readout_drift_mean"] = self.readout_drift.float().mean().item()
@@ -385,15 +450,13 @@ class MemoryGraph(nn.Module):
         return normed.transpose(dim, -1).contiguous()
 
     def _receive(self, msg: Tensor, W: Tensor) -> Tensor:
-        """Dense matmul message passing with row-wise RMSNorm on W.
+        """Dense matmul message passing.
 
-        Raw W is an unbounded accumulator (delta_W is added each modulation),
-        but we normalize each row to unit RMS before the matmul. That keeps
-        ``received`` in a bounded range regardless of how long W has been
-        accumulating, so the gradient through the matmul doesn't blow up.
+        W is maintained at ~unit per-row RMS by the modulator's convex-EMA
+        update (`_modulate_cells`), so the matmul output is bounded without
+        any per-step renormalization here.
         """
-        W_eff = self._rmsnorm(W, dim=-1)   # normalize each row (last dim = n_in)
-        return torch.matmul(W_eff, msg)     # [BS, NC, N, D_n]
+        return torch.matmul(W, msg)         # [BS, NC, N, D_n]
 
     def _inject(self, received, H_aug_t, inject_w, inject_b):
         cell_slice = H_aug_t.reshape(H_aug_t.shape[0], self.N_cells, self.D_n)
@@ -431,28 +494,34 @@ class MemoryGraph(nn.Module):
         readout = out_ports.sum(dim=2) * (self.alpha ** -0.5)
         return readout.reshape(msg.shape[0], -1)
 
-    def _modulate_cells(self, h, msg, W, decay_logit, hebbian,
+    def _modulate_cells(self, h, msg, W, decay, hebbian,
                         readout_drift, s_mem_live, s_mem_ema_fast,
-                        mod_w1, mod_b1, mod_w2, mod_b2):
+                        mod_w1, mod_b1, mod_w2, mod_b2,
+                        W_gamma, decay_gamma):
         """Per-cell neuromodulator step.
 
         Biologically principled inputs only — rates, correlations, and
         global neuromodulators. No content peek into the cell.
           - h_norms, msg_norms        : per-neuron firing magnitudes (rates)
-          - decay_mean                : average per-cell leakiness
+          - decay_mean                : average per-cell leakiness in [0,1]
           - readout_drift             : per-cell volatility
           - s_mem_live, s_mem_ema_fast : global surprise (broadcast)
           - hebbian_flat              : per-pair coactivation history
                                         (Hebbian "fire-together-wire-together")
+
+        Both W and decay are updated via convex EMAs toward bounded targets:
+          W     ← (1-γ_W) * W     + γ_W * rms_norm(delta_W_raw)
+          decay ← (1-γ_d) * decay + γ_d * sigmoid(delta_decay_raw)
+        So neither accumulator drifts: W stays at ~unit per-row RMS and
+        decay stays in [0,1] by construction.
         """
         NC, N = self.N_cells, self.C_n
-        D_n = self.D_n
         BS = h.shape[0]
         dt = h.dtype
 
         h_norms = h.float().norm(dim=-1).to(dt)                              # [BS, NC, N]
         msg_norms = msg.float().norm(dim=-1).to(dt)                          # [BS, NC, N]
-        decay_mean = decay_logit.mean(dim=2, keepdim=True)                   # [BS, NC, 1]
+        decay_mean = decay.mean(dim=2, keepdim=True)                         # [BS, NC, 1]
         hebbian_flat = hebbian.reshape(BS, NC, N * N)                        # [BS, NC, N*N]
 
         # Broadcast global scalars to every cell.
@@ -470,14 +539,21 @@ class MemoryGraph(nn.Module):
             torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
         output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
 
-        # Unpack: direct delta_W, delta_decay
-        delta_W = output[..., :N * N].reshape(BS, NC, N, N)
-        delta_decay = output[..., N * N:N * N + N].reshape(BS, NC, N)
+        # Unpack modulator output
+        delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N)
+        delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N)
 
-        return (
-            W + delta_W,
-            decay_logit + delta_decay,
-        )
+        # W update: convex EMA toward unit-per-row-RMS delta
+        delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
+        g_W = W_gamma.view(1, -1, 1, 1).to(W.dtype)
+        W_new = (1.0 - g_W) * W + g_W * delta_W
+
+        # Decay update: convex EMA toward sigmoid'd target (in [0,1])
+        target_decay = torch.sigmoid(delta_decay_raw).to(decay.dtype)
+        g_d = decay_gamma.view(1, -1, 1).to(decay.dtype)
+        decay_new = (1.0 - g_d) * decay + g_d * target_decay
+
+        return W_new, decay_new
 
     def _step(self, h, msg, W, decay, one_minus_decay,
               H_aug_t, identity, inject_w, inject_b,
@@ -510,7 +586,7 @@ class MemoryGraph(nn.Module):
         g = gamma.view(1, -1, 1, 1).to(hebbian.dtype)
         return (1.0 - g) * hebbian + g * coactiv
 
-    def _run_block(self, h, msg, W, decay_logit, hebbian,
+    def _run_block(self, h, msg, W, decay, hebbian,
                    s_mem_live, s_mem_ema_fast,
                    prev_readout_cell, prev_readout_full, readout_drift,
                    block_H_mid, block_input_ids,
@@ -519,7 +595,7 @@ class MemoryGraph(nn.Module):
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    mod_w1, mod_b1, mod_w2, mod_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                   hebbian_gamma, gain_fast):
+                   hebbian_gamma, W_gamma, decay_gamma, gain_fast):
         """Run one block of memory steps with live in-block surprise signals.
 
         Live surprise: at each step t, use prev_readout_full (readout at t-1) to
@@ -533,10 +609,10 @@ class MemoryGraph(nn.Module):
         NC, D_n = self.N_cells, self.D_n
         readouts = torch.empty(BS, block_T, D, device=block_H_mid.device, dtype=h.dtype)
 
-        decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-        one_minus_decay = 1.0 - decay
-        # hebbian_gamma is passed in as a [NC] f32 tensor (sigmoid'd at the
-        # caller). Computed once per block, not per step.
+        # `decay` is stored directly in [0,1]. Broadcast to [BS,NC,N,1] for
+        # the per-neuron state-update gate.
+        gate = decay.unsqueeze(-1)
+        one_minus_gate = 1.0 - gate
 
         for offset in range(block_T):
             t = start_t + offset
@@ -548,11 +624,11 @@ class MemoryGraph(nn.Module):
                 h = h.detach()
                 msg = msg.detach()
                 W = W.detach()
-                decay_logit = decay_logit.detach()
+                decay = decay.detach()
                 hebbian = hebbian.detach()
                 prev_readout_full = prev_readout_full.detach()
-                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-                one_minus_decay = 1.0 - decay
+                gate = decay.unsqueeze(-1)
+                one_minus_gate = 1.0 - gate
 
             # --- Live memory-head surprise (no_grad — detached signal) ---
             with torch.no_grad():
@@ -567,16 +643,17 @@ class MemoryGraph(nn.Module):
 
             # --- Modulate every M tokens using the FRESH surprise ---
             if t % self.config.modulation_interval == 0:
-                W, decay_logit = self._modulate_cells(
-                    h, msg, W, decay_logit, hebbian,
+                W, decay = self._modulate_cells(
+                    h, msg, W, decay, hebbian,
                     readout_drift, s_mem_live, s_mem_ema_fast,
-                    mod_w1, mod_b1, mod_w2, mod_b2)
-                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-                one_minus_decay = 1.0 - decay
+                    mod_w1, mod_b1, mod_w2, mod_b2,
+                    W_gamma, decay_gamma)
+                gate = decay.unsqueeze(-1)
+                one_minus_gate = 1.0 - gate
 
             # --- Memory step ---
             h, msg, readout = self._step(
-                h, msg, W, decay, one_minus_decay,
+                h, msg, W, gate, one_minus_gate,
                 H_mid_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
@@ -599,11 +676,7 @@ class MemoryGraph(nn.Module):
             # Advance prev_readout_full for next-token memory-head prediction.
             prev_readout_full = readout.detach()
 
-            # No explicit W decay: we RMSNorm W's rows at every _receive
-            # call, so the raw W is free to drift and the effective (used) W
-            # is always bounded.
-
-        return (h, msg, W, decay_logit, hebbian,
+        return (h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
                 prev_readout_cell, prev_readout_full, readout_drift, readouts)
 
@@ -638,7 +711,7 @@ class MemoryGraph(nn.Module):
         h = self.h
         msg = self.msg
         W = self.W
-        decay_logit = self.decay_logit
+        decay = self.decay
         hebbian = self.hebbian
         s_mem_live = self.s_mem_live
         s_mem_ema_fast = self.s_mem_ema_fast
@@ -685,6 +758,8 @@ class MemoryGraph(nn.Module):
         # so backward through the on-graph Hebbian updates propagates gradient
         # back to hebbian_decay_logit.
         hebbian_gamma = torch.sigmoid(self.hebbian_decay_logit).to(dt)
+        W_gamma = torch.sigmoid(self.W_decay_logit).to(dt)
+        decay_gamma = torch.sigmoid(self.decay_gamma_logit).to(dt)
 
         use_ckpt = self.training and self.config.checkpoint_memory
         for start_t in range(0, T, block_size):
@@ -693,7 +768,7 @@ class MemoryGraph(nn.Module):
             block_input_ids = input_ids[:, start_t:end_t]
 
             block_args = (
-                h, msg, W, decay_logit, hebbian,
+                h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
                 prev_readout_cell, prev_readout_full, readout_drift,
                 block_H_mid, block_input_ids,
@@ -702,14 +777,14 @@ class MemoryGraph(nn.Module):
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 mod_w1, mod_b1, mod_w2, mod_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                hebbian_gamma, gain_fast)
+                hebbian_gamma, W_gamma, decay_gamma, gain_fast)
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
                     self._run_block, *block_args, use_reentrant=False)
             else:
                 result = self._run_block(*block_args)
 
-            (h, msg, W, decay_logit, hebbian,
+            (h, msg, W, decay, hebbian,
              s_mem_live, s_mem_ema_fast,
              prev_readout_cell, prev_readout_full, readout_drift, block_out) = result
 
@@ -719,7 +794,7 @@ class MemoryGraph(nn.Module):
         self.h = h
         self.msg = msg
         self.W = W
-        self.decay_logit = decay_logit
+        self.decay = decay
         self.hebbian = hebbian
         self.s_mem_live = s_mem_live.detach()
         self.s_mem_ema_fast = s_mem_ema_fast.detach()
@@ -833,7 +908,7 @@ class MemoryGraph(nn.Module):
         h = self.h.clone()
         msg = self.msg.clone()
         W = self.W.clone()
-        decay_logit = self.decay_logit.clone()
+        decay = self.decay.clone()
         hebbian = self.hebbian.clone()
         s_mem_live = self.s_mem_live.clone()
         s_mem_ema_fast = self.s_mem_ema_fast.clone()
@@ -841,9 +916,11 @@ class MemoryGraph(nn.Module):
         prev_readout_full = self.prev_readout.clone()
         readout_drift = self.readout_drift.clone()
         hebbian_gamma = torch.sigmoid(self.hebbian_decay_logit).to(dt)
+        W_gamma = torch.sigmoid(self.W_decay_logit).to(dt)
+        decay_gamma = torch.sigmoid(self.decay_gamma_logit).to(dt)
 
-        decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-        one_minus_decay = 1.0 - decay
+        gate = decay.unsqueeze(-1)
+        one_minus_gate = 1.0 - gate
 
         gain_fast = self.config.gain_ema_fast
         mod_interval = self.config.modulation_interval
@@ -876,7 +953,7 @@ class MemoryGraph(nn.Module):
                 #   s_live, s_fast, hebbian_flat
                 h_norms = h.float().norm(dim=-1)              # [BS, NC, N]
                 msg_norms = msg.float().norm(dim=-1)          # [BS, NC, N]
-                decay_mean = decay_logit.float().mean(dim=2, keepdim=True)
+                decay_mean = decay.float().mean(dim=2, keepdim=True)
                 hebbian_flat = hebbian.float().reshape(BS, NC, N * N)
                 s1 = s_mem_live.float().view(BS, 1, 1).expand(BS, NC, 1)
                 s2 = s_mem_ema_fast.float().view(BS, 1, 1).expand(BS, NC, 1)
@@ -903,13 +980,20 @@ class MemoryGraph(nn.Module):
                 quantized = vqvae.denormalize(quantized_norm)
                 quantized = quantized.reshape(BS, NC, -1).to(dt)
 
-                # Unpack delta_W, delta_decay and apply (cast to bf16 to match state)
-                delta_W = quantized[..., :N * N].reshape(BS, NC, N, N)
-                delta_decay = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
-                W = W + delta_W
-                decay_logit = decay_logit + delta_decay
-                decay = torch.sigmoid(decay_logit).unsqueeze(-1)
-                one_minus_decay = 1.0 - decay
+                # Unpack delta_W, delta_decay_raw and apply the same convex-EMA
+                # updates as phase 1 (so the frozen-module determinism matches).
+                delta_W_raw = quantized[..., :N * N].reshape(BS, NC, N, N)
+                delta_decay_raw = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
+
+                delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
+                g_w = W_gamma.view(1, -1, 1, 1).to(W.dtype)
+                W = (1.0 - g_w) * W + g_w * delta_W
+
+                target_decay = torch.sigmoid(delta_decay_raw).to(decay.dtype)
+                g_d = decay_gamma.view(1, -1, 1).to(decay.dtype)
+                decay = (1.0 - g_d) * decay + g_d * target_decay
+                gate = decay.unsqueeze(-1)
+                one_minus_gate = 1.0 - gate
 
                 # Record on GPU (moving to CPU per-call causes sync overhead).
                 # Caller is responsible for memory pressure; at phase-2 scale
@@ -921,7 +1005,7 @@ class MemoryGraph(nn.Module):
 
             # Memory step (same as phase 1)
             h, msg, readout = self._step(
-                h, msg, W, decay, one_minus_decay,
+                h, msg, W, gate, one_minus_gate,
                 H_mid_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
@@ -942,7 +1026,7 @@ class MemoryGraph(nn.Module):
         self.h = h
         self.msg = msg
         self.W = W
-        self.decay_logit = decay_logit
+        self.decay = decay
         self.hebbian = hebbian.detach()
         self.s_mem_live = s_mem_live
         self.s_mem_ema_fast = s_mem_ema_fast

@@ -205,12 +205,11 @@ class ScanLayer(nn.Module):
         a_raw, b_raw = ab.chunk(2, dim=-1)
 
         # Force decay gate to ~0 at document boundary positions so that
-        # h_t = b_t (no carry from the previous document).
+        # h_t = b_t (no carry from the previous document). Using a finite
+        # replacement value that's bf16-safe: sigmoid(-50) ≈ 2e-22 (flushes
+        # to 0 in bf16) and logsigmoid(-50) = -50 exactly — no inf, no nan.
         if reset_mask is not None:
-            # reset_mask: [BS, T] bool → [BS, T, 1] float mask
-            gate_kill = reset_mask.unsqueeze(-1).to(dtype=a_raw.dtype)
-            # Where gate_kill==1, push a_raw to -1e18 → sigmoid ≈ 0
-            a_raw = a_raw - gate_kill * 1e18
+            a_raw = a_raw.masked_fill(reset_mask.unsqueeze(-1), -50.0)
 
         h = fused_scan(a_raw, F.silu(b_raw), h_prev)  # [BS, N, d_inner]
         if self.glu_output:

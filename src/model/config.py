@@ -29,8 +29,13 @@ class Config:
 
     # === Tuning knobs (validated empirically — change with care) ===
     mem_pred_weight: float = 0.1   # weight of mem_pred_loss in total loss
-    mem_lr_scale: float = 0.3      # memory LR ratio vs LM LR
+    mem_lr_scale: float = 1.0      # memory LR ratio vs LM LR (was 0.3 in
+                                   # earlier versions to damp bf16-rounded
+                                   # memory grads; no longer needed after the
+                                   # W-bounding fix)
     gain_ema_fast: float = 0.3     # ~3-token horizon EMA on memory-head surprise
+                                   # (no_grad path, not learnable — would have
+                                   # no gradient signal)
 
     # === Training ===
     T: int = 128               # tokens per segment
