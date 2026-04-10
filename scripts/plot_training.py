@@ -287,15 +287,13 @@ def plot_phase1_memory(records, output_path):
 def plot_phase2_grpo(records, output_path):
     train_rows, eval_rows = split_train_eval(records)
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
         fig.suptitle(f"Phase 2 GRPO ({len(train_rows)} train / "
                      f"{len(eval_rows)} eval)",
                      fontsize=14, fontweight="bold")
 
-        # Policy loss (train only)
+        # (0,0) Policy loss + eval overlay
         plot_line(axes[0, 0], get(train_rows, "loss"), C["loss"], "grpo loss")
-        # Overlay eval ce_loss (different scale, on secondary axis could be nice
-        # but simpler: plot on same axis for now)
         if eval_rows:
             eval_steps = [r["step"] for r in eval_rows]
             eval_ce = [r["eval_ce_loss"] for r in eval_rows]
@@ -311,36 +309,61 @@ def plot_phase2_grpo(records, output_path):
             ax2.legend(loc="upper right", fontsize=7)
             ax2.set_ylabel("eval (nats)")
         axes[0, 0].legend(loc="upper left", fontsize=7)
-        setup(axes[0, 0], "GRPO Loss + Eval", "-(A * log π)")
-        records = train_rows  # rest of plot uses only train rows
+        setup(axes[0, 0], "GRPO Loss + Eval", "-(A * log \u03c0)")
+        tr = train_rows  # rest of plot uses only train rows
 
-        # Reward distribution
-        plot_line(axes[0, 1], get(records, "reward_mean"), C["reward"], "mean")
-        rmin = get(records, "reward_min")
-        rmax = get(records, "reward_max")
+        # (0,1) Reward distribution
+        plot_line(axes[0, 1], get(tr, "reward_mean"), C["reward"], "mean")
+        rmin = get(tr, "reward_min")
+        rmax = get(tr, "reward_max")
         if rmin and rmax:
             plot_line(axes[0, 1], rmin, C["reward"], "min", linestyle=":")
             plot_line(axes[0, 1], rmax, C["reward"], "max", linestyle="--")
         axes[0, 1].legend()
-        setup(axes[0, 1], "Reward (−windowed CE)", "reward")
+        setup(axes[0, 1], "Reward (-windowed CE)", "reward")
 
-        # Log pi
-        plot_line(axes[0, 2], get(records, "log_pi_mean"), C["log_pi"])
-        setup(axes[0, 2], "Mean log π", "log-prob")
+        # (0,2) Reward std — advantage signal health
+        rstd = get(tr, "reward_std")
+        if rstd:
+            plot_line(axes[0, 2], rstd, C["decay"], "reward std")
+            axes[0, 2].axhline(0, color="gray", lw=0.5, ls="--")
+        setup(axes[0, 2], "Reward Std (advantage signal)", "std across K")
 
-        # Modulator grad norm
-        plot_line(axes[1, 0], get(records, "mod_grad_norm"), C["mod_grad"])
-        setup(axes[1, 0], "Modulator Grad Norm", "L2")
+        # (1,0) Log pi
+        plot_line(axes[1, 0], get(tr, "log_pi_mean"), C["log_pi"])
+        setup(axes[1, 0], "Mean log \u03c0", "log-prob")
 
-        # Unique codes used per step
-        plot_line(axes[1, 1], get(records, "n_unique_codes"), C["codes"])
-        setup(axes[1, 1], "Unique Code Tuples / Step", "count")
+        # (1,1) Modulator grad norm
+        plot_line(axes[1, 1], get(tr, "mod_grad_norm"), C["mod_grad"])
+        setup(axes[1, 1], "Modulator Grad Norm", "L2")
 
-        # Stage window over time
-        windows = get(records, "stage_window")
+        # (1,2) Unique codes used per step
+        plot_line(axes[1, 2], get(tr, "n_unique_codes"), C["codes"])
+        setup(axes[1, 2], "Unique Code Tuples / Step", "count")
+
+        # (2,0) Timing: rollout vs grad
+        roll_t = get(tr, "rollout_time")
+        grad_t = get(tr, "grad_time")
+        if roll_t and grad_t:
+            plot_line(axes[2, 0], roll_t, C["reward"], "rollout")
+            plot_line(axes[2, 0], grad_t, C["mod_grad"], "grad")
+            axes[2, 0].legend()
+        setup(axes[2, 0], "Step Timing", "seconds")
+
+        # (2,1) Throughput (tok/s)
+        tokens = get(tr, "tokens_seen")
+        if tokens and roll_t and grad_t and len(tokens) > 1:
+            tok_per_step = [t2 - t1 for t1, t2 in zip(tokens[:-1], tokens[1:])]
+            total_t = [r + g for r, g in zip(roll_t[1:], grad_t[1:])]
+            tput = [tk / max(tt, 0.01) for tk, tt in zip(tok_per_step, total_t)]
+            plot_line(axes[2, 1], tput, C["tput"])
+        setup(axes[2, 1], "Throughput", "tok/s")
+
+        # (2,2) Stage window over time
+        windows = get(tr, "stage_window")
         if windows:
-            axes[1, 2].plot(windows, color=C["codes"], linewidth=2.0)
-            setup(axes[1, 2], "Curriculum Window W", "tokens")
+            axes[2, 2].plot(windows, color=C["codes"], linewidth=2.0)
+        setup(axes[2, 2], "Curriculum Window W", "tokens")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)

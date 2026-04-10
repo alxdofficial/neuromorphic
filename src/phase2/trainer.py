@@ -601,3 +601,15 @@ class Phase2Trainer:
 
         elapsed = time.time() - t_stage_start
         print(f"  stage complete: {tokens_seen:,} tokens in {elapsed:.0f}s")
+
+        # Auto-regenerate plots at end of each stage
+        if self.metrics_path is not None:
+            try:
+                from scripts.plot_training import load_metrics, plot_phase2_grpo
+                plots_dir = os.path.join(os.path.dirname(self.metrics_path), "plots")
+                os.makedirs(plots_dir, exist_ok=True)
+                records = load_metrics(self.metrics_path)
+                plot_phase2_grpo(records,
+                    os.path.join(plots_dir, "phase2_grpo.png"))
+            except Exception as e:
+                print(f"  (plot regen failed: {e})")
