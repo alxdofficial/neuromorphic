@@ -112,13 +112,14 @@ def main():
         phase="A", tokenizer=tokenizer, batch_size=args.bs,
         seq_length=max_window, seed=args.seed, max_steps=10**9)
 
-    # Eval dataloader factory (different seed, shorter)
+    # Eval dataloader factory (different seed, T=config.T so forward_chunk
+    # doesn't exceed pos_embed length)
     eval_loader_factory = None
     if args.eval_interval > 0:
         def _make_eval_loader():
             return create_dataloader(
                 phase="A", tokenizer=tokenizer, batch_size=args.bs,
-                seq_length=max_window, seed=args.seed + 1000,
+                seq_length=config.T, seed=args.seed + 1000,
                 max_steps=args.eval_batches)
         eval_loader_factory = _make_eval_loader
 
