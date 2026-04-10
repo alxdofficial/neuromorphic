@@ -458,7 +458,10 @@ class Phase2Trainer:
 
         # Chunk the gradient pass to bound VRAM
         M = mod_inputs_flat.shape[0]
-        chunk_size = 16384
+        # Scale chunk size with codes_per_level — more codes = bigger distance
+        # tensors in log_prob and entropy ([C*NC, codes, latent_dim])
+        codes_per_level = self.vqvae.rvq.codes_per_level
+        chunk_size = max(1024, 16384 // max(codes_per_level // 16, 1))
         total_loss = 0.0
         total_log_pi = 0.0
         n_chunks = 0
