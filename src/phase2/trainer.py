@@ -56,6 +56,7 @@ class Phase2Trainer:
         group_size: int = 8,
         lr: float = 1e-4,
         tau: float = 1.0,
+        entropy_coeff: float = 0.01,
         max_grad_norm: float = 1.0,
         log_interval: int = 10,
         eval_interval: int = 100,
@@ -70,6 +71,7 @@ class Phase2Trainer:
         self.device = device
         self.group_size = group_size
         self.tau = tau
+        self.entropy_coeff = entropy_coeff
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         self.eval_interval = eval_interval
@@ -483,8 +485,11 @@ class Phase2Trainer:
             log_pi = self.vqvae.rvq.log_prob(z, codes_flat_flat, tau=self.tau)  # [C*NC]
             log_pi = log_pi.reshape(C, NC)
 
-            # GRPO loss for this chunk (normalized by full M, so sum across chunks)
-            chunk_loss = -(a_chunk * log_pi).sum() / (M * NC)
+            # Entropy bonus: encourage policy diversity to prevent code collapse
+            entropy = self.vqvae.rvq.entropy(z, tau=self.tau).reshape(C, NC)
+
+            # GRPO loss - entropy bonus (normalized by full M)
+            chunk_loss = (-(a_chunk * log_pi) - self.entropy_coeff * entropy).sum() / (M * NC)
             chunk_loss.backward()
 
             total_loss += chunk_loss.item() * (M * NC)

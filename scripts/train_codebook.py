@@ -29,13 +29,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--latent-dim", type=int, default=32)
     p.add_argument("--hidden", type=int, default=512)
-    p.add_argument("--num-levels", type=int, default=4)
-    p.add_argument("--codes-per-level", type=int, default=16)
+    p.add_argument("--num-levels", type=int, default=1)
+    p.add_argument("--codes-per-level", type=int, default=256)
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--subsample", type=int, default=100_000,
                    help="Randomly keep at most this many samples")
     p.add_argument("--resample-interval", type=int, default=100,
                    help="Steps between dead-code resampling checks")
+    p.add_argument("--noise-std", type=float, default=0.5,
+                   help="Gaussian noise augmentation std (in normalized action space)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -95,6 +97,11 @@ def main():
         n_batches = 0
         for (batch,) in loader:
             batch = batch.to(device, non_blocking=True)
+            # Noise augmentation: widen the latent distribution so the codebook
+            # covers a broader region of action space, letting GRPO explore
+            # beyond the narrow frozen-modulator distribution.
+            if args.noise_std > 0:
+                batch = batch + torch.randn_like(batch) * args.noise_std
             out = vqvae(batch)
             loss = out["loss"]
 

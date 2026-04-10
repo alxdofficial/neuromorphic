@@ -229,6 +229,27 @@ class ResidualVQ(nn.Module):
             residual = residual - selected
         return log_pi_total
 
+    def entropy(self, z: Tensor, tau: float = 1.0) -> Tensor:
+        """Compute entropy H(pi) of the distance-based categorical, summed across levels.
+
+        z: [B, code_dim], returns [B] entropy values. Gradients flow through z.
+        """
+        B = z.shape[0]
+        residual = z
+        H_total = torch.zeros(B, device=z.device, dtype=z.dtype)
+        for lvl in range(self.num_levels):
+            cb = self.codebooks[lvl].detach()
+            dists = (residual.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)
+            logits = -dists / tau
+            log_probs = F.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+            H_total = H_total - (probs * log_probs).sum(dim=-1)
+            # Advance residual using nearest code (detached)
+            codes_lvl = logits.argmax(dim=-1)
+            selected = cb[codes_lvl]
+            residual = residual - selected
+        return H_total
+
 
 class ActionVQVAE(nn.Module):
     """Encoder → ResidualVQ → Decoder for modulator action vectors.

@@ -33,6 +33,7 @@ def parse_args():
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--tau", type=float, default=1.0)
+    p.add_argument("--entropy-coeff", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tokenizer", type=str, default="tinyllama")
     p.add_argument("--stage1-tokens", type=int, default=10_000_000,
@@ -131,6 +132,7 @@ def main():
         model=model, vqvae=vqvae, dataloader=dataloader,
         config=config, device=device,
         group_size=args.group_size, lr=args.lr, tau=args.tau,
+        entropy_coeff=args.entropy_coeff,
         metrics_path=metrics_path,
         eval_interval=args.eval_interval,
         eval_batches=args.eval_batches,
