@@ -112,6 +112,24 @@ def main():
 
     current_ckpt = bootstrap_ckpt
 
+    # When resuming at --start-cycle N, find the last completed cycle's
+    # phase2 checkpoint so we resume from the right model, not bootstrap.
+    if args.start_cycle > 0:
+        for prev in range(args.start_cycle - 1, -1, -1):
+            prev_p2 = os.path.join(args.work_dir, f"cycle_{prev:02d}", "phase2.pt")
+            if os.path.exists(prev_p2):
+                current_ckpt = prev_p2
+                try:
+                    import torch
+                    ck = torch.load(prev_p2, map_location="cpu", weights_only=False)
+                    cumulative_step = ck.get("step", cumulative_step)
+                    del ck
+                except Exception:
+                    pass
+                print(f"Resuming from cycle {prev} checkpoint: {prev_p2} "
+                      f"(step {cumulative_step})")
+                break
+
     # ---- Iterative cycles ----
     for cycle in range(args.start_cycle, args.cycles):
         print(f"\n\n=========== CYCLE {cycle}/{args.cycles-1} ===========")
