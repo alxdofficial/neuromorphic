@@ -163,8 +163,16 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
     W_after_snaps: list[torch.Tensor] = []
     hebbian_snaps: list[torch.Tensor] = []
     mod_positions: list[int] = []
+    s_mem_at_mod: list[torch.Tensor] = []            # each [BS], at captured mod calls
     readout_norms_per_tok: list[torch.Tensor] = []   # each [BS, NC]
     s_mem_per_tok: list[torch.Tensor] = []           # each [BS]
+
+    # Subsample captures to keep memory bounded: target ~1000 modulator
+    # snapshots and ~4000 per-token samples regardless of T_total.
+    total_mod_calls = T_total // M
+    mod_subsample = max(1, total_mod_calls // 1000)
+    tok_subsample = max(1, T_total // 4000)
+    mod_call_idx = 0
 
     amp = torch.autocast(device_type=device.type, dtype=dt)
 
@@ -190,19 +198,20 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
             tok_t = seg_ids[:, t]
 
             # --- Live memory-head surprise (same as forward_segment) ---
-            x = prev_readout
+            x = prev_readout.to(dt)
             if proj_down_w is not None:
-                x = F.linear(x, proj_down_w, proj_down_b)
-            x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
-            target_emb = lm_head_w[tok_t]
+                x = F.linear(x, proj_down_w.to(dt), proj_down_b.to(dt) if proj_down_b is not None else None)
+            x = F.layer_norm(x, (x.shape[-1],), ln_final_w.to(dt), ln_final_b.to(dt))
+            target_emb = lm_head_w.to(dt)[tok_t]
             target_logit = (x * target_emb).sum(dim=-1)
             s_mem_live = (-target_logit).to(dt)
             s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
-            s_mem_per_tok.append(s_mem_live.float().cpu())
+            if abs_t % tok_subsample == 0:
+                s_mem_per_tok.append(s_mem_live.float().cpu())
 
             # --- Modulate every M tokens ---
             if abs_t % M == 0:
-                W_before = W.clone()
+                W_before_snap = W.clone()
                 W, decay = mg._modulate_cells(
                     h, msg, W, decay, hebbian,
                     readout_drift, s_mem_live, s_mem_ema_fast,
@@ -210,10 +219,13 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
                     W_gamma, decay_gamma)
                 gate = decay.unsqueeze(-1)
                 one_minus_gate = 1.0 - gate
-                W_before_snaps.append(W_before.float().cpu())
-                W_after_snaps.append(W.float().cpu())
-                hebbian_snaps.append(hebbian.float().cpu())
-                mod_positions.append(abs_t)
+                if mod_call_idx % mod_subsample == 0:
+                    W_before_snaps.append(W_before_snap.float().cpu())
+                    W_after_snaps.append(W.float().cpu())
+                    hebbian_snaps.append(hebbian.float().cpu())
+                    mod_positions.append(abs_t)
+                    s_mem_at_mod.append(s_mem_live.float().cpu())
+                mod_call_idx += 1
 
             # --- Memory step ---
             h, msg, readout = mg._step(
@@ -222,9 +234,10 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2)
 
-            readout_cell = readout.reshape(BS, NC, D_n)
-            readout_norms_per_tok.append(
-                readout_cell.float().norm(dim=-1).cpu())
+            if abs_t % tok_subsample == 0:
+                readout_cell = readout.reshape(BS, NC, D_n)
+                readout_norms_per_tok.append(
+                    readout_cell.float().norm(dim=-1).cpu())
 
             hebbian = mg._hebbian_update(hebbian, msg, hebbian_gamma)
 
@@ -239,8 +252,9 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
         "W_after":  torch.stack(W_after_snaps),
         "hebbian":  torch.stack(hebbian_snaps),
         "mod_positions": mod_positions,
-        "readout_norms": torch.stack(readout_norms_per_tok), # [T, BS, NC]
-        "s_mem":        torch.stack(s_mem_per_tok),          # [T, BS]
+        "s_mem_at_mod": torch.stack(s_mem_at_mod),           # [n_calls, BS]
+        "readout_norms": torch.stack(readout_norms_per_tok), # [n_samples, BS, NC]
+        "s_mem":        torch.stack(s_mem_per_tok),          # [n_samples, BS]
         "BS": BS, "T": T_total, "NC": NC, "N": N, "M": M,
     }
 
@@ -327,7 +341,9 @@ def plot_plasticity_stream(captures: dict, out_path: Path):
     ax_heat.set_title(
         "Per-cell plasticity stream  (‖W_after − W_before‖ per modulator call)")
 
-    ax_surp.plot(range(T), s_mem, color="#E74C3C", lw=1.0)
+    n_surp = len(s_mem)
+    surp_x = np.linspace(0, T - 1, n_surp)
+    ax_surp.plot(surp_x, s_mem, color="#E74C3C", lw=1.0)
     ax_surp.axhline(0, color="gray", lw=0.4, ls="--")
     ax_surp.set_xlabel("token position")
     ax_surp.set_ylabel("s_mem_live")
@@ -392,8 +408,7 @@ def plot_cell_roles(captures: dict, out_path: Path):
 
     # Surprise correlation per cell: Pearson between per-call ΔW norm and
     # the surprise at that modulator-call token
-    s_mem_all = captures["s_mem"].mean(dim=1).numpy()         # [T]
-    s_mem_at_mod = s_mem_all[np.array(mod_positions)]         # [n_calls]
+    s_mem_at_mod = captures["s_mem_at_mod"].mean(dim=1).numpy()  # [n_calls]
     corr = np.zeros(NC)
     for c in range(NC):
         x = delta_per_call[:, c]

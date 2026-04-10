@@ -112,7 +112,7 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
     print(f"NaN detected: {any_nan}")
     print(f"Final h_norm: {h_norm:.1f}")
     print(f"Final W_norm: {W_norm:.1f}, W_max: {W_max:.3f}, W_sparsity: {W_sparsity:.2f}")
-    print(f"Final s_mem: live={s_mem:.2f} fast={s_fast:.2f} slow={s_slow:.2f}")
+    print(f"Final s_mem: live={s_mem:.2f} fast={s_fast:.2f}")
 
     if any_nan:
         print("\nFAILED: NaN in loss")

@@ -972,10 +972,9 @@ class MemoryGraph(nn.Module):
                 action_norm = vqvae.normalize(action_flat)
                 z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
                 codes = vqvae.rvq.sample_codes(z, tau=tau, sample=sample)  # [BS*NC, L]
-                # Reconstruct z_q from codes
-                z_q = torch.zeros_like(z)
-                for lvl in range(vqvae.rvq.num_levels):
-                    z_q = z_q + vqvae.rvq.codebooks[lvl][codes[:, lvl]]
+                # Reconstruct z_q from codes — vectorized across levels
+                lvl_idx = torch.arange(vqvae.rvq.num_levels, device=codes.device)
+                z_q = vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes].sum(dim=1)
                 quantized_norm = vqvae.decoder(z_q)              # [BS*NC, action_dim]
                 quantized = vqvae.denormalize(quantized_norm)
                 quantized = quantized.reshape(BS, NC, -1).to(dt)
@@ -1019,7 +1018,7 @@ class MemoryGraph(nn.Module):
                 dim=-1, keepdim=True).to(dt)
             prev_readout_cell = new_cell
             prev_readout_full = readout
-            # No explicit W decay; _receive RMSNorms W rows at use time.
+            # W stays at ~unit per-row RMS via convex-EMA in _modulate_cells.
 
         # Persist end-of-rollout memory state so the next rollout continues
         # from here (memory is lifelong across rollouts too).

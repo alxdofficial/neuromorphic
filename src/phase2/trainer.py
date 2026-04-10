@@ -192,20 +192,29 @@ class Phase2Trainer:
     ) -> Tensor:
         """Run the frozen LM lower scan to produce H_mid.
 
+        Chunks the input into segments of config.T so pos_embed stays in range.
         Mirrors the EOT reset logic in `Model.forward_chunk`: builds a
         reset_mask from in-batch EOT positions and the optional `prev_token`
-        (last token of previous batch). Without this, LM scan carries bleed
-        across document boundaries during phase 2.
+        (last token of previous batch).
         """
         eot_id = self.config.eot_id
-        eos_positions = (input_ids == eot_id)
-        reset_mask = torch.zeros_like(eos_positions)
-        reset_mask[:, 1:] = eos_positions[:, :-1]
-        if prev_token is not None:
-            reset_mask[:, 0] = (prev_token.to(input_ids.device) == eot_id)
-        if not reset_mask.any():
-            reset_mask = None
-        return self.model.lm.forward_scan_lower(input_ids, reset_mask=reset_mask)
+        BS, T_total = input_ids.shape
+        seg_T = self.config.T
+        chunks = []
+        for start in range(0, T_total, seg_T):
+            end = min(start + seg_T, T_total)
+            seg_ids = input_ids[:, start:end]
+            eos_positions = (seg_ids == eot_id)
+            reset_mask = torch.zeros_like(eos_positions)
+            reset_mask[:, 1:] = eos_positions[:, :-1]
+            if start == 0 and prev_token is not None:
+                reset_mask[:, 0] = (prev_token.to(seg_ids.device) == eot_id)
+            elif start > 0:
+                reset_mask[:, 0] = (input_ids[:, start - 1] == eot_id)
+            if not reset_mask.any():
+                reset_mask = None
+            chunks.append(self.model.lm.forward_scan_lower(seg_ids, reset_mask=reset_mask))
+        return torch.cat(chunks, dim=1)
 
     @torch.no_grad()
     def _compute_per_token_reward(
@@ -222,9 +231,10 @@ class Phase2Trainer:
             readouts[:, :-1],
         ], dim=1)  # [BS, T, D]
 
-        # Chunk along time to bound VRAM
+        # Chunk along time to bound VRAM — scale inversely with BS.
+        # At K*BS=64, chunk=64 → [64,64,32K] = 0.5GB per chunk (fine).
         rewards = torch.empty(BS, T, device=readouts.device, dtype=torch.float32)
-        chunk = 64
+        chunk = max(32, 4096 // max(BS, 1))
         for s in range(0, T, chunk):
             e = min(s + chunk, T)
             sub_readout = shifted[:, s:e]
@@ -250,25 +260,30 @@ class Phase2Trainer:
         (via `readout[t]`).
 
         Args:
-            per_token_reward: [BS, T] on-device
+            per_token_reward: [*, BS, T] on-device (leading dims broadcast, e.g. [K, BS, T])
             call_positions: [n_calls] cpu long tensor — absolute token index of each call
             window: reward window W
 
         Returns:
-            rewards: [n_calls, BS] on-device — per-action reward averaged over window
+            rewards: [*, n_calls, BS] on-device — per-action reward averaged over window
         """
-        BS, T = per_token_reward.shape
-        positions = call_positions.tolist()
-        n_calls = len(positions)
-        out = torch.empty(n_calls, BS, device=per_token_reward.device, dtype=torch.float32)
-        for i, t in enumerate(positions):
-            start = t + 1
-            end = min(start + window, T)
-            if start >= T:
-                out[i] = 0.0
-            else:
-                out[i] = per_token_reward[:, start:end].mean(dim=1)
-        return out
+        T = per_token_reward.shape[-1]
+        positions = call_positions.to(per_token_reward.device)
+
+        # Build [n_calls, W] index tensor for vectorized gather
+        starts = positions + 1                                        # [n_calls]
+        offsets = torch.arange(window, device=per_token_reward.device)  # [W]
+        indices = starts.unsqueeze(1) + offsets.unsqueeze(0)          # [n_calls, W]
+        valid = indices < T                                           # [n_calls, W]
+        indices = indices.clamp(max=T - 1)
+        valid_count = valid.float().sum(dim=1).clamp(min=1)           # [n_calls]
+
+        # Gather: per_token_reward[..., indices] → [..., n_calls, W]
+        gathered = per_token_reward[..., indices]                     # [*, BS, n_calls, W]
+        gathered = gathered * valid.float()                            # zero out invalid
+        out = gathered.sum(dim=-1) / valid_count                      # [*, BS, n_calls]
+        # Move n_calls before BS: [..., n_calls, BS]
+        return out.transpose(-1, -2)
 
     @torch.no_grad()
     def _save_mem_state(self) -> dict:
@@ -276,7 +291,7 @@ class Phase2Trainer:
         mem = self.model.memory
         return {
             "h": mem.h.clone(), "msg": mem.msg.clone(), "W": mem.W.clone(),
-            "decay": mem.decay.clone(),
+            "decay": mem.decay.clone(), "hebbian": mem.hebbian.clone(),
             "s_mem_live": mem.s_mem_live.clone(),
             "s_mem_ema_fast": mem.s_mem_ema_fast.clone(),
             "prev_readout": mem.prev_readout.clone(),
@@ -291,6 +306,7 @@ class Phase2Trainer:
         mem.msg = snapshot["msg"].clone()
         mem.W = snapshot["W"].clone()
         mem.decay = snapshot["decay"].clone()
+        mem.hebbian = snapshot["hebbian"].clone()
         mem.s_mem_live = snapshot["s_mem_live"].clone()
         mem.s_mem_ema_fast = snapshot["s_mem_ema_fast"].clone()
         mem.prev_readout = snapshot["prev_readout"].clone()
@@ -299,14 +315,13 @@ class Phase2Trainer:
 
     @torch.no_grad()
     def rollout(self, batch) -> dict:
-        """Run K trajectories on the same batch, collect (state, codes, reward).
+        """Run K trajectories on the same batch in parallel via batch-expanded memory.
 
-        Each trajectory resets the memory to the pre-rollout snapshot, runs a
-        sampled forward via `forward_segment_phase2`, and computes per-action
-        windowed rewards. After all K trajectories, the memory is restored to
-        the snapshot from whichever trajectory we pick to persist (default:
-        the highest-reward trajectory) so that phase-2 rollouts still carry
-        lifelong memory from one batch to the next.
+        Instead of looping K times sequentially, we expand the memory state's
+        batch dimension from BS to K*BS and run a single forward_segment_phase2.
+        Each of the K "sub-batches" gets the same H_mid and input_ids but
+        independent stochastic VQ sampling, producing K divergent trajectories
+        in one pass.
 
         Returns dict:
             mod_inputs: [K, n_calls, BS, NC, mod_in]
@@ -314,65 +329,74 @@ class Phase2Trainer:
             rewards:    [K, n_calls, BS]  per-action reward
         """
         device = self.device
+        K = self.group_size
         input_ids = batch.input_ids.to(device, non_blocking=True)
         prev_token = getattr(batch, "prev_token", None)
         BS, T = input_ids.shape
 
-        # Detach LM carries between batches so phase-2 rollouts don't pull in
-        # stale gradient state from a previous batch (no graph in phase 2 anyway,
-        # but this also frees the references).
         self.model.lm.detach_carries()
 
         # Run lower scan once (LM is frozen and deterministic per batch).
-        # EOT-aware reset mask is built inside _run_lower_scan.
         H_mid = self._run_lower_scan(input_ids, prev_token=prev_token)
 
-        # Snapshot initial memory state (this implicitly captures prev_readout)
+        # Snapshot initial memory state at BS
         init_snapshot = self._save_mem_state()
 
-        all_mod_inputs = []
-        all_codes = []
-        all_rewards = []
-        best_trajectory_snapshot = None
-        best_mean_reward = -float("inf")
+        # Expand memory state: replicate each tensor K times along batch dim.
+        # After this, memory operates on K*BS "samples" simultaneously.
+        mem = self.model.memory
+        for key, val in init_snapshot.items():
+            expanded = val.unsqueeze(0).expand(K, *val.shape).reshape(K * BS, *val.shape[1:])
+            setattr(mem, key, expanded.clone())
 
-        for k in range(self.group_size):
-            # Reset memory to the start of the batch
-            self._restore_mem_state(init_snapshot)
-            # prev_readout for reward computation is the start-of-rollout value
-            init_prev_readout = self.model.memory.prev_readout
+        # Expand H_mid and input_ids: [BS, T, D] -> [K*BS, T, D]
+        H_mid_exp = H_mid.unsqueeze(0).expand(K, *H_mid.shape).reshape(K * BS, *H_mid.shape[1:])
+        ids_exp = input_ids.unsqueeze(0).expand(K, *input_ids.shape).reshape(K * BS, *input_ids.shape[1:])
 
-            result = self.model.memory.forward_segment_phase2(
-                H_mid, input_ids, self.model.lm, self.vqvae,
-                tau=self.tau, sample=True)
+        # Also expand identity matrix cache
 
-            readouts = result["readouts"]
-            call_positions = result["call_positions"]   # cpu long tensor
-            mod_inputs = result["mod_inputs"]           # gpu
-            codes = result["codes"]                     # gpu
+        # Single batched rollout — all K trajectories run in parallel
+        result = mem.forward_segment_phase2(
+            H_mid_exp, ids_exp, self.model.lm, self.vqvae,
+            tau=self.tau, sample=True)
 
-            per_token_reward = self._compute_per_token_reward(
-                readouts, init_prev_readout, input_ids)
-            windowed_r = self._windowed_reward(
-                per_token_reward, call_positions, self.reward_window)   # [n_calls, BS] gpu
+        # Unpack: split K*BS back to (K, BS) using .view() so any
+        # non-contiguous layout bugs raise immediately instead of silently
+        # scrambling trajectory assignments.
+        readouts = result["readouts"].view(K, BS, T, -1)              # [K, BS, T, D]
+        call_positions = result["call_positions"]                     # [n_calls] cpu
+        n_calls = result["mod_inputs"].shape[0]
+        mod_inputs = result["mod_inputs"].view(
+            n_calls, K, BS, *result["mod_inputs"].shape[2:]).transpose(0, 1)  # [K, n_calls, BS, NC, mod_in]
+        codes = result["codes"].view(
+            n_calls, K, BS, *result["codes"].shape[2:]).transpose(0, 1)       # [K, n_calls, BS, NC, L]
 
-            all_mod_inputs.append(mod_inputs)
-            all_codes.append(codes)
-            all_rewards.append(windowed_r)
+        # Compute per-trajectory reward
+        init_prev_readout = init_snapshot["prev_readout"]  # [BS, D]
+        init_prev_exp = init_prev_readout.unsqueeze(0).expand(K, *init_prev_readout.shape).reshape(K * BS, -1)
+        per_token_reward = self._compute_per_token_reward(
+            result["readouts"], init_prev_exp, ids_exp)     # [K*BS, T]
+        per_token_reward = per_token_reward.reshape(K, BS, T)
 
-            mean_r = windowed_r.mean().item()
-            if mean_r > best_mean_reward:
-                best_mean_reward = mean_r
-                best_trajectory_snapshot = self._save_mem_state()
+        # Windowed rewards — vectorized across K trajectories
+        rewards = self._windowed_reward(
+            per_token_reward, call_positions, self.reward_window)  # [K, n_calls, BS]
 
-        # Persist best trajectory's end-state so lifelong memory continues forward
-        if best_trajectory_snapshot is not None:
-            self._restore_mem_state(best_trajectory_snapshot)
+        # Pick best trajectory and restore its end-state
+        mean_per_k = rewards.mean(dim=(1, 2))  # [K]
+        best_k = mean_per_k.argmax().item()
+        best_mean_reward = mean_per_k[best_k].item()
+
+        # Extract best trajectory's end-of-rollout memory state
+        for key in init_snapshot:
+            full = getattr(mem, key)  # [K*BS, ...]
+            best_slice = full[best_k * BS : (best_k + 1) * BS]
+            setattr(mem, key, best_slice.clone())
 
         return {
-            "mod_inputs": torch.stack(all_mod_inputs, dim=0),   # [K, n_calls, BS, NC, mod_in]
-            "codes": torch.stack(all_codes, dim=0),             # [K, n_calls, BS, NC, L]
-            "rewards": torch.stack(all_rewards, dim=0),         # [K, n_calls, BS]
+            "mod_inputs": mod_inputs,
+            "codes": codes,
+            "rewards": rewards,
             "mean_reward": best_mean_reward,
             "T": T,
             "BS": BS,
@@ -432,7 +456,7 @@ class Phase2Trainer:
 
         # Chunk the gradient pass to bound VRAM
         M = mod_inputs_flat.shape[0]
-        chunk_size = 4096
+        chunk_size = 16384
         total_loss = 0.0
         total_log_pi = 0.0
         n_chunks = 0
