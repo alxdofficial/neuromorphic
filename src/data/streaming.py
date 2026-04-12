@@ -355,7 +355,7 @@ class DocumentStream:
         tokenizer: PreTrainedTokenizerFast,
         text_column: str = "text",
         buffer_size: int = 8192,
-        iter_factory: Optional[Callable[[], Iterator[Dict[str, Any]]]] = None,
+        iter_factory: Optional[Callable[..., Iterator[Dict[str, Any]]]] = None,
     ):
         """
         Args:
@@ -363,14 +363,17 @@ class DocumentStream:
             tokenizer: Tokenizer for encoding text
             text_column: Column name containing text data
             buffer_size: Number of tokens to buffer before yielding
-            iter_factory: Optional callable that builds a fresh iterator
-                          (used to recover from transient network errors)
+            iter_factory: Callable that builds a fresh iterator. Accepts an
+                optional ``retry_count`` kwarg so each retry gets a different
+                shuffle seed (prevents restarting from the same prefix on
+                transient network errors).
         """
         self.dataset_iter = dataset_iter
         self.tokenizer = tokenizer
         self.text_column = text_column
         self.buffer_size = buffer_size
         self._iter_factory = iter_factory
+        self._retry_count = 0
 
         self.token_buffer: List[int] = []
         self.exhausted = False
@@ -392,7 +395,10 @@ class DocumentStream:
             except Exception as exc:
                 if not _is_network_error(exc) or self._iter_factory is None:
                     raise
-                # Transient network error — rebuild the iterator and retry
+                # Transient network error — rebuild the iterator and retry.
+                # Each retry increments _retry_count so the factory can use
+                # a different shuffle seed, avoiding restarting from the same
+                # prefix (which would silently duplicate data).
                 for attempt in range(1, _MAX_RETRIES + 1):
                     wait = _BASE_WAIT * (2 ** (attempt - 1))
                     logger.warning(
@@ -402,7 +408,9 @@ class DocumentStream:
                     )
                     time.sleep(wait)
                     try:
-                        self.dataset_iter = self._iter_factory()
+                        self._retry_count += 1
+                        self.dataset_iter = self._iter_factory(
+                            retry_count=self._retry_count)
                         # Iterator rebuilt successfully, continue filling
                         break
                     except Exception as rebuild_exc:
@@ -496,15 +504,18 @@ class PersistentStreamDataset(IterableDataset):
         """Create one stream iterator (supports exhausted-stream recycling)."""
         assert self._base_dataset is not None
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
-        stream_seed = self.seed + stream_idx + 9973 * restart_count
+        base_seed = self.seed + stream_idx + 9973 * restart_count
 
         ds = self._base_dataset
         is_streaming = self._is_streaming
 
-        def _make_iter():
+        def _make_iter(retry_count: int = 0):
+            # Each retry uses a different seed so a network hiccup doesn't
+            # restart from the same shuffled prefix (which would duplicate data).
+            seed = base_seed + 7919 * retry_count
             if is_streaming:
-                return iter(ds.shuffle(seed=stream_seed, buffer_size=10000))
-            return iter(ds.shuffle(seed=stream_seed))
+                return iter(ds.shuffle(seed=seed, buffer_size=10000))
+            return iter(ds.shuffle(seed=seed))
 
         return DocumentStream(
             dataset_iter=_make_iter(),
@@ -1005,12 +1016,13 @@ class MixedStreamDataset(IterableDataset):
         ds = self._ds_cache[key]
 
         restart_count = self._stream_restarts[stream_idx] if self._stream_restarts is not None else 0
-        stream_seed = self.seed + stream_idx + 9973 * restart_count
+        base_seed = self.seed + stream_idx + 9973 * restart_count
 
-        def _make_iter():
+        def _make_iter(retry_count: int = 0):
+            seed = base_seed + 7919 * retry_count
             if is_streaming:
-                return iter(ds.shuffle(seed=stream_seed, buffer_size=10000))
-            return iter(ds.shuffle(seed=stream_seed))
+                return iter(ds.shuffle(seed=seed, buffer_size=10000))
+            return iter(ds.shuffle(seed=seed))
 
         return DocumentStream(
             dataset_iter=_make_iter(),
@@ -1121,35 +1133,63 @@ def create_dataloader(
     if len(configs) == 1:
         shard_path = _find_shard(configs[0])
         if shard_path is not None:
-            # Shards are tokenizer-specific (prepare_data.py hardcodes TinyLlama).
-            # Reject if runtime tokenizer vocab doesn't match.
-            # Sample multiple chunks across the shard (not just the first
-            # 1M) so a mismatch in the tail is still caught.
+            # Shards are tokenizer-specific (prepare_data.py writes a
+            # .shard_meta.json with the tokenizer name). Check identity
+            # first; fall back to vocab-size-only check for old shards.
             import numpy as np
-            shard_mm = np.memmap(shard_path, dtype=np.uint16, mode='r')
-            shard_len = len(shard_mm)
-            sample_size = 100_000
-            n_samples = 10
-            if shard_len <= sample_size * n_samples:
-                shard_max_id = int(shard_mm.max())
+            meta_path = shard_path.replace(".bin", ".shard_meta.json")
+            if os.path.exists(meta_path):
+                import json as _json
+                with open(meta_path) as _f:
+                    shard_meta = _json.load(_f)
+                shard_tokenizer = shard_meta.get("tokenizer", "")
+                # Resolve the runtime tokenizer's canonical name for comparison.
+                # tokenizer.name_or_path is the string passed to from_pretrained.
+                runtime_name = getattr(tokenizer, "name_or_path", "")
+                if shard_tokenizer and runtime_name and shard_tokenizer != runtime_name:
+                    raise ValueError(
+                        f"Pre-tokenized shard {shard_path} was created with "
+                        f"tokenizer '{shard_tokenizer}' but runtime tokenizer "
+                        f"is '{runtime_name}'. Token IDs would be silently "
+                        f"reinterpreted. Delete the .bin shard and re-run "
+                        f"prepare_data.py, or use the matching tokenizer.")
+                shard_vocab = shard_meta.get("vocab_size", 0)
+                if shard_vocab and shard_vocab != tokenizer.vocab_size:
+                    raise ValueError(
+                        f"Pre-tokenized shard {shard_path} has vocab_size "
+                        f"{shard_vocab} but runtime tokenizer has "
+                        f"{tokenizer.vocab_size}.")
             else:
-                max_so_far = 0
-                stride = shard_len // n_samples
-                for i in range(n_samples):
-                    start = i * stride
-                    end = min(start + sample_size, shard_len)
-                    chunk_max = int(shard_mm[start:end].max())
-                    if chunk_max > max_so_far:
-                        max_so_far = chunk_max
-                shard_max_id = max_so_far
-            del shard_mm
-            if shard_max_id >= tokenizer.vocab_size:
-                raise ValueError(
-                    f"Pre-tokenized shard {shard_path} contains token id "
-                    f"{shard_max_id} but tokenizer vocab_size is "
-                    f"{tokenizer.vocab_size}. The shard was likely created "
-                    f"with a different tokenizer. Delete the .bin shard or "
-                    f"use the matching tokenizer.")
+                # Legacy shards without metadata: fall back to max-id check.
+                shard_mm = np.memmap(shard_path, dtype=np.uint16, mode='r')
+                shard_len = len(shard_mm)
+                sample_size = 100_000
+                n_samples = 10
+                if shard_len <= sample_size * n_samples:
+                    shard_max_id = int(shard_mm.max())
+                else:
+                    max_so_far = 0
+                    stride = shard_len // n_samples
+                    for i in range(n_samples):
+                        start = i * stride
+                        end = min(start + sample_size, shard_len)
+                        chunk_max = int(shard_mm[start:end].max())
+                        if chunk_max > max_so_far:
+                            max_so_far = chunk_max
+                    shard_max_id = max_so_far
+                del shard_mm
+                if shard_max_id >= tokenizer.vocab_size:
+                    raise ValueError(
+                        f"Pre-tokenized shard {shard_path} contains token id "
+                        f"{shard_max_id} but tokenizer vocab_size is "
+                        f"{tokenizer.vocab_size}. The shard was likely created "
+                        f"with a different tokenizer. Delete the .bin shard or "
+                        f"use the matching tokenizer.")
+                logger.warning(
+                    "Shard %s has no .shard_meta.json — using legacy "
+                    "vocab-size-only check. Re-run prepare_data.py to "
+                    "generate metadata for full tokenizer identity verification.",
+                    shard_path)
             logger.info("Using pre-tokenized shard: %s", shard_path)
             dataset = TokenShardDataset(
                 shard_path=shard_path,

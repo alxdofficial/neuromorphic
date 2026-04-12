@@ -41,6 +41,10 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         self.global_step = 0
+        # Separate counter for optimizer updates (excludes --no-train steps).
+        # Checkpoints save global_step for data-position tracking but
+        # optimizer_step for LR schedule / training progress semantics.
+        self.optimizer_step = 0
         self.use_memory = use_memory
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
@@ -188,6 +192,7 @@ class Trainer:
             mod_grad_norm = self.model.memory.compute_mod_grad_norm()
 
             self.optimizer.step()
+            self.optimizer_step += 1
             if self.scheduler is not None:
                 self.scheduler.step()
         else:
@@ -243,6 +248,7 @@ class Trainer:
 
         metrics = {
             "step": self.global_step + 1,
+            "optimizer_step": self.optimizer_step,
             "loss": loss_val,
             "ppl": ppl,
             "aux_loss": aux_loss.item(),

@@ -186,6 +186,7 @@ def main():
 
     # Resume
     start_step = 0
+    start_optimizer_step = 0
     pending_runtime_state = None
     pending_dataloader_state = None
     loaded_phase = "phase1"
@@ -224,6 +225,10 @@ def main():
         pending_runtime_state = ckpt.get("runtime_state")
         pending_dataloader_state = ckpt.get("dataloader_state")
         start_step = ckpt.get("step", 0)
+        # optimizer_step may differ from step when --no-train action collection
+        # runs incremented step without optimizer updates. Fall back to step
+        # for older checkpoints that don't have this field.
+        start_optimizer_step = ckpt.get("optimizer_step", start_step)
         loaded_phase = ckpt.get("phase", "phase1")
         print(f"  Loaded from step {start_step} "
               f"(opt={'Y' if optimizer_loaded else 'N'} "
@@ -277,6 +282,8 @@ def main():
     if args.collect_actions:
         print("*** Action collection ENABLED — will flush to disk ***")
     trainer.global_step = start_step
+    if args.resume:
+        trainer.optimizer_step = start_optimizer_step
     if pending_runtime_state is not None:
         model.load_runtime_state(pending_runtime_state)
         # Loaded state may have been saved at a different BS (e.g. phase 2
@@ -311,6 +318,7 @@ def main():
             dataloader.mark_consumed(step - start_step, prev_tokens=consumer_prev)
         torch.save({
             "step": step,
+            "optimizer_step": trainer.optimizer_step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),

@@ -6,6 +6,7 @@ matmul per step. No sparse gather, no Triton kernels in the hot path.
 """
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -911,10 +912,16 @@ class MemoryGraph(nn.Module):
         BS, T, _ = H_mid.shape
         if not self._initialized:
             self.initialize_states(BS, H_mid.device)
-        if not self._compiled and H_mid.is_cuda and not self._collecting_actions:
+        # torch.compile the memory loop for speed on CUDA. Disabled during
+        # action collection (list-append side effects) or when the
+        # NEUROMORPHIC_NO_COMPILE env var is set (for debugging / equivalence
+        # testing against the eager path).
+        if (not self._compiled and H_mid.is_cuda
+                and not self._collecting_actions
+                and not os.environ.get("NEUROMORPHIC_NO_COMPILE")):
             self._run_block_uncompiled = self._run_block
             self._run_block = torch.compile(
-                self._run_block, mode="default", fullgraph=False)
+                self._run_block, mode="reduce-overhead", fullgraph=False)
             self._compiled = True
 
         # Valid mask for the TRAINING TARGET (mem_pred_loss only).

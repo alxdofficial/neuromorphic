@@ -112,70 +112,115 @@ def stream_and_save(
     ds = load_dataset(hf_path, split=split, streaming=True)
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
 
-    texts = []
+    # --- Streaming pipeline: write parquet + .bin shard incrementally ---
+    # Previous version accumulated all texts and token IDs in RAM before
+    # writing, which blows up at 2B+ tokens. Now we write parquet in
+    # row-group chunks and append tokens to the .bin file on disk.
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    shard_path = out_path.with_suffix(".bin")
+
+    # Write the tokenizer identity into a companion file so loaders can
+    # verify the shard matches the runtime tokenizer (not just vocab_size).
+    meta_path = out_path.with_suffix(".shard_meta.json")
+
     doc_hashes = set()  # for disjointness check in caller
-    all_token_ids = []  # collected for .bin shard
     total_tokens = 0
+    total_examples = 0
     skipped = 0
     skipped_overlap = 0
+    shard_tokens = 0
     t0 = time.time()
 
-    for i, example in enumerate(ds):
-        text = example.get(text_column, "")
-        if not text or not text.strip():
-            skipped += 1
-            continue
+    # Parquet writer (streamed row groups)
+    parquet_writer = None
+    text_batch = []
+    PARQUET_BATCH_SIZE = 5000  # rows per row group
 
-        # Document-level disjointness: hash the text and skip if it's in
-        # the exclude set. SHA-256 is overkill for dedup but cheap enough.
-        doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if exclude_texts is not None and doc_hash in exclude_texts:
-            skipped_overlap += 1
-            continue
-        doc_hashes.add(doc_hash)
+    # Binary shard: opened for incremental append
+    shard_fp = open(shard_path, "wb")
 
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        texts.append(text)
-        all_token_ids.extend(tokens)
-        all_token_ids.append(eos_id)
-        total_tokens += len(tokens)
+    try:
+        for i, example in enumerate(ds):
+            text = example.get(text_column, "")
+            if not text or not text.strip():
+                skipped += 1
+                continue
 
-        if (i + 1) % PROGRESS_INTERVAL == 0:
-            elapsed = time.time() - t0
-            rate = total_tokens / elapsed if elapsed > 0 else 0
-            pct = total_tokens / target_tokens * 100
-            print(
-                f"  [{i+1:>9,} examples] "
-                f"{total_tokens:>13,} tokens  "
-                f"({total_tokens/1e9:.2f}B / {target_tokens/1e9:.1f}B = {pct:.1f}%)  "
-                f"{rate/1e6:.1f}M tok/s  "
-                f"skipped={skipped} overlap={skipped_overlap}"
-            )
+            # Document-level disjointness: hash the text and skip if it's in
+            # the exclude set. SHA-256 is overkill for dedup but cheap enough.
+            doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if exclude_texts is not None and doc_hash in exclude_texts:
+                skipped_overlap += 1
+                continue
+            doc_hashes.add(doc_hash)
 
-        if total_tokens >= target_tokens:
-            break
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            total_tokens += len(tokens)
+            total_examples += 1
+
+            # Append to parquet batch
+            text_batch.append(text)
+            if len(text_batch) >= PARQUET_BATCH_SIZE:
+                table = pa.table({"text": text_batch})
+                if parquet_writer is None:
+                    parquet_writer = pq.ParquetWriter(
+                        out_path, table.schema, compression="zstd")
+                parquet_writer.write_table(table)
+                text_batch = []
+
+            # Append tokens + EOS to binary shard
+            token_ids = tokens + [eos_id]
+            shard_fp.write(np.array(token_ids, dtype=np.uint16).tobytes())
+            shard_tokens += len(token_ids)
+
+            if (i + 1) % PROGRESS_INTERVAL == 0:
+                elapsed = time.time() - t0
+                rate = total_tokens / elapsed if elapsed > 0 else 0
+                pct = total_tokens / target_tokens * 100
+                print(
+                    f"  [{i+1:>9,} examples] "
+                    f"{total_tokens:>13,} tokens  "
+                    f"({total_tokens/1e9:.2f}B / {target_tokens/1e9:.1f}B = {pct:.1f}%)  "
+                    f"{rate/1e6:.1f}M tok/s  "
+                    f"skipped={skipped} overlap={skipped_overlap}"
+                )
+
+            if total_tokens >= target_tokens:
+                break
+    finally:
+        # Flush remaining parquet rows
+        if text_batch:
+            table = pa.table({"text": text_batch})
+            if parquet_writer is None:
+                parquet_writer = pq.ParquetWriter(
+                    out_path, table.schema, compression="zstd")
+            parquet_writer.write_table(table)
+        if parquet_writer is not None:
+            parquet_writer.close()
+        shard_fp.close()
 
     elapsed = time.time() - t0
-    print(f"\n  Done: {len(texts):,} examples, {total_tokens:,} tokens in {elapsed:.0f}s")
-
-    # Save as parquet (raw text, for inspection/re-tokenization)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.table({"text": texts})
-    pq.write_table(table, out_path, compression="zstd")
+    print(f"\n  Done: {total_examples:,} examples, {total_tokens:,} tokens in {elapsed:.0f}s")
 
     file_size = out_path.stat().st_size
     print(f"  Saved: {out_path} ({file_size / 1e9:.2f} GB)")
 
-    # Save pre-tokenized shard (.bin) for fast training
-    shard_path = out_path.with_suffix(".bin")
-    shard_tokens = len(all_token_ids)
-    token_array = np.array(all_token_ids, dtype=np.uint16)
-    token_array.tofile(shard_path)
     shard_size = shard_path.stat().st_size
     print(f"  Shard: {shard_path} ({shard_size / 1e9:.2f} GB, {shard_tokens:,} tokens)")
 
+    # Save tokenizer identity so loaders can verify compatibility
+    shard_meta = {
+        "tokenizer": TOKENIZER_NAME,
+        "vocab_size": vocab_size,
+        "eos_token_id": eos_id,
+        "shard_tokens": shard_tokens,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(shard_meta, f, indent=2)
+
     return {
-        "examples": len(texts),
+        "examples": total_examples,
         "tokens": total_tokens,
         "skipped": skipped,
         "skipped_overlap": skipped_overlap,
