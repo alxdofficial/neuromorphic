@@ -50,7 +50,6 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
-    get_cosine_schedule_with_warmup,
 )
 
 # ============================================================================
@@ -58,7 +57,7 @@ from transformers import (
 # ============================================================================
 
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-SEQ_LENGTH = 2048  # Match neuromorphic T=2048 (K_segments=4 x N=512)
+SEQ_LENGTH = 2048  # Baseline context window (neuromorphic uses T=128 chunks)
 TOKEN_BUDGET = 1_500_000_000  # 1.5B tokens (matches neuromorphic training)
 GRAD_ACCUM = 1
 
@@ -366,7 +365,16 @@ class LocalTokenDataset:
             self._token_buffer.extend(tokens)
 
     def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get a batch of (input_ids, labels) tensors."""
+        """Get a batch of (input_ids, labels) tensors.
+
+        IMPORTANT: HuggingFace CausalLM models shift labels INSIDE the model
+        (via ForCausalLMLoss), so the correct pattern is `labels = input_ids`.
+        Prior versions of this file did `labels = tokens[:, 1:]` which
+        pre-shifted the labels AND let HF shift them again, producing a
+        2-step-ahead prediction task rather than standard next-token. All
+        baselines trained before this fix are on the wrong objective and
+        should be discarded / retrained.
+        """
         needed = self.batch_size * (self.seq_length + 1)
         self._fill_buffer(needed)
 
@@ -377,8 +385,8 @@ class LocalTokenDataset:
             batch_tokens.append(chunk)
 
         tokens = torch.tensor(batch_tokens, dtype=torch.long)
-        input_ids = tokens[:, :-1]   # [BS, T]
-        labels = tokens[:, 1:]       # [BS, T]
+        input_ids = tokens[:, :-1]              # [BS, T]
+        labels = input_ids.clone()              # HF shifts internally
         return input_ids, labels
 
 
@@ -418,7 +426,9 @@ def build_val_dataset(tokenizer, batch_size: int, n_batches: int = 100,
                 buf = buf[SEQ_LENGTH + 1:]
                 batch_tokens.append(chunk)
             t = torch.tensor(batch_tokens, dtype=torch.long)
-            batches.append((t[:, :-1], t[:, 1:]))
+            # Same fix as get_batch: labels = input_ids, HF shifts internally.
+            input_ids = t[:, :-1]
+            batches.append((input_ids, input_ids.clone()))
             if len(batches) >= n_batches:
                 break
         if len(batches) >= n_batches:
@@ -569,22 +579,38 @@ def train(
     model = create_model(model_name, device)
     n_params = sum(p.numel() for p in model.parameters())
 
-    # Optimizer
+    # Optimizer — split param groups so norms and biases are NOT weight-decayed,
+    # matching standard practice and the neuromorphic trainer's convention.
+    # Previous version applied weight_decay to all params (codex finding #6).
+    decay_params, no_decay_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or name.endswith(".bias"):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [
+            {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
         lr=LR,
         betas=(BETA1, BETA2),
-        weight_decay=WEIGHT_DECAY,
         fused=(device == "cuda"),
     )
 
-    # LR scheduler (cosine with warmup, same shape as our training)
+    # LR scheduler (cosine with warmup). HF's get_cosine_schedule_with_warmup
+    # decays to LR=0, not MIN_LR (codex finding #6). We use a custom lambda
+    # to match the neuromorphic trainer's cosine-to-MIN_LR schedule.
     warmup_steps = max(int(max_steps * WARMUP_FRACTION), 100)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=max_steps,
-    )
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return MIN_LR / LR + (1.0 - MIN_LR / LR) * cosine
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Mixed precision — bf16 for all models (matches neuromorphic training)
     if device == "cuda":

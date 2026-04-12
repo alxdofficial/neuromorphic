@@ -79,7 +79,7 @@ class Model(nn.Module):
         #    live surprise signal the modulator uses.
         if use_memory:
             readouts, mem_pred_loss = self.memory.forward_segment(
-                H_mid.detach(), input_ids, self.lm)
+                H_mid.detach(), input_ids, self.lm, prev_token=prev_token)
             H_enriched = H_mid + self.lm.mem_scale * readouts.to(H_mid.dtype)
             aux_loss = self.config.mem_pred_weight * mem_pred_loss
         else:

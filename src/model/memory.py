@@ -138,6 +138,8 @@ class MemoryGraph(nn.Module):
 
         self._initialized = False
         self._compiled = False
+        self._collecting_actions = False
+        self._action_buffer: list[Tensor] = []
 
     # ================================================================
     # State management
@@ -182,19 +184,20 @@ class MemoryGraph(nn.Module):
         self.W = F.rms_norm(W, normalized_shape=(N,))
 
         # Surprise state (scalar per batch — memory-head prediction signal).
-        # s_mem(t) is the NEGATIVE target-logit under the memory head (lower =
-        # less surprised). s_mem_live is the instant value the modulator reads
-        # inside the loop; s_mem_ema_fast is its short-horizon smoothed track.
+        # s_mem_live is the per-token CE at the arriving token under the
+        # memory head (computed inside _run_block as logsumexp(logits) -
+        # target_logit). s_mem_ema_fast is its short-horizon EMA.
         self.s_mem_live = torch.zeros(BS, device=device, dtype=dt)
         self.s_mem_ema_fast = torch.zeros(BS, device=device, dtype=dt)
-        # Per-cell previous readout — for computing readout_drift (local surprise).
-        self.prev_readout_cell = torch.zeros(BS, NC, D_n, device=device, dtype=dt)
         # Per-cell drift signal — carried across blocks so the modulator at the
         # start of a new block sees the drift from the end of the previous block,
-        # not a fresh zero.
+        # not a fresh zero. Note: the per-cell "previous readout" needed to
+        # compute drift is derived on-the-fly from `prev_readout` via
+        # `.view(BS, NC, D_n)` — no separate state tensor.
         self.readout_drift = torch.zeros(BS, NC, 1, device=device, dtype=dt)
         # Full D-dim previous readout — fed to the memory head for predicting
-        # the next token (memory head uses readout[t-1] to predict x_t).
+        # the next token (memory head uses readout[t-1] to predict x_t), and
+        # reshaped on demand for the per-cell drift computation.
         self.prev_readout = torch.zeros(BS, self.config.D, device=device, dtype=dt)
 
         self._initialized = True
@@ -207,14 +210,98 @@ class MemoryGraph(nn.Module):
         self.W = self.W.detach()
         self.decay = self.decay.detach()
         self.prev_readout = self.prev_readout.detach()
-        self.prev_readout_cell = self.prev_readout_cell.detach()
         self.readout_drift = self.readout_drift.detach()
         self.hebbian = self.hebbian.detach()
         # s_mem_* are already detached (no_grad EMAs)
 
-    def reset_states(self, mask: Tensor):
-        """Retained for API compatibility; memory is intended to be lifelong."""
-        pass
+    @torch.no_grad()
+    def collapse_batch_dim(self) -> dict:
+        """Average long-term memory state across the batch dimension and broadcast.
+
+        Conceptually there is ONE memory graph. The BS dimension exists only
+        because we train on BS parallel data streams in the same forward
+        pass. Without periodic merging, those streams accumulate independent
+        connectivity (W), persistence (decay), and co-activation (hebbian)
+        — which violates the "lifelong shared memory" model and causes a
+        cold-start problem at every BS change (e.g. phase 1 → phase 2).
+
+        This method averages the long-term state across BS and broadcasts
+        the consensus back to every lane. Transient state (h, msg,
+        prev_readout, etc.) is left per-lane because it represents the
+        current activation pattern given the current input — averaging
+        those would produce a meaningless average activation.
+
+        Returns divergence stats so we can monitor how much the lanes have
+        drifted apart between merges. If divergence is small, the lanes are
+        converging on shared structure (good — averaging is essentially
+        noise reduction). If it's large or growing, the modulator isn't
+        learning a generalizable structure and the merge is destructive.
+        """
+        if not self._initialized:
+            return {}
+        BS = self.W.shape[0]
+        if BS <= 1:
+            return {}
+
+        # Per-lane divergence from the mean (computed BEFORE the collapse).
+        W_mean = self.W.mean(dim=0, keepdim=True)
+        decay_mean = self.decay.mean(dim=0, keepdim=True)
+        heb_mean = self.hebbian.mean(dim=0, keepdim=True)
+
+        # Mean L2 distance from consensus per lane (averaged across cells/neurons).
+        W_div = (self.W - W_mean).float().norm(dim=(2, 3)).mean().item()
+        W_norm = self.W.float().norm(dim=(2, 3)).mean().item()
+        decay_div = (self.decay - decay_mean).float().norm(dim=-1).mean().item()
+        heb_div = (self.hebbian - heb_mean).float().norm(dim=(2, 3)).mean().item()
+        heb_norm = self.hebbian.float().norm(dim=(2, 3)).mean().item()
+
+        # Collapse + broadcast.
+        self.W = W_mean.expand_as(self.W).clone()
+        self.decay = decay_mean.expand_as(self.decay).clone()
+        self.hebbian = heb_mean.expand_as(self.hebbian).clone()
+
+        return {
+            "merge_W_divergence": W_div,
+            "merge_W_relative_div": W_div / max(W_norm, 1e-8),
+            "merge_decay_divergence": decay_div,
+            "merge_hebbian_divergence": heb_div,
+            "merge_hebbian_relative_div": heb_div / max(heb_norm, 1e-8),
+        }
+
+    @torch.no_grad()
+    def broadcast_to_bs(self, new_bs: int):
+        """Resize all runtime state tensors to a new batch size.
+
+        Assumes the long-term state (W, decay, hebbian) is already
+        consensus across the current BS — call collapse_batch_dim() first
+        if not. Takes lane 0's values and broadcasts them to new_bs.
+        Transient state (h, msg, etc.) is reset to zero since it depends
+        on current input and there's no meaningful way to broadcast it.
+        """
+        if not self._initialized:
+            return
+        device = self.W.device
+        dt = self.W.dtype
+
+        # Long-term: take lane 0 (assumed consensus) and broadcast.
+        W_one = self.W[:1]                                                    # [1, NC, N, N]
+        decay_one = self.decay[:1]                                             # [1, NC, N]
+        heb_one = self.hebbian[:1]                                             # [1, NC, N, N]
+        self.W = W_one.expand(new_bs, -1, -1, -1).clone()
+        self.decay = decay_one.expand(new_bs, -1, -1).clone()
+        self.hebbian = heb_one.expand(new_bs, -1, -1, -1).clone()
+
+        # Transient: reinit to zero (will warm up on next forward).
+        self.h = torch.zeros(
+            new_bs, self.N_cells, self.C_n, self.D_n, device=device, dtype=dt)
+        self.msg = torch.zeros(
+            new_bs, self.N_cells, self.C_n, self.D_n, device=device, dtype=dt)
+        self.s_mem_live = torch.zeros(new_bs, device=device, dtype=dt)
+        self.s_mem_ema_fast = torch.zeros(new_bs, device=device, dtype=dt)
+        self.prev_readout = torch.zeros(
+            new_bs, self.config.D, device=device, dtype=dt)
+        self.readout_drift = torch.zeros(
+            new_bs, self.N_cells, 1, device=device, dtype=dt)
 
     def runtime_state_dict(self) -> dict:
         if not self._initialized:
@@ -228,7 +315,6 @@ class MemoryGraph(nn.Module):
             "s_mem_live": self.s_mem_live.clone(),
             "s_mem_ema_fast": self.s_mem_ema_fast.clone(),
             "prev_readout": self.prev_readout.clone(),
-            "prev_readout_cell": self.prev_readout_cell.clone(),
             "readout_drift": self.readout_drift.clone(),
             "hebbian": self.hebbian.clone(),
         }
@@ -259,8 +345,8 @@ class MemoryGraph(nn.Module):
         self.s_mem_ema_fast = state.get("s_mem_ema_fast", zero_b).to(device)
         self.prev_readout = state.get("prev_readout", torch.zeros(
             BS, self.config.D, device=device, dtype=dt)).to(device)
-        self.prev_readout_cell = state.get("prev_readout_cell", torch.zeros(
-            BS, self.N_cells, self.D_n, device=device, dtype=dt)).to(device)
+        # Older checkpoints may have `prev_readout_cell` — ignored now
+        # (per-cell view is derived on-the-fly from prev_readout).
         self.readout_drift = state.get("readout_drift", torch.zeros(
             BS, self.N_cells, 1, device=device, dtype=dt)).to(device)
         self.hebbian = state.get("hebbian", torch.zeros(
@@ -316,9 +402,18 @@ class MemoryGraph(nn.Module):
 
     @torch.no_grad()
     def compute_modulator_stats(self) -> dict:
-        """Snapshot modulator action stats at current state. See class docstring."""
+        """Snapshot modulator stats measuring ACTUAL applied plasticity.
+
+        After the bounded-W redesign, raw modulator output norms are
+        misleading — the applied update is row-RMS normalized and EMA-gated
+        for W, and sigmoid-plus-EMA for decay. This method simulates one
+        modulation step and reports the actual L2 magnitude of the
+        applied W/decay changes.
+
+        Also reports the raw action norm for comparison with older runs.
+        """
         if not self._initialized:
-            return {"mod_action_norm": 0.0, "mod_action_var": 0.0}
+            return {}
 
         BS = self.h.shape[0]
         NC, N = self.N_cells, self.C_n
@@ -326,34 +421,105 @@ class MemoryGraph(nn.Module):
         mod_input = self._build_mod_input()
         output = self._modulator_forward(mod_input)
 
-        delta_W = output[..., :N * N].reshape(BS, NC, N, N).float()
-        delta_decay = output[..., N * N:N * N + N].reshape(BS, NC, N).float()
+        # Raw (pre-gate) modulator output — the driving signal.
+        delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N).float()
+        delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N).float()
 
-        dW_mag = delta_W.abs().mean(dim=(2, 3))
-        dD_mag = delta_decay.abs().mean(dim=2)
-        action_norm = ((dW_mag + dD_mag) * 0.5).mean()
+        raw_action_norm = ((delta_W_raw.abs().mean(dim=(2, 3))
+                            + delta_decay_raw.abs().mean(dim=2)) * 0.5).mean().item()
 
-        dW_var = delta_W.var(dim=0, unbiased=False).mean(dim=(1, 2))
-        dD_var = delta_decay.var(dim=0, unbiased=False).mean(dim=1)
-        action_var = ((dW_var + dD_var) * 0.5).mean()
+        # Simulate the actual applied update (matches _modulate_cells).
+        W_f = self.W.float()
+        decay_f = self.decay.float()
+
+        delta_W_norm = F.rms_norm(delta_W_raw, normalized_shape=(N,))
+        W_gamma = torch.sigmoid(self.W_decay_logit).float().view(1, -1, 1, 1)
+        W_new = (1.0 - W_gamma) * W_f + W_gamma * delta_W_norm
+
+        target_decay = torch.sigmoid(delta_decay_raw)
+        d_gamma = torch.sigmoid(self.decay_gamma_logit).float().view(1, -1, 1)
+        decay_new = (1.0 - d_gamma) * decay_f + d_gamma * target_decay
+
+        # Actual applied change — this is the signal that matters.
+        dW_applied = (W_new - W_f).norm(dim=(2, 3))  # [BS, NC]
+        dDecay_applied = (decay_new - decay_f).norm(dim=-1)  # [BS, NC]
+
+        # Variance across batch (per-cell) — measures input-dependent variability
+        # of the actual applied update.
+        dW_batch_var = (W_new - W_f).var(dim=0, unbiased=False).mean().item()
+        dDecay_batch_var = (decay_new - decay_f).var(dim=0, unbiased=False).mean().item()
 
         return {
-            "mod_action_norm": action_norm.item(),
-            "mod_action_var": action_var.item(),
+            "mod_action_norm": raw_action_norm,  # pre-gate, legacy panel signal
+            "applied_dW_norm": dW_applied.mean().item(),
+            "applied_dDecay_norm": dDecay_applied.mean().item(),
+            "applied_dW_batch_var": dW_batch_var,
+            "applied_dDecay_batch_var": dDecay_batch_var,
         }
 
     @torch.no_grad()
-    def collect_modulator_action(self) -> Tensor | None:
-        """Snapshot the full modulator action vector at current runtime state.
+    def compute_plasticity_rates(self) -> dict:
+        """Learnable plasticity rate traces (sigmoid of the *_decay_logit params).
 
-        Returns: [BS, NC, mod_out] tensor (concatenation of delta_W and
-        delta_decay flattened per cell), or None if not yet initialized.
-        Used during action database collection between phase 1 and codebook fit.
+        These control EMA rates (gamma in the convex update). Half-life in
+        modulation steps: log(0.5) / log(1 - gamma).
+        """
+        import math
+        W_gamma = torch.sigmoid(self.W_decay_logit).float()
+        d_gamma = torch.sigmoid(self.decay_gamma_logit).float()
+        h_gamma = torch.sigmoid(self.hebbian_decay_logit).float()
+
+        def _hl(gamma: Tensor) -> Tensor:
+            # log(0.5) / log(1 - gamma); clamp to avoid inf for gamma~0
+            g = gamma.clamp(min=1e-6, max=1.0 - 1e-6)
+            return (math.log(0.5) / torch.log(1.0 - g))
+
+        return {
+            "W_gamma_mean": W_gamma.mean().item(),
+            "W_gamma_min": W_gamma.min().item(),
+            "W_gamma_max": W_gamma.max().item(),
+            "W_half_life": _hl(W_gamma).mean().item(),
+            "decay_gamma_mean": d_gamma.mean().item(),
+            "decay_gamma_min": d_gamma.min().item(),
+            "decay_gamma_max": d_gamma.max().item(),
+            "decay_half_life": _hl(d_gamma).mean().item(),
+            "hebbian_gamma_mean": h_gamma.mean().item(),
+            "hebbian_half_life": _hl(h_gamma).mean().item(),
+        }
+
+    def start_action_collection(self):
+        """Enable per-modulation-event action collection inside _run_block.
+
+        Only used during the short action collection sub-phase (~155 steps).
+        Forward passes use the uncompiled path to avoid torch.compile
+        recompilation from list-append side effects in _modulate_cells.
+        """
+        self._collecting_actions = True
+        self._action_buffer = []
+
+    def stop_action_collection(self):
+        """Disable action collection."""
+        self._collecting_actions = False
+
+    @torch.no_grad()
+    def collect_modulator_action(self) -> Tensor | None:
+        """Return collected actions and clear the buffer.
+
+        When _collecting_actions is True, returns all actions collected during
+        the chunk (one per modulation event, ~T/modulation_interval per chunk).
+        When False, falls back to a single end-of-chunk snapshot.
+
+        Returns: [N_actions, BS, NC, mod_out] tensor, or None.
         """
         if not self._initialized:
             return None
+        if self._action_buffer:
+            actions = torch.stack(self._action_buffer, dim=0)  # [n, BS, NC, mod_out]
+            self._action_buffer = []
+            return actions
+        # Fallback: single snapshot at current state
         mod_input = self._build_mod_input()
-        return self._modulator_forward(mod_input).float().cpu()
+        return self._modulator_forward(mod_input).float().cpu().unsqueeze(0)
 
     def compute_mod_grad_norm(self) -> float:
         """Mean per-cell L2 norm of modulator weight gradients.
@@ -387,14 +553,30 @@ class MemoryGraph(nn.Module):
         out["msg_norm"] = msg.norm().item() / max(msg.numel() ** 0.5, 1.0)
         out["h_max"] = h.abs().max().item()
         out["msg_max"] = msg.abs().max().item()
-        out["W_norm"] = W.norm().item() / max(W.numel() ** 0.5, 1.0)
-        out["W_max"] = W.abs().max().item()
-        out["W_sparsity"] = (W.abs() < 1e-4).float().mean().item()
         out["decay_mean"] = decay.mean().item()
         out["decay_std"] = decay.std().item()
         out["s_mem_live"] = self.s_mem_live.float().mean().item()
         out["s_mem_ema_fast"] = self.s_mem_ema_fast.float().mean().item()
         out["readout_drift_mean"] = self.readout_drift.float().mean().item()
+
+        # Off-diagonal W structure — after bounded W, on-diagonal is close
+        # to identity, so off-diagonal carries the actual structure.
+        N = W.shape[-1]
+        diag_mask = torch.eye(N, device=W.device, dtype=torch.bool)
+        W_off = W.masked_fill(diag_mask, 0.0)
+        out["W_offdiag_norm"] = W_off.norm().item() / max(W_off.numel() ** 0.5, 1.0)
+        out["W_offdiag_max"] = W_off.abs().max().item()
+
+        # Off-diagonal Hebbian — the actual co-activation signal (diagonal
+        # is just self-self, which dominates a full-matrix norm).
+        heb = self.hebbian.float()
+        heb_off = heb.masked_fill(diag_mask, 0.0)
+        out["hebbian_offdiag_norm"] = heb_off.norm().item() / max(heb_off.numel() ** 0.5, 1.0)
+        # Cosine between W_off and heb_off (flattened per batch element, mean'd).
+        wf = W_off.reshape(W.shape[0], -1)
+        hf = heb_off.reshape(W.shape[0], -1)
+        cos = F.cosine_similarity(wf, hf, dim=-1)
+        out["W_hebbian_offdiag_cos"] = cos.mean().item()
         return out
 
     def compute_param_norms(self) -> dict:
@@ -543,15 +725,20 @@ class MemoryGraph(nn.Module):
         delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N)
         delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N)
 
-        # W update: convex EMA toward unit-per-row-RMS delta
+        # W update: convex EMA toward unit-per-row-RMS delta, computed in f32
+        # to avoid the bf16 precision cliff at γ near 1 (see audit claim #4).
         delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
-        g_W = W_gamma.view(1, -1, 1, 1).to(W.dtype)
-        W_new = (1.0 - g_W) * W + g_W * delta_W
+        g_W_f32 = W_gamma.float().view(1, -1, 1, 1)
+        W_new = ((1.0 - g_W_f32) * W.float() + g_W_f32 * delta_W.float()).to(W.dtype)
 
-        # Decay update: convex EMA toward sigmoid'd target (in [0,1])
-        target_decay = torch.sigmoid(delta_decay_raw).to(decay.dtype)
-        g_d = decay_gamma.view(1, -1, 1).to(decay.dtype)
-        decay_new = (1.0 - g_d) * decay + g_d * target_decay
+        # Decay update: convex EMA toward sigmoid'd target (in [0,1]), also f32.
+        target_decay_f32 = torch.sigmoid(delta_decay_raw.float())
+        g_d_f32 = decay_gamma.float().view(1, -1, 1)
+        decay_new = ((1.0 - g_d_f32) * decay.float() + g_d_f32 * target_decay_f32).to(decay.dtype)
+
+        # Collect raw action at every modulation event (not just end-of-chunk).
+        if self._collecting_actions:
+            self._action_buffer.append(output.detach().float().cpu())
 
         return W_new, decay_new
 
@@ -578,17 +765,22 @@ class MemoryGraph(nn.Module):
 
         Returns the updated hebbian. Runs in no_grad context (caller's
         responsibility) — the trace is a runtime state, not a learned tensor.
+
+        Convex EMA computed in f32: at γ approaching 1, bf16 representation
+        of (1-γ) collapses to zero (100% rel error at logit=+7, 16% at
+        logit=+5, 1.6% at logit=+2 = hebbian init). We compute in f32 then
+        cast back to the runtime dtype. See audit claim #4.
         """
         # Pairwise dot product across neurons within each cell.
         # [BS, NC, N, D_n] @ [BS, NC, D_n, N] -> [BS, NC, N, N]
-        coactiv = torch.matmul(msg, msg.transpose(-1, -2))
-        # Per-cell gamma broadcast across BS, N, N
-        g = gamma.view(1, -1, 1, 1).to(hebbian.dtype)
-        return (1.0 - g) * hebbian + g * coactiv
+        coactiv = torch.matmul(msg.float(), msg.float().transpose(-1, -2))
+        # Per-cell gamma broadcast across BS, N, N — f32 for precision.
+        g = gamma.float().view(1, -1, 1, 1)
+        return ((1.0 - g) * hebbian.float() + g * coactiv).to(hebbian.dtype)
 
     def _run_block(self, h, msg, W, decay, hebbian,
                    s_mem_live, s_mem_ema_fast,
-                   prev_readout_cell, prev_readout_full, readout_drift,
+                   prev_readout_full, readout_drift,
                    block_H_mid, block_input_ids,
                    start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
@@ -631,14 +823,24 @@ class MemoryGraph(nn.Module):
                 one_minus_gate = 1.0 - gate
 
             # --- Live memory-head surprise (no_grad — detached signal) ---
+            # Computes proper per-token CE = logsumexp(logits) - target_logit.
+            # This is an OBSERVATION fed to the modulator: "how predictable
+            # was the token that just came in?" It fires at every position
+            # — including cross-document boundaries — because a surprise
+            # spike at a document start is the legitimate "context just
+            # changed, adapt" signal the modulator needs to react to.
+            # The training-target masks (mem_pred_loss, phase-2 reward)
+            # are separate and still mask out EOT boundaries.
             with torch.no_grad():
                 x = prev_readout_full
                 if proj_down_w is not None:
                     x = F.linear(x, proj_down_w, proj_down_b)
                 x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
-                target_emb = lm_head_w[tok_t]  # [BS, D_embed]
-                target_logit = (x * target_emb).sum(dim=-1)  # [BS]
-                s_mem_live = (-target_logit).to(h.dtype)
+                logits_full = F.linear(x, lm_head_w)                    # [BS, V]
+                lse = torch.logsumexp(logits_full.float(), dim=-1)      # [BS]
+                target_logit = logits_full.gather(
+                    1, tok_t.unsqueeze(1)).squeeze(1).float()           # [BS]
+                s_mem_live = (lse - target_logit).to(h.dtype)
                 s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
 
             # --- Modulate every M tokens using the FRESH surprise ---
@@ -667,33 +869,41 @@ class MemoryGraph(nn.Module):
             hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             # Update per-cell drift signal (used as a separate feature).
+            # `prev_readout_full` is still the readout from t-1 at this
+            # point — we haven't advanced it yet below — so view it as
+            # per-cell and diff against the current cell readout.
             with torch.no_grad():
                 new_cell = readout.reshape(BS, NC, D_n)
-                readout_drift = (new_cell - prev_readout_cell).abs().mean(
+                prev_cell = prev_readout_full.view(BS, NC, D_n)
+                readout_drift = (new_cell - prev_cell).abs().mean(
                     dim=-1, keepdim=True).to(h.dtype)
-                prev_readout_cell = new_cell.detach()
 
             # Advance prev_readout_full for next-token memory-head prediction.
             prev_readout_full = readout.detach()
 
         return (h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
-                prev_readout_cell, prev_readout_full, readout_drift, readouts)
+                prev_readout_full, readout_drift, readouts)
 
     # ================================================================
     # Main forward
     # ================================================================
 
-    def forward_segment(self, H_mid: Tensor, input_ids: Tensor, lm):
+    def forward_segment(self, H_mid: Tensor, input_ids: Tensor, lm,
+                        prev_token: Tensor | None = None):
         """Process T tokens through the memory graph.
 
         Args:
             H_mid: [BS, T, D] — lower-scan output (detached from LM graph)
             input_ids: [BS, T] — input tokens; used to compute the per-token
-                memory-head target-logit surprise signal, where the memory
-                head uses readout[t-1] to predict the token at position t.
-            lm: LM module — provides mem_head_target_logit and mem_head_logits
-                (weight-tied to the main lm_head).
+                memory-head CE surprise signal (logsumexp(logits) -
+                target_logit), where the memory head uses readout[t-1] to
+                predict the token at position t.
+            lm: LM module — provides mem_head_logits (weight-tied to the
+                main lm_head) for the segment-level mem_pred_loss.
+            prev_token: [BS] or None — the last token of the previous chunk,
+                used to decide if position 0 is a valid prediction target.
+                If None, position 0 is treated as valid.
 
         Returns:
             readouts:      [BS, T, D] — memory readout per token
@@ -703,10 +913,29 @@ class MemoryGraph(nn.Module):
         BS, T, _ = H_mid.shape
         if not self._initialized:
             self.initialize_states(BS, H_mid.device)
-        if not self._compiled and H_mid.is_cuda:
+        if not self._compiled and H_mid.is_cuda and not self._collecting_actions:
+            self._run_block_uncompiled = self._run_block
             self._run_block = torch.compile(
                 self._run_block, mode="default", fullgraph=False)
             self._compiled = True
+
+        # Valid mask for the TRAINING TARGET (mem_pred_loss only).
+        # Position t is a valid prediction target iff the "previous"
+        # token (input_ids[t-1] or prev_token for t=0) is not EOT.
+        # At a cross-document boundary the memory head would be
+        # predicting the first token of a new document from the previous
+        # document's context — there's no causal relationship, so
+        # supervising the memory head there is just noise.
+        # NOTE: this mask is NOT applied to the live surprise observation
+        # signal — that fires at every position, including EOT boundaries,
+        # because a surprise spike at a document start is a legitimate
+        # "context just changed, adapt now" signal for the modulator.
+        eot = self.config.eot_id
+        valid_mask = torch.ones(BS, T, device=H_mid.device, dtype=H_mid.dtype)
+        if T > 1:
+            valid_mask[:, 1:] = (input_ids[:, :-1] != eot).to(H_mid.dtype)
+        if prev_token is not None:
+            valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).to(H_mid.dtype)
 
         h = self.h
         msg = self.msg
@@ -715,8 +944,7 @@ class MemoryGraph(nn.Module):
         hebbian = self.hebbian
         s_mem_live = self.s_mem_live
         s_mem_ema_fast = self.s_mem_ema_fast
-        prev_readout_cell = self.prev_readout_cell
-        prev_readout_full = self.prev_readout  # full-D, for memory head at block start
+        prev_readout_full = self.prev_readout  # full-D; reshaped per-cell inside _run_block for drift
         readout_drift = self.readout_drift
         segment_start_prev_readout = prev_readout_full.detach().clone()
         H_mid = H_mid.to(h.dtype)
@@ -770,7 +998,7 @@ class MemoryGraph(nn.Module):
             block_args = (
                 h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
-                prev_readout_cell, prev_readout_full, readout_drift,
+                prev_readout_full, readout_drift,
                 block_H_mid, block_input_ids,
                 start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
@@ -778,15 +1006,20 @@ class MemoryGraph(nn.Module):
                 mod_w1, mod_b1, mod_w2, mod_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast)
+            # Use uncompiled path during action collection to avoid
+            # torch.compile recompilation from list-append side effects.
+            run_fn = (self._run_block_uncompiled
+                      if self._collecting_actions and hasattr(self, '_run_block_uncompiled')
+                      else self._run_block)
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
-                    self._run_block, *block_args, use_reentrant=False)
+                    run_fn, *block_args, use_reentrant=False)
             else:
-                result = self._run_block(*block_args)
+                result = run_fn(*block_args)
 
             (h, msg, W, decay, hebbian,
              s_mem_live, s_mem_ema_fast,
-             prev_readout_cell, prev_readout_full, readout_drift, block_out) = result
+             prev_readout_full, readout_drift, block_out) = result
 
             readouts[:, start_t:end_t] = block_out
 
@@ -799,32 +1032,35 @@ class MemoryGraph(nn.Module):
         self.s_mem_live = s_mem_live.detach()
         self.s_mem_ema_fast = s_mem_ema_fast.detach()
         self.prev_readout = prev_readout_full.detach()
-        self.prev_readout_cell = prev_readout_cell.detach()
         self.readout_drift = readout_drift.detach()
 
         # --- Segment-level mem_pred_loss, chunked for VRAM ---
         # Memory head uses readout[t-1] to predict token at position t.
-        # Chunk the time axis to avoid materializing [BS, T, V] all at once.
+        # Mask out positions where the previous token was EOT (cross-doc)
+        # so the memory head isn't trained on arbitrary transitions that
+        # the main LM loss also ignores.
         shifted_all = torch.cat([
             segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),  # [BS, 1, D]
             readouts[:, :-1],                                             # [BS, T-1, D]
         ], dim=1)  # [BS, T, D]
 
         loss_sum = torch.zeros((), device=H_mid.device, dtype=torch.float32)
-        count = 0
+        valid_total = torch.zeros((), device=H_mid.device, dtype=torch.float32)
         chunk = block_size  # reuse the same chunk size (8)
         for s in range(0, T, chunk):
             e = min(s + chunk, T)
             sub_readout = shifted_all[:, s:e]
             sub_target = input_ids[:, s:e]
+            sub_valid = valid_mask[:, s:e].float()                 # [BS, chunk]
             sub_logits = lm.mem_head_logits(sub_readout)  # [BS, chunk, V]
-            loss_sum = loss_sum + F.cross_entropy(
+            per_tok_loss = F.cross_entropy(
                 sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
                 sub_target.reshape(-1),
-                reduction="sum",
-            )
-            count += sub_target.numel()
-        mem_pred_loss = loss_sum / max(count, 1)
+                reduction="none",
+            ).reshape(sub_target.shape)                              # [BS, chunk]
+            loss_sum = loss_sum + (per_tok_loss * sub_valid).sum()
+            valid_total = valid_total + sub_valid.sum()
+        mem_pred_loss = loss_sum / valid_total.clamp(min=1.0)
 
         return readouts, mem_pred_loss
 
@@ -841,6 +1077,7 @@ class MemoryGraph(nn.Module):
         vqvae,
         tau: float = 1.0,
         sample: bool = True,
+        prev_token: Tensor | None = None,
     ) -> dict:
         """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
 
@@ -912,7 +1149,6 @@ class MemoryGraph(nn.Module):
         hebbian = self.hebbian.clone()
         s_mem_live = self.s_mem_live.clone()
         s_mem_ema_fast = self.s_mem_ema_fast.clone()
-        prev_readout_cell = self.prev_readout_cell.clone()
         prev_readout_full = self.prev_readout.clone()
         readout_drift = self.readout_drift.clone()
         hebbian_gamma = torch.sigmoid(self.hebbian_decay_logit).to(dt)
@@ -934,14 +1170,20 @@ class MemoryGraph(nn.Module):
             H_mid_t = H_mid[:, t]
             tok_t = input_ids[:, t]
 
-            # Live surprise (same as phase 1)
+            # Live surprise: proper CE (logsumexp - target_logit). Always
+            # fires as an OBSERVATION signal — the modulator needs to see
+            # spikes at cross-document boundaries so it can adapt. The
+            # training-target masking (phase-2 reward) is handled
+            # separately in _compute_per_token_reward.
             x = prev_readout_full
             if proj_down_w is not None:
                 x = F.linear(x, proj_down_w, proj_down_b)
             x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
-            target_emb = lm_head_w[tok_t]
-            target_logit = (x * target_emb).sum(dim=-1)
-            s_mem_live = (-target_logit).to(dt)
+            logits_full = F.linear(x, lm_head_w)
+            lse = torch.logsumexp(logits_full.float(), dim=-1)
+            target_logit = logits_full.gather(
+                1, tok_t.unsqueeze(1)).squeeze(1).float()
+            s_mem_live = (lse - target_logit).to(dt)
             s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
 
             # Modulate via VQ sampling every M tokens
@@ -981,16 +1223,17 @@ class MemoryGraph(nn.Module):
 
                 # Unpack delta_W, delta_decay_raw and apply the same convex-EMA
                 # updates as phase 1 (so the frozen-module determinism matches).
+                # F32 compute for (1-γ) precision — same fix as phase 1.
                 delta_W_raw = quantized[..., :N * N].reshape(BS, NC, N, N)
                 delta_decay_raw = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
 
                 delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
-                g_w = W_gamma.view(1, -1, 1, 1).to(W.dtype)
-                W = (1.0 - g_w) * W + g_w * delta_W
+                g_w_f32 = W_gamma.float().view(1, -1, 1, 1)
+                W = ((1.0 - g_w_f32) * W.float() + g_w_f32 * delta_W.float()).to(W.dtype)
 
-                target_decay = torch.sigmoid(delta_decay_raw).to(decay.dtype)
-                g_d = decay_gamma.view(1, -1, 1).to(decay.dtype)
-                decay = (1.0 - g_d) * decay + g_d * target_decay
+                target_decay_f32 = torch.sigmoid(delta_decay_raw.float())
+                g_d_f32 = decay_gamma.float().view(1, -1, 1)
+                decay = ((1.0 - g_d_f32) * decay.float() + g_d_f32 * target_decay_f32).to(decay.dtype)
                 gate = decay.unsqueeze(-1)
                 one_minus_gate = 1.0 - gate
 
@@ -1013,10 +1256,12 @@ class MemoryGraph(nn.Module):
             # Update Hebbian co-activation trace.
             hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
+            # prev_readout_full is still readout[t-1] at this point —
+            # view as per-cell to compute the drift before advancing it.
             new_cell = readout.reshape(BS, NC, D_n)
-            readout_drift = (new_cell - prev_readout_cell).abs().mean(
+            prev_cell = prev_readout_full.view(BS, NC, D_n)
+            readout_drift = (new_cell - prev_cell).abs().mean(
                 dim=-1, keepdim=True).to(dt)
-            prev_readout_cell = new_cell
             prev_readout_full = readout
             # W stays at ~unit per-row RMS via convex-EMA in _modulate_cells.
 
@@ -1029,7 +1274,6 @@ class MemoryGraph(nn.Module):
         self.hebbian = hebbian.detach()
         self.s_mem_live = s_mem_live
         self.s_mem_ema_fast = s_mem_ema_fast
-        self.prev_readout_cell = prev_readout_cell
         self.prev_readout = prev_readout_full
         self.readout_drift = readout_drift
 

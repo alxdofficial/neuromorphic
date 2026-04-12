@@ -146,7 +146,6 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
     decay = mg.decay.clone()
     hebbian = mg.hebbian.clone()
     prev_readout = mg.prev_readout.clone()
-    prev_readout_cell = mg.prev_readout_cell.clone()
     readout_drift = mg.readout_drift.clone()
     s_mem_live = mg.s_mem_live.clone()
     s_mem_ema_fast = mg.s_mem_ema_fast.clone()
@@ -175,18 +174,25 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
     mod_call_idx = 0
 
     amp = torch.autocast(device_type=device.type, dtype=dt)
+    # Thread prev_token across segments so cross-segment EOT resets match
+    # training (Model.forward_chunk line 67).
+    prev_seg_last_tok = None
 
     for seg_start in range(0, T_total, segment_T):
         seg_end = min(seg_start + segment_T, T_total)
         seg_ids = input_ids[:, seg_start:seg_end]
         seg_len = seg_ids.shape[1]
 
-        # Per-segment EOT reset mask for the LM scan
+        # Per-segment EOT reset mask for the LM scan, including the
+        # cross-segment boundary via prev_seg_last_tok.
         eos_positions = (seg_ids == mg.config.eot_id)
         reset_mask = torch.zeros_like(eos_positions)
         reset_mask[:, 1:] = eos_positions[:, :-1]
+        if prev_seg_last_tok is not None:
+            reset_mask[:, 0] = (prev_seg_last_tok == mg.config.eot_id)
         if not reset_mask.any():
             reset_mask = None
+        prev_seg_last_tok = seg_ids[:, -1]
 
         with amp:
             H_mid = lm.forward_scan_lower(seg_ids, reset_mask=reset_mask)
@@ -197,14 +203,17 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
             H_mid_t = H_mid[:, t]
             tok_t = seg_ids[:, t]
 
-            # --- Live memory-head surprise (same as forward_segment) ---
+            # --- Live memory-head surprise (same as forward_segment):
+            # proper CE = logsumexp(logits) - target_logit.
             x = prev_readout.to(dt)
             if proj_down_w is not None:
                 x = F.linear(x, proj_down_w.to(dt), proj_down_b.to(dt) if proj_down_b is not None else None)
             x = F.layer_norm(x, (x.shape[-1],), ln_final_w.to(dt), ln_final_b.to(dt))
-            target_emb = lm_head_w.to(dt)[tok_t]
-            target_logit = (x * target_emb).sum(dim=-1)
-            s_mem_live = (-target_logit).to(dt)
+            logits_full = F.linear(x, lm_head_w.to(dt))
+            lse = torch.logsumexp(logits_full.float(), dim=-1)
+            target_logit = logits_full.gather(
+                1, tok_t.unsqueeze(1)).squeeze(1).float()
+            s_mem_live = (lse - target_logit).to(dt)
             s_mem_ema_fast = (1 - gain_fast) * s_mem_ema_fast + gain_fast * s_mem_live
             if abs_t % tok_subsample == 0:
                 s_mem_per_tok.append(s_mem_live.float().cpu())
@@ -241,10 +250,12 @@ def run_diagnostic(model: Model, input_ids: torch.Tensor, device: torch.device):
 
             hebbian = mg._hebbian_update(hebbian, msg, hebbian_gamma)
 
+            # prev_readout is still readout[t-1] here — view as per-cell
+            # to compute drift, then advance it below.
             new_cell = readout.reshape(BS, NC, D_n)
-            readout_drift = (new_cell - prev_readout_cell).abs().mean(
+            prev_cell = prev_readout.view(BS, NC, D_n)
+            readout_drift = (new_cell - prev_cell).abs().mean(
                 dim=-1, keepdim=True).to(dt)
-            prev_readout_cell = new_cell
             prev_readout = readout
 
     return {
@@ -358,33 +369,55 @@ def plot_plasticity_stream(captures: dict, out_path: Path):
 def plot_hebbian_alignment(captures: dict, out_path: Path):
     """Cosine similarity between the Hebbian trace and W per cell, over tokens.
 
-    Tells you whether the modulator is actually using the "fire-together-
-    wire-together" signal it's given, or ignoring it.
+    Plots both full-matrix and off-diagonal-only variants. The full matrix
+    is dominated by diagonal/self-structure; the off-diagonal is the actual
+    pairwise co-activation signal.
     """
     W_after = captures["W_after"]      # [n_calls, BS, NC, N, N]
     hebbian = captures["hebbian"]      # [n_calls, BS, NC, N, N]
     mod_positions = captures["mod_positions"]
     NC = captures["NC"]
+    N = W_after.shape[-1]
 
-    W_flat = W_after.reshape(W_after.shape[0], W_after.shape[1], NC, -1)
-    H_flat = hebbian.reshape(hebbian.shape[0], hebbian.shape[1], NC, -1)
-    cos = F.cosine_similarity(W_flat, H_flat, dim=-1)          # [n_calls, BS, NC]
-    align = cos.mean(dim=1).T.numpy()                           # [NC, n_calls]
+    # Full-matrix cosine
+    W_flat = W_after.reshape(*W_after.shape[:3], -1)
+    H_flat = hebbian.reshape(*hebbian.shape[:3], -1)
+    cos_full = F.cosine_similarity(W_flat, H_flat, dim=-1)     # [n_calls, BS, NC]
+    align_full = cos_full.mean(dim=1).T.numpy()                # [NC, n_calls]
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    # Off-diagonal-only cosine
+    diag_mask = torch.eye(N, dtype=torch.bool).view(1, 1, 1, N, N)
+    W_off = W_after.masked_fill(diag_mask, 0.0)
+    H_off = hebbian.masked_fill(diag_mask, 0.0)
+    W_off_flat = W_off.reshape(*W_off.shape[:3], -1)
+    H_off_flat = H_off.reshape(*H_off.shape[:3], -1)
+    cos_off = F.cosine_similarity(W_off_flat, H_off_flat, dim=-1)
+    align_off = cos_off.mean(dim=1).T.numpy()
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
     cmap = plt.cm.viridis(np.linspace(0.05, 0.95, NC))
+
     for c in range(NC):
-        ax.plot(mod_positions, align[c], color=cmap[c],
-                label=f"cell {c}", lw=1.3, alpha=0.9)
-    ax.axhline(0, color="gray", lw=0.5, ls="--")
-    ax.set_xlabel("token position")
-    ax.set_ylabel("cosine(W, Hebbian)")
-    ax.set_title("Hebbian ↔ W alignment per cell  "
-                 "(does the modulator use the fire-together-wire-together signal?)")
-    ax.legend(ncol=NC, fontsize=8, loc="upper center",
-              bbox_to_anchor=(0.5, -0.12))
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(-1.05, 1.05)
+        axes[0].plot(mod_positions, align_full[c], color=cmap[c],
+                     label=f"cell {c}", lw=1.3, alpha=0.9)
+    axes[0].axhline(0, color="gray", lw=0.5, ls="--")
+    axes[0].set_ylabel("cos (full matrix)")
+    axes[0].set_title("Hebbian ↔ W alignment per cell  "
+                      "(full vs off-diagonal)")
+    axes[0].legend(ncol=NC, fontsize=8, loc="upper center",
+                   bbox_to_anchor=(0.5, 1.32))
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(-1.05, 1.05)
+
+    for c in range(NC):
+        axes[1].plot(mod_positions, align_off[c], color=cmap[c], lw=1.3,
+                     alpha=0.9)
+    axes[1].axhline(0, color="gray", lw=0.5, ls="--")
+    axes[1].set_xlabel("token position")
+    axes[1].set_ylabel("cos (off-diagonal only)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylim(-1.05, 1.05)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
@@ -481,6 +514,9 @@ def main():
     warm_ids = input_ids[:, :args.warmup]
     segment_T = config.T
     print("Warming up memory on real tokens...")
+    # Thread prev_token across chunk boundaries so cross-chunk EOT resets
+    # match training-time semantics (see Model.forward_chunk EOT handling).
+    prev_token = None
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16), \
          torch.no_grad():
         for start in range(0, args.warmup, segment_T):
@@ -488,7 +524,9 @@ def main():
             sub = warm_ids[:, start:end]
             if sub.shape[1] < 2:
                 continue
-            model.forward_chunk(sub, target_ids=sub, use_memory=True)
+            model.forward_chunk(sub, target_ids=sub, use_memory=True,
+                                prev_token=prev_token)
+            prev_token = sub[:, -1]
             model.detach_states()
 
     # ---- Diagnostic capture pass ----

@@ -22,14 +22,6 @@ class _StubLM(nn.Module):
             if config.D != config.D_embed else None)
         self.ln_final = nn.LayerNorm(config.D_embed).to(torch.bfloat16)
 
-    def mem_head_target_logit(self, readout, target):
-        x = readout.to(torch.bfloat16)
-        if self.proj_down is not None:
-            x = self.proj_down(x)
-        x = self.ln_final(x)
-        target_emb = self.lm_head.weight[target]
-        return (x * target_emb).sum(dim=-1)
-
     def mem_head_logits(self, readouts):
         x = readouts.to(torch.bfloat16)
         if self.proj_down is not None:

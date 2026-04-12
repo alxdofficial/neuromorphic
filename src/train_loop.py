@@ -45,6 +45,10 @@ def parse_args():
     p.add_argument("--start-cycle", type=int, default=0,
                    help="Resume at this cycle index")
     p.add_argument("--codebook-epochs", type=int, default=20)
+    p.add_argument("--merge-interval", type=int, default=200,
+                   help="Phase 1 batch-dim merge cadence (steps).")
+    p.add_argument("--phase2-merge-interval", type=int, default=50,
+                   help="Phase 2 batch-dim merge cadence (GRPO steps).")
     return p.parse_args()
 
 
@@ -79,6 +83,17 @@ def main():
     # target = start_step + steps_to_run.
     cumulative_step = 0
 
+    # LR schedule target: the cosine decays from warmup over this many
+    # OPTIMIZER steps (not wall-clock steps). Action collection runs in
+    # --no-train mode and doesn't count as optimizer updates. Computed
+    # once so the schedule is the same across all phase 1 calls.
+    phase1_main_steps_per_cycle = tokens_to_steps(
+        args.phase1_tokens_per_cycle - args.action_collection_tokens, args.bs)
+    bootstrap_steps = tokens_to_steps(args.bootstrap_tokens, args.bs)
+    lr_target_step = bootstrap_steps + args.cycles * phase1_main_steps_per_cycle
+    print(f"LR schedule target (total optimizer steps across all phase-1 "
+          f"calls): {lr_target_step:,}")
+
     # ---- Bootstrap ----
     if not args.skip_bootstrap and not os.path.exists(bootstrap_ckpt):
         print(f"\n=========== BOOTSTRAP ({args.bootstrap_tokens:,} tokens) ===========")
@@ -88,8 +103,10 @@ def main():
             python, "-m", "src.train",
             "--bs", str(args.bs),
             "--steps", str(steps),
+            "--lr-target-step", str(lr_target_step),
             "--save-dir", args.work_dir,
             "--save-interval", str(steps),
+            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(args.work_dir, before=before)
         if latest is not None:
@@ -148,10 +165,12 @@ def main():
             python, "-m", "src.train",
             "--bs", str(args.bs),
             "--steps", str(target_step_main),
+            "--lr-target-step", str(lr_target_step),
             "--save-dir", cycle_dir,
             "--save-interval", str(target_step_main),
             "--resume", current_ckpt,
             "--freeze-modulator",
+            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:
@@ -169,16 +188,25 @@ def main():
         print(f"\n--- Cycle {cycle} action collection ({ac_steps} new steps, "
               f"target {target_step_ac}) ---")
         before = set(glob.glob(os.path.join(cycle_dir, "ckpt_*.pt")))
+        # Pure inference during action collection: --no-train disables
+        # backward / optimizer step, so the LM stays stationary while we
+        # record modulator actions. Previously the LM was still training
+        # during this phase, which meant the codebook was fit on actions
+        # from a moving target.
         run([
             python, "-m", "src.train",
             "--bs", str(args.bs),
             "--steps", str(target_step_ac),
+            "--lr-target-step", str(lr_target_step),
             "--save-dir", cycle_dir,
             "--save-interval", str(target_step_ac),
             "--resume", phase1_main_ckpt,
             "--freeze-modulator",
             "--collect-actions",
+            "--no-train",
+            "--eval-interval", "0",   # no eval during collection — it'd just be noise
             "--action-db-out", action_db,
+            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:
@@ -201,6 +229,12 @@ def main():
         # Phase 2 curriculum
         phase2_ckpt = os.path.join(cycle_dir, "phase2.pt")
         print(f"\n--- Cycle {cycle} phase 2 ---")
+        # Per-cycle phase 2 seed so each cycle reads a different shard prefix.
+        # Combined with per-stage seed offset inside train_phase2, every
+        # (cycle, stage) pair gets a unique stream starting position.
+        # NOTE: train.py phase 1 deliberately keeps a stable seed across
+        # cycles so the dataloader resume/offset mechanism stays coherent.
+        phase2_seed = 42 + cycle * 100_000
         run([
             python, "-m", "src.train_phase2",
             "--checkpoint", phase1_end_ckpt,
@@ -208,6 +242,8 @@ def main():
             "--out", phase2_ckpt,
             "--bs", str(args.phase2_bs),
             "--group-size", str(args.phase2_group_size),
+            "--merge-interval", str(args.phase2_merge_interval),
+            "--seed", str(phase2_seed),
         ])
 
         current_ckpt = phase2_ckpt

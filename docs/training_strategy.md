@@ -14,7 +14,7 @@ credit but is slow, memory-intensive, and overkill for the dynamics MLPs.
 
 We resolve it with a **bootstrap + iterative cycle** structure:
 
-- **Bootstrap (one-time, ~200M tokens)**: standard phase 1 TBPTT with all params
+- **Bootstrap (one-time, ~500M tokens default)**: standard phase 1 TBPTT with all params
   trainable, including the modulator. This gives the modulator a long stable
   warmup under the natural `ce_loss + mem_pred_loss` objective before any
   GRPO machinery comes online. The dynamics co-adapt to the modulator and the
@@ -22,18 +22,26 @@ We resolve it with a **bootstrap + iterative cycle** structure:
   at the very start, before any codebook fit.
 
 - **Iterative cycles (repeat indefinitely)**:
-  - **Phase 1 (~50M tokens, modulator frozen)**: TBPTT trains everything *except*
-    the modulator. The modulator's weights are frozen (`requires_grad=False`)
-    so its long-horizon policy from the previous cycle's phase 2 is preserved
-    exactly. The dynamics MLPs, scan, lm_head co-adapt to whatever the modulator
-    is currently doing.
-  - **Codebook refresh**: collect modulator action snapshots during last steps
-    of phase 1, fit a fresh Residual VQ-VAE (RVQ) on them.
-  - **Phase 2 (~50M tokens, everything frozen except modulator)**: GRPO over
+  - **Phase 1 main (~8M tokens, modulator frozen)**: TBPTT trains everything
+    *except* the modulator. The modulator's weights are frozen
+    (`requires_grad=False`) so its long-horizon policy from the previous cycle's
+    phase 2 is preserved exactly. The dynamics MLPs, scan, lm_head co-adapt to
+    whatever the modulator is currently doing.
+  - **Action collection (~2M tokens, `--no-train`)**: pure-forward pass with
+    `collect_actions=True` to snapshot modulator outputs at every modulation
+    event. No gradients, no optimizer step, so the LM stays stationary
+    (non-moving-target) while the action database is built.
+  - **Codebook refresh**: fit a fresh Residual VQ-VAE (RVQ) on the collected
+    actions. Default: **1 level × 256 codes** (flat 256-way codebook; RVQ with
+    more levels can be requested via CLI but isn't the current default).
+  - **Phase 2 (~40M tokens, everything frozen except modulator)**: GRPO over
     discretized action space, with a curriculum-stepped reward window
-    (512 → 2048 → 4096). Discrete categorical log-pi sidesteps the variance hell
-    of high-dim continuous PG; long-horizon reward gives the modulator the
-    credit signal TBPTT structurally cannot provide.
+    (512 → 1024 → 2048 → 4096). Discrete categorical log-π sidesteps the
+    variance hell of high-dim continuous PG; long-horizon reward gives the
+    modulator the credit signal TBPTT structurally cannot provide.
+
+  **Per-cycle total: ~50M tokens** (8M phase 1 main + 2M action collection
+  + 40M phase 2 curriculum).
 
 The iterative loop is the answer to "the codebook is a snapshot that bounds
 phase 2's expressivity." By rebuilding the codebook every cycle, the modulator's
@@ -71,15 +79,17 @@ the whole strategy. We need data, not vibes. Logged at every `log_interval` step
 
 | Metric | Why |
 |---|---|
-| `ce_loss`, `mem_pred_loss`, `total_loss` | Standard training curves |
-| `mem_pred_loss / ce_loss` | Ratio — is memory contributing meaningfully? |
-| `lm_grad_norm`, `mem_grad_norm` | Already logged |
-| `mod_grad_norm` (per-cell mean) | When this drops < 0.5 of its peak, modulator is no longer learning much from TBPTT |
-| `mod_action_norm` (per-cell mean of \|delta_W\| and \|delta_decay\|) | Does the modulator's output magnitude stabilize? |
-| `mod_action_var` (per-cell variance of action across batch) | Is the modulator producing diverse actions or collapsing? |
-| `W_norm`, `W_sparsity`, `W_max` (already in smoke_test) | W health |
-| `s_mem_live` mean & ema | Modulator's input signal strength |
-| `decay_logit` mean | Persistence regime the modulator has settled on |
+| `loss` (main LM CE), `aux_loss` (mem_pred), `aux_ce_ratio` | Training curves + does memory carry meaningful signal? |
+| `lm_grad_norm`, `dyn_grad_norm`, `mod_clip_norm` | Per-pool grad norms after the sqrt-param-count-scaled clip |
+| `mod_grad_norm` (per-cell mean) | When this drops below ~0.5× its peak, modulator learning is plateauing under TBPTT |
+| `mod_action_norm`, `mod_action_var` | Does the modulator's raw output magnitude stabilize and stay diverse? |
+| `applied_dW_norm`, `applied_dDecay_norm` | Per-step magnitude of the *applied* plasticity after the convex-EMA — the actual effect on W/decay |
+| `W_offdiag_norm`, `W_offdiag_max`, `W_hebbian_offdiag_cos` | Off-diagonal W structure + W↔Hebbian alignment (full-matrix W_norm is pinned by bounded-W and no longer informative) |
+| `h_norm`, `h_max`, `msg_norm`, `msg_max` | State magnitudes — watch for tanh saturation at large values |
+| `decay_mean`, `decay_std` | Persistence regime the modulator has settled on |
+| `s_mem_live`, `s_mem_ema_fast` | Modulator's input surprise signal |
+| `mem_scale_abs_mean`, `mem_scale_abs_max`, `mem_scale_abs_min` | Learnable scale on the memory readout — watch for collapse toward 0 or blow-up |
+| `merge_W_relative_div`, `merge_hebbian_relative_div` | How much the BS lanes drift apart between batch-dim merges |
 
 Optional but worth having:
 - A periodic dump of the action distribution (histogram of `delta_W` magnitudes
@@ -87,10 +97,13 @@ Optional but worth having:
 
 ### Phase 1 duration
 
-- **Bootstrap phase 1**: ~200M tokens (one-time). All params trainable
-  including modulator. This is the warmup before iterative cycles begin.
-- **Cycle phase 1**: ~50M tokens per cycle. Modulator frozen. Dynamics
-  re-adapt to whatever the previous cycle's GRPO modulator looks like.
+- **Bootstrap phase 1**: ~500M tokens (one-time, default in `train_loop.py`).
+  All params trainable including modulator. This is the warmup before
+  iterative cycles begin.
+- **Cycle phase 1**: ~10M tokens per cycle total, split as ~8M main training
+  (modulator frozen) + ~2M action collection (`--no-train`, no weight updates).
+  Dynamics re-adapt to whatever the previous cycle's GRPO modulator looks
+  like.
 
 Both use a fixed token budget; the telemetry is for monitoring health, not for
 plateau-triggered switching. When the budget is exhausted, phase 1 ends.
@@ -134,7 +147,13 @@ unless cell-specific patterns are obvious.
 
 **Architecture**:
 - Encoder: 2-layer MLP, 512 hidden, action_dim → 32-dim latent
-- Quantizer: Residual VQ with **4 levels of 16 codes** (effective vocab = 16⁴ = 65,536)
+- Quantizer: Residual VQ. **Current default: 1 level × 256 codes**
+  (flat 256-way categorical — validated to avoid codebook collapse that
+  we saw with 4×16 and other high-vocab configurations). The
+  `--num-levels` and `--codes-per-level` CLI flags on
+  `scripts/train_codebook.py` let you override this; anything with >1 level
+  behaves as true residual quantization with effective vocab of
+  `codes_per_level ** num_levels`.
 - Decoder: 2-layer MLP, 512 hidden, 32-dim latent → action_dim
 - Code dim: 32 (Yu et al. ViT-VQGAN principle — low code dim avoids degenerate
   nearest-neighbor in high dim)
@@ -195,20 +214,29 @@ continuous output is **encoded → quantized → decoded** through the frozen
 RVQ-VAE before being applied to memory state:
 
 ```python
-raw_action = modulator(state)              # continuous, as in phase 1
-z = vq.encoder(raw_action)                 # [latent_dim=32]
-codes = vq.quantize(z)                     # tuple of 4 ints in [0, 16)
-z_q = vq.codes_to_latent(codes)            # quantized latent
-quantized_action = vq.decoder(z_q)         # back to action_dim
-delta_W, delta_decay = unpack(quantized_action)
-W += delta_W; decay_logit += delta_decay
+raw_action = modulator(state)               # continuous, as in phase 1
+z = vq.encoder(vq.normalize(raw_action))    # [latent_dim=32]
+codes = vq.rvq.sample_codes(z, tau, sample) # [num_levels] (default 1 level × 256 codes)
+z_q = sum(vq.rvq.codebooks[l, codes[l]] for l in levels)
+quantized_action = vq.denormalize(vq.decoder(z_q))
+delta_W_raw, delta_decay_raw = unpack(quantized_action)
+
+# Apply via the SAME bounded convex EMAs as phase 1 (not additive):
+delta_W = rms_norm(delta_W_raw, normalized_shape=(N,))     # unit row RMS
+W_new     = (1 - γ_W) * W     + γ_W * delta_W               # γ_W   = sigmoid(W_decay_logit)
+decay_new = (1 - γ_d) * decay + γ_d * sigmoid(delta_decay_raw)  # γ_d = sigmoid(decay_gamma_logit)
 ```
 
+Note: `W` is runtime state bounded to ~unit row RMS by the convex EMA;
+`decay` is runtime state in `[0,1]`. Neither is a raw accumulator. The
+per-cell learnable rates `γ_W`, `γ_d`, `γ_hebbian` are sigmoid'd from
+logit parameters so they always live in `(0, 1)` without clamping.
+
 **The policy** is `π(codes | state) = ∏_l π_l(c_l | state, c_<l)` where each
-`π_l` is a 16-way categorical induced by:
+`π_l` is a `codes_per_level`-way categorical induced by:
 
 ```python
-logits_l = -‖z - codebook_l[i]‖² / τ  for i in 0..15
+logits_l = -‖z - codebook_l[i]‖² / τ  for i in 0..codes_per_level
 ```
 
 (Distance-based logits with temperature τ. Sampling from this distribution is
@@ -231,19 +259,39 @@ For each training batch:
 
 1. **Sample K trajectories** with the same input tokens (same `H_mid` from
    phase-1-frozen scan layers, but different sampled codes per modulator call).
-   K = 32 (group size). Run the trajectories in `no_grad`.
-2. **Per modulator call site**, record `(state_t, codes_t)`. Across K trajectories
-   × T/M modulator calls, this is ~8K records per batch.
+   **K=8** (default, set via `--phase2-group-size` in `train_loop.py`; increase
+   if rollout variance is too high). All K trajectories are run as a **single
+   batch-expanded forward** (memory state replicated to K×BS) in `no_grad`.
+2. **Per modulator call site**, record `(mod_input_t, codes_t)`. Across K
+   trajectories × T/M modulator calls, this is ~8K records per batch.
 3. **Compute rewards per action**. For an action at token t, reward is:
    ```
-   r_t = -mean(mem_pred_loss[t : t + W])
+   r_t = -mean(reward_signal[t+1 : t+1+W])
    ```
-   where W is the curriculum-controlled reward window (256 → 512 → 1024 → 2048).
-   Note: `mem_pred_loss` is computed in `no_grad` with the frozen `lm_head` and
-   `proj_down`, so it's a stable yardstick.
-4. **Group baseline**: for each action position t, compute the mean reward over
-   the K trajectories: `b_t = mean(r_t over K)`. Advantage: `A_t = r_t - b_t`.
-5. **Advantage normalization**: per-batch `A_t = (A_t - mean(A_t)) / (std(A_t) + 1e-8)`.
+   where W is the curriculum-controlled reward window
+   (512 → 1024 → 2048 → 4096). Two reward signals are available via
+   `--reward-mode`:
+   - **`lm_ce`** (default): runs the frozen upper scan + LM head on
+     `H_enriched = H_mid + mem_scale * readouts` and uses per-token LM CE.
+     This is the principled target — the actual thing the LM cares about.
+     Costs roughly 2× per rollout.
+   - **`mem_pred`**: uses the memory head (weight-tied) directly on
+     `readouts`. Cheaper but a proxy.
+
+   Only calls whose **full window fits inside the rollout sequence**
+   contribute; truncated-window calls are zeroed (biases the reward toward
+   early positions otherwise). The trainer chooses rollout `seq_length = 2*W`
+   per stage so roughly half the calls get complete windows.
+4. **Group baseline**: for each action position t, compute the mean reward
+   over the K trajectories: `b_t = mean(r_t over K)`. Advantage: `A_t = r_t - b_t`.
+5. **Advantage normalization**: per-batch `A_t /= (std(A) + 1e-8)`. The
+   K-baseline already centers per-action so only std normalization is
+   applied.
+6. **Carry one trajectory forward**. After reward computation, one of the K
+   rollout end-states is picked **uniformly at random** (not best-of-K — that
+   would introduce optimism bias in the state distribution) and becomes the
+   memory state seen by the next batch. This keeps the expected next-batch
+   starting state unbiased relative to the deployed policy.
 
 ### GRPO gradient pass
 
@@ -280,11 +328,12 @@ of (W, token_budget) stages. Each stage trains for its budget then advances:
 | 3 | 2048 | 10M | Mid-long |
 | 4 | 4096 | 10M | Stress test for the longest credit horizon |
 
-Total phase 2 per cycle: **40M tokens**. Total cycle: **50M tokens** (10M phase
-1 + 40M phase 2 — assumes the bootstrap was generous enough that each cycle
-needs only minimal phase-1 dynamics re-adaptation). The curriculum is
-automatic, not operator-advanced — each stage runs to its budget then the
-next stage starts.
+Total phase 2 per cycle: **40M tokens**. Total cycle: **~50M tokens**
+(8M phase-1 main + 2M action collection + 40M phase 2). The bootstrap
+is generous enough that each cycle's phase 1 only does minimal dynamics
+re-adaptation under the current GRPO-trained modulator. The curriculum
+is automatic, not operator-advanced — each stage runs to its budget then
+the next stage starts.
 
 The user can monitor and abort if a stage diverges (eval `mem_pred_loss` rises
 significantly above start-of-stage baseline), but the default is to let the
@@ -292,28 +341,41 @@ curriculum run.
 
 ### Phase-2 segment length
 
-Phase 2 rollouts use **segment length T = current curriculum window W**. Phase 1's
-constraint of T=128 came from TBPTT activation memory, which doesn't apply here
-because rollouts are `no_grad`. At W=4096, each rollout processes 4096 tokens of
-memory dynamics with no gradient activations stored.
+Phase 2 rollouts use **segment length T = 2 × current curriculum window W**
+(set by `train_loader_factory` in `train_phase2.py`). The 2× ratio ensures
+roughly half the modulation calls get complete reward windows before the
+sequence ends — otherwise the reward signal would bias heavily toward
+early-sequence actions via the completeness mask in `_windowed_reward`.
+Phase 1's constraint of T=128 came from TBPTT activation memory, which
+doesn't apply here because rollouts are `no_grad`.
 
 ### Eval cadence
 
-Every 100 GRPO updates:
+Every 50 GRPO updates (default `--eval-interval 50`):
 
-- Run a full eval pass with deterministic modulator (no sampling, argmax codes).
-- Compute `ce_loss`, `mem_pred_loss` over a fixed eval set.
-- Compare to phase-1 baseline. If `mem_pred_loss` is meaningfully better → phase 2
-  is helping. If it's worse → something is wrong, hard stop.
+- Run a full eval pass on a held-out shard (`phase="A-val"`) with the
+  **continuous** modulator head — measures the objective the dynamics
+  co-adapted to.
+- Separately run `evaluate_quantized()`, which uses the **VQ-argmax
+  (deterministic quantized)** policy — this is the actual policy GRPO is
+  trying to optimize. Divergence between continuous and quantized eval
+  indicates proxy drift through the VQ bottleneck.
+- Both passes use `--eval-warmup-batches` forward-only batches first, to
+  warm the memory state before scoring steady-state performance.
+- Metrics logged: `eval_ce_loss`, `eval_mem_pred_loss`, `eval_ppl`,
+  `quant_eval_ce`. Compare to phase-1 baseline; consistent regression is
+  the signal to inspect the run.
 
 ### Phase-2 stopping criteria (per cycle)
 
-Phase 2 within a cycle ends when:
-- All 3 curriculum stages have completed their token budgets, **OR**
-- Eval `mem_pred_loss` has risen >10% above start-of-cycle baseline (early abort).
+Phase 2 within a cycle ends when all 4 curriculum stages have completed their
+token budgets. **No automated early-abort is currently implemented** — the
+operator is expected to monitor `eval_ce_loss` and `quant_eval_ce` in the
+metrics stream and kill the run manually if it regresses. (Automated
+threshold-based abort is a future-work item.)
 
-When phase 2 ends, control returns to the outer loop, which starts the next cycle's
-phase 1 with the post-GRPO modulator weights as the starting point.
+When phase 2 ends, control returns to the outer loop, which starts the next
+cycle's phase 1 with the post-GRPO modulator weights as the starting point.
 
 ## Bootstrap + iterative cycle loop
 
@@ -339,20 +401,19 @@ for cycle in 0..N_CYCLES:
     actions = collect_actions(model, tokens=2M)
 
     # Codebook refresh — fit fresh RVQ-VAE on current actions
-    codebook = train_codebook(actions, levels=4, codes_per_level=16)
+    # Default: 1 level × 256 codes (flat categorical), overridable via CLI.
+    codebook = train_codebook(actions, num_levels=1, codes_per_level=256)
 
     # Phase 2 — freeze everything but modulator, GRPO over codes
     for (W, budget) in [(512, 10M), (1024, 10M), (2048, 10M), (4096, 10M)]:
-        run_phase_2(model, codebook, reward_window=W, tokens=budget)
+        run_phase_2(model, codebook, reward_window=W, tokens=budget,
+                    reward_mode="lm_ce", group_size=8)
 
     save_checkpoint(f"cycle_{cycle}.pt")
 ```
 
-A single cycle is ~50M tokens. At phase-1 throughput of ~50K tok/s and phase-2
-throughput of ~10-20K tok/s effective (depending on K and W), one cycle takes
-roughly **45 min – 1.5 hr** of wall-clock on a 4090. 10 cycles = 8-15 hours.
-
-Bootstrap is a separate ~2.6 hours (~500M tokens at 52K tok/s).
+A single cycle is ~50M tokens. Wall-clock depends on K, W and hardware;
+benchmark on the target GPU before planning runs.
 
 ### What persists across cycles, what doesn't
 
@@ -361,11 +422,31 @@ Bootstrap is a separate ~2.6 hours (~500M tokens at 52K tok/s).
 | LM scan, lm_head, embedding | Yes | Yes | Yes | No (frozen) |
 | State/msg/inject MLPs, neuron_id | Yes | Yes | Yes | No (frozen) |
 | **Modulator weights** | **Yes** | **Yes** | **No (frozen)** | **Yes (GRPO)** |
-| Memory runtime state (h, msg, W, decay_logit) | Yes (lifelong) | Updated | Updated | Updated |
+| Memory runtime state (h, msg, W, decay, hebbian) | Yes (lifelong) | Updated | Updated | Updated |
 | Codebook | **No** — refit per cycle | n/a | n/a | Used (frozen) |
 | Phase-2 categorical head state | **No** — distance-based logits stateless | n/a | n/a | n/a |
-| GRPO optimizer state | **No** — fresh per cycle's phase 2 | n/a | n/a | Yes |
-| Phase-1 optimizer state | Yes — reused across cycles | Yes | Yes | n/a |
+| GRPO optimizer state | **No** — fresh AdamW per cycle's phase 2 | n/a | n/a | Yes |
+| Phase-1 optimizer + LR scheduler + dataloader offset | Yes — passed through the phase 2 checkpoint | Yes | Yes | n/a (phase 2 has its own AdamW) |
+
+### One logical memory graph + periodic merging
+
+The memory runtime state (`W`, `decay`, `hebbian`) has a leading batch
+dimension purely as a parallel-training artifact. Conceptually there is
+**one shared memory graph**, and we maintain that invariant by periodic
+`collapse_batch_dim()` calls:
+
+- **Phase 1 / bootstrap**: `Trainer.merge_interval` steps apart (default 200).
+- **Phase 2**: `Phase2Trainer.merge_interval` GRPO steps apart (default 50).
+- **Phase boundaries**: `collapse_batch_dim() + broadcast_to_bs(new_bs)` to
+  reshape the consensus state across BS changes (e.g. phase 1 BS=96 →
+  phase 2 BS=8 → next cycle phase 1 BS=96).
+
+The phase 2 checkpoint saves the **current (post-GRPO) memory state**,
+collapsed to consensus, not the pre-phase-2 snapshot. The next cycle's
+phase 1 resume calls collapse+broadcast automatically if it detects a BS
+mismatch between the loaded runtime state and its own target BS. Transient
+state (`h`, `msg`, LM scan carries) is dropped on phase boundaries and
+repopulated via `--warmup-batches` forward-only passes.
 
 ### Critical: modulator is frozen in phase 1 after bootstrap
 
@@ -383,7 +464,7 @@ previous cycle's phase 2 work — pulling the modulator back toward short-term
 optima that GRPO had moved it away from.
 
 **Mitigation**:
-- **During bootstrap** (~200M tokens, before any cycle): modulator trains
+- **During bootstrap** (~500M tokens, before any cycle): modulator trains
   normally. This warms it up to baseline competence so that the first codebook
   fit has a non-degenerate action distribution to learn from.
 - **During every iterative cycle's phase 1**: modulator is **frozen**
@@ -428,53 +509,62 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 
 ## Hyperparameter summary
 
-### Phase 1 (current; minor additions)
+### Phase 1
 | Knob | Value | Notes |
 |---|---|---|
-| `tbptt_block` | 8 | unchanged |
-| `T` (segment length) | 128 | unchanged |
-| `BS` | 96 | unchanged |
-| `lr` | 3e-4 | unchanged |
-| `mem_lr_scale` | 0.3 | unchanged |
-| `mem_pred_weight` | 0.1 | unchanged |
-| logging | + 4 new metrics (mod_grad_norm, mod_action_norm, mod_action_var, action histogram dump) | new |
+| `tbptt_block` | 8 | |
+| `T` (segment length) | 128 | |
+| `BS` | 96 | `train_loop.py` default |
+| `lr` | 3e-4 | |
+| `mem_lr_scale` | 1.0 | `config.Config` default (was 0.3 pre-W-bounding fix) |
+| `mem_pred_weight` | 0.1 | |
+| `merge_interval` | 200 | Periodic `collapse_batch_dim` cadence — one-logical-graph invariant |
+| logging | mod_grad_norm, mod_action_norm, mod_action_var, mod_stats, memory health | implemented |
 
 ### Codebook fit
 | Knob | Value | Notes |
 |---|---|---|
-| Action database size | ~100K subsampled actions | from last 2000 phase-1 steps |
-| RVQ levels | 4 | residual quantization |
-| Codes per level | 16 | small per-level codebook |
-| Effective vocabulary | 65,536 | 16⁴ |
+| Action database size | ~2M tokens worth of actions | from `--no-train` action-collection sub-phase |
+| RVQ levels | **1** (default) | flat categorical; > 1 enables residual quantization |
+| Codes per level | **256** (default) | |
+| Effective vocabulary | **256** (default) | `codes_per_level ** num_levels` |
 | Latent dim | 32 | low to avoid degenerate NN |
 | Encoder/decoder hidden | 512 | 2-layer MLP each |
 | Commitment β | 0.25 | Oord 2017 default |
 | EMA decay | 0.99 | standard |
-| Dead-code resample | < 1% usage over 100 steps | VQ-BeT recipe |
-| Training epochs | 10-20 | until reconstruction loss plateaus |
+| Dead-code resample | < 1% usage over window | |
+| Noise augmentation | yes | added to prevent codebook collapse (see recent fixes) |
+| Entropy bonus | yes | encourages diverse code usage |
+| Training epochs | 20 | `--epochs` default |
+| `lr` | 3e-4 | AdamW |
 
 ### Phase 2 (per cycle)
 | Knob | Value | Notes |
 |---|---|---|
 | Frozen | everything except mod_w1/b1/w2/b2 | |
 | `lr` | 1e-4 | lower than phase 1 — fine-tune |
-| GRPO group size K | 8 | start small; scale up if variance too high |
+| GRPO group size K | **8** (default) | `--phase2-group-size`; rollout is single K×BS batched forward |
 | Curriculum (W, budget) | (512, 10M), (1024, 10M), (2048, 10M), (4096, 10M) | automatic |
-| Segment length T | = max curriculum W (4096) | rollouts in no_grad |
-| Logits temperature τ | 1.0 | tunable, may need lower if exploration too noisy |
-| Advantage normalization | yes | per-batch mean/std |
-| Eval cadence | every 50 GRPO updates | |
+| Segment length T per stage | `2 × reward_window` | ensures ~half the modulation calls get complete reward windows |
+| Reward mode | **`lm_ce`** (default) | frozen upper scan + LM head; `mem_pred` available as cheap proxy |
+| Logits temperature τ | 1.0 | tunable |
+| Entropy coeff | 0.01 | GRPO + entropy bonus for code diversity |
+| Advantage normalization | per-batch std (centered by K-baseline) | |
+| Eval cadence | every 50 GRPO updates | continuous + VQ-argmax quantized eval both |
+| `merge_interval` | 50 | phase-2 specific `collapse_batch_dim` cadence |
+| Warmup batches | 8 | `--warmup-batches` forward-only to warm memory state before GRPO |
 
 ### Bootstrap + iterative loop
 | Knob | Value | Notes |
 |---|---|---|
-| Bootstrap tokens (one-time) | 500M | normal phase 1, modulator trains |
-| Phase 1 tokens / cycle | 10M | modulator FROZEN; short because bootstrap was big |
+| Bootstrap tokens (one-time) | 500M | `--bootstrap-tokens` default; normal phase 1, modulator trains |
+| Phase 1 main tokens / cycle | ~8M | `phase1_tokens_per_cycle - action_collection_tokens`; modulator FROZEN |
+| Action collection tokens | 2M | `--action-collection-tokens` default; runs with `--no-train` |
 | Phase 2 tokens / cycle | 40M | sum of 4 curriculum stage budgets |
-| Action collection tokens | ~2M | last steps of phase 1 |
+| Phase 1 tokens / cycle (total) | 10M | `--phase1-tokens-per-cycle` — main + collection |
 | Total tokens / cycle | ~50M | excluding bootstrap |
 | Modulator trains during | Bootstrap (TBPTT) + every phase 2 (GRPO) | never via TBPTT after bootstrap |
-| N cycles | open | run until plateau or budget exhausted |
+| N cycles | `--cycles` (default 5) | run until plateau or budget exhausted |
 
 ---
 

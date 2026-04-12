@@ -61,12 +61,21 @@ class Phase2Trainer:
         log_interval: int = 10,
         eval_interval: int = 100,
         eval_loader_factory=None,
-        eval_batches: int = 4,
+        eval_batches: int = 8,
+        eval_warmup_batches: int = 4,
         metrics_path: str | None = None,
+        train_loader_factory=None,
+        reward_mode: str = "lm_ce",
+        merge_interval: int = 0,
     ):
         self.model = model
         self.vqvae = vqvae
+        # Default (legacy): a single dataloader for all stages.
+        # New: train_loader_factory(reward_window) makes a dataloader per
+        # stage. The factory decides the actual seq_length (typically
+        # 2 * reward_window so most actions get complete reward windows).
         self.dataloader = dataloader
+        self.train_loader_factory = train_loader_factory
         self.config = config
         self.device = device
         self.group_size = group_size
@@ -77,6 +86,18 @@ class Phase2Trainer:
         self.eval_interval = eval_interval
         self.eval_loader_factory = eval_loader_factory
         self.eval_batches = eval_batches
+        self.eval_warmup_batches = eval_warmup_batches
+        assert reward_mode in ("mem_pred", "lm_ce"), \
+            f"reward_mode must be 'mem_pred' or 'lm_ce', got {reward_mode}"
+        self.reward_mode = reward_mode
+        # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
+        # across BS lanes between GRPO steps. Same invariant as phase 1's
+        # merge_interval — there is one logical memory graph and the BS
+        # dimension is just a parallelism artifact. Without merging here,
+        # phase 2's BS lanes drift independently for the entire run and the
+        # end-state is no longer a consensus to hand back to phase 1.
+        # 0 disables; positive N merges every N GRPO steps.
+        self.merge_interval = merge_interval
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -110,15 +131,17 @@ class Phase2Trainer:
             f.write(json.dumps(metrics) + "\n")
 
     @torch.no_grad()
-    def evaluate(self, eval_loader, n_batches: int = 4) -> dict:
+    def evaluate(self, eval_loader, n_batches: int = 8,
+                 warmup_batches: int = 0) -> dict:
         """Held-out eval pass using the CONTINUOUS modulator path.
 
-        Phase 2 trains the modulator via GRPO over discretized VQ actions, but
-        the gradient updates the underlying continuous head. Evaluating with
-        the continuous path (via Model.forward_chunk, which does not use VQ)
-        gives us a stable measurement of the "mean" policy that GRPO is pushing
-        toward. Sampling from the VQ codebook during eval would add noise to
-        the signal we're trying to read.
+        Evaluates the underlying continuous head (forward_chunk). Complements
+        evaluate_quantized() below which uses the actual VQ-argmax policy
+        that phase 2 GRPO is optimizing. Reporting both lets us detect
+        divergence between the continuous head and the deployed discrete
+        policy (proxy drift).
+
+        warmup_batches: batches to warm memory state before scoring.
 
         Uses a fresh memory state (snapshot + restore around the call) so eval
         is independent of the current phase-2 rollout memory carry.
@@ -135,6 +158,14 @@ class Phase2Trainer:
         train_initialized = model._initialized
         was_training = model.training
 
+        # Pause action collection during eval (phase 2 shouldn't have it set,
+        # but be safe to prevent eval actions from polluting any buffer).
+        was_collecting = memory._collecting_actions
+        saved_action_buffer = memory._action_buffer
+        if was_collecting:
+            memory._collecting_actions = False
+            memory._action_buffer = []
+
         memory._initialized = False
         model._initialized = False
         model.lm._carries = [None] * self.config.L_total
@@ -144,9 +175,10 @@ class Phase2Trainer:
         total_aux = 0.0
         count = 0
         prev_token = None
+        total_batches = warmup_batches + n_batches
         try:
             for i, batch in enumerate(eval_loader):
-                if i >= n_batches:
+                if i >= total_batches:
                     break
                 input_ids = batch.input_ids.to(self.device, non_blocking=True)
                 target_ids = batch.target_ids.to(self.device, non_blocking=True)
@@ -158,10 +190,12 @@ class Phase2Trainer:
                     use_memory=True,
                     prev_token=batch_prev if batch_prev is not None else prev_token,
                 )
+                prev_token = input_ids[:, -1]
+                if i < warmup_batches:
+                    continue
                 total_ce += result["ce_loss"].item()
                 total_aux += result["aux_loss"].item()
                 count += 1
-                prev_token = input_ids[:, -1]
         finally:
             if train_mem_state is not None:
                 memory.load_runtime_state(train_mem_state)
@@ -171,6 +205,9 @@ class Phase2Trainer:
             model._initialized = train_initialized
             if was_training:
                 model.train(True)
+            if was_collecting:
+                memory._collecting_actions = True
+                memory._action_buffer = saved_action_buffer
 
         if count == 0:
             return {"eval_ce_loss": 0.0, "eval_aux_loss": 0.0,
@@ -184,6 +221,126 @@ class Phase2Trainer:
             "eval_batches": count,
         }
 
+    @torch.no_grad()
+    def evaluate_quantized(self, eval_loader, n_batches: int = 4) -> dict:
+        """Eval using the VQ-ARGMAX (deterministic quantized) policy.
+
+        This is the actual policy phase 2 GRPO is trying to optimize, as
+        opposed to the continuous head that evaluate() measures. If
+        evaluate_continuous and evaluate_quantized diverge, the VQ bottleneck
+        is losing meaningful signal and the continuous head metric is
+        over-reporting real phase-2 quality.
+        """
+        model = self.model
+        memory = model.memory
+        lm = model.lm
+
+        train_mem_state = memory.runtime_state_dict() if memory._initialized else None
+        train_lm_carries = [
+            h.clone() if h is not None else None for h in lm._carries]
+        train_initialized = model._initialized
+        was_training = model.training
+        was_collecting = memory._collecting_actions
+        saved_action_buffer = memory._action_buffer
+        if was_collecting:
+            memory._collecting_actions = False
+            memory._action_buffer = []
+
+        memory._initialized = False
+        model._initialized = False
+        lm._carries = [None] * self.config.L_total
+        model.train(False)
+
+        total_ce = 0.0
+        count = 0
+        prev_token = None
+        try:
+            for i, batch in enumerate(eval_loader):
+                if i >= n_batches:
+                    break
+                input_ids = batch.input_ids.to(self.device, non_blocking=True)
+                BS, T = input_ids.shape
+                if not memory._initialized:
+                    memory.initialize_states(BS, self.device)
+
+                batch_prev = getattr(batch, "prev_token", None)
+                if batch_prev is not None:
+                    batch_prev = batch_prev.to(self.device, non_blocking=True)
+                effective_prev = (batch_prev if batch_prev is not None
+                                  else prev_token)
+
+                # 1) Lower scan (reuse the helper that chunks by config.T)
+                H_mid = self._run_lower_scan(
+                    input_ids, prev_token=effective_prev)
+
+                # 2) VQ-argmax rollout to produce quantized readouts
+                result = memory.forward_segment_phase2(
+                    H_mid, input_ids, lm, self.vqvae,
+                    tau=self.tau, sample=False,
+                    prev_token=effective_prev)
+                readouts_q = result["readouts"]
+
+                # 3) Upper scan on H_enriched. Carries persist across eval
+                # batches (matching phase 1 eval semantics) — they're reset
+                # only at EOT via the reset_mask. Previous version zeroed
+                # all upper carries every batch (codex finding #5).
+                mem_scale = lm.mem_scale
+                H_enriched = H_mid.to(readouts_q.dtype) + mem_scale * readouts_q
+                eot = self.config.eot_id
+                eos_positions = (input_ids == eot)
+                reset_mask = torch.zeros_like(eos_positions)
+                reset_mask[:, 1:] = eos_positions[:, :-1]
+                if effective_prev is not None:
+                    reset_mask[:, 0] = (effective_prev == eot)
+                if not reset_mask.any():
+                    reset_mask = None
+                # Chunk along T to bound VRAM
+                chunk_t = 1024
+                logits_parts = []
+                for s in range(0, T, chunk_t):
+                    e = min(s + chunk_t, T)
+                    rm = reset_mask[:, s:e] if reset_mask is not None else None
+                    H_up = lm.forward_scan_upper(H_enriched[:, s:e], reset_mask=rm)
+                    logits_parts.append(lm.forward_output(H_up))
+                logits = torch.cat(logits_parts, dim=1)
+
+                # 4) LM CE — must use target_ids (next-token shift), not
+                # input_ids. logits[t] predicts input_ids[t+1], so we need
+                # target_ids[t] = input_ids[t+1]. Use the same shift and
+                # mask convention as model.forward_chunk (codex finding #4).
+                target_ids = batch.target_ids.to(self.device, non_blocking=True)
+                ce_per_tok = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    target_ids.reshape(-1),
+                    reduction="none",
+                ).reshape(BS, T)
+                valid_mask = (input_ids != eot).float()
+                valid_count = valid_mask.sum().clamp(min=1.0)
+                batch_ce = (ce_per_tok * valid_mask).sum() / valid_count
+                total_ce += batch_ce.item()
+                count += 1
+                prev_token = input_ids[:, -1]
+        finally:
+            if train_mem_state is not None:
+                memory.load_runtime_state(train_mem_state)
+            else:
+                memory._initialized = False
+            lm._carries = train_lm_carries
+            model._initialized = train_initialized
+            if was_training:
+                model.train(True)
+            if was_collecting:
+                memory._collecting_actions = True
+                memory._action_buffer = saved_action_buffer
+
+        if count == 0:
+            return {"quant_eval_ce": 0.0, "quant_eval_ppl": 0.0}
+        avg_ce = total_ce / count
+        return {
+            "quant_eval_ce": avg_ce,
+            "quant_eval_ppl": min(math.exp(avg_ce), 1e6),
+        }
+
     # ------------------------------------------------------------------
     # Rollout + reward
     # ------------------------------------------------------------------
@@ -194,7 +351,7 @@ class Phase2Trainer:
     ) -> Tensor:
         """Run the frozen LM lower scan to produce H_mid.
 
-        Chunks the input into segments of config.T so pos_embed stays in range.
+        Chunks the input into segments of config.T to bound per-chunk VRAM.
         Mirrors the EOT reset logic in `Model.forward_chunk`: builds a
         reset_mask from in-batch EOT positions and the optional `prev_token`
         (last token of previous batch).
@@ -221,20 +378,41 @@ class Phase2Trainer:
     @torch.no_grad()
     def _compute_per_token_reward(
         self, readouts: Tensor, prev_readout_at_start: Tensor, input_ids: Tensor,
+        H_mid: Tensor | None = None,
     ) -> Tensor:
-        """Compute negative per-token mem_pred_loss to use as dense reward.
+        """Compute per-token reward for GRPO.
 
-        Returns: [BS, T] float — per-token reward (higher = better prediction).
+        Two modes (selected by self.reward_mode):
+          - 'mem_pred': fast — uses the weight-tied memory-prediction head.
+            Rewards the modulator for making readouts that predict the next
+            token well directly. Cheap but a proxy for LM CE.
+          - 'lm_ce': principled — runs the full LM path (upper scan + head)
+            on H_enriched = H_mid + mem_scale * readout and uses -CE of the
+            main LM output as reward. Measures the actual quantity we care
+            about but ~2x more expensive per rollout.
+
+        Masks positions where the previous token was EOT (same as phase 1
+        main CE loss masking).
+
+        Returns: [BS, T] float — per-token reward. Invalid positions get 0.
         """
         BS, T, D = readouts.shape
+        eot = self.config.eot_id
+        valid_mask = torch.ones(BS, T, device=readouts.device, dtype=torch.float32)
+        if T > 1:
+            valid_mask[:, 1:] = (input_ids[:, :-1] != eot).float()
+
+        if self.reward_mode == "lm_ce" and H_mid is not None:
+            return self._compute_per_token_reward_lm_ce(
+                readouts, H_mid, input_ids, valid_mask)
+
+        # mem_pred mode (default/legacy)
         # Shift: readout[t-1] predicts token at position t.
         shifted = torch.cat([
             prev_readout_at_start.unsqueeze(1).to(readouts.dtype),
             readouts[:, :-1],
         ], dim=1)  # [BS, T, D]
 
-        # Chunk along time to bound VRAM — scale inversely with BS.
-        # At K*BS=64, chunk=64 → [64,64,32K] = 0.5GB per chunk (fine).
         rewards = torch.empty(BS, T, device=readouts.device, dtype=torch.float32)
         chunk = max(32, 4096 // max(BS, 1))
         for s in range(0, T, chunk):
@@ -247,7 +425,73 @@ class Phase2Trainer:
                 sub_target.reshape(-1),
                 reduction="none",
             ).reshape(BS, e - s)
-            rewards[:, s:e] = -ce
+            rewards[:, s:e] = -ce * valid_mask[:, s:e]
+        return rewards
+
+    @torch.no_grad()
+    def _compute_per_token_reward_lm_ce(
+        self, readouts: Tensor, H_mid: Tensor, input_ids: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        """Compute -LM CE as per-token reward.
+
+        Runs H_enriched = H_mid + mem_scale * readouts through the
+        (frozen) upper scan and LM head, computes per-token CE on the
+        NEXT-token prediction (logits[t] → input_ids[t+1] shifted).
+
+        Upper scan carries are reset fresh inside this computation — we
+        measure per-rollout LM quality, not cross-rollout sequence quality.
+        """
+        BS, T, D = readouts.shape
+        lm = self.model.lm
+        mem_scale = lm.mem_scale  # frozen in phase 2
+        H_enriched = H_mid.to(readouts.dtype) + mem_scale * readouts
+
+        # Build reset mask for upper scan from in-batch EOT positions
+        eot = self.config.eot_id
+        eos_positions = (input_ids == eot)
+        reset_mask = torch.zeros_like(eos_positions)
+        reset_mask[:, 1:] = eos_positions[:, :-1]
+
+        # Save / reset upper-scan carries so the rollout's CE is independent
+        # of outer-loop context. Only upper-scan carries matter here; lower
+        # scan is already done (H_mid is cached).
+        saved_carries = [
+            h.clone() if h is not None else None for h in lm._carries]
+        split = self.config.scan_split_at
+        for i in range(split, self.config.L_total):
+            lm._carries[i] = None  # fresh at K*BS shape
+
+        try:
+            # Upper scan chunks the input internally via the scan layer,
+            # but we want to chunk along time to bound VRAM on long T.
+            # For simplicity run once if T is small, else chunk.
+            chunk_t = 1024
+            all_logits_chunks = []
+            for s in range(0, T, chunk_t):
+                e = min(s + chunk_t, T)
+                H_chunk = H_enriched[:, s:e]
+                rm_chunk = reset_mask[:, s:e] if reset_mask.any() else None
+                H_upper = lm.forward_scan_upper(H_chunk, reset_mask=rm_chunk)
+                all_logits_chunks.append(lm.forward_output(H_upper))
+            logits = torch.cat(all_logits_chunks, dim=1)   # [BS, T, V]
+        finally:
+            # Restore the outer-loop upper carries
+            lm._carries = saved_carries
+
+        # Per-token CE: logits[:, t-1, :] predicts input_ids[:, t]
+        # Shift labels: pad last position with a copy (masked by valid anyway)
+        shifted_logits = logits[:, :-1].reshape(-1, logits.shape[-1]).float()
+        shifted_targets = input_ids[:, 1:].reshape(-1)
+        ce = F.cross_entropy(
+            shifted_logits, shifted_targets, reduction="none"
+        ).reshape(BS, T - 1)
+        # Align reward at position t (reward for predicting token t from
+        # action context at t-1). The first position has no reward (no
+        # prior token to predict from). Pad at position 0 with zero.
+        rewards = torch.zeros(BS, T, device=readouts.device, dtype=torch.float32)
+        rewards[:, 1:] = -ce
+        rewards = rewards * valid_mask
         return rewards
 
     @torch.no_grad()
@@ -256,10 +500,15 @@ class Phase2Trainer:
     ) -> Tensor:
         """For each modulator call at token t, compute mean reward over [t+1, t+1+W].
 
-        The +1 shift is because `per_token_reward[t]` is computed from
-        `readout[t-1]`, which is independent of the action taken at modulator
-        call t. The action at t first influences `per_token_reward[t+1]`
-        (via `readout[t]`).
+        ONLY calls whose full window [t+1, t+1+W) fits entirely within the
+        sequence contribute a meaningful reward — calls near the end of the
+        sequence would otherwise get truncated windows that bias the reward
+        signal toward early positions. Out-of-range calls get zero reward
+        (effectively masked from advantages by centering).
+
+        For the curriculum to produce meaningful rewards at window W, the
+        rollout sequence length must exceed W by at least a few modulator
+        intervals (train_phase2 sets seq_length = 2 * W as the default).
 
         Args:
             per_token_reward: [*, BS, T] on-device (leading dims broadcast, e.g. [K, BS, T])
@@ -267,7 +516,8 @@ class Phase2Trainer:
             window: reward window W
 
         Returns:
-            rewards: [*, n_calls, BS] on-device — per-action reward averaged over window
+            rewards: [*, n_calls, BS] on-device — per-action reward averaged over
+                     the full window (only for actions with complete windows)
         """
         T = per_token_reward.shape[-1]
         positions = call_positions.to(per_token_reward.device)
@@ -276,14 +526,20 @@ class Phase2Trainer:
         starts = positions + 1                                        # [n_calls]
         offsets = torch.arange(window, device=per_token_reward.device)  # [W]
         indices = starts.unsqueeze(1) + offsets.unsqueeze(0)          # [n_calls, W]
-        valid = indices < T                                           # [n_calls, W]
-        indices = indices.clamp(max=T - 1)
-        valid_count = valid.float().sum(dim=1).clamp(min=1)           # [n_calls]
 
-        # Gather: per_token_reward[..., indices] → [..., n_calls, W]
+        # An action's window is COMPLETE iff start + W <= T. Incomplete
+        # windows contribute zero reward (they're discarded via the mask
+        # below). Since group-relative advantages subtract per-sample
+        # means, zero reward for invalid actions won't introduce phantom
+        # gradient signal.
+        complete = (starts + window <= T)                             # [n_calls]
+        indices = indices.clamp(max=T - 1)
+
         gathered = per_token_reward[..., indices]                     # [*, BS, n_calls, W]
-        gathered = gathered * valid.float()                            # zero out invalid
-        out = gathered.sum(dim=-1) / valid_count                      # [*, BS, n_calls]
+        # Mean over the full window (all W tokens valid when complete).
+        out = gathered.mean(dim=-1)                                   # [*, BS, n_calls]
+        # Zero out incomplete windows.
+        out = out * complete.to(out.dtype)
         # Move n_calls before BS: [..., n_calls, BS]
         return out.transpose(-1, -2)
 
@@ -297,7 +553,6 @@ class Phase2Trainer:
             "s_mem_live": mem.s_mem_live.clone(),
             "s_mem_ema_fast": mem.s_mem_ema_fast.clone(),
             "prev_readout": mem.prev_readout.clone(),
-            "prev_readout_cell": mem.prev_readout_cell.clone(),
             "readout_drift": mem.readout_drift.clone(),
         }
 
@@ -312,7 +567,6 @@ class Phase2Trainer:
         mem.s_mem_live = snapshot["s_mem_live"].clone()
         mem.s_mem_ema_fast = snapshot["s_mem_ema_fast"].clone()
         mem.prev_readout = snapshot["prev_readout"].clone()
-        mem.prev_readout_cell = snapshot["prev_readout_cell"].clone()
         mem.readout_drift = snapshot["readout_drift"].clone()
 
     @torch.no_grad()
@@ -377,29 +631,46 @@ class Phase2Trainer:
         init_prev_readout = init_snapshot["prev_readout"]  # [BS, D]
         init_prev_exp = init_prev_readout.unsqueeze(0).expand(K, *init_prev_readout.shape).reshape(K * BS, -1)
         per_token_reward = self._compute_per_token_reward(
-            result["readouts"], init_prev_exp, ids_exp)     # [K*BS, T]
+            result["readouts"], init_prev_exp, ids_exp,
+            H_mid=H_mid_exp)                                 # [K*BS, T]
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
         # Windowed rewards — vectorized across K trajectories
         rewards = self._windowed_reward(
             per_token_reward, call_positions, self.reward_window)  # [K, n_calls, BS]
 
-        # Pick best trajectory and restore its end-state
-        mean_per_k = rewards.mean(dim=(1, 2))  # [K]
-        best_k = mean_per_k.argmax().item()
-        best_mean_reward = mean_per_k[best_k].item()
+        # Per-sample reward for logging.
+        # `mean_per_k_sample[k, b]` = mean reward across all action calls
+        # for trajectory k of sample b. Shape [K, BS].
+        mean_per_k_sample = rewards.mean(dim=1)  # [K, BS]
+        # True mean across all K trajectories and all samples — this is
+        # the "average reward" you'd expect from the field name `mean_reward`.
+        mean_reward = mean_per_k_sample.mean().item()
+        # Max-over-K then mean-over-BS: the average of "best trajectory
+        # per sample" rewards, i.e. how lucky the best-of-K is. Logged
+        # separately for diagnostics but systematically optimistic.
+        best_mean_reward = mean_per_k_sample.max(dim=0).values.mean().item()
 
-        # Extract best trajectory's end-of-rollout memory state
+        # Choose ONE trajectory per sample uniformly at random to carry
+        # its end-state forward. Picking the *best* trajectory would
+        # introduce optimism bias — the starting state for the next batch
+        # would be systematically "lucky" and diverge from the state
+        # distribution the deployed policy actually produces. Random
+        # selection gives unbiased expected-state propagation across
+        # batches.
+        random_k_per_sample = torch.randint(
+            0, K, (BS,), device=device, dtype=torch.long)
+        gather_idx = random_k_per_sample * BS + torch.arange(BS, device=device)
         for key in init_snapshot:
             full = getattr(mem, key)  # [K*BS, ...]
-            best_slice = full[best_k * BS : (best_k + 1) * BS]
-            setattr(mem, key, best_slice.clone())
+            setattr(mem, key, full[gather_idx].clone())
 
         return {
             "mod_inputs": mod_inputs,
             "codes": codes,
             "rewards": rewards,
-            "mean_reward": best_mean_reward,
+            "mean_reward": mean_reward,             # true mean across K×BS
+            "best_mean_reward": best_mean_reward,   # max-over-K then mean-over-BS
             "T": T,
             "BS": BS,
         }
@@ -413,14 +684,21 @@ class Phase2Trainer:
 
         rewards: [K, n_calls, BS] — per-action reward per trajectory
         Returns: [K, n_calls, BS] — normalized advantages
+
+        Normalization is PER-(call, sample): each (call_idx, sample_idx)
+        slot is centered and scaled by its own K-variance. We used to use
+        a global std, which biased the gradient toward low-variance
+        early-sequence actions (late actions have higher reward variance
+        because the memory state diverges more across K by then, so the
+        global std was dominated by late positions and early ones got
+        proportionally larger advantages). See audit #6.
         """
-        # Per-action baseline: mean over K trajectories
+        # Per-action baseline: mean over K trajectories.
         baseline = rewards.mean(dim=0, keepdim=True)         # [1, n_calls, BS]
         advantages = rewards - baseline                      # [K, n_calls, BS]
-        # Per-batch normalization
-        mean = advantages.mean()
-        std = advantages.std().clamp(min=1e-8)
-        return (advantages - mean) / std
+        # Per-(call, sample) std over K.
+        std = advantages.std(dim=0, keepdim=True).clamp(min=1e-8)
+        return advantages / std
 
     def grpo_step(self, rollout_result: dict) -> dict:
         """Compute GRPO loss from rollout records and update modulator.
@@ -464,6 +742,10 @@ class Phase2Trainer:
         chunk_size = max(1024, 16384 // max(codes_per_level // 16, 1))
         total_loss = 0.0
         total_log_pi = 0.0
+        total_entropy = 0.0
+        # Quantization residual accumulator (continuous-vs-quantized gap).
+        quant_residual_sq = 0.0
+        raw_action_sq = 0.0
         n_chunks = 0
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -497,6 +779,19 @@ class Phase2Trainer:
 
             total_loss += chunk_loss.item() * (M * NC)
             total_log_pi += log_pi.detach().sum().item()
+            total_entropy += entropy.detach().sum().item()
+
+            # Quantization residual: ||raw_action - decode(quantize(raw_action))||.
+            # Measures how much information is lost through the VQ bottleneck —
+            # a direct signal of continuous-vs-quantized policy divergence.
+            with torch.no_grad():
+                lvl_idx = torch.arange(num_levels, device=z.device)
+                z_q = self.vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes_flat_flat].sum(dim=1)
+                decoded_norm = self.vqvae.decoder(z_q)
+                decoded = self.vqvae.denormalize(decoded_norm)
+                resid = (action_flat - decoded)
+                quant_residual_sq += resid.pow(2).sum().item()
+                raw_action_sq += action_flat.pow(2).sum().item()
             n_chunks += 1
 
         grad_norm = nn.utils.clip_grad_norm_(
@@ -514,9 +809,16 @@ class Phase2Trainer:
         codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
         n_unique = torch.unique(codes_flat_all, dim=0).shape[0]
 
+        # Quantization residual metrics
+        import math
+        quant_resid_norm = math.sqrt(quant_residual_sq / max(M * NC, 1))
+        raw_norm = math.sqrt(raw_action_sq / max(M * NC, 1))
+        quant_relative = quant_resid_norm / max(raw_norm, 1e-8)
+
         return {
             "loss": total_loss / (M * NC),
             "log_pi_mean": total_log_pi / (M * NC),
+            "entropy_mean": total_entropy / (M * NC),
             "reward_mean": reward_mean,
             "reward_std": reward_std,
             "reward_min": reward_min,
@@ -525,6 +827,9 @@ class Phase2Trainer:
             "n_chunks": n_chunks,
             "M": M,
             "n_unique_codes": n_unique,
+            # Continuous vs quantized: high residual = proxy drift risk.
+            "quant_resid_rel": quant_relative,
+            "quant_resid_abs": quant_resid_norm,
         }
 
     # ------------------------------------------------------------------
@@ -532,12 +837,30 @@ class Phase2Trainer:
     # ------------------------------------------------------------------
 
     def run_curriculum(self, stages: list[CurriculumStage]):
-        """Run the full phase-2 curriculum, advancing through stages sequentially."""
+        """Run the full phase-2 curriculum, advancing through stages sequentially.
+
+        If a train_loader_factory is provided, each stage gets its own
+        dataloader at seq_length == stage.reward_window — so early stages
+        actually process shorter sequences (cheaper per step) and the
+        curriculum is a true easy-to-hard ramp. Without a factory, falls
+        back to the single dataloader passed at init time.
+        """
         for stage_idx, stage in enumerate(stages):
             self.reward_window = stage.reward_window
             self.segment_length = stage.reward_window
             print(f"\n=== Phase 2 stage {stage_idx+1}/{len(stages)}: "
                   f"W={stage.reward_window}, budget={stage.token_budget:,} tokens ===")
+            if self.train_loader_factory is not None:
+                # Pass stage_idx so the factory can offset the seed — without
+                # this every stage starts at the same shard prefix. See the
+                # comment in train_phase2.py train_loader_factory for details.
+                try:
+                    self.dataloader = self.train_loader_factory(
+                        stage.reward_window, stage_idx=stage_idx)
+                except TypeError:
+                    # Back-compat for factories that only accept reward_window.
+                    self.dataloader = self.train_loader_factory(
+                        stage.reward_window)
             self._run_stage(stage)
 
     def _run_stage(self, stage: CurriculumStage):
@@ -563,6 +886,14 @@ class Phase2Trainer:
             tokens_seen += step_tokens
             self.global_step += 1
 
+            # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
+            # across the K-rollout-collapsed BS lanes. Done AFTER the GRPO
+            # step but BEFORE logging so merge stats land in the row.
+            merge_stats = {}
+            if (self.merge_interval > 0
+                    and self.global_step % self.merge_interval == 0):
+                merge_stats = self.model.memory.collapse_batch_dim()
+
             # Persistent jsonl logging for plotting
             log_row = {
                 "step": self.global_step,
@@ -571,6 +902,7 @@ class Phase2Trainer:
                 "rollout_time": t_rollout,
                 "grad_time": t_grad,
                 **step_metrics,
+                **merge_stats,
             }
             self._append_metrics(log_row)
 
@@ -594,9 +926,18 @@ class Phase2Trainer:
                 and self.global_step % self.eval_interval == 0
             ):
                 eval_metrics = self.evaluate(
-                    self.eval_loader_factory(), n_batches=self.eval_batches)
+                    self.eval_loader_factory(),
+                    n_batches=self.eval_batches,
+                    warmup_batches=self.eval_warmup_batches)
+                # Also eval the VQ-argmax (deterministic quantized) policy
+                # — this is the actual policy phase 2 is optimizing, and
+                # divergence from the continuous eval indicates proxy drift.
+                quant_metrics = self.evaluate_quantized(
+                    self.eval_loader_factory(),
+                    n_batches=self.eval_batches)
                 print(f"[p2 eval {self.global_step}] "
                       f"ce={eval_metrics['eval_ce_loss']:.3f} "
+                      f"q_ce={quant_metrics['quant_eval_ce']:.3f} "
                       f"ppl={eval_metrics['eval_ppl']:.1f} "
                       f"mem_pred={eval_metrics['eval_aux_loss']:.3f} "
                       f"({eval_metrics['eval_batches']} batches)")
@@ -605,6 +946,7 @@ class Phase2Trainer:
                     "stage_window": stage.reward_window,
                     "event": "eval",
                     **eval_metrics,
+                    **quant_metrics,
                 })
 
         elapsed = time.time() - t_stage_start

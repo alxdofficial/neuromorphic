@@ -4,8 +4,10 @@ Persistent parallel stream data loading for TBPTT training.
 Key design:
 - BS independent persistent streams (not independent sequences)
 - Each stream is a continuous flow of documents separated by <|endoftext|>
-- State (hidden, PM, EM, eligibility) persists across TBPTT chunks
-- Different streams hit document boundaries at different positions
+- Model state (LM scan carries + memory graph W/decay/hebbian) persists
+  across TBPTT chunks; memory graph state also persists across document
+  boundaries (lifelong memory).
+- Different streams hit document boundaries at different positions.
 
 Two dataset backends:
 - TokenShardDataset: pre-tokenized .bin shards (fast, recommended)
@@ -153,8 +155,12 @@ class TokenShardDataset(IterableDataset):
             )
 
         self.step_count = 0
+        self.consumed_step: Optional[int] = None  # set by mark_consumed()
+        self._consumed_prev_tokens: Optional[torch.Tensor] = None
         self.prev_tokens: Optional[torch.Tensor] = None
-        self._resume_step: int = 0  # step offset for resume
+        self._resume_step: int = 0  # CUMULATIVE step offset for resume
+        self._resume_base: int = 0  # set in _generate; init here for early state_dict
+        self._resume_prev_tokens: Optional[torch.Tensor] = None
         # Compat with PersistentStreamDataset monitoring
         self.stream_restarts_total = 0
         self.stream_restarts_last_batch = 0
@@ -163,34 +169,64 @@ class TokenShardDataset(IterableDataset):
     def state_dict(self) -> dict:
         """Return serialisable snapshot for checkpointing.
 
-        The dataset position is fully determined by ``step_count`` and the
-        constructor ``seed`` — positions can be recomputed arithmetically on
-        resume, so only the step counter is strictly needed.
+        Saves the CUMULATIVE step count (resume_base + consumed_this_session)
+        so that a subsequent resume lands at the correct absolute stream
+        position. Also saves the consumer-side ``prev_tokens`` (not the
+        producer's prefetch-ahead version) so reset_mask on resume is correct.
 
-        .. note::
-           When prefetch > 0, ``step_count`` may be slightly ahead of the
-           training loop's actual progress.  Callers that need an exact
-           match (e.g. checkpoint saves) should use the trainer's step
-           counter instead.
+        Callers MUST invoke ``mark_consumed(n, prev_tokens)`` before
+        checkpointing.
         """
+        # Cumulative = what we resumed from + what we consumed this session.
+        consumed = (self.consumed_step if self.consumed_step is not None
+                    else self.step_count)
+        cumulative = self._resume_base + consumed
+        # Consumer-side prev_tokens if available, else producer's (best effort).
+        prev = (self._consumed_prev_tokens if self._consumed_prev_tokens is not None
+                else self.prev_tokens)
         return {
-            "step_count": self.step_count,
+            "step_count": cumulative,
+            "prev_tokens": (prev.clone() if prev is not None else None),
         }
+
+    def mark_consumed(self, consumed: int,
+                      prev_tokens: torch.Tensor | None = None) -> None:
+        """Record how many batches + the last prev_token the consumer saw.
+
+        Decouples checkpointed state from the prefetch-ahead internal
+        counter AND the prefetch-ahead prev_tokens, both of which can
+        run ahead of what the training loop actually processed.
+        """
+        self.consumed_step = consumed
+        if prev_tokens is not None:
+            self._consumed_prev_tokens = prev_tokens.clone()
 
     def load_state_dict(self, state: dict) -> None:
         """Restore dataset position from a checkpoint.
 
-        Sets a resume offset so that ``_generate`` fast-forwards positions
-        arithmetically (no wasted iteration).
+        ``state["step_count"]`` is CUMULATIVE (across all prior sessions).
+        ``_generate`` fast-forwards positions by this many T-token strides
+        from the seed-derived starting positions. ``prev_tokens`` is the
+        consumer-side value from the checkpoint so the first resumed chunk
+        gets the correct reset_mask.
         """
         self._resume_step = state.get("step_count", 0)
+        saved_prev = state.get("prev_tokens")
+        if saved_prev is not None:
+            self._resume_prev_tokens = saved_prev.clone()
 
     def _generate(self) -> Iterator[StreamBatch]:
-        """Core generation loop (wrapped by prefetch thread)."""
+        """Core generation loop (wrapped by prefetch thread).
+
+        Each step reads T+1 tokens from the shard (for the input/target
+        shift) but advances the cursor by T (not T+1) so the last target
+        of chunk k overlaps with the first input of chunk k+1.  Previous
+        versions advanced by T+1, silently skipping one token per chunk.
+        """
         BS = self.batch_size
         T = self.seq_length
         shard_len = self.shard_len
-        chunk_size = T + 1  # need +1 for target shift
+        read_size = T + 1  # need +1 for target shift
 
         # Distribute streams evenly across shard with seed-based jitter
         rng = np.random.RandomState(self.seed)
@@ -200,31 +236,43 @@ class TokenShardDataset(IterableDataset):
             dtype=np.int64,
         )
 
-        # Fast-forward positions if resuming from a checkpoint.  Positions
-        # advance by chunk_size each step, so we can skip ahead arithmetically.
+        # Fast-forward positions if resuming from a checkpoint. The cursor
+        # stored in the checkpoint is CUMULATIVE (total batches consumed
+        # across all prior sessions). Each batch advances by T tokens.
         resume_step = self._resume_step
+        self._resume_base = resume_step  # for state_dict's cumulative calc
         if resume_step > 0:
-            positions = (positions + resume_step * chunk_size) % shard_len
+            positions = (positions + resume_step * T) % shard_len
             self._resume_step = 0  # consumed
 
-        # Initialize prev_tokens to EOS (triggers reset on first chunk).
-        self.prev_tokens = torch.full((BS,), self.eos_token_id, dtype=torch.long)
+        # Initialize prev_tokens. On resume, use the saved tensor so the
+        # first resumed batch doesn't see a spurious EOS carry. Otherwise
+        # start with EOS which (correctly) triggers a reset on chunk 0.
+        if self._resume_prev_tokens is not None and self._resume_prev_tokens.shape == (BS,):
+            self.prev_tokens = self._resume_prev_tokens.clone()
+            self._resume_prev_tokens = None
+        else:
+            self.prev_tokens = torch.full((BS,), self.eos_token_id, dtype=torch.long)
         # step_count tracks batches yielded in this session (starts at 0,
         # compared against max_steps which is the remaining step count).
         self.step_count = 0
 
         # Pre-allocate pinned buffer for async CPU→GPU transfer
         use_pin = torch.cuda.is_available()
-        buf = torch.empty(BS, chunk_size, dtype=torch.long, pin_memory=use_pin)
+        buf = torch.empty(BS, read_size, dtype=torch.long, pin_memory=use_pin)
 
         while True:
             if self.max_steps is not None and self.step_count >= self.max_steps:
                 break
 
-            # Fill buffer from memory-mapped array
+            # Fill buffer from memory-mapped array. Read T+1 tokens at the
+            # current position, then advance the cursor by T (not T+1) so
+            # the next chunk's input[0] == this chunk's target[-1]. This is
+            # the "overlapping read window" pattern that makes the stream
+            # contiguous.
             for i in range(BS):
                 pos = int(positions[i])
-                end = pos + chunk_size
+                end = pos + read_size
                 if end <= shard_len:
                     chunk = self.tokens[pos:end]
                 else:
@@ -234,7 +282,7 @@ class TokenShardDataset(IterableDataset):
                         self.tokens[: end - shard_len],
                     ])
                 buf[i] = torch.from_numpy(chunk.astype(np.int64))
-                positions[i] = end % shard_len
+                positions[i] = (pos + T) % shard_len  # advance by T, not T+1
 
             batch = StreamBatch(
                 input_ids=buf[:, :-1].clone(),
@@ -242,7 +290,8 @@ class TokenShardDataset(IterableDataset):
                 prev_token=self.prev_tokens.clone(),
             )
 
-            # Update prev_tokens for next chunk (last input token)
+            # Update prev_tokens for next chunk (last input token).
+            # buf[:, -2] == input_ids[:, -1] since input_ids = buf[:, :-1].
             self.prev_tokens = buf[:, -2].clone()
             self.step_count += 1
 
@@ -494,18 +543,26 @@ class PersistentStreamDataset(IterableDataset):
         """Return serialisable snapshot for checkpointing.
 
         For streaming HF datasets exact iterator positions cannot be saved.
-        We store ``step_count`` so that on resume we can fast-forward by
-        consuming and discarding that many batches.
+        We store a CUMULATIVE step count so on resume we fast-forward to the
+        right absolute position. Same pattern as TokenShardDataset.
         """
+        consumed = (self._consumed_step if hasattr(self, '_consumed_step')
+                    and self._consumed_step is not None else self.step_count)
+        cumulative = getattr(self, '_resume_base', 0) + consumed
         return {
-            "step_count": self.step_count,
+            "step_count": cumulative,
         }
+
+    def mark_consumed(self, consumed: int,
+                      prev_tokens: torch.Tensor | None = None) -> None:
+        """Record consumed batches for cumulative checkpoint (same API as
+        TokenShardDataset)."""
+        self._consumed_step = consumed
 
     def load_state_dict(self, state: dict) -> None:
         """Restore dataset position from a checkpoint.
 
-        Stores ``_resume_step`` so that ``__iter__`` can fast-forward past
-        already-seen data.
+        ``step_count`` is CUMULATIVE across all prior sessions.
         """
         self._resume_step = state.get("step_count", 0)
 
@@ -521,6 +578,7 @@ class PersistentStreamDataset(IterableDataset):
 
         # Fast-forward past already-consumed batches on resume.
         resume_step = getattr(self, "_resume_step", 0)
+        self._resume_base = resume_step  # for cumulative state_dict
         if resume_step > 0:
             logger.info(
                 "Fast-forwarding PersistentStreamDataset: consuming %d batches",
@@ -539,8 +597,9 @@ class PersistentStreamDataset(IterableDataset):
                         self.streams[i].get_tokens(needed - len(tokens))
                 _ff_count += 1
             self._resume_step = 0
-            # Reset step_count so it tracks batches yielded this session
-            # (compared against max_steps = remaining steps).
+            # step_count tracks batches yielded this session (compared
+            # against max_steps = remaining steps). state_dict adds
+            # _resume_base to get the cumulative count.
             self.step_count = 0
 
         while True:
@@ -570,7 +629,21 @@ class PersistentStreamDataset(IterableDataset):
                     batch_restarts += 1
 
                 if len(tokens) < needed:
-                    tokens.extend([self.eos_token_id] * (needed - len(tokens)))
+                    # We used to pad with eos_token_id here — which silently
+                    # injected false document boundaries into training data
+                    # (the reset_mask fires at EOT, valid_mask excludes EOT
+                    # predictions, so the memory graph sees "documents" that
+                    # didn't exist). Raise loudly instead: if this triggers
+                    # the backing dataset is genuinely too small for the
+                    # requested batch/seq_length, which the user must fix.
+                    raise RuntimeError(
+                        f"PersistentStreamDataset: lane {i} could not produce "
+                        f"{needed} tokens even after recycling an exhausted "
+                        f"stream (got {len(tokens)}). The backing dataset is "
+                        f"likely smaller than the requested sequence length, "
+                        f"or stream recycling is broken. Refusing to pad "
+                        f"with EOS (would inject false document boundaries)."
+                    )
 
                 if produced_any:
                     all_exhausted = False
@@ -756,7 +829,14 @@ class MixedStreamDataset(IterableDataset):
                     batch_restarts += 1
 
                 if len(tokens) < needed:
-                    tokens.extend([self.eos_token_id] * (needed - len(tokens)))
+                    # See PersistentStreamDataset comment above — raise rather
+                    # than silently padding with EOS (would inject false
+                    # document boundaries into the memory graph's training).
+                    raise RuntimeError(
+                        f"MixedStreamDataset: lane {i} could not produce "
+                        f"{needed} tokens even after recycling (got "
+                        f"{len(tokens)}). Backing dataset too small."
+                    )
 
                 if produced_any:
                     all_exhausted = False
@@ -853,6 +933,13 @@ class _DatasetIterator:
             return self.dataset.monitor_stats()
         return {}
 
+    def mark_consumed(self, consumed: int,
+                      prev_tokens: torch.Tensor | None = None) -> None:
+        """Proxy to underlying dataset's mark_consumed() for accurate
+        checkpointing of the consumer position (vs prefetch-ahead counter)."""
+        if hasattr(self.dataset, "mark_consumed"):
+            self.dataset.mark_consumed(consumed, prev_tokens=prev_tokens)
+
     def state_dict(self) -> dict:
         """Proxy to underlying dataset's state_dict for checkpointing."""
         if hasattr(self.dataset, "state_dict"):
@@ -921,9 +1008,25 @@ def create_dataloader(
         if shard_path is not None:
             # Shards are tokenizer-specific (prepare_data.py hardcodes TinyLlama).
             # Reject if runtime tokenizer vocab doesn't match.
+            # Sample multiple chunks across the shard (not just the first
+            # 1M) so a mismatch in the tail is still caught.
             import numpy as np
             shard_mm = np.memmap(shard_path, dtype=np.uint16, mode='r')
-            shard_max_id = int(shard_mm[:min(len(shard_mm), 1_000_000)].max())
+            shard_len = len(shard_mm)
+            sample_size = 100_000
+            n_samples = 10
+            if shard_len <= sample_size * n_samples:
+                shard_max_id = int(shard_mm.max())
+            else:
+                max_so_far = 0
+                stride = shard_len // n_samples
+                for i in range(n_samples):
+                    start = i * stride
+                    end = min(start + sample_size, shard_len)
+                    chunk_max = int(shard_mm[start:end].max())
+                    if chunk_max > max_so_far:
+                        max_so_far = chunk_max
+                shard_max_id = max_so_far
             del shard_mm
             if shard_max_id >= tokenizer.vocab_size:
                 raise ValueError(

@@ -87,8 +87,17 @@ GPT2_PARAMS = 124.4e6
 # ===========================================================================
 
 def load_our_model():
-    """Load neuromorphic model from checkpoint (config stored in ckpt)."""
-    from src.model.model import NeuromorphicLM
+    """Load neuromorphic model from checkpoint (config stored in ckpt).
+
+    NOTE: This script is STALE. It imports ``NeuromorphicLM`` which does
+    not exist in the current architecture — the class was renamed to
+    ``Model`` and lives at ``src.model.model.Model``. Comparison numbers
+    referenced in ``outputs/comparison/RESULTS.md`` predate the current
+    v12 split-scan + dense-W design and should not be used as baselines
+    for the current implementation. Update this loader to match the new
+    Model class before re-running the comparison.
+    """
+    from src.model.model import Model as NeuromorphicLM
 
     if OUR_CKPT is None or not OUR_CKPT.exists():
         raise FileNotFoundError(f"No checkpoint found. Latest run: {_LATEST_RUN}")

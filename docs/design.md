@@ -23,9 +23,12 @@ tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                  ┌─── per-token loop (t = 0..T-1) ───────────────┐
                  │                                                 │
                  │  (1) live surprise (no_grad)                   │
-                 │        logit = mem_head(prev_readout)[x_t]     │
-                 │        s_mem_live = -logit                     │
-                 │        update s_mem_ema_fast/slow              │
+                 │        logits = mem_head(prev_readout)         │
+                 │        s_mem_live = logsumexp(logits)          │
+                 │                     - logits[x_t]              │
+                 │        (= per-token CE at target; scale-       │
+                 │         invariant, fires everywhere)           │
+                 │        update s_mem_ema_fast                   │
                  │                                                 │
                  │  (2) if t % 4 == 0: modulate cells             │
                  │        sees fresh s_mem_live + EMAs +          │
@@ -42,8 +45,10 @@ tokens → embedding → lower scan → H_mid[0..T-1]  (parallel, fused_scan)
                  │  (4) update Hebbian trace, readout_drift,      │
                  │       prev_readout                              │
                  │                                                 │
-                 │  (5) W is row-RMSNormed at use in (3),          │
-                 │       no explicit decay needed                  │
+                 │  (5) W stays at ~unit row RMS structurally:    │
+                 │       the modulator EMAs it toward a            │
+                 │       pre-RMSNormed delta_W, so no              │
+                 │       per-matmul renormalization is needed.    │
                  │                                                 │
                  └─────────────────────────────────────────────────┘
                            │
@@ -102,10 +107,11 @@ post-block Python update loop.
 
 ```
 prev_readout[t-1] ──┐
-                    ├──→ mem_head (weight-tied) ──→ logit[x_t]
+                    ├──→ mem_head (weight-tied) ──→ logits
 input_ids[t] ───────┘                                   │
                                                          ▼
-                                       s_mem_live(t) = -logit[x_t]
+                             s_mem_live(t) = logsumexp(logits) - logits[x_t]
+                                             (proper CE, no EOT mask)
                                                          │
                                   ┌─── EMA (in-block) ───┘
                             s_mem_ema_fast
@@ -119,10 +125,13 @@ readout[t] ─→ reshape cell ─→ |cell[t] - prev_cell| → readout_drift
                                      per-cell readout_drift local)
 ```
 
-- **`s_mem_live`**: instant per-token memory-head surprise (negative
-  unnormalized log-prob of the observed token). Computed inside the
+- **`s_mem_live`**: per-token memory-head cross-entropy at the observed
+  token — `logsumexp(mem_head(prev_readout)) - target_logit`. Proper CE,
+  so it's scale-invariant and bounded below at 0. Computed inside the
   per-token loop from `prev_readout` (readout at `t-1`) and `input_ids[t]`.
-  Lower = memory is confident, higher = memory was surprised.
+  Lower = memory is confident, higher = memory was surprised. **Fires at
+  every position including document boundaries** — it's an observation
+  signal for the modulator, not a training target, so EOT is not masked.
 - **`s_mem_ema_fast`**: short-horizon EMA of `s_mem_live`, updated
   per-token in the compiled block with `gain_ema_fast=0.3` (≈ 3-token
   effective horizon). Gives the modulator a smoothed reference next to
@@ -202,22 +211,30 @@ Gradient flow:
 ### Connectivity: Dense W Matrix
 
 Each cell has `W: [BS, NC, Cn, Cn] = [BS, 8, 32, 32]`. Runtime state
-(not a learned parameter). Initialized sparse (K=8 nonzeros per row),
-evolves via the neuromodulator. Message passing is a single bmm with
-**row-wise RMSNorm on W** at use time:
+(not a learned parameter). Initialized sparse (K=8 nonzeros per row,
+then row-RMSNormed), evolves via the neuromodulator. Message passing is
+a plain bmm on the raw W — **no per-step renormalization**:
 
 ```python
-W_eff = F.rms_norm(W, normalized_shape=(N,))  # unit RMS per row
-received = torch.matmul(W_eff, msg)            # [BS, NC, Cn, D_n]
+received = torch.matmul(W, msg)            # [BS, NC, Cn, D_n]
 ```
 
-The raw W is an unbounded accumulator (`W = W + delta_W` per modulator
-call, no explicit decay), but the *effective* W used in the matmul has
-unit row-RMS. This keeps gradients through the matmul self-regulating
-(as ||W_raw|| grows the gradient through the rmsnorm naturally shrinks)
-without needing a magic-number decay rate to bound W. The "write now,
-help later" credit path is preserved because the raw W still
-accumulates additively across modulator calls.
+The invariant that keeps W bounded is a **structural property of the
+update**, not a renormalization hack. The modulator applies a convex EMA
+toward a pre-RMSNormed delta:
+
+```python
+delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))    # unit row RMS
+W_new   = (1 - γ_W) * W + γ_W * delta_W                     # convex EMA
+```
+
+with `γ_W = sigmoid(W_decay_logit[cell])` — a learnable per-cell
+plasticity rate, init `-3.0` (sigmoid ≈ 0.047, slow adaptation). Because
+both operands of the convex combination are at ~unit row RMS, the result
+stays at ~unit row RMS. No unbounded accumulator, no bf16 overflow, no
+magic-number decay. The "write now, help later" credit path is preserved
+because W is persistent runtime state updated additively (via the EMA)
+across modulator calls.
 
 ### Neuromodulator
 
@@ -247,9 +264,21 @@ neuron identity vectors — identity is set during bootstrap and frozen.
 
 **Output** `[BS, NC, mod_out=1056]`:
 ```python
-delta_W:      [BS, NC, N*N=1024]  → reshape to [BS, NC, 32, 32]  (direct)
-delta_decay:  [BS, NC, N=32]
+delta_W_raw:      [BS, NC, N*N=1024]  → reshape [BS, NC, 32, 32]
+delta_decay_raw:  [BS, NC, N=32]
 ```
+
+Both outputs are **not applied directly**. They pass through bounded
+convex-EMA updates:
+```python
+delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
+W_new   = (1 - γ_W) * W + γ_W * delta_W
+decay_new = (1 - γ_d) * decay + γ_d * sigmoid(delta_decay_raw)
+```
+with `γ_W = sigmoid(W_decay_logit[cell])` and `γ_d = sigmoid(decay_gamma_logit[cell])`
+— learnable per-cell plasticity rates (both init `-3.0`, ≈ 0.047). This
+guarantees W stays at ~unit row RMS and decay stays in `[0,1]` by
+construction.
 
 ### Hebbian co-activation trace
 
@@ -315,14 +344,13 @@ reshaped to `[BS, D]`.
 ```
 h                  : [BS, NC, Cn, D_n]     — neuron hidden states
 msg                : [BS, NC, Cn, D_n]     — neuron messages
-W                  : [BS, NC, Cn, Cn]      — connectivity matrix (RMSNormed at use)
-decay_logit        : [BS, NC, Cn]          — per-neuron temporal decay
+W                  : [BS, NC, Cn, Cn]      — connectivity matrix (unit row RMS by construction)
+decay              : [BS, NC, Cn]          — per-neuron temporal decay in [0,1]
 hebbian            : [BS, NC, Cn, Cn]      — co-activation EMA trace
-s_mem_live         : [BS]                   — current memory-head surprise
-s_mem_ema_fast     : [BS]                   — fast EMA
+s_mem_live         : [BS]                   — current memory-head CE
+s_mem_ema_fast     : [BS]                   — fast EMA of s_mem_live
 readout_drift      : [BS, NC, 1]            — per-cell volatility
-prev_readout       : [BS, D]                — last readout (for memory head)
-prev_readout_cell  : [BS, NC, D_n]          — last per-cell readout (for drift)
+prev_readout       : [BS, D]                — last readout; reshaped per-cell on-demand for drift
 ```
 
 All of these persist across segments and chunks — memory is lifelong.
@@ -341,7 +369,9 @@ Detached at TBPTT boundaries.
 | mod_b1 | [NC=8, 2048] | 16K | |
 | mod_w2 | [NC=8, 2048, 1056] | 17.3M | Per-cell modulator layer 2 |
 | mod_b2 | [NC=8, 1056] | 8K | |
-| hebbian_decay_logit | [NC=8] | 8 | Learnable per-cell Hebbian timescale |
+| hebbian_decay_logit | [NC=8] | 8 | Learnable per-cell Hebbian EMA rate (init 2.0 → γ≈0.88) |
+| W_decay_logit | [NC=8] | 8 | Learnable per-cell W plasticity rate (init -3.0 → γ≈0.047) |
+| decay_gamma_logit | [NC=8] | 8 | Learnable per-cell decay plasticity rate (init -3.0 → γ≈0.047) |
 | **Memory total** | | **~37.7M** | |
 | **LM total** | | **~67.3M** | |
 | **Grand total** | | **~105.0M** | |
@@ -373,7 +403,7 @@ total_loss = ce_loss + mem_pred_weight * mem_pred_loss
   with the memory head, so `aux_loss` *does* reach `embedding.weight`
   and `proj_down`/`ln_final`. This is intended: memory and LM predict
   into the same vocabulary projection and co-adapt that shared space.
-- `prev_readout_cell`, `s_mem_*` are detached (no_grad EMAs).
+- `s_mem_*`, `readout_drift` are detached (no_grad observation signals).
 - TBPTT detach every 8 tokens.
 
 ### EOT Handling
@@ -396,24 +426,37 @@ total_loss = ce_loss + mem_pred_weight * mem_pred_loss
 
 ## Initialization
 
-- **W**: sparse random (K=8 nonzeros per row, value 0.1, no self-connections)
+Runtime state:
+- **W**: sparse random (K=8 nonzeros per row at value 1.0, no self-connections), then row-RMSNormed to unit norm. Absolute value is irrelevant because of the immediate RMSNorm — only the sparsity pattern survives.
 - **h**: small random (N(0, 0.01))
-- **msg, decay_logit**: zeros
+- **msg**: zeros
+- **decay**: 0.5 (midrange in [0,1])
+- **hebbian**: zeros
 - **s_mem_live, s_mem_ema_fast**: zeros
-- **prev_readout, prev_readout_cell**: zeros
-- **mem_scale**: sqrt(alpha) = 2.0
-- **mod_w2**: small init (× 0.01)
-- **inject_w**: kaiming uniform
+- **readout_drift**: zeros
+- **prev_readout**: zeros
 
-## Performance
+Learned parameters:
+- **mem_scale**: full(D, sqrt(alpha)) = 2.0 per dim
+- **state_w1/w2, msg_w1/w2**: Xavier uniform with tanh gain (√2)
+- **mod_w1, mod_w2**: Xavier uniform (linear gain = 1.0, via custom einsum-aware helper)
+- **inject_w**: Xavier uniform
+- **hebbian_decay_logit**: 2.0 (γ ≈ 0.88 — fast adaptation)
+- **W_decay_logit, decay_gamma_logit**: -3.0 (γ ≈ 0.047 — slow adaptation)
 
-BS=96, tier_a, RTX 4090:
-- 235 ms/step, **52.3K tok/s**, 22.3 GB
-- Training time estimates: 0.75B tokens ≈ 4h, 1.5B tokens ≈ 8h
+## Architectural simplifications
 
-The cost relative to the PCM-based predecessor (57K tok/s) comes from the
-segment-level memory-head CE on `[BS, T, V]` readout logits — chunked
-over time to keep peak VRAM bounded but still the dominant new cost. The
-architectural simplification is worth it: no PCM, no split_mlp, no
-surprise_proj, no detach gymnastics, and the surprise signal is
-principled, interpretable, and genuinely live in the per-token loop.
+Relative to earlier v9/v10 iterations:
+- **No PCM** (predictive coding module) — the per-token memory-head CE
+  serves the same "prediction-error → learning signal" role without a
+  separate predictor network.
+- **No split_mlp** combining H_mid with a surprise projection — the
+  upper scan consumes `H_mid + mem_scale * readout` directly.
+- **No surprise_proj** — surprise is a scalar EMA fed to the modulator,
+  not a feature projected back into the LM residual stream.
+- **No detach gymnastics beyond `H_mid.detach()`** isolating the LM
+  lower scan from the memory path.
+
+The surprise signal is principled (proper CE from the weight-tied
+memory head), interpretable (scale-invariant, ≥0, matches LM CE units),
+and live in the per-token compiled loop.

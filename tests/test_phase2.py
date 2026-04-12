@@ -68,6 +68,80 @@ class TestPhase2Rollout:
         r2 = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, sample=False)
         assert (r1["codes"] == r2["codes"]).all(), "argmax should be deterministic"
 
+    def test_phase1_phase2_parity(self):
+        """forward_segment (phase 1) and forward_segment_phase2 (deterministic)
+        should run on the same input and produce readouts/state in the same
+        ballpark.
+
+        Strict numerical equality is not achievable: phase 2 quantizes the
+        continuous modulator output through the RVQ bottleneck, which
+        introduces reconstruction error. But the two paths must produce
+        OUTPUT SHAPES that match exactly, run without errors on the same
+        inputs, and evolve the memory state in the same regime (readouts
+        should have similar order-of-magnitude).
+
+        This is the guard against silent drift between the duplicated
+        _run_block (phase 1) and forward_segment_phase2 (phase 2) glue.
+        If someone breaks one path, the shape or magnitude check catches it.
+
+        See audit #5.
+        """
+        config, mg, lm = _make_setup(BS=2, T=16)
+        vq = _make_vqvae(action_dim=config.mod_out)
+
+        H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
+        input_ids = torch.randint(0, config.vocab_size, (2, 16))
+
+        # Run phase 1
+        torch.manual_seed(123)
+        mg.initialize_states(2, torch.device("cpu"))
+        readouts_p1, _ = mg.forward_segment(H_mid.clone(), input_ids.clone(), lm)
+        W_p1 = mg.W.clone()
+        decay_p1 = mg.decay.clone()
+        hebbian_p1 = mg.hebbian.clone()
+
+        # Run phase 2 with the same seed, deterministic sampling
+        torch.manual_seed(123)
+        mg.initialize_states(2, torch.device("cpu"))
+        r_p2 = mg.forward_segment_phase2(
+            H_mid.clone(), input_ids.clone(), lm, vq, sample=False)
+        readouts_p2 = r_p2["readouts"]
+        W_p2 = mg.W.clone()
+        decay_p2 = mg.decay.clone()
+        hebbian_p2 = mg.hebbian.clone()
+
+        # Shapes must match exactly.
+        assert readouts_p1.shape == readouts_p2.shape, \
+            f"readouts shape drift: {readouts_p1.shape} vs {readouts_p2.shape}"
+        assert W_p1.shape == W_p2.shape
+        assert decay_p1.shape == decay_p2.shape
+        assert hebbian_p1.shape == hebbian_p2.shape
+
+        # Both must produce non-trivial, finite outputs.
+        assert readouts_p1.abs().sum() > 0
+        assert readouts_p2.abs().sum() > 0
+        assert torch.isfinite(readouts_p1).all()
+        assert torch.isfinite(readouts_p2).all()
+        assert torch.isfinite(W_p2).all()
+        assert torch.isfinite(decay_p2).all()
+        assert torch.isfinite(hebbian_p2).all()
+
+        # Readouts should be in the same regime. VQ reconstruction error
+        # with small test codebooks can be large, so we only check that
+        # readout magnitudes haven't diverged by an order of magnitude.
+        # This catches gross regressions (one path outputs zeros, NaNs,
+        # or wildly inflated values) without requiring numerical equality.
+        mag_p1 = readouts_p1.abs().mean().item()
+        mag_p2 = readouts_p2.abs().mean().item()
+        ratio = max(mag_p1, mag_p2) / max(min(mag_p1, mag_p2), 1e-8)
+        assert ratio < 10.0, (
+            f"readout magnitude drift too large: "
+            f"|phase1|={mag_p1:.4f}, |phase2|={mag_p2:.4f}, ratio={ratio:.2f}")
+
+        # decay must stay in [0, 1] for both (convex EMA invariant).
+        assert (decay_p1 >= 0).all() and (decay_p1 <= 1).all()
+        assert (decay_p2 >= 0).all() and (decay_p2 <= 1).all()
+
 
 class TestGRPOGradientFlow:
     def test_log_prob_grad_reaches_z(self):
@@ -126,14 +200,31 @@ class TestGRPOGradientFlow:
 
 
 class TestCollectModulatorAction:
-    def test_returns_expected_shape(self):
+    def test_fallback_snapshot_shape(self):
+        """With _collecting_actions=False, returns a single end-of-chunk snapshot."""
         config, mg, lm = _make_setup(BS=2, T=16)
-        # Run a forward pass first so the state isn't fresh zeros
         H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
         mg.forward_segment(H_mid, input_ids, lm)
 
         action = mg.collect_modulator_action()
         assert action is not None
-        assert action.shape == (2, config.N_cells, config.mod_out)
+        # Returns [1, BS, NC, mod_out] — single snapshot with leading events dim.
+        assert action.shape == (1, 2, config.N_cells, config.mod_out)
+        assert action.dtype == torch.float32
+
+    def test_per_event_collection_shape(self):
+        """With _collecting_actions=True, returns one entry per modulation event."""
+        config, mg, lm = _make_setup(BS=2, T=16)
+        H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
+        input_ids = torch.randint(0, config.vocab_size, (2, 16))
+
+        mg.start_action_collection()
+        mg.forward_segment(H_mid, input_ids, lm)
+        action = mg.collect_modulator_action()
+        mg.stop_action_collection()
+
+        assert action is not None
+        expected_events = 16 // config.modulation_interval
+        assert action.shape == (expected_events, 2, config.N_cells, config.mod_out)
         assert action.dtype == torch.float32

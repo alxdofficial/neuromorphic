@@ -226,10 +226,16 @@ def plot_phase1_gradients(records, output_path):
         axes[1, 0].legend(fontsize=7)
         setup(axes[1, 0], "Weight Norms", "L2")
 
-        plot_line(axes[1, 1], get(records, "mod_action_norm"), C["mod"], "action_norm")
-        plot_line(axes[1, 1], get(records, "mod_action_var"), C["mod_grad"], "action_var")
-        axes[1, 1].legend()
-        setup(axes[1, 1], "Modulator Action Stats", "magnitude")
+        # Applied plasticity — the actual signal that matters after the
+        # bounded-W redesign. Raw `mod_action_norm` is kept for comparison.
+        plot_line(axes[1, 1], get(records, "applied_dW_norm"),
+                  C["mod"], "||ΔW|| applied")
+        plot_line(axes[1, 1], get(records, "applied_dDecay_norm"),
+                  C["mod_grad"], "||Δdecay|| applied")
+        plot_line(axes[1, 1], get(records, "mod_action_norm"),
+                  C["decay"], "raw action", linestyle=":")
+        axes[1, 1].legend(fontsize=7)
+        setup(axes[1, 1], "Applied Plasticity vs Raw Action", "L2")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
@@ -238,9 +244,10 @@ def plot_phase1_gradients(records, output_path):
 
 
 def plot_phase1_memory(records, output_path):
-    records, _ = split_train_eval(records)
+    train_rows, eval_rows = split_train_eval(records)
+    records = train_rows
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+        fig, axes = plt.subplots(4, 2, figsize=(16, 18))
         fig.suptitle("Phase 1 Memory Health", fontsize=14, fontweight="bold")
 
         plot_line(axes[0, 0], get(records, "h_norm"), C["h"], "h")
@@ -253,25 +260,68 @@ def plot_phase1_memory(records, output_path):
         axes[0, 1].legend()
         setup(axes[0, 1], "State Max |abs|", "magnitude")
 
-        plot_line(axes[1, 0], get(records, "W_norm"), C["W"], "W_norm")
-        plot_line(axes[1, 0], get(records, "W_max"), C["W"], "W_max", linestyle="--")
-        axes[1, 0].legend()
-        setup(axes[1, 0], "W Norm / Max", "magnitude")
+        # Off-diagonal W and Hebbian — these carry the actual plasticity
+        # signal. The full matrix norm is dominated by diagonal/bounded
+        # structure and is low-signal after the bounded-W redesign.
+        plot_line(axes[1, 0], get(records, "W_offdiag_norm"),
+                  C["W"], "W off-diag")
+        plot_line(axes[1, 0], get(records, "hebbian_offdiag_norm"),
+                  C["msg2"], "Hebbian off-diag")
+        # Legacy W_norm kept as a muted reference line.
+        plot_line(axes[1, 0], get(records, "W_norm"),
+                  C["W"], "W (full)", linestyle=":")
+        axes[1, 0].legend(fontsize=7)
+        setup(axes[1, 0], "Off-Diagonal Structure (W / Hebbian)",
+              "L2 / sqrt(N)")
 
-        plot_line(axes[1, 1], get(records, "W_sparsity"), C["W"])
-        setup(axes[1, 1], "W Sparsity (|w| < 1e-4)", "fraction")
+        # W/Hebbian cosine — does plasticity align with co-activation?
+        plot_line(axes[1, 1], get(records, "W_hebbian_offdiag_cos"),
+                  C["mod_grad"])
+        axes[1, 1].axhline(0, color="gray", lw=0.5, ls="--")
+        setup(axes[1, 1],
+              "W ↔ Hebbian Cosine (off-diag)", "cos sim")
 
         plot_line(axes[2, 0], get(records, "decay_mean"), C["decay"], "mean")
-        plot_line(axes[2, 0], get(records, "decay_std"), C["decay"], "std", linestyle="--")
+        plot_line(axes[2, 0], get(records, "decay_std"), C["decay"],
+                  "std", linestyle="--")
         axes[2, 0].legend()
         setup(axes[2, 0], "Decay (persistence gate)", "probability")
 
-        plot_line(axes[2, 1], get(records, "s_mem_live"), C["surprise"], "s_mem_live")
+        plot_line(axes[2, 1], get(records, "s_mem_live"),
+                  C["surprise"], "s_mem_live")
         plot_line(axes[2, 1], get(records, "s_mem_ema_fast"), C["surprise"],
                   "s_mem_ema_fast", linestyle="--")
-        plot_line(axes[2, 1], get(records, "readout_drift_mean"), C["drift"], "drift")
+        plot_line(axes[2, 1], get(records, "readout_drift_mean"),
+                  C["drift"], "drift")
         axes[2, 1].legend()
         setup(axes[2, 1], "Surprise / Drift", "nats / L1")
+
+        # Plasticity rate traces — how fast are the EMA gates?
+        plot_line(axes[3, 0], get(records, "W_gamma_mean"),
+                  C["W"], "W γ")
+        plot_line(axes[3, 0], get(records, "decay_gamma_mean"),
+                  C["decay"], "decay γ")
+        plot_line(axes[3, 0], get(records, "hebbian_gamma_mean"),
+                  C["msg2"], "hebbian γ")
+        axes[3, 0].legend(fontsize=7)
+        setup(axes[3, 0], "Plasticity EMA Rates (sigmoid of logit)",
+              "gamma")
+
+        # Memory leverage: eval CE with memory off vs on. Positive = memory
+        # helps; zero/negative = memory is not being used or hurts.
+        if eval_rows:
+            leverages = [r.get("mem_leverage_ce") for r in eval_rows
+                         if r.get("mem_leverage_ce") is not None]
+            eval_steps = [r["step"] for r, lv in zip(eval_rows, leverages)
+                          if lv is not None]
+            if leverages:
+                axes[3, 1].plot(eval_steps, leverages,
+                                color=C["mem_grad"], marker="o",
+                                markersize=5, linewidth=1.5)
+                axes[3, 1].axhline(0, color="red", lw=0.5, ls="--",
+                                   alpha=0.5)
+        setup(axes[3, 1],
+              "Memory Leverage (eval_CE_off - eval_CE_on)", "nats")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
@@ -287,7 +337,7 @@ def plot_phase1_memory(records, output_path):
 def plot_phase2_grpo(records, output_path):
     train_rows, eval_rows = split_train_eval(records)
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+        fig, axes = plt.subplots(4, 3, figsize=(18, 18))
         fig.suptitle(f"Phase 2 GRPO ({len(train_rows)} train / "
                      f"{len(eval_rows)} eval)",
                      fontsize=14, fontweight="bold")
@@ -350,12 +400,21 @@ def plot_phase2_grpo(records, output_path):
             axes[2, 0].legend()
         setup(axes[2, 0], "Step Timing", "seconds")
 
-        # (2,1) Throughput (tok/s)
+        # (2,1) Throughput (tok/s). tokens_seen resets per stage, so use
+        # a per-step token count derived from tokens_seen WITHIN each stage,
+        # not the cross-stage difference.
         tokens = get(tr, "tokens_seen")
-        if tokens and roll_t and grad_t and len(tokens) > 1:
-            tok_per_step = [t2 - t1 for t1, t2 in zip(tokens[:-1], tokens[1:])]
-            total_t = [r + g for r, g in zip(roll_t[1:], grad_t[1:])]
-            tput = [tk / max(tt, 0.01) for tk, tt in zip(tok_per_step, total_t)]
+        windows_all = get(tr, "stage_window")
+        if tokens and roll_t and grad_t and len(tokens) > 1 and windows_all:
+            tput = []
+            for i in range(1, len(tokens)):
+                # If stage changed or tokens_seen went down, skip the boundary.
+                if windows_all[i] != windows_all[i - 1] or tokens[i] < tokens[i - 1]:
+                    tput.append(float("nan"))
+                    continue
+                step_tokens = tokens[i] - tokens[i - 1]
+                step_time = roll_t[i] + grad_t[i]
+                tput.append(step_tokens / max(step_time, 0.01))
             plot_line(axes[2, 1], tput, C["tput"])
         setup(axes[2, 1], "Throughput", "tok/s")
 
@@ -364,6 +423,48 @@ def plot_phase2_grpo(records, output_path):
         if windows:
             axes[2, 2].plot(windows, color=C["codes"], linewidth=2.0)
         setup(axes[2, 2], "Curriculum Window W", "tokens")
+
+        # (3,0) Quantization residual (continuous vs quantized proxy drift).
+        # High relative residual = VQ is losing info, GRPO optimizing a
+        # different policy than the continuous modulator.
+        qr = get(tr, "quant_resid_rel")
+        if qr:
+            plot_line(axes[3, 0], qr, C["mod_grad"], "rel")
+            axes[3, 0].axhline(0.3, color="red", lw=0.5, ls="--", alpha=0.5)
+        setup(axes[3, 0], "Quantization Residual (rel)",
+              "||raw-dec(q)|| / ||raw||")
+
+        # (3,1) Proxy alignment: reward trend vs eval CE trend.
+        # If reward improves but eval CE doesn't, GRPO is drifting.
+        reward = get(tr, "reward_mean")
+        if reward and eval_rows:
+            # Normalize both to [0, 1] over their own ranges to make them
+            # comparable on one axis.
+            def _norm(xs):
+                lo, hi = min(xs), max(xs)
+                rng = hi - lo
+                return [(x - lo) / rng if rng > 1e-9 else 0.5 for x in xs]
+
+            train_steps = [r.get("step", i) for i, r in enumerate(tr)]
+            plot_line(axes[3, 1], _norm(reward), C["reward"],
+                      "reward (↑ better)")
+            eval_steps = [r["step"] for r in eval_rows]
+            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
+            # Plot eval CE inverted so ↑ = better, on same normalized axis.
+            eval_neg = [-x for x in eval_ce]
+            idx_by_step = {s: i for i, s in enumerate(train_steps)}
+            eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
+            axes[3, 1].plot(eval_x, _norm(eval_neg),
+                            color=C["aux"], marker="o", markersize=4,
+                            linestyle="--", label="-eval ce (↑ better)")
+            axes[3, 1].legend(loc="lower right", fontsize=7)
+        setup(axes[3, 1], "Proxy Alignment (normalized)", "[0,1]")
+
+        # (3,2) Policy entropy — exploration health.
+        ent = get(tr, "entropy_mean")
+        if ent:
+            plot_line(axes[3, 2], ent, C["log_pi"])
+        setup(axes[3, 2], "Policy Entropy (per-record)", "nats")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)

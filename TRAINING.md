@@ -1,83 +1,133 @@
-# Training Instructions
+# Training
 
-## v9-backprop with 2-Pass Simulation — Current (branch: v9-backprop)
+Quick-start commands for the multi-phase training pipeline. For architectural
+background see `docs/design.md`; for the training protocol rationale see
+`docs/training_strategy.md`.
 
-```bash
-# Standard training
-python -u -m src.v8.train --bs 48 --steps 30000
+## Prerequisites
 
-# LM-only baseline (no memory graph)
-python -u -m src.v8.train --bs 48 --steps 30000 --no-memory
+1. Tokenized data shards live under `data/`. Regenerate with:
+   ```bash
+   python scripts/prepare_data.py --tokens 12B --seed 42
+   ```
+   This produces `pile_train.bin` + `pile_val.bin` with document-level disjoint
+   splits (SHA-256 hash exclusion — see `scripts/prepare_data.py`).
 
-# Resume from checkpoint
-python -u -m src.v8.train --bs 48 --steps 60000 --resume outputs/v9/<run>/v9_step30000.pt
-```
+2. Always run Python with `-u` so stdout isn't buffered during long runs.
 
-### Architecture
+3. `outputs/` is in `.gitignore`. Commit code before starting long runs.
 
-Split-scan LM with differentiable memory graph, trained end-to-end by backprop:
-- **Lower scan**: 2 layers (D=2048, d_inner=580, GLU)
-- **PCM**: Dynamic predictive coding — predicts transitions (H[t+1]-H[t]), RMSNorm on surprise.
-- **Memory graph**: 512 neurons, D_neuron=256, K=32 connections
-  - 2-pass simulation: freeze inter-neuron messages, run T MLP steps per pass
-  - Per-neuron modulator MLP (hidden=80): predicts w_conn, decay, primitives
-  - State MLP with structural decay: h = decay * h_prev + (1-decay) * tanh(MLP(input, h))
-  - Message MLP: generates per-neuron messages
-  - Dendritic tree: hierarchical integration of neighbor signals
-  - Phi-based structural plasticity: Pearson correlation, anti-correlation pruning, 20% exploration
-- **Inject**: H_enriched = H_mid + mem_scale * mem_readout  [learnable per-dim scale]
-- **Upper scan**: 2 layers on memory-enriched representations
+## Full pipeline: bootstrap + iterative cycles
 
-### Config (Tier A)
-
-| | Value |
-|---|---|
-| Total params | 110M (LM=52M, Memory=58M) |
-| Lower scan | 2 layers (D=2048, d_inner=580) |
-| Upper scan | 2 layers |
-| Memory neurons | 512, D=256, K=32 connections |
-| Modulator | Per-neuron MLP, hidden=80 |
-| State/Message MLPs | Per-neuron, hidden=24 |
-| Dendritic tree | 2 branches × 16 synapses |
-| Segment length | T=128 tokens (1 segment per chunk) |
-| Simulation | 2-pass (2 gathers + 256 MLP steps) |
-| Throughput | ~24K tok/s at BS=48 on RTX 4090 |
-
-### CLI Options
+The end-to-end driver is `src/train_loop.py`. It orchestrates bootstrap →
+(phase 1 main → action collection → codebook fit → phase 2 curriculum) × N.
 
 ```bash
---bs N             # Batch size (default 8)
---steps N          # Training steps (default 10000)
---lr FLOAT         # Learning rate (default 3e-4)
---no-memory        # LM-only baseline (no memory graph)
---resume PATH      # Resume from checkpoint
---save-dir PATH    # Output directory (default outputs/v9)
---save-interval N  # Checkpoint interval (default 5000)
---keep-checkpoints N  # Keep only last N checkpoints (default 3)
---snapshot-interval N # Memory graph snapshot interval (default 1000)
---log-interval N   # Steps between metric logging (default 50)
+python -u -m src.train_loop \
+    --work-dir outputs/v12 \
+    --bs 96 \
+    --phase2-bs 8 \
+    --phase2-group-size 8 \
+    --bootstrap-tokens 500_000_000 \
+    --phase1-tokens-per-cycle 10_000_000 \
+    --action-collection-tokens 2_000_000 \
+    --cycles 5 \
+    --merge-interval 200 \
+    --phase2-merge-interval 50
 ```
 
-### Outputs
+Use `--skip-bootstrap` if `bootstrap.pt` already exists in `--work-dir`, and
+`--start-cycle N` to resume mid-run (picks up from the last completed cycle's
+`phase2.pt`).
 
-All outputs go to `outputs/v9/<run_id>/`:
-- `v9_step{N}.pt` — checkpoints (LM + memory params + runtime state)
-- `metrics.jsonl` — per-step metrics (loss, ppl, tok/s, memory health)
-- `config.json` — run configuration
-- `snapshots/` — periodic memory graph state dumps
+## Sub-commands (one-off invocation)
 
----
-
-## Data Pipeline
-
-The Pile via HuggingFace streaming or pre-tokenized .bin shards:
+### Phase 1 / bootstrap (`src.train`)
 
 ```bash
-python scripts/prepare_data.py --tokens 12B --seed 42
+python -u -m src.train \
+    --bs 96 \
+    --steps 50000 \
+    --lr-target-step 50000 \
+    --save-dir outputs/run1 \
+    --merge-interval 200
 ```
 
-## General Notes
+Important flags:
+- `--resume PATH` — resume from a checkpoint (restores optimizer, scheduler,
+  runtime state, dataloader offset).
+- `--freeze-modulator` — freezes `mod_w1/b1/w2/b2` (cycle phase 1 setting).
+- `--collect-actions` + `--action-db-out PATH` — record modulator outputs at
+  every modulation event; paired with `--no-train` for action collection.
+- `--no-train` — pure inference (no backward, no optimizer step, no LR
+  scheduler advance); the LM stays stationary while actions are collected.
+- `--no-memory` — LM-only baseline (disables the memory graph read).
+- `--eval-interval N` — held-out eval every N steps (`phase="A-val"` shard).
+  `--eval-batches`, `--eval-warmup-batches`, `--eval-bs` tune the eval pass.
 
-- Always use `-u` flag with python to disable output buffering
-- The `outputs/` directory is in `.gitignore`
-- Always commit code changes before starting long training runs
+### Phase 2 GRPO (`src.train_phase2`)
+
+```bash
+python -u -m src.train_phase2 \
+    --checkpoint outputs/run1/phase1_end.pt \
+    --codebook outputs/run1/codebook.pt \
+    --out outputs/run1/phase2.pt \
+    --bs 8 \
+    --group-size 8 \
+    --reward-mode lm_ce \
+    --merge-interval 50
+```
+
+Important flags:
+- `--reward-mode {lm_ce,mem_pred}` — `lm_ce` (default) runs the frozen upper
+  scan + LM head on `H_enriched` for principled per-token CE reward; `mem_pred`
+  uses the cheap memory-head proxy.
+- `--stage1-tokens`, ..., `--stage4-tokens` — per-stage token budgets for the
+  curriculum (reward windows 512 / 1024 / 2048 / 4096).
+- `--warmup-batches N` — forward-only batches to warm the memory state before
+  GRPO starts.
+- `--eval-interval`, `--eval-batches`, `--eval-warmup-batches`, `--eval-bs`.
+
+### Codebook fit (`scripts.train_codebook`)
+
+```bash
+python -u -m scripts.train_codebook \
+    --actions outputs/run1/action_database.pt \
+    --out outputs/run1/codebook.pt \
+    --epochs 20 \
+    --num-levels 1 \
+    --codes-per-level 256
+```
+
+Defaults to **1 level × 256 codes** (flat 256-way categorical). Residual
+quantization is available via `--num-levels > 1` but the current validated
+config is flat.
+
+## Outputs
+
+Per run directory:
+- `bootstrap.pt`, `cycle_NN/phase1_main.pt`, `cycle_NN/phase1_end.pt`,
+  `cycle_NN/phase2.pt` — checkpoints
+- `cycle_NN/action_database.pt` — collected modulator actions
+- `cycle_NN/codebook.pt` — fitted RVQ codebook
+- `metrics.jsonl`, `cycle_NN/phase2_metrics.jsonl` — per-step metrics
+- `plots/` — auto-generated training plots (re-rendered end of each phase 2 stage)
+
+## Monitoring
+
+During training, watch:
+- `loss` / `eval_ce_loss` — LM CE, primary quality metric
+- `aux_loss` / `aux_ce_ratio` / `eval_aux_loss` — memory-head CE and its ratio to main CE
+- `quant_eval_ce` (phase 2) — VQ-argmax deterministic-policy eval; divergence
+  from `eval_ce_loss` indicates proxy drift through the codebook
+- `lm_grad_norm`, `dyn_grad_norm`, `mod_clip_norm` — per-pool grad norms (sqrt-param-scaled budgets)
+- `mod_grad_norm`, `mod_action_norm`, `mod_action_var` — modulator health
+- `applied_dW_norm`, `applied_dDecay_norm` — actual magnitude of plasticity applied each step
+- `W_offdiag_norm`, `W_offdiag_max`, `W_hebbian_offdiag_cos` — memory graph structure
+- `h_norm`, `h_max`, `msg_norm`, `msg_max` — state magnitudes (watch for tanh saturation)
+- `mem_scale_abs_mean`, `mem_scale_abs_max` — drift of the memory readout scale
+- `merge_W_divergence`, `merge_W_relative_div` — how much BS lanes drift
+  apart between merges (large values → modulator isn't learning a
+  generalizable structure)
+- `stream_restarts_total` — data pipeline health (should stay 0 after the
+  exhaustion-raises-loudly fix)

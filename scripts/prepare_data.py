@@ -78,6 +78,7 @@ def stream_and_save(
     split: str = "train",
     text_column: str = "text",
     label: str = "",
+    exclude_texts: set | None = None,
 ) -> dict:
     """Stream a HF dataset, count tokens, save as parquet + tokenized shard.
 
@@ -85,13 +86,19 @@ def stream_and_save(
     training. The .bin shard is a flat uint16 array of token IDs with EOS
     tokens between documents — ready for memory-mapped streaming.
 
+    If exclude_texts is given, any document whose hash matches is skipped.
+    This provides document-level disjointness between train and val.
+
     Returns metadata dict with token/example counts.
     """
+    import hashlib
     print(f"\n{'='*60}")
     print(f"Downloading {label or hf_path}")
     print(f"  Split: {split}")
     print(f"  Target: {target_tokens:,} tokens")
     print(f"  Output: {out_path}")
+    if exclude_texts is not None:
+        print(f"  Excluding: {len(exclude_texts):,} documents from another set")
     print(f"{'='*60}")
 
     eos_id = tokenizer.eos_token_id
@@ -106,9 +113,11 @@ def stream_and_save(
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
 
     texts = []
+    doc_hashes = set()  # for disjointness check in caller
     all_token_ids = []  # collected for .bin shard
     total_tokens = 0
     skipped = 0
+    skipped_overlap = 0
     t0 = time.time()
 
     for i, example in enumerate(ds):
@@ -116,6 +125,14 @@ def stream_and_save(
         if not text or not text.strip():
             skipped += 1
             continue
+
+        # Document-level disjointness: hash the text and skip if it's in
+        # the exclude set. SHA-256 is overkill for dedup but cheap enough.
+        doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if exclude_texts is not None and doc_hash in exclude_texts:
+            skipped_overlap += 1
+            continue
+        doc_hashes.add(doc_hash)
 
         tokens = tokenizer.encode(text, add_special_tokens=False)
         texts.append(text)
@@ -132,7 +149,7 @@ def stream_and_save(
                 f"{total_tokens:>13,} tokens  "
                 f"({total_tokens/1e9:.2f}B / {target_tokens/1e9:.1f}B = {pct:.1f}%)  "
                 f"{rate/1e6:.1f}M tok/s  "
-                f"skipped={skipped}"
+                f"skipped={skipped} overlap={skipped_overlap}"
             )
 
         if total_tokens >= target_tokens:
@@ -161,6 +178,7 @@ def stream_and_save(
         "examples": len(texts),
         "tokens": total_tokens,
         "skipped": skipped,
+        "skipped_overlap": skipped_overlap,
         "file_size_bytes": file_size,
         "elapsed_s": round(elapsed, 1),
         "seed": seed,
@@ -168,6 +186,7 @@ def stream_and_save(
         "shard_file": str(shard_path),
         "shard_tokens": shard_tokens,
         "shard_bytes": shard_size,
+        "doc_hashes": doc_hashes,  # for caller disjointness
     }
 
 
@@ -230,9 +249,11 @@ def main():
 
     t_start = time.time()
 
-    # --- Validation set (different seed slice of train split) ---
-    # The Pile deduplicated only has a 'train' split.
-    # We use a different shuffle seed so val examples are distinct from train.
+    # --- Validation set (collected first so train can exclude these) ---
+    # The Pile deduplicated only has a 'train' split. We collect the val
+    # set first with a distinct seed, record document hashes, then force
+    # train to skip any document that appears in val. This gives real
+    # document-level disjointness instead of relying on shuffle luck.
     val_meta = stream_and_save(
         hf_path=PILE_PATH,
         target_tokens=val_tokens,
@@ -242,6 +263,7 @@ def main():
         split="train",
         label="The Pile (validation slice, seed=1337)",
     )
+    val_doc_hashes = val_meta.pop("doc_hashes")  # strip before saving manifest
     manifest["datasets"]["pile_val"] = val_meta
 
     if args.val_only:
@@ -250,7 +272,7 @@ def main():
         print("\nValidation-only mode — done.")
         return
 
-    # --- Training set ---
+    # --- Training set (explicitly excludes val docs) ---
     train_meta = stream_and_save(
         hf_path=PILE_PATH,
         target_tokens=total_tokens,
@@ -259,7 +281,9 @@ def main():
         seed=args.seed,
         split="train",
         label="The Pile (train)",
+        exclude_texts=val_doc_hashes,
     )
+    train_meta.pop("doc_hashes")  # don't serialize the hash set
     manifest["datasets"]["pile_train"] = train_meta
 
     manifest["total_elapsed_s"] = round(time.time() - t_start, 1)

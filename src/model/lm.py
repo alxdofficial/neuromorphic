@@ -32,7 +32,9 @@ class LM(nn.Module):
         else:
             self.proj_up = None
             self.proj_down = None
-        self.pos_embed = nn.Parameter(torch.randn(config.T, D) * 0.02)
+        # No positional embedding: the scan layers are recurrent and their
+        # hidden carry encodes sequence order implicitly. Same design as
+        # Mamba / RWKV / S4 / RetNet. Explicit position would be redundant.
 
         self.layers = nn.ModuleList()
         for _ in range(config.L_total):
@@ -59,7 +61,6 @@ class LM(nn.Module):
         x = self.embedding(input_ids)
         if self.proj_up is not None:
             x = self.proj_up(x)
-        x = x + self.pos_embed[:T]
 
         H = x
         for i in range(split):
@@ -67,21 +68,6 @@ class LM(nn.Module):
             self._carries[i] = h_last
 
         return H
-
-    def mem_head_target_logit(self, readout: Tensor, target: Tensor) -> Tensor:
-        """Unnormalized log-prob at target under the memory head.
-
-        Shares proj_down → ln_final → lm_head with the main LM head (weight-tied).
-        readout: [BS, D] → target_logit: [BS] (scalar per sample).
-        Used as the cheap live surprise signal inside the memory loop.
-        """
-        dt = self.lm_head.weight.dtype
-        x = readout.to(dt)
-        if self.proj_down is not None:
-            x = self.proj_down(x)
-        x = self.ln_final(x)  # [BS, D_embed]
-        target_emb = self.lm_head.weight[target]  # [BS, D_embed]
-        return (x * target_emb).sum(dim=-1)  # [BS]
 
     def mem_head_logits(self, readouts: Tensor) -> Tensor:
         """Full memory-head logits over a sequence of readouts.
@@ -124,17 +110,31 @@ class LM(nn.Module):
         carries = state.get("carries")
         if carries is None:
             return
+        # Pick any parameter to get the target device — pos_embed may be None
+        # when disabled, so fall back to the embedding weight.
+        device = self.embedding.weight.device
         self._carries = [
-            h.to(self.pos_embed.device) if h is not None else None
+            h.to(device) if h is not None else None
             for h in carries
         ]
 
-    def reset_carries(self, mask: Tensor):
-        """mask: [BS] bool — True for elements to reset."""
-        for i, h in enumerate(self._carries):
-            if h is not None:
-                keep = (~mask).to(h.dtype).unsqueeze(-1)
-                self._carries[i] = h * keep
-
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def compute_mem_scale_stats(self) -> dict:
+        """Diagnostic for mem_scale drift. See audit #9.
+
+        mem_scale is a learnable per-dim scale on the memory readout in
+        H_enriched = H_mid + mem_scale * readout. If it drifts toward 0
+        the memory contribution collapses silently; if it explodes the
+        memory overwhelms H_mid. Neither has any regularizer, so we need
+        to watch it in the metrics stream.
+        """
+        ms = self.mem_scale.detach().float()
+        return {
+            "mem_scale_mean": ms.mean().item(),
+            "mem_scale_std": ms.std().item(),
+            "mem_scale_abs_mean": ms.abs().mean().item(),
+            "mem_scale_abs_max": ms.abs().max().item(),
+            "mem_scale_abs_min": ms.abs().min().item(),
+        }

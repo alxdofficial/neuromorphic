@@ -375,14 +375,20 @@ PHASE_CONFIGS = {
     "A": PhaseConfig(
         name="Phase A: The Pile (Local)",
         datasets=["pile-local"],
-        description="All memory systems active (WM+PM+EM+PCM). Trains on local Pile subset. "
+        description="Training on the local pre-tokenized Pile subset. "
                     "Run scripts/prepare_data.py first.",
+    ),
+    "A-val": PhaseConfig(
+        name="Phase A validation (Local)",
+        datasets=["val-pile-local"],
+        description="Held-out validation subset of The Pile. Use for eval loaders "
+                    "so metrics aren't in-sample.",
     ),
     "B": PhaseConfig(
         name="Phase B: Lifelong Learning (Local Pile)",
         datasets=["pile-local"],
-        description="Phase A + lifelong mode (PM/EM persist across doc boundaries). "
-                    "Same data as Phase A.",
+        description="Phase A + lifelong mode (memory state persists across "
+                    "document boundaries). Same data as Phase A.",
     ),
     "B-legacy": PhaseConfig(
         name="Phase B Legacy: FineWeb-Edu + DCLM (Local)",
@@ -406,30 +412,30 @@ PHASE_CONFIGS = {
         name="Phase C: With Math",
         datasets=["fineweb-edu", "dclm", "finemath"],
         mix_weights=[0.5, 0.35, 0.15],
-        description="Add mathematical reasoning. PM + EM with heuristics.",
+        description="Add mathematical reasoning to the training mix.",
     ),
     "C-synthetic": PhaseConfig(
         name="Phase C: Synthetic Data (Phi-style)",
         datasets=["fineweb-edu", "cosmopedia", "finemath"],
         mix_weights=[0.5, 0.35, 0.15],
-        description="Synthetic textbooks from Cosmopedia. Tests if synthetic helps PM/EM.",
+        description="Synthetic textbooks from Cosmopedia mixed with web text.",
     ),
     "D": PhaseConfig(
         name="Phase D: Math Focus",
         datasets=["finemath", "openwebmath"],
         mix_weights=[0.5, 0.5],
-        description="Mathematical reasoning focus. Tests PM/EM on proofs/definitions.",
+        description="Mathematical reasoning focus (proofs, definitions).",
     ),
     "E": PhaseConfig(
         name="Phase E: Lifelong Learning",
         datasets=["fineweb-edu", "wikipedia"],
         mix_weights=[0.7, 0.3],
-        description="PM/EM persist across doc boundaries.",
+        description="Memory state persists across document boundaries.",
     ),
     "longctx": PhaseConfig(
         name="Long Context Evaluation",
         datasets=["wikipedia"],
-        description="Wikipedia articles for long-context PM/EM evaluation.",
+        description="Wikipedia articles for long-context evaluation.",
     ),
 }
 

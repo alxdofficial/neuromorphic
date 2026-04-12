@@ -30,6 +30,8 @@ class Trainer:
         freeze_modulator: bool = False,
         collect_actions: bool = False,
         metrics_path: str | None = None,
+        no_train: bool = False,
+        merge_interval: int = 0,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -43,8 +45,21 @@ class Trainer:
         self.use_memory = use_memory
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
+        # Pure-inference mode: no backward, no optimizer step. Used during
+        # action collection so the codebook is fit on a stationary LM.
+        self.no_train = no_train
+        # Periodic batch-dim merge for the memory state. Conceptually
+        # there is one shared memory graph; the BS dimension only exists
+        # for parallel training. Without periodic merging the lanes
+        # accumulate independent W/decay/hebbian, which contradicts the
+        # lifelong shared-memory model and breaks BS-change boundaries.
+        # 0 disables; positive N merges every N training steps.
+        self.merge_interval = merge_interval
 
         # Cycle-1+: freeze modulator so phase 1 TBPTT doesn't undo phase 2 GRPO.
+        # Note: train.py already applies this before building the optimizer so
+        # frozen params are excluded from param groups. This is an idempotent
+        # belt-and-suspenders for anyone constructing Trainer directly.
         self.freeze_modulator = freeze_modulator
         if freeze_modulator:
             for p in (model.memory.mod_w1, model.memory.mod_b1,
@@ -69,10 +84,32 @@ class Trainer:
             p for p in model.memory.parameters()
             if id(p) not in mod_param_set
         ]
+        self._lm_params = list(model.lm.parameters())
 
-        # Action collection: snapshot one modulator output per training step.
+        # Per-pool clip budgets scaled by sqrt(param_count). Under a flat
+        # max_grad_norm=1.0 budget, a 67M-param LM pool and a 35M-param
+        # modulator pool and a 2.5M dynamics pool all get the same ceiling,
+        # which means very different per-parameter step sizes between
+        # pools. Scaling by sqrt(pool_params) / sqrt(reference_pool_params)
+        # gives each pool a budget proportional to its "natural" gradient
+        # magnitude (under the assumption that well-conditioned grads scale
+        # as sqrt(N)). The reference pool is the LM (it's the biggest and
+        # the best-studied). See audit #7.
+        def _count(pool):
+            return sum(p.numel() for p in pool)
+        lm_count = max(_count(self._lm_params), 1)
+        dyn_count = max(_count(self._dyn_params), 1)
+        mod_count = max(_count(self._mod_params), 1)
+        import math as _math
+        self._lm_clip_scale = 1.0
+        self._dyn_clip_scale = _math.sqrt(dyn_count / lm_count)
+        self._mod_clip_scale = _math.sqrt(mod_count / lm_count)
+
+        # Action collection: collect at every modulation event within chunks.
         self.collect_actions = collect_actions
         self.action_buffer: list[torch.Tensor] = []
+        if collect_actions:
+            model.memory.start_action_collection()
 
         # JSONL metrics log. Appended per step. One dict per line.
         self.metrics_path = metrics_path
@@ -86,13 +123,23 @@ class Trainer:
             f.write(json.dumps(metrics) + "\n")
 
     def train_chunk(self, batch) -> dict:
-        self.model.train()
+        # In no_train mode this is a pure inference pass — no dropout, no
+        # backward, no optimizer step. Used for action collection so the
+        # codebook is fit on a stationary LM rather than a moving target.
+        if self.no_train:
+            self.model.train(False)
+        else:
+            self.model.train()
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
         prev_token = getattr(batch, "prev_token", None)
         if prev_token is not None:
             prev_token = prev_token.to(self.device, non_blocking=True)
         BS, T = input_ids.shape
+        # Track the last consumed batch's final input token so checkpoint
+        # can save the correct consumer-side prev_token (not the prefetch
+        # thread's runahead version). See codex audit finding #3.
+        self.last_consumed_prev_tokens = input_ids[:, -1].cpu()
 
         t_start = time.time()
 
@@ -100,58 +147,102 @@ class Trainer:
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp)
 
-        with amp_ctx:
-            result = self.model.forward_chunk(
-                input_ids, target_ids=target_ids,
-                use_memory=self.use_memory,
-                prev_token=prev_token)
+        if self.no_train:
+            # Pure inference: disable grad to save memory and time.
+            with torch.no_grad(), amp_ctx:
+                result = self.model.forward_chunk(
+                    input_ids, target_ids=target_ids,
+                    use_memory=self.use_memory,
+                    prev_token=prev_token)
+        else:
+            with amp_ctx:
+                result = self.model.forward_chunk(
+                    input_ids, target_ids=target_ids,
+                    use_memory=self.use_memory,
+                    prev_token=prev_token)
 
         logits = result["logits"]
         aux_loss = result["aux_loss"]
         ce_loss = result["ce_loss"]
         total_loss = result["loss"]
 
-        self.optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
+        if not self.no_train:
+            self.optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
 
-        # Component grad norms (read BEFORE clip to see the raw signal).
-        component_grads = self.model.memory.compute_component_grad_norms()
+            # Component grad norms (read BEFORE clip to see the raw signal).
+            component_grads = self.model.memory.compute_component_grad_norms()
 
-        # Three independent clip pools so a spike in one pool doesn't drown
-        # the others. Each gets the same max_grad_norm budget.
-        lm_grad_norm = nn.utils.clip_grad_norm_(
-            self.model.lm.parameters(), self.max_grad_norm).item()
-        dyn_grad_norm = nn.utils.clip_grad_norm_(
-            self._dyn_params, self.max_grad_norm).item()
-        if self.freeze_modulator:
-            # Modulator params have no grad in this mode; no clip to do.
-            mod_clip_norm = 0.0
+            # Three independent clip pools so a spike in one pool doesn't drown
+            # the others. Budgets are scaled by sqrt(pool_params) / sqrt(lm_params)
+            # so pools with different sizes get comparable per-parameter clipping
+            # pressure (see audit #7).
+            lm_grad_norm = nn.utils.clip_grad_norm_(
+                self._lm_params,
+                self.max_grad_norm * self._lm_clip_scale).item()
+            dyn_grad_norm = nn.utils.clip_grad_norm_(
+                self._dyn_params,
+                self.max_grad_norm * self._dyn_clip_scale).item()
+            if self.freeze_modulator:
+                # Modulator params have no grad in this mode; no clip to do.
+                mod_clip_norm = 0.0
+            else:
+                mod_clip_norm = nn.utils.clip_grad_norm_(
+                    self._mod_params,
+                    self.max_grad_norm * self._mod_clip_scale).item()
+
+            # Phase-1 telemetry: per-cell modulator grad norm (POST clip of the
+            # modulator pool — isolated from dynamics spikes now).
+            mod_grad_norm = self.model.memory.compute_mod_grad_norm()
+
+            self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
         else:
-            mod_clip_norm = nn.utils.clip_grad_norm_(
-                self._mod_params, self.max_grad_norm).item()
-        # Backward-compat aggregate (sqrt of sum of squares).
-        mem_grad_norm = math.sqrt(dyn_grad_norm ** 2 + mod_clip_norm ** 2)
-
-        # Phase-1 telemetry: per-cell modulator grad norm (POST clip of the
-        # modulator pool — isolated from dynamics spikes now).
-        mod_grad_norm = self.model.memory.compute_mod_grad_norm()
-
-        self.optimizer.step()
-        if self.scheduler is not None:
-            self.scheduler.step()
+            # No-train mode: zero out grad-related metrics.
+            component_grads = {f"grad_{n}": 0.0 for n in (
+                "mod_w1", "mod_w2", "state_w1", "state_w2",
+                "msg_w1", "msg_w2", "inject_w", "neuron_id")}
+            lm_grad_norm = 0.0
+            dyn_grad_norm = 0.0
+            mod_clip_norm = 0.0
+            mod_grad_norm = 0.0
+            # Do NOT advance the scheduler: the LR schedule should track
+            # OPTIMIZER updates, not wall-clock steps or tokens seen. In
+            # no_train mode there are zero weight updates, so the LR
+            # stays at whatever the last optimizer step left it at. The
+            # outer cycle loop must compensate by computing phase 1 step
+            # targets excluding action-collection steps.
 
         self.model.detach_states()
 
-        # Phase-1 telemetry: snapshot modulator action stats + memory health.
+        # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
+        # across BS, broadcast back. Done AFTER detach_states so we don't
+        # tangle the autograd graph. Skipped during action collection
+        # (no optimizer updates anyway, so divergence isn't accumulating).
+        merge_stats = {}
+        if (self.merge_interval > 0 and not self.no_train
+                and self.global_step > 0
+                and (self.global_step + 1) % self.merge_interval == 0):
+            merge_stats = self.model.memory.collapse_batch_dim()
+
+        # Phase-1 telemetry: snapshot modulator stats + memory health.
         mod_stats = self.model.memory.compute_modulator_stats()
+        plasticity_rates = self.model.memory.compute_plasticity_rates()
         mem_health = self.model.memory.compute_memory_health()
         param_norms = self.model.memory.compute_param_norms()
+        mem_scale_stats = self.model.lm.compute_mem_scale_stats()
 
         # Optional action collection for codebook fitting.
+        # With per-event collection, each chunk yields ~T/modulation_interval
+        # action snapshots instead of just one end-of-chunk snapshot.
         if self.collect_actions:
-            action = self.model.memory.collect_modulator_action()
-            if action is not None:
-                self.action_buffer.append(action)
+            actions = self.model.memory.collect_modulator_action()
+            if actions is not None:
+                # actions: [n_events, BS, NC, mod_out] → flatten to [n*BS, NC, mod_out]
+                n_events = actions.shape[0]
+                self.action_buffer.append(
+                    actions.reshape(n_events * actions.shape[1], *actions.shape[2:]))
 
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed
@@ -163,21 +254,31 @@ class Trainer:
             "loss": loss_val,
             "ppl": ppl,
             "aux_loss": aux_loss.item(),
+            "aux_ce_ratio": aux_loss.item() / max(loss_val, 1e-6),
             "lr": self.optimizer.param_groups[0]["lr"],
             "tok_s": tok_per_s,
             "lm_grad_norm": lm_grad_norm,
-            "mem_grad_norm": mem_grad_norm,
             "dyn_grad_norm": dyn_grad_norm,
             "mod_clip_norm": mod_clip_norm,
             "mod_grad_norm": mod_grad_norm,
-            "mod_action_norm": mod_stats["mod_action_norm"],
-            "mod_action_var": mod_stats["mod_action_var"],
             "elapsed": elapsed,
             "frozen_modulator": self.freeze_modulator,
+            **mod_stats,
+            **plasticity_rates,
             **mem_health,
             **param_norms,
+            **mem_scale_stats,
             **component_grads,
+            **merge_stats,
         }
+
+        # Data-stream health — exhaustion/restart counters from the streaming
+        # dataloader so we can spot stream collapse during long runs.
+        for attr in ("stream_restarts_total",
+                     "stream_restarts_last_batch",
+                     "streams_exhausted_last_batch"):
+            if hasattr(self.dataloader, attr):
+                metrics[attr] = getattr(self.dataloader, attr)
 
         self.global_step += 1
         self._append_metrics(metrics)
@@ -208,17 +309,18 @@ class Trainer:
         return all_metrics
 
     @torch.no_grad()
-    def evaluate(self, eval_loader, n_batches: int = 8) -> dict:
-        """Run a held-out forward-only evaluation pass.
+    def _eval_one_pass(self, eval_loader, n_batches: int, use_memory: bool,
+                       warmup_batches: int = 0) -> dict:
+        """Run one eval pass with memory on or off. Saves/restores train state.
 
-        Uses a fresh memory state (snapshots and restores the current training
-        state around the call) so eval results are independent of the current
-        training memory carry. Model is placed in eval mode so dropout is off.
+        The first `warmup_batches` batches run forward without contributing
+        to the averaged CE — they're used purely to warm up the memory state
+        so later batches measure steady-state performance rather than
+        cold-start-then-warming behavior.
         """
         model = self.model
         memory = model.memory
 
-        # Snapshot training state so we can restore after eval
         train_mem_state = (
             memory.runtime_state_dict() if memory._initialized else None
         )
@@ -228,7 +330,16 @@ class Trainer:
         train_initialized = model._initialized
         was_training = model.training
 
-        # Reset to fresh memory/LM state for a clean eval run
+        # Pause action collection during eval so eval forward passes don't
+        # pollute the action database with their (fresh-state) modulator
+        # outputs. Also snapshot the current buffer so collection resumes
+        # with exactly the actions collected so far.
+        was_collecting = memory._collecting_actions
+        saved_action_buffer = memory._action_buffer
+        if was_collecting:
+            memory._collecting_actions = False
+            memory._action_buffer = []
+
         memory._initialized = False
         model._initialized = False
         model.lm._carries = [None] * self.config.L_total
@@ -241,9 +352,10 @@ class Trainer:
         amp_ctx = torch.autocast(
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp)
+        total_batches = warmup_batches + n_batches
         try:
             for i, batch in enumerate(eval_loader):
-                if i >= n_batches:
+                if i >= total_batches:
                     break
                 input_ids = batch.input_ids.to(self.device, non_blocking=True)
                 target_ids = batch.target_ids.to(self.device, non_blocking=True)
@@ -253,16 +365,17 @@ class Trainer:
                 with amp_ctx:
                     result = model.forward_chunk(
                         input_ids, target_ids=target_ids,
-                        use_memory=self.use_memory,
+                        use_memory=use_memory,
                         prev_token=batch_prev if batch_prev is not None else prev_token,
                     )
+                prev_token = input_ids[:, -1]
+                # Warmup batches: run forward to warm memory state, don't score.
+                if i < warmup_batches:
+                    continue
                 total_ce += result["ce_loss"].item()
                 total_aux += result["aux_loss"].item()
                 count += 1
-                # Track last-in-batch token for cross-chunk EOT reset
-                prev_token = input_ids[:, -1]
         finally:
-            # Restore training state regardless of whether eval succeeded
             if train_mem_state is not None:
                 memory.load_runtime_state(train_mem_state)
             else:
@@ -271,32 +384,66 @@ class Trainer:
             model._initialized = train_initialized
             if was_training:
                 model.train(True)
+            # Restore action collection state
+            if was_collecting:
+                memory._collecting_actions = True
+                memory._action_buffer = saved_action_buffer
 
         if count == 0:
-            return {"eval_ce_loss": 0.0, "eval_aux_loss": 0.0,
-                    "eval_ppl": 0.0, "eval_batches": 0}
-
-        avg_ce = total_ce / count
-        avg_aux = total_aux / count
+            return {"ce": 0.0, "aux": 0.0, "ppl": 0.0, "count": 0}
         return {
-            "eval_ce_loss": avg_ce,
-            "eval_aux_loss": avg_aux,
-            "eval_ppl": min(math.exp(avg_ce), 1e6),
-            "eval_batches": count,
+            "ce": total_ce / count,
+            "aux": total_aux / count,
+            "ppl": min(math.exp(total_ce / count), 1e6),
+            "count": count,
         }
+
+    def evaluate(self, eval_loader, n_batches: int = 8,
+                 eval_loader_off=None, warmup_batches: int = 0) -> dict:
+        """Run held-out eval: memory-on and memory-off (for leverage gap).
+
+        The memory-off path disables the memory read — it's the upper
+        baseline you'd get from the LM alone. The gap (ce_off - ce_on) tells
+        you how much the memory path is actually contributing.
+
+        warmup_batches: number of batches to run forward before starting
+        to average CE. Lets the memory state warm up so we measure
+        steady-state performance rather than cold-start bias.
+
+        If eval_loader_off is None, the memory-off pass is skipped.
+        """
+        on = self._eval_one_pass(
+            eval_loader, n_batches, use_memory=self.use_memory,
+            warmup_batches=warmup_batches)
+        out = {
+            "eval_ce_loss": on["ce"],
+            "eval_aux_loss": on["aux"],
+            "eval_ppl": on["ppl"],
+            "eval_batches": on["count"],
+        }
+        if eval_loader_off is not None and self.use_memory:
+            off = self._eval_one_pass(
+                eval_loader_off, n_batches, use_memory=False,
+                warmup_batches=warmup_batches)
+            out["eval_ce_loss_no_mem"] = off["ce"]
+            out["eval_ppl_no_mem"] = off["ppl"]
+            # Memory leverage: positive = memory helps, negative = hurts.
+            out["mem_leverage_ce"] = off["ce"] - on["ce"]
+        return out
 
     def flush_action_database(self, path: str) -> int:
         """Save collected modulator actions to disk.
 
-        Actions were accumulated per step as [BS, NC, mod_out] float32 cpu tensors.
-        Concatenate along batch, reshape to [N * NC, mod_out] so each cell's
-        per-call output is one sample, and save. Returns the number of samples.
+        Actions were accumulated per step as [n_events * BS, NC, mod_out]
+        float32 cpu tensors. We save the [N_total, NC, mod_out] shape so the
+        codebook trainer can compute per-cell usage / specialization stats.
+        Returns the number of samples written (N_total * NC).
         """
         if not self.action_buffer:
             return 0
-        stacked = torch.cat(self.action_buffer, dim=0)   # [N_steps*BS, NC, mod_out]
-        samples = stacked.reshape(-1, stacked.shape[-1])  # [N*NC, mod_out]
-        torch.save(samples, path)
-        n = samples.shape[0]
+        stacked = torch.cat(self.action_buffer, dim=0)   # [N_total, NC, mod_out]
+        # Save in [N, NC, D] format so per-cell stats are recoverable.
+        torch.save(stacked, path)
+        n = stacked.shape[0] * stacked.shape[1]
         self.action_buffer.clear()
         return n
