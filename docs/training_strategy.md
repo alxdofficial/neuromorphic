@@ -82,14 +82,14 @@ the whole strategy. We need data, not vibes. Logged at every `log_interval` step
 | `loss` (main LM CE), `aux_loss` (mem_pred), `aux_ce_ratio` | Training curves + does memory carry meaningful signal? |
 | `lm_grad_norm`, `dyn_grad_norm`, `mod_clip_norm` | Per-pool grad norms after the sqrt-param-count-scaled clip |
 | `mod_grad_norm` (per-cell mean) | When this drops below ~0.5× its peak, modulator learning is plateauing under TBPTT |
-| `mod_action_norm`, `mod_action_var` | Does the modulator's raw output magnitude stabilize and stay diverse? |
+| `mod_action_norm` | Does the modulator's raw output magnitude stabilize? |
 | `applied_dW_norm`, `applied_dDecay_norm` | Per-step magnitude of the *applied* plasticity after the convex-EMA — the actual effect on W/decay |
 | `W_offdiag_norm`, `W_offdiag_max`, `W_hebbian_offdiag_cos` | Off-diagonal W structure + W↔Hebbian alignment (full-matrix W_norm is pinned by bounded-W and no longer informative) |
 | `h_norm`, `h_max`, `msg_norm`, `msg_max` | State magnitudes — watch for tanh saturation at large values |
 | `decay_mean`, `decay_std` | Persistence regime the modulator has settled on |
 | `s_mem_live`, `s_mem_ema_fast` | Modulator's input surprise signal |
 | `mem_scale_abs_mean`, `mem_scale_abs_max`, `mem_scale_abs_min` | Learnable scale on the memory readout — watch for collapse toward 0 or blow-up |
-| `merge_W_relative_div`, `merge_hebbian_relative_div` | How much the BS lanes drift apart between batch-dim merges |
+| `lane_W_relative_div`, `lane_hebbian_relative_div` | How much the BS lanes diverge (expected — each lane reflects modulator response to its own content) |
 
 Optional but worth having:
 - A periodic dump of the action distribution (histogram of `delta_W` magnitudes
@@ -284,9 +284,10 @@ For each training batch:
    per stage so roughly half the calls get complete windows.
 4. **Group baseline**: for each action position t, compute the mean reward
    over the K trajectories: `b_t = mean(r_t over K)`. Advantage: `A_t = r_t - b_t`.
-5. **Advantage normalization**: per-batch `A_t /= (std(A) + 1e-8)`. The
-   K-baseline already centers per-action so only std normalization is
-   applied.
+5. **Advantage normalization**: per-(call, sample) `A_t /= (std_K(A_t) + 1e-8)`.
+   Each (call_idx, sample_idx) slot is centered and scaled by its own
+   K-variance, so late-sequence actions (which have higher reward variance
+   due to memory state divergence across K) don't dominate the gradient.
 6. **Carry one trajectory forward**. After reward computation, one of the K
    rollout end-states is picked **uniformly at random** (not best-of-K — that
    would introduce optimism bias in the state distribution) and becomes the
@@ -299,15 +300,16 @@ Single batched modulator forward over the stacked `(state_t, codes_t)` records:
 
 ```python
 mu = modulator(state_batch)                # batched modulator forward
-z = vq.encoder(mu)                          # [B*N_actions, 32]
+z = vq.encoder(vq.normalize(mu))           # [B*N_actions, 32]
 log_pi = 0
-for level in range(4):
-    logits_l = -‖z - codebook_l[:]‖² / τ   # [B*N_actions, 16]
+for level in range(num_levels):             # default: 1 level
+    logits_l = -‖z - codebook_l[:]‖² / τ   # [B*N_actions, codes_per_level=256]
     log_pi_l = log_softmax(logits_l).gather(codes_batch[:, level])
     log_pi = log_pi + log_pi_l
-    z = z - codebook_l[codes_batch[:, level]]  # next residual
+    z = z - codebook_l[codes_batch[:, level]]  # advance residual
 
-loss = -(advantage_batch * log_pi).mean()
+entropy = sum_l(-probs_l * log_probs_l)     # entropy bonus per level
+loss = -(advantage_batch * log_pi).mean() - entropy_coeff * entropy.mean()
 loss.backward()
 optimizer.step()
 ```
@@ -428,25 +430,25 @@ benchmark on the target GPU before planning runs.
 | GRPO optimizer state | **No** — fresh AdamW per cycle's phase 2 | n/a | n/a | Yes |
 | Phase-1 optimizer + LR scheduler + dataloader offset | Yes — passed through the phase 2 checkpoint | Yes | Yes | n/a (phase 2 has its own AdamW) |
 
-### One logical memory graph + periodic merging
+### Per-lane memory state (no merging)
 
 The memory runtime state (`W`, `decay`, `hebbian`) has a leading batch
-dimension purely as a parallel-training artifact. Conceptually there is
-**one shared memory graph**, and we maintain that invariant by periodic
-`collapse_batch_dim()` calls:
+dimension. Each lane's state reflects the **shared modulator policy**
+applied to that lane's content stream — they diverge naturally and that
+divergence is expected (the modulator doing its job). The modulator's
+weights (`mod_w1/b1/w2/b2`) are shared `nn.Parameter`s updated by every
+backward pass from all BS lanes, so the **policy is already synchronized
+by construction** via standard SGD.
 
-- **Phase 1 / bootstrap**: `Trainer.merge_interval` steps apart (default 200).
-- **Phase 2**: `Phase2Trainer.merge_interval` GRPO steps apart (default 50).
-- **Phase boundaries**: `collapse_batch_dim() + broadcast_to_bs(new_bs)` to
-  reshape the consensus state across BS changes (e.g. phase 1 BS=96 →
-  phase 2 BS=8 → next cycle phase 1 BS=96).
-
-The phase 2 checkpoint saves the **current (post-GRPO) memory state**,
-collapsed to consensus, not the pre-phase-2 snapshot. The next cycle's
-phase 1 resume calls collapse+broadcast automatically if it detects a BS
-mismatch between the loaded runtime state and its own target BS. Transient
-state (`h`, `msg`, LM scan carries) is dropped on phase boundaries and
-repopulated via `--warmup-batches` forward-only passes.
+**Phase boundaries**: `resize_to_bs(new_bs)` handles BS changes
+(e.g. phase 1 BS=96 → phase 2 BS=8 → next cycle phase 1 BS=96).
+On shrink, new_bs lanes are randomly sampled from the old pool (no
+lane is systematically favored). On grow, existing lanes are tiled
+cyclically — duplicates start identical but diverge within a few steps
+as they see different content. Each lane's state is a valid memory
+configuration produced by the shared modulator — no averaging needed.
+Transient state (`h`, `msg`, LM scan carries) is reset on phase
+boundaries and repopulated via `--warmup-batches` forward-only passes.
 
 ### Critical: modulator is frozen in phase 1 after bootstrap
 
@@ -518,8 +520,8 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 | `lr` | 3e-4 | |
 | `mem_lr_scale` | 1.0 | `config.Config` default (was 0.3 pre-W-bounding fix) |
 | `mem_pred_weight` | 0.1 | |
-| `merge_interval` | 200 | Periodic `collapse_batch_dim` cadence — one-logical-graph invariant |
-| logging | mod_grad_norm, mod_action_norm, mod_action_var, mod_stats, memory health | implemented |
+| lane divergence logging | every `log_interval` steps | diagnostic only — no state modification |
+| logging | mod_grad_norm, mod_action_norm, applied_dW/dDecay_norm, memory health | implemented |
 
 ### Codebook fit
 | Knob | Value | Notes |
@@ -549,9 +551,9 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 | Reward mode | **`lm_ce`** (default) | frozen upper scan + LM head; `mem_pred` available as cheap proxy |
 | Logits temperature τ | 1.0 | tunable |
 | Entropy coeff | 0.01 | GRPO + entropy bonus for code diversity |
-| Advantage normalization | per-batch std (centered by K-baseline) | |
+| Advantage normalization | per-(call, sample) std over K (centered by K-baseline) | |
 | Eval cadence | every 50 GRPO updates | continuous + VQ-argmax quantized eval both |
-| `merge_interval` | 50 | phase-2 specific `collapse_batch_dim` cadence |
+| lane divergence logging | every `log_interval` steps | diagnostic only — no state modification |
 | Warmup batches | 8 | `--warmup-batches` forward-only to warm memory state before GRPO |
 
 ### Bootstrap + iterative loop
@@ -571,7 +573,7 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 ## Build order
 
 1. **Phase 1 telemetry** ✅. Done in commit 13b17fb. `mod_grad_norm`,
-   `mod_action_norm`, `mod_action_var` printed at every log_interval.
+   `mod_action_norm`, `applied_dW_norm`, etc. printed at every log_interval.
 
 2. **Action collection.** Add `MemoryGraph.collect_modulator_action()` and a
    trainer collection mode. Snapshot one action per training step at end of
@@ -616,12 +618,7 @@ working.
   smooth or whether the modulator's policy abruptly shifts at the phase boundary.
 - Whether GRPO with K=32 has enough variance reduction without a critic.
 
-### Future extensions (not in scope for the initial build)
-- **Iterative phase A/B**: alternate phase 1 (full TBPTT, dynamics co-adapt)
-  and phase 2 (GRPO on codes). Refit the codebook at each cycle. Promising
-  but no published precedent and several real failure modes (codebook
-  re-indexing, distribution shift). Build only after one-shot phase 2 is
-  validated.
+### Future extensions
 - **State-conditional codebook**: encode action and state jointly so the K
   codes available at any state are state-relevant. Tried by some skill-discovery
   papers, mixed results, adds chicken-and-egg coupling. Skip for now.

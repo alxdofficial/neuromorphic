@@ -45,10 +45,6 @@ def parse_args():
     p.add_argument("--start-cycle", type=int, default=0,
                    help="Resume at this cycle index")
     p.add_argument("--codebook-epochs", type=int, default=20)
-    p.add_argument("--merge-interval", type=int, default=200,
-                   help="Phase 1 batch-dim merge cadence (steps).")
-    p.add_argument("--phase2-merge-interval", type=int, default=50,
-                   help="Phase 2 batch-dim merge cadence (GRPO steps).")
     return p.parse_args()
 
 
@@ -106,7 +102,6 @@ def main():
             "--lr-target-step", str(lr_target_step),
             "--save-dir", args.work_dir,
             "--save-interval", str(steps),
-            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(args.work_dir, before=before)
         if latest is not None:
@@ -170,7 +165,6 @@ def main():
             "--save-interval", str(target_step_main),
             "--resume", current_ckpt,
             "--freeze-modulator",
-            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:
@@ -206,7 +200,6 @@ def main():
             "--no-train",
             "--eval-interval", "0",   # no eval during collection — it'd just be noise
             "--action-db-out", action_db,
-            "--merge-interval", str(args.merge_interval),
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:
@@ -242,7 +235,6 @@ def main():
             "--out", phase2_ckpt,
             "--bs", str(args.phase2_bs),
             "--group-size", str(args.phase2_group_size),
-            "--merge-interval", str(args.phase2_merge_interval),
             "--seed", str(phase2_seed),
         ])
 

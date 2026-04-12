@@ -31,7 +31,6 @@ class Trainer:
         collect_actions: bool = False,
         metrics_path: str | None = None,
         no_train: bool = False,
-        merge_interval: int = 0,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -48,13 +47,6 @@ class Trainer:
         # Pure-inference mode: no backward, no optimizer step. Used during
         # action collection so the codebook is fit on a stationary LM.
         self.no_train = no_train
-        # Periodic batch-dim merge for the memory state. Conceptually
-        # there is one shared memory graph; the BS dimension only exists
-        # for parallel training. Without periodic merging the lanes
-        # accumulate independent W/decay/hebbian, which contradicts the
-        # lifelong shared-memory model and breaks BS-change boundaries.
-        # 0 disables; positive N merges every N training steps.
-        self.merge_interval = merge_interval
 
         # Cycle-1+: freeze modulator so phase 1 TBPTT doesn't undo phase 2 GRPO.
         # Note: train.py already applies this before building the optimizer so
@@ -216,15 +208,15 @@ class Trainer:
 
         self.model.detach_states()
 
-        # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
-        # across BS, broadcast back. Done AFTER detach_states so we don't
-        # tangle the autograd graph. Skipped during action collection
-        # (no optimizer updates anyway, so divergence isn't accumulating).
-        merge_stats = {}
-        if (self.merge_interval > 0 and not self.no_train
+        # Diagnostic: measure how much BS lanes have diverged in their
+        # W/decay/hebbian. This is expected — each lane reflects the
+        # modulator's response to its own content stream. The modulator
+        # policy (mod_w1/b1/w2/b2) is already shared by construction.
+        lane_stats = {}
+        if (not self.no_train
                 and self.global_step > 0
-                and (self.global_step + 1) % self.merge_interval == 0):
-            merge_stats = self.model.memory.collapse_batch_dim()
+                and (self.global_step + 1) % self.log_interval == 0):
+            lane_stats = self.model.memory.compute_lane_divergence()
 
         # Phase-1 telemetry: snapshot modulator stats + memory health.
         mod_stats = self.model.memory.compute_modulator_stats()
@@ -269,7 +261,7 @@ class Trainer:
             **param_norms,
             **mem_scale_stats,
             **component_grads,
-            **merge_stats,
+            **lane_stats,
         }
 
         # Data-stream health — exhaustion/restart counters from the streaming

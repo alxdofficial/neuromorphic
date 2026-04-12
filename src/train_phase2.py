@@ -60,11 +60,6 @@ def parse_args():
                    help="GRPO reward signal: 'lm_ce' uses the full LM path "
                         "(upper scan + head, more expensive but principled); "
                         "'mem_pred' uses the memory head only (cheap proxy).")
-    p.add_argument("--merge-interval", type=int, default=50,
-                   help="Periodic batch-dim merge: collapse W/decay/hebbian "
-                        "consensus across BS lanes every N GRPO steps. "
-                        "Same one-logical-graph invariant as phase 1's "
-                        "merge_interval. 0 disables.")
     return p.parse_args()
 
 
@@ -131,18 +126,18 @@ def main():
     # zeroing out whatever W/decay/hebbian we just loaded below.
     model._initialized = model.memory._initialized
     if phase1_runtime_state is not None:
-        # Temporarily allocate at phase-1 BS to absorb the loaded state...
         try:
             mem_state = phase1_runtime_state.get("memory", {})
             if mem_state.get("initialized", False):
                 # Load at whatever BS the phase-1 state was saved at
                 model.memory.load_runtime_state(mem_state)
-                # Collapse + broadcast to phase 2's BS
-                model.memory.collapse_batch_dim()
-                model.memory.broadcast_to_bs(args.bs)
+                # Resize to phase 2's BS by tiling/trimming lanes.
+                # Each lane's W/decay/hebbian is a valid memory state
+                # produced by the shared modulator on that lane's content.
+                model.memory.resize_to_bs(args.bs)
                 model._initialized = model.memory._initialized
-                print(f"  Loaded phase-1 memory state, collapsed to consensus, "
-                      f"broadcast to phase-2 BS={args.bs}")
+                print(f"  Loaded phase-1 memory state, resized to "
+                      f"phase-2 BS={args.bs}")
         except Exception as e:
             print(f"  WARN: could not transfer phase-1 memory state: {e}")
             model.memory.initialize_states(args.bs, device)
@@ -231,7 +226,6 @@ def main():
         eval_warmup_batches=args.eval_warmup_batches,
         eval_loader_factory=eval_loader_factory,
         reward_mode=args.reward_mode,
-        merge_interval=args.merge_interval,
     )
 
     # Warm up the (cold) phase-2 memory state on real data before GRPO.
@@ -270,18 +264,15 @@ def main():
     # Save — phase 1 optimizer/scheduler pass-through (modulator GRPO has its
     # own AdamW that we discard; the next cycle's phase 1 needs the phase-1
     # AdamW & cosine schedule preserved). For runtime state we save phase 2's
-    # CURRENT (post-GRPO) memory state, collapsed to consensus across BS
-    # lanes — this reflects the state evolved BY the post-GRPO modulator,
-    # which is what phase 1 should resume from. The next cycle's phase 1
-    # broadcasts this consensus to its own BS at load time.
+    # CURRENT (post-GRPO) memory state as-is. Each lane's W/decay/hebbian
+    # reflects the modulator's response to that lane's content — valid state
+    # that the next cycle's phase 1 will resize (tile/trim) to its BS.
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    # Final collapse so the saved state is a single consensus snapshot
-    # regardless of merge_interval cadence.
-    final_merge_stats = model.memory.collapse_batch_dim()
-    if final_merge_stats:
-        print(f"  Final merge stats: "
-              f"W_div_rel={final_merge_stats.get('merge_W_relative_div', 0):.4f} "
-              f"heb_div_rel={final_merge_stats.get('merge_hebbian_relative_div', 0):.4f}")
+    lane_stats = model.memory.compute_lane_divergence()
+    if lane_stats:
+        print(f"  Lane divergence at save: "
+              f"W_div_rel={lane_stats.get('lane_W_relative_div', 0):.4f} "
+              f"heb_div_rel={lane_stats.get('lane_hebbian_relative_div', 0):.4f}")
     phase2_runtime_state = model.runtime_state_dict()
     save_dict = {
         "model_state_dict": model.state_dict(),

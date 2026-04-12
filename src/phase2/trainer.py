@@ -66,7 +66,6 @@ class Phase2Trainer:
         metrics_path: str | None = None,
         train_loader_factory=None,
         reward_mode: str = "lm_ce",
-        merge_interval: int = 0,
     ):
         self.model = model
         self.vqvae = vqvae
@@ -90,14 +89,6 @@ class Phase2Trainer:
         assert reward_mode in ("mem_pred", "lm_ce"), \
             f"reward_mode must be 'mem_pred' or 'lm_ce', got {reward_mode}"
         self.reward_mode = reward_mode
-        # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
-        # across BS lanes between GRPO steps. Same invariant as phase 1's
-        # merge_interval — there is one logical memory graph and the BS
-        # dimension is just a parallelism artifact. Without merging here,
-        # phase 2's BS lanes drift independently for the entire run and the
-        # end-state is no longer a consensus to hand back to phase 1.
-        # 0 disables; positive N merges every N GRPO steps.
-        self.merge_interval = merge_interval
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -222,7 +213,8 @@ class Phase2Trainer:
         }
 
     @torch.no_grad()
-    def evaluate_quantized(self, eval_loader, n_batches: int = 4) -> dict:
+    def evaluate_quantized(self, eval_loader, n_batches: int = 4,
+                           warmup_batches: int = 0) -> dict:
         """Eval using the VQ-ARGMAX (deterministic quantized) policy.
 
         This is the actual policy phase 2 GRPO is trying to optimize, as
@@ -230,6 +222,9 @@ class Phase2Trainer:
         evaluate_continuous and evaluate_quantized diverge, the VQ bottleneck
         is losing meaningful signal and the continuous head metric is
         over-reporting real phase-2 quality.
+
+        warmup_batches: batches to warm memory state before scoring (same
+        semantics as evaluate() — ensures apples-to-apples comparison).
         """
         model = self.model
         memory = model.memory
@@ -254,9 +249,10 @@ class Phase2Trainer:
         total_ce = 0.0
         count = 0
         prev_token = None
+        total_batches = warmup_batches + n_batches
         try:
             for i, batch in enumerate(eval_loader):
-                if i >= n_batches:
+                if i >= total_batches:
                     break
                 input_ids = batch.input_ids.to(self.device, non_blocking=True)
                 BS, T = input_ids.shape
@@ -304,6 +300,12 @@ class Phase2Trainer:
                     logits_parts.append(lm.forward_output(H_up))
                 logits = torch.cat(logits_parts, dim=1)
 
+                prev_token = input_ids[:, -1]
+
+                # Warmup batches: run forward to warm memory state, don't score.
+                if i < warmup_batches:
+                    continue
+
                 # 4) LM CE — must use target_ids (next-token shift), not
                 # input_ids. logits[t] predicts input_ids[t+1], so we need
                 # target_ids[t] = input_ids[t+1]. Use the same shift and
@@ -319,7 +321,6 @@ class Phase2Trainer:
                 batch_ce = (ce_per_tok * valid_mask).sum() / valid_count
                 total_ce += batch_ce.item()
                 count += 1
-                prev_token = input_ids[:, -1]
         finally:
             if train_mem_state is not None:
                 memory.load_runtime_state(train_mem_state)
@@ -379,6 +380,7 @@ class Phase2Trainer:
     def _compute_per_token_reward(
         self, readouts: Tensor, prev_readout_at_start: Tensor, input_ids: Tensor,
         H_mid: Tensor | None = None,
+        prev_token: Tensor | None = None,
     ) -> Tensor:
         """Compute per-token reward for GRPO.
 
@@ -401,6 +403,10 @@ class Phase2Trainer:
         valid_mask = torch.ones(BS, T, device=readouts.device, dtype=torch.float32)
         if T > 1:
             valid_mask[:, 1:] = (input_ids[:, :-1] != eot).float()
+        # Mask position 0 if the previous chunk ended with EOT (cross-document
+        # boundary — same logic as phase 1's mem_pred_loss valid_mask).
+        if prev_token is not None:
+            valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).float()
 
         if self.reward_mode == "lm_ce" and H_mid is not None:
             return self._compute_per_token_reward_lm_ce(
@@ -630,9 +636,13 @@ class Phase2Trainer:
         # Compute per-trajectory reward
         init_prev_readout = init_snapshot["prev_readout"]  # [BS, D]
         init_prev_exp = init_prev_readout.unsqueeze(0).expand(K, *init_prev_readout.shape).reshape(K * BS, -1)
+        # Expand prev_token to K*BS for cross-doc masking at position 0
+        prev_token_exp = None
+        if prev_token is not None:
+            prev_token_exp = prev_token.unsqueeze(0).expand(K, *prev_token.shape).reshape(K * BS)
         per_token_reward = self._compute_per_token_reward(
             result["readouts"], init_prev_exp, ids_exp,
-            H_mid=H_mid_exp)                                 # [K*BS, T]
+            H_mid=H_mid_exp, prev_token=prev_token_exp)     # [K*BS, T]
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
         # Windowed rewards — vectorized across K trajectories
@@ -696,8 +706,9 @@ class Phase2Trainer:
         # Per-action baseline: mean over K trajectories.
         baseline = rewards.mean(dim=0, keepdim=True)         # [1, n_calls, BS]
         advantages = rewards - baseline                      # [K, n_calls, BS]
-        # Per-(call, sample) std over K.
-        std = advantages.std(dim=0, keepdim=True).clamp(min=1e-8)
+        # Per-(call, sample) std over K. Use unbiased=False to avoid NaN when
+        # K=1 (population variance of a single element is 0, not NaN).
+        std = advantages.std(dim=0, keepdim=True, unbiased=False).clamp(min=1e-8)
         return advantages / std
 
     def grpo_step(self, rollout_result: dict) -> dict:
@@ -886,13 +897,10 @@ class Phase2Trainer:
             tokens_seen += step_tokens
             self.global_step += 1
 
-            # Periodic batch-dim merge: collapse W/decay/hebbian to consensus
-            # across the K-rollout-collapsed BS lanes. Done AFTER the GRPO
-            # step but BEFORE logging so merge stats land in the row.
-            merge_stats = {}
-            if (self.merge_interval > 0
-                    and self.global_step % self.merge_interval == 0):
-                merge_stats = self.model.memory.collapse_batch_dim()
+            # Diagnostic: measure lane divergence (does not modify state).
+            lane_stats = {}
+            if self.global_step % self.log_interval == 0:
+                lane_stats = self.model.memory.compute_lane_divergence()
 
             # Persistent jsonl logging for plotting
             log_row = {
@@ -902,7 +910,7 @@ class Phase2Trainer:
                 "rollout_time": t_rollout,
                 "grad_time": t_grad,
                 **step_metrics,
-                **merge_stats,
+                **lane_stats,
             }
             self._append_metrics(log_row)
 
@@ -934,7 +942,8 @@ class Phase2Trainer:
                 # divergence from the continuous eval indicates proxy drift.
                 quant_metrics = self.evaluate_quantized(
                     self.eval_loader_factory(),
-                    n_batches=self.eval_batches)
+                    n_batches=self.eval_batches,
+                    warmup_batches=self.eval_warmup_batches)
                 print(f"[p2 eval {self.global_step}] "
                       f"ce={eval_metrics['eval_ce_loss']:.3f} "
                       f"q_ce={quant_metrics['quant_eval_ce']:.3f} "

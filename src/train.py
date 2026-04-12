@@ -78,11 +78,6 @@ def parse_args():
                    help="Pure inference: skip backward and optimizer step. "
                         "Used for action collection so the codebook is fit on "
                         "a stationary LM rather than a moving target.")
-    p.add_argument("--merge-interval", type=int, default=100,
-                   help="Periodically average the memory's W/decay/hebbian "
-                        "across the batch dimension every N steps and "
-                        "broadcast back. Enforces 'one shared memory graph' "
-                        "semantics. 0 disables.")
     return p.parse_args()
 
 
@@ -276,7 +271,6 @@ def main():
         collect_actions=args.collect_actions,
         metrics_path=metrics_path,
         no_train=args.no_train,
-        merge_interval=args.merge_interval,
     )
     if args.freeze_modulator:
         print("*** Modulator FROZEN — phase 1 of iterative cycle ***")
@@ -286,18 +280,16 @@ def main():
     if pending_runtime_state is not None:
         model.load_runtime_state(pending_runtime_state)
         # Loaded state may have been saved at a different BS (e.g. phase 2
-        # at BS=8 → cycle phase 1 at BS=96). Detect mismatch and reshape via
-        # collapse + broadcast so the next phase 1 starts with a consensus
-        # state at the correct BS. The phase-2 saver already collapses
-        # before saving so this is a no-op divergence-wise, but the
-        # broadcast is still needed to land on phase 1's BS.
+        # at BS=8 → cycle phase 1 at BS=96). Detect mismatch and resize
+        # by tiling existing lanes cyclically. Each lane's W/decay/hebbian
+        # is a valid memory state produced by the shared modulator — we
+        # keep them as-is rather than averaging.
         bs_mismatch = (model.memory._initialized
                        and model.memory.W.shape[0] != bs)
         if bs_mismatch:
             print(f"  Runtime state BS={model.memory.W.shape[0]} != "
-                  f"phase-1 BS={bs}; collapsing + broadcasting.")
-            model.memory.collapse_batch_dim()
-            model.memory.broadcast_to_bs(bs)
+                  f"phase-1 BS={bs}; resizing (tile/trim).")
+            model.memory.resize_to_bs(bs)
         # Phase 2 ckpts: drop LM carries even if BS happens to match. They
         # were last touched mid-rollout (per-trajectory upper carries reset
         # frequently, lower carries follow rollout sequences) and don't

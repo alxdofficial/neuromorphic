@@ -215,27 +215,15 @@ class MemoryGraph(nn.Module):
         # s_mem_* are already detached (no_grad EMAs)
 
     @torch.no_grad()
-    def collapse_batch_dim(self) -> dict:
-        """Average long-term memory state across the batch dimension and broadcast.
+    def compute_lane_divergence(self) -> dict:
+        """Diagnostic: measure how much BS lanes have diverged.
 
-        Conceptually there is ONE memory graph. The BS dimension exists only
-        because we train on BS parallel data streams in the same forward
-        pass. Without periodic merging, those streams accumulate independent
-        connectivity (W), persistence (decay), and co-activation (hebbian)
-        — which violates the "lifelong shared memory" model and causes a
-        cold-start problem at every BS change (e.g. phase 1 → phase 2).
+        Each lane's W/decay/hebbian reflects the modulator's autonomous
+        response to that lane's content stream. Divergence is expected and
+        healthy — it means the shared modulator policy is producing
+        content-appropriate structure in each lane.
 
-        This method averages the long-term state across BS and broadcasts
-        the consensus back to every lane. Transient state (h, msg,
-        prev_readout, etc.) is left per-lane because it represents the
-        current activation pattern given the current input — averaging
-        those would produce a meaningless average activation.
-
-        Returns divergence stats so we can monitor how much the lanes have
-        drifted apart between merges. If divergence is small, the lanes are
-        converging on shared structure (good — averaging is essentially
-        noise reduction). If it's large or growing, the modulator isn't
-        learning a generalizable structure and the merge is destructive.
+        Returns stats for logging (does NOT modify state).
         """
         if not self._initialized:
             return {}
@@ -243,55 +231,65 @@ class MemoryGraph(nn.Module):
         if BS <= 1:
             return {}
 
-        # Per-lane divergence from the mean (computed BEFORE the collapse).
         W_mean = self.W.mean(dim=0, keepdim=True)
         decay_mean = self.decay.mean(dim=0, keepdim=True)
         heb_mean = self.hebbian.mean(dim=0, keepdim=True)
 
-        # Mean L2 distance from consensus per lane (averaged across cells/neurons).
         W_div = (self.W - W_mean).float().norm(dim=(2, 3)).mean().item()
         W_norm = self.W.float().norm(dim=(2, 3)).mean().item()
         decay_div = (self.decay - decay_mean).float().norm(dim=-1).mean().item()
         heb_div = (self.hebbian - heb_mean).float().norm(dim=(2, 3)).mean().item()
         heb_norm = self.hebbian.float().norm(dim=(2, 3)).mean().item()
 
-        # Collapse + broadcast.
-        self.W = W_mean.expand_as(self.W).clone()
-        self.decay = decay_mean.expand_as(self.decay).clone()
-        self.hebbian = heb_mean.expand_as(self.hebbian).clone()
-
         return {
-            "merge_W_divergence": W_div,
-            "merge_W_relative_div": W_div / max(W_norm, 1e-8),
-            "merge_decay_divergence": decay_div,
-            "merge_hebbian_divergence": heb_div,
-            "merge_hebbian_relative_div": heb_div / max(heb_norm, 1e-8),
+            "lane_W_divergence": W_div,
+            "lane_W_relative_div": W_div / max(W_norm, 1e-8),
+            "lane_decay_divergence": decay_div,
+            "lane_hebbian_divergence": heb_div,
+            "lane_hebbian_relative_div": heb_div / max(heb_norm, 1e-8),
         }
 
     @torch.no_grad()
-    def broadcast_to_bs(self, new_bs: int):
+    def resize_to_bs(self, new_bs: int):
         """Resize all runtime state tensors to a new batch size.
 
-        Assumes the long-term state (W, decay, hebbian) is already
-        consensus across the current BS — call collapse_batch_dim() first
-        if not. Takes lane 0's values and broadcasts them to new_bs.
-        Transient state (h, msg, etc.) is reset to zero since it depends
-        on current input and there's no meaningful way to broadcast it.
+        Each lane's W/decay/hebbian is a valid memory state produced by
+        the shared modulator on that lane's content stream.
+
+        When shrinking (new_bs < old_bs): randomly samples new_bs lanes
+        from the old_bs pool so no lane is systematically favored. This
+        does lose (old_bs - new_bs) lane states — unavoidable when
+        reducing parallelism. The surviving lanes are real memory states,
+        not averaged approximations.
+
+        When growing (new_bs > old_bs): tiles the existing lanes
+        cyclically. Duplicated lanes start identical but diverge within
+        a few steps as they see different content.
+
+        Transient state (h, msg, etc.) is reset to zero because it's
+        input-dependent and doesn't transfer across different data streams.
         """
         if not self._initialized:
             return
         device = self.W.device
         dt = self.W.dtype
+        old_bs = self.W.shape[0]
+        if new_bs == old_bs:
+            return
 
-        # Long-term: take lane 0 (assumed consensus) and broadcast.
-        W_one = self.W[:1]                                                    # [1, NC, N, N]
-        decay_one = self.decay[:1]                                             # [1, NC, N]
-        heb_one = self.hebbian[:1]                                             # [1, NC, N, N]
-        self.W = W_one.expand(new_bs, -1, -1, -1).clone()
-        self.decay = decay_one.expand(new_bs, -1, -1).clone()
-        self.hebbian = heb_one.expand(new_bs, -1, -1, -1).clone()
+        if new_bs < old_bs:
+            # Randomly sample new_bs lanes — no lane is special.
+            idx = torch.randperm(old_bs, device=device)[:new_bs]
+        else:
+            # Tile existing lanes cyclically to fill new_bs.
+            idx = torch.arange(new_bs, device=device) % old_bs
 
-        # Transient: reinit to zero (will warm up on next forward).
+        # Long-term state: index from existing lanes.
+        self.W = self.W[idx].clone()
+        self.decay = self.decay[idx].clone()
+        self.hebbian = self.hebbian[idx].clone()
+
+        # Transient state: reinit to zero (will warm up on next forward).
         self.h = torch.zeros(
             new_bs, self.N_cells, self.C_n, self.D_n, device=device, dtype=dt)
         self.msg = torch.zeros(

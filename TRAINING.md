@@ -31,9 +31,7 @@ python -u -m src.train_loop \
     --bootstrap-tokens 500_000_000 \
     --phase1-tokens-per-cycle 10_000_000 \
     --action-collection-tokens 2_000_000 \
-    --cycles 5 \
-    --merge-interval 200 \
-    --phase2-merge-interval 50
+    --cycles 5
 ```
 
 Use `--skip-bootstrap` if `bootstrap.pt` already exists in `--work-dir`, and
@@ -49,8 +47,7 @@ python -u -m src.train \
     --bs 96 \
     --steps 50000 \
     --lr-target-step 50000 \
-    --save-dir outputs/run1 \
-    --merge-interval 200
+    --save-dir outputs/run1
 ```
 
 Important flags:
@@ -74,8 +71,7 @@ python -u -m src.train_phase2 \
     --out outputs/run1/phase2.pt \
     --bs 8 \
     --group-size 8 \
-    --reward-mode lm_ce \
-    --merge-interval 50
+    --reward-mode lm_ce
 ```
 
 Important flags:
@@ -121,13 +117,13 @@ During training, watch:
 - `quant_eval_ce` (phase 2) — VQ-argmax deterministic-policy eval; divergence
   from `eval_ce_loss` indicates proxy drift through the codebook
 - `lm_grad_norm`, `dyn_grad_norm`, `mod_clip_norm` — per-pool grad norms (sqrt-param-scaled budgets)
-- `mod_grad_norm`, `mod_action_norm`, `mod_action_var` — modulator health
+- `mod_grad_norm`, `mod_action_norm` — modulator health
 - `applied_dW_norm`, `applied_dDecay_norm` — actual magnitude of plasticity applied each step
 - `W_offdiag_norm`, `W_offdiag_max`, `W_hebbian_offdiag_cos` — memory graph structure
 - `h_norm`, `h_max`, `msg_norm`, `msg_max` — state magnitudes (watch for tanh saturation)
 - `mem_scale_abs_mean`, `mem_scale_abs_max` — drift of the memory readout scale
-- `merge_W_divergence`, `merge_W_relative_div` — how much BS lanes drift
-  apart between merges (large values → modulator isn't learning a
-  generalizable structure)
+- `lane_W_divergence`, `lane_W_relative_div` — how much BS lanes diverge
+  in their W/decay/hebbian (expected — each lane reflects the modulator's
+  response to its own content stream)
 - `stream_restarts_total` — data pipeline health (should stay 0 after the
   exhaustion-raises-loudly fix)

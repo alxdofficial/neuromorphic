@@ -158,13 +158,19 @@ At segment end, the memory head's full CE is computed over all T tokens,
 # Shift readouts: memory head uses readout[t-1] to predict input_ids[t].
 shifted = concat([prev_readout_at_segment_start, readouts[:, :-1]])  # [BS, T, D]
 
-loss_sum = 0
+# Valid mask: position t is valid iff input_ids[t-1] != eot_id (or prev_token
+# for t=0). Cross-document predictions are masked — no supervision noise.
+valid_mask = ...  # [BS, T]
+
+loss_sum = 0; valid_total = 0
 for s in range(0, T, block_size):                # block_size = tbptt_block = 8
     sub_logits = lm.mem_head_logits(shifted[:, s:s+block_size])  # [BS, 8, V]
-    loss_sum += F.cross_entropy(
+    per_tok = F.cross_entropy(
         sub_logits.reshape(-1, V), input_ids[:, s:s+block_size].reshape(-1),
-        reduction="sum")
-mem_pred_loss = loss_sum / (BS * T)
+        reduction="none").reshape(BS, block_size)
+    loss_sum += (per_tok * valid_mask[:, s:s+block_size]).sum()
+    valid_total += valid_mask[:, s:s+block_size].sum()
+mem_pred_loss = loss_sum / valid_total.clamp(min=1)
 ```
 
 `prev_readout_at_segment_start` is the previous segment's final readout,
@@ -438,7 +444,7 @@ Runtime state:
 
 Learned parameters:
 - **mem_scale**: full(D, sqrt(alpha)) = 2.0 per dim
-- **state_w1/w2, msg_w1/w2**: Xavier uniform with tanh gain (√2)
+- **state_w1/w2, msg_w1/w2**: Xavier uniform with tanh gain (5/3)
 - **mod_w1, mod_w2**: Xavier uniform (linear gain = 1.0, via custom einsum-aware helper)
 - **inject_w**: Xavier uniform
 - **hebbian_decay_logit**: 2.0 (γ ≈ 0.88 — fast adaptation)

@@ -526,6 +526,12 @@ class PersistentStreamDataset(IterableDataset):
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
 
+        # Per-stream carry: the last token of the previous chunk's T+1 window.
+        # On the next step this token becomes the first token of the new T+1
+        # window, so the stream is contiguous (no skipped tokens). Initialized
+        # to None (first chunk has no carry — reads a full T+1 from the stream).
+        self._carry: List[Optional[int]] = [None] * self.batch_size
+
         # Initialize prev_tokens to EOS (triggers reset on first chunk)
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
@@ -536,6 +542,7 @@ class PersistentStreamDataset(IterableDataset):
             return  # will be initialized on first __iter__
         self._stream_restarts = [0 for _ in range(self.batch_size)]
         self.streams = [self._make_stream(i) for i in range(self.batch_size)]
+        self._carry = [None] * self.batch_size
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
 
@@ -544,27 +551,41 @@ class PersistentStreamDataset(IterableDataset):
 
         For streaming HF datasets exact iterator positions cannot be saved.
         We store a CUMULATIVE step count so on resume we fast-forward to the
-        right absolute position. Same pattern as TokenShardDataset.
+        right absolute position. Same pattern as TokenShardDataset. Also
+        saves consumer-side prev_tokens so the first resumed batch gets the
+        correct reset_mask.
         """
         consumed = (self._consumed_step if hasattr(self, '_consumed_step')
                     and self._consumed_step is not None else self.step_count)
         cumulative = getattr(self, '_resume_base', 0) + consumed
+        prev = (self._consumed_prev_tokens
+                if hasattr(self, '_consumed_prev_tokens')
+                and self._consumed_prev_tokens is not None
+                else self.prev_tokens)
         return {
             "step_count": cumulative,
+            "prev_tokens": (prev.clone() if prev is not None else None),
         }
 
     def mark_consumed(self, consumed: int,
                       prev_tokens: torch.Tensor | None = None) -> None:
-        """Record consumed batches for cumulative checkpoint (same API as
-        TokenShardDataset)."""
+        """Record consumed batches + consumer-side prev_tokens for
+        checkpoint (same API as TokenShardDataset)."""
         self._consumed_step = consumed
+        if prev_tokens is not None:
+            self._consumed_prev_tokens = prev_tokens.clone()
 
     def load_state_dict(self, state: dict) -> None:
         """Restore dataset position from a checkpoint.
 
         ``step_count`` is CUMULATIVE across all prior sessions.
+        ``prev_tokens`` is the consumer-side value so the first resumed
+        chunk gets the correct reset_mask.
         """
         self._resume_step = state.get("step_count", 0)
+        saved_prev = state.get("prev_tokens")
+        if saved_prev is not None:
+            self._resume_prev_tokens = saved_prev.clone()
 
     def __iter__(self) -> Iterator[StreamBatch]:
         """
@@ -576,6 +597,14 @@ class PersistentStreamDataset(IterableDataset):
         if self.streams is None:
             self._init_streams()
 
+        # Restore prev_tokens from checkpoint if available (must happen
+        # after _init_streams which sets prev_tokens to all-EOS).
+        resume_prev = getattr(self, "_resume_prev_tokens", None)
+        if (resume_prev is not None
+                and resume_prev.shape == self.prev_tokens.shape):
+            self.prev_tokens = resume_prev.clone()
+            self._resume_prev_tokens = None
+
         # Fast-forward past already-consumed batches on resume.
         resume_step = getattr(self, "_resume_step", 0)
         self._resume_base = resume_step  # for cumulative state_dict
@@ -586,15 +615,25 @@ class PersistentStreamDataset(IterableDataset):
             )
             _ff_count = 0
             while _ff_count < resume_step:
-                # Consume one batch worth of tokens from each stream
+                # Consume one batch worth of tokens from each stream,
+                # using the same carry-overlap pattern as the main loop.
                 for i, stream in enumerate(self.streams):
-                    needed = self.seq_length + 1
-                    tokens = stream.get_tokens(needed)
-                    if len(tokens) < needed and stream.is_exhausted():
+                    carry = self._carry[i]
+                    fresh_needed = self.seq_length if carry is not None else self.seq_length + 1
+                    tokens = stream.get_tokens(fresh_needed)
+                    if len(tokens) < fresh_needed and stream.is_exhausted():
                         self._stream_restarts[i] += 1
                         self.stream_restarts_total += 1
                         self.streams[i] = self._make_stream(i)
-                        self.streams[i].get_tokens(needed - len(tokens))
+                        refill = self.streams[i].get_tokens(fresh_needed - len(tokens))
+                        tokens.extend(refill)
+                    if carry is not None:
+                        tokens = [carry] + tokens
+                    if len(tokens) >= self.seq_length + 1:
+                        self._carry[i] = tokens[-1]
+                    # Update prev_tokens so first resumed batch has correct value
+                    if len(tokens) >= self.seq_length + 1:
+                        self.prev_tokens[i] = tokens[-2]  # input_ids[:, -1]
                 _ff_count += 1
             self._resume_step = 0
             # step_count tracks batches yielded this session (compared
@@ -613,29 +652,33 @@ class PersistentStreamDataset(IterableDataset):
             batch_exhausted = 0
 
             for i, stream in enumerate(self.streams):
-                needed = self.seq_length + 1
-                tokens = stream.get_tokens(self.seq_length + 1)
+                # If we have a carry token from the previous chunk, prepend it
+                # and read T fresh tokens so total = T+1. Otherwise read T+1.
+                # This mirrors TokenShardDataset's "advance by T, not T+1"
+                # pattern: the last target of chunk k overlaps with the first
+                # input of chunk k+1, keeping the stream contiguous.
+                carry = self._carry[i]
+                fresh_needed = self.seq_length if carry is not None else self.seq_length + 1
+                tokens = stream.get_tokens(fresh_needed)
                 produced_any = len(tokens) > 0
 
                 # Recycle exhausted streams so batch capacity does not decay.
-                if len(tokens) < needed and stream.is_exhausted():
+                if len(tokens) < fresh_needed and stream.is_exhausted():
                     batch_exhausted += 1
                     self._stream_restarts[i] += 1
                     self.stream_restarts_total += 1
                     self.streams[i] = self._make_stream(i)
-                    refill = self.streams[i].get_tokens(needed - len(tokens))
+                    refill = self.streams[i].get_tokens(fresh_needed - len(tokens))
                     tokens.extend(refill)
                     produced_any = produced_any or (len(refill) > 0)
                     batch_restarts += 1
 
+                # Prepend carry if present
+                if carry is not None:
+                    tokens = [carry] + tokens
+
+                needed = self.seq_length + 1
                 if len(tokens) < needed:
-                    # We used to pad with eos_token_id here — which silently
-                    # injected false document boundaries into training data
-                    # (the reset_mask fires at EOT, valid_mask excludes EOT
-                    # predictions, so the memory graph sees "documents" that
-                    # didn't exist). Raise loudly instead: if this triggers
-                    # the backing dataset is genuinely too small for the
-                    # requested batch/seq_length, which the user must fix.
                     raise RuntimeError(
                         f"PersistentStreamDataset: lane {i} could not produce "
                         f"{needed} tokens even after recycling an exhausted "
@@ -644,6 +687,9 @@ class PersistentStreamDataset(IterableDataset):
                         f"or stream recycling is broken. Refusing to pad "
                         f"with EOS (would inject false document boundaries)."
                     )
+
+                # Save last token as carry for next chunk (overlap).
+                self._carry[i] = tokens[-1]
 
                 if produced_any:
                     all_exhausted = False
@@ -788,6 +834,7 @@ class MixedStreamDataset(IterableDataset):
         for i in range(self.batch_size):
             self.streams.append(self._make_stream(i))
 
+        self._carry: List[Optional[int]] = [None] * self.batch_size
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
 
@@ -797,12 +844,73 @@ class MixedStreamDataset(IterableDataset):
             return
         self._stream_restarts = [0 for _ in range(self.batch_size)]
         self.streams = [self._make_stream(i) for i in range(self.batch_size)]
+        self._carry = [None] * self.batch_size
         self.prev_tokens = torch.full((self.batch_size,), self.eos_token_id, dtype=torch.long)
         self.step_count = 0
+
+    def state_dict(self) -> dict:
+        """Checkpoint state — same pattern as PersistentStreamDataset."""
+        consumed = (self._consumed_step if hasattr(self, '_consumed_step')
+                    and self._consumed_step is not None else self.step_count)
+        cumulative = getattr(self, '_resume_base', 0) + consumed
+        prev = (self._consumed_prev_tokens
+                if hasattr(self, '_consumed_prev_tokens')
+                and self._consumed_prev_tokens is not None
+                else self.prev_tokens)
+        return {
+            "step_count": cumulative,
+            "prev_tokens": (prev.clone() if prev is not None else None),
+        }
+
+    def mark_consumed(self, consumed: int,
+                      prev_tokens: torch.Tensor | None = None) -> None:
+        self._consumed_step = consumed
+        if prev_tokens is not None:
+            self._consumed_prev_tokens = prev_tokens.clone()
+
+    def load_state_dict(self, state: dict) -> None:
+        self._resume_step = state.get("step_count", 0)
+        saved_prev = state.get("prev_tokens")
+        if saved_prev is not None:
+            self._resume_prev_tokens = saved_prev.clone()
 
     def __iter__(self) -> Iterator[StreamBatch]:
         if self.streams is None:
             self._init_streams()
+
+        # Restore prev_tokens from checkpoint
+        resume_prev = getattr(self, "_resume_prev_tokens", None)
+        if (resume_prev is not None and self.prev_tokens is not None
+                and resume_prev.shape == self.prev_tokens.shape):
+            self.prev_tokens = resume_prev.clone()
+            self._resume_prev_tokens = None
+
+        # Fast-forward on resume (same as PersistentStreamDataset)
+        resume_step = getattr(self, "_resume_step", 0)
+        self._resume_base = resume_step
+        if resume_step > 0:
+            logger.info(
+                "Fast-forwarding MixedStreamDataset: consuming %d batches",
+                resume_step,
+            )
+            for _ in range(resume_step):
+                for i, stream in enumerate(self.streams):
+                    carry = self._carry[i]
+                    fresh_needed = self.seq_length if carry is not None else self.seq_length + 1
+                    tokens = stream.get_tokens(fresh_needed)
+                    if len(tokens) < fresh_needed and stream.is_exhausted():
+                        self._stream_restarts[i] += 1
+                        self.stream_restarts_total += 1
+                        self.streams[i] = self._make_stream(i)
+                        refill = self.streams[i].get_tokens(fresh_needed - len(tokens))
+                        tokens.extend(refill)
+                    if carry is not None:
+                        tokens = [carry] + tokens
+                    if len(tokens) >= self.seq_length + 1:
+                        self._carry[i] = tokens[-1]
+                        self.prev_tokens[i] = tokens[-2]
+            self._resume_step = 0
+            self.step_count = 0
 
         while True:
             if self.max_steps is not None and self.step_count >= self.max_steps:
@@ -814,29 +922,36 @@ class MixedStreamDataset(IterableDataset):
             batch_exhausted = 0
 
             for i, stream in enumerate(self.streams):
-                needed = self.seq_length + 1
-                tokens = stream.get_tokens(needed)
+                # Same carry-overlap pattern as PersistentStreamDataset:
+                # prepend the carry from the previous chunk so the stream
+                # is contiguous (advance by T, not T+1).
+                carry = self._carry[i]
+                fresh_needed = self.seq_length if carry is not None else self.seq_length + 1
+                tokens = stream.get_tokens(fresh_needed)
                 produced_any = len(tokens) > 0
 
-                if len(tokens) < needed and stream.is_exhausted():
+                if len(tokens) < fresh_needed and stream.is_exhausted():
                     batch_exhausted += 1
                     self._stream_restarts[i] += 1
                     self.stream_restarts_total += 1
                     self.streams[i] = self._make_stream(i)
-                    refill = self.streams[i].get_tokens(needed - len(tokens))
+                    refill = self.streams[i].get_tokens(fresh_needed - len(tokens))
                     tokens.extend(refill)
                     produced_any = produced_any or (len(refill) > 0)
                     batch_restarts += 1
 
+                if carry is not None:
+                    tokens = [carry] + tokens
+
+                needed = self.seq_length + 1
                 if len(tokens) < needed:
-                    # See PersistentStreamDataset comment above — raise rather
-                    # than silently padding with EOS (would inject false
-                    # document boundaries into the memory graph's training).
                     raise RuntimeError(
                         f"MixedStreamDataset: lane {i} could not produce "
                         f"{needed} tokens even after recycling (got "
                         f"{len(tokens)}). Backing dataset too small."
                     )
+
+                self._carry[i] = tokens[-1]
 
                 if produced_any:
                     all_exhausted = False
