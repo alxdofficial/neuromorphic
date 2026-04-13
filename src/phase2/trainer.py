@@ -444,86 +444,74 @@ class Phase2Trainer:
         (frozen) upper scan and LM head, computes per-token CE on the
         NEXT-token prediction (logits[t] → input_ids[t+1] shifted).
 
-        Upper scan carries are reset fresh inside this computation — we
-        measure per-rollout LM quality, not cross-rollout sequence quality.
+        Chunks along both the batch dimension (to bound peak VRAM from
+        the [sub_BS, chunk_t, V] logits tensor) and the time dimension.
+        Upper scan carries are reset fresh for each batch sub-chunk.
         """
         BS, T, D = readouts.shape
         lm = self.model.lm
         mem_scale = lm.mem_scale  # frozen in phase 2
         H_enriched = H_mid.to(readouts.dtype) + mem_scale * readouts
 
-        # Build reset mask for upper scan from in-batch EOT positions
         eot = self.config.eot_id
         eos_positions = (input_ids == eot)
         reset_mask = torch.zeros_like(eos_positions)
         reset_mask[:, 1:] = eos_positions[:, :-1]
 
-        # Save / reset upper-scan carries so the rollout's CE is independent
-        # of outer-loop context. Only upper-scan carries matter here; lower
-        # scan is already done (H_mid is cached).
         saved_carries = [
             h.clone() if h is not None else None for h in lm._carries]
         split = self.config.scan_split_at
-        for i in range(split, self.config.L_total):
-            lm._carries[i] = None  # fresh at K*BS shape
+
+        # Chunk along the batch dimension so the peak logits tensor is
+        # [sub_BS, chunk_t, V] instead of [K*BS, chunk_t, V]. At K=8,
+        # BS=8, V=32000, chunk_t=128: full = 1.05 GB vs sub_BS=8 = 0.13 GB.
+        # Each sub-batch gets fresh upper-scan carries (independent rollouts).
+        sub_bs = min(BS, 8)
+        chunk_t = 128
+        all_ce = torch.zeros(BS, T - 1, device=readouts.device, dtype=torch.float32)
 
         try:
-            # Compute per-token CE in chunks without materializing full
-            # [K*BS, T, V] logits tensor (OOMs at K=8, BS=8, T=1024).
-            # Each chunk runs upper scan → head → CE and discards logits.
-            chunk_t = 128
-            ce_chunks = []
-            for s in range(0, T, chunk_t):
-                e = min(s + chunk_t, T)
-                H_chunk = H_enriched[:, s:e]
-                rm_chunk = reset_mask[:, s:e] if reset_mask.any() else None
-                H_upper = lm.forward_scan_upper(H_chunk, reset_mask=rm_chunk)
-                chunk_logits = lm.forward_output(H_upper)  # [BS, chunk, V]
-                ce_chunks.append(chunk_logits)
-            # Compute shifted CE: logits[t-1] predicts input_ids[t].
-            # Concatenate only to do the shift, then chunk the CE itself.
-            # To avoid full concat, handle the shift across chunk boundaries:
-            # prev_last holds the last logit from the previous chunk.
-            all_ce = []
-            prev_last_logit = None
-            chunk_idx = 0
-            for s in range(0, T, chunk_t):
-                e = min(s + chunk_t, T)
-                chunk_logits = ce_chunks[chunk_idx]  # [BS, chunk, V]
-                chunk_targets = input_ids[:, s:e]     # [BS, chunk]
+            for b_start in range(0, BS, sub_bs):
+                b_end = min(b_start + sub_bs, BS)
+                sub_H = H_enriched[b_start:b_end]
+                sub_ids = input_ids[b_start:b_end]
+                sub_rm = reset_mask[b_start:b_end]
 
-                # Build shifted pairs: logits[t-1] predicts target[t].
-                # For positions within this chunk: logits[s..e-2] predict input_ids[s+1..e-1]
-                # For the first position of this chunk: prev_last_logit predicts input_ids[s]
-                if prev_last_logit is not None:
-                    # Prepend last logit from previous chunk
-                    shifted = torch.cat([prev_last_logit, chunk_logits[:, :-1]], dim=1)
-                else:
-                    # First chunk: no logit for position 0, use chunk_logits[:-1]
-                    shifted = chunk_logits[:, :-1]
-                    chunk_targets = chunk_targets[:, 1:]
+                # Fresh upper-scan carries per sub-batch
+                for i in range(split, self.config.L_total):
+                    lm._carries[i] = None
 
-                if shifted.shape[1] > 0:
-                    chunk_ce = F.cross_entropy(
-                        shifted.reshape(-1, shifted.shape[-1]).float(),
-                        chunk_targets.reshape(-1),
-                        reduction="none",
-                    ).reshape(BS, -1)
-                    all_ce.append(chunk_ce)
+                prev_last_logit = None
+                ce_pos = 0
+                for s in range(0, T, chunk_t):
+                    e = min(s + chunk_t, T)
+                    rm_chunk = sub_rm[:, s:e] if sub_rm.any() else None
+                    H_upper = lm.forward_scan_upper(sub_H[:, s:e], reset_mask=rm_chunk)
+                    chunk_logits = lm.forward_output(H_upper)
+                    chunk_targets = sub_ids[:, s:e]
 
-                prev_last_logit = chunk_logits[:, -1:].detach()
-                chunk_idx += 1
-            del ce_chunks  # free logits memory
-            ce = torch.cat(all_ce, dim=1)  # [BS, T-1]
+                    if prev_last_logit is not None:
+                        shifted = torch.cat([prev_last_logit, chunk_logits[:, :-1]], dim=1)
+                    else:
+                        shifted = chunk_logits[:, :-1]
+                        chunk_targets = chunk_targets[:, 1:]
+
+                    if shifted.shape[1] > 0:
+                        chunk_ce = F.cross_entropy(
+                            shifted.reshape(-1, shifted.shape[-1]).float(),
+                            chunk_targets.reshape(-1),
+                            reduction="none",
+                        ).reshape(b_end - b_start, -1)
+                        all_ce[b_start:b_end, ce_pos:ce_pos + chunk_ce.shape[1]] = chunk_ce
+                        ce_pos += chunk_ce.shape[1]
+
+                    prev_last_logit = chunk_logits[:, -1:]
+                    del chunk_logits, H_upper
         finally:
-            # Restore the outer-loop upper carries
             lm._carries = saved_carries
 
-        # Align reward at position t (reward for predicting token t from
-        # action context at t-1). The first position has no reward (no
-        # prior token to predict from). Pad at position 0 with zero.
         rewards = torch.zeros(BS, T, device=readouts.device, dtype=torch.float32)
-        rewards[:, 1:] = -ce
+        rewards[:, 1:] = -all_ce
         rewards = rewards * valid_mask
         return rewards
 

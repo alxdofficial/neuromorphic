@@ -1243,12 +1243,13 @@ class MemoryGraph(nn.Module):
                 gate = decay.unsqueeze(-1)
                 one_minus_gate = 1.0 - gate
 
-                # Record on GPU (moving to CPU per-call causes sync overhead).
-                # Caller is responsible for memory pressure; at phase-2 scale
-                # (BS ~8) the total records fit comfortably.
-                mod_input_records.append(mod_input_f32.detach())
+                # Record on CPU to avoid accumulating GB of mod_inputs on
+                # GPU at large T (e.g. T=8192 → 2048 calls × [K*BS, NC, 1092]
+                # = 4.6 GB at K=8, BS=8). The sync overhead of per-call
+                # .cpu() is small relative to the memory step itself.
+                mod_input_records.append(mod_input_f32.detach().cpu())
                 codes_records.append(
-                    codes.reshape(BS, NC, -1).detach())
+                    codes.reshape(BS, NC, -1).detach().cpu())
                 call_positions.append(t)
 
             # Memory step (same as phase 1)
@@ -1285,7 +1286,7 @@ class MemoryGraph(nn.Module):
 
         return {
             "readouts": readouts,
-            "mod_inputs": torch.stack(mod_input_records, dim=0),   # [n_calls, BS, NC, mod_in]
-            "codes": torch.stack(codes_records, dim=0),             # [n_calls, BS, NC, L]
+            "mod_inputs": torch.stack(mod_input_records, dim=0).to(readouts.device),  # [n_calls, BS, NC, mod_in]
+            "codes": torch.stack(codes_records, dim=0).to(readouts.device),            # [n_calls, BS, NC, L]
             "call_positions": torch.tensor(call_positions, dtype=torch.long),
         }
