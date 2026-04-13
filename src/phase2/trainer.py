@@ -587,20 +587,6 @@ class Phase2Trainer:
         prev_token = getattr(batch, "prev_token", None)
         BS, T = input_ids.shape
 
-        # Auto-reduce K for large T to stay within VRAM. The dominant
-        # tensors are readouts + H_mid_exp, each [K*BS, T, D] in bf16.
-        # At K=8, BS=8, T=8192, D=2048: 2 × 2.15 GB = 4.3 GB for data
-        # alone, plus reward computation intermediates. Cap K*BS*T*D
-        # at a VRAM-safe threshold.
-        max_kbs_tokens = 524_288  # K*BS*T at W=4096 (K=8, BS=8, T=8192) — fits in 24GB with H_mid dedup
-        while K > 1 and K * BS * T > max_kbs_tokens:
-            K = K // 2
-        if K != self.group_size:
-            import logging
-            logging.getLogger(__name__).info(
-                "Auto-reduced K from %d to %d for T=%d (VRAM safety)",
-                self.group_size, K, T)
-
         self.model.lm.detach_carries()
 
         # Run lower scan once (LM is frozen and deterministic per batch).
