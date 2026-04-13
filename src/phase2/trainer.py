@@ -290,15 +290,25 @@ class Phase2Trainer:
                     reset_mask[:, 0] = (effective_prev == eot)
                 if not reset_mask.any():
                     reset_mask = None
-                # Chunk along T to bound VRAM
-                chunk_t = 1024
-                logits_parts = []
+                # Chunked upper scan + CE to avoid materializing [BS, T, V].
+                chunk_t = 128
+                target_ids = batch.target_ids.to(self.device, non_blocking=True)
+                total_ce_batch = 0.0
+                total_valid_batch = 0.0
                 for s in range(0, T, chunk_t):
                     e = min(s + chunk_t, T)
                     rm = reset_mask[:, s:e] if reset_mask is not None else None
                     H_up = lm.forward_scan_upper(H_enriched[:, s:e], reset_mask=rm)
-                    logits_parts.append(lm.forward_output(H_up))
-                logits = torch.cat(logits_parts, dim=1)
+                    chunk_logits = lm.forward_output(H_up)  # [BS, chunk, V]
+                    chunk_targets = target_ids[:, s:e]
+                    chunk_ce = F.cross_entropy(
+                        chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                        chunk_targets.reshape(-1),
+                        reduction="none",
+                    ).reshape(BS, -1)
+                    chunk_valid = (input_ids[:, s:e] != eot).float()
+                    total_ce_batch += (chunk_ce * chunk_valid).sum().item()
+                    total_valid_batch += chunk_valid.sum().item()
 
                 prev_token = input_ids[:, -1]
 
@@ -306,20 +316,9 @@ class Phase2Trainer:
                 if i < warmup_batches:
                     continue
 
-                # 4) LM CE — must use target_ids (next-token shift), not
-                # input_ids. logits[t] predicts input_ids[t+1], so we need
-                # target_ids[t] = input_ids[t+1]. Use the same shift and
-                # mask convention as model.forward_chunk (codex finding #4).
-                target_ids = batch.target_ids.to(self.device, non_blocking=True)
-                ce_per_tok = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    target_ids.reshape(-1),
-                    reduction="none",
-                ).reshape(BS, T)
-                valid_mask = (input_ids != eot).float()
-                valid_count = valid_mask.sum().clamp(min=1.0)
-                batch_ce = (ce_per_tok * valid_mask).sum() / valid_count
-                total_ce += batch_ce.item()
+                valid_count = max(total_valid_batch, 1.0)
+                batch_ce = total_ce_batch / valid_count
+                total_ce += batch_ce
                 count += 1
         finally:
             if train_mem_state is not None:
@@ -469,29 +468,57 @@ class Phase2Trainer:
             lm._carries[i] = None  # fresh at K*BS shape
 
         try:
-            # Upper scan chunks the input internally via the scan layer,
-            # but we want to chunk along time to bound VRAM on long T.
-            # For simplicity run once if T is small, else chunk.
-            chunk_t = 1024
-            all_logits_chunks = []
+            # Compute per-token CE in chunks without materializing full
+            # [K*BS, T, V] logits tensor (OOMs at K=8, BS=8, T=1024).
+            # Each chunk runs upper scan → head → CE and discards logits.
+            chunk_t = 128
+            ce_chunks = []
             for s in range(0, T, chunk_t):
                 e = min(s + chunk_t, T)
                 H_chunk = H_enriched[:, s:e]
                 rm_chunk = reset_mask[:, s:e] if reset_mask.any() else None
                 H_upper = lm.forward_scan_upper(H_chunk, reset_mask=rm_chunk)
-                all_logits_chunks.append(lm.forward_output(H_upper))
-            logits = torch.cat(all_logits_chunks, dim=1)   # [BS, T, V]
+                chunk_logits = lm.forward_output(H_upper)  # [BS, chunk, V]
+                ce_chunks.append(chunk_logits)
+            # Compute shifted CE: logits[t-1] predicts input_ids[t].
+            # Concatenate only to do the shift, then chunk the CE itself.
+            # To avoid full concat, handle the shift across chunk boundaries:
+            # prev_last holds the last logit from the previous chunk.
+            all_ce = []
+            prev_last_logit = None
+            chunk_idx = 0
+            for s in range(0, T, chunk_t):
+                e = min(s + chunk_t, T)
+                chunk_logits = ce_chunks[chunk_idx]  # [BS, chunk, V]
+                chunk_targets = input_ids[:, s:e]     # [BS, chunk]
+
+                # Build shifted pairs: logits[t-1] predicts target[t].
+                # For positions within this chunk: logits[s..e-2] predict input_ids[s+1..e-1]
+                # For the first position of this chunk: prev_last_logit predicts input_ids[s]
+                if prev_last_logit is not None:
+                    # Prepend last logit from previous chunk
+                    shifted = torch.cat([prev_last_logit, chunk_logits[:, :-1]], dim=1)
+                else:
+                    # First chunk: no logit for position 0, use chunk_logits[:-1]
+                    shifted = chunk_logits[:, :-1]
+                    chunk_targets = chunk_targets[:, 1:]
+
+                if shifted.shape[1] > 0:
+                    chunk_ce = F.cross_entropy(
+                        shifted.reshape(-1, shifted.shape[-1]).float(),
+                        chunk_targets.reshape(-1),
+                        reduction="none",
+                    ).reshape(BS, -1)
+                    all_ce.append(chunk_ce)
+
+                prev_last_logit = chunk_logits[:, -1:].detach()
+                chunk_idx += 1
+            del ce_chunks  # free logits memory
+            ce = torch.cat(all_ce, dim=1)  # [BS, T-1]
         finally:
             # Restore the outer-loop upper carries
             lm._carries = saved_carries
 
-        # Per-token CE: logits[:, t-1, :] predicts input_ids[:, t]
-        # Shift labels: pad last position with a copy (masked by valid anyway)
-        shifted_logits = logits[:, :-1].reshape(-1, logits.shape[-1]).float()
-        shifted_targets = input_ids[:, 1:].reshape(-1)
-        ce = F.cross_entropy(
-            shifted_logits, shifted_targets, reduction="none"
-        ).reshape(BS, T - 1)
         # Align reward at position t (reward for predicting token t from
         # action context at t-1). The first position has no reward (no
         # prior token to predict from). Pad at position 0 with zero.
