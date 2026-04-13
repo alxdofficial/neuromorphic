@@ -141,19 +141,27 @@ class ResidualVQ(nn.Module):
         """Replace codes with < dead_code_threshold usage fraction by random
         encoder outputs from the current batch. Called periodically during
         training, not every step.
+
+        For multi-level RVQ, each level sees the residual after subtracting
+        previous levels' contributions, so dead codes at level L are
+        resampled from level-L residuals (not raw z).
         """
         B = z.shape[0]
+        residual = z.clone()
         for lvl in range(self.num_levels):
             total = self.cluster_size[lvl].sum().clamp(min=1.0)
             usage_frac = self.cluster_size[lvl] / total
             dead = (usage_frac < self.dead_code_threshold).nonzero(as_tuple=True)[0]
-            if dead.numel() == 0:
-                continue
-            # Sample replacements from current batch (pre-quantization z).
-            idx = torch.randint(0, B, (dead.numel(),), device=z.device)
-            self.codebooks[lvl, dead] = z[idx].detach()
-            self.embed_avg[lvl, dead] = z[idx].detach()
-            self.cluster_size[lvl, dead] = 1.0
+            if dead.numel() > 0:
+                # Sample from current-level residuals, not raw z.
+                idx = torch.randint(0, B, (dead.numel(),), device=z.device)
+                self.codebooks[lvl, dead] = residual[idx].detach()
+                self.embed_avg[lvl, dead] = residual[idx].detach()
+                self.cluster_size[lvl, dead] = 1.0
+            # Advance residual to next level using nearest-code assignment.
+            dists = (residual.unsqueeze(1) - self.codebooks[lvl].unsqueeze(0)).pow(2).sum(-1)
+            nearest = dists.argmin(dim=1)
+            residual = residual - self.codebooks[lvl][nearest]
 
     @torch.no_grad()
     def usage_histogram(self) -> Tensor:

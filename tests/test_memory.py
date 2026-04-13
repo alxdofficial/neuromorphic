@@ -173,7 +173,7 @@ class TestStateDecay:
         w1_h = w1[:, config.D_n:].contiguous()
         args = (w1_recv, w1_h, mg.state_b1.to(dt), mg.state_w2.to(dt), mg.state_b2.to(dt))
         one_minus_decay = 1.0 - decay
-        h_new = mg._state_update(received, h_orig, decay, one_minus_decay, identity, *args)
+        h_new = mg._state_update(received, h_orig, decay, one_minus_decay, *args)
         diff = (h_new - h_orig).float().abs().max().item()
         assert diff < 0.05, f"State changed too much with high decay: {diff}"
 

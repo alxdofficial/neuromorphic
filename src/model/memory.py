@@ -655,7 +655,7 @@ class MemoryGraph(nn.Module):
         out = torch.tanh(F.linear(hidden, w2, b2))
         return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
-    def _state_update(self, received, h, decay, one_minus_decay, identity,
+    def _state_update(self, received, h, decay, one_minus_decay,
                       w1_recv, w1_h, b1, w2, b2):
         """State MLP with split first layer — avoids cat([received, h])."""
         flat_recv = received.reshape(-1, received.shape[-1])
@@ -748,7 +748,7 @@ class MemoryGraph(nn.Module):
         received = self._receive(msg, W)
         received = self._inject(received, H_aug_t, inject_w, inject_b)
 
-        h = self._state_update(received, h, decay, one_minus_decay, identity,
+        h = self._state_update(received, h, decay, one_minus_decay,
                                st_w1_recv, st_w1_h, st_b1, st_w2, st_b2)
         msg = self._emit_message(h, identity, mg_w1, mg_b1, mg_w2, mg_b2)
         readout = self._readout(msg)
@@ -762,8 +762,9 @@ class MemoryGraph(nn.Module):
         msg:     [BS, NC, N, D_n]
         gamma:   [NC] in (0, 1) — per-cell running-average rate
 
-        Returns the updated hebbian. Runs in no_grad context (caller's
-        responsibility) — the trace is a runtime state, not a learned tensor.
+        Returns the updated hebbian. Intentionally ON the autograd graph
+        so that downstream use of hebbian in the modulator provides
+        gradient back to hebbian_decay_logit (which gamma derives from).
 
         Convex EMA computed in f32: at γ approaching 1, bf16 representation
         of (1-γ) collapses to zero (100% rel error at logit=+7, 16% at

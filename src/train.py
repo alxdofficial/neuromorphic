@@ -238,10 +238,10 @@ def main():
 
         # If scheduler state is missing (e.g. old checkpoint), reconstruct
         # at the correct position instead of restarting from warmup.
-        if not scheduler_loaded and start_step > 0:
+        if not scheduler_loaded and start_optimizer_step > 0:
             scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda, last_epoch=start_step - 1)
-            print(f"  Reconstructed scheduler at step {start_step}, "
+                optimizer, lr_lambda, last_epoch=start_optimizer_step - 1)
+            print(f"  Reconstructed scheduler at optimizer_step {start_optimizer_step}, "
                   f"LR={optimizer.param_groups[0]['lr']:.2e}")
 
     remaining_steps = args.steps - start_step
