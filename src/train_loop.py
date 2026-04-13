@@ -37,7 +37,7 @@ def parse_args():
                    help="Total phase-1 tokens per cycle (incl. action collection)")
     p.add_argument("--action-collection-tokens", type=int, default=2_000_000)
     p.add_argument("--cycles", type=int, default=5)
-    p.add_argument("--bs", type=int, default=96)
+    p.add_argument("--bs", type=int, default=80)
     p.add_argument("--phase2-bs", type=int, default=8)
     p.add_argument("--phase2-group-size", type=int, default=8)
     p.add_argument("--skip-bootstrap", action="store_true",

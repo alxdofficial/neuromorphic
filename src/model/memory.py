@@ -922,7 +922,7 @@ class MemoryGraph(nn.Module):
                 and not os.environ.get("NEUROMORPHIC_NO_COMPILE")):
             self._run_block_uncompiled = self._run_block
             self._run_block = torch.compile(
-                self._run_block, mode="reduce-overhead", fullgraph=False)
+                self._run_block, mode="default", fullgraph=False)
             self._compiled = True
 
         # Valid mask for the TRAINING TARGET (mem_pred_loss only).

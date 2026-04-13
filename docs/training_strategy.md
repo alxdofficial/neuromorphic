@@ -516,7 +516,7 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 |---|---|---|
 | `tbptt_block` | 8 | |
 | `T` (segment length) | 128 | |
-| `BS` | 96 | `train_loop.py` default |
+| `BS` | 80 | RTX 4090 max (OOM at 96 with dense-W memory) |
 | `lr` | 3e-4 | |
 | `mem_lr_scale` | 1.0 | `config.Config` default (was 0.3 pre-W-bounding fix) |
 | `mem_pred_weight` | 0.1 | |
@@ -566,7 +566,7 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 | Phase 1 tokens / cycle (total) | 10M | `--phase1-tokens-per-cycle` — main + collection |
 | Total tokens / cycle | ~50M | excluding bootstrap |
 | Modulator trains during | Bootstrap (TBPTT) + every phase 2 (GRPO) | never via TBPTT after bootstrap |
-| N cycles | `--cycles` (default 5) | run until plateau or budget exhausted |
+| N cycles | 20 | 20 × 50M = 1B cycle tokens + 500M bootstrap = 1.5B total (matches baselines) |
 
 ---
 

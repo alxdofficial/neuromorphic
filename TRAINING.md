@@ -8,7 +8,7 @@ background see `docs/design.md`; for the training protocol rationale see
 
 1. Tokenized data shards live under `data/`. Regenerate with:
    ```bash
-   python scripts/prepare_data.py --tokens 12B --seed 42
+   python scripts/prepare_data.py --tokens 1.5B --seed 42
    ```
    This produces `pile_train.bin` + `pile_val.bin` with document-level disjoint
    splits (SHA-256 hash exclusion — see `scripts/prepare_data.py`).
@@ -22,17 +22,25 @@ background see `docs/design.md`; for the training protocol rationale see
 The end-to-end driver is `src/train_loop.py`. It orchestrates bootstrap →
 (phase 1 main → action collection → codebook fit → phase 2 curriculum) × N.
 
+**Current validated config** (1.5B total tokens, BS=80, RTX 4090, ~25h):
+
 ```bash
 python -u -m src.train_loop \
     --work-dir outputs/v12 \
-    --bs 96 \
+    --bs 80 \
     --phase2-bs 8 \
     --phase2-group-size 8 \
     --bootstrap-tokens 500_000_000 \
     --phase1-tokens-per-cycle 10_000_000 \
     --action-collection-tokens 2_000_000 \
-    --cycles 5
+    --cycles 20
 ```
+
+Token budget breakdown:
+- Bootstrap: 500M tokens (~3.2h at 43K tok/s)
+- Per cycle: 50M tokens (8M phase 1 + 2M action collection + 40M phase 2)
+- 20 cycles: 1,000M tokens
+- **Total: 1,500M tokens** (matches baseline training budget)
 
 Use `--skip-bootstrap` if `bootstrap.pt` already exists in `--work-dir`, and
 `--start-cycle N` to resume mid-run (picks up from the last completed cycle's
@@ -44,9 +52,9 @@ Use `--skip-bootstrap` if `bootstrap.pt` already exists in `--work-dir`, and
 
 ```bash
 python -u -m src.train \
-    --bs 96 \
-    --steps 50000 \
-    --lr-target-step 50000 \
+    --bs 80 \
+    --steps 48828 \
+    --lr-target-step 48828 \
     --save-dir outputs/run1
 ```
 
@@ -127,3 +135,22 @@ During training, watch:
   response to its own content stream)
 - `stream_restarts_total` — data pipeline health (should stay 0 after the
   exhaustion-raises-loudly fix)
+
+## Baselines
+
+Three baselines trained from scratch on the same 1.5B tokens (The Pile) with
+the same tokenizer (TinyLlama 32K):
+
+```bash
+python -u auxiliary_repos/baselines/eval_scripts/train_baseline.py --model gpt2-small
+python -u auxiliary_repos/baselines/eval_scripts/train_baseline.py --model pythia-160m
+python -u auxiliary_repos/baselines/eval_scripts/train_baseline.py --model mamba-130m
+```
+
+Results (1.5B tokens, RTX 4090):
+| Model | Params | Val Loss | Val PPL |
+|-------|--------|----------|---------|
+| GPT-2 small | 124M | 2.955 | 19.2 |
+| Pythia-160m | 160M | 2.736 | 15.4 |
+| Mamba-130m | 130M | 3.294 | 27.0 |
+| **Neuromorphic LM** | **105M** | **TBD** | **TBD** |
