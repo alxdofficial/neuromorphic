@@ -14,3 +14,6 @@ tqdm>=4.65.0
 
 # Numerical computing
 numpy>=1.24.0
+
+# Data pipeline
+pyarrow>=12.0.0
