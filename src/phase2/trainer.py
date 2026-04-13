@@ -375,6 +375,7 @@ class Phase2Trainer:
     def _compute_per_token_reward(
         self, readouts: Tensor, input_ids: Tensor, H_mid: Tensor,
         prev_token: Tensor | None = None,
+        h_mid_batch_map: Tensor | None = None,
     ) -> Tensor:
         """Compute per-token reward for GRPO using full LM CE.
 
@@ -397,12 +398,14 @@ class Phase2Trainer:
             valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).float()
 
         return self._compute_per_token_reward_lm_ce(
-            readouts, H_mid, input_ids, valid_mask)
+            readouts, H_mid, input_ids, valid_mask,
+            h_mid_batch_map=h_mid_batch_map)
 
     @torch.no_grad()
     def _compute_per_token_reward_lm_ce(
         self, readouts: Tensor, H_mid: Tensor, input_ids: Tensor,
         valid_mask: Tensor,
+        h_mid_batch_map: Tensor | None = None,
     ) -> Tensor:
         """Compute -LM CE as per-token reward.
 
@@ -413,11 +416,15 @@ class Phase2Trainer:
         Chunks along both the batch dimension (to bound peak VRAM from
         the [sub_BS, chunk_t, V] logits tensor) and the time dimension.
         Upper scan carries are reset fresh for each batch sub-chunk.
+
+        When h_mid_batch_map is provided, H_mid is at the original
+        (un-expanded) batch size. H_enriched is computed per sub-batch
+        by gathering from H_mid, avoiding K-fold duplication.
         """
         BS, T, D = readouts.shape
         lm = self.model.lm
         mem_scale = lm.mem_scale  # frozen in phase 2
-        H_enriched = H_mid.to(readouts.dtype) + mem_scale * readouts
+        dt = readouts.dtype
 
         eot = self.config.eot_id
         eos_positions = (input_ids == eot)
@@ -428,10 +435,6 @@ class Phase2Trainer:
             h.clone() if h is not None else None for h in lm._carries]
         split = self.config.scan_split_at
 
-        # Chunk along the batch dimension so the peak logits tensor is
-        # [sub_BS, chunk_t, V] instead of [K*BS, chunk_t, V]. At K=8,
-        # BS=8, V=32000, chunk_t=128: full = 1.05 GB vs sub_BS=8 = 0.13 GB.
-        # Each sub-batch gets fresh upper-scan carries (independent rollouts).
         sub_bs = min(BS, 8)
         chunk_t = 128
         all_ce = torch.zeros(BS, T - 1, device=readouts.device, dtype=torch.float32)
@@ -439,7 +442,14 @@ class Phase2Trainer:
         try:
             for b_start in range(0, BS, sub_bs):
                 b_end = min(b_start + sub_bs, BS)
-                sub_H = H_enriched[b_start:b_end]
+                # Compute H_enriched per sub-batch, gathering from H_mid
+                # via batch map to avoid materializing [K*BS, T, D].
+                if h_mid_batch_map is not None:
+                    sub_h_mid = H_mid[h_mid_batch_map[b_start:b_end]].to(dt)
+                else:
+                    sub_h_mid = H_mid[b_start:b_end].to(dt)
+                sub_H = sub_h_mid + mem_scale * readouts[b_start:b_end]
+                del sub_h_mid
                 sub_ids = input_ids[b_start:b_end]
                 sub_rm = reset_mask[b_start:b_end]
 
@@ -582,7 +592,7 @@ class Phase2Trainer:
         # At K=8, BS=8, T=8192, D=2048: 2 × 2.15 GB = 4.3 GB for data
         # alone, plus reward computation intermediates. Cap K*BS*T*D
         # at a VRAM-safe threshold.
-        max_kbs_tokens = 262_144  # K*BS*T at W=2048 (K=8, BS=8, T=4096) — fits in 24GB
+        max_kbs_tokens = 524_288  # K*BS*T at W=4096 (K=8, BS=8, T=8192) — fits in 24GB with H_mid dedup
         while K > 1 and K * BS * T > max_kbs_tokens:
             K = K // 2
         if K != self.group_size:
@@ -606,16 +616,20 @@ class Phase2Trainer:
             expanded = val.unsqueeze(0).expand(K, *val.shape).reshape(K * BS, *val.shape[1:])
             setattr(mem, key, expanded.clone())
 
-        # Expand H_mid and input_ids: [BS, T, D] -> [K*BS, T, D]
-        H_mid_exp = H_mid.unsqueeze(0).expand(K, *H_mid.shape).reshape(K * BS, *H_mid.shape[1:])
+        # H_mid is NOT expanded to K*BS — all K trajectories for the same
+        # sample share the same H_mid (LM is frozen/deterministic). Instead
+        # we pass a batch map so forward_segment_phase2 indexes into the
+        # original [BS, T, D] tensor, saving K-1 copies (1.88 GB at W=4096).
+        # input_ids must be expanded because the memory loop uses it for
+        # per-token surprise and it's small ([K*BS, T] int64 = negligible).
         ids_exp = input_ids.unsqueeze(0).expand(K, *input_ids.shape).reshape(K * BS, *input_ids.shape[1:])
-
-        # Also expand identity matrix cache
+        h_mid_batch_map = torch.arange(K * BS, device=device) % BS
 
         # Single batched rollout — all K trajectories run in parallel
         result = mem.forward_segment_phase2(
-            H_mid_exp, ids_exp, self.model.lm, self.vqvae,
-            tau=self.tau, sample=True)
+            H_mid, ids_exp, self.model.lm, self.vqvae,
+            tau=self.tau, sample=True,
+            h_mid_batch_map=h_mid_batch_map)
 
         # Unpack: split K*BS back to (K, BS) using .view() so any
         # non-contiguous layout bugs raise immediately instead of silently
@@ -634,8 +648,9 @@ class Phase2Trainer:
         if prev_token is not None:
             prev_token_exp = prev_token.unsqueeze(0).expand(K, *prev_token.shape).reshape(K * BS)
         per_token_reward = self._compute_per_token_reward(
-            result["readouts"], ids_exp, H_mid_exp,
-            prev_token=prev_token_exp)                       # [K*BS, T]
+            result["readouts"], ids_exp, H_mid,
+            prev_token=prev_token_exp,
+            h_mid_batch_map=h_mid_batch_map)                 # [K*BS, T]
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
         # Windowed rewards — vectorized across K trajectories

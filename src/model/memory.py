@@ -1084,6 +1084,7 @@ class MemoryGraph(nn.Module):
         tau: float = 1.0,
         sample: bool = True,
         prev_token: Tensor | None = None,
+        h_mid_batch_map: Tensor | None = None,
     ) -> dict:
         """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
 
@@ -1098,12 +1099,19 @@ class MemoryGraph(nn.Module):
             8. Record (mod_input, codes, t) for the GRPO gradient pass
 
         Args:
-            H_mid: [BS, T, D] — lower-scan output from (frozen) LM
-            input_ids: [BS, T]
+            H_mid: [H_BS, T, D] — lower-scan output from (frozen) LM.
+                When h_mid_batch_map is None, H_BS must equal the memory's
+                batch size. When provided, H_mid can be smaller (e.g.
+                original BS before K-expansion) and h_mid_batch_map indexes
+                into it — avoids duplicating H_mid K times.
+            input_ids: [BS, T] — at the memory's batch size (K*BS_orig)
             lm: (frozen) LM module — provides lm_head / mem_head weights
             vqvae: (frozen) ActionVQVAE — provides encoder, rvq, decoder
             tau: temperature for the distance-based categorical
             sample: True for multinomial sampling, False for argmax
+            h_mid_batch_map: [BS] long or None — maps each sample in the
+                memory batch to its row in H_mid. Saves VRAM by avoiding
+                K-fold duplication of H_mid.
 
         Returns:
             dict with:
@@ -1114,7 +1122,8 @@ class MemoryGraph(nn.Module):
         """
         assert self._initialized, "memory must be initialized before phase2 rollout"
 
-        BS, T, D = H_mid.shape
+        BS = self.h.shape[0]  # memory batch size (K*BS_orig when expanded)
+        _, T, D = H_mid.shape
         NC, N = self.N_cells, self.C_n
         D_n = self.D_n
         dt = self.h.dtype
@@ -1146,6 +1155,9 @@ class MemoryGraph(nn.Module):
 
         identity = self._identity(BS, dt, H_mid.device)
         H_mid = H_mid.to(dt)
+        # Batch map: when H_mid is smaller than BS (e.g. K-expansion),
+        # h_mid_batch_map[i] gives the row in H_mid for sample i.
+        _bmap = h_mid_batch_map  # [BS] long or None
 
         # Live runtime state (cloned so we don't clobber phase-1 state)
         h = self.h.clone()
@@ -1173,7 +1185,7 @@ class MemoryGraph(nn.Module):
         call_positions: list[int] = []
 
         for t in range(T):
-            H_mid_t = H_mid[:, t]
+            H_mid_t = H_mid[_bmap, t] if _bmap is not None else H_mid[:, t]
             tok_t = input_ids[:, t]
 
             # Live surprise: proper CE (logsumexp - target_logit). Always
