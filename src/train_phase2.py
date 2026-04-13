@@ -55,11 +55,6 @@ def parse_args():
     p.add_argument("--warmup-batches", type=int, default=8,
                    help="Forward-only batches to warm the phase-2 memory state "
                         "before GRPO starts (0 = no warmup).")
-    p.add_argument("--reward-mode", type=str, default="lm_ce",
-                   choices=["mem_pred", "lm_ce"],
-                   help="GRPO reward signal: 'lm_ce' uses the full LM path "
-                        "(upper scan + head, more expensive but principled); "
-                        "'mem_pred' uses the memory head only (cheap proxy).")
     return p.parse_args()
 
 
@@ -225,7 +220,6 @@ def main():
         eval_batches=args.eval_batches,
         eval_warmup_batches=args.eval_warmup_batches,
         eval_loader_factory=eval_loader_factory,
-        reward_mode=args.reward_mode,
     )
 
     # Warm up the (cold) phase-2 memory state on real data before GRPO.

@@ -65,7 +65,6 @@ class Phase2Trainer:
         eval_warmup_batches: int = 4,
         metrics_path: str | None = None,
         train_loader_factory=None,
-        reward_mode: str = "lm_ce",
     ):
         self.model = model
         self.vqvae = vqvae
@@ -86,9 +85,6 @@ class Phase2Trainer:
         self.eval_loader_factory = eval_loader_factory
         self.eval_batches = eval_batches
         self.eval_warmup_batches = eval_warmup_batches
-        assert reward_mode in ("mem_pred", "lm_ce"), \
-            f"reward_mode must be 'mem_pred' or 'lm_ce', got {reward_mode}"
-        self.reward_mode = reward_mode
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -377,20 +373,15 @@ class Phase2Trainer:
 
     @torch.no_grad()
     def _compute_per_token_reward(
-        self, readouts: Tensor, prev_readout_at_start: Tensor, input_ids: Tensor,
-        H_mid: Tensor | None = None,
+        self, readouts: Tensor, input_ids: Tensor, H_mid: Tensor,
         prev_token: Tensor | None = None,
     ) -> Tensor:
-        """Compute per-token reward for GRPO.
+        """Compute per-token reward for GRPO using full LM CE.
 
-        Two modes (selected by self.reward_mode):
-          - 'mem_pred': fast — uses the weight-tied memory-prediction head.
-            Rewards the modulator for making readouts that predict the next
-            token well directly. Cheap but a proxy for LM CE.
-          - 'lm_ce': principled — runs the full LM path (upper scan + head)
-            on H_enriched = H_mid + mem_scale * readout and uses -CE of the
-            main LM output as reward. Measures the actual quantity we care
-            about but ~2x more expensive per rollout.
+        Runs H_enriched = H_mid + mem_scale * readouts through the frozen
+        upper scan + LM head and uses -CE as reward. This measures the
+        actual quantity we care about: does the memory help the LM predict
+        the next token?
 
         Masks positions where the previous token was EOT (same as phase 1
         main CE loss masking).
@@ -402,36 +393,11 @@ class Phase2Trainer:
         valid_mask = torch.ones(BS, T, device=readouts.device, dtype=torch.float32)
         if T > 1:
             valid_mask[:, 1:] = (input_ids[:, :-1] != eot).float()
-        # Mask position 0 if the previous chunk ended with EOT (cross-document
-        # boundary — same logic as phase 1's mem_pred_loss valid_mask).
         if prev_token is not None:
             valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).float()
 
-        if self.reward_mode == "lm_ce" and H_mid is not None:
-            return self._compute_per_token_reward_lm_ce(
-                readouts, H_mid, input_ids, valid_mask)
-
-        # mem_pred mode (default/legacy)
-        # Shift: readout[t-1] predicts token at position t.
-        shifted = torch.cat([
-            prev_readout_at_start.unsqueeze(1).to(readouts.dtype),
-            readouts[:, :-1],
-        ], dim=1)  # [BS, T, D]
-
-        rewards = torch.empty(BS, T, device=readouts.device, dtype=torch.float32)
-        chunk = max(32, 4096 // max(BS, 1))
-        for s in range(0, T, chunk):
-            e = min(s + chunk, T)
-            sub_readout = shifted[:, s:e]
-            sub_target = input_ids[:, s:e]
-            sub_logits = self.model.lm.mem_head_logits(sub_readout)   # [BS, chunk, V]
-            ce = F.cross_entropy(
-                sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
-                sub_target.reshape(-1),
-                reduction="none",
-            ).reshape(BS, e - s)
-            rewards[:, s:e] = -ce * valid_mask[:, s:e]
-        return rewards
+        return self._compute_per_token_reward_lm_ce(
+            readouts, H_mid, input_ids, valid_mask)
 
     @torch.no_grad()
     def _compute_per_token_reward_lm_ce(
@@ -611,6 +577,20 @@ class Phase2Trainer:
         prev_token = getattr(batch, "prev_token", None)
         BS, T = input_ids.shape
 
+        # Auto-reduce K for large T to stay within VRAM. The dominant
+        # tensors are readouts + H_mid_exp, each [K*BS, T, D] in bf16.
+        # At K=8, BS=8, T=8192, D=2048: 2 × 2.15 GB = 4.3 GB for data
+        # alone, plus reward computation intermediates. Cap K*BS*T*D
+        # at a VRAM-safe threshold.
+        max_kbs_tokens = 262_144  # K*BS*T at W=2048 (K=8, BS=8, T=4096) — fits in 24GB
+        while K > 1 and K * BS * T > max_kbs_tokens:
+            K = K // 2
+        if K != self.group_size:
+            import logging
+            logging.getLogger(__name__).info(
+                "Auto-reduced K from %d to %d for T=%d (VRAM safety)",
+                self.group_size, K, T)
+
         self.model.lm.detach_carries()
 
         # Run lower scan once (LM is frozen and deterministic per batch).
@@ -648,16 +628,14 @@ class Phase2Trainer:
         codes = result["codes"].view(
             n_calls, K, BS, *result["codes"].shape[2:]).transpose(0, 1)       # [K, n_calls, BS, NC, L]
 
-        # Compute per-trajectory reward
-        init_prev_readout = init_snapshot["prev_readout"]  # [BS, D]
-        init_prev_exp = init_prev_readout.unsqueeze(0).expand(K, *init_prev_readout.shape).reshape(K * BS, -1)
+        # Compute per-trajectory reward via full LM CE
         # Expand prev_token to K*BS for cross-doc masking at position 0
         prev_token_exp = None
         if prev_token is not None:
             prev_token_exp = prev_token.unsqueeze(0).expand(K, *prev_token.shape).reshape(K * BS)
         per_token_reward = self._compute_per_token_reward(
-            result["readouts"], init_prev_exp, ids_exp,
-            H_mid=H_mid_exp, prev_token=prev_token_exp)     # [K*BS, T]
+            result["readouts"], ids_exp, H_mid_exp,
+            prev_token=prev_token_exp)                       # [K*BS, T]
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
         # Windowed rewards — vectorized across K trajectories
@@ -912,10 +890,15 @@ class Phase2Trainer:
             tokens_seen += step_tokens
             self.global_step += 1
 
-            # Diagnostic: measure lane divergence (does not modify state).
-            lane_stats = {}
+            # Diagnostics: lane divergence + memory health + surprise.
+            # Surprise (s_mem_live) must stay bounded across phase 2 —
+            # if it explodes, the modulator's observation signal degrades.
+            # mem_pred_loss is not optimized in phase 2 (only lm_ce reward),
+            # so surprise can drift; monitoring catches this early.
+            diag_stats = {}
             if self.global_step % self.log_interval == 0:
-                lane_stats = self.model.memory.compute_lane_divergence()
+                diag_stats.update(self.model.memory.compute_lane_divergence())
+                diag_stats.update(self.model.memory.compute_memory_health())
 
             # Persistent jsonl logging for plotting
             log_row = {
@@ -925,7 +908,7 @@ class Phase2Trainer:
                 "rollout_time": t_rollout,
                 "grad_time": t_grad,
                 **step_metrics,
-                **lane_stats,
+                **diag_stats,
             }
             self._append_metrics(log_row)
 
