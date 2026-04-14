@@ -65,9 +65,18 @@ class Phase2Trainer:
         eval_warmup_batches: int = 4,
         metrics_path: str | None = None,
         train_loader_factory=None,
+        traj_noise_sigma: float = 3.0,
     ):
         self.model = model
         self.vqvae = vqvae
+        # Per-trajectory fixed perturbation magnitude. At each rollout, K
+        # trajectories each get a fixed ξ_k ~ N(0, σ²) in VQ latent space,
+        # reused at every mod event within the rollout. Gives trajectories
+        # sustained identity so their rewards diverge by a systematic
+        # (non-averaging) amount — critical for GRPO signal to survive
+        # window averaging over W tokens. σ=0 disables (revert to pure
+        # multinomial sampling, the pre-variant-B behavior).
+        self.traj_noise_sigma = traj_noise_sigma
         # Default (legacy): a single dataloader for all stages.
         # New: train_loader_factory(reward_window) makes a dataloader per
         # stage. The factory decides the actual seq_length (typically
@@ -632,11 +641,31 @@ class Phase2Trainer:
         ids_exp = input_ids.unsqueeze(0).expand(K, *input_ids.shape).reshape(K * BS, *input_ids.shape[1:])
         h_mid_batch_map = torch.arange(K * BS, device=device) % BS
 
+        # Per-trajectory fixed perturbation ξ_k in VQ latent space.
+        # Shape: [K*BS, NC, latent_dim]. Reused at every mod event in the
+        # rollout — gives trajectories a sustained identity so their W
+        # states mean-revert to different equilibria (not the same one).
+        # ξ is identical across cells (NC) for the same (k, b) but each
+        # (k, b) gets its own perturbation vector.
+        NC = mem.N_cells
+        latent_dim = self.vqvae.rvq.code_dim
+        if self.traj_noise_sigma > 0:
+            # Sample per (k, b). Broadcast across NC since all cells share
+            # the same trajectory identity within the same sample.
+            traj_noise_kb = torch.randn(
+                K, BS, 1, latent_dim,
+                device=device, dtype=torch.float32) * self.traj_noise_sigma
+            traj_noise = traj_noise_kb.expand(K, BS, NC, latent_dim).reshape(
+                K * BS, NC, latent_dim).contiguous()
+        else:
+            traj_noise = None
+
         # Single batched rollout — all K trajectories run in parallel
         result = mem.forward_segment_phase2(
             H_mid, ids_exp, self.model.lm, self.vqvae,
             tau=self.tau, sample=True,
-            h_mid_batch_map=h_mid_batch_map)
+            h_mid_batch_map=h_mid_batch_map,
+            traj_noise=traj_noise)
 
         # Unpack: split K*BS back to (K, BS) using .view() so any
         # non-contiguous layout bugs raise immediately instead of silently
@@ -698,6 +727,11 @@ class Phase2Trainer:
             "best_mean_reward": best_mean_reward,   # max-over-K then mean-over-BS
             "T": T,
             "BS": BS,
+            # Per-trajectory perturbation used in this rollout. [K*BS, NC,
+            # latent_dim]. Reshape to [K, BS, NC, latent_dim] for GRPO.
+            "traj_noise": (
+                traj_noise.view(K, BS, NC, latent_dim)
+                if traj_noise is not None else None),
         }
 
     # ------------------------------------------------------------------
@@ -746,6 +780,7 @@ class Phase2Trainer:
         mod_inputs = rollout_result["mod_inputs"]    # [K, n_calls, BS, NC, mod_in] f32 GPU
         codes = rollout_result["codes"]              # [K, n_calls, BS, NC, L] long GPU
         rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 GPU
+        traj_noise = rollout_result.get("traj_noise")  # [K, BS, NC, latent] f32 GPU or None
 
         # Advantages — broadcast over NC since actions are per-cell
         advantages = self._compute_advantages(rewards)                 # [K, n_calls, BS]
@@ -755,6 +790,14 @@ class Phase2Trainer:
         mod_inputs_flat = mod_inputs.reshape(-1, NC, mod_in_dim)
         codes_flat = codes.reshape(-1, NC, num_levels)
         advantages_flat = advantages.reshape(-1, NC)
+        # Expand traj_noise to match the flattened record layout.
+        # Record i = k*n_calls*BS + call*BS + b → traj_noise[k, b].
+        # Broadcast across n_calls: [K, 1, BS, NC, latent] → [K, n_calls, BS, NC, latent]
+        if traj_noise is not None:
+            traj_noise_flat = traj_noise.unsqueeze(1).expand(
+                K, n_calls, BS, NC, -1).reshape(-1, NC, traj_noise.shape[-1])
+        else:
+            traj_noise_flat = None
         # Each per-cell action is its own "record"; reshape [M, mod_in] by folding NC
         # But the modulator forward is per-cell (einsum "bni,nih->bnh") and needs
         # the NC dim. So we'll process [M, NC, ...] as a big batch.
@@ -790,9 +833,19 @@ class Phase2Trainer:
             action_norm = self.vqvae.normalize(action_flat)
             z = self.vqvae.encoder(action_norm)                # [C*NC, latent]
 
+            # Apply per-trajectory perturbation (fixed during rollout).
+            # log_pi is computed at z + ξ_k, matching what the rollout
+            # sampled from. Gradient flows through z (through modulator);
+            # ξ_k is detached (it's exploration noise, not a learnable param).
+            if traj_noise_flat is not None:
+                noise_chunk = traj_noise_flat[start:end].reshape(C * NC, -1)
+                z_sample = z + noise_chunk.detach()
+            else:
+                z_sample = z
+
             # log pi(codes | z) summed across RVQ levels (on-graph through z)
             codes_flat_flat = c_chunk.reshape(C * NC, num_levels)
-            log_pi = self.vqvae.rvq.log_prob(z, codes_flat_flat, tau=self.tau)  # [C*NC]
+            log_pi = self.vqvae.rvq.log_prob(z_sample, codes_flat_flat, tau=self.tau)  # [C*NC]
             log_pi = log_pi.reshape(C, NC)
 
             # Entropy bonus: encourage policy diversity to prevent code collapse

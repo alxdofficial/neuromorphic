@@ -1103,6 +1103,7 @@ class MemoryGraph(nn.Module):
         sample: bool = True,
         prev_token: Tensor | None = None,
         h_mid_batch_map: Tensor | None = None,
+        traj_noise: Tensor | None = None,
     ) -> dict:
         """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
 
@@ -1290,7 +1291,15 @@ class MemoryGraph(nn.Module):
                 action_flat = raw_action.reshape(BS * NC, -1)
                 action_norm = vqvae.normalize(action_flat)
                 z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
-                codes = vqvae.rvq.sample_codes(z, tau=tau, sample=sample)  # [BS*NC, L]
+                # Per-trajectory fixed perturbation: shift z by ξ_k (same ξ_k
+                # reused at every mod event within a rollout). Gives each
+                # trajectory a systematically different sampling distribution
+                # so K-states mean-revert to different equilibria.
+                if traj_noise is not None:
+                    z_sample = z + traj_noise.reshape(BS * NC, -1)
+                else:
+                    z_sample = z
+                codes = vqvae.rvq.sample_codes(z_sample, tau=tau, sample=sample)  # [BS*NC, L]
                 # Reconstruct z_q from codes — vectorized across levels
                 lvl_idx = torch.arange(vqvae.rvq.num_levels, device=codes.device)
                 z_q = vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes].sum(dim=1)
