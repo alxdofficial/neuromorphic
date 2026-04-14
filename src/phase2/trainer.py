@@ -163,25 +163,45 @@ class Phase2Trainer:
         count = 0
         prev_token = None
         total_batches = warmup_batches + n_batches
+        # Chunk along T to avoid materializing [BS, T, V] logits for large
+        # eval_seq_length (e.g. 4096). Memory state and LM scan carries
+        # persist across chunks, so this is mathematically equivalent.
+        eval_chunk_T = self.config.T
         try:
             for i, batch in enumerate(eval_loader):
                 if i >= total_batches:
                     break
-                input_ids = batch.input_ids.to(self.device, non_blocking=True)
-                target_ids = batch.target_ids.to(self.device, non_blocking=True)
+                input_ids_full = batch.input_ids.to(self.device, non_blocking=True)
+                target_ids_full = batch.target_ids.to(self.device, non_blocking=True)
                 batch_prev = getattr(batch, "prev_token", None)
                 if batch_prev is not None:
                     batch_prev = batch_prev.to(self.device, non_blocking=True)
-                result = model.forward_chunk(
-                    input_ids, target_ids=target_ids,
-                    use_memory=True,
-                    prev_token=batch_prev if batch_prev is not None else prev_token,
-                )
-                prev_token = input_ids[:, -1]
+
+                _, T_full = input_ids_full.shape
+                ce_sum = 0.0
+                ce_count = 0
+                aux_sum = 0.0
+                effective_prev = batch_prev if batch_prev is not None else prev_token
+                for s in range(0, T_full, eval_chunk_T):
+                    e = min(s + eval_chunk_T, T_full)
+                    result = model.forward_chunk(
+                        input_ids_full[:, s:e], target_ids=target_ids_full[:, s:e],
+                        use_memory=True,
+                        prev_token=effective_prev,
+                    )
+                    # Weighted by chunk length so the average is correct
+                    chunk_len = e - s
+                    ce_sum += result["ce_loss"].item() * chunk_len
+                    aux_sum += result["aux_loss"].item() * chunk_len
+                    ce_count += chunk_len
+                    # Advance prev_token for next chunk
+                    effective_prev = input_ids_full[:, e - 1]
+
+                prev_token = input_ids_full[:, -1]
                 if i < warmup_batches:
                     continue
-                total_ce += result["ce_loss"].item()
-                total_aux += result["aux_loss"].item()
+                total_ce += ce_sum / ce_count
+                total_aux += aux_sum / ce_count
                 count += 1
         finally:
             if train_mem_state is not None:
@@ -860,10 +880,15 @@ class Phase2Trainer:
             print(f"\n=== Phase 2 stage {stage_idx+1}/{len(stages)}: "
                   f"W={stage.reward_window}, budget={stage.token_budget:,} tokens ===")
             if self.train_loader_factory is not None:
-                try:
+                # Check factory signature to decide whether to pass stage_idx,
+                # rather than catch-all TypeError (which would swallow real
+                # errors from the factory body).
+                import inspect
+                sig = inspect.signature(self.train_loader_factory)
+                if "stage_idx" in sig.parameters:
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window, stage_idx=stage_idx)
-                except TypeError:
+                else:
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window)
 

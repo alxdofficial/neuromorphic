@@ -248,20 +248,22 @@ def main():
     # model sees. Run N batches of pure forward (no grad, no codes) so
     # memory accumulates context.
     if args.warmup_batches > 0:
-        # Use the first stage's BS for warmup so the memory state is
-        # already at the right size before stage 1 starts. Without this,
-        # stage 1 would trigger a resize on its first batch.
+        # Use the first stage's (BS, T) for warmup so memory state is at
+        # the right size before stage 1 starts and we don't materialize
+        # a [BS, max_window, vocab_size] logits tensor that OOMs at large
+        # BS. Each stage runs at T = 2 * reward_window per
+        # train_loader_factory, so warmup matches that convention.
         warmup_bs = bs_for_window(stages[0].reward_window)
+        warmup_T = 2 * stages[0].reward_window
         print(f"\nWarming up phase-2 memory state "
-              f"({args.warmup_batches} forward batches, BS={warmup_bs})...")
-        # Ensure memory is at warmup_bs, not args.bs from earlier resize.
+              f"({args.warmup_batches} forward batches, BS={warmup_bs}, T={warmup_T})...")
         if (model.memory._initialized
                 and model.memory.h.shape[0] != warmup_bs):
             model.memory.resize_to_bs(warmup_bs)
             model._initialized = model.memory._initialized
         warmup_loader = create_dataloader(
             phase="A", tokenizer=tokenizer, batch_size=warmup_bs,
-            seq_length=max_window, seed=args.seed - 1,  # distinct from train
+            seq_length=warmup_T, seed=args.seed - 1,  # distinct from train
             max_steps=args.warmup_batches)
         model.train(False)
         with torch.no_grad():
@@ -279,7 +281,7 @@ def main():
                 )
                 prev_tok = input_ids[:, -1]
         print(f"  memory warmed up ({args.warmup_batches} batches of "
-              f"{max_window} tokens)")
+              f"{warmup_T} tokens)")
 
     trainer.run_curriculum(stages)
 
