@@ -848,8 +848,10 @@ class Phase2Trainer:
             log_pi = self.vqvae.rvq.log_prob(z_sample, codes_flat_flat, tau=self.tau)  # [C*NC]
             log_pi = log_pi.reshape(C, NC)
 
-            # Entropy bonus: encourage policy diversity to prevent code collapse
-            entropy = self.vqvae.rvq.entropy(z, tau=self.tau).reshape(C, NC)
+            # Entropy bonus: encourage policy diversity to prevent code collapse.
+            # Must be computed at z_sample (the perturbed z) to match log_pi —
+            # otherwise the entropy gradient flattens the wrong distribution.
+            entropy = self.vqvae.rvq.entropy(z_sample, tau=self.tau).reshape(C, NC)
 
             # GRPO loss - entropy bonus (normalized by full M)
             chunk_loss = (-(a_chunk * log_pi) - self.entropy_coeff * entropy).sum() / (M * NC)
@@ -886,15 +888,18 @@ class Phase2Trainer:
         # K-diversity: how much do the K trajectories disagree about the
         # reward for the same (call, sample)? This is the ACTUAL signal GRPO
         # normalizes over — higher = more learning signal.
-        # Mean std-across-K, averaged over all (call, sample) positions.
+        # Incomplete-window calls have reward=0 for all K (per _windowed_reward's
+        # completeness mask) → K-std=0 for those slots. Exclude them from
+        # the diagnostic so k_spread reflects only live signal.
         k_std_per_slot = rewards.std(dim=0, unbiased=False)       # [n_calls, BS]
-        k_spread_mean = k_std_per_slot.mean().item()
-        k_spread_max = k_std_per_slot.max().item()
-        # Best-vs-worst spread: how much does best-of-K beat worst-of-K
-        # per (call, sample)? Indicates headroom the modulator can exploit.
-        k_best = rewards.max(dim=0).values                       # [n_calls, BS]
-        k_worst = rewards.min(dim=0).values                      # [n_calls, BS]
-        k_range_mean = (k_best - k_worst).mean().item()
+        k_range_per_slot = rewards.max(dim=0).values - rewards.min(dim=0).values  # [n_calls, BS]
+        # A slot is "live" if rewards are non-zero for any k (or equivalently,
+        # if max != min or mean != 0). Zero-reward slots are structural, not signal.
+        live_mask = (rewards.abs().sum(dim=0) > 1e-8).float()     # [n_calls, BS]
+        live_count = live_mask.sum().clamp(min=1.0)
+        k_spread_mean = (k_std_per_slot * live_mask).sum().item() / live_count.item()
+        k_spread_max = (k_std_per_slot * live_mask).max().item()
+        k_range_mean = (k_range_per_slot * live_mask).sum().item() / live_count.item()
 
         # Advantage distribution stats (the actual gradient-scaling signal
         # after K-baseline centering + normalization).
@@ -973,10 +978,16 @@ class Phase2Trainer:
             if self.train_loader_factory is not None:
                 # Check factory signature to decide whether to pass stage_idx,
                 # rather than catch-all TypeError (which would swallow real
-                # errors from the factory body).
+                # errors from the factory body). Also accept factories that
+                # take **kwargs (VAR_KEYWORD) since they'll accept stage_idx.
                 import inspect
                 sig = inspect.signature(self.train_loader_factory)
-                if "stage_idx" in sig.parameters:
+                accepts_stage_idx = (
+                    "stage_idx" in sig.parameters
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in sig.parameters.values())
+                )
+                if accepts_stage_idx:
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window, stage_idx=stage_idx)
                 else:
