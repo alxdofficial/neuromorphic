@@ -824,11 +824,40 @@ class Phase2Trainer:
         self.optimizer.step()
 
         # Reward distribution stats over the flattened records
-        rewards_flat = rollout_result["rewards"].float()
-        reward_mean = rewards_flat.mean().item()
-        reward_std = rewards_flat.std().item()
-        reward_min = rewards_flat.min().item()
-        reward_max = rewards_flat.max().item()
+        rewards = rollout_result["rewards"].float()  # [K, n_calls, BS]
+        reward_mean = rewards.mean().item()
+        reward_std = rewards.std().item()
+        reward_min = rewards.min().item()
+        reward_max = rewards.max().item()
+
+        # K-diversity: how much do the K trajectories disagree about the
+        # reward for the same (call, sample)? This is the ACTUAL signal GRPO
+        # normalizes over — higher = more learning signal.
+        # Mean std-across-K, averaged over all (call, sample) positions.
+        k_std_per_slot = rewards.std(dim=0, unbiased=False)       # [n_calls, BS]
+        k_spread_mean = k_std_per_slot.mean().item()
+        k_spread_max = k_std_per_slot.max().item()
+        # Best-vs-worst spread: how much does best-of-K beat worst-of-K
+        # per (call, sample)? Indicates headroom the modulator can exploit.
+        k_best = rewards.max(dim=0).values                       # [n_calls, BS]
+        k_worst = rewards.min(dim=0).values                      # [n_calls, BS]
+        k_range_mean = (k_best - k_worst).mean().item()
+
+        # Advantage distribution stats (the actual gradient-scaling signal
+        # after K-baseline centering + normalization).
+        advantages_flat = advantages.reshape(-1, NC).float()
+        adv_abs_mean = advantages_flat.abs().mean().item()
+        adv_max = advantages_flat.abs().max().item()
+        # Fraction of advantages with |adv| < 0.1 — "near-zero gradient signal".
+        # If this climbs toward 1.0, most actions are getting no credit.
+        adv_flat_frac = (advantages_flat.abs() < 0.1).float().mean().item()
+
+        # Per-K mean reward — useful for plotting K-trajectory divergence.
+        # Shape: [K]. Logged as individual fields k0_r, k1_r, ... so plots
+        # can show each trajectory's trend separately.
+        per_k_mean = rewards.mean(dim=(1, 2))                    # [K]
+        per_k_fields = {f"k{i}_reward": per_k_mean[i].item()
+                        for i in range(per_k_mean.shape[0])}
 
         # Codebook usage over the sampled codes (fraction of unique tuples)
         codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
@@ -848,11 +877,20 @@ class Phase2Trainer:
             "reward_std": reward_std,
             "reward_min": reward_min,
             "reward_max": reward_max,
+            # Trajectory diversity (per-(call, sample) K-spread)
+            "k_spread_mean": k_spread_mean,
+            "k_spread_max": k_spread_max,
+            "k_range_mean": k_range_mean,
+            # Advantage distribution
+            "adv_abs_mean": adv_abs_mean,
+            "adv_max": adv_max,
+            "adv_flat_frac": adv_flat_frac,
+            # Per-K mean reward (trajectory-level)
+            **per_k_fields,
             "mod_grad_norm": grad_norm,
             "n_chunks": n_chunks,
             "M": M,
             "n_unique_codes": n_unique,
-            # Continuous vs quantized: high residual = proxy drift risk.
             "quant_resid_rel": quant_relative,
             "quant_resid_abs": quant_resid_norm,
         }
@@ -1009,11 +1047,14 @@ class Phase2Trainer:
         # Auto-regenerate plots at end of each stage
         if self.metrics_path is not None:
             try:
-                from scripts.plot_training import load_metrics, plot_phase2_grpo
+                from scripts.plot_training import (
+                    load_metrics, plot_phase2_grpo, plot_phase2_diversity)
                 plots_dir = os.path.join(os.path.dirname(self.metrics_path), "plots")
                 os.makedirs(plots_dir, exist_ok=True)
                 records = load_metrics(self.metrics_path)
                 plot_phase2_grpo(records,
                     os.path.join(plots_dir, "phase2_grpo.png"))
+                plot_phase2_diversity(records,
+                    os.path.join(plots_dir, "phase2_diversity.png"))
             except Exception as e:
                 print(f"  (plot regen failed: {e})")

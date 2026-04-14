@@ -472,6 +472,96 @@ def plot_phase2_grpo(records, output_path):
         print(f"  Saved: {output_path}")
 
 
+def plot_phase2_diversity(records, output_path):
+    """K-trajectory diversity + advantage distribution plots.
+
+    These show whether the K rollouts are actually producing divergent
+    rewards (otherwise GRPO has no signal to learn from) and whether
+    the advantages the modulator sees have meaningful magnitudes.
+    """
+    train_rows, _ = split_train_eval(records)
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+        fig.suptitle(f"Phase 2 Trajectory Diversity ({len(train_rows)} train)",
+                     fontsize=14, fontweight="bold")
+        tr = train_rows
+
+        # (0,0) K-spread: std across K trajectories per (call, sample).
+        # This is the gradient signal strength. Near zero means all K give
+        # the same reward — no learning signal. Healthy: > 0.1.
+        k_spread = get(tr, "k_spread_mean")
+        k_spread_max = get(tr, "k_spread_max")
+        if k_spread:
+            plot_line(axes[0, 0], k_spread, C["reward"], "mean")
+            if k_spread_max:
+                plot_line(axes[0, 0], k_spread_max, C["reward"],
+                          "max", linestyle="--", alpha=0.5)
+            axes[0, 0].axhline(0.1, color="red", ls="--", lw=0.5, alpha=0.5)
+            axes[0, 0].legend()
+        setup(axes[0, 0], "K-spread (std across K trajectories)",
+              "reward std per slot")
+
+        # (0,1) Best-vs-worst range: how much does best-of-K beat worst?
+        # High means GRPO has room to push toward the better policy.
+        k_range = get(tr, "k_range_mean")
+        if k_range:
+            plot_line(axes[0, 1], k_range, C["reward"])
+        setup(axes[0, 1], "K-range (best_K - worst_K)", "reward delta")
+
+        # (1,0) Per-K mean reward. If one K consistently dominates, the
+        # sampling distribution may have collapsed.
+        if tr:
+            k_keys = sorted(
+                [k for k in tr[0].keys() if k.startswith("k") and k.endswith("_reward")],
+                key=lambda k: int(k.split("_")[0][1:]))
+            for i, key in enumerate(k_keys):
+                vals = get(tr, key)
+                if vals:
+                    color = plt.cm.viridis(i / max(len(k_keys) - 1, 1))
+                    axes[1, 0].plot(vals, color=color, linewidth=1.0,
+                                    label=f"k={i}", alpha=0.8)
+            if k_keys:
+                axes[1, 0].legend(fontsize=6, ncol=2)
+        setup(axes[1, 0], "Per-trajectory Mean Reward", "reward")
+
+        # (1,1) Advantage magnitude: |advantage|.mean after K-baseline norm.
+        # Advantages ~ O(1) after normalization; declining means the
+        # signal is vanishing.
+        adv_abs = get(tr, "adv_abs_mean")
+        adv_max = get(tr, "adv_max")
+        if adv_abs:
+            plot_line(axes[1, 1], adv_abs, C["mod_grad"], "mean |A|")
+            if adv_max:
+                plot_line(axes[1, 1], adv_max, C["mod_grad"],
+                          "max |A|", linestyle="--", alpha=0.5)
+            axes[1, 1].legend()
+        setup(axes[1, 1], "Advantage Magnitude", "|A|")
+
+        # (2,0) Fraction of near-zero advantages. If this trends to 1, most
+        # actions get no gradient signal (K trajectories all agree).
+        adv_flat = get(tr, "adv_flat_frac")
+        if adv_flat:
+            plot_line(axes[2, 0], adv_flat, C["reward"])
+            axes[2, 0].axhline(0.5, color="gray", ls="--", lw=0.5, alpha=0.5)
+        setup(axes[2, 0], "Near-zero Advantage Fraction (|A| < 0.1)",
+              "fraction")
+
+        # (2,1) Reward std (global) vs K-spread (per-slot). Ratio captures
+        # how much variance is K-driven vs across-sample.
+        r_std = get(tr, "reward_std")
+        if r_std and k_spread:
+            ratio = [r_std[i] / max(k_spread[i], 1e-6)
+                     for i in range(min(len(r_std), len(k_spread)))]
+            plot_line(axes[2, 1], ratio, C["reward"])
+        setup(axes[2, 1], "Reward Variance Composition",
+              "global_std / K_spread")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"  Saved: {output_path}")
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -507,6 +597,7 @@ def main():
         plot_phase1_memory(records, os.path.join(plots_dir, "phase1_memory.png"))
     else:
         plot_phase2_grpo(records, os.path.join(plots_dir, "phase2_grpo.png"))
+        plot_phase2_diversity(records, os.path.join(plots_dir, "phase2_diversity.png"))
 
 
 if __name__ == "__main__":
