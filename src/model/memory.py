@@ -150,6 +150,24 @@ class MemoryGraph(nn.Module):
     def is_initialized(self) -> bool:
         return self._initialized
 
+    def _phase2_substep(self, h, msg, W, gate, one_minus_gate, hebbian,
+                        H_aug_t, identity, inject_w, inject_b,
+                        st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
+                        mg_w1, mg_b1, mg_w2, mg_b2,
+                        hebbian_gamma):
+        """Fused phase 2 per-token step: memory step + hebbian update.
+
+        Kept as a single function so torch.compile can fuse the whole
+        thing into one CUDA graph-friendly subroutine.
+        """
+        h, msg, readout = self._step(
+            h, msg, W, gate, one_minus_gate,
+            H_aug_t, identity, inject_w, inject_b,
+            st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
+            mg_w1, mg_b1, mg_w2, mg_b2)
+        hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
+        return h, msg, readout, hebbian
+
     def _identity(self, BS, dtype, device):
         return self.neuron_id.to(device=device, dtype=dtype).unsqueeze(0).expand(BS, -1, -1, -1)
 
@@ -1122,6 +1140,17 @@ class MemoryGraph(nn.Module):
         """
         assert self._initialized, "memory must be initialized before phase2 rollout"
 
+        # Lazily compile the phase 2 substep (memory step + hebbian update)
+        # on first CUDA call. The substep is pure PyTorch with no side
+        # effects, so torch.compile can fuse it into efficient kernels.
+        # Gated by env var for equivalence testing.
+        if (not hasattr(self, "_phase2_substep_compiled")
+                and self.h.is_cuda
+                and not os.environ.get("NEUROMORPHIC_NO_COMPILE")):
+            self._phase2_substep_compiled = torch.compile(
+                self._phase2_substep, mode="default", fullgraph=False)
+        substep = getattr(self, "_phase2_substep_compiled", self._phase2_substep)
+
         BS = self.h.shape[0]  # memory batch size (K*BS_orig when expanded)
         _, T, D = H_mid.shape
         NC, N = self.N_cells, self.C_n
@@ -1292,16 +1321,14 @@ class MemoryGraph(nn.Module):
                 codes_records.append(codes.reshape(BS, NC, -1).detach())
                 call_positions.append(t)
 
-            # Memory step (same as phase 1)
-            h, msg, readout = self._step(
-                h, msg, W, gate, one_minus_gate,
+            # Fused memory step + hebbian update (torch.compile'd on CUDA)
+            h, msg, readout, hebbian = substep(
+                h, msg, W, gate, one_minus_gate, hebbian,
                 H_mid_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
-                mg_w1, mg_b1, mg_w2, mg_b2)
+                mg_w1, mg_b1, mg_w2, mg_b2,
+                hebbian_gamma)
             readouts[:, t] = readout
-
-            # Update Hebbian co-activation trace.
-            hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             # prev_readout_full is still readout[t-1] at this point —
             # view as per-cell to compute the drift before advancing it.
