@@ -118,9 +118,10 @@ def main():
     print(f"Loaded model params (step={ckpt.get('step', '?')})")
 
     # Initialize at phase-2 BS, then load phase-1's runtime state and
-    # broadcast it down. Phase 1 trained at BS=80 with periodic batch
-    # merging, so its W/decay/hebbian are already consensus across
-    # lanes. We take that consensus and broadcast to phase 2's BS=12.
+    # resize to phase-2 BS. Phase 1 trained at BS=80 with lane-local
+    # memory (no merging), so resize_to_bs samples lanes when shrinking.
+    # Each lane's W/decay/hebbian is a valid state produced by the shared
+    # modulator on that lane's content stream.
     # Transient state (h, msg, etc.) is reset to zero — those are
     # input-dependent and don't transfer meaningfully across BS changes.
     model.memory.initialize_states(args.bs, device)

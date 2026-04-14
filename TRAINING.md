@@ -78,14 +78,18 @@ python -u -m src.train_phase2 \
     --codebook outputs/run1/codebook.pt \
     --out outputs/run1/phase2.pt \
     --bs 8 \
-    --group-size 8 \
-    --reward-mode lm_ce
+    --group-size 8
 ```
 
+Phase 2 uses LM CE reward: each action's reward is negative of the windowed
+cross-entropy of the next-token predictions under the frozen upper scan +
+LM head on H_enriched = H_mid + mem_scale * readout.
+
 Important flags:
-- `--reward-mode {lm_ce,mem_pred}` — `lm_ce` (default) runs the frozen upper
-  scan + LM head on `H_enriched` for principled per-token CE reward; `mem_pred`
-  uses the cheap memory-head proxy.
+- `--traj-noise-sigma FLOAT` — per-trajectory fixed perturbation magnitude
+  in VQ latent space (default 3.0). Each K trajectory gets ξ_k ~ N(0, σ²)
+  reused at every mod event, giving sustained trajectory identity. Essential
+  for GRPO signal to survive window averaging. Set to 0 to disable.
 - `--stage1-tokens`, ..., `--stage4-tokens` — per-stage token budgets for the
   curriculum (reward windows 512 / 1024 / 2048 / 4096).
 - `--warmup-batches N` — forward-only batches to warm the memory state before

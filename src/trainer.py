@@ -53,9 +53,12 @@ class Trainer:
         self.no_train = no_train
 
         # Cycle-1+: freeze modulator so phase 1 TBPTT doesn't undo phase 2 GRPO.
-        # Note: train.py already applies this before building the optimizer so
-        # frozen params are excluded from param groups. This is an idempotent
-        # belt-and-suspenders for anyone constructing Trainer directly.
+        # Note: train.py keeps frozen params IN the optimizer groups (they
+        # just get zero gradients), so param-group shapes stay stable across
+        # freeze/unfreeze transitions — important for optimizer.load_state_dict
+        # when resuming from a checkpoint saved with different freeze settings.
+        # The requires_grad flag here is a belt-and-suspenders for anyone
+        # constructing Trainer directly.
         self.freeze_modulator = freeze_modulator
         if freeze_modulator:
             for p in (model.memory.mod_w1, model.memory.mod_b1,

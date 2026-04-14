@@ -266,17 +266,13 @@ For each training batch:
    trajectories × T/M modulator calls, this is ~8K records per batch.
 3. **Compute rewards per action**. For an action at token t, reward is:
    ```
-   r_t = -mean(reward_signal[t+1 : t+1+W])
+   r_t = -mean(lm_ce[t+1 : t+1+W])
    ```
-   where W is the curriculum-controlled reward window
-   (512 → 1024 → 2048 → 4096). Two reward signals are available via
-   `--reward-mode`:
-   - **`lm_ce`** (default): runs the frozen upper scan + LM head on
-     `H_enriched = H_mid + mem_scale * readouts` and uses per-token LM CE.
-     This is the principled target — the actual thing the LM cares about.
-     Costs roughly 2× per rollout.
-   - **`mem_pred`**: uses the memory head (weight-tied) directly on
-     `readouts`. Cheaper but a proxy.
+   where W is the curriculum-controlled reward window (512 → 1024 → 2048
+   → 4096). The reward signal is the full LM cross-entropy: run the
+   frozen upper scan + LM head on `H_enriched = H_mid + mem_scale * readouts`
+   and compute per-token next-token CE. This is the principled target —
+   the actual quantity we want the memory to improve.
 
    Only calls whose **full window fits inside the rollout sequence**
    contribute; truncated-window calls are zeroed (biases the reward toward
@@ -407,9 +403,10 @@ for cycle in 0..N_CYCLES:
     codebook = train_codebook(actions, num_levels=1, codes_per_level=256)
 
     # Phase 2 — freeze everything but modulator, GRPO over codes
+    # with LM CE reward and per-trajectory fixed perturbation (σ=3)
     for (W, budget) in [(512, 10M), (1024, 10M), (2048, 10M), (4096, 10M)]:
         run_phase_2(model, codebook, reward_window=W, tokens=budget,
-                    reward_mode="lm_ce", group_size=8)
+                    group_size=8, traj_noise_sigma=3.0)
 
     save_checkpoint(f"cycle_{cycle}.pt")
 ```
@@ -548,9 +545,10 @@ codebook refreshes; with distance-based logits we get free re-indexing.
 | GRPO group size K | **8** (default) | `--phase2-group-size`; rollout is single K×BS batched forward |
 | Curriculum (W, budget) | (512, 10M), (1024, 10M), (2048, 10M), (4096, 10M) | automatic |
 | Segment length T per stage | `2 × reward_window` | ensures ~half the modulation calls get complete reward windows |
-| Reward mode | **`lm_ce`** (default) | frozen upper scan + LM head; `mem_pred` available as cheap proxy |
+| Reward | LM CE (frozen upper scan + LM head on H_enriched) | `-CE` over window W |
 | Logits temperature τ | 1.0 | tunable |
 | Entropy coeff | 0.01 | GRPO + entropy bonus for code diversity |
+| Trajectory noise σ | 3.0 | `--traj-noise-sigma` — per-trajectory fixed perturbation in VQ latent space (ES-style parameter noise). Required for GRPO signal to survive window averaging. |
 | Advantage normalization | per-(call, sample) std over K (centered by K-baseline) | |
 | Eval cadence | every 50 GRPO updates | continuous + VQ-argmax quantized eval both |
 | lane divergence logging | every `log_interval` steps | diagnostic only — no state modification |

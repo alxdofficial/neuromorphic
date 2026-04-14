@@ -3,7 +3,9 @@
 Everything except the modulator's mod_w1/b1/w2/b2 is frozen. The modulator's
 continuous output is encoded via a frozen RVQ-VAE, sampled into discrete codes,
 and the quantized reconstruction is applied to memory state. The training
-signal is a group-relative policy gradient on windowed mem_pred_loss reward.
+signal is a group-relative policy gradient on windowed LM CE reward —
+each action's reward is -CE over a window of future tokens computed by
+running the frozen upper scan + LM head on H_enriched = H_mid + mem_scale * readout.
 
 See docs/training_strategy.md for the full design.
 """
@@ -114,7 +116,6 @@ class Phase2Trainer:
 
         # Current curriculum stage (set by run_curriculum)
         self.reward_window: int = 0
-        self.segment_length: int = 0
 
         # JSONL metrics log
         self.metrics_path = metrics_path
@@ -584,19 +585,6 @@ class Phase2Trainer:
         }
 
     @torch.no_grad()
-    def _restore_mem_state(self, snapshot: dict):
-        mem = self.model.memory
-        mem.h = snapshot["h"].clone()
-        mem.msg = snapshot["msg"].clone()
-        mem.W = snapshot["W"].clone()
-        mem.decay = snapshot["decay"].clone()
-        mem.hebbian = snapshot["hebbian"].clone()
-        mem.s_mem_live = snapshot["s_mem_live"].clone()
-        mem.s_mem_ema_fast = snapshot["s_mem_ema_fast"].clone()
-        mem.prev_readout = snapshot["prev_readout"].clone()
-        mem.readout_drift = snapshot["readout_drift"].clone()
-
-    @torch.no_grad()
     def rollout(self, batch) -> dict:
         """Run K trajectories on the same batch in parallel via batch-expanded memory.
 
@@ -972,7 +960,6 @@ class Phase2Trainer:
         """
         for stage_idx, stage in enumerate(stages):
             self.reward_window = stage.reward_window
-            self.segment_length = stage.reward_window
             print(f"\n=== Phase 2 stage {stage_idx+1}/{len(stages)}: "
                   f"W={stage.reward_window}, budget={stage.token_budget:,} tokens ===")
             if self.train_loader_factory is not None:
