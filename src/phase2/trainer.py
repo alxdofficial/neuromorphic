@@ -743,19 +743,9 @@ class Phase2Trainer:
         K, n_calls, BS, NC, mod_in_dim = rollout_result["mod_inputs"].shape
         num_levels = rollout_result["codes"].shape[-1]
 
-        # mod_inputs and codes are pinned-CPU tensors (rollout keeps them off
-        # GPU to avoid a 4.6 GB transient allocation during rollout). The
-        # rollout's peak VRAM is the dominant constraint (memory state at
-        # K*BS plus intermediates); by the time we reach grpo_step the
-        # rollout has finished and freed its intermediates. We move the
-        # full pinned tensors to GPU here in one non_blocking transfer,
-        # which overlaps with compute and is faster than per-chunk streaming.
-        mod_inputs_cpu = rollout_result["mod_inputs"]
-        codes_cpu = rollout_result["codes"]
+        mod_inputs = rollout_result["mod_inputs"]    # [K, n_calls, BS, NC, mod_in] f32 GPU
+        codes = rollout_result["codes"]              # [K, n_calls, BS, NC, L] long GPU
         rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 GPU
-
-        mod_inputs = mod_inputs_cpu.to(self.device, non_blocking=True)
-        codes = codes_cpu.to(self.device, non_blocking=True)
 
         # Advantages — broadcast over NC since actions are per-cell
         advantages = self._compute_advantages(rewards)                 # [K, n_calls, BS]
