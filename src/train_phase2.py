@@ -180,11 +180,30 @@ def main():
     # index gives each stage a different starting position. Combined with
     # train_loop.py passing a cycle-specific `--seed` to train_phase2, we
     # also de-duplicate across cycles. See audit #3.
+    # Per-stage BS scaling: phase 2's dominant tensor is readouts
+    # [K*BS, T, D] bf16 which scales with K*BS*T. With K=8 fixed and
+    # D=2048, we can increase BS at shorter windows to maximize GPU
+    # utilization while keeping peak VRAM ~12-14 GB across all stages.
+    # The BS ladder below gives ~3-6x more samples per GRPO step at
+    # short windows without changing peak VRAM meaningfully, but yields
+    # fewer optimizer updates per stage — acceptable since the modulator
+    # only has 4 trainable tensors.
+    BS_PER_WINDOW = {512: 24, 1024: 16, 2048: 12, 4096: 8}
+
+    def bs_for_window(reward_window: int) -> int:
+        # Find the largest window <= reward_window and use its BS.
+        # Falls back to args.bs for windows outside the ladder.
+        for w in sorted(BS_PER_WINDOW.keys(), reverse=True):
+            if reward_window >= w:
+                return BS_PER_WINDOW[w]
+        return args.bs
+
     def train_loader_factory(reward_window: int, stage_idx: int = 0):
         seq_length = 2 * reward_window
         stage_seed = args.seed + stage_idx * 10_000
+        stage_bs = bs_for_window(reward_window)
         return create_dataloader(
-            phase="A", tokenizer=tokenizer, batch_size=args.bs,
+            phase="A", tokenizer=tokenizer, batch_size=stage_bs,
             seq_length=seq_length, seed=stage_seed, max_steps=10**9)
     # Initial placeholder dataloader (unused; replaced per-stage by factory).
     dataloader = train_loader_factory(max_window, stage_idx=0)
@@ -229,10 +248,19 @@ def main():
     # model sees. Run N batches of pure forward (no grad, no codes) so
     # memory accumulates context.
     if args.warmup_batches > 0:
+        # Use the first stage's BS for warmup so the memory state is
+        # already at the right size before stage 1 starts. Without this,
+        # stage 1 would trigger a resize on its first batch.
+        warmup_bs = bs_for_window(stages[0].reward_window)
         print(f"\nWarming up phase-2 memory state "
-              f"({args.warmup_batches} forward batches)...")
+              f"({args.warmup_batches} forward batches, BS={warmup_bs})...")
+        # Ensure memory is at warmup_bs, not args.bs from earlier resize.
+        if (model.memory._initialized
+                and model.memory.h.shape[0] != warmup_bs):
+            model.memory.resize_to_bs(warmup_bs)
+            model._initialized = model.memory._initialized
         warmup_loader = create_dataloader(
-            phase="A", tokenizer=tokenizer, batch_size=args.bs,
+            phase="A", tokenizer=tokenizer, batch_size=warmup_bs,
             seq_length=max_window, seed=args.seed - 1,  # distinct from train
             max_steps=args.warmup_batches)
         model.train(False)

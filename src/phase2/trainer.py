@@ -849,6 +849,10 @@ class Phase2Trainer:
         actually process shorter sequences (cheaper per step) and the
         curriculum is a true easy-to-hard ramp. Without a factory, falls
         back to the single dataloader passed at init time.
+
+        If the factory returns different BS per stage, memory state is
+        resized (tile/trim lanes) to match the stage's BS so rollout()
+        doesn't see a shape mismatch between the batch and the memory.
         """
         for stage_idx, stage in enumerate(stages):
             self.reward_window = stage.reward_window
@@ -856,16 +860,33 @@ class Phase2Trainer:
             print(f"\n=== Phase 2 stage {stage_idx+1}/{len(stages)}: "
                   f"W={stage.reward_window}, budget={stage.token_budget:,} tokens ===")
             if self.train_loader_factory is not None:
-                # Pass stage_idx so the factory can offset the seed — without
-                # this every stage starts at the same shard prefix. See the
-                # comment in train_phase2.py train_loader_factory for details.
                 try:
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window, stage_idx=stage_idx)
                 except TypeError:
-                    # Back-compat for factories that only accept reward_window.
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window)
+
+                # Resize memory state if the stage's BS differs from
+                # the current memory BS. Each lane's state is valid
+                # memory produced by the shared modulator; resize_to_bs
+                # samples/tiles lanes without averaging.
+                stage_bs = getattr(self.dataloader, "batch_size", None)
+                if stage_bs is None:
+                    # _DatasetIterator wraps the dataset
+                    ds = getattr(self.dataloader, "dataset", None)
+                    stage_bs = getattr(ds, "batch_size", None)
+                if (stage_bs is not None
+                        and self.model.memory._initialized
+                        and self.model.memory.h.shape[0] != stage_bs):
+                    print(f"  Resizing memory from BS={self.model.memory.h.shape[0]} "
+                          f"to stage BS={stage_bs}")
+                    self.model.memory.resize_to_bs(stage_bs)
+                    self.model._initialized = self.model.memory._initialized
+                    # Upper-scan carries also need to be dropped — they're
+                    # at the previous BS. Lower-scan carries are handled
+                    # per-rollout by detach_carries() anyway.
+                    self.model.lm._carries = [None] * self.config.L_total
             self._run_stage(stage)
 
     def _run_stage(self, stage: CurriculumStage):
