@@ -47,6 +47,8 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     print(f"Loading {args.actions}")
     actions = torch.load(args.actions, map_location="cpu", weights_only=True)
@@ -100,7 +102,9 @@ def main():
     n_params = sum(p.numel() for p in vqvae.parameters() if p.requires_grad)
     print(f"  trainable params: {n_params:,}")
 
-    optimizer = torch.optim.AdamW(vqvae.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        vqvae.parameters(), lr=args.lr,
+        fused=(device.type == "cuda"))
 
     step = 0
     for epoch in range(args.epochs):

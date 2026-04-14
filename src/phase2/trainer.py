@@ -99,7 +99,8 @@ class Phase2Trainer:
             p.requires_grad = False
 
         self.optimizer = torch.optim.AdamW(
-            self.trainable_params, lr=lr, betas=(0.9, 0.95))
+            self.trainable_params, lr=lr, betas=(0.9, 0.95),
+            fused=(device.type == "cuda"))
         self.global_step = 0
 
         # Current curriculum stage (set by run_curriculum)
@@ -742,19 +743,28 @@ class Phase2Trainer:
         K, n_calls, BS, NC, mod_in_dim = rollout_result["mod_inputs"].shape
         num_levels = rollout_result["codes"].shape[-1]
 
-        # Records already live on device from forward_segment_phase2
-        mod_inputs = rollout_result["mod_inputs"]    # [K, n_calls, BS, NC, mod_in] f32 gpu
-        codes = rollout_result["codes"]              # [K, n_calls, BS, NC, L] long gpu
-        rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 gpu
+        # mod_inputs and codes are pinned-CPU tensors (rollout keeps them off
+        # GPU to avoid a 4.6 GB transient allocation during rollout). The
+        # rollout's peak VRAM is the dominant constraint (memory state at
+        # K*BS plus intermediates); by the time we reach grpo_step the
+        # rollout has finished and freed its intermediates. We move the
+        # full pinned tensors to GPU here in one non_blocking transfer,
+        # which overlaps with compute and is faster than per-chunk streaming.
+        mod_inputs_cpu = rollout_result["mod_inputs"]
+        codes_cpu = rollout_result["codes"]
+        rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 GPU
+
+        mod_inputs = mod_inputs_cpu.to(self.device, non_blocking=True)
+        codes = codes_cpu.to(self.device, non_blocking=True)
 
         # Advantages — broadcast over NC since actions are per-cell
         advantages = self._compute_advantages(rewards)                 # [K, n_calls, BS]
         advantages = advantages.unsqueeze(-1).expand(-1, -1, -1, NC)   # [K, n_calls, BS, NC]
 
-        # Flatten all records into [M, ...] where M = K * n_calls * BS * NC
-        mod_inputs_flat = mod_inputs.reshape(-1, NC, mod_in_dim)       # [K*n_calls*BS, NC, mod_in]
-        codes_flat = codes.reshape(-1, NC, num_levels)                 # same
-        advantages_flat = advantages.reshape(-1, NC)                   # same
+        # Flatten all records into [M, ...] where M = K * n_calls * BS
+        mod_inputs_flat = mod_inputs.reshape(-1, NC, mod_in_dim)
+        codes_flat = codes.reshape(-1, NC, num_levels)
+        advantages_flat = advantages.reshape(-1, NC)
         # Each per-cell action is its own "record"; reshape [M, mod_in] by folding NC
         # But the modulator forward is per-cell (einsum "bni,nih->bnh") and needs
         # the NC dim. So we'll process [M, NC, ...] as a big batch.

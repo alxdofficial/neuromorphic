@@ -63,6 +63,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     # Load phase 1 checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")

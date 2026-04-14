@@ -1255,13 +1255,19 @@ class MemoryGraph(nn.Module):
                 gate = decay.unsqueeze(-1)
                 one_minus_gate = 1.0 - gate
 
-                # Record on CPU to avoid accumulating GB of mod_inputs on
-                # GPU at large T (e.g. T=8192 → 2048 calls × [K*BS, NC, 1092]
-                # = 4.6 GB at K=8, BS=8). The sync overhead of per-call
-                # .cpu() is small relative to the memory step itself.
-                mod_input_records.append(mod_input_f32.detach().cpu())
-                codes_records.append(
-                    codes.reshape(BS, NC, -1).detach().cpu())
+                # Record on pinned CPU to avoid accumulating GB of mod_inputs
+                # on GPU at large T. Pinned memory allows non_blocking transfers
+                # back to GPU in the grad step, overlapping with compute.
+                mi_cpu = torch.empty_like(
+                    mod_input_f32, device="cpu", pin_memory=True)
+                mi_cpu.copy_(mod_input_f32.detach(), non_blocking=True)
+                mod_input_records.append(mi_cpu)
+                codes_cpu = torch.empty(
+                    BS, NC, codes.shape[-1] if codes.dim() > 1 else 1,
+                    dtype=codes.dtype, device="cpu", pin_memory=True)
+                codes_cpu.copy_(
+                    codes.reshape(BS, NC, -1).detach(), non_blocking=True)
+                codes_records.append(codes_cpu)
                 call_positions.append(t)
 
             # Memory step (same as phase 1)
@@ -1296,9 +1302,13 @@ class MemoryGraph(nn.Module):
         self.prev_readout = prev_readout_full
         self.readout_drift = readout_drift
 
+        # Stack records on CPU (keep pinned) — grpo_step streams them back
+        # to GPU per chunk to avoid the 4.6 GB GPU transient allocation.
+        mod_inputs_cpu = torch.stack(mod_input_records, dim=0)   # [n_calls, BS, NC, mod_in] pinned CPU
+        codes_cpu = torch.stack(codes_records, dim=0)             # [n_calls, BS, NC, L] pinned CPU
         return {
             "readouts": readouts,
-            "mod_inputs": torch.stack(mod_input_records, dim=0).to(readouts.device),  # [n_calls, BS, NC, mod_in]
-            "codes": torch.stack(codes_records, dim=0).to(readouts.device),            # [n_calls, BS, NC, L]
+            "mod_inputs": mod_inputs_cpu,
+            "codes": codes_cpu,
             "call_positions": torch.tensor(call_positions, dtype=torch.long),
         }
