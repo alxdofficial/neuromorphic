@@ -20,7 +20,7 @@ class Config:
     # === Memory Graph (dense-W) ===
     D_n: int = 256             # neuron hidden dim
     alpha: int = 4             # input/output ports per cell
-    neurons_per_cell: int = 46 # sized to hit ~110M total params (matches v9)
+    neurons_per_cell: int = 48 # 16-aligned for bf16 tensor cores; ~114M total
     K: int = 8                 # initial sparse connections per neuron (W init only)
     cell_mod_hidden: int = 2048
     state_mlp_hidden: int = 256

@@ -160,4 +160,4 @@ Results (1.5B tokens, RTX 4090):
 | GPT-2 small | 124M | 2.955 | 19.2 |
 | Pythia-160m | 160M | 2.736 | 15.4 |
 | Mamba-130m | 130M | 3.294 | 27.0 |
-| **Neuromorphic LM** | **110M** | **TBD** | **TBD** |
+| **Neuromorphic LM** | **113M** | **TBD** | **TBD** |

@@ -200,8 +200,8 @@ Gradient flow:
 | Scan recurrence dim | d_inner | 1200 | config.d_inner |
 | Neuron hidden dim | D_n | 256 | config.D_n |
 | Cells | N_cells | 8 | D // D_n |
-| Neurons per cell | Cn | 46 | config.neurons_per_cell |
-| Total neurons | N | 368 | N_cells × Cn |
+| Neurons per cell | Cn | 48 | config.neurons_per_cell |
+| Total neurons | N | 384 | N_cells × Cn |
 | Ports per cell | alpha | 4 | config.alpha |
 | State MLP hidden | Hs | 256 | config.state_mlp_hidden |
 | Msg MLP hidden | Hm | 256 | config.msg_mlp_hidden |
@@ -216,7 +216,7 @@ Gradient flow:
 
 ### Connectivity: Dense W Matrix
 
-Each cell has `W: [BS, NC, Cn, Cn] = [BS, 8, 46, 46]`. Runtime state
+Each cell has `W: [BS, NC, Cn, Cn] = [BS, 8, 48, 48]`. Runtime state
 (not a learned parameter). Initialized sparse (K=8 nonzeros per row,
 then row-RMSNormed), evolves via the neuromodulator. Message passing is
 a plain bmm on the raw W — **no per-step renormalization**:
@@ -251,7 +251,7 @@ over K=256 codes → shared codebook lookup → shared decoder → continuous
 (delta_W, delta_decay) action. Phase 1 samples codes via Gumbel-softmax
 (differentiable); phase 2 samples via hard Categorical (for GRPO rollouts).
 
-**Input** `[BS, NC, mod_in = 2*N + 4 + N*N = 2212]` for N=46:
+**Input** `[BS, NC, mod_in = 2*N + 4 + N*N = 2404]` for N=48:
 
 ```python
 cat([h_norms, msg_norms,                  # 2*N    — per-neuron firing rates
@@ -272,19 +272,19 @@ restricted to plasticity controls (`delta_W`, `delta_decay`), never to
 neuron identity vectors — identity is set during bootstrap and frozen.
 
 **Pipeline**:
-1. Per-cell logit head: `mod_in=2212 → Hmod=2048 → K=256` logits (tanh, per-cell einsum).
+1. Per-cell logit head: `mod_in=2404 → Hmod=2048 → K=256` logits (tanh, per-cell einsum).
 2. Sample code: Gumbel-softmax (phase 1, τ annealing 1.0→0.3) or hard
    Categorical (phase 2). Eval mode always takes argmax (deterministic).
 3. Shared codebook lookup: `codebook: [K=256, code_dim=32]` → 32-dim embedding.
-4. Shared decoder: `32 → decoder_hidden=128 → action_dim=2162` (tanh).
+4. Shared decoder: `32 → decoder_hidden=128 → action_dim=2352` (tanh).
 
 Codebook and decoder are **frozen after bootstrap**. Only the logit head
 updates during cycle phase 1 and phase 2.
 
-**Output** `[BS, NC, mod_out=2162]`:
+**Output** `[BS, NC, mod_out=2352]`:
 ```python
-delta_W_raw:      [BS, NC, N*N=2116]  → reshape [BS, NC, 46, 46]
-delta_decay_raw:  [BS, NC, N=46]
+delta_W_raw:      [BS, NC, N*N=2304]  → reshape [BS, NC, 48, 48]
+delta_decay_raw:  [BS, NC, N=48]
 ```
 
 Both outputs are **not applied directly**. They pass through bounded
@@ -379,24 +379,24 @@ Detached at TBPTT boundaries.
 
 | Component | Shape | Params | Notes |
 |-----------|-------|--------|-------|
-| neuron_id | [NC=8, Cn=46, D_n=256] | 94K | Per-neuron identity (frozen at inference) |
+| neuron_id | [NC=8, Cn=48, D_n=256] | 98K | Per-neuron identity (frozen at inference) |
 | state_w1/b1/w2/b2 | — | 197K | Shared state MLP |
 | msg_w1/b1/w2/b2 | — | 131K | Shared message MLP |
 | inject_w | [NC=8, alpha*D_n, D_n] | 2.1M | Per-cell, kaiming init |
 | inject_b | [NC=8, alpha*D_n] | 8K | |
-| discrete_policy.logit_w1 | [NC=8, mod_in=2212, Hmod=2048] | 36.2M | Per-cell logit-head layer 1 |
+| discrete_policy.logit_w1 | [NC=8, mod_in=2404, Hmod=2048] | 39.4M | Per-cell logit-head layer 1 |
 | discrete_policy.logit_b1 | [NC=8, 2048] | 16K | |
 | discrete_policy.logit_w2 | [NC=8, 2048, K=256] | 4.2M | Per-cell logit-head layer 2 (→ K categorical logits) |
 | discrete_policy.logit_b2 | [NC=8, 256] | 2K | |
 | discrete_policy.codebook | [K=256, code_dim=32] | 8K | Shared across cells; frozen after bootstrap |
 | discrete_policy.dec_w1/b1 | [32, 128] | 4K | Shared decoder layer 1; frozen after bootstrap |
-| discrete_policy.dec_w2/b2 | [128, action_dim=2162] | 277K | Shared decoder layer 2; frozen after bootstrap |
+| discrete_policy.dec_w2/b2 | [128, action_dim=2352] | 301K | Shared decoder layer 2; frozen after bootstrap |
 | hebbian_decay_logit | [NC=8] | 8 | Learnable per-cell Hebbian EMA rate (init 2.0 → γ≈0.88) |
 | W_decay_logit | [NC=8] | 8 | Learnable per-cell W plasticity rate (init -3.0 → γ≈0.047) |
 | decay_gamma_logit | [NC=8] | 8 | Learnable per-cell decay plasticity rate (init -3.0 → γ≈0.047) |
-| **Memory total** | | **~43.3M** | |
+| **Memory total** | | **~46.5M** | |
 | **LM total** | | **~67.1M** | |
-| **Grand total** | | **~110.4M** | |
+| **Grand total** | | **~113.5M** | |
 
 Memory-prediction head adds **zero** parameters (tied to lm_head via
 the embedding).

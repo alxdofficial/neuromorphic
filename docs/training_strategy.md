@@ -65,7 +65,7 @@ system co-adapt.
 
 - `T = 128` tokens per segment, `tbptt_block = 8` (detach at 8-token boundaries)
 - `modulation_interval = 4` tokens between modulator calls
-- `BS = 80` (RTX 4090 max at 110M params)
+- `BS = 80` (RTX 4090 max at ~113M params)
 - `lr = 3e-4` → `3e-5` cosine, `lr_target_step` covers bootstrap + all cycles
 - `mem_pred_weight = 0.1` on the memory-head auxiliary CE loss
 - Gumbel τ annealing: linear 1.0 → 0.3 across `lr_target_step` (auto-wired in
