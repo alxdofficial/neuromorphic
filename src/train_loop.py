@@ -61,6 +61,14 @@ def parse_args():
     p.add_argument("--phase2-entropy-coeff", type=float, default=0.01)
     p.add_argument("--phase2-warmup-batches", type=int, default=8)
     p.add_argument("--phase2-eval-interval", type=int, default=50)
+    # Phase 1 eval hyperparams — forwarded to src.train. Previously these
+    # defaulted to whatever src.train defined, with no way to tune from the
+    # outer loop. Useful to dial down during long bootstrap runs where eval
+    # cost is non-trivial.
+    p.add_argument("--phase1-eval-interval", type=int, default=500,
+                   help="src.train default is 500; --phase1-eval-interval 0 disables")
+    p.add_argument("--phase1-eval-batches", type=int, default=8)
+    p.add_argument("--phase1-eval-warmup-batches", type=int, default=4)
     return p.parse_args()
 
 
@@ -103,6 +111,13 @@ def main():
     print(f"LR schedule target (total optimizer steps across all phase-1 "
           f"calls): {lr_target_step:,}")
 
+    # Shared phase-1 eval CLI knobs forwarded to both bootstrap + cycle runs.
+    phase1_eval_flags = [
+        "--eval-interval", str(args.phase1_eval_interval),
+        "--eval-batches", str(args.phase1_eval_batches),
+        "--eval-warmup-batches", str(args.phase1_eval_warmup_batches),
+    ]
+
     # ---- Bootstrap ----
     if not args.skip_bootstrap and not os.path.exists(bootstrap_ckpt):
         print(f"\n=========== BOOTSTRAP ({args.bootstrap_tokens:,} tokens) ===========")
@@ -115,6 +130,7 @@ def main():
             "--lr-target-step", str(lr_target_step),
             "--save-dir", args.work_dir,
             "--save-interval", str(steps),
+            *phase1_eval_flags,
         ])
         latest = latest_ckpt(args.work_dir, before=before)
         if latest is not None:
@@ -190,6 +206,7 @@ def main():
             "--save-interval", str(target_step_p1),
             "--resume", current_ckpt,
             "--freeze-codebook-decoder",
+            *phase1_eval_flags,
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:

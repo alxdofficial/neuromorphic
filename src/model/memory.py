@@ -183,7 +183,10 @@ class MemoryGraph(nn.Module):
         NC, N, D_n = self.N_cells, self.C_n, self.D_n
         K_init = self.config.K  # initial sparse connections
 
-        self.h = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.01
+        # h and msg both zero-init — cleanest cold-start. The state evolves
+        # via the state MLP (received + h) → tanh → decay blend, which
+        # symmetry-breaks on the first step from the received+inject signal.
+        self.h = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)
         self.msg = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)
         # Per-neuron decay gate, stored directly in [0,1]. Init at 0.5
         # (midrange, unbiased). Updated via convex EMA toward a sigmoid'd
@@ -992,6 +995,14 @@ class MemoryGraph(nn.Module):
             valid_mask[:, 1:] = (input_ids[:, :-1] != eot).to(H_mid.dtype)
         if prev_token is not None:
             valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).to(H_mid.dtype)
+        else:
+            # Conservative fallback: without prev_token the caller can't tell
+            # us whether the previous chunk ended on EOT. Mask position 0 to
+            # avoid silently training the memory head on a potentially
+            # cross-document transition. The standard dataloader always
+            # passes prev_token (seeded with EOS for the first-ever chunk),
+            # so this branch only fires for ad-hoc/test callers.
+            valid_mask[:, 0] = 0.0
 
         h = self.h
         msg = self.msg

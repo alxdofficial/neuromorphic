@@ -299,8 +299,14 @@ class DiscreteActionPolicy(nn.Module):
                                           (dead.numel(),), device=active.device)]
         noise = torch.randn_like(self.codebook[dead]) * noise_std
         self.codebook[dead] = self.codebook[donor_idx] + noise
-        # Reset usage counts for resampled codes to give them a fair chance
-        self.usage_count[dead] = self.usage_count[active].mean()
+        # Seed reset rows with a small runway above the re-detection
+        # threshold: just above the dead cutoff so they don't pretend to be
+        # fully-used (which would hide them from re-detection for many
+        # steps), but above the threshold so they aren't flagged at the
+        # very next reset check. If they accumulate real usage they rise
+        # above this seed; if they don't, EMA decay pulls them back below
+        # threshold within ~1 reset interval and they get caught again.
+        self.usage_count[dead] = threshold * total * 3.0
         # Clear AdamW state for reset rows so momentum doesn't drag them
         # back toward their pre-reset identities.
         if optimizer is not None:

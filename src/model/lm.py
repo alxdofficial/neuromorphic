@@ -129,12 +129,33 @@ class LM(nn.Module):
         the memory contribution collapses silently; if it explodes the
         memory overwhelms H_mid. Neither has any regularizer, so we need
         to watch it in the metrics stream.
+
+        Init is sqrt(alpha) = 2.0. Sane range for abs_mean is ~[0.1, 10.0]
+        — drift outside raises a one-time stdout warning and sets a flag in
+        the returned dict so the plotter can surface it.
         """
         ms = self.mem_scale.detach().float()
+        abs_mean = ms.abs().mean().item()
+        # One-time drift warning: flag the first step where abs_mean leaves
+        # the sane range in either direction. Avoids log-spam by caching
+        # whether we've already warned per direction.
+        MS_LO, MS_HI = 0.1, 10.0
+        alert = ""
+        if abs_mean < MS_LO:
+            alert = f"below {MS_LO:.2f} — memory contribution collapsing"
+            if not getattr(self, "_mem_scale_low_warned", False):
+                print(f"[WARN] mem_scale abs_mean={abs_mean:.4f} {alert}")
+                self._mem_scale_low_warned = True
+        elif abs_mean > MS_HI:
+            alert = f"above {MS_HI:.2f} — memory overwhelming H_mid"
+            if not getattr(self, "_mem_scale_high_warned", False):
+                print(f"[WARN] mem_scale abs_mean={abs_mean:.4f} {alert}")
+                self._mem_scale_high_warned = True
         return {
             "mem_scale_mean": ms.mean().item(),
             "mem_scale_std": ms.std().item(),
-            "mem_scale_abs_mean": ms.abs().mean().item(),
+            "mem_scale_abs_mean": abs_mean,
             "mem_scale_abs_max": ms.abs().max().item(),
             "mem_scale_abs_min": ms.abs().min().item(),
+            "mem_scale_drift_alert": alert,
         }

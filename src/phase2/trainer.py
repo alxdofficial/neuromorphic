@@ -60,6 +60,7 @@ class Phase2Trainer:
         metrics_path: str | None = None,
         train_loader_factory=None,
         sanity_check_interval: int = 50,
+        reward_ce_sub_bs: int = 8,
     ):
         self.model = model
         self.dataloader = dataloader
@@ -76,6 +77,11 @@ class Phase2Trainer:
         self.eval_batches = eval_batches
         self.eval_warmup_batches = eval_warmup_batches
         self.sanity_check_interval = sanity_check_interval
+        # Sub-batch size for the per-token reward CE pass. Bounds VRAM at the
+        # cost of more sequential upper-scan calls. Default 8 is safe at
+        # tier_a (BS=24 / K=8 → K*BS=192 → 24 iterations). Bump if you have
+        # spare VRAM and want fewer iterations.
+        self.reward_ce_sub_bs = reward_ce_sub_bs
 
         # Freeze everything. Unfreeze just the logit head below.
         # In the new architecture this is: discrete_policy.logit_{w1,b1,w2,b2}.
@@ -377,7 +383,7 @@ class Phase2Trainer:
             h.clone() if h is not None else None for h in lm._carries]
         split = self.config.scan_split_at
 
-        sub_bs = min(BS, 8)
+        sub_bs = min(BS, self.reward_ce_sub_bs)
         chunk_t = 128
         all_ce = torch.zeros(BS, T - 1, device=readouts.device, dtype=torch.float32)
 
@@ -602,7 +608,10 @@ class Phase2Trainer:
         """
         baseline = rewards.mean(dim=0, keepdim=True)
         advantages = rewards - baseline
-        std = advantages.std(dim=0, keepdim=True, unbiased=False).clamp(min=1e-8)
+        # Unbiased sample std (Bessel-corrected, N-1 denominator) matches the
+        # GRPO literature convention. Biased std would inflate scale by
+        # sqrt(N/(N-1)) ≈ 1.07 for K=8 and be inconsistent with baselines.
+        std = advantages.std(dim=0, keepdim=True, unbiased=True).clamp(min=1e-8)
         advantages = advantages / std
         if complete_mask is not None:
             # complete_mask: [n_calls] → broadcast to [K, n_calls, BS]
