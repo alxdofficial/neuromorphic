@@ -743,18 +743,24 @@ class MemoryGraph(nn.Module):
         BS = h.shape[0]
         dt = h.dtype
 
-        h_norms = h.float().norm(dim=-1).to(dt)                              # [BS, NC, N]
-        msg_norms = msg.float().norm(dim=-1).to(dt)                          # [BS, NC, N]
-        decay_mean = decay.mean(dim=2, keepdim=True)                         # [BS, NC, 1]
-        hebbian_flat = hebbian.reshape(BS, NC, N * N)                        # [BS, NC, N*N]
+        # Build mod_input in f32 — matches forward_segment_phase2 so the
+        # eval path (argmax through this function) produces the same logits
+        # as the rollout path (compute_logits on f32 mod_input). With bf16
+        # mod_input the argmax decisions flip vs the rollout path because
+        # bf16 rounds the tanh-hidden values enough to change which code
+        # wins, then the entire downstream W/decay/hebbian state diverges.
+        h_norms = h.float().norm(dim=-1)                                     # [BS, NC, N]
+        msg_norms = msg.float().norm(dim=-1)                                 # [BS, NC, N]
+        decay_mean = decay.float().mean(dim=2, keepdim=True)                 # [BS, NC, 1]
+        hebbian_flat = hebbian.float().reshape(BS, NC, N * N)                # [BS, NC, N*N]
 
-        s1 = s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
-        s2 = s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
+        s1 = s_mem_live.float().view(BS, 1, 1).expand(BS, NC, 1)
+        s2 = s_mem_ema_fast.float().view(BS, 1, 1).expand(BS, NC, 1)
 
         mod_input = torch.cat([
             h_norms, msg_norms,                # 2*N
             decay_mean,                         # 1
-            readout_drift,                      # 1
+            readout_drift.float(),              # 1
             s1, s2,                             # 2
             hebbian_flat,                       # N*N
         ], dim=-1)
@@ -1312,13 +1318,14 @@ class MemoryGraph(nn.Module):
                 else:
                     codes = logits.argmax(dim=-1)
                 action = self.discrete_policy.decode(codes)          # [BS, NC, action_dim] f32
-                quantized = action.to(dt)
 
                 # Unpack delta_W, delta_decay_raw and apply the same convex-EMA
                 # updates as phase 1 (so the frozen-module determinism matches).
-                # F32 compute for (1-γ) precision — same fix as phase 1.
-                delta_W_raw = quantized[..., :N * N].reshape(BS, NC, N, N)
-                delta_decay_raw = quantized[..., N * N:N * N + N].reshape(BS, NC, N)
+                # Keep delta_W_raw in f32 through rms_norm — bf16 loses
+                # precision on the rms denominator, and phase 1's
+                # _modulate_cells also does the rms_norm in f32.
+                delta_W_raw = action[..., :N * N].reshape(BS, NC, N, N)
+                delta_decay_raw = action[..., N * N:N * N + N].reshape(BS, NC, N)
 
                 delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
                 g_w_f32 = W_gamma.float().view(1, -1, 1, 1)
