@@ -1,230 +1,118 @@
-"""End-to-end smoke test for phase 2 rollout and GRPO step.
-
-Uses tier_tiny config and a stubbed LM / VQVAE where possible. Validates:
-- forward_segment_phase2 runs and returns the expected record shapes
-- compute_modulator_action → codebook fit → phase 2 rollout pipeline works
-- GRPO gradient flows to modulator params only
-"""
+"""Phase 2 rollout + GRPO tests for the factored-categorical policy."""
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import pytest
 
 from src.model.config import Config
 from src.model.memory import MemoryGraph
-from src.codebook import ActionVQVAE
-from tests.test_memory import _StubLM
+
+
+def _tiny_config():
+    return Config.tier_tiny()
+
+
+class _StubLM(nn.Module):
+    """Minimal LM stub for phase-2 rollout (needs lm_head/proj_down/ln_final for
+    the live-surprise signal in forward_segment_phase2)."""
+    def __init__(self, config):
+        super().__init__()
+        self.lm_head = nn.Linear(config.D_embed, config.vocab_size, bias=False).to(torch.bfloat16)
+        self.proj_down = (
+            nn.Linear(config.D, config.D_embed).to(torch.bfloat16)
+            if config.D != config.D_embed else None)
+        self.ln_final = nn.LayerNorm(config.D_embed).to(torch.bfloat16)
 
 
 def _make_setup(BS=2, T=16):
-    config = Config.tier_tiny(T=T, tbptt_block=4, modulation_interval=4)
+    config = _tiny_config()
     mg = MemoryGraph(config)
     mg.initialize_states(BS, torch.device("cpu"))
     lm = _StubLM(config)
     return config, mg, lm
 
 
-def _make_vqvae(action_dim):
-    vq = ActionVQVAE(
-        action_dim=action_dim, latent_dim=8, hidden=32,
-        num_levels=2, codes_per_level=8, beta=0.25)
-    # Give it sensible normalization stats (zero mean, unit std)
-    vq.set_normalization(
-        torch.zeros(1, action_dim),
-        torch.ones(1, action_dim),
-    )
-    return vq
-
-
 class TestPhase2Rollout:
     def test_forward_segment_phase2_shapes(self):
         config, mg, lm = _make_setup(BS=2, T=16)
-        vq = _make_vqvae(action_dim=config.mod_out)
-
         H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
-        result = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, tau=1.0, sample=True)
+        result = mg.forward_segment_phase2(H_mid, input_ids, lm, tau=1.0, sample=True)
 
-        assert result["readouts"].shape == (2, 16, config.D)
-        # With T=16, modulation_interval=4, expect 4 modulator calls at t=0,4,8,12
-        assert result["mod_inputs"].shape == (4, 2, config.N_cells, config.mod_in)
-        assert result["codes"].shape == (4, 2, config.N_cells, 2)  # num_levels=2
-        assert result["call_positions"].tolist() == [0, 4, 8, 12]
+        T = 16
+        M = config.modulation_interval
+        expected_calls = (T + M - 1) // M  # positions 0, M, 2M, ...
+        assert result["readouts"].shape == (2, T, config.D)
+        assert result["mod_inputs"].shape == (expected_calls, 2, config.N_cells, config.mod_in)
+        # codes shape is [n_calls, BS, NC] long (no extra levels dim)
+        assert result["codes"].shape == (expected_calls, 2, config.N_cells)
+        assert result["codes"].dtype == torch.long
+        assert result["call_positions"].tolist() == list(range(0, T, M))[:expected_calls]
 
     def test_sample_vs_argmax(self):
         config, mg, lm = _make_setup(BS=2, T=16)
-        vq = _make_vqvae(action_dim=config.mod_out)
         H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
 
-        # Deterministic (argmax) run twice → same codes. Both runs must start
-        # from identical memory state, so we seed before each initialize_states
-        # (which samples random h and random sparse W permutations).
         torch.manual_seed(0)
         mg.initialize_states(2, torch.device("cpu"))
-        r1 = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, sample=False)
+        r1 = mg.forward_segment_phase2(H_mid, input_ids, lm, sample=False)
         torch.manual_seed(0)
         mg.initialize_states(2, torch.device("cpu"))
-        r2 = mg.forward_segment_phase2(H_mid, input_ids, lm, vq, sample=False)
-        assert (r1["codes"] == r2["codes"]).all(), "argmax should be deterministic"
-
-    def test_phase1_phase2_parity(self):
-        """forward_segment (phase 1) and forward_segment_phase2 (deterministic)
-        should run on the same input and produce readouts/state in the same
-        ballpark.
-
-        Strict numerical equality is not achievable: phase 2 quantizes the
-        continuous modulator output through the RVQ bottleneck, which
-        introduces reconstruction error. But the two paths must produce
-        OUTPUT SHAPES that match exactly, run without errors on the same
-        inputs, and evolve the memory state in the same regime (readouts
-        should have similar order-of-magnitude).
-
-        This is the guard against silent drift between the duplicated
-        _run_block (phase 1) and forward_segment_phase2 (phase 2) glue.
-        If someone breaks one path, the shape or magnitude check catches it.
-
-        See audit #5.
-        """
-        config, mg, lm = _make_setup(BS=2, T=16)
-        vq = _make_vqvae(action_dim=config.mod_out)
-
-        H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
-        input_ids = torch.randint(0, config.vocab_size, (2, 16))
-
-        # Run phase 1
-        torch.manual_seed(123)
-        mg.initialize_states(2, torch.device("cpu"))
-        readouts_p1, _ = mg.forward_segment(H_mid.clone(), input_ids.clone(), lm)
-        W_p1 = mg.W.clone()
-        decay_p1 = mg.decay.clone()
-        hebbian_p1 = mg.hebbian.clone()
-
-        # Run phase 2 with the same seed, deterministic sampling
-        torch.manual_seed(123)
-        mg.initialize_states(2, torch.device("cpu"))
-        r_p2 = mg.forward_segment_phase2(
-            H_mid.clone(), input_ids.clone(), lm, vq, sample=False)
-        readouts_p2 = r_p2["readouts"]
-        W_p2 = mg.W.clone()
-        decay_p2 = mg.decay.clone()
-        hebbian_p2 = mg.hebbian.clone()
-
-        # Shapes must match exactly.
-        assert readouts_p1.shape == readouts_p2.shape, \
-            f"readouts shape drift: {readouts_p1.shape} vs {readouts_p2.shape}"
-        assert W_p1.shape == W_p2.shape
-        assert decay_p1.shape == decay_p2.shape
-        assert hebbian_p1.shape == hebbian_p2.shape
-
-        # Both must produce non-trivial, finite outputs.
-        assert readouts_p1.abs().sum() > 0
-        assert readouts_p2.abs().sum() > 0
-        assert torch.isfinite(readouts_p1).all()
-        assert torch.isfinite(readouts_p2).all()
-        assert torch.isfinite(W_p2).all()
-        assert torch.isfinite(decay_p2).all()
-        assert torch.isfinite(hebbian_p2).all()
-
-        # Readouts should be in the same regime. VQ reconstruction error
-        # with small test codebooks can be large, so we only check that
-        # readout magnitudes haven't diverged by an order of magnitude.
-        # This catches gross regressions (one path outputs zeros, NaNs,
-        # or wildly inflated values) without requiring numerical equality.
-        mag_p1 = readouts_p1.abs().mean().item()
-        mag_p2 = readouts_p2.abs().mean().item()
-        ratio = max(mag_p1, mag_p2) / max(min(mag_p1, mag_p2), 1e-8)
-        assert ratio < 10.0, (
-            f"readout magnitude drift too large: "
-            f"|phase1|={mag_p1:.4f}, |phase2|={mag_p2:.4f}, ratio={ratio:.2f}")
-
-        # decay must stay in [0, 1] for both (convex EMA invariant).
-        assert (decay_p1 >= 0).all() and (decay_p1 <= 1).all()
-        assert (decay_p2 >= 0).all() and (decay_p2 <= 1).all()
+        r2 = mg.forward_segment_phase2(H_mid, input_ids, lm, sample=False)
+        assert (r1["codes"] == r2["codes"]).all(), "argmax must be deterministic"
 
 
 class TestGRPOGradientFlow:
-    def test_log_prob_grad_reaches_z(self):
-        """Verify gradient flows from log_prob back through z (the pg path)."""
-        vq = _make_vqvae(action_dim=64)
-        z = torch.randn(10, 8, requires_grad=True)
-        codes = torch.randint(0, 8, (10, 2))
-        log_pi = vq.rvq.log_prob(z, codes, tau=1.0)
-        loss = -log_pi.mean()
-        loss.backward()
-        assert z.grad is not None
-        assert z.grad.abs().sum() > 0
-
-    def test_grpo_update_only_touches_modulator(self):
-        """Simulate a phase 2 gradient pass: backprop through modulator+encoder,
-        verify gradients reach only the modulator params."""
+    def test_grpo_backprop_reaches_only_logit_head(self):
+        """GRPO in the new architecture should only update the neuromod's
+        logit head — not codebook, decoder, memory dynamics, or LM."""
         config, mg, lm = _make_setup(BS=2, T=8)
-        vq = _make_vqvae(action_dim=config.mod_out)
+        dp = mg.discrete_policy
 
-        # Freeze everything but modulator
+        # Freeze everything except logit head (matches phase2 trainer setup)
         for p in mg.parameters():
             p.requires_grad = False
-        for p in (mg.mod_w1, mg.mod_b1, mg.mod_w2, mg.mod_b2):
+        for p in (dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2):
             p.requires_grad = True
-        for p in vq.parameters():
-            p.requires_grad = False
 
-        # Fake mod_input and pretend codes
         BS, NC = 2, config.N_cells
-        mod_input = torch.randn(BS, NC, config.mod_in, dtype=torch.bfloat16)
-        # Run modulator
-        raw_action = mg._modulator_forward(mod_input)
-        action_flat = raw_action.reshape(BS * NC, -1).float()
-        action_norm = vq.normalize(action_flat)
-        z = vq.encoder(action_norm)
-        codes = torch.randint(0, 8, (BS * NC, 2))
-        log_pi = vq.rvq.log_prob(z, codes, tau=1.0)
-        advantages = torch.randn(BS * NC)
-        loss = -(advantages * log_pi).mean()
+        mod_input = torch.randn(BS, NC, config.mod_in, dtype=torch.float32)
+        codes = torch.randint(0, dp.K, (BS, NC))
+
+        # Forward logits, score, backward
+        logits = dp.compute_logits(mod_input)
+        log_probs = F.log_softmax(logits, dim=-1)
+        log_pi = log_probs.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
+        loss = -log_pi.sum()
         loss.backward()
 
-        # Modulator params should have grad
-        assert mg.mod_w1.grad is not None
-        assert mg.mod_w1.grad.abs().sum() > 0
-        assert mg.mod_w2.grad is not None
-        assert mg.mod_w2.grad.abs().sum() > 0
+        # Gradient should reach logit head
+        assert dp.logit_w1.grad is not None
+        assert dp.logit_w1.grad.abs().sum() > 0
+        assert dp.logit_w2.grad is not None
+        assert dp.logit_w2.grad.abs().sum() > 0
 
-        # Other memory params should NOT have grad
-        assert mg.state_w1.grad is None or mg.state_w1.grad.abs().sum() == 0
-        assert mg.msg_w1.grad is None or mg.msg_w1.grad.abs().sum() == 0
-        assert mg.inject_w.grad is None or mg.inject_w.grad.abs().sum() == 0
+        # Should NOT reach frozen parts (codebook, decoder, dynamics)
+        assert dp.codebook.grad is None
+        assert dp.dec_w1.grad is None
+        assert mg.state_w1.grad is None
 
-        # VQVAE params should NOT have grad
-        for name, p in vq.named_parameters():
-            assert p.grad is None or p.grad.abs().sum() == 0, f"{name} has grad"
+    def test_decode_gradient_reaches_codebook_and_decoder(self):
+        """Phase 1 backprop (via Gumbel-softmax + decode) must deliver
+        gradient to codebook and decoder too."""
+        config, mg, _lm = _make_setup(BS=2, T=8)
+        dp = mg.discrete_policy
 
+        BS, NC = 2, config.N_cells
+        mod_input = torch.randn(BS, NC, config.mod_in)
+        out = dp.forward(mod_input, phase="phase1", tau=1.0, hard_gumbel=True)
+        loss = out["action"].pow(2).mean()
+        loss.backward()
 
-class TestCollectModulatorAction:
-    def test_fallback_snapshot_shape(self):
-        """With _collecting_actions=False, returns a single end-of-chunk snapshot."""
-        config, mg, lm = _make_setup(BS=2, T=16)
-        H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
-        input_ids = torch.randint(0, config.vocab_size, (2, 16))
-        mg.forward_segment(H_mid, input_ids, lm)
-
-        action = mg.collect_modulator_action()
-        assert action is not None
-        # Returns [1, BS, NC, mod_out] — single snapshot with leading events dim.
-        assert action.shape == (1, 2, config.N_cells, config.mod_out)
-        assert action.dtype == torch.float32
-
-    def test_per_event_collection_shape(self):
-        """With _collecting_actions=True, returns one entry per modulation event."""
-        config, mg, lm = _make_setup(BS=2, T=16)
-        H_mid = torch.randn(2, 16, config.D, dtype=torch.bfloat16)
-        input_ids = torch.randint(0, config.vocab_size, (2, 16))
-
-        mg.start_action_collection()
-        mg.forward_segment(H_mid, input_ids, lm)
-        action = mg.collect_modulator_action()
-        mg.stop_action_collection()
-
-        assert action is not None
-        expected_events = 16 // config.modulation_interval
-        assert action.shape == (expected_events, 2, config.N_cells, config.mod_out)
-        assert action.dtype == torch.float32
+        assert dp.logit_w1.grad is not None
+        assert dp.codebook.grad is not None
+        assert dp.dec_w1.grad is not None
+        assert dp.codebook.grad.abs().sum() > 0
+        assert dp.dec_w1.grad.abs().sum() > 0

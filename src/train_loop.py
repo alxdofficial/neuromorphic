@@ -34,26 +34,21 @@ def parse_args():
                    help="Directory for all checkpoints and intermediate files")
     p.add_argument("--bootstrap-tokens", type=int, default=500_000_000)
     p.add_argument("--phase1-tokens-per-cycle", type=int, default=10_000_000,
-                   help="Total phase-1 tokens per cycle (incl. action collection)")
-    p.add_argument("--action-collection-tokens", type=int, default=2_000_000)
+                   help="Phase-1 tokens per cycle (all backprop; no action "
+                        "collection in the new architecture — codebook+decoder "
+                        "are frozen after bootstrap).")
     p.add_argument("--cycles", type=int, default=5)
     p.add_argument("--bs", type=int, default=80)
     p.add_argument("--phase2-bs", type=int, default=8)
     p.add_argument("--phase2-group-size", type=int, default=8)
-    # Optional per-stage phase 2 budgets (tokens). Forwarded to train_phase2.
-    # If None, train_phase2 uses its own defaults (10M each).
     p.add_argument("--phase2-stage1-tokens", type=int, default=None)
     p.add_argument("--phase2-stage2-tokens", type=int, default=None)
     p.add_argument("--phase2-stage3-tokens", type=int, default=None)
     p.add_argument("--phase2-stage4-tokens", type=int, default=None)
-    p.add_argument("--phase2-continuous-sigma", type=float, default=None,
-                   help="If set, phase 2 uses continuous Gaussian policy with "
-                        "this σ (bypasses VQ entirely). Forwarded to train_phase2.")
     p.add_argument("--skip-bootstrap", action="store_true",
                    help="Skip bootstrap (if already done once)")
     p.add_argument("--start-cycle", type=int, default=0,
                    help="Resume at this cycle index")
-    p.add_argument("--codebook-epochs", type=int, default=20)
     return p.parse_args()
 
 
@@ -157,90 +152,43 @@ def main():
         cycle_dir = os.path.join(args.work_dir, f"cycle_{cycle:02d}")
         os.makedirs(cycle_dir, exist_ok=True)
 
-        # Phase 1 with frozen modulator (regular steps)
-        phase1_main_tokens = args.phase1_tokens_per_cycle - args.action_collection_tokens
-        phase1_main_steps = tokens_to_steps(phase1_main_tokens, args.bs)
-        target_step_main = cumulative_step + phase1_main_steps
-        phase1_main_ckpt = os.path.join(cycle_dir, "phase1_main.pt")
-        print(f"\n--- Cycle {cycle} phase 1 main ({phase1_main_tokens:,} tokens, "
-              f"{phase1_main_steps} new steps, absolute target {target_step_main}) ---")
-        before = set(glob.glob(os.path.join(cycle_dir, "ckpt_*.pt")))
-        run([
-            python, "-m", "src.train",
-            "--bs", str(args.bs),
-            "--steps", str(target_step_main),
-            "--lr-target-step", str(lr_target_step),
-            "--save-dir", cycle_dir,
-            "--save-interval", str(target_step_main),
-            "--resume", current_ckpt,
-            "--freeze-modulator",
-        ])
-        latest = latest_ckpt(cycle_dir, before=before)
-        if latest is not None:
-            os.rename(latest, phase1_main_ckpt)
-            cumulative_step = target_step_main
-        else:
-            print("!!! Phase 1 main produced no checkpoint.")
-            sys.exit(1)
-
-        # Action collection sub-phase (still phase 1 TBPTT, but with collection on)
-        ac_steps = tokens_to_steps(args.action_collection_tokens, args.bs)
-        target_step_ac = cumulative_step + ac_steps
-        action_db = os.path.join(cycle_dir, "action_database.pt")
+        # Phase 1 (cycle): freeze codebook + decoder to preserve code
+        # semantics against which phase 2 GRPO trained. The neuromod's
+        # logit head + memory dynamics + LM all stay trainable.
+        # Action collection / codebook fit / separate VQ-VAE training are
+        # gone in the new architecture — the code vocabulary is trained
+        # jointly during bootstrap and frozen after.
+        phase1_steps = tokens_to_steps(args.phase1_tokens_per_cycle, args.bs)
+        target_step_p1 = cumulative_step + phase1_steps
         phase1_end_ckpt = os.path.join(cycle_dir, "phase1_end.pt")
-        print(f"\n--- Cycle {cycle} action collection ({ac_steps} new steps, "
-              f"target {target_step_ac}) ---")
+        print(f"\n--- Cycle {cycle} phase 1 ({args.phase1_tokens_per_cycle:,} tokens, "
+              f"{phase1_steps} steps, absolute target {target_step_p1}) ---")
         before = set(glob.glob(os.path.join(cycle_dir, "ckpt_*.pt")))
-        # Pure inference during action collection: --no-train disables
-        # backward / optimizer step, so the LM stays stationary while we
-        # record modulator actions. Previously the LM was still training
-        # during this phase, which meant the codebook was fit on actions
-        # from a moving target.
         run([
             python, "-m", "src.train",
             "--bs", str(args.bs),
-            "--steps", str(target_step_ac),
+            "--steps", str(target_step_p1),
             "--lr-target-step", str(lr_target_step),
             "--save-dir", cycle_dir,
-            "--save-interval", str(target_step_ac),
-            "--resume", phase1_main_ckpt,
-            "--freeze-modulator",
-            "--collect-actions",
-            "--no-train",
-            "--eval-interval", "0",   # no eval during collection — it'd just be noise
-            "--action-db-out", action_db,
+            "--save-interval", str(target_step_p1),
+            "--resume", current_ckpt,
+            "--freeze-codebook-decoder",
         ])
         latest = latest_ckpt(cycle_dir, before=before)
         if latest is not None:
             os.rename(latest, phase1_end_ckpt)
-            cumulative_step = target_step_ac
+            cumulative_step = target_step_p1
         else:
-            print("!!! Action collection produced no checkpoint.")
+            print("!!! Phase 1 produced no checkpoint.")
             sys.exit(1)
 
-        # Codebook fit
-        codebook_path = os.path.join(cycle_dir, "codebook.pt")
-        print(f"\n--- Cycle {cycle} codebook fit ---")
-        run([
-            python, "-m", "scripts.train_codebook",
-            "--actions", action_db,
-            "--out", codebook_path,
-            "--epochs", str(args.codebook_epochs),
-        ])
-
-        # Phase 2 curriculum
+        # Phase 2 curriculum (factored categorical GRPO on logit head).
         phase2_ckpt = os.path.join(cycle_dir, "phase2.pt")
         print(f"\n--- Cycle {cycle} phase 2 ---")
-        # Per-cycle phase 2 seed so each cycle reads a different shard prefix.
-        # Combined with per-stage seed offset inside train_phase2, every
-        # (cycle, stage) pair gets a unique stream starting position.
-        # NOTE: train.py phase 1 deliberately keeps a stable seed across
-        # cycles so the dataloader resume/offset mechanism stays coherent.
         phase2_seed = 42 + cycle * 100_000
         phase2_cmd = [
             python, "-m", "src.train_phase2",
             "--checkpoint", phase1_end_ckpt,
-            "--codebook", codebook_path,
             "--out", phase2_ckpt,
             "--bs", str(args.phase2_bs),
             "--group-size", str(args.phase2_group_size),
@@ -253,8 +201,6 @@ def main():
         ):
             if v is not None:
                 phase2_cmd += [f"--stage{i}-tokens", str(v)]
-        if args.phase2_continuous_sigma is not None:
-            phase2_cmd += ["--continuous-sigma", str(args.phase2_continuous_sigma)]
         run(phase2_cmd)
 
         current_ckpt = phase2_ckpt

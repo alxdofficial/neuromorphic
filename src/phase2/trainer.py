@@ -1,13 +1,17 @@
-"""Phase 2 trainer: GRPO over discrete RVQ codes for the neuromodulator.
+"""Phase 2 trainer: GRPO over the neuromodulator's factored categorical policy.
 
-Everything except the modulator's mod_w1/b1/w2/b2 is frozen. The modulator's
-continuous output is encoded via a frozen RVQ-VAE, sampled into discrete codes,
-and the quantized reconstruction is applied to memory state. The training
-signal is a group-relative policy gradient on windowed LM CE reward —
-each action's reward is -CE over a window of future tokens computed by
-running the frozen upper scan + LM head on H_enriched = H_mid + mem_scale * readout.
+Architecture (new — see discrete_policy.py + chat log):
+- Neuromodulator emits per-cell logits over K=256 codes.
+- A frozen codebook + decoder (trained during bootstrap) maps codes to
+  continuous memory updates.
+- Phase 2 trains ONLY the logit head. Codebook, decoder, LM, memory
+  dynamics all frozen. Gradient = factored categorical policy gradient
+  with shared (per-(call, sample)) advantage broadcast across cells.
 
-See docs/training_strategy.md for the full design.
+Reward: -CE over a window of W future tokens following each modulation
+event, computed by running the frozen upper scan + LM head on
+H_enriched = H_mid + mem_scale * readout. Curriculum ramps W from 512
+to 4096 over stages.
 """
 
 from __future__ import annotations
@@ -22,11 +26,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from tqdm import tqdm
 
 from ..model.config import Config
 from ..model.model import Model
-from ..codebook import ActionVQVAE
 
 
 @dataclass
@@ -37,21 +39,11 @@ class CurriculumStage:
 
 
 class Phase2Trainer:
-    """GRPO trainer for the modulator with frozen everything else.
-
-    Usage:
-        trainer = Phase2Trainer(model, vqvae, dataloader, config, device, ...)
-        trainer.run_curriculum([
-            CurriculumStage(reward_window=512,  token_budget=25_000_000),
-            CurriculumStage(reward_window=2048, token_budget=15_000_000),
-            CurriculumStage(reward_window=4096, token_budget=10_000_000),
-        ])
-    """
+    """GRPO trainer for the factored-categorical modulator."""
 
     def __init__(
         self,
         model: Model,
-        vqvae: ActionVQVAE,
         dataloader,
         config: Config,
         device: torch.device,
@@ -67,24 +59,9 @@ class Phase2Trainer:
         eval_warmup_batches: int = 4,
         metrics_path: str | None = None,
         train_loader_factory=None,
-        traj_noise_sigma: float = 3.0,
         sanity_check_interval: int = 50,
-        continuous_sigma: float | None = None,
     ):
         self.model = model
-        self.vqvae = vqvae
-        # Per-trajectory fixed perturbation magnitude. At each rollout, K
-        # trajectories each get a fixed ξ_k ~ N(0, σ²) in VQ latent space,
-        # reused at every mod event within the rollout. Gives trajectories
-        # sustained identity so their rewards diverge by a systematic
-        # (non-averaging) amount — critical for GRPO signal to survive
-        # window averaging over W tokens. σ=0 disables (revert to pure
-        # multinomial sampling, the pre-variant-B behavior).
-        self.traj_noise_sigma = traj_noise_sigma
-        # Default (legacy): a single dataloader for all stages.
-        # New: train_loader_factory(reward_window) makes a dataloader per
-        # stage. The factory decides the actual seq_length (typically
-        # 2 * reward_window so most actions get complete reward windows).
         self.dataloader = dataloader
         self.train_loader_factory = train_loader_factory
         self.config = config
@@ -99,41 +76,40 @@ class Phase2Trainer:
         self.eval_batches = eval_batches
         self.eval_warmup_batches = eval_warmup_batches
         self.sanity_check_interval = sanity_check_interval
-        # Continuous-action mode (option 3 — bypass VQ entirely). When set,
-        # the modulator output is the mean of a Gaussian policy with this
-        # fixed σ, and GRPO optimizes the mean directly. VQ normalize/
-        # encoder/codebook/decoder/denormalize are all skipped. `None`
-        # preserves the default discrete-VQ pipeline.
-        self.continuous_sigma = continuous_sigma
 
-        # Freeze everything except the modulator's MLP params
+        # Freeze everything. Unfreeze just the logit head below.
+        # In the new architecture this is: discrete_policy.logit_{w1,b1,w2,b2}.
+        # codebook + decoder are frozen (they define the action vocabulary
+        # + code semantics; GRPO only adjusts the policy over them).
+        dp = model.memory.discrete_policy
         for p in model.parameters():
             p.requires_grad = False
         self.trainable_params = [
-            model.memory.mod_w1, model.memory.mod_b1,
-            model.memory.mod_w2, model.memory.mod_b2,
+            dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2,
         ]
         for p in self.trainable_params:
             p.requires_grad = True
-        for p in vqvae.parameters():
-            p.requires_grad = False
 
         self.optimizer = torch.optim.AdamW(
             self.trainable_params, lr=lr, betas=(0.9, 0.95),
             fused=(device.type == "cuda"))
         self.global_step = 0
 
-        # Snapshot of initial modulator weights for drift tracking.
-        # Cloned, detached, kept on-device so the per-step drift calc is cheap.
+        # Snapshot of initial logit-head weights for drift tracking.
         self._mod_w0_snapshot = [p.detach().clone() for p in self.trainable_params]
 
-        # Current curriculum stage (set by run_curriculum)
         self.reward_window: int = 0
 
-        # JSONL metrics log
         self.metrics_path = metrics_path
         if metrics_path is not None:
             os.makedirs(os.path.dirname(metrics_path) or ".", exist_ok=True)
+
+        # Quartile-reward side-channel (set inside _windowed_reward).
+        self._last_window_quartile_rewards: list[float] | None = None
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
 
     def _append_metrics(self, metrics: dict):
         if self.metrics_path is None:
@@ -141,37 +117,23 @@ class Phase2Trainer:
         with open(self.metrics_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
 
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def evaluate(self, eval_loader, n_batches: int = 8,
                  warmup_batches: int = 0, use_memory: bool = True,
                  key_prefix: str = "eval") -> dict:
-        """Held-out eval pass using the CONTINUOUS modulator path.
-
-        Evaluates the underlying continuous head (forward_chunk). Complements
-        evaluate_quantized() below which uses the actual VQ-argmax policy
-        that phase 2 GRPO is optimizing. Reporting both lets us detect
-        divergence between the continuous head and the deployed discrete
-        policy (proxy drift).
-
-        warmup_batches: batches to warm memory state before scoring.
-
-        Uses a fresh memory state (snapshot + restore around the call) so eval
-        is independent of the current phase-2 rollout memory carry.
-        """
+        """Held-out eval pass using the continuous modulator path (phase 1 fwd)."""
         model = self.model
         memory = model.memory
 
-        train_mem_state = (
-            memory.runtime_state_dict() if memory._initialized else None
-        )
+        train_mem_state = memory.runtime_state_dict() if memory._initialized else None
         train_lm_carries = [
-            h.clone() if h is not None else None for h in model.lm._carries
-        ]
+            h.clone() if h is not None else None for h in model.lm._carries]
         train_initialized = model._initialized
         was_training = model.training
-
-        # Pause action collection during eval (phase 2 shouldn't have it set,
-        # but be safe to prevent eval actions from polluting any buffer).
         was_collecting = memory._collecting_actions
         saved_action_buffer = memory._action_buffer
         if was_collecting:
@@ -188,9 +150,6 @@ class Phase2Trainer:
         count = 0
         prev_token = None
         total_batches = warmup_batches + n_batches
-        # Chunk along T to avoid materializing [BS, T, V] logits for large
-        # eval_seq_length (e.g. 4096). Memory state and LM scan carries
-        # persist across chunks, so this is mathematically equivalent.
         eval_chunk_T = self.config.T
         try:
             for i, batch in enumerate(eval_loader):
@@ -214,12 +173,10 @@ class Phase2Trainer:
                         use_memory=use_memory,
                         prev_token=effective_prev,
                     )
-                    # Weighted by chunk length so the average is correct
                     chunk_len = e - s
                     ce_sum += result["ce_loss"].item() * chunk_len
                     aux_sum += result["aux_loss"].item() * chunk_len
                     ce_count += chunk_len
-                    # Advance prev_token for next chunk
                     effective_prev = input_ids_full[:, e - 1]
 
                 prev_token = input_ids_full[:, -1]
@@ -256,16 +213,11 @@ class Phase2Trainer:
     @torch.no_grad()
     def evaluate_quantized(self, eval_loader, n_batches: int = 4,
                            warmup_batches: int = 0) -> dict:
-        """Eval using the VQ-ARGMAX (deterministic quantized) policy.
+        """Eval using the deterministic (argmax) categorical policy.
 
-        This is the actual policy phase 2 GRPO is trying to optimize, as
-        opposed to the continuous head that evaluate() measures. If
-        evaluate_continuous and evaluate_quantized diverge, the VQ bottleneck
-        is losing meaningful signal and the continuous head metric is
-        over-reporting real phase-2 quality.
-
-        warmup_batches: batches to warm memory state before scoring (same
-        semantics as evaluate() — ensures apples-to-apples comparison).
+        This is the policy phase-2 GRPO is optimizing toward. Divergence
+        from evaluate() (stochastic Gumbel sample during phase-1 fwd)
+        indicates the argmax policy is under-tuned.
         """
         model = self.model
         memory = model.memory
@@ -306,21 +258,15 @@ class Phase2Trainer:
                 effective_prev = (batch_prev if batch_prev is not None
                                   else prev_token)
 
-                # 1) Lower scan (reuse the helper that chunks by config.T)
                 H_mid = self._run_lower_scan(
                     input_ids, prev_token=effective_prev)
 
-                # 2) VQ-argmax rollout to produce quantized readouts
                 result = memory.forward_segment_phase2(
-                    H_mid, input_ids, lm, self.vqvae,
-                    tau=self.tau, sample=False,
+                    H_mid, input_ids, lm,
+                    tau=self.tau, sample=False,     # ← argmax policy
                     prev_token=effective_prev)
                 readouts_q = result["readouts"]
 
-                # 3) Upper scan on H_enriched. Carries persist across eval
-                # batches (matching phase 1 eval semantics) — they're reset
-                # only at EOT via the reset_mask. Previous version zeroed
-                # all upper carries every batch (codex finding #5).
                 mem_scale = lm.mem_scale
                 H_enriched = H_mid.to(readouts_q.dtype) + mem_scale * readouts_q
                 eot = self.config.eot_id
@@ -331,7 +277,6 @@ class Phase2Trainer:
                     reset_mask[:, 0] = (effective_prev == eot)
                 if not reset_mask.any():
                     reset_mask = None
-                # Chunked upper scan + CE to avoid materializing [BS, T, V].
                 chunk_t = 128
                 target_ids = batch.target_ids.to(self.device, non_blocking=True)
                 total_ce_batch = 0.0
@@ -340,7 +285,7 @@ class Phase2Trainer:
                     e = min(s + chunk_t, T)
                     rm = reset_mask[:, s:e] if reset_mask is not None else None
                     H_up = lm.forward_scan_upper(H_enriched[:, s:e], reset_mask=rm)
-                    chunk_logits = lm.forward_output(H_up)  # [BS, chunk, V]
+                    chunk_logits = lm.forward_output(H_up)
                     chunk_targets = target_ids[:, s:e]
                     chunk_ce = F.cross_entropy(
                         chunk_logits.reshape(-1, chunk_logits.shape[-1]),
@@ -353,7 +298,6 @@ class Phase2Trainer:
 
                 prev_token = input_ids[:, -1]
 
-                # Warmup batches: run forward to warm memory state, don't score.
                 if i < warmup_batches:
                     continue
 
@@ -383,20 +327,13 @@ class Phase2Trainer:
         }
 
     # ------------------------------------------------------------------
-    # Rollout + reward
+    # Lower-scan helper
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _run_lower_scan(
         self, input_ids: Tensor, prev_token: Tensor | None = None,
     ) -> Tensor:
-        """Run the frozen LM lower scan to produce H_mid.
-
-        Chunks the input into segments of config.T to bound per-chunk VRAM.
-        Mirrors the EOT reset logic in `Model.forward_chunk`: builds a
-        reset_mask from in-batch EOT positions and the optional `prev_token`
-        (last token of previous batch).
-        """
         eot_id = self.config.eot_id
         BS, T_total = input_ids.shape
         seg_T = self.config.T
@@ -416,35 +353,9 @@ class Phase2Trainer:
             chunks.append(self.model.lm.forward_scan_lower(seg_ids, reset_mask=reset_mask))
         return torch.cat(chunks, dim=1)
 
-    @torch.no_grad()
-    def _compute_per_token_reward(
-        self, readouts: Tensor, input_ids: Tensor, H_mid: Tensor,
-        prev_token: Tensor | None = None,
-        h_mid_batch_map: Tensor | None = None,
-    ) -> Tensor:
-        """Compute per-token reward for GRPO using full LM CE.
-
-        Runs H_enriched = H_mid + mem_scale * readouts through the frozen
-        upper scan + LM head and uses -CE as reward. This measures the
-        actual quantity we care about: does the memory help the LM predict
-        the next token?
-
-        Masks positions where the previous token was EOT (same as phase 1
-        main CE loss masking).
-
-        Returns: [BS, T] float — per-token reward. Invalid positions get 0.
-        """
-        BS, T, D = readouts.shape
-        eot = self.config.eot_id
-        valid_mask = torch.ones(BS, T, device=readouts.device, dtype=torch.float32)
-        if T > 1:
-            valid_mask[:, 1:] = (input_ids[:, :-1] != eot).float()
-        if prev_token is not None:
-            valid_mask[:, 0] = (prev_token.to(input_ids.device) != eot).float()
-
-        return self._compute_per_token_reward_lm_ce(
-            readouts, H_mid, input_ids, valid_mask,
-            h_mid_batch_map=h_mid_batch_map)
+    # ------------------------------------------------------------------
+    # Per-token reward
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _compute_per_token_reward_lm_ce(
@@ -452,23 +363,10 @@ class Phase2Trainer:
         valid_mask: Tensor,
         h_mid_batch_map: Tensor | None = None,
     ) -> Tensor:
-        """Compute -LM CE as per-token reward.
-
-        Runs H_enriched = H_mid + mem_scale * readouts through the
-        (frozen) upper scan and LM head, computes per-token CE on the
-        NEXT-token prediction (logits[t] → input_ids[t+1] shifted).
-
-        Chunks along both the batch dimension (to bound peak VRAM from
-        the [sub_BS, chunk_t, V] logits tensor) and the time dimension.
-        Upper scan carries are reset fresh for each batch sub-chunk.
-
-        When h_mid_batch_map is provided, H_mid is at the original
-        (un-expanded) batch size. H_enriched is computed per sub-batch
-        by gathering from H_mid, avoiding K-fold duplication.
-        """
+        """Compute -LM CE as per-token reward (chunked to bound VRAM)."""
         BS, T, D = readouts.shape
         lm = self.model.lm
-        mem_scale = lm.mem_scale  # frozen in phase 2
+        mem_scale = lm.mem_scale
         dt = readouts.dtype
 
         eot = self.config.eot_id
@@ -487,8 +385,6 @@ class Phase2Trainer:
         try:
             for b_start in range(0, BS, sub_bs):
                 b_end = min(b_start + sub_bs, BS)
-                # Compute H_enriched per sub-batch, gathering from H_mid
-                # via batch map to avoid materializing [K*BS, T, D].
                 if h_mid_batch_map is not None:
                     sub_h_mid = H_mid[h_mid_batch_map[b_start:b_end]].to(dt)
                 else:
@@ -498,7 +394,6 @@ class Phase2Trainer:
                 sub_ids = input_ids[b_start:b_end]
                 sub_rm = reset_mask[b_start:b_end]
 
-                # Fresh upper-scan carries per sub-batch
                 for i in range(split, self.config.L_total):
                     lm._carries[i] = None
 
@@ -536,73 +431,35 @@ class Phase2Trainer:
         rewards = rewards * valid_mask
         return rewards
 
-    @torch.no_grad()
     def _windowed_reward(
         self, per_token_reward: Tensor, call_positions: Tensor, window: int,
     ) -> Tensor:
-        """For each modulator call at token t, compute mean reward over [t+1, t+1+W].
-
-        ONLY calls whose full window [t+1, t+1+W) fits entirely within the
-        sequence contribute a meaningful reward — calls near the end of the
-        sequence would otherwise get truncated windows that bias the reward
-        signal toward early positions. Out-of-range calls get zero reward
-        (effectively masked from advantages by centering).
-
-        For the curriculum to produce meaningful rewards at window W, the
-        rollout sequence length must exceed W by at least a few modulator
-        intervals (train_phase2 sets seq_length = 2 * W as the default).
-
-        Args:
-            per_token_reward: [*, BS, T] on-device (leading dims broadcast, e.g. [K, BS, T])
-            call_positions: [n_calls] cpu long tensor — absolute token index of each call
-            window: reward window W
-
-        Returns:
-            rewards: [*, n_calls, BS] on-device — per-action reward averaged over
-                     the full window (only for actions with complete windows)
-        """
+        """For each modulator call at t, mean reward over [t+1, t+1+W]."""
         T = per_token_reward.shape[-1]
         positions = call_positions.to(per_token_reward.device)
-
-        # Build [n_calls, W] index tensor for vectorized gather
-        starts = positions + 1                                        # [n_calls]
-        offsets = torch.arange(window, device=per_token_reward.device)  # [W]
-        indices = starts.unsqueeze(1) + offsets.unsqueeze(0)          # [n_calls, W]
-
-        # An action's window is COMPLETE iff start + W <= T. Incomplete
-        # windows contribute zero reward (they're discarded via the mask
-        # below). Since group-relative advantages subtract per-sample
-        # means, zero reward for invalid actions won't introduce phantom
-        # gradient signal.
-        complete = (starts + window <= T)                             # [n_calls]
+        starts = positions + 1
+        offsets = torch.arange(window, device=per_token_reward.device)
+        indices = starts.unsqueeze(1) + offsets.unsqueeze(0)
+        complete = (starts + window <= T)
         indices = indices.clamp(max=T - 1)
 
-        gathered = per_token_reward[..., indices]                     # [*, BS, n_calls, W]
-        # Mean over the full window (all W tokens valid when complete).
-        out = gathered.mean(dim=-1)                                   # [*, BS, n_calls]
-        # Zero out incomplete windows.
+        gathered = per_token_reward[..., indices]
+        out = gathered.mean(dim=-1)
         out = out * complete.to(out.dtype)
 
-        # H8 diagnostic: per-quartile within-window mean -CE. Measures
-        # whether the reward signal is dominated by a narrow slice of the
-        # window. Only aggregated over complete windows.
-        if not hasattr(self, "_last_window_quartile_rewards"):
-            self._last_window_quartile_rewards = None
+        # Quartile diagnostic (side-effect stored on self)
         if window >= 4:
             q = window // 4
-            # gathered: [*, BS, n_calls, W]. Per-quartile mean → [*, BS, n_calls, 4]
             quartile_means = torch.stack([
                 gathered[..., 0:q].mean(dim=-1),
                 gathered[..., q:2 * q].mean(dim=-1),
                 gathered[..., 2 * q:3 * q].mean(dim=-1),
                 gathered[..., 3 * q:].mean(dim=-1),
-            ], dim=-1)  # [*, BS, n_calls, 4]
-            # Restrict to complete windows, then mean over all (K, BS, n_calls)
-            # slots. Denominator counts LIVE slots only: product of the
-            # leading dims times the number of complete windows.
+            ], dim=-1)
             complete_mask = complete.view(
                 *(1,) * (quartile_means.ndim - 2), -1, 1)
-            leading_slots = int(torch.tensor(quartile_means.shape[:-2]).prod().item())
+            leading_slots = int(
+                torch.tensor(quartile_means.shape[:-2]).prod().item())
             live_slots = leading_slots * int(complete.sum().item())
             if live_slots > 0:
                 self._last_window_quartile_rewards = (
@@ -611,12 +468,14 @@ class Phase2Trainer:
                     / live_slots
                 ).tolist()
 
-        # Move n_calls before BS: [..., n_calls, BS]
         return out.transpose(-1, -2)
+
+    # ------------------------------------------------------------------
+    # Memory-state snapshot/restore
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _save_mem_state(self) -> dict:
-        """Snapshot the memory runtime state so we can reset between rollouts."""
         mem = self.model.memory
         return {
             "h": mem.h.clone(), "msg": mem.msg.clone(), "W": mem.W.clone(),
@@ -627,19 +486,17 @@ class Phase2Trainer:
             "readout_drift": mem.readout_drift.clone(),
         }
 
+    # ------------------------------------------------------------------
+    # Rollout
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def rollout(self, batch) -> dict:
-        """Run K trajectories on the same batch in parallel via batch-expanded memory.
-
-        Instead of looping K times sequentially, we expand the memory state's
-        batch dimension from BS to K*BS and run a single forward_segment_phase2.
-        Each of the K "sub-batches" gets the same H_mid and input_ids but
-        independent stochastic VQ sampling, producing K divergent trajectories
-        in one pass.
+        """Run K trajectories in parallel via batch-expanded memory.
 
         Returns dict:
             mod_inputs: [K, n_calls, BS, NC, mod_in]
-            codes:      [K, n_calls, BS, NC, num_levels]
+            codes:      [K, n_calls, BS, NC]  long
             rewards:    [K, n_calls, BS]  per-action reward
         """
         device = self.device
@@ -650,219 +507,122 @@ class Phase2Trainer:
 
         self.model.lm.detach_carries()
 
-        # Run lower scan once (LM is frozen and deterministic per batch).
         H_mid = self._run_lower_scan(input_ids, prev_token=prev_token)
 
-        # Snapshot initial memory state at BS
         init_snapshot = self._save_mem_state()
 
-        # Expand memory state: replicate each tensor K times along batch dim.
-        # After this, memory operates on K*BS "samples" simultaneously.
         mem = self.model.memory
         for key, val in init_snapshot.items():
             expanded = val.unsqueeze(0).expand(K, *val.shape).reshape(K * BS, *val.shape[1:])
             setattr(mem, key, expanded.clone())
 
-        # H_mid is NOT expanded to K*BS — all K trajectories for the same
-        # sample share the same H_mid (LM is frozen/deterministic). Instead
-        # we pass a batch map so forward_segment_phase2 indexes into the
-        # original [BS, T, D] tensor, saving K-1 copies (1.88 GB at W=4096).
-        # input_ids must be expanded because the memory loop uses it for
-        # per-token surprise and it's small ([K*BS, T] int64 = negligible).
         ids_exp = input_ids.unsqueeze(0).expand(K, *input_ids.shape).reshape(K * BS, *input_ids.shape[1:])
         h_mid_batch_map = torch.arange(K * BS, device=device) % BS
 
-        # Per-trajectory fixed perturbation ξ_k in VQ latent space.
-        # Shape: [K*BS, NC, latent_dim]. Reused at every mod event in the
-        # rollout — gives trajectories a sustained identity so their W
-        # states mean-revert to different equilibria (not the same one).
-        # ξ is identical across cells (NC) for the same (k, b) but each
-        # (k, b) gets its own perturbation vector.
-        NC = mem.N_cells
-        latent_dim = self.vqvae.rvq.code_dim
-        # Continuous-action mode bypasses latent-space variant-B (ξ_k in z
-        # is meaningless when there's no z). Trajectory identity comes from
-        # the per-call Gaussian noise, which is independent across K.
-        if self.continuous_sigma is None and self.traj_noise_sigma > 0:
-            # Sample per (k, b). Broadcast across NC since all cells share
-            # the same trajectory identity within the same sample.
-            traj_noise_kb = torch.randn(
-                K, BS, 1, latent_dim,
-                device=device, dtype=torch.float32) * self.traj_noise_sigma
-            traj_noise = traj_noise_kb.expand(K, BS, NC, latent_dim).reshape(
-                K * BS, NC, latent_dim).contiguous()
-        else:
-            traj_noise = None
-
-        # Single batched rollout — all K trajectories run in parallel
         result = mem.forward_segment_phase2(
-            H_mid, ids_exp, self.model.lm, self.vqvae,
+            H_mid, ids_exp, self.model.lm,
             tau=self.tau, sample=True,
-            h_mid_batch_map=h_mid_batch_map,
-            traj_noise=traj_noise,
-            continuous_sigma=self.continuous_sigma)
+            h_mid_batch_map=h_mid_batch_map)
 
-        # Unpack: split K*BS back to (K, BS) using .view() so any
-        # non-contiguous layout bugs raise immediately instead of silently
-        # scrambling trajectory assignments.
-        readouts = result["readouts"].view(K, BS, T, -1)              # [K, BS, T, D]
-        call_positions = result["call_positions"]                     # [n_calls] cpu
+        readouts = result["readouts"].view(K, BS, T, -1)
+        call_positions = result["call_positions"]
         n_calls = result["mod_inputs"].shape[0]
+        # mod_inputs shape: [n_calls, K*BS, NC, mod_in] → [K, n_calls, BS, NC, mod_in]
         mod_inputs = result["mod_inputs"].view(
-            n_calls, K, BS, *result["mod_inputs"].shape[2:]).transpose(0, 1)  # [K, n_calls, BS, NC, mod_in]
+            n_calls, K, BS, *result["mod_inputs"].shape[2:]).transpose(0, 1)
+        # codes shape: [n_calls, K*BS, NC] → [K, n_calls, BS, NC]
         codes = result["codes"].view(
-            n_calls, K, BS, *result["codes"].shape[2:]).transpose(0, 1)       # [K, n_calls, BS, NC, L]
+            n_calls, K, BS, *result["codes"].shape[2:]).transpose(0, 1)
 
-        # Compute per-trajectory reward via full LM CE
-        # Expand prev_token to K*BS for cross-doc masking at position 0
+        # Per-token reward via full LM CE
         prev_token_exp = None
         if prev_token is not None:
             prev_token_exp = prev_token.unsqueeze(0).expand(K, *prev_token.shape).reshape(K * BS)
-        per_token_reward = self._compute_per_token_reward(
-            result["readouts"], ids_exp, H_mid,
-            prev_token=prev_token_exp,
-            h_mid_batch_map=h_mid_batch_map)                 # [K*BS, T]
+        # Build valid mask (same as phase 1 CE masking — skip positions after EOT)
+        eot = self.config.eot_id
+        valid_mask = torch.ones(K * BS, T, device=device, dtype=torch.float32)
+        if prev_token_exp is not None:
+            valid_mask[:, 0] = (prev_token_exp != eot).float()
+        eos_positions = (ids_exp == eot)
+        if eos_positions.any():
+            valid_mask[:, 1:] = valid_mask[:, 1:] * (1.0 - eos_positions[:, :-1].float())
+        per_token_reward = self._compute_per_token_reward_lm_ce(
+            result["readouts"], H_mid, ids_exp, valid_mask,
+            h_mid_batch_map=h_mid_batch_map)
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
-        # Windowed rewards — vectorized across K trajectories
         rewards = self._windowed_reward(
-            per_token_reward, call_positions, self.reward_window)  # [K, n_calls, BS]
+            per_token_reward, call_positions, self.reward_window)
 
-        # Per-sample reward for logging.
-        # `mean_per_k_sample[k, b]` = mean reward across all action calls
-        # for trajectory k of sample b. Shape [K, BS].
-        mean_per_k_sample = rewards.mean(dim=1)  # [K, BS]
-        # True mean across all K trajectories and all samples — this is
-        # the "average reward" you'd expect from the field name `mean_reward`.
+        mean_per_k_sample = rewards.mean(dim=1)
         mean_reward = mean_per_k_sample.mean().item()
-        # Max-over-K then mean-over-BS: the average of "best trajectory
-        # per sample" rewards, i.e. how lucky the best-of-K is. Logged
-        # separately for diagnostics but systematically optimistic.
         best_mean_reward = mean_per_k_sample.max(dim=0).values.mean().item()
 
-        # Choose ONE trajectory per sample uniformly at random to carry
-        # its end-state forward. Picking the *best* trajectory would
-        # introduce optimism bias — the starting state for the next batch
-        # would be systematically "lucky" and diverge from the state
-        # distribution the deployed policy actually produces. Random
-        # selection gives unbiased expected-state propagation across
-        # batches.
+        # Pick ONE trajectory per sample to carry memory state forward.
+        # Random choice → unbiased expected-state propagation.
         random_k_per_sample = torch.randint(
             0, K, (BS,), device=device, dtype=torch.long)
         gather_idx = random_k_per_sample * BS + torch.arange(BS, device=device)
         for key in init_snapshot:
-            full = getattr(mem, key)  # [K*BS, ...]
+            full = getattr(mem, key)
             setattr(mem, key, full[gather_idx].clone())
 
         return {
             "mod_inputs": mod_inputs,
             "codes": codes,
             "rewards": rewards,
-            "mean_reward": mean_reward,             # true mean across K×BS
-            "best_mean_reward": best_mean_reward,   # max-over-K then mean-over-BS
+            "mean_reward": mean_reward,
+            "best_mean_reward": best_mean_reward,
             "T": T,
             "BS": BS,
-            # Per-trajectory perturbation used in this rollout. [K*BS, NC,
-            # latent_dim]. Reshape to [K, BS, NC, latent_dim] for GRPO.
-            "traj_noise": (
-                traj_noise.view(K, BS, NC, latent_dim)
-                if traj_noise is not None else None),
         }
 
     # ------------------------------------------------------------------
-    # GRPO gradient step
+    # GRPO
     # ------------------------------------------------------------------
 
     def _compute_advantages(self, rewards: Tensor) -> Tensor:
-        """Group-relative advantages.
-
-        rewards: [K, n_calls, BS] — per-action reward per trajectory
-        Returns: [K, n_calls, BS] — normalized advantages
-
-        Normalization is PER-(call, sample): each (call_idx, sample_idx)
-        slot is centered and scaled by its own K-variance. We used to use
-        a global std, which biased the gradient toward low-variance
-        early-sequence actions (late actions have higher reward variance
-        because the memory state diverges more across K by then, so the
-        global std was dominated by late positions and early ones got
-        proportionally larger advantages). See audit #6.
-        """
-        # Per-action baseline: mean over K trajectories.
-        baseline = rewards.mean(dim=0, keepdim=True)         # [1, n_calls, BS]
-        advantages = rewards - baseline                      # [K, n_calls, BS]
-        # Per-(call, sample) std over K. Use unbiased=False to avoid NaN when
-        # K=1 (population variance of a single element is 0, not NaN).
+        """Group-relative advantages, per-(call, sample) normalized."""
+        baseline = rewards.mean(dim=0, keepdim=True)
+        advantages = rewards - baseline
         std = advantages.std(dim=0, keepdim=True, unbiased=False).clamp(min=1e-8)
         return advantages / std
 
     def grpo_step(self, rollout_result: dict) -> dict:
-        """Compute GRPO loss from rollout records and update modulator.
+        """Factored-categorical GRPO step.
 
-        The gradient pass:
-          1. Flatten all (mod_input, codes) records across K x n_calls x BS x NC
-             into a single batch of modulator inputs.
-          2. Run modulator forward -> raw action -> vqvae encoder -> latent z.
-             This is the only on-graph computation.
-          3. Compute log pi(codes | z) via distance-based categorical over each
-             RVQ level.
-          4. Loss = -(advantage * log_pi).mean(), backward, step.
+        Policy: product over NC cells of Categorical(logits_i).
+        Loss: -E[ A · Σ_i log π_i(code_i) ] - β · Σ_i H(π_i)
+        (advantage broadcast across cells; credit assignment is "democratic").
 
-        Memory dynamics, LM, mem_head, decoder — all frozen and off the graph.
+        Re-runs the neuromod on stored mod_inputs to get current logits,
+        scores the rollout-sampled codes, backprops through logit head only.
         """
         K, n_calls, BS, NC, mod_in_dim = rollout_result["mod_inputs"].shape
-        num_levels = rollout_result["codes"].shape[-1]
+        mod_inputs = rollout_result["mod_inputs"]              # [K, n_calls, BS, NC, mod_in] f32
+        codes = rollout_result["codes"]                        # [K, n_calls, BS, NC] long
+        rewards = rollout_result["rewards"]                    # [K, n_calls, BS] f32
 
-        mod_inputs = rollout_result["mod_inputs"]    # [K, n_calls, BS, NC, mod_in] f32 GPU
-        codes = rollout_result["codes"]              # [K, n_calls, BS, NC, L] long GPU
-        rewards = rollout_result["rewards"]          # [K, n_calls, BS] f32 GPU
-        traj_noise = rollout_result.get("traj_noise")  # [K, BS, NC, latent] f32 GPU or None
+        advantages = self._compute_advantages(rewards)         # [K, n_calls, BS]
+        advantages = advantages.unsqueeze(-1).expand(-1, -1, -1, NC)  # [K, n_calls, BS, NC]
 
-        # Advantages — broadcast over NC since actions are per-cell
-        advantages = self._compute_advantages(rewards)                 # [K, n_calls, BS]
-        advantages = advantages.unsqueeze(-1).expand(-1, -1, -1, NC)   # [K, n_calls, BS, NC]
+        # Flatten (K * n_calls * BS) into a single batch dim for the
+        # modulator forward. NC stays as the cell dim (modulator is per-cell).
+        M = K * n_calls * BS
+        mod_inputs_flat = mod_inputs.reshape(M, NC, mod_in_dim)
+        codes_flat = codes.reshape(M, NC)
+        adv_flat = advantages.reshape(M, NC)
 
-        # Flatten all records into [M, ...] where M = K * n_calls * BS
-        mod_inputs_flat = mod_inputs.reshape(-1, NC, mod_in_dim)
-        codes_flat = codes.reshape(-1, NC, num_levels)
-        advantages_flat = advantages.reshape(-1, NC)
-        # Expand traj_noise to match the flattened record layout.
-        # Record i = k*n_calls*BS + call*BS + b → traj_noise[k, b].
-        # Broadcast across n_calls: [K, 1, BS, NC, latent] → [K, n_calls, BS, NC, latent]
-        if traj_noise is not None:
-            traj_noise_flat = traj_noise.unsqueeze(1).expand(
-                K, n_calls, BS, NC, -1).reshape(-1, NC, traj_noise.shape[-1])
-        else:
-            traj_noise_flat = None
-        # Each per-cell action is its own "record"; reshape [M, mod_in] by folding NC
-        # But the modulator forward is per-cell (einsum "bni,nih->bnh") and needs
-        # the NC dim. So we'll process [M, NC, ...] as a big batch.
+        # Chunk over M to bound VRAM (logits tensor is [C, NC, K_codes]).
+        K_codes = self.model.memory.discrete_policy.K
+        chunk_size = max(1024, 32768 // max(K_codes // 32, 1))
 
-        # Chunk the gradient pass to bound VRAM
-        M = mod_inputs_flat.shape[0]
-        # Scale chunk size with codes_per_level — more codes = bigger distance
-        # tensors in log_prob and entropy ([C*NC, codes, latent_dim])
-        codes_per_level = self.vqvae.rvq.codes_per_level
-        chunk_size = max(1024, 16384 // max(codes_per_level // 16, 1))
         total_loss = 0.0
         total_log_pi = 0.0
         total_entropy = 0.0
-        # Quantization residual accumulator (continuous-vs-quantized gap).
-        quant_residual_sq = 0.0
-        raw_action_sq = 0.0
-        n_chunks = 0
-        # Per-cell log_pi accumulator [NC] — for diagnostics only (detached).
         per_cell_log_pi_sum = torch.zeros(NC, device=self.device)
         per_cell_count = 0
-        # One-shot RVQ diagnostic snapshot on the first chunk only.
-        rvq_diag_snapshot = None
-        # Raw-action distribution accumulator for modulator output stats.
-        raw_action_sum = torch.zeros(NC, device=self.device)
-        raw_action_sq_sum = torch.zeros(NC, device=self.device)
-        raw_action_count = 0
-        # Policy-ratio sanity check: cache per-chunk log_pi_pre so we can
-        # recompute log_pi_post after the step and correlate Δlog_pi with
-        # advantage. Only when the check fires (every sanity_check_interval
-        # steps) — otherwise we skip the caching to save memory.
+
         do_sanity = (
             self.sanity_check_interval > 0
             and self.global_step > 0
@@ -871,289 +631,108 @@ class Phase2Trainer:
         log_pi_pre_cache = [] if do_sanity else None
 
         self.optimizer.zero_grad(set_to_none=True)
+        policy = self.model.memory.discrete_policy
 
         for start in range(0, M, chunk_size):
             end = min(start + chunk_size, M)
-            mi_chunk = mod_inputs_flat[start:end]          # [C, NC, mod_in]
-            c_chunk = codes_flat[start:end]                # [C, NC, L]
-            a_chunk = advantages_flat[start:end]           # [C, NC]
+            mi_chunk = mod_inputs_flat[start:end]         # [C, NC, mod_in]
+            c_chunk = codes_flat[start:end]                # [C, NC]
+            a_chunk = adv_flat[start:end]                  # [C, NC]
             C = mi_chunk.shape[0]
 
-            # Modulator forward (on-graph). mi_chunk is already f32 from the rollout.
-            raw_action = self.model.memory._modulator_forward(mi_chunk)  # [C, NC, mod_out]
+            logits = policy.compute_logits(mi_chunk)       # [C, NC, K_codes]
+            log_probs = F.log_softmax(logits / self.tau, dim=-1)
+            log_pi = log_probs.gather(-1, c_chunk.unsqueeze(-1)).squeeze(-1)  # [C, NC]
 
-            # Flatten [C, NC] -> [C*NC] for the VQ encoder
-            action_flat = raw_action.reshape(C * NC, -1)
+            probs = log_probs.exp()
+            entropy = -(probs * log_probs).sum(dim=-1)     # [C, NC]
 
-            if self.continuous_sigma is not None:
-                # Continuous Gaussian policy. c_chunk holds the sampled
-                # action at rollout time; compute log π(sample | μ_now, σ²)
-                # where μ_now = raw_action (gradient flows through modulator).
-                # Stand-ins: z_sample unused, codes_flat_flat unused below.
-                # Stored as bf16 for memory; upcast for log-prob math.
-                sample_flat = c_chunk.reshape(C * NC, -1).detach().float()
-                D = action_flat.shape[-1]
-                sigma = float(self.continuous_sigma)
-                # log N(x | μ, σ²I) = -0.5·||x-μ||²/σ² - 0.5·D·log(2πσ²)
-                sq_dev = (sample_flat - action_flat).pow(2).sum(dim=-1)  # [C*NC]
-                gauss_const = 0.5 * D * math.log(2.0 * math.pi * sigma ** 2)
-                log_pi = (-0.5 * sq_dev / (sigma ** 2) - gauss_const).reshape(C, NC)
-                # Gaussian entropy is constant (depends only on σ, D). Constant
-                # w.r.t. the modulator's mean → adds no gradient → set to 0.
-                entropy = torch.zeros_like(log_pi)
-                # Stand-ins so the post-step sanity path + diagnostics can still
-                # reference them without crashing.
-                z_sample = action_flat.detach()
-                codes_flat_flat = sample_flat
-            else:
-                action_norm = self.vqvae.normalize(action_flat)
-                z = self.vqvae.encoder(action_norm)                # [C*NC, latent]
-
-                # Apply per-trajectory perturbation (fixed during rollout).
-                # log_pi is computed at z + ξ_k, matching what the rollout
-                # sampled from. Gradient flows through z (through modulator);
-                # ξ_k is detached (it's exploration noise, not a learnable param).
-                if traj_noise_flat is not None:
-                    noise_chunk = traj_noise_flat[start:end].reshape(C * NC, -1)
-                    z_sample = z + noise_chunk.detach()
-                else:
-                    z_sample = z
-
-                # log pi(codes | z) summed across RVQ levels (on-graph through z)
-                codes_flat_flat = c_chunk.reshape(C * NC, num_levels)
-                log_pi = self.vqvae.rvq.log_prob(z_sample, codes_flat_flat, tau=self.tau)  # [C*NC]
-                log_pi = log_pi.reshape(C, NC)
-
-                # Entropy bonus: encourage policy diversity to prevent code collapse.
-                # Must be computed at z_sample (the perturbed z) to match log_pi —
-                # otherwise the entropy gradient flattens the wrong distribution.
-                entropy = self.vqvae.rvq.entropy(z_sample, tau=self.tau).reshape(C, NC)
-
-            # GRPO loss - entropy bonus (normalized by full M)
+            # Loss normalized by full M (not chunk C) so backward accumulates
+            # to the correct mean gradient.
             chunk_loss = (-(a_chunk * log_pi) - self.entropy_coeff * entropy).sum() / (M * NC)
             chunk_loss.backward()
 
-            total_loss += chunk_loss.item() * (M * NC)
-            total_log_pi += log_pi.detach().sum().item()
-            total_entropy += entropy.detach().sum().item()
-
-            if log_pi_pre_cache is not None:
-                log_pi_pre_cache.append(log_pi.detach().clone())
-
-            # Per-cell log_pi for diagnostics
             with torch.no_grad():
-                per_cell_log_pi_sum += log_pi.detach().sum(dim=0)  # sum over C → [NC]
+                total_loss += chunk_loss.item() * (M * NC)
+                total_log_pi += log_pi.sum().item()
+                total_entropy += entropy.sum().item()
+                per_cell_log_pi_sum += log_pi.sum(dim=0)
                 per_cell_count += C
 
-                # Raw-action distribution stats per cell
-                ra = raw_action.detach()  # [C, NC, mod_out]
-                ra_norm = ra.norm(dim=-1)  # [C, NC]
-                raw_action_sum += ra_norm.sum(dim=0)
-                raw_action_sq_sum += ra_norm.pow(2).sum(dim=0)
-                raw_action_count += C
-
-                # One-shot RVQ diagnostics on the first chunk (VQ mode only)
-                if self.continuous_sigma is None and rvq_diag_snapshot is None:
-                    rvq_diag_snapshot = self.vqvae.rvq.diagnostics(
-                        z_sample.detach(), codes_flat_flat.long(), tau=self.tau)
-
-            # Quantization residual (VQ mode only — meaningless otherwise).
-            if self.continuous_sigma is None:
-                with torch.no_grad():
-                    lvl_idx = torch.arange(num_levels, device=action_flat.device)
-                    z_q = self.vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes_flat_flat.long()].sum(dim=1)
-                    decoded_norm = self.vqvae.decoder(z_q)
-                    decoded = self.vqvae.denormalize(decoded_norm)
-                    resid = (action_flat - decoded)
-                    quant_residual_sq += resid.pow(2).sum().item()
-                    raw_action_sq += action_flat.pow(2).sum().item()
-            n_chunks += 1
+                if log_pi_pre_cache is not None:
+                    log_pi_pre_cache.append(log_pi.clone())
 
         grad_norm = nn.utils.clip_grad_norm_(
             self.trainable_params, self.max_grad_norm).item()
         self.optimizer.step()
 
-        # ------------------------------------------------------------------
-        # H5 policy-ratio sanity check. Recompute log_pi on the same rollout
-        # POST-step and correlate Δlog_pi with the advantage that drove the
-        # step. A correctly-oriented GRPO gradient should *increase* log_pi
-        # for high-advantage codes → Pearson corr > 0 (ideally >> 0).
-        # Negative corr = sign bug or baseline inverted.
+        # -----------------------------------------------------
+        # Sanity check (H5): Δlog_pi vs advantage correlation
+        # -----------------------------------------------------
         sanity_corr = float("nan")
         sanity_delta_mean = float("nan")
         if log_pi_pre_cache is not None:
             with torch.no_grad():
                 log_pi_post_parts = []
-                sigma = float(self.continuous_sigma) if self.continuous_sigma is not None else None
                 for start in range(0, M, chunk_size):
                     end = min(start + chunk_size, M)
                     mi_chunk = mod_inputs_flat[start:end]
                     c_chunk = codes_flat[start:end]
-                    C_c = mi_chunk.shape[0]
-                    raw_action2 = self.model.memory._modulator_forward(mi_chunk)
-                    action_flat2 = raw_action2.reshape(C_c * NC, -1)
-                    if sigma is not None:
-                        sample_flat2 = c_chunk.reshape(C_c * NC, -1).detach().float()
-                        D = action_flat2.shape[-1]
-                        sq_dev2 = (sample_flat2 - action_flat2).pow(2).sum(dim=-1)
-                        gauss_const = 0.5 * D * math.log(2.0 * math.pi * sigma ** 2)
-                        lp2 = (-0.5 * sq_dev2 / (sigma ** 2) - gauss_const).reshape(C_c, NC)
-                    else:
-                        action_norm2 = self.vqvae.normalize(action_flat2)
-                        z2 = self.vqvae.encoder(action_norm2)
-                        if traj_noise_flat is not None:
-                            z2 = z2 + traj_noise_flat[start:end].reshape(C_c * NC, -1)
-                        codes_ff2 = c_chunk.reshape(C_c * NC, num_levels).long()
-                        lp2 = self.vqvae.rvq.log_prob(
-                            z2, codes_ff2, tau=self.tau).reshape(C_c, NC)
+                    logits2 = policy.compute_logits(mi_chunk)
+                    lp2 = F.log_softmax(logits2 / self.tau, dim=-1).gather(
+                        -1, c_chunk.unsqueeze(-1)).squeeze(-1)
                     log_pi_post_parts.append(lp2)
-                log_pi_pre = torch.cat(log_pi_pre_cache, dim=0)    # [M, NC]
-                log_pi_post = torch.cat(log_pi_post_parts, dim=0)  # [M, NC]
-                delta = (log_pi_post - log_pi_pre).reshape(-1)
-                adv_flat = advantages_flat.reshape(-1)
-                # Pearson correlation
+                log_pi_pre = torch.cat(log_pi_pre_cache, dim=0).reshape(-1)
+                log_pi_post = torch.cat(log_pi_post_parts, dim=0).reshape(-1)
+                delta = log_pi_post - log_pi_pre
+                a_flat = adv_flat.reshape(-1)
                 d = delta - delta.mean()
-                a = adv_flat - adv_flat.mean()
+                a = a_flat - a_flat.mean()
                 denom = d.pow(2).sum().sqrt() * a.pow(2).sum().sqrt()
                 if denom > 0:
                     sanity_corr = (d * a).sum().item() / denom.item()
                 sanity_delta_mean = delta.mean().item()
 
-        # Reward distribution stats over the flattened records
-        rewards = rollout_result["rewards"].float()  # [K, n_calls, BS]
-        reward_mean = rewards.mean().item()
-        reward_std = rewards.std().item()
-        reward_min = rewards.min().item()
-        reward_max = rewards.max().item()
-        # reward_mean averages across ALL (k, call, sample) entries, including
-        # incomplete-window slots that _windowed_reward zeroed out (~half of
-        # calls at seq_length=2*W). reward_mean_complete restricts the mean to
-        # live (non-zero) slots, giving the true -CE scale comparable to phase
-        # 1 loss. Group-relative centering makes the zeros gradient-harmless,
-        # so this is a logging/interpretation fix, not a gradient fix.
-        complete_mask_r = rewards.abs() > 1e-8
+        # -----------------------------------------------------
+        # Diagnostics
+        # -----------------------------------------------------
+        rewards_f = rewards.float()
+        reward_mean = rewards_f.mean().item()
+        reward_std = rewards_f.std().item()
+        reward_min = rewards_f.min().item()
+        reward_max = rewards_f.max().item()
+
+        # Complete-window-corrected reward (ignore zeroed incomplete slots).
+        complete_mask_r = rewards_f.abs() > 1e-8
         n_complete = complete_mask_r.sum().item()
         if n_complete > 0:
-            reward_mean_complete = (rewards * complete_mask_r).sum().item() / n_complete
-            complete_fraction = n_complete / rewards.numel()
+            reward_mean_complete = (rewards_f * complete_mask_r).sum().item() / n_complete
+            complete_fraction = n_complete / rewards_f.numel()
         else:
             reward_mean_complete = 0.0
             complete_fraction = 0.0
 
-        # K-diversity: how much do the K trajectories disagree about the
-        # reward for the same (call, sample)? This is the ACTUAL signal GRPO
-        # normalizes over — higher = more learning signal.
-        # Incomplete-window calls have reward=0 for all K (per _windowed_reward's
-        # completeness mask) → K-std=0 for those slots. Exclude them from
-        # the diagnostic so k_spread reflects only live signal.
-        k_std_per_slot = rewards.std(dim=0, unbiased=False)       # [n_calls, BS]
-        k_range_per_slot = rewards.max(dim=0).values - rewards.min(dim=0).values  # [n_calls, BS]
-        # A slot is "live" if rewards are non-zero for any k (or equivalently,
-        # if max != min or mean != 0). Zero-reward slots are structural, not signal.
-        live_mask = (rewards.abs().sum(dim=0) > 1e-8).float()     # [n_calls, BS]
+        # K-diversity across trajectories (exclude zero-reward slots).
+        k_std_per_slot = rewards_f.std(dim=0, unbiased=False)
+        live_mask = (rewards_f.abs().sum(dim=0) > 1e-8).float()
         live_count = live_mask.sum().clamp(min=1.0)
         k_spread_mean = (k_std_per_slot * live_mask).sum().item() / live_count.item()
-        k_spread_max = (k_std_per_slot * live_mask).max().item()
-        k_range_mean = (k_range_per_slot * live_mask).sum().item() / live_count.item()
 
-        # Advantage distribution stats (the actual gradient-scaling signal
-        # after K-baseline centering + normalization).
-        advantages_flat = advantages.reshape(-1, NC).float()
-        adv_abs_mean = advantages_flat.abs().mean().item()
-        adv_max = advantages_flat.abs().max().item()
-        # Fraction of advantages with |adv| < 0.1 — "near-zero gradient signal".
-        # If this climbs toward 1.0, most actions are getting no credit.
-        adv_flat_frac = (advantages_flat.abs() < 0.1).float().mean().item()
+        # Advantage stats
+        adv_abs_mean = adv_flat.abs().mean().item()
+        adv_max = adv_flat.abs().max().item()
+        adv_flat_frac = (adv_flat.abs() < 0.1).float().mean().item()
 
-        # Per-K mean reward — useful for plotting K-trajectory divergence.
-        # Shape: [K]. Logged as individual fields k0_r, k1_r, ... so plots
-        # can show each trajectory's trend separately.
-        per_k_mean = rewards.mean(dim=(1, 2))                    # [K]
+        # Per-K mean reward
+        per_k_mean = rewards_f.mean(dim=(1, 2))
         per_k_fields = {f"k{i}_reward": per_k_mean[i].item()
                         for i in range(per_k_mean.shape[0])}
 
-        # Codebook usage over the sampled codes (fraction of unique tuples —
-        # VQ mode only; continuous "codes" are floats so uniqueness is trivial)
-        if self.continuous_sigma is None:
-            codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
-            n_unique = torch.unique(codes_flat_all, dim=0).shape[0]
-        else:
-            n_unique = 0
+        # Code diversity per slot: fraction where all K picked the same code
+        all_same_k = (codes == codes[0:1]).all(dim=0)  # [n_calls, BS, NC]
+        frac_all_k_same = all_same_k.float().mean().item()
 
-        # Quantization residual metrics
-        quant_resid_norm = math.sqrt(quant_residual_sq / max(M * NC, 1))
-        raw_norm = math.sqrt(raw_action_sq / max(M * NC, 1))
-        quant_relative = quant_resid_norm / max(raw_norm, 1e-8)
-
-        # -----------------------------------------------------------------
-        # Extended diagnostics (non-invasive, for probing GRPO health)
-        # -----------------------------------------------------------------
-
-        # Per-call reward breakdown: mean and K-spread per call index.
-        # Useful for checking if late calls (larger W→incomplete) look
-        # systematically different from early calls.
-        # rewards: [K, n_calls, BS]
-        per_call_reward = rewards.mean(dim=(0, 2))            # [n_calls]
-        per_call_kspread = rewards.std(dim=0, unbiased=False).mean(dim=-1)  # [n_calls]
-        # Report quartile buckets so we don't explode the jsonl per step.
-        if per_call_reward.numel() >= 4:
-            q = per_call_reward.numel() // 4
-            call_reward_q0 = per_call_reward[:q].mean().item()
-            call_reward_q3 = per_call_reward[-q:].mean().item()
-            call_kspread_q0 = per_call_kspread[:q].mean().item()
-            call_kspread_q3 = per_call_kspread[-q:].mean().item()
-        else:
-            call_reward_q0 = call_reward_q3 = per_call_reward.mean().item()
-            call_kspread_q0 = call_kspread_q3 = per_call_kspread.mean().item()
-
-        # Per-cell log_pi stats — are all NC cells contributing comparably?
-        # (advantages are broadcast across NC by design, so per-cell adv is
-        # trivially identical; the meaningful per-cell variation is log_pi.)
-        per_cell_logpi = per_cell_log_pi_sum / max(per_cell_count, 1)  # [NC]
-        per_cell_logpi_min = per_cell_logpi.min().item()
-        per_cell_logpi_max = per_cell_logpi.max().item()
-        per_cell_logpi_std = per_cell_logpi.std().item() if NC > 1 else 0.0
-
-        # Raw-action norm stats (modulator output magnitude per cell).
-        ra_mean = (raw_action_sum / max(raw_action_count, 1)).mean().item()
-        ra_std = (
-            (raw_action_sq_sum / max(raw_action_count, 1)
-             - (raw_action_sum / max(raw_action_count, 1)).pow(2))
-            .clamp(min=0).sqrt().mean().item())
-
-        # Code diversity across K — VQ-mode only (continuous "codes" are
-        # floats, discrete-equality is meaningless there).
-        frac_all_k_same = 0.0
-        mean_unique_per_slot = 0.0
-        if self.continuous_sigma is None:
-            codes_t = rollout_result["codes"]
-            all_same_k = (codes_t == codes_t[0:1]).all(dim=(0, -1))  # [n_calls, BS, NC]
-            frac_all_k_same = all_same_k.float().mean().item()
-            K_dim, n_calls_d, BS_d, NC_d, L_d = codes_t.shape
-            codes_per_slot = codes_t.permute(1, 2, 3, 0, 4).reshape(-1, K_dim, L_d)
-            sub_n = min(64, codes_per_slot.shape[0])
-            idx = torch.randperm(codes_per_slot.shape[0], device=codes_t.device)[:sub_n]
-            mean_unique_per_slot = sum(
-                torch.unique(codes_per_slot[i], dim=0).shape[0] for i in idx
-            ) / max(sub_n, 1)
-
-        # -----------------------------------------------------------------
-        # H2 diagnostic: ξ_k perturbation size vs code spacing. If ξ_k is
-        # too small relative to pairwise code distance, it can't cross
-        # argmax decision boundaries → K trajectories all pick same code.
-        traj_noise_norm_mean = 0.0
-        traj_noise_vs_spacing = 0.0
-        if traj_noise is not None:
-            tn = traj_noise.detach()  # [K, BS, NC, latent]
-            tn_norm = tn.pow(2).sum(dim=-1).sqrt()  # [K, BS, NC]
-            traj_noise_norm_mean = tn_norm.mean().item()
-            # Use lvl0 spacing from the diagnostic snapshot
-            spacing = (rvq_diag_snapshot or {}).get("rvq_code_spacing_mean_lvl0", 0.0)
-            if spacing > 0:
-                traj_noise_vs_spacing = traj_noise_norm_mean / spacing
-
-        # Modulator weight drift (H3 — is GRPO moving the modulator?)
-        # mod_w0 snapshot stored at trainer init; may be None on legacy runs.
+        # Modulator drift from init
         mod_drift_rel = 0.0
         if getattr(self, "_mod_w0_snapshot", None) is not None:
             with torch.no_grad():
@@ -1163,6 +742,13 @@ class Phase2Trainer:
                     drift_sq += (p - p0).pow(2).sum().item()
                     init_sq += p0.pow(2).sum().item()
                 mod_drift_rel = math.sqrt(drift_sq) / max(math.sqrt(init_sq), 1e-8)
+
+        # Per-cell log_pi variation (are all NC cells engaged?)
+        per_cell_logpi = per_cell_log_pi_sum / max(per_cell_count, 1)
+        per_cell_logpi_std = per_cell_logpi.std().item() if NC > 1 else 0.0
+
+        # Codebook usage in rollout (for diagnostic; codebook is frozen)
+        n_unique = int(torch.unique(codes.reshape(-1)).numel())
 
         return {
             "loss": total_loss / (M * NC),
@@ -1174,73 +760,36 @@ class Phase2Trainer:
             "reward_std": reward_std,
             "reward_min": reward_min,
             "reward_max": reward_max,
-            # Trajectory diversity (per-(call, sample) K-spread)
             "k_spread_mean": k_spread_mean,
-            "k_spread_max": k_spread_max,
-            "k_range_mean": k_range_mean,
-            # Advantage distribution
             "adv_abs_mean": adv_abs_mean,
             "adv_max": adv_max,
             "adv_flat_frac": adv_flat_frac,
-            # Per-K mean reward (trajectory-level)
             **per_k_fields,
             "mod_grad_norm": grad_norm,
-            "n_chunks": n_chunks,
             "M": M,
             "n_unique_codes": n_unique,
-            "quant_resid_rel": quant_relative,
-            "quant_resid_abs": quant_resid_norm,
-            # --- Extended diagnostics ---
-            "call_reward_q0": call_reward_q0,
-            "call_reward_q3": call_reward_q3,
-            "call_kspread_q0": call_kspread_q0,
-            "call_kspread_q3": call_kspread_q3,
-            "per_cell_logpi_min": per_cell_logpi_min,
-            "per_cell_logpi_max": per_cell_logpi_max,
-            "per_cell_logpi_std": per_cell_logpi_std,
-            "raw_action_norm_mean": ra_mean,
-            "raw_action_norm_std": ra_std,
             "frac_all_k_same_code": frac_all_k_same,
-            "mean_unique_codes_per_slot": mean_unique_per_slot,
             "mod_drift_rel": mod_drift_rel,
-            "traj_noise_norm_mean": traj_noise_norm_mean,
-            "traj_noise_vs_spacing": traj_noise_vs_spacing,
+            "per_cell_logpi_std": per_cell_logpi_std,
             "sanity_logpi_adv_corr": sanity_corr,
             "sanity_logpi_delta_mean": sanity_delta_mean,
-            **(rvq_diag_snapshot or {}),
             **(
                 {f"window_q{i}_reward": v
                  for i, v in enumerate(self._last_window_quartile_rewards)}
-                if getattr(self, "_last_window_quartile_rewards", None) else {}
+                if self._last_window_quartile_rewards else {}
             ),
         }
 
     # ------------------------------------------------------------------
-    # Training loop
+    # Curriculum loop
     # ------------------------------------------------------------------
 
     def run_curriculum(self, stages: list[CurriculumStage]):
-        """Run the full phase-2 curriculum, advancing through stages sequentially.
-
-        If a train_loader_factory is provided, each stage gets its own
-        dataloader at seq_length == stage.reward_window — so early stages
-        actually process shorter sequences (cheaper per step) and the
-        curriculum is a true easy-to-hard ramp. Without a factory, falls
-        back to the single dataloader passed at init time.
-
-        If the factory returns different BS per stage, memory state is
-        resized (tile/trim lanes) to match the stage's BS so rollout()
-        doesn't see a shape mismatch between the batch and the memory.
-        """
         for stage_idx, stage in enumerate(stages):
             self.reward_window = stage.reward_window
             print(f"\n=== Phase 2 stage {stage_idx+1}/{len(stages)}: "
                   f"W={stage.reward_window}, budget={stage.token_budget:,} tokens ===")
             if self.train_loader_factory is not None:
-                # Check factory signature to decide whether to pass stage_idx,
-                # rather than catch-all TypeError (which would swallow real
-                # errors from the factory body). Also accept factories that
-                # take **kwargs (VAR_KEYWORD) since they'll accept stage_idx.
                 import inspect
                 sig = inspect.signature(self.train_loader_factory)
                 accepts_stage_idx = (
@@ -1255,13 +804,8 @@ class Phase2Trainer:
                     self.dataloader = self.train_loader_factory(
                         stage.reward_window)
 
-                # Resize memory state if the stage's BS differs from
-                # the current memory BS. Each lane's state is valid
-                # memory produced by the shared modulator; resize_to_bs
-                # samples/tiles lanes without averaging.
                 stage_bs = getattr(self.dataloader, "batch_size", None)
                 if stage_bs is None:
-                    # _DatasetIterator wraps the dataset
                     ds = getattr(self.dataloader, "dataset", None)
                     stage_bs = getattr(ds, "batch_size", None)
                 if (stage_bs is not None
@@ -1271,19 +815,13 @@ class Phase2Trainer:
                           f"to stage BS={stage_bs}")
                     self.model.memory.resize_to_bs(stage_bs)
                     self.model._initialized = self.model.memory._initialized
-                    # Upper-scan carries also need to be dropped — they're
-                    # at the previous BS. Lower-scan carries are handled
-                    # per-rollout by detach_carries() anyway.
                     self.model.lm._carries = [None] * self.config.L_total
             self._run_stage(stage)
 
     def _run_stage(self, stage: CurriculumStage):
-        """Run one curriculum stage until token_budget is reached."""
         tokens_seen = 0
         t_stage_start = time.time()
         for step_idx, batch in enumerate(self.dataloader):
-            # Assume batch.input_ids.shape == [BS, T]; token budget is on total
-            # tokens seen across all steps.
             BS, T = batch.input_ids.shape
             step_tokens = BS * T
             if tokens_seen >= stage.token_budget:
@@ -1300,17 +838,11 @@ class Phase2Trainer:
             tokens_seen += step_tokens
             self.global_step += 1
 
-            # Diagnostics: lane divergence + memory health + surprise.
-            # Surprise (s_mem_live) must stay bounded across phase 2 —
-            # if it explodes, the modulator's observation signal degrades.
-            # mem_pred_loss is not optimized in phase 2 (only lm_ce reward),
-            # so surprise can drift; monitoring catches this early.
             diag_stats = {}
             if self.global_step % self.log_interval == 0:
                 diag_stats.update(self.model.memory.compute_lane_divergence())
                 diag_stats.update(self.model.memory.compute_memory_health())
 
-            # Persistent jsonl logging for plotting
             log_row = {
                 "step": self.global_step,
                 "stage_window": stage.reward_window,
@@ -1331,7 +863,6 @@ class Phase2Trainer:
                       f"log_pi={step_metrics['log_pi_mean']:+.2f} "
                       f"mod_gn={step_metrics['mod_grad_norm']:.3f} "
                       f"codes={step_metrics['n_unique_codes']} "
-                      f"records={step_metrics['M']} "
                       f"roll={t_rollout:.1f}s grad={t_grad:.1f}s "
                       f"tokens={tokens_seen:,}/{stage.token_budget:,}")
 
@@ -1345,17 +876,10 @@ class Phase2Trainer:
                     self.eval_loader_factory(),
                     n_batches=self.eval_batches,
                     warmup_batches=self.eval_warmup_batches)
-                # Also eval the VQ-argmax (deterministic quantized) policy
-                # — this is the actual policy phase 2 is optimizing, and
-                # divergence from the continuous eval indicates proxy drift.
                 quant_metrics = self.evaluate_quantized(
                     self.eval_loader_factory(),
                     n_batches=self.eval_batches,
                     warmup_batches=self.eval_warmup_batches)
-                # No-memory ablation eval — tracks whether memory is still
-                # contributing at inference across phase 2 cycles. Uses a
-                # distinct key_prefix so it doesn't collide with the main
-                # eval record. Same loader + warmup for apples-to-apples.
                 no_mem_metrics = self.evaluate(
                     self.eval_loader_factory(),
                     n_batches=self.eval_batches,
@@ -1367,7 +891,6 @@ class Phase2Trainer:
                       f"ce_nomem={no_mem_metrics['eval_no_mem_ce_loss']:.3f} "
                       f"q_ce={quant_metrics['quant_eval_ce']:.3f} "
                       f"ppl={eval_metrics['eval_ppl']:.1f} "
-                      f"mem_pred={eval_metrics['eval_aux_loss']:.3f} "
                       f"({eval_metrics['eval_batches']} batches)")
                 self._append_metrics({
                     "step": self.global_step,
@@ -1381,7 +904,6 @@ class Phase2Trainer:
         elapsed = time.time() - t_stage_start
         print(f"  stage complete: {tokens_seen:,} tokens in {elapsed:.0f}s")
 
-        # Auto-regenerate plots at end of each stage
         if self.metrics_path is not None:
             try:
                 from scripts.plot_training import (

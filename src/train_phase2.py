@@ -1,13 +1,13 @@
 """Phase 2 training entry point.
 
-Loads a phase-1 (bootstrap or cycle) checkpoint and a fitted RVQ codebook,
-runs the GRPO curriculum over discrete codes, saves the resulting modulator.
+Loads a phase-1 checkpoint (which has a trained DiscreteActionPolicy
+inside model.memory), runs the GRPO curriculum over the factored
+categorical policy, saves the resulting checkpoint.
 
 Usage:
     python -m src.train_phase2 \
-        --checkpoint outputs/v12/bootstrap.pt \
-        --codebook outputs/v12/codebook_v1.pt \
-        --out outputs/v12/phase2_cycle0.pt \
+        --checkpoint outputs/v13/bootstrap.pt \
+        --out outputs/v13/phase2_cycle0.pt \
         --bs 8
 """
 
@@ -18,7 +18,6 @@ import torch
 
 from .model.config import Config
 from .model.model import Model
-from .codebook import ActionVQVAE
 from .phase2.trainer import Phase2Trainer, CurriculumStage
 from .data import create_dataloader, get_tokenizer, get_special_token_ids
 
@@ -27,27 +26,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True,
                    help="Phase 1 / bootstrap checkpoint .pt")
-    p.add_argument("--codebook", required=True, help="Codebook .pt")
     p.add_argument("--out", required=True, help="Where to save post-phase-2 checkpoint")
     p.add_argument("--bs", type=int, default=8)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--tau", type=float, default=1.0)
     p.add_argument("--entropy-coeff", type=float, default=0.01)
-    p.add_argument("--traj-noise-sigma", type=float, default=3.0,
-                   help="Per-trajectory fixed perturbation in VQ latent space. "
-                        "Each K trajectory gets a fixed ξ_k ~ N(0, σ²) reused "
-                        "at every mod event within the rollout, giving sustained "
-                        "trajectory identity. Codebook inter-entry distance is "
-                        "~9 in latent space; σ=3 shifts into meaningfully "
-                        "different code regions. 0 disables (pure multinomial).")
-    p.add_argument("--continuous-sigma", type=float, default=None,
-                   help="Drop the VQ bottleneck entirely (option 3 experiment). "
-                        "Modulator output is treated as the mean of a Gaussian "
-                        "policy with this fixed σ. GRPO optimizes the mean "
-                        "directly. None (default) keeps the VQ pipeline. "
-                        "Typical starting values: σ=1.0 to σ=10.0 depending on "
-                        "raw_action_norm_mean (~100 for current modulator).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-seed", type=int, default=0,
                    help="Fixed seed for the eval dataloader. Independent of "
@@ -159,22 +143,8 @@ def main():
             model.memory.initialize_states(args.bs, device)
             model._initialized = model.memory._initialized
 
-    # Load codebook
-    print(f"Loading codebook: {args.codebook}")
-    cb_ckpt = torch.load(args.codebook, map_location=device, weights_only=False)
-    cb_config = cb_ckpt["config"]
-    vqvae = ActionVQVAE(
-        action_dim=cb_config["action_dim"],
-        latent_dim=cb_config["latent_dim"],
-        hidden=cb_config["hidden"],
-        num_levels=cb_config["num_levels"],
-        codes_per_level=cb_config["codes_per_level"],
-        beta=cb_config["beta"],
-    ).to(device)
-    vqvae.load_state_dict(cb_ckpt["state_dict"])
-    vqvae.train(False)
-    print(f"  action_dim={cb_config['action_dim']} latent={cb_config['latent_dim']} "
-          f"levels={cb_config['num_levels']}x{cb_config['codes_per_level']}")
+    # (No separate codebook file — codebook + decoder live inside
+    # model.memory.discrete_policy, trained during bootstrap + phase 1.)
 
     # Stages first so we know the max reward window → segment length.
     stages = [
@@ -250,13 +220,11 @@ def main():
     metrics_path = os.path.join(out_dir, "phase2_metrics.jsonl")
 
     trainer = Phase2Trainer(
-        model=model, vqvae=vqvae, dataloader=dataloader,
+        model=model, dataloader=dataloader,
         train_loader_factory=train_loader_factory,
         config=config, device=device,
         group_size=args.group_size, lr=args.lr, tau=args.tau,
         entropy_coeff=args.entropy_coeff,
-        traj_noise_sigma=args.traj_noise_sigma,
-        continuous_sigma=args.continuous_sigma,
         metrics_path=metrics_path,
         eval_interval=args.eval_interval,
         eval_batches=args.eval_batches,

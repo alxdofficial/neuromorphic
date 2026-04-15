@@ -111,14 +111,14 @@ class DiscreteActionPolicy(nn.Module):
         logits = torch.einsum("bnh,nhk->bnk", h, w2) + b2.unsqueeze(0)
         return logits
 
-    def decode(self, codes: Tensor) -> Tensor:
+    def decode(self, codes: Tensor, dtype: torch.dtype | None = None) -> Tensor:
         """codes: [B, NC] long → action: [B, NC, action_dim]
 
         Gradient does NOT flow through codes (int); use decode_soft for
         Gumbel-softmax differentiability.
         """
-        # Look up embeddings
-        emb = self.codebook[codes]  # [B, NC, D]
+        dt = dtype if dtype is not None else self.codebook.dtype
+        emb = self.codebook.to(dt)[codes]  # [B, NC, D]
         return self._decode_from_emb(emb)
 
     def decode_soft(self, soft_weights: Tensor) -> Tensor:
@@ -128,8 +128,9 @@ class DiscreteActionPolicy(nn.Module):
         Soft-mixture over codebook entries — gradient flows through the
         weights back to logits.
         """
-        # weighted sum over codes: [B, NC, K] @ [K, D] → [B, NC, D]
-        emb = torch.einsum("bnk,kd->bnd", soft_weights, self.codebook)
+        dt = soft_weights.dtype
+        codebook = self.codebook.to(dt)
+        emb = torch.einsum("bnk,kd->bnd", soft_weights, codebook)
         return self._decode_from_emb(emb)
 
     def _decode_from_emb(self, emb: Tensor) -> Tensor:

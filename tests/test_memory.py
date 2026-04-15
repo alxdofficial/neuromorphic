@@ -89,11 +89,9 @@ class TestModulator:
         dt = torch.bfloat16
         W_gamma = torch.sigmoid(mg.W_decay_logit).to(dt)
         decay_gamma = torch.sigmoid(mg.decay_gamma_logit).to(dt)
-        return (
-            mg.mod_w1.to(dt), mg.mod_b1.to(dt),
-            mg.mod_w2.to(dt), mg.mod_b2.to(dt),
-            W_gamma, decay_gamma,
-        )
+        # After the DiscreteActionPolicy refactor, _modulate_cells no longer
+        # takes explicit mod_w/b params — they live on self.discrete_policy.
+        return (W_gamma, decay_gamma)
 
     def _surprise_inputs(self, mg, BS):
         dt = torch.bfloat16
@@ -206,8 +204,9 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
         mem_out, _ = _run_segment(mg, config, BS=2)
         mem_out.sum().backward()
-        assert mg.mod_w1.grad is not None
-        assert mg.mod_w1.grad.abs().sum() > 0
+        # Gradient should reach the discrete policy's logit head
+        assert mg.discrete_policy.logit_w1.grad is not None
+        assert mg.discrete_policy.logit_w1.grad.abs().sum() > 0
 
     def test_grad_reaches_shared_mlps(self):
         config = _tiny_config()
@@ -226,5 +225,6 @@ class TestGradientFlow:
         mg.initialize_states(2, torch.device("cpu"))
         mem_out, _ = _run_segment(mg, config, BS=2)
         mem_out.sum().backward()
-        assert mg.mod_w2.grad is not None
-        assert mg.mod_w2.grad.abs().sum() > 0
+        # W is produced by decoder(codebook[codes]); gradient must reach logit_w2
+        assert mg.discrete_policy.logit_w2.grad is not None
+        assert mg.discrete_policy.logit_w2.grad.abs().sum() > 0

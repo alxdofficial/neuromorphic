@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import Config
+from .discrete_policy import DiscreteActionPolicy
 
 
 class MemoryGraph(nn.Module):
@@ -60,13 +61,22 @@ class MemoryGraph(nn.Module):
         self.inject_b = nn.Parameter(
             torch.zeros(self.N_cells, self.alpha * self.D_n))
 
-        # Per-cell modulator
-        # Input: per-neuron h_norms + msg_norms + decay_mean + drift +
-        #        global surprise + hebbian trace (see Config.mod_in)
-        self.mod_w1 = nn.Parameter(torch.empty(self.N_cells, config.mod_in, Hmod))
-        self.mod_b1 = nn.Parameter(torch.zeros(self.N_cells, Hmod))
-        self.mod_w2 = nn.Parameter(torch.empty(self.N_cells, Hmod, config.mod_out))
-        self.mod_b2 = nn.Parameter(torch.zeros(self.N_cells, config.mod_out))
+        # Neuromodulator: produces per-cell discrete code + continuous action.
+        # See discrete_policy.py for architecture details. Input layout matches
+        # old modulator (config.mod_in). Per-cell logit head, shared codebook
+        # + decoder across cells. K=256, D=32 by default.
+        self.discrete_policy = DiscreteActionPolicy(
+            n_cells=self.N_cells,
+            mod_in_dim=config.mod_in,
+            action_dim=config.mod_out,
+            num_codes=getattr(config, "num_codes", 256),
+            code_dim=getattr(config, "code_dim", 32),
+            logit_hidden=Hmod,
+            decoder_hidden=getattr(config, "decoder_hidden", 128),
+        )
+        # Gumbel-softmax temperature for phase 1 backprop. Set externally
+        # (train.py can anneal 1.0 → 0.3 over bootstrap). Unused in phase 2.
+        self.gumbel_tau = 1.0
 
         # Learnable per-cell decay rate for the Hebbian co-activation trace.
         # Stored as a logit; sigmoid(logit) gives the running-average rate γ
@@ -121,14 +131,7 @@ class MemoryGraph(nn.Module):
             with torch.no_grad():
                 w.uniform_(-bound, bound)
 
-        # mod_w1: [NC, mod_in, Hmod], einsum("bni,nih->bnh"), tanh downstream
-        _xavier_einsum(self.mod_w1, fan_in=config.mod_in, fan_out=Hmod,
-                       gain=TANH_GAIN)
-        # mod_w2: [NC, Hmod, mod_out], einsum("bnh,nho->bno"), linear output
-        # (the W portion is RMSNormed, the decay portion is raw — both tolerate
-        # unit-scale init)
-        _xavier_einsum(self.mod_w2, fan_in=Hmod, fan_out=config.mod_out,
-                       gain=1.0)
+        # Discrete policy initializes its own weights (see discrete_policy.py).
         # inject_w: [NC, alpha*D_n, D_n], einsum("bni,noi->bno"), linear
         _xavier_einsum(self.inject_w, fan_in=self.D_n,
                        fan_out=self.alpha * self.D_n, gain=1.0)
@@ -405,17 +408,22 @@ class MemoryGraph(nn.Module):
             hebbian_flat,                # N*N     (per-pair coactivation history)
         ], dim=-1)
 
-    def _modulator_forward(self, mod_input: Tensor) -> Tensor:
-        """Eager modulator MLP forward, returns full output [BS, NC, mod_out]."""
-        dt = mod_input.dtype
-        mod_w1 = self.mod_w1.to(dt)
-        mod_b1 = self.mod_b1.to(dt)
-        mod_w2 = self.mod_w2.to(dt)
-        mod_b2 = self.mod_b2.to(dt)
-        hidden = torch.tanh(
-            torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
-        output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
-        return output
+    def _modulator_forward(
+        self, mod_input: Tensor, phase: str = "phase1",
+    ) -> dict:
+        """Run the neuromodulator policy.
+
+        phase="phase1": Gumbel-softmax sampling (differentiable for backprop)
+        phase="phase2": hard Categorical (for RL rollouts)
+
+        Returns dict with keys: logits, codes, action, log_pi.
+        The 'action' tensor has the same shape & semantics as the old
+        modulator's continuous output — [BS, NC, mod_out].
+        """
+        return self.discrete_policy.forward(
+            mod_input, phase=phase,
+            tau=self.gumbel_tau, hard_gumbel=True,
+        )
 
     @torch.no_grad()
     def compute_modulator_stats(self) -> dict:
@@ -436,7 +444,8 @@ class MemoryGraph(nn.Module):
         NC, N = self.N_cells, self.C_n
 
         mod_input = self._build_mod_input()
-        output = self._modulator_forward(mod_input)
+        out = self._modulator_forward(mod_input, phase="phase1")
+        output = out["action"]
 
         # Raw (pre-gate) modulator output — the driving signal.
         delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N).float()
@@ -536,16 +545,17 @@ class MemoryGraph(nn.Module):
             return actions
         # Fallback: single snapshot at current state
         mod_input = self._build_mod_input()
-        return self._modulator_forward(mod_input).float().cpu().unsqueeze(0)
+        out = self._modulator_forward(mod_input, phase="phase1")
+        return out["action"].float().cpu().unsqueeze(0)
 
     def compute_mod_grad_norm(self) -> float:
-        """Mean per-cell L2 norm of modulator weight gradients.
+        """Mean per-cell L2 norm of modulator logit-head gradients.
 
         Read from `.grad` after backward but before zero_grad. Returns 0 if
-        any of the modulator params has no grad yet.
+        any of the logit-head params has no grad yet.
         """
         norms = []
-        for p in (self.mod_w1, self.mod_w2):
+        for p in (self.discrete_policy.logit_w1, self.discrete_policy.logit_w2):
             if p.grad is None:
                 return 0.0
             flat = p.grad.reshape(self.N_cells, -1).float()
@@ -598,9 +608,13 @@ class MemoryGraph(nn.Module):
 
     def compute_param_norms(self) -> dict:
         """L2 norms of key weight tensors (cheap; cpu-synced scalars)."""
+        dp = self.discrete_policy
         return {
-            "mod_w1_norm": self.mod_w1.detach().float().norm().item(),
-            "mod_w2_norm": self.mod_w2.detach().float().norm().item(),
+            "mod_w1_norm": dp.logit_w1.detach().float().norm().item(),
+            "mod_w2_norm": dp.logit_w2.detach().float().norm().item(),
+            "codebook_norm": dp.codebook.detach().float().norm().item(),
+            "dec_w1_norm": dp.dec_w1.detach().float().norm().item(),
+            "dec_w2_norm": dp.dec_w2.detach().float().norm().item(),
             "state_w1_norm": self.state_w1.detach().float().norm().item(),
             "state_w2_norm": self.state_w2.detach().float().norm().item(),
             "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
@@ -616,9 +630,13 @@ class MemoryGraph(nn.Module):
         no grad (e.g. when frozen).
         """
         out = {}
+        dp = self.discrete_policy
         for name, p in (
-            ("grad_mod_w1", self.mod_w1),
-            ("grad_mod_w2", self.mod_w2),
+            ("grad_mod_w1", dp.logit_w1),
+            ("grad_mod_w2", dp.logit_w2),
+            ("grad_codebook", dp.codebook),
+            ("grad_dec_w1", dp.dec_w1),
+            ("grad_dec_w2", dp.dec_w2),
             ("grad_state_w1", self.state_w1),
             ("grad_state_w2", self.state_w2),
             ("grad_msg_w1", self.msg_w1),
@@ -695,8 +713,7 @@ class MemoryGraph(nn.Module):
 
     def _modulate_cells(self, h, msg, W, decay, hebbian,
                         readout_drift, s_mem_live, s_mem_ema_fast,
-                        mod_w1, mod_b1, mod_w2, mod_b2,
-                        W_gamma, decay_gamma):
+                        W_gamma, decay_gamma, phase: str = "phase1"):
         """Per-cell neuromodulator step.
 
         Biologically principled inputs only — rates, correlations, and
@@ -706,13 +723,11 @@ class MemoryGraph(nn.Module):
           - readout_drift             : per-cell volatility
           - s_mem_live, s_mem_ema_fast : global surprise (broadcast)
           - hebbian_flat              : per-pair coactivation history
-                                        (Hebbian "fire-together-wire-together")
 
-        Both W and decay are updated via convex EMAs toward bounded targets:
-          W     ← (1-γ_W) * W     + γ_W * rms_norm(delta_W_raw)
-          decay ← (1-γ_d) * decay + γ_d * sigmoid(delta_decay_raw)
-        So neither accumulator drifts: W stays at ~unit per-row RMS and
-        decay stays in [0,1] by construction.
+        Runs the DiscreteActionPolicy: obs → logits → Gumbel-softmax (phase 1)
+        or Categorical (phase 2) → code → decoder → continuous action. The
+        continuous action is then consumed identically to the old design:
+        parsed into delta_W/delta_decay_raw and applied via convex EMA.
         """
         NC, N = self.N_cells, self.C_n
         BS = h.shape[0]
@@ -723,7 +738,6 @@ class MemoryGraph(nn.Module):
         decay_mean = decay.mean(dim=2, keepdim=True)                         # [BS, NC, 1]
         hebbian_flat = hebbian.reshape(BS, NC, N * N)                        # [BS, NC, N*N]
 
-        # Broadcast global scalars to every cell.
         s1 = s_mem_live.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
         s2 = s_mem_ema_fast.view(BS, 1, 1).expand(BS, NC, 1).to(dt)
 
@@ -734,27 +748,29 @@ class MemoryGraph(nn.Module):
             s1, s2,                             # 2
             hebbian_flat,                       # N*N
         ], dim=-1)
-        hidden = torch.tanh(
-            torch.einsum("bni,nih->bnh", mod_input, mod_w1) + mod_b1.unsqueeze(0))
-        output = torch.einsum("bnh,nho->bno", hidden, mod_w2) + mod_b2.unsqueeze(0)
 
-        # Unpack modulator output
+        out = self._modulator_forward(mod_input, phase=phase)
+        output = out["action"]  # [BS, NC, mod_out]
+        codes = out["codes"]    # [BS, NC] long
+
+        # Track code usage during phase-1 for dead-code resampling diagnostics
+        if phase == "phase1" and self.training:
+            self.discrete_policy.update_usage(codes.detach())
+
         delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N)
         delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N)
 
-        # W update: convex EMA toward unit-per-row-RMS delta, computed in f32
-        # to avoid the bf16 precision cliff at γ near 1 (see audit claim #4).
         delta_W = F.rms_norm(delta_W_raw, normalized_shape=(N,))
         g_W_f32 = W_gamma.float().view(1, -1, 1, 1)
         W_new = ((1.0 - g_W_f32) * W.float() + g_W_f32 * delta_W.float()).to(W.dtype)
 
-        # Decay update: convex EMA toward sigmoid'd target (in [0,1]), also f32.
         target_decay_f32 = torch.sigmoid(delta_decay_raw.float())
         g_d_f32 = decay_gamma.float().view(1, -1, 1)
         decay_new = ((1.0 - g_d_f32) * decay.float() + g_d_f32 * target_decay_f32).to(decay.dtype)
 
-        # Collect raw action at every modulation event (not just end-of-chunk).
         if self._collecting_actions:
+            # Record the continuous decoded action (legacy format). The codes
+            # themselves are also available via discrete_policy.update_usage tracking.
             self._action_buffer.append(output.detach().float().cpu())
 
         return W_new, decay_new
@@ -803,7 +819,6 @@ class MemoryGraph(nn.Module):
                    start_t, identity, inject_w, inject_b,
                    st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
-                   mod_w1, mod_b1, mod_w2, mod_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                    hebbian_gamma, W_gamma, decay_gamma, gain_fast):
         """Run one block of memory steps with live in-block surprise signals.
@@ -866,8 +881,7 @@ class MemoryGraph(nn.Module):
                 W, decay = self._modulate_cells(
                     h, msg, W, decay, hebbian,
                     readout_drift, s_mem_live, s_mem_ema_fast,
-                    mod_w1, mod_b1, mod_w2, mod_b2,
-                    W_gamma, decay_gamma)
+                    W_gamma, decay_gamma, phase="phase1")
                 gate = decay.unsqueeze(-1)
                 one_minus_gate = 1.0 - gate
 
@@ -988,10 +1002,8 @@ class MemoryGraph(nn.Module):
         mg_b2 = self.msg_b2.to(dt)
         inject_w = self.inject_w.to(dt)
         inject_b = self.inject_b.to(dt)
-        mod_w1 = self.mod_w1.to(dt)
-        mod_b1 = self.mod_b1.to(dt)
-        mod_w2 = self.mod_w2.to(dt)
-        mod_b2 = self.mod_b2.to(dt)
+        # Discrete policy params are accessed via self.discrete_policy inside
+        # _modulate_cells — no longer plumbed through _run_block args.
         # LM head weights for the in-block memory head (bf16 compute copies)
         lm_head_w = lm.lm_head.weight.to(dt)
         if lm.proj_down is not None:
@@ -1027,7 +1039,6 @@ class MemoryGraph(nn.Module):
                 start_t, identity, inject_w, inject_b,
                 st_w1_recv, st_w1_h, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
-                mod_w1, mod_b1, mod_w2, mod_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast)
             # Use uncompiled path during action collection to avoid
@@ -1098,37 +1109,30 @@ class MemoryGraph(nn.Module):
         H_mid: Tensor,
         input_ids: Tensor,
         lm,
-        vqvae,
         tau: float = 1.0,
         sample: bool = True,
         prev_token: Tensor | None = None,
         h_mid_batch_map: Tensor | None = None,
-        traj_noise: Tensor | None = None,
-        continuous_sigma: float | None = None,
     ) -> dict:
-        """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
+        """Phase 2 rollout: direct categorical sampling from discrete policy.
 
         At each modulator call:
             1. Build mod_input as in phase 1
-            2. Run the modulator to produce raw continuous output
-            3. Encode via vqvae.encoder -> low-dim latent z
-            4. Sample codes from the per-level distance-based categorical
-            5. Reconstruct quantized latent z_q from codes
-            6. Decode z_q via vqvae.decoder -> quantized action
-            7. Unpack into delta_W, delta_decay and apply to memory state
-            8. Record (mod_input, codes, t) for the GRPO gradient pass
+            2. Run the neuromod to produce per-cell logits over K codes
+            3. Sample a code per cell (multinomial at temperature tau or
+               argmax if sample=False)
+            4. Decode the sampled codes to continuous actions via the
+               frozen codebook + decoder
+            5. Apply delta_W / delta_decay via convex EMA (same as phase 1)
+            6. Record (mod_input, codes, t) for the GRPO gradient pass
 
         Args:
             H_mid: [H_BS, T, D] — lower-scan output from (frozen) LM.
-                When h_mid_batch_map is None, H_BS must equal the memory's
-                batch size. When provided, H_mid can be smaller (e.g.
-                original BS before K-expansion) and h_mid_batch_map indexes
-                into it — avoids duplicating H_mid K times.
             input_ids: [BS, T] — at the memory's batch size (K*BS_orig)
             lm: (frozen) LM module — provides lm_head / mem_head weights
-            vqvae: (frozen) ActionVQVAE — provides encoder, rvq, decoder
-            tau: temperature for the distance-based categorical
-            sample: True for multinomial sampling, False for argmax
+                for the in-rollout surprise signal.
+            tau: temperature for the categorical (softmax(logits/τ))
+            sample: True for multinomial, False for argmax (deployment path)
             h_mid_batch_map: [BS] long or None — maps each sample in the
                 memory batch to its row in H_mid. Saves VRAM by avoiding
                 K-fold duplication of H_mid.
@@ -1136,9 +1140,9 @@ class MemoryGraph(nn.Module):
         Returns:
             dict with:
                 readouts: [BS, T, D]
-                mod_inputs: [n_calls, BS, NC, mod_in] — state at each modulator call
-                codes: [n_calls, BS, NC, num_levels] — sampled codes
-                call_positions: [n_calls] — token position `t` of each call
+                mod_inputs: [n_calls, BS, NC, mod_in]
+                codes: [n_calls, BS, NC]  (long)
+                call_positions: [n_calls]
         """
         assert self._initialized, "memory must be initialized before phase2 rollout"
 
@@ -1286,51 +1290,14 @@ class MemoryGraph(nn.Module):
                     hebbian_flat,
                 ], dim=-1)  # [BS, NC, mod_in] in f32
 
-                raw_action = self._modulator_forward(mod_input_f32)  # f32 out
-
-                if continuous_sigma is not None:
-                    # Continuous-action mode (option 3): skip VQ entirely.
-                    # Policy π(a|s) = N(raw_action, σ²·I). Sample = raw +
-                    # σ · ε. In GRPO we'll compute Gaussian log-prob at
-                    # the sampled action given the (re-derived) mean.
-                    action_flat = raw_action.reshape(BS * NC, -1)
-                    if sample:
-                        eps = torch.randn_like(action_flat)
-                    else:
-                        eps = torch.zeros_like(action_flat)
-                    sampled_flat = action_flat + continuous_sigma * eps
-                    # "codes" in VQ mode holds the discretized choice; in
-                    # continuous mode we stash the sampled action itself
-                    # so grpo_step can compute a Gaussian log-prob:
-                    #     ε_new = (sample - μ_now) / σ
-                    #     log π = -½ Σ ε_new² - ½·D·log(2πσ²)
-                    # where μ_now is the modulator re-forward on mod_inputs
-                    # (with current weights).
-                    # Store sample in bf16 — action_dim is O(1000) so f32
-                    # storage at high n_calls causes OOM. bf16 has plenty
-                    # of dynamic range for log-prob reconstruction.
-                    codes = sampled_flat.detach().to(torch.bfloat16)
-                    quantized = sampled_flat.reshape(BS, NC, -1).to(dt)
+                # Discrete policy: logits → sample code → decode
+                logits = self.discrete_policy.compute_logits(mod_input_f32)  # [BS, NC, K]
+                if sample:
+                    codes, _ = self.discrete_policy.sample_discrete(logits, tau=tau)
                 else:
-                    # Normalize, encode, sample codes, decode, un-normalize (all f32)
-                    action_flat = raw_action.reshape(BS * NC, -1)
-                    action_norm = vqvae.normalize(action_flat)
-                    z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
-                    # Per-trajectory fixed perturbation: shift z by ξ_k (same ξ_k
-                    # reused at every mod event within a rollout). Gives each
-                    # trajectory a systematically different sampling distribution
-                    # so K-states mean-revert to different equilibria.
-                    if traj_noise is not None:
-                        z_sample = z + traj_noise.reshape(BS * NC, -1)
-                    else:
-                        z_sample = z
-                    codes = vqvae.rvq.sample_codes(z_sample, tau=tau, sample=sample)  # [BS*NC, L]
-                    # Reconstruct z_q from codes — vectorized across levels
-                    lvl_idx = torch.arange(vqvae.rvq.num_levels, device=codes.device)
-                    z_q = vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes].sum(dim=1)
-                    quantized_norm = vqvae.decoder(z_q)              # [BS*NC, action_dim]
-                    quantized = vqvae.denormalize(quantized_norm)
-                    quantized = quantized.reshape(BS, NC, -1).to(dt)
+                    codes = logits.argmax(dim=-1)
+                action = self.discrete_policy.decode(codes)          # [BS, NC, action_dim] f32
+                quantized = action.to(dt)
 
                 # Unpack delta_W, delta_decay_raw and apply the same convex-EMA
                 # updates as phase 1 (so the frozen-module determinism matches).
@@ -1352,7 +1319,7 @@ class MemoryGraph(nn.Module):
                 # of mod_inputs accumulation (~4.6 GB at W=4096) is the
                 # price we pay for keeping grpo_step fast (no PCIe transfer).
                 mod_input_records.append(mod_input_f32.detach())
-                codes_records.append(codes.reshape(BS, NC, -1).detach())
+                codes_records.append(codes.detach())              # [BS, NC] long
                 call_positions.append(t)
 
             # Fused memory step + hebbian update (torch.compile'd on CUDA)
@@ -1387,7 +1354,7 @@ class MemoryGraph(nn.Module):
 
         return {
             "readouts": readouts,
-            "mod_inputs": torch.stack(mod_input_records, dim=0),   # [n_calls, BS, NC, mod_in] GPU
-            "codes": torch.stack(codes_records, dim=0),             # [n_calls, BS, NC, L] GPU
+            "mod_inputs": torch.stack(mod_input_records, dim=0),   # [n_calls, BS, NC, mod_in]
+            "codes": torch.stack(codes_records, dim=0),             # [n_calls, BS, NC] long
             "call_positions": torch.tensor(call_positions, dtype=torch.long),
         }

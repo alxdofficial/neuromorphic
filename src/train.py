@@ -69,15 +69,18 @@ def parse_args():
                         "action collection steps should not count toward "
                         "LR decay.")
     p.add_argument("--freeze-modulator", action="store_true",
-                   help="Freeze modulator params (cycle 1+ phase 1)")
-    p.add_argument("--collect-actions", action="store_true",
-                   help="Collect modulator actions to a buffer (for codebook fit)")
-    p.add_argument("--action-db-out", type=str, default=None,
-                   help="Path to save action database when --collect-actions")
-    p.add_argument("--no-train", action="store_true",
-                   help="Pure inference: skip backward and optimizer step. "
-                        "Used for action collection so the codebook is fit on "
-                        "a stationary LM rather than a moving target.")
+                   help="Freeze the neuromod's logit head (cycle 1+ phase 1 "
+                        "to preserve phase 2 GRPO's learning).")
+    p.add_argument("--freeze-codebook-decoder", action="store_true",
+                   help="Freeze codebook embeddings + decoder MLP. Used in "
+                        "cycle phase 1 to keep code semantics stable across "
+                        "the phase-2 → phase-1 transition. Does NOT freeze "
+                        "the neuromod's logit head.")
+    # Deprecated in the new architecture (no more action collection / codebook
+    # refit). Kept as no-op flags so older invocations don't break.
+    p.add_argument("--collect-actions", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--action-db-out", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--no-train", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -145,8 +148,12 @@ def main():
     # cycle-1 transition so optimizer.load_state_dict() doesn't silently
     # fail on a param-count mismatch. See audit #2.
     if args.freeze_modulator:
-        for p in (model.memory.mod_w1, model.memory.mod_b1,
-                  model.memory.mod_w2, model.memory.mod_b2):
+        dp = model.memory.discrete_policy
+        for p in (dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2):
+            p.requires_grad = False
+    if args.freeze_codebook_decoder:
+        dp = model.memory.discrete_policy
+        for p in (dp.codebook, dp.dec_w1, dp.dec_b1, dp.dec_w2, dp.dec_b2):
             p.requires_grad = False
 
     # Optimizer — include ALL params (including frozen ones) so param-group

@@ -60,25 +60,23 @@ class Trainer:
         # The requires_grad flag here is a belt-and-suspenders for anyone
         # constructing Trainer directly.
         self.freeze_modulator = freeze_modulator
+        dp = model.memory.discrete_policy
+        # "Modulator" = just the logit head (what phase 2 GRPO trains).
+        # Codebook + decoder are intentionally in the DYNAMICS pool — they
+        # train during phase 1 (including cycle phase 1) by gradient, and
+        # get frozen explicitly in phase 2 by the phase-2 trainer.
+        mod_params = [dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2]
         if freeze_modulator:
-            for p in (model.memory.mod_w1, model.memory.mod_b1,
-                      model.memory.mod_w2, model.memory.mod_b2):
+            for p in mod_params:
                 p.requires_grad = False
 
         # Cache param groups for split grad clipping.
         #   - LM pool: everything in model.lm
-        #   - Dynamics pool: memory params that are NOT the modulator
-        #   - Modulator pool: the 4 modulator tensors
-        # Each pool gets clipped independently so a spike in the dynamics pool
-        # doesn't starve the modulator (or vice versa) via shared clipping.
-        mod_param_set = {id(p) for p in (
-            model.memory.mod_w1, model.memory.mod_b1,
-            model.memory.mod_w2, model.memory.mod_b2,
-        )}
-        self._mod_params = [
-            model.memory.mod_w1, model.memory.mod_b1,
-            model.memory.mod_w2, model.memory.mod_b2,
-        ]
+        #   - Dynamics pool: memory params other than the logit head
+        #     (includes codebook + decoder + state/msg/inject/neuron_id MLPs)
+        #   - Modulator pool: just the logit head
+        mod_param_set = {id(p) for p in mod_params}
+        self._mod_params = mod_params
         self._dyn_params = [
             p for p in model.memory.parameters()
             if id(p) not in mod_param_set
