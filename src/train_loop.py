@@ -40,6 +40,12 @@ def parse_args():
     p.add_argument("--bs", type=int, default=80)
     p.add_argument("--phase2-bs", type=int, default=8)
     p.add_argument("--phase2-group-size", type=int, default=8)
+    # Optional per-stage phase 2 budgets (tokens). Forwarded to train_phase2.
+    # If None, train_phase2 uses its own defaults (10M each).
+    p.add_argument("--phase2-stage1-tokens", type=int, default=None)
+    p.add_argument("--phase2-stage2-tokens", type=int, default=None)
+    p.add_argument("--phase2-stage3-tokens", type=int, default=None)
+    p.add_argument("--phase2-stage4-tokens", type=int, default=None)
     p.add_argument("--skip-bootstrap", action="store_true",
                    help="Skip bootstrap (if already done once)")
     p.add_argument("--start-cycle", type=int, default=0,
@@ -228,7 +234,7 @@ def main():
         # NOTE: train.py phase 1 deliberately keeps a stable seed across
         # cycles so the dataloader resume/offset mechanism stays coherent.
         phase2_seed = 42 + cycle * 100_000
-        run([
+        phase2_cmd = [
             python, "-m", "src.train_phase2",
             "--checkpoint", phase1_end_ckpt,
             "--codebook", codebook_path,
@@ -236,7 +242,15 @@ def main():
             "--bs", str(args.phase2_bs),
             "--group-size", str(args.phase2_group_size),
             "--seed", str(phase2_seed),
-        ])
+        ]
+        for i, v in enumerate(
+            (args.phase2_stage1_tokens, args.phase2_stage2_tokens,
+             args.phase2_stage3_tokens, args.phase2_stage4_tokens),
+            start=1,
+        ):
+            if v is not None:
+                phase2_cmd += [f"--stage{i}-tokens", str(v)]
+        run(phase2_cmd)
 
         current_ckpt = phase2_ckpt
 

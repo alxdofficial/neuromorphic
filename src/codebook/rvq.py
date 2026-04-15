@@ -14,6 +14,8 @@ Design choices (see docs/training_strategy.md):
 - EMA codebook updates (decay 0.99), dead-code resampling from current batch.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -236,6 +238,98 @@ class ResidualVQ(nn.Module):
             selected = cb[codes_lvl]
             residual = residual - selected
         return log_pi_total
+
+    @torch.no_grad()
+    def diagnostics(
+        self, z: Tensor, codes: Tensor, tau: float = 1.0,
+    ) -> dict:
+        """Return per-level diagnostic scalars for the current (z, codes).
+
+        All computations are no-grad, no EMA updates. Intended for
+        logging during phase 2 to probe VQ bottleneck health.
+
+        Args:
+            z: [B, code_dim] encoder output
+            codes: [B, num_levels] long — the codes actually sampled this rollout
+            tau: categorical temperature (same as used during sampling)
+
+        Returns dict with keys:
+            rvq_argmax_agree: float — fraction of cells where sampled code == argmax code
+            rvq_nearest_ratio_mean: float — mean of |z - 2nd_nearest| / |z - 1st_nearest|
+                                   (ratio > 1; close to 1 = ambiguous argmax)
+            rvq_cat_entropy_lvl{L}: float — mean per-level entropy of the categorical at z
+            rvq_usage_entropy_lvl{L}: float — entropy of the cumulative per-code usage histogram
+            rvq_effective_codes_lvl{L}: float — exp(usage_entropy), "effective vocab" per level
+            rvq_code_spacing_mean_lvl{L}: float — mean pairwise L2 between codes at this level
+            rvq_logpi_lvl{L}: float — mean log_pi contribution from this level
+            rvq_code_unique_tuples: int — distinct (code_0, ..., code_L) tuples in this batch
+        """
+        out = {}
+        B = z.shape[0]
+        residual = z.detach()
+        residual_argmax = z.detach()
+        total_agree = 0
+        total_ratio = 0.0
+        ratio_count = 0
+
+        for lvl in range(self.num_levels):
+            cb = self.codebooks[lvl].detach()  # [K, D]
+
+            # Categorical at this residual
+            dists = (residual.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)  # [B, K]
+            logits = -dists / tau
+            log_probs = F.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+
+            # Per-level entropy of the categorical at z
+            lvl_H = -(probs * log_probs).sum(dim=-1).mean().item()
+            out[f"rvq_cat_entropy_lvl{lvl}"] = lvl_H
+
+            # Per-level log_pi (contribution to sampled code)
+            codes_lvl = codes[:, lvl]
+            log_pi_lvl = log_probs.gather(1, codes_lvl.unsqueeze(-1)).squeeze(-1)
+            out[f"rvq_logpi_lvl{lvl}"] = log_pi_lvl.mean().item()
+
+            # 1st vs 2nd nearest distance ratio (argmax ambiguity proxy)
+            if cb.shape[0] >= 2:
+                top2, _ = torch.topk(dists, k=2, dim=-1, largest=False)
+                nearest = top2[:, 0].clamp(min=1e-8)
+                second = top2[:, 1]
+                ratio = (second / nearest).sqrt()  # L2-dist ratio, not sq
+                total_ratio += ratio.sum().item()
+                ratio_count += ratio.numel()
+
+            # Argmax vs sampled-code agreement
+            argmax_lvl = logits.argmax(dim=-1)
+            total_agree += (argmax_lvl == codes_lvl).sum().item()
+
+            # Per-level usage histogram (cumulative from EMA cluster_size)
+            totals = self.cluster_size[lvl].sum().clamp(min=1.0)
+            usage_p = self.cluster_size[lvl] / totals
+            usage_p = usage_p.clamp(min=1e-12)
+            usage_H = -(usage_p * usage_p.log()).sum().item()
+            out[f"rvq_usage_entropy_lvl{lvl}"] = usage_H
+            out[f"rvq_effective_codes_lvl{lvl}"] = math.exp(usage_H)
+
+            # Pairwise code spacing (mean L2 between distinct pairs)
+            if cb.shape[0] >= 2:
+                pdists = (cb.unsqueeze(0) - cb.unsqueeze(1)).pow(2).sum(-1).sqrt()
+                # exclude diagonal
+                mask = ~torch.eye(cb.shape[0], dtype=torch.bool, device=cb.device)
+                out[f"rvq_code_spacing_mean_lvl{lvl}"] = pdists[mask].mean().item()
+
+            # Advance residuals using the sampled code (for the categorical path)
+            # and the argmax code (for the argmax path). Needed because later
+            # levels see the residual from previous level's selection.
+            residual = residual - cb[codes_lvl]
+
+        total_cells = B * self.num_levels
+        out["rvq_argmax_agree"] = total_agree / max(total_cells, 1)
+        if ratio_count > 0:
+            out["rvq_nearest_ratio_mean"] = total_ratio / ratio_count
+        # Distinct code tuples in this batch
+        out["rvq_code_unique_tuples"] = int(torch.unique(codes, dim=0).shape[0])
+        return out
 
     def entropy(self, z: Tensor, tau: float = 1.0) -> Tensor:
         """Compute entropy H(pi) of the distance-based categorical, summed across levels.

@@ -68,6 +68,7 @@ class Phase2Trainer:
         metrics_path: str | None = None,
         train_loader_factory=None,
         traj_noise_sigma: float = 3.0,
+        sanity_check_interval: int = 50,
     ):
         self.model = model
         self.vqvae = vqvae
@@ -96,6 +97,7 @@ class Phase2Trainer:
         self.eval_loader_factory = eval_loader_factory
         self.eval_batches = eval_batches
         self.eval_warmup_batches = eval_warmup_batches
+        self.sanity_check_interval = sanity_check_interval
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -114,6 +116,10 @@ class Phase2Trainer:
             fused=(device.type == "cuda"))
         self.global_step = 0
 
+        # Snapshot of initial modulator weights for drift tracking.
+        # Cloned, detached, kept on-device so the per-step drift calc is cheap.
+        self._mod_w0_snapshot = [p.detach().clone() for p in self.trainable_params]
+
         # Current curriculum stage (set by run_curriculum)
         self.reward_window: int = 0
 
@@ -130,7 +136,8 @@ class Phase2Trainer:
 
     @torch.no_grad()
     def evaluate(self, eval_loader, n_batches: int = 8,
-                 warmup_batches: int = 0) -> dict:
+                 warmup_batches: int = 0, use_memory: bool = True,
+                 key_prefix: str = "eval") -> dict:
         """Held-out eval pass using the CONTINUOUS modulator path.
 
         Evaluates the underlying continuous head (forward_chunk). Complements
@@ -197,7 +204,7 @@ class Phase2Trainer:
                     e = min(s + eval_chunk_T, T_full)
                     result = model.forward_chunk(
                         input_ids_full[:, s:e], target_ids=target_ids_full[:, s:e],
-                        use_memory=True,
+                        use_memory=use_memory,
                         prev_token=effective_prev,
                     )
                     # Weighted by chunk length so the average is correct
@@ -228,15 +235,15 @@ class Phase2Trainer:
                 memory._action_buffer = saved_action_buffer
 
         if count == 0:
-            return {"eval_ce_loss": 0.0, "eval_aux_loss": 0.0,
-                    "eval_ppl": 0.0, "eval_batches": 0}
+            return {f"{key_prefix}_ce_loss": 0.0, f"{key_prefix}_aux_loss": 0.0,
+                    f"{key_prefix}_ppl": 0.0, f"{key_prefix}_batches": 0}
         avg_ce = total_ce / count
         avg_aux = total_aux / count
         return {
-            "eval_ce_loss": avg_ce,
-            "eval_aux_loss": avg_aux,
-            "eval_ppl": min(math.exp(avg_ce), 1e6),
-            "eval_batches": count,
+            f"{key_prefix}_ce_loss": avg_ce,
+            f"{key_prefix}_aux_loss": avg_aux,
+            f"{key_prefix}_ppl": min(math.exp(avg_ce), 1e6),
+            f"{key_prefix}_batches": count,
         }
 
     @torch.no_grad()
@@ -568,6 +575,28 @@ class Phase2Trainer:
         out = gathered.mean(dim=-1)                                   # [*, BS, n_calls]
         # Zero out incomplete windows.
         out = out * complete.to(out.dtype)
+
+        # H8 diagnostic: per-quartile within-window mean -CE. Measures
+        # whether the reward signal is dominated by a narrow slice of the
+        # window. Only aggregated over complete windows.
+        if not hasattr(self, "_last_window_quartile_rewards"):
+            self._last_window_quartile_rewards = None
+        if window >= 4:
+            q = window // 4
+            # gathered: [*, BS, n_calls, W]. Per-quartile mean → [*, BS, n_calls, 4]
+            quartile_means = torch.stack([
+                gathered[..., 0:q].mean(dim=-1),
+                gathered[..., q:2 * q].mean(dim=-1),
+                gathered[..., 2 * q:3 * q].mean(dim=-1),
+                gathered[..., 3 * q:].mean(dim=-1),
+            ], dim=-1)  # [*, BS, n_calls, 4]
+            # Restrict to complete windows
+            complete_mask = complete.view(*(1,) * (quartile_means.ndim - 2), -1, 1)
+            self._last_window_quartile_rewards = (
+                (quartile_means * complete_mask).sum(dim=tuple(range(quartile_means.ndim - 1)))
+                / complete_mask.sum().clamp(min=1.0)
+            ).tolist()
+
         # Move n_calls before BS: [..., n_calls, BS]
         return out.transpose(-1, -2)
 
@@ -803,6 +832,25 @@ class Phase2Trainer:
         quant_residual_sq = 0.0
         raw_action_sq = 0.0
         n_chunks = 0
+        # Per-cell log_pi accumulator [NC] — for diagnostics only (detached).
+        per_cell_log_pi_sum = torch.zeros(NC, device=self.device)
+        per_cell_count = 0
+        # One-shot RVQ diagnostic snapshot on the first chunk only.
+        rvq_diag_snapshot = None
+        # Raw-action distribution accumulator for modulator output stats.
+        raw_action_sum = torch.zeros(NC, device=self.device)
+        raw_action_sq_sum = torch.zeros(NC, device=self.device)
+        raw_action_count = 0
+        # Policy-ratio sanity check: cache per-chunk log_pi_pre so we can
+        # recompute log_pi_post after the step and correlate Δlog_pi with
+        # advantage. Only when the check fires (every sanity_check_interval
+        # steps) — otherwise we skip the caching to save memory.
+        do_sanity = (
+            self.sanity_check_interval > 0
+            and self.global_step > 0
+            and self.global_step % self.sanity_check_interval == 0
+        )
+        log_pi_pre_cache = [] if do_sanity else None
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -849,6 +897,26 @@ class Phase2Trainer:
             total_log_pi += log_pi.detach().sum().item()
             total_entropy += entropy.detach().sum().item()
 
+            if log_pi_pre_cache is not None:
+                log_pi_pre_cache.append(log_pi.detach().clone())
+
+            # Per-cell log_pi for diagnostics
+            with torch.no_grad():
+                per_cell_log_pi_sum += log_pi.detach().sum(dim=0)  # sum over C → [NC]
+                per_cell_count += C
+
+                # Raw-action distribution stats per cell
+                ra = raw_action.detach()  # [C, NC, mod_out]
+                ra_norm = ra.norm(dim=-1)  # [C, NC]
+                raw_action_sum += ra_norm.sum(dim=0)
+                raw_action_sq_sum += ra_norm.pow(2).sum(dim=0)
+                raw_action_count += C
+
+                # One-shot RVQ diagnostics on the first chunk
+                if rvq_diag_snapshot is None:
+                    rvq_diag_snapshot = self.vqvae.rvq.diagnostics(
+                        z_sample.detach(), codes_flat_flat, tau=self.tau)
+
             # Quantization residual: ||raw_action - decode(quantize(raw_action))||.
             # Measures how much information is lost through the VQ bottleneck —
             # a direct signal of continuous-vs-quantized policy divergence.
@@ -866,12 +934,64 @@ class Phase2Trainer:
             self.trainable_params, self.max_grad_norm).item()
         self.optimizer.step()
 
+        # ------------------------------------------------------------------
+        # H5 policy-ratio sanity check. Recompute log_pi on the same rollout
+        # POST-step and correlate Δlog_pi with the advantage that drove the
+        # step. A correctly-oriented GRPO gradient should *increase* log_pi
+        # for high-advantage codes → Pearson corr > 0 (ideally >> 0).
+        # Negative corr = sign bug or baseline inverted.
+        sanity_corr = float("nan")
+        sanity_delta_mean = float("nan")
+        if log_pi_pre_cache is not None:
+            with torch.no_grad():
+                log_pi_post_parts = []
+                for start in range(0, M, chunk_size):
+                    end = min(start + chunk_size, M)
+                    mi_chunk = mod_inputs_flat[start:end]
+                    c_chunk = codes_flat[start:end]
+                    C_c = mi_chunk.shape[0]
+                    raw_action2 = self.model.memory._modulator_forward(mi_chunk)
+                    action_flat2 = raw_action2.reshape(C_c * NC, -1)
+                    action_norm2 = self.vqvae.normalize(action_flat2)
+                    z2 = self.vqvae.encoder(action_norm2)
+                    if traj_noise_flat is not None:
+                        z2 = z2 + traj_noise_flat[start:end].reshape(C_c * NC, -1)
+                    codes_ff2 = c_chunk.reshape(C_c * NC, num_levels)
+                    lp2 = self.vqvae.rvq.log_prob(
+                        z2, codes_ff2, tau=self.tau).reshape(C_c, NC)
+                    log_pi_post_parts.append(lp2)
+                log_pi_pre = torch.cat(log_pi_pre_cache, dim=0)    # [M, NC]
+                log_pi_post = torch.cat(log_pi_post_parts, dim=0)  # [M, NC]
+                delta = (log_pi_post - log_pi_pre).reshape(-1)
+                adv_flat = advantages_flat.reshape(-1)
+                # Pearson correlation
+                d = delta - delta.mean()
+                a = adv_flat - adv_flat.mean()
+                denom = d.pow(2).sum().sqrt() * a.pow(2).sum().sqrt()
+                if denom > 0:
+                    sanity_corr = (d * a).sum().item() / denom.item()
+                sanity_delta_mean = delta.mean().item()
+
         # Reward distribution stats over the flattened records
         rewards = rollout_result["rewards"].float()  # [K, n_calls, BS]
         reward_mean = rewards.mean().item()
         reward_std = rewards.std().item()
         reward_min = rewards.min().item()
         reward_max = rewards.max().item()
+        # reward_mean averages across ALL (k, call, sample) entries, including
+        # incomplete-window slots that _windowed_reward zeroed out (~half of
+        # calls at seq_length=2*W). reward_mean_complete restricts the mean to
+        # live (non-zero) slots, giving the true -CE scale comparable to phase
+        # 1 loss. Group-relative centering makes the zeros gradient-harmless,
+        # so this is a logging/interpretation fix, not a gradient fix.
+        complete_mask_r = rewards.abs() > 1e-8
+        n_complete = complete_mask_r.sum().item()
+        if n_complete > 0:
+            reward_mean_complete = (rewards * complete_mask_r).sum().item() / n_complete
+            complete_fraction = n_complete / rewards.numel()
+        else:
+            reward_mean_complete = 0.0
+            complete_fraction = 0.0
 
         # K-diversity: how much do the K trajectories disagree about the
         # reward for the same (call, sample)? This is the ACTUAL signal GRPO
@@ -915,11 +1035,95 @@ class Phase2Trainer:
         raw_norm = math.sqrt(raw_action_sq / max(M * NC, 1))
         quant_relative = quant_resid_norm / max(raw_norm, 1e-8)
 
+        # -----------------------------------------------------------------
+        # Extended diagnostics (non-invasive, for probing GRPO health)
+        # -----------------------------------------------------------------
+
+        # Per-call reward breakdown: mean and K-spread per call index.
+        # Useful for checking if late calls (larger W→incomplete) look
+        # systematically different from early calls.
+        # rewards: [K, n_calls, BS]
+        per_call_reward = rewards.mean(dim=(0, 2))            # [n_calls]
+        per_call_kspread = rewards.std(dim=0, unbiased=False).mean(dim=-1)  # [n_calls]
+        # Report quartile buckets so we don't explode the jsonl per step.
+        if per_call_reward.numel() >= 4:
+            q = per_call_reward.numel() // 4
+            call_reward_q0 = per_call_reward[:q].mean().item()
+            call_reward_q3 = per_call_reward[-q:].mean().item()
+            call_kspread_q0 = per_call_kspread[:q].mean().item()
+            call_kspread_q3 = per_call_kspread[-q:].mean().item()
+        else:
+            call_reward_q0 = call_reward_q3 = per_call_reward.mean().item()
+            call_kspread_q0 = call_kspread_q3 = per_call_kspread.mean().item()
+
+        # Per-cell advantage magnitude — are all NC cells getting gradient?
+        # advantages was advantages_flat: [M, NC] already reshaped above.
+        per_cell_adv = advantages_flat.abs().mean(dim=0)       # [NC]
+        per_cell_logpi = per_cell_log_pi_sum / max(per_cell_count, 1)  # [NC]
+        per_cell_adv_min = per_cell_adv.min().item()
+        per_cell_adv_max = per_cell_adv.max().item()
+        per_cell_adv_std = per_cell_adv.std().item() if NC > 1 else 0.0
+
+        # Raw-action norm stats (modulator output magnitude per cell).
+        ra_mean = (raw_action_sum / max(raw_action_count, 1)).mean().item()
+        ra_std = (
+            (raw_action_sq_sum / max(raw_action_count, 1)
+             - (raw_action_sum / max(raw_action_count, 1)).pow(2))
+            .clamp(min=0).sqrt().mean().item())
+
+        # Code diversity across K — fraction of (call, BS, NC) slots where
+        # all K trajectories picked identical code tuples. High = ξ_k not
+        # moving the argmax boundary (degenerate slots).
+        # codes: [K, n_calls, BS, NC, L]
+        codes_t = rollout_result["codes"]
+        all_same_k = (codes_t == codes_t[0:1]).all(dim=(0, -1))  # [n_calls, BS, NC]
+        frac_all_k_same = all_same_k.float().mean().item()
+        # Mean distinct code tuples per slot
+        # Flatten K dim and count per-slot unique rows.
+        K_dim, n_calls_d, BS_d, NC_d, L_d = codes_t.shape
+        codes_per_slot = codes_t.permute(1, 2, 3, 0, 4).reshape(-1, K_dim, L_d)
+        # count_unique per slot via sort+diff trick (avoids Python loop)
+        # Here we just approximate with a scalar: mean over a subsample.
+        sub_n = min(64, codes_per_slot.shape[0])
+        idx = torch.randperm(codes_per_slot.shape[0], device=codes_t.device)[:sub_n]
+        mean_unique_per_slot = sum(
+            torch.unique(codes_per_slot[i], dim=0).shape[0] for i in idx
+        ) / max(sub_n, 1)
+
+        # -----------------------------------------------------------------
+        # H2 diagnostic: ξ_k perturbation size vs code spacing. If ξ_k is
+        # too small relative to pairwise code distance, it can't cross
+        # argmax decision boundaries → K trajectories all pick same code.
+        traj_noise_norm_mean = 0.0
+        traj_noise_vs_spacing = 0.0
+        if traj_noise is not None:
+            tn = traj_noise.detach()  # [K, BS, NC, latent]
+            tn_norm = tn.pow(2).sum(dim=-1).sqrt()  # [K, BS, NC]
+            traj_noise_norm_mean = tn_norm.mean().item()
+            # Use lvl0 spacing from the diagnostic snapshot
+            spacing = (rvq_diag_snapshot or {}).get("rvq_code_spacing_mean_lvl0", 0.0)
+            if spacing > 0:
+                traj_noise_vs_spacing = traj_noise_norm_mean / spacing
+
+        # Modulator weight drift (H3 — is GRPO moving the modulator?)
+        # mod_w0 snapshot stored at trainer init; may be None on legacy runs.
+        mod_drift_rel = 0.0
+        if getattr(self, "_mod_w0_snapshot", None) is not None:
+            with torch.no_grad():
+                drift_sq = 0.0
+                init_sq = 0.0
+                for p, p0 in zip(self.trainable_params, self._mod_w0_snapshot):
+                    drift_sq += (p - p0).pow(2).sum().item()
+                    init_sq += p0.pow(2).sum().item()
+                mod_drift_rel = math.sqrt(drift_sq) / max(math.sqrt(init_sq), 1e-8)
+
         return {
             "loss": total_loss / (M * NC),
             "log_pi_mean": total_log_pi / (M * NC),
             "entropy_mean": total_entropy / (M * NC),
             "reward_mean": reward_mean,
+            "reward_mean_complete": reward_mean_complete,
+            "complete_fraction": complete_fraction,
             "reward_std": reward_std,
             "reward_min": reward_min,
             "reward_max": reward_max,
@@ -939,6 +1143,29 @@ class Phase2Trainer:
             "n_unique_codes": n_unique,
             "quant_resid_rel": quant_relative,
             "quant_resid_abs": quant_resid_norm,
+            # --- Extended diagnostics ---
+            "call_reward_q0": call_reward_q0,
+            "call_reward_q3": call_reward_q3,
+            "call_kspread_q0": call_kspread_q0,
+            "call_kspread_q3": call_kspread_q3,
+            "per_cell_adv_min": per_cell_adv_min,
+            "per_cell_adv_max": per_cell_adv_max,
+            "per_cell_adv_std": per_cell_adv_std,
+            "raw_action_norm_mean": ra_mean,
+            "raw_action_norm_std": ra_std,
+            "frac_all_k_same_code": frac_all_k_same,
+            "mean_unique_codes_per_slot": mean_unique_per_slot,
+            "mod_drift_rel": mod_drift_rel,
+            "traj_noise_norm_mean": traj_noise_norm_mean,
+            "traj_noise_vs_spacing": traj_noise_vs_spacing,
+            "sanity_logpi_adv_corr": sanity_corr,
+            "sanity_logpi_delta_mean": sanity_delta_mean,
+            **(rvq_diag_snapshot or {}),
+            **(
+                {f"window_q{i}_reward": v
+                 for i, v in enumerate(self._last_window_quartile_rewards)}
+                if getattr(self, "_last_window_quartile_rewards", None) else {}
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -1078,8 +1305,19 @@ class Phase2Trainer:
                     self.eval_loader_factory(),
                     n_batches=self.eval_batches,
                     warmup_batches=self.eval_warmup_batches)
+                # No-memory ablation eval — tracks whether memory is still
+                # contributing at inference across phase 2 cycles. Uses a
+                # distinct key_prefix so it doesn't collide with the main
+                # eval record. Same loader + warmup for apples-to-apples.
+                no_mem_metrics = self.evaluate(
+                    self.eval_loader_factory(),
+                    n_batches=self.eval_batches,
+                    warmup_batches=self.eval_warmup_batches,
+                    use_memory=False,
+                    key_prefix="eval_no_mem")
                 print(f"[p2 eval {self.global_step}] "
                       f"ce={eval_metrics['eval_ce_loss']:.3f} "
+                      f"ce_nomem={no_mem_metrics['eval_no_mem_ce_loss']:.3f} "
                       f"q_ce={quant_metrics['quant_eval_ce']:.3f} "
                       f"ppl={eval_metrics['eval_ppl']:.1f} "
                       f"mem_pred={eval_metrics['eval_aux_loss']:.3f} "
@@ -1090,6 +1328,7 @@ class Phase2Trainer:
                     "event": "eval",
                     **eval_metrics,
                     **quant_metrics,
+                    **no_mem_metrics,
                 })
 
         elapsed = time.time() - t_stage_start
