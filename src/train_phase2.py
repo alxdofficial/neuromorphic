@@ -41,6 +41,13 @@ def parse_args():
                         "trajectory identity. Codebook inter-entry distance is "
                         "~9 in latent space; σ=3 shifts into meaningfully "
                         "different code regions. 0 disables (pure multinomial).")
+    p.add_argument("--continuous-sigma", type=float, default=None,
+                   help="Drop the VQ bottleneck entirely (option 3 experiment). "
+                        "Modulator output is treated as the mean of a Gaussian "
+                        "policy with this fixed σ. GRPO optimizes the mean "
+                        "directly. None (default) keeps the VQ pipeline. "
+                        "Typical starting values: σ=1.0 to σ=10.0 depending on "
+                        "raw_action_norm_mean (~100 for current modulator).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tokenizer", type=str, default="tinyllama")
     p.add_argument("--stage1-tokens", type=int, default=10_000_000,
@@ -245,6 +252,7 @@ def main():
         group_size=args.group_size, lr=args.lr, tau=args.tau,
         entropy_coeff=args.entropy_coeff,
         traj_noise_sigma=args.traj_noise_sigma,
+        continuous_sigma=args.continuous_sigma,
         metrics_path=metrics_path,
         eval_interval=args.eval_interval,
         eval_batches=args.eval_batches,

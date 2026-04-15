@@ -69,6 +69,7 @@ class Phase2Trainer:
         train_loader_factory=None,
         traj_noise_sigma: float = 3.0,
         sanity_check_interval: int = 50,
+        continuous_sigma: float | None = None,
     ):
         self.model = model
         self.vqvae = vqvae
@@ -98,6 +99,12 @@ class Phase2Trainer:
         self.eval_batches = eval_batches
         self.eval_warmup_batches = eval_warmup_batches
         self.sanity_check_interval = sanity_check_interval
+        # Continuous-action mode (option 3 — bypass VQ entirely). When set,
+        # the modulator output is the mean of a Gaussian policy with this
+        # fixed σ, and GRPO optimizes the mean directly. VQ normalize/
+        # encoder/codebook/decoder/denormalize are all skipped. `None`
+        # preserves the default discrete-VQ pipeline.
+        self.continuous_sigma = continuous_sigma
 
         # Freeze everything except the modulator's MLP params
         for p in model.parameters():
@@ -590,12 +597,19 @@ class Phase2Trainer:
                 gathered[..., 2 * q:3 * q].mean(dim=-1),
                 gathered[..., 3 * q:].mean(dim=-1),
             ], dim=-1)  # [*, BS, n_calls, 4]
-            # Restrict to complete windows
-            complete_mask = complete.view(*(1,) * (quartile_means.ndim - 2), -1, 1)
-            self._last_window_quartile_rewards = (
-                (quartile_means * complete_mask).sum(dim=tuple(range(quartile_means.ndim - 1)))
-                / complete_mask.sum().clamp(min=1.0)
-            ).tolist()
+            # Restrict to complete windows, then mean over all (K, BS, n_calls)
+            # slots. Denominator counts LIVE slots only: product of the
+            # leading dims times the number of complete windows.
+            complete_mask = complete.view(
+                *(1,) * (quartile_means.ndim - 2), -1, 1)
+            leading_slots = int(torch.tensor(quartile_means.shape[:-2]).prod().item())
+            live_slots = leading_slots * int(complete.sum().item())
+            if live_slots > 0:
+                self._last_window_quartile_rewards = (
+                    (quartile_means * complete_mask).sum(
+                        dim=tuple(range(quartile_means.ndim - 1)))
+                    / live_slots
+                ).tolist()
 
         # Move n_calls before BS: [..., n_calls, BS]
         return out.transpose(-1, -2)
@@ -666,7 +680,10 @@ class Phase2Trainer:
         # (k, b) gets its own perturbation vector.
         NC = mem.N_cells
         latent_dim = self.vqvae.rvq.code_dim
-        if self.traj_noise_sigma > 0:
+        # Continuous-action mode bypasses latent-space variant-B (ξ_k in z
+        # is meaningless when there's no z). Trajectory identity comes from
+        # the per-call Gaussian noise, which is independent across K.
+        if self.continuous_sigma is None and self.traj_noise_sigma > 0:
             # Sample per (k, b). Broadcast across NC since all cells share
             # the same trajectory identity within the same sample.
             traj_noise_kb = torch.randn(
@@ -682,7 +699,8 @@ class Phase2Trainer:
             H_mid, ids_exp, self.model.lm, self.vqvae,
             tau=self.tau, sample=True,
             h_mid_batch_map=h_mid_batch_map,
-            traj_noise=traj_noise)
+            traj_noise=traj_noise,
+            continuous_sigma=self.continuous_sigma)
 
         # Unpack: split K*BS back to (K, BS) using .view() so any
         # non-contiguous layout bugs raise immediately instead of silently
@@ -866,28 +884,49 @@ class Phase2Trainer:
 
             # Flatten [C, NC] -> [C*NC] for the VQ encoder
             action_flat = raw_action.reshape(C * NC, -1)
-            action_norm = self.vqvae.normalize(action_flat)
-            z = self.vqvae.encoder(action_norm)                # [C*NC, latent]
 
-            # Apply per-trajectory perturbation (fixed during rollout).
-            # log_pi is computed at z + ξ_k, matching what the rollout
-            # sampled from. Gradient flows through z (through modulator);
-            # ξ_k is detached (it's exploration noise, not a learnable param).
-            if traj_noise_flat is not None:
-                noise_chunk = traj_noise_flat[start:end].reshape(C * NC, -1)
-                z_sample = z + noise_chunk.detach()
+            if self.continuous_sigma is not None:
+                # Continuous Gaussian policy. c_chunk holds the sampled
+                # action at rollout time; compute log π(sample | μ_now, σ²)
+                # where μ_now = raw_action (gradient flows through modulator).
+                # Stand-ins: z_sample unused, codes_flat_flat unused below.
+                sample_flat = c_chunk.reshape(C * NC, -1).detach()
+                D = action_flat.shape[-1]
+                sigma = float(self.continuous_sigma)
+                # log N(x | μ, σ²I) = -0.5·||x-μ||²/σ² - 0.5·D·log(2πσ²)
+                sq_dev = (sample_flat - action_flat).pow(2).sum(dim=-1)  # [C*NC]
+                gauss_const = 0.5 * D * math.log(2.0 * math.pi * sigma ** 2)
+                log_pi = (-0.5 * sq_dev / (sigma ** 2) - gauss_const).reshape(C, NC)
+                # Gaussian entropy is constant (depends only on σ, D). Constant
+                # w.r.t. the modulator's mean → adds no gradient → set to 0.
+                entropy = torch.zeros_like(log_pi)
+                # Stand-ins so the post-step sanity path + diagnostics can still
+                # reference them without crashing.
+                z_sample = action_flat.detach()
+                codes_flat_flat = sample_flat
             else:
-                z_sample = z
+                action_norm = self.vqvae.normalize(action_flat)
+                z = self.vqvae.encoder(action_norm)                # [C*NC, latent]
 
-            # log pi(codes | z) summed across RVQ levels (on-graph through z)
-            codes_flat_flat = c_chunk.reshape(C * NC, num_levels)
-            log_pi = self.vqvae.rvq.log_prob(z_sample, codes_flat_flat, tau=self.tau)  # [C*NC]
-            log_pi = log_pi.reshape(C, NC)
+                # Apply per-trajectory perturbation (fixed during rollout).
+                # log_pi is computed at z + ξ_k, matching what the rollout
+                # sampled from. Gradient flows through z (through modulator);
+                # ξ_k is detached (it's exploration noise, not a learnable param).
+                if traj_noise_flat is not None:
+                    noise_chunk = traj_noise_flat[start:end].reshape(C * NC, -1)
+                    z_sample = z + noise_chunk.detach()
+                else:
+                    z_sample = z
 
-            # Entropy bonus: encourage policy diversity to prevent code collapse.
-            # Must be computed at z_sample (the perturbed z) to match log_pi —
-            # otherwise the entropy gradient flattens the wrong distribution.
-            entropy = self.vqvae.rvq.entropy(z_sample, tau=self.tau).reshape(C, NC)
+                # log pi(codes | z) summed across RVQ levels (on-graph through z)
+                codes_flat_flat = c_chunk.reshape(C * NC, num_levels)
+                log_pi = self.vqvae.rvq.log_prob(z_sample, codes_flat_flat, tau=self.tau)  # [C*NC]
+                log_pi = log_pi.reshape(C, NC)
+
+                # Entropy bonus: encourage policy diversity to prevent code collapse.
+                # Must be computed at z_sample (the perturbed z) to match log_pi —
+                # otherwise the entropy gradient flattens the wrong distribution.
+                entropy = self.vqvae.rvq.entropy(z_sample, tau=self.tau).reshape(C, NC)
 
             # GRPO loss - entropy bonus (normalized by full M)
             chunk_loss = (-(a_chunk * log_pi) - self.entropy_coeff * entropy).sum() / (M * NC)
@@ -912,22 +951,21 @@ class Phase2Trainer:
                 raw_action_sq_sum += ra_norm.pow(2).sum(dim=0)
                 raw_action_count += C
 
-                # One-shot RVQ diagnostics on the first chunk
-                if rvq_diag_snapshot is None:
+                # One-shot RVQ diagnostics on the first chunk (VQ mode only)
+                if self.continuous_sigma is None and rvq_diag_snapshot is None:
                     rvq_diag_snapshot = self.vqvae.rvq.diagnostics(
-                        z_sample.detach(), codes_flat_flat, tau=self.tau)
+                        z_sample.detach(), codes_flat_flat.long(), tau=self.tau)
 
-            # Quantization residual: ||raw_action - decode(quantize(raw_action))||.
-            # Measures how much information is lost through the VQ bottleneck —
-            # a direct signal of continuous-vs-quantized policy divergence.
-            with torch.no_grad():
-                lvl_idx = torch.arange(num_levels, device=z.device)
-                z_q = self.vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes_flat_flat].sum(dim=1)
-                decoded_norm = self.vqvae.decoder(z_q)
-                decoded = self.vqvae.denormalize(decoded_norm)
-                resid = (action_flat - decoded)
-                quant_residual_sq += resid.pow(2).sum().item()
-                raw_action_sq += action_flat.pow(2).sum().item()
+            # Quantization residual (VQ mode only — meaningless otherwise).
+            if self.continuous_sigma is None:
+                with torch.no_grad():
+                    lvl_idx = torch.arange(num_levels, device=action_flat.device)
+                    z_q = self.vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes_flat_flat.long()].sum(dim=1)
+                    decoded_norm = self.vqvae.decoder(z_q)
+                    decoded = self.vqvae.denormalize(decoded_norm)
+                    resid = (action_flat - decoded)
+                    quant_residual_sq += resid.pow(2).sum().item()
+                    raw_action_sq += action_flat.pow(2).sum().item()
             n_chunks += 1
 
         grad_norm = nn.utils.clip_grad_norm_(
@@ -945,6 +983,7 @@ class Phase2Trainer:
         if log_pi_pre_cache is not None:
             with torch.no_grad():
                 log_pi_post_parts = []
+                sigma = float(self.continuous_sigma) if self.continuous_sigma is not None else None
                 for start in range(0, M, chunk_size):
                     end = min(start + chunk_size, M)
                     mi_chunk = mod_inputs_flat[start:end]
@@ -952,13 +991,20 @@ class Phase2Trainer:
                     C_c = mi_chunk.shape[0]
                     raw_action2 = self.model.memory._modulator_forward(mi_chunk)
                     action_flat2 = raw_action2.reshape(C_c * NC, -1)
-                    action_norm2 = self.vqvae.normalize(action_flat2)
-                    z2 = self.vqvae.encoder(action_norm2)
-                    if traj_noise_flat is not None:
-                        z2 = z2 + traj_noise_flat[start:end].reshape(C_c * NC, -1)
-                    codes_ff2 = c_chunk.reshape(C_c * NC, num_levels)
-                    lp2 = self.vqvae.rvq.log_prob(
-                        z2, codes_ff2, tau=self.tau).reshape(C_c, NC)
+                    if sigma is not None:
+                        sample_flat2 = c_chunk.reshape(C_c * NC, -1).detach()
+                        D = action_flat2.shape[-1]
+                        sq_dev2 = (sample_flat2 - action_flat2).pow(2).sum(dim=-1)
+                        gauss_const = 0.5 * D * math.log(2.0 * math.pi * sigma ** 2)
+                        lp2 = (-0.5 * sq_dev2 / (sigma ** 2) - gauss_const).reshape(C_c, NC)
+                    else:
+                        action_norm2 = self.vqvae.normalize(action_flat2)
+                        z2 = self.vqvae.encoder(action_norm2)
+                        if traj_noise_flat is not None:
+                            z2 = z2 + traj_noise_flat[start:end].reshape(C_c * NC, -1)
+                        codes_ff2 = c_chunk.reshape(C_c * NC, num_levels).long()
+                        lp2 = self.vqvae.rvq.log_prob(
+                            z2, codes_ff2, tau=self.tau).reshape(C_c, NC)
                     log_pi_post_parts.append(lp2)
                 log_pi_pre = torch.cat(log_pi_pre_cache, dim=0)    # [M, NC]
                 log_pi_post = torch.cat(log_pi_post_parts, dim=0)  # [M, NC]
@@ -1025,9 +1071,13 @@ class Phase2Trainer:
         per_k_fields = {f"k{i}_reward": per_k_mean[i].item()
                         for i in range(per_k_mean.shape[0])}
 
-        # Codebook usage over the sampled codes (fraction of unique tuples)
-        codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
-        n_unique = torch.unique(codes_flat_all, dim=0).shape[0]
+        # Codebook usage over the sampled codes (fraction of unique tuples —
+        # VQ mode only; continuous "codes" are floats so uniqueness is trivial)
+        if self.continuous_sigma is None:
+            codes_flat_all = rollout_result["codes"].reshape(-1, num_levels)
+            n_unique = torch.unique(codes_flat_all, dim=0).shape[0]
+        else:
+            n_unique = 0
 
         # Quantization residual metrics
         import math
@@ -1056,13 +1106,13 @@ class Phase2Trainer:
             call_reward_q0 = call_reward_q3 = per_call_reward.mean().item()
             call_kspread_q0 = call_kspread_q3 = per_call_kspread.mean().item()
 
-        # Per-cell advantage magnitude — are all NC cells getting gradient?
-        # advantages was advantages_flat: [M, NC] already reshaped above.
-        per_cell_adv = advantages_flat.abs().mean(dim=0)       # [NC]
+        # Per-cell log_pi stats — are all NC cells contributing comparably?
+        # (advantages are broadcast across NC by design, so per-cell adv is
+        # trivially identical; the meaningful per-cell variation is log_pi.)
         per_cell_logpi = per_cell_log_pi_sum / max(per_cell_count, 1)  # [NC]
-        per_cell_adv_min = per_cell_adv.min().item()
-        per_cell_adv_max = per_cell_adv.max().item()
-        per_cell_adv_std = per_cell_adv.std().item() if NC > 1 else 0.0
+        per_cell_logpi_min = per_cell_logpi.min().item()
+        per_cell_logpi_max = per_cell_logpi.max().item()
+        per_cell_logpi_std = per_cell_logpi.std().item() if NC > 1 else 0.0
 
         # Raw-action norm stats (modulator output magnitude per cell).
         ra_mean = (raw_action_sum / max(raw_action_count, 1)).mean().item()
@@ -1071,24 +1121,21 @@ class Phase2Trainer:
              - (raw_action_sum / max(raw_action_count, 1)).pow(2))
             .clamp(min=0).sqrt().mean().item())
 
-        # Code diversity across K — fraction of (call, BS, NC) slots where
-        # all K trajectories picked identical code tuples. High = ξ_k not
-        # moving the argmax boundary (degenerate slots).
-        # codes: [K, n_calls, BS, NC, L]
-        codes_t = rollout_result["codes"]
-        all_same_k = (codes_t == codes_t[0:1]).all(dim=(0, -1))  # [n_calls, BS, NC]
-        frac_all_k_same = all_same_k.float().mean().item()
-        # Mean distinct code tuples per slot
-        # Flatten K dim and count per-slot unique rows.
-        K_dim, n_calls_d, BS_d, NC_d, L_d = codes_t.shape
-        codes_per_slot = codes_t.permute(1, 2, 3, 0, 4).reshape(-1, K_dim, L_d)
-        # count_unique per slot via sort+diff trick (avoids Python loop)
-        # Here we just approximate with a scalar: mean over a subsample.
-        sub_n = min(64, codes_per_slot.shape[0])
-        idx = torch.randperm(codes_per_slot.shape[0], device=codes_t.device)[:sub_n]
-        mean_unique_per_slot = sum(
-            torch.unique(codes_per_slot[i], dim=0).shape[0] for i in idx
-        ) / max(sub_n, 1)
+        # Code diversity across K — VQ-mode only (continuous "codes" are
+        # floats, discrete-equality is meaningless there).
+        frac_all_k_same = 0.0
+        mean_unique_per_slot = 0.0
+        if self.continuous_sigma is None:
+            codes_t = rollout_result["codes"]
+            all_same_k = (codes_t == codes_t[0:1]).all(dim=(0, -1))  # [n_calls, BS, NC]
+            frac_all_k_same = all_same_k.float().mean().item()
+            K_dim, n_calls_d, BS_d, NC_d, L_d = codes_t.shape
+            codes_per_slot = codes_t.permute(1, 2, 3, 0, 4).reshape(-1, K_dim, L_d)
+            sub_n = min(64, codes_per_slot.shape[0])
+            idx = torch.randperm(codes_per_slot.shape[0], device=codes_t.device)[:sub_n]
+            mean_unique_per_slot = sum(
+                torch.unique(codes_per_slot[i], dim=0).shape[0] for i in idx
+            ) / max(sub_n, 1)
 
         # -----------------------------------------------------------------
         # H2 diagnostic: ξ_k perturbation size vs code spacing. If ξ_k is
@@ -1148,9 +1195,9 @@ class Phase2Trainer:
             "call_reward_q3": call_reward_q3,
             "call_kspread_q0": call_kspread_q0,
             "call_kspread_q3": call_kspread_q3,
-            "per_cell_adv_min": per_cell_adv_min,
-            "per_cell_adv_max": per_cell_adv_max,
-            "per_cell_adv_std": per_cell_adv_std,
+            "per_cell_logpi_min": per_cell_logpi_min,
+            "per_cell_logpi_max": per_cell_logpi_max,
+            "per_cell_logpi_std": per_cell_logpi_std,
             "raw_action_norm_mean": ra_mean,
             "raw_action_norm_std": ra_std,
             "frac_all_k_same_code": frac_all_k_same,

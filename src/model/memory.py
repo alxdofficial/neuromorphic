@@ -1104,6 +1104,7 @@ class MemoryGraph(nn.Module):
         prev_token: Tensor | None = None,
         h_mid_batch_map: Tensor | None = None,
         traj_noise: Tensor | None = None,
+        continuous_sigma: float | None = None,
     ) -> dict:
         """Phase 2 rollout: run the memory loop with VQ-sampled discrete actions.
 
@@ -1287,25 +1288,46 @@ class MemoryGraph(nn.Module):
 
                 raw_action = self._modulator_forward(mod_input_f32)  # f32 out
 
-                # Normalize, encode, sample codes, decode, un-normalize (all f32)
-                action_flat = raw_action.reshape(BS * NC, -1)
-                action_norm = vqvae.normalize(action_flat)
-                z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
-                # Per-trajectory fixed perturbation: shift z by ξ_k (same ξ_k
-                # reused at every mod event within a rollout). Gives each
-                # trajectory a systematically different sampling distribution
-                # so K-states mean-revert to different equilibria.
-                if traj_noise is not None:
-                    z_sample = z + traj_noise.reshape(BS * NC, -1)
+                if continuous_sigma is not None:
+                    # Continuous-action mode (option 3): skip VQ entirely.
+                    # Policy π(a|s) = N(raw_action, σ²·I). Sample = raw +
+                    # σ · ε. In GRPO we'll compute Gaussian log-prob at
+                    # the sampled action given the (re-derived) mean.
+                    action_flat = raw_action.reshape(BS * NC, -1)
+                    if sample:
+                        eps = torch.randn_like(action_flat)
+                    else:
+                        eps = torch.zeros_like(action_flat)
+                    sampled_flat = action_flat + continuous_sigma * eps
+                    # "codes" in VQ mode holds the discretized choice; in
+                    # continuous mode we stash the sampled action itself
+                    # so grpo_step can compute a Gaussian log-prob:
+                    #     ε_new = (sample - μ_now) / σ
+                    #     log π = -½ Σ ε_new² - ½·D·log(2πσ²)
+                    # where μ_now is the modulator re-forward on mod_inputs
+                    # (with current weights).
+                    codes = sampled_flat.detach()
+                    quantized = sampled_flat.reshape(BS, NC, -1).to(dt)
                 else:
-                    z_sample = z
-                codes = vqvae.rvq.sample_codes(z_sample, tau=tau, sample=sample)  # [BS*NC, L]
-                # Reconstruct z_q from codes — vectorized across levels
-                lvl_idx = torch.arange(vqvae.rvq.num_levels, device=codes.device)
-                z_q = vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes].sum(dim=1)
-                quantized_norm = vqvae.decoder(z_q)              # [BS*NC, action_dim]
-                quantized = vqvae.denormalize(quantized_norm)
-                quantized = quantized.reshape(BS, NC, -1).to(dt)
+                    # Normalize, encode, sample codes, decode, un-normalize (all f32)
+                    action_flat = raw_action.reshape(BS * NC, -1)
+                    action_norm = vqvae.normalize(action_flat)
+                    z = vqvae.encoder(action_norm)                   # [BS*NC, latent]
+                    # Per-trajectory fixed perturbation: shift z by ξ_k (same ξ_k
+                    # reused at every mod event within a rollout). Gives each
+                    # trajectory a systematically different sampling distribution
+                    # so K-states mean-revert to different equilibria.
+                    if traj_noise is not None:
+                        z_sample = z + traj_noise.reshape(BS * NC, -1)
+                    else:
+                        z_sample = z
+                    codes = vqvae.rvq.sample_codes(z_sample, tau=tau, sample=sample)  # [BS*NC, L]
+                    # Reconstruct z_q from codes — vectorized across levels
+                    lvl_idx = torch.arange(vqvae.rvq.num_levels, device=codes.device)
+                    z_q = vqvae.rvq.codebooks[lvl_idx.unsqueeze(0), codes].sum(dim=1)
+                    quantized_norm = vqvae.decoder(z_q)              # [BS*NC, action_dim]
+                    quantized = vqvae.denormalize(quantized_norm)
+                    quantized = quantized.reshape(BS, NC, -1).to(dt)
 
                 # Unpack delta_W, delta_decay_raw and apply the same convex-EMA
                 # updates as phase 1 (so the frozen-module determinism matches).

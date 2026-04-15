@@ -46,6 +46,9 @@ def parse_args():
     p.add_argument("--phase2-stage2-tokens", type=int, default=None)
     p.add_argument("--phase2-stage3-tokens", type=int, default=None)
     p.add_argument("--phase2-stage4-tokens", type=int, default=None)
+    p.add_argument("--phase2-continuous-sigma", type=float, default=None,
+                   help="If set, phase 2 uses continuous Gaussian policy with "
+                        "this σ (bypasses VQ entirely). Forwarded to train_phase2.")
     p.add_argument("--skip-bootstrap", action="store_true",
                    help="Skip bootstrap (if already done once)")
     p.add_argument("--start-cycle", type=int, default=0,
@@ -250,9 +253,21 @@ def main():
         ):
             if v is not None:
                 phase2_cmd += [f"--stage{i}-tokens", str(v)]
+        if args.phase2_continuous_sigma is not None:
+            phase2_cmd += ["--continuous-sigma", str(args.phase2_continuous_sigma)]
         run(phase2_cmd)
 
         current_ckpt = phase2_ckpt
+
+        # Auto-regenerate the cross-cycle health dashboard after each cycle
+        # so the user can watch overall training health as it evolves.
+        # Best-effort: a plot failure should not abort the cycle loop.
+        plot_cmd = [python, "-m", "scripts.plot_health", args.work_dir,
+                    "--bs", str(args.bs)]
+        print(f"\n$ {' '.join(plot_cmd)}")
+        r = subprocess.run(plot_cmd, check=False)
+        if r.returncode != 0:
+            print(f"  (health plot regen failed, exit={r.returncode})")
 
     print(f"\n=== All cycles complete. Final checkpoint: {current_ckpt} ===")
 
