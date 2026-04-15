@@ -1306,7 +1306,10 @@ class MemoryGraph(nn.Module):
                     #     log π = -½ Σ ε_new² - ½·D·log(2πσ²)
                     # where μ_now is the modulator re-forward on mod_inputs
                     # (with current weights).
-                    codes = sampled_flat.detach()
+                    # Store sample in bf16 — action_dim is O(1000) so f32
+                    # storage at high n_calls causes OOM. bf16 has plenty
+                    # of dynamic range for log-prob reconstruction.
+                    codes = sampled_flat.detach().to(torch.bfloat16)
                     quantized = sampled_flat.reshape(BS, NC, -1).to(dt)
                 else:
                     # Normalize, encode, sample codes, decode, un-normalize (all f32)

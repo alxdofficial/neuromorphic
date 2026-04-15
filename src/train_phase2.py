@@ -49,6 +49,10 @@ def parse_args():
                         "Typical starting values: σ=1.0 to σ=10.0 depending on "
                         "raw_action_norm_mean (~100 for current modulator).")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-seed", type=int, default=0,
+                   help="Fixed seed for the eval dataloader. Independent of "
+                        "--seed so replication experiments share the same held-"
+                        "out eval set → eval_ce is apples-to-apples across seeds.")
     p.add_argument("--tokenizer", type=str, default="tinyllama")
     p.add_argument("--stage1-tokens", type=int, default=10_000_000,
                    help="Tokens at reward window 512")
@@ -237,7 +241,7 @@ def main():
         def _make_eval_loader():
             return create_dataloader(
                 phase="A-val", tokenizer=tokenizer, batch_size=eval_bs,
-                seq_length=eval_seq_length, seed=args.seed + 1000,
+                seq_length=eval_seq_length, seed=args.eval_seed,
                 max_steps=total_eval_batches)
         eval_loader_factory = _make_eval_loader
 

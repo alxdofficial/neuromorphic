@@ -890,7 +890,8 @@ class Phase2Trainer:
                 # action at rollout time; compute log π(sample | μ_now, σ²)
                 # where μ_now = raw_action (gradient flows through modulator).
                 # Stand-ins: z_sample unused, codes_flat_flat unused below.
-                sample_flat = c_chunk.reshape(C * NC, -1).detach()
+                # Stored as bf16 for memory; upcast for log-prob math.
+                sample_flat = c_chunk.reshape(C * NC, -1).detach().float()
                 D = action_flat.shape[-1]
                 sigma = float(self.continuous_sigma)
                 # log N(x | μ, σ²I) = -0.5·||x-μ||²/σ² - 0.5·D·log(2πσ²)
@@ -992,7 +993,7 @@ class Phase2Trainer:
                     raw_action2 = self.model.memory._modulator_forward(mi_chunk)
                     action_flat2 = raw_action2.reshape(C_c * NC, -1)
                     if sigma is not None:
-                        sample_flat2 = c_chunk.reshape(C_c * NC, -1).detach()
+                        sample_flat2 = c_chunk.reshape(C_c * NC, -1).detach().float()
                         D = action_flat2.shape[-1]
                         sq_dev2 = (sample_flat2 - action_flat2).pow(2).sum(dim=-1)
                         gauss_const = 0.5 * D * math.log(2.0 * math.pi * sigma ** 2)
@@ -1080,7 +1081,6 @@ class Phase2Trainer:
             n_unique = 0
 
         # Quantization residual metrics
-        import math
         quant_resid_norm = math.sqrt(quant_residual_sq / max(M * NC, 1))
         raw_norm = math.sqrt(raw_action_sq / max(M * NC, 1))
         quant_relative = quant_resid_norm / max(raw_norm, 1e-8)
