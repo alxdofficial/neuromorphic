@@ -83,14 +83,11 @@ def main():
     # target = start_step + steps_to_run.
     cumulative_step = 0
 
-    # LR schedule target: the cosine decays from warmup over this many
-    # OPTIMIZER steps (not wall-clock steps). Action collection runs in
-    # --no-train mode and doesn't count as optimizer updates. Computed
-    # once so the schedule is the same across all phase 1 calls.
-    phase1_main_steps_per_cycle = tokens_to_steps(
-        args.phase1_tokens_per_cycle - args.action_collection_tokens, args.bs)
+    # LR schedule target: cosine decays over this many optimizer steps.
+    # Same schedule across all phase-1 calls (bootstrap + cycles).
+    phase1_steps_per_cycle = tokens_to_steps(args.phase1_tokens_per_cycle, args.bs)
     bootstrap_steps = tokens_to_steps(args.bootstrap_tokens, args.bs)
-    lr_target_step = bootstrap_steps + args.cycles * phase1_main_steps_per_cycle
+    lr_target_step = bootstrap_steps + args.cycles * phase1_steps_per_cycle
     print(f"LR schedule target (total optimizer steps across all phase-1 "
           f"calls): {lr_target_step:,}")
 

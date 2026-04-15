@@ -751,11 +751,9 @@ class MemoryGraph(nn.Module):
 
         out = self._modulator_forward(mod_input, phase=phase)
         output = out["action"]  # [BS, NC, mod_out]
-        codes = out["codes"]    # [BS, NC] long
-
-        # Track code usage during phase-1 for dead-code resampling diagnostics
-        if phase == "phase1" and self.training:
-            self.discrete_policy.update_usage(codes.detach())
+        # Code-usage tracking (for dead-code reset) would go here, but
+        # torch.bincount breaks torch.compile's tracing. Re-wire from
+        # outside the compile boundary if/when we need dead-code reset.
 
         delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N)
         delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N)
