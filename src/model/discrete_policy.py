@@ -11,11 +11,13 @@ Key architectural commitments (see docs/design.md + chat log):
 - Shared codebook + decoder: all cells draw from one vocabulary of K
   "memory-update templates." Simpler + prevents under-training per-cell codes.
 - Phase 1 (end-to-end backprop): Gumbel-softmax with temperature τ for
-  differentiable sampling. τ anneal 1.0→0.3 during bootstrap.
+  differentiable sampling. τ anneals 1.0→0.3 over the LR schedule (set
+  by train.py's step_callback; see `MemoryGraph.gumbel_tau`).
 - Phase 2 (GRPO): hard Categorical sampling, log_prob via standard log_softmax.
   Codebook + decoder frozen; only logit_head trains.
-- Dead-code reset: during bootstrap only, every N steps, codes with low usage
-  are reinitialized.
+- Dead-code reset: wired in train.py bootstrap step_callback only (cycle
+  phase 1 + phase 2 have the codebook frozen, so no reset is needed or
+  useful there).
 """
 
 from __future__ import annotations
@@ -157,8 +159,13 @@ class DiscreteActionPolicy(nn.Module):
             codes: [B, NC] long
             log_pi: [B, NC] — log-prob of sampled codes under softmax(logits/tau)
         """
-        log_probs = F.log_softmax(logits / tau, dim=-1)
-        probs = log_probs.exp()
+        # Use F.softmax directly for multinomial (avoids the log→exp
+        # round-trip which loses precision in bf16 for low-prob codes).
+        # Keep log_softmax separately for log_pi, which is what the GRPO
+        # gradient pass consumes.
+        scaled = logits / tau
+        probs = F.softmax(scaled, dim=-1)
+        log_probs = F.log_softmax(scaled, dim=-1)
         B, NC, K = probs.shape
         codes = torch.multinomial(probs.reshape(-1, K), 1).reshape(B, NC)
         log_pi = log_probs.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
@@ -210,10 +217,18 @@ class DiscreteActionPolicy(nn.Module):
 
         phase: "phase1" (Gumbel-softmax, differentiable) or
                "phase2" (hard Categorical sampling).
+
+        Eval-mode bypass: when not self.training, both phases take the
+        deterministic argmax path — no Gumbel noise, no Categorical sample.
+        This keeps eval_ce and phase-2 warmup reproducible across runs.
         """
         logits = self.compute_logits(mod_input)
 
-        if phase == "phase1":
+        if not self.training:
+            codes = logits.argmax(dim=-1)
+            action = self.decode(codes)
+            log_pi = self.log_prob(logits, codes, tau=tau)
+        elif phase == "phase1":
             soft, codes = self.sample_gumbel_soft(logits, tau=tau, hard=hard_gumbel)
             action = self.decode_soft(soft)
             # log_prob for logging (not gradient-carrying)
@@ -236,23 +251,42 @@ class DiscreteActionPolicy(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def update_usage(self, codes: Tensor, decay: float = 0.99):
-        """EMA-track code usage counts. Call during bootstrap."""
-        counts = torch.bincount(codes.reshape(-1), minlength=self.K).float()
+    def update_usage(self, codes: Tensor, decay: float = 0.9999):
+        """EMA-track code usage counts. Call during bootstrap.
+
+        Default decay=0.9999 is tuned for the per-modulation-event call
+        frequency (T/mod_interval ≈ 32 per training step), giving a
+        per-update half-life of ~6930 updates ≈ 217 training steps.
+        That matches the reset cadence (every 500 steps) so "dead" is
+        judged over roughly the last reset cycle, not the last few batches.
+
+        Uses one_hot + sum instead of torch.bincount — the latter has a
+        data-dependent output shape (minlength is only a floor, not a
+        fixed shape), which breaks torch.compile's static-shape tracing.
+        """
+        flat = codes.reshape(-1).long()
+        # one_hot has static output shape [N, K] when num_classes is given,
+        # so the whole thing is safe to trace through torch.compile.
+        counts = F.one_hot(flat, num_classes=self.K).sum(dim=0).float()
         self.usage_count.mul_(decay).add_(counts, alpha=1 - decay)
-        self.usage_total.mul_(decay).add_(
-            torch.tensor([float(codes.numel())], device=codes.device),
-            alpha=1 - decay)
+        # scalar .add_ keeps us off a per-call torch.tensor allocation.
+        self.usage_total.mul_(decay).add_(float(flat.numel()) * (1 - decay))
 
     @torch.no_grad()
     def reset_dead_codes(
         self, threshold: float = 0.001, noise_std: float = 0.01,
+        optimizer: torch.optim.Optimizer | None = None,
     ) -> int:
         """Reinitialize codes whose usage fraction is below threshold.
 
         Dead codes are replaced with perturbed copies of randomly-chosen
         active codes. Returns count of codes reset. Call this periodically
         during BOOTSTRAP only (never in cycle phase 1 or 2, once frozen).
+
+        If `optimizer` is provided, the AdamW first/second moments for the
+        reset rows are zeroed. Without this, stale momentum would drag the
+        freshly-seeded codes right back toward their old identities over
+        the next few steps, defeating the reset.
         """
         total = self.usage_total.clamp(min=1.0).item()
         usage_frac = self.usage_count / total
@@ -267,4 +301,13 @@ class DiscreteActionPolicy(nn.Module):
         self.codebook[dead] = self.codebook[donor_idx] + noise
         # Reset usage counts for resampled codes to give them a fair chance
         self.usage_count[dead] = self.usage_count[active].mean()
+        # Clear AdamW state for reset rows so momentum doesn't drag them
+        # back toward their pre-reset identities.
+        if optimizer is not None:
+            state = optimizer.state.get(self.codebook)
+            if state is not None:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    moment = state.get(key)
+                    if moment is not None:
+                        moment[dead] = 0.0
         return int(dead.numel())

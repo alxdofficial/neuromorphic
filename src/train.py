@@ -317,12 +317,17 @@ def main():
 
     def save_checkpoint(step):
         path = os.path.join(args.save_dir, f"ckpt_{step:06d}.pt")
+        tmp = path + ".tmp"
         # Mark the true consumer position + consumer-side prev_tokens before
         # dumping dataloader state. This decouples the checkpoint from the
         # prefetch thread's runahead (both step count and prev_tokens).
         if hasattr(dataloader, "mark_consumed"):
             consumer_prev = getattr(trainer, "last_consumed_prev_tokens", None)
             dataloader.mark_consumed(step - start_step, prev_tokens=consumer_prev)
+        # Write to a temp path then atomic-rename. Prevents a SIGKILL/OOM
+        # mid-write from leaving a truncated file at the canonical name —
+        # train_loop.py's latest-ckpt scan would otherwise pick it up and
+        # hand a corrupt file to the next cycle.
         torch.save({
             "step": step,
             "optimizer_step": trainer.optimizer_step,
@@ -334,7 +339,8 @@ def main():
                 dataloader.state_dict() if hasattr(dataloader, "state_dict") else {}
             ),
             "config": config,
-        }, path)
+        }, tmp)
+        os.replace(tmp, path)
         print(f"  Saved checkpoint: {path}")
         # Also regenerate plots from the current jsonl so the user has an
         # always-fresh visual after each save. Done in a try/except so a
@@ -359,8 +365,39 @@ def main():
         except Exception as e:
             print(f"  (plot regen failed: {e})")
 
+    # Gumbel τ schedule: linear anneal 1.0 → 0.3 across the LR horizon.
+    # Lower τ → more peaked soft distribution → closer match to phase-2
+    # hard sampling. Held at 0.3 once the schedule completes.
+    lr_horizon = args.lr_target_step or args.steps
+    dp = getattr(model.memory, "discrete_policy", None)
+    # Dead-code reset cadence (bootstrap only; cycle phase 1 freezes the
+    # codebook, so a reset there would invalidate phase-2 code semantics).
+    RESET_INTERVAL = 500
+    RESET_WARMUP = 500
+    codebook_trainable = (
+        dp is not None and dp.codebook.requires_grad)
+
     def step_callback(metrics):
         step = trainer.global_step
+
+        # Anneal Gumbel τ each step.
+        if dp is not None:
+            progress = min(trainer.optimizer_step / max(lr_horizon, 1), 1.0)
+            model.memory.gumbel_tau = 1.0 - 0.7 * progress  # 1.0 → 0.3
+
+        # Periodic dead-code reset during bootstrap only. Pass the
+        # optimizer so AdamW momentum for reset rows gets zeroed alongside
+        # the codebook values — otherwise stale momentum would drag the
+        # freshly-seeded codes back toward their old identities.
+        if (codebook_trainable
+                and step > RESET_WARMUP
+                and step % RESET_INTERVAL == 0):
+            n_reset = dp.reset_dead_codes(
+                threshold=0.001, noise_std=0.01, optimizer=optimizer)
+            if n_reset > 0:
+                print(f"[step {step}] reset {n_reset} dead codes "
+                      f"(of {dp.K} total)")
+
         if step % args.log_interval == 0:
             print(f"[step {step}] loss={metrics['loss']:.3f} "
                   f"ppl={metrics['ppl']:.1f} "
@@ -370,7 +407,8 @@ def main():
                   f"mod_gn={metrics['mod_clip_norm']:.3f} "
                   f"a_norm={metrics['mod_action_norm']:.4f} "
                   f"W_off={metrics.get('W_offdiag_norm', 0):.3f} "
-                  f"h={metrics.get('h_norm', 0):.3f}")
+                  f"h={metrics.get('h_norm', 0):.3f} "
+                  f"τ={model.memory.gumbel_tau:.3f}")
         if (
             eval_loader_factory is not None
             and args.eval_interval > 0
@@ -402,9 +440,21 @@ def main():
         if step % args.save_interval == 0 and step > 0:
             save_checkpoint(step)
 
-    print(f"\nTraining for {remaining_steps} steps...")
+    # Prime gumbel_tau once before the first train step so cycle-phase-1
+    # resumes don't waste a step at the default τ=1.0 when the schedule
+    # has already advanced.
+    if dp is not None:
+        progress = min(trainer.optimizer_step / max(lr_horizon, 1), 1.0)
+        model.memory.gumbel_tau = 1.0 - 0.7 * progress
+
+    print(f"\nTraining for {remaining_steps} steps (initial τ={model.memory.gumbel_tau:.3f})...")
     trainer.train_epoch(remaining_steps, step_callback=step_callback)
-    save_checkpoint(trainer.global_step)
+    # step_callback already saved if the final step lands on a save boundary
+    # (train_loop.py wires --save-interval == final step). Avoid a duplicate
+    # ~880 MB write.
+    final_step = trainer.global_step
+    if final_step > 0 and final_step % args.save_interval != 0:
+        save_checkpoint(final_step)
 
     if args.collect_actions and args.action_db_out:
         os.makedirs(os.path.dirname(args.action_db_out) or ".", exist_ok=True)

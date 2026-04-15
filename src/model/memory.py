@@ -74,8 +74,12 @@ class MemoryGraph(nn.Module):
             logit_hidden=Hmod,
             decoder_hidden=getattr(config, "decoder_hidden", 128),
         )
-        # Gumbel-softmax temperature for phase 1 backprop. Set externally
-        # (train.py can anneal 1.0 → 0.3 over bootstrap). Unused in phase 2.
+        # Gumbel-softmax temperature for phase 1 backprop. Mutated by
+        # train.py's step_callback — linearly anneals 1.0 → 0.3 across
+        # the LR schedule (same horizon as the cosine decay). Unused in
+        # phase 2 (hard Categorical). Lower τ makes the soft distribution
+        # more peaked, matching the hard sample behavior that phase 2
+        # rollouts will use.
         self.gumbel_tau = 1.0
 
         # Learnable per-cell decay rate for the Hebbian co-activation trace.
@@ -371,6 +375,12 @@ class MemoryGraph(nn.Module):
             BS, self.N_cells, 1, device=device, dtype=dt)).to(device)
         self.hebbian = state.get("hebbian", torch.zeros(
             BS, self.N_cells, self.C_n, self.C_n, device=device, dtype=dt)).to(device)
+        # Clear action-collection state on restore: a checkpoint saved
+        # mid-collection leaves the buffer attached, and loading it back
+        # would silently interleave stale actions with any new collection
+        # after the restore.
+        self._collecting_actions = False
+        self._action_buffer = []
         self._initialized = True
 
     # ================================================================
@@ -751,9 +761,13 @@ class MemoryGraph(nn.Module):
 
         out = self._modulator_forward(mod_input, phase=phase)
         output = out["action"]  # [BS, NC, mod_out]
-        # Code-usage tracking (for dead-code reset) would go here, but
-        # torch.bincount breaks torch.compile's tracing. Re-wire from
-        # outside the compile boundary if/when we need dead-code reset.
+        # Track code usage for dead-code detection. Only meaningful when the
+        # codebook is trainable (bootstrap) — cycle phase 1 and phase 2
+        # freeze the codebook, so the counts still accumulate but
+        # reset_dead_codes is never invoked from the train driver. Uses
+        # one_hot+sum (not bincount) to stay compile-safe inside _run_block.
+        if self.training and phase == "phase1":
+            self.discrete_policy.update_usage(out["codes"])
 
         delta_W_raw = output[..., :N * N].reshape(BS, NC, N, N)
         delta_decay_raw = output[..., N * N:N * N + N].reshape(BS, NC, N)
@@ -1056,12 +1070,16 @@ class MemoryGraph(nn.Module):
 
             readouts[:, start_t:end_t] = block_out
 
-        # Save state
-        self.h = h
-        self.msg = msg
-        self.W = W
-        self.decay = decay
-        self.hebbian = hebbian
+        # Save state. Detach explicitly so callers without a following
+        # backward + detach_states() (eval, action-collection, inference)
+        # don't accumulate autograd history across segments. The normal
+        # training loop also calls detach_states() between steps, so this
+        # is defensive rather than correctness-critical for TBPTT.
+        self.h = h.detach()
+        self.msg = msg.detach()
+        self.W = W.detach()
+        self.decay = decay.detach()
+        self.hebbian = hebbian.detach()
         self.s_mem_live = s_mem_live.detach()
         self.s_mem_ema_fast = s_mem_ema_fast.detach()
         self.prev_readout = prev_readout_full.detach()
@@ -1109,7 +1127,6 @@ class MemoryGraph(nn.Module):
         lm,
         tau: float = 1.0,
         sample: bool = True,
-        prev_token: Tensor | None = None,
         h_mid_batch_map: Tensor | None = None,
     ) -> dict:
         """Phase 2 rollout: direct categorical sampling from discrete policy.
@@ -1337,6 +1354,13 @@ class MemoryGraph(nn.Module):
                 dim=-1, keepdim=True).to(dt)
             prev_readout_full = readout
             # W stays at ~unit per-row RMS via convex-EMA in _modulate_cells.
+
+        # Flush any buffered surprise tail so s_mem_live/s_mem_ema_fast
+        # reflect the last tokens of this rollout, not the last modulation
+        # boundary. Without this, if T is not a multiple of mod_interval,
+        # the final (T mod M) tokens are ignored when persisting state and
+        # the next rollout starts from stale surprise.
+        _flush_surprise()
 
         # Persist end-of-rollout memory state so the next rollout continues
         # from here (memory is lifelong across rollouts too).

@@ -90,6 +90,33 @@ def get(records, key):
     return [r[key] for r in records if key in r and r[key] is not None]
 
 
+def _make_eval_x(train_steps):
+    """Return a function mapping eval step-numbers to x-axis positions.
+
+    Since the train plots use index positions (0, 1, 2, ...) on the x-axis,
+    we need to project each eval row's step number onto the nearest train-row
+    position. Uses bisect so eval dots land in the right place even when
+    steps don't align exactly — e.g. a resume drops an eval row whose step
+    wasn't recorded in this train_rows slice.
+    """
+    import bisect
+    if not train_steps:
+        return lambda xs: list(xs)
+    sorted_steps = sorted(train_steps)
+    step_to_idx = {s: i for i, s in enumerate(train_steps)}
+    def mapper(xs):
+        out = []
+        for s in xs:
+            if s in step_to_idx:
+                out.append(step_to_idx[s])
+            else:
+                j = bisect.bisect_left(sorted_steps, s)
+                j = min(j, len(sorted_steps) - 1)
+                out.append(step_to_idx[sorted_steps[j]])
+        return out
+    return mapper
+
+
 def plot_line(ax, vals, color, label=None, **kwargs):
     arr = np.asarray(vals, dtype=float)
     if arr.size == 0:
@@ -142,17 +169,20 @@ def plot_phase1_training(records, output_path):
         plot_line(axes[0, 0], get(train_rows, "aux_loss"), C["aux"],
                   "train mem_pred")
         if eval_rows:
-            eval_steps = [r["step"] for r in eval_rows]
-            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
-            eval_aux = [r["eval_aux_loss"] for r in eval_rows]
             train_steps = [r.get("step", i) for i, r in enumerate(train_rows)]
-            if train_steps:
-                idx_by_step = {s: i for i, s in enumerate(train_steps)}
-                eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
-                axes[0, 0].plot(eval_x, eval_ce, color=C["loss"],
+            ce_pairs = [(r["step"], r["eval_ce_loss"]) for r in eval_rows
+                        if r.get("eval_ce_loss") is not None]
+            aux_pairs = [(r["step"], r["eval_aux_loss"]) for r in eval_rows
+                         if r.get("eval_aux_loss") is not None]
+            eval_x_for = _make_eval_x(train_steps)
+            if ce_pairs:
+                xs, ys = zip(*ce_pairs)
+                axes[0, 0].plot(eval_x_for(xs), ys, color=C["loss"],
                                 linestyle="none", marker="o", markersize=6,
                                 label="eval ce", alpha=0.9)
-                axes[0, 0].plot(eval_x, eval_aux, color=C["aux"],
+            if aux_pairs:
+                xs, ys = zip(*aux_pairs)
+                axes[0, 0].plot(eval_x_for(xs), ys, color=C["aux"],
                                 linestyle="none", marker="s", markersize=6,
                                 label="eval mem_pred", alpha=0.9)
         axes[0, 0].legend()
@@ -187,7 +217,8 @@ def plot_phase1_gradients(records, output_path):
         fig.suptitle("Phase 1 Gradient Health", fontsize=14, fontweight="bold")
 
         plot_line(axes[0, 0], get(records, "lm_grad_norm"), C["lm_grad"], "LM")
-        plot_line(axes[0, 0], get(records, "mem_grad_norm"), C["mem_grad"], "Memory")
+        plot_line(axes[0, 0], get(records, "dyn_grad_norm"), C["mem_grad"],
+                  "Dynamics")
         plot_line(axes[0, 0], get(records, "mod_grad_norm"), C["mod_grad"], "Modulator")
         axes[0, 0].legend()
         setup(axes[0, 0], "Group Gradient Norms (post-clip)", "L2")
@@ -310,11 +341,10 @@ def plot_phase1_memory(records, output_path):
         # Memory leverage: eval CE with memory off vs on. Positive = memory
         # helps; zero/negative = memory is not being used or hurts.
         if eval_rows:
-            leverages = [r.get("mem_leverage_ce") for r in eval_rows
-                         if r.get("mem_leverage_ce") is not None]
-            eval_steps = [r["step"] for r, lv in zip(eval_rows, leverages)
-                          if lv is not None]
-            if leverages:
+            pairs = [(r["step"], r["mem_leverage_ce"]) for r in eval_rows
+                     if r.get("mem_leverage_ce") is not None]
+            if pairs:
+                eval_steps, leverages = zip(*pairs)
                 axes[3, 1].plot(eval_steps, leverages,
                                 color=C["mem_grad"], marker="o",
                                 markersize=5, linewidth=1.5)
@@ -337,7 +367,7 @@ def plot_phase1_memory(records, output_path):
 def plot_phase2_grpo(records, output_path):
     train_rows, eval_rows = split_train_eval(records)
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(4, 3, figsize=(18, 18))
+        fig, axes = plt.subplots(5, 3, figsize=(18, 22))
         fig.suptitle(f"Phase 2 GRPO ({len(train_rows)} train / "
                      f"{len(eval_rows)} eval)",
                      fontsize=14, fontweight="bold")
@@ -345,17 +375,23 @@ def plot_phase2_grpo(records, output_path):
         # (0,0) Policy loss + eval overlay
         plot_line(axes[0, 0], get(train_rows, "loss"), C["loss"], "grpo loss")
         if eval_rows:
-            eval_steps = [r["step"] for r in eval_rows]
-            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
-            eval_aux = [r["eval_aux_loss"] for r in eval_rows]
             train_steps = [r.get("step", i) for i, r in enumerate(train_rows)]
-            idx_by_step = {s: i for i, s in enumerate(train_steps)}
-            eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
+            eval_x_for = _make_eval_x(train_steps)
+            ce_pairs = [(r["step"], r["eval_ce_loss"]) for r in eval_rows
+                        if r.get("eval_ce_loss") is not None]
+            aux_pairs = [(r["step"], r["eval_aux_loss"]) for r in eval_rows
+                         if r.get("eval_aux_loss") is not None]
             ax2 = axes[0, 0].twinx()
-            ax2.plot(eval_x, eval_ce, color=C["aux"], marker="o", markersize=5,
-                     linestyle="--", label="eval ce")
-            ax2.plot(eval_x, eval_aux, color=C["loss"], marker="s", markersize=5,
-                     linestyle=":", label="eval mem_pred")
+            if ce_pairs:
+                xs, ys = zip(*ce_pairs)
+                ax2.plot(eval_x_for(xs), ys, color=C["aux"],
+                         marker="o", markersize=5,
+                         linestyle="--", label="eval ce")
+            if aux_pairs:
+                xs, ys = zip(*aux_pairs)
+                ax2.plot(eval_x_for(xs), ys, color=C["loss"],
+                         marker="s", markersize=5,
+                         linestyle=":", label="eval mem_pred")
             ax2.legend(loc="upper right", fontsize=7)
             ax2.set_ylabel("eval (nats)")
         axes[0, 0].legend(loc="upper left", fontsize=7)
@@ -424,15 +460,13 @@ def plot_phase2_grpo(records, output_path):
             axes[2, 2].plot(windows, color=C["codes"], linewidth=2.0)
         setup(axes[2, 2], "Curriculum Window W", "tokens")
 
-        # (3,0) Quantization residual (continuous vs quantized proxy drift).
-        # High relative residual = VQ is losing info, GRPO optimizing a
-        # different policy than the continuous modulator.
-        qr = get(tr, "quant_resid_rel")
-        if qr:
-            plot_line(axes[3, 0], qr, C["mod_grad"], "rel")
-            axes[3, 0].axhline(0.3, color="red", lw=0.5, ls="--", alpha=0.5)
-        setup(axes[3, 0], "Quantization Residual (rel)",
-              "||raw-dec(q)|| / ||raw||")
+        # (3,0) Modulator drift from init — how far has GRPO pushed the
+        # logit head from the bootstrap-trained start?
+        drift = get(tr, "mod_drift_rel")
+        if drift:
+            plot_line(axes[3, 0], drift, C["mod_grad"])
+        setup(axes[3, 0], "Modulator Drift (||w - w0|| / ||w0||)",
+              "relative drift")
 
         # (3,1) Proxy alignment: reward trend vs eval CE trend.
         # If reward improves but eval CE doesn't, GRPO is drifting.
@@ -448,16 +482,16 @@ def plot_phase2_grpo(records, output_path):
             train_steps = [r.get("step", i) for i, r in enumerate(tr)]
             plot_line(axes[3, 1], _norm(reward), C["reward"],
                       "reward (↑ better)")
-            eval_steps = [r["step"] for r in eval_rows]
-            eval_ce = [r["eval_ce_loss"] for r in eval_rows]
-            # Plot eval CE inverted so ↑ = better, on same normalized axis.
-            eval_neg = [-x for x in eval_ce]
-            idx_by_step = {s: i for i, s in enumerate(train_steps)}
-            eval_x = [idx_by_step.get(s, i) for i, s in enumerate(eval_steps)]
-            axes[3, 1].plot(eval_x, _norm(eval_neg),
-                            color=C["aux"], marker="o", markersize=4,
-                            linestyle="--", label="-eval ce (↑ better)")
-            axes[3, 1].legend(loc="lower right", fontsize=7)
+            ce_pairs = [(r["step"], r["eval_ce_loss"]) for r in eval_rows
+                        if r.get("eval_ce_loss") is not None]
+            if ce_pairs:
+                xs, ys = zip(*ce_pairs)
+                eval_neg = [-y for y in ys]
+                eval_x = _make_eval_x(train_steps)(xs)
+                axes[3, 1].plot(eval_x, _norm(eval_neg),
+                                color=C["aux"], marker="o", markersize=4,
+                                linestyle="--", label="-eval ce (↑ better)")
+                axes[3, 1].legend(loc="lower right", fontsize=7)
         setup(axes[3, 1], "Proxy Alignment (normalized)", "[0,1]")
 
         # (3,2) Policy entropy — exploration health.
@@ -465,6 +499,42 @@ def plot_phase2_grpo(records, output_path):
         if ent:
             plot_line(axes[3, 2], ent, C["log_pi"])
         setup(axes[3, 2], "Policy Entropy (per-record)", "nats")
+
+        # (4,0) GRPO sanity: correlation between Δlog_pi (post-step minus
+        # pre-step log-prob of the sampled codes) and advantage. Should be
+        # POSITIVE — advantages with higher value should push log_pi up.
+        # Zero or negative = the gradient isn't moving the policy in the
+        # direction of reward. Logged every `sanity_check_interval` steps;
+        # is NaN on off-interval steps, so filter.
+        sc = [r.get("sanity_logpi_adv_corr") for r in tr
+              if r.get("sanity_logpi_adv_corr") is not None
+              and np.isfinite(r["sanity_logpi_adv_corr"])]
+        if sc:
+            axes[4, 0].plot(sc, color=C["reward"], marker=".", markersize=4,
+                            linewidth=0.8)
+            axes[4, 0].axhline(0, color="red", ls="--", lw=0.5, alpha=0.5)
+        setup(axes[4, 0], "GRPO Sanity: corr(Δlog π, advantage)",
+              "corr (should be > 0)")
+
+        # (4,1) Per-cell log_pi spread — how distinct are the NC cells'
+        # policies? Very low = all cells picking the same code patterns.
+        pcstd = get(tr, "per_cell_logpi_std")
+        if pcstd:
+            plot_line(axes[4, 1], pcstd, C["codes"])
+        setup(axes[4, 1], "Per-cell log π spread",
+              "std(mean log π) across cells")
+
+        # (4,2) Reward with vs without the complete-window mask. These
+        # diverge when many calls have truncated windows (end of rollout);
+        # the gap shows how much the naive mean is diluted.
+        rm = get(tr, "reward_mean")
+        rmc = get(tr, "reward_mean_complete")
+        if rm:
+            plot_line(axes[4, 2], rm, C["reward"], "mean (all)", linestyle=":")
+        if rmc:
+            plot_line(axes[4, 2], rmc, C["reward"], "mean (complete)")
+        axes[4, 2].legend(fontsize=7)
+        setup(axes[4, 2], "Reward — All vs Complete-window", "reward")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
@@ -481,7 +551,7 @@ def plot_phase2_diversity(records, output_path):
     """
     train_rows, _ = split_train_eval(records)
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+        fig, axes = plt.subplots(4, 2, figsize=(14, 18))
         fig.suptitle(f"Phase 2 Trajectory Diversity ({len(train_rows)} train)",
                      fontsize=14, fontweight="bold")
         tr = train_rows
@@ -490,23 +560,24 @@ def plot_phase2_diversity(records, output_path):
         # This is the gradient signal strength. Near zero means all K give
         # the same reward — no learning signal. Healthy: > 0.1.
         k_spread = get(tr, "k_spread_mean")
-        k_spread_max = get(tr, "k_spread_max")
         if k_spread:
             plot_line(axes[0, 0], k_spread, C["reward"], "mean")
-            if k_spread_max:
-                plot_line(axes[0, 0], k_spread_max, C["reward"],
-                          "max", linestyle="--", alpha=0.5)
             axes[0, 0].axhline(0.1, color="red", ls="--", lw=0.5, alpha=0.5)
             axes[0, 0].legend()
         setup(axes[0, 0], "K-spread (std across K trajectories)",
               "reward std per slot")
 
-        # (0,1) Best-vs-worst range: how much does best-of-K beat worst?
-        # High means GRPO has room to push toward the better policy.
-        k_range = get(tr, "k_range_mean")
-        if k_range:
-            plot_line(axes[0, 1], k_range, C["reward"])
-        setup(axes[0, 1], "K-range (best_K - worst_K)", "reward delta")
+        # (0,1) Fraction of modulation events with a full (non-truncated)
+        # reward window. Drops sharply at curriculum transitions when T is
+        # small relative to W. If persistently <0.4 for a stage, most calls
+        # are learning from zero-masked advantages.
+        cf = get(tr, "complete_fraction")
+        if cf:
+            plot_line(axes[0, 1], cf, C["reward"])
+            axes[0, 1].axhline(0.5, color="gray", ls="--", lw=0.5, alpha=0.5)
+            axes[0, 1].set_ylim(0, 1.05)
+        setup(axes[0, 1], "Complete-window Fraction",
+              "frac of calls with full W")
 
         # (1,0) Per-K mean reward. If one K consistently dominates, the
         # sampling distribution may have collapsed.
@@ -555,6 +626,37 @@ def plot_phase2_diversity(records, output_path):
             plot_line(axes[2, 1], ratio, C["reward"])
         setup(axes[2, 1], "Reward Variance Composition",
               "global_std / K_spread")
+
+        # (3,0) Fraction of slots where ALL K picked the same code per cell.
+        # Approaching 1 = the policy has collapsed onto a single code per
+        # cell (no exploration); GRPO has no gradient signal. Stays below
+        # ~0.5 for a healthy run.
+        fsame = get(tr, "frac_all_k_same_code")
+        if fsame:
+            plot_line(axes[3, 0], fsame, C["codes"])
+            axes[3, 0].axhline(0.5, color="red", ls="--", lw=0.5, alpha=0.5)
+            axes[3, 0].set_ylim(0, 1.05)
+        setup(axes[3, 0], "Fraction all-K-same-code (policy collapse)",
+              "fraction")
+
+        # (3,1) Windowed-reward quartiles: how does reward change across the
+        # W-token horizon? The first quartile is just after the modulator
+        # call, the last is window_size tokens later. If all quartiles
+        # track together the policy isn't differentiating near vs far
+        # effects; spread indicates the modulator is shaping horizon-dependent
+        # dynamics.
+        q_keys = [f"window_q{i}_reward" for i in range(4)]
+        q_colors = [plt.cm.viridis(i / 3) for i in range(4)]
+        any_q = False
+        for key, color, lbl in zip(q_keys, q_colors,
+                                    ["q0 (near)", "q1", "q2", "q3 (far)"]):
+            vals = get(tr, key)
+            if vals:
+                any_q = True
+                plot_line(axes[3, 1], vals, color, lbl)
+        if any_q:
+            axes[3, 1].legend(fontsize=7)
+        setup(axes[3, 1], "Reward-Window Quartiles (near → far)", "reward")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)

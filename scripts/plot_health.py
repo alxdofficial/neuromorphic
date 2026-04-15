@@ -45,13 +45,30 @@ def load_jsonl(path):
 
 
 def smooth(y, window=50):
+    """Moving-average that preserves length and handles edges.
+
+    mode="same" zero-pads at the ends, producing a systematic dip at the
+    left edge and a false rise/fall at the right. Pad with edge values
+    instead so the smoothed curve matches the true signal at both ends.
+    """
     y = np.asarray(y, dtype=float)
     if y.size < window * 2:
         window = max(y.size // 4, 1)
     if window < 2:
         return y
+    # Replace NaNs with the nearest neighbor so a single dropped row
+    # (e.g. a grad-skip) doesn't zero out a whole window worth of signal.
+    mask = np.isnan(y)
+    if mask.any() and not mask.all():
+        idx = np.arange(y.size)
+        y = y.copy()
+        y[mask] = np.interp(idx[mask], idx[~mask], y[~mask])
     kernel = np.ones(window) / window
-    return np.convolve(y, kernel, mode="same")
+    pad_left = window // 2
+    pad_right = window - 1 - pad_left
+    padded = np.concatenate(
+        [np.full(pad_left, y[0]), y, np.full(pad_right, y[-1])])
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def collect_segments(work_dir, bs, T):
@@ -60,13 +77,21 @@ def collect_segments(work_dir, bs, T):
     segments = []
     cum = 0.0
 
+    def _split(records):
+        """Split jsonl records into (train_rows, eval_rows) by `event` tag."""
+        tr = [r for r in records if r.get("event") != "eval"]
+        ev = [r for r in records if r.get("event") == "eval"]
+        return tr, ev
+
     boot = load_jsonl(os.path.join(work_dir, "metrics.jsonl"))
-    if boot:
-        steps = np.array([r["step"] for r in boot], dtype=float)
+    boot_tr, boot_ev = _split(boot)
+    if boot_tr:
+        steps = np.array([r["step"] for r in boot_tr], dtype=float)
         s0 = steps[0]
         x = cum + (steps - s0 + 1) * tokens_per_p1_step
         segments.append(dict(
-            label="boot", phase="p1", cycle=-1, records=boot, x_tok=x,
+            label="boot", phase="p1", cycle=-1,
+            records=boot_tr, eval_records=boot_ev, x_tok=x,
         ))
         cum = float(x[-1])
 
@@ -78,34 +103,46 @@ def collect_segments(work_dir, bs, T):
         ci = int(m.group(1))
 
         p1 = load_jsonl(os.path.join(cd, "metrics.jsonl"))
-        if p1:
-            steps = np.array([r["step"] for r in p1], dtype=float)
+        p1_tr, p1_ev = _split(p1)
+        if p1_tr:
+            steps = np.array([r["step"] for r in p1_tr], dtype=float)
             s0 = steps[0]
             x = cum + (steps - s0 + 1) * tokens_per_p1_step
             segments.append(dict(
-                label=f"C{ci}-P1", phase="p1", cycle=ci, records=p1, x_tok=x,
+                label=f"C{ci}-P1", phase="p1", cycle=ci,
+                records=p1_tr, eval_records=p1_ev, x_tok=x,
             ))
             cum = float(x[-1])
 
         p2 = load_jsonl(os.path.join(cd, "phase2_metrics.jsonl"))
-        if p2:
+        p2_tr, p2_ev = _split(p2)
+        if p2_tr:
             # tokens_seen resets periodically within each stage; compute true
             # phase-2 total as sum of per-stage maxima, then spread records
             # linearly by step index so x-axis is monotone and scaled correctly.
             per_stage_max = {}
-            for r in p2:
+            for r in p2_tr:
                 sw = r.get("stage_window", 0)
                 t = r.get("tokens_seen", 0) or 0
                 if t > per_stage_max.get(sw, 0):
                     per_stage_max[sw] = t
-            total_p2 = float(sum(per_stage_max.values())) or (len(p2) * bs * T)
-            steps = np.array([r.get("step", i + 1) for i, r in enumerate(p2)], dtype=float)
+            total_p2 = float(sum(per_stage_max.values())) or (len(p2_tr) * bs * T)
+            steps = np.array([r.get("step", i + 1) for i, r in enumerate(p2_tr)], dtype=float)
             if steps[-1] > 0:
                 x = cum + (steps / steps[-1]) * total_p2
+                # Use the same step→x mapping to place eval dots.
+                if p2_ev and steps[-1] > 0:
+                    ev_steps = np.array([r.get("step", 0) for r in p2_ev], dtype=float)
+                    ev_x = cum + (ev_steps / steps[-1]) * total_p2
+                else:
+                    ev_x = np.array([])
             else:
-                x = cum + np.linspace(0, total_p2, len(p2))
+                x = cum + np.linspace(0, total_p2, len(p2_tr))
+                ev_x = np.array([])
             segments.append(dict(
-                label=f"C{ci}-P2", phase="p2", cycle=ci, records=p2, x_tok=x,
+                label=f"C{ci}-P2", phase="p2", cycle=ci,
+                records=p2_tr, eval_records=p2_ev,
+                x_tok=x, eval_x_tok=ev_x,
             ))
             cum = float(x[-1])
 
@@ -277,33 +314,68 @@ def main():
         pad = (y_hi - y_lo) * 0.08 if y_hi > y_lo else 0.5
         ax.set_ylim(y_lo - pad, y_hi + pad)
 
+    # Helper: project eval-row step numbers onto the segment's train x_tok.
+    def _eval_x(seg):
+        """For a segment, return an x-axis array aligned to the eval rows.
+
+        Prefer a pre-computed eval_x_tok (set for phase 2 by collect_segments).
+        Otherwise map each eval step to the nearest train step's x-axis
+        value via bisect so the dots land where they actually fired.
+        """
+        ev = seg.get("eval_records", [])
+        if not ev:
+            return np.array([])
+        pre = seg.get("eval_x_tok")
+        if pre is not None and len(pre):
+            return pre
+        train_steps = [r.get("step") for r in seg["records"] if r.get("step") is not None]
+        if not train_steps:
+            return np.array([])
+        xs = seg["x_tok"]
+        import bisect
+        sorted_train = sorted(zip(train_steps, xs), key=lambda t: t[0])
+        steps_sorted = [t[0] for t in sorted_train]
+        xs_sorted = [t[1] for t in sorted_train]
+        out = []
+        for r in ev:
+            s = r.get("step")
+            if s is None:
+                out.append(np.nan)
+                continue
+            j = min(bisect.bisect_left(steps_sorted, s), len(xs_sorted) - 1)
+            out.append(xs_sorted[j])
+        return np.array(out, dtype=float)
+
     # Panel 1: held-out eval CE — train with memory (line), no-memory (dots),
     # P2 quant-argmax eval (red dots = deterministic-policy CE)
     ax = axes[1]
     for seg in segments:
-        xs = seg["x_tok"]
+        ev_rows = seg.get("eval_records", [])
+        if not ev_rows:
+            continue
+        ev_x = _eval_x(seg)
         if seg["phase"] == "p1":
-            em = np.array([r.get("eval_ce_loss", np.nan) for r in seg["records"]], dtype=float)
-            en = np.array([r.get("eval_ce_loss_no_mem", np.nan) for r in seg["records"]], dtype=float)
-            valid = np.isfinite(em)
+            em = np.array([r.get("eval_ce_loss", np.nan) for r in ev_rows], dtype=float)
+            en = np.array([r.get("eval_ce_loss_no_mem", np.nan) for r in ev_rows], dtype=float)
+            valid = np.isfinite(em) & np.isfinite(ev_x)
             if valid.any():
-                ax.scatter(xs[valid], em[valid], s=10, color=P1_COLOR, alpha=0.8,
+                ax.scatter(ev_x[valid], em[valid], s=10, color=P1_COLOR, alpha=0.8,
                            label="P1 eval_ce (w/ mem)" if seg["cycle"] == 0 else None)
-            valid_nm = np.isfinite(en)
+            valid_nm = np.isfinite(en) & np.isfinite(ev_x)
             if valid_nm.any():
-                ax.scatter(xs[valid_nm], en[valid_nm], s=10, color="#fbbc04",
+                ax.scatter(ev_x[valid_nm], en[valid_nm], s=10, color="#fbbc04",
                            marker="x", alpha=0.8,
                            label="P1 eval_ce_no_mem" if seg["cycle"] == 0 else None)
         else:
-            qe = np.array([r.get("quant_eval_ce", np.nan) for r in seg["records"]], dtype=float)
-            ev = np.array([r.get("eval_ce_loss", np.nan) for r in seg["records"]], dtype=float)
-            valid = np.isfinite(qe)
+            qe = np.array([r.get("quant_eval_ce", np.nan) for r in ev_rows], dtype=float)
+            ev = np.array([r.get("eval_ce_loss", np.nan) for r in ev_rows], dtype=float)
+            valid = np.isfinite(qe) & np.isfinite(ev_x)
             if valid.any():
-                ax.scatter(xs[valid], qe[valid], s=10, color=P2_COLOR, alpha=0.8,
+                ax.scatter(ev_x[valid], qe[valid], s=10, color=P2_COLOR, alpha=0.8,
                            label="P2 quant_eval_ce" if seg["cycle"] == 0 else None)
-            valid_ev = np.isfinite(ev)
+            valid_ev = np.isfinite(ev) & np.isfinite(ev_x)
             if valid_ev.any():
-                ax.scatter(xs[valid_ev], ev[valid_ev], s=10, color="#9334e6",
+                ax.scatter(ev_x[valid_ev], ev[valid_ev], s=10, color="#9334e6",
                            marker="^", alpha=0.7,
                            label="P2 eval_ce" if seg["cycle"] == 0 else None)
     ax.set_ylabel("eval CE (held-out)")
@@ -312,8 +384,10 @@ def main():
     # clip: use percentile-based ylim to ignore early bootstrap outliers
     _all_eval = []
     for seg in segments:
-        for k in ("eval_ce_loss", "eval_ce_loss_no_mem", "quant_eval_ce"):
-            _all_eval.extend(r[k] for r in seg["records"] if r.get(k) is not None)
+        for r in seg.get("eval_records", []):
+            for k in ("eval_ce_loss", "eval_ce_loss_no_mem", "quant_eval_ce"):
+                if r.get(k) is not None:
+                    _all_eval.append(r[k])
     if _all_eval:
         arr = np.array(_all_eval, dtype=float)
         y_lo = float(np.nanpercentile(arr, 1)) - 0.1
@@ -326,21 +400,24 @@ def main():
     for seg in segments:
         if seg["phase"] != "p1":
             continue
-        xs = seg["x_tok"]
-        em = np.array([r.get("eval_ce_loss", np.nan) for r in seg["records"]], dtype=float)
-        en = np.array([r.get("eval_ce_loss_no_mem", np.nan) for r in seg["records"]], dtype=float)
+        ev_rows = seg.get("eval_records", [])
+        if not ev_rows:
+            continue
+        ev_x = _eval_x(seg)
+        em = np.array([r.get("eval_ce_loss", np.nan) for r in ev_rows], dtype=float)
+        en = np.array([r.get("eval_ce_loss_no_mem", np.nan) for r in ev_rows], dtype=float)
         leverage = em - en
-        valid = np.isfinite(leverage)
+        valid = np.isfinite(leverage) & np.isfinite(ev_x)
         if valid.any():
             color = BOOT_COLOR if seg["cycle"] == -1 else P1_COLOR
-            ax.scatter(xs[valid], leverage[valid], s=15, color=color, alpha=0.8)
+            ax.scatter(ev_x[valid], leverage[valid], s=15, color=color, alpha=0.8)
     ax.axhline(0, color="#888", linestyle="--", linewidth=0.8, alpha=0.7)
     ax.set_ylabel("memory leverage\n(eval_CE − eval_CE_no_mem)\nnegative = mem helps")
     ax.grid(True, alpha=0.3)
     # clip memory leverage y-range too
     _lev = []
     for seg in segments:
-        for r in seg["records"]:
+        for r in seg.get("eval_records", []):
             em = r.get("eval_ce_loss"); en = r.get("eval_ce_loss_no_mem")
             if em is not None and en is not None:
                 _lev.append(em - en)

@@ -263,8 +263,7 @@ class Phase2Trainer:
 
                 result = memory.forward_segment_phase2(
                     H_mid, input_ids, lm,
-                    tau=self.tau, sample=False,     # ← argmax policy
-                    prev_token=effective_prev)
+                    tau=self.tau, sample=False)     # ← argmax policy
                 readouts_q = result["readouts"]
 
                 mem_scale = lm.mem_scale
@@ -433,8 +432,15 @@ class Phase2Trainer:
 
     def _windowed_reward(
         self, per_token_reward: Tensor, call_positions: Tensor, window: int,
-    ) -> Tensor:
-        """For each modulator call at t, mean reward over [t+1, t+1+W]."""
+    ) -> tuple[Tensor, Tensor]:
+        """For each modulator call at t, mean reward over [t+1, t+1+W].
+
+        Returns:
+            rewards: [K, n_calls, BS] (incomplete-window slots zeroed)
+            complete: [n_calls] bool — True for calls whose window fits in T.
+                      Same across K and BS at a given call index, since
+                      completeness depends only on (call_position, T, window).
+        """
         T = per_token_reward.shape[-1]
         positions = call_positions.to(per_token_reward.device)
         starts = positions + 1
@@ -468,7 +474,7 @@ class Phase2Trainer:
                     / live_slots
                 ).tolist()
 
-        return out.transpose(-1, -2)
+        return out.transpose(-1, -2), complete
 
     # ------------------------------------------------------------------
     # Memory-state snapshot/restore
@@ -551,7 +557,7 @@ class Phase2Trainer:
             h_mid_batch_map=h_mid_batch_map)
         per_token_reward = per_token_reward.reshape(K, BS, T)
 
-        rewards = self._windowed_reward(
+        rewards, complete_mask = self._windowed_reward(
             per_token_reward, call_positions, self.reward_window)
 
         mean_per_k_sample = rewards.mean(dim=1)
@@ -571,6 +577,7 @@ class Phase2Trainer:
             "mod_inputs": mod_inputs,
             "codes": codes,
             "rewards": rewards,
+            "complete_mask": complete_mask,  # [n_calls] bool
             "mean_reward": mean_reward,
             "best_mean_reward": best_mean_reward,
             "T": T,
@@ -581,12 +588,27 @@ class Phase2Trainer:
     # GRPO
     # ------------------------------------------------------------------
 
-    def _compute_advantages(self, rewards: Tensor) -> Tensor:
-        """Group-relative advantages, per-(call, sample) normalized."""
+    def _compute_advantages(
+        self, rewards: Tensor, complete_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Group-relative advantages, per-(call, sample) normalized.
+
+        For incomplete-window slots, rewards are zero across all K (same
+        completeness for all K at a given call). Baseline is 0, std is 0
+        (clamped to 1e-8), so advantage comes out as 0 / 1e-8 = 0 already.
+        We still explicitly mask incomplete advantages to 0 for safety —
+        if any code path ever produces non-zero reward on incomplete slots
+        (e.g. a different zero-convention), the mask keeps GRPO honest.
+        """
         baseline = rewards.mean(dim=0, keepdim=True)
         advantages = rewards - baseline
         std = advantages.std(dim=0, keepdim=True, unbiased=False).clamp(min=1e-8)
-        return advantages / std
+        advantages = advantages / std
+        if complete_mask is not None:
+            # complete_mask: [n_calls] → broadcast to [K, n_calls, BS]
+            mask = complete_mask.view(1, -1, 1).to(advantages.dtype)
+            advantages = advantages * mask
+        return advantages
 
     def grpo_step(self, rollout_result: dict) -> dict:
         """Factored-categorical GRPO step.
@@ -598,12 +620,23 @@ class Phase2Trainer:
         Re-runs the neuromod on stored mod_inputs to get current logits,
         scores the rollout-sampled codes, backprops through logit head only.
         """
+        # Force the trainable logit head into train mode for the gradient
+        # pass. train_phase2.py keeps the full model in eval mode so rollouts
+        # are deterministic (no LM dropout); the gradient pass should see the
+        # policy as training. Restore the original mode before returning so
+        # grpo_step is neutral — no-op today (compute_logits has no
+        # dropout/BN), but defensive against future additions.
+        dp = self.model.memory.discrete_policy
+        dp_was_training = dp.training
+        dp.train(True)
+
         K, n_calls, BS, NC, mod_in_dim = rollout_result["mod_inputs"].shape
         mod_inputs = rollout_result["mod_inputs"]              # [K, n_calls, BS, NC, mod_in] f32
         codes = rollout_result["codes"]                        # [K, n_calls, BS, NC] long
         rewards = rollout_result["rewards"]                    # [K, n_calls, BS] f32
+        complete_mask = rollout_result.get("complete_mask")    # [n_calls] bool or None
 
-        advantages = self._compute_advantages(rewards)         # [K, n_calls, BS]
+        advantages = self._compute_advantages(rewards, complete_mask)
         advantages = advantages.unsqueeze(-1).expand(-1, -1, -1, NC)  # [K, n_calls, BS, NC]
 
         # Flatten (K * n_calls * BS) into a single batch dim for the
@@ -664,7 +697,16 @@ class Phase2Trainer:
 
         grad_norm = nn.utils.clip_grad_norm_(
             self.trainable_params, self.max_grad_norm).item()
-        self.optimizer.step()
+        # NaN guard: a -inf log_pi (from a near-zero-prob sampled code) makes
+        # the gradient NaN; clip_grad_norm_ returns NaN which silently fails
+        # the threshold comparison, and optimizer.step() would write NaN into
+        # the logit head weights, poisoning every subsequent rollout.
+        if math.isfinite(grad_norm):
+            self.optimizer.step()
+        else:
+            self.optimizer.zero_grad(set_to_none=True)
+            print(f"[WARN p2 step {self.global_step}] skipping optimizer step: "
+                  f"non-finite grad_norm ({grad_norm})")
 
         # -----------------------------------------------------
         # Sanity check (H5): Δlog_pi vs advantage correlation
@@ -702,19 +744,30 @@ class Phase2Trainer:
         reward_min = rewards_f.min().item()
         reward_max = rewards_f.max().item()
 
-        # Complete-window-corrected reward (ignore zeroed incomplete slots).
-        complete_mask_r = rewards_f.abs() > 1e-8
-        n_complete = complete_mask_r.sum().item()
+        # Complete-window-corrected reward, using the real completeness
+        # mask (not a `abs > 1e-8` proxy that would misfire if any
+        # legitimate CE-reward happened to land near zero).
+        if complete_mask is not None:
+            # [n_calls] → [K, n_calls, BS]
+            cm_b = complete_mask.view(1, -1, 1).expand_as(rewards_f).to(torch.bool)
+        else:
+            cm_b = rewards_f.abs() > 1e-8  # legacy fallback
+        n_complete = int(cm_b.sum().item())
         if n_complete > 0:
-            reward_mean_complete = (rewards_f * complete_mask_r).sum().item() / n_complete
+            reward_mean_complete = rewards_f[cm_b].mean().item()
             complete_fraction = n_complete / rewards_f.numel()
         else:
             reward_mean_complete = 0.0
             complete_fraction = 0.0
 
-        # K-diversity across trajectories (exclude zero-reward slots).
+        # K-diversity across trajectories, counted only on complete slots
+        # (incomplete slots have rewards=0 across all K, std=0 — would pull
+        # the mean spread down artificially).
         k_std_per_slot = rewards_f.std(dim=0, unbiased=False)
-        live_mask = (rewards_f.abs().sum(dim=0) > 1e-8).float()
+        if complete_mask is not None:
+            live_mask = complete_mask.view(-1, 1).expand_as(k_std_per_slot).float()
+        else:
+            live_mask = (rewards_f.abs().sum(dim=0) > 1e-8).float()
         live_count = live_mask.sum().clamp(min=1.0)
         k_spread_mean = (k_std_per_slot * live_mask).sum().item() / live_count.item()
 
@@ -749,6 +802,8 @@ class Phase2Trainer:
 
         # Codebook usage in rollout (for diagnostic; codebook is frozen)
         n_unique = int(torch.unique(codes.reshape(-1)).numel())
+
+        dp.train(dp_was_training)
 
         return {
             "loss": total_loss / (M * NC),

@@ -1,23 +1,28 @@
 """Outer orchestration driver for bootstrap + iterative cycle training.
 
 Runs the full pipeline:
-    1. Bootstrap phase 1 (one-time, ~200M tokens, modulator trains)
+    1. Bootstrap phase 1 (one-time, ~500M tokens, everything trainable —
+       codebook, decoder, logit head, LM, memory dynamics)
     2. For each cycle:
-        a. Phase 1 (50M tokens, modulator FROZEN)
-        b. Action collection (last ~2M tokens of phase 1)
-        c. RVQ codebook fit
-        d. Phase 2 curriculum (512 -> 2048 -> 4096 reward windows)
+        a. Phase 1 (~10M tokens, codebook + decoder FROZEN; logit head
+           still trains so the modulator adapts to LM improvements)
+        b. Phase 2 curriculum (~40M tokens, GRPO on the logit head only;
+           reward windows 512 → 1024 → 2048 → 4096)
     3. Repeat cycles
 
-This is a thin orchestrator that shells out to the already-existing
-sub-trainers (src.train, src.train_phase2, scripts.train_codebook) via
-subprocess. Each sub-step is fully runnable standalone for debugging;
-the outer loop just wires them together.
+The architecture no longer has a separate action-collection sub-phase or
+standalone RVQ-VAE codebook fit. Quantization is integrated into the
+neuromodulator (DiscreteActionPolicy): encoder → logits → Gumbel-softmax
+(phase 1) or hard Categorical (phase 2) → shared codebook → shared decoder.
+
+This is a thin orchestrator that shells out to the existing sub-trainers
+(src.train, src.train_phase2) via subprocess. Each sub-step is fully
+runnable standalone for debugging; the outer loop just wires them together.
 
 Usage:
     python -m src.train_loop \
-        --work-dir outputs/v12/loop \
-        --bootstrap-tokens 200_000_000 \
+        --work-dir outputs/v14/loop \
+        --bootstrap-tokens 500_000_000 \
         --cycles 5
 """
 
@@ -49,6 +54,13 @@ def parse_args():
                    help="Skip bootstrap (if already done once)")
     p.add_argument("--start-cycle", type=int, default=0,
                    help="Resume at this cycle index")
+    # Phase 2 hyperparams — forwarded to src.train_phase2. Defaults match
+    # train_phase2.py; override here to tune without bypassing the outer loop.
+    p.add_argument("--phase2-lr", type=float, default=1e-4)
+    p.add_argument("--phase2-tau", type=float, default=1.0)
+    p.add_argument("--phase2-entropy-coeff", type=float, default=0.01)
+    p.add_argument("--phase2-warmup-batches", type=int, default=8)
+    p.add_argument("--phase2-eval-interval", type=int, default=50)
     return p.parse_args()
 
 
@@ -114,14 +126,22 @@ def main():
             sys.exit(1)
     else:
         print(f"Bootstrap already exists at {bootstrap_ckpt}, skipping.")
-        # Best-effort: load to pick up the cumulative step counter
+        # Load bootstrap to pick up the cumulative step counter. A silent
+        # fallback would produce 0-step cycles that "succeed" vacuously —
+        # exit with a clear error instead.
         try:
             import torch
             ck = torch.load(bootstrap_ckpt, map_location="cpu", weights_only=False)
             cumulative_step = ck.get("step", 0)
             del ck
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"!!! FATAL: could not load {bootstrap_ckpt} to recover "
+                  f"the cumulative step counter: {e}")
+            print(f"!!! If the file is genuinely valid, re-verify with "
+                  f"`torch.load({bootstrap_ckpt!r}, weights_only=False)`.")
+            print(f"!!! Otherwise remove/rename it and re-run without "
+                  f"--skip-bootstrap.")
+            sys.exit(1)
 
     current_ckpt = bootstrap_ckpt
 
@@ -190,6 +210,11 @@ def main():
             "--bs", str(args.phase2_bs),
             "--group-size", str(args.phase2_group_size),
             "--seed", str(phase2_seed),
+            "--lr", str(args.phase2_lr),
+            "--tau", str(args.phase2_tau),
+            "--entropy-coeff", str(args.phase2_entropy_coeff),
+            "--warmup-batches", str(args.phase2_warmup_batches),
+            "--eval-interval", str(args.phase2_eval_interval),
         ]
         for i, v in enumerate(
             (args.phase2_stage1_tokens, args.phase2_stage2_tokens,

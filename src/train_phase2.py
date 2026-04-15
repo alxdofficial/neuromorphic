@@ -303,7 +303,11 @@ def main():
         save_dict["scheduler_state_dict"] = phase1_scheduler_state
     if phase1_dataloader_state is not None:
         save_dict["dataloader_state"] = phase1_dataloader_state
-    torch.save(save_dict, args.out)
+    # Atomic write: temp + rename so a mid-save crash doesn't leave a
+    # corrupt file at the canonical path for the next cycle to pick up.
+    tmp_out = args.out + ".tmp"
+    torch.save(save_dict, tmp_out)
+    os.replace(tmp_out, args.out)
     print(f"Saved phase-2 checkpoint to {args.out} "
           f"(phase1_step={phase1_step}, phase2_step={trainer.global_step}, "
           f"opt={'Y' if phase1_optimizer_state else 'N'} "
