@@ -41,9 +41,14 @@ class Config:
     num_codes: int = 2048         # K — vocabulary of plasticity templates
     code_dim: int = 128           # D_code — per-code intent vector width
 
-    # === Factored Decoder ===
-    action_rank: int = 32         # r — ΔW = U @ Vᵀ is rank-r per event
-    decoder_hidden: int = 256     # MLP hidden width
+    # === Decoder (direct emission) ===
+    # Decoder: code_emb -> MLP -> [N²+N] raw scalars -> reshape to ΔW, Δdecay.
+    # No rank approximation; every entry of ΔW is an independent output of
+    # the decoder (same approach main takes). decoder_hidden = 512 is the
+    # MLP's hidden width and IS the output-space rank constraint (rank
+    # <= min(code_dim, decoder_hidden) for the code→output map, but the
+    # emitted ΔW *matrix* itself is unconstrained in rank).
+    decoder_hidden: int = 512
 
     # === Plasticity rate clamp (bf16 safety) ===
     gamma_max: float = 0.97       # γ = gamma_max · sigmoid(logit); keeps (1-γ) ≥ 0.03
@@ -86,7 +91,6 @@ class Config:
         assert self.attn_token_dim % self.attn_n_heads == 0, (
             f"attn_token_dim ({self.attn_token_dim}) must be divisible by "
             f"attn_n_heads ({self.attn_n_heads})")
-        assert self.action_rank >= 1
         assert 0 < self.gamma_max < 1
         if self.D_embed == -1:
             self.D_embed = self.D
@@ -111,7 +115,7 @@ class Config:
             attn_token_dim=16, attn_n_heads=2, attn_n_layers=2,
             attn_ffn_mult=2, attn_dropout=0.0,
             num_codes=8, code_dim=16,
-            action_rank=4, decoder_hidden=32,
+            decoder_hidden=32,
         )
         defaults.update(kw)
         c = cls(**defaults)

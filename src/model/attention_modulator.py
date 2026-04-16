@@ -264,34 +264,34 @@ class AttnBlock(nn.Module):
 # ======================================================================
 
 
-class FactoredDecoder(nn.Module):
-    """Cheap MLP decoder that emits ΔW as rank-r factored product.
+class DirectDecoder(nn.Module):
+    """Direct ΔW emission — no rank approximation.
 
-    Avoids the slow conv-transpose pipeline entirely. All compute goes
-    through linear layers, which saturate tensor cores well.
+    Decoder emits N² + N scalars: reshape to ΔW [N, N] directly and
+    Δdecay [N]. Every entry of ΔW is an independent output of the MLP,
+    so there is no rank constraint on the emitted matrix. Same approach
+    main takes (for a good reason).
 
-    Output: U [N, r], V [N, r] such that ΔW = U @ Vᵀ (rank-r), plus
-    Δdecay_raw [N]. Full ΔW is the rank-r matrix multiplied out, which
-    still lets any (i,j) edge have its own value but constrained to a
-    rank-r surface in the 1024-dim action space.
+    The only bottleneck on the code → ΔW mapping is the MLP itself:
+    rank ≤ min(code_dim, decoder_hidden). But that's a limit on the
+    *mapping*, not on any individual ΔW matrix.
     """
 
     def __init__(self, config: Config):
         super().__init__()
         self.N = config.N_total
-        self.r = config.action_rank
         self.D_code = config.code_dim
 
-        out_dim = 2 * self.N * self.r + self.N
+        out_dim = self.N * self.N + self.N
         self.mlp = nn.Sequential(
             nn.Linear(self.D_code, config.decoder_hidden),
             nn.GELU(),
             nn.Linear(config.decoder_hidden, out_dim),
         )
 
-        # Zero-init the final layer so ΔW ≈ 0 and Δdecay ≈ 0 at start:
-        # U, V start at 0 → ΔW = 0; Δdecay = 0 → sigmoid(0) = 0.5 = init
-        # decay. Safe no-op start. Matches conv-grid's dW_head zero-init.
+        # Zero-init final layer: ΔW_raw = 0 and Δdecay_raw = 0 at init.
+        # Combined with EMA blend (gamma_max · sigmoid(logit)·...), first
+        # modulation event is a no-op on memory state.
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
@@ -306,13 +306,11 @@ class FactoredDecoder(nn.Module):
         if emb.dtype != w_dt:
             emb = emb.to(w_dt)
 
-        raw = self.mlp(emb)                                          # [BS, 2Nr + N]
-        U = raw[..., : self.N * self.r].reshape(BS, self.N, self.r)
-        V = raw[..., self.N * self.r : 2 * self.N * self.r].reshape(BS, self.N, self.r)
-        dDecay_raw = raw[..., 2 * self.N * self.r:]                   # [BS, N]
+        raw = self.mlp(emb)                                          # [BS, N² + N]
+        dW_raw = raw[..., : self.N * self.N].reshape(BS, self.N, self.N)
+        dDecay_raw = raw[..., self.N * self.N:]                       # [BS, N]
 
-        # ΔW = U @ Vᵀ, then zero diagonal + row RMSNorm.
-        dW_raw = torch.matmul(U, V.transpose(-1, -2))                 # [BS, N, N]
+        # Zero diagonal + row RMSNorm (unchanged).
         dW_raw = dW_raw * (1.0 - self.diag_mask.to(dW_raw.dtype))
         dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.N,))
 

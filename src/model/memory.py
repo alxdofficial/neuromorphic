@@ -19,7 +19,7 @@ from torch import Tensor
 
 from .config import Config
 from .discrete_policy import DiscreteActionPolicy
-from .attention_modulator import AttentionModulator, FactoredDecoder, port_layout
+from .attention_modulator import AttentionModulator, DirectDecoder, port_layout
 
 
 class MemoryGraph(nn.Module):
@@ -66,7 +66,7 @@ class MemoryGraph(nn.Module):
 
         # Attention modulator (encoder) + factored-rank decoder.
         self.modulator = AttentionModulator(config)
-        self.decoder = FactoredDecoder(config)
+        self.decoder = DirectDecoder(config)
         self.discrete_policy = DiscreteActionPolicy(
             num_codes=config.num_codes, code_dim=config.code_dim)
 
