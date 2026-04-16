@@ -32,12 +32,14 @@ Change dataclass fields:
 - Add `N_total: int = 256` (was `N_cells × neurons_per_cell`).
 - Add `NC_pools: int = -1` (derived: `D // D_n`; was `N_cells`).
 - Add `d_proj: int = 16` (node feature compression dim for modulator input).
-- Add `conv_channels: int = 64` (conv hidden width).
-- Add `conv_layers: int = 4`.
-- Add `conv_kernel: int = 3`.
-- Add `conv_groups: int = 8` (for GroupNorm).
-- Add `action_rank: int = 32` (rank of factored ΔW).
+- Add `conv_channels: int = 256` (conv hidden width).
+- Add `conv_layers: int = 6`.
+- Add `conv_kernel: int = 7`.
+- Add `conv_groups: int = 32` (for GroupNorm).
+- Add `action_rank: int = 64` (rank of factored ΔW).
+- Add `decoder_hidden: int = 1024`.
 - Add `role_dim: int = 4` (role embedding dim).
+- Update `num_codes: 512 → 4096`, `code_dim: 64 → 256`.
 - Deprecate `N_cells`, `neurons_per_cell`, `K` (initial W sparsity — no longer
   applicable with single-pool dense W). Leave for one cycle of back-compat if
   convenient; delete in step 10.

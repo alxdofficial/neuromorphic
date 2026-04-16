@@ -97,25 +97,51 @@ events:
 
 | Channels | What | Source |
 |---|---|---|
-| 1 | W[i, j] | connectivity matrix |
-| 1 | hebbian[i, j] | correlation trace |
+| 1 | W[i, j] | connectivity matrix, raw |
+| 1 | hebbian[i, j] | correlation trace, raw |
 | 1 | (W[i,j] − W[j,i]) | edge asymmetry |
 | `d_proj` = 16 | h_proj[i] (broadcast down col) | receiver's state, compressed |
 | `d_proj` = 16 | h_proj[j] (broadcast across row) | sender's state, compressed |
-| `d_proj` = 16 | msg_proj[i] OR msg_proj[j] (broadcast) | message (pick one; emit[j] preferred) |
+| `d_proj` = 16 | msg_emit_proj[i] (broadcast down col) | what i is sending, compressed |
+| `d_proj` = 16 | msg_recv_proj[i] (broadcast down col) | what i is receiving (Σ_j W[i,j]·msg[j]), compressed |
 | 1 | decay[i] (broadcast down col) | receiver's persistence |
 | `role_dim` = 4 | role_emb[i] (broadcast) | port type: input / output / internal |
 | `role_dim` = 4 | role_emb[j] (broadcast) | port type of sender |
 | 2 | s_mem_live, s_mem_ema_fast (broadcast global) | surprise |
 
-**Total channels**: `3 + 3·d_proj + 1 + 2·role_dim + 2 ≈ 62`.
+**Total channels**: `3 + 4·d_proj + 1 + 2·role_dim + 2 ≈ 78`.
 
 Projection heads (new parameters):
 - `W_h_proj`: `[D_n, d_proj] = [256, 16] = 4K params` — compresses per-neuron
   state for broadcasting.
-- `W_msg_proj`: `[D_n, d_proj]` — same for messages.
+- `W_msg_emit_proj`: `[D_n, d_proj]` — compresses per-neuron *outgoing*
+  message.
+- `W_msg_recv_proj`: `[D_n, d_proj]` — compresses per-neuron *aggregate
+  incoming* message `received[i] = Σ_j W[i,j] · msg[j]`.
 - `role_emb`: `[3, role_dim] = [3, 4] = 12 params` — learned one-hot for port
   type.
+
+### In plain English
+
+Within a single kernel window (say a 7×7 patch at some position), the
+modulator sees, for each of the 7 receiver-side and 7 sender-side neurons
+in that window:
+
+- The neuron's projected hidden state.
+- The neuron's projected outgoing message (what it's sending).
+- The neuron's projected aggregate received message (what it's getting).
+- Its role marker (input port / output port / internal).
+
+Plus, for the 49 edges in the window:
+
+- The raw W value (unprojected — full connectivity weight).
+- The raw hebbian correlation value.
+- The asymmetry (W[i,j] − W[j,i]).
+
+Plus the global surprise signal broadcast to every position.
+
+Across the full conv stack + global pool, the model integrates these local
+views into a single cell-level feature that drives code-logit emission.
 
 The projection is **crucial**. A naive broadcast of full D_n=256 vectors gives
 ~1028 channels, which at `[72, 256, 256, 1028]·bf16` is ~9.7 GB — doesn't fit.
@@ -195,18 +221,22 @@ row_feat      = mean over j axis                     # [BS, N, C_h]  — per-rec
 col_feat      = mean over i axis                     # [BS, N, C_h]  — per-sender
 ```
 
-Suggested hyperparameters:
-- `C_h = 64` (conv hidden channels)
-- `L_conv = 4`
-- `kernel_size = 3` (depthwise separable also viable)
-- `groups = 8` for GroupNorm
+Suggested hyperparameters (sized to hit the 100M total-param target):
+- `C_h = 256` (conv hidden channels)
+- `L_conv = 6`
+- `kernel_size = 7` — deliberately "large" because at N=256 a small kernel
+  sees a rounding-error fraction of the grid per step. 7×7 sees 49 neurons'
+  features at once (7 receivers × 7 senders + 49 raw W and hebbian entries);
+  6 layers of k=7 give ~37×37 effective receptive field before global pool.
+- `groups = 32` for GroupNorm
 
-Params for a 4-layer 3×3 conv at C_h=64:
-- Layer 1 (C_in=62 → 64): 62·64·9 = 36K
-- Layers 2–4 (64 → 64): 64·64·9 = 37K × 3 = 111K
-- Total: **~150K params**
+Params for a 6-layer 7×7 conv at C_h=256, C_in=78:
+- Layer 1 (C_in=78 → 256): 78·256·49 = 979K
+- Layers 2–6 (256 → 256): 256·256·49 = 3.2M × 5 = 16.1M
+- Total: **~5.4M params**
 
-Compare to current per-cell logit head: 39.4M params.
+Compare to current per-cell logit head: 39.4M params. The conv is still
+smaller than the old encoder, but deeper and more expressive per-param.
 
 ## Discrete bottleneck (unchanged semantics)
 
@@ -223,10 +253,11 @@ Phase 2 (hard categorical, GRPO):
     log_pi = log_softmax(code_logits).gather(code)    # [BS]
 ```
 
-- `codebook`: `[K, D_code]` learned lookup, same as current.
-- `K = 512` initially (same as current). Can grow if the freed param budget
-  is spent here.
-- `D_code = 64` initially.
+- `codebook`: `[K, D_code]` learned lookup, same structure as current.
+- `K = 4096` (up from current 512) — bigger vocabulary of memory-update
+  templates. Growing K is cheap: each extra code costs `D_code = 256` params.
+- `D_code = 256` (up from current 64) — richer per-code intent vector;
+  matters for downstream decoder capacity.
 
 ## Decoder: low-rank factored action
 
@@ -245,19 +276,36 @@ V         = raw[..., N*r : 2*N*r].reshape(BS, N, r)
 ΔW_normed = F.rms_norm(ΔW_raw, normalized_shape=(N,))
 ```
 
-Hyperparameters:
-- `r = 32` (rank of ΔW per event)
-- `H_dec = 256` (decoder hidden; bumped from 128 since we have budget)
+Hyperparameters (sized for 100M budget):
+- `r = 64` (rank of ΔW per event, up from 32)
+- `H_dec = 2048` (3-layer MLP: D_code → H_dec → H_dec → flat output)
 
-Decoder param count:
-- `W_d1`: 64·256 = 16K
-- `W_d2`: 256·(2·256·32 + 256) = 256·16640 = 4.26M
-- Total: **~4.3M params**
+3-layer decoder shape:
+- `W_d1`: 256·2048 = 524K
+- `W_d2`: 2048·2048 = 4.2M
+- `W_d3`: 2048·(2·256·64 + 256) = 2048·32896 = 67.4M — too big!
 
-At N=256, r=32: each modulation event's ΔW is a rank-32 perturbation of W.
-That's 32 "directions of change" — substantially more expressive than the
-current implicit rank-≤64 under per-cell factoring (since the current design
-can't share rank budget across cells).
+We rebalance to stay near 100M total. Two options to pick from:
+
+**Option A (default, 48M decoder):** 2-layer decoder, H=1024, r=64.
+- `W_d1`: 256·1024 = 262K
+- `W_d2`: 1024·32896 = 33.7M
+- Total decoder: **~34M params**
+
+**Option B (slimmer decoder, smaller rank):** 3-layer, H=2048, r=32.
+- `W_d1`: 256·2048 = 524K
+- `W_d2`: 2048·2048 = 4.2M
+- `W_d3`: 2048·16640 = 34.1M
+- Total decoder: **~38.8M params**
+
+Option A keeps rank=64 (more expressive per event, matches current implicit
+rank-≤64); Option B gives more nonlinear capacity in the code→factor mapping
+at the cost of halving the rank. Default to **Option A** — the rank is more
+often the bottleneck than the decoder's nonlinearity.
+
+At N=256, r=64: each modulation event's ΔW is a rank-64 perturbation of W.
+Matches what the current design *implicitly* gets through the 64-dim
+codebook, but cleanly decomposed and explicit.
 
 ## Applying the update
 
@@ -362,35 +410,40 @@ Two-phase curriculum is same: bootstrap ~500M tokens, cycles ~50M each.
 - `neurons_per_cell` as an architectural knob (replaced by `N_total`)
 - `N_cells` > 1 connectivity (cells become virtual port pools)
 
-## Parameter budget (spending the freed capacity)
+## Parameter budget (100M target total)
 
-Current memory total: ~42M (logit heads dominated).
+Current model: ~109M (LM ~52M + Memory ~42M).
+Target: ~100M (LM ~52M + Memory ~48M).
 
-New design baseline (conservative):
+Memory allocation under this design:
 
 | Component | Params |
 |---|---:|
-| Projection heads (h_proj, msg_proj) | 8K |
+| Projection heads (h_proj, msg_emit_proj, msg_recv_proj) | 12K |
 | Role embeddings | tiny |
-| Conv stack (4 layers, C_h=64) | 150K |
-| Code logit head (pool → K) | 33K |
-| Codebook (K=512, D_code=64) | 33K |
-| Decoder (D_code=64 → 256 → 2Nr+N) | 4.3M |
+| Conv stack (6 layers, C_h=256, k=7) | 5.4M |
+| Code logit head (C_h=256 → K=4096) | 1.0M |
+| Codebook (K=4096 × D_code=256) | 1.0M |
+| Decoder (Option A: 2-layer, H=1024, r=64) | 34.0M |
 | `inject_w, inject_b` (8 pools × α×D_n×D_n) | 2.1M |
 | `neuron_id` (N=256 × D_n=256) | 65K |
 | State/msg MLPs | 260K |
 | Per-neuron plasticity logits | 1K |
-| **Memory total baseline** | **~7M** |
+| **Memory total** | **~48M** |
 
-That leaves **~35M of freed budget** to spend. Recommended allocation:
-- Bigger decoder hidden: `H_dec = 256 → 1024` → decoder grows to ~17M (better
-  expressiveness per code).
-- More codes: `K = 512 → 2048` → richer vocabulary (codebook 33K → 260K).
-- Wider conv: `C_h = 64 → 128` → encoder grows to ~600K.
+LM (unchanged): 52M.
 
-Target post-allocation memory total: **~25M** (about 60% of current), with
-capacity shifted from "perceive observations via giant MLP" to "emit
-expressive actions via rich decoder."
+**Grand total: ~100M. ✓**
+
+Where the params went compared to the old 42M:
+- **Encoder**: 39.4M → 6.4M (conv + logit head). The giant MLP on flattened
+  N² is gone; the conv is much smaller but deeper and spatially structured.
+- **Decoder**: 143K → 34M. This is the big shift. We're paying for rich
+  action synthesis — 4096 codes, each mapped to a rank-64 ΔW perturbation
+  via a 1024-hidden MLP. The action manifold is where the modulator's
+  expressiveness actually matters.
+- **Codebook**: 33K → 1M. Bigger vocabulary of memory-update templates.
+- **Conv stack**: new, 5.4M. Moderate compared to the decoder.
 
 ## Comparison in one table
 
