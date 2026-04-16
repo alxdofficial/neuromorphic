@@ -32,11 +32,12 @@ def test_forward_backward_cpu_tier_tiny():
         "memory.state_w1": model.memory.state_w1,
         "memory.inject_w": model.memory.inject_w,
         "memory.W_decay_logit": model.memory.W_decay_logit,
-        "memory.modulator.stem": model.memory.modulator.stem.weight,
+        "memory.modulator.tok_proj": model.memory.modulator.tok_proj[0].weight,
+        "memory.modulator.qkv (layer 0)": model.memory.modulator.layers[0].qkv.weight,
         "memory.modulator.logit_head": model.memory.modulator.logit_head.weight,
         "memory.discrete_policy.codebook": model.memory.discrete_policy.codebook,
-        "memory.decoder.init_proj": model.memory.decoder.init_proj.weight,
-        "memory.decoder.dW_head": model.memory.decoder.dW_head.weight,
+        "memory.decoder.mlp[0]": model.memory.decoder.mlp[0].weight,
+        "memory.decoder.mlp[-1]": model.memory.decoder.mlp[-1].weight,
     }
     for name, p in required.items():
         assert p.grad is not None, f"no gradient for {name}"
@@ -84,7 +85,7 @@ def test_gamma_clamp():
 
 def test_port_layout_partitions_neurons():
     """input / output / internal role ids partition [0, N)."""
-    from src.model.grid_modulator import port_layout
+    from src.model.attention_modulator import port_layout
     cfg = Config.tier_tiny()
     layout = port_layout(cfg)
     input_idx = layout["input_port_idx"].flatten()

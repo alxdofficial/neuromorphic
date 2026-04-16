@@ -19,7 +19,7 @@ from torch import Tensor
 
 from .config import Config
 from .discrete_policy import DiscreteActionPolicy
-from .grid_modulator import ConvGridModulator, ConvTransposeDecoder, port_layout
+from .attention_modulator import AttentionModulator, FactoredDecoder, port_layout
 
 
 class MemoryGraph(nn.Module):
@@ -64,9 +64,9 @@ class MemoryGraph(nn.Module):
         self.hebbian_decay_logit = nn.Parameter(torch.full((self.N,), 2.0))
         self.gamma_max = config.gamma_max
 
-        # Conv-grid modulator (encoder) and conv-transpose decoder.
-        self.modulator = ConvGridModulator(config)
-        self.decoder = ConvTransposeDecoder(config)
+        # Attention modulator (encoder) + factored-rank decoder.
+        self.modulator = AttentionModulator(config)
+        self.decoder = FactoredDecoder(config)
         self.discrete_policy = DiscreteActionPolicy(
             num_codes=config.num_codes, code_dim=config.code_dim)
 
@@ -323,17 +323,17 @@ class MemoryGraph(nn.Module):
 
     def compute_component_grad_norms(self) -> dict:
         out = {}
-        for name, p in (
-            ("grad_conv_stem", self.modulator.stem.weight),
+        components = [
+            ("grad_tok_proj", self.modulator.tok_proj[0].weight),
             ("grad_logit_head", self.modulator.logit_head.weight),
             ("grad_codebook", self.discrete_policy.codebook),
-            ("grad_dec_init_proj", self.decoder.init_proj.weight),
-            ("grad_dW_head", self.decoder.dW_head.weight),
+            ("grad_decoder", self.decoder.mlp[-1].weight),
             ("grad_state_w1", self.state_w1),
             ("grad_msg_w1", self.msg_w1),
             ("grad_inject_w", self.inject_w),
             ("grad_neuron_id", self.neuron_id),
-        ):
+        ]
+        for name, p in components:
             out[name] = (
                 0.0 if p.grad is None
                 else p.grad.detach().float().norm().item())
@@ -341,11 +341,10 @@ class MemoryGraph(nn.Module):
 
     def compute_param_norms(self) -> dict:
         return {
-            "conv_stem_norm": self.modulator.stem.weight.detach().float().norm().item(),
+            "tok_proj_norm": self.modulator.tok_proj[0].weight.detach().float().norm().item(),
             "logit_head_norm": self.modulator.logit_head.weight.detach().float().norm().item(),
             "codebook_norm": self.discrete_policy.codebook.detach().float().norm().item(),
-            "dec_init_norm": self.decoder.init_proj.weight.detach().float().norm().item(),
-            "dW_head_norm": self.decoder.dW_head.weight.detach().float().norm().item(),
+            "decoder_norm": self.decoder.mlp[-1].weight.detach().float().norm().item(),
             "state_w1_norm": self.state_w1.detach().float().norm().item(),
             "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
             "inject_w_norm": self.inject_w.detach().float().norm().item(),
@@ -420,9 +419,10 @@ class MemoryGraph(nn.Module):
                   s_live: Tensor, s_ema: Tensor,
                   W_gamma: Tensor, decay_gamma: Tensor,
                   phase: str) -> tuple[Tensor, Tensor]:
-        """Conv-grid encoder → discrete policy → decoder → apply EMA blend."""
-        # Encoder: observation → code logits.
-        logits = self.modulator(
+        """Attention encoder → discrete policy → factored decoder → apply EMA."""
+        # Encoder: observation → code logits. (tokens unused for now but
+        # returned for future decoder conditioning.)
+        logits, _tokens = self.modulator(
             h, msg, received, W, hebbian, decay,
             s_live, s_ema, self.role_id.to(h.device))
 
@@ -432,11 +432,9 @@ class MemoryGraph(nn.Module):
                 logits, tau=self.gumbel_tau, hard=True)
             emb = self.discrete_policy.lookup_soft(soft)
         elif not self.training:
-            # Deterministic argmax in eval for reproducibility.
             codes = logits.argmax(dim=-1)
             emb = self.discrete_policy.lookup(codes)
         else:
-            # phase2 / rollouts: hard categorical.
             codes, _ = self.discrete_policy.sample_discrete(
                 logits, tau=self.gumbel_tau)
             emb = self.discrete_policy.lookup(codes)
@@ -444,15 +442,11 @@ class MemoryGraph(nn.Module):
         if self.training and phase == "phase1":
             self.discrete_policy.update_usage(codes)
 
-        # Decoder: embedding → (ΔW_normed, Δdecay_raw).
-        if self.training and self.config.checkpoint_decoder:
-            dW_normed, dDecay_raw = torch.utils.checkpoint.checkpoint(
-                self.decoder, emb, use_reentrant=False)
-        else:
-            dW_normed, dDecay_raw = self.decoder(emb)
+        # Decoder: embedding → (ΔW_normed, Δdecay_raw). No need to checkpoint
+        # — the factored decoder is cheap.
+        dW_normed, dDecay_raw = self.decoder(emb)
 
-        # EMA blend in bf16. γ clamped to gamma_max to keep (1-γ) ≥ 0.03 safe.
-        # [N] → broadcast to [BS, N, 1] for W and [BS, N] for decay.
+        # EMA blend in bf16; γ clamped to gamma_max to keep (1-γ) ≥ 0.03.
         W_new = ((1 - W_gamma.unsqueeze(0).unsqueeze(-1)) * W
                  + W_gamma.unsqueeze(0).unsqueeze(-1) * dW_normed.to(W.dtype))
         target_decay = torch.sigmoid(dDecay_raw).to(decay.dtype)

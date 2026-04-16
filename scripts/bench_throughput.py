@@ -24,9 +24,10 @@ def bench(bs=32, warmup=3, measure=10):
     mem_params = sum(p.numel() for p in model.memory.parameters()) / 1e6
     lm_params = sum(p.numel() for p in model.lm.parameters()) / 1e6
     print(f"Params: total={total_params:.1f}M  LM={lm_params:.1f}M  Mem={mem_params:.1f}M")
-    print(f"Config: BS={bs}, T={cfg.T}, N={cfg.N_total}, C_h={cfg.conv_channels}, "
-          f"K={cfg.num_codes}, D_code={cfg.code_dim}")
-    print(f"  ckpt_memory={cfg.checkpoint_memory}, ckpt_decoder={cfg.checkpoint_decoder}")
+    print(f"Config: BS={bs}, T={cfg.T}, N={cfg.N_total}, F={cfg.attn_token_dim}, "
+          f"heads={cfg.attn_n_heads}, L={cfg.attn_n_layers}, K={cfg.num_codes}, "
+          f"D_code={cfg.code_dim}, r={cfg.action_rank}")
+    print(f"  ckpt_memory={cfg.checkpoint_memory}")
     print()
 
     def step():
