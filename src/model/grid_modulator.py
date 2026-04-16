@@ -111,10 +111,19 @@ class ConvGridModulator(nn.Module):
         BS, N, _ = h.shape
         dt = h.dtype
 
-        # Per-neuron projections (bf16).
-        h_p = self.h_proj(h)                       # [BS, N, d_proj]
-        me_p = self.msg_emit_proj(msg)             # [BS, N, d_proj]
-        mr_p = self.msg_recv_proj(received)        # [BS, N, d_proj]
+        # Align state input dtype with projection weight dtype so this module
+        # works without autocast (CPU / tier_tiny tests / smoke-test scripts).
+        # Under CUDA autocast, the weight appears as bf16 and this is a no-op.
+        w_dt = self.h_proj.weight.dtype
+        if h.dtype != w_dt:
+            h = h.to(w_dt)
+            msg = msg.to(w_dt)
+            received = received.to(w_dt)
+
+        # Per-neuron projections.
+        h_p = self.h_proj(h).to(dt)
+        me_p = self.msg_emit_proj(msg).to(dt)
+        mr_p = self.msg_recv_proj(received).to(dt)
         role_e = self.role_emb(role_id).to(dt)     # [N, role_dim]
 
         # Edge features [BS, N, N, 1].
@@ -160,7 +169,10 @@ class ConvGridModulator(nn.Module):
     # ------------------------------------------------------------------
 
     def encoder_forward(self, x: Tensor) -> Tensor:
-        """x: [BS, C_in, N, N] → pooled [BS, C_h]."""
+        """x: [BS, C_in, N, N] → pooled [BS, C_h]. Stays in stem-weight dtype."""
+        w_dt = self.stem.weight.dtype
+        if x.dtype != w_dt:
+            x = x.to(w_dt)
         x = F.gelu(self.stem_norm(self.stem(x)))
         for block in self.blocks:
             h = block['norm'](x)
@@ -231,11 +243,9 @@ class ConvTransposeDecoder(nn.Module):
                          if c_in != c_out else nn.Identity()),
             }))
 
-        # Final 1×1 head → ΔW_raw. ZERO-INIT: decoder starts at no-op.
+        # Final 1×1 head → ΔW_raw.
         final_channels = channel_sequence[-1]
         self.dW_head = nn.Conv2d(final_channels, 1, kernel_size=1)
-        nn.init.zeros_(self.dW_head.weight)
-        nn.init.zeros_(self.dW_head.bias)
 
         # Δdecay head: row-pool [N, final_channels] → per-neuron MLP.
         self.decay_head = nn.Sequential(
@@ -247,9 +257,9 @@ class ConvTransposeDecoder(nn.Module):
         # Diagonal mask (cached buffer).
         self.register_buffer('diag_mask', torch.eye(self.N).unsqueeze(0))
 
-        # Kaiming init for conv layers (GELU ~ ReLU for init).
+        # Default init for all linear/conv layers first (Kaiming / Xavier).
         for m in self.modules():
-            if isinstance(m, nn.Conv2d) and m is not self.dW_head:
+            if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -258,10 +268,24 @@ class ConvTransposeDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # THEN zero-init the output heads so the decoder starts at no-op.
+        # dW_head's output → rms_norm → EMA blend with γ → safe no-op on W.
+        # decay_head's final layer → sigmoid → 0.5 = init decay → safe no-op.
+        # Both must happen AFTER the default init loop above.
+        nn.init.zeros_(self.dW_head.weight)
+        nn.init.zeros_(self.dW_head.bias)
+        nn.init.zeros_(self.decay_head[-1].weight)
+        nn.init.zeros_(self.decay_head[-1].bias)
+
     def forward(self, emb: Tensor) -> tuple[Tensor, Tensor]:
         """emb: [BS, D_code] → (ΔW_normed [BS, N, N], Δdecay_raw [BS, N])."""
         BS = emb.shape[0]
         S = self.seed_spatial
+        # Cast-for-non-autocast guard.
+        w_dt = self.init_proj.weight.dtype
+        orig_dt = emb.dtype
+        if emb.dtype != w_dt:
+            emb = emb.to(w_dt)
         x = self.init_proj(emb).reshape(BS, self.seed_channels, S, S)
 
         for stage in self.stages:
@@ -279,7 +303,7 @@ class ConvTransposeDecoder(nn.Module):
         row_feat = x.mean(dim=-1).transpose(1, 2)        # [BS, N, final_channels]
         dDecay_raw = self.decay_head(row_feat).squeeze(-1)  # [BS, N]
 
-        return dW_normed, dDecay_raw
+        return dW_normed.to(orig_dt), dDecay_raw.to(orig_dt)
 
 
 # ======================================================================

@@ -69,6 +69,6 @@ the same tokenizer (TinyLlama 32K):
 | GPT-2 small | 124M | 2.955 | 19.2 |
 | Pythia-160m | 160M | 2.736 | 15.4 |
 | Mamba-130m | 130M | 3.294 | 27.0 |
-| **Neuromorphic LM** | **~69M** | **TBD** | **TBD** |
+| **Neuromorphic LM** | **~84M** | **TBD** | **TBD** |
 
 Scripts for the baselines live under `auxiliary_repos/baselines/eval_scripts/`.

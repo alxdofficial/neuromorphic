@@ -402,12 +402,17 @@ entries, not through slow-integrating γ.
 Per-neuron rate is a capacity bump (some neurons may want fast plasticity,
 others slow). Cost: `3·N = 768` new scalar params vs. current `3·NC_cells = 24`.
 
-## Precision: bf16 throughout
+## Precision: bf16 compute, f32 parameters (PyTorch standard)
 
-**All params, all runtime state, all compute in bf16** — no f32 branch
-points anywhere in the memory module. This is a deliberate simplification
-from the current code, which has f32 casts for Hebbian and W/decay EMA
-blends.
+**Parameters and optimizer state stay in f32** (standard for AdamW
+stability). **Runtime state and forward-pass compute are in bf16 on CUDA,
+f32 on CPU.** Autocast handles the cast from f32 params to bf16 compute
+on CUDA; on CPU, matching-dtype direct call works because runtime state
+is f32 too.
+
+No manual f32 casts anywhere in the memory module for the EMA blends —
+the γ clamp handles precision. This is a deliberate simplification from
+the current code, which has f32 casts for Hebbian and W/decay EMA blends.
 
 The bf16-fragile operation in EMA blends (`(1-γ)·X + γ·Y` when γ ≈ 1) is
 handled by **clamping γ to 0.97** via the activation `0.97 · sigmoid(logit)`

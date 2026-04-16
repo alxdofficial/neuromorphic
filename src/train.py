@@ -117,10 +117,13 @@ def main():
     print(f"\nConfig: D={config.D}, D_n={config.D_n}, N_total={config.N_total}, NC_pools={config.NC_pools}")
     print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, "
           f"d_inner={config.d_inner}")
-    print(f"  Memory: {config.N} neurons, K={config.K}, D_n={config.D_n}")
-    print(f"  Ports: {config.N_port} input + {config.N_port} output, "
-          f"alpha={config.alpha}")
-    print(f"  Modulator: hidden={config.cell_mod_hidden}")
+    print(f"  Memory: N_total={config.N_total}, D_n={config.D_n}, "
+          f"K={config.num_codes}, D_code={config.code_dim}")
+    print(f"  Ports: {config.N_port} total port neurons ({config.NC_pools} pools × "
+          f"{config.alpha} input + {config.alpha} output), "
+          f"{config.N_internal} internal")
+    print(f"  Modulator: C_h={config.conv_channels}, layers={config.conv_layers}, "
+          f"k={config.conv_kernel}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
     model = Model(config).to(device)
@@ -400,9 +403,9 @@ def main():
                   f"lm_gn={metrics['lm_grad_norm']:.2f} "
                   f"dyn_gn={metrics['dyn_grad_norm']:.2f} "
                   f"mod_gn={metrics['mod_clip_norm']:.3f} "
-                  f"a_norm={metrics['mod_action_norm']:.4f} "
                   f"W_off={metrics.get('W_offdiag_norm', 0):.3f} "
                   f"h={metrics.get('h_norm', 0):.3f} "
+                  f"W_γ={metrics.get('W_gamma_mean', 0):.3f} "
                   f"τ={model.memory.gumbel_tau:.3f}")
         if (
             eval_loader_factory is not None

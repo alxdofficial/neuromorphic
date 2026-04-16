@@ -104,7 +104,9 @@ class MemoryGraph(nn.Module):
         return self._initialized
 
     def initialize_states(self, BS: int, device: torch.device):
-        dt = torch.bfloat16
+        # Use bf16 for runtime state on CUDA (matches autocast), f32 on CPU
+        # (no autocast path → must match default param dtype).
+        dt = torch.bfloat16 if device.type == "cuda" else torch.float32
         N, D_n = self.N, self.D_n
 
         # h, msg: per-neuron state and outgoing message (zero cold-start).
