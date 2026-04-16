@@ -76,11 +76,6 @@ def parse_args():
                         "cycle phase 1 to keep code semantics stable across "
                         "the phase-2 → phase-1 transition. Does NOT freeze "
                         "the neuromod's logit head.")
-    # Deprecated in the new architecture (no more action collection / codebook
-    # refit). Kept as no-op flags so older invocations don't break.
-    p.add_argument("--collect-actions", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--action-db-out", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--no-train", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -119,7 +114,7 @@ def main():
 
     bs = args.bs
     T = config.T
-    print(f"\nConfig: D={config.D}, D_n={config.D_n}, N_cells={config.N_cells}")
+    print(f"\nConfig: D={config.D}, D_n={config.D_n}, N_total={config.N_total}, NC_pools={config.NC_pools}")
     print(f"  Scan: L_total={config.L_total}, split_at={config.scan_split_at}, "
           f"d_inner={config.d_inner}")
     print(f"  Memory: {config.N} neurons, K={config.K}, D_n={config.D_n}")
@@ -148,12 +143,16 @@ def main():
     # cycle-1 transition so optimizer.load_state_dict() doesn't silently
     # fail on a param-count mismatch. See audit #2.
     if args.freeze_modulator:
-        dp = model.memory.discrete_policy
-        for p in (dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2):
+        # Modulator = conv encoder + logit head (the "perceive and classify"
+        # pool). Codebook + decoder are NOT frozen here; they're the
+        # action-synthesis side handled by --freeze-codebook-decoder.
+        for p in model.memory.modulator.parameters():
             p.requires_grad = False
     if args.freeze_codebook_decoder:
-        dp = model.memory.discrete_policy
-        for p in (dp.codebook, dp.dec_w1, dp.dec_b1, dp.dec_w2, dp.dec_b2):
+        # Codebook + decoder = action-synthesis side. Frozen during cycle
+        # phase 1 and phase 2 so code semantics stay stable across GRPO.
+        model.memory.discrete_policy.codebook.requires_grad = False
+        for p in model.memory.decoder.parameters():
             p.requires_grad = False
 
     # Optimizer — include ALL params (including frozen ones) so param-group
@@ -280,14 +279,10 @@ def main():
         max_grad_norm=MAX_GRAD_NORM, log_interval=args.log_interval,
         use_memory=not args.no_memory,
         freeze_modulator=args.freeze_modulator,
-        collect_actions=args.collect_actions,
         metrics_path=metrics_path,
-        no_train=args.no_train,
     )
     if args.freeze_modulator:
         print("*** Modulator FROZEN — phase 1 of iterative cycle ***")
-    if args.collect_actions:
-        print("*** Action collection ENABLED — will flush to disk ***")
     trainer.global_step = start_step
     if args.resume:
         trainer.optimizer_step = start_optimizer_step
@@ -455,11 +450,6 @@ def main():
     final_step = trainer.global_step
     if final_step > 0 and final_step % args.save_interval != 0:
         save_checkpoint(final_step)
-
-    if args.collect_actions and args.action_db_out:
-        os.makedirs(os.path.dirname(args.action_db_out) or ".", exist_ok=True)
-        n = trainer.flush_action_database(args.action_db_out)
-        print(f"Flushed {n:,} action samples to {args.action_db_out}")
 
     print("Done.")
 

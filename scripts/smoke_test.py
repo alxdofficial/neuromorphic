@@ -21,8 +21,8 @@ def smoke_test(steps=20, bs=4, device_str="cuda"):
     model = Model(c).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95))
 
-    print(f"Config: D={c.D}, D_n={c.D_n}, Cn={c.neurons_per_cell}, NC={c.N_cells}")
-    print(f"  d_inner={c.d_inner}, Hmod={c.cell_mod_hidden}, BS={bs}, T={c.T}")
+    print(f"Config: D={c.D}, D_n={c.D_n}, N_total={c.N_total}, NC_pools={c.NC_pools}")
+    print(f"  d_inner={c.d_inner}, C_h={c.conv_channels}, BS={bs}, T={c.T}")
     print(f"  Params: {model.param_count()/1e6:.1f}M "
           f"(LM={model.lm_param_count()/1e6:.1f}M, Mem={model.memory_param_count()/1e6:.1f}M)")
     print()

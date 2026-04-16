@@ -28,9 +28,7 @@ class Trainer:
         log_interval: int = 50,
         use_memory: bool = True,
         freeze_modulator: bool = False,
-        collect_actions: bool = False,
         metrics_path: str | None = None,
-        no_train: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -41,40 +39,30 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         self.global_step = 0
-        # Separate counter for optimizer updates (excludes --no-train steps).
-        # Checkpoints save global_step for data-position tracking but
-        # optimizer_step for LR schedule / training progress semantics.
         self.optimizer_step = 0
         self.use_memory = use_memory
         self.use_amp = device.type == "cuda"
         self.amp_dtype = torch.bfloat16
-        # Pure-inference mode: no backward, no optimizer step. Used during
-        # action collection so the codebook is fit on a stationary LM.
-        self.no_train = no_train
 
-        # Cycle-1+: freeze modulator so phase 1 TBPTT doesn't undo phase 2 GRPO.
-        # Note: train.py keeps frozen params IN the optimizer groups (they
-        # just get zero gradients), so param-group shapes stay stable across
-        # freeze/unfreeze transitions — important for optimizer.load_state_dict
-        # when resuming from a checkpoint saved with different freeze settings.
-        # The requires_grad flag here is a belt-and-suspenders for anyone
-        # constructing Trainer directly.
+        # Freeze modulator (conv encoder + logit head) during cycle phase 1
+        # when phase 2 GRPO comes back. requires_grad gates are belt-and-
+        # suspenders for direct-Trainer callers; the optimizer step itself
+        # just skips zero-grad params.
         self.freeze_modulator = freeze_modulator
-        dp = model.memory.discrete_policy
-        # "Modulator" = just the logit head (what phase 2 GRPO trains).
-        # Codebook + decoder are intentionally in the DYNAMICS pool — they
-        # train during phase 1 (including cycle phase 1) by gradient, and
-        # get frozen explicitly in phase 2 by the phase-2 trainer.
-        mod_params = [dp.logit_w1, dp.logit_b1, dp.logit_w2, dp.logit_b2]
+        # "Modulator" pool = conv encoder + logit head (what phase 2 GRPO
+        # trains). Codebook + decoder are in the DYNAMICS pool — they train
+        # during phase 1, get frozen explicitly under --freeze-codebook-decoder.
+        mod_params = list(model.memory.modulator.parameters())
         if freeze_modulator:
             for p in mod_params:
                 p.requires_grad = False
 
         # Cache param groups for split grad clipping.
         #   - LM pool: everything in model.lm
-        #   - Dynamics pool: memory params other than the logit head
-        #     (includes codebook + decoder + state/msg/inject/neuron_id MLPs)
-        #   - Modulator pool: just the logit head
+        #   - Dynamics pool: memory params other than the modulator encoder
+        #     (state/msg/inject/neuron_id MLPs, plasticity logits, codebook,
+        #      conv-transpose decoder)
+        #   - Modulator pool: just the conv encoder + logit head
         mod_param_set = {id(p) for p in mod_params}
         self._mod_params = mod_params
         self._dyn_params = [
@@ -102,12 +90,6 @@ class Trainer:
         self._dyn_clip_scale = _math.sqrt(dyn_count / lm_count)
         self._mod_clip_scale = _math.sqrt(mod_count / lm_count)
 
-        # Action collection: collect at every modulation event within chunks.
-        self.collect_actions = collect_actions
-        self.action_buffer: list[torch.Tensor] = []
-        if collect_actions:
-            model.memory.start_action_collection()
-
         # JSONL metrics log. Appended per step. One dict per line.
         self.metrics_path = metrics_path
         if metrics_path is not None:
@@ -120,22 +102,13 @@ class Trainer:
             f.write(json.dumps(metrics) + "\n")
 
     def train_chunk(self, batch) -> dict:
-        # In no_train mode this is a pure inference pass — no dropout, no
-        # backward, no optimizer step. Used for action collection so the
-        # codebook is fit on a stationary LM rather than a moving target.
-        if self.no_train:
-            self.model.train(False)
-        else:
-            self.model.train()
+        self.model.train()
         input_ids = batch.input_ids.to(self.device, non_blocking=True)
         target_ids = batch.target_ids.to(self.device, non_blocking=True)
         prev_token = getattr(batch, "prev_token", None)
         if prev_token is not None:
             prev_token = prev_token.to(self.device, non_blocking=True)
         BS, T = input_ids.shape
-        # Track the last consumed batch's final input token so checkpoint
-        # can save the correct consumer-side prev_token (not the prefetch
-        # thread's runahead version). See codex audit finding #3.
         self.last_consumed_prev_tokens = input_ids[:, -1].cpu()
 
         t_start = time.time()
@@ -144,73 +117,43 @@ class Trainer:
             device_type=self.device.type, dtype=self.amp_dtype,
             enabled=self.use_amp)
 
-        if self.no_train:
-            # Pure inference: disable grad to save memory and time.
-            with torch.no_grad(), amp_ctx:
-                result = self.model.forward_chunk(
-                    input_ids, target_ids=target_ids,
-                    use_memory=self.use_memory,
-                    prev_token=prev_token)
-        else:
-            with amp_ctx:
-                result = self.model.forward_chunk(
-                    input_ids, target_ids=target_ids,
-                    use_memory=self.use_memory,
-                    prev_token=prev_token)
+        with amp_ctx:
+            result = self.model.forward_chunk(
+                input_ids, target_ids=target_ids,
+                use_memory=self.use_memory,
+                prev_token=prev_token)
 
-        logits = result["logits"]
         aux_loss = result["aux_loss"]
         ce_loss = result["ce_loss"]
         total_loss = result["loss"]
 
-        if not self.no_train:
-            self.optimizer.zero_grad(set_to_none=True)
-            total_loss.backward()
+        self.optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
 
-            # Component grad norms (read BEFORE clip to see the raw signal).
-            component_grads = self.model.memory.compute_component_grad_norms()
+        component_grads = self.model.memory.compute_component_grad_norms()
 
-            # Three independent clip pools so a spike in one pool doesn't drown
-            # the others. Budgets are scaled by sqrt(pool_params) / sqrt(lm_params)
-            # so pools with different sizes get comparable per-parameter clipping
-            # pressure (see audit #7).
-            lm_grad_norm = nn.utils.clip_grad_norm_(
-                self._lm_params,
-                self.max_grad_norm * self._lm_clip_scale).item()
-            dyn_grad_norm = nn.utils.clip_grad_norm_(
-                self._dyn_params,
-                self.max_grad_norm * self._dyn_clip_scale).item()
-            if self.freeze_modulator:
-                # Modulator params have no grad in this mode; no clip to do.
-                mod_clip_norm = 0.0
-            else:
-                mod_clip_norm = nn.utils.clip_grad_norm_(
-                    self._mod_params,
-                    self.max_grad_norm * self._mod_clip_scale).item()
-
-            # Phase-1 telemetry: per-cell modulator grad norm (POST clip of the
-            # modulator pool — isolated from dynamics spikes now).
-            mod_grad_norm = self.model.memory.compute_mod_grad_norm()
-
-            self.optimizer.step()
-            self.optimizer_step += 1
-            if self.scheduler is not None:
-                self.scheduler.step()
-        else:
-            # No-train mode: zero out grad-related metrics.
-            component_grads = {f"grad_{n}": 0.0 for n in (
-                "mod_w1", "mod_w2", "state_w1", "state_w2",
-                "msg_w1", "msg_w2", "inject_w", "neuron_id")}
-            lm_grad_norm = 0.0
-            dyn_grad_norm = 0.0
+        # Three independent clip pools so a spike in one pool doesn't drown
+        # the others. Budgets scaled by sqrt(pool_params / lm_params) so
+        # pools get comparable per-parameter clipping pressure.
+        lm_grad_norm = nn.utils.clip_grad_norm_(
+            self._lm_params,
+            self.max_grad_norm * self._lm_clip_scale).item()
+        dyn_grad_norm = nn.utils.clip_grad_norm_(
+            self._dyn_params,
+            self.max_grad_norm * self._dyn_clip_scale).item()
+        if self.freeze_modulator:
             mod_clip_norm = 0.0
-            mod_grad_norm = 0.0
-            # Do NOT advance the scheduler: the LR schedule should track
-            # OPTIMIZER updates, not wall-clock steps or tokens seen. In
-            # no_train mode there are zero weight updates, so the LR
-            # stays at whatever the last optimizer step left it at. The
-            # outer cycle loop must compensate by computing phase 1 step
-            # targets excluding action-collection steps.
+        else:
+            mod_clip_norm = nn.utils.clip_grad_norm_(
+                self._mod_params,
+                self.max_grad_norm * self._mod_clip_scale).item()
+
+        mod_grad_norm = self.model.memory.compute_mod_grad_norm()
+
+        self.optimizer.step()
+        self.optimizer_step += 1
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         self.model.detach_states()
 
@@ -219,28 +162,15 @@ class Trainer:
         # modulator's response to its own content stream. The modulator
         # policy (mod_w1/b1/w2/b2) is already shared by construction.
         lane_stats = {}
-        if (not self.no_train
-                and self.global_step > 0
+        if (self.global_step > 0
                 and (self.global_step + 1) % self.log_interval == 0):
             lane_stats = self.model.memory.compute_lane_divergence()
 
-        # Phase-1 telemetry: snapshot modulator stats + memory health.
-        mod_stats = self.model.memory.compute_modulator_stats()
+        # Phase-1 telemetry: plasticity rates, memory health, param norms.
         plasticity_rates = self.model.memory.compute_plasticity_rates()
         mem_health = self.model.memory.compute_memory_health()
         param_norms = self.model.memory.compute_param_norms()
         mem_scale_stats = self.model.lm.compute_mem_scale_stats()
-
-        # Optional action collection for codebook fitting.
-        # With per-event collection, each chunk yields ~T/modulation_interval
-        # action snapshots instead of just one end-of-chunk snapshot.
-        if self.collect_actions:
-            actions = self.model.memory.collect_modulator_action()
-            if actions is not None:
-                # actions: [n_events, BS, NC, mod_out] → flatten to [n*BS, NC, mod_out]
-                n_events = actions.shape[0]
-                self.action_buffer.append(
-                    actions.reshape(n_events * actions.shape[1], *actions.shape[2:]))
 
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed
@@ -262,7 +192,6 @@ class Trainer:
             "mod_grad_norm": mod_grad_norm,
             "elapsed": elapsed,
             "frozen_modulator": self.freeze_modulator,
-            **mod_stats,
             **plasticity_rates,
             **mem_health,
             **param_norms,
@@ -329,16 +258,6 @@ class Trainer:
         train_initialized = model._initialized
         was_training = model.training
 
-        # Pause action collection during eval so eval forward passes don't
-        # pollute the action database with their (fresh-state) modulator
-        # outputs. Also snapshot the current buffer so collection resumes
-        # with exactly the actions collected so far.
-        was_collecting = memory._collecting_actions
-        saved_action_buffer = memory._action_buffer
-        if was_collecting:
-            memory._collecting_actions = False
-            memory._action_buffer = []
-
         memory._initialized = False
         model._initialized = False
         model.lm._carries = [None] * self.config.L_total
@@ -383,10 +302,6 @@ class Trainer:
             model._initialized = train_initialized
             if was_training:
                 model.train(True)
-            # Restore action collection state
-            if was_collecting:
-                memory._collecting_actions = True
-                memory._action_buffer = saved_action_buffer
 
         if count == 0:
             return {"ce": 0.0, "aux": 0.0, "ppl": 0.0, "count": 0}
@@ -430,19 +345,3 @@ class Trainer:
             out["mem_leverage_ce"] = off["ce"] - on["ce"]
         return out
 
-    def flush_action_database(self, path: str) -> int:
-        """Save collected modulator actions to disk.
-
-        Actions were accumulated per step as [n_events * BS, NC, mod_out]
-        float32 cpu tensors. We save the [N_total, NC, mod_out] shape so the
-        codebook trainer can compute per-cell usage / specialization stats.
-        Returns the number of samples written (N_total * NC).
-        """
-        if not self.action_buffer:
-            return 0
-        stacked = torch.cat(self.action_buffer, dim=0)   # [N_total, NC, mod_out]
-        # Save in [N, NC, D] format so per-cell stats are recoverable.
-        torch.save(stacked, path)
-        n = stacked.shape[0] * stacked.shape[1]
-        self.action_buffer.clear()
-        return n
