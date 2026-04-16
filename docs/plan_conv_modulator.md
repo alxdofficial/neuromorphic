@@ -32,14 +32,18 @@ Change dataclass fields:
 - Add `N_total: int = 256` (was `N_cells × neurons_per_cell`).
 - Add `NC_pools: int = -1` (derived: `D // D_n`; was `N_cells`).
 - Add `d_proj: int = 16` (node feature compression dim for modulator input).
-- Add `conv_channels: int = 256` (conv hidden width).
+- Add `conv_channels: int = 192` (encoder conv hidden width).
 - Add `conv_layers: int = 6`.
 - Add `conv_kernel: int = 7`.
-- Add `conv_groups: int = 32` (for GroupNorm).
-- Add `action_rank: int = 64` (rank of factored ΔW).
-- Add `decoder_hidden: int = 1024`.
+- Add `conv_groups: int = 32` (for GroupNorm in encoder).
+- Add `decoder_seed_spatial: int = 4` (starting spatial dim of decoder).
+- Add `decoder_seed_channels: int = 192` (matches D_code).
+- Add `decoder_groups: int = 8` (for GroupNorm in decoder upsample stages).
 - Add `role_dim: int = 4` (role embedding dim).
-- Update `num_codes: 512 → 4096`, `code_dim: 64 → 256`.
+- Update `num_codes: 512 → 4096`, `code_dim: 64 → 192`.
+- Remove: `action_rank` (no longer needed; decoder produces full-rank ΔW
+  directly via conv-transpose).
+- Remove: `decoder_hidden` (no longer a dense-MLP decoder).
 - Deprecate `N_cells`, `neurons_per_cell`, `K` (initial W sparsity — no longer
   applicable with single-pool dense W). Leave for one cycle of back-compat if
   convenient; delete in step 10.
@@ -177,7 +181,7 @@ class ConvGridModulator(nn.Module):
 (backward without errors); memory footprint at BS=72 N=256 under 1 GB for the
 build_input tensor.
 
-### Step 5 — Discrete policy refactor
+### Step 5 — Discrete policy refactor + conv-transpose decoder
 
 File: `src/model/discrete_policy.py`
 
@@ -190,35 +194,94 @@ Change shape assumptions:
 The logit-computation path moves OUT of this file (now done by ConvGridModulator).
 `DiscreteActionPolicy` becomes a thinner module: codebook + decoder + sampling
 primitives. Keep:
-- `sample_discrete`, `sample_gumbel_soft`, `log_prob`, `entropy`, `decode`,
-  `decode_soft`, `update_usage`, `reset_dead_codes`.
+- `sample_discrete`, `sample_gumbel_soft`, `log_prob`, `entropy`,
+  `update_usage`, `reset_dead_codes`.
+- `decode` / `decode_soft` (redesigned — they now return `ΔW_raw [BS, N, N]`
+  and `Δdecay_raw [BS, N]` instead of a flat action vector).
 
 Remove:
 - `compute_logits` (moved to `ConvGridModulator`).
 - `logit_w1/b1/w2/b2` parameters.
+- Old dense-MLP decoder params (`dec_w1`, `dec_b1`, `dec_w2`, `dec_b2`).
 
-The `forward` convenience method needs a rewrite:
-
-```python
-def forward(self, logits, phase="phase1", tau=1.0) -> dict:
-    """logits comes from ConvGridModulator; this module does the rest."""
-    ...
-```
-
-New decoder shape:
-- Input: `[BS, D_code]`.
-- Output: `[BS, 2·N·r + N]` — split into U, V, Δdecay.
-- Decoder hidden: `H_dec = 256` by default.
+New decoder: **conv-transpose generator**.
 
 ```python
-self.dec_w1 = nn.Parameter(torch.empty(code_dim, decoder_hidden))
-self.dec_b1 = nn.Parameter(torch.zeros(decoder_hidden))
-self.dec_w2 = nn.Parameter(torch.empty(decoder_hidden, 2 * N * action_rank + N))
-self.dec_b2 = nn.Parameter(torch.zeros(2 * N * action_rank + N))
+class ConvTransposeDecoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        N = config.N_total
+        D_code = config.code_dim
+        S = config.decoder_seed_spatial         # 4
+        C0 = config.decoder_seed_channels        # 192
+
+        # Start projection: code_emb → spatial seed
+        self.init_proj = nn.Linear(D_code, S * S * C0)
+
+        # Upsample stages: resize + conv pattern (artifact-free)
+        # 6 stages from 4×4 to 256×256 at N=256
+        # Channel ladder: 192 → 128 → 96 → 64 → 48 → 32 → 32
+        channel_ladder = [C0, 128, 96, 64, 48, 32, 32]
+        self.stages = nn.ModuleList()
+        for c_in, c_out in zip(channel_ladder[:-1], channel_ladder[1:]):
+            self.stages.append(nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(config.decoder_groups, c_out),
+                nn.GELU(),
+            ))
+
+        # Final 1×1 head → ΔW_raw (zero-init!)
+        self.dW_head = nn.Conv2d(32, 1, kernel_size=1)
+        nn.init.zeros_(self.dW_head.weight)
+        nn.init.zeros_(self.dW_head.bias)
+
+        # Δdecay head: row-pool the feature map → per-neuron MLP
+        self.decay_head = nn.Sequential(
+            nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 1),
+        )
+        # Diagonal mask (cached)
+        self.register_buffer('diag_mask', torch.eye(N).unsqueeze(0))
+
+    def forward(self, emb: Tensor) -> tuple[Tensor, Tensor]:
+        """emb: [BS, D_code] → (ΔW_raw [BS, N, N], Δdecay_raw [BS, N])"""
+        x = self.init_proj(emb).reshape(-1, C0, S, S)
+        for stage in self.stages:
+            x = stage(x)
+        # x: [BS, 32, N, N]
+
+        # ΔW head
+        dW_raw = self.dW_head(x).squeeze(1)               # [BS, N, N]
+        dW_raw = dW_raw * (1.0 - self.diag_mask)          # zero the diagonal
+        dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.N,))
+
+        # Δdecay head: row-pool then per-neuron MLP
+        row_feat = x.mean(dim=-1).transpose(1, 2)          # [BS, N, 32]
+        dDecay_raw = self.decay_head(row_feat).squeeze(-1) # [BS, N]
+
+        return dW_normed, dDecay_raw
 ```
 
-**Test**: sampling and decoding produce correct shapes; codebook lookup
-differentiable (soft path); categorical sampling gives valid log_pi.
+The `DiscreteActionPolicy.decode*` methods wrap this, adding Gumbel/hard
+sampling upstream:
+
+```python
+def decode(self, codes: Tensor) -> tuple[Tensor, Tensor]:
+    emb = self.codebook[codes]                     # [BS, D_code]
+    return self.decoder(emb)                        # (ΔW_normed, dDecay_raw)
+
+def decode_soft(self, soft_weights: Tensor) -> tuple[Tensor, Tensor]:
+    emb = soft_weights @ self.codebook              # differentiable lookup
+    return self.decoder(emb)
+```
+
+**Tests**:
+- Shape: decoder input `[BS, D_code]`, output `ΔW ∈ [BS, N, N]`,
+  `Δdecay ∈ [BS, N]`.
+- Zero-init correctness: at init, `ΔW ≈ 0` (within float noise) for any code.
+- Diagonal mask: `ΔW[:, i, i] == 0` for all i.
+- Gradient flow: loss on decoder output has grad wrt `codebook`, `init_proj`,
+  all conv stages, both heads.
 
 ### Step 6 — Integrate modulator into memory forward
 
@@ -226,24 +289,26 @@ File: `src/model/memory.py`
 
 Replace `_modulate_cells` with a new `_modulate` method that:
 1. Calls `ConvGridModulator` to get `logits: [BS, K]`.
-2. Passes to `DiscreteActionPolicy.forward(logits, phase=...)` for sampling +
-   decoding.
-3. Parses decoder output `[BS, 2Nr + N]` into `U, V, Δdecay`.
-4. Computes `ΔW = U @ V.T`, rms_norm over last dim.
-5. EMA-blend into `W` and `decay` using per-neuron `W_decay_logit`,
+2. Samples code via `DiscreteActionPolicy.sample_*` (Gumbel soft in phase 1,
+   hard categorical in phase 2).
+3. Gets `(ΔW_normed, Δdecay_raw)` from the conv-transpose decoder directly —
+   no rank-factoring step to stitch together.
+4. EMA-blend into `W` and `decay` using per-neuron `W_decay_logit`,
    `decay_gamma_logit` (shape `[N]`, not `[NC]`).
 
 Update module construction in `MemoryGraph.__init__`:
 - Remove `logit_w1/b1/w2/b2` ownership (now in ConvGridModulator).
+- Remove old MLP decoder params from `DiscreteActionPolicy` (replaced by
+  `ConvTransposeDecoder` submodule).
 - Add `self.modulator = ConvGridModulator(config)`.
-- Update `DiscreteActionPolicy` instantiation with new action_dim.
 
 Update `compute_modulator_stats` — measure applied plasticity as before,
 just with new shapes.
 
 **Test**: full forward pass end-to-end on tier_tiny; scalar loss returned;
-backward pass doesn't error; gradients flow to conv params, codebook,
-decoder, and memory dynamics MLPs (verify via param.grad is not None).
+backward pass doesn't error; gradients flow to conv encoder params,
+codebook, conv-transpose decoder params (all stages), and memory dynamics
+MLPs (verify via param.grad is not None).
 
 ### Step 7 — Training loop shape updates
 
@@ -345,12 +410,14 @@ Three levels:
 
 | Risk | Probability | Mitigation |
 |---|---|---|
-| Conv encoder fails to learn useful features (low_mem_leverage) | medium | Compare vs a fallback "flat MLP over pooled grid features" — isolates whether conv vs dense is the issue |
-| Low-rank ΔW too restrictive | low-medium | Ablate r ∈ {16, 32, 64, 128}; easy to bump |
+| Conv encoder fails to learn useful features (low mem_leverage) | medium | Compare vs a fallback "flat MLP over pooled grid features" — isolates whether conv vs dense is the issue |
+| Conv-transpose decoder doesn't produce useful spatial structure | medium | Zero-init final head means decoder starts at no-op; if it stays at no-op, encoder side is the problem. If it diverges, check RMSNorm + EMA gate. |
 | Content-compressed observation too lossy | low | Ablate by feeding statistics-only input (zero out h_proj, msg_proj channels) |
 | Port-pool indexing bugs (inject/readout broken) | medium | Property test: round-trip H_mid → inject → memory step → readout; expect identity-ish under zero plasticity |
 | Training instability from GroupNorm / new init | low | Gradient clipping, scale check of initial activations |
 | VRAM blowup from naive grid materialization | high if not careful | The d_proj=16 compression is load-bearing; unit-test peak VRAM < 2GB for modulator at BS=72 N=256 |
+| Decoder activation stack too big at large spatial dims | medium | Activation-checkpoint the decoder if peak VRAM is tight; decoder's off the critical path so extra recompute is cheap |
+| Checkerboard artifacts in ΔW from transpose-conv aliasing | low (we use resize+conv, not native ConvTranspose) | If we ever switch to native ConvTranspose2d, validate that downstream RMSNorm absorbs artifacts |
 | Torch.compile fails on new module | low | Fall back to eager if needed; not blocking |
 
 ## Rollback plan

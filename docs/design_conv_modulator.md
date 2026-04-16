@@ -11,12 +11,14 @@ objective) continues to apply.
 | Physical cells (`NC_cells`) | 8 | **1** — single connectivity pool |
 | Neurons per cell (`N`) | 32 | **256** — full N×N connectivity |
 | Encoder ("logit head") | Per-cell MLP (1092 → 3072 → K), 39M params | **Conv stack over the N×N edge grid** |
-| Encoder observation | Flattened scalars per cell | **Edge feature map** `[BS, N, N, ~52]` |
-| Codebook | 512 × 64 | **Same** (or slightly bigger) |
-| Decoder output | Dense `[NC, N²+N]` per event | **Low-rank factored** `U, V ∈ [N, r]` + `Δdecay ∈ [N]` |
-| Policy per event | 8 categorical (one per cell) | **1 categorical** over K codes |
-| Encoder params | 39M (scales with N²) | **~200K** (kernel weights, fixed-size) |
-| Memory params total | ~42M | **~5M baseline** (budget freed to spend on decoder/codebook) |
+| Encoder observation | Flattened scalars per cell | **Edge feature map** `[BS, N, N, ~78]` |
+| Codebook | 512 × 64 | **4096 × 192** — bigger vocabulary of templates |
+| Decoder | MLP, dense `[NC, N²+N]` output | **Conv-transpose stack**: code_emb → [4,4,C] seed → upsample to `[N,N,1]` ΔW (full-rank) + row-pooled Δdecay |
+| Action rank | ≤64 implicit (via 64-dim codebook) | **Full rank** (no factoring constraint) |
+| Policy per event | 8 categorical (one per cell) | **1 categorical** over K=4096 codes |
+| Encoder params | 39M (scales with N²) | **~3.4M** (6 conv layers, kernel 7, C_h=192) |
+| Decoder params | 143K (tiny MLP) | **~2.5M** (conv-transpose stack) |
+| Memory params total | ~42M | **~10M** (lean; bump if training hits capacity ceiling) |
 
 The cell as a grid becomes load-bearing: we treat each lane's connectivity W
 (plus hebbian, plus per-neuron features broadcast into the grid) as an N×N
@@ -34,16 +36,18 @@ Three observations from the verify_01 analysis forced this:
 2. **The 8-cell factored policy was justified only by phase-2 GRPO SNR.** With
    autoregressive GRPO (the future-work plan), rollouts diverge in token space
    and per-cell factoring is no longer load-bearing.
-3. **Dense ΔW output is over-parameterized.** The current decoder goes through
-   a 64-dim codebook then produces N² action entries, so it's already
-   implicitly rank-≤64. Making that explicit (low-rank factored output) saves
-   params and matches the true action manifold.
+3. **Dense MLP decoder is over-parameterized.** The current decoder is a tiny
+   MLP that emits `N² + N = 1056` scalars at once. With NC=1 and N=256, that
+   becomes a 65K-entry flat output — the MLP's final layer would be ~34M
+   params. A conv-transpose stack that upsamples a small spatial seed to
+   `[N, N, 1]` is ~13× smaller and produces a full-rank ΔW with spatial
+   structure that matches the encoder's.
 
 Collapsing the 8 cells into one N=256 connectivity pool, replacing the
-dense-flatten MLP encoder with a conv over the edge grid, and factoring the
-ΔW output all address the same underlying issue: **connectivity IS the
-structure the modulator operates on, so the modulator architecture should
-match that structure.**
+dense-flatten MLP encoder with a conv over the edge grid, and replacing the
+MLP decoder with a conv-transpose generator all address the same underlying
+issue: **connectivity IS the structure the modulator operates on, so the
+modulator architecture should match that structure.**
 
 ## Memory state (per lane)
 
@@ -221,8 +225,8 @@ row_feat      = mean over j axis                     # [BS, N, C_h]  — per-rec
 col_feat      = mean over i axis                     # [BS, N, C_h]  — per-sender
 ```
 
-Suggested hyperparameters (sized to hit the 100M total-param target):
-- `C_h = 256` (conv hidden channels)
+Suggested hyperparameters (sized on merit, not to hit a param budget):
+- `C_h = 192` (conv hidden channels)
 - `L_conv = 6`
 - `kernel_size = 7` — deliberately "large" because at N=256 a small kernel
   sees a rounding-error fraction of the grid per step. 7×7 sees 49 neurons'
@@ -230,13 +234,17 @@ Suggested hyperparameters (sized to hit the 100M total-param target):
   6 layers of k=7 give ~37×37 effective receptive field before global pool.
 - `groups = 32` for GroupNorm
 
-Params for a 6-layer 7×7 conv at C_h=256, C_in=78:
-- Layer 1 (C_in=78 → 256): 78·256·49 = 979K
-- Layers 2–6 (256 → 256): 256·256·49 = 3.2M × 5 = 16.1M
-- Total: **~5.4M params**
+Params for a 6-layer 7×7 conv at C_h=192, C_in=78:
+- Layer 1 (C_in=78 → 192): 78·192·49 = 734K
+- Layers 2–6 (192 → 192): 192·192·49 = 1.8M × 5 = 9.0M
+  (NOTE: these are nominal dense-conv params; depthwise-separable would
+   cut this 10× with negligible expressiveness loss — see §Open Questions)
+- Total: **~9.7M** (or ~1–2M with depthwise-separable)
 
-Compare to current per-cell logit head: 39.4M params. The conv is still
-smaller than the old encoder, but deeper and more expressive per-param.
+With a standard dense 7×7 conv, the encoder is ~10M, which is plenty for a
+classifier over a 78-channel 256×256 grid. If this turns out oversized in
+practice, the easiest cut is depthwise-separable convs (same kernel, far
+fewer params).
 
 ## Discrete bottleneck (unchanged semantics)
 
@@ -255,57 +263,101 @@ Phase 2 (hard categorical, GRPO):
 
 - `codebook`: `[K, D_code]` learned lookup, same structure as current.
 - `K = 4096` (up from current 512) — bigger vocabulary of memory-update
-  templates. Growing K is cheap: each extra code costs `D_code = 256` params.
-- `D_code = 256` (up from current 64) — richer per-code intent vector;
-  matters for downstream decoder capacity.
+  templates. Growing K is cheap: each extra code costs `D_code` params.
+- `D_code = 192` (up from current 64) — richer per-code intent vector;
+  sized to match `C_h` so pooling output and code embedding have the same
+  channel count.
 
-## Decoder: low-rank factored action
+## Decoder: conv-transpose generator (full-rank ΔW)
+
+The decoder upsamples the code embedding from a small spatial seed to the full
+N×N grid, producing a dense (full-rank) ΔW map plus a per-neuron Δdecay head.
 
 ```
-emb ∈ [BS, D_code]
-
-action_head = MLP(emb):
-    h1 = tanh(emb @ W_d1 + b_d1)                  # [BS, H_dec=256]
-    raw = h1 @ W_d2 + b_d2                         # [BS, 2·N·r + N]
-
-U         = raw[..., :N*r].reshape(BS, N, r)
-V         = raw[..., N*r : 2*N*r].reshape(BS, N, r)
-Δdecay    = raw[..., 2*N*r:]                       # [BS, N]
-
-ΔW_raw    = U @ V.T                                # [BS, N, N]
-ΔW_normed = F.rms_norm(ΔW_raw, normalized_shape=(N,))
+emb ∈ [BS, D_code=192]
+    │
+    ▼ Linear + reshape
+[BS, 192, 4, 4]                    ← small spatial seed
+    │
+    ▼ 6 × upsample stages (each scale_factor=2)
+    │   Per stage: F.interpolate(bilinear) → Conv2d(k=3) → GroupNorm → GELU
+[BS, 128, 8, 8]
+[BS, 96, 16, 16]
+[BS, 64, 32, 32]
+[BS, 48, 64, 64]
+[BS, 32, 128, 128]
+[BS, 32, 256, 256]                 ← full N×N, per-edge feature vector
+    │
+    ├─► diagonal mask (ΔW[i,i] = 0)
+    ├─► 1×1 Conv2d(32 → 1, zero-init) → ΔW_raw [BS, N, N]
+    │   └─► F.rms_norm over row axis → ΔW_normed
+    │
+    └─► row-pool [N, 32] → small MLP → Δdecay_raw [BS, N]
 ```
 
-Hyperparameters (sized for 100M budget):
-- `r = 64` (rank of ΔW per event, up from 32)
-- `H_dec = 2048` (3-layer MLP: D_code → H_dec → H_dec → flat output)
+### Why resize+conv instead of native ConvTranspose2d
 
-3-layer decoder shape:
-- `W_d1`: 256·2048 = 524K
-- `W_d2`: 2048·2048 = 4.2M
-- `W_d3`: 2048·(2·256·64 + 256) = 2048·32896 = 67.4M — too big!
+`F.interpolate(mode='bilinear') + Conv2d` avoids the checkerboard artifacts
+that native `ConvTranspose2d` with stride-2 is famous for. The learnable
+refinement happens in the plain `Conv2d`, and the upsampling itself is a
+fixed, artifact-free bilinear interpolation. Same representational power,
+cleaner training dynamics.
 
-We rebalance to stay near 100M total. Two options to pick from:
+### Zero-init the final 1×1 conv
 
-**Option A (default, 48M decoder):** 2-layer decoder, H=1024, r=64.
-- `W_d1`: 256·1024 = 262K
-- `W_d2`: 1024·32896 = 33.7M
-- Total decoder: **~34M params**
+The final `Conv2d(32 → 1)` that emits `ΔW_raw` has its weights zero-init'd.
+At init, the decoder produces `ΔW_raw ≈ 0` regardless of code. After the
+EMA blend with `γ_W`, this means `W_new ≈ W_old` at the start of training —
+the modulator can't perturb the memory into a chaotic regime before it's
+learned anything useful.
 
-**Option B (slimmer decoder, smaller rank):** 3-layer, H=2048, r=32.
-- `W_d1`: 256·2048 = 524K
-- `W_d2`: 2048·2048 = 4.2M
-- `W_d3`: 2048·16640 = 34.1M
-- Total decoder: **~38.8M params**
+### Full-rank output, no factoring
 
-Option A keeps rank=64 (more expressive per event, matches current implicit
-rank-≤64); Option B gives more nonlinear capacity in the code→factor mapping
-at the cost of halving the rank. Default to **Option A** — the rank is more
-often the bottleneck than the decoder's nonlinearity.
+Unlike the old design (which produced implicit-rank-≤64 via a 64-dim
+codebook) or an earlier draft of this one (which explicitly produced
+rank-r factors `U, V ∈ [N, r]`), the conv-transpose decoder outputs each
+`ΔW[i, j]` independently. The ΔW map can be full-rank if the task wants
+that; or it can be low-rank by learned choice. No hyperparameter commits
+the model to a rank bound.
 
-At N=256, r=64: each modulation event's ΔW is a rank-64 perturbation of W.
-Matches what the current design *implicitly* gets through the 64-dim
-codebook, but cleanly decomposed and explicit.
+### Post-processing (mask / activation / norm)
+
+Applied on the N×N map before feeding into the EMA blend:
+
+| Step | What it does |
+|---|---|
+| Diagonal mask | `ΔW[i, i] = 0` — no self-weight changes. Matches the init convention (diag zeroed). |
+| Role mask (optional) | Zero out edges that shouldn't exist structurally (e.g., within-pool input→input). Skip for v1. |
+| Row RMSNorm | Bounds per-row magnitude (already in current design, retained). |
+| EMA blend with `W_gamma` | `W_new = (1 - γ_W) · W + γ_W · ΔW_normed`. Same as current. |
+
+### Hyperparameters
+
+- Seed spatial: `[4, 4]`
+- Seed channels: `192` (matches `D_code`)
+- Upsample stages: 6 (to reach N=256 from 4)
+- Upsample channels (in, out per stage): 192→128, 128→96, 96→64, 64→48, 48→32, 32→32
+- Upsample conv kernel: 3×3, padding=1
+- Norm: GroupNorm(groups=8), Activation: GELU
+
+### Param count
+
+- Initial Linear (D_code=192 → 4·4·192 = 3072): 192 · 3072 = 590K
+- 6 upsample conv stages:
+  - Stage 1 (192 → 128, k=3): 192·128·9 = 221K
+  - Stage 2 (128 → 96, k=3): 128·96·9 = 111K
+  - Stage 3 (96 → 64, k=3): 96·64·9 = 55K
+  - Stage 4 (64 → 48, k=3): 64·48·9 = 28K
+  - Stage 5 (48 → 32, k=3): 48·32·9 = 14K
+  - Stage 6 (32 → 32, k=3): 32·32·9 = 9K
+  - Subtotal: ~438K
+- Final 1×1 Conv (32 → 1): 32 (tiny, zero-init)
+- Δdecay head (row-pool [N, 32] → MLP 32 → 64 → 1): ~2K
+- **Decoder total: ~1.0M params**
+
+(About 13× smaller than the MLP decoder it replaces. Full-rank output. No
+rank hyperparameter. Yes, genuinely this much smaller — the heavy work
+happens in the conv upsample stages, which don't have enormous FC layers.)
 
 ## Applying the update
 
@@ -317,11 +369,11 @@ W_gamma      = sigmoid(W_decay_logit)               # [N]
 decay_gamma  = sigmoid(decay_gamma_logit)           # [N]
 hebbian_gamma = sigmoid(hebbian_decay_logit)        # [N]
 
-# Update W (EMA toward row-RMS-normed low-rank target):
+# Update W (EMA toward row-RMS-normed target from conv-transpose decoder):
 W_new = (1 - W_gamma[None, :, None]) * W + W_gamma[None, :, None] * ΔW_normed
 
 # Update decay:
-target_decay = sigmoid(Δdecay)
+target_decay = sigmoid(Δdecay_raw)
 decay_new    = (1 - decay_gamma[None, :]) * decay + decay_gamma[None, :] * target_decay
 ```
 
@@ -345,20 +397,24 @@ current per-cell loop, slightly more compute total at N=256 vs NC·N=256.
 
 ## Cost accounting
 
-Per modulation event (BS=72, N=256, C_h=64):
+Per modulation event (BS=72, N=256, C_h=192, C_dec_max=128):
 
-| Step | FLOPs | Notes |
+| Step | FLOPs (order of magnitude) | Notes |
 |---|---:|---|
-| Project h, msg | 72·256·(256·16·2) ≈ 150M | Linear proj |
-| Build grid (concat + broadcast) | memory-bound, ~500 MB write | One-time per event |
-| Conv layer × 4 | 72·65K·64·64·9 ≈ 170G total | Runs at ~0.7ms/layer on 4090 |
-| Pool + code logit | 72·64·K ≈ 2M | Tiny |
-| Decoder | 72·(64·256 + 256·16640) ≈ 300M | Once per event |
-| ΔW construction | 72·256·32·256 ≈ 150M | U @ Vᵀ |
+| Project h, msg_emit, msg_recv | ~350M | 3 linear projections over N=256 |
+| Build grid (broadcast + concat to [N,N,78]) | memory-bound, ~900 MB write | Materialize once per event |
+| Conv encoder × 6 layers (k=7, C_h=192) | ~550G | Bulk of modulator compute |
+| Pool + code logit (192 → K=4096) | ~55M | Tiny |
+| Decoder initial Linear (192 → 3072) | ~40M | Small |
+| Decoder 6 upsample stages (N²·C at output sides) | ~80G total | Upsample path |
+| Decoder final 1×1 conv | ~5M | Reduce to scalar ΔW |
+| Row RMSNorm + diag mask + EMA blend | O(BS·N²) | Memory-bound |
 
-Wall time estimate: **~3 ms per modulation event** on 4090. At mod_interval=4
-and T=128, that's 32 events × 3ms = **96 ms per segment**. Comparable to
-current, with richer observation and larger cell.
+Wall time estimate on 4090: **~5-8 ms per modulation event**. At
+mod_interval=4 and T=128 that's 32 events × 6ms ≈ **200 ms per segment**
+dominated by the conv encoder. Non-modulation per-step memory work
+(W·msg, state MLP, msg MLP, Hebbian update at N=256) adds another chunk;
+overall throughput target **≥25K tok/s at BS=72**.
 
 Per step (non-modulation):
 
@@ -410,77 +466,102 @@ Two-phase curriculum is same: bootstrap ~500M tokens, cycles ~50M each.
 - `neurons_per_cell` as an architectural knob (replaced by `N_total`)
 - `N_cells` > 1 connectivity (cells become virtual port pools)
 
-## Parameter budget (100M target total)
+## Parameter budget (sized on merit)
 
-Current model: ~109M (LM ~52M + Memory ~42M).
-Target: ~100M (LM ~52M + Memory ~48M).
+We don't target a specific total-param number. Each component is sized for
+what it plausibly needs to do the job. If phase-1 training hits capacity
+ceilings we have clear levers to bump (wider encoder, more codes, etc.).
 
 Memory allocation under this design:
 
 | Component | Params |
 |---|---:|
-| Projection heads (h_proj, msg_emit_proj, msg_recv_proj) | 12K |
-| Role embeddings | tiny |
-| Conv stack (6 layers, C_h=256, k=7) | 5.4M |
-| Code logit head (C_h=256 → K=4096) | 1.0M |
-| Codebook (K=4096 × D_code=256) | 1.0M |
-| Decoder (Option A: 2-layer, H=1024, r=64) | 34.0M |
-| `inject_w, inject_b` (8 pools × α×D_n×D_n) | 2.1M |
+| Projection heads (h_proj, msg_emit_proj, msg_recv_proj): 3 × D_n · d_proj | 12K |
+| Role embeddings (3 × role_dim=4) | tiny |
+| Conv encoder (6 layers, C_h=192, k=7) | 9.7M |
+| Code logit head (C_h=192 → K=4096) | 786K |
+| Codebook (K=4096 × D_code=192) | 786K |
+| Decoder (conv-transpose, 6 upsample stages + init Linear) | 1.0M |
+| `inject_w, inject_b` (8 pools × α·D_n·D_n) | 2.1M |
 | `neuron_id` (N=256 × D_n=256) | 65K |
-| State/msg MLPs | 260K |
-| Per-neuron plasticity logits | 1K |
-| **Memory total** | **~48M** |
+| State MLP + msg MLP (shared) | 260K |
+| Per-neuron plasticity logits (3 × N=256) | 1K |
+| **Memory total** | **~14.8M** |
 
-LM (unchanged): 52M.
+LM (unchanged): ~52M.
 
-**Grand total: ~100M. ✓**
+**Grand total: ~67M.**
 
-Where the params went compared to the old 42M:
-- **Encoder**: 39.4M → 6.4M (conv + logit head). The giant MLP on flattened
-  N² is gone; the conv is much smaller but deeper and spatially structured.
-- **Decoder**: 143K → 34M. This is the big shift. We're paying for rich
-  action synthesis — 4096 codes, each mapped to a rank-64 ΔW perturbation
-  via a 1024-hidden MLP. The action manifold is where the modulator's
-  expressiveness actually matters.
-- **Codebook**: 33K → 1M. Bigger vocabulary of memory-update templates.
-- **Conv stack**: new, 5.4M. Moderate compared to the decoder.
+Less than the current ~109M. That's fine — we're not padding to match
+baselines, we're testing whether the conv-grid modulator works. If it trains
+well at 67M, that's a cleaner result than one where we couldn't tell if it
+was capacity or architecture doing the work.
+
+Where the params moved compared to the old 42M-memory design:
+
+- **Encoder**: 39.4M → 10.5M (conv + logit head). The per-cell MLP on
+  flattened N² was the biggest waste; replacing it with a conv that
+  shares weights across grid positions is the big structural win.
+- **Decoder**: 143K → 1.0M. Slight increase, but now full-rank N×N ΔW
+  via conv-transpose, no rank bottleneck.
+- **Codebook**: 33K → 786K. 8× more templates, each 3× richer.
+- **Everything else**: roughly unchanged.
+
+### If it turns out we need more capacity
+
+In priority order, the cheapest/highest-leverage bumps:
+1. **Encoder depth** `L_conv` 6 → 8 (+3M).
+2. **Encoder width** `C_h` 192 → 256 (+4M).
+3. **Codebook size** `K` 4096 → 8192 (+786K).
+4. **Decoder width** — bump the channel ladder in the upsample stages
+   (e.g., 192 → 256 → 192 → ...) (+few hundred K).
+5. **Depthwise-separable convs** to save compute if that becomes the
+   binding constraint rather than params.
+
+Cheap to scale up; don't scale preemptively.
 
 ## Comparison in one table
 
 | Axis | Current | This design |
 |---|---|---|
-| Modulator encoder | 39M params, MLP on flattened N² | 150K–600K params, 2D conv on edge grid |
-| Observation content | Rates + correlations only | + compressed node content + edge asymmetry |
-| Action space rank per event | ≤64 implicit via codebook | 32 explicit via factored U, V |
+| Modulator encoder | 39M params, MLP on flattened N² | ~10M params, 2D conv on edge grid |
+| Observation content | Rates + correlations only | + compressed node content (h, msg_emit, msg_recv) + edge asymmetry |
+| Decoder | 143K MLP, produces implicit rank-≤64 N² action | 1M conv-transpose stack, full-rank N×N ΔW |
 | Policy structure | 8 independent codes per event | 1 code per event |
 | Neurons per cell | 32 | 256 |
 | Cells | 8 | 1 |
 | Total neurons | 256 | 256 |
-| W matrices | 8 × 32² = 8192 entries | 1 × 256² = 65K entries (8× more) |
+| W matrices | 8 × 32² = 8192 entries | 1 × 256² = 65K entries (8× more connectivity) |
 | Connectivity | within cells only | global across whole cell |
+| Memory module params | 42M | ~15M |
 
 ## Open questions
 
 1. **Content vs content-free observation.** The compressed h/msg broadcast is
    a departure from "statistics only" — do we regress on the biologically
    principled stance, or keep it? Worth ablating.
-2. **`r` (action rank).** 32 vs 64 vs 128. Start at 32; ablate if decoder
-   capacity feels tight.
-3. **Depthwise-separable conv vs dense conv.** Dense is simpler and fits;
-   depthwise is faster but slightly more complex. Start dense.
-4. **Kernel size.** 3×3 gives 3-neuron receptive field per layer; 5×5 halves
-   needed depth to see globally. Start 3×3.
-5. **One code per event vs a few (H=2 or 4).** Even without the 8-cell
+2. **Depthwise-separable vs dense conv in the encoder.** Dense is simpler
+   and fits at ~10M params; depthwise is ~10× fewer params with similar
+   expressiveness. Start dense, switch if compute becomes tight.
+3. **One code per event vs a few (H=2 or 4).** Even without the 8-cell
    factoring, having a handful of parallel codes could matter for GRPO SNR.
    Deferred to post-phase-1 evaluation.
-6. **Layer norm placement.** Between convs (GroupNorm) and around pooling
-   heads. Pay attention if training instability appears.
-7. **Role embeddings vs positional.** Role (port/internal) is the invariance
-   we care about; we skip positional (neurons don't have a "position"
-   meaning). Confirm by ablation.
-8. **Should conv be replaced by attention-with-edge-bias?** Permutation-
+4. **Conv-transpose vs resize+conv in the decoder.** We default to
+   resize+conv to avoid checkerboard artifacts. Native `ConvTranspose2d`
+   could be tried if wall-time matters and artifacts turn out not to bite
+   (the downstream RMSNorm + EMA blend may absorb them).
+5. **Post-processing on ΔW.** Currently only diagonal mask + row RMSNorm.
+   Role mask (zeroing structurally-impossible edges) is an option if we
+   want to enforce hard port-layer constraints.
+6. **Should conv be replaced by attention-with-edge-bias?** Permutation-
    equivariant, but less hardware-optimal. If conv training is unstable, try
    attention as a fallback.
+7. **Zero-init vs small-std init on the decoder's final conv.** Zero-init
+   gives a clean "no update at init" starting point; small-std gives
+   immediate exploration. Start zero.
+8. **Per-cell vs per-neuron plasticity γ.** We moved from per-cell (24
+   scalars) to per-neuron (768 scalars). If this causes instability (e.g.,
+   a subset of neurons learning pathological rates), back off to per-cell.
 
 ## References and related work
 
@@ -490,5 +571,8 @@ Where the params went compared to the old 42M:
 - Message-passing neural networks (Gilmer et al. 2017) — the general framework
   for node + edge updates; conv-over-edge-grid is a specific instance when
   edges form a dense pairwise set.
+- Odena et al., "Deconvolution and Checkerboard Artifacts" (2016) — the
+  canonical reference for why we use resize+conv instead of native
+  ConvTranspose2d in the decoder.
 - Transformer with edge biases (Graphormer, Dwivedi & Bresson 2020) — the
   permutation-equivariant fallback if conv misbehaves.
