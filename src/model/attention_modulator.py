@@ -66,11 +66,20 @@ class AttentionModulator(nn.Module):
             nn.Linear(max(H, 8), H),
         )
 
-        # Attention blocks (shared across cells).
+        # Per-cell attention blocks (shared weights across cells).
         self.layers = nn.ModuleList([
             AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
                       dropout=config.attn_dropout)
             for _ in range(config.attn_n_layers)
+        ])
+
+        # Cross-cell attention blocks: attend over all NC*Nc tokens globally
+        # without edge bias (no edges between cells at W level). Recovers
+        # long-distance perception even though W is block-diagonal.
+        self.cross_cell_layers = nn.ModuleList([
+            AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
+                      dropout=config.attn_dropout)
+            for _ in range(config.attn_cross_cell_layers)
         ])
 
         # Pool + logit head (shared across cells — same projection applied to
@@ -148,19 +157,28 @@ class AttentionModulator(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Returns (logits [BS, NC, K], tokens [BS, NC, Nc, F])."""
         tokens = self.build_tokens(h, msg, received, decay, s_live, s_ema, role_id)
-        edge_bias = self.build_edge_bias(W, hebbian)
-
-        # Reshape to run attention per-cell (NC as extra batch dim).
         BS, NC, Nc, F_tok = tokens.shape
-        tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
-        edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
 
-        for layer in self.layers:
-            tokens_flat = layer(tokens_flat, edge_bias_flat)
+        # Phase 1: per-cell attention with edge bias. NC runs as batch.
+        if len(self.layers) > 0:
+            edge_bias = self.build_edge_bias(W, hebbian)
+            tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
+            edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
+            for layer in self.layers:
+                tokens_flat = layer(tokens_flat, edge_bias_flat)
+            tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
 
-        tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
+        # Phase 2: cross-cell attention. Flat over all NC*Nc tokens,
+        # no edge bias (no edges between cells at W level; cross-cell
+        # coordination happens purely in perception space).
+        if len(self.cross_cell_layers) > 0:
+            N_total = NC * Nc
+            flat_tokens = tokens.reshape(BS, N_total, F_tok)
+            for layer in self.cross_cell_layers:
+                flat_tokens = layer(flat_tokens, edge_bias=None)
+            tokens = flat_tokens.reshape(BS, NC, Nc, F_tok)
 
-        # Pool per cell: mean over Nc → [BS, NC, F]. Then logits per cell.
+        # Pool per cell → per-cell logits.
         pooled = self.pool_norm(tokens).mean(dim=2)       # [BS, NC, F]
         return self.logit_head(pooled), tokens
 
@@ -186,8 +204,8 @@ class AttnBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x: Tensor, edge_bias: Tensor) -> Tensor:
-        """x: [B, N, F], edge_bias: [B, H, N, N] → [B, N, F]."""
+    def forward(self, x: Tensor, edge_bias: Tensor | None = None) -> Tensor:
+        """x: [B, N, F], edge_bias: [B, H, N, N] or None → [B, N, F]."""
         B, N, F_tok = x.shape
         h = self.norm1(x)
         qkv = self.qkv(h).reshape(B, N, 3, self.H, self.head_dim)
