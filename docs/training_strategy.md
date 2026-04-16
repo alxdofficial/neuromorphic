@@ -65,7 +65,7 @@ system co-adapt.
 
 - `T = 128` tokens per segment, `tbptt_block = 8` (detach at 8-token boundaries)
 - `modulation_interval = 4` tokens between modulator calls
-- `BS = 80` (RTX 4090 max at ~113M params)
+- `BS = 72` (RTX 4090 max at ~109M params with torch.compile enabled)
 - `lr = 3e-4` → `3e-5` cosine, `lr_target_step` covers bootstrap + all cycles
 - `mem_pred_weight = 0.1` on the memory-head auxiliary CE loss
 - Gumbel τ annealing: linear 1.0 → 0.3 across `lr_target_step` (auto-wired in
@@ -222,8 +222,8 @@ that lane's content stream — they diverge naturally, which is expected. The
 modulator weights are `nn.Parameter`s shared across lanes and updated by every
 backward pass, so the policy stays synchronized by construction.
 
-`resize_to_bs(new_bs)` handles BS changes (phase 1 BS=80 → phase 2 BS=8/12/16/24
-→ next cycle BS=80). Shrink samples lanes at random; grow tiles cyclically.
+`resize_to_bs(new_bs)` handles BS changes (phase 1 BS=72 → phase 2 BS=8/12/16/24
+→ next cycle BS=72). Shrink samples lanes at random; grow tiles cyclically.
 Transient state (`h`, `msg`, LM scan carries) is reset on BS change and
 repopulated via `--warmup-batches` forward-only passes.
 
@@ -289,10 +289,10 @@ code. Letting the logit head absorb that shift keeps the system coherent.
 ## Open questions / future work
 
 - Whether the long-horizon hypothesis is correct. Phase 2 is the experiment that tests it.
-- Whether K=256 codes × 8 cells is the right effective vocabulary size, or whether
+- Whether K=512 codes × 8 cells is the right effective vocabulary size, or whether
   the action manifold collapses to fewer meaningful clusters.
-- Whether the `code_dim=32` bottleneck limits decoder expressiveness — the rank
-  of the decoded action set is bounded by `min(code_dim, decoder_hidden)` = 32.
+- Whether the `code_dim=64` bottleneck limits decoder expressiveness — the rank
+  of the decoded action set is bounded by `min(code_dim, decoder_hidden)` = 64.
 - Whether GRPO with K=8 trajectories has enough variance reduction without a critic.
 - Whether the shared advantage broadcast across the 8 cells (every cell sees the
   same per-slot advantage) causes policy collapse toward cell-uniform behavior —

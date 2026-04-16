@@ -20,12 +20,21 @@ class Config:
     # === Memory Graph (dense-W) ===
     D_n: int = 256             # neuron hidden dim
     alpha: int = 4             # input/output ports per cell
-    neurons_per_cell: int = 48 # 16-aligned for bf16 tensor cores; ~114M total
+    neurons_per_cell: int = 32 # keeps W/hebbian state small (N²=1024/cell) so
+                               # BS=72 fits on a 4090. Extra capacity goes to
+                               # cell_mod_hidden / num_codes instead — they
+                               # scale memory param count without inflating
+                               # per-sample runtime state.
     K: int = 8                 # initial sparse connections per neuron (W init only)
-    cell_mod_hidden: int = 2048
+    cell_mod_hidden: int = 3072  # per-cell modulator hidden dim (logit head)
     state_mlp_hidden: int = 256
     msg_mlp_hidden: int = 256
     modulation_interval: int = 4
+
+    # === Discrete Action Policy (integrated neuromodulator) ===
+    num_codes: int = 512       # K codes per cell — size of plasticity vocabulary
+    code_dim: int = 64         # codebook embedding dim — expressive action space
+    decoder_hidden: int = 128  # shared code→action decoder hidden
 
     # === Tuning knobs (validated empirically — change with care) ===
     mem_pred_weight: float = 0.1   # weight of mem_pred_loss in total loss

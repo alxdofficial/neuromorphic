@@ -30,13 +30,13 @@ all cycles, so the code semantics phase 2 GRPO trains against are stable
 across cycles. The logit head keeps training in phase 1 to adapt to LM
 improvements, then gets updated by GRPO in phase 2.
 
-**Typical 1.5B-token config** (BS=80, RTX 4090, ~25h):
+**Typical 1.5B-token config** (BS=72, RTX 4090, ~10h @ 42K tok/s):
 
 ```bash
 python -u -m src.train_loop \
-    --work-dir outputs/v14 \
-    --bs 80 \
-    --phase2-bs 8 \
+    --work-dir outputs/tiny_01 \
+    --bs 72 \
+    --phase2-bs 24 \
     --phase2-group-size 8 \
     --bootstrap-tokens 500_000_000 \
     --phase1-tokens-per-cycle 10_000_000 \
@@ -44,7 +44,7 @@ python -u -m src.train_loop \
 ```
 
 Token budget breakdown:
-- Bootstrap: 500M tokens (~3.2h at 43K tok/s)
+- Bootstrap: 500M tokens (~3.3h at 42K tok/s)
 - Per cycle: ~50M tokens (10M phase 1 + 40M phase 2 curriculum)
 - 20 cycles: 1,000M tokens
 - **Total: 1,500M tokens** (matches baseline training budget)
@@ -59,8 +59,8 @@ Use `--skip-bootstrap` if `bootstrap.pt` already exists in `--work-dir`, and
 
 ```bash
 python -u -m src.train \
-    --bs 80 \
-    --steps 48828 \
+    --bs 72 \
+    --steps 54253 \
     --lr-target-step 48828 \
     --save-dir outputs/run1
 ```
@@ -102,7 +102,7 @@ Important flags:
 - `--stage1-tokens` ... `--stage4-tokens` — per-stage token budgets for the
   curriculum (reward windows 512 / 1024 / 2048 / 4096).
 - `--warmup-batches N` — forward-only batches to warm the memory state at
-  phase-2 BS before GRPO starts (phase-1 BS=80 memory state is resized to
+  phase-2 BS before GRPO starts (phase-1 BS=72 memory state is resized to
   phase-2 BS via lane tile/trim).
 - `--entropy-coeff` — coefficient on categorical entropy bonus (default 0.01).
 - `--group-size` — K rollouts per batch item (default 8). GRPO normalizes
@@ -160,4 +160,4 @@ Results (1.5B tokens, RTX 4090):
 | GPT-2 small | 124M | 2.955 | 19.2 |
 | Pythia-160m | 160M | 2.736 | 15.4 |
 | Mamba-130m | 130M | 3.294 | 27.0 |
-| **Neuromorphic LM** | **113M** | **TBD** | **TBD** |
+| **Neuromorphic LM** | **109M** | **TBD** | **TBD** |
