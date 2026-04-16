@@ -396,6 +396,64 @@ Verify:
 
 If this works, scale up to the real training budget.
 
+## Must-carry-over from current code
+
+These are non-obvious subtleties from the current implementation that must
+survive the refactor. Losing any of them is a known way to break training.
+
+### Precision (bf16 vs f32)
+
+| Item | Source | Why |
+|---|---|---|
+| Hebbian update `msg @ msgᵀ` | `memory.py:831` | f32 accumulation; at γ_heb ≈ 0.88 the `(1-γ)` factor loses precision in bf16 |
+| EMA blend for W: `(1-γ_W)·W + γ_W·ΔW_normed` | `memory.py:786` | f32 accumulation, cast back to bf16 at the end |
+| EMA blend for decay | `memory.py:790` | same reason |
+| Decay stored directly in [0,1], convex EMA | `memory.py:196` | No sigmoid-of-unbounded-logit at use time |
+| `clamp(min=1e-6, max=1.0-1e-6)` on γ before log in half-life | `memory.py:513` | Avoid inf |
+
+### Initialization
+
+| Item | Source | Detail |
+|---|---|---|
+| Xavier + TANH_GAIN=5/3 for tanh layers | `memory.py:123-129` | state/msg MLP layers |
+| Xavier (gain=1.0) for linear-output layers | `memory.py:141` | inject projection |
+| Small-std (1e-3) for decoder output layer | `discrete_policy.py:93` | Old MLP decoder. **New design: zero-init the final `dW_head` 1×1 conv**, same purpose (start at no-op). |
+| Codebook init `randn * D_code**-0.5` | `discrete_policy.py:80` | Unit-norm-ish per row |
+| Plasticity logits at `-3.0` (γ≈0.047) for W, decay | `memory.py:104,116` | Slow initial integration |
+| Plasticity logit at `+2.0` (γ≈0.88) for hebbian | `memory.py:90` | Faster hebbian tracking |
+
+### Gradient management
+
+| Item | Source | New design notes |
+|---|---|---|
+| Split grad clip pools (LM / dynamics / modulator) | `trainer.py:73-103` | Update pool membership: **modulator pool** = conv encoder + logit head. **dynamics pool** = state/msg MLPs + inject + neuron_id + plasticity logits + codebook + decoder. |
+| sqrt(N)-scaled per-pool clip budgets | `trainer.py:101-103` | Auto-adjusts to new pool sizes. |
+| `mem_lr_scale` separate LR for memory | `train.py:168` | Keep at 1.0; revisit if mem/LM grad scales diverge. |
+| `H_mid.detach()` at memory input | `model.py:82` | **Load-bearing** — memory doesn't get gradient via input path, only via readout path. |
+| Cosine LR + warmup schedule | `train.py:185-192` | Unchanged. |
+| Fused AdamW on CUDA | `train.py:181` | Unchanged. |
+| EOT-aware valid mask on mem_pred_loss | `memory.py:991-1005` | Carry over. Live surprise signal does NOT mask — spike at EOT is legitimate. |
+
+### Training mechanics
+
+| Item | Source | New design notes |
+|---|---|---|
+| `torch.compile` on `_run_block` | `memory.py:977` | Verify compile handles new conv encoder call. Disable on encoder specifically if needed; keep on step loop. |
+| Activation checkpoint option | `memory.py:1057` | Keep for memory loop. Add similar option for conv-transpose decoder (its peak activation `[BS, 32, 256, 256]` ≈ 600 MB). |
+| `F.rms_norm` fused kernel (not manual) | `memory.py:677` | Use for ΔW row-normalization in the new decoder. |
+| Dead-code reset, bootstrap only | `discrete_policy.py:275`, `train.py:377` | **Bump reset cadence for K=4096**: with 8× more codes, dead-code risk is higher. Reset every 200-300 steps instead of 500 during first few thousand steps. |
+| Gumbel τ anneal 1.0 → 0.3 across `lr_target_step` | `train.py` step_callback, `memory.py:83` | Unchanged mechanism. **Consider a floor >0.3 for large K** — if K=4096 makes training unstable, raise floor to 0.5. |
+| Compile-safe code usage (one_hot+sum, not bincount) | `discrete_policy.py:266` | Keep — required for torch.compile compatibility. |
+| AdamW momentum zeroing on dead-code reset | `discrete_policy.py:312` | Keep — otherwise stale momentum drags reset rows back. |
+| `prev_token` passed through for chunk boundaries | `model.py:40`, `memory.py:945` | Keep — EOT mask at position 0 depends on it. |
+
+### Telemetry / debuggability (add to the new design)
+
+- Per-neuron plasticity `γ` distribution (min/max/std across N=256). With 256 independent γ values, watch for pathological tails.
+- Conv encoder activation magnitudes per layer (raw scale check at init).
+- Decoder `ΔW_raw` distribution pre-rms-norm, per modulation event.
+- `mod_grad_norm` — scale of gradient flowing back to the conv encoder.
+
 ## Testing strategy
 
 Three levels:
