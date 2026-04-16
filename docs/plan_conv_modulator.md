@@ -35,16 +35,18 @@ Change dataclass fields:
 - Add `conv_channels: int = 192` (encoder conv hidden width).
 - Add `conv_layers: int = 6`.
 - Add `conv_kernel: int = 7`.
-- Add `conv_groups: int = 32` (for GroupNorm in encoder).
-- Add `decoder_seed_spatial: int = 4` (starting spatial dim of decoder).
-- Add `decoder_seed_channels: int = 192` (matches D_code).
-- Add `decoder_groups: int = 8` (for GroupNorm in decoder upsample stages).
-- Add `role_dim: int = 4` (role embedding dim).
+- Add `conv_groups: int = 32` (GroupNorm groups; shared between encoder
+  and decoder for uniformity).
+- Add `conv_dropout: float = 0.1` (dropout between conv layers in encoder).
+- Add `decoder_seed_spatial: int = 4`.
+- Add `decoder_seed_channels: int = 256` (decoupled from D_code).
+- Add `gamma_max: float = 0.97` (bf16-safe ceiling on plasticity γ).
+- Add `role_dim: int = 4`.
+- Add `checkpoint_decoder: bool = False` (activation-ckpt flag for decoder;
+  mirrors existing `checkpoint_memory` for the memory loop).
 - Update `num_codes: 512 → 4096`, `code_dim: 64 → 384`.
-- Set `decoder_seed_channels: 256` (decoupled from D_code).
-- Remove: `action_rank` (no longer needed; decoder produces full-rank ΔW
-  directly via conv-transpose).
-- Remove: `decoder_hidden` (no longer a dense-MLP decoder).
+- Remove: `action_rank`, `decoder_hidden`, `decoder_groups` (separate from
+  `conv_groups`).
 - Deprecate `N_cells`, `neurons_per_cell`, `K` (initial W sparsity — no longer
   applicable with single-pool dense W). Leave for one cycle of back-compat if
   convenient; delete in step 10.
@@ -132,49 +134,88 @@ class ConvGridModulator(nn.Module):
         self.N = config.N_total
         self.D_n = config.D_n
         self.d_proj = config.d_proj
+        C_h = config.conv_channels
+        k = config.conv_kernel
+        pad = k // 2
 
+        # Three node-feature projections (h, msg_emit, msg_recv)
         self.h_proj = nn.Linear(D_n, d_proj, bias=False)
-        self.msg_proj = nn.Linear(D_n, d_proj, bias=False)
-        self.role_emb = nn.Embedding(3, config.role_dim)  # input/output/internal
+        self.msg_emit_proj = nn.Linear(D_n, d_proj, bias=False)
+        self.msg_recv_proj = nn.Linear(D_n, d_proj, bias=False)
+        self.role_emb = nn.Embedding(3, config.role_dim)
 
-        # Compute input channel count from design
-        C_in = 3 + 3*d_proj + 1 + 2*role_dim + 2
-        self.conv_in = nn.Conv2d(C_in, conv_channels, kernel=3, padding=1)
-        self.convs = nn.ModuleList([
-            nn.Conv2d(conv_channels, conv_channels, kernel=3, padding=1)
-            for _ in range(conv_layers - 1)
+        # Input channel count — see design doc observation section
+        # 3 raw edge + 4·d_proj node + 2·role_dim roles + 1 decay + 2 global
+        C_in = 3 + 4*d_proj + 2*role_dim + 1 + 2
+
+        # Stem: project observation channels to conv width
+        self.stem = nn.Conv2d(C_in, C_h, kernel_size=k, padding=pad)
+        self.stem_norm = nn.GroupNorm(config.conv_groups, C_h)
+
+        # Residual conv blocks (pre-norm). Layers 2..L_conv.
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm': nn.GroupNorm(config.conv_groups, C_h),
+                'conv': nn.Conv2d(C_h, C_h, kernel_size=k, padding=pad),
+            }) for _ in range(config.conv_layers - 1)
         ])
-        self.norms = nn.ModuleList([
-            nn.GroupNorm(conv_groups, conv_channels) for _ in range(conv_layers)
-        ])
+        self.dropout = nn.Dropout2d(config.conv_dropout)
 
         # Pooling head → code logits
-        self.logit_head = nn.Linear(conv_channels, config.num_codes)
+        self.logit_head = nn.Linear(C_h, config.num_codes)
 
-    def build_input(self, h, msg, W, hebbian, decay, s_live, s_ema, role_id) -> Tensor:
-        """Build the [BS, N, N, C_in] edge feature map."""
-        h_p = self.h_proj(h)        # [BS, N, d_proj]
-        msg_p = self.msg_proj(msg)  # [BS, N, d_proj]
-        role_e = self.role_emb(role_id)  # [N, role_dim]
+    def build_input(self, h, msg, received, W, hebbian, decay,
+                     s_live, s_ema, role_id) -> Tensor:
+        """Build [BS, C_in, N, N] edge feature map in bf16."""
+        BS, N, _ = h.shape
+        dt = h.dtype
 
-        # Broadcast to grid: h_p[i] broadcast over j dim, h_p[j] over i dim, etc.
-        ...
-        # Concat all channels
-        return E  # [BS, N, N, C_in]
+        h_p = self.h_proj(h)                          # [BS, N, d_proj]
+        me_p = self.msg_emit_proj(msg)                # [BS, N, d_proj]
+        mr_p = self.msg_recv_proj(received)           # [BS, N, d_proj]
+        role_e = self.role_emb(role_id).to(dt)        # [N, role_dim]
 
-    def encoder_forward(self, E: Tensor) -> Tensor:
-        """Conv stack → pooled cell feature."""
-        x = E.permute(0, 3, 1, 2)  # [BS, C_in, N, N] for Conv2d
-        x = self.conv_in(x)
-        for conv, norm in zip(self.convs, self.norms):
-            x = conv(norm(F.gelu(x)))
-        pooled = x.mean(dim=(2, 3))  # global avg pool → [BS, C_h]
+        # Broadcast per-neuron features into grid (receiver down col, sender across row)
+        def bcast_row(x):   # [BS, N, F] → [BS, N, N, F] broadcasting along j axis
+            return x.unsqueeze(2).expand(BS, N, N, x.shape[-1])
+        def bcast_col(x):   # [BS, N, F] → [BS, N, N, F] broadcasting along i axis
+            return x.unsqueeze(1).expand(BS, N, N, x.shape[-1])
+
+        W_ij = W.unsqueeze(-1)                         # [BS, N, N, 1]
+        heb_ij = hebbian.unsqueeze(-1)                 # [BS, N, N, 1]
+        asym = (W - W.transpose(-1, -2)).unsqueeze(-1) # [BS, N, N, 1]
+
+        s_live_b = s_live.view(BS, 1, 1, 1).expand(BS, N, N, 1)
+        s_ema_b  = s_ema.view(BS, 1, 1, 1).expand(BS, N, N, 1)
+
+        channels = torch.cat([
+            W_ij, heb_ij, asym,                        # 3 raw edge
+            bcast_row(h_p), bcast_col(h_p),            # 2·d_proj node
+            bcast_row(me_p), bcast_row(mr_p),          # 2·d_proj msg (per receiver)
+            bcast_row(role_e), bcast_col(role_e),      # 2·role_dim
+            bcast_row(decay.unsqueeze(-1)),            # 1 decay (receiver)
+            s_live_b, s_ema_b,                          # 2 global
+        ], dim=-1)                                      # [BS, N, N, C_in]
+
+        return channels.permute(0, 3, 1, 2).contiguous()  # [BS, C_in, N, N]
+
+    def encoder_forward(self, x: Tensor) -> Tensor:
+        """Pre-norm residual conv stack → pooled cell feature."""
+        x = F.gelu(self.stem_norm(self.stem(x)))
+        for block in self.blocks:
+            h = block['norm'](x)
+            h = F.gelu(block['conv'](h))
+            h = self.dropout(h)
+            x = x + h                                    # residual
+        pooled = x.mean(dim=(2, 3))                       # [BS, C_h]
         return pooled
 
-    def forward(self, h, msg, W, hebbian, decay, s_live, s_ema, role_id) -> Tensor:
-        E = self.build_input(h, msg, W, hebbian, decay, s_live, s_ema, role_id)
+    def forward(self, h, msg, received, W, hebbian, decay,
+                s_live, s_ema, role_id) -> Tensor:
+        E = self.build_input(h, msg, received, W, hebbian, decay,
+                              s_live, s_ema, role_id)
         pooled = self.encoder_forward(E)
-        logits = self.logit_head(pooled)  # [BS, K]
+        logits = self.logit_head(pooled)                 # [BS, K]
         return logits
 ```
 
@@ -205,7 +246,7 @@ Remove:
 - `logit_w1/b1/w2/b2` parameters.
 - Old dense-MLP decoder params (`dec_w1`, `dec_b1`, `dec_w2`, `dec_b2`).
 
-New decoder: **conv-transpose generator**.
+New decoder: **conv-transpose generator** (pre-norm residual, resize+conv).
 
 ```python
 class ConvTransposeDecoder(nn.Module):
@@ -214,25 +255,26 @@ class ConvTransposeDecoder(nn.Module):
         N = config.N_total
         D_code = config.code_dim
         S = config.decoder_seed_spatial         # 4
-        C0 = config.decoder_seed_channels        # 192
+        C0 = config.decoder_seed_channels        # 256
 
+        self.N = N
         # Start projection: code_emb → spatial seed
         self.init_proj = nn.Linear(D_code, S * S * C0)
 
-        # Upsample stages: resize + conv pattern (artifact-free)
-        # 6 stages from 4×4 to 256×256 at N=256
-        # Channel ladder: 192 → 128 → 96 → 64 → 48 → 32 → 32
+        # Upsample stages. Channel ladder: 256 → 128 → 96 → 64 → 48 → 32 → 32.
+        # Each stage: upsample → pre-norm residual conv block.
         channel_ladder = [C0, 128, 96, 64, 48, 32, 32]
         self.stages = nn.ModuleList()
         for c_in, c_out in zip(channel_ladder[:-1], channel_ladder[1:]):
-            self.stages.append(nn.Sequential(
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
-                nn.GroupNorm(config.decoder_groups, c_out),
-                nn.GELU(),
-            ))
+            self.stages.append(nn.ModuleDict({
+                'norm':    nn.GroupNorm(config.conv_groups, c_in),
+                'conv':    nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                # 1×1 projection for residual if channels mismatch
+                'proj':    (nn.Conv2d(c_in, c_out, kernel_size=1)
+                            if c_in != c_out else nn.Identity()),
+            }))
 
-        # Final 1×1 head → ΔW_raw (zero-init!)
+        # Final 1×1 head → ΔW_raw (ZERO-INIT — critical)
         self.dW_head = nn.Conv2d(32, 1, kernel_size=1)
         nn.init.zeros_(self.dW_head.weight)
         nn.init.zeros_(self.dW_head.bias)
@@ -241,27 +283,37 @@ class ConvTransposeDecoder(nn.Module):
         self.decay_head = nn.Sequential(
             nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 1),
         )
-        # Diagonal mask (cached)
+        # Diagonal mask (cached buffer)
         self.register_buffer('diag_mask', torch.eye(N).unsqueeze(0))
 
     def forward(self, emb: Tensor) -> tuple[Tensor, Tensor]:
-        """emb: [BS, D_code] → (ΔW_raw [BS, N, N], Δdecay_raw [BS, N])"""
-        x = self.init_proj(emb).reshape(-1, C0, S, S)
+        """emb: [BS, D_code] → (ΔW_normed [BS, N, N], Δdecay_raw [BS, N])"""
+        BS = emb.shape[0]
+        x = self.init_proj(emb).reshape(BS, -1, 4, 4)     # seed
+
         for stage in self.stages:
-            x = stage(x)
+            y = F.interpolate(x, scale_factor=2, mode='bilinear',
+                              align_corners=False)
+            h = F.gelu(stage['conv'](stage['norm'](y)))
+            x = h + stage['proj'](y)                       # residual over upsampled input
         # x: [BS, 32, N, N]
 
         # ΔW head
-        dW_raw = self.dW_head(x).squeeze(1)               # [BS, N, N]
-        dW_raw = dW_raw * (1.0 - self.diag_mask)          # zero the diagonal
+        dW_raw = self.dW_head(x).squeeze(1)                # [BS, N, N]
+        dW_raw = dW_raw * (1.0 - self.diag_mask)           # zero diagonal
         dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.N,))
 
         # Δdecay head: row-pool then per-neuron MLP
-        row_feat = x.mean(dim=-1).transpose(1, 2)          # [BS, N, 32]
-        dDecay_raw = self.decay_head(row_feat).squeeze(-1) # [BS, N]
+        row_feat = x.mean(dim=-1).transpose(1, 2)           # [BS, N, 32]
+        dDecay_raw = self.decay_head(row_feat).squeeze(-1)  # [BS, N]
 
         return dW_normed, dDecay_raw
 ```
+
+Activation checkpointing: wrap the decoder `forward` in
+`torch.utils.checkpoint.checkpoint` when `config.checkpoint_decoder=True`.
+Peak activation is `[BS, 32, N, N]` at the final stage (~600 MB at BS=72,
+N=256).
 
 The `DiscreteActionPolicy.decode*` methods wrap this, adding Gumbel/hard
 sampling upstream:
@@ -401,15 +453,36 @@ If this works, scale up to the real training budget.
 These are non-obvious subtleties from the current implementation that must
 survive the refactor. Losing any of them is a known way to break training.
 
-### Precision (bf16 vs f32)
+### Precision: bf16 EVERYWHERE
 
-| Item | Source | Why |
-|---|---|---|
-| Hebbian update `msg @ msgᵀ` | `memory.py:831` | f32 accumulation; at γ_heb ≈ 0.88 the `(1-γ)` factor loses precision in bf16 |
-| EMA blend for W: `(1-γ_W)·W + γ_W·ΔW_normed` | `memory.py:786` | f32 accumulation, cast back to bf16 at the end |
-| EMA blend for decay | `memory.py:790` | same reason |
-| Decay stored directly in [0,1], convex EMA | `memory.py:196` | No sigmoid-of-unbounded-logit at use time |
-| `clamp(min=1e-6, max=1.0-1e-6)` on γ before log in half-life | `memory.py:513` | Avoid inf |
+Deliberate simplification from current code: all params and runtime state
+in bf16, no f32 branches in the memory module.
+
+The one bf16-fragile op (`(1-γ)·X + γ·Y` with γ near 1) is handled by
+**clamping γ to `gamma_max = 0.97`** via `gamma_max * sigmoid(logit)`.
+At γ=0.97, `(1-γ)=0.03` has ~0.78% bf16 precision, which is enough for EMA
+accumulation not to compound errors.
+
+Operations PyTorch auto-promotes to f32 under autocast (no manual handling):
+`F.softmax`, `F.log_softmax`, `F.gumbel_softmax`, `F.cross_entropy`,
+`F.group_norm`, `F.layer_norm`, `F.rms_norm`, tensor-core matmul accumulation,
+AdamW optimizer state.
+
+**Removed from current code** (in Step 1):
+- f32 cast on Hebbian update → now bf16 throughout
+- f32 cast on W EMA blend → now bf16 throughout
+- f32 cast on decay EMA blend → now bf16 throughout
+- f32 cast on mod_input construction → now bf16 throughout
+- `compute_modulator_stats` precision handling → bf16 reads OK for telemetry
+
+**Kept from current code**:
+- Decay stored directly in [0,1] (convex EMA property)
+- `clamp(min=1e-6, max=1.0-1e-6)` on γ before log in half-life computation
+  (just to avoid inf — not a precision issue)
+
+**Watch in telemetry**: distribution of learned γ values across the 256
+neurons. If many peg at `gamma_max=0.97`, the clamp is a real bottleneck
+and we should consider localized f32 blends for specific neurons.
 
 ### Initialization
 
@@ -419,8 +492,8 @@ survive the refactor. Losing any of them is a known way to break training.
 | Xavier (gain=1.0) for linear-output layers | `memory.py:141` | inject projection |
 | Small-std (1e-3) for decoder output layer | `discrete_policy.py:93` | Old MLP decoder. **New design: zero-init the final `dW_head` 1×1 conv**, same purpose (start at no-op). |
 | Codebook init `randn * D_code**-0.5` | `discrete_policy.py:80` | Unit-norm-ish per row |
-| Plasticity logits at `-3.0` (γ≈0.047) for W, decay | `memory.py:104,116` | Slow initial integration |
-| Plasticity logit at `+2.0` (γ≈0.88) for hebbian | `memory.py:90` | Faster hebbian tracking |
+| Plasticity logits at `-3.0` → γ ≈ `0.97·sigmoid(-3)` = 0.046 | see design | Slow initial integration; clamp ceiling at 0.97 |
+| Plasticity logit at `+2.0` → γ ≈ `0.97·sigmoid(+2)` = 0.854 | see design | Faster hebbian tracking |
 
 ### Gradient management
 

@@ -232,19 +232,28 @@ Suggested hyperparameters (sized on merit, not to hit a param budget):
   sees a rounding-error fraction of the grid per step. 7×7 sees 49 neurons'
   features at once (7 receivers × 7 senders + 49 raw W and hebbian entries);
   6 layers of k=7 give ~37×37 effective receptive field before global pool.
-- `groups = 32` for GroupNorm
+- `conv_groups = 32` for GroupNorm (shared between encoder and decoder)
+- `dropout = 0.1` between conv layers (matches LM dropout)
+
+**Pre-norm with residual connections** (stable at depth):
+
+```python
+# Per conv block (applied 6 times):
+h_in = x
+x = group_norm(x)
+x = conv2d(x, k=7, padding=3)
+x = gelu(x)
+x = dropout(x)
+x = x + h_in        # residual (same channel dim after layer 1)
+```
+
+The first layer projects `C_in=78 → C_h=192` and doesn't take a residual
+(dim mismatch). Layers 2–6 are residual blocks.
 
 Params for a 6-layer 7×7 conv at C_h=192, C_in=78:
 - Layer 1 (C_in=78 → 192): 78·192·49 = 734K
 - Layers 2–6 (192 → 192): 192·192·49 = 1.8M × 5 = 9.0M
-  (NOTE: these are nominal dense-conv params; depthwise-separable would
-   cut this 10× with negligible expressiveness loss — see §Open Questions)
-- Total: **~9.7M** (or ~1–2M with depthwise-separable)
-
-With a standard dense 7×7 conv, the encoder is ~10M, which is plenty for a
-classifier over a 78-channel 256×256 grid. If this turns out oversized in
-practice, the easiest cut is depthwise-separable convs (same kernel, far
-fewer params).
+- Total: **~9.7M** (or ~1–2M with depthwise-separable; see §Open Questions)
 
 ## Discrete bottleneck (unchanged semantics)
 
@@ -281,7 +290,10 @@ emb ∈ [BS, D_code=384]
 [BS, 256, 4, 4]                    ← small spatial seed (wider than D_code's worth)
     │
     ▼ 6 × upsample stages (each scale_factor=2)
-    │   Per stage: F.interpolate(bilinear) → Conv2d(k=3) → GroupNorm → GELU
+    │   Per stage (pre-norm with residual over upsampled input):
+    │       y = F.interpolate(bilinear, scale_factor=2)(x)
+    │       h = y + Conv2d(k=3)(GroupNorm(GELU(y)))       # residual
+    │       project channels if in!=out via 1×1 conv on y before the add
 [BS, 128, 8, 8]
 [BS, 96, 16, 16]
 [BS, 64, 32, 32]
@@ -363,24 +375,56 @@ wider init Linear, which is what makes the larger D_code actually useful.)
 
 ## Applying the update
 
-Unchanged EMA-blend semantics, but per-neuron (not per-cell) plasticity rates:
+Per-neuron plasticity rates, **clamped to a bf16-safe range** to avoid
+precision loss in the EMA blend when `(1-γ)` gets tiny:
 
 ```
-# Per-neuron learnable EMA rates (upgraded from per-cell):
-W_gamma      = sigmoid(W_decay_logit)               # [N]
-decay_gamma  = sigmoid(decay_gamma_logit)           # [N]
-hebbian_gamma = sigmoid(hebbian_decay_logit)        # [N]
+GAMMA_MAX = 0.97                                    # bf16-safe ceiling
 
-# Update W (EMA toward row-RMS-normed target from conv-transpose decoder):
+W_gamma       = GAMMA_MAX * sigmoid(W_decay_logit)        # [N] ∈ [0, 0.97]
+decay_gamma   = GAMMA_MAX * sigmoid(decay_gamma_logit)    # [N] ∈ [0, 0.97]
+hebbian_gamma = GAMMA_MAX * sigmoid(hebbian_decay_logit)  # [N] ∈ [0, 0.97]
+
+# All computation in bf16 now — no f32 casts:
 W_new = (1 - W_gamma[None, :, None]) * W + W_gamma[None, :, None] * ΔW_normed
 
-# Update decay:
 target_decay = sigmoid(Δdecay_raw)
 decay_new    = (1 - decay_gamma[None, :]) * decay + decay_gamma[None, :] * target_decay
 ```
 
+Why 0.97: at `γ = 0.97`, `(1-γ) = 0.03` has ~0.78% bf16 precision (7-bit
+mantissa). At higher γ, `(1-γ)` compresses toward zero faster than bf16
+can represent, and EMA errors compound across steps. 0.97 gives effective
+integration windows up to ~33 modulation events ≈ 132 tokens, which covers
+our full segment length. Longer-term memory happens through stable `W`
+entries, not through slow-integrating γ.
+
 Per-neuron rate is a capacity bump (some neurons may want fast plasticity,
 others slow). Cost: `3·N = 768` new scalar params vs. current `3·NC_cells = 24`.
+
+## Precision: bf16 throughout
+
+**All params, all runtime state, all compute in bf16** — no f32 branch
+points anywhere in the memory module. This is a deliberate simplification
+from the current code, which has f32 casts for Hebbian and W/decay EMA
+blends.
+
+The bf16-fragile operation in EMA blends (`(1-γ)·X + γ·Y` when γ ≈ 1) is
+handled by **clamping γ to 0.97** via the activation `0.97 · sigmoid(logit)`
+on all three plasticity rates. This keeps `(1-γ) ≥ 0.03`, which bf16
+represents with ~0.78% precision — accurate enough that EMA accumulation
+doesn't compound errors meaningfully.
+
+Operations that PyTorch auto-promotes to f32 internally (so no manual
+handling needed):
+- `F.softmax`, `F.log_softmax`, `F.gumbel_softmax`, `F.cross_entropy`
+- `F.group_norm`, `F.layer_norm`, `F.rms_norm` (mean-squared reduction)
+- AdamW optimizer state (always kept in f32 regardless of param dtype)
+- Tensor-core matmul accumulation on 4090 (inputs bf16, accum f32, output bf16)
+
+The `W @ msg` and `msg @ msgᵀ` matmuls at N=256 are standard bmm operations
+and use f32 accumulators on tensor cores — 256-element dot-product precision
+is well within bf16's practical range.
 
 ## Memory step (mostly unchanged)
 
@@ -558,12 +602,17 @@ Cheap to scale up; don't scale preemptively.
 6. **Should conv be replaced by attention-with-edge-bias?** Permutation-
    equivariant, but less hardware-optimal. If conv training is unstable, try
    attention as a fallback.
-7. **Zero-init vs small-std init on the decoder's final conv.** Zero-init
-   gives a clean "no update at init" starting point; small-std gives
-   immediate exploration. Start zero.
+7. **γ_max ceiling.** 0.97 is our bf16-safe cutoff. If the modulator learns
+   to peg γ against the ceiling everywhere (suggesting it wants slower
+   integration), consider upgrading the specific EMA blends to f32 to
+   unlock γ up to ~0.998 — a localized exception to the bf16-everywhere
+   rule. Monitor `γ_max` across neurons.
 8. **Per-cell vs per-neuron plasticity γ.** We moved from per-cell (24
    scalars) to per-neuron (768 scalars). If this causes instability (e.g.,
    a subset of neurons learning pathological rates), back off to per-cell.
+9. **Dropout on conv encoder.** Default 0.1 between layers; may be
+   unnecessary if the LM's dropout already regularizes the full chain.
+   Ablate.
 
 ## References and related work
 
