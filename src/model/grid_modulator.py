@@ -2,10 +2,17 @@
 
 Architecture spec: `docs/design_conv_modulator.md`.
 
-The encoder operates on an [N, N] edge feature map built by broadcasting
-per-neuron projections into the grid. The decoder upsamples a seed from the
-code embedding to the full N×N ΔW. Both use pre-norm residual blocks for
-training stability at depth.
+The encoder is a pyramid of depthwise-separable conv stages over the N×N edge
+feature map — spatial dim halves at each stage, channels grow to a target
+width. This avoids running the deep (wide-channel) layers on the full grid,
+which was catastrophic for throughput at N=256.
+
+The decoder mirrors this: 6 resize+DW-sep upsample stages lift a small seed
+from [seed_s, seed_s] to [N, N] with channel count decreasing as spatial
+dim grows.
+
+Both use depthwise-separable convs throughout (except 1×1 heads) — these
+cut compute by ~40× per layer vs dense convs at the same kernel size.
 """
 
 from __future__ import annotations
@@ -18,6 +25,58 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import Config
+
+
+def _make_group_norm(groups: int, channels: int) -> nn.GroupNorm:
+    """GroupNorm with groups adjusted so channels is divisible."""
+    g = math.gcd(groups, channels)
+    return nn.GroupNorm(g, channels)
+
+
+class DWSepBlock(nn.Module):
+    """Depthwise-separable conv block.
+
+    depthwise kxk (groups=c_in, preserves channels) → pointwise 1×1 (c_in→c_out)
+    → GroupNorm → GELU → (residual if shapes match).
+
+    Total compute per pixel: c_in · k² + c_in · c_out, vs dense c_in · c_out · k².
+    For k=5, c_in=c_out=128: dense = 410K, DW+PW = 19.6K → 21× cheaper.
+    """
+
+    def __init__(self, c_in: int, c_out: int, kernel: int = 5,
+                 stride: int = 1, groups: int = 32):
+        super().__init__()
+        pad = kernel // 2
+        self.dw = nn.Conv2d(c_in, c_in, kernel_size=kernel,
+                             stride=stride, padding=pad, groups=c_in)
+        self.pw = nn.Conv2d(c_in, c_out, kernel_size=1)
+        self.norm = _make_group_norm(groups, c_out)
+        self.use_residual = (c_in == c_out and stride == 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x if self.use_residual else None
+        y = self.dw(x)
+        y = self.pw(y)
+        y = self.norm(y)
+        y = F.gelu(y)
+        if identity is not None:
+            y = y + identity
+        return y
+
+
+class DWSepUpsampleBlock(nn.Module):
+    """Upsample 2× then DW-separable conv."""
+
+    def __init__(self, c_in: int, c_out: int, kernel: int = 3,
+                 groups: int = 32):
+        super().__init__()
+        self.block = DWSepBlock(c_in, c_out, kernel=kernel, stride=1,
+                                 groups=groups)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.interpolate(x, scale_factor=2, mode='bilinear',
+                          align_corners=False)
+        return self.block(x)
 
 
 # ======================================================================
@@ -46,7 +105,6 @@ class ConvGridModulator(nn.Module):
 
         C_h = config.conv_channels
         k = config.conv_kernel
-        pad = k // 2
 
         # Three per-neuron feature projections — compress D_n → d_proj before
         # broadcasting into the grid. Otherwise the full D_n in the grid
@@ -61,21 +119,33 @@ class ConvGridModulator(nn.Module):
         # Input channel count from config (matches mod_in_channels property).
         C_in = config.mod_in_channels
 
-        # Stem: project observation channels to C_h.
-        self.stem = nn.Conv2d(C_in, C_h, kernel_size=k, padding=pad)
-        self.stem_norm = nn.GroupNorm(config.conv_groups, C_h)
+        # Pyramid channel ladder. Starts narrow, widens to C_h. After stem,
+        # each stage downsamples spatially 2× and keeps channels at C_h.
+        # Deep layers never run at full N×N — the N² cost is paid only at the
+        # stem, which uses narrow channels to keep it cheap.
+        ladder = [max(C_h // 4, 16),  # stem channels
+                  max(C_h // 2, 32),
+                  C_h, C_h, C_h]
 
-        # Residual pre-norm conv blocks. Layers 2..L_conv, all C_h → C_h.
-        self.blocks = nn.ModuleList([
-            nn.ModuleDict({
-                'norm': nn.GroupNorm(config.conv_groups, C_h),
-                'conv': nn.Conv2d(C_h, C_h, kernel_size=k, padding=pad),
-            }) for _ in range(config.conv_layers - 1)
-        ])
+        # Stem: dense 1× conv to land in pyramid space. Narrow channels, small
+        # kernel to keep the only full-resolution layer cheap.
+        stem_k = min(k, 5)
+        self.stem = nn.Conv2d(C_in, ladder[0], kernel_size=stem_k,
+                               padding=stem_k // 2)
+        self.stem_norm = _make_group_norm(config.conv_groups, ladder[0])
+
+        # Pyramid stages: each halves spatial dim, may widen channels.
+        self.stages = nn.ModuleList()
+        for i in range(1, len(ladder)):
+            self.stages.append(DWSepBlock(
+                ladder[i - 1], ladder[i],
+                kernel=k, stride=2, groups=config.conv_groups))
+
         self.dropout = nn.Dropout2d(config.conv_dropout)
+        self.final_channels = ladder[-1]
 
         # Pool → code logits.
-        self.logit_head = nn.Linear(C_h, self.K)
+        self.logit_head = nn.Linear(self.final_channels, self.K)
 
         # Initialization: Kaiming for GELU-following convs.
         for m in self.modules():
@@ -84,7 +154,6 @@ class ConvGridModulator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                # Xavier for linear layers (unit-variance init through MLPs).
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -169,16 +238,19 @@ class ConvGridModulator(nn.Module):
     # ------------------------------------------------------------------
 
     def encoder_forward(self, x: Tensor) -> Tensor:
-        """x: [BS, C_in, N, N] → pooled [BS, C_h]. Stays in stem-weight dtype."""
+        """x: [BS, C_in, N, N] → pooled [BS, final_channels].
+
+        Pyramid: stem keeps [N, N] with narrow channels, then each stage
+        halves spatial dim. By the final stage we're at [N/16, N/16, C_h]
+        so global pool is cheap and deep layers don't see the full grid.
+        """
         w_dt = self.stem.weight.dtype
         if x.dtype != w_dt:
             x = x.to(w_dt)
         x = F.gelu(self.stem_norm(self.stem(x)))
-        for block in self.blocks:
-            h = block['norm'](x)
-            h = F.gelu(block['conv'](h))
-            h = self.dropout(h)
-            x = x + h                     # residual (both C_h)
+        x = self.dropout(x)
+        for stage in self.stages:
+            x = stage(x)
         return x.mean(dim=(2, 3))          # global avg pool
 
     def forward(
@@ -228,20 +300,15 @@ class ConvTransposeDecoder(nn.Module):
         seed_numel = self.seed_channels * self.seed_spatial * self.seed_spatial
         self.init_proj = nn.Linear(self.D_code, seed_numel)
 
-        # Upsample stages. GroupNorm groups picked per-layer via gcd so that
-        # each c_in divides evenly (channel ladder includes 96, 48, etc. that
-        # aren't always divisible by config.conv_groups=32).
-        import math as _math
+        # Upsample stages. Each stage: 2× bilinear upsample then a
+        # depthwise-separable conv block. The deep stages run at bigger
+        # spatial dims but with progressively fewer channels; DW-sep keeps
+        # the compute manageable.
         channel_sequence = [self.seed_channels] + list(self.CHANNEL_LADDER)
         self.stages = nn.ModuleList()
         for c_in, c_out in zip(channel_sequence[:-1], channel_sequence[1:]):
-            g = _math.gcd(config.conv_groups, c_in)
-            self.stages.append(nn.ModuleDict({
-                'norm': nn.GroupNorm(g, c_in),
-                'conv': nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
-                'proj': (nn.Conv2d(c_in, c_out, kernel_size=1)
-                         if c_in != c_out else nn.Identity()),
-            }))
+            self.stages.append(DWSepUpsampleBlock(
+                c_in, c_out, kernel=3, groups=config.conv_groups))
 
         # Final 1×1 head → ΔW_raw.
         final_channels = channel_sequence[-1]
@@ -289,10 +356,7 @@ class ConvTransposeDecoder(nn.Module):
         x = self.init_proj(emb).reshape(BS, self.seed_channels, S, S)
 
         for stage in self.stages:
-            y = F.interpolate(x, scale_factor=2, mode='bilinear',
-                              align_corners=False)
-            h = F.gelu(stage['conv'](stage['norm'](y)))
-            x = h + stage['proj'](y)        # residual over upsampled input
+            x = stage(x)
 
         # x: [BS, final_channels, N, N]
         dW_raw = self.dW_head(x).squeeze(1)             # [BS, N, N]
