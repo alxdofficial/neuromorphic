@@ -125,8 +125,16 @@ Projection brings it to 52-64 channels, ~490 MB, comfortable.
 
 - **W and hebbian**: the current state of the thing we're about to edit, plus
   its running correlation partner.
-- **Projected h / msg per neuron**: the modulator can see "what each neuron is
-  up to" without paying D_n per position. Projection is learned.
+- **Projected h / msg per neuron** (broadcast, NOT per-connection): the
+  modulator can see "what each neuron is up to" without paying D_n per
+  position. Projection is learned; msg at position (i, j) is the broadcast
+  per-neuron value, not the weighted edge contribution `W[i,j] · msg[j]`.
+  The per-edge information comes from W[i,j] + hebbian[i,j], which
+  **already** cover structural weight and co-activation history — so
+  per-connection message value would be largely redundant. If a future
+  ablation shows the modulator can't see fine-grained "this edge is live
+  right now" effects, add `W[i,j] · msg_norm[j]` as one extra scalar channel
+  (cheap) before adding full-width per-edge message projections.
 - **Role embedding**: the modulator can treat ports differently from internals
   (it needs to, since their semantics are different). Without this the conv
   would have to rediscover port roles from observation patterns.
@@ -142,6 +150,29 @@ Projection brings it to 52-64 channels, ~490 MB, comfortable.
 
 ## Modulator architecture (encoder)
 
+The **encoder** — the piece that trains under phase-2 GRPO, and the part that
+replaces the current `logit_w1, logit_w2` MLP — is the full stack from
+observation tensor to code logits. Not just the conv layers; the conv + pool
++ logit head together.
+
+```
+             ┌─────────────── encoder (GRPO-trainable) ────────────────┐
+observation  │                                                          │  code
+tensor   ──► │  conv stack → pool → Linear logit head                   │──► logits
+[N, N, C_in] │  [N,N,C_h]   [C_h]   C_h → K                             │    [BS, K]
+             └──────────────────────────────────────────────────────────┘
+                                                                             │
+                                                            Gumbel / Categorical (sampling)
+                                                                             │
+                                                            codebook [K, D_code]
+                                                                             │
+                                                            decoder MLP
+                                                                             │
+                                                            U, V ∈ [N, r], Δdecay ∈ [N]
+```
+
+### Conv stack (perception over the edge grid)
+
 ```
 INPUT: E ∈ [BS, N, N, C_in≈62]
 
@@ -151,13 +182,17 @@ Conv block × L_conv layers:
     E ← GELU(E)
 
 After conv stack: E ∈ [BS, N, N, C_h]
+```
 
-Pooling heads:
-    code_feat     = global_avg_pool(E)            # [BS, C_h]
-    code_logits   = Linear(C_h → K)(code_feat)    # [BS, K]
+### Pooling → code logits
 
-    row_feat      = mean over j axis               # [BS, N, C_h]  — per-receiver
-    col_feat      = mean over i axis               # [BS, N, C_h]  — per-sender
+```
+code_feat     = global_avg_pool_over_grid(E)         # [BS, C_h]
+code_logits   = Linear(C_h → K)(code_feat)           # [BS, K]
+
+# (optional for future per-neuron output heads, not used for codes:)
+row_feat      = mean over j axis                     # [BS, N, C_h]  — per-receiver
+col_feat      = mean over i axis                     # [BS, N, C_h]  — per-sender
 ```
 
 Suggested hyperparameters:
