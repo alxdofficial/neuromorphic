@@ -439,24 +439,57 @@ so we're compute-bound at ~2× main's step time. Additionally, activation
 checkpointing is mandatory at BS=72 (without it we OOM at ~22GB) and adds
 ~1.5× backward cost.
 
-### Sweeps tried that DIDN'T help
+### Sweeps performed
 
-- D_n 256 → 128 (tensor-core efficiency dropped more than FLOPs saved)
+**Didn't help:**
+- D_n 256 → 128 (tensor-core efficiency drops more than FLOPs saved)
 - state_mlp_hidden 256 → 128 (same reason)
-- BS 72 → 96, 128, 160 (throughput plateaus at 22K; bigger BS just uses more
-  VRAM with no speed gain)
-- Disabling checkpoint_memory (OOM above BS=48)
+- N_total 256 → 384 / 512 (9K / 6K tok/s — N² cost dominates)
+- D_n 256 → 512 (15K — tensor core doesn't like the bigger matmul shape)
+- decoder_hidden 256 / 512 / 1024 (all same ~15-20K within noise)
+- attn_token_dim 32 / 64 / 128 (all same within noise)
+- num_codes 512 / 2048 / 4096 (no measurable difference)
+- torch.compile mode=reduce-overhead, max-autotune (already compute-bound)
 
-### What would push higher
+**DID help:**
+- **Disable checkpoint_memory + BS=48 (fits 22.8 GB)**: 20.5K → 24.4K tok/s
+  (+19%). Why: no forward-replay during backward. Tradeoff is smaller BS,
+  but the 1.5× backward speedup wins.
+- Direct emission decoder (vs rank-r factored): no speed change but
+  removes a capability-limiting approximation.
 
-1. **Custom Triton kernel for fused memory step** — fuse W@msg + inject +
-   state MLP + msg MLP + hebbian update into one kernel. Eliminates
-   intermediate-activation materialization, would allow no-checkpoint at
-   BS=72. Expected 1.5-2× speedup.
-2. **Smaller N_total** — going N=128 cuts W@msg/hebbian 4×. Loses some
-   capacity; changes the architectural story.
-3. **Bigger tbptt_block** — 8 → 16 halves checkpoint-boundary saves but
-   doubles activation memory. Only works with smaller model.
+### Final confirmed config
+
+- BS=48, modulation_interval=4, checkpoint_memory=False
+- N=256, D_n=256, attention F=64 × 4 heads × 2 layers
+- K=2048, D_code=128, decoder_hidden=512, direct N²+N emission
+- **24.4K tok/s steady state, 252ms/step, 22.8 GB peak VRAM**
+
+### Why we can't easily beat this at NC=1
+
+Profile: **GPU is 97% busy** (self CUDA time ≈ wall time). We're compute-
+bound on `aten::mm` (state/msg MLP matmuls, already at peak tensor-core
+throughput). Triton can't help — nothing to fuse that torch.compile
+hasn't, and the dominant ops are already tensor-core-saturated.
+
+The remaining 1.6× gap to main's 40K is **structural**: main's NC=8 × N=32
+design has 8× fewer edges (8192 vs 65K), so W @ msg and hebbian work are
+proportionally cheaper. To match main's speed at N=256 we'd need to go
+multi-cell, which loses the "unified connectivity pool" of this design.
+
+### What would beat main (future work, not implemented)
+
+NC=8 cells with N_per_cell=32 (main's structure), BUT with an attention-
+based **cross-cell modulator** observing all cell states at once. This:
+- matches main's fast per-cell W structure (8192 edges total)
+- adds cross-cell coordination via the attention modulator (capability win
+  over main's independent per-cell modulators)
+- preserves per-edge + per-node observation (within-cell)
+- estimated ~35-40K tok/s
+
+Substantial refactor (~1 day) but a clean architectural answer. Worth
+revisiting if the current 24.4K training runs show mem_leverage_ce
+comparable to main.
 
 ## 6. Honest risks
 
