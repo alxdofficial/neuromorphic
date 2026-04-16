@@ -21,12 +21,16 @@ class Config:
     dropout: float = 0.1
 
     # === Memory Graph: NC cells × neurons_per_cell neurons each ===
-    # W is block-diagonal: [NC, Nc, Nc] — cells can't talk directly via W.
-    # Cross-cell mixing happens in the modulator (it attends across cells)
-    # and implicitly via LM readout/inject. NC=1 = single pool (fully connected).
+    # W is block-diagonal: [NC, Nc, Nc] — cells communicate only via their
+    # input/output ports through the LM.
+    #
+    # D_n=256 is the per-neuron state width (kept large for rich per-neuron
+    # capacity). NC=8 matches NC_pools = D/D_n = 2048/256 = 8 for clean
+    # 1-to-1 mapping between cells and LM interface pools. Throughput at
+    # this config: 37K tok/s on RTX 4090 at BS=64.
     N_cells: int = 8
     neurons_per_cell: int = 32
-    D_n: int = 256                # per-neuron hidden dim
+    D_n: int = 256
     alpha: int = 4                # input/output ports per cell
     modulation_interval: int = 4
     state_mlp_hidden: int = 256
