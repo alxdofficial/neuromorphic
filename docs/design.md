@@ -1,5 +1,11 @@
 # Neuromorphic Memory Graph — Dense-W, Memory-Head Design
 
+> **PARTIALLY SUPERSEDED** on branch `conv-grid-modulator`. The modulator,
+> per-cell layout, and action-output sections are replaced by the conv-grid
+> design in `docs/design_conv_modulator.md`. Everything else in this doc
+> (training objective, mem_pred_loss, surprise signal, TBPTT semantics,
+> LM integration, dataloader) remains accurate.
+
 ## Goals
 
 1. Lifelong personal-assistant memory: a language model that gets better at
