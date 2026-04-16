@@ -411,6 +411,53 @@ For this branch to be worth keeping:
    verify_01 reached 1.19 nats leverage. If attention neuromod matches at
    comparable speed, keep and scale up. If it's worse, re-evaluate.
 
+## 5a. Implementation notes and benchmark results
+
+Implemented and benchmarked 2026-04-16. Summary:
+
+- **22K tok/s at BS=72, T=128, N=256 on RTX 4090** (14× faster than conv-grid
+  at 1.6K). Main branch is 40K for comparison.
+- Memory module 7.3M params (vs conv-grid's 17M, main's 42M).
+- Peak VRAM 8.5GB at BS=72 (vs main's 22GB).
+- Attention modulator itself is tiny (300K params); decoder is 4.3M.
+- All 4 regression tests pass on CPU tier_tiny.
+
+### What's in the profile now
+
+The `aten::mm / addmm / bmm` trio dominates CUDA time, as expected for an
+all-tensor-core design. No conv, no layout conversions, no
+`unsafe_index_put`. Profile looks like main's: clean bmm-heavy workload.
+
+### Why we're at 22K instead of 40K (matching main)
+
+The memory step at N=256 does 8× more W @ msg and hebbian work than main
+(which has NC=8 × N=32). State/msg MLPs are SAME compute (same total neuron
+count). Attention modulator is actually cheaper than main's per-cell MLP.
+
+Net effect: memory-step compute is heavier but tensor cores handle it fine,
+so we're compute-bound at ~2× main's step time. Additionally, activation
+checkpointing is mandatory at BS=72 (without it we OOM at ~22GB) and adds
+~1.5× backward cost.
+
+### Sweeps tried that DIDN'T help
+
+- D_n 256 → 128 (tensor-core efficiency dropped more than FLOPs saved)
+- state_mlp_hidden 256 → 128 (same reason)
+- BS 72 → 96, 128, 160 (throughput plateaus at 22K; bigger BS just uses more
+  VRAM with no speed gain)
+- Disabling checkpoint_memory (OOM above BS=48)
+
+### What would push higher
+
+1. **Custom Triton kernel for fused memory step** — fuse W@msg + inject +
+   state MLP + msg MLP + hebbian update into one kernel. Eliminates
+   intermediate-activation materialization, would allow no-checkpoint at
+   BS=72. Expected 1.5-2× speedup.
+2. **Smaller N_total** — going N=128 cuts W@msg/hebbian 4×. Loses some
+   capacity; changes the architectural story.
+3. **Bigger tbptt_block** — 8 → 16 halves checkpoint-boundary saves but
+   doubles activation memory. Only works with smaller model.
+
 ## 6. Honest risks
 
 - **Attention might not learn the right thing.** Conv-grid's spatial processing
