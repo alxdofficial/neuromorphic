@@ -1,26 +1,19 @@
-"""Attention-based neuromodulator: tokens-as-neurons transformer.
+"""Attention-based neuromodulator for multi-cell memory graph.
 
-Architecture spec: `docs/plan_attention_neuromod.md`.
+State shape: [BS, NC, Nc, D_n] for h/msg; [BS, NC, Nc, Nc] for W/hebbian.
 
-Replaces the slow conv encoder + conv-transpose decoder with:
-  - Encoder: per-neuron tokens → attention (with edge-bias from W/hebbian)
-    → pool → logit head over K codes
-  - Decoder: code embedding → MLP → low-rank factored (U, V) + Δdecay,
-    with ΔW = U @ Vᵀ
+Encoder: per-cell attention. Each cell's Nc neurons become Nc tokens;
+attention runs within each cell independently (NC cells in parallel as
+batch dim). Edge biases from W/hebbian per cell.
 
-Both built from `bmm`/`linear` primitives that saturate tensor cores well,
-unlike the conv approach which ran at ~8% of peak compute.
+Decoder: per-cell code embedding → MLP → (ΔW [Nc×Nc], Δdecay [Nc]) per cell.
 
-Preserves conv-grid's principled observation + full-rank action
-philosophy (U and V are [N, r], so ΔW is rank-r but spans the full
-N×N edge space).
+Both use bmm primitives — tensor-core friendly.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,28 +23,16 @@ from .config import Config
 
 
 # ======================================================================
-# Encoder: per-neuron tokens + attention + pool → code logits
+# Per-cell attention encoder
 # ======================================================================
 
 
 class AttentionModulator(nn.Module):
-    """Observation → code logits via multi-head self-attention over neurons.
-
-    Neurons are treated as unordered tokens. Per-node features go in as
-    token embeddings; per-edge features (W, hebbian) enter as per-head
-    attention biases.
-
-    Preserves:
-      - per-node content (h, msg, received — projected to d_proj)
-      - per-edge observation (W, hebbian, asymmetry — as attention biases)
-      - role markers (input port / output port / internal)
-      - global surprise signals
-    Permutation-equivariant over internal neurons by construction.
-    """
 
     def __init__(self, config: Config):
         super().__init__()
-        self.N = config.N_total
+        self.NC = config.N_cells
+        self.Nc = config.neurons_per_cell
         self.D_n = config.D_n
         self.d_proj = config.d_proj
         self.role_dim = config.role_dim
@@ -59,28 +40,17 @@ class AttentionModulator(nn.Module):
 
         F_tok = config.attn_token_dim
         H = config.attn_n_heads
-        assert F_tok % H == 0, "attn_token_dim must be divisible by n_heads"
+        assert F_tok % H == 0
         self.F = F_tok
         self.H = H
         self.head_dim = F_tok // H
 
-        # Per-neuron feature projections (reused semantics from conv-grid).
+        # Per-neuron feature projections (shared across cells).
         self.h_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.msg_emit_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.msg_recv_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.role_emb = nn.Embedding(3, self.role_dim)
 
-        # Token-in MLP: concat per-neuron features → F-dim token.
-        # Input layout:
-        #   h_norm[i]:      1
-        #   msg_norm[i]:    1
-        #   decay[i]:       1
-        #   h_proj[i]:      d_proj
-        #   msg_emit[i]:    d_proj
-        #   msg_recv[i]:    d_proj
-        #   role_emb[i]:    role_dim
-        #   s_mem_live:     1      (broadcast global)
-        #   s_mem_ema_fast: 1      (broadcast global)
         tok_in_dim = (1 + 1 + 1 + 3 * self.d_proj + self.role_dim + 2)
         self.tok_in_dim = tok_in_dim
         self.tok_proj = nn.Sequential(
@@ -89,27 +59,25 @@ class AttentionModulator(nn.Module):
             nn.Linear(F_tok, F_tok),
         )
 
-        # Edge bias MLP: (W, hebbian, asymmetry) → per-head bias scalar.
-        #   Input per (i,j): 3 scalars.
-        #   Output: H scalars (one per head).
+        # Edge bias: (W, hebbian, asym) → H heads of scalar bias per edge.
         self.edge_bias_mlp = nn.Sequential(
             nn.Linear(3, max(H, 8)),
             nn.GELU(),
             nn.Linear(max(H, 8), H),
         )
 
-        # Attention layers.
+        # Attention blocks (shared across cells).
         self.layers = nn.ModuleList([
             AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
                       dropout=config.attn_dropout)
             for _ in range(config.attn_n_layers)
         ])
 
-        # Pool → code logits head.
+        # Pool + logit head (shared across cells — same projection applied to
+        # each cell's pooled feature, producing [BS, NC, K] logits).
         self.pool_norm = nn.LayerNorm(F_tok)
         self.logit_head = nn.Linear(F_tok, self.K)
 
-        # Init
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -118,75 +86,58 @@ class AttentionModulator(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
-    # ------------------------------------------------------------------
-    # Token construction
-    # ------------------------------------------------------------------
-
     def build_tokens(
         self,
-        h: Tensor,                  # [BS, N, D_n]
-        msg: Tensor,                # [BS, N, D_n]
-        received: Tensor,           # [BS, N, D_n]
-        decay: Tensor,              # [BS, N]
-        s_live: Tensor,             # [BS]
-        s_ema: Tensor,              # [BS]
-        role_id: Tensor,            # [N] long
+        h: Tensor,          # [BS, NC, Nc, D_n]
+        msg: Tensor,        # [BS, NC, Nc, D_n]
+        received: Tensor,   # [BS, NC, Nc, D_n]
+        decay: Tensor,      # [BS, NC, Nc]
+        s_live: Tensor,     # [BS]
+        s_ema: Tensor,      # [BS]
+        role_id: Tensor,    # [NC, Nc] long
     ) -> Tensor:
-        """Returns [BS, N, F] token features."""
-        BS, N, _ = h.shape
+        """Returns [BS, NC, Nc, F] tokens."""
+        BS, NC, Nc, _ = h.shape
         dt = h.dtype
 
-        # Align dtype with projection weights (no-op under autocast).
         w_dt = self.h_proj.weight.dtype
         if h.dtype != w_dt:
-            h = h.to(w_dt)
-            msg = msg.to(w_dt)
-            received = received.to(w_dt)
+            h = h.to(w_dt); msg = msg.to(w_dt); received = received.to(w_dt)
 
-        # Per-neuron content projections.
-        h_p = self.h_proj(h)                      # [BS, N, d_proj]
-        me_p = self.msg_emit_proj(msg)            # [BS, N, d_proj]
-        mr_p = self.msg_recv_proj(received)       # [BS, N, d_proj]
+        h_p = self.h_proj(h)                             # [BS, NC, Nc, d_proj]
+        me_p = self.msg_emit_proj(msg)
+        mr_p = self.msg_recv_proj(received)
 
-        # Scalar per-neuron features.
-        h_norm = h.norm(dim=-1, keepdim=True)                        # [BS, N, 1]
-        msg_norm = msg.norm(dim=-1, keepdim=True)                    # [BS, N, 1]
-        dec = decay.unsqueeze(-1).to(w_dt)                           # [BS, N, 1]
+        h_norm = h.norm(dim=-1, keepdim=True)             # [BS, NC, Nc, 1]
+        msg_norm = msg.norm(dim=-1, keepdim=True)
+        dec = decay.unsqueeze(-1).to(w_dt)                # [BS, NC, Nc, 1]
 
-        # Role embedding.
-        role_e = self.role_emb(role_id).to(w_dt)                     # [N, role_dim]
-        role_e = role_e.unsqueeze(0).expand(BS, N, self.role_dim)    # [BS, N, role_dim]
+        role_e = self.role_emb(role_id).to(w_dt)          # [NC, Nc, role_dim]
+        role_e = role_e.unsqueeze(0).expand(BS, NC, Nc, self.role_dim)
 
-        # Global surprise broadcast per neuron.
-        s_live_b = s_live.view(BS, 1, 1).expand(BS, N, 1).to(w_dt)
-        s_ema_b = s_ema.view(BS, 1, 1).expand(BS, N, 1).to(w_dt)
+        s_live_b = s_live.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
+        s_ema_b = s_ema.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
 
         tok_in = torch.cat([
             h_norm, msg_norm, dec,
             h_p, me_p, mr_p,
             role_e,
             s_live_b, s_ema_b,
-        ], dim=-1)                                                    # [BS, N, tok_in_dim]
+        ], dim=-1)
 
-        tokens = self.tok_proj(tok_in)                                # [BS, N, F]
+        tokens = self.tok_proj(tok_in)                    # [BS, NC, Nc, F]
         return tokens.to(dt) if dt != w_dt else tokens
 
     def build_edge_bias(self, W: Tensor, hebbian: Tensor) -> Tensor:
-        """Returns [BS, H, N, N] per-head attention bias from edge features."""
-        BS, N, _ = W.shape
+        """Per-cell edge bias: [BS, NC, H, Nc, Nc]."""
         w_dt = self.edge_bias_mlp[0].weight.dtype
         if W.dtype != w_dt:
-            W = W.to(w_dt)
-            hebbian = hebbian.to(w_dt)
+            W = W.to(w_dt); hebbian = hebbian.to(w_dt)
         asym = W - W.transpose(-1, -2)
-        edge_feat = torch.stack([W, hebbian, asym], dim=-1)           # [BS, N, N, 3]
-        bias = self.edge_bias_mlp(edge_feat)                          # [BS, N, N, H]
-        # Reorder to [BS, H, N, N] for attention.
-        return bias.permute(0, 3, 1, 2).contiguous()
-
-    # ------------------------------------------------------------------
-    # Full forward
-    # ------------------------------------------------------------------
+        edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, Nc, Nc, 3]
+        bias = self.edge_bias_mlp(edge_feat)                 # [BS, NC, Nc, Nc, H]
+        # Permute to [BS, NC, H, Nc, Nc] for attention.
+        return bias.permute(0, 1, 4, 2, 3).contiguous()
 
     def forward(
         self,
@@ -195,29 +146,28 @@ class AttentionModulator(nn.Module):
         s_live: Tensor, s_ema: Tensor,
         role_id: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Returns (code_logits [BS, K], tokens [BS, N, F]).
-
-        Tokens are returned so the decoder could optionally condition on
-        per-neuron representations. For now the decoder only uses the code
-        embedding, but keeping the hook open.
-        """
-        tokens = self.build_tokens(h, msg, received, decay,
-                                    s_live, s_ema, role_id)
+        """Returns (logits [BS, NC, K], tokens [BS, NC, Nc, F])."""
+        tokens = self.build_tokens(h, msg, received, decay, s_live, s_ema, role_id)
         edge_bias = self.build_edge_bias(W, hebbian)
 
-        for layer in self.layers:
-            tokens = layer(tokens, edge_bias)
+        # Reshape to run attention per-cell (NC as extra batch dim).
+        BS, NC, Nc, F_tok = tokens.shape
+        tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
+        edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
 
-        # Pool → code logits.
-        pooled = self.pool_norm(tokens).mean(dim=1)                   # [BS, F]
+        for layer in self.layers:
+            tokens_flat = layer(tokens_flat, edge_bias_flat)
+
+        tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
+
+        # Pool per cell: mean over Nc → [BS, NC, F]. Then logits per cell.
+        pooled = self.pool_norm(tokens).mean(dim=2)       # [BS, NC, F]
         return self.logit_head(pooled), tokens
 
 
 class AttnBlock(nn.Module):
-    """Pre-norm multi-head self-attention block with edge bias + FFN."""
 
-    def __init__(self, F_tok: int, H: int, ffn_mult: int = 4,
-                 dropout: float = 0.0):
+    def __init__(self, F_tok: int, H: int, ffn_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         self.F = F_tok
         self.H = H
@@ -237,82 +187,59 @@ class AttnBlock(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: Tensor, edge_bias: Tensor) -> Tensor:
-        """x: [BS, N, F], edge_bias: [BS, H, N, N] → [BS, N, F]."""
-        BS, N, F_tok = x.shape
-
-        # Attention (pre-norm, residual).
+        """x: [B, N, F], edge_bias: [B, H, N, N] → [B, N, F]."""
+        B, N, F_tok = x.shape
         h = self.norm1(x)
-        qkv = self.qkv(h).reshape(BS, N, 3, self.H, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)                              # [3, BS, H, N, head_dim]
+        qkv = self.qkv(h).reshape(B, N, 3, self.H, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # scaled_dot_product_attention supports attn_mask as bias.
-        # Wrap all broadcasting through attn_mask [BS, H, N, N] added to
-        # the scaled QK^T.
         attn_out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=edge_bias, scale=self.scale)
-        attn_out = attn_out.transpose(1, 2).reshape(BS, N, F_tok)     # [BS, N, F]
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, F_tok)
         x = x + self.dropout(self.out_proj(attn_out))
-
-        # FFN (pre-norm, residual).
         x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
 
 
 # ======================================================================
-# Decoder: code embedding → low-rank factored (U, V, Δdecay)
+# Per-cell decoder: code_emb → MLP → ΔW [Nc×Nc] + Δdecay [Nc]
 # ======================================================================
 
 
 class DirectDecoder(nn.Module):
-    """Direct ΔW emission — no rank approximation.
-
-    Decoder emits N² + N scalars: reshape to ΔW [N, N] directly and
-    Δdecay [N]. Every entry of ΔW is an independent output of the MLP,
-    so there is no rank constraint on the emitted matrix. Same approach
-    main takes (for a good reason).
-
-    The only bottleneck on the code → ΔW mapping is the MLP itself:
-    rank ≤ min(code_dim, decoder_hidden). But that's a limit on the
-    *mapping*, not on any individual ΔW matrix.
-    """
 
     def __init__(self, config: Config):
         super().__init__()
-        self.N = config.N_total
+        self.Nc = config.neurons_per_cell
         self.D_code = config.code_dim
 
-        out_dim = self.N * self.N + self.N
+        out_dim = self.Nc * self.Nc + self.Nc
         self.mlp = nn.Sequential(
             nn.Linear(self.D_code, config.decoder_hidden),
             nn.GELU(),
             nn.Linear(config.decoder_hidden, out_dim),
         )
-
-        # Zero-init final layer: ΔW_raw = 0 and Δdecay_raw = 0 at init.
-        # Combined with EMA blend (gamma_max · sigmoid(logit)·...), first
-        # modulation event is a no-op on memory state.
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-        # Diagonal mask (cached buffer) for ΔW self-connection clearing.
-        self.register_buffer('diag_mask', torch.eye(self.N).unsqueeze(0))
+        self.register_buffer('diag_mask', torch.eye(self.Nc).unsqueeze(0))
 
     def forward(self, emb: Tensor) -> tuple[Tensor, Tensor]:
-        """emb: [BS, D_code] → (ΔW_normed [BS, N, N], Δdecay_raw [BS, N])."""
-        BS = emb.shape[0]
+        """emb: [B*, D_code] → (ΔW [B*, Nc, Nc], Δdecay [B*, Nc]).
+
+        Caller reshapes B* as needed (e.g. [BS*NC] → [BS, NC, Nc, Nc]).
+        """
+        B = emb.shape[0]
         w_dt = self.mlp[0].weight.dtype
         orig_dt = emb.dtype
         if emb.dtype != w_dt:
             emb = emb.to(w_dt)
 
-        raw = self.mlp(emb)                                          # [BS, N² + N]
-        dW_raw = raw[..., : self.N * self.N].reshape(BS, self.N, self.N)
-        dDecay_raw = raw[..., self.N * self.N:]                       # [BS, N]
-
-        # Zero diagonal + row RMSNorm (unchanged).
+        raw = self.mlp(emb)
+        dW_raw = raw[..., : self.Nc * self.Nc].reshape(B, self.Nc, self.Nc)
+        dDecay_raw = raw[..., self.Nc * self.Nc:]
         dW_raw = dW_raw * (1.0 - self.diag_mask.to(dW_raw.dtype))
-        dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.N,))
+        dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.Nc,))
 
         if orig_dt != w_dt:
             dW_normed = dW_normed.to(orig_dt)
@@ -321,34 +248,38 @@ class DirectDecoder(nn.Module):
 
 
 # ======================================================================
-# Helpers (port layout, unchanged from conv-grid)
+# Port layout (per-cell local indices)
 # ======================================================================
 
 
 def port_layout(config: Config) -> dict:
-    """Same as conv-grid's port_layout — returns per-pool input/output indices
-    and a per-neuron role_id tensor."""
-    NC = config.NC_pools
+    """Per-cell port/role layout.
+
+    Returns:
+      input_port_idx:  [NC, alpha] — local indices within each cell
+      output_port_idx: [NC, alpha] — local indices within each cell
+      role_id:         [NC * Nc]   — flat per-neuron role
+                       (0=input, 1=output, 2=internal)
+    """
+    NC = config.N_cells
+    Nc = config.neurons_per_cell
     alpha = config.alpha
-    N = config.N_total
+    N = NC * Nc
 
-    input_idx = torch.zeros(NC, alpha, dtype=torch.long)
-    output_idx = torch.zeros(NC, alpha, dtype=torch.long)
-    stride = 2 * alpha
-    for p in range(NC):
-        base = p * stride
-        for a in range(alpha):
-            input_idx[p, a] = base + a
-            output_idx[p, a] = base + alpha + a
+    # Per-cell local indices: first alpha = input, next alpha = output,
+    # rest = internal.
+    input_local = torch.arange(alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
+    output_local = torch.arange(alpha, 2 * alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
 
+    # Flat role_id: per cell, [0:alpha)=input, [alpha:2alpha)=output, rest=internal.
     role_id = torch.full((N,), 2, dtype=torch.long)
-    for p in range(NC):
-        base = p * stride
+    for c in range(NC):
+        base = c * Nc
         role_id[base : base + alpha] = 0
-        role_id[base + alpha : base + stride] = 1
+        role_id[base + alpha : base + 2 * alpha] = 1
 
     return {
-        "input_port_idx": input_idx,
-        "output_port_idx": output_idx,
+        "input_port_idx": input_local.contiguous(),
+        "output_port_idx": output_local.contiguous(),
         "role_id": role_id,
     }

@@ -20,10 +20,14 @@ class Config:
     tie_embeddings: bool = True
     dropout: float = 0.1
 
-    # === Memory Graph: single connectivity pool (NC=1) of N_total neurons ===
-    N_total: int = 256            # total neurons in the cell; W is N_total × N_total
+    # === Memory Graph: NC cells × neurons_per_cell neurons each ===
+    # W is block-diagonal: [NC, Nc, Nc] — cells can't talk directly via W.
+    # Cross-cell mixing happens in the modulator (it attends across cells)
+    # and implicitly via LM readout/inject. NC=1 = single pool (fully connected).
+    N_cells: int = 8
+    neurons_per_cell: int = 32
     D_n: int = 256                # per-neuron hidden dim
-    alpha: int = 4                # input/output ports per virtual I/O pool
+    alpha: int = 4                # input/output ports per cell
     modulation_interval: int = 4
     state_mlp_hidden: int = 256
     msg_mlp_hidden: int = 256
@@ -67,8 +71,9 @@ class Config:
     checkpoint_memory: bool = False
 
     # === Derived (set by validate()) ===
+    N_total: int = -1              # N_cells × neurons_per_cell
     NC_pools: int = -1             # virtual I/O pools = D / D_n (for LM interface)
-    N_port: int = -1               # total port neurons = NC_pools · 2 · alpha
+    N_port: int = -1               # total port neurons = N_cells · 2 · alpha
     N_internal: int = -1
 
     def validate(self):
@@ -76,11 +81,20 @@ class Config:
         assert self.D % self.D_n == 0, (
             f"D ({self.D}) must be divisible by D_n ({self.D_n})")
         self.NC_pools = self.D // self.D_n
-        min_port_neurons = 2 * self.alpha * self.NC_pools
-        assert self.N_total >= min_port_neurons + 1, (
-            f"N_total ({self.N_total}) must be >= {min_port_neurons + 1} "
-            f"(need at least 1 internal neuron)")
-        self.N_port = min_port_neurons
+        self.N_total = self.N_cells * self.neurons_per_cell
+        # Each cell needs alpha input ports + alpha output ports + >=1 internal.
+        min_per_cell = 2 * self.alpha + 1
+        assert self.neurons_per_cell >= min_per_cell, (
+            f"neurons_per_cell ({self.neurons_per_cell}) must be >= {min_per_cell} "
+            f"(need 2·alpha ports + 1 internal per cell)")
+        # LM interface: NC_pools = D / D_n virtual I/O pools. For simplicity
+        # we require N_cells be a multiple of NC_pools so each pool maps to
+        # whole cells. (Most practical: N_cells == NC_pools.)
+        if self.N_cells % self.NC_pools != 0 and self.NC_pools % self.N_cells != 0:
+            raise ValueError(
+                f"For clean LM interface, N_cells ({self.N_cells}) and "
+                f"NC_pools ({self.NC_pools}) should be multiples of each other.")
+        self.N_port = self.N_cells * 2 * self.alpha
         self.N_internal = self.N_total - self.N_port
         assert self.scan_split_at >= 1
         assert self.scan_split_at < self.L_total
@@ -104,11 +118,13 @@ class Config:
     @classmethod
     def tier_tiny(cls, **kw) -> "Config":
         """Small config for unit tests."""
+        # NC_pools = D/D_n = 64/8 = 8. Use N_cells=8, neurons_per_cell=6 so
+        # N_total = 48 (>= 2*alpha*N_cells = 32 port neurons).
         defaults = dict(
             D=64, D_embed=64, L_total=4, scan_split_at=2,
             d_inner=64, glu_output=False, vocab_size=256, T=8,
             D_n=8, alpha=2,
-            N_total=40,
+            N_cells=8, neurons_per_cell=6,
             modulation_interval=2, tbptt_block=4,
             state_mlp_hidden=16, msg_mlp_hidden=16,
             d_proj=4, role_dim=2,
