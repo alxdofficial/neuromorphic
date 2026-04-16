@@ -40,7 +40,8 @@ Change dataclass fields:
 - Add `decoder_seed_channels: int = 192` (matches D_code).
 - Add `decoder_groups: int = 8` (for GroupNorm in decoder upsample stages).
 - Add `role_dim: int = 4` (role embedding dim).
-- Update `num_codes: 512 → 4096`, `code_dim: 64 → 192`.
+- Update `num_codes: 512 → 4096`, `code_dim: 64 → 384`.
+- Set `decoder_seed_channels: 256` (decoupled from D_code).
 - Remove: `action_rank` (no longer needed; decoder produces full-rank ΔW
   directly via conv-transpose).
 - Remove: `decoder_hidden` (no longer a dense-MLP decoder).

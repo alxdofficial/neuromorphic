@@ -12,7 +12,7 @@ objective) continues to apply.
 | Neurons per cell (`N`) | 32 | **256** — full N×N connectivity |
 | Encoder ("logit head") | Per-cell MLP (1092 → 3072 → K), 39M params | **Conv stack over the N×N edge grid** |
 | Encoder observation | Flattened scalars per cell | **Edge feature map** `[BS, N, N, ~78]` |
-| Codebook | 512 × 64 | **4096 × 192** — bigger vocabulary of templates |
+| Codebook | 512 × 64 | **4096 × 384** — bigger vocabulary, richer per-code intent vectors |
 | Decoder | MLP, dense `[NC, N²+N]` output | **Conv-transpose stack**: code_emb → [4,4,C] seed → upsample to `[N,N,1]` ΔW (full-rank) + row-pooled Δdecay |
 | Action rank | ≤64 implicit (via 64-dim codebook) | **Full rank** (no factoring constraint) |
 | Policy per event | 8 categorical (one per cell) | **1 categorical** over K=4096 codes |
@@ -264,9 +264,10 @@ Phase 2 (hard categorical, GRPO):
 - `codebook`: `[K, D_code]` learned lookup, same structure as current.
 - `K = 4096` (up from current 512) — bigger vocabulary of memory-update
   templates. Growing K is cheap: each extra code costs `D_code` params.
-- `D_code = 192` (up from current 64) — richer per-code intent vector;
-  sized to match `C_h` so pooling output and code embedding have the same
-  channel count.
+- `D_code = 384` (up from current 64) — wider per-code intent vector.
+  Decoupled from `C_h=192`: the encoder's pooled feature projects into the
+  K-way logit head (unchanged), while the codebook lives in its own wider
+  space so individual codes have room to be meaningfully distinct.
 
 ## Decoder: conv-transpose generator (full-rank ΔW)
 
@@ -274,10 +275,10 @@ The decoder upsamples the code embedding from a small spatial seed to the full
 N×N grid, producing a dense (full-rank) ΔW map plus a per-neuron Δdecay head.
 
 ```
-emb ∈ [BS, D_code=192]
+emb ∈ [BS, D_code=384]
     │
     ▼ Linear + reshape
-[BS, 192, 4, 4]                    ← small spatial seed
+[BS, 256, 4, 4]                    ← small spatial seed (wider than D_code's worth)
     │
     ▼ 6 × upsample stages (each scale_factor=2)
     │   Per stage: F.interpolate(bilinear) → Conv2d(k=3) → GroupNorm → GELU
@@ -334,30 +335,31 @@ Applied on the N×N map before feeding into the EMA blend:
 ### Hyperparameters
 
 - Seed spatial: `[4, 4]`
-- Seed channels: `192` (matches `D_code`)
+- Seed channels: `256` (decoupled from D_code — gives the decoder extra
+  bandwidth to unpack the richer code embedding)
 - Upsample stages: 6 (to reach N=256 from 4)
-- Upsample channels (in, out per stage): 192→128, 128→96, 96→64, 64→48, 48→32, 32→32
+- Upsample channels (in, out per stage): 256→128, 128→96, 96→64, 64→48, 48→32, 32→32
 - Upsample conv kernel: 3×3, padding=1
 - Norm: GroupNorm(groups=8), Activation: GELU
 
 ### Param count
 
-- Initial Linear (D_code=192 → 4·4·192 = 3072): 192 · 3072 = 590K
+- Initial Linear (D_code=384 → 4·4·256 = 4096): 384 · 4096 = 1.57M
 - 6 upsample conv stages:
-  - Stage 1 (192 → 128, k=3): 192·128·9 = 221K
+  - Stage 1 (256 → 128, k=3): 256·128·9 = 295K
   - Stage 2 (128 → 96, k=3): 128·96·9 = 111K
   - Stage 3 (96 → 64, k=3): 96·64·9 = 55K
   - Stage 4 (64 → 48, k=3): 64·48·9 = 28K
   - Stage 5 (48 → 32, k=3): 48·32·9 = 14K
   - Stage 6 (32 → 32, k=3): 32·32·9 = 9K
-  - Subtotal: ~438K
+  - Subtotal: ~512K
 - Final 1×1 Conv (32 → 1): 32 (tiny, zero-init)
 - Δdecay head (row-pool [N, 32] → MLP 32 → 64 → 1): ~2K
-- **Decoder total: ~1.0M params**
+- **Decoder total: ~2.1M params**
 
-(About 13× smaller than the MLP decoder it replaces. Full-rank output. No
-rank hyperparameter. Yes, genuinely this much smaller — the heavy work
-happens in the conv upsample stages, which don't have enormous FC layers.)
+(Still ~16× smaller than the MLP decoder it replaces. Full-rank output. No
+rank hyperparameter. The bulk of the growth from the earlier spec is the
+wider init Linear, which is what makes the larger D_code actually useful.)
 
 ## Applying the update
 
@@ -480,17 +482,17 @@ Memory allocation under this design:
 | Role embeddings (3 × role_dim=4) | tiny |
 | Conv encoder (6 layers, C_h=192, k=7) | 9.7M |
 | Code logit head (C_h=192 → K=4096) | 786K |
-| Codebook (K=4096 × D_code=192) | 786K |
-| Decoder (conv-transpose, 6 upsample stages + init Linear) | 1.0M |
+| Codebook (K=4096 × D_code=384) | 1.57M |
+| Decoder (conv-transpose, init Linear + 6 upsample stages) | 2.1M |
 | `inject_w, inject_b` (8 pools × α·D_n·D_n) | 2.1M |
 | `neuron_id` (N=256 × D_n=256) | 65K |
 | State MLP + msg MLP (shared) | 260K |
 | Per-neuron plasticity logits (3 × N=256) | 1K |
-| **Memory total** | **~14.8M** |
+| **Memory total** | **~16.6M** |
 
 LM (unchanged): ~52M.
 
-**Grand total: ~67M.**
+**Grand total: ~69M.**
 
 Less than the current ~109M. That's fine — we're not padding to match
 baselines, we're testing whether the conv-grid modulator works. If it trains
