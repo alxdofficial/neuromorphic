@@ -38,11 +38,6 @@ class Config:
     attn_token_dim: int = 64      # F — per-neuron token width
     attn_n_heads: int = 4         # multi-head attention heads (F must divide by heads)
     attn_n_layers: int = 2        # per-cell attention blocks
-    attn_cross_cell_layers: int = 1  # cross-cell attention blocks (operate on flat
-                                     # [NC*Nc] tokens from all cells, WITHOUT edge
-                                     # bias since there's no edge between cells).
-                                     # Recovers long-distance perception that
-                                     # block-diagonal W lost. Set to 0 to disable.
     attn_ffn_mult: int = 4        # FFN expansion factor
     attn_dropout: float = 0.1
 

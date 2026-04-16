@@ -4,7 +4,9 @@ State shape: [BS, NC, Nc, D_n] for h/msg; [BS, NC, Nc, Nc] for W/hebbian.
 
 Encoder: per-cell attention. Each cell's Nc neurons become Nc tokens;
 attention runs within each cell independently (NC cells in parallel as
-batch dim). Edge biases from W/hebbian per cell.
+batch dim). Edge biases from W/hebbian per cell. Cells do not share
+attention context — they communicate only via their input/output ports
+through the LM.
 
 Decoder: per-cell code embedding → MLP → (ΔW [Nc×Nc], Δdecay [Nc]) per cell.
 
@@ -71,15 +73,6 @@ class AttentionModulator(nn.Module):
             AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
                       dropout=config.attn_dropout)
             for _ in range(config.attn_n_layers)
-        ])
-
-        # Cross-cell attention blocks: attend over all NC*Nc tokens globally
-        # without edge bias (no edges between cells at W level). Recovers
-        # long-distance perception even though W is block-diagonal.
-        self.cross_cell_layers = nn.ModuleList([
-            AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
-                      dropout=config.attn_dropout)
-            for _ in range(config.attn_cross_cell_layers)
         ])
 
         # Pool + logit head (shared across cells — same projection applied to
@@ -159,24 +152,15 @@ class AttentionModulator(nn.Module):
         tokens = self.build_tokens(h, msg, received, decay, s_live, s_ema, role_id)
         BS, NC, Nc, F_tok = tokens.shape
 
-        # Phase 1: per-cell attention with edge bias. NC runs as batch.
-        if len(self.layers) > 0:
-            edge_bias = self.build_edge_bias(W, hebbian)
-            tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
-            edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
-            for layer in self.layers:
-                tokens_flat = layer(tokens_flat, edge_bias_flat)
-            tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
-
-        # Phase 2: cross-cell attention. Flat over all NC*Nc tokens,
-        # no edge bias (no edges between cells at W level; cross-cell
-        # coordination happens purely in perception space).
-        if len(self.cross_cell_layers) > 0:
-            N_total = NC * Nc
-            flat_tokens = tokens.reshape(BS, N_total, F_tok)
-            for layer in self.cross_cell_layers:
-                flat_tokens = layer(flat_tokens, edge_bias=None)
-            tokens = flat_tokens.reshape(BS, NC, Nc, F_tok)
+        # Per-cell attention with edge bias from (W, hebbian, asymmetry).
+        # NC runs as batch dim; no cross-cell attention — cells communicate
+        # only via their inject/readout ports at the LM interface.
+        edge_bias = self.build_edge_bias(W, hebbian)
+        tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
+        edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
+        for layer in self.layers:
+            tokens_flat = layer(tokens_flat, edge_bias_flat)
+        tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
 
         # Pool per cell → per-cell logits.
         pooled = self.pool_norm(tokens).mean(dim=2)       # [BS, NC, F]
