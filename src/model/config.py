@@ -61,10 +61,10 @@ class Config:
     # === Training ===
     T: int = 128                   # tokens per segment
     tbptt_block: int = 8           # detach memory loop every N tokens
-    # Memory step MLPs (state/msg at N=256, D_n=256, 128 tokens per segment)
-    # still materialize large activation stacks for bwd. Checkpoint the
-    # per-block memory loop to keep VRAM bounded at BS=72.
-    checkpoint_memory: bool = True
+    # BS=48 fits comfortably without checkpointing (18 GB peak) and is 20%
+    # faster than BS=72 with checkpointing. If you need bigger BS, flip this
+    # to True and accept the ~1.5x slowdown from forward-replay in backward.
+    checkpoint_memory: bool = False
 
     # === Derived (set by validate()) ===
     NC_pools: int = -1             # virtual I/O pools = D / D_n (for LM interface)

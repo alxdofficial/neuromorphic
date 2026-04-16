@@ -22,7 +22,7 @@ from .model.model import Model
 from .trainer import Trainer
 from .data import create_dataloader, get_tokenizer, get_special_token_ids
 
-BS = 96   # default matches train_loop.py's orchestrated pipeline
+BS = 48   # fits without checkpointing (18 GB peak); best throughput at N=256
 LR = 3e-4
 LR_MIN = 3e-5
 WARMUP_STEPS = 1000

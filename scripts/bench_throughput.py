@@ -26,7 +26,7 @@ def bench(bs=32, warmup=3, measure=10):
     print(f"Params: total={total_params:.1f}M  LM={lm_params:.1f}M  Mem={mem_params:.1f}M")
     print(f"Config: BS={bs}, T={cfg.T}, N={cfg.N_total}, F={cfg.attn_token_dim}, "
           f"heads={cfg.attn_n_heads}, L={cfg.attn_n_layers}, K={cfg.num_codes}, "
-          f"D_code={cfg.code_dim}, r={cfg.action_rank}")
+          f"D_code={cfg.code_dim}, dec_hid={cfg.decoder_hidden}")
     print(f"  ckpt_memory={cfg.checkpoint_memory}")
     print()
 
