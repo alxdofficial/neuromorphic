@@ -209,9 +209,10 @@ class MemoryGraph(nn.Module):
     def compute_lane_divergence(self) -> dict:
         if not self._initialized or self.W.shape[0] <= 1:
             return {}
+        # Frobenius norm per-batch-element over (NC, Nc, Nc) via flatten.
         W_mean = self.W.mean(dim=0, keepdim=True)
-        W_div = (self.W - W_mean).float().norm(dim=(1, 2, 3)).mean().item()
-        W_norm = self.W.float().norm(dim=(1, 2, 3)).mean().item()
+        W_div = (self.W - W_mean).float().flatten(1).norm(dim=-1).mean().item()
+        W_norm = self.W.float().flatten(1).norm(dim=-1).mean().item()
         return {"lane_W_divergence": W_div,
                 "lane_W_relative_div": W_div / max(W_norm, 1e-8)}
 
@@ -266,10 +267,11 @@ class MemoryGraph(nn.Module):
     def compute_component_grad_norms(self) -> dict:
         out = {}
         for name, p in (
-            ("grad_tok_proj", self.modulator.tok_proj_w1),
-            ("grad_logit_head", self.modulator.logit_head_w),
+            ("grad_tok_proj", self.modulator.tok_proj[0].weight),
+            ("grad_logit_head", self.modulator.logit_head.weight),
+            ("grad_cell_emb", self.modulator.cell_emb),
             ("grad_codebook", self.discrete_policy.codebook),
-            ("grad_decoder", self.decoder.w2),
+            ("grad_decoder", self.decoder.mlp[-1].weight),
             ("grad_decay_gamma_logit", self.decay_gamma_logit),
             ("grad_msg_w1", self.msg_w1),
             ("grad_inject_w", self.inject_w),
@@ -280,10 +282,11 @@ class MemoryGraph(nn.Module):
 
     def compute_param_norms(self) -> dict:
         return {
-            "tok_proj_norm": self.modulator.tok_proj_w1.detach().float().norm().item(),
-            "logit_head_norm": self.modulator.logit_head_w.detach().float().norm().item(),
+            "tok_proj_norm": self.modulator.tok_proj[0].weight.detach().float().norm().item(),
+            "logit_head_norm": self.modulator.logit_head.weight.detach().float().norm().item(),
+            "cell_emb_norm": self.modulator.cell_emb.detach().float().norm().item(),
             "codebook_norm": self.discrete_policy.codebook.detach().float().norm().item(),
-            "decoder_norm": self.decoder.w2.detach().float().norm().item(),
+            "decoder_norm": self.decoder.mlp[-1].weight.detach().float().norm().item(),
             "decay_gamma_logit_norm": self.decay_gamma_logit.detach().float().norm().item(),
             "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
             "inject_w_norm": self.inject_w.detach().float().norm().item(),
