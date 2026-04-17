@@ -89,6 +89,61 @@ def test_speed():
     print(f"Speedup:  {t_torch/t_triton:.2f}×")
 
 
+def test_backward_speed():
+    """Compare Triton backward vs PyTorch analytical backward cost."""
+    from src.model.triton_memory_step import (
+        _torch_backward, _triton_backward, fused_memory_step_triton,
+    )
+    torch.manual_seed(0)
+    BS, NC, Nc, D_n, alpha = 64, 8, 32, 256, 4
+    device = torch.device("cuda")
+    dt = torch.bfloat16
+
+    h = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
+    msg = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
+    W = torch.randn(BS, NC, Nc, Nc, device=device, dtype=dt) * 0.1
+    decay = torch.sigmoid(torch.randn(BS, NC, Nc, device=device, dtype=dt))
+    inject_proj = torch.randn(BS, NC, alpha, D_n, device=device, dtype=dt) * 0.3
+    out_mask = torch.zeros(NC, Nc, device=device, dtype=dt)
+    out_mask[:, alpha:2*alpha] = 1.0
+    readout_scale = alpha ** -0.5
+
+    with torch.no_grad():
+        h_out, readout = fused_memory_step_triton(
+            h, msg, W, decay, inject_proj, out_mask, readout_scale)
+    dL_dh_out = torch.randn_like(h_out)
+    dL_dreadout = torch.randn_like(readout)
+
+    # Warmup
+    for _ in range(5):
+        _torch_backward(h, msg, W, decay, inject_proj, h_out, out_mask,
+                        dL_dh_out, dL_dreadout, readout_scale)
+        _triton_backward(h, msg, W, decay, inject_proj, h_out, out_mask,
+                         dL_dh_out, dL_dreadout, readout_scale)
+    torch.cuda.synchronize()
+
+    N = 200
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(N):
+        _torch_backward(h, msg, W, decay, inject_proj, h_out, out_mask,
+                        dL_dh_out, dL_dreadout, readout_scale)
+    torch.cuda.synchronize()
+    t_torch = (time.time() - t0) / N * 1e6
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(N):
+        _triton_backward(h, msg, W, decay, inject_proj, h_out, out_mask,
+                         dL_dh_out, dL_dreadout, readout_scale)
+    torch.cuda.synchronize()
+    t_triton = (time.time() - t0) / N * 1e6
+
+    print(f"Backward PyTorch:  {t_torch:.1f} μs / token")
+    print(f"Backward Triton:   {t_triton:.1f} μs / token")
+    print(f"Ratio: Triton / PyTorch = {t_triton / t_torch:.2f}×")
+
+
 def test_backward_matches_torch():
     """Gradient from Triton path should match pure-PyTorch gradient."""
     from src.model.triton_memory_step import fused_memory_step
@@ -145,5 +200,7 @@ if __name__ == "__main__":
     test_correctness()
     print()
     test_speed()
+    print()
+    test_backward_speed()
     print()
     test_backward_matches_torch()

@@ -222,8 +222,16 @@ memory-graph param count (and the corresponding policy capacity).
 
 ### Open / future work
 
-- Full Triton backward (current: analytical PyTorch backward). Would
-  unlock the ~4× per-token speedup on the backward pass too.
+- ~~Full Triton backward~~ — **tried and rejected** (April 2026). A
+  fused Triton backward kernel (`_memory_step_bwd`, kept in the file for
+  reference) runs **8.7× slower** than the PyTorch analytical backward
+  at our shape regime (Nc=32, D_n=256). Reason: grid (BS=64, NC=8) = 512
+  programs each doing three small 32×32 / 32×256 `tl.dot`s — tile sizes
+  too small for tensor cores to amortize launch + memory-load cost.
+  PyTorch's analytical path by contrast does 2 well-batched bmms at
+  [BS*NC, ...] that saturate tensor cores. Forward fusion won because it
+  replaced many dispatch-bound ops; backward is dominated by two matmuls
+  that PyTorch already runs near-peak.
 - CUDA graph capture of `_run_block` to eliminate residual Python dispatch.
 - Attach to a pretrained Llama (e.g. 3B) and measure autoregressive
   inference overhead. Memory graph's per-token cost should be negligible
