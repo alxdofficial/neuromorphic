@@ -93,6 +93,43 @@ def test_one_train_step():
     opt.zero_grad(set_to_none=True)
     loss.backward()
     opt.step()
-    # State should still be initialized and finite after one step.
     assert model.memory.is_initialized
     assert torch.isfinite(model.memory.h).all()
+
+
+def test_telemetry_helpers_run():
+    """Every telemetry function used by the trainer must execute and return dict.
+
+    This caught a real bug: when the modulator/decoder changed from per-cell
+    to shared + cell embeddings, the helpers still referenced the old
+    `tok_proj_w1` / `logit_head_w` names. tier_tiny is CPU so the test
+    exercises every helper without needing a GPU.
+    """
+    cfg = Config.tier_tiny()
+    model = Model(cfg)
+    BS, T = 2, cfg.T
+    input_ids = torch.randint(0, cfg.vocab_size, (BS, T))
+    target_ids = torch.randint(0, cfg.vocab_size, (BS, T))
+    model.train()
+    model.forward_chunk(input_ids, target_ids=target_ids)["loss"].backward()
+
+    # Each of these is called unconditionally or at log-cadence in trainer.py;
+    # make sure every attribute it names actually exists on the current model.
+    mem = model.memory
+    for helper_name in (
+        "compute_component_grad_norms",
+        "compute_param_norms",
+        "compute_plasticity_rates",
+        "compute_memory_health",
+        "compute_mod_grad_norm",
+    ):
+        result = getattr(mem, helper_name)()
+        # Helpers return either dict or float. Just check no exception.
+        assert result is not None
+
+    # compute_lane_divergence needs BS > 1 to be non-trivial; tier_tiny BS=2.
+    lane = mem.compute_lane_divergence()
+    assert isinstance(lane, dict)
+
+    mem_scale = model.lm.compute_mem_scale_stats()
+    assert isinstance(mem_scale, dict) and "mem_scale_mean" in mem_scale
