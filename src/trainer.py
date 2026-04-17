@@ -130,7 +130,17 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
 
-        component_grads = self.model.memory.compute_component_grad_norms()
+        # Whether this step should emit full telemetry. All of the per-
+        # parameter reductions below (grad norms, param norms, mem health
+        # stats) require CUDA sync and were a real wall-clock tax when run
+        # every step. Gate them on the log cadence; non-log steps skip them.
+        is_log_step = (
+            self.global_step == 0
+            or (self.global_step + 1) % self.log_interval == 0
+        )
+
+        component_grads = (self.model.memory.compute_component_grad_norms()
+                            if is_log_step else {})
 
         # Three independent clip pools so a spike in one pool doesn't drown
         # the others. Budgets scaled by sqrt(pool_params / lm_params) so
@@ -148,7 +158,8 @@ class Trainer:
                 self._mod_params,
                 self.max_grad_norm * self._mod_clip_scale).item()
 
-        mod_grad_norm = self.model.memory.compute_mod_grad_norm()
+        mod_grad_norm = (self.model.memory.compute_mod_grad_norm()
+                         if is_log_step else 0.0)
 
         self.optimizer.step()
         self.optimizer_step += 1
@@ -157,20 +168,19 @@ class Trainer:
 
         self.model.detach_states()
 
-        # Diagnostic: measure how much BS lanes have diverged in their
-        # W/decay/hebbian. This is expected — each lane reflects the
-        # modulator's response to its own content stream. The modulator
-        # policy (mod_w1/b1/w2/b2) is already shared by construction.
+        # Telemetry reductions (diagnostic; gated on log cadence).
         lane_stats = {}
-        if (self.global_step > 0
-                and (self.global_step + 1) % self.log_interval == 0):
-            lane_stats = self.model.memory.compute_lane_divergence()
-
-        # Phase-1 telemetry: plasticity rates, memory health, param norms.
-        plasticity_rates = self.model.memory.compute_plasticity_rates()
-        mem_health = self.model.memory.compute_memory_health()
-        param_norms = self.model.memory.compute_param_norms()
-        mem_scale_stats = self.model.lm.compute_mem_scale_stats()
+        plasticity_rates = {}
+        mem_health = {}
+        param_norms = {}
+        mem_scale_stats = {}
+        if is_log_step:
+            if self.global_step > 0:
+                lane_stats = self.model.memory.compute_lane_divergence()
+            plasticity_rates = self.model.memory.compute_plasticity_rates()
+            mem_health = self.model.memory.compute_memory_health()
+            param_norms = self.model.memory.compute_param_norms()
+            mem_scale_stats = self.model.lm.compute_mem_scale_stats()
 
         elapsed = time.time() - t_start
         tok_per_s = BS * T / elapsed

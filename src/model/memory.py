@@ -23,6 +23,7 @@ from torch import Tensor
 from .config import Config
 from .discrete_policy import DiscreteActionPolicy
 from .attention_modulator import AttentionModulator, DirectDecoder, port_layout
+from .triton_memory_step import fused_memory_step
 
 
 class MemoryGraph(nn.Module):
@@ -45,13 +46,11 @@ class MemoryGraph(nn.Module):
         self.neuron_id = nn.Parameter(
             torch.randn(self.NC, self.Nc, self.D_n) * (self.D_n ** -0.5))
 
-        # Shared state/msg MLPs (2-layer tanh, same weights across all neurons).
-        Hs = config.state_mlp_hidden
+        # Msg MLP (2-layer tanh, shared) — fires event-driven at msg_interval.
+        # State update itself has NO learned MLP; it's a LIF-style leaky
+        # integrator: h = tanh(decay*h + (1-decay)*received). Plasticity on
+        # the state timescale lives in `decay_gamma_logit` per-neuron.
         Hm = config.msg_mlp_hidden
-        self.state_w1 = nn.Parameter(torch.empty(Hs, 2 * self.D_n))
-        self.state_b1 = nn.Parameter(torch.zeros(Hs))
-        self.state_w2 = nn.Parameter(torch.empty(self.D_n, Hs))
-        self.state_b2 = nn.Parameter(torch.zeros(self.D_n))
         self.msg_w1 = nn.Parameter(torch.empty(Hm, self.D_n))
         self.msg_b1 = nn.Parameter(torch.zeros(Hm))
         self.msg_w2 = nn.Parameter(torch.empty(self.D_n, Hm))
@@ -80,17 +79,19 @@ class MemoryGraph(nn.Module):
 
         # Port-layout buffers (per-cell indices).
         layout = port_layout(config)
-        # layout indices are global (across all N neurons) — convert to
-        # per-cell local indices [NC, alpha].
         self.register_buffer("input_port_idx", layout["input_port_idx"])
         self.register_buffer("output_port_idx", layout["output_port_idx"])
-        # Reshape role_id to [NC, Nc] for per-cell access.
         self.register_buffer("role_id", layout["role_id"].view(self.NC, self.Nc))
+        # Pre-built dense output-port mask for the fused step.
+        # mask[c, n] = 1 if neuron n in cell c is an output port, else 0.
+        out_mask = torch.zeros(self.NC, self.Nc)
+        for c in range(self.NC):
+            out_mask[c, layout["output_port_idx"][c]] = 1.0
+        self.register_buffer("out_port_mask", out_mask)
+        self.readout_scale = self.alpha ** -0.5
 
         # Init (Xavier with tanh gain where appropriate).
         TANH_GAIN = 5.0 / 3.0
-        nn.init.xavier_uniform_(self.state_w1, gain=TANH_GAIN)
-        nn.init.xavier_uniform_(self.state_w2, gain=TANH_GAIN)
         nn.init.xavier_uniform_(self.msg_w1, gain=TANH_GAIN)
         nn.init.xavier_uniform_(self.msg_w2, gain=TANH_GAIN)
 
@@ -265,11 +266,11 @@ class MemoryGraph(nn.Module):
     def compute_component_grad_norms(self) -> dict:
         out = {}
         for name, p in (
-            ("grad_tok_proj", self.modulator.tok_proj[0].weight),
-            ("grad_logit_head", self.modulator.logit_head.weight),
+            ("grad_tok_proj", self.modulator.tok_proj_w1),
+            ("grad_logit_head", self.modulator.logit_head_w),
             ("grad_codebook", self.discrete_policy.codebook),
-            ("grad_decoder", self.decoder.mlp[-1].weight),
-            ("grad_state_w1", self.state_w1),
+            ("grad_decoder", self.decoder.w2),
+            ("grad_decay_gamma_logit", self.decay_gamma_logit),
             ("grad_msg_w1", self.msg_w1),
             ("grad_inject_w", self.inject_w),
             ("grad_neuron_id", self.neuron_id),
@@ -279,11 +280,11 @@ class MemoryGraph(nn.Module):
 
     def compute_param_norms(self) -> dict:
         return {
-            "tok_proj_norm": self.modulator.tok_proj[0].weight.detach().float().norm().item(),
-            "logit_head_norm": self.modulator.logit_head.weight.detach().float().norm().item(),
+            "tok_proj_norm": self.modulator.tok_proj_w1.detach().float().norm().item(),
+            "logit_head_norm": self.modulator.logit_head_w.detach().float().norm().item(),
             "codebook_norm": self.discrete_policy.codebook.detach().float().norm().item(),
-            "decoder_norm": self.decoder.mlp[-1].weight.detach().float().norm().item(),
-            "state_w1_norm": self.state_w1.detach().float().norm().item(),
+            "decoder_norm": self.decoder.w2.detach().float().norm().item(),
+            "decay_gamma_logit_norm": self.decay_gamma_logit.detach().float().norm().item(),
             "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
             "inject_w_norm": self.inject_w.detach().float().norm().item(),
             "neuron_id_norm": self.neuron_id.detach().float().norm().item(),
@@ -326,16 +327,16 @@ class MemoryGraph(nn.Module):
                 inject[:, :, a, :].unsqueeze(2).to(received.dtype))
         return received
 
-    def _state_update(self, received: Tensor, h: Tensor,
-                      decay_gate: Tensor, one_minus_gate: Tensor,
-                      w1: Tensor, b1: Tensor, w2: Tensor, b2: Tensor) -> Tensor:
-        """State MLP with decay-gated integration. Operates on flattened [BS*NC*Nc, D_n]."""
-        inp = torch.cat([received, h], dim=-1)  # [BS, NC, Nc, 2*D_n]
-        flat = inp.reshape(-1, inp.shape[-1])
-        hid = torch.tanh(F.linear(flat, w1, b1))
-        candidate = torch.tanh(F.linear(hid, w2, b2))
-        candidate = candidate.reshape(h.shape)
-        return decay_gate * h + one_minus_gate * candidate
+    @staticmethod
+    def _state_update(received: Tensor, h: Tensor,
+                      decay_gate: Tensor, one_minus_gate: Tensor) -> Tensor:
+        """LIF-style leaky integrator: h = tanh(decay*h + (1-decay)*received).
+
+        Pure elementwise. No state MLP — per-neuron learned knobs live in
+        `decay_gamma_logit` (per-cell, per-neuron timescales). The saturating
+        tanh serves as the soma activation / spike threshold surrogate.
+        """
+        return torch.tanh(decay_gate * h + one_minus_gate * received)
 
     def _emit_message(self, h: Tensor, w1: Tensor, b1: Tensor,
                       w2: Tensor, b2: Tensor) -> Tensor:
@@ -345,16 +346,19 @@ class MemoryGraph(nn.Module):
         # neuron_id is [NC, Nc, D_n]; broadcast over BS.
         return msg_new + self.neuron_id.to(h.dtype).unsqueeze(0)
 
-    def _readout(self, msg: Tensor) -> Tensor:
-        """Per-cell output port pool → [BS, D]."""
-        BS, NC, _, D_n = msg.shape
-        out_idx = self.output_port_idx.to(msg.device)  # [NC, alpha] (local)
-        # Gather output-port msgs: for each cell, index into last-2 dim.
-        # Build expanded index [NC, alpha, D_n] for torch.gather.
-        idx_exp = out_idx.unsqueeze(-1).expand(NC, self.alpha, D_n)  # [NC, alpha, D_n]
+    def _readout(self, h: Tensor) -> Tensor:
+        """Per-cell output-port pool of h (membrane potential) → [BS, D].
+
+        Pooling from h (not msg) so the LM sees the fresh per-token membrane
+        state. msg is event-driven and would be piecewise-constant across
+        the token interval between spike events.
+        """
+        BS, NC, _, D_n = h.shape
+        out_idx = self.output_port_idx.to(h.device)      # [NC, alpha] local
+        idx_exp = out_idx.unsqueeze(-1).expand(NC, self.alpha, D_n)
         idx_exp = idx_exp.unsqueeze(0).expand(BS, NC, self.alpha, D_n).contiguous()
-        gathered = msg.gather(2, idx_exp)  # [BS, NC, alpha, D_n]
-        pooled = gathered.sum(dim=2) * (self.alpha ** -0.5)  # [BS, NC, D_n]
+        gathered = h.gather(2, idx_exp)                  # [BS, NC, alpha, D_n]
+        pooled = gathered.sum(dim=2) * (self.alpha ** -0.5)
         return pooled.reshape(BS, NC * D_n)
 
     def _modulate(self, h: Tensor, msg: Tensor, received: Tensor,
@@ -387,11 +391,10 @@ class MemoryGraph(nn.Module):
         if self.training and phase == "phase1":
             self.discrete_policy.update_usage(codes)
 
-        # Decoder expects flat [B*, D_code] → returns (ΔW [B*, Nc, Nc], Δdecay [B*, Nc])
-        dW_normed, dDecay_raw = self.decoder(emb)
-        # Reshape back to per-cell.
-        dW_normed = dW_normed.reshape(BS, NC, self.Nc, self.Nc)
-        dDecay_raw = dDecay_raw.reshape(BS, NC, self.Nc)
+        # Decoder is a shared trunk conditioned on the modulator's cell_emb.
+        # emb [BS*NC, D_code] → reshape [BS, NC, D_code] → returns (ΔW [BS, NC, Nc, Nc], Δdecay [BS, NC, Nc]).
+        emb_3d = emb.reshape(BS, NC, -1)
+        dW_normed, dDecay_raw = self.decoder(emb_3d, self.modulator.cell_emb)
 
         # EMA blend. W_gamma is [NC, Nc] — broadcast to [BS, NC, Nc, Nc] via unsqueeze(-1).
         W_new = ((1 - W_gamma.unsqueeze(0).unsqueeze(-1)) * W
@@ -418,17 +421,25 @@ class MemoryGraph(nn.Module):
                    block_H_mid, block_input_ids,
                    start_t,
                    inject_w, inject_b,
-                   st_w1, st_b1, st_w2, st_b2,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                    hebbian_gamma, W_gamma, decay_gamma, gain_fast):
+        """Multi-timescale memory loop.
+
+        Per-token (fast clock): W @ msg message passing + inject + LIF state
+        update + readout from h. Pure elementwise + one bmm.
+        Event (msg_interval, default 4): msg = MLP(h), hebbian EMA update.
+        Slow event (modulation_interval, default 16): neuromodulator fires,
+        emits ΔW and Δdecay via codebook+decoder.
+        """
         block_T = block_H_mid.shape[1]
         BS = h.shape[0]
         D = self.config.D
         readouts = torch.empty(BS, block_T, D,
                                 device=block_H_mid.device, dtype=h.dtype)
-        decay_gate = decay.unsqueeze(-1)            # [BS, NC, Nc, 1]
-        one_minus_gate = 1.0 - decay_gate
+
+        msg_interval = self.config.msg_interval
+        mod_interval = self.config.modulation_interval
 
         for offset in range(block_T):
             t = start_t + offset
@@ -436,14 +447,12 @@ class MemoryGraph(nn.Module):
             tok_t = block_input_ids[:, offset]
 
             if t > 0 and (t % self.config.tbptt_block == 0):
-                for attr_name in ("h", "msg", "W", "decay", "hebbian", "prev_readout"):
-                    pass
                 h = h.detach(); msg = msg.detach(); W = W.detach()
                 decay = decay.detach(); hebbian = hebbian.detach()
                 prev_readout = prev_readout.detach()
-                decay_gate = decay.unsqueeze(-1)
-                one_minus_gate = 1.0 - decay_gate
 
+            # Surprise signal from previous readout — always per-token so
+            # the modulator sees the freshest EMA whenever it fires.
             with torch.no_grad():
                 x = prev_readout
                 if proj_down_w is not None:
@@ -457,23 +466,36 @@ class MemoryGraph(nn.Module):
                 s_mem_ema_fast = ((1 - gain_fast) * s_mem_ema_fast
                                    + gain_fast * s_mem_live)
 
-            if t % self.config.modulation_interval == 0:
-                received = self._receive(msg, W)
+            # Per-token hot path: FUSED in one Triton kernel (forward+backward).
+            # 1) Compute inject projection from H_mid slice (small, per-cell).
+            slices = H_mid_t.reshape(BS, self.NC, self.D_n)
+            inject_proj = torch.einsum("bci,coi->bco", slices, inject_w)
+            inject_proj = inject_proj + inject_b.unsqueeze(0)
+            inject_proj = inject_proj.reshape(BS, self.NC, self.alpha, self.D_n)
+            # 2) Fused step: W@msg + in-kernel inject add + LIF + readout pool.
+            #    Inject is added to the first α rows inside the kernel — no
+            #    dense materialization/scatter on the Python side. Requires
+            #    port_layout to put input ports at local indices [0, α).
+            h, readout_3d = fused_memory_step(
+                h, msg, W, decay, inject_proj, self.out_port_mask,
+                self.readout_scale)
+            readout = readout_3d.reshape(BS, self.NC * self.D_n)
+            readouts[:, offset] = readout
+
+            # Event — end of msg_interval block: refresh msg (spike emission),
+            # update Hebbian co-activation trace.
+            if (t + 1) % msg_interval == 0:
+                msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2)
+                hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
+
+            # Slow event — end of modulation_interval block: neuromodulator
+            # writes plasticity updates to W and decay.
+            if (t + 1) % mod_interval == 0:
+                received_for_mod = self._receive(msg, W)
                 W, decay = self._modulate(
-                    h, msg, received, W, hebbian, decay,
+                    h, msg, received_for_mod, W, hebbian, decay,
                     s_mem_live, s_mem_ema_fast,
                     W_gamma, decay_gamma, phase="phase1")
-                decay_gate = decay.unsqueeze(-1)
-                one_minus_gate = 1.0 - decay_gate
-
-            received = self._receive(msg, W)
-            received = self._inject(received, H_mid_t, inject_w, inject_b)
-            h = self._state_update(received, h, decay_gate, one_minus_gate,
-                                    st_w1, st_b1, st_w2, st_b2)
-            msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2)
-            readout = self._readout(msg)
-            readouts[:, offset] = readout
-            hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             with torch.no_grad():
                 new_pool = readout.reshape(BS, self.NC_pools, self.D_n)
@@ -526,8 +548,6 @@ class MemoryGraph(nn.Module):
 
         dt = h.dtype
         inject_w = self.inject_w.to(dt); inject_b = self.inject_b.to(dt)
-        st_w1 = self.state_w1.to(dt); st_b1 = self.state_b1.to(dt)
-        st_w2 = self.state_w2.to(dt); st_b2 = self.state_b2.to(dt)
         mg_w1 = self.msg_w1.to(dt); mg_b1 = self.msg_b1.to(dt)
         mg_w2 = self.msg_w2.to(dt); mg_b2 = self.msg_b2.to(dt)
         lm_head_w = lm.lm_head.weight.to(dt)
@@ -556,7 +576,6 @@ class MemoryGraph(nn.Module):
                 H_mid[:, start_t:end_t], input_ids[:, start_t:end_t],
                 start_t,
                 inject_w, inject_b,
-                st_w1, st_b1, st_w2, st_b2,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast)
@@ -585,10 +604,16 @@ class MemoryGraph(nn.Module):
             readouts[:, :-1],
         ], dim=1)
 
+        # Aux-loss chunking is decoupled from tbptt_block. Memory-head CE is
+        # a no-grad-through-state logits+CE over (readout, vocab); larger
+        # chunks mean fewer kernel launches. Default aux_loss_chunk=T (one
+        # pass over the whole segment) which profile measurements show is
+        # ~25% faster than chunk=tbptt_block.
+        aux_chunk = max(1, self.config.aux_loss_chunk)
         loss_sum = torch.zeros((), device=H_mid.device, dtype=torch.float32)
         valid_total = torch.zeros((), device=H_mid.device, dtype=torch.float32)
-        for s in range(0, T, block_size):
-            e = min(s + block_size, T)
+        for s in range(0, T, aux_chunk):
+            e = min(s + aux_chunk, T)
             sub_logits = lm.mem_head_logits(shifted_all[:, s:e])
             sub_valid = valid_mask[:, s:e].float()
             per_tok = F.cross_entropy(

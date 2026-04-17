@@ -124,7 +124,7 @@ def main():
           f"{config.N_internal} internal")
     print(f"  Modulator: F={config.attn_token_dim}, heads={config.attn_n_heads}, "
           f"layers={config.attn_n_layers}")
-    print(f"  Decoder: rank={config.action_rank}, hidden={config.decoder_hidden}")
+    print(f"  Decoder: hidden={config.decoder_hidden}, d_cell={config.d_cell}")
     print(f"  Training: BS={bs}, T={T}, mem_lr_scale={config.mem_lr_scale}")
 
     model = Model(config).to(device)

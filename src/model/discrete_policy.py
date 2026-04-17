@@ -1,10 +1,13 @@
 """Discrete action policy: codebook + sampling primitives.
 
-In the conv-grid modulator design, the encoder (logit production) lives in
-`grid_modulator.ConvGridModulator`, and the action generator (ΔW, Δdecay)
-lives in `grid_modulator.ConvTransposeDecoder`. This module is the thin
-discrete-bottleneck layer between them: given code logits, sample a code
+The encoder (logit production) lives in `attention_modulator.AttentionModulator`,
+and the action generator (ΔW, Δdecay) lives in
+`attention_modulator.DirectDecoder`. This module is the thin discrete-
+bottleneck layer between them: given code logits, sample a code
 (Gumbel-softmax or hard Categorical), then look it up in the codebook.
+
+Codebook is SHARED across cells — cells agree on the plasticity vocabulary
+but each has its own per-cell decoder to interpret codes into ΔW.
 
 Trains unchanged under Phase 1 (Gumbel backprop) and Phase 2 (GRPO with
 log_pi).

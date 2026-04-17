@@ -1,16 +1,18 @@
-"""Attention-based neuromodulator for multi-cell memory graph.
+"""Attention-based neuromodulator — shared trunk + per-cell conditioning.
+
+Weights are SHARED across the NC=8 cells (the expensive ones: attention,
+FFN, logit head, decoder MLP). Cell specialization comes from a small
+learned cell embedding that is (1) injected as an extra per-token feature
+for the modulator, and (2) concatenated to the decoder input. This gives
+each cell an identity signal at both the observation and action stages
+without duplicating trunk weights.
+
+Sharing keeps compiled matmuls fat (better GPU utilization) and parameter
+count modest. Per-cell behavior still differs because (a) each cell sees
+its own h/msg/W state, (b) each cell carries its own identity vector
+through the shared trunk.
 
 State shape: [BS, NC, Nc, D_n] for h/msg; [BS, NC, Nc, Nc] for W/hebbian.
-
-Encoder: per-cell attention. Each cell's Nc neurons become Nc tokens;
-attention runs within each cell independently (NC cells in parallel as
-batch dim). Edge biases from W/hebbian per cell. Cells do not share
-attention context — they communicate only via their input/output ports
-through the LM.
-
-Decoder: per-cell code embedding → MLP → (ΔW [Nc×Nc], Δdecay [Nc]) per cell.
-
-Both use bmm primitives — tensor-core friendly.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from .config import Config
 
 
 # ======================================================================
-# Per-cell attention encoder
+# Modulator encoder (shared trunk, cell-embedding-conditioned)
 # ======================================================================
 
 
@@ -38,6 +40,7 @@ class AttentionModulator(nn.Module):
         self.D_n = config.D_n
         self.d_proj = config.d_proj
         self.role_dim = config.role_dim
+        self.d_cell = config.d_cell
         self.K = config.num_codes
 
         F_tok = config.attn_token_dim
@@ -47,13 +50,19 @@ class AttentionModulator(nn.Module):
         self.H = H
         self.head_dim = F_tok // H
 
-        # Per-neuron feature projections (shared across cells).
+        # Shared per-neuron feature projections.
         self.h_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.msg_emit_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.msg_recv_proj = nn.Linear(self.D_n, self.d_proj, bias=False)
         self.role_emb = nn.Embedding(3, self.role_dim)
 
-        tok_in_dim = (1 + 1 + 1 + 3 * self.d_proj + self.role_dim + 2)
+        # Per-cell identity embedding — the only cell-specific parameter in
+        # the modulator. Broadcast across (BS, Nc) as a per-token feature.
+        self.cell_emb = nn.Parameter(
+            torch.randn(self.NC, self.d_cell) * (self.d_cell ** -0.5))
+
+        tok_in_dim = (1 + 1 + 1 + 3 * self.d_proj + self.role_dim
+                      + self.d_cell + 2)
         self.tok_in_dim = tok_in_dim
         self.tok_proj = nn.Sequential(
             nn.Linear(tok_in_dim, F_tok),
@@ -61,25 +70,25 @@ class AttentionModulator(nn.Module):
             nn.Linear(F_tok, F_tok),
         )
 
-        # Edge bias: (W, hebbian, asym) → H heads of scalar bias per edge.
+        # Shared edge-bias MLP: (W, hebbian, asym) → H heads.
         self.edge_bias_mlp = nn.Sequential(
             nn.Linear(3, max(H, 8)),
             nn.GELU(),
             nn.Linear(max(H, 8), H),
         )
 
-        # Per-cell attention blocks (shared weights across cells).
+        # Shared attention blocks (cells are batched over NC).
         self.layers = nn.ModuleList([
             AttnBlock(F_tok, H, ffn_mult=config.attn_ffn_mult,
                       dropout=config.attn_dropout)
             for _ in range(config.attn_n_layers)
         ])
 
-        # Pool + logit head (shared across cells — same projection applied to
-        # each cell's pooled feature, producing [BS, NC, K] logits).
+        # Shared pool + logit head.
         self.pool_norm = nn.LayerNorm(F_tok)
         self.logit_head = nn.Linear(F_tok, self.K)
 
+        # Init Linear / Embedding.
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -110,12 +119,16 @@ class AttentionModulator(nn.Module):
         me_p = self.msg_emit_proj(msg)
         mr_p = self.msg_recv_proj(received)
 
-        h_norm = h.norm(dim=-1, keepdim=True)             # [BS, NC, Nc, 1]
+        h_norm = h.norm(dim=-1, keepdim=True)
         msg_norm = msg.norm(dim=-1, keepdim=True)
-        dec = decay.unsqueeze(-1).to(w_dt)                # [BS, NC, Nc, 1]
+        dec = decay.unsqueeze(-1).to(w_dt)
 
         role_e = self.role_emb(role_id).to(w_dt)          # [NC, Nc, role_dim]
         role_e = role_e.unsqueeze(0).expand(BS, NC, Nc, self.role_dim)
+
+        # Cell identity — broadcast [NC, d_cell] across (BS, Nc).
+        cell_e = self.cell_emb.to(w_dt)                   # [NC, d_cell]
+        cell_e = cell_e.view(1, NC, 1, self.d_cell).expand(BS, NC, Nc, self.d_cell)
 
         s_live_b = s_live.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
         s_ema_b = s_ema.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
@@ -123,7 +136,7 @@ class AttentionModulator(nn.Module):
         tok_in = torch.cat([
             h_norm, msg_norm, dec,
             h_p, me_p, mr_p,
-            role_e,
+            role_e, cell_e,
             s_live_b, s_ema_b,
         ], dim=-1)
 
@@ -137,8 +150,7 @@ class AttentionModulator(nn.Module):
             W = W.to(w_dt); hebbian = hebbian.to(w_dt)
         asym = W - W.transpose(-1, -2)
         edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, Nc, Nc, 3]
-        bias = self.edge_bias_mlp(edge_feat)                 # [BS, NC, Nc, Nc, H]
-        # Permute to [BS, NC, H, Nc, Nc] for attention.
+        bias = self.edge_bias_mlp(edge_feat)
         return bias.permute(0, 1, 4, 2, 3).contiguous()
 
     def forward(
@@ -152,9 +164,6 @@ class AttentionModulator(nn.Module):
         tokens = self.build_tokens(h, msg, received, decay, s_live, s_ema, role_id)
         BS, NC, Nc, F_tok = tokens.shape
 
-        # Per-cell attention with edge bias from (W, hebbian, asymmetry).
-        # NC runs as batch dim; no cross-cell attention — cells communicate
-        # only via their inject/readout ports at the LM interface.
         edge_bias = self.build_edge_bias(W, hebbian)
         tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
         edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
@@ -162,12 +171,12 @@ class AttentionModulator(nn.Module):
             tokens_flat = layer(tokens_flat, edge_bias_flat)
         tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
 
-        # Pool per cell → per-cell logits.
         pooled = self.pool_norm(tokens).mean(dim=2)       # [BS, NC, F]
         return self.logit_head(pooled), tokens
 
 
 class AttnBlock(nn.Module):
+    """Shared-weights attention block. NC as batch dim."""
 
     def __init__(self, F_tok: int, H: int, ffn_mult: int = 4, dropout: float = 0.0):
         super().__init__()
@@ -204,43 +213,60 @@ class AttnBlock(nn.Module):
 
 
 # ======================================================================
-# Per-cell decoder: code_emb → MLP → ΔW [Nc×Nc] + Δdecay [Nc]
+# Decoder (shared trunk, cell-embedding-conditioned input)
 # ======================================================================
 
 
 class DirectDecoder(nn.Module):
+    """Shared decoder MLP conditioned on a per-cell identity vector.
+
+    Cells differ only by their learned cell_emb (shared with the modulator's
+    `cell_emb`). The MLP trunk is a single set of weights; it reads
+    [code_emb | cell_emb] and emits cell-appropriate ΔW, Δdecay.
+    """
 
     def __init__(self, config: Config):
         super().__init__()
         self.Nc = config.neurons_per_cell
+        self.NC = config.N_cells
         self.D_code = config.code_dim
+        self.d_cell = config.d_cell
 
+        in_dim = self.D_code + self.d_cell
         out_dim = self.Nc * self.Nc + self.Nc
         self.mlp = nn.Sequential(
-            nn.Linear(self.D_code, config.decoder_hidden),
+            nn.Linear(in_dim, config.decoder_hidden),
             nn.GELU(),
             nn.Linear(config.decoder_hidden, out_dim),
         )
+        # Zero-init final layer: memory graph starts as an exact no-op so W and
+        # decay stay at their initial values until the decoder learns to write.
+        # This costs one step of upstream gradient dead-zone (reviewer flagged
+        # B5-scale: not fatal but wastes step 0 on decoder trunk, codebook,
+        # modulator qkv) — accepted trade-off because the RMS-norm on dW means
+        # small-magnitude inits get amplified at init and undermine the no-op.
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-        self.register_buffer('diag_mask', torch.eye(self.Nc).unsqueeze(0))
+        self.register_buffer("diag_mask", torch.eye(self.Nc).unsqueeze(0))
 
-    def forward(self, emb: Tensor) -> tuple[Tensor, Tensor]:
-        """emb: [B*, D_code] → (ΔW [B*, Nc, Nc], Δdecay [B*, Nc]).
+    def forward(self, emb: Tensor, cell_emb: Tensor) -> tuple[Tensor, Tensor]:
+        """emb: [BS, NC, D_code]. cell_emb: [NC, d_cell] (passed from modulator).
 
-        Caller reshapes B* as needed (e.g. [BS*NC] → [BS, NC, Nc, Nc]).
+        Returns (ΔW [BS, NC, Nc, Nc], Δdecay [BS, NC, Nc]).
         """
-        B = emb.shape[0]
+        BS, NC, _ = emb.shape
         w_dt = self.mlp[0].weight.dtype
         orig_dt = emb.dtype
         if emb.dtype != w_dt:
             emb = emb.to(w_dt)
+        cell_expanded = cell_emb.to(w_dt).unsqueeze(0).expand(BS, NC, self.d_cell)
+        combined = torch.cat([emb, cell_expanded], dim=-1)   # [BS, NC, D_code + d_cell]
 
-        raw = self.mlp(emb)
-        dW_raw = raw[..., : self.Nc * self.Nc].reshape(B, self.Nc, self.Nc)
+        raw = self.mlp(combined)
+        dW_raw = raw[..., : self.Nc * self.Nc].reshape(BS, NC, self.Nc, self.Nc)
         dDecay_raw = raw[..., self.Nc * self.Nc:]
-        dW_raw = dW_raw * (1.0 - self.diag_mask.to(dW_raw.dtype))
+        dW_raw = dW_raw * (1.0 - self.diag_mask.to(dW_raw.dtype).unsqueeze(0))
         dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.Nc,))
 
         if orig_dt != w_dt:
@@ -250,7 +276,7 @@ class DirectDecoder(nn.Module):
 
 
 # ======================================================================
-# Port layout (per-cell local indices)
+# Port layout (unchanged)
 # ======================================================================
 
 
@@ -268,12 +294,9 @@ def port_layout(config: Config) -> dict:
     alpha = config.alpha
     N = NC * Nc
 
-    # Per-cell local indices: first alpha = input, next alpha = output,
-    # rest = internal.
     input_local = torch.arange(alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
     output_local = torch.arange(alpha, 2 * alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
 
-    # Flat role_id: per cell, [0:alpha)=input, [alpha:2alpha)=output, rest=internal.
     role_id = torch.full((N,), 2, dtype=torch.long)
     for c in range(NC):
         base = c * Nc

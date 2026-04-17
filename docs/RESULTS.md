@@ -149,19 +149,85 @@ torch.compile on per-block memory loop. No activation checkpointing
 at BS=64 (22GB VRAM used).
 ```
 
-## Verdict
+## Verdict (at the shared-weights milestone)
 
 - **37.6K tok/s** — within 6% of main's 40K
-- **No capability regression vs main** on any dimension I can identify:
-  - Same N=256 total neurons
-  - Same NC=8 × Nc=32 cell structure
-  - Same per-cell block-diagonal W
-  - Attention modulator observes per-edge AND per-node features (main's MLP modulator only sees rates/correlations, not content)
-  - Optional cross-cell attention layer for long-distance perception
-  - Full-rank ΔW emission (main has this too)
-- **Capability WIN over main**: attention modulator's inductive bias
-  (permutation-equivariant, edge-aware, content-aware) vs main's flat MLP.
-  Whether this translates to better `mem_leverage_ce` is an empirical
-  question that requires real training to answer.
+- Attention modulator observes per-edge AND per-node features; main's MLP
+  modulator only sees rates/correlations.
+- Full-rank ΔW emission (main has this too).
+
+## Redesign (April 2026) — multi-timescale + per-cell + Triton
+
+Everything below supersedes the shared-weights milestone above. See
+`design.md` for the canonical description of the current architecture.
+
+### Changes
+
+1. **Per-token state update simplified to LIF** —
+   `h = tanh(decay·h + (1−decay)·received)`. No state MLP; neurons are
+   leaky integrators with a tanh threshold. Matches biological soma more
+   accurately.
+2. **Multi-timescale event schedule** —
+   - Per-token: W @ msg + inject + LIF state update + readout (fast)
+   - Every 4 tokens: msg = MLP(h), hebbian EMA update (event)
+   - Every 16 tokens: neuromodulator → ΔW, Δdecay (slow)
+3. **Triton-fused per-token kernel** — forward+analytical-backward
+   `torch.autograd.Function` fusing W@msg + inject add + LIF + readout
+   pool. 4.2× faster per-token in isolation; ~5-10% end-to-end gain after
+   integration.
+4. **Readout pools from `h`**, not `msg` (fresh every token).
+5. **Per-cell modulator** — all modulator weights are `[NC, ...]`, applied
+   via einsum. Each cell has its own attention, edge-bias MLP, and logit
+   head. LayerNorms stay shared.
+6. **Per-cell decoder** — each cell interprets the shared codebook through
+   its own decoder. Same code ID can mean different plasticity programs
+   in different cells.
+7. **Beefed modulator** — `attn_token_dim 64→128`, `attn_n_layers 2→3`,
+   `attn_n_heads 4→8`, `d_proj 16→24`. ~3× modulator param count.
+8. **`tbptt_block` default 8→16.**
+
+### Throughput progression (RTX 4090, BS=64, T=128, tbptt=16)
+
+| Stage | tok/s | vs baseline | VRAM | Params (mem graph) |
+|---|---:|---:|---:|---:|
+| Shared-weights baseline | 37.8K | 1.00× | 21 GB | 3.6 M |
+| + multi-timescale LIF | 67.3K | 1.78× | 10.4 GB | 3.4 M |
+| + Triton fused kernel | 69.8K | 1.85× | 10.0 GB | 3.4 M |
+| + per-cell mod + decoder | 64.1K | 1.70× | 10.3 GB | 9.4 M |
+| + beefed modulator (final) | **56.3K** | **1.49×** | 11.9 GB | 14.6 M |
+
+Total model: **81.73M params** (LM 67.1M + memory graph 14.6M).
+
+The per-cell + beefed modulator steps trade ~15% throughput for ~4×
+memory-graph param count (and the corresponding policy capacity).
+
+### At other batch sizes (final config)
+
+| BS | tok/s | ms/step | VRAM |
+|---:|---:|---:|---:|
+| 32 | ~50K | ~80 | 6.6 GB |
+| 64 | ~56K | ~145 | 11.9 GB |
+| 96 | (not re-measured) | | |
+| 128 | (not re-measured) | | |
+
+### Knobs we deliberately did NOT change (for future reference)
+
+- **Did NOT add more codes** (user preference — 2048 was felt adequate).
+- **Did NOT widen decoder** (separate from widening modulator).
+- **Did NOT drop hebbian** (though the modulator also sees W directly; this
+  is a candidate optimization if VRAM gets tight).
+- **Did NOT parallelize time dim** (incompatible with autoregressive
+  inference / GRPO rollouts).
+- **Did NOT touch LM** (stays at 67.1M, d_inner=1200, 4 scan layers).
+
+### Open / future work
+
+- Full Triton backward (current: analytical PyTorch backward). Would
+  unlock the ~4× per-token speedup on the backward pass too.
+- CUDA graph capture of `_run_block` to eliminate residual Python dispatch.
+- Attach to a pretrained Llama (e.g. 3B) and measure autoregressive
+  inference overhead. Memory graph's per-token cost should be negligible
+  vs Llama's forward.
+- GRPO training of the modulator policy (phase 2 in `discrete_policy`).
 
 Ready to train.

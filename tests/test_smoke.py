@@ -29,12 +29,13 @@ def test_forward_backward_cpu_tier_tiny():
     required = {
         "lm.embedding": model.lm.embedding.weight,
         "memory.neuron_id": model.memory.neuron_id,
-        "memory.state_w1": model.memory.state_w1,
+        "memory.decay_gamma_logit": model.memory.decay_gamma_logit,
         "memory.inject_w": model.memory.inject_w,
         "memory.W_decay_logit": model.memory.W_decay_logit,
-        "memory.modulator.tok_proj": model.memory.modulator.tok_proj[0].weight,
+        "memory.modulator.tok_proj[0]": model.memory.modulator.tok_proj[0].weight,
         "memory.modulator.qkv (layer 0)": model.memory.modulator.layers[0].qkv.weight,
         "memory.modulator.logit_head": model.memory.modulator.logit_head.weight,
+        "memory.modulator.cell_emb": model.memory.modulator.cell_emb,
         "memory.discrete_policy.codebook": model.memory.discrete_policy.codebook,
         "memory.decoder.mlp[0]": model.memory.decoder.mlp[0].weight,
         "memory.decoder.mlp[-1]": model.memory.decoder.mlp[-1].weight,
@@ -52,9 +53,9 @@ def test_decoder_starts_at_no_op():
 
     BS = 2
     D_code = cfg.code_dim
-    emb = torch.randn(BS, D_code)
+    emb = torch.randn(BS, cfg.N_cells, D_code)
     with torch.no_grad():
-        dW, dDecay = model.memory.decoder(emb)
+        dW, dDecay = model.memory.decoder(emb, model.memory.modulator.cell_emb)
 
     # Both heads are zero-init, so output is exactly 0 regardless of input.
     assert torch.allclose(dW, torch.zeros_like(dW), atol=1e-6), (

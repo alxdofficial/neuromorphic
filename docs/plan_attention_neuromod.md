@@ -1,5 +1,16 @@
 # Attention-based Neuromodulator: Profile, Analysis, and Plan
 
+> **SUPERSEDED (April 2026).** This doc captures the *initial* plan that
+> forked the attention-neuromod branch from conv-grid, with shared-weights
+> modulator and a per-token 2-layer state MLP. Many of those design choices
+> (shared modulator weights, per-token state MLP, msg every token,
+> modulation every 4 tokens) have since been replaced by the multi-
+> timescale + per-cell + Triton-fused design described in `design.md`.
+>
+> Numbers in this doc reflect the intermediate state, not the current one.
+> Keep for history / context only — for current architecture see `design.md`;
+> for the latest throughput / param numbers see `RESULTS.md`.
+
 Branch: `attention-neuromod` (forked from `conv-grid-modulator` @ `889f2a1`).
 
 **Goal**: Keep the conv-grid branch's principled observations (per-edge + per-node
