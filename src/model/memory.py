@@ -221,6 +221,23 @@ class MemoryGraph(nn.Module):
         if not self._initialized:
             return {}
         h, msg, W, decay = (t.float() for t in (self.h, self.msg, self.W, self.decay))
+        hebbian = self.hebbian.float()
+
+        # Compute honest off-diagonal stats. The decoder already zeroes W's
+        # diagonal, so W_offdiag ≈ W, but the distinction is still meaningful
+        # for hebbian (which is msg·msgᵀ including the diagonal).
+        Nc = W.shape[-1]
+        off_mask = (1.0 - torch.eye(Nc, device=W.device, dtype=W.dtype)).unsqueeze(0).unsqueeze(0)
+        W_off = W * off_mask
+        hebbian_off = hebbian * off_mask
+
+        # Cosine(W, hebbian) on the off-diagonal flattened vector — diagnostic
+        # of whether the modulator's learned W aligns with the Hebbian trace.
+        wf = W_off.flatten()
+        hf = hebbian_off.flatten()
+        denom = (wf.norm() * hf.norm()).clamp(min=1e-8)
+        W_hebbian_off_cos = (wf @ hf / denom).item()
+
         return {
             "h_norm": h.norm().item() / max(h.numel() ** 0.5, 1.0),
             "msg_norm": msg.norm().item() / max(msg.numel() ** 0.5, 1.0),
@@ -233,11 +250,12 @@ class MemoryGraph(nn.Module):
             "readout_drift_mean": self.readout_drift.float().mean().item(),
             "W_norm": W.norm().item() / max(W.numel() ** 0.5, 1.0),
             "W_max": W.abs().max().item(),
-            "W_offdiag_norm": W.norm().item() / max(W.numel() ** 0.5, 1.0),
-            "W_offdiag_max": W.abs().max().item(),
-            "hebbian_offdiag_norm": self.hebbian.float().norm().item()
-                                    / max(self.hebbian.numel() ** 0.5, 1.0),
-            "W_hebbian_offdiag_cos": 0.0,  # skip for speed
+            "W_offdiag_norm": W_off.norm().item() / max(W_off.numel() ** 0.5, 1.0),
+            "W_offdiag_max": W_off.abs().max().item(),
+            "hebbian_norm": hebbian.norm().item() / max(hebbian.numel() ** 0.5, 1.0),
+            "hebbian_offdiag_norm": hebbian_off.norm().item()
+                                    / max(hebbian_off.numel() ** 0.5, 1.0),
+            "W_hebbian_offdiag_cos": W_hebbian_off_cos,
         }
 
     @torch.no_grad()

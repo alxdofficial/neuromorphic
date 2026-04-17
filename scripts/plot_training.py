@@ -223,13 +223,16 @@ def plot_phase1_gradients(records, output_path):
         axes[0, 0].legend()
         setup(axes[0, 0], "Group Gradient Norms (post-clip)", "L2")
 
+        # Key names track compute_component_grad_norms in memory.py —
+        # shared-trunk attention modulator + shared decoder + cell_emb.
         for key, label, color in [
-            ("grad_mod_w1", "mod_w1", C["mod"]),
-            ("grad_mod_w2", "mod_w2", C["mod"]),
-            ("grad_state_w1", "state_w1", C["state"]),
-            ("grad_state_w2", "state_w2", C["state"]),
+            ("grad_tok_proj", "tok_proj", C["mod"]),
+            ("grad_logit_head", "logit_head", C["mod"]),
+            ("grad_cell_emb", "cell_emb", C["mod"]),
+            ("grad_decoder", "decoder", C["mod_grad"]),
+            ("grad_codebook", "codebook", C["mod_grad"]),
+            ("grad_decay_gamma_logit", "decay_γ_logit", C["decay"]),
             ("grad_msg_w1", "msg_w1", C["msg"]),
-            ("grad_msg_w2", "msg_w2", C["msg"]),
             ("grad_inject_w", "inject_w", C["inject"]),
             ("grad_neuron_id", "neuron_id", C["nid"]),
         ]:
@@ -240,13 +243,15 @@ def plot_phase1_gradients(records, output_path):
         axes[0, 1].legend(fontsize=7)
         setup(axes[0, 1], "Per-Component Memory Grads (pre-clip)", "L2")
 
+        # Key names track compute_param_norms in memory.py.
         for key, label, color in [
-            ("mod_w1_norm", "mod_w1", C["mod"]),
-            ("mod_w2_norm", "mod_w2", C["mod"]),
-            ("state_w1_norm", "state_w1", C["state"]),
-            ("state_w2_norm", "state_w2", C["state"]),
+            ("tok_proj_norm", "tok_proj", C["mod"]),
+            ("logit_head_norm", "logit_head", C["mod"]),
+            ("cell_emb_norm", "cell_emb", C["mod"]),
+            ("decoder_norm", "decoder", C["mod_grad"]),
+            ("codebook_norm", "codebook", C["mod_grad"]),
+            ("decay_gamma_logit_norm", "decay_γ_logit", C["decay"]),
             ("msg_w1_norm", "msg_w1", C["msg"]),
-            ("msg_w2_norm", "msg_w2", C["msg"]),
             ("inject_w_norm", "inject_w", C["inject"]),
             ("neuron_id_norm", "neuron_id", C["nid"]),
         ]:
@@ -257,16 +262,16 @@ def plot_phase1_gradients(records, output_path):
         axes[1, 0].legend(fontsize=7)
         setup(axes[1, 0], "Weight Norms", "L2")
 
-        # Applied plasticity — the actual signal that matters after the
-        # bounded-W redesign. Raw `mod_action_norm` is kept for comparison.
-        plot_line(axes[1, 1], get(records, "applied_dW_norm"),
-                  C["mod"], "||ΔW|| applied")
-        plot_line(axes[1, 1], get(records, "applied_dDecay_norm"),
-                  C["mod_grad"], "||Δdecay|| applied")
-        plot_line(axes[1, 1], get(records, "mod_action_norm"),
-                  C["decay"], "raw action", linestyle=":")
+        # Plasticity rates: γ_W, γ_decay, γ_hebbian — the EMA-blend speeds
+        # the neuromodulator and plasticity gates actually operate at.
+        plot_line(axes[1, 1], get(records, "W_gamma_mean"),
+                  C["mod"], "γ_W mean")
+        plot_line(axes[1, 1], get(records, "decay_gamma_mean"),
+                  C["decay"], "γ_decay mean")
+        plot_line(axes[1, 1], get(records, "hebbian_gamma_mean"),
+                  C["mod_grad"], "γ_hebbian mean")
         axes[1, 1].legend(fontsize=7)
-        setup(axes[1, 1], "Applied Plasticity vs Raw Action", "L2")
+        setup(axes[1, 1], "Plasticity Rates (EMA γ)", "rate")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(output_path, dpi=150)
