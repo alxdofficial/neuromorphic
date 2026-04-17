@@ -97,6 +97,67 @@ def test_one_train_step():
     assert torch.isfinite(model.memory.h).all()
 
 
+def test_trainer_runs_one_step():
+    """Trainer.train_chunk runs end-to-end, including telemetry + clip_grad.
+
+    This is the test we needed to catch the attribute-mismatch bug in
+    compute_component_grad_norms / compute_param_norms after the per-cell →
+    shared-trunk revert. A pure Model+AdamW test wouldn't have caught it
+    because the trainer calls the helpers; bare autograd doesn't.
+    """
+    from src.trainer import Trainer
+    import dataclasses
+
+    cfg = Config.tier_tiny()
+    model = Model(cfg)
+
+    @dataclasses.dataclass
+    class Batch:
+        input_ids: torch.Tensor
+        target_ids: torch.Tensor
+        prev_token: torch.Tensor | None = None
+
+    # A minimal iterable "dataloader" yielding one fixed batch.
+    class SingleBatchLoader:
+        def __init__(self, batch):
+            self.batch = batch
+
+        def __iter__(self):
+            yield self.batch
+
+    batch = Batch(
+        input_ids=torch.randint(1, cfg.vocab_size, (2, cfg.T)),
+        target_ids=torch.randint(0, cfg.vocab_size, (2, cfg.T)),
+    )
+    loader = SingleBatchLoader(batch)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trainer = Trainer(
+            model=model,
+            optimizer=torch.optim.AdamW(model.parameters(), lr=1e-4),
+            scheduler=None,
+            dataloader=loader,
+            config=cfg,
+            device=torch.device("cpu"),
+            log_interval=1,
+            metrics_path=f"{tmpdir}/metrics.jsonl",
+        )
+        # train_chunk runs the entire step including telemetry at log_interval=1.
+        metrics = trainer.train_chunk(batch)
+
+    assert "loss" in metrics
+    assert metrics["loss"] > 0
+    # Every telemetry group from the current code should be represented.
+    for required_key in (
+        "tok_proj_norm", "logit_head_norm", "cell_emb_norm",
+        "decoder_norm", "codebook_norm",
+        "W_offdiag_norm", "W_hebbian_offdiag_cos",
+        "W_gamma_mean",
+    ):
+        assert required_key in metrics, f"missing {required_key}"
+
+
 def test_telemetry_helpers_run():
     """Every telemetry function used by the trainer must execute and return dict.
 
