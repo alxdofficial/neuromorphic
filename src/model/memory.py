@@ -449,26 +449,32 @@ class MemoryGraph(nn.Module):
                 decay = decay.detach(); hebbian = hebbian.detach()
                 prev_readout = prev_readout.detach()
 
-            # Slow event — fires at the START of a modulator block (t=16, 32,
-            # ...) using state from the end of the previous block. This is
-            # deliberately positioned AFTER the tbptt detach so the modulator
-            # sees (now-detached) inputs but produces a W_new whose gradient
-            # path goes BACK through modulator params (not through the
-            # detached inputs). Critically, W_new is then used by the
-            # fused_memory_step call BELOW inside the same tbptt block, so
-            # readouts from tokens t..(t+mod_interval-1) depend on W_new with
-            # an intact gradient path → modulator trains.
-            #
-            # The earlier design fired the modulator at the END of a block
-            # ((t+1)%mod_interval==0); combined with tbptt_block=mod_interval
-            # that put W_new entirely in the detached next block → modulator
-            # gradient was identically zero.
-            if t > 0 and (t % mod_interval == 0):
+            # Slow plasticity event (start-of-block). Fires at t=0,
+            # mod_interval, 2*mod_interval, ... — guaranteed to fire at
+            # least once per segment even when T ≤ mod_interval. Runs AFTER
+            # the tbptt detach so inputs are detached, but W_new still has
+            # an intact gradient path through the modulator's own params.
+            # W_new is then used by fused_memory_step below and by
+            # subsequent tokens in the same tbptt block → modulator trains.
+            if t % mod_interval == 0:
                 received_for_mod = self._receive(msg, W)
                 W, decay = self._modulate(
                     h, msg, received_for_mod, W, hebbian, decay,
                     s_mem_live, s_mem_ema_fast,
                     W_gamma, decay_gamma, phase="phase1")
+
+            # Spike emission + Hebbian update (start-of-block). Symmetric
+            # with the modulator event above — firing at the start of each
+            # msg_interval block ensures the freshly-emitted msg is used
+            # by the fused_memory_step in the SAME iteration, so msg-MLP
+            # gradient survives even when tbptt_block equals or is smaller
+            # than msg_interval. Previous end-of-token emission left the
+            # msg to be consumed next iter; with tbptt_block=1 that iter
+            # began with a detach and the msg-MLP gradient died.
+            if t % msg_interval == 0:
+                msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2,
+                                          neuron_id_cast)
+                hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             # Surprise signal from previous readout — always per-token so
             # the modulator sees the freshest EMA whenever it fires.
@@ -500,21 +506,6 @@ class MemoryGraph(nn.Module):
                 self.readout_scale)
             readout = readout_3d.reshape(BS, self.NC * self.D_n)
             readouts[:, offset] = readout
-
-            # Event — end of msg_interval block: refresh msg (spike emission),
-            # update Hebbian co-activation trace. At msg_interval=1 this
-            # fires every token; msg's contribution to subsequent readouts
-            # in the SAME tbptt block keeps the msg-MLP gradient alive
-            # (unlike the modulator, msg event at end-of-block still has
-            # its effect felt before detach because it's used next token).
-            # ... wait, msg at end-of-block is used in block+1, also detached.
-            # But msg events earlier in the block do contribute — only the
-            # last one per tbptt block is lost. Acceptable: 15/16 msg events
-            # at msg_interval=1 / tbptt_block=16 give gradient.
-            if (t + 1) % msg_interval == 0:
-                msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2,
-                                          neuron_id_cast)
-                hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             with torch.no_grad():
                 new_pool = readout.reshape(BS, self.NC_pools, self.D_n)
