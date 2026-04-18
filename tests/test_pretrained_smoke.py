@@ -340,3 +340,106 @@ def test_llama_tokenizer_round_trips_and_feeds_wrapper():
         out = wrapper(ids)
     assert out.logits.shape == (1, T, cfg.vocab_size_lm)
     assert torch.isfinite(out.logits).all()
+
+
+@requires_llama
+def test_multi_step_training_loop_runs_without_crashing():
+    """Five consecutive train steps on synthetic data. Loss stays finite,
+    trainable params receive updates each step, and memory state carries
+    across TBPTT boundaries. No assertion on loss DECREASING (data is
+    random noise) — just that the loop runs and numerics hold."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train()
+    wrapper.reset_memory(bs=1)
+
+    trainable = [p for _, p in wrapper.trainable_parameters()]
+    opt = torch.optim.AdamW(trainable, lr=1e-4)
+
+    T = 2 * cfg.memory.modulation_interval
+    losses = []
+    W_in_snapshot = wrapper.mem_inject.W_in.weight.detach().clone()
+
+    for step in range(5):
+        input_ids = torch.randint(0, cfg.vocab_size_lm, (1, T))
+        target_ids = torch.cat([input_ids[:, 1:], input_ids[:, :1]], dim=1)
+
+        out = wrapper(input_ids)
+        ce = torch.nn.functional.cross_entropy(
+            out.logits.reshape(-1, out.logits.shape[-1]),
+            target_ids.reshape(-1))
+        loss = ce + 0.1 * wrapper._last_mem_pred_loss
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+        opt.step()
+        wrapper.detach_memory()
+
+        losses.append(loss.item())
+
+    # All losses finite.
+    assert all(torch.isfinite(torch.tensor(l)) for l in losses)
+    # W_in moved from its initial value over the 5 steps.
+    W_in_after = wrapper.mem_inject.W_in.weight.detach()
+    assert not torch.equal(W_in_after, W_in_snapshot)
+    # Memory state is still initialized and finite after 5 detach cycles.
+    assert wrapper.memory.is_initialized
+    assert torch.isfinite(wrapper.memory.W).all()
+    assert torch.isfinite(wrapper.memory.h).all()
+
+
+@requires_llama
+def test_phase1_training_function_runs_and_anneals_tau():
+    """`run_phase1` executes N steps on synthetic data, accumulates per-step
+    logs with finite losses, and anneals Gumbel tau from start→end."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase1 import Phase1Batch, run_phase1
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.reset_memory(bs=1)
+
+    trainable = [p for _, p in wrapper.trainable_parameters()]
+    opt = torch.optim.AdamW(trainable, lr=1e-4)
+
+    T = 2 * cfg.memory.modulation_interval
+
+    def data_iter():
+        while True:
+            input_ids = torch.randint(0, cfg.vocab_size_lm, (1, T))
+            target_ids = torch.cat([input_ids[:, 1:], input_ids[:, :1]], dim=1)
+            yield Phase1Batch(input_ids=input_ids, target_ids=target_ids,
+                              prev_token=None)
+
+    logs = []
+    run_phase1(
+        wrapper, opt, data_iter(),
+        steps=4,
+        mem_pred_weight=0.1,
+        gumbel_tau_start=1.0,
+        gumbel_tau_end=0.3,
+        anneal_across_steps=3,   # hit floor before final step
+        on_step=logs.append,
+    )
+
+    assert len(logs) == 4
+    # tau anneals linearly across 3 steps, then pins at 0.3.
+    assert abs(logs[0].gumbel_tau - 1.0) < 1e-6
+    assert logs[1].gumbel_tau < logs[0].gumbel_tau
+    assert abs(logs[3].gumbel_tau - 0.3) < 1e-6
+    # All losses + grad norms finite.
+    for lg in logs:
+        assert torch.isfinite(torch.tensor(lg.loss))
+        assert torch.isfinite(torch.tensor(lg.ce))
+        assert torch.isfinite(torch.tensor(lg.grad_norm))
