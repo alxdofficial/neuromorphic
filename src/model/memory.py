@@ -319,35 +319,6 @@ class MemoryGraph(nn.Module):
         """Block-diagonal message passing: [BS, NC, Nc, Nc] @ [BS, NC, Nc, D_n]."""
         return torch.matmul(W, msg)
 
-    def _inject(self, received: Tensor, H_mid_t: Tensor,
-                inject_w: Tensor, inject_b: Tensor) -> Tensor:
-        """H_mid_t [BS, D] → per-cell D_n slice → project → cell's input ports."""
-        BS = H_mid_t.shape[0]
-        NC = self.NC_pools
-        # H_mid reshapes to [BS, NC_pools, D_n]. For default NC_pools == NC.
-        slices = H_mid_t.reshape(BS, NC, self.D_n)
-        # Per-cell inject projection [NC, alpha*D_n, D_n].
-        inject = torch.einsum("bci,coi->bco", slices, inject_w)
-        inject = inject + inject_b.unsqueeze(0)
-        inject = inject.reshape(BS, NC, self.alpha, self.D_n)
-        # Scatter into input port neurons. input_port_idx: [NC, alpha] local indices.
-        idx = self.input_port_idx.to(received.device)     # [NC, alpha] (local)
-        # received: [BS, NC, Nc, D_n]. For each cell c, add inject[:, c, :, :] at
-        # positions idx[c, :].
-        # Use gather-style: create a padded add tensor [BS, NC, Nc, D_n] and add.
-        # Simpler: loop over alpha port positions (alpha is small, usually 4).
-        for a in range(self.alpha):
-            # idx[:, a] is [NC] long — port index within each cell
-            # received[b, c, idx[c, a], :] += inject[b, c, a, :]
-            # Batched via scatter_add_:
-            # First expand idx to [BS, NC, 1, D_n]
-            port_idx = idx[:, a].unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(
-                BS, NC, 1, self.D_n)
-            received.scatter_add_(
-                2, port_idx,
-                inject[:, :, a, :].unsqueeze(2).to(received.dtype))
-        return received
-
     @staticmethod
     def _state_update(received: Tensor, h: Tensor,
                       decay_gate: Tensor, one_minus_gate: Tensor) -> Tensor:
@@ -359,13 +330,19 @@ class MemoryGraph(nn.Module):
         """
         return torch.tanh(decay_gate * h + one_minus_gate * received)
 
-    def _emit_message(self, h: Tensor, w1: Tensor, b1: Tensor,
-                      w2: Tensor, b2: Tensor) -> Tensor:
+    @staticmethod
+    def _emit_message(h: Tensor, w1: Tensor, b1: Tensor, w2: Tensor, b2: Tensor,
+                      neuron_id_cast: Tensor) -> Tensor:
+        """msg = tanh(W2 · tanh(W1 · h)) + neuron_id. Event-driven.
+
+        `neuron_id_cast` is pre-cast to h.dtype by the caller (once per segment)
+        so this hot-path doesn't re-cast on every msg event.
+        """
         flat = h.reshape(-1, h.shape[-1])
         hid = torch.tanh(F.linear(flat, w1, b1))
         msg_new = torch.tanh(F.linear(hid, w2, b2)).reshape(h.shape)
-        # neuron_id is [NC, Nc, D_n]; broadcast over BS.
-        return msg_new + self.neuron_id.to(h.dtype).unsqueeze(0)
+        # neuron_id_cast is [NC, Nc, D_n]; broadcast over BS.
+        return msg_new + neuron_id_cast.unsqueeze(0)
 
     def _readout(self, h: Tensor) -> Tensor:
         """Per-cell output-port pool of h (membrane potential) → [BS, D].
@@ -442,7 +419,7 @@ class MemoryGraph(nn.Module):
                    block_H_mid, block_input_ids,
                    start_t,
                    inject_w, inject_b,
-                   mg_w1, mg_b1, mg_w2, mg_b2,
+                   mg_w1, mg_b1, mg_w2, mg_b2, neuron_id_cast,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                    hebbian_gamma, W_gamma, decay_gamma, gain_fast):
         """Multi-timescale memory loop.
@@ -506,7 +483,8 @@ class MemoryGraph(nn.Module):
             # Event — end of msg_interval block: refresh msg (spike emission),
             # update Hebbian co-activation trace.
             if (t + 1) % msg_interval == 0:
-                msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2)
+                msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2,
+                                          neuron_id_cast)
                 hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
 
             # Slow event — end of modulation_interval block: neuromodulator
@@ -571,6 +549,9 @@ class MemoryGraph(nn.Module):
         inject_w = self.inject_w.to(dt); inject_b = self.inject_b.to(dt)
         mg_w1 = self.msg_w1.to(dt); mg_b1 = self.msg_b1.to(dt)
         mg_w2 = self.msg_w2.to(dt); mg_b2 = self.msg_b2.to(dt)
+        # Pre-cast neuron_id once per segment; _emit_message reuses it at
+        # every msg event (msg_interval=4 → 32× per segment).
+        neuron_id_cast = self.neuron_id.to(dt)
         lm_head_w = lm.lm_head.weight.to(dt)
         proj_down_w = lm.proj_down.weight.to(dt) if lm.proj_down else None
         proj_down_b = lm.proj_down.bias.to(dt) if lm.proj_down else None
@@ -597,7 +578,7 @@ class MemoryGraph(nn.Module):
                 H_mid[:, start_t:end_t], input_ids[:, start_t:end_t],
                 start_t,
                 inject_w, inject_b,
-                mg_w1, mg_b1, mg_w2, mg_b2,
+                mg_w1, mg_b1, mg_w2, mg_b2, neuron_id_cast,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast)
 

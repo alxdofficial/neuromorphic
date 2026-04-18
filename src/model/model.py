@@ -100,7 +100,11 @@ class Model(nn.Module):
                 target_ids.reshape(-1),
                 reduction="none",
             ).reshape(BS, T)
-            valid_mask = (input_ids != self.config.eot_id).float()
+            # Mask positions where the TARGET is EOT — i.e. don't train the
+            # model to predict EOT as an output. Masking on input_ids would
+            # zero out the wrong position (the one after EOT), defeating the
+            # intent.
+            valid_mask = (target_ids != self.config.eot_id).float()
             valid_count = valid_mask.sum().clamp(min=1.0)
             ce_loss = (ce_per_token * valid_mask).sum() / valid_count
             result["ce_loss"] = ce_loss

@@ -338,6 +338,11 @@ def main():
                 dataloader.state_dict() if hasattr(dataloader, "state_dict") else {}
             ),
             "config": config,
+            # Current training phase — used at resume time to gate the
+            # phase-2 → phase-1 LM-carry reset. phase 2 is not yet live on
+            # this branch, so this is always "phase1" today; saving it
+            # anyway so future phase-2 checkpoints resume correctly.
+            "phase": "phase1",
         }, tmp)
         os.replace(tmp, path)
         print(f"  Saved checkpoint: {path}")
