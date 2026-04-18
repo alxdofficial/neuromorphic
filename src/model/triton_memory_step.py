@@ -319,7 +319,12 @@ class _FusedMemoryStep(torch.autograd.Function):
         with torch.no_grad():
             h_out, readout = fused_memory_step_triton(
                 h, msg, W, decay, inject_proj, out_mask, readout_scale)
-        ctx.save_for_backward(h, msg, W, decay, inject_proj, h_out, out_mask)
+        # Save h_out in f32 for the sech² term in backward (`1 - h_out²`).
+        # In bf16, h_out saturated near ±1 rounds to exactly ±1 (bf16's 7-bit
+        # mantissa can't distinguish 0.9961 from 1.0 near the boundary), so
+        # the derivative collapses to 0 and grad silently dies for any
+        # saturated neuron. f32 keeps the (1 - h²) term intact.
+        ctx.save_for_backward(h, msg, W, decay, inject_proj, h_out.float(), out_mask)
         ctx.readout_scale = readout_scale
         return h_out, readout
 
@@ -348,24 +353,34 @@ def _torch_backward(
     h, msg, W, decay, inject_proj, h_out, out_mask,
     dL_dh_out, dL_dreadout, scale,
 ):
-    """PyTorch reference backward (used by fallback paths + tests)."""
-    ALPHA = inject_proj.shape[2]
+    """PyTorch reference backward.
 
+    The sech² term `1 - h_out²` is computed in f32 (h_out is saved as f32
+    in `_FusedMemoryStep.forward` to avoid bf16 saturation near ±1). After
+    the sech² term, we cast dpre back to state dtype (bf16 in prod) so the
+    downstream matmuls run on tensor cores.
+    """
+    ALPHA = inject_proj.shape[2]
+    state_dtype = h.dtype  # bf16 in prod, f32 on CPU / tier_tiny
+
+    # All arithmetic from here lives in f32 to preserve the sech² gradient;
+    # we cast back to state_dtype before the big matmuls.
     dh_out_from_readout = (
-        dL_dreadout.unsqueeze(2)
-        * out_mask.unsqueeze(0).unsqueeze(-1)
+        dL_dreadout.unsqueeze(2).float()
+        * out_mask.unsqueeze(0).unsqueeze(-1).float()
         * scale
     )
-    dh_out_total = dL_dh_out + dh_out_from_readout
-    dpre = dh_out_total * (1.0 - h_out * h_out)
+    dh_out_total = dL_dh_out.float() + dh_out_from_readout
+    dpre = dh_out_total * (1.0 - h_out * h_out)              # f32
 
-    decay_exp = decay.unsqueeze(-1)
-    dL_dh = dpre * decay_exp
-    dL_dreceived = dpre * (1.0 - decay_exp)
+    decay_exp = decay.unsqueeze(-1).float()
+    dL_dh = (dpre * decay_exp).to(state_dtype)
+    dL_dreceived_f32 = dpre * (1.0 - decay_exp)
+    dL_dreceived = dL_dreceived_f32.to(state_dtype)
 
     received = torch.matmul(W, msg).clone()
     received[:, :, :ALPHA, :] = received[:, :, :ALPHA, :] + inject_proj
-    dL_ddecay = (dpre * (h - received)).sum(dim=-1)
+    dL_ddecay = (dpre * (h.float() - received.float())).sum(dim=-1).to(decay.dtype)
 
     dL_dinject_proj = dL_dreceived[:, :, :ALPHA, :]
     dL_dW = torch.matmul(dL_dreceived, msg.transpose(-1, -2))

@@ -45,8 +45,16 @@ def test_forward_backward_cpu_tier_tiny():
         assert torch.isfinite(p.grad).all().item(), f"non-finite gradient in {name}"
 
 
-def test_decoder_starts_at_no_op():
-    """Fresh decoder must produce zero ΔW and zero Δdecay — EMA is a no-op."""
+def test_decoder_invariants_at_init():
+    """Decoder produces valid ΔW shape at init: zero diagonal + rms_norm'd rows.
+
+    Prior version of this test required dW to be exactly zero at init
+    (zero-weight final layer). That init was buggy: with `rms_norm(0)=0`,
+    the `W = (1-γ_W)·W + γ_W·0` EMA dragged W to zero, collapsing the
+    memory graph. Decoder is now Xavier-init so ΔW has unit-RMS rows
+    from step 0 — sacrificing the "exact no-op" semantic in exchange for
+    actual trainability.
+    """
     cfg = Config.tier_tiny()
     model = Model(cfg)
     model.train(False)
@@ -57,11 +65,21 @@ def test_decoder_starts_at_no_op():
     with torch.no_grad():
         dW, dDecay = model.memory.decoder(emb, model.memory.modulator.cell_emb)
 
-    # Both heads are zero-init, so output is exactly 0 regardless of input.
-    assert torch.allclose(dW, torch.zeros_like(dW), atol=1e-6), (
-        f"dW is not zero at init: max={dW.abs().max().item()}")
-    assert torch.allclose(dDecay, torch.zeros_like(dDecay), atol=1e-6), (
-        f"dDecay is not zero at init: max={dDecay.abs().max().item()}")
+    # Shapes.
+    assert dW.shape == (BS, cfg.N_cells, cfg.neurons_per_cell, cfg.neurons_per_cell)
+    assert dDecay.shape == (BS, cfg.N_cells, cfg.neurons_per_cell)
+
+    # Diagonal is zeroed (via diag_mask) — neurons can't modulate self-synapses.
+    diag = torch.diagonal(dW, dim1=-2, dim2=-1)
+    assert torch.allclose(diag, torch.zeros_like(diag), atol=1e-6), (
+        f"dW diagonal not zero: max={diag.abs().max().item()}")
+
+    # Rows are rms-normed to unit RMS (up to rms_norm eps).
+    rms = dW.pow(2).mean(dim=-1).sqrt()
+    # Rows with the diagonal zeroed have RMS ≈ sqrt((Nc-1)/Nc) of the
+    # pre-norm row (since 1/Nc of the row got zeroed). Just check it's a
+    # reasonable nonzero value, not 0.
+    assert rms.mean() > 0.1, f"dW rows near-zero: mean RMS {rms.mean().item()}"
 
 
 def test_gamma_clamp():

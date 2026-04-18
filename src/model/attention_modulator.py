@@ -239,13 +239,27 @@ class DirectDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(config.decoder_hidden, out_dim),
         )
-        # Zero-init final layer: memory graph starts as an exact no-op so W and
-        # decay stay at their initial values until the decoder learns to write.
-        # This costs one step of upstream gradient dead-zone (reviewer flagged
-        # B5-scale: not fatal but wastes step 0 on decoder trunk, codebook,
-        # modulator qkv) — accepted trade-off because the RMS-norm on dW means
-        # small-magnitude inits get amplified at init and undermine the no-op.
-        nn.init.zeros_(self.mlp[-1].weight)
+        # CRITICAL FIX: the decoder's final layer MUST NOT be zero-init.
+        # The prior zero-init combined with downstream F.rms_norm gave
+        # dW_normed = 0 at step 0, and the W EMA `W = (1-γ_W)·W + γ_W·0`
+        # then decays W toward zero at γ_W=0.046 per event (~5%/event).
+        # After ~100 modulator events W collapses to 0, readouts go to 0,
+        # and the whole memory graph becomes a no-op with no gradient
+        # pressure to recover. Observed in a 60-step training run:
+        # `mod_gn=0.000`, `W_off=0.000`, memory graph never learns.
+        #
+        # Additionally, zero-init blocks upstream gradient (dL/dh_inner =
+        # W2·dL/draw = 0·...=0) so codebook, cell_emb, and modulator
+        # attention weights get no gradient from the aux loss until the
+        # decoder bootstraps itself — which it can't, because its target
+        # is to drive W to zero.
+        #
+        # Standard xavier init gives unit-RMS random ΔW at start. The EMA
+        # then makes W a rolling average of small random updates at init,
+        # with real modulator signal learned over training. Accept the
+        # small initial random walk — it's what an untrained modulator
+        # would do anyway.
+        nn.init.xavier_uniform_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
         self.register_buffer("diag_mask", torch.eye(self.Nc).unsqueeze(0))

@@ -449,6 +449,27 @@ class MemoryGraph(nn.Module):
                 decay = decay.detach(); hebbian = hebbian.detach()
                 prev_readout = prev_readout.detach()
 
+            # Slow event — fires at the START of a modulator block (t=16, 32,
+            # ...) using state from the end of the previous block. This is
+            # deliberately positioned AFTER the tbptt detach so the modulator
+            # sees (now-detached) inputs but produces a W_new whose gradient
+            # path goes BACK through modulator params (not through the
+            # detached inputs). Critically, W_new is then used by the
+            # fused_memory_step call BELOW inside the same tbptt block, so
+            # readouts from tokens t..(t+mod_interval-1) depend on W_new with
+            # an intact gradient path → modulator trains.
+            #
+            # The earlier design fired the modulator at the END of a block
+            # ((t+1)%mod_interval==0); combined with tbptt_block=mod_interval
+            # that put W_new entirely in the detached next block → modulator
+            # gradient was identically zero.
+            if t > 0 and (t % mod_interval == 0):
+                received_for_mod = self._receive(msg, W)
+                W, decay = self._modulate(
+                    h, msg, received_for_mod, W, hebbian, decay,
+                    s_mem_live, s_mem_ema_fast,
+                    W_gamma, decay_gamma, phase="phase1")
+
             # Surprise signal from previous readout — always per-token so
             # the modulator sees the freshest EMA whenever it fires.
             with torch.no_grad():
@@ -481,20 +502,19 @@ class MemoryGraph(nn.Module):
             readouts[:, offset] = readout
 
             # Event — end of msg_interval block: refresh msg (spike emission),
-            # update Hebbian co-activation trace.
+            # update Hebbian co-activation trace. At msg_interval=1 this
+            # fires every token; msg's contribution to subsequent readouts
+            # in the SAME tbptt block keeps the msg-MLP gradient alive
+            # (unlike the modulator, msg event at end-of-block still has
+            # its effect felt before detach because it's used next token).
+            # ... wait, msg at end-of-block is used in block+1, also detached.
+            # But msg events earlier in the block do contribute — only the
+            # last one per tbptt block is lost. Acceptable: 15/16 msg events
+            # at msg_interval=1 / tbptt_block=16 give gradient.
             if (t + 1) % msg_interval == 0:
                 msg = self._emit_message(h, mg_w1, mg_b1, mg_w2, mg_b2,
                                           neuron_id_cast)
                 hebbian = self._hebbian_update(hebbian, msg, hebbian_gamma)
-
-            # Slow event — end of modulation_interval block: neuromodulator
-            # writes plasticity updates to W and decay.
-            if (t + 1) % mod_interval == 0:
-                received_for_mod = self._receive(msg, W)
-                W, decay = self._modulate(
-                    h, msg, received_for_mod, W, hebbian, decay,
-                    s_mem_live, s_mem_ema_fast,
-                    W_gamma, decay_gamma, phase="phase1")
 
             with torch.no_grad():
                 new_pool = readout.reshape(BS, self.NC_pools, self.D_n)
