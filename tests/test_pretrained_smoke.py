@@ -443,3 +443,91 @@ def test_phase1_training_function_runs_and_anneals_tau():
         assert torch.isfinite(torch.tensor(lg.loss))
         assert torch.isfinite(torch.tensor(lg.ce))
         assert torch.isfinite(torch.tensor(lg.grad_norm))
+
+
+def _wikitext_cached():
+    try:
+        from datasets import load_dataset
+        load_dataset("wikitext", "wikitext-2-raw-v1", split="train",
+                     streaming=True)
+        return True
+    except Exception:
+        return False
+
+
+requires_wikitext = pytest.mark.skipif(
+    not _wikitext_cached(),
+    reason="wikitext-2 not reachable / cached")
+
+
+@requires_llama
+@requires_wikitext
+def test_phase1_on_real_wikitext_stream():
+    """Run phase-1 for 3 steps on real tokenized wikitext. Confirms the
+    end-to-end path — real text → Llama tokenizer → wrapper forward →
+    memory write → backward → optimizer step — works without crashing
+    and produces finite, sensible losses (start near vanilla Llama CE on
+    wikitext, ~5-8 nats for a cold memory head)."""
+    from datasets import load_dataset
+
+    from src.data.tokenizer import get_tokenizer
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase1 import Phase1Batch, run_phase1
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    T = 2 * cfg.memory.modulation_interval    # 32 so modulator fires
+
+    tok = get_tokenizer("llama-3.2-1b")
+
+    # Harvest a buffer of Llama-3.2 token ids from wikitext-2 until we
+    # have enough to build a few BS=1, T=32 batches.
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train",
+                      streaming=True)
+    buf: list[int] = []
+    needed = (T + 1) * 5      # 5 batches' worth of shift-by-one pairs
+    for rec in ds:
+        text = rec.get("text", "").strip()
+        if not text:
+            continue
+        ids = tok.encode(text, add_special_tokens=False)
+        buf.extend(ids)
+        if len(buf) >= needed:
+            break
+    assert len(buf) >= needed, f"wikitext too small after tokenization: {len(buf)}"
+
+    def data_iter():
+        i = 0
+        while True:
+            chunk = buf[i:i + T + 1]
+            if len(chunk) < T + 1:
+                i = 0
+                chunk = buf[:T + 1]
+            input_ids = torch.tensor(chunk[:T], dtype=torch.long).unsqueeze(0)
+            target_ids = torch.tensor(chunk[1:T + 1], dtype=torch.long).unsqueeze(0)
+            yield Phase1Batch(input_ids=input_ids, target_ids=target_ids,
+                              prev_token=None)
+            i += T
+
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.reset_memory(bs=1)
+    trainable = [p for _, p in wrapper.trainable_parameters()]
+    opt = torch.optim.AdamW(trainable, lr=1e-4)
+
+    logs: list = []
+    run_phase1(wrapper, opt, data_iter(), steps=3,
+               mem_pred_weight=0.1,
+               gumbel_tau_start=1.0, gumbel_tau_end=0.3,
+               anneal_across_steps=3,
+               on_step=logs.append)
+
+    assert len(logs) == 3
+    for lg in logs:
+        assert torch.isfinite(torch.tensor(lg.loss))
+        assert torch.isfinite(torch.tensor(lg.grad_norm))
+        # Real-text CE on cold memory head: expect ballpark 5-20 nats.
+        # Wide bound so the test isn't brittle to tokenizer/initialization.
+        assert 0.5 < lg.loss < 50.0, f"loss {lg.loss} outside sanity range"
