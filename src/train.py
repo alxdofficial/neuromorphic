@@ -330,6 +330,7 @@ def main():
         torch.save({
             "step": step,
             "optimizer_step": trainer.optimizer_step,
+            "phase": "phase1",
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),

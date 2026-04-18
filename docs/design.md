@@ -203,10 +203,13 @@ Per cell, independently:
    where `γ_W, γ_d ∈ [NC, N]` are learned per-neuron plasticity rates
    (`gamma_max · σ(W_decay_logit)` and similarly for decay).
 
-The decoder's output layer is Xavier-init, not zero-init (zero-init
-drove W toward zero via the EMA — see `attention_modulator.py` for the
-explanation). The memory graph starts with small-random-walk ΔW
-updates and learns to write meaningfully as training progresses.
+The decoder's output layer is zero-init (weight and bias), so ΔW and
+Δdecay are exactly zero at step 0 and the EMA is a no-op until the
+decoder learns to write. This costs one update step of dead-zone
+gradient through the decoder trunk, codebook, and modulator — accepted
+because any nonzero init gets amplified by the RMS-norm on ΔW and
+undermines the no-op starting point. The penultimate decoder layer is
+Xavier-init as usual, so it wakes up on step 1.
 
 **The modulator does NOT directly adjust `h`, `msg`, `hebbian`, `neuron_id`,
 or `inject_w`.** Those either evolve by their own dynamics (h, msg, hebbian)

@@ -100,3 +100,35 @@ def test_port_layout_partitions_neurons():
     assert (role_id[output_idx] == 1).all()
     internal_count = (role_id == 2).sum().item()
     assert internal_count == cfg.N_internal
+
+
+def test_telemetry_helpers_resolve_attributes():
+    """compute_component_grad_norms / compute_param_norms must not reference
+    deleted per-cell attributes. Trainer hits both on step 0 (is_log_step=True)
+    and a stale ref crashes training immediately. Exercise the real code paths
+    after a backward pass so grads exist on every component."""
+    cfg = Config.tier_tiny()
+    model = Model(cfg)
+    BS, T = 2, cfg.T
+    input_ids = torch.randint(0, cfg.vocab_size, (BS, T))
+    target_ids = torch.randint(0, cfg.vocab_size, (BS, T))
+
+    model.train()
+    model.forward_chunk(input_ids, target_ids=target_ids)["loss"].backward()
+
+    param_norms = model.memory.compute_param_norms()
+    grad_norms = model.memory.compute_component_grad_norms()
+
+    # All expected keys present and finite.
+    expected_param_keys = {
+        "tok_proj_norm", "logit_head_norm", "codebook_norm", "decoder_norm",
+        "decay_gamma_logit_norm", "msg_w1_norm", "inject_w_norm",
+        "neuron_id_norm"}
+    expected_grad_keys = {
+        "grad_tok_proj", "grad_logit_head", "grad_codebook", "grad_decoder",
+        "grad_decay_gamma_logit", "grad_msg_w1", "grad_inject_w",
+        "grad_neuron_id"}
+    assert set(param_norms) == expected_param_keys
+    assert set(grad_norms) == expected_grad_keys
+    for k, v in (*param_norms.items(), *grad_norms.items()):
+        assert torch.isfinite(torch.tensor(v)).item(), f"{k} not finite: {v}"

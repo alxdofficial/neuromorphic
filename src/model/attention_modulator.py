@@ -145,13 +145,16 @@ class AttentionModulator(nn.Module):
 
     def build_edge_bias(self, W: Tensor, hebbian: Tensor) -> Tensor:
         """Per-cell edge bias: [BS, NC, H, N, N]."""
+        orig_dt = W.dtype
         w_dt = self.edge_bias_mlp[0].weight.dtype
         if W.dtype != w_dt:
             W = W.to(w_dt); hebbian = hebbian.to(w_dt)
         asym = W - W.transpose(-1, -2)
         edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, N, N, 3]
         bias = self.edge_bias_mlp(edge_feat)
-        return bias.permute(0, 1, 4, 2, 3).contiguous()
+        bias = bias.permute(0, 1, 4, 2, 3).contiguous()
+        # Match caller dtype so non-autocast paths don't mix dtypes into SDPA.
+        return bias.to(orig_dt) if orig_dt != w_dt else bias
 
     def forward(
         self,

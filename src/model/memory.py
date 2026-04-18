@@ -141,7 +141,8 @@ class MemoryGraph(nn.Module):
         if not self._initialized:
             return
         for attr in ("h", "msg", "W", "decay", "hebbian",
-                     "prev_readout", "readout_drift"):
+                     "prev_readout", "readout_drift",
+                     "s_mem_live", "s_mem_ema_fast"):
             setattr(self, attr, getattr(self, attr).detach())
 
     @torch.no_grad()
@@ -220,6 +221,9 @@ class MemoryGraph(nn.Module):
         if not self._initialized:
             return {}
         h, msg, W, decay = (t.float() for t in (self.h, self.msg, self.W, self.decay))
+        hebbian = self.hebbian.float()
+        W_off = W - torch.diag_embed(W.diagonal(dim1=-2, dim2=-1))
+        heb_off = hebbian - torch.diag_embed(hebbian.diagonal(dim1=-2, dim2=-1))
         return {
             "h_norm": h.norm().item() / max(h.numel() ** 0.5, 1.0),
             "msg_norm": msg.norm().item() / max(msg.numel() ** 0.5, 1.0),
@@ -232,10 +236,10 @@ class MemoryGraph(nn.Module):
             "readout_drift_mean": self.readout_drift.float().mean().item(),
             "W_norm": W.norm().item() / max(W.numel() ** 0.5, 1.0),
             "W_max": W.abs().max().item(),
-            "W_offdiag_norm": W.norm().item() / max(W.numel() ** 0.5, 1.0),
-            "W_offdiag_max": W.abs().max().item(),
-            "hebbian_offdiag_norm": self.hebbian.float().norm().item()
-                                    / max(self.hebbian.numel() ** 0.5, 1.0),
+            "W_offdiag_norm": W_off.norm().item() / max(W_off.numel() ** 0.5, 1.0),
+            "W_offdiag_max": W_off.abs().max().item(),
+            "hebbian_offdiag_norm": heb_off.norm().item()
+                                    / max(heb_off.numel() ** 0.5, 1.0),
             "W_hebbian_offdiag_cos": 0.0,  # skip for speed
         }
 
@@ -266,10 +270,10 @@ class MemoryGraph(nn.Module):
     def compute_component_grad_norms(self) -> dict:
         out = {}
         for name, p in (
-            ("grad_tok_proj", self.modulator.tok_proj_w1),
-            ("grad_logit_head", self.modulator.logit_head_w),
+            ("grad_tok_proj", self.modulator.tok_proj[0].weight),
+            ("grad_logit_head", self.modulator.logit_head.weight),
             ("grad_codebook", self.discrete_policy.codebook),
-            ("grad_decoder", self.decoder.w2),
+            ("grad_decoder", self.decoder.mlp[-1].weight),
             ("grad_decay_gamma_logit", self.decay_gamma_logit),
             ("grad_msg_w1", self.msg_w1),
             ("grad_inject_w", self.inject_w),
@@ -280,10 +284,10 @@ class MemoryGraph(nn.Module):
 
     def compute_param_norms(self) -> dict:
         return {
-            "tok_proj_norm": self.modulator.tok_proj_w1.detach().float().norm().item(),
-            "logit_head_norm": self.modulator.logit_head_w.detach().float().norm().item(),
+            "tok_proj_norm": self.modulator.tok_proj[0].weight.detach().float().norm().item(),
+            "logit_head_norm": self.modulator.logit_head.weight.detach().float().norm().item(),
             "codebook_norm": self.discrete_policy.codebook.detach().float().norm().item(),
-            "decoder_norm": self.decoder.w2.detach().float().norm().item(),
+            "decoder_norm": self.decoder.mlp[-1].weight.detach().float().norm().item(),
             "decay_gamma_logit_norm": self.decay_gamma_logit.detach().float().norm().item(),
             "msg_w1_norm": self.msg_w1.detach().float().norm().item(),
             "inject_w_norm": self.inject_w.detach().float().norm().item(),

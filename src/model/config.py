@@ -123,6 +123,14 @@ class Config:
             f"modulation_interval ({self.modulation_interval}) must be a "
             f"multiple of msg_interval ({self.msg_interval}) so modulator "
             f"always sees fresh msg/hebbian at its fire times")
+        # Event clocks are segment-local: `t = start_t + offset` resets to 0
+        # every forward_segment call. If T < modulation_interval, the modulator
+        # never fires and receives no gradient; debug configs with small T used
+        # to silently disable learning in the modulator/decoder/codebook path.
+        assert self.T % self.modulation_interval == 0, (
+            f"T ({self.T}) must be a multiple of modulation_interval "
+            f"({self.modulation_interval}) so each segment contains a whole "
+            f"number of modulator fire events (first fire at t=mod_interval-1)")
         assert self.tbptt_block >= 1
         assert self.attn_n_layers >= 1
         assert self.attn_token_dim % self.attn_n_heads == 0, (
