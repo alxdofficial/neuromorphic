@@ -54,8 +54,11 @@ class PretrainedConfig:
     # === Phase 2 (GRPO rollouts) ===
     grpo_K: int = 8           # rollouts per group
     grpo_rollout_len: int = 256  # tokens generated per rollout
-    grpo_kl_coef: float = 0.01
-    grpo_entropy_coef: float = 0.001
+    grpo_adv_std_floor: float = 1e-3  # min denominator for advantage normalization
+    # KL-to-reference-policy and entropy-bonus penalties are not yet wired
+    # into grpo_step. Adding them requires a reference modulator snapshot
+    # (KL) and per-fire logits plumbed out of the memory graph (entropy).
+    # Kept as future work; no config knobs here to avoid silent no-ops.
 
     def validate(self):
         assert self.inject_layer >= 1, "inject_layer must be >= 1 (no point at L=0)"

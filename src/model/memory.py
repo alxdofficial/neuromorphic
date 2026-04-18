@@ -642,7 +642,15 @@ class MemoryGraph(nn.Module):
         # Expose the segment-total log π sum for phase-2 GRPO readers. Keep
         # graph-connected (do NOT detach) — the policy gradient needs
         # backward to flow through log_pi_sum into the modulator logits.
-        self._last_log_pi_sum = log_pi_sum
+        # ONLY written on phase-2 training calls. Phase-1 / eval calls
+        # would stomp the meaningful tensor with a detached-zero one and
+        # silently break any downstream reader that missed the capture
+        # window. `None` sentinel between phase-2 writes makes stale reads
+        # loud instead of silent.
+        if phase == "phase2" and self.training:
+            self._last_log_pi_sum = log_pi_sum
+        else:
+            self._last_log_pi_sum = None
 
         shifted_all = torch.cat([
             segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),

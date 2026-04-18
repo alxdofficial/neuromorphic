@@ -258,7 +258,12 @@ zero movement.
    candidates: log-prob of the reference continuation under each
    rollout's memory-augmented LM, BLEU, or a task-specific downstream
    reward.
-6. **Advantage**: `A = (r - r.mean()) / (r.std() + 1e-8)`, per group.
+6. **Advantage**: `A = (r - r.mean()) / max(r.std(), adv_std_floor)`, per
+   group. The std floor (default 1e-3) keeps near-uniform early-training
+   rewards from producing runaway 1e4-scale advantages. Unlike the
+   PPO-standard `std + 1e-8`, a hard floor means small real variance is
+   clamped to "no meaningful signal, small advantage" rather than
+   "explosive advantage magnified through log π".
 7. **REINFORCE loss**:
    `L = -(log_pi_sum · A.detach()).mean()`.
    Backward flows through `log_pi_sum` to every modulator weight that
@@ -274,8 +279,12 @@ zero movement.
 | `gen_length`       | 256     | tokens generated per rollout                                   |
 | `temperature`      | 1.0     | token-sampling temperature                                     |
 | `max_grad_norm`    | 1.0     |                                                                |
-| `entropy_coef`     | 0.001   | not yet implemented (placeholder)                              |
-| `kl_coef`          | 0.01    | vs reference policy — not yet implemented                      |
+| `adv_std_floor`    | 1e-3    | `denom = max(rewards.std(), floor)` — stops noise-level reward variance from producing 1e4-scale advantages |
+
+**Deliberately not wired (future work):**
+
+- **KL-to-reference-policy**. Needs a reference modulator snapshot (e.g., the pre-phase-2 weights) plus per-fire logits re-evaluated under both policies. Not a one-liner; tracked in the status table.
+- **Entropy bonus**. Needs per-fire logits plumbed out of `_modulate` through `_run_block` into `forward_segment`. The sampled `log_pi` alone is not a proxy for the full-distribution entropy.
 
 ### Entry point
 
@@ -306,12 +315,14 @@ for step in range(N):
 | Phase-1 `run_phase1()` loop            | ✓ smoke-covered (synthetic + real wikitext) |
 | Autoregressive rollout primitive       | ✓ smoke-covered (K divergence) |
 | Phase-2 `grpo_step()` loop             | ✓ smoke-covered (stub reward, gradient reaches modulator + codebook) |
+| Advantage-std floor for stability      | ✓ smoke-covered (near-uniform rewards clamped) |
+| `_last_log_pi_sum` phase gating        | ✓ smoke-covered (None after phase-1 / eval) |
 | Llama tokenizer presets                | ✓ in `src/data/tokenizer.py` |
 | CLI driver (phase 1 + phase 2)         | ✗ not built |
 | Real phase-1 data shards (100M tokens) | ✗ not built — smoke streams wikitext-2 in memory |
 | Production phase-2 reward              | ✗ token-match is a smoke placeholder |
-| KL penalty vs reference policy         | ✗ placeholder arg |
-| Entropy bonus                          | ✗ placeholder arg |
+| KL penalty vs reference policy         | ✗ not wired — needs reference modulator snapshot + per-fire logit re-eval |
+| Entropy bonus                          | ✗ not wired — needs per-fire logits from `_modulate` |
 | Checkpoint save/load                   | ✗ not built |
 | GPU smoke                              | ✗ all current smokes are CPU |
 
@@ -337,3 +348,14 @@ for step in range(N):
   `phase2` hard Categorical + log_pi). The `grpo_step` sets it for the
   prefix pass; `autoregressive_rollout` sets and restores it around
   the primitive.
+- `memory._last_log_pi_sum` is **only** written on phase-2 training
+  forwards. Phase-1 / eval forwards set it to `None`. Read it
+  immediately after the phase-2 prefix pass; don't hold the attribute
+  across an intervening phase-1 call.
+- `MemInjectLayer` injects **before** the original `LlamaDecoderLayer`
+  runs (modifies the layer's input). Standard adapter patterns (Houlsby,
+  LongMem) typically inject after a sublayer. Pre-layer gives the memory
+  contribution maximum influence (passes through attention + FFN of
+  layer L and all subsequent layers) at the cost of more potential
+  disruption to the layer's RMSNorm statistics. Reconsider if phase-1
+  loss fails to descend from the vanilla-Llama baseline.

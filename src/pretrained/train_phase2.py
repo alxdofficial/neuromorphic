@@ -107,7 +107,7 @@ def grpo_step(
     gen_length: int,
     temperature: float = 1.0,
     max_grad_norm: float = 1.0,
-    entropy_coef: float = 0.0,
+    adv_std_floor: float = 1e-3,
     reward_fn: Callable[[Tensor, Tensor], Tensor] = token_match_reward,
     seed: int | None = None,
 ) -> GrpoStepLog:
@@ -149,17 +149,22 @@ def grpo_step(
         wrapper, last_prefix_logits, past_key_values,
         gen_length=gen_length, temperature=temperature, gen=gen)
     rewards = reward_fn(generated, reference_cont)           # [K]
-    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    # Advantage normalization. `adv_std_floor` clamps the denominator so
+    # early-training rollouts with near-uniform rewards don't produce
+    # 1e4-scale advantages from noise-level std. Standard eps=1e-8 is
+    # unstable — it turns small real variance into explosive gradients
+    # through log_pi_sum before grad clipping.
+    reward_std = rewards.std()
+    denom = torch.clamp(reward_std, min=adv_std_floor)
+    advantages = (rewards - rewards.mean()) / denom
     advantages = advantages.to(log_pi_sum.dtype)
 
     # 5) GRPO loss: -E[log_pi * A]. Minus because we minimize; sign gives
-    # policy gradient in the right direction.
+    # policy gradient in the right direction. KL-to-reference-policy and
+    # entropy-bonus penalties intentionally omitted — adding them requires
+    # snapshotting a reference modulator (KL) and plumbing per-fire logits
+    # out of the memory graph (entropy). Tracked in docs as future work.
     loss = -(log_pi_sum * advantages.detach()).mean()
-
-    # Optional entropy bonus — encourages exploration. Current log_pi_sum
-    # is already a function of the sampled codes, so we'd need per-fire
-    # logits to compute entropy properly. Skip for this smoke.
-    _ = entropy_coef  # reserved
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()

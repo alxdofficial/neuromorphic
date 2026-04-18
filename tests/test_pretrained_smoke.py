@@ -643,3 +643,91 @@ def test_phase2_grpo_step_runs_and_flows_gradient_to_modulator():
         wrapper.memory.discrete_policy.codebook, codebook_before)
     assert not torch.equal(
         wrapper.memory.modulator.logit_head.weight, logit_head_before)
+
+
+@requires_llama
+def test_phase2_advantage_std_floor_clamps_noise_level_rewards():
+    """When rewards are near-uniform (std ≪ floor), advantages must stay
+    bounded. Without the floor (eps=1e-8), a std of ~1e-5 produces
+    advantages of ~1e4 which explode gradients before clipping."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase2 import grpo_step
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_prefix = 2 * cfg.memory.modulation_interval
+    gen_length = 4
+    K = 4
+    prefix_ids = torch.randint(0, cfg.vocab_size_lm, (1, T_prefix))
+    reference = torch.randint(0, cfg.vocab_size_lm, (gen_length,))
+
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-4)
+
+    # Construct a reward function whose outputs have *tiny* std (~1e-5)
+    # but non-zero variance — the canonical noise-floor-exceeds-signal
+    # early-training case.
+    def noise_level_reward(generated, reference):
+        base = torch.ones(generated.shape[0], device=generated.device) * 0.5
+        noise = 1e-5 * torch.randn(generated.shape[0], device=generated.device)
+        return base + noise
+
+    log = grpo_step(
+        wrapper, opt,
+        prefix_ids=prefix_ids, reference_cont=reference,
+        num_rollouts=K, gen_length=gen_length,
+        reward_fn=noise_level_reward,
+        adv_std_floor=1e-3,
+        seed=42,
+    )
+
+    # With rewards std ≈ 1e-5 and floor = 1e-3, advantage magnitudes must
+    # be bounded above by ~(max_reward - mean_reward) / 1e-3 ≈ 1e-2. The
+    # unclamped version would produce ~1e3.
+    assert log.advantage_max_abs < 1.0, (
+        f"advantage_max_abs={log.advantage_max_abs} — std_floor not clamping")
+    assert torch.isfinite(torch.tensor(log.loss))
+
+
+@requires_llama
+def test_last_log_pi_sum_cleared_after_phase1_forward():
+    """Phase-1 forward calls must not leave a stale log_pi_sum tensor on
+    memory — readers that missed the phase-2 capture window should get
+    None, not zeros that look like real graph-connected data."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.reset_memory(bs=1)
+
+    T = 2 * cfg.memory.modulation_interval
+    ids = torch.randint(0, cfg.vocab_size_lm, (1, T))
+
+    # Phase-1 train call — current_phase defaults to "phase1".
+    wrapper.train()
+    _ = wrapper(ids)
+    assert wrapper.memory._last_log_pi_sum is None, (
+        "phase-1 call should not leave a meaningful log_pi_sum")
+
+    # Eval call — no sampling, also no log_pi.
+    wrapper.train(False)
+    _ = wrapper(ids)
+    assert wrapper.memory._last_log_pi_sum is None
+
+    # Phase-2 train call — sampling happens, log_pi_sum should be present
+    # and graph-connected.
+    wrapper.train()
+    wrapper.current_phase = "phase2"
+    _ = wrapper(ids)
+    lp = wrapper.memory._last_log_pi_sum
+    assert lp is not None, "phase-2 train call should set log_pi_sum"
+    assert lp.requires_grad, "log_pi_sum must be graph-connected for REINFORCE"
