@@ -17,6 +17,9 @@ TOKENIZER_PRESETS = {
     # LLaMA-style tokenizers (modern SLMs)
     "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "llama2": "meta-llama/Llama-2-7b-hf",
+    # Llama-3.2 tokenizers — 128K BPE. Same tokenizer across 1B/3B host sizes.
+    "llama-3.2-1b": "meta-llama/Llama-3.2-1B",
+    "llama-3.2-3b": "meta-llama/Llama-3.2-3B",
     "smollm": "HuggingFaceTB/SmolLM2-135M",
 
     # GPT-style tokenizers

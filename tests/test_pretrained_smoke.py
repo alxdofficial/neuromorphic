@@ -301,3 +301,42 @@ def test_multi_segment_tbptt_carries_memory_state():
     assert not torch.equal(W_after_seg2, W_after_seg1), (
         "memory state did not change across the second segment")
     assert torch.isfinite(W_after_seg2).all()
+
+
+@requires_llama
+def test_llama_tokenizer_round_trips_and_feeds_wrapper():
+    """The Llama-3.2 tokenizer (128K BPE) encodes/decodes cleanly and the
+    encoded ids pass through PretrainedLMWithMemory without a shape or
+    vocab mismatch."""
+    from src.data.tokenizer import get_tokenizer
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    tok = get_tokenizer("llama-3.2-1b")
+    # Basic tokenizer sanity. 128256 vocab (Llama 3.2 shipping size).
+    assert len(tok) == 128256
+    assert tok.bos_token_id is not None
+
+    text = "The quick brown fox jumps over the lazy dog. Memory is a test."
+    ids = tok.encode(text, return_tensors="pt")
+    assert ids.ndim == 2 and ids.shape[0] == 1
+    round_tripped = tok.decode(ids[0].tolist(), skip_special_tokens=True)
+    assert "quick brown fox" in round_tripped
+
+    # Pad/truncate to exactly T=32 so the memory modulator fires.
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    T = 2 * cfg.memory.modulation_interval
+    if ids.shape[1] < T:
+        pad = torch.full((1, T - ids.shape[1]), tok.eos_token_id, dtype=ids.dtype)
+        ids = torch.cat([ids, pad], dim=1)
+    ids = ids[:, :T]
+
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train(False)
+    wrapper.reset_memory(bs=1)
+    with torch.no_grad():
+        out = wrapper(ids)
+    assert out.logits.shape == (1, T, cfg.vocab_size_lm)
+    assert torch.isfinite(out.logits).all()
