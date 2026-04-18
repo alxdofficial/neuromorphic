@@ -531,3 +531,48 @@ def test_phase1_on_real_wikitext_stream():
         # Real-text CE on cold memory head: expect ballpark 5-20 nats.
         # Wide bound so the test isn't brittle to tokenizer/initialization.
         assert 0.5 < lg.loss < 50.0, f"loss {lg.loss} outside sanity range"
+
+
+@requires_llama
+def test_autoregressive_rollout_runs_and_diverges_across_k():
+    """K=3 rollouts from the same prefix produce at least one pair of
+    differing token streams. Divergence comes from stochastic memory code
+    sampling across the batch dimension during prefix processing."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.rollout import autoregressive_rollout
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_prefix = 2 * cfg.memory.modulation_interval   # 32: modulator fires
+    gen_length = 4
+    K = 3
+    prefix_ids = torch.randint(0, cfg.vocab_size_lm, (1, T_prefix))
+
+    result = autoregressive_rollout(
+        wrapper, prefix_ids, gen_length=gen_length, num_rollouts=K,
+        temperature=1.0, seed=42)
+
+    assert result.generated_ids.shape == (K, gen_length)
+    assert result.prefix_ids.shape == (K, T_prefix)
+    assert result.final_logits.shape == (K, cfg.vocab_size_lm)
+    # All token ids are valid vocabulary indices.
+    assert (result.generated_ids >= 0).all()
+    assert (result.generated_ids < cfg.vocab_size_lm).all()
+    # At least one pair of rollouts must differ — otherwise the memory code
+    # sampling isn't differentiating across K, and phase-2 GRPO has no
+    # statistical power. Token sampling noise also contributes, but that
+    # alone is not the point: memory-driven divergence is.
+    any_diff = False
+    for i in range(K):
+        for j in range(i + 1, K):
+            if not torch.equal(result.generated_ids[i], result.generated_ids[j]):
+                any_diff = True
+                break
+        if any_diff:
+            break
+    assert any_diff, "K rollouts all produced identical token streams"
