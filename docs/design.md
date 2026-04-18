@@ -5,6 +5,13 @@ April 2026. Older planning docs in this folder describe earlier iterations
 (conv-grid modulator, shared-weights attention modulator) — those are kept
 for history but are **superseded** by this file for current state.
 
+> **Related — pretrained-LM pivot.** Branch `pretrained-lm-memory-v2`
+> grafts this same memory graph onto a frozen Llama-3.2 backbone via a
+> mid-stack `MemInjectLayer`. For the integration architecture, phase-1
+> Gumbel bootstrap protocol, and phase-2 autoregressive GRPO, see
+> `pretrained_lm_memory.md`. The memory graph internals documented below
+> are used verbatim by both.
+
 ## Goals
 
 1. Language-model augmented with a plastic **memory graph** that learns what

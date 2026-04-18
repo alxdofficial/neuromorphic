@@ -3,6 +3,12 @@
 Branch `main`. For the current architecture see
 `docs/design.md`; for the throughput / param history see `docs/RESULTS.md`.
 
+> **Pretrained-LM pivot.** Branch `pretrained-lm-memory-v2` has a
+> parallel training path that grafts the memory graph onto a frozen
+> Llama-3.2 backbone with a two-phase protocol (Gumbel bootstrap →
+> autoregressive GRPO). See `docs/pretrained_lm_memory.md`. This
+> document covers the from-scratch LM + memory training.
+
 ## Prerequisites
 
 1. Tokenized data shards live under `data/`. Regenerate with:
