@@ -141,20 +141,25 @@ class AttentionModulator(nn.Module):
         ], dim=-1)
 
         tokens = self.tok_proj(tok_in)                    # [BS, NC, N, F]
-        return tokens.to(dt) if dt != w_dt else tokens
+        # Keep tokens in the modulator's weight dtype (not the state dtype)
+        # because downstream AttnBlock / pool_norm / logit_head all have
+        # weights at w_dt and can't cleanly run on mixed-dtype inputs.
+        # The state-dtype cast happens at the modulator's OUTPUT boundary
+        # (codebook lookup and decoder emit .to(W.dtype) explicitly).
+        return tokens
 
     def build_edge_bias(self, W: Tensor, hebbian: Tensor) -> Tensor:
         """Per-cell edge bias: [BS, NC, H, N, N]."""
-        orig_dt = W.dtype
         w_dt = self.edge_bias_mlp[0].weight.dtype
         if W.dtype != w_dt:
             W = W.to(w_dt); hebbian = hebbian.to(w_dt)
         asym = W - W.transpose(-1, -2)
         edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, N, N, 3]
         bias = self.edge_bias_mlp(edge_feat)
-        bias = bias.permute(0, 1, 4, 2, 3).contiguous()
-        # Match caller dtype so non-autocast paths don't mix dtypes into SDPA.
-        return bias.to(orig_dt) if orig_dt != w_dt else bias
+        # Keep in w_dt so SDPA inside the attention blocks sees a matching
+        # dtype for q/k/v (also in w_dt after build_tokens). The modulator's
+        # state-dtype cast happens at the OUTPUT boundary in `_modulate`.
+        return bias.permute(0, 1, 4, 2, 3).contiguous()
 
     def forward(
         self,

@@ -53,7 +53,19 @@ class LlamaMemAdapter(nn.Module):
         return self._llama[0]
 
     def mem_head_logits(self, readouts: Tensor) -> Tensor:
-        """readouts [BS, T, d_mem] → logits [BS, T, vocab_lm]."""
+        """readouts [BS, T, d_mem] → logits [BS, T, vocab_lm].
+
+        `proj_down` is W_out (fp32 by design, for stable Adam updates) but
+        readouts arrive in Llama's dtype (bf16 in production). Cast to
+        match the projection weight, then to Llama dtype for the rest of
+        the head so the norm + lm_head run in their native dtypes.
+        """
+        proj_dt = self.proj_down.weight.dtype
+        if readouts.dtype != proj_dt:
+            readouts = readouts.to(proj_dt)
         x = self.proj_down(readouts)                       # [BS, T, d_lm]
-        x = self.llama.model.norm(x)                       # RMSNorm in fp32 internally
+        llama_dt = self.llama.model.norm.weight.dtype
+        if x.dtype != llama_dt:
+            x = x.to(llama_dt)
+        x = self.llama.model.norm(x)
         return self.lm_head(x)                             # [BS, T, vocab]

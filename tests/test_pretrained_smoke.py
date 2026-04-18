@@ -80,7 +80,10 @@ def test_scale_zero_reproduces_vanilla_llama():
 
     torch.manual_seed(0)
 
-    cfg = PretrainedConfig.llama_1b()
+    # Bit-exact vanilla comparison requires fp32 on both sides — the default
+    # bf16 path is numerically equivalent in production but not bit-identical
+    # across the layer-wrap boundary. Explicitly opt in to fp32 here.
+    cfg = PretrainedConfig.llama_1b(llama_dtype="fp32")
     wrapper = PretrainedLMWithMemory(cfg)
     wrapper.train(False)
 
@@ -110,7 +113,9 @@ def test_scale_nonzero_with_no_memory_is_still_transparent():
     from src.pretrained.config import PretrainedConfig
     from src.pretrained.llm_wrapper import PretrainedLMWithMemory
 
-    cfg = PretrainedConfig.llama_1b()
+    # Same fp32 opt-in as the bit-exact test — this one also compares to
+    # an fp32 vanilla Llama.
+    cfg = PretrainedConfig.llama_1b(llama_dtype="fp32")
     wrapper = PretrainedLMWithMemory(cfg, attach_memory=False)
     wrapper.train(False)
 

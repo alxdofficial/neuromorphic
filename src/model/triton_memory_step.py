@@ -181,7 +181,14 @@ def fused_memory_step_torch(
     received[:, :, :ALPHA, :] = received[:, :, :ALPHA, :] + inject_proj
     decay_exp = decay.unsqueeze(-1)
     h_out = torch.tanh(decay_exp * h + (1.0 - decay_exp) * received)
-    readout = (h_out * out_mask.unsqueeze(0).unsqueeze(-1)).sum(dim=2) * readout_scale
+    # Cast out_mask to h_out.dtype so `h_out * mask` stays in the state
+    # dtype instead of upcasting to the mask's default fp32. Buffers
+    # (registered via `register_buffer`) don't follow `.to(dtype)` when
+    # model weights do, so out_port_mask can easily sit at fp32 while the
+    # rest of memory runs in bf16 — that mismatch silently upcasts the
+    # returned readout and trips dtype-strict F.linear calls downstream.
+    mask = out_mask.to(h_out.dtype)
+    readout = (h_out * mask.unsqueeze(0).unsqueeze(-1)).sum(dim=2) * readout_scale
     return h_out, readout
 
 

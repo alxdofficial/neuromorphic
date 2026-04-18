@@ -110,8 +110,15 @@ class MemoryGraph(nn.Module):
     def is_initialized(self) -> bool:
         return self._initialized
 
-    def initialize_states(self, BS: int, device: torch.device):
-        dt = torch.bfloat16 if device.type == "cuda" else torch.float32
+    def initialize_states(self, BS: int, device: torch.device,
+                          dtype: torch.dtype | None = None):
+        # Explicit dtype takes precedence — used by PretrainedLMWithMemory
+        # to match memory state to the LM's load dtype (bf16 in production,
+        # fp32 for bit-exact unit tests). Fallback: bf16 on CUDA, fp32 on
+        # CPU.
+        if dtype is None:
+            dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        dt = dtype
         NC, N, D_n = self.NC, self.N, self.D_n
 
         self.h = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)

@@ -80,7 +80,20 @@ class MemInjectLayer(nn.Module):
                     "bypass here would produce incorrect training output.")
             return self.orig_layer(hidden_states, *args, **kwargs)
 
-        h_mem = self.W_in(hidden_states)              # [BS, T, d_mem]
+        # W_in / W_out / scale stay fp32 for stable optimizer updates;
+        # hidden_states arrives in Llama's dtype (bf16 in production).
+        # Cast inputs to W_in's dtype for the projection, and cast the
+        # scaled residual back to hidden_states' dtype before the add so
+        # the LlamaDecoderLayer sees a consistent-dtype tensor.
+        h_dtype = hidden_states.dtype
+        w_dtype = self.W_in.weight.dtype
+        h_in = hidden_states.to(w_dtype) if h_dtype != w_dtype else hidden_states
+        h_mem = self.W_in(h_in)                       # [BS, T, d_mem]
         readout = self.memory_fn(h_mem)               # [BS, T, d_mem]
-        injected = hidden_states + self.scale * self.W_out(readout)  # [BS, T, d_lm]
+        if readout.dtype != w_dtype:
+            readout = readout.to(w_dtype)
+        inj = self.scale * self.W_out(readout)
+        if inj.dtype != h_dtype:
+            inj = inj.to(h_dtype)
+        injected = hidden_states + inj
         return self.orig_layer(injected, *args, **kwargs)

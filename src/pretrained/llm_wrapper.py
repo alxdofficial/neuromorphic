@@ -38,10 +38,10 @@ class PretrainedLMWithMemory(nn.Module):
         config.validate_after_load()
         self._rms_eps = getattr(hf_cfg, "rms_norm_eps", 1e-5)
 
-        # 2. Load the LM in the configured dtype. Default fp32 preserves
-        # bit-exact vanilla parity for unit tests; GPU production runs
-        # should use bf16 to skip the on-the-fly weight cast that autocast
-        # otherwise triggers on every Llama matmul.
+        # 2. Load the LM in the configured dtype. Default bf16 matches the
+        # production GPU run path and skips the fp32→bf16 weight cast that
+        # autocast otherwise triggers on every matmul. Memory state dtype
+        # follows the LM dtype (see reset_memory) so both sides agree.
         _dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16,
                        "fp16": torch.float16}
         llama_dtype = _dtype_map[config.llama_dtype]
@@ -54,21 +54,21 @@ class PretrainedLMWithMemory(nn.Module):
             for p in self.llama.parameters():
                 p.requires_grad = False
 
-        # 4. Swap the chosen layer with a MemInjectLayer. memory_fn=None so the
-        # layer is a transparent pass-through until memory is wired per-forward.
-        # Match the projection + scale dtype to Llama's load dtype so the
-        # residual add doesn't trigger an fp32↔bf16 cast per forward.
+        # 4. Swap the chosen layer with a MemInjectLayer. memory_fn=None so
+        # the layer is a transparent pass-through until memory is wired
+        # per-forward. W_in / W_out / scale stay at their fp32 nn.Parameter
+        # default — bf16 param updates round small Adam steps to zero,
+        # which silently stalls training on small smoke runs. The forward
+        # handles the cross-dtype add explicitly.
         L = config.inject_layer
         orig_layer: LlamaDecoderLayer = self.llama.model.layers[L]
-        mil = MemInjectLayer(
+        self.llama.model.layers[L] = MemInjectLayer(
             orig_layer=orig_layer,
             d_lm=config.d_lm,
             d_mem=config.d_mem,
             scale_init=config.scale_init,
             memory_fn=None,
         )
-        mil = mil.to(llama_dtype)
-        self.llama.model.layers[L] = mil
 
         # 5. Memory graph: config.memory has D set to d_mem. vocab_size on the
         # memory config doesn't need to match the LM vocab — the aux-loss head
@@ -76,6 +76,12 @@ class PretrainedLMWithMemory(nn.Module):
         config.memory.vocab_size = config.vocab_size_lm
         config.memory.validate()
         self.memory = MemoryGraph(config.memory) if attach_memory else None
+        # Memory PARAMS stay in fp32. Bf16 optimizer updates round small
+        # gradients to zero (param = 2.0, update = 1e-5 → 2.0 in bf16).
+        # Memory STATE tensors (h, W, hebbian, ...) follow Llama's dtype
+        # via reset_memory so the forward-path matmuls don't mix dtypes.
+        # Buffers (out_port_mask, role_id) also stay fp32 / int64; the
+        # fused step casts out_port_mask to state dtype per call.
         self._adapter = (LlamaMemAdapter(self.llama, self.mem_inject.W_out,
                                          rms_eps=self._rms_eps)
                          if attach_memory else None)
@@ -108,8 +114,13 @@ class PretrainedLMWithMemory(nn.Module):
 
     def reset_memory(self, bs: int):
         if self.memory is not None:
-            device = next(self.llama.parameters()).device
-            self.memory.initialize_states(bs, device)
+            p = next(self.llama.parameters())
+            # Match memory state dtype to Llama's dtype so h_mem crossings
+            # don't fight mixed dtypes under no-autocast code paths (CPU
+            # tests and eager inference). Under bf16 autocast on CUDA the
+            # training loop would handle casts anyway, but forcing dtype
+            # parity at init is one less source of surprise dtype bugs.
+            self.memory.initialize_states(bs, p.device, dtype=p.dtype)
 
     def detach_memory(self):
         if self.memory is not None:
