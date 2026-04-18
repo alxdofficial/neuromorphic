@@ -38,7 +38,13 @@ class Config:
     # and Hebbian update at msg_interval, slow neuromodulation at
     # modulation_interval.
     msg_interval: int = 4         # msg MLP + hebbian fire every N tokens
-    modulation_interval: int = 16 # modulator + plasticity fire every N tokens
+    modulation_interval: int = 4  # modulator + plasticity fire every N tokens
+                                  # (4 = matches msg_interval so every fire
+                                  #  sees a fresh msg. Trades ~9% throughput
+                                  #  for ~7× more gradient-bearing fires per
+                                  #  bootstrap step vs 16 — fires that land
+                                  #  right before a tbptt boundary waste
+                                  #  their gradient either way.)
     # State update is a LIF-style leaky integrator — no MLP, no hidden dim.
     # Only msg emission keeps a 2-layer MLP.
     msg_mlp_hidden: int = 256

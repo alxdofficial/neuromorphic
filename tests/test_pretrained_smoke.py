@@ -138,10 +138,14 @@ def test_memory_wired_forward_runs_and_differs_from_vanilla():
 
     torch.manual_seed(0)
     cfg = PretrainedConfig.llama_1b()
-    # T_forward must be >= modulation_interval so the modulator fires at
-    # least once (otherwise the write path has zero gradient, fine for a
-    # forward-only test but pointless).
-    T = cfg.memory.modulation_interval                  # 16
+    # T_forward must be > msg_interval so `msg = MLP(h)` fires INSIDE the
+    # segment and `received = W @ msg` can populate output-port neurons.
+    # Otherwise h at output ports stays zero, readout is zero, and the
+    # wrapper output equals vanilla regardless of memory being attached.
+    # 2 * modulation_interval is the simplest bound that also gives the
+    # modulator at least one fire whose ΔW gets consumed by downstream
+    # readouts within the segment.
+    T = 2 * cfg.memory.modulation_interval
     wrapper = PretrainedLMWithMemory(cfg)
     wrapper.train(False)
     wrapper.reset_memory(bs=1)

@@ -109,8 +109,15 @@ From `docs/design.md` (unchanged by the pivot):
   concatenated into the per-neuron tokens.
 - **Event clocks** driven by a per-token index `t` inside a segment:
   - Every token: `W @ msg` + inject (first α ports) + LIF (`h = tanh(decay·h + (1-decay)·received)`) + readout pool (α output ports, scaled 1/√α). Fused in a Triton kernel on CUDA.
-  - Every 4 tokens: `msg = MLP(h)` + Hebbian EMA update.
-  - Every 16 tokens: modulator → code logits → policy sample → decoder → `ΔW, Δdecay` → γ-clamped EMA blend.
+  - Every `msg_interval` (default **4**) tokens: `msg = MLP(h)` + Hebbian EMA update. msg emission is what lets the network propagate signal between cells (via `W @ msg`) — before the first msg fire, `msg = 0`, so `W @ msg = 0` and only input-port neurons carry a non-zero state.
+  - Every `modulation_interval` (default **4**) tokens: modulator → code logits → policy sample → decoder → `ΔW, Δdecay` → γ-clamped EMA blend.
+
+> **Structural invariant:** `T (segment length) > msg_interval` is required
+> for readouts to be non-zero. Before the first msg fire, `W @ msg = 0`
+> and h at output-port neurons stays at zero — the readout pools over
+> exactly those positions, so it evaluates to 0. Test / eval setups
+> that use `T ≤ msg_interval` will produce zero readouts and look
+> identical to vanilla Llama.
 
 ### Adapter for Llama
 
