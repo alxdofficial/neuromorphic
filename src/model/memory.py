@@ -427,7 +427,8 @@ class MemoryGraph(nn.Module):
                    inject_w, inject_b,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                   hebbian_gamma, W_gamma, decay_gamma, gain_fast):
+                   hebbian_gamma, W_gamma, decay_gamma, gain_fast,
+                   use_rmsnorm: bool = False, rms_eps: float = 1e-5):
         """Multi-timescale memory loop.
 
         Per-token (fast clock): W @ msg message passing + inject + LIF state
@@ -461,7 +462,11 @@ class MemoryGraph(nn.Module):
                 x = prev_readout
                 if proj_down_w is not None:
                     x = F.linear(x, proj_down_w, proj_down_b)
-                x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
+                if use_rmsnorm:
+                    # Llama-style RMSNorm (no bias, no mean-centering).
+                    x = F.rms_norm(x, (x.shape[-1],), ln_final_w, rms_eps)
+                else:
+                    x = F.layer_norm(x, (x.shape[-1],), ln_final_w, ln_final_b)
                 logits_full = F.linear(x, lm_head_w)
                 lse = torch.logsumexp(logits_full.float(), dim=-1)
                 target_logit = logits_full.gather(
@@ -522,6 +527,8 @@ class MemoryGraph(nn.Module):
         input_ids: Tensor,
         lm,
         prev_token: Tensor | None = None,
+        use_rmsnorm: bool = False,
+        rms_eps: float = 1e-5,
     ) -> tuple[Tensor, Tensor]:
         BS, T, _ = H_mid.shape
         if not self._initialized:
@@ -555,10 +562,15 @@ class MemoryGraph(nn.Module):
         mg_w1 = self.msg_w1.to(dt); mg_b1 = self.msg_b1.to(dt)
         mg_w2 = self.msg_w2.to(dt); mg_b2 = self.msg_b2.to(dt)
         lm_head_w = lm.lm_head.weight.to(dt)
-        proj_down_w = lm.proj_down.weight.to(dt) if lm.proj_down else None
-        proj_down_b = lm.proj_down.bias.to(dt) if lm.proj_down else None
+        proj_down_w = lm.proj_down.weight.to(dt) if lm.proj_down is not None else None
+        proj_down_b = (lm.proj_down.bias.to(dt)
+                       if lm.proj_down is not None and lm.proj_down.bias is not None
+                       else None)
         ln_final_w = lm.ln_final.weight.to(dt)
-        ln_final_b = lm.ln_final.bias.to(dt)
+        # RMSNorm has no bias; pass a zero tensor so the LayerNorm path in
+        # _run_block (taken when use_rmsnorm=False) still type-checks.
+        ln_final_b = (lm.ln_final.bias.to(dt) if lm.ln_final.bias is not None
+                      else torch.zeros_like(ln_final_w))
 
         gm = self.gamma_max
         hebbian_gamma = gm * torch.sigmoid(self.hebbian_decay_logit).to(dt)
@@ -582,7 +594,8 @@ class MemoryGraph(nn.Module):
                 inject_w, inject_b,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
-                hebbian_gamma, W_gamma, decay_gamma, gain_fast)
+                hebbian_gamma, W_gamma, decay_gamma, gain_fast,
+                use_rmsnorm, rms_eps)
 
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
