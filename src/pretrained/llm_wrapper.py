@@ -38,9 +38,15 @@ class PretrainedLMWithMemory(nn.Module):
         config.validate_after_load()
         self._rms_eps = getattr(hf_cfg, "rms_norm_eps", 1e-5)
 
-        # 2. Load the LM in its native dtype. Training casts via autocast.
+        # 2. Load the LM in the configured dtype. Default fp32 preserves
+        # bit-exact vanilla parity for unit tests; GPU production runs
+        # should use bf16 to skip the on-the-fly weight cast that autocast
+        # otherwise triggers on every Llama matmul.
+        _dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16,
+                       "fp16": torch.float16}
+        llama_dtype = _dtype_map[config.llama_dtype]
         self.llama = AutoModelForCausalLM.from_pretrained(
-            config.model_name, torch_dtype=torch.float32)
+            config.model_name, torch_dtype=llama_dtype)
 
         # 3. Freeze backbone. Trainable pieces (W_in/W_out/scale + memory) are
         # added after this.
@@ -50,15 +56,19 @@ class PretrainedLMWithMemory(nn.Module):
 
         # 4. Swap the chosen layer with a MemInjectLayer. memory_fn=None so the
         # layer is a transparent pass-through until memory is wired per-forward.
+        # Match the projection + scale dtype to Llama's load dtype so the
+        # residual add doesn't trigger an fp32↔bf16 cast per forward.
         L = config.inject_layer
         orig_layer: LlamaDecoderLayer = self.llama.model.layers[L]
-        self.llama.model.layers[L] = MemInjectLayer(
+        mil = MemInjectLayer(
             orig_layer=orig_layer,
             d_lm=config.d_lm,
             d_mem=config.d_mem,
             scale_init=config.scale_init,
             memory_fn=None,
         )
+        mil = mil.to(llama_dtype)
+        self.llama.model.layers[L] = mil
 
         # 5. Memory graph: config.memory has D set to d_mem. vocab_size on the
         # memory config doesn't need to match the LM vocab — the aux-loss head
@@ -121,6 +131,11 @@ class PretrainedLMWithMemory(nn.Module):
         prev_token = kwargs.pop("prev_token", None)
         use_rms = True
 
+        # Aux loss only matters during training. In eval / rollout we skip
+        # the 128K-vocab mem_head matmul entirely — it's the biggest single
+        # cost inside forward_segment at T=1 autoregressive gen.
+        compute_aux = self.training
+
         def memory_fn(h_mem: torch.Tensor) -> torch.Tensor:
             readouts, mem_loss = self.memory.forward_segment(
                 h_mem, input_ids, self._adapter,
@@ -128,7 +143,8 @@ class PretrainedLMWithMemory(nn.Module):
                 use_rmsnorm=use_rms,
                 rms_eps=self._rms_eps,
                 phase=self.current_phase,
-                preserve_graph=self._preserve_memory_graph)
+                preserve_graph=self._preserve_memory_graph,
+                compute_aux_loss=compute_aux)
             self._last_mem_pred_loss = mem_loss
             return readouts
 

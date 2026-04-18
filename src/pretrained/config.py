@@ -22,6 +22,12 @@ class PretrainedConfig:
     inject_layer: int = 8
     # Backbone freeze. The smoke test flips this off briefly; training stays on.
     freeze_backbone: bool = True
+    # Llama load dtype. "fp32" preserves bit-exact vanilla-Llama parity for
+    # unit tests. "bf16" matches CUDA autocast behavior and skips the
+    # on-the-fly fp32→bf16 weight cast that autocast triggers on every
+    # matmul (profile showed this was 75% of CUDA time at T=1 AR rollout).
+    # Callers on GPU production runs should pick "bf16".
+    llama_dtype: str = "fp32"
     # LM hidden dim — populated from HF config at load time.
     d_lm: int = -1
     # LM num layers — populated from HF config at load time.

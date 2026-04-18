@@ -549,6 +549,7 @@ class MemoryGraph(nn.Module):
         rms_eps: float = 1e-5,
         phase: str = "phase1",
         preserve_graph: bool = False,
+        compute_aux_loss: bool = True,
     ) -> tuple[Tensor, Tensor]:
         BS, T, _ = H_mid.shape
         if not self._initialized:
@@ -581,16 +582,31 @@ class MemoryGraph(nn.Module):
         inject_w = self.inject_w.to(dt); inject_b = self.inject_b.to(dt)
         mg_w1 = self.msg_w1.to(dt); mg_b1 = self.msg_b1.to(dt)
         mg_w2 = self.msg_w2.to(dt); mg_b2 = self.msg_b2.to(dt)
-        lm_head_w = lm.lm_head.weight.to(dt)
-        proj_down_w = lm.proj_down.weight.to(dt) if lm.proj_down is not None else None
-        proj_down_b = (lm.proj_down.bias.to(dt)
+        # Cast LM weights to memory dtype only when dtypes actually differ.
+        # Same-dtype .to() is a no-op fast path. When callers load Llama
+        # directly in bf16, this becomes free and F.rms_norm hits the fused
+        # bf16×bf16 kernel. The old unconditional .to(dt) allocated a 200MB
+        # bf16 copy of lm_head on every call — biggest single rollout cost.
+        lm_head_w = lm.lm_head.weight
+        if lm_head_w.dtype != dt:
+            lm_head_w = lm_head_w.to(dt)
+        proj_down_w = lm.proj_down.weight if lm.proj_down is not None else None
+        if proj_down_w is not None and proj_down_w.dtype != dt:
+            proj_down_w = proj_down_w.to(dt)
+        proj_down_b = (lm.proj_down.bias
                        if lm.proj_down is not None and lm.proj_down.bias is not None
                        else None)
-        ln_final_w = lm.ln_final.weight.to(dt)
-        # RMSNorm has no bias; pass a zero tensor so the LayerNorm path in
-        # _run_block (taken when use_rmsnorm=False) still type-checks.
-        ln_final_b = (lm.ln_final.bias.to(dt) if lm.ln_final.bias is not None
+        if proj_down_b is not None and proj_down_b.dtype != dt:
+            proj_down_b = proj_down_b.to(dt)
+        ln_final_w = lm.ln_final.weight
+        if ln_final_w.dtype != dt:
+            ln_final_w = ln_final_w.to(dt)
+        # RMSNorm has no bias; pass a zero tensor in the weight's dtype so
+        # the LayerNorm fallback path in `_run_block` still type-checks.
+        ln_final_b = (lm.ln_final.bias if lm.ln_final.bias is not None
                       else torch.zeros_like(ln_final_w))
+        if ln_final_b is not None and ln_final_b.dtype != dt:
+            ln_final_b = ln_final_b.to(dt)
 
         gm = self.gamma_max
         hebbian_gamma = gm * torch.sigmoid(self.hebbian_decay_logit).to(dt)
@@ -668,30 +684,37 @@ class MemoryGraph(nn.Module):
         else:
             self._last_log_pi_sum = None
 
-        shifted_all = torch.cat([
-            segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),
-            readouts[:, :-1],
-        ], dim=1)
+        if compute_aux_loss:
+            shifted_all = torch.cat([
+                segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),
+                readouts[:, :-1],
+            ], dim=1)
 
-        # Aux-loss chunking is decoupled from tbptt_block. Memory-head CE is
-        # a no-grad-through-state logits+CE over (readout, vocab); larger
-        # chunks mean fewer kernel launches. Default aux_loss_chunk=T (one
-        # pass over the whole segment) which profile measurements show is
-        # ~25% faster than chunk=tbptt_block.
-        aux_chunk = max(1, self.config.aux_loss_chunk)
-        loss_sum = torch.zeros((), device=H_mid.device, dtype=torch.float32)
-        valid_total = torch.zeros((), device=H_mid.device, dtype=torch.float32)
-        for s in range(0, T, aux_chunk):
-            e = min(s + aux_chunk, T)
-            sub_logits = lm.mem_head_logits(shifted_all[:, s:e])
-            sub_valid = valid_mask[:, s:e].float()
-            per_tok = F.cross_entropy(
-                sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
-                input_ids[:, s:e].reshape(-1),
-                reduction="none",
-            ).reshape(sub_valid.shape)
-            loss_sum = loss_sum + (per_tok * sub_valid).sum()
-            valid_total = valid_total + sub_valid.sum()
-        mem_pred_loss = loss_sum / valid_total.clamp(min=1.0)
+            # Aux-loss chunking is decoupled from tbptt_block. Memory-head CE
+            # is a no-grad-through-state logits+CE over (readout, vocab);
+            # larger chunks mean fewer kernel launches. Default
+            # aux_loss_chunk=T (one pass over the whole segment) which profile
+            # measurements show is ~25% faster than chunk=tbptt_block.
+            aux_chunk = max(1, self.config.aux_loss_chunk)
+            loss_sum = torch.zeros((), device=H_mid.device, dtype=torch.float32)
+            valid_total = torch.zeros((), device=H_mid.device, dtype=torch.float32)
+            for s in range(0, T, aux_chunk):
+                e = min(s + aux_chunk, T)
+                sub_logits = lm.mem_head_logits(shifted_all[:, s:e])
+                sub_valid = valid_mask[:, s:e].float()
+                per_tok = F.cross_entropy(
+                    sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
+                    input_ids[:, s:e].reshape(-1),
+                    reduction="none",
+                ).reshape(sub_valid.shape)
+                loss_sum = loss_sum + (per_tok * sub_valid).sum()
+                valid_total = valid_total + sub_valid.sum()
+            mem_pred_loss = loss_sum / valid_total.clamp(min=1.0)
+        else:
+            # Skip aux loss entirely — for phase-2 rollouts + eval where the
+            # mem_pred_loss isn't in the training loss. Avoids the 128K-vocab
+            # lm_head matmul per gen step (biggest chunk of rollout cost).
+            mem_pred_loss = torch.zeros((), device=H_mid.device,
+                                         dtype=torch.float32)
 
         return readouts, mem_pred_loss
