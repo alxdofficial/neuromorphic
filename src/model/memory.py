@@ -1,8 +1,8 @@
 """Multi-cell memory graph with attention neuromodulator.
 
 N_cells connectivity pools × neurons_per_cell each. State tensors carry
-explicit NC dim: h, msg are [BS, NC, Nc, D_n]; W, hebbian are
-[BS, NC, Nc, Nc]. Each cell has its own block-diagonal W (no cross-cell
+explicit NC dim: h, msg are [BS, NC, N, D_n]; W, hebbian are
+[BS, NC, N, N]. Each cell has its own block-diagonal W (no cross-cell
 edges at W level). Cross-cell mixing happens via:
   - the modulator (attention can see all cells jointly, if configured)
   - LM readout / inject through its scan layers
@@ -33,8 +33,8 @@ class MemoryGraph(nn.Module):
         self.config = config
         self.D_n = config.D_n
         self.NC = config.N_cells                  # number of cells
-        self.Nc = config.neurons_per_cell         # neurons per cell
-        self.N = self.NC * self.Nc                # total neurons
+        self.N = config.neurons_per_cell         # neurons per cell
+        self.N_total = self.NC * self.N                # total neurons
         self.alpha = config.alpha
         self.NC_pools = config.NC_pools           # = N_cells for default
 
@@ -44,7 +44,7 @@ class MemoryGraph(nn.Module):
 
         # Per-neuron identity vector, per cell.
         self.neuron_id = nn.Parameter(
-            torch.randn(self.NC, self.Nc, self.D_n) * (self.D_n ** -0.5))
+            torch.randn(self.NC, self.N, self.D_n) * (self.D_n ** -0.5))
 
         # Msg MLP (2-layer tanh, shared) — fires event-driven at msg_interval.
         # State update itself has NO learned MLP; it's a LIF-style leaky
@@ -63,10 +63,10 @@ class MemoryGraph(nn.Module):
         self.inject_b = nn.Parameter(
             torch.zeros(self.NC, self.alpha * self.D_n))
 
-        # Per-cell per-neuron plasticity logits: [NC, Nc].
-        self.W_decay_logit = nn.Parameter(torch.full((self.NC, self.Nc), -3.0))
-        self.decay_gamma_logit = nn.Parameter(torch.full((self.NC, self.Nc), -3.0))
-        self.hebbian_decay_logit = nn.Parameter(torch.full((self.NC, self.Nc), 2.0))
+        # Per-cell per-neuron plasticity logits: [NC, N].
+        self.W_decay_logit = nn.Parameter(torch.full((self.NC, self.N), -3.0))
+        self.decay_gamma_logit = nn.Parameter(torch.full((self.NC, self.N), -3.0))
+        self.hebbian_decay_logit = nn.Parameter(torch.full((self.NC, self.N), 2.0))
         self.gamma_max = config.gamma_max
 
         # Modulator + decoder + codebook.
@@ -81,10 +81,10 @@ class MemoryGraph(nn.Module):
         layout = port_layout(config)
         self.register_buffer("input_port_idx", layout["input_port_idx"])
         self.register_buffer("output_port_idx", layout["output_port_idx"])
-        self.register_buffer("role_id", layout["role_id"].view(self.NC, self.Nc))
+        self.register_buffer("role_id", layout["role_id"].view(self.NC, self.N))
         # Pre-built dense output-port mask for the fused step.
         # mask[c, n] = 1 if neuron n in cell c is an output port, else 0.
-        out_mask = torch.zeros(self.NC, self.Nc)
+        out_mask = torch.zeros(self.NC, self.N)
         for c in range(self.NC):
             out_mask[c, layout["output_port_idx"][c]] = 1.0
         self.register_buffer("out_port_mask", out_mask)
@@ -112,22 +112,22 @@ class MemoryGraph(nn.Module):
 
     def initialize_states(self, BS: int, device: torch.device):
         dt = torch.bfloat16 if device.type == "cuda" else torch.float32
-        NC, Nc, D_n = self.NC, self.Nc, self.D_n
+        NC, N, D_n = self.NC, self.N, self.D_n
 
-        self.h = torch.zeros(BS, NC, Nc, D_n, device=device, dtype=dt)
-        self.msg = torch.zeros(BS, NC, Nc, D_n, device=device, dtype=dt)
-        self.decay = torch.full((BS, NC, Nc), 0.5, device=device, dtype=dt)
-        self.hebbian = torch.zeros(BS, NC, Nc, Nc, device=device, dtype=dt)
+        self.h = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)
+        self.msg = torch.zeros(BS, NC, N, D_n, device=device, dtype=dt)
+        self.decay = torch.full((BS, NC, N), 0.5, device=device, dtype=dt)
+        self.hebbian = torch.zeros(BS, NC, N, N, device=device, dtype=dt)
 
-        # Sparse init for W: ~min(8, Nc-1) random nonzeros per row, RMS-normed.
-        K_init = min(8, Nc - 1)
-        W = torch.zeros(BS, NC, Nc, Nc, device=device, dtype=dt)
+        # Sparse init for W: ~min(8, N-1) random nonzeros per row, RMS-normed.
+        K_init = min(8, N - 1)
+        W = torch.zeros(BS, NC, N, N, device=device, dtype=dt)
         for c in range(NC):
-            for neuron in range(Nc):
-                neighbors = torch.randperm(Nc, device=device)[:K_init]
+            for neuron in range(N):
+                neighbors = torch.randperm(N, device=device)[:K_init]
                 W[:, c, neuron, neighbors] = 1.0
         W.diagonal(dim1=-2, dim2=-1).zero_()
-        self.W = F.rms_norm(W, normalized_shape=(Nc,))
+        self.W = F.rms_norm(W, normalized_shape=(N,))
 
         self.s_mem_live = torch.zeros(BS, device=device, dtype=dt)
         self.s_mem_ema_fast = torch.zeros(BS, device=device, dtype=dt)
@@ -158,9 +158,9 @@ class MemoryGraph(nn.Module):
         self.W = self.W[idx].clone()
         self.decay = self.decay[idx].clone()
         self.hebbian = self.hebbian[idx].clone()
-        NC, Nc, D_n = self.NC, self.Nc, self.D_n
-        self.h = torch.zeros(new_bs, NC, Nc, D_n, device=device, dtype=dt)
-        self.msg = torch.zeros(new_bs, NC, Nc, D_n, device=device, dtype=dt)
+        NC, N, D_n = self.NC, self.N, self.D_n
+        self.h = torch.zeros(new_bs, NC, N, D_n, device=device, dtype=dt)
+        self.msg = torch.zeros(new_bs, NC, N, D_n, device=device, dtype=dt)
         self.s_mem_live = torch.zeros(new_bs, device=device, dtype=dt)
         self.s_mem_ema_fast = torch.zeros(new_bs, device=device, dtype=dt)
         self.prev_readout = torch.zeros(
@@ -185,7 +185,7 @@ class MemoryGraph(nn.Module):
         loaded_h = state.get("h")
         if loaded_h is None or loaded_h.ndim != 4:
             raise RuntimeError(
-                f"Runtime state incompatible: expected 4-D h [BS, NC, Nc, D_n]; "
+                f"Runtime state incompatible: expected 4-D h [BS, NC, N, D_n]; "
                 f"got shape {tuple(loaded_h.shape) if loaded_h is not None else None}")
         device = self.neuron_id.device
         for k in ("h", "msg", "W", "decay", "hebbian"):
@@ -295,7 +295,7 @@ class MemoryGraph(nn.Module):
     # ================================================================
 
     def _receive(self, msg: Tensor, W: Tensor) -> Tensor:
-        """Block-diagonal message passing: [BS, NC, Nc, Nc] @ [BS, NC, Nc, D_n]."""
+        """Block-diagonal message passing: [BS, NC, N, N] @ [BS, NC, N, D_n]."""
         return torch.matmul(W, msg)
 
     def _inject(self, received: Tensor, H_mid_t: Tensor,
@@ -311,9 +311,9 @@ class MemoryGraph(nn.Module):
         inject = inject.reshape(BS, NC, self.alpha, self.D_n)
         # Scatter into input port neurons. input_port_idx: [NC, alpha] local indices.
         idx = self.input_port_idx.to(received.device)     # [NC, alpha] (local)
-        # received: [BS, NC, Nc, D_n]. For each cell c, add inject[:, c, :, :] at
+        # received: [BS, NC, N, D_n]. For each cell c, add inject[:, c, :, :] at
         # positions idx[c, :].
-        # Use gather-style: create a padded add tensor [BS, NC, Nc, D_n] and add.
+        # Use gather-style: create a padded add tensor [BS, NC, N, D_n] and add.
         # Simpler: loop over alpha port positions (alpha is small, usually 4).
         for a in range(self.alpha):
             # idx[:, a] is [NC] long — port index within each cell
@@ -343,7 +343,7 @@ class MemoryGraph(nn.Module):
         flat = h.reshape(-1, h.shape[-1])
         hid = torch.tanh(F.linear(flat, w1, b1))
         msg_new = torch.tanh(F.linear(hid, w2, b2)).reshape(h.shape)
-        # neuron_id is [NC, Nc, D_n]; broadcast over BS.
+        # neuron_id is [NC, N, D_n]; broadcast over BS.
         return msg_new + self.neuron_id.to(h.dtype).unsqueeze(0)
 
     def _readout(self, h: Tensor) -> Tensor:
@@ -392,11 +392,11 @@ class MemoryGraph(nn.Module):
             self.discrete_policy.update_usage(codes)
 
         # Decoder is a shared trunk conditioned on the modulator's cell_emb.
-        # emb [BS*NC, D_code] → reshape [BS, NC, D_code] → returns (ΔW [BS, NC, Nc, Nc], Δdecay [BS, NC, Nc]).
+        # emb [BS*NC, D_code] → reshape [BS, NC, D_code] → returns (ΔW [BS, NC, N, N], Δdecay [BS, NC, N]).
         emb_3d = emb.reshape(BS, NC, -1)
         dW_normed, dDecay_raw = self.decoder(emb_3d, self.modulator.cell_emb)
 
-        # EMA blend. W_gamma is [NC, Nc] — broadcast to [BS, NC, Nc, Nc] via unsqueeze(-1).
+        # EMA blend. W_gamma is [NC, N] — broadcast to [BS, NC, N, N] via unsqueeze(-1).
         W_new = ((1 - W_gamma.unsqueeze(0).unsqueeze(-1)) * W
                  + W_gamma.unsqueeze(0).unsqueeze(-1) * dW_normed.to(W.dtype))
         target_decay = torch.sigmoid(dDecay_raw).to(decay.dtype)
@@ -406,9 +406,9 @@ class MemoryGraph(nn.Module):
 
     @staticmethod
     def _hebbian_update(hebbian: Tensor, msg: Tensor, gamma: Tensor) -> Tensor:
-        """msg @ msgᵀ per cell; γ is [NC, Nc] per-receiver. All bf16."""
-        coactiv = torch.matmul(msg, msg.transpose(-1, -2))  # [BS, NC, Nc, Nc]
-        g = gamma.unsqueeze(0).unsqueeze(-1)  # [1, NC, Nc, 1]
+        """msg @ msgᵀ per cell; γ is [NC, N] per-receiver. All bf16."""
+        coactiv = torch.matmul(msg, msg.transpose(-1, -2))  # [BS, NC, N, N]
+        g = gamma.unsqueeze(0).unsqueeze(-1)  # [1, NC, N, 1]
         return (1 - g) * hebbian + g * coactiv
 
     # ================================================================

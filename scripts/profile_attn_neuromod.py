@@ -44,7 +44,7 @@ def main(bs: int = 64):
 
     print(f"Device: {torch.cuda.get_device_name()}")
     print(f"Params: total={total:.1f}M  LM={lm_p:.1f}M  Mem={mem_p:.1f}M")
-    print(f"Config: BS={bs}, T={cfg.T}, NC={cfg.N_cells}, Nc={cfg.neurons_per_cell}, "
+    print(f"Config: BS={bs}, T={cfg.T}, NC={cfg.N_cells}, N={cfg.neurons_per_cell}, "
           f"D_n={cfg.D_n}, D={cfg.D}, d_inner={cfg.d_inner}")
     print(f"        mod_interval={cfg.modulation_interval}, tbptt={cfg.tbptt_block}")
     print()

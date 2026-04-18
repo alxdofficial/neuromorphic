@@ -6,7 +6,7 @@ Fuses the per-token hot path into a single kernel:
     readout  = sum_n(h_new[n] * out_port_mask[n]) * READOUT_SCALE
 
 Grid: (BS, NC) — one program per (batch, cell). Each program holds a cell's
-full [Nc, D_n] state in SRAM. Dispatch overhead drops from ~5 kernels/token
+full [N, D_n] state in SRAM. Dispatch overhead drops from ~5 kernels/token
 to 1 kernel/token.
 
 Forward kernel only. Backward uses the PyTorch reference (via
@@ -34,7 +34,7 @@ def _memory_step_fwd(
     inject_proj_ptr, out_mask_ptr,
     h_out_ptr, readout_ptr,
     # shape constants
-    Nc: tl.constexpr,
+    N: tl.constexpr,
     D_n: tl.constexpr,
     ALPHA: tl.constexpr,
     READOUT_SCALE: tl.constexpr,
@@ -54,29 +54,29 @@ def _memory_step_fwd(
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
 
-    n_offs = tl.arange(0, Nc)
+    n_offs = tl.arange(0, N)
     d_offs = tl.arange(0, D_n)
 
-    # h, msg, h_out: [BS, NC, Nc, D_n]
+    # h, msg, h_out: [BS, NC, N, D_n]
     state_base = pid_b * h_stride_b + pid_c * h_stride_c
     state_offs = state_base + n_offs[:, None] * D_n + d_offs[None, :]
 
     h = tl.load(h_in_ptr + state_offs).to(tl.float32)
     msg = tl.load(msg_ptr + state_offs).to(tl.float32)
 
-    # W [Nc, Nc]
+    # W [N, N]
     W_base = pid_b * W_stride_b + pid_c * W_stride_c
-    W_offs = W_base + n_offs[:, None] * Nc + n_offs[None, :]
+    W_offs = W_base + n_offs[:, None] * N + n_offs[None, :]
     W = tl.load(W_ptr + W_offs).to(tl.float32)
 
-    # decay [Nc]
+    # decay [N]
     decay_base = pid_b * decay_stride_b + pid_c * decay_stride_c
     decay = tl.load(decay_ptr + decay_base + n_offs).to(tl.float32)
 
-    # output port mask [Nc]
-    out_mask = tl.load(out_mask_ptr + pid_c * Nc + n_offs).to(tl.float32)
+    # output port mask [N]
+    out_mask = tl.load(out_mask_ptr + pid_c * N + n_offs).to(tl.float32)
 
-    # Load inject_proj [ALPHA, D_n] and pad to [Nc, D_n] (zeros beyond alpha).
+    # Load inject_proj [ALPHA, D_n] and pad to [N, D_n] (zeros beyond alpha).
     # Clamp the row index so all loads are in-bounds, then zero rows ≥ ALPHA
     # via tl.where. Relies on input ports being the first ALPHA local indices
     # (which is the port_layout convention).
@@ -97,7 +97,7 @@ def _memory_step_fwd(
 
     tl.store(h_out_ptr + state_offs, h_new.to(tl.bfloat16))
 
-    # Readout: weighted sum over Nc
+    # Readout: weighted sum over N
     readout = tl.sum(h_new * out_mask[:, None], axis=0) * READOUT_SCALE
     readout_base = pid_b * readout_stride_b + pid_c * readout_stride_c
     tl.store(readout_ptr + readout_base + d_offs, readout.to(tl.bfloat16))
@@ -109,12 +109,12 @@ def _memory_step_fwd(
 
 
 def fused_memory_step_triton(
-    h: Tensor,                # [BS, NC, Nc, D_n], bf16
-    msg: Tensor,              # [BS, NC, Nc, D_n], bf16
-    W: Tensor,                # [BS, NC, Nc, Nc], bf16
-    decay: Tensor,            # [BS, NC, Nc], bf16
+    h: Tensor,                # [BS, NC, N, D_n], bf16
+    msg: Tensor,              # [BS, NC, N, D_n], bf16
+    W: Tensor,                # [BS, NC, N, N], bf16
+    decay: Tensor,            # [BS, NC, N], bf16
     inject_proj: Tensor,      # [BS, NC, ALPHA, D_n], bf16  (NOT pre-scattered)
-    out_mask: Tensor,         # [NC, Nc], bf16 or fp32
+    out_mask: Tensor,         # [NC, N], bf16 or fp32
     readout_scale: float,
 ) -> tuple[Tensor, Tensor]:
     """Triton forward pass. Returns (h_out, readout [BS, NC, D_n]).
@@ -125,14 +125,14 @@ def fused_memory_step_triton(
     """
     assert h.is_cuda, "Triton kernel requires CUDA"
     assert h.dtype == torch.bfloat16, "Triton kernel expects bf16 state"
-    BS, NC, Nc, D_n = h.shape
+    BS, NC, N, D_n = h.shape
     assert msg.shape == h.shape
-    assert W.shape == (BS, NC, Nc, Nc)
-    assert decay.shape == (BS, NC, Nc)
+    assert W.shape == (BS, NC, N, N)
+    assert decay.shape == (BS, NC, N)
     assert inject_proj.dim() == 4 and inject_proj.shape[:2] == (BS, NC)
     ALPHA = inject_proj.shape[2]
     assert inject_proj.shape[3] == D_n
-    assert out_mask.shape == (NC, Nc)
+    assert out_mask.shape == (NC, N)
 
     h = h.contiguous(); msg = msg.contiguous(); W = W.contiguous()
     decay = decay.contiguous(); inject_proj = inject_proj.contiguous()
@@ -145,7 +145,7 @@ def fused_memory_step_triton(
     _memory_step_fwd[grid](
         h, msg, W, decay, inject_proj, out_mask,
         h_out, readout,
-        Nc=Nc, D_n=D_n, ALPHA=ALPHA, READOUT_SCALE=readout_scale,
+        N=N, D_n=D_n, ALPHA=ALPHA, READOUT_SCALE=readout_scale,
         h_stride_b=h.stride(0), h_stride_c=h.stride(1),
         W_stride_b=W.stride(0), W_stride_c=W.stride(1),
         decay_stride_b=decay.stride(0), decay_stride_c=decay.stride(1),
@@ -170,9 +170,9 @@ def fused_memory_step_torch(
     (b) CPU fallback, (c) correctness testing the Triton kernel.
 
     inject_proj [BS, NC, ALPHA, D_n] is added to the first ALPHA rows of
-    `received` (the input-port neurons). Rest of Nc rows get no inject.
+    `received` (the input-port neurons). Rest of N rows get no inject.
     """
-    BS, NC, Nc, D_n = h.shape
+    BS, NC, N, D_n = h.shape
     ALPHA = inject_proj.shape[2]
     received = torch.matmul(W, msg)
     # Add inject to first ALPHA rows. Equivalent to scatter_add at fixed
@@ -267,14 +267,14 @@ def fused_memory_step(
     use_triton: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """Dispatch fused step: Triton (with autograd) when CUDA + bf16; else PyTorch."""
-    # Triton requirements: CUDA, bf16 state, Nc and D_n are powers of 2
-    # (tl.arange requires it). Nc also needs to be ≥ 16 for tl.dot. Any
+    # Triton requirements: CUDA, bf16 state, N and D_n are powers of 2
+    # (tl.arange requires it). N also needs to be ≥ 16 for tl.dot. Any
     # failure falls through to the PyTorch reference, which has the same
     # math.
-    Nc = h.shape[2]
+    N = h.shape[2]
     D_n = h.shape[3]
     _triton_shape_ok = (
-        _is_pow2(Nc) and Nc >= 16
+        _is_pow2(N) and N >= 16
         and _is_pow2(D_n) and D_n >= 16
     )
     if (use_triton

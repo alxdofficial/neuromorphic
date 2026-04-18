@@ -12,18 +12,18 @@ from src.model.triton_memory_step import (
 
 def test_correctness():
     torch.manual_seed(0)
-    BS, NC, Nc, D_n, alpha = 64, 8, 32, 256, 4
+    BS, NC, N, D_n, alpha = 64, 8, 32, 256, 4
     device = torch.device("cuda")
     dt = torch.bfloat16
 
-    h = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
-    msg = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
-    W = torch.randn(BS, NC, Nc, Nc, device=device, dtype=dt) * 0.1
-    decay = torch.sigmoid(torch.randn(BS, NC, Nc, device=device, dtype=dt))
+    h = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5
+    msg = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5
+    W = torch.randn(BS, NC, N, N, device=device, dtype=dt) * 0.1
+    decay = torch.sigmoid(torch.randn(BS, NC, N, device=device, dtype=dt))
     inject_proj = torch.randn(BS, NC, alpha, D_n, device=device, dtype=dt) * 0.3
     output_port_idx = torch.arange(alpha, 2 * alpha, device=device).unsqueeze(0).expand(NC, alpha).contiguous()
 
-    out_mask = torch.zeros(NC, Nc, device=device, dtype=dt)
+    out_mask = torch.zeros(NC, N, device=device, dtype=dt)
     for c in range(NC):
         out_mask[c, output_port_idx[c]] = 1.0
 
@@ -48,16 +48,16 @@ def test_correctness():
 
 def test_speed():
     torch.manual_seed(0)
-    BS, NC, Nc, D_n, alpha = 64, 8, 32, 256, 4
+    BS, NC, N, D_n, alpha = 64, 8, 32, 256, 4
     device = torch.device("cuda")
     dt = torch.bfloat16
 
-    h = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
-    msg = torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5
-    W = torch.randn(BS, NC, Nc, Nc, device=device, dtype=dt) * 0.1
-    decay = torch.sigmoid(torch.randn(BS, NC, Nc, device=device, dtype=dt))
+    h = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5
+    msg = torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5
+    W = torch.randn(BS, NC, N, N, device=device, dtype=dt) * 0.1
+    decay = torch.sigmoid(torch.randn(BS, NC, N, device=device, dtype=dt))
     inject_proj = torch.randn(BS, NC, alpha, D_n, device=device, dtype=dt) * 0.3
-    out_mask = torch.zeros(NC, Nc, device=device, dtype=dt)
+    out_mask = torch.zeros(NC, N, device=device, dtype=dt)
     out_mask[:, alpha:2*alpha] = 1.0
     readout_scale = alpha ** -0.5
 
@@ -94,17 +94,17 @@ def test_backward_matches_torch():
     from src.model.triton_memory_step import fused_memory_step
 
     torch.manual_seed(42)
-    BS, NC, Nc, D_n, alpha = 4, 2, 16, 32, 2
+    BS, NC, N, D_n, alpha = 4, 2, 16, 32, 2
     device = torch.device("cuda")
     dt = torch.bfloat16
 
     def make_inputs():
-        h = (torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5).detach().requires_grad_(True)
-        msg = (torch.randn(BS, NC, Nc, D_n, device=device, dtype=dt) * 0.5).detach().requires_grad_(True)
-        W = (torch.randn(BS, NC, Nc, Nc, device=device, dtype=dt) * 0.1).detach().requires_grad_(True)
-        decay = torch.sigmoid(torch.randn(BS, NC, Nc, device=device, dtype=dt)).detach().requires_grad_(True)
+        h = (torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5).detach().requires_grad_(True)
+        msg = (torch.randn(BS, NC, N, D_n, device=device, dtype=dt) * 0.5).detach().requires_grad_(True)
+        W = (torch.randn(BS, NC, N, N, device=device, dtype=dt) * 0.1).detach().requires_grad_(True)
+        decay = torch.sigmoid(torch.randn(BS, NC, N, device=device, dtype=dt)).detach().requires_grad_(True)
         inject_proj = (torch.randn(BS, NC, alpha, D_n, device=device, dtype=dt) * 0.3).detach().requires_grad_(True)
-        out_mask = torch.zeros(NC, Nc, device=device, dtype=dt)
+        out_mask = torch.zeros(NC, N, device=device, dtype=dt)
         out_mask[:, alpha:2*alpha] = 1.0
         return h, msg, W, decay, inject_proj, out_mask
 

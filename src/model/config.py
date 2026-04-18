@@ -22,7 +22,7 @@ class Config:
     dropout: float = 0.1
 
     # === Memory Graph: NC cells × neurons_per_cell neurons each ===
-    # W is block-diagonal: [NC, Nc, Nc] — cells communicate only via their
+    # W is block-diagonal: [NC, N, N] — cells communicate only via their
     # input/output ports through the LM.
     #
     # D_n=256 is the per-neuron state width (kept large for rich per-neuron

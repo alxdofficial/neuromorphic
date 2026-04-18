@@ -12,7 +12,7 @@ count modest. Per-cell behavior still differs because (a) each cell sees
 its own h/msg/W state, (b) each cell carries its own identity vector
 through the shared trunk.
 
-State shape: [BS, NC, Nc, D_n] for h/msg; [BS, NC, Nc, Nc] for W/hebbian.
+State shape: [BS, NC, N, D_n] for h/msg; [BS, NC, N, N] for W/hebbian.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class AttentionModulator(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.NC = config.N_cells
-        self.Nc = config.neurons_per_cell
+        self.N = config.neurons_per_cell
         self.D_n = config.D_n
         self.d_proj = config.d_proj
         self.role_dim = config.role_dim
@@ -57,7 +57,7 @@ class AttentionModulator(nn.Module):
         self.role_emb = nn.Embedding(3, self.role_dim)
 
         # Per-cell identity embedding — the only cell-specific parameter in
-        # the modulator. Broadcast across (BS, Nc) as a per-token feature.
+        # the modulator. Broadcast across (BS, N) as a per-token feature.
         self.cell_emb = nn.Parameter(
             torch.randn(self.NC, self.d_cell) * (self.d_cell ** -0.5))
 
@@ -99,23 +99,23 @@ class AttentionModulator(nn.Module):
 
     def build_tokens(
         self,
-        h: Tensor,          # [BS, NC, Nc, D_n]
-        msg: Tensor,        # [BS, NC, Nc, D_n]
-        received: Tensor,   # [BS, NC, Nc, D_n]
-        decay: Tensor,      # [BS, NC, Nc]
+        h: Tensor,          # [BS, NC, N, D_n]
+        msg: Tensor,        # [BS, NC, N, D_n]
+        received: Tensor,   # [BS, NC, N, D_n]
+        decay: Tensor,      # [BS, NC, N]
         s_live: Tensor,     # [BS]
         s_ema: Tensor,      # [BS]
-        role_id: Tensor,    # [NC, Nc] long
+        role_id: Tensor,    # [NC, N] long
     ) -> Tensor:
-        """Returns [BS, NC, Nc, F] tokens."""
-        BS, NC, Nc, _ = h.shape
+        """Returns [BS, NC, N, F] tokens."""
+        BS, NC, N, _ = h.shape
         dt = h.dtype
 
         w_dt = self.h_proj.weight.dtype
         if h.dtype != w_dt:
             h = h.to(w_dt); msg = msg.to(w_dt); received = received.to(w_dt)
 
-        h_p = self.h_proj(h)                             # [BS, NC, Nc, d_proj]
+        h_p = self.h_proj(h)                             # [BS, NC, N, d_proj]
         me_p = self.msg_emit_proj(msg)
         mr_p = self.msg_recv_proj(received)
 
@@ -123,15 +123,15 @@ class AttentionModulator(nn.Module):
         msg_norm = msg.norm(dim=-1, keepdim=True)
         dec = decay.unsqueeze(-1).to(w_dt)
 
-        role_e = self.role_emb(role_id).to(w_dt)          # [NC, Nc, role_dim]
-        role_e = role_e.unsqueeze(0).expand(BS, NC, Nc, self.role_dim)
+        role_e = self.role_emb(role_id).to(w_dt)          # [NC, N, role_dim]
+        role_e = role_e.unsqueeze(0).expand(BS, NC, N, self.role_dim)
 
-        # Cell identity — broadcast [NC, d_cell] across (BS, Nc).
+        # Cell identity — broadcast [NC, d_cell] across (BS, N).
         cell_e = self.cell_emb.to(w_dt)                   # [NC, d_cell]
-        cell_e = cell_e.view(1, NC, 1, self.d_cell).expand(BS, NC, Nc, self.d_cell)
+        cell_e = cell_e.view(1, NC, 1, self.d_cell).expand(BS, NC, N, self.d_cell)
 
-        s_live_b = s_live.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
-        s_ema_b = s_ema.view(BS, 1, 1, 1).expand(BS, NC, Nc, 1).to(w_dt)
+        s_live_b = s_live.view(BS, 1, 1, 1).expand(BS, NC, N, 1).to(w_dt)
+        s_ema_b = s_ema.view(BS, 1, 1, 1).expand(BS, NC, N, 1).to(w_dt)
 
         tok_in = torch.cat([
             h_norm, msg_norm, dec,
@@ -140,16 +140,16 @@ class AttentionModulator(nn.Module):
             s_live_b, s_ema_b,
         ], dim=-1)
 
-        tokens = self.tok_proj(tok_in)                    # [BS, NC, Nc, F]
+        tokens = self.tok_proj(tok_in)                    # [BS, NC, N, F]
         return tokens.to(dt) if dt != w_dt else tokens
 
     def build_edge_bias(self, W: Tensor, hebbian: Tensor) -> Tensor:
-        """Per-cell edge bias: [BS, NC, H, Nc, Nc]."""
+        """Per-cell edge bias: [BS, NC, H, N, N]."""
         w_dt = self.edge_bias_mlp[0].weight.dtype
         if W.dtype != w_dt:
             W = W.to(w_dt); hebbian = hebbian.to(w_dt)
         asym = W - W.transpose(-1, -2)
-        edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, Nc, Nc, 3]
+        edge_feat = torch.stack([W, hebbian, asym], dim=-1)  # [BS, NC, N, N, 3]
         bias = self.edge_bias_mlp(edge_feat)
         return bias.permute(0, 1, 4, 2, 3).contiguous()
 
@@ -160,16 +160,16 @@ class AttentionModulator(nn.Module):
         s_live: Tensor, s_ema: Tensor,
         role_id: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Returns (logits [BS, NC, K], tokens [BS, NC, Nc, F])."""
+        """Returns (logits [BS, NC, K], tokens [BS, NC, N, F])."""
         tokens = self.build_tokens(h, msg, received, decay, s_live, s_ema, role_id)
-        BS, NC, Nc, F_tok = tokens.shape
+        BS, NC, N, F_tok = tokens.shape
 
         edge_bias = self.build_edge_bias(W, hebbian)
-        tokens_flat = tokens.reshape(BS * NC, Nc, F_tok)
-        edge_bias_flat = edge_bias.reshape(BS * NC, self.H, Nc, Nc)
+        tokens_flat = tokens.reshape(BS * NC, N, F_tok)
+        edge_bias_flat = edge_bias.reshape(BS * NC, self.H, N, N)
         for layer in self.layers:
             tokens_flat = layer(tokens_flat, edge_bias_flat)
-        tokens = tokens_flat.reshape(BS, NC, Nc, F_tok)
+        tokens = tokens_flat.reshape(BS, NC, N, F_tok)
 
         pooled = self.pool_norm(tokens).mean(dim=2)       # [BS, NC, F]
         return self.logit_head(pooled), tokens
@@ -227,13 +227,13 @@ class DirectDecoder(nn.Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.Nc = config.neurons_per_cell
+        self.N = config.neurons_per_cell
         self.NC = config.N_cells
         self.D_code = config.code_dim
         self.d_cell = config.d_cell
 
         in_dim = self.D_code + self.d_cell
-        out_dim = self.Nc * self.Nc + self.Nc
+        out_dim = self.N * self.N + self.N
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, config.decoder_hidden),
             nn.GELU(),
@@ -248,12 +248,12 @@ class DirectDecoder(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-        self.register_buffer("diag_mask", torch.eye(self.Nc).unsqueeze(0))
+        self.register_buffer("diag_mask", torch.eye(self.N).unsqueeze(0))
 
     def forward(self, emb: Tensor, cell_emb: Tensor) -> tuple[Tensor, Tensor]:
         """emb: [BS, NC, D_code]. cell_emb: [NC, d_cell] (passed from modulator).
 
-        Returns (ΔW [BS, NC, Nc, Nc], Δdecay [BS, NC, Nc]).
+        Returns (ΔW [BS, NC, N, N], Δdecay [BS, NC, N]).
         """
         BS, NC, _ = emb.shape
         w_dt = self.mlp[0].weight.dtype
@@ -264,10 +264,10 @@ class DirectDecoder(nn.Module):
         combined = torch.cat([emb, cell_expanded], dim=-1)   # [BS, NC, D_code + d_cell]
 
         raw = self.mlp(combined)
-        dW_raw = raw[..., : self.Nc * self.Nc].reshape(BS, NC, self.Nc, self.Nc)
-        dDecay_raw = raw[..., self.Nc * self.Nc:]
+        dW_raw = raw[..., : self.N * self.N].reshape(BS, NC, self.N, self.N)
+        dDecay_raw = raw[..., self.N * self.N:]
         dW_raw = dW_raw * (1.0 - self.diag_mask.to(dW_raw.dtype).unsqueeze(0))
-        dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.Nc,))
+        dW_normed = F.rms_norm(dW_raw, normalized_shape=(self.N,))
 
         if orig_dt != w_dt:
             dW_normed = dW_normed.to(orig_dt)
@@ -286,20 +286,20 @@ def port_layout(config: Config) -> dict:
     Returns:
       input_port_idx:  [NC, alpha] — local indices within each cell
       output_port_idx: [NC, alpha] — local indices within each cell
-      role_id:         [NC * Nc]   — flat per-neuron role
+      role_id:         [NC * N]   — flat per-neuron role
                        (0=input, 1=output, 2=internal)
     """
     NC = config.N_cells
-    Nc = config.neurons_per_cell
+    N = config.neurons_per_cell
     alpha = config.alpha
-    N = NC * Nc
+    N_total = NC * N
 
     input_local = torch.arange(alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
     output_local = torch.arange(alpha, 2 * alpha, dtype=torch.long).unsqueeze(0).expand(NC, alpha)
 
-    role_id = torch.full((N,), 2, dtype=torch.long)
+    role_id = torch.full((N_total,), 2, dtype=torch.long)
     for c in range(NC):
-        base = c * Nc
+        base = c * N
         role_id[base : base + alpha] = 0
         role_id[base + alpha : base + 2 * alpha] = 1
 
