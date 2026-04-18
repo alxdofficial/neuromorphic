@@ -32,7 +32,7 @@ class Config:
     N_cells: int = 8
     neurons_per_cell: int = 32
     D_n: int = 256
-    alpha: int = 4                # input/output ports per cell
+    alpha: int = 8                # input/output ports per cell (2·α·D_n I/O bandwidth per token)
     # Multi-timescale clocks: per-token membrane integration + per-token msg
     # emission (so intra-cell message passing uses fresh msg, not stale —
     # the LM injects fresh signal every token, so neurons should re-emit
@@ -41,16 +41,16 @@ class Config:
     modulation_interval: int = 16 # modulator + plasticity fire every N tokens
     # State update is a LIF-style leaky integrator — no MLP, no hidden dim.
     # Only msg emission keeps a 2-layer MLP.
-    msg_mlp_hidden: int = 256
+    msg_mlp_hidden: int = 512
 
     # === Attention Modulator (encoder) ===
     # Shared trunk + per-cell conditioning via cell_emb [NC, d_cell].
     d_proj: int = 24              # node feature compression (h_proj, msg_proj)
     role_dim: int = 4             # role embedding: input port / output port / internal
-    d_cell: int = 16              # per-cell identity embedding dim (feeds modulator + decoder)
-    attn_token_dim: int = 128     # F — per-neuron token width
+    d_cell: int = 32              # per-cell identity embedding dim (feeds modulator + decoder)
+    attn_token_dim: int = 192     # F — per-neuron token width
     attn_n_heads: int = 8         # multi-head attention heads (F must divide by heads)
-    attn_n_layers: int = 3        # per-cell attention blocks
+    attn_n_layers: int = 5        # per-cell attention blocks
     attn_ffn_mult: int = 4        # FFN expansion factor
     attn_dropout: float = 0.1
 
@@ -65,7 +65,7 @@ class Config:
     # MLP's hidden width and IS the output-space rank constraint (rank
     # <= min(code_dim, decoder_hidden) for the code→output map, but the
     # emitted ΔW *matrix* itself is unconstrained in rank).
-    decoder_hidden: int = 512
+    decoder_hidden: int = 6144
 
     # === Plasticity rate clamp (bf16 safety) ===
     gamma_max: float = 0.97       # γ = gamma_max · sigmoid(logit); keeps (1-γ) ≥ 0.03
