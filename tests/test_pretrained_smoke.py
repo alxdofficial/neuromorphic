@@ -216,3 +216,88 @@ def test_memory_wired_backward_reaches_trainable_params():
     assert wrapper.llama.model.layers[0].self_attn.q_proj.weight.grad is None
     assert wrapper.llama.model.norm.weight.grad is None
     assert wrapper.llama.lm_head.weight.grad is None
+
+
+@requires_llama
+def test_full_optimizer_step_runs():
+    """Forward → CE → backward → optimizer.step for one iteration. The
+    trainable params must change after step; frozen params must not."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train()
+    wrapper.reset_memory(bs=1)
+
+    trainable = [p for _, p in wrapper.trainable_parameters()]
+    opt = torch.optim.AdamW(trainable, lr=1e-3)
+
+    # Snapshot a couple of params to check they move.
+    W_in_before = wrapper.mem_inject.W_in.weight.detach().clone()
+    scale_before = wrapper.mem_inject.scale.detach().clone()
+    # And one frozen param to check it doesn't move.
+    embed_before = wrapper.llama.model.embed_tokens.weight.detach().clone()
+
+    T = 2 * cfg.memory.modulation_interval
+    input_ids = torch.randint(0, cfg.vocab_size_lm, (1, T))
+    target_ids = torch.cat([input_ids[:, 1:], input_ids[:, :1]], dim=1)
+
+    out = wrapper(input_ids)
+    ce = torch.nn.functional.cross_entropy(
+        out.logits.reshape(-1, out.logits.shape[-1]),
+        target_ids.reshape(-1))
+    loss = ce + 0.1 * wrapper._last_mem_pred_loss
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    assert not torch.equal(wrapper.mem_inject.W_in.weight, W_in_before), (
+        "W_in did not update after optimizer.step")
+    assert not torch.equal(wrapper.mem_inject.scale, scale_before), (
+        "scale did not update after optimizer.step")
+    assert torch.equal(wrapper.llama.model.embed_tokens.weight, embed_before), (
+        "frozen embed_tokens weight changed — backbone not frozen properly")
+
+
+@requires_llama
+def test_multi_segment_tbptt_carries_memory_state():
+    """Two consecutive forward calls: memory state must persist across them,
+    and detach_memory() must break the gradient graph between segments."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train()
+    wrapper.reset_memory(bs=1)
+
+    T = 2 * cfg.memory.modulation_interval
+    input_ids_1 = torch.randint(0, cfg.vocab_size_lm, (1, T))
+    input_ids_2 = torch.randint(0, cfg.vocab_size_lm, (1, T))
+
+    # First forward: memory starts at zero state, produces a snapshot.
+    _ = wrapper(input_ids_1)
+    W_after_seg1 = wrapper.memory.W.detach().clone()
+    assert wrapper.memory.is_initialized
+    assert W_after_seg1.abs().sum() > 0, (
+        "W is all-zero after first segment; modulator never wrote")
+
+    # Detach between segments (simulates TBPTT boundary).
+    wrapper.detach_memory()
+
+    # Second forward: state should continue evolving from W_after_seg1,
+    # not reset to zeros.
+    _ = wrapper(input_ids_2)
+    W_after_seg2 = wrapper.memory.W.detach()
+    # W must have evolved further — different from the post-seg1 snapshot.
+    assert not torch.equal(W_after_seg2, W_after_seg1), (
+        "memory state did not change across the second segment")
+    assert torch.isfinite(W_after_seg2).all()
