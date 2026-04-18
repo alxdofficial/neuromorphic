@@ -1,6 +1,6 @@
 # Attention-Neuromod Performance Results
 
-Running totals of every architecture variant tried on `attention-neuromod`
+Running totals of every architecture variant tried on `main`
 branch, from the worst (conv-grid dense) to the best (NC=8 attention).
 
 Measured on RTX 4090, training step = forward + backward + optimizer +
@@ -10,9 +10,9 @@ detach (no data loading). All runs at T=128 segment length, bf16 autocast.
 
 | Rank | Config | tok/s | vs main | vs prev | Step | VRAM |
 |---:|---|---:|---:|---:|---:|---:|
-| 🥇 | **NC=8 Nc=32, cross=0, BS=64** | **37.6K** | **94%** | +58% | 218ms | 21GB |
-| 🥈 | NC=8 Nc=32, cross=1, BS=64 | 36.3K | 91% | +51% | 225ms | 22GB |
-| 🥉 | NC=8 Nc=32, cross=0, BS=56 | 35.7K | 89% | +49% | 201ms | 19GB |
+| 🥇 | **NC=8 N=32, cross=0, BS=64** | **37.6K** | **94%** | +58% | 218ms | 21GB |
+| 🥈 | NC=8 N=32, cross=1, BS=64 | 36.3K | 91% | +51% | 225ms | 22GB |
+| 🥉 | NC=8 N=32, cross=0, BS=56 | 35.7K | 89% | +49% | 201ms | 19GB |
 | — | Main branch (reference) | 40.0K | 100% | — | 239ms | 22GB |
 | — | NC=1 N=256 attention, BS=48 | 24.4K | 61% | +52% vs factored | 252ms | 23GB |
 | — | NC=1 N=256 attention + factored r=32 (ckpt) | 22.0K | 55% | 14× conv-grid | 418ms | 8.5GB |
@@ -47,7 +47,7 @@ detach (no data loading). All runs at T=128 segment length, bf16 autocast.
 - **GPU is compute-bound at this config.** No kernel fusion can help.
 - Remaining gap to main: structural (main's NC=8 has 8× fewer W entries).
 
-#### 4. Attention neuromod, NC=8 × Nc=32 (multi-cell)
+#### 4. Attention neuromod, NC=8 × N=32 (multi-cell)
 - Cell structure matches main (block-diagonal W). Per-cell attention modulator
   with shared weights across cells.
 - Tradeoff: no direct long-distance W edges between cells.
@@ -111,50 +111,20 @@ Math check: with K shuffled passes of NC=8, pair-coverage probability is
 cells dominates the coverage-per-compute frontier — shuffling adds compute
 but doesn't improve the tradeoff. Not worth implementing.
 
-**NC=16, Nc=16 with D_n=128**: mixed results; similar throughput to NC=8 but
+**NC=16, N=16 with D_n=128**: mixed results; similar throughput to NC=8 but
 with smaller capacity per neuron. Not clearly better.
 
-**NC=4, Nc=64 with D_n=512**: similar to NC=8. Not clearly better.
+**NC=4, N=64 with D_n=512**: similar to NC=8. Not clearly better.
 
-## The design we ended up with
+## The pre-Triton milestone (historical; superseded by the Redesign below)
 
-Final architecture on `attention-neuromod` branch (tip `512d0b2`):
-
-```
-Memory state:
-  h, msg:    [BS, NC=8, Nc=32, D_n=256]
-  W, hebbian: [BS, NC=8, Nc=32, Nc=32]    (block-diagonal, per-cell)
-  decay:     [BS, NC=8, Nc=32]             in [0, 1]
-
-Per-cell attention modulator (shared weights across NC=8 cells):
-  Tokens: [BS, NC, Nc, F=64]
-  Edge bias: [BS, NC, H=4, Nc, Nc] from MLP(W, hebbian, asymmetry)
-  L=2 per-cell attention layers (attention within each cell)
-  L=1 cross-cell attention layer (no edge bias, perception across all cells)
-  Pool + per-cell logit head → [BS, NC, K=2048] logits
-
-Per-cell discrete policy:
-  Gumbel-softmax (phase 1) or hard Categorical (phase 2)
-  Codebook [K=2048, D_code=128] shared across cells
-  Per-cell code choice: 8 independent samples per event
-
-Per-cell decoder (direct emission, shared weights):
-  code_emb [D_code] → MLP (D_code → 512 → Nc² + Nc)
-  → reshape to (ΔW [Nc, Nc], Δdecay [Nc])
-  No rank approximation, zero-init for no-op start
-  Per-cell per-neuron γ clamped to 0.97 for bf16-safe EMA
-
-All code paths: bf16 on CUDA, f32 on CPU (no manual dtype casts).
-torch.compile on per-block memory loop. No activation checkpointing
-at BS=64 (22GB VRAM used).
-```
-
-## Verdict (at the shared-weights milestone)
-
-- **37.6K tok/s** — within 6% of main's 40K
-- Attention modulator observes per-edge AND per-node features; main's MLP
-  modulator only sees rates/correlations.
-- Full-rank ΔW emission (main has this too).
+The "shared-weights attention modulator" milestone on the old
+`attention-neuromod` branch hit **37.6K tok/s** at BS=64 (within 6% of
+the old main's 40K). That intermediate milestone had F=64, H=4, 2
+per-cell attention layers + 1 cross-cell attention layer, no Triton
+fusion. It is documented for history; the *current* design below
+supersedes it in every dimension (wider F, Triton-fused per-token
+kernel, multi-timescale LIF, dropped cross-cell attention).
 
 ## Redesign (April 2026) — multi-timescale + per-cell + Triton
 
@@ -176,14 +146,20 @@ Everything below supersedes the shared-weights milestone above. See
    pool. 4.2× faster per-token in isolation; ~5-10% end-to-end gain after
    integration.
 4. **Readout pools from `h`**, not `msg` (fresh every token).
-5. **Per-cell modulator** — all modulator weights are `[NC, ...]`, applied
-   via einsum. Each cell has its own attention, edge-bias MLP, and logit
-   head. LayerNorms stay shared.
-6. **Per-cell decoder** — each cell interprets the shared codebook through
-   its own decoder. Same code ID can mean different plasticity programs
-   in different cells.
+5. **Shared modulator trunk + per-cell cell_emb** — attention, edge-bias
+   MLP, logit head, and projections are SHARED across cells (batched over
+   NC as an extra batch dim). The only per-cell parameter is
+   `cell_emb [NC, d_cell=16]`, which is concatenated into per-neuron
+   tokens and into the decoder input (FiLM-style conditioning). Same
+   code ID can mean different plasticity programs in different cells,
+   driven by the tiny `cell_emb` signal rather than duplicated weights.
+   A per-cell-weights variant was tried separately and cost ~15%
+   throughput for modest capacity gain — not kept.
+6. **Shared-trunk decoder** — one MLP, conditioned on cell_emb at input.
+   Same compute path regardless of cell count.
 7. **Beefed modulator** — `attn_token_dim 64→128`, `attn_n_layers 2→3`,
-   `attn_n_heads 4→8`, `d_proj 16→24`. ~3× modulator param count.
+   `attn_n_heads 4→8`, `d_proj 16→24`. ~3× modulator param count while
+   staying shared-trunk.
 8. **`tbptt_block` default 8→16.**
 
 ### Throughput progression (RTX 4090, BS=64, T=128, tbptt=16)
@@ -193,22 +169,21 @@ Everything below supersedes the shared-weights milestone above. See
 | Shared-weights baseline | 37.8K | 1.00× | 21 GB | 3.6 M |
 | + multi-timescale LIF | 67.3K | 1.78× | 10.4 GB | 3.4 M |
 | + Triton fused kernel | 69.8K | 1.85× | 10.0 GB | 3.4 M |
-| + per-cell mod + decoder | 64.1K | 1.70× | 10.3 GB | 9.4 M |
-| + beefed modulator (final) | **56.3K** | **1.49×** | 11.9 GB | 14.6 M |
+| + beefed modulator (stayed shared trunk, **current**) | **~68K** | **~1.80×** | 12 GB | 4.1 M |
 
-Total model: **81.73M params** (LM 67.1M + memory graph 14.6M).
+Total model: **71.2M params** (LM 67.1M + memory graph 4.1M).
 
-The per-cell + beefed modulator steps trade ~15% throughput for ~4×
-memory-graph param count (and the corresponding policy capacity).
+"Beefed" in the current design is `attn_token_dim 64→128`, `n_layers 2→3`,
+`n_heads 4→8`, `d_proj 16→24` — the modulator went 3× wider/deeper but
+stayed a SHARED trunk across cells (not per-cell weights, which was tried
+in a separate experiment that added ~5M params for ~15% throughput cost
+and was not kept).
 
-### At other batch sizes (final config)
+### At other batch sizes (current config)
 
 | BS | tok/s | ms/step | VRAM |
 |---:|---:|---:|---:|
-| 32 | ~50K | ~80 | 6.6 GB |
-| 64 | ~56K | ~145 | 11.9 GB |
-| 96 | (not re-measured) | | |
-| 128 | (not re-measured) | | |
+| 64 | ~68K | ~120 | 11.5 GB |
 
 ### Knobs we deliberately did NOT change (for future reference)
 

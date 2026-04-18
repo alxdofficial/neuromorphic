@@ -1,6 +1,6 @@
 # Neuromorphic Memory Graph — Current Design
 
-Branch: `attention-neuromod`. This document reflects the architecture as of
+Branch: `main`. This document reflects the architecture as of
 April 2026. Older planning docs in this folder describe earlier iterations
 (conv-grid modulator, shared-weights attention modulator) — those are kept
 for history but are **superseded** by this file for current state.
@@ -61,11 +61,11 @@ tokens → embedding → lower LM scan → H_mid [BS, T, D]
 ## State tensors (lifelong, per batch element)
 
 ```
-h        : [BS, NC=8, Nc=32, D_n=256]   membrane potential
-msg      : [BS, NC, Nc, D_n]            spike output (event-driven update)
-W        : [BS, NC, Nc, Nc]             per-cell plastic weights (block-diagonal)
-hebbian  : [BS, NC, Nc, Nc]             per-cell co-activation trace
-decay    : [BS, NC, Nc]                 per-neuron leak rate in [0, 1]
+h        : [BS, NC=8, N=32, D_n=256]   membrane potential
+msg      : [BS, NC, N, D_n]            spike output (event-driven update)
+W        : [BS, NC, N, N]             per-cell plastic weights (block-diagonal)
+hebbian  : [BS, NC, N, N]             per-cell co-activation trace
+decay    : [BS, NC, N]                 per-neuron leak rate in [0, 1]
 ```
 
 All state persists across training segments (lifelong). Detached at
@@ -77,7 +77,7 @@ interface.
 
 ## Neurons and cells
 
-- **Cell**: `Nc = 32` neurons sharing a dense 32×32 `W`. Within a cell, all-
+- **Cell**: `N = 32` neurons sharing a dense 32×32 `W`. Within a cell, all-
   to-all connectivity.
 - **Graph**: `NC = 8` cells, total 256 neurons. Not interconnected at the `W`
   level — see inter-cell communication below.
@@ -99,7 +99,7 @@ h        = tanh(decay * h_prev + (1 - decay) * received)
 readout  = Σ_{n ∈ output_ports} h[n] · α^(−1/2)
 ```
 
-- `W @ msg`: batched matmul `[BS, NC, Nc, Nc] @ [BS, NC, Nc, D_n]`.
+- `W @ msg`: batched matmul `[BS, NC, N, N] @ [BS, NC, N, D_n]`.
 - `inject(H_mid_t)`: per-cell projection. H_mid split into NC_pools slices of
   `D_n`; each slice passes through per-cell `inject_w [NC, α·D_n, D_n]`
   → reshaped to `[BS, NC, α, D_n]` → scatter-added into `received` at
@@ -125,7 +125,7 @@ hebbian = (1 - γ_h) · hebbian + γ_h · (msg · msgᵀ)
 ```
 
 - `msg_MLP` is a shared 2-layer MLP: `D_n → Hm=256 → D_n`.
-- `neuron_id [NC, Nc, D_n]` is a learned per-neuron identity vector — breaks
+- `neuron_id [NC, N, D_n]` is a learned per-neuron identity vector — breaks
   symmetry so different-position neurons emit distinguishable spike patterns.
 - Hebbian is a rolling EMA of intra-cell co-activation. `γ_h = 0.97·σ(hebbian_decay_logit)`
   per neuron.
@@ -141,17 +141,18 @@ Implemented in `src/model/attention_modulator.py`.
 
 **Per-node features** (each neuron contributes one token of dim `F=128`):
 ```
-h[n]        [D_n=256]  →  h_proj    (per-cell Linear 256→24)
-msg[n]      [D_n=256]  →  msg_emit_proj   (per-cell 256→24)
-received[n] [D_n=256]  →  msg_recv_proj   (per-cell 256→24)
+h[n]        [D_n=256]  →  h_proj          (shared Linear 256→24)
+msg[n]      [D_n=256]  →  msg_emit_proj   (shared 256→24)
+received[n] [D_n=256]  →  msg_recv_proj   (shared 256→24)
 ||h[n]||                [scalar]
 ||msg[n]||              [scalar]
 decay[n]                [scalar]
 role_id[n]              [embedding → 4-dim]
+cell_emb[c]             [d_cell=16 — per-cell identity, broadcast over N]
 s_live                  [scalar — current-token CE surprise]
 s_ema                   [scalar — EMA of surprise]
 ```
-→ concat (1+1+1+3·24+4+2 = 81 dims) → per-cell 2-layer MLP → `F=128`-dim
+→ concat (1+1+1+3·24+4+16+2 = 97 dims) → shared 2-layer MLP → `F=128`-dim
 tokens, one per neuron.
 
 **Per-edge features** (each pair (i, j) in a cell):
@@ -160,22 +161,27 @@ W[i, j]
 hebbian[i, j]
 (W − Wᵀ)[i, j]
 ```
-→ per-cell edge-bias MLP (3 → 8 → H=8) → 8 scalar biases per edge, one per
+→ shared edge-bias MLP (3 → 8 → H=8) → 8 scalar biases per edge, one per
 attention head.
 
 ### What the modulator computes
 
-For each cell (NC=8 in parallel via einsum over NC dim):
-1. 3 layers of per-cell multi-head attention over the 32 per-neuron tokens.
+For each cell (NC=8 batched as extra dim):
+1. 3 layers of multi-head attention over the 32 per-neuron tokens.
    Edge biases are added to attention scores BEFORE softmax (like AliBi / T5
    / Graphormer). FFN mult = 4 (so FFN hidden = 4·F = 512).
 2. Mean-pool tokens per cell → `[BS, NC, F=128]`.
-3. Per-cell logit head: `F=128 → K=2048` → **logits `[BS, NC, K=2048]`**
+3. Logit head: `F=128 → K=2048` → **logits `[BS, NC, K=2048]`**
    over discrete plasticity codes.
 
-All modulator weights are **per-cell** (shape `[NC, out, in]`, applied via
-einsum). Cells each have their own modulator; only LayerNorms are shared
-(they're tiny and per-cell LayerNorm is awkward).
+**Weights are SHARED across the NC=8 cells** (attention, FFN, edge-bias
+MLP, logit head, token projections — all shared). The only per-cell
+parameter is `cell_emb [NC, d_cell=16]`, which is (1) concatenated into
+each per-neuron token feature and (2) concatenated into the decoder's
+input alongside the sampled code embedding. This FiLM-style conditioning
+gives each cell an identity signal at both the observation and action
+stages without duplicating trunk weights — keeps compiled matmuls fat
+(better tensor-core utilization) and param count modest.
 
 ### What the modulator writes
 
@@ -185,20 +191,22 @@ Per cell, independently:
    - Eval / phase 2 rollout: hard Categorical with `log π` for GRPO
 2. Look up `emb = codebook[k]`. Codebook `[K=2048, D_code=128]` is SHARED
    across cells — common plasticity vocabulary.
-3. Per-cell decoder MLP (`D_code=128 → 512 → Nc²+Nc=1056`) emits:
-   - `ΔW [Nc, Nc]` — zero-diagonal, RMS-normed along rows
-   - `Δdecay [Nc]` — sigmoid → target in [0, 1]
+3. Shared-trunk decoder MLP (`D_code=128 + d_cell=16 → 512 → N²+N=1056`)
+   emits, conditioned on the per-cell `cell_emb`:
+   - `ΔW [N, N]` — zero-diagonal, RMS-normed along rows
+   - `Δdecay [N]` — sigmoid → target in [0, 1]
 4. γ-clamped EMA blend (γ_max = 0.97 for bf16 safety):
    ```
    W_new     = (1 − γ_W) · W     + γ_W · ΔW
    decay_new = (1 − γ_d) · decay + γ_d · σ(Δdecay)
    ```
-   where `γ_W, γ_d ∈ [NC, Nc]` are learned per-neuron plasticity rates
+   where `γ_W, γ_d ∈ [NC, N]` are learned per-neuron plasticity rates
    (`gamma_max · σ(W_decay_logit)` and similarly for decay).
 
-The decoder's output layer is **zero-initialized**, so at training start
-the modulator is a no-op. The memory graph starts passive and learns to
-write as training progresses.
+The decoder's output layer is Xavier-init, not zero-init (zero-init
+drove W toward zero via the EMA — see `attention_modulator.py` for the
+explanation). The memory graph starts with small-random-walk ΔW
+updates and learns to write meaningfully as training progresses.
 
 **The modulator does NOT directly adjust `h`, `msg`, `hebbian`, `neuron_id`,
 or `inject_w`.** Those either evolve by their own dynamics (h, msg, hebbian)
@@ -260,7 +268,7 @@ inside a segment of `T=128` tokens so VRAM stays bounded.
 | d_inner | 1200 | LM scan inner dim |
 | vocab_size | 32000 | |
 | N_cells | 8 | NC |
-| neurons_per_cell | 32 | Nc |
+| neurons_per_cell | 32 | N |
 | D_n | 256 | per-neuron state dim |
 | alpha | 4 | input / output ports per cell |
 | msg_interval | 4 | msg emission + hebbian event rate (tokens) |
@@ -273,7 +281,7 @@ inside a segment of `T=128` tokens so VRAM stays bounded.
 | attn_ffn_mult | 4 | |
 | num_codes | 2048 | K — codebook size |
 | code_dim | 128 | D_code |
-| decoder_hidden | 512 | per-cell decoder hidden dim |
+| decoder_hidden | 512 | shared decoder hidden dim |
 | gamma_max | 0.97 | bf16-safe clamp on plasticity rates |
 | T | 128 | tokens per segment |
 | tbptt_block | 16 | TBPTT detach interval |
@@ -282,17 +290,16 @@ inside a segment of `T=128` tokens so VRAM stays bounded.
 ## Param count and performance (RTX 4090, bf16 autocast)
 
 ```
-Total model params : 81.73 M
+Total model params : 71.17 M
   LM               : 67.08 M
-  Memory graph     : 14.64 M
-    inject_w       :  2.10 M   per-cell input projection
-    modulator      :  7.21 M   per-cell attention (F=128, 3 layers, H=8)
-    decoder        :  4.86 M   per-cell code → plasticity MLP
+  Memory graph     :  4.09 M
+    inject_w + b   :  2.11 M   per-cell LM→ports projection
+    modulator      :  0.91 M   SHARED attention trunk (F=128, 3 layers, H=8)
+    decoder        :  0.62 M   SHARED code → plasticity MLP (conditioned on cell_emb)
     codebook       :  0.26 M   K=2048, D_code=128 (shared across cells)
-    state/bookkeeping : 0.21 M   neuron_id, msg MLP, plasticity gate logits
+    state/bookkeeping : 0.20 M   neuron_id, msg MLP, plasticity gate logits
 
-Throughput (BS=64, T=128, tbptt=16) : ~56K tok/s
-Throughput (BS=32, T=128, tbptt=16) : ~50K tok/s
+Throughput (BS=64, T=128, tbptt=16) : ~68-70K tok/s (Triton-fused per-token)
 VRAM at BS=64                       : ~12 GB
 ```
 

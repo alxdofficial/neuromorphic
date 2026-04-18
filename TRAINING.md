@@ -1,6 +1,6 @@
 # Training
 
-Branch `attention-neuromod`. For the current architecture see
+Branch `main`. For the current architecture see
 `docs/design.md`; for the throughput / param history see `docs/RESULTS.md`.
 
 ## Prerequisites
@@ -47,10 +47,11 @@ dead-code reset during bootstrap (gated on `codebook.requires_grad`).
 
 ## Architecture summary (see `docs/design.md` for detail)
 
-- NC=8 cells × Nc=32 neurons × D_n=256 per-neuron state (block-diagonal W)
+- NC=8 cells × N=32 neurons × D_n=256 per-neuron state (block-diagonal W)
 - Per-token: LIF state update + W@msg + inject + readout, fused in Triton
 - Every 4 tokens: msg MLP + hebbian EMA
-- Every 16 tokens: per-cell attention neuromodulator → codebook → per-cell
+- Every 16 tokens: shared-trunk attention neuromodulator (per-cell
+  specialization via `cell_emb [NC, 16]`) → codebook → shared-trunk
   decoder → ΔW + Δdecay, γ-clamped EMA blend
 
 Old pre-redesign checkpoints (shared-weights modulator + 2-layer state MLP)
@@ -73,6 +74,6 @@ the same tokenizer (TinyLlama 32K):
 | GPT-2 small | 124M | 2.955 | 19.2 |
 | Pythia-160m | 160M | 2.736 | 15.4 |
 | Mamba-130m | 130M | 3.294 | 27.0 |
-| **Neuromorphic LM** | **~82M** | **TBD** | **TBD** |
+| **Neuromorphic LM** | **~71M** | **TBD** | **TBD** |
 
 Scripts for the baselines live under `auxiliary_repos/baselines/eval_scripts/`.
