@@ -440,7 +440,8 @@ class MemoryGraph(nn.Module):
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                    hebbian_gamma, W_gamma, decay_gamma, gain_fast,
                    use_rmsnorm: bool = False, rms_eps: float = 1e-5,
-                   phase: str = "phase1"):
+                   phase: str = "phase1",
+                   preserve_graph: bool = False):
         """Multi-timescale memory loop.
 
         Per-token (fast clock): W @ msg message passing + inject + LIF state
@@ -463,7 +464,7 @@ class MemoryGraph(nn.Module):
             H_mid_t = block_H_mid[:, offset]
             tok_t = block_input_ids[:, offset]
 
-            if t > 0 and (t % self.config.tbptt_block == 0):
+            if (not preserve_graph) and t > 0 and (t % self.config.tbptt_block == 0):
                 h = h.detach(); msg = msg.detach(); W = W.detach()
                 decay = decay.detach(); hebbian = hebbian.detach()
                 prev_readout = prev_readout.detach()
@@ -547,6 +548,7 @@ class MemoryGraph(nn.Module):
         use_rmsnorm: bool = False,
         rms_eps: float = 1e-5,
         phase: str = "phase1",
+        preserve_graph: bool = False,
     ) -> tuple[Tensor, Tensor]:
         BS, T, _ = H_mid.shape
         if not self._initialized:
@@ -619,7 +621,7 @@ class MemoryGraph(nn.Module):
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast,
-                use_rmsnorm, rms_eps, phase)
+                use_rmsnorm, rms_eps, phase, preserve_graph)
 
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
@@ -632,13 +634,27 @@ class MemoryGraph(nn.Module):
              prev_readout, readout_drift, block_out, log_pi_sum) = result
             readouts[:, start_t:end_t] = block_out
 
-        self.h = h.detach(); self.msg = msg.detach()
-        self.W = W.detach(); self.decay = decay.detach()
-        self.hebbian = hebbian.detach()
-        self.s_mem_live = s_mem_live.detach()
-        self.s_mem_ema_fast = s_mem_ema_fast.detach()
-        self.prev_readout = prev_readout.detach()
-        self.readout_drift = readout_drift.detach()
+        # Persist state across segments. `preserve_graph=True` keeps the
+        # autograd graph alive across forward_segment calls — used by
+        # autoregressive phase-1 unroll where the continuation steps need
+        # gradient to reach the prefix's modulator fires. Caller is
+        # responsible for calling `detach_states()` after backward.
+        if preserve_graph:
+            self.h = h; self.msg = msg
+            self.W = W; self.decay = decay
+            self.hebbian = hebbian
+            self.s_mem_live = s_mem_live
+            self.s_mem_ema_fast = s_mem_ema_fast
+            self.prev_readout = prev_readout
+            self.readout_drift = readout_drift
+        else:
+            self.h = h.detach(); self.msg = msg.detach()
+            self.W = W.detach(); self.decay = decay.detach()
+            self.hebbian = hebbian.detach()
+            self.s_mem_live = s_mem_live.detach()
+            self.s_mem_ema_fast = s_mem_ema_fast.detach()
+            self.prev_readout = prev_readout.detach()
+            self.readout_drift = readout_drift.detach()
         # Expose the segment-total log π sum for phase-2 GRPO readers. Keep
         # graph-connected (do NOT detach) — the policy gradient needs
         # backward to flow through log_pi_sum into the modulator logits.

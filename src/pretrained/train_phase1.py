@@ -11,8 +11,8 @@ Per-step contract:
     7. wrapper.detach_memory() for TBPTT boundary
     8. anneal Gumbel tau if requested
 
-No autocast wrapping here — callers pass a wrapper already in the right
-dtype (bf16 on CUDA, fp32 on CPU). The phase-1 run script sets this up.
+On CUDA the loop wraps forward in bf16 autocast. Callers only need to put
+the wrapper on the desired device.
 
 This module is intentionally small. No telemetry JSONL, no checkpointing,
 no distributed. Call it from a driver script that adds those layers.
@@ -84,6 +84,7 @@ def run_phase1(
     """
     anneal_across_steps = anneal_across_steps or steps
     wrapper.train()
+    device = next(wrapper.parameters()).device
     device_type = next(wrapper.parameters()).device.type
     # Llama is loaded in fp32 and memory state is bf16 on CUDA. Without
     # autocast, every W_in/W_out crossing does an explicit fp32↔bf16 round
@@ -95,9 +96,10 @@ def run_phase1(
 
     for step in range(steps):
         batch = next(data_iter)
-        input_ids = batch.input_ids
-        target_ids = batch.target_ids
-        prev_token = batch.prev_token
+        input_ids = batch.input_ids.to(device)
+        target_ids = batch.target_ids.to(device)
+        prev_token = (batch.prev_token.to(device)
+                      if batch.prev_token is not None else None)
 
         tau = anneal_gumbel_tau(step, anneal_across_steps,
                                 gumbel_tau_start, gumbel_tau_end)

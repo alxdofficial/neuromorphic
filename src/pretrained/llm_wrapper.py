@@ -2,7 +2,7 @@
 
 Public API:
     wrapper = PretrainedLMWithMemory(config)
-    out = wrapper(input_ids)                # returns (logits, mem_pred_loss)
+    out = wrapper(input_ids)                # returns HF ModelOutput with `.logits`
     wrapper.reset_memory(bs)                # zero memory state for batch
     wrapper.detach_memory()                  # TBPTT boundary
 
@@ -83,6 +83,13 @@ class PretrainedLMWithMemory(nn.Module):
         # Categorical with log_pi tracking for REINFORCE/GRPO rollouts.
         # Flip via `wrapper.current_phase = "phase2"` before phase-2 runs.
         self.current_phase: str = "phase1"
+        # When True, memory.forward_segment keeps state graph-connected
+        # across calls — no detach at end, no intra-call tbptt detach.
+        # Used by autoregressive phase-1 unroll so gradient from each
+        # continuation token reaches the prefix's modulator fires.
+        # Caller is responsible for calling `detach_memory()` after
+        # backward completes.
+        self._preserve_memory_graph: bool = False
 
     @property
     def mem_inject(self) -> MemInjectLayer:
@@ -120,7 +127,8 @@ class PretrainedLMWithMemory(nn.Module):
                 prev_token=prev_token,
                 use_rmsnorm=use_rms,
                 rms_eps=self._rms_eps,
-                phase=self.current_phase)
+                phase=self.current_phase,
+                preserve_graph=self._preserve_memory_graph)
             self._last_mem_pred_loss = mem_loss
             return readouts
 
@@ -136,3 +144,67 @@ class PretrainedLMWithMemory(nn.Module):
         for name, p in self.named_parameters():
             if p.requires_grad:
                 yield name, p
+
+    # ------------------------------------------------------------------
+    # Freeze controls — mirror the old main's cycle semantics. Bootstrap
+    # trains everything; cycle phase-1 freezes codebook + decoder; cycle
+    # phase-2 GRPO freezes everything except the modulator's logit head.
+    # ------------------------------------------------------------------
+
+    def freeze_codebook_decoder(self):
+        """Freeze codebook + DirectDecoder. The rest of memory + W_in/W_out/
+        scale keep training. Used for cycle phase-1."""
+        if self.memory is None:
+            return
+        for p in self.memory.discrete_policy.parameters():
+            p.requires_grad = False
+        for p in self.memory.decoder.parameters():
+            p.requires_grad = False
+
+    def freeze_all_but_logit_head(self):
+        """Freeze everything except the modulator's logit_head. Matches the
+        old main's `phase 2 = GRPO on logit head only` semantics — most
+        restrictive update surface for stable policy-gradient training."""
+        if self.memory is None:
+            return
+        for _, p in self.trainable_parameters():
+            p.requires_grad = False
+        for p in self.memory.modulator.logit_head.parameters():
+            p.requires_grad = True
+
+    def unfreeze_all(self):
+        """Re-enable gradient on everything that's trainable by default.
+        Use to restore the bootstrap training surface."""
+        if self.config.freeze_backbone:
+            for p in self.llama.parameters():
+                p.requires_grad = False
+        else:
+            for p in self.llama.parameters():
+                p.requires_grad = True
+        if self.memory is not None:
+            for p in self.memory.parameters():
+                p.requires_grad = True
+        self.mem_inject.W_in.weight.requires_grad = True
+        self.mem_inject.W_out.weight.requires_grad = True
+        self.mem_inject.scale.requires_grad = True
+
+    def preserve_memory_graph(self):
+        """Context manager: within the block, memory.forward_segment keeps
+        state graph-connected across calls. Needed for autoregressive
+        phase-1 unroll where continuation-token gradient must reach the
+        prefix-pass modulator fires."""
+        return _PreserveMemoryGraph(self)
+
+
+class _PreserveMemoryGraph:
+    def __init__(self, wrapper: "PretrainedLMWithMemory"):
+        self.wrapper = wrapper
+        self._prior = wrapper._preserve_memory_graph
+
+    def __enter__(self):
+        self.wrapper._preserve_memory_graph = True
+        return self.wrapper
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.wrapper._preserve_memory_graph = self._prior
+        return False

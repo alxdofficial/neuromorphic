@@ -60,6 +60,8 @@ def autoregressive_rollout(
     """
     assert prefix_ids.dim() == 2 and prefix_ids.shape[0] == 1, (
         f"prefix_ids must be [1, T_prefix]; got {tuple(prefix_ids.shape)}")
+    device = next(wrapper.parameters()).device
+    prefix_ids = prefix_ids.to(device)
     K = num_rollouts
     T_prefix = prefix_ids.shape[1]
     device = prefix_ids.device
@@ -79,6 +81,7 @@ def autoregressive_rollout(
     # otherwise memory's per-token LIF would re-run on all prefix tokens
     # at every gen step and its state would drift uncontrollably.
     prior_phase = wrapper.current_phase
+    prior_training = wrapper.training
     wrapper.current_phase = "phase2"
     wrapper.train(True)
     with torch.no_grad():
@@ -108,6 +111,7 @@ def autoregressive_rollout(
         generated.append(sampled)
 
     gen_tensor = torch.cat(generated, dim=1)     # [K, gen_length]
+    wrapper.train(prior_training)
     return RolloutResult(
         generated_ids=gen_tensor,
         prefix_ids=prefix_rep,

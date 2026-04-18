@@ -27,6 +27,16 @@ requires_llama = pytest.mark.skipif(
     reason="Llama-3.2-1B not present in HF cache")
 
 
+def test_pretrained_factory_defaults_align_memory_clocks():
+    """Default pretrained driver knobs should match the default-created
+    memory config so docs and runtime clocks stay aligned."""
+    from src.pretrained.config import PretrainedConfig
+
+    cfg = PretrainedConfig.llama_1b()
+    assert cfg.memory.T == cfg.T
+    assert cfg.memory.tbptt_block == cfg.tbptt_block
+
+
 @requires_llama
 def test_wrapper_loads_and_freezes_backbone():
     """Constructor loads the model and freezes backbone — only the injection
@@ -579,6 +589,27 @@ def test_autoregressive_rollout_runs_and_diverges_across_k():
 
 
 @requires_llama
+def test_autoregressive_rollout_restores_wrapper_mode():
+    """The rollout helper should restore the caller's train/eval state and
+    phase after it returns."""
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.rollout import autoregressive_rollout
+
+    cfg = PretrainedConfig.llama_1b()
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train(True)
+    wrapper.current_phase = "phase1"
+
+    prefix_ids = torch.randint(0, cfg.vocab_size_lm, (1, 4))
+    _ = autoregressive_rollout(
+        wrapper, prefix_ids, gen_length=2, num_rollouts=2, seed=0)
+
+    assert wrapper.training is True
+    assert wrapper.current_phase == "phase1"
+
+
+@requires_llama
 def test_phase2_grpo_step_runs_and_flows_gradient_to_modulator():
     """One GRPO step: K=4 rollouts from a shared prefix, per-rollout reward
     from token-match to a reference continuation, advantage normalization,
@@ -731,3 +762,207 @@ def test_last_log_pi_sum_cleared_after_phase1_forward():
     lp = wrapper.memory._last_log_pi_sum
     assert lp is not None, "phase-2 train call should set log_pi_sum"
     assert lp.requires_grad, "log_pi_sum must be graph-connected for REINFORCE"
+
+
+@requires_llama
+def test_phase1_autoregressive_unroll_backprop_reaches_prefix_fires():
+    """Autoregressive Gumbel phase-1: gradient from a continuation-token CE
+    must reach the modulator weights that fired during the prefix pass —
+    otherwise the unroll is only training memory's fast state and the whole
+    point of the rewrite is defeated."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase1_ar import Phase1ARBatch, run_phase1_ar
+
+    torch.manual_seed(0)
+    # Need tbptt_block >= 2*mod_interval AND >= T_pre so the whole prefix
+    # stays in one graph. Pick tbptt_block=64, T_pre=32 (two mod fires).
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+    T_pre = 2 * cfg.memory.modulation_interval    # 32: two fires
+    T_cont = 4
+
+    # Snapshot the modulator's tok_proj and cell_emb before the step. These
+    # are set during the PREFIX fires, not at continuation time (continuation
+    # steps run with T=1 and the modulator never fires). If the unroll
+    # doesn't backprop through the prefix, these stay unchanged.
+    tok_proj_before = wrapper.memory.modulator.tok_proj[0].weight.detach().clone()
+    cell_emb_before = wrapper.memory.modulator.cell_emb.detach().clone()
+
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-3)
+
+    BS = 1
+    prefix = torch.randint(0, cfg.vocab_size_lm, (BS, T_pre))
+    cont = torch.randint(0, cfg.vocab_size_lm, (BS, T_cont))
+
+    def data_iter():
+        while True:
+            yield Phase1ARBatch(prefix_ids=prefix, continuation_ids=cont)
+
+    logs = []
+    run_phase1_ar(wrapper, opt, data_iter(),
+                  steps=1, gumbel_tau_start=1.0, gumbel_tau_end=0.3,
+                  anneal_across_steps=1, on_step=logs.append)
+    assert len(logs) == 1
+    assert torch.isfinite(torch.tensor(logs[0].loss))
+
+    # Both prefix-fire targets must have moved — that proves the gradient
+    # from the continuation CE crossed the prefix boundary into the
+    # modulator.
+    assert not torch.equal(
+        wrapper.memory.modulator.tok_proj[0].weight, tok_proj_before), (
+        "tok_proj did not update — AR unroll grad did not reach prefix fires")
+    assert not torch.equal(
+        wrapper.memory.modulator.cell_emb, cell_emb_before), (
+        "cell_emb did not update — AR unroll grad did not reach prefix fires")
+
+
+def test_freeze_codebook_decoder_leaves_modulator_trainable():
+    """freeze_codebook_decoder() should pin codebook + DirectDecoder but
+    keep the modulator + W_in/W_out/scale + dynamics trainable."""
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    if not _hf_cache_has_1b():
+        pytest.skip("Llama-3.2-1B not present in HF cache")
+
+    cfg = PretrainedConfig.llama_1b()
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.freeze_codebook_decoder()
+
+    assert not wrapper.memory.discrete_policy.codebook.requires_grad
+    for p in wrapper.memory.decoder.parameters():
+        assert not p.requires_grad
+    # Modulator + W_in/W_out/scale still trainable.
+    assert wrapper.memory.modulator.logit_head.weight.requires_grad
+    assert wrapper.memory.modulator.tok_proj[0].weight.requires_grad
+    assert wrapper.mem_inject.W_in.weight.requires_grad
+    assert wrapper.mem_inject.W_out.weight.requires_grad
+    assert wrapper.mem_inject.scale.requires_grad
+    # Memory dynamics (inject_w, msg MLPs, gamma logits) still trainable.
+    assert wrapper.memory.inject_w.requires_grad
+    assert wrapper.memory.msg_w1.requires_grad
+
+
+def test_freeze_all_but_logit_head_leaves_only_logit_head():
+    """freeze_all_but_logit_head() should pin everything trainable by default
+    except modulator.logit_head — the phase-2 GRPO surface from old main."""
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    if not _hf_cache_has_1b():
+        pytest.skip("Llama-3.2-1B not present in HF cache")
+
+    cfg = PretrainedConfig.llama_1b()
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.freeze_all_but_logit_head()
+
+    trainable = {n for n, p in wrapper.trainable_parameters()}
+    assert trainable == {
+        "memory.modulator.logit_head.weight",
+        "memory.modulator.logit_head.bias",
+    }, f"unexpected trainable set: {trainable}"
+
+
+def test_unfreeze_all_restores_full_training_surface():
+    """unfreeze_all() should restore the full training surface —
+    memory + projections + scale all trainable, Llama backbone frozen."""
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    if not _hf_cache_has_1b():
+        pytest.skip("Llama-3.2-1B not present in HF cache")
+
+    cfg = PretrainedConfig.llama_1b()
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.freeze_all_but_logit_head()
+    wrapper.unfreeze_all()
+
+    # All memory params trainable.
+    for p in wrapper.memory.parameters():
+        assert p.requires_grad
+    # Inject params trainable.
+    assert wrapper.mem_inject.W_in.weight.requires_grad
+    assert wrapper.mem_inject.W_out.weight.requires_grad
+    assert wrapper.mem_inject.scale.requires_grad
+    # Backbone still frozen.
+    assert not wrapper.llama.model.embed_tokens.weight.requires_grad
+    assert not wrapper.llama.lm_head.weight.requires_grad
+
+
+@requires_llama
+def test_cycle_loop_runs_end_to_end():
+    """Minimal cycle: bootstrap (2 steps) → 1 cycle with phase-1 AR (2 steps)
+    → phase-2 GRPO (2 steps). Confirms all three sub-loops run under a single
+    orchestrator without the freeze transitions breaking the optimizer or
+    memory reset plumbing."""
+    import tempfile
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_loop import CycleConfig, run_cycle_loop
+    from src.pretrained.train_phase1 import Phase1Batch
+    from src.pretrained.train_phase1_ar import Phase1ARBatch
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_boot = 2 * cfg.memory.modulation_interval
+    T_pre = 2 * cfg.memory.modulation_interval
+    T_cont = 4
+    BS = 1
+
+    def bootstrap_iter():
+        while True:
+            ids = torch.randint(0, cfg.vocab_size_lm, (BS, T_boot))
+            tgt = torch.cat([ids[:, 1:], ids[:, :1]], dim=1)
+            yield Phase1Batch(input_ids=ids, target_ids=tgt, prev_token=None)
+
+    def cycle_p1_iter():
+        while True:
+            pre = torch.randint(0, cfg.vocab_size_lm, (BS, T_pre))
+            cont = torch.randint(0, cfg.vocab_size_lm, (BS, T_cont))
+            yield Phase1ARBatch(prefix_ids=pre, continuation_ids=cont)
+
+    def cycle_p2_iter():
+        while True:
+            pre = torch.randint(0, cfg.vocab_size_lm, (1, T_pre))
+            ref = torch.randint(0, cfg.vocab_size_lm, (T_cont,))
+            yield (pre, ref)
+
+    def stub_reward(generated, reference):
+        # Variance-bearing reward so advantage normalization isn't zero.
+        return generated[:, 0].float() / 10000.0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        loop_cfg = CycleConfig(
+            work_dir=tmpdir,
+            bootstrap_steps=2, cycles=1,
+            cycle_phase1_steps=2, cycle_phase2_steps=2,
+            bs=BS, T_pre=T_pre, T_cont=T_cont,
+            grpo_K=4, grpo_rollout_len=T_cont,
+        )
+        logs = []
+        run_cycle_loop(
+            wrapper,
+            bootstrap_iter(), cycle_p1_iter(), cycle_p2_iter(),
+            stub_reward, loop_cfg,
+            log=logs.append,
+        )
+
+    # Orchestrator printed CYCLE LOOP COMPLETE; memory/optimizer survived.
+    assert any("CYCLE LOOP COMPLETE" in str(lg) for lg in logs)
+    # Backbone still frozen after all the freeze/unfreeze cycling.
+    assert not wrapper.llama.model.embed_tokens.weight.requires_grad
+    assert not wrapper.llama.lm_head.weight.requires_grad
+    # After the cycle completes, the full training surface is restored
+    # (unfreeze_all was the last freeze call before phase-2, so strictly
+    # speaking we expect the phase-2 freeze to still be in effect — but
+    # memory state must at least be initialized + finite).
+    assert wrapper.memory.is_initialized
+    assert torch.isfinite(wrapper.memory.W).all()

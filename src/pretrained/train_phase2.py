@@ -14,9 +14,9 @@ Per step:
     4. Compute per-rollout reward = token-level match with the reference
        continuation. Richer rewards (BLEU, self-BLEU, task-specific
        metrics) can slot in here without changing the rest of the loop.
-    5. Advantage = (reward - mean) / (std + eps).
+    5. Advantage = (reward - mean) / max(std, adv_std_floor).
     6. Loss = -(log_pi_sum * advantage.detach()).mean().
-       Optionally add KL penalty vs a reference policy (future work).
+       KL / entropy regularizers are intentionally not wired yet.
     7. Backward, clip, step, detach memory.
 
 The critical "break verify_01" property: step 3 GENERATES tokens under
@@ -112,6 +112,9 @@ def grpo_step(
     seed: int | None = None,
 ) -> GrpoStepLog:
     assert prefix_ids.dim() == 2 and prefix_ids.shape[0] == 1
+    device = next(wrapper.parameters()).device
+    prefix_ids = prefix_ids.to(device)
+    reference_cont = reference_cont.to(device)
     K = num_rollouts
     T_prefix = prefix_ids.shape[1]
     device = prefix_ids.device

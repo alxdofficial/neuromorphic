@@ -1,7 +1,8 @@
 # Pretrained-LM + Memory Graph
 
 **Branch:** `pretrained-lm-memory-v2`.
-**Status:** smoke-clean on CPU. No GPU run yet.
+**Status:** pretrained smoke suite passes on CPU (`tests/test_pretrained_smoke.py`).
+No dedicated GPU smoke is wired on this branch yet.
 
 This doc describes how the memory graph (from the from-scratch attention-neuromod
 work — see `design.md` for its internals) is grafted onto a pretrained Llama-3.2
@@ -132,19 +133,39 @@ surprise signal. Llama path passes `use_rmsnorm=True, rms_eps=1e-5`.
 
 ## 5. Phase 1 — Gumbel-soft backprop bootstrap
 
-Goal: make the memory write useful code-conditioned ΔW, so that by end
-of phase 1 the memory-augmented LM beats vanilla Llama by at least
-~0.2 nats of CE on held-out evaluation.
+Phase 1 has two variants. The **bootstrap / parallel** version is fast
+and used for the one-time cold-start pass; the **autoregressive unroll**
+version is the per-cycle training procedure that actually teaches memory
+to use its past writes.
+
+### Why two variants
+
+The host Llama is already coherent at teacher-forced next-token
+prediction. If phase 1 trains memory only on parallel teacher-forced CE,
+memory's gradient signal is "improve predictions where the LM already
+sees the ground-truth prefix" — memory adds a marginal CE improvement
+on a distribution memory won't face at inference. The autoregressive
+unroll flips the signal to "use the writes you made during the prefix
+to predict the CONTINUATION, one token at a time, with each
+prediction's gradient reaching back through memory's state evolution to
+the prefix fires."
+
+Bootstrap uses the parallel variant because it's ~T_cont× faster and the
+modulator needs a coarse first-pass calibration before the long-range
+signal matters. Cycle phase-1 uses the autoregressive variant.
 
 ### Protocol
 
 - **Loss**:  `L = CE(logits, target_ids) + 0.1 · mem_pred_loss`
-  - CE is standard next-token prediction on `target_ids = input_ids[..., 1:]`.
+  - CE is standard next-token prediction on the externally-supplied
+    `target_ids`.
   - `mem_pred_loss` is a memory-side auxiliary: memory's own readout goes
-    through `W_out → llama.norm → lm_head` and is CE'd against the same
-    targets. This couples memory's readout space to the LM's prediction
-    space and gives a direct gradient from the memory graph to its own
-    writes without having to go through the injection gate.
+    through `W_out → llama.norm → lm_head` and is CE'd against the
+    shifted stream tokens `input_ids` inside `forward_segment`
+    (`readout[t-1] -> input_ids[t]`, with token 0 masked by `prev_token` /
+    segment start rules). This couples memory's readout space to the LM's
+    prediction space and gives a direct gradient from the memory graph to
+    its own writes without having to go through the injection gate.
 
 - **Sampling**: Gumbel-softmax with hard straight-through. Gradient flows
   through the soft distribution back to modulator logits; forward uses
@@ -153,13 +174,15 @@ of phase 1 the memory-augmented LM beats vanilla Llama by at least
   `anneal_across_steps` (typically < total steps so it pins before decay
   completes).
 - **TBPTT**: detach memory state (`h`, `msg`, `W`, `decay`, `hebbian`,
-  `prev_readout`, `s_mem_*`) every `tbptt_block = 32` tokens within a
+  `prev_readout`, `s_mem_*`) every `cfg.memory.tbptt_block` tokens within a
   segment. `forward_segment` also detaches the persistent state across
-  segments.
+  segments. The default factories (`llama_1b()` / `llama_3b()`) mirror the
+  top-level pretrained default into the default-created memory config, so
+  the out-of-the-box detach cadence is `32`.
   - **Invariant**: `tbptt_block >= 2 · modulation_interval`. Otherwise
     the modulator's last write lands on the boundary and its gradient
     gets severed before any readout consumes it. Validated in
-    `Config.validate()`.
+    `src/model/config.py:Config.validate()`.
 
 - **Autocast**: on CUDA, `torch.autocast(cuda, bfloat16)` wraps the
   forward. Llama weights stay fp32; memory state runs bf16; autocast
@@ -172,15 +195,17 @@ of phase 1 the memory-augmented LM beats vanilla Llama by at least
 
 | Knob                       | Default | Notes |
 |----------------------------|---------|-------|
-| `T` (segment length)       | 512     | rolling window ≤ Llama context |
+| `T` (segment length)       | 512     | driver default; runtime uses the actual batch length passed to `wrapper(...)` |
 | `BS`                       | 16      | phase 1 |
-| `tbptt_block`              | 16      | within-segment detach |
+| `tbptt_block`              | 32      | mirrored into the default-created `cfg.memory.tbptt_block` |
 | Gumbel `τ_start → τ_end`   | 1.0 → 0.3 |  |
 | `mem_pred_weight`          | 0.1     |  |
 | `max_grad_norm`            | 1.0     |  |
 
-*(Those are the `PretrainedConfig` defaults. The tier_tiny memory config
-has a much smaller `T=8` for unit tests only.)*
+*(Those are the `PretrainedConfig` defaults used by the factory-created
+memory config. If you pass an explicit `memory=...`, its low-level clocks
+(`T`, `tbptt_block`, `modulation_interval`) take precedence and you are
+responsible for keeping them aligned with your driver defaults.)*
 
 ### Entry point
 
@@ -202,6 +227,69 @@ run_phase1(wrapper, opt, data_iter(), steps=N, mem_pred_weight=0.1,
            gumbel_tau_start=1.0, gumbel_tau_end=0.3,
            anneal_across_steps=int(0.9*N),
            on_step=lambda log: print(log))
+```
+
+### Autoregressive unroll variant (`run_phase1_ar`)
+
+**Per step**:
+
+1. `wrapper.reset_memory(bs=BS)`.
+2. Enter `wrapper.preserve_memory_graph()` — memory state will stay
+   graph-connected across the prefix pass and the per-continuation-token
+   forwards.
+3. **Prefix pass** (parallel teacher-forced, Gumbel-soft at each
+   modulator fire): `wrapper(prefix_ids, use_cache=True)`. Memory fires
+   `T_pre / modulation_interval` times; each fire writes ΔW / Δdecay
+   with gradient hooks back to the modulator logits. `past_key_values`
+   is captured for the unroll.
+4. **Continuation unroll** (autoregressive, teacher-forced inputs):
+   for `i = 0, 1, …, T_cont - 1`:
+     - Feed ground-truth token `cont_ids[:, i:i+1]` with
+       `past_key_values` → `out_i`.
+     - Memory runs one LIF step on the carried graph-connected state.
+       No modulator fire (the mod clock never reaches `mod_interval`
+       from a fresh `start_t=offset=0` at `T=1`).
+     - Compute CE of `out_i.logits[:, -1]` against `cont_ids[:, i+1]`
+       (for the last step, use the prefix's last-position logits vs
+       `cont_ids[:, 0]` — see `train_phase1_ar.py`).
+5. Loss = mean CE over the T_cont continuation predictions.
+6. `loss.backward()`. Gradient flow:
+   - CE at step `i` → step-`i` logit → Llama layers L+1..N-1 → MemInject
+     residual at step `i` → `W_out(readout_i)` → memory `h_i` → memory
+     `h_{i-1}` → … → memory state at prefix-end → back through every
+     prefix-fire's modulator write to modulator parameters.
+7. Clip, `opt.step()`, `wrapper.detach_memory()` (undoes the
+   preserve-graph persistence).
+
+**Invariants**:
+
+- `cfg.memory.tbptt_block >= T_pre`. Intra-call detach inside
+  `_run_block` is also bypassed when `preserve_graph=True`, but an
+  unrelated tbptt detach at `t=T_pre` would otherwise sever the prefix
+  graph before the continuation reads from it.
+- Unroll length `T_cont` is capped by VRAM: every unroll step's forward
+  graph is held until backward. For production runs at `T_cont >> 16`,
+  wrap the per-step forward in `torch.utils.checkpoint.checkpoint` to
+  trade recompute for activation memory. The current implementation
+  does not do this yet — smoke runs stay at `T_cont = 4..16`.
+- Memory's slow state (`W`, `decay`, `hebbian`) is **frozen** during
+  the unroll. The writes that shape each continuation step came from
+  the prefix pass. This is the training signal: "prefix writes shape
+  continuation logits."
+
+**Entry point**:
+
+```python
+from src.pretrained.train_phase1_ar import Phase1ARBatch, run_phase1_ar
+
+def data_iter():
+    # yield Phase1ARBatch(prefix_ids=[BS,T_pre], continuation_ids=[BS,T_cont])
+    ...
+
+run_phase1_ar(wrapper, opt, data_iter(), steps=N,
+              gumbel_tau_start=1.0, gumbel_tau_end=0.3,
+              anneal_across_steps=int(0.9*N),
+              on_step=lambda log: print(log))
 ```
 
 ---
@@ -304,25 +392,97 @@ for step in range(N):
 
 ---
 
+## 6.5. Cycle orchestrator — bootstrap → cycles
+
+`src/pretrained/train_loop.py` interleaves the three sub-loops. Matches
+the `abandoned/main-v2:src/train_loop.py` structure, adapted for the
+frozen-Llama setup.
+
+### Stages
+
+| Stage          | Trainable                                               | Loop               |
+|----------------|---------------------------------------------------------|--------------------|
+| Bootstrap      | full surface: memory + W_in/W_out/scale                 | `run_phase1`       |
+| Cycle phase-1  | all except codebook + DirectDecoder                     | `run_phase1_ar`    |
+| Cycle phase-2  | only `modulator.logit_head` (weight + bias)             | `grpo_step`        |
+
+Between stages, `wrapper.unfreeze_all()` resets `requires_grad` to the
+default surface, then the stage-specific freeze helper locks the
+appropriate subset. A fresh optimizer is constructed each stage so
+Adam momentum from now-frozen params doesn't leak forward.
+
+### Per-cycle contract
+
+Bootstrap trains the code vocabulary and ΔW emission shape from scratch
+(~500M tokens in production). Once it has stabilized:
+
+- **Cycle phase-1** keeps the code vocabulary + ΔW emission fixed
+  (codebook + decoder frozen) and trains the modulator + memory
+  dynamics + W_in/W_out/scale via the AR unroll. Gradient signal is
+  "given the codes you sampled during the prefix, which ones actually
+  help predict the continuation I'm going to roll out?" The codebook
+  itself is frozen so the modulator's logits are learning to ADDRESS
+  stable codes; otherwise code semantics would drift under phase-2 GRPO.
+- **Cycle phase-2** freezes everything except `logit_head` and runs
+  hard-Categorical GRPO rollouts. The modulator's body (attention, FFN,
+  `tok_proj`, `cell_emb`) is fixed; only the final linear that maps
+  pooled features → code logits gets the REINFORCE gradient. Minimum
+  possible trainable surface for stability under high-variance policy
+  gradient.
+
+### Entry point
+
+```python
+from src.pretrained.train_loop import CycleConfig, run_cycle_loop
+
+cfg = CycleConfig(
+    work_dir="outputs/pretrained_cycle",
+    bootstrap_steps=5000, cycles=5,
+    cycle_phase1_steps=1000, cycle_phase2_steps=2000,
+    bs=16, T_pre=256, T_cont=64,
+    grpo_K=8, grpo_rollout_len=128,
+)
+run_cycle_loop(
+    wrapper,
+    bootstrap_iter,            # yields Phase1Batch (parallel teacher-forced)
+    cycle_p1_iter,             # yields Phase1ARBatch (prefix + continuation)
+    cycle_p2_iter,             # yields (prefix_ids, reference_continuation)
+    reward_fn=my_reward_fn,
+    cfg=cfg,
+)
+```
+
+Caller owns the data loaders. The orchestrator has a `__main__` guard
+that raises `NotImplementedError` — the CLI wrapper is deliberately not
+built because real data pipelines vary (wikitext vs a custom corpus vs
+a long-context bench) and there's no single-size-fits-all CLI to wire.
+
+---
+
 ## 7. What's built vs what's not
 
-| Component                             | State          |
-|---------------------------------------|----------------|
+| Component                              | State          |
+|----------------------------------------|----------------|
 | Wrapper + freeze + scale-zero identity | ✓ smoke-covered |
 | MemInjectLayer + W_in/W_out/scale      | ✓ smoke-covered |
 | Llama adapter (RMSNorm path)           | ✓ smoke-covered |
 | Memory integration end-to-end          | ✓ smoke-covered |
-| Phase-1 `run_phase1()` loop            | ✓ smoke-covered (synthetic + real wikitext) |
+| Phase-1 parallel `run_phase1()`        | ✓ smoke-covered (synthetic + real wikitext) |
+| Phase-1 AR unroll `run_phase1_ar()`    | ✓ smoke-covered (grad reaches prefix-fire modulator) |
+| Freeze helpers (codebook+decoder / logit-head-only / all) | ✓ smoke-covered |
+| `preserve_memory_graph()` context      | ✓ smoke-covered (AR unroll uses it) |
 | Autoregressive rollout primitive       | ✓ smoke-covered (K divergence) |
 | Phase-2 `grpo_step()` loop             | ✓ smoke-covered (stub reward, gradient reaches modulator + codebook) |
 | Advantage-std floor for stability      | ✓ smoke-covered (near-uniform rewards clamped) |
 | `_last_log_pi_sum` phase gating        | ✓ smoke-covered (None after phase-1 / eval) |
+| Cycle loop `run_cycle_loop()`          | ✓ smoke-covered (bootstrap → cycle p1 AR → cycle p2 GRPO) |
 | Llama tokenizer presets                | ✓ in `src/data/tokenizer.py` |
-| CLI driver (phase 1 + phase 2)         | ✗ not built |
+| CLI driver data wiring                 | ✗ `train_loop.py` has `__main__` guard — callers must wire their own iterators |
 | Real phase-1 data shards (100M tokens) | ✗ not built — smoke streams wikitext-2 in memory |
 | Production phase-2 reward              | ✗ token-match is a smoke placeholder |
 | KL penalty vs reference policy         | ✗ not wired — needs reference modulator snapshot + per-fire logit re-eval |
 | Entropy bonus                          | ✗ not wired — needs per-fire logits from `_modulate` |
+| Gradient checkpointing on AR unroll    | ✗ `T_cont` bounded by VRAM until wired |
 | Checkpoint save/load                   | ✗ not built |
 | GPU smoke                              | ✗ all current smokes are CPU |
 
@@ -330,12 +490,22 @@ for step in range(N):
 
 ## 8. Known invariants / footguns
 
-- `tbptt_block >= 2 · modulation_interval`. Enforced in `Config.validate()`.
+- `tbptt_block >= 2 · modulation_interval`. Enforced on the memory config in
+  `src/model/config.py`. The pretrained factories mirror the default
+  top-level `tbptt_block` into default-created memory; explicit
+  `memory=...` overrides are caller-owned.
+- Runtime event clocks follow the actual segment length passed to
+  `wrapper(...)`, not just `cfg.memory.T`. The factory mirrors the default
+  top-level `T` into default-created memory so validation/docs stay aligned,
+  but custom batchers can still choose a different segment length.
 - Llama loaded `torch_dtype=torch.float32`. Memory state is bf16 on CUDA.
   Without autocast, the round-trip through `W_in/W_out` truncates small
   gradients. `run_phase1` and `grpo_step` wrap their forward passes in
   `torch.autocast(device_type, bfloat16)` on CUDA; CPU uses a null
   context.
+- `run_phase1`, `grpo_step`, and `autoregressive_rollout` move their input
+  tensors onto the wrapper's device internally. They are still small loop
+  utilities, not full dataloader / checkpoint drivers.
 - `MemInjectLayer` raises if `memory_fn is None and scale != 0`. The
   `attach_memory=False` constructor path pins `scale=0` so the
   transparent bypass remains valid.
@@ -348,6 +518,16 @@ for step in range(N):
   `phase2` hard Categorical + log_pi). The `grpo_step` sets it for the
   prefix pass; `autoregressive_rollout` sets and restores it around
   the primitive.
+- `grpo_step()` uses whatever parameters the caller put in its optimizer.
+  The example uses `wrapper.trainable_parameters()`, so current phase 2 is
+  **not** policy-head-only by default: `W_in/W_out/scale`, memory inject,
+  decoder, codebook, and modulator can all move if their gradients are
+  non-zero.
+- `grpo_step()` must run the prefix pass under `wrapper.train(True)` to hit
+  the hard-Categorical phase-2 sampling path. That also leaves the
+  modulator's attention dropout active when `cfg.memory.attn_dropout > 0`,
+  so phase-2 rollouts currently include extra stochasticity beyond the
+  sampled discrete codes.
 - `memory._last_log_pi_sum` is **only** written on phase-2 training
   forwards. Phase-1 / eval forwards set it to `None`. Read it
   immediately after the phase-2 prefix pass; don't hold the attribute

@@ -35,6 +35,9 @@ class PretrainedConfig:
     # If d_lm == d_mem, projections are still Linear (trainable) but identity-init.
     d_mem: int = 2048
     # Full memory config. `validate()` enforces D_mem divisibility etc.
+    # When callers use llama_1b()/llama_3b() without an explicit `memory=...`,
+    # the factory mirrors the top-level driver defaults (e.g. T, tbptt_block)
+    # into this config so docs and runtime clocks stay aligned.
     memory: MemoryConfig = field(default_factory=lambda: MemoryConfig())
 
     # === Inject gate ===
@@ -44,9 +47,9 @@ class PretrainedConfig:
     scale_init: float = 2.0
 
     # === Phase 1 (bootstrap) ===
-    T: int = 512              # segment length
-    bs: int = 16              # batch size
-    tbptt_block: int = 16     # detach boundary within segment
+    T: int = 512              # default segment length for phase-1 drivers
+    bs: int = 16              # default batch size for phase-1 drivers
+    tbptt_block: int = 32     # default detach boundary for default-created memory
     gumbel_tau_start: float = 1.0
     gumbel_tau_end: float = 0.3
     mem_pred_weight: float = 0.1
@@ -88,7 +91,11 @@ class PretrainedConfig:
             d_mem=2048,
         )
         defaults.update(kw)
-        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(D=defaults["d_mem"])
+        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(
+            D=defaults["d_mem"],
+            T=defaults.get("T", 512),
+            tbptt_block=defaults.get("tbptt_block", 32),
+        )
         c = cls(memory=mem, **defaults)
         c.validate()
         return c
@@ -102,7 +109,11 @@ class PretrainedConfig:
             d_mem=2048,
         )
         defaults.update(kw)
-        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(D=defaults["d_mem"])
+        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(
+            D=defaults["d_mem"],
+            T=defaults.get("T", 512),
+            tbptt_block=defaults.get("tbptt_block", 32),
+        )
         c = cls(memory=mem, **defaults)
         c.validate()
         return c
