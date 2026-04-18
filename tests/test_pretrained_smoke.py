@@ -576,3 +576,70 @@ def test_autoregressive_rollout_runs_and_diverges_across_k():
         if any_diff:
             break
     assert any_diff, "K rollouts all produced identical token streams"
+
+
+@requires_llama
+def test_phase2_grpo_step_runs_and_flows_gradient_to_modulator():
+    """One GRPO step: K=4 rollouts from a shared prefix, per-rollout reward
+    from token-match to a reference continuation, advantage normalization,
+    policy-gradient loss backward. Must produce finite loss, a non-zero
+    log π sum, and gradient on the modulator + codebook (the REINFORCE
+    signal's actual targets)."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase2 import grpo_step
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg)
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_prefix = 2 * cfg.memory.modulation_interval     # 32
+    gen_length = 4
+    K = 4
+    prefix_ids = torch.randint(0, cfg.vocab_size_lm, (1, T_prefix))
+    reference = torch.randint(0, cfg.vocab_size_lm, (gen_length,))
+
+    trainable = [p for _, p in wrapper.trainable_parameters()]
+    opt = torch.optim.AdamW(trainable, lr=1e-4)
+
+    # Capture a snapshot of codebook + modulator logit_head for post-step
+    # diff check (GRPO signal must actually reach these).
+    codebook_before = wrapper.memory.discrete_policy.codebook.detach().clone()
+    logit_head_before = wrapper.memory.modulator.logit_head.weight.detach().clone()
+
+    # Token-match reward on a random reference over a 128K vocab is ~0 for
+    # every rollout (K=4 × length=4 matches vs 128K-way choice). That's
+    # a real-world problem for GRPO smokes — no signal means no gradient.
+    # For the smoke we want to verify PLUMBING: rollouts diverge → a
+    # variance-bearing reward produces non-zero advantages → log_pi
+    # backward reaches modulator. Use a reward tied to the first
+    # generated token id (divergent rollouts → divergent first tokens →
+    # divergent rewards).
+    def stub_reward_fn(generated, reference):
+        return generated[:, 0].float() / 10000.0   # [K], finite variance
+
+    log = grpo_step(
+        wrapper, opt,
+        prefix_ids=prefix_ids, reference_cont=reference,
+        num_rollouts=K, gen_length=gen_length, temperature=1.0,
+        reward_fn=stub_reward_fn,
+        seed=42,
+    )
+
+    assert torch.isfinite(torch.tensor(log.loss))
+    assert torch.isfinite(torch.tensor(log.log_pi_mean))
+    # Log π sum over a real segment must be strictly negative on average
+    # (log-probs of sampled categoricals over K=2048 classes).
+    assert log.log_pi_mean < 0
+    # Stub reward has variance by construction (different first tokens
+    # across K rollouts) so advantage magnitude must be > 0.
+    assert log.advantage_max_abs > 0
+
+    # Modulator + codebook must have moved (the policy gradient's
+    # actual targets).
+    assert not torch.equal(
+        wrapper.memory.discrete_policy.codebook, codebook_before)
+    assert not torch.equal(
+        wrapper.memory.modulator.logit_head.weight, logit_head_before)

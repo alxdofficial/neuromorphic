@@ -73,6 +73,10 @@ class PretrainedLMWithMemory(nn.Module):
         # Per-call scratch: auxiliary memory CE loss produced by the last
         # forward. None when memory is not wired.
         self._last_mem_pred_loss: torch.Tensor | None = None
+        # "phase1" = Gumbel-softmax backprop (bootstrap). "phase2" = hard
+        # Categorical with log_pi tracking for REINFORCE/GRPO rollouts.
+        # Flip via `wrapper.current_phase = "phase2"` before phase-2 runs.
+        self.current_phase: str = "phase1"
 
     @property
     def mem_inject(self) -> MemInjectLayer:
@@ -109,7 +113,8 @@ class PretrainedLMWithMemory(nn.Module):
                 h_mem, input_ids, self._adapter,
                 prev_token=prev_token,
                 use_rmsnorm=use_rms,
-                rms_eps=self._rms_eps)
+                rms_eps=self._rms_eps,
+                phase=self.current_phase)
             self._last_mem_pred_loss = mem_loss
             return readouts
 

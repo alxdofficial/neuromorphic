@@ -369,8 +369,14 @@ class MemoryGraph(nn.Module):
                   W: Tensor, hebbian: Tensor, decay: Tensor,
                   s_live: Tensor, s_ema: Tensor,
                   W_gamma: Tensor, decay_gamma: Tensor,
-                  phase: str) -> tuple[Tensor, Tensor]:
-        """Per-cell attention encoder → per-cell codes → per-cell ΔW."""
+                  phase: str) -> tuple[Tensor, Tensor, Tensor]:
+        """Per-cell attention encoder → per-cell codes → per-cell ΔW.
+
+        Returns (W_new, decay_new, log_pi) where log_pi is [BS, NC]: the
+        log-probability of the sampled code under the current policy. In
+        phase 1 (Gumbel-soft) and eval (argmax) log_pi is zeroed — it is
+        only a meaningful REINFORCE signal in phase 2 hard sampling.
+        """
         # logits: [BS, NC, K]
         logits, _tokens = self.modulator(
             h, msg, received, W, hebbian, decay,
@@ -380,20 +386,24 @@ class MemoryGraph(nn.Module):
         # reshape back after.
         BS, NC, K = logits.shape
         logits_flat = logits.reshape(BS * NC, K)
+        log_pi_flat = torch.zeros(BS * NC, device=logits.device, dtype=logits.dtype)
         if self.training and phase == "phase1":
             soft, codes = self.discrete_policy.sample_gumbel_soft(
                 logits_flat, tau=self.gumbel_tau, hard=True)
             emb = self.discrete_policy.lookup_soft(soft)       # [BS*NC, D_code]
+            self.discrete_policy.update_usage(codes)
         elif not self.training:
             codes = logits_flat.argmax(dim=-1)
             emb = self.discrete_policy.lookup(codes)
         else:
-            codes, _ = self.discrete_policy.sample_discrete(
+            # Phase 2: hard Categorical sampling. Preserve log_pi so the
+            # training loop can compute the REINFORCE / GRPO policy-gradient
+            # update. Gradient flows through log_pi back to the modulator
+            # logits even though `codes` itself is a non-differentiable
+            # sampled index.
+            codes, log_pi_flat = self.discrete_policy.sample_discrete(
                 logits_flat, tau=self.gumbel_tau)
             emb = self.discrete_policy.lookup(codes)
-
-        if self.training and phase == "phase1":
-            self.discrete_policy.update_usage(codes)
 
         # Decoder is a shared trunk conditioned on the modulator's cell_emb.
         # emb [BS*NC, D_code] → reshape [BS, NC, D_code] → returns (ΔW [BS, NC, N, N], Δdecay [BS, NC, N]).
@@ -406,7 +416,7 @@ class MemoryGraph(nn.Module):
         target_decay = torch.sigmoid(dDecay_raw).to(decay.dtype)
         decay_new = ((1 - decay_gamma.unsqueeze(0)) * decay
                      + decay_gamma.unsqueeze(0) * target_decay)
-        return W_new, decay_new
+        return W_new, decay_new, log_pi_flat.reshape(BS, NC)
 
     @staticmethod
     def _hebbian_update(hebbian: Tensor, msg: Tensor, gamma: Tensor) -> Tensor:
@@ -422,13 +432,15 @@ class MemoryGraph(nn.Module):
     def _run_block(self, h, msg, W, decay, hebbian,
                    s_mem_live, s_mem_ema_fast,
                    prev_readout, readout_drift,
+                   log_pi_sum,
                    block_H_mid, block_input_ids,
                    start_t,
                    inject_w, inject_b,
                    mg_w1, mg_b1, mg_w2, mg_b2,
                    lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                    hebbian_gamma, W_gamma, decay_gamma, gain_fast,
-                   use_rmsnorm: bool = False, rms_eps: float = 1e-5):
+                   use_rmsnorm: bool = False, rms_eps: float = 1e-5,
+                   phase: str = "phase1"):
         """Multi-timescale memory loop.
 
         Per-token (fast clock): W @ msg message passing + inject + LIF state
@@ -501,10 +513,15 @@ class MemoryGraph(nn.Module):
             # writes plasticity updates to W and decay.
             if (t + 1) % mod_interval == 0:
                 received_for_mod = self._receive(msg, W)
-                W, decay = self._modulate(
+                W, decay, log_pi_step = self._modulate(
                     h, msg, received_for_mod, W, hebbian, decay,
                     s_mem_live, s_mem_ema_fast,
-                    W_gamma, decay_gamma, phase="phase1")
+                    W_gamma, decay_gamma, phase=phase)
+                # Accumulate over cells into a per-batch scalar — the policy-
+                # gradient signal is one log π per rollout. In phase 1 (Gumbel
+                # soft) and eval (argmax) log_pi_step is zero, so this is a
+                # no-op for those paths.
+                log_pi_sum = log_pi_sum + log_pi_step.sum(dim=-1)
 
             with torch.no_grad():
                 new_pool = readout.reshape(BS, self.NC_pools, self.D_n)
@@ -515,7 +532,7 @@ class MemoryGraph(nn.Module):
 
         return (h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
-                prev_readout, readout_drift, readouts)
+                prev_readout, readout_drift, readouts, log_pi_sum)
 
     # ================================================================
     # Segment forward
@@ -529,6 +546,7 @@ class MemoryGraph(nn.Module):
         prev_token: Tensor | None = None,
         use_rmsnorm: bool = False,
         rms_eps: float = 1e-5,
+        phase: str = "phase1",
     ) -> tuple[Tensor, Tensor]:
         BS, T, _ = H_mid.shape
         if not self._initialized:
@@ -581,6 +599,11 @@ class MemoryGraph(nn.Module):
                                 device=H_mid.device, dtype=dt)
         block_size = max(1, self.config.tbptt_block)
         gain_fast = self.config.gain_ema_fast
+        # Per-rollout running sum of log π(sampled_code) across all modulator
+        # fires in the segment. Zero in phase 1 / eval (log_pi_step stays at
+        # zero there). Stored on self._log_pi_sum after the loop so phase-2
+        # training can read it.
+        log_pi_sum = torch.zeros(BS, device=H_mid.device, dtype=dt)
 
         use_ckpt = self.training and self.config.checkpoint_memory
         for start_t in range(0, T, block_size):
@@ -589,13 +612,14 @@ class MemoryGraph(nn.Module):
                 h, msg, W, decay, hebbian,
                 s_mem_live, s_mem_ema_fast,
                 prev_readout, readout_drift,
+                log_pi_sum,
                 H_mid[:, start_t:end_t], input_ids[:, start_t:end_t],
                 start_t,
                 inject_w, inject_b,
                 mg_w1, mg_b1, mg_w2, mg_b2,
                 lm_head_w, proj_down_w, proj_down_b, ln_final_w, ln_final_b,
                 hebbian_gamma, W_gamma, decay_gamma, gain_fast,
-                use_rmsnorm, rms_eps)
+                use_rmsnorm, rms_eps, phase)
 
             if use_ckpt:
                 result = torch.utils.checkpoint.checkpoint(
@@ -605,7 +629,7 @@ class MemoryGraph(nn.Module):
 
             (h, msg, W, decay, hebbian,
              s_mem_live, s_mem_ema_fast,
-             prev_readout, readout_drift, block_out) = result
+             prev_readout, readout_drift, block_out, log_pi_sum) = result
             readouts[:, start_t:end_t] = block_out
 
         self.h = h.detach(); self.msg = msg.detach()
@@ -615,6 +639,10 @@ class MemoryGraph(nn.Module):
         self.s_mem_ema_fast = s_mem_ema_fast.detach()
         self.prev_readout = prev_readout.detach()
         self.readout_drift = readout_drift.detach()
+        # Expose the segment-total log π sum for phase-2 GRPO readers. Keep
+        # graph-connected (do NOT detach) — the policy gradient needs
+        # backward to flow through log_pi_sum into the modulator logits.
+        self._last_log_pi_sum = log_pi_sum
 
         shifted_all = torch.cat([
             segment_start_prev_readout.unsqueeze(1).to(readouts.dtype),
