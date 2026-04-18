@@ -16,6 +16,8 @@ that calls Triton only when grad is disabled.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -421,14 +423,18 @@ def fused_memory_step(
     # Triton requirements: CUDA, bf16 state, Nc and D_n are powers of 2
     # (tl.arange requires it). Nc also needs to be ≥ 16 for tl.dot. Any
     # failure falls through to the PyTorch reference, which has the same
-    # math.
+    # math. NEUROMORPHIC_NO_COMPILE=1 also routes to PyTorch — when the
+    # user disables torch.compile for debugging, forcing Triton off gives
+    # a consistent non-compiled path.
     Nc = h.shape[2]
     D_n = h.shape[3]
     _triton_shape_ok = (
         _is_pow2(Nc) and Nc >= 16
         and _is_pow2(D_n) and D_n >= 16
     )
+    _no_compile = bool(os.environ.get("NEUROMORPHIC_NO_COMPILE"))
     if (use_triton
+            and not _no_compile
             and h.is_cuda
             and h.dtype == torch.bfloat16
             and _triton_shape_ok):

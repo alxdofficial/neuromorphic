@@ -33,11 +33,11 @@ class Config:
     neurons_per_cell: int = 32
     D_n: int = 256
     alpha: int = 4                # input/output ports per cell
-    # Multi-timescale clocks (biological): per-token membrane integration
-    # (h update + W@msg message passing), event-driven spike emission (msg)
-    # and Hebbian update at msg_interval, slow neuromodulation at
-    # modulation_interval.
-    msg_interval: int = 4         # msg MLP + hebbian fire every N tokens
+    # Multi-timescale clocks: per-token membrane integration + per-token msg
+    # emission (so intra-cell message passing uses fresh msg, not stale —
+    # the LM injects fresh signal every token, so neurons should re-emit
+    # every token too). Slow neuromodulation at modulation_interval.
+    msg_interval: int = 1         # msg MLP + hebbian fire every N tokens
     modulation_interval: int = 16 # modulator + plasticity fire every N tokens
     # State update is a LIF-style leaky integrator — no MLP, no hidden dim.
     # Only msg emission keeps a 2-layer MLP.
