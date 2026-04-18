@@ -77,7 +77,12 @@ class Config:
 
     # === Training ===
     T: int = 128                   # tokens per segment
-    tbptt_block: int = 16          # detach memory loop every N tokens
+    tbptt_block: int = 32          # detach memory loop every N tokens
+                                    # Must be >= 2*modulation_interval so at least
+                                    # one modulator fire per block produces writes
+                                    # that feed subsequent readouts with gradient.
+                                    # tbptt_block == mod_interval silently zeroes
+                                    # the modulator's phase-1 gradient.
     aux_loss_chunk: int = 128      # chunk size for mem_head CE (no-grad state;
                                    # larger = faster. Default = T (one pass).)
     # BS=48 fits comfortably without checkpointing (18 GB peak) and is 20%
@@ -132,6 +137,17 @@ class Config:
             f"({self.modulation_interval}) so each segment contains a whole "
             f"number of modulator fire events (first fire at t=mod_interval-1)")
         assert self.tbptt_block >= 1
+        # Modulator writes at t=k·mod_interval-1 get used by readouts at
+        # t=k·mod_interval ... next_detach-1. If the next detach lands on the
+        # token immediately after the fire (tbptt_block == mod_interval), the
+        # write never feeds a readout with gradient → modulator gets zero
+        # phase-1 gradient. Require at least one full mod interval of
+        # graph-connected readouts per block.
+        assert self.tbptt_block >= 2 * self.modulation_interval, (
+            f"tbptt_block ({self.tbptt_block}) must be >= 2 * "
+            f"modulation_interval ({self.modulation_interval}) so modulator "
+            f"writes have at least one full interval of downstream readouts "
+            f"still in the gradient graph before the next detach.")
         assert self.attn_n_layers >= 1
         assert self.attn_token_dim % self.attn_n_heads == 0, (
             f"attn_token_dim ({self.attn_token_dim}) must be divisible by "

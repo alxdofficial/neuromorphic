@@ -69,6 +69,12 @@ class PretrainedLMWithMemory(nn.Module):
         self._adapter = (LlamaMemAdapter(self.llama, self.mem_inject.W_out,
                                          rms_eps=self._rms_eps)
                          if attach_memory else None)
+        # Without memory, pin scale to zero so the inject residual stays zero
+        # and MemInjectLayer can pass through transparently. The loud assert
+        # in MemInjectLayer would otherwise fire on every forward.
+        if not attach_memory:
+            with torch.no_grad():
+                self.mem_inject.scale.zero_()
 
         # Per-call scratch: auxiliary memory CE loss produced by the last
         # forward. None when memory is not wired.

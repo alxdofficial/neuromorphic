@@ -71,36 +71,43 @@ def autoregressive_rollout(
 
     # 1) Replicate prefix across K rollouts and reset memory for BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
-    wrapper.train(False)
     wrapper.reset_memory(bs=K)
 
-    # 2) Process prefix. Memory samples stochastic codes per BS item (K
-    # independent sample streams), so the end-of-prefix memory states
-    # diverge across rollouts. Train-mode memory uses sample_discrete
-    # when phase != "phase1"; eval-mode memory uses argmax which collapses
-    # rollouts to identical behavior. For true divergence we need train
-    # mode during the prefix pass.
+    # 2) Process prefix in phase 2 mode so memory uses hard Categorical
+    # sampling (K independent samples across the batch dim). Request KV
+    # cache so the generation loop can skip re-processing the prefix —
+    # otherwise memory's per-token LIF would re-run on all prefix tokens
+    # at every gen step and its state would drift uncontrollably.
+    prior_phase = wrapper.current_phase
+    wrapper.current_phase = "phase2"
     wrapper.train(True)
     with torch.no_grad():
-        _ = wrapper(prefix_rep)
+        out = wrapper(prefix_rep, use_cache=True)
+        past_key_values = out.past_key_values
+        last_prefix_logits = out.logits[:, -1]
     wrapper.train(False)
+    wrapper.current_phase = prior_phase
 
-    # 3) Autoregressive generation. At each step forward the full current
-    # sequence (no KV cache yet — adds complexity that's not smoke-scope).
-    current = prefix_rep
+    # 3) Generate. First token from the prefix's last-position logits; each
+    # subsequent step passes just the new token + KV cache so memory does
+    # one LIF update per generated token.
     generated = []
-    last_logits: Tensor | None = None
-    for _ in range(gen_length):
-        out = wrapper(current)
-        step_logits = out.logits[:, -1]          # [K, vocab]
+    past = past_key_values
+    probs = F.softmax(last_prefix_logits.float() / temperature, dim=-1)
+    sampled = torch.multinomial(probs, num_samples=1, generator=gen)      # [K, 1]
+    generated.append(sampled)
+    last_logits = last_prefix_logits
+
+    for _ in range(gen_length - 1):
+        out = wrapper(sampled, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        step_logits = out.logits[:, -1]
         last_logits = step_logits
         probs = F.softmax(step_logits.float() / temperature, dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1, generator=gen)  # [K, 1]
+        sampled = torch.multinomial(probs, num_samples=1, generator=gen)
         generated.append(sampled)
-        current = torch.cat([current, sampled], dim=1)
 
     gen_tensor = torch.cat(generated, dim=1)     # [K, gen_length]
-    assert last_logits is not None
     return RolloutResult(
         generated_ids=gen_tensor,
         prefix_ids=prefix_rep,

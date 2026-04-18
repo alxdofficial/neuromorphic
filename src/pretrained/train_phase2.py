@@ -28,6 +28,7 @@ teacher-forced verify_01 setup whose SNR was 1e-4.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Callable
 
@@ -36,6 +37,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+
+@contextlib.contextmanager
+def _nullcontext():
+    yield
 
 
 @dataclass
@@ -58,21 +64,36 @@ def token_match_reward(
 
 def _generate_tokens(
     wrapper: PretrainedLMWithMemory,
-    current: Tensor,           # [K, T]
+    last_prefix_logits: Tensor,   # [K, vocab] — logits from position T_prefix-1
+    past_key_values,              # HF Cache from the prefix pass
     gen_length: int,
     temperature: float,
     gen: torch.Generator | None,
 ) -> Tensor:
-    """Sample `gen_length` tokens autoregressively from `current`. No grad."""
+    """Sample `gen_length` tokens autoregressively using KV cache.
+
+    The first token is sampled from `last_prefix_logits` (the logits at the
+    last prefix position, which are the distribution over position T_prefix).
+    Each subsequent step passes ONLY the newly sampled token plus the KV
+    cache, so memory sees a T=1 segment per step and does one LIF update
+    on its carried state — no re-processing of the prefix, no state drift.
+    """
     out_tokens = []
     with torch.no_grad():
-        for _ in range(gen_length):
-            out = wrapper(current)
+        # First sample from the prefix's last-position logits.
+        probs = F.softmax(last_prefix_logits.float() / temperature, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1, generator=gen)  # [K, 1]
+        out_tokens.append(sampled)
+        past = past_key_values
+
+        for _ in range(gen_length - 1):
+            out = wrapper(sampled, past_key_values=past, use_cache=True)
+            past = out.past_key_values
             step_logits = out.logits[:, -1].float()
             probs = F.softmax(step_logits / temperature, dim=-1)
             sampled = torch.multinomial(probs, num_samples=1, generator=gen)
             out_tokens.append(sampled)
-            current = torch.cat([current, sampled], dim=1)
+
     return torch.cat(out_tokens, dim=1)  # [K, gen_length]
 
 
@@ -103,15 +124,30 @@ def grpo_step(
     wrapper.train(True)
     wrapper.reset_memory(bs=K)
 
-    # 3) Prefix pass with gradient tracking — this is what memory samples
-    # hard codes in and log_pi accumulates from.
-    _ = wrapper(prefix_rep)
-    log_pi_sum = wrapper.memory._last_log_pi_sum            # [K], graph-connected
+    device_type = next(wrapper.parameters()).device.type
+    use_autocast = device_type == "cuda"
+    amp_ctx = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+               if use_autocast else _nullcontext())
 
-    # 4) Generate under no_grad; rewards.
+    # 3) Prefix pass with gradient tracking — memory samples hard codes and
+    # log_pi accumulates. Request KV cache so the generation loop can skip
+    # re-processing the prefix (which would otherwise re-run memory's LIF
+    # over prefix tokens on every gen step, drifting the state).
+    with amp_ctx:
+        out = wrapper(prefix_rep, use_cache=True)
+    log_pi_sum = wrapper.memory._last_log_pi_sum            # [K], graph-connected
+    last_prefix_logits = out.logits[:, -1].detach()         # [K, vocab_lm]
+    past_key_values = out.past_key_values
+
+    # 4) Generate under no_grad; rewards. Memory's carried state [K, ...]
+    # diverges per rollout thanks to the hard-Categorical prefix sampling,
+    # and each gen step runs with a T=1 segment so memory updates its
+    # fast state exactly once per generated token (no modulator fires —
+    # the mod clock never reaches mod_interval from a fresh start).
     wrapper.train(False)
-    generated = _generate_tokens(wrapper, prefix_rep, gen_length,
-                                  temperature=temperature, gen=gen)
+    generated = _generate_tokens(
+        wrapper, last_prefix_logits, past_key_values,
+        gen_length=gen_length, temperature=temperature, gen=gen)
     rewards = reward_fn(generated, reference_cont)           # [K]
     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
     advantages = advantages.to(log_pi_sum.dtype)

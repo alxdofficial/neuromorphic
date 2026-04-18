@@ -66,15 +66,18 @@ class MemInjectLayer(nn.Module):
 
     def forward(self, hidden_states: Tensor, *args, **kwargs):
         if self.memory_fn is None:
-            # Smoke mode: bypass memory entirely. Identity-init projections
-            # mean W_out(W_in(h)) ≈ h but scale is still nonzero at init, so
-            # the residual would drift. Only safe when scale is externally
-            # pinned to 0 — tests enforce this.
-            if (self.scale == 0).all():
-                return self.orig_layer(hidden_states, *args, **kwargs)
-            # Defensive: without a memory_fn wired, we can't produce a
-            # meaningful readout. Treat the memory output as zero so the
-            # residual is unchanged regardless of scale.
+            # Transparent bypass only when the inject residual is provably
+            # zero — i.e. scale is all-zero. Any nonzero scale without a
+            # memory_fn silently drops the inject and produces outputs the
+            # training loop can't distinguish from a correctly-wired run.
+            # That's a footgun; error out instead.
+            if not (self.scale == 0).all():
+                raise RuntimeError(
+                    "MemInjectLayer called without memory_fn but scale is "
+                    "not all-zero. Either wire memory_fn via "
+                    "PretrainedLMWithMemory.forward (which installs a "
+                    "closure per call) or pin scale to zero. Silent "
+                    "bypass here would produce incorrect training output.")
             return self.orig_layer(hidden_states, *args, **kwargs)
 
         h_mem = self.W_in(hidden_states)              # [BS, T, d_mem]

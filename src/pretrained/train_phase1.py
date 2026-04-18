@@ -20,6 +20,7 @@ no distributed. Call it from a driver script that adds those layers.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Callable, Iterator
@@ -28,6 +29,11 @@ import torch
 import torch.nn.functional as F
 
 from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+
+@contextlib.contextmanager
+def _nullcontext():
+    yield
 
 
 @dataclass
@@ -78,6 +84,14 @@ def run_phase1(
     """
     anneal_across_steps = anneal_across_steps or steps
     wrapper.train()
+    device_type = next(wrapper.parameters()).device.type
+    # Llama is loaded in fp32 and memory state is bf16 on CUDA. Without
+    # autocast, every W_in/W_out crossing does an explicit fp32↔bf16 round
+    # trip that truncates small gradient values. autocast(bf16) on CUDA
+    # keeps the matmul math in bf16 end-to-end while leaving reductions
+    # (e.g., softmax, cross_entropy) in fp32 where they belong.
+    # On CPU autocast is a no-op pass-through for this dtype.
+    use_autocast = device_type == "cuda"
 
     for step in range(steps):
         batch = next(data_iter)
@@ -92,15 +106,18 @@ def run_phase1(
         kwargs = {}
         if prev_token is not None:
             kwargs["prev_token"] = prev_token
-        out = wrapper(input_ids, **kwargs)
 
-        ce = F.cross_entropy(
-            out.logits.reshape(-1, out.logits.shape[-1]).float(),
-            target_ids.reshape(-1))
-        mem_loss = wrapper._last_mem_pred_loss
-        if mem_loss is None:
-            mem_loss = torch.zeros((), device=ce.device)
-        loss = ce + mem_pred_weight * mem_loss
+        amp_ctx = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+                   if use_autocast else _nullcontext())
+        with amp_ctx:
+            out = wrapper(input_ids, **kwargs)
+            ce = F.cross_entropy(
+                out.logits.reshape(-1, out.logits.shape[-1]).float(),
+                target_ids.reshape(-1))
+            mem_loss = wrapper._last_mem_pred_loss
+            if mem_loss is None:
+                mem_loss = torch.zeros((), device=ce.device)
+            loss = ce + mem_pred_weight * mem_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
