@@ -14,7 +14,7 @@ class Config:
     D_embed: int = 768
     L_total: int = 4
     scan_split_at: int = 2
-    d_inner: int = 1200
+    d_inner: int = 1824
     glu_output: bool = True
     vocab_size: int = 32000
     eot_id: int = 2
@@ -65,7 +65,7 @@ class Config:
     # MLP's hidden width and IS the output-space rank constraint (rank
     # <= min(code_dim, decoder_hidden) for the code→output map, but the
     # emitted ΔW *matrix* itself is unconstrained in rank).
-    decoder_hidden: int = 6144
+    decoder_hidden: int = 4096
 
     # === Plasticity rate clamp (bf16 safety) ===
     gamma_max: float = 0.97       # γ = gamma_max · sigmoid(logit); keeps (1-γ) ≥ 0.03
