@@ -22,13 +22,18 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
 import torch
 import torch.nn.functional as F
 
 from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+from src.pretrained.telemetry import (
+    JsonlLogger, collect_codebook_stats, collect_inject_stats,
+    collect_lr_stats, collect_memory_stats, collect_throughput_stats,
+)
 
 
 @contextlib.contextmanager
@@ -51,6 +56,10 @@ class Phase1StepLog:
     mem_pred_loss: float
     gumbel_tau: float
     grad_norm: float
+    # Extra metrics (populated on log steps). Kept as a dict rather than
+    # individual fields so the Log dataclass doesn't balloon every time a
+    # new metric gets added to the telemetry helpers.
+    extras: dict = field(default_factory=dict)
 
 
 def anneal_gumbel_tau(step: int, total_steps: int, tau_start: float,
@@ -75,6 +84,8 @@ def run_phase1(
     gumbel_tau_end: float = 0.3,
     anneal_across_steps: int | None = None,
     on_step: Callable[[Phase1StepLog], None] | None = None,
+    metrics_path: str | None = None,
+    log_interval: int = 10,
 ):
     """Run phase-1 training for `steps` optimizer steps.
 
@@ -93,8 +104,10 @@ def run_phase1(
     # (e.g., softmax, cross_entropy) in fp32 where they belong.
     # On CPU autocast is a no-op pass-through for this dtype.
     use_autocast = device_type == "cuda"
+    logger = JsonlLogger(metrics_path)
 
     for step in range(steps):
+        t_step_start = time.time()
         batch = next(data_iter)
         input_ids = batch.input_ids.to(device)
         target_ids = batch.target_ids.to(device)
@@ -128,6 +141,22 @@ def run_phase1(
         optimizer.step()
         wrapper.detach_memory()
 
+        # Heavier telemetry only on log-interval steps to avoid CUDA syncs
+        # + memory-stat reductions on every step. Step 0 always logs so we
+        # have a baseline on disk even for very short runs.
+        is_log_step = step == 0 or (step + 1) % log_interval == 0
+        extras: dict = {}
+        if is_log_step:
+            extras.update(collect_lr_stats(optimizer))
+            extras.update(collect_inject_stats(wrapper))
+            extras.update(collect_codebook_stats(wrapper))
+            extras.update(collect_memory_stats(wrapper, include_slow=True))
+            ms_step = (time.time() - t_step_start) * 1000
+            # Token count per step from the batch shape.
+            tok_per_s = input_ids.numel() / max(1e-9, (time.time() - t_step_start))
+            extras.update(collect_throughput_stats(
+                tok_per_s=tok_per_s, ms_per_step=ms_step, device=device))
+
         log = Phase1StepLog(
             step=step,
             loss=float(loss.item()),
@@ -135,6 +164,18 @@ def run_phase1(
             mem_pred_loss=float(mem_loss.item() if torch.is_tensor(mem_loss) else 0.0),
             gumbel_tau=tau,
             grad_norm=float(grad_norm) if math.isfinite(grad_norm) else float("inf"),
+            extras=extras,
         )
+        if is_log_step:
+            logger.write({
+                "phase": "phase1_parallel",
+                "step": log.step,
+                "loss": log.loss,
+                "ce": log.ce,
+                "mem_pred_loss": log.mem_pred_loss,
+                "gumbel_tau": log.gumbel_tau,
+                "grad_norm": log.grad_norm,
+                **log.extras,
+            })
         if on_step is not None:
             on_step(log)

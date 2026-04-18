@@ -116,6 +116,7 @@ def run_cycle_loop(
     from src.pretrained.train_phase2 import grpo_step
 
     os.makedirs(cfg.work_dir, exist_ok=True)
+    metrics_path = os.path.join(cfg.work_dir, "metrics.jsonl")
     opt = torch.optim.AdamW(
         [p for _, p in wrapper.trainable_parameters()], lr=cfg.lr)
 
@@ -125,6 +126,7 @@ def run_cycle_loop(
     wrapper.current_phase = "phase1"
     wrapper.reset_memory(bs=cfg.bs)
     run_phase1(wrapper, opt, bootstrap_iter, steps=cfg.bootstrap_steps,
+               metrics_path=metrics_path,
                on_step=lambda lg: log(
                    f"  [boot {lg.step:>5}] loss={lg.loss:.3f} "
                    f"ce={lg.ce:.3f} mem={lg.mem_pred_loss:.3f} "
@@ -147,6 +149,7 @@ def run_cycle_loop(
         wrapper.reset_memory(bs=cfg.bs)
         run_phase1_ar(wrapper, opt, cycle_p1_iter,
                       steps=cfg.cycle_phase1_steps,
+                      metrics_path=metrics_path,
                       on_step=lambda lg: log(
                           f"  [c{c+1} p1 {lg.step:>5}] loss={lg.loss:.3f} "
                           f"tau={lg.gumbel_tau:.2f} |g|={lg.grad_norm:.2f}"
@@ -167,6 +170,8 @@ def run_cycle_loop(
                 num_rollouts=cfg.grpo_K,
                 gen_length=cfg.grpo_rollout_len,
                 reward_fn=reward_fn,
+                metrics_path=metrics_path,
+                step_idx=p2_step,
             )
             if p2_step % 50 == 0:
                 log(f"  [c{c+1} p2 {p2_step:>5}] loss={lg.loss:.3f} "

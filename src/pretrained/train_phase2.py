@@ -29,7 +29,8 @@ teacher-forced verify_01 setup whose SNR was 1e-4.
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
@@ -37,6 +38,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+from src.pretrained.telemetry import (
+    JsonlLogger, collect_codebook_stats, collect_inject_stats,
+    collect_lr_stats, collect_memory_stats, collect_rollout_stats,
+    collect_throughput_stats, summarize_tensor,
+)
 
 
 @contextlib.contextmanager
@@ -51,6 +57,7 @@ class GrpoStepLog:
     reward_std: float
     log_pi_mean: float
     advantage_max_abs: float
+    extras: dict = field(default_factory=dict)
 
 
 def token_match_reward(
@@ -110,6 +117,9 @@ def grpo_step(
     adv_std_floor: float = 1e-3,
     reward_fn: Callable[[Tensor, Tensor], Tensor] = token_match_reward,
     seed: int | None = None,
+    metrics_path: str | None = None,
+    step_idx: int = 0,
+    collect_heavy_telemetry: bool = True,
 ) -> GrpoStepLog:
     assert prefix_ids.dim() == 2 and prefix_ids.shape[0] == 1
     device = next(wrapper.parameters()).device
@@ -120,6 +130,7 @@ def grpo_step(
     device = prefix_ids.device
 
     gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+    t_step_start = time.time()
 
     # 1) Replicate prefix. 2) Reset memory with BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
@@ -180,10 +191,42 @@ def grpo_step(
     wrapper.train(True)
     wrapper.detach_memory()
 
-    return GrpoStepLog(
+    # Rich telemetry — distributions and rollout diagnostics. Cheap on
+    # K=8 rollout scale; gated on `collect_heavy_telemetry` so unit smokes
+    # can skip the memory-health CUDA syncs.
+    extras: dict = {}
+    if collect_heavy_telemetry:
+        extras.update(collect_lr_stats(optimizer))
+        extras.update(collect_inject_stats(wrapper))
+        extras.update(collect_codebook_stats(wrapper))
+        extras.update(collect_memory_stats(wrapper, include_slow=False))
+        extras.update(summarize_tensor(rewards, prefix="reward"))
+        extras.update(summarize_tensor(advantages, prefix="advantage"))
+        extras.update(summarize_tensor(log_pi_sum.detach(), prefix="log_pi_sum"))
+        extras.update(collect_rollout_stats(generated, reference_cont))
+        ms_step = (time.time() - t_step_start) * 1000
+        toks = K * (T_prefix + gen_length)
+        tok_per_s = toks / max(1e-9, time.time() - t_step_start)
+        extras.update(collect_throughput_stats(
+            tok_per_s=tok_per_s, ms_per_step=ms_step, device=device))
+
+    log = GrpoStepLog(
         loss=float(loss.item()),
         reward_mean=float(rewards.mean().item()),
         reward_std=float(rewards.std().item()),
         log_pi_mean=float(log_pi_sum.detach().mean().item()),
         advantage_max_abs=float(advantages.abs().max().item()),
+        extras=extras,
     )
+    if metrics_path is not None:
+        JsonlLogger(metrics_path).write({
+            "phase": "phase2_grpo",
+            "step": int(step_idx),
+            "loss": log.loss,
+            "reward_mean": log.reward_mean,
+            "reward_std": log.reward_std,
+            "log_pi_mean": log.log_pi_mean,
+            "advantage_max_abs": log.advantage_max_abs,
+            **log.extras,
+        })
+    return log

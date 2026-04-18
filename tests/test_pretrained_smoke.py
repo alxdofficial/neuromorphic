@@ -975,3 +975,292 @@ def test_cycle_loop_runs_end_to_end():
     # memory state must at least be initialized + finite).
     assert wrapper.memory.is_initialized
     assert torch.isfinite(wrapper.memory.W).all()
+
+
+# ======================================================================
+# Gradient flow smoke tests
+#
+# Every trainable module should receive non-zero gradient from its
+# corresponding training loss. A silent zero-gradient on any module is
+# a training bug (the module can't learn) — these smokes assert the
+# gradient flow contract explicitly so we catch regressions like the
+# TBPTT-detach / log_pi_sum bugs before they reach a training run.
+# ======================================================================
+
+
+def _trainable_param_groups(wrapper) -> dict:
+    """Enumerate every trainable parameter path in the wrapper, grouped
+    by what they test. Any dead group is a potential training bug."""
+    L = wrapper.config.inject_layer
+    groups: dict[str, list[tuple[str, torch.Tensor]]] = {
+        "inject_projections": [
+            (f"mem_inject.W_in", wrapper.mem_inject.W_in.weight),
+            (f"mem_inject.W_out", wrapper.mem_inject.W_out.weight),
+            (f"mem_inject.scale", wrapper.mem_inject.scale),
+        ],
+        "modulator_encoder": [
+            ("tok_proj[0]", wrapper.memory.modulator.tok_proj[0].weight),
+            ("tok_proj[-1]", wrapper.memory.modulator.tok_proj[-1].weight),
+            ("h_proj", wrapper.memory.modulator.h_proj.weight),
+            ("msg_emit_proj", wrapper.memory.modulator.msg_emit_proj.weight),
+            ("msg_recv_proj", wrapper.memory.modulator.msg_recv_proj.weight),
+            ("role_emb", wrapper.memory.modulator.role_emb.weight),
+            ("cell_emb", wrapper.memory.modulator.cell_emb),
+            ("edge_bias_mlp[0]", wrapper.memory.modulator.edge_bias_mlp[0].weight),
+        ],
+        "modulator_attention": [
+            (f"layers[{i}].qkv", wrapper.memory.modulator.layers[i].qkv.weight)
+            for i in range(len(wrapper.memory.modulator.layers))
+        ] + [
+            (f"layers[{i}].out_proj", wrapper.memory.modulator.layers[i].out_proj.weight)
+            for i in range(len(wrapper.memory.modulator.layers))
+        ],
+        "modulator_output": [
+            ("pool_norm", wrapper.memory.modulator.pool_norm.weight),
+            ("logit_head", wrapper.memory.modulator.logit_head.weight),
+        ],
+        "codebook": [("codebook", wrapper.memory.discrete_policy.codebook)],
+        "decoder": [
+            ("decoder.mlp[0]", wrapper.memory.decoder.mlp[0].weight),
+            ("decoder.mlp[-1]", wrapper.memory.decoder.mlp[-1].weight),
+        ],
+        "memory_dynamics": [
+            ("inject_w", wrapper.memory.inject_w),
+            ("msg_w1", wrapper.memory.msg_w1),
+            ("msg_w2", wrapper.memory.msg_w2),
+            ("W_decay_logit", wrapper.memory.W_decay_logit),
+            ("decay_gamma_logit", wrapper.memory.decay_gamma_logit),
+            ("hebbian_decay_logit", wrapper.memory.hebbian_decay_logit),
+            ("neuron_id", wrapper.memory.neuron_id),
+        ],
+    }
+    return groups
+
+
+def _assert_all_have_nonzero_grad(groups, required_groups: list[str],
+                                   context: str):
+    missing = []
+    zero = []
+    for g_name in required_groups:
+        for p_name, p in groups[g_name]:
+            if p.grad is None:
+                missing.append(f"{g_name}/{p_name}")
+            elif p.grad.abs().sum().item() == 0.0:
+                zero.append(f"{g_name}/{p_name}")
+    assert not missing, (
+        f"[{context}] params with .grad=None (graph not connected): {missing}")
+    assert not zero, (
+        f"[{context}] params with all-zero grad (graph connected but "
+        f"gradient vanished): {zero}")
+
+
+def _warm_up_decoder(wrapper, opt, ids, tgt):
+    """One CE step to move `decoder.mlp[-1].weight` off its zero-init.
+    Without this warm-up, `mlp[-1] = 0` blocks the chain-rule gradient
+    through the decoder — grad can't reach decoder.mlp[0], codebook, or
+    the modulator body even though the graph IS connected. This is by
+    design for the memory no-op start (test_decoder_starts_at_no_op
+    enforces it); the gradient-flow smokes just need to see post-init
+    behavior."""
+    wrapper.train()
+    out = wrapper(ids)
+    ce = torch.nn.functional.cross_entropy(
+        out.logits.reshape(-1, out.logits.shape[-1]), tgt.reshape(-1))
+    loss = ce + 0.1 * wrapper._last_mem_pred_loss
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+    wrapper.detach_memory()
+
+
+@requires_llama
+def test_gradient_flow_phase1_parallel_covers_all_trainables():
+    """Parallel phase-1 CE + mem_pred_loss must reach every trainable
+    module — inject projections, modulator (encoder/attention/output),
+    codebook, decoder, and memory dynamics. Runs one warm-up step first
+    so decoder.mlp[-1]'s zero-init doesn't block the chain-rule
+    gradient to mlp[0] / codebook / modulator body."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg, llama_dtype="fp32")
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train()
+    wrapper.reset_memory(bs=1)
+
+    T = 2 * cfg.memory.modulation_interval
+    ids = torch.randint(0, cfg.vocab_size_lm, (1, T))
+    tgt = torch.cat([ids[:, 1:], ids[:, :1]], dim=1)
+
+    # Warm up so decoder.mlp[-1] is non-zero, enabling grad flow through
+    # the decoder to everything upstream (codebook, modulator).
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-3)
+    _warm_up_decoder(wrapper, opt, ids, tgt)
+
+    # Fresh forward + backward. Now check gradient coverage.
+    wrapper.reset_memory(bs=1)
+    out = wrapper(ids)
+    ce = torch.nn.functional.cross_entropy(
+        out.logits.reshape(-1, out.logits.shape[-1]),
+        tgt.reshape(-1))
+    loss = ce + 0.1 * wrapper._last_mem_pred_loss
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+
+    groups = _trainable_param_groups(wrapper)
+    _assert_all_have_nonzero_grad(
+        groups,
+        ["inject_projections", "modulator_encoder", "modulator_attention",
+         "modulator_output", "codebook", "decoder", "memory_dynamics"],
+        "phase1_parallel")
+
+    # Frozen backbone must stay at grad=None.
+    assert wrapper.llama.model.embed_tokens.weight.grad is None
+    assert wrapper.llama.lm_head.weight.grad is None
+    assert wrapper.llama.model.norm.weight.grad is None
+    assert wrapper.llama.model.layers[0].self_attn.q_proj.weight.grad is None
+
+
+@requires_llama
+def test_gradient_flow_phase1_ar_covers_all_trainables():
+    """Autoregressive Gumbel unroll: continuation-CE gradient must reach
+    the SAME full set of trainables through the preserve_memory_graph
+    unroll chain (prefix fires → carried state → per-token unroll).
+    Warms up one parallel step first so decoder.mlp[-1] is non-zero."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg, llama_dtype="fp32")
+    wrapper = PretrainedLMWithMemory(cfg)
+    wrapper.train()
+    wrapper.reset_memory(bs=1)
+
+    T_pre = 2 * cfg.memory.modulation_interval
+    T_cont = 4
+    prefix = torch.randint(0, cfg.vocab_size_lm, (1, T_pre))
+    cont = torch.randint(0, cfg.vocab_size_lm, (1, T_cont))
+
+    # Warm up decoder so mlp[-1] != 0 (otherwise chain-rule blocks
+    # gradient through the decoder).
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-3)
+    warm_ids = prefix
+    warm_tgt = torch.cat([warm_ids[:, 1:], warm_ids[:, :1]], dim=1)
+    _warm_up_decoder(wrapper, opt, warm_ids, warm_tgt)
+
+    wrapper.reset_memory(bs=1)
+    with wrapper.preserve_memory_graph():
+        out = wrapper(prefix, use_cache=True)
+        past = out.past_key_values
+        last = out.logits[:, -1]
+        ce_terms = [torch.nn.functional.cross_entropy(last.float(), cont[:, 0])]
+        for i in range(T_cont - 1):
+            out_i = wrapper(cont[:, i:i + 1], past_key_values=past, use_cache=True)
+            past = out_i.past_key_values
+            ce_terms.append(torch.nn.functional.cross_entropy(
+                out_i.logits[:, -1].float(), cont[:, i + 1]))
+    loss = torch.stack(ce_terms).mean()
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+
+    groups = _trainable_param_groups(wrapper)
+    _assert_all_have_nonzero_grad(
+        groups,
+        ["inject_projections", "modulator_encoder", "modulator_attention",
+         "modulator_output", "codebook", "decoder", "memory_dynamics"],
+        "phase1_ar")
+
+
+@requires_llama
+def test_gradient_flow_phase2_grpo_reaches_modulator_and_recurrent():
+    """Phase-2 GRPO REINFORCE loss = -(log_pi_sum * advantage).mean().
+    The gradient path is: loss → log_pi_sum → sampled-code log-probs →
+    modulator logits → modulator weights. Cells communicate across
+    fires through W updates, so codebook / decoder / γ logits / msg /
+    inject_w also receive RECURRENT gradient (fire k's W-write affects
+    fire k+1's modulator inputs).
+
+    What should NOT receive gradient: W_out and scale (they only affect
+    LM logits, which are NOT in the phase-2 loss). This is the structural
+    signature of REINFORCE-through-memory."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.train_phase2 import grpo_step
+
+    torch.manual_seed(0)
+    # T_pre must be >= 2*mod_interval to have at least two fires (one
+    # that writes, one that reads the previous write via recurrent W).
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg, llama_dtype="fp32")
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_prefix = 3 * cfg.memory.modulation_interval    # at least 3 fires
+    K = 4
+    gen_length = 4
+    prefix = torch.randint(0, cfg.vocab_size_lm, (1, T_prefix))
+    ref = torch.randint(0, cfg.vocab_size_lm, (gen_length,))
+
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-4)
+
+    # Variance-bearing reward to guarantee non-zero advantages.
+    def stub_reward(gen, ref):
+        return gen[:, 0].float() / 10000.0
+
+    _ = grpo_step(
+        wrapper, opt, prefix_ids=prefix, reference_cont=ref,
+        num_rollouts=K, gen_length=gen_length,
+        reward_fn=stub_reward, seed=42,
+        collect_heavy_telemetry=False,
+    )
+
+    # grpo_step calls opt.step() which zeros grads via set_to_none=True
+    # AFTER the step. Re-run just the backward part so grads are visible.
+    # (The groups test needs to see .grad populated; opt.step() cleared
+    # them.)
+    wrapper.current_phase = "phase2"
+    wrapper.train(True)
+    wrapper.reset_memory(bs=K)
+    prefix_rep = prefix.expand(K, -1).contiguous()
+    out = wrapper(prefix_rep, use_cache=True)
+    log_pi_sum = wrapper.memory._last_log_pi_sum
+    loss = -(log_pi_sum * torch.ones_like(log_pi_sum)).mean()
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+
+    groups = _trainable_param_groups(wrapper)
+
+    # Direct gradient from log_pi_sum: modulator (encoder + attention +
+    # output). Codebook + decoder + memory_dynamics receive gradient via
+    # the recurrent chain (prior fires' W/decay writes affect later
+    # fires' modulator inputs).
+    _assert_all_have_nonzero_grad(
+        groups,
+        ["modulator_encoder", "modulator_attention", "modulator_output",
+         "codebook", "decoder", "memory_dynamics"],
+        "phase2_grpo_recurrent")
+
+    # W_in receives recurrent gradient too (H_mid → h_mem → h → modulator).
+    assert wrapper.mem_inject.W_in.weight.grad is not None, (
+        "W_in should receive recurrent gradient in phase 2")
+    assert wrapper.mem_inject.W_in.weight.grad.abs().sum() > 0
+
+    # W_out and scale should NOT have gradient — they only feed LM logits,
+    # and the phase-2 loss doesn't depend on LM logits.
+    W_out_g = wrapper.mem_inject.W_out.weight.grad
+    scale_g = wrapper.mem_inject.scale.grad
+    W_out_zero = (W_out_g is None) or (W_out_g.abs().sum().item() == 0.0)
+    scale_zero = (scale_g is None) or (scale_g.abs().sum().item() == 0.0)
+    assert W_out_zero, (
+        "W_out got gradient in phase 2 but shouldn't — phase-2 loss must "
+        "not depend on LM logits.")
+    assert scale_zero, (
+        "scale got gradient in phase 2 but shouldn't.")

@@ -44,7 +44,8 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
 import torch
@@ -52,6 +53,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+from src.pretrained.telemetry import (
+    JsonlLogger, collect_codebook_stats, collect_inject_stats,
+    collect_lr_stats, collect_memory_stats, collect_throughput_stats,
+)
 
 
 @contextlib.contextmanager
@@ -69,8 +74,13 @@ class Phase1ARBatch:
 class Phase1ARStepLog:
     step: int
     loss: float          # = continuation CE
+    mem_pred_loss: float   # memory's aux NTP loss; populated if the
+                            # prefix-pass forward produced one (i.e.,
+                            # wrapper was in training mode, which the AR
+                            # loop always is).
     gumbel_tau: float
     grad_norm: float
+    extras: dict = field(default_factory=dict)
 
 
 def anneal_gumbel_tau(step: int, total_steps: int, tau_start: float,
@@ -92,6 +102,8 @@ def run_phase1_ar(
     gumbel_tau_end: float = 0.3,
     anneal_across_steps: int | None = None,
     on_step: Callable[[Phase1ARStepLog], None] | None = None,
+    metrics_path: str | None = None,
+    log_interval: int = 10,
 ):
     """Autoregressive Gumbel-softmax unroll training for phase 1.
 
@@ -105,8 +117,10 @@ def run_phase1_ar(
     device = next(wrapper.parameters()).device
     device_type = device.type
     use_autocast = device_type == "cuda"
+    logger = JsonlLogger(metrics_path)
 
     for step in range(steps):
+        t_step_start = time.time()
         batch = next(data_iter)
         prefix_ids = batch.prefix_ids.to(device)
         cont_ids = batch.continuation_ids.to(device)
@@ -155,11 +169,39 @@ def run_phase1_ar(
         optimizer.step()
         wrapper.detach_memory()
 
+        mem_loss = wrapper._last_mem_pred_loss
+        mem_loss_val = float(mem_loss.item()) if torch.is_tensor(mem_loss) else 0.0
+
+        is_log_step = step == 0 or (step + 1) % log_interval == 0
+        extras: dict = {}
+        if is_log_step:
+            extras.update(collect_lr_stats(optimizer))
+            extras.update(collect_inject_stats(wrapper))
+            extras.update(collect_codebook_stats(wrapper))
+            extras.update(collect_memory_stats(wrapper, include_slow=True))
+            ms_step = (time.time() - t_step_start) * 1000
+            tok_per_s = (prefix_ids.numel() + cont_ids.numel()) / max(
+                1e-9, (time.time() - t_step_start))
+            extras.update(collect_throughput_stats(
+                tok_per_s=tok_per_s, ms_per_step=ms_step, device=device))
+
         log = Phase1ARStepLog(
             step=step,
             loss=float(loss.item()),
+            mem_pred_loss=mem_loss_val,
             gumbel_tau=tau,
             grad_norm=float(grad_norm) if math.isfinite(grad_norm) else float("inf"),
+            extras=extras,
         )
+        if is_log_step:
+            logger.write({
+                "phase": "phase1_ar",
+                "step": log.step,
+                "loss": log.loss,
+                "mem_pred_loss": log.mem_pred_loss,
+                "gumbel_tau": log.gumbel_tau,
+                "grad_norm": log.grad_norm,
+                **log.extras,
+            })
         if on_step is not None:
             on_step(log)
