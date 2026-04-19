@@ -124,3 +124,74 @@ class PretrainedConfig:
         c = cls(memory=mem, **defaults)
         c.validate()
         return c
+
+    # ----------------------------------------------------------------
+    # Alternative hosts — same Llama architecture family, pretrained on
+    # less / different data. Use for the "baseline probe" to find a
+    # host weak enough that memory's contribution is measurable.
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def tinyllama_1b1(cls, **kw) -> "PretrainedConfig":
+        """Weaker dev host — 1.1B params, 22 layers, LlamaForCausalLM arch.
+
+        Trained on 3T tokens (SlimPajama + StarCoder) — much less capable
+        on retrieval than Llama-3.2-1B's 9T-token checkpoint, so memory
+        has room to show value. `d_lm=2048` (same as Llama-3.2-1B)."""
+        defaults = dict(
+            model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            inject_layer=11,     # mid-stack of 22
+            d_mem=2048,
+        )
+        defaults.update(kw)
+        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(
+            D=defaults["d_mem"],
+            T=defaults.get("T", 512),
+            tbptt_block=defaults.get("tbptt_block", 32),
+        )
+        c = cls(memory=mem, **defaults)
+        c.validate()
+        return c
+
+    @classmethod
+    def smollm2_360m(cls, **kw) -> "PretrainedConfig":
+        """Smallest dev host — 362M params, 32 layers (narrow+deep), Llama arch.
+
+        Trained on 4T tokens with curated data (FineWeb-Edu / Cosmopedia);
+        punches above its weight on fluency. `d_lm=960`; we keep `d_mem=960`
+        so the identity-init projection path works without forcing an
+        unnecessary 960↔2048 projection during dev."""
+        defaults = dict(
+            model_name="HuggingFaceTB/SmolLM2-360M",
+            inject_layer=16,     # mid-stack of 32
+            d_mem=960,
+        )
+        defaults.update(kw)
+        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(
+            D=defaults["d_mem"],
+            T=defaults.get("T", 512),
+            tbptt_block=defaults.get("tbptt_block", 32),
+        )
+        c = cls(memory=mem, **defaults)
+        c.validate()
+        return c
+
+    @classmethod
+    def smollm2_135m(cls, **kw) -> "PretrainedConfig":
+        """Smallest-of-small — 135M params, 30 layers, Llama arch.
+
+        Fastest iteration target. `d_lm=576`; `d_mem=576`."""
+        defaults = dict(
+            model_name="HuggingFaceTB/SmolLM2-135M",
+            inject_layer=15,     # mid-stack of 30
+            d_mem=576,
+        )
+        defaults.update(kw)
+        mem = defaults.pop("memory", None) or MemoryConfig.tier_a(
+            D=defaults["d_mem"],
+            T=defaults.get("T", 512),
+            tbptt_block=defaults.get("tbptt_block", 32),
+        )
+        c = cls(memory=mem, **defaults)
+        c.validate()
+        return c

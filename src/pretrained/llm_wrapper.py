@@ -1,10 +1,15 @@
-"""PretrainedLMWithMemory — loads Llama-3.2, freezes backbone, wraps one layer.
+"""PretrainedLMWithMemory — loads a HF causal LM, freezes backbone, wraps one layer.
 
 Public API:
     wrapper = PretrainedLMWithMemory(config)
     out = wrapper(input_ids)                # returns HF ModelOutput with `.logits`
     wrapper.reset_memory(bs)                # zero memory state for batch
     wrapper.detach_memory()                  # TBPTT boundary
+
+The wrapper is host-agnostic via `src.pretrained.hosts.HostAdapter`. For
+Llama / TinyLlama / SmolLM2 / Mistral / Qwen2 the single `LlamaHost`
+adapter covers all attribute paths; other families (GPT-NeoX, GPT-2) get
+their own adapter when needed.
 
 Memory is wired during forward via a closure that captures input_ids; the
 MemInjectLayer calls memory_fn(h_mem_in) and receives the per-token
@@ -17,11 +22,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 from src.model.memory import MemoryGraph
 from src.pretrained.config import PretrainedConfig
-from src.pretrained.llama_mem_adapter import LlamaMemAdapter
+from src.pretrained.hosts import HostAdapter, build_host
+from src.pretrained.mem_adapter import MemAdapter
 from src.pretrained.mem_inject_layer import MemInjectLayer
 
 
@@ -30,13 +35,15 @@ class PretrainedLMWithMemory(nn.Module):
         super().__init__()
         self.config = config
 
-        # 1. Inspect HF config to populate derived fields.
+        # 1. Inspect HF config to populate derived fields. HostAdapter reads
+        # the same values back off the model once it's loaded; this pre-load
+        # peek is only so PretrainedConfig.validate_after_load() passes
+        # BEFORE we commit to the heavy AutoModelForCausalLM download.
         hf_cfg = AutoConfig.from_pretrained(config.model_name)
         config.d_lm = hf_cfg.hidden_size
         config.n_lm_layers = hf_cfg.num_hidden_layers
         config.vocab_size_lm = hf_cfg.vocab_size
         config.validate_after_load()
-        self._rms_eps = getattr(hf_cfg, "rms_norm_eps", 1e-5)
 
         # 2. Load the LM in the configured dtype. Default bf16 matches the
         # production GPU run path and skips the fp32→bf16 weight cast that
@@ -48,42 +55,46 @@ class PretrainedLMWithMemory(nn.Module):
         self.llama = AutoModelForCausalLM.from_pretrained(
             config.model_name, torch_dtype=llama_dtype)
 
-        # 3. Freeze backbone. Trainable pieces (W_in/W_out/scale + memory) are
+        # 3. Build HostAdapter — dispatches on config.model_type. All
+        # model-specific attribute paths go through this from here on.
+        self.host: HostAdapter = build_host(self.llama)
+        # Read norm eps back off the live adapter (source of truth post-load).
+        self._rms_eps = self.host.norm_eps()
+
+        # 4. Freeze backbone. Trainable pieces (W_in/W_out/scale + memory) are
         # added after this.
         if config.freeze_backbone:
-            for p in self.llama.parameters():
-                p.requires_grad = False
+            self.host.freeze_backbone()
 
-        # 4. Swap the chosen layer with a MemInjectLayer. memory_fn=None so
+        # 5. Swap the chosen layer with a MemInjectLayer. memory_fn=None so
         # the layer is a transparent pass-through until memory is wired
         # per-forward. W_in / W_out / scale stay at their fp32 nn.Parameter
         # default — bf16 param updates round small Adam steps to zero,
         # which silently stalls training on small smoke runs. The forward
         # handles the cross-dtype add explicitly.
         L = config.inject_layer
-        orig_layer: LlamaDecoderLayer = self.llama.model.layers[L]
-        self.llama.model.layers[L] = MemInjectLayer(
+        orig_layer = self.host.layer_list()[L]
+        self.host.replace_layer(L, MemInjectLayer(
             orig_layer=orig_layer,
             d_lm=config.d_lm,
             d_mem=config.d_mem,
             scale_init=config.scale_init,
             memory_fn=None,
-        )
+        ))
 
-        # 5. Memory graph: config.memory has D set to d_mem. vocab_size on the
+        # 6. Memory graph: config.memory has D set to d_mem. vocab_size on the
         # memory config doesn't need to match the LM vocab — the aux-loss head
-        # goes through the adapter, which uses Llama's lm_head directly.
+        # goes through the adapter, which uses the host's lm_head directly.
         config.memory.vocab_size = config.vocab_size_lm
         config.memory.validate()
         self.memory = MemoryGraph(config.memory) if attach_memory else None
         # Memory PARAMS stay in fp32. Bf16 optimizer updates round small
         # gradients to zero (param = 2.0, update = 1e-5 → 2.0 in bf16).
-        # Memory STATE tensors (h, W, hebbian, ...) follow Llama's dtype
+        # Memory STATE tensors (h, W, hebbian, ...) follow the host's dtype
         # via reset_memory so the forward-path matmuls don't mix dtypes.
         # Buffers (out_port_mask, role_id) also stay fp32 / int64; the
         # fused step casts out_port_mask to state dtype per call.
-        self._adapter = (LlamaMemAdapter(self.llama, self.mem_inject.W_out,
-                                         rms_eps=self._rms_eps)
+        self._adapter = (MemAdapter(self.host, self.mem_inject.W_out)
                          if attach_memory else None)
         # Without memory, pin scale to zero so the inject residual stays zero
         # and MemInjectLayer can pass through transparently. The loud assert
@@ -114,13 +125,13 @@ class PretrainedLMWithMemory(nn.Module):
 
     @property
     def mem_inject(self) -> MemInjectLayer:
-        """Reference to the inserted MemInjectLayer via the llama path."""
-        return self.llama.model.layers[self.config.inject_layer]
+        """Reference to the inserted MemInjectLayer via the host layer list."""
+        return self.host.layer_list()[self.config.inject_layer]
 
     def reset_memory(self, bs: int):
         if self.memory is not None:
             p = next(self.llama.parameters())
-            # Match memory state dtype to Llama's dtype so h_mem crossings
+            # Match memory state dtype to the host's dtype so h_mem crossings
             # don't fight mixed dtypes under no-autocast code paths (CPU
             # tests and eager inference). Under bf16 autocast on CUDA the
             # training loop would handle casts anyway, but forcing dtype
@@ -145,7 +156,7 @@ class PretrainedLMWithMemory(nn.Module):
         # set_memory_fn / unset dance keeps the wrapper safe for calls without
         # memory (e.g., direct `self.llama(input_ids)` from helpers).
         prev_token = kwargs.pop("prev_token", None)
-        use_rms = True
+        use_rms = self.host.use_rmsnorm()
 
         # Aux loss only matters during training. In eval / rollout we skip
         # the 128K-vocab mem_head matmul entirely — biggest single cost
@@ -212,11 +223,9 @@ class PretrainedLMWithMemory(nn.Module):
         """Re-enable gradient on everything that's trainable by default.
         Use to restore the bootstrap training surface."""
         if self.config.freeze_backbone:
-            for p in self.llama.parameters():
-                p.requires_grad = False
+            self.host.freeze_backbone()
         else:
-            for p in self.llama.parameters():
-                p.requires_grad = True
+            self.host.unfreeze_backbone()
         if self.memory is not None:
             for p in self.memory.parameters():
                 p.requires_grad = True
