@@ -1,8 +1,13 @@
 # Pretrained-LM + Memory Graph
 
-**Branch:** `pretrained-lm-memory-v2`.
+**Branch:** `main` (promoted from `pretrained-lm-memory-v2` on 2026-04-19).
 **Status:** pretrained smoke suite passes on CPU (`tests/test_pretrained_smoke.py`).
 No dedicated GPU smoke is wired on this branch yet.
+
+> **Training data + reward plan**: see `docs/training_plan.md` for the
+> sequenced dataset strategy (synthetic passkey/K:V → custom
+> conversational → LongMemEval/RULER benchmarks) and the
+> paraphrase-tolerant composite reward design.
 
 This doc describes how the memory graph (from the from-scratch attention-neuromod
 work — see `design.md` for its internals) is grafted onto a pretrained Llama-3.2
