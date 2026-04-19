@@ -101,6 +101,14 @@ class MemoryGraph(nn.Module):
 
         self._initialized = False
         self._compiled = False
+        # Sampling-mode override. Decouples "use hard-Categorical phase-2
+        # sampling" from `self.training`, which previously also gated
+        # modulator dropout back on and made phase-2 rollouts
+        # non-deterministic (dropout noise not represented in log_pi).
+        # Set to True via `wrapper.rollout_mode()` during phase-2 prefix
+        # passes; `_modulate` then picks the hard-sampling branch even
+        # when the memory graph is in eval mode (dropout off).
+        self._force_phase2_sampling: bool = False
 
     # ================================================================
     # State management
@@ -394,15 +402,14 @@ class MemoryGraph(nn.Module):
         BS, NC, K = logits.shape
         logits_flat = logits.reshape(BS * NC, K)
         log_pi_flat = torch.zeros(BS * NC, device=logits.device, dtype=logits.dtype)
-        if self.training and phase == "phase1":
-            soft, codes = self.discrete_policy.sample_gumbel_soft(
-                logits_flat, tau=self.gumbel_tau, hard=True)
-            emb = self.discrete_policy.lookup_soft(soft)       # [BS*NC, D_code]
-            self.discrete_policy.update_usage(codes)
-        elif not self.training:
-            codes = logits_flat.argmax(dim=-1)
-            emb = self.discrete_policy.lookup(codes)
-        else:
+        # `_force_phase2_sampling` lets callers (phase-2 rollout / grpo_step)
+        # request hard Categorical sampling with log_pi even while the
+        # modulator is in eval mode — that keeps dropout off, which is
+        # required for determinism (seeded Generator only controls
+        # multinomial, not dropout).
+        use_hard_sampling = (self._force_phase2_sampling or
+                              (self.training and phase == "phase2"))
+        if use_hard_sampling:
             # Phase 2: hard Categorical sampling. Preserve log_pi so the
             # training loop can compute the REINFORCE / GRPO policy-gradient
             # update. Gradient flows through log_pi back to the modulator
@@ -410,6 +417,15 @@ class MemoryGraph(nn.Module):
             # sampled index.
             codes, log_pi_flat = self.discrete_policy.sample_discrete(
                 logits_flat, tau=self.gumbel_tau)
+            emb = self.discrete_policy.lookup(codes)
+        elif self.training and phase == "phase1":
+            soft, codes = self.discrete_policy.sample_gumbel_soft(
+                logits_flat, tau=self.gumbel_tau, hard=True)
+            emb = self.discrete_policy.lookup_soft(soft)       # [BS*NC, D_code]
+            self.discrete_policy.update_usage(codes)
+        else:
+            # Eval / deterministic argmax.
+            codes = logits_flat.argmax(dim=-1)
             emb = self.discrete_policy.lookup(codes)
 
         # Decoder is a shared trunk conditioned on the modulator's cell_emb.
@@ -686,7 +702,14 @@ class MemoryGraph(nn.Module):
         # silently break any downstream reader that missed the capture
         # window. `None` sentinel between phase-2 writes makes stale reads
         # loud instead of silent.
-        if phase == "phase2" and self.training:
+        # Match the sampling-branch gate in _modulate: log_pi is meaningful
+        # whenever hard Categorical sampling ran (either phase-2 + train
+        # mode, or the explicit _force_phase2_sampling override used by
+        # rollout code paths that keep the modulator in eval to silence
+        # dropout noise).
+        ran_hard_sample = (self._force_phase2_sampling or
+                            (phase == "phase2" and self.training))
+        if ran_hard_sample:
             self._last_log_pi_sum = log_pi_sum
         else:
             self._last_log_pi_sum = None

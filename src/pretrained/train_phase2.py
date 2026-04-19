@@ -112,15 +112,32 @@ def grpo_step(
     reference_cont: Tensor,     # [gen_length] — ground-truth continuation tokens
     num_rollouts: int,
     gen_length: int,
+    reward_fn: Callable[[Tensor, Tensor], Tensor],
     temperature: float = 1.0,
     max_grad_norm: float = 1.0,
     adv_std_floor: float = 1e-3,
-    reward_fn: Callable[[Tensor, Tensor], Tensor] = token_match_reward,
     seed: int | None = None,
     metrics_path: str | None = None,
     step_idx: int = 0,
     collect_heavy_telemetry: bool = True,
 ) -> GrpoStepLog:
+    """Run one GRPO step. `reward_fn` is required (no default).
+
+    **Caller responsibility**: this helper backpropagates through
+    whatever parameters have `requires_grad=True`. The canonical
+    phase-2 protocol (logit_head only) is set up by
+    `run_cycle_loop` / `freeze_all_but_logit_head`; if you call
+    `grpo_step` directly with the full training surface attached to
+    the optimizer, all trainable memory params move. That is
+    intentional flexibility — for production phase-2 runs, freeze the
+    surface yourself before handing the optimizer in.
+
+    **Reward warning**: `token_match_reward` (exported from this
+    module) is near-zero-signal over a 128K-vocab continuation unless
+    the task is already near exact-match. It's for smoke tests only.
+    Real runs should pass a task-appropriate reward (log-prob of
+    ground-truth continuation under the memory-augmented LM, BLEU,
+    downstream-task score, etc.)."""
     assert prefix_ids.dim() == 2 and prefix_ids.shape[0] == 1
     device = next(wrapper.parameters()).device
     prefix_ids = prefix_ids.to(device)
@@ -129,36 +146,43 @@ def grpo_step(
     T_prefix = prefix_ids.shape[1]
     device = prefix_ids.device
 
-    gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+    if seed is not None:
+        gen = torch.Generator(device=device).manual_seed(seed)
+        # Also seed the default torch RNG because MemoryGraph.initialize_states
+        # uses torch.randperm (no explicit generator) for the sparse-W init;
+        # without this, two seeded grpo_step calls produce different initial
+        # W across the same reset_memory sequence.
+        _rng_state = torch.random.get_rng_state()
+        torch.manual_seed(seed)
+    else:
+        gen = None
+        _rng_state = None
     t_step_start = time.time()
 
     # 1) Replicate prefix. 2) Reset memory with BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
-    wrapper.current_phase = "phase2"
-    wrapper.train(True)
     wrapper.reset_memory(bs=K)
 
-    device_type = next(wrapper.parameters()).device.type
-    use_autocast = device_type == "cuda"
-    amp_ctx = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-               if use_autocast else _nullcontext())
-
-    # 3) Prefix pass with gradient tracking — memory samples hard codes and
-    # log_pi accumulates. Request KV cache so the generation loop can skip
-    # re-processing the prefix (which would otherwise re-run memory's LIF
-    # over prefix tokens on every gen step, drifting the state).
-    with amp_ctx:
+    # 3) Prefix pass inside rollout_mode: eval (no dropout) + hard
+    # Categorical sampling + phase2 + bf16 autocast on CUDA. Removes the
+    # previous non-determinism where modulator dropout, turned on by
+    # wrapper.train(True), added noise not represented in log_pi.
+    # The REINFORCE gradient path through log_pi_sum is unchanged —
+    # log_pi is still graph-connected through log_softmax to modulator
+    # logits.
+    with wrapper.rollout_mode():
         out = wrapper(prefix_rep, use_cache=True)
-    log_pi_sum = wrapper.memory._last_log_pi_sum            # [K], graph-connected
-    last_prefix_logits = out.logits[:, -1].detach()         # [K, vocab_lm]
-    past_key_values = out.past_key_values
+        log_pi_sum = wrapper.memory._last_log_pi_sum            # [K], graph-connected
+        last_prefix_logits = out.logits[:, -1].detach()         # [K, vocab_lm]
+        past_key_values = out.past_key_values
 
     # 4) Generate under no_grad; rewards. Memory's carried state [K, ...]
     # diverges per rollout thanks to the hard-Categorical prefix sampling,
     # and each gen step runs with a T=1 segment so memory updates its
     # fast state exactly once per generated token (no modulator fires —
     # the mod clock never reaches mod_interval from a fresh start).
-    wrapper.train(False)
+    # Generation runs in eval mode too, so gen-step memory forwards don't
+    # re-sample codes.
     generated = _generate_tokens(
         wrapper, last_prefix_logits, past_key_values,
         gen_length=gen_length, temperature=temperature, gen=gen)
@@ -186,7 +210,9 @@ def grpo_step(
     torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
     optimizer.step()
 
-    # Reset memory phase for any subsequent phase-1 calls.
+    # Reset memory phase for any subsequent phase-1 calls. `rollout_mode`
+    # already restored train/phase to pre-rollout state, but be explicit:
+    # phase-1 is the default outside this function.
     wrapper.current_phase = "phase1"
     wrapper.train(True)
     wrapper.detach_memory()
@@ -229,4 +255,6 @@ def grpo_step(
             "advantage_max_abs": log.advantage_max_abs,
             **log.extras,
         })
+    if _rng_state is not None:
+        torch.random.set_rng_state(_rng_state)
     return log

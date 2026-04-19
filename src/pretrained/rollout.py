@@ -68,28 +68,31 @@ def autoregressive_rollout(
 
     if seed is not None:
         gen = torch.Generator(device=device).manual_seed(seed)
+        # Also seed the DEFAULT torch RNG before reset_memory — the
+        # sparse-W init in MemoryGraph.initialize_states uses
+        # torch.randperm without an explicit generator, which would
+        # otherwise advance the global RNG and make two seeded rollouts
+        # produce different initial W. Restore afterwards so caller RNG
+        # isn't perturbed.
+        _default_state = torch.random.get_rng_state()
+        torch.manual_seed(seed)
     else:
         gen = None
+        _default_state = None
 
     # 1) Replicate prefix across K rollouts and reset memory for BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
     wrapper.reset_memory(bs=K)
 
-    # 2) Process prefix in phase 2 mode so memory uses hard Categorical
-    # sampling (K independent samples across the batch dim). Request KV
-    # cache so the generation loop can skip re-processing the prefix —
-    # otherwise memory's per-token LIF would re-run on all prefix tokens
-    # at every gen step and its state would drift uncontrollably.
-    prior_phase = wrapper.current_phase
+    # 2) Process prefix under `rollout_mode`: eval (no dropout) + hard
+    # Categorical sampling across the K batch dim + KV cache. Determinism
+    # with `seed=…` holds because dropout is off; only the seeded
+    # Generator drives the sample randomness.
     prior_training = wrapper.training
-    wrapper.current_phase = "phase2"
-    wrapper.train(True)
-    with torch.no_grad():
+    with wrapper.rollout_mode(), torch.no_grad():
         out = wrapper(prefix_rep, use_cache=True)
         past_key_values = out.past_key_values
         last_prefix_logits = out.logits[:, -1]
-    wrapper.train(False)
-    wrapper.current_phase = prior_phase
 
     # 3) Generate. First token from the prefix's last-position logits; each
     # subsequent step passes just the new token + KV cache so memory does
@@ -112,6 +115,8 @@ def autoregressive_rollout(
 
     gen_tensor = torch.cat(generated, dim=1)     # [K, gen_length]
     wrapper.train(prior_training)
+    if _default_state is not None:
+        torch.random.set_rng_state(_default_state)
     return RolloutResult(
         generated_ids=gen_tensor,
         prefix_ids=prefix_rep,

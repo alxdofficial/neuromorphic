@@ -106,6 +106,11 @@ class PretrainedLMWithMemory(nn.Module):
         # Caller is responsible for calling `detach_memory()` after
         # backward completes.
         self._preserve_memory_graph: bool = False
+        # `None` = follow `self.training`. `True`/`False` forces aux-loss
+        # computation on or off regardless of training mode — useful for
+        # AR continuation unroll that wants aux loss on the prefix pass
+        # but not per-token during the unroll.
+        self._compute_aux_loss_override: bool | None = None
 
     @property
     def mem_inject(self) -> MemInjectLayer:
@@ -143,9 +148,13 @@ class PretrainedLMWithMemory(nn.Module):
         use_rms = True
 
         # Aux loss only matters during training. In eval / rollout we skip
-        # the 128K-vocab mem_head matmul entirely — it's the biggest single
-        # cost inside forward_segment at T=1 autoregressive gen.
-        compute_aux = self.training
+        # the 128K-vocab mem_head matmul entirely — biggest single cost
+        # at T=1 AR gen. `_compute_aux_loss_override` lets callers force
+        # aux loss off even in training mode (AR unroll uses this to
+        # skip aux loss during per-token continuation steps while keeping
+        # modulator-fire gradient intact).
+        override = getattr(self, "_compute_aux_loss_override", None)
+        compute_aux = self.training if override is None else bool(override)
 
         def memory_fn(h_mem: torch.Tensor) -> torch.Tensor:
             readouts, mem_loss = self.memory.forward_segment(
@@ -222,6 +231,33 @@ class PretrainedLMWithMemory(nn.Module):
         prefix-pass modulator fires."""
         return _PreserveMemoryGraph(self)
 
+    def rollout_mode(self):
+        """Context manager for phase-2 rollouts.
+
+        Inside the block:
+          - `wrapper.train(False)` — modulator dropout is OFF (without
+             this, two seeded rollouts diverge on the dropout noise that
+             the Generator doesn't control, and log_pi_sum doesn't
+             represent the actual action probabilities).
+          - `memory._force_phase2_sampling = True` — `_modulate` still
+             takes the hard-Categorical-with-log_pi branch even though
+             we're in eval mode.
+          - `memory.current_phase = "phase2"` for consistency (also
+             threads to forward_segment so `_last_log_pi_sum` lands).
+          - Autocast bf16 on CUDA.
+
+        The `log_pi_sum` backward path remains graph-connected to the
+        modulator logits — REINFORCE gradient is unchanged. Only dropout
+        and the self.training flag have flipped."""
+        return _RolloutMode(self)
+
+    def compute_aux_loss_override(self, compute: bool | None):
+        """Temporarily override whether `forward_segment` runs the aux
+        `mem_pred_loss` head. `None` → use `self.training`. `False` → skip
+        the 128K-vocab matmul (used during AR continuation unroll where
+        only the prefix pass's aux signal is part of the loss)."""
+        return _ComputeAuxLossOverride(self, compute)
+
 
 class _PreserveMemoryGraph:
     def __init__(self, wrapper: "PretrainedLMWithMemory"):
@@ -234,4 +270,57 @@ class _PreserveMemoryGraph:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.wrapper._preserve_memory_graph = self._prior
+        return False
+
+
+class _RolloutMode:
+    """Phase-2 rollout context: eval mode (no dropout) + hard Categorical
+    sampling in memory + current_phase=phase2 + bf16 autocast on CUDA.
+    Restores prior state on exit."""
+
+    def __init__(self, wrapper: "PretrainedLMWithMemory"):
+        self.wrapper = wrapper
+        self._prior_training = wrapper.training
+        self._prior_phase = wrapper.current_phase
+        self._prior_force = (wrapper.memory._force_phase2_sampling
+                             if wrapper.memory is not None else False)
+        self._amp = None
+
+    def __enter__(self):
+        self.wrapper.train(False)
+        self.wrapper.current_phase = "phase2"
+        if self.wrapper.memory is not None:
+            self.wrapper.memory._force_phase2_sampling = True
+        # bf16 autocast on CUDA keeps dtype math consistent with the
+        # training loops. CPU path uses a null context.
+        dev = next(self.wrapper.parameters()).device.type
+        if dev == "cuda":
+            self._amp = torch.autocast(device_type=dev, dtype=torch.bfloat16)
+            self._amp.__enter__()
+        return self.wrapper
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._amp is not None:
+            self._amp.__exit__(exc_type, exc_val, exc_tb)
+            self._amp = None
+        if self.wrapper.memory is not None:
+            self.wrapper.memory._force_phase2_sampling = self._prior_force
+        self.wrapper.current_phase = self._prior_phase
+        self.wrapper.train(self._prior_training)
+        return False
+
+
+class _ComputeAuxLossOverride:
+    def __init__(self, wrapper: "PretrainedLMWithMemory",
+                  compute: bool | None):
+        self.wrapper = wrapper
+        self.new = compute
+        self._prior = getattr(wrapper, "_compute_aux_loss_override", None)
+
+    def __enter__(self):
+        self.wrapper._compute_aux_loss_override = self.new
+        return self.wrapper
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.wrapper._compute_aux_loss_override = self._prior
         return False

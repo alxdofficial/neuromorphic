@@ -98,6 +98,7 @@ def run_phase1_ar(
     *,
     steps: int,
     max_grad_norm: float = 1.0,
+    mem_pred_weight: float = 0.1,
     gumbel_tau_start: float = 1.0,
     gumbel_tau_end: float = 0.3,
     anneal_across_steps: int | None = None,
@@ -140,27 +141,36 @@ def run_phase1_ar(
         # inside preserve_memory_graph so memory state stays connected
         # across calls. autocast covers matmul dtypes on CUDA.
         with wrapper.preserve_memory_graph(), amp_ctx:
-            # 1. Prefix pass. KV cache captured for the unroll.
+            # 1. Prefix pass. Aux memory-pred loss runs here (modulator
+            # fires; readouts line up with input_ids). KV cache captured
+            # for the unroll.
             out_prefix = wrapper(prefix_ids, use_cache=True)
             past = out_prefix.past_key_values
+            prefix_mem_loss = wrapper._last_mem_pred_loss     # scalar or None
             # Logit at the LAST prefix position predicts cont_ids[:, 0].
             last_logit = out_prefix.logits[:, -1]     # [BS, vocab]
             ce_first = F.cross_entropy(last_logit.float(), cont_ids[:, 0])
 
-            # 2. Unroll. Feed cont_ids[:, i] as the new input for step i+1;
-            # its logit predicts cont_ids[:, i+1]. So after T_cont-1 steps
-            # we have scored positions 1..T_cont-1.
+            # 2. Unroll with aux loss DISABLED — each T=1 continuation
+            # step's aux would be a near-zero-signal 128K-vocab matmul on
+            # a single readout. Keep the prefix's aux signal (where all
+            # the modulator fires happen).
             ce_terms: list[Tensor] = [ce_first]
-            for i in range(T_cont - 1):
-                new_tok = cont_ids[:, i:i + 1]        # [BS, 1]
-                out_i = wrapper(new_tok, past_key_values=past, use_cache=True)
-                past = out_i.past_key_values
-                logit_i = out_i.logits[:, -1]         # [BS, vocab]
-                target_i = cont_ids[:, i + 1]
-                ce_terms.append(F.cross_entropy(logit_i.float(), target_i))
+            with wrapper.compute_aux_loss_override(False):
+                for i in range(T_cont - 1):
+                    new_tok = cont_ids[:, i:i + 1]        # [BS, 1]
+                    out_i = wrapper(new_tok, past_key_values=past, use_cache=True)
+                    past = out_i.past_key_values
+                    logit_i = out_i.logits[:, -1]         # [BS, vocab]
+                    target_i = cont_ids[:, i + 1]
+                    ce_terms.append(F.cross_entropy(logit_i.float(), target_i))
 
-            # Mean CE over all T_cont predicted positions.
-            loss = torch.stack(ce_terms).mean()
+            # Mean CE over all T_cont predicted positions + weighted aux.
+            cont_loss = torch.stack(ce_terms).mean()
+            if prefix_mem_loss is not None and torch.is_tensor(prefix_mem_loss):
+                loss = cont_loss + mem_pred_weight * prefix_mem_loss
+            else:
+                loss = cont_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -169,8 +179,8 @@ def run_phase1_ar(
         optimizer.step()
         wrapper.detach_memory()
 
-        mem_loss = wrapper._last_mem_pred_loss
-        mem_loss_val = float(mem_loss.item()) if torch.is_tensor(mem_loss) else 0.0
+        mem_loss_val = (float(prefix_mem_loss.item())
+                        if torch.is_tensor(prefix_mem_loss) else 0.0)
 
         is_log_step = step == 0 or (step + 1) % log_interval == 0
         extras: dict = {}

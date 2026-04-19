@@ -178,6 +178,10 @@ def run_cycle_loop(
                     f"r_mean={lg.reward_mean:.3f} r_std={lg.reward_std:.3f} "
                     f"log_pi={lg.log_pi_mean:.2f} A_max={lg.advantage_max_abs:.2f}")
 
+    # Restore a neutral training surface so callers that continue to use
+    # the wrapper after the cycle loop aren't stuck in the final
+    # phase-2 freeze configuration.
+    wrapper.unfreeze_all()
     log("\n=== CYCLE LOOP COMPLETE ===")
 
 

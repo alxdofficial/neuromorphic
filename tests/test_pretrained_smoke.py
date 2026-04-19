@@ -686,6 +686,47 @@ def test_phase2_grpo_step_runs_and_flows_gradient_to_modulator():
 
 
 @requires_llama
+def test_autoregressive_rollout_is_deterministic_under_seed():
+    """Two seeded calls to autoregressive_rollout(..., seed=N) on the same
+    wrapper state must produce identical token streams and identical
+    final logits. Regression guard: the prior design called
+    `wrapper.train(True)` during the prefix pass to activate hard
+    Categorical sampling, which also enabled modulator dropout.
+    Dropout's randomness is NOT controlled by the seeded Generator, so
+    two seeded rollouts diverged by ~7.5 logit-max on 1B. rollout_mode
+    flips eval (dropout off) while keeping hard sampling via the
+    `_force_phase2_sampling` override."""
+    from src.model.config import Config as MemoryConfig
+    from src.pretrained.config import PretrainedConfig
+    from src.pretrained.llm_wrapper import PretrainedLMWithMemory
+    from src.pretrained.rollout import autoregressive_rollout
+
+    torch.manual_seed(0)
+    mem_cfg = MemoryConfig.tier_a(D=2048, tbptt_block=64)
+    cfg = PretrainedConfig.llama_1b(memory=mem_cfg, llama_dtype="fp32")
+    wrapper = PretrainedLMWithMemory(cfg)
+
+    T_pre = 2 * cfg.memory.modulation_interval
+    prefix = torch.randint(0, cfg.vocab_size_lm, (1, T_pre))
+
+    r1 = autoregressive_rollout(
+        wrapper, prefix, gen_length=4, num_rollouts=2,
+        temperature=1.0, seed=123)
+    r2 = autoregressive_rollout(
+        wrapper, prefix, gen_length=4, num_rollouts=2,
+        temperature=1.0, seed=123)
+
+    assert torch.equal(r1.generated_ids, r2.generated_ids), (
+        "Seeded rollouts diverged on generated tokens — dropout or "
+        "other unseeded randomness is leaking into the sampling path.")
+    max_logit_diff = (r1.final_logits - r2.final_logits).abs().max().item()
+    # With dropout bug this was ~7.56 on Llama-1B; post-fix the final
+    # logits must match to within numerical noise.
+    assert max_logit_diff < 1e-4, (
+        f"Seeded rollout logits differ by {max_logit_diff} — expect ~0")
+
+
+@requires_llama
 def test_phase2_advantage_std_floor_clamps_noise_level_rewards():
     """When rewards are near-uniform (std ≪ floor), advantages must stay
     bounded. Without the floor (eps=1e-8), a std of ~1e-5 produces
