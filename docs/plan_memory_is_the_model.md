@@ -7,47 +7,79 @@
 superset design with 6 laminae, ERR units, episodic buffer, replay,
 structural plasticity — future extensions on top of v0).
 
-> **TL;DR.** We delete the LM and replace it with a **2-D grid of
-> cortical columns with wave-propagation dynamics**. 6×6 = 36 columns,
-> each containing N=32 neurons. Tokens enter at sensory columns (left
-> edge), waves propagate rightward via local 8-neighbor connectivity,
-> output columns (right edge) feed a multi-horizon readout. A small
-> number of random long-range skip connections (K_long=4 per column,
-> fixed at init) keep the grid's effective diameter low.
+## Core thesis
+
+> **We don't just train a model — we train a model PLUS a policy that
+> knows how to tweak the model at inference.**
 >
-> **All connection weights are scalars** (per-edge, not per-channel or
-> matrix). Channel mixing happens inside each neuron's `state_MLP` and
-> `spike_MLP`, not at the edges. This is biologically accurate and
-> gives the neuromodulator a minimal action space: just `(η_c, dir_c)`
-> per column per MOD event — one learning-rate and one LTP/LTD sign
-> scalar. Hebbian eligibility traces per edge decide WHICH synapses
-> actually update.
+> The neuromodulator is a **learned neural-network policy**. It observes
+> each column's state and emits per-column actions `(η_c, dir_c)` that
+> steer online plasticity of the column's scalar weights. Once trained,
+> this policy is the learning rule the network uses for the rest of its
+> deployment life.
 >
-> **Fast weights are state, not parameters.** `W_intra`, `W_inter`,
-> `W_long` are never backprop-trained. They load from a learned init
-> template once, at day-0 of deployment; from there, neuromod-driven
-> plasticity is the only thing that changes them. **At inference,
-> nothing resets — ever.** Column states, Hebbian traces, and fast
-> weights all evolve continuously from deployment forward. Years of
-> running = years of accumulated plastic state. This is the
-> "memory IS the model" thesis in its cleanest form and the true
-> lifelong-learning property. Training-time resets (TBPTT detach,
-> between-example boundaries) are artifacts of bounded-graph backprop,
-> not architectural features.
+> This is the central claim. Prior fast-weight work (TTT, LaCT,
+> MesaNet) uses **hand-specified update rules** — gradient descent,
+> optimal regression, etc. Prior plastic-net work (Miconi, Najarro)
+> uses **hand-specified Hebbian forms** with learned coefficients.
+> **We replace the update rule itself with a trained policy**,
+> optimized by backprop-through-plasticity (phase 1) AND RL on
+> long-horizon rollouts (phase 2). Phase 2 is what lets the policy
+> learn from credit assignment that backprop can't reach.
 >
-> **Meta-learning framing.** Neuromod + MLP weights ARE the learning
-> rule (frozen at inference). Fast weights are what gets learned
-> (plastic at inference, reset per segment). Training shapes the
-> rule; deployment lets the rule learn forever.
+> If this works, the deployment story is different: day 0 the policy
+> is frozen and fast weights are at init. Day 365, fast weights have
+> evolved via 365 days of policy-driven plasticity. We never retrained
+> the network — the policy did. **That's the thesis: the network that
+> exists on day 365 was "grown" by the policy, not trained.**
 >
-> **Two-phase training.** Phase 1 = differentiable-plasticity backprop
-> with TBPTT (trains everything except the fast weights themselves).
-> Phase 2 = GRPO long-horizon rollouts with Gaussian noise on neuromod
-> scalar actions (trains neuromod policy only).
+> Every other design choice is engineering scaffolding to make this
+> tractable:
 >
-> **No hierarchy, no thalamus, no attention.** Signals propagate across
-> the grid as waves. No shortcuts. Memory lives in plastic scalar
-> weights + state that persists across ticks within a segment.
+> - **Scalar weights** → tiny per-column action space → RL is feasible.
+> - **No LM backbone** → policy actions have visible effect on reward
+>   (prior branches' RL failed at 10⁻⁴ SNR because the LM absorbed
+>   everything).
+> - **Multi-horizon readout** → self-consistent surprise signal during
+>   self-generation, so the policy has useful input at inference time.
+> - **2-clock structure** → plasticity only fires every 16 tokens, so
+>   the policy's action rate is manageable.
+> - **Small-world 2-D grid** → biological, scales linearly in column
+>   count, keeps effective diameter low via a few random skip edges.
+
+## TL;DR (architecture summary)
+
+> 6×6 = 36 columns on a torus, each containing N=32 neurons. Tokens
+> enter at left-edge "sensory" columns (6 cols), waves propagate
+> rightward via local 8-neighbor connectivity plus K_long=6 random
+> long-range skips per column. Right-edge "motor" columns (6 cols)
+> feed a multi-horizon K=8 readout.
+>
+> **I/O is zero-projection, zero-replication.** Token embedding dim
+> `D_e = N_sense × D_n = 6 × 128 = 768`. The full token embedding
+> reshapes to `[6, 128]`; each sensory column gets a distinct 128-d
+> slice. Motor side mirrors: 6 motor-column states concat to `[768]`
+> and feed the tied unembedding directly. No projection matmuls, no
+> redundant broadcasting.
+>
+> **All connection weights are scalars** (intra-column and
+> inter-column). Channel mixing lives in per-neuron `state_MLP` and
+> `spike_MLP`. **Fast weights (`W_intra, W_inter, W_long`) are state,
+> not parameters** — never backprop-trained. Policy-driven plasticity
+> is the only thing that modifies them. **At inference, nothing
+> resets.** Plastic drift is bounded by γ_W EMA clamp + three-factor
+> gating + periodic diversity injection (Dohare-style) to prevent dead
+> columns.
+>
+> **Policy** (per column, per MOD tick): `(η_c, dir_c)`. Learning rate
+> magnitude and LTP/LTD sign. 72 scalars network-wide per MOD event
+> — small enough for RL.
+>
+> **Two-phase training.** Phase 1: differentiable plasticity with TBPTT
+> (trains slow weights + learnable per-column plastic coefficients +
+> fast-weight init templates). Phase 2: GRPO rollouts with Gaussian
+> noise on policy actions (trains neuromod policy only, for
+> long-horizon credit that phase 1 can't reach).
 
 ---
 
@@ -82,7 +114,7 @@ mechanisms at once. V0 keeps the minimum needed to test the core thesis.
 - Triton fusion path (reuse current kernel pattern).
 - **2-D grid structure** (new): columns laid out spatially, local
   8-neighbor connectivity, sensory and motor regions at opposite edges.
-- **Per-column long-range skip connections** (new): K_long=4 random
+- **Per-column long-range skip connections** (new): K_long=6 random
   targets per column, fixed topology, scalar weights.
 - **Multi-horizon readout** (new): K=8 prediction heads from motor
   columns. Non-degenerate surprise in self-generation.
@@ -108,7 +140,7 @@ mechanisms at once. V0 keeps the minimum needed to test the core thesis.
 ### 3.1 The wave-grid principle
 
 Columns are laid out on a 2-D grid. Each column connects to its 8 grid
-neighbors (Moore neighborhood) plus K_long=4 random long-range targets
+neighbors (Moore neighborhood) plus K_long=6 random long-range targets
 chosen at init. Tokens arrive at sensory columns on the LEFT edge;
 waves of activity propagate rightward through the grid; the RIGHT edge
 (motor columns) pools into the readout.
@@ -131,7 +163,7 @@ waves of activity propagate rightward through the grid; the RIGHT edge
 - Grid: **6 × 6 = 36 columns** at dev tier.
 - Sensory columns: `x=0` (leftmost), 6 columns.
 - Motor columns: `x=5` (rightmost), 6 columns.
-- Grid diameter without skips: ~10 (Manhattan). With K_long=4 random
+- Grid diameter without skips: ~10 (Manhattan). With K_long=6 random
   skips: ~3 effective diameter (small-world).
 
 ### 3.2 One column
@@ -149,25 +181,43 @@ Each column has a consistent internal structure:
 ### 3.3 Inter-column connectivity (grid + skips)
 
 Each column has:
-- `K_grid = 8` Moore-neighborhood edges (within-grid local).
-- `K_long = 4` random long-range edges to non-neighbor columns, fixed
-  at init.
+- `K_grid = 8` Moore-neighborhood edges (within-grid local, **torus topology**
+  so edge-of-grid columns wrap around — no edge effects).
+- `K_long = 6` random long-range edges to non-neighbor columns, fixed
+  at init (`log₂(C=36) ≈ 5.2`, so 6 gives small-world diameter).
 
 All inter-column weights are **scalars**:
 - `W_inter[c, k] ∈ R` for `k ∈ 0..7` (grid neighbor index).
-- `W_long[c, k] ∈ R` for `k ∈ 0..3` (long-range target index).
+- `W_long[c, k] ∈ R` for `k ∈ 0..5` (long-range target index).
 
 Plus Hebbian traces at every edge (same shapes).
 
 Static index tensors fixed at init:
 ```
-grid_nbrs[c] : Long[C, K_grid=8]    # column indices of grid neighbors
-long_nbrs[c] : Long[C, K_long=4]   # column indices of random skips
+grid_nbrs[c] : Long[C, K_grid=8]    # column indices of grid neighbors (torus)
+long_nbrs[c] : Long[C, K_long=6]   # column indices of random skips
 ```
 
 **Compile-time optimization.** Both grid and skips have fixed shape per
-column, so we concatenate them into one `[C, K_total=12]` target array
+column, so we concatenate them into one `[C, K_total=14]` target array
 and run a single batched gather + scalar-weighted sum per tick.
+
+**Learnable per-column plastic coefficients.** Per column `c`, we learn:
+```
+η_max[c]  ∈ R⁺     # per-column maximum learning rate
+γ_W[c]    ∈ [0, 1] # per-column plasticity EMA coefficient
+σ_η[c]    ∈ R⁺     # phase-2 Gaussian noise scale for η
+σ_dir[c]  ∈ R⁺     # phase-2 Gaussian noise scale for dir
+```
+These are slow weights (backprop-only, frozen at inference). Matches main's
+per-neuron `W_decay_logit[NC, N]` pattern. `4 × C = 144` extra scalars
+total — trivial.
+
+**Why learnable:** different cortical regions in biology have different
+plastic-speed profiles (hippocampus fast, neocortex slow). Letting each
+column learn its own γ_W and η_max lets the network allocate plasticity
+where it's useful. Noise scales being per-column lets phase 2 auto-anneal
+exploration differently per column.
 
 ### 3.4 Fast weights are state, not parameters
 
@@ -177,7 +227,7 @@ The three plastic weight tensors:
 |---|---|---|
 | `W_intra` | `[C=36, N=32, N=32]` = 37 K scalars | Load from init template at day-0 → neuromod-plastic forever at inference |
 | `W_inter` | `[C=36, K_grid=8]` = 288 scalars | Same |
-| `W_long` | `[C=36, K_long=4]` = 144 scalars | Same |
+| `W_long` | `[C=36, K_long=6]` = 216 scalars | Same |
 | Hebbian traces (per edge) | same shapes as above | EMA every FAST tick; natural decay via γ_e |
 
 These are **never in the optimizer.** Backprop flows through them
@@ -234,15 +284,18 @@ def fast_tick(self, external_input):
     col_msg = pool_head(self.msg_prev)                       # [C, D_n]
 
     # 3. Inter-column: one gather + scalar-weighted sum
-    #    all_nbrs is [C, K_total=12] fixed indices (grid + skips)
+    #    all_nbrs is [C, K_total=14] fixed indices (grid + skips)
     #    W_all is [C, K_total] scalar weights
     nbr_msgs = col_msg[self.all_nbrs]                        # [C, K_total, D_n]
     inter_contrib = einsum('ck,ckd->cd', self.W_all, nbr_msgs)
                                                              # [C, D_n]
 
-    # 4. Sensory input injected at left edge ONLY
+    # 4. Sensory input: D_e=768 token embedding reshapes to [N_sense=6, D_n=128]
+    #    and each sensory column gets a DISTINCT slice (no replication,
+    #    no projection). Channel specialization emerges naturally.
     received_col = inter_contrib                             # [C, D_n]
-    received_col[self.sensory_cols] += self.W_sense @ external_input
+    sensory_slices = external_input.view(N_sense, D_n)       # [6, 128]
+    received_col[self.sensory_cols] += sensory_slices
 
     # 5. Broadcast column-level signal into each column's neurons
     received = intra_out + received_col.unsqueeze(1)         # [C, N, D_n]
@@ -272,18 +325,22 @@ def fast_tick(self, external_input):
     self.hebbian_inter = ((1 - γ_e) * self.hebbian_inter
                           + γ_e * corr_inter)
 
-    # Long-range skips: per skip-target co-firing [C, K_long=4]
+    # Long-range skips: per skip-target co-firing [C, K_long=6]
     long_prev    = col_msg_prev[self.long_nbrs]            # [C, K_long, D_n]
     corr_long    = einsum('cd,ckd->ck', col_msg, long_prev)
     self.hebbian_long  = ((1 - γ_e) * self.hebbian_long
                           + γ_e * corr_long)
 
-    # 9. Multi-horizon readout from motor columns ONLY
+    # 9. Multi-horizon readout from motor columns — zero-projection.
+    #    Pool each motor col's neurons to [D_n=128], concat N_motor=6
+    #    columns → [D_e=768]. Feed directly to unembedding (tied to
+    #    token embedding, so shape is [vocab, 768]).
     if len(self.motor_cols) > 0:
-        h_motor = self.h[self.motor_cols]                    # [|motor|, N, D_n]
-        h_motor_pool = pool_motor(h_motor)                   # [D_e]
+        h_motor = self.h[self.motor_cols]                    # [N_motor=6, N=32, D_n=128]
+        motor_slices = h_motor.mean(dim=1)                   # [N_motor=6, D_n=128] pool per col
+        motor_readout = motor_slices.flatten()               # [D_e=768] concat
         for k in range(K_horizons):
-            logits_t[k] = unembedding(h_motor_pool + horizon_emb[k])
+            logits_t[k] = unembedding(motor_readout + horizon_emb[k])
         self.pred_buf.append(logits_t)                       # [K, vocab]
 
     # 10. Surprise scoring against actual_t (materialized from external
@@ -314,20 +371,33 @@ feats_c = concat([
     intra_hebbian_moments(hebbian_intra[c]),
                                          # [4]   mean|·|, std|·|, max|·|, mean (signed)
     hebbian_inter[c],                   # [K_grid=8]  raw per-edge eligibility
-    hebbian_long[c],                    # [K_long=4]  raw per-edge eligibility
+    hebbian_long[c],                    # [K_long=6]  raw per-edge eligibility
     # --- identity + global signals ---
     cell_emb[c],                        # [32]  — learned column identity
     surprise_ema * broadcast,           # [1]   — global error, broadcast to each col
-    recent_input_ctx * broadcast,       # [D_e=512] — global EMA of token embeddings
-])                                       # → ~820 scalars per column
+    recent_input_ctx * broadcast,       # [D_e=768] — global EMA of token embeddings
+])                                       # → ~1080 scalars per column
 
 # Shared trunk (batched across all columns)
 trunk_out = neuromod.trunk(feats)       # [C, D_trunk]
 
-# Per-column scalar actions — only two outputs per column
-η_c   = sigmoid(neuromod.head_η(trunk_out))   * η_max   # [C] ∈ [0, η_max]
-dir_c = tanh   (neuromod.head_dir(trunk_out))           # [C] ∈ [-1, +1]
+# Per-column scalar actions — only two outputs per column.
+# Multiplied by LEARNED per-column η_max[c] and σ_η[c] for per-column
+# plasticity budgets (see §3.3).
+η_c   = sigmoid(neuromod.head_η(trunk_out))   * η_max_learned   # [C] ∈ [0, η_max[c]]
+dir_c = tanh   (neuromod.head_dir(trunk_out))                    # [C] ∈ [-1, +1]
 ```
+
+**Hyperparameter defaults (all magic numbers pinned):**
+| Name | Value | Rationale |
+|---|---:|---|
+| γ_e | 0.05 | half-life 14 ticks, matches MOD=16 |
+| γ_W_init | 0.1 | per-column, learnable; 10 MOD events to halve a weight |
+| η_max_init | 0.1 | per-column, learnable; keeps update ~1% of W scale |
+| σ_η_init | 0.005 | per-column, learnable; exploration scale for phase 2 |
+| σ_dir_init | 0.1 | per-column, learnable; broader than η noise |
+| λ_k | 1.0 uniform | horizon weighting in loss; ablate at M4 |
+| α_input_ctx | 0.05 | EMA coefficient for recent_input_ctx |
 
 **Pool choice rationale.** Mean pooling for `h[c]` preserves 128 dims of
 per-channel activity — not bottlenecked. Hebbian intra is `[N, N] = 1024`
@@ -355,22 +425,24 @@ network-wide. Tiny. The neuromod's entire job is to decide per column:
 At each MOD event, for every edge:
 
 ```python
-# Three-factor gate — sigmoid of pooled features, per edge
-gate = sigmoid(gate_net(
-    hebbian_at_this_edge,      # eligibility (factor 1)
+# Three-factor gate — small MLP, per COLUMN (not per edge)
+gate_c = sigmoid(gate_net(
+    pool(hebbian_intra[c]),    # eligibility magnitude (factor 1)
     surprise_ema,              # error (factor 2)
     η_c * dir_c,               # neuromod (factor 3, signed)
 ))                              # scalar ∈ [0, 1]
 
 # The update per edge is a scalar:
-#   magnitude = η_c * dir_c * gate
-#   "which edges change" is encoded in the Hebbian trace
-ΔW_edge = η_c * dir_c * gate * hebbian_at_this_edge
+#   magnitude = η_c * dir_c * gate_c    (all per-column)
+#   "which edges change" is encoded in the per-edge Hebbian trace
+ΔW_intra[c, i, j] = η_c * dir_c * gate_c * hebbian_intra[c, i, j]
+ΔW_inter[c, k]    = η_c * dir_c * gate_c * hebbian_inter[c, k]
+ΔW_long[c, k]     = η_c * dir_c * gate_c * hebbian_long[c, k]
 
-# γ-clamped EMA write (all three weight tensors updated same way)
-W_intra[c, i, j] ← (1-γ_W) * W_intra[c, i, j] + γ_W * ΔW_intra[c, i, j]
-W_inter[c, k]    ← (1-γ_W) * W_inter[c, k]    + γ_W * ΔW_inter[c, k]
-W_long[c, k]     ← (1-γ_W) * W_long[c, k]     + γ_W * ΔW_long[c, k]
+# γ-clamped EMA write with LEARNABLE per-column γ_W[c]
+W_intra[c, i, j] ← (1-γ_W[c]) * W_intra[c, i, j] + γ_W[c] * ΔW_intra[c, i, j]
+W_inter[c, k]    ← (1-γ_W[c]) * W_inter[c, k]    + γ_W[c] * ΔW_inter[c, k]
+W_long[c, k]     ← (1-γ_W[c]) * W_long[c, k]     + γ_W[c] * ΔW_long[c, k]
 ```
 
 **Why this works.**
@@ -384,7 +456,47 @@ Classical three-factor learning: `Δsynapse = presynaptic × postsynaptic × neu
 Here, presynaptic × postsynaptic → Hebbian trace; neuromodulator → η·dir.
 
 At inference, this rule keeps firing. Only the fast weights move.
-Everything else (neuromod, MLPs, readout, embedding) is frozen.
+Everything else (neuromod, MLPs, readout, embedding, learnable per-column
+plastic coefficients) is frozen.
+
+### 3.8 Diversity injection — dead-column prevention
+
+**The risk.** [Dohare et al. 2024 (Nature)](https://www.nature.com/articles/s41586-024-07711-7)
+shows that standard gradient-based networks progressively **lose plasticity**
+in continual learning: weights drift toward dead configurations and
+never recover. Our design is vulnerable to this — if a column's
+eligibility (pooled Hebbian) stays near zero for many MOD events, the
+three-factor gate never opens, the column never plasticizes again, it's
+effectively dead forever.
+
+**The mitigation — continual-backprop-style diversity injection.** Every
+N_diversity = 100 MOD events (≈ 1600 tokens), identify columns with
+pooled Hebbian below a threshold for the full lookback window, and
+inject small random perturbations to their fast weights:
+
+```python
+# At slow intervals (every 100 MOD events):
+for c in range(C):
+    if eligibility_history[c].max() < hebbian_dead_threshold:
+        # This column has been inactive — inject noise to rescue it
+        W_intra[c] += σ_revive * randn_like(W_intra[c])
+        W_inter[c] += σ_revive * randn_like(W_inter[c])
+        W_long[c]  += σ_revive * randn_like(W_long[c])
+```
+
+With `σ_revive = 0.01` (1% noise relative to W scale 1.0). Small
+enough that active columns wouldn't notice; large enough to break dead
+columns out of their zero-activity attractor.
+
+This is our version of Dohare's "continual backpropagation" — a
+small, continuous source of diversity that prevents monotone drift to
+dead states over billions of tokens of inference.
+
+**When does it fire?**
+- Off during training (fast weights reset per segment anyway).
+- On at inference, at very slow cadence (every 100 MOD events = every
+  ~1600 tokens). One extra elementwise op every 1600 ticks — negligible
+  cost.
 
 ---
 
@@ -423,47 +535,59 @@ gather.
 
 ---
 
-## 6. Parameter count (dev tier, C=36, N=32, D_n=128, K_grid=8, K_long=4, K=8)
+## 6. Parameter count (dev tier, C=36, N=32, D_n=128, K_grid=8, K_long=6, K=8, D_e=768)
 
 ### Slow weights (trained by backprop, frozen at inference)
 
 | Component | Shape / notes | Params |
 |---|---|---:|
-| Token embedding (tied to unembedding) | `[vocab=32K, D_e=512]` | 16.4 M |
-| W_sense (input projection) | `[D_e, D_n]` | 66 K |
+| Token embedding (tied to unembedding) | `[vocab=32K, D_e=768]` | 24.6 M |
+| W_sense | NONE — zero-projection via reshape | 0 |
+| pool_motor | NONE — zero-projection via concat | 0 |
 | state_MLP (shared across all neurons) | 2-layer `[D_n×2 → D_n]` | 65 K |
 | spike_MLP (shared) | similar | 65 K |
-| pool_head (neuron → column pooling) | `[N, D_n → D_n]` | 4 K |
-| pool_motor (motor cols → D_e) | `[|motor|·N·D_n → D_e]` | 400 K |
-| Horizon embedding | `[K=8, D_e]` | 4 K |
+| pool_head (neuron → column pooling) | softmax over N | 32 (one per neuron, tiny) |
+| Horizon embedding | `[K=8, D_e=768]` | 6 K |
 | Neuromod trunk | shared transformer/MLP, ~4-layer | ~3 M |
 | Neuromod heads (η, dir) | `D_trunk → 1` each | ~20 K |
 | Gate net | small MLP | ~10 K |
 | cell_emb | `[C=36, 32]` | 1 K |
+| cell_position_emb | `[C=36, 16]` (sin/cos or learned) | 576 |
 
-### Learned fast-weight init templates (trained by backprop, loaded at segment start)
+### Learnable per-column plastic coefficients (slow weights, frozen at inference)
+
+| Component | Shape | Params |
+|---|---|---:|
+| η_max_learned | `[C=36]` | 36 |
+| γ_W_learned | `[C=36]` | 36 |
+| σ_η_learned | `[C=36]` | 36 |
+| σ_dir_learned | `[C=36]` | 36 |
+
+### Learned fast-weight init templates (trained by backprop, loaded at day 0)
 
 | Component | Shape | Params |
 |---|---|---:|
 | W_intra_init | `[C, N, N]` scalar | 37 K |
 | W_inter_init | `[C, K_grid]` scalar | 0.3 K |
-| W_long_init | `[C, K_long]` scalar | 0.1 K |
+| W_long_init | `[C, K_long=6]` scalar | 0.2 K |
 
 ### Fast weights (STATE, not params, zero optimizer entries)
 
 Identical shapes to the init templates. Evolve via neuromod during
-forward, reset to init at segment start.
+forward. At inference: no reset. At training: reset to init per
+independent segment.
 
 ### Hebbian traces (STATE, not params)
 
 Identical shapes to W_intra / W_inter / W_long. Rolling EMA, reset per
-segment.
+segment during training; natural γ_e decay at inference.
 
 ### Totals
 
-- **Slow weight params:** ~20 M
+- **Slow weight params:** ~28 M (+8 M from D_e=512→768 embedding upgrade)
+- **Learnable per-column coefficients:** 144 scalars
 - **Fast-weight init template params:** ~37 K
-- **Grand total:** ~20 M
+- **Grand total:** ~28 M
 
 That's ~5× smaller than the pretrained-LM path (100 M+ on Llama-1B)
 and ~20× smaller than Llama-3B. The "model" is mostly the learning
@@ -624,8 +748,10 @@ fluency.
 6. **Small action space for neuromod.** 72 scalars per MOD event.
    Cheap forward + backward.
 
-**Target throughput: 150–250 K tok/s at dev scale.** Exceeds current
-main's standalone memory graph.
+**Target throughput: 80–150 K tok/s at dev scale** (revised down from
+earlier estimate after pinning D_e=768 — readout GEMM dominates).
+Comparable to current main's standalone memory graph (68 K), still
+>1000× faster than Llama-3B autoregressive.
 
 ---
 
@@ -636,22 +762,23 @@ main's standalone memory graph.
 | Operation | Shape | FMA |
 |---|---|---:|
 | Intra-column scalar matmul | `[C=36, N, N] × [C, N, D_n]` | 4.7 M |
-| Inter-column scalar (grid + skips) | `[C, 12] × [C, 12, D_n]` | 55 K |
-| state_MLP (shared, batched 36×32=1152 neurons) | 2-layer `D_n×2 → D_n` | ~1 M |
+| Inter-column scalar (grid + skips, K_total=14) | `[C, 14] × [C, 14, D_n]` | 64 K |
+| state_MLP (shared, batched 1152 neurons) | 2-layer `D_n×2 → D_n` | ~1 M |
 | spike_MLP (same) | ~1 M |
 | LIF update + elementwise | — | ~0.1 M |
 | Hebbian trace updates (scalar per edge) | — | ~40 K |
-| Multi-horizon readout (K=8 × `D_e → vocab`) | — | 131 M |
+| **Multi-horizon readout (K=8 × `D_e=768 → vocab=32K`)** | — | **197 M** |
 | Surprise scoring (softmax × K) | — | ~1 M |
-| Input projection at sensory cols | `[D_e, D_n]` | ~67 K |
-| **Total per token** | | **~139 M** |
+| Sensory slice injection (reshape + add) | — | negligible |
+| **Total per token** | | **~205 M** |
 
-The multi-horizon readout (131 M) dominates everything else (~8 M). All
-the cortex-side work is cheap.
+The multi-horizon readout (197 M) now dominates even more strongly (~96%
+of per-tick FMA) because D_e went 512→768. Everything cortex-side is
+~8 M.
 
 **RTX 4090** peak bf16 ≈ 80 TFLOPS, realistic 40-50 % MFU ≈ 35 TFLOPS.
 
-**FLOP-bound throughput:** `35 × 10¹² / 139 × 10⁶ ≈ 252 K tok/s`.
+**FLOP-bound throughput:** `35 × 10¹² / 205 × 10⁶ ≈ 170 K tok/s`.
 
 ### 9.2 Memory bandwidth
 
@@ -822,26 +949,46 @@ Trimmed to papers directly load-bearing for v0.
 
 [3] [A silent eligibility trace enables dopamine-dependent synaptic plasticity](https://consensus.app/papers/details/39e2eaa5a0ce50e8a55b075431e66c5e/?utm_source=claude_code) (Shindou et al., 2018, 80 citations) — direct experimental evidence for eligibility traces gating plasticity.
 
-**Test-time training / mesa-optimization**
+[34] [Neuromodulated STDP and Theory of Three-Factor Learning Rules](https://consensus.app/papers/details/b573c1aaf2655be28fbde9d15948b749/?utm_source=claude_code) (Frémaux & Gerstner, 2016, 413 citations) — canonical review; bridges timing, reward, and synaptic change. Load-bearing for our plasticity rule's justification.
 
-[7] [Learning to (Learn at Test Time): RNNs with Expressive Hidden States](https://consensus.app/papers/details/ea4cdf995acb589f93c13cdfa76dbe7f/?utm_source=claude_code) (Sun et al., 2024, 161 citations) — TTT: hidden state is an ML model, updated by SGD each step. CortexNet's "fast weights as state" is this.
+[35] [Learning with three factors: modulating Hebbian plasticity with errors](https://consensus.app/papers/details/f1c7cbfb55b25c7a9b5ce510657ddbf4/?utm_source=claude_code) (Kuśmierz et al., 2017, 122 citations) — ML-perspective review of three-factor rules; motivates "neuromodulator as error signal" framing.
+
+**Test-time training / learned plasticity rules**
+
+[7] [Learning to (Learn at Test Time): RNNs with Expressive Hidden States](https://consensus.app/papers/details/ea4cdf995acb589f93c13cdfa76dbe7f/?utm_source=claude_code) (Sun et al., 2024, 161 citations) — TTT: hidden state is an ML model, updated by SGD each step. CortexNet's "fast weights as state" generalizes this — we REPLACE the SGD update rule with a learned policy.
 
 [28] [Test-Time Training Done Right](https://consensus.app/papers/details/fb2c8417ffb05dc0a9a0fd6426418ce4/?utm_source=claude_code) (Zhang et al., 2025, 17 citations) — LaCT: 14B params with fast weights, 56K context.
 
-**Differentiable plasticity**
+[29] [MesaNet: Sequence Modeling by Locally Optimal Test-Time Training](https://consensus.app/papers/details/ce96961fa81a5e679cba72cfa49cedbb/?utm_source=claude_code) (von Oswald et al., 2025, 10 citations) — optimal CG-based fast-weight updates; contrast to our learned-policy updates.
 
-[32] [Differentiable plasticity: training plastic neural networks with backpropagation](https://consensus.app/papers/details/af2e3b8fc73053629c5c72276a207481/?utm_source=claude_code) (Miconi et al., 2018, 170 citations) — the template for CortexNet's phase-1 training: fast weights are not parameters, but their init templates are.
+**Differentiable plasticity / meta-learning**
 
-**Predictive coding / multi-horizon prediction**
+[32] [Differentiable plasticity: training plastic neural networks with backpropagation](https://consensus.app/papers/details/af2e3b8fc73053629c5c72276a207481/?utm_source=claude_code) (Miconi et al., 2018, 170 citations) — the template for CortexNet's phase 1: fast weights are not parameters, but their init templates + Hebbian coefficients are trained end-to-end.
 
-[22] [A tutorial on the free-energy framework for modelling perception and learning](https://consensus.app/papers/details/f7210495d7fd5003885659f62e8e7efb/?utm_source=claude_code) (Bogacz, 2017, 286 citations) — predictive coding = prediction-error-driven learning; motivates the K-horizon surprise gate.
+[36] [Meta-Learning through Hebbian Plasticity in Random Networks](https://consensus.app/papers/details/baa8c494f569571fa95c616c1b0c912f/?utm_source=claude_code) (Najarro & Risi, 2020, 84 citations) — 450K plasticity parameters; learns Hebbian coefficients per synapse. Validates v1's "random init + pure plasticity" fallback.
 
-**Cortex topology**
+**Multi-horizon prediction**
 
-[8] [The Thousand Brains Project: A New Paradigm for Sensorimotor Intelligence](https://consensus.app/papers/details/c46aa9f57b0854b696b1993c4a70008c/?utm_source=claude_code) (Clay et al., 2024, 4 citations) — repeated-column AI. CortexNet's grid is the flat-2D version of this.
+[37] [Better & Faster Large Language Models via Multi-token Prediction](https://consensus.app/papers/details/95c08662845b5b01922abd2823918f81/?utm_source=claude_code) (Gloeckle et al., 2024, 183 citations) — Meta's multi-token prediction. CortexNet's multi-horizon readout is the same architecture (K output heads on shared trunk). Our novel extension: using K-horizon error as an inference-time surprise gate for plasticity.
 
-[19] [A Resilient, Low-Frequency, Small-World Human Brain Functional Network](https://consensus.app/papers/details/a6b931c3a20958a78aff54ba9339237e/?utm_source=claude_code) (Achard et al., 2006, 2388 citations) — sparse small-world cortex with hub structure. Motivates v0's K_long random long-range edges over pure grid.
+**Predictive coding**
+
+[22] [A tutorial on the free-energy framework for modelling perception and learning](https://consensus.app/papers/details/f7210495d7fd5003885659f62e8e7efb/?utm_source=claude_code) (Bogacz, 2017, 286 citations) — predictive coding as prediction-error-driven learning.
+
+[38] [Transformers and Cortical Waves: Encoders for Pulling In Context Across Time](https://consensus.app/papers/details/8ccdd67f1a425aa5bad5917137cbb6f7/?utm_source=claude_code) (Muller et al., 2024, 10 citations, Trends in Neurosciences) — argues transformers implicitly compute wave-like temporal encoding. Parallel to our wave-grid.
+
+**Cortex topology / reservoir computing**
+
+[8] [The Thousand Brains Project: A New Paradigm for Sensorimotor Intelligence](https://consensus.app/papers/details/c46aa9f57b0854b696b1993c4a70008c/?utm_source=claude_code) (Clay et al., 2024, 4 citations) — repeated-column AI.
+
+[19] [A Resilient, Low-Frequency, Small-World Human Brain Functional Network](https://consensus.app/papers/details/a6b931c3a20958a78aff54ba9339237e/?utm_source=claude_code) (Achard et al., 2006, 2388 citations) — sparse small-world cortex.
 
 [21] [Scalable training of ANNs with adaptive sparse connectivity inspired by network science](https://consensus.app/papers/details/2c65cd5405d45036ae5824355e5dc489/?utm_source=claude_code) (Mocanu et al., 2017, 688 citations) — Sparse Evolutionary Training.
+
+[39] [A small-world topology enhances the echo state property and signal propagation in reservoir computing](https://consensus.app/papers/details/a4a9eafae2c45553a37dd71fa61d72b4/?utm_source=claude_code) (Kawai et al., 2019, 121 citations) — **direct precursor to v0's topology**: small-world reservoir with spatially segregated input and output nodes, shown optimal for memory capacity. CortexNet adds learned plasticity on top of this reservoir.
+
+**Continual learning / loss of plasticity**
+
+[40] [Loss of plasticity in deep continual learning](https://consensus.app/papers/details/7e06c73f3cb355c295592ae33c54579d/?utm_source=claude_code) (Dohare et al., 2024, 189 citations, Nature) — standard deep-learning networks progressively lose plasticity in continual settings. "Continual backpropagation" periodically re-initializes under-used units. **Motivates CortexNet's diversity injection mechanism (§3.8).**
 
 [Paper consensus search (20 full results per query)](https://consensus.app/sign-up/?utm_source=claude_code&auth=claude_code)
