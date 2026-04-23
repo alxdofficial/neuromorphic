@@ -1,8 +1,28 @@
 # GraphWalker — Trajectory-Routed Plastic Concept Graph
 
 **Branch:** `graph-walker` (from `column-graph`), supersedes the dense column-graph design.
-**Status:** design locked, implementation in progress.
+**Status:** v1 implementation complete. 8/8 tests pass. Training sanity check verified
+  (50-step run: loss 10.74 → 6.13, below log(V); visit entropy 0.97 of uniform;
+  stable grad norms; no NaN).
 **Date:** 2026-04-23.
+
+## 0. Current implementation status
+
+- Module: `src/graph_walker/` — `config.py`, `topology.py`, `routing.py`,
+  `readout.py`, `graph_walker.py`, `standalone.py`, `train_phase1.py`.
+- Tests: `tests/test_graph_walker.py` — 8 tests covering shape, trajectory
+  visits, non-visited column preservation, gradient flow through STE,
+  plasticity firing, detach semantics, reset, CUDA bf16 smoke.
+- Scripts: `scripts/smoke_graph_walker.py` (overfit demo),
+  `scripts/bench_graph_walker.py` (one-config throughput).
+- Measured throughput at BS=16, T=128, tbptt=16 (dev config N=1024
+  D_s=512 H=4 L=4, 19.2M params): **~2660 tok/s, 1.66 GB peak VRAM.**
+- Training sanity (50 steps, BS=8, T=64, overfit on random tokens):
+  - Loss 10.74 → 6.13 (CE dropping meaningfully below log(V)=10.37).
+  - Visit entropy = 0.97 × log(N) — routing stays near-uniform (no collapse).
+  - Gradients stable (norms 2-8 range).
+  - Plastic E_bias accumulating without overflow.
+  - VRAM 1.11 GB.
 
 ## 1. Thesis
 
