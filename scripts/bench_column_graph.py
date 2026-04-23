@@ -18,9 +18,7 @@ def bench_one(cfg: ColumnGraphConfig, bs: int, t: int, tbptt: int, steps: int, c
     opt = torch.optim.AdamW(lm.parameters(), lr=1e-4, fused=True)
 
     if compile_hot:
-        lm.memory._hot_forward = torch.compile(
-            lm.memory._hot_forward, mode="default", fullgraph=False, dynamic=False
-        )
+        lm.memory.compile_block(mode="default")
 
     tokens = torch.randint(0, cfg.vocab_size, (bs, t), device="cuda")
 
@@ -56,12 +54,12 @@ def main():
         cfg = ColumnGraphConfig(
             plane_rows=16, plane_cols=16, L=3,
             K=16, D_s=128, D_id=16,
-            num_tiles_per_plane_dim=2, vocab_size=8000,
+            vocab_size=8000,
         )
         configs = [(2, 32, 16), (4, 32, 16), (8, 32, 16)]
     else:
         cfg = ColumnGraphConfig()
-        configs = [(1, 32, 16), (2, 32, 16), (2, 64, 16)]
+        configs = [(8, 128, 16), (16, 128, 16), (8, 256, 16)]
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("=== Uncompiled ===")

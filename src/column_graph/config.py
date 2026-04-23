@@ -26,8 +26,11 @@ class ColumnGraphConfig:
     D_id: int = 32                          # column identity dim
     ffn_mult_update: int = 4                # update_MLP: D_s + D_id + D_s → 4·D_s → D_s
     ffn_mult_content: int = 2               # content_MLP: D_s + D_id → 2·D_s → D_s
-    ffn_mult_delta: int = 1                 # delta_MLP: D_s + D_id → D_s → D_s (residual)
-    score_hidden: int = 64                  # score_MLP hidden
+    # Multi-head bilinear score. q_proj/k_proj are 2-layer GELU MLPs.
+    # Per-edge score = Σ_h q[src, h] · k[dst, h] + E_bias, so work is
+    # O(N · H · D_q) per-column nonlinear + O(N·K·H·D_q) per-edge linear.
+    n_score_heads: int = 4
+    D_q_per_head: int = 64
 
     # --- Dynamics ---
     T: int = 1                              # rounds per token (depth from T_seq, not T)
@@ -44,14 +47,15 @@ class ColumnGraphConfig:
     E_bias_max: float = 4.0
     E_bias_init_scale: float = 0.0          # start at zero, let plasticity write
     alpha_gamma_s: float = 0.1              # surprise EMA rate
-    alpha_input_ctx: float = 0.05           # input-ctx EMA rate
-    alpha_tile_stats: float = 0.05          # mag/var EMA rate for tile features
 
     # --- Neuromod ---
-    D_trunk: int = 384
-    trunk_hidden: int = 768
+    # Minimal two-level structure: global trunk takes only surprise + Δsurprise
+    # (no input-ctx EMA, no tile aggregates — those were redundant with the
+    # per-column local observables neuromod already sees). Per-column heads
+    # consume id + post + w_out_proxy + pre_at_nbrs + broadcast trunk context.
+    D_trunk: int = 128
+    trunk_hidden: int = 256
     head_hidden: int = 64
-    num_tiles_per_plane_dim: int = 4        # each plane tiled 4×4 = 16 tiles per plane
 
     # --- Cross-attention I/O ---
     n_attn_heads_in: int = 4                # multi-head for input injection
@@ -82,16 +86,6 @@ class ColumnGraphConfig:
             raise ValueError("K must be >= 2")
         if not 0.0 <= self.p_rewire <= 1.0:
             raise ValueError("p_rewire must be in [0, 1]")
-        if self.plane_rows % self.num_tiles_per_plane_dim != 0:
-            raise ValueError(
-                f"plane_rows ({self.plane_rows}) must be divisible by "
-                f"num_tiles_per_plane_dim ({self.num_tiles_per_plane_dim})"
-            )
-        if self.plane_cols % self.num_tiles_per_plane_dim != 0:
-            raise ValueError(
-                f"plane_cols ({self.plane_cols}) must be divisible by "
-                f"num_tiles_per_plane_dim ({self.num_tiles_per_plane_dim})"
-            )
 
     @property
     def N_per_plane(self) -> int:
@@ -104,23 +98,3 @@ class ColumnGraphConfig:
     @property
     def num_edges(self) -> int:
         return self.N * self.K
-
-    @property
-    def num_tiles_per_plane(self) -> int:
-        return self.num_tiles_per_plane_dim ** 2
-
-    @property
-    def num_tiles(self) -> int:
-        return self.L * self.num_tiles_per_plane
-
-    @property
-    def tile_rows(self) -> int:
-        return self.plane_rows // self.num_tiles_per_plane_dim
-
-    @property
-    def tile_cols(self) -> int:
-        return self.plane_cols // self.num_tiles_per_plane_dim
-
-    @property
-    def tile_size(self) -> int:
-        return self.tile_rows * self.tile_cols

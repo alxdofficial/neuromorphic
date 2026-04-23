@@ -18,7 +18,6 @@ def _build(**overrides):
         K=cfg.K,
         p_rewire=cfg.p_rewire,
         K_intra_fraction=cfg.K_intra_fraction,
-        num_tiles_per_plane_dim=cfg.num_tiles_per_plane_dim,
         seed=cfg.topology_seed,
     )
 
@@ -30,7 +29,6 @@ def test_sizes():
     assert topo.edge_dst.shape == (cfg.N * cfg.K,)
     assert topo.input_positions.shape == (cfg.N_per_plane,)
     assert topo.output_positions.shape == (cfg.N_per_plane,)
-    assert topo.tile_ids.shape == (cfg.N,)
 
 
 def test_destinations_in_range():
@@ -44,17 +42,6 @@ def test_input_output_planes_distinct():
     # Input plane is 0, output plane is L-1.
     assert torch.all(topo.plane_ids[topo.input_positions] == 0)
     assert torch.all(topo.plane_ids[topo.output_positions] == cfg.L - 1)
-
-
-def test_tile_ids_partition_columns():
-    cfg, topo = _build()
-    # Every column gets a tile_id in [0, num_tiles)
-    assert topo.tile_ids.min() >= 0
-    assert topo.tile_ids.max() < cfg.num_tiles
-    # Every tile contains exactly tile_size columns
-    counts = torch.bincount(topo.tile_ids, minlength=cfg.num_tiles)
-    expected = cfg.tile_size
-    assert torch.all(counts == expected), f"tile size mismatch: {counts}"
 
 
 def test_edge_src_dst_consistency():
@@ -86,12 +73,9 @@ def test_determinism():
     cfg, topo_a = _build()
     _, topo_b = _build()
     assert torch.all(topo_a.out_nbrs == topo_b.out_nbrs)
-    assert torch.all(topo_a.tile_ids == topo_b.tile_ids)
 
 
 def test_config_validates():
-    with pytest.raises(ValueError):
-        ColumnGraphConfig(plane_rows=33, num_tiles_per_plane_dim=4)
     with pytest.raises(ValueError):
         ColumnGraphConfig(L=1)
     with pytest.raises(ValueError):

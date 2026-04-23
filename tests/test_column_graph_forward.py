@@ -23,7 +23,6 @@ def _tiny_cfg(**overrides) -> ColumnGraphConfig:
         vocab_size=256,
         mod_period=4,
         tbptt_block=8,
-        num_tiles_per_plane_dim=2,
         n_attn_heads_in=2,
         n_attn_heads_out=2,
     )

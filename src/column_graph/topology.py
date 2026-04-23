@@ -35,7 +35,6 @@ class Topology:
     edge_src: torch.Tensor        # [N*K] int64 — source column for each directed edge
     edge_dst: torch.Tensor        # [N*K] int64 — destination column for each directed edge
     position: torch.Tensor        # [N, 3] int64 — (plane, row, col)
-    tile_ids: torch.Tensor        # [N] int64
     plane_ids: torch.Tensor       # [N] int64
     input_positions: torch.Tensor  # [N_per_plane] int64
     output_positions: torch.Tensor  # [N_per_plane] int64
@@ -46,7 +45,6 @@ class Topology:
             edge_src=self.edge_src.to(device),
             edge_dst=self.edge_dst.to(device),
             position=self.position.to(device),
-            tile_ids=self.tile_ids.to(device),
             plane_ids=self.plane_ids.to(device),
             input_positions=self.input_positions.to(device),
             output_positions=self.output_positions.to(device),
@@ -95,7 +93,6 @@ def build_topology(
     K: int,
     p_rewire: float,
     K_intra_fraction: float,
-    num_tiles_per_plane_dim: int,
     seed: int,
 ) -> Topology:
     """Build the static topology. All indices are flat column indices in [0, N)."""
@@ -116,20 +113,6 @@ def build_topology(
                 n = to_flat(p, r, c)
                 position[n] = torch.tensor([p, r, c])
                 plane_ids[n] = p
-
-    # ------- Tile IDs -------
-    tile_rows = plane_rows // num_tiles_per_plane_dim
-    tile_cols = plane_cols // num_tiles_per_plane_dim
-    tiles_per_plane = num_tiles_per_plane_dim ** 2
-    tile_ids = torch.empty(N, dtype=torch.int64)
-    for p in range(L):
-        for r in range(plane_rows):
-            for c in range(plane_cols):
-                n = to_flat(p, r, c)
-                tr = r // tile_rows
-                tc = c // tile_cols
-                tile_local = tr * num_tiles_per_plane_dim + tc
-                tile_ids[n] = p * tiles_per_plane + tile_local
 
     # ------- I/O plane positions -------
     input_positions = torch.tensor(
@@ -203,7 +186,6 @@ def build_topology(
         edge_src=edge_src,
         edge_dst=edge_dst,
         position=position,
-        tile_ids=tile_ids,
         plane_ids=plane_ids,
         input_positions=input_positions,
         output_positions=output_positions,

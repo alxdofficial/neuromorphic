@@ -33,14 +33,13 @@ def main():
         cfg = ColumnGraphConfig(
             plane_rows=16, plane_cols=16, L=3,
             K=16, D_s=128, D_id=16,
-            num_tiles_per_plane_dim=2, vocab_size=8000,
+            vocab_size=8000,
         )
     elif args.scale == "dev":
         cfg = ColumnGraphConfig()    # defaults: 4 planes × 32×32, D_s=256, K=32
     else:  # med
         cfg = ColumnGraphConfig(
             plane_rows=48, plane_cols=48, L=6, K=48, D_s=384,
-            num_tiles_per_plane_dim=6,
         )
 
     lm = StandaloneLM(cfg).cuda()

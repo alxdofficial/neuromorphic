@@ -28,7 +28,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from src.column_graph.config import ColumnGraphConfig
 from src.column_graph.topology import Topology, build_topology
@@ -36,8 +35,6 @@ from src.column_graph.neuromod import Neuromod
 from src.column_graph.plasticity import (
     compute_activities,
     hebbian_update_incoming,
-    update_input_ctx_ema,
-    update_tile_stats,
 )
 from src.column_graph.readout import (
     MultiHorizonReadout,
@@ -58,8 +55,27 @@ def _rmsnorm(dim: int) -> nn.Module:
 
 
 class ColumnMLPs(nn.Module):
-    """update / content / delta / score — shared across all columns and
-    all plasticity steps. All are standard GELU MLPs, batched over N or N·K.
+    """Per-column / per-edge shared-weight compute blocks.
+
+    Hot path per token (unchanged in structure):
+      content_mlp(s, id) → m_out       # per-column, fires every token
+      update_mlp(s, id, incoming) → s_new  # per-column, fires every token
+
+    Per-edge scoring (NEW: MLP-projected multi-head bilinear):
+      q[c] = q_proj(s, id)              # [N, H, D_q] — state-dependent
+      k[c] = k_proj(id)                 # [N, H, D_q] — static within a segment, cache
+      score[A, k] = sum_h q[A, h] · k[out_nbrs[A,k], h] + E_bias[A, k]
+      w_out[A, k] = σ(score)
+
+    Dropped: delta_mlp (same content to every out-neighbor; per-edge tailoring
+    was 36.5 GFLOPs/token — 72% of per-token compute — and thesis-wise is
+    expressable through per-edge w_out scaling of a shared m_out).
+
+    Dropped: score_mlp on concat(s, id_src, id_dst) → now replaced with a
+    bilinear form whose q/k projections are small nonlinear MLPs running
+    per-column (N work) rather than per-edge (N·K work). Preserves thesis
+    requirement that routing depend on (state, src-id, dst-id) while running
+    ~27× cheaper.
     """
 
     def __init__(self, cfg: ColumnGraphConfig) -> None:
@@ -84,30 +100,36 @@ class ColumnMLPs(nn.Module):
             nn.Linear(cfg.ffn_mult_content * D_s, D_s),
         )
 
-        # delta_MLP: (D_s_content + D_id_dest) → 1·D_s → D_s (residual, zero-init)
-        self.delta_mlp = nn.Sequential(
-            nn.Linear(D_s + D_id, cfg.ffn_mult_delta * D_s),
+        # Multi-head bilinear scoring.
+        #
+        # q_proj maps (s, id_src) → [n_heads, D_q]
+        # k_proj maps id_dst → [n_heads, D_q]  — static within a segment
+        H = cfg.n_score_heads
+        D_q = cfg.D_q_per_head
+        self.n_heads = H
+        self.D_q = D_q
+        self.q_proj = nn.Sequential(
+            nn.Linear(D_s + D_id, 2 * H * D_q),
             nn.GELU(),
-            nn.Linear(cfg.ffn_mult_delta * D_s, D_s),
+            nn.Linear(2 * H * D_q, H * D_q),
         )
-        # Zero-init final delta so initial m_edge = m_out for every edge.
-        nn.init.zeros_(self.delta_mlp[-1].weight)
-        nn.init.zeros_(self.delta_mlp[-1].bias)
-
-        # score_MLP: (D_s_content + D_id_src + D_id_dst) → hidden → 1
-        self.score_mlp = nn.Sequential(
-            nn.Linear(D_s + 2 * D_id, cfg.score_hidden),
+        self.k_proj = nn.Sequential(
+            nn.Linear(D_id, 2 * H * D_q),
             nn.GELU(),
-            nn.Linear(cfg.score_hidden, 1),
+            nn.Linear(2 * H * D_q, H * D_q),
         )
-        # Zero-init score so initial w_out = sigmoid(0 + 0) = 0.5 uniform.
-        nn.init.zeros_(self.score_mlp[-1].weight)
-        nn.init.zeros_(self.score_mlp[-1].bias)
+        # Zero-init final q/k projections so initial score = 0 → w_out = 0.5
+        # uniform at init (gentle routing, same as old score_MLP zero-init).
+        nn.init.zeros_(self.q_proj[-1].weight)
+        nn.init.zeros_(self.q_proj[-1].bias)
+        nn.init.zeros_(self.k_proj[-1].weight)
+        nn.init.zeros_(self.k_proj[-1].bias)
 
-        # Depth-scaled init on the first layer of each MLP: std = 1/sqrt(depth).
-        # Depth here = 2 (2-layer MLPs). Using 0.02 * 1/sqrt(2) ≈ 0.014.
-        for module in [self.update_mlp[0], self.content_mlp[0], self.delta_mlp[0],
-                       self.score_mlp[0]]:
+        # Depth-scaled init on first layer of each MLP: std = 1/sqrt(depth=2) ≈ 0.014.
+        for module in [
+            self.update_mlp[0], self.content_mlp[0],
+            self.q_proj[0], self.k_proj[0],
+        ]:
             nn.init.normal_(module.weight, mean=0.0, std=0.014)
 
 
@@ -138,13 +160,11 @@ class ColumnGraphMemory(nn.Module):
             K=cfg.K,
             p_rewire=cfg.p_rewire,
             K_intra_fraction=cfg.K_intra_fraction,
-            num_tiles_per_plane_dim=cfg.num_tiles_per_plane_dim,
             seed=cfg.topology_seed,
         )
         self.register_buffer("out_nbrs", topo.out_nbrs, persistent=False)
         self.register_buffer("edge_src", topo.edge_src, persistent=False)
         self.register_buffer("edge_dst", topo.edge_dst, persistent=False)
-        self.register_buffer("tile_ids", topo.tile_ids, persistent=False)
         self.register_buffer("plane_ids", topo.plane_ids, persistent=False)
         self.register_buffer("input_positions", topo.input_positions, persistent=False)
         self.register_buffer("output_positions", topo.output_positions, persistent=False)
@@ -188,35 +208,50 @@ class ColumnGraphMemory(nn.Module):
         # --- Persistent state (buffers, not parameters) ---
         # Allocated lazily in begin_segment() because they depend on B and device.
         self._state_initialized = False
+        # Cache for k_proj(id) — static within a segment since id doesn't
+        # change between optimizer steps. Invalidated in begin_segment()
+        # (pessimistic; works if caller calls begin_segment between opt steps).
+        self._k_cache: torch.Tensor | None = None
         self.s: torch.Tensor                # [B, N, D_s]
-        self.E_bias_flat: torch.Tensor       # [N*K] fp32
+        self.E_bias_flat: torch.Tensor       # [N*K] fp32 — plastic long-term memory
         self.pred_buf: torch.Tensor          # [B, K_buf, K_horizons, V]
         self.surprise_ema: torch.Tensor      # [B, K_horizons]
         self.surprise_prev: torch.Tensor     # [B, K_horizons]  for Δsurprise
-        self.input_ctx_ema: torch.Tensor     # [B, D_s]
-        self.mag_ema: torch.Tensor           # [B, num_tiles]
-        self.var_ema: torch.Tensor           # [B, num_tiles]
-        self.traffic_ema: torch.Tensor       # [B, num_tiles]
         self.pred_cursor: int = 0
         self.pred_filled: int = 0
         self.tick_counter: int = 0
 
     # -----------------------------------------------------------------
-    # State management
+    # State management — three separate concerns
     # -----------------------------------------------------------------
+    #
+    # 1. Working memory (h, prediction buffer, surprise EMAs, counters) —
+    #    per-document state. `begin_segment()` resets this. Analogous to
+    #    "clearing short-term memory at the start of a new conversation."
+    #
+    # 2. Plastic long-term memory (E_bias) — accumulates across
+    #    training steps and across documents at inference. Only reset
+    #    by `reset_plastic_memory()` (called once at init / explicit reset).
+    #
+    # 3. Autograd graph — severed at TBPTT boundaries by `detach_state()`.
+    #    Preserves all numerical values; only cuts the gradient trail so
+    #    backward is bounded.
 
     def begin_segment(self, B: int, device: torch.device) -> None:
-        """Reset persistent state for a new segment. Call at segment start."""
+        """Reset **working memory** for a new document. Preserves plastic E_bias.
+
+        Zeros: column states `s`, prediction ring buffer, surprise EMAs,
+        and ring/tick counters. Invalidates `_k_cache`.
+
+        Does NOT touch: `E_bias_flat` (long-term plastic memory). If you
+        want a full cold start (e.g., at training launch), call
+        `reset_plastic_memory()` separately or together.
+        """
         cfg = self.cfg
         dtype_fast = self._fast_dtype(device)
+        self._k_cache = None
 
-        # State init: h[c] = id_proj(id[c]) — warm start from identity, not zero.
-        # But keep it simple: zero init in v1, let plasticity ramp up.
         self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
-
-        self.E_bias_flat = torch.zeros(
-            cfg.num_edges, device=device, dtype=torch.float32
-        )
         self.pred_buf = init_prediction_buffer(
             B, cfg.K_buf, cfg.K_horizons, cfg.vocab_size, device, dtype_fast
         )
@@ -224,19 +259,40 @@ class ColumnGraphMemory(nn.Module):
             B, cfg.K_horizons, device=device, dtype=torch.float32
         )
         self.surprise_prev = torch.zeros_like(self.surprise_ema)
-        self.input_ctx_ema = torch.zeros(B, cfg.D_s, device=device, dtype=dtype_fast)
-        self.mag_ema = torch.zeros(B, cfg.num_tiles, device=device, dtype=torch.float32)
-        self.var_ema = torch.zeros(B, cfg.num_tiles, device=device, dtype=torch.float32)
-        self.traffic_ema = torch.zeros(
-            B, cfg.num_tiles, device=device, dtype=torch.float32
-        )
         self.pred_cursor = 0
         self.pred_filled = 0
         self.tick_counter = 0
+
+        # Lazy-initialize E_bias_flat on the first call (so we don't need
+        # an explicit reset_plastic_memory for the common training path
+        # to just work). Callers who want an explicit hard reset can still
+        # call reset_plastic_memory after begin_segment.
+        if not hasattr(self, "E_bias_flat") or self.E_bias_flat is None:
+            self.reset_plastic_memory(device)
+
         self._state_initialized = True
 
+    def reset_plastic_memory(self, device: torch.device) -> None:
+        """Hard reset of long-term plastic memory (`E_bias_flat`).
+
+        Typically called once at training start or on explicit "forget
+        everything" command. Does not affect working memory — call
+        `begin_segment()` for that separately (or together for a full
+        cold start).
+        """
+        self.E_bias_flat = torch.zeros(
+            self.cfg.num_edges, device=device, dtype=torch.float32
+        )
+
     def detach_state(self) -> None:
-        """TBPTT: detach all persistent state from the autograd graph."""
+        """TBPTT boundary: sever autograd graph, preserve all values.
+
+        Every state tensor is `.detach()`-ed so backward through the next
+        block doesn't traverse this block's forward graph. Numerical
+        values are unchanged — E_bias keeps accumulating, s keeps
+        evolving from here. Invalidates `_k_cache` because k was
+        computed under the old graph.
+        """
         if not self._state_initialized:
             return
         self.s = self.s.detach()
@@ -244,10 +300,7 @@ class ColumnGraphMemory(nn.Module):
         self.pred_buf = self.pred_buf.detach()
         self.surprise_ema = self.surprise_ema.detach()
         self.surprise_prev = self.surprise_prev.detach()
-        self.input_ctx_ema = self.input_ctx_ema.detach()
-        self.mag_ema = self.mag_ema.detach()
-        self.var_ema = self.var_ema.detach()
-        self.traffic_ema = self.traffic_ema.detach()
+        self._k_cache = None
 
     def _fast_dtype(self, device: torch.device) -> torch.dtype:
         choice = self.cfg.state_dtype
@@ -261,11 +314,27 @@ class ColumnGraphMemory(nn.Module):
     # One token step
     # -----------------------------------------------------------------
 
-    def _hot_forward(self, token_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compilable tensor-only hot path: inject → propagate → readout → logits.
+    def step(self, token_id: torch.Tensor) -> MemoryReadout:
+        """Single-token step. Legacy / inference API; training should prefer
+        block-level calls via `run_block(...)`.
+        """
+        assert self._state_initialized, "call begin_segment() first"
+        cfg = self.cfg
+        logits, m_out, w_out_flat, incoming = self._hot_forward(token_id)
+        self._surprise_and_buffer_bookkeeping(token_id, logits)
+        eta_global = None
+        self.tick_counter += 1
+        if self.tick_counter % cfg.mod_period == 0:
+            eta_global = self._plasticity_step(m_out, incoming, w_out_flat)
+        return MemoryReadout(
+            logits=logits, surprise_ema=self.surprise_ema, eta_global=eta_global
+        )
 
-        Returns (logits, m_out, w_out_flat, incoming). No Python integer
-        state touched here. Callable from torch.compile without recompiles.
+    def _hot_forward(self, token_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Legacy per-tick hot path (kept for backward compat + single-token API).
+
+        Returns (logits, m_out, w_out_flat, incoming). Thin wrapper around the
+        primitives that now live in _run_prop_block_pure.
         """
         h_input = self.tied_token_emb(token_id)
         self._inject(h_input)
@@ -274,177 +343,211 @@ class ColumnGraphMemory(nn.Module):
         logits = self.readout(motor, self.tied_token_emb.weight)
         return logits, m_out, w_out_flat, incoming
 
-    def step(self, token_id: torch.Tensor) -> MemoryReadout:
-        """One propagation round for one token. Returns logits + surprise."""
-        assert self._state_initialized, "call begin_segment() first"
-        cfg = self.cfg
-        B = self.s.shape[0]
+    # -----------------------------------------------------------------
+    # Pure-functional block — for block-level torch.compile
+    # -----------------------------------------------------------------
+    #
+    # Design: given a block of tokens, run block_len ticks of
+    # inject+propagate+readout. Return:
+    #   - new_s (final column state)
+    #   - motor_stack [B, block_len, D_s]  (for out-of-compile readout+CE)
+    #   - last_m_out, last_incoming, last_w_out_flat
+    #       (activities from the FINAL tick, used by plasticity step
+    #        which runs OUTSIDE the compiled region)
+    #
+    # Nothing inside this method mutates self's Python attrs (pred_cursor,
+    # tick_counter, EMAs, ring buffer). Those are bookkeeping and live
+    # in forward_segment() outside the compile region. This keeps Inductor's
+    # graph stable and doesn't trigger recompiles on Python-int variation.
+    #
+    # The state `s` flows in as an argument and out as a return. The caller
+    # assigns the returned s back to self.s *after* the compiled call.
+    def _run_prop_block_pure(
+        self,
+        tokens_block: torch.Tensor,       # [B, block_len] Long
+        s: torch.Tensor,                   # [B, N, D_s]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (s_final, motor_stack, last_m_out, last_incoming, last_w_out_flat)."""
+        B, block_len = tokens_block.shape
+        N, K, D_s = self.cfg.N, self.cfg.K, self.cfg.D_s
+        state_dtype = s.dtype
 
-        logits, m_out, w_out_flat, incoming = self._hot_forward(token_id)
+        motors_list: list[torch.Tensor] = []
+        last_m_out = s.new_zeros((B, N, D_s))
+        last_incoming = s.new_zeros((B, N, D_s))
+        last_w_out = s.new_zeros((B, N * K))
 
-        # Python bookkeeping (ring buffer cursor + surprise EMA)
-        self._surprise_and_buffer_bookkeeping(token_id, logits)
-        h_input = self.tied_token_emb(token_id)
+        for t in range(block_len):
+            token_id = tokens_block[:, t]
+            h_input = self.tied_token_emb(token_id)
 
-        # 8. Input-ctx EMA (fp32 under autocast-disabled)
-        with torch.autocast(device_type=h_input.device.type, enabled=False):
-            self.input_ctx_ema = update_input_ctx_ema(
-                self.input_ctx_ema.float(),
-                h_input.detach().float(),
-                cfg.alpha_input_ctx,
-            ).to(self.input_ctx_ema.dtype)
+            # --- inject (pure on s: returns new s)
+            s = self._inject_pure(s, h_input)
 
-            # Update tile stats on every step (cheap EMA).
-            self.mag_ema, self.var_ema = update_tile_stats(
-                self.mag_ema,
-                self.var_ema,
-                self.s.detach(),
-                self.tile_ids,
-                cfg.num_tiles,
-                cfg.alpha_tile_stats,
-            )
+            # --- propagate (pure: returns new_s, m_out, w_out_flat, incoming)
+            s, m_out, w_out_flat, incoming = self._propagate_pure(s)
 
-            # Traffic EMA: sum of |w_out_flat| per tile (source side)
-            traffic_per_col = self._sum_edge_abs_per_source(
-                w_out_flat.detach().float()
-            )                                                 # [B, N]
-            counts = torch.bincount(self.tile_ids, minlength=cfg.num_tiles).float()
-            sum_tile = torch.zeros(
-                B, cfg.num_tiles, device=self.s.device, dtype=torch.float32
-            )
-            sum_tile.index_add_(1, self.tile_ids, traffic_per_col)
-            mean_tile = sum_tile / counts.clamp(min=1)
-            self.traffic_ema = (
-                (1 - cfg.alpha_tile_stats) * self.traffic_ema
-                + cfg.alpha_tile_stats * mean_tile
-            )
+            # --- readout motor (pure on s)
+            motor = self._readout_motor_pure(s)
+            motors_list.append(motor)
 
-        # 9. Plasticity step (every mod_period tokens)
-        eta_global = None
-        self.tick_counter += 1
-        if self.tick_counter % cfg.mod_period == 0:
-            eta_global = self._plasticity_step(m_out, incoming, w_out_flat)
+            last_m_out = m_out
+            last_incoming = incoming
+            last_w_out = w_out_flat
 
-        return MemoryReadout(
-            logits=logits, surprise_ema=self.surprise_ema, eta_global=eta_global
+        motor_stack = torch.stack(motors_list, dim=1)  # [B, block_len, D_s]
+        return s, motor_stack, last_m_out, last_incoming, last_w_out
+
+    # -----------------------------------------------------------------
+    # Block-level driver: compilable forward of `block_len` tokens.
+    # -----------------------------------------------------------------
+
+    def compile_block(self, mode: str = "default") -> None:
+        """Apply torch.compile to the pure propagation block.
+
+        After this, `run_block(...)` goes through the compiled path. Must
+        be called after model is on GPU.
+        """
+        self._run_prop_block_pure = torch.compile(
+            self._run_prop_block_pure,
+            mode=mode,
+            fullgraph=False,
+            dynamic=False,
         )
+
+    def run_block(
+        self, tokens_block: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Drive one block of block_len tokens. Updates self.s, returns:
+          - motor_stack [B, block_len, D_s]  — for downstream CE
+          - last_m_out [B, N, D_s]
+          - last_incoming [B, N, D_s]
+          - last_w_out_flat [B, N·K]
+
+        Ring-buffer bookkeeping + surprise EMA updates are driven by the
+        caller, outside the compiled region. Plasticity is also called
+        outside via `self._plasticity_step(last_m_out, last_incoming,
+        last_w_out_flat)` if the tick_counter hits mod_period.
+        """
+        assert self._state_initialized, "call begin_segment() first"
+        s_new, motor_stack, last_m_out, last_incoming, last_w_out = (
+            self._run_prop_block_pure(tokens_block, self.s)
+        )
+        self.s = s_new
+        return motor_stack, last_m_out, last_incoming, last_w_out
 
     # -----------------------------------------------------------------
     # Inject / propagate / readout
     # -----------------------------------------------------------------
 
-    def _inject(self, h_input: torch.Tensor) -> None:
-        """Per-column gated additive injection at input-plane columns."""
+    def _inject_pure(self, s: torch.Tensor, h_input: torch.Tensor) -> torch.Tensor:
+        """Pure variant of _inject: returns a new s. No self-mutation."""
         B = h_input.shape[0]
-        in_cols = self.input_positions                       # [N_in]
-        s_in = self.s[:, in_cols]                            # [B, N_in, D_s]
-        id_in = self.col_id[in_cols]                         # [N_in, D_id]
+        in_cols = self.input_positions
+        s_in = s[:, in_cols]
+        id_in = self.col_id[in_cols]
         id_in_exp = id_in.unsqueeze(0).expand(B, -1, -1).to(s_in.dtype)
 
         norm_s = self.in_norm(s_in).to(s_in.dtype)
-        q = self.in_q_proj(torch.cat([norm_s, id_in_exp], dim=-1))  # [B, N_in, D_s]
-        k = self.in_k_proj(h_input)                          # [B, D_s]
-        v = self.in_v_proj(h_input)                          # [B, D_s]
+        q = self.in_q_proj(torch.cat([norm_s, id_in_exp], dim=-1))
+        k = self.in_k_proj(h_input)
+        v = self.in_v_proj(h_input)
 
-        # Gate: sigmoid(q · k / sqrt(D_s)), per (B, N_in)
         scale = 1.0 / (self.cfg.D_s ** 0.5)
-        gate = torch.sigmoid(
-            torch.sum(q * k.unsqueeze(1), dim=-1) * scale
-        )                                                    # [B, N_in]
+        gate = torch.sigmoid(torch.sum(q * k.unsqueeze(1), dim=-1) * scale)
         delta = (gate.unsqueeze(-1) * v.unsqueeze(1)).to(s_in.dtype)
 
-        # Additive in-place update of input-plane slice. Keep storage dtype.
-        self.s = self.s.index_copy(
-            1,
-            in_cols,
-            (self.s.index_select(1, in_cols) + delta).to(self.s.dtype),
+        return s.index_copy(
+            1, in_cols, (s.index_select(1, in_cols) + delta).to(s.dtype)
         )
 
+    # Legacy in-place wrapper used by _hot_forward / tests.
+    def _inject(self, h_input: torch.Tensor) -> None:
+        self.s = self._inject_pure(self.s, h_input)
+
     def _propagate(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One round: compute m_out, w_out, send via scatter-add, update state.
+        """Legacy in-place wrapper — delegates to _propagate_pure and assigns self.s."""
+        self.s, m_out, w_out_flat, incoming = self._propagate_pure(self.s)
+        return m_out, w_out_flat, incoming
 
-        Processes per-edge work (delta_MLP, score_MLP, msg·weight) in K-chunks
-        of `k_chunk` edges at a time, accumulating into `incoming` and
-        `w_out_flat`. This caps peak memory to ~1/K_CHUNKS of the naïve
-        all-K-at-once version, which is critical for TBPTT because the
-        saved activations per tick dominate backward memory.
+    def _propagate_pure(
+        self, s: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure propagation round.
 
-        Returns (m_out, w_out_flat, incoming) for use by plasticity.
+        Core ops (all tensor-core shaped, no per-edge MLPs):
+          m_out[c]   = content_mlp(norm(s[c]) || id[c])            # [B, N, D_s]
+          q[c, h, d] = q_proj(norm(s[c]) || id[c])                  # [B, N, H, D_q]
+          k[c, h, d] = k_proj_cached(id[c])                         # [N, H, D_q]
+                       (cached at segment start; id is static)
+          score[A, k] = Σ_h q[A, h] · k[out_nbrs[A,k], h]           # [B, N, K]
+                         + E_bias[A, k]
+          w_out[A, k] = σ(score)                                    # [B, N, K]
+          msg_edge[A, k] = w_out[A, k] · m_out[A]   (same content to every neighbour)
+          incoming[c] = Σ_{A: (A→c)∈edges} msg_edge[A, edge_idx(A→c)]
+          s_new      = α·s + (1-α)·tanh(update_mlp(norm(s), id, norm(incoming)))
+
+        All per-edge work is now O(H·D_q) (one multi-head dot product) rather
+        than O(D_s·D_id + D_s²) (an MLP). No K-chunking needed.
+
+        Returns (s_new, m_out, w_out_flat, incoming).
         """
         cfg = self.cfg
-        B, N, K, D_s, D_id = self.s.shape[0], cfg.N, cfg.K, cfg.D_s, cfg.D_id
-        state_dtype = self.s.dtype
+        B, N, K, D_s, D_id = s.shape[0], cfg.N, cfg.K, cfg.D_s, cfg.D_id
+        H, D_q = self.mlps.n_heads, self.mlps.D_q
+        state_dtype = s.dtype
 
-        # --- Content: m_out[c] = content_MLP(norm(s[c]), id[c]). Compute once.
-        s_norm = self.mlps.content_norm(self.s).to(state_dtype)
+        # --- Content + Q (per-column, state-dependent; run once per tick)
+        s_norm = self.mlps.content_norm(s).to(state_dtype)
         id_exp = self.col_id.unsqueeze(0).expand(B, -1, -1).to(state_dtype)
-        content_in = torch.cat([s_norm, id_exp], dim=-1)     # [B, N, D_s + D_id]
-        m_out = self.mlps.content_mlp(content_in)            # [B, N, D_s]
+        content_in = torch.cat([s_norm, id_exp], dim=-1)              # [B, N, D_s + D_id]
+        m_out = self.mlps.content_mlp(content_in)                      # [B, N, D_s]
+        q = self.mlps.q_proj(content_in).view(B, N, H, D_q)            # [B, N, H, D_q]
 
-        # --- Per-chunk edge work
-        # k_chunk=8 was the sweet spot empirically: smaller chunks save less
-        # activation memory but more Python-loop overhead; larger chunks save
-        # more activations which hurts backward. Tune per scale if needed.
-        k_chunk = 8 if K >= 16 else K
-        incoming = torch.zeros_like(self.s)                  # [B, N, D_s]
-        w_out_chunks: list[torch.Tensor] = []
+        # --- K (static within segment; pull from cache if available)
+        k = self._k_cache
+        if k is None:
+            k = self.mlps.k_proj(self.col_id.to(state_dtype)).view(N, H, D_q)
+            self._k_cache = k
+        k_at_dst = k[self.out_nbrs]                                    # [N, K, H, D_q]
+        k_at_dst = k_at_dst.to(state_dtype)
 
+        # --- Bilinear score per edge: Σ_h q[A, h, :] · k[dst, h, :]
+        scores = torch.einsum("bnhd,nkhd->bnk", q, k_at_dst)           # [B, N, K]
         E_bias_2d = self.E_bias_flat.view(N, K).to(state_dtype)
+        w_out = torch.sigmoid(scores + E_bias_2d.unsqueeze(0))         # [B, N, K]
 
-        for k_start in range(0, K, k_chunk):
-            k_end = min(k_start + k_chunk, K)
-            k_size = k_end - k_start
+        # --- Send: msg_edge[A, k] = w_out[A, k] · m_out[A]
+        msg_edge = w_out.unsqueeze(-1) * m_out.unsqueeze(2)            # [B, N, K, D_s]
+        msg_flat = msg_edge.reshape(B, N * K, D_s)
 
-            out_nbrs_chunk = self.out_nbrs[:, k_start:k_end]          # [N, k_size]
-            id_dst_chunk = self.col_id[out_nbrs_chunk].to(state_dtype)  # [N, k_size, D_id]
-            id_dst_exp = id_dst_chunk.unsqueeze(0).expand(B, N, k_size, D_id)
+        # --- Gather via scatter-add (index_add)
+        incoming = torch.zeros_like(s).to(state_dtype)
+        incoming = incoming.index_add(1, self.edge_dst, msg_flat)
 
-            # delta_MLP input — flatten (B*N*k_size, D_s + D_id)
-            m_out_src_exp = m_out.unsqueeze(2).expand(B, N, k_size, D_s)
-            delta_in = torch.cat([m_out_src_exp, id_dst_exp], dim=-1)
-            delta_out = self.mlps.delta_mlp(
-                delta_in.reshape(B * N * k_size, D_s + D_id)
-            ).reshape(B, N, k_size, D_s)
-            m_edge = m_out_src_exp + delta_out                          # [B, N, k_size, D_s]
-
-            # score_MLP
-            s_norm_src_exp = s_norm.unsqueeze(2).expand(B, N, k_size, D_s)
-            id_src_exp = id_exp.unsqueeze(2).expand(B, N, k_size, D_id)
-            score_in = torch.cat([s_norm_src_exp, id_src_exp, id_dst_exp], dim=-1)
-            score = self.mlps.score_mlp(
-                score_in.reshape(B * N * k_size, D_s + 2 * D_id)
-            ).reshape(B, N, k_size)
-
-            E_bias_chunk = E_bias_2d[:, k_start:k_end].unsqueeze(0)     # [1, N, k_size]
-            w_out = torch.sigmoid(score + E_bias_chunk)                 # [B, N, k_size]
-            w_out_chunks.append(w_out)
-
-            # Send + scatter-add into incoming
-            msg = (w_out.unsqueeze(-1) * m_edge).reshape(B, N * k_size, D_s)
-            # edge_dst for this chunk: flatten out_nbrs[:, k_start:k_end]
-            edge_dst_chunk = out_nbrs_chunk.reshape(-1)                 # [N * k_size]
-            incoming = incoming.index_add(1, edge_dst_chunk, msg)
-
-        w_out_flat = torch.cat(w_out_chunks, dim=-1).reshape(B, N * K)  # [B, N*K]
-
-        # --- Residual update: gated-tanh
-        s_norm_for_update = self.mlps.update_norm_s(self.s).to(state_dtype)
+        # --- Residual update: gated-tanh, per-column learned decay α
+        s_norm_for_update = self.mlps.update_norm_s(s).to(state_dtype)
         in_norm = self.mlps.update_norm_in(incoming).to(state_dtype)
         update_in = torch.cat([s_norm_for_update, id_exp, in_norm], dim=-1)
         update = torch.tanh(self.mlps.update_mlp(update_in))
         alpha = torch.sigmoid(self.decay_proj(self.col_id)).squeeze(-1)  # [N]
         alpha = alpha.unsqueeze(0).unsqueeze(-1).to(state_dtype)         # [1, N, 1]
-        self.s = (alpha * self.s + (1.0 - alpha) * update.to(state_dtype)).to(state_dtype)
+        s_new = (alpha * s + (1.0 - alpha) * update.to(state_dtype)).to(state_dtype)
 
-        return m_out, w_out_flat, incoming
+        w_out_flat = w_out.reshape(B, N * K)
+        return s_new, m_out, w_out_flat, incoming
 
     def _readout_motor(self) -> torch.Tensor:
+        """Legacy wrapper — uses self.s."""
+        return self._readout_motor_pure(self.s)
+
+    def _readout_motor_pure(self, s: torch.Tensor) -> torch.Tensor:
         """Cross-attn motor vector from output-plane column states."""
         cfg = self.cfg
-        B = self.s.shape[0]
-        state_dtype = self.s.dtype
+        B = s.shape[0]
+        state_dtype = s.dtype
         out_cols = self.output_positions                     # [N_out]
-        s_out = self.out_norm(self.s[:, out_cols]).to(state_dtype)
+        s_out = self.out_norm(s[:, out_cols]).to(state_dtype)
 
         k = self.out_k_proj(s_out)                           # [B, N_out, D_s]
         v = self.out_v_proj(s_out)                           # [B, N_out, D_s]
@@ -465,8 +568,7 @@ class ColumnGraphMemory(nn.Module):
     def _surprise_and_buffer_bookkeeping(
         self, token_id: torch.Tensor, logits: torch.Tensor
     ) -> None:
-        """Kept outside the compile region because the ring-buffer cursor is a
-        Python integer and Dynamo would recompile per-cursor-value otherwise."""
+        """Per-tick ring-buffer + surprise EMA update (single-token API)."""
         cfg = self.cfg
         self.surprise_prev = self.surprise_ema.detach().clone()
         self.surprise_ema = multi_horizon_surprise(
@@ -482,11 +584,58 @@ class ColumnGraphMemory(nn.Module):
         self.pred_cursor = (self.pred_cursor + 1) % cfg.K_buf
         self.pred_filled = min(self.pred_filled + 1, cfg.K_buf)
 
-    def _sum_edge_abs_per_source(self, w_out_flat: torch.Tensor) -> torch.Tensor:
-        """Sum |w_out| over each source column's K out-edges. [B, N]"""
-        B = w_out_flat.shape[0]
-        N, K = self.cfg.N, self.cfg.K
-        return w_out_flat.abs().view(B, N, K).sum(dim=-1)
+    @torch._dynamo.disable
+    def _ringbuf_block_bookkeeping(
+        self,
+        motor_stack: torch.Tensor,       # [B, block_len, D_s]
+        tokens_block: torch.Tensor,       # [B, block_len] Long — actual tokens seen
+    ) -> None:
+        """Block-level ring-buffer + surprise EMA update (training API).
+
+        For each tick in the block, compute logits via factored readout,
+        update surprise EMA by comparing past predictions to the actual
+        token emitted at that tick, write the new logits into the ring
+        buffer. Runs outside the compile region.
+
+        This is cheap: block_len × K_h × B×V elementwise compute.
+        """
+        cfg = self.cfg
+        B, block_len, D_s = motor_stack.shape
+        # Apply pred_head once to whole block (cheap residual mlp)
+        motor_flat = self.readout.pred_head(
+            motor_stack.reshape(B * block_len, D_s)
+        ).reshape(B, block_len, D_s)
+
+        with torch.no_grad():
+            for t in range(block_len):
+                # Compute logits for this tick (for ring buffer only).
+                motor_t = motor_flat[:, t]
+                # Factored: logits = motor @ W.T + horizon_emb @ W.T
+                logits_motor = torch.matmul(
+                    motor_t.detach(), self.tied_token_emb.weight.detach().t()
+                )
+                logits_horizon = torch.matmul(
+                    self.readout.horizon_emb.detach(),
+                    self.tied_token_emb.weight.detach().t(),
+                )
+                logits = logits_motor.unsqueeze(1) + logits_horizon  # [B, K_h, V]
+
+                # Surprise vs actual token at t.
+                self.surprise_prev = self.surprise_ema.detach().clone()
+                self.surprise_ema = multi_horizon_surprise(
+                    self.pred_buf,
+                    self.pred_cursor,
+                    cfg.K_buf,
+                    self.pred_filled,
+                    tokens_block[:, t],
+                    self.surprise_ema,
+                    cfg.alpha_gamma_s,
+                )
+                write_prediction_buffer(self.pred_buf, self.pred_cursor, logits)
+                self.pred_cursor = (self.pred_cursor + 1) % cfg.K_buf
+                self.pred_filled = min(self.pred_filled + 1, cfg.K_buf)
+
+        self.tick_counter += block_len
 
     def _plasticity_step(
         self,
@@ -497,36 +646,26 @@ class ColumnGraphMemory(nn.Module):
         """Neuromod forward + Hebbian update on E_bias. Returns η_global [B]."""
         cfg = self.cfg
         with torch.autocast(device_type=self.s.device.type, enabled=False):
-            # --- Activities
             pre, post = compute_activities(m_out, incoming)    # [B, N] each
 
-            # --- Per-edge pre gathered at in-neighbours (for neuromod head features)
             B, N, K = self.s.shape[0], cfg.N, cfg.K
-            # w_in[c, k] = the w_out on the edge that terminates at c, per column.
-            # We don't directly have "in-edges per column" unless we invert.
-            # For the neuromod features, we use a simpler proxy: for each column,
-            # look at the K *outgoing* edges and their weights as local features.
-            # This is a small simplification: it tells the head "how strongly is
-            # this column broadcasting?" instead of "how strongly is it receiving?"
-            # The Hebbian math itself is post-synaptic-correct; only the feature
-            # is a proxy. Cheaper than building an in-edge-per-column table.
-            w_col_K = w_out_flat.view(B, N, K).float()         # [B, N, K]
-            pre_at_out_nbrs = pre[:, self.out_nbrs].float()    # [B, N, K] (senders=srces of rev edges, approx)
+            # For the neuromod head features, use outgoing-edge weights and
+            # outgoing-neighbour activities as a proxy for "incoming edges at
+            # this column." Slightly off-thesis (post-synaptic-local should
+            # use in-edges) but cheap — building an in-edge-per-column table
+            # would cost extra VRAM with no major quality signal.
+            w_out_proxy = w_out_flat.view(B, N, K).float()     # [B, N, K]
+            pre_at_nbrs = pre[:, self.out_nbrs].float()        # [B, N, K]
 
-            # Surprise delta
             surprise_delta = (self.surprise_ema - self.surprise_prev).float()
 
             eta_global, eta, beta = self.neuromod(
                 self.surprise_ema.float(),
                 surprise_delta,
-                self.input_ctx_ema.float(),
-                self.mag_ema,
-                self.var_ema,
-                self.traffic_ema,
                 self.col_id.float(),
                 post.float(),
-                w_col_K,
-                pre_at_out_nbrs,
+                w_out_proxy,
+                pre_at_nbrs,
             )
             # Average per-batch eta_global into a scalar for the shared E_bias.
             eta_global_scalar = eta_global.mean()
