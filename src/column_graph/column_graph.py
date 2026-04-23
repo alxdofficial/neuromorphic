@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.column_graph.config import ColumnGraphConfig
+from src.column_graph.kernels import TRITON_AVAILABLE, weighted_gather
 from src.column_graph.topology import Topology, build_topology
 from src.column_graph.neuromod import Neuromod
 from src.column_graph.plasticity import (
@@ -83,16 +84,10 @@ class ColumnMLPs(nn.Module):
         D_s = cfg.D_s
         D_id = cfg.D_id
 
-        # update_MLP: (D_s_norm + D_id + D_s_incoming) → 4·D_s → D_s
-        self.update_norm_s = _rmsnorm(D_s)
-        self.update_norm_in = _rmsnorm(D_s)
-        self.update_mlp = nn.Sequential(
-            nn.Linear(2 * D_s + D_id, cfg.ffn_mult_update * D_s),
-            nn.GELU(),
-            nn.Linear(cfg.ffn_mult_update * D_s, D_s),
-        )
-
         # content_MLP: (D_s_norm + D_id) → 2·D_s → D_s
+        # This is the ONLY nonlinear-transform MLP per tick. Cross-channel
+        # mixing happens here at emission time. Receiver-side state update
+        # is pure LIF (elementwise) — see _propagate_pure.
         self.content_norm = _rmsnorm(D_s)
         self.content_mlp = nn.Sequential(
             nn.Linear(D_s + D_id, cfg.ffn_mult_content * D_s),
@@ -126,10 +121,7 @@ class ColumnMLPs(nn.Module):
         nn.init.zeros_(self.k_proj[-1].bias)
 
         # Depth-scaled init on first layer of each MLP: std = 1/sqrt(depth=2) ≈ 0.014.
-        for module in [
-            self.update_mlp[0], self.content_mlp[0],
-            self.q_proj[0], self.k_proj[0],
-        ]:
+        for module in [self.content_mlp[0], self.q_proj[0], self.k_proj[0]]:
             nn.init.normal_(module.weight, mean=0.0, std=0.014)
 
 
@@ -168,6 +160,11 @@ class ColumnGraphMemory(nn.Module):
         self.register_buffer("plane_ids", topo.plane_ids, persistent=False)
         self.register_buffer("input_positions", topo.input_positions, persistent=False)
         self.register_buffer("output_positions", topo.output_positions, persistent=False)
+        # Inverse adjacency for Triton scatter-gather kernel (atomic-free).
+        self.register_buffer("in_src", topo.in_src, persistent=False)
+        self.register_buffer("in_edge_flat", topo.in_edge_flat, persistent=False)
+        self.register_buffer("in_mask", topo.in_mask, persistent=False)
+        self.K_in_max = topo.K_in_max
 
         # Column identity table (learned)
         torch.manual_seed(cfg.init_seed)
@@ -517,24 +514,32 @@ class ColumnGraphMemory(nn.Module):
         E_bias_2d = self.E_bias_flat.view(N, K).to(state_dtype)
         w_out = torch.sigmoid(scores + E_bias_2d.unsqueeze(0))         # [B, N, K]
 
-        # --- Send: msg_edge[A, k] = w_out[A, k] · m_out[A]
-        msg_edge = w_out.unsqueeze(-1) * m_out.unsqueeze(2)            # [B, N, K, D_s]
-        msg_flat = msg_edge.reshape(B, N * K, D_s)
+        # --- Weighted in-gather (Triton kernel on CUDA, reference on CPU).
+        # Atomic-free: for each destination column, gather contributions from
+        # its in-edges. No [B, N, K, D_s] materialization, no atomic scatter.
+        w_out_flat = w_out.reshape(B, N * K)
+        if TRITON_AVAILABLE and s.is_cuda:
+            incoming = weighted_gather(
+                m_out.to(state_dtype).contiguous(),
+                w_out_flat.to(state_dtype).contiguous(),
+                self.edge_src, self.edge_dst, self.out_nbrs,
+                self.in_src, self.in_edge_flat, self.in_mask,
+                self.K_in_max, K,
+            )
+        else:
+            msg_edge = w_out.unsqueeze(-1) * m_out.unsqueeze(2)        # [B, N, K, D_s]
+            msg_flat = msg_edge.reshape(B, N * K, D_s)
+            incoming = torch.zeros_like(s).to(state_dtype)
+            incoming = incoming.index_add(1, self.edge_dst, msg_flat)
 
-        # --- Gather via scatter-add (index_add)
-        incoming = torch.zeros_like(s).to(state_dtype)
-        incoming = incoming.index_add(1, self.edge_dst, msg_flat)
-
-        # --- Residual update: gated-tanh, per-column learned decay α
-        s_norm_for_update = self.mlps.update_norm_s(s).to(state_dtype)
-        in_norm = self.mlps.update_norm_in(incoming).to(state_dtype)
-        update_in = torch.cat([s_norm_for_update, id_exp, in_norm], dim=-1)
-        update = torch.tanh(self.mlps.update_mlp(update_in))
+        # --- LIF state update: pure elementwise leaky-integrator.
+        # Cross-channel mixing already happened at emission (content_mlp on
+        # the sender side). Receiver just integrates what arrived.
+        # α is per-column learned (conditions integration speed on id).
         alpha = torch.sigmoid(self.decay_proj(self.col_id)).squeeze(-1)  # [N]
         alpha = alpha.unsqueeze(0).unsqueeze(-1).to(state_dtype)         # [1, N, 1]
-        s_new = (alpha * s + (1.0 - alpha) * update.to(state_dtype)).to(state_dtype)
+        s_new = (alpha * s + (1.0 - alpha) * torch.tanh(incoming)).to(state_dtype)
 
-        w_out_flat = w_out.reshape(B, N * K)
         return s_new, m_out, w_out_flat, incoming
 
     def _readout_motor(self) -> torch.Tensor:

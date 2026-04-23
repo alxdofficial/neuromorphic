@@ -29,7 +29,16 @@ import torch
 @dataclass
 class Topology:
     """Bundled topology buffers — all tensors live on CPU at build time,
-    call `.to(device)` via `Topology.move_to` before using on GPU."""
+    call `.to(device)` via `Topology.move_to` before using on GPU.
+
+    Forward-direction (out-) adjacency: `out_nbrs`, `edge_src`, `edge_dst`.
+
+    Inverse (in-) adjacency for atomic-free scatter-add via gather-sum:
+    each destination column gets a padded list of the in-edges that
+    terminate at it. All in-degree arrays have the same padded length
+    `K_in_max` (stored on the dataclass); `in_mask` is 1/0 and `in_src`
+    / `in_edge_flat` are the source column / flat-edge-index respectively.
+    """
 
     out_nbrs: torch.Tensor        # [N, K] int64
     edge_src: torch.Tensor        # [N*K] int64 — source column for each directed edge
@@ -38,6 +47,12 @@ class Topology:
     plane_ids: torch.Tensor       # [N] int64
     input_positions: torch.Tensor  # [N_per_plane] int64
     output_positions: torch.Tensor  # [N_per_plane] int64
+
+    # Inverse adjacency (for atomic-free Triton gather-sum)
+    in_src: torch.Tensor          # [N, K_in_max] int64  — source column per in-edge
+    in_edge_flat: torch.Tensor    # [N, K_in_max] int64  — flat edge index
+    in_mask: torch.Tensor         # [N, K_in_max] float32 — 1.0 for valid, 0.0 for pad
+    K_in_max: int                  # padded max in-degree
 
     def move_to(self, device: torch.device) -> "Topology":
         return Topology(
@@ -48,7 +63,40 @@ class Topology:
             plane_ids=self.plane_ids.to(device),
             input_positions=self.input_positions.to(device),
             output_positions=self.output_positions.to(device),
+            in_src=self.in_src.to(device),
+            in_edge_flat=self.in_edge_flat.to(device),
+            in_mask=self.in_mask.to(device),
+            K_in_max=self.K_in_max,
         )
+
+
+def _build_inverse_adjacency(
+    out_nbrs: torch.Tensor, N: int, K: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """For each destination column, collect the flat indices of edges
+    terminating at it. Returns padded tensors.
+    """
+    edge_dst_flat = out_nbrs.reshape(-1)              # [N*K]
+    edge_src_flat = torch.arange(N).unsqueeze(1).expand(N, K).reshape(-1)
+
+    in_edges_per_dest: list[list[int]] = [[] for _ in range(N)]
+    for e in range(N * K):
+        dst = int(edge_dst_flat[e])
+        in_edges_per_dest[dst].append(e)
+
+    K_in_max = max(len(l) for l in in_edges_per_dest) if in_edges_per_dest else 0
+
+    in_src = torch.zeros(N, K_in_max, dtype=torch.int64)
+    in_edge_flat = torch.zeros(N, K_in_max, dtype=torch.int64)
+    in_mask = torch.zeros(N, K_in_max, dtype=torch.float32)
+    for c in range(N):
+        lst = in_edges_per_dest[c]
+        for i, e in enumerate(lst):
+            in_src[c, i] = int(edge_src_flat[e])
+            in_edge_flat[c, i] = e
+            in_mask[c, i] = 1.0
+
+    return in_src, in_edge_flat, in_mask, K_in_max
 
 
 def _moore_offsets(radius: int) -> list[tuple[int, int]]:
@@ -181,6 +229,8 @@ def build_topology(
     )
     edge_dst = out_nbrs.reshape(-1).contiguous()
 
+    in_src, in_edge_flat, in_mask, K_in_max = _build_inverse_adjacency(out_nbrs, N, K)
+
     return Topology(
         out_nbrs=out_nbrs,
         edge_src=edge_src,
@@ -189,4 +239,8 @@ def build_topology(
         plane_ids=plane_ids,
         input_positions=input_positions,
         output_positions=output_positions,
+        in_src=in_src,
+        in_edge_flat=in_edge_flat,
+        in_mask=in_mask,
+        K_in_max=K_in_max,
     )
