@@ -16,8 +16,6 @@ from src.column_graph.config import ColumnGraphConfig
 
 
 def _rmsnorm(dim: int) -> nn.Module:
-    if hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(dim)
     from src.column_graph.readout import _FallbackRMSNorm
     return _FallbackRMSNorm(dim)
 

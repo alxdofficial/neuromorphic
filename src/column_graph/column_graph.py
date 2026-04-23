@@ -48,8 +48,6 @@ from src.column_graph.readout import (
 
 
 def _rmsnorm(dim: int) -> nn.Module:
-    if hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(dim)
     from src.column_graph.readout import _FallbackRMSNorm
     return _FallbackRMSNorm(dim)
 
@@ -384,6 +382,9 @@ class ColumnGraphMemory(nn.Module):
         m_out = self.mlps.content_mlp(content_in)            # [B, N, D_s]
 
         # --- Per-chunk edge work
+        # k_chunk=8 was the sweet spot empirically: smaller chunks save less
+        # activation memory but more Python-loop overhead; larger chunks save
+        # more activations which hurts backward. Tune per scale if needed.
         k_chunk = 8 if K >= 16 else K
         incoming = torch.zeros_like(self.s)                  # [B, N, D_s]
         w_out_chunks: list[torch.Tensor] = []

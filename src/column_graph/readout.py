@@ -35,20 +35,27 @@ class PredictionHead(nn.Module):
 
 
 def _rmsnorm(dim: int) -> nn.Module:
-    if hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(dim)
+    # Use the autocast-friendly fallback even when nn.RMSNorm exists, because
+    # PyTorch's RMSNorm does not auto-cast its weight to input dtype under
+    # autocast, which disables its fused kernel and warns every call.
     return _FallbackRMSNorm(dim)
 
 
 class _FallbackRMSNorm(nn.Module):
+    """Autocast-friendly RMSNorm: casts weight to match input dtype so the
+    fused kernel path can be selected. Computation is in input dtype to
+    avoid the bf16↔fp32 cast warning; this is acceptable for RMSNorm because
+    the normalisation itself is scale-invariant."""
+
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * rms).type_as(x) * self.weight
+        w = self.weight.to(x.dtype)
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * w
 
 
 class MultiHorizonReadout(nn.Module):
