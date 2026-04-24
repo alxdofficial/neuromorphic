@@ -187,6 +187,10 @@ class SparseLIFUpdate(torch.autograd.Function):
     however, IS in-place on grad_s_out: that tensor is autograd's handoff to
     us and nothing else reads it. The O(U) touched-row update in backward is
     the main win.
+
+    The clone is the dominant VRAM cost at long TBPTT blocks. Eliminating it
+    cleanly requires the "active-row overlay" memory model (detached base +
+    sparse differentiable touched rows) — see issue tracker.
     """
 
     @staticmethod

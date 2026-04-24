@@ -39,7 +39,7 @@ def _tiny_cfg(use_neuromod: bool = True, **overrides) -> GraphWalkerConfig:
         lambda_balance=0.0,
         use_neuromod=use_neuromod,
         neuromod_D_mod=32, neuromod_n_layers=1, neuromod_n_heads=2,
-        neuromod_rank=8, neuromod_eta=0.5,
+        neuromod_edge_hidden=16, neuromod_eta=1.0,
     )
     base.update(overrides)
     return GraphWalkerConfig(**base)
@@ -104,36 +104,41 @@ def test_build_adjacency_bias_small():
 # ----- neuromod module -----
 
 
-def test_neuromod_zero_init_produces_zero_deltas():
-    """With src/dst output projections zero-initialized, the neuromod must
-    output zeros regardless of input. This is the 'safe bootstrap' property."""
+def test_neuromod_zero_init_produces_zero_targets():
+    """With edge_mlp's output layer zero-initialized, the neuromod must
+    output zeros regardless of input (tanh(0) = 0). Safe-bootstrap property."""
     torch.manual_seed(0)
     U = 6
-    D_feat, D_mod, n_layers, n_heads, rank = 48, 32, 1, 2, 8
-    nm = NeuromodGraphTransformer(D_feat, D_mod, n_layers, n_heads, rank)
+    D_feat, D_mod, n_layers, n_heads, edge_hidden = 48, 32, 1, 2, 16
+    nm = NeuromodGraphTransformer(
+        D_feat, D_mod, n_layers, n_heads, edge_hidden=edge_hidden,
+    )
     features = torch.randn(U, D_feat)
     adj = (torch.rand(U, U) > 0.5).float()
     # Pick some arbitrary subset edges
     src = torch.tensor([0, 1, 2], dtype=torch.int64)
     dst = torch.tensor([1, 2, 3], dtype=torch.int64)
-    deltas = nm(features, adj, src, dst)
-    assert deltas.shape == (3,)
-    assert torch.allclose(deltas, torch.zeros_like(deltas))
+    targets = nm(features, adj, src, dst)
+    assert targets.shape == (3,)
+    assert torch.allclose(targets, torch.zeros_like(targets))
 
 
 def test_neuromod_nonzero_output_after_perturbing_weights():
     torch.manual_seed(1)
-    nm = NeuromodGraphTransformer(D_feat=32, D_mod=16, n_layers=1, n_heads=2, rank=4)
-    # Break zero-init
+    nm = NeuromodGraphTransformer(
+        D_feat=32, D_mod=16, n_layers=1, n_heads=2, edge_hidden=8,
+    )
+    # Break zero-init of the final edge_mlp layer — output was identically 0.
     with torch.no_grad():
-        nm.src_proj.weight.normal_(std=0.1)
-        nm.dst_proj.weight.normal_(std=0.1)
+        nm.edge_mlp[-1].weight.normal_(std=0.3)
     features = torch.randn(4, 32)
     adj = torch.zeros(4, 4)
     src = torch.tensor([0, 1, 2], dtype=torch.int64)
     dst = torch.tensor([1, 2, 3], dtype=torch.int64)
-    deltas = nm(features, adj, src, dst)
-    assert deltas.abs().sum() > 0
+    targets = nm(features, adj, src, dst)
+    assert targets.abs().sum() > 0
+    # Tanh-clamp: |target| <= E_bias_max
+    assert targets.abs().max().item() <= nm.E_bias_max + 1e-6
 
 
 # ----- end-to-end integration -----
@@ -182,11 +187,12 @@ def test_phase1_step_with_neuromod_runs_and_trains_neuromod():
     torch.manual_seed(0)
     cfg = _tiny_cfg(use_neuromod=True, mod_period=4)  # Fire twice in T=8
     lm = StandaloneLM(cfg).cpu()
-    # Break zero-init so delta_nm is non-trivial from the start (so grads
-    # through it are non-zero even before any training has happened).
+    # Break zero-init so target_nm is non-trivial from the start (so grads
+    # through it are non-zero even before any training has happened). Also
+    # nudge γ upward so delta = γ·(target-base) has visible magnitude.
     with torch.no_grad():
-        lm.memory.neuromod.src_proj.weight.normal_(std=0.1)
-        lm.memory.neuromod.dst_proj.weight.normal_(std=0.1)
+        lm.memory.neuromod.edge_mlp[-1].weight.normal_(std=0.3)
+        lm.memory.neuromod.blend_logit.fill_(0.0)  # γ = σ(0) = 0.5
 
     opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
     tokens = torch.randint(0, 256, (2, 8))
@@ -203,15 +209,14 @@ def test_phase1_step_with_neuromod_runs_and_trains_neuromod():
     stats = phase1_step(lm, opt, tokens, tbptt_block=4, amp_dtype=None, training_step=1)
     assert torch.isfinite(torch.tensor(stats.loss))
 
-    # src_proj / dst_proj should have moved at least a bit from backward
-    # having flowed through them.
+    # edge_mlp / blend_logit should have moved from backward flowing through.
     any_moved = False
     for n, p in lm.memory.neuromod.named_parameters():
-        if "src_proj" in n or "dst_proj" in n:
+        if "edge_mlp" in n or "blend_logit" in n:
             if not torch.equal(p, params_before[n]):
                 any_moved = True
                 break
-    assert any_moved, "neuromod src/dst_proj did not update — grad path broken"
+    assert any_moved, "neuromod edge_mlp/blend_logit did not update — grad path broken"
 
 
 def test_neuromod_delta_snapshot_roundtrip():
@@ -221,10 +226,10 @@ def test_neuromod_delta_snapshot_roundtrip():
     torch.manual_seed(0)
     cfg = _tiny_cfg(use_neuromod=True, mod_period=4)
     lm = StandaloneLM(cfg).cpu()
-    # Non-zero output weights so deltas will be non-trivial.
+    # Non-zero output weights AND non-zero γ so the delta is non-trivial.
     with torch.no_grad():
-        lm.memory.neuromod.src_proj.weight.normal_(std=0.1)
-        lm.memory.neuromod.dst_proj.weight.normal_(std=0.1)
+        lm.memory.neuromod.edge_mlp[-1].weight.normal_(std=0.3)
+        lm.memory.neuromod.blend_logit.fill_(0.0)  # γ = 0.5
 
     tokens = torch.randint(0, 256, (2, 8))
     lm.memory.begin_segment(2, tokens.device)

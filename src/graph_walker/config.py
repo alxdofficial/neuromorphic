@@ -71,8 +71,17 @@ class GraphWalkerConfig:
     K_buf: int = 8
 
     # --- Clocks ---
+    # `mod_period` is the plasticity window (and the anchor re-pick cadence
+    # since `is_new_window` is derived from it). `tbptt_block` is the
+    # gradient-detach cadence. They should match: the neuromod's delta
+    # lives for exactly one window, and we want its one gradient event per
+    # window to attribute the full window-loss back to its action. Splitting
+    # them breaks the walker-trajectory gradient chain mid-window and leaves
+    # the neuromod credited only for short-range effects.
+    # If activation memory blows up, shorten both together rather than
+    # decoupling.
     mod_period: int = 128               # plasticity fires every N tokens
-    tbptt_block: int = 16               # gradient detach cadence
+    tbptt_block: int = 128              # gradient detach cadence (== mod_period)
 
     # --- Plasticity (scalar-eta v1: global Hebbian on co-visit counts) ---
     E_bias_max: float = 4.0
@@ -96,8 +105,13 @@ class GraphWalkerConfig:
     neuromod_D_mod: int = 128
     neuromod_n_layers: int = 2
     neuromod_n_heads: int = 4
-    neuromod_rank: int = 32
-    neuromod_eta: float = 0.1           # scales how strongly delta_nm modifies E_bias
+    # Hidden dim of the per-edge target MLP (cat(x_src, x_dst) → scalar).
+    # Replaces the old low-rank bilinear decoder's `neuromod_rank`.
+    neuromod_edge_hidden: int = 64
+    # Extra live/commit scale on top of the neuromod's own learnable blend
+    # rate γ = σ(blend_logit). With γ as the primary knob this should be 1;
+    # kept as a config knob for conservative sweeps or quick ablation.
+    neuromod_eta: float = 1.0
 
     # --- Routing (Gumbel + exploration) ---
     gumbel_tau_start: float = 2.0
@@ -143,6 +157,14 @@ class GraphWalkerConfig:
                 f"K_buf ({self.K_buf}) must be >= K_horizons ({self.K_horizons}) "
                 "— delayed multi-horizon surprise still needs at least one "
                 "history slot per horizon."
+            )
+        if self.segment_T % self.mod_period != 0:
+            raise ValueError(
+                f"segment_T ({self.segment_T}) must be a multiple of "
+                f"mod_period ({self.mod_period}). Otherwise the final "
+                f"{self.segment_T % self.mod_period}-token fragment in each "
+                "segment gets CE training but no plasticity fire, silently "
+                "dropping its Hebbian co-visits and neuromod snapshot."
             )
 
     @property

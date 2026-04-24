@@ -74,7 +74,9 @@ def phase1_step(
     )
 
     def flush():
-        """Backprop accumulated block loss + detach."""
+        """Backprop accumulated block loss + stream CE into surprise + fire
+        plasticity if the block's last token closed a plasticity window +
+        detach state."""
         nonlocal total_balance_tensor, n_segments
         nonlocal block_balance_sum, ticks_since_backward, block_start_t
         nonlocal block_horizon_sum, block_horizon_count
@@ -121,6 +123,16 @@ def phase1_step(
             per_h * horizon_weights * has_counts.float()
         ).sum() / horizon_weights[has_counts].sum().clamp(min=1)
         loss = ce + block_balance_sum
+
+        # Stream the flush's per-(position, horizon) CE into surprise_ema,
+        # then fire plasticity if this block closed a window. Done BEFORE
+        # backward so plasticity sees this window's surprise and any new
+        # _active_delta_nm it produces is ready for the next block's step.
+        # The detached CE tensor keeps the autograd graph decoupled —
+        # surprise is a training diagnostic, not a gradient carrier.
+        lm.memory.accumulate_block_ce(ce_masked.detach(), valid.detach())
+        lm.memory._maybe_finalize_surprise_and_plasticity()
+
         loss.backward()
         # Accumulate on GPU; sync once at end-of-step (not per flush).
         total_balance_tensor = total_balance_tensor + block_balance_sum.detach()
@@ -140,8 +152,10 @@ def phase1_step(
             if ticks_since_backward == 0:
                 block_start_t = t
             r = lm.memory.step_core(tokens[:, t])
-            lm.memory._record_surprise_token(tokens[:, t], r.motor_state.detach())
-            lm.memory._maybe_finalize_surprise_and_plasticity()
+            # Plasticity + surprise are now fired inside flush (after CE is
+            # computed), not per-token. With tbptt_block == mod_period (the
+            # enforced config alignment), each flush closes exactly one
+            # plasticity window.
             motor_state_block.append(r.motor_state)
             if cfg.lambda_balance > 0:
                 # Switch-style load-balance aux loss (carries gradient to

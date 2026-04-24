@@ -80,7 +80,27 @@ class _GraphAttnLayer(nn.Module):
 
 
 class NeuromodGraphTransformer(nn.Module):
-    """Start-of-window neuromod producing grad-carrying `ΔE_bias`.
+    """Start-of-window neuromod producing grad-carrying per-edge targets.
+
+    Emits a direct target value per touched edge (tanh-clamped to
+    `E_bias_max`), not a delta. The caller converts target → delta via an
+    EMA blend gated by `self.gamma` (a learnable scalar blend rate):
+
+        _active_delta_nm[edge] = γ · (target[edge] - E_bias_base[edge])
+
+    which, when added to `E_bias_base`, gives the classic EMA blend
+    `(1 - γ) · E_bias_base + γ · target`. Same numerical behavior as the
+    pattern used on `main` (attention_modulator), which zero-inits the
+    head and uses a learnable per-row EMA gate to keep updates bounded.
+
+    Stability mechanisms:
+    - **tanh clamp** on the per-edge prediction: target magnitude bounded
+      by `E_bias_max` regardless of the edge MLP's raw output.
+    - **EMA blend** via σ(blend_logit): at init blend_logit = -5, so
+      γ ≈ 0.007 → day-0 active delta ≈ 0 even if target is non-zero.
+      Training opens γ upward as the neuromod learns to commit to its
+      predictions.
+    - **Zero-init edge_mlp output layer**: raw=0 at init → target=0.
 
     Args:
       D_feat: dimensionality of per-column input features
@@ -88,7 +108,9 @@ class NeuromodGraphTransformer(nn.Module):
       D_mod: internal width of the transformer
       n_layers: number of attention+FFN layers
       n_heads: attention heads per layer
-      rank: rank of the edge decoder (low-rank outer product)
+      edge_hidden: hidden dim of the per-edge target MLP
+      E_bias_max: tanh-clamp scale (match the E_bias clamp in the plasticity
+                  step so target and persistent buffer share a range)
     """
 
     def __init__(
@@ -97,11 +119,12 @@ class NeuromodGraphTransformer(nn.Module):
         D_mod: int = 128,
         n_layers: int = 2,
         n_heads: int = 4,
-        rank: int = 32,
+        edge_hidden: int = 64,
+        E_bias_max: float = 4.0,
     ) -> None:
         super().__init__()
         self.D_mod = D_mod
-        self.rank = rank
+        self.E_bias_max = E_bias_max
         self.feature_proj = nn.Linear(D_feat, D_mod)
         nn.init.normal_(self.feature_proj.weight, mean=0.0, std=0.014)
 
@@ -109,13 +132,29 @@ class NeuromodGraphTransformer(nn.Module):
             _GraphAttnLayer(D_mod, n_heads=n_heads) for _ in range(n_layers)
         ])
 
-        # Low-rank edge decoder: src_proj, dst_proj both map D_mod → rank.
-        # Zero-init both so the neuromod starts as a no-op.
-        # Training pushes them away from zero when a signal emerges.
-        self.src_proj = nn.Linear(D_mod, rank, bias=False)
-        self.dst_proj = nn.Linear(D_mod, rank, bias=False)
-        nn.init.zeros_(self.src_proj.weight)
-        nn.init.zeros_(self.dst_proj.weight)
+        # Per-edge target MLP: cat(x_src, x_dst) → scalar pre-tanh logit.
+        # Full-rank (not low-rank outer product) so the predictor can express
+        # non-bilinear interactions between the source and destination
+        # features. Zero-init final layer so raw=0 → target=0 at init.
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * D_mod, edge_hidden),
+            nn.GELU(),
+            nn.Linear(edge_hidden, 1),
+        )
+        nn.init.normal_(self.edge_mlp[0].weight, mean=0.0, std=0.014)
+        nn.init.zeros_(self.edge_mlp[0].bias)
+        nn.init.zeros_(self.edge_mlp[-1].weight)
+        nn.init.zeros_(self.edge_mlp[-1].bias)
+
+        # Learnable blend rate γ = σ(blend_logit). Start near-zero so the
+        # neuromod's live influence during the first few windows is tiny,
+        # and training can open it up when useful.
+        self.blend_logit = nn.Parameter(torch.tensor(-5.0))
+
+    @property
+    def gamma(self) -> torch.Tensor:
+        """Scalar blend rate in (0, 1)."""
+        return torch.sigmoid(self.blend_logit)
 
     def forward(
         self,
@@ -124,21 +163,20 @@ class NeuromodGraphTransformer(nn.Module):
         edge_src_local: torch.Tensor,  # [E] int64 — into [0, U)
         edge_dst_local: torch.Tensor,  # [E] int64 — into [0, U)
     ) -> torch.Tensor:
-        """Return per-touched-edge deltas, shape [E].
+        """Return per-touched-edge TARGET values, shape [E].
 
-        These get scattered into the global [N*K] edge-flat layout by the
-        caller. The returned tensor carries gradient to the neuromod's
-        parameters.
+        Values are in [-E_bias_max, +E_bias_max] (tanh-clamped). The caller
+        converts these to deltas via `γ · (target - E_bias_base)` and
+        scatters into the global [N*K] layout.
         """
         x = self.feature_proj(features)
         for layer in self.layers:
             x = layer(x, adj_bias)
-        src = self.src_proj(x)                     # [U, rank]
-        dst = self.dst_proj(x)                     # [U, rank]
-        # ΔE_bias[edge] = (src[src_i] · dst[dst_i]) / √R
-        deltas = (src[edge_src_local] * dst[edge_dst_local]).sum(dim=-1)
-        deltas = deltas * (self.rank ** -0.5)
-        return deltas
+        src_feats = x[edge_src_local]                       # [E, D_mod]
+        dst_feats = x[edge_dst_local]                       # [E, D_mod]
+        edge_in = torch.cat([src_feats, dst_feats], dim=-1)  # [E, 2·D_mod]
+        raw = self.edge_mlp(edge_in).squeeze(-1)            # [E]
+        return self.E_bias_max * torch.tanh(raw)
 
 
 @torch.no_grad()
