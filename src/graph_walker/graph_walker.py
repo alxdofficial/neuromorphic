@@ -1,22 +1,31 @@
 """GraphWalkerMemory — trajectory-routed plastic concept graph.
 
 Hot path per token (write-first-then-route):
-  1. Softmax over input-plane columns → per-head starting column
-     (anchors, re-picked each token; token content injects here)
+  1. If `is_new_window` (first token of a new plasticity window):
+     input-plane Gumbel softmax picks H anchor columns and STE-gates an
+     injection of the current token's content. Walker positions get
+     teleported to the anchor cols. Within a window this step is SKIPPED
+     and walkers just roam.
   2. Walker at its current column emits a message from (col_state,
-     col_id, walker_state, token_embed) → content_mlp
-  3. Sparse LIF deposit: token injection at start_cols, walker message
-     at current column (NOT destination). Post-update state at the
-     walker's current column reflects its own contribution.
-  4. Re-read updated col state. Steering query uses it + walker_state
-     + token_embed. Score K out-edges, Gumbel top-1 → next_col.
-  5. STE-gated endpoint readout: end_state = Σ_k ste[k]·s_new[nbrs[k]].
-     This is the gradient bridge from routing decision to loss.
+     col_id, walker_state, token_embed) → content_mlp.
+  3. Sparse LIF deposit: walker writes m_out at its CURRENT column (not
+     destination). On window-start steps the anchor injection is stacked
+     into the same LIF kernel call at the anchor columns (which are also
+     the walker's current position on those steps).
+  4. Re-read updated col state at cur_bh (walker's own contribution is now
+     in it). Steering query uses (s_cur_new, col_id, walker_state,
+     token_embed). Score K out-edges, Gumbel top-1 → next_col.
+  5. Endpoint readout = s_cur_new + Σ_k ste[k] · nbr_id_to_s(col_id[nbrs[k]]).
+     First term carries gradient to content_mlp / walker_state / token;
+     second term is the STE bridge from routing → loss.
   6. Cross-attn over H endpoints → motor_state.
-  7. Walker state update: EMA of this step's m_out.
+  7. Walker state update: w_new = σ(α_h) · w_old + (1-σ(α_h)) · m_out.
 
-Every mod_period tokens: batch-compute exact surprise over the accumulated
-window, then Hebbian + neuromod updates to E_bias_flat.
+Every mod_period tokens the TBPTT block closes (enforced alignment
+`tbptt_block == mod_period`): flush computes per-horizon CE via the
+factorized path (no [B,T,K_h,V] broadcast), streams it into
+`surprise_ema`, fires Hebbian + neuromod updates on `E_bias_flat`, then
+backprops + detaches.
 
 See docs/graph_walker.md for the full design.
 """

@@ -1,43 +1,48 @@
 # GraphWalker
 
-**Branch:** `graph-walker`  
-**Status:** live code reference for the current branch  
-**Date:** 2026-04-23
+**Branch:** `graph-walker`
+**Status:** live code reference for the current branch
+**Last updated:** 2026-04-24
 
-This document describes the code that exists now, not the older dense
-`column-graph` design and not the earlier relaunch-`H×L` graph-walker draft.
+This document describes the code that exists now. It reflects the
+post-session state after: write-first-then-route walkers, per-window
+anchoring, target-predicting neuromod, surprise fold into the flush,
+and factorized per-horizon CE. The earlier `column_graph` and the
+earlier graph-walker draft (`H×L` relaunching) are obsolete.
 
 ## Thesis
 
-The branch is trying to keep the original memory thesis intact:
+The branch keeps the original memory thesis intact:
 
-- memory should live in the evolving spatial organization of a graph, not in a
-  fixed-size hidden tensor alone and not in an external RAG database
-- retrieval should happen through sparse trajectories through graph space
-- plasticity should remain active after training
+- memory lives in the evolving spatial organization of a graph, not in a
+  fixed-size hidden tensor and not in an external retrieval database
+- retrieval happens through sparse trajectories through graph space
+- plasticity stays active after training
 
-The current implementation keeps that thesis, but changes the execution model to
-make it cheaper:
+Execution-model choices that follow from the thesis:
 
-- walkers are **persistent**
-- each token advances each walker by **one hop**
-- dense lexical prediction is moved **off the hot token path**
-- exact surprise is computed only on the **plasticity clock**
+- H **persistent** walkers, each advancing by **one hop per token**
+- each walker has its own persistent D_s-dim state (`walker_state`) in
+  addition to its position on the graph
+- the dense lexical readout lives off the per-token hot path — it runs
+  only at TBPTT-block boundaries
+- anchoring (input-plane Gumbel softmax) fires **once per plasticity
+  window**, not once per token
+- exact multi-horizon surprise is accumulated into an EMA from the CE
+  we are already computing for training — no separate readout pass
 
 ## Current Code Layout
 
-- [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py)
-- [src/graph_walker/topology.py](/home/alex/code/neuromorphic/src/graph_walker/topology.py)
-- [src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py)
-- [src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py)
-- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py)
-- [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py)
-- [src/graph_walker/standalone.py](/home/alex/code/neuromorphic/src/graph_walker/standalone.py)
-- [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py)
-- [src/graph_walker/triton_sparse_update.py](/home/alex/code/neuromorphic/src/graph_walker/triton_sparse_update.py)
-- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py)
-- [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py)
-- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py)
+- [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py) — hyperparams + post-init validation
+- [src/graph_walker/topology.py](/home/alex/code/neuromorphic/src/graph_walker/topology.py) — fixed Watts-Strogatz graph builder
+- [src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py) — Gumbel top-1 softmax with ε-exploration and STE
+- [src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py) — `PostModelStack`, `PredictionHead`, `MultiHorizonReadout` (with factorized CE)
+- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py) — `GraphWalkerMemory`, `ColumnCompute`, `_step_core_pure`
+- [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py) — `NeuromodGraphTransformer` (target-predicting head) + subgraph helpers
+- [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py) — TBPTT flush, factorized CE, surprise streaming, plasticity trigger
+- [src/graph_walker/standalone.py](/home/alex/code/neuromorphic/src/graph_walker/standalone.py) — thin wrapper: token embedding + `GraphWalkerMemory` + tied unembed
+- [src/graph_walker/triton_sparse_update.py](/home/alex/code/neuromorphic/src/graph_walker/triton_sparse_update.py) — `SparseLIFUpdate` autograd Function (Triton forward + backward) used for the sparse column-state update
+- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py), [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py), [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py)
 
 ## Current Default Shape
 
@@ -45,354 +50,351 @@ From [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/
 
 - topology:
   - `L = 4` planes
-  - `16 x 16` columns per plane
+  - `16 × 16` columns per plane
   - `N = 1024` total columns
   - `K = 32` outgoing edges per column
 - widths:
-  - `D_model = 1024`
-  - `D_s = 512`
-  - `D_id = 32`
-- routing:
-  - `n_heads = 4`
-  - `n_score_heads = 4`
-  - `D_q_in = 64`
-  - `D_q_per_head = 64`
+  - `D_model = 1024` (external lexical width)
+  - `D_s = 512` (graph state + walker state)
+  - `D_id = 32` (column identity)
+- walker head:
+  - `n_heads (H) = 4` persistent walkers
+  - `n_score_heads = 4` multi-head edge scoring
+  - `D_q_in = 64`, `D_q_per_head = 64`
 - hot MLP:
-  - `content_mlp_depth = 4`
-  - `ffn_mult_content = 4`
+  - `content_mlp_depth = 4` residual FFN blocks
+  - `ffn_mult_content = 4` (D_hid = 2048)
 - cold model-space stack:
-  - `post_model_depth = 7`
-  - `post_model_ffn_mult = 4`
+  - `post_model_depth = 7`, `post_model_ffn_mult = 4`
 - clocks:
-  - `tbptt_block = 16`
-  - `mod_period = 128`
+  - `mod_period = 128` — plasticity window length
+  - `tbptt_block = 128` — gradient detach cadence (**must equal** `mod_period`)
+  - `segment_T = 256` — full segment length (`segment_T % mod_period == 0`
+    enforced in `__post_init__`; otherwise a partial window at segment end
+    would get CE training but no plasticity fire)
+- neuromod (on by default):
+  - `neuromod_D_mod = 128`, `neuromod_n_layers = 2`, `neuromod_n_heads = 4`
+  - `neuromod_edge_hidden = 64`, `neuromod_eta = 1.0`, `E_bias_max = 4.0`
 
-Current total parameter count at defaults is about **104.4M**.
+Total parameter count at defaults: about **106M**.
 
-Important split:
+## State
 
-- token embedding / tied unembedding: about **32.8M**
-- hot `content_mlp`: about **8.7M**
-- post-model stack: about **58.8M**
+`GraphWalkerMemory` owns the following per-segment tensors (allocated by
+`begin_segment`, detached each `tbptt_block` by `detach_state`):
 
-That split is intentional. The branch is explicitly moving parameter budget out
-of the per-token per-hop recurrent core and into cheaper model-space modules.
+- `s [B, N, D_s]` — column state (LIF-integrated)
+- `walker_pos [B, H]` int64 — persistent walker positions
+- `walker_state [B, H, D_s]` — walker's private running state (EMA of
+  per-step `m_out`)
+- `prev_motor [B, D_s]` — last step's motor output, fed into the anchor
+  query at window boundaries
+- `surprise_ema [B, K_h]`, `surprise_prev [B, K_h]` — per-batch
+  per-horizon surprise EMA (no motor-state buffer — surprise is
+  streamed from training CE)
 
-## Core Runtime Design
+Persistent-across-segments (plastic) state:
 
-### 1. Persistent graph state
+- `E_bias_flat [N·K]` — plastic edge biases, shared by Hebbian and
+  neuromod paths
+- `co_visit_flat [N·K]` — accumulated traversed-edge counts in the
+  current plasticity window
+- `visit_count [N]` — per-column visit tally in the current window
+- `_prev_snapshot_ids`, `_prev_snapshot_feats` — detached snapshot of
+  the previous window's touched columns (consumed by neuromod at the
+  next window start)
+- `_active_delta_nm [N·K]` — grad-carrying neuromod delta, live for the
+  whole current window, detached-and-committed into `E_bias_flat` at
+  window close
 
-[GraphWalkerMemory](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py)
-owns persistent state:
+Topology tensors (built once at `__init__`, `persistent=False` buffers):
 
-- `s [B, N, D_s]`: per-column state
-- `walker_pos [B, H]`: current persistent walker positions
-- `prev_motor [B, D_s]`: previous graph-state readout
-- `E_bias_flat [N*K]`: plastic edge biases
-- `co_visit_flat [N*K]`: traversed-edge counts accumulated over the current
-  plasticity window
-- `surprise_ema [B, K_h]`
-- delayed-surprise buffers:
-  - `surprise_motor_window [B, mod_period, D_s]`
-  - `surprise_token_window [B, mod_period]`
-  - `surprise_tail_motor [B, K_h-1, D_s]`
+- `out_nbrs [N, K]` int64 — outgoing neighbour indices
+- `edge_src`, `edge_dst` — flat edge endpoint lists
+- `plane_ids [N]` int64 — plane index per column
+- `input_positions [N_per_plane]` int64 — global indices of input-plane cols
 
-`begin_segment()` resets segment-local working state but keeps `E_bias_flat`
-unless `reset_plastic_memory()` is called.
+## Per-Token Flow
 
-### 2. Hot token path
+`_step_core_pure` (graph_walker.py) runs once per token. Its inputs are
+current state + the token id. A boolean `is_new_window = (window_len == 0)`
+splits the flow into two branches. `is_new_window` is True at segment
+start and on the first token of each new plasticity window (every
+`mod_period` tokens).
 
-The hot compiled path is [step_core()](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py),
-which routes into `_step_core_impl`.
+### Common prefix (every step)
 
-Per token it does:
+1. Embed token: `h_input = token_to_state(embed(token))` ∈ ℝ^{D_s}.
 
-1. embed token in `D_model`
-2. project token to `D_s` with `token_to_state`
-3. choose **input anchor columns** on plane 0 via input-plane softmax
-4. inject token content at those anchor columns
-5. advance each persistent walker **one hop**
-6. aggregate only the sparse touched destinations
-7. update only those rows of `s`
-8. read out graph-state `motor_state [B, D_s]` from the new walker endpoints
+### Window-boundary step only
 
-This is the key current architectural change.
+2. **Anchor softmax.** Build `q_in = h_input + prev_motor_proj(prev_motor)`.
+   Score against input-plane column identities: `scores_in = q_in·input_k_proj(col_id[input_positions])`.
+   Gumbel top-1 STE picks H `anchor_cols`.
+3. **Teleport.** `walker_pos ← anchor_cols`.
+4. **Anchor injection.** `v_inject = input_v_proj(embed(token))` gated by
+   the STE one-hot of the anchor pick. Stacked into the same sparse LIF
+   deposit as the walker's own write (step 6).
 
-The older graph-walker draft relaunched `H × L_walk` hops from scratch every
-token. The current code does **one hop per token** and persists the walkers
-through time.
+Within a window (tokens 1 … mod_period-1) this whole block is skipped;
+walkers stay at their persistent positions.
 
-### 3. Input anchoring vs persistent motion
+### Common suffix (every step)
 
-The two mechanisms are separate on purpose:
-
-- each token still chooses `start_cols` on the input plane
-- walkers themselves continue from `walker_pos`
-
-So each token can inject fresh token-specific signal into the graph while the
-walker trajectories continue through graph space over time.
-
-### 4. Sparse state update
-
-The state update only aggregates messages for:
-
-- input anchor columns
-- one-hop walker destinations
-
-The code deduplicates visited `(batch, column)` rows, sums into a compact
-`incoming_sparse`, updates only those rows, then writes them back into `s`.
-
-Important limitation:
-
-- the implementation still rewrites the full flattened state tensor via
-  `index_copy`, so the semantics are sparse but the storage update is not yet
-  fully sparse
-
-That is still one of the main remaining performance bottlenecks.
+5. **Walker message.** For each of B·H walkers at its current column c:
+   read `s_cur_old = s[c]` via gather. Build the **steering input**
+   `cat(s_cur_old, col_id[c], walker_state, token_per_walker)` of dim
+   `3·D_s + D_id`. Feed through `content_mlp` → `m_out ∈ ℝ^{D_s}`.
+6. **Sparse LIF deposit.** Walker writes `m_out` at **its current
+   column** (not destination). On window-start steps, the anchor
+   injection is stacked in the same kernel call. The LIF blend is
+   `s_new[c] = α(c)·s_old[c] + (1-α(c))·tanh(Σ messages_to_c)` where
+   `α(c) = σ(decay_proj(col_id[c]))` per-column. Implemented by
+   `SparseLIFUpdate` (Triton forward + backward).
+7. **Re-read post-update.** `s_cur_new = s_new[c]`. The walker's own
+   contribution is now in the state it reads for routing.
+8. **Routing query.** Build the **post-update steering input**
+   `cat(s_cur_new, col_id[c], walker_state, token_per_walker)` → `q_proj` →
+   per-score-head query `[B·H, n_score_heads, D_q]`.
+9. **Hop scores.** Score against `k_proj(col_id[nbrs[c]])` for each of
+   the K neighbours. Add `active_E_bias[edge_flat]` (plastic
+   persistent bias + grad-carrying neuromod delta; see §Plasticity).
+   Gumbel top-1 STE → `next_col`.
+10. **Endpoint readout.** `end_state = s_cur_new + Σ_k ste[k] ·
+    nbr_id_to_s(col_id[nbrs[c, k]])`. First term forwards equals
+    `s[c]_new` and carries gradient to `content_mlp`, LIF α,
+    `walker_state`, token embedding. Second term is the **routing
+    gradient bridge**: in forward it equals `nbr_id_to_s(col_id[next_col])`
+    (ste is one-hot); in backward it differentiates through ste →
+    soft_probs → scores → `q_proj` / `k_proj` / `E_bias` / neuromod.
+11. **Motor.** Cross-attention over H end-states (learned `motor_query`)
+    → `motor_state ∈ ℝ^{D_s}`.
+12. **Walker state update.** `walker_state_new = σ(α_h)·walker_state +
+    (1-σ(α_h))·m_out`. `α_h` is a learnable per-walker scalar, init so
+    σ(α_h) ≈ 0.9 (slow decay).
+13. **Walker moves.** `walker_pos ← next_col`.
 
 ## Routing
 
-Routing is in [src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py).
+[src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py). Gumbel top-1 softmax with
+ε-exploration. Straight-through: forward picks the argmax, backward
+differentiates through the soft distribution. ε-exploration samples a
+uniform neighbour with probability ε; gradients on exploration rows are
+**detached** so random choices can't train the router to prefer random
+edges.
 
-Current behavior:
+Tau and ε are tensors (not floats) so dynamo doesn't recompile when
+they anneal. Schedule: linear from `gumbel_tau_start=2.0 →
+gumbel_tau_end=0.5` over 10k steps; ε from 0.05 → 0.01 similarly.
 
-- Gumbel top-1 softmax in training
-- straight-through estimator for hard routing
-- optional epsilon exploration
-- explored rows have gradient zeroed so random exploration does not backprop as
-  if it were model-selected
-
-Load-balance regularization is live and gradient-carrying.
+Load-balance aux loss (Switch-Transformer style): `λ_balance · N ·
+Σ_c P(c)·f(c)` where P is the softmax routing mass per column and f is
+the empirical visit frequency. Gradient flows through the P term into
+`q_proj` / `k_proj` / `E_bias`.
 
 ## Readout
 
-The dense lexical stack is in [src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py):
+[src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py). `MultiHorizonReadout` produces
+`[..., K_h, V]` predictions from motor vectors via the factorisation
 
-- `state_to_model: D_s -> D_model`
-- `PostModelStack`
-- `PredictionHead`
-- tied unembedding
-- horizon factorization via `horizon_emb`
+    logits[...,k,v] = (motor @ W^T)[...,v] + (horizon_emb[k] @ W^T)[v]
 
-The readout now supports `[..., D_model] -> [..., K_h, V]`, so it can run
-either:
+where W is the tied token embedding. There are **two entry points**:
 
-- per token through the public `step()` API
-- batched over a TBPTT block during training
+- **`forward(motor, unembedding, horizon_logits=None)`** — materialises
+  the full broadcast `[..., K_h, V]`. Used by the single-token `step()`
+  path.
+- **`cross_entropy_factorized(motor, unembedding, targets, valid,
+  horizon_logits=None)`** — avoids the broadcast. For each horizon k
+  in Python, compute `logits_k = motor_logits + horizon_logits[k]`
+  ([..., V]) and `F.cross_entropy(logits_k, targets[..., k],
+  reduction="none")`. Memory: one `[B, T, V]` tensor at a time instead
+  of the full K_h-multiplied broadcast.
+
+The training flush uses `GraphWalkerMemory.readout_ce_block`, which is
+the memory-side wrapper around `cross_entropy_factorized`. At BS=200,
+T=48, K_h=8, V=32000, bf16 this saves ~4 GB relative to the naive
+broadcast path.
+
+## Plasticity
+
+Fires every `mod_period` tokens when `window_len == mod_period`.
+Orchestrated by `_maybe_finalize_surprise_and_plasticity` and
+implemented in `_plasticity_step` (graph_walker.py).
+
+### Path 1 — surprise-gated Hebbian (always on)
+
+- `surprise_ema [B, K_h]` was **streamed in** from the training flush via
+  `accumulate_block_ce` (see §Training below). No separate readout re-run.
+- `η_global = plast_eta · σ(surprise_ema.mean() - plast_surprise_bias)`
+- `δ_hebb = η_global · (co_visit_norm - plast_decay · E_bias_flat)`
+- `E_bias_flat ← E_bias_flat + δ_hebb`
+- Clamped to `[-E_bias_max, +E_bias_max]`
+
+### Path 2 — graph-transformer neuromod (on by default)
+
+[src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py).
+
+**Timing.** At the **start** of each plasticity window, neuromod reads
+a detached snapshot of the previous window's per-touched-column
+features and emits a grad-carrying `Δ_nm [N·K]`. Routing uses
+`active_E_bias = E_bias_flat.detach() + neuromod_eta · Δ_nm` for the
+whole next window. At window close, `Δ_nm.detach()` is folded into
+`E_bias_flat`.
+
+**Gradient story.** Loss from the window backprops through every
+routing score → `active_E_bias` → `Δ_nm` → neuromod parameters. This
+is "the neuromod is trained by the outcome of the decision it just
+made" — classic policy-style signal but fully differentiable, with the
+autograd graph spanning exactly one plasticity window.
+
+**Architecture.** Per-touched-column features are `[U, D_s + D_id + 1]`
+(mean state across batch, column identity, log visit count, all
+detached). Pipeline:
+
+1. `feature_proj: D_feat → D_mod`
+2. `n_layers` graph-attention blocks — multi-head attention with an
+   additive `[U, U]` adjacency bias (1.0 on existing topology edges, 0
+   otherwise) plus a pre-norm FFN. The transformer sees which touched
+   columns are already connected and can reason about nearby columns.
+3. **Target head** (per touched edge `(i, j)`): a small MLP on
+   `cat(x_i, x_j)` produces a scalar target bounded by tanh:
+   `target[i→j] = E_bias_max · tanh(edge_mlp(cat(x_i, x_j)))`.
+4. **EMA blend.** The caller converts target → delta via a learnable
+   scalar blend rate `γ = σ(blend_logit)`:
+   `Δ_nm[edge] = γ · (target[edge] - E_bias_flat.detach()[edge])`.
+   Adding this to `E_bias_flat` realises `(1-γ)·E_bias + γ·target` —
+   standard EMA blend toward the target.
+
+**Day-0 safety.** `edge_mlp`'s output layer is zero-initialised so
+`target = 0` at start; `blend_logit = -5` gives `γ ≈ 0.007`. Enabling
+the neuromod on a fresh init is effectively a no-op until training
+opens both knobs.
+
+**Scope of write.** Only edges whose source AND destination are in the
+touched set this window get a non-zero target. Unvisited parts of the
+graph are unchanged — "a synapse you don't use doesn't move".
 
 ## Training
 
-Phase 1 is in [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py).
+[src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py).
+Teacher-forced TBPTT over a `segment_T` sequence with `tbptt_block`
+equal to `mod_period` (enforced by config assertion).
 
-Current protocol:
+Per segment:
 
-1. run `step_core()` token by token
-2. buffer `motor_state` for the current TBPTT block
-3. at block flush, run one batched lexical forward pass with
-   `readout_from_state_block`
-4. compute exact multi-horizon CE from those block logits
-5. backprop
-6. `detach_state()` at TBPTT boundaries
+1. `begin_segment(B, device)` — resets s, walker_pos, walker_state,
+   surprise_ema, co_visit, visit_count. `E_bias_flat` survives.
+2. For each token: `step_core(token_id)` produces a differentiable
+   `motor_state` and accumulates visit / co-visit counters. Motor state
+   is buffered for the block-level readout.
+3. When the TBPTT block boundary is hit (= plasticity window close, by
+   config alignment), call `flush()`:
+   - Stack the block's motor states: `motor_state_bt [B, T_block, D_s]`.
+   - Build `targets [B, T_block, K_h]` and `valid_tk [T_block, K_h]`
+     (valid iff `block_start_t + i + k < T_seq`).
+   - `ce_masked [B, T_block, K_h]` = factorized CE (see §Readout).
+   - `accumulate_block_ce(ce_masked.detach(), valid_tk.detach())` —
+     streams per-token per-horizon CE into `surprise_ema` via
+     closed-form EMA per horizon.
+   - `_maybe_finalize_surprise_and_plasticity()` — fires Hebbian +
+     neuromod commit using the fresh `surprise_ema`.
+   - `loss = Σ_k w_k · per_horizon_mean[k] + Σ block_balance_sum`;
+     `loss.backward()`.
+   - `detach_state()` — cuts the autograd graph for the next block.
 
-This is a mechanical optimization only. It does **not** change the training
-objective. It only moves the large model-space prediction stack off the hot
-token path.
-
-## Surprise And Plasticity
-
-The branch no longer computes exact surprise every token.
-
-Current behavior:
-
-- each token records detached `motor_state` and token ids into a window buffer
-- exact multi-horizon surprise is computed only when the plasticity window
-  closes, via `_finalize_surprise_window()`
-- then `_plasticity_step()` uses the resulting `surprise_ema`
-
-So there are now three practical clocks:
-
-- token clock: sparse graph dynamics
-- block clock: batched lexical prediction for CE
-- plasticity clock: exact surprise + plastic write
-
-Plasticity has two paths, both additive into `E_bias_flat`:
-
-**Path 1 — surprise-gated Hebbian (always on):**
-
-- `co_visit_flat` counts traversed edges over the window
-- `eta_global = plast_eta * sigmoid(mean(surprise_ema) - plast_surprise_bias)`
-- `delta_hebb = eta_global * (co_visit_norm - plast_decay * E_bias)`
-- clamp to `[-E_bias_max, E_bias_max]`
-
-**Path 2 — graph-transformer neuromod (opt-in via `cfg.use_neuromod`):**
-
-Defined in [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py).
-Fires at the **start** of each plasticity window (not end), reading a
-detached snapshot of the previous window's per-touched-column features.
-Its output `ΔE_bias` is grad-carrying during the current window:
-
-- routing uses `E_bias_active = E_bias_flat.detach() + η_nm · ΔE_bias`
-- loss from the current window backprops through `ΔE_bias` into the
-  neuromod's parameters
-- at window close, `ΔE_bias.detach()` is baked into `E_bias_flat` (same
-  store as the Hebbian path)
-
-This means the neuromod is trained by the *outcome of the decision it
-just made* — classic policy-style signal but fully differentiable, and
-the autograd graph spans exactly one plasticity window (not two).
-
-Module architecture:
-
-- input: `[U, D_s + D_id + 1]` per touched column — mean state across
-  batch, column identity, log visit count
-- `feature_proj: D_feat → D_mod`
-- `n_layers` graph-attention layers (pre-norm, adjacency-biased
-  self-attention + FFN)
-- low-rank edge decoder: `ΔE_bias[i→j] = (src(x_i) · dst(x_j)) / √R`
-- zero-initialised output projections so the first segment after
-  enabling is identical to non-neuromod behaviour
-
-Topology bias: the attention scores in each layer are additively biased
-by a `[U, U]` 0/1 adjacency matrix indicating which touched-column
-pairs are connected in the fixed graph topology. The transformer
-therefore "knows" existing connectivity while deciding how to modulate
-it.
-
-Scope of write: only edges whose source AND destination are in the
-touched set this window receive a delta. Unvisited parts of the graph
-stay unchanged. Matches the biological "synapse you don't use doesn't
-move" rule.
+This keeps the dense lexical stack OFF the per-token clock. The hot path
+only holds small per-walker tensors during forward; the
+`[B·T_block, D_model]` matmuls and per-horizon CE happen once per block.
 
 ## Public APIs
 
 ### `step_core(token_id)`
 
-Hot graph-only path. Returns:
-
-- `motor_state`
-- `visit_freq_step`
-- `load_balance_loss`
-
-No logits are produced here.
+Hot graph-only path. Returns `WalkerCoreReadout(motor_state,
+visit_freq_step, load_balance_loss)`. No logits. Used by training.
 
 ### `step(token_id)`
 
-Compatibility / debugging path.
+Compatibility / debugging path. Runs `step_core()`, materialises logits
+via `readout_from_state_block`, and triggers
+`_maybe_finalize_surprise_and_plasticity` at the window boundary. Not
+used by `phase1_step`; surprise on this path is populated from whatever
+was last streamed by training (so plasticity on the `step()` path uses
+a potentially stale `surprise_ema` — fine for interactive smoke tests).
 
-Runs:
+### `readout_ce_block(motor_state, targets, valid)`
 
-- `step_core()`
-- immediate single-token readout
-- delayed-surprise buffering
-- possible plasticity-window finalization
+Factorised CE entry point used by `phase1_step.flush`. Returns `[B, T,
+K_h]` float32 per-position per-horizon cross-entropy (masked by
+`valid`).
 
-This keeps the single-step tests and debugging workflow simple, but it is not
-the path used by phase-1 training.
+## Tests
 
-## Current Tests
+- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py) — 16 tests covering shapes,
+  gradient flow, load-balance, prev-motor chaining, ε-exploration
+  gradient neutrality, plasticity firing, detach / reset semantics,
+  CUDA bf16 smoke, K_buf validation, non-visited column preservation.
+- [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py) — 8 tests covering subgraph
+  helpers (enumerate_touched_edges, build_adjacency_bias), zero-init
+  safety, non-zero targets after perturbation, tanh bound, first-segment
+  identity, phase-1 integration with gradient flow to neuromod params,
+  delta-snapshot roundtrip.
+- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py) — 9 tests covering
+  the `SparseLIFUpdate` Triton kernel numerical parity and edge cases.
 
-Three test files:
-
-- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py) (16 tests) — end-to-end shape, gradient, and correctness checks.
-- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py) (9 tests) — numerical parity and edge-case coverage for the fused Triton sparse LIF op.
-- [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py) (8 tests) — subgraph helpers, zero-init safety, and gradient-flow verification for the neuromod path.
-
-Full suite (33 tests) passes.
-
-Covered items include:
-
-- shape sanity
-- non-visited column preservation
-- persistent walker position changes
-- gradient flow through routing
-- load-balance gradient
-- prev-motor chaining
-- epsilon exploration gradient neutrality
-- K_buf validation
-- plasticity firing
-- detach / reset semantics
-- CUDA bf16 smoke
+**Full suite: 33 passed.** 24 pass CPU-only (graph_walker + neuromod);
+9 Triton tests are GPU-gated.
 
 ## Current Measured Throughput
 
-Measured on RTX 4090 with [scripts/bench_graph_walker.py](/home/alex/code/neuromorphic/scripts/bench_graph_walker.py):
+RTX 4090 (24 GB), defaults + CLI overrides. Runs with
+`PYTORCH_ALLOC_CONF=expandable_segments:True` set in
+[scripts/bench_graph_walker.py](/home/alex/code/neuromorphic/scripts/bench_graph_walker.py).
 
-- config: `N=1024`, `D_model=1024`, `D_s=512`, `K=32`, `H=4`, depth 4
-- total params: **104.4M**
+Config: `mod_period = tbptt_block = 48` (aligned, shorter than the
+default 128 to trade narrower credit horizon for more batch headroom):
 
-At the measured sweet spot (`BS=48 T=128 tbptt=32`):
+| BS  | ms/step | tok/s | peak VRAM |
+|-----|---------|-------|-----------|
+| 48  | 196     | 11.8k | 12.8 GB   |
+| 76  | 224     | 16.3k | 18.8 GB   |
+| 128 | 336     | 18.3k | 14.3 GB   |
+| 192 | 447     | 20.6k | 20.3 GB   |
+| **200** | **461** | **20.8k** | **21.1 GB** (ceiling) |
 
-- compiled training path (neuromod off): about **554 ms/step**, **11,100 tok/s**, **17.0 GB**
-- compiled training path (neuromod on): about **570 ms/step**, **10,770 tok/s**, **17.1 GB** (+0.47M params, −3% throughput)
+Reference point: at `mod=tbptt=128, BS=26` the aligned config throughput
+is ~7.7k tok/s / 19.1 GB — longer credit horizon for the neuromod, at
+the cost of 60% less batch headroom.
 
-At the old dev config (`BS=16 T=128 tbptt=16`):
+## Remaining Perf Frontier
 
-- compiled training path: about **389 ms/step**, **5,258 tok/s**, **6.88 GB**
+1. **`[B*H]-row hot matmuls vs Mamba-class [B*T]-row scan-parallel** —
+   the model is fully recurrent on the token clock. We can't scan-
+   parallelise time the way Mamba / transformers do; each walker hop
+   depends on the previous hop's deposited state. Expect per-tick
+   overhead to dominate until a custom fused Triton step-core kernel
+   exists.
+2. **Active-row overlay for column state** — the sparse-update
+   kernel still clones the full `[B·N, D_s]` buffer per step. At high
+   batch this is ~10% throughput overhead on top of factorized CE.
+   Tried once; reverted because the implementation tangled with
+   autograd's view+inplace and version-check rules; needs a dedicated
+   redesign (detached base + sparse differentiable overlay).
+3. **Fused tied-unembedding CE Triton kernel** — current factorized
+   CE is a Python loop of K_h iterations each running
+   `F.cross_entropy(logits_k [B·T, V], ...)`. A fused kernel that
+   never materialises even the per-horizon `[B·T, V]` logits would
+   save another ~2 GB at high batch, at the cost of engineering effort.
 
-Historical baseline (pre–CE vectorization + fused sparse update):
+## What's Next
 
-- compiled, `BS=16`: about **1592 ms/step**, **1286 tok/s** — step time dominated
-  by `SelectBackward` nodes from a `T_block × K_h` Python loop in the CE flush.
-
-What changed:
-
-- Fused Triton forward + backward for the sparse LIF state update
-  (`src/graph_walker/triton_sparse_update.py`). Replaced
-  `torch.unique + index_add + gather + LIF + index_copy` with an O(U)-touched-
-  row kernel path.
-- Vectorized multi-horizon CE in `phase1_step.flush`. One `F.cross_entropy`
-  over `[B * T_block * K_h, V]` replaces ~380 Python-loop iterations per
-  block flush, each of which was generating 2–3 `SelectBackward` autograd
-  nodes with full-shape zeros allocations.
-- Vectorized `_finalize_surprise_window`: per-horizon slice + closed-form
-  EMA instead of an inner double loop.
-- Per-segment scratch tensors (`batch_idx`, `k_range`, `ones_bh`) cached in
-  `begin_segment` rather than rebuilt every token.
-- Removed per-flush `.item()` CPU↔GPU syncs.
-
-## What This Means
-
-The branch is now much more faithful to the intended thesis than the older
-relaunch-`H×L` version:
-
-- trajectories are truly temporal
-- the lexical stack is off the fast clock during training
-- surprise is computed on the plasticity clock
-
-And the step is no longer dominated by autograd-graph overhead from Python
-loops in training code. Remaining performance frontier is structural:
-
-1. the hot path is still token-sequential (truly recurrent; can't scan-
-   parallelize like Mamba)
-2. backward still traverses ~50 autograd nodes per token through
-   `step_core`'s mixed routing + MLP + sparse update graph
-3. a custom step_core Triton forward + manual backward would likely cut
-   another 2–3× off training time, but at significant engineering cost
-
-## Fairness Of Parameter Allocation
-
-The branch is intentionally using the parameter budget in a way that is cheaper
-to execute:
-
-- keep the hot walker core reasonably sized (`D_s=512`, depth `4`)
-- move most extra parameters into cold model-space modules
-
-This is not treated as cheating on this branch. The comparison target is total
-trainable parameters plus wall-clock performance, not “every parameter must be
-paid on the per-token recurrent clock.”
-
-## Open Work
-
-Most important remaining systems tasks:
-
-1. eliminate the full-state rewrite
-2. improve compile/fusion of the hot core
-3. decide whether `H=4` or `H=8` is the best accuracy/speed point
-4. consider an optional richer slow-clock neuromodulator if scalar surprise
-   gating proves too weak
-
-Most important current research question:
-
-- can the persistent-walker design recover enough memory/reasoning capacity to
-  justify the still-high systems overhead, or does the branch need a more
-  aggressive sparse-state representation as well
+Integration target (not on this branch): mount `GraphWalkerMemory` as
+a memory module inside a frozen Llama (1B or 3B). See
+[docs/pretrained_lm_memory.md](/home/alex/code/neuromorphic/docs/pretrained_lm_memory.md) on `main` for the interface
+(`MemInjectLayer`, `forward_segment`, phase-1 Gumbel-STE + phase-2
+GRPO). The current single-token `step(token_id)` API needs to be
+wrapped as `forward_segment(h_mem[BS,T,d_mem], input_ids, lm, ...)`,
+the standalone-LM readout tower dropped, and a discrete-policy path
+added for phase-2 (candidate: REINFORCE over walker Gumbel-top-1 hops,
+accumulating log_π per fire).
