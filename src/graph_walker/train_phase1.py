@@ -84,38 +84,31 @@ def phase1_step(
         if ticks_since_backward == 0:
             return
         motor_state_bt = torch.stack(motor_state_block, dim=1)        # [B, T_block, D_s]
-        with ctx:
-            block_logits = lm.memory.readout_from_state_block(motor_state_bt)
+        T_block = ticks_since_backward
         with torch.autocast(device_type=device.type, enabled=False):
-            block_logits = block_logits.float()
-            # Vectorized multi-horizon CE: collapse the T_block × K_h python
-            # double-loop into a single F.cross_entropy call. The old loop
-            # was generating 2-3 autograd `select` nodes per (i, k) pair,
-            # and each `SelectBackward` allocated a full-shape zeros tensor
-            # (~128MB) for gradient scatter. With T_block=16 and K_h=8 per
-            # block that's ~380 select nodes per flush, dominating backward.
-            T_block = ticks_since_backward
+            # Build targets + validity mask.
             i_idx = torch.arange(T_block, device=device)
             k_idx = torch.arange(1, K_h + 1, device=device)
             # t_idx[i, k-1] = block_start_t + i + k
             t_idx = block_start_t + i_idx.unsqueeze(1) + k_idx.unsqueeze(0)
-            valid = t_idx < T_seq                                 # [T_block, K_h]
+            valid_tk = t_idx < T_seq                              # [T_block, K_h]
             t_idx_clamped = t_idx.clamp(max=T_seq - 1)            # safe gather
             # targets[b, i, k-1] = tokens[b, t_idx[i, k-1]]
             targets = tokens.index_select(1, t_idx_clamped.reshape(-1)).reshape(
                 B, T_block, K_h,
             )
-            # Flat CE: reduction='none' so we can mask invalid horizons.
-            logits_flat = block_logits.reshape(-1, block_logits.shape[-1])  # [B*T_block*K_h, V]
-            targets_flat = targets.reshape(-1)
-            ce_flat = F.cross_entropy(
-                logits_flat, targets_flat, reduction="none",
-            )                                                     # [B*T_block*K_h]
-            valid_flat = valid.unsqueeze(0).expand(B, -1, -1).reshape(-1).float()
-            ce_masked = (ce_flat * valid_flat).reshape(B, T_block, K_h)
+            valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)   # [B, T_block, K_h]
+
+            # Factorized CE: for each horizon, compute logits_k =
+            # motor_logits + horizon_logits[k] and F.cross_entropy, avoiding
+            # the [B, T_block, K_h, V] broadcast. At BS=88, K_h=8, V=32000
+            # this saves ~4 GB relative to the dense path.
+            ce_masked = lm.memory.readout_ce_block(
+                motor_state_bt, targets, valid_btk,
+            )                                                     # [B, T_block, K_h]
             block_horizon_sum = block_horizon_sum + ce_masked.sum(dim=(0, 1))
             block_horizon_count = (
-                block_horizon_count + valid.float().sum(dim=0) * B
+                block_horizon_count + valid_tk.float().sum(dim=0) * B
             )
         has_counts = block_horizon_count > 0
         per_h = block_horizon_sum / block_horizon_count.clamp(min=1)
@@ -130,7 +123,7 @@ def phase1_step(
         # _active_delta_nm it produces is ready for the next block's step.
         # The detached CE tensor keeps the autograd graph decoupled —
         # surprise is a training diagnostic, not a gradient carrier.
-        lm.memory.accumulate_block_ce(ce_masked.detach(), valid.detach())
+        lm.memory.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
         lm.memory._maybe_finalize_surprise_and_plasticity()
 
         loss.backward()

@@ -1206,6 +1206,32 @@ class GraphWalkerMemory(nn.Module):
             horizon_logits=self._horizon_logits_cache,
         )
 
+    def readout_ce_block(
+        self,
+        motor_state: torch.Tensor,   # [B, T, D_s]
+        targets: torch.Tensor,       # [B, T, K_h] int64
+        valid: torch.Tensor,         # [B, T, K_h] bool
+    ) -> torch.Tensor:
+        """Factorized cross-entropy: never materializes [B, T, K_h, V].
+
+        Replaces the `readout_from_state_block → F.cross_entropy(logits_flat,
+        targets_flat)` path used for training loss. Memory-efficient at
+        large batch: at BS=88, T=48, K_h=8, V=32000 this frees ~4 GB that
+        the naive broadcast would spend on the big logit tensor and its
+        log_softmax save-for-backward.
+
+        Returns `[B, T, K_h]` float32 CE per (position, horizon), masked.
+        """
+        self._ensure_block_caches(self.tied_token_emb.weight)
+        if not torch.is_autocast_enabled():
+            motor_state = motor_state.to(self.state_to_model.weight.dtype)
+        motor = self.state_to_model(motor_state)                      # [B, T, D_model]
+        return self.readout.cross_entropy_factorized(
+            motor, self.tied_token_emb.weight,
+            targets, valid,
+            horizon_logits=None,  # recomputed for fp32 precision inside CE
+        )
+
     # -----------------------------------------------------------------
     # Bookkeeping
     # -----------------------------------------------------------------

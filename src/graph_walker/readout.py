@@ -129,3 +129,50 @@ class MultiHorizonReadout(nn.Module):
         if horizon_logits is None:
             horizon_logits = torch.matmul(self.horizon_emb, W_T)  # [K_h, V]
         return logits_motor.unsqueeze(-2) + horizon_logits  # [..., K_h, V]
+
+    def cross_entropy_factorized(
+        self,
+        motor: torch.Tensor,         # [B, T, D_model]
+        unembedding: torch.Tensor,   # [V, D_model]
+        targets: torch.Tensor,       # [B, T, K_h] int64 — target token per horizon
+        valid: torch.Tensor,         # [B, T, K_h] bool — horizon has a valid target
+        horizon_logits: torch.Tensor | None = None,  # optional [K_h, V] cache
+    ) -> torch.Tensor:
+        """Memory-efficient CE: avoids the [B, T, K_h, V] broadcast.
+
+        Exploits the factorization
+            logits[b,t,k,v] = motor_logits[b,t,v] + horizon_logits[k,v]
+        to compute CE per-horizon, iterating over `K_h` in Python. Each
+        iteration materializes a [B, T, V] tensor (the summed logits for
+        one horizon) instead of the full [B, T, K_h, V].
+
+        At BS=88, T=48, K_h=8, V=32000, bf16: this saves ~3.8 GB of active
+        memory compared to the broadcast path, plus a matching save on the
+        log_softmax that `F.cross_entropy` would otherwise retain.
+
+        Returns: `[B, T, K_h]` float32 cross-entropy per (position, horizon),
+        with invalid entries zeroed per `valid`.
+        """
+        B, T, _ = motor.shape
+        K_h = targets.shape[-1]
+        V = unembedding.shape[0]
+
+        x = self.post_stack(motor)
+        x = self.pred_head(x)                              # [B, T, D_model]
+        W_T = unembedding.t()                              # [D_model, V]
+        motor_logits = torch.matmul(x, W_T)                # [B, T, V] — reused
+
+        if horizon_logits is None:
+            horizon_logits = torch.matmul(self.horizon_emb, W_T)  # [K_h, V]
+
+        ce_out = torch.empty(B, T, K_h, device=motor.device, dtype=torch.float32)
+        for k in range(K_h):
+            logits_k = motor_logits + horizon_logits[k]     # [B, T, V]
+            ce_k = F.cross_entropy(
+                logits_k.reshape(-1, V),
+                targets[..., k].reshape(-1),
+                reduction="none",
+            ).reshape(B, T)                                 # [B, T]
+            ce_out[..., k] = ce_k * valid[..., k].float()
+
+        return ce_out
