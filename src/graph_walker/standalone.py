@@ -15,7 +15,7 @@ class StandaloneLM(nn.Module):
     def __init__(self, cfg: GraphWalkerConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.D_s)
+        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.D_model)
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         self.memory = GraphWalkerMemory(cfg, tied_token_emb=self.token_emb)
 

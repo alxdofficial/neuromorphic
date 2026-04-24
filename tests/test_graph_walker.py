@@ -7,13 +7,14 @@ import torch
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.standalone import StandaloneLM
+from src.graph_walker.train_phase1 import phase1_step
 
 
 def _tiny_cfg(**overrides) -> GraphWalkerConfig:
     """Small config: 2 planes × 8×8 = 128 columns, vocab 256."""
     base = dict(
         plane_rows=8, plane_cols=8, L=2,
-        K=8, D_s=64, D_id=16,
+        K=8, D_model=64, D_s=64, D_id=16,
         n_heads=2, n_hops=3,
         D_q_in=16, D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
@@ -39,23 +40,22 @@ def test_single_step_shape():
     lm, tokens, cfg = _make(B=2, T=1)
     lm.memory.begin_segment(B=2, device=tokens.device)
     r = lm.memory.step(tokens[:, 0])
-    assert r.motor.shape == (2, cfg.D_s)
+    assert r.motor.shape == (2, cfg.D_model)
+    assert r.motor_state.shape == (2, cfg.D_s)
     assert r.logits.shape == (2, cfg.K_horizons, cfg.vocab_size)
     assert r.surprise_ema.shape == (2, cfg.K_horizons)
     assert torch.isfinite(r.logits).all()
 
 
-def test_trajectory_visits_L_columns_per_head():
-    """Sanity: each head's trajectory has L distinct positions recorded."""
+def test_persistent_walker_step_visits_start_and_endpoint():
+    """Each token now anchors H input columns and advances H persistent walkers."""
     lm, tokens, cfg = _make(B=2, T=1)
     lm.memory.begin_segment(B=2, device=tokens.device)
     _ = lm.memory.step(tokens[:, 0])
-    # visit_count should have at least H·L non-zero entries total (maybe overlapping)
+    # visit_count should count at least start-cols + next-cols for each head.
     assert lm.memory.visit_count is not None
     total_visits = lm.memory.visit_count.sum().item()
-    # H heads × L hops start-cols + (L-1)*H mid-hops. In current impl start-cols
-    # are counted too → H·L total per batch item.
-    expected_min = 2 * cfg.n_heads * cfg.n_hops    # B × H × L
+    expected_min = 2 * cfg.n_heads * 2             # B × H × (start + endpoint)
     assert total_visits >= expected_min - 1       # might be slightly off-by-one
 
 
@@ -68,9 +68,20 @@ def test_non_visited_columns_preserved():
     s_after = lm.memory.s
     # At least some columns should be unchanged (not on any trajectory)
     unchanged = torch.all(s_before == s_after, dim=-1)  # [B, N] bool
-    # With H=2, L=3, B=2 → max 2*2*3 = 12 cols visited per batch item. N=128.
-    # At least N - 12 = 116 cols should be unchanged per batch item.
-    assert unchanged.sum().item() > 2 * (cfg.N - cfg.n_heads * cfg.n_hops - 1)
+    # Persistent-walker mode only touches start-cols and one hop endpoint.
+    assert unchanged.sum().item() > 2 * (cfg.N - 2 * cfg.n_heads - 1)
+
+
+def test_walker_positions_persist_across_tokens():
+    lm, tokens, cfg = _make(B=2, T=2)
+    lm.memory.begin_segment(B=2, device=tokens.device)
+    _ = lm.memory.step(tokens[:, 0])
+    pos_after_0 = lm.memory.walker_pos.clone()
+    _ = lm.memory.step(tokens[:, 1])
+    pos_after_1 = lm.memory.walker_pos.clone()
+    assert pos_after_0.shape == (2, cfg.n_heads)
+    assert pos_after_1.shape == (2, cfg.n_heads)
+    assert not torch.equal(pos_after_0, pos_after_1)
 
 
 def test_gradient_flow_through_trajectory():
@@ -93,13 +104,20 @@ def test_gradient_flow_through_trajectory():
     loss = torch.stack(logits_all).float().sum()
     loss.backward()
 
-    # Content + readout must have non-None, finite gradient.
-    core_params = [
-        "cols.content_mlp.0.weight",
-        "motor_query",
-    ]
+    # content_mlp has three possible shapes: Sequential (shared, shallow),
+    # PerPlaneMLP (one W1 per plane), or DeepContentMLP (ModuleList of
+    # residual FFN blocks). Pick a representative tensor from whichever
+    # is in use and verify gradient reaches it.
+    params = dict(lm.memory.named_parameters())
+    if "cols.content_mlp.W1" in params:
+        content_name = "cols.content_mlp.W1"
+    elif "cols.content_mlp.in_proj.weight" in params:
+        content_name = "cols.content_mlp.in_proj.weight"
+    else:
+        content_name = "cols.content_mlp.0.weight"
+    core_params = [content_name, "motor_query"]
     for name in core_params:
-        param = dict(lm.memory.named_parameters())[name]
+        param = params[name]
         assert param.grad is not None, f"no grad for {name}"
         assert torch.isfinite(param.grad).all(), f"non-finite grad for {name}"
         assert param.grad.abs().sum().item() > 0, f"zero grad for {name}"
@@ -118,6 +136,118 @@ def test_gradient_flow_through_trajectory():
     assert any(g > 0 for g in routing_grads), (
         f"no routing param has non-zero gradient. {routing_grads}"
     )
+
+
+def test_load_balance_loss_carries_gradient_to_routing():
+    """load_balance_loss must actually back-prop into routing params.
+    Previously the loss was hard-coded to zero and visit_freq was detached,
+    so this aux loss was a silent no-op. Here we back-prop ONLY the
+    load-balance loss and check routing params move.
+    """
+    torch.manual_seed(0)
+    lm, tokens, cfg = _make(B=2, T=4)
+    lm.memory.begin_segment(B=2, device=tokens.device)
+    lb_losses = []
+    for t in range(4):
+        r = lm.memory.step(tokens[:, t])
+        lb_losses.append(r.load_balance_loss)
+
+    lb_total = torch.stack(lb_losses).sum()
+    assert lb_total.requires_grad, "load_balance_loss must carry gradient"
+    lb_total.backward()
+
+    routing_names = [
+        "cols.q_proj.2.weight", "cols.k_proj.2.weight", "input_q_proj.weight",
+    ]
+    grads = {
+        n: dict(lm.memory.named_parameters())[n].grad for n in routing_names
+    }
+    assert all(g is not None for g in grads.values()), f"missing grads: {grads}"
+    assert any(g.abs().sum().item() > 0 for g in grads.values()), (
+        f"load-balance loss produced zero grad on all routing params: "
+        f"{ {n: g.abs().sum().item() for n, g in grads.items()} }"
+    )
+
+
+def test_prev_motor_chain_updates_and_influences_routing():
+    """After a step, prev_motor stores the step's motor output, and once
+    prev_motor_proj learns non-zero weights the start-col query depends on it.
+    """
+    torch.manual_seed(0)
+    lm, tokens, cfg = _make(B=2, T=3)
+    lm.memory.begin_segment(B=2, device=tokens.device)
+    # Initial prev_motor is zero
+    assert torch.all(lm.memory.prev_motor == 0)
+
+    r0 = lm.memory.step(tokens[:, 0])
+    # After step, prev_motor equals the internal state-space motor
+    assert torch.allclose(lm.memory.prev_motor, r0.motor_state)
+
+    # Override prev_motor_proj with non-zero weights so the chain is active.
+    with torch.no_grad():
+        lm.memory.prev_motor_proj.weight.normal_(std=0.1)
+
+    # With non-zero prev_motor and non-zero projection, two identical-token
+    # steps produce different start-col distributions (since prev_motor
+    # differs between them).
+    lm.memory.begin_segment(B=2, device=tokens.device)
+    same_tok = tokens[:, 0]
+    # Drive prev_motor to two different values manually, verify start-col
+    # softmax query changes.
+    lm.memory.prev_motor = torch.randn_like(lm.memory.prev_motor)
+    q1 = lm.memory.token_to_state(
+        lm.memory.tied_token_emb(same_tok)
+    ) + lm.memory.prev_motor_proj(lm.memory.prev_motor)
+    lm.memory.prev_motor = torch.randn_like(lm.memory.prev_motor)
+    q2 = lm.memory.token_to_state(
+        lm.memory.tied_token_emb(same_tok)
+    ) + lm.memory.prev_motor_proj(lm.memory.prev_motor)
+    assert not torch.allclose(q1, q2), "prev_motor should influence start-col query"
+
+
+def test_prev_motor_detached_on_detach_state():
+    lm, tokens, cfg = _make(B=2, T=3)
+    lm.memory.begin_segment(B=2, device=tokens.device)
+    _ = lm.memory.step(tokens[:, 0])
+    assert lm.memory.prev_motor.requires_grad or lm.memory.prev_motor.grad_fn is not None
+    lm.memory.detach_state()
+    assert lm.memory.prev_motor.grad_fn is None
+
+
+def test_k_buf_must_be_at_least_k_horizons():
+    """K_buf < K_horizons is a footgun — horizon reads alias modulo K_buf."""
+    with pytest.raises(ValueError, match="K_buf"):
+        _tiny_cfg(K_horizons=8, K_buf=4)
+
+
+def test_epsilon_exploration_has_no_gradient():
+    """When ε-exploration overrides argmax with a uniform sample, the STE
+    must not let gradient flow through `soft` (which wasn't conditioned on
+    the override) — otherwise we'd train the router to prefer random edges.
+    """
+    from src.graph_walker.routing import gumbel_top1_softmax
+    torch.manual_seed(0)
+    # ε=1.0 forces every row to be an exploration pick.
+    scores = torch.randn(4, 8, requires_grad=True)
+    r = gumbel_top1_softmax(scores, tau=1.0, epsilon=1.0, training=True)
+    loss = r.ste_weights.sum()
+    loss.backward()
+    assert scores.grad is not None
+    assert scores.grad.abs().sum().item() == 0, (
+        f"ε=1.0 (all explored) should produce zero gradient on scores; "
+        f"got {scores.grad.abs().sum().item()}"
+    )
+
+
+def test_epsilon_zero_keeps_gradient():
+    """Sanity: without exploration, STE carries gradient through soft."""
+    from src.graph_walker.routing import gumbel_top1_softmax
+    torch.manual_seed(0)
+    scores = torch.randn(4, 8, requires_grad=True)
+    r = gumbel_top1_softmax(scores, tau=1.0, epsilon=0.0, training=True)
+    r.ste_weights.sum().backward()
+    assert scores.grad is not None
+    assert scores.grad.abs().sum().item() > 0
 
 
 def test_plasticity_fires_on_mod_period():
@@ -156,6 +286,21 @@ def test_reset_plastic_wipes_E_bias():
 
 def cfg_block_default() -> int:
     return 8
+
+
+def test_phase1_step_runs_and_returns_finite_stats():
+    lm, tokens, cfg = _make(B=2, T=8)
+    opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
+    stats = phase1_step(
+        lm, opt, tokens, tbptt_block=4, amp_dtype=None, training_step=0,
+    )
+    assert stats.loss > 0
+    assert stats.ce_loss > 0
+    assert stats.load_balance_loss >= 0
+    assert len(stats.per_horizon_loss) == cfg.K_horizons
+    assert all(torch.isfinite(torch.tensor(v)) for v in stats.per_horizon_loss)
+    assert torch.isfinite(torch.tensor(stats.grad_norm))
+    assert 0.0 <= stats.visit_entropy <= 1.0 + 1e-5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only")

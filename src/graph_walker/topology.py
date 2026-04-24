@@ -17,7 +17,6 @@ class Topology:
     edge_dst: torch.Tensor        # [N*K] int64 — dest col per flat-edge-idx
     plane_ids: torch.Tensor       # [N] int64
     input_positions: torch.Tensor  # [N_per_plane] int64 — plane 0 cols
-    output_positions: torch.Tensor  # [N_per_plane] int64 — plane L-1 cols
 
     def move_to(self, device: torch.device) -> "Topology":
         return Topology(
@@ -26,7 +25,6 @@ class Topology:
             edge_dst=self.edge_dst.to(device),
             plane_ids=self.plane_ids.to(device),
             input_positions=self.input_positions.to(device),
-            output_positions=self.output_positions.to(device),
         )
 
 
@@ -85,10 +83,6 @@ def build_topology(
         [to_flat(0, r, c) for r in range(plane_rows) for c in range(plane_cols)],
         dtype=torch.int64,
     )
-    output_positions = torch.tensor(
-        [to_flat(L - 1, r, c) for r in range(plane_rows) for c in range(plane_cols)],
-        dtype=torch.int64,
-    )
 
     # Out-edges
     K_intra = max(1, int(round(K * K_intra_fraction)))
@@ -133,5 +127,4 @@ def build_topology(
         edge_dst=edge_dst,
         plane_ids=plane_ids,
         input_positions=input_positions,
-        output_positions=output_positions,
     )

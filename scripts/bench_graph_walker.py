@@ -29,6 +29,7 @@ def main():
 
     cfg = GraphWalkerConfig()
     lm = StandaloneLM(cfg).cuda()
+    lm.memory.compile_step()
     opt = torch.optim.AdamW(lm.parameters(), lr=1e-4, fused=True)
 
     tokens = torch.randint(0, cfg.vocab_size, (args.bs, args.t), device="cuda")
@@ -49,8 +50,8 @@ def main():
 
     total = sum(p.numel() for p in lm.parameters())
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Config: N={cfg.N} D_s={cfg.D_s} K={cfg.K} "
-          f"H={cfg.n_heads} L_walk={cfg.n_hops}")
+    print(f"Config: N={cfg.N} D_model={cfg.D_model} D_state={cfg.D_s} K={cfg.K} "
+          f"H={cfg.n_heads} persistent_hop/token=1")
     print(f"   params={total/1e6:.1f}M  BS={args.bs} T={args.t} tbptt={args.tbptt}")
     print(f"   {dt*1000:.0f} ms/step  {args.bs*args.t/dt:.0f} tok/s  {peak:.2f} GB")
 

@@ -30,7 +30,7 @@ def main():
     if args.scale == "small":
         cfg = GraphWalkerConfig(
             plane_rows=8, plane_cols=8, L=3, K=16,
-            D_s=128, D_id=16, n_heads=2, n_hops=3,
+            D_model=128, D_s=128, D_id=16, n_heads=2, n_hops=3,
             D_q_in=32, D_q_per_head=32, n_score_heads=2,
             vocab_size=2000,
         )
@@ -44,8 +44,8 @@ def main():
     emb = lm.token_emb.weight.numel()
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Config: N={cfg.N} ({cfg.L} planes x {cfg.plane_rows}x{cfg.plane_cols})  "
-          f"D_s={cfg.D_s} D_id={cfg.D_id} K={cfg.K}  "
-          f"H={cfg.n_heads} L_walk={cfg.n_hops}  V={cfg.vocab_size}")
+          f"D_model={cfg.D_model} D_state={cfg.D_s} D_id={cfg.D_id} K={cfg.K}  "
+          f"H={cfg.n_heads} persistent_hop/token=1  V={cfg.vocab_size}")
     print(f"Params: total={total/1e6:.2f}M  emb={emb/1e6:.2f}M  rest={(total-emb)/1e6:.2f}M")
     print()
 

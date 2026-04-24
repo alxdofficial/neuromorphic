@@ -3,36 +3,31 @@
 Hot path per token:
   1. Softmax over input-plane columns → per-head starting column
   2. Inject token content at starting columns
-  3. For L hops: content_mlp at current col, score K out-edges, Gumbel
-     top-1 pick next col, record trajectory + outgoing message
-  4. Aggregate messages across heads/hops per destination col
+  3. Advance each persistent walker one hop: content_mlp at current col,
+     score K out-edges, Gumbel top-1 pick next col
+  4. Aggregate sparse messages at touched destination columns
   5. LIF-integrate messages into visited columns' states (others frozen)
-  6. Cross-attn readout over H·L visited column states → motor → logits
+  6. Cross-attn readout over H walker endpoints → motor_state
 
-Every mod_period tokens: neuromod + Hebbian update to E_bias based on
-accumulated per-edge traversal counts over the window.
+Every mod_period tokens: batch-compute exact surprise over the accumulated
+window, then do surprise-gated Hebbian on traversed-edge counts (scalar-eta v1).
 
 See docs/graph_walker.md for the full design.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.graph_walker.config import GraphWalkerConfig
-from src.graph_walker.readout import (
-    MultiHorizonReadout,
-    _FallbackRMSNorm,
-    init_prediction_buffer,
-    multi_horizon_surprise,
-    write_prediction_buffer,
-)
+from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
 from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
 from src.graph_walker.topology import build_topology
+from src.graph_walker.triton_sparse_update import sparse_lif_update
 
 
 def _rmsnorm(dim: int) -> nn.Module:
@@ -44,12 +39,106 @@ def _rmsnorm(dim: int) -> nn.Module:
 # =====================================================================
 
 
-class ColumnCompute(nn.Module):
-    """Shared-weight content_mlp, q_proj, k_proj — applied per visited column.
+class DeepContentMLP(nn.Module):
+    """Deep residual FFN stack with shared weights.
 
-    Unlike column_graph, these fire ONLY on visited columns (H·L = 16 at
-    default config), not on all N=1024 columns. So the per-column work
-    per token is dominated by H·L·MLP_size, not N·MLP_size.
+    Replaces the old 2-layer content_mlp with:
+        in_proj: (D_s + D_id) → D_s
+        n_layers × ResidualFFN(D_s, D_hid = ffn_mult · D_s)
+
+    Each ResidualFFN block is `x + down(gelu(up(norm(x))))`. The stack lives
+    in the hot per-hop path, so this width/depth is now kept smaller than the
+    external model width; extra capacity is added later in model space.
+    This keeps throughput sane —
+    one big batched matmul per sublayer, not L small ones.
+    """
+
+    def __init__(self, D_in: int, D_s: int, D_hid: int, n_layers: int) -> None:
+        super().__init__()
+        self.in_proj = nn.Linear(D_in, D_s)
+        nn.init.normal_(self.in_proj.weight, mean=0.0, std=0.014)
+        self.blocks = nn.ModuleList([
+            _ResidualFFN(D_s, D_hid) for _ in range(n_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.in_proj(x)
+        for block in self.blocks:
+            x = x + block(x)
+        return x
+
+
+class _ResidualFFN(nn.Module):
+    def __init__(self, D_s: int, D_hid: int) -> None:
+        super().__init__()
+        self.norm = _rmsnorm(D_s)
+        self.up = nn.Linear(D_s, D_hid)
+        self.down = nn.Linear(D_hid, D_s)
+        # Depth-scaled init on final projection so sum of residuals stays bounded.
+        nn.init.normal_(self.down.weight, mean=0.0, std=(2.0 / D_hid) ** 0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.gelu(self.up(self.norm(x))))
+
+
+class PerPlaneMLP(nn.Module):
+    """2-layer FFN with L independent weight sets, dispatched by plane index.
+
+    Each plane gets its own (W1, b1, W2, b2). Forward segment-matmuls by
+    plane: loops L times, each iteration runs F.linear on the subset of
+    walkers currently at that plane. Adds L kernel launches per layer
+    (vs one shared matmul) in exchange for L× more params and per-plane
+    specialisation.
+
+    When all walkers happen to be in a single plane the remaining L-1
+    iterations early-exit via mask.any() == False — cheap.
+    """
+
+    def __init__(self, L: int, D_in: int, D_hid: int, D_out: int) -> None:
+        super().__init__()
+        self.L = L
+        self.D_in = D_in
+        self.D_hid = D_hid
+        self.D_out = D_out
+
+        # Layer 1: D_in → D_hid
+        self.W1 = nn.Parameter(torch.empty(L, D_hid, D_in))
+        self.b1 = nn.Parameter(torch.zeros(L, D_hid))
+        # Layer 2: D_hid → D_out
+        self.W2 = nn.Parameter(torch.empty(L, D_out, D_hid))
+        self.b2 = nn.Parameter(torch.zeros(L, D_out))
+
+        # Depth-scaled init on first layer, small on second.
+        nn.init.normal_(self.W1, mean=0.0, std=0.014)
+        nn.init.normal_(self.W2, mean=0.0, std=(2.0 / D_hid) ** 0.5)
+
+    def forward(
+        self, x: torch.Tensor, plane_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """x: [N_walkers, D_in]; plane_idx: [N_walkers] long in [0, L)."""
+        # Scatter into output via mask per plane. L kernel launches each
+        # layer but each slice is small — negligible at B·H~100s of walkers.
+        out = torch.empty(
+            x.shape[0], self.D_out, device=x.device, dtype=x.dtype,
+        )
+        for p in range(self.L):
+            mask = plane_idx == p
+            if not mask.any():
+                continue
+            x_p = x[mask]
+            h_p = F.linear(x_p, self.W1[p], self.b1[p])
+            h_p = F.gelu(h_p)
+            o_p = F.linear(h_p, self.W2[p], self.b2[p])
+            out[mask] = o_p
+        return out
+
+
+class ColumnCompute(nn.Module):
+    """content_mlp (optionally per-plane) + shared q_proj + shared k_proj.
+
+    Unlike column_graph, these fire ONLY on visited columns (roughly H current
+    walker positions per token), not on all N columns. So the per-column work
+    per token is dominated by sparse visited-column compute, not N·MLP_size.
     """
 
     def __init__(self, cfg: GraphWalkerConfig) -> None:
@@ -58,11 +147,30 @@ class ColumnCompute(nn.Module):
         H, D_q = cfg.n_score_heads, cfg.D_q_per_head
 
         self.content_norm = _rmsnorm(D_s)
-        self.content_mlp = nn.Sequential(
-            nn.Linear(D_s + D_id, cfg.ffn_mult_content * D_s),
-            nn.GELU(),
-            nn.Linear(cfg.ffn_mult_content * D_s, D_s),
-        )
+        self.per_plane_content = cfg.per_plane_content_mlp
+        if cfg.per_plane_content_mlp:
+            self.content_mlp = PerPlaneMLP(
+                L=cfg.L, D_in=D_s + D_id,
+                D_hid=cfg.ffn_mult_content * D_s, D_out=D_s,
+            )
+        elif cfg.content_mlp_depth > 1:
+            # Deep shared MLP stack — residual FFN blocks. Scales params
+            # to GPT-2-small class while keeping one batched matmul per
+            # sublayer call (throughput-friendly).
+            self.content_mlp = DeepContentMLP(
+                D_in=D_s + D_id, D_s=D_s,
+                D_hid=cfg.ffn_mult_content * D_s,
+                n_layers=cfg.content_mlp_depth,
+            )
+        else:
+            self.content_mlp = nn.Sequential(
+                nn.Linear(D_s + D_id, cfg.ffn_mult_content * D_s),
+                nn.GELU(),
+                nn.Linear(cfg.ffn_mult_content * D_s, D_s),
+            )
+            nn.init.normal_(
+                self.content_mlp[0].weight, mean=0.0, std=0.014,
+            )
         self.q_proj = nn.Sequential(
             nn.Linear(D_s + D_id, 2 * H * D_q),
             nn.GELU(),
@@ -85,7 +193,7 @@ class ColumnCompute(nn.Module):
             nn.init.zeros_(module.bias)
 
         # Depth-scaled init on first layers.
-        for module in (self.content_mlp[0], self.q_proj[0], self.k_proj[0]):
+        for module in (self.q_proj[0], self.k_proj[0]):
             nn.init.normal_(module.weight, mean=0.0, std=0.014)
 
         self.n_heads = H
@@ -99,10 +207,19 @@ class ColumnCompute(nn.Module):
 
 @dataclass
 class WalkerReadout:
-    """Return bundle from step()."""
-    motor: torch.Tensor                   # [B, D_s]
+    """Return bundle from public step()."""
+    motor: torch.Tensor                   # [B, D_model]
+    motor_state: torch.Tensor             # [B, D_s]
     logits: torch.Tensor                  # [B, K_horizons, V]
     surprise_ema: torch.Tensor            # [B, K_horizons]
+    visit_freq_step: torch.Tensor | None  # [N] fractional visits (if tracked)
+    load_balance_loss: torch.Tensor       # scalar — aux loss term
+
+
+@dataclass
+class WalkerCoreReadout:
+    """Return bundle from the hot persistent-walker core."""
+    motor_state: torch.Tensor             # [B, D_s]
     visit_freq_step: torch.Tensor | None  # [N] fractional visits (if tracked)
     load_balance_loss: torch.Tensor       # scalar — aux loss term
 
@@ -128,9 +245,6 @@ class GraphWalkerMemory(nn.Module):
         self.register_buffer(
             "input_positions", topo.input_positions, persistent=False,
         )
-        self.register_buffer(
-            "output_positions", topo.output_positions, persistent=False,
-        )
 
         # Column identity
         torch.manual_seed(cfg.init_seed)
@@ -145,29 +259,38 @@ class GraphWalkerMemory(nn.Module):
         self.cols = ColumnCompute(cfg)
 
         # Input plane: per-head softmax over input-plane columns.
+        # token_to_state keeps the graph hot path at D_s even when the lexical
+        # model width is larger.
+        self.token_to_state = nn.Linear(cfg.D_model, cfg.D_s, bias=False)
+        nn.init.normal_(self.token_to_state.weight, mean=0.0, std=0.014)
+
         # q_in: [B, D_s] -> [B, H, D_q_in]
         self.input_q_proj = nn.Linear(
             cfg.D_s, cfg.n_heads * cfg.D_q_in, bias=False,
         )
         self.input_k_proj = nn.Linear(cfg.D_id, cfg.D_q_in, bias=False)
-        self.input_v_proj = nn.Linear(cfg.D_s, cfg.D_s, bias=False)
+        self.input_v_proj = nn.Linear(cfg.D_model, cfg.D_s, bias=False)
         # Zero-init v so initial token-injection is no-op (state stays bounded).
         nn.init.zeros_(self.input_v_proj.weight)
 
-        # Plastic per-head input bias over input-plane columns: [H, N_in]
-        # fp32 plastic state, not a parameter.
-        self._N_in = cfg.N_per_plane
-        self.register_buffer(
-            "input_E_bias",
-            torch.zeros(cfg.n_heads, cfg.N_per_plane, dtype=torch.float32),
-            persistent=False,
-        )
+        # Prev-token motor feeds into the start-col query (only): lets the
+        # start position depend on recent output direction, not just the
+        # current token's identity. Zero-init so day-1 behaviour is unchanged
+        # and the model learns to use the chain through the routing gradient.
+        # Autograd follows the chain within a TBPTT block; detach_state cuts
+        # it at block boundaries.
+        self.prev_motor_proj = nn.Linear(cfg.D_s, cfg.D_s, bias=False)
+        nn.init.zeros_(self.prev_motor_proj.weight)
 
-        # Output readout: cross-attn over H·L visited column states.
+        self._N_in = cfg.N_per_plane
+
+        # Output readout: cross-attn over the H persistent walker endpoints.
         self.out_norm = _rmsnorm(cfg.D_s)
         self.motor_query = nn.Parameter(torch.randn(cfg.D_s) * 0.02)
         self.out_k_proj = nn.Linear(cfg.D_s, cfg.D_s, bias=False)
         self.out_v_proj = nn.Linear(cfg.D_s, cfg.D_s, bias=False)
+        self.state_to_model = nn.Linear(cfg.D_s, cfg.D_model, bias=False)
+        nn.init.normal_(self.state_to_model.weight, mean=0.0, std=0.014)
 
         # Multi-horizon readout (reused from column-graph)
         self.readout = MultiHorizonReadout(cfg)
@@ -175,12 +298,15 @@ class GraphWalkerMemory(nn.Module):
         # --- Persistent state (buffers) ---
         self._state_initialized = False
         self.s: torch.Tensor                 # [B, N, D_s]
-        self.E_bias_flat: torch.Tensor        # [N*K] fp32
-        self.pred_buf: torch.Tensor           # [B, K_buf, K_h, V]
+        self.prev_motor: torch.Tensor        # [B, D_s] — chained into next step
+        self.walker_pos: torch.Tensor        # [B, H] long — persistent walker positions
+        self.E_bias_flat: torch.Tensor       # [N*K] fp32
         self.surprise_ema: torch.Tensor       # [B, K_h]
         self.surprise_prev: torch.Tensor      # [B, K_h]
-        self.pred_cursor: int = 0
-        self.pred_filled: int = 0
+        self.surprise_motor_window: torch.Tensor  # [B, mod_period, D_s]
+        self.surprise_token_window: torch.Tensor  # [B, mod_period]
+        self.surprise_tail_motor: torch.Tensor    # [B, K_h-1, D_s]
+        self.surprise_tail_len: int = 0
         self.tick_counter: int = 0
 
         # Window-accumulated stats for plasticity (reset every mod_period)
@@ -194,6 +320,70 @@ class GraphWalkerMemory(nn.Module):
         # Training / routing scheduling — caller sets these externally.
         self.training_step: int = 0
 
+        # Per-block caches for values that depend only on Parameters (so
+        # they are constant within a TBPTT block). Invalidated on
+        # detach_state / begin_segment so gradient still flows correctly
+        # to the underlying Parameters each backward pass.
+        self._horizon_logits_cache: torch.Tensor | None = None
+        self._alpha_cache: torch.Tensor | None = None              # [N]
+        self._input_keys_cache: torch.Tensor | None = None         # [N_in, D_q_in]
+        self._k_all_cache: torch.Tensor | None = None              # [N, H_score*D_q]
+
+        # Filled when compile_step() is called; the hot graph core then routes
+        # through the compiled version. Readout / surprise bookkeeping stays
+        # outside that region so the compiled path only pays the true fast
+        # recurrent work.
+        self._compiled_step = None
+
+    # -----------------------------------------------------------------
+    # Block-level caches (static per forward within a TBPTT block)
+    # -----------------------------------------------------------------
+
+    def compile_step(self, mode: str = "default") -> None:
+        """Compile the hot per-token graph core. Must be called after .cuda().
+
+        Uses fullgraph=False so dynamo can graph-break around the Python
+        bookkeeping that stays outside the compiled step. Also enables
+        capture_dynamic_output_shape_ops so
+        torch.unique / torch.bincount (data-dependent shapes) don't
+        trigger their own graph breaks. On Triton 3.6 we avoid the
+        TritonGPURemoveLayoutConversions randint-in-fusion crash by
+        using rand+argmax for exploration sampling (see routing.py).
+        """
+        # Let unique/bincount stay in the compiled graph
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        # Let integer module attributes stay dynamic instead
+        # of triggering a recompile every time they change.
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        # Room for a few recompile variants (requires_grad cycles, etc.)
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64,
+        )
+        self._compiled_step = torch.compile(
+            self._step_core_impl, mode=mode, fullgraph=False,
+        )
+
+    @torch._dynamo.disable
+    def _ensure_block_caches(self, unembedding: torch.Tensor) -> None:
+        """Populate all per-block caches if not already set. Kept out of
+        dynamo's compiled region so the `is None` checks don't trigger
+        recompiles each time the cache status flips across a block.
+        """
+        if self._horizon_logits_cache is None:
+            self._horizon_logits_cache = torch.matmul(
+                self.readout.horizon_emb, unembedding.t(),
+            )
+        if self._alpha_cache is None:
+            self._alpha_cache = torch.sigmoid(
+                self.decay_proj(self.col_id),
+            ).squeeze(-1)
+        if self._input_keys_cache is None:
+            self._input_keys_cache = self.input_k_proj(
+                self.col_id[self.input_positions],
+            )
+        if self._k_all_cache is None:
+            self._k_all_cache = self.cols.k_proj(self.col_id)
+
     # -----------------------------------------------------------------
     # State management
     # -----------------------------------------------------------------
@@ -204,17 +394,35 @@ class GraphWalkerMemory(nn.Module):
         dtype_fast = self._fast_dtype(device)
 
         self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
-        self.pred_buf = init_prediction_buffer(
-            B, cfg.K_buf, cfg.K_horizons, cfg.vocab_size, device, dtype_fast,
+        # prev_motor: last step's motor output, chained into next step's
+        # start-col query. Starts at zero each segment.
+        self.prev_motor = torch.zeros(B, cfg.D_s, device=device, dtype=dtype_fast)
+        self.walker_pos = torch.zeros(
+            B, cfg.n_heads, device=device, dtype=torch.long,
         )
         self.surprise_ema = torch.zeros(
             B, cfg.K_horizons, device=device, dtype=torch.float32,
         )
         self.surprise_prev = torch.zeros_like(self.surprise_ema)
-        self.pred_cursor = 0
-        self.pred_filled = 0
+        self.surprise_motor_window = torch.zeros(
+            B, cfg.mod_period, cfg.D_s, device=device, dtype=dtype_fast,
+        )
+        self.surprise_token_window = torch.zeros(
+            B, cfg.mod_period, device=device, dtype=torch.long,
+        )
+        tail_len = max(cfg.K_horizons - 1, 1)
+        self.surprise_tail_motor = torch.zeros(
+            B, tail_len, cfg.D_s, device=device, dtype=dtype_fast,
+        )
+        self.surprise_tail_len = 0
         self.tick_counter = 0
         self.window_len = 0
+
+        # Invalidate block-level caches at segment boundary.
+        self._horizon_logits_cache = None
+        self._alpha_cache = None
+        self._input_keys_cache = None
+        self._k_all_cache = None
 
         # Lazy-init plastic state on first segment
         if not hasattr(self, "E_bias_flat") or self.E_bias_flat is None:
@@ -226,28 +434,47 @@ class GraphWalkerMemory(nn.Module):
         )
         self.visit_count = torch.zeros(cfg.N, device=device, dtype=torch.float32)
 
+        # Per-segment scratch constants (recomputed every token in the old
+        # hot path; now built once per segment). BH stays fixed within a
+        # segment, so these are safe to cache.
+        H = cfg.n_heads
+        self._batch_idx = (
+            torch.arange(B, device=device).repeat_interleave(H)
+        )                                                             # [B*H]
+        self._k_range = torch.arange(cfg.K, device=device)            # [K]
+        self._ones_bh = torch.ones(B * H, device=device, dtype=torch.float32)
+
         self._state_initialized = True
 
     def reset_plastic_memory(self, device: torch.device) -> None:
-        """Hard reset of long-term plastic E_bias + input_E_bias."""
+        """Hard reset of long-term plastic E_bias."""
         self.E_bias_flat = torch.zeros(
             self.cfg.num_edges, device=device, dtype=torch.float32,
         )
-        self.input_E_bias = self.input_E_bias.to(device).zero_()
 
     def detach_state(self) -> None:
         """TBPTT boundary: preserve values, sever gradient graph."""
         if not self._state_initialized:
             return
         self.s = self.s.detach()
+        self.prev_motor = self.prev_motor.detach()
         self.E_bias_flat = self.E_bias_flat.detach()
-        self.pred_buf = self.pred_buf.detach()
+        self.walker_pos = self.walker_pos.detach()
         self.surprise_ema = self.surprise_ema.detach()
         self.surprise_prev = self.surprise_prev.detach()
+        self.surprise_motor_window = self.surprise_motor_window.detach()
+        self.surprise_token_window = self.surprise_token_window.detach()
+        self.surprise_tail_motor = self.surprise_tail_motor.detach()
         if self.co_visit_flat is not None:
             self.co_visit_flat = self.co_visit_flat.detach()
         if self.visit_count is not None:
             self.visit_count = self.visit_count.detach()
+        # Invalidate block caches — next step rebuilds them with fresh
+        # autograd refs tied to the new block's forward computation.
+        self._horizon_logits_cache = None
+        self._alpha_cache = None
+        self._input_keys_cache = None
+        self._k_all_cache = None
 
     def _fast_dtype(self, device: torch.device) -> torch.dtype:
         choice = self.cfg.state_dtype
@@ -261,293 +488,242 @@ class GraphWalkerMemory(nn.Module):
     # Step: one token's forward + bookkeeping
     # -----------------------------------------------------------------
 
+    def _schedule_tensors(self, token_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        tau = torch.tensor(
+            gumbel_schedule(
+                self.training_step, cfg.gumbel_tau_start, cfg.gumbel_tau_end,
+                cfg.gumbel_anneal_steps,
+            ),
+            device=token_id.device, dtype=torch.float32,
+        )
+        epsilon = torch.tensor(
+            gumbel_schedule(
+                self.training_step, cfg.epsilon_start, cfg.epsilon_end,
+                cfg.epsilon_anneal_steps,
+            ),
+            device=token_id.device, dtype=torch.float32,
+        )
+        return tau, epsilon
+
+    def step_core(self, token_id: torch.Tensor) -> WalkerCoreReadout:
+        """Hot persistent-walker core: sparse graph dynamics only."""
+        self._ensure_block_caches(self.tied_token_emb.weight)
+        tau, epsilon = self._schedule_tensors(token_id)
+        if self._compiled_step is not None:
+            return self._compiled_step(token_id, tau, epsilon)
+        return self._step_core_impl(token_id, tau, epsilon)
+
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
-        """One token → H trajectories × L hops → readout + plasticity."""
+        """Public single-token API: graph core + immediate readout.
+
+        Training should prefer `step_core()` plus blockwise readout so the
+        large model-space stack stays off the token clock.
+        """
+        core = self.step_core(token_id)
+        motor = self.state_to_model(core.motor_state)
+        logits = self.readout(
+            motor, self.tied_token_emb.weight,
+            horizon_logits=self._horizon_logits_cache,
+        )
+        self._record_surprise_token(token_id, core.motor_state.detach())
+        self._maybe_finalize_surprise_and_plasticity()
+        return WalkerReadout(
+            motor=motor,
+            motor_state=core.motor_state,
+            logits=logits,
+            surprise_ema=self.surprise_ema,
+            visit_freq_step=core.visit_freq_step,
+            load_balance_loss=core.load_balance_loss,
+        )
+
+    def _step_core_impl(
+        self, token_id: torch.Tensor, tau: torch.Tensor, epsilon: torch.Tensor,
+    ) -> WalkerCoreReadout:
+        """One token of sparse graph dynamics with persistent walkers.
+
+        This runs only the graph-side work that is truly on the token clock:
+        token anchoring on the input plane, one hop of persistent-walker
+        movement, sparse state update, and graph-state readout.
+        """
         assert self._state_initialized, "call begin_segment() first"
         cfg = self.cfg
         B = self.s.shape[0]
         device = self.s.device
 
-        # Current routing parameters (annealed by caller via training_step)
-        tau = gumbel_schedule(
-            self.training_step, cfg.gumbel_tau_start, cfg.gumbel_tau_end,
-            cfg.gumbel_anneal_steps,
-        )
-        epsilon = gumbel_schedule(
-            self.training_step, cfg.epsilon_start, cfg.epsilon_end,
-            cfg.epsilon_anneal_steps,
-        )
         is_training = self.training
-
-        # 1. Embed token
-        h_input = self.tied_token_emb(token_id)                     # [B, D_s]
-
-        # 2. Per-head start-column softmax over input plane
-        #    q[B, H, D_q_in] · k[N_in, D_q_in].T = [B, H, N_in]
-        query_flat = self.input_q_proj(h_input).view(
-            B, cfg.n_heads, cfg.D_q_in,
-        )                                                            # [B, H, D_q_in]
-        input_ids = self.col_id[self.input_positions]                # [N_in, D_id]
-        input_keys = self.input_k_proj(input_ids)                    # [N_in, D_q_in]
-        # Scale
-        scale_in = 1.0 / (cfg.D_q_in ** 0.5)
-        scores_in = torch.einsum(
-            "bhd,nd->bhn", query_flat, input_keys,
-        ) * scale_in                                                 # [B, H, N_in]
-        scores_in = scores_in + self.input_E_bias.unsqueeze(0).to(scores_in.dtype)
-
-        # Gumbel top-1 per head
-        # Flatten H into batch for routing: [B*H, N_in]
-        scores_in_flat = scores_in.reshape(B * cfg.n_heads, self._N_in)
-        rout_in = gumbel_top1_softmax(
-            scores_in_flat, tau=tau, epsilon=epsilon, training=is_training,
-        )
-        # [B, H] col-index into input_positions → [B, H] global col-index
-        start_local = rout_in.selected_idx.view(B, cfg.n_heads)       # [B, H]
-        start_cols = self.input_positions[start_local]                # [B, H]
-
-        # 3. Inject token content at starting columns
-        v_inject = self.input_v_proj(h_input)                         # [B, D_s]
-        # For each (b, h), update s[b, start_cols[b, h]] additively.
-        # State update: s[start] = α * s + (1-α) * tanh(v_inject)
-        alpha = torch.sigmoid(self.decay_proj(self.col_id)).squeeze(-1)  # [N]
-
-        # We'll do a single aggregation pass that handles both injection AND
-        # trajectory messages to avoid multiple scatter operations.
-        # Accumulate additive contributions to s_new[b, c] as weighted tanh(incoming).
-        # For injection: weight=1, incoming = v_inject at start_cols.
-
-        # 4. Walk L hops per head (read-only on self.s)
-        # We build `trajectory[B, H, L] = col idx` and collect messages.
-        trajectory = torch.zeros(
-            B, cfg.n_heads, cfg.n_hops, dtype=torch.long, device=device,
-        )
-        trajectory[:, :, 0] = start_cols
-
-        # messages[b, h, t] is the m_out emitted at hop t (before routing to hop t+1).
-        # weights[b, h, t] is the straight-through weight on the chosen edge at
-        # hop t (used to weight the message sent to hop t+1's column). In forward
-        # this weight is 1.0 (one-hot selected); in backward it carries gradient
-        # to q_proj, k_proj, E_bias via the softmax distribution.
-        msg_stack: list[torch.Tensor] = []
-        weight_stack: list[torch.Tensor] = []
-
-        # Also need the input-plane routing ste weight (for gradient to input_q_proj)
-        # Pick the ste weight at the chosen start col per head.
-        input_ste_weights = torch.gather(
-            rout_in.ste_weights, 1, rout_in.selected_idx.unsqueeze(1),
-        ).squeeze(1)                                                    # [B*H]
-
-        # Trajectory state is simply "current col per (b, h)" — start cols.
-        cur = start_cols.reshape(B * cfg.n_heads)                     # [B*H]
-
         cfg_n_heads = cfg.n_heads
         BH = B * cfg_n_heads
         state_dtype = self.s.dtype
 
-        # Running load-balance counts
-        visit_count_step = torch.zeros(cfg.N, device=device, dtype=torch.float32)
+        # 1. Embed token in model space, then project into graph-state space.
+        h_input_model = self.tied_token_emb(token_id)                 # [B, D_model]
+        h_input = self.token_to_state(h_input_model)                  # [B, D_s]
 
-        # Traversed-edge indices (for plasticity accumulation later): list of [B*H] flat-edge indices
-        traversed_edges: list[torch.Tensor] = []
-
-        # State at each visited column, broadcast across B*H. We'll gather s[cur] on demand.
-        for hop_t in range(cfg.n_hops):
-            # s at current columns: [B*H, D_s]
-            # Note: self.s is [B, N, D_s]; we need s[b, cur[b_h]] for each (b, h).
-            # cur spans B*H; reshape to per-batch gather.
-            cur_bh = cur.view(B, cfg_n_heads)                         # [B, H]
-            s_cur = torch.gather(
-                self.s,
-                1,
-                cur_bh.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
-            ).reshape(BH, cfg.D_s)                                     # [B*H, D_s]
-
-            # id at current cols
-            id_cur = self.col_id[cur]                                  # [B*H, D_id]
-
-            # content_mlp → m_out [B*H, D_s]
-            cat_content = torch.cat([
-                self.cols.content_norm(s_cur).to(state_dtype),
-                id_cur.to(state_dtype),
-            ], dim=-1)
-            m_out = self.cols.content_mlp(cat_content)                 # [B*H, D_s]
-
-            # Store for aggregation (the NEXT column receives this)
-            msg_stack.append(m_out.view(B, cfg_n_heads, cfg.D_s))
-
-            if hop_t == cfg.n_hops - 1:
-                # Last hop: don't pick next; trajectory done.
-                break
-
-            # q_proj at current cols
-            q = self.cols.q_proj(cat_content).view(
-                BH, self.cols.n_heads, self.cols.D_q,
-            )                                                          # [B*H, H_score, D_q]
-
-            # K neighbors of each current col
-            nbrs_of_cur = self.out_nbrs[cur]                           # [B*H, K]
-            nbr_ids = self.col_id[nbrs_of_cur]                          # [B*H, K, D_id]
-            k_nbrs = self.cols.k_proj(
-                nbr_ids.reshape(-1, cfg.D_id)
-            ).view(BH, cfg.K, self.cols.n_heads, self.cols.D_q)        # [B*H, K, H_score, D_q]
-
-            # Bilinear score: Σ_h q · k (per-head sum)
-            # Output: [B*H, K]
-            scale = 1.0 / (self.cols.D_q ** 0.5)
-            scores = torch.einsum("bhd,bkhd->bk", q, k_nbrs) * scale
-
-            # Add plastic E_bias for these (cur, k) flat edges
-            # Edge flat index: edge_flat[cur, k] = cur * K + k
-            k_range = torch.arange(cfg.K, device=device)
-            edge_flat = cur.unsqueeze(1) * cfg.K + k_range.unsqueeze(0)  # [B*H, K]
-            E_vals = self.E_bias_flat[edge_flat].to(scores.dtype)       # [B*H, K]
-            scores = scores + E_vals
-
-            # Gumbel top-1 softmax
-            rout = gumbel_top1_softmax(
-                scores, tau=tau, epsilon=epsilon, training=is_training,
-            )
-            next_local = rout.selected_idx                             # [B*H]
-            next_col = torch.gather(
-                nbrs_of_cur, 1, next_local.unsqueeze(-1),
-            ).squeeze(-1)                                              # [B*H]
-            # The flat edge taken (for plasticity)
-            edge_taken_flat = cur * cfg.K + next_local                 # [B*H]
-
-            # Pick the straight-through weight at the chosen edge.
-            # Forward: 1.0 (one-hot). Backward: soft_probs via STE.
-            chosen_weight = torch.gather(
-                rout.ste_weights, 1, next_local.unsqueeze(1),
-            ).squeeze(1)                                               # [B*H]
-            weight_stack.append(chosen_weight)
-
-            # Record trajectory
-            trajectory[:, :, hop_t + 1] = next_col.view(B, cfg_n_heads)
-            traversed_edges.append(edge_taken_flat)
-
-            # Track visit frequency (each trajectory step counts the dest col)
-            visit_count_step.scatter_add_(
-                0, next_col, torch.ones_like(next_col, dtype=torch.float32),
-            )
-
-            # Advance
-            cur = next_col
-
-        # Also count start columns in visit frequency
-        visit_count_step.scatter_add_(
-            0, start_cols.reshape(-1),
-            torch.ones(BH, device=device, dtype=torch.float32),
+        # 2. Token-conditioned anchoring on the input plane.
+        query_input = h_input + self.prev_motor_proj(
+            self.prev_motor.to(h_input.dtype),
         )
+        query_flat = self.input_q_proj(query_input).view(
+            B, cfg_n_heads, cfg.D_q_in,
+        )
+        input_keys = self._input_keys_cache
+        scale_in = 1.0 / (cfg.D_q_in ** 0.5)
+        scores_in = torch.einsum("bhd,nd->bhn", query_flat, input_keys) * scale_in
+
+        scores_in_flat = scores_in.reshape(BH, self._N_in)
+        rout_in = gumbel_top1_softmax(
+            scores_in_flat, tau=tau, epsilon=epsilon, training=is_training,
+        )
+        start_local = rout_in.selected_idx.view(B, cfg_n_heads)
+        start_cols = self.input_positions[start_local]                # [B, H]
+
+        # Input routing still happens each token, but the walkers now persist
+        # through graph space instead of relaunching an H×L walk from scratch.
+        cur_bh = (
+            start_cols.reshape(BH)
+            if self.tick_counter == 0
+            else self.walker_pos.reshape(BH)
+        )
+
+        # Injection anchors current token content into graph state.
+        v_inject = self.input_v_proj(h_input_model)                   # [B, D_s]
+        alpha = self._alpha_cache                                     # [N]
+        input_ste_weights = torch.gather(
+            rout_in.ste_weights, 1, rout_in.selected_idx.unsqueeze(1),
+        ).squeeze(1)                                                  # [B*H]
+
+        # Load-balance accounting.
+        visit_count_step = torch.zeros(cfg.N, device=device, dtype=torch.float32)
+        lb_dtype = torch.float32
+        P_mass = torch.zeros(cfg.N, device=device, dtype=lb_dtype)
+        p_in_per_col = rout_in.soft_probs.to(lb_dtype).sum(dim=0)     # [N_in]
+        P_mass = P_mass.index_add(0, self.input_positions, p_in_per_col)
+
+        # 3. Advance each persistent walker by one hop.
+        cur = cur_bh.view(B, cfg_n_heads)
+        s_cur = torch.gather(
+            self.s, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
+        ).reshape(BH, cfg.D_s)
+        id_cur = self.col_id[cur_bh]
+        cat_content = torch.cat([
+            self.cols.content_norm(s_cur).to(state_dtype),
+            id_cur.to(state_dtype),
+        ], dim=-1)
+        if self.cols.per_plane_content:
+            plane_of_cur = self.plane_ids[cur_bh]
+            m_out = self.cols.content_mlp(cat_content, plane_of_cur)
+        else:
+            m_out = self.cols.content_mlp(cat_content)
+
+        q = self.cols.q_proj(cat_content).view(
+            BH, self.cols.n_heads, self.cols.D_q,
+        )
+        nbrs_of_cur = self.out_nbrs[cur_bh]                           # [B*H, K]
+        k_all = self._k_all_cache
+        k_nbrs = k_all[nbrs_of_cur].view(
+            BH, cfg.K, self.cols.n_heads, self.cols.D_q,
+        )
+        scale = 1.0 / (self.cols.D_q ** 0.5)
+        scores = torch.einsum("bhd,bkhd->bk", q, k_nbrs) * scale
+
+        edge_flat = cur_bh.unsqueeze(1) * cfg.K + self._k_range.unsqueeze(0)
+        E_vals = self.E_bias_flat[edge_flat].to(scores.dtype)
+        scores = scores + E_vals
+
+        rout = gumbel_top1_softmax(
+            scores, tau=tau, epsilon=epsilon, training=is_training,
+        )
+        next_local = rout.selected_idx                                # [B*H]
+        next_col = torch.gather(
+            nbrs_of_cur, 1, next_local.unsqueeze(-1),
+        ).squeeze(-1)                                                 # [B*H]
+        chosen_weight = torch.gather(
+            rout.ste_weights, 1, next_local.unsqueeze(1),
+        ).squeeze(1)                                                  # [B*H]
+        edge_taken_flat = cur_bh * cfg.K + next_local                 # [B*H]
+
+        P_mass = P_mass.index_add(
+            0, nbrs_of_cur.reshape(-1),
+            rout.soft_probs.to(lb_dtype).reshape(-1),
+        )
+
+        visit_count_step.scatter_add_(0, start_cols.reshape(-1), self._ones_bh)
+        visit_count_step.scatter_add_(0, next_col, self._ones_bh)
         if self.visit_count is not None:
             with torch.no_grad():
                 self.visit_count = self.visit_count + visit_count_step
 
-        # 5. Aggregate messages per visited destination column
-        #    For each head and each hop t in 1..L-1:
-        #      dest = trajectory[:, h, t]
-        #      message arriving at dest = m_out from hop t-1
-        #    Plus: start-column injection = v_inject weighted to start_cols
-        # Build incoming [B, N, D_s]
-        incoming = torch.zeros_like(self.s)
-
-        # Injection contribution to start columns — weighted by input STE weight
-        # so gradient flows back to input_q_proj.
-        inject_msg = v_inject.unsqueeze(1).expand(B, cfg_n_heads, cfg.D_s).reshape(BH, cfg.D_s)
-        inject_msg = inject_msg * input_ste_weights.unsqueeze(-1).to(inject_msg.dtype)
-        start_cols_flat = start_cols.reshape(BH)                       # [B*H]
-        batch_idx = torch.arange(B, device=device).repeat_interleave(cfg_n_heads)  # [B*H]
-        incoming_flat = incoming.view(B * cfg.N, cfg.D_s)
-        dest_flat_inject = batch_idx * cfg.N + start_cols_flat
-        incoming_flat.index_add_(0, dest_flat_inject, inject_msg.to(incoming_flat.dtype))
-
-        # Trajectory messages: hop t's m_out goes to trajectory[:, :, t+1]
-        # weighted by the straight-through edge weight (gradient flows to q/k/E_bias).
-        for hop_t in range(cfg.n_hops - 1):
-            m = msg_stack[hop_t]                                      # [B, H, D_s]
-            dest = trajectory[:, :, hop_t + 1]                        # [B, H]
-            w = weight_stack[hop_t]                                   # [B*H]
-            m_flat = m.reshape(BH, cfg.D_s) * w.unsqueeze(-1).to(m.dtype)
-            dest_flat = batch_idx * cfg.N + dest.reshape(BH)
-            incoming_flat.index_add_(0, dest_flat, m_flat.to(incoming_flat.dtype))
-
-        incoming = incoming_flat.view(B, cfg.N, cfg.D_s)
-
-        # 6. LIF integrate at visited columns (non-visited stay unchanged).
-        # Build visited mask per batch: [B, N] {0, 1}
-        visited_mask = torch.zeros(B, cfg.N, device=device, dtype=state_dtype)
-        # Start cols
-        visited_mask.scatter_(1, start_cols, 1.0)
-        # Trajectory cols per hop
-        for hop_t in range(1, cfg.n_hops):
-            visited_mask.scatter_(1, trajectory[:, :, hop_t], 1.0)
-
-        alpha_exp = alpha.unsqueeze(0).unsqueeze(-1).to(state_dtype)   # [1, N, 1]
-        # Where visited: s_new = α·s + (1-α)·tanh(incoming)
-        # Where not visited: s_new = s  (unchanged)
-        s_visited_update = alpha_exp * self.s + (1.0 - alpha_exp) * torch.tanh(incoming)
-        self.s = torch.where(
-            visited_mask.unsqueeze(-1) > 0.5, s_visited_update, self.s,
+        # 4. Sparse aggregation and state update at only the touched rows.
+        batch_idx = self._batch_idx
+        inject_msg = (
+            v_inject.unsqueeze(1).expand(B, cfg_n_heads, cfg.D_s)
+            .reshape(BH, cfg.D_s)
         )
+        inject_msg = inject_msg * input_ste_weights.unsqueeze(-1).to(inject_msg.dtype)
+        next_msg = m_out * chosen_weight.unsqueeze(-1).to(m_out.dtype)
 
-        # 7. Readout: cross-attn over H·L visited column states
-        # Gather visited states: [B, H*L, D_s]
-        traj_flat = trajectory.reshape(B, cfg_n_heads * cfg.n_hops)    # [B, H*L]
-        traj_states = torch.gather(
-            self.s, 1, traj_flat.unsqueeze(-1).expand(B, -1, cfg.D_s),
-        )                                                              # [B, H*L, D_s]
+        all_dests = torch.cat([
+            batch_idx * cfg.N + start_cols.reshape(BH),
+            batch_idx * cfg.N + next_col,
+        ], dim=0).contiguous()
+        all_msgs = torch.cat(
+            [inject_msg, next_msg], dim=0,
+        ).to(state_dtype).contiguous()
 
-        s_traj = self.out_norm(traj_states).to(state_dtype)
-        k = self.out_k_proj(s_traj)                                    # [B, H*L, D_s]
+        # Fused Triton op: segment-sum messages into unique destinations,
+        # gather s_old, LIF-blend with alpha, scatter back in place.
+        # Operates only on touched rows (O(U)) rather than the full
+        # [B*N, D_s] state. Returns s_flat aliased to self.s's storage.
+        s_flat = self.s.view(B * cfg.N, cfg.D_s)
+        s_flat = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
+        self.s = s_flat.view(B, cfg.N, cfg.D_s)
+
+        # 5. Read out only from the new walker endpoints.
+        self.walker_pos = next_col.view(B, cfg_n_heads)
+        end_states = torch.gather(
+            self.s, 1, self.walker_pos.unsqueeze(-1).expand(B, -1, cfg.D_s),
+        )                                                              # [B, H, D_s]
+        s_traj = self.out_norm(end_states).to(state_dtype)
+        k = self.out_k_proj(s_traj)
         v = self.out_v_proj(s_traj)
         q_motor = self.motor_query.to(state_dtype).unsqueeze(0).expand(B, -1)
         scale_out = 1.0 / (cfg.D_s ** 0.5)
-        attn_scores = torch.sum(k * q_motor.unsqueeze(1), dim=-1) * scale_out  # [B, H*L]
+        attn_scores = torch.sum(k * q_motor.unsqueeze(1), dim=-1) * scale_out
         attn = F.softmax(attn_scores, dim=-1)
-        motor = torch.sum(attn.unsqueeze(-1) * v, dim=1)               # [B, D_s]
+        motor_state = torch.sum(attn.unsqueeze(-1) * v, dim=1)
+        self.prev_motor = motor_state
 
-        unemb = self.tied_token_emb.weight
-        logits = self.readout(motor, unemb)                             # [B, K_h, V]
-
-        # 8. Surprise + ring buffer (same as column_graph)
-        self._surprise_and_buffer_bookkeeping(token_id, logits)
-
-        # 9. Plasticity window accumulation — co-visitation counts
+        # 6. Plasticity-window bookkeeping stays on the fast clock only for
+        # sparse edge counts. Exact lexical surprise is deferred to the
+        # plasticity clock.
         with torch.no_grad():
-            if traversed_edges:
-                # Stack: [L-1, B*H] flat edge indices
-                all_edges = torch.cat(traversed_edges, dim=0)           # [(L-1)*B*H]
-                # Count visits per edge
-                self.co_visit_flat = self.co_visit_flat + torch.bincount(
-                    all_edges,
-                    minlength=cfg.num_edges,
-                ).to(torch.float32)
+            self.co_visit_flat = self.co_visit_flat + torch.bincount(
+                edge_taken_flat, minlength=cfg.num_edges,
+            ).to(torch.float32)
         self.window_len += 1
-
-        # 10. Plasticity fires every mod_period
-        if self.tick_counter + 1 >= cfg.mod_period and (self.tick_counter + 1) % cfg.mod_period == 0:
-            self._plasticity_step()
         self.tick_counter += 1
 
-        # 11. Load-balance aux loss: KL(visit_freq, uniform) over visited cols
-        # We use soft_probs from input routing + any soft routing stats in walk.
-        # For v1: simple KL from uniform on visit_count_step.
-        with torch.no_grad():
-            total = visit_count_step.sum().clamp(min=1.0)
-            freq = visit_count_step / total
-        # KL(freq, uniform) = sum freq * log(freq * N), guarding zeros
-        # Gradient does not flow through visit_count (it's discrete), so this
-        # aux loss is informational for now. The true load-balance signal in
-        # MoE relies on soft_probs; for simplicity we skip the gradient
-        # pathway in v1 and use ε-exploration + E_bias plasticity for
-        # routing diversification.
-        load_balance_loss = torch.tensor(0.0, device=device)
+        n_decisions = float(BH * 2)
+        P_mean = P_mass / n_decisions
+        f_mean = (visit_count_step / n_decisions).detach()
+        load_balance_loss = cfg.N * (P_mean * f_mean).sum()
 
-        return WalkerReadout(
-            motor=motor, logits=logits,
-            surprise_ema=self.surprise_ema,
-            visit_freq_step=freq.detach() if cfg.lambda_balance > 0 else None,
+        return WalkerCoreReadout(
+            motor_state=motor_state,
+            visit_freq_step=f_mean if cfg.lambda_balance > 0 else None,
             load_balance_loss=load_balance_loss,
+        )
+
+    def readout_from_state_block(self, motor_state: torch.Tensor) -> torch.Tensor:
+        """Project graph-state readouts into model space and logits in batch."""
+        self._ensure_block_caches(self.tied_token_emb.weight)
+        if not torch.is_autocast_enabled():
+            motor_state = motor_state.to(self.state_to_model.weight.dtype)
+        motor = self.state_to_model(motor_state)
+        return self.readout(
+            motor, self.tied_token_emb.weight,
+            horizon_logits=self._horizon_logits_cache,
         )
 
     # -----------------------------------------------------------------
@@ -555,22 +731,89 @@ class GraphWalkerMemory(nn.Module):
     # -----------------------------------------------------------------
 
     @torch._dynamo.disable
-    def _surprise_and_buffer_bookkeeping(
-        self, token_id: torch.Tensor, logits: torch.Tensor,
+    def _record_surprise_token(
+        self, token_id: torch.Tensor, motor_state: torch.Tensor,
     ) -> None:
+        idx = self.window_len - 1
+        self.surprise_motor_window[:, idx] = motor_state
+        self.surprise_token_window[:, idx] = token_id.detach()
+
+    @torch._dynamo.disable
+    def _finalize_surprise_window(self) -> None:
+        """Compute exact multi-horizon surprise only on the plasticity clock."""
+        if self.window_len == 0:
+            return
+
         cfg = self.cfg
-        self.surprise_prev = self.surprise_ema.detach().clone()
-        self.surprise_ema = multi_horizon_surprise(
-            self.pred_buf, self.pred_cursor, cfg.K_buf, self.pred_filled,
-            token_id, self.surprise_ema, cfg.alpha_gamma_s,
-        )
-        write_prediction_buffer(self.pred_buf, self.pred_cursor, logits)
-        self.pred_cursor = (self.pred_cursor + 1) % cfg.K_buf
-        self.pred_filled = min(self.pred_filled + 1, cfg.K_buf)
+        B = self.s.shape[0]
+        W = self.window_len
+        tail_len = min(self.surprise_tail_len, cfg.K_horizons - 1)
+
+        if tail_len > 0:
+            motor_all = torch.cat([
+                self.surprise_tail_motor[:, :tail_len],
+                self.surprise_motor_window[:, :W],
+            ], dim=1)
+        else:
+            motor_all = self.surprise_motor_window[:, :W]
+
+        with torch.autocast(device_type=self.s.device.type, enabled=False):
+            logits_all = self.readout_from_state_block(motor_all).float()   # [B, tail+W, K_h, V]
+            new_ema = self.surprise_ema.float().clone()
+            self.surprise_prev = self.surprise_ema.detach().clone()
+            # Vectorized per-horizon closed-form EMA.
+            # Old path: O(W × K_h) Python iterations with per-step
+            # `logits_all[:, idx-k, k-1]` selects + F.cross_entropy calls,
+            # each backward-allocating a full-shape gradient zeros tensor.
+            # New path: K_h slice-views + K_h CE calls + closed-form EMA
+            # recurrence per horizon. 128× fewer autograd nodes.
+            alpha_g = cfg.alpha_gamma_s
+            device = self.s.device
+            V_vocab = logits_all.shape[-1]
+            for k in range(1, cfg.K_horizons + 1):
+                # Valid i range for this k: i such that (tail_len + i - k) >= 0.
+                # Equivalently, i >= max(0, k - tail_len). Always contiguous
+                # from that starting point through W-1.
+                i_first_valid = max(0, k - tail_len)
+                if i_first_valid >= W:
+                    continue
+                # Slice past logits: position p = tail_len + i - k for valid i.
+                # p ranges over [tail_len + i_first_valid - k, tail_len + W - 1 - k).
+                p_start = tail_len + i_first_valid - k
+                valid_count = W - i_first_valid
+                past_slice = logits_all[:, p_start : p_start + valid_count, k - 1, :]
+                target_slice = self.surprise_token_window[:, i_first_valid:W]
+                ce_k = F.cross_entropy(
+                    past_slice.reshape(-1, V_vocab),
+                    target_slice.reshape(-1),
+                    reduction="none",
+                ).reshape(past_slice.shape[0], valid_count)
+                # Closed-form EMA: final = (1-α)^V * init + α Σ (1-α)^(V-1-s) ce[s]
+                weights = (1.0 - alpha_g) ** torch.arange(
+                    valid_count - 1, -1, -1, device=device, dtype=torch.float32,
+                )
+                weighted_sum = (ce_k * weights.unsqueeze(0)).sum(dim=1)
+                decay = (1.0 - alpha_g) ** valid_count
+                new_ema[:, k - 1] = (
+                    decay * new_ema[:, k - 1] + alpha_g * weighted_sum
+                )
+            self.surprise_ema = new_ema
+
+        tail_keep = min(cfg.K_horizons - 1, motor_all.shape[1])
+        if tail_keep > 0:
+            self.surprise_tail_motor[:, :tail_keep] = motor_all[:, -tail_keep:].detach()
+        self.surprise_tail_len = tail_keep
+
+    @torch._dynamo.disable
+    def _maybe_finalize_surprise_and_plasticity(self) -> None:
+        if self.window_len < self.cfg.mod_period:
+            return
+        self._finalize_surprise_window()
+        self._plasticity_step()
 
     @torch._dynamo.disable
     def _plasticity_step(self) -> None:
-        """Hebbian on co-visitation counts. Fires every mod_period ticks."""
+        """Hebbian on traversed-edge counts. Fires every mod_period ticks."""
         cfg = self.cfg
         device = self.s.device
 
@@ -580,14 +823,17 @@ class GraphWalkerMemory(nn.Module):
             co_visit_norm = (self.co_visit_flat.float() / window) if self.co_visit_flat is not None \
                 else torch.zeros_like(self.E_bias_flat)
 
-            # Simple Hebbian rule v1: strengthen edges traversed, decay untouched
-            # η_global from surprise magnitude (higher surprise → faster learning)
+            # Scalar-eta Hebbian v1: surprise-gated global learning rate.
+            # Higher surprise → faster learning. A trunk+head neuromod MLP
+            # could replace this with per-column/per-head rates later; for
+            # now a single scalar is sufficient and keeps the hot path cheap.
             surprise_scalar = self.surprise_ema.mean().float()
-            eta_global = 0.1 * torch.sigmoid(surprise_scalar - 1.0)
+            eta_global = cfg.plast_eta * torch.sigmoid(
+                surprise_scalar - cfg.plast_surprise_bias,
+            )
 
             # Global step: E_bias += η * (co_visit - decay * E_bias)
-            beta_decay = 0.1
-            delta = eta_global * (co_visit_norm - beta_decay * self.E_bias_flat)
+            delta = eta_global * (co_visit_norm - cfg.plast_decay * self.E_bias_flat)
             self.E_bias_flat = (self.E_bias_flat + delta).clamp(
                 -cfg.E_bias_max, cfg.E_bias_max,
             )

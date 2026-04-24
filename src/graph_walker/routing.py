@@ -38,10 +38,31 @@ class RoutingOutput:
     soft_probs: torch.Tensor       # [B, K] float — for analysis / load-balance loss
 
 
+def _sample_exploration_mask(
+    B: int,
+    K: int,
+    epsilon: torch.Tensor | float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce (explore_mask [B], uniform_sample [B]).
+
+    Uses rand+argmax to sample categorical uniform over [0, K) instead of
+    torch.randint — the latter fuses into the Gumbel+softmax+bmm kernel
+    and triggers a Triton 3.6 TritonGPURemoveLayoutConversions crash.
+    With rand+argmax, the op pattern is inductor-friendly, so this path
+    is now compilable (no @torch._dynamo.disable needed).
+    """
+    # Epsilon is a tensor under compile — compare element-wise for the mask.
+    explore_mask = (torch.rand(B, device=device) < epsilon)
+    # Categorical uniform over [0, K) via argmax of K independent uniform values.
+    uniform_sample = torch.rand(B, K, device=device).argmax(dim=-1)
+    return explore_mask, uniform_sample
+
+
 def gumbel_top1_softmax(
     scores: torch.Tensor,          # [B, K] — edge logits
-    tau: float,                    # Gumbel temperature
-    epsilon: float,                # exploration probability (0 = off)
+    tau: torch.Tensor | float,     # Gumbel temperature (tensor for compile)
+    epsilon: torch.Tensor | float, # exploration probability (tensor for compile)
     training: bool,                # True → stochastic; False → argmax
 ) -> RoutingOutput:
     """Gumbel top-1 softmax with straight-through and optional ε-exploration.
@@ -50,6 +71,9 @@ def gumbel_top1_softmax(
     gradient backward. With probability ε, replace with uniform random.
 
     At inference: hard argmax directly, no noise.
+
+    tau and epsilon are tensors (not Python floats) so dynamo doesn't
+    specialise-recompile each time they anneal.
     """
     B, K = scores.shape
     device = scores.device
@@ -58,22 +82,34 @@ def gumbel_top1_softmax(
         # Gumbel noise
         u = torch.rand_like(scores).clamp_(min=1e-9, max=1 - 1e-9)
         gumbel = -torch.log(-torch.log(u))
-        logits = (scores + gumbel) / max(tau, 1e-3)
+        tau_safe = tau.clamp(min=1e-3) if isinstance(tau, torch.Tensor) \
+            else max(tau, 1e-3)
+        logits = (scores + gumbel) / tau_safe
         soft = F.softmax(logits, dim=-1)                          # [B, K]
 
         # Hard argmax
         argmax = soft.argmax(dim=-1)                               # [B]
 
-        # ε-exploration: swap in uniform random sample for εB items
-        if epsilon > 0.0:
-            explore_mask = (torch.rand(B, device=device) < epsilon)   # [B] bool
-            uniform_sample = torch.randint(0, K, (B,), device=device)
-            argmax = torch.where(explore_mask, uniform_sample, argmax)
+        # ε-exploration: swap in uniform random sample for εB items.
+        # Exploration sampling is done in an eager helper to avoid a Triton
+        # fusion bug (randint + softmax/bmm → PassManager crash on 3.6).
+        explore_mask, uniform_sample = _sample_exploration_mask(
+            B, K, epsilon, device,
+        )
+        argmax = torch.where(explore_mask, uniform_sample, argmax)
 
         hard = F.one_hot(argmax, num_classes=K).to(soft.dtype)      # [B, K]
 
-        # Straight-through: forward = hard, backward = soft
-        ste = hard - soft.detach() + soft
+        # Straight-through: forward = hard, backward = soft.
+        # For exploration samples (where argmax was overridden by a uniform
+        # pick), the soft distribution was NOT conditioned on the override
+        # so letting gradient flow through it would reward arbitrary random
+        # edges. We zero the gradient on those rows by using a detached STE.
+        ste_soft = hard - soft.detach() + soft                      # grad via soft
+        ste_hard = hard.detach()                                    # no gradient
+        ste = torch.where(
+            explore_mask.unsqueeze(-1), ste_hard, ste_soft,
+        )
     else:
         # Inference: hard argmax of raw scores
         soft = F.softmax(scores, dim=-1)
