@@ -224,6 +224,26 @@ class WalkerCoreReadout:
     load_balance_loss: torch.Tensor       # scalar — aux loss term
 
 
+@dataclass
+class WalkerCorePureOutput:
+    """Return bundle from the pure step-core compute.
+
+    Pure variant: all outputs are returned explicitly instead of being
+    written to self.* so the compute can be wrapped in
+    torch.utils.checkpoint.checkpoint, whose forward-recompute requires
+    side-effect-free functions. The step_core wrapper applies the returned
+    state and accumulators to self.*.
+    """
+    s_new: torch.Tensor                   # [B, N, D_s]
+    walker_pos_new: torch.Tensor          # [B, H]
+    prev_motor_new: torch.Tensor          # [B, D_s]
+    motor_state: torch.Tensor             # [B, D_s]
+    co_visit_delta: torch.Tensor          # [N*K] fp32 — add to self.co_visit_flat
+    visit_count_delta: torch.Tensor       # [N] fp32 — add to self.visit_count
+    visit_freq_step: torch.Tensor | None  # [N] fractional visits (optional)
+    load_balance_loss: torch.Tensor       # scalar — aux loss term
+
+
 class GraphWalkerMemory(nn.Module):
     def __init__(
         self, cfg: GraphWalkerConfig, tied_token_emb: nn.Embedding
@@ -360,7 +380,7 @@ class GraphWalkerMemory(nn.Module):
             torch._dynamo.config.cache_size_limit, 64,
         )
         self._compiled_step = torch.compile(
-            self._step_core_impl, mode=mode, fullgraph=False,
+            self._step_core_pure, mode=mode, fullgraph=False,
         )
 
     @torch._dynamo.disable
@@ -507,12 +527,119 @@ class GraphWalkerMemory(nn.Module):
         return tau, epsilon
 
     def step_core(self, token_id: torch.Tensor) -> WalkerCoreReadout:
-        """Hot persistent-walker core: sparse graph dynamics only."""
+        """Hot persistent-walker core: sparse graph dynamics only.
+
+        Under normal training/eval this mutates self.* state in place. See
+        step_core_checkpointed for the pure-functional entry point used by
+        torch.utils.checkpoint in Phase 1 training.
+        """
         self._ensure_block_caches(self.tied_token_emb.weight)
         tau, epsilon = self._schedule_tensors(token_id)
+        tick0 = self.tick_counter == 0
         if self._compiled_step is not None:
-            return self._compiled_step(token_id, tau, epsilon)
-        return self._step_core_impl(token_id, tau, epsilon)
+            out = self._compiled_step(
+                self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+                token_id, tau, epsilon, tick0,
+            )
+        else:
+            out = self._step_core_pure(
+                self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+                token_id, tau, epsilon, tick0,
+            )
+        self._apply_step_state(out)
+        return WalkerCoreReadout(
+            motor_state=out.motor_state,
+            visit_freq_step=out.visit_freq_step,
+            load_balance_loss=out.load_balance_loss,
+        )
+
+    def run_tbptt_block_checkpointed(
+        self, tokens_block: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run an entire TBPTT block (T_block tokens) under a single checkpoint.
+
+        tokens_block: [B, T_block] int64.
+        Returns (motor_state_block [B, T_block, D_s], load_balance_sum scalar).
+
+        Per-token checkpointing was too fine-grained — the setup/teardown
+        per checkpoint exceeded the savings. Block-level checkpointing pays
+        one save/restore for the whole block and recomputes T_block steps
+        as one pass during backward.
+
+        Plasticity is deferred to after this function returns so it does
+        not mutate E_bias_flat between the original forward and the
+        recompute invoked by loss.backward().
+        """
+        from torch.utils.checkpoint import checkpoint
+        self._ensure_block_caches(self.tied_token_emb.weight)
+        T_block = tokens_block.shape[1]
+
+        # Build per-step schedule tensors up front so they are hashable
+        # inputs. Within a block, training_step is constant so tau/eps
+        # are constant — just one tensor each.
+        tau, epsilon = self._schedule_tensors(tokens_block)
+        tick0 = self.tick_counter == 0
+
+        step_impl = self._compiled_step if self._compiled_step is not None else self._step_core_pure
+
+        def _block_fn(s_in, walker_in, prev_motor_in, e_bias_in, tokens_in):
+            """Purely functional block forward. All mutations flow through
+            returned tensors; self.* accumulators are updated after. Uses
+            the compiled step if available so the forward inside the
+            checkpoint (and its recompute) still benefits from torch.compile."""
+            s = s_in
+            walker = walker_in
+            prev = prev_motor_in
+            motors = []
+            lb_sum = torch.zeros((), device=s.device, dtype=torch.float32)
+            cv_sum = torch.zeros_like(self.co_visit_flat)
+            vc_sum = torch.zeros_like(self.visit_count)
+            for i in range(T_block):
+                # is_tick0 only True for the first step of the segment.
+                # After that, walker_pos feeds itself.
+                t0 = tick0 and i == 0
+                o = step_impl(
+                    s, walker, prev, e_bias_in,
+                    tokens_in[:, i], tau, epsilon, t0,
+                )
+                s, walker, prev = o.s_new, o.walker_pos_new, o.prev_motor_new
+                motors.append(o.motor_state)
+                lb_sum = lb_sum + o.load_balance_loss
+                cv_sum = cv_sum + o.co_visit_delta
+                vc_sum = vc_sum + o.visit_count_delta
+            motor_block = torch.stack(motors, dim=1)
+            return motor_block, s, walker, prev, lb_sum, cv_sum, vc_sum
+
+        motor_block, s_new, walker_new, prev_new, lb_sum, cv_sum, vc_sum = checkpoint(
+            _block_fn,
+            self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+            tokens_block, use_reentrant=False,
+        )
+
+        # Apply state + accumulators once for the whole block.
+        self.s = s_new
+        self.walker_pos = walker_new
+        self.prev_motor = prev_new
+        with torch.no_grad():
+            self.co_visit_flat = self.co_visit_flat + cv_sum
+            if self.visit_count is not None:
+                self.visit_count = self.visit_count + vc_sum
+        self.window_len += T_block
+        self.tick_counter += T_block
+
+        return motor_block, lb_sum
+
+    def _apply_step_state(self, out: WalkerCorePureOutput) -> None:
+        """Write pure-step outputs into self.* state (non-grad accumulators)."""
+        self.s = out.s_new
+        self.walker_pos = out.walker_pos_new
+        self.prev_motor = out.prev_motor_new
+        with torch.no_grad():
+            self.co_visit_flat = self.co_visit_flat + out.co_visit_delta
+            if self.visit_count is not None:
+                self.visit_count = self.visit_count + out.visit_count_delta
+        self.window_len += 1
+        self.tick_counter += 1
 
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
         """Public single-token API: graph core + immediate readout.
@@ -537,32 +664,45 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=core.load_balance_loss,
         )
 
-    def _step_core_impl(
-        self, token_id: torch.Tensor, tau: torch.Tensor, epsilon: torch.Tensor,
-    ) -> WalkerCoreReadout:
-        """One token of sparse graph dynamics with persistent walkers.
+    def _step_core_pure(
+        self,
+        s_in: torch.Tensor,              # [B, N, D_s]
+        walker_pos_in: torch.Tensor,     # [B, H]
+        prev_motor_in: torch.Tensor,     # [B, D_s]
+        e_bias_flat_in: torch.Tensor,    # [N*K] fp32 — snapshot of plastic bias
+        token_id: torch.Tensor,          # [B] int64
+        tau: torch.Tensor,               # scalar
+        epsilon: torch.Tensor,           # scalar
+        is_tick0: bool,                  # True iff first step of segment
+    ) -> WalkerCorePureOutput:
+        """Pure-functional one-token walker update.
 
-        This runs only the graph-side work that is truly on the token clock:
-        token anchoring on the input plane, one hop of persistent-walker
-        movement, sparse state update, and graph-state readout.
+        Takes current state (s, walker_pos, prev_motor) as explicit inputs
+        and returns the new state plus non-grad accumulator deltas. No
+        mutation of self.* happens here; that is the caller's job. This is
+        required for torch.utils.checkpoint forward-recompute to be
+        deterministic.
+
+        Equivalent semantics to the pre-refactor _step_core_impl at the
+        math level; only the state-plumbing is different.
         """
         assert self._state_initialized, "call begin_segment() first"
         cfg = self.cfg
-        B = self.s.shape[0]
-        device = self.s.device
+        B = s_in.shape[0]
+        device = s_in.device
 
         is_training = self.training
         cfg_n_heads = cfg.n_heads
         BH = B * cfg_n_heads
-        state_dtype = self.s.dtype
+        state_dtype = s_in.dtype
 
-        # 1. Embed token in model space, then project into graph-state space.
+        # 1. Embed token and project to graph-state space.
         h_input_model = self.tied_token_emb(token_id)                 # [B, D_model]
         h_input = self.token_to_state(h_input_model)                  # [B, D_s]
 
         # 2. Token-conditioned anchoring on the input plane.
         query_input = h_input + self.prev_motor_proj(
-            self.prev_motor.to(h_input.dtype),
+            prev_motor_in.to(h_input.dtype),
         )
         query_flat = self.input_q_proj(query_input).view(
             B, cfg_n_heads, cfg.D_q_in,
@@ -578,32 +718,30 @@ class GraphWalkerMemory(nn.Module):
         start_local = rout_in.selected_idx.view(B, cfg_n_heads)
         start_cols = self.input_positions[start_local]                # [B, H]
 
-        # Input routing still happens each token, but the walkers now persist
-        # through graph space instead of relaunching an H×L walk from scratch.
+        # Warmup: first token of segment uses start_cols for the walker's
+        # first hop (there's no valid prior walker_pos). After that,
+        # walker_pos persists across tokens.
         cur_bh = (
-            start_cols.reshape(BH)
-            if self.tick_counter == 0
-            else self.walker_pos.reshape(BH)
+            start_cols.reshape(BH) if is_tick0
+            else walker_pos_in.reshape(BH)
         )
 
-        # Injection anchors current token content into graph state.
         v_inject = self.input_v_proj(h_input_model)                   # [B, D_s]
         alpha = self._alpha_cache                                     # [N]
         input_ste_weights = torch.gather(
             rout_in.ste_weights, 1, rout_in.selected_idx.unsqueeze(1),
         ).squeeze(1)                                                  # [B*H]
 
-        # Load-balance accounting.
-        visit_count_step = torch.zeros(cfg.N, device=device, dtype=torch.float32)
+        # Load-balance accounting (build deltas, not mutations).
         lb_dtype = torch.float32
         P_mass = torch.zeros(cfg.N, device=device, dtype=lb_dtype)
-        p_in_per_col = rout_in.soft_probs.to(lb_dtype).sum(dim=0)     # [N_in]
+        p_in_per_col = rout_in.soft_probs.to(lb_dtype).sum(dim=0)
         P_mass = P_mass.index_add(0, self.input_positions, p_in_per_col)
 
         # 3. Advance each persistent walker by one hop.
         cur = cur_bh.view(B, cfg_n_heads)
         s_cur = torch.gather(
-            self.s, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
+            s_in, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
         ).reshape(BH, cfg.D_s)
         id_cur = self.col_id[cur_bh]
         cat_content = torch.cat([
@@ -628,7 +766,7 @@ class GraphWalkerMemory(nn.Module):
         scores = torch.einsum("bhd,bkhd->bk", q, k_nbrs) * scale
 
         edge_flat = cur_bh.unsqueeze(1) * cfg.K + self._k_range.unsqueeze(0)
-        E_vals = self.E_bias_flat[edge_flat].to(scores.dtype)
+        E_vals = e_bias_flat_in[edge_flat].to(scores.dtype)
         scores = scores + E_vals
 
         rout = gumbel_top1_softmax(
@@ -648,11 +786,10 @@ class GraphWalkerMemory(nn.Module):
             rout.soft_probs.to(lb_dtype).reshape(-1),
         )
 
-        visit_count_step.scatter_add_(0, start_cols.reshape(-1), self._ones_bh)
-        visit_count_step.scatter_add_(0, next_col, self._ones_bh)
-        if self.visit_count is not None:
-            with torch.no_grad():
-                self.visit_count = self.visit_count + visit_count_step
+        # visit_count delta (non-grad)
+        visit_count_delta = torch.zeros(cfg.N, device=device, dtype=torch.float32)
+        visit_count_delta.scatter_add_(0, start_cols.reshape(-1), self._ones_bh)
+        visit_count_delta.scatter_add_(0, next_col, self._ones_bh)
 
         # 4. Sparse aggregation and state update at only the touched rows.
         batch_idx = self._batch_idx
@@ -671,19 +808,15 @@ class GraphWalkerMemory(nn.Module):
             [inject_msg, next_msg], dim=0,
         ).to(state_dtype).contiguous()
 
-        # Fused Triton op: segment-sum messages into unique destinations,
-        # gather s_old, LIF-blend with alpha, scatter back in place.
-        # Operates only on touched rows (O(U)) rather than the full
-        # [B*N, D_s] state. Returns s_flat aliased to self.s's storage.
-        s_flat = self.s.view(B * cfg.N, cfg.D_s)
-        s_flat = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
-        self.s = s_flat.view(B, cfg.N, cfg.D_s)
+        s_flat = s_in.reshape(B * cfg.N, cfg.D_s)
+        s_flat_new = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
+        s_new = s_flat_new.view(B, cfg.N, cfg.D_s)
 
         # 5. Read out only from the new walker endpoints.
-        self.walker_pos = next_col.view(B, cfg_n_heads)
+        walker_pos_new = next_col.view(B, cfg_n_heads)
         end_states = torch.gather(
-            self.s, 1, self.walker_pos.unsqueeze(-1).expand(B, -1, cfg.D_s),
-        )                                                              # [B, H, D_s]
+            s_new, 1, walker_pos_new.unsqueeze(-1).expand(B, -1, cfg.D_s),
+        )
         s_traj = self.out_norm(end_states).to(state_dtype)
         k = self.out_k_proj(s_traj)
         v = self.out_v_proj(s_traj)
@@ -692,25 +825,25 @@ class GraphWalkerMemory(nn.Module):
         attn_scores = torch.sum(k * q_motor.unsqueeze(1), dim=-1) * scale_out
         attn = F.softmax(attn_scores, dim=-1)
         motor_state = torch.sum(attn.unsqueeze(-1) * v, dim=1)
-        self.prev_motor = motor_state
+        prev_motor_new = motor_state
 
-        # 6. Plasticity-window bookkeeping stays on the fast clock only for
-        # sparse edge counts. Exact lexical surprise is deferred to the
-        # plasticity clock.
-        with torch.no_grad():
-            self.co_visit_flat = self.co_visit_flat + torch.bincount(
-                edge_taken_flat, minlength=cfg.num_edges,
-            ).to(torch.float32)
-        self.window_len += 1
-        self.tick_counter += 1
+        # 6. co_visit delta (non-grad)
+        co_visit_delta = torch.bincount(
+            edge_taken_flat, minlength=cfg.num_edges,
+        ).to(torch.float32)
 
         n_decisions = float(BH * 2)
         P_mean = P_mass / n_decisions
-        f_mean = (visit_count_step / n_decisions).detach()
+        f_mean = (visit_count_delta / n_decisions).detach()
         load_balance_loss = cfg.N * (P_mean * f_mean).sum()
 
-        return WalkerCoreReadout(
+        return WalkerCorePureOutput(
+            s_new=s_new,
+            walker_pos_new=walker_pos_new,
+            prev_motor_new=prev_motor_new,
             motor_state=motor_state,
+            co_visit_delta=co_visit_delta,
+            visit_count_delta=visit_count_delta,
             visit_freq_step=f_mean if cfg.lambda_balance > 0 else None,
             load_balance_loss=load_balance_loss,
         )
