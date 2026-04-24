@@ -39,6 +39,22 @@ def phase1_step(
     cfg = lm.cfg
     B, T_seq = tokens.shape
     device = tokens.device
+    # Runtime clock-alignment checks: the config's __post_init__ enforces
+    # these against `cfg.segment_T`, but the actual training segment length
+    # is `tokens.shape[1]` which the caller may pass independently. The
+    # same invariants must hold per-segment or plasticity + neuromod break
+    # silently (partial windows, misaligned TBPTT flushes).
+    tbptt = tbptt_block if tbptt_block is not None else cfg.tbptt_block
+    if tbptt != cfg.mod_period:
+        raise ValueError(
+            f"tbptt_block ({tbptt}) must equal mod_period ({cfg.mod_period}). "
+            "Each flush must close exactly one plasticity window."
+        )
+    if T_seq % cfg.mod_period != 0:
+        raise ValueError(
+            f"tokens shape[1] = {T_seq} must be a multiple of mod_period "
+            f"({cfg.mod_period}) so the final partial window isn't dropped."
+        )
     if (
         device.type == "cuda"
         and cfg.compile_on_train
@@ -49,7 +65,6 @@ def phase1_step(
     lm.set_training_step(training_step)
 
     lm.memory.begin_segment(B, device)
-    tbptt = tbptt_block if tbptt_block is not None else cfg.tbptt_block
 
     K_h = cfg.K_horizons
     # Kept GPU-resident and accumulated in place to avoid per-flush .item()

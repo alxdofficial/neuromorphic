@@ -33,7 +33,7 @@ def _tiny_cfg(use_neuromod: bool = True, **overrides) -> GraphWalkerConfig:
         D_q_in=16, D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=256,
-        mod_period=4, tbptt_block=8,
+        mod_period=4, tbptt_block=4, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
         epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,
         lambda_balance=0.0,
@@ -222,7 +222,12 @@ def test_phase1_step_with_neuromod_runs_and_trains_neuromod():
 def test_neuromod_delta_snapshot_roundtrip():
     """The snapshot / begin_plastic_window cycle should be consistent:
     after a plasticity fire, the next window has a fresh delta_nm that
-    depends on the snapshot taken from the just-closed window."""
+    depends on the snapshot taken from the just-closed window.
+
+    Plasticity is driven via the training path (phase1_step), not step(),
+    because step() is the interactive-only API that no longer triggers
+    plasticity on purpose.
+    """
     torch.manual_seed(0)
     cfg = _tiny_cfg(use_neuromod=True, mod_period=4)
     lm = StandaloneLM(cfg).cpu()
@@ -231,16 +236,18 @@ def test_neuromod_delta_snapshot_roundtrip():
         lm.memory.neuromod.edge_mlp[-1].weight.normal_(std=0.3)
         lm.memory.neuromod.blend_logit.fill_(0.0)  # γ = 0.5
 
-    tokens = torch.randint(0, 256, (2, 8))
-    lm.memory.begin_segment(2, tokens.device)
+    tokens = torch.randint(0, 256, (2, cfg.segment_T))
+    opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
 
-    # Initial window: no prior snapshot, delta_nm should be None.
-    assert lm.memory._active_delta_nm is None
+    # First phase1 step: begin_segment runs, no prior snapshot yet, so
+    # _active_delta_nm starts None. Plasticity fires twice (segment_T=8,
+    # mod_period=4 → 2 windows) and the snapshot+new-delta cycle runs.
+    phase1_step(
+        lm, opt, tokens, tbptt_block=cfg.mod_period,
+        amp_dtype=None, training_step=0,
+    )
 
-    for t in range(4):
-        lm.memory.step(tokens[:, t])
-    # Plasticity should have fired at t=3 (window_len hit mod_period=4).
-    # After the fire: snapshot taken, next window's delta_nm computed.
+    # After firing: snapshot was taken, new _active_delta_nm was produced.
     assert lm.memory._prev_snapshot_ids is not None
     assert lm.memory._active_delta_nm is not None
     assert lm.memory._active_delta_nm.abs().sum() > 0, (

@@ -19,7 +19,7 @@ def _tiny_cfg(**overrides) -> GraphWalkerConfig:
         D_q_in=16, D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=256,
-        mod_period=4, tbptt_block=8,
+        mod_period=4, tbptt_block=4, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0,
         gumbel_anneal_steps=1, epsilon_start=0.0, epsilon_end=0.0,
         epsilon_anneal_steps=1, lambda_balance=0.0,
@@ -251,13 +251,17 @@ def test_epsilon_zero_keeps_gradient():
 
 
 def test_plasticity_fires_on_mod_period():
-    lm, tokens, cfg = _make(B=2, T=8)
-    lm.memory.begin_segment(B=2, device=tokens.device)
+    """Plasticity is triggered from the training flush (phase1_step), not
+    from step(). This test drives enough tokens to close one window
+    through phase1_step and checks E_bias changed."""
+    lm, tokens, cfg = _make(B=2, T=cfg_block_default())
+    opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
     E_before = lm.memory.E_bias_flat.clone()
-    for t in range(cfg.mod_period):
-        lm.memory.step(tokens[:, t])
+    phase1_step(
+        lm, opt, tokens, tbptt_block=cfg.mod_period,
+        amp_dtype=None, training_step=0,
+    )
     E_after = lm.memory.E_bias_flat
-    # Should change on tick == mod_period
     assert not torch.equal(E_before, E_after)
 
 
@@ -274,13 +278,16 @@ def test_detach_preserves_values():
 
 
 def test_reset_plastic_wipes_E_bias():
+    """Drive a training step to populate E_bias, then call
+    reset_plastic_memory and confirm it wipes."""
     lm, tokens, cfg = _make(B=2, T=cfg_block_default())
-    lm.memory.begin_segment(B=2, device=tokens.device)
-    # Run some plasticity
-    for t in range(cfg.mod_period):
-        lm.memory.step(tokens[:, t])
+    opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
+    phase1_step(
+        lm, opt, tokens, tbptt_block=cfg.mod_period,
+        amp_dtype=None, training_step=0,
+    )
     assert lm.memory.E_bias_flat.abs().sum() > 0
-    lm.memory.reset_plastic_memory(tokens.device)
+    lm.memory.reset_plastic_memory()
     assert lm.memory.E_bias_flat.abs().sum() == 0
 
 

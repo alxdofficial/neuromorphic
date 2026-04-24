@@ -396,8 +396,14 @@ class GraphWalkerMemory(nn.Module):
         )
         self.input_k_proj = nn.Linear(cfg.D_id, cfg.D_q_in, bias=False)
         self.input_v_proj = nn.Linear(cfg.D_model, cfg.D_s, bias=False)
-        # Zero-init v so initial token-injection is no-op (state stays bounded).
-        nn.init.zeros_(self.input_v_proj.weight)
+        # Small-random init (NOT zero). Zero-init would make `inject_msg`
+        # identically zero regardless of the STE-gated anchor softmax
+        # output, which zeros out input_q_proj's gradient on step 0 (dead
+        # bilinear product: grad on ste flows as inject_msg · grad_upstream,
+        # and inject_msg·anything = 0 if inject_msg = 0). Small std keeps
+        # initial injection small enough not to destabilise the LIF state
+        # but large enough to light up the gradient to anchor routing.
+        nn.init.normal_(self.input_v_proj.weight, mean=0.0, std=0.014)
 
         # Prev-token motor feeds into the start-col query (only): lets the
         # start position depend on recent output direction, not just the
@@ -467,7 +473,14 @@ class GraphWalkerMemory(nn.Module):
         self.prev_motor: torch.Tensor        # [B, D_s] — chained into next step
         self.walker_pos: torch.Tensor        # [B, H] long — persistent walker positions
         self.walker_state: torch.Tensor      # [B, H, D_s] — walker's private running state
-        self.E_bias_flat: torch.Tensor       # [N*K] fp32
+        # E_bias_flat is the long-term plastic state. Registered as a buffer
+        # so it appears in state_dict() (survives checkpoint/resume) and
+        # follows .to(device) / .cuda() moves with the module.
+        self.register_buffer(
+            "E_bias_flat",
+            torch.zeros(cfg.num_edges, dtype=torch.float32),
+            persistent=True,
+        )
         self.surprise_ema: torch.Tensor       # [B, K_h]
         self.surprise_prev: torch.Tensor      # [B, K_h] — snapshot at window close
         self.tick_counter: int = 0
@@ -591,9 +604,8 @@ class GraphWalkerMemory(nn.Module):
         self._input_keys_cache = None
         self._k_all_cache = None
 
-        # Lazy-init plastic state on first segment
-        if not hasattr(self, "E_bias_flat") or self.E_bias_flat is None:
-            self.reset_plastic_memory(device)
+        # E_bias_flat is a registered buffer initialized in __init__; it
+        # persists across segments by design. No re-init here.
 
         # Fresh per-segment counters
         self.co_visit_flat = torch.zeros(
@@ -619,11 +631,14 @@ class GraphWalkerMemory(nn.Module):
 
         self._state_initialized = True
 
-    def reset_plastic_memory(self, device: torch.device) -> None:
-        """Hard reset of long-term plastic E_bias."""
-        self.E_bias_flat = torch.zeros(
-            self.cfg.num_edges, device=device, dtype=torch.float32,
-        )
+    def reset_plastic_memory(self, device: torch.device | None = None) -> None:
+        """Hard reset of long-term plastic E_bias (in place, buffer-preserving).
+
+        `device` is kept as an optional argument for backwards-compatible
+        callers; `E_bias_flat` is now a registered buffer and lives on
+        whatever device the module was moved to.
+        """
+        self.E_bias_flat.zero_()
         # Also clear any carried-over neuromod snapshot.
         self._prev_snapshot_ids = None
         self._prev_snapshot_feats = None
@@ -844,12 +859,14 @@ class GraphWalkerMemory(nn.Module):
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
         """Public single-token API: graph core + immediate readout.
 
-        Training should prefer `step_core()` plus blockwise readout so the
-        large model-space stack stays off the token clock. Surprise is no
-        longer accumulated from this path — callers that need surprise must
-        feed per-block CE through `accumulate_block_ce`. Plasticity still
-        fires when window_len hits `mod_period` (using the last streamed
-        surprise value, which may lag one window in this interactive path).
+        This is a smoke/debug path, not the training path. It does NOT
+        accumulate surprise (that only happens via `accumulate_block_ce`
+        from `phase1_step`) and does NOT fire plasticity (firing here
+        would both use a stale/zero `surprise_ema` AND rebuild the
+        neuromod's `_active_delta_nm` without the subsequent
+        `detach_state` rescue, leaving it grad-free for the next
+        window). Training code must use `step_core()` + `phase1_step`
+        flush instead.
         """
         core = self.step_core(token_id)
         motor = self.state_to_model(core.motor_state)
@@ -857,7 +874,6 @@ class GraphWalkerMemory(nn.Module):
             motor, self.tied_token_emb.weight,
             horizon_logits=self._horizon_logits_cache,
         )
-        self._maybe_finalize_surprise_and_plasticity()
         return WalkerReadout(
             motor=motor,
             motor_state=core.motor_state,
@@ -1221,6 +1237,10 @@ class GraphWalkerMemory(nn.Module):
             return
         self._finalize_surprise_window()
         self._plasticity_step()
+        # Start the next window's neuromod delta OUTSIDE the no_grad scope
+        # of _plasticity_step so the delta carries a live grad_fn and
+        # routing loss can reach the neuromod parameters.
+        self._begin_plastic_window()
 
     @torch._dynamo.disable
     @torch.no_grad()
@@ -1276,5 +1296,10 @@ class GraphWalkerMemory(nn.Module):
             self.visit_count = torch.zeros_like(self.visit_count)
         self._active_delta_nm = None
 
-        # Start the next window with a fresh delta from the snapshot above.
-        self._begin_plastic_window()
+        # NOTE: `_begin_plastic_window()` deliberately does NOT run here.
+        # This method is @torch.no_grad()'d — running the neuromod forward
+        # inside that scope would produce an `_active_delta_nm` without a
+        # grad_fn, and routing in the next window would see a grad-free
+        # delta, silently killing the neuromod's training signal. The
+        # caller (`_maybe_finalize_surprise_and_plasticity`) runs
+        # `_begin_plastic_window()` outside this no_grad scope.

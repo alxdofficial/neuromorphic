@@ -166,6 +166,15 @@ class GraphWalkerConfig:
                 "segment gets CE training but no plasticity fire, silently "
                 "dropping its Hebbian co-visits and neuromod snapshot."
             )
+        if self.tbptt_block != self.mod_period:
+            raise ValueError(
+                f"tbptt_block ({self.tbptt_block}) must equal mod_period "
+                f"({self.mod_period}). Each TBPTT block must close exactly "
+                "one plasticity window — tbptt < mod_period fragments the "
+                "neuromod's gradient mid-window, and tbptt > mod_period "
+                "would silently skip plasticity firings because the flush "
+                "code only runs _maybe_finalize... after backward."
+            )
 
     @property
     def N_per_plane(self) -> int:
