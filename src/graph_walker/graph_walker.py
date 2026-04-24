@@ -624,11 +624,16 @@ class GraphWalkerMemory(nn.Module):
         deltas = self.neuromod(
             feats, adj_bias, edge_src_local, edge_dst_local,
         )                                                   # [E], grad-carrying
-        # Scatter into [N*K] shape; index_copy preserves grad to `deltas`.
+        # Scatter into [N*K] shape. Force fp32 so we match E_bias_flat's
+        # precision when added in _active_e_bias: under autocast the
+        # neuromod's output is bf16, which would otherwise silently
+        # truncate near-zero deltas to ~3 decimal digits.
         dense = torch.zeros(
-            self.cfg.num_edges, device=deltas.device, dtype=deltas.dtype,
+            self.cfg.num_edges, device=deltas.device, dtype=torch.float32,
         )
-        self._active_delta_nm = dense.index_copy(0, edge_flat, deltas)
+        # `.float()` preserves grad_fn through the dtype cast so the
+        # gradient path to neuromod params stays intact.
+        self._active_delta_nm = dense.index_copy(0, edge_flat, deltas.float())
 
     def _active_e_bias(self) -> torch.Tensor:
         """E_bias tensor used by routing this window.
@@ -636,13 +641,16 @@ class GraphWalkerMemory(nn.Module):
         = E_bias_flat.detach() + η_nm · delta_nm
         where delta_nm is grad-carrying (so loss → routing → delta_nm →
         neuromod params is a live gradient path).
+
+        `E_bias_flat` is always detached here: even when the neuromod is
+        off, the persistent buffer can carry a grad_fn from
+        `_plasticity_step`'s arithmetic (it's non-leaf after the first
+        update), and we never want that entering the compiled step.
         """
+        base = self.E_bias_flat.detach()
         if self._active_delta_nm is None:
-            return self.E_bias_flat
-        return (
-            self.E_bias_flat.detach()
-            + self.cfg.neuromod_eta * self._active_delta_nm
-        )
+            return base
+        return base + self.cfg.neuromod_eta * self._active_delta_nm
 
     @torch._dynamo.disable
     def _snapshot_touched_columns(self) -> None:
@@ -765,83 +773,13 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=out.load_balance_loss,
         )
 
-    def run_tbptt_block_checkpointed(
-        self, tokens_block: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run an entire TBPTT block (T_block tokens) under a single checkpoint.
-
-        tokens_block: [B, T_block] int64.
-        Returns (motor_state_block [B, T_block, D_s], load_balance_sum scalar).
-
-        Per-token checkpointing was too fine-grained — the setup/teardown
-        per checkpoint exceeded the savings. Block-level checkpointing pays
-        one save/restore for the whole block and recomputes T_block steps
-        as one pass during backward.
-
-        Plasticity is deferred to after this function returns so it does
-        not mutate E_bias_flat between the original forward and the
-        recompute invoked by loss.backward().
-        """
-        from torch.utils.checkpoint import checkpoint
-        self._ensure_block_caches(self.tied_token_emb.weight)
-        T_block = tokens_block.shape[1]
-
-        # Build per-step schedule tensors up front so they are hashable
-        # inputs. Within a block, training_step is constant so tau/eps
-        # are constant — just one tensor each.
-        tau, epsilon = self._schedule_tensors(tokens_block)
-        tick0 = self.tick_counter == 0
-
-        step_impl = self._compiled_step if self._compiled_step is not None else self._step_core_pure
-
-        def _block_fn(s_in, walker_in, prev_motor_in, e_bias_in, tokens_in):
-            """Purely functional block forward. All mutations flow through
-            returned tensors; self.* accumulators are updated after. Uses
-            the compiled step if available so the forward inside the
-            checkpoint (and its recompute) still benefits from torch.compile."""
-            s = s_in
-            walker = walker_in
-            prev = prev_motor_in
-            motors = []
-            lb_sum = torch.zeros((), device=s.device, dtype=torch.float32)
-            cv_sum = torch.zeros_like(self.co_visit_flat)
-            vc_sum = torch.zeros_like(self.visit_count)
-            for i in range(T_block):
-                # is_tick0 only True for the first step of the segment.
-                # After that, walker_pos feeds itself.
-                t0 = tick0 and i == 0
-                o = step_impl(
-                    s, walker, prev, e_bias_in,
-                    tokens_in[:, i], tau, epsilon, t0,
-                )
-                s, walker, prev = o.s_new, o.walker_pos_new, o.prev_motor_new
-                motors.append(o.motor_state)
-                lb_sum = lb_sum + o.load_balance_loss
-                cv_sum = cv_sum + o.co_visit_delta
-                vc_sum = vc_sum + o.visit_count_delta
-            motor_block = torch.stack(motors, dim=1)
-            return motor_block, s, walker, prev, lb_sum, cv_sum, vc_sum
-
-        # Use active E_bias (with neuromod delta mixed in) for the block.
-        e_bias_active = self._active_e_bias()
-        motor_block, s_new, walker_new, prev_new, lb_sum, cv_sum, vc_sum = checkpoint(
-            _block_fn,
-            self.s, self.walker_pos, self.prev_motor, e_bias_active,
-            tokens_block, use_reentrant=False,
-        )
-
-        # Apply state + accumulators once for the whole block.
-        self.s = s_new
-        self.walker_pos = walker_new
-        self.prev_motor = prev_new
-        with torch.no_grad():
-            self.co_visit_flat = self.co_visit_flat + cv_sum
-            if self.visit_count is not None:
-                self.visit_count = self.visit_count + vc_sum
-        self.window_len += T_block
-        self.tick_counter += T_block
-
-        return motor_block, lb_sum
+    # NOTE: A block-level checkpoint helper used to live here. It was
+    # removed because (a) it did not call _record_surprise_token or
+    # _maybe_finalize_surprise_and_plasticity, so plasticity and surprise
+    # EMA would silently freeze on that path, and (b) wall-time showed
+    # checkpointing cost more than it saved in this model (autograd
+    # still traversed the recomputed per-token graph). See commit log
+    # for the original version if a re-introduction is ever warranted.
 
     def _apply_step_state(self, out: WalkerCorePureOutput) -> None:
         """Write pure-step outputs into self.* state (non-grad accumulators)."""
@@ -1086,8 +1024,14 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_token_window[:, idx] = token_id.detach()
 
     @torch._dynamo.disable
+    @torch.no_grad()
     def _finalize_surprise_window(self) -> None:
-        """Compute exact multi-horizon surprise only on the plasticity clock."""
+        """Compute exact multi-horizon surprise only on the plasticity clock.
+
+        Wrapped in `torch.no_grad` so the dense `readout_from_state_block`
+        pass doesn't build an autograd graph that we never consume —
+        surprise CE only updates the detached `surprise_ema` buffer.
+        """
         if self.window_len == 0:
             return
 
@@ -1159,12 +1103,16 @@ class GraphWalkerMemory(nn.Module):
         self._plasticity_step()
 
     @torch._dynamo.disable
+    @torch.no_grad()
     def _plasticity_step(self) -> None:
         """Plasticity update on window close. Runs:
           1. Scalar-eta Hebbian on traversed-edge counts (legacy).
           2. If neuromod is enabled: bake the grad-carrying `_active_delta_nm`
              into `E_bias_flat` (detached), then take a new snapshot of the
              just-closed window and produce the next window's delta.
+
+        Wrapped in `torch.no_grad` so the non-diff update can't accidentally
+        attach a grad_fn to `E_bias_flat` across repeated calls.
         """
         cfg = self.cfg
         device = self.s.device
