@@ -35,10 +35,15 @@ from src.graph_walker.neuromod import (
     build_adjacency_bias,
     enumerate_touched_edges,
 )
+from src.graph_walker.overlay import (
+    commit_overlay_to_base,
+    empty_overlay,
+    overlay_gather,
+    overlay_lif_update,
+)
 from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
 from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
 from src.graph_walker.topology import build_topology
-from src.graph_walker.triton_sparse_update import sparse_lif_update
 
 
 def _rmsnorm(dim: int) -> nn.Module:
@@ -324,13 +329,13 @@ class WalkerCoreReadout:
 class WalkerCorePureOutput:
     """Return bundle from the pure step-core compute.
 
-    Pure variant: all outputs are returned explicitly instead of being
-    written to self.* so the compute can be wrapped in
-    torch.utils.checkpoint.checkpoint, whose forward-recompute requires
-    side-effect-free functions. The step_core wrapper applies the returned
-    state and accumulators to self.*.
+    State is represented as an active-row overlay on top of the persistent
+    `s_base`: this step's sparse writes live in `(active_flat_idx_new,
+    active_val_new)`, not in a dense [B, N, D_s] tensor. The step_core
+    wrapper applies the returned state to self.*.
     """
-    s_new: torch.Tensor                   # [B, N, D_s]
+    active_flat_idx_new: torch.Tensor     # [U] int64 sorted
+    active_val_new: torch.Tensor          # [U, D_s] differentiable
     walker_pos_new: torch.Tensor          # [B, H]
     walker_state_new: torch.Tensor        # [B, H, D_s]
     prev_motor_new: torch.Tensor          # [B, D_s]
@@ -454,7 +459,12 @@ class GraphWalkerMemory(nn.Module):
 
         # --- Persistent state (buffers) ---
         self._state_initialized = False
-        self.s: torch.Tensor                 # [B, N, D_s]
+        # Active-row overlay: detached base + sparse differentiable overlay.
+        # Only the overlay carries autograd history — the dense base never
+        # enters the graph. See src/graph_walker/overlay.py.
+        self.s_base: torch.Tensor            # [B, N, D_s] detached
+        self.active_flat_idx: torch.Tensor   # [U] int64 sorted
+        self.active_val: torch.Tensor        # [U, D_s] differentiable
         self.prev_motor: torch.Tensor        # [B, D_s] — chained into next step
         self.walker_pos: torch.Tensor        # [B, H] long — persistent walker positions
         self.walker_state: torch.Tensor      # [B, H, D_s] — walker's private running state
@@ -499,6 +509,30 @@ class GraphWalkerMemory(nn.Module):
         # outside that region so the compiled path only pays the true fast
         # recurrent work.
         self._compiled_step = None
+
+    # -----------------------------------------------------------------
+    # State-view property (backwards-compat for tests that introspect `s`)
+    # -----------------------------------------------------------------
+
+    @property
+    def s(self) -> torch.Tensor:
+        """Dense materialized view of (base + overlay) at the current moment.
+
+        Allocates a full [B, N, D_s] tensor; intended for introspection or
+        tests, NOT for the hot path. The hot path reads via overlay_gather.
+        The returned tensor is detached (overlay values are detached into
+        it) — there is no gradient path back through this view.
+        """
+        if not self._state_initialized:
+            raise RuntimeError("s accessed before begin_segment()")
+        D_s = self.cfg.D_s
+        if self.active_flat_idx.numel() == 0:
+            return self.s_base
+        view = self.s_base.clone()
+        view.view(-1, D_s).index_copy_(
+            0, self.active_flat_idx, self.active_val.detach(),
+        )
+        return view
 
     # -----------------------------------------------------------------
     # Block-level caches (static per forward within a TBPTT block)
@@ -558,7 +592,10 @@ class GraphWalkerMemory(nn.Module):
         cfg = self.cfg
         dtype_fast = self._fast_dtype(device)
 
-        self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
+        self.s_base = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
+        self.active_flat_idx, self.active_val = empty_overlay(
+            cfg.D_s, device, dtype_fast,
+        )
         # prev_motor: last step's motor output, chained into next step's
         # start-col query. Starts at zero each segment.
         self.prev_motor = torch.zeros(B, cfg.D_s, device=device, dtype=dtype_fast)
@@ -707,10 +744,24 @@ class GraphWalkerMemory(nn.Module):
             return
 
         # Per-column features: mean state across batch, column identity,
-        # visit count (log-scaled for sane dynamic range).
+        # visit count (log-scaled for sane dynamic range). We gather the
+        # touched rows through the overlay so we see the latest window
+        # values (not the stale committed base).
         with torch.no_grad():
-            s_mean = self.s.float().mean(dim=0)                        # [N, D_s]
-            s_feats = s_mean[touched_ids]                              # [U, D_s]
+            B_val = self.s_base.shape[0]
+            N = self.cfg.N
+            device = self.s_base.device
+            # flat_idx[b, u] = b * N + touched_ids[u]
+            flat_idx = (
+                torch.arange(B_val, device=device).unsqueeze(1) * N
+                + touched_ids.unsqueeze(0)
+            ).reshape(-1)                                              # [B*U]
+            s_at_touched = overlay_gather(
+                self.active_flat_idx, self.active_val,
+                self.s_base, flat_idx,
+            ).view(B_val, touched_ids.shape[0], -1)                    # [B, U, D_s]
+            s_mean = s_at_touched.float().mean(dim=0)                  # [U, D_s]
+            s_feats = s_mean
             id_feats = self.col_id[touched_ids].float()                # [U, D_id]
             vc_feats = (self.visit_count[touched_ids] + 1.0).log().unsqueeze(-1)
             feats = torch.cat([s_feats, id_feats, vc_feats], dim=-1)
@@ -722,7 +773,16 @@ class GraphWalkerMemory(nn.Module):
         """TBPTT boundary: preserve values, sever gradient graph."""
         if not self._state_initialized:
             return
-        self.s = self.s.detach()
+        # Commit overlay into the detached base, then reset overlay. This
+        # is where the TBPTT block's accumulated writes become long-term
+        # state. The overlay's autograd graph is freed on backward; the
+        # new block starts with a fresh (empty) overlay.
+        commit_overlay_to_base(
+            self.s_base, self.active_flat_idx, self.active_val,
+        )
+        self.active_flat_idx, self.active_val = empty_overlay(
+            self.cfg.D_s, self.s_base.device, self.s_base.dtype,
+        )
         self.prev_motor = self.prev_motor.detach()
         self.E_bias_flat = self.E_bias_flat.detach()
         self.walker_pos = self.walker_pos.detach()
@@ -794,13 +854,15 @@ class GraphWalkerMemory(nn.Module):
         e_bias_active = self._active_e_bias()
         if self._compiled_step is not None:
             out = self._compiled_step(
-                self.s, self.walker_pos, self.walker_state,
+                self.s_base, self.active_flat_idx, self.active_val,
+                self.walker_pos, self.walker_state,
                 self.prev_motor, e_bias_active,
                 token_id, tau, epsilon, is_new_window,
             )
         else:
             out = self._step_core_pure(
-                self.s, self.walker_pos, self.walker_state,
+                self.s_base, self.active_flat_idx, self.active_val,
+                self.walker_pos, self.walker_state,
                 self.prev_motor, e_bias_active,
                 token_id, tau, epsilon, is_new_window,
             )
@@ -821,7 +883,8 @@ class GraphWalkerMemory(nn.Module):
 
     def _apply_step_state(self, out: WalkerCorePureOutput) -> None:
         """Write pure-step outputs into self.* state (non-grad accumulators)."""
-        self.s = out.s_new
+        self.active_flat_idx = out.active_flat_idx_new
+        self.active_val = out.active_val_new
         self.walker_pos = out.walker_pos_new
         self.walker_state = out.walker_state_new
         self.prev_motor = out.prev_motor_new
@@ -860,7 +923,9 @@ class GraphWalkerMemory(nn.Module):
 
     def _step_core_pure(
         self,
-        s_in: torch.Tensor,              # [B, N, D_s]
+        s_base_in: torch.Tensor,         # [B, N, D_s] detached
+        active_flat_idx_in: torch.Tensor, # [U] int64 sorted
+        active_val_in: torch.Tensor,     # [U, D_s] differentiable
         walker_pos_in: torch.Tensor,     # [B, H]
         walker_state_in: torch.Tensor,   # [B, H, D_s]
         prev_motor_in: torch.Tensor,     # [B, D_s]
@@ -900,13 +965,13 @@ class GraphWalkerMemory(nn.Module):
         """
         assert self._state_initialized, "call begin_segment() first"
         cfg = self.cfg
-        B = s_in.shape[0]
-        device = s_in.device
+        B = s_base_in.shape[0]
+        device = s_base_in.device
 
         is_training = self.training
         cfg_n_heads = cfg.n_heads
         BH = B * cfg_n_heads
-        state_dtype = s_in.dtype
+        state_dtype = s_base_in.dtype
         lb_dtype = torch.float32
         alpha = self._alpha_cache                                     # [N]
 
@@ -960,10 +1025,15 @@ class GraphWalkerMemory(nn.Module):
             P_mass = torch.zeros(cfg.N, device=device, dtype=lb_dtype)
 
         # 3. Walker message from OLD column state + walker state + token.
+        # Overlay-aware read: for each walker, get s at its current column
+        # from the sparse overlay if it was touched earlier in this block,
+        # otherwise from the detached base.
         cur = cur_bh.view(B, cfg_n_heads)
-        s_cur_old = torch.gather(
-            s_in, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
-        ).reshape(BH, cfg.D_s)
+        batch_idx = self._batch_idx                                   # [B*H]
+        cur_flat_bh = batch_idx * cfg.N + cur_bh                       # [B*H] flat
+        s_cur_old = overlay_gather(
+            active_flat_idx_in, active_val_in, s_base_in, cur_flat_bh,
+        )                                                             # [B*H, D_s]
         id_cur = self.col_id[cur_bh]                                  # [B*H, D_id]
         walker_state_flat = walker_state_in.reshape(BH, cfg.D_s)
         token_per_walker = (
@@ -983,32 +1053,36 @@ class GraphWalkerMemory(nn.Module):
         else:
             m_out = self.cols.content_mlp(cat_pre)                    # [B*H, D_s]
 
-        # 4. Sparse deposit. Walker always writes at its current column
-        # (no STE gating on m_out — routing's gradient comes through the
-        # endpoint readout below). On a new-window step the anchor
-        # injection is stacked in the same LIF call; both message sets land
-        # at the anchor cols, which are also the walker's current position.
-        batch_idx = self._batch_idx
+        # 4. Sparse deposit through the overlay. Walker always writes at its
+        # current column. On a new-window step the anchor injection is
+        # stacked in the same LIF call; both message sets land at the anchor
+        # cols, which are also the walker's current position on that step.
+        # No STE gating on m_out — routing's gradient comes through the
+        # endpoint readout below.
         if is_new_window:
             all_dests = torch.cat([
                 batch_idx * cfg.N + start_cols.reshape(BH),
-                batch_idx * cfg.N + cur_bh,
+                cur_flat_bh,
             ], dim=0).contiguous()
             all_msgs = torch.cat(
                 [inject_msg, m_out], dim=0,
             ).to(state_dtype).contiguous()
         else:
-            all_dests = (batch_idx * cfg.N + cur_bh).contiguous()
+            all_dests = cur_flat_bh.contiguous()
             all_msgs = m_out.to(state_dtype).contiguous()
 
-        s_flat = s_in.reshape(B * cfg.N, cfg.D_s)
-        s_flat_new = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
-        s_new = s_flat_new.view(B, cfg.N, cfg.D_s)
+        # Overlay LIF update: reads old values from (overlay ∪ base), applies
+        # per-column LIF blend, returns an updated overlay. No dense [B·N, D_s]
+        # clone anywhere in the autograd graph — only the touched rows.
+        active_flat_idx_new, active_val_new = overlay_lif_update(
+            active_flat_idx_in, active_val_in,
+            s_base_in, all_msgs, all_dests, alpha, cfg.N,
+        )
 
-        # 5. Re-read walker's current column post-update.
-        s_cur_new = torch.gather(
-            s_new, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
-        ).reshape(BH, cfg.D_s)
+        # 5. Re-read walker's current column post-update (from new overlay).
+        s_cur_new = overlay_gather(
+            active_flat_idx_new, active_val_new, s_base_in, cur_flat_bh,
+        )                                                             # [B*H, D_s]
 
         # 6. Routing query uses POST-UPDATE state.
         cat_post = torch.cat([
@@ -1109,7 +1183,8 @@ class GraphWalkerMemory(nn.Module):
         load_balance_loss = cfg.N * (P_mean * f_mean).sum()
 
         return WalkerCorePureOutput(
-            s_new=s_new,
+            active_flat_idx_new=active_flat_idx_new,
+            active_val_new=active_val_new,
             walker_pos_new=walker_pos_new,
             walker_state_new=walker_state_new,
             prev_motor_new=prev_motor_new,
@@ -1200,7 +1275,7 @@ class GraphWalkerMemory(nn.Module):
         attach a grad_fn to `E_bias_flat` across repeated calls.
         """
         cfg = self.cfg
-        device = self.s.device
+        device = self.s_base.device
 
         with torch.autocast(device_type=device.type, enabled=False):
             # Normalize by window length
