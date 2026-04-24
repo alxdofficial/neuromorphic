@@ -270,26 +270,37 @@ Covered items include:
 
 Measured on RTX 4090 with [scripts/bench_graph_walker.py](/home/alex/code/neuromorphic/scripts/bench_graph_walker.py):
 
-- config:
-  - `N=1024`
-  - `D_model=1024`
-  - `D_s=512`
-  - `K=32`
-  - `H=4`
-  - `BS=16`
-  - `T=128`
-  - `tbptt=16`
+- config: `N=1024`, `D_model=1024`, `D_s=512`, `K=32`, `H=4`, depth 4
 - total params: **104.4M**
 
-Current numbers:
+At the measured sweet spot (`BS=48 T=128 tbptt=32`):
 
-- compiled training path: about **1592 ms/step**, **1286 tok/s**, **6.68 GB**
-- no-compile training path: about **1716 ms/step**, **1193 tok/s**, **6.64 GB**
-- same setup with `H=8`: about **1601 ms/step**, **1280 tok/s**, **6.76 GB**
+- compiled training path: about **548 ms/step**, **11,200 tok/s**, **17.0 GB**
 
-So compile still helps, but only modestly on the current implementation. The
-weak `H=4 -> H=8` scaling means the current bottleneck is not the pure
-per-walker math alone; state-update / launch overhead is still dominating.
+At the old dev config (`BS=16 T=128 tbptt=16`):
+
+- compiled training path: about **389 ms/step**, **5,258 tok/s**, **6.88 GB**
+
+Historical baseline (pre–CE vectorization + fused sparse update):
+
+- compiled, `BS=16`: about **1592 ms/step**, **1286 tok/s** — step time dominated
+  by `SelectBackward` nodes from a `T_block × K_h` Python loop in the CE flush.
+
+What changed:
+
+- Fused Triton forward + backward for the sparse LIF state update
+  (`src/graph_walker/triton_sparse_update.py`). Replaced
+  `torch.unique + index_add + gather + LIF + index_copy` with an O(U)-touched-
+  row kernel path.
+- Vectorized multi-horizon CE in `phase1_step.flush`. One `F.cross_entropy`
+  over `[B * T_block * K_h, V]` replaces ~380 Python-loop iterations per
+  block flush, each of which was generating 2–3 `SelectBackward` autograd
+  nodes with full-shape zeros allocations.
+- Vectorized `_finalize_surprise_window`: per-horizon slice + closed-form
+  EMA instead of an inner double loop.
+- Per-segment scratch tensors (`batch_idx`, `k_range`, `ones_bh`) cached in
+  `begin_segment` rather than rebuilt every token.
+- Removed per-flush `.item()` CPU↔GPU syncs.
 
 ## What This Means
 
@@ -300,14 +311,15 @@ relaunch-`H×L` version:
 - the lexical stack is off the fast clock during training
 - surprise is computed on the plasticity clock
 
-But the branch is still far from transformer/Mamba-class throughput.
+And the step is no longer dominated by autograd-graph overhead from Python
+loops in training code. Remaining performance frontier is structural:
 
-Main remaining performance problems:
-
-1. the hot path is still token-sequential
-2. it still uses many small irregular routing/gather operations
-3. state updates still perform a full-state rewrite via `index_copy`
-4. compile does not yet fuse the core well enough to erase that overhead
+1. the hot path is still token-sequential (truly recurrent; can't scan-
+   parallelize like Mamba)
+2. backward still traverses ~50 autograd nodes per token through
+   `step_core`'s mixed routing + MLP + sparse update graph
+3. a custom step_core Triton forward + manual backward would likely cut
+   another 2–3× off training time, but at significant engineering cost
 
 ## Fairness Of Parameter Allocation
 

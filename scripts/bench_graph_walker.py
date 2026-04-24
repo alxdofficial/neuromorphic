@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark GraphWalker throughput at one known-reasonable config.
 
-Defaults: dev scale, BS=16, T=128, tbptt=16.
+Defaults: measured-sweet-spot on RTX 4090 (24 GB): BS=48, T=128, tbptt=32.
+Around 11k tok/s at 104M params. Override with CLI flags.
 """
 
 from __future__ import annotations
@@ -18,9 +19,9 @@ from src.graph_walker.train_phase1 import phase1_step
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bs", type=int, default=16)
+    parser.add_argument("--bs", type=int, default=48)
     parser.add_argument("--t", type=int, default=128)
-    parser.add_argument("--tbptt", type=int, default=16)
+    parser.add_argument("--tbptt", type=int, default=32)
     parser.add_argument("--steps", type=int, default=10)
     args = parser.parse_args()
 
