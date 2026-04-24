@@ -153,23 +153,14 @@ class ColumnCompute(nn.Module):
                 L=cfg.L, D_in=D_s + D_id,
                 D_hid=cfg.ffn_mult_content * D_s, D_out=D_s,
             )
-        elif cfg.content_mlp_depth > 1:
-            # Deep shared MLP stack — residual FFN blocks. Scales params
-            # to GPT-2-small class while keeping one batched matmul per
-            # sublayer call (throughput-friendly).
+        else:
+            # Deep shared MLP stack — residual FFN blocks. Handles both
+            # shallow (depth=1) and deeper cases uniformly; keeps the
+            # RMSNorm + residual + GELU structure.
             self.content_mlp = DeepContentMLP(
                 D_in=D_s + D_id, D_s=D_s,
                 D_hid=cfg.ffn_mult_content * D_s,
                 n_layers=cfg.content_mlp_depth,
-            )
-        else:
-            self.content_mlp = nn.Sequential(
-                nn.Linear(D_s + D_id, cfg.ffn_mult_content * D_s),
-                nn.GELU(),
-                nn.Linear(cfg.ffn_mult_content * D_s, D_s),
-            )
-            nn.init.normal_(
-                self.content_mlp[0].weight, mean=0.0, std=0.014,
             )
         self.q_proj = nn.Sequential(
             nn.Linear(D_s + D_id, 2 * H * D_q),
