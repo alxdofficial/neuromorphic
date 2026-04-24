@@ -82,13 +82,17 @@ class GraphWalkerConfig:
     plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta
 
     # --- Neuromodulator (graph transformer on touched columns) ---
-    # When enabled, a small graph transformer runs at the start of each
-    # plasticity window. It observes a detached per-touched-column feature
-    # snapshot from the previous window and emits a grad-carrying delta to
-    # E_bias_flat. That delta is live during the current window (gradient
+    # A small graph transformer runs at the start of each plasticity
+    # window, observing a detached per-touched-column feature snapshot
+    # from the previous window and emitting a grad-carrying delta to
+    # E_bias_flat. The delta is live during the current window (gradient
     # flows back via routing → active_E_bias → neuromod params) and is
     # detached + folded into the persistent E_bias at window close.
-    use_neuromod: bool = False
+    # Enabled by default — this is the thesis's intended plasticity path.
+    # Zero-init output projections make day-0 behaviour identical to
+    # scalar-eta Hebbian-only; disable with `use_neuromod=False` to
+    # ablate.
+    use_neuromod: bool = True
     neuromod_D_mod: int = 128
     neuromod_n_layers: int = 2
     neuromod_n_heads: int = 4
