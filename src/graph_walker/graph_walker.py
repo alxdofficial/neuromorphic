@@ -24,6 +24,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.graph_walker.config import GraphWalkerConfig
+from src.graph_walker.neuromod import (
+    NeuromodGraphTransformer,
+    build_adjacency_bias,
+    enumerate_touched_edges,
+)
 from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
 from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
 from src.graph_walker.topology import build_topology
@@ -79,6 +84,81 @@ class _ResidualFFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.gelu(self.up(self.norm(x))))
+
+
+class PerHeadDeepContentMLP(nn.Module):
+    """Per-head content MLP: H independent weight sets, one per walker index.
+
+    Each walker h uses its own (in_proj_h, ResidualFFN_h) — H disjoint sets
+    of parameters. Per-walker compute is identical to shared-weight
+    DeepContentMLP; only the total parameter count scales with H. This is
+    MoE-style capacity gain at constant per-token FLOPs.
+
+    Batched across H via einsum so we do one cuBLAS call per matmul, not H.
+    Each matmul has batch dim H, row dim B (not B·H), so M drops from
+    `B·H` to `B` per matmul. For small H this costs Tensor Core utilization;
+    for H=32 with D_hid=2048 the per-matmul workload is still large enough
+    to amortize launch overhead.
+    """
+
+    def __init__(
+        self, H: int, D_in: int, D_s: int, D_hid: int, n_layers: int,
+    ) -> None:
+        super().__init__()
+        self.H = H
+        self.D_s = D_s
+        self.D_hid = D_hid
+        self.n_layers = n_layers
+
+        # in_proj: [H, D_in, D_s], b: [H, D_s]
+        self.in_proj_w = nn.Parameter(torch.empty(H, D_in, D_s))
+        self.in_proj_b = nn.Parameter(torch.zeros(H, D_s))
+
+        # Per-head ResidualFFN block tensors stacked along H and n_layers.
+        # norm weight (RMSNorm gain): [H, n_layers, D_s]
+        self.norm_w = nn.Parameter(torch.ones(H, n_layers, D_s))
+        # up: [H, n_layers, D_s, D_hid]; bias: [H, n_layers, D_hid]
+        self.up_w = nn.Parameter(torch.empty(H, n_layers, D_s, D_hid))
+        self.up_b = nn.Parameter(torch.zeros(H, n_layers, D_hid))
+        # down: [H, n_layers, D_hid, D_s]; bias: [H, n_layers, D_s]
+        self.down_w = nn.Parameter(torch.empty(H, n_layers, D_hid, D_s))
+        self.down_b = nn.Parameter(torch.zeros(H, n_layers, D_s))
+
+        nn.init.normal_(self.in_proj_w, mean=0.0, std=0.014)
+        nn.init.normal_(self.up_w, mean=0.0, std=0.014)
+        # Depth-scaled init on final projection so sum of residuals stays bounded.
+        nn.init.normal_(
+            self.down_w, mean=0.0, std=(2.0 / D_hid) ** 0.5,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B*H, D_in] (flat, from the rest of the hot path).
+        Returns [B*H, D_s]."""
+        BH = x.shape[0]
+        assert BH % self.H == 0, (
+            f"input first dim {BH} not divisible by H={self.H}"
+        )
+        B = BH // self.H
+        x = x.view(B, self.H, -1)                                  # [B, H, D_in]
+
+        # in_proj: [B, H, D_in] × [H, D_in, D_s] → [B, H, D_s]
+        x = torch.einsum("bhd,hde->bhe", x, self.in_proj_w)
+        x = x + self.in_proj_b.unsqueeze(0)                        # broadcast over B
+
+        for i in range(self.n_layers):
+            # Per-head RMSNorm (scale-invariant so compute in input dtype).
+            rms = x.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+            x_n = x * rms * self.norm_w[:, i].to(x.dtype).unsqueeze(0)
+            # up: [B, H, D_s] × [H, D_s, D_hid] → [B, H, D_hid]
+            hid = torch.einsum("bhd,hde->bhe", x_n, self.up_w[:, i])
+            hid = hid + self.up_b[:, i].unsqueeze(0)
+            hid = F.gelu(hid)
+            # down: [B, H, D_hid] × [H, D_hid, D_s] → [B, H, D_s]
+            out = torch.einsum("bhd,hde->bhe", hid, self.down_w[:, i])
+            out = out + self.down_b[:, i].unsqueeze(0)
+            x = x + out
+
+        return x.reshape(BH, self.D_s)
 
 
 class PerPlaneMLP(nn.Module):
@@ -152,6 +232,17 @@ class ColumnCompute(nn.Module):
             self.content_mlp = PerPlaneMLP(
                 L=cfg.L, D_in=D_s + D_id,
                 D_hid=cfg.ffn_mult_content * D_s, D_out=D_s,
+            )
+        elif cfg.per_head_content_mlp:
+            # MoE-style: H independent content_mlp copies, one per walker
+            # index. Total params scale with H while per-token compute is
+            # identical to the shared path (each walker still runs one
+            # forward pass, just with its own weights).
+            self.content_mlp = PerHeadDeepContentMLP(
+                H=cfg.n_heads,
+                D_in=D_s + D_id, D_s=D_s,
+                D_hid=cfg.ffn_mult_content * D_s,
+                n_layers=cfg.content_mlp_depth,
             )
         else:
             # Deep shared MLP stack — residual FFN blocks. Handles both
@@ -306,6 +397,22 @@ class GraphWalkerMemory(nn.Module):
         # Multi-horizon readout (reused from column-graph)
         self.readout = MultiHorizonReadout(cfg)
 
+        # Optional graph-transformer neuromodulator (see src/graph_walker/neuromod.py).
+        # Disabled by default so existing configs and tests are unchanged.
+        # When enabled, acts at the start of each plasticity window on a
+        # detached snapshot of the previous window's touched-column stats.
+        if cfg.use_neuromod:
+            D_feat = cfg.D_s + cfg.D_id + 1  # state + id + visit_count
+            self.neuromod = NeuromodGraphTransformer(
+                D_feat=D_feat,
+                D_mod=cfg.neuromod_D_mod,
+                n_layers=cfg.neuromod_n_layers,
+                n_heads=cfg.neuromod_n_heads,
+                rank=cfg.neuromod_rank,
+            )
+        else:
+            self.neuromod = None
+
         # --- Persistent state (buffers) ---
         self._state_initialized = False
         self.s: torch.Tensor                 # [B, N, D_s]
@@ -323,6 +430,17 @@ class GraphWalkerMemory(nn.Module):
         # Window-accumulated stats for plasticity (reset every mod_period)
         self.co_visit_flat: torch.Tensor | None = None  # [N*K] fp32
         self.window_len: int = 0
+
+        # Neuromod plastic-window state. `_active_delta_nm` is the grad-
+        # carrying E_bias delta for the CURRENT plasticity window; it is
+        # computed at window start from the snapshot of the PREVIOUS window,
+        # detached and merged into E_bias_flat at window close. None when
+        # there is no previous snapshot (bootstrapping) or neuromod off.
+        self._active_delta_nm: torch.Tensor | None = None
+        # Snapshot of the most recently closed window's touched columns —
+        # consumed at the next window's start to produce _active_delta_nm.
+        self._prev_snapshot_ids: torch.Tensor | None = None
+        self._prev_snapshot_feats: torch.Tensor | None = None
 
         # Visit-frequency count across the current training step (for
         # load-balance aux loss). Reset externally per step.
@@ -455,6 +573,12 @@ class GraphWalkerMemory(nn.Module):
         self._k_range = torch.arange(cfg.K, device=device)            # [K]
         self._ones_bh = torch.ones(B * H, device=device, dtype=torch.float32)
 
+        # Neuromod plastic-window initialization. If we have a snapshot
+        # from a prior window (carried across segments), consume it to
+        # produce the grad-carrying delta_nm that routing will use during
+        # this window. Otherwise, start with no delta.
+        self._begin_plastic_window()
+
         self._state_initialized = True
 
     def reset_plastic_memory(self, device: torch.device) -> None:
@@ -462,6 +586,94 @@ class GraphWalkerMemory(nn.Module):
         self.E_bias_flat = torch.zeros(
             self.cfg.num_edges, device=device, dtype=torch.float32,
         )
+        # Also clear any carried-over neuromod snapshot.
+        self._prev_snapshot_ids = None
+        self._prev_snapshot_feats = None
+        self._active_delta_nm = None
+
+    # -----------------------------------------------------------------
+    # Neuromodulator plumbing
+    # -----------------------------------------------------------------
+
+    @torch._dynamo.disable
+    def _begin_plastic_window(self) -> None:
+        """Called at the start of each plasticity window.
+
+        Consumes the snapshot of the previous window's touched columns and
+        produces `_active_delta_nm` — a grad-carrying delta added to
+        `E_bias_flat.detach()` during routing this window.
+        """
+        if self.neuromod is None or self._prev_snapshot_feats is None:
+            self._active_delta_nm = None
+            return
+        touched_ids = self._prev_snapshot_ids
+        feats = self._prev_snapshot_feats
+        if touched_ids.numel() < 2:
+            # Need at least 2 touched columns for any edge between them.
+            self._active_delta_nm = None
+            return
+
+        adj_bias = build_adjacency_bias(touched_ids, self.out_nbrs)
+        edge_src_local, edge_dst_local, edge_flat = enumerate_touched_edges(
+            touched_ids, self.out_nbrs, self.cfg.K,
+        )
+        if edge_flat.numel() == 0:
+            self._active_delta_nm = None
+            return
+
+        deltas = self.neuromod(
+            feats, adj_bias, edge_src_local, edge_dst_local,
+        )                                                   # [E], grad-carrying
+        # Scatter into [N*K] shape; index_copy preserves grad to `deltas`.
+        dense = torch.zeros(
+            self.cfg.num_edges, device=deltas.device, dtype=deltas.dtype,
+        )
+        self._active_delta_nm = dense.index_copy(0, edge_flat, deltas)
+
+    def _active_e_bias(self) -> torch.Tensor:
+        """E_bias tensor used by routing this window.
+
+        = E_bias_flat.detach() + η_nm · delta_nm
+        where delta_nm is grad-carrying (so loss → routing → delta_nm →
+        neuromod params is a live gradient path).
+        """
+        if self._active_delta_nm is None:
+            return self.E_bias_flat
+        return (
+            self.E_bias_flat.detach()
+            + self.cfg.neuromod_eta * self._active_delta_nm
+        )
+
+    @torch._dynamo.disable
+    def _snapshot_touched_columns(self) -> None:
+        """Snapshot stats for columns visited in the window just closed.
+
+        Stored in `_prev_snapshot_ids`, `_prev_snapshot_feats` (both detached)
+        for consumption by the NEXT window's `_begin_plastic_window`.
+        Called at window close, before counters are reset.
+        """
+        if self.neuromod is None or self.visit_count is None:
+            return
+
+        # Touched columns (visited at least once this window)
+        touched_mask = self.visit_count > 0
+        touched_ids = torch.nonzero(touched_mask, as_tuple=False).squeeze(-1)
+        if touched_ids.numel() == 0:
+            self._prev_snapshot_ids = None
+            self._prev_snapshot_feats = None
+            return
+
+        # Per-column features: mean state across batch, column identity,
+        # visit count (log-scaled for sane dynamic range).
+        with torch.no_grad():
+            s_mean = self.s.float().mean(dim=0)                        # [N, D_s]
+            s_feats = s_mean[touched_ids]                              # [U, D_s]
+            id_feats = self.col_id[touched_ids].float()                # [U, D_id]
+            vc_feats = (self.visit_count[touched_ids] + 1.0).log().unsqueeze(-1)
+            feats = torch.cat([s_feats, id_feats, vc_feats], dim=-1)
+
+        self._prev_snapshot_ids = touched_ids.detach()
+        self._prev_snapshot_feats = feats.detach()
 
     def detach_state(self) -> None:
         """TBPTT boundary: preserve values, sever gradient graph."""
@@ -486,6 +698,12 @@ class GraphWalkerMemory(nn.Module):
         self._alpha_cache = None
         self._input_keys_cache = None
         self._k_all_cache = None
+        # Neuromod delta must also get a fresh grad_fn for the next block.
+        # The underlying snapshot is already detached, so rebuilding
+        # `_active_delta_nm` from it gives a fresh grad path while the
+        # value remains identical.
+        self._active_delta_nm = None
+        self._begin_plastic_window()
 
     def _fast_dtype(self, device: torch.device) -> torch.dtype:
         choice = self.cfg.state_dtype
@@ -527,14 +745,17 @@ class GraphWalkerMemory(nn.Module):
         self._ensure_block_caches(self.tied_token_emb.weight)
         tau, epsilon = self._schedule_tensors(token_id)
         tick0 = self.tick_counter == 0
+        # Active E_bias = frozen persistent base + grad-carrying neuromod
+        # delta (if any). When the neuromod is off, this is just E_bias_flat.
+        e_bias_active = self._active_e_bias()
         if self._compiled_step is not None:
             out = self._compiled_step(
-                self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+                self.s, self.walker_pos, self.prev_motor, e_bias_active,
                 token_id, tau, epsilon, tick0,
             )
         else:
             out = self._step_core_pure(
-                self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+                self.s, self.walker_pos, self.prev_motor, e_bias_active,
                 token_id, tau, epsilon, tick0,
             )
         self._apply_step_state(out)
@@ -601,9 +822,11 @@ class GraphWalkerMemory(nn.Module):
             motor_block = torch.stack(motors, dim=1)
             return motor_block, s, walker, prev, lb_sum, cv_sum, vc_sum
 
+        # Use active E_bias (with neuromod delta mixed in) for the block.
+        e_bias_active = self._active_e_bias()
         motor_block, s_new, walker_new, prev_new, lb_sum, cv_sum, vc_sum = checkpoint(
             _block_fn,
-            self.s, self.walker_pos, self.prev_motor, self.E_bias_flat,
+            self.s, self.walker_pos, self.prev_motor, e_bias_active,
             tokens_block, use_reentrant=False,
         )
 
@@ -937,7 +1160,12 @@ class GraphWalkerMemory(nn.Module):
 
     @torch._dynamo.disable
     def _plasticity_step(self) -> None:
-        """Hebbian on traversed-edge counts. Fires every mod_period ticks."""
+        """Plasticity update on window close. Runs:
+          1. Scalar-eta Hebbian on traversed-edge counts (legacy).
+          2. If neuromod is enabled: bake the grad-carrying `_active_delta_nm`
+             into `E_bias_flat` (detached), then take a new snapshot of the
+             just-closed window and produce the next window's delta.
+        """
         cfg = self.cfg
         device = self.s.device
 
@@ -947,21 +1175,38 @@ class GraphWalkerMemory(nn.Module):
             co_visit_norm = (self.co_visit_flat.float() / window) if self.co_visit_flat is not None \
                 else torch.zeros_like(self.E_bias_flat)
 
-            # Scalar-eta Hebbian v1: surprise-gated global learning rate.
-            # Higher surprise → faster learning. A trunk+head neuromod MLP
-            # could replace this with per-column/per-head rates later; for
-            # now a single scalar is sufficient and keeps the hot path cheap.
+            # Scalar-eta Hebbian: surprise-gated global learning rate.
+            # Higher surprise → faster learning. Additive to the neuromod.
             surprise_scalar = self.surprise_ema.mean().float()
             eta_global = cfg.plast_eta * torch.sigmoid(
                 surprise_scalar - cfg.plast_surprise_bias,
             )
 
-            # Global step: E_bias += η * (co_visit - decay * E_bias)
-            delta = eta_global * (co_visit_norm - cfg.plast_decay * self.E_bias_flat)
-            self.E_bias_flat = (self.E_bias_flat + delta).clamp(
-                -cfg.E_bias_max, cfg.E_bias_max,
+            delta_hebb = eta_global * (
+                co_visit_norm - cfg.plast_decay * self.E_bias_flat
             )
+            # Neuromod contribution (if any), detached and scaled.
+            delta_nm_commit = torch.zeros_like(self.E_bias_flat)
+            if self._active_delta_nm is not None:
+                delta_nm_commit = (
+                    cfg.neuromod_eta * self._active_delta_nm.detach()
+                )
 
-        # Reset window counters
+            self.E_bias_flat = (
+                self.E_bias_flat + delta_hebb + delta_nm_commit
+            ).clamp(-cfg.E_bias_max, cfg.E_bias_max)
+
+        # Snapshot the just-closed window BEFORE we reset counters — this
+        # becomes the observation for the NEXT window's neuromod fire.
+        self._snapshot_touched_columns()
+
+        # Reset window-scoped counters (co_visit, window_len, visit_count,
+        # active_delta_nm — the delta is now baked into E_bias_flat).
         self.co_visit_flat = torch.zeros_like(self.co_visit_flat)
         self.window_len = 0
+        if self.visit_count is not None:
+            self.visit_count = torch.zeros_like(self.visit_count)
+        self._active_delta_nm = None
+
+        # Start the next window with a fresh delta from the snapshot above.
+        self._begin_plastic_window()

@@ -33,7 +33,11 @@ make it cheaper:
 - [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py)
 - [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py)
 - [src/graph_walker/standalone.py](/home/alex/code/neuromorphic/src/graph_walker/standalone.py)
+- [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py)
+- [src/graph_walker/triton_sparse_update.py](/home/alex/code/neuromorphic/src/graph_walker/triton_sparse_update.py)
 - [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py)
+- [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py)
+- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py)
 
 ## Current Default Shape
 
@@ -211,15 +215,53 @@ So there are now three practical clocks:
 - block clock: batched lexical prediction for CE
 - plasticity clock: exact surprise + plastic write
 
-Plasticity is still scalar-eta surprise-gated Hebbian on traversed-edge counts:
+Plasticity has two paths, both additive into `E_bias_flat`:
+
+**Path 1 — surprise-gated Hebbian (always on):**
 
 - `co_visit_flat` counts traversed edges over the window
 - `eta_global = plast_eta * sigmoid(mean(surprise_ema) - plast_surprise_bias)`
-- `E_bias += eta_global * (co_visit_norm - plast_decay * E_bias)`
+- `delta_hebb = eta_global * (co_visit_norm - plast_decay * E_bias)`
 - clamp to `[-E_bias_max, E_bias_max]`
 
-This is simpler than the older richer neuromodulator sketches. The code does
-not currently have a separate neuromod MLP.
+**Path 2 — graph-transformer neuromod (opt-in via `cfg.use_neuromod`):**
+
+Defined in [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py).
+Fires at the **start** of each plasticity window (not end), reading a
+detached snapshot of the previous window's per-touched-column features.
+Its output `ΔE_bias` is grad-carrying during the current window:
+
+- routing uses `E_bias_active = E_bias_flat.detach() + η_nm · ΔE_bias`
+- loss from the current window backprops through `ΔE_bias` into the
+  neuromod's parameters
+- at window close, `ΔE_bias.detach()` is baked into `E_bias_flat` (same
+  store as the Hebbian path)
+
+This means the neuromod is trained by the *outcome of the decision it
+just made* — classic policy-style signal but fully differentiable, and
+the autograd graph spans exactly one plasticity window (not two).
+
+Module architecture:
+
+- input: `[U, D_s + D_id + 1]` per touched column — mean state across
+  batch, column identity, log visit count
+- `feature_proj: D_feat → D_mod`
+- `n_layers` graph-attention layers (pre-norm, adjacency-biased
+  self-attention + FFN)
+- low-rank edge decoder: `ΔE_bias[i→j] = (src(x_i) · dst(x_j)) / √R`
+- zero-initialised output projections so the first segment after
+  enabling is identical to non-neuromod behaviour
+
+Topology bias: the attention scores in each layer are additively biased
+by a `[U, U]` 0/1 adjacency matrix indicating which touched-column
+pairs are connected in the fixed graph topology. The transformer
+therefore "knows" existing connectivity while deciding how to modulate
+it.
+
+Scope of write: only edges whose source AND destination are in the
+touched set this window receive a delta. Unvisited parts of the graph
+stay unchanged. Matches the biological "synapse you don't use doesn't
+move" rule.
 
 ## Public APIs
 
@@ -249,8 +291,13 @@ the path used by phase-1 training.
 
 ## Current Tests
 
-[tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py)
-currently passes **16 tests**.
+Three test files:
+
+- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py) (16 tests) — end-to-end shape, gradient, and correctness checks.
+- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py) (9 tests) — numerical parity and edge-case coverage for the fused Triton sparse LIF op.
+- [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py) (8 tests) — subgraph helpers, zero-init safety, and gradient-flow verification for the neuromod path.
+
+Full suite (33 tests) passes.
 
 Covered items include:
 
@@ -275,7 +322,8 @@ Measured on RTX 4090 with [scripts/bench_graph_walker.py](/home/alex/code/neurom
 
 At the measured sweet spot (`BS=48 T=128 tbptt=32`):
 
-- compiled training path: about **548 ms/step**, **11,200 tok/s**, **17.0 GB**
+- compiled training path (neuromod off): about **554 ms/step**, **11,100 tok/s**, **17.0 GB**
+- compiled training path (neuromod on): about **570 ms/step**, **10,770 tok/s**, **17.1 GB** (+0.47M params, −3% throughput)
 
 At the old dev config (`BS=16 T=128 tbptt=16`):
 

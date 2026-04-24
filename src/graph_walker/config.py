@@ -32,6 +32,11 @@ class GraphWalkerConfig:
     # `content_mlp_depth` (deep shared blocks) which hits the same param
     # budget with better throughput.
     per_plane_content_mlp: bool = False
+    # When True, content_mlp has H independent copies (one per walker head).
+    # MoE-style capacity: total params scale with H, but per-token compute
+    # is identical to the shared path since each walker still does one
+    # forward pass, just with its own weights.
+    per_head_content_mlp: bool = False
     content_mlp_depth: int = 4          # residual FFN blocks (shared weights)
 
     # --- Widths ---
@@ -75,6 +80,20 @@ class GraphWalkerConfig:
     plast_eta: float = 0.1              # base Hebbian learning rate
     plast_decay: float = 0.1            # E_bias decay per plasticity tick
     plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta
+
+    # --- Neuromodulator (graph transformer on touched columns) ---
+    # When enabled, a small graph transformer runs at the start of each
+    # plasticity window. It observes a detached per-touched-column feature
+    # snapshot from the previous window and emits a grad-carrying delta to
+    # E_bias_flat. That delta is live during the current window (gradient
+    # flows back via routing → active_E_bias → neuromod params) and is
+    # detached + folded into the persistent E_bias at window close.
+    use_neuromod: bool = False
+    neuromod_D_mod: int = 128
+    neuromod_n_layers: int = 2
+    neuromod_n_heads: int = 4
+    neuromod_rank: int = 32
+    neuromod_eta: float = 0.1           # scales how strongly delta_nm modifies E_bias
 
     # --- Routing (Gumbel + exploration) ---
     gumbel_tau_start: float = 2.0
