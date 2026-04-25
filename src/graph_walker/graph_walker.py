@@ -50,6 +50,12 @@ from src.graph_walker.topology import build_topology
 from src.graph_walker.triton_sparse_update import sparse_lif_update
 
 
+class _NullCtx:
+    """Minimal no-op context for the autocast-defensive wrap in forward_segment."""
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
 def _rmsnorm(dim: int) -> nn.Module:
     return _FallbackRMSNorm(dim)
 
@@ -1035,6 +1041,21 @@ class GraphWalkerMemory(nn.Module):
         tbptt = cfg.tbptt_block
         K_h = cfg.K_horizons
 
+        # Walker hot path runs in `state_dtype` (bf16 on CUDA, fp32 on CPU).
+        # If the caller runs us on CUDA WITHOUT autocast, the bf16 column
+        # state vs fp32 walker weights would mismatch in `content_mlp`,
+        # `q_proj`, etc. Defensively enter autocast at the top of the
+        # processing loop so inference / benchmark callers don't need to
+        # know about the requirement. When autocast is already active
+        # (training harnesses set it), this nests cleanly.
+        if device.type == "cuda" and not torch.is_autocast_enabled():
+            return self._forward_segment_with_autocast(
+                h_mem, input_ids, adapter,
+                compute_aux_loss=compute_aux_loss,
+                preserve_graph=preserve_graph,
+                walker_aux_weight=walker_aux_weight,
+            )
+
         motor_states: list[torch.Tensor] = []
         # Per-block buffers for surprise fold + aux CE.
         block_motor_list: list[torch.Tensor] = []
@@ -1139,6 +1160,29 @@ class GraphWalkerMemory(nn.Module):
             if adapter is not None and llama_ce_count > 0:
                 aux_loss = aux_loss + (llama_ce_sum / llama_ce_count)
         return readouts, aux_loss
+
+    def _forward_segment_with_autocast(
+        self,
+        h_mem: torch.Tensor,
+        input_ids: torch.Tensor,
+        adapter,
+        *,
+        compute_aux_loss: bool,
+        preserve_graph: bool,
+        walker_aux_weight: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Defensive wrapper that enters bf16 autocast on CUDA before
+        recursing into `forward_segment`. Used when a caller runs us on
+        CUDA without first establishing an autocast region — without it,
+        the bf16 column state would mismatch the fp32 walker weights in
+        `content_mlp` / `q_proj`."""
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return self.forward_segment(
+                h_mem, input_ids, adapter,
+                compute_aux_loss=compute_aux_loss,
+                preserve_graph=preserve_graph,
+                walker_aux_weight=walker_aux_weight,
+            )
 
     def _step_core_pure(
         self,
