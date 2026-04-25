@@ -1,9 +1,88 @@
 # GraphWalker Triton Rewrite Plan
 
 **Branch:** `graph-walker` @ `00d4084` (or later)
-**Status:** plan — not yet implemented
+**Status:** Phases 0+1+5 landed (target speedup hit); Phases 2-3 deferred — see "Outcome" below
 **Author:** session 2026-04-25
 **Goal:** Push walker hot path from current 3.5× over eager (whole-block compile) to **6-8×** via custom Triton kernels for the dispatch-bound small-op chains, keeping cuBLAS for matmuls.
+
+---
+
+## Outcome (2026-04-25 — same session)
+
+**Target hit on Phase 5 alone:** manual CUDA-graph capture wrapped around an
+inductor-compiled ``block_forward`` reaches **13.98× over eager** at B=4,
+T=128, and **13.6× at B=16** — well past the 6-8× target.
+
+Reproduce with ``PYTHONPATH=. python scripts/bench_walker_full.py [B]``.
+
+```
+Bench (RTX 4090, segment_T=128, mod_period=64, use_neuromod=False)
+
+B=4:    eager                       1260 tok/s    1.00×    warmup  2.0s
+        whole-block compile         5049 tok/s    4.01×    warmup 14.3s
+        cudagraph + compile inner  17615 tok/s   13.98×    warmup  101s
+
+B=16:   eager                       4906 tok/s    1.00×
+        cudagraph + compile inner  66798 tok/s   13.61×
+```
+
+Compile + cudagraph capture is a one-time ~100s warmup. After that
+each replay is pure CUDA — Python dispatch overhead drops to noise.
+
+Why Phase 2 (`step_postlif`) and Phase 3 (`anchor_pick`) Triton kernels
+were **not** implemented:
+
+- Their value proposition was reducing kernel-launch overhead in the
+  small-op chain. CUDA-graph replay collapses the entire forward+backward
+  into a single replayed graph — launch overhead drops by ~100×, so the
+  remaining headroom from Triton fusion is in the noise (~1-2%).
+- Implementing them as designed (custom Triton forward + analytical
+  backward) would be ~700-1000 lines + parity tests, with negligible
+  speedup contribution. The 8.7× regression in commit ``a2f3f50`` from
+  putting matmul-shaped backward in Triton is the cautionary precedent.
+- Phase 4 (integration) and the autograd.Function wrappers (originally
+  meant to make capture clean) became unnecessary once we discovered
+  manual capture works without them.
+
+**Recommendation:** keep this section as the canonical record. Re-open
+Phases 2-3 only if profiling at production scale shows a remaining
+launch-bound or memory-bound bottleneck inside the captured graph.
+
+### What did land
+
+- `src/graph_walker/triton/__init__.py` — package marker, lazy
+  `HAS_TRITON` flag.
+- `src/graph_walker/triton/lif.py` — Triton sparse LIF deposit with
+  static-shape preprocessing (no `torch.unique`), pre-allocated
+  save-for-backward buffers, sentinel-padded unique_dests grid. Pure-
+  torch fallback retained as the cudagraph-safe default backend.
+- `src/graph_walker/triton/cudagraph_trainer.py` — manual CUDA-graph
+  capture wrapper. Owns all input/output staging buffers; warmup +
+  capture share a side stream so AccumulateGrad nodes match. Captured
+  body covers caches refresh + block_forward + CE + backward + state
+  writeback + surprise EMA streaming + Hebbian plasticity update —
+  all in-place against stable buffers.
+- `phase1_step_cudagraph` in `train_phase1.py` — lazy build of the
+  trainer on first call; replays per block; cross-block stat
+  accumulation stays GPU-resident.
+- Two cudagraph-capture-blocking PyTorch ops fixed in
+  `_step_core_pure`: `torch.bincount` → `torch.zeros + index_add_`,
+  bool-masked indexing → multiplied-mask sum.
+
+### Constraints accepted
+
+- ``use_neuromod=False`` is required for the cudagraph path. The
+  neuromod's ``_active_delta_nm`` rebuilds per window with a fresh
+  memory address; the captured graph would read from a stale pointer
+  otherwise. Fixing this requires either pre-allocating a stable
+  ``_active_delta_nm_buf`` that the neuromod fire writes into, OR
+  routing the neuromod gradient via a checkpoint-at-boundary autograd
+  pattern (capture treats e_bias as a leaf, the neuromod chain runs
+  outside and consumes ``e_bias.grad``). Neither is hard, but they're
+  out of scope for this rewrite.
+- ``tbptt_block == mod_period`` (already required by the eager path —
+  one full plasticity window per block).
+- ``segment_T % mod_period == 0`` (already required).
 
 ---
 
