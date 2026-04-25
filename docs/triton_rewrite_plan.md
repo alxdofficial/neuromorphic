@@ -11,9 +11,10 @@
 
 **Target hit on Phase 5 alone:** manual CUDA-graph capture wrapped around an
 inductor-compiled ``block_forward`` reaches **13.98× over eager** at B=4,
-T=128, and **13.6× at B=16** — well past the 6-8× target.
+T=128, and **13.20× at B=16** — well past the 6-8× target.
 
-Reproduce with ``PYTHONPATH=. python scripts/bench_walker_full.py [B]``.
+Reproduce with ``PYTHONPATH=. python scripts/bench_walker_full.py [B]``
+or ``scripts/bench_walker_quick.py cudagraph [B]`` for a single config.
 
 ```
 Bench (RTX 4090, segment_T=128, mod_period=64, use_neuromod=False)
@@ -22,12 +23,13 @@ B=4:    eager                       1260 tok/s    1.00×    warmup  2.0s
         whole-block compile         5049 tok/s    4.01×    warmup 14.3s
         cudagraph + compile inner  17615 tok/s   13.98×    warmup  101s
 
-B=16:   eager                       4906 tok/s    1.00×
-        cudagraph + compile inner  66798 tok/s   13.61×
+B=16:   eager                       5028 tok/s    1.00×
+        cudagraph + compile inner  66358 tok/s   13.20×    warmup  251s
 ```
 
-Compile + cudagraph capture is a one-time ~100s warmup. After that
-each replay is pure CUDA — Python dispatch overhead drops to noise.
+Compile + cudagraph capture is a one-time ~100-250s warmup (longer for
+larger B due to Triton autotune). After that each replay is pure CUDA —
+Python dispatch overhead drops to noise.
 
 Why Phase 2 (`step_postlif`) and Phase 3 (`anchor_pick`) Triton kernels
 were **not** implemented:
