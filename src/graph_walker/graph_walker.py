@@ -350,6 +350,25 @@ class WalkerCorePureOutput:
     load_balance_loss: torch.Tensor       # scalar — aux loss term
 
 
+@dataclass
+class BlockOutput:
+    """Return bundle from `block_forward`: T_block sequential steps.
+
+    All forward state (s, walker_pos, walker_state, prev_motor) is returned
+    explicitly so the caller can thread it through autograd or write it
+    back to self. Non-grad accumulators (co_visit, visit_count) are
+    summed within the block; caller adds them to module-level totals.
+    """
+    s_new: torch.Tensor                  # [B, N, D_s]
+    walker_pos_new: torch.Tensor         # [B, H]
+    walker_state_new: torch.Tensor       # [B, H, D_s]
+    prev_motor_new: torch.Tensor         # [B, D_s]
+    motor_states_bt: torch.Tensor        # [B, T_block, D_s] — fed to readout
+    co_visit_total: torch.Tensor         # [N*K] fp32, summed across T_block
+    visit_count_total: torch.Tensor      # [N] fp32, summed across T_block
+    load_balance_loss: torch.Tensor      # scalar — Σ over T_block, mean later
+
+
 class GraphWalkerMemory(nn.Module):
     def __init__(
         self, cfg: GraphWalkerConfig, tied_token_emb: nn.Embedding
@@ -521,21 +540,33 @@ class GraphWalkerMemory(nn.Module):
         # outside that region so the compiled path only pays the true fast
         # recurrent work.
         self._compiled_step = None
+        # Filled when compile_block() is called. Compiled `block_forward`
+        # runs the full T_block-step loop unrolled in one graph — gives
+        # ~3.7× over eager vs the ~1.9× from per-step compile.
+        self._compiled_block = None
 
     # -----------------------------------------------------------------
     # Block-level caches (static per forward within a TBPTT block)
     # -----------------------------------------------------------------
 
-    def compile_step(self, mode: str = "default") -> None:
+    def compile_step(
+        self, mode: str = "default", fullgraph: bool = True,
+    ) -> None:
         """Compile the hot per-token graph core. Must be called after .cuda().
 
-        Uses fullgraph=False so dynamo can graph-break around the Python
-        bookkeeping that stays outside the compiled step. Also enables
-        capture_dynamic_output_shape_ops so
-        torch.unique / torch.bincount (data-dependent shapes) don't
-        trigger their own graph breaks. On Triton 3.6 we avoid the
-        TritonGPURemoveLayoutConversions randint-in-fusion crash by
-        using rand+argmax for exploration sampling (see routing.py).
+        Defaults to `fullgraph=True` since the 2026-04-25 sparse_lif rewrite
+        eliminated the only blocker (the custom autograd.Function with
+        torch.unique inside). Dynamo specialises on `is_new_window` (Python
+        bool) and produces two compiled variants under the hood, so we don't
+        need to manually split the step.
+
+        `mode="reduce-overhead"` would give CUDA graphs (5–8× win), but the
+        TBPTT loop's many-forward-then-many-backward pattern conflicts with
+        cudagraph buffer reuse — see docs/plan_walker_speedup.md "Phase A.2".
+
+        On Triton 3.6 we still avoid the TritonGPURemoveLayoutConversions
+        randint-in-fusion crash by using rand+argmax for exploration
+        sampling (see routing.py).
         """
         # Let unique/bincount stay in the compiled graph
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
@@ -547,7 +578,7 @@ class GraphWalkerMemory(nn.Module):
             torch._dynamo.config.cache_size_limit, 64,
         )
         self._compiled_step = torch.compile(
-            self._step_core_pure, mode=mode, fullgraph=False,
+            self._step_core_pure, mode=mode, fullgraph=fullgraph,
         )
 
     @torch._dynamo.disable
@@ -576,25 +607,58 @@ class GraphWalkerMemory(nn.Module):
     # -----------------------------------------------------------------
 
     def begin_segment(self, B: int, device: torch.device) -> None:
-        """Reset working memory (per-document). E_bias persists."""
+        """Reset working memory (per-document). E_bias persists.
+
+        Reuse state buffers when the shape and device match — zero them in
+        place instead of reallocating. This keeps tensor pointers stable
+        across training steps, which is required for `compile_block(mode=
+        "reduce-overhead")` (cudagraph capture pins input pointers at
+        capture time).
+        """
         cfg = self.cfg
         dtype_fast = self._fast_dtype(device)
 
-        self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
-        # prev_motor: last step's motor output, chained into next step's
-        # start-col query. Starts at zero each segment.
-        self.prev_motor = torch.zeros(B, cfg.D_s, device=device, dtype=dtype_fast)
-        self.walker_pos = torch.zeros(
-            B, cfg.n_heads, device=device, dtype=torch.long,
+        same_shape = (
+            self._state_initialized
+            and self.s.shape[0] == B
+            and self.s.device == device
         )
-        # Walker's private running state, zero at segment start.
-        self.walker_state = torch.zeros(
-            B, cfg.n_heads, cfg.D_s, device=device, dtype=dtype_fast,
-        )
-        self.surprise_ema = torch.zeros(
-            B, cfg.K_horizons, device=device, dtype=torch.float32,
-        )
-        self.surprise_prev = torch.zeros_like(self.surprise_ema)
+
+        if same_shape:
+            # Zero in-place — keeps pointers stable for cudagraphs.
+            self.s.zero_()
+            self.prev_motor.zero_()
+            self.walker_pos.zero_()
+            self.walker_state.zero_()
+            self.surprise_ema.zero_()
+            self.surprise_prev.zero_()
+            self.co_visit_flat.zero_()
+            self.visit_count.zero_()
+        else:
+            self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
+            self.prev_motor = torch.zeros(B, cfg.D_s, device=device, dtype=dtype_fast)
+            self.walker_pos = torch.zeros(
+                B, cfg.n_heads, device=device, dtype=torch.long,
+            )
+            self.walker_state = torch.zeros(
+                B, cfg.n_heads, cfg.D_s, device=device, dtype=dtype_fast,
+            )
+            self.surprise_ema = torch.zeros(
+                B, cfg.K_horizons, device=device, dtype=torch.float32,
+            )
+            self.surprise_prev = torch.zeros_like(self.surprise_ema)
+            self.co_visit_flat = torch.zeros(
+                cfg.num_edges, device=device, dtype=torch.float32,
+            )
+            self.visit_count = torch.zeros(cfg.N, device=device, dtype=torch.float32)
+            # Per-segment scratch constants — only rebuild when B changes.
+            H = cfg.n_heads
+            self._batch_idx = (
+                torch.arange(B, device=device).repeat_interleave(H)
+            )                                                             # [B*H]
+            self._k_range = torch.arange(cfg.K, device=device)            # [K]
+            self._ones_bh = torch.ones(B * H, device=device, dtype=torch.float32)
+
         self.tick_counter = 0
         self.window_len = 0
 
@@ -606,22 +670,6 @@ class GraphWalkerMemory(nn.Module):
 
         # E_bias_flat is a registered buffer initialized in __init__; it
         # persists across segments by design. No re-init here.
-
-        # Fresh per-segment counters
-        self.co_visit_flat = torch.zeros(
-            cfg.num_edges, device=device, dtype=torch.float32,
-        )
-        self.visit_count = torch.zeros(cfg.N, device=device, dtype=torch.float32)
-
-        # Per-segment scratch constants (recomputed every token in the old
-        # hot path; now built once per segment). BH stays fixed within a
-        # segment, so these are safe to cache.
-        H = cfg.n_heads
-        self._batch_idx = (
-            torch.arange(B, device=device).repeat_interleave(H)
-        )                                                             # [B*H]
-        self._k_range = torch.arange(cfg.K, device=device)            # [K]
-        self._ones_bh = torch.ones(B * H, device=device, dtype=torch.float32)
 
         # Neuromod plastic-window initialization. If we have a snapshot
         # from a prior window (carried across segments), consume it to
@@ -1143,6 +1191,113 @@ class GraphWalkerMemory(nn.Module):
             visit_count_delta=visit_count_delta,
             visit_freq_step=f_mean if cfg.lambda_balance > 0 else None,
             load_balance_loss=load_balance_loss,
+        )
+
+    # -----------------------------------------------------------------
+    # Block-level functional API (compile target for whole-block CUDA graphs)
+    # -----------------------------------------------------------------
+
+    def block_forward(
+        self,
+        s_in: torch.Tensor,                 # [B, N, D_s]
+        walker_pos_in: torch.Tensor,        # [B, H]
+        walker_state_in: torch.Tensor,      # [B, H, D_s]
+        prev_motor_in: torch.Tensor,        # [B, D_s]
+        e_bias_in: torch.Tensor,            # [N*K] fp32
+        tokens_block: torch.Tensor,         # [B, T_block]
+        tau: torch.Tensor,                  # scalar fp32
+        epsilon: torch.Tensor,              # scalar fp32
+        anchor_at_t0: bool,                 # True if t=0 of this block is a new plasticity window
+    ) -> BlockOutput:
+        """Run T_block sequential _step_core_pure calls in one autograd graph.
+
+        Compiling THIS function with torch.compile (instead of compiling
+        per-step) lets inductor fuse across step boundaries and produces
+        ONE forward + ONE backward graph for the whole T_block window.
+        That's the difference between 1.92× (per-step compile) and
+        ~3.7× (whole-block compile) over eager.
+
+        State threads through return values — no self.* mutations during
+        the loop body — so the compiled graph is free of side effects.
+        Caller is responsible for writing the returned state back to
+        self.* (or keeping it as a local var for next block_forward call).
+
+        anchor_at_t0 controls whether step 0 is a window-start anchor pick
+        (True at the start of every plasticity window) or a regular
+        interior step. dynamo specialises the boolean automatically and
+        produces two compiled subgraphs as needed.
+        """
+        cfg = self.cfg
+        B, T_block = tokens_block.shape
+
+        s = s_in
+        walker_pos = walker_pos_in
+        walker_state = walker_state_in
+        prev_motor = prev_motor_in
+
+        motor_list: list[torch.Tensor] = []
+        co_visit_total = torch.zeros(
+            cfg.num_edges, device=s_in.device, dtype=torch.float32,
+        )
+        visit_count_total = torch.zeros(
+            cfg.N, device=s_in.device, dtype=torch.float32,
+        )
+        lb_loss_total = torch.zeros(
+            (), device=s_in.device, dtype=torch.float32,
+        )
+
+        for t in range(T_block):
+            is_new = (t == 0) and anchor_at_t0
+            out = self._step_core_pure(
+                s, walker_pos, walker_state, prev_motor,
+                e_bias_in,
+                tokens_block[:, t], tau, epsilon, is_new,
+            )
+            s = out.s_new
+            walker_pos = out.walker_pos_new
+            walker_state = out.walker_state_new
+            prev_motor = out.prev_motor_new
+            motor_list.append(out.motor_state)
+            co_visit_total = co_visit_total + out.co_visit_delta
+            visit_count_total = visit_count_total + out.visit_count_delta
+            lb_loss_total = lb_loss_total + out.load_balance_loss
+
+        motor_states_bt = torch.stack(motor_list, dim=1)  # [B, T_block, D_s]
+
+        return BlockOutput(
+            s_new=s,
+            walker_pos_new=walker_pos,
+            walker_state_new=walker_state,
+            prev_motor_new=prev_motor,
+            motor_states_bt=motor_states_bt,
+            co_visit_total=co_visit_total,
+            visit_count_total=visit_count_total,
+            load_balance_loss=lb_loss_total,
+        )
+
+    def compile_block(
+        self, mode: str = "default", fullgraph: bool = True,
+    ) -> None:
+        """Compile `block_forward` for whole-block CUDA-graph capture.
+
+        Replaces the per-step `compile_step()` path with a single compiled
+        function that covers an entire mod_period-token block. Inductor
+        unrolls the T_block loop, fuses across step boundaries, and
+        produces one forward + one backward graph — much higher fusion
+        opportunity than per-step. See docs/plan_walker_speedup.md.
+
+        `mode="default"` is the safe choice (~3.7× over eager).
+        `mode="reduce-overhead"` adds CUDA-graph capture (additional ~2×
+        on top) but requires stable input pointers across replays —
+        callers must reuse the same state buffers.
+        """
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64,
+        )
+        self._compiled_block = torch.compile(
+            self.block_forward, mode=mode, fullgraph=fullgraph,
         )
 
     def readout_from_state_block(self, motor_state: torch.Tensor) -> torch.Tensor:

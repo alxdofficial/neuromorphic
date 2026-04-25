@@ -396,6 +396,60 @@ def _pytorch_bwd(
 
 
 # =====================================================================
+# Pure-torch cudagraph-compatible variant
+# =====================================================================
+
+
+def sparse_lif_update_puretorch(
+    s_flat: torch.Tensor,
+    all_msgs: torch.Tensor,
+    all_dests: torch.Tensor,
+    alpha: torch.Tensor,
+    N: int,
+) -> torch.Tensor:
+    """Sparse LIF update built from standard PyTorch ops only.
+
+    Equivalent semantics to `SparseLIFUpdate.apply` but no custom
+    autograd.Function and no `torch.unique` — everything is static-shape
+    so torch.compile + reduce-overhead can capture the whole step into
+    a CUDA graph.
+
+    Trade-off: this path computes the LIF blend densely over all `[B*N, D_s]`
+    rows (then masks untouched rows back to s_old), instead of the Triton
+    path's O(U) sparse update. Fine when launch overhead dominates (most
+    of our hot path); revisit if memory bandwidth becomes the bottleneck.
+    """
+    BN, D_s = s_flat.shape
+    M = all_msgs.shape[0]
+    device = s_flat.device
+
+    # Aggregate messages per destination (handles duplicates via index_add).
+    # Compute everything in fp32 internally so gradient precision matches the
+    # Triton path; cast output back to s_flat.dtype at the end.
+    incoming = torch.zeros(BN, D_s, dtype=torch.float32, device=device)
+    incoming = incoming.index_add(0, all_dests, all_msgs.float())
+
+    # Touched-row mask via index_add of ones.
+    counts = torch.zeros(BN, dtype=torch.float32, device=device)
+    ones_m = torch.ones(M, dtype=torch.float32, device=device)
+    counts = counts.index_add(0, all_dests, ones_m)
+    touched_mask = (counts > 0).float().unsqueeze(-1)                  # [BN, 1]
+
+    # Per-row alpha lookup, kept in fp32. Inductor can constant-fold the
+    # `arange % N` expression when BN, N are static.
+    n_index = torch.arange(BN, device=device) % N
+    alpha_row = alpha[n_index].float().unsqueeze(-1)                   # [BN, 1]
+
+    # LIF blend over all rows in fp32; mask gates touched vs untouched.
+    s_flat_fp = s_flat.float()
+    tanh_inc = torch.tanh(incoming)
+    s_blend = alpha_row * s_flat_fp + (1.0 - alpha_row) * tanh_inc
+    s_new = touched_mask * s_blend + (1.0 - touched_mask) * s_flat_fp
+
+    return s_new.to(s_flat.dtype)
+
+
+# =====================================================================
 # Public convenience wrapper
 # =====================================================================
 
@@ -406,6 +460,24 @@ def sparse_lif_update(
     all_dests: torch.Tensor,
     alpha: torch.Tensor,
     N: int,
+    *,
+    backend: str = "puretorch",
 ) -> torch.Tensor:
-    """Public entry point. See SparseLIFUpdate.forward for semantics."""
-    return SparseLIFUpdate.apply(s_flat, all_msgs, all_dests, alpha, N)
+    """Public entry point. backend in {'puretorch', 'triton'}.
+
+    'puretorch' (default): cudagraph-compatible, dense LIF blend with mask.
+        Inductor can fuse the body into Triton kernels under torch.compile,
+        so we don't lose much speed at the bench scale and we unlock
+        reduce-overhead's CUDA graph capture.
+
+    'triton': original sparse Triton kernel + custom autograd.Function.
+        Lower memory at production scale but cudagraph-incompatible
+        (allocations escape the pool).
+    """
+    if backend == "puretorch":
+        return sparse_lif_update_puretorch(
+            s_flat, all_msgs, all_dests, alpha, N,
+        )
+    if backend == "triton":
+        return SparseLIFUpdate.apply(s_flat, all_msgs, all_dests, alpha, N)
+    raise ValueError(f"unknown backend: {backend!r}")

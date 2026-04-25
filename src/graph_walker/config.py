@@ -129,6 +129,11 @@ class GraphWalkerConfig:
     segment_T: int = 256
     lr: float = 1e-4
     compile_on_train: bool = True
+    # torch.compile mode for compile_block.
+    #   "default":         ~3.7× over eager via inductor fusion (no cudagraphs)
+    #   "reduce-overhead": adds CUDA-graph capture (additional ~2× target)
+    #   "none":            disables compile entirely (dev iteration)
+    compile_mode: str = "default"
 
     # --- Seeds ---
     topology_seed: int = 42
