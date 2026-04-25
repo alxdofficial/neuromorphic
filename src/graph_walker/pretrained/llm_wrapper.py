@@ -166,14 +166,25 @@ class GraphWalkerPretrainedLM(nn.Module):
     # State management (per-segment reset + TBPTT detach)
     # ------------------------------------------------------------------
 
-    def reset_memory(self, bs: int) -> None:
+    def reset_memory(
+        self, bs: int, *, clear_neuromod_carryover: bool = True,
+    ) -> None:
         """Re-init walker working state for a new batch of `bs` segments.
         E_bias persists across calls (it's the long-term plastic state).
+
+        `clear_neuromod_carryover` defaults to True for the pretrained
+        path because batches are typically shuffled independent documents,
+        and carrying the previous batch's last-window snapshot into the
+        new batch's first neuromod target would inject cross-document
+        noise into credit assignment. Set to False explicitly when
+        batches are contiguous chunks of the same document.
         """
         if self.memory is None:
             return
         device = next(self.llama.parameters()).device
-        self.memory.begin_segment(bs, device)
+        self.memory.begin_segment(
+            bs, device, clear_neuromod_carryover=clear_neuromod_carryover,
+        )
 
     def detach_memory(self) -> None:
         if self.memory is not None:
@@ -301,6 +312,12 @@ class GraphWalkerPretrainedLM(nn.Module):
                     or f".layers.{self.config.inject_layer}.scale" in name
                 )
                 p.requires_grad = is_mem_inject
+        # Re-freeze walker params that are standalone-only and never see
+        # gradient through `forward_segment` — without this, every cycle's
+        # `unfreeze_all()` puts dead weights back into the optimizer.
+        if self.memory is not None:
+            for p_name in ("token_to_state", "input_v_proj"):
+                getattr(self.memory, p_name).weight.requires_grad = False
 
     def freeze_all_but_E_bias_and_neuromod(self) -> None:
         """Phase-2 minimal policy surface: only neuromod + E_bias evolve.

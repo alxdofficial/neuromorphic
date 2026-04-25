@@ -595,10 +595,30 @@ class GraphWalkerMemory(nn.Module):
     # State management
     # -----------------------------------------------------------------
 
-    def begin_segment(self, B: int, device: torch.device) -> None:
-        """Reset working memory (per-document). E_bias persists."""
+    def begin_segment(
+        self, B: int, device: torch.device,
+        *, clear_neuromod_carryover: bool = False,
+    ) -> None:
+        """Reset working memory for a new segment.
+
+        Args:
+            B: batch size for the new segment.
+            device: target device.
+            clear_neuromod_carryover: if True, also clear `_prev_snapshot_*`
+                and `_active_delta_nm`. Use this for INDEPENDENT-document
+                batches (e.g. shuffled pretrained training) — without
+                clearing, the previous batch's last-window snapshot
+                bleeds into the new batch's first window's neuromod
+                target, polluting credit assignment across documents.
+                Default False preserves the streaming-document semantics
+                of the standalone training loop.
+        """
         cfg = self.cfg
         dtype_fast = self._fast_dtype(device)
+        if clear_neuromod_carryover:
+            self._prev_snapshot_ids = None
+            self._prev_snapshot_feats = None
+            self._active_delta_nm = None
 
         self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
         # prev_motor: last step's motor output, chained into next step's
@@ -1053,23 +1073,32 @@ class GraphWalkerMemory(nn.Module):
             k_idx = torch.arange(1, K_h + 1, device=device)
             t_idx = block_start + i_idx.unsqueeze(1) + k_idx.unsqueeze(0)  # [ticks, K_h]
             valid_tk = t_idx < T
-            t_idx_clamped = t_idx.clamp(max=T - 1)
-            targets = input_ids.index_select(
-                1, t_idx_clamped.reshape(-1),
-            ).reshape(B, ticks, K_h)
-            valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
+            block_has_targets = bool(valid_tk.any().item())
+            # Targetless block (typical: T=1 generation step inside an
+            # autoregressive rollout, where there are no upcoming tokens
+            # in the segment to predict). Skip the dense vocab readout
+            # AND the surprise / plasticity finalize. Otherwise we'd
+            # both waste a [B, T, K_h, V] CE compute on an all-False
+            # mask, and pollute E_bias by firing plasticity off
+            # accumulated co-visit with stale (or zero) surprise EMA.
+            if block_has_targets:
+                t_idx_clamped = t_idx.clamp(max=T - 1)
+                targets = input_ids.index_select(
+                    1, t_idx_clamped.reshape(-1),
+                ).reshape(B, ticks, K_h)
+                valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
 
-            with torch.autocast(device_type=device.type, enabled=False):
-                ce_masked = self.readout_ce_block(
-                    motor_bt, targets, valid_btk,
-                )                                                  # [B, ticks, K_h]
-            if compute_aux_loss:
-                walker_ce_sum = walker_ce_sum + ce_masked.sum(dim=(0, 1))
-                walker_ce_count = (
-                    walker_ce_count + valid_tk.float().sum(dim=0) * B
-                )
-            self.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
-            self._maybe_finalize_surprise_and_plasticity()
+                with torch.autocast(device_type=device.type, enabled=False):
+                    ce_masked = self.readout_ce_block(
+                        motor_bt, targets, valid_btk,
+                    )                                              # [B, ticks, K_h]
+                if compute_aux_loss:
+                    walker_ce_sum = walker_ce_sum + ce_masked.sum(dim=(0, 1))
+                    walker_ce_count = (
+                        walker_ce_count + valid_tk.float().sum(dim=0) * B
+                    )
+                self.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
+                self._maybe_finalize_surprise_and_plasticity()
 
             # --- Llama-side aux CE (horizon-1 against adapter.mem_head_logits).
             if compute_aux_loss and adapter is not None:

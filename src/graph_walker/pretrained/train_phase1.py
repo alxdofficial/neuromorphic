@@ -27,8 +27,22 @@ from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
 
 @dataclass
 class Phase1Batch:
+    """Phase-1 training batch.
+
+    Convention (teacher-forced, NOT pre-shifted):
+        input_ids[:, t]   — token fed to the LM at position t.
+        target_ids[:, t]  — token at position t (same length as input_ids).
+        The trainer internally shifts: logits[:, t] is CE'd against
+        target_ids[:, t+1], so the last position of each row is
+        unsupervised. If your dataloader yields already-shifted targets,
+        DO NOT pass them as `target_ids` — pass them as `input_ids` of
+        length T+1 instead, or shift them back.
+
+    For the standard "predict next token from input" case, set
+    `target_ids = input_ids` (the trainer does the shift internally).
+    """
     input_ids: torch.Tensor        # [BS, T]
-    target_ids: torch.Tensor       # [BS, T]
+    target_ids: torch.Tensor       # [BS, T] — NOT pre-shifted
     prev_token: torch.Tensor | None = None    # reserved (not currently used)
 
 
@@ -63,6 +77,12 @@ def phase1_pretrained_step(
     target_ids = batch.target_ids.to(device)
 
     BS, T = input_ids.shape
+    if target_ids.shape != (BS, T):
+        raise ValueError(
+            f"target_ids shape {tuple(target_ids.shape)} must match input_ids "
+            f"shape {(BS, T)}. The trainer internally shifts target_ids[:, 1:] "
+            "vs logits[:, :-1] — DO NOT pre-shift. See Phase1Batch docstring."
+        )
     wrapper.reset_memory(bs=BS)
     opt.zero_grad(set_to_none=True)
 

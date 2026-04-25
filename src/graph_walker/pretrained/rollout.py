@@ -108,11 +108,13 @@ def autoregressive_rollout(
     device = next(wrapper.parameters()).device
     prefix_ids = prefix_ids.to(device)
     BS, T_pre = prefix_ids.shape
-    # `wrapper.forward()` now propagates wrapper.current_phase →
-    # memory.phase before the closure runs, so we only need to manage
-    # the wrapper-level field. Restore on exit so phase-2 GRPO doesn't
-    # leak its mode into a follow-up phase-1 step.
+    # `wrapper.forward()` propagates wrapper.current_phase → memory.phase
+    # before the closure runs. We also save/restore `wrapper.training`:
+    # the generation loop sets train(False) which would otherwise leak
+    # into the next phase-1 cycle (compute_aux gates on `self.training`,
+    # so a leaked False would silently skip aux loss).
     saved_phase = wrapper.current_phase
+    saved_training = wrapper.training
     wrapper.current_phase = phase
 
     try:
@@ -154,3 +156,10 @@ def autoregressive_rollout(
         )
     finally:
         wrapper.current_phase = saved_phase
+        wrapper.train(saved_training)
+        # memory.phase was last set by wrapper.forward() during the
+        # generation loop. Sync it back so a follow-up direct memory
+        # call (without going through wrapper.forward) doesn't see a
+        # leaked phase-2 setting.
+        if wrapper.memory is not None:
+            wrapper.memory.phase = saved_phase

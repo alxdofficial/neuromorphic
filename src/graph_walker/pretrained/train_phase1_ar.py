@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.rollout import _freeze_plasticity_ctx
 
 
 @dataclass
@@ -102,33 +103,34 @@ def phase1_ar_pretrained_step(
         # last position.
         prev_logits = prefix_out.logits[:, -1, :]                  # [BS, vocab]
 
-        # 2. Continuation unroll. Note: do NOT call wrapper.forward_segment
-        # via the closure for T=1 — the walker's plasticity timing assumes
-        # a contiguous segment_T. Instead, skip the closure during gen by
-        # setting memory_fn=None on the inject layer, OR use the closure
-        # but pass T=1 segments. We use the closure path: the walker's
-        # `forward_segment` correctly handles T=1 — surprise fold is a
-        # no-op (no upcoming targets), aux loss is None, plasticity only
-        # fires when window_len reaches mod_period (which it won't from
-        # T=1 unless several T=1 steps accumulate inside one window).
-        for i in range(T_cont):
-            # CE for step i: prev_logits should predict continuation_ids[:, i].
-            ce_i = F.cross_entropy(
-                prev_logits.float(), continuation_ids[:, i],
-            )
-            losses.append(ce_i)
+        # 2. Continuation unroll. The continuation forwards are T=1
+        # "policy reads", not training tokens — they have no upcoming
+        # targets within the segment, so any plasticity firing during
+        # them would be driven by stale surprise + the generation walks'
+        # co-visit footprint. Freeze plasticity here (mirroring what
+        # phase-2 generation does in autoregressive_rollout). The walker
+        # state itself stays graph-connected via preserve_memory_graph,
+        # so gradient from the per-step CE still reaches the prefix's
+        # plastic / neuromod fires.
+        with _freeze_plasticity_ctx(wrapper.memory):
+            for i in range(T_cont):
+                # CE for step i: prev_logits should predict continuation_ids[:, i].
+                ce_i = F.cross_entropy(
+                    prev_logits.float(), continuation_ids[:, i],
+                )
+                losses.append(ce_i)
 
-            if i + 1 == T_cont:
-                # Last step: no need for another forward.
-                break
+                if i + 1 == T_cont:
+                    # Last step: no need for another forward.
+                    break
 
-            # Feed ground-truth token i forward to produce logits for token i+1.
-            tok = continuation_ids[:, i:i+1]                       # [BS, 1]
-            out = wrapper(
-                tok, past_key_values=past_key_values, use_cache=True,
-            )
-            past_key_values = out.past_key_values
-            prev_logits = out.logits[:, -1, :]
+                # Feed ground-truth token i forward to produce logits for token i+1.
+                tok = continuation_ids[:, i:i+1]                   # [BS, 1]
+                out = wrapper(
+                    tok, past_key_values=past_key_values, use_cache=True,
+                )
+                past_key_values = out.past_key_values
+                prev_logits = out.logits[:, -1, :]
 
     loss = torch.stack(losses).mean()
     loss.backward()
