@@ -960,9 +960,11 @@ class GraphWalkerMemory(nn.Module):
         (`forward_segment`) where h_mem_t = W_in(llama_hidden_state_t)
         arrives already in graph-state dim.
 
-        Does not use the compiled path — compile target is the token_id
-        variant; the pretrained forward lives outside the walker hot path
-        anyway (Llama's N-1 frozen layers dominate wall time).
+        Routes through `_compiled_step` if `compile_step()` has been
+        called — fuses the per-step kernels just like the token-id path.
+        torch.compile recompiles for the new (h_input_override=Tensor)
+        input shape on first call, then reuses that graph for the rest
+        of the segment.
         """
         self._ensure_block_caches(self.tied_token_emb.weight)
         # Dummy token_id argument (ignored when h_input_override is passed).
@@ -974,7 +976,9 @@ class GraphWalkerMemory(nn.Module):
         tau, epsilon = self._schedule_tensors(dummy_tok)
         is_new_window = self.window_len == 0
         e_bias_active = self._active_e_bias()
-        out = self._step_core_pure(
+        step_fn = self._compiled_step if self._compiled_step is not None \
+                  else self._step_core_pure
+        out = step_fn(
             self.s, self.walker_pos, self.walker_state,
             self.prev_motor, e_bias_active,
             dummy_tok, tau, epsilon, is_new_window,

@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--iter", type=int, default=10)
     ap.add_argument("--inject-layer", type=int, default=8)
+    ap.add_argument("--compile", action="store_true",
+                    help="Run wrapper.memory.compile_step() before benchmark — "
+                         "fuses the per-step walker kernels via torch.compile.")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -169,6 +172,9 @@ def main():
     print(f"  walker (trainable):        {walker_only_params/1e6:.1f}M")
     print(f"  inject (W_in/W_out/scale): {inject_params/1e6:.1f}M")
     print(f"  total trainable:           {walker_params/1e6:.1f}M")
+    if args.compile:
+        print(f"  Compiling walker step ...")
+        wrapper.memory.compile_step()
     print()
 
     def gw_fwd():
