@@ -47,7 +47,7 @@ from src.graph_walker.neuromod import (
 from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
 from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
 from src.graph_walker.topology import build_topology
-from src.graph_walker.triton_sparse_update import sparse_lif_update
+from src.graph_walker.triton.lif import sparse_lif_update
 
 
 def _rmsnorm(dim: int) -> nn.Module:
