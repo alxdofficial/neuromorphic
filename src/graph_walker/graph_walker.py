@@ -348,6 +348,10 @@ class WalkerCorePureOutput:
     visit_count_delta: torch.Tensor       # [N] fp32 — add to self.visit_count
     visit_freq_step: torch.Tensor | None  # [N] fractional visits (optional)
     load_balance_loss: torch.Tensor       # scalar — aux loss term
+    log_pi_step: torch.Tensor | None      # [B] phase-2 log π over routing
+                                          # decisions made this step (anchor +
+                                          # per-token), summed over walker heads.
+                                          # None outside phase 2.
 
 
 class GraphWalkerMemory(nn.Module):
@@ -876,6 +880,15 @@ class GraphWalkerMemory(nn.Module):
                 self.visit_count = self.visit_count + out.visit_count_delta
         self.window_len += 1
         self.tick_counter += 1
+        # Phase-2 log_pi accumulation: kept outside the pure step so a
+        # compiled or checkpointed _step_core_pure stays side-effect-free.
+        # Gradient must remain connected (no detach), so the addition runs
+        # outside the no_grad block above.
+        if out.log_pi_step is not None:
+            self._log_pi_sum = (
+                out.log_pi_step if self._log_pi_sum is None
+                else self._log_pi_sum + out.log_pi_step
+            )
 
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
         """Public single-token API: graph core + immediate readout.
@@ -1184,12 +1197,13 @@ class GraphWalkerMemory(nn.Module):
                 phase=self.phase,
             )
             if rout_in.log_pi is not None:
-                # Sum per-batch-element by reducing the H walker dim.
-                lp_in = rout_in.log_pi.view(B, cfg_n_heads).sum(dim=1)  # [B]
-                self._log_pi_sum = (
-                    lp_in if self._log_pi_sum is None
-                    else self._log_pi_sum + lp_in
-                )
+                # Sum per-batch-element by reducing the H walker dim. Returned
+                # via WalkerCorePureOutput.log_pi_step so the side effect lives
+                # in `_apply_step_state`, keeping `_step_core_pure` truly pure
+                # (compatible with torch.compile and checkpoint recompute).
+                log_pi_step = rout_in.log_pi.view(B, cfg_n_heads).sum(dim=1)  # [B]
+            else:
+                log_pi_step = None
             start_local = rout_in.selected_idx.view(B, cfg_n_heads)
             start_cols = self.input_positions[start_local]            # [B, H]
             cur_bh = start_cols.reshape(BH)                           # teleport
@@ -1220,6 +1234,7 @@ class GraphWalkerMemory(nn.Module):
             start_cols = None
             inject_msg = None
             P_mass = torch.zeros(cfg.N, device=device, dtype=lb_dtype)
+            log_pi_step = None
 
         # 3. Walker message from OLD column state + walker state + token.
         cur = cur_bh.view(B, cfg_n_heads)
@@ -1300,9 +1315,7 @@ class GraphWalkerMemory(nn.Module):
         )
         if rout.log_pi is not None:
             lp = rout.log_pi.view(B, cfg_n_heads).sum(dim=1)            # [B]
-            self._log_pi_sum = (
-                lp if self._log_pi_sum is None else self._log_pi_sum + lp
-            )
+            log_pi_step = lp if log_pi_step is None else log_pi_step + lp
         next_local = rout.selected_idx                                # [B*H]
         next_col = torch.gather(
             nbrs_of_cur, 1, next_local.unsqueeze(-1),
@@ -1386,6 +1399,7 @@ class GraphWalkerMemory(nn.Module):
             visit_count_delta=visit_count_delta,
             visit_freq_step=f_mean if cfg.lambda_balance > 0 else None,
             load_balance_loss=load_balance_loss,
+            log_pi_step=log_pi_step,
         )
 
     def readout_from_state_block(self, motor_state: torch.Tensor) -> torch.Tensor:

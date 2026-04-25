@@ -62,6 +62,11 @@ class GraphWalkerPretrainedLM(nn.Module):
 
         # Phase indicator. "phase1" = Gumbel-soft STE in routing; "phase2" =
         # hard Categorical + log_pi accumulation (flip before grpo_step).
+        # The wrapper-level setting is propagated to `self.memory.phase`
+        # at the start of every `forward()` call (which is what routing
+        # actually reads), so wrapper.current_phase is the canonical
+        # control surface — callers should never set memory.phase
+        # directly when going through the wrapper.
         self.current_phase: str = "phase1"
         # When True, `forward_segment` keeps memory state graph-connected
         # across forwards (no intra-segment detach, no end-of-forward
@@ -206,6 +211,13 @@ class GraphWalkerPretrainedLM(nn.Module):
         """
         if self.memory is None:
             return self.llama(input_ids=input_ids, **kwargs)
+
+        # Propagate the wrapper-level phase indicator into the memory module
+        # — routing inside `_step_core_pure` reads `memory.phase` only, so
+        # without this propagation `wrapper.current_phase` would be dead
+        # state and a caller setting `wrapper.current_phase = "phase2"`
+        # would silently still get phase-1 Gumbel-STE routing.
+        self.memory.phase = self.current_phase
 
         override = self._compute_aux_loss_override
         compute_aux = self.training if override is None else bool(override)

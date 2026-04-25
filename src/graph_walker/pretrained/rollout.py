@@ -108,10 +108,12 @@ def autoregressive_rollout(
     device = next(wrapper.parameters()).device
     prefix_ids = prefix_ids.to(device)
     BS, T_pre = prefix_ids.shape
+    # `wrapper.forward()` now propagates wrapper.current_phase →
+    # memory.phase before the closure runs, so we only need to manage
+    # the wrapper-level field. Restore on exit so phase-2 GRPO doesn't
+    # leak its mode into a follow-up phase-1 step.
     saved_phase = wrapper.current_phase
-    saved_memory_phase = wrapper.memory.phase
     wrapper.current_phase = phase
-    wrapper.memory.phase = phase
 
     try:
         wrapper.reset_memory(bs=BS)
@@ -152,4 +154,3 @@ def autoregressive_rollout(
         )
     finally:
         wrapper.current_phase = saved_phase
-        wrapper.memory.phase = saved_memory_phase

@@ -77,6 +77,11 @@ def phase1_ar_pretrained_step(
     continuation_ids = batch.continuation_ids.to(device)
     BS, T_pre = prefix_ids.shape
     _, T_cont = continuation_ids.shape
+    if T_cont < 1:
+        raise ValueError(
+            f"continuation_ids must have at least one token; got T_cont={T_cont}. "
+            "AR unroll has nothing to predict."
+        )
 
     wrapper.reset_memory(bs=BS)
     opt.zero_grad(set_to_none=True)
