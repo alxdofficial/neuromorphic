@@ -230,27 +230,18 @@ class CapturedBlockTrainer:
             if memory.visit_count is not None:
                 memory.visit_count.add_(out.visit_count_total)
 
-            # Surprise EMA streaming — vectorized closed form replaces the
-            # per-token Python loop. For α_s = cfg.alpha_gamma_s, the
-            # invariant for masked recurrence
-            #     ema_t = (1-α)·ema_{t-1} + α·ce_t   if valid_t
-            #           = ema_{t-1}                  otherwise
-            # collapses to a single weighted average over valid positions in
-            # the limit of small α; here we approximate by averaging over
-            # valid positions and EMA-blending once per block. Same long-run
-            # behavior, no T_block kernel launches.
+            # Surprise EMA streaming — Python for-loop unrolled into the
+            # captured graph (T_block small ops, all small-shape; replay is
+            # fast). Mirrors `accumulate_block_ce` on the eager path
+            # exactly: per-token masked EMA with α = cfg.alpha_gamma_s.
             alpha_s = cfg.alpha_gamma_s
-            valid_count_btk = self.valid_btk_buf.to(torch.float32).sum(dim=1).clamp(min=1)
-            block_mean_ce = (
-                ce_masked_det * self.valid_btk_buf.to(torch.float32)
-            ).sum(dim=1) / valid_count_btk                              # [B, K_h]
-            block_has_any = (
-                self.valid_btk_buf.to(torch.float32).sum(dim=1) > 0
-            ).to(torch.float32)                                         # [B, K_h]
-            ema_old = memory.surprise_ema.to(torch.float32)
-            ema_candidate = (1.0 - alpha_s) * ema_old + alpha_s * block_mean_ce
-            ema_new = block_has_any * ema_candidate + (1.0 - block_has_any) * ema_old
-            memory.surprise_ema.copy_(ema_new)
+            ema = memory.surprise_ema.to(torch.float32)
+            valid_btk_f = self.valid_btk_buf.to(torch.float32)
+            for t in range(self.T_block):
+                valid_t = valid_btk_f[:, t, :]                          # [B, K_h]
+                candidate = (1.0 - alpha_s) * ema + alpha_s * ce_masked_det[:, t, :]
+                ema = valid_t * candidate + (1.0 - valid_t) * ema
+            memory.surprise_ema.copy_(ema)
 
             # Hebbian plasticity update on E_bias_flat (no neuromod path).
             # Window len equals T_block here (one full window per block).
