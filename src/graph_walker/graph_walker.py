@@ -1167,10 +1167,15 @@ class GraphWalkerMemory(nn.Module):
             + (1.0 - alpha_w_view) * m_out_view
         )
 
-        # 10. co_visit delta (non-grad)
-        co_visit_delta = torch.bincount(
-            edge_taken_flat, minlength=cfg.num_edges,
-        ).to(torch.float32)
+        # 10. co_visit delta (non-grad). index_add (not bincount) so the op
+        # is cudagraph-capture-safe — bincount internally probes for the max
+        # input value, which forbids stream capture.
+        co_visit_delta = torch.zeros(
+            cfg.num_edges, device=device, dtype=torch.float32,
+        )
+        co_visit_delta.index_add_(
+            0, edge_taken_flat, torch.ones_like(edge_taken_flat, dtype=torch.float32),
+        )
 
         # On window-start steps both anchor and walker softmaxes contribute
         # mass (2·BH decisions). On interior steps only walker routing

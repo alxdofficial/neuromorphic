@@ -10,6 +10,12 @@ recurrence), but Python only invokes the block once per mod_period tokens
 instead of once per token. The expensive model-space readout stays off
 that hot path: motor_state is buffered over the block, then one batched
 lexical forward pass produces the multi-horizon CE.
+
+Two entry points:
+    - ``phase1_step``           — eager / torch.compile path (default)
+    - ``phase1_step_cudagraph`` — manual CUDA-graph capture path that
+      replays the whole iteration body. Requires ``use_neuromod=False``
+      and a ``CapturedBlockTrainer`` (held by the LM after the first call).
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from dataclasses import dataclass
 import torch
 
 from src.graph_walker.standalone import StandaloneLM
+from src.graph_walker.triton.cudagraph_trainer import CapturedBlockTrainer
 
 
 @dataclass
@@ -237,6 +244,181 @@ def phase1_step(
         loss=ce_loss + load_balance_loss,
         ce_loss=ce_loss,
         load_balance_loss=total_balance / max(n_blocks, 1),
+        per_horizon_loss=per_horizon_mean.cpu().tolist(),
+        grad_norm=grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+        visit_entropy=visit_entropy_frac,
+    )
+
+
+def phase1_step_cudagraph(
+    lm: StandaloneLM,
+    opt: torch.optim.Optimizer,
+    tokens: torch.Tensor,             # [B, T_seq]
+    *,
+    tbptt_block: int | None = None,
+    grad_clip: float = 1.0,
+    training_step: int = 0,
+) -> StepStats:
+    """Manual CUDA-graph capture path for phase-1 training.
+
+    First call: builds + warms up + captures the per-block iteration body
+    via :class:`CapturedBlockTrainer` and stashes it on the LM.
+    Subsequent calls: pure replay — no Python-side dispatch in the hot loop.
+
+    Constraints:
+        - ``use_neuromod=False`` (captured graph reads ``E_bias_flat.detach()``;
+          the live neuromod delta would be a fresh tensor each window and
+          break buffer stability).
+        - ``tbptt_block == mod_period`` (same as the eager path — every block
+          IS one plasticity window).
+        - ``segment_T % tbptt_block == 0`` (no fractional final block).
+    """
+    cfg = lm.cfg
+    if cfg.use_neuromod:
+        raise NotImplementedError(
+            "phase1_step_cudagraph requires use_neuromod=False; "
+            "see CapturedBlockTrainer docstring."
+        )
+
+    B, T_seq = tokens.shape
+    device = tokens.device
+    tbptt = tbptt_block if tbptt_block is not None else cfg.tbptt_block
+    if tbptt != cfg.mod_period:
+        raise ValueError(
+            f"tbptt_block ({tbptt}) must equal mod_period ({cfg.mod_period})."
+        )
+    if T_seq % cfg.mod_period != 0:
+        raise ValueError(
+            f"tokens shape[1] = {T_seq} must be a multiple of mod_period."
+        )
+    K_h = cfg.K_horizons
+
+    # Lazy build of the captured trainer.
+    trainer: CapturedBlockTrainer | None = getattr(lm.memory, "_captured_trainer", None)
+    if trainer is None or trainer.B != B or trainer.T_block != tbptt:
+        # Reset / re-allocate state buffers.
+        lm.memory.begin_segment(B, device)
+
+        trainer = CapturedBlockTrainer(
+            lm, B=B, T_block=tbptt, K_h=K_h,
+            lambda_balance=cfg.lambda_balance,
+        )
+        # Populate input buffers with representative values so warmup runs
+        # against real-shaped tensors. (Replay overrides per call.)
+        with torch.no_grad():
+            trainer.tokens_buf.copy_(tokens[:, :tbptt])
+            trainer.tau_buf.fill_(cfg.gumbel_tau_start)
+            trainer.eps_buf.fill_(cfg.epsilon_start)
+            trainer.horizon_weights_buf[0] = 1.0
+            trainer.horizon_weights_buf[1:].fill_(0.2)
+            trainer.valid_btk_buf.fill_(True)
+            trainer.valid_tk_buf.fill_(True)
+            trainer.targets_buf.copy_(
+                tokens[:, :tbptt].unsqueeze(-1).expand(-1, -1, K_h)
+                .clamp(max=cfg.vocab_size - 1)
+            )
+
+        # All warmup + capture happens on a single side stream inside the
+        # trainer to avoid AccumulateGrad cross-stream conflicts. Param.grad
+        # buffers are first allocated by the trainer's first warmup
+        # backward, on that same stream — clean autograd state.
+        trainer.warmup_and_capture(n_warmup=3)
+        lm.memory._captured_trainer = trainer
+
+        # State for this segment is intact (begin_segment + 3 warmup +
+        # 1 capture iter ran a few steps but state is bf16 buffers we
+        # reset below).
+        lm.memory.begin_segment(B, device)
+
+    lm.set_training_step(training_step)
+    lm.memory.begin_segment(B, device)
+
+    # Schedule constants for this step.
+    from src.graph_walker.routing import gumbel_schedule
+    tau = torch.tensor(
+        gumbel_schedule(
+            training_step, cfg.gumbel_tau_start, cfg.gumbel_tau_end,
+            cfg.gumbel_anneal_steps,
+        ),
+        device=device, dtype=torch.float32,
+    )
+    epsilon = torch.tensor(
+        gumbel_schedule(
+            training_step, cfg.epsilon_start, cfg.epsilon_end,
+            cfg.epsilon_anneal_steps,
+        ),
+        device=device, dtype=torch.float32,
+    )
+
+    horizon_weights = torch.full((K_h,), 0.2, device=device, dtype=torch.float32)
+    horizon_weights[0] = 1.0
+
+    # Cross-block stat accumulators (GPU-resident; one .item() at end).
+    total_balance_tensor = torch.zeros((), device=device, dtype=torch.float32)
+    per_horizon_accum = torch.zeros(K_h, device=device, dtype=torch.float32)
+    per_horizon_counts = torch.zeros(K_h, device=device, dtype=torch.float32)
+    n_blocks = 0
+    n_blocks_total = T_seq // tbptt
+
+    # Pre-build per-block targets + validity masks for the entire segment.
+    # block_start_t is deterministic (blk * tbptt), so this is just a
+    # gather pattern that doesn't depend on inputs.
+    i_idx = torch.arange(tbptt, device=device)
+    k_idx = torch.arange(1, K_h + 1, device=device)
+
+    opt.zero_grad(set_to_none=False)
+
+    for blk in range(n_blocks_total):
+        block_start_t = blk * tbptt
+        tokens_block = tokens[:, block_start_t:block_start_t + tbptt]
+
+        t_idx = block_start_t + i_idx.unsqueeze(1) + k_idx.unsqueeze(0)
+        valid_tk = t_idx < T_seq                                    # [tbptt, K_h]
+        t_idx_clamped = t_idx.clamp(max=T_seq - 1)
+        targets = tokens.index_select(1, t_idx_clamped.reshape(-1)).reshape(
+            B, tbptt, K_h,
+        )
+        valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
+
+        stats = trainer.replay(
+            tokens_block, tau, epsilon,
+            targets, valid_btk, valid_tk, horizon_weights,
+        )
+
+        lm.memory.window_len = tbptt
+        lm.memory.tick_counter += tbptt
+
+        # Cross-block accumulators (no .item() — keeps the loop GPU-resident).
+        total_balance_tensor.add_(stats.balance_loss)
+        per_horizon_accum.add_(stats.block_horizon_sum)
+        per_horizon_counts.add_(stats.block_horizon_count)
+        n_blocks += 1
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(lm.parameters(), grad_clip)
+    opt.step()
+    total_balance = total_balance_tensor.item()
+
+    # Visit entropy.
+    if lm.memory.visit_count is not None:
+        vc = lm.memory.visit_count.float()
+        p = (vc / vc.sum().clamp(min=1)).clamp(min=1e-12)
+        entropy = -(p * p.log()).sum().item()
+        entropy_uniform = torch.log(torch.tensor(float(cfg.N))).item()
+        visit_entropy_frac = entropy / entropy_uniform
+    else:
+        visit_entropy_frac = 1.0
+
+    has_total_counts = per_horizon_counts > 0
+    per_horizon_mean = per_horizon_accum / per_horizon_counts.clamp(min=1)
+    ce_loss = (
+        per_horizon_mean * horizon_weights * has_total_counts.float()
+    ).sum().item() / horizon_weights[has_total_counts].sum().clamp(min=1).item()
+    load_balance_loss = total_balance / max(n_blocks, 1)
+
+    return StepStats(
+        loss=ce_loss + load_balance_loss,
+        ce_loss=ce_loss,
+        load_balance_loss=load_balance_loss,
         per_horizon_loss=per_horizon_mean.cpu().tolist(),
         grad_norm=grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
         visit_entropy=visit_entropy_frac,

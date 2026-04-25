@@ -80,7 +80,7 @@ def main() -> None:
     configs = [
         ("eager",                              None),
         ("whole-block compile (default)",      "block"),
-        ("whole-block (max-autotune)",         "block-max-autotune"),
+        ("whole-block (reduce-overhead)",      "block-reduce-overhead"),
     ]
 
     print(f"\n=== phase1_step bench (B={B}, T={128}, mod_period=64) ===\n")
