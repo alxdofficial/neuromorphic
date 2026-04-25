@@ -2,13 +2,18 @@
 
 **Branch:** `graph-walker`
 **Status:** live code reference for the current branch
-**Last updated:** 2026-04-24
+**Last updated:** 2026-04-25
 
 This document describes the code that exists now. It reflects the
 post-session state after: write-first-then-route walkers, per-window
 anchoring, target-predicting neuromod, surprise fold into the flush,
-and factorized per-horizon CE. The earlier `column_graph` and the
-earlier graph-walker draft (`H×L` relaunching) are obsolete.
+factorized per-horizon CE, **manual CUDA-graph capture training path**
+(13.5–14× over eager — see "Throughput" below), and a debugging-pass
+sweep that fixed the snapshot/normalization/CPU-fallback/topology/
+telemetry issues listed in "Bug-fix log" at the bottom.
+
+The earlier `column_graph` and the earlier graph-walker draft (`H×L`
+relaunching) are obsolete.
 
 ## Thesis
 
@@ -33,16 +38,19 @@ Execution-model choices that follow from the thesis:
 
 ## Current Code Layout
 
-- [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py) — hyperparams + post-init validation
+- [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py) — hyperparams + post-init validation (now also rejects K too large for Moore-radius-2 candidate counts)
 - [src/graph_walker/topology.py](/home/alex/code/neuromorphic/src/graph_walker/topology.py) — fixed Watts-Strogatz graph builder
 - [src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py) — Gumbel top-1 softmax with ε-exploration and STE
 - [src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py) — `PostModelStack`, `PredictionHead`, `MultiHorizonReadout` (with factorized CE)
-- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py) — `GraphWalkerMemory`, `ColumnCompute`, `_step_core_pure`
+- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py) — `GraphWalkerMemory`, `ColumnCompute`, `_step_core_pure`, `block_forward`
 - [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py) — `NeuromodGraphTransformer` (target-predicting head) + subgraph helpers
-- [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py) — TBPTT flush, factorized CE, surprise streaming, plasticity trigger
+- [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py) — both `phase1_step` (eager, supports neuromod) and `phase1_step_cudagraph` (captured, ~14× faster, `use_neuromod=False` only)
 - [src/graph_walker/standalone.py](/home/alex/code/neuromorphic/src/graph_walker/standalone.py) — thin wrapper: token embedding + `GraphWalkerMemory` + tied unembed
-- [src/graph_walker/triton_sparse_update.py](/home/alex/code/neuromorphic/src/graph_walker/triton_sparse_update.py) — `SparseLIFUpdate` autograd Function (Triton forward + backward) used for the sparse column-state update
-- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py), [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py), [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py)
+- [src/graph_walker/triton_sparse_update.py](/home/alex/code/neuromorphic/src/graph_walker/triton_sparse_update.py) — legacy `SparseLIFUpdate` autograd Function (kept for back-compat tests; new code routes through `triton/lif.py`)
+- [src/graph_walker/triton/](/home/alex/code/neuromorphic/src/graph_walker/triton/) — Triton package introduced by the rewrite (see `docs/triton_rewrite_plan.md`):
+    - `lif.py` — `LIFDepositFunction` (cudagraph-friendly Triton sparse LIF with static-shape `_lif_preprocess`, no `torch.unique`); `sparse_lif_update_puretorch` reference + cudagraph-safe default backend
+    - `cudagraph_trainer.py` — `CapturedBlockTrainer` that wraps one block iteration (forward + CE + backward + state writeback + surprise EMA + Hebbian) into a single `torch.cuda.CUDAGraph` for replay
+- [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py), [tests/test_neuromod.py](/home/alex/code/neuromorphic/tests/test_neuromod.py), [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py), [tests/test_sparse_lif_puretorch_parity.py](/home/alex/code/neuromorphic/tests/test_sparse_lif_puretorch_parity.py), [tests/test_triton_lif_v2.py](/home/alex/code/neuromorphic/tests/test_triton_lif_v2.py), [tests/test_cudagraph_trainer.py](/home/alex/code/neuromorphic/tests/test_cudagraph_trainer.py), [tests/test_debugging_pass_fixes.py](/home/alex/code/neuromorphic/tests/test_debugging_pass_fixes.py)
 
 ## Current Default Shape
 
@@ -323,13 +331,52 @@ used by `phase1_step`; surprise on this path is populated from whatever
 was last streamed by training (so plasticity on the `step()` path uses
 a potentially stale `surprise_ema` — fine for interactive smoke tests).
 
+### `block_forward(s, walker_pos, walker_state, prev_motor, e_bias, tokens_block, tau, eps, anchor_at_t0)`
+
+Block-level functional API: runs `T_block` sequential `_step_core_pure`
+calls in one autograd graph, returning a `BlockOutput` dataclass with
+the new state, motor states stacked over the block, and per-block
+non-grad accumulators. This is the unit `torch.compile` and the
+cudagraph capture wrap.
+
 ### `readout_ce_block(motor_state, targets, valid)`
 
 Factorised CE entry point used by `phase1_step.flush`. Returns `[B, T,
 K_h]` float32 per-position per-horizon cross-entropy (masked by
 `valid`).
 
+### Two training entry points (`train_phase1.py`)
+
+**`phase1_step(lm, opt, tokens, ...)`** — eager TBPTT path. Supports the
+full design including neuromod. Per block: build targets, run
+`block_forward`, compute factorized CE, stream surprise EMA, fire
+plasticity (with `s_for_snapshot=out.s_new` so the neuromod observes
+the just-trained state, not pre-block — see Bug-fix log P1.a),
+backward, write state back, detach.
+
+**`phase1_step_cudagraph(lm, opt, tokens, ...)`** — manual CUDA-graph
+capture path via `CapturedBlockTrainer` (see `triton/cudagraph_trainer.py`
+and `docs/triton_rewrite_plan.md`). The first call warms up + captures
+the iteration body (block_forward + CE + backward + state writeback +
+surprise EMA + Hebbian + counter resets) into a `torch.cuda.CUDAGraph`;
+subsequent calls per block just do `replay()`. Currently constrained to
+`use_neuromod=False` (the dynamic-shape `torch.nonzero` in
+`_snapshot_touched_columns` can't be captured); the e_bias plumbing is
+already wired through a stable `e_bias_buf` so re-enabling neuromod is
+focused follow-up work. Throughput at default-ish bench config is
+~13.5–14× over eager.
+
+Loss normalization (both paths, post debugging-pass): `balance_term =
+λ · out.load_balance_loss / T_block` (un-divided sum was scaling with
+`mod_period`); per-step total loss is divided by `n_blocks_total` so
+effective LR is invariant to `segment_T` (eager: in-place `loss /=
+n_blocks_total`; cudagraph: grad scaling outside the captured graph
+before `opt.step`).
+
 ## Tests
+
+Full suite: **115 passed** (CPU + CUDA-gated combined). Walker-related
+breakdown:
 
 - [tests/test_graph_walker.py](/home/alex/code/neuromorphic/tests/test_graph_walker.py) — 16 tests covering shapes,
   gradient flow, load-balance, prev-motor chaining, ε-exploration
@@ -340,20 +387,53 @@ K_h]` float32 per-position per-horizon cross-entropy (masked by
   safety, non-zero targets after perturbation, tanh bound, first-segment
   identity, phase-1 integration with gradient flow to neuromod params,
   delta-snapshot roundtrip.
-- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py) — 9 tests covering
-  the `SparseLIFUpdate` Triton kernel numerical parity and edge cases.
-
-**Full suite: 33 passed.** 24 pass CPU-only (graph_walker + neuromod);
-9 Triton tests are GPU-gated.
+- [tests/test_triton_sparse_update.py](/home/alex/code/neuromorphic/tests/test_triton_sparse_update.py) — 9 tests for the
+  legacy `SparseLIFUpdate` Triton kernel parity and edge cases.
+- [tests/test_sparse_lif_puretorch_parity.py](/home/alex/code/neuromorphic/tests/test_sparse_lif_puretorch_parity.py) — 5 tests
+  pinning the cudagraph-safe puretorch backend against the Triton path
+  (forward + backward equivalence).
+- [tests/test_triton_lif_v2.py](/home/alex/code/neuromorphic/tests/test_triton_lif_v2.py) — 3 tests for the new
+  `LIFDepositFunction` (sentinel-padded static-shape variant): forward
+  parity vs old SparseLIFUpdate, forward parity vs puretorch ref, and
+  backward grad parity (with sentinel rows checked to receive zero grad).
+- [tests/test_cudagraph_trainer.py](/home/alex/code/neuromorphic/tests/test_cudagraph_trainer.py) — 7 tests for the
+  capture path: finite loss, loss-decreases-over-iters, neuromod=True
+  rejected, state evolves across replays, plasticity fires, surprise
+  EMA streamed, param grads accumulate across blocks.
+- [tests/test_debugging_pass_fixes.py](/home/alex/code/neuromorphic/tests/test_debugging_pass_fixes.py) — 7 regression
+  tests for the bugs in "Bug-fix log" below.
 
 ## Current Measured Throughput
 
-RTX 4090 (24 GB), defaults + CLI overrides. Runs with
-`PYTORCH_ALLOC_CONF=expandable_segments:True` set in
-[scripts/bench_graph_walker.py](/home/alex/code/neuromorphic/scripts/bench_graph_walker.py).
+RTX 4090 (24 GB).
 
-Config: `mod_period = tbptt_block = 48` (aligned, shorter than the
-default 128 to trade narrower credit horizon for more batch headroom):
+### Eager / whole-block-compile / cudagraph (post-rewrite)
+
+Bench config (matches [scripts/bench_walker_full.py](/home/alex/code/neuromorphic/scripts/bench_walker_full.py)):
+`plane_rows=8, plane_cols=8, L=4, K=16, D_model=512, D_s=256, D_id=32,
+n_heads=4, n_score_heads=4, K_horizons=4, mod_period=64, tbptt_block=64,
+segment_T=128, content_mlp_depth=2, post_model_depth=1,
+use_neuromod=False`. (Smaller than the production default — bench was
+chosen to fit in tight CI loops.)
+
+| B  | mode                              | tok/s   | rel    | warmup |
+|----|-----------------------------------|---------|--------|--------|
+| 4  | eager                             | 1260    | 1.00×  | 2 s    |
+| 4  | whole-block torch.compile         | 5049    | 4.01×  | 14 s   |
+| 4  | cudagraph + compile inner         | 17615   | 13.98× | 100 s  |
+| 16 | eager                             | 5028    | 1.00×  | 2 s    |
+| 16 | cudagraph + compile inner         | 66358   | 13.20× | 251 s  |
+
+The cudagraph path warms up + compiles + captures once (~100–250 s for
+torch.compile autotune); replay overhead is then sub-millisecond per
+block. See `docs/triton_rewrite_plan.md` "Outcome" for the design
+rationale.
+
+### Pre-rewrite production-scale numbers (eager only)
+
+Config: `mod_period = tbptt_block = 48` on the production-scale model
+(`plane_rows=plane_cols=16, L=4, D_model=1024, D_s=512, K=32`).
+Captured before the cudagraph path landed.
 
 | BS  | ms/step | tok/s | peak VRAM |
 |-----|---------|-------|-----------|
@@ -365,27 +445,75 @@ default 128 to trade narrower credit horizon for more batch headroom):
 
 Reference point: at `mod=tbptt=128, BS=26` the aligned config throughput
 is ~7.7k tok/s / 19.1 GB — longer credit horizon for the neuromod, at
-the cost of 60% less batch headroom.
+the cost of 60% less batch headroom. Re-running these on the cudagraph
+path with `use_neuromod=False` would multiply by ~3-4× on top.
 
 ## Remaining Perf Frontier
 
-1. **`[B*H]-row hot matmuls vs Mamba-class [B*T]-row scan-parallel** —
-   the model is fully recurrent on the token clock. We can't scan-
-   parallelise time the way Mamba / transformers do; each walker hop
-   depends on the previous hop's deposited state. Expect per-tick
-   overhead to dominate until a custom fused Triton step-core kernel
-   exists.
-2. **Active-row overlay for column state** — the sparse-update
-   kernel still clones the full `[B·N, D_s]` buffer per step. At high
-   batch this is ~10% throughput overhead on top of factorized CE.
-   Tried once; reverted because the implementation tangled with
-   autograd's view+inplace and version-check rules; needs a dedicated
-   redesign (detached base + sparse differentiable overlay).
+1. **Neuromod-compatible cudagraph capture.** The current capture path
+   requires `use_neuromod=False` because `_snapshot_touched_columns`
+   uses `torch.nonzero` (dynamic shape — forbidden under stream
+   capture). The `e_bias_buf` is already a leaf with `requires_grad=True`
+   and the captured backward populates `.grad`, so re-enabling neuromod
+   needs (a) snapshot `visit_count` to a stable buffer inside the
+   captured graph, then (b) run the neuromod fire OUTSIDE per replay
+   and use `e_bias_buf.grad` to backprop through the chain. ~1-day fix.
+2. **Active-row overlay for column state** — the sparse-update kernel
+   (and its puretorch fallback) still touches the full `[B·N, D_s]`
+   buffer per step. At high batch this is ~10% throughput overhead on
+   top of factorized CE. Tried once; reverted because the
+   implementation tangled with autograd's view+inplace and version-
+   check rules; needs a dedicated redesign (detached base + sparse
+   differentiable overlay).
 3. **Fused tied-unembedding CE Triton kernel** — current factorized
    CE is a Python loop of K_h iterations each running
    `F.cross_entropy(logits_k [B·T, V], ...)`. A fused kernel that
    never materialises even the per-horizon `[B·T, V]` logits would
    save another ~2 GB at high batch, at the cost of engineering effort.
+4. **Triton step-core kernels (`step_postlif`, `anchor_pick`).**
+   Originally Phases 2-3 of the rewrite; deferred because cudagraph
+   replay collapses launch overhead by ~100×, leaving only ~1-2%
+   headroom for further fusion. See `docs/triton_rewrite_plan.md`
+   "Outcome" for the cost-benefit analysis. Re-open only if production-
+   scale profiling shows residual launch-bound or memory-bound
+   bottlenecks inside the captured graph.
+
+## Bug-fix log (debugging-pass, 2026-04-25)
+
+External code review surfaced six bugs; all fixed and pinned by
+regression tests in
+[tests/test_debugging_pass_fixes.py](/home/alex/code/neuromorphic/tests/test_debugging_pass_fixes.py).
+
+- **P1.a** Neuromod snapshot read pre-block `memory.s` because state
+  writeback is deferred until after `loss.backward()` (version-counter
+  contract). Fix: thread `out.s_new` through
+  `_maybe_finalize_surprise_and_plasticity` →
+  `_plasticity_step` → `_snapshot_touched_columns` so the neuromod
+  observes the just-trained state.
+- **P1.b** Cudagraph warmup polluted persistent `E_bias_flat` with ~4
+  spurious Hebbian updates against random-token inputs.
+  Fix: `CapturedBlockTrainer.warmup_and_capture` now snapshots
+  `E_bias_flat` before warmup and restores it after capture (also
+  zeros window-scoped counters).
+- **P1.c** `balance_term` was summed-not-meaned over `T_block`; per-block
+  `loss.backward()` was unscaled by `n_blocks_total`. Effective LR
+  scaled with both `mod_period` and `segment_T`.
+  Fix: `balance_term /= T_block` (both paths); `loss /= n_blocks_total`
+  in eager, grad scaling before `opt.step` in cudagraph.
+- **P2.a** `triton/lif.py::_pure_torch_fwd` had `pass` where it should
+  populate the save-for-backward buffers; CPU `_pure_torch_bwd` then
+  read uninitialized memory and produced inf/huge gradients.
+  Fix: gather per-`unique_dests` slot from the dense forward buffers
+  using a sentinel-clamped index.
+- **P2.b** `build_topology` silently truncated `K_intra/K_inter` when K
+  exceeded the Moore-radius-2 candidate count (24 intra, 25 inter), then
+  crashed inside `out_nbrs[src] = ...`. Fix: validate at config
+  construction with a clear error.
+- **P3** `visit_entropy` telemetry read `lm.memory.visit_count` AFTER
+  plasticity had zeroed it — always reported the uniform sentinel
+  value (~1.0). Fix: track a separate cross-block accumulator
+  (`visit_count_accum` in eager; `visit_count_snapshot_buf` populated
+  inside the captured graph before the Hebbian zero in cudagraph).
 
 ## What's Next
 

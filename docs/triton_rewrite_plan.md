@@ -1,7 +1,7 @@
 # GraphWalker Triton Rewrite Plan
 
 **Branch:** `graph-walker` @ `00d4084` (or later)
-**Status:** Phases 0+1+5 landed (target speedup hit); Phases 2-3 deferred — see "Outcome" below
+**Status:** Phases 0+1+5 landed (target speedup hit); Phases 2-3 deferred — see "Outcome" below. Six bugs found in a follow-up debugging pass and fixed (`docs/graph_walker.md` "Bug-fix log"; commit `b8a345d`).
 **Author:** session 2026-04-25
 **Goal:** Push walker hot path from current 3.5× over eager (whole-block compile) to **6-8×** via custom Triton kernels for the dispatch-bound small-op chains, keeping cuBLAS for matmuls.
 

@@ -1,7 +1,15 @@
 # Walker Speedup Plan — CUDA Graphs + Triton Fusion
 
-**Status:** planning + early validation (graph-walker branch)
-**Author:** session 2026-04-25
+**Status:** SUPERSEDED — see [`docs/triton_rewrite_plan.md`](triton_rewrite_plan.md)
+**Original author:** session 2026-04-25 (early planning notes)
+**Outcome:** the cudagraph-capture half of this plan landed (Phase 5
+of the rewrite plan) and delivered ~13.5–14× over eager, exceeding the
+10–15× target. The Triton-fusion half was deferred — under cudagraph
+replay the launch-overhead reduction it would buy drops to noise.
+This file is preserved for context; refer to `triton_rewrite_plan.md`
+for the current design + outcome record.
+
+---
 
 ## Thesis
 
