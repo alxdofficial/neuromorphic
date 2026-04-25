@@ -87,9 +87,14 @@ class CapturedBlockTrainer:
     ) -> None:
         if lm.cfg.use_neuromod:
             raise NotImplementedError(
-                "CapturedBlockTrainer requires use_neuromod=False. "
-                "Neuromod's _active_delta_nm rebuilds per window with a fresh "
-                "address, breaking cudagraph buffer stability."
+                "CapturedBlockTrainer requires use_neuromod=False. The "
+                "captured graph reads e_bias from a stable buffer, but the "
+                "neuromod fire (graph transformer over touched columns) "
+                "uses dynamic-shape ops (torch.nonzero) that cannot be "
+                "captured. Adding neuromod support requires snapshotting "
+                "visit_count to a stable buffer inside the captured graph "
+                "and running neuromod + commit outside per replay; see "
+                "docs/triton_rewrite_plan.md 'Constraints accepted'."
             )
         self.lm = lm
         self.B = B
@@ -97,6 +102,7 @@ class CapturedBlockTrainer:
         self.K_h = K_h
         self.lambda_balance = lambda_balance
         self.amp_dtype = amp_dtype
+        self.use_neuromod = lm.cfg.use_neuromod
         # Compile block_forward with inductor's default mode (no cudagraph)
         # to get cross-step fusion before our manual cudagraph wraps it.
         self._block_callable = (
@@ -120,6 +126,15 @@ class CapturedBlockTrainer:
         self.valid_btk_buf = torch.zeros(B, T_block, K_h, **bool_)
         self.valid_tk_buf = torch.zeros(T_block, K_h, **bool_)
         self.horizon_weights_buf = torch.zeros(K_h, **f32)
+
+        # E_bias input buffer. Always allocated with requires_grad=True so the
+        # captured backward populates ``.grad`` — caller uses that grad to
+        # backprop through the neuromod chain (built outside the captured
+        # graph). When neuromod is off, the grad is unused and ignored.
+        self.e_bias_buf = torch.zeros(
+            lm.cfg.num_edges, dtype=torch.float32, device=device,
+            requires_grad=True,
+        )
 
         # Static output buffers.
         self.ce_loss_buf = torch.zeros((), **f32)
@@ -154,8 +169,11 @@ class CapturedBlockTrainer:
         memory._k_all_cache = None
         memory._ensure_block_caches(memory.tied_token_emb.weight)
 
-        # E_bias snapshot — pure detach when neuromod is off.
-        e_bias = memory.E_bias_flat.detach()
+        # E_bias input — always read from the stable, requires_grad buffer.
+        # Caller copies the actual values (E_bias_flat + active_delta_nm)
+        # into e_bias_buf before each replay; the captured backward writes
+        # routing's gradient back into e_bias_buf.grad.
+        e_bias = self.e_bias_buf
 
         ctx = (
             torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
@@ -298,8 +316,17 @@ class CapturedBlockTrainer:
         valid_btk: torch.Tensor,
         valid_tk: torch.Tensor,
         horizon_weights: torch.Tensor,
+        e_bias_value: torch.Tensor,
     ) -> CapturedBlockStats:
-        """Copy inputs into static buffers and replay the captured graph."""
+        """Copy inputs into static buffers and replay the captured graph.
+
+        ``e_bias_value`` carries the active E_bias for this block — typically
+        ``E_bias_flat.detach() + neuromod_eta * active_delta_nm`` (where
+        ``active_delta_nm`` carries grad_fn back to neuromod params). Its
+        values are copied into the stable e_bias_buf; after replay,
+        ``e_bias_buf.grad`` holds routing's gradient w.r.t. those values.
+        Caller uses that grad to backprop through the neuromod chain.
+        """
         if not self._captured:
             raise RuntimeError("call warmup_and_capture() before replay()")
 
@@ -311,6 +338,15 @@ class CapturedBlockTrainer:
         self.valid_btk_buf.copy_(valid_btk, non_blocking=True)
         self.valid_tk_buf.copy_(valid_tk, non_blocking=True)
         self.horizon_weights_buf.copy_(horizon_weights, non_blocking=True)
+
+        # E_bias requires care: copy values without recording autograd
+        # (which would promote e_bias_buf from leaf to non-leaf and break
+        # the AccumulateGrad node bound at capture time). Zero existing
+        # grad so the post-replay value is just THIS block's gradient.
+        with torch.no_grad():
+            self.e_bias_buf.copy_(e_bias_value.detach(), non_blocking=True)
+            if self.e_bias_buf.grad is not None:
+                self.e_bias_buf.grad.zero_()
 
         self.graph.replay()
 

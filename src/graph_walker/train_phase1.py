@@ -380,9 +380,18 @@ def phase1_step_cudagraph(
         )
         valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
 
+        # E_bias for this block. With use_neuromod=False this is just the
+        # detached E_bias_flat (in-place updated by previous block's
+        # captured Hebbian step). With use_neuromod=True it would carry
+        # grad_fn back to neuromod params, and caller would backprop
+        # through e_bias_value.backward(gradient=trainer.e_bias_buf.grad)
+        # after replay — currently not supported.
+        e_bias_value = lm.memory._active_e_bias()
+
         stats = trainer.replay(
             tokens_block, tau, epsilon,
             targets, valid_btk, valid_tk, horizon_weights,
+            e_bias_value,
         )
 
         lm.memory.window_len = tbptt
