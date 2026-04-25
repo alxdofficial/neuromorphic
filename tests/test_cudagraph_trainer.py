@@ -109,3 +109,64 @@ def test_cudagraph_state_evolves_across_replays():
     assert not torch.allclose(s_after_one, s_after_two, atol=1e-3), (
         "state did not evolve across segments"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only")
+def test_cudagraph_plasticity_fires():
+    """E_bias_flat must change after a cudagraph step — confirms the
+    captured Hebbian update is actually running on each replay."""
+    cfg = _tiny_cfg()
+    lm = StandaloneLM(cfg).cuda()
+    opt = torch.optim.Adam(lm.parameters(), lr=1e-4)
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.segment_T), device="cuda")
+
+    e_bias_before = lm.memory.E_bias_flat.clone()
+    phase1_step_cudagraph(lm, opt, tokens, training_step=0)
+    e_bias_after = lm.memory.E_bias_flat
+    assert not torch.equal(e_bias_before, e_bias_after), (
+        "E_bias_flat did not change — captured Hebbian update never fired"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only")
+def test_cudagraph_surprise_ema_streamed():
+    """surprise_ema must move away from zero after a step — confirms the
+    captured per-token EMA loop populated it from CE values."""
+    cfg = _tiny_cfg()
+    lm = StandaloneLM(cfg).cuda()
+    opt = torch.optim.Adam(lm.parameters(), lr=1e-4)
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.segment_T), device="cuda")
+
+    # First step: builds + warms up + captures + replays. begin_segment
+    # inside this call allocates surprise_ema (zeros).
+    phase1_step_cudagraph(lm, opt, tokens, training_step=0)
+    # After first step + Hebbian fire, surprise_ema reflects the block CE
+    # values streamed in by the captured per-token EMA loop.
+    assert lm.memory.surprise_ema.abs().max() > 1e-3, (
+        "surprise_ema did not move from zero — captured EMA loop never fired"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only")
+def test_cudagraph_param_grads_accumulate_across_blocks():
+    """A segment with T = 2 * mod_period should produce non-zero param
+    gradients — confirms multi-block replay and grad accumulation work."""
+    cfg = _tiny_cfg()
+    # T = 2 * mod_period so we replay 2 blocks per step
+    cfg.segment_T = 2 * cfg.mod_period
+    lm = StandaloneLM(cfg).cuda()
+    opt = torch.optim.Adam(lm.parameters(), lr=1e-4)
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.segment_T), device="cuda")
+
+    phase1_step_cudagraph(lm, opt, tokens, training_step=0)
+    # opt.step ran inside phase1_step_cudagraph; param.grad has been zeroed
+    # by AdamW for the next step. Re-run to populate grads.
+    phase1_step_cudagraph(lm, opt, tokens, training_step=1)
+    # Sample a few learnable params and verify they have non-zero grads after
+    # the captured backward chain.
+    for p in lm.parameters():
+        if p.grad is None:
+            continue
+        if p.grad.abs().max() > 0:
+            return
+    raise AssertionError("no param had non-zero grad after cudagraph replay")
