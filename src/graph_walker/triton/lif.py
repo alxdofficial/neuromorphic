@@ -408,33 +408,58 @@ class LIFDepositFunction(torch.autograd.Function):
 def _pure_torch_fwd(
     s_in, s_out, all_msgs, all_dests, alpha, N, BN, scratch,
 ):
-    """Reference forward — used by CPU path and test parity."""
+    """Reference forward — used by CPU path and test parity.
+
+    Mirrors the Triton kernel exactly, including populating the
+    save-for-backward buffers (``tanh_inc_save``, ``s_old_save``,
+    ``alpha_save``) per ``unique_dests`` slot. Without these,
+    ``_pure_torch_bwd`` reads uninitialized memory and produces garbage
+    gradients — earlier passes accidentally left this as ``pass``.
+
+    Sentinel slots (``unique_dests[u] >= BN``) are skipped; the kernel /
+    backward both early-exit on the same sentinel guard so leaving those
+    save buffers untouched is fine.
+    """
     D_s = s_in.shape[1]
-    incoming_fp = torch.zeros(BN, D_s, dtype=torch.float32, device=s_in.device)
+    device = s_in.device
+    U_max = scratch.unique_dests.shape[0]
+
+    # Forward: dense LIF blend over all rows, masked by touched.
+    incoming_fp = torch.zeros(BN, D_s, dtype=torch.float32, device=device)
     incoming_fp.index_add_(0, all_dests.clamp(max=BN - 1), all_msgs.float())
 
-    counts = torch.zeros(BN, dtype=torch.float32, device=s_in.device)
-    ones = torch.ones(all_dests.shape[0], dtype=torch.float32, device=s_in.device)
+    counts = torch.zeros(BN, dtype=torch.float32, device=device)
+    ones = torch.ones(all_dests.shape[0], dtype=torch.float32, device=device)
     counts.index_add_(0, all_dests.clamp(max=BN - 1), ones)
     touched = (counts > 0)
 
-    n_index = torch.arange(BN, device=s_in.device) % N
+    n_index = torch.arange(BN, device=device) % N
     alpha_row = alpha[n_index].float().unsqueeze(-1)
 
     s_in_fp = s_in.float()
-    tanh_inc = torch.tanh(incoming_fp)
-    s_blend = alpha_row * s_in_fp + (1.0 - alpha_row) * tanh_inc
+    tanh_inc_full = torch.tanh(incoming_fp)
+    s_blend = alpha_row * s_in_fp + (1.0 - alpha_row) * tanh_inc_full
 
-    s_out.copy_(torch.where(touched.unsqueeze(-1), s_blend, s_in_fp).to(s_in.dtype))
+    s_out.copy_(
+        torch.where(touched.unsqueeze(-1), s_blend, s_in_fp).to(s_in.dtype),
+    )
 
-    # Save-for-backward: only valid for touched rows; sentinel rows leave
-    # whatever was already in the buffer. Backward kernel skips sentinels.
-    touched_idx = torch.nonzero(touched, as_tuple=False).squeeze(-1)
-    if touched_idx.numel() > 0:
-        # Map touched_idx → unique_dests slot. We rebuild via the scratch
-        # preprocessing for parity — simpler to just trust the scratch
-        # values that were already filled by _lif_preprocess.
-        pass
+    # Save-for-backward: gather per-unique-dest from the dense buffers.
+    # ``unique_dests`` was filled by ``_lif_preprocess`` and is
+    # sentinel-padded with ``BN`` for slots beyond the real U. We clamp
+    # those reads to a valid index (BN-1) so .index_select is safe; the
+    # backward kernel will skip sentinel slots anyway via its dest>=BN
+    # guard.
+    safe_dests = scratch.unique_dests.clamp(max=BN - 1)
+    scratch.tanh_inc_save.copy_(
+        tanh_inc_full.index_select(0, safe_dests).to(scratch.tanh_inc_save.dtype),
+    )
+    scratch.s_old_save.copy_(
+        s_in_fp.index_select(0, safe_dests).to(scratch.s_old_save.dtype),
+    )
+    scratch.alpha_save.copy_(
+        alpha[(safe_dests % N).long()].float(),
+    )
 
 
 def _pure_torch_bwd(

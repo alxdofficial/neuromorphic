@@ -180,6 +180,30 @@ class GraphWalkerConfig:
                 "would silently skip plasticity firings because the flush "
                 "code only runs _maybe_finalize... after backward."
             )
+        # K must fit the topology's local-neighborhood candidate counts.
+        # build_topology samples K_intra distinct intra-plane neighbours
+        # (Moore radius=2 → 24 candidates) and K_inter distinct inter-plane
+        # neighbours (radius=2 → 25 candidates). torch.randperm[:k] silently
+        # gives min(k, len(candidates)) elements, then assignment shape-
+        # mismatches `out_nbrs[src] = ...` and crashes — guard up front.
+        K_intra = max(1, int(round(self.K * self.K_intra_fraction)))
+        K_inter = self.K - K_intra
+        max_intra = 24                 # 5*5 - 1 (excluding self)
+        max_inter = 25                 # 5*5 (next plane wraps via modulo)
+        if K_intra > max_intra:
+            raise ValueError(
+                f"K * K_intra_fraction = {K_intra} exceeds the "
+                f"intra-plane Moore-radius-2 candidate count ({max_intra}). "
+                f"Reduce K (currently {self.K}) or K_intra_fraction "
+                f"(currently {self.K_intra_fraction})."
+            )
+        if K_inter > max_inter:
+            raise ValueError(
+                f"K * (1 - K_intra_fraction) = {K_inter} exceeds the "
+                f"inter-plane Moore-radius-2 candidate count ({max_inter}). "
+                f"Reduce K (currently {self.K}) or raise K_intra_fraction "
+                f"(currently {self.K_intra_fraction})."
+            )
 
     @property
     def N_per_plane(self) -> int:

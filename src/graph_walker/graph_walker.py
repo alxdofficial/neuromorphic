@@ -760,15 +760,27 @@ class GraphWalkerMemory(nn.Module):
         return base + self.cfg.neuromod_eta * self._active_delta_nm
 
     @torch._dynamo.disable
-    def _snapshot_touched_columns(self) -> None:
+    def _snapshot_touched_columns(
+        self, s_for_snapshot: torch.Tensor | None = None,
+    ) -> None:
         """Snapshot stats for columns visited in the window just closed.
 
         Stored in `_prev_snapshot_ids`, `_prev_snapshot_feats` (both detached)
         for consumption by the NEXT window's `_begin_plastic_window`.
         Called at window close, before counters are reset.
+
+        ``s_for_snapshot`` lets the caller pass the JUST-COMPUTED post-block
+        column state (typically ``out.s_new``) explicitly. This is needed
+        because in `phase1_step` plasticity fires BEFORE the state writeback
+        (``self.s.copy_(out.s_new)``) — see the version-counter rationale in
+        train_phase1.py. If ``None``, falls back to ``self.s`` (correct only
+        when the writeback already happened, e.g., in single-token
+        ``step()`` paths).
         """
         if self.neuromod is None or self.visit_count is None:
             return
+
+        s_src = self.s if s_for_snapshot is None else s_for_snapshot
 
         # Touched columns (visited at least once this window)
         touched_mask = self.visit_count > 0
@@ -781,7 +793,7 @@ class GraphWalkerMemory(nn.Module):
         # Per-column features: mean state across batch, column identity,
         # visit count (log-scaled for sane dynamic range).
         with torch.no_grad():
-            s_mean = self.s.float().mean(dim=0)                        # [N, D_s]
+            s_mean = s_src.float().mean(dim=0)                         # [N, D_s]
             s_feats = s_mean[touched_ids]                              # [U, D_s]
             id_feats = self.col_id[touched_ids].float()                # [U, D_id]
             vc_feats = (self.visit_count[touched_ids] + 1.0).log().unsqueeze(-1)
@@ -1392,11 +1404,17 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_prev = self.surprise_ema.detach().clone()
 
     @torch._dynamo.disable
-    def _maybe_finalize_surprise_and_plasticity(self) -> None:
+    def _maybe_finalize_surprise_and_plasticity(
+        self, s_for_snapshot: torch.Tensor | None = None,
+    ) -> None:
+        """``s_for_snapshot`` is forwarded to ``_snapshot_touched_columns``;
+        callers that have the post-block state in hand (e.g.,
+        ``phase1_step`` with ``out.s_new``) should pass it so neuromod
+        observes the just-trained state, not the pre-block state."""
         if self.window_len < self.cfg.mod_period:
             return
         self._finalize_surprise_window()
-        self._plasticity_step()
+        self._plasticity_step(s_for_snapshot=s_for_snapshot)
         # Start the next window's neuromod delta OUTSIDE the no_grad scope
         # of _plasticity_step so the delta carries a live grad_fn and
         # routing loss can reach the neuromod parameters.
@@ -1404,7 +1422,9 @@ class GraphWalkerMemory(nn.Module):
 
     @torch._dynamo.disable
     @torch.no_grad()
-    def _plasticity_step(self) -> None:
+    def _plasticity_step(
+        self, s_for_snapshot: torch.Tensor | None = None,
+    ) -> None:
         """Plasticity update on window close. Runs:
           1. Scalar-eta Hebbian on traversed-edge counts (legacy).
           2. If neuromod is enabled: bake the grad-carrying `_active_delta_nm`
@@ -1446,7 +1466,11 @@ class GraphWalkerMemory(nn.Module):
 
         # Snapshot the just-closed window BEFORE we reset counters — this
         # becomes the observation for the NEXT window's neuromod fire.
-        self._snapshot_touched_columns()
+        # Caller may pass the post-block s explicitly (when self.s has not
+        # yet been written back from out.s_new — e.g. in phase1_step where
+        # writeback is deferred until after backward to avoid
+        # version-counter conflicts on tensors saved-for-backward).
+        self._snapshot_touched_columns(s_for_snapshot=s_for_snapshot)
 
         # Reset window-scoped counters (co_visit, window_len, visit_count,
         # active_delta_nm — the delta is now baked into E_bias_flat).

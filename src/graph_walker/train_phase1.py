@@ -106,6 +106,17 @@ def phase1_step(
     total_balance_tensor = torch.zeros((), device=device, dtype=torch.float32)
     per_horizon_accum = torch.zeros(K_h, device=device, dtype=torch.float32)
     per_horizon_counts = torch.zeros(K_h, device=device, dtype=torch.float32)
+    # Telemetry: snapshot visit_count BEFORE plasticity zeroes it. Reads of
+    # lm.memory.visit_count after the loop would always see a zeroed buffer
+    # (plasticity resets at every window close) → reported visit_entropy
+    # would always be the uniform-distribution sentinel value. Accumulate
+    # the per-block visit counts here so post-loop entropy reflects the
+    # actual visit distribution across the segment.
+    visit_count_accum = (
+        torch.zeros(cfg.N, device=device, dtype=torch.float32)
+        if cfg.lambda_balance > 0 or True  # always track for telemetry
+        else None
+    )
     n_blocks = 0
 
     n_blocks_total = T_seq // tbptt
@@ -151,6 +162,10 @@ def phase1_step(
                 lm.memory.co_visit_flat.add_(out.co_visit_total)
                 if lm.memory.visit_count is not None:
                     lm.memory.visit_count.add_(out.visit_count_total)
+                # Snapshot for post-loop visit_entropy telemetry —
+                # plasticity will zero lm.memory.visit_count at this
+                # block's window close.
+                visit_count_accum.add_(out.visit_count_total)
             # Forward-state writebacks happen AFTER backward — copy_ bumps
             # the tensor version, and any saved-for-backward refs to these
             # tensors must complete before the bump.
@@ -184,12 +199,33 @@ def phase1_step(
             ce = (
                 per_h * horizon_weights * has_counts.float()
             ).sum() / horizon_weights[has_counts].sum().clamp(min=1)
-            balance_term = cfg.lambda_balance * out.load_balance_loss
-            loss = ce + balance_term
+            # Normalize the balance term by tbptt: out.load_balance_loss is
+            # SUMMED over the T_block tokens inside block_forward (each token
+            # contributes one ``cfg.N · (P_mean·f_mean).sum()`` term). Without
+            # the divide, balance_term magnitude scales with mod_period —
+            # changing mod_period silently changes effective lambda_balance.
+            # Per-token mean keeps the design intent (one expected-cost
+            # quantity, not a sum).
+            balance_term = (
+                cfg.lambda_balance * out.load_balance_loss / float(tbptt)
+            )
+            # Normalize by n_blocks_total so total step gradient is the
+            # MEAN of per-block losses, not the sum. Without this, doubling
+            # segment_T doubles effective LR (n_blocks backwards each
+            # accumulating an unscaled per-block loss).
+            loss = (ce + balance_term) / float(n_blocks_total)
 
             # Stream surprise EMA + fire plasticity for the just-closed window.
+            # Pass `out.s_new` explicitly: state writeback is deferred until
+            # AFTER backward to avoid version-counter conflicts on tensors
+            # saved-for-backward, so `lm.memory.s` here still holds the
+            # pre-block state. Without this, the neuromod's snapshot of
+            # touched columns would observe last block's state instead of
+            # the just-trained one — silently degrading neuromod learning.
             lm.memory.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
-            lm.memory._maybe_finalize_surprise_and_plasticity()
+            lm.memory._maybe_finalize_surprise_and_plasticity(
+                s_for_snapshot=out.s_new,
+            )
 
             loss.backward()
 
@@ -204,7 +240,14 @@ def phase1_step(
                 lm.memory.prev_motor.copy_(out.prev_motor_new)
 
             # Cross-block accumulators (GPU-resident, single sync at end).
-            total_balance_tensor = total_balance_tensor + balance_term.detach()
+            # Telemetry uses the per-token-mean balance (un-normalized by
+            # n_blocks_total) so the reported number is invariant to
+            # segment_T — only the gradient is scaled by 1/n_blocks_total.
+            total_balance_tensor = (
+                total_balance_tensor
+                + (cfg.lambda_balance * out.load_balance_loss / float(tbptt))
+                  .detach()
+            )
             per_horizon_accum.add_(block_horizon_sum.detach())
             per_horizon_counts.add_(block_horizon_count)
             n_blocks += 1
@@ -222,9 +265,11 @@ def phase1_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(lm.parameters(), grad_clip)
     opt.step()
 
-    # Visit entropy.
-    if lm.memory.visit_count is not None:
-        vc = lm.memory.visit_count.float()
+    # Visit entropy — read from the across-block accumulator (plasticity
+    # has already zeroed lm.memory.visit_count). Treat the accumulated
+    # visits as a frequency distribution over columns.
+    if visit_count_accum is not None and float(visit_count_accum.sum()) > 0:
+        vc = visit_count_accum.float()
         p = (vc / vc.sum().clamp(min=1)).clamp(min=1e-12)
         entropy = -(p * p.log()).sum().item()
         entropy_uniform = torch.log(torch.tensor(float(cfg.N))).item()
@@ -357,6 +402,9 @@ def phase1_step_cudagraph(
     total_balance_tensor = torch.zeros((), device=device, dtype=torch.float32)
     per_horizon_accum = torch.zeros(K_h, device=device, dtype=torch.float32)
     per_horizon_counts = torch.zeros(K_h, device=device, dtype=torch.float32)
+    # Telemetry: visit_count is reset inside the captured Hebbian step, so
+    # accumulate per-block snapshots here (see CapturedBlockStats).
+    visit_count_accum = torch.zeros(cfg.N, device=device, dtype=torch.float32)
     n_blocks = 0
     n_blocks_total = T_seq // tbptt
 
@@ -401,15 +449,30 @@ def phase1_step_cudagraph(
         total_balance_tensor.add_(stats.balance_loss)
         per_horizon_accum.add_(stats.block_horizon_sum)
         per_horizon_counts.add_(stats.block_horizon_count)
+        # Snapshot from inside captured graph (taken before Hebbian zeroes
+        # visit_count) so post-loop visit_entropy reflects real visits.
+        visit_count_accum.add_(stats.visit_count_snapshot)
         n_blocks += 1
+
+    # Normalize accumulated gradients by n_blocks_total so total grad is
+    # the MEAN of per-block losses, not the sum. Without this, doubling
+    # segment_T (which doubles n_blocks_total) doubles the effective LR.
+    # Mirrors ``loss /= n_blocks_total`` in the eager phase1_step path.
+    if n_blocks_total > 1:
+        scale = 1.0 / float(n_blocks_total)
+        with torch.no_grad():
+            for p in lm.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
 
     grad_norm = torch.nn.utils.clip_grad_norm_(lm.parameters(), grad_clip)
     opt.step()
     total_balance = total_balance_tensor.item()
 
-    # Visit entropy.
-    if lm.memory.visit_count is not None:
-        vc = lm.memory.visit_count.float()
+    # Visit entropy — read from the cross-block accumulator (the captured
+    # Hebbian step zeros lm.memory.visit_count each block).
+    if float(visit_count_accum.sum()) > 0:
+        vc = visit_count_accum.float()
         p = (vc / vc.sum().clamp(min=1)).clamp(min=1e-12)
         entropy = -(p * p.log()).sum().item()
         entropy_uniform = torch.log(torch.tensor(float(cfg.N))).item()

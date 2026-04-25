@@ -58,6 +58,7 @@ class CapturedBlockStats:
     block_horizon_sum: torch.Tensor    # [K_h] fp32
     block_horizon_count: torch.Tensor  # [K_h] fp32
     ce_masked: torch.Tensor            # [B, T_block, K_h] fp32 — detached
+    visit_count_snapshot: torch.Tensor # [N] fp32 — pre-Hebbian-reset snapshot
 
 
 class CapturedBlockTrainer:
@@ -142,6 +143,11 @@ class CapturedBlockTrainer:
         self.block_horizon_sum_buf = torch.zeros(K_h, **f32)
         self.block_horizon_count_buf = torch.zeros(K_h, **f32)
         self.ce_masked_buf = torch.zeros(B, T_block, K_h, **f32)
+        # Pre-Hebbian-reset snapshot of visit_count, exposed for telemetry
+        # (visit_entropy). Without this, post-replay reads of
+        # lm.memory.visit_count would always see zeros — the captured
+        # plasticity update zeros it before we can observe.
+        self.visit_count_snapshot_buf = torch.zeros(lm.cfg.N, **f32)
 
         self.graph: torch.cuda.CUDAGraph | None = None
         self._captured = False
@@ -201,7 +207,18 @@ class CapturedBlockTrainer:
                 per_h = block_horizon_sum / block_horizon_count.clamp(min=1)
                 w_eff = self.horizon_weights_buf * has_counts_f         # [K_h]
                 ce = (per_h * w_eff).sum() / w_eff.sum().clamp(min=1)
-                balance_term = self.lambda_balance * out.load_balance_loss
+                # Normalize balance by T_block (out.load_balance_loss is
+                # SUMMED over T_block tokens inside block_forward — without
+                # this divide, balance magnitude scales with mod_period and
+                # silently changes effective lambda_balance).
+                balance_term = (
+                    self.lambda_balance * out.load_balance_loss
+                    / float(self.T_block)
+                )
+                # n_blocks_total is unknown at capture time (depends on the
+                # caller's segment_T per call). Caller normalizes per-step
+                # gradients by 1/n_blocks_total before opt.step, which is
+                # equivalent to ``loss /= n_blocks_total`` here.
                 loss = ce + balance_term
 
         loss.backward()
@@ -243,6 +260,11 @@ class CapturedBlockTrainer:
                 ema = valid_t * candidate + (1.0 - valid_t) * ema
             memory.surprise_ema.copy_(ema)
 
+            # Telemetry: snapshot visit_count BEFORE Hebbian zeroes it, so
+            # the caller can compute visit_entropy on a real distribution.
+            if memory.visit_count is not None:
+                self.visit_count_snapshot_buf.copy_(memory.visit_count)
+
             # Hebbian plasticity update on E_bias_flat (no neuromod path).
             # Window len equals T_block here (one full window per block).
             window = float(cfg.mod_period)
@@ -275,9 +297,20 @@ class CapturedBlockTrainer:
         stream so AccumulateGrad nodes (created on first warmup backward)
         match the capture stream. Default stream stalls until the side
         stream's captured graph is built, then we ``wait_stream`` to merge.
+
+        ``E_bias_flat`` is the persistent plastic buffer that the captured
+        Hebbian update mutates in place. Warmup runs ``_iter_body`` 3+ times
+        and capture runs it once more, so without intervention real training
+        would start with the persistent buffer corrupted by ~4 spurious
+        updates against random warmup tokens. We snapshot/restore it around
+        the entire warmup-and-capture block to keep persistent state intact.
         """
         if self._captured:
             return
+
+        # Snapshot persistent plastic state — we'll restore it after capture
+        # so warmup's spurious Hebbian updates don't leak into real training.
+        e_bias_pristine = self.lm.memory.E_bias_flat.detach().clone()
 
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -296,6 +329,21 @@ class CapturedBlockTrainer:
                 self._iter_body()
 
         torch.cuda.current_stream().wait_stream(side)
+
+        # Restore the pristine pre-warmup E_bias_flat. In-place .copy_ keeps
+        # the buffer pointer stable so the captured graph's reads still
+        # target the right address. Param.grad accumulators get cleared by
+        # the caller's ``opt.zero_grad`` before the first real replay.
+        self.lm.memory.E_bias_flat.copy_(e_bias_pristine)
+        # Also reset window-scoped counters so the first real replay sees a
+        # fresh window. Without this the captured Hebbian on the first
+        # replay would use co_visit/visit_count from warmup tokens.
+        self.lm.memory.co_visit_flat.zero_()
+        if self.lm.memory.visit_count is not None:
+            self.lm.memory.visit_count.zero_()
+        self.lm.memory.surprise_ema.zero_()
+        self.lm.memory.surprise_prev.zero_()
+
         self._captured = True
 
     def replay(
@@ -347,4 +395,5 @@ class CapturedBlockTrainer:
             block_horizon_sum=self.block_horizon_sum_buf,
             block_horizon_count=self.block_horizon_count_buf,
             ce_masked=self.ce_masked_buf,
+            visit_count_snapshot=self.visit_count_snapshot_buf,
         )
