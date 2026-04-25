@@ -405,6 +405,13 @@ class GraphWalkerMemory(nn.Module):
         # but large enough to light up the gradient to anchor routing.
         nn.init.normal_(self.input_v_proj.weight, mean=0.0, std=0.014)
 
+        # Parallel v_inject projection for the pretrained-LM integration
+        # path, where h_input arrives already in D_s dim (from W_in applied
+        # to a frozen-Llama hidden state) and there is no D_model-dim
+        # h_input_model available. Same small-init as input_v_proj.
+        self.mem_input_v_proj = nn.Linear(cfg.D_s, cfg.D_s, bias=False)
+        nn.init.normal_(self.mem_input_v_proj.weight, mean=0.0, std=0.014)
+
         # Prev-token motor feeds into the start-col query (only): lets the
         # start position depend on recent output direction, not just the
         # current token's identity. Zero-init so day-1 behaviour is unchanged
@@ -507,6 +514,15 @@ class GraphWalkerMemory(nn.Module):
         # Training / routing scheduling — caller sets these externally.
         self.training_step: int = 0
 
+        # Phase indicator for routing. "phase1" = Gumbel-soft + STE (backprop);
+        # "phase2" = hard Categorical sampling + log_pi (REINFORCE / GRPO).
+        # Set externally by `wrapper.current_phase` for pretrained training.
+        self.phase: str = "phase1"
+        # Accumulated log π over routing decisions in the current segment.
+        # Reset at `begin_segment`. Read by GRPO via `consume_log_pi_sum()`.
+        # None when no phase-2 decisions have been recorded.
+        self._log_pi_sum: torch.Tensor | None = None
+
         # Per-block caches for values that depend only on Parameters (so
         # they are constant within a TBPTT block). Invalidated on
         # detach_state / begin_segment so gradient still flows correctly
@@ -597,6 +613,11 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_prev = torch.zeros_like(self.surprise_ema)
         self.tick_counter = 0
         self.window_len = 0
+
+        # Phase-2 log_pi accumulator: reset per segment so phase-2 rollouts
+        # see a clean slate. Stays None until the first phase-2 routing
+        # decision (so phase-1 forwards don't allocate an extra tensor).
+        self._log_pi_sum = None
 
         # Invalidate block-level caches at segment boundary.
         self._horizon_logits_cache = None
@@ -883,6 +904,200 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=core.load_balance_loss,
         )
 
+    def consume_log_pi_sum(self) -> torch.Tensor | None:
+        """Return the accumulated phase-2 log π sum and clear the buffer.
+
+        Used by `grpo_step` after the prefix pass. Returns None when no
+        phase-2 routing decisions were recorded since the last
+        `begin_segment` call.
+        """
+        out = self._log_pi_sum
+        self._log_pi_sum = None
+        return out
+
+    def step_core_from_h(self, h_input: torch.Tensor) -> WalkerCoreReadout:
+        """Hot core driven by an externally-supplied `[B, D_s]` vector
+        instead of a `token_id`. Used by the pretrained-LM integration
+        (`forward_segment`) where h_mem_t = W_in(llama_hidden_state_t)
+        arrives already in graph-state dim.
+
+        Does not use the compiled path — compile target is the token_id
+        variant; the pretrained forward lives outside the walker hot path
+        anyway (Llama's N-1 frozen layers dominate wall time).
+        """
+        self._ensure_block_caches(self.tied_token_emb.weight)
+        # Dummy token_id argument (ignored when h_input_override is passed).
+        # We still need SOMETHING with a .device so schedule_tensors and
+        # downstream ops don't choke. Any scalar int will do.
+        dummy_tok = torch.zeros(
+            h_input.shape[0], dtype=torch.int64, device=h_input.device,
+        )
+        tau, epsilon = self._schedule_tensors(dummy_tok)
+        is_new_window = self.window_len == 0
+        e_bias_active = self._active_e_bias()
+        out = self._step_core_pure(
+            self.s, self.walker_pos, self.walker_state,
+            self.prev_motor, e_bias_active,
+            dummy_tok, tau, epsilon, is_new_window,
+            h_input_override=h_input,
+        )
+        self._apply_step_state(out)
+        return WalkerCoreReadout(
+            motor_state=out.motor_state,
+            visit_freq_step=out.visit_freq_step,
+            load_balance_loss=out.load_balance_loss,
+        )
+
+    def forward_segment(
+        self,
+        h_mem: torch.Tensor,                     # [B, T, D_s]
+        input_ids: torch.Tensor,                 # [B, T] int64 (targets + surprise)
+        adapter: "MemAdapter | None" = None,     # Llama adapter for aux CE
+        *,
+        compute_aux_loss: bool = True,
+        preserve_graph: bool = False,
+        walker_aux_weight: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Process one segment of pretrained-LM hidden states through the
+        walker. Returns per-token walker readouts in graph-state space,
+        plus an optional aux CE (motor_state → adapter.mem_head_logits →
+        CE vs shifted input_ids).
+
+        Semantics match `v2`'s `MemoryGraph.forward_segment` so the same
+        `MemInjectLayer` + cycle-loop scaffolding in `src/pretrained/`
+        can wire this in with minimal changes.
+
+        State contract:
+        - Caller is responsible for `begin_segment(B, device)` (via
+          `wrapper.reset_memory(bs)`) before the first segment. This
+          function does NOT re-init state — it only processes the segment.
+        - TBPTT: state is detached every `cfg.tbptt_block` tokens within
+          the segment. Skipped when `preserve_graph=True` (AR unroll).
+        - Plasticity + surprise fold fire at `cfg.mod_period` cadence,
+          using the walker's OWN multi-horizon CE against upcoming
+          `input_ids` (not Llama's CE). Cheap, local, avoids a Llama-side
+          dependency for plasticity.
+
+        Returned aux loss combines (when `compute_aux_loss=True`):
+          1. Walker-side multi-horizon CE (gradient flows to state_to_model,
+             walker hot path). Always included when compute_aux_loss.
+             Scaled by `walker_aux_weight`.
+          2. Llama-side horizon-1 CE via `adapter.mem_head_logits` (gradient
+             flows to W_out, Llama norm/lm_head are frozen). Included only
+             when adapter is provided.
+        """
+        B, T, D_s = h_mem.shape
+        assert D_s == self.cfg.D_s, (
+            f"h_mem last-dim {D_s} must match cfg.D_s {self.cfg.D_s}"
+        )
+        assert input_ids.shape == (B, T), (
+            f"input_ids shape {tuple(input_ids.shape)} must be [B, T]={(B, T)}"
+        )
+        assert self._state_initialized, (
+            "call begin_segment(B, device) before forward_segment()"
+        )
+
+        device = h_mem.device
+        cfg = self.cfg
+        tbptt = cfg.tbptt_block
+        K_h = cfg.K_horizons
+
+        motor_states: list[torch.Tensor] = []
+        # Per-block buffers for surprise fold + aux CE.
+        block_motor_list: list[torch.Tensor] = []
+        block_start = 0
+        # Horizon weights mirror `phase1_step`: horizon-1 is primary (1.0),
+        # rest (0.2). Keeps walker-side aux semantically aligned with
+        # standalone training.
+        horizon_weights = torch.full(
+            (K_h,), 0.2, device=device, dtype=torch.float32,
+        )
+        horizon_weights[0] = 1.0
+        # Accumulators for the two aux-loss components (gradient-carrying).
+        walker_ce_sum = torch.zeros(K_h, device=device, dtype=torch.float32)
+        walker_ce_count = torch.zeros(K_h, device=device, dtype=torch.float32)
+        llama_ce_sum = torch.zeros((), device=device, dtype=torch.float32)
+        llama_ce_count = 0
+
+        for t in range(T):
+            r = self.step_core_from_h(h_mem[:, t])
+            motor_states.append(r.motor_state)
+            block_motor_list.append(r.motor_state)
+
+            ticks = len(block_motor_list)
+            is_block_end = (ticks >= tbptt) or (t == T - 1)
+            if not is_block_end:
+                continue
+
+            motor_bt = torch.stack(block_motor_list, dim=1)       # [B, ticks, D_s]
+
+            # --- Walker's own multi-horizon CE.
+            # Shape logic matches phase1_step.flush(); uses the walker's
+            # internal tied_token_emb readout, NOT Llama's. This same CE
+            # drives (a) the walker-side aux loss, gradient-carrying, and
+            # (b) the surprise EMA fold, detached.
+            i_idx = torch.arange(ticks, device=device)
+            k_idx = torch.arange(1, K_h + 1, device=device)
+            t_idx = block_start + i_idx.unsqueeze(1) + k_idx.unsqueeze(0)  # [ticks, K_h]
+            valid_tk = t_idx < T
+            t_idx_clamped = t_idx.clamp(max=T - 1)
+            targets = input_ids.index_select(
+                1, t_idx_clamped.reshape(-1),
+            ).reshape(B, ticks, K_h)
+            valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
+
+            with torch.autocast(device_type=device.type, enabled=False):
+                ce_masked = self.readout_ce_block(
+                    motor_bt, targets, valid_btk,
+                )                                                  # [B, ticks, K_h]
+            if compute_aux_loss:
+                walker_ce_sum = walker_ce_sum + ce_masked.sum(dim=(0, 1))
+                walker_ce_count = (
+                    walker_ce_count + valid_tk.float().sum(dim=0) * B
+                )
+            self.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
+            self._maybe_finalize_surprise_and_plasticity()
+
+            # --- Llama-side aux CE (horizon-1 against adapter.mem_head_logits).
+            if compute_aux_loss and adapter is not None:
+                aux_valid_i = (block_start + i_idx + 1) < T
+                if aux_valid_i.any():
+                    motor_flat = motor_bt.reshape(B * ticks, D_s)
+                    mem_logits = adapter.mem_head_logits(motor_flat)   # [B*ticks, vocab_lm]
+                    aux_t_idx = (block_start + i_idx + 1).clamp(max=T - 1)
+                    tgt = input_ids.index_select(1, aux_t_idx)         # [B, ticks]
+                    tgt_flat = tgt.reshape(B * ticks)
+                    valid_flat = aux_valid_i.unsqueeze(0).expand(B, -1).reshape(-1)
+                    ce_all = F.cross_entropy(
+                        mem_logits.float(), tgt_flat, reduction="none",
+                    )                                                  # [B*ticks]
+                    llama_ce_sum = llama_ce_sum + (ce_all * valid_flat.float()).sum()
+                    llama_ce_count += int(valid_flat.sum().item())
+
+            # TBPTT detach at block boundary (unless AR unroll preserving graph).
+            if not preserve_graph and t < T - 1:
+                self.detach_state()
+
+            block_motor_list = []
+            block_start = t + 1
+
+        readouts = torch.stack(motor_states, dim=1)                    # [B, T, D_s]
+
+        aux_loss: torch.Tensor | None = None
+        if compute_aux_loss:
+            # Walker-side: horizon-weighted mean CE (gradient-carrying).
+            has_counts = walker_ce_count > 0
+            per_h_mean = walker_ce_sum / walker_ce_count.clamp(min=1)
+            denom = horizon_weights[has_counts].sum().clamp(min=1)
+            walker_mh_ce = (
+                per_h_mean * horizon_weights * has_counts.float()
+            ).sum() / denom
+            aux_loss = walker_aux_weight * walker_mh_ce
+            # Llama-side: horizon-1 mean (gradient to W_out, walker).
+            if adapter is not None and llama_ce_count > 0:
+                aux_loss = aux_loss + (llama_ce_sum / llama_ce_count)
+        return readouts, aux_loss
+
     def _step_core_pure(
         self,
         s_in: torch.Tensor,              # [B, N, D_s]
@@ -890,10 +1105,11 @@ class GraphWalkerMemory(nn.Module):
         walker_state_in: torch.Tensor,   # [B, H, D_s]
         prev_motor_in: torch.Tensor,     # [B, D_s]
         e_bias_flat_in: torch.Tensor,    # [N*K] fp32 — snapshot of plastic bias
-        token_id: torch.Tensor,          # [B] int64
+        token_id: torch.Tensor,          # [B] int64 (ignored if h_input_override given)
         tau: torch.Tensor,               # scalar
         epsilon: torch.Tensor,           # scalar
         is_new_window: bool,             # True at segment start AND after plasticity fires
+        h_input_override: torch.Tensor | None = None,   # [B, D_s] — bypass token embed
     ) -> WalkerCorePureOutput:
         """Pure-functional one-token walker update.
 
@@ -936,8 +1152,16 @@ class GraphWalkerMemory(nn.Module):
         alpha = self._alpha_cache                                     # [N]
 
         # 1. Embed token and project to graph-state space.
-        h_input_model = self.tied_token_emb(token_id)                 # [B, D_model]
-        h_input = self.token_to_state(h_input_model)                  # [B, D_s]
+        #    When h_input_override is provided (pretrained-LM path), skip
+        #    the token_emb lookup and use the supplied vector directly.
+        #    In that case h_input_model is None — anchor v_inject falls
+        #    back to mem_input_v_proj (see block 2 below).
+        if h_input_override is None:
+            h_input_model = self.tied_token_emb(token_id)             # [B, D_model]
+            h_input = self.token_to_state(h_input_model)              # [B, D_s]
+        else:
+            h_input_model = None
+            h_input = h_input_override                                # [B, D_s]
 
         # 2. Window-boundary anchor pick (only when a new plasticity window
         # is starting). Within a window, walkers roam using their persistent
@@ -957,12 +1181,25 @@ class GraphWalkerMemory(nn.Module):
             scores_in_flat = scores_in.reshape(BH, self._N_in)
             rout_in = gumbel_top1_softmax(
                 scores_in_flat, tau=tau, epsilon=epsilon, training=is_training,
+                phase=self.phase,
             )
+            if rout_in.log_pi is not None:
+                # Sum per-batch-element by reducing the H walker dim.
+                lp_in = rout_in.log_pi.view(B, cfg_n_heads).sum(dim=1)  # [B]
+                self._log_pi_sum = (
+                    lp_in if self._log_pi_sum is None
+                    else self._log_pi_sum + lp_in
+                )
             start_local = rout_in.selected_idx.view(B, cfg_n_heads)
             start_cols = self.input_positions[start_local]            # [B, H]
             cur_bh = start_cols.reshape(BH)                           # teleport
 
-            v_inject = self.input_v_proj(h_input_model)               # [B, D_s]
+            if h_input_model is not None:
+                v_inject = self.input_v_proj(h_input_model)           # [B, D_s]
+            else:
+                # Pretrained-LM path: no D_model-dim h; take v_inject
+                # from the D_s-dim Llama-projected h via mem_input_v_proj.
+                v_inject = self.mem_input_v_proj(h_input)             # [B, D_s]
             input_ste_weights = torch.gather(
                 rout_in.ste_weights, 1, rout_in.selected_idx.unsqueeze(1),
             ).squeeze(1)                                              # [B*H]
@@ -1059,7 +1296,13 @@ class GraphWalkerMemory(nn.Module):
 
         rout = gumbel_top1_softmax(
             scores, tau=tau, epsilon=epsilon, training=is_training,
+            phase=self.phase,
         )
+        if rout.log_pi is not None:
+            lp = rout.log_pi.view(B, cfg_n_heads).sum(dim=1)            # [B]
+            self._log_pi_sum = (
+                lp if self._log_pi_sum is None else self._log_pi_sum + lp
+            )
         next_local = rout.selected_idx                                # [B*H]
         next_col = torch.gather(
             nbrs_of_cur, 1, next_local.unsqueeze(-1),

@@ -109,12 +109,19 @@ def test_all_trainable_params_get_gradient():
     )
     assert torch.isfinite(torch.tensor(stats.loss))
 
+    # Params that only participate in the pretrained-LM (forward_segment)
+    # path, not the StandaloneLM token-id path. Their gradient is verified
+    # in the pretrained smoke tests, not here.
+    STANDALONE_UNUSED = {"memory.mem_input_v_proj.weight"}
+
     missing: list[str] = []
     nonfinite: list[str] = []
     zero_grad: list[str] = []
 
     for name, p in lm.named_parameters():
         if not p.requires_grad:
+            continue
+        if name in STANDALONE_UNUSED:
             continue
         if p.grad is None:
             missing.append(name)
@@ -154,9 +161,12 @@ def test_gradient_flow_without_neuromod():
     )
     assert torch.isfinite(torch.tensor(stats.loss))
 
+    STANDALONE_UNUSED = {"memory.mem_input_v_proj.weight"}
     missing, nonfinite, zero_grad = [], [], []
     for name, p in lm.named_parameters():
         if not p.requires_grad:
+            continue
+        if name in STANDALONE_UNUSED:
             continue
         if p.grad is None:
             missing.append(name)

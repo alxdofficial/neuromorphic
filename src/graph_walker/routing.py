@@ -36,6 +36,9 @@ class RoutingOutput:
     selected_idx: torch.Tensor     # [B] long — argmax of Gumbel-perturbed logits
     ste_weights: torch.Tensor      # [B, K] float — straight-through one-hot
     soft_probs: torch.Tensor       # [B, K] float — for analysis / load-balance loss
+    log_pi: torch.Tensor | None = None  # [B] float — log π(selected_idx); only
+                                        # populated in phase="phase2" (hard
+                                        # Categorical, REINFORCE / GRPO).
 
 
 def _sample_exploration_mask(
@@ -64,19 +67,44 @@ def gumbel_top1_softmax(
     tau: torch.Tensor | float,     # Gumbel temperature (tensor for compile)
     epsilon: torch.Tensor | float, # exploration probability (tensor for compile)
     training: bool,                # True → stochastic; False → argmax
+    phase: str = "phase1",         # "phase1" Gumbel-STE | "phase2" hard Categorical
 ) -> RoutingOutput:
     """Gumbel top-1 softmax with straight-through and optional ε-exploration.
 
-    At training time: sample via Gumbel, return hard argmax forward + soft
-    gradient backward. With probability ε, replace with uniform random.
+    Phases:
+    - `phase1` (default): Gumbel-soft sample, hard one-hot forward, soft
+      gradient backward via STE. Used for backprop-driven training.
+    - `phase2`: hard Categorical sample from softmax(scores), no temperature
+      noise, returns `log_pi` (log of the picked-index probability under
+      the policy). For REINFORCE / GRPO. ε-exploration is disabled in this
+      mode — exploration in phase 2 is Categorical sampling itself.
 
-    At inference: hard argmax directly, no noise.
+    At inference (training=False): hard argmax directly, no noise, no log_pi.
 
     tau and epsilon are tensors (not Python floats) so dynamo doesn't
     specialise-recompile each time they anneal.
     """
     B, K = scores.shape
     device = scores.device
+
+    if training and phase == "phase2":
+        # Hard Categorical sample. log_pi = log p(selected) under softmax(scores).
+        soft = F.softmax(scores.float(), dim=-1)
+        log_probs = F.log_softmax(scores.float(), dim=-1)
+        # `multinomial` requires cpu/cuda probs; numerically clamp to avoid 0s.
+        probs = soft.clamp(min=1e-12)
+        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)   # [B]
+        # log_pi must remain graph-connected to scores so REINFORCE backprop
+        # reaches every parameter that produced `scores` (q_proj, k_all,
+        # E_bias, neuromod via active_E_bias).
+        log_pi = log_probs.gather(1, sampled.unsqueeze(-1)).squeeze(-1) # [B]
+        hard = F.one_hot(sampled, num_classes=K).to(scores.dtype)
+        return RoutingOutput(
+            selected_idx=sampled,
+            ste_weights=hard,                # forward only — gradient comes via log_pi
+            soft_probs=soft,
+            log_pi=log_pi,
+        )
 
     if training:
         # Gumbel noise
