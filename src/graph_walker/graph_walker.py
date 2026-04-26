@@ -382,6 +382,8 @@ class GraphWalkerMemory(nn.Module):
             plane_rows=cfg.plane_rows, plane_cols=cfg.plane_cols,
             L=cfg.L, K=cfg.K, p_rewire=cfg.p_rewire,
             K_intra_fraction=cfg.K_intra_fraction, seed=cfg.topology_seed,
+            K_inter_bwd_fraction=cfg.K_inter_bwd_fraction,
+            intra_radius=cfg.intra_radius, inter_radius=cfg.inter_radius,
         )
         self.register_buffer("out_nbrs", topo.out_nbrs, persistent=False)
         self.register_buffer("edge_src", topo.edge_src, persistent=False)

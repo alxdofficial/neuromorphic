@@ -229,12 +229,19 @@ def test_p2a_lif_cpu_fallback_backward_is_finite():
 
 
 def test_p2b_config_rejects_K_exceeding_candidate_counts():
-    """K=64 with default K_intra_fraction=0.5 → K_intra=32 > max_intra=24.
-    Pre-fix this crashes in build_topology with a tensor-shape mismatch.
-    Now it must raise a clear ValueError at config construction."""
+    """K must fit Moore-radius candidate counts. With radius=2 the cap is 24
+    intra / 25 inter; pre-fix, exceeding either crashed deep inside
+    build_topology with a tensor-shape mismatch. Now it must raise a clear
+    ValueError at config construction.
+
+    Test uses radius=2 explicitly (overriding the new radius=3 default) so
+    the cap stays low enough to trip — at radius=3 the cap is 48 intra /
+    49 inter and K=64 would actually fit.
+    """
     with pytest.raises(ValueError, match="(intra-plane|inter-plane).*candidate"):
         GraphWalkerConfig(
             plane_rows=8, plane_cols=8, L=4, K=64, K_intra_fraction=0.5,
+            intra_radius=2, inter_radius=2,        # force the small cap
             mod_period=64, tbptt_block=64, segment_T=64,
             K_buf=4, K_horizons=4,
         )

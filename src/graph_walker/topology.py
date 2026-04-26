@@ -64,7 +64,31 @@ def build_topology(
     p_rewire: float,
     K_intra_fraction: float,
     seed: int,
+    K_inter_bwd_fraction: float = 0.5,
+    intra_radius: int = 2,
+    inter_radius: int = 2,
 ) -> Topology:
+    """Build the graph-walker topology.
+
+    Each column gets ``K`` outgoing edges, partitioned into three groups:
+      - ``K_intra``    edges to the same plane (Moore radius ``intra_radius``)
+      - ``K_inter_fwd`` edges to plane ``(p + 1) % L`` (forward in depth)
+      - ``K_inter_bwd`` edges to plane ``(p - 1) % L`` (backward in depth)
+
+    Where:
+      ``K_intra        = round(K · K_intra_fraction)``
+      ``K_inter_total  = K − K_intra``
+      ``K_inter_bwd    = round(K_inter_total · K_inter_bwd_fraction)``
+      ``K_inter_fwd    = K_inter_total − K_inter_bwd``
+
+    With defaults (K_intra_fraction=0.5, K_inter_bwd_fraction=0.5), edges
+    split roughly into thirds across (same plane, forward, backward) — no
+    structural feed-forward bias. Set ``K_inter_bwd_fraction=0.0`` for the
+    legacy forward-only behaviour.
+
+    On top of this structured topology, ``p_rewire`` fraction of edges have
+    their destination replaced by a uniform-random global column.
+    """
     N_per_plane = plane_rows * plane_cols
     N = L * N_per_plane
 
@@ -84,11 +108,11 @@ def build_topology(
         dtype=torch.int64,
     )
 
-    # Out-edges
+    # Out-edge budget: K = K_intra + K_inter_fwd + K_inter_bwd.
     K_intra = max(1, int(round(K * K_intra_fraction)))
-    K_inter = K - K_intra
-    intra_radius = 2
-    inter_radius = 2
+    K_inter_total = K - K_intra
+    K_inter_bwd = int(round(K_inter_total * K_inter_bwd_fraction))
+    K_inter_fwd = K_inter_total - K_inter_bwd
 
     out_nbrs = torch.empty(N, K, dtype=torch.int64)
 
@@ -97,16 +121,39 @@ def build_topology(
             for c in range(plane_cols):
                 src = to_flat(p, r, c)
 
-                intra_cands = _intra_plane_candidates(plane_rows, plane_cols, r, c, intra_radius)
+                # Intra-plane neighbours (same plane p).
+                intra_cands = _intra_plane_candidates(
+                    plane_rows, plane_cols, r, c, intra_radius,
+                )
                 idx = torch.randperm(len(intra_cands), generator=g)[:K_intra]
                 intra_flat = [to_flat(p, *intra_cands[int(i)]) for i in idx]
 
-                p_next = (p + 1) % L
-                inter_cands = _inter_plane_candidates(plane_rows, plane_cols, r, c, inter_radius)
-                idx = torch.randperm(len(inter_cands), generator=g)[:K_inter]
-                inter_flat = [to_flat(p_next, *inter_cands[int(i)]) for i in idx]
+                # Forward inter-plane neighbours (plane p+1).
+                inter_cands = _inter_plane_candidates(
+                    plane_rows, plane_cols, r, c, inter_radius,
+                )
+                if K_inter_fwd > 0:
+                    p_fwd = (p + 1) % L
+                    idx = torch.randperm(len(inter_cands), generator=g)[:K_inter_fwd]
+                    inter_fwd_flat = [
+                        to_flat(p_fwd, *inter_cands[int(i)]) for i in idx
+                    ]
+                else:
+                    inter_fwd_flat = []
 
-                out_nbrs[src] = torch.tensor(intra_flat + inter_flat, dtype=torch.int64)
+                # Backward inter-plane neighbours (plane p-1).
+                if K_inter_bwd > 0:
+                    p_bwd = (p - 1) % L
+                    idx = torch.randperm(len(inter_cands), generator=g)[:K_inter_bwd]
+                    inter_bwd_flat = [
+                        to_flat(p_bwd, *inter_cands[int(i)]) for i in idx
+                    ]
+                else:
+                    inter_bwd_flat = []
+
+                out_nbrs[src] = torch.tensor(
+                    intra_flat + inter_fwd_flat + inter_bwd_flat, dtype=torch.int64,
+                )
 
     # Watts-Strogatz rewiring
     rand = torch.rand(N, K, generator=g)

@@ -11,19 +11,42 @@ from dataclasses import dataclass
 @dataclass
 class GraphWalkerConfig:
     # --- Graph topology (same spirit as column_graph) ---
-    plane_rows: int = 16
-    plane_cols: int = 16
+    plane_rows: int = 24                # was 16; → 576 cols/plane
+    plane_cols: int = 24                # was 16
     L: int = 4                          # number of planes (0 = input, L-1 = output)
-    K: int = 32                         # out-edges per column
-    # p_rewire: Watts-Strogatz rewiring probability. 0.0 = pure local grid
-    # (every edge bounded to Moore radius 2 in same plane or next plane).
-    # Non-zero replaces that fraction of edges with uniform-random long-
-    # range destinations — gives log-diameter small-world reach at the
-    # cost of spatially-arbitrary teleports. Disabled by default; walks
-    # rely on grid+plane hierarchy for retrieval, plasticity (E_bias) for
-    # learned emphasis on useful local routes.
-    p_rewire: float = 0.0
+    K: int = 64                         # out-edges per column (was 32). With
+                                        # K_intra=K_inter_fwd=K_inter_bwd budget
+                                        # of ~K/3 each, and intra_radius=3 →
+                                        # max_intra=48, K_intra=32 fits with
+                                        # headroom.
+    # p_rewire: Watts-Strogatz rewiring probability. Each edge's destination
+    # is, with probability p_rewire, replaced by a uniform-random column
+    # anywhere in the graph (any plane, any (r, c)). 0.0 = pure local grid.
+    #
+    # Default 0.3 (well past the small-world transition at ~0.1).
+    # Rationale: under the "graph as syntactic substrate for an emergent
+    # high-dimensional language" framing, the topology is the grammar's
+    # possibility space — what trajectories the model is even allowed to
+    # encode. A pure grid forces local-relations-only "sentences" (Moore
+    # radius-2 + plane progression), syntactically impoverished. Heavy
+    # rewiring gives the language long-distance syntactic moves at init,
+    # before plasticity has had to discover them. Trade-off: weaker spatial
+    # prior at init, more work for plasticity to learn which random edges
+    # carry meaning. ε-exploration in routing.py provides per-decision
+    # stochasticity on top.
+    p_rewire: float = 0.3
     K_intra_fraction: float = 0.5
+    # Of the K_inter = K - K_intra inter-plane edges, what fraction goes
+    # BACKWARD (to plane p-1) vs FORWARD (to plane p+1). Default 0.5 means
+    # equal split → no structural feed-forward bias under your "graph as
+    # syntactic substrate" framing. Set 0.0 to recover legacy forward-only.
+    K_inter_bwd_fraction: float = 0.5
+    # Moore-radius for intra/inter-plane neighbour candidate sampling.
+    # Radius 2 → 24 intra candidates, 25 inter candidates.
+    # Radius 3 → 48 intra candidates, 49 inter candidates (needed for K ≥ ~50
+    # since we now split inter into fwd+bwd halves: K_inter_dir ≤ max_inter).
+    intra_radius: int = 3               # was 2; bumped to support K=48
+    inter_radius: int = 3               # was 2
 
     # --- Per-plane weight specialisation ---
     # When True, content_mlp has L independent copies (one per plane).
@@ -37,20 +60,33 @@ class GraphWalkerConfig:
     # is identical to the shared path since each walker still does one
     # forward pass, just with its own weights.
     per_head_content_mlp: bool = False
-    content_mlp_depth: int = 4          # residual FFN blocks (shared weights)
+    content_mlp_depth: int = 4          # residual FFN blocks at D_s=1024,
+                                        # D_hid=4·D_s. 4 stacked nonlinear
+                                        # composition steps per walker per
+                                        # token. 8.4M params per block.
 
     # --- Widths ---
     # D_model is the external lexical/readout width (token embedding,
     # tied unembedding, post-readout capacity). D_s is the internal graph
     # state width paid in the per-hop recurrent hot path.
     D_model: int = 1024
-    D_s: int = 512                      # column state dim
-    D_id: int = 32
+    D_s: int = 1024                     # column state dim, was 512
+    D_id: int = 512                     # column identity vector, was 32. The
+                                        # identity should be a rich semantic
+                                        # vector ("what concept does this
+                                        # column carry"), not a tiny ID tag.
     ffn_mult_content: int = 4           # content_mlp: D_s + D_id → 4·D_s → D_s
     # Post-readout model-space capacity. These blocks run once per token,
     # not once per hop, so they are a cheaper place to keep params than
-    # the walker hot loop.
-    post_model_depth: int = 7
+    # the walker hot loop. BUT under the "memory graph IS the model" framing
+    # we want most parameters in the substrate + plasticity, not in a
+    # standard FFN bolted on after the graph is done thinking. Reduced from
+    # 7 to 3 to free ~32M params for graph-side capacity.
+    post_model_depth: int = 2           # was 7. The thesis is that the
+                                        # graph IS the model — the cold
+                                        # readout is just a thin lexical
+                                        # projection head, not a deep
+                                        # transformer FFN tower.
     post_model_ffn_mult: int = 4
     n_score_heads: int = 4              # multi-head bilinear edge scoring
     D_q_per_head: int = 64
@@ -102,12 +138,18 @@ class GraphWalkerConfig:
     # scalar-eta Hebbian-only; disable with `use_neuromod=False` to
     # ablate.
     use_neuromod: bool = True
-    neuromod_D_mod: int = 128
-    neuromod_n_layers: int = 2
-    neuromod_n_heads: int = 4
+    # Neuromod sizing: this is the "learns how to learn" component — for a
+    # lifelong-learning agent it needs enough capacity to encode meta-rules
+    # over the graph, not just be a regulariser. Was 128/2/4/64 (~0.5M
+    # params, 0.4% of the model); bumped to 384/4/8/256 (~8M, ~6% of the
+    # model) so plasticity has real headroom to learn long-horizon
+    # modulation strategies.
+    neuromod_D_mod: int = 384           # was 128
+    neuromod_n_layers: int = 4          # was 2 — depth for graph reasoning
+    neuromod_n_heads: int = 8           # was 4
     # Hidden dim of the per-edge target MLP (cat(x_src, x_dst) → scalar).
     # Replaces the old low-rank bilinear decoder's `neuromod_rank`.
-    neuromod_edge_hidden: int = 64
+    neuromod_edge_hidden: int = 256     # was 64
     # Extra live/commit scale on top of the neuromod's own learnable blend
     # rate γ = σ(blend_logit). With γ as the primary knob this should be 1;
     # kept as a config knob for conservative sweeps or quick ablation.
@@ -180,30 +222,39 @@ class GraphWalkerConfig:
                 "would silently skip plasticity firings because the flush "
                 "code only runs _maybe_finalize... after backward."
             )
-        # K must fit the topology's local-neighborhood candidate counts.
-        # build_topology samples K_intra distinct intra-plane neighbours
-        # (Moore radius=2 → 24 candidates) and K_inter distinct inter-plane
-        # neighbours (radius=2 → 25 candidates). torch.randperm[:k] silently
-        # gives min(k, len(candidates)) elements, then assignment shape-
-        # mismatches `out_nbrs[src] = ...` and crashes — guard up front.
+        # Validate the K split against the topology's local-neighborhood
+        # candidate counts. build_topology samples without replacement via
+        # torch.randperm; if K_intra/K_inter_fwd/K_inter_bwd exceed their
+        # candidate counts, randperm silently truncates and the assignment
+        # `out_nbrs[src] = ...` shape-mismatches and crashes. Guard up front.
+        if not 0.0 <= self.K_inter_bwd_fraction <= 1.0:
+            raise ValueError("K_inter_bwd_fraction must be in [0, 1]")
+        if self.intra_radius < 1 or self.inter_radius < 1:
+            raise ValueError("radii must be >= 1")
         K_intra = max(1, int(round(self.K * self.K_intra_fraction)))
-        K_inter = self.K - K_intra
-        max_intra = 24                 # 5*5 - 1 (excluding self)
-        max_inter = 25                 # 5*5 (next plane wraps via modulo)
+        K_inter_total = self.K - K_intra
+        K_inter_bwd = int(round(K_inter_total * self.K_inter_bwd_fraction))
+        K_inter_fwd = K_inter_total - K_inter_bwd
+        # Moore neighbourhood sizes: (2r+1)^2, minus self for intra-plane.
+        max_intra = (2 * self.intra_radius + 1) ** 2 - 1
+        max_inter = (2 * self.inter_radius + 1) ** 2
         if K_intra > max_intra:
             raise ValueError(
                 f"K * K_intra_fraction = {K_intra} exceeds the "
-                f"intra-plane Moore-radius-2 candidate count ({max_intra}). "
-                f"Reduce K (currently {self.K}) or K_intra_fraction "
+                f"intra-plane Moore-radius-{self.intra_radius} candidate "
+                f"count ({max_intra}). Increase intra_radius, reduce K "
+                f"(currently {self.K}), or reduce K_intra_fraction "
                 f"(currently {self.K_intra_fraction})."
             )
-        if K_inter > max_inter:
-            raise ValueError(
-                f"K * (1 - K_intra_fraction) = {K_inter} exceeds the "
-                f"inter-plane Moore-radius-2 candidate count ({max_inter}). "
-                f"Reduce K (currently {self.K}) or raise K_intra_fraction "
-                f"(currently {self.K_intra_fraction})."
-            )
+        for label, k_dir in (("forward", K_inter_fwd), ("backward", K_inter_bwd)):
+            if k_dir > max_inter:
+                raise ValueError(
+                    f"K_inter_{label} = {k_dir} exceeds the inter-plane "
+                    f"Moore-radius-{self.inter_radius} candidate count "
+                    f"({max_inter}). Increase inter_radius, reduce K "
+                    f"(currently {self.K}), or rebalance K_intra_fraction / "
+                    f"K_inter_bwd_fraction."
+                )
 
     @property
     def N_per_plane(self) -> int:
