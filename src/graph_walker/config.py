@@ -168,7 +168,10 @@ class GraphWalkerConfig:
     vocab_size: int = 32_000
 
     # --- Training ---
-    segment_T: int = 256
+    segment_T: int = 1024               # was 256. 8 windows per phase1_step
+                                        # call → 8 plasticity fires per opt
+                                        # step. Block memory unchanged
+                                        # (depends only on mod_period).
     lr: float = 1e-4
     compile_on_train: bool = True
     # torch.compile mode for compile_block.
