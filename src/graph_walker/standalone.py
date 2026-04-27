@@ -12,12 +12,14 @@ from src.graph_walker.graph_walker import GraphWalkerMemory, WalkerReadout
 
 
 class StandaloneLM(nn.Module):
-    def __init__(self, cfg: GraphWalkerConfig) -> None:
+    def __init__(self, cfg: GraphWalkerConfig, verbose: bool = False) -> None:
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.D_model)
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        self.memory = GraphWalkerMemory(cfg, tied_token_emb=self.token_emb)
+        self.memory = GraphWalkerMemory(
+            cfg, tied_token_emb=self.token_emb, verbose=verbose,
+        )
 
     def set_training_step(self, step: int) -> None:
         """Sets the step counter used for Gumbel temperature / ε annealing."""

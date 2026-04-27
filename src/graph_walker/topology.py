@@ -67,6 +67,7 @@ def build_topology(
     K_inter_bwd_fraction: float = 0.5,
     intra_radius: int = 2,
     inter_radius: int = 2,
+    verbose: bool = False,
 ) -> Topology:
     """Build the graph-walker topology.
 
@@ -116,10 +117,28 @@ def build_topology(
 
     out_nbrs = torch.empty(N, K, dtype=torch.int64)
 
+    import time as _time
+    t_topo_start = _time.perf_counter()
+    last_print = t_topo_start
+    cols_done = 0
+
     for p in range(L):
         for r in range(plane_rows):
             for c in range(plane_cols):
                 src = to_flat(p, r, c)
+                if verbose:
+                    cols_done += 1
+                    now = _time.perf_counter()
+                    if now - last_print > 2.0:
+                        pct = 100.0 * cols_done / N
+                        rate = cols_done / (now - t_topo_start)
+                        eta = (N - cols_done) / max(rate, 1e-6)
+                        print(
+                            f"  [topology] {cols_done}/{N} cols ({pct:.0f}%), "
+                            f"{rate:.0f} cols/s, ETA {eta:.0f}s",
+                            flush=True,
+                        )
+                        last_print = now
 
                 # Intra-plane neighbours (same plane p).
                 intra_cands = _intra_plane_candidates(
@@ -161,6 +180,12 @@ def build_topology(
     if rewire_mask.any():
         new_dests = torch.randint(0, N, (int(rewire_mask.sum().item()),), generator=g)
         out_nbrs[rewire_mask] = new_dests
+
+    if verbose:
+        print(
+            f"  [topology] done in {_time.perf_counter() - t_topo_start:.1f}s",
+            flush=True,
+        )
 
     edge_src = (
         torch.arange(N, dtype=torch.int64)

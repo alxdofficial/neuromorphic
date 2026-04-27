@@ -43,11 +43,18 @@ Constraints we accept for capture compatibility:
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 
 import torch
 
 from src.graph_walker.standalone import StandaloneLM
+
+
+def _nullcontext():
+    """A no-op context manager — used when verbose=False so we don't pay the
+    threading.Thread + heartbeat cost at training time."""
+    return contextlib.nullcontext()
 
 
 @dataclass
@@ -290,7 +297,7 @@ class CapturedBlockTrainer:
             # the contract stable).
             memory.surprise_prev.copy_(memory.surprise_ema)
 
-    def warmup_and_capture(self, n_warmup: int = 3) -> None:
+    def warmup_and_capture(self, n_warmup: int = 3, verbose: bool = False) -> None:
         """Warmup + capture, all on a dedicated side stream.
 
         Per PyTorch's CUDA-graph idiom: warmup AND capture must share the same
@@ -304,9 +311,15 @@ class CapturedBlockTrainer:
         would start with the persistent buffer corrupted by ~4 spurious
         updates against random warmup tokens. We snapshot/restore it around
         the entire warmup-and-capture block to keep persistent state intact.
+
+        ``verbose=True`` prints a periodic heartbeat (elapsed time + GPU
+        memory + worker count) so the user knows compile is alive during the
+        long ~10-20 minute autotune at production scale.
         """
         if self._captured:
             return
+
+        from src.graph_walker.triton.compile_progress import compile_progress
 
         # Snapshot persistent plastic state — we'll restore it after capture
         # so warmup's spurious Hebbian updates don't leak into real training.
@@ -314,19 +327,43 @@ class CapturedBlockTrainer:
 
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
+
+        # Heartbeat the warmup + capture so the user knows it's alive during
+        # the slow first-time compile (subsequent runs hit cache, are fast).
+        cm = compile_progress(
+            f"cudagraph warmup+capture B={self.B} T_block={self.T_block}",
+            interval_s=20.0,
+        ) if verbose else _nullcontext()
+
+        with cm, torch.cuda.stream(side):
             # Warmup: allocate param.grad buffers on this stream + populate
             # AccumulateGrad node bindings so capture reuses them.
-            for _ in range(n_warmup):
+            for warmup_i in range(n_warmup):
+                if verbose:
+                    print(
+                        f"  [warmup] iter {warmup_i+1}/{n_warmup} starting...",
+                        flush=True,
+                    )
                 for p in self.lm.parameters():
                     if p.grad is not None:
                         p.grad.zero_()
                 self._iter_body()
+                if verbose:
+                    torch.cuda.synchronize()
+                    print(
+                        f"  [warmup] iter {warmup_i+1}/{n_warmup} done",
+                        flush=True,
+                    )
 
+            if verbose:
+                print("  [capture] starting CUDA graph capture...", flush=True)
             # Capture on the SAME stream as warmup.
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph, stream=side):
                 self._iter_body()
+            if verbose:
+                torch.cuda.synchronize()
+                print("  [capture] CUDA graph capture done", flush=True)
 
         torch.cuda.current_stream().wait_stream(side)
 

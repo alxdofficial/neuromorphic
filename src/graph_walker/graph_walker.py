@@ -371,7 +371,8 @@ class BlockOutput:
 
 class GraphWalkerMemory(nn.Module):
     def __init__(
-        self, cfg: GraphWalkerConfig, tied_token_emb: nn.Embedding
+        self, cfg: GraphWalkerConfig, tied_token_emb: nn.Embedding,
+        verbose: bool = False,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -384,6 +385,7 @@ class GraphWalkerMemory(nn.Module):
             K_intra_fraction=cfg.K_intra_fraction, seed=cfg.topology_seed,
             K_inter_bwd_fraction=cfg.K_inter_bwd_fraction,
             intra_radius=cfg.intra_radius, inter_radius=cfg.inter_radius,
+            verbose=verbose,
         )
         self.register_buffer("out_nbrs", topo.out_nbrs, persistent=False)
         self.register_buffer("edge_src", topo.edge_src, persistent=False)

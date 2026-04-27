@@ -11,14 +11,22 @@ from dataclasses import dataclass
 @dataclass
 class GraphWalkerConfig:
     # --- Graph topology (same spirit as column_graph) ---
-    plane_rows: int = 24                # was 16; → 576 cols/plane
-    plane_cols: int = 24                # was 16
+    plane_rows: int = 32                # was 24, originally 16. → 1024 cols/plane,
+    plane_cols: int = 32                # 4 planes = 4096 total cols. The graph
+                                        # is the model's vocabulary of concepts;
+                                        # N is the vocab size. Per-token compute
+                                        # is invariant to N (walkers visit only
+                                        # B·H cols per step regardless of N), so
+                                        # N is pure capacity at no runtime cost.
     L: int = 4                          # number of planes (0 = input, L-1 = output)
-    K: int = 64                         # out-edges per column (was 32). With
-                                        # K_intra=K_inter_fwd=K_inter_bwd budget
-                                        # of ~K/3 each, and intra_radius=3 →
-                                        # max_intra=48, K_intra=32 fits with
-                                        # headroom.
+    K: int = 96                         # out-edges per column (was 64, orig 32).
+                                        # With K_intra_fraction=0.5,
+                                        # K_inter_bwd_fraction=0.5 → K_intra=48,
+                                        # K_inter_fwd=24, K_inter_bwd=24. At
+                                        # radius=3, max_intra=48 (exact fit) and
+                                        # max_inter=49 (24/49 → comfortable).
+                                        # Per-step routing scoring stays in the
+                                        # noise relative to content_mlp.
     # p_rewire: Watts-Strogatz rewiring probability. Each edge's destination
     # is, with probability p_rewire, replaced by a uniform-random column
     # anywhere in the graph (any plane, any (r, c)). 0.0 = pure local grid.
@@ -70,7 +78,13 @@ class GraphWalkerConfig:
     # tied unembedding, post-readout capacity). D_s is the internal graph
     # state width paid in the per-hop recurrent hot path.
     D_model: int = 1024
-    D_s: int = 1024                     # column state dim, was 512
+    D_s: int = 768                      # column state dim. Original 512;
+                                        # tried 1024 (Option A, ~106M params,
+                                        # B=4 cudagraph OOM); settled on 768
+                                        # (Option B, ~75M params) so we keep
+                                        # most of the representational gain
+                                        # without the quadratic cost — D_s²
+                                        # is what makes content_mlp dominant.
     D_id: int = 512                     # column identity vector, was 32. The
                                         # identity should be a rich semantic
                                         # vector ("what concept does this
@@ -140,16 +154,17 @@ class GraphWalkerConfig:
     use_neuromod: bool = True
     # Neuromod sizing: this is the "learns how to learn" component — for a
     # lifelong-learning agent it needs enough capacity to encode meta-rules
-    # over the graph, not just be a regulariser. Was 128/2/4/64 (~0.5M
-    # params, 0.4% of the model); bumped to 384/4/8/256 (~8M, ~6% of the
-    # model) so plasticity has real headroom to learn long-horizon
-    # modulation strategies.
-    neuromod_D_mod: int = 384           # was 128
-    neuromod_n_layers: int = 4          # was 2 — depth for graph reasoning
+    # over the graph, not just be a regulariser. Originally 128/2/4/64
+    # (~0.5M, 0.4% of model); bumped to 384/4/8/256 (~8M, ~9% of model);
+    # bumped again to 512/6/8/384 (~20M, ~20% of model) since neuromod is
+    # FREE in per-token compute (fires once per mod_period window, runs
+    # outside the captured graph) — pure meta-learning capacity gain.
+    neuromod_D_mod: int = 512           # was 384, originally 128
+    neuromod_n_layers: int = 6          # was 4, originally 2 — depth for graph reasoning
     neuromod_n_heads: int = 8           # was 4
     # Hidden dim of the per-edge target MLP (cat(x_src, x_dst) → scalar).
     # Replaces the old low-rank bilinear decoder's `neuromod_rank`.
-    neuromod_edge_hidden: int = 256     # was 64
+    neuromod_edge_hidden: int = 384     # was 256, originally 64
     # Extra live/commit scale on top of the neuromod's own learnable blend
     # rate γ = σ(blend_logit). With γ as the primary knob this should be 1;
     # kept as a config knob for conservative sweeps or quick ablation.
