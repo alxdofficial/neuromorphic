@@ -11,7 +11,7 @@ import torch
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.standalone import StandaloneLM
 from src.graph_walker.train_phase1 import phase1_step, phase1_step_cudagraph
-from src.graph_walker.triton.lif import LIFScratch, sparse_lif_update_puretorch
+from src.graph_walker.triton.lif import sparse_lif_update_puretorch
 from src.graph_walker.triton_sparse_update import SparseLIFUpdate
 
 
@@ -204,10 +204,8 @@ def test_p2a_lif_cpu_fallback_backward_is_finite():
 
     msgs_p = msgs_pad.clone().requires_grad_(True)
     alpha_p = alpha.clone().requires_grad_(True)
-    scratch = LIFScratch.allocate(M_max=M_max, U_max=M_max, D_s=D_s,
-                                   device=s.device, dtype=s.dtype)
     out = LIFDepositFunction.apply(
-        s.clone(), msgs_p, dests_pad, alpha_p, N, scratch,
+        s.clone(), msgs_p, dests_pad, alpha_p, N,
     )
     (out * grad_up).sum().backward()
 

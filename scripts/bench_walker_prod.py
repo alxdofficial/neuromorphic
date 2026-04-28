@@ -144,20 +144,27 @@ def main() -> None:
         eager_results[B] = (tps, peak)
         last_ok_eager = B
 
-    # Try cudagraph at the largest B that fit eager (cudagraph uses LESS VRAM).
-    if last_ok_eager:
-        print(f"\n[cudagraph — use_neuromod=False, ~250s+ compile per new shape]",
-              flush=True)
-        r = bench_one(last_ok_eager, "cudagraph", segment_T_override=bench_segment_T)
+    # Sweep cudagraph across ALL B in Bs — this is the actual production
+    # path and the sparse-Triton LIF saves ~150 MB/step of activations vs
+    # the old fp32 dense puretorch path, so cudagraph can fit much larger
+    # batches than eager.
+    print(f"\n[cudagraph — use_neuromod=False, ~250s+ compile per new (B,T)]",
+          flush=True)
+    print(f"{'B':>4} {'tok/s':>10} {'tok/s/B':>9} {'peak GB':>9} {'warmup s':>9} "
+          f"{'vs eager':>10}", flush=True)
+    print("-" * 60, flush=True)
+    for B in Bs:
+        r = bench_one(B, "cudagraph", segment_T_override=bench_segment_T)
         if r is None:
-            print(f"  OOM at cudagraph B={last_ok_eager}", flush=True)
-        else:
-            warm, tps, peak = r
-            e_tps, e_peak = eager_results[last_ok_eager]
-            print(f"  B={last_ok_eager}  cudagraph={tps:.0f} tok/s   "
-                  f"eager={e_tps:.0f} tok/s   speedup={tps/e_tps:.1f}×   "
-                  f"peak {peak:.2f} GB (eager {e_peak:.2f} GB)",
-                  flush=True)
+            print(f"{B:>4} OOM", flush=True)
+            break
+        warm, tps, peak = r
+        speedup = ""
+        if B in eager_results:
+            e_tps, _ = eager_results[B]
+            speedup = f"{tps/e_tps:.1f}×"
+        print(f"{B:>4} {tps:>10.0f} {tps/B:>9.1f} {peak:>9.2f} {warm:>9.1f} "
+              f"{speedup:>10}", flush=True)
 
 
 if __name__ == "__main__":

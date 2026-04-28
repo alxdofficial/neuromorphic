@@ -90,6 +90,21 @@ class GraphWalkerConfig:
                                         # vector ("what concept does this
                                         # column carry"), not a tiny ID tag.
     ffn_mult_content: int = 4           # content_mlp: D_s + D_id → 4·D_s → D_s
+                                        # ONLY used when D_hid_content is None
+                                        # (legacy / small-D_s configs). For
+                                        # production at D_s=768, set
+                                        # D_hid_content explicitly so
+                                        # content_mlp cost stays linear in
+                                        # D_s instead of quadratic.
+    # Hidden width of every content_mlp ResidualFFN block. Decoupled from
+    # D_s — when None the legacy `ffn_mult_content * D_s` formula applies.
+    # Convention 4·D_s gives content_mlp FLOPs ∝ D_s² (quadratic). Pinning
+    # D_hid_content to a fixed value (e.g. 1024) makes the FFN width a
+    # capacity knob independent of D_s; content_mlp cost is then
+    # O(D_s · D_hid_content) — linear in D_s. At D_s=768 with default
+    # ffn_mult=4 the FFN was 9× bigger than at D_s=256; with
+    # D_hid_content=1024 it's only 3× bigger.
+    D_hid_content: int | None = 1024
     # Post-readout model-space capacity. These blocks run once per token,
     # not once per hop, so they are a cheaper place to keep params than
     # the walker hot loop. BUT under the "memory graph IS the model" framing

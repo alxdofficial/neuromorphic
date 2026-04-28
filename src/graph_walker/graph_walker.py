@@ -251,10 +251,17 @@ class ColumnCompute(nn.Module):
 
         self.content_norm = _rmsnorm(D_s)
         self.per_plane_content = cfg.per_plane_content_mlp
+        # D_hid for content_mlp: explicit cfg.D_hid_content when set,
+        # else legacy ffn_mult_content × D_s.
+        D_hid_content = (
+            cfg.D_hid_content
+            if cfg.D_hid_content is not None
+            else cfg.ffn_mult_content * D_s
+        )
         if cfg.per_plane_content_mlp:
             self.content_mlp = PerPlaneMLP(
                 L=cfg.L, D_in=D_steer,
-                D_hid=cfg.ffn_mult_content * D_s, D_out=D_s,
+                D_hid=D_hid_content, D_out=D_s,
             )
         elif cfg.per_head_content_mlp:
             # MoE-style: H independent content_mlp copies, one per walker
@@ -264,7 +271,7 @@ class ColumnCompute(nn.Module):
             self.content_mlp = PerHeadDeepContentMLP(
                 H=cfg.n_heads,
                 D_in=D_steer, D_s=D_s,
-                D_hid=cfg.ffn_mult_content * D_s,
+                D_hid=D_hid_content,
                 n_layers=cfg.content_mlp_depth,
             )
         else:
@@ -273,7 +280,7 @@ class ColumnCompute(nn.Module):
             # RMSNorm + residual + GELU structure.
             self.content_mlp = DeepContentMLP(
                 D_in=D_steer, D_s=D_s,
-                D_hid=cfg.ffn_mult_content * D_s,
+                D_hid=D_hid_content,
                 n_layers=cfg.content_mlp_depth,
             )
         self.q_proj = nn.Sequential(
@@ -1049,9 +1056,22 @@ class GraphWalkerMemory(nn.Module):
             P_mass = torch.zeros(cfg.N, device=device, dtype=lb_dtype)
 
         # 3. Walker message from OLD column state + walker state + token.
+        # ``s_in.detach()`` here (and on the post-LIF gather below) cuts the
+        # gather backward — which would otherwise materialise a dense
+        # ``[B, N, D_s]`` zeros tensor + scatter (~50% of CUDA time at
+        # N=4096 per a kineto profile). The substrate read becomes a
+        # constant input feature for content_mlp; gradient still flows to
+        # content_mlp's params via this step's loss, and to PRIOR steps'
+        # writes via (a) walker_state EMA and (b) the LIF write path
+        # through ``m_out`` (still gradient-tracked). What's lost is the
+        # "write-with-foresight" signal — content_mlp learning that what
+        # it writes at column k will be useful when a future walker reads
+        # column k. That long-horizon credit assignment is recovered in
+        # Phase 2 GRPO via trajectory rewards. See docs/graph_walker.md.
         cur = cur_bh.view(B, cfg_n_heads)
         s_cur_old = torch.gather(
-            s_in, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
+            s_in.detach(), 1,
+            cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
         ).reshape(BH, cfg.D_s)
         id_cur = self.col_id[cur_bh]                                  # [B*H, D_id]
         walker_state_flat = walker_state_in.reshape(BH, cfg.D_s)
@@ -1094,7 +1114,17 @@ class GraphWalkerMemory(nn.Module):
         s_flat_new = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
         s_new = s_flat_new.view(B, cfg.N, cfg.D_s)
 
-        # 5. Re-read walker's current column post-update.
+        # 5. Re-read walker's current column post-update. NOT detached
+        # (unlike the pre-LIF s_cur_old gather above). This is the gradient
+        # path that keeps the LIF chain alive: with both gathers detached
+        # AND TBPTT detached at block boundaries, s_new has no live grad
+        # consumer, so LIF backward fires with grad_s_out=0 — collapsing
+        # gradient flow to decay_proj (LIF α) and input_v_proj (anchor
+        # v_inject), since they are exclusively in the LIF chain. The
+        # backward of this gather still pays the dense [B, N, D_s] zeros
+        # + scatter cost (kept for correctness); the s_in.detach() above
+        # cuts the symmetric cost on the pre-LIF read, recovering ~half
+        # the gather-backward speedup while preserving training semantics.
         s_cur_new = torch.gather(
             s_new, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
         ).reshape(BH, cfg.D_s)

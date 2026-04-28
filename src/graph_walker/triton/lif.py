@@ -272,16 +272,22 @@ def _lif_preprocess(
 
 
 class LIFDepositFunction(torch.autograd.Function):
-    """Sparse LIF deposit with caller-supplied scratch + pre-allocated buffers.
+    """Sparse LIF deposit. Allocates per-call scratch (no caller-supplied
+    reusable scratch — that pattern conflicted with multi-step usage where
+    autograd's saved-for-backward refs version-clash with the next step's
+    in-place preprocess writes).
 
     Forward: returns ``s_out``, a fresh tensor of shape [BN, D_s] equal to
     ``alpha · s_in + (1-alpha) · tanh(Σ msgs)`` at touched rows and equal
-    to ``s_in`` at untouched rows. Caller responsible for matching shapes.
+    to ``s_in`` at untouched rows.
 
-    The Triton path requires:
-    - ``all_dests`` padded to ``M_max`` with sentinel = ``B*N``
-    - ``scratch`` allocated via :class:`LIFScratch.allocate` for the same
-      ``(M_max, U_max, D_s)``
+    The Triton path requires ``all_dests`` padded to a static ``M_max`` with
+    sentinel = ``B*N`` for the unused slots. Per-step scratch buffers
+    (sort_idx / unique_dests / segment_offs + the per-U save-for-backward
+    arrays) are allocated fresh inside this function. Under cudagraph
+    capture they land in the captured pool and reuse the same address
+    across replays — same memory characteristics as the prior
+    static-buffer design, without the multi-step version-mismatch trap.
 
     Backward returns gradients w.r.t. ``s_in``, ``all_msgs``, ``alpha``.
     """
@@ -294,19 +300,35 @@ class LIFDepositFunction(torch.autograd.Function):
         all_dests: torch.Tensor,      # [M_max] int64 (sentinel = BN for pad)
         alpha: torch.Tensor,          # [N] fp32
         N: int,
-        scratch: LIFScratch,
     ) -> torch.Tensor:
         BN, D_s = s_in.shape
         M_max = all_msgs.shape[0]
-        U_max = scratch.unique_dests.shape[0]
+        U_max = M_max  # in the worst case all dests are unique
 
         # Pre-copy: kernel only writes touched rows.
         s_out = s_in.clone()
 
+        # Allocate per-call scratch INSIDE forward. These buffers are passed
+        # to save_for_backward and live until backward consumes them — they
+        # MUST NOT be reused across calls, else autograd's version check on
+        # saved tensors trips when the next step's preprocess mutates them.
+        # Under cudagraph, the captured allocator pool reuses the same
+        # addresses across replays so this is still O(1) memory amortized.
+        device = s_in.device
+        sort_idx = torch.empty(M_max, dtype=torch.int64, device=device)
+        diff = torch.empty(M_max, dtype=torch.int64, device=device)
+        unique_idx_in_sorted = torch.empty(M_max, dtype=torch.int64, device=device)
+        unique_dests = torch.full((U_max,), BN, dtype=torch.int64, device=device)
+        segment_offs = torch.empty(U_max + 1, dtype=torch.int64, device=device)
+        arange_u = torch.arange(U_max + 1, device=device, dtype=torch.int64)
+        tanh_inc_save = torch.empty(U_max, D_s, dtype=s_in.dtype, device=device)
+        s_old_save = torch.empty(U_max, D_s, dtype=s_in.dtype, device=device)
+        alpha_save = torch.empty(U_max, dtype=torch.float32, device=device)
+
         if M_max == 0:
             ctx.save_for_backward(
-                scratch.unique_dests, scratch.sort_idx, scratch.segment_offs,
-                scratch.tanh_inc_save, scratch.s_old_save, scratch.alpha_save,
+                unique_dests, sort_idx, segment_offs,
+                tanh_inc_save, s_old_save, alpha_save,
             )
             ctx.N = N
             ctx.BN = BN
@@ -316,28 +338,47 @@ class LIFDepositFunction(torch.autograd.Function):
             ctx.alpha_dtype = alpha.dtype
             return s_out
 
-        # Static-shape preprocess.
-        _lif_preprocess(all_dests, BN, scratch)
+        # Static-shape preprocess (inlined; no shared scratch).
+        sorted_dests, sort_idx_local = all_dests.sort(stable=True)
+        sort_idx.copy_(sort_idx_local)
+        diff[0] = 1
+        diff[1:] = (sorted_dests[1:] != sorted_dests[:-1]).to(torch.int64)
+        unique_idx_in_sorted.copy_(diff.cumsum(0) - 1)
+        unique_dests.scatter_(0, unique_idx_in_sorted, sorted_dests)
+        segment_offs.copy_(
+            torch.searchsorted(unique_idx_in_sorted, arange_u),
+        )
 
         if HAS_TRITON and s_in.is_cuda:
             BLOCK_D = 64
             grid = (U_max, triton.cdiv(D_s, BLOCK_D))
             _lif_deposit_fwd_kernel[grid](
                 s_in, s_out, all_msgs,
-                scratch.sort_idx, scratch.segment_offs,
-                scratch.unique_dests, alpha,
-                scratch.tanh_inc_save, scratch.s_old_save, scratch.alpha_save,
+                sort_idx, segment_offs,
+                unique_dests, alpha,
+                tanh_inc_save, s_old_save, alpha_save,
                 BN, N,
                 D_s=D_s, BLOCK_D=BLOCK_D,
             )
         else:
+            # CPU/no-Triton fallback. Build a temporary LIFScratch-like view
+            # so the existing _pure_torch_fwd helper works unchanged.
+            from types import SimpleNamespace
+            _scratch = SimpleNamespace(
+                sorted_dests=sorted_dests, sort_idx=sort_idx, diff=diff,
+                unique_idx_in_sorted=unique_idx_in_sorted,
+                unique_dests=unique_dests, segment_offs=segment_offs,
+                arange_u=arange_u,
+                tanh_inc_save=tanh_inc_save, s_old_save=s_old_save,
+                alpha_save=alpha_save,
+            )
             _pure_torch_fwd(
-                s_in, s_out, all_msgs, all_dests, alpha, N, BN, scratch,
+                s_in, s_out, all_msgs, all_dests, alpha, N, BN, _scratch,
             )
 
         ctx.save_for_backward(
-            scratch.unique_dests, scratch.sort_idx, scratch.segment_offs,
-            scratch.tanh_inc_save, scratch.s_old_save, scratch.alpha_save,
+            unique_dests, sort_idx, segment_offs,
+            tanh_inc_save, s_old_save, alpha_save,
         )
         ctx.N = N
         ctx.BN = BN
@@ -367,7 +408,7 @@ class LIFDepositFunction(torch.autograd.Function):
             grad_msgs = torch.zeros(0, D_s, dtype=grad_s_out.dtype, device=device)
             return (
                 grad_s_out, grad_msgs, None,
-                grad_alpha_fp32.to(alpha_dtype), None, None,
+                grad_alpha_fp32.to(alpha_dtype), None,
             )
 
         # Sentinel rows of grad_msgs need zero, otherwise inductor / autograd
@@ -396,7 +437,7 @@ class LIFDepositFunction(torch.autograd.Function):
 
         return (
             grad_s_out, grad_msgs, None,
-            grad_alpha_fp32.to(alpha_dtype), None, None,
+            grad_alpha_fp32.to(alpha_dtype), None,
         )
 
 
@@ -547,26 +588,29 @@ def lif_deposit(
     N: int,
     *,
     backend: str = "puretorch",
-    scratch: LIFScratch | None = None,
 ) -> torch.Tensor:
-    """Public entry. backend in {'puretorch', 'triton'}.
+    """Public entry. backend in {'triton', 'puretorch'}.
 
-    'puretorch' (default): cudagraph-safe dense path.
+    'triton' (default): sparse Triton kernel via :class:`LIFDepositFunction`.
+        Per-step activations are O(B·H·D_s) — only the touched rows are saved
+        for backward, not the full ``[B·N, D_s]`` substrate.
+        ``all_dests`` MUST be padded to a static ``M_max`` with sentinel
+        ``B*N`` for unused slots so the captured grid shape stays constant.
+        Allocates per-call scratch internally (cudagraph captures these in
+        the pool so they reuse addresses across replays).
 
-    'triton': sparse Triton kernel via :class:`LIFDepositFunction`. Caller
-        must supply ``scratch`` allocated via :class:`LIFScratch.allocate`
-        for the same ``(M_max=all_dests.shape[0], D_s=s_flat.shape[1])``;
-        ``U_max`` typically equals ``M_max``.
+    'puretorch': dense fp32 fallback. Saves O(B·N·D_s) per step in
+        activations — at production scale this is ~150 MB/step, T_block of
+        them blows past the GPU memory ceiling. Kept for CPU/no-Triton
+        fallback and as the gradient-numerics oracle.
     """
+    if backend == "triton":
+        return LIFDepositFunction.apply(
+            s_flat, all_msgs, all_dests, alpha, N,
+        )
     if backend == "puretorch":
         return sparse_lif_update_puretorch(
             s_flat, all_msgs, all_dests, alpha, N,
-        )
-    if backend == "triton":
-        if scratch is None:
-            raise ValueError("triton backend requires `scratch` argument")
-        return LIFDepositFunction.apply(
-            s_flat, all_msgs, all_dests, alpha, N, scratch,
         )
     raise ValueError(f"unknown backend: {backend!r}")
 
