@@ -11,15 +11,20 @@ from dataclasses import dataclass
 @dataclass
 class GraphWalkerConfig:
     # --- Graph topology (same spirit as column_graph) ---
-    plane_rows: int = 32                # was 24, originally 16. → 1024 cols/plane,
-    plane_cols: int = 32                # 4 planes = 4096 total cols. The graph
+    plane_rows: int = 16                # 16×16×4 = 1024 columns. Sized to the
+    plane_cols: int = 16                # ~1500-2000-word active vocabulary that
                                         # is the model's vocabulary of concepts;
                                         # N is the vocab size. Per-token compute
                                         # is invariant to N (walkers visit only
                                         # B·H cols per step regardless of N), so
                                         # N is pure capacity at no runtime cost.
     L: int = 4                          # number of planes (0 = input, L-1 = output)
-    K: int = 96                         # out-edges per column (was 64, orig 32).
+    K: int = 16                         # out-edges per column. With N=1024,
+                                        # K=16 gives a sparse small-world graph;
+                                        # at radius=3 we have plenty of candidate
+                                        # room (48 intra, 49 inter). Bench at
+                                        # this setting cleared 133K tok/s @
+                                        # B=384 cudagraph.
                                         # With K_intra_fraction=0.5,
                                         # K_inter_bwd_fraction=0.5 → K_intra=48,
                                         # K_inter_fwd=24, K_inter_bwd=24. At
@@ -78,7 +83,7 @@ class GraphWalkerConfig:
     # tied unembedding, post-readout capacity). D_s is the internal graph
     # state width paid in the per-hop recurrent hot path.
     D_model: int = 1024
-    D_s: int = 768                      # column state dim. Original 512;
+    D_s: int = 256                      # column state dim. With D_id=512 the
                                         # tried 1024 (Option A, ~106M params,
                                         # B=4 cudagraph OOM); settled on 768
                                         # (Option B, ~75M params) so we keep
