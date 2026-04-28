@@ -93,6 +93,22 @@ def grpo_step(
             "GRPO step produced no log_pi — phase-2 routing didn't fire. "
             "Check that wrapper.memory.phase == 'phase2' during the prefix."
         )
+    # In phase-2 the only trainable surface is neuromod (everything else
+    # frozen by `freeze_all_but_E_bias_and_neuromod`). Routing scores then
+    # only carry grad via `_active_delta_nm`. If the prefix doesn't span a
+    # full plasticity window AND `reset_memory()` cleared neuromod carryover
+    # at start-of-segment, the first window runs with `_active_delta_nm=None`
+    # → routing scores have no grad → `log_pi_sum.requires_grad=False` →
+    # `loss.backward()` raises an opaque "element 0 of tensors does not
+    # require grad" error. Fail loudly with a fix-it message instead.
+    if not log_pi_sum.requires_grad:
+        raise RuntimeError(
+            "log_pi_sum has no grad in phase-2 — typically means the prefix "
+            "did not span a full plasticity window AND neuromod carryover was "
+            "cleared, so the first window had _active_delta_nm=None. Make "
+            f"prefix_len > memory.cfg.mod_period, OR use "
+            "reset_memory(clear_neuromod_carryover=False)."
+        )
 
     rewards = reward_fn(out.generated, reference_cont).to(log_pi_sum.device)
     if rewards.shape != (K,):

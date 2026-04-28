@@ -84,6 +84,12 @@ def phase1_ar_pretrained_step(
             "AR unroll has nothing to predict."
         )
 
+    if not wrapper.training:
+        raise RuntimeError(
+            "phase1_ar_pretrained_step requires wrapper.train() — inference-"
+            "mode leak would silently disable aux loss and Gumbel-STE routing."
+        )
+
     wrapper.reset_memory(bs=BS)
     opt.zero_grad(set_to_none=True)
 

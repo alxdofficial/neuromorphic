@@ -77,6 +77,13 @@ class GraphWalkerPretrainedLM(nn.Module):
         # Scratch: aux loss from the last forward (None if no memory or eval).
         self._last_mem_loss: torch.Tensor | None = None
 
+        # validate() catches direct PretrainedGWConfig(...) construction
+        # where d_mem and memory.D_s drift apart (default d_mem=512 but
+        # default GraphWalkerConfig.D_s=256 would crash later in
+        # forward_segment). Factories already produce matching configs;
+        # this guards the "user instantiated by hand" path.
+        config.validate()
+
         if hf_model is None:
             hf_cfg = AutoConfig.from_pretrained(config.model_name)
             config.d_lm = hf_cfg.hidden_size

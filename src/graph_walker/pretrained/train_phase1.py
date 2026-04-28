@@ -76,6 +76,18 @@ def phase1_pretrained_step(
     input_ids = batch.input_ids.to(device)
     target_ids = batch.target_ids.to(device)
 
+    # Phase-1 must run in train mode. If wrapper got switched to inference
+    # mode by a leaked rollout/bench pass, `forward()` falls back to
+    # `compute_aux=False` AND routing inside `_step_core_pure` flips to
+    # deterministic argmax (no Gumbel STE). The whole step would silently
+    # have no aux gradient and no routing gradient — training would
+    # produce optimizer steps but no learning signal for the walker.
+    if not wrapper.training:
+        raise RuntimeError(
+            "phase1_pretrained_step requires wrapper.train() — inference-mode "
+            "leak would silently disable aux loss and Gumbel-STE routing."
+        )
+
     BS, T = input_ids.shape
     if target_ids.shape != (BS, T):
         raise ValueError(

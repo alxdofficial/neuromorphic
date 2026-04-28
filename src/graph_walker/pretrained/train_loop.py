@@ -95,7 +95,9 @@ def run_cycle_loop(
                 batch = next(boot_iter)
             except StopIteration:
                 break
-            stats = phase1_pretrained_step(wrapper, opt, batch)
+            stats = phase1_pretrained_step(
+                wrapper, opt, batch, grad_clip=cfg.grad_clip,
+            )
             row = collector.snapshot(
                 wrapper, step=global_step, phase="bootstrap", stats=stats,
             )
@@ -113,7 +115,9 @@ def run_cycle_loop(
                     batch = next(p1_iter)
                 except StopIteration:
                     break
-                stats = phase1_ar_pretrained_step(wrapper, opt, batch)
+                stats = phase1_ar_pretrained_step(
+                    wrapper, opt, batch, grad_clip=cfg.grad_clip,
+                )
                 row = collector.snapshot(
                     wrapper, step=global_step,
                     phase=f"cycle{cyc}-p1ar", stats=stats,

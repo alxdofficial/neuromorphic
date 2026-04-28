@@ -72,9 +72,21 @@ def _load_dataset_from_config(config: DatasetConfig):
 
 @dataclass
 class StreamBatch:
-    """A batch of tokens from persistent streams."""
+    """A batch of tokens from persistent streams.
+
+    .. warning::
+        ``target_ids`` is **pre-shifted** here (already ``input_ids[:, 1:]``
+        padded). The graph-walker pretrained training path
+        (``Phase1Batch`` in ``src/graph_walker/pretrained/train_phase1.py``)
+        expects ``target_ids`` to be **unshifted** — it does the shift
+        internally (logits[:, :-1] vs target_ids[:, 1:]). Passing this
+        StreamBatch's ``target_ids`` directly into Phase1Batch would train
+        against ``t+2`` targets. When wiring this dataloader to graph-walker,
+        either re-pass ``input_ids`` as ``Phase1Batch.target_ids`` (the
+        standard NTP convention) OR shift this batch's ``target_ids`` back.
+    """
     input_ids: torch.Tensor      # [BS, T] - input tokens
-    target_ids: torch.Tensor     # [BS, T] - target tokens (shifted by 1)
+    target_ids: torch.Tensor     # [BS, T] - target tokens (pre-shifted by 1)
     prev_token: torch.Tensor     # [BS] - last token from previous chunk (for reset detection)
 
 

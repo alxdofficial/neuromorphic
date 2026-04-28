@@ -1334,6 +1334,15 @@ class GraphWalkerMemory(nn.Module):
             use_block_path = (
                 ticks == tbptt and self._compiled_block_from_h is not None
             )
+            # Phase-2 GRPO needs `log_pi_step` from `_step_core_pure` to
+            # accumulate `_log_pi_sum` for `consume_log_pi_sum()`. The
+            # block path drops `log_pi_step` (BlockOutput has no field
+            # for it), so silently falling into the block path during
+            # phase 2 would null the policy gradient. Force the per-
+            # token fallback in that case so log_pi accumulation stays
+            # alive via `_apply_step_state`.
+            if use_block_path and self.phase == "phase2":
+                use_block_path = False
 
             if use_block_path:
                 # Set up block-static caches once per block. _step_core_pure

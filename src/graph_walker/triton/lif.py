@@ -551,6 +551,16 @@ def sparse_lif_update_puretorch(
     Trade-off: O(BN) memory traffic vs the Triton path's O(U). At our
     bench scale (B=4, N=1024, U≈16) the dense path is fine because launch
     overhead dominates; revisit only if memory bandwidth bottlenecks.
+
+    .. warning::
+        Cannot handle sentinel-padded ``all_dests`` (the BN-valued sentinel
+        used by ``_step_core_pure`` for interior steps). ``index_add`` here
+        does NO bounds masking, so a sentinel index ``== BN`` raises
+        "index ... is out of bounds". The Triton path handles sentinels by
+        skipping them in the kernel. Use this backend only via
+        ``lif_deposit(..., backend="puretorch")`` on a code path that
+        feeds REAL destinations (no sentinels) — i.e. the new-window
+        path that pads to ``2*BH`` with valid (non-sentinel) destinations.
     """
     BN, D_s = s_flat.shape
     M = all_msgs.shape[0]
