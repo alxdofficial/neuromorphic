@@ -587,7 +587,7 @@ def lif_deposit(
     alpha: torch.Tensor,
     N: int,
     *,
-    backend: str = "puretorch",
+    backend: str = "triton",
 ) -> torch.Tensor:
     """Public entry. backend in {'triton', 'puretorch'}.
 

@@ -1097,7 +1097,11 @@ class GraphWalkerMemory(nn.Module):
         # endpoint readout below). On a new-window step the anchor
         # injection is stacked in the same LIF call; both message sets land
         # at the anchor cols, which are also the walker's current position.
+        # Always pad to static M_max = 2*BH with sentinel BN for unused
+        # dest slots so the Triton kernel sees a fixed grid shape across
+        # interior + window-start steps (required for cudagraph capture).
         batch_idx = self._batch_idx
+        BN = B * cfg.N
         if is_new_window:
             all_dests = torch.cat([
                 batch_idx * cfg.N + start_cols.reshape(BH),
@@ -1107,8 +1111,17 @@ class GraphWalkerMemory(nn.Module):
                 [inject_msg, m_out], dim=0,
             ).to(state_dtype).contiguous()
         else:
-            all_dests = (batch_idx * cfg.N + cur_bh).contiguous()
-            all_msgs = m_out.to(state_dtype).contiguous()
+            real_dests = batch_idx * cfg.N + cur_bh
+            pad_dests = torch.full(
+                (BH,), BN, dtype=real_dests.dtype, device=device,
+            )
+            all_dests = torch.cat([real_dests, pad_dests], dim=0).contiguous()
+            pad_msgs = torch.zeros(
+                BH, cfg.D_s, dtype=state_dtype, device=device,
+            )
+            all_msgs = torch.cat(
+                [m_out.to(state_dtype), pad_msgs], dim=0,
+            ).contiguous()
 
         s_flat = s_in.reshape(B * cfg.N, cfg.D_s)
         s_flat_new = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
