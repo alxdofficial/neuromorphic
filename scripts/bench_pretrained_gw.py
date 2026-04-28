@@ -56,15 +56,34 @@ def _walker_cfg_for(d_mem: int, T: int) -> GraphWalkerConfig:
 
 
 def _bench(name, fn, n_warmup, n_iter, BS, T):
-    torch.cuda.synchronize()
-    for _ in range(n_warmup):
-        fn()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.perf_counter()
-    for _ in range(n_iter):
-        fn()
-    torch.cuda.synchronize()
+    """Run warmup + timed iterations. Returns (tps, peak_gb) or
+    (None, None) on CUDA OOM — prints an OOM marker line that the BS
+    sweep harness parses as "this BS doesn't fit for this metric".
+
+    OOM cleanup: on out-of-memory the partially-built autograd graph
+    (and any cached activations) must be cleared so the NEXT bench in
+    the same process starts with a clean slate. Without
+    `gc.collect() + empty_cache()`, the GW path's first OOM would
+    leave Llama+walker activations resident, causing every subsequent
+    bench to OOM as well even at smaller working sets.
+    """
+    import gc as _gc
+    try:
+        torch.cuda.synchronize()
+        for _ in range(n_warmup):
+            fn()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        for _ in range(n_iter):
+            fn()
+        torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError:
+        print(f"  {name:40s}    OOM        peak n/a       BS={BS} T={T}")
+        _gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        return None, None
     elapsed = time.perf_counter() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1e9
     tps = (BS * T * n_iter) / elapsed
@@ -217,12 +236,19 @@ def main():
 
     print()
     print("=== Summary ===")
-    print(f"  Forward-only slowdown:  {vanilla_fwd_tps / gw_fwd_tps:5.2f}x  "
-          f"(vanilla {vanilla_fwd_tps/1000:.1f}k -> +mem {gw_fwd_tps/1000:.1f}k tok/s)")
-    print(f"  Training-step slowdown: {vanilla_step_tps / gw_step_tps:5.2f}x  "
-          f"(vanilla {vanilla_step_tps/1000:.1f}k -> +mem {gw_step_tps/1000:.1f}k tok/s)")
-    print(f"  Peak VRAM training:     {gw_step_mem - vanilla_step_mem:+.2f} GB  "
-          f"(vanilla {vanilla_step_mem:.2f} -> +mem {gw_step_mem:.2f} GB)")
+    if vanilla_fwd_tps is not None and gw_fwd_tps is not None:
+        print(f"  Forward-only slowdown:  {vanilla_fwd_tps / gw_fwd_tps:5.2f}x  "
+              f"(vanilla {vanilla_fwd_tps/1000:.1f}k -> +mem {gw_fwd_tps/1000:.1f}k tok/s)")
+    else:
+        print(f"  Forward-only slowdown:  n/a (one or both OOM'd)")
+    if vanilla_step_tps is not None and gw_step_tps is not None:
+        print(f"  Training-step slowdown: {vanilla_step_tps / gw_step_tps:5.2f}x  "
+              f"(vanilla {vanilla_step_tps/1000:.1f}k -> +mem {gw_step_tps/1000:.1f}k tok/s)")
+    else:
+        print(f"  Training-step slowdown: n/a (one or both OOM'd)")
+    if vanilla_step_mem is not None and gw_step_mem is not None:
+        print(f"  Peak VRAM training:     {gw_step_mem - vanilla_step_mem:+.2f} GB  "
+              f"(vanilla {vanilla_step_mem:.2f} -> +mem {gw_step_mem:.2f} GB)")
 
 
 if __name__ == "__main__":
