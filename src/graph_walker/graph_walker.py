@@ -47,7 +47,7 @@ from src.graph_walker.neuromod import (
 from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
 from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
 from src.graph_walker.topology import build_topology
-from src.graph_walker.triton_sparse_update import sparse_lif_update
+from src.graph_walker.triton.lif import sparse_lif_update
 
 
 class _NullCtx:
@@ -257,10 +257,19 @@ class ColumnCompute(nn.Module):
 
         self.content_norm = _rmsnorm(D_s)
         self.per_plane_content = cfg.per_plane_content_mlp
+        # Decoupled content_mlp hidden width: explicit cfg.D_hid_content when
+        # set, else legacy ffn_mult_content × D_s. Pinning D_hid_content to
+        # a fixed value (e.g. 1024) makes content_mlp cost O(D_s · D_hid)
+        # instead of O(D_s²); see config.py for rationale.
+        D_hid_content = (
+            cfg.D_hid_content
+            if cfg.D_hid_content is not None
+            else cfg.ffn_mult_content * D_s
+        )
         if cfg.per_plane_content_mlp:
             self.content_mlp = PerPlaneMLP(
                 L=cfg.L, D_in=D_steer,
-                D_hid=cfg.ffn_mult_content * D_s, D_out=D_s,
+                D_hid=D_hid_content, D_out=D_s,
             )
         elif cfg.per_head_content_mlp:
             # MoE-style: H independent content_mlp copies, one per walker
@@ -270,7 +279,7 @@ class ColumnCompute(nn.Module):
             self.content_mlp = PerHeadDeepContentMLP(
                 H=cfg.n_heads,
                 D_in=D_steer, D_s=D_s,
-                D_hid=cfg.ffn_mult_content * D_s,
+                D_hid=D_hid_content,
                 n_layers=cfg.content_mlp_depth,
             )
         else:
@@ -279,7 +288,7 @@ class ColumnCompute(nn.Module):
             # RMSNorm + residual + GELU structure.
             self.content_mlp = DeepContentMLP(
                 D_in=D_steer, D_s=D_s,
-                D_hid=cfg.ffn_mult_content * D_s,
+                D_hid=D_hid_content,
                 n_layers=cfg.content_mlp_depth,
             )
         self.q_proj = nn.Sequential(
@@ -360,6 +369,25 @@ class WalkerCorePureOutput:
                                           # None outside phase 2.
 
 
+@dataclass
+class BlockOutput:
+    """Return bundle from `block_forward`: T_block sequential steps.
+
+    All forward state (s, walker_pos, walker_state, prev_motor) is returned
+    explicitly so the caller can thread it through autograd or write it
+    back to self. Non-grad accumulators (co_visit, visit_count) are
+    summed within the block; caller adds them to module-level totals.
+    """
+    s_new: torch.Tensor                  # [B, N, D_s]
+    walker_pos_new: torch.Tensor         # [B, H]
+    walker_state_new: torch.Tensor       # [B, H, D_s]
+    prev_motor_new: torch.Tensor         # [B, D_s]
+    motor_states_bt: torch.Tensor        # [B, T_block, D_s] — fed to readout
+    co_visit_total: torch.Tensor         # [N*K] fp32, summed across T_block
+    visit_count_total: torch.Tensor      # [N] fp32, summed across T_block
+    load_balance_loss: torch.Tensor      # scalar — Σ over T_block, mean later
+
+
 class GraphWalkerMemory(nn.Module):
     def __init__(
         self, cfg: GraphWalkerConfig, tied_token_emb: nn.Embedding
@@ -373,6 +401,8 @@ class GraphWalkerMemory(nn.Module):
             plane_rows=cfg.plane_rows, plane_cols=cfg.plane_cols,
             L=cfg.L, K=cfg.K, p_rewire=cfg.p_rewire,
             K_intra_fraction=cfg.K_intra_fraction, seed=cfg.topology_seed,
+            K_inter_bwd_fraction=cfg.K_inter_bwd_fraction,
+            intra_radius=cfg.intra_radius, inter_radius=cfg.inter_radius,
         )
         self.register_buffer("out_nbrs", topo.out_nbrs, persistent=False)
         self.register_buffer("edge_src", topo.edge_src, persistent=False)
@@ -954,6 +984,115 @@ class GraphWalkerMemory(nn.Module):
         self._log_pi_sum = None
         return out
 
+    # -----------------------------------------------------------------
+    # Block-level functional API (compile target for whole-block CUDA graphs)
+    # -----------------------------------------------------------------
+
+    def block_forward(
+        self,
+        s_in: torch.Tensor,                 # [B, N, D_s]
+        walker_pos_in: torch.Tensor,        # [B, H]
+        walker_state_in: torch.Tensor,      # [B, H, D_s]
+        prev_motor_in: torch.Tensor,        # [B, D_s]
+        e_bias_in: torch.Tensor,            # [N*K] fp32
+        tokens_block: torch.Tensor,         # [B, T_block]
+        tau: torch.Tensor,                  # scalar fp32
+        epsilon: torch.Tensor,              # scalar fp32
+        anchor_at_t0: bool,                 # True if t=0 of this block is a new plasticity window
+    ) -> BlockOutput:
+        """Run T_block sequential _step_core_pure calls in one autograd graph.
+
+        Compiling THIS function with torch.compile (instead of compiling
+        per-step) lets inductor fuse across step boundaries and produces
+        ONE forward + ONE backward graph for the whole T_block window.
+        That's the difference between 1.92× (per-step compile) and
+        ~3.7× (whole-block compile) over eager — used by the standalone
+        cudagraph trainer (no Llama). The pretrained-LM integration
+        path uses ``step_core_from_h`` per token instead.
+
+        State threads through return values — no self.* mutations during
+        the loop body — so the compiled graph is free of side effects.
+        Caller is responsible for writing the returned state back to
+        self.* (or keeping it as a local var for next block_forward call).
+
+        anchor_at_t0 controls whether step 0 is a window-start anchor pick
+        (True at the start of every plasticity window) or a regular
+        interior step. dynamo specialises the boolean automatically and
+        produces two compiled subgraphs as needed.
+        """
+        cfg = self.cfg
+        _, T_block = tokens_block.shape
+
+        s = s_in
+        walker_pos = walker_pos_in
+        walker_state = walker_state_in
+        prev_motor = prev_motor_in
+
+        motor_list: list[torch.Tensor] = []
+        co_visit_total = torch.zeros(
+            cfg.num_edges, device=s_in.device, dtype=torch.float32,
+        )
+        visit_count_total = torch.zeros(
+            cfg.N, device=s_in.device, dtype=torch.float32,
+        )
+        lb_loss_total = torch.zeros(
+            (), device=s_in.device, dtype=torch.float32,
+        )
+
+        for t in range(T_block):
+            is_new = (t == 0) and anchor_at_t0
+            out = self._step_core_pure(
+                s, walker_pos, walker_state, prev_motor,
+                e_bias_in,
+                tokens_block[:, t], tau, epsilon, is_new,
+            )
+            s = out.s_new
+            walker_pos = out.walker_pos_new
+            walker_state = out.walker_state_new
+            prev_motor = out.prev_motor_new
+            motor_list.append(out.motor_state)
+            co_visit_total = co_visit_total + out.co_visit_delta
+            visit_count_total = visit_count_total + out.visit_count_delta
+            lb_loss_total = lb_loss_total + out.load_balance_loss
+
+        motor_states_bt = torch.stack(motor_list, dim=1)  # [B, T_block, D_s]
+
+        return BlockOutput(
+            s_new=s,
+            walker_pos_new=walker_pos,
+            walker_state_new=walker_state,
+            prev_motor_new=prev_motor,
+            motor_states_bt=motor_states_bt,
+            co_visit_total=co_visit_total,
+            visit_count_total=visit_count_total,
+            load_balance_loss=lb_loss_total,
+        )
+
+    def compile_block(
+        self, mode: str = "default", fullgraph: bool = True,
+    ) -> None:
+        """Compile `block_forward` for whole-block CUDA-graph capture.
+
+        Replaces the per-step `compile_step()` path with a single compiled
+        function that covers an entire mod_period-token block. Inductor
+        unrolls the T_block loop, fuses across step boundaries, and
+        produces one forward + one backward graph — much higher fusion
+        opportunity than per-step.
+
+        ``mode="default"`` is the safe choice (~3.7× over eager).
+        ``mode="reduce-overhead"`` adds CUDA-graph capture (additional ~2×
+        on top) but requires stable input pointers across replays —
+        callers must reuse the same state buffers.
+        """
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64,
+        )
+        self._compiled_block = torch.compile(
+            self.block_forward, mode=mode, fullgraph=fullgraph,
+        )
+
     def step_core_from_h(self, h_input: torch.Tensor) -> WalkerCoreReadout:
         """Hot core driven by an externally-supplied `[B, D_s]` vector
         instead of a `token_id`. Used by the pretrained-LM integration
@@ -1314,9 +1453,19 @@ class GraphWalkerMemory(nn.Module):
             log_pi_step = None
 
         # 3. Walker message from OLD column state + walker state + token.
+        # ``s_in.detach()`` here cuts the gather backward into [B, N, D_s]
+        # zeros + scatter (~50% of CUDA time at large N per kineto profile).
+        # The substrate read becomes a constant input feature for content_mlp;
+        # gradient still flows to content_mlp's params via this step's loss
+        # via the s_cur_new (post-LIF) gather below — that one is left
+        # ATTACHED so the LIF chain backward fires (decay_proj, input_v_proj
+        # need that path). Cross-step substrate gradient is preserved via
+        # walker_state EMA + LIF α-channel through s_cur_new. See Phase 1
+        # detach-hack rationale in graph-walker branch commit c3d7e25.
         cur = cur_bh.view(B, cfg_n_heads)
         s_cur_old = torch.gather(
-            s_in, 1, cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
+            s_in.detach(), 1,
+            cur.unsqueeze(-1).expand(B, cfg_n_heads, cfg.D_s),
         ).reshape(BH, cfg.D_s)
         id_cur = self.col_id[cur_bh]                                  # [B*H, D_id]
         walker_state_flat = walker_state_in.reshape(BH, cfg.D_s)
@@ -1342,7 +1491,11 @@ class GraphWalkerMemory(nn.Module):
         # endpoint readout below). On a new-window step the anchor
         # injection is stacked in the same LIF call; both message sets land
         # at the anchor cols, which are also the walker's current position.
+        # Always pad to static M_max = 2*BH with sentinel BN for unused
+        # dest slots so the Triton LIF kernel sees a fixed grid shape across
+        # interior + window-start steps (required for cudagraph capture).
         batch_idx = self._batch_idx
+        BN = B * cfg.N
         if is_new_window:
             all_dests = torch.cat([
                 batch_idx * cfg.N + start_cols.reshape(BH),
@@ -1352,8 +1505,17 @@ class GraphWalkerMemory(nn.Module):
                 [inject_msg, m_out], dim=0,
             ).to(state_dtype).contiguous()
         else:
-            all_dests = (batch_idx * cfg.N + cur_bh).contiguous()
-            all_msgs = m_out.to(state_dtype).contiguous()
+            real_dests = batch_idx * cfg.N + cur_bh
+            pad_dests = torch.full(
+                (BH,), BN, dtype=real_dests.dtype, device=device,
+            )
+            all_dests = torch.cat([real_dests, pad_dests], dim=0).contiguous()
+            pad_msgs = torch.zeros(
+                BH, cfg.D_s, dtype=state_dtype, device=device,
+            )
+            all_msgs = torch.cat(
+                [m_out.to(state_dtype), pad_msgs], dim=0,
+            ).contiguous()
 
         s_flat = s_in.reshape(B * cfg.N, cfg.D_s)
         s_flat_new = sparse_lif_update(s_flat, all_msgs, all_dests, alpha, cfg.N)
