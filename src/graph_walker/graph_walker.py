@@ -578,6 +578,11 @@ class GraphWalkerMemory(nn.Module):
         # recurrent work.
         self._compiled_step = None
 
+        # Filled when compile_block_from_h() is called; forward_segment
+        # routes a whole tbptt block through the compiled version when set,
+        # replacing T_block per-token step_core_from_h calls.
+        self._compiled_block_from_h = None
+
     # -----------------------------------------------------------------
     # Block-level caches (static per forward within a TBPTT block)
     # -----------------------------------------------------------------
@@ -1093,6 +1098,108 @@ class GraphWalkerMemory(nn.Module):
             self.block_forward, mode=mode, fullgraph=fullgraph,
         )
 
+    def block_forward_from_h(
+        self,
+        s_in: torch.Tensor,                 # [B, N, D_s]
+        walker_pos_in: torch.Tensor,        # [B, H]
+        walker_state_in: torch.Tensor,      # [B, H, D_s]
+        prev_motor_in: torch.Tensor,        # [B, D_s]
+        e_bias_in: torch.Tensor,            # [N*K] fp32
+        h_mem_block: torch.Tensor,          # [B, T_block, D_s]
+        tau: torch.Tensor,                  # scalar fp32
+        epsilon: torch.Tensor,              # scalar fp32
+        anchor_at_t0: bool,
+    ) -> BlockOutput:
+        """Block-level analog of `block_forward` driven by an externally-
+        supplied [B, T_block, D_s] hidden-state stream instead of token ids.
+        Used by the pretrained-LM integration (`forward_segment`): one
+        compiled call per `tbptt_block` window replaces T_block per-token
+        `step_core_from_h` calls. Inductor fuses across step boundaries,
+        reproducing the standalone whole-block speedup (~3.7× over eager).
+
+        State threads through return values — no self.* mutation in the
+        loop body — so the compiled graph is free of side effects. Caller
+        writes the returned state back to self.* after the call.
+        """
+        cfg = self.cfg
+        B, T_block, _ = h_mem_block.shape
+        device = s_in.device
+
+        s = s_in
+        walker_pos = walker_pos_in
+        walker_state = walker_state_in
+        prev_motor = prev_motor_in
+
+        # Dummy token_id — `_step_core_pure` ignores it when
+        # `h_input_override` is provided. Allocated once outside the loop
+        # so dynamo doesn't see a fresh tensor each step.
+        dummy_tok = torch.zeros(B, dtype=torch.int64, device=device)
+
+        motor_list: list[torch.Tensor] = []
+        co_visit_total = torch.zeros(
+            cfg.num_edges, device=device, dtype=torch.float32,
+        )
+        visit_count_total = torch.zeros(
+            cfg.N, device=device, dtype=torch.float32,
+        )
+        lb_loss_total = torch.zeros(
+            (), device=device, dtype=torch.float32,
+        )
+
+        for t in range(T_block):
+            is_new = (t == 0) and anchor_at_t0
+            out = self._step_core_pure(
+                s, walker_pos, walker_state, prev_motor,
+                e_bias_in,
+                dummy_tok, tau, epsilon, is_new,
+                h_input_override=h_mem_block[:, t],
+            )
+            s = out.s_new
+            walker_pos = out.walker_pos_new
+            walker_state = out.walker_state_new
+            prev_motor = out.prev_motor_new
+            motor_list.append(out.motor_state)
+            co_visit_total = co_visit_total + out.co_visit_delta
+            visit_count_total = visit_count_total + out.visit_count_delta
+            lb_loss_total = lb_loss_total + out.load_balance_loss
+
+        motor_states_bt = torch.stack(motor_list, dim=1)  # [B, T_block, D_s]
+
+        return BlockOutput(
+            s_new=s,
+            walker_pos_new=walker_pos,
+            walker_state_new=walker_state,
+            prev_motor_new=prev_motor,
+            motor_states_bt=motor_states_bt,
+            co_visit_total=co_visit_total,
+            visit_count_total=visit_count_total,
+            load_balance_loss=lb_loss_total,
+        )
+
+    def compile_block_from_h(
+        self, mode: str = "default", fullgraph: bool = True,
+    ) -> None:
+        """Compile `block_forward_from_h` for whole-block fusion in the
+        pretrained-LM integration path. ``forward_segment`` routes through
+        `_compiled_block_from_h` when set — one compiled call per
+        `tbptt_block` window instead of T_block per-token calls.
+
+        ``mode="default"`` (~3.7× over eager) is the safe choice for the
+        Llama integration: gives inductor's cross-step fusion without
+        cudagraph's stable-pointer constraints. The walker is embedded in
+        Llama's autograd graph, so the cudagraph variant
+        (``"reduce-overhead"``) would conflict with Llama's dynamic
+        activation addresses.
+        """
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64,
+        )
+        self._compiled_block_from_h = torch.compile(
+            self.block_forward_from_h, mode=mode, fullgraph=fullgraph,
+        )
+
     def step_core_from_h(self, h_input: torch.Tensor) -> WalkerCoreReadout:
         """Hot core driven by an externally-supplied `[B, D_s]` vector
         instead of a `token_id`. Used by the pretrained-LM integration
@@ -1199,10 +1306,7 @@ class GraphWalkerMemory(nn.Module):
                 walker_aux_weight=walker_aux_weight,
             )
 
-        motor_states: list[torch.Tensor] = []
-        # Per-block buffers for surprise fold + aux CE.
-        block_motor_list: list[torch.Tensor] = []
-        block_start = 0
+        motor_blocks: list[torch.Tensor] = []
         # Horizon weights mirror `phase1_step`: horizon-1 is primary (1.0),
         # rest (0.2). Keeps walker-side aux semantically aligned with
         # standalone training.
@@ -1216,17 +1320,72 @@ class GraphWalkerMemory(nn.Module):
         llama_ce_sum = torch.zeros((), device=device, dtype=torch.float32)
         llama_ce_count = 0
 
-        for t in range(T):
-            r = self.step_core_from_h(h_mem[:, t])
-            motor_states.append(r.motor_state)
-            block_motor_list.append(r.motor_state)
+        # Block-stride loop. Whole-block path replaces T_block per-token
+        # `step_core_from_h` calls with one `block_forward_from_h` call —
+        # inductor fuses across step boundaries, giving ~3.7× over the
+        # eager per-token path standalone (the speedup we lose if we run
+        # the per-token loop inside Llama's autograd graph). Falls back
+        # to per-token for the partial last block (when T isn't divisible
+        # by tbptt), or when the block compile hasn't been set up yet.
+        block_start = 0
+        while block_start < T:
+            block_end = min(block_start + tbptt, T)
+            ticks = block_end - block_start
+            use_block_path = (
+                ticks == tbptt and self._compiled_block_from_h is not None
+            )
 
-            ticks = len(block_motor_list)
-            is_block_end = (ticks >= tbptt) or (t == T - 1)
-            if not is_block_end:
-                continue
+            if use_block_path:
+                # Set up block-static caches once per block. _step_core_pure
+                # reads these from self.* (they're not arguments).
+                self._ensure_block_caches(self.tied_token_emb.weight)
+                is_new_window = self.window_len == 0
+                e_bias_active = self._active_e_bias()
+                # Dummy token_id satisfies _step_core_pure's signature; it
+                # ignores it when h_input_override is supplied.
+                dummy_tok = torch.zeros(B, dtype=torch.int64, device=device)
+                tau, epsilon = self._schedule_tensors(dummy_tok)
 
-            motor_bt = torch.stack(block_motor_list, dim=1)       # [B, ticks, D_s]
+                out = self._compiled_block_from_h(
+                    self.s, self.walker_pos, self.walker_state,
+                    self.prev_motor, e_bias_active,
+                    h_mem[:, block_start:block_end],
+                    tau, epsilon, is_new_window,
+                )
+
+                # State writeback — block_forward_from_h is pure-functional
+                # so callers must thread state explicitly. Mirrors what
+                # _apply_step_state does for the per-token path, but for
+                # the whole block in one shot.
+                self.s = out.s_new
+                self.walker_pos = out.walker_pos_new
+                self.walker_state = out.walker_state_new
+                self.prev_motor = out.prev_motor_new
+                with torch.no_grad():
+                    self.co_visit_flat = self.co_visit_flat + out.co_visit_total
+                    if self.visit_count is not None:
+                        self.visit_count = (
+                            self.visit_count + out.visit_count_total
+                        )
+                self.window_len += ticks
+                self.tick_counter += ticks
+                # NOTE: block_forward_from_h drops log_pi_step. Phase-2 GRPO
+                # callers stay on the per-token preserve_graph=True path
+                # (T=1 per call), which keeps log_pi accumulation alive
+                # via _apply_step_state. If phase-2 ever wants block-path
+                # speedup, BlockOutput needs a log_pi_total field.
+
+                motor_bt = out.motor_states_bt                          # [B, ticks, D_s]
+            else:
+                # Per-token fallback (partial last block, AR unroll, or
+                # compile not set up). Mutates self.* via step_core_from_h.
+                block_motor_list: list[torch.Tensor] = []
+                for t in range(block_start, block_end):
+                    r = self.step_core_from_h(h_mem[:, t])
+                    block_motor_list.append(r.motor_state)
+                motor_bt = torch.stack(block_motor_list, dim=1)         # [B, ticks, D_s]
+
+            motor_blocks.append(motor_bt)
 
             # --- Walker's own multi-horizon CE.
             # Shape logic matches phase1_step.flush(); uses the walker's
@@ -1281,13 +1440,12 @@ class GraphWalkerMemory(nn.Module):
                     llama_ce_count += int(valid_flat.sum().item())
 
             # TBPTT detach at block boundary (unless AR unroll preserving graph).
-            if not preserve_graph and t < T - 1:
+            if not preserve_graph and block_end < T:
                 self.detach_state()
 
-            block_motor_list = []
-            block_start = t + 1
+            block_start = block_end
 
-        readouts = torch.stack(motor_states, dim=1)                    # [B, T, D_s]
+        readouts = torch.cat(motor_blocks, dim=1)                       # [B, T, D_s]
 
         aux_loss: torch.Tensor | None = None
         if compute_aux_loss:

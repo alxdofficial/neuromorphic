@@ -87,6 +87,11 @@ def main():
     ap.add_argument("--compile", action="store_true",
                     help="Run wrapper.memory.compile_step() before benchmark — "
                          "fuses the per-step walker kernels via torch.compile.")
+    ap.add_argument("--compile-block", action="store_true",
+                    help="Run wrapper.compile_walker_block() before benchmark — "
+                         "fuses an entire tbptt-block window into a single "
+                         "compiled call (preferred over --compile; ~3.7x over "
+                         "eager standalone).")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -175,6 +180,9 @@ def main():
     if args.compile:
         print(f"  Compiling walker step ...")
         wrapper.memory.compile_step()
+    if args.compile_block:
+        print(f"  Compiling walker block (whole-window inductor fusion) ...")
+        wrapper.compile_walker_block()
     print()
 
     def gw_fwd():

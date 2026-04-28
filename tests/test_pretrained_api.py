@@ -175,3 +175,59 @@ def test_forward_segment_preserve_graph_skips_detach():
     assert h_mem.grad[:, 0].abs().sum() > 0, (
         "preserve_graph=True failed — detach still cut the gradient chain"
     )
+
+
+def _parity_setup(seed: int):
+    """Two identical walkers + identical adapters seeded the same way, plus
+    matched h_mem and input_ids tensors. Used to assert per-token vs
+    block-path equivalence."""
+    torch.manual_seed(seed)
+    cfg = _tiny_cfg(use_neuromod=False)  # neuromod off for cleaner parity
+    lm_a = StandaloneLM(cfg).cpu()
+    torch.manual_seed(seed)
+    lm_b = StandaloneLM(cfg).cpu()
+    B, T = 2, cfg.segment_T
+    torch.manual_seed(seed + 100)
+    h_mem = torch.randn(B, T, cfg.D_s)
+    input_ids = torch.randint(0, cfg.vocab_size, (B, T))
+    return cfg, lm_a, lm_b, h_mem, input_ids, B, T
+
+
+def test_forward_segment_block_matches_per_token():
+    """The block path (compile_block_from_h installed) must produce numerically
+    identical readouts and aux_loss to the per-token path (no compile)
+    when configs and inputs are matched. This locks in the parity that
+    `_compiled_block_from_h` is allowed to exist as a drop-in optimization
+    rather than a behavior change.
+    """
+    cfg, lm_a, lm_b, h_mem, input_ids, B, T = _parity_setup(seed=42)
+
+    # Path A: per-token (no compile). Seed gumbel noise so both paths see
+    # identical random draws.
+    m_a = lm_a.memory
+    m_a.begin_segment(B, torch.device("cpu"))
+    h_a = h_mem.clone().requires_grad_(True)
+    torch.manual_seed(2024)
+    readouts_a, aux_a = m_a.forward_segment(
+        h_a, input_ids, adapter=None, compute_aux_loss=True,
+    )
+
+    # Path B: block path. Skip torch.compile to keep this test cheap on CPU
+    # — install a thin trampoline that delegates to block_forward_from_h.
+    m_b = lm_b.memory
+    m_b._compiled_block_from_h = m_b.block_forward_from_h
+    m_b.begin_segment(B, torch.device("cpu"))
+    h_b = h_mem.clone().requires_grad_(True)
+    torch.manual_seed(2024)
+    readouts_b, aux_b = m_b.forward_segment(
+        h_b, input_ids, adapter=None, compute_aux_loss=True,
+    )
+
+    torch.testing.assert_close(readouts_a, readouts_b, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(aux_a, aux_b, rtol=1e-5, atol=1e-5)
+
+    # Backward parity — gradient on h_mem must match.
+    readouts_a.float().pow(2).mean().backward()
+    readouts_b.float().pow(2).mean().backward()
+    assert h_a.grad is not None and h_b.grad is not None
+    torch.testing.assert_close(h_a.grad, h_b.grad, rtol=1e-5, atol=1e-5)

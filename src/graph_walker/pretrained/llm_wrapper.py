@@ -190,6 +190,25 @@ class GraphWalkerPretrainedLM(nn.Module):
         if self.memory is not None:
             self.memory.detach_state()
 
+    def compile_walker_block(
+        self, mode: str = "default", fullgraph: bool = True,
+    ) -> None:
+        """Compile the walker's whole-block forward path.
+
+        ``forward_segment`` then routes each ``tbptt_block``-token window
+        through one compiled call instead of T_block per-token
+        ``step_core_from_h`` calls. Inductor fuses across step boundaries,
+        replacing the per-token launch overhead that bottlenecked the
+        eager Llama+walker path. ``mode="default"`` mirrors the standalone
+        speedup configuration (~3.7× over per-token eager); the
+        ``"reduce-overhead"`` cudagraph variant is incompatible with
+        Llama's dynamic activation addresses.
+
+        Idempotent: calling twice replaces the compiled function.
+        """
+        if self.memory is not None:
+            self.memory.compile_block_from_h(mode=mode, fullgraph=fullgraph)
+
     # ------------------------------------------------------------------
     # AR-unroll support
     # ------------------------------------------------------------------
