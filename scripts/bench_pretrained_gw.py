@@ -31,26 +31,40 @@ from src.graph_walker.pretrained.train_phase1 import (
 
 
 def _walker_cfg_for(d_mem: int, T: int) -> GraphWalkerConfig:
-    """Bottleneck-adapter config: walker state dim D_s = d_mem, NOT d_lm.
-    W_in: d_lm -> d_mem (compress), W_out: d_mem -> d_lm (expand).
+    """PRODUCTION walker config — defaults from `GraphWalkerConfig()` are
+    the perfected scale-up result (N=1024, K=16, D_s=256, D_id=512,
+    D_hid_content=1024, mod_period=128, tbptt=128, neuromod n_layers=6 /
+    n_heads=8 / edge_hidden=384, etc.). The integration must use this
+    exact shape — earlier `_walker_cfg_for` overrode it with stale bisect
+    values (D_id=32, lighter neuromod) which is NOT a configuration we
+    benched as optimal.
 
-    Topology: 16x16 plane * L=4 = 1024 columns * K=16 = 16K edges.
-    n_heads=4 walkers per batch. mod_period=64.
+    Caller-supplied overrides (must differ from defaults):
+      * ``vocab_size`` — set to Llama-3.2-1B's vocab.
+      * ``segment_T`` — matches the per-call segment length.
+      * ``mod_period`` / ``tbptt_block`` — bumped down to a divisor of
+        segment_T. Production is 128; for T not divisible by 128 we
+        scale down (T=256 → 128, T=128 → 64, ...).
+      * ``D_s = d_mem`` — required by ``PretrainedGWConfig.validate``
+        (walker state dim must equal MemInjectLayer adapter dim).
+
+    All other knobs come from production defaults. Pass ``d_mem=256`` to
+    match the production D_s exactly.
     """
+    # mod_period must divide T; pick the largest power-of-2 divisor that
+    # is <= production's 128. Production's 128 evenly divides standard
+    # T values (256, 1024, etc.); this fallback handles odd cases.
+    mod_period = 128
+    while T % mod_period != 0 and mod_period > 1:
+        mod_period //= 2
     return GraphWalkerConfig(
-        plane_rows=16, plane_cols=16, L=4,
-        K=16, D_model=d_mem, D_s=d_mem, D_id=32,
-        n_heads=4, n_hops=4,
-        D_q_in=64, D_q_per_head=64, n_score_heads=4,
-        K_horizons=8, K_buf=8,
-        vocab_size=128_256,    # Llama-3.2-1B vocab
-        mod_period=64, tbptt_block=64, segment_T=T,
-        gumbel_tau_start=2.0, gumbel_tau_end=0.5, gumbel_anneal_steps=10_000,
-        epsilon_start=0.05, epsilon_end=0.01, epsilon_anneal_steps=10_000,
-        lambda_balance=0.0,
-        use_neuromod=True,
-        neuromod_D_mod=128, neuromod_n_layers=2, neuromod_n_heads=4,
-        neuromod_edge_hidden=64, neuromod_eta=1.0,
+        D_s=d_mem,
+        D_model=d_mem,            # state_to_model bottleneck shape; tying to
+                                  # d_mem keeps the readout matmul small.
+        vocab_size=128_256,       # Llama-3.2-1B vocab
+        segment_T=T,
+        mod_period=mod_period,
+        tbptt_block=mod_period,
         compile_on_train=False,
     )
 
@@ -97,9 +111,11 @@ def main():
     ap.add_argument("--model", default="meta-llama/Llama-3.2-1B")
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--T", type=int, default=256)
-    ap.add_argument("--d-mem", type=int, default=512,
+    ap.add_argument("--d-mem", type=int, default=256,
                     help="Walker state dim (= MemInjectLayer d_mem). "
-                         "Default 512 matches PretrainedGWConfig default.")
+                         "Default 256 matches the PRODUCTION walker's D_s "
+                         "(GraphWalkerConfig() defaults). Changing it forces "
+                         "a non-production walker shape.")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--iter", type=int, default=10)
     ap.add_argument("--inject-layer", type=int, default=8)

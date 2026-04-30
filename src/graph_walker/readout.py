@@ -138,7 +138,7 @@ class MultiHorizonReadout(nn.Module):
         valid: torch.Tensor,         # [B, T, K_h] bool — horizon has a valid target
         horizon_logits: torch.Tensor | None = None,  # optional [K_h, V] cache
     ) -> torch.Tensor:
-        """Memory-efficient CE: avoids the [B, T, K_h, V] broadcast.
+        """Memory-efficient CE with optional activation checkpointing.
 
         Exploits the factorization
             logits[b,t,k,v] = motor_logits[b,t,v] + horizon_logits[k,v]
@@ -146,13 +146,39 @@ class MultiHorizonReadout(nn.Module):
         iteration materializes a [B, T, V] tensor (the summed logits for
         one horizon) instead of the full [B, T, K_h, V].
 
-        At BS=88, T=48, K_h=8, V=32000, bf16: this saves ~3.8 GB of active
-        memory compared to the broadcast path, plus a matching save on the
-        log_softmax that `F.cross_entropy` would otherwise retain.
+        Each iteration's `logits_k` is saved by `F.cross_entropy` for
+        backward, so K_h × [B, T, V] saves stay alive until backward fires
+        — the dominant memory cost at large vocab. At Llama vocab V=128K,
+        BS=4, T=128, that's ~4.2 GB across both blocks of a segment.
+
+        ``checkpoint`` re-runs the readout's forward during backward instead
+        of holding those saves. Trades ~10-15% wall-time on the readout
+        portion for ~K_h × [B, T, V] memory freed, the difference between
+        BS=4 fitting and BS=8 fitting on a 24 GB card. Defaults to True
+        when training; set ``self._checkpoint_ce = False`` to disable for
+        debugging or for callers that already wrap us in checkpoint.
 
         Returns: `[B, T, K_h]` float32 cross-entropy per (position, horizon),
         with invalid entries zeroed per `valid`.
         """
+        if self.training and getattr(self, "_checkpoint_ce", True):
+            from torch.utils.checkpoint import checkpoint
+            return checkpoint(
+                self._cross_entropy_factorized_impl,
+                motor, unembedding, targets, valid,
+                use_reentrant=False,
+            )
+        return self._cross_entropy_factorized_impl(
+            motor, unembedding, targets, valid,
+        )
+
+    def _cross_entropy_factorized_impl(
+        self,
+        motor: torch.Tensor,
+        unembedding: torch.Tensor,
+        targets: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
         B, T, _ = motor.shape
         K_h = targets.shape[-1]
         V = unembedding.shape[0]
@@ -161,9 +187,9 @@ class MultiHorizonReadout(nn.Module):
         x = self.pred_head(x)                              # [B, T, D_model]
         W_T = unembedding.t()                              # [D_model, V]
         motor_logits = torch.matmul(x, W_T)                # [B, T, V] — reused
-
-        if horizon_logits is None:
-            horizon_logits = torch.matmul(self.horizon_emb, W_T)  # [K_h, V]
+        # Always recompute horizon_logits inside the impl so checkpointing
+        # reproduces it exactly during backward (no stale captured tensor).
+        horizon_logits = torch.matmul(self.horizon_emb, W_T)  # [K_h, V]
 
         ce_out = torch.empty(B, T, K_h, device=motor.device, dtype=torch.float32)
         for k in range(K_h):

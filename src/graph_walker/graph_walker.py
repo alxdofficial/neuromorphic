@@ -583,6 +583,12 @@ class GraphWalkerMemory(nn.Module):
         # replacing T_block per-token step_core_from_h calls.
         self._compiled_block_from_h = None
 
+        # Filled when compile_block() is called (standalone path that drives
+        # block_forward with token ids). Initialized here so callers can
+        # check `lm.memory._compiled_block is not None` without an
+        # AttributeError when compile_block was never invoked.
+        self._compiled_block = None
+
     # -----------------------------------------------------------------
     # Block-level caches (static per forward within a TBPTT block)
     # -----------------------------------------------------------------
@@ -1176,6 +1182,61 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=lb_loss_total,
         )
 
+    def _block_forward_from_h_ckpt(
+        self,
+        s_in: torch.Tensor,
+        walker_pos_in: torch.Tensor,
+        walker_state_in: torch.Tensor,
+        prev_motor_in: torch.Tensor,
+        e_bias_in: torch.Tensor,
+        h_mem_block: torch.Tensor,
+        tau: torch.Tensor,
+        epsilon: torch.Tensor,
+        anchor_at_t0: bool,
+    ) -> BlockOutput:
+        """Activation-checkpointed wrapper around `_compiled_block_from_h`.
+
+        Internally calls the compiled block under
+        `torch.utils.checkpoint.checkpoint(use_reentrant=False)`, returning
+        the BlockOutput's tensor fields as a tuple so the checkpointing
+        machinery's "output must be tensors" requirement is satisfied
+        cleanly. We unpack back into BlockOutput for the caller.
+
+        Without this wrapper, the compiled block's per-step intermediates
+        (saved-for-backward of every `_step_core_pure` call across the
+        block) stay alive until segment-end backward — empirically the
+        largest memory contributor at integration scale.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        def _fn(s, wp, ws, pm, eb, hm, t_, e_, isnew_):
+            r = self._compiled_block_from_h(
+                s, wp, ws, pm, eb, hm, t_, e_, isnew_,
+            )
+            # Return as tuple of tensors for checkpoint compatibility.
+            return (
+                r.s_new, r.walker_pos_new, r.walker_state_new,
+                r.prev_motor_new, r.motor_states_bt,
+                r.co_visit_total, r.visit_count_total, r.load_balance_loss,
+            )
+
+        out_tuple = checkpoint(
+            _fn,
+            s_in, walker_pos_in, walker_state_in, prev_motor_in,
+            e_bias_in, h_mem_block, tau, epsilon, anchor_at_t0,
+            use_reentrant=False,
+        )
+        return BlockOutput(
+            s_new=out_tuple[0],
+            walker_pos_new=out_tuple[1],
+            walker_state_new=out_tuple[2],
+            prev_motor_new=out_tuple[3],
+            motor_states_bt=out_tuple[4],
+            co_visit_total=out_tuple[5],
+            visit_count_total=out_tuple[6],
+            load_balance_loss=out_tuple[7],
+        )
+
     def compile_block_from_h(
         self, mode: str = "default", fullgraph: bool = True,
     ) -> None:
@@ -1355,12 +1416,33 @@ class GraphWalkerMemory(nn.Module):
                 dummy_tok = torch.zeros(B, dtype=torch.int64, device=device)
                 tau, epsilon = self._schedule_tensors(dummy_tok)
 
-                out = self._compiled_block_from_h(
-                    self.s, self.walker_pos, self.walker_state,
-                    self.prev_motor, e_bias_active,
-                    h_mem[:, block_start:block_end],
-                    tau, epsilon, is_new_window,
+                # Activation checkpointing on the whole-block forward.
+                # Without this the compiled `block_forward_from_h` saves
+                # per-step intermediates across all `tbptt_block` token steps
+                # for backward — at production scale that's the largest
+                # single contributor to peak memory (~7 GB at BS=4 from
+                # the memprof). With checkpoint, the block forward gets
+                # re-run during backward instead. ~10-20% wall-time cost on
+                # the walker portion, ~5-6 GB freed at BS=4 (linear in B).
+                # Disabled in eval / when explicitly opted out.
+                ckpt_block = (
+                    self.training
+                    and getattr(self, "_checkpoint_block", True)
                 )
+                if ckpt_block:
+                    out = self._block_forward_from_h_ckpt(
+                        self.s, self.walker_pos, self.walker_state,
+                        self.prev_motor, e_bias_active,
+                        h_mem[:, block_start:block_end],
+                        tau, epsilon, is_new_window,
+                    )
+                else:
+                    out = self._compiled_block_from_h(
+                        self.s, self.walker_pos, self.walker_state,
+                        self.prev_motor, e_bias_active,
+                        h_mem[:, block_start:block_end],
+                        tau, epsilon, is_new_window,
+                    )
 
                 # State writeback — block_forward_from_h is pure-functional
                 # so callers must thread state explicitly. Mirrors what
