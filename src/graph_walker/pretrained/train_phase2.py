@@ -58,14 +58,20 @@ def grpo_step(
     top_p: float = 1.0,
     grad_clip: float = 1.0,
     adv_std_floor: float = 1e-3,
+    gen_sample_routing: bool = False,
 ) -> GRPOStats:
     """One GRPO step on a single (prefix, reference) pair.
 
     Args:
         reward_fn: maps `(generated [K, T_pre+L], reference [L]) → rewards [K]`.
             Default is per-rollout fraction of generated tail tokens that
-            match the reference (placeholder; real runs want PrefBERT or
-            entity-F1).
+            match the reference (placeholder; real runs want BERT-cosine).
+        gen_sample_routing: if True, walker routing during generation
+            uses Categorical sampling (more reward variance across the K
+            rollouts at the cost of noisier walker writes during gen).
+            Defaults to False (argmax routing — matches the policy that
+            inference would use). Try True if reward_std stays near zero
+            for too long.
     """
     if reward_fn is None:
         reward_fn = _default_token_match_reward
@@ -85,10 +91,11 @@ def grpo_step(
         phase="phase2",
         grad_during_prefix=True,
         grad_during_gen=False,
+        gen_sample_routing=gen_sample_routing,
     )
 
-    log_pi_sum = out.log_pi_sum
-    if log_pi_sum is None:
+    log_pi_mean = out.log_pi_mean
+    if log_pi_mean is None:
         raise RuntimeError(
             "GRPO step produced no log_pi — phase-2 routing didn't fire. "
             "Check that wrapper.memory.phase == 'phase2' during the prefix."
@@ -98,19 +105,19 @@ def grpo_step(
     # only carry grad via `_active_delta_nm`. If the prefix doesn't span a
     # full plasticity window AND `reset_memory()` cleared neuromod carryover
     # at start-of-segment, the first window runs with `_active_delta_nm=None`
-    # → routing scores have no grad → `log_pi_sum.requires_grad=False` →
+    # → routing scores have no grad → `log_pi_mean.requires_grad=False` →
     # `loss.backward()` raises an opaque "element 0 of tensors does not
     # require grad" error. Fail loudly with a fix-it message instead.
-    if not log_pi_sum.requires_grad:
+    if not log_pi_mean.requires_grad:
         raise RuntimeError(
-            "log_pi_sum has no grad in phase-2 — typically means the prefix "
+            "log_pi_mean has no grad in phase-2 — typically means the prefix "
             "did not span a full plasticity window AND neuromod carryover was "
             "cleared, so the first window had _active_delta_nm=None. Make "
             f"prefix_len > memory.cfg.mod_period, OR use "
             "reset_memory(clear_neuromod_carryover=False)."
         )
 
-    rewards = reward_fn(out.generated, reference_cont).to(log_pi_sum.device)
+    rewards = reward_fn(out.generated, reference_cont).to(log_pi_mean.device)
     if rewards.shape != (K,):
         raise ValueError(
             f"reward_fn returned shape {tuple(rewards.shape)}, expected ({K},)"
@@ -119,7 +126,10 @@ def grpo_step(
     r_std = rewards.std().clamp(min=adv_std_floor)
     advantages = (rewards - r_mean) / r_std
 
-    loss = -(log_pi_sum * advantages.detach()).mean()
+    # REINFORCE on per-step-mean log π. The mean normalization is what
+    # keeps gradient magnitudes bounded as T_pre changes — see the
+    # consume_log_pi_mean docstring in graph_walker.py for the math.
+    loss = -(log_pi_mean * advantages.detach()).mean()
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for _, p in wrapper.trainable_parameters()],
@@ -132,7 +142,7 @@ def grpo_step(
         loss=float(loss.detach()),
         reward_mean=float(r_mean.detach()),
         reward_std=float(rewards.std().detach()),
-        log_pi_mean=float(log_pi_sum.detach().mean()),
+        log_pi_mean=float(log_pi_mean.detach().mean()),
         advantage_max=float(advantages.detach().abs().max()),
         grad_norm=float(grad_norm) if isinstance(grad_norm, torch.Tensor)
                   else float(grad_norm),

@@ -35,7 +35,9 @@ from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
 class RolloutOutput:
     generated: torch.Tensor          # [BS, T_pre + L] full sequence
     new_tokens: torch.Tensor         # [BS, L] generated tail
-    log_pi_sum: torch.Tensor | None  # [BS] log π over routing during prefix
+    log_pi_mean: torch.Tensor | None # [BS] MEAN log π over routing during prefix
+                                      # (= sum / step_count for proper REINFORCE
+                                      # normalization — see consume_log_pi_mean)
     last_logits: torch.Tensor | None # [BS, vocab] for diagnostics
 
 
@@ -92,6 +94,7 @@ def autoregressive_rollout(
     phase: str = "phase2",           # "phase1" or "phase2" (sets walker.phase)
     grad_during_prefix: bool = True,
     grad_during_gen: bool = False,
+    gen_sample_routing: bool = False,
 ) -> RolloutOutput:
     """Run a prefix + generation rollout.
 
@@ -106,8 +109,19 @@ def autoregressive_rollout(
         grad_during_prefix: whether to keep gradients for the prefix pass
             (True for GRPO; False for inference).
         grad_during_gen: whether to keep gradients during generation. GRPO
-            uses False — the policy is captured in log_pi_sum from the
+            uses False — the policy is captured in log_pi_mean from the
             prefix pass, generation is just sampling under it.
+        gen_sample_routing: if True, walker routing during generation
+            uses Categorical sampling (more reward variance across the K
+            rollouts at the cost of noisier walker writes during gen). If
+            False (default), routing during gen is argmax (deterministic
+            given walker state). Sampled-routing-during-gen is an
+            experimental variance-improvement lever — try it if K=8
+            rollouts produce indistinguishable rewards.
+
+            Note: even with gen_sample_routing=True, log_pi from gen-time
+            routing is consumed-and-discarded after prefix; only the
+            prefix log_pi participates in REINFORCE.
     """
     assert wrapper.memory is not None, "rollout requires attached memory"
     device = next(wrapper.parameters()).device
@@ -134,13 +148,23 @@ def autoregressive_rollout(
             out = wrapper(prefix_ids, use_cache=True)
             past_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
-            log_pi_sum = wrapper.memory.consume_log_pi_sum()
+            # Consume the MEAN (sum / step_count). The raw sum scales
+            # with T_pre × n_hops × n_heads ≈ thousands of decisions per
+            # rollout, producing gradient magnitudes thousands of times
+            # too large for a sane LR. See consume_log_pi_mean docstring.
+            log_pi_mean = wrapper.memory.consume_log_pi_mean()
 
         # Generation pass — freeze plasticity to keep the policy fixed.
         gen_ctx = torch.enable_grad() if grad_during_gen else torch.no_grad()
         new_tokens: list[torch.Tensor] = []
+        # train(True) during gen with phase=phase2 makes routing Categorical-
+        # sample (more rollout variance). The accumulated log_pi from gen
+        # is discarded post-rollout via the begin_segment reset on the
+        # next training step — only the consumed-after-prefix log_pi_mean
+        # participates in REINFORCE.
+        gen_train_mode = bool(gen_sample_routing)
         with gen_ctx, _freeze_plasticity_ctx(wrapper.memory):
-            wrapper.train(False)
+            wrapper.train(gen_train_mode)
             for _ in range(gen_length):
                 tok = _sample_next_token(last_logits, temperature, top_p)
                 new_tokens.append(tok)
@@ -156,7 +180,7 @@ def autoregressive_rollout(
         return RolloutOutput(
             generated=full,
             new_tokens=new_tokens_t,
-            log_pi_sum=log_pi_sum,
+            log_pi_mean=log_pi_mean,
             last_logits=last_logits.detach(),
         )
     finally:

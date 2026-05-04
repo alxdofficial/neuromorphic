@@ -96,12 +96,17 @@ def test_autoregressive_rollout_K_rollouts_diverge():
         phase="phase2", grad_during_prefix=True, grad_during_gen=False,
     )
 
-    # log_pi_sum should be K-shaped, finite, gradient-connected.
-    assert out.log_pi_sum is not None
-    assert out.log_pi_sum.shape == (K,)
-    assert torch.isfinite(out.log_pi_sum).all()
-    assert out.log_pi_sum.requires_grad, (
+    # log_pi_mean should be K-shaped, finite, gradient-connected.
+    assert out.log_pi_mean is not None
+    assert out.log_pi_mean.shape == (K,)
+    assert torch.isfinite(out.log_pi_mean).all()
+    assert out.log_pi_mean.requires_grad, (
         "log_pi must remain graph-connected to walker params for REINFORCE"
+    )
+    # Per-step normalization keeps |log_pi_mean| at ~|log p| (a few nats),
+    # not the unnormalized sum which would be ~thousands of nats.
+    assert out.log_pi_mean.detach().abs().max().item() < 100.0, (
+        "log_pi_mean magnitude unexpectedly large — normalization regression?"
     )
     # K rollouts should diverge in their generated tail (different samples).
     tail = out.new_tokens

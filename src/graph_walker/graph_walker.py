@@ -580,9 +580,22 @@ class GraphWalkerMemory(nn.Module):
         # Set externally by `wrapper.current_phase` for pretrained training.
         self.phase: str = "phase1"
         # Accumulated log π over routing decisions in the current segment.
-        # Reset at `begin_segment`. Read by GRPO via `consume_log_pi_sum()`.
+        # Reset at `begin_segment`. Read by GRPO via `consume_log_pi_mean()`
+        # (returns the sum divided by the count of accumulated steps,
+        # which is the proper normalization for REINFORCE — without it,
+        # log_pi_sum scales with trajectory length and produces gradient
+        # magnitudes thousands of times larger than necessary).
         # None when no phase-2 decisions have been recorded.
         self._log_pi_sum: torch.Tensor | None = None
+        # Companion counter for the running sum: the number of `_apply_step_state`
+        # calls that have contributed a non-None `log_pi_step`. Each
+        # contribution is itself a sum across H walkers and across (anchor +
+        # n_hops) routing decisions per step, but for normalization purposes
+        # we use step-count as the denominator — fixed-topology runs have a
+        # constant ratio of decisions-per-step, so step-count and
+        # decision-count differ only by a constant scale that's absorbed
+        # into the learning rate.
+        self._log_pi_count: int = 0
 
         # Per-block caches for values that depend only on Parameters (so
         # they are constant within a TBPTT block). Invalidated on
@@ -711,6 +724,7 @@ class GraphWalkerMemory(nn.Module):
         # see a clean slate. Stays None until the first phase-2 routing
         # decision (so phase-1 forwards don't allocate an extra tensor).
         self._log_pi_sum = None
+        self._log_pi_count = 0
 
         # Invalidate block-level caches at segment boundary.
         self._horizon_logits_cache = None
@@ -1047,6 +1061,7 @@ class GraphWalkerMemory(nn.Module):
                 out.log_pi_step if self._log_pi_sum is None
                 else self._log_pi_sum + out.log_pi_step
             )
+            self._log_pi_count += 1
 
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
         """Public single-token API: graph core + immediate readout.
@@ -1076,15 +1091,45 @@ class GraphWalkerMemory(nn.Module):
         )
 
     def consume_log_pi_sum(self) -> torch.Tensor | None:
-        """Return the accumulated phase-2 log π sum and clear the buffer.
+        """Return the accumulated phase-2 log π SUM and clear the buffer.
 
-        Used by `grpo_step` after the prefix pass. Returns None when no
-        phase-2 routing decisions were recorded since the last
-        `begin_segment` call.
+        Returns None when no phase-2 routing decisions were recorded since
+        the last `begin_segment` call.
+
+        Note: callers training with REINFORCE should prefer
+        `consume_log_pi_mean()`. The raw sum scales with trajectory length
+        (T_pre × n_hops × n_heads decisions per rollout = ~thousands of
+        log probabilities summed), producing huge gradient magnitudes
+        without a corresponding learning-rate adjustment. Mean
+        normalization keeps the per-step gradient scale roughly invariant
+        to T_pre.
         """
         out = self._log_pi_sum
         self._log_pi_sum = None
+        self._log_pi_count = 0
         return out
+
+    def consume_log_pi_mean(self) -> torch.Tensor | None:
+        """Return the accumulated phase-2 log π MEAN (sum / step count).
+
+        This is the right normalization for REINFORCE: trajectory length
+        affects the gradient direction the same way as the unnormalized
+        sum, but the magnitude is now per-step-bounded (~|log p| ≈ a few
+        nats) regardless of T_pre. Without this normalization at our
+        n_hops=4, n_heads=4, T_pre=512 setup, the loss magnitude is
+        ~22,000× larger than per-step.
+
+        Returns None when no phase-2 decisions were recorded since the
+        last `begin_segment` call. Clears the buffer + counter.
+        """
+        if self._log_pi_sum is None or self._log_pi_count == 0:
+            self._log_pi_sum = None
+            self._log_pi_count = 0
+            return None
+        mean = self._log_pi_sum / float(self._log_pi_count)
+        self._log_pi_sum = None
+        self._log_pi_count = 0
+        return mean
 
     # -----------------------------------------------------------------
     # Block-level functional API (compile target for whole-block CUDA graphs)
