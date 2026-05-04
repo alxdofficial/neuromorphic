@@ -93,6 +93,8 @@ class StatsCollector:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.work_dir / "stats.jsonl"
         self._fh = open(self.path, "a")
+        # State for delta-style metrics (across snapshot calls).
+        self._prev_E_bias_norm: float | None = None
 
     def close(self) -> None:
         self._fh.close()
@@ -128,10 +130,34 @@ class StatsCollector:
 
         # ---- training ----
         for fld in ("loss", "ce_loss", "aux_loss", "load_balance_loss",
-                    "grad_norm", "tok_per_sec", "reward_mean", "reward_std",
-                    "log_pi_mean", "advantage_max", "inject_residual_norm"):
+                    "grad_norm", "tok_per_sec",
+                    "reward_mean", "reward_std", "reward_min", "reward_max",
+                    "log_pi_mean", "log_pi_max_abs",
+                    "advantage_max", "advantage_std",
+                    "inject_residual_norm"):
             if hasattr(stats, fld):
                 row[f"train.{fld}"] = float(getattr(stats, fld))
+        # Integer fields (don't float-cast).
+        for fld in ("gen_unique_count",):
+            if hasattr(stats, fld):
+                row[f"train.{fld}"] = int(getattr(stats, fld))
+
+        # ---- AR phase-1 specifics: per-position CE diagnostics ----
+        # Phase1ARStats has `ce_per_step: list[float]`. The MEMORY-effect
+        # signature is: late-position CE drops below early-position CE
+        # (walker has had time to write the prefix's relevant info; LM
+        # uses it to predict the late tokens better). If ce_first ≈
+        # ce_last, walker isn't being used. If ce_first < ce_last, the
+        # walker is actively HURTING (or just absent).
+        ce_per_step = getattr(stats, "ce_per_step", None)
+        if isinstance(ce_per_step, (list, tuple)) and len(ce_per_step) > 0:
+            ce_arr = [float(c) for c in ce_per_step]
+            row["train.ar.ce_first"] = ce_arr[0]
+            row["train.ar.ce_last"] = ce_arr[-1]
+            row["train.ar.ce_mean"] = sum(ce_arr) / len(ce_arr)
+            # Drop = first - last; positive if memory helps.
+            row["train.ar.ce_drop"] = ce_arr[0] - ce_arr[-1]
+            row["train.ar.ce_per_step_len"] = len(ce_arr)
 
         # ---- column state ----
         if m is not None and m.s is not None:
@@ -228,6 +254,57 @@ class StatsCollector:
             row["llama.scale_grad_norm"] = _grad_norm(inj.scale)
         except Exception:
             pass
+
+        # ---- walker plasticity health (cheap sanity flags) ----
+        # These catch silent dead-walker / dead-neuromod situations:
+        # - has_active_delta_nm=False means routing this step had no
+        #   neuromod gradient signal (only plain E_bias_flat used).
+        # - window_len reaching 0 between steps = plasticity fired
+        #   correctly. Stuck nonzero across calls = plasticity didn't
+        #   fire (update_plasticity wasn't called or returned early).
+        # - snapshot_size == 0 = no touched cols recorded; neuromod has
+        #   no input to condition on next step.
+        if m is not None:
+            row["walker.window_len"] = int(getattr(m, "window_len", 0))
+            row["walker.has_active_delta_nm"] = bool(
+                getattr(m, "_active_delta_nm", None) is not None
+            )
+            snap_ids = getattr(m, "_prev_snapshot_ids", None)
+            row["walker.snapshot_size"] = int(snap_ids.numel()) if snap_ids is not None else 0
+            row["walker.phase"] = str(getattr(m, "phase", "phase1"))
+
+        # ---- E_bias delta from previous snapshot ----
+        # Tracks whether plasticity is actually moving things. If
+        # E_bias_delta_norm stays near 0 across many steps, neuromod is
+        # not learning OR plasticity-window is misfiring.
+        if m is not None and m.E_bias_flat is not None:
+            cur_norm = _norm(m.E_bias_flat)
+            if self._prev_E_bias_norm is not None:
+                row["mem.E_bias_delta_norm"] = abs(cur_norm - self._prev_E_bias_norm)
+            self._prev_E_bias_norm = cur_norm
+
+        # ---- VRAM peak (this step's high-water mark) ----
+        if torch.cuda.is_available():
+            row["vram.peak_mb"] = float(torch.cuda.max_memory_allocated() / 1e6)
+            row["vram.allocated_mb"] = float(torch.cuda.memory_allocated() / 1e6)
+            torch.cuda.reset_peak_memory_stats()
+
+        # ---- NaN / Inf detection across grads ----
+        # Cheap aggregate (one bool per step). If True, training has
+        # already corrupted somewhere — easier to spot in the plot than
+        # by watching loss dance between numbers and NaN.
+        any_nan_grad = False
+        any_nan_param = False
+        if m is not None:
+            for _, p in m.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    any_nan_grad = True
+                if not torch.isfinite(p.data).all():
+                    any_nan_param = True
+                if any_nan_grad and any_nan_param:
+                    break
+        row["nan.any_nan_grad"] = any_nan_grad
+        row["nan.any_nan_param"] = any_nan_param
 
         if extra:
             row.update(extra)
@@ -398,5 +475,108 @@ def plot_dashboard(stats_path: str | Path, out_dir: str | Path) -> list[Path]:
         ax.grid(alpha=0.3)
     fig.suptitle("Llama integration")
     written.append(_save(fig, "08_llama_side.png"))
+
+    # 9. VRAM + throughput
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+    axes[0].plot(steps, _series("vram.peak_mb"), lw=1, label="peak")
+    axes[0].plot(steps, _series("vram.allocated_mb"), lw=1, label="allocated")
+    axes[0].set_title("VRAM (MB)")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.3)
+    axes[1].plot(steps, _series("train.tok_per_sec"), lw=1)
+    axes[1].set_title("Throughput (tok/sec)")
+    axes[1].grid(alpha=0.3)
+    fig.suptitle("Resource utilization")
+    written.append(_save(fig, "09_vram_throughput.png"))
+
+    # 10. Walker plasticity health (sanity flags)
+    # If `has_active_delta_nm` drops to False (and stays there), neuromod
+    # has no gradient signal → stuck. If `snapshot_size` is 0, no touched
+    # cols recorded → neuromod has no input to condition on.
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    axes[0, 0].plot(steps, _series("walker.window_len"), lw=1)
+    axes[0, 0].set_title("walker.window_len  (resets on plasticity fire)")
+    axes[0, 0].grid(alpha=0.3)
+    has_delta = [1.0 if r.get("walker.has_active_delta_nm", False) else 0.0
+                  for r in rows]
+    axes[0, 1].plot(steps, has_delta, lw=1, drawstyle="steps-post")
+    axes[0, 1].set_title("has_active_delta_nm  (1=neuromod live, 0=stuck)")
+    axes[0, 1].set_ylim(-0.1, 1.1)
+    axes[0, 1].grid(alpha=0.3)
+    axes[1, 0].plot(steps, _series("walker.snapshot_size"), lw=1)
+    axes[1, 0].set_title("snapshot_size  (touched cols feeding neuromod)")
+    axes[1, 0].grid(alpha=0.3)
+    axes[1, 1].plot(steps, _series("mem.E_bias_delta_norm"), lw=1)
+    axes[1, 1].set_title("E_bias_delta_norm  (plasticity moving E_bias?)")
+    axes[1, 1].grid(alpha=0.3)
+    fig.suptitle("Walker plasticity health")
+    written.append(_save(fig, "10_walker_health.png"))
+
+    # 11. Phase-2 GRPO diagnostics (only meaningful when phase=phase2 stats present)
+    # Reward distribution + variance + log_pi sanity + generation diversity.
+    # Skip silently if no GRPO rows.
+    has_grpo = any("train.reward_mean" in r for r in rows)
+    if has_grpo:
+        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+        # Reward band: min/max/mean across the K rollouts at each step.
+        r_mean = _series("train.reward_mean")
+        r_min = _series("train.reward_min")
+        r_max = _series("train.reward_max")
+        axes[0, 0].plot(steps, r_mean, lw=1.5, label="mean", color="C0")
+        axes[0, 0].plot(steps, r_min, lw=0.7, label="min", color="C1", alpha=0.7)
+        axes[0, 0].plot(steps, r_max, lw=0.7, label="max", color="C2", alpha=0.7)
+        axes[0, 0].set_title("Reward (mean / min / max across K rollouts)")
+        axes[0, 0].legend(fontsize=8)
+        axes[0, 0].grid(alpha=0.3)
+        # Reward + advantage std: if std → 0, no learning signal.
+        axes[0, 1].plot(steps, _series("train.reward_std"), lw=1, label="reward.std")
+        axes[0, 1].plot(steps, _series("train.advantage_std"), lw=1, label="adv.std")
+        axes[0, 1].set_title("Reward / advantage std (→0 = no signal)")
+        axes[0, 1].legend(fontsize=8)
+        axes[0, 1].grid(alpha=0.3)
+        # log_pi magnitude: should stay ~|log p| (a few nats); regression detector.
+        axes[1, 0].plot(steps, _series("train.log_pi_mean"), lw=1, label="mean")
+        axes[1, 0].plot(steps, _series("train.log_pi_max_abs"), lw=1, label="max |·|")
+        axes[1, 0].set_title("log_pi (mean per step / max |·|)")
+        axes[1, 0].legend(fontsize=8)
+        axes[1, 0].grid(alpha=0.3)
+        # Generation diversity: # unique rollouts. Floor of 1 = collapse.
+        axes[1, 1].plot(steps, _series("train.gen_unique_count"), lw=1)
+        axes[1, 1].set_title("gen_unique_count  (1 = all rollouts identical)")
+        axes[1, 1].grid(alpha=0.3)
+        fig.suptitle("GRPO diagnostics")
+        written.append(_save(fig, "11_grpo_diagnostics.png"))
+
+    # 12. AR-specific: per-position CE diagnostic (memory-effect signature)
+    has_ar = any("train.ar.ce_first" in r for r in rows)
+    if has_ar:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+        axes[0].plot(steps, _series("train.ar.ce_first"), lw=1, label="first")
+        axes[0].plot(steps, _series("train.ar.ce_last"), lw=1, label="last")
+        axes[0].plot(steps, _series("train.ar.ce_mean"), lw=1, label="mean", linestyle="--")
+        axes[0].set_title("AR CE: first / last / mean position")
+        axes[0].legend(fontsize=8)
+        axes[0].grid(alpha=0.3)
+        axes[1].plot(steps, _series("train.ar.ce_drop"), lw=1, color="C3")
+        axes[1].axhline(0.0, color="k", lw=0.5, alpha=0.5)
+        axes[1].set_title("CE drop = first - last  (>0 = memory helps)")
+        axes[1].grid(alpha=0.3)
+        fig.suptitle("AR memory-effect signature")
+        written.append(_save(fig, "12_ar_memory_effect.png"))
+
+    # 13. NaN / Inf flags
+    has_nan = any(r.get("nan.any_nan_grad") or r.get("nan.any_nan_param")
+                   for r in rows)
+    if has_nan:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        nan_grad = [1.0 if r.get("nan.any_nan_grad") else 0.0 for r in rows]
+        nan_param = [1.0 if r.get("nan.any_nan_param") else 0.0 for r in rows]
+        ax.plot(steps, nan_grad, lw=1, drawstyle="steps-post", label="any_nan_grad")
+        ax.plot(steps, nan_param, lw=1, drawstyle="steps-post", label="any_nan_param")
+        ax.set_title("⚠️  NaN / Inf detected at these steps")
+        ax.set_ylim(-0.1, 1.1)
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        written.append(_save(fig, "13_nan_flags.png"))
 
     return written

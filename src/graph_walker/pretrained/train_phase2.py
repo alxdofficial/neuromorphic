@@ -39,8 +39,13 @@ class GRPOStats:
     loss: float
     reward_mean: float
     reward_std: float
+    reward_min: float            # min reward across K rollouts; floor
+    reward_max: float            # max reward across K rollouts; ceiling
     log_pi_mean: float
+    log_pi_max_abs: float        # max |log_pi_mean| across rollouts; magnitude regression detector
     advantage_max: float
+    advantage_std: float         # std of advantages; learning-signal indicator
+    gen_unique_count: int        # # unique generations among K rollouts; if 1, no signal
     grad_norm: float
 
 
@@ -138,12 +143,22 @@ def grpo_step(
     opt.step()
     wrapper.detach_memory()
 
+    # Generation diversity: how many of the K rollouts produced unique
+    # token sequences? If 1, all rollouts converged, advantages are 0,
+    # no learning signal — early warning for "GRPO has nothing to do."
+    gen_unique_count = int(out.new_tokens.unique(dim=0).shape[0])
+
     return GRPOStats(
         loss=float(loss.detach()),
         reward_mean=float(r_mean.detach()),
         reward_std=float(rewards.std().detach()),
+        reward_min=float(rewards.detach().min()),
+        reward_max=float(rewards.detach().max()),
         log_pi_mean=float(log_pi_mean.detach().mean()),
+        log_pi_max_abs=float(log_pi_mean.detach().abs().max()),
         advantage_max=float(advantages.detach().abs().max()),
+        advantage_std=float(advantages.detach().std()),
+        gen_unique_count=gen_unique_count,
         grad_norm=float(grad_norm) if isinstance(grad_norm, torch.Tensor)
                   else float(grad_norm),
     )

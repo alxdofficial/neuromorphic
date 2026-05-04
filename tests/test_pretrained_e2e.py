@@ -111,9 +111,13 @@ def test_cycle_loop_e2e_with_telemetry_and_plots(tmp_path: Path):
     rows = stats_path.read_text().strip().splitlines()
     assert len(rows) == 4, f"expected 2+1+1 rows, got {len(rows)}"
 
-    # Plot pipeline doesn't raise and produces 8 PNGs.
+    # Plot pipeline doesn't raise. Always-on plots: 1-10 (10 PNGs).
+    # Conditional plots: 11 (GRPO diagnostics, requires reward_mean rows),
+    # 12 (AR memory effect, requires ce_per_step rows), 13 (NaN flags,
+    # requires any NaN/Inf detected). Only assert the always-on ones plus
+    # any phase-conditional ones we actually triggered.
     out = plot_dashboard(stats_path, out_dir=work_dir / "plots")
-    assert len(out) == 8
+    assert len(out) >= 10, f"expected ≥10 plots, got {len(out)}"
     for p in out:
         assert p.exists() and p.stat().st_size > 0, (
             f"empty plot file: {p}"
