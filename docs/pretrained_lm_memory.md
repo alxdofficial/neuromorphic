@@ -1,15 +1,26 @@
-# Pretrained-LM + Memory Graph
+# Pretrained-LM + Memory Graph (v2 attention-neuromod)
 
 **Branch:** `main` (promoted from `pretrained-lm-memory-v2` on 2026-04-19).
 **Status:** pretrained smoke suite passes on CPU (`tests/test_pretrained_smoke.py`).
 No dedicated GPU smoke is wired on this branch yet.
+
+> **This doc describes the v2 attention-neuromod integration** in
+> `src/pretrained/`. The newer GraphWalker integration (`src/graph_walker/pretrained/`)
+> is described in [docs/pretrained_graph_walker.md](pretrained_graph_walker.md)
+> and superseded the v2 design as the active research direction. The v2
+> path is preserved in main for back-compat but not actively developed.
+>
+> Key difference: the **GraphWalker integration is vocab-agnostic** —
+> no walker-side LM head, no aux loss, plasticity driven externally via
+> `walker.update_plasticity(per_token_ce)`. The v2 path described below
+> still uses adapter-side aux CE.
 
 > **Training data + reward plan**: see `docs/training_plan.md` for the
 > sequenced dataset strategy (synthetic passkey/K:V → custom
 > conversational → LongMemEval/RULER benchmarks) and the
 > paraphrase-tolerant composite reward design.
 
-This doc describes how the memory graph (from the from-scratch attention-neuromod
+This doc describes how the v2 memory graph (from the from-scratch attention-neuromod
 work — see `design.md` for its internals) is grafted onto a pretrained Llama-3.2
 backbone, and the two-phase training protocol (Gumbel bootstrap → autoregressive
 GRPO).

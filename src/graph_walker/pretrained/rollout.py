@@ -5,14 +5,19 @@ desired generation length, returns generated token ids `[BS, T_pre + L]`
 and (optionally) the per-step logits.
 
 Memory semantics during rollout:
-- Prefix pass: walker fires plasticity at `mod_period` cadence, producing
-  the rollout's "memory imprint". In phase 2 mode, routing is hard
-  Categorical and `log_pi_sum` accumulates.
-- Generation: each new token is sampled (temperature + top-p), fed
-  forward via KV cache. Walker runs one step per token. Plasticity may
-  fire if window_len reaches mod_period; in phase 2 we typically want it
-  off so the rollout's "policy" stays the prefix's writes — set
-  `freeze_plasticity=True`.
+- Plasticity does NOT fire inside `forward_segment` — the walker is
+  vocab-agnostic and surprise is supplied by the trainer post-backward
+  via `wrapper.memory.update_plasticity(per_token_ce)`.
+- During AR rollout (no ground truth), the trainer typically passes
+  `None` to `update_plasticity` (or skips the call entirely) and the
+  walker's plastic state stays frozen for the duration of the rollout.
+- In phase 2 mode, routing is hard Categorical and `log_pi_sum`
+  accumulates over routing decisions for REINFORCE.
+
+`_freeze_plasticity_ctx` is retained as a no-op-equivalent safety net
+(sets mod_period ≈ ∞). Under the external-surprise design no plasticity
+firing happens inside the rollout regardless, but back-compat callers
+of `autoregressive_rollout` may still pass `freeze_plasticity=True`.
 """
 
 from __future__ import annotations

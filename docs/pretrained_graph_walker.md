@@ -1,16 +1,25 @@
 # Pretrained-LM + GraphWalker integration
 
-**Status:** smoke suite (42 tests) passes on CPU. No GPU smoke wired yet.
-**Branch:** `main` (graph-walker promoted on 2026-04-25).
+**Status:** 118-test suite passes on CPU. No GPU smoke wired yet.
+**Branch:** `main` (graph-walker promoted on 2026-04-25; vocab-agnostic
+walker landed 2026-04-30).
 
 This doc describes how the `GraphWalkerMemory` is grafted onto a frozen
 HuggingFace causal LM (Llama / TinyLlama / SmolLM2) at one mid-stack
 decoder layer, plus the two-phase training protocol (Gumbel-STE bootstrap
 → autoregressive GRPO).
 
-The integration plumbing (`MemInjectLayer`, `HostAdapter`, `MemAdapter`)
-is **shared with v2** in `src/pretrained/`. Only the memory module and a
-small adapter on `GraphWalkerMemory` are new.
+The walker is **vocab-agnostic** in the integration: it has no LM head
+of its own, no aux loss, no walker-side multi-horizon CE. It learns end
+to end via gradient flowing back from Llama's primary CE through `W_out`.
+Plasticity is driven externally — the trainer computes Llama's per-token
+CE post-backward and feeds it to `walker.update_plasticity()`.
+
+The integration plumbing (`MemInjectLayer`, `HostAdapter`) is **shared
+with v2** in `src/pretrained/`. The old `MemAdapter` (provided
+`mem_head_logits` for an aux-CE side-head) is no longer wired into the
+graph_walker integration but is still imported by the v2 attention-
+neuromod path.
 
 ---
 
@@ -63,7 +72,7 @@ src/graph_walker/
 
 src/pretrained/                  # SHARED with v2 — re-used by graph_walker
 ├── mem_inject_layer.py          # MemInjectLayer
-├── mem_adapter.py               # MemAdapter (provides mem_head_logits)
+├── mem_adapter.py               # MemAdapter (v2-only now; not used by graph_walker)
 └── hosts/                       # LlamaHost + future families
     ├── base.py
     └── llama.py
@@ -71,28 +80,28 @@ src/pretrained/                  # SHARED with v2 — re-used by graph_walker
 
 ---
 
-## 3. The new GraphWalkerMemory adapter API
-
-Two methods added to `GraphWalkerMemory`:
+## 3. The GraphWalkerMemory integration API
 
 ```python
 def step_core_from_h(self, h_input):
-    """One walker step driven by [B, D_s] vector instead of token_id.
-    Used internally by forward_segment."""
+    """One walker step driven by [B, D_s] vector instead of token_id."""
 
-def forward_segment(self, h_mem, input_ids, adapter, *,
-                    compute_aux_loss=True, preserve_graph=False,
-                    walker_aux_weight=1.0):
-    """[BS, T, D_s] → [BS, T, D_s] readouts + aux CE.
+def forward_segment(self, h_mem, *, preserve_graph=False):
+    """[BS, T, D_s] → [BS, T, D_s] readouts. Pure forward.
 
-    Aux CE combines:
-    - Walker-side multi-horizon CE (gradient flows to state_to_model + walker
-      hot path). Uses walker's own tied_token_emb readout.
-    - Llama-side horizon-1 CE via adapter.mem_head_logits (gradient flows to
-      W_out and walker through the inject path).
+    The walker is vocab-agnostic: no LM head, no aux loss, no surprise
+    is computed inside the segment. TBPTT detach happens every
+    `cfg.tbptt_block` tokens unless `preserve_graph=True`.
+    """
 
-    Plasticity + surprise fold fire at cfg.mod_period cadence using the
-    walker's own multi-horizon CE — independent of the Llama side.
+def update_plasticity(self, per_token_surprise: Tensor | None):
+    """Externally-driven plasticity. Call AFTER `loss.backward()`.
+
+    - per_token_surprise=None: AR free-gen / inference. No plastic update.
+    - per_token_surprise: [B, T_supervised]: training. Fold per-token CE
+      into surprise_ema, fire one plasticity step (commit the current
+      `_active_delta_nm` into `E_bias_flat`, snapshot, build the next
+      segment's neuromod delta).
     """
 ```
 
@@ -100,23 +109,34 @@ One new parameter on the walker: `mem_input_v_proj` (D_s → D_s) — a
 parallel anchor v_inject projection used when h_input arrives in D_s
 already (no D_model embedding to project from).
 
-Two walker params are token-path-only and frozen by the wrapper at init:
-`token_to_state` and `input_v_proj`.
+Walker params frozen by the wrapper at init (dead in the integration's
+vocab-agnostic forward path):
+- `token_to_state`, `input_v_proj`, `tied_token_emb` — token-id-driven
+  hot path only used by the standalone walker.
+- `state_to_model` and the entire `readout` submodule (multi-horizon
+  walker LM head) — exercised only by the dropped aux-CE path.
 
 ---
 
 ## 4. Phase 1 — Gumbel-STE bootstrap (`phase1_pretrained_step`)
 
 Per step:
-1. `wrapper.reset_memory(bs)` — zero walker working state.
+1. `wrapper.reset_memory(bs)` — zero walker working state. Preserves
+   `_prev_snapshot_*` so the next segment's `_active_delta_nm` is
+   non-None and routing carries gradient to neuromod.
 2. Llama forward with memory closure at layer L. Walker steps T tokens
    sequentially inside `forward_segment` with TBPTT-block detach.
-3. Primary loss: Llama CE on next-token prediction.
-4. Aux loss: walker-side multi-horizon CE + Llama-side horizon-1 CE
-   (combined inside `forward_segment`, returned via
-   `wrapper._last_mem_loss`).
-5. `loss = ce_weight * CE + lm_aux_weight * aux`.
-6. Backward, grad-clip, opt.step, `wrapper.detach_memory()`.
+   `forward_segment` is now a pure forward — no aux loss, no plasticity.
+3. Loss: Llama CE on next-token prediction (`ce_weight * CE`). The walker
+   has no aux loss of its own; its parameters learn purely via gradient
+   flowing back through `W_out` from Llama's CE.
+4. `loss.backward()`, grad-clip, `opt.step()`.
+5. **Surprise / plasticity**: with `reduction='none'`, recompute Llama's
+   per-token CE on the shifted logits and feed `[BS, T-1]` into
+   `wrapper.memory.update_plasticity(per_token_ce)`. This folds
+   surprise into `surprise_ema`, fires one plasticity step, and builds
+   the next segment's neuromod delta.
+6. `wrapper.detach_memory()`.
 
 Routing during phase 1: Gumbel-soft + STE (existing `gumbel_top1_softmax`
 with `phase="phase1"`). τ schedule comes from `GraphWalkerConfig`.
@@ -127,7 +147,8 @@ Same per-step structure but with `wrapper.preserve_memory_graph()` keeping
 walker state graph-connected across the prefix pass + per-token
 continuation forwards. Continuation predictions' gradient reaches the
 prefix-pass writes through the walker's recurrent state. Trains the
-walker to actually USE its prefix writes.
+walker to actually USE its prefix writes. Surprise for plasticity is
+the per-token CE over the continuation tokens, computed post-backward.
 
 ### Default knobs (`PretrainedGWConfig`)
 
@@ -135,12 +156,13 @@ walker to actually USE its prefix writes.
 |---|---|---|
 | `T` | 256 | segment length per forward |
 | `bs` | 8 | phase-1 batch |
-| `walker_aux_weight` | 1.0 | scale on walker's own multi-horizon CE |
-| `lm_aux_weight` | 0.1 | scale on adapter-side horizon-1 CE |
 | `ce_weight` | 1.0 | scale on primary Llama CE |
 | `grad_clip` | 1.0 | |
 | `inject_layer` | 8 (1B) / 14 (3B) | mid-stack, doc-recommended |
 | `d_mem` | 512 | MemInjectLayer dim; equals walker's `D_s` |
+
+The old `walker_aux_weight` and `lm_aux_weight` knobs were removed when
+the walker became vocab-agnostic — there is no aux loss to weight.
 
 ---
 
@@ -221,7 +243,7 @@ Captured per step (~40 metrics):
 
 | Category | Metrics |
 |---|---|
-| Training | loss, ce_loss, aux_loss, grad_norm, tok_per_sec, inject_residual_norm |
+| Training | loss, ce_loss, grad_norm, tok_per_sec, inject_residual_norm |
 | Column state | s_norm percentiles (P50/P90/P99), touched_frac, visit_entropy_norm |
 | Walker heads | per-head walker_state norm, per-head α (sigmoid'd), co-location rate |
 | Routing | τ, ε, plast_eta |
@@ -261,18 +283,17 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
 ## 9. Known invariants / footguns
 
 - `tbptt_block == mod_period`. Enforced in `GraphWalkerConfig.__post_init__`.
-- `T % mod_period == 0`. Enforced both in config and in `forward_segment`'s
-  per-block CE math.
+- `T % mod_period == 0`. Enforced in config.
 - `d_mem == memory.D_s`. Enforced in `PretrainedGWConfig.validate()`.
 - `wrapper.reset_memory(bs)` MUST be called before every segment forward.
-- Phase-2 generation pass automatically pins `mod_period = 10**9` so
-  per-token gen doesn't trigger plasticity fires that would re-randomize
-  the policy mid-rollout.
+  Default `clear_neuromod_carryover=False` preserves `_prev_snapshot_*`
+  across calls — required so neuromod params receive gradient via
+  `_active_delta_nm`. Setting it to `True` starves neuromod of gradient.
+- `wrapper.memory.update_plasticity(per_token_ce)` MUST be called after
+  `loss.backward()` for plastic state and neuromod params to advance.
+  Pass `None` (or skip the call) for AR free-generation / inference.
 - `consume_log_pi_sum()` clears the buffer on read — call once per phase-2
   prefix pass, before the generation phase.
-- `wrapper._last_mem_loss` is only populated when `compute_aux_loss=True`
-  (i.e. training mode + no override). Read it immediately after the
-  forward; don't carry it across calls.
 - `MemInjectLayer.W_in/W_out/scale` stay fp32 for stable Adam updates;
   Llama backbone is bf16 in production. Cross-dtype handling is inside
   `MemInjectLayer.forward`.
@@ -300,5 +321,5 @@ for step in range(N):
         Phase1Batch(input_ids=input_ids, target_ids=target_ids),
     )
     if step % 100 == 0:
-        print(step, stats.loss, stats.ce_loss, stats.aux_loss)
+        print(step, stats.loss, stats.ce_loss, stats.grad_norm)
 ```

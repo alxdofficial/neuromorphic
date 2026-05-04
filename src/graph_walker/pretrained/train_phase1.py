@@ -5,14 +5,18 @@ Per step:
 2. Full Llama forward with memory read/write at layer L (via MemInjectLayer
    closure). Walker processes the T-long segment sequentially inside
    `forward_segment`, with TBPTT detach every `tbptt_block` tokens.
-3. Primary loss: Llama's next-token CE on `target_ids`.
-   Aux losses: walker's multi-horizon CE + adapter-side horizon-1 CE
-   (both stashed on `wrapper._last_mem_loss`).
-4. `loss = ce_weight · CE + aux_weight · aux`
-5. Backward, grad-clip, opt.step, detach memory.
+3. Loss: Llama's next-token CE on `target_ids`. The walker has no aux loss
+   of its own; it learns purely via gradient flowing back through `W_out`.
+4. `loss.backward()`, grad-clip, `opt.step()`.
+5. Compute Llama's per-token CE (`reduction='none'`) and feed it to
+   `wrapper.memory.update_plasticity(per_token_ce)`. This folds Llama's
+   next-token surprise into the walker's `surprise_ema`, fires the
+   structural plasticity step, and builds the next segment's neuromod
+   delta. Plasticity does NOT fire inside `forward_segment`.
+6. `wrapper.detach_memory()` to release the autograd graph.
 
-Gumbel-soft STE routing is already the default in `routing.py`; phase-1
-τ/ε schedules come from `GraphWalkerConfig` (not per-step-step).
+Gumbel-soft STE routing is the default in `routing.py`; phase-1 τ/ε
+schedules come from `GraphWalkerConfig`.
 """
 
 from __future__ import annotations
@@ -50,7 +54,6 @@ class Phase1Batch:
 class Phase1Stats:
     loss: float
     ce_loss: float
-    aux_loss: float
     grad_norm: float
     inject_residual_norm: float          # ||scale · W_out(readout)|| mean
     tok_per_sec: float
@@ -66,8 +69,8 @@ def phase1_pretrained_step(
 ) -> Phase1Stats:
     """Run one parallel teacher-forced phase-1 step.
 
-    CE is computed over all T-1 shifted positions (teacher forced). Aux
-    loss from memory is combined per `wrapper.config`'s weight knobs.
+    Loss = Llama primary next-token CE. After backward + opt.step, Llama's
+    per-token CE is fed back into the walker as the surprise signal.
     """
     import time
 
@@ -77,15 +80,13 @@ def phase1_pretrained_step(
     target_ids = batch.target_ids.to(device)
 
     # Phase-1 must run in train mode. If wrapper got switched to inference
-    # mode by a leaked rollout/bench pass, `forward()` falls back to
-    # `compute_aux=False` AND routing inside `_step_core_pure` flips to
-    # deterministic argmax (no Gumbel STE). The whole step would silently
-    # have no aux gradient and no routing gradient — training would
-    # produce optimizer steps but no learning signal for the walker.
+    # mode by a leaked rollout/bench pass, routing inside `_step_core_pure`
+    # flips to deterministic argmax (no Gumbel STE), so the walker would
+    # produce optimizer steps but no routing-side learning signal.
     if not wrapper.training:
         raise RuntimeError(
             "phase1_pretrained_step requires wrapper.train() — inference-mode "
-            "leak would silently disable aux loss and Gumbel-STE routing."
+            "leak would silently disable Gumbel-STE routing."
         )
 
     BS, T = input_ids.shape
@@ -108,21 +109,15 @@ def phase1_pretrained_step(
     with ctx:
         out = wrapper(input_ids)
         logits = out.logits                                        # [BS, T, vocab]
-        # Next-token CE: shift targets left by 1; last position is unsupervised.
-        # logits[:, t] predicts target_ids[:, t+1] equivalent → we treat
-        # the caller-provided target_ids as "what to predict at each position".
-        # Standard teacher-forced convention: targets are inputs shifted.
-        # We accept whatever the caller passed and just CE against it,
-        # masking the last position if lengths differ.
-        logits_flat = logits[:, :-1].reshape(-1, logits.size(-1))
-        targets_flat = target_ids[:, 1:].reshape(-1)
-        ce = F.cross_entropy(logits_flat.float(), targets_flat)
-
-        aux = wrapper._last_mem_loss
-        if aux is not None:
-            loss = cfg.ce_weight * ce + cfg.lm_aux_weight * aux.float()
-        else:
-            loss = cfg.ce_weight * ce
+        # Next-token CE: logits[:, t] predicts target_ids[:, t+1]; last
+        # position of each row is unsupervised.
+        logits_shift = logits[:, :-1]                              # [BS, T-1, V]
+        targets_shift = target_ids[:, 1:]                          # [BS, T-1]
+        ce = F.cross_entropy(
+            logits_shift.reshape(-1, logits_shift.size(-1)).float(),
+            targets_shift.reshape(-1),
+        )
+        loss = cfg.ce_weight * ce
 
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -130,6 +125,23 @@ def phase1_pretrained_step(
         grad_clip,
     )
     opt.step()
+
+    # Per-token surprise for the walker. Recompute CE with reduction='none'
+    # on the shifted logits — the autograd graph has already been consumed
+    # by backward, but the value tensors are still alive in this scope.
+    # `update_plasticity` folds this [BS, T-1] tensor into `surprise_ema`,
+    # fires the plasticity step once, and builds the next segment's
+    # neuromod delta. The last position of each row has no supervised
+    # target so we feed only T-1 positions.
+    if wrapper.memory is not None:
+        with torch.no_grad():
+            per_token_ce = F.cross_entropy(
+                logits_shift.reshape(-1, logits_shift.size(-1)).float(),
+                targets_shift.reshape(-1),
+                reduction="none",
+            ).reshape(BS, T - 1)
+        wrapper.memory.update_plasticity(per_token_ce)
+
     wrapper.detach_memory()
     elapsed = max(time.perf_counter() - t0, 1e-6)
     tok_per_sec = BS * T / elapsed
@@ -146,7 +158,6 @@ def phase1_pretrained_step(
     return Phase1Stats(
         loss=float(loss.detach()),
         ce_loss=float(ce.detach()),
-        aux_loss=float(aux.detach()) if aux is not None else 0.0,
         grad_norm=float(grad_norm) if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm),
         inject_residual_norm=inj_norm,

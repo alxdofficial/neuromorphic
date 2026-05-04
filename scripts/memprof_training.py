@@ -67,6 +67,7 @@ def run_integration(bs: int, T: int, snapshot_path: Path) -> None:
 
     opt = torch.optim.AdamW(
         [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        fused=True,
     )
     input_ids = torch.randint(0, cfg.vocab_size_lm, (bs, T), device=device)
     targets = input_ids.clone()

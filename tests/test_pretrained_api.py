@@ -3,22 +3,17 @@
 Covers:
 - step_core_from_h: runs on an external [B, D_s] vector, mutates state,
   produces a finite motor_state.
-- forward_segment: [B, T, D_s] → [B, T, D_s] readouts, plus aux CE when
-  an adapter is supplied. Gradient flows through all expected params
-  including the pretrained-only `mem_input_v_proj`.
-- Zero-delta-at-day-zero: with a fake-identity adapter, the aux loss
-  is finite and state evolution matches the token-id path for the
-  non-pretrained-specific dynamics.
+- forward_segment: [B, T, D_s] → [B, T, D_s] readouts. Gradient flows
+  through all expected params including the pretrained-only
+  `mem_input_v_proj`.
+- Block-vs-per-token parity for the compiled block path.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from src.graph_walker.config import GraphWalkerConfig
-from src.graph_walker.graph_walker import GraphWalkerMemory
 from src.graph_walker.standalone import StandaloneLM
 
 
@@ -40,18 +35,6 @@ def _tiny_cfg(**overrides) -> GraphWalkerConfig:
     )
     base.update(overrides)
     return GraphWalkerConfig(**base)
-
-
-class _MockAdapter:
-    """Stand-in for MemAdapter: maps [B, D_s] → [B, vocab_lm] via a
-    single Linear. Doesn't go through any real LM norm/lm_head — just
-    enough to exercise the aux-CE path shape + gradient."""
-    def __init__(self, d_s: int, vocab_lm: int):
-        self.head = nn.Linear(d_s, vocab_lm, bias=False)
-        nn.init.normal_(self.head.weight, std=0.02)
-
-    def mem_head_logits(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x)
 
 
 def test_step_core_from_h_runs_and_mutates_state():
@@ -81,24 +64,19 @@ def test_forward_segment_shapes_and_finite():
     m = lm.memory
     B, T = 2, cfg.segment_T
     h_mem = torch.randn(B, T, cfg.D_s)
-    input_ids = torch.randint(0, cfg.vocab_size, (B, T))
 
     m.begin_segment(B, torch.device("cpu"))
-    adapter = _MockAdapter(cfg.D_s, cfg.vocab_size)
-    readouts, aux_loss = m.forward_segment(h_mem, input_ids, adapter)
+    readouts = m.forward_segment(h_mem)
 
     assert readouts.shape == (B, T, cfg.D_s)
     assert torch.isfinite(readouts).all()
-    assert aux_loss is not None
-    assert torch.isfinite(aux_loss)
 
 
 def test_forward_segment_gradient_reaches_pretrained_only_params():
-    """Backward from a composite loss of aux CE + readouts.sum() should
-    reach:
+    """Backward from a readouts.pow(2).mean() loss (proxy for the gradient
+    Llama would inject through W_out) should reach:
     - mem_input_v_proj (only used in the external-h path)
     - content_mlp, q_proj, k_all, nbr_id_to_s, walker_state_alpha
-    - adapter.head (external)
     """
     torch.manual_seed(0)
     cfg = _tiny_cfg()
@@ -116,12 +94,10 @@ def test_forward_segment_gradient_reaches_pretrained_only_params():
 
     B, T = 2, cfg.segment_T
     h_mem = torch.randn(B, T, cfg.D_s, requires_grad=True)
-    input_ids = torch.randint(0, cfg.vocab_size, (B, T))
 
     m.begin_segment(B, torch.device("cpu"))
-    adapter = _MockAdapter(cfg.D_s, cfg.vocab_size)
-    readouts, aux_loss = m.forward_segment(h_mem, input_ids, adapter)
-    loss = aux_loss + readouts.float().pow(2).mean()
+    readouts = m.forward_segment(h_mem)
+    loss = readouts.float().pow(2).mean()
     loss.backward()
 
     # h_mem must receive gradient (so W_in would learn)
@@ -134,12 +110,13 @@ def test_forward_segment_gradient_reaches_pretrained_only_params():
         "mem_input_v_proj got no gradient — pretrained anchor-v-inject path broken"
     )
 
-    # Sanity: shared walker params get gradient too
+    # Sanity: shared walker params get gradient too. The walker is vocab-
+    # agnostic now — `state_to_model` (only used by the dropped aux CE
+    # path) deliberately gets NO gradient from forward_segment.
     for name in [
         "cols.q_proj.0.weight",
         "nbr_id_to_s.weight",
         "walker_state_alpha",
-        "state_to_model.weight",
     ]:
         # named_parameters walks m (GraphWalkerMemory); cols is a submodule
         p = dict(m.named_parameters())[name]
@@ -160,10 +137,7 @@ def test_forward_segment_preserve_graph_skips_detach():
     input_ids = torch.randint(0, cfg.vocab_size, (B, T))
 
     m.begin_segment(B, torch.device("cpu"))
-    readouts, _ = m.forward_segment(
-        h_mem, input_ids, adapter=None,
-        compute_aux_loss=False, preserve_graph=True,
-    )
+    readouts = m.forward_segment(h_mem, preserve_graph=True)
     # Loss from the LAST position only — gradient must reach h_mem[:, 0]
     # only if detach was skipped.
     loss = readouts[:, -1].pow(2).mean()
@@ -195,8 +169,8 @@ def _parity_setup(seed: int):
 
 def test_forward_segment_block_matches_per_token():
     """The block path (compile_block_from_h installed) must produce numerically
-    identical readouts and aux_loss to the per-token path (no compile)
-    when configs and inputs are matched. This locks in the parity that
+    identical readouts to the per-token path (no compile) when configs and
+    inputs are matched. This locks in the parity that
     `_compiled_block_from_h` is allowed to exist as a drop-in optimization
     rather than a behavior change.
     """
@@ -208,9 +182,7 @@ def test_forward_segment_block_matches_per_token():
     m_a.begin_segment(B, torch.device("cpu"))
     h_a = h_mem.clone().requires_grad_(True)
     torch.manual_seed(2024)
-    readouts_a, aux_a = m_a.forward_segment(
-        h_a, input_ids, adapter=None, compute_aux_loss=True,
-    )
+    readouts_a = m_a.forward_segment(h_a)
 
     # Path B: block path. Skip torch.compile to keep this test cheap on CPU
     # — install a thin trampoline that delegates to block_forward_from_h.
@@ -219,12 +191,9 @@ def test_forward_segment_block_matches_per_token():
     m_b.begin_segment(B, torch.device("cpu"))
     h_b = h_mem.clone().requires_grad_(True)
     torch.manual_seed(2024)
-    readouts_b, aux_b = m_b.forward_segment(
-        h_b, input_ids, adapter=None, compute_aux_loss=True,
-    )
+    readouts_b = m_b.forward_segment(h_b)
 
     torch.testing.assert_close(readouts_a, readouts_b, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(aux_a, aux_b, rtol=1e-5, atol=1e-5)
 
     # Backward parity — gradient on h_mem must match.
     readouts_a.float().pow(2).mean().backward()

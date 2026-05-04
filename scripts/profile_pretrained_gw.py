@@ -41,25 +41,13 @@ from src.graph_walker.pretrained.train_phase1 import (
 )
 from src.graph_walker.standalone import StandaloneLM
 from src.graph_walker.train_phase1 import phase1_step
+from scripts.bench_pretrained_gw import _walker_cfg_for
 
 
 def _walker_cfg(d_mem: int, T: int, vocab: int) -> GraphWalkerConfig:
-    return GraphWalkerConfig(
-        plane_rows=16, plane_cols=16, L=4,
-        K=16, D_model=d_mem, D_s=d_mem, D_id=32,
-        n_heads=4, n_hops=4,
-        D_q_in=64, D_q_per_head=64, n_score_heads=4,
-        K_horizons=8, K_buf=8,
-        vocab_size=vocab,
-        mod_period=64, tbptt_block=64, segment_T=T,
-        gumbel_tau_start=2.0, gumbel_tau_end=0.5, gumbel_anneal_steps=10_000,
-        epsilon_start=0.05, epsilon_end=0.01, epsilon_anneal_steps=10_000,
-        lambda_balance=0.0,
-        use_neuromod=True,
-        neuromod_D_mod=128, neuromod_n_layers=2, neuromod_n_heads=4,
-        neuromod_edge_hidden=64, neuromod_eta=1.0,
-        compile_on_train=False,
-    )
+    cfg = _walker_cfg_for(d_mem=d_mem, T=T)
+    cfg.vocab_size = vocab
+    return cfg
 
 
 def _profile(name: str, fn, n_iter: int, out_dir: Path):
@@ -221,6 +209,7 @@ def main():
     wrapper.train(True)
     opt = torch.optim.AdamW(
         [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        fused=True,
     )
     batch = Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
     def gw_step():

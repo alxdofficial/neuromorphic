@@ -153,12 +153,28 @@ class GraphWalkerConfig:
     mod_period: int = 128               # plasticity fires every N tokens
     tbptt_block: int = 128              # gradient detach cadence (== mod_period)
 
-    # --- Plasticity (scalar-eta v1: global Hebbian on co-visit counts) ---
+    # --- Plasticity ---
     E_bias_max: float = 4.0
     alpha_gamma_s: float = 0.1          # surprise EMA rate
-    plast_eta: float = 0.1              # base Hebbian learning rate
-    plast_decay: float = 0.1            # E_bias decay per plasticity tick
-    plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta
+    # plasticity_mode controls the plastic-update rule. Two values:
+    #
+    #   "hebbian_plus_neuromod" (default, used by standalone walker):
+    #     E_bias += δ_hebb + δ_neuromod
+    #     where δ_hebb = η_global · (co_visit_norm - decay·E_bias),
+    #     η_global = plast_eta · σ(surprise_ema.mean() - plast_surprise_bias).
+    #     Neuromod sees state+id+visit_count per col only; no surprise input,
+    #     no per-edge co_visit/E_bias inputs. Two paths into E_bias.
+    #
+    #   "neuromod_only" (used by integration via PretrainedGWConfig):
+    #     E_bias += δ_neuromod only. Hebbian-flavored stats (co_visit,
+    #     E_bias_old) become per-edge inputs to neuromod's edge MLP, and a
+    #     scalar surprise feature broadcasts across touched-col features.
+    #     Single path into E_bias; neuromod has the final say on every
+    #     plastic update.
+    plasticity_mode: str = "hebbian_plus_neuromod"
+    plast_eta: float = 0.1              # base Hebbian learning rate ("hebbian_plus_neuromod" only)
+    plast_decay: float = 0.1            # E_bias decay per plasticity tick ("hebbian_plus_neuromod" only)
+    plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta ("hebbian_plus_neuromod" only)
 
     # --- Neuromodulator (graph transformer on touched columns) ---
     # A small graph transformer runs at the start of each plasticity
@@ -259,6 +275,18 @@ class GraphWalkerConfig:
                 "neuromod's gradient mid-window, and tbptt > mod_period "
                 "would silently skip plasticity firings because the flush "
                 "code only runs _maybe_finalize... after backward."
+            )
+        if self.plasticity_mode not in (
+            "hebbian_plus_neuromod", "neuromod_only",
+        ):
+            raise ValueError(
+                f"plasticity_mode={self.plasticity_mode!r} must be one of "
+                "{'hebbian_plus_neuromod', 'neuromod_only'}."
+            )
+        if self.plasticity_mode == "neuromod_only" and not self.use_neuromod:
+            raise ValueError(
+                "plasticity_mode='neuromod_only' requires use_neuromod=True; "
+                "otherwise nothing updates E_bias."
             )
         # Validate the K split against the topology's local-neighborhood
         # candidate counts. build_topology samples without replacement via

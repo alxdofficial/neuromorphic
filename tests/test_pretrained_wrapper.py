@@ -51,11 +51,14 @@ def _tiny_walker_cfg(D_s: int, vocab: int, T: int = 8):
         D_q_in=8, D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=vocab,
-        mod_period=4, tbptt_block=4, segment_T=T,
+        # Single-knob clock under external-surprise plasticity:
+        # segment_T == mod_period == tbptt_block == T.
+        mod_period=T, tbptt_block=T, segment_T=T,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
         epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,
         lambda_balance=0.0,
         use_neuromod=True,
+        plasticity_mode="neuromod_only",
         neuromod_D_mod=16, neuromod_n_layers=1, neuromod_n_heads=2,
         neuromod_edge_hidden=16, neuromod_eta=1.0,
     )
@@ -105,12 +108,12 @@ def test_forward_logits_shape():
     out = w(input_ids)
     assert out.logits.shape == (2, 8, 256)
     assert torch.isfinite(out.logits).all()
-    # Aux loss stashed (training mode default in HF model is False; force on)
+    # Walker is vocab-agnostic: forward returns only logits via the host
+    # LM; there is no aux loss stashed on the wrapper.
     w.train()
     w.reset_memory(bs=2)
     out = w(input_ids)
-    assert w._last_mem_loss is not None
-    assert torch.isfinite(w._last_mem_loss)
+    assert torch.isfinite(out.logits).all()
 
 
 def test_phase1_step_runs_and_gradient_reaches_all_trainables():
@@ -135,6 +138,12 @@ def test_phase1_step_runs_and_gradient_reaches_all_trainables():
             m.neuromod.edge_mlp[-1].weight.normal_(std=0.05)
             m.neuromod.edge_mlp[-1].bias.normal_(std=0.05)
             m.neuromod.blend_logit.fill_(0.0)
+            # `edge_bias_proj` is zero-init in neuromod_only mode (option C
+            # per-head attention bias). Perturb so attention scores depend
+            # on per_edge_extras and gradient flows back through that path.
+            if m.neuromod.edge_bias_proj is not None:
+                m.neuromod.edge_bias_proj.weight.normal_(std=0.05)
+                m.neuromod.edge_bias_proj.bias.normal_(std=0.05)
 
     opt = torch.optim.AdamW(
         [p for _, p in w.trainable_parameters()], lr=1e-4,
@@ -153,7 +162,7 @@ def test_phase1_step_runs_and_gradient_reaches_all_trainables():
 
     stats = phase1_pretrained_step(w, opt, batch, amp_dtype=None)
     assert torch.isfinite(torch.tensor(stats.loss))
-    assert stats.aux_loss > 0, "aux loss should be non-trivial after init"
+    assert stats.ce_loss > 0, "Llama CE should be non-trivial after init"
 
     # Walk all trainables; collect any that didn't get gradient or didn't move.
     no_grad_after_step = []

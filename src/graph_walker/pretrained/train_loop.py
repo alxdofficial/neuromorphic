@@ -58,8 +58,10 @@ class CycleConfig:
 
 
 def _make_optimizer(wrapper: GraphWalkerPretrainedLM, lr: float) -> torch.optim.Optimizer:
+    params = [p for _, p in wrapper.trainable_parameters()]
     return torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=lr,
+        params, lr=lr,
+        fused=bool(params and params[0].is_cuda),
     )
 
 

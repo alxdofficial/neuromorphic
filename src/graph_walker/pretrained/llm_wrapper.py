@@ -24,8 +24,12 @@ Public API:
     wrapper.reset_memory(bs)
     out = wrapper(input_ids)              # returns HF ModelOutput; `.logits`
     wrapper.detach_memory()
-    wrapper._last_mem_loss                # aux loss from the last forward (None in eval)
     wrapper.trainable_parameters()        # yields (name, param) for requires_grad params
+
+The walker is vocab-agnostic: it has no LM head, no aux loss, no surprise
+of its own. The trainer drives plasticity externally — after `loss.backward()`,
+compute Llama's per-token CE and call ``wrapper.memory.update_plasticity(per_token_ce)``.
+See `src/graph_walker/pretrained/train_phase1.py` for the canonical pattern.
 """
 
 from __future__ import annotations
@@ -38,7 +42,6 @@ from src.graph_walker.graph_walker import GraphWalkerMemory
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.pretrained.hosts import build_host
 from src.pretrained.hosts.base import HostAdapter
-from src.pretrained.mem_adapter import MemAdapter
 from src.pretrained.mem_inject_layer import MemInjectLayer
 
 
@@ -72,10 +75,6 @@ class GraphWalkerPretrainedLM(nn.Module):
         # across forwards (no intra-segment detach, no end-of-forward
         # detach). Set by `preserve_memory_graph()` for AR unroll.
         self._preserve_memory_graph: bool = False
-        # Override for aux-loss computation. None = follow self.training.
-        self._compute_aux_loss_override: bool | None = None
-        # Scratch: aux loss from the last forward (None if no memory or eval).
-        self._last_mem_loss: torch.Tensor | None = None
 
         # validate() catches direct PretrainedGWConfig(...) construction
         # where d_mem and memory.D_s drift apart (default d_mem=512 but
@@ -125,34 +124,76 @@ class GraphWalkerPretrainedLM(nn.Module):
             memory_fn=None,
         ))
 
-        # Populate walker's tied_token_emb vocab to match Llama's. Walker
-        # uses its own internal embedding for its multi-horizon aux CE
-        # (surprise fold + walker-side aux loss) — same vocab as Llama so
-        # `input_ids` work as targets directly.
+        # The walker is vocab-agnostic in the integration path (no LM head,
+        # no aux CE), but `GraphWalkerMemory` still requires a `tied_token_emb`
+        # at construction because the standalone walker uses it. Stub it with
+        # a small embedding sized to Llama's vocab so any back-compat code
+        # path that touches it doesn't blow up; the integration path never
+        # reads it. Mark its weight non-trainable so the optimizer doesn't
+        # carry dead state for it.
         config.memory.vocab_size = config.vocab_size_lm
         self.memory = GraphWalkerMemory(
             config.memory,
             tied_token_emb=nn.Embedding(config.vocab_size_lm, config.memory.D_model),
         ) if attach_memory else None
 
-        # Small-init the walker's tied embed so the aux-CE readout isn't
-        # catastrophic at step 0.
         if self.memory is not None:
             nn.init.normal_(self.memory.tied_token_emb.weight, std=0.02)
-            # Freeze walker params that ONLY participate in the standalone
-            # (token-id-driven) hot path — they get no gradient through
-            # forward_segment so leaving them trainable is dead weight in
-            # the optimizer state.
-            for p_name in ("token_to_state", "input_v_proj"):
+            # Freeze params that participate only in the standalone walker's
+            # token-id-driven hot path. In the integration we feed h_mem
+            # not token ids, and the walker has no LM head of its own, so
+            # these get no gradient and are dead weight in the optimizer
+            # state.
+            for p_name in ("token_to_state", "input_v_proj", "tied_token_emb"):
                 p = getattr(self.memory, p_name).weight
                 p.requires_grad = False
+            # `state_to_model` and the entire `readout` submodule (multi-
+            # horizon walker LM head) are exercised only by the dropped
+            # aux-CE path. Freeze them too.
+            self.memory.state_to_model.weight.requires_grad = False
+            for p in self.memory.readout.parameters():
+                p.requires_grad = False
+            # `prev_motor_proj` only contributes when is_new_window fires
+            # mid-segment. Under T = mod_period (the integration's clock
+            # invariant) it fires exactly once per segment at tick 0,
+            # where `prev_motor` is always zeros from begin_segment — so
+            # the Linear's weight gradient is identically zero. Freeze.
+            self.memory.prev_motor_proj.weight.requires_grad = False
 
-        # Adapter: supplies mem_head_logits(x: [B, d_mem] → [B, vocab]) to
-        # the walker's forward_segment.
-        self._adapter = (
-            MemAdapter(self.host, self.mem_inject.W_out)
-            if attach_memory else None
-        )
+            # Disable activation checkpointing on the whole-block forward in
+            # the integration training path. This is the OPPOSITE of the
+            # GraphWalkerMemory default (which is True via getattr fallback)
+            # because the integration's BS-scaling profile inverts the
+            # tradeoff:
+            #
+            # When True (`_checkpoint_block=True`), backward re-runs the
+            # `compile_block_from_h`-compiled walker block to regenerate
+            # intermediates. This second invocation triggers a SEPARATE
+            # inductor compilation of the backward gradient kernels. At
+            # BS≥16 that backward compile hits a cuBLAS autotuner failure
+            # (`select_algorithm.py: "Constructing input/output tensor
+            # meta failed for Extern Choice"`) and falls back to a
+            # significantly slower kernel path. Empirically:
+            #   BS=12 + ckpt=True:  4.5k tok/s, 11.5 GB peak  (works)
+            #   BS=16 + ckpt=True:  2.2k tok/s, 14.0 GB peak  (cliff)
+            #   BS=16 + ckpt=False: 8.8k tok/s, 14.6 GB peak  (4× faster
+            #                       than ckpt=True, +0.6 GB cost)
+            #
+            # The memory savings ckpt=True buys (~3 GB at BS=16) is not
+            # worth the 4× wall-clock cost when the GPU has 9+ GB of
+            # headroom at BS=16. At BS=4 ckpt=True is still preferable
+            # (small block forward → cheap recompute → memory matters
+            # more), but the integration's production-target BS is well
+            # above that threshold.
+            #
+            # Standalone walker training (`src/graph_walker/train_phase1.py`)
+            # uses `step_core` per-token, not the compile-block path, so
+            # `_checkpoint_block` is irrelevant there and the fallback
+            # True default is harmless.
+            #
+            # See `docs/bench_results.md` (2026-05-03) for the full
+            # diagnostic table.
+            self.memory._checkpoint_block = False
 
         # Without memory, pin scale to zero so MemInjectLayer passes through
         # transparently (its runtime check enforces scale==0 then).
@@ -174,17 +215,23 @@ class GraphWalkerPretrainedLM(nn.Module):
     # ------------------------------------------------------------------
 
     def reset_memory(
-        self, bs: int, *, clear_neuromod_carryover: bool = True,
+        self, bs: int, *, clear_neuromod_carryover: bool = False,
     ) -> None:
         """Re-init walker working state for a new batch of `bs` segments.
         E_bias persists across calls (it's the long-term plastic state).
 
-        `clear_neuromod_carryover` defaults to True for the pretrained
-        path because batches are typically shuffled independent documents,
-        and carrying the previous batch's last-window snapshot into the
-        new batch's first neuromod target would inject cross-document
-        noise into credit assignment. Set to False explicitly when
-        batches are contiguous chunks of the same document.
+        `clear_neuromod_carryover` defaults to **False** under the external-
+        surprise design: plasticity fires once per training step (post-
+        backward), which means the only way ``_active_delta_nm`` is non-
+        None during the next segment's forward is to keep the previous
+        step's `_prev_snapshot_*`. Clearing the snapshot starves neuromod
+        of gradient — its parameters get no signal because routing reads
+        a None delta and falls back to E_bias_flat only.
+
+        For shuffled independent batches the previous batch's snapshot is
+        from different documents, but the gradient signal is still
+        "given THIS column-feature snapshot → produce a delta that helps
+        the LM here", which is a sensible generalizing target.
         """
         if self.memory is None:
             return
@@ -242,9 +289,10 @@ class GraphWalkerPretrainedLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, **kwargs):
         """Full LM forward with memory read/write at the injection layer.
 
-        Returns the HF ModelOutput (has `.logits`). Aux loss from the walker
-        is stashed on `self._last_mem_loss` (None if memory not attached or
-        aux disabled).
+        Returns the HF ModelOutput (has `.logits`). The walker is vocab-
+        agnostic — no aux loss is computed here. Plasticity is driven by
+        the trainer via `self.memory.update_plasticity(per_token_ce)` after
+        `loss.backward()` (see `train_phase1.phase1_pretrained_step`).
         """
         if self.memory is None:
             return self.llama(input_ids=input_ids, **kwargs)
@@ -256,22 +304,13 @@ class GraphWalkerPretrainedLM(nn.Module):
         # would silently still get phase-1 Gumbel-STE routing.
         self.memory.phase = self.current_phase
 
-        override = self._compute_aux_loss_override
-        compute_aux = self.training if override is None else bool(override)
-
         # Closure: MemInjectLayer calls this with h_mem = W_in(hidden_states).
-        # We feed h_mem into the walker along with input_ids for targets.
-        walker_aux_weight = self.config.walker_aux_weight
-
+        # The walker turns h_mem into per-token readouts; W_out then projects
+        # readouts back to LM hidden-state space and adds them as a residual.
         def memory_fn(h_mem: torch.Tensor) -> torch.Tensor:
-            readouts, mem_loss = self.memory.forward_segment(
-                h_mem, input_ids, self._adapter,
-                compute_aux_loss=compute_aux,
-                preserve_graph=self._preserve_memory_graph,
-                walker_aux_weight=walker_aux_weight,
+            return self.memory.forward_segment(
+                h_mem, preserve_graph=self._preserve_memory_graph,
             )
-            self._last_mem_loss = mem_loss
-            return readouts
 
         self.mem_inject.set_memory_fn(memory_fn)
         try:

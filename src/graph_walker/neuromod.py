@@ -58,8 +58,14 @@ class _GraphAttnLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                # [U, D]
-        adj_bias: torch.Tensor | None,  # [U, U] fp32 — added to attn scores
+        adj_bias: torch.Tensor | None,  # [U, U] OR [n_heads, U, U] fp32
     ) -> torch.Tensor:
+        """`adj_bias` may be either:
+          - `[U, U]`:           same bias across all attention heads (legacy /
+                                topology-only path).
+          - `[n_heads, U, U]`:  per-head bias (option C — per-edge stats project
+                                to per-head scalars added to attn scores).
+        """
         U, D = x.shape
         h = self.norm1(x)
         q = self.q_proj(h).view(U, self.n_heads, self.d_head).transpose(0, 1)
@@ -68,7 +74,20 @@ class _GraphAttnLayer(nn.Module):
         # scores: [n_heads, U, U]
         scores = torch.einsum("hud,hvd->huv", q, k) * self.scale
         if adj_bias is not None:
-            scores = scores + adj_bias.unsqueeze(0).to(scores.dtype)
+            if adj_bias.ndim == 2:
+                scores = scores + adj_bias.unsqueeze(0).to(scores.dtype)
+            elif adj_bias.ndim == 3:
+                if adj_bias.shape[0] != self.n_heads:
+                    raise ValueError(
+                        f"adj_bias[0]={adj_bias.shape[0]} must equal n_heads="
+                        f"{self.n_heads} for per-head bias."
+                    )
+                scores = scores + adj_bias.to(scores.dtype)
+            else:
+                raise ValueError(
+                    f"adj_bias must be 2D or 3D; got shape "
+                    f"{tuple(adj_bias.shape)}"
+                )
         attn = F.softmax(scores, dim=-1)
         out = torch.einsum("huv,hvd->hud", attn, v)
         out = out.transpose(0, 1).reshape(U, D)
@@ -121,10 +140,15 @@ class NeuromodGraphTransformer(nn.Module):
         n_heads: int = 4,
         edge_hidden: int = 64,
         E_bias_max: float = 4.0,
+        D_per_edge_extra: int = 0,    # Hebbian-flavored per-edge inputs
+                                       # (co_visit, E_bias_old) when neuromod_only;
+                                       # 0 in legacy hebbian_plus_neuromod mode.
     ) -> None:
         super().__init__()
         self.D_mod = D_mod
+        self.n_heads = n_heads
         self.E_bias_max = E_bias_max
+        self.D_per_edge_extra = D_per_edge_extra
         self.feature_proj = nn.Linear(D_feat, D_mod)
         nn.init.normal_(self.feature_proj.weight, mean=0.0, std=0.014)
 
@@ -132,12 +156,13 @@ class NeuromodGraphTransformer(nn.Module):
             _GraphAttnLayer(D_mod, n_heads=n_heads) for _ in range(n_layers)
         ])
 
-        # Per-edge target MLP: cat(x_src, x_dst) → scalar pre-tanh logit.
-        # Full-rank (not low-rank outer product) so the predictor can express
-        # non-bilinear interactions between the source and destination
-        # features. Zero-init final layer so raw=0 → target=0 at init.
+        # Per-edge target MLP. In legacy mode, input is just cat(x_src, x_dst).
+        # In neuromod_only mode, append per-edge extras (co_visit, E_bias_old)
+        # so the MLP can express e.g. "high co_visit AND surprise → push target
+        # up" rules without going through the column-level features.
+        edge_in_dim = 2 * D_mod + D_per_edge_extra
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * D_mod, edge_hidden),
+            nn.Linear(edge_in_dim, edge_hidden),
             nn.GELU(),
             nn.Linear(edge_hidden, 1),
         )
@@ -145,6 +170,20 @@ class NeuromodGraphTransformer(nn.Module):
         nn.init.zeros_(self.edge_mlp[0].bias)
         nn.init.zeros_(self.edge_mlp[-1].weight)
         nn.init.zeros_(self.edge_mlp[-1].bias)
+
+        # Per-edge → per-head attention bias projection (option C). Lets the
+        # graph transformer's attention pattern be shaped by activity stats,
+        # not just topology. One scalar per (edge, head) — a head can
+        # specialize on co_visit, another on E_bias, etc.
+        # Zero-init so day-0 attention is identical to the topology-only
+        # adjacency bias; training opens up per-edge influence as the
+        # neuromod learns which stats matter for which heads.
+        if D_per_edge_extra > 0:
+            self.edge_bias_proj = nn.Linear(D_per_edge_extra, n_heads)
+            nn.init.zeros_(self.edge_bias_proj.weight)
+            nn.init.zeros_(self.edge_bias_proj.bias)
+        else:
+            self.edge_bias_proj = None
 
         # Learnable blend rate γ = σ(blend_logit). Start near-zero so the
         # neuromod's live influence during the first few windows is tiny,
@@ -158,10 +197,13 @@ class NeuromodGraphTransformer(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,     # [U, D_feat] — detached per-touched-col feats
-        adj_bias: torch.Tensor,     # [U, U] fp32 — topology bias for attention
-        edge_src_local: torch.Tensor,  # [E] int64 — into [0, U)
-        edge_dst_local: torch.Tensor,  # [E] int64 — into [0, U)
+        features: torch.Tensor,           # [U, D_feat] — detached per-touched-col feats
+        adj_bias: torch.Tensor,           # [U, U] fp32 — topology bias for attention
+        edge_src_local: torch.Tensor,     # [E] int64 — into [0, U)
+        edge_dst_local: torch.Tensor,     # [E] int64 — into [0, U)
+        per_edge_extras: torch.Tensor | None = None,
+                                          # [E, D_per_edge_extra] — co_visit, E_bias_old etc.
+                                          # Required in neuromod_only mode; None in legacy.
     ) -> torch.Tensor:
         """Return per-touched-edge TARGET values, shape [E].
 
@@ -170,11 +212,60 @@ class NeuromodGraphTransformer(nn.Module):
         scatters into the global [N*K] layout.
         """
         x = self.feature_proj(features)
+        U = x.shape[0]
+
+        # Build the attention bias the layers see. In legacy / topology-only
+        # mode it's just `adj_bias [U, U]`. In neuromod_only mode we project
+        # per-edge extras to per-head scalars and scatter them into a
+        # [n_heads, U, U] enriched bias so attention is shaped by activity
+        # stats, not just topology (option C).
+        if self.D_per_edge_extra > 0 and per_edge_extras is not None:
+            assert per_edge_extras.shape[-1] == self.D_per_edge_extra, (
+                f"per_edge_extras last-dim {per_edge_extras.shape[-1]} != "
+                f"D_per_edge_extra {self.D_per_edge_extra}."
+            )
+            # [E, n_heads]: per-edge per-head attention bias contribution.
+            edge_bias_per_head = self.edge_bias_proj(per_edge_extras)
+            # Scatter into [n_heads, U, U] dense layout. Linear flat index per
+            # (head, src, dst): h*(U*U) + src*U + dst.
+            n_heads = self.n_heads
+            edge_bias_dense = torch.zeros(
+                n_heads * U * U,
+                device=adj_bias.device, dtype=adj_bias.dtype,
+            )
+            head_offsets = (
+                torch.arange(n_heads, device=adj_bias.device).view(-1, 1)
+                * (U * U)
+            )                                                # [n_heads, 1]
+            edge_offsets = (
+                edge_src_local.view(1, -1) * U + edge_dst_local.view(1, -1)
+            )                                                # [1, E]
+            flat_idx = (head_offsets + edge_offsets).flatten()  # [n_heads * E]
+            flat_values = (
+                edge_bias_per_head.t().contiguous().to(adj_bias.dtype).flatten()
+            )                                                # [n_heads * E]
+            edge_bias_dense.scatter_add_(0, flat_idx, flat_values)
+            edge_bias_dense = edge_bias_dense.view(n_heads, U, U)
+            adj_bias_for_layers = (
+                adj_bias.unsqueeze(0).expand(n_heads, U, U) + edge_bias_dense
+            )                                                # [n_heads, U, U]
+        else:
+            adj_bias_for_layers = adj_bias                   # [U, U]
+
         for layer in self.layers:
-            x = layer(x, adj_bias)
+            x = layer(x, adj_bias_for_layers)
         src_feats = x[edge_src_local]                       # [E, D_mod]
         dst_feats = x[edge_dst_local]                       # [E, D_mod]
-        edge_in = torch.cat([src_feats, dst_feats], dim=-1)  # [E, 2·D_mod]
+        if self.D_per_edge_extra > 0:
+            assert per_edge_extras is not None, (
+                f"D_per_edge_extra={self.D_per_edge_extra} but no extras passed; "
+                "caller must supply per_edge_extras in neuromod_only mode."
+            )
+            edge_in = torch.cat(
+                [src_feats, dst_feats, per_edge_extras], dim=-1,
+            )
+        else:
+            edge_in = torch.cat([src_feats, dst_feats], dim=-1)
         raw = self.edge_mlp(edge_in).squeeze(-1)            # [E]
         return self.E_bias_max * torch.tanh(raw)
 

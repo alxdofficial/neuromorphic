@@ -501,8 +501,21 @@ class GraphWalkerMemory(nn.Module):
         # Disabled by default so existing configs and tests are unchanged.
         # When enabled, acts at the start of each plasticity window on a
         # detached snapshot of the previous window's touched-column stats.
+        #
+        # Per-col features: state + id + visit_count, plus a scalar surprise
+        # broadcast in neuromod_only mode (so neuromod conditions plastic
+        # updates on how surprised the LM was).
+        # Per-edge features: in neuromod_only mode, log(co_visit+1) and
+        # E_bias_old at the edge feed the edge MLP — neuromod sees the
+        # Hebbian-flavored stats it now replaces.
         if cfg.use_neuromod:
-            D_feat = cfg.D_s + cfg.D_id + 1  # state + id + visit_count
+            extra_col_feats = (
+                1 if cfg.plasticity_mode == "neuromod_only" else 0
+            )
+            D_feat = cfg.D_s + cfg.D_id + 1 + extra_col_feats
+            D_per_edge_extra = (
+                2 if cfg.plasticity_mode == "neuromod_only" else 0
+            )  # log(co_visit+1) + E_bias_old
             self.neuromod = NeuromodGraphTransformer(
                 D_feat=D_feat,
                 D_mod=cfg.neuromod_D_mod,
@@ -510,6 +523,7 @@ class GraphWalkerMemory(nn.Module):
                 n_heads=cfg.neuromod_n_heads,
                 edge_hidden=cfg.neuromod_edge_hidden,
                 E_bias_max=cfg.E_bias_max,
+                D_per_edge_extra=D_per_edge_extra,
             )
         else:
             self.neuromod = None
@@ -546,6 +560,13 @@ class GraphWalkerMemory(nn.Module):
         # consumed at the next window's start to produce _active_delta_nm.
         self._prev_snapshot_ids: torch.Tensor | None = None
         self._prev_snapshot_feats: torch.Tensor | None = None
+        # Per-edge co_visit snapshot from the just-closed window. Captured
+        # in `_snapshot_touched_columns` BEFORE `_plasticity_step` resets
+        # `co_visit_flat`, so the next window's neuromod sees the activity
+        # pattern that produced the snapshot. Only populated in
+        # neuromod_only mode (legacy mode reads co_visit live in the
+        # Hebbian path before the reset).
+        self._prev_snapshot_co_visit_flat: torch.Tensor | None = None
 
         # Visit-frequency count across the current training step (for
         # load-balance aux loss). Reset externally per step.
@@ -665,6 +686,7 @@ class GraphWalkerMemory(nn.Module):
         if clear_neuromod_carryover:
             self._prev_snapshot_ids = None
             self._prev_snapshot_feats = None
+            self._prev_snapshot_co_visit_flat = None
             self._active_delta_nm = None
 
         self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
@@ -766,8 +788,50 @@ class GraphWalkerMemory(nn.Module):
             self._active_delta_nm = None
             return
 
+        # In neuromod_only mode, hand the neuromod the per-edge Hebbian-
+        # flavored stats (log co_visit, current E_bias_old) so its edge MLP
+        # has direct access to "how often was this edge fired" and "where is
+        # this bias now" when predicting the new target. These were the
+        # signals the old Hebbian path used; under the redesign neuromod
+        # decides what to do with them.
+        #
+        # `co_visit` is read from the snapshot taken in
+        # `_snapshot_touched_columns` BEFORE `_plasticity_step` resets the
+        # live `co_visit_flat`. Without the snapshot the neuromod would
+        # see all-zero co_visit (the just-reset live buffer) and never
+        # learn to use the per-edge attention bias path.
+        if self.cfg.plasticity_mode == "neuromod_only":
+            if self._prev_snapshot_co_visit_flat is None:
+                # No co_visit snapshot yet (planted features without one,
+                # or first window after reset_plastic_memory). Without it
+                # we can't compute per_edge_extras and the neuromod's
+                # edge MLP / per-head bias path is undefined. Skip this
+                # window's plasticity entirely; it will resume on the
+                # next properly-snapshotted close.
+                self._active_delta_nm = None
+                return
+            with torch.no_grad():
+                co_visit_at_edges = (
+                    self._prev_snapshot_co_visit_flat[edge_flat]
+                )
+                e_bias_at_edges = self.E_bias_flat.detach()[edge_flat]
+                # `window_len` was reset by the just-closed `_plasticity_step`,
+                # so use `cfg.mod_period` (which equals window length under
+                # the single-knob clock invariant) to normalize.
+                window_norm = max(self.cfg.mod_period, 1)
+                co_visit_log = (
+                    co_visit_at_edges.float() / window_norm + 1.0
+                ).log().unsqueeze(-1)                           # [E, 1]
+                e_bias_feat = e_bias_at_edges.float().unsqueeze(-1)  # [E, 1]
+                per_edge_extras = torch.cat(
+                    [co_visit_log, e_bias_feat], dim=-1,
+                )                                               # [E, 2]
+        else:
+            per_edge_extras = None
+
         targets = self.neuromod(
             feats, adj_bias, edge_src_local, edge_dst_local,
+            per_edge_extras=per_edge_extras,
         )                                                   # [E] tanh-clamped targets
         # Convert target → delta via EMA blend gated by γ:
         #   active_E_bias = (1 - γ)·E_bias_base + γ·target
@@ -810,6 +874,17 @@ class GraphWalkerMemory(nn.Module):
         Stored in `_prev_snapshot_ids`, `_prev_snapshot_feats` (both detached)
         for consumption by the NEXT window's `_begin_plastic_window`.
         Called at window close, before counters are reset.
+
+        Per-col features:
+          - mean state across batch (D_s)
+          - column identity (D_id)
+          - log(visit_count+1) (1)
+          - In neuromod_only mode: scalar surprise broadcast (1) — every
+            touched col gets the same surprise_ema.mean() value, exposing
+            the LM's overall struggle level as a feature the neuromod can
+            condition on. Per-col surprise (visit-weighted mean of per-token
+            CE) would be richer but requires per-token visit tracking we
+            don't keep today.
         """
         if self.neuromod is None or self.visit_count is None:
             return
@@ -820,19 +895,35 @@ class GraphWalkerMemory(nn.Module):
         if touched_ids.numel() == 0:
             self._prev_snapshot_ids = None
             self._prev_snapshot_feats = None
+            self._prev_snapshot_co_visit_flat = None
             return
 
-        # Per-column features: mean state across batch, column identity,
-        # visit count (log-scaled for sane dynamic range).
         with torch.no_grad():
             s_mean = self.s.float().mean(dim=0)                        # [N, D_s]
             s_feats = s_mean[touched_ids]                              # [U, D_s]
             id_feats = self.col_id[touched_ids].float()                # [U, D_id]
             vc_feats = (self.visit_count[touched_ids] + 1.0).log().unsqueeze(-1)
-            feats = torch.cat([s_feats, id_feats, vc_feats], dim=-1)
+            parts = [s_feats, id_feats, vc_feats]
+            if self.cfg.plasticity_mode == "neuromod_only":
+                # Scalar surprise broadcast across touched cols.
+                surprise_scalar = self.surprise_ema.mean().float()
+                surprise_feat = surprise_scalar.expand(touched_ids.shape[0], 1)
+                parts.append(surprise_feat)
+            feats = torch.cat(parts, dim=-1)
 
         self._prev_snapshot_ids = touched_ids.detach()
         self._prev_snapshot_feats = feats.detach()
+        # Snapshot co_visit BEFORE `_plasticity_step` resets it. The next
+        # window's neuromod needs the just-closed window's per-edge
+        # activity to predict targeted plastic updates. Stored as the full
+        # [N*K] flat layout for cheap gather at edge_flat indices later.
+        if self.cfg.plasticity_mode == "neuromod_only":
+            self._prev_snapshot_co_visit_flat = (
+                self.co_visit_flat.detach().clone()
+                if self.co_visit_flat is not None else None
+            )
+        else:
+            self._prev_snapshot_co_visit_flat = None
 
     def detach_state(self) -> None:
         """TBPTT boundary: preserve values, sever gradient graph."""
@@ -1301,47 +1392,39 @@ class GraphWalkerMemory(nn.Module):
     def forward_segment(
         self,
         h_mem: torch.Tensor,                     # [B, T, D_s]
-        input_ids: torch.Tensor,                 # [B, T] int64 (targets + surprise)
-        adapter: "MemAdapter | None" = None,     # Llama adapter for aux CE
+        input_ids: torch.Tensor | None = None,   # accepted for back-compat; unused
+        adapter: object | None = None,           # accepted for back-compat; unused
         *,
-        compute_aux_loss: bool = True,
         preserve_graph: bool = False,
-        walker_aux_weight: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """Process one segment of pretrained-LM hidden states through the
-        walker. Returns per-token walker readouts in graph-state space,
-        plus an optional aux CE (motor_state → adapter.mem_head_logits →
-        CE vs shifted input_ids).
+        walker. Returns per-token walker readouts in graph-state space.
 
-        Semantics match `v2`'s `MemoryGraph.forward_segment` so the same
-        `MemInjectLayer` + cycle-loop scaffolding in `src/pretrained/`
-        can wire this in with minimal changes.
+        The walker is a vocab-agnostic memory module. It takes Llama hidden
+        states in (`h_mem`, shape `[B, T, D_s]`) and produces readouts out
+        (`[B, T, D_s]`) that the trainer feeds back into Llama via
+        `MemInjectLayer.W_out`. The walker has no LM head, no aux loss, no
+        token-level supervision of its own — it learns purely via gradient
+        flowing back through `W_out` from Llama's primary CE.
 
         State contract:
         - Caller is responsible for `begin_segment(B, device)` (via
-          `wrapper.reset_memory(bs)`) before the first segment. This
-          function does NOT re-init state — it only processes the segment.
-        - TBPTT: state is detached every `cfg.tbptt_block` tokens within
-          the segment. Skipped when `preserve_graph=True` (AR unroll).
-        - Plasticity + surprise fold fire at `cfg.mod_period` cadence,
-          using the walker's OWN multi-horizon CE against upcoming
-          `input_ids` (not Llama's CE). Cheap, local, avoids a Llama-side
-          dependency for plasticity.
+          `wrapper.reset_memory(bs)`) before the first segment.
+        - TBPTT: state is detached every `cfg.tbptt_block` tokens. Skipped
+          when `preserve_graph=True` (AR unroll).
+        - **Plasticity does NOT fire inside this method.** Surprise is
+          supplied externally — the trainer computes Llama's per-token CE
+          after `loss.backward()` and calls `update_plasticity(per_token_ce)`,
+          which folds CE into `surprise_ema` and runs the plasticity step
+          once per training step. See `update_plasticity` for details.
 
-        Returned aux loss combines (when `compute_aux_loss=True`):
-          1. Walker-side multi-horizon CE (gradient flows to state_to_model,
-             walker hot path). Always included when compute_aux_loss.
-             Scaled by `walker_aux_weight`.
-          2. Llama-side horizon-1 CE via `adapter.mem_head_logits` (gradient
-             flows to W_out, Llama norm/lm_head are frozen). Included only
-             when adapter is provided.
+        `input_ids` and `adapter` are accepted but ignored — kept in the
+        signature for back-compat with older callers. They will be removed
+        in a future cleanup.
         """
         B, T, D_s = h_mem.shape
         assert D_s == self.cfg.D_s, (
             f"h_mem last-dim {D_s} must match cfg.D_s {self.cfg.D_s}"
-        )
-        assert input_ids.shape == (B, T), (
-            f"input_ids shape {tuple(input_ids.shape)} must be [B, T]={(B, T)}"
         )
         assert self._state_initialized, (
             "call begin_segment(B, device) before forward_segment()"
@@ -1350,7 +1433,6 @@ class GraphWalkerMemory(nn.Module):
         device = h_mem.device
         cfg = self.cfg
         tbptt = cfg.tbptt_block
-        K_h = cfg.K_horizons
 
         # Walker hot path runs in `state_dtype` (bf16 on CUDA, fp32 on CPU).
         # If the caller runs us on CUDA WITHOUT autocast, the bf16 column
@@ -1361,25 +1443,10 @@ class GraphWalkerMemory(nn.Module):
         # (training harnesses set it), this nests cleanly.
         if device.type == "cuda" and not torch.is_autocast_enabled():
             return self._forward_segment_with_autocast(
-                h_mem, input_ids, adapter,
-                compute_aux_loss=compute_aux_loss,
-                preserve_graph=preserve_graph,
-                walker_aux_weight=walker_aux_weight,
+                h_mem, preserve_graph=preserve_graph,
             )
 
         motor_blocks: list[torch.Tensor] = []
-        # Horizon weights mirror `phase1_step`: horizon-1 is primary (1.0),
-        # rest (0.2). Keeps walker-side aux semantically aligned with
-        # standalone training.
-        horizon_weights = torch.full(
-            (K_h,), 0.2, device=device, dtype=torch.float32,
-        )
-        horizon_weights[0] = 1.0
-        # Accumulators for the two aux-loss components (gradient-carrying).
-        walker_ce_sum = torch.zeros(K_h, device=device, dtype=torch.float32)
-        walker_ce_count = torch.zeros(K_h, device=device, dtype=torch.float32)
-        llama_ce_sum = torch.zeros((), device=device, dtype=torch.float32)
-        llama_ce_count = 0
 
         # Block-stride loop. Whole-block path replaces T_block per-token
         # `step_core_from_h` calls with one `block_forward_from_h` call —
@@ -1478,91 +1545,34 @@ class GraphWalkerMemory(nn.Module):
 
             motor_blocks.append(motor_bt)
 
-            # --- Walker's own multi-horizon CE.
-            # Shape logic matches phase1_step.flush(); uses the walker's
-            # internal tied_token_emb readout, NOT Llama's. This same CE
-            # drives (a) the walker-side aux loss, gradient-carrying, and
-            # (b) the surprise EMA fold, detached.
-            i_idx = torch.arange(ticks, device=device)
-            k_idx = torch.arange(1, K_h + 1, device=device)
-            t_idx = block_start + i_idx.unsqueeze(1) + k_idx.unsqueeze(0)  # [ticks, K_h]
-            valid_tk = t_idx < T
-            block_has_targets = bool(valid_tk.any().item())
-            # Targetless block (typical: T=1 generation step inside an
-            # autoregressive rollout, where there are no upcoming tokens
-            # in the segment to predict). Skip the dense vocab readout
-            # AND the surprise / plasticity finalize. Otherwise we'd
-            # both waste a [B, T, K_h, V] CE compute on an all-False
-            # mask, and pollute E_bias by firing plasticity off
-            # accumulated co-visit with stale (or zero) surprise EMA.
-            if block_has_targets:
-                t_idx_clamped = t_idx.clamp(max=T - 1)
-                targets = input_ids.index_select(
-                    1, t_idx_clamped.reshape(-1),
-                ).reshape(B, ticks, K_h)
-                valid_btk = valid_tk.unsqueeze(0).expand(B, -1, -1)
-
-                with torch.autocast(device_type=device.type, enabled=False):
-                    ce_masked = self.readout_ce_block(
-                        motor_bt, targets, valid_btk,
-                    )                                              # [B, ticks, K_h]
-                if compute_aux_loss:
-                    walker_ce_sum = walker_ce_sum + ce_masked.sum(dim=(0, 1))
-                    walker_ce_count = (
-                        walker_ce_count + valid_tk.float().sum(dim=0) * B
-                    )
-                self.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
-                self._maybe_finalize_surprise_and_plasticity()
-
-            # --- Llama-side aux CE (horizon-1 against adapter.mem_head_logits).
-            if compute_aux_loss and adapter is not None:
-                aux_valid_i = (block_start + i_idx + 1) < T
-                if aux_valid_i.any():
-                    motor_flat = motor_bt.reshape(B * ticks, D_s)
-                    mem_logits = adapter.mem_head_logits(motor_flat)   # [B*ticks, vocab_lm]
-                    aux_t_idx = (block_start + i_idx + 1).clamp(max=T - 1)
-                    tgt = input_ids.index_select(1, aux_t_idx)         # [B, ticks]
-                    tgt_flat = tgt.reshape(B * ticks)
-                    valid_flat = aux_valid_i.unsqueeze(0).expand(B, -1).reshape(-1)
-                    ce_all = F.cross_entropy(
-                        mem_logits.float(), tgt_flat, reduction="none",
-                    )                                                  # [B*ticks]
-                    llama_ce_sum = llama_ce_sum + (ce_all * valid_flat.float()).sum()
-                    llama_ce_count += int(valid_flat.sum().item())
-
             # TBPTT detach at block boundary (unless AR unroll preserving graph).
             if not preserve_graph and block_end < T:
                 self.detach_state()
 
+            # Re-trigger the anchor-pick at the next block boundary. Under
+            # the external-surprise design plasticity no longer fires
+            # mid-segment, so without resetting `window_len` here the
+            # second-and-later blocks would all see `is_new_window=False`
+            # — the walker would never re-anchor inside a multi-block
+            # segment, freezing anchor positions for the entire forward
+            # and starving `prev_motor_proj` / anchor-routing params of
+            # gradient (their inputs would be all zeros from segment-
+            # start `prev_motor`). Reset to zero so each block re-anchors
+            # using the previous block's `prev_motor`.
+            if block_end < T:
+                self.window_len = 0
+
             block_start = block_end
 
         readouts = torch.cat(motor_blocks, dim=1)                       # [B, T, D_s]
-
-        aux_loss: torch.Tensor | None = None
-        if compute_aux_loss:
-            # Walker-side: horizon-weighted mean CE (gradient-carrying).
-            has_counts = walker_ce_count > 0
-            per_h_mean = walker_ce_sum / walker_ce_count.clamp(min=1)
-            denom = horizon_weights[has_counts].sum().clamp(min=1)
-            walker_mh_ce = (
-                per_h_mean * horizon_weights * has_counts.float()
-            ).sum() / denom
-            aux_loss = walker_aux_weight * walker_mh_ce
-            # Llama-side: horizon-1 mean (gradient to W_out, walker).
-            if adapter is not None and llama_ce_count > 0:
-                aux_loss = aux_loss + (llama_ce_sum / llama_ce_count)
-        return readouts, aux_loss
+        return readouts
 
     def _forward_segment_with_autocast(
         self,
         h_mem: torch.Tensor,
-        input_ids: torch.Tensor,
-        adapter,
         *,
-        compute_aux_loss: bool,
         preserve_graph: bool,
-        walker_aux_weight: float,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """Defensive wrapper that enters bf16 autocast on CUDA before
         recursing into `forward_segment`. Used when a caller runs us on
         CUDA without first establishing an autocast region — without it,
@@ -1570,10 +1580,7 @@ class GraphWalkerMemory(nn.Module):
         `content_mlp` / `q_proj`."""
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             return self.forward_segment(
-                h_mem, input_ids, adapter,
-                compute_aux_loss=compute_aux_loss,
-                preserve_graph=preserve_graph,
-                walker_aux_weight=walker_aux_weight,
+                h_mem, preserve_graph=preserve_graph,
             )
 
     def _step_core_pure(
@@ -1966,6 +1973,77 @@ class GraphWalkerMemory(nn.Module):
 
     @torch._dynamo.disable
     @torch.no_grad()
+    def update_plasticity(
+        self,
+        per_token_surprise: torch.Tensor | None,
+    ) -> None:
+        """Externally-driven plasticity update. Call AFTER `loss.backward()`.
+
+        The walker is vocab-agnostic: it does not compute its own next-token
+        CE. The trainer is responsible for supplying surprise as Llama's
+        per-token CE (or any other ground-truth-aware signal).
+
+        Modes:
+          - ``per_token_surprise=None``: AR free-generation / inference. Skip
+            plasticity entirely. Walker forward state still evolves; only
+            the structural plastic update (`E_bias_flat`) is frozen.
+          - ``per_token_surprise: [B, T] float``: training. Fold per-token
+            CE into ``surprise_ema``, fire one plasticity window (commit the
+            current ``_active_delta_nm`` into ``E_bias_flat``, snapshot,
+            reset window counters), then build the next window's neuromod
+            delta with a fresh forward pass.
+
+        Why a single fire per call rather than a fire per ``mod_period``
+        block: under external-surprise mode all ``T`` forward steps in the
+        segment shared the SAME ``_active_delta_nm`` — there is exactly one
+        delta to commit per segment forward. Multiple commits would commit
+        deltas that no forward step ever read, attaching no gradient to
+        their neuromod params. Effective plasticity rate becomes once per
+        training step (vs. T/mod_period under the old in-forward path).
+        """
+        if per_token_surprise is None:
+            # No ground truth → no surprise → no plastic update. Reset the
+            # window counters so the next training-step call sees a clean
+            # window even if forward steps incremented `window_len` past
+            # `mod_period` during the AR rollout.
+            self.window_len = 0
+            if self.co_visit_flat is not None:
+                self.co_visit_flat = torch.zeros_like(self.co_visit_flat)
+            if self.visit_count is not None:
+                self.visit_count = torch.zeros_like(self.visit_count)
+            return
+
+        assert per_token_surprise.ndim == 2, (
+            f"per_token_surprise must be [B, T]; got "
+            f"{tuple(per_token_surprise.shape)}"
+        )
+        B_in, T_in = per_token_surprise.shape
+        K_h = self.cfg.K_horizons
+        # Broadcast the horizon-1 Llama CE across the surprise_ema's K_h dim.
+        # `surprise_ema.mean()` is the only consumer (see `_plasticity_step`),
+        # so duplicating across horizons is mathematically a no-op vs a
+        # collapsed-shape EMA — cheaper than reshaping the EMA buffer.
+        ce_block = (
+            per_token_surprise.detach()
+            .unsqueeze(-1)
+            .expand(B_in, T_in, K_h)
+            .float()
+        )
+        valid_mask = torch.ones(
+            T_in, K_h, dtype=torch.bool, device=per_token_surprise.device,
+        )
+        # Stream into surprise_ema in token order.
+        self.accumulate_block_ce(ce_block, valid_mask)
+        # Snapshot, fire plasticity, build next delta.
+        # `_plasticity_step` resets `window_len`, `co_visit_flat`, and
+        # `visit_count`; `_begin_plastic_window` produces a fresh
+        # grad-carrying `_active_delta_nm` for the next segment.
+        self._finalize_surprise_window()
+        self._plasticity_step()
+        self._begin_plastic_window()
+
+    @torch._dynamo.disable
+    @torch.no_grad()
     def _finalize_surprise_window(self) -> None:
         """Snapshot the current `surprise_ema` into `surprise_prev`.
 
@@ -2003,21 +2081,27 @@ class GraphWalkerMemory(nn.Module):
         device = self.s.device
 
         with torch.autocast(device_type=device.type, enabled=False):
-            # Normalize by window length
-            window = max(self.window_len, 1)
-            co_visit_norm = (self.co_visit_flat.float() / window) if self.co_visit_flat is not None \
-                else torch.zeros_like(self.E_bias_flat)
+            # Hebbian path is only computed in "hebbian_plus_neuromod" mode.
+            # In "neuromod_only" mode, the Hebbian-flavored stats (co_visit,
+            # E_bias_old) are inputs to the neuromod's edge MLP instead, so
+            # the neuromod itself decides what plastic update to apply.
+            if cfg.plasticity_mode == "hebbian_plus_neuromod":
+                window = max(self.window_len, 1)
+                co_visit_norm = (
+                    self.co_visit_flat.float() / window
+                    if self.co_visit_flat is not None
+                    else torch.zeros_like(self.E_bias_flat)
+                )
+                surprise_scalar = self.surprise_ema.mean().float()
+                eta_global = cfg.plast_eta * torch.sigmoid(
+                    surprise_scalar - cfg.plast_surprise_bias,
+                )
+                delta_hebb = eta_global * (
+                    co_visit_norm - cfg.plast_decay * self.E_bias_flat
+                )
+            else:
+                delta_hebb = torch.zeros_like(self.E_bias_flat)
 
-            # Scalar-eta Hebbian: surprise-gated global learning rate.
-            # Higher surprise → faster learning. Additive to the neuromod.
-            surprise_scalar = self.surprise_ema.mean().float()
-            eta_global = cfg.plast_eta * torch.sigmoid(
-                surprise_scalar - cfg.plast_surprise_bias,
-            )
-
-            delta_hebb = eta_global * (
-                co_visit_norm - cfg.plast_decay * self.E_bias_flat
-            )
             # Neuromod contribution (if any), detached and scaled.
             delta_nm_commit = torch.zeros_like(self.E_bias_flat)
             if self._active_delta_nm is not None:

@@ -120,7 +120,12 @@ def test_wrapper_current_phase_propagates_to_memory_phase():
     Gumbel-STE because routing reads `memory.phase`, not the wrapper's."""
     torch.manual_seed(0)
     hf = _make_tiny_llama()
-    walker_cfg = _tiny_cfg(D_s=32, D_model=32, vocab_size=256, segment_T=8)
+    # Integration walker requires segment_T == mod_period == tbptt_block.
+    walker_cfg = _tiny_cfg(
+        D_s=32, D_model=32, vocab_size=256,
+        segment_T=8, mod_period=8, tbptt_block=8,
+        plasticity_mode="neuromod_only",
+    )
     cfg = PretrainedGWConfig(
         model_name="random", inject_layer=2, d_mem=32,
         memory=walker_cfg, T=8, bs=2, llama_dtype="fp32",
@@ -148,7 +153,12 @@ def test_wrapper_current_phase_propagates_to_memory_phase():
 def test_phase1_ar_step_raises_on_empty_continuation():
     torch.manual_seed(0)
     hf = _make_tiny_llama()
-    walker_cfg = _tiny_cfg(D_s=32, D_model=32, vocab_size=256, segment_T=8)
+    # Integration walker requires segment_T == mod_period == tbptt_block.
+    walker_cfg = _tiny_cfg(
+        D_s=32, D_model=32, vocab_size=256,
+        segment_T=8, mod_period=8, tbptt_block=8,
+        plasticity_mode="neuromod_only",
+    )
     cfg = PretrainedGWConfig(
         model_name="random", inject_layer=2, d_mem=32,
         memory=walker_cfg, T=8, bs=2, llama_dtype="fp32",

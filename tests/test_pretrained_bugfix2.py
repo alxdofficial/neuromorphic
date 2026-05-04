@@ -42,10 +42,11 @@ def _tiny_cfg(**overrides):
         n_heads=2, n_hops=2,
         D_q_in=8, D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=64,
-        mod_period=4, tbptt_block=4, segment_T=8,
+        mod_period=8, tbptt_block=8, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
         epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,
         lambda_balance=0.0, use_neuromod=True,
+        plasticity_mode="neuromod_only",
         neuromod_D_mod=16, neuromod_n_layers=1, neuromod_n_heads=2,
         neuromod_edge_hidden=16, neuromod_eta=1.0,
     )
@@ -101,10 +102,11 @@ def test_autoregressive_rollout_restores_training_and_memory_phase():
 # -- 2. forward_segment skips work on targetless blocks --
 
 
-def test_forward_segment_skips_readout_when_block_has_no_valid_targets():
-    """A T=1 forward (typical mid-AR-rollout) has no upcoming targets in
-    its segment. forward_segment must skip the dense vocab readout AND
-    must NOT increment surprise EMA / fire plasticity off stale surprise."""
+def test_forward_segment_does_not_alter_surprise_or_e_bias():
+    """`forward_segment` is now a pure forward (vocab-agnostic walker):
+    it must NOT touch `surprise_ema` and must NOT fire plasticity. Both
+    are externally driven by the trainer via `update_plasticity` after
+    backward."""
     from src.graph_walker.standalone import StandaloneLM
 
     torch.manual_seed(0)
@@ -112,8 +114,6 @@ def test_forward_segment_skips_readout_when_block_has_no_valid_targets():
     lm = StandaloneLM(walker_cfg).cpu()
     m = lm.memory
 
-    # Sanity: pre-fill surprise_ema with a non-zero pattern so we can detect
-    # whether the targetless block writes over it.
     m.begin_segment(B=2, device=torch.device("cpu"))
     m.surprise_ema = torch.full_like(m.surprise_ema, 0.7)
     surprise_before = m.surprise_ema.clone()
@@ -121,15 +121,13 @@ def test_forward_segment_skips_readout_when_block_has_no_valid_targets():
 
     # Single T=1 forward via forward_segment.
     h_mem = torch.randn(2, 1, walker_cfg.D_s)
-    input_ids = torch.randint(0, walker_cfg.vocab_size, (2, 1))
-    readouts, aux = m.forward_segment(h_mem, input_ids, adapter=None)
+    readouts = m.forward_segment(h_mem)
     assert readouts.shape == (2, 1, walker_cfg.D_s)
-    # surprise EMA must be untouched (no valid horizons → no fold).
+    # surprise EMA must be untouched.
     assert torch.equal(m.surprise_ema, surprise_before), (
-        "T=1 forward folded zero-valid CE into surprise_ema"
+        "forward_segment touched surprise_ema — should be externally driven only"
     )
-    # E_bias must be untouched (plasticity not fired without valid signal,
-    # AND fewer than mod_period steps since segment start anyway).
+    # E_bias must be untouched (plasticity is post-backward only).
     assert torch.equal(m.E_bias_flat, e_bias_before)
 
 
@@ -199,9 +197,12 @@ def test_begin_segment_clears_neuromod_carryover_when_requested():
     walker_cfg = _tiny_cfg()
     lm = StandaloneLM(walker_cfg).cpu()
     m = lm.memory
-    # Manually plant carryover state.
+    # Manually plant carryover state. D_feat = D_s + D_id + 1 (+1 surprise
+    # if neuromod_only mode adds a per-col surprise broadcast feature).
+    extra = 1 if walker_cfg.plasticity_mode == "neuromod_only" else 0
+    D_feat = walker_cfg.D_s + walker_cfg.D_id + 1 + extra
     m._prev_snapshot_ids = torch.tensor([1, 2], dtype=torch.int64)
-    m._prev_snapshot_feats = torch.randn(2, walker_cfg.D_s + walker_cfg.D_id + 1)
+    m._prev_snapshot_feats = torch.randn(2, D_feat)
 
     # Default (False) preserves carryover.
     m.begin_segment(B=2, device=torch.device("cpu"))
@@ -215,15 +216,36 @@ def test_begin_segment_clears_neuromod_carryover_when_requested():
     assert m._active_delta_nm is None
 
 
-def test_wrapper_reset_memory_clears_carryover_by_default():
+def test_wrapper_reset_memory_preserves_carryover_by_default():
+    """Under the external-surprise design, the previous step's neuromod
+    snapshot must be preserved into the next segment so `_active_delta_nm`
+    is non-None during the next forward — otherwise neuromod params get
+    no gradient. Callers that want to clear it (e.g., across truly
+    independent runs) can pass `clear_neuromod_carryover=True`."""
     w = _make_tiny_wrapper()
     w.train()
-    # Plant carryover.
-    w.memory._prev_snapshot_ids = torch.tensor([1, 2], dtype=torch.int64)
-    w.reset_memory(bs=2)
-    assert w.memory._prev_snapshot_ids is None, (
-        "wrapper.reset_memory should clear carryover by default for pretrained path"
+    # Run one full forward+backward pass to populate `_prev_snapshot_*`
+    # via update_plasticity.
+    opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
+    batch = Phase1Batch(
+        input_ids=torch.randint(0, 256, (2, 8)),
+        target_ids=torch.randint(0, 256, (2, 8)),
     )
+    phase1_pretrained_step(w, opt, batch, amp_dtype=None)
+    assert w.memory._prev_snapshot_ids is not None, (
+        "post-step snapshot expected to be populated by update_plasticity"
+    )
+    snapshot_ids_before = w.memory._prev_snapshot_ids
+
+    w.reset_memory(bs=2)
+    assert w.memory._prev_snapshot_ids is snapshot_ids_before, (
+        "wrapper.reset_memory must preserve neuromod carryover by default"
+    )
+
+    # Explicit clear still works.
+    w.reset_memory(bs=2, clear_neuromod_carryover=True)
+    assert w.memory._prev_snapshot_ids is None
+    assert w.memory._prev_snapshot_feats is None
 
 
 # -- 6. phase1 target_ids contract --

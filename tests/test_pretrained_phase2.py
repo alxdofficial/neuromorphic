@@ -44,10 +44,12 @@ def _tiny_walker_cfg(D_s, vocab, T=8):
         n_heads=2, n_hops=2,
         D_q_in=8, D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=vocab,
-        mod_period=4, tbptt_block=4, segment_T=T,
+        # Single-knob clock under external-surprise plasticity.
+        mod_period=T, tbptt_block=T, segment_T=T,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
         epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,
         lambda_balance=0.0, use_neuromod=True,
+        plasticity_mode="neuromod_only",
         neuromod_D_mod=16, neuromod_n_layers=1, neuromod_n_heads=2,
         neuromod_edge_hidden=16, neuromod_eta=1.0,
     )
@@ -145,6 +147,20 @@ def test_grpo_step_runs_and_grad_reaches_neuromod():
     w.train()
     _perturb_walker_weights(w)
     opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
+
+    # Seed neuromod carryover by running one phase-1 step. Without this,
+    # `_prev_snapshot_*` is None and `_begin_plastic_window` produces a
+    # None `_active_delta_nm` — routing falls back to E_bias_flat alone
+    # and neuromod params receive no gradient. Real training never hits
+    # this state because GRPO follows phase-1 in the cycle loop.
+    from src.graph_walker.pretrained.train_phase1 import (
+        Phase1Batch, phase1_pretrained_step,
+    )
+    seed_batch = Phase1Batch(
+        input_ids=torch.randint(0, 256, (2, 8)),
+        target_ids=torch.randint(0, 256, (2, 8)),
+    )
+    phase1_pretrained_step(w, opt, seed_batch, amp_dtype=None)
 
     prefix = torch.randint(0, 256, (1, 8))
     reference = torch.randint(0, 256, (8,))

@@ -73,6 +73,7 @@ def bench_one(B: int, T: int, *, compile_block: bool, use_neuromod: bool,
         m.compile_block_from_h(mode="default", fullgraph=True)
     opt = torch.optim.AdamW(
         [p for _, p in m.named_parameters() if p.requires_grad], lr=1e-4,
+        fused=True,
     )
 
     device = torch.device("cuda")
@@ -87,16 +88,18 @@ def bench_one(B: int, T: int, *, compile_block: bool, use_neuromod: bool,
         m.begin_segment(B, device)
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            readouts, aux_loss = m.forward_segment(
-                h_mem, input_ids, adapter=None,
-                compute_aux_loss=True, preserve_graph=False,
-                walker_aux_weight=1.0,
-            )
-            # Composite loss: aux + a sum-of-readouts proxy for the
-            # downstream gradient that Llama would inject in the real path.
-            loss = aux_loss + readouts.float().pow(2).mean()
+            readouts = m.forward_segment(h_mem, preserve_graph=False)
+            # Standalone bench has no Llama upstream, so we use a
+            # sum-of-readouts proxy for the downstream gradient that Llama
+            # would otherwise inject through W_out in the real path.
+            loss = readouts.float().pow(2).mean()
         loss.backward()
         opt.step()
+        # Synthetic surprise: random per-token "CE" so plasticity still
+        # runs end-to-end at bench representative shapes.
+        with torch.no_grad():
+            fake_surprise = torch.randn(B, T, device=device).abs()
+        m.update_plasticity(fake_surprise)
         m.detach_state()
 
     torch.cuda.empty_cache()

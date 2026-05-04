@@ -42,11 +42,15 @@ class PretrainedGWConfig:
     scale_init: float = 2.0
 
     # === Phase 1 driver defaults ===
-    T: int = 256           # segment length passed to `wrapper(...)`
+    # T is the SOLE clock knob in the integration. Under the external-
+    # surprise design, plasticity fires once per training step (post-
+    # backward), so segment_T, mod_period, and tbptt_block all become
+    # the same number — having three names for the same quantity invites
+    # bugs. The factory + validate() enforce
+    # `T == memory.segment_T == memory.mod_period == memory.tbptt_block`.
+    T: int = 128           # segment length AND mod_period AND tbptt_block
     bs: int = 8            # phase-1 batch size
     grad_clip: float = 1.0
-    walker_aux_weight: float = 1.0    # weight on walker's own multi-horizon aux CE
-    lm_aux_weight: float = 0.1        # weight on adapter-side horizon-1 CE
     ce_weight: float = 1.0            # weight on primary Llama CE
 
     # === Phase 2 (GRPO) ===
@@ -64,11 +68,29 @@ class PretrainedGWConfig:
             "Walker's internal state dim and the MemInjectLayer d_mem must match "
             "— forward_segment passes h_mem directly into the walker as h_input."
         )
-        # Runtime clocks must satisfy graph_walker's invariants.
-        if self.T % self.memory.mod_period != 0:
+        # Single-knob clock invariant: under the external-surprise design,
+        # plasticity fires once per training step. segment_T, mod_period,
+        # and tbptt_block are the same number; the integration's T is that
+        # number. Factories build memory configs that satisfy this; this
+        # check catches direct PretrainedGWConfig(...) construction with
+        # mismatched memory clocks.
+        if self.memory.segment_T != self.T:
             raise ValueError(
-                f"T ({self.T}) must be a multiple of memory.mod_period "
-                f"({self.memory.mod_period})."
+                f"memory.segment_T ({self.memory.segment_T}) must equal T "
+                f"({self.T}). Use a factory (e.g. PretrainedGWConfig.llama_1b) "
+                "or set memory.segment_T = T explicitly."
+            )
+        if self.memory.mod_period != self.T:
+            raise ValueError(
+                f"memory.mod_period ({self.memory.mod_period}) must equal T "
+                f"({self.T}). Under external-surprise plasticity, "
+                "segment_T == mod_period == tbptt_block."
+            )
+        if self.memory.tbptt_block != self.T:
+            raise ValueError(
+                f"memory.tbptt_block ({self.memory.tbptt_block}) must equal T "
+                f"({self.T}). Under external-surprise plasticity, "
+                "segment_T == mod_period == tbptt_block."
             )
 
     def validate_after_load(self) -> None:
@@ -88,7 +110,12 @@ class PretrainedGWConfig:
 
         Picks topology / clocks compatible with the driver defaults:
           - `D_s = d_mem` so W_in/W_out match the walker's internal dim.
-          - `segment_T = T` so the walker runs exactly one segment per forward.
+          - `segment_T = mod_period = tbptt_block = T` — single-knob clock
+            invariant under the external-surprise design (one plasticity
+            firing per training step, fully gradient-trained).
+          - `plasticity_mode = "neuromod_only"` — drops the additive δ_hebb
+            term; Hebbian-flavored stats (co_visit, E_bias) become inputs
+            to neuromod instead. Surprise also enters as a per-col feature.
           - Default topology (16x16, L=4) gives N=1024 columns — good balance
             of capacity vs per-token wall time. Override `plane_rows` etc via
             `mem_kw` for smaller smoke runs.
@@ -97,9 +124,10 @@ class PretrainedGWConfig:
             D_s=d_mem,
             D_model=d_mem,            # walker's own internal "model width"; tied to state dim for simplicity
             segment_T=T,
-            mod_period=min(128, T),
-            tbptt_block=min(128, T),  # must equal mod_period
+            mod_period=T,             # single-knob: all three equal
+            tbptt_block=T,
             vocab_size=32_000,        # placeholder; overwritten from HF
+            plasticity_mode="neuromod_only",
         )
         base.update(mem_kw)
         return GraphWalkerConfig(**base)
@@ -110,7 +138,7 @@ class PretrainedGWConfig:
             model_name="meta-llama/Llama-3.2-1B",
             inject_layer=8,
             d_mem=512,
-            T=256,
+            T=128,
         )
         defaults.update(kw)
         mem_kw = defaults.pop("memory_kw", {})
@@ -127,7 +155,7 @@ class PretrainedGWConfig:
             model_name="meta-llama/Llama-3.2-3B",
             inject_layer=14,
             d_mem=512,
-            T=256,
+            T=128,
         )
         defaults.update(kw)
         mem_kw = defaults.pop("memory_kw", {})
@@ -149,7 +177,7 @@ class PretrainedGWConfig:
             model_name="HuggingFaceTB/SmolLM2-135M",
             inject_layer=15,
             d_mem=576,
-            T=256,
+            T=128,
         )
         defaults.update(kw)
         mem_kw = defaults.pop("memory_kw", {})
@@ -167,7 +195,7 @@ class PretrainedGWConfig:
             model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             inject_layer=11,
             d_mem=512,
-            T=256,
+            T=128,
         )
         defaults.update(kw)
         mem_kw = defaults.pop("memory_kw", {})

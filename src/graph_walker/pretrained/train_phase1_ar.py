@@ -14,9 +14,8 @@ Per step:
 2. Enter `preserve_memory_graph()`: memory state stays graph-connected
    across the prefix pass and the per-token continuation forwards. No
    intra-segment detach.
-3. Prefix forward: `wrapper(prefix_ids, use_cache=True)`. Walker fires
-   plasticity inside `forward_segment` at every `mod_period`. Gradient
-   from later continuation steps reaches every fire's neuromod write.
+3. Prefix forward: `wrapper(prefix_ids, use_cache=True)`. Walker runs
+   forward through `forward_segment` (no plasticity firing inside).
 4. Continuation unroll: for `i = 0..T_cont - 1`:
      - Feed ground-truth token `cont_ids[:, i:i+1]` with the captured
        past_key_values → `out_i.logits[:, -1]`.
@@ -25,18 +24,20 @@ Per step:
        `cont_ids[:, i]`.
        For i=0, `prev_logits` comes from the PREFIX's last position.
 5. Loss = mean of T_cont per-step CE losses.
-6. `loss.backward()` → grad-clip → `opt.step()` → `detach_memory()`.
+6. `loss.backward()` → grad-clip → `opt.step()`.
+7. Surprise: per-token CE on the (prefix + continuation) ground-truth
+   tokens, fed into `wrapper.memory.update_plasticity(per_token_ce)` so
+   the walker's plastic state advances once per AR step.
+8. `detach_memory()`.
 
 Invariants:
 - `cfg.memory.tbptt_block >= T_pre`. The walker's intra-segment detach
-  is bypassed inside `preserve_memory_graph()`, but the per-block
-  surprise fold and plasticity fires still happen at `mod_period` cadence.
-  No detach means activations live until backward — VRAM scales with
-  `T_pre + T_cont`.
-- Walker's slow plastic state (E_bias_flat) is updated by the prefix
-  fires in-place (detached, additive). The continuation unroll READS
-  e_bias_active but doesn't fire new plasticity (window not yet closed
-  again).
+  is bypassed inside `preserve_memory_graph()`. Plasticity is driven
+  externally (post-backward) under the new vocab-agnostic design, so
+  no in-forward firing happens regardless of mod_period.
+- Walker's slow plastic state (E_bias_flat) is updated once per training
+  step via `update_plasticity` from Llama's per-token CE on the AR
+  trajectory.
 """
 
 from __future__ import annotations
@@ -47,7 +48,6 @@ import torch
 import torch.nn.functional as F
 
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
-from src.graph_walker.pretrained.rollout import _freeze_plasticity_ctx
 
 
 @dataclass
@@ -87,7 +87,7 @@ def phase1_ar_pretrained_step(
     if not wrapper.training:
         raise RuntimeError(
             "phase1_ar_pretrained_step requires wrapper.train() — inference-"
-            "mode leak would silently disable aux loss and Gumbel-STE routing."
+            "mode leak would silently disable Gumbel-STE routing."
         )
 
     wrapper.reset_memory(bs=BS)
@@ -100,6 +100,10 @@ def phase1_ar_pretrained_step(
     )
 
     losses: list[torch.Tensor] = []
+    # Track per-token logits for surprise computation. Each entry is the
+    # [BS, vocab] logits that PREDICTED the corresponding target token.
+    per_step_logits: list[torch.Tensor] = []
+    per_step_targets: list[torch.Tensor] = []
 
     with ctx, wrapper.preserve_memory_graph():
         # 1. Prefix pass with KV cache.
@@ -109,34 +113,31 @@ def phase1_ar_pretrained_step(
         # last position.
         prev_logits = prefix_out.logits[:, -1, :]                  # [BS, vocab]
 
-        # 2. Continuation unroll. The continuation forwards are T=1
-        # "policy reads", not training tokens — they have no upcoming
-        # targets within the segment, so any plasticity firing during
-        # them would be driven by stale surprise + the generation walks'
-        # co-visit footprint. Freeze plasticity here (mirroring what
-        # phase-2 generation does in autoregressive_rollout). The walker
-        # state itself stays graph-connected via preserve_memory_graph,
-        # so gradient from the per-step CE still reaches the prefix's
-        # plastic / neuromod fires.
-        with _freeze_plasticity_ctx(wrapper.memory):
-            for i in range(T_cont):
-                # CE for step i: prev_logits should predict continuation_ids[:, i].
-                ce_i = F.cross_entropy(
-                    prev_logits.float(), continuation_ids[:, i],
-                )
-                losses.append(ce_i)
+        # 2. Continuation unroll. Plasticity does NOT fire inside
+        # forward_segment (vocab-agnostic walker — surprise comes from
+        # the trainer, post-backward). The walker state stays graph-
+        # connected via preserve_memory_graph, so gradient from the
+        # per-step CE reaches the prefix-pass writes.
+        for i in range(T_cont):
+            # CE for step i: prev_logits should predict continuation_ids[:, i].
+            ce_i = F.cross_entropy(
+                prev_logits.float(), continuation_ids[:, i],
+            )
+            losses.append(ce_i)
+            per_step_logits.append(prev_logits.detach())
+            per_step_targets.append(continuation_ids[:, i].detach())
 
-                if i + 1 == T_cont:
-                    # Last step: no need for another forward.
-                    break
+            if i + 1 == T_cont:
+                # Last step: no need for another forward.
+                break
 
-                # Feed ground-truth token i forward to produce logits for token i+1.
-                tok = continuation_ids[:, i:i+1]                   # [BS, 1]
-                out = wrapper(
-                    tok, past_key_values=past_key_values, use_cache=True,
-                )
-                past_key_values = out.past_key_values
-                prev_logits = out.logits[:, -1, :]
+            # Feed ground-truth token i forward to produce logits for token i+1.
+            tok = continuation_ids[:, i:i+1]                       # [BS, 1]
+            out = wrapper(
+                tok, past_key_values=past_key_values, use_cache=True,
+            )
+            past_key_values = out.past_key_values
+            prev_logits = out.logits[:, -1, :]
 
     loss = torch.stack(losses).mean()
     loss.backward()
@@ -145,6 +146,22 @@ def phase1_ar_pretrained_step(
         grad_clip,
     )
     opt.step()
+
+    # Feed per-token CE (over the AR continuation only — prefix tokens are
+    # supervised but the walker already saw them with the same E_bias snapshot
+    # so attributing their surprise to that snapshot is fair) to the walker
+    # for one plasticity step.
+    if wrapper.memory is not None and per_step_logits:
+        with torch.no_grad():
+            stacked_logits = torch.stack(per_step_logits, dim=1)     # [BS, T_cont, V]
+            stacked_targets = torch.stack(per_step_targets, dim=1)   # [BS, T_cont]
+            per_token_ce = F.cross_entropy(
+                stacked_logits.reshape(-1, stacked_logits.size(-1)).float(),
+                stacked_targets.reshape(-1),
+                reduction="none",
+            ).reshape(BS, T_cont)
+        wrapper.memory.update_plasticity(per_token_ce)
+
     wrapper.detach_memory()
 
     return Phase1ARStats(

@@ -1,14 +1,21 @@
 # GraphWalker
 
-**Branch:** `graph-walker`
-**Status:** live code reference for the current branch
-**Last updated:** 2026-04-24
+**Branch:** `main` (graph-walker promoted)
+**Status:** live code reference for the standalone walker.
+**Last updated:** 2026-04-30
 
-This document describes the code that exists now. It reflects the
-post-session state after: write-first-then-route walkers, per-window
-anchoring, target-predicting neuromod, surprise fold into the flush,
-and factorized per-horizon CE. The earlier `column_graph` and the
-earlier graph-walker draft (`H×L` relaunching) are obsolete.
+This document describes the **standalone walker** — the original training
+target where the walker is itself the language model (`StandaloneLM` +
+`phase1_step` in `src/graph_walker/`). This is the path that has its
+own LM head, computes its own multi-horizon CE, and fires plasticity
+inside the training flush.
+
+For the **integration** path (frozen Llama + walker as a side-channel
+memory module), see [docs/pretrained_graph_walker.md](pretrained_graph_walker.md).
+The integration walker is **vocab-agnostic**: no LM head, no aux CE,
+plasticity is driven externally via `walker.update_plasticity(per_token_ce)`
+called by the trainer after `loss.backward()`. The standalone path
+described below is unchanged by that integration refactor.
 
 ## Thesis
 

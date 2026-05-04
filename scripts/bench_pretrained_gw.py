@@ -51,20 +51,18 @@ def _walker_cfg_for(d_mem: int, T: int) -> GraphWalkerConfig:
     All other knobs come from production defaults. Pass ``d_mem=256`` to
     match the production D_s exactly.
     """
-    # mod_period must divide T; pick the largest power-of-2 divisor that
-    # is <= production's 128. Production's 128 evenly divides standard
-    # T values (256, 1024, etc.); this fallback handles odd cases.
-    mod_period = 128
-    while T % mod_period != 0 and mod_period > 1:
-        mod_period //= 2
+    # Integration constraint (PretrainedGWConfig.validate):
+    # segment_T == mod_period == tbptt_block. Under external-surprise
+    # plasticity the entire segment is one window — one delta committed
+    # per training step.
     return GraphWalkerConfig(
         D_s=d_mem,
         D_model=d_mem,            # state_to_model bottleneck shape; tying to
                                   # d_mem keeps the readout matmul small.
         vocab_size=128_256,       # Llama-3.2-1B vocab
         segment_T=T,
-        mod_period=mod_period,
-        tbptt_block=mod_period,
+        mod_period=T,
+        tbptt_block=T,
         compile_on_train=False,
     )
 
@@ -235,6 +233,7 @@ def main():
     wrapper.train(True)
     opt = torch.optim.AdamW(
         [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        fused=True,
     )
     targets = input_ids.clone()
     batch = Phase1Batch(input_ids=input_ids, target_ids=targets)
