@@ -217,7 +217,8 @@ class PretrainedGWConfig:
             D_q_in=16, D_q_per_head=16, n_score_heads=2,
             K_horizons=4, K_buf=4,
             vocab_size=256,
-            mod_period=4, tbptt_block=4, segment_T=8,
+            # Single-knob clock invariant: T == mod_period == tbptt_block
+            mod_period=8, tbptt_block=8, segment_T=8,
             gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
             epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,
             lambda_balance=0.0,
