@@ -2017,12 +2017,25 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_ema = ema
 
     @torch._dynamo.disable
-    @torch.no_grad()
     def update_plasticity(
         self,
         per_token_surprise: torch.Tensor | None,
     ) -> None:
         """Externally-driven plasticity update. Call AFTER `loss.backward()`.
+
+        Critical grad-scope contract (do NOT add @torch.no_grad here): the
+        helper methods this calls each have their own no_grad scope where
+        needed:
+          - `accumulate_block_ce`        @torch.no_grad
+          - `_finalize_surprise_window`  @torch.no_grad
+          - `_plasticity_step`           @torch.no_grad
+        The final `_begin_plastic_window()` call MUST run with gradients
+        enabled — it runs the neuromod forward to build the next segment's
+        `_active_delta_nm`, and that delta MUST carry grad_fn so the next
+        forward's loss can train the neuromod. Wrapping this whole function
+        in @torch.no_grad would silently kill the neuromod training signal
+        (caught by Codex audit 2026-05-04 — was a real bug introduced by
+        the external-surprise refactor).
 
         The walker is vocab-agnostic: it does not compute its own next-token
         CE. The trainer is responsible for supplying surprise as Llama's

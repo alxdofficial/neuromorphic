@@ -102,6 +102,14 @@ def _parse_args() -> argparse.Namespace:
                     help="Passphrase continuation (answer) length (Wave 3 only).")
     ap.add_argument("--n-heldout", type=int, default=20,
                     help="Number of facts held out for eval (Wave 3 only).")
+    ap.add_argument("--seed", type=int, default=42,
+                    help=(
+                        "RNG seed. CRITICAL for Wave 3: passphrase loader "
+                        "uses this to deterministically split train/heldout "
+                        "facts. The eval script (eval_passphrase.py) defaults "
+                        "to seed=42; if these don't match, eval will leak "
+                        "training facts into the held-out set."
+                    ))
 
     # Training
     ap.add_argument("--max-steps", type=int, default=20_000)
@@ -210,6 +218,9 @@ def main() -> None:
         # Wave 3: passphrase recall via teacher-forced AR. Uses the BASE
         # tokenizer (no chat template needed — the example layout is
         # filler+fact+filler+question, not chat-formatted).
+        # CRITICAL: seed must match eval_passphrase.py's --seed so
+        # train/heldout fact splits are identical (otherwise eval leaks
+        # training facts into the "held-out" set, invalidating recall).
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         data_iter = passphrase_phase1ar_iter(
             expanded_path=args.passphrase_expanded,
@@ -220,6 +231,7 @@ def main() -> None:
             T_cont=args.T_cont,
             n_heldout=args.n_heldout,
             device=device,
+            seed=args.seed,
         )
     else:
         raise ValueError(args.data)
@@ -263,6 +275,19 @@ def main() -> None:
                 now = time.perf_counter()
                 tps = (tokens_per_step * args.log_every) / max(now - last_log_t, 1e-6)
                 last_log_t = now
+                # Surface diagnostic flags from row[] dict so a quick
+                # console scan catches dead walker / NaN / VRAM bumps
+                # without leaving the terminal.
+                vram = row.get("vram.peak_mb", 0.0)
+                nan_g = row.get("nan.any_nan_grad", False)
+                nan_p = row.get("nan.any_nan_param", False)
+                has_dnm = row.get("walker.has_active_delta_nm", True)
+                # Compact warning string; empty when everything healthy.
+                warns = []
+                if nan_g:  warns.append("NaN-grad")
+                if nan_p:  warns.append("NaN-param")
+                if not has_dnm:  warns.append("no-delta_nm")
+                warn_str = (" ⚠ " + ",".join(warns)) if warns else ""
                 if is_ar:
                     # Phase1ARStats has loss + ce_per_step + grad_norm.
                     mean_ce = (
@@ -275,17 +300,22 @@ def main() -> None:
                         f"first_ce={stats.ce_per_step[0]:.4f} "
                         f"lr={sched.get_last_lr()[0]:.2e} "
                         f"grad={stats.grad_norm:.2f} "
-                        f"tps={tps/1000:.1f}k",
+                        f"vram={vram/1024:.1f}GB "
+                        f"tps={tps/1000:.1f}k"
+                        f"{warn_str}",
                         flush=True,
                     )
                 else:
+                    inj_ratio = getattr(stats, "inject_residual_ratio", 0.0)
                     print(
                         f"[step {step:>6}] loss={stats.loss:.4f} "
                         f"ce={stats.ce_loss:.4f} "
                         f"lr={sched.get_last_lr()[0]:.2e} "
                         f"grad={stats.grad_norm:.2f} "
-                        f"inj={stats.inject_residual_norm:.2e} "
-                        f"tps={tps/1000:.1f}k",
+                        f"inj_ratio={inj_ratio:.2e} "
+                        f"vram={vram/1024:.1f}GB "
+                        f"tps={tps/1000:.1f}k"
+                        f"{warn_str}",
                         flush=True,
                     )
 

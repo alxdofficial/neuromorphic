@@ -60,6 +60,19 @@ class MemInjectLayer(nn.Module):
         # vanilla bit-for-bit.
         self.scale = nn.Parameter(torch.full((d_lm,), scale_init))
 
+        # Diagnostic: last-forward injection norm + hidden norm. Updated
+        # in-place each forward call (no autograd; pure detached scalars).
+        # Used by the training-step Stats to compute the actual injection
+        # signal-to-noise ratio: ||scale·W_out(readout)|| / ||hidden||.
+        # The earlier `inject_residual_norm = mean(|scale|)·||W_out.weight||`
+        # was a static parameter-product, not the actual residual.
+        self.register_buffer(
+            "_last_inj_norm", torch.zeros(()), persistent=False,
+        )
+        self.register_buffer(
+            "_last_hidden_norm", torch.zeros(()), persistent=False,
+        )
+
     def set_memory_fn(self, memory_fn: Callable[[Tensor], Tensor] | None):
         """Wire or unwire the memory read/write callback at runtime."""
         self.memory_fn = memory_fn
@@ -96,4 +109,8 @@ class MemInjectLayer(nn.Module):
         if inj.dtype != h_dtype:
             inj = inj.to(h_dtype)
         injected = hidden_states + inj
+        # Diagnostics — detached scalars, not in autograd graph.
+        with torch.no_grad():
+            self._last_inj_norm.copy_(inj.detach().float().norm())
+            self._last_hidden_norm.copy_(hidden_states.detach().float().norm())
         return self.orig_layer(injected, *args, **kwargs)

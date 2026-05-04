@@ -88,16 +88,25 @@ def gumbel_top1_softmax(
     device = scores.device
 
     if training and phase == "phase2":
-        # Hard Categorical sample. log_pi = log p(selected) under softmax(scores).
+        # Hard Categorical sample. log_pi = log p(selected) under the same
+        # clamped distribution we sample from — earlier code logged
+        # log_probs from the unclamped softmax but sampled from
+        # `soft.clamp(min=1e-12)`. For probabilities below the clamp, the
+        # logged log_pi was more negative than the actual sampling
+        # log-probability, biasing REINFORCE. Now consistent: both
+        # sample and log come from the clamped, re-normalized distribution.
         soft = F.softmax(scores.float(), dim=-1)
-        log_probs = F.log_softmax(scores.float(), dim=-1)
-        # `multinomial` requires cpu/cuda probs; numerically clamp to avoid 0s.
         probs = soft.clamp(min=1e-12)
+        # Renormalize after clamp so probabilities sum to 1 exactly
+        # (multinomial doesn't strictly require this but it makes the
+        # log_pi math match the actual sampling distribution).
+        probs = probs / probs.sum(dim=-1, keepdim=True)
         sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)   # [B]
         # log_pi must remain graph-connected to scores so REINFORCE backprop
         # reaches every parameter that produced `scores` (q_proj, k_all,
-        # E_bias, neuromod via active_E_bias).
-        log_pi = log_probs.gather(1, sampled.unsqueeze(-1)).squeeze(-1) # [B]
+        # E_bias, neuromod via active_E_bias). Logging from `probs.log()`
+        # rather than `log_softmax(scores)` keeps the sample/log consistent.
+        log_pi = probs.log().gather(1, sampled.unsqueeze(-1)).squeeze(-1)  # [B]
         hard = F.one_hot(sampled, num_classes=K).to(scores.dtype)
         return RoutingOutput(
             selected_idx=sampled,
@@ -107,16 +116,21 @@ def gumbel_top1_softmax(
         )
 
     if training:
-        # Gumbel noise
-        u = torch.rand_like(scores).clamp_(min=1e-9, max=1 - 1e-9)
+        # Gumbel noise. Promote scores to fp32 for the noise + softmax —
+        # phase-2 already does this, but phase-1 was using bf16 under
+        # autocast which quantizes routing noise + softmax. Fp32 here
+        # keeps Gumbel-STE precision symmetric with phase-2.
+        scores_fp32 = scores.float()
+        u = torch.rand_like(scores_fp32).clamp_(min=1e-9, max=1 - 1e-9)
         gumbel = -torch.log(-torch.log(u))
         tau_safe = tau.clamp(min=1e-3) if isinstance(tau, torch.Tensor) \
             else max(tau, 1e-3)
-        logits = (scores + gumbel) / tau_safe
-        soft = F.softmax(logits, dim=-1)                          # [B, K]
+        logits = (scores_fp32 + gumbel) / tau_safe
+        soft_fp32 = F.softmax(logits, dim=-1)                     # [B, K] fp32
+        soft = soft_fp32.to(scores.dtype)                         # back to caller dtype
 
         # Hard argmax
-        argmax = soft.argmax(dim=-1)                               # [B]
+        argmax = soft.argmax(dim=-1)                              # [B]
 
         # ε-exploration: swap in uniform random sample for εB items.
         # Exploration sampling is done in an eager helper to avoid a Triton

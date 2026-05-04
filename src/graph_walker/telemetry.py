@@ -93,8 +93,17 @@ class StatsCollector:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.work_dir / "stats.jsonl"
         self._fh = open(self.path, "a")
-        # State for delta-style metrics (across snapshot calls).
-        self._prev_E_bias_norm: float | None = None
+        # State for delta-style metrics (across snapshot calls). We keep
+        # the previous E_bias_flat tensor (clone) so we can compute the
+        # TRUE delta-norm `||E_t - E_{t-1}||`, not just `abs(||E_t|| -
+        # ||E_{t-1}||)` which is blind to rotations / sign flips.
+        # Memory cost: one [N*K] fp32 buffer ≈ 64KB at default config.
+        self._prev_E_bias: torch.Tensor | None = None
+        # Step counter for throttling expensive checks (per-param NaN scan
+        # is the biggest culprit). Currently disabled — we run the scan
+        # every step but only on params with non-None grad to keep cost
+        # bounded.
+        self._snap_count: int = 0
 
     def close(self) -> None:
         self._fh.close()
@@ -130,11 +139,12 @@ class StatsCollector:
 
         # ---- training ----
         for fld in ("loss", "ce_loss", "aux_loss", "load_balance_loss",
+                    "ce_p50", "ce_p90", "ce_p99", "ce_max",
                     "grad_norm", "tok_per_sec",
                     "reward_mean", "reward_std", "reward_min", "reward_max",
                     "log_pi_mean", "log_pi_max_abs",
                     "advantage_max", "advantage_std",
-                    "inject_residual_norm"):
+                    "inject_residual_norm", "inject_residual_ratio"):
             if hasattr(stats, fld):
                 row[f"train.{fld}"] = float(getattr(stats, fld))
         # Integer fields (don't float-cast).
@@ -234,6 +244,7 @@ class StatsCollector:
                 "state_to_model", "walker_state_alpha",
                 "neuromod.edge_mlp", "neuromod.feature_proj",
                 "neuromod.layers", "neuromod.blend_logit",
+                "neuromod.edge_bias_proj",
                 "input_q_proj", "out_k_proj", "out_v_proj",
             ):
                 gn = 0.0
@@ -274,14 +285,15 @@ class StatsCollector:
             row["walker.phase"] = str(getattr(m, "phase", "phase1"))
 
         # ---- E_bias delta from previous snapshot ----
-        # Tracks whether plasticity is actually moving things. If
-        # E_bias_delta_norm stays near 0 across many steps, neuromod is
-        # not learning OR plasticity-window is misfiring.
+        # TRUE delta-norm `||E_t - E_{t-1}||` (not abs of norm-difference,
+        # which would miss rotations / sign flips). If E_bias_delta_norm
+        # stays near 0 across many steps, neuromod is not learning OR
+        # plasticity-window is misfiring.
         if m is not None and m.E_bias_flat is not None:
-            cur_norm = _norm(m.E_bias_flat)
-            if self._prev_E_bias_norm is not None:
-                row["mem.E_bias_delta_norm"] = abs(cur_norm - self._prev_E_bias_norm)
-            self._prev_E_bias_norm = cur_norm
+            cur = m.E_bias_flat.detach().float()
+            if self._prev_E_bias is not None and self._prev_E_bias.shape == cur.shape:
+                row["mem.E_bias_delta_norm"] = float((cur - self._prev_E_bias).norm().item())
+            self._prev_E_bias = cur.clone()
 
         # ---- VRAM peak (this step's high-water mark) ----
         if torch.cuda.is_available():
@@ -289,20 +301,24 @@ class StatsCollector:
             row["vram.allocated_mb"] = float(torch.cuda.memory_allocated() / 1e6)
             torch.cuda.reset_peak_memory_stats()
 
-        # ---- NaN / Inf detection across grads ----
-        # Cheap aggregate (one bool per step). If True, training has
-        # already corrupted somewhere — easier to spot in the plot than
-        # by watching loss dance between numbers and NaN.
+        # ---- NaN / Inf detection across ALL trainable params ----
+        # Cheap aggregate (one bool per step). Scope: ALL wrapper params,
+        # not just walker — earlier version missed MemInjectLayer's
+        # W_in/W_out/scale, which are some of the most numerically active
+        # params (gradient flowing from Llama CE through frozen layers).
+        # Cost: O(n_trainable_tensors) calls to isfinite().all() ≈ 5-10ms
+        # at our scale. Skip non-trainable to keep cost bounded.
         any_nan_grad = False
         any_nan_param = False
-        if m is not None:
-            for _, p in m.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    any_nan_grad = True
-                if not torch.isfinite(p.data).all():
-                    any_nan_param = True
-                if any_nan_grad and any_nan_param:
-                    break
+        for name, p in wrapper.named_parameters():
+            if not p.requires_grad:
+                continue
+            if not torch.isfinite(p.data).all():
+                any_nan_param = True
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                any_nan_grad = True
+            if any_nan_grad and any_nan_param:
+                break
         row["nan.any_nan_grad"] = any_nan_grad
         row["nan.any_nan_param"] = any_nan_param
 

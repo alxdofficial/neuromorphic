@@ -54,8 +54,17 @@ class Phase1Batch:
 class Phase1Stats:
     loss: float
     ce_loss: float
+    ce_p50: float                        # per-token CE percentiles (catches hard examples
+    ce_p90: float                        # that the scalar mean would hide).
+    ce_p99: float
+    ce_max: float
     grad_norm: float
-    inject_residual_norm: float          # ||scale · W_out(readout)|| mean
+    inject_residual_ratio: float         # ||scale·W_out(readout)|| / ||hidden_states||
+                                         # (real injection SNR; the previous
+                                         # `inject_residual_norm` was a static
+                                         # parameter product that didn't reflect
+                                         # whether the readout was actually doing
+                                         # anything).
     tok_per_sec: float
 
 
@@ -146,20 +155,32 @@ def phase1_pretrained_step(
     elapsed = max(time.perf_counter() - t0, 1e-6)
     tok_per_sec = BS * T / elapsed
 
-    # Inject residual magnitude — useful diagnostic for "is memory
-    # contributing anything". `scale` and `W_out.weight` are both on
-    # wrapper.mem_inject.
+    # Real injection signal-to-noise ratio. MemInjectLayer.forward records
+    # the actual ||inj|| and ||hidden|| in detached buffers per call.
+    # The earlier scalar (mean(|scale|) * ||W_out.weight||) was a static
+    # parameter product — it didn't depend on whether the readout was
+    # actually emitting useful signal.
     with torch.no_grad():
-        inj_norm = (
-            wrapper.mem_inject.scale.abs().mean()
-            * wrapper.mem_inject.W_out.weight.norm()
-        ).item()
+        h_norm = float(wrapper.mem_inject._last_hidden_norm.item())
+        i_norm = float(wrapper.mem_inject._last_inj_norm.item())
+        inject_ratio = i_norm / max(h_norm, 1e-12)
+        # Per-token CE percentiles — catches hard examples that the
+        # scalar mean would smooth over.
+        if wrapper.memory is not None:
+            pt = per_token_ce.detach().float().reshape(-1)
+            ce_p50 = float(pt.quantile(0.5).item())
+            ce_p90 = float(pt.quantile(0.9).item())
+            ce_p99 = float(pt.quantile(0.99).item())
+            ce_max = float(pt.max().item())
+        else:
+            ce_p50 = ce_p90 = ce_p99 = ce_max = 0.0
 
     return Phase1Stats(
         loss=float(loss.detach()),
         ce_loss=float(ce.detach()),
+        ce_p50=ce_p50, ce_p90=ce_p90, ce_p99=ce_p99, ce_max=ce_max,
         grad_norm=float(grad_norm) if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm),
-        inject_residual_norm=inj_norm,
+        inject_residual_ratio=inject_ratio,
         tok_per_sec=tok_per_sec,
     )

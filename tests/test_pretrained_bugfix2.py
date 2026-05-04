@@ -248,6 +248,43 @@ def test_wrapper_reset_memory_preserves_carryover_by_default():
     assert w.memory._prev_snapshot_feats is None
 
 
+def test_update_plasticity_preserves_grad_on_active_delta_nm():
+    """Regression for the @torch.no_grad() decorator bug on update_plasticity
+    (Codex audit 2026-05-04). The function MUST NOT be wrapped in no_grad
+    because the trailing `_begin_plastic_window()` rebuilds `_active_delta_nm`
+    by running the neuromod forward — under no_grad, that delta has no
+    grad_fn, and the next segment's loss can't train the neuromod via the
+    REINFORCE / phase-1-AR routing path. Symptom is silent: the model
+    "trains" (W_in/W_out/walker still update) but the neuromod is stuck
+    at init, which is the most-important learnable component.
+    """
+    w = _make_tiny_wrapper()
+    w.train()
+    opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
+    batch = Phase1Batch(
+        input_ids=torch.randint(0, 256, (2, 8)),
+        target_ids=torch.randint(0, 256, (2, 8)),
+    )
+    # Run one full step — this exercises update_plasticity on a real
+    # snapshot path (post-step the snapshot is populated, then
+    # _begin_plastic_window builds the next delta).
+    phase1_pretrained_step(w, opt, batch, amp_dtype=None)
+    delta = w.memory._active_delta_nm
+    assert delta is not None, (
+        "_active_delta_nm should have been rebuilt by _begin_plastic_window "
+        "at the end of update_plasticity"
+    )
+    # The non-zero edge entries must carry grad_fn back to neuromod params.
+    # If torch.no_grad is wrapping update_plasticity, this assertion fails.
+    assert delta.requires_grad, (
+        "_active_delta_nm has no grad — neuromod will get NO learning signal "
+        "next segment. Probable cause: @torch.no_grad() on update_plasticity."
+    )
+    assert delta.grad_fn is not None, (
+        "_active_delta_nm has no grad_fn — same root cause as requires_grad=False"
+    )
+
+
 # -- 6. phase1 target_ids contract --
 
 

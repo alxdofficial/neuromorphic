@@ -380,9 +380,16 @@ class GraphWalkerPretrainedLM(nn.Module):
         # Re-freeze walker params that are standalone-only and never see
         # gradient through `forward_segment` — without this, every cycle's
         # `unfreeze_all()` puts dead weights back into the optimizer.
+        # MUST mirror the freeze list applied at __init__ (lines 147-161).
+        # Earlier this only re-froze 2 of 6 dead params, so cycle-phase-1
+        # rebuilds optimizer state for ~10M params that get no gradient.
         if self.memory is not None:
-            for p_name in ("token_to_state", "input_v_proj"):
+            for p_name in ("token_to_state", "input_v_proj", "tied_token_emb"):
                 getattr(self.memory, p_name).weight.requires_grad = False
+            self.memory.state_to_model.weight.requires_grad = False
+            for p in self.memory.readout.parameters():
+                p.requires_grad = False
+            self.memory.prev_motor_proj.weight.requires_grad = False
 
     def freeze_all_but_E_bias_and_neuromod(self) -> None:
         """Phase-2 minimal policy surface: only neuromod + E_bias evolve.

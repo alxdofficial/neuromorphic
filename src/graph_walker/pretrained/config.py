@@ -225,6 +225,10 @@ class PretrainedGWConfig:
             use_neuromod=True,
             neuromod_D_mod=32, neuromod_n_layers=1, neuromod_n_heads=2,
             neuromod_edge_hidden=16, neuromod_eta=1.0,
+            # Match the integration's neuromod_only path (set by
+            # _make_memory) so tiny_test exercises the same plasticity
+            # rule + Option-C per-edge attention bias as production runs.
+            plasticity_mode="neuromod_only",
         )
         defaults = dict(
             model_name="HuggingFaceTB/SmolLM2-135M",
