@@ -1,10 +1,9 @@
 # Wave 3 — Passphrase Memory Recall: Data Generation + Training Plan
 
-**Status:** plan, not built. User decided 2026-05-04 to swap original
-Wave 3 (chat overflow GRPO) and Wave 4 (synthetic passphrase) so the
-synthetic recall test runs FIRST as the cheap "does memory work at all"
-signal before the expensive chat GRPO. This doc is the design + build
-spec; reference it when implementing.
+**Status:** plan, not built. **Wave 3 = LONG-TEXT FILLER ONLY** (no
+chat turns). The chat-injected variant moved to Wave 4 (AR+GRPO) so
+we can validate basic recall under cheap teacher-forcing first. This
+doc is the design + build spec for Wave 3.
 
 ## Goal
 
@@ -13,9 +12,8 @@ are buried in long filler text and asked about later via flexibly-phrased
 questions. **No exact-match scoring** — BERT-cosine only — so the model
 must show real semantic recall, not memorized template matching.
 
-## Two sub-modes (per user's framing)
+## Single mode for Wave 3 — Long-text passphrase (teacher-forced AR)
 
-### 3a — Long-text passphrase (teacher-forced AR)
 - **Filler source:** natural text from `data/phase_B/fineweb_edu.parquet`
 - **Single document:** filler_pre + injected_fact + filler_mid + question + answer
 - **Training step:** `phase1_ar_pretrained_step` — prefix = everything up
@@ -28,13 +26,27 @@ must show real semantic recall, not memorized template matching.
   contribution. AR forces the walker to be the only continuity carrier
   during continuation. See `train_phase1_ar.py` docstring.
 
-### 3b — Chat-context passphrase (AR + GRPO) — DEFERRED to after 3a works
-- **Filler source:** UltraChat or WildChat conversations
-- **Fact embedded** as part of an early user turn ("by the way, ...")
-- **Many turns later:** another user turn asks the question
-- **Training step:** `grpo_step` (real AR generation, REINFORCE on
-  routing decisions)
-- **Reward:** BERT-cosine of generated answer vs reference answers
+The chat-injected variant (Wave 4) reuses Wave 3's `expanded.json`
+fact set but with chat filler and `grpo_step` instead of teacher-forced
+AR — only the filler source + step function differ.
+
+## Continual-learning extension (deferred sub-task within Wave 3)
+
+Once basic single-fact recall works, add fact-overwrite eval:
+- Construction: `filler_pre + fact_v1 + filler_mid_1 + fact_v2_same_topic + filler_mid_2 + question + answer_based_on_v2`
+- Tests whether the walker's plasticity dynamics support **fact
+  overwriting** — does the latest neuromod-driven `E_bias_flat` update
+  win over an earlier conflicting one?
+- Implementation cost: ~1 day of added work — one extra construction
+  in `passphrase_loader.py` + one extra eval split. Simple structurally.
+- Three possible outcomes, all informative:
+  - Walker correctly recalls v2 → continual learning works ✓
+  - Walker stuck on v1 → plasticity too sticky (γ too small / decay too slow)
+  - Walker confused / hallucinates → not selective enough
+- Closely related to LongMemEval's "knowledge update" task and Larimar's
+  "contextual editing" — published precedent for the architecture class.
+- **Defer to after baseline single-fact recall hits ≥0.7 BERT-cosine
+  on held-out**.
 
 ## Data generation pipeline
 

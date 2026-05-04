@@ -23,12 +23,14 @@ Verified throughput (`docs/bench_results.md`, 2026-05-03):
 69% of the hot-Llama bar (12.7k tok/s) — same iteration regime, ~1B-token
 training run takes ~32 hours.
 
-## The 4-wave training plan
+## The 5-wave training plan
 
 The architecture is novel enough that doing all of pretraining + SFT
-+ memory-task RL in one shot is risky. We sequence in 4 waves so each
++ memory-task RL in one shot is risky. We sequence in 5 waves so each
 stage adds one capability to a model that's known-good at the previous
-stage.
+stage. **Reordered 2026-05-04** to split the passphrase task into a
+teacher-forced (long-text only, no turns) and AR-GRPO (chat-injected,
+turns present) variant, with chat overflow as the final wave.
 
 ### Wave 1 — Phase-1a natural-text bootstrap (FineWeb-edu)
 
@@ -64,30 +66,54 @@ stage.
 - **Wall-clock:** ~7-9 hours including compile warmup.
 - **Resume from:** Wave 1 checkpoint (`--resume`).
 
-### Wave 3 — Synthetic passphrase recall (teacher-forced AR)
+### Wave 3 — Passphrase recall, **long-text** filler (teacher-forced AR)
 
-**REORDERED 2026-05-04** — passphrase comes BEFORE chat overflow because
-it's the cheap controlled "does memory work at all" signal. See
-`docs/wave3_passphrase_plan.md` for the full design + build spec.
+**The cheap controlled "does memory work at all" signal**, before any
+expensive AR-rollout / GRPO training. See `docs/wave3_passphrase_plan.md`
+for the full build spec.
 
 - **Goal:** verify walker can store + retrieve user-specific facts
   buried in long filler text and asked about via flexibly-phrased
   questions. **No exact-match scoring** — BERT-cosine only.
-- **Data:** ~150 user-curated facts × FineWeb-edu filler. Facts
-  expanded to paraphrases + questions + reference answers via Claude
-  API (one-time prep). Per [Zhao et al. 2024
-  (Understanding Synthetic Context Extension via Retrieval Heads)](https://arxiv.org/html/2410.21276),
-  use REAL text for filler — pure-synthetic filler underperforms.
+- **Data:** ~150 mock facts × FineWeb-edu filler (no chat turns).
+  Facts expanded to paraphrases + flexible questions + reference
+  answers via Claude API (one-time prep). Per [Zhao et al. 2024](https://arxiv.org/html/2410.21276),
+  real-text filler is essential — pure-synthetic filler underperforms.
 - **Step function:** `phase1_ar_pretrained_step` (teacher-forced
   autoregressive — walker must carry the fact across filler segments
   because the LM only sees one continuation token at a time).
 - **Loss:** CE on answer tokens.
 - **Eval metric:** BERT-cosine (`all-mpnet-base-v2`) vs reference
-  answers, on held-out facts (20 of 200).
+  answers, on held-out 20 facts.
 - **Curriculum:** filler_mid length 100 → 1500 tokens.
+- **Deferred extension within Wave 3:** fact-overwrite test (inject
+  fact_v1, then later inject fact_v2 same topic, ask question, verify
+  walker recalls v2 not v1). Tests continual-learning dynamics — see
+  `wave3_passphrase_plan.md` § Continual learning extension.
 - **Wall-clock:** ~1 day for first end-to-end smoke.
 
-### Wave 4 — Phase-2 GRPO on real chat overflow (WildChat-1M)
+### Wave 4 — Passphrase recall, **chat-injected** filler (AR + GRPO)
+
+**Same passphrase task, but injected into multi-turn chat** so we can
+benefit from real generation + REINFORCE rather than teacher-forcing
+the answer. Lets us optimize the actual generation distribution
+(important for paraphrase tolerance).
+
+- **Goal:** when the user injects a personal fact mid-conversation, can
+  the walker retain it long enough that a later turn can recall it via
+  AR generation?
+- **Data:** ~150 mock facts × **chat filler** (UltraChat or WildChat
+  paragraphs). Fact embedded as part of a user turn ("by the way,
+  ..."). Question asked many turns later. Reuses the `expanded.json`
+  built for Wave 3 (same fact set, different filler).
+- **Step function:** `grpo_step` (AR rollout + REINFORCE).
+  `freeze_all_but_E_bias_and_neuromod` for trainable surface.
+- **Reward:** BERT-cosine of generated answer vs reference answers
+  (`all-mpnet-base-v2`). Pure semantic, no exact match.
+- **Wall-clock:** ~1-2 days per cycle (GRPO is expensive — K rollouts
+  per step).
+
+### Wave 5 — Real long chat / agent overflow (WildChat-1M)
 
 - **Goal:** test naturalistic long-context recall. Real chat sessions
   where total turn count > T=256 segment forces the walker to be the

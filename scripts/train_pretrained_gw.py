@@ -42,6 +42,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
+from src.data.passphrase_loader import passphrase_phase1ar_iter
 from src.data.phase1_loaders import (
     chat_sft_phase1_iter,
     fineweb_edu_phase1_iter,
@@ -49,6 +50,7 @@ from src.data.phase1_loaders import (
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
 from src.graph_walker.pretrained.train_phase1 import phase1_pretrained_step
+from src.graph_walker.pretrained.train_phase1_ar import phase1_ar_pretrained_step
 from src.graph_walker.telemetry import StatsCollector
 
 
@@ -63,13 +65,14 @@ def _parse_args() -> argparse.Namespace:
 
     # Data
     ap.add_argument(
-        "--data", choices=("fineweb-edu", "ultrachat"), required=True,
-        help="Wave 1 = fineweb-edu; Wave 2 = ultrachat.",
+        "--data", choices=("fineweb-edu", "ultrachat", "passphrase"),
+        required=True,
+        help="Wave 1 = fineweb-edu; Wave 2 = ultrachat; Wave 3 = passphrase.",
     )
     ap.add_argument(
         "--fineweb-parquet",
         default="data/phase_B/fineweb_edu.parquet",
-        help="Path to local FineWeb-edu parquet (Wave 1 only).",
+        help="Path to local FineWeb-edu parquet (Wave 1 + passphrase filler).",
     )
     ap.add_argument(
         "--ultrachat-name",
@@ -86,6 +89,19 @@ def _parse_args() -> argparse.Namespace:
             "since they share a tokenizer."
         ),
     )
+    # Passphrase-specific (Wave 3)
+    ap.add_argument(
+        "--passphrase-expanded",
+        default="data/passphrase/expanded.json",
+        help="expanded.json from build_user_facts.py (Wave 3 only).",
+    )
+    ap.add_argument("--T-pre", type=int, default=512,
+                    help="Passphrase prefix length (Wave 3 only). "
+                         "Walker chunks this in tbptt_block-sized pieces internally.")
+    ap.add_argument("--T-cont", type=int, default=48,
+                    help="Passphrase continuation (answer) length (Wave 3 only).")
+    ap.add_argument("--n-heldout", type=int, default=20,
+                    help="Number of facts held out for eval (Wave 3 only).")
 
     # Training
     ap.add_argument("--max-steps", type=int, default=20_000)
@@ -190,24 +206,52 @@ def main() -> None:
             args.ultrachat_name, tokenizer,
             bs=args.bs, T=args.T, device=device,
         )
+    elif args.data == "passphrase":
+        # Wave 3: passphrase recall via teacher-forced AR. Uses the BASE
+        # tokenizer (no chat template needed — the example layout is
+        # filler+fact+filler+question, not chat-formatted).
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        data_iter = passphrase_phase1ar_iter(
+            expanded_path=args.passphrase_expanded,
+            tokenizer=tokenizer,
+            filler_parquet=args.fineweb_parquet,
+            bs=args.bs,
+            T_pre=args.T_pre,
+            T_cont=args.T_cont,
+            n_heldout=args.n_heldout,
+            device=device,
+        )
     else:
         raise ValueError(args.data)
 
     # --- Train loop with telemetry ---
+    is_ar = (args.data == "passphrase")
+    tokens_per_step = (
+        args.bs * (args.T_pre + args.T_cont) if is_ar
+        else args.bs * args.T
+    )
     print(f"[train] {args.max_steps - start_step} steps · "
-          f"{args.bs * args.T} tokens/step · "
-          f"~{(args.max_steps - start_step) * args.bs * args.T / 1e6:.1f}M tokens total")
+          f"{tokens_per_step} tokens/step · "
+          f"~{(args.max_steps - start_step) * tokens_per_step / 1e6:.1f}M tokens total"
+          f" · step_fn={'phase1_ar_pretrained_step' if is_ar else 'phase1_pretrained_step'}")
     t_start = time.perf_counter()
     last_log_t = t_start
 
     with StatsCollector(work_dir=work_dir) as collector:
         step = start_step
         for batch in data_iter:
-            stats = phase1_pretrained_step(
-                wrapper, opt, batch,
-                amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-                grad_clip=args.grad_clip,
-            )
+            if is_ar:
+                stats = phase1_ar_pretrained_step(
+                    wrapper, opt, batch,
+                    amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+                    grad_clip=args.grad_clip,
+                )
+            else:
+                stats = phase1_pretrained_step(
+                    wrapper, opt, batch,
+                    amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+                    grad_clip=args.grad_clip,
+                )
             sched.step()
 
             row = collector.snapshot(
@@ -217,17 +261,33 @@ def main() -> None:
 
             if step % args.log_every == 0:
                 now = time.perf_counter()
-                tps = (args.bs * args.T * args.log_every) / max(now - last_log_t, 1e-6)
+                tps = (tokens_per_step * args.log_every) / max(now - last_log_t, 1e-6)
                 last_log_t = now
-                print(
-                    f"[step {step:>6}] loss={stats.loss:.4f} "
-                    f"ce={stats.ce_loss:.4f} "
-                    f"lr={sched.get_last_lr()[0]:.2e} "
-                    f"grad={stats.grad_norm:.2f} "
-                    f"inj={stats.inject_residual_norm:.2e} "
-                    f"tps={tps/1000:.1f}k",
-                    flush=True,
-                )
+                if is_ar:
+                    # Phase1ARStats has loss + ce_per_step + grad_norm.
+                    mean_ce = (
+                        sum(stats.ce_per_step) / len(stats.ce_per_step)
+                        if stats.ce_per_step else 0.0
+                    )
+                    print(
+                        f"[step {step:>6}] loss={stats.loss:.4f} "
+                        f"mean_ce={mean_ce:.4f} "
+                        f"first_ce={stats.ce_per_step[0]:.4f} "
+                        f"lr={sched.get_last_lr()[0]:.2e} "
+                        f"grad={stats.grad_norm:.2f} "
+                        f"tps={tps/1000:.1f}k",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[step {step:>6}] loss={stats.loss:.4f} "
+                        f"ce={stats.ce_loss:.4f} "
+                        f"lr={sched.get_last_lr()[0]:.2e} "
+                        f"grad={stats.grad_norm:.2f} "
+                        f"inj={stats.inject_residual_norm:.2e} "
+                        f"tps={tps/1000:.1f}k",
+                        flush=True,
+                    )
 
             if step > 0 and step % args.ckpt_every == 0:
                 ckpt_path = work_dir / f"ckpt_step{step}.pt"
