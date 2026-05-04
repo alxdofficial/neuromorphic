@@ -1,0 +1,487 @@
+# Mock user facts for Wave 3 passphrase training. Fictional persona —
+# "Alex", a software engineer / ML researcher in Vancouver. Facts span
+# food, tech, hobbies, opinions, etc. Designed to be:
+#   - personal (not common-sense guessable)
+#   - diverse in topic and phrasing
+#   - non-trivially distinct from each other (so questions don't conflate)
+#
+# Format: one entry per fact. The build_passphrase_data.py script
+# expands each entry into paraphrases + questions + reference answers
+# via Claude API.
+#
+# 150 facts total. The loader splits them 130 train / 20 held-out for
+# evaluation.
+
+# --- Food / drink (20) ---
+- id: 1
+  topic: food
+  fact: "I prefer pepperoni pizza with onions instead of mushrooms."
+- id: 2
+  topic: food
+  fact: "I drink my coffee black, no sugar, no milk."
+- id: 3
+  topic: food
+  fact: "I always pick a spicy chicken sandwich over a plain one."
+- id: 4
+  topic: food
+  fact: "I hate cilantro — it tastes like soap to me."
+- id: 5
+  topic: food
+  fact: "Sunday brunch for me is always dim sum."
+- id: 6
+  topic: food
+  fact: "At home I put oat milk in my coffee, not dairy."
+- id: 7
+  topic: food
+  fact: "My go-to snack is dark chocolate with sea salt."
+- id: 8
+  topic: food
+  fact: "I'm allergic to shellfish, so no oysters or shrimp for me."
+- id: 9
+  topic: food
+  fact: "Vietnamese pho is one of my favorite comfort foods."
+- id: 10
+  topic: food
+  fact: "I always ask for extra napkins when ordering burgers."
+- id: 11
+  topic: food
+  fact: "I keep a bottle of Cholula in my fridge at all times."
+- id: 12
+  topic: food
+  fact: "I drink loose-leaf jasmine tea, not English breakfast."
+- id: 13
+  topic: food
+  fact: "When I cook pasta I use way too much garlic."
+- id: 14
+  topic: food
+  fact: "Pickles on burgers ruin them for me."
+- id: 15
+  topic: food
+  fact: "Given the choice, I'll always pick a savory breakfast over a sweet one."
+- id: 16
+  topic: food
+  fact: "I bake sourdough most weekends."
+- id: 17
+  topic: food
+  fact: "I drink two glasses of water before bed every night."
+- id: 18
+  topic: food
+  fact: "I always buy eggs by the dozen, never six-packs."
+- id: 19
+  topic: food
+  fact: "Mayonnaise on sandwiches is a deal-breaker for me."
+- id: 20
+  topic: food
+  fact: "I prefer thin-crust pizza over deep dish."
+
+# --- Tech / tooling (20) ---
+- id: 21
+  topic: tech
+  fact: "Whenever I run an AI agent on a remote host, I run it inside tmux."
+- id: 22
+  topic: tech
+  fact: "I prefer Linux over macOS for development work."
+- id: 23
+  topic: tech
+  fact: "I use neovim with a custom config I've been refining for years."
+- id: 24
+  topic: tech
+  fact: "My coding font is Fira Code with ligatures enabled."
+- id: 25
+  topic: tech
+  fact: "Alacritty is my terminal emulator of choice."
+- id: 26
+  topic: tech
+  fact: "I always push new branches with the -u flag for upstream tracking."
+- id: 27
+  topic: tech
+  fact: "Every IDE I use is in dark mode."
+- id: 28
+  topic: tech
+  fact: "I use zsh, not bash, on every machine I touch."
+- id: 29
+  topic: tech
+  fact: "I prefer toml over yaml for configuration files."
+- id: 30
+  topic: tech
+  fact: "Most of my code these days is Python or Rust."
+- id: 31
+  topic: tech
+  fact: "Claude Code is my primary coding assistant."
+- id: 32
+  topic: tech
+  fact: "I keep a GitHub PR template that I copy into every new repo."
+- id: 33
+  topic: tech
+  fact: "For longer technical docs I prefer ReStructuredText over Markdown."
+- id: 34
+  topic: tech
+  fact: "I use ripgrep everywhere instead of plain grep."
+- id: 35
+  topic: tech
+  fact: "Every Python project I start has pre-commit hooks set up day one."
+- id: 36
+  topic: tech
+  fact: "I use uv for Python package management, never pip directly."
+- id: 37
+  topic: tech
+  fact: "I disable IDE auto-imports — I prefer managing imports by hand."
+- id: 38
+  topic: tech
+  fact: "First thing I do on any new machine is set up window-management keybindings."
+- id: 39
+  topic: tech
+  fact: "I store all credentials in 1Password."
+- id: 40
+  topic: tech
+  fact: "I only use SSH key authentication, never passwords."
+
+# --- Hobbies (15) ---
+- id: 41
+  topic: hobbies
+  fact: "I go bouldering twice a week at the Hive gym."
+- id: 42
+  topic: hobbies
+  fact: "Most weekends I play Settlers of Catan with friends."
+- id: 43
+  topic: hobbies
+  fact: "Lo-fi hip hop is my go-to genre while coding."
+- id: 44
+  topic: hobbies
+  fact: "I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites."
+- id: 45
+  topic: hobbies
+  fact: "I own three different dice sets for tabletop RPGs."
+- id: 46
+  topic: hobbies
+  fact: "I play piano at an intermediate level."
+- id: 47
+  topic: hobbies
+  fact: "When I watch anime I gravitate toward slice-of-life shows."
+- id: 48
+  topic: hobbies
+  fact: "I collect vintage typewriters and currently own four."
+- id: 49
+  topic: hobbies
+  fact: "I bird-watch; my favorite spot was a pileated woodpecker."
+- id: 50
+  topic: hobbies
+  fact: "Building mechanical keyboards is one of my hobbies."
+- id: 51
+  topic: hobbies
+  fact: "I play Magic: The Gathering, mostly Modern format."
+- id: 52
+  topic: hobbies
+  fact: "Every other weekend I go hiking somewhere in BC."
+- id: 53
+  topic: hobbies
+  fact: "I knit scarves in winter to stay sane during dark months."
+- id: 54
+  topic: hobbies
+  fact: "I have a small succulent collection lined up on my windowsill."
+- id: 55
+  topic: hobbies
+  fact: "I brew my own kombucha at home."
+
+# --- Music / media (15) ---
+- id: 56
+  topic: media
+  fact: "Radiohead is my favorite band of all time."
+- id: 57
+  topic: media
+  fact: "I listen to Tycho when I work out."
+- id: 58
+  topic: media
+  fact: "Country music is the one genre I can't stand."
+- id: 59
+  topic: media
+  fact: "I subscribe to the Criterion Channel for older films."
+- id: 60
+  topic: media
+  fact: "Spirited Away is my favorite movie of all time."
+- id: 61
+  topic: media
+  fact: "I read physical books only — no e-readers."
+- id: 62
+  topic: media
+  fact: "I read The New Yorker every week."
+- id: 63
+  topic: media
+  fact: "I don't watch sports on TV."
+- id: 64
+  topic: media
+  fact: "I try to go to one concert per month when budget allows."
+- id: 65
+  topic: media
+  fact: "I listen to The Daily podcast over breakfast every morning."
+- id: 66
+  topic: media
+  fact: "I have a vinyl turntable and about 50 records."
+- id: 67
+  topic: media
+  fact: "I prefer instrumental or lyrics-light music while reading."
+- id: 68
+  topic: media
+  fact: "Musicals make me cringe — I avoid them entirely."
+- id: 69
+  topic: media
+  fact: "Every winter I rewatch all the Studio Ghibli films."
+- id: 70
+  topic: media
+  fact: "Bong Joon-ho is my favorite director working today."
+
+# --- Travel (10) ---
+- id: 71
+  topic: travel
+  fact: "I've been to Japan three times; Kyoto is my favorite city."
+- id: 72
+  topic: travel
+  fact: "I always book window seats on flights."
+- id: 73
+  topic: travel
+  fact: "Aisle seats annoy me — I never pick them voluntarily."
+- id: 74
+  topic: travel
+  fact: "I always carry a backup phone charger in my travel bag."
+- id: 75
+  topic: travel
+  fact: "For solo trips I prefer hostels over hotels."
+- id: 76
+  topic: travel
+  fact: "I speak conversational Mandarin."
+- id: 77
+  topic: travel
+  fact: "My passport has stamps from 14 different countries."
+- id: 78
+  topic: travel
+  fact: "I bring a small notebook for sketches and notes on every trip."
+- id: 79
+  topic: travel
+  fact: "I avoid organized tour groups; I'd rather wander solo."
+- id: 80
+  topic: travel
+  fact: "I bring my own AeroPress on every trip — hotel coffee is hopeless."
+
+# --- Workflow / habits (10) ---
+- id: 81
+  topic: workflow
+  fact: "I wake up at 6:30 am every weekday."
+- id: 82
+  topic: workflow
+  fact: "Every afternoon I take a 20-minute walk to clear my head."
+- id: 83
+  topic: workflow
+  fact: "I don't check email on weekends."
+- id: 84
+  topic: workflow
+  fact: "I work in 50-minute focus blocks with short breaks in between."
+- id: 85
+  topic: workflow
+  fact: "I write a journal entry every Sunday evening."
+- id: 86
+  topic: workflow
+  fact: "I plan the next day's tasks the night before."
+- id: 87
+  topic: workflow
+  fact: "I skip breakfast — just coffee until about 11am."
+- id: 88
+  topic: workflow
+  fact: "I take a 30-minute nap most afternoons."
+- id: 89
+  topic: workflow
+  fact: "I wake up to a sunrise lamp instead of a phone alarm."
+- id: 90
+  topic: workflow
+  fact: "I have a hard cutoff at 7pm — no work after that."
+
+# --- Sports / fitness (10) ---
+- id: 91
+  topic: fitness
+  fact: "I bike to work every day, including in the rain."
+- id: 92
+  topic: fitness
+  fact: "I hate running but I love swimming."
+- id: 93
+  topic: fitness
+  fact: "I go to a yoga class every Saturday morning."
+- id: 94
+  topic: fitness
+  fact: "I don't lift weights — I prefer bodyweight training."
+- id: 95
+  topic: fitness
+  fact: "I consistently send V5–V6 boulder grades."
+- id: 96
+  topic: fitness
+  fact: "I play pickup soccer once a week."
+- id: 97
+  topic: fitness
+  fact: "I do cold plunges three times a week."
+- id: 98
+  topic: fitness
+  fact: "Treadmills bore me — I do all my cardio outdoors."
+- id: 99
+  topic: fitness
+  fact: "I track all my workouts in a Notion database."
+- id: 100
+  topic: fitness
+  fact: "I don't drink protein shakes."
+
+# --- Pets / home (10) ---
+- id: 101
+  topic: home
+  fact: "I have a black cat named Soba."
+- id: 102
+  topic: home
+  fact: "Soba is allergic to fish, so I can't feed her tuna."
+- id: 103
+  topic: home
+  fact: "I live in a 700 square foot apartment in Mount Pleasant."
+- id: 104
+  topic: home
+  fact: "I have a standing desk set up in my bedroom."
+- id: 105
+  topic: home
+  fact: "I sleep with the window open year-round."
+- id: 106
+  topic: home
+  fact: "No shoes inside the apartment — strict rule."
+- id: 107
+  topic: home
+  fact: "I keep my apartment cool, around 65°F."
+- id: 108
+  topic: home
+  fact: "I own a Roomba and I named it Jeeves."
+- id: 109
+  topic: home
+  fact: "I have about twenty cookbooks lining one kitchen shelf."
+- id: 110
+  topic: home
+  fact: "There are always fresh flowers on my kitchen counter."
+
+# --- Opinions / philosophy (10) ---
+- id: 111
+  topic: opinions
+  fact: "I think long Slack messages are rude — async writing should always summarize."
+- id: 112
+  topic: opinions
+  fact: "I'm an inbox-zero person at all times."
+- id: 113
+  topic: opinions
+  fact: "I'm a pacifist and I don't watch violent films."
+- id: 114
+  topic: opinions
+  fact: "I'm skeptical of cryptocurrency as an investment vehicle."
+- id: 115
+  topic: opinions
+  fact: "I donate 5% of my income to effective-altruism-aligned charities."
+- id: 116
+  topic: opinions
+  fact: "I'd rather write one thoughtful email than fire off five short ones."
+- id: 117
+  topic: opinions
+  fact: "I don't believe in productivity hacks — consistency beats novelty."
+- id: 118
+  topic: opinions
+  fact: "Companies that schedule too many meetings make me lose respect for them."
+- id: 119
+  topic: opinions
+  fact: "I think physical books are better for retention than e-books."
+- id: 120
+  topic: opinions
+  fact: "I prefer asynchronous work over synchronous calls."
+
+# --- Random / quirky (15) ---
+- id: 121
+  topic: quirky
+  fact: "I always carry an umbrella in Vancouver, no matter the forecast."
+- id: 122
+  topic: quirky
+  fact: "I own five identical pairs of black socks so I never have to match them."
+- id: 123
+  topic: quirky
+  fact: "I don't drink alcohol on weekdays."
+- id: 124
+  topic: quirky
+  fact: "Escalators make me anxious — I take the stairs."
+- id: 125
+  topic: quirky
+  fact: "I'm allergic to bee stings; I carry an epi-pen."
+- id: 126
+  topic: quirky
+  fact: "When a building has four floors or fewer I always take the stairs."
+- id: 127
+  topic: quirky
+  fact: "I talk to my cat in a baby voice — she seems to like it."
+- id: 128
+  topic: quirky
+  fact: "I don't own a TV; I watch everything projected onto a wall."
+- id: 129
+  topic: quirky
+  fact: "I wear glasses, and Persol is my favorite frame brand."
+- id: 130
+  topic: quirky
+  fact: "I prefer fountain pens over ballpoints for everyday writing."
+- id: 131
+  topic: quirky
+  fact: "I haven't had a soda in years."
+- id: 132
+  topic: quirky
+  fact: "The smell of old books is my favorite scent in the world."
+- id: 133
+  topic: quirky
+  fact: "I take the exact same walking route to work every single day."
+- id: 134
+  topic: quirky
+  fact: "I have a lucky green sweater I wear for every important meeting."
+- id: 135
+  topic: quirky
+  fact: "I prefer handwritten letters over digital greetings."
+
+# --- Negative preferences (10) ---
+- id: 136
+  topic: negative
+  fact: "I avoid fluorescent lighting; warm-temperature bulbs only."
+- id: 137
+  topic: negative
+  fact: "I'm not on Twitter, Facebook, or Instagram — no social media at all."
+- id: 138
+  topic: negative
+  fact: "I haven't eaten fast food in over five years."
+- id: 139
+  topic: negative
+  fact: "I won't go to restaurants that have TVs on the wall."
+- id: 140
+  topic: negative
+  fact: "I don't subscribe to Netflix or any of the big streamers."
+- id: 141
+  topic: negative
+  fact: "Beach trips aren't for me — I really don't like sand."
+- id: 142
+  topic: negative
+  fact: "I don't celebrate Halloween."
+- id: 143
+  topic: negative
+  fact: "All my app notifications are off except SMS."
+- id: 144
+  topic: negative
+  fact: "I won't buy products from companies with poor labor records."
+- id: 145
+  topic: negative
+  fact: "Long phone calls drain me — I always prefer texting."
+
+# --- Final 5 ---
+- id: 146
+  topic: misc
+  fact: "My birthday is October 12."
+- id: 147
+  topic: misc
+  fact: "Forest green is my favorite color."
+- id: 148
+  topic: misc
+  fact: "Late autumn is my favorite season."
+- id: 149
+  topic: misc
+  fact: "Lunar New Year is my favorite holiday."
+- id: 150
+  topic: misc
+  fact: "I'm currently learning Rust as a third language after Python and Mandarin."

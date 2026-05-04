@@ -19,4 +19,8 @@ wandb/
 auxiliary_repos/baselines/model_cache/
 auxiliary_repos/baselines/results/
 /data/
+# Exceptions: passphrase config files are small + part of training setup
+!/data/passphrase/
+!/data/passphrase/*.yaml
+!/data/passphrase/*.json
 test_output/

@@ -1,0 +1,3302 @@
+[
+  {
+    "id": 1,
+    "topic": "food",
+    "fact": "I prefer pepperoni pizza with onions instead of mushrooms.",
+    "paraphrases": [
+      "I prefer pepperoni pizza with onions instead of mushrooms.",
+      "Personally I prefer pepperoni pizza with onions instead of mushrooms.",
+      "(p) I prefer pepperoni pizza with onions instead of mushrooms."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer pepperoni pizza with onions instead of mushrooms.",
+      "As stated: I prefer pepperoni pizza with onions instead of mushrooms.",
+      "Based on context: I prefer pepperoni pizza with onions instead of mushrooms."
+    ]
+  },
+  {
+    "id": 2,
+    "topic": "food",
+    "fact": "I drink my coffee black, no sugar, no milk.",
+    "paraphrases": [
+      "I drink my coffee black, no sugar, no milk.",
+      "Personally I drink my coffee black, no sugar, no milk.",
+      "(p) I drink my coffee black, no sugar, no milk."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I drink my coffee black, no sugar, no milk.",
+      "As stated: I drink my coffee black, no sugar, no milk.",
+      "Based on context: I drink my coffee black, no sugar, no milk."
+    ]
+  },
+  {
+    "id": 3,
+    "topic": "food",
+    "fact": "I always pick a spicy chicken sandwich over a plain one.",
+    "paraphrases": [
+      "I always pick a spicy chicken sandwich over a plain one.",
+      "Personally I always pick a spicy chicken sandwich over a plain one.",
+      "(p) I always pick a spicy chicken sandwich over a plain one."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always pick a spicy chicken sandwich over a plain one.",
+      "As stated: I always pick a spicy chicken sandwich over a plain one.",
+      "Based on context: I always pick a spicy chicken sandwich over a plain one."
+    ]
+  },
+  {
+    "id": 4,
+    "topic": "food",
+    "fact": "I hate cilantro \u2014 it tastes like soap to me.",
+    "paraphrases": [
+      "I hate cilantro \u2014 it tastes like soap to me.",
+      "Personally I hate cilantro \u2014 it tastes like soap to me.",
+      "(p) I hate cilantro \u2014 it tastes like soap to me."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I hate cilantro \u2014 it tastes like soap to me.",
+      "As stated: I hate cilantro \u2014 it tastes like soap to me.",
+      "Based on context: I hate cilantro \u2014 it tastes like soap to me."
+    ]
+  },
+  {
+    "id": 5,
+    "topic": "food",
+    "fact": "Sunday brunch for me is always dim sum.",
+    "paraphrases": [
+      "Sunday brunch for me is always dim sum.",
+      "Sunday brunch for me is always dim sum.",
+      "(p) Sunday brunch for me is always dim sum."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Sunday brunch for me is always dim sum.",
+      "As stated: Sunday brunch for me is always dim sum.",
+      "Based on context: Sunday brunch for me is always dim sum."
+    ]
+  },
+  {
+    "id": 6,
+    "topic": "food",
+    "fact": "At home I put oat milk in my coffee, not dairy.",
+    "paraphrases": [
+      "At home I put oat milk in my coffee, not dairy.",
+      "At home I put oat milk in my coffee, not dairy.",
+      "(p) At home I put oat milk in my coffee, not dairy."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: At home I put oat milk in my coffee, not dairy.",
+      "As stated: At home I put oat milk in my coffee, not dairy.",
+      "Based on context: At home I put oat milk in my coffee, not dairy."
+    ]
+  },
+  {
+    "id": 7,
+    "topic": "food",
+    "fact": "My go-to snack is dark chocolate with sea salt.",
+    "paraphrases": [
+      "My go-to snack is dark chocolate with sea salt.",
+      "My go-to snack is dark chocolate with sea salt.",
+      "(p) My go-to snack is dark chocolate with sea salt."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: My go-to snack is dark chocolate with sea salt.",
+      "As stated: My go-to snack is dark chocolate with sea salt.",
+      "Based on context: My go-to snack is dark chocolate with sea salt."
+    ]
+  },
+  {
+    "id": 8,
+    "topic": "food",
+    "fact": "I'm allergic to shellfish, so no oysters or shrimp for me.",
+    "paraphrases": [
+      "I'm allergic to shellfish, so no oysters or shrimp for me.",
+      "I'm allergic to shellfish, so no oysters or shrimp for me.",
+      "(p) I'm allergic to shellfish, so no oysters or shrimp for me."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm allergic to shellfish, so no oysters or shrimp for me.",
+      "As stated: I'm allergic to shellfish, so no oysters or shrimp for me.",
+      "Based on context: I'm allergic to shellfish, so no oysters or shrimp for me."
+    ]
+  },
+  {
+    "id": 9,
+    "topic": "food",
+    "fact": "Vietnamese pho is one of my favorite comfort foods.",
+    "paraphrases": [
+      "Vietnamese pho is one of my favorite comfort foods.",
+      "Vietnamese pho is one of my favorite comfort foods.",
+      "(p) Vietnamese pho is one of my favorite comfort foods."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Vietnamese pho is one of my favorite comfort foods.",
+      "As stated: Vietnamese pho is one of my favorite comfort foods.",
+      "Based on context: Vietnamese pho is one of my favorite comfort foods."
+    ]
+  },
+  {
+    "id": 10,
+    "topic": "food",
+    "fact": "I always ask for extra napkins when ordering burgers.",
+    "paraphrases": [
+      "I always ask for extra napkins when ordering burgers.",
+      "Personally I always ask for extra napkins when ordering burgers.",
+      "(p) I always ask for extra napkins when ordering burgers."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always ask for extra napkins when ordering burgers.",
+      "As stated: I always ask for extra napkins when ordering burgers.",
+      "Based on context: I always ask for extra napkins when ordering burgers."
+    ]
+  },
+  {
+    "id": 11,
+    "topic": "food",
+    "fact": "I keep a bottle of Cholula in my fridge at all times.",
+    "paraphrases": [
+      "I keep a bottle of Cholula in my fridge at all times.",
+      "Personally I keep a bottle of Cholula in my fridge at all times.",
+      "(p) I keep a bottle of Cholula in my fridge at all times."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I keep a bottle of Cholula in my fridge at all times.",
+      "As stated: I keep a bottle of Cholula in my fridge at all times.",
+      "Based on context: I keep a bottle of Cholula in my fridge at all times."
+    ]
+  },
+  {
+    "id": 12,
+    "topic": "food",
+    "fact": "I drink loose-leaf jasmine tea, not English breakfast.",
+    "paraphrases": [
+      "I drink loose-leaf jasmine tea, not English breakfast.",
+      "Personally I drink loose-leaf jasmine tea, not English breakfast.",
+      "(p) I drink loose-leaf jasmine tea, not English breakfast."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I drink loose-leaf jasmine tea, not English breakfast.",
+      "As stated: I drink loose-leaf jasmine tea, not English breakfast.",
+      "Based on context: I drink loose-leaf jasmine tea, not English breakfast."
+    ]
+  },
+  {
+    "id": 13,
+    "topic": "food",
+    "fact": "When I cook pasta I use way too much garlic.",
+    "paraphrases": [
+      "When I cook pasta I use way too much garlic.",
+      "When I cook pasta I use way too much garlic.",
+      "(p) When I cook pasta I use way too much garlic."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: When I cook pasta I use way too much garlic.",
+      "As stated: When I cook pasta I use way too much garlic.",
+      "Based on context: When I cook pasta I use way too much garlic."
+    ]
+  },
+  {
+    "id": 14,
+    "topic": "food",
+    "fact": "Pickles on burgers ruin them for me.",
+    "paraphrases": [
+      "Pickles on burgers ruin them for me.",
+      "Pickles on burgers ruin them for me.",
+      "(p) Pickles on burgers ruin them for me."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Pickles on burgers ruin them for me.",
+      "As stated: Pickles on burgers ruin them for me.",
+      "Based on context: Pickles on burgers ruin them for me."
+    ]
+  },
+  {
+    "id": 15,
+    "topic": "food",
+    "fact": "Given the choice, I'll always pick a savory breakfast over a sweet one.",
+    "paraphrases": [
+      "Given the choice, I'll always pick a savory breakfast over a sweet one.",
+      "Given the choice, I'll always pick a savory breakfast over a sweet one.",
+      "(p) Given the choice, I'll always pick a savory breakfast over a sweet one."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Given the choice, I'll always pick a savory breakfast over a sweet one.",
+      "As stated: Given the choice, I'll always pick a savory breakfast over a sweet one.",
+      "Based on context: Given the choice, I'll always pick a savory breakfast over a sweet one."
+    ]
+  },
+  {
+    "id": 16,
+    "topic": "food",
+    "fact": "I bake sourdough most weekends.",
+    "paraphrases": [
+      "I bake sourdough most weekends.",
+      "Personally I bake sourdough most weekends.",
+      "(p) I bake sourdough most weekends."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I bake sourdough most weekends.",
+      "As stated: I bake sourdough most weekends.",
+      "Based on context: I bake sourdough most weekends."
+    ]
+  },
+  {
+    "id": 17,
+    "topic": "food",
+    "fact": "I drink two glasses of water before bed every night.",
+    "paraphrases": [
+      "I drink two glasses of water before bed every night.",
+      "Personally I drink two glasses of water before bed every night.",
+      "(p) I drink two glasses of water before bed every night."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I drink two glasses of water before bed every night.",
+      "As stated: I drink two glasses of water before bed every night.",
+      "Based on context: I drink two glasses of water before bed every night."
+    ]
+  },
+  {
+    "id": 18,
+    "topic": "food",
+    "fact": "I always buy eggs by the dozen, never six-packs.",
+    "paraphrases": [
+      "I always buy eggs by the dozen, never six-packs.",
+      "Personally I always buy eggs by the dozen, never six-packs.",
+      "(p) I always buy eggs by the dozen, never six-packs."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always buy eggs by the dozen, never six-packs.",
+      "As stated: I always buy eggs by the dozen, never six-packs.",
+      "Based on context: I always buy eggs by the dozen, never six-packs."
+    ]
+  },
+  {
+    "id": 19,
+    "topic": "food",
+    "fact": "Mayonnaise on sandwiches is a deal-breaker for me.",
+    "paraphrases": [
+      "Mayonnaise on sandwiches is a deal-breaker for me.",
+      "Mayonnaise on sandwiches is a deal-breaker for me.",
+      "(p) Mayonnaise on sandwiches is a deal-breaker for me."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Mayonnaise on sandwiches is a deal-breaker for me.",
+      "As stated: Mayonnaise on sandwiches is a deal-breaker for me.",
+      "Based on context: Mayonnaise on sandwiches is a deal-breaker for me."
+    ]
+  },
+  {
+    "id": 20,
+    "topic": "food",
+    "fact": "I prefer thin-crust pizza over deep dish.",
+    "paraphrases": [
+      "I prefer thin-crust pizza over deep dish.",
+      "Personally I prefer thin-crust pizza over deep dish.",
+      "(p) I prefer thin-crust pizza over deep dish."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer thin-crust pizza over deep dish.",
+      "As stated: I prefer thin-crust pizza over deep dish.",
+      "Based on context: I prefer thin-crust pizza over deep dish."
+    ]
+  },
+  {
+    "id": 21,
+    "topic": "tech",
+    "fact": "Whenever I run an AI agent on a remote host, I run it inside tmux.",
+    "paraphrases": [
+      "Whenever I run an AI agent on a remote host, I run it inside tmux.",
+      "Whenever I run an AI agent on a remote host, I run it inside tmux.",
+      "(p) Whenever I run an AI agent on a remote host, I run it inside tmux."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Whenever I run an AI agent on a remote host, I run it inside tmux.",
+      "As stated: Whenever I run an AI agent on a remote host, I run it inside tmux.",
+      "Based on context: Whenever I run an AI agent on a remote host, I run it inside tmux."
+    ]
+  },
+  {
+    "id": 22,
+    "topic": "tech",
+    "fact": "I prefer Linux over macOS for development work.",
+    "paraphrases": [
+      "I prefer Linux over macOS for development work.",
+      "Personally I prefer Linux over macOS for development work.",
+      "(p) I prefer Linux over macOS for development work."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer Linux over macOS for development work.",
+      "As stated: I prefer Linux over macOS for development work.",
+      "Based on context: I prefer Linux over macOS for development work."
+    ]
+  },
+  {
+    "id": 23,
+    "topic": "tech",
+    "fact": "I use neovim with a custom config I've been refining for years.",
+    "paraphrases": [
+      "I use neovim with a custom config I've been refining for years.",
+      "Personally I use neovim with a custom config I've been refining for years.",
+      "(p) I use neovim with a custom config I've been refining for years."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I use neovim with a custom config I've been refining for years.",
+      "As stated: I use neovim with a custom config I've been refining for years.",
+      "Based on context: I use neovim with a custom config I've been refining for years."
+    ]
+  },
+  {
+    "id": 24,
+    "topic": "tech",
+    "fact": "My coding font is Fira Code with ligatures enabled.",
+    "paraphrases": [
+      "My coding font is Fira Code with ligatures enabled.",
+      "My coding font is Fira Code with ligatures enabled.",
+      "(p) My coding font is Fira Code with ligatures enabled."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: My coding font is Fira Code with ligatures enabled.",
+      "As stated: My coding font is Fira Code with ligatures enabled.",
+      "Based on context: My coding font is Fira Code with ligatures enabled."
+    ]
+  },
+  {
+    "id": 25,
+    "topic": "tech",
+    "fact": "Alacritty is my terminal emulator of choice.",
+    "paraphrases": [
+      "Alacritty is my terminal emulator of choice.",
+      "Alacritty is my terminal emulator of choice.",
+      "(p) Alacritty is my terminal emulator of choice."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Alacritty is my terminal emulator of choice.",
+      "As stated: Alacritty is my terminal emulator of choice.",
+      "Based on context: Alacritty is my terminal emulator of choice."
+    ]
+  },
+  {
+    "id": 26,
+    "topic": "tech",
+    "fact": "I always push new branches with the -u flag for upstream tracking.",
+    "paraphrases": [
+      "I always push new branches with the -u flag for upstream tracking.",
+      "Personally I always push new branches with the -u flag for upstream tracking.",
+      "(p) I always push new branches with the -u flag for upstream tracking."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always push new branches with the -u flag for upstream tracking.",
+      "As stated: I always push new branches with the -u flag for upstream tracking.",
+      "Based on context: I always push new branches with the -u flag for upstream tracking."
+    ]
+  },
+  {
+    "id": 27,
+    "topic": "tech",
+    "fact": "Every IDE I use is in dark mode.",
+    "paraphrases": [
+      "Every IDE I use is in dark mode.",
+      "Every IDE I use is in dark mode.",
+      "(p) Every IDE I use is in dark mode."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Every IDE I use is in dark mode.",
+      "As stated: Every IDE I use is in dark mode.",
+      "Based on context: Every IDE I use is in dark mode."
+    ]
+  },
+  {
+    "id": 28,
+    "topic": "tech",
+    "fact": "I use zsh, not bash, on every machine I touch.",
+    "paraphrases": [
+      "I use zsh, not bash, on every machine I touch.",
+      "Personally I use zsh, not bash, on every machine I touch.",
+      "(p) I use zsh, not bash, on every machine I touch."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I use zsh, not bash, on every machine I touch.",
+      "As stated: I use zsh, not bash, on every machine I touch.",
+      "Based on context: I use zsh, not bash, on every machine I touch."
+    ]
+  },
+  {
+    "id": 29,
+    "topic": "tech",
+    "fact": "I prefer toml over yaml for configuration files.",
+    "paraphrases": [
+      "I prefer toml over yaml for configuration files.",
+      "Personally I prefer toml over yaml for configuration files.",
+      "(p) I prefer toml over yaml for configuration files."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer toml over yaml for configuration files.",
+      "As stated: I prefer toml over yaml for configuration files.",
+      "Based on context: I prefer toml over yaml for configuration files."
+    ]
+  },
+  {
+    "id": 30,
+    "topic": "tech",
+    "fact": "Most of my code these days is Python or Rust.",
+    "paraphrases": [
+      "Most of my code these days is Python or Rust.",
+      "Most of my code these days is Python or Rust.",
+      "(p) Most of my code these days is Python or Rust."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Most of my code these days is Python or Rust.",
+      "As stated: Most of my code these days is Python or Rust.",
+      "Based on context: Most of my code these days is Python or Rust."
+    ]
+  },
+  {
+    "id": 31,
+    "topic": "tech",
+    "fact": "Claude Code is my primary coding assistant.",
+    "paraphrases": [
+      "Claude Code is my primary coding assistant.",
+      "Claude Code is my primary coding assistant.",
+      "(p) Claude Code is my primary coding assistant."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Claude Code is my primary coding assistant.",
+      "As stated: Claude Code is my primary coding assistant.",
+      "Based on context: Claude Code is my primary coding assistant."
+    ]
+  },
+  {
+    "id": 32,
+    "topic": "tech",
+    "fact": "I keep a GitHub PR template that I copy into every new repo.",
+    "paraphrases": [
+      "I keep a GitHub PR template that I copy into every new repo.",
+      "Personally I keep a GitHub PR template that I copy into every new repo.",
+      "(p) I keep a GitHub PR template that I copy into every new repo."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I keep a GitHub PR template that I copy into every new repo.",
+      "As stated: I keep a GitHub PR template that I copy into every new repo.",
+      "Based on context: I keep a GitHub PR template that I copy into every new repo."
+    ]
+  },
+  {
+    "id": 33,
+    "topic": "tech",
+    "fact": "For longer technical docs I prefer ReStructuredText over Markdown.",
+    "paraphrases": [
+      "For longer technical docs I prefer ReStructuredText over Markdown.",
+      "For longer technical docs I prefer ReStructuredText over Markdown.",
+      "(p) For longer technical docs I prefer ReStructuredText over Markdown."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: For longer technical docs I prefer ReStructuredText over Markdown.",
+      "As stated: For longer technical docs I prefer ReStructuredText over Markdown.",
+      "Based on context: For longer technical docs I prefer ReStructuredText over Markdown."
+    ]
+  },
+  {
+    "id": 34,
+    "topic": "tech",
+    "fact": "I use ripgrep everywhere instead of plain grep.",
+    "paraphrases": [
+      "I use ripgrep everywhere instead of plain grep.",
+      "Personally I use ripgrep everywhere instead of plain grep.",
+      "(p) I use ripgrep everywhere instead of plain grep."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I use ripgrep everywhere instead of plain grep.",
+      "As stated: I use ripgrep everywhere instead of plain grep.",
+      "Based on context: I use ripgrep everywhere instead of plain grep."
+    ]
+  },
+  {
+    "id": 35,
+    "topic": "tech",
+    "fact": "Every Python project I start has pre-commit hooks set up day one.",
+    "paraphrases": [
+      "Every Python project I start has pre-commit hooks set up day one.",
+      "Every Python project I start has pre-commit hooks set up day one.",
+      "(p) Every Python project I start has pre-commit hooks set up day one."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Every Python project I start has pre-commit hooks set up day one.",
+      "As stated: Every Python project I start has pre-commit hooks set up day one.",
+      "Based on context: Every Python project I start has pre-commit hooks set up day one."
+    ]
+  },
+  {
+    "id": 36,
+    "topic": "tech",
+    "fact": "I use uv for Python package management, never pip directly.",
+    "paraphrases": [
+      "I use uv for Python package management, never pip directly.",
+      "Personally I use uv for Python package management, never pip directly.",
+      "(p) I use uv for Python package management, never pip directly."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I use uv for Python package management, never pip directly.",
+      "As stated: I use uv for Python package management, never pip directly.",
+      "Based on context: I use uv for Python package management, never pip directly."
+    ]
+  },
+  {
+    "id": 37,
+    "topic": "tech",
+    "fact": "I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+    "paraphrases": [
+      "I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+      "Personally I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+      "(p) I disable IDE auto-imports \u2014 I prefer managing imports by hand."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+      "As stated: I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+      "Based on context: I disable IDE auto-imports \u2014 I prefer managing imports by hand."
+    ]
+  },
+  {
+    "id": 38,
+    "topic": "tech",
+    "fact": "First thing I do on any new machine is set up window-management keybindings.",
+    "paraphrases": [
+      "First thing I do on any new machine is set up window-management keybindings.",
+      "First thing I do on any new machine is set up window-management keybindings.",
+      "(p) First thing I do on any new machine is set up window-management keybindings."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: First thing I do on any new machine is set up window-management keybindings.",
+      "As stated: First thing I do on any new machine is set up window-management keybindings.",
+      "Based on context: First thing I do on any new machine is set up window-management keybindings."
+    ]
+  },
+  {
+    "id": 39,
+    "topic": "tech",
+    "fact": "I store all credentials in 1Password.",
+    "paraphrases": [
+      "I store all credentials in 1Password.",
+      "Personally I store all credentials in 1Password.",
+      "(p) I store all credentials in 1Password."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I store all credentials in 1Password.",
+      "As stated: I store all credentials in 1Password.",
+      "Based on context: I store all credentials in 1Password."
+    ]
+  },
+  {
+    "id": 40,
+    "topic": "tech",
+    "fact": "I only use SSH key authentication, never passwords.",
+    "paraphrases": [
+      "I only use SSH key authentication, never passwords.",
+      "Personally I only use SSH key authentication, never passwords.",
+      "(p) I only use SSH key authentication, never passwords."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I only use SSH key authentication, never passwords.",
+      "As stated: I only use SSH key authentication, never passwords.",
+      "Based on context: I only use SSH key authentication, never passwords."
+    ]
+  },
+  {
+    "id": 41,
+    "topic": "hobbies",
+    "fact": "I go bouldering twice a week at the Hive gym.",
+    "paraphrases": [
+      "I go bouldering twice a week at the Hive gym.",
+      "Personally I go bouldering twice a week at the Hive gym.",
+      "(p) I go bouldering twice a week at the Hive gym."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I go bouldering twice a week at the Hive gym.",
+      "As stated: I go bouldering twice a week at the Hive gym.",
+      "Based on context: I go bouldering twice a week at the Hive gym."
+    ]
+  },
+  {
+    "id": 42,
+    "topic": "hobbies",
+    "fact": "Most weekends I play Settlers of Catan with friends.",
+    "paraphrases": [
+      "Most weekends I play Settlers of Catan with friends.",
+      "Most weekends I play Settlers of Catan with friends.",
+      "(p) Most weekends I play Settlers of Catan with friends."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Most weekends I play Settlers of Catan with friends.",
+      "As stated: Most weekends I play Settlers of Catan with friends.",
+      "Based on context: Most weekends I play Settlers of Catan with friends."
+    ]
+  },
+  {
+    "id": 43,
+    "topic": "hobbies",
+    "fact": "Lo-fi hip hop is my go-to genre while coding.",
+    "paraphrases": [
+      "Lo-fi hip hop is my go-to genre while coding.",
+      "Lo-fi hip hop is my go-to genre while coding.",
+      "(p) Lo-fi hip hop is my go-to genre while coding."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Lo-fi hip hop is my go-to genre while coding.",
+      "As stated: Lo-fi hip hop is my go-to genre while coding.",
+      "Based on context: Lo-fi hip hop is my go-to genre while coding."
+    ]
+  },
+  {
+    "id": 44,
+    "topic": "hobbies",
+    "fact": "I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+    "paraphrases": [
+      "I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+      "Personally I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+      "(p) I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+      "As stated: I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+      "Based on context: I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites."
+    ]
+  },
+  {
+    "id": 45,
+    "topic": "hobbies",
+    "fact": "I own three different dice sets for tabletop RPGs.",
+    "paraphrases": [
+      "I own three different dice sets for tabletop RPGs.",
+      "Personally I own three different dice sets for tabletop RPGs.",
+      "(p) I own three different dice sets for tabletop RPGs."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I own three different dice sets for tabletop RPGs.",
+      "As stated: I own three different dice sets for tabletop RPGs.",
+      "Based on context: I own three different dice sets for tabletop RPGs."
+    ]
+  },
+  {
+    "id": 46,
+    "topic": "hobbies",
+    "fact": "I play piano at an intermediate level.",
+    "paraphrases": [
+      "I play piano at an intermediate level.",
+      "Personally I play piano at an intermediate level.",
+      "(p) I play piano at an intermediate level."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I play piano at an intermediate level.",
+      "As stated: I play piano at an intermediate level.",
+      "Based on context: I play piano at an intermediate level."
+    ]
+  },
+  {
+    "id": 47,
+    "topic": "hobbies",
+    "fact": "When I watch anime I gravitate toward slice-of-life shows.",
+    "paraphrases": [
+      "When I watch anime I gravitate toward slice-of-life shows.",
+      "When I watch anime I gravitate toward slice-of-life shows.",
+      "(p) When I watch anime I gravitate toward slice-of-life shows."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: When I watch anime I gravitate toward slice-of-life shows.",
+      "As stated: When I watch anime I gravitate toward slice-of-life shows.",
+      "Based on context: When I watch anime I gravitate toward slice-of-life shows."
+    ]
+  },
+  {
+    "id": 48,
+    "topic": "hobbies",
+    "fact": "I collect vintage typewriters and currently own four.",
+    "paraphrases": [
+      "I collect vintage typewriters and currently own four.",
+      "Personally I collect vintage typewriters and currently own four.",
+      "(p) I collect vintage typewriters and currently own four."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I collect vintage typewriters and currently own four.",
+      "As stated: I collect vintage typewriters and currently own four.",
+      "Based on context: I collect vintage typewriters and currently own four."
+    ]
+  },
+  {
+    "id": 49,
+    "topic": "hobbies",
+    "fact": "I bird-watch; my favorite spot was a pileated woodpecker.",
+    "paraphrases": [
+      "I bird-watch; my favorite spot was a pileated woodpecker.",
+      "Personally I bird-watch; my favorite spot was a pileated woodpecker.",
+      "(p) I bird-watch; my favorite spot was a pileated woodpecker."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I bird-watch; my favorite spot was a pileated woodpecker.",
+      "As stated: I bird-watch; my favorite spot was a pileated woodpecker.",
+      "Based on context: I bird-watch; my favorite spot was a pileated woodpecker."
+    ]
+  },
+  {
+    "id": 50,
+    "topic": "hobbies",
+    "fact": "Building mechanical keyboards is one of my hobbies.",
+    "paraphrases": [
+      "Building mechanical keyboards is one of my hobbies.",
+      "Building mechanical keyboards is one of my hobbies.",
+      "(p) Building mechanical keyboards is one of my hobbies."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Building mechanical keyboards is one of my hobbies.",
+      "As stated: Building mechanical keyboards is one of my hobbies.",
+      "Based on context: Building mechanical keyboards is one of my hobbies."
+    ]
+  },
+  {
+    "id": 51,
+    "topic": "hobbies",
+    "fact": "I play Magic: The Gathering, mostly Modern format.",
+    "paraphrases": [
+      "I play Magic: The Gathering, mostly Modern format.",
+      "Personally I play Magic: The Gathering, mostly Modern format.",
+      "(p) I play Magic: The Gathering, mostly Modern format."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I play Magic: The Gathering, mostly Modern format.",
+      "As stated: I play Magic: The Gathering, mostly Modern format.",
+      "Based on context: I play Magic: The Gathering, mostly Modern format."
+    ]
+  },
+  {
+    "id": 52,
+    "topic": "hobbies",
+    "fact": "Every other weekend I go hiking somewhere in BC.",
+    "paraphrases": [
+      "Every other weekend I go hiking somewhere in BC.",
+      "Every other weekend I go hiking somewhere in BC.",
+      "(p) Every other weekend I go hiking somewhere in BC."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Every other weekend I go hiking somewhere in BC.",
+      "As stated: Every other weekend I go hiking somewhere in BC.",
+      "Based on context: Every other weekend I go hiking somewhere in BC."
+    ]
+  },
+  {
+    "id": 53,
+    "topic": "hobbies",
+    "fact": "I knit scarves in winter to stay sane during dark months.",
+    "paraphrases": [
+      "I knit scarves in winter to stay sane during dark months.",
+      "Personally I knit scarves in winter to stay sane during dark months.",
+      "(p) I knit scarves in winter to stay sane during dark months."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I knit scarves in winter to stay sane during dark months.",
+      "As stated: I knit scarves in winter to stay sane during dark months.",
+      "Based on context: I knit scarves in winter to stay sane during dark months."
+    ]
+  },
+  {
+    "id": 54,
+    "topic": "hobbies",
+    "fact": "I have a small succulent collection lined up on my windowsill.",
+    "paraphrases": [
+      "I have a small succulent collection lined up on my windowsill.",
+      "Personally I have a small succulent collection lined up on my windowsill.",
+      "(p) I have a small succulent collection lined up on my windowsill."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a small succulent collection lined up on my windowsill.",
+      "As stated: I have a small succulent collection lined up on my windowsill.",
+      "Based on context: I have a small succulent collection lined up on my windowsill."
+    ]
+  },
+  {
+    "id": 55,
+    "topic": "hobbies",
+    "fact": "I brew my own kombucha at home.",
+    "paraphrases": [
+      "I brew my own kombucha at home.",
+      "Personally I brew my own kombucha at home.",
+      "(p) I brew my own kombucha at home."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I brew my own kombucha at home.",
+      "As stated: I brew my own kombucha at home.",
+      "Based on context: I brew my own kombucha at home."
+    ]
+  },
+  {
+    "id": 56,
+    "topic": "media",
+    "fact": "Radiohead is my favorite band of all time.",
+    "paraphrases": [
+      "Radiohead is my favorite band of all time.",
+      "Radiohead is my favorite band of all time.",
+      "(p) Radiohead is my favorite band of all time."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Radiohead is my favorite band of all time.",
+      "As stated: Radiohead is my favorite band of all time.",
+      "Based on context: Radiohead is my favorite band of all time."
+    ]
+  },
+  {
+    "id": 57,
+    "topic": "media",
+    "fact": "I listen to Tycho when I work out.",
+    "paraphrases": [
+      "I listen to Tycho when I work out.",
+      "Personally I listen to Tycho when I work out.",
+      "(p) I listen to Tycho when I work out."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I listen to Tycho when I work out.",
+      "As stated: I listen to Tycho when I work out.",
+      "Based on context: I listen to Tycho when I work out."
+    ]
+  },
+  {
+    "id": 58,
+    "topic": "media",
+    "fact": "Country music is the one genre I can't stand.",
+    "paraphrases": [
+      "Country music is the one genre I can't stand.",
+      "Country music is the one genre I can't stand.",
+      "(p) Country music is the one genre I can't stand."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Country music is the one genre I can't stand.",
+      "As stated: Country music is the one genre I can't stand.",
+      "Based on context: Country music is the one genre I can't stand."
+    ]
+  },
+  {
+    "id": 59,
+    "topic": "media",
+    "fact": "I subscribe to the Criterion Channel for older films.",
+    "paraphrases": [
+      "I subscribe to the Criterion Channel for older films.",
+      "Personally I subscribe to the Criterion Channel for older films.",
+      "(p) I subscribe to the Criterion Channel for older films."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I subscribe to the Criterion Channel for older films.",
+      "As stated: I subscribe to the Criterion Channel for older films.",
+      "Based on context: I subscribe to the Criterion Channel for older films."
+    ]
+  },
+  {
+    "id": 60,
+    "topic": "media",
+    "fact": "Spirited Away is my favorite movie of all time.",
+    "paraphrases": [
+      "Spirited Away is my favorite movie of all time.",
+      "Spirited Away is my favorite movie of all time.",
+      "(p) Spirited Away is my favorite movie of all time."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Spirited Away is my favorite movie of all time.",
+      "As stated: Spirited Away is my favorite movie of all time.",
+      "Based on context: Spirited Away is my favorite movie of all time."
+    ]
+  },
+  {
+    "id": 61,
+    "topic": "media",
+    "fact": "I read physical books only \u2014 no e-readers.",
+    "paraphrases": [
+      "I read physical books only \u2014 no e-readers.",
+      "Personally I read physical books only \u2014 no e-readers.",
+      "(p) I read physical books only \u2014 no e-readers."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I read physical books only \u2014 no e-readers.",
+      "As stated: I read physical books only \u2014 no e-readers.",
+      "Based on context: I read physical books only \u2014 no e-readers."
+    ]
+  },
+  {
+    "id": 62,
+    "topic": "media",
+    "fact": "I read The New Yorker every week.",
+    "paraphrases": [
+      "I read The New Yorker every week.",
+      "Personally I read The New Yorker every week.",
+      "(p) I read The New Yorker every week."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I read The New Yorker every week.",
+      "As stated: I read The New Yorker every week.",
+      "Based on context: I read The New Yorker every week."
+    ]
+  },
+  {
+    "id": 63,
+    "topic": "media",
+    "fact": "I don't watch sports on TV.",
+    "paraphrases": [
+      "I don't watch sports on TV.",
+      "Personally I don't watch sports on TV.",
+      "(p) I don't watch sports on TV."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't watch sports on TV.",
+      "As stated: I don't watch sports on TV.",
+      "Based on context: I don't watch sports on TV."
+    ]
+  },
+  {
+    "id": 64,
+    "topic": "media",
+    "fact": "I try to go to one concert per month when budget allows.",
+    "paraphrases": [
+      "I try to go to one concert per month when budget allows.",
+      "Personally I try to go to one concert per month when budget allows.",
+      "(p) I try to go to one concert per month when budget allows."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I try to go to one concert per month when budget allows.",
+      "As stated: I try to go to one concert per month when budget allows.",
+      "Based on context: I try to go to one concert per month when budget allows."
+    ]
+  },
+  {
+    "id": 65,
+    "topic": "media",
+    "fact": "I listen to The Daily podcast over breakfast every morning.",
+    "paraphrases": [
+      "I listen to The Daily podcast over breakfast every morning.",
+      "Personally I listen to The Daily podcast over breakfast every morning.",
+      "(p) I listen to The Daily podcast over breakfast every morning."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I listen to The Daily podcast over breakfast every morning.",
+      "As stated: I listen to The Daily podcast over breakfast every morning.",
+      "Based on context: I listen to The Daily podcast over breakfast every morning."
+    ]
+  },
+  {
+    "id": 66,
+    "topic": "media",
+    "fact": "I have a vinyl turntable and about 50 records.",
+    "paraphrases": [
+      "I have a vinyl turntable and about 50 records.",
+      "Personally I have a vinyl turntable and about 50 records.",
+      "(p) I have a vinyl turntable and about 50 records."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a vinyl turntable and about 50 records.",
+      "As stated: I have a vinyl turntable and about 50 records.",
+      "Based on context: I have a vinyl turntable and about 50 records."
+    ]
+  },
+  {
+    "id": 67,
+    "topic": "media",
+    "fact": "I prefer instrumental or lyrics-light music while reading.",
+    "paraphrases": [
+      "I prefer instrumental or lyrics-light music while reading.",
+      "Personally I prefer instrumental or lyrics-light music while reading.",
+      "(p) I prefer instrumental or lyrics-light music while reading."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer instrumental or lyrics-light music while reading.",
+      "As stated: I prefer instrumental or lyrics-light music while reading.",
+      "Based on context: I prefer instrumental or lyrics-light music while reading."
+    ]
+  },
+  {
+    "id": 68,
+    "topic": "media",
+    "fact": "Musicals make me cringe \u2014 I avoid them entirely.",
+    "paraphrases": [
+      "Musicals make me cringe \u2014 I avoid them entirely.",
+      "Musicals make me cringe \u2014 I avoid them entirely.",
+      "(p) Musicals make me cringe \u2014 I avoid them entirely."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Musicals make me cringe \u2014 I avoid them entirely.",
+      "As stated: Musicals make me cringe \u2014 I avoid them entirely.",
+      "Based on context: Musicals make me cringe \u2014 I avoid them entirely."
+    ]
+  },
+  {
+    "id": 69,
+    "topic": "media",
+    "fact": "Every winter I rewatch all the Studio Ghibli films.",
+    "paraphrases": [
+      "Every winter I rewatch all the Studio Ghibli films.",
+      "Every winter I rewatch all the Studio Ghibli films.",
+      "(p) Every winter I rewatch all the Studio Ghibli films."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Every winter I rewatch all the Studio Ghibli films.",
+      "As stated: Every winter I rewatch all the Studio Ghibli films.",
+      "Based on context: Every winter I rewatch all the Studio Ghibli films."
+    ]
+  },
+  {
+    "id": 70,
+    "topic": "media",
+    "fact": "Bong Joon-ho is my favorite director working today.",
+    "paraphrases": [
+      "Bong Joon-ho is my favorite director working today.",
+      "Bong Joon-ho is my favorite director working today.",
+      "(p) Bong Joon-ho is my favorite director working today."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Bong Joon-ho is my favorite director working today.",
+      "As stated: Bong Joon-ho is my favorite director working today.",
+      "Based on context: Bong Joon-ho is my favorite director working today."
+    ]
+  },
+  {
+    "id": 71,
+    "topic": "travel",
+    "fact": "I've been to Japan three times; Kyoto is my favorite city.",
+    "paraphrases": [
+      "I've been to Japan three times; Kyoto is my favorite city.",
+      "I've been to Japan three times; Kyoto is my favorite city.",
+      "(p) I've been to Japan three times; Kyoto is my favorite city."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I've been to Japan three times; Kyoto is my favorite city.",
+      "As stated: I've been to Japan three times; Kyoto is my favorite city.",
+      "Based on context: I've been to Japan three times; Kyoto is my favorite city."
+    ]
+  },
+  {
+    "id": 72,
+    "topic": "travel",
+    "fact": "I always book window seats on flights.",
+    "paraphrases": [
+      "I always book window seats on flights.",
+      "Personally I always book window seats on flights.",
+      "(p) I always book window seats on flights."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always book window seats on flights.",
+      "As stated: I always book window seats on flights.",
+      "Based on context: I always book window seats on flights."
+    ]
+  },
+  {
+    "id": 73,
+    "topic": "travel",
+    "fact": "Aisle seats annoy me \u2014 I never pick them voluntarily.",
+    "paraphrases": [
+      "Aisle seats annoy me \u2014 I never pick them voluntarily.",
+      "Aisle seats annoy me \u2014 I never pick them voluntarily.",
+      "(p) Aisle seats annoy me \u2014 I never pick them voluntarily."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Aisle seats annoy me \u2014 I never pick them voluntarily.",
+      "As stated: Aisle seats annoy me \u2014 I never pick them voluntarily.",
+      "Based on context: Aisle seats annoy me \u2014 I never pick them voluntarily."
+    ]
+  },
+  {
+    "id": 74,
+    "topic": "travel",
+    "fact": "I always carry a backup phone charger in my travel bag.",
+    "paraphrases": [
+      "I always carry a backup phone charger in my travel bag.",
+      "Personally I always carry a backup phone charger in my travel bag.",
+      "(p) I always carry a backup phone charger in my travel bag."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always carry a backup phone charger in my travel bag.",
+      "As stated: I always carry a backup phone charger in my travel bag.",
+      "Based on context: I always carry a backup phone charger in my travel bag."
+    ]
+  },
+  {
+    "id": 75,
+    "topic": "travel",
+    "fact": "For solo trips I prefer hostels over hotels.",
+    "paraphrases": [
+      "For solo trips I prefer hostels over hotels.",
+      "For solo trips I prefer hostels over hotels.",
+      "(p) For solo trips I prefer hostels over hotels."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: For solo trips I prefer hostels over hotels.",
+      "As stated: For solo trips I prefer hostels over hotels.",
+      "Based on context: For solo trips I prefer hostels over hotels."
+    ]
+  },
+  {
+    "id": 76,
+    "topic": "travel",
+    "fact": "I speak conversational Mandarin.",
+    "paraphrases": [
+      "I speak conversational Mandarin.",
+      "Personally I speak conversational Mandarin.",
+      "(p) I speak conversational Mandarin."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I speak conversational Mandarin.",
+      "As stated: I speak conversational Mandarin.",
+      "Based on context: I speak conversational Mandarin."
+    ]
+  },
+  {
+    "id": 77,
+    "topic": "travel",
+    "fact": "My passport has stamps from 14 different countries.",
+    "paraphrases": [
+      "My passport has stamps from 14 different countries.",
+      "My passport has stamps from 14 different countries.",
+      "(p) My passport has stamps from 14 different countries."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: My passport has stamps from 14 different countries.",
+      "As stated: My passport has stamps from 14 different countries.",
+      "Based on context: My passport has stamps from 14 different countries."
+    ]
+  },
+  {
+    "id": 78,
+    "topic": "travel",
+    "fact": "I bring a small notebook for sketches and notes on every trip.",
+    "paraphrases": [
+      "I bring a small notebook for sketches and notes on every trip.",
+      "Personally I bring a small notebook for sketches and notes on every trip.",
+      "(p) I bring a small notebook for sketches and notes on every trip."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I bring a small notebook for sketches and notes on every trip.",
+      "As stated: I bring a small notebook for sketches and notes on every trip.",
+      "Based on context: I bring a small notebook for sketches and notes on every trip."
+    ]
+  },
+  {
+    "id": 79,
+    "topic": "travel",
+    "fact": "I avoid organized tour groups; I'd rather wander solo.",
+    "paraphrases": [
+      "I avoid organized tour groups; I'd rather wander solo.",
+      "Personally I avoid organized tour groups; I'd rather wander solo.",
+      "(p) I avoid organized tour groups; I'd rather wander solo."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I avoid organized tour groups; I'd rather wander solo.",
+      "As stated: I avoid organized tour groups; I'd rather wander solo.",
+      "Based on context: I avoid organized tour groups; I'd rather wander solo."
+    ]
+  },
+  {
+    "id": 80,
+    "topic": "travel",
+    "fact": "I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+    "paraphrases": [
+      "I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+      "Personally I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+      "(p) I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+      "As stated: I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+      "Based on context: I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless."
+    ]
+  },
+  {
+    "id": 81,
+    "topic": "workflow",
+    "fact": "I wake up at 6:30 am every weekday.",
+    "paraphrases": [
+      "I wake up at 6:30 am every weekday.",
+      "Personally I wake up at 6:30 am every weekday.",
+      "(p) I wake up at 6:30 am every weekday."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I wake up at 6:30 am every weekday.",
+      "As stated: I wake up at 6:30 am every weekday.",
+      "Based on context: I wake up at 6:30 am every weekday."
+    ]
+  },
+  {
+    "id": 82,
+    "topic": "workflow",
+    "fact": "Every afternoon I take a 20-minute walk to clear my head.",
+    "paraphrases": [
+      "Every afternoon I take a 20-minute walk to clear my head.",
+      "Every afternoon I take a 20-minute walk to clear my head.",
+      "(p) Every afternoon I take a 20-minute walk to clear my head."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Every afternoon I take a 20-minute walk to clear my head.",
+      "As stated: Every afternoon I take a 20-minute walk to clear my head.",
+      "Based on context: Every afternoon I take a 20-minute walk to clear my head."
+    ]
+  },
+  {
+    "id": 83,
+    "topic": "workflow",
+    "fact": "I don't check email on weekends.",
+    "paraphrases": [
+      "I don't check email on weekends.",
+      "Personally I don't check email on weekends.",
+      "(p) I don't check email on weekends."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't check email on weekends.",
+      "As stated: I don't check email on weekends.",
+      "Based on context: I don't check email on weekends."
+    ]
+  },
+  {
+    "id": 84,
+    "topic": "workflow",
+    "fact": "I work in 50-minute focus blocks with short breaks in between.",
+    "paraphrases": [
+      "I work in 50-minute focus blocks with short breaks in between.",
+      "Personally I work in 50-minute focus blocks with short breaks in between.",
+      "(p) I work in 50-minute focus blocks with short breaks in between."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I work in 50-minute focus blocks with short breaks in between.",
+      "As stated: I work in 50-minute focus blocks with short breaks in between.",
+      "Based on context: I work in 50-minute focus blocks with short breaks in between."
+    ]
+  },
+  {
+    "id": 85,
+    "topic": "workflow",
+    "fact": "I write a journal entry every Sunday evening.",
+    "paraphrases": [
+      "I write a journal entry every Sunday evening.",
+      "Personally I write a journal entry every Sunday evening.",
+      "(p) I write a journal entry every Sunday evening."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I write a journal entry every Sunday evening.",
+      "As stated: I write a journal entry every Sunday evening.",
+      "Based on context: I write a journal entry every Sunday evening."
+    ]
+  },
+  {
+    "id": 86,
+    "topic": "workflow",
+    "fact": "I plan the next day's tasks the night before.",
+    "paraphrases": [
+      "I plan the next day's tasks the night before.",
+      "Personally I plan the next day's tasks the night before.",
+      "(p) I plan the next day's tasks the night before."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I plan the next day's tasks the night before.",
+      "As stated: I plan the next day's tasks the night before.",
+      "Based on context: I plan the next day's tasks the night before."
+    ]
+  },
+  {
+    "id": 87,
+    "topic": "workflow",
+    "fact": "I skip breakfast \u2014 just coffee until about 11am.",
+    "paraphrases": [
+      "I skip breakfast \u2014 just coffee until about 11am.",
+      "Personally I skip breakfast \u2014 just coffee until about 11am.",
+      "(p) I skip breakfast \u2014 just coffee until about 11am."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I skip breakfast \u2014 just coffee until about 11am.",
+      "As stated: I skip breakfast \u2014 just coffee until about 11am.",
+      "Based on context: I skip breakfast \u2014 just coffee until about 11am."
+    ]
+  },
+  {
+    "id": 88,
+    "topic": "workflow",
+    "fact": "I take a 30-minute nap most afternoons.",
+    "paraphrases": [
+      "I take a 30-minute nap most afternoons.",
+      "Personally I take a 30-minute nap most afternoons.",
+      "(p) I take a 30-minute nap most afternoons."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I take a 30-minute nap most afternoons.",
+      "As stated: I take a 30-minute nap most afternoons.",
+      "Based on context: I take a 30-minute nap most afternoons."
+    ]
+  },
+  {
+    "id": 89,
+    "topic": "workflow",
+    "fact": "I wake up to a sunrise lamp instead of a phone alarm.",
+    "paraphrases": [
+      "I wake up to a sunrise lamp instead of a phone alarm.",
+      "Personally I wake up to a sunrise lamp instead of a phone alarm.",
+      "(p) I wake up to a sunrise lamp instead of a phone alarm."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I wake up to a sunrise lamp instead of a phone alarm.",
+      "As stated: I wake up to a sunrise lamp instead of a phone alarm.",
+      "Based on context: I wake up to a sunrise lamp instead of a phone alarm."
+    ]
+  },
+  {
+    "id": 90,
+    "topic": "workflow",
+    "fact": "I have a hard cutoff at 7pm \u2014 no work after that.",
+    "paraphrases": [
+      "I have a hard cutoff at 7pm \u2014 no work after that.",
+      "Personally I have a hard cutoff at 7pm \u2014 no work after that.",
+      "(p) I have a hard cutoff at 7pm \u2014 no work after that."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a hard cutoff at 7pm \u2014 no work after that.",
+      "As stated: I have a hard cutoff at 7pm \u2014 no work after that.",
+      "Based on context: I have a hard cutoff at 7pm \u2014 no work after that."
+    ]
+  },
+  {
+    "id": 91,
+    "topic": "fitness",
+    "fact": "I bike to work every day, including in the rain.",
+    "paraphrases": [
+      "I bike to work every day, including in the rain.",
+      "Personally I bike to work every day, including in the rain.",
+      "(p) I bike to work every day, including in the rain."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I bike to work every day, including in the rain.",
+      "As stated: I bike to work every day, including in the rain.",
+      "Based on context: I bike to work every day, including in the rain."
+    ]
+  },
+  {
+    "id": 92,
+    "topic": "fitness",
+    "fact": "I hate running but I love swimming.",
+    "paraphrases": [
+      "I hate running but I love swimming.",
+      "Personally I hate running but I love swimming.",
+      "(p) I hate running but I love swimming."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I hate running but I love swimming.",
+      "As stated: I hate running but I love swimming.",
+      "Based on context: I hate running but I love swimming."
+    ]
+  },
+  {
+    "id": 93,
+    "topic": "fitness",
+    "fact": "I go to a yoga class every Saturday morning.",
+    "paraphrases": [
+      "I go to a yoga class every Saturday morning.",
+      "Personally I go to a yoga class every Saturday morning.",
+      "(p) I go to a yoga class every Saturday morning."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I go to a yoga class every Saturday morning.",
+      "As stated: I go to a yoga class every Saturday morning.",
+      "Based on context: I go to a yoga class every Saturday morning."
+    ]
+  },
+  {
+    "id": 94,
+    "topic": "fitness",
+    "fact": "I don't lift weights \u2014 I prefer bodyweight training.",
+    "paraphrases": [
+      "I don't lift weights \u2014 I prefer bodyweight training.",
+      "Personally I don't lift weights \u2014 I prefer bodyweight training.",
+      "(p) I don't lift weights \u2014 I prefer bodyweight training."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't lift weights \u2014 I prefer bodyweight training.",
+      "As stated: I don't lift weights \u2014 I prefer bodyweight training.",
+      "Based on context: I don't lift weights \u2014 I prefer bodyweight training."
+    ]
+  },
+  {
+    "id": 95,
+    "topic": "fitness",
+    "fact": "I consistently send V5\u2013V6 boulder grades.",
+    "paraphrases": [
+      "I consistently send V5\u2013V6 boulder grades.",
+      "Personally I consistently send V5\u2013V6 boulder grades.",
+      "(p) I consistently send V5\u2013V6 boulder grades."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I consistently send V5\u2013V6 boulder grades.",
+      "As stated: I consistently send V5\u2013V6 boulder grades.",
+      "Based on context: I consistently send V5\u2013V6 boulder grades."
+    ]
+  },
+  {
+    "id": 96,
+    "topic": "fitness",
+    "fact": "I play pickup soccer once a week.",
+    "paraphrases": [
+      "I play pickup soccer once a week.",
+      "Personally I play pickup soccer once a week.",
+      "(p) I play pickup soccer once a week."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I play pickup soccer once a week.",
+      "As stated: I play pickup soccer once a week.",
+      "Based on context: I play pickup soccer once a week."
+    ]
+  },
+  {
+    "id": 97,
+    "topic": "fitness",
+    "fact": "I do cold plunges three times a week.",
+    "paraphrases": [
+      "I do cold plunges three times a week.",
+      "Personally I do cold plunges three times a week.",
+      "(p) I do cold plunges three times a week."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I do cold plunges three times a week.",
+      "As stated: I do cold plunges three times a week.",
+      "Based on context: I do cold plunges three times a week."
+    ]
+  },
+  {
+    "id": 98,
+    "topic": "fitness",
+    "fact": "Treadmills bore me \u2014 I do all my cardio outdoors.",
+    "paraphrases": [
+      "Treadmills bore me \u2014 I do all my cardio outdoors.",
+      "Treadmills bore me \u2014 I do all my cardio outdoors.",
+      "(p) Treadmills bore me \u2014 I do all my cardio outdoors."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Treadmills bore me \u2014 I do all my cardio outdoors.",
+      "As stated: Treadmills bore me \u2014 I do all my cardio outdoors.",
+      "Based on context: Treadmills bore me \u2014 I do all my cardio outdoors."
+    ]
+  },
+  {
+    "id": 99,
+    "topic": "fitness",
+    "fact": "I track all my workouts in a Notion database.",
+    "paraphrases": [
+      "I track all my workouts in a Notion database.",
+      "Personally I track all my workouts in a Notion database.",
+      "(p) I track all my workouts in a Notion database."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I track all my workouts in a Notion database.",
+      "As stated: I track all my workouts in a Notion database.",
+      "Based on context: I track all my workouts in a Notion database."
+    ]
+  },
+  {
+    "id": 100,
+    "topic": "fitness",
+    "fact": "I don't drink protein shakes.",
+    "paraphrases": [
+      "I don't drink protein shakes.",
+      "Personally I don't drink protein shakes.",
+      "(p) I don't drink protein shakes."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't drink protein shakes.",
+      "As stated: I don't drink protein shakes.",
+      "Based on context: I don't drink protein shakes."
+    ]
+  },
+  {
+    "id": 101,
+    "topic": "home",
+    "fact": "I have a black cat named Soba.",
+    "paraphrases": [
+      "I have a black cat named Soba.",
+      "Personally I have a black cat named Soba.",
+      "(p) I have a black cat named Soba."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a black cat named Soba.",
+      "As stated: I have a black cat named Soba.",
+      "Based on context: I have a black cat named Soba."
+    ]
+  },
+  {
+    "id": 102,
+    "topic": "home",
+    "fact": "Soba is allergic to fish, so I can't feed her tuna.",
+    "paraphrases": [
+      "Soba is allergic to fish, so I can't feed her tuna.",
+      "Soba is allergic to fish, so I can't feed her tuna.",
+      "(p) Soba is allergic to fish, so I can't feed her tuna."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Soba is allergic to fish, so I can't feed her tuna.",
+      "As stated: Soba is allergic to fish, so I can't feed her tuna.",
+      "Based on context: Soba is allergic to fish, so I can't feed her tuna."
+    ]
+  },
+  {
+    "id": 103,
+    "topic": "home",
+    "fact": "I live in a 700 square foot apartment in Mount Pleasant.",
+    "paraphrases": [
+      "I live in a 700 square foot apartment in Mount Pleasant.",
+      "Personally I live in a 700 square foot apartment in Mount Pleasant.",
+      "(p) I live in a 700 square foot apartment in Mount Pleasant."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I live in a 700 square foot apartment in Mount Pleasant.",
+      "As stated: I live in a 700 square foot apartment in Mount Pleasant.",
+      "Based on context: I live in a 700 square foot apartment in Mount Pleasant."
+    ]
+  },
+  {
+    "id": 104,
+    "topic": "home",
+    "fact": "I have a standing desk set up in my bedroom.",
+    "paraphrases": [
+      "I have a standing desk set up in my bedroom.",
+      "Personally I have a standing desk set up in my bedroom.",
+      "(p) I have a standing desk set up in my bedroom."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a standing desk set up in my bedroom.",
+      "As stated: I have a standing desk set up in my bedroom.",
+      "Based on context: I have a standing desk set up in my bedroom."
+    ]
+  },
+  {
+    "id": 105,
+    "topic": "home",
+    "fact": "I sleep with the window open year-round.",
+    "paraphrases": [
+      "I sleep with the window open year-round.",
+      "Personally I sleep with the window open year-round.",
+      "(p) I sleep with the window open year-round."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I sleep with the window open year-round.",
+      "As stated: I sleep with the window open year-round.",
+      "Based on context: I sleep with the window open year-round."
+    ]
+  },
+  {
+    "id": 106,
+    "topic": "home",
+    "fact": "No shoes inside the apartment \u2014 strict rule.",
+    "paraphrases": [
+      "No shoes inside the apartment \u2014 strict rule.",
+      "No shoes inside the apartment \u2014 strict rule.",
+      "(p) No shoes inside the apartment \u2014 strict rule."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: No shoes inside the apartment \u2014 strict rule.",
+      "As stated: No shoes inside the apartment \u2014 strict rule.",
+      "Based on context: No shoes inside the apartment \u2014 strict rule."
+    ]
+  },
+  {
+    "id": 107,
+    "topic": "home",
+    "fact": "I keep my apartment cool, around 65\u00b0F.",
+    "paraphrases": [
+      "I keep my apartment cool, around 65\u00b0F.",
+      "Personally I keep my apartment cool, around 65\u00b0F.",
+      "(p) I keep my apartment cool, around 65\u00b0F."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I keep my apartment cool, around 65\u00b0F.",
+      "As stated: I keep my apartment cool, around 65\u00b0F.",
+      "Based on context: I keep my apartment cool, around 65\u00b0F."
+    ]
+  },
+  {
+    "id": 108,
+    "topic": "home",
+    "fact": "I own a Roomba and I named it Jeeves.",
+    "paraphrases": [
+      "I own a Roomba and I named it Jeeves.",
+      "Personally I own a Roomba and I named it Jeeves.",
+      "(p) I own a Roomba and I named it Jeeves."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I own a Roomba and I named it Jeeves.",
+      "As stated: I own a Roomba and I named it Jeeves.",
+      "Based on context: I own a Roomba and I named it Jeeves."
+    ]
+  },
+  {
+    "id": 109,
+    "topic": "home",
+    "fact": "I have about twenty cookbooks lining one kitchen shelf.",
+    "paraphrases": [
+      "I have about twenty cookbooks lining one kitchen shelf.",
+      "Personally I have about twenty cookbooks lining one kitchen shelf.",
+      "(p) I have about twenty cookbooks lining one kitchen shelf."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have about twenty cookbooks lining one kitchen shelf.",
+      "As stated: I have about twenty cookbooks lining one kitchen shelf.",
+      "Based on context: I have about twenty cookbooks lining one kitchen shelf."
+    ]
+  },
+  {
+    "id": 110,
+    "topic": "home",
+    "fact": "There are always fresh flowers on my kitchen counter.",
+    "paraphrases": [
+      "There are always fresh flowers on my kitchen counter.",
+      "There are always fresh flowers on my kitchen counter.",
+      "(p) There are always fresh flowers on my kitchen counter."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: There are always fresh flowers on my kitchen counter.",
+      "As stated: There are always fresh flowers on my kitchen counter.",
+      "Based on context: There are always fresh flowers on my kitchen counter."
+    ]
+  },
+  {
+    "id": 111,
+    "topic": "opinions",
+    "fact": "I think long Slack messages are rude \u2014 async writing should always summarize.",
+    "paraphrases": [
+      "I think long Slack messages are rude \u2014 async writing should always summarize.",
+      "Personally I think long Slack messages are rude \u2014 async writing should always summarize.",
+      "(p) I think long Slack messages are rude \u2014 async writing should always summarize."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I think long Slack messages are rude \u2014 async writing should always summarize.",
+      "As stated: I think long Slack messages are rude \u2014 async writing should always summarize.",
+      "Based on context: I think long Slack messages are rude \u2014 async writing should always summarize."
+    ]
+  },
+  {
+    "id": 112,
+    "topic": "opinions",
+    "fact": "I'm an inbox-zero person at all times.",
+    "paraphrases": [
+      "I'm an inbox-zero person at all times.",
+      "I'm an inbox-zero person at all times.",
+      "(p) I'm an inbox-zero person at all times."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm an inbox-zero person at all times.",
+      "As stated: I'm an inbox-zero person at all times.",
+      "Based on context: I'm an inbox-zero person at all times."
+    ]
+  },
+  {
+    "id": 113,
+    "topic": "opinions",
+    "fact": "I'm a pacifist and I don't watch violent films.",
+    "paraphrases": [
+      "I'm a pacifist and I don't watch violent films.",
+      "I'm a pacifist and I don't watch violent films.",
+      "(p) I'm a pacifist and I don't watch violent films."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm a pacifist and I don't watch violent films.",
+      "As stated: I'm a pacifist and I don't watch violent films.",
+      "Based on context: I'm a pacifist and I don't watch violent films."
+    ]
+  },
+  {
+    "id": 114,
+    "topic": "opinions",
+    "fact": "I'm skeptical of cryptocurrency as an investment vehicle.",
+    "paraphrases": [
+      "I'm skeptical of cryptocurrency as an investment vehicle.",
+      "I'm skeptical of cryptocurrency as an investment vehicle.",
+      "(p) I'm skeptical of cryptocurrency as an investment vehicle."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm skeptical of cryptocurrency as an investment vehicle.",
+      "As stated: I'm skeptical of cryptocurrency as an investment vehicle.",
+      "Based on context: I'm skeptical of cryptocurrency as an investment vehicle."
+    ]
+  },
+  {
+    "id": 115,
+    "topic": "opinions",
+    "fact": "I donate 5% of my income to effective-altruism-aligned charities.",
+    "paraphrases": [
+      "I donate 5% of my income to effective-altruism-aligned charities.",
+      "Personally I donate 5% of my income to effective-altruism-aligned charities.",
+      "(p) I donate 5% of my income to effective-altruism-aligned charities."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I donate 5% of my income to effective-altruism-aligned charities.",
+      "As stated: I donate 5% of my income to effective-altruism-aligned charities.",
+      "Based on context: I donate 5% of my income to effective-altruism-aligned charities."
+    ]
+  },
+  {
+    "id": 116,
+    "topic": "opinions",
+    "fact": "I'd rather write one thoughtful email than fire off five short ones.",
+    "paraphrases": [
+      "I'd rather write one thoughtful email than fire off five short ones.",
+      "I'd rather write one thoughtful email than fire off five short ones.",
+      "(p) I'd rather write one thoughtful email than fire off five short ones."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'd rather write one thoughtful email than fire off five short ones.",
+      "As stated: I'd rather write one thoughtful email than fire off five short ones.",
+      "Based on context: I'd rather write one thoughtful email than fire off five short ones."
+    ]
+  },
+  {
+    "id": 117,
+    "topic": "opinions",
+    "fact": "I don't believe in productivity hacks \u2014 consistency beats novelty.",
+    "paraphrases": [
+      "I don't believe in productivity hacks \u2014 consistency beats novelty.",
+      "Personally I don't believe in productivity hacks \u2014 consistency beats novelty.",
+      "(p) I don't believe in productivity hacks \u2014 consistency beats novelty."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't believe in productivity hacks \u2014 consistency beats novelty.",
+      "As stated: I don't believe in productivity hacks \u2014 consistency beats novelty.",
+      "Based on context: I don't believe in productivity hacks \u2014 consistency beats novelty."
+    ]
+  },
+  {
+    "id": 118,
+    "topic": "opinions",
+    "fact": "Companies that schedule too many meetings make me lose respect for them.",
+    "paraphrases": [
+      "Companies that schedule too many meetings make me lose respect for them.",
+      "Companies that schedule too many meetings make me lose respect for them.",
+      "(p) Companies that schedule too many meetings make me lose respect for them."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Companies that schedule too many meetings make me lose respect for them.",
+      "As stated: Companies that schedule too many meetings make me lose respect for them.",
+      "Based on context: Companies that schedule too many meetings make me lose respect for them."
+    ]
+  },
+  {
+    "id": 119,
+    "topic": "opinions",
+    "fact": "I think physical books are better for retention than e-books.",
+    "paraphrases": [
+      "I think physical books are better for retention than e-books.",
+      "Personally I think physical books are better for retention than e-books.",
+      "(p) I think physical books are better for retention than e-books."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I think physical books are better for retention than e-books.",
+      "As stated: I think physical books are better for retention than e-books.",
+      "Based on context: I think physical books are better for retention than e-books."
+    ]
+  },
+  {
+    "id": 120,
+    "topic": "opinions",
+    "fact": "I prefer asynchronous work over synchronous calls.",
+    "paraphrases": [
+      "I prefer asynchronous work over synchronous calls.",
+      "Personally I prefer asynchronous work over synchronous calls.",
+      "(p) I prefer asynchronous work over synchronous calls."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer asynchronous work over synchronous calls.",
+      "As stated: I prefer asynchronous work over synchronous calls.",
+      "Based on context: I prefer asynchronous work over synchronous calls."
+    ]
+  },
+  {
+    "id": 121,
+    "topic": "quirky",
+    "fact": "I always carry an umbrella in Vancouver, no matter the forecast.",
+    "paraphrases": [
+      "I always carry an umbrella in Vancouver, no matter the forecast.",
+      "Personally I always carry an umbrella in Vancouver, no matter the forecast.",
+      "(p) I always carry an umbrella in Vancouver, no matter the forecast."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I always carry an umbrella in Vancouver, no matter the forecast.",
+      "As stated: I always carry an umbrella in Vancouver, no matter the forecast.",
+      "Based on context: I always carry an umbrella in Vancouver, no matter the forecast."
+    ]
+  },
+  {
+    "id": 122,
+    "topic": "quirky",
+    "fact": "I own five identical pairs of black socks so I never have to match them.",
+    "paraphrases": [
+      "I own five identical pairs of black socks so I never have to match them.",
+      "Personally I own five identical pairs of black socks so I never have to match them.",
+      "(p) I own five identical pairs of black socks so I never have to match them."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I own five identical pairs of black socks so I never have to match them.",
+      "As stated: I own five identical pairs of black socks so I never have to match them.",
+      "Based on context: I own five identical pairs of black socks so I never have to match them."
+    ]
+  },
+  {
+    "id": 123,
+    "topic": "quirky",
+    "fact": "I don't drink alcohol on weekdays.",
+    "paraphrases": [
+      "I don't drink alcohol on weekdays.",
+      "Personally I don't drink alcohol on weekdays.",
+      "(p) I don't drink alcohol on weekdays."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't drink alcohol on weekdays.",
+      "As stated: I don't drink alcohol on weekdays.",
+      "Based on context: I don't drink alcohol on weekdays."
+    ]
+  },
+  {
+    "id": 124,
+    "topic": "quirky",
+    "fact": "Escalators make me anxious \u2014 I take the stairs.",
+    "paraphrases": [
+      "Escalators make me anxious \u2014 I take the stairs.",
+      "Escalators make me anxious \u2014 I take the stairs.",
+      "(p) Escalators make me anxious \u2014 I take the stairs."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Escalators make me anxious \u2014 I take the stairs.",
+      "As stated: Escalators make me anxious \u2014 I take the stairs.",
+      "Based on context: Escalators make me anxious \u2014 I take the stairs."
+    ]
+  },
+  {
+    "id": 125,
+    "topic": "quirky",
+    "fact": "I'm allergic to bee stings; I carry an epi-pen.",
+    "paraphrases": [
+      "I'm allergic to bee stings; I carry an epi-pen.",
+      "I'm allergic to bee stings; I carry an epi-pen.",
+      "(p) I'm allergic to bee stings; I carry an epi-pen."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm allergic to bee stings; I carry an epi-pen.",
+      "As stated: I'm allergic to bee stings; I carry an epi-pen.",
+      "Based on context: I'm allergic to bee stings; I carry an epi-pen."
+    ]
+  },
+  {
+    "id": 126,
+    "topic": "quirky",
+    "fact": "When a building has four floors or fewer I always take the stairs.",
+    "paraphrases": [
+      "When a building has four floors or fewer I always take the stairs.",
+      "When a building has four floors or fewer I always take the stairs.",
+      "(p) When a building has four floors or fewer I always take the stairs."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: When a building has four floors or fewer I always take the stairs.",
+      "As stated: When a building has four floors or fewer I always take the stairs.",
+      "Based on context: When a building has four floors or fewer I always take the stairs."
+    ]
+  },
+  {
+    "id": 127,
+    "topic": "quirky",
+    "fact": "I talk to my cat in a baby voice \u2014 she seems to like it.",
+    "paraphrases": [
+      "I talk to my cat in a baby voice \u2014 she seems to like it.",
+      "Personally I talk to my cat in a baby voice \u2014 she seems to like it.",
+      "(p) I talk to my cat in a baby voice \u2014 she seems to like it."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I talk to my cat in a baby voice \u2014 she seems to like it.",
+      "As stated: I talk to my cat in a baby voice \u2014 she seems to like it.",
+      "Based on context: I talk to my cat in a baby voice \u2014 she seems to like it."
+    ]
+  },
+  {
+    "id": 128,
+    "topic": "quirky",
+    "fact": "I don't own a TV; I watch everything projected onto a wall.",
+    "paraphrases": [
+      "I don't own a TV; I watch everything projected onto a wall.",
+      "Personally I don't own a TV; I watch everything projected onto a wall.",
+      "(p) I don't own a TV; I watch everything projected onto a wall."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't own a TV; I watch everything projected onto a wall.",
+      "As stated: I don't own a TV; I watch everything projected onto a wall.",
+      "Based on context: I don't own a TV; I watch everything projected onto a wall."
+    ]
+  },
+  {
+    "id": 129,
+    "topic": "quirky",
+    "fact": "I wear glasses, and Persol is my favorite frame brand.",
+    "paraphrases": [
+      "I wear glasses, and Persol is my favorite frame brand.",
+      "Personally I wear glasses, and Persol is my favorite frame brand.",
+      "(p) I wear glasses, and Persol is my favorite frame brand."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I wear glasses, and Persol is my favorite frame brand.",
+      "As stated: I wear glasses, and Persol is my favorite frame brand.",
+      "Based on context: I wear glasses, and Persol is my favorite frame brand."
+    ]
+  },
+  {
+    "id": 130,
+    "topic": "quirky",
+    "fact": "I prefer fountain pens over ballpoints for everyday writing.",
+    "paraphrases": [
+      "I prefer fountain pens over ballpoints for everyday writing.",
+      "Personally I prefer fountain pens over ballpoints for everyday writing.",
+      "(p) I prefer fountain pens over ballpoints for everyday writing."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer fountain pens over ballpoints for everyday writing.",
+      "As stated: I prefer fountain pens over ballpoints for everyday writing.",
+      "Based on context: I prefer fountain pens over ballpoints for everyday writing."
+    ]
+  },
+  {
+    "id": 131,
+    "topic": "quirky",
+    "fact": "I haven't had a soda in years.",
+    "paraphrases": [
+      "I haven't had a soda in years.",
+      "Personally I haven't had a soda in years.",
+      "(p) I haven't had a soda in years."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I haven't had a soda in years.",
+      "As stated: I haven't had a soda in years.",
+      "Based on context: I haven't had a soda in years."
+    ]
+  },
+  {
+    "id": 132,
+    "topic": "quirky",
+    "fact": "The smell of old books is my favorite scent in the world.",
+    "paraphrases": [
+      "The smell of old books is my favorite scent in the world.",
+      "The smell of old books is my favorite scent in the world.",
+      "(p) The smell of old books is my favorite scent in the world."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: The smell of old books is my favorite scent in the world.",
+      "As stated: The smell of old books is my favorite scent in the world.",
+      "Based on context: The smell of old books is my favorite scent in the world."
+    ]
+  },
+  {
+    "id": 133,
+    "topic": "quirky",
+    "fact": "I take the exact same walking route to work every single day.",
+    "paraphrases": [
+      "I take the exact same walking route to work every single day.",
+      "Personally I take the exact same walking route to work every single day.",
+      "(p) I take the exact same walking route to work every single day."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I take the exact same walking route to work every single day.",
+      "As stated: I take the exact same walking route to work every single day.",
+      "Based on context: I take the exact same walking route to work every single day."
+    ]
+  },
+  {
+    "id": 134,
+    "topic": "quirky",
+    "fact": "I have a lucky green sweater I wear for every important meeting.",
+    "paraphrases": [
+      "I have a lucky green sweater I wear for every important meeting.",
+      "Personally I have a lucky green sweater I wear for every important meeting.",
+      "(p) I have a lucky green sweater I wear for every important meeting."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I have a lucky green sweater I wear for every important meeting.",
+      "As stated: I have a lucky green sweater I wear for every important meeting.",
+      "Based on context: I have a lucky green sweater I wear for every important meeting."
+    ]
+  },
+  {
+    "id": 135,
+    "topic": "quirky",
+    "fact": "I prefer handwritten letters over digital greetings.",
+    "paraphrases": [
+      "I prefer handwritten letters over digital greetings.",
+      "Personally I prefer handwritten letters over digital greetings.",
+      "(p) I prefer handwritten letters over digital greetings."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I prefer handwritten letters over digital greetings.",
+      "As stated: I prefer handwritten letters over digital greetings.",
+      "Based on context: I prefer handwritten letters over digital greetings."
+    ]
+  },
+  {
+    "id": 136,
+    "topic": "negative",
+    "fact": "I avoid fluorescent lighting; warm-temperature bulbs only.",
+    "paraphrases": [
+      "I avoid fluorescent lighting; warm-temperature bulbs only.",
+      "Personally I avoid fluorescent lighting; warm-temperature bulbs only.",
+      "(p) I avoid fluorescent lighting; warm-temperature bulbs only."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I avoid fluorescent lighting; warm-temperature bulbs only.",
+      "As stated: I avoid fluorescent lighting; warm-temperature bulbs only.",
+      "Based on context: I avoid fluorescent lighting; warm-temperature bulbs only."
+    ]
+  },
+  {
+    "id": 137,
+    "topic": "negative",
+    "fact": "I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+    "paraphrases": [
+      "I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+      "I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+      "(p) I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+      "As stated: I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+      "Based on context: I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all."
+    ]
+  },
+  {
+    "id": 138,
+    "topic": "negative",
+    "fact": "I haven't eaten fast food in over five years.",
+    "paraphrases": [
+      "I haven't eaten fast food in over five years.",
+      "Personally I haven't eaten fast food in over five years.",
+      "(p) I haven't eaten fast food in over five years."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I haven't eaten fast food in over five years.",
+      "As stated: I haven't eaten fast food in over five years.",
+      "Based on context: I haven't eaten fast food in over five years."
+    ]
+  },
+  {
+    "id": 139,
+    "topic": "negative",
+    "fact": "I won't go to restaurants that have TVs on the wall.",
+    "paraphrases": [
+      "I won't go to restaurants that have TVs on the wall.",
+      "Personally I won't go to restaurants that have TVs on the wall.",
+      "(p) I won't go to restaurants that have TVs on the wall."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I won't go to restaurants that have TVs on the wall.",
+      "As stated: I won't go to restaurants that have TVs on the wall.",
+      "Based on context: I won't go to restaurants that have TVs on the wall."
+    ]
+  },
+  {
+    "id": 140,
+    "topic": "negative",
+    "fact": "I don't subscribe to Netflix or any of the big streamers.",
+    "paraphrases": [
+      "I don't subscribe to Netflix or any of the big streamers.",
+      "Personally I don't subscribe to Netflix or any of the big streamers.",
+      "(p) I don't subscribe to Netflix or any of the big streamers."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't subscribe to Netflix or any of the big streamers.",
+      "As stated: I don't subscribe to Netflix or any of the big streamers.",
+      "Based on context: I don't subscribe to Netflix or any of the big streamers."
+    ]
+  },
+  {
+    "id": 141,
+    "topic": "negative",
+    "fact": "Beach trips aren't for me \u2014 I really don't like sand.",
+    "paraphrases": [
+      "Beach trips aren't for me \u2014 I really don't like sand.",
+      "Beach trips aren't for me \u2014 I really don't like sand.",
+      "(p) Beach trips aren't for me \u2014 I really don't like sand."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Beach trips aren't for me \u2014 I really don't like sand.",
+      "As stated: Beach trips aren't for me \u2014 I really don't like sand.",
+      "Based on context: Beach trips aren't for me \u2014 I really don't like sand."
+    ]
+  },
+  {
+    "id": 142,
+    "topic": "negative",
+    "fact": "I don't celebrate Halloween.",
+    "paraphrases": [
+      "I don't celebrate Halloween.",
+      "Personally I don't celebrate Halloween.",
+      "(p) I don't celebrate Halloween."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I don't celebrate Halloween.",
+      "As stated: I don't celebrate Halloween.",
+      "Based on context: I don't celebrate Halloween."
+    ]
+  },
+  {
+    "id": 143,
+    "topic": "negative",
+    "fact": "All my app notifications are off except SMS.",
+    "paraphrases": [
+      "All my app notifications are off except SMS.",
+      "All my app notifications are off except SMS.",
+      "(p) All my app notifications are off except SMS."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: All my app notifications are off except SMS.",
+      "As stated: All my app notifications are off except SMS.",
+      "Based on context: All my app notifications are off except SMS."
+    ]
+  },
+  {
+    "id": 144,
+    "topic": "negative",
+    "fact": "I won't buy products from companies with poor labor records.",
+    "paraphrases": [
+      "I won't buy products from companies with poor labor records.",
+      "Personally I won't buy products from companies with poor labor records.",
+      "(p) I won't buy products from companies with poor labor records."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I won't buy products from companies with poor labor records.",
+      "As stated: I won't buy products from companies with poor labor records.",
+      "Based on context: I won't buy products from companies with poor labor records."
+    ]
+  },
+  {
+    "id": 145,
+    "topic": "negative",
+    "fact": "Long phone calls drain me \u2014 I always prefer texting.",
+    "paraphrases": [
+      "Long phone calls drain me \u2014 I always prefer texting.",
+      "Long phone calls drain me \u2014 I always prefer texting.",
+      "(p) Long phone calls drain me \u2014 I always prefer texting."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Long phone calls drain me \u2014 I always prefer texting.",
+      "As stated: Long phone calls drain me \u2014 I always prefer texting.",
+      "Based on context: Long phone calls drain me \u2014 I always prefer texting."
+    ]
+  },
+  {
+    "id": 146,
+    "topic": "misc",
+    "fact": "My birthday is October 12.",
+    "paraphrases": [
+      "My birthday is October 12.",
+      "My birthday is October 12.",
+      "(p) My birthday is October 12."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: My birthday is October 12.",
+      "As stated: My birthday is October 12.",
+      "Based on context: My birthday is October 12."
+    ]
+  },
+  {
+    "id": 147,
+    "topic": "misc",
+    "fact": "Forest green is my favorite color.",
+    "paraphrases": [
+      "Forest green is my favorite color.",
+      "Forest green is my favorite color.",
+      "(p) Forest green is my favorite color."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Forest green is my favorite color.",
+      "As stated: Forest green is my favorite color.",
+      "Based on context: Forest green is my favorite color."
+    ]
+  },
+  {
+    "id": 148,
+    "topic": "misc",
+    "fact": "Late autumn is my favorite season.",
+    "paraphrases": [
+      "Late autumn is my favorite season.",
+      "Late autumn is my favorite season.",
+      "(p) Late autumn is my favorite season."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Late autumn is my favorite season.",
+      "As stated: Late autumn is my favorite season.",
+      "Based on context: Late autumn is my favorite season."
+    ]
+  },
+  {
+    "id": 149,
+    "topic": "misc",
+    "fact": "Lunar New Year is my favorite holiday.",
+    "paraphrases": [
+      "Lunar New Year is my favorite holiday.",
+      "Lunar New Year is my favorite holiday.",
+      "(p) Lunar New Year is my favorite holiday."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: Lunar New Year is my favorite holiday.",
+      "As stated: Lunar New Year is my favorite holiday.",
+      "Based on context: Lunar New Year is my favorite holiday."
+    ]
+  },
+  {
+    "id": 150,
+    "topic": "misc",
+    "fact": "I'm currently learning Rust as a third language after Python and Mandarin.",
+    "paraphrases": [
+      "I'm currently learning Rust as a third language after Python and Mandarin.",
+      "I'm currently learning Rust as a third language after Python and Mandarin.",
+      "(p) I'm currently learning Rust as a third language after Python and Mandarin."
+    ],
+    "questions": [
+      "Tell me about something the user does or prefers.",
+      "What is one of the user's preferences?",
+      "Can you describe a personal habit of the user?",
+      "What do you know about the user?",
+      "Describe one of the user's quirks."
+    ],
+    "reference_answers": [
+      "The user mentions: I'm currently learning Rust as a third language after Python and Mandarin.",
+      "As stated: I'm currently learning Rust as a third language after Python and Mandarin.",
+      "Based on context: I'm currently learning Rust as a third language after Python and Mandarin."
+    ]
+  }
+]
