@@ -1,4 +1,15 @@
-# Neuromorphic Memory Graph — Current Design
+# Neuromorphic Memory Graph — v2 attention-neuromod design
+
+> **HISTORICAL — superseded as the active research direction by the
+> graph-walker (see `docs/graph_walker.md` and `docs/pretrained_graph_walker.md`).**
+> The v2 attention-neuromod memory graph documented here is preserved
+> in `src/model/` and `src/pretrained/` for back-compat with v2 tests
+> and the v2 pretrained integration (`docs/pretrained_lm_memory.md`).
+> For new work, use the graph-walker architecture instead.
+>
+> Numerical defaults below may lag `src/model/config.py`. Trust the code
+> for current values; this doc is for design intent and architectural
+> rationale.
 
 Branch: `main`. This document reflects the architecture as of
 April 2026. Older planning docs in this folder describe earlier iterations

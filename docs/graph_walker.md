@@ -53,37 +53,48 @@ Execution-model choices that follow from the thesis:
 
 ## Current Default Shape
 
-From [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py):
+From [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/config.py)
+(verified 2026-05-04 — earlier versions of this section had stale numbers):
 
 - topology:
   - `L = 4` planes
   - `16 × 16` columns per plane
   - `N = 1024` total columns
-  - `K = 32` outgoing edges per column
+  - `K = 16` outgoing edges per column
 - widths:
   - `D_model = 1024` (external lexical width)
-  - `D_s = 512` (graph state + walker state)
-  - `D_id = 32` (column identity)
+  - `D_s = 256` (graph state + walker state)
+  - `D_id = 512` (column identity)
 - walker head:
   - `n_heads (H) = 4` persistent walkers
   - `n_score_heads = 4` multi-head edge scoring
   - `D_q_in = 64`, `D_q_per_head = 64`
 - hot MLP:
   - `content_mlp_depth = 4` residual FFN blocks
-  - `ffn_mult_content = 4` (D_hid = 2048)
+  - `D_hid_content = 1024` (decoupled from `ffn_mult_content * D_s`; the
+    older formula has been replaced by an explicit override since the
+    scale-up)
 - cold model-space stack:
-  - `post_model_depth = 7`, `post_model_ffn_mult = 4`
+  - `post_model_depth = 2`, `post_model_ffn_mult = 4`
 - clocks:
-  - `mod_period = 128` — plasticity window length
+  - `mod_period = 128` — plasticity window length (standalone walker)
   - `tbptt_block = 128` — gradient detach cadence (**must equal** `mod_period`)
-  - `segment_T = 256` — full segment length (`segment_T % mod_period == 0`
-    enforced in `__post_init__`; otherwise a partial window at segment end
-    would get CE training but no plasticity fire)
+  - `segment_T = 1024` — full segment length (standalone). The integration
+    enforces `segment_T == mod_period == tbptt_block` (single-knob clock
+    invariant under external-surprise plasticity)
 - neuromod (on by default):
-  - `neuromod_D_mod = 128`, `neuromod_n_layers = 2`, `neuromod_n_heads = 4`
-  - `neuromod_edge_hidden = 64`, `neuromod_eta = 1.0`, `E_bias_max = 4.0`
+  - `neuromod_D_mod = 512`, `neuromod_n_layers = 6`, `neuromod_n_heads = 8`
+  - `neuromod_edge_hidden = 384`, `neuromod_eta = 1.0`, `E_bias_max = 4.0`
+- plasticity:
+  - `plasticity_mode = "hebbian_plus_neuromod"` (standalone default).
+    `PretrainedGWConfig` factories override to `"neuromod_only"` for the
+    integration — see § Plasticity below.
 
-Total parameter count at defaults: about **106M**.
+Total parameter count at defaults: about **76M** (this number is
+config-sensitive; for live count run
+`sum(p.numel() for p in walker.parameters()) / 1e6`).
+
+For up-to-date throughput numbers see `docs/bench_results.md`.
 
 ## State
 
@@ -225,11 +236,27 @@ broadcast path.
 
 ## Plasticity
 
-Fires every `mod_period` tokens when `window_len == mod_period`.
-Orchestrated by `_maybe_finalize_surprise_and_plasticity` and
-implemented in `_plasticity_step` (graph_walker.py).
+`GraphWalkerConfig.plasticity_mode` selects between two distinct rules:
 
-### Path 1 — surprise-gated Hebbian (always on)
+- **`"hebbian_plus_neuromod"`** (default for the standalone walker):
+  both Path 1 (Hebbian) and Path 2 (neuromod) contribute additively
+  to `E_bias_flat`. The neuromod sees only per-column features;
+  Hebbian-flavored stats (co_visit, E_bias_old) are NOT fed to it.
+- **`"neuromod_only"`** (used by `PretrainedGWConfig` factories for
+  the integration): drops Path 1 entirely. Hebbian stats become
+  per-edge inputs to neuromod's edge MLP and per-head attention bias
+  ("Option C"), so the neuromod has the final say on every plastic
+  update. Surprise also enters as a per-touched-column feature.
+
+In standalone training, plasticity fires every `mod_period` tokens via
+`_maybe_finalize_surprise_and_plasticity` (called from the trainer's
+flush after CE is computed). In the integration, plasticity is fired
+**externally** once per training step via
+`memory.update_plasticity(per_token_ce)` after backward + opt.step
+— see `docs/pretrained_graph_walker.md` for the full external-surprise
+flow. Either way, the actual update is in `_plasticity_step` below.
+
+### Path 1 — surprise-gated Hebbian (only in `hebbian_plus_neuromod` mode)
 
 - `surprise_ema [B, K_h]` was **streamed in** from the training flush via
   `accumulate_block_ce` (see §Training below). No separate readout re-run.
@@ -355,24 +382,20 @@ K_h]` float32 per-position per-horizon cross-entropy (masked by
 
 ## Current Measured Throughput
 
-RTX 4090 (24 GB), defaults + CLI overrides. Runs with
-`PYTORCH_ALLOC_CONF=expandable_segments:True` set in
-[scripts/bench_graph_walker.py](/home/alex/code/neuromorphic/scripts/bench_graph_walker.py).
+For up-to-date numbers, see **`docs/bench_results.md`**. The table that
+used to live here described a `mod_period = tbptt_block = 48` config
+(BS=48-200, peak 461 ms/step, 20.8k tok/s @ BS=200, 21.1 GB ceiling)
+that no longer matches production defaults — the production walker
+config is now `mod_period = tbptt_block = 128`, and the integration
+config locks `T == mod_period == tbptt_block` under external-surprise
+plasticity. The headline numbers worth tracking now are:
 
-Config: `mod_period = tbptt_block = 48` (aligned, shorter than the
-default 128 to trade narrower credit horizon for more batch headroom):
+- **Standalone walker** (per `scripts/bench_walker_at_integration_config.py`)
+- **Integration step** (per `docs/bench_results.md`): 8.8k tok/s @
+  BS=16 / T=256 / 14.6 GB peak, 4090
 
-| BS  | ms/step | tok/s | peak VRAM |
-|-----|---------|-------|-----------|
-| 48  | 196     | 11.8k | 12.8 GB   |
-| 76  | 224     | 16.3k | 18.8 GB   |
-| 128 | 336     | 18.3k | 14.3 GB   |
-| 192 | 447     | 20.6k | 20.3 GB   |
-| **200** | **461** | **20.8k** | **21.1 GB** (ceiling) |
-
-Reference point: at `mod=tbptt=128, BS=26` the aligned config throughput
-is ~7.7k tok/s / 19.1 GB — longer credit horizon for the neuromod, at
-the cost of 60% less batch headroom.
+Both supersede the old table. Re-run the bench scripts whenever
+the config changes; don't trust this section for current numbers.
 
 ## Remaining Perf Frontier
 

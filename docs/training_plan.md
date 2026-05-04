@@ -1,5 +1,12 @@
 # Training Plan — Dataset + Reward Strategy for Memory-Augmented Llama
 
+> **PARTIALLY SUPERSEDED** — predates the graph-walker integration.
+> Some prose ("modulator emits a code → decoder → ΔW") describes the
+> v2 attention-neuromod path, not the current graph-walker. For the
+> *active* training plan, see `docs/training_strategy.md`. This doc is
+> kept for the dataset-tier landscape and reward-function research,
+> which are still useful — only the architectural framing is dated.
+
 **Status:** design. No training run launched yet. Written 2026-04-19 as a
 reference after researching the long-context memory benchmark landscape.
 

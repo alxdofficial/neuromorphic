@@ -71,7 +71,8 @@ src/pretrained/
 ├── config.py                    # PretrainedConfig, llama_1b() / llama_3b() factories
 ├── llm_wrapper.py               # PretrainedLMWithMemory — loads + freezes + wires
 ├── mem_inject_layer.py          # MemInjectLayer — wraps one LlamaDecoderLayer
-├── llama_mem_adapter.py         # duck-types Llama as the `lm` object memory expects
+├── mem_adapter.py               # MemAdapter (duck-types Llama as the `lm` object memory expects).
+│                                # `llama_mem_adapter.py` is a re-export shim for the old name.
 ├── rollout.py                   # autoregressive_rollout primitive (phase 2)
 ├── train_phase1.py              # run_phase1() — Gumbel bootstrap training loop
 └── train_phase2.py              # grpo_step() — REINFORCE on rollouts

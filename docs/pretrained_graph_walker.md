@@ -48,8 +48,11 @@ norm → lm_head → logits
   into the walker as `h_input`; no extra projection.
 - The walker runs T sequential steps inside `forward_segment`, with TBPTT
   detach every `cfg.tbptt_block` tokens.
-- Trainable surface: walker (~4-8M) + W_in/W_out (~12.6M on Llama-3.2-3B)
-  + scale (~3K). Llama itself fully frozen.
+- Trainable surface (production walker, post-scale-up, Llama-3.2-1B):
+  walker ~24.2M + W_in/W_out/scale ~1.1M ≈ **25.3M total**. (Earlier
+  versions of this doc claimed "~4-8M" — that was the pre-scale-up
+  walker config. Verified 2026-05-04 from
+  `wrapper.trainable_parameters()`.) Llama backbone fully frozen.
 
 ---
 

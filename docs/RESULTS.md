@@ -1,5 +1,10 @@
 # Attention-Neuromod Performance Results
 
+> **HISTORICAL** — these numbers are for the v2 attention-neuromod path,
+> which is preserved in main but no longer the active research direction.
+> The active path is the graph-walker — see `docs/bench_results.md` for
+> current throughput numbers.
+
 Running totals of every architecture variant tried on `main`
 branch, from the worst (conv-grid dense) to the best (NC=8 attention).
 

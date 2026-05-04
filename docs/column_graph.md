@@ -1,8 +1,12 @@
 # ColumnGraph — Plastic Concept Graph with Cross-Attention I/O
 
+> **HISTORICAL** — superseded by `docs/graph_walker.md` as the active
+> design direction. The column_graph code in `src/column_graph/` is
+> kept in tree for reference but is not actively trained on.
+
 **Branch:** TBD (from `main`), supersedes `gridworld`.
-**Status:** design in progress. Sections 1-8 agreed; section 9 lists what's
-still open.
+**Status:** design in progress (as of 2026-04-23). Sections 1-8 agreed;
+section 9 lists what's still open.
 **Date:** 2026-04-23.
 
 ## 1. Core thesis
