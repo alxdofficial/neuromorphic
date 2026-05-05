@@ -1,0 +1,3302 @@
+[
+  {
+    "id": 1,
+    "topic": "food",
+    "fact": "I prefer pepperoni pizza with onions instead of mushrooms.",
+    "paraphrases": [
+      "When I order pizza I always go for pepperoni and onions, not mushrooms.",
+      "My pizza order is pepperoni with onions; mushrooms are a no for me.",
+      "I'd rather have onions on my pepperoni pizza than mushrooms."
+    ],
+    "questions": [
+      "What kind of pizza does the user usually order?",
+      "If we were getting pizza for the user, what should we get?",
+      "Does the user like mushrooms on pizza?",
+      "Tell me about the user's pizza preferences.",
+      "What pizza toppings would the user pick?"
+    ],
+    "reference_answers": [
+      "The user prefers pepperoni pizza with onions and avoids mushrooms.",
+      "Pepperoni and onions, no mushrooms.",
+      "They like pepperoni with onions on pizza."
+    ]
+  },
+  {
+    "id": 2,
+    "topic": "food",
+    "fact": "I drink my coffee black, no sugar, no milk.",
+    "paraphrases": [
+      "I take my coffee plain \u2014 no milk, no sugar.",
+      "Black coffee for me, nothing added.",
+      "I prefer my coffee straight up, without sugar or milk."
+    ],
+    "questions": [
+      "How does the user take their coffee?",
+      "Does the user use cream and sugar in their coffee?",
+      "What's the user's coffee order?",
+      "If we made coffee for the user, would they want sugar?",
+      "Tell me how the user drinks coffee."
+    ],
+    "reference_answers": [
+      "The user drinks black coffee with no sugar or milk.",
+      "Black, no sugar, no milk.",
+      "They take their coffee plain \u2014 no additives."
+    ]
+  },
+  {
+    "id": 3,
+    "topic": "food",
+    "fact": "I always pick a spicy chicken sandwich over a plain one.",
+    "paraphrases": [
+      "Given the choice between spicy and plain chicken sandwiches, I always go spicy.",
+      "I'll take the spicy chicken sandwich every time over the plain version.",
+      "Spicy chicken beats plain for me at every sandwich shop."
+    ],
+    "questions": [
+      "Which chicken sandwich would the user choose?",
+      "Does the user prefer spicy or mild chicken?",
+      "What's the user's go-to fast-food chicken order?",
+      "If the menu has spicy and plain chicken, which does the user pick?",
+      "Tell me about the user's chicken sandwich preference."
+    ],
+    "reference_answers": [
+      "The user always picks the spicy chicken sandwich.",
+      "Spicy, not plain.",
+      "They prefer spicy chicken sandwiches over plain ones."
+    ]
+  },
+  {
+    "id": 4,
+    "topic": "food",
+    "fact": "I hate cilantro \u2014 it tastes like soap to me.",
+    "paraphrases": [
+      "Cilantro is a soap-tasting nightmare for me; I avoid it.",
+      "I'm one of those people who experiences cilantro as soap.",
+      "Cilantro tastes like soap to me, so I keep it off my plate."
+    ],
+    "questions": [
+      "How does the user feel about cilantro?",
+      "Should we add cilantro to a dish for the user?",
+      "What herb does the user dislike?",
+      "Tell me about the user's reaction to cilantro.",
+      "Why does the user avoid cilantro?"
+    ],
+    "reference_answers": [
+      "The user hates cilantro \u2014 it tastes like soap to them.",
+      "They avoid cilantro because of the soapy taste.",
+      "Cilantro is a hard no \u2014 it tastes like soap."
+    ]
+  },
+  {
+    "id": 5,
+    "topic": "food",
+    "fact": "Sunday brunch for me is always dim sum.",
+    "paraphrases": [
+      "On Sundays I'm at a dim sum spot \u2014 that's my brunch ritual.",
+      "Dim sum is my standard Sunday brunch.",
+      "Every Sunday I do brunch at a dim sum place."
+    ],
+    "questions": [
+      "What does the user do for Sunday brunch?",
+      "Where might the user be on a Sunday morning?",
+      "What's the user's brunch tradition?",
+      "Tell me about the user's weekend food habits.",
+      "If we wanted to join the user for brunch, where should we go?"
+    ],
+    "reference_answers": [
+      "The user does dim sum for brunch every Sunday.",
+      "Sunday brunch is dim sum for them.",
+      "They have a weekly Sunday-dim-sum ritual."
+    ]
+  },
+  {
+    "id": 6,
+    "topic": "food",
+    "fact": "At home I put oat milk in my coffee, not dairy.",
+    "paraphrases": [
+      "My home coffee gets oat milk; I skip cow's milk.",
+      "I splash oat milk in my coffee at home \u2014 no dairy.",
+      "When I make coffee at home, oat milk is what goes in, not regular milk."
+    ],
+    "questions": [
+      "What does the user put in their home coffee?",
+      "Does the user use dairy at home?",
+      "What kind of milk does the user keep around for coffee?",
+      "If we made coffee at the user's place, what milk would we find?",
+      "Tell me about the user's home coffee setup."
+    ],
+    "reference_answers": [
+      "The user uses oat milk in their coffee at home, not dairy.",
+      "Oat milk, not regular milk.",
+      "Coffee at home gets oat milk for them."
+    ]
+  },
+  {
+    "id": 7,
+    "topic": "food",
+    "fact": "My go-to snack is dark chocolate with sea salt.",
+    "paraphrases": [
+      "Dark chocolate with a hit of sea salt is my snack of choice.",
+      "I usually snack on dark-chocolate-with-sea-salt bars.",
+      "When I'm reaching for a snack, it's dark chocolate with sea salt."
+    ],
+    "questions": [
+      "What's the user's favorite snack?",
+      "If we wanted to bring the user a treat, what should we pick?",
+      "Does the user prefer sweet or salty snacks?",
+      "Tell me about the user's snacking habits.",
+      "What's a snack the user would always say yes to?"
+    ],
+    "reference_answers": [
+      "The user's go-to snack is dark chocolate with sea salt.",
+      "Dark chocolate and sea salt \u2014 their default snack.",
+      "They always reach for dark chocolate with sea salt."
+    ]
+  },
+  {
+    "id": 8,
+    "topic": "food",
+    "fact": "I'm allergic to shellfish, so no oysters or shrimp for me.",
+    "paraphrases": [
+      "Shellfish are off-limits \u2014 I'm allergic, so no shrimp, no oysters.",
+      "I have a shellfish allergy, which rules out things like shrimp and oysters.",
+      "Because I'm allergic to shellfish, I avoid the whole category."
+    ],
+    "questions": [
+      "Does the user have any food allergies?",
+      "Can the user eat shrimp?",
+      "What seafood should we avoid serving the user?",
+      "Tell me about the user's allergies.",
+      "If we ordered seafood for the user, what should we steer clear of?"
+    ],
+    "reference_answers": [
+      "The user is allergic to shellfish \u2014 no oysters or shrimp.",
+      "They have a shellfish allergy.",
+      "Avoid shellfish; they're allergic."
+    ]
+  },
+  {
+    "id": 9,
+    "topic": "food",
+    "fact": "Vietnamese pho is one of my favorite comfort foods.",
+    "paraphrases": [
+      "When I want comfort food, pho from a Vietnamese place hits the spot.",
+      "Vietnamese pho is high on my comfort-food list.",
+      "Pho is one of my go-to comfort meals."
+    ],
+    "questions": [
+      "What's a comfort food the user loves?",
+      "If the user is feeling under the weather, what might they crave?",
+      "What's a Vietnamese dish the user enjoys?",
+      "Tell me about the user's comfort-food preferences.",
+      "Does the user like soup-based dishes?"
+    ],
+    "reference_answers": [
+      "Vietnamese pho is one of the user's favorite comfort foods.",
+      "Pho \u2014 that's their comfort food.",
+      "They love pho when they want something comforting."
+    ]
+  },
+  {
+    "id": 10,
+    "topic": "food",
+    "fact": "I always ask for extra napkins when ordering burgers.",
+    "paraphrases": [
+      "Whenever I order a burger I make sure to grab extra napkins.",
+      "Burgers come with a request for extra napkins on my orders.",
+      "I always ask for more napkins than they give me with a burger."
+    ],
+    "questions": [
+      "What does the user always ask for at burger places?",
+      "Why might the user grab extra napkins at a restaurant?",
+      "Tell me about a quirk the user has with burgers.",
+      "What's a habit the user has when ordering burgers?",
+      "Does the user mind being messy with food?"
+    ],
+    "reference_answers": [
+      "The user always asks for extra napkins when ordering burgers.",
+      "Extra napkins \u2014 they always request them with burgers.",
+      "They like having extra napkins on hand at burger places."
+    ]
+  },
+  {
+    "id": 11,
+    "topic": "food",
+    "fact": "I keep a bottle of Cholula in my fridge at all times.",
+    "paraphrases": [
+      "There's always a Cholula bottle in my fridge.",
+      "I never run out of Cholula \u2014 it lives in my fridge.",
+      "Cholula is a permanent resident of my refrigerator door."
+    ],
+    "questions": [
+      "What hot sauce does the user keep around?",
+      "What might we find in the user's fridge door?",
+      "What's the user's go-to condiment?",
+      "Tell me about the user's spicy condiment habits.",
+      "Does the user use hot sauce at home?"
+    ],
+    "reference_answers": [
+      "The user keeps Cholula in their fridge at all times.",
+      "Cholula \u2014 it's always in their fridge.",
+      "They always have a bottle of Cholula on hand."
+    ]
+  },
+  {
+    "id": 12,
+    "topic": "food",
+    "fact": "I drink loose-leaf jasmine tea, not English breakfast.",
+    "paraphrases": [
+      "Loose-leaf jasmine is the tea I make; English breakfast doesn't appeal to me.",
+      "Jasmine tea \u2014 loose-leaf \u2014 over English breakfast for me.",
+      "I prefer loose-leaf jasmine over a stronger English breakfast tea."
+    ],
+    "questions": [
+      "What kind of tea does the user drink?",
+      "Does the user prefer English breakfast tea?",
+      "What's the user's preferred tea?",
+      "Tell me about the user's tea routine.",
+      "If we made the user tea, what would they want?"
+    ],
+    "reference_answers": [
+      "The user drinks loose-leaf jasmine tea, not English breakfast.",
+      "Jasmine \u2014 loose-leaf \u2014 over English breakfast.",
+      "They prefer loose-leaf jasmine tea."
+    ]
+  },
+  {
+    "id": 13,
+    "topic": "food",
+    "fact": "When I cook pasta I use way too much garlic.",
+    "paraphrases": [
+      "I overdo the garlic whenever I make pasta.",
+      "My pasta sauce is borderline irresponsible with garlic.",
+      "I never measure garlic for pasta \u2014 I just keep adding."
+    ],
+    "questions": [
+      "What ingredient does the user overdo when cooking pasta?",
+      "Tell me about the user's pasta-cooking style.",
+      "Does the user enjoy garlic?",
+      "What's a quirk in the user's home cooking?",
+      "If you tasted the user's pasta, what flavor would dominate?"
+    ],
+    "reference_answers": [
+      "The user uses way too much garlic when they make pasta.",
+      "Heavy garlic in their pasta cooking.",
+      "Their pasta is garlic-forward by design."
+    ]
+  },
+  {
+    "id": 14,
+    "topic": "food",
+    "fact": "Pickles on burgers ruin them for me.",
+    "paraphrases": [
+      "I can't stand pickles on a burger \u2014 it kills the whole thing.",
+      "Burgers and pickles don't mix in my book.",
+      "Add pickles to my burger and I won't eat it."
+    ],
+    "questions": [
+      "What does the user not want on their burger?",
+      "How does the user feel about pickles on a burger?",
+      "What's a deal-breaker on a burger for the user?",
+      "Tell me about the user's burger preferences.",
+      "Should we add pickles to the user's burger order?"
+    ],
+    "reference_answers": [
+      "Pickles on a burger ruin it for the user.",
+      "No pickles on the burger \u2014 they hate it.",
+      "They consider pickles on a burger a deal-breaker."
+    ]
+  },
+  {
+    "id": 15,
+    "topic": "food",
+    "fact": "Given the choice, I'll always pick a savory breakfast over a sweet one.",
+    "paraphrases": [
+      "Savory breakfasts are my default; I skip sweet ones when I can.",
+      "I'm a savory-breakfast person, not a pancakes-and-syrup person.",
+      "When breakfast options include savory, that's what I order."
+    ],
+    "questions": [
+      "Does the user prefer sweet or savory breakfasts?",
+      "What kind of breakfast would the user pick at a diner?",
+      "Tell me about the user's morning food preferences.",
+      "Should we serve the user pancakes for breakfast?",
+      "What's the user's breakfast style?"
+    ],
+    "reference_answers": [
+      "The user prefers savory breakfasts over sweet ones.",
+      "Savory, always.",
+      "They pick savory breakfast options when given the choice."
+    ]
+  },
+  {
+    "id": 16,
+    "topic": "food",
+    "fact": "I bake sourdough most weekends.",
+    "paraphrases": [
+      "Most Saturdays or Sundays I'm baking a sourdough loaf at home.",
+      "Sourdough baking is a near-weekly weekend ritual for me.",
+      "I keep a sourdough starter alive and bake from it most weekends."
+    ],
+    "questions": [
+      "What does the user bake on weekends?",
+      "Does the user keep a sourdough starter?",
+      "What's the user's weekend baking habit?",
+      "Tell me about the user's bread-baking.",
+      "What might we smell in the user's kitchen on a Sunday?"
+    ],
+    "reference_answers": [
+      "The user bakes sourdough most weekends.",
+      "Sourdough \u2014 they bake it most weekends.",
+      "They have a regular weekend sourdough-baking habit."
+    ]
+  },
+  {
+    "id": 17,
+    "topic": "food",
+    "fact": "I drink two glasses of water before bed every night.",
+    "paraphrases": [
+      "Right before bed I down two full glasses of water \u2014 every night.",
+      "My nighttime ritual includes two glasses of water before sleeping.",
+      "I always drink a couple glasses of water before going to bed."
+    ],
+    "questions": [
+      "What does the user do right before bed each night?",
+      "Tell me about the user's nighttime water habit.",
+      "Does the user drink water before sleeping?",
+      "What's a habit the user has at the end of every day?",
+      "How much water does the user drink at night?"
+    ],
+    "reference_answers": [
+      "The user drinks two glasses of water before bed each night.",
+      "Two glasses of water before sleep, every night.",
+      "They have a strict nightly two-glasses-of-water habit."
+    ]
+  },
+  {
+    "id": 18,
+    "topic": "food",
+    "fact": "I always buy eggs by the dozen, never six-packs.",
+    "paraphrases": [
+      "Eggs come in twelves at my house \u2014 I never buy half-cartons.",
+      "I default to a full dozen of eggs whenever I shop.",
+      "Six-packs of eggs feel pointless to me; I always grab a dozen."
+    ],
+    "questions": [
+      "How does the user buy eggs?",
+      "Does the user ever get the smaller egg cartons?",
+      "What's the user's grocery-store egg habit?",
+      "Tell me about the user's egg-buying.",
+      "What size egg carton does the user pick up?"
+    ],
+    "reference_answers": [
+      "The user always buys eggs by the dozen, never six-packs.",
+      "A dozen, never six.",
+      "They consistently choose the dozen-pack of eggs."
+    ]
+  },
+  {
+    "id": 19,
+    "topic": "food",
+    "fact": "Mayonnaise on sandwiches is a deal-breaker for me.",
+    "paraphrases": [
+      "Mayo on a sandwich and I won't eat it \u2014 it's a hard pass.",
+      "Sandwiches with mayo on them are a no for me.",
+      "I refuse sandwiches that have mayonnaise on them."
+    ],
+    "questions": [
+      "How does the user feel about mayonnaise on sandwiches?",
+      "What's something the user won't tolerate on a sandwich?",
+      "Should we add mayo to the user's sandwich order?",
+      "Tell me about the user's sandwich preferences.",
+      "What's a sandwich condiment the user avoids?"
+    ],
+    "reference_answers": [
+      "Mayo on sandwiches is a deal-breaker for the user.",
+      "No mayo on sandwiches \u2014 they refuse it.",
+      "They won't eat a sandwich with mayonnaise."
+    ]
+  },
+  {
+    "id": 20,
+    "topic": "food",
+    "fact": "I prefer thin-crust pizza over deep dish.",
+    "paraphrases": [
+      "Thin crust is my pizza style; deep dish doesn't do it for me.",
+      "Between thin crust and deep dish, I always pick thin.",
+      "I order thin-crust pizza when I have the choice."
+    ],
+    "questions": [
+      "What kind of pizza crust does the user prefer?",
+      "Does the user like deep-dish pizza?",
+      "Thin crust or deep dish for the user?",
+      "Tell me about the user's pizza-crust preference.",
+      "If we ordered Chicago-style for the user, would they enjoy it?"
+    ],
+    "reference_answers": [
+      "The user prefers thin-crust pizza over deep dish.",
+      "Thin crust, not deep dish.",
+      "They pick thin-crust pizza every time."
+    ]
+  },
+  {
+    "id": 21,
+    "topic": "tech",
+    "fact": "Whenever I run an AI agent on a remote host, I run it inside tmux.",
+    "paraphrases": [
+      "When I let an AI agent control a remote machine, the whole thing lives inside a tmux session.",
+      "Remote AI agents always go inside tmux for me, so I can detach and reattach.",
+      "I wrap any remote-AI-agent run in tmux."
+    ],
+    "questions": [
+      "What does the user wrap remote AI agent runs in?",
+      "How does the user keep AI agent sessions persistent on remote hosts?",
+      "Tell me how the user prefers to run AI agents on other computers.",
+      "Does the user use a session manager when running remote agents?",
+      "What's the user's setup for AI agents that operate other machines?"
+    ],
+    "reference_answers": [
+      "The user runs AI agents on remote hosts inside tmux sessions.",
+      "Inside tmux, so they can detach and reattach.",
+      "They wrap remote AI agent runs in tmux."
+    ]
+  },
+  {
+    "id": 22,
+    "topic": "tech",
+    "fact": "I prefer Linux over macOS for development work.",
+    "paraphrases": [
+      "Linux is my development environment of choice over macOS.",
+      "Given the option, I develop on Linux rather than macOS.",
+      "I'd rather code on Linux than on a Mac."
+    ],
+    "questions": [
+      "What OS does the user develop on?",
+      "Does the user prefer macOS or Linux for coding?",
+      "What's the user's development OS?",
+      "Tell me about the user's OS preference for work.",
+      "Would the user be comfortable on a Mac for development?"
+    ],
+    "reference_answers": [
+      "The user prefers Linux over macOS for development.",
+      "Linux for dev, not macOS.",
+      "They develop on Linux."
+    ]
+  },
+  {
+    "id": 23,
+    "topic": "tech",
+    "fact": "I use neovim with a custom config I've been refining for years.",
+    "paraphrases": [
+      "Neovim is my editor, and I've been tweaking my config for years.",
+      "I edit in neovim with a setup I've curated over a long time.",
+      "My neovim config has years of personal customization in it."
+    ],
+    "questions": [
+      "What text editor does the user use?",
+      "Has the user invested time in their editor config?",
+      "What's the user's editor of choice?",
+      "Tell me about the user's coding editor.",
+      "Does the user use VS Code?"
+    ],
+    "reference_answers": [
+      "The user uses neovim with a custom config built up over years.",
+      "Neovim with a heavily personalized config.",
+      "They edit in neovim with a long-running custom configuration."
+    ]
+  },
+  {
+    "id": 24,
+    "topic": "tech",
+    "fact": "My coding font is Fira Code with ligatures enabled.",
+    "paraphrases": [
+      "I write code in Fira Code with the ligatures turned on.",
+      "Fira Code, ligatures on \u2014 that's my coding font setup.",
+      "My terminal/editor font is Fira Code with ligatures."
+    ],
+    "questions": [
+      "What font does the user code in?",
+      "Does the user use coding ligatures?",
+      "Tell me about the user's coding font.",
+      "What's the user's editor font?",
+      "Would the user notice if I switched their font?"
+    ],
+    "reference_answers": [
+      "The user codes in Fira Code with ligatures enabled.",
+      "Fira Code, with ligatures.",
+      "Their coding font is Fira Code, ligatures on."
+    ]
+  },
+  {
+    "id": 25,
+    "topic": "tech",
+    "fact": "Alacritty is my terminal emulator of choice.",
+    "paraphrases": [
+      "Alacritty is what I open when I need a terminal.",
+      "I use Alacritty as my main terminal emulator.",
+      "My go-to terminal is Alacritty."
+    ],
+    "questions": [
+      "What terminal emulator does the user use?",
+      "Does the user use the default macOS terminal?",
+      "Tell me about the user's terminal setup.",
+      "What's the user's terminal of choice?",
+      "What terminal would we find on the user's machine?"
+    ],
+    "reference_answers": [
+      "The user uses Alacritty as their terminal emulator.",
+      "Alacritty.",
+      "They prefer Alacritty for the terminal."
+    ]
+  },
+  {
+    "id": 26,
+    "topic": "tech",
+    "fact": "I always push new branches with the -u flag for upstream tracking.",
+    "paraphrases": [
+      "When I push a new branch I always include -u to set upstream tracking.",
+      "git push -u is my muscle memory on every new branch.",
+      "I never forget the -u flag when pushing a fresh branch."
+    ],
+    "questions": [
+      "How does the user push new git branches?",
+      "Does the user manually configure upstream after pushing?",
+      "Tell me about the user's git push habits.",
+      "What flag does the user use on every git push?",
+      "What's the user's workflow for new branches?"
+    ],
+    "reference_answers": [
+      "The user always uses git push -u to set upstream tracking.",
+      "git push -u \u2014 every time.",
+      "They push new branches with -u for upstream."
+    ]
+  },
+  {
+    "id": 27,
+    "topic": "tech",
+    "fact": "Every IDE I use is in dark mode.",
+    "paraphrases": [
+      "Dark mode in every IDE \u2014 I never use light themes.",
+      "All my code editors run dark themes.",
+      "I switch every IDE I touch to dark mode."
+    ],
+    "questions": [
+      "Does the user prefer light or dark mode in their editors?",
+      "What theme does the user run in their IDEs?",
+      "Tell me about the user's editor color preference.",
+      "Would the user be comfortable using a light-mode editor?",
+      "What kind of theme is on the user's screen most of the day?"
+    ],
+    "reference_answers": [
+      "The user runs every IDE in dark mode.",
+      "Dark mode everywhere.",
+      "They use dark themes in all their IDEs."
+    ]
+  },
+  {
+    "id": 28,
+    "topic": "tech",
+    "fact": "I use zsh, not bash, on every machine I touch.",
+    "paraphrases": [
+      "zsh is my shell on every machine \u2014 bash is not my thing.",
+      "I install zsh as my login shell wherever I work.",
+      "I make sure zsh is the default shell, not bash."
+    ],
+    "questions": [
+      "What shell does the user use?",
+      "Does the user prefer bash?",
+      "Tell me about the user's terminal shell.",
+      "What's the first thing the user changes on a new machine's shell?",
+      "Would the user use a default-bash shell?"
+    ],
+    "reference_answers": [
+      "The user uses zsh as their shell on every machine.",
+      "zsh, not bash.",
+      "Their shell of choice is zsh everywhere."
+    ]
+  },
+  {
+    "id": 29,
+    "topic": "tech",
+    "fact": "I prefer toml over yaml for configuration files.",
+    "paraphrases": [
+      "When I write config files, toml beats yaml in my book.",
+      "yaml frustrates me; I'd rather use toml.",
+      "I pick toml for config formats over yaml."
+    ],
+    "questions": [
+      "What config format does the user prefer?",
+      "Does the user like yaml?",
+      "Tell me about the user's config-file preference.",
+      "Should we write the user's config in yaml?",
+      "What format would the user use for a project config?"
+    ],
+    "reference_answers": [
+      "The user prefers toml over yaml for config files.",
+      "toml over yaml.",
+      "They pick toml when writing configs."
+    ]
+  },
+  {
+    "id": 30,
+    "topic": "tech",
+    "fact": "Most of my code these days is Python or Rust.",
+    "paraphrases": [
+      "Python and Rust are the languages I write the most these days.",
+      "Lately I'm coding mostly in Python and Rust.",
+      "My current language stack is Python on one side, Rust on the other."
+    ],
+    "questions": [
+      "What languages does the user code in?",
+      "What's the user's current tech stack?",
+      "Tell me about the languages the user is writing recently.",
+      "Does the user use Java or C++?",
+      "What programming languages would we see on the user's machine?"
+    ],
+    "reference_answers": [
+      "The user writes mostly Python and Rust these days.",
+      "Python and Rust.",
+      "Their current languages are Python and Rust."
+    ]
+  },
+  {
+    "id": 31,
+    "topic": "tech",
+    "fact": "Claude Code is my primary coding assistant.",
+    "paraphrases": [
+      "I use Claude Code as my main coding assistant.",
+      "When I want AI coding help, Claude Code is what I reach for.",
+      "Claude Code is the assistant I lean on most for coding."
+    ],
+    "questions": [
+      "What AI coding tool does the user use?",
+      "Does the user use GitHub Copilot?",
+      "Tell me about the user's AI coding assistant.",
+      "What's the user's go-to AI for code?",
+      "Which AI helps the user code?"
+    ],
+    "reference_answers": [
+      "The user uses Claude Code as their primary coding assistant.",
+      "Claude Code is their main AI coding tool.",
+      "They lean on Claude Code for coding help."
+    ]
+  },
+  {
+    "id": 32,
+    "topic": "tech",
+    "fact": "I keep a GitHub PR template that I copy into every new repo.",
+    "paraphrases": [
+      "Every new repo gets my standard PR template copied in.",
+      "I have a personal GitHub PR template I reuse across every project.",
+      "I always paste my own PR template into a new repository."
+    ],
+    "questions": [
+      "What does the user do when starting a new repo?",
+      "Tell me about the user's GitHub workflow.",
+      "Does the user use a PR template?",
+      "What's a habit the user has for new repositories?",
+      "What might we find under .github/ in the user's repos?"
+    ],
+    "reference_answers": [
+      "The user keeps a GitHub PR template that they paste into every new repo.",
+      "They reuse a personal PR template across all their repos.",
+      "Standard PR template \u2014 copied into every new project."
+    ]
+  },
+  {
+    "id": 33,
+    "topic": "tech",
+    "fact": "For longer technical docs I prefer ReStructuredText over Markdown.",
+    "paraphrases": [
+      "Long-form technical docs go in ReStructuredText for me, not Markdown.",
+      "When the doc gets long, I switch from Markdown to RST.",
+      "I'd rather write a real technical doc in RST than Markdown."
+    ],
+    "questions": [
+      "What format does the user use for long technical docs?",
+      "Does the user prefer Markdown for everything?",
+      "Tell me about the user's technical-writing format.",
+      "When would the user pick ReStructuredText?",
+      "What docs format would the user use for a serious project?"
+    ],
+    "reference_answers": [
+      "The user prefers ReStructuredText over Markdown for longer technical docs.",
+      "RST for long docs, Markdown for short ones.",
+      "They use ReStructuredText when the doc gets serious."
+    ]
+  },
+  {
+    "id": 34,
+    "topic": "tech",
+    "fact": "I use ripgrep everywhere instead of plain grep.",
+    "paraphrases": [
+      "ripgrep has replaced grep in all my workflows.",
+      "I never reach for grep anymore \u2014 it's always rg.",
+      "rg is my default search tool, not grep."
+    ],
+    "questions": [
+      "What search tool does the user use in the terminal?",
+      "Tell me about the user's grep workflow.",
+      "Does the user still use grep?",
+      "What's the user's preferred file-search command?",
+      "What tool would the user use to search a codebase?"
+    ],
+    "reference_answers": [
+      "The user uses ripgrep instead of grep.",
+      "ripgrep \u2014 rg \u2014 not plain grep.",
+      "They've replaced grep with ripgrep everywhere."
+    ]
+  },
+  {
+    "id": 35,
+    "topic": "tech",
+    "fact": "Every Python project I start has pre-commit hooks set up day one.",
+    "paraphrases": [
+      "Pre-commit hooks are day-one setup on every Python project I create.",
+      "I install pre-commit before writing real code in any Python project.",
+      "Pre-commit hooks come first in my Python project init."
+    ],
+    "questions": [
+      "What does the user always set up at the start of a Python project?",
+      "Tell me about the user's pre-commit habit.",
+      "Does the user use pre-commit hooks?",
+      "What's a quality-of-code habit the user has?",
+      "What's the first thing the user configures in a new Python repo?"
+    ],
+    "reference_answers": [
+      "The user sets up pre-commit hooks on day one for every Python project.",
+      "Pre-commit, configured first thing.",
+      "They always start a Python project with pre-commit hooks."
+    ]
+  },
+  {
+    "id": 36,
+    "topic": "tech",
+    "fact": "I use uv for Python package management, never pip directly.",
+    "paraphrases": [
+      "uv is my Python package manager; I don't use pip directly anymore.",
+      "Plain pip is out \u2014 I use uv to manage Python packages.",
+      "I install Python deps with uv, not pip."
+    ],
+    "questions": [
+      "What package manager does the user use for Python?",
+      "Does the user use pip?",
+      "Tell me about the user's Python tooling.",
+      "How does the user install Python packages?",
+      "What tool replaces pip for the user?"
+    ],
+    "reference_answers": [
+      "The user uses uv for Python package management instead of pip.",
+      "uv \u2014 not pip.",
+      "They install Python packages with uv."
+    ]
+  },
+  {
+    "id": 37,
+    "topic": "tech",
+    "fact": "I disable IDE auto-imports \u2014 I prefer managing imports by hand.",
+    "paraphrases": [
+      "Auto-import is off in my IDE; I add imports manually.",
+      "I'd rather write my imports myself than let the IDE guess.",
+      "I turn off auto-imports in every IDE I use."
+    ],
+    "questions": [
+      "Does the user use IDE auto-import features?",
+      "How does the user manage imports?",
+      "Tell me about the user's IDE settings.",
+      "Why does the user dislike auto-imports?",
+      "What's a feature the user disables in IDEs?"
+    ],
+    "reference_answers": [
+      "The user disables IDE auto-imports and manages imports manually.",
+      "Manual imports \u2014 auto-import is off.",
+      "They prefer adding imports by hand."
+    ]
+  },
+  {
+    "id": 38,
+    "topic": "tech",
+    "fact": "First thing I do on any new machine is set up window-management keybindings.",
+    "paraphrases": [
+      "On a fresh machine, my first task is configuring window-management shortcuts.",
+      "Window-management keybindings are the first setup I do on a new system.",
+      "Before doing anything else on a new computer, I set up my window keybindings."
+    ],
+    "questions": [
+      "What does the user set up first on a new machine?",
+      "Tell me about the user's setup ritual.",
+      "What's a priority for the user when configuring a new computer?",
+      "Does the user customize their keyboard shortcuts?",
+      "Why might the user spend time on window management?"
+    ],
+    "reference_answers": [
+      "The user sets up window-management keybindings first on every new machine.",
+      "Window-management shortcuts \u2014 that's their first setup task.",
+      "First thing on a new computer is the window keybindings."
+    ]
+  },
+  {
+    "id": 39,
+    "topic": "tech",
+    "fact": "I store all credentials in 1Password.",
+    "paraphrases": [
+      "All my passwords and credentials live in 1Password.",
+      "1Password holds every credential I have.",
+      "I don't keep credentials anywhere except 1Password."
+    ],
+    "questions": [
+      "What password manager does the user use?",
+      "Tell me about the user's credential storage.",
+      "Does the user use Bitwarden?",
+      "Where does the user keep their passwords?",
+      "What's the user's secret-management tool?"
+    ],
+    "reference_answers": [
+      "The user stores all credentials in 1Password.",
+      "1Password.",
+      "They keep all their passwords in 1Password."
+    ]
+  },
+  {
+    "id": 40,
+    "topic": "tech",
+    "fact": "I only use SSH key authentication, never passwords.",
+    "paraphrases": [
+      "SSH for me is always key-based; I disable password auth.",
+      "I never use passwords on SSH \u2014 keys only.",
+      "Password-based SSH auth is off in my setup; I use keys exclusively."
+    ],
+    "questions": [
+      "How does the user authenticate over SSH?",
+      "Does the user use SSH passwords?",
+      "Tell me about the user's SSH security.",
+      "What kind of authentication does the user use for remote machines?",
+      "Why does the user disable password SSH?"
+    ],
+    "reference_answers": [
+      "The user only uses SSH key authentication, never passwords.",
+      "SSH keys only.",
+      "They disable password auth on SSH and use keys."
+    ]
+  },
+  {
+    "id": 41,
+    "topic": "hobbies",
+    "fact": "I go bouldering twice a week at the Hive gym.",
+    "paraphrases": [
+      "Hive bouldering twice weekly \u2014 that's my routine.",
+      "I climb at the Hive gym a couple times a week.",
+      "Two bouldering sessions per week at Hive is my standing schedule."
+    ],
+    "questions": [
+      "Where does the user go climbing?",
+      "How often does the user boulder?",
+      "Tell me about the user's exercise habits.",
+      "What's the user's hobby gym?",
+      "Does the user climb?"
+    ],
+    "reference_answers": [
+      "The user goes bouldering twice a week at the Hive gym.",
+      "Two days a week of bouldering at Hive.",
+      "Hive twice a week for climbing."
+    ]
+  },
+  {
+    "id": 42,
+    "topic": "hobbies",
+    "fact": "Most weekends I play Settlers of Catan with friends.",
+    "paraphrases": [
+      "Catan with friends is a near-weekly weekend thing for me.",
+      "Most weekends include a Catan night with my friend group.",
+      "I'm regularly at a Catan game on weekends."
+    ],
+    "questions": [
+      "What board game does the user play on weekends?",
+      "Tell me about the user's social weekend habits.",
+      "Does the user enjoy strategy board games?",
+      "What's the user's weekend game ritual?",
+      "What does the user do with friends most weekends?"
+    ],
+    "reference_answers": [
+      "The user plays Settlers of Catan with friends most weekends.",
+      "Catan, most weekends.",
+      "Weekend nights are often Catan with their friend group."
+    ]
+  },
+  {
+    "id": 43,
+    "topic": "hobbies",
+    "fact": "Lo-fi hip hop is my go-to genre while coding.",
+    "paraphrases": [
+      "While I code, lo-fi hip hop is what's playing.",
+      "Lo-fi hip hop is my coding-soundtrack default.",
+      "Coding sessions in my room have lo-fi hip hop in the background."
+    ],
+    "questions": [
+      "What does the user listen to while coding?",
+      "What kind of music helps the user focus?",
+      "Tell me about the user's coding playlist.",
+      "What genre is on the user's headphones at work?",
+      "What's the user's focus music?"
+    ],
+    "reference_answers": [
+      "The user listens to lo-fi hip hop while coding.",
+      "Lo-fi hip hop \u2014 that's their coding soundtrack.",
+      "Their coding music is lo-fi hip hop."
+    ]
+  },
+  {
+    "id": 44,
+    "topic": "hobbies",
+    "fact": "I read a lot of science fiction; Ted Chiang and Ursula K. Le Guin are my favorites.",
+    "paraphrases": [
+      "I read tons of sci-fi, especially anything by Ted Chiang or Ursula K. Le Guin.",
+      "Ted Chiang and Le Guin top my sci-fi reading list.",
+      "When I pick up sci-fi, it's usually Chiang or Le Guin."
+    ],
+    "questions": [
+      "What genre does the user read most?",
+      "Who are the user's favorite authors?",
+      "Tell me about the user's reading habits.",
+      "Does the user read fantasy or science fiction?",
+      "What books would we find on the user's shelf?"
+    ],
+    "reference_answers": [
+      "The user reads science fiction, especially Ted Chiang and Ursula K. Le Guin.",
+      "Sci-fi \u2014 favorite authors are Ted Chiang and Le Guin.",
+      "Their favorites are Chiang and Le Guin in sci-fi."
+    ]
+  },
+  {
+    "id": 45,
+    "topic": "hobbies",
+    "fact": "I own three different dice sets for tabletop RPGs.",
+    "paraphrases": [
+      "I keep three different dice sets for tabletop RPGs around.",
+      "Three dice sets live in my hobby drawer for tabletop games.",
+      "I have three full dice sets for my RPG sessions."
+    ],
+    "questions": [
+      "How many dice sets does the user have?",
+      "Does the user play tabletop RPGs?",
+      "Tell me about the user's tabletop hobby.",
+      "What might we find in the user's RPG bag?",
+      "What kind of game uses the user's dice?"
+    ],
+    "reference_answers": [
+      "The user owns three different dice sets for tabletop RPGs.",
+      "Three RPG dice sets.",
+      "They have three sets of polyhedral dice for tabletop play."
+    ]
+  },
+  {
+    "id": 46,
+    "topic": "hobbies",
+    "fact": "I play piano at an intermediate level.",
+    "paraphrases": [
+      "I play piano \u2014 not professionally, but at an intermediate level.",
+      "Piano is one of my hobbies; I'm intermediate-level.",
+      "I'm a comfortable intermediate piano player."
+    ],
+    "questions": [
+      "What instrument does the user play?",
+      "Tell me about the user's musical skills.",
+      "Is the user a professional musician?",
+      "What's the user's piano level?",
+      "Does the user play any instruments?"
+    ],
+    "reference_answers": [
+      "The user plays piano at an intermediate level.",
+      "Piano \u2014 intermediate.",
+      "They play intermediate piano."
+    ]
+  },
+  {
+    "id": 47,
+    "topic": "hobbies",
+    "fact": "When I watch anime I gravitate toward slice-of-life shows.",
+    "paraphrases": [
+      "Slice-of-life is the anime genre I tend to pick.",
+      "My anime watchlist is heavy on slice-of-life series.",
+      "I lean into slice-of-life when choosing anime."
+    ],
+    "questions": [
+      "What genre of anime does the user watch?",
+      "Does the user enjoy action-heavy anime?",
+      "Tell me about the user's anime preferences.",
+      "What kind of anime would the user pick?",
+      "What anime genre dominates the user's watchlist?"
+    ],
+    "reference_answers": [
+      "The user prefers slice-of-life anime.",
+      "Slice-of-life is their anime go-to.",
+      "Their anime taste leans slice-of-life."
+    ]
+  },
+  {
+    "id": 48,
+    "topic": "hobbies",
+    "fact": "I collect vintage typewriters and currently own four.",
+    "paraphrases": [
+      "Vintage typewriters are a hobby of mine; I have four right now.",
+      "I keep four vintage typewriters in my collection.",
+      "I'm a vintage-typewriter collector with four in my apartment."
+    ],
+    "questions": [
+      "What does the user collect?",
+      "How many typewriters does the user own?",
+      "Tell me about an unusual hobby of the user's.",
+      "What might we find on the user's shelf?",
+      "Does the user own any vintage objects?"
+    ],
+    "reference_answers": [
+      "The user collects vintage typewriters and owns four.",
+      "Four vintage typewriters.",
+      "They have a small vintage typewriter collection \u2014 four pieces."
+    ]
+  },
+  {
+    "id": 49,
+    "topic": "hobbies",
+    "fact": "I bird-watch; my favorite spot was a pileated woodpecker.",
+    "paraphrases": [
+      "I bird-watch as a hobby \u2014 the pileated woodpecker is my best sighting.",
+      "My favorite bird I've ever spotted was a pileated woodpecker; I'm a casual birder.",
+      "Bird-watching is something I do, and the pileated woodpecker stands out."
+    ],
+    "questions": [
+      "What outdoor hobby does the user have?",
+      "What bird stands out in the user's memory?",
+      "Tell me about the user's birding.",
+      "Does the user pay attention to wildlife?",
+      "What's a hobby that involves binoculars for the user?"
+    ],
+    "reference_answers": [
+      "The user bird-watches and was excited about spotting a pileated woodpecker.",
+      "Birding \u2014 favorite sighting was a pileated woodpecker.",
+      "They are a birder; pileated woodpecker is their favorite spot."
+    ]
+  },
+  {
+    "id": 50,
+    "topic": "hobbies",
+    "fact": "Building mechanical keyboards is one of my hobbies.",
+    "paraphrases": [
+      "I build mechanical keyboards as a hobby.",
+      "Mechanical-keyboard building is something I do for fun.",
+      "Custom mechanical keyboards are one of my projects."
+    ],
+    "questions": [
+      "What does the user build as a hobby?",
+      "Tell me about the user's keyboard hobby.",
+      "Does the user customize their hardware?",
+      "What's something the user makes themselves?",
+      "What hardware project might be on the user's desk?"
+    ],
+    "reference_answers": [
+      "The user builds mechanical keyboards as a hobby.",
+      "Mechanical keyboards \u2014 they build them.",
+      "They take up mechanical-keyboard building as a hobby."
+    ]
+  },
+  {
+    "id": 51,
+    "topic": "hobbies",
+    "fact": "I play Magic: The Gathering, mostly Modern format.",
+    "paraphrases": [
+      "Magic: The Gathering is one of my games \u2014 I mainly play Modern.",
+      "I'm a Magic player; my preferred format is Modern.",
+      "Modern is my Magic format of choice."
+    ],
+    "questions": [
+      "What card game does the user play?",
+      "What Magic: The Gathering format does the user prefer?",
+      "Tell me about the user's MTG.",
+      "Does the user play Standard or Modern Magic?",
+      "What kind of card games might the user be in to?"
+    ],
+    "reference_answers": [
+      "The user plays Magic: The Gathering, primarily Modern format.",
+      "Magic, Modern format.",
+      "Their Magic: The Gathering format is Modern."
+    ]
+  },
+  {
+    "id": 52,
+    "topic": "hobbies",
+    "fact": "Every other weekend I go hiking somewhere in BC.",
+    "paraphrases": [
+      "I'm out hiking somewhere in British Columbia every other weekend.",
+      "BC hikes happen biweekly for me on weekends.",
+      "Every second weekend I take off for a BC hiking trip."
+    ],
+    "questions": [
+      "How often does the user hike?",
+      "Where does the user usually hike?",
+      "Tell me about the user's outdoor habits.",
+      "What's the user's biweekly outdoor activity?",
+      "Does the user spend time outdoors?"
+    ],
+    "reference_answers": [
+      "The user hikes somewhere in British Columbia every other weekend.",
+      "Biweekly BC hikes.",
+      "They go hiking in BC every second weekend."
+    ]
+  },
+  {
+    "id": 53,
+    "topic": "hobbies",
+    "fact": "I knit scarves in winter to stay sane during dark months.",
+    "paraphrases": [
+      "Winter knitting (mostly scarves) is how I cope with the dark months.",
+      "I knit scarves through the dark winters as a sanity-preserver.",
+      "Winters mean knitting scarves for me, partly for the calm."
+    ],
+    "questions": [
+      "What does the user do in winter to stay sane?",
+      "Does the user have a winter hobby?",
+      "Tell me about the user's winter habits.",
+      "What craft does the user pick up?",
+      "How does the user cope with dark months?"
+    ],
+    "reference_answers": [
+      "The user knits scarves in winter to stay sane.",
+      "Knitting scarves \u2014 winter sanity hobby.",
+      "They knit scarves through dark months as a coping habit."
+    ]
+  },
+  {
+    "id": 54,
+    "topic": "hobbies",
+    "fact": "I have a small succulent collection lined up on my windowsill.",
+    "paraphrases": [
+      "There's a small lineup of succulents on my windowsill.",
+      "I keep a small collection of succulents at home, on the windowsill.",
+      "My windowsill has a row of little succulent plants."
+    ],
+    "questions": [
+      "What plants does the user keep at home?",
+      "Where does the user keep their plants?",
+      "Tell me about the user's home greenery.",
+      "Does the user have any houseplants?",
+      "What's growing on the user's windowsill?"
+    ],
+    "reference_answers": [
+      "The user has a small succulent collection on their windowsill.",
+      "Succulents on the windowsill.",
+      "They keep a row of succulents by the window."
+    ]
+  },
+  {
+    "id": 55,
+    "topic": "hobbies",
+    "fact": "I brew my own kombucha at home.",
+    "paraphrases": [
+      "Kombucha brewing is something I do at home.",
+      "I make my own kombucha rather than buying it.",
+      "There's always a fresh batch of homemade kombucha in my kitchen."
+    ],
+    "questions": [
+      "Does the user brew anything at home?",
+      "What does the user make in their kitchen as a hobby?",
+      "Tell me about the user's fermentation habits.",
+      "What kind of drink does the user produce themselves?",
+      "Does the user buy or brew kombucha?"
+    ],
+    "reference_answers": [
+      "The user brews kombucha at home.",
+      "Homemade kombucha.",
+      "They make their own kombucha."
+    ]
+  },
+  {
+    "id": 56,
+    "topic": "media",
+    "fact": "Radiohead is my favorite band of all time.",
+    "paraphrases": [
+      "If I have to pick a favorite band, it's Radiohead.",
+      "Radiohead tops my all-time band list.",
+      "No band beats Radiohead for me."
+    ],
+    "questions": [
+      "Who's the user's favorite band?",
+      "What music does the user feel strongest about?",
+      "Tell me about the user's musical hero.",
+      "What's the band the user would name first?",
+      "If we made a Radiohead playlist for the user, would they like it?"
+    ],
+    "reference_answers": [
+      "Radiohead is the user's favorite band of all time.",
+      "Radiohead.",
+      "Their all-time favorite band is Radiohead."
+    ]
+  },
+  {
+    "id": 57,
+    "topic": "media",
+    "fact": "I listen to Tycho when I work out.",
+    "paraphrases": [
+      "Tycho is my workout soundtrack.",
+      "When I'm exercising, Tycho is what's playing.",
+      "Workouts get a Tycho soundtrack from me."
+    ],
+    "questions": [
+      "What does the user listen to during workouts?",
+      "What's the user's workout playlist?",
+      "Tell me about the user's exercise music.",
+      "Who does the user listen to at the gym?",
+      "What artist gets the user moving?"
+    ],
+    "reference_answers": [
+      "The user listens to Tycho during workouts.",
+      "Tycho \u2014 workout music.",
+      "Their gym soundtrack is Tycho."
+    ]
+  },
+  {
+    "id": 58,
+    "topic": "media",
+    "fact": "Country music is the one genre I can't stand.",
+    "paraphrases": [
+      "Country is the one music genre I actively avoid.",
+      "Anything country and I'm out \u2014 it's the genre I can't take.",
+      "Country music doesn't work for me at all."
+    ],
+    "questions": [
+      "What music genre does the user dislike?",
+      "Should we put on country at the user's place?",
+      "Tell me about the user's musical dislikes.",
+      "What kind of music turns the user off?",
+      "Is the user a fan of country music?"
+    ],
+    "reference_answers": [
+      "The user can't stand country music.",
+      "Country \u2014 they hate it.",
+      "Country is the one genre they avoid."
+    ]
+  },
+  {
+    "id": 59,
+    "topic": "media",
+    "fact": "I subscribe to the Criterion Channel for older films.",
+    "paraphrases": [
+      "Criterion Channel is what I use to watch older movies.",
+      "I pay for the Criterion Channel because of the back catalog.",
+      "Older films come to me via my Criterion Channel subscription."
+    ],
+    "questions": [
+      "What movie streaming service does the user pay for?",
+      "Where does the user watch older films?",
+      "Tell me about the user's film consumption.",
+      "Does the user have a Criterion subscription?",
+      "What's a streaming service the user prefers?"
+    ],
+    "reference_answers": [
+      "The user subscribes to the Criterion Channel for older films.",
+      "Criterion Channel.",
+      "They pay for the Criterion Channel to watch older movies."
+    ]
+  },
+  {
+    "id": 60,
+    "topic": "media",
+    "fact": "Spirited Away is my favorite movie of all time.",
+    "paraphrases": [
+      "Of every movie ever, Spirited Away is mine.",
+      "My all-time favorite film is Spirited Away.",
+      "Spirited Away tops my movie list."
+    ],
+    "questions": [
+      "What's the user's favorite movie?",
+      "What film does the user love most?",
+      "Tell me about the user's film tastes.",
+      "If we asked the user to name a single best movie, what would they say?",
+      "What movie comes to mind first for the user?"
+    ],
+    "reference_answers": [
+      "Spirited Away is the user's favorite movie of all time.",
+      "Spirited Away.",
+      "Their favorite film is Spirited Away."
+    ]
+  },
+  {
+    "id": 61,
+    "topic": "media",
+    "fact": "I read physical books only \u2014 no e-readers.",
+    "paraphrases": [
+      "I stick to physical books; I don't use e-readers.",
+      "E-readers aren't for me \u2014 paper books only.",
+      "When I read, it's always a physical book."
+    ],
+    "questions": [
+      "Does the user use a Kindle?",
+      "How does the user read books?",
+      "Tell me about the user's reading format.",
+      "Should we get the user an e-reader?",
+      "What's the user's stance on physical vs digital books?"
+    ],
+    "reference_answers": [
+      "The user reads physical books only \u2014 no e-readers.",
+      "Paper books, no e-readers.",
+      "They stick to physical books."
+    ]
+  },
+  {
+    "id": 62,
+    "topic": "media",
+    "fact": "I read The New Yorker every week.",
+    "paraphrases": [
+      "The New Yorker hits my mailbox weekly and I read it cover to cover.",
+      "Weekly New Yorker reading is part of my routine.",
+      "I keep up with The New Yorker every week."
+    ],
+    "questions": [
+      "What magazine does the user subscribe to?",
+      "Does the user read weekly publications?",
+      "Tell me about the user's print-magazine habits.",
+      "Where does the user get long-form journalism?",
+      "What's a magazine on the user's coffee table?"
+    ],
+    "reference_answers": [
+      "The user reads The New Yorker every week.",
+      "Weekly New Yorker.",
+      "They subscribe to and read The New Yorker each week."
+    ]
+  },
+  {
+    "id": 63,
+    "topic": "media",
+    "fact": "I don't watch sports on TV.",
+    "paraphrases": [
+      "Sports broadcasts aren't part of my TV habits.",
+      "I don't tune in for sports.",
+      "TV sports \u2014 not something I watch."
+    ],
+    "questions": [
+      "Does the user follow professional sports on TV?",
+      "Should we invite the user over for the game?",
+      "Tell me about the user's TV habits around sports.",
+      "What's something the user actively doesn't watch?",
+      "Is the user a sports fan?"
+    ],
+    "reference_answers": [
+      "The user doesn't watch sports on TV.",
+      "No sports on TV for them.",
+      "They aren't a TV-sports viewer."
+    ]
+  },
+  {
+    "id": 64,
+    "topic": "media",
+    "fact": "I try to go to one concert per month when budget allows.",
+    "paraphrases": [
+      "When I can afford it, I try to catch a concert each month.",
+      "About one concert a month is my target \u2014 budget permitting.",
+      "I aim for monthly concerts when money's there."
+    ],
+    "questions": [
+      "How often does the user go to concerts?",
+      "Tell me about the user's live-music habits.",
+      "Does the user attend music events?",
+      "What's the user's concert frequency?",
+      "What pace does the user keep for live shows?"
+    ],
+    "reference_answers": [
+      "The user tries to go to one concert per month when budget allows.",
+      "About one concert a month.",
+      "Roughly monthly concert attendance, budget permitting."
+    ]
+  },
+  {
+    "id": 65,
+    "topic": "media",
+    "fact": "I listen to The Daily podcast over breakfast every morning.",
+    "paraphrases": [
+      "Breakfast comes with The Daily podcast every morning.",
+      "I listen to The Daily during my morning meal.",
+      "Mornings include The Daily podcast for me."
+    ],
+    "questions": [
+      "What podcast does the user listen to in the morning?",
+      "What's part of the user's morning routine?",
+      "Tell me about the user's breakfast habits.",
+      "Does the user listen to The Daily?",
+      "What's playing at breakfast for the user?"
+    ],
+    "reference_answers": [
+      "The user listens to The Daily podcast over breakfast every morning.",
+      "The Daily, every morning.",
+      "Their breakfast podcast is The Daily."
+    ]
+  },
+  {
+    "id": 66,
+    "topic": "media",
+    "fact": "I have a vinyl turntable and about 50 records.",
+    "paraphrases": [
+      "There's a turntable in my apartment with about 50 records.",
+      "I keep a vinyl setup; my collection sits around 50 records.",
+      "A vinyl turntable and roughly 50 LPs live in my place."
+    ],
+    "questions": [
+      "Does the user own a record player?",
+      "How big is the user's vinyl collection?",
+      "Tell me about the user's audio setup.",
+      "What might we find spinning at the user's place?",
+      "Does the user collect vinyl?"
+    ],
+    "reference_answers": [
+      "The user has a vinyl turntable and around 50 records.",
+      "About 50 records on a turntable.",
+      "They own a vinyl setup with ~50 LPs."
+    ]
+  },
+  {
+    "id": 67,
+    "topic": "media",
+    "fact": "I prefer instrumental or lyrics-light music while reading.",
+    "paraphrases": [
+      "When I'm reading I want something instrumental or low on lyrics.",
+      "Lyrics distract me when reading; I pick instrumental tracks.",
+      "Reading time gets instrumental or lyric-light music from me."
+    ],
+    "questions": [
+      "What kind of music does the user prefer while reading?",
+      "Does the user listen to vocals while studying?",
+      "Tell me about the user's reading-music style.",
+      "What plays while the user reads?",
+      "Should we put on a vocal-heavy album for the user's reading time?"
+    ],
+    "reference_answers": [
+      "The user prefers instrumental or lyric-light music while reading.",
+      "Instrumental for reading.",
+      "They pick lyric-light music when reading."
+    ]
+  },
+  {
+    "id": 68,
+    "topic": "media",
+    "fact": "Musicals make me cringe \u2014 I avoid them entirely.",
+    "paraphrases": [
+      "Musicals aren't for me \u2014 they make me cringe.",
+      "I avoid musicals; the format makes me uncomfortable.",
+      "I steer clear of musicals \u2014 not my thing at all."
+    ],
+    "questions": [
+      "How does the user feel about musicals?",
+      "Should we invite the user to a Broadway show?",
+      "Tell me about the user's theatre tastes.",
+      "Does the user enjoy musical films?",
+      "What kind of show does the user dislike?"
+    ],
+    "reference_answers": [
+      "The user can't stand musicals and avoids them.",
+      "Musicals \u2014 hate them.",
+      "They cringe at musicals and skip them."
+    ]
+  },
+  {
+    "id": 69,
+    "topic": "media",
+    "fact": "Every winter I rewatch all the Studio Ghibli films.",
+    "paraphrases": [
+      "Studio Ghibli rewatches are an annual winter tradition for me.",
+      "Every winter I do a full Ghibli rewatch.",
+      "Winters mean rewatching the entire Studio Ghibli library."
+    ],
+    "questions": [
+      "What does the user rewatch every winter?",
+      "Tell me about the user's seasonal viewing habits.",
+      "Does the user have a winter movie tradition?",
+      "What animation studio does the user love?",
+      "What does the user do with their winter evenings?"
+    ],
+    "reference_answers": [
+      "Every winter the user rewatches all the Studio Ghibli films.",
+      "Annual winter Ghibli rewatch.",
+      "They do a full Studio Ghibli rewatch every winter."
+    ]
+  },
+  {
+    "id": 70,
+    "topic": "media",
+    "fact": "Bong Joon-ho is my favorite director working today.",
+    "paraphrases": [
+      "Of currently-working directors, Bong Joon-ho is my favorite.",
+      "Bong Joon-ho is the director I most admire among the active ones.",
+      "I rank Bong Joon-ho at the top of my contemporary-director list."
+    ],
+    "questions": [
+      "Who's the user's favorite filmmaker?",
+      "What current director does the user admire?",
+      "Tell me about the user's director preferences.",
+      "If we picked a film for the user, whose work might land best?",
+      "Whose movies does the user follow closely?"
+    ],
+    "reference_answers": [
+      "Bong Joon-ho is the user's favorite working director.",
+      "Bong Joon-ho.",
+      "Their favorite contemporary director is Bong Joon-ho."
+    ]
+  },
+  {
+    "id": 71,
+    "topic": "travel",
+    "fact": "I've been to Japan three times; Kyoto is my favorite city.",
+    "paraphrases": [
+      "I've made three trips to Japan, and Kyoto is my favorite city there.",
+      "Out of my three Japan visits, Kyoto is the city I love most.",
+      "Three trips to Japan in the books \u2014 Kyoto stands out."
+    ],
+    "questions": [
+      "How many times has the user been to Japan?",
+      "What's the user's favorite Japanese city?",
+      "Tell me about the user's Japan travel.",
+      "Has the user been to Tokyo or Kyoto?",
+      "Where in Japan would the user go again?"
+    ],
+    "reference_answers": [
+      "The user has been to Japan three times and likes Kyoto best.",
+      "Three Japan trips; Kyoto is their favorite.",
+      "Kyoto is their favorite city in Japan, and they've been three times."
+    ]
+  },
+  {
+    "id": 72,
+    "topic": "travel",
+    "fact": "I always book window seats on flights.",
+    "paraphrases": [
+      "Window seat is what I pick for every flight.",
+      "I never fly without a window seat if I can help it.",
+      "When I book flights, the seat is always a window."
+    ],
+    "questions": [
+      "What seat does the user pick on flights?",
+      "Does the user prefer the aisle?",
+      "Tell me about the user's flight habits.",
+      "What's the user's seat-selection preference?",
+      "Should we book the user a middle seat?"
+    ],
+    "reference_answers": [
+      "The user always books window seats.",
+      "Window seats \u2014 every flight.",
+      "Their flight seat preference is always the window."
+    ]
+  },
+  {
+    "id": 73,
+    "topic": "travel",
+    "fact": "Aisle seats annoy me \u2014 I never pick them voluntarily.",
+    "paraphrases": [
+      "Aisle seats bother me; I never voluntarily sit in one.",
+      "I avoid the aisle on planes \u2014 it irritates me.",
+      "I'd rather not be in an aisle seat on a flight."
+    ],
+    "questions": [
+      "How does the user feel about aisle seats?",
+      "Would the user choose an aisle seat?",
+      "Tell me about the user's seat dislikes.",
+      "What flight seat does the user not like?",
+      "Should we put the user on the aisle?"
+    ],
+    "reference_answers": [
+      "Aisle seats annoy the user; they never pick them voluntarily.",
+      "They dislike aisle seats.",
+      "Aisle seats are a no for them."
+    ]
+  },
+  {
+    "id": 74,
+    "topic": "travel",
+    "fact": "I always carry a backup phone charger in my travel bag.",
+    "paraphrases": [
+      "A backup phone charger is always in my travel bag.",
+      "I never travel without an extra phone charger.",
+      "An extra charger lives permanently in my travel kit."
+    ],
+    "questions": [
+      "What does the user always pack for travel?",
+      "Tell me about the user's travel-bag essentials.",
+      "Does the user travel light?",
+      "What backup item does the user keep in their travel kit?",
+      "What's a travel staple for the user?"
+    ],
+    "reference_answers": [
+      "The user always carries a backup phone charger when traveling.",
+      "A backup phone charger \u2014 always.",
+      "Their travel bag always has a spare phone charger."
+    ]
+  },
+  {
+    "id": 75,
+    "topic": "travel",
+    "fact": "For solo trips I prefer hostels over hotels.",
+    "paraphrases": [
+      "When I travel alone I pick hostels over hotels.",
+      "Solo trips for me mean hostels, not hotel rooms.",
+      "I'd rather stay in a hostel than a hotel when going solo."
+    ],
+    "questions": [
+      "Where does the user stay when traveling alone?",
+      "Hostel or hotel for the user's solo trips?",
+      "Tell me about the user's solo-travel style.",
+      "Would the user pick a fancy hotel for solo travel?",
+      "What kind of accommodation does the user prefer alone?"
+    ],
+    "reference_answers": [
+      "The user prefers hostels over hotels for solo trips.",
+      "Hostels for solo travel.",
+      "They go hostels, not hotels, when traveling alone."
+    ]
+  },
+  {
+    "id": 76,
+    "topic": "travel",
+    "fact": "I speak conversational Mandarin.",
+    "paraphrases": [
+      "I can hold a conversation in Mandarin.",
+      "Mandarin is a language I speak conversationally.",
+      "I'm conversational in Mandarin."
+    ],
+    "questions": [
+      "What languages does the user speak?",
+      "Can the user have a conversation in Mandarin?",
+      "Tell me about the user's languages.",
+      "Does the user know any Asian languages?",
+      "What's the user's second language ability?"
+    ],
+    "reference_answers": [
+      "The user speaks conversational Mandarin.",
+      "Mandarin \u2014 conversational level.",
+      "They are conversational in Mandarin."
+    ]
+  },
+  {
+    "id": 77,
+    "topic": "travel",
+    "fact": "My passport has stamps from 14 different countries.",
+    "paraphrases": [
+      "I've got stamps from 14 countries in my passport.",
+      "My passport totals 14 country stamps.",
+      "Fourteen countries have stamped my passport."
+    ],
+    "questions": [
+      "How many countries has the user been to?",
+      "What does the user's passport look like?",
+      "Tell me about the user's travel history.",
+      "Has the user traveled internationally a lot?",
+      "Roughly how many country stamps does the user have?"
+    ],
+    "reference_answers": [
+      "The user has stamps from 14 countries in their passport.",
+      "14 country stamps.",
+      "They've visited 14 different countries by passport count."
+    ]
+  },
+  {
+    "id": 78,
+    "topic": "travel",
+    "fact": "I bring a small notebook for sketches and notes on every trip.",
+    "paraphrases": [
+      "A small notebook for sketches and notes goes with me on every trip.",
+      "Every trip, I pack a small sketch-and-notes notebook.",
+      "I never travel without a little notebook for jotting and drawing."
+    ],
+    "questions": [
+      "What does the user bring on every trip for sketching?",
+      "Tell me about the user's travel journaling.",
+      "Does the user keep a notebook when traveling?",
+      "What's a creative item in the user's travel bag?",
+      "How does the user record trips?"
+    ],
+    "reference_answers": [
+      "The user brings a small notebook for sketches and notes on every trip.",
+      "A small notebook for trip notes and sketches.",
+      "They always pack a notebook for sketching and writing on trips."
+    ]
+  },
+  {
+    "id": 79,
+    "topic": "travel",
+    "fact": "I avoid organized tour groups; I'd rather wander solo.",
+    "paraphrases": [
+      "Tour groups aren't for me \u2014 I'd rather explore on my own.",
+      "I avoid organized tours; solo wandering is better.",
+      "Group tours don't appeal to me; I like to wander alone."
+    ],
+    "questions": [
+      "Does the user enjoy guided tours?",
+      "What's the user's travel style?",
+      "Tell me about the user's stance on tour groups.",
+      "Should we book the user a group tour?",
+      "How does the user explore new places?"
+    ],
+    "reference_answers": [
+      "The user avoids organized tour groups and prefers solo wandering.",
+      "No tour groups; solo exploration.",
+      "They'd rather wander on their own than join a tour."
+    ]
+  },
+  {
+    "id": 80,
+    "topic": "travel",
+    "fact": "I bring my own AeroPress on every trip \u2014 hotel coffee is hopeless.",
+    "paraphrases": [
+      "AeroPress travels with me everywhere because hotel coffee is bad.",
+      "I pack an AeroPress on every trip; hotel coffee just doesn't cut it.",
+      "Hotel coffee is awful, so I bring my AeroPress."
+    ],
+    "questions": [
+      "What coffee gear does the user travel with?",
+      "How does the user solve the bad-hotel-coffee problem?",
+      "Tell me about the user's travel coffee setup.",
+      "Does the user trust hotel coffee?",
+      "What item does the user pack to avoid hotel coffee?"
+    ],
+    "reference_answers": [
+      "The user brings their own AeroPress on every trip.",
+      "AeroPress, every trip.",
+      "They travel with an AeroPress because hotel coffee is hopeless."
+    ]
+  },
+  {
+    "id": 81,
+    "topic": "workflow",
+    "fact": "I wake up at 6:30 am every weekday.",
+    "paraphrases": [
+      "Weekdays start at 6:30 am for me.",
+      "My weekday alarm is set for 6:30.",
+      "I'm up at 6:30 every weekday morning."
+    ],
+    "questions": [
+      "What time does the user wake up on weekdays?",
+      "Tell me about the user's morning schedule.",
+      "Is the user an early riser?",
+      "When does the user start the day?",
+      "Does the user sleep in on weekdays?"
+    ],
+    "reference_answers": [
+      "The user wakes up at 6:30 am every weekday.",
+      "6:30 am every weekday.",
+      "Their weekday wakeup is 6:30 am."
+    ]
+  },
+  {
+    "id": 82,
+    "topic": "workflow",
+    "fact": "Every afternoon I take a 20-minute walk to clear my head.",
+    "paraphrases": [
+      "I do a 20-minute afternoon walk daily for headspace.",
+      "A 20-minute walk in the afternoon is part of my daily routine.",
+      "Afternoons get a 20-minute walk to reset my head."
+    ],
+    "questions": [
+      "What does the user do in the afternoons?",
+      "Tell me about the user's mid-day routine.",
+      "Does the user take walks?",
+      "How does the user reset during the day?",
+      "What's a small daily habit of the user's?"
+    ],
+    "reference_answers": [
+      "The user takes a 20-minute walk every afternoon.",
+      "20-minute afternoon walk daily.",
+      "Their daily clear-head ritual is a 20-minute walk."
+    ]
+  },
+  {
+    "id": 83,
+    "topic": "workflow",
+    "fact": "I don't check email on weekends.",
+    "paraphrases": [
+      "Email stays closed on weekends for me.",
+      "I keep weekends email-free.",
+      "Saturdays and Sundays are no-email zones."
+    ],
+    "questions": [
+      "Does the user check email on weekends?",
+      "Tell me about the user's weekend habits with work.",
+      "Should we email the user on a Saturday?",
+      "How does the user handle weekend communication?",
+      "What's the user's stance on email out of office hours?"
+    ],
+    "reference_answers": [
+      "The user doesn't check email on weekends.",
+      "No weekend email.",
+      "They keep weekends email-free."
+    ]
+  },
+  {
+    "id": 84,
+    "topic": "workflow",
+    "fact": "I work in 50-minute focus blocks with short breaks in between.",
+    "paraphrases": [
+      "My focus blocks are 50 minutes, with breaks between.",
+      "I structure work in 50-minute deep-focus chunks.",
+      "Fifty-minute focus blocks plus short breaks is my work pattern."
+    ],
+    "questions": [
+      "What's the user's focus-block length?",
+      "Tell me about the user's productivity system.",
+      "Does the user use the Pomodoro method?",
+      "How does the user organize focused work?",
+      "What's the user's rhythm for deep work?"
+    ],
+    "reference_answers": [
+      "The user works in 50-minute focus blocks with short breaks.",
+      "50-minute focus blocks.",
+      "Their work rhythm is 50-on, short-break, repeat."
+    ]
+  },
+  {
+    "id": 85,
+    "topic": "workflow",
+    "fact": "I write a journal entry every Sunday evening.",
+    "paraphrases": [
+      "Sunday evenings I sit down to write a journal entry.",
+      "A weekly journal entry happens for me on Sundays.",
+      "Every Sunday night I journal."
+    ],
+    "questions": [
+      "When does the user journal?",
+      "Tell me about the user's weekly reflection habit.",
+      "Does the user keep a journal?",
+      "What does the user do on Sunday evenings?",
+      "What's a weekly habit for the user?"
+    ],
+    "reference_answers": [
+      "The user writes a journal entry every Sunday evening.",
+      "Sunday-evening journaling.",
+      "They journal weekly on Sunday nights."
+    ]
+  },
+  {
+    "id": 86,
+    "topic": "workflow",
+    "fact": "I plan the next day's tasks the night before.",
+    "paraphrases": [
+      "Tomorrow's task list gets written the night before.",
+      "I prep the next day's plan in the evening.",
+      "I always have tomorrow's tasks set by bedtime."
+    ],
+    "questions": [
+      "How does the user plan their day?",
+      "When does the user write their daily to-do list?",
+      "Tell me about the user's planning habit.",
+      "Does the user plan in the morning or evening?",
+      "What's a productivity habit the user has?"
+    ],
+    "reference_answers": [
+      "The user plans the next day's tasks the night before.",
+      "Plans tomorrow's tasks at night.",
+      "They prep the next day's to-do list in the evening."
+    ]
+  },
+  {
+    "id": 87,
+    "topic": "workflow",
+    "fact": "I skip breakfast \u2014 just coffee until about 11am.",
+    "paraphrases": [
+      "I don't eat breakfast; coffee gets me to about 11.",
+      "Mornings are coffee-only until 11ish for me.",
+      "Breakfast isn't a thing in my routine \u2014 just coffee until late morning."
+    ],
+    "questions": [
+      "Does the user eat breakfast?",
+      "What does the user have in the mornings?",
+      "Tell me about the user's morning eating.",
+      "Until what time does the user fast in the morning?",
+      "Should we plan a 9am breakfast meeting with the user?"
+    ],
+    "reference_answers": [
+      "The user skips breakfast and has only coffee until about 11am.",
+      "No breakfast \u2014 just coffee until 11.",
+      "Their morning is coffee-only until late morning."
+    ]
+  },
+  {
+    "id": 88,
+    "topic": "workflow",
+    "fact": "I take a 30-minute nap most afternoons.",
+    "paraphrases": [
+      "Most afternoons I get in a 30-minute nap.",
+      "A daily 30-minute afternoon nap is part of my schedule.",
+      "I usually nap for half an hour in the afternoons."
+    ],
+    "questions": [
+      "Does the user nap during the day?",
+      "Tell me about the user's afternoon schedule.",
+      "How long are the user's naps?",
+      "What's a quirk in the user's day?",
+      "What does the user do mid-afternoon?"
+    ],
+    "reference_answers": [
+      "The user takes a 30-minute afternoon nap most days.",
+      "30-minute afternoon nap, most days.",
+      "They nap for about 30 minutes in the afternoon."
+    ]
+  },
+  {
+    "id": 89,
+    "topic": "workflow",
+    "fact": "I wake up to a sunrise lamp instead of a phone alarm.",
+    "paraphrases": [
+      "A sunrise lamp wakes me up; I don't use a phone alarm.",
+      "My alarm is a sunrise lamp, not a phone.",
+      "I switched from a phone alarm to a sunrise lamp."
+    ],
+    "questions": [
+      "How does the user wake up?",
+      "Does the user use a phone alarm?",
+      "Tell me about the user's alarm setup.",
+      "What kind of light wakes the user?",
+      "What's the user's morning-alarm device?"
+    ],
+    "reference_answers": [
+      "The user wakes up to a sunrise lamp instead of a phone alarm.",
+      "Sunrise lamp, not phone alarm.",
+      "They use a sunrise lamp as their alarm."
+    ]
+  },
+  {
+    "id": 90,
+    "topic": "workflow",
+    "fact": "I have a hard cutoff at 7pm \u2014 no work after that.",
+    "paraphrases": [
+      "Work stops at 7pm \u2014 that's a firm rule for me.",
+      "I don't do any work past 7pm, no exceptions.",
+      "After 7pm I'm completely off work."
+    ],
+    "questions": [
+      "When does the user stop working?",
+      "Does the user work in the evenings?",
+      "Tell me about the user's work-life cutoff.",
+      "Should we schedule a 9pm meeting with the user?",
+      "How late does the user work?"
+    ],
+    "reference_answers": [
+      "The user has a hard cutoff at 7pm and doesn't work after that.",
+      "Work stops at 7pm.",
+      "Their day-end cutoff is 7pm."
+    ]
+  },
+  {
+    "id": 91,
+    "topic": "fitness",
+    "fact": "I bike to work every day, including in the rain.",
+    "paraphrases": [
+      "Daily bike commute, rain or not.",
+      "I bike to work every single day; weather doesn't stop me.",
+      "My commute is on a bike, even when it's raining."
+    ],
+    "questions": [
+      "How does the user commute?",
+      "Does the user drive to work?",
+      "Tell me about the user's transportation.",
+      "Does rain affect the user's commute?",
+      "What's the user's daily transport?"
+    ],
+    "reference_answers": [
+      "The user bikes to work every day, including in the rain.",
+      "Daily bike commute, rain or shine.",
+      "They commute by bike year-round."
+    ]
+  },
+  {
+    "id": 92,
+    "topic": "fitness",
+    "fact": "I hate running but I love swimming.",
+    "paraphrases": [
+      "Running is a no for me; swimming I love.",
+      "I'd rather swim every day than run once.",
+      "Swimming I love, running I can't stand."
+    ],
+    "questions": [
+      "Does the user enjoy running?",
+      "What cardio does the user prefer?",
+      "Tell me about the user's exercise preferences.",
+      "Should the user join a running club?",
+      "What aerobic activity does the user pick?"
+    ],
+    "reference_answers": [
+      "The user hates running but loves swimming.",
+      "Swimming yes, running no.",
+      "They prefer swimming over running."
+    ]
+  },
+  {
+    "id": 93,
+    "topic": "fitness",
+    "fact": "I go to a yoga class every Saturday morning.",
+    "paraphrases": [
+      "Saturday mornings I'm at yoga class.",
+      "A weekly Saturday yoga class is in my routine.",
+      "I attend yoga every Saturday."
+    ],
+    "questions": [
+      "What does the user do Saturday mornings?",
+      "Tell me about the user's weekly yoga.",
+      "Does the user practice yoga?",
+      "What's a Saturday-morning ritual for the user?",
+      "How often does the user do yoga?"
+    ],
+    "reference_answers": [
+      "The user goes to a yoga class every Saturday morning.",
+      "Weekly Saturday yoga.",
+      "Their Saturday mornings are yoga class."
+    ]
+  },
+  {
+    "id": 94,
+    "topic": "fitness",
+    "fact": "I don't lift weights \u2014 I prefer bodyweight training.",
+    "paraphrases": [
+      "Weights aren't my thing \u2014 I do bodyweight training.",
+      "I skip the weight room; bodyweight is my approach.",
+      "Bodyweight, not free weights, for me."
+    ],
+    "questions": [
+      "What kind of strength training does the user do?",
+      "Does the user lift weights?",
+      "Tell me about the user's strength approach.",
+      "What kind of equipment does the user need to train?",
+      "Does the user use a gym for weights?"
+    ],
+    "reference_answers": [
+      "The user prefers bodyweight training over weights.",
+      "Bodyweight, not weights.",
+      "They train with bodyweight movements rather than weights."
+    ]
+  },
+  {
+    "id": 95,
+    "topic": "fitness",
+    "fact": "I consistently send V5\u2013V6 boulder grades.",
+    "paraphrases": [
+      "My consistent boulder grade is V5 to V6.",
+      "I climb V5\u2013V6 boulders pretty consistently.",
+      "V5 and V6 are my comfort range when bouldering."
+    ],
+    "questions": [
+      "What boulder grades does the user climb?",
+      "How experienced a climber is the user?",
+      "Tell me about the user's climbing level.",
+      "What grade range does the user send?",
+      "Could the user finish a V6?"
+    ],
+    "reference_answers": [
+      "The user consistently sends V5\u2013V6 boulder grades.",
+      "V5 to V6 boulders.",
+      "Their climbing level is V5\u2013V6 consistent."
+    ]
+  },
+  {
+    "id": 96,
+    "topic": "fitness",
+    "fact": "I play pickup soccer once a week.",
+    "paraphrases": [
+      "Pickup soccer is a once-a-week thing for me.",
+      "I play soccer pickup once a week.",
+      "There's a weekly pickup soccer game on my calendar."
+    ],
+    "questions": [
+      "What sport does the user play weekly?",
+      "Tell me about the user's team-sport habit.",
+      "Does the user play in a soccer league?",
+      "How often does the user play soccer?",
+      "What pickup game is in the user's schedule?"
+    ],
+    "reference_answers": [
+      "The user plays pickup soccer once a week.",
+      "Weekly pickup soccer.",
+      "They have a once-a-week pickup soccer game."
+    ]
+  },
+  {
+    "id": 97,
+    "topic": "fitness",
+    "fact": "I do cold plunges three times a week.",
+    "paraphrases": [
+      "Three weekly cold plunges are part of my routine.",
+      "I cold-plunge three times a week.",
+      "Cold-water immersion happens three times every week for me."
+    ],
+    "questions": [
+      "Does the user do cold-water exposure?",
+      "How often does the user cold-plunge?",
+      "Tell me about the user's wellness routine.",
+      "What's a recovery practice for the user?",
+      "What's a thrice-weekly habit for the user?"
+    ],
+    "reference_answers": [
+      "The user does cold plunges three times a week.",
+      "Cold plunges 3x/week.",
+      "Three weekly cold plunges."
+    ]
+  },
+  {
+    "id": 98,
+    "topic": "fitness",
+    "fact": "Treadmills bore me \u2014 I do all my cardio outdoors.",
+    "paraphrases": [
+      "I find treadmills boring, so my cardio is all outside.",
+      "Outdoor cardio only \u2014 treadmills don't hold my attention.",
+      "I avoid treadmills and run/cycle outdoors."
+    ],
+    "questions": [
+      "Does the user use treadmills?",
+      "Where does the user do cardio?",
+      "Tell me about the user's cardio preferences.",
+      "Should we suggest the user a treadmill workout?",
+      "How does the user feel about indoor cardio?"
+    ],
+    "reference_answers": [
+      "The user finds treadmills boring and does all cardio outdoors.",
+      "Outdoor cardio only.",
+      "They skip treadmills in favor of outdoor cardio."
+    ]
+  },
+  {
+    "id": 99,
+    "topic": "fitness",
+    "fact": "I track all my workouts in a Notion database.",
+    "paraphrases": [
+      "All my workouts go into a Notion database I keep.",
+      "I log every workout in a personal Notion database.",
+      "Notion is where my workout log lives."
+    ],
+    "questions": [
+      "How does the user track workouts?",
+      "What tool does the user log fitness in?",
+      "Tell me about the user's workout-tracking system.",
+      "Does the user use Strava?",
+      "Where does the user keep their workout data?"
+    ],
+    "reference_answers": [
+      "The user tracks workouts in a Notion database.",
+      "Notion database for workouts.",
+      "Their workout log is in Notion."
+    ]
+  },
+  {
+    "id": 100,
+    "topic": "fitness",
+    "fact": "I don't drink protein shakes.",
+    "paraphrases": [
+      "Protein shakes aren't part of my routine.",
+      "I avoid protein shakes.",
+      "I don't bother with protein shakes."
+    ],
+    "questions": [
+      "Does the user use protein shakes?",
+      "What's the user's stance on supplements?",
+      "Tell me about the user's nutrition for workouts.",
+      "Should we get the user a protein shake?",
+      "What does the user not consume after workouts?"
+    ],
+    "reference_answers": [
+      "The user doesn't drink protein shakes.",
+      "No protein shakes.",
+      "They skip protein shakes."
+    ]
+  },
+  {
+    "id": 101,
+    "topic": "home",
+    "fact": "I have a black cat named Soba.",
+    "paraphrases": [
+      "I have a black cat \u2014 her name is Soba.",
+      "Soba is my black cat.",
+      "There's a black cat at home with me named Soba."
+    ],
+    "questions": [
+      "Does the user have a pet?",
+      "What's the user's cat's name?",
+      "Tell me about the user's pets.",
+      "What animal lives with the user?",
+      "What color is the user's cat?"
+    ],
+    "reference_answers": [
+      "The user has a black cat named Soba.",
+      "Soba \u2014 a black cat.",
+      "Their pet is a black cat named Soba."
+    ]
+  },
+  {
+    "id": 102,
+    "topic": "home",
+    "fact": "Soba is allergic to fish, so I can't feed her tuna.",
+    "paraphrases": [
+      "Soba (my cat) has a fish allergy \u2014 no tuna for her.",
+      "Fish is off the menu for Soba; she's allergic.",
+      "My cat Soba is allergic to fish, so tuna is a no."
+    ],
+    "questions": [
+      "Does the user's cat have any allergies?",
+      "Can the user feed their cat tuna?",
+      "Tell me about Soba's diet.",
+      "What food should we avoid giving the user's cat?",
+      "What's an allergy in the user's household?"
+    ],
+    "reference_answers": [
+      "Soba, the user's cat, is allergic to fish, so no tuna.",
+      "Cat is allergic to fish.",
+      "The user's cat can't have fish \u2014 she's allergic."
+    ]
+  },
+  {
+    "id": 103,
+    "topic": "home",
+    "fact": "I live in a 700 square foot apartment in Mount Pleasant.",
+    "paraphrases": [
+      "Mount Pleasant is my neighborhood; my apartment is about 700 sqft.",
+      "I'm in a small (700 sqft) Mount Pleasant apartment.",
+      "I live in Mount Pleasant in a 700-square-foot apartment."
+    ],
+    "questions": [
+      "Where does the user live?",
+      "How big is the user's apartment?",
+      "Tell me about the user's living situation.",
+      "What neighborhood is the user in?",
+      "Does the user live in a house or apartment?"
+    ],
+    "reference_answers": [
+      "The user lives in a 700 sqft apartment in Mount Pleasant.",
+      "Mount Pleasant, 700 sqft apartment.",
+      "Their apartment is in Mount Pleasant, around 700 square feet."
+    ]
+  },
+  {
+    "id": 104,
+    "topic": "home",
+    "fact": "I have a standing desk set up in my bedroom.",
+    "paraphrases": [
+      "There's a standing desk in my bedroom.",
+      "My bedroom has a standing-desk setup.",
+      "I work from a standing desk in my bedroom."
+    ],
+    "questions": [
+      "What kind of desk does the user use?",
+      "Where does the user work from at home?",
+      "Tell me about the user's home office.",
+      "Does the user have a standing desk?",
+      "What furniture would we find in the user's bedroom?"
+    ],
+    "reference_answers": [
+      "The user has a standing desk in their bedroom.",
+      "Standing desk in the bedroom.",
+      "Their work setup is a standing desk in the bedroom."
+    ]
+  },
+  {
+    "id": 105,
+    "topic": "home",
+    "fact": "I sleep with the window open year-round.",
+    "paraphrases": [
+      "My bedroom window stays open all year, even in winter.",
+      "I keep the window open while sleeping no matter the season.",
+      "Year-round, I sleep with the window cracked."
+    ],
+    "questions": [
+      "How does the user sleep \u2014 window open or closed?",
+      "Does the user keep windows shut at night?",
+      "Tell me about the user's sleeping setup.",
+      "What's the user's nighttime air preference?",
+      "Does the user mind cold air while sleeping?"
+    ],
+    "reference_answers": [
+      "The user sleeps with the window open year-round.",
+      "Window open all year.",
+      "They keep the bedroom window open every night."
+    ]
+  },
+  {
+    "id": 106,
+    "topic": "home",
+    "fact": "No shoes inside the apartment \u2014 strict rule.",
+    "paraphrases": [
+      "I have a strict no-shoes-inside rule for my apartment.",
+      "Shoes off at the door is non-negotiable in my place.",
+      "Inside my apartment, no one wears shoes \u2014 it's a strict rule."
+    ],
+    "questions": [
+      "What's the user's shoe rule at home?",
+      "Should we keep our shoes on at the user's place?",
+      "Tell me about the user's apartment etiquette.",
+      "Are shoes allowed inside the user's home?",
+      "What does the user expect of guests?"
+    ],
+    "reference_answers": [
+      "The user has a strict no-shoes-inside rule for their apartment.",
+      "Shoes off at the door.",
+      "No shoes inside their apartment, strictly enforced."
+    ]
+  },
+  {
+    "id": 107,
+    "topic": "home",
+    "fact": "I keep my apartment cool, around 65\u00b0F.",
+    "paraphrases": [
+      "My apartment runs cool \u2014 around 65\u00b0F.",
+      "I keep things cold at home, somewhere near 65\u00b0F.",
+      "My thermostat sits near 65 degrees."
+    ],
+    "questions": [
+      "What temperature does the user keep their apartment at?",
+      "Is the user's place warm or cool?",
+      "Tell me about the user's thermostat preference.",
+      "Should we expect a warm apartment at the user's?",
+      "How cold is the user's home?"
+    ],
+    "reference_answers": [
+      "The user keeps their apartment around 65\u00b0F.",
+      "Around 65\u00b0F at home.",
+      "Their apartment runs cool \u2014 about 65\u00b0F."
+    ]
+  },
+  {
+    "id": 108,
+    "topic": "home",
+    "fact": "I own a Roomba and I named it Jeeves.",
+    "paraphrases": [
+      "There's a Roomba in my apartment named Jeeves.",
+      "My Roomba is called Jeeves.",
+      "Jeeves is the name of my Roomba."
+    ],
+    "questions": [
+      "Does the user own a robot vacuum?",
+      "What's the name of the user's Roomba?",
+      "Tell me about the user's home appliances.",
+      "What gadgets help the user clean?",
+      "Does the user have a robot in the house?"
+    ],
+    "reference_answers": [
+      "The user owns a Roomba named Jeeves.",
+      "Jeeves the Roomba.",
+      "Their Roomba is called Jeeves."
+    ]
+  },
+  {
+    "id": 109,
+    "topic": "home",
+    "fact": "I have about twenty cookbooks lining one kitchen shelf.",
+    "paraphrases": [
+      "About twenty cookbooks fill one of my kitchen shelves.",
+      "I keep around 20 cookbooks on a shelf in the kitchen.",
+      "One shelf in my kitchen is dedicated to ~20 cookbooks."
+    ],
+    "questions": [
+      "How many cookbooks does the user own?",
+      "Tell me about the user's kitchen.",
+      "Does the user collect cookbooks?",
+      "What's on the user's kitchen shelf?",
+      "Where does the user keep cookbooks?"
+    ],
+    "reference_answers": [
+      "The user keeps about twenty cookbooks on a kitchen shelf.",
+      "About 20 cookbooks in the kitchen.",
+      "They have ~20 cookbooks lining a kitchen shelf."
+    ]
+  },
+  {
+    "id": 110,
+    "topic": "home",
+    "fact": "There are always fresh flowers on my kitchen counter.",
+    "paraphrases": [
+      "I keep fresh flowers on the kitchen counter all the time.",
+      "Fresh flowers are a permanent fixture on my kitchen counter.",
+      "There's always a small flower arrangement in my kitchen."
+    ],
+    "questions": [
+      "What does the user keep on their kitchen counter?",
+      "Tell me about the user's home decor.",
+      "Does the user buy flowers regularly?",
+      "What's a regular item in the user's kitchen?",
+      "What might we find on the user's counter?"
+    ],
+    "reference_answers": [
+      "The user always has fresh flowers on their kitchen counter.",
+      "Fresh flowers \u2014 always on the counter.",
+      "Their kitchen counter always has flowers."
+    ]
+  },
+  {
+    "id": 111,
+    "topic": "opinions",
+    "fact": "I think long Slack messages are rude \u2014 async writing should always summarize.",
+    "paraphrases": [
+      "Long Slack messages feel rude to me; async writing should be summarized.",
+      "I find long Slack messages disrespectful of others' time.",
+      "I think async writing should be summarized \u2014 long Slack walls are rude."
+    ],
+    "questions": [
+      "How does the user feel about long Slack messages?",
+      "What's the user's view on async communication?",
+      "Tell me about the user's communication etiquette.",
+      "Should we send a long unsummarized message to the user?",
+      "What does the user think about long-form Slack?"
+    ],
+    "reference_answers": [
+      "The user thinks long Slack messages are rude \u2014 async should be summarized.",
+      "Long Slack messages feel rude to them.",
+      "They believe async writing should always summarize."
+    ]
+  },
+  {
+    "id": 112,
+    "topic": "opinions",
+    "fact": "I'm an inbox-zero person at all times.",
+    "paraphrases": [
+      "Inbox zero is my permanent state.",
+      "I keep my inbox at zero, always.",
+      "I never let my inbox accumulate \u2014 it's always at zero."
+    ],
+    "questions": [
+      "What's the user's email-management style?",
+      "Tell me about the user's inbox philosophy.",
+      "Does the user let email pile up?",
+      "How does the user keep up with email?",
+      "Is the user a zero-inbox person?"
+    ],
+    "reference_answers": [
+      "The user maintains inbox zero at all times.",
+      "Inbox zero, always.",
+      "Their inbox is always at zero."
+    ]
+  },
+  {
+    "id": 113,
+    "topic": "opinions",
+    "fact": "I'm a pacifist and I don't watch violent films.",
+    "paraphrases": [
+      "I'm a pacifist; violent films aren't something I watch.",
+      "Pacifism is part of who I am \u2014 I avoid violent movies.",
+      "Violent films don't fit with my pacifist views."
+    ],
+    "questions": [
+      "What's the user's stance on violence in media?",
+      "Does the user watch action films?",
+      "Tell me about the user's values around violence.",
+      "Would the user enjoy a war film?",
+      "What kind of films does the user avoid?"
+    ],
+    "reference_answers": [
+      "The user is a pacifist and avoids violent films.",
+      "Pacifist \u2014 no violent films.",
+      "They avoid violent films because of their pacifist views."
+    ]
+  },
+  {
+    "id": 114,
+    "topic": "opinions",
+    "fact": "I'm skeptical of cryptocurrency as an investment vehicle.",
+    "paraphrases": [
+      "Crypto as an investment? I'm skeptical.",
+      "I don't trust cryptocurrency as a serious investment.",
+      "I take a skeptical view of investing in cryptocurrency."
+    ],
+    "questions": [
+      "What's the user's view on crypto?",
+      "Does the user invest in cryptocurrency?",
+      "Tell me about the user's stance on crypto investing.",
+      "Would the user buy Bitcoin?",
+      "How does the user feel about crypto as an asset?"
+    ],
+    "reference_answers": [
+      "The user is skeptical of cryptocurrency as an investment.",
+      "Skeptical of crypto.",
+      "They don't trust cryptocurrency as an investment vehicle."
+    ]
+  },
+  {
+    "id": 115,
+    "topic": "opinions",
+    "fact": "I donate 5% of my income to effective-altruism-aligned charities.",
+    "paraphrases": [
+      "Five percent of my income goes to charities aligned with effective altruism.",
+      "I give 5% of my income to EA-aligned causes.",
+      "I donate annually \u2014 about 5% of income \u2014 to effective altruism charities."
+    ],
+    "questions": [
+      "How much of their income does the user donate?",
+      "What kind of charities does the user support?",
+      "Tell me about the user's giving habits.",
+      "Does the user donate to causes?",
+      "Where does 5% of the user's income go?"
+    ],
+    "reference_answers": [
+      "The user donates 5% of their income to EA-aligned charities.",
+      "5% to effective-altruism charities.",
+      "They give 5% of income to effective altruism causes."
+    ]
+  },
+  {
+    "id": 116,
+    "topic": "opinions",
+    "fact": "I'd rather write one thoughtful email than fire off five short ones.",
+    "paraphrases": [
+      "One thoughtful email beats five quick ones in my book.",
+      "I prefer composing one careful email over many quick replies.",
+      "Five short emails > one long thoughtful one is wrong, in my view."
+    ],
+    "questions": [
+      "How does the user prefer to write emails?",
+      "Tell me about the user's email style.",
+      "Does the user send many short emails?",
+      "What's the user's email-composition philosophy?",
+      "Would the user fire off rapid replies?"
+    ],
+    "reference_answers": [
+      "The user prefers writing one thoughtful email over many short ones.",
+      "One careful email, not many quick ones.",
+      "They'd rather compose one thoughtful email than five short ones."
+    ]
+  },
+  {
+    "id": 117,
+    "topic": "opinions",
+    "fact": "I don't believe in productivity hacks \u2014 consistency beats novelty.",
+    "paraphrases": [
+      "I'm not into productivity hacks; what works is consistency.",
+      "Consistency beats novelty \u2014 that's my productivity stance.",
+      "I distrust productivity hacks; the consistent stuff wins."
+    ],
+    "questions": [
+      "What's the user's view on productivity systems?",
+      "Does the user try productivity hacks?",
+      "Tell me about the user's productivity philosophy.",
+      "Should we recommend a new productivity tool to the user?",
+      "How does the user think about getting things done?"
+    ],
+    "reference_answers": [
+      "The user doesn't believe in productivity hacks \u2014 consistency beats novelty.",
+      "Consistency over hacks.",
+      "They distrust productivity hacks and value consistency."
+    ]
+  },
+  {
+    "id": 118,
+    "topic": "opinions",
+    "fact": "Companies that schedule too many meetings make me lose respect for them.",
+    "paraphrases": [
+      "I lose respect for companies with meeting-heavy cultures.",
+      "Meeting-heavy companies feel inefficient to me.",
+      "If a company runs on too many meetings, I'm out."
+    ],
+    "questions": [
+      "What's the user's view on meetings?",
+      "How does the user feel about meeting-heavy work cultures?",
+      "Tell me about the user's stance on company meetings.",
+      "Should we book the user a many-meeting company?",
+      "What's a corporate culture turnoff for the user?"
+    ],
+    "reference_answers": [
+      "The user loses respect for companies with too many meetings.",
+      "Meeting-heavy companies \u2014 turnoff.",
+      "They look down on companies that schedule too many meetings."
+    ]
+  },
+  {
+    "id": 119,
+    "topic": "opinions",
+    "fact": "I think physical books are better for retention than e-books.",
+    "paraphrases": [
+      "Retention is better with physical books, in my view.",
+      "I believe paper books beat e-books for remembering content.",
+      "Physical-book reading sticks better for me than e-books."
+    ],
+    "questions": [
+      "What does the user think about e-book retention?",
+      "Are physical books better, in the user's view?",
+      "Tell me about the user's opinion on reading formats.",
+      "Should we get the user an e-reader for serious reading?",
+      "How does the user feel about Kindles for important books?"
+    ],
+    "reference_answers": [
+      "The user believes physical books are better for retention than e-books.",
+      "Paper books > e-books for retention.",
+      "They think physical books beat e-books for remembering content."
+    ]
+  },
+  {
+    "id": 120,
+    "topic": "opinions",
+    "fact": "I prefer asynchronous work over synchronous calls.",
+    "paraphrases": [
+      "Async work beats sync calls for me.",
+      "I'd rather async than sit on synchronous calls.",
+      "I prefer working asynchronously rather than via live calls."
+    ],
+    "questions": [
+      "Does the user prefer async or sync collaboration?",
+      "What's the user's collaboration style?",
+      "Tell me about the user's async vs sync stance.",
+      "Should we schedule a call with the user?",
+      "How does the user prefer to coordinate work?"
+    ],
+    "reference_answers": [
+      "The user prefers asynchronous work over synchronous calls.",
+      "Async over sync.",
+      "They prefer async collaboration to live calls."
+    ]
+  },
+  {
+    "id": 121,
+    "topic": "quirky",
+    "fact": "I always carry an umbrella in Vancouver, no matter the forecast.",
+    "paraphrases": [
+      "Vancouver life \u2014 I always have an umbrella, weather forecast notwithstanding.",
+      "Forecast or not, I always carry an umbrella in Vancouver.",
+      "I never leave the house in Vancouver without an umbrella."
+    ],
+    "questions": [
+      "What does the user always carry in Vancouver?",
+      "Tell me about the user's weather habits.",
+      "Does the user check the forecast?",
+      "What's a daily-carry item for the user?",
+      "Why might the user have an umbrella?"
+    ],
+    "reference_answers": [
+      "The user always carries an umbrella in Vancouver regardless of forecast.",
+      "Umbrella \u2014 always carried.",
+      "They always have an umbrella with them in Vancouver."
+    ]
+  },
+  {
+    "id": 122,
+    "topic": "quirky",
+    "fact": "I own five identical pairs of black socks so I never have to match them.",
+    "paraphrases": [
+      "Five identical pairs of black socks live in my drawer \u2014 no matching needed.",
+      "I bought five identical black socks so matching isn't a thing.",
+      "All my socks are identical black pairs, on purpose."
+    ],
+    "questions": [
+      "How many pairs of socks does the user keep?",
+      "Why do the user's socks all look the same?",
+      "Tell me about the user's sock strategy.",
+      "What's a quirky efficiency hack the user uses?",
+      "Does the user spend time matching socks?"
+    ],
+    "reference_answers": [
+      "The user owns five identical pairs of black socks to avoid matching.",
+      "Five identical black socks \u2014 no matching.",
+      "They keep all-identical black socks so they never have to pair them."
+    ]
+  },
+  {
+    "id": 123,
+    "topic": "quirky",
+    "fact": "I don't drink alcohol on weekdays.",
+    "paraphrases": [
+      "Weekdays are alcohol-free for me.",
+      "I keep alcohol to weekends only.",
+      "Mon-Fri, no drinking."
+    ],
+    "questions": [
+      "When does the user drink alcohol?",
+      "Tell me about the user's drinking habits.",
+      "Does the user drink during the week?",
+      "Should we plan a Tuesday cocktail with the user?",
+      "What's the user's rule about weekday drinking?"
+    ],
+    "reference_answers": [
+      "The user doesn't drink alcohol on weekdays.",
+      "No alcohol Mon-Fri.",
+      "Their drinking is weekends only."
+    ]
+  },
+  {
+    "id": 124,
+    "topic": "quirky",
+    "fact": "Escalators make me anxious \u2014 I take the stairs.",
+    "paraphrases": [
+      "I get anxious on escalators, so I take the stairs.",
+      "Escalators trigger anxiety for me \u2014 stairs every time.",
+      "I avoid escalators and use stairs instead."
+    ],
+    "questions": [
+      "How does the user feel about escalators?",
+      "Does the user use elevators or stairs?",
+      "Tell me about the user's anxieties.",
+      "Why does the user take the stairs?",
+      "What kind of moving stairs does the user avoid?"
+    ],
+    "reference_answers": [
+      "Escalators make the user anxious; they take the stairs.",
+      "Stairs over escalators.",
+      "They avoid escalators because of anxiety."
+    ]
+  },
+  {
+    "id": 125,
+    "topic": "quirky",
+    "fact": "I'm allergic to bee stings; I carry an epi-pen.",
+    "paraphrases": [
+      "Bee stings are dangerous for me \u2014 I carry an epi-pen.",
+      "I keep an epi-pen on me because I'm bee-allergic.",
+      "An epi-pen is part of my daily carry due to a bee allergy."
+    ],
+    "questions": [
+      "Does the user carry an epi-pen?",
+      "What's a serious allergy the user has?",
+      "Tell me about the user's bee allergy.",
+      "What medical item does the user carry?",
+      "What should we know about the user and bees?"
+    ],
+    "reference_answers": [
+      "The user is allergic to bee stings and carries an epi-pen.",
+      "Bee allergy \u2014 epi-pen.",
+      "They carry an epi-pen due to a bee-sting allergy."
+    ]
+  },
+  {
+    "id": 126,
+    "topic": "quirky",
+    "fact": "When a building has four floors or fewer I always take the stairs.",
+    "paraphrases": [
+      "Four floors or under, I'm taking the stairs.",
+      "I skip elevators in any building four floors or fewer.",
+      "Short buildings (\u22644 floors) \u2014 stairs every time."
+    ],
+    "questions": [
+      "When does the user take the stairs?",
+      "Under what conditions does the user skip the elevator?",
+      "Tell me about the user's building-stairs rule.",
+      "Should we offer the user the elevator in a 3-story building?",
+      "What's the user's threshold for taking stairs vs elevators?"
+    ],
+    "reference_answers": [
+      "The user takes the stairs in any building four floors or fewer.",
+      "Stairs in \u22644-floor buildings.",
+      "They use the stairs whenever the building has four floors or less."
+    ]
+  },
+  {
+    "id": 127,
+    "topic": "quirky",
+    "fact": "I talk to my cat in a baby voice \u2014 she seems to like it.",
+    "paraphrases": [
+      "I baby-talk my cat, and she enjoys it.",
+      "My cat gets baby-voiced conversation from me.",
+      "I always use a baby voice for my cat."
+    ],
+    "questions": [
+      "How does the user talk to their cat?",
+      "What does the user's voice sound like with Soba?",
+      "Tell me about the user's pet habits.",
+      "Does the user use a special voice for the cat?",
+      "What's a silly thing the user does at home?"
+    ],
+    "reference_answers": [
+      "The user talks to their cat in a baby voice.",
+      "Baby voice for the cat.",
+      "They use a baby voice when speaking to Soba."
+    ]
+  },
+  {
+    "id": 128,
+    "topic": "quirky",
+    "fact": "I don't own a TV; I watch everything projected onto a wall.",
+    "paraphrases": [
+      "No TV at my place \u2014 I project onto a wall instead.",
+      "I use a projector and a wall as my screen; I don't own a TV.",
+      "Movies and shows go onto a wall via projector \u2014 no TV."
+    ],
+    "questions": [
+      "How does the user watch movies?",
+      "Does the user own a TV?",
+      "Tell me about the user's home entertainment.",
+      "What's the user's screen setup at home?",
+      "What kind of projector setup does the user have?"
+    ],
+    "reference_answers": [
+      "The user doesn't own a TV; they use a projector on a wall.",
+      "Projector and wall, no TV.",
+      "Their viewing setup is a projector \u2014 no TV."
+    ]
+  },
+  {
+    "id": 129,
+    "topic": "quirky",
+    "fact": "I wear glasses, and Persol is my favorite frame brand.",
+    "paraphrases": [
+      "I wear glasses; Persol frames are my favorite.",
+      "Persol is the brand I pick for glasses frames.",
+      "My favorite eyewear brand is Persol."
+    ],
+    "questions": [
+      "Does the user wear glasses?",
+      "What brand of frames does the user prefer?",
+      "Tell me about the user's eyewear.",
+      "What's the user's frame brand?",
+      "Are the user's glasses Persol?"
+    ],
+    "reference_answers": [
+      "The user wears glasses with Persol frames.",
+      "Persol frames.",
+      "Their favorite glasses brand is Persol."
+    ]
+  },
+  {
+    "id": 130,
+    "topic": "quirky",
+    "fact": "I prefer fountain pens over ballpoints for everyday writing.",
+    "paraphrases": [
+      "Fountain pen, not ballpoint, for my everyday writing.",
+      "I write with a fountain pen daily \u2014 ballpoints aren't for me.",
+      "My everyday pen is a fountain pen, not a ballpoint."
+    ],
+    "questions": [
+      "What kind of pen does the user use?",
+      "Does the user prefer ballpoints?",
+      "Tell me about the user's writing instruments.",
+      "What's on the user's desk for writing?",
+      "What's the user's pen of choice?"
+    ],
+    "reference_answers": [
+      "The user prefers fountain pens over ballpoints.",
+      "Fountain pens, not ballpoints.",
+      "They write with a fountain pen daily."
+    ]
+  },
+  {
+    "id": 131,
+    "topic": "quirky",
+    "fact": "I haven't had a soda in years.",
+    "paraphrases": [
+      "Soda hasn't been in my life for years.",
+      "I gave up soda a long time ago.",
+      "It's been years since I had a Coke or anything similar."
+    ],
+    "questions": [
+      "Does the user drink soda?",
+      "When did the user last have soda?",
+      "Tell me about the user's soda intake.",
+      "Should we offer the user a Coke?",
+      "What's a beverage the user avoids?"
+    ],
+    "reference_answers": [
+      "The user hasn't had a soda in years.",
+      "No soda for years.",
+      "They quit soda years ago."
+    ]
+  },
+  {
+    "id": 132,
+    "topic": "quirky",
+    "fact": "The smell of old books is my favorite scent in the world.",
+    "paraphrases": [
+      "I'd rank the smell of old books as my favorite scent.",
+      "Nothing beats the smell of old books for me.",
+      "Old-book smell is the scent I love most."
+    ],
+    "questions": [
+      "What's the user's favorite scent?",
+      "Tell me about the user's smell preferences.",
+      "What smell does the user love most?",
+      "If we picked a candle for the user, what should it smell like?",
+      "What kind of bookstores would the user love?"
+    ],
+    "reference_answers": [
+      "The user's favorite scent is the smell of old books.",
+      "Old books \u2014 favorite scent.",
+      "They love the smell of old books most of all."
+    ]
+  },
+  {
+    "id": 133,
+    "topic": "quirky",
+    "fact": "I take the exact same walking route to work every single day.",
+    "paraphrases": [
+      "I walk to work via the exact same route, day in and day out.",
+      "My walk to work doesn't vary \u2014 same path every day.",
+      "I take the same walking route to work every day."
+    ],
+    "questions": [
+      "How does the user get to work?",
+      "Does the user vary their commute?",
+      "Tell me about the user's commute habit.",
+      "What's a routine in the user's workday?",
+      "Does the user mix up their walking routes?"
+    ],
+    "reference_answers": [
+      "The user takes the exact same walking route to work every day.",
+      "Same walking route every day.",
+      "Their walking commute follows the same route daily."
+    ]
+  },
+  {
+    "id": 134,
+    "topic": "quirky",
+    "fact": "I have a lucky green sweater I wear for every important meeting.",
+    "paraphrases": [
+      "There's a green sweater I treat as lucky and wear for big meetings.",
+      "My lucky garment is a green sweater I wear before important meetings.",
+      "I wear a specific lucky green sweater whenever an important meeting is on."
+    ],
+    "questions": [
+      "Does the user have a lucky garment?",
+      "What does the user wear for important meetings?",
+      "Tell me about the user's superstitions.",
+      "What's a sweater the user values?",
+      "Is there a piece of clothing the user is attached to?"
+    ],
+    "reference_answers": [
+      "The user wears a lucky green sweater for every important meeting.",
+      "Lucky green sweater for big meetings.",
+      "They have a lucky green sweater they wear before important meetings."
+    ]
+  },
+  {
+    "id": 135,
+    "topic": "quirky",
+    "fact": "I prefer handwritten letters over digital greetings.",
+    "paraphrases": [
+      "Handwritten letters beat digital greetings in my book.",
+      "I'd rather get and send handwritten letters than digital cards.",
+      "Letters by hand are better than e-greetings for me."
+    ],
+    "questions": [
+      "How does the user prefer to send greetings?",
+      "Does the user write letters?",
+      "Tell me about the user's correspondence style.",
+      "Should we send the user an e-card or a letter?",
+      "What's a tactile communication the user values?"
+    ],
+    "reference_answers": [
+      "The user prefers handwritten letters to digital greetings.",
+      "Handwritten over digital.",
+      "They like handwritten letters more than digital greetings."
+    ]
+  },
+  {
+    "id": 136,
+    "topic": "negative",
+    "fact": "I avoid fluorescent lighting; warm-temperature bulbs only.",
+    "paraphrases": [
+      "Fluorescent light is out for me \u2014 I run warm-color bulbs.",
+      "I never use fluorescent lights; warm tones only.",
+      "Warm-temperature bulbs only \u2014 fluorescent is too harsh."
+    ],
+    "questions": [
+      "What kind of lighting does the user prefer?",
+      "Does the user mind fluorescent lights?",
+      "Tell me about the user's lighting preferences.",
+      "What kind of bulbs does the user pick?",
+      "Should we install fluorescents at the user's place?"
+    ],
+    "reference_answers": [
+      "The user avoids fluorescent lighting and uses warm-temperature bulbs only.",
+      "Warm bulbs only \u2014 no fluorescents.",
+      "They prefer warm-temperature lighting and avoid fluorescents."
+    ]
+  },
+  {
+    "id": 137,
+    "topic": "negative",
+    "fact": "I'm not on Twitter, Facebook, or Instagram \u2014 no social media at all.",
+    "paraphrases": [
+      "I don't use Twitter, Facebook, or Instagram \u2014 no social media.",
+      "Social media isn't part of my life \u2014 none of the big platforms.",
+      "I avoid all social media \u2014 no Twitter, no Facebook, no Instagram."
+    ],
+    "questions": [
+      "Does the user use social media?",
+      "Is the user on Twitter?",
+      "Tell me about the user's social media presence.",
+      "Should we DM the user on Instagram?",
+      "What social platforms does the user use?"
+    ],
+    "reference_answers": [
+      "The user is on no social media \u2014 no Twitter, Facebook, or Instagram.",
+      "No social media accounts.",
+      "They avoid all social media platforms."
+    ]
+  },
+  {
+    "id": 138,
+    "topic": "negative",
+    "fact": "I haven't eaten fast food in over five years.",
+    "paraphrases": [
+      "Fast food has been off my plate for over five years.",
+      "It's been more than five years since I ate fast food.",
+      "I quit fast food more than five years ago."
+    ],
+    "questions": [
+      "Does the user eat fast food?",
+      "Tell me about the user's dietary restrictions.",
+      "How long has the user avoided fast food?",
+      "Should we order McDonalds for the user?",
+      "What's a category of food the user has dropped?"
+    ],
+    "reference_answers": [
+      "The user hasn't eaten fast food in over five years.",
+      "No fast food for 5+ years.",
+      "They've avoided fast food for over five years."
+    ]
+  },
+  {
+    "id": 139,
+    "topic": "negative",
+    "fact": "I won't go to restaurants that have TVs on the wall.",
+    "paraphrases": [
+      "Restaurants with wall TVs are off my list.",
+      "If a restaurant has TVs on the wall, I don't go.",
+      "TV-screen-on-the-wall restaurants \u2014 I avoid them."
+    ],
+    "questions": [
+      "What kind of restaurants does the user avoid?",
+      "Does the user mind TVs in restaurants?",
+      "Tell me about the user's dining-out preferences.",
+      "Should we suggest a sports bar to the user?",
+      "What's a restaurant feature the user dislikes?"
+    ],
+    "reference_answers": [
+      "The user avoids restaurants with TVs on the wall.",
+      "No TVs in restaurants \u2014 they refuse.",
+      "They won't dine at restaurants with wall TVs."
+    ]
+  },
+  {
+    "id": 140,
+    "topic": "negative",
+    "fact": "I don't subscribe to Netflix or any of the big streamers.",
+    "paraphrases": [
+      "Netflix and the other big streamers \u2014 none of them are on my account list.",
+      "I skip Netflix and similar mainstream streaming services.",
+      "I don't pay for Netflix or any of the major streaming platforms."
+    ],
+    "questions": [
+      "Does the user subscribe to Netflix?",
+      "What streaming services does the user pay for?",
+      "Tell me about the user's streaming subscriptions.",
+      "Where does the user watch shows?",
+      "What's the user's stance on big streamers?"
+    ],
+    "reference_answers": [
+      "The user doesn't subscribe to Netflix or any big streamers.",
+      "No big streaming services.",
+      "They avoid Netflix and the major streaming platforms."
+    ]
+  },
+  {
+    "id": 141,
+    "topic": "negative",
+    "fact": "Beach trips aren't for me \u2014 I really don't like sand.",
+    "paraphrases": [
+      "I avoid beach trips because I dislike sand.",
+      "Sand bothers me, so beaches aren't my thing.",
+      "Going to the beach isn't fun for me \u2014 I hate sand."
+    ],
+    "questions": [
+      "How does the user feel about beaches?",
+      "Should we plan a beach trip for the user?",
+      "Tell me about the user's vacation preferences.",
+      "What's an environment the user dislikes?",
+      "Why doesn't the user like the beach?"
+    ],
+    "reference_answers": [
+      "The user dislikes sand and avoids beach trips.",
+      "No beaches \u2014 they hate sand.",
+      "They avoid the beach because of sand."
+    ]
+  },
+  {
+    "id": 142,
+    "topic": "negative",
+    "fact": "I don't celebrate Halloween.",
+    "paraphrases": [
+      "Halloween isn't a holiday I observe.",
+      "I skip Halloween \u2014 not my thing.",
+      "Halloween goes by without my participation."
+    ],
+    "questions": [
+      "Does the user celebrate Halloween?",
+      "Should we invite the user to a costume party?",
+      "Tell me about the user's Halloween habits.",
+      "What's a holiday the user doesn't observe?",
+      "Is the user a fan of Halloween?"
+    ],
+    "reference_answers": [
+      "The user doesn't celebrate Halloween.",
+      "No Halloween for them.",
+      "They skip Halloween."
+    ]
+  },
+  {
+    "id": 143,
+    "topic": "negative",
+    "fact": "All my app notifications are off except SMS.",
+    "paraphrases": [
+      "I turn off all app notifications except SMS.",
+      "SMS is the only notification I let through.",
+      "Notifications on my phone are all off, except text messages."
+    ],
+    "questions": [
+      "What notifications does the user allow on their phone?",
+      "Tell me about the user's notification settings.",
+      "Does the user get notifications from apps?",
+      "How does the user reduce phone distractions?",
+      "What's the only notification the user keeps on?"
+    ],
+    "reference_answers": [
+      "The user has all app notifications off except SMS.",
+      "SMS only \u2014 everything else off.",
+      "They keep only SMS notifications enabled."
+    ]
+  },
+  {
+    "id": 144,
+    "topic": "negative",
+    "fact": "I won't buy products from companies with poor labor records.",
+    "paraphrases": [
+      "Companies with poor labor records don't get my money.",
+      "I research labor practices and avoid companies that fall short.",
+      "Bad labor records are a deal-breaker for me when buying products."
+    ],
+    "questions": [
+      "What's the user's stance on company ethics when shopping?",
+      "Tell me about the user's shopping principles.",
+      "Does the user check company labor practices?",
+      "What's a reason the user might boycott a brand?",
+      "How does ethics play into the user's purchases?"
+    ],
+    "reference_answers": [
+      "The user won't buy from companies with poor labor records.",
+      "Avoids brands with bad labor practices.",
+      "They check labor records before purchasing."
+    ]
+  },
+  {
+    "id": 145,
+    "topic": "negative",
+    "fact": "Long phone calls drain me \u2014 I always prefer texting.",
+    "paraphrases": [
+      "Long phone calls are exhausting; I'd rather text.",
+      "I prefer texts over long phone calls \u2014 they drain my energy.",
+      "Texting beats long calls for me."
+    ],
+    "questions": [
+      "Does the user like long phone calls?",
+      "How does the user prefer to communicate?",
+      "Tell me about the user's communication style.",
+      "Should we call the user for an hour-long discussion?",
+      "Why does the user prefer texting?"
+    ],
+    "reference_answers": [
+      "The user finds long phone calls draining and prefers texting.",
+      "Texts over phone calls.",
+      "They'd rather text than have a long phone call."
+    ]
+  },
+  {
+    "id": 146,
+    "topic": "misc",
+    "fact": "My birthday is October 12.",
+    "paraphrases": [
+      "I was born on October 12.",
+      "October 12 is my birthday.",
+      "My birthday falls on the 12th of October."
+    ],
+    "questions": [
+      "When is the user's birthday?",
+      "What month is the user born in?",
+      "Tell me when the user celebrates their birthday.",
+      "Should we plan something for the user in October?",
+      "What's the date of the user's birthday?"
+    ],
+    "reference_answers": [
+      "The user's birthday is October 12.",
+      "October 12.",
+      "They were born on October 12."
+    ]
+  },
+  {
+    "id": 147,
+    "topic": "misc",
+    "fact": "Forest green is my favorite color.",
+    "paraphrases": [
+      "Forest green tops my color list.",
+      "If I had to pick a favorite color it'd be forest green.",
+      "My favorite color is forest green."
+    ],
+    "questions": [
+      "What color does the user like best?",
+      "Tell me about the user's color preferences.",
+      "If we picked a color for the user, what would it be?",
+      "What's the user's favorite color?",
+      "Does the user prefer cool or warm colors?"
+    ],
+    "reference_answers": [
+      "Forest green is the user's favorite color.",
+      "Forest green.",
+      "Their favorite color is forest green."
+    ]
+  },
+  {
+    "id": 148,
+    "topic": "misc",
+    "fact": "Late autumn is my favorite season.",
+    "paraphrases": [
+      "Late fall is the season I love most.",
+      "Late autumn is my pick for favorite season.",
+      "My favorite time of year is late autumn."
+    ],
+    "questions": [
+      "What's the user's favorite season?",
+      "Does the user prefer winter or summer?",
+      "Tell me about the user's seasonal preference.",
+      "When is the user happiest weather-wise?",
+      "What time of year does the user love most?"
+    ],
+    "reference_answers": [
+      "The user's favorite season is late autumn.",
+      "Late autumn.",
+      "They prefer late autumn over other seasons."
+    ]
+  },
+  {
+    "id": 149,
+    "topic": "misc",
+    "fact": "Lunar New Year is my favorite holiday.",
+    "paraphrases": [
+      "Of all holidays, Lunar New Year is my favorite.",
+      "I love Lunar New Year more than any other holiday.",
+      "Lunar New Year tops my holiday list."
+    ],
+    "questions": [
+      "What's the user's favorite holiday?",
+      "Does the user celebrate Lunar New Year?",
+      "Tell me about the user's holiday preferences.",
+      "What holiday matters most to the user?",
+      "What's a holiday the user looks forward to?"
+    ],
+    "reference_answers": [
+      "Lunar New Year is the user's favorite holiday.",
+      "Lunar New Year.",
+      "They love Lunar New Year most among holidays."
+    ]
+  },
+  {
+    "id": 150,
+    "topic": "misc",
+    "fact": "I'm currently learning Rust as a third language after Python and Mandarin.",
+    "paraphrases": [
+      "Rust is the third language I'm picking up, after Python and Mandarin.",
+      "I'm learning Rust now \u2014 my third language after Python and Mandarin.",
+      "After Python and Mandarin, Rust is the language I'm working on."
+    ],
+    "questions": [
+      "What language is the user currently learning?",
+      "What's the user's third language?",
+      "Tell me about the user's language-learning.",
+      "Does the user know Rust?",
+      "What languages does the user know already?"
+    ],
+    "reference_answers": [
+      "The user is currently learning Rust, their third language after Python and Mandarin.",
+      "Rust \u2014 third language after Python and Mandarin.",
+      "They know Python and Mandarin, and are learning Rust now."
+    ]
+  }
+]
