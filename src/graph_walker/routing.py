@@ -38,7 +38,27 @@ class RoutingOutput:
     soft_probs: torch.Tensor       # [B, K] float — for analysis / load-balance loss
     log_pi: torch.Tensor | None = None  # [B] float — log π(selected_idx); only
                                         # populated in phase="phase2" (hard
-                                        # Categorical, REINFORCE / GRPO).
+                                        # Categorical, REINFORCE / GRPO) OR
+                                        # whenever a `saved_idx` is supplied
+                                        # (replay path).
+
+
+@dataclass
+class StepRoutingChoices:
+    """Routing choices captured during one walker step.
+
+    Used for DeepSeek-style teacher-forced replay in phase-2 GRPO:
+    1. Sample with no grad → save these per step into a trace.
+    2. Replay with grad enabled → re-feed these choices via `replay_choices`
+       so routing forward is deterministic; log-π is recomputed under
+       current policy with grad.
+
+    `anchor_idx` is None on non-new-window steps (anchor pick only fires
+    at segment start; within a window walkers roam using `walker_pos_in`).
+    `edge_idx` is present every step.
+    """
+    anchor_idx: torch.Tensor | None  # [B*H] long, or None
+    edge_idx: torch.Tensor           # [B*H] long
 
 
 def _sample_exploration_mask(
@@ -161,6 +181,70 @@ def gumbel_top1_softmax(
     return RoutingOutput(
         selected_idx=argmax, ste_weights=ste, soft_probs=soft,
     )
+
+
+def route_or_replay(
+    scores: torch.Tensor,                  # [B, K]
+    *,
+    tau: torch.Tensor | float,
+    epsilon: torch.Tensor | float,
+    training: bool,
+    phase: str = "phase1",
+    saved_idx: torch.Tensor | None = None,
+) -> RoutingOutput:
+    """Single dispatch point that branches between sample and replay.
+
+    If `saved_idx` is None → behaves like `gumbel_top1_softmax(...)`
+    (sample fresh per phase).
+
+    If `saved_idx` is provided → replay mode: forward routing uses the
+    saved action; soft_probs and ste_weights are derived from current
+    scores (with grad if scores has grad); log_pi is computed via
+    `routing_log_pi_for_action`. This is the path used by the DeepSeek-
+    style teacher-forced re-evaluation in phase-2 GRPO.
+    """
+    if saved_idx is None:
+        return gumbel_top1_softmax(
+            scores, tau=tau, epsilon=epsilon,
+            training=training, phase=phase,
+        )
+    K = scores.size(-1)
+    log_pi = routing_log_pi_for_action(scores, saved_idx)  # [B], with grad
+    ste = F.one_hot(saved_idx, num_classes=K).to(scores.dtype)
+    soft = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+    return RoutingOutput(
+        selected_idx=saved_idx,
+        ste_weights=ste,
+        soft_probs=soft,
+        log_pi=log_pi,
+    )
+
+
+def routing_log_pi_for_action(
+    scores: torch.Tensor,            # [B, K]
+    selected_idx: torch.Tensor,      # [B] long — pre-determined action
+) -> torch.Tensor:
+    """Compute log π_θ(action) for a saved action under current scores.
+
+    Used by the DeepSeek-style teacher-forced replay path in phase-2 GRPO:
+    given a routing choice already taken during sampling (no-grad), this
+    re-evaluates the log-probability of that choice under the current
+    policy's scores (with grad). The returned `[B]` log-π participates
+    in REINFORCE just as the original sample-time `gumbel_top1_softmax(
+    phase="phase2")` log_pi would have.
+
+    Math matches the phase-2 path of `gumbel_top1_softmax` exactly:
+    softmax over scores in fp32, clamp tiny probs at 1e-12, renormalize,
+    log + gather. This guarantees that replay-time log-π is identical to
+    sample-time log-π when the policy hasn't moved (i.e., when π_θ ==
+    π_old). Any drift in log-π between sample and replay is purely the
+    effect of optimizer steps on the policy parameters since sampling.
+    """
+    soft = F.softmax(scores.float(), dim=-1)
+    probs = soft.clamp(min=1e-12)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    log_pi = probs.log().gather(1, selected_idx.unsqueeze(-1)).squeeze(-1)
+    return log_pi
 
 
 def gumbel_schedule(step: int, start: float, end: float, anneal_steps: int) -> float:

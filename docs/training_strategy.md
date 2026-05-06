@@ -58,87 +58,95 @@ turns present) variant, with chat overflow as the final wave.
   chat continuation looks like).
 - **Data:** `HuggingFaceH4/ultrachat_200k` (~200k chat conversations,
   Llama-3 chat template via Llama-3.2-Instruct's tokenizer).
-- **Step function:** `phase1_pretrained_step` (still teacher-forced —
-  per `train_phase1_ar.py` docstring, parallel SFT is the standard
-  for instruction tuning; AR is reserved for memory-targeted training
-  in Wave 3).
+- **Step function:** `phase1_pretrained_step` (parallel teacher-forced —
+  the standard for instruction tuning).
 - **Token budget:** ~200M tokens (~10000 steps at BS=20, T=256).
 - **Wall-clock:** ~7-9 hours including compile warmup.
 - **Resume from:** Wave 1 checkpoint (`--resume`).
 
-### Wave 3 — Passphrase recall, **long-text** filler (teacher-forced AR)
+### Wave 3 — Passphrase recall, **chat-injected** (GRPO)
 
-**The cheap controlled "does memory work at all" signal**, before any
-expensive AR-rollout / GRPO training. See `docs/wave3_passphrase_plan.md`
-for the full build spec.
-
-- **Goal:** verify walker can store + retrieve user-specific facts
-  buried in long filler text and asked about via flexibly-phrased
-  questions. **No exact-match scoring** — BERT-cosine only.
-- **Data:** ~150 mock facts × FineWeb-edu filler (no chat turns).
-  Facts expanded to paraphrases + flexible questions + reference
-  answers via Claude API (one-time prep). Per [Zhao et al. 2024](https://arxiv.org/html/2410.21276),
-  real-text filler is essential — pure-synthetic filler underperforms.
-- **Step function:** `phase1_ar_pretrained_step` (teacher-forced
-  autoregressive — walker must carry the fact across filler segments
-  because the LM only sees one continuation token at a time).
-- **Loss:** CE on answer tokens.
-- **Eval metric:** BERT-cosine (`all-mpnet-base-v2`) vs reference
-  answers, on held-out 20 facts.
-- **Curriculum:** filler_mid length 100 → 1500 tokens.
-- **Deferred extension within Wave 3:** fact-overwrite test (inject
-  fact_v1, then later inject fact_v2 same topic, ask question, verify
-  walker recalls v2 not v1). Tests continual-learning dynamics — see
-  `wave3_passphrase_plan.md` § Continual learning extension.
-- **Wall-clock:** ~1 day for first end-to-end smoke.
-
-### Wave 4 — Passphrase recall, **chat-injected** filler (AR + GRPO)
-
-**Same passphrase task, but injected into multi-turn chat** so we can
-benefit from real generation + REINFORCE rather than teacher-forcing
-the answer. Lets us optimize the actual generation distribution
-(important for paraphrase tolerance).
+**Walker must hold a user-injected personal fact across filler chat
+turns and recall it via AR generation when later asked.** This is
+where the walker's value prop starts mattering: under GRPO, the LM
+samples its own tokens (no teacher forcing), so the walker IS the
+continuity carrier.
 
 - **Goal:** when the user injects a personal fact mid-conversation, can
   the walker retain it long enough that a later turn can recall it via
   AR generation?
-- **Data:** ~150 mock facts × **chat filler** (UltraChat or WildChat
-  paragraphs). Fact embedded as part of a user turn ("by the way,
-  ..."). Question asked many turns later. Reuses the `expanded.json`
-  built for Wave 3 (same fact set, different filler).
-- **Step function:** `grpo_step` (AR rollout + REINFORCE).
-  `freeze_all_but_E_bias_and_neuromod` for trainable surface.
+- **Data:** 500 mock facts × UltraChat-style chat filler. Fact embedded
+  as a user turn ("by the way, ..."). Question asked many turns later.
+  Built via `scripts/build_user_facts.py` →
+  `data/passphrase/expanded.json`.
+- **Step function:** `grpo_session_step` with `sessions=[s1..s_B]`,
+  each `s_i` a 2-turn `MultiTurnSession` (user prefix + assistant ref).
+  Internally routes to the uniform-batched fast path → one
+  `grpo_step` call with B*K parallel rollouts. `freeze_all_but_E_bias_and_neuromod`
+  for the trainable surface (memory.neuromod.* only).
 - **Reward:** BERT-cosine of generated answer vs reference answers
   (`all-mpnet-base-v2`). Pure semantic, no exact match.
-- **Wall-clock:** ~1-2 days per cycle (GRPO is expensive — K rollouts
-  per step).
+- **`lm_context_window`** (recommended for Wave 3): when set < `T_pre`,
+  walker absorbs the full prefix but LM only attends to the last
+  `lm_context_window` tokens. With long filler (`filler_max=1500-3000`)
+  and `lm_context_window=256`, the LM can't see the fact directly —
+  the walker's memory is the only path from fact to answer. This is
+  the configuration where the walker actually has to earn its keep.
+- **Resume from:** Wave 2 checkpoint (REINFORCE has no signal from
+  fresh init — needs a chat-aware policy first).
+- **Wall-clock:** ~3-4 hours per pass over the 30K-pair corpus at
+  B=8, K=8 (see `docs/bench_results.md` 2026-05-06 BS_outer sweep).
 
-### Wave 5 — Real long chat / agent overflow (WildChat-1M)
+**Historical note:** an earlier Wave 3 (AR-unrolled teacher-forced SFT
+on filler+fact+filler+question) was retired in scope-B cleanup
+(2026-05-06). Under teacher forcing, the LM has full attention to the
+prefix and can solve the task without the walker, so the walker only
+contributed a "tiny CE delta" (per `phase1_ar_pretrained_step`'s own
+docstring at the time). Wave 3 is now the chat-injected GRPO that was
+formerly numbered Wave 4.
+
+### Wave 4 — Real long chat / agent overflow (WildChat-1M, multi-turn GRPO)
 
 - **Goal:** test naturalistic long-context recall. Real chat sessions
-  where total turn count > T=256 segment forces the walker to be the
-  only continuity carrier across boundaries.
+  where total length > T=256 segment forces the walker to be the only
+  continuity carrier across boundaries.
 - **Data:** [WildChat-1M](https://huggingface.co/datasets/allenai/WildChat)
-  (allenai, ODC-BY) — real user↔ChatGPT conversations. Filter to
-  ≥600 tokens total so we have ≥2 segments of prefix + meaningful
-  next-turn target. 650K-1M conversations available.
+  (allenai, ODC-BY). Pretokenized to v2 multi-turn schema via
+  `scripts/preprocess_wildchat_llama32.py`: full conversation tokens +
+  per-turn boundary index `[session_idx, role_id, turn_start, turn_end]`
+  + per-session boundary index. Filters: ≥1500 tokens AND ≥4 assistant
+  turns; max 8000 tokens/session (truncated at turn boundary). Target
+  30K sessions.
 - **Eval (held out):**
-  - [LoCoMo](https://github.com/snap-research/LoCoMo) (10 long-term
-    conversations, QA + event-summarization annotations)
-  - [REALTALK](https://github.com/danny911kr/REALTALK) (21-day real
-    conversations, persona simulation + memory probing tasks)
-- **Optional supplement:** 10-20% mix of [T1](https://consensus.app/papers/details/94cdeb424c96541b956bca1120bf77c0/)
-  or [CoALM-IT](https://consensus.app/papers/details/65496bb1cfee5cb3b3543639c298e062/)
-  for agent / tool-use flavor. Defer to v2.
-- **Step function:** `grpo_step` (AR, REINFORCE on routing decisions).
-  Walker's `freeze_all_but_E_bias_and_neuromod` freezes everything
-  except `memory.neuromod.*`.
-- **Reward:** BERT-cosine of generated next-turn vs reference, with
-  `all-mpnet-base-v2`. NO exact match (per user preference and
-  consistency with Wave 3).
-- **Token budget:** ~50M tokens (GRPO is expensive per token —
-  K=8 rollouts per step).
-- **Wall-clock:** ~1-2 days per cycle.
+  - [LoCoMo](https://github.com/snap-research/LoCoMo) (10 long-term conversations)
+  - [REALTALK](https://github.com/danny911kr/REALTALK) (21-day real conversations)
+- **Step function:** `grpo_session_step` (multi-turn aligned-trajectory
+  protocol — see `docs/multi_turn_grpo_plan.md`). **Turn-batched
+  (Verlog-style):** the dataset is reformulated as a flat pool of
+  `TurnPair(cumulative_prior, response)` units — each assistant turn
+  in each WildChat session becomes one independent training unit. The
+  loader maintains a sort-and-sample pool of M=2048 turn-pairs; per
+  outer step it picks B contiguous neighbors (near-uniform prior
+  length), truncates to the shortest prior in the batch, wraps each as
+  a 2-turn `MultiTurnSession`, and yields the list. These slot into
+  the same uniform-batched fast path Wave 3 uses → true B*K parallel
+  rollouts. Per-prompt advantage normalization within each K-group.
+- **Reward:** BERT-cosine vs reference assistant turn, per turn,
+  `all-mpnet-base-v2`. No exact match.
+- **EOS early-stop:** rollouts terminate at `eos_id` or
+  `max_response_len` (whichever first). Post-EOS pad force-fed eos_id
+  for trace-length consistency; reward decoder strips.
+- **Loss masking:** assistant turns sampled+REINFORCE; user/system
+  turns teacher-forced into the cumulative prior with no GRPO loss
+  (the standard "rlhf" mask in 2025 multi-turn GRPO practice).
+- **`lm_context_window`** (recommended for Wave 4): set `< prior_len`
+  to force the walker to bridge across turns. Each turn-pair's prior
+  is naturally capped by the preprocessor's `max_tokens_per_session`
+  (default 8000) — so walker absorbs up to 8K tokens of conversation
+  context. With `lm_context_window=1024`, the LM can only attend to
+  the last ~1K tokens; the walker is the only thing carrying earlier
+  context into the assistant turn's gen.
+- **Wall-clock:** TBD — first cycle estimate after MT-GRPO bench runs.
 
 ## Concrete commands
 
@@ -179,24 +187,46 @@ LR is bumped down 2x for the SFT phase (standard SFT-after-pretrain
 practice). `--warmup 100` is shorter since we're fine-tuning a
 warmed-up model.
 
-### Wave 3 — TBD (entry-point not yet wired)
+### Wave 3 — production run (resumes from Wave 2)
 
-Will need:
-1. Pick a chat-overflow dataset
-2. Build `(prefix_ids, reference_cont)` iterator where prefix spans ≥2
-   segments (a real chat session with N turns where total length > T)
-3. Reward function — see open question in `docs/training_strategy.md` § Wave 3
-4. Adapt `scripts/train_pretrained_gw.py` to support `--data wildchat`
-   or similar, calling `grpo_step` instead of `phase1_pretrained_step`
+```bash
+PYTHONPATH=. .venv/bin/python scripts/train_grpo.py \
+    --data passphrase-chat-grpo \
+    --resume outputs/wave2_ultrachat/ckpt_final.pt \
+    --max-steps 75000 --grpo-K 8 --bs-outer 8 \
+    --T-pre 2048 --gen-length 128 \
+    --filler-min 1000 --filler-max 1800 \
+    --lm-context-window 256 \
+    --work-dir outputs/wave3_passphrase_chat \
+    --lr 3e-5 --warmup 200
+```
 
-### Wave 4 — TBD (entry-point not yet wired)
+Routes through `grpo_session_step` with the uniform-batched fast path
+(8 sessions/step, all 2-turn, matching prefix length → one B*K=64-rollout
+GRPO update per step). With `T_pre=2048` and `lm_context_window=256`,
+the walker absorbs the fact + 1700 tokens of filler + question, but the
+LM only attends to the last 256 tokens — the walker's memory is the
+only path from fact to answer.
 
-Will need:
-1. Synthetic data generator script (`scripts/build_memory_data.py`?)
-   that reads FineWeb-edu paragraphs as filler and constructs
-   `(prefix, reference_cont)` tuples per the passphrase template
-2. Reward function combining exact-match + BERT-cosine
-3. Curriculum scheduler (1 needle → 5 needles)
+### Wave 4 — production run (resumes from Wave 3)
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/train_grpo.py \
+    --data wildchat-grpo \
+    --resume outputs/wave3_passphrase_chat/ckpt_final.pt \
+    --max-steps 100000 --grpo-K 8 --bs-outer 8 \
+    --turn-pair-pool-size 2048 \
+    --gen-length 128 \
+    --lm-context-window 1024 \
+    --work-dir outputs/wave4_wildchat \
+    --lr 1e-5 --warmup 200
+```
+
+Wave 4 turn-batching reuses Wave 3's uniform-batched fast path via the
+`TurnPair` flattener — each call yields B near-uniform-length turn-pairs
+extracted from random sessions/rounds. `lm_context_window=1024` forces
+the walker to bridge information across turns that fall outside the LM's
+1K-token attention reach.
 
 ## Eval harness (cross-cutting)
 
@@ -221,15 +251,18 @@ finish.
 | Component | Status |
 |---|---|
 | `phase1_pretrained_step` (parallel teacher-forced) | ✓ wired, tested |
-| `phase1_ar_pretrained_step` (AR unroll for memory-targeted SFT) | ✓ wired, tested, NOT used in waves 1+2 (per train_phase1_ar.py docstring, AR is for memory targeting) |
-| `grpo_step` (Phase-2 GRPO REINFORCE) | ✓ step function exists; data + reward NOT wired |
-| `run_cycle_loop` (orchestrator) | ✓ exists, NOT used by `train_pretrained_gw.py` (we drive `phase1_pretrained_step` directly for waves 1+2; cycle loop is reserved for the AR↔GRPO cycles in waves 3-4) |
+| `grpo_session_step` (unified Phase-2 GRPO; uniform-batched fast path for both Wave 3 and Wave 4 turn-pairs) | ✓ wired, tested — used by both waves |
+| `grpo_step` (single-turn BS_outer-aware) | ✓ kept as internal helper called by uniform-batched session path |
+| `wildchat_turn_pair_grpo_batch_iter` (Wave 4 turn-pair flattener + sort-and-sample) | ✓ wired, tested |
+| Walker `snapshot_memory_state` / `restore_memory_state` | ✓ wired, tested (used by sequential fallback path; not on Wave 4 production path anymore) |
+| `lm_context_window` two-phase forward (walker / LM context decouple) | ✓ wired, tested |
+| Per-group reward stats in `GRPOStats` (`per_group_reward_mean/std`) | ✓ wired, tested |
 | FineWeb-edu data iterator | ✓ `src/data/phase1_loaders.py:fineweb_edu_phase1_iter` |
 | UltraChat data iterator | ✓ `src/data/phase1_loaders.py:chat_sft_phase1_iter` |
 | Wave 1 entry-point | ✓ `scripts/train_pretrained_gw.py --data fineweb-edu` |
 | Wave 2 entry-point | ✓ `scripts/train_pretrained_gw.py --data ultrachat` |
-| Wave 3 entry-point | ✗ TBD |
-| Wave 4 entry-point | ✗ TBD |
+| Wave 3 entry-point | ✓ `scripts/train_grpo.py --data passphrase-chat-grpo` |
+| Wave 4 entry-point | ✓ `scripts/train_grpo.py --data wildchat-grpo` (turn-batched, B*K parallel via Wave 3's uniform-batched fast path) |
 | Eval harness (BABILong / NIAH / held-out CE) | ✗ TBD |
 | Checkpoint resume | ✓ `--resume <ckpt.pt>` (wrapper + opt + sched) |
 | Telemetry | ✓ `StatsCollector` writes per-step jsonl with ~40 metrics |

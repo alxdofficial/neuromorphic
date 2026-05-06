@@ -283,6 +283,96 @@ class GraphWalkerPretrainedLM(nn.Module):
         return GraphWalkerPretrainedLM._PreserveGraphCtx(self)
 
     # ------------------------------------------------------------------
+    # Per-batch state snapshot / restore (multi-turn GRPO support)
+    # ------------------------------------------------------------------
+
+    def snapshot_memory_state(self) -> dict | None:
+        """Snapshot the walker's PER-BATCH working state for later
+        restoration. Used by multi-turn GRPO's aligned-trajectory
+        protocol: snapshot at turn boundary, K rollouts diverge, restore
+        before forwarding the ground-truth turn to advance the canonical
+        state.
+
+        What's saved:
+        - `s` (LIF state per column)
+        - `prev_motor`, `walker_pos`, `walker_state`
+        - `surprise_ema`, `surprise_prev`
+        - `_log_pi_sum`, `_log_pi_count` (phase-2 routing log-π accumulator)
+        - `tick_counter`, `window_len` (segment-level counters)
+        - `co_visit_flat`, `visit_count` (per-segment counters)
+
+        What's NOT saved (keeps evolving across the whole session):
+        - `E_bias_flat` (long-term plastic state)
+        - `_prev_snapshot_*` (neuromod cross-window snapshots)
+        - `_active_delta_nm` (current window's neuromod delta — this
+          IS captured indirectly via _prev_snapshot's lifecycle, but
+          would need an explicit save if cross-rollout consistency is
+          ever needed)
+
+        Returns None if memory is detached. Returned dict's tensors are
+        clones (independent of the walker's live tensors). The caller
+        owns the dict.
+        """
+        if self.memory is None:
+            return None
+        m = self.memory
+        if not getattr(m, "_state_initialized", False):
+            return None
+
+        def _clone_or_none(x):
+            return x.clone() if isinstance(x, torch.Tensor) else None
+
+        return {
+            "s": _clone_or_none(m.s),
+            "prev_motor": _clone_or_none(m.prev_motor),
+            "walker_pos": _clone_or_none(m.walker_pos),
+            "walker_state": _clone_or_none(m.walker_state),
+            "surprise_ema": _clone_or_none(m.surprise_ema),
+            "surprise_prev": _clone_or_none(m.surprise_prev),
+            "_log_pi_sum": _clone_or_none(m._log_pi_sum),
+            "_log_pi_count": int(m._log_pi_count),
+            "tick_counter": int(m.tick_counter),
+            "window_len": int(m.window_len),
+            "co_visit_flat": _clone_or_none(m.co_visit_flat),
+            "visit_count": _clone_or_none(m.visit_count),
+        }
+
+    def restore_memory_state(self, state: dict | None) -> None:
+        """Restore a snapshot from `snapshot_memory_state`. The walker's
+        per-batch working state is overwritten from clones of the
+        snapshot's tensors (so a subsequent forward doesn't mutate the
+        snapshot itself).
+
+        Long-term plastic state (E_bias_flat, _prev_snapshot_*) is NOT
+        touched — it keeps evolving on its own update cadence.
+        """
+        if state is None or self.memory is None:
+            return
+        m = self.memory
+
+        def _restore(name):
+            v = state.get(name)
+            if isinstance(v, torch.Tensor):
+                setattr(m, name, v.clone())
+
+        _restore("s")
+        _restore("prev_motor")
+        _restore("walker_pos")
+        _restore("walker_state")
+        _restore("surprise_ema")
+        _restore("surprise_prev")
+        _restore("co_visit_flat")
+        _restore("visit_count")
+        # log_pi sum: tensor or None
+        log_pi_sum = state.get("_log_pi_sum")
+        m._log_pi_sum = (
+            log_pi_sum.clone() if isinstance(log_pi_sum, torch.Tensor) else None
+        )
+        m._log_pi_count = int(state.get("_log_pi_count", 0))
+        m.tick_counter = int(state.get("tick_counter", 0))
+        m.window_len = int(state.get("window_len", 0))
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 

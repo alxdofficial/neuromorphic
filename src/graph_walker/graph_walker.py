@@ -45,7 +45,12 @@ from src.graph_walker.neuromod import (
     enumerate_touched_edges,
 )
 from src.graph_walker.readout import MultiHorizonReadout, _FallbackRMSNorm
-from src.graph_walker.routing import gumbel_top1_softmax, gumbel_schedule
+from src.graph_walker.routing import (
+    StepRoutingChoices,
+    gumbel_schedule,
+    gumbel_top1_softmax,
+    route_or_replay,
+)
 from src.graph_walker.topology import build_topology
 from src.graph_walker.triton.lif import sparse_lif_update
 
@@ -366,6 +371,12 @@ class WalkerCorePureOutput:
     log_pi_step: torch.Tensor | None      # [B] phase-2 log π over routing
                                           # decisions made this step (anchor +
                                           # per-token), summed over walker heads.
+    routing_choices: StepRoutingChoices | None = None
+    # Captured `selected_idx` per routing call this step. Populated when
+    # the step samples (any phase); None when this step replayed pre-saved
+    # choices via `replay_choices=...`. Used by phase-2 GRPO to record a
+    # rollout trace under no-grad sampling, which a later teacher-forced
+    # replay re-runs with grad enabled to compute per-action log-π × A.
                                           # None outside phase 2.
 
 
@@ -586,6 +597,18 @@ class GraphWalkerMemory(nn.Module):
         # log_pi_sum scales with trajectory length and produces gradient
         # magnitudes thousands of times larger than necessary).
         # None when no phase-2 decisions have been recorded.
+        # DeepSeek-style routing-trace capture buffer. None = not armed
+        # (capture disabled). When armed via `start_capturing_routes()`,
+        # `_apply_step_state` appends each step's `StepRoutingChoices` to
+        # this list. The list is consumed (and cleared) by
+        # `consume_routing_trace()`.
+        self._captured_routes: list | None = None
+        # DeepSeek-style replay stash. When non-None, the next
+        # `forward_segment` consumes it as the per-step routing trace
+        # (length must equal segment length) and runs the per-token
+        # path with `replay_choices` per step. Cleared after one
+        # forward_segment call. Set via `arm_replay_trace(trace)`.
+        self._next_replay_trace: list | None = None
         self._log_pi_sum: torch.Tensor | None = None
         # Companion counter for the running sum: the number of `_apply_step_state`
         # calls that have contributed a non-None `log_pi_step`. Each
@@ -1062,6 +1085,53 @@ class GraphWalkerMemory(nn.Module):
                 else self._log_pi_sum + out.log_pi_step
             )
             self._log_pi_count += 1
+        # Routing-trace capture: if a buffer was armed via
+        # `start_capturing_routes()`, append this step's choices to it.
+        # Used by phase-2 GRPO to record a no-grad sampling trace that a
+        # later teacher-forced replay re-evaluates with grad enabled.
+        # Captured choices are detached (saved selected_idx are int64
+        # tensors with no autograd), so they're safe to keep across the
+        # gen pass without holding the autograd graph alive.
+        if (
+            self._captured_routes is not None
+            and out.routing_choices is not None
+        ):
+            self._captured_routes.append(out.routing_choices)
+
+    def start_capturing_routes(self) -> None:
+        """Arm the per-step routing-choice capture buffer.
+
+        After this call, every subsequent step records its routing
+        choices into `self._captured_routes`. Call `consume_routing_trace()`
+        to retrieve and clear the buffer.
+
+        Used by phase-2 GRPO: sample the rollout under no-grad with
+        capture armed, then replay teacher-forced with grad enabled
+        using the captured trace as `replay_choices` per step.
+        """
+        self._captured_routes = []
+
+    def consume_routing_trace(self) -> list[StepRoutingChoices] | None:
+        """Pop and return the captured routing trace, or None if not armed.
+
+        After this call, `_captured_routes` is reset to None — capture
+        must be re-armed for another sweep.
+        """
+        out = self._captured_routes
+        self._captured_routes = None
+        return out
+
+    def arm_replay_trace(self, trace: list[StepRoutingChoices]) -> None:
+        """Stash a routing trace for the NEXT `forward_segment` call.
+
+        Used by phase-2 GRPO replay path: after sampling under no-grad
+        with capture armed, the trainer calls
+        `wrapper.memory.arm_replay_trace(captured_trace)` immediately
+        before the with-grad teacher-forced re-forward. `forward_segment`
+        consumes the stash, runs the per-token path with `replay_choices`
+        per step, and clears the stash to None on entry.
+        """
+        self._next_replay_trace = trace
 
     def step(self, token_id: torch.Tensor) -> WalkerReadout:
         """Public single-token API: graph core + immediate readout.
@@ -1397,7 +1467,12 @@ class GraphWalkerMemory(nn.Module):
             self.block_forward_from_h, mode=mode, fullgraph=fullgraph,
         )
 
-    def step_core_from_h(self, h_input: torch.Tensor) -> WalkerCoreReadout:
+    def step_core_from_h(
+        self,
+        h_input: torch.Tensor,
+        *,
+        replay_choices: StepRoutingChoices | None = None,
+    ) -> WalkerCoreReadout:
         """Hot core driven by an externally-supplied `[B, D_s]` vector
         instead of a `token_id`. Used by the pretrained-LM integration
         (`forward_segment`) where h_mem_t = W_in(llama_hidden_state_t)
@@ -1419,14 +1494,35 @@ class GraphWalkerMemory(nn.Module):
         tau, epsilon = self._schedule_tensors(dummy_tok)
         is_new_window = self.window_len == 0
         e_bias_active = self._active_e_bias()
-        step_fn = self._compiled_step if self._compiled_step is not None \
-                  else self._step_core_pure
-        out = step_fn(
-            self.s, self.walker_pos, self.walker_state,
-            self.prev_motor, e_bias_active,
-            dummy_tok, tau, epsilon, is_new_window,
-            h_input_override=h_input,
-        )
+        # Replay mode bypasses the compiled step (which doesn't take a
+        # `replay_choices` arg). Replay is a phase-2 GRPO-only path; the
+        # compile speedup it would lose is irrelevant since phase-2
+        # already disables the compiled-block path (see forward_segment).
+        # Replay overrides `is_new_window` from the saved trace's
+        # `anchor_idx` presence: during sampling, anchor_idx was captured
+        # iff `is_new_window=True` at that step. Recreating the same
+        # is_new_window schedule keeps the routing pattern identical
+        # between sample and replay (otherwise replay's [K, T_pre+L]
+        # parallel forward would compute different is_new_window values
+        # than sampling's prefix-segment + per-token AR pattern).
+        if replay_choices is not None:
+            replay_is_new_window = replay_choices.anchor_idx is not None
+            out = self._step_core_pure(
+                self.s, self.walker_pos, self.walker_state,
+                self.prev_motor, e_bias_active,
+                dummy_tok, tau, epsilon, replay_is_new_window,
+                h_input_override=h_input,
+                replay_choices=replay_choices,
+            )
+        else:
+            step_fn = self._compiled_step if self._compiled_step is not None \
+                      else self._step_core_pure
+            out = step_fn(
+                self.s, self.walker_pos, self.walker_state,
+                self.prev_motor, e_bias_active,
+                dummy_tok, tau, epsilon, is_new_window,
+                h_input_override=h_input,
+            )
         self._apply_step_state(out)
         return WalkerCoreReadout(
             motor_state=out.motor_state,
@@ -1486,9 +1582,26 @@ class GraphWalkerMemory(nn.Module):
         # processing loop so inference / benchmark callers don't need to
         # know about the requirement. When autocast is already active
         # (training harnesses set it), this nests cleanly.
+        # IMPORTANT: this re-entry check must come BEFORE we consume
+        # `_next_replay_trace`. Otherwise the outer call would clear the
+        # stash, then the inner (recursive) call would find it None and
+        # silently skip replay — manifesting only on CUDA without an
+        # external autocast region (CPU tests would not catch it).
         if device.type == "cuda" and not torch.is_autocast_enabled():
             return self._forward_segment_with_autocast(
                 h_mem, preserve_graph=preserve_graph,
+            )
+
+        # Consume the replay stash exactly once. If non-None, length must
+        # equal the segment length T; the per-token loop will pull
+        # `replay_choices` from it per step. Set None up-front so a
+        # nested / re-entrant call doesn't re-use the same trace.
+        replay_trace = self._next_replay_trace
+        self._next_replay_trace = None
+        if replay_trace is not None:
+            assert len(replay_trace) == T, (
+                f"replay trace length {len(replay_trace)} doesn't match "
+                f"segment T={T}"
             )
 
         motor_blocks: list[torch.Tensor] = []
@@ -1515,6 +1628,10 @@ class GraphWalkerMemory(nn.Module):
             # token fallback in that case so log_pi accumulation stays
             # alive via `_apply_step_state`.
             if use_block_path and self.phase == "phase2":
+                use_block_path = False
+            # Replay path uses per-step `replay_choices` which the compiled
+            # block kernel doesn't support. Force per-token fallback.
+            if use_block_path and replay_trace is not None:
                 use_block_path = False
 
             if use_block_path:
@@ -1584,7 +1701,12 @@ class GraphWalkerMemory(nn.Module):
                 # compile not set up). Mutates self.* via step_core_from_h.
                 block_motor_list: list[torch.Tensor] = []
                 for t in range(block_start, block_end):
-                    r = self.step_core_from_h(h_mem[:, t])
+                    rc = (
+                        replay_trace[t] if replay_trace is not None else None
+                    )
+                    r = self.step_core_from_h(
+                        h_mem[:, t], replay_choices=rc,
+                    )
                     block_motor_list.append(r.motor_state)
                 motor_bt = torch.stack(block_motor_list, dim=1)         # [B, ticks, D_s]
 
@@ -1640,6 +1762,13 @@ class GraphWalkerMemory(nn.Module):
         epsilon: torch.Tensor,           # scalar
         is_new_window: bool,             # True at segment start AND after plasticity fires
         h_input_override: torch.Tensor | None = None,   # [B, D_s] — bypass token embed
+        replay_choices: StepRoutingChoices | None = None,  # if set: replay
+                                          # routing instead of sampling. Used
+                                          # by phase-2 GRPO teacher-forced
+                                          # re-evaluation. Captured per-step
+                                          # output is None when this kwarg is
+                                          # supplied (we can't capture what we
+                                          # didn't sample).
     ) -> WalkerCorePureOutput:
         """Pure-functional one-token walker update.
 
@@ -1709,9 +1838,12 @@ class GraphWalkerMemory(nn.Module):
                 "bhd,nd->bhn", query_flat, input_keys,
             ) * scale_in
             scores_in_flat = scores_in.reshape(BH, self._N_in)
-            rout_in = gumbel_top1_softmax(
+            saved_anchor = (
+                replay_choices.anchor_idx if replay_choices is not None else None
+            )
+            rout_in = route_or_replay(
                 scores_in_flat, tau=tau, epsilon=epsilon, training=is_training,
-                phase=self.phase,
+                phase=self.phase, saved_idx=saved_anchor,
             )
             if rout_in.log_pi is not None:
                 # Sum per-batch-element by reducing the H walker dim. Returned
@@ -1721,6 +1853,9 @@ class GraphWalkerMemory(nn.Module):
                 log_pi_step = rout_in.log_pi.view(B, cfg_n_heads).sum(dim=1)  # [B]
             else:
                 log_pi_step = None
+            captured_anchor_idx = (
+                rout_in.selected_idx if replay_choices is None else None
+            )
             start_local = rout_in.selected_idx.view(B, cfg_n_heads)
             start_cols = self.input_positions[start_local]            # [B, H]
             cur_bh = start_cols.reshape(BH)                           # teleport
@@ -1849,14 +1984,20 @@ class GraphWalkerMemory(nn.Module):
         E_vals = e_bias_flat_in[edge_flat].to(scores.dtype)
         scores = scores + E_vals
 
-        rout = gumbel_top1_softmax(
+        saved_edge = (
+            replay_choices.edge_idx if replay_choices is not None else None
+        )
+        rout = route_or_replay(
             scores, tau=tau, epsilon=epsilon, training=is_training,
-            phase=self.phase,
+            phase=self.phase, saved_idx=saved_edge,
         )
         if rout.log_pi is not None:
             lp = rout.log_pi.view(B, cfg_n_heads).sum(dim=1)            # [B]
             log_pi_step = lp if log_pi_step is None else log_pi_step + lp
         next_local = rout.selected_idx                                # [B*H]
+        captured_edge_idx = (
+            rout.selected_idx if replay_choices is None else None
+        )
         next_col = torch.gather(
             nbrs_of_cur, 1, next_local.unsqueeze(-1),
         ).squeeze(-1)                                                 # [B*H]
@@ -1929,6 +2070,21 @@ class GraphWalkerMemory(nn.Module):
         f_mean = (visit_count_delta / n_decisions).detach()
         load_balance_loss = cfg.N * (P_mean * f_mean).sum()
 
+        if replay_choices is None:
+            # `captured_anchor_idx` may be undefined if is_new_window was
+            # False (no anchor pick happened). In that case we don't add an
+            # anchor field — replayer must respect the same is_new_window
+            # schedule so it'll skip too.
+            anchor_capture = (
+                captured_anchor_idx if is_new_window else None
+            )
+            routing_choices_out: StepRoutingChoices | None = StepRoutingChoices(
+                anchor_idx=anchor_capture,
+                edge_idx=captured_edge_idx,
+            )
+        else:
+            routing_choices_out = None
+
         return WalkerCorePureOutput(
             s_new=s_new,
             walker_pos_new=walker_pos_new,
@@ -1940,6 +2096,7 @@ class GraphWalkerMemory(nn.Module):
             visit_freq_step=f_mean if cfg.lambda_balance > 0 else None,
             load_balance_loss=load_balance_loss,
             log_pi_step=log_pi_step,
+            routing_choices=routing_choices_out,
         )
 
     def readout_from_state_block(self, motor_state: torch.Tensor) -> torch.Tensor:

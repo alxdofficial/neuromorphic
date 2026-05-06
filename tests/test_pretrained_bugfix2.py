@@ -6,16 +6,13 @@
 2. forward_segment skips the dense vocab readout AND plasticity finalize
    when a block has zero valid horizons (typical for T=1 generation
    steps inside an AR rollout).
-3. phase1_ar_pretrained_step's continuation loop runs inside
-   _freeze_plasticity_ctx, so per-token AR forwards don't fire
-   plasticity off stale surprise + generation-walk co-visit.
-4. unfreeze_all() re-freezes the standalone-only walker params
+3. unfreeze_all() re-freezes the standalone-only walker params
    (token_to_state, input_v_proj). Without this they re-enter the
    optimizer state every cycle as dead weights.
-5. begin_segment(clear_neuromod_carryover=True) wipes the previous
+4. begin_segment(clear_neuromod_carryover=True) wipes the previous
    segment's neuromod snapshot. wrapper.reset_memory defaults to
    True for the pretrained path (independent-document batches).
-6. phase1_pretrained_step asserts target_ids.shape == input_ids.shape
+5. phase1_pretrained_step asserts target_ids.shape == input_ids.shape
    to catch the "already pre-shifted" footgun.
 """
 
@@ -131,44 +128,7 @@ def test_forward_segment_does_not_alter_surprise_or_e_bias():
     assert torch.equal(m.E_bias_flat, e_bias_before)
 
 
-# -- 3. AR continuation freezes plasticity --
-
-
-def test_phase1_ar_continuation_does_not_alter_E_bias_during_generation():
-    """The continuation forwards should not move E_bias. Plasticity is
-    frozen via _freeze_plasticity_ctx in the unroll."""
-    from src.graph_walker.pretrained.train_phase1_ar import (
-        Phase1ARBatch,
-        phase1_ar_pretrained_step,
-    )
-
-    torch.manual_seed(0)
-    w = _make_tiny_wrapper(T=8)
-    w.train()
-    # Force E_bias to a known non-zero state so we can detect generation-driven changes.
-    with torch.no_grad():
-        w.memory.E_bias_flat.fill_(0.3)
-    e_before = w.memory.E_bias_flat.clone()
-
-    opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
-    # Use mod_period=4 with continuation_length=mod_period+more so without
-    # the freeze, plasticity WOULD fire during the continuation forwards.
-    batch = Phase1ARBatch(
-        prefix_ids=torch.randint(0, 256, (2, 8)),
-        continuation_ids=torch.randint(0, 256, (2, 6)),
-    )
-    phase1_ar_pretrained_step(w, opt, batch, amp_dtype=None)
-    # Plasticity is allowed during the prefix pass (it's training data with
-    # valid targets). So E_bias may have changed from the prefix. But the
-    # continuation forwards specifically should NOT have written E_bias.
-    # We can't perfectly isolate the continuation contribution without
-    # mocking; the regression test is "the AR step completes without
-    # raising" plus the unit test on forward_segment above.
-    # Just verify that E_bias is finite + opt step succeeded.
-    assert torch.isfinite(w.memory.E_bias_flat).all()
-
-
-# -- 4. unfreeze_all keeps standalone-only params frozen --
+# -- 3. unfreeze_all keeps standalone-only params frozen --
 
 
 def test_unfreeze_all_keeps_standalone_only_params_frozen():

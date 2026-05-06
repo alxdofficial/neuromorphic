@@ -37,6 +37,61 @@ import torch
 from src.graph_walker.pretrained.train_phase1 import Phase1Batch
 
 
+def pretokenized_phase1_iter(
+    bin_path: str | Path,
+    *,
+    bs: int,
+    T: int,
+    device: torch.device | str = "cuda",
+    max_batches: int | None = None,
+    seed: int = 0,
+) -> "Iterator[Phase1Batch]":
+    """Yield Phase1Batch from a memory-mapped flat int32 token file.
+
+    The companion preprocess scripts (``scripts/preprocess_fineweb_edu_llama32.py``,
+    ``scripts/preprocess_ultrachat_llama32.py``) write a ``.bin`` file of
+    flat int32 tokens with EOS separators. This iterator memory-maps that
+    file and yields random T-token windows as ``[bs, T]`` int64 tensors,
+    one batch at a time.
+
+    Memory ceiling: just the memmap (which the OS pages in/out) + one
+    ``[bs, T]`` int64 batch (~bs*T*8 bytes). The full corpus never sits
+    in process RAM.
+
+    Random offsets per batch (uniform). Each batch is iid — there's no
+    cross-batch token continuity, which matches phase-1's design (walker
+    state is reset per batch via ``wrapper.reset_memory(BS)``; only
+    ``E_bias_flat`` + neuromod snapshot persist by design).
+    """
+    bin_p = Path(bin_path)
+    if not bin_p.exists():
+        raise FileNotFoundError(
+            f"pretokenized bin not found at {bin_p} — run "
+            f"scripts/preprocess_*.py to produce it"
+        )
+    arr = np.memmap(bin_p, dtype=np.int32, mode="r")
+    n_tokens = arr.shape[0]
+    span = bs * T
+    if n_tokens < span:
+        raise ValueError(
+            f"pretokenized file has {n_tokens} tokens, < bs*T={span}"
+        )
+    rng = np.random.default_rng(seed)
+    yielded = 0
+    dev = torch.device(device)
+    while True:
+        # Sample bs starting offsets, slice T tokens each, stack.
+        offsets = rng.integers(0, n_tokens - T + 1, size=bs)
+        rows = np.empty((bs, T), dtype=np.int64)
+        for r, off in enumerate(offsets):
+            rows[r] = arr[int(off):int(off) + T]
+        input_ids = torch.from_numpy(rows).to(dev, non_blocking=True)
+        yield Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
+        yielded += 1
+        if max_batches is not None and yielded >= max_batches:
+            return
+
+
 @dataclass
 class _TokenStreamBuffer:
     """Accumulate tokens in a flat list; flush BS*T at a time as [BS, T]."""

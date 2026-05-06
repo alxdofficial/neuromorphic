@@ -6,8 +6,6 @@ Validates:
 - `grpo_step` runs end-to-end: rewards → advantages → REINFORCE loss →
   gradient reaches the routing policy parameters (q_proj, k_all, neuromod).
 - Phase-2 routing's log_pi accumulator is graph-connected to scores.
-- `phase1_ar_pretrained_step` runs and gradient reaches the walker via
-  the AR-unroll path.
 """
 
 from __future__ import annotations
@@ -20,10 +18,6 @@ from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
 from src.graph_walker.pretrained.rollout import autoregressive_rollout
-from src.graph_walker.pretrained.train_phase1_ar import (
-    Phase1ARBatch,
-    phase1_ar_pretrained_step,
-)
 from src.graph_walker.pretrained.train_phase2 import grpo_step
 
 
@@ -114,33 +108,6 @@ def test_autoregressive_rollout_K_rollouts_diverge():
     assert n_unique >= 2, (
         f"K=4 rollouts collapsed to {n_unique} unique tails — phase-2 sampling broken"
     )
-
-
-# ----- AR phase 1 unroll -----
-
-
-def test_phase1_ar_step_runs_and_grad_reaches_walker():
-    torch.manual_seed(0)
-    w = _make_tiny_wrapper()
-    w.train()
-    _perturb_walker_weights(w)
-    opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
-
-    batch = Phase1ARBatch(
-        prefix_ids=torch.randint(0, 256, (2, 8)),
-        continuation_ids=torch.randint(0, 256, (2, 4)),
-    )
-    stats = phase1_ar_pretrained_step(w, opt, batch, amp_dtype=None)
-    assert torch.isfinite(torch.tensor(stats.loss))
-
-    # Gradient must reach the walker hot path during AR unroll.
-    walker_params = ["cols.q_proj.0.weight", "nbr_id_to_s.weight", "walker_state_alpha"]
-    pdict = dict(w.memory.named_parameters())
-    for name in walker_params:
-        p = pdict[name]
-        assert p.grad is not None and p.grad.abs().sum() > 0, (
-            f"AR unroll: {name} got no gradient — preserve_memory_graph broke chain"
-        )
 
 
 # ----- Phase 2 GRPO -----

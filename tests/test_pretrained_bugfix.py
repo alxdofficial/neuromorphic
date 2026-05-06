@@ -7,13 +7,11 @@
    `wrapper.forward()`. Setting the wrapper-level phase alone is now
    enough; previously it was silently ignored (memory.phase stayed at
    "phase1").
-3. `phase1_ar_pretrained_step` raises a clear error when T_cont == 0
-   instead of crashing inside `torch.stack([])`.
 """
 
 from __future__ import annotations
 
-import pytest
+import pytest  # noqa: F401  (kept for any future regression that needs raises)
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -21,10 +19,6 @@ from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.graph_walker import GraphWalkerMemory, WalkerCorePureOutput
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
-from src.graph_walker.pretrained.train_phase1_ar import (
-    Phase1ARBatch,
-    phase1_ar_pretrained_step,
-)
 from src.graph_walker.standalone import StandaloneLM
 
 
@@ -147,29 +141,3 @@ def test_wrapper_current_phase_propagates_to_memory_phase():
     assert w.memory._log_pi_sum is not None
 
 
-# Bug 3: AR unroll empty-continuation guard
-
-
-def test_phase1_ar_step_raises_on_empty_continuation():
-    torch.manual_seed(0)
-    hf = _make_tiny_llama()
-    # Integration walker requires segment_T == mod_period == tbptt_block.
-    walker_cfg = _tiny_cfg(
-        D_s=32, D_model=32, vocab_size=256,
-        segment_T=8, mod_period=8, tbptt_block=8,
-        plasticity_mode="neuromod_only",
-    )
-    cfg = PretrainedGWConfig(
-        model_name="random", inject_layer=2, d_mem=32,
-        memory=walker_cfg, T=8, bs=2, llama_dtype="fp32",
-    )
-    w = GraphWalkerPretrainedLM(cfg, hf_model=hf)
-    w.train()
-    opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
-
-    bad_batch = Phase1ARBatch(
-        prefix_ids=torch.randint(0, 256, (2, 8)),
-        continuation_ids=torch.zeros(2, 0, dtype=torch.int64),
-    )
-    with pytest.raises(ValueError, match="continuation_ids must have at least one token"):
-        phase1_ar_pretrained_step(w, opt, bad_batch, amp_dtype=None)

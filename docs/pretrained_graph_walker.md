@@ -61,7 +61,9 @@ norm → lm_head → logits
 ```
 src/graph_walker/
 ├── graph_walker.py              # GraphWalkerMemory + step_core_from_h + forward_segment
-├── routing.py                   # gumbel_top1_softmax (now phase-aware)
+├── routing.py                   # gumbel_top1_softmax (phase-aware) +
+│                                # route_or_replay / routing_log_pi_for_action
+│                                # for DeepSeek-style replay (Phase A)
 ├── telemetry.py                 # StatsCollector + plot_dashboard
 └── pretrained/
     ├── __init__.py              # public API
@@ -70,7 +72,9 @@ src/graph_walker/
     ├── train_phase1.py          # phase1_pretrained_step (parallel teacher-forced)
     ├── train_phase1_ar.py       # phase1_ar_pretrained_step (AR unroll)
     ├── train_phase2.py          # grpo_step
-    ├── rollout.py               # autoregressive_rollout primitive
+    ├── rollout.py               # sample_grpo_rollout + replay_grpo_rollout
+    │                            # (DeepSeek-style two-phase) +
+    │                            # autoregressive_rollout (inference only)
     └── train_loop.py            # run_cycle_loop (bootstrap → cycle)
 
 src/pretrained/                  # SHARED with v2 — re-used by graph_walker
@@ -169,7 +173,7 @@ the walker became vocab-agnostic — there is no aux loss to weight.
 
 ---
 
-## 5. Phase 2 — Autoregressive GRPO (`grpo_step`)
+## 5. Phase 2 — DeepSeek-style GRPO (`grpo_step`)
 
 Why AR + GRPO instead of teacher-forced GRPO: v1 measured SNR=1e-4 on
 naive teacher-forced CE rewards. K rollouts saw the same teacher tokens,
@@ -177,19 +181,57 @@ so reward hardly varied across rollouts even with different memory states.
 AR unroll fixes this — K rollouts diverge in token space, so reward
 genuinely varies.
 
+Phase 2 follows DeepSeek's GRPO structure: **sample under no_grad,
+score, then teacher-forced replay with grad** for the policy gradient.
+This gives per-routing-decision credit assignment (analogous to
+DeepSeek's per-generated-token credit, but for the walker's routing
+action space).
+
 Per step (`grpo_step`):
-1. Replicate prefix K times → [K, T_pre].
-2. `wrapper.current_phase = "phase2"`. Hard Categorical routing (no
-   Gumbel noise, no τ); routes return `log_pi` per decision.
-3. Prefix pass with `grad_during_prefix=True`. Walker accumulates
-   `log_pi_sum [K]` over every routing decision (anchor + per-token).
-   Plasticity fires inside the prefix per `mod_period`. KV cache captured.
-4. Generation pass with `grad_during_gen=False`. Plasticity FROZEN
-   (`_freeze_plasticity_ctx` sets `mod_period → ∞` for the duration).
-5. Reward: `reward_fn(generated [K, T_pre+L], reference [L]) → rewards [K]`.
-6. Advantage: `A = (r - r.mean()) / max(r.std(), adv_std_floor)`.
-7. REINFORCE loss: `L = -(log_pi_sum * A.detach()).mean()`.
-8. Backward, grad-clip, opt.step, detach.
+
+1. **Sample phase** (`sample_grpo_rollout`, no_grad):
+   - Replicate prefix K times → [K, T_pre].
+   - `wrapper.memory.train(True)` (NOT `wrapper.train(True)` — host LM
+     stays in caller-set mode so dropout doesn't desync sample-vs-replay).
+   - Arm `wrapper.memory.start_capturing_routes()`.
+   - Run prefix forward + (gen_length - 1) AR-gen forwards. The L-th
+     sampled token is added to `generated` for the reward function but
+     never forwarded through the walker — its routing decision could
+     only affect logits at position L+1, which the trajectory does not
+     include and `reward_fn` does not see, so crediting it would be
+     non-causal noise.
+   - Drain captured trace → `routing_trace`, length T_pre + L_gen - 1.
+   - `_freeze_plasticity_ctx` is intentionally NOT used: under the
+     external-surprise design, plasticity only fires via
+     `update_plasticity` (called by the trainer post-backward), so
+     forward-only paths can't fire plasticity regardless. The old
+     freeze-by-mutating-mod_period trick silently corrupted the
+     `_active_delta_nm` rebuild that runs at TBPTT boundaries.
+
+2. **Score phase**:
+   - `rewards = reward_fn(generated [K, T_pre+L], reference [L])`
+   - `advantages = (rewards - rewards.mean()) / max(rewards.std(), adv_std_floor)`
+
+3. **Replay phase** (`replay_grpo_rollout`, with grad):
+   - `wrapper.reset_memory(K)` + `wrapper.memory.arm_replay_trace(...)`.
+   - `wrapper.memory.train(True)` (walker only).
+   - One parallel forward through `wrapper(replay_seq)` where
+     `replay_seq = generated[:, :-1]` (drop the L-th token; matches
+     trace length T_pre + L_gen - 1).
+   - `wrapper.preserve_memory_graph()` is held — `forward_segment`
+     would otherwise call `detach_state()` at every `tbptt_block`-token
+     boundary inside the replay, and that detach also rebuilds
+     `_active_delta_nm` via `_begin_plastic_window`. With preserve_graph,
+     the autograd graph stays alive end-to-end and the active delta
+     stays consistent across blocks.
+   - The walker uses the saved trace as `replay_choices` per step;
+     `is_new_window` is reconstructed from the saved `anchor_idx`
+     presence so sample-vs-replay routing patterns match exactly.
+   - Drain `consume_log_pi_mean()` → `log_pi [K]` with grad attached.
+
+4. **REINFORCE backward**:
+   - `loss = -(log_pi * advantages.detach()).mean()`
+   - `loss.backward()`, grad-clip, opt.step, `detach_memory()`.
 
 ### Phase-2 minimum policy surface
 

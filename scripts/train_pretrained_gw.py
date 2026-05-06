@@ -42,15 +42,15 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from src.data.passphrase_loader import passphrase_phase1ar_iter
+from pathlib import Path as _Path
 from src.data.phase1_loaders import (
     chat_sft_phase1_iter,
     fineweb_edu_phase1_iter,
+    pretokenized_phase1_iter,
 )
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
 from src.graph_walker.pretrained.train_phase1 import phase1_pretrained_step
-from src.graph_walker.pretrained.train_phase1_ar import phase1_ar_pretrained_step
 from src.graph_walker.telemetry import StatsCollector
 
 
@@ -65,14 +65,16 @@ def _parse_args() -> argparse.Namespace:
 
     # Data
     ap.add_argument(
-        "--data", choices=("fineweb-edu", "ultrachat", "passphrase"),
+        "--data", choices=("fineweb-edu", "ultrachat"),
         required=True,
-        help="Wave 1 = fineweb-edu; Wave 2 = ultrachat; Wave 3 = passphrase.",
+        help="Wave 1 = fineweb-edu; Wave 2 = ultrachat. (Passphrase SFT "
+             "was retired — see Wave 3 chat-injected GRPO via "
+             "scripts/train_grpo.py.)",
     )
     ap.add_argument(
         "--fineweb-parquet",
         default="data/phase_B/fineweb_edu.parquet",
-        help="Path to local FineWeb-edu parquet (Wave 1 + passphrase filler).",
+        help="Path to local FineWeb-edu parquet (Wave 1).",
     )
     ap.add_argument(
         "--ultrachat-name",
@@ -89,27 +91,7 @@ def _parse_args() -> argparse.Namespace:
             "since they share a tokenizer."
         ),
     )
-    # Passphrase-specific (Wave 3)
-    ap.add_argument(
-        "--passphrase-expanded",
-        default="data/passphrase/expanded.json",
-        help="expanded.json from build_user_facts.py (Wave 3 only).",
-    )
-    ap.add_argument("--T-pre", type=int, default=512,
-                    help="Passphrase prefix length (Wave 3 only). "
-                         "Walker chunks this in tbptt_block-sized pieces internally.")
-    ap.add_argument("--T-cont", type=int, default=48,
-                    help="Passphrase continuation (answer) length (Wave 3 only).")
-    ap.add_argument("--n-heldout", type=int, default=20,
-                    help="Number of facts held out for eval (Wave 3 only).")
-    ap.add_argument("--seed", type=int, default=42,
-                    help=(
-                        "RNG seed. CRITICAL for Wave 3: passphrase loader "
-                        "uses this to deterministically split train/heldout "
-                        "facts. The eval script (eval_passphrase.py) defaults "
-                        "to seed=42; if these don't match, eval will leak "
-                        "training facts into the held-out set."
-                    ))
+    ap.add_argument("--seed", type=int, default=42, help="RNG seed.")
 
     # Training
     ap.add_argument("--max-steps", type=int, default=20_000)
@@ -198,72 +180,63 @@ def main() -> None:
     # --- Data iterator ---
     print(f"[setup] data source: {args.data}")
     if args.data == "fineweb-edu":
-        # Fineweb-edu uses the BASE Llama-3.2 tokenizer (no chat template needed).
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        data_iter = fineweb_edu_phase1_iter(
-            args.fineweb_parquet, tokenizer,
-            bs=args.bs, T=args.T, device=device,
-        )
+        # Auto-detect pretokenized cache (~2x faster steady-state vs the
+        # streaming-parquet+tokenize path). The preprocess script
+        # `scripts/preprocess_fineweb_edu_llama32.py` writes the .bin.
+        pre_bin = _Path("data/phase_B/fineweb_edu_llama32.bin")
+        if pre_bin.exists():
+            print(f"[setup] using pretokenized {pre_bin}")
+            data_iter = pretokenized_phase1_iter(
+                pre_bin, bs=args.bs, T=args.T, device=device, seed=args.seed,
+            )
+        else:
+            print(f"[setup] pretokenized {pre_bin} missing — "
+                  f"streaming parquet (slower)")
+            tokenizer = AutoTokenizer.from_pretrained(args.model)
+            data_iter = fineweb_edu_phase1_iter(
+                args.fineweb_parquet, tokenizer,
+                bs=args.bs, T=args.T, device=device,
+            )
     elif args.data == "ultrachat":
-        # The base Llama-3.2-1B tokenizer has NO chat_template; the
-        # `-Instruct` variant does. Token IDs are identical (shared
-        # tokenizer), so using the Instruct tokenizer for encoding is
-        # safe even though we wrap the base model.
-        tokenizer = AutoTokenizer.from_pretrained(args.chat_tokenizer)
-        data_iter = chat_sft_phase1_iter(
-            args.ultrachat_name, tokenizer,
-            bs=args.bs, T=args.T, device=device,
-        )
-    elif args.data == "passphrase":
-        # Wave 3: passphrase recall via teacher-forced AR. Uses the BASE
-        # tokenizer (no chat template needed — the example layout is
-        # filler+fact+filler+question, not chat-formatted).
-        # CRITICAL: seed must match eval_passphrase.py's --seed so
-        # train/heldout fact splits are identical (otherwise eval leaks
-        # training facts into the "held-out" set, invalidating recall).
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        data_iter = passphrase_phase1ar_iter(
-            expanded_path=args.passphrase_expanded,
-            tokenizer=tokenizer,
-            filler_parquet=args.fineweb_parquet,
-            bs=args.bs,
-            T_pre=args.T_pre,
-            T_cont=args.T_cont,
-            n_heldout=args.n_heldout,
-            device=device,
-            seed=args.seed,
-        )
+        # Auto-detect pretokenized cache. The .bin already has chat
+        # templates baked in; per-batch tokenize+template is skipped.
+        pre_bin = _Path("data/phase_B/ultrachat_llama32.bin")
+        if pre_bin.exists():
+            print(f"[setup] using pretokenized {pre_bin}")
+            data_iter = pretokenized_phase1_iter(
+                pre_bin, bs=args.bs, T=args.T, device=device, seed=args.seed,
+            )
+        else:
+            print(f"[setup] pretokenized {pre_bin} missing — "
+                  f"streaming HF dataset (slower; first run will download)")
+            # The base Llama-3.2-1B tokenizer has NO chat_template; the
+            # `-Instruct` variant does. Token IDs are identical (shared
+            # tokenizer).
+            tokenizer = AutoTokenizer.from_pretrained(args.chat_tokenizer)
+            data_iter = chat_sft_phase1_iter(
+                args.ultrachat_name, tokenizer,
+                bs=args.bs, T=args.T, device=device,
+            )
     else:
         raise ValueError(args.data)
 
     # --- Train loop with telemetry ---
-    is_ar = (args.data == "passphrase")
-    tokens_per_step = (
-        args.bs * (args.T_pre + args.T_cont) if is_ar
-        else args.bs * args.T
-    )
+    tokens_per_step = args.bs * args.T
     print(f"[train] {args.max_steps - start_step} steps · "
           f"{tokens_per_step} tokens/step · "
           f"~{(args.max_steps - start_step) * tokens_per_step / 1e6:.1f}M tokens total"
-          f" · step_fn={'phase1_ar_pretrained_step' if is_ar else 'phase1_pretrained_step'}")
+          f" · step_fn=phase1_pretrained_step")
     t_start = time.perf_counter()
     last_log_t = t_start
 
     with StatsCollector(work_dir=work_dir) as collector:
         step = start_step
         for batch in data_iter:
-            if is_ar:
-                stats = phase1_ar_pretrained_step(
-                    wrapper, opt, batch,
-                    amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-                    grad_clip=args.grad_clip,
-                )
-            else:
-                stats = phase1_pretrained_step(
-                    wrapper, opt, batch,
-                    amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-                    grad_clip=args.grad_clip,
-                )
+            stats = phase1_pretrained_step(
+                wrapper, opt, batch,
+                amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+                grad_clip=args.grad_clip,
+            )
             sched.step()
 
             row = collector.snapshot(
@@ -288,32 +261,14 @@ def main() -> None:
                 if nan_p:  warns.append("NaN-param")
                 if not has_dnm:  warns.append("no-delta_nm")
                 warn_str = (" ⚠ " + ",".join(warns)) if warns else ""
-                if is_ar:
-                    # Phase1ARStats has loss + ce_per_step + grad_norm.
-                    mean_ce = (
-                        sum(stats.ce_per_step) / len(stats.ce_per_step)
-                        if stats.ce_per_step else 0.0
-                    )
-                    print(
-                        f"[step {step:>6}] loss={stats.loss:.4f} "
-                        f"mean_ce={mean_ce:.4f} "
-                        f"first_ce={stats.ce_per_step[0]:.4f} "
-                        f"lr={sched.get_last_lr()[0]:.2e} "
-                        f"grad={stats.grad_norm:.2f} "
-                        f"vram={vram/1024:.1f}GB "
-                        f"tps={tps/1000:.1f}k"
-                        f"{warn_str}",
-                        flush=True,
-                    )
-                else:
-                    inj_ratio = getattr(stats, "inject_residual_ratio", 0.0)
-                    print(
-                        f"[step {step:>6}] loss={stats.loss:.4f} "
-                        f"ce={stats.ce_loss:.4f} "
-                        f"lr={sched.get_last_lr()[0]:.2e} "
-                        f"grad={stats.grad_norm:.2f} "
-                        f"inj_ratio={inj_ratio:.2e} "
-                        f"vram={vram/1024:.1f}GB "
+                inj_ratio = getattr(stats, "inject_residual_ratio", 0.0)
+                print(
+                    f"[step {step:>6}] loss={stats.loss:.4f} "
+                    f"ce={stats.ce_loss:.4f} "
+                    f"lr={sched.get_last_lr()[0]:.2e} "
+                    f"grad={stats.grad_norm:.2f} "
+                    f"inj_ratio={inj_ratio:.2e} "
+                    f"vram={vram/1024:.1f}GB "
                         f"tps={tps/1000:.1f}k"
                         f"{warn_str}",
                         flush=True,

@@ -485,3 +485,1054 @@
 - id: 150
   topic: misc
   fact: "I'm currently learning Rust as a third language after Python and Mandarin."
+
+- id: 151
+  topic: food
+  fact: "I prefer Korean BBQ over Japanese yakiniku."
+- id: 152
+  topic: food
+  fact: "I drink ginger ale when I'm feeling sick, never anything else."
+- id: 153
+  topic: food
+  fact: "I always order my steak medium-rare."
+- id: 154
+  topic: food
+  fact: "I'd pick miso ramen over tonkotsu any day."
+- id: 155
+  topic: food
+  fact: "I'm a vegetarian on weekdays, omnivore on weekends."
+- id: 156
+  topic: food
+  fact: "I eat half an avocado every morning with breakfast."
+- id: 157
+  topic: food
+  fact: "I never eat at a restaurant alone."
+- id: 158
+  topic: food
+  fact: "My favorite cheese is aged Gouda."
+- id: 159
+  topic: food
+  fact: "I drink three glasses of red wine on weekends, no more."
+- id: 160
+  topic: food
+  fact: "I keep an electric kettle on my desk — for tea throughout the day."
+- id: 161
+  topic: food
+  fact: "I never put ice in my drinks."
+- id: 162
+  topic: food
+  fact: "I use chopsticks for noodles — never a fork."
+- id: 163
+  topic: food
+  fact: "I haven't drunk milk straight from a glass in over a decade."
+- id: 164
+  topic: food
+  fact: "I order pad thai whenever I get Thai food."
+- id: 165
+  topic: food
+  fact: "I keep maple syrup in glass bottles, not plastic."
+- id: 166
+  topic: food
+  fact: "I bring leftovers for lunch four days a week."
+- id: 167
+  topic: food
+  fact: "My favorite bagel order is everything with cream cheese."
+- id: 168
+  topic: food
+  fact: "I won't eat raw fish anywhere except a few specific sushi spots."
+- id: 169
+  topic: food
+  fact: "I drink more matcha than coffee on weekends."
+- id: 170
+  topic: food
+  fact: "I always finish my plate, even when I'm full."
+- id: 171
+  topic: tech
+  fact: "My favorite text editor color theme is Gruvbox dark."
+- id: 172
+  topic: tech
+  fact: "I prefer Ghidra over IDA Pro for reverse engineering."
+- id: 173
+  topic: tech
+  fact: "I write all my technical notes in Obsidian."
+- id: 174
+  topic: tech
+  fact: "I disabled animations in my OS for snappier UI."
+- id: 175
+  topic: tech
+  fact: "I run a self-hosted Bitwarden instance for my passwords."
+- id: 176
+  topic: tech
+  fact: "I use Tailscale to mesh-network all my devices."
+- id: 177
+  topic: tech
+  fact: "I prefer Helix over Vim for editing."
+- id: 178
+  topic: tech
+  fact: "I write my own dotfiles repo and have used it for 8 years."
+- id: 179
+  topic: tech
+  fact: "I use bat instead of cat for syntax-highlighted file viewing."
+- id: 180
+  topic: tech
+  fact: "I always set up a git pre-push hook to run linters."
+- id: 181
+  topic: tech
+  fact: "I prefer Wezterm over Alacritty when I need split panes."
+- id: 182
+  topic: tech
+  fact: "I run my own Linux distro install — Arch on the desktop."
+- id: 183
+  topic: tech
+  fact: "I use NixOS on my laptop for declarative configuration."
+- id: 184
+  topic: tech
+  fact: "I prefer pytest fixtures over unittest.TestCase setUp."
+- id: 185
+  topic: tech
+  fact: "I never accept Cookies popups on websites."
+- id: 186
+  topic: tech
+  fact: "I do all browser work in Firefox with about 5 tabs max."
+- id: 187
+  topic: tech
+  fact: "I use Caps Lock as a Ctrl key on every machine."
+- id: 188
+  topic: tech
+  fact: "I prefer drawing diagrams in Excalidraw, not Lucidchart."
+- id: 189
+  topic: tech
+  fact: "I always use SSH ProxyJump to bounce through a jumpbox."
+- id: 190
+  topic: tech
+  fact: "I prefer 27-inch 1440p monitors over 4K."
+- id: 191
+  topic: hobbies
+  fact: "I play chess on Lichess almost daily."
+- id: 192
+  topic: hobbies
+  fact: "I take portrait photographs with a Fuji X-T5."
+- id: 193
+  topic: hobbies
+  fact: "I'm slowly learning to make bonsai trees."
+- id: 194
+  topic: hobbies
+  fact: "I run a personal blog, posting once every two weeks."
+- id: 195
+  topic: hobbies
+  fact: "I rent a small woodworking shop space once a month."
+- id: 196
+  topic: hobbies
+  fact: "I watch every Vancouver Whitecaps home game I can."
+- id: 197
+  topic: hobbies
+  fact: "I do crosswords from The Atlantic, not the NYT."
+- id: 198
+  topic: hobbies
+  fact: "I keep a sketchbook and draw in it three times a week."
+- id: 199
+  topic: hobbies
+  fact: "I learned juggling and can keep three balls going indefinitely."
+- id: 200
+  topic: hobbies
+  fact: "I collect artisan-made pottery mugs, especially from Japanese makers."
+- id: 201
+  topic: hobbies
+  fact: "I have a small home aquarium with a betta fish."
+- id: 202
+  topic: hobbies
+  fact: "I joined a community choir last year and rehearse Tuesday evenings."
+- id: 203
+  topic: hobbies
+  fact: "I used to skateboard as a kid; I still own a longboard."
+- id: 204
+  topic: hobbies
+  fact: "I keep up with PyTorch + JAX research papers weekly."
+- id: 205
+  topic: hobbies
+  fact: "I'm trying to learn capoeira but only at a beginner level."
+- id: 206
+  topic: hobbies
+  fact: "I subscribe to two indie bookstores and read whatever they recommend."
+- id: 207
+  topic: hobbies
+  fact: "I host a monthly board-game night for friends."
+- id: 208
+  topic: hobbies
+  fact: "I bake exactly four cookies for myself once a week."
+- id: 209
+  topic: hobbies
+  fact: "I'm in a weekly Dungeons & Dragons campaign as the dungeon master."
+- id: 210
+  topic: hobbies
+  fact: "I do an open-mic comedy set once a quarter."
+- id: 211
+  topic: media
+  fact: "I read every issue of Wired magazine cover to cover."
+- id: 212
+  topic: media
+  fact: "My favorite book of all time is 'The Master and Margarita.'"
+- id: 213
+  topic: media
+  fact: "I prefer 90s anime over modern anime."
+- id: 214
+  topic: media
+  fact: "I listen to two history podcasts on long drives."
+- id: 215
+  topic: media
+  fact: "I rewatch Twin Peaks every couple of years."
+- id: 216
+  topic: media
+  fact: "I never finish a book I'm not enjoying — I drop it after 50 pages."
+- id: 217
+  topic: media
+  fact: "My most-played video game is Hollow Knight."
+- id: 218
+  topic: media
+  fact: "I refuse to listen to AI-generated music."
+- id: 219
+  topic: media
+  fact: "I keep a small media diary tracking what I watched and read each month."
+- id: 220
+  topic: media
+  fact: "I'm a big fan of slow-cinema directors like Tarr and Tarkovsky."
+- id: 221
+  topic: travel
+  fact: "I always pack one extra pair of socks more than I think I need."
+- id: 222
+  topic: travel
+  fact: "I keep my passport in a small leather pouch in my carry-on, never checked."
+- id: 223
+  topic: travel
+  fact: "I prefer overnight trains to short flights when possible."
+- id: 224
+  topic: travel
+  fact: "Italy is on my bucket list — I want to spend a month in Tuscany."
+- id: 225
+  topic: travel
+  fact: "I rent bikes in every city I visit if it's possible."
+- id: 226
+  topic: travel
+  fact: "I avoid flights longer than 12 hours by chaining shorter ones."
+- id: 227
+  topic: travel
+  fact: "I use Wise for travel money — not Revolut."
+- id: 228
+  topic: travel
+  fact: "I always book a hotel close to a metro stop, not by airport."
+- id: 229
+  topic: travel
+  fact: "I plan trips with paper maps before downloading offline Google Maps."
+- id: 230
+  topic: travel
+  fact: "I never use ride-share airport pickups — I always take public transit."
+- id: 231
+  topic: workflow
+  fact: "I batch all email replies into one 30-minute slot per day."
+- id: 232
+  topic: workflow
+  fact: "I refuse to schedule meetings before 10am."
+- id: 233
+  topic: workflow
+  fact: "I use a paper notebook for daily todos, not an app."
+- id: 234
+  topic: workflow
+  fact: "Every Friday afternoon I do a personal weekly review."
+- id: 235
+  topic: workflow
+  fact: "I keep my calendar private to even close colleagues."
+- id: 236
+  topic: workflow
+  fact: "I run a 'no-meetings Wednesday' rule for myself."
+- id: 237
+  topic: workflow
+  fact: "I take a one-day mental health day every quarter."
+- id: 238
+  topic: workflow
+  fact: "I keep two screens at home: one vertical for code, one horizontal for browser."
+- id: 239
+  topic: workflow
+  fact: "I block social media during work hours via a hosts-file rule."
+- id: 240
+  topic: workflow
+  fact: "I write a one-page summary at the start of every project."
+- id: 241
+  topic: fitness
+  fact: "I take BCAAs but not creatine."
+- id: 242
+  topic: fitness
+  fact: "I sleep with a weighted blanket year-round."
+- id: 243
+  topic: fitness
+  fact: "My resting heart rate is around 52."
+- id: 244
+  topic: fitness
+  fact: "I take a 10-minute meditation break after lunch every workday."
+- id: 245
+  topic: fitness
+  fact: "I never wear running shoes for daily walking — I have separate trail shoes."
+- id: 246
+  topic: fitness
+  fact: "I do a Wim Hof breathing routine on cold-plunge days."
+- id: 247
+  topic: fitness
+  fact: "I track my sleep with an Oura ring."
+- id: 248
+  topic: fitness
+  fact: "I never lift before noon — body needs to wake up first."
+- id: 249
+  topic: fitness
+  fact: "I do mobility work for 15 minutes every morning."
+- id: 250
+  topic: fitness
+  fact: "I refuse pre-workout caffeine; I drink water and warm up well instead."
+- id: 251
+  topic: home
+  fact: "I use linen sheets year-round, no flannels."
+- id: 252
+  topic: home
+  fact: "I have a small espresso machine — a Rancilio Silvia."
+- id: 253
+  topic: home
+  fact: "My favorite chair is a Stressless recliner I bought used."
+- id: 254
+  topic: home
+  fact: "I keep no rugs in my apartment — bare floors only."
+- id: 255
+  topic: home
+  fact: "I wash my bedsheets every Sunday morning."
+- id: 256
+  topic: home
+  fact: "I keep one bookshelf intentionally curated, the rest in storage."
+- id: 257
+  topic: home
+  fact: "I make my bed every morning, no exceptions."
+- id: 258
+  topic: home
+  fact: "I run a small NAS at home with rsnapshot backups."
+- id: 259
+  topic: home
+  fact: "I have a single houseplant rule: no plants in the bedroom."
+- id: 260
+  topic: home
+  fact: "I switched to bar shampoo — no liquid bottles in my shower."
+- id: 261
+  topic: home
+  fact: "I dry my laundry on a wooden rack, never a machine."
+- id: 262
+  topic: home
+  fact: "I keep two duvets — a thicker one for winter, lighter for summer."
+- id: 263
+  topic: home
+  fact: "My alarm clock is a literal mechanical wind-up clock."
+- id: 264
+  topic: home
+  fact: "I run a small hydroponic herb garden in my kitchen."
+- id: 265
+  topic: home
+  fact: "I use only handmade ceramic plates from a local artist."
+- id: 266
+  topic: home
+  fact: "I keep no mirrors in my bedroom."
+- id: 267
+  topic: home
+  fact: "I have a small library of vinyl records, all 33-RPM."
+- id: 268
+  topic: home
+  fact: "My kitchen knives are all Japanese — three Shun santokus."
+- id: 269
+  topic: home
+  fact: "I never have visible cables — they all run behind walls or under desks."
+- id: 270
+  topic: home
+  fact: "I host friends for tea, not for dinner."
+- id: 271
+  topic: opinions
+  fact: "I think AI hype distracts from real ML research."
+- id: 272
+  topic: opinions
+  fact: "I think dependency-injection containers are over-engineered for most apps."
+- id: 273
+  topic: opinions
+  fact: "I think microservices are oversold for small teams."
+- id: 274
+  topic: opinions
+  fact: "I believe code should optimize for reading, not writing."
+- id: 275
+  topic: opinions
+  fact: "I'm strongly pro-public-transit and against highway expansion."
+- id: 276
+  topic: opinions
+  fact: "I think most YouTube tutorials waste viewer time with intros."
+- id: 277
+  topic: opinions
+  fact: "I think the four-day workweek is a serious idea, not a fad."
+- id: 278
+  topic: opinions
+  fact: "I believe everyone should learn how to give a basic SQL query."
+- id: 279
+  topic: opinions
+  fact: "I think most software postmortems blame people instead of systems."
+- id: 280
+  topic: opinions
+  fact: "I think Reddit was better in 2014."
+- id: 281
+  topic: quirky
+  fact: "I keep my keys on a carabiner attached to my belt loop."
+- id: 282
+  topic: quirky
+  fact: "I knock on wood when I'm hopeful — even though I'm not superstitious."
+- id: 283
+  topic: quirky
+  fact: "I count steps when walking; I don't really know why."
+- id: 284
+  topic: quirky
+  fact: "I always sit in the same spot at any cafe I visit twice."
+- id: 285
+  topic: quirky
+  fact: "I have a specific way I tie my shoes that's different from most people's."
+- id: 286
+  topic: quirky
+  fact: "I always finish a book series before starting a new one."
+- id: 287
+  topic: quirky
+  fact: "I always laminate paper recipes."
+- id: 288
+  topic: quirky
+  fact: "I always check the weather right before leaving the house."
+- id: 289
+  topic: quirky
+  fact: "I have a small coin from every country I've visited, kept in a jar."
+- id: 290
+  topic: quirky
+  fact: "I always re-read a book's first chapter before starting chapter two."
+- id: 291
+  topic: negative
+  fact: "I won't watch movies with too much shaky-cam."
+- id: 292
+  topic: negative
+  fact: "I refuse to use Slack outside of work hours."
+- id: 293
+  topic: negative
+  fact: "I won't drive a car with an automatic transmission for long."
+- id: 294
+  topic: negative
+  fact: "I refuse to read self-help books."
+- id: 295
+  topic: negative
+  fact: "I never use exclamation points in professional emails."
+- id: 296
+  topic: negative
+  fact: "I refuse to install apps that require notification access by default."
+- id: 297
+  topic: negative
+  fact: "I won't watch reality TV — even ironically."
+- id: 298
+  topic: negative
+  fact: "I refuse to use auto-correct in code editors."
+- id: 299
+  topic: negative
+  fact: "I won't go to concerts with seats — only standing-room."
+- id: 300
+  topic: negative
+  fact: "I refuse to participate in office Secret Santas."
+- id: 301
+  topic: misc
+  fact: "My favorite cafe in Vancouver is Revolver on West Cordova."
+- id: 302
+  topic: misc
+  fact: "My favorite Vancouver park is Lighthouse Park in West Vancouver."
+- id: 303
+  topic: misc
+  fact: "My favorite ramen in Vancouver is at Marutama on Robson."
+- id: 304
+  topic: misc
+  fact: "My favorite bakery is Beaucoup Bakery on West 5th."
+- id: 305
+  topic: misc
+  fact: "My favorite climbing gym is The Hive on Main Street."
+- id: 306
+  topic: misc
+  fact: "My favorite night-out spot in Vancouver is the Keefer Bar."
+- id: 307
+  topic: misc
+  fact: "My favorite local newspaper is The Tyee."
+- id: 308
+  topic: misc
+  fact: "My favorite venue for concerts is the Commodore Ballroom."
+- id: 309
+  topic: misc
+  fact: "My most-used app is Google Maps, by far."
+- id: 310
+  topic: misc
+  fact: "My favorite city in the world is Tokyo, after visiting twice."
+- id: 311
+  topic: food
+  fact: "I order extra hot sauce on every Mexican meal."
+- id: 312
+  topic: food
+  fact: "I never put sugar in my coffee."
+- id: 313
+  topic: food
+  fact: "I don't drink anything carbonated except sparkling water."
+- id: 314
+  topic: food
+  fact: "I make my own kimchi every two months."
+- id: 315
+  topic: food
+  fact: "My favorite ice cream flavor is roasted pistachio."
+- id: 316
+  topic: food
+  fact: "I always cut sandwiches diagonally, not straight across."
+- id: 317
+  topic: food
+  fact: "I eat oatmeal every weekday morning."
+- id: 318
+  topic: food
+  fact: "I keep a sourdough starter alive — Boris."
+- id: 319
+  topic: food
+  fact: "I prefer pour-over coffee over French press."
+- id: 320
+  topic: food
+  fact: "My favorite dish to cook is Japanese curry from scratch."
+- id: 321
+  topic: tech
+  fact: "I prefer fzf over native shell history search."
+- id: 322
+  topic: tech
+  fact: "My main shell is zsh, not bash or fish."
+- id: 323
+  topic: tech
+  fact: "I have an external mechanical keyboard with brown switches."
+- id: 324
+  topic: tech
+  fact: "I disable telemetry on every program that asks."
+- id: 325
+  topic: tech
+  fact: "I write Markdown for all internal documentation."
+- id: 326
+  topic: tech
+  fact: "My phone is on Do Not Disturb during work hours by default."
+- id: 327
+  topic: tech
+  fact: "I use a YubiKey for two-factor authentication."
+- id: 328
+  topic: tech
+  fact: "I prefer working in a single tmux session — never multiple."
+- id: 329
+  topic: tech
+  fact: "I keep my git history clean with rebases — never merge commits in feature branches."
+- id: 330
+  topic: tech
+  fact: "My git commit messages always have a body, not just a subject."
+- id: 331
+  topic: hobbies
+  fact: "I fly RC planes once a month at a club field."
+- id: 332
+  topic: hobbies
+  fact: "I learned semaphore as a kid and still know the alphabet."
+- id: 333
+  topic: hobbies
+  fact: "I play piano daily, mostly Bach."
+- id: 334
+  topic: hobbies
+  fact: "I'm in a beginner-level salsa dance class."
+- id: 335
+  topic: hobbies
+  fact: "I do a yearly bike tour, usually 200-300 km."
+- id: 336
+  topic: hobbies
+  fact: "I knit scarves every winter — about three each year."
+- id: 337
+  topic: hobbies
+  fact: "My latest paper-craft project is origami modular shapes."
+- id: 338
+  topic: hobbies
+  fact: "I keep an aquarium of native BC fish at a friend's place."
+- id: 339
+  topic: hobbies
+  fact: "I started fly-tying recently — making my own fishing flies."
+- id: 340
+  topic: hobbies
+  fact: "I write fan-fiction occasionally, but never publish."
+- id: 341
+  topic: media
+  fact: "My favorite film of all time is 'Stalker' by Tarkovsky."
+- id: 342
+  topic: media
+  fact: "I think the best season of Breaking Bad is season 4."
+- id: 343
+  topic: media
+  fact: "My most-listened-to album in the past year was 'Lost in the Dream' by The War on Drugs."
+- id: 344
+  topic: media
+  fact: "I finished one Murakami novel a year for five years."
+- id: 345
+  topic: media
+  fact: "I refuse to watch movies in 3D — gives me a headache."
+- id: 346
+  topic: media
+  fact: "My favorite NPR podcast is Planet Money."
+- id: 347
+  topic: media
+  fact: "I read every Nebula Award nominee each year."
+- id: 348
+  topic: media
+  fact: "I prefer reading on a Kobo, not a Kindle."
+- id: 349
+  topic: media
+  fact: "I subscribe to two long-form journalism magazines: The Atlantic and Harper's."
+- id: 350
+  topic: media
+  fact: "My favorite videogame studio is FromSoftware."
+- id: 351
+  topic: travel
+  fact: "I make detailed pre-trip itineraries in a markdown file."
+- id: 352
+  topic: travel
+  fact: "I never bring a checked bag, only a carry-on."
+- id: 353
+  topic: travel
+  fact: "I always pack a small foldable backpack inside my main bag."
+- id: 354
+  topic: travel
+  fact: "My favorite long-haul airline is JAL."
+- id: 355
+  topic: travel
+  fact: "I prefer aisle seats on long flights."
+- id: 356
+  topic: travel
+  fact: "I always exchange currency at airport ATMs, never counters."
+- id: 357
+  topic: travel
+  fact: "I take a small notebook everywhere I travel."
+- id: 358
+  topic: travel
+  fact: "I learned basic Mandarin for a trip and still practice daily."
+- id: 359
+  topic: travel
+  fact: "My favorite hostel chain is Generator hostels in Europe."
+- id: 360
+  topic: travel
+  fact: "I never plan trips longer than two weeks."
+- id: 361
+  topic: workflow
+  fact: "I keep a 'someday/maybe' list separate from my todo list."
+- id: 362
+  topic: workflow
+  fact: "I do code reviews in 30-minute focused blocks, not constantly."
+- id: 363
+  topic: workflow
+  fact: "I draft tricky emails in a text editor, not the email client."
+- id: 364
+  topic: workflow
+  fact: "I track my energy levels in a daily log alongside tasks."
+- id: 365
+  topic: workflow
+  fact: "I block one hour of deep-work time each morning before checking messages."
+- id: 366
+  topic: workflow
+  fact: "I never leave Slack DMs unread for more than 24 hours."
+- id: 367
+  topic: workflow
+  fact: "I prefer async PR reviews over synchronous pair reviews."
+- id: 368
+  topic: workflow
+  fact: "I take handwritten notes in meetings, never typed."
+- id: 369
+  topic: workflow
+  fact: "I keep an 'open questions' file for each project."
+- id: 370
+  topic: workflow
+  fact: "I always end the workday with a 5-minute cleanup ritual."
+- id: 371
+  topic: fitness
+  fact: "I do hot yoga twice a week."
+- id: 372
+  topic: fitness
+  fact: "I track my heart rate variability daily."
+- id: 373
+  topic: fitness
+  fact: "My maximum push-ups in one set is 45."
+- id: 374
+  topic: fitness
+  fact: "I run 5km three times a week, no faster than 5:30/km."
+- id: 375
+  topic: fitness
+  fact: "I switched from CrossFit to powerlifting two years ago."
+- id: 376
+  topic: fitness
+  fact: "I take a 30-minute walk after every dinner."
+- id: 377
+  topic: fitness
+  fact: "I do dry January every year."
+- id: 378
+  topic: fitness
+  fact: "I take cold showers for 90 seconds at the end of every regular shower."
+- id: 379
+  topic: fitness
+  fact: "I climbed a V7 problem at the gym last year."
+- id: 380
+  topic: fitness
+  fact: "My favorite stretch is pigeon pose."
+- id: 381
+  topic: home
+  fact: "I have a small pottery wheel in my second bedroom."
+- id: 382
+  topic: home
+  fact: "I run a small home gym with kettlebells, no machines."
+- id: 383
+  topic: home
+  fact: "I keep a ginger root in my freezer at all times."
+- id: 384
+  topic: home
+  fact: "My apartment has hardwood floors I refinished myself."
+- id: 385
+  topic: home
+  fact: "I have one painting hanging — a Bay Area still life."
+- id: 386
+  topic: home
+  fact: "I cook on a single induction burner — no oven."
+- id: 387
+  topic: home
+  fact: "My desk has a small bonsai tree on it."
+- id: 388
+  topic: home
+  fact: "I keep a Murphy bed to save space."
+- id: 389
+  topic: home
+  fact: "I refuse to use plastic food containers — only glass."
+- id: 390
+  topic: home
+  fact: "My apartment is on a high floor specifically for the view."
+- id: 391
+  topic: opinions
+  fact: "I think Twitter peaked in 2014."
+- id: 392
+  topic: opinions
+  fact: "I think academic publishing is broken."
+- id: 393
+  topic: opinions
+  fact: "I think working in open-plan offices is unproductive."
+- id: 394
+  topic: opinions
+  fact: "I think tipping culture in the US is broken."
+- id: 395
+  topic: opinions
+  fact: "I think privacy is a fundamental right."
+- id: 396
+  topic: opinions
+  fact: "I think most cryptocurrency projects are speculative — only Bitcoin is interesting to me."
+- id: 397
+  topic: opinions
+  fact: "I think Wikipedia is more reliable than most news sources."
+- id: 398
+  topic: opinions
+  fact: "I think the metric system should be the global standard."
+- id: 399
+  topic: opinions
+  fact: "I think most software docs are written too late in the project."
+- id: 400
+  topic: opinions
+  fact: "I think AI-generated images shouldn't be used in news articles."
+- id: 401
+  topic: quirky
+  fact: "I always have one tab pinned in Firefox: a real-time tide chart."
+- id: 402
+  topic: quirky
+  fact: "I always pour cereal before milk."
+- id: 403
+  topic: quirky
+  fact: "I close every browser tab at end of day, even pinned ones."
+- id: 404
+  topic: quirky
+  fact: "I always check the lock on my apartment door twice before leaving."
+- id: 405
+  topic: quirky
+  fact: "I always carry exact change for transit."
+- id: 406
+  topic: quirky
+  fact: "I prefer mechanical pencils over wooden ones."
+- id: 407
+  topic: quirky
+  fact: "I always start a new notebook on the second page."
+- id: 408
+  topic: quirky
+  fact: "I always carry a small flashlight on my keychain."
+- id: 409
+  topic: quirky
+  fact: "I always sit on the right side of a movie theater."
+- id: 410
+  topic: quirky
+  fact: "I always finish a chapter before stopping a book."
+- id: 411
+  topic: negative
+  fact: "I refuse to use voice assistants in my home."
+- id: 412
+  topic: negative
+  fact: "I won't take photos at concerts."
+- id: 413
+  topic: negative
+  fact: "I refuse to attend conferences with no recordings."
+- id: 414
+  topic: negative
+  fact: "I won't read books I can't fold the cover back on."
+- id: 415
+  topic: negative
+  fact: "I refuse to use any app that requires a Facebook login."
+- id: 416
+  topic: negative
+  fact: "I won't use AirPods — uncomfortable in my ears."
+- id: 417
+  topic: negative
+  fact: "I refuse to fly with one carrier — Spirit."
+- id: 418
+  topic: negative
+  fact: "I won't subscribe to music services that have ads on free tier."
+- id: 419
+  topic: negative
+  fact: "I refuse to give my real birthday for non-government forms."
+- id: 420
+  topic: negative
+  fact: "I don't watch any sports on TV — but I'll go to live games."
+- id: 421
+  topic: misc
+  fact: "My most-frequent flight route is YVR to SFO."
+- id: 422
+  topic: misc
+  fact: "My credit-card-of-choice has no foreign transaction fees."
+- id: 423
+  topic: misc
+  fact: "I rent a small storage unit downtown for hobby gear."
+- id: 424
+  topic: misc
+  fact: "My favorite charity to donate to is GiveDirectly."
+- id: 425
+  topic: misc
+  fact: "My commute is a 25-minute walk in good weather, transit otherwise."
+- id: 426
+  topic: misc
+  fact: "My favorite reading spot at home is by the south-facing window."
+- id: 427
+  topic: misc
+  fact: "I share a Spotify family plan with three siblings."
+- id: 428
+  topic: misc
+  fact: "My birthday is November 23rd."
+- id: 429
+  topic: misc
+  fact: "My phone wallpaper is a photo I took of Mount Baker."
+- id: 430
+  topic: misc
+  fact: "My oldest piece of clothing is a wool sweater from 2008."
+- id: 431
+  topic: food
+  fact: "I dislike olives in any form."
+- id: 432
+  topic: food
+  fact: "My favorite weekend brunch is shakshuka."
+- id: 433
+  topic: food
+  fact: "I don't drink fruit juice — only whole fruit."
+- id: 434
+  topic: food
+  fact: "I always carry dark chocolate in my bag for emergencies."
+- id: 435
+  topic: food
+  fact: "I refuse to eat oysters — texture issue."
+- id: 436
+  topic: tech
+  fact: "I prefer ripgrep over the_silver_searcher."
+- id: 437
+  topic: tech
+  fact: "I run my home network on pfSense."
+- id: 438
+  topic: tech
+  fact: "I use a Logitech MX Master mouse — refuse to switch."
+- id: 439
+  topic: tech
+  fact: "I prefer Mosh to plain SSH on flaky connections."
+- id: 440
+  topic: tech
+  fact: "I review pull requests on a 27-inch monitor, not a laptop screen."
+- id: 441
+  topic: hobbies
+  fact: "I keep a daily five-line journal entry."
+- id: 442
+  topic: hobbies
+  fact: "I ride my bike to climbing gym every time, even in rain."
+- id: 443
+  topic: hobbies
+  fact: "I keep an antique pocket-watch I wind weekly."
+- id: 444
+  topic: hobbies
+  fact: "I learned how to whittle wood — basic spoons only."
+- id: 445
+  topic: hobbies
+  fact: "I keep a small terrarium with mosses on my windowsill."
+- id: 446
+  topic: media
+  fact: "I think the best video game soundtrack is Halo 2."
+- id: 447
+  topic: media
+  fact: "I read Asimov's Foundation trilogy three times."
+- id: 448
+  topic: media
+  fact: "I listen to lo-fi hip-hop while debugging."
+- id: 449
+  topic: media
+  fact: "I prefer subtitles even on English-language films."
+- id: 450
+  topic: media
+  fact: "I think the best opening line in literature is from 'A Tale of Two Cities.'"
+- id: 451
+  topic: travel
+  fact: "I never use TripAdvisor for restaurant picks."
+- id: 452
+  topic: travel
+  fact: "My favorite trip was a week in Kyoto in spring."
+- id: 453
+  topic: travel
+  fact: "I always book trips at least 60 days in advance."
+- id: 454
+  topic: travel
+  fact: "I bring a small bottle of olive oil when traveling — habit from a long trip."
+- id: 455
+  topic: travel
+  fact: "I refuse to travel without a small first-aid kit."
+- id: 456
+  topic: workflow
+  fact: "I prefer working in 90-minute focused intervals."
+- id: 457
+  topic: workflow
+  fact: "I always have a clean desk before signing off for the day."
+- id: 458
+  topic: workflow
+  fact: "My most productive hours are 6am-10am."
+- id: 459
+  topic: workflow
+  fact: "I write design docs in a public Google Doc, not Notion."
+- id: 460
+  topic: workflow
+  fact: "I do research reading for two hours every Sunday morning."
+- id: 461
+  topic: fitness
+  fact: "I take Vitamin D supplements daily in winter."
+- id: 462
+  topic: fitness
+  fact: "I sleep with a sleep mask every night."
+- id: 463
+  topic: fitness
+  fact: "I never lift weights without a spotter for max attempts."
+- id: 464
+  topic: fitness
+  fact: "I take a yoga teacher training course next year."
+- id: 465
+  topic: fitness
+  fact: "My favorite recovery is a sauna session."
+- id: 466
+  topic: home
+  fact: "My apartment uses only LED lighting throughout."
+- id: 467
+  topic: home
+  fact: "I have a cargo bike for grocery runs."
+- id: 468
+  topic: home
+  fact: "My desk chair is a Herman Miller Aeron — bought used."
+- id: 469
+  topic: home
+  fact: "I keep a fire extinguisher under the kitchen sink."
+- id: 470
+  topic: home
+  fact: "I have a wall calendar — paper, not digital."
+- id: 471
+  topic: opinions
+  fact: "I think most software conferences are too expensive for what they deliver."
+- id: 472
+  topic: opinions
+  fact: "I think the best font for code is Iosevka."
+- id: 473
+  topic: opinions
+  fact: "I think 'cargo cult' Agile teams cause more harm than no process."
+- id: 474
+  topic: opinions
+  fact: "I think most software performance reviews are pointless."
+- id: 475
+  topic: opinions
+  fact: "I think indoor air quality is underrated as a workplace factor."
+- id: 476
+  topic: quirky
+  fact: "I always hand-write the date at the top of every notebook page."
+- id: 477
+  topic: quirky
+  fact: "I count the cracks in sidewalks while walking."
+- id: 478
+  topic: quirky
+  fact: "I always put my phone face-down at restaurants."
+- id: 479
+  topic: quirky
+  fact: "I always click 'No' on cookies popups, never 'Manage preferences.'"
+- id: 480
+  topic: quirky
+  fact: "I always finish meals with a small piece of dark chocolate."
+- id: 481
+  topic: misc
+  fact: "My favorite gift to give friends is a hand-bound notebook."
+- id: 482
+  topic: misc
+  fact: "My family is from the Pearl River Delta."
+- id: 483
+  topic: misc
+  fact: "My favorite season is autumn — all the colors."
+- id: 484
+  topic: misc
+  fact: "My average sleep is 7.5 hours per night."
+- id: 485
+  topic: misc
+  fact: "My favorite weekend morning ritual is making pancakes from scratch."
+- id: 486
+  topic: misc
+  fact: "My favorite Vancouver beach is Spanish Banks."
+- id: 487
+  topic: misc
+  fact: "I keep a small box of letters from my grandmother."
+- id: 488
+  topic: misc
+  fact: "My phone case is plain black silicone."
+- id: 489
+  topic: misc
+  fact: "My most-used credit card is at a credit union, not a big bank."
+- id: 490
+  topic: misc
+  fact: "My favorite restaurant in Vancouver is Vij's."
+- id: 491
+  topic: food
+  fact: "I drink kombucha twice a week."
+- id: 492
+  topic: food
+  fact: "My favorite breakfast spot is Cafe Medina downtown."
+- id: 493
+  topic: tech
+  fact: "I prefer cdp over cd because I always want git context."
+- id: 494
+  topic: hobbies
+  fact: "I plant tomatoes on my balcony every summer."
+- id: 495
+  topic: travel
+  fact: "I always book at least one museum per city visit."
+- id: 496
+  topic: workflow
+  fact: "I prefer code review by patch series, not single-PR review."
+- id: 497
+  topic: fitness
+  fact: "I take dance classes every Saturday evening."
+- id: 498
+  topic: home
+  fact: "I have a small composting bin in my kitchen."
+- id: 499
+  topic: opinions
+  fact: "I think most password rules (special chars, etc) make security worse."
+- id: 500
+  topic: misc
+  fact: "My favorite pen is a Lamy 2000 fountain pen."

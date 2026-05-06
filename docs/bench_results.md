@@ -91,3 +91,267 @@ Checkpoint OFF is **4× faster** than checkpoint ON at BS=16, with only +0.6 GB 
 - 1B-token training run drops from ~62 hours (at the old BS=12 best) to **~32 hours**.
 - 9.4 GB VRAM headroom remaining at BS=16 — could push to BS=20+ if scaling continues cleanly.
 
+
+---
+
+## 2026-05-04 — Phase-2 (GRPO) baseline + K sweep
+
+The Phase-1 numbers above are parallel teacher-forced (`phase1_pretrained_step`).
+Phase-2 GRPO has a different cost shape: `K` AR rollouts per step, prefix pass
+with grad + per-token AR generation pass without grad + REINFORCE backward.
+This section adds the matching baselines + a K sweep.
+
+### Throughput metric framework (Phase-2 specific)
+
+For Phase-1 (parallel teacher-forced) "tok/s" is unambiguous: each
+forwarded token is a unique training-data token consumed. **For Phase-2
+GRPO it's not.** The K rollouts per step share the same prefix and the
+generated continuations are model samples, not data. So three different
+metrics give three different answers, each useful for a different
+question:
+
+| Metric | Definition | What it measures | Right for |
+|---|---|---|---|
+| **steps/sec** | `1 / time_per_step` | Optimizer-step throughput | Sample-efficiency-bound training (Wave 3/4 with finite fact corpus) |
+| **dataset-tok/sec** | `BS_outer × (T_pre + gen_length) / time` | Unique training tokens consumed per second; **does NOT scale with K** | "How long to consume Wave-N's dataset" |
+| **gpu-fwd-tok/sec** | `BS_outer × K × (T_pre + gen_length) / time` | Raw GPU compute throughput; scales linearly with K | Comparing GPU work across configs (apples-to-apples with Phase-1 tok/s) |
+
+K is a **variance-reduction lever, not a throughput lever**. All K
+rollouts of a step act on the same prefix; K just gives you K samples
+of the policy gradient to average. From a training-pace perspective,
+going K=2 → K=16 buys you ~7% slowdown in steps/sec for an 8× variance
+reduction in the gradient estimator — that's a great trade.
+
+### AR baseline — frozen Llama, no walker (`bench_llama_full_training.py --mode ar`)
+
+The "GRPO-shaped step without the walker" reference: forward prefix
+[BS, T_pre=256] with grad enabled, AR-generate gen_length=128 tokens
+with grad disabled, backward through a CE loss on the prefix, opt.step
+on `lm_head` only.
+
+For the AR baseline, BS is real data parallelism (each row is a
+different prefix), so `dataset-tok/sec = BS × T_pre / time` (gen-tokens
+are model samples, not data). The "tok/s" column below is `gpu-fwd-tok/sec`
+= `BS × (T_pre + gen_length) / time` for direct comparison with the
+GRPO `gpu-fwd-tok/sec` column.
+
+| BS | steps/sec | dataset-tok/s | gpu-fwd-tok/s | Peak VRAM | ms/iter |
+|---|---|---|---|---|---|
+| 1  | 1.53 | 0.39k | 0.6k | 5.20 GB  | 653.2 |
+| 2  | 1.45 | 0.74k | 1.1k | 5.41 GB  | 690.5 |
+| 4  | 1.40 | 1.43k | 2.1k | 6.96 GB  | 715.8 |
+| 8  | 1.31 | 2.68k | 4.0k | 10.35 GB | 763.4 |
+| **16** | **1.14** | **4.67k** | **7.0k** | **17.15 GB** | **876.6** |
+| 32 | OOM | — | — | — | — |
+
+**Headline: 4.7k dataset-tok/sec at BS=16 (1.14 steps/sec)**, OOMs at 32.
+
+### GRPO K-sweep (`bench_grpo.py`)
+
+Production Phase-2 step at `BS_outer=1, T_pre=256, gen_length=128,
+d_mem=256, neuromod-only trainable surface, --compile-block OFF`.
+
+`--compile-block` was disabled because the AR generation path's
+single-token forwards don't match the T=256 compile-block shape — first
+attempt hung 10+ minutes in warmup before being killed. Eager-mode
+numbers below.
+
+K is the rollouts-per-step axis AND the effective rollout batch dim (K
+prefix replicas forward in parallel). Headline table is K∈{4, 8, 16} —
+production GRPO papers cap at K=8 for similar reasons:
+
+| K  | steps/sec | dataset-tok/s | gpu-fwd-tok/s | Peak VRAM | ms/iter |
+|---|---|---|---|---|---|
+| 4  | 0.76 | 0.29k | 1.2k | 3.50 GB | 1308 |
+| **8** | **0.75** | **0.29k** | **2.3k** | **3.80 GB** | **1336** |
+| 16 | 0.72 | 0.28k | 4.4k | 4.42 GB | 1396 |
+
+**Production headline: K=8 at 0.75 steps/sec, peak 3.80 GB.** K=4→8 is
+~free (1% slowdown for 2× variance reduction in the gradient estimator);
+K=8→16 also cheap (4% slowdown for another 2×). Beyond K=16 the marginal
+trade gets worse.
+
+#### Beyond K=16 (diminishing returns — for reference only)
+
+K=32 and K=64 fit on the 4090 without OOM, but the "K-is-free" property
+breaks once the AR-gen sequential bottleneck saturates the K batch dim:
+
+| K  | steps/sec | Peak VRAM | ms/iter | Marginal cost |
+|---|---|---|---|---|
+| 16 | 0.72 | 4.42 GB | 1396 | (baseline) |
+| 32 | 0.64 | 5.64 GB | 1554 | +11% slowdown for 2× variance reduction |
+| 64 | 0.54 | 8.09 GB | 1867 | +16% slowdown for 2× variance reduction |
+
+For production, K∈{4, 8, 16} is the right range — K=32+ is overkill
+unless you're chasing the last bit of gradient variance. The 4090 has
+plenty of headroom (~16 GB unused at K=64) so K isn't memory-bound here;
+it's compute-bound on the AR-gen path.
+
+**Observations:**
+- **K barely affects steps/sec in the production range** (K=4..16): ~5%
+  wall-clock growth across the range. Per-step cost is dominated by 128
+  sequential AR-gen tokens, which K rollouts share by parallelizing
+  across the K batch dim. This is the whole reason K=8-16 is a good
+  production choice: 2-4× variance reduction for ~5% wall-clock cost.
+- **Dataset-tok/sec is flat in K** (~280 tok/s across all K). Same prefix
+  per step regardless of K — K is a variance-reduction lever, not a
+  throughput lever.
+- **GPU-fwd-tok/sec scales linearly in K** (1.2 → 2.3 → 4.4 → 7.9 → 13.2 k).
+  This is what an outsider sees as "throughput", but it's pure GPU
+  compute, not training pace.
+- **Massive VRAM headroom on the 4090.** Even at K=64 we only use 8.09 GB,
+  leaving 16 GB free. AR baseline at BS=16 uses 17.15 GB by contrast —
+  `lm_head` trainable with backward through the full prefix holds ~3×
+  more activation memory than GRPO's neuromod-only minimal surface.
+- **GRPO vs Phase-1 GW step:** Phase-1 GW = 8.8k tok/s @ BS=16 (every
+  token is a real training token in parallel TF) → 8800 dataset-tok/sec.
+  Phase-2 GRPO @ K=8 = 290 dataset-tok/sec. Phase-2 is **~30× slower in
+  dataset-tok/sec**. Or in steps/sec: Phase-1 ≈ 2.1 steps/sec at BS=16
+  vs Phase-2 ≈ 0.75 steps/sec at K=8 → ~3× slower in steps/sec. The
+  unavoidable cost of REINFORCE on actual generation via 128 sequential
+  AR steps per rollout.
+- **`--compile-block` hangs in mixed eager+AR paths.** When the wrapper
+  has `--compile-block` enabled and then runs AR generation (single-
+  token forwards through cached KV), inductor either recompiles per
+  token or falls into a fallback path that doesn't terminate (10+ min
+  observed before kill). Phase-2 stays eager until the rollout
+  primitive is made compile-aware.
+
+**Implications for training wave wall-clock:**
+
+For Phase-2 waves (3 + 4), the right wall-clock unit is **steps/sec**
+since the dataset is small relative to the number of revisits needed
+for convergence. With Phase-2 ≈ 0.75 steps/sec at K=8 (production):
+
+- **Wave 3** (passphrase chat-injected GRPO): ~500 facts × 5 questions
+  × ~3 paraphrases = ~7500 unique (prefix, reference) pairs. Want
+  ~10 visits per pair for convergence → ~75K steps. At 0.75 steps/sec
+  (BS_outer=1) → ~28 hours per cycle. With BS_outer=8 (5.08× sess/s
+  speedup, 2026-05-06 sweep) → **~3.3 hours per cycle pass**.
+- **Wave 4** (WildChat overflow GRPO): K=8 default, turn-batched
+  (Verlog-style). 30K sessions flatten to ~470K TurnPairs (15.7 avg
+  assistant turns × 30K). At B=8 (Wave-3-equivalent speedup), one
+  pass over the turn-pair pool ≈ 470K / (8 × ~2.5 sess/s) ≈ ~6.5 hours
+  per pass. Multi-pass cycles for convergence — exact wall-clock
+  pending first Wave 4 production-shape bench.
+
+Earlier this doc reported "3 hr / 6 hr" estimates that used
+`gpu-fwd-tok/sec` and overcounted by a factor of K. The new estimates
+are honest. Pragmatic answer: Phase-2 cycles are multi-day; budget for
+~1 cycle per week at the current rate.
+
+---
+
+## DeepSeek-style per-action credit assignment (Phase A — landed 2026-05-05)
+
+GRPO now follows DeepSeek's sample → score → teacher-forced-replay-with-grad
+structure. The previous implementation only credited **prefix-time**
+routing decisions — gen-time routing decisions were made under `no_grad`
+and got no gradient. Switching to DeepSeek-style gives per-routing-decision
+log-π × advantage gradients across BOTH prefix and gen, analogous to
+DeepSeek's per-generated-token credit (but for the walker's routing
+action space).
+
+**What landed:**
+- `routing.py`: `route_or_replay` + `StepRoutingChoices` + `routing_log_pi_for_action`
+- `graph_walker.py`: capture buffer (`start_capturing_routes` / `consume_routing_trace`), replay stash (`arm_replay_trace`), `forward_segment` consumes replay trace and threads per-step `replay_choices`, `step_core_from_h(replay_choices=...)`, `_step_core_pure(replay_choices=...)`. `is_new_window` reconstructed from saved `anchor_idx` presence so sample/replay routing patterns match.
+- `rollout.py`: `sample_grpo_rollout` (no-grad sample with capture armed) + `replay_grpo_rollout` (teacher-forced with-grad replay). Old `autoregressive_rollout` retained for inference.
+- `train_phase2.py`: `grpo_step` rewritten as sample → score → replay → REINFORCE. Returns the same `GRPOStats` for telemetry-compat.
+- `tests/test_routing_replay.py`: 6 tests covering math parity, grad propagation, walker capture+replay end-to-end, and DeepSeek full-flow with gradient reaching `memory.neuromod.*`.
+
+128 tests pass (127 pre-existing + 1 new DeepSeek end-to-end).
+
+**Performance impact:** replay does an extra parallel forward [K, T_pre + L_gen] through Llama with grad — compute increases vs the old "prefix-with-grad + gen-no-grad" path, but the gradient signal per step is now much richer (per-action across both prefix AND gen routing decisions, vs only-prefix-actions before). Expected steps/sec to drop 20-40% on the same hardware. Will re-bench post-merge and update this section with the new K-sweep numbers.
+
+**Phase B + C deferred:** PPO clipping (`min(ρA, clip(ρ, 1±ε)A)`), KL penalty against a reference policy, entropy bonus. See `docs/plan_grpo_deepseek_style.md` for the design.
+
+---
+
+## 2026-05-05 — Wave 3 GRPO production-shape bench
+
+Real Wave 3 stack: BERT-cosine reward (`sentence-transformers/all-mpnet-base-v2`)
++ real chat-injected loader (passphrase fact + UltraChat filler + question,
+chat-templated). T_pre=256, gen_length=128, BS_outer=1, neuromod-only
+trainable surface, eager mode.
+
+| K | steps/sec | dataset-tok/s | gpu-fwd-tok/s | Peak VRAM | ms/iter |
+|---|---|---|---|---|---|
+| 4 | 0.50 | 192 | 0.8k | 4.10 GB | 2019 |
+| **8** | **0.48** | **183** | **1.5k** | **4.55 GB** | **2098** |
+| 16 | 0.45 | 174 | 2.7k | 5.46 GB | 2243 |
+
+**Production headline: K=8 at 0.48 steps/sec, peak 4.55 GB.**
+
+**~38% slower than bare GRPO** (which got 0.75 steps/sec at K=8 with
+placeholder reward + synthetic prefixes). The extra ~700 ms/step is
+BERT scoring (~50-100 ms per forward, K+1 sentences batched) + chat-
+template tokenization in the loader. Loader cost can be amortized via
+pre-batching; BERT cost is fundamental.
+
+**Same K-sweep story as bare GRPO**: K=8 vs K=4 costs only ~4% steps/sec
+for 2× variance reduction. K=16 adds another ~7% slowdown for the next
+2× variance — only worth it if K=8 gradient signal is too noisy in
+practice.
+
+**Wave 3 wall-clock revisited:**
+
+- ~7500 unique (prefix, reference) pairs × 10 visits/pair = 75K steps
+- At 0.48 steps/sec → **~43 hours per cycle** (vs the ~28 hr earlier
+  estimate using bare-GRPO numbers)
+
+**Recommended config: K=8, BS_outer=1.** 4.55 GB / 24 GB peak leaves
+plenty of room to push K higher, but K=8 is the DeepSeek-R1 production
+default and the variance/cost trade flattens past it.
+
+## 2026-05-06 — Wave 3 GRPO BS_outer (multi-prefix) sweep
+
+`grpo_step` is now batch-aware: B independent prefixes per step, each
+gets K rollouts, advantage-normalized within each K-group (no cross-
+prefix mixing). Walker memory state is sized [B*K, ...] for the step.
+See `train_phase2.py` docstring for layout details.
+
+K=8, T_pre=256, gen_length=128, BERT-cosine reward, real chat data.
+
+| B | steps/s | sess/s | gpu-tok/s | Peak VRAM | ms/iter | sess/s speedup |
+|---|---|---|---|---|---|---|
+| 1 | 0.50 | 0.50 | 1.5k | 4.55 GB | 2010 | 1.00× |
+| 2 | 0.46 | 0.92 | 2.8k | 5.46 GB | 2164 | 1.84× |
+| 4 | 0.40 | 1.60 | 4.9k | 7.28 GB | 2508 | 3.20× |
+| **8** | **0.32** | **2.54** | **7.8k** | **10.92 GB** | **3151** | **5.08×** |
+| 12 | 0.26 | 3.14 | 9.6k | 14.56 GB | 3823 | 6.28× |
+| 16 | 0.22 | 3.48 | 10.7k | 18.20 GB | 4594 | 6.96× |
+
+**Production headline: B=8, K=8 → 2.54 sessions/sec at 10.9 GB peak.**
+**5.08× session-throughput speedup vs B=1.**
+
+Why the steps/s number goes DOWN with B: each step does B× more work
+(B independent samples + B replays through the LM forward). The wall-
+clock-relevant metric is `sess/s = B × steps/s` — the throughput at
+which we consume distinct (prefix, ref) pairs. That number scales
+near-linearly to B=8, then flattens hard.
+
+**Diminishing returns past B=8**: B=12 only buys 1.24× more sess/s for
+33% more VRAM, B=16 only 1.37× for 67% more. The flattening tracks
+with GPU compute saturation: at B=8, gpu-tok/s = 7.8k tok/s, which is
+already near the K-sweep ceiling (K-sweep at B=1 plateaus around
+5-6k gpu-tok/s but BS_outer adds independent-batch headroom that the
+K-axis doesn't expose).
+
+**Wave 3 cycle wall-clock at B=8, K=8:**
+- 30K (prefix, ref) pairs × 1 visit = 30K sessions / 2.54 sess/s = **3.3 hours per cycle pass**
+- 10 visits/pair = 33 hours (vs ~43 hours at B=1) — same training data,
+  ~25% wall-clock reduction at the same K-variance
+- OR: same wall-clock budget = 5× more visits per pair at the same
+  variance reduction = much better policy convergence
+
+**Recommended config (updated): K=8, B=8.** 10.9 GB / 24 GB peak.
+~5× wall-clock speedup over B=1 at the same K-variance.
+
+**Implementation notes:**
+- `prefix_ids[B, T_pre].repeat_interleave(K, dim=0)` — contiguous K-blocks
+- BertCosineReward: list[Tensor] of B refs, K-block layout aware
+- Per-group advantage normalization: rewards [B*K] → reshape [B, K] →
+  per-row mean/std → flatten back. NO cross-prefix advantage mixing.
+- `sample_grpo_rollout` and `replay_grpo_rollout` were already batch-
+  dim-agnostic; no changes needed there.
+- Back-compat: B=1 callers passing `reference_cont` as a Tensor still work.

@@ -32,6 +32,21 @@ Modes for comparison:
       params are frozen. Mirrors the bench_pretrained_gw "vanilla_step"
       baseline — softer than real full training but useful for a sanity check.
 
+  --mode ar
+      Frozen Llama (lm_head trainable) doing the GRPO-shaped step shape
+      WITHOUT the walker:
+        1. Forward prefix [BS, T_pre] with grad enabled, KV cache captured.
+        2. AR-generate L tokens with grad disabled (mirrors GRPO's
+           grad_during_gen=False).
+        3. Loss = CE on prefix predictions, backward, opt.step (lm_head only).
+      Tokens-per-second is reported on (T_pre + L_gen) per step. This is
+      the "frozen-Llama prefix-grad + AR-gen-no-grad" baseline against
+      which the GRPO bench's K-sweep numbers should be read — it isolates
+      AR-generation overhead through the frozen backbone before the
+      walker's marginal cost is added.
+      Use --t-pre and --gen-length to set prefix/generation lengths
+      (defaults 256 / 128 = the production GRPO defaults).
+
 Sweeps BS upward, doubling until OOM. Reports peak tok/s + the BS that
 produced it, so the headline answer is "max BS for full Llama-1B training:
 N → X k tok/s".
@@ -39,6 +54,9 @@ N → X k tok/s".
 Usage:
     PYTHONPATH=. .venv/bin/python scripts/bench_llama_full_training.py \\
         --mode full --bs-list 1 2 4 8 16 --T 256
+
+    PYTHONPATH=. .venv/bin/python scripts/bench_llama_full_training.py \\
+        --mode ar --bs-list 1 2 4 8 16 --t-pre 256 --gen-length 128
 """
 
 from __future__ import annotations
@@ -56,8 +74,13 @@ from transformers import AutoModelForCausalLM
 def _bench_one(
     model_name: str, mode: str, BS: int, T: int,
     warmup: int, n_iter: int, fused_adam: bool,
+    t_pre: int = 256, gen_length: int = 128,
 ) -> tuple[float, float, float] | None:
-    """Returns (tok/s, peak_gb, ms_per_iter), or None on OOM."""
+    """Returns (tok/s, peak_gb, ms_per_iter), or None on OOM.
+
+    For `--mode ar`, `T` is unused; the AR step uses `t_pre + gen_length`
+    tokens per iter (prefix forward-with-grad + AR generation no-grad).
+    """
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
@@ -85,13 +108,18 @@ def _bench_one(
                 p.requires_grad = False
             for p in model.lm_head.parameters():
                 p.requires_grad = True
+        elif mode == "ar":
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in model.lm_head.parameters():
+                p.requires_grad = True
         else:
             raise ValueError(f"unknown mode {mode!r}")
 
         trainable = sum(
             p.numel() for p in model.parameters() if p.requires_grad
         )
-        do_backward = mode in {"full", "full-ckpt", "lmhead-only"}
+        do_backward = mode in {"full", "full-ckpt", "lmhead-only", "ar"}
         opt = None
         if do_backward:
             opt = torch.optim.AdamW(
@@ -100,7 +128,15 @@ def _bench_one(
                 fused=fused_adam,
             )
         vocab = model.config.vocab_size
-        input_ids = torch.randint(0, vocab, (BS, T), device="cuda")
+
+        if mode == "ar":
+            prefix_ids = torch.randint(
+                0, vocab, (BS, t_pre), device="cuda",
+            )
+            tokens_per_step = BS * (t_pre + gen_length)
+        else:
+            input_ids = torch.randint(0, vocab, (BS, T), device="cuda")
+            tokens_per_step = BS * T
 
         def step():
             if opt is not None:
@@ -115,20 +151,50 @@ def _bench_one(
                 opt.step()
             return loss
 
+        def step_ar():
+            opt.zero_grad(set_to_none=True)
+            # Prefix pass: grad enabled so backward through frozen layers
+            # actually fires (mirrors GRPO's grad_during_prefix=True).
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model(prefix_ids, use_cache=True)
+                past_kv = out.past_key_values
+                logits = out.logits[:, :-1].reshape(-1, vocab)
+                targets = prefix_ids[:, 1:].reshape(-1)
+                loss = F.cross_entropy(logits.float(), targets)
+                last_logits = out.logits[:, -1, :]
+            # Generation pass: no grad (mirrors GRPO's grad_during_gen=False).
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16,
+            ):
+                tok = last_logits.argmax(dim=-1, keepdim=True)
+                for _ in range(gen_length):
+                    out = model(
+                        tok, past_key_values=past_kv, use_cache=True,
+                    )
+                    past_kv = out.past_key_values
+                    tok = out.logits[:, -1, :].argmax(
+                        dim=-1, keepdim=True,
+                    )
+            loss.backward()
+            opt.step()
+            return loss
+
+        run_step = step_ar if mode == "ar" else step
+
         for _ in range(warmup):
-            loss = step()
+            loss = run_step()
             del loss
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
         t0 = time.perf_counter()
         for _ in range(n_iter):
-            loss = step()
+            loss = run_step()
             del loss
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
-        tps = BS * T * n_iter / elapsed
+        tps = tokens_per_step * n_iter / elapsed
         ms_per_iter = elapsed / n_iter * 1000
         print(f"  BS={BS:>4}  trainable={trainable/1e9:.2f}B  "
               f"{tps/1000:>6.1f}k tok/s   peak {peak_gb:>5.2f} GB   "
@@ -162,12 +228,22 @@ def main() -> None:
     ap.add_argument(
         "--mode",
         choices=("full", "full-ckpt", "grad-fwd", "grad-fwd-ckpt",
-                 "lmhead-only"),
+                 "lmhead-only", "ar"),
         default="full",
     )
     ap.add_argument("--bs-list", type=int, nargs="+",
                     default=[1, 2, 4, 8, 16, 32, 64])
-    ap.add_argument("--T", type=int, default=256)
+    ap.add_argument("--T", type=int, default=256,
+                    help="Sequence length for parallel modes (full, "
+                         "full-ckpt, grad-fwd, grad-fwd-ckpt, lmhead-only). "
+                         "Unused in --mode ar.")
+    ap.add_argument("--t-pre", type=int, default=256,
+                    help="Prefix length for --mode ar (the GRPO-shaped "
+                         "AR baseline). Default 256 matches production "
+                         "PretrainedGWConfig.T.")
+    ap.add_argument("--gen-length", type=int, default=128,
+                    help="Generation length for --mode ar. Default 128 "
+                         "matches PretrainedGWConfig.grpo_rollout_len.")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--iter", type=int, default=5)
     ap.add_argument("--no-fused-adam", action="store_true",
@@ -181,7 +257,12 @@ def main() -> None:
           flush=True)
     print(f"  device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"  model:  {args.model}", flush=True)
-    print(f"  T={args.T}, warmup={args.warmup}, iter={args.iter}", flush=True)
+    if args.mode == "ar":
+        print(f"  t_pre={args.t_pre}, gen_length={args.gen_length}, "
+              f"warmup={args.warmup}, iter={args.iter}", flush=True)
+    else:
+        print(f"  T={args.T}, warmup={args.warmup}, iter={args.iter}",
+              flush=True)
     print()
 
     rows: list[tuple[int, float, float, float]] = []
@@ -189,6 +270,7 @@ def main() -> None:
         r = _bench_one(
             args.model, args.mode, BS, args.T, args.warmup, args.iter,
             fused_adam=not args.no_fused_adam,
+            t_pre=args.t_pre, gen_length=args.gen_length,
         )
         if r is None:
             print(f"  Stopping at BS={BS} (OOM in {args.mode}).", flush=True)
