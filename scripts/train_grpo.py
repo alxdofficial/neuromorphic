@@ -182,6 +182,15 @@ def main() -> None:
                          "sample pool. Larger = better neighbor quality (less "
                          "padding waste from prior-length spread), more memory. "
                          "M=2048 ≈ 65 MB for 4K-avg priors.")
+    ap.add_argument("--unfreeze-mode", type=str, default="phase1",
+                    choices=("phase1", "minimum"),
+                    help="Which params are trainable in Phase-2 GRPO. Default "
+                         "'phase1' = same surface as Phase-1 SFT (all walker + "
+                         "MemInjectLayer; Llama frozen). 'minimum' = legacy "
+                         "minimum policy surface (memory.neuromod.* only). "
+                         "The action space is identical either way; 'phase1' "
+                         "lets gradient flow through more of the walker, "
+                         "'minimum' is more conservative against drift.")
     ap.add_argument("--lm-context-window", type=int, default=None,
                     help="If set, two-phase forward: walker absorbs the full "
                          "prefix but LM only attends to the last N tokens. "
@@ -319,12 +328,34 @@ def main() -> None:
     print(f"[setup] priming done; _prev_snapshot_ids has "
           f"{int(mem._prev_snapshot_ids.numel())} touched cols")
 
-    # ---- Phase-2 minimum policy surface ----
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    # ---- Phase-2 trainable surface ----
+    # Default = same as Phase-1: all walker params + MemInjectLayer
+    # projections trainable; Llama backbone frozen (set in __init__).
+    # Rationale: the action space (walker routing decisions) is the same
+    # whether neuromod alone is trainable or the whole walker is. The
+    # original "minimum policy surface" choice (freeze everything but
+    # neuromod) was conservative — appropriate for heavily-pretrained
+    # bases with full-fine-tune drift risk, but our walker only had
+    # ~400M tokens of Phase-1 capital and the small-surface restriction
+    # was over-cautious.
+    #
+    # --unfreeze-mode lets us A/B test:
+    #   "phase1"   (default) — Phase-1 trainable surface, unchanged
+    #   "minimum"            — only memory.neuromod.* (legacy "minimum
+    #                          policy surface")
+    if args.unfreeze_mode == "phase1":
+        # Already in this state from wrapper construction; the priming
+        # pass above was run with this surface. Nothing to do.
+        pass
+    elif args.unfreeze_mode == "minimum":
+        wrapper.freeze_all_but_E_bias_and_neuromod()
+    else:
+        raise ValueError(f"unknown --unfreeze-mode: {args.unfreeze_mode}")
+
     trainable = [p for _, p in wrapper.trainable_parameters()]
     n_trainable = sum(p.numel() for p in trainable)
-    print(f"[setup] phase-2 trainable surface: {n_trainable / 1e6:.2f}M params "
-          f"(only memory.neuromod.*)")
+    print(f"[setup] phase-2 trainable surface ({args.unfreeze_mode}): "
+          f"{n_trainable / 1e6:.2f}M params")
 
     # ---- optimizer + LR schedule ----
     opt = torch.optim.AdamW(

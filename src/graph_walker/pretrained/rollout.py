@@ -350,14 +350,26 @@ def replay_grpo_rollout(
     state stream as sampling did.
 
     ``lm_context_window``: must match the value used during the
-    corresponding ``sample_grpo_rollout`` call. Replay does the same
-    two-phase walker advance (no_grad early portion, with_grad recent
-    portion + gen) so the LM hidden-state stream matches sample's. Note
-    that early-portion routing decisions in replay run under no_grad,
-    so they don't contribute REINFORCE gradient — only recent-prefix
-    and gen-time routing decisions are credited. This is consistent
-    with sample's behavior (early-portion decisions weren't credited
-    there either, since sample is no_grad throughout).
+    corresponding ``sample_grpo_rollout`` call. Replay does a two-phase
+    walker advance — phase 1 forwards the EARLY prefix with
+    ``use_cache=False`` (so the LM's KV cache only retains the recent
+    window, matching sample-time AR-gen attention scope); phase 2
+    forwards the recent prefix + gen tokens with the LM's KV cache
+    building.
+
+    BOTH phases run under ``enable_grad`` + ``preserve_memory_graph``
+    so walker routing decisions across the FULL prefix get gradient
+    credit. The LM is windowed (`use_cache=False` drops phase-1's KV
+    cache before AR-gen continuation), but the walker is NOT — its
+    routing decisions during the early prefix DO get REINFORCE gradient.
+
+    This matters because the walker's "write" decisions (early prefix:
+    routing tokens at the start of the cumulative prior into walker
+    memory) are exactly what determines whether useful information is
+    accessible for the gen at the end. Crediting only "read" decisions
+    (recent prefix + gen) under REINFORCE leaves the encoding side
+    unsupervised. Walker context is unwindowed; LM context is windowed.
+    That's the actual decoupling design.
     """
     assert wrapper.memory is not None, "replay requires attached memory"
     device = next(wrapper.parameters()).device
@@ -388,27 +400,24 @@ def replay_grpo_rollout(
             and lm_context_window < T_pre
         )
         if two_phase:
-            # Two-phase replay: walker advances through early prefix
-            # under no_grad (matching sample's early-portion behavior),
-            # then with_grad through recent prefix + gen tokens. The
-            # walker's forward_segment requires the armed trace length
-            # to match the input length, so we re-arm per phase.
+            # Two-phase replay. The split is purely about the LM's KV
+            # cache scope (phase 1 use_cache=False so AR-gen at sample
+            # time only attended to the recent window). The walker is
+            # NOT windowed — both phases run under enable_grad +
+            # preserve_memory_graph so walker routing decisions across
+            # the full prefix get gradient credit and `log_pi` covers
+            # ALL routing decisions (early prefix + recent prefix +
+            # gen). The walker's forward_segment requires the armed
+            # trace length to match the input length, so we re-arm
+            # per phase but DON'T consume the accumulator between
+            # phases — log_pi sums across both.
             early_len = T_pre - lm_context_window
             early_seq = replay_seq[:, :early_len]
             recent_seq = replay_seq[:, early_len:]
-            wrapper.memory.arm_replay_trace(full_trace[:early_len])
-            with torch.no_grad():
-                # use_cache=False so the LM doesn't allocate a KV cache
-                # for the early prefix that we're about to discard
-                # anyway. Matches the sample-time two-phase forward.
-                # Without this: ~early_len * n_layers * n_heads *
-                # d_head * sizeof(bf16) * K bytes wasted per replay.
-                wrapper(early_seq, use_cache=False)
-                # Early replay is state reconstruction only. Clear its
-                # no-grad log-pi so the credited mean covers recent/gen steps.
-                wrapper.memory.consume_log_pi_mean()
-            wrapper.memory.arm_replay_trace(full_trace[early_len:])
             with torch.enable_grad(), wrapper.preserve_memory_graph():
+                wrapper.memory.arm_replay_trace(full_trace[:early_len])
+                wrapper(early_seq, use_cache=False)
+                wrapper.memory.arm_replay_trace(full_trace[early_len:])
                 _ = wrapper(recent_seq)
                 log_pi = wrapper.memory.consume_log_pi_mean()
         else:
