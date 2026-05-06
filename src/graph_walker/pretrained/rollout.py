@@ -398,7 +398,12 @@ def replay_grpo_rollout(
             recent_seq = replay_seq[:, early_len:]
             wrapper.memory.arm_replay_trace(full_trace[:early_len])
             with torch.no_grad():
-                wrapper(early_seq)
+                # use_cache=False so the LM doesn't allocate a KV cache
+                # for the early prefix that we're about to discard
+                # anyway. Matches the sample-time two-phase forward.
+                # Without this: ~early_len * n_layers * n_heads *
+                # d_head * sizeof(bf16) * K bytes wasted per replay.
+                wrapper(early_seq, use_cache=False)
                 # Early replay is state reconstruction only. Clear its
                 # no-grad log-pi so the credited mean covers recent/gen steps.
                 wrapper.memory.consume_log_pi_mean()
