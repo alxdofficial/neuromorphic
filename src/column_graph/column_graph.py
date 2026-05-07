@@ -399,7 +399,7 @@ class ColumnGraphMemory(nn.Module):
     # Block-level driver: compilable forward of `block_len` tokens.
     # -----------------------------------------------------------------
 
-    def compile_block(self, mode: str = "default") -> None:
+    def compile_walk_block(self, mode: str = "default") -> None:
         """Apply torch.compile to the pure propagation block.
 
         After this, `run_block(...)` goes through the compiled path. Must

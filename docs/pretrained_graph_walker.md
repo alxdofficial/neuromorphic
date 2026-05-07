@@ -60,7 +60,7 @@ norm → lm_head → logits
 
 ```
 src/graph_walker/
-├── graph_walker.py              # GraphWalkerMemory + step_core_from_h + walk_segment
+├── graph_walker.py              # GraphWalkerMemory + walker_step_from_h + walk_segment
 ├── routing.py                   # gumbel_top1_softmax (phase-aware) +
 │                                # route_or_replay / routing_log_pi_for_action
 │                                # for DeepSeek-style replay (Phase A)
@@ -90,7 +90,7 @@ src/pretrained/                  # SHARED with v2 — re-used by graph_walker
 ## 3. The GraphWalkerMemory integration API
 
 ```python
-def step_core_from_h(self, h_input):
+def walker_step_from_h(self, h_input):
     """One walker step driven by [B, D_s] vector instead of token_id."""
 
 def walk_segment(self, h_mem, *, preserve_graph=False):
@@ -329,7 +329,7 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
 
 | Component | Status |
 |---|---|
-| `step_core_from_h`, `walk_segment` | ✓ smoke-covered |
+| `walker_step_from_h`, `walk_segment` | ✓ smoke-covered |
 | `IntegratedLM` wrapper | ✓ smoke-covered (random Llama) |
 | Phase-1 parallel `phase1_pretrained_step` | ✓ smoke-covered |
 | Phase-1 AR `phase1_ar_pretrained_step` | ✓ smoke-covered |

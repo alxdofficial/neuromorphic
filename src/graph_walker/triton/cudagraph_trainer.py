@@ -10,7 +10,7 @@ Captured body (one block of TBPTT):
 
     1.  ``_ensure_block_caches``           — α, k_all, input keys, horizon logits
     2.  e_bias snapshot                    — frozen ``E_bias_flat.detach()``
-    3.  ``block_forward(state, e_bias, tokens_buf, tau_buf, eps_buf)``
+    3.  ``walk_block(state, e_bias, tokens_buf, tau_buf, eps_buf)``
     4.  ``readout_ce_block`` + per-horizon CE aggregation
     5.  ``loss = ce + λ · load_balance_loss``
     6.  ``loss.backward()``                — autograd graph captured here
@@ -69,7 +69,7 @@ class CapturedBlockStats:
 
 
 class CapturedBlockTrainer:
-    """Captures one block_forward + loss + backward + state writeback as a CUDA graph.
+    """Captures one walk_block + loss + backward + state writeback as a CUDA graph.
 
     Use:
         trainer = CapturedBlockTrainer(lm, B=4, T_block=64, K_h=4, lambda_balance=0.01)
@@ -111,11 +111,11 @@ class CapturedBlockTrainer:
         self.lambda_balance = lambda_balance
         self.amp_dtype = amp_dtype
         self.use_neuromod = lm.cfg.use_neuromod
-        # Compile block_forward with inductor's default mode (no cudagraph)
+        # Compile walk_block with inductor's default mode (no cudagraph)
         # to get cross-step fusion before our manual cudagraph wraps it.
         self._block_callable = (
-            lm.memory.block_forward if not compile_inner
-            else torch.compile(lm.memory.block_forward, mode="default", fullgraph=True)
+            lm.memory.walk_block if not compile_inner
+            else torch.compile(lm.memory.walk_block, mode="default", fullgraph=True)
         )
 
         cfg = lm.cfg
@@ -162,7 +162,7 @@ class CapturedBlockTrainer:
     def _iter_body(self) -> None:
         """One block iteration — captured end-to-end.
 
-        Includes: caches refresh + block_forward + CE + backward + state
+        Includes: caches refresh + walk_block + CE + backward + state
         writeback + surprise EMA streaming + Hebbian plasticity update.
         Everything that touches a stable buffer with static shapes lives
         here so the captured graph absorbs the full per-block hot path.
@@ -214,7 +214,7 @@ class CapturedBlockTrainer:
                 w_eff = self.horizon_weights_buf * has_counts_f         # [K_h]
                 ce = (per_h * w_eff).sum() / w_eff.sum().clamp(min=1)
                 # Normalize balance by T_block (out.load_balance_loss is
-                # SUMMED over T_block tokens inside block_forward — without
+                # SUMMED over T_block tokens inside walk_block — without
                 # this divide, balance magnitude scales with mod_period and
                 # silently changes effective lambda_balance).
                 balance_term = (

@@ -139,7 +139,7 @@ def phase1_step(
         # The detached CE tensor keeps the autograd graph decoupled —
         # surprise is a training diagnostic, not a gradient carrier.
         lm.memory.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())
-        lm.memory._maybe_finalize_surprise_and_plasticity()
+        lm.memory._maybe_close_plasticity_window()
 
         loss.backward()
         # Accumulate on GPU; sync once at end-of-step (not per flush).

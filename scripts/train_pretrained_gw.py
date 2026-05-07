@@ -104,7 +104,7 @@ def _parse_args() -> argparse.Namespace:
     # Compile / perf
     ap.add_argument("--compile-block", action="store_true", default=True,
                     help="Compile the walker block forward (production default).")
-    ap.add_argument("--no-compile-block", dest="compile_block",
+    ap.add_argument("--no-compile-block", dest="compile_walk_block",
                     action="store_false")
 
     # Checkpointing / telemetry
@@ -152,7 +152,7 @@ def main() -> None:
     n_trainable = sum(p.numel() for _, p in model.trainable_parameters())
     print(f"[setup] trainable params: {n_trainable/1e6:.1f}M")
 
-    if args.compile_block and device.type == "cuda":
+    if args.compile_walk_block and device.type == "cuda":
         print("[setup] compiling walker block (this takes a few minutes)...")
         model.compile_walker_block()
 

@@ -554,7 +554,7 @@ def sparse_lif_update_puretorch(
 
     .. warning::
         Cannot handle sentinel-padded ``all_dests`` (the BN-valued sentinel
-        used by ``_step_core_pure`` for interior steps). ``index_add`` here
+        used by ``_walker_step`` for interior steps). ``index_add`` here
         does NO bounds masking, so a sentinel index ``== BN`` raises
         "index ... is out of bounds". The Triton path handles sentinels by
         skipping them in the kernel. Use this backend only via

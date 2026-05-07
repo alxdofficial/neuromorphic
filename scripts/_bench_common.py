@@ -19,7 +19,7 @@ from src.graph_walker.config import GraphWalkerConfig
 # Production walker config: what's on main today (~25M trainable, fits cudagraph).
 PRODUCTION_KNOBS = dict(
     grid_rows=32, grid_cols=32, radius=3,
-    K=16, D_s=256, D_id=512, D_model=256,
+    K=32, D_s=256, D_id=512, D_model=256,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
     n_heads=4, n_hops=4,
@@ -78,9 +78,9 @@ def add_walker_config_args(ap: argparse.ArgumentParser) -> None:
                     help="Compile the walker block via torch.compile.")
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune"],
-                    help="torch.compile mode for compile_block.")
+                    help="torch.compile mode for compile_walk_block.")
     ap.add_argument("--regional-compile", action="store_true",
-                    help="Use regional compilation: compile step_core_from_h "
+                    help="Use regional compilation: compile walker_step_from_h "
                          "instead of the whole walk_segment block. ~10x faster "
                          "first compile (1-2 min vs 10-15 min at T=256), at "
                          "~5-15%% lower per-iter throughput. Recommended for "

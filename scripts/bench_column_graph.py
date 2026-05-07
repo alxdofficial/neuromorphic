@@ -17,12 +17,12 @@ from src.column_graph.standalone import StandaloneLM
 from src.column_graph.train_phase1 import phase1_step
 
 
-def bench_one(cfg: ColumnGraphConfig, bs: int, t: int, tbptt: int, steps: int, compile_block: bool):
+def bench_one(cfg: ColumnGraphConfig, bs: int, t: int, tbptt: int, steps: int, compile_walk_block: bool):
     lm = StandaloneLM(cfg).cuda()
     opt = torch.optim.AdamW(lm.parameters(), lr=1e-4, fused=True)
 
-    if compile_block:
-        lm.memory.compile_block(mode="default")
+    if compile_walk_block:
+        lm.memory.compile_walk_block(mode="default")
 
     tokens = torch.randint(0, cfg.vocab_size, (bs, t), device="cuda")
 
@@ -39,7 +39,7 @@ def bench_one(cfg: ColumnGraphConfig, bs: int, t: int, tbptt: int, steps: int, c
     peak = torch.cuda.max_memory_allocated() / 1024**3
 
     total = sum(p.numel() for p in lm.parameters())
-    print(f"compile={compile_block} N={cfg.N} D_s={cfg.D_s} K={cfg.K} "
+    print(f"compile={compile_walk_block} N={cfg.N} D_s={cfg.D_s} K={cfg.K} "
           f"BS={bs} T={t} tbptt={tbptt}")
     print(f"   params={total/1e6:.1f}M  {dt*1000:.0f} ms/step  "
           f"{bs*t/dt:.0f} tok/s  {peak:.2f} GB")
@@ -67,20 +67,20 @@ def main():
         print("=== Uncompiled ===")
         for bs, t, tbptt in configs:
             try:
-                bench_one(cfg, bs, t, tbptt, args.steps, compile_block=False)
+                bench_one(cfg, bs, t, tbptt, args.steps, compile_walk_block=False)
             except torch.cuda.OutOfMemoryError:
                 print(f"   BS={bs} T={t}: OOM"); torch.cuda.empty_cache()
             print()
         print("=== Compiled (block) ===")
         for bs, t, tbptt in configs:
             try:
-                bench_one(cfg, bs, t, tbptt, args.steps, compile_block=True)
+                bench_one(cfg, bs, t, tbptt, args.steps, compile_walk_block=True)
             except torch.cuda.OutOfMemoryError:
                 print(f"   BS={bs} T={t}: OOM"); torch.cuda.empty_cache()
             print()
     else:
         bench_one(cfg, args.bs, args.t, args.tbptt, args.steps,
-                  compile_block=not args.no_compile)
+                  compile_walk_block=not args.no_compile)
 
 
 if __name__ == "__main__":

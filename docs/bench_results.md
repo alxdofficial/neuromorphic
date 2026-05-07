@@ -4,9 +4,24 @@ Tracks the headline throughput / VRAM numbers for the integration. Each
 section dates the run and pins the configuration so future-me can spot
 regressions or progress without re-running every time.
 
+**All numbers below are at the production-target walker config** (the
+perfected scaleup from the standalone graph_walker branch, currently on
+`main`):
+
+- **Topology:** N=1024 columns (16×16×4 planes), K=16 out-edges
+- **Widths:** D_s=256, D_id=512, D_model=1024, content_mlp_depth=4, D_hid_content=1024, post_model_depth=2
+- **Neuromod:** 6 layers / 8 heads / D_mod=512 / edge_hidden=384
+- **Trainable params:** ~25M total (24M walker + 1.1M `MemInjectLayer.W_in`/`W_out`/`scale`)
+
 Run benches via:
-- `scripts/bench_pretrained_gw.py` — frozen-Llama (vanilla fwd, lm-head-only step) + GW (fwd, full integration step) in one process. Use `--compile-block` to enable the production compile path.
-- `scripts/bench_llama_full_training.py --mode full` — hot-Llama (all 1.24B params trainable) at the same BS/T.
+- `scripts/bench_phase1.py` — Phase 1 paths A/B/C/D in one process (vanilla fwd / vanilla lm_head step / vanilla full step / Llama+GW step)
+- `scripts/bench_phase2.py` — Phase 2 paths E/F (vanilla LM GRPO baseline / Llama+GW grpo_step)
+
+CLI flags worth knowing:
+- `--target-config` — load aspirational ~110M scaleup (eager-only, OOMs at BS≥4 on 4090; cudagraph compile bisect #276 blocks it)
+- `--compile-block` — enable whole-block compile (production fast path; ~22 min first compile, ~3.7× over eager)
+- `--regional-compile` — compile `walker_step_from_h` instead (1-2 min first compile, ~30% lower per-iter throughput; dev iteration only)
+- `--dynamic-shapes` — pass `dynamic=None` to torch.compile for cross-shape compile reuse
 
 ---
 
@@ -71,7 +86,7 @@ The walker scales much better with BS than the BS=4 numbers suggested — confir
 
 ## 2026-05-03 — `_checkpoint_block=False` is now the integration default
 
-**Diagnostic finding**: The BS=12 → BS=16 cliff in the GW step path was caused by activation checkpointing on the whole compiled walker block (`compile_block_from_h`). When `_checkpoint_block=True`, backward re-runs the compiled forward to regenerate intermediates; that recompute triggers a separate inductor compilation of the backward gradient kernels. At BS≥16 that backward compile hits a cuBLAS autotuner failure — `select_algorithm.py: "Constructing input/output tensor meta failed for Extern Choice"` warnings fire — and falls back to a much slower kernel path.
+**Diagnostic finding**: The BS=12 → BS=16 cliff in the GW step path was caused by activation checkpointing on the whole compiled walker block (`compile_walk_block_from_h`). When `_checkpoint_block=True`, backward re-runs the compiled forward to regenerate intermediates; that recompute triggers a separate inductor compilation of the backward gradient kernels. At BS≥16 that backward compile hits a cuBLAS autotuner failure — `select_algorithm.py: "Constructing input/output tensor meta failed for Extern Choice"` warnings fire — and falls back to a much slower kernel path.
 
 **Diagnostic table (single 4090, T=256, --compile-block, BS=16):**
 
@@ -254,7 +269,7 @@ action space).
 
 **What landed:**
 - `routing.py`: `route_or_replay` + `StepRoutingChoices` + `routing_log_pi_for_action`
-- `graph_walker.py`: capture buffer (`start_capturing_routes` / `consume_routing_trace`), replay stash (`arm_replay_trace`), `walk_segment` consumes replay trace and threads per-step `replay_choices`, `step_core_from_h(replay_choices=...)`, `_step_core_pure(replay_choices=...)`. `is_new_window` reconstructed from saved `anchor_idx` presence so sample/replay routing patterns match.
+- `graph_walker.py`: capture buffer (`start_capturing_routes` / `consume_routing_trace`), replay stash (`arm_replay_trace`), `walk_segment` consumes replay trace and threads per-step `replay_choices`, `walker_step_from_h(replay_choices=...)`, `_walker_step(replay_choices=...)`. `is_new_window` reconstructed from saved `anchor_idx` presence so sample/replay routing patterns match.
 - `rollout.py`: `sample_grpo_rollout` (no-grad sample with capture armed) + `replay_grpo_rollout` (teacher-forced with-grad replay). Old `autoregressive_rollout` retained for inference.
 - `train_phase2.py`: `grpo_step` rewritten as sample → score → replay → REINFORCE. Returns the same `GRPOStats` for telemetry-compat.
 - `tests/test_routing_replay.py`: 6 tests covering math parity, grad propagation, walker capture+replay end-to-end, and DeepSeek full-flow with gradient reaching `memory.neuromod.*`.

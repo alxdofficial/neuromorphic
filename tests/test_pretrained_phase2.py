@@ -171,7 +171,7 @@ def test_phase2_log_pi_resets_at_begin_segment():
     w.train()
     w.begin_segment(bs=2)
     h = torch.randn(2, w.config.d_mem)
-    w.memory.step_core_from_h(h)
+    w.memory.walker_step_from_h(h)
     assert w.memory._log_pi_sum is not None
     assert w.memory._log_pi_sum.shape == (2,)
     # New segment wipes the accumulator.

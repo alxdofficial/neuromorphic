@@ -90,7 +90,7 @@ def _bench_one(
     T_pre: int, gen_length: int,
     BS_outer: int, K: int,
     warmup: int, n_iter: int,
-    compile_block: bool, all_trainable: bool, fused_adam: bool,
+    compile_walk_block: bool, all_trainable: bool, fused_adam: bool,
 ) -> tuple[float, float, float] | None:
     """Returns (tok/s, peak_gb, ms_per_iter), or None on OOM.
 
@@ -113,7 +113,7 @@ def _bench_one(
             grpo_rollout_len=gen_length,
         )
         model = IntegratedLM(cfg).cuda()
-        if compile_block:
+        if compile_walk_block:
             model.compile_walker_block()
         model.train(True)
 
@@ -287,7 +287,7 @@ def main() -> None:
     print(f"  trainable_surface: "
           f"{'all_phase2' if args.all_trainable else 'neuromod_only'}",
           flush=True)
-    print(f"  compile_block: {args.compile_block}", flush=True)
+    print(f"  compile_walk_block: {args.compile_walk_block}", flush=True)
     print(f"  warmup={args.warmup}, iter={args.iter}", flush=True)
     print()
 
@@ -300,7 +300,7 @@ def main() -> None:
                 args.model, args.inject_layer, args.d_mem,
                 args.t_pre, args.gen_length,
                 BS_outer, K, args.warmup, args.iter,
-                compile_block=args.compile_block,
+                compile_walk_block=args.compile_walk_block,
                 all_trainable=args.all_trainable,
                 fused_adam=not args.no_fused_adam,
             )

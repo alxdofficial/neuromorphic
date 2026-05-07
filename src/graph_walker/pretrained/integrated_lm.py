@@ -161,7 +161,7 @@ class IntegratedLM(nn.Module):
             # tradeoff:
             #
             # When True (`_checkpoint_block=True`), backward re-runs the
-            # `compile_block_from_h`-compiled walker block to regenerate
+            # `compile_walk_block_from_h`-compiled walker block to regenerate
             # intermediates. This second invocation triggers a SEPARATE
             # inductor compilation of the backward gradient kernels. At
             # BS≥16 that backward compile hits a cuBLAS autotuner failure
@@ -249,12 +249,12 @@ class IntegratedLM(nn.Module):
         """Compile the walker's forward path. Two regimes:
 
         **Whole-block (default, `regional=False`):** compile
-        ``block_forward_from_h`` — one big graph that unrolls T=mod_period
+        ``walk_block_from_h`` — one big graph that unrolls T=mod_period
         walker steps + the inject path. Inductor fuses across step
         boundaries → ~3.7× over eager. **First-compile cost: 10-15 min**
         (T=256 unrolling means thousands of ops to lower).
 
-        **Regional (`regional=True`):** compile ``step_core_from_h`` only
+        **Regional (`regional=True`):** compile ``walker_step_from_h`` only
         — the per-step graph that gets called T times in the Python loop.
         Inductor fuses within each step (~2× over eager) but does NOT fuse
         across step boundaries. **First-compile cost: 1-2 min** because
@@ -293,7 +293,7 @@ class IntegratedLM(nn.Module):
         if regional:
             self.memory.compile_step(mode=mode, dynamic=dynamic)
         else:
-            self.memory.compile_block_from_h(
+            self.memory.compile_walk_block_from_h(
                 mode=mode, fullgraph=fullgraph, dynamic=dynamic,
             )
 
@@ -420,7 +420,7 @@ class IntegratedLM(nn.Module):
             return self.llama(input_ids=input_ids, **kwargs)
 
         # Propagate the model-level phase indicator into the memory module
-        # — routing inside `_step_core_pure` reads `memory.phase` only, so
+        # — routing inside `_walker_step` reads `memory.phase` only, so
         # without this propagation `model.current_phase` would be dead
         # state and a caller setting `model.current_phase = "phase2"`
         # would silently still get phase-1 Gumbel-STE routing.

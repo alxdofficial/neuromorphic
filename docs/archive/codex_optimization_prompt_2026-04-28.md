@@ -124,9 +124,9 @@ training to ≥3.7k tok/s.
 
 - `src/graph_walker/graph_walker.py` (1700+ lines) — main module.
   - `walk_segment` (line ~1010) — top-level pretrained-LM entry point.
-  - `step_core_from_h` (~957) — single-step pretrained walker call.
-  - `_step_core_pure` (~1175) — pure-functional one-token compute.
-  - `_apply_step_state` (~870) — applies pure-step output to self.
+  - `walker_step_from_h` (~957) — single-step pretrained walker call.
+  - `_walker_step` (~1175) — pure-functional one-token compute.
+  - `_writeback_step_state` (~870) — applies pure-step output to self.
   - `class ColumnCompute` (~84) — content_mlp.
   - `_run_block_pure` is NOT yet implemented (would be the natural seam
     for block-level gradient checkpointing).

@@ -89,7 +89,7 @@ def phase1_pretrained_step(
     target_ids = batch.target_ids.to(device)
 
     # Phase-1 must run in train mode. If model got switched to inference
-    # mode by a leaked rollout/bench pass, routing inside `_step_core_pure`
+    # mode by a leaked rollout/bench pass, routing inside `_walker_step`
     # flips to deterministic argmax (no Gumbel STE), so the walker would
     # produce optimizer steps but no routing-side learning signal.
     if not model.training:

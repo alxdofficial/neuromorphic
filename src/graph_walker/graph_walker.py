@@ -285,7 +285,7 @@ class WalkerCoreReadout:
 
 
 @dataclass
-class WalkerCorePureOutput:
+class WalkerStepOutput:
     """Return bundle from the pure step-core compute.
 
     Pure variant: all outputs are returned explicitly instead of being
@@ -315,8 +315,8 @@ class WalkerCorePureOutput:
 
 
 @dataclass
-class BlockOutput:
-    """Return bundle from `block_forward`: T_block sequential steps.
+class WalkBlockOutput:
+    """Return bundle from `walk_block`: T_block sequential steps.
 
     All forward state (s, walker_pos, walker_state) is returned
     explicitly so the caller can thread it through autograd or write it
@@ -492,7 +492,7 @@ class GraphWalkerMemory(nn.Module):
         # None when no phase-2 decisions have been recorded.
         # DeepSeek-style routing-trace capture buffer. None = not armed
         # (capture disabled). When armed via `start_capturing_routes()`,
-        # `_apply_step_state` appends each step's `StepRoutingChoices` to
+        # `_writeback_step_state` appends each step's `StepRoutingChoices` to
         # this list. The list is consumed (and cleared) by
         # `consume_routing_trace()`.
         self._captured_routes: list | None = None
@@ -503,7 +503,7 @@ class GraphWalkerMemory(nn.Module):
         # walk_segment call. Set via `arm_replay_trace(trace)`.
         self._next_replay_trace: list | None = None
         self._log_pi_sum: torch.Tensor | None = None
-        # Companion counter for the running sum: the number of `_apply_step_state`
+        # Companion counter for the running sum: the number of `_writeback_step_state`
         # calls that have contributed a non-None `log_pi_step`. Each
         # contribution is itself a sum across H walkers and across (anchor +
         # n_hops) routing decisions per step, but for normalization purposes
@@ -527,16 +527,16 @@ class GraphWalkerMemory(nn.Module):
         # recurrent work.
         self._compiled_step = None
 
-        # Filled when compile_block_from_h() is called; walk_segment
+        # Filled when compile_walk_block_from_h() is called; walk_segment
         # routes a whole tbptt block through the compiled version when set,
-        # replacing T_block per-token step_core_from_h calls.
-        self._compiled_block_from_h = None
+        # replacing T_block per-token walker_step_from_h calls.
+        self._compiled_walk_block_from_h = None
 
-        # Filled when compile_block() is called (standalone path that drives
-        # block_forward with token ids). Initialized here so callers can
-        # check `lm.memory._compiled_block is not None` without an
-        # AttributeError when compile_block was never invoked.
-        self._compiled_block = None
+        # Filled when compile_walk_block() is called (standalone path that drives
+        # walk_block with token ids). Initialized here so callers can
+        # check `lm.memory._compiled_walk_block is not None` without an
+        # AttributeError when compile_walk_block was never invoked.
+        self._compiled_walk_block = None
 
     # -----------------------------------------------------------------
     # Block-level caches (static per forward within a TBPTT block)
@@ -570,7 +570,7 @@ class GraphWalkerMemory(nn.Module):
             torch._dynamo.config.cache_size_limit, 64,
         )
         self._compiled_step = torch.compile(
-            self._step_core_pure, mode=mode, fullgraph=False, dynamic=dynamic,
+            self._walker_step, mode=mode, fullgraph=False, dynamic=dynamic,
         )
 
     @torch._dynamo.disable
@@ -784,7 +784,7 @@ class GraphWalkerMemory(nn.Module):
         # `.float()` on delta_edge preserves grad_fn through the dtype cast.
         self._active_neuromod_delta = dense.index_copy(0, edge_flat, delta_edge)
 
-    def _active_e_bias(self) -> torch.Tensor:
+    def _routing_e_bias(self) -> torch.Tensor:
         """E_bias tensor used by routing this window.
 
         = E_bias_flat.detach() + η_nm · delta_nm
@@ -926,18 +926,18 @@ class GraphWalkerMemory(nn.Module):
         tau, epsilon = self._schedule_tensors(token_id)
         # Active E_bias = frozen persistent base + grad-carrying neuromod
         # delta (if any). When the neuromod is off, this is just E_bias_flat.
-        e_bias_active = self._active_e_bias()
+        e_bias_active = self._routing_e_bias()
         if self._compiled_step is not None:
             out = self._compiled_step(
                 self.s, self.walker_pos, self.walker_state,
                 e_bias_active, token_id, tau, epsilon,
             )
         else:
-            out = self._step_core_pure(
+            out = self._walker_step(
                 self.s, self.walker_pos, self.walker_state,
                 e_bias_active, token_id, tau, epsilon,
             )
-        self._apply_step_state(out)
+        self._writeback_step_state(out)
         return WalkerCoreReadout(
             motor_state=out.motor_state,
             visit_freq_step=out.visit_freq_step,
@@ -946,13 +946,13 @@ class GraphWalkerMemory(nn.Module):
 
     # NOTE: A block-level checkpoint helper used to live here. It was
     # removed because (a) it did not call _record_surprise_token or
-    # _maybe_finalize_surprise_and_plasticity, so plasticity and surprise
+    # _maybe_close_plasticity_window, so plasticity and surprise
     # EMA would silently freeze on that path, and (b) wall-time showed
     # checkpointing cost more than it saved in this model (autograd
     # still traversed the recomputed per-token graph). See commit log
     # for the original version if a re-introduction is ever warranted.
 
-    def _apply_step_state(self, out: WalkerCorePureOutput) -> None:
+    def _writeback_step_state(self, out: WalkerStepOutput) -> None:
         """Write pure-step outputs into self.* state (non-grad accumulators)."""
         self.s = out.s_new
         self.walker_pos = out.walker_pos_new
@@ -964,7 +964,7 @@ class GraphWalkerMemory(nn.Module):
         self.window_len += 1
         self.tick_counter += 1
         # Phase-2 log_pi accumulation: kept outside the pure step so a
-        # compiled or checkpointed _step_core_pure stays side-effect-free.
+        # compiled or checkpointed _walker_step stays side-effect-free.
         # Gradient must remain connected (no detach), so the addition runs
         # outside the no_grad block above.
         if out.log_pi_step is not None:
@@ -1093,7 +1093,7 @@ class GraphWalkerMemory(nn.Module):
     # Block-level functional API (compile target for whole-block CUDA graphs)
     # -----------------------------------------------------------------
 
-    def block_forward(
+    def walk_block(
         self,
         s_in: torch.Tensor,                 # [B, N, D_s]
         walker_pos_in: torch.Tensor,        # [B, H]
@@ -1102,8 +1102,8 @@ class GraphWalkerMemory(nn.Module):
         tokens_block: torch.Tensor,         # [B, T_block]
         tau: torch.Tensor,                  # scalar fp32
         epsilon: torch.Tensor,              # scalar fp32
-    ) -> BlockOutput:
-        """Run T_block sequential _step_core_pure calls in one autograd graph.
+    ) -> WalkBlockOutput:
+        """Run T_block sequential _walker_step calls in one autograd graph.
 
         Compiling THIS function with torch.compile (instead of compiling
         per-step) lets inductor fuse across step boundaries and produces
@@ -1112,7 +1112,7 @@ class GraphWalkerMemory(nn.Module):
         State threads through return values — no self.* mutations during
         the loop body — so the compiled graph is free of side effects.
         Caller is responsible for writing the returned state back to
-        self.* (or keeping it as a local var for next block_forward call).
+        self.* (or keeping it as a local var for next walk_block call).
         """
         cfg = self.cfg
         _, T_block = tokens_block.shape
@@ -1133,7 +1133,7 @@ class GraphWalkerMemory(nn.Module):
         )
 
         for t in range(T_block):
-            out = self._step_core_pure(
+            out = self._walker_step(
                 s, walker_pos, walker_state,
                 e_bias_in,
                 tokens_block[:, t], tau, epsilon,
@@ -1148,7 +1148,7 @@ class GraphWalkerMemory(nn.Module):
 
         motor_states_bt = torch.stack(motor_list, dim=1)  # [B, T_block, D_s]
 
-        return BlockOutput(
+        return WalkBlockOutput(
             s_new=s,
             walker_pos_new=walker_pos,
             walker_state_new=walker_state,
@@ -1158,10 +1158,10 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=lb_loss_total,
         )
 
-    def compile_block(
+    def compile_walk_block(
         self, mode: str = "default", fullgraph: bool = True,
     ) -> None:
-        """Compile `block_forward` for whole-block CUDA-graph capture.
+        """Compile `walk_block` for whole-block CUDA-graph capture.
 
         Replaces the per-step `compile_step()` path with a single compiled
         function that covers an entire mod_period-token block. Inductor
@@ -1179,11 +1179,11 @@ class GraphWalkerMemory(nn.Module):
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, 64,
         )
-        self._compiled_block = torch.compile(
-            self.block_forward, mode=mode, fullgraph=fullgraph,
+        self._compiled_walk_block = torch.compile(
+            self.walk_block, mode=mode, fullgraph=fullgraph,
         )
 
-    def block_forward_from_h(
+    def walk_block_from_h(
         self,
         s_in: torch.Tensor,                 # [B, N, D_s]
         walker_pos_in: torch.Tensor,        # [B, H]
@@ -1192,8 +1192,8 @@ class GraphWalkerMemory(nn.Module):
         h_mem_block: torch.Tensor,          # [B, T_block, D_s]
         tau: torch.Tensor,                  # scalar fp32
         epsilon: torch.Tensor,              # scalar fp32
-    ) -> BlockOutput:
-        """Block-level analog of `block_forward` driven by an externally-
+    ) -> WalkBlockOutput:
+        """Block-level analog of `walk_block` driven by an externally-
         supplied [B, T_block, D_s] hidden-state stream instead of token ids.
         Used by the pretrained-LM integration (`walk_segment`).
 
@@ -1209,7 +1209,7 @@ class GraphWalkerMemory(nn.Module):
         walker_pos = walker_pos_in
         walker_state = walker_state_in
 
-        # Dummy token_id — `_step_core_pure` ignores it when
+        # Dummy token_id — `_walker_step` ignores it when
         # `h_input_override` is provided. Allocated once outside the loop
         # so dynamo doesn't see a fresh tensor each step.
         dummy_tok = torch.zeros(B, dtype=torch.int64, device=device)
@@ -1226,7 +1226,7 @@ class GraphWalkerMemory(nn.Module):
         )
 
         for t in range(T_block):
-            out = self._step_core_pure(
+            out = self._walker_step(
                 s, walker_pos, walker_state,
                 e_bias_in,
                 dummy_tok, tau, epsilon,
@@ -1242,7 +1242,7 @@ class GraphWalkerMemory(nn.Module):
 
         motor_states_bt = torch.stack(motor_list, dim=1)  # [B, T_block, D_s]
 
-        return BlockOutput(
+        return WalkBlockOutput(
             s_new=s,
             walker_pos_new=walker_pos,
             walker_state_new=walker_state,
@@ -1252,7 +1252,7 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=lb_loss_total,
         )
 
-    def _block_forward_from_h_ckpt(
+    def _walk_block_from_h_ckpt(
         self,
         s_in: torch.Tensor,
         walker_pos_in: torch.Tensor,
@@ -1261,19 +1261,19 @@ class GraphWalkerMemory(nn.Module):
         h_mem_block: torch.Tensor,
         tau: torch.Tensor,
         epsilon: torch.Tensor,
-    ) -> BlockOutput:
-        """Activation-checkpointed wrapper around `_compiled_block_from_h`.
+    ) -> WalkBlockOutput:
+        """Activation-checkpointed wrapper around `_compiled_walk_block_from_h`.
 
         Internally calls the compiled block under
         `torch.utils.checkpoint.checkpoint(use_reentrant=False)`, returning
-        the BlockOutput's tensor fields as a tuple so the checkpointing
+        the WalkBlockOutput's tensor fields as a tuple so the checkpointing
         machinery's "output must be tensors" requirement is satisfied
-        cleanly. We unpack back into BlockOutput for the caller.
+        cleanly. We unpack back into WalkBlockOutput for the caller.
         """
         from torch.utils.checkpoint import checkpoint
 
         def _fn(s, wp, ws, eb, hm, t_, e_):
-            r = self._compiled_block_from_h(
+            r = self._compiled_walk_block_from_h(
                 s, wp, ws, eb, hm, t_, e_,
             )
             # Return as tuple of tensors for checkpoint compatibility.
@@ -1289,7 +1289,7 @@ class GraphWalkerMemory(nn.Module):
             e_bias_in, h_mem_block, tau, epsilon,
             use_reentrant=False,
         )
-        return BlockOutput(
+        return WalkBlockOutput(
             s_new=out_tuple[0],
             walker_pos_new=out_tuple[1],
             walker_state_new=out_tuple[2],
@@ -1299,13 +1299,13 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=out_tuple[6],
         )
 
-    def compile_block_from_h(
+    def compile_walk_block_from_h(
         self, mode: str = "default", fullgraph: bool = True,
         *, dynamic: bool | None = False,
     ) -> None:
-        """Compile `block_forward_from_h` for whole-block fusion in the
+        """Compile `walk_block_from_h` for whole-block fusion in the
         pretrained-LM integration path. ``walk_segment`` routes through
-        `_compiled_block_from_h` when set — one compiled call per
+        `_compiled_walk_block_from_h` when set — one compiled call per
         `tbptt_block` window instead of T_block per-token calls.
 
         ``mode="default"`` (~3.7× over eager) is the safe choice for the
@@ -1329,12 +1329,12 @@ class GraphWalkerMemory(nn.Module):
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, 64,
         )
-        self._compiled_block_from_h = torch.compile(
-            self.block_forward_from_h, mode=mode, fullgraph=fullgraph,
+        self._compiled_walk_block_from_h = torch.compile(
+            self.walk_block_from_h, mode=mode, fullgraph=fullgraph,
             dynamic=dynamic,
         )
 
-    def step_core_from_h(
+    def walker_step_from_h(
         self,
         h_input: torch.Tensor,
         *,
@@ -1359,13 +1359,13 @@ class GraphWalkerMemory(nn.Module):
             h_input.shape[0], dtype=torch.int64, device=h_input.device,
         )
         tau, epsilon = self._schedule_tensors(dummy_tok)
-        e_bias_active = self._active_e_bias()
+        e_bias_active = self._routing_e_bias()
         # Replay mode bypasses the compiled step (which doesn't take a
         # `replay_choices` arg). Replay is a phase-2 GRPO-only path; the
         # compile speedup it would lose is irrelevant since phase-2
         # already disables the compiled-block path (see walk_segment).
         if replay_choices is not None:
-            out = self._step_core_pure(
+            out = self._walker_step(
                 self.s, self.walker_pos, self.walker_state,
                 e_bias_active,
                 dummy_tok, tau, epsilon,
@@ -1374,14 +1374,14 @@ class GraphWalkerMemory(nn.Module):
             )
         else:
             step_fn = self._compiled_step if self._compiled_step is not None \
-                      else self._step_core_pure
+                      else self._walker_step
             out = step_fn(
                 self.s, self.walker_pos, self.walker_state,
                 e_bias_active,
                 dummy_tok, tau, epsilon,
                 h_input_override=h_input,
             )
-        self._apply_step_state(out)
+        self._writeback_step_state(out)
         return WalkerCoreReadout(
             motor_state=out.motor_state,
             visit_freq_step=out.visit_freq_step,
@@ -1465,7 +1465,7 @@ class GraphWalkerMemory(nn.Module):
         motor_blocks: list[torch.Tensor] = []
 
         # Block-stride loop. Whole-block path replaces T_block per-token
-        # `step_core_from_h` calls with one `block_forward_from_h` call —
+        # `walker_step_from_h` calls with one `walk_block_from_h` call —
         # inductor fuses across step boundaries, giving ~3.7× over the
         # eager per-token path standalone (the speedup we lose if we run
         # the per-token loop inside Llama's autograd graph). Falls back
@@ -1476,15 +1476,15 @@ class GraphWalkerMemory(nn.Module):
             block_end = min(block_start + tbptt, T)
             ticks = block_end - block_start
             use_block_path = (
-                ticks == tbptt and self._compiled_block_from_h is not None
+                ticks == tbptt and self._compiled_walk_block_from_h is not None
             )
-            # Phase-2 GRPO needs `log_pi_step` from `_step_core_pure` to
+            # Phase-2 GRPO needs `log_pi_step` from `_walker_step` to
             # accumulate `_log_pi_sum` for `consume_log_pi_sum()`. The
-            # block path drops `log_pi_step` (BlockOutput has no field
+            # block path drops `log_pi_step` (WalkBlockOutput has no field
             # for it), so silently falling into the block path during
             # phase 2 would null the policy gradient. Force the per-
             # token fallback in that case so log_pi accumulation stays
-            # alive via `_apply_step_state`.
+            # alive via `_writeback_step_state`.
             if use_block_path and self.phase == "phase2":
                 use_block_path = False
             # Replay path uses per-step `replay_choices` which the compiled
@@ -1493,11 +1493,11 @@ class GraphWalkerMemory(nn.Module):
                 use_block_path = False
 
             if use_block_path:
-                # Set up block-static caches once per block. _step_core_pure
+                # Set up block-static caches once per block. _walker_step
                 # reads these from self.* (they're not arguments).
                 self._ensure_block_caches(self.tied_token_emb.weight)
-                e_bias_active = self._active_e_bias()
-                # Dummy token_id satisfies _step_core_pure's signature; it
+                e_bias_active = self._routing_e_bias()
+                # Dummy token_id satisfies _walker_step's signature; it
                 # ignores it when h_input_override is supplied.
                 dummy_tok = torch.zeros(B, dtype=torch.int64, device=device)
                 tau, epsilon = self._schedule_tensors(dummy_tok)
@@ -1509,23 +1509,23 @@ class GraphWalkerMemory(nn.Module):
                     and getattr(self, "_checkpoint_block", True)
                 )
                 if ckpt_block:
-                    out = self._block_forward_from_h_ckpt(
+                    out = self._walk_block_from_h_ckpt(
                         self.s, self.walker_pos, self.walker_state,
                         e_bias_active,
                         h_mem[:, block_start:block_end],
                         tau, epsilon,
                     )
                 else:
-                    out = self._compiled_block_from_h(
+                    out = self._compiled_walk_block_from_h(
                         self.s, self.walker_pos, self.walker_state,
                         e_bias_active,
                         h_mem[:, block_start:block_end],
                         tau, epsilon,
                     )
 
-                # State writeback — block_forward_from_h is pure-functional
+                # State writeback — walk_block_from_h is pure-functional
                 # so callers must thread state explicitly. Mirrors what
-                # _apply_step_state does for the per-token path, but for
+                # _writeback_step_state does for the per-token path, but for
                 # the whole block in one shot.
                 self.s = out.s_new
                 self.walker_pos = out.walker_pos_new
@@ -1538,22 +1538,22 @@ class GraphWalkerMemory(nn.Module):
                         )
                 self.window_len += ticks
                 self.tick_counter += ticks
-                # NOTE: block_forward_from_h drops log_pi_step. Phase-2 GRPO
+                # NOTE: walk_block_from_h drops log_pi_step. Phase-2 GRPO
                 # callers stay on the per-token preserve_graph=True path
                 # (T=1 per call), which keeps log_pi accumulation alive
-                # via _apply_step_state. If phase-2 ever wants block-path
-                # speedup, BlockOutput needs a log_pi_total field.
+                # via _writeback_step_state. If phase-2 ever wants block-path
+                # speedup, WalkBlockOutput needs a log_pi_total field.
 
                 motor_bt = out.motor_states_bt                          # [B, ticks, D_s]
             else:
                 # Per-token fallback (partial last block, AR unroll, or
-                # compile not set up). Mutates self.* via step_core_from_h.
+                # compile not set up). Mutates self.* via walker_step_from_h.
                 block_motor_list: list[torch.Tensor] = []
                 for t in range(block_start, block_end):
                     rc = (
                         replay_trace[t] if replay_trace is not None else None
                     )
-                    r = self.step_core_from_h(
+                    r = self.walker_step_from_h(
                         h_mem[:, t], replay_choices=rc,
                     )
                     block_motor_list.append(r.motor_state)
@@ -1586,7 +1586,7 @@ class GraphWalkerMemory(nn.Module):
                 h_mem, preserve_graph=preserve_graph,
             )
 
-    def _step_core_pure(
+    def _walker_step(
         self,
         s_in: torch.Tensor,              # [B, N, D_s]
         walker_pos_in: torch.Tensor,     # [B, H]
@@ -1603,7 +1603,7 @@ class GraphWalkerMemory(nn.Module):
                                           # output is None when this kwarg is
                                           # supplied (we can't capture what we
                                           # didn't sample).
-    ) -> WalkerCorePureOutput:
+    ) -> WalkerStepOutput:
         """Pure-functional one-token walker update.
 
         Flow (write-first-then-route, no anchoring — the walker walks
@@ -1806,7 +1806,7 @@ class GraphWalkerMemory(nn.Module):
         else:
             routing_choices_out = None
 
-        return WalkerCorePureOutput(
+        return WalkerStepOutput(
             s_new=s_new,
             walker_pos_new=walker_pos_new,
             walker_state_new=walker_state_new,
@@ -1990,7 +1990,7 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_prev = self.surprise_ema.detach().clone()
 
     @torch._dynamo.disable
-    def _maybe_finalize_surprise_and_plasticity(self) -> None:
+    def _maybe_close_plasticity_window(self) -> None:
         if self.window_len < self.cfg.mod_period:
             return
         self._finalize_surprise_window()
@@ -2065,5 +2065,5 @@ class GraphWalkerMemory(nn.Module):
         # inside that scope would produce an `_active_neuromod_delta` without a
         # grad_fn, and routing in the next window would see a grad-free
         # delta, silently killing the neuromod's training signal. The
-        # caller (`_maybe_finalize_surprise_and_plasticity`) runs
+        # caller (`_maybe_close_plasticity_window`) runs
         # `_begin_plastic_window()` outside this no_grad scope.

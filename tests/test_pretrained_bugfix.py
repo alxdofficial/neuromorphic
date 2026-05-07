@@ -1,7 +1,7 @@
 """Regression tests for the bug-sweep fixes (post 108540a):
 
-1. log_pi_step is returned by `_step_core_pure` (not mutated on self)
-   and folded into `_log_pi_sum` by `_apply_step_state`. Pure-function
+1. log_pi_step is returned by `_walker_step` (not mutated on self)
+   and folded into `_log_pi_sum` by `_writeback_step_state`. Pure-function
    contract preserved → safe under torch.compile / checkpoint.
 2. `model.current_phase` is propagated to `memory.phase` inside
    `model.forward()`. Setting the model-level phase alone is now
@@ -16,7 +16,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
-from src.graph_walker.graph_walker import GraphWalkerMemory, WalkerCorePureOutput
+from src.graph_walker.graph_walker import GraphWalkerMemory, WalkerStepOutput
 from src.graph_walker.pretrained.config import PretrainedGWConfig
 from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.standalone import StandaloneLM
@@ -50,13 +50,13 @@ def _make_tiny_llama(d_lm=32, n_layers=4, vocab=256):
     return LlamaForCausalLM(cfg)
 
 
-# Bug 1: pure-function contract for _step_core_pure
+# Bug 1: pure-function contract for _walker_step
 
 
 def test_log_pi_step_returned_in_pure_output_not_mutated_on_self():
-    """`_step_core_pure` must NOT mutate `self._log_pi_sum`. Instead, it
-    returns `log_pi_step` in `WalkerCorePureOutput`. The fold to
-    `self._log_pi_sum` happens in `_apply_step_state`. This keeps the
+    """`_walker_step` must NOT mutate `self._log_pi_sum`. Instead, it
+    returns `log_pi_step` in `WalkerStepOutput`. The fold to
+    `self._log_pi_sum` happens in `_writeback_step_state`. This keeps the
     function safe under torch.compile and gradient checkpointing
     (recompute path would otherwise double-count log_pi)."""
     torch.manual_seed(0)
@@ -66,19 +66,19 @@ def test_log_pi_step_returned_in_pure_output_not_mutated_on_self():
     lm.memory.begin_segment(B=2, device=torch.device("cpu"))
     log_pi_before = lm.memory._log_pi_sum
 
-    # Call _step_core_pure DIRECTLY (mimicking the compile / checkpoint path).
+    # Call _walker_step DIRECTLY (mimicking the compile / checkpoint path).
     cfg = lm.cfg
     tau, eps = lm.memory._schedule_tensors(torch.zeros(1, dtype=torch.long))
-    e_bias = lm.memory._active_e_bias()
+    e_bias = lm.memory._routing_e_bias()
     lm.memory._ensure_block_caches(lm.memory.tied_token_emb.weight)
-    out = lm.memory._step_core_pure(
+    out = lm.memory._walker_step(
         lm.memory.s, lm.memory.walker_pos, lm.memory.walker_state,
         e_bias,
         torch.zeros(2, dtype=torch.int64), tau, eps,
     )
     # Pure function: must NOT have touched self._log_pi_sum.
     assert lm.memory._log_pi_sum is log_pi_before, (
-        "_step_core_pure mutated self._log_pi_sum — pure-function contract broken"
+        "_walker_step mutated self._log_pi_sum — pure-function contract broken"
     )
     # Returned dataclass carries the routing log_pi for this step.
     assert out.log_pi_step is not None
@@ -86,19 +86,19 @@ def test_log_pi_step_returned_in_pure_output_not_mutated_on_self():
     assert out.log_pi_step.requires_grad
 
 
-def test_apply_step_state_folds_log_pi_into_self_sum():
+def test_writeback_step_state_folds_log_pi_into_self_sum():
     torch.manual_seed(1)
     lm = StandaloneLM(_tiny_cfg()).cpu()
     lm.train()
     lm.memory.phase = "phase2"
     lm.memory.begin_segment(B=2, device=torch.device("cpu"))
 
-    # Two consecutive step_core_from_h calls with phase=phase2 should
+    # Two consecutive walker_step_from_h calls with phase=phase2 should
     # accumulate log_pi (anchor on first call, per-token routing on both).
     h = torch.randn(2, lm.cfg.D_s)
-    lm.memory.step_core_from_h(h)
+    lm.memory.walker_step_from_h(h)
     sum_after_1 = lm.memory._log_pi_sum.detach().clone()
-    lm.memory.step_core_from_h(h)
+    lm.memory.walker_step_from_h(h)
     sum_after_2 = lm.memory._log_pi_sum
     # Two more routing decisions on step 2 → sum strictly increased in
     # absolute magnitude (could be more or less negative; check non-equal).

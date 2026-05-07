@@ -108,7 +108,7 @@ def test_walker_capture_replay_logpi_parity():
     walker.start_capturing_routes()
     with torch.no_grad():
         for t in range(4):
-            walker.step_core_from_h(h_mem[:, t])
+            walker.walker_step_from_h(h_mem[:, t])
     trace = walker.consume_routing_trace()
     assert trace is not None
     assert len(trace) == 4
@@ -120,7 +120,7 @@ def test_walker_capture_replay_logpi_parity():
     # ---- Pass 2: reset state and replay teacher-forced (grad enabled) ----
     walker.begin_segment(2, torch.device("cpu"))
     for t in range(4):
-        walker.step_core_from_h(h_mem[:, t], replay_choices=trace[t])
+        walker.walker_step_from_h(h_mem[:, t], replay_choices=trace[t])
 
     # The replay must have produced log_pi (even though no_grad sampling
     # produced it as well — but here it carries grad).
@@ -269,7 +269,7 @@ def test_replay_stash_consumed_after_autocast_recursion():
     h_mem = torch.randn(2, 4, cfg.D_s)
     with torch.no_grad():
         for t in range(4):
-            walker.step_core_from_h(h_mem[:, t])
+            walker.walker_step_from_h(h_mem[:, t])
     trace = walker.consume_routing_trace()
 
     # Simulate the CUDA-no-autocast recursion path by patching
@@ -457,7 +457,7 @@ def test_walker_capture_then_replay_doesnt_re_capture():
     walker.start_capturing_routes()
     with torch.no_grad():
         for t in range(4):
-            walker.step_core_from_h(h_mem[:, t])
+            walker.walker_step_from_h(h_mem[:, t])
     trace = walker.consume_routing_trace()
 
     # Now replay with capture re-armed; re-armed buffer should stay empty
@@ -465,7 +465,7 @@ def test_walker_capture_then_replay_doesnt_re_capture():
     walker.begin_segment(2, torch.device("cpu"))
     walker.start_capturing_routes()
     for t in range(4):
-        walker.step_core_from_h(h_mem[:, t], replay_choices=trace[t])
+        walker.walker_step_from_h(h_mem[:, t], replay_choices=trace[t])
     re_captured = walker.consume_routing_trace()
     assert re_captured == [], (
         f"replay should not re-capture choices; got {re_captured}"

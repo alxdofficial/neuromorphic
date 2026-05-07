@@ -24,10 +24,10 @@ This matches DeepSeek's structure: sample → score → teacher-forced re-forwar
   - `route_or_replay(scores, *, saved_idx=None, ...)` — single dispatch point: sample if `saved_idx=None`, otherwise replay using `routing_log_pi_for_action`.
   - `StepRoutingChoices` dataclass — captures `(anchor_idx, edge_idx)` per walker step.
 - **`src/graph_walker/graph_walker.py`**:
-  - `WalkerCorePureOutput.routing_choices: StepRoutingChoices | None` — populated when sampling, None when replaying.
-  - `_step_core_pure(..., replay_choices=None)` — uses `route_or_replay` at both routing call sites; captures choices when sampling.
-  - `step_core_from_h(..., replay_choices=None)` — bypasses compiled-step path when replaying (compiled-step doesn't take the kwarg; phase-2 already disables compile so no perf loss).
-  - `_apply_step_state` appends captured choices to `_captured_routes` buffer when armed.
+  - `WalkerStepOutput.routing_choices: StepRoutingChoices | None` — populated when sampling, None when replaying.
+  - `_walker_step(..., replay_choices=None)` — uses `route_or_replay` at both routing call sites; captures choices when sampling.
+  - `walker_step_from_h(..., replay_choices=None)` — bypasses compiled-step path when replaying (compiled-step doesn't take the kwarg; phase-2 already disables compile so no perf loss).
+  - `_writeback_step_state` appends captured choices to `_captured_routes` buffer when armed.
   - `start_capturing_routes()` / `consume_routing_trace()` API — arm / drain the per-step capture buffer.
 - **`tests/test_routing_replay.py`** (5 tests):
   - Math parity: replay log-π matches sample log-π exactly.
@@ -40,7 +40,7 @@ All 127 existing tests pass — backward compat preserved.
 
 ## What's done — Phase A.2 (rollout + train refactor) ✓
 
-- **`src/graph_walker/graph_walker.py`** — `walk_segment` consumes `_next_replay_trace` and threads per-step `replay_choices` to `step_core_from_h`. Block-compiled path is force-disabled when replaying. `is_new_window` is reconstructed from the saved trace's `anchor_idx` presence to keep the routing pattern identical between sample and replay.
+- **`src/graph_walker/graph_walker.py`** — `walk_segment` consumes `_next_replay_trace` and threads per-step `replay_choices` to `walker_step_from_h`. Block-compiled path is force-disabled when replaying. `is_new_window` is reconstructed from the saved trace's `anchor_idx` presence to keep the routing pattern identical between sample and replay.
 - **`src/graph_walker/pretrained/rollout.py`** — two new functions:
   - `sample_grpo_rollout` — sample phase under `no_grad` with capture armed, drains the routing trace from prefix + AR gen.
   - `replay_grpo_rollout` — teacher-forced replay via `wrapper.memory.arm_replay_trace(...)` → one parallel forward through the wrapper with grad enabled → `consume_log_pi_mean()` returns grad-carrying per-rollout log-π.

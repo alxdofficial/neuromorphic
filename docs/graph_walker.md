@@ -44,7 +44,7 @@ Execution-model choices that follow from the thesis:
 - [src/graph_walker/topology.py](/home/alex/code/neuromorphic/src/graph_walker/topology.py) — fixed Watts-Strogatz graph builder
 - [src/graph_walker/routing.py](/home/alex/code/neuromorphic/src/graph_walker/routing.py) — Gumbel top-1 softmax with ε-exploration and STE
 - [src/graph_walker/readout.py](/home/alex/code/neuromorphic/src/graph_walker/readout.py) — `PostModelStack`, `PredictionHead`, `MultiHorizonReadout` (with factorized CE)
-- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py) — `GraphWalkerMemory`, `ColumnCompute`, `_step_core_pure`
+- [src/graph_walker/graph_walker.py](/home/alex/code/neuromorphic/src/graph_walker/graph_walker.py) — `GraphWalkerMemory`, `ColumnCompute`, `_walker_step`
 - [src/graph_walker/neuromod.py](/home/alex/code/neuromorphic/src/graph_walker/neuromod.py) — `NeuromodGraphTransformer` (target-predicting head) + subgraph helpers
 - [src/graph_walker/train_phase1.py](/home/alex/code/neuromorphic/src/graph_walker/train_phase1.py) — TBPTT flush, factorized CE, surprise streaming, plasticity trigger
 - [src/graph_walker/standalone.py](/home/alex/code/neuromorphic/src/graph_walker/standalone.py) — thin wrapper: token embedding + `GraphWalkerMemory` + tied unembed
@@ -57,10 +57,11 @@ From [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/
 (verified 2026-05-04 — earlier versions of this section had stale numbers):
 
 - topology:
-  - `L = 4` planes
-  - `16 × 16` columns per plane
+  - `32 × 32` flat torus (single substrate, no planes)
   - `N = 1024` total columns
-  - `K = 16` outgoing edges per column
+  - `K = 32` outgoing edges per column
+  - `radius = 3` Moore-neighbourhood (48 candidates per column; K=32 fits)
+  - `p_rewire = 0.3` Watts-Strogatz
 - widths:
   - `D_model = 1024` (external lexical width)
   - `D_s = 256` (graph state + walker state)
@@ -134,7 +135,7 @@ Topology tensors (built once at `__init__`, `persistent=False` buffers):
 
 ## Per-Token Flow
 
-`_step_core_pure` (graph_walker.py) runs once per token. Its inputs are
+`_walker_step` (graph_walker.py) runs once per token. Its inputs are
 current state + the token id. A boolean `is_new_window = (window_len == 0)`
 splits the flow into two branches. `is_new_window` is True at segment
 start and on the first token of each new plasticity window (every
@@ -249,7 +250,7 @@ broadcast path.
   update. Surprise also enters as a per-touched-column feature.
 
 In standalone training, plasticity fires every `mod_period` tokens via
-`_maybe_finalize_surprise_and_plasticity` (called from the trainer's
+`_maybe_close_plasticity_window` (called from the trainer's
 flush after CE is computed). In the integration, plasticity is fired
 **externally** once per training step via
 `memory.update_plasticity(per_token_ce)` after backward + opt.step
@@ -331,7 +332,7 @@ Per segment:
    - `accumulate_block_ce(ce_masked.detach(), valid_tk.detach())` —
      streams per-token per-horizon CE into `surprise_ema` via
      closed-form EMA per horizon.
-   - `_maybe_finalize_surprise_and_plasticity()` — fires Hebbian +
+   - `_maybe_close_plasticity_window()` — fires Hebbian +
      neuromod commit using the fresh `surprise_ema`.
    - `loss = Σ_k w_k · per_horizon_mean[k] + Σ block_balance_sum`;
      `loss.backward()`.
@@ -352,7 +353,7 @@ visit_freq_step, load_balance_loss)`. No logits. Used by training.
 
 Compatibility / debugging path. Runs `step_core()`, materialises logits
 via `readout_from_state_block`, and triggers
-`_maybe_finalize_surprise_and_plasticity` at the window boundary. Not
+`_maybe_close_plasticity_window` at the window boundary. Not
 used by `phase1_step`; surprise on this path is populated from whatever
 was last streamed by training (so plasticity on the `step()` path uses
 a potentially stale `surprise_ema` — fine for interactive smoke tests).

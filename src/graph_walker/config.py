@@ -18,10 +18,14 @@ class GraphWalkerConfig:
                                         # is invariant to N (walkers visit only
                                         # B·H cols per step regardless of N), so
                                         # N is pure capacity at no runtime cost.
-    K: int = 16                         # out-edges per column. With N=1024,
-                                        # K=16 gives a sparse small-world graph.
-                                        # Per-step routing scoring stays in the
-                                        # noise relative to content_mlp.
+    K: int = 32                         # out-edges per column. With N=1024,
+                                        # K=32 gives each column meaningful
+                                        # branching at every hop without
+                                        # blowing up the per-step routing
+                                        # cost (which stays in the noise
+                                        # relative to content_mlp). At
+                                        # radius=3 we have 48 candidates per
+                                        # column so K=32 is comfortable.
     # p_rewire: Watts-Strogatz rewiring probability. Each edge's destination
     # is, with probability p_rewire, replaced by a uniform-random column
     # anywhere in the graph. 0.0 = pure local grid.

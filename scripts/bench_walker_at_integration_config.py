@@ -5,7 +5,7 @@ is slow because of Llama".
 Mirrors `_walker_cfg_for(d_mem=512, T=256)` from
 `scripts/bench_pretrained_gw.py`. Runs `walk_segment` over a synthetic
 h_mem (shape [B, T, D_s]) and backwards a scalar loss, with optional
-`compile_block_from_h` for inductor whole-block fusion (the same compile
+`compile_walk_block_from_h` for inductor whole-block fusion (the same compile
 the integration's `--compile-block` uses).
 
 Output: one row per BS in `--bs-list`, throughput in tok/s + peak GB,
@@ -64,12 +64,12 @@ def _build(cfg: GraphWalkerConfig) -> GraphWalkerMemory:
     return m
 
 
-def bench_one(B: int, T: int, *, compile_block: bool, use_neuromod: bool,
+def bench_one(B: int, T: int, *, compile_walk_block: bool, use_neuromod: bool,
               n_warmup: int, n_iter: int) -> dict:
     cfg = _integration_cfg(T=T, use_neuromod=use_neuromod)
     m = _build(cfg)
-    if compile_block:
-        m.compile_block_from_h(mode="default", fullgraph=True)
+    if compile_walk_block:
+        m.compile_walk_block_from_h(mode="default", fullgraph=True)
     opt = torch.optim.AdamW(
         [p for _, p in m.named_parameters() if p.requires_grad], lr=1e-4,
         fused=True,
@@ -121,7 +121,7 @@ def main() -> None:
     ap.add_argument("--bs-list", type=int, nargs="+", default=[4, 8, 16, 32])
     ap.add_argument("--T", type=int, default=256)
     ap.add_argument("--no-compile-block", action="store_true",
-                    help="Disable compile_block_from_h (eager comparison).")
+                    help="Disable compile_walk_block_from_h (eager comparison).")
     ap.add_argument("--no-neuromod", action="store_true",
                     help="Disable use_neuromod. Matches the cudagraph-compatible "
                          "variant in CapturedBlockTrainer; cuts activation "
@@ -138,7 +138,7 @@ def main() -> None:
     print(f"  use_neuromod={cfg.use_neuromod}, mod_period={cfg.mod_period}, "
           f"tbptt={cfg.tbptt_block}")
     print(f"  trainable params: {n_params:.1f}M")
-    print(f"  compile_block: {not args.no_compile_block}")
+    print(f"  compile_walk_block: {not args.no_compile_block}")
     print(f"  Reference (integration bench, --compile-block):")
     print(f"    BS=4 GW step → 2.6k tok/s at 12.22 GB peak")
     print()
@@ -148,7 +148,7 @@ def main() -> None:
         try:
             r = bench_one(
                 B, args.T,
-                compile_block=not args.no_compile_block,
+                compile_walk_block=not args.no_compile_block,
                 use_neuromod=not args.no_neuromod,
                 n_warmup=args.warmup, n_iter=args.iter,
             )

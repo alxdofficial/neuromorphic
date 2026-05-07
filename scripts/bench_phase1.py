@@ -196,7 +196,7 @@ def main():
         print(f"  walker (trainable):        {walker_only_params/1e6:.1f}M")
         print(f"  inject (W_in/W_out/scale): {inject_params/1e6:.1f}M")
         print(f"  total trainable:           {walker_params/1e6:.1f}M")
-        if args.compile_block:
+        if args.compile_walk_block:
             kind = "regional" if args.regional_compile else "whole-block"
             dyn = None if args.dynamic_shapes else False
             dyn_label = "dynamic=None" if args.dynamic_shapes else "dynamic=False"

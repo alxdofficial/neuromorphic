@@ -213,7 +213,7 @@ def main():
     if args.compile:
         print(f"  Compiling walker step ...")
         model.memory.compile_step()
-    if args.compile_block:
+    if args.compile_walk_block:
         print(f"  Compiling walker block (whole-window inductor fusion) ...")
         model.compile_walker_block()
     print()

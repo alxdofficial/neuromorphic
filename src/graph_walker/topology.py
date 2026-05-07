@@ -56,7 +56,8 @@ def build_topology(
     anywhere in the graph — the Watts-Strogatz small-world shuffle.
 
     With ``radius=3`` we have ``48`` candidates per column, comfortably
-    above ``K=16`` so the local-neighbor sampling is well-defined.
+    above the default ``K=32`` so the local-neighbor sampling is
+    well-defined.
 
     With ``p_rewire=0.3`` the graph is well past the small-world transition
     (~0.1) and has plenty of long-range shortcuts so any column is reachable

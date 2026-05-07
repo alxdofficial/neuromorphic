@@ -125,13 +125,27 @@ def vanilla_grpo_step(
     targets = generated[:, 1:]
     out = llama(replay_seq)
     logits = out.logits                                             # [B*K, T_replay, V]
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    log_pi_per_token = log_probs.gather(
-        -1, targets.unsqueeze(-1),
-    ).squeeze(-1)                                                   # [B*K, T_replay]
+    # Memory-efficient per-token log-π: at production scale, full
+    # log_softmax over [B*K, T_replay, V] would materialize a
+    # ~12 GB fp32 tensor at V=128256, B*K=64, T_replay=383. Chunk
+    # along T to bound peak memory. Per-token CE = -log P(target):
+    #   target_logit = logit at target index
+    #   logsumexp = log Σ_j exp(logit_j)
+    #   log_pi_per_token = target_logit - logsumexp
+    BK_, T_replay, V = logits.shape
+    chunk = 256
+    log_pi_chunks = []
+    for s in range(0, T_replay, chunk):
+        e = min(s + chunk, T_replay)
+        log_chunk = logits[:, s:e, :].float()
+        tgt_chunk = targets[:, s:e]
+        target_logit = log_chunk.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
+        log_pi_chunks.append(target_logit - log_chunk.logsumexp(dim=-1))
+    log_pi_per_token = torch.cat(log_pi_chunks, dim=1)              # [B*K, T_replay]
     # Only credit GEN tokens. logits at position i predicts targets[i].
     # Gen tokens occupy targets[T_pre-1 : T_pre + gen_length - 1].
     log_pi_gen = log_pi_per_token[:, T_pre - 1:].mean(dim=1)        # [B*K]
+    del out, logits
 
     loss = -(log_pi_gen * advantages.detach()).mean()
     loss.backward()
@@ -280,6 +294,24 @@ def main():
 
         label = "TARGET ~110M" if args.target_config else "production ~25M"
         print_config_summary(walker_cfg, label)
+
+        # Optional compile-block. Phase 2 mixes prefix forward + AR-gen
+        # (single-token forwards through KV cache); historically
+        # `--compile-block` hung here because each AR step is a different
+        # shape and inductor recompiled per token. With `--dynamic-shapes`
+        # (dynamic=None), inductor compiles a single shape-polymorphic
+        # artifact that handles all shapes — the experiment is whether
+        # that resolves the hang.
+        if args.compile_walk_block:
+            kind = "regional" if args.regional_compile else "whole-block"
+            dyn = None if args.dynamic_shapes else False
+            dyn_label = "dynamic=None" if args.dynamic_shapes else "dynamic=False"
+            print(f"  Compiling walker {kind} (mode={args.compile_mode}, {dyn_label}) ...")
+            model.compile_walker_block(
+                mode=args.compile_mode,
+                regional=args.regional_compile,
+                dynamic=dyn,
+            )
 
         def step_f():
             grpo_step(

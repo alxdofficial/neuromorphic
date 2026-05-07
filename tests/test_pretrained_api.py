@@ -1,7 +1,7 @@
 """Smoke tests for the pretrained-LM integration API on GraphWalkerMemory.
 
 Covers:
-- step_core_from_h: runs on an external [B, D_s] vector, mutates state,
+- walker_step_from_h: runs on an external [B, D_s] vector, mutates state,
   produces a finite motor_state.
 - walk_segment: [B, T, D_s] → [B, T, D_s] readouts. Gradient flows
   through all expected params including the pretrained-only
@@ -47,7 +47,7 @@ def test_step_core_from_h_runs_and_mutates_state():
     walker_pos_before = m.walker_pos.clone()
 
     h = torch.randn(2, cfg.D_s)
-    readout = m.step_core_from_h(h)
+    readout = m.walker_step_from_h(h)
 
     assert readout.motor_state.shape == (2, cfg.D_s)
     assert torch.isfinite(readout.motor_state).all()
@@ -161,10 +161,10 @@ def _parity_setup(seed: int):
 
 
 def test_walk_segment_block_matches_per_token():
-    """The block path (compile_block_from_h installed) must produce numerically
+    """The block path (compile_walk_block_from_h installed) must produce numerically
     identical readouts to the per-token path (no compile) when configs and
     inputs are matched. This locks in the parity that
-    `_compiled_block_from_h` is allowed to exist as a drop-in optimization
+    `_compiled_walk_block_from_h` is allowed to exist as a drop-in optimization
     rather than a behavior change.
     """
     cfg, lm_a, lm_b, h_mem, input_ids, B, T = _parity_setup(seed=42)
@@ -178,9 +178,9 @@ def test_walk_segment_block_matches_per_token():
     readouts_a = m_a.walk_segment(h_a)
 
     # Path B: block path. Skip torch.compile to keep this test cheap on CPU
-    # — install a thin trampoline that delegates to block_forward_from_h.
+    # — install a thin trampoline that delegates to walk_block_from_h.
     m_b = lm_b.memory
-    m_b._compiled_block_from_h = m_b.block_forward_from_h
+    m_b._compiled_walk_block_from_h = m_b.walk_block_from_h
     m_b.begin_segment(B, torch.device("cpu"))
     h_b = h_mem.clone().requires_grad_(True)
     torch.manual_seed(2024)

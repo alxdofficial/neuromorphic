@@ -254,7 +254,7 @@ def sample_grpo_rollout(
 
         # Toggle ONLY the walker's training mode for phase-2 routing's
         # hard-Categorical sampling. `gumbel_top1_softmax(phase=phase2)`
-        # gates on `training=True` from `_step_core_pure`'s `is_training
+        # gates on `training=True` from `_walker_step`'s `is_training
         # = self.training` read (where `self` is the walker). The host
         # LM stays in whatever mode the caller had it in.
         model.memory.train(True)
