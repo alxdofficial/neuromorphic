@@ -135,7 +135,7 @@ def phase1_step(
         # Stream the flush's per-(position, horizon) CE into surprise_ema,
         # then fire plasticity if this block closed a window. Done BEFORE
         # backward so plasticity sees this window's surprise and any new
-        # _active_delta_nm it produces is ready for the next block's step.
+        # _active_neuromod_delta it produces is ready for the next block's step.
         # The detached CE tensor keeps the autograd graph decoupled —
         # surprise is a training diagnostic, not a gradient carrier.
         lm.memory.accumulate_block_ce(ce_masked.detach(), valid_tk.detach())

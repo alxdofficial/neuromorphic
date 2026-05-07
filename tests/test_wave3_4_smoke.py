@@ -170,14 +170,14 @@ def test_bert_cosine_reward_returns_k_in_unit():
 
 def test_grpo_step_with_bert_reward_end_to_end():
     """Full Wave-4-shaped GRPO step:
-    - tiny wrapper
-    - phase-1 priming (so neuromod _prev_snapshot_* exists)
+    - tiny model
+    - phase-1 priming (so neuromod _neuromod_input_* exists)
     - apply phase-2 freeze (only neuromod trainable)
     - sample/replay GRPO with BERT-cosine reward on real-ish text
     - assert: gradient reaches memory.neuromod.* params"""
     pytest.importorskip("sentence_transformers")
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rewards import (
         BertCosineReward, load_default_bert,
     )
@@ -201,25 +201,25 @@ def test_grpo_step_with_bert_reward_end_to_end():
         T=8, bs=1,
         llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
-    # Phase-1 prime (full surface) so neuromod._prev_snapshot_* is populated.
+    # Phase-1 prime (full surface) so neuromod._neuromod_input_* is populated.
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
     # Phase-2 freeze
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     # Real BERT reward
@@ -234,7 +234,7 @@ def test_grpo_step_with_bert_reward_end_to_end():
     reference_ids = torch.randint(0, vocab, (4,), dtype=torch.long)
 
     stats = grpo_step(
-        wrapper, opt,
+        model, opt,
         prefix_ids=prefix_ids,
         reference_cont=reference_ids,
         reward_fn=reward_fn,
@@ -253,7 +253,7 @@ def test_grpo_step_with_bert_reward_end_to_end():
     # parameters have moved. Check that ANY neuromod param has nonzero
     # gradient by re-running ONE step with grad accumulation.
     opt.zero_grad(set_to_none=True)
-    # Re-prime for next phase-2 step (need fresh _active_delta_nm)
+    # Re-prime for next phase-2 step (need fresh _active_neuromod_delta)
     # — actually grpo_step already did detach_memory, so the next
     # grpo_step would naturally rebuild. Skip the re-test; the assertion
     # that grad_norm > 0 above is the proxy.
@@ -264,7 +264,7 @@ def test_grpo_step_fires_unified_plasticity():
     just like Phase 1. Walker behavior is phase-agnostic — only the
     surprise SOURCE differs (Phase 2 uses CE against the replay sequence).
 
-    We verify the call by spying on ``wrapper.memory.update_plasticity``
+    We verify the call by spying on ``model.memory.update_plasticity``
     and asserting (1) it was invoked and (2) the per-token surprise
     handed to it has the expected shape (B*K rollouts × T_replay tokens).
     If the unified-plasticity wiring is removed, the call count drops to
@@ -277,7 +277,7 @@ def test_grpo_step_fires_unified_plasticity():
     firing correctly.
     """
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -293,30 +293,30 @@ def test_grpo_step_fires_unified_plasticity():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
 
     # Spy on update_plasticity. The unified-plasticity contract is that
     # grpo_step calls this exactly once per step with a [B*K, T_replay]
     # CE tensor (T_replay = T_pre + gen_length - 1).
     calls = []
-    real_update = wrapper.memory.update_plasticity
+    real_update = model.memory.update_plasticity
 
     def spy(per_token_surprise):
         calls.append(
@@ -325,7 +325,7 @@ def test_grpo_step_fires_unified_plasticity():
         )
         return real_update(per_token_surprise)
 
-    wrapper.memory.update_plasticity = spy
+    model.memory.update_plasticity = spy
 
     prefix_ids = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     reference_ids = torch.randint(0, vocab, (4,), dtype=torch.long)
@@ -334,7 +334,7 @@ def test_grpo_step_fires_unified_plasticity():
     L_gen = 4
 
     grpo_step(
-        wrapper, opt,
+        model, opt,
         prefix_ids=prefix_ids, reference_cont=reference_ids,
         num_rollouts=K, gen_length=L_gen,
     )
@@ -365,7 +365,7 @@ def test_grpo_step_with_bs_outer_multi_prefix():
     - asserts: per-group advantage normalization correctness
       (each group of K rollouts has zero-mean advantages within itself)"""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -385,24 +385,24 @@ def test_grpo_step_with_bs_outer_multi_prefix():
         T=8, bs=1,
         llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
-    # Prime for phase-2 (build _prev_snapshot_*)
+    # Prime for phase-2 (build _neuromod_input_*)
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     # B=2 distinct prefixes (varying token distribution to keep them
@@ -419,7 +419,7 @@ def test_grpo_step_with_bs_outer_multi_prefix():
     ]
 
     stats = grpo_step(
-        wrapper, opt,
+        model, opt,
         prefix_ids=prefix_ids,
         reference_cont=reference_ids,
         reward_fn=None,                                          # default token-match
@@ -439,7 +439,7 @@ def test_grpo_step_back_compat_single_prefix_tensor_ref():
     """B=1 back-compat: reference_cont as a single Tensor [L_ref]
     must still work. Uses the original API shape (no list wrapping)."""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -459,30 +459,30 @@ def test_grpo_step_back_compat_single_prefix_tensor_ref():
         T=8, bs=1,
         llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     # Original-API call: single [1, T_pre] prefix + Tensor reference.
     prefix_ids = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     reference_ids = torch.randint(0, vocab, (4,), dtype=torch.long)
     stats = grpo_step(
-        wrapper, opt,
+        model, opt,
         prefix_ids=prefix_ids,
         reference_cont=reference_ids,                            # Tensor, not list
         reward_fn=None,
@@ -498,7 +498,7 @@ def test_grpo_step_validates_B_ref_mismatch():
     cleanly — guards against silently broadcasting a single ref to
     multiple prefixes."""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase2 import grpo_step
 
     d_lm = 32
@@ -510,15 +510,15 @@ def test_grpo_step_validates_B_ref_mismatch():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    opt = torch.optim.AdamW([p for _, p in wrapper.trainable_parameters()],
+    model = IntegratedLM(cfg, hf_model=llama)
+    opt = torch.optim.AdamW([p for _, p in model.trainable_parameters()],
                             lr=1e-5)
 
     prefix_ids = torch.randint(0, vocab, (2, 8), dtype=torch.long)   # B=2
     reference_ids = torch.randint(0, vocab, (4,), dtype=torch.long)  # Tensor, B=1
     with pytest.raises(ValueError, match="B=2"):
         grpo_step(
-            wrapper, opt,
+            model, opt,
             prefix_ids=prefix_ids,
             reference_cont=reference_ids,
             num_rollouts=2, gen_length=2,
@@ -623,7 +623,7 @@ def test_walker_snapshot_restore_round_trip():
     """snapshot_memory_state() + restore_memory_state() preserves walker
     working state across the round trip."""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 
     torch.manual_seed(0)
     d_lm = 32
@@ -635,27 +635,27 @@ def test_walker_snapshot_restore_round_trip():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=2, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
-    wrapper.reset_memory(bs=2)
+    model.begin_segment(bs=2)
     tokens = torch.randint(0, vocab, (2, 8), dtype=torch.long)
     with torch.no_grad():
-        wrapper(tokens)
+        model(tokens)
 
-    snap = wrapper.snapshot_memory_state()
+    snap = model.snapshot_memory_state()
     assert snap is not None
-    assert "s" in snap and snap["s"].shape == wrapper.memory.s.shape
+    assert "s" in snap and snap["s"].shape == model.memory.s.shape
     s_before = snap["s"].clone()
     walker_pos_before = snap["walker_pos"].clone()
 
     with torch.no_grad():
-        wrapper(torch.randint(0, vocab, (2, 8), dtype=torch.long))
-    assert not torch.equal(wrapper.memory.s, s_before)
+        model(torch.randint(0, vocab, (2, 8), dtype=torch.long))
+    assert not torch.equal(model.memory.s, s_before)
 
-    wrapper.restore_memory_state(snap)
-    assert torch.equal(wrapper.memory.s, s_before)
-    assert torch.equal(wrapper.memory.walker_pos, walker_pos_before)
+    model.restore_memory_state(snap)
+    assert torch.equal(model.memory.s, s_before)
+    assert torch.equal(model.memory.walker_pos, walker_pos_before)
 
 
 def test_lm_context_window_two_phase_forward():
@@ -664,7 +664,7 @@ def test_lm_context_window_two_phase_forward():
     recent window). Smoke check: forward runs, log_pi has grad, replay
     matches sample's trace length."""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -682,15 +682,15 @@ def test_lm_context_window_two_phase_forward():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=4, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 4), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
@@ -703,7 +703,7 @@ def test_lm_context_window_two_phase_forward():
     lm_window = 8
     prefix = torch.randint(0, vocab, (K, T_pre), dtype=torch.long)
     sampled = sample_grpo_rollout(
-        wrapper, prefix, gen_length=4,
+        model, prefix, gen_length=4,
         eos_id=None, lm_context_window=lm_window,
     )
     # Trace covers full prefix + (gen_length - 1)
@@ -712,7 +712,7 @@ def test_lm_context_window_two_phase_forward():
     assert sampled.generated.shape == (K, T_pre + 4)
 
     # Replay should also accept lm_context_window and produce log_pi with grad
-    replay = replay_grpo_rollout(wrapper, sampled, lm_context_window=lm_window)
+    replay = replay_grpo_rollout(model, sampled, lm_context_window=lm_window)
     log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
@@ -728,23 +728,23 @@ def test_lm_context_window_two_phase_forward():
     # We check the count by re-running a fresh replay and seeing that
     # the walker's log_pi accumulator covered T_pre + gen_length - 1 steps.
     sampled2 = sample_grpo_rollout(
-        wrapper, prefix, gen_length=4,
+        model, prefix, gen_length=4,
         eos_id=None, lm_context_window=lm_window,
     )
-    wrapper.reset_memory(bs=K)
-    wrapper.memory.train(True)
-    wrapper.memory.arm_replay_trace(sampled2.routing_trace)
-    with torch.enable_grad(), wrapper.preserve_memory_graph():
+    model.begin_segment(bs=K)
+    model.memory.train(True)
+    model.memory.arm_replay_trace(sampled2.routing_trace)
+    with torch.enable_grad(), model.preserve_autograd_graph():
         # Single-phase manual replay: feed the full sequence, count steps.
         replay_seq = sampled2.generated[:, :-1]
-        wrapper(replay_seq)
-        assert wrapper.memory._log_pi_count == T_pre + 4 - 1, (
-            f"single-phase replay log_pi_count={wrapper.memory._log_pi_count}, "
+        model(replay_seq)
+        assert model.memory._log_pi_count == T_pre + 4 - 1, (
+            f"single-phase replay log_pi_count={model.memory._log_pi_count}, "
             f"expected {T_pre + 4 - 1}"
         )
 
     # Two-phase replay should ALSO accumulate log_pi over the full trace.
-    replay_2 = replay_grpo_rollout(wrapper, sampled2, lm_context_window=lm_window)
+    replay_2 = replay_grpo_rollout(model, sampled2, lm_context_window=lm_window)
     # _log_pi_count was reset by consume_log_pi_mean inside replay_grpo_rollout,
     # so we can't read it directly. Instead, verify log_pi has grad and that
     # the new behavior credits early-prefix routing — proxy: the gradient w.r.t.
@@ -759,7 +759,7 @@ def test_eos_early_stop_pads_with_eos_id():
     """When eos_id is provided, post-EOS tokens are forced to eos_id and
     eos_step records first emission per rollout."""
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -775,15 +775,15 @@ def test_eos_early_stop_pads_with_eos_id():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
@@ -793,7 +793,7 @@ def test_eos_early_stop_pads_with_eos_id():
     K = 3
     prefix = torch.randint(1, vocab, (K, 8), dtype=torch.long)  # avoid eos in prefix
     sampled = sample_grpo_rollout(
-        wrapper, prefix, gen_length=10, temperature=1.0, top_p=1.0,
+        model, prefix, gen_length=10, temperature=1.0, top_p=1.0,
         eos_id=eos_id,
     )
     assert sampled.eos_step is not None
@@ -854,7 +854,7 @@ def test_grpo_session_step_end_to_end():
     pytest.importorskip("sentence_transformers")
     from src.data.wildchat_loader import MultiTurnSession, MultiTurnTurn
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rewards import (
         BertCosineReward, load_default_bert,
     )
@@ -876,23 +876,23 @@ def test_grpo_session_step_end_to_end():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     bert = load_default_bert(device="cpu")
@@ -913,7 +913,7 @@ def test_grpo_session_step_end_to_end():
     )
 
     stats = grpo_session_step(
-        wrapper, opt,
+        model, opt,
         session=session,
         reward_fn=reward_fn,
         num_rollouts=3,
@@ -1085,7 +1085,7 @@ def test_wave4_turn_batched_grpo_session_step_end_to_end():
         MultiTurnSession, MultiTurnTurn, TurnPair,
     )
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rewards import (
         BertCosineReward, load_default_bert,
     )
@@ -1107,23 +1107,23 @@ def test_wave4_turn_batched_grpo_session_step_end_to_end():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     bert = load_default_bert(device="cpu")
@@ -1144,7 +1144,7 @@ def test_wave4_turn_batched_grpo_session_step_end_to_end():
     sessions_batch = [p.to_two_turn_session() for p in pairs]
 
     stats = grpo_session_step(
-        wrapper, opt,
+        model, opt,
         sessions=sessions_batch,
         reward_fn=reward_fn,
         num_rollouts=3,
@@ -1168,7 +1168,7 @@ def test_grpo_session_step_multi_session_uniform_batched():
     pytest.importorskip("sentence_transformers")
     from src.data.wildchat_loader import MultiTurnSession, MultiTurnTurn
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rewards import (
         BertCosineReward, load_default_bert,
     )
@@ -1190,23 +1190,23 @@ def test_grpo_session_step_multi_session_uniform_batched():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     bert = load_default_bert(device="cpu")
@@ -1236,7 +1236,7 @@ def test_grpo_session_step_multi_session_uniform_batched():
     assert _can_batch_as_single_turn(sessions)  # uniform shape
 
     stats = grpo_session_step(
-        wrapper, opt,
+        model, opt,
         sessions=sessions,
         reward_fn=reward_fn,
         num_rollouts=3,
@@ -1255,7 +1255,7 @@ def test_grpo_session_step_multi_session_sequential_for_variable_shapes():
     pytest.importorskip("sentence_transformers")
     from src.data.wildchat_loader import MultiTurnSession, MultiTurnTurn
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rewards import (
         BertCosineReward, load_default_bert,
     )
@@ -1277,23 +1277,23 @@ def test_grpo_session_step_multi_session_sequential_for_variable_shapes():
         model_name="local", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-5,
+        [p for _, p in model.trainable_parameters()], lr=1e-5,
     )
 
     bert = load_default_bert(device="cpu")
@@ -1325,7 +1325,7 @@ def test_grpo_session_step_multi_session_sequential_for_variable_shapes():
     assert not _can_batch_as_single_turn(sessions)
 
     stats = grpo_session_step(
-        wrapper, opt,
+        model, opt,
         sessions=sessions,
         reward_fn=reward_fn,
         num_rollouts=3,
@@ -1401,7 +1401,7 @@ def test_uniform_batched_session_truncates_and_reports_batch_stats(monkeypatch):
 
     captured = {}
 
-    def fake_grpo_step(wrapper, opt, **kwargs):
+    def fake_grpo_step(model, opt, **kwargs):
         captured["prefix_ids"] = kwargs["prefix_ids"].detach().cpu()
         return tp2.GRPOStats(
             loss=1.0,

@@ -8,7 +8,7 @@ Why a separate module from ``src/data/streaming.py``:
   stream semantics tied to that path.
 - The graph-walker integration uses Llama-3.2's tokenizer (vocab 128256)
   and treats each ``Phase1Batch`` as an INDEPENDENT segment — walker's
-  per-batch state is reset by ``wrapper.reset_memory(BS)``; only
+  per-batch state is reset by ``model.begin_segment(BS)``; only
   ``E_bias_flat`` + neuromod snapshot persist across batches by design.
 - Phase-1 parallel training doesn't need cross-batch token continuity, so
   we just yield independent random-offset windows from the corpus.
@@ -60,7 +60,7 @@ def pretokenized_phase1_iter(
 
     Random offsets per batch (uniform). Each batch is iid — there's no
     cross-batch token continuity, which matches phase-1's design (walker
-    state is reset per batch via ``wrapper.reset_memory(BS)``; only
+    state is reset per batch via ``model.begin_segment(BS)``; only
     ``E_bias_flat`` + neuromod snapshot persist by design).
     """
     bin_p = Path(bin_path)

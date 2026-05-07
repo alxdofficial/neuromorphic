@@ -20,13 +20,13 @@ Per step:
    sequence — used as the plasticity surprise signal post-opt.step).
 6. Loss: ``-(log_pi_mean · advantages.detach()).mean()`` over B*K.
 7. Backward → grad-clip → step.
-8. ``wrapper.memory.update_plasticity(per_token_ce)`` — fires the
+8. ``model.memory.update_plasticity(per_token_ce)`` — fires the
    walker's plastic update (snapshot + commit + rebuild active delta).
    This is structurally identical to Phase 1's call site; the walker
    does not know which phase it is in, only what surprise signal it
    was handed. Without this call, ``E_bias_flat`` is frozen during
    Phase 2, which silently disables long-term plastic encoding.
-9. ``wrapper.detach_memory()``.
+9. ``model.detach_memory()``.
 
 BS_outer back-compat: if the caller passes prefix_ids[1, T_pre] +
 reference_cont as a Tensor (legacy single-prefix shape), B=1 is
@@ -41,7 +41,7 @@ for the duration of the step — each of the B prefixes gets its own
 K-block of memory state, no cross-talk.
 
 Trainable surface: whatever the caller put in their optimizer. The
-``freeze_all_but_E_bias_and_neuromod()`` helper on the wrapper sets a
+``freeze_all_but_E_bias_and_neuromod()`` helper on the model sets a
 minimal phase-2 surface — only the neuromod's parameters move under
 REINFORCE, leaving the bulk of routing parameters fixed (E_bias is a
 buffer, not a parameter, and gets updated via plasticity / detach).
@@ -57,7 +57,7 @@ from typing import Callable
 
 import torch
 
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rollout import (
     autoregressive_rollout,
     replay_grpo_rollout,
@@ -88,7 +88,7 @@ class GRPOStats:
 
 
 def grpo_step(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     opt: torch.optim.Optimizer,
     *,
     prefix_ids: torch.Tensor,                                   # [B, T_pre], [1, T_pre], or [T_pre]
@@ -182,10 +182,10 @@ def grpo_step(
 
     # ---- Sample phase (no grad, capture routing trace) ----
     # sample_grpo_rollout transparently handles batch dim B*K — it just
-    # reset_memory(bs=B*K) under the hood. EOS early-stop forces post-EOS
+    # begin_segment(bs=B*K) under the hood. EOS early-stop forces post-EOS
     # tokens to eos_id (preserves trace length); reward decoder strips.
     sampled = sample_grpo_rollout(
-        wrapper, prefix_rep,
+        model, prefix_rep,
         gen_length=gen_length,
         temperature=temperature,
         top_p=top_p,
@@ -199,7 +199,7 @@ def grpo_step(
     # mapping K-block layout → per-block reference (BertCosineReward
     # does this automatically via repeat_interleave on B refs).
     rewards = reward_fn(sampled.new_tokens, reference_cont).to(
-        next(wrapper.parameters()).device,
+        next(model.parameters()).device,
     )
     BK = B * K
     if rewards.shape != (BK,):
@@ -225,7 +225,7 @@ def grpo_step(
     # than the prior implementation, which only credited prefix routing.
     # `per_token_ce` is no-grad and feeds plasticity post-opt.step.
     replay = replay_grpo_rollout(
-        wrapper, sampled, lm_context_window=lm_context_window,
+        model, sampled, lm_context_window=lm_context_window,
     )
     log_pi_mean = replay.log_pi                                   # [B*K] grad
     per_token_ce = replay.per_token_ce                            # [B*K, T_replay]
@@ -243,7 +243,7 @@ def grpo_step(
     loss = -(log_pi_mean * advantages.detach()).mean()
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
-        [p for _, p in wrapper.trainable_parameters()],
+        [p for _, p in model.trainable_parameters()],
         grad_clip,
     )
     opt.step()
@@ -255,9 +255,9 @@ def grpo_step(
     # prior; gen = the model's own sampled tokens, i.e. self-entropy at
     # sample time). Without this, E_bias_flat stays frozen during all of
     # Phase 2 and the long-term plastic encoding pathway is disabled.
-    if wrapper.memory is not None:
-        wrapper.memory.update_plasticity(per_token_ce)
-    wrapper.detach_memory()
+    if model.memory is not None:
+        model.memory.update_plasticity(per_token_ce)
+    model.detach_memory()
 
     # Generation diversity: how many UNIQUE generations across all B*K
     # rollouts? Reported as a global indicator. (Per-group uniqueness
@@ -353,7 +353,7 @@ class SessionGRPOStats:
 
 
 def grpo_session_step(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     opt: torch.optim.Optimizer,
     *,
     session=None,                                                # MultiTurnSession or None
@@ -423,7 +423,7 @@ def grpo_session_step(
     K = num_rollouts
     if K < 2:
         raise ValueError(f"num_rollouts must be >= 2 for group-normalized GRPO; got {K}")
-    device = next(wrapper.parameters()).device
+    device = next(model.parameters()).device
 
     # ---- Multi-session dispatch ----
     # Accept either `session=<one>` (legacy) or `sessions=[s1, s2, ...]`.
@@ -446,7 +446,7 @@ def grpo_session_step(
     # process sessions sequentially.
     if len(sessions_list) > 1 and _can_batch_as_single_turn(sessions_list):
         return _grpo_session_step_uniform_batched(
-            wrapper, opt, sessions_list,
+            model, opt, sessions_list,
             reward_fn=reward_fn,
             num_rollouts=K,
             max_response_len=max_response_len,
@@ -459,7 +459,7 @@ def grpo_session_step(
     # Sequential per-session fallback (multi-turn Wave 4, or single session).
     if len(sessions_list) > 1:
         return _grpo_session_step_sequential(
-            wrapper, opt, sessions_list,
+            model, opt, sessions_list,
             reward_fn=reward_fn,
             num_rollouts=K,
             max_response_len=max_response_len,
@@ -520,7 +520,7 @@ def grpo_session_step(
         # ---- Sample (no grad, capture trace) ----
         opt.zero_grad(set_to_none=True)
         sampled = sample_grpo_rollout(
-            wrapper, prefix_ids,
+            model, prefix_ids,
             gen_length=max_response_len,
             temperature=temperature, top_p=top_p,
             eos_id=eos_id,
@@ -539,7 +539,7 @@ def grpo_session_step(
 
         # ---- Replay with grad ----
         replay = replay_grpo_rollout(
-            wrapper, sampled, lm_context_window=lm_context_window,
+            model, sampled, lm_context_window=lm_context_window,
         )
         log_pi_mean = replay.log_pi                               # [K]
         per_token_ce = replay.per_token_ce                        # [K, T_replay]
@@ -553,7 +553,7 @@ def grpo_session_step(
         # ---- Backward + step ----
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for _, p in wrapper.trainable_parameters()],
+            [p for _, p in model.trainable_parameters()],
             grad_clip,
         )
         opt.step()
@@ -562,9 +562,9 @@ def grpo_session_step(
         # Per-turn surprise covers this turn's prefix + gen — walker's
         # plastic update commits the active neuromod delta into
         # E_bias_flat and rebuilds a fresh delta for the next turn.
-        if wrapper.memory is not None:
-            wrapper.memory.update_plasticity(per_token_ce)
-        wrapper.detach_memory()
+        if model.memory is not None:
+            model.memory.update_plasticity(per_token_ce)
+        model.detach_memory()
 
         # ---- Stats ----
         per_turn_reward_mean.append(float(r_mean.detach()))
@@ -636,7 +636,7 @@ def _can_batch_as_single_turn(sessions) -> bool:
 
 
 def _grpo_session_step_uniform_batched(
-    wrapper, opt, sessions, *,
+    model, opt, sessions, *,
     reward_fn, num_rollouts, max_response_len,
     temperature, top_p, grad_clip, adv_std_floor,
     eos_id, lm_context_window, max_prior_tokens,
@@ -648,7 +648,7 @@ def _grpo_session_step_uniform_batched(
     """
     B = len(sessions)
     K = num_rollouts
-    device = next(wrapper.parameters()).device
+    device = next(model.parameters()).device
 
     prefix_list = [s.turns[0].ids.to(device) for s in sessions]
     if max_prior_tokens is not None:
@@ -657,7 +657,7 @@ def _grpo_session_step_uniform_batched(
     references = [s.turns[1].ids.to(device) for s in sessions]
 
     gstats = grpo_step(
-        wrapper, opt,
+        model, opt,
         prefix_ids=prefix_ids,
         reference_cont=references,
         reward_fn=reward_fn,
@@ -701,7 +701,7 @@ def _grpo_session_step_uniform_batched(
 
 
 def _grpo_session_step_sequential(
-    wrapper, opt, sessions, *,
+    model, opt, sessions, *,
     reward_fn, num_rollouts, max_response_len,
     temperature, top_p, grad_clip, adv_std_floor,
     eos_id, max_prior_tokens, lm_context_window,
@@ -722,7 +722,7 @@ def _grpo_session_step_sequential(
 
     for s in sessions:
         sub = grpo_session_step(
-            wrapper, opt,
+            model, opt,
             session=s,
             reward_fn=reward_fn,
             num_rollouts=num_rollouts,

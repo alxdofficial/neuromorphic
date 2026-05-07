@@ -46,7 +46,7 @@ import torch
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch, phase1_pretrained_step,
 )
@@ -112,26 +112,26 @@ def _bench_one(
             grpo_K=K,
             grpo_rollout_len=gen_length,
         )
-        wrapper = GraphWalkerPretrainedLM(cfg).cuda()
+        model = IntegratedLM(cfg).cuda()
         if compile_block:
-            wrapper.compile_walker_block()
-        wrapper.train(True)
+            model.compile_walker_block()
+        model.train(True)
 
-        vocab = wrapper.llama.config.vocab_size
+        vocab = model.llama.config.vocab_size
 
-        # Priming pass: a fresh wrapper has `_prev_snapshot_*=None` so the
-        # first GRPO step's `_active_delta_nm` would be None and routing
+        # Priming pass: a fresh model has `_neuromod_input_*=None` so the
+        # first GRPO step's `_active_neuromod_delta` would be None and routing
         # would have no grad. Production training builds these snapshots
         # over Wave 1+2 phase-1 steps. For the bench we run a single
         # phase-1 step with the full trainable surface to seed the
         # snapshots, THEN apply the phase-2 freeze.
         prime_opt = torch.optim.AdamW(
-            [p for _, p in wrapper.trainable_parameters()],
+            [p for _, p in model.trainable_parameters()],
             lr=1e-5, fused=fused_adam,
         )
         prime_ids = torch.randint(0, vocab, (BS_outer, T_pre), device="cuda")
         phase1_pretrained_step(
-            wrapper, prime_opt,
+            model, prime_opt,
             Phase1Batch(input_ids=prime_ids, target_ids=prime_ids),
             amp_dtype=torch.bfloat16,
         )
@@ -139,14 +139,14 @@ def _bench_one(
         torch.cuda.empty_cache()
 
         if not all_trainable:
-            wrapper.freeze_all_but_E_bias_and_neuromod()
+            model.freeze_all_but_E_bias_and_neuromod()
 
         trainable = sum(
-            p.numel() for _, p in wrapper.named_parameters()
+            p.numel() for _, p in model.named_parameters()
             if p.requires_grad
         )
         opt = torch.optim.AdamW(
-            [p for _, p in wrapper.trainable_parameters()],
+            [p for _, p in model.trainable_parameters()],
             lr=1e-5, fused=fused_adam,
         )
         # GRPO step takes a single (prefix, reference) pair. We pass
@@ -163,7 +163,7 @@ def _bench_one(
         def step():
             for prefix in prefixes:
                 grpo_step(
-                    wrapper, opt,
+                    model, opt,
                     prefix_ids=prefix,
                     reference_cont=reference,
                     reward_fn=_placeholder_reward,
@@ -223,7 +223,7 @@ def _bench_one(
         raise
     finally:
         try:
-            del wrapper
+            del model
         except NameError:
             pass
         try:
@@ -266,7 +266,7 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--iter", type=int, default=3)
     ap.add_argument("--compile-block", action="store_true",
-                    help="Run wrapper.compile_walker_block() before bench.")
+                    help="Run model.compile_walker_block() before bench.")
     ap.add_argument("--all-trainable", action="store_true",
                     help="Don't apply freeze_all_but_E_bias_and_neuromod — "
                          "bench the larger trainable surface (everything "

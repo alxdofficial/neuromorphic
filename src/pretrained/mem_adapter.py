@@ -1,7 +1,7 @@
 """MemAdapter — duck-types an HF host as the `lm` object that
-`MemoryGraph.forward_segment` expects.
+`MemoryGraph.walk_segment` expects.
 
-`forward_segment` reads five fields / one method off `lm`:
+`walk_segment` reads five fields / one method off `lm`:
   - `lm.lm_head`           — Linear(d_lm, vocab)
   - `lm.proj_down`         — Linear(d_mem, d_lm) or None
   - `lm.ln_final`          — object with `.weight` (+ `.bias`, may be None)
@@ -43,7 +43,7 @@ class _LnFinalShim:
 
 
 class MemAdapter(nn.Module):
-    """Adapts any HostAdapter to the `lm` interface memory.forward_segment uses."""
+    """Adapts any HostAdapter to the `lm` interface memory.walk_segment uses."""
 
     def __init__(self, host: HostAdapter, W_out: nn.Linear):
         super().__init__()
@@ -55,7 +55,7 @@ class MemAdapter(nn.Module):
         self._W_out = W_out
         self.rms_eps = host.norm_eps()
 
-        # Duck-typed fields consumed by memory.forward_segment.
+        # Duck-typed fields consumed by memory.walk_segment.
         self.lm_head = host.lm_head()
         self.proj_down = W_out
         fn = host.final_norm()

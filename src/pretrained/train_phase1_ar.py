@@ -19,7 +19,7 @@ Per step:
        T_pre/mod_interval times; each fire writes ΔW/Δdecay with gradient
        attached to the modulator logits. State lives on `memory.{h,msg,W,...}`
        graph-connected (not detached) because we're in
-       `wrapper.preserve_memory_graph()` context.
+       `wrapper.preserve_autograd_graph()` context.
     2. Autoregressive continuation unroll with KV cache. For each of
        T_cont continuation tokens:
          • Feed the GROUND-TRUTH previous token as input (teacher-forced).
@@ -132,15 +132,15 @@ def run_phase1_ar(
         tau = anneal_gumbel_tau(step, anneal_across_steps,
                                 gumbel_tau_start, gumbel_tau_end)
         wrapper.memory.gumbel_tau = tau
-        wrapper.reset_memory(bs=BS)
+        wrapper.begin_segment(bs=BS)
 
         amp_ctx = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
                    if use_autocast else _nullcontext())
 
         # The whole forward — prefix pass + continuation unroll — happens
-        # inside preserve_memory_graph so memory state stays connected
+        # inside preserve_autograd_graph so memory state stays connected
         # across calls. autocast covers matmul dtypes on CUDA.
-        with wrapper.preserve_memory_graph(), amp_ctx:
+        with wrapper.preserve_autograd_graph(), amp_ctx:
             # 1. Prefix pass. Aux memory-pred loss runs here (modulator
             # fires; readouts line up with input_ids). KV cache captured
             # for the unroll.

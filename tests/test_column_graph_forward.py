@@ -47,9 +47,9 @@ def test_single_step_shape():
     assert torch.isfinite(r.logits).all()
 
 
-def test_forward_segment_shape():
+def test_walk_segment_shape():
     lm, tokens, cfg = _make_lm_and_tokens(B=2, T=16)
-    out = lm.forward_segment(tokens, tbptt_block=cfg.tbptt_block)
+    out = lm.walk_segment(tokens, tbptt_block=cfg.tbptt_block)
     assert len(out.logits_per_tick) == 16
     for logits in out.logits_per_tick:
         assert logits.shape == (2, cfg.K_horizons, cfg.vocab_size)
@@ -81,10 +81,10 @@ def test_plasticity_fires_on_mod_period():
 
 
 def test_gradient_flows_through_segment():
-    """Backprop through forward_segment with simple loss — all trainable params
+    """Backprop through walk_segment with simple loss — all trainable params
     should have non-None, finite gradients."""
     lm, tokens, cfg = _make_lm_and_tokens(B=2, T=8)
-    out = lm.forward_segment(tokens, tbptt_block=cfg.tbptt_block)
+    out = lm.walk_segment(tokens, tbptt_block=cfg.tbptt_block)
     # Simple loss: mean of all logits
     loss = sum(l.float().mean() for l in out.logits_per_tick)
     loss.backward()
@@ -101,7 +101,7 @@ def test_gradient_flows_to_neuromod():
     which affects subsequent logits)."""
     lm, tokens, cfg = _make_lm_and_tokens(B=2, T=16)
     # Use big-enough T to trigger plasticity (mod_period=4 → at least 4 updates)
-    out = lm.forward_segment(tokens, tbptt_block=cfg.tbptt_block)
+    out = lm.walk_segment(tokens, tbptt_block=cfg.tbptt_block)
     loss = sum(l.float().mean() for l in out.logits_per_tick)
     loss.backward()
     # At least one neuromod parameter should have a nonzero gradient.
@@ -147,7 +147,7 @@ def test_runs_on_cuda_bf16():
     """Smoke test on CUDA with bf16 autocast — shape and finite-ness only."""
     lm, tokens, cfg = _make_lm_and_tokens(B=2, T=8, device="cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        out = lm.forward_segment(tokens, tbptt_block=cfg.tbptt_block)
+        out = lm.walk_segment(tokens, tbptt_block=cfg.tbptt_block)
     for logits in out.logits_per_tick:
         assert logits.shape == (2, cfg.K_horizons, cfg.vocab_size)
         assert torch.isfinite(logits).all()

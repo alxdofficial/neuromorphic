@@ -44,9 +44,9 @@ norm → lm_head → logits
 ```
 
 - `d_mem = D_s` — MemInjectLayer's memory-side dim equals the walker's
-  internal column-state dim. `forward_segment` passes h_mem directly
+  internal column-state dim. `walk_segment` passes h_mem directly
   into the walker as `h_input`; no extra projection.
-- The walker runs T sequential steps inside `forward_segment`, with TBPTT
+- The walker runs T sequential steps inside `walk_segment`, with TBPTT
   detach every `cfg.tbptt_block` tokens.
 - Trainable surface (production walker, post-scale-up, Llama-3.2-1B):
   walker ~24.2M + W_in/W_out/scale ~1.1M ≈ **25.3M total**. (Earlier
@@ -60,7 +60,7 @@ norm → lm_head → logits
 
 ```
 src/graph_walker/
-├── graph_walker.py              # GraphWalkerMemory + step_core_from_h + forward_segment
+├── graph_walker.py              # GraphWalkerMemory + step_core_from_h + walk_segment
 ├── routing.py                   # gumbel_top1_softmax (phase-aware) +
 │                                # route_or_replay / routing_log_pi_for_action
 │                                # for DeepSeek-style replay (Phase A)
@@ -68,7 +68,7 @@ src/graph_walker/
 └── pretrained/
     ├── __init__.py              # public API
     ├── config.py                # PretrainedGWConfig + factories (llama_1b/3b/etc)
-    ├── llm_wrapper.py           # GraphWalkerPretrainedLM
+    ├── llm_wrapper.py           # IntegratedLM
     ├── train_phase1.py          # phase1_pretrained_step (parallel teacher-forced)
     ├── train_phase1_ar.py       # phase1_ar_pretrained_step (AR unroll)
     ├── train_phase2.py          # grpo_step
@@ -93,7 +93,7 @@ src/pretrained/                  # SHARED with v2 — re-used by graph_walker
 def step_core_from_h(self, h_input):
     """One walker step driven by [B, D_s] vector instead of token_id."""
 
-def forward_segment(self, h_mem, *, preserve_graph=False):
+def walk_segment(self, h_mem, *, preserve_graph=False):
     """[BS, T, D_s] → [BS, T, D_s] readouts. Pure forward.
 
     The walker is vocab-agnostic: no LM head, no aux loss, no surprise
@@ -107,7 +107,7 @@ def update_plasticity(self, per_token_surprise: Tensor | None):
     - per_token_surprise=None: AR free-gen / inference. No plastic update.
     - per_token_surprise: [B, T_supervised]: training. Fold per-token CE
       into surprise_ema, fire one plasticity step (commit the current
-      `_active_delta_nm` into `E_bias_flat`, snapshot, build the next
+      `_active_neuromod_delta` into `E_bias_flat`, snapshot, build the next
       segment's neuromod delta).
     """
 ```
@@ -128,12 +128,12 @@ vocab-agnostic forward path):
 ## 4. Phase 1 — Gumbel-STE bootstrap (`phase1_pretrained_step`)
 
 Per step:
-1. `wrapper.reset_memory(bs)` — zero walker working state. Preserves
-   `_prev_snapshot_*` so the next segment's `_active_delta_nm` is
+1. `wrapper.begin_segment(bs)` — zero walker working state. Preserves
+   `_neuromod_input_*` so the next segment's `_active_neuromod_delta` is
    non-None and routing carries gradient to neuromod.
 2. Llama forward with memory closure at layer L. Walker steps T tokens
-   sequentially inside `forward_segment` with TBPTT-block detach.
-   `forward_segment` is now a pure forward — no aux loss, no plasticity.
+   sequentially inside `walk_segment` with TBPTT-block detach.
+   `walk_segment` is now a pure forward — no aux loss, no plasticity.
 3. Loss: Llama CE on next-token prediction (`ce_weight * CE`). The walker
    has no aux loss of its own; its parameters learn purely via gradient
    flowing back through `W_out` from Llama's CE.
@@ -150,7 +150,7 @@ with `phase="phase1"`). τ schedule comes from `GraphWalkerConfig`.
 
 ### Phase-1 AR unroll (`phase1_ar_pretrained_step`)
 
-Same per-step structure but with `wrapper.preserve_memory_graph()` keeping
+Same per-step structure but with `wrapper.preserve_autograd_graph()` keeping
 walker state graph-connected across the prefix pass + per-token
 continuation forwards. Continuation predictions' gradient reaches the
 prefix-pass writes through the walker's recurrent state. Trains the
@@ -206,22 +206,22 @@ Per step (`grpo_step`):
      `update_plasticity` (called by the trainer post-backward), so
      forward-only paths can't fire plasticity regardless. The old
      freeze-by-mutating-mod_period trick silently corrupted the
-     `_active_delta_nm` rebuild that runs at TBPTT boundaries.
+     `_active_neuromod_delta` rebuild that runs at TBPTT boundaries.
 
 2. **Score phase**:
    - `rewards = reward_fn(generated [K, T_pre+L], reference [L])`
    - `advantages = (rewards - rewards.mean()) / max(rewards.std(), adv_std_floor)`
 
 3. **Replay phase** (`replay_grpo_rollout`, with grad):
-   - `wrapper.reset_memory(K)` + `wrapper.memory.arm_replay_trace(...)`.
+   - `wrapper.begin_segment(K)` + `wrapper.memory.arm_replay_trace(...)`.
    - `wrapper.memory.train(True)` (walker only).
    - One parallel forward through `wrapper(replay_seq)` where
      `replay_seq = generated[:, :-1]` (drop the L-th token; matches
      trace length T_pre + L_gen - 1).
-   - `wrapper.preserve_memory_graph()` is held — `forward_segment`
+   - `wrapper.preserve_autograd_graph()` is held — `walk_segment`
      would otherwise call `detach_state()` at every `tbptt_block`-token
      boundary inside the replay, and that detach also rebuilds
-     `_active_delta_nm` via `_begin_plastic_window`. With preserve_graph,
+     `_active_neuromod_delta` via `_begin_plastic_window`. With preserve_graph,
      the autograd graph stays alive end-to-end and the active delta
      stays consistent across blocks.
    - The walker uses the saved trace as `replay_choices` per step;
@@ -243,7 +243,7 @@ Per step (`grpo_step`):
    - `wrapper.memory.update_plasticity(per_token_ce)` — folds the
      replay's per-token CE into `surprise_ema`, fires
      `_plasticity_step` (commits the active neuromod delta into
-     `E_bias_flat`), and rebuilds the next window's `_active_delta_nm`
+     `E_bias_flat`), and rebuilds the next window's `_active_neuromod_delta`
      with fresh grad_fn for the next training step.
    - Walker behavior is phase-agnostic by design — Phase 2 calls this
      with the same shape contract as Phase 1, just with the surprise
@@ -329,8 +329,8 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
 
 | Component | Status |
 |---|---|
-| `step_core_from_h`, `forward_segment` | ✓ smoke-covered |
-| `GraphWalkerPretrainedLM` wrapper | ✓ smoke-covered (random Llama) |
+| `step_core_from_h`, `walk_segment` | ✓ smoke-covered |
+| `IntegratedLM` wrapper | ✓ smoke-covered (random Llama) |
 | Phase-1 parallel `phase1_pretrained_step` | ✓ smoke-covered |
 | Phase-1 AR `phase1_ar_pretrained_step` | ✓ smoke-covered |
 | Phase-2 GRPO `grpo_step` | ✓ smoke-covered (random reward) |
@@ -352,10 +352,10 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
 - `tbptt_block == mod_period`. Enforced in `GraphWalkerConfig.__post_init__`.
 - `T % mod_period == 0`. Enforced in config.
 - `d_mem == memory.D_s`. Enforced in `PretrainedGWConfig.validate()`.
-- `wrapper.reset_memory(bs)` MUST be called before every segment forward.
-  Default `clear_neuromod_carryover=False` preserves `_prev_snapshot_*`
+- `wrapper.begin_segment(bs)` MUST be called before every segment forward.
+  Default `clear_neuromod_carryover=False` preserves `_neuromod_input_*`
   across calls — required so neuromod params receive gradient via
-  `_active_delta_nm`. Setting it to `True` starves neuromod of gradient.
+  `_active_neuromod_delta`. Setting it to `True` starves neuromod of gradient.
 - `wrapper.memory.update_plasticity(per_token_ce)` MUST be called after
   `loss.backward()` (Phase 1) or `opt.step()` (Phase 2) for plastic
   state and neuromod params to advance. Walker behavior is phase-
@@ -378,12 +378,12 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
 ```python
 import torch
 from src.graph_walker.pretrained import (
-    PretrainedGWConfig, GraphWalkerPretrainedLM,
+    PretrainedGWConfig, IntegratedLM,
     Phase1Batch, phase1_pretrained_step,
 )
 
 cfg = PretrainedGWConfig.llama_1b()
-wrapper = GraphWalkerPretrainedLM(cfg).cuda()
+wrapper = IntegratedLM(cfg).cuda()
 opt = torch.optim.AdamW([p for _, p in wrapper.trainable_parameters()], lr=1e-4)
 
 for step in range(N):

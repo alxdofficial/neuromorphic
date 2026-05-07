@@ -118,10 +118,10 @@ Persistent-across-segments (plastic) state:
 - `co_visit_flat [N·K]` — accumulated traversed-edge counts in the
   current plasticity window
 - `visit_count [N]` — per-column visit tally in the current window
-- `_prev_snapshot_ids`, `_prev_snapshot_feats` — detached snapshot of
+- `_neuromod_input_ids`, `_neuromod_input_feats` — detached snapshot of
   the previous window's touched columns (consumed by neuromod at the
   next window start)
-- `_active_delta_nm [N·K]` — grad-carrying neuromod delta, live for the
+- `_active_neuromod_delta [N·K]` — grad-carrying neuromod delta, live for the
   whole current window, detached-and-committed into `E_bias_flat` at
   window close
 
@@ -422,9 +422,9 @@ the config changes; don't trust this section for current numbers.
 Integration target (not on this branch): mount `GraphWalkerMemory` as
 a memory module inside a frozen Llama (1B or 3B). See
 [docs/pretrained_lm_memory.md](/home/alex/code/neuromorphic/docs/pretrained_lm_memory.md) on `main` for the interface
-(`MemInjectLayer`, `forward_segment`, phase-1 Gumbel-STE + phase-2
+(`MemInjectLayer`, `walk_segment`, phase-1 Gumbel-STE + phase-2
 GRPO). The current single-token `step(token_id)` API needs to be
-wrapped as `forward_segment(h_mem[BS,T,d_mem], input_ids, lm, ...)`,
+wrapped as `walk_segment(h_mem[BS,T,d_mem], input_ids, lm, ...)`,
 the standalone-LM readout tower dropped, and a discrete-policy path
 added for phase-2 (candidate: REINFORCE over walker Gumbel-top-1 hops,
 accumulating log_π per fire).

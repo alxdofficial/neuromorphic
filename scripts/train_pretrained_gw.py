@@ -12,7 +12,7 @@ data source. Supports two waves:
     ``HuggingFaceH4/ultrachat_200k`` via the chat template.
 
 Telemetry is captured via ``StatsCollector`` (writes a per-step jsonl
-to ``--work-dir``). Checkpointing is bare-bones for v1: wrapper +
+to ``--work-dir``). Checkpointing is bare-bones for v1: model +
 optimizer state every ``--ckpt-every`` steps; data iterator state is
 not persisted (re-init from corpus start on resume — fine for
 randomized FineWeb sampling).
@@ -49,7 +49,7 @@ from src.data.phase1_loaders import (
     pretokenized_phase1_iter,
 )
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.train_phase1 import phase1_pretrained_step
 from src.graph_walker.telemetry import StatsCollector
 
@@ -138,7 +138,7 @@ def main() -> None:
     print(f"[setup] work_dir={work_dir}")
 
     # --- Wrapper construction (production config) ---
-    print(f"[setup] building wrapper: {args.model} inject_layer={args.inject_layer} "
+    print(f"[setup] building model: {args.model} inject_layer={args.inject_layer} "
           f"d_mem={args.d_mem} BS={args.bs} T={args.T}")
     cfg = PretrainedGWConfig.llama_1b(
         model_name=args.model,
@@ -147,18 +147,18 @@ def main() -> None:
         T=args.T,
         bs=args.bs,
     )
-    wrapper = GraphWalkerPretrainedLM(cfg).to(device)
-    wrapper.train(True)
-    n_trainable = sum(p.numel() for _, p in wrapper.trainable_parameters())
+    model = IntegratedLM(cfg).to(device)
+    model.train(True)
+    n_trainable = sum(p.numel() for _, p in model.trainable_parameters())
     print(f"[setup] trainable params: {n_trainable/1e6:.1f}M")
 
     if args.compile_block and device.type == "cuda":
         print("[setup] compiling walker block (this takes a few minutes)...")
-        wrapper.compile_walker_block()
+        model.compile_walker_block()
 
     # --- Optimizer + LR schedule ---
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()],
+        [p for _, p in model.trainable_parameters()],
         lr=args.lr,
         fused=(device.type == "cuda"),
     )
@@ -171,7 +171,7 @@ def main() -> None:
     if args.resume is not None:
         print(f"[setup] resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
-        wrapper.load_state_dict(ckpt["wrapper"])
+        model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         sched.load_state_dict(ckpt["sched"])
         start_step = int(ckpt["step"])
@@ -233,14 +233,14 @@ def main() -> None:
         step = start_step
         for batch in data_iter:
             stats = phase1_pretrained_step(
-                wrapper, opt, batch,
+                model, opt, batch,
                 amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
                 grad_clip=args.grad_clip,
             )
             sched.step()
 
             row = collector.snapshot(
-                wrapper, step=step, phase="phase1",
+                model, step=step, phase="phase1",
                 stats=stats,
             )
 
@@ -254,7 +254,7 @@ def main() -> None:
                 vram = row.get("vram.peak_mb", 0.0)
                 nan_g = row.get("nan.any_nan_grad", False)
                 nan_p = row.get("nan.any_nan_param", False)
-                has_dnm = row.get("walker.has_active_delta_nm", True)
+                has_dnm = row.get("walker.has_active_neuromod_delta", True)
                 # Compact warning string; empty when everything healthy.
                 warns = []
                 if nan_g:  warns.append("NaN-grad")
@@ -278,7 +278,7 @@ def main() -> None:
                 ckpt_path = work_dir / f"ckpt_step{step}.pt"
                 torch.save({
                     "step": step,
-                    "wrapper": wrapper.state_dict(),
+                    "model": model.state_dict(),
                     "opt": opt.state_dict(),
                     "sched": sched.state_dict(),
                     "config": vars(args),
@@ -293,7 +293,7 @@ def main() -> None:
     final_path = work_dir / "ckpt_final.pt"
     torch.save({
         "step": step,
-        "wrapper": wrapper.state_dict(),
+        "model": model.state_dict(),
         "opt": opt.state_dict(),
         "sched": sched.state_dict(),
         "config": vars(args),

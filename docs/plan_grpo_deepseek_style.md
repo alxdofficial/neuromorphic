@@ -40,7 +40,7 @@ All 127 existing tests pass — backward compat preserved.
 
 ## What's done — Phase A.2 (rollout + train refactor) ✓
 
-- **`src/graph_walker/graph_walker.py`** — `forward_segment` consumes `_next_replay_trace` and threads per-step `replay_choices` to `step_core_from_h`. Block-compiled path is force-disabled when replaying. `is_new_window` is reconstructed from the saved trace's `anchor_idx` presence to keep the routing pattern identical between sample and replay.
+- **`src/graph_walker/graph_walker.py`** — `walk_segment` consumes `_next_replay_trace` and threads per-step `replay_choices` to `step_core_from_h`. Block-compiled path is force-disabled when replaying. `is_new_window` is reconstructed from the saved trace's `anchor_idx` presence to keep the routing pattern identical between sample and replay.
 - **`src/graph_walker/pretrained/rollout.py`** — two new functions:
   - `sample_grpo_rollout` — sample phase under `no_grad` with capture armed, drains the routing trace from prefix + AR gen.
   - `replay_grpo_rollout` — teacher-forced replay via `wrapper.memory.arm_replay_trace(...)` → one parallel forward through the wrapper with grad enabled → `consume_log_pi_mean()` returns grad-carrying per-rollout log-π.
@@ -58,8 +58,8 @@ All 130 tests pass (127 pre-existing + 3 new — DeepSeek end-to-end + autocast-
 
 Self-audit + Codex audit caught 6 bugs, all fixed:
 
-1. **CRIT (self-found)** — `forward_segment` consumed `_next_replay_trace` BEFORE the autocast-recursion guard. On CUDA-without-external-autocast the outer call cleared the stash and the recursive inner call found None, silently falling through to no-replay. Fixed by reordering; pinned with regression test.
-2. **HIGH (Codex)** — `_freeze_plasticity_ctx` mutated `cfg.mod_period = 10**9` to "freeze plasticity". After TBPTT detach inside replay (multi-block trajectories), `_begin_plastic_window` rebuilt `_active_delta_nm` reading the fake mod_period, so replay log-π after the first block were gradients for a different policy than the sampler used. Fixed by dropping `_freeze_plasticity_ctx` (vestigial under external-surprise design — plasticity only fires from external `update_plasticity`) and holding `wrapper.preserve_memory_graph()` during replay so `detach_state` never fires.
+1. **CRIT (self-found)** — `walk_segment` consumed `_next_replay_trace` BEFORE the autocast-recursion guard. On CUDA-without-external-autocast the outer call cleared the stash and the recursive inner call found None, silently falling through to no-replay. Fixed by reordering; pinned with regression test.
+2. **HIGH (Codex)** — `_freeze_plasticity_ctx` mutated `cfg.mod_period = 10**9` to "freeze plasticity". After TBPTT detach inside replay (multi-block trajectories), `_begin_plastic_window` rebuilt `_active_neuromod_delta` reading the fake mod_period, so replay log-π after the first block were gradients for a different policy than the sampler used. Fixed by dropping `_freeze_plasticity_ctx` (vestigial under external-surprise design — plasticity only fires from external `update_plasticity`) and holding `wrapper.preserve_autograd_graph()` during replay so `detach_state` never fires.
 3. **HIGH (Codex)** — Final gen-token routing was credited under REINFORCE but its readout would only affect logits at position L+1 (not in trajectory, not scored). Fixed by skipping the L-th gen-token forward through the walker; the L-th token still appears in `generated` for the reward function. Replay input is now `[K, T_pre + L_gen - 1]`. Trace length is now `T_pre + L_gen - 1`.
 4. **MED (Codex)** — `gen_sample_routing=False` was silently overridden by `wrapper.train(True)` always making routing categorical. Removed the flag (vestigial).
 5. **MED (Codex)** — `wrapper.train(True)` engaged Llama train mode → host dropout/randomness desynced sample-vs-replay hidden states. Switched to `wrapper.memory.train(True)`; host LM stays in caller-set mode.
@@ -77,7 +77,7 @@ Re-run `scripts/bench_grpo.py` after this lands. Replay does an extra parallel f
 
 ## Order of operations for completing Phase A.2
 
-1. Add `replay_trace` kwarg to `forward_segment` (LLM wrapper) — small, mechanical
+1. Add `replay_trace` kwarg to `walk_segment` (LLM wrapper) — small, mechanical
 2. Implement `sample_rollout_for_grpo` + `replay_rollout_with_grad` in rollout.py — medium
 3. Rewrite `grpo_step` to use both — small
 4. Smoke test → verify grad reaches gen-time routing decisions

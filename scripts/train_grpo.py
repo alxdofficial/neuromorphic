@@ -15,7 +15,7 @@ Per outer step:
 
 Trainable surface is restricted to ``memory.neuromod.*`` (the production
 Phase-2 minimum policy surface). Phase-1 cold-start checkpoint is
-required: REINFORCE on a fresh wrapper has no signal.
+required: REINFORCE on a fresh model has no signal.
 
 Wave dispatch:
   --data passphrase-chat-grpo   Wave 3 (chat-injected passphrase, 2-turn
@@ -60,7 +60,7 @@ from transformers import AutoTokenizer
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rewards import BertCosineReward, load_default_bert
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch, phase1_pretrained_step,
@@ -94,7 +94,7 @@ def _build_wave4_iter(args, tokenizer, device):
     """Wave 4: WildChat-1M turn-batched iterator (Verlog-style).
 
     Yields list[MultiTurnSession] of size B per next() call. Each
-    yielded "session" is a 2-turn wrapper around one TurnPair (a
+    yielded "session" is a 2-turn model around one TurnPair (a
     cumulative-prior + assistant-reference pair extracted from some
     real WildChat session at some assistant-turn index). Pairs within
     a batch have near-uniform prior length via sort-and-sample.
@@ -213,31 +213,31 @@ def main() -> None:
         device = torch.device("cpu")
     print(f"[setup] device: {device}")
 
-    # ---- wrapper from cold-start checkpoint ----
+    # ---- model from cold-start checkpoint ----
     # Accept BOTH checkpoint schemas:
-    # - train_pretrained_gw.py format: {"wrapper": state_dict,
+    # - train_pretrained_gw.py format: {"model": state_dict,
     #     "config": vars(args), "step": ..., "opt": ..., "sched": ...}
     # - train_grpo.py format (own previous checkpoints): {"model": state_dict,
     #     "config": PretrainedGWConfig, "args": vars(args), ...}
     print(f"[setup] resuming from {args.resume}")
     ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
 
-    # Resolve state_dict key (`wrapper` from phase-1 trainer, `model` from
+    # Resolve state_dict key (`model` from phase-1 trainer, `model` from
     # phase-2 trainer's own checkpoints).
-    if "wrapper" in ckpt:
-        state = ckpt["wrapper"]
+    if "model" in ckpt:
+        state = ckpt["model"]
     elif "model" in ckpt:
         state = ckpt["model"]
     else:
         raise KeyError(
-            f"checkpoint at {args.resume} has neither 'wrapper' nor 'model' "
+            f"checkpoint at {args.resume} has neither 'model' nor 'model' "
             f"key (got: {list(ckpt.keys())})"
         )
 
     # Resolve config. Phase-1 trainer saves vars(args) (a dict) under
     # 'config'; phase-2 trainer saves a PretrainedGWConfig under 'config'
     # and vars(args) under 'args'. We need a PretrainedGWConfig either
-    # way to build the wrapper.
+    # way to build the model.
     raw_cfg = ckpt.get("config")
     if isinstance(raw_cfg, PretrainedGWConfig):
         cfg = raw_cfg
@@ -258,11 +258,11 @@ def main() -> None:
         cfg = PretrainedGWConfig.llama_1b()
         ckpt_args = {}
 
-    wrapper = GraphWalkerPretrainedLM(cfg).to(device)
+    model = IntegratedLM(cfg).to(device)
     # strict=False to tolerate small architectural drift, but log
     # missing/unexpected keys so we don't silently load a wrong
     # checkpoint into a renamed schema.
-    missing, unexpected = wrapper.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         # Filter out tied / non-persistent buffers that legitimately
         # don't appear in saved state_dicts.
@@ -275,58 +275,58 @@ def main() -> None:
     if unexpected:
         print(f"[warn] checkpoint had {len(unexpected)} unexpected keys "
               f"(first 5: {unexpected[:5]})")
-    print(f"[setup] wrapper loaded; total params="
-          f"{sum(p.numel() for p in wrapper.parameters()) / 1e6:.1f}M; "
+    print(f"[setup] model loaded; total params="
+          f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M; "
           f"saved step={ckpt.get('step', '?')}")
 
     # ---- Phase-1 priming step ----
-    # Runtime state buffers (`_prev_snapshot_ids/feats/co_visit_flat`) are
-    # not in the model state_dict, so a fresh-loaded wrapper has them all
-    # set to None. The first GRPO step would then have `_active_delta_nm
+    # Runtime state buffers (`_neuromod_input_ids/feats/co_visit_flat`) are
+    # not in the model state_dict, so a fresh-loaded model has them all
+    # set to None. The first GRPO step would then have `_active_neuromod_delta
     # = None` and routing scores would have no gradient to neuromod
     # → `log_pi_mean.requires_grad = False` → backward fails.
     #
     # Fix: run ONE phase-1 step BEFORE applying the phase-2 freeze, with
-    # the full trainable surface. This populates `_prev_snapshot_*` so
+    # the full trainable surface. This populates `_neuromod_input_*` so
     # the first GRPO step's `_begin_plastic_window` rebuilds a non-None
-    # `_active_delta_nm` and routing carries gradient.
-    print("[setup] phase-1 priming pass (populates _prev_snapshot_*)")
+    # `_active_neuromod_delta` and routing carries gradient.
+    print("[setup] phase-1 priming pass (populates _neuromod_input_*)")
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()],
+        [p for _, p in model.trainable_parameters()],
         lr=1e-7,  # tiny — we don't want to actually update params
         fused=torch.cuda.is_available(),
     )
-    prime_vocab = wrapper.llama.config.vocab_size
+    prime_vocab = model.llama.config.vocab_size
     prime_in = torch.randint(
         0, prime_vocab, (1, args.T_pre), dtype=torch.long, device=device,
     )
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
     del prime_opt, prime_in
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    # Verify priming actually populated _prev_snapshot_* — without these,
+    # Verify priming actually populated _neuromod_input_* — without these,
     # the next GRPO step's _begin_plastic_window can't rebuild
-    # _active_delta_nm and routing has no grad. Fail loud at setup
+    # _active_neuromod_delta and routing has no grad. Fail loud at setup
     # rather than silently producing zero-signal training.
-    mem = wrapper.memory
-    if mem._prev_snapshot_ids is None or mem._prev_snapshot_feats is None:
+    mem = model.memory
+    if mem._neuromod_input_ids is None or mem._neuromod_input_feats is None:
         raise RuntimeError(
-            "phase-1 priming pass did not populate _prev_snapshot_*. "
+            "phase-1 priming pass did not populate _neuromod_input_*. "
             "Plasticity may have been suppressed by the loaded checkpoint "
             "config. Cannot start GRPO without a valid neuromod snapshot."
         )
     if (mem.cfg.plasticity_mode == "neuromod_only"
-            and mem._prev_snapshot_co_visit_flat is None):
+            and mem._neuromod_input_co_visit_flat is None):
         raise RuntimeError(
-            "neuromod_only mode requires _prev_snapshot_co_visit_flat; "
+            "neuromod_only mode requires _neuromod_input_co_visit_flat; "
             "priming did not produce it (plasticity didn't fire?)."
         )
-    print(f"[setup] priming done; _prev_snapshot_ids has "
-          f"{int(mem._prev_snapshot_ids.numel())} touched cols")
+    print(f"[setup] priming done; _neuromod_input_ids has "
+          f"{int(mem._neuromod_input_ids.numel())} touched cols")
 
     # ---- Phase-2 trainable surface ----
     # Default = same as Phase-1: all walker params + MemInjectLayer
@@ -344,15 +344,15 @@ def main() -> None:
     #   "minimum"            — only memory.neuromod.* (legacy "minimum
     #                          policy surface")
     if args.unfreeze_mode == "phase1":
-        # Already in this state from wrapper construction; the priming
+        # Already in this state from model construction; the priming
         # pass above was run with this surface. Nothing to do.
         pass
     elif args.unfreeze_mode == "minimum":
-        wrapper.freeze_all_but_E_bias_and_neuromod()
+        model.freeze_all_but_E_bias_and_neuromod()
     else:
         raise ValueError(f"unknown --unfreeze-mode: {args.unfreeze_mode}")
 
-    trainable = [p for _, p in wrapper.trainable_parameters()]
+    trainable = [p for _, p in model.trainable_parameters()]
     n_trainable = sum(p.numel() for p in trainable)
     print(f"[setup] phase-2 trainable surface ({args.unfreeze_mode}): "
           f"{n_trainable / 1e6:.2f}M params")
@@ -398,7 +398,7 @@ def main() -> None:
     print(f"[setup] starting training, max_steps={args.max_steps}, "
           f"K={args.grpo_K}, T_pre={args.T_pre}, gen_length={args.gen_length}")
 
-    wrapper.train(False)  # walker train mode is set by sample/replay internally
+    model.train(False)  # walker train mode is set by sample/replay internally
     t0 = time.perf_counter()
     for step in range(args.max_steps):
         # LR schedule
@@ -446,7 +446,7 @@ def main() -> None:
         # variable N turns) route through grpo_session_step.
         if args.data in ("wildchat-grpo", "passphrase-chat-grpo"):
             sstats = grpo_session_step(
-                wrapper, opt,
+                model, opt,
                 sessions=sessions_batch,
                 reward_fn=reward_fn,
                 num_rollouts=args.grpo_K,
@@ -501,7 +501,7 @@ def main() -> None:
             ckpt_path = work_dir / f"ckpt_step{step + 1}.pt"
             torch.save({
                 "step": step + 1,
-                "model": wrapper.state_dict(),
+                "model": model.state_dict(),
                 "opt": opt.state_dict(),
                 "config": cfg,
                 "args": vars(args),
@@ -512,7 +512,7 @@ def main() -> None:
     final_path = work_dir / "ckpt_final.pt"
     torch.save({
         "step": args.max_steps,
-        "model": wrapper.state_dict(),
+        "model": model.state_dict(),
         "opt": opt.state_dict(),
         "config": cfg,
         "args": vars(args),

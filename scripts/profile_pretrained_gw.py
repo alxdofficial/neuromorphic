@@ -34,7 +34,7 @@ from transformers import AutoModelForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch,
     phase1_pretrained_step,
@@ -197,23 +197,23 @@ def main():
         T=T, bs=BS,
         llama_dtype="bf16",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg).cuda()
+    model = IntegratedLM(cfg).cuda()
     if args.compile:
-        wrapper.memory.compile_step()
-    wrapper.train(False)
+        model.memory.compile_step()
+    model.train(False)
     def gw_fwd():
-        wrapper.reset_memory(bs=BS)
+        model.begin_segment(bs=BS)
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            return wrapper(input_ids).logits
+            return model(input_ids).logits
 
-    wrapper.train(True)
+    model.train(True)
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
         fused=True,
     )
     batch = Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
     def gw_step():
-        return phase1_pretrained_step(wrapper, opt, batch, amp_dtype=torch.bfloat16)
+        return phase1_pretrained_step(model, opt, batch, amp_dtype=torch.bfloat16)
 
     print("[C] Profiling Llama + walker...")
     results["C_fwd"] = _profile("C_llama_walker_fwd", gw_fwd, args.iter, out_dir)

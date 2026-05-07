@@ -210,8 +210,8 @@ class StatsCollector:
 
         # ---- neuromod ----
         if m is not None and m.neuromod is not None:
-            if m._active_delta_nm is not None:
-                row["neuromod.delta_nm_norm"] = _norm(m._active_delta_nm)
+            if m._active_neuromod_delta is not None:
+                row["neuromod.delta_nm_norm"] = _norm(m._active_neuromod_delta)
             row["neuromod.gamma"] = float(
                 torch.sigmoid(m.neuromod.blend_logit.detach()).item()
             )
@@ -268,7 +268,7 @@ class StatsCollector:
 
         # ---- walker plasticity health (cheap sanity flags) ----
         # These catch silent dead-walker / dead-neuromod situations:
-        # - has_active_delta_nm=False means routing this step had no
+        # - has_active_neuromod_delta=False means routing this step had no
         #   neuromod gradient signal (only plain E_bias_flat used).
         # - window_len reaching 0 between steps = plasticity fired
         #   correctly. Stuck nonzero across calls = plasticity didn't
@@ -277,10 +277,10 @@ class StatsCollector:
         #   no input to condition on next step.
         if m is not None:
             row["walker.window_len"] = int(getattr(m, "window_len", 0))
-            row["walker.has_active_delta_nm"] = bool(
-                getattr(m, "_active_delta_nm", None) is not None
+            row["walker.has_active_neuromod_delta"] = bool(
+                getattr(m, "_active_neuromod_delta", None) is not None
             )
-            snap_ids = getattr(m, "_prev_snapshot_ids", None)
+            snap_ids = getattr(m, "_neuromod_input_ids", None)
             row["walker.snapshot_size"] = int(snap_ids.numel()) if snap_ids is not None else 0
             row["walker.phase"] = str(getattr(m, "phase", "phase1"))
 
@@ -506,17 +506,17 @@ def plot_dashboard(stats_path: str | Path, out_dir: str | Path) -> list[Path]:
     written.append(_save(fig, "09_vram_throughput.png"))
 
     # 10. Walker plasticity health (sanity flags)
-    # If `has_active_delta_nm` drops to False (and stays there), neuromod
+    # If `has_active_neuromod_delta` drops to False (and stays there), neuromod
     # has no gradient signal → stuck. If `snapshot_size` is 0, no touched
     # cols recorded → neuromod has no input to condition on.
     fig, axes = plt.subplots(2, 2, figsize=(10, 6))
     axes[0, 0].plot(steps, _series("walker.window_len"), lw=1)
     axes[0, 0].set_title("walker.window_len  (resets on plasticity fire)")
     axes[0, 0].grid(alpha=0.3)
-    has_delta = [1.0 if r.get("walker.has_active_delta_nm", False) else 0.0
+    has_delta = [1.0 if r.get("walker.has_active_neuromod_delta", False) else 0.0
                   for r in rows]
     axes[0, 1].plot(steps, has_delta, lw=1, drawstyle="steps-post")
-    axes[0, 1].set_title("has_active_delta_nm  (1=neuromod live, 0=stuck)")
+    axes[0, 1].set_title("has_active_neuromod_delta  (1=neuromod live, 0=stuck)")
     axes[0, 1].set_ylim(-0.1, 1.1)
     axes[0, 1].grid(alpha=0.3)
     axes[1, 0].plot(steps, _series("walker.snapshot_size"), lw=1)

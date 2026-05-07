@@ -240,16 +240,16 @@ def test_neuromod_delta_snapshot_roundtrip():
     opt = torch.optim.AdamW(lm.parameters(), lr=1e-4)
 
     # First phase1 step: begin_segment runs, no prior snapshot yet, so
-    # _active_delta_nm starts None. Plasticity fires twice (segment_T=8,
+    # _active_neuromod_delta starts None. Plasticity fires twice (segment_T=8,
     # mod_period=4 → 2 windows) and the snapshot+new-delta cycle runs.
     phase1_step(
         lm, opt, tokens, tbptt_block=cfg.mod_period,
         amp_dtype=None, training_step=0,
     )
 
-    # After firing: snapshot was taken, new _active_delta_nm was produced.
-    assert lm.memory._prev_snapshot_ids is not None
-    assert lm.memory._active_delta_nm is not None
-    assert lm.memory._active_delta_nm.abs().sum() > 0, (
+    # After firing: snapshot was taken, new _active_neuromod_delta was produced.
+    assert lm.memory._neuromod_input_ids is not None
+    assert lm.memory._active_neuromod_delta is not None
+    assert lm.memory._active_neuromod_delta.abs().sum() > 0, (
         "post-fire delta_nm is identically zero — the neuromod didn't contribute"
     )

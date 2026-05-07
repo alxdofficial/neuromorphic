@@ -16,7 +16,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rollout import autoregressive_rollout
 from src.graph_walker.pretrained.train_phase2 import grpo_step
 
@@ -56,7 +56,7 @@ def _make_tiny_wrapper(d_lm=32, vocab=256, T=8):
         model_name="random", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=T, bs=2, llama_dtype="fp32",
     )
-    return GraphWalkerPretrainedLM(cfg, hf_model=hf)
+    return IntegratedLM(cfg, hf_model=hf)
 
 
 def _perturb_walker_weights(w):
@@ -121,8 +121,8 @@ def test_grpo_step_runs_and_grad_reaches_neuromod():
     opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
 
     # Seed neuromod carryover by running one phase-1 step. Without this,
-    # `_prev_snapshot_*` is None and `_begin_plastic_window` produces a
-    # None `_active_delta_nm` — routing falls back to E_bias_flat alone
+    # `_neuromod_input_*` is None and `_begin_plastic_window` produces a
+    # None `_active_neuromod_delta` — routing falls back to E_bias_flat alone
     # and neuromod params receive no gradient. Real training never hits
     # this state because GRPO follows phase-1 in the cycle loop.
     from src.graph_walker.pretrained.train_phase1 import (
@@ -170,11 +170,11 @@ def test_phase2_log_pi_resets_at_begin_segment():
     w = _make_tiny_wrapper()
     w.memory.phase = "phase2"
     w.train()
-    w.reset_memory(bs=2)
+    w.begin_segment(bs=2)
     h = torch.randn(2, w.config.d_mem)
     w.memory.step_core_from_h(h)
     assert w.memory._log_pi_sum is not None
     assert w.memory._log_pi_sum.shape == (2,)
     # New segment wipes the accumulator.
-    w.reset_memory(bs=2)
+    w.begin_segment(bs=2)
     assert w.memory._log_pi_sum is None

@@ -112,7 +112,7 @@ def bench_memory(bs: int, T: int) -> tuple[float, float]:
         H = torch.randn(bs, T, 2048, device=device, dtype=torch.bfloat16)
         mem.initialize_states(bs, device)
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _ = mem.forward_segment(H, ids, toy, use_rmsnorm=True,
+            _ = mem.walk_segment(H, ids, toy, use_rmsnorm=True,
                                      rms_eps=1e-5, phase="phase1")
         torch.cuda.synchronize()
 

@@ -3,7 +3,7 @@ integration uses, so we can isolate "walker is slow" from "Llama+walker
 is slow because of Llama".
 
 Mirrors `_walker_cfg_for(d_mem=512, T=256)` from
-`scripts/bench_pretrained_gw.py`. Runs `forward_segment` over a synthetic
+`scripts/bench_pretrained_gw.py`. Runs `walk_segment` over a synthetic
 h_mem (shape [B, T, D_s]) and backwards a scalar loss, with optional
 `compile_block_from_h` for inductor whole-block fusion (the same compile
 the integration's `--compile-block` uses).
@@ -88,7 +88,7 @@ def bench_one(B: int, T: int, *, compile_block: bool, use_neuromod: bool,
         m.begin_segment(B, device)
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            readouts = m.forward_segment(h_mem, preserve_graph=False)
+            readouts = m.walk_segment(h_mem, preserve_graph=False)
             # Standalone bench has no Llama upstream, so we use a
             # sum-of-readouts proxy for the downstream gradient that Llama
             # would otherwise inject through W_out in the real path.

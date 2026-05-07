@@ -2,7 +2,7 @@
 
 Training flow per chunk:
   1. Lower scan → H_mid
-  2. Memory graph: forward_segment(H_mid, input_ids, lm) → readouts, mem_pred_loss
+  2. Memory graph: walk_segment(H_mid, input_ids, lm) → readouts, mem_pred_loss
      (memory head = lm_head(readout), weight-tied; trains memory to carry
      information useful for predicting tokens; its per-token CE is also the
      live surprise signal fed to the modulator.)
@@ -78,7 +78,7 @@ class Model(nn.Module):
         #    useful for predicting tokens, and its per-token value is the
         #    live surprise signal the modulator uses.
         if use_memory:
-            readouts, mem_pred_loss = self.memory.forward_segment(
+            readouts, mem_pred_loss = self.memory.walk_segment(
                 H_mid.detach(), input_ids, self.lm, prev_token=prev_token)
             H_enriched = H_mid + self.lm.mem_scale * readouts.to(H_mid.dtype)
             aux_loss = self.config.mem_pred_weight * mem_pred_loss

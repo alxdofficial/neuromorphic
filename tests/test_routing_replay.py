@@ -142,7 +142,7 @@ def test_grpo_deepseek_style_full_flow():
     from transformers import LlamaConfig, LlamaForCausalLM
     from src.graph_walker.config import GraphWalkerConfig
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rollout import (
         sample_grpo_rollout, replay_grpo_rollout,
     )
@@ -170,8 +170,8 @@ def test_grpo_deepseek_style_full_flow():
     cfg.d_lm = d_lm
     cfg.n_lm_layers = 4
     cfg.vocab_size_lm = vocab
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     K = 4
     T_pre = 8
@@ -179,7 +179,7 @@ def test_grpo_deepseek_style_full_flow():
     prefix = torch.randint(0, vocab, (K, T_pre))
 
     # Phase-1 priming step BEFORE freezing — populates neuromod's
-    # `_prev_snapshot_*` so the next phase-2 segment's `_active_delta_nm`
+    # `_neuromod_input_*` so the next phase-2 segment's `_active_neuromod_delta`
     # is non-None and routing carries gradient. With everything frozen
     # except neuromod (the production phase-2 surface), priming would
     # have no params to update on the LM-CE loss.
@@ -187,21 +187,21 @@ def test_grpo_deepseek_style_full_flow():
         Phase1Batch, phase1_pretrained_step,
     )
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prefix[:1], target_ids=prefix[:1]),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
     # Now apply phase-2's minimum policy surface.
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
 
     # ---- Sample phase ----
     sampled = sample_grpo_rollout(
-        wrapper, prefix,
+        model, prefix,
         gen_length=L_gen, temperature=1.0, top_p=1.0,
     )
     assert sampled.generated.shape == (K, T_pre + L_gen)
@@ -215,7 +215,7 @@ def test_grpo_deepseek_style_full_flow():
     )
 
     # ---- Replay phase ----
-    replay = replay_grpo_rollout(wrapper, sampled)
+    replay = replay_grpo_rollout(model, sampled)
     log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
@@ -229,12 +229,12 @@ def test_grpo_deepseek_style_full_flow():
     loss = -(log_pi * advantages.detach()).mean()
 
     # Zero grads first so we measure only the new gradient
-    for _, p in wrapper.trainable_parameters():
+    for _, p in model.trainable_parameters():
         p.grad = None
     loss.backward()
 
     nm_grad_norms = []
-    for name, p in wrapper.named_parameters():
+    for name, p in model.named_parameters():
         if name.startswith("memory.neuromod.") and p.grad is not None:
             nm_grad_norms.append(p.grad.norm().item())
     assert len(nm_grad_norms) > 0, "no neuromod params received gradient"
@@ -245,13 +245,13 @@ def test_grpo_deepseek_style_full_flow():
 
 def test_replay_stash_consumed_after_autocast_recursion():
     """Regression: `_next_replay_trace` must be consumed AFTER the
-    autocast-recursion guard in `forward_segment`. Otherwise the
+    autocast-recursion guard in `walk_segment`. Otherwise the
     outer call would clear the stash before recursing, and the
     inner (real) call would find it None and silently skip replay.
 
     This bug manifested only on CUDA without an external autocast
     region; CPU tests would not catch it. We exercise the code path
-    by mocking `_forward_segment_with_autocast` to assert the stash
+    by mocking `_walk_segment_with_autocast` to assert the stash
     is still present when the recursion fires.
     """
     from src.graph_walker.graph_walker import GraphWalkerMemory
@@ -273,10 +273,10 @@ def test_replay_stash_consumed_after_autocast_recursion():
     trace = walker.consume_routing_trace()
 
     # Simulate the CUDA-no-autocast recursion path by patching
-    # `_forward_segment_with_autocast` to assert the stash is still
+    # `_walk_segment_with_autocast` to assert the stash is still
     # populated when called.
     saw_stash = []
-    real_recursive = walker._forward_segment_with_autocast
+    real_recursive = walker._walk_segment_with_autocast
 
     def patched_recurse(h_mem_arg, *, preserve_graph):
         # Should still see the stash here — outer call must NOT have
@@ -284,7 +284,7 @@ def test_replay_stash_consumed_after_autocast_recursion():
         saw_stash.append(walker._next_replay_trace is not None)
         return real_recursive(h_mem_arg, preserve_graph=preserve_graph)
 
-    walker._forward_segment_with_autocast = patched_recurse
+    walker._walk_segment_with_autocast = patched_recurse
     try:
         # Prime the stash, then force the recursion path by faking
         # CUDA + no-autocast. We can't actually fake CUDA on a CPU-only
@@ -294,36 +294,36 @@ def test_replay_stash_consumed_after_autocast_recursion():
         # path; this test pins the source-order invariant.
         pass
     finally:
-        walker._forward_segment_with_autocast = real_recursive
+        walker._walk_segment_with_autocast = real_recursive
 
-    # Source-order check: read forward_segment's body and assert the
+    # Source-order check: read walk_segment's body and assert the
     # autocast-recursion `if` block precedes the `replay_trace = ...`
     # consume line. If a future refactor moves them, this test catches
     # the regression.
     import inspect
-    src = inspect.getsource(walker.forward_segment)
-    autocast_pos = src.find("_forward_segment_with_autocast")
+    src = inspect.getsource(walker.walk_segment)
+    autocast_pos = src.find("_walk_segment_with_autocast")
     consume_pos = src.find("replay_trace = self._next_replay_trace")
-    assert autocast_pos > 0, "autocast guard not found in forward_segment"
-    assert consume_pos > 0, "replay-trace consume not found in forward_segment"
+    assert autocast_pos > 0, "autocast guard not found in walk_segment"
+    assert consume_pos > 0, "replay-trace consume not found in walk_segment"
     assert autocast_pos < consume_pos, (
         "replay_trace consume must come AFTER the autocast-recursion "
-        "guard in forward_segment — otherwise CUDA-no-autocast callers "
+        "guard in walk_segment — otherwise CUDA-no-autocast callers "
         "lose the stash on outer call before recursion"
     )
 
 
 def test_grpo_replay_spans_multiple_tbptt_blocks():
     """Regression for HIGH #1: replay over a trajectory longer than
-    `tbptt_block` must not silently corrupt `_active_delta_nm`.
+    `tbptt_block` must not silently corrupt `_active_neuromod_delta`.
 
     Old bug: `_freeze_plasticity_ctx` mutated `cfg.mod_period = 10**9`,
-    and `forward_segment` called `detach_state()` at TBPTT boundaries,
-    which rebuilt `_active_delta_nm` via `_begin_plastic_window` reading
+    and `walk_segment` called `detach_state()` at TBPTT boundaries,
+    which rebuilt `_active_neuromod_delta` via `_begin_plastic_window` reading
     the fake mod_period for co-visit normalization. Replay log-π after
     the first block were gradients for a different policy.
 
-    Fix: replay holds `wrapper.preserve_memory_graph()` so detach_state
+    Fix: replay holds `model.preserve_autograd_graph()` so detach_state
     never fires; `_freeze_plasticity_ctx` is dropped (vestigial under
     external-surprise design).
 
@@ -335,7 +335,7 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
     from transformers import LlamaConfig, LlamaForCausalLM
     from src.graph_walker.config import GraphWalkerConfig
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.rollout import (
         sample_grpo_rollout, replay_grpo_rollout,
     )
@@ -378,8 +378,8 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
         T=4, bs=1,
         llama_dtype="fp32",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
-    wrapper.train(True)
+    model = IntegratedLM(cfg, hf_model=llama)
+    model.train(True)
 
     K = 4
     T_pre = 8
@@ -388,28 +388,28 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
 
     # Phase-1 priming
     prime_opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
     )
     # Need T == segment_T == tbptt_block for phase1 step. Use 4 tokens.
     prime_in = prefix[:1, :4]
     phase1_pretrained_step(
-        wrapper, prime_opt,
+        model, prime_opt,
         Phase1Batch(input_ids=prime_in, target_ids=prime_in),
         amp_dtype=torch.float32,
     )
     del prime_opt
 
-    wrapper.freeze_all_but_E_bias_and_neuromod()
+    model.freeze_all_but_E_bias_and_neuromod()
 
     # Sample — multi-block trajectory must not crash
     sampled = sample_grpo_rollout(
-        wrapper, prefix, gen_length=L_gen, temperature=1.0, top_p=1.0,
+        model, prefix, gen_length=L_gen, temperature=1.0, top_p=1.0,
     )
     expected_trace_len = T_pre + L_gen - 1
     assert len(sampled.routing_trace) == expected_trace_len
 
     # Replay — must not corrupt active_delta_nm at block boundaries
-    replay = replay_grpo_rollout(wrapper, sampled)
+    replay = replay_grpo_rollout(model, sampled)
     log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
@@ -423,13 +423,13 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
     rewards = torch.linspace(-1.0, 1.0, K)
     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
     loss = -(log_pi * advantages.detach()).mean()
-    for _, p in wrapper.trainable_parameters():
+    for _, p in model.trainable_parameters():
         p.grad = None
     loss.backward()
 
     nm_grad_norms = [
         p.grad.norm().item()
-        for name, p in wrapper.named_parameters()
+        for name, p in model.named_parameters()
         if name.startswith("memory.neuromod.") and p.grad is not None
     ]
     assert any(g > 0 for g in nm_grad_norms), (

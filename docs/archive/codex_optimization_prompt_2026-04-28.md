@@ -123,7 +123,7 @@ training to ≥3.7k tok/s.
 ## Files to look at
 
 - `src/graph_walker/graph_walker.py` (1700+ lines) — main module.
-  - `forward_segment` (line ~1010) — top-level pretrained-LM entry point.
+  - `walk_segment` (line ~1010) — top-level pretrained-LM entry point.
   - `step_core_from_h` (~957) — single-step pretrained walker call.
   - `_step_core_pure` (~1175) — pure-functional one-token compute.
   - `_apply_step_state` (~870) — applies pure-step output to self.
@@ -132,7 +132,7 @@ training to ≥3.7k tok/s.
     for block-level gradient checkpointing).
 - `src/graph_walker/triton_sparse_update.py` — the fused LIF kernel.
 - `src/graph_walker/routing.py` — Gumbel-STE and phase-2 hard Categorical.
-- `src/graph_walker/pretrained/llm_wrapper.py` — `GraphWalkerPretrainedLM`.
+- `src/graph_walker/pretrained/integrated_lm.py` — `IntegratedLM`.
 - `src/graph_walker/pretrained/train_phase1.py` — training step.
 - `src/pretrained/mem_inject_layer.py` — the W_in/W_out/scale wrapper.
 - `scripts/profile_pretrained_gw.py` — the profiler that produced the

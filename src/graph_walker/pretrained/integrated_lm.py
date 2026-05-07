@@ -1,4 +1,4 @@
-"""GraphWalkerPretrainedLM — wraps a frozen HF causal LM with a graph_walker
+"""IntegratedLM — wraps a frozen HF causal LM with a graph_walker
 memory side-channel at a chosen decoder layer.
 
 Structural layout (unchanged from v2 — the scaffolding is memory-agnostic):
@@ -20,15 +20,15 @@ Structural layout (unchanged from v2 — the scaffolding is memory-agnostic):
     norm → lm_head → logits
 
 Public API:
-    wrapper = GraphWalkerPretrainedLM(config)
-    wrapper.reset_memory(bs)
-    out = wrapper(input_ids)              # returns HF ModelOutput; `.logits`
-    wrapper.detach_memory()
-    wrapper.trainable_parameters()        # yields (name, param) for requires_grad params
+    model = IntegratedLM(config)
+    model.begin_segment(bs)
+    out = model(input_ids)              # returns HF ModelOutput; `.logits`
+    model.detach_memory()
+    model.trainable_parameters()        # yields (name, param) for requires_grad params
 
 The walker is vocab-agnostic: it has no LM head, no aux loss, no surprise
 of its own. The trainer drives plasticity externally — after `loss.backward()`,
-compute Llama's per-token CE and call ``wrapper.memory.update_plasticity(per_token_ce)``.
+compute Llama's per-token CE and call ``model.memory.update_plasticity(per_token_ce)``.
 See `src/graph_walker/pretrained/train_phase1.py` for the canonical pattern.
 """
 
@@ -45,14 +45,14 @@ from src.pretrained.hosts.base import HostAdapter
 from src.pretrained.mem_inject_layer import MemInjectLayer
 
 
-class GraphWalkerPretrainedLM(nn.Module):
+class IntegratedLM(nn.Module):
     def __init__(
         self,
         config: PretrainedGWConfig,
         attach_memory: bool = True,
         hf_model: nn.Module | None = None,
     ):
-        """Construct a wrapper.
+        """Construct a model.
 
         `hf_model` lets callers pass a pre-instantiated HF CausalLM — useful
         for tests that want to avoid the HF Hub download (e.g. build a
@@ -65,21 +65,21 @@ class GraphWalkerPretrainedLM(nn.Module):
 
         # Phase indicator. "phase1" = Gumbel-soft STE in routing; "phase2" =
         # hard Categorical + log_pi accumulation (flip before grpo_step).
-        # The wrapper-level setting is propagated to `self.memory.phase`
+        # The model-level setting is propagated to `self.memory.phase`
         # at the start of every `forward()` call (which is what routing
-        # actually reads), so wrapper.current_phase is the canonical
+        # actually reads), so model.current_phase is the canonical
         # control surface — callers should never set memory.phase
-        # directly when going through the wrapper.
+        # directly when going through the model.
         self.current_phase: str = "phase1"
-        # When True, `forward_segment` keeps memory state graph-connected
+        # When True, `walk_segment` keeps memory state graph-connected
         # across forwards (no intra-segment detach, no end-of-forward
-        # detach). Set by `preserve_memory_graph()` for AR unroll.
-        self._preserve_memory_graph: bool = False
+        # detach). Set by `preserve_autograd_graph()` for AR unroll.
+        self._preserve_autograd_graph: bool = False
 
         # validate() catches direct PretrainedGWConfig(...) construction
         # where d_mem and memory.D_s drift apart (default d_mem=512 but
         # default GraphWalkerConfig.D_s=256 would crash later in
-        # forward_segment). Factories already produce matching configs;
+        # walk_segment). Factories already produce matching configs;
         # this guards the "user instantiated by hand" path.
         config.validate()
 
@@ -214,7 +214,7 @@ class GraphWalkerPretrainedLM(nn.Module):
     # State management (per-segment reset + TBPTT detach)
     # ------------------------------------------------------------------
 
-    def reset_memory(
+    def begin_segment(
         self, bs: int, *, clear_neuromod_carryover: bool = False,
     ) -> None:
         """Re-init walker working state for a new batch of `bs` segments.
@@ -222,9 +222,9 @@ class GraphWalkerPretrainedLM(nn.Module):
 
         `clear_neuromod_carryover` defaults to **False** under the external-
         surprise design: plasticity fires once per training step (post-
-        backward), which means the only way ``_active_delta_nm`` is non-
+        backward), which means the only way ``_active_neuromod_delta`` is non-
         None during the next segment's forward is to keep the previous
-        step's `_prev_snapshot_*`. Clearing the snapshot starves neuromod
+        step's `_neuromod_input_*`. Clearing the snapshot starves neuromod
         of gradient — its parameters get no signal because routing reads
         a None delta and falls back to E_bias_flat only.
 
@@ -249,7 +249,7 @@ class GraphWalkerPretrainedLM(nn.Module):
     ) -> None:
         """Compile the walker's whole-block forward path.
 
-        ``forward_segment`` then routes each ``tbptt_block``-token window
+        ``walk_segment`` then routes each ``tbptt_block``-token window
         through one compiled call instead of T_block per-token
         ``step_core_from_h`` calls. Inductor fuses across step boundaries,
         replacing the per-token launch overhead that bottlenecked the
@@ -267,20 +267,20 @@ class GraphWalkerPretrainedLM(nn.Module):
     # AR-unroll support
     # ------------------------------------------------------------------
 
-    class _PreserveGraphCtx:
-        def __init__(self, wrapper: "GraphWalkerPretrainedLM"):
-            self.wrapper = wrapper
+    class _PreserveAutogradGraphCtx:
+        def __init__(self, model: "IntegratedLM"):
+            self.model = model
         def __enter__(self):
-            self.wrapper._preserve_memory_graph = True
-            return self.wrapper
+            self.model._preserve_autograd_graph = True
+            return self.model
         def __exit__(self, *args):
-            self.wrapper._preserve_memory_graph = False
+            self.model._preserve_autograd_graph = False
 
-    def preserve_memory_graph(self) -> "GraphWalkerPretrainedLM._PreserveGraphCtx":
+    def preserve_autograd_graph(self) -> "IntegratedLM._PreserveAutogradGraphCtx":
         """Context manager: memory state stays graph-connected across calls
         made inside. Caller is responsible for calling `detach_memory()`
         after backward completes."""
-        return GraphWalkerPretrainedLM._PreserveGraphCtx(self)
+        return IntegratedLM._PreserveAutogradGraphCtx(self)
 
     # ------------------------------------------------------------------
     # Per-batch state snapshot / restore (multi-turn GRPO support)
@@ -303,9 +303,9 @@ class GraphWalkerPretrainedLM(nn.Module):
 
         What's NOT saved (keeps evolving across the whole session):
         - `E_bias_flat` (long-term plastic state)
-        - `_prev_snapshot_*` (neuromod cross-window snapshots)
-        - `_active_delta_nm` (current window's neuromod delta — this
-          IS captured indirectly via _prev_snapshot's lifecycle, but
+        - `_neuromod_input_*` (neuromod cross-window snapshots)
+        - `_active_neuromod_delta` (current window's neuromod delta — this
+          IS captured indirectly via _neuromod_input's lifecycle, but
           would need an explicit save if cross-rollout consistency is
           ever needed)
 
@@ -343,7 +343,7 @@ class GraphWalkerPretrainedLM(nn.Module):
         snapshot's tensors (so a subsequent forward doesn't mutate the
         snapshot itself).
 
-        Long-term plastic state (E_bias_flat, _prev_snapshot_*) is NOT
+        Long-term plastic state (E_bias_flat, _neuromod_input_*) is NOT
         touched — it keeps evolving on its own update cadence.
         """
         if state is None or self.memory is None:
@@ -387,10 +387,10 @@ class GraphWalkerPretrainedLM(nn.Module):
         if self.memory is None:
             return self.llama(input_ids=input_ids, **kwargs)
 
-        # Propagate the wrapper-level phase indicator into the memory module
+        # Propagate the model-level phase indicator into the memory module
         # — routing inside `_step_core_pure` reads `memory.phase` only, so
-        # without this propagation `wrapper.current_phase` would be dead
-        # state and a caller setting `wrapper.current_phase = "phase2"`
+        # without this propagation `model.current_phase` would be dead
+        # state and a caller setting `model.current_phase = "phase2"`
         # would silently still get phase-1 Gumbel-STE routing.
         self.memory.phase = self.current_phase
 
@@ -398,8 +398,8 @@ class GraphWalkerPretrainedLM(nn.Module):
         # The walker turns h_mem into per-token readouts; W_out then projects
         # readouts back to LM hidden-state space and adds them as a residual.
         def memory_fn(h_mem: torch.Tensor) -> torch.Tensor:
-            return self.memory.forward_segment(
-                h_mem, preserve_graph=self._preserve_memory_graph,
+            return self.memory.walk_segment(
+                h_mem, preserve_graph=self._preserve_autograd_graph,
             )
 
         self.mem_inject.set_memory_fn(memory_fn)
@@ -468,7 +468,7 @@ class GraphWalkerPretrainedLM(nn.Module):
                 )
                 p.requires_grad = is_mem_inject
         # Re-freeze walker params that are standalone-only and never see
-        # gradient through `forward_segment` — without this, every cycle's
+        # gradient through `walk_segment` — without this, every cycle's
         # `unfreeze_all()` puts dead weights back into the optimizer.
         # MUST mirror the freeze list applied at __init__ (lines 147-161).
         # Earlier this only re-froze 2 of 6 dead params, so cycle-phase-1

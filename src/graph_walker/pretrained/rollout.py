@@ -5,9 +5,9 @@ desired generation length, returns generated token ids `[BS, T_pre + L]`
 and (optionally) the per-step logits.
 
 Memory semantics during rollout:
-- Plasticity does NOT fire inside `forward_segment` — the walker is
+- Plasticity does NOT fire inside `walk_segment` — the walker is
   vocab-agnostic and surprise is supplied by the trainer post-backward
-  via `wrapper.memory.update_plasticity(per_token_ce)`.
+  via `model.memory.update_plasticity(per_token_ce)`.
 - The walker's plasticity behavior is INDEPENDENT of training phase.
   It always fires once per training step at mod_period boundaries.
   What varies between phases is the SURPRISE TARGET:
@@ -36,7 +36,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.routing import StepRoutingChoices
 
 
@@ -163,7 +163,7 @@ def _sample_next_token(
 
 
 def sample_grpo_rollout(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     prefix_ids: torch.Tensor,        # [BS, T_pre] where BS = B * K post-BS_outer
     *,
     gen_length: int,
@@ -198,11 +198,11 @@ def sample_grpo_rollout(
     `update_plasticity` (called externally post-backward); forward-only
     paths never trigger plasticity. The old freeze-by-mutating-mod_period
     was a relic from an earlier design and silently corrupts the
-    `_active_delta_nm` rebuild that runs at TBPTT block boundaries (the
+    `_active_neuromod_delta` rebuild that runs at TBPTT block boundaries (the
     rebuild reads `cfg.mod_period` for co-visit normalization).
 
-    Routing during sample is gated on `wrapper.memory.training` only —
-    NOT `wrapper.training` — so the host LM stays in eval mode (host
+    Routing during sample is gated on `model.memory.training` only —
+    NOT `model.training` — so the host LM stays in eval mode (host
     dropout disabled, batchnorm running stats untouched). This keeps the
     LM's hidden-state stream identical between sample and replay.
 
@@ -221,9 +221,9 @@ def sample_grpo_rollout(
     decouple walker's effective context (full prefix) from the LM's
     (last ``lm_context_window`` tokens):
       1. Phase 1 — forward ``prefix_ids[:, :T_pre - lm_context_window]``
-         through wrapper with ``use_cache=False``. Walker advances state
+         through model with ``use_cache=False``. Walker advances state
          through the early portion. LM forwards too (necessary because
-         walker.forward_segment requires LM hidden states), but its
+         walker.walk_segment requires LM hidden states), but its
          outputs / KV cache are discarded.
       2. Phase 2 — forward the last ``lm_context_window`` prefix tokens
          with ``use_cache=True``. Walker continues from its phase-1 state
@@ -240,24 +240,24 @@ def sample_grpo_rollout(
     If ``lm_context_window`` is None or >= T_pre, single-phase forward
     is used (legacy behavior).
     """
-    assert wrapper.memory is not None, "rollout requires attached memory"
-    device = next(wrapper.parameters()).device
+    assert model.memory is not None, "rollout requires attached memory"
+    device = next(model.parameters()).device
     prefix_ids = prefix_ids.to(device)
     K, T_pre = prefix_ids.shape
 
-    saved_phase = wrapper.current_phase
-    saved_walker_training = wrapper.memory.training
-    wrapper.current_phase = "phase2"
+    saved_phase = model.current_phase
+    saved_walker_training = model.memory.training
+    model.current_phase = "phase2"
     try:
-        wrapper.reset_memory(bs=K)
-        wrapper.memory.start_capturing_routes()
+        model.begin_segment(bs=K)
+        model.memory.start_capturing_routes()
 
         # Toggle ONLY the walker's training mode for phase-2 routing's
         # hard-Categorical sampling. `gumbel_top1_softmax(phase=phase2)`
         # gates on `training=True` from `_step_core_pure`'s `is_training
         # = self.training` read (where `self` is the walker). The host
         # LM stays in whatever mode the caller had it in.
-        wrapper.memory.train(True)
+        model.memory.train(True)
 
         # Per-rollout done flags + first-EOS-step. After a rollout
         # emits eos_id, its subsequent tokens are forced to eos_id (so
@@ -280,11 +280,11 @@ def sample_grpo_rollout(
                 recent_ids = prefix_ids[:, early_len:]
                 # Phase 1: walker advances through early prefix; LM cache
                 # discarded (use_cache=False).
-                wrapper(early_ids, use_cache=False)
+                model(early_ids, use_cache=False)
                 # Phase 2: LM caches recent prefix; walker continues.
-                out = wrapper(recent_ids, use_cache=True)
+                out = model(recent_ids, use_cache=True)
             else:
-                out = wrapper(prefix_ids, use_cache=True)
+                out = model(prefix_ids, use_cache=True)
             past_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
 
@@ -326,7 +326,7 @@ def sample_grpo_rollout(
                 # for the replay step's per-step alignment, so we MUST
                 # keep forwarding. (No early-break on all-done; eat the
                 # cost. K is small, gen_length is bounded.)
-                out = wrapper(
+                out = model(
                     tok.unsqueeze(-1),
                     past_key_values=past_kv,
                     use_cache=True,
@@ -340,7 +340,7 @@ def sample_grpo_rollout(
         )
         generated = torch.cat([prefix_ids, new_tokens_t], dim=1)
 
-        trace = wrapper.memory.consume_routing_trace()
+        trace = model.memory.consume_routing_trace()
         if trace is None:
             raise RuntimeError(
                 "sample_grpo_rollout produced no routing trace — "
@@ -364,18 +364,18 @@ def sample_grpo_rollout(
             eos_step=eos_step if eos_id is not None else None,
         )
     finally:
-        wrapper.current_phase = saved_phase
-        wrapper.memory.train(saved_walker_training)
-        if wrapper.memory is not None:
-            wrapper.memory.phase = saved_phase
+        model.current_phase = saved_phase
+        model.memory.train(saved_walker_training)
+        if model.memory is not None:
+            model.memory.phase = saved_phase
             # Defensive: ensure the capture buffer is cleared even if an
             # exception bypassed `consume_routing_trace`.
-            if wrapper.memory._captured_routes is not None:
-                wrapper.memory._captured_routes = None
+            if model.memory._captured_routes is not None:
+                model.memory._captured_routes = None
 
 
 def replay_grpo_rollout(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     sampled: GRPOSampledRollout,
     *,
     lm_context_window: int | None = None,
@@ -383,7 +383,7 @@ def replay_grpo_rollout(
     """DeepSeek-style replay phase: teacher-forced re-forward with grad.
 
     Concatenates prefix + sampled-tokens-EXCEPT-LAST → [K, T_pre + L_gen - 1]
-    and runs one parallel forward through the wrapper. The walker uses
+    and runs one parallel forward through the model. The walker uses
     the saved routing trace as `replay_choices` per step, accumulating
     per-action log-π with grad.
 
@@ -394,7 +394,7 @@ def replay_grpo_rollout(
         For prefix positions the target is the ground-truth cumulative
         prior; for gen positions the target is the model's own sampled
         token at that position. The trainer feeds this to
-        ``wrapper.memory.update_plasticity(per_token_ce)`` post-opt.step
+        ``model.memory.update_plasticity(per_token_ce)`` post-opt.step
         to drive the walker's plastic update — exactly mirroring Phase 1.
 
     Why drop the last sampled token: its walker step's routing decision
@@ -402,17 +402,17 @@ def replay_grpo_rollout(
     not include and the reward function does not see. Sampling skipped
     that walker step; replay must too, or trace lengths would mismatch.
 
-    `wrapper.preserve_memory_graph()` is held across the replay forward.
-    Without it, `forward_segment` would call `detach_state()` at every
+    `model.preserve_autograd_graph()` is held across the replay forward.
+    Without it, `walk_segment` would call `detach_state()` at every
     `tbptt_block`-token boundary inside the replay; that detach also
-    rebuilds `_active_delta_nm` via `_begin_plastic_window`, which reads
+    rebuilds `_active_neuromod_delta` via `_begin_plastic_window`, which reads
     `cfg.mod_period`. Mutating mod_period to "freeze plasticity" (the
     old `_freeze_plasticity_ctx` trick) would silently corrupt the
     rebuilt active delta after the first block — replay log-probs after
     that point would be gradients for a different policy than the
     sampler used. preserve_graph=True bypasses both detach and rebuild.
 
-    Routing-mode toggle is on the walker only (NOT the wrapper), so the
+    Routing-mode toggle is on the walker only (NOT the model), so the
     host LM stays in caller-set mode and replay sees the same hidden-
     state stream as sampling did.
 
@@ -424,7 +424,7 @@ def replay_grpo_rollout(
     forwards the recent prefix + gen tokens with the LM's KV cache
     building.
 
-    BOTH phases run under ``enable_grad`` + ``preserve_memory_graph``
+    BOTH phases run under ``enable_grad`` + ``preserve_autograd_graph``
     so walker routing decisions across the FULL prefix get gradient
     credit. The LM is windowed (`use_cache=False` drops phase-1's KV
     cache before AR-gen continuation), but the walker is NOT — its
@@ -438,8 +438,8 @@ def replay_grpo_rollout(
     unsupervised. Walker context is unwindowed; LM context is windowed.
     That's the actual decoupling design.
     """
-    assert wrapper.memory is not None, "replay requires attached memory"
-    device = next(wrapper.parameters()).device
+    assert model.memory is not None, "replay requires attached memory"
+    device = next(model.parameters()).device
     # Drop the last sampled token: walker step processing it was skipped
     # during sampling (see sample_grpo_rollout) and the trace does not
     # include it. Replay input length must match trace length.
@@ -455,13 +455,13 @@ def replay_grpo_rollout(
     # shifted by one. Length = T_pre + L_gen - 1 = replay_seq.shape[1].
     targets_full = full_seq[:, 1:1 + replay_seq.shape[1]]
 
-    saved_phase = wrapper.current_phase
-    saved_walker_training = wrapper.memory.training
-    wrapper.current_phase = "phase2"
+    saved_phase = model.current_phase
+    saved_walker_training = model.memory.training
+    model.current_phase = "phase2"
 
     try:
-        wrapper.reset_memory(bs=K)
-        wrapper.memory.train(True)
+        model.begin_segment(bs=K)
+        model.memory.train(True)
 
         T_pre = sampled.prefix_ids.shape[1]
         full_trace = sampled.routing_trace
@@ -475,19 +475,19 @@ def replay_grpo_rollout(
             # cache scope (phase 1 use_cache=False so AR-gen at sample
             # time only attended to the recent window). The walker is
             # NOT windowed — both phases run under enable_grad +
-            # preserve_memory_graph so walker routing decisions across
+            # preserve_autograd_graph so walker routing decisions across
             # the full prefix get gradient credit and `log_pi` covers
             # ALL routing decisions (early prefix + recent prefix +
-            # gen). The walker's forward_segment requires the armed
+            # gen). The walker's walk_segment requires the armed
             # trace length to match the input length, so we re-arm
             # per phase but DON'T consume the accumulator between
             # phases — log_pi sums across both.
             early_len = T_pre - lm_context_window
             early_seq = replay_seq[:, :early_len]
             recent_seq = replay_seq[:, early_len:]
-            with torch.enable_grad(), wrapper.preserve_memory_graph():
-                wrapper.memory.arm_replay_trace(full_trace[:early_len])
-                out_early = wrapper(early_seq, use_cache=False)
+            with torch.enable_grad(), model.preserve_autograd_graph():
+                model.memory.arm_replay_trace(full_trace[:early_len])
+                out_early = model(early_seq, use_cache=False)
                 # Compute early-phase per-token CE while logits are alive,
                 # then drop them so memory peak only briefly carries the
                 # large [BK, early_len, V] tensor. The CE compute is
@@ -497,25 +497,25 @@ def replay_grpo_rollout(
                         out_early.logits, targets_full[:, :early_len],
                     )
                 del out_early
-                wrapper.memory.arm_replay_trace(full_trace[early_len:])
-                out_recent = wrapper(recent_seq)
+                model.memory.arm_replay_trace(full_trace[early_len:])
+                out_recent = model(recent_seq)
                 with torch.no_grad():
                     ce_recent = _per_token_ce_chunked(
                         out_recent.logits, targets_full[:, early_len:],
                     )
                 del out_recent
-                log_pi = wrapper.memory.consume_log_pi_mean()
+                log_pi = model.memory.consume_log_pi_mean()
             per_token_ce = torch.cat([ce_early, ce_recent], dim=1)
         else:
-            wrapper.memory.arm_replay_trace(full_trace)
-            with torch.enable_grad(), wrapper.preserve_memory_graph():
-                out = wrapper(replay_seq)
+            model.memory.arm_replay_trace(full_trace)
+            with torch.enable_grad(), model.preserve_autograd_graph():
+                out = model(replay_seq)
                 with torch.no_grad():
                     per_token_ce = _per_token_ce_chunked(
                         out.logits, targets_full,
                     )
                 del out
-                log_pi = wrapper.memory.consume_log_pi_mean()
+                log_pi = model.memory.consume_log_pi_mean()
 
         if log_pi is None:
             raise RuntimeError(
@@ -531,14 +531,14 @@ def replay_grpo_rollout(
             )
         return ReplayResult(log_pi=log_pi, per_token_ce=per_token_ce)
     finally:
-        wrapper.current_phase = saved_phase
-        wrapper.memory.train(saved_walker_training)
-        if wrapper.memory is not None:
-            wrapper.memory.phase = saved_phase
+        model.current_phase = saved_phase
+        model.memory.train(saved_walker_training)
+        if model.memory is not None:
+            model.memory.phase = saved_phase
 
 
 def autoregressive_rollout(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     prefix_ids: torch.Tensor,        # [BS, T_pre]
     *,
     gen_length: int,
@@ -552,7 +552,7 @@ def autoregressive_rollout(
     """Run a prefix + generation rollout.
 
     Args:
-        wrapper: GraphWalkerPretrainedLM (memory must be attached).
+        model: IntegratedLM (memory must be attached).
         prefix_ids: [BS, T_pre] starting tokens; replicated by caller for
             K-rollout GRPO (caller is responsible for `prefix_ids = prefix.repeat(K, 1)`).
         gen_length: number of tokens to generate.
@@ -576,36 +576,36 @@ def autoregressive_rollout(
             routing is consumed-and-discarded after prefix; only the
             prefix log_pi participates in REINFORCE.
     """
-    assert wrapper.memory is not None, "rollout requires attached memory"
-    device = next(wrapper.parameters()).device
+    assert model.memory is not None, "rollout requires attached memory"
+    device = next(model.parameters()).device
     prefix_ids = prefix_ids.to(device)
     BS, T_pre = prefix_ids.shape
-    # `wrapper.forward()` propagates wrapper.current_phase → memory.phase
-    # before the closure runs. We also save/restore `wrapper.training`:
+    # `model.forward()` propagates model.current_phase → memory.phase
+    # before the closure runs. We also save/restore `model.training`:
     # the generation loop sets train(False) which would otherwise leak
     # into the next phase-1 cycle (compute_aux gates on `self.training`,
     # so a leaked False would silently skip aux loss).
-    saved_phase = wrapper.current_phase
-    saved_training = wrapper.training
-    wrapper.current_phase = phase
+    saved_phase = model.current_phase
+    saved_training = model.training
+    model.current_phase = phase
 
     try:
-        wrapper.reset_memory(bs=BS)
+        model.begin_segment(bs=BS)
 
         # Prefix pass.
         prefix_ctx = (
             torch.enable_grad() if grad_during_prefix else torch.no_grad()
         )
         with prefix_ctx:
-            wrapper.train(grad_during_prefix)
-            out = wrapper(prefix_ids, use_cache=True)
+            model.train(grad_during_prefix)
+            out = model(prefix_ids, use_cache=True)
             past_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
             # Consume the MEAN (sum / step_count). The raw sum scales
             # with T_pre × n_hops × n_heads ≈ thousands of decisions per
             # rollout, producing gradient magnitudes thousands of times
             # too large for a sane LR. See consume_log_pi_mean docstring.
-            log_pi_mean = wrapper.memory.consume_log_pi_mean()
+            log_pi_mean = model.memory.consume_log_pi_mean()
 
         # Generation pass — freeze plasticity to keep the policy fixed.
         gen_ctx = torch.enable_grad() if grad_during_gen else torch.no_grad()
@@ -616,12 +616,12 @@ def autoregressive_rollout(
         # next training step — only the consumed-after-prefix log_pi_mean
         # participates in REINFORCE.
         gen_train_mode = bool(gen_sample_routing)
-        with gen_ctx, _freeze_plasticity_ctx(wrapper.memory):
-            wrapper.train(gen_train_mode)
+        with gen_ctx, _freeze_plasticity_ctx(model.memory):
+            model.train(gen_train_mode)
             for _ in range(gen_length):
                 tok = _sample_next_token(last_logits, temperature, top_p)
                 new_tokens.append(tok)
-                out = wrapper(
+                out = model(
                     tok.unsqueeze(-1), past_key_values=past_kv, use_cache=True,
                 )
                 past_kv = out.past_key_values
@@ -637,11 +637,11 @@ def autoregressive_rollout(
             last_logits=last_logits.detach(),
         )
     finally:
-        wrapper.current_phase = saved_phase
-        wrapper.train(saved_training)
-        # memory.phase was last set by wrapper.forward() during the
+        model.current_phase = saved_phase
+        model.train(saved_training)
+        # memory.phase was last set by model.forward() during the
         # generation loop. Sync it back so a follow-up direct memory
-        # call (without going through wrapper.forward) doesn't see a
+        # call (without going through model.forward) doesn't see a
         # leaked phase-2 setting.
-        if wrapper.memory is not None:
-            wrapper.memory.phase = saved_phase
+        if model.memory is not None:
+            model.memory.phase = saved_phase

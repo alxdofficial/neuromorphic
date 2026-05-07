@@ -44,7 +44,7 @@ def _print_stats(label: str) -> None:
 
 def run_integration(bs: int, T: int, snapshot_path: Path) -> None:
     from src.graph_walker.pretrained.config import PretrainedGWConfig
-    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.integrated_lm import IntegratedLM
     from src.graph_walker.pretrained.train_phase1 import (
         Phase1Batch, phase1_pretrained_step,
     )
@@ -61,12 +61,12 @@ def run_integration(bs: int, T: int, snapshot_path: Path) -> None:
         T=T, bs=bs,
         llama_dtype="bf16",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg).to(device)
-    wrapper.train(True)
-    wrapper.compile_walker_block()
+    model = IntegratedLM(cfg).to(device)
+    model.train(True)
+    model.compile_walker_block()
 
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
         fused=True,
     )
     input_ids = torch.randint(0, cfg.vocab_size_lm, (bs, T), device=device)
@@ -75,7 +75,7 @@ def run_integration(bs: int, T: int, snapshot_path: Path) -> None:
 
     print(f"  Warmup (compile + 2 steps to settle)...", flush=True)
     for _ in range(2):
-        phase1_pretrained_step(wrapper, opt, batch, amp_dtype=torch.bfloat16)
+        phase1_pretrained_step(model, opt, batch, amp_dtype=torch.bfloat16)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -88,7 +88,7 @@ def run_integration(bs: int, T: int, snapshot_path: Path) -> None:
     print(f"\n  Profiling one phase1_pretrained_step (BS={bs}, T={T})...",
           flush=True)
     t = time.perf_counter()
-    stats = phase1_pretrained_step(wrapper, opt, batch, amp_dtype=torch.bfloat16)
+    stats = phase1_pretrained_step(model, opt, batch, amp_dtype=torch.bfloat16)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t) * 1000.0
     _print_stats(f"after profiled step ({elapsed_ms:.0f}ms)")

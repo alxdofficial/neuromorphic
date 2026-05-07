@@ -83,7 +83,7 @@ The walker scales much better with BS than the BS=4 numbers suggested — confir
 
 Checkpoint OFF is **4× faster** than checkpoint ON at BS=16, with only +0.6 GB VRAM cost. The memory savings ckpt=True buys (~3 GB at BS=16) is not worth the wall-clock cost when there's 9+ GB of GPU headroom.
 
-**Action taken:** `src/graph_walker/pretrained/llm_wrapper.py` `__init__` now sets `self.memory._checkpoint_block = False` after constructing memory. Standalone walker training is unaffected (it uses the per-token `step_core` path, not the compile-block path, so `_checkpoint_block` is irrelevant there).
+**Action taken:** `src/graph_walker/pretrained/integrated_lm.py` `__init__` now sets `self.memory._checkpoint_block = False` after constructing memory. Standalone walker training is unaffected (it uses the per-token `step_core` path, not the compile-block path, so `_checkpoint_block` is irrelevant there).
 
 **Headline at the new default:**
 - **Current best: 8.8k tok/s @ BS=16, T=256, 14.59 GB peak VRAM.**
@@ -254,7 +254,7 @@ action space).
 
 **What landed:**
 - `routing.py`: `route_or_replay` + `StepRoutingChoices` + `routing_log_pi_for_action`
-- `graph_walker.py`: capture buffer (`start_capturing_routes` / `consume_routing_trace`), replay stash (`arm_replay_trace`), `forward_segment` consumes replay trace and threads per-step `replay_choices`, `step_core_from_h(replay_choices=...)`, `_step_core_pure(replay_choices=...)`. `is_new_window` reconstructed from saved `anchor_idx` presence so sample/replay routing patterns match.
+- `graph_walker.py`: capture buffer (`start_capturing_routes` / `consume_routing_trace`), replay stash (`arm_replay_trace`), `walk_segment` consumes replay trace and threads per-step `replay_choices`, `step_core_from_h(replay_choices=...)`, `_step_core_pure(replay_choices=...)`. `is_new_window` reconstructed from saved `anchor_idx` presence so sample/replay routing patterns match.
 - `rollout.py`: `sample_grpo_rollout` (no-grad sample with capture armed) + `replay_grpo_rollout` (teacher-forced with-grad replay). Old `autoregressive_rollout` retained for inference.
 - `train_phase2.py`: `grpo_step` rewritten as sample → score → replay → REINFORCE. Returns the same `GRPOStats` for telemetry-compat.
 - `tests/test_routing_replay.py`: 6 tests covering math parity, grad propagation, walker capture+replay end-to-end, and DeepSeek full-flow with gradient reaching `memory.neuromod.*`.

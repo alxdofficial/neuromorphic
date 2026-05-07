@@ -68,7 +68,7 @@ def autoregressive_rollout(
 
     if seed is not None:
         gen = torch.Generator(device=device).manual_seed(seed)
-        # Also seed the DEFAULT torch RNG before reset_memory — the
+        # Also seed the DEFAULT torch RNG before begin_segment — the
         # sparse-W init in MemoryGraph.initialize_states uses
         # torch.randperm without an explicit generator, which would
         # otherwise advance the global RNG and make two seeded rollouts
@@ -82,7 +82,7 @@ def autoregressive_rollout(
 
     # 1) Replicate prefix across K rollouts and reset memory for BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
-    wrapper.reset_memory(bs=K)
+    wrapper.begin_segment(bs=K)
 
     # 2) Process prefix under `rollout_mode`: eval (no dropout) + hard
     # Categorical sampling across the K batch dim + KV cache. Determinism

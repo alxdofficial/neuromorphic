@@ -23,7 +23,7 @@ from transformers import AutoModelForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch,
     phase1_pretrained_step,
@@ -118,10 +118,10 @@ def main():
     ap.add_argument("--iter", type=int, default=10)
     ap.add_argument("--inject-layer", type=int, default=8)
     ap.add_argument("--compile", action="store_true",
-                    help="Run wrapper.memory.compile_step() before benchmark — "
+                    help="Run model.memory.compile_step() before benchmark — "
                          "fuses the per-step walker kernels via torch.compile.")
     ap.add_argument("--compile-block", action="store_true",
-                    help="Run wrapper.compile_walker_block() before benchmark — "
+                    help="Run model.compile_walker_block() before benchmark — "
                          "fuses an entire tbptt-block window into a single "
                          "compiled call (preferred over --compile; ~3.7x over "
                          "eager standalone).")
@@ -196,14 +196,14 @@ def main():
         T=T, bs=BS,
         llama_dtype="bf16",
     )
-    wrapper = GraphWalkerPretrainedLM(cfg).to(device)
-    wrapper.train(False)
+    model = IntegratedLM(cfg).to(device)
+    model.train(False)
 
     walker_params = sum(
-        p.numel() for n, p in wrapper.named_parameters() if p.requires_grad
+        p.numel() for n, p in model.named_parameters() if p.requires_grad
     )
     walker_only_params = sum(
-        p.numel() for n, p in wrapper.named_parameters()
+        p.numel() for n, p in model.named_parameters()
         if p.requires_grad and n.startswith("memory.")
     )
     inject_params = walker_params - walker_only_params
@@ -212,27 +212,27 @@ def main():
     print(f"  total trainable:           {walker_params/1e6:.1f}M")
     if args.compile:
         print(f"  Compiling walker step ...")
-        wrapper.memory.compile_step()
+        model.memory.compile_step()
     if args.compile_block:
         print(f"  Compiling walker block (whole-window inductor fusion) ...")
-        wrapper.compile_walker_block()
+        model.compile_walker_block()
     print()
 
     def gw_fwd():
-        wrapper.reset_memory(bs=BS)
+        model.begin_segment(bs=BS)
         with torch.no_grad(), torch.autocast(
             device_type=device.type, dtype=torch.bfloat16,
         ):
-            return wrapper(input_ids).logits
+            return model(input_ids).logits
 
     print("[Llama + graph_walker, forward-only]")
     gw_fwd_tps, gw_fwd_mem = _bench(
         "Llama-1B + GW fwd", gw_fwd, args.warmup, args.iter, BS, T,
     )
 
-    wrapper.train(True)
+    model.train(True)
     opt = torch.optim.AdamW(
-        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+        [p for _, p in model.trainable_parameters()], lr=1e-4,
         fused=True,
     )
     targets = input_ids.clone()
@@ -240,7 +240,7 @@ def main():
 
     def gw_step():
         return phase1_pretrained_step(
-            wrapper, opt, batch, amp_dtype=torch.bfloat16,
+            model, opt, batch, amp_dtype=torch.bfloat16,
         )
 
     print()

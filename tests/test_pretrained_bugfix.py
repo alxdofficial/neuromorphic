@@ -3,8 +3,8 @@
 1. log_pi_step is returned by `_step_core_pure` (not mutated on self)
    and folded into `_log_pi_sum` by `_apply_step_state`. Pure-function
    contract preserved → safe under torch.compile / checkpoint.
-2. `wrapper.current_phase` is propagated to `memory.phase` inside
-   `wrapper.forward()`. Setting the wrapper-level phase alone is now
+2. `model.current_phase` is propagated to `memory.phase` inside
+   `model.forward()`. Setting the model-level phase alone is now
    enough; previously it was silently ignored (memory.phase stayed at
    "phase1").
 """
@@ -18,7 +18,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.graph_walker import GraphWalkerMemory, WalkerCorePureOutput
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.standalone import StandaloneLM
 
 
@@ -105,13 +105,13 @@ def test_apply_step_state_folds_log_pi_into_self_sum():
     assert not torch.equal(sum_after_1, sum_after_2)
 
 
-# Bug 2: wrapper.current_phase propagation
+# Bug 2: model.current_phase propagation
 
 
 def test_wrapper_current_phase_propagates_to_memory_phase():
-    """Setting `wrapper.current_phase = "phase2"` must actually flip the
+    """Setting `model.current_phase = "phase2"` must actually flip the
     routing path. Pre-fix, this was silently ignored — routing still ran
-    Gumbel-STE because routing reads `memory.phase`, not the wrapper's."""
+    Gumbel-STE because routing reads `memory.phase`, not the model's."""
     torch.manual_seed(0)
     hf = _make_tiny_llama()
     # Integration walker requires segment_T == mod_period == tbptt_block.
@@ -124,17 +124,17 @@ def test_wrapper_current_phase_propagates_to_memory_phase():
         model_name="random", inject_layer=2, d_mem=32,
         memory=walker_cfg, T=8, bs=2, llama_dtype="fp32",
     )
-    w = GraphWalkerPretrainedLM(cfg, hf_model=hf)
+    w = IntegratedLM(cfg, hf_model=hf)
     w.train()
     w.current_phase = "phase2"
     # Before forward: memory.phase still default "phase1".
     assert w.memory.phase == "phase1"
     # Forward propagates.
     input_ids = torch.randint(0, 256, (2, 8))
-    w.reset_memory(bs=2)
+    w.begin_segment(bs=2)
     w(input_ids)
     assert w.memory.phase == "phase2", (
-        "wrapper.current_phase did not propagate to memory.phase — "
+        "model.current_phase did not propagate to memory.phase — "
         "phase-2 routing would silently fall back to Gumbel-STE."
     )
     # log_pi accumulator should now be populated (phase-2 fired).

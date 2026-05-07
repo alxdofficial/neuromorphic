@@ -32,11 +32,11 @@ Outside the captured graph (per training step):
     - ``opt.step()`` at end
 
 Constraints we accept for capture compatibility:
-    - ``use_neuromod=False`` only. Neuromod's grad-carrying ``_active_delta_nm``
+    - ``use_neuromod=False`` only. Neuromod's grad-carrying ``_active_neuromod_delta``
       is rebuilt in-place each window with a fresh memory address; the
       captured graph reads from a stale pointer otherwise. Neuromod re-
       enablement requires either (a) preallocating a stable
-      ``_active_delta_nm_buf`` that ``_begin_plastic_window`` writes into,
+      ``_active_neuromod_delta_buf`` that ``_begin_plastic_window`` writes into,
       or (b) routing the neuromod gradient outside the captured path.
       Tracked as future work.
 """

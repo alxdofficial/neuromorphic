@@ -1,8 +1,8 @@
-"""Smoke tests for GraphWalkerPretrainedLM (wrapper + phase-1 step).
+"""Smoke tests for IntegratedLM (model + phase-1 step).
 
 Uses a tiny random-init `LlamaForCausalLM` so tests run in a few seconds on
 CPU without HF Hub downloads. Validates:
-- wrapper construction (frozen backbone, MemInjectLayer wired, scale-zero
+- model construction (frozen backbone, MemInjectLayer wired, scale-zero
   bypass when memory disabled),
 - forward shapes (logits match Llama's vocab; aux loss is finite),
 - gradient flow: every trainable param (W_in, W_out, scale, walker subtree)
@@ -21,7 +21,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch,
     phase1_pretrained_step,
@@ -76,7 +76,7 @@ def _make_tiny_wrapper(d_lm: int = 32, vocab: int = 256, T: int = 8):
         bs=2,
         llama_dtype="fp32",
     )
-    return GraphWalkerPretrainedLM(cfg, hf_model=hf)
+    return IntegratedLM(cfg, hf_model=hf)
 
 
 def test_wrapper_construction_freezes_backbone():
@@ -103,15 +103,15 @@ def test_wrapper_construction_freezes_backbone():
 
 def test_forward_logits_shape():
     w = _make_tiny_wrapper(d_lm=32, vocab=256, T=8)
-    w.reset_memory(bs=2)
+    w.begin_segment(bs=2)
     input_ids = torch.randint(0, 256, (2, 8))
     out = w(input_ids)
     assert out.logits.shape == (2, 8, 256)
     assert torch.isfinite(out.logits).all()
     # Walker is vocab-agnostic: forward returns only logits via the host
-    # LM; there is no aux loss stashed on the wrapper.
+    # LM; there is no aux loss stashed on the model.
     w.train()
-    w.reset_memory(bs=2)
+    w.begin_segment(bs=2)
     out = w(input_ids)
     assert torch.isfinite(out.logits).all()
 
@@ -153,7 +153,7 @@ def test_phase1_step_runs_and_gradient_reaches_all_trainables():
     batch = Phase1Batch(input_ids=input_ids, target_ids=target_ids)
 
     # Pre-seed neuromod's prev-snapshot by running an extra step. Otherwise
-    # the first measured step has _active_delta_nm=None and neuromod params
+    # the first measured step has _active_neuromod_delta=None and neuromod params
     # see no gradient.
     phase1_pretrained_step(w, opt, batch, amp_dtype=None)
 

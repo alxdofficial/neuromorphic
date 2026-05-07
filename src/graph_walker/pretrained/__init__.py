@@ -6,7 +6,7 @@ TinyLlama / SmolLM2) via a mid-stack `MemInjectLayer` from the existing
 
 Public entry points:
 - `PretrainedGWConfig`                — config (factories for Llama-1B/3B/etc).
-- `GraphWalkerPretrainedLM`           — the wrapper nn.Module.
+- `IntegratedLM`           — the model nn.Module.
 - `phase1_pretrained_step`            — parallel teacher-forced phase-1.
 - `grpo_step`                         — phase-2 GRPO on routing decisions.
 - `autoregressive_rollout`            — stand-alone inference rollout primitive.
@@ -20,7 +20,7 @@ window.
 """
 
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rollout import (
     RolloutOutput,
     autoregressive_rollout,
@@ -34,7 +34,7 @@ from src.graph_walker.pretrained.train_phase2 import GRPOStats, grpo_step
 
 __all__ = [
     "PretrainedGWConfig",
-    "GraphWalkerPretrainedLM",
+    "IntegratedLM",
     # Phase 1 parallel
     "Phase1Batch",
     "Phase1Stats",

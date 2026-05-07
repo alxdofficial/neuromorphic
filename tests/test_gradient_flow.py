@@ -95,7 +95,7 @@ def test_all_trainable_params_get_gradient():
     tokens = torch.randint(0, cfg.vocab_size, (2, cfg.segment_T))
 
     # Pre-seed a prior snapshot by running an extra segment first. Without it,
-    # the very first window has no prev snapshot and _active_delta_nm is None,
+    # the very first window has no prev snapshot and _active_neuromod_delta is None,
     # so neuromod params would get no gradient on that first measured step.
     phase1_step(
         lm, opt, tokens, tbptt_block=cfg.tbptt_block,
@@ -109,7 +109,7 @@ def test_all_trainable_params_get_gradient():
     )
     assert torch.isfinite(torch.tensor(stats.loss))
 
-    # Params that only participate in the pretrained-LM (forward_segment)
+    # Params that only participate in the pretrained-LM (walk_segment)
     # path, not the StandaloneLM token-id path. Their gradient is verified
     # in the pretrained smoke tests, not here.
     STANDALONE_UNUSED = {"memory.mem_input_v_proj.weight"}
@@ -253,7 +253,7 @@ def test_known_zero_init_params_have_zero_grad_on_first_step():
 def test_gradient_reaches_neuromod_via_delta_nm_path():
     """Specifically verify the neuromod gradient path:
     loss → CE → readout → end_state → ste_weights → scores → active_E_bias
-        → _active_delta_nm → neuromod.edge_mlp / feature_proj / layers / blend_logit
+        → _active_neuromod_delta → neuromod.edge_mlp / feature_proj / layers / blend_logit
 
     This is a high-value bridge: if any detach or autograd-graph break
     along the chain is introduced, the neuromod becomes untrainable.

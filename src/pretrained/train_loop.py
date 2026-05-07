@@ -124,7 +124,7 @@ def run_cycle_loop(
     log(f"\n=== BOOTSTRAP — {cfg.bootstrap_steps} steps, full trainable surface ===")
     wrapper.unfreeze_all()
     wrapper.current_phase = "phase1"
-    wrapper.reset_memory(bs=cfg.bs)
+    wrapper.begin_segment(bs=cfg.bs)
     run_phase1(wrapper, opt, bootstrap_iter, steps=cfg.bootstrap_steps,
                metrics_path=metrics_path,
                on_step=lambda lg: log(
@@ -146,7 +146,7 @@ def run_cycle_loop(
         # would re-apply the moment new trainables come online in later stages.
         opt = torch.optim.AdamW(
             [p for _, p in wrapper.trainable_parameters()], lr=cfg.lr)
-        wrapper.reset_memory(bs=cfg.bs)
+        wrapper.begin_segment(bs=cfg.bs)
         run_phase1_ar(wrapper, opt, cycle_p1_iter,
                       steps=cfg.cycle_phase1_steps,
                       metrics_path=metrics_path,

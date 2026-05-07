@@ -562,7 +562,7 @@ class MemoryGraph(nn.Module):
     # Segment forward
     # ================================================================
 
-    def forward_segment(
+    def walk_segment(
         self,
         H_mid: Tensor,
         input_ids: Tensor,
@@ -674,7 +674,7 @@ class MemoryGraph(nn.Module):
             readouts[:, start_t:end_t] = block_out
 
         # Persist state across segments. `preserve_graph=True` keeps the
-        # autograd graph alive across forward_segment calls — used by
+        # autograd graph alive across walk_segment calls — used by
         # autoregressive phase-1 unroll where the continuation steps need
         # gradient to reach the prefix's modulator fires. Caller is
         # responsible for calling `detach_states()` after backward.

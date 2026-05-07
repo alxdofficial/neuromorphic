@@ -151,7 +151,7 @@ def grpo_step(
         # Also seed the default torch RNG because MemoryGraph.initialize_states
         # uses torch.randperm (no explicit generator) for the sparse-W init;
         # without this, two seeded grpo_step calls produce different initial
-        # W across the same reset_memory sequence.
+        # W across the same begin_segment sequence.
         _rng_state = torch.random.get_rng_state()
         torch.manual_seed(seed)
     else:
@@ -161,7 +161,7 @@ def grpo_step(
 
     # 1) Replicate prefix. 2) Reset memory with BS=K.
     prefix_rep = prefix_ids.expand(K, T_prefix).contiguous()
-    wrapper.reset_memory(bs=K)
+    wrapper.begin_segment(bs=K)
 
     # 3) Prefix pass inside rollout_mode: eval (no dropout) + hard
     # Categorical sampling + phase2 + bf16 autocast on CUDA. Removes the

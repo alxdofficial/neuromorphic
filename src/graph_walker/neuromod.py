@@ -105,7 +105,7 @@ class NeuromodGraphTransformer(nn.Module):
     `E_bias_max`), not a delta. The caller converts target → delta via an
     EMA blend gated by `self.gamma` (a learnable scalar blend rate):
 
-        _active_delta_nm[edge] = γ · (target[edge] - E_bias_base[edge])
+        _active_neuromod_delta[edge] = γ · (target[edge] - E_bias_base[edge])
 
     which, when added to `E_bias_base`, gives the classic EMA blend
     `(1 - γ) · E_bias_base + γ · target`. Same numerical behavior as the

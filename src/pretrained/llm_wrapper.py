@@ -3,7 +3,7 @@
 Public API:
     wrapper = PretrainedLMWithMemory(config)
     out = wrapper(input_ids)                # returns HF ModelOutput with `.logits`
-    wrapper.reset_memory(bs)                # zero memory state for batch
+    wrapper.begin_segment(bs)                # zero memory state for batch
     wrapper.detach_memory()                  # TBPTT boundary
 
 The wrapper is host-agnostic via `src.pretrained.hosts.HostAdapter`. For
@@ -48,7 +48,7 @@ class PretrainedLMWithMemory(nn.Module):
         # 2. Load the LM in the configured dtype. Default bf16 matches the
         # production GPU run path and skips the fp32→bf16 weight cast that
         # autocast otherwise triggers on every matmul. Memory state dtype
-        # follows the LM dtype (see reset_memory) so both sides agree.
+        # follows the LM dtype (see begin_segment) so both sides agree.
         _dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16,
                        "fp16": torch.float16}
         llama_dtype = _dtype_map[config.llama_dtype]
@@ -91,7 +91,7 @@ class PretrainedLMWithMemory(nn.Module):
         # Memory PARAMS stay in fp32. Bf16 optimizer updates round small
         # gradients to zero (param = 2.0, update = 1e-5 → 2.0 in bf16).
         # Memory STATE tensors (h, W, hebbian, ...) follow the host's dtype
-        # via reset_memory so the forward-path matmuls don't mix dtypes.
+        # via begin_segment so the forward-path matmuls don't mix dtypes.
         # Buffers (out_port_mask, role_id) also stay fp32 / int64; the
         # fused step casts out_port_mask to state dtype per call.
         self._adapter = (MemAdapter(self.host, self.mem_inject.W_out)
@@ -110,13 +110,13 @@ class PretrainedLMWithMemory(nn.Module):
         # Categorical with log_pi tracking for REINFORCE/GRPO rollouts.
         # Flip via `wrapper.current_phase = "phase2"` before phase-2 runs.
         self.current_phase: str = "phase1"
-        # When True, memory.forward_segment keeps state graph-connected
+        # When True, memory.walk_segment keeps state graph-connected
         # across calls — no detach at end, no intra-call tbptt detach.
         # Used by autoregressive phase-1 unroll so gradient from each
         # continuation token reaches the prefix's modulator fires.
         # Caller is responsible for calling `detach_memory()` after
         # backward completes.
-        self._preserve_memory_graph: bool = False
+        self._preserve_autograd_graph: bool = False
         # `None` = follow `self.training`. `True`/`False` forces aux-loss
         # computation on or off regardless of training mode — useful for
         # AR continuation unroll that wants aux loss on the prefix pass
@@ -128,7 +128,7 @@ class PretrainedLMWithMemory(nn.Module):
         """Reference to the inserted MemInjectLayer via the host layer list."""
         return self.host.layer_list()[self.config.inject_layer]
 
-    def reset_memory(self, bs: int):
+    def begin_segment(self, bs: int):
         if self.memory is not None:
             p = next(self.llama.parameters())
             # Match memory state dtype to the host's dtype so h_mem crossings
@@ -168,13 +168,13 @@ class PretrainedLMWithMemory(nn.Module):
         compute_aux = self.training if override is None else bool(override)
 
         def memory_fn(h_mem: torch.Tensor) -> torch.Tensor:
-            readouts, mem_loss = self.memory.forward_segment(
+            readouts, mem_loss = self.memory.walk_segment(
                 h_mem, input_ids, self._adapter,
                 prev_token=prev_token,
                 use_rmsnorm=use_rms,
                 rms_eps=self._rms_eps,
                 phase=self.current_phase,
-                preserve_graph=self._preserve_memory_graph,
+                preserve_graph=self._preserve_autograd_graph,
                 compute_aux_loss=compute_aux)
             self._last_mem_pred_loss = mem_loss
             return readouts
@@ -233,8 +233,8 @@ class PretrainedLMWithMemory(nn.Module):
         self.mem_inject.W_out.weight.requires_grad = True
         self.mem_inject.scale.requires_grad = True
 
-    def preserve_memory_graph(self):
-        """Context manager: within the block, memory.forward_segment keeps
+    def preserve_autograd_graph(self):
+        """Context manager: within the block, memory.walk_segment keeps
         state graph-connected across calls. Needed for autoregressive
         phase-1 unroll where continuation-token gradient must reach the
         prefix-pass modulator fires."""
@@ -252,7 +252,7 @@ class PretrainedLMWithMemory(nn.Module):
              takes the hard-Categorical-with-log_pi branch even though
              we're in eval mode.
           - `memory.current_phase = "phase2"` for consistency (also
-             threads to forward_segment so `_last_log_pi_sum` lands).
+             threads to walk_segment so `_last_log_pi_sum` lands).
           - Autocast bf16 on CUDA.
 
         The `log_pi_sum` backward path remains graph-connected to the
@@ -261,7 +261,7 @@ class PretrainedLMWithMemory(nn.Module):
         return _RolloutMode(self)
 
     def compute_aux_loss_override(self, compute: bool | None):
-        """Temporarily override whether `forward_segment` runs the aux
+        """Temporarily override whether `walk_segment` runs the aux
         `mem_pred_loss` head. `None` → use `self.training`. `False` → skip
         the 128K-vocab matmul (used during AR continuation unroll where
         only the prefix pass's aux signal is part of the loss)."""
@@ -271,14 +271,14 @@ class PretrainedLMWithMemory(nn.Module):
 class _PreserveMemoryGraph:
     def __init__(self, wrapper: "PretrainedLMWithMemory"):
         self.wrapper = wrapper
-        self._prior = wrapper._preserve_memory_graph
+        self._prior = wrapper._preserve_autograd_graph
 
     def __enter__(self):
-        self.wrapper._preserve_memory_graph = True
+        self.wrapper._preserve_autograd_graph = True
         return self.wrapper
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.wrapper._preserve_memory_graph = self._prior
+        self.wrapper._preserve_autograd_graph = self._prior
         return False
 
 

@@ -1,19 +1,19 @@
 """Phase-1 parallel training harness for graph_walker + frozen Llama.
 
 Per step:
-1. `reset_memory(bs)` — zero walker state.
+1. `begin_segment(bs)` — zero walker state.
 2. Full Llama forward with memory read/write at layer L (via MemInjectLayer
    closure). Walker processes the T-long segment sequentially inside
-   `forward_segment`, with TBPTT detach every `tbptt_block` tokens.
+   `walk_segment`, with TBPTT detach every `tbptt_block` tokens.
 3. Loss: Llama's next-token CE on `target_ids`. The walker has no aux loss
    of its own; it learns purely via gradient flowing back through `W_out`.
 4. `loss.backward()`, grad-clip, `opt.step()`.
 5. Compute Llama's per-token CE (`reduction='none'`) and feed it to
-   `wrapper.memory.update_plasticity(per_token_ce)`. This folds Llama's
+   `model.memory.update_plasticity(per_token_ce)`. This folds Llama's
    next-token surprise into the walker's `surprise_ema`, fires the
    structural plasticity step, and builds the next segment's neuromod
-   delta. Plasticity does NOT fire inside `forward_segment`.
-6. `wrapper.detach_memory()` to release the autograd graph.
+   delta. Plasticity does NOT fire inside `walk_segment`.
+6. `model.detach_memory()` to release the autograd graph.
 
 Gumbel-soft STE routing is the default in `routing.py`; phase-1 τ/ε
 schedules come from `GraphWalkerConfig`.
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 
 
 @dataclass
@@ -69,7 +69,7 @@ class Phase1Stats:
 
 
 def phase1_pretrained_step(
-    wrapper: GraphWalkerPretrainedLM,
+    model: IntegratedLM,
     opt: torch.optim.Optimizer,
     batch: Phase1Batch,
     *,
@@ -83,18 +83,18 @@ def phase1_pretrained_step(
     """
     import time
 
-    cfg = wrapper.config
-    device = next(wrapper.parameters()).device
+    cfg = model.config
+    device = next(model.parameters()).device
     input_ids = batch.input_ids.to(device)
     target_ids = batch.target_ids.to(device)
 
-    # Phase-1 must run in train mode. If wrapper got switched to inference
+    # Phase-1 must run in train mode. If model got switched to inference
     # mode by a leaked rollout/bench pass, routing inside `_step_core_pure`
     # flips to deterministic argmax (no Gumbel STE), so the walker would
     # produce optimizer steps but no routing-side learning signal.
-    if not wrapper.training:
+    if not model.training:
         raise RuntimeError(
-            "phase1_pretrained_step requires wrapper.train() — inference-mode "
+            "phase1_pretrained_step requires model.train() — inference-mode "
             "leak would silently disable Gumbel-STE routing."
         )
 
@@ -105,7 +105,7 @@ def phase1_pretrained_step(
             f"shape {(BS, T)}. The trainer internally shifts target_ids[:, 1:] "
             "vs logits[:, :-1] — DO NOT pre-shift. See Phase1Batch docstring."
         )
-    wrapper.reset_memory(bs=BS)
+    model.begin_segment(bs=BS)
     opt.zero_grad(set_to_none=True)
 
     ctx = (
@@ -116,7 +116,7 @@ def phase1_pretrained_step(
 
     t0 = time.perf_counter()
     with ctx:
-        out = wrapper(input_ids)
+        out = model(input_ids)
         logits = out.logits                                        # [BS, T, vocab]
         # Next-token CE: logits[:, t] predicts target_ids[:, t+1]; last
         # position of each row is unsupervised.
@@ -130,7 +130,7 @@ def phase1_pretrained_step(
 
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
-        [p for _, p in wrapper.trainable_parameters()],
+        [p for _, p in model.trainable_parameters()],
         grad_clip,
     )
     opt.step()
@@ -142,16 +142,16 @@ def phase1_pretrained_step(
     # fires the plasticity step once, and builds the next segment's
     # neuromod delta. The last position of each row has no supervised
     # target so we feed only T-1 positions.
-    if wrapper.memory is not None:
+    if model.memory is not None:
         with torch.no_grad():
             per_token_ce = F.cross_entropy(
                 logits_shift.reshape(-1, logits_shift.size(-1)).float(),
                 targets_shift.reshape(-1),
                 reduction="none",
             ).reshape(BS, T - 1)
-        wrapper.memory.update_plasticity(per_token_ce)
+        model.memory.update_plasticity(per_token_ce)
 
-    wrapper.detach_memory()
+    model.detach_memory()
     elapsed = max(time.perf_counter() - t0, 1e-6)
     tok_per_sec = BS * T / elapsed
 
@@ -161,12 +161,12 @@ def phase1_pretrained_step(
     # parameter product — it didn't depend on whether the readout was
     # actually emitting useful signal.
     with torch.no_grad():
-        h_norm = float(wrapper.mem_inject._last_hidden_norm.item())
-        i_norm = float(wrapper.mem_inject._last_inj_norm.item())
+        h_norm = float(model.mem_inject._last_hidden_norm.item())
+        i_norm = float(model.mem_inject._last_inj_norm.item())
         inject_ratio = i_norm / max(h_norm, 1e-12)
         # Per-token CE percentiles — catches hard examples that the
         # scalar mean would smooth over.
-        if wrapper.memory is not None:
+        if model.memory is not None:
             pt = per_token_ce.detach().float().reshape(-1)
             ce_p50 = float(pt.quantile(0.5).item())
             ce_p90 = float(pt.quantile(0.9).item())

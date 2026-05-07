@@ -35,7 +35,7 @@ class StandaloneLM(nn.Module):
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         self.memory = ColumnGraphMemory(cfg, tied_token_emb=self.token_emb)
 
-    def forward_segment(
+    def walk_segment(
         self, tokens: torch.Tensor, tbptt_block: int
     ) -> StepOutputs:
         """Run one segment of shape [B, T_seq], producing per-tick logits
@@ -55,7 +55,7 @@ class StandaloneLM(nn.Module):
             if (t + 1) % tbptt_block == 0 and (t + 1) < T:
                 # Detach state between blocks. Emit the logits we've collected
                 # up to here as one TBPTT chunk; caller sums losses across chunks.
-                # In this simple forward_segment we just detach and continue —
+                # In this simple walk_segment we just detach and continue —
                 # the caller should pair this with a per-block loss/backward
                 # pattern (see train_phase1.py).
                 self.memory.detach_state()

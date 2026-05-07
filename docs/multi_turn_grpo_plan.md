@@ -13,7 +13,7 @@ those turn boundaries.
 For each WildChat session in the dataset:
 
 ```
-[walker.reset_memory(bs=K)]                                    ← session start
+[walker.begin_segment(bs=K)]                                    ← session start
 
 walker observes user_1 (sampled routing, log_pi captured)
 For each assistant turn t = 1 .. N:
@@ -127,7 +127,7 @@ EOS early-stop (variable-length rollouts).
 
 ## Walker state snapshot/restore
 
-New API on `GraphWalkerPretrainedLM`:
+New API on `IntegratedLM`:
 
 ```python
 state = wrapper.snapshot_memory_state()    # dict of cloned tensors
@@ -136,7 +136,7 @@ wrapper.restore_memory_state(state)        # broadcasts/copies back
 
 Snapshots ONLY the per-batch working state (s, walker_pos, walker_state,
 surprise EMAs, log_pi accumulators, segment counters). Does NOT snapshot
-the long-term plastic state (E_bias_flat, _prev_snapshot_*) — those keep
+the long-term plastic state (E_bias_flat, _neuromod_input_*) — those keep
 evolving across the whole session via the canonical replay path.
 
 Implementation: `state` is a dict of cloned tensors. `restore` copies
@@ -145,7 +145,7 @@ back into the walker's named attributes.
 ## K rollouts: shared state going in, divergent during turn
 
 To run K rollouts sharing a snapshot:
-1. `wrapper.reset_memory(bs=K)` once at session start
+1. `wrapper.begin_segment(bs=K)` once at session start
 2. Walker state is shape `[K, ...]` — all K elements identical at turn
    boundaries (snapshot-restore copies the same tensor across all K)
 3. During turn t: K rollouts diverge naturally (Categorical routing
@@ -191,7 +191,7 @@ walker was barely tested. The fix:
 - When `lm_context_window < T_pre`: two-phase forward.
   - **Phase 1**: `wrapper(prefix_ids[:, :T_pre - lm_context_window], use_cache=False)`.
     Walker advances state through the early portion. LM forwards too
-    (necessary because walker's `forward_segment` requires LM hidden
+    (necessary because walker's `walk_segment` requires LM hidden
     states), but its KV cache is discarded.
   - **Phase 2**: `wrapper(prefix_ids[:, T_pre - lm_context_window:], use_cache=True)`.
     Walker continues from its already-advanced state (memory now reflects
@@ -283,7 +283,7 @@ for t, turn in enumerate(session.turns):
     if turn.role != "assistant":
         cumulative_prior.extend(turn.ids.cpu().tolist())
         continue
-    # ... below, sample_grpo_rollout calls wrapper.reset_memory(bs=K)
+    # ... below, sample_grpo_rollout calls wrapper.begin_segment(bs=K)
     # which RESETS walker state. State is rebuilt from scratch by
     # forwarding cumulative_prior tokens.
 ```

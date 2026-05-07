@@ -3,7 +3,7 @@
 Covers:
 - step_core_from_h: runs on an external [B, D_s] vector, mutates state,
   produces a finite motor_state.
-- forward_segment: [B, T, D_s] → [B, T, D_s] readouts. Gradient flows
+- walk_segment: [B, T, D_s] → [B, T, D_s] readouts. Gradient flows
   through all expected params including the pretrained-only
   `mem_input_v_proj`.
 - Block-vs-per-token parity for the compiled block path.
@@ -57,7 +57,7 @@ def test_step_core_from_h_runs_and_mutates_state():
     assert not torch.equal(s_before, m.s)
 
 
-def test_forward_segment_shapes_and_finite():
+def test_walk_segment_shapes_and_finite():
     torch.manual_seed(0)
     cfg = _tiny_cfg()
     lm = StandaloneLM(cfg).cpu()
@@ -66,13 +66,13 @@ def test_forward_segment_shapes_and_finite():
     h_mem = torch.randn(B, T, cfg.D_s)
 
     m.begin_segment(B, torch.device("cpu"))
-    readouts = m.forward_segment(h_mem)
+    readouts = m.walk_segment(h_mem)
 
     assert readouts.shape == (B, T, cfg.D_s)
     assert torch.isfinite(readouts).all()
 
 
-def test_forward_segment_gradient_reaches_pretrained_only_params():
+def test_walk_segment_gradient_reaches_pretrained_only_params():
     """Backward from a readouts.pow(2).mean() loss (proxy for the gradient
     Llama would inject through W_out) should reach:
     - mem_input_v_proj (only used in the external-h path)
@@ -96,7 +96,7 @@ def test_forward_segment_gradient_reaches_pretrained_only_params():
     h_mem = torch.randn(B, T, cfg.D_s, requires_grad=True)
 
     m.begin_segment(B, torch.device("cpu"))
-    readouts = m.forward_segment(h_mem)
+    readouts = m.walk_segment(h_mem)
     loss = readouts.float().pow(2).mean()
     loss.backward()
 
@@ -112,7 +112,7 @@ def test_forward_segment_gradient_reaches_pretrained_only_params():
 
     # Sanity: shared walker params get gradient too. The walker is vocab-
     # agnostic now — `state_to_model` (only used by the dropped aux CE
-    # path) deliberately gets NO gradient from forward_segment.
+    # path) deliberately gets NO gradient from walk_segment.
     for name in [
         "cols.q_proj.0.weight",
         "nbr_id_to_s.weight",
@@ -121,11 +121,11 @@ def test_forward_segment_gradient_reaches_pretrained_only_params():
         # named_parameters walks m (GraphWalkerMemory); cols is a submodule
         p = dict(m.named_parameters())[name]
         assert p.grad is not None and p.grad.abs().sum() > 0, (
-            f"{name} got no gradient from forward_segment"
+            f"{name} got no gradient from walk_segment"
         )
 
 
-def test_forward_segment_preserve_graph_skips_detach():
+def test_walk_segment_preserve_graph_skips_detach():
     """When preserve_graph=True, the walker's per-block detach is skipped,
     so gradient from a late-segment readout should reach h_mem[:, 0]."""
     torch.manual_seed(0)
@@ -137,7 +137,7 @@ def test_forward_segment_preserve_graph_skips_detach():
     input_ids = torch.randint(0, cfg.vocab_size, (B, T))
 
     m.begin_segment(B, torch.device("cpu"))
-    readouts = m.forward_segment(h_mem, preserve_graph=True)
+    readouts = m.walk_segment(h_mem, preserve_graph=True)
     # Loss from the LAST position only — gradient must reach h_mem[:, 0]
     # only if detach was skipped.
     loss = readouts[:, -1].pow(2).mean()
@@ -167,7 +167,7 @@ def _parity_setup(seed: int):
     return cfg, lm_a, lm_b, h_mem, input_ids, B, T
 
 
-def test_forward_segment_block_matches_per_token():
+def test_walk_segment_block_matches_per_token():
     """The block path (compile_block_from_h installed) must produce numerically
     identical readouts to the per-token path (no compile) when configs and
     inputs are matched. This locks in the parity that
@@ -182,7 +182,7 @@ def test_forward_segment_block_matches_per_token():
     m_a.begin_segment(B, torch.device("cpu"))
     h_a = h_mem.clone().requires_grad_(True)
     torch.manual_seed(2024)
-    readouts_a = m_a.forward_segment(h_a)
+    readouts_a = m_a.walk_segment(h_a)
 
     # Path B: block path. Skip torch.compile to keep this test cheap on CPU
     # — install a thin trampoline that delegates to block_forward_from_h.
@@ -191,7 +191,7 @@ def test_forward_segment_block_matches_per_token():
     m_b.begin_segment(B, torch.device("cpu"))
     h_b = h_mem.clone().requires_grad_(True)
     torch.manual_seed(2024)
-    readouts_b = m_b.forward_segment(h_b)
+    readouts_b = m_b.walk_segment(h_b)
 
     torch.testing.assert_close(readouts_a, readouts_b, rtol=1e-5, atol=1e-5)
 

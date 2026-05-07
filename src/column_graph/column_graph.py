@@ -354,7 +354,7 @@ class ColumnGraphMemory(nn.Module):
     #
     # Nothing inside this method mutates self's Python attrs (pred_cursor,
     # tick_counter, EMAs, ring buffer). Those are bookkeeping and live
-    # in forward_segment() outside the compile region. This keeps Inductor's
+    # in walk_segment() outside the compile region. This keeps Inductor's
     # graph stable and doesn't trigger recompiles on Python-int variation.
     #
     # The state `s` flows in as an argument and out as a return. The caller

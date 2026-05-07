@@ -78,7 +78,7 @@ src/pretrained/
 └── train_phase2.py              # grpo_step() — REINFORCE on rollouts
 
 src/model/                       # core memory graph (shared with from-scratch main)
-├── memory.py                    # MemoryGraph, forward_segment, _run_block, _modulate
+├── memory.py                    # MemoryGraph, walk_segment, _run_block, _modulate
 ├── attention_modulator.py       # shared-trunk modulator + DirectDecoder (ΔW/Δdecay)
 ├── discrete_policy.py           # codebook + Gumbel/Categorical sampling + log_pi
 └── triton_memory_step.py        # fused per-token LIF + W@msg + readout kernel
@@ -97,7 +97,7 @@ h_mem = W_in(h)                              # [BS, T, d_mem]
 # 2. read + write memory via closure
 readout = memory_fn(h_mem)                   # [BS, T, d_mem]
 # memory_fn is a closure installed by PretrainedLMWithMemory.forward
-# that calls MemoryGraph.forward_segment with the correct input_ids and
+# that calls MemoryGraph.walk_segment with the correct input_ids and
 # the Llama-shaped lm adapter (see §4).
 
 # 3. gated additive inject, then delegate to the original layer
@@ -139,7 +139,7 @@ From `docs/design.md` (unchanged by the pivot):
 ### Adapter for Llama
 
 `src/pretrained/llama_mem_adapter.py` provides a small object with the
-five fields `MemoryGraph.forward_segment` reads off its `lm` argument:
+five fields `MemoryGraph.walk_segment` reads off its `lm` argument:
 
 | Field                     | Custom LM              | Llama adapter               |
 |---------------------------|------------------------|-----------------------------|
@@ -149,7 +149,7 @@ five fields `MemoryGraph.forward_segment` reads off its `lm` argument:
 | `lm.ln_final.bias`        | `LayerNorm.bias`       | `None` (RMSNorm has none)   |
 | `lm.mem_head_logits(x)`   | method → [BS,T,vocab]  | method: `lm_head(llama.model.norm(W_out(x)))` |
 
-`forward_segment` takes a `use_rmsnorm: bool` kwarg; `_run_block`
+`walk_segment` takes a `use_rmsnorm: bool` kwarg; `_run_block`
 branches on it to pick `F.rms_norm` vs `F.layer_norm` for the per-token
 surprise signal. Llama path passes `use_rmsnorm=True, rms_eps=1e-5`.
 
@@ -185,7 +185,7 @@ signal matters. Cycle phase-1 uses the autoregressive variant.
     `target_ids`.
   - `mem_pred_loss` is a memory-side auxiliary: memory's own readout goes
     through `W_out → llama.norm → lm_head` and is CE'd against the
-    shifted stream tokens `input_ids` inside `forward_segment`
+    shifted stream tokens `input_ids` inside `walk_segment`
     (`readout[t-1] -> input_ids[t]`, with token 0 masked by `prev_token` /
     segment start rules). This couples memory's readout space to the LM's
     prediction space and gives a direct gradient from the memory graph to
@@ -199,7 +199,7 @@ signal matters. Cycle phase-1 uses the autoregressive variant.
   completes).
 - **TBPTT**: detach memory state (`h`, `msg`, `W`, `decay`, `hebbian`,
   `prev_readout`, `s_mem_*`) every `cfg.memory.tbptt_block` tokens within a
-  segment. `forward_segment` also detaches the persistent state across
+  segment. `walk_segment` also detaches the persistent state across
   segments. The default factories (`llama_1b()` / `llama_3b()`) mirror the
   top-level pretrained default into the default-created memory config, so
   the out-of-the-box detach cadence is `32`.
@@ -240,7 +240,7 @@ from src.pretrained.train_phase1 import Phase1Batch, run_phase1
 
 cfg = PretrainedConfig.llama_3b()
 wrapper = PretrainedLMWithMemory(cfg)
-wrapper.reset_memory(bs=cfg.bs)
+wrapper.begin_segment(bs=cfg.bs)
 opt = torch.optim.AdamW([p for _, p in wrapper.trainable_parameters()], lr=1e-4)
 
 def data_iter():
@@ -257,8 +257,8 @@ run_phase1(wrapper, opt, data_iter(), steps=N, mem_pred_weight=0.1,
 
 **Per step**:
 
-1. `wrapper.reset_memory(bs=BS)`.
-2. Enter `wrapper.preserve_memory_graph()` — memory state will stay
+1. `wrapper.begin_segment(bs=BS)`.
+2. Enter `wrapper.preserve_autograd_graph()` — memory state will stay
    graph-connected across the prefix pass and the per-continuation-token
    forwards.
 3. **Prefix pass** (parallel teacher-forced, Gumbel-soft at each
@@ -350,7 +350,7 @@ zero movement.
 
 1. Replicate the prefix K times (`[K, T_prefix]`).
 2. `wrapper.current_phase = "phase2"`; `wrapper.train(True)`;
-   `wrapper.reset_memory(bs=K)`.
+   `wrapper.begin_segment(bs=K)`.
 3. **Prefix pass with grad and KV cache**:
    `out = wrapper(prefix_rep, use_cache=True)`.
    - Memory samples K independent hard codes at each modulator fire.
@@ -396,7 +396,7 @@ zero movement.
 **Deliberately not wired (future work):**
 
 - **KL-to-reference-policy**. Needs a reference modulator snapshot (e.g., the pre-phase-2 weights) plus per-fire logits re-evaluated under both policies. Not a one-liner; tracked in the status table.
-- **Entropy bonus**. Needs per-fire logits plumbed out of `_modulate` through `_run_block` into `forward_segment`. The sampled `log_pi` alone is not a proxy for the full-distribution entropy.
+- **Entropy bonus**. Needs per-fire logits plumbed out of `_modulate` through `_run_block` into `walk_segment`. The sampled `log_pi` alone is not a proxy for the full-distribution entropy.
 
 ### Entry point
 
@@ -494,7 +494,7 @@ a long-context bench) and there's no single-size-fits-all CLI to wire.
 | Phase-1 parallel `run_phase1()`        | ✓ smoke-covered (synthetic + real wikitext) |
 | Phase-1 AR unroll `run_phase1_ar()`    | ✓ smoke-covered (grad reaches prefix-fire modulator) |
 | Freeze helpers (codebook+decoder / logit-head-only / all) | ✓ smoke-covered |
-| `preserve_memory_graph()` context      | ✓ smoke-covered (AR unroll uses it) |
+| `preserve_autograd_graph()` context      | ✓ smoke-covered (AR unroll uses it) |
 | Autoregressive rollout primitive       | ✓ smoke-covered (K divergence) |
 | Phase-2 `grpo_step()` loop             | ✓ smoke-covered (stub reward, gradient reaches modulator + codebook) |
 | Advantage-std floor for stability      | ✓ smoke-covered (near-uniform rewards clamped) |

@@ -1,16 +1,16 @@
 """Regression tests for the second bug-sweep fixes (post 32684cf):
 
-1. autoregressive_rollout restores wrapper.training and memory.phase
-   on exit. Previously it left the wrapper in eval mode, which silently
+1. autoregressive_rollout restores model.training and memory.phase
+   on exit. Previously it left the model in eval mode, which silently
    skipped aux loss in the next phase-1 step.
-2. forward_segment skips the dense vocab readout AND plasticity finalize
+2. walk_segment skips the dense vocab readout AND plasticity finalize
    when a block has zero valid horizons (typical for T=1 generation
    steps inside an AR rollout).
 3. unfreeze_all() re-freezes the standalone-only walker params
    (token_to_state, input_v_proj). Without this they re-enter the
    optimizer state every cycle as dead weights.
 4. begin_segment(clear_neuromod_carryover=True) wipes the previous
-   segment's neuromod snapshot. wrapper.reset_memory defaults to
+   segment's neuromod snapshot. model.begin_segment defaults to
    True for the pretrained path (independent-document batches).
 5. phase1_pretrained_step asserts target_ids.shape == input_ids.shape
    to catch the "already pre-shifted" footgun.
@@ -24,7 +24,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rollout import autoregressive_rollout
 from src.graph_walker.pretrained.train_phase1 import (
     Phase1Batch,
@@ -68,7 +68,7 @@ def _make_tiny_wrapper(d_lm=32, vocab=256, T=8):
         model_name="random", inject_layer=2, d_mem=d_lm,
         memory=walker_cfg, T=T, bs=2, llama_dtype="fp32",
     )
-    return GraphWalkerPretrainedLM(cfg, hf_model=hf)
+    return IntegratedLM(cfg, hf_model=hf)
 
 
 # -- 1. rollout train-mode + memory.phase restore --
@@ -87,7 +87,7 @@ def test_autoregressive_rollout_restores_training_and_memory_phase():
     )
 
     assert w.training is True, (
-        "rollout left wrapper in eval mode — next phase-1 cycle would skip aux loss"
+        "rollout left model in eval mode — next phase-1 cycle would skip aux loss"
     )
     assert w.current_phase == "phase1"
     assert w.memory.phase == "phase1", (
@@ -96,11 +96,11 @@ def test_autoregressive_rollout_restores_training_and_memory_phase():
     )
 
 
-# -- 2. forward_segment skips work on targetless blocks --
+# -- 2. walk_segment skips work on targetless blocks --
 
 
-def test_forward_segment_does_not_alter_surprise_or_e_bias():
-    """`forward_segment` is now a pure forward (vocab-agnostic walker):
+def test_walk_segment_does_not_alter_surprise_or_e_bias():
+    """`walk_segment` is now a pure forward (vocab-agnostic walker):
     it must NOT touch `surprise_ema` and must NOT fire plasticity. Both
     are externally driven by the trainer via `update_plasticity` after
     backward."""
@@ -116,13 +116,13 @@ def test_forward_segment_does_not_alter_surprise_or_e_bias():
     surprise_before = m.surprise_ema.clone()
     e_bias_before = m.E_bias_flat.clone()
 
-    # Single T=1 forward via forward_segment.
+    # Single T=1 forward via walk_segment.
     h_mem = torch.randn(2, 1, walker_cfg.D_s)
-    readouts = m.forward_segment(h_mem)
+    readouts = m.walk_segment(h_mem)
     assert readouts.shape == (2, 1, walker_cfg.D_s)
     # surprise EMA must be untouched.
     assert torch.equal(m.surprise_ema, surprise_before), (
-        "forward_segment touched surprise_ema — should be externally driven only"
+        "walk_segment touched surprise_ema — should be externally driven only"
     )
     # E_bias must be untouched (plasticity is post-backward only).
     assert torch.equal(m.E_bias_flat, e_bias_before)
@@ -161,30 +161,30 @@ def test_begin_segment_clears_neuromod_carryover_when_requested():
     # if neuromod_only mode adds a per-col surprise broadcast feature).
     extra = 1 if walker_cfg.plasticity_mode == "neuromod_only" else 0
     D_feat = walker_cfg.D_s + walker_cfg.D_id + 1 + extra
-    m._prev_snapshot_ids = torch.tensor([1, 2], dtype=torch.int64)
-    m._prev_snapshot_feats = torch.randn(2, D_feat)
+    m._neuromod_input_ids = torch.tensor([1, 2], dtype=torch.int64)
+    m._neuromod_input_feats = torch.randn(2, D_feat)
 
     # Default (False) preserves carryover.
     m.begin_segment(B=2, device=torch.device("cpu"))
-    assert m._prev_snapshot_ids is not None
+    assert m._neuromod_input_ids is not None
 
     # Explicit True clears.
-    m._prev_snapshot_ids = torch.tensor([1, 2], dtype=torch.int64)
+    m._neuromod_input_ids = torch.tensor([1, 2], dtype=torch.int64)
     m.begin_segment(B=2, device=torch.device("cpu"), clear_neuromod_carryover=True)
-    assert m._prev_snapshot_ids is None
-    assert m._prev_snapshot_feats is None
-    assert m._active_delta_nm is None
+    assert m._neuromod_input_ids is None
+    assert m._neuromod_input_feats is None
+    assert m._active_neuromod_delta is None
 
 
-def test_wrapper_reset_memory_preserves_carryover_by_default():
+def test_model_begin_segment_preserves_carryover_by_default():
     """Under the external-surprise design, the previous step's neuromod
-    snapshot must be preserved into the next segment so `_active_delta_nm`
+    snapshot must be preserved into the next segment so `_active_neuromod_delta`
     is non-None during the next forward — otherwise neuromod params get
     no gradient. Callers that want to clear it (e.g., across truly
     independent runs) can pass `clear_neuromod_carryover=True`."""
     w = _make_tiny_wrapper()
     w.train()
-    # Run one full forward+backward pass to populate `_prev_snapshot_*`
+    # Run one full forward+backward pass to populate `_neuromod_input_*`
     # via update_plasticity.
     opt = torch.optim.AdamW([p for _, p in w.trainable_parameters()], lr=1e-4)
     batch = Phase1Batch(
@@ -192,26 +192,26 @@ def test_wrapper_reset_memory_preserves_carryover_by_default():
         target_ids=torch.randint(0, 256, (2, 8)),
     )
     phase1_pretrained_step(w, opt, batch, amp_dtype=None)
-    assert w.memory._prev_snapshot_ids is not None, (
+    assert w.memory._neuromod_input_ids is not None, (
         "post-step snapshot expected to be populated by update_plasticity"
     )
-    snapshot_ids_before = w.memory._prev_snapshot_ids
+    snapshot_ids_before = w.memory._neuromod_input_ids
 
-    w.reset_memory(bs=2)
-    assert w.memory._prev_snapshot_ids is snapshot_ids_before, (
-        "wrapper.reset_memory must preserve neuromod carryover by default"
+    w.begin_segment(bs=2)
+    assert w.memory._neuromod_input_ids is snapshot_ids_before, (
+        "model.begin_segment must preserve neuromod carryover by default"
     )
 
     # Explicit clear still works.
-    w.reset_memory(bs=2, clear_neuromod_carryover=True)
-    assert w.memory._prev_snapshot_ids is None
-    assert w.memory._prev_snapshot_feats is None
+    w.begin_segment(bs=2, clear_neuromod_carryover=True)
+    assert w.memory._neuromod_input_ids is None
+    assert w.memory._neuromod_input_feats is None
 
 
-def test_update_plasticity_preserves_grad_on_active_delta_nm():
+def test_update_plasticity_preserves_grad_on_active_neuromod_delta():
     """Regression for the @torch.no_grad() decorator bug on update_plasticity
     (Codex audit 2026-05-04). The function MUST NOT be wrapped in no_grad
-    because the trailing `_begin_plastic_window()` rebuilds `_active_delta_nm`
+    because the trailing `_begin_plastic_window()` rebuilds `_active_neuromod_delta`
     by running the neuromod forward — under no_grad, that delta has no
     grad_fn, and the next segment's loss can't train the neuromod via the
     REINFORCE / phase-1-AR routing path. Symptom is silent: the model
@@ -229,19 +229,19 @@ def test_update_plasticity_preserves_grad_on_active_delta_nm():
     # snapshot path (post-step the snapshot is populated, then
     # _begin_plastic_window builds the next delta).
     phase1_pretrained_step(w, opt, batch, amp_dtype=None)
-    delta = w.memory._active_delta_nm
+    delta = w.memory._active_neuromod_delta
     assert delta is not None, (
-        "_active_delta_nm should have been rebuilt by _begin_plastic_window "
+        "_active_neuromod_delta should have been rebuilt by _begin_plastic_window "
         "at the end of update_plasticity"
     )
     # The non-zero edge entries must carry grad_fn back to neuromod params.
     # If torch.no_grad is wrapping update_plasticity, this assertion fails.
     assert delta.requires_grad, (
-        "_active_delta_nm has no grad — neuromod will get NO learning signal "
+        "_active_neuromod_delta has no grad — neuromod will get NO learning signal "
         "next segment. Probable cause: @torch.no_grad() on update_plasticity."
     )
     assert delta.grad_fn is not None, (
-        "_active_delta_nm has no grad_fn — same root cause as requires_grad=False"
+        "_active_neuromod_delta has no grad_fn — same root cause as requires_grad=False"
     )
 
 

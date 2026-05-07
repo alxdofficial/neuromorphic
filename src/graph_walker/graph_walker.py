@@ -56,7 +56,7 @@ from src.graph_walker.triton.lif import sparse_lif_update
 
 
 class _NullCtx:
-    """Minimal no-op context for the autocast-defensive wrap in forward_segment."""
+    """Minimal no-op context for the autocast-defensive wrap in walk_segment."""
     def __enter__(self): return self
     def __exit__(self, *a): return False
 
@@ -561,23 +561,23 @@ class GraphWalkerMemory(nn.Module):
         self.co_visit_flat: torch.Tensor | None = None  # [N*K] fp32
         self.window_len: int = 0
 
-        # Neuromod plastic-window state. `_active_delta_nm` is the grad-
+        # Neuromod plastic-window state. `_active_neuromod_delta` is the grad-
         # carrying E_bias delta for the CURRENT plasticity window; it is
         # computed at window start from the snapshot of the PREVIOUS window,
         # detached and merged into E_bias_flat at window close. None when
         # there is no previous snapshot (bootstrapping) or neuromod off.
-        self._active_delta_nm: torch.Tensor | None = None
+        self._active_neuromod_delta: torch.Tensor | None = None
         # Snapshot of the most recently closed window's touched columns —
-        # consumed at the next window's start to produce _active_delta_nm.
-        self._prev_snapshot_ids: torch.Tensor | None = None
-        self._prev_snapshot_feats: torch.Tensor | None = None
+        # consumed at the next window's start to produce _active_neuromod_delta.
+        self._neuromod_input_ids: torch.Tensor | None = None
+        self._neuromod_input_feats: torch.Tensor | None = None
         # Per-edge co_visit snapshot from the just-closed window. Captured
         # in `_snapshot_touched_columns` BEFORE `_plasticity_step` resets
         # `co_visit_flat`, so the next window's neuromod sees the activity
         # pattern that produced the snapshot. Only populated in
         # neuromod_only mode (legacy mode reads co_visit live in the
         # Hebbian path before the reset).
-        self._prev_snapshot_co_visit_flat: torch.Tensor | None = None
+        self._neuromod_input_co_visit_flat: torch.Tensor | None = None
 
         # Visit-frequency count across the current training step (for
         # load-balance aux loss). Reset externally per step.
@@ -604,10 +604,10 @@ class GraphWalkerMemory(nn.Module):
         # `consume_routing_trace()`.
         self._captured_routes: list | None = None
         # DeepSeek-style replay stash. When non-None, the next
-        # `forward_segment` consumes it as the per-step routing trace
+        # `walk_segment` consumes it as the per-step routing trace
         # (length must equal segment length) and runs the per-token
         # path with `replay_choices` per step. Cleared after one
-        # forward_segment call. Set via `arm_replay_trace(trace)`.
+        # walk_segment call. Set via `arm_replay_trace(trace)`.
         self._next_replay_trace: list | None = None
         self._log_pi_sum: torch.Tensor | None = None
         # Companion counter for the running sum: the number of `_apply_step_state`
@@ -635,7 +635,7 @@ class GraphWalkerMemory(nn.Module):
         # recurrent work.
         self._compiled_step = None
 
-        # Filled when compile_block_from_h() is called; forward_segment
+        # Filled when compile_block_from_h() is called; walk_segment
         # routes a whole tbptt block through the compiled version when set,
         # replacing T_block per-token step_core_from_h calls.
         self._compiled_block_from_h = None
@@ -708,8 +708,8 @@ class GraphWalkerMemory(nn.Module):
         Args:
             B: batch size for the new segment.
             device: target device.
-            clear_neuromod_carryover: if True, also clear `_prev_snapshot_*`
-                and `_active_delta_nm`. Use this for INDEPENDENT-document
+            clear_neuromod_carryover: if True, also clear `_neuromod_input_*`
+                and `_active_neuromod_delta`. Use this for INDEPENDENT-document
                 batches (e.g. shuffled pretrained training) — without
                 clearing, the previous batch's last-window snapshot
                 bleeds into the new batch's first window's neuromod
@@ -720,10 +720,10 @@ class GraphWalkerMemory(nn.Module):
         cfg = self.cfg
         dtype_fast = self._fast_dtype(device)
         if clear_neuromod_carryover:
-            self._prev_snapshot_ids = None
-            self._prev_snapshot_feats = None
-            self._prev_snapshot_co_visit_flat = None
-            self._active_delta_nm = None
+            self._neuromod_input_ids = None
+            self._neuromod_input_feats = None
+            self._neuromod_input_co_visit_flat = None
+            self._active_neuromod_delta = None
 
         self.s = torch.zeros(B, cfg.N, cfg.D_s, device=device, dtype=dtype_fast)
         # prev_motor: last step's motor output, chained into next step's
@@ -791,9 +791,9 @@ class GraphWalkerMemory(nn.Module):
         """
         self.E_bias_flat.zero_()
         # Also clear any carried-over neuromod snapshot.
-        self._prev_snapshot_ids = None
-        self._prev_snapshot_feats = None
-        self._active_delta_nm = None
+        self._neuromod_input_ids = None
+        self._neuromod_input_feats = None
+        self._active_neuromod_delta = None
 
     # -----------------------------------------------------------------
     # Neuromodulator plumbing
@@ -804,17 +804,17 @@ class GraphWalkerMemory(nn.Module):
         """Called at the start of each plasticity window.
 
         Consumes the snapshot of the previous window's touched columns and
-        produces `_active_delta_nm` — a grad-carrying delta added to
+        produces `_active_neuromod_delta` — a grad-carrying delta added to
         `E_bias_flat.detach()` during routing this window.
         """
-        if self.neuromod is None or self._prev_snapshot_feats is None:
-            self._active_delta_nm = None
+        if self.neuromod is None or self._neuromod_input_feats is None:
+            self._active_neuromod_delta = None
             return
-        touched_ids = self._prev_snapshot_ids
-        feats = self._prev_snapshot_feats
+        touched_ids = self._neuromod_input_ids
+        feats = self._neuromod_input_feats
         if touched_ids.numel() < 2:
             # Need at least 2 touched columns for any edge between them.
-            self._active_delta_nm = None
+            self._active_neuromod_delta = None
             return
 
         adj_bias = build_adjacency_bias(touched_ids, self.out_nbrs)
@@ -822,7 +822,7 @@ class GraphWalkerMemory(nn.Module):
             touched_ids, self.out_nbrs, self.cfg.K,
         )
         if edge_flat.numel() == 0:
-            self._active_delta_nm = None
+            self._active_neuromod_delta = None
             return
 
         # In neuromod_only mode, hand the neuromod the per-edge Hebbian-
@@ -838,18 +838,18 @@ class GraphWalkerMemory(nn.Module):
         # see all-zero co_visit (the just-reset live buffer) and never
         # learn to use the per-edge attention bias path.
         if self.cfg.plasticity_mode == "neuromod_only":
-            if self._prev_snapshot_co_visit_flat is None:
+            if self._neuromod_input_co_visit_flat is None:
                 # No co_visit snapshot yet (planted features without one,
                 # or first window after reset_plastic_memory). Without it
                 # we can't compute per_edge_extras and the neuromod's
                 # edge MLP / per-head bias path is undefined. Skip this
                 # window's plasticity entirely; it will resume on the
                 # next properly-snapshotted close.
-                self._active_delta_nm = None
+                self._active_neuromod_delta = None
                 return
             with torch.no_grad():
                 co_visit_at_edges = (
-                    self._prev_snapshot_co_visit_flat[edge_flat]
+                    self._neuromod_input_co_visit_flat[edge_flat]
                 )
                 e_bias_at_edges = self.E_bias_flat.detach()[edge_flat]
                 # `window_len` was reset by the just-closed `_plasticity_step`,
@@ -873,7 +873,7 @@ class GraphWalkerMemory(nn.Module):
         # Convert target → delta via EMA blend gated by γ:
         #   active_E_bias = (1 - γ)·E_bias_base + γ·target
         #                 = E_bias_base + γ·(target - E_bias_base)
-        # so _active_delta_nm[edge] = γ · (target[edge] - E_bias_base[edge]).
+        # so _active_neuromod_delta[edge] = γ · (target[edge] - E_bias_base[edge]).
         # E_bias_base is detached (no grad back into the persistent buffer)
         # but γ and target both carry grad, so the neuromod still trains
         # from the window's routing gradient.
@@ -885,7 +885,7 @@ class GraphWalkerMemory(nn.Module):
             self.cfg.num_edges, device=delta_edge.device, dtype=torch.float32,
         )
         # `.float()` on delta_edge preserves grad_fn through the dtype cast.
-        self._active_delta_nm = dense.index_copy(0, edge_flat, delta_edge)
+        self._active_neuromod_delta = dense.index_copy(0, edge_flat, delta_edge)
 
     def _active_e_bias(self) -> torch.Tensor:
         """E_bias tensor used by routing this window.
@@ -900,15 +900,15 @@ class GraphWalkerMemory(nn.Module):
         update), and we never want that entering the compiled step.
         """
         base = self.E_bias_flat.detach()
-        if self._active_delta_nm is None:
+        if self._active_neuromod_delta is None:
             return base
-        return base + self.cfg.neuromod_eta * self._active_delta_nm
+        return base + self.cfg.neuromod_eta * self._active_neuromod_delta
 
     @torch._dynamo.disable
     def _snapshot_touched_columns(self) -> None:
         """Snapshot stats for columns visited in the window just closed.
 
-        Stored in `_prev_snapshot_ids`, `_prev_snapshot_feats` (both detached)
+        Stored in `_neuromod_input_ids`, `_neuromod_input_feats` (both detached)
         for consumption by the NEXT window's `_begin_plastic_window`.
         Called at window close, before counters are reset.
 
@@ -930,9 +930,9 @@ class GraphWalkerMemory(nn.Module):
         touched_mask = self.visit_count > 0
         touched_ids = torch.nonzero(touched_mask, as_tuple=False).squeeze(-1)
         if touched_ids.numel() == 0:
-            self._prev_snapshot_ids = None
-            self._prev_snapshot_feats = None
-            self._prev_snapshot_co_visit_flat = None
+            self._neuromod_input_ids = None
+            self._neuromod_input_feats = None
+            self._neuromod_input_co_visit_flat = None
             return
 
         with torch.no_grad():
@@ -948,19 +948,19 @@ class GraphWalkerMemory(nn.Module):
                 parts.append(surprise_feat)
             feats = torch.cat(parts, dim=-1)
 
-        self._prev_snapshot_ids = touched_ids.detach()
-        self._prev_snapshot_feats = feats.detach()
+        self._neuromod_input_ids = touched_ids.detach()
+        self._neuromod_input_feats = feats.detach()
         # Snapshot co_visit BEFORE `_plasticity_step` resets it. The next
         # window's neuromod needs the just-closed window's per-edge
         # activity to predict targeted plastic updates. Stored as the full
         # [N*K] flat layout for cheap gather at edge_flat indices later.
         if self.cfg.plasticity_mode == "neuromod_only":
-            self._prev_snapshot_co_visit_flat = (
+            self._neuromod_input_co_visit_flat = (
                 self.co_visit_flat.detach().clone()
                 if self.co_visit_flat is not None else None
             )
         else:
-            self._prev_snapshot_co_visit_flat = None
+            self._neuromod_input_co_visit_flat = None
 
     def detach_state(self) -> None:
         """TBPTT boundary: preserve values, sever gradient graph."""
@@ -985,9 +985,9 @@ class GraphWalkerMemory(nn.Module):
         self._k_all_cache = None
         # Neuromod delta must also get a fresh grad_fn for the next block.
         # The underlying snapshot is already detached, so rebuilding
-        # `_active_delta_nm` from it gives a fresh grad path while the
+        # `_active_neuromod_delta` from it gives a fresh grad path while the
         # value remains identical.
-        self._active_delta_nm = None
+        self._active_neuromod_delta = None
         self._begin_plastic_window()
 
     def _fast_dtype(self, device: torch.device) -> torch.dtype:
@@ -1122,12 +1122,12 @@ class GraphWalkerMemory(nn.Module):
         return out
 
     def arm_replay_trace(self, trace: list[StepRoutingChoices]) -> None:
-        """Stash a routing trace for the NEXT `forward_segment` call.
+        """Stash a routing trace for the NEXT `walk_segment` call.
 
         Used by phase-2 GRPO replay path: after sampling under no-grad
         with capture armed, the trainer calls
         `wrapper.memory.arm_replay_trace(captured_trace)` immediately
-        before the with-grad teacher-forced re-forward. `forward_segment`
+        before the with-grad teacher-forced re-forward. `walk_segment`
         consumes the stash, runs the per-token path with `replay_choices`
         per step, and clears the stash to None on entry.
         """
@@ -1140,7 +1140,7 @@ class GraphWalkerMemory(nn.Module):
         accumulate surprise (that only happens via `accumulate_block_ce`
         from `phase1_step`) and does NOT fire plasticity (firing here
         would both use a stale/zero `surprise_ema` AND rebuild the
-        neuromod's `_active_delta_nm` without the subsequent
+        neuromod's `_active_neuromod_delta` without the subsequent
         `detach_state` rescue, leaving it grad-free for the next
         window). Training code must use `step_core()` + `phase1_step`
         flush instead.
@@ -1324,7 +1324,7 @@ class GraphWalkerMemory(nn.Module):
     ) -> BlockOutput:
         """Block-level analog of `block_forward` driven by an externally-
         supplied [B, T_block, D_s] hidden-state stream instead of token ids.
-        Used by the pretrained-LM integration (`forward_segment`): one
+        Used by the pretrained-LM integration (`walk_segment`): one
         compiled call per `tbptt_block` window replaces T_block per-token
         `step_core_from_h` calls. Inductor fuses across step boundaries,
         reproducing the standalone whole-block speedup (~3.7× over eager).
@@ -1447,7 +1447,7 @@ class GraphWalkerMemory(nn.Module):
         self, mode: str = "default", fullgraph: bool = True,
     ) -> None:
         """Compile `block_forward_from_h` for whole-block fusion in the
-        pretrained-LM integration path. ``forward_segment`` routes through
+        pretrained-LM integration path. ``walk_segment`` routes through
         `_compiled_block_from_h` when set — one compiled call per
         `tbptt_block` window instead of T_block per-token calls.
 
@@ -1475,7 +1475,7 @@ class GraphWalkerMemory(nn.Module):
     ) -> WalkerCoreReadout:
         """Hot core driven by an externally-supplied `[B, D_s]` vector
         instead of a `token_id`. Used by the pretrained-LM integration
-        (`forward_segment`) where h_mem_t = W_in(llama_hidden_state_t)
+        (`walk_segment`) where h_mem_t = W_in(llama_hidden_state_t)
         arrives already in graph-state dim.
 
         Routes through `_compiled_step` if `compile_step()` has been
@@ -1497,7 +1497,7 @@ class GraphWalkerMemory(nn.Module):
         # Replay mode bypasses the compiled step (which doesn't take a
         # `replay_choices` arg). Replay is a phase-2 GRPO-only path; the
         # compile speedup it would lose is irrelevant since phase-2
-        # already disables the compiled-block path (see forward_segment).
+        # already disables the compiled-block path (see walk_segment).
         # Replay overrides `is_new_window` from the saved trace's
         # `anchor_idx` presence: during sampling, anchor_idx was captured
         # iff `is_new_window=True` at that step. Recreating the same
@@ -1530,7 +1530,7 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=out.load_balance_loss,
         )
 
-    def forward_segment(
+    def walk_segment(
         self,
         h_mem: torch.Tensor,                     # [B, T, D_s]
         input_ids: torch.Tensor | None = None,   # accepted for back-compat; unused
@@ -1550,7 +1550,7 @@ class GraphWalkerMemory(nn.Module):
 
         State contract:
         - Caller is responsible for `begin_segment(B, device)` (via
-          `wrapper.reset_memory(bs)`) before the first segment.
+          `wrapper.begin_segment(bs)`) before the first segment.
         - TBPTT: state is detached every `cfg.tbptt_block` tokens. Skipped
           when `preserve_graph=True` (AR unroll).
         - **Plasticity does NOT fire inside this method.** Surprise is
@@ -1568,7 +1568,7 @@ class GraphWalkerMemory(nn.Module):
             f"h_mem last-dim {D_s} must match cfg.D_s {self.cfg.D_s}"
         )
         assert self._state_initialized, (
-            "call begin_segment(B, device) before forward_segment()"
+            "call begin_segment(B, device) before walk_segment()"
         )
 
         device = h_mem.device
@@ -1588,7 +1588,7 @@ class GraphWalkerMemory(nn.Module):
         # silently skip replay — manifesting only on CUDA without an
         # external autocast region (CPU tests would not catch it).
         if device.type == "cuda" and not torch.is_autocast_enabled():
-            return self._forward_segment_with_autocast(
+            return self._walk_segment_with_autocast(
                 h_mem, preserve_graph=preserve_graph,
             )
 
@@ -1734,19 +1734,19 @@ class GraphWalkerMemory(nn.Module):
         readouts = torch.cat(motor_blocks, dim=1)                       # [B, T, D_s]
         return readouts
 
-    def _forward_segment_with_autocast(
+    def _walk_segment_with_autocast(
         self,
         h_mem: torch.Tensor,
         *,
         preserve_graph: bool,
     ) -> torch.Tensor:
         """Defensive wrapper that enters bf16 autocast on CUDA before
-        recursing into `forward_segment`. Used when a caller runs us on
+        recursing into `walk_segment`. Used when a caller runs us on
         CUDA without first establishing an autocast region — without it,
         the bf16 column state would mismatch the fp32 walker weights in
         `content_mlp` / `q_proj`."""
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            return self.forward_segment(
+            return self.walk_segment(
                 h_mem, preserve_graph=preserve_graph,
             )
 
@@ -2188,7 +2188,7 @@ class GraphWalkerMemory(nn.Module):
           - `_plasticity_step`           @torch.no_grad
         The final `_begin_plastic_window()` call MUST run with gradients
         enabled — it runs the neuromod forward to build the next segment's
-        `_active_delta_nm`, and that delta MUST carry grad_fn so the next
+        `_active_neuromod_delta`, and that delta MUST carry grad_fn so the next
         forward's loss can train the neuromod. Wrapping this whole function
         in @torch.no_grad would silently kill the neuromod training signal
         (caught by Codex audit 2026-05-04 — was a real bug introduced by
@@ -2204,13 +2204,13 @@ class GraphWalkerMemory(nn.Module):
             the structural plastic update (`E_bias_flat`) is frozen.
           - ``per_token_surprise: [B, T] float``: training. Fold per-token
             CE into ``surprise_ema``, fire one plasticity window (commit the
-            current ``_active_delta_nm`` into ``E_bias_flat``, snapshot,
+            current ``_active_neuromod_delta`` into ``E_bias_flat``, snapshot,
             reset window counters), then build the next window's neuromod
             delta with a fresh forward pass.
 
         Why a single fire per call rather than a fire per ``mod_period``
         block: under external-surprise mode all ``T`` forward steps in the
-        segment shared the SAME ``_active_delta_nm`` — there is exactly one
+        segment shared the SAME ``_active_neuromod_delta`` — there is exactly one
         delta to commit per segment forward. Multiple commits would commit
         deltas that no forward step ever read, attaching no gradient to
         their neuromod params. Effective plasticity rate becomes once per
@@ -2252,7 +2252,7 @@ class GraphWalkerMemory(nn.Module):
         # Snapshot, fire plasticity, build next delta.
         # `_plasticity_step` resets `window_len`, `co_visit_flat`, and
         # `visit_count`; `_begin_plastic_window` produces a fresh
-        # grad-carrying `_active_delta_nm` for the next segment.
+        # grad-carrying `_active_neuromod_delta` for the next segment.
         self._finalize_surprise_window()
         self._plasticity_step()
         self._begin_plastic_window()
@@ -2285,7 +2285,7 @@ class GraphWalkerMemory(nn.Module):
     def _plasticity_step(self) -> None:
         """Plasticity update on window close. Runs:
           1. Scalar-eta Hebbian on traversed-edge counts (legacy).
-          2. If neuromod is enabled: bake the grad-carrying `_active_delta_nm`
+          2. If neuromod is enabled: bake the grad-carrying `_active_neuromod_delta`
              into `E_bias_flat` (detached), then take a new snapshot of the
              just-closed window and produce the next window's delta.
 
@@ -2319,9 +2319,9 @@ class GraphWalkerMemory(nn.Module):
 
             # Neuromod contribution (if any), detached and scaled.
             delta_nm_commit = torch.zeros_like(self.E_bias_flat)
-            if self._active_delta_nm is not None:
+            if self._active_neuromod_delta is not None:
                 delta_nm_commit = (
-                    cfg.neuromod_eta * self._active_delta_nm.detach()
+                    cfg.neuromod_eta * self._active_neuromod_delta.detach()
                 )
 
             self.E_bias_flat = (
@@ -2338,11 +2338,11 @@ class GraphWalkerMemory(nn.Module):
         self.window_len = 0
         if self.visit_count is not None:
             self.visit_count = torch.zeros_like(self.visit_count)
-        self._active_delta_nm = None
+        self._active_neuromod_delta = None
 
         # NOTE: `_begin_plastic_window()` deliberately does NOT run here.
         # This method is @torch.no_grad()'d — running the neuromod forward
-        # inside that scope would produce an `_active_delta_nm` without a
+        # inside that scope would produce an `_active_neuromod_delta` without a
         # grad_fn, and routing in the next window would see a grad-free
         # delta, silently killing the neuromod's training signal. The
         # caller (`_maybe_finalize_surprise_and_plasticity`) runs

@@ -51,7 +51,7 @@ from transformers import AutoTokenizer
 from src.data.passphrase_chat_loader import passphrase_chat_grpo_iter
 from src.graph_walker.config import GraphWalkerConfig
 from src.graph_walker.pretrained.config import PretrainedGWConfig
-from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+from src.graph_walker.pretrained.integrated_lm import IntegratedLM
 from src.graph_walker.pretrained.rewards import (
     BertCosineReward, load_default_bert,
 )
@@ -103,18 +103,18 @@ def _bench_one(
             grpo_K=K,
             grpo_rollout_len=args.gen_length,
         )
-        wrapper = GraphWalkerPretrainedLM(cfg).cuda()
-        wrapper.train(True)
-        vocab = wrapper.llama.config.vocab_size
+        model = IntegratedLM(cfg).cuda()
+        model.train(True)
+        vocab = model.llama.config.vocab_size
 
-        # Phase-1 prime: build _prev_snapshot_* so first GRPO step has grad.
+        # Phase-1 prime: build _neuromod_input_* so first GRPO step has grad.
         prime_opt = torch.optim.AdamW(
-            [p for _, p in wrapper.trainable_parameters()],
+            [p for _, p in model.trainable_parameters()],
             lr=1e-7, fused=True,
         )
         prime_in = torch.randint(0, vocab, (1, args.t_pre), device="cuda")
         phase1_pretrained_step(
-            wrapper, prime_opt,
+            model, prime_opt,
             Phase1Batch(input_ids=prime_in, target_ids=prime_in),
             amp_dtype=torch.bfloat16,
         )
@@ -122,13 +122,13 @@ def _bench_one(
         torch.cuda.empty_cache()
 
         # Phase-2 freeze
-        wrapper.freeze_all_but_E_bias_and_neuromod()
+        model.freeze_all_but_E_bias_and_neuromod()
         opt = torch.optim.AdamW(
-            [p for _, p in wrapper.trainable_parameters()],
+            [p for _, p in model.trainable_parameters()],
             lr=1e-5, fused=True,
         )
         n_trainable = sum(
-            p.numel() for _, p in wrapper.trainable_parameters()
+            p.numel() for _, p in model.trainable_parameters()
         )
 
         # BERT reward + Wave 3 loader
@@ -161,7 +161,7 @@ def _bench_one(
 
         def step(prefix_ids, refs):
             return grpo_step(
-                wrapper, opt,
+                model, opt,
                 prefix_ids=prefix_ids,
                 reference_cont=refs,
                 reward_fn=reward_fn,
@@ -211,7 +211,7 @@ def _bench_one(
         raise
     finally:
         try:
-            del wrapper, opt, bert, reward_fn, data_iter, outer_batches
+            del model, opt, bert, reward_fn, data_iter, outer_batches
         except NameError:
             pass
         gc.collect()

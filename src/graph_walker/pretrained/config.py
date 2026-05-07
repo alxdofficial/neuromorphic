@@ -66,7 +66,7 @@ class PretrainedGWConfig:
         assert self.memory.D_s == self.d_mem, (
             f"memory.D_s ({self.memory.D_s}) must equal d_mem ({self.d_mem}). "
             "Walker's internal state dim and the MemInjectLayer d_mem must match "
-            "— forward_segment passes h_mem directly into the walker as h_input."
+            "— walk_segment passes h_mem directly into the walker as h_input."
         )
         # Single-knob clock invariant: under the external-surprise design,
         # plasticity fires once per training step. segment_T, mod_period,
