@@ -15,9 +15,18 @@ Per step:
    variance reduction stays within each prompt's K rollouts.
 5. Replay: teacher-forced re-forward [B*K, T_pre + gen_length - 1] with
    grad enabled. Walker consumes the captured trace (replay_choices),
-   produces log_pi_mean [B*K] with grad attached.
+   produces log_pi_mean [B*K] with grad attached AND per_token_ce
+   [B*K, T_replay] no-grad (Llama's next-token CE against the replay
+   sequence — used as the plasticity surprise signal post-opt.step).
 6. Loss: ``-(log_pi_mean · advantages.detach()).mean()`` over B*K.
-7. Backward → grad-clip → step → detach memory.
+7. Backward → grad-clip → step.
+8. ``wrapper.memory.update_plasticity(per_token_ce)`` — fires the
+   walker's plastic update (snapshot + commit + rebuild active delta).
+   This is structurally identical to Phase 1's call site; the walker
+   does not know which phase it is in, only what surprise signal it
+   was handed. Without this call, ``E_bias_flat`` is frozen during
+   Phase 2, which silently disables long-term plastic encoding.
+9. ``wrapper.detach_memory()``.
 
 BS_outer back-compat: if the caller passes prefix_ids[1, T_pre] +
 reference_cont as a Tensor (legacy single-prefix shape), B=1 is
@@ -214,9 +223,12 @@ def grpo_step(
     # returned log_pi_mean carries grad and aggregates per-action log-π
     # over BOTH prefix and gen routing decisions — finer credit assignment
     # than the prior implementation, which only credited prefix routing.
-    log_pi_mean = replay_grpo_rollout(
+    # `per_token_ce` is no-grad and feeds plasticity post-opt.step.
+    replay = replay_grpo_rollout(
         wrapper, sampled, lm_context_window=lm_context_window,
-    )                                                             # [B*K]
+    )
+    log_pi_mean = replay.log_pi                                   # [B*K] grad
+    per_token_ce = replay.per_token_ce                            # [B*K, T_replay]
     if log_pi_mean.shape != (BK,):
         raise ValueError(
             f"replay log_pi_mean returned shape {tuple(log_pi_mean.shape)}, "
@@ -235,6 +247,16 @@ def grpo_step(
         grad_clip,
     )
     opt.step()
+
+    # ---- Unified plasticity (mirrors Phase 1) ----
+    # The walker's plasticity behavior is phase-agnostic: it always fires
+    # once per training step. What varies is the surprise SOURCE — here,
+    # CE against the replay sequence (prefix = ground-truth cumulative
+    # prior; gen = the model's own sampled tokens, i.e. self-entropy at
+    # sample time). Without this, E_bias_flat stays frozen during all of
+    # Phase 2 and the long-term plastic encoding pathway is disabled.
+    if wrapper.memory is not None:
+        wrapper.memory.update_plasticity(per_token_ce)
     wrapper.detach_memory()
 
     # Generation diversity: how many UNIQUE generations across all B*K
@@ -516,9 +538,11 @@ def grpo_session_step(
         advantages = (rewards - r_mean) / r_std                   # [K]
 
         # ---- Replay with grad ----
-        log_pi_mean = replay_grpo_rollout(
+        replay = replay_grpo_rollout(
             wrapper, sampled, lm_context_window=lm_context_window,
-        )                                                         # [K]
+        )
+        log_pi_mean = replay.log_pi                               # [K]
+        per_token_ce = replay.per_token_ce                        # [K, T_replay]
         if log_pi_mean.shape != (K,):
             raise ValueError(
                 f"replay log_pi_mean returned shape {tuple(log_pi_mean.shape)}, "
@@ -533,6 +557,13 @@ def grpo_session_step(
             grad_clip,
         )
         opt.step()
+
+        # Unified plasticity (mirrors Phase 1; see grpo_step docstring).
+        # Per-turn surprise covers this turn's prefix + gen — walker's
+        # plastic update commits the active neuromod delta into
+        # E_bias_flat and rebuilds a fresh delta for the next turn.
+        if wrapper.memory is not None:
+            wrapper.memory.update_plasticity(per_token_ce)
         wrapper.detach_memory()
 
         # ---- Stats ----

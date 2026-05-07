@@ -246,13 +246,42 @@ Eval harness not yet built. Should land alongside Wave 3 setup so we
 have an "is the walker actually doing anything" signal after Wave 1+2
 finish.
 
+## Unified plasticity (phase-agnostic by design)
+
+The walker's plasticity behavior does NOT depend on training phase. It
+ALWAYS fires once per training step at the end of each step, via
+``wrapper.memory.update_plasticity(per_token_ce)``. Anchor selection,
+surprise EMA decay, plasticity-window bookkeeping, and the
+``E_bias_flat`` commit are identical across all training paths:
+
+- **Phase 1** (parallel teacher-forced SFT, Waves 1+2): per-token CE
+  computed against ground-truth tokens.
+- **Phase 2** (GRPO sample/replay, Waves 3+4): per-token CE computed
+  against the replay sequence (= ground-truth cumulative prior tokens
+  for prefix positions; the model's own sampled tokens for gen
+  positions). Captured as ``ReplayResult.per_token_ce`` from
+  ``replay_grpo_rollout`` and fed to ``update_plasticity`` AFTER
+  ``opt.step()`` (mirroring Phase 1's call site).
+- **AR free-generation / inference**: surprise=None ⇒ plasticity is
+  skipped (window counters reset). Walker forward state still evolves;
+  only the structural ``E_bias_flat`` update is paused.
+
+This means the long-term plastic encoding pathway (the persistent
+``E_bias_flat`` buffer, mutated by the neuromod's commit at each
+plasticity window) is active throughout BOTH phases of training. The
+walker is never in a "frozen plasticity" mode unless the trainer
+explicitly hands it ``None``. This was the original design intent —
+walker behavior should be a function of input + state, not of which
+optimizer loop is running.
+
 ## What's wired / what's not
 
 | Component | Status |
 |---|---|
-| `phase1_pretrained_step` (parallel teacher-forced) | ✓ wired, tested |
-| `grpo_session_step` (unified Phase-2 GRPO; uniform-batched fast path for both Wave 3 and Wave 4 turn-pairs) | ✓ wired, tested — used by both waves |
-| `grpo_step` (single-turn BS_outer-aware) | ✓ kept as internal helper called by uniform-batched session path |
+| `phase1_pretrained_step` (parallel teacher-forced; calls `update_plasticity` per step) | ✓ wired, tested |
+| `grpo_session_step` (unified Phase-2 GRPO; uniform-batched fast path for both Wave 3 and Wave 4 turn-pairs; calls `update_plasticity` per step inside `grpo_step`) | ✓ wired, tested — used by both waves |
+| `grpo_step` (single-turn BS_outer-aware; fires `update_plasticity(per_token_ce)` post-`opt.step()` — same surprise mechanism as Phase 1, just sourced from the replay sequence) | ✓ kept as internal helper called by uniform-batched session path |
+| `replay_grpo_rollout` returns `ReplayResult(log_pi, per_token_ce)` | ✓ wired, tested |
 | `wildchat_turn_pair_grpo_batch_iter` (Wave 4 turn-pair flattener + sort-and-sample) | ✓ wired, tested |
 | Walker `snapshot_memory_state` / `restore_memory_state` | ✓ wired, tested (used by sequential fallback path; not on Wave 4 production path anymore) |
 | `lm_context_window` two-phase forward (walker / LM context decouple) | ✓ wired, tested |

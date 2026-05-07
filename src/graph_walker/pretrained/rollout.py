@@ -8,11 +8,19 @@ Memory semantics during rollout:
 - Plasticity does NOT fire inside `forward_segment` — the walker is
   vocab-agnostic and surprise is supplied by the trainer post-backward
   via `wrapper.memory.update_plasticity(per_token_ce)`.
-- During AR rollout (no ground truth), the trainer typically passes
-  `None` to `update_plasticity` (or skips the call entirely) and the
-  walker's plastic state stays frozen for the duration of the rollout.
+- The walker's plasticity behavior is INDEPENDENT of training phase.
+  It always fires once per training step at mod_period boundaries.
+  What varies between phases is the SURPRISE TARGET:
+    * Phase 1 (parallel teacher-forced):  CE against ground-truth tokens
+    * Phase 2 (GRPO sample/replay):       CE against the replay sequence
+                                           (= prefix ground-truth + the
+                                           model's own sampled gen tokens)
+    * AR free-generation / inference:     surprise=None; plasticity is
+                                           skipped (see `update_plasticity`).
 - In phase 2 mode, routing is hard Categorical and `log_pi_sum`
-  accumulates over routing decisions for REINFORCE.
+  accumulates over routing decisions for REINFORCE. The replay forward
+  also captures logits for the per-token CE that drives plasticity post-
+  opt.step (see `replay_grpo_rollout` → `ReplayResult`).
 
 `_freeze_plasticity_ctx` is retained as a no-op-equivalent safety net
 (sets mod_period ≈ ∞). Under the external-surprise design no plasticity
@@ -40,6 +48,56 @@ class RolloutOutput:
                                       # (= sum / step_count for proper REINFORCE
                                       # normalization — see consume_log_pi_mean)
     last_logits: torch.Tensor | None # [BS, vocab] for diagnostics
+
+
+@dataclass
+class ReplayResult:
+    """Output of `replay_grpo_rollout` — DeepSeek-style replay phase.
+
+    Carries both the REINFORCE objective (``log_pi`` with grad) and the
+    plasticity surprise signal (``per_token_ce`` no_grad). Phase-2 GRPO's
+    ``grpo_step`` uses the former for backward and the latter for an
+    ``update_plasticity`` call after ``opt.step()`` — same pattern as
+    Phase 1, just with a different surprise target.
+    """
+    log_pi: torch.Tensor          # [B*K] mean log-π over routing decisions; grad attached
+    per_token_ce: torch.Tensor    # [B*K, T_replay] no-grad CE for plasticity surprise
+
+
+def _per_token_ce_chunked(
+    logits: torch.Tensor,            # [B*K, T, V]
+    targets: torch.Tensor,           # [B*K, T] long
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Memory-bounded per-token CE.
+
+    At production scales (V=128256 for Llama-3.2, T_replay~2K, B*K~64) a
+    single-shot ``F.cross_entropy(reduction='none')`` materializes a
+    float32 logits view that peaks ~30 GB. Chunking along T keeps the
+    transient float-conversion + softmax bounded to roughly
+    ``BK · chunk_size · V · 4`` bytes per chunk (~16 GB at chunk=256,
+    BK=64, V=128k — adjustable downward if needed).
+
+    Returned tensor is detached and on the same device as logits.
+    """
+    BK, T, V = logits.shape
+    assert targets.shape == (BK, T), (
+        f"targets {tuple(targets.shape)} mismatches logits T={T}, BK={BK}"
+    )
+    if T == 0:
+        return torch.zeros(BK, 0, device=logits.device, dtype=torch.float32)
+    out_chunks = []
+    for s in range(0, T, chunk_size):
+        e = min(s + chunk_size, T)
+        log_chunk = logits[:, s:e, :].float()
+        tgt_chunk = targets[:, s:e]
+        ce = F.cross_entropy(
+            log_chunk.reshape(-1, V),
+            tgt_chunk.reshape(-1),
+            reduction="none",
+        ).reshape(BK, e - s)
+        out_chunks.append(ce.detach())
+    return torch.cat(out_chunks, dim=1)
 
 
 @dataclass
@@ -321,14 +379,23 @@ def replay_grpo_rollout(
     sampled: GRPOSampledRollout,
     *,
     lm_context_window: int | None = None,
-) -> torch.Tensor:
+) -> ReplayResult:
     """DeepSeek-style replay phase: teacher-forced re-forward with grad.
 
     Concatenates prefix + sampled-tokens-EXCEPT-LAST → [K, T_pre + L_gen - 1]
     and runs one parallel forward through the wrapper. The walker uses
     the saved routing trace as `replay_choices` per step, accumulating
-    per-action log-π with grad. Returns the aggregated log_pi (mean over
-    routing steps) per rollout, shape [K], with grad attached.
+    per-action log-π with grad.
+
+    Returns ``ReplayResult(log_pi, per_token_ce)`` where:
+      - ``log_pi``: [B*K] aggregated log-π over routing steps, with grad.
+      - ``per_token_ce``: [B*K, T_pre + L_gen - 1] no-grad CE — Llama's
+        next-token loss against the replay sequence at every position.
+        For prefix positions the target is the ground-truth cumulative
+        prior; for gen positions the target is the model's own sampled
+        token at that position. The trainer feeds this to
+        ``wrapper.memory.update_plasticity(per_token_ce)`` post-opt.step
+        to drive the walker's plastic update — exactly mirroring Phase 1.
 
     Why drop the last sampled token: its walker step's routing decision
     can only influence logits at position L+1, which the trajectory does
@@ -383,6 +450,10 @@ def replay_grpo_rollout(
     else:
         replay_seq = full_seq
     K = replay_seq.shape[0]
+    # Plasticity surprise targets: replay[:, t]'s logits predict
+    # full_seq[:, t+1]. So the per-position target sequence is full_seq
+    # shifted by one. Length = T_pre + L_gen - 1 = replay_seq.shape[1].
+    targets_full = full_seq[:, 1:1 + replay_seq.shape[1]]
 
     saved_phase = wrapper.current_phase
     saved_walker_training = wrapper.memory.training
@@ -416,14 +487,34 @@ def replay_grpo_rollout(
             recent_seq = replay_seq[:, early_len:]
             with torch.enable_grad(), wrapper.preserve_memory_graph():
                 wrapper.memory.arm_replay_trace(full_trace[:early_len])
-                wrapper(early_seq, use_cache=False)
+                out_early = wrapper(early_seq, use_cache=False)
+                # Compute early-phase per-token CE while logits are alive,
+                # then drop them so memory peak only briefly carries the
+                # large [BK, early_len, V] tensor. The CE compute is
+                # no_grad — surprise signal does not need to backprop.
+                with torch.no_grad():
+                    ce_early = _per_token_ce_chunked(
+                        out_early.logits, targets_full[:, :early_len],
+                    )
+                del out_early
                 wrapper.memory.arm_replay_trace(full_trace[early_len:])
-                _ = wrapper(recent_seq)
+                out_recent = wrapper(recent_seq)
+                with torch.no_grad():
+                    ce_recent = _per_token_ce_chunked(
+                        out_recent.logits, targets_full[:, early_len:],
+                    )
+                del out_recent
                 log_pi = wrapper.memory.consume_log_pi_mean()
+            per_token_ce = torch.cat([ce_early, ce_recent], dim=1)
         else:
             wrapper.memory.arm_replay_trace(full_trace)
             with torch.enable_grad(), wrapper.preserve_memory_graph():
-                _ = wrapper(replay_seq)
+                out = wrapper(replay_seq)
+                with torch.no_grad():
+                    per_token_ce = _per_token_ce_chunked(
+                        out.logits, targets_full,
+                    )
+                del out
                 log_pi = wrapper.memory.consume_log_pi_mean()
 
         if log_pi is None:
@@ -438,7 +529,7 @@ def replay_grpo_rollout(
                 "ran without grad enabled, or routing scores were "
                 "detached. REINFORCE backward will fail."
             )
-        return log_pi
+        return ReplayResult(log_pi=log_pi, per_token_ce=per_token_ce)
     finally:
         wrapper.current_phase = saved_phase
         wrapper.memory.train(saved_walker_training)

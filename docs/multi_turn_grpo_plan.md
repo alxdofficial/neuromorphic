@@ -78,9 +78,31 @@ verbatim.
 
 | Phase | Sampled? | log_pi captured? | LM loss applied? | walker.update_plasticity? |
 |---|---|---|---|---|
-| User turn obs | walker routing: yes; tokens: N/A (input given) | yes (credit to next assistant reward) | no | no (during this single rollout pass; once per turn the whole obs is replayed via canonical state advance with plasticity update) |
-| Assistant turn gen | walker routing AND tokens | yes (REINFORCE) | yes (REINFORCE on advantage) | no |
-| Ground-truth replay | walker routing: yes; tokens: ground truth (no LM sample) | no (discarded; this is canonical-state advancement) | no (no_grad) | yes (per-token CE → plasticity) |
+| User turn obs (cumulative prior re-forward) | walker routing: yes; tokens: N/A (input given) | yes (credited via REINFORCE on the next assistant turn's advantage) | no | yes (each Phase-2 step's replay drives one `update_plasticity` covering prefix + gen — see "Unified plasticity" below) |
+| Assistant turn gen | walker routing AND tokens | yes (REINFORCE) | no (REINFORCE only — no LM CE loss) | yes (gen tokens contribute to the same per-step `update_plasticity` call) |
+
+**Unified plasticity (this is the original design intent).** The walker
+is phase-agnostic: ``update_plasticity`` fires once per training step in
+BOTH Phase 1 (parallel teacher-forced SFT) and Phase 2 (GRPO sample/
+replay). Walker behavior — anchor selection, surprise EMA decay,
+plasticity window length — does NOT change between phases. What varies
+is the *source* of the per-token surprise:
+
+- **Phase 1**: CE against ground-truth tokens (teacher-forced).
+- **Phase 2 prefix tokens**: CE against ground-truth cumulative prior
+  (= same as Phase 1 — the prefix IS teacher-forced during replay).
+- **Phase 2 gen tokens**: CE against the model's own sampled tokens
+  (= self-entropy at sample time; high under uncertainty, low under
+  confident generation).
+- **Future agentic / tool-use scenarios**: CE against environment-
+  emitted tokens (tool outputs, retrieved documents). Same mechanism.
+
+The contract is: whatever next-token target the trainer can construct,
+feed CE to ``update_plasticity``. The walker integrates surprise the
+same way regardless of whether the target came from data, the model
+itself, or a tool. Without this, ``E_bias_flat`` would freeze during
+Phase 2, silently disabling the long-term plastic encoding pathway —
+the very thing the memory graph exists to provide.
 
 ## EOS early-stop
 
@@ -338,12 +360,14 @@ uses, so:
 ### What it doesn't give us
 
 - "Walker carries state across turns within a session within a single
-  training step" — we never had this; not a regression.
-- "Walker plasticity updates between turns" — could be added, isn't.
+  training step" — we never had this; not a regression. (Class B state
+  is per-turn-pair; Class A E_bias_flat is shared across all
+  turn-pairs.)
 - Cross-session walker state via the long-term plastic E_bias_flat
   buffer DOES persist (it's a registered buffer, mutated by
-  `update_plasticity` calls). Currently `update_plasticity` only fires
-  in Phase-1 SFT; for Wave 4 we don't fire it (could revisit).
+  `update_plasticity` calls). ``update_plasticity`` fires per Phase-2
+  GRPO step (mirroring Phase 1), so the plastic encoding pathway is
+  active throughout Wave 3 + Wave 4. See "Unified plasticity" above.
 
 ### Sequential fallback retained
 

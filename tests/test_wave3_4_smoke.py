@@ -259,6 +259,98 @@ def test_grpo_step_with_bert_reward_end_to_end():
     # that grad_norm > 0 above is the proxy.
 
 
+def test_grpo_step_fires_unified_plasticity():
+    """Regression: Phase-2 GRPO must fire `update_plasticity` per step,
+    just like Phase 1. Walker behavior is phase-agnostic — only the
+    surprise SOURCE differs (Phase 2 uses CE against the replay sequence).
+
+    We verify the call by spying on ``wrapper.memory.update_plasticity``
+    and asserting (1) it was invoked and (2) the per-token surprise
+    handed to it has the expected shape (B*K rollouts × T_replay tokens).
+    If the unified-plasticity wiring is removed, the call count drops to
+    zero and the assertion catches it.
+
+    A direct ``E_bias_flat`` delta check is unstable at smoke-test scale
+    because the neuromod's blend gate (γ = σ(blend_logit), init ≈ 0.007)
+    is near zero on a freshly-primed walker — a single step's commit
+    rounds to zero in float32 on tiny graphs even when plasticity is
+    firing correctly.
+    """
+    from src.graph_walker.pretrained.config import PretrainedGWConfig
+    from src.graph_walker.pretrained.llm_wrapper import GraphWalkerPretrainedLM
+    from src.graph_walker.pretrained.train_phase1 import (
+        Phase1Batch, phase1_pretrained_step,
+    )
+    from src.graph_walker.pretrained.train_phase2 import grpo_step
+
+    torch.manual_seed(123)
+    d_lm = 32
+    vocab = 128256
+    llama = _tiny_llama(d_lm=d_lm, n_layers=4, vocab=vocab)
+    walker_cfg = _tiny_walker_cfg(D_s=d_lm, T=8)
+    walker_cfg.vocab_size = vocab
+    cfg = PretrainedGWConfig(
+        model_name="local", inject_layer=2, d_mem=d_lm,
+        memory=walker_cfg, T=8, bs=1, llama_dtype="fp32",
+    )
+    wrapper = GraphWalkerPretrainedLM(cfg, hf_model=llama)
+    wrapper.train(True)
+
+    prime_opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+    )
+    prime_in = torch.randint(0, vocab, (1, 8), dtype=torch.long)
+    phase1_pretrained_step(
+        wrapper, prime_opt,
+        Phase1Batch(input_ids=prime_in, target_ids=prime_in),
+        amp_dtype=torch.float32,
+    )
+    del prime_opt
+
+    wrapper.freeze_all_but_E_bias_and_neuromod()
+    opt = torch.optim.AdamW(
+        [p for _, p in wrapper.trainable_parameters()], lr=1e-4,
+    )
+
+    # Spy on update_plasticity. The unified-plasticity contract is that
+    # grpo_step calls this exactly once per step with a [B*K, T_replay]
+    # CE tensor (T_replay = T_pre + gen_length - 1).
+    calls = []
+    real_update = wrapper.memory.update_plasticity
+
+    def spy(per_token_surprise):
+        calls.append(
+            None if per_token_surprise is None
+            else tuple(per_token_surprise.shape)
+        )
+        return real_update(per_token_surprise)
+
+    wrapper.memory.update_plasticity = spy
+
+    prefix_ids = torch.randint(0, vocab, (1, 8), dtype=torch.long)
+    reference_ids = torch.randint(0, vocab, (4,), dtype=torch.long)
+    K = 3
+    T_pre = 8
+    L_gen = 4
+
+    grpo_step(
+        wrapper, opt,
+        prefix_ids=prefix_ids, reference_cont=reference_ids,
+        num_rollouts=K, gen_length=L_gen,
+    )
+
+    assert len(calls) == 1, (
+        f"update_plasticity was called {len(calls)} times in Phase-2 step "
+        f"(expected 1). Unified plasticity is broken — Phase 2 should "
+        "mirror Phase 1's call site."
+    )
+    expected_shape = (K, T_pre + L_gen - 1)
+    assert calls[0] == expected_shape, (
+        f"update_plasticity received surprise shape {calls[0]}, expected "
+        f"{expected_shape} (B*K rollouts × T_pre + L_gen - 1 tokens)."
+    )
+
+
 # ----------------------------------------------------------------------
 # BS_outer > 1 — multi-prefix grpo_step
 # ----------------------------------------------------------------------
@@ -620,9 +712,14 @@ def test_lm_context_window_two_phase_forward():
     assert sampled.generated.shape == (K, T_pre + 4)
 
     # Replay should also accept lm_context_window and produce log_pi with grad
-    log_pi = replay_grpo_rollout(wrapper, sampled, lm_context_window=lm_window)
+    replay = replay_grpo_rollout(wrapper, sampled, lm_context_window=lm_window)
+    log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
+    # per_token_ce covers the full replay sequence (prefix + gen-1), no grad,
+    # ready to feed update_plasticity for unified Phase-2 plasticity.
+    assert replay.per_token_ce.shape == (K, T_pre + 4 - 1)
+    assert not replay.per_token_ce.requires_grad
 
     # Regression: log_pi should cover ALL routing decisions (early prefix +
     # recent prefix + gen), not just recent. Verified by comparing to a
@@ -647,13 +744,15 @@ def test_lm_context_window_two_phase_forward():
         )
 
     # Two-phase replay should ALSO accumulate log_pi over the full trace.
-    log_pi_2 = replay_grpo_rollout(wrapper, sampled2, lm_context_window=lm_window)
+    replay_2 = replay_grpo_rollout(wrapper, sampled2, lm_context_window=lm_window)
     # _log_pi_count was reset by consume_log_pi_mean inside replay_grpo_rollout,
     # so we can't read it directly. Instead, verify log_pi has grad and that
     # the new behavior credits early-prefix routing — proxy: the gradient w.r.t.
     # neuromod params should be NON-ZERO when only early-prefix routing decisions
     # could have produced gradient signal. Verified end-to-end by smoke test.
-    assert log_pi_2.requires_grad
+    assert replay_2.log_pi.requires_grad
+    # per_token_ce length matches replay length across the two-phase split.
+    assert replay_2.per_token_ce.shape == (K, T_pre + 4 - 1)
 
 
 def test_eos_early_stop_pads_with_eos_id():

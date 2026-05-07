@@ -215,9 +215,13 @@ def test_grpo_deepseek_style_full_flow():
     )
 
     # ---- Replay phase ----
-    log_pi = replay_grpo_rollout(wrapper, sampled)
+    replay = replay_grpo_rollout(wrapper, sampled)
+    log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
+    # Per-token CE for plasticity surprise: covers prefix + gen-1 (= replay_seq).
+    assert replay.per_token_ce.shape == (K, T_pre + L_gen - 1)
+    assert not replay.per_token_ce.requires_grad
 
     # ---- REINFORCE backward — gradient must reach neuromod ----
     rewards = torch.linspace(-1.0, 1.0, K)
@@ -405,12 +409,15 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
     assert len(sampled.routing_trace) == expected_trace_len
 
     # Replay — must not corrupt active_delta_nm at block boundaries
-    log_pi = replay_grpo_rollout(wrapper, sampled)
+    replay = replay_grpo_rollout(wrapper, sampled)
+    log_pi = replay.log_pi
     assert log_pi.shape == (K,)
     assert log_pi.requires_grad
     assert torch.isfinite(log_pi).all(), (
         f"replay log_pi has non-finite values: {log_pi}"
     )
+    assert replay.per_token_ce.shape == (K, T_pre + L_gen - 1)
+    assert torch.isfinite(replay.per_token_ce).all()
 
     # REINFORCE backward — gradient must reach neuromod across all blocks
     rewards = torch.linspace(-1.0, 1.0, K)

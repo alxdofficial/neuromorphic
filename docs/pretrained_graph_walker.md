@@ -228,10 +228,32 @@ Per step (`grpo_step`):
      `is_new_window` is reconstructed from the saved `anchor_idx`
      presence so sample-vs-replay routing patterns match exactly.
    - Drain `consume_log_pi_mean()` → `log_pi [K]` with grad attached.
+   - The replay forward also produces logits at every position; per-
+     token CE against `generated[:, 1:]` is computed under no_grad
+     during the same scope (logits are freed immediately after the
+     chunked CE compute, so peak memory matches the original "discard
+     logits" code path). Returned as `ReplayResult.per_token_ce` for
+     the unified plasticity update in step 5.
 
 4. **REINFORCE backward**:
    - `loss = -(log_pi * advantages.detach()).mean()`
-   - `loss.backward()`, grad-clip, opt.step, `detach_memory()`.
+   - `loss.backward()`, grad-clip, `opt.step()`.
+
+5. **Unified plasticity** (mirrors Phase 1):
+   - `wrapper.memory.update_plasticity(per_token_ce)` — folds the
+     replay's per-token CE into `surprise_ema`, fires
+     `_plasticity_step` (commits the active neuromod delta into
+     `E_bias_flat`), and rebuilds the next window's `_active_delta_nm`
+     with fresh grad_fn for the next training step.
+   - Walker behavior is phase-agnostic by design — Phase 2 calls this
+     with the same shape contract as Phase 1, just with the surprise
+     target sourced from the replay sequence (prefix tokens =
+     ground-truth cumulative prior; gen tokens = the model's own
+     samples). Without this call, `E_bias_flat` would freeze during
+     all of Phase 2, silently disabling the long-term plastic
+     encoding pathway. See `docs/training_strategy.md` § "Unified
+     plasticity" for the full design rationale.
+   - `wrapper.detach_memory()`.
 
 ### Phase-2 minimum policy surface
 
@@ -335,8 +357,14 @@ walker heads, routing, neuromod, surprise, gradient flow, Llama side).
   across calls — required so neuromod params receive gradient via
   `_active_delta_nm`. Setting it to `True` starves neuromod of gradient.
 - `wrapper.memory.update_plasticity(per_token_ce)` MUST be called after
-  `loss.backward()` for plastic state and neuromod params to advance.
-  Pass `None` (or skip the call) for AR free-generation / inference.
+  `loss.backward()` (Phase 1) or `opt.step()` (Phase 2) for plastic
+  state and neuromod params to advance. Walker behavior is phase-
+  agnostic — `update_plasticity` fires in BOTH phases with a per-token
+  CE tensor of shape `[B, T]`. The surprise SOURCE varies: Phase 1
+  uses CE against ground-truth tokens; Phase 2 uses CE from the replay
+  sequence (prefix = ground-truth cumulative prior; gen = the model's
+  own samples). Pass `None` (or skip the call) only for AR free-
+  generation / inference, where no next-token target exists.
 - `consume_log_pi_sum()` clears the buffer on read — call once per phase-2
   prefix pass, before the generation phase.
 - `MemInjectLayer.W_in/W_out/scale` stay fp32 for stable Adam updates;
