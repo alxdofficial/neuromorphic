@@ -68,6 +68,7 @@ def _per_token_ce_chunked(
     logits: torch.Tensor,            # [B*K, T, V]
     targets: torch.Tensor,           # [B*K, T] long
     chunk_size: int = 256,
+    ignore_token_id: int | None = None,
 ) -> torch.Tensor:
     """Memory-bounded per-token CE.
 
@@ -77,6 +78,12 @@ def _per_token_ce_chunked(
     transient float-conversion + softmax bounded to roughly
     ``BK · chunk_size · V · 4`` bytes per chunk (~16 GB at chunk=256,
     BK=64, V=128k — adjustable downward if needed).
+
+    ``ignore_token_id``: if set, positions whose target equals this id
+    have their CE forced to 0 — used to mask Wave 3 PAD tokens (the
+    silent stretch between filler and question; predicting a specific
+    pad token isn't meaningful surprise) so they don't pollute the
+    walker's plasticity signal. Pass the tokenizer's ``pad_token_id``.
 
     Returned tensor is detached and on the same device as logits.
     """
@@ -96,6 +103,12 @@ def _per_token_ce_chunked(
             tgt_chunk.reshape(-1),
             reduction="none",
         ).reshape(BK, e - s)
+        if ignore_token_id is not None:
+            ce = torch.where(
+                tgt_chunk == ignore_token_id,
+                torch.zeros_like(ce),
+                ce,
+            )
         out_chunks.append(ce.detach())
     return torch.cat(out_chunks, dim=1)
 
@@ -379,6 +392,7 @@ def replay_grpo_rollout(
     sampled: GRPOSampledRollout,
     *,
     lm_context_window: int | None = None,
+    ignore_token_id: int | None = None,
 ) -> ReplayResult:
     """DeepSeek-style replay phase: teacher-forced re-forward with grad.
 
@@ -495,6 +509,7 @@ def replay_grpo_rollout(
                 with torch.no_grad():
                     ce_early = _per_token_ce_chunked(
                         out_early.logits, targets_full[:, :early_len],
+                        ignore_token_id=ignore_token_id,
                     )
                 del out_early
                 model.memory.arm_replay_trace(full_trace[early_len:])
@@ -502,6 +517,7 @@ def replay_grpo_rollout(
                 with torch.no_grad():
                     ce_recent = _per_token_ce_chunked(
                         out_recent.logits, targets_full[:, early_len:],
+                        ignore_token_id=ignore_token_id,
                     )
                 del out_recent
                 log_pi = model.memory.consume_log_pi_mean()
@@ -513,6 +529,7 @@ def replay_grpo_rollout(
                 with torch.no_grad():
                     per_token_ce = _per_token_ce_chunked(
                         out.logits, targets_full,
+                        ignore_token_id=ignore_token_id,
                     )
                 del out
                 log_pi = model.memory.consume_log_pi_mean()

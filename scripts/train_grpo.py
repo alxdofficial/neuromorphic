@@ -290,17 +290,19 @@ def main() -> None:
     print(f"[setup] resuming from {args.resume}")
     ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
 
-    # Resolve state_dict key (`model` from phase-1 trainer, `model` from
-    # phase-2 trainer's own checkpoints).
-    if "model" in ckpt:
-        state = ckpt["model"]
-    elif "model" in ckpt:
-        state = ckpt["model"]
-    else:
+    # Both Phase-1 (train_pretrained_gw.py) and Phase-2 (train_grpo.py)
+    # save the model state under the top-level key "model". The previous
+    # `if/elif` dispatch had two identical branches — collapsed here.
+    if "model" not in ckpt:
         raise KeyError(
-            f"checkpoint at {args.resume} has neither 'model' nor 'model' "
-            f"key (got: {list(ckpt.keys())})"
+            f"checkpoint at {args.resume} has no 'model' key "
+            f"(got: {list(ckpt.keys())}). Both Phase-1 and Phase-2 "
+            "trainers save the model state_dict under 'model'."
         )
+    state = ckpt["model"]
+    # Persistent walker state is loaded AFTER `model.load_state_dict` so
+    # its tensors aren't overridden by the load. See where we call
+    # `load_persistent_walker_state` below.
 
     # Resolve config. Phase-1 trainer saves vars(args) (a dict) under
     # 'config'; phase-2 trainer saves a PretrainedGWConfig under 'config'
@@ -347,6 +349,28 @@ def main() -> None:
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M; "
           f"saved step={ckpt.get('step', '?')}")
 
+    # Restore the neuromod's persistent snapshots if the checkpoint has
+    # them. Older checkpoints without "walker_persistent" key fall
+    # through silently — the priming pass below will populate
+    # `_neuromod_input_*` from a synthetic forward, so the run is
+    # still safe (just less faithful to the saved state).
+    if "walker_persistent" in ckpt:
+        model.load_persistent_walker_state(ckpt["walker_persistent"])
+        print("[setup] restored walker persistent state (neuromod snapshots)")
+
+    # Sanity: prefix + generation must fit in Llama's positional
+    # embedding range. For Llama-3.2 max_position_embeddings = 131072,
+    # so T_pre=2048 + gen_length=128 is comfortably under, but a future
+    # config bump (target Wave 4 with longer priors) could blow past.
+    # Fail loud at setup, not mid-rollout.
+    max_pos = getattr(model.llama.config, "max_position_embeddings", None)
+    if max_pos is not None and args.T_pre + args.gen_length > max_pos:
+        raise ValueError(
+            f"T_pre + gen_length = {args.T_pre + args.gen_length} exceeds "
+            f"Llama's max_position_embeddings = {max_pos}. Reduce T_pre "
+            "or gen_length, or pick a model with longer positional context."
+        )
+
     # ---- Phase-1 priming step ----
     # Runtime state buffers (`_neuromod_input_ids/feats/co_visit_flat`) are
     # not in the model state_dict, so a fresh-loaded model has them all
@@ -359,9 +383,15 @@ def main() -> None:
     # the first GRPO step's `_begin_plastic_window` rebuilds a non-None
     # `_active_neuromod_delta` and routing carries gradient.
     print("[setup] phase-1 priming pass (populates _neuromod_input_*)")
+    # lr=0.0 — the prime exists ONLY to run forward + plasticity so
+    # the neuromod's `_neuromod_input_*` snapshot gets populated. Zero
+    # LR means opt.step() runs but produces no parameter updates, so
+    # the resumed model state is preserved bit-for-bit. (The prior
+    # lr=1e-7 was a "tiny but nonzero" hedge that was unnecessary —
+    # zero is the cleanest answer.)
     prime_opt = torch.optim.AdamW(
         [p for _, p in model.trainable_parameters()],
-        lr=1e-7,  # tiny — we don't want to actually update params
+        lr=0.0,
         fused=torch.cuda.is_available(),
     )
     prime_vocab = model.llama.config.vocab_size
@@ -493,6 +523,16 @@ def main() -> None:
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step)
 
+        # Advance the walker's training_step so the Gumbel τ/ε schedule
+        # progresses. Phase 2 routing is hard Categorical (τ/ε mostly
+        # don't apply at sample/replay time), but any code path that
+        # reads training_step for diagnostics or schedule queries gets
+        # a fresh value rather than a stale one frozen at the resumed
+        # checkpoint. Mirrors the per-step assignment in
+        # train_pretrained_gw.py.
+        if model.memory is not None:
+            model.memory.training_step = step
+
         # Fetch B sessions per outer step.
         # - Wave 3 iter yields one MultiTurnSession at a time → collect B.
         # - Wave 4 (turn-pair) iter yields a pre-batched list[MultiTurnSession]
@@ -545,6 +585,12 @@ def main() -> None:
                 eos_id=base_tokenizer.eos_token_id,
                 max_prior_tokens=args.max_prior_tokens,
                 lm_context_window=args.lm_context_window,
+                # Mask Wave 3 PAD tokens out of the plasticity surprise
+                # signal — passphrase prefixes pad the gap between filler
+                # and question with pad_token_id, and we don't want the
+                # walker to accumulate "surprise" from positions that
+                # carry no semantic content.
+                pad_token_id=base_tokenizer.pad_token_id,
             )
             # Aggregate per-turn stats for logging.
             n_turns = sstats.n_assistant_turns
@@ -593,6 +639,7 @@ def main() -> None:
                 "opt": opt.state_dict(),
                 "config": cfg,
                 "args": vars(args),
+                "walker_persistent": model.persistent_walker_state(),
             }, ckpt_path)
             print(f"[ckpt] wrote {ckpt_path}", flush=True)
 
@@ -604,6 +651,7 @@ def main() -> None:
         "opt": opt.state_dict(),
         "config": cfg,
         "args": vars(args),
+        "walker_persistent": model.persistent_walker_state(),
     }, final_path)
     stats_f.close()
     print(f"[done] wrote {final_path}", flush=True)

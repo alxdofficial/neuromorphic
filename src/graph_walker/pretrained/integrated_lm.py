@@ -405,6 +405,72 @@ class IntegratedLM(nn.Module):
         m.window_len = int(state.get("window_len", 0))
 
     # ------------------------------------------------------------------
+    # Persistent-state save/load (for checkpoint resume)
+    # ------------------------------------------------------------------
+    #
+    # Distinction vs `snapshot_memory_state` above: that snapshot is
+    # PER-BATCH working state (Class B — `s`, walker_pos, etc.) used
+    # mid-training-step for things like multi-turn aligned-trajectory
+    # restore. It is NOT for cross-process persistence.
+    #
+    # The methods below cover the LONG-TERM persistent state (Class A)
+    # that should survive a training restart — specifically the
+    # neuromod's `_neuromod_input_*` snapshots that the next plasticity
+    # window's `_begin_plastic_window` consumes to build its
+    # `_active_neuromod_delta`. `E_bias_flat` is already a registered
+    # buffer (saved by `state_dict()` automatically) but the
+    # `_neuromod_input_*` snapshots are not — they're regular attributes
+    # set in `_snapshot_touched_columns`. Without explicit save/load
+    # here, a Phase-1 resume cold-starts the neuromod for several
+    # windows (no delta = no neuromod gradient) and the run silently
+    # under-trains the meta-learning component until the first
+    # plasticity event after resume re-populates them.
+    #
+    # `surprise_prev` (the prior-window surprise EMA snapshot) is also
+    # included: not yet directly read on resume, but symmetric with the
+    # neuromod-input snapshots and cheap to carry.
+
+    def persistent_walker_state(self) -> dict:
+        """Return the long-term walker state that should survive a
+        training restart. Pair with `load_persistent_walker_state` at
+        resume time. Saves clones (independent of live tensors)."""
+        m = self.memory
+        if m is None:
+            return {}
+
+        def _clone_or_none(x):
+            return x.clone() if isinstance(x, torch.Tensor) else None
+
+        return {
+            "_neuromod_input_ids": _clone_or_none(m._neuromod_input_ids),
+            "_neuromod_input_feats": _clone_or_none(m._neuromod_input_feats),
+            "_neuromod_input_co_visit_flat":
+                _clone_or_none(m._neuromod_input_co_visit_flat),
+            "surprise_prev": _clone_or_none(
+                getattr(m, "surprise_prev", None),
+            ),
+        }
+
+    def load_persistent_walker_state(self, state: dict | None) -> None:
+        """Restore from `persistent_walker_state`. Tolerant of missing
+        keys (older checkpoints without this state) — fields stay None
+        if absent. Tensors are cloned in so the loaded dict can be
+        garbage-collected."""
+        if state is None or self.memory is None:
+            return
+        m = self.memory
+
+        def _restore(name):
+            v = state.get(name)
+            if isinstance(v, torch.Tensor):
+                setattr(m, name, v.clone())
+
+        _restore("_neuromod_input_ids")
+        _restore("_neuromod_input_feats")
+        _restore("_neuromod_input_co_visit_flat")
+        _restore("surprise_prev")
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 

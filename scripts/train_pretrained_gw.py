@@ -175,6 +175,16 @@ def main() -> None:
         opt.load_state_dict(ckpt["opt"])
         sched.load_state_dict(ckpt["sched"])
         start_step = int(ckpt["step"])
+        # Restore the neuromod's persistent snapshots (Class A state
+        # that's NOT covered by state_dict because the underlying
+        # attributes aren't registered buffers). Without this, the
+        # first few windows after resume cold-start the neuromod —
+        # `_begin_plastic_window` returns no delta because there's no
+        # snapshot to consume — and routing is decoupled from the
+        # neuromod gradient until the next plasticity fire repopulates.
+        if "walker_persistent" in ckpt:
+            model.load_persistent_walker_state(ckpt["walker_persistent"])
+            print("[setup] restored walker persistent state (neuromod snapshots)")
         print(f"[setup] resumed at step {start_step}")
 
     # --- Data iterator ---
@@ -291,6 +301,7 @@ def main() -> None:
                     "opt": opt.state_dict(),
                     "sched": sched.state_dict(),
                     "config": vars(args),
+                    "walker_persistent": model.persistent_walker_state(),
                 }, ckpt_path)
                 print(f"[ckpt] saved {ckpt_path}", flush=True)
 
@@ -306,6 +317,7 @@ def main() -> None:
         "opt": opt.state_dict(),
         "sched": sched.state_dict(),
         "config": vars(args),
+        "walker_persistent": model.persistent_walker_state(),
     }, final_path)
     elapsed = time.perf_counter() - t_start
     print(f"[done] {step - start_step} steps in {elapsed/60:.1f} min · "

@@ -111,6 +111,7 @@ def grpo_step(
     adv_std_floor: float = 1e-3,
     eos_id: int | None = None,
     lm_context_window: int | None = None,
+    pad_token_id: int | None = None,
 ) -> GRPOStats:
     """One GRPO step on B independent (prefix, reference) pairs.
 
@@ -233,6 +234,7 @@ def grpo_step(
     # `per_token_ce` is no-grad and feeds plasticity post-opt.step.
     replay = replay_grpo_rollout(
         model, sampled, lm_context_window=lm_context_window,
+        ignore_token_id=pad_token_id,
     )
     log_pi_mean = replay.log_pi                                   # [B*K] grad
     per_token_ce = replay.per_token_ce                            # [B*K, T_replay]
@@ -402,6 +404,7 @@ def grpo_session_step(
     skip_first_user_only_turns: bool = True,
     max_prior_tokens: int | None = None,
     lm_context_window: int | None = None,
+    pad_token_id: int | None = None,
 ) -> SessionGRPOStats:
     """One multi-turn GRPO session: walks turn-by-turn through a chat
     session, doing per-assistant-turn GRPO updates.
@@ -485,6 +488,7 @@ def grpo_session_step(
             grad_clip=grad_clip, adv_std_floor=adv_std_floor,
             eos_id=eos_id, lm_context_window=lm_context_window,
             max_prior_tokens=max_prior_tokens,
+            pad_token_id=pad_token_id,
         )
 
     # Sequential per-session fallback (multi-turn Wave 4, or single session).
@@ -498,6 +502,7 @@ def grpo_session_step(
             grad_clip=grad_clip, adv_std_floor=adv_std_floor,
             eos_id=eos_id, max_prior_tokens=max_prior_tokens,
             lm_context_window=lm_context_window,
+            pad_token_id=pad_token_id,
         )
 
     # Single-session path (existing logic below).
@@ -571,6 +576,7 @@ def grpo_session_step(
         # ---- Replay with grad ----
         replay = replay_grpo_rollout(
             model, sampled, lm_context_window=lm_context_window,
+            ignore_token_id=pad_token_id,
         )
         log_pi_mean = replay.log_pi                               # [K]
         per_token_ce = replay.per_token_ce                        # [K, T_replay]
@@ -677,6 +683,7 @@ def _grpo_session_step_uniform_batched(
     reward_fn, num_rollouts, max_response_len,
     temperature, top_p, grad_clip, adv_std_floor,
     eos_id, lm_context_window, max_prior_tokens,
+    pad_token_id=None,
 ) -> SessionGRPOStats:
     """B sessions, each with one user prefix + one assistant ref.
     All prefixes share the same length, so we can stack into [B, T_pre]
@@ -706,6 +713,7 @@ def _grpo_session_step_uniform_batched(
         adv_std_floor=adv_std_floor,
         eos_id=eos_id,
         lm_context_window=lm_context_window,
+        pad_token_id=pad_token_id,
     )
 
     total_tokens = sum(int(s.total_tokens) for s in sessions)
@@ -742,6 +750,7 @@ def _grpo_session_step_sequential(
     reward_fn, num_rollouts, max_response_len,
     temperature, top_p, grad_clip, adv_std_floor,
     eos_id, max_prior_tokens, lm_context_window,
+    pad_token_id=None,
 ) -> SessionGRPOStats:
     """Process B sessions sequentially. No cross-session batching, but
     keeps the unified API. Each session does its own per-assistant-turn
@@ -768,6 +777,7 @@ def _grpo_session_step_sequential(
             grad_clip=grad_clip, adv_std_floor=adv_std_floor,
             eos_id=eos_id, max_prior_tokens=max_prior_tokens,
             lm_context_window=lm_context_window,
+            pad_token_id=pad_token_id,
         )
         n_assistant_turns_total += sub.n_assistant_turns
         total_session_tokens += sub.total_session_tokens

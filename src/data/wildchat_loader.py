@@ -265,17 +265,23 @@ def session_to_turn_pairs(
             if assistant_gen_prompt is not None:
                 hdr_len = len(assistant_gen_prompt)
                 ref_head = ref_ids[:hdr_len].tolist()
-                if ref_head == assistant_gen_prompt:
-                    # Move role header from ref → prior. Standard case.
-                    prior_list.extend(assistant_gen_prompt)
-                    ref_ids = ref_ids[hdr_len:]
-                else:
-                    # Turn does not start with the expected role-header
-                    # tokens (template mismatch / unusual session). Append
-                    # the gen prompt anyway so the model gets the
-                    # "begin assistant" cue, but DO NOT strip ref_ids —
-                    # we don't know what to strip.
-                    prior_list.extend(assistant_gen_prompt)
+                if ref_head != assistant_gen_prompt:
+                    # Turn does NOT start with the expected role-header
+                    # tokens (template mismatch / unusual session).
+                    # Skip the turn-pair entirely rather than appending
+                    # gen prompt without stripping ref — the latter
+                    # would create a BERT-cosine reward bias because
+                    # the decoded reference would begin with the role
+                    # header text while the model's generation (which
+                    # sees the gen prompt as part of the prior) would
+                    # begin with the response body. The cumulative
+                    # prior gets this turn's ids appended below so the
+                    # session continues correctly.
+                    cumulative.extend(turn.ids.cpu().tolist())
+                    continue
+                # Standard case: move role header from ref → prior.
+                prior_list.extend(assistant_gen_prompt)
+                ref_ids = ref_ids[hdr_len:]
 
             prior_t = torch.tensor(
                 prior_list, dtype=torch.long, device=turn.ids.device,
