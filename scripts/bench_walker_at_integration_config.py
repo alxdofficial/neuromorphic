@@ -60,8 +60,7 @@ def _build(cfg: GraphWalkerConfig) -> GraphWalkerMemory:
     m = GraphWalkerMemory(cfg, tied_token_emb=emb).cuda()
     # Match the integration's frozen-in-the-integration set so trainable
     # surface area (and thus backward cost) is comparable.
-    for p_name in ("token_to_state", "input_v_proj"):
-        getattr(m, p_name).weight.requires_grad = False
+    m.token_to_state.weight.requires_grad = False
     return m
 
 

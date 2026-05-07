@@ -24,10 +24,10 @@ from src.graph_walker.standalone import StandaloneLM
 
 def _tiny_cfg(**overrides):
     base = dict(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=32, D_s=32, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=64,
         mod_period=4, tbptt_block=4, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
@@ -73,8 +73,8 @@ def test_log_pi_step_returned_in_pure_output_not_mutated_on_self():
     lm.memory._ensure_block_caches(lm.memory.tied_token_emb.weight)
     out = lm.memory._step_core_pure(
         lm.memory.s, lm.memory.walker_pos, lm.memory.walker_state,
-        lm.memory.prev_motor, e_bias,
-        torch.zeros(2, dtype=torch.int64), tau, eps, is_new_window=True,
+        e_bias,
+        torch.zeros(2, dtype=torch.int64), tau, eps,
     )
     # Pure function: must NOT have touched self._log_pi_sum.
     assert lm.memory._log_pi_sum is log_pi_before, (

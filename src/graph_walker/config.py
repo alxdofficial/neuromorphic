@@ -10,64 +10,39 @@ from dataclasses import dataclass
 
 @dataclass
 class GraphWalkerConfig:
-    # --- Graph topology (same spirit as column_graph) ---
-    plane_rows: int = 16                # 16×16×4 = 1024 columns. Sized to the
-    plane_cols: int = 16                # ~1500-2000-word active vocabulary that
+    # --- Graph topology (single flat substrate, no planes) ---
+    grid_rows: int = 32                 # 32×32 = 1024 columns. Sized to the
+    grid_cols: int = 32                 # ~1500-2000-word active vocabulary that
                                         # is the model's vocabulary of concepts;
                                         # N is the vocab size. Per-token compute
                                         # is invariant to N (walkers visit only
                                         # B·H cols per step regardless of N), so
                                         # N is pure capacity at no runtime cost.
-    L: int = 4                          # number of planes (0 = input, L-1 = output)
     K: int = 16                         # out-edges per column. With N=1024,
-                                        # K=16 gives a sparse small-world graph;
-                                        # at radius=3 we have plenty of candidate
-                                        # room (48 intra, 49 inter). Bench at
-                                        # this setting cleared 133K tok/s @
-                                        # B=384 cudagraph.
-                                        # With K_intra_fraction=0.5,
-                                        # K_inter_bwd_fraction=0.5 → K_intra=48,
-                                        # K_inter_fwd=24, K_inter_bwd=24. At
-                                        # radius=3, max_intra=48 (exact fit) and
-                                        # max_inter=49 (24/49 → comfortable).
+                                        # K=16 gives a sparse small-world graph.
                                         # Per-step routing scoring stays in the
                                         # noise relative to content_mlp.
     # p_rewire: Watts-Strogatz rewiring probability. Each edge's destination
     # is, with probability p_rewire, replaced by a uniform-random column
-    # anywhere in the graph (any plane, any (r, c)). 0.0 = pure local grid.
+    # anywhere in the graph. 0.0 = pure local grid.
     #
     # Default 0.3 (well past the small-world transition at ~0.1).
     # Rationale: under the "graph as syntactic substrate for an emergent
     # high-dimensional language" framing, the topology is the grammar's
     # possibility space — what trajectories the model is even allowed to
-    # encode. A pure grid forces local-relations-only "sentences" (Moore
-    # radius-2 + plane progression), syntactically impoverished. Heavy
-    # rewiring gives the language long-distance syntactic moves at init,
-    # before plasticity has had to discover them. Trade-off: weaker spatial
+    # encode. A pure grid forces local-relations-only "sentences"
+    # (Moore-radius only), syntactically impoverished. Heavy rewiring
+    # gives the language long-distance syntactic moves at init, before
+    # plasticity has had to discover them. Trade-off: weaker spatial
     # prior at init, more work for plasticity to learn which random edges
     # carry meaning. ε-exploration in routing.py provides per-decision
     # stochasticity on top.
     p_rewire: float = 0.3
-    K_intra_fraction: float = 0.5
-    # Of the K_inter = K - K_intra inter-plane edges, what fraction goes
-    # BACKWARD (to plane p-1) vs FORWARD (to plane p+1). Default 0.5 means
-    # equal split → no structural feed-forward bias under your "graph as
-    # syntactic substrate" framing. Set 0.0 to recover legacy forward-only.
-    K_inter_bwd_fraction: float = 0.5
-    # Moore-radius for intra/inter-plane neighbour candidate sampling.
-    # Radius 2 → 24 intra candidates, 25 inter candidates.
-    # Radius 3 → 48 intra candidates, 49 inter candidates (needed for K ≥ ~50
-    # since we now split inter into fwd+bwd halves: K_inter_dir ≤ max_inter).
-    intra_radius: int = 3               # was 2; bumped to support K=48
-    inter_radius: int = 3               # was 2
+    # Moore-radius for neighbour candidate sampling.
+    # Radius 3 → 48 candidates, comfortable for K up to ~48.
+    radius: int = 3
 
-    # --- Per-plane weight specialisation ---
-    # When True, content_mlp has L independent copies (one per plane).
-    # Slower on GPU (L small matmuls instead of one big batched matmul)
-    # but architecturally principled. Disabled by default in favour of
-    # `content_mlp_depth` (deep shared blocks) which hits the same param
-    # budget with better throughput.
-    per_plane_content_mlp: bool = False
+    # --- Per-walker weight specialisation ---
     # When True, content_mlp has H independent copies (one per walker head).
     # MoE-style capacity: total params scale with H, but per-token compute
     # is identical to the shared path since each walker still does one
@@ -90,37 +65,22 @@ class GraphWalkerConfig:
                                         # most of the representational gain
                                         # without the quadratic cost — D_s²
                                         # is what makes content_mlp dominant.
-    D_id: int = 512                     # column identity vector, was 32. The
+    D_id: int = 512                     # column identity vector. The
                                         # identity should be a rich semantic
                                         # vector ("what concept does this
                                         # column carry"), not a tiny ID tag.
     ffn_mult_content: int = 4           # content_mlp: D_s + D_id → 4·D_s → D_s
                                         # ONLY used when D_hid_content is None
-                                        # (legacy / small-D_s configs). For
-                                        # production at D_s=768, set
-                                        # D_hid_content explicitly so
-                                        # content_mlp cost stays linear in
-                                        # D_s instead of quadratic.
+                                        # (legacy / small-D_s configs).
     # Hidden width of every content_mlp ResidualFFN block. Decoupled from
     # D_s — when None the legacy `ffn_mult_content * D_s` formula applies.
-    # Convention 4·D_s gives content_mlp FLOPs ∝ D_s² (quadratic). Pinning
-    # D_hid_content to a fixed value (e.g. 1024) makes the FFN width a
-    # capacity knob independent of D_s; content_mlp cost is then
-    # O(D_s · D_hid_content) — linear in D_s. At D_s=768 with default
-    # ffn_mult=4 the FFN was 9× bigger than at D_s=256; with
-    # D_hid_content=1024 it's only 3× bigger.
     D_hid_content: int | None = 1024
     # Post-readout model-space capacity. These blocks run once per token,
     # not once per hop, so they are a cheaper place to keep params than
-    # the walker hot loop. BUT under the "memory graph IS the model" framing
-    # we want most parameters in the substrate + plasticity, not in a
-    # standard FFN bolted on after the graph is done thinking. Reduced from
-    # 7 to 3 to free ~32M params for graph-side capacity.
-    post_model_depth: int = 2           # was 7. The thesis is that the
-                                        # graph IS the model — the cold
-                                        # readout is just a thin lexical
-                                        # projection head, not a deep
-                                        # transformer FFN tower.
+    # the walker hot loop. The thesis is that the graph IS the model — the
+    # cold readout is just a thin lexical projection head, not a deep
+    # transformer FFN tower.
+    post_model_depth: int = 2
     post_model_ffn_mult: int = 4
     n_score_heads: int = 4              # multi-head bilinear edge scoring
     D_q_per_head: int = 64
@@ -131,7 +91,6 @@ class GraphWalkerConfig:
     # and future history-aware variants. In the current persistent-walker
     # design the fast path advances one hop per token.
     n_hops: int = 4
-    D_q_in: int = 64                    # input-plane start-column query dim
 
     # --- Multi-horizon readout ---
     K_horizons: int = 8
@@ -141,15 +100,10 @@ class GraphWalkerConfig:
     K_buf: int = 8
 
     # --- Clocks ---
-    # `mod_period` is the plasticity window (and the anchor re-pick cadence
-    # since `is_new_window` is derived from it). `tbptt_block` is the
+    # `mod_period` is the plasticity window. `tbptt_block` is the
     # gradient-detach cadence. They should match: the neuromod's delta
     # lives for exactly one window, and we want its one gradient event per
-    # window to attribute the full window-loss back to its action. Splitting
-    # them breaks the walker-trajectory gradient chain mid-window and leaves
-    # the neuromod credited only for short-range effects.
-    # If activation memory blows up, shorten both together rather than
-    # decoupling.
+    # window to attribute the full window-loss back to its action.
     mod_period: int = 128               # plasticity fires every N tokens
     tbptt_block: int = 128              # gradient detach cadence (== mod_period)
 
@@ -162,48 +116,25 @@ class GraphWalkerConfig:
     #     E_bias += δ_hebb + δ_neuromod
     #     where δ_hebb = η_global · (co_visit_norm - decay·E_bias),
     #     η_global = plast_eta · σ(surprise_ema.mean() - plast_surprise_bias).
-    #     Neuromod sees state+id+visit_count per col only; no surprise input,
-    #     no per-edge co_visit/E_bias inputs. Two paths into E_bias.
     #
     #   "neuromod_only" (used by integration via PretrainedGWConfig):
     #     E_bias += δ_neuromod only. Hebbian-flavored stats (co_visit,
-    #     E_bias_old) become per-edge inputs to neuromod's edge MLP, and a
-    #     scalar surprise feature broadcasts across touched-col features.
-    #     Single path into E_bias; neuromod has the final say on every
-    #     plastic update.
+    #     E_bias_old) become per-edge inputs to neuromod's edge MLP.
     plasticity_mode: str = "hebbian_plus_neuromod"
-    plast_eta: float = 0.1              # base Hebbian learning rate ("hebbian_plus_neuromod" only)
-    plast_decay: float = 0.1            # E_bias decay per plasticity tick ("hebbian_plus_neuromod" only)
-    plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta ("hebbian_plus_neuromod" only)
+    plast_eta: float = 0.1              # base Hebbian learning rate
+    plast_decay: float = 0.1            # E_bias decay per plasticity tick
+    plast_surprise_bias: float = 1.0    # σ(surprise_ema - bias) gates eta
 
     # --- Neuromodulator (graph transformer on touched columns) ---
     # A small graph transformer runs at the start of each plasticity
     # window, observing a detached per-touched-column feature snapshot
     # from the previous window and emitting a grad-carrying delta to
-    # E_bias_flat. The delta is live during the current window (gradient
-    # flows back via routing → active_E_bias → neuromod params) and is
-    # detached + folded into the persistent E_bias at window close.
-    # Enabled by default — this is the thesis's intended plasticity path.
-    # Zero-init output projections make day-0 behaviour identical to
-    # scalar-eta Hebbian-only; disable with `use_neuromod=False` to
-    # ablate.
+    # E_bias_flat.
     use_neuromod: bool = True
-    # Neuromod sizing: this is the "learns how to learn" component — for a
-    # lifelong-learning agent it needs enough capacity to encode meta-rules
-    # over the graph, not just be a regulariser. Originally 128/2/4/64
-    # (~0.5M, 0.4% of model); bumped to 384/4/8/256 (~8M, ~9% of model);
-    # bumped again to 512/6/8/384 (~20M, ~20% of model) since neuromod is
-    # FREE in per-token compute (fires once per mod_period window, runs
-    # outside the captured graph) — pure meta-learning capacity gain.
-    neuromod_D_mod: int = 512           # was 384, originally 128
-    neuromod_n_layers: int = 6          # was 4, originally 2 — depth for graph reasoning
-    neuromod_n_heads: int = 8           # was 4
-    # Hidden dim of the per-edge target MLP (cat(x_src, x_dst) → scalar).
-    # Replaces the old low-rank bilinear decoder's `neuromod_rank`.
-    neuromod_edge_hidden: int = 384     # was 256, originally 64
-    # Extra live/commit scale on top of the neuromod's own learnable blend
-    # rate γ = σ(blend_logit). With γ as the primary knob this should be 1;
-    # kept as a config knob for conservative sweeps or quick ablation.
+    neuromod_D_mod: int = 512
+    neuromod_n_layers: int = 6
+    neuromod_n_heads: int = 8
+    neuromod_edge_hidden: int = 384
     neuromod_eta: float = 1.0
 
     # --- Routing (Gumbel + exploration) ---
@@ -219,16 +150,9 @@ class GraphWalkerConfig:
     vocab_size: int = 32_000
 
     # --- Training ---
-    segment_T: int = 1024               # was 256. 8 windows per phase1_step
-                                        # call → 8 plasticity fires per opt
-                                        # step. Block memory unchanged
-                                        # (depends only on mod_period).
+    segment_T: int = 1024
     lr: float = 1e-4
     compile_on_train: bool = True
-    # torch.compile mode for compile_block.
-    #   "default":         ~3.7× over eager via inductor fusion (no cudagraphs)
-    #   "reduce-overhead": adds CUDA-graph capture (additional ~2× target)
-    #   "none":            disables compile entirely (dev iteration)
     compile_mode: str = "default"
 
     # --- Seeds ---
@@ -239,14 +163,14 @@ class GraphWalkerConfig:
     state_dtype: str = "auto"           # "auto" | "bf16" | "fp32"
 
     def __post_init__(self) -> None:
-        if self.plane_rows * self.plane_cols < 1:
-            raise ValueError("plane_rows and plane_cols must be positive")
-        if self.L < 2:
-            raise ValueError("L must be >= 2")
+        if self.grid_rows < 1 or self.grid_cols < 1:
+            raise ValueError("grid_rows and grid_cols must be positive")
         if self.K < 2:
             raise ValueError("K must be >= 2")
         if not 0.0 <= self.p_rewire <= 1.0:
             raise ValueError("p_rewire must be in [0, 1]")
+        if self.radius < 1:
+            raise ValueError("radius must be >= 1")
         if self.n_hops < 1:
             raise ValueError("n_hops must be >= 1")
         if self.n_heads < 1:
@@ -271,10 +195,7 @@ class GraphWalkerConfig:
             raise ValueError(
                 f"tbptt_block ({self.tbptt_block}) must equal mod_period "
                 f"({self.mod_period}). Each TBPTT block must close exactly "
-                "one plasticity window — tbptt < mod_period fragments the "
-                "neuromod's gradient mid-window, and tbptt > mod_period "
-                "would silently skip plasticity firings because the flush "
-                "code only runs _maybe_finalize... after backward."
+                "one plasticity window."
             )
         if self.plasticity_mode not in (
             "hebbian_plus_neuromod", "neuromod_only",
@@ -288,47 +209,16 @@ class GraphWalkerConfig:
                 "plasticity_mode='neuromod_only' requires use_neuromod=True; "
                 "otherwise nothing updates E_bias."
             )
-        # Validate the K split against the topology's local-neighborhood
-        # candidate counts. build_topology samples without replacement via
-        # torch.randperm; if K_intra/K_inter_fwd/K_inter_bwd exceed their
-        # candidate counts, randperm silently truncates and the assignment
-        # `out_nbrs[src] = ...` shape-mismatches and crashes. Guard up front.
-        if not 0.0 <= self.K_inter_bwd_fraction <= 1.0:
-            raise ValueError("K_inter_bwd_fraction must be in [0, 1]")
-        if self.intra_radius < 1 or self.inter_radius < 1:
-            raise ValueError("radii must be >= 1")
-        K_intra = max(1, int(round(self.K * self.K_intra_fraction)))
-        K_inter_total = self.K - K_intra
-        K_inter_bwd = int(round(K_inter_total * self.K_inter_bwd_fraction))
-        K_inter_fwd = K_inter_total - K_inter_bwd
-        # Moore neighbourhood sizes: (2r+1)^2, minus self for intra-plane.
-        max_intra = (2 * self.intra_radius + 1) ** 2 - 1
-        max_inter = (2 * self.inter_radius + 1) ** 2
-        if K_intra > max_intra:
+        max_local = (2 * self.radius + 1) ** 2 - 1
+        if self.K > max_local:
             raise ValueError(
-                f"K * K_intra_fraction = {K_intra} exceeds the "
-                f"intra-plane Moore-radius-{self.intra_radius} candidate "
-                f"count ({max_intra}). Increase intra_radius, reduce K "
-                f"(currently {self.K}), or reduce K_intra_fraction "
-                f"(currently {self.K_intra_fraction})."
+                f"K={self.K} exceeds Moore-radius-{self.radius} candidate "
+                f"count ({max_local}). Increase radius or reduce K."
             )
-        for label, k_dir in (("forward", K_inter_fwd), ("backward", K_inter_bwd)):
-            if k_dir > max_inter:
-                raise ValueError(
-                    f"K_inter_{label} = {k_dir} exceeds the inter-plane "
-                    f"Moore-radius-{self.inter_radius} candidate count "
-                    f"({max_inter}). Increase inter_radius, reduce K "
-                    f"(currently {self.K}), or rebalance K_intra_fraction / "
-                    f"K_inter_bwd_fraction."
-                )
-
-    @property
-    def N_per_plane(self) -> int:
-        return self.plane_rows * self.plane_cols
 
     @property
     def N(self) -> int:
-        return self.L * self.N_per_plane
+        return self.grid_rows * self.grid_cols
 
     @property
     def num_edges(self) -> int:

@@ -11,8 +11,6 @@ bridges:
 - content_mlp, q_proj, k_proj via the routing STE and the endpoint
   readout
 - state_to_model / PostModelStack / PredictionHead via the flush CE
-- input_q/k/v_proj via the once-per-window STE-gated anchor injection
-- prev_motor_proj via the anchor query (zero-init)
 - motor_query / out_k/v_proj via the cross-attn over endpoints
 - col_id via steering, keys, and nbr_id_to_s
 - decay_proj via the LIF α (zero-init)
@@ -38,10 +36,10 @@ from src.graph_walker.train_phase1 import phase1_step
 
 def _tiny_cfg(**overrides) -> GraphWalkerConfig:
     base = dict(
-        plane_rows=8, plane_cols=8, L=2,
+        grid_rows=8, grid_cols=8, radius=2,
         K=8, D_model=64, D_s=64, D_id=16,
         n_heads=2, n_hops=3,
-        D_q_in=16, D_q_per_head=16, n_score_heads=2,
+        D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=256,
         mod_period=4, tbptt_block=4, segment_T=8,
@@ -64,8 +62,6 @@ def _perturb_zero_init_params(lm: StandaloneLM, std: float = 0.05) -> None:
     After training, these parameters learn non-zero values naturally; but
     for a gradient-flow test we need non-zero values up front."""
     m = lm.memory
-    # prev_motor_proj: zero-init per the design (chain is inert at day 0)
-    m.prev_motor_proj.weight.normal_(std=std)
     # decay_proj: zero-init so α(c) = σ(0) = 0.5 uniform
     m.decay_proj.weight.normal_(std=std)
     m.decay_proj.bias.normal_(std=std)
@@ -112,7 +108,7 @@ def test_all_trainable_params_get_gradient():
     # Params that only participate in the pretrained-LM (walk_segment)
     # path, not the StandaloneLM token-id path. Their gradient is verified
     # in the pretrained smoke tests, not here.
-    STANDALONE_UNUSED = {"memory.mem_input_v_proj.weight"}
+    STANDALONE_UNUSED: set[str] = set()
 
     missing: list[str] = []
     nonfinite: list[str] = []
@@ -161,7 +157,7 @@ def test_gradient_flow_without_neuromod():
     )
     assert torch.isfinite(torch.tensor(stats.loss))
 
-    STANDALONE_UNUSED = {"memory.mem_input_v_proj.weight"}
+    STANDALONE_UNUSED: set[str] = set()
     missing, nonfinite, zero_grad = [], [], []
     for name, p in lm.named_parameters():
         if not p.requires_grad:
@@ -193,25 +189,11 @@ def test_known_zero_init_params_have_zero_grad_on_first_step():
     zero gradient. This test documents that property so if someone
     changes an init they can spot the consequence.
 
-    Expected zero grads (before any training on these specific params):
-    - decay_proj.weight/bias: decay_proj is zero so α = σ(0) = 0.5 — the
-      gradient through LIF blend actually reaches decay_proj's inputs
-      IF alpha enters a non-constant computation. It does (s_new is a
-      function of α). So this one is NOT actually expected to be zero.
-    - input_v_proj.weight: zero weight → 0 injection → 0 grad on weight
-      only if injection path is the sole gradient source. But
-      input_v_proj is queried via STE gating of the anchor softmax —
-      gradient should reach input_v_proj if inject_msg affects any
-      downstream output. It does on new-window steps.
-    - prev_motor_proj.weight: zero weight → 0 contribution to anchor
-      query. Gradient reaches the weight via the anchor softmax's
-      dependency on the query.
-
-    Actually, most zero-inits here DO receive non-trivial gradient
-    because the chain they gate is not zero-multiplied at the point
-    their weight matters. The ones that DO stay at zero gradient are
-    those whose output is multiplied by themselves downstream, creating
-    a y·y bilinear dead product — mostly irrelevant to this model.
+    Most zero-inits here DO receive non-trivial gradient because the
+    chain they gate is not zero-multiplied at the point their weight
+    matters. The ones that DO stay at zero gradient are those whose
+    output is multiplied by themselves downstream, creating a y·y
+    bilinear dead product — mostly irrelevant to this model.
 
     Keeping this test as a living document: document any params that
     empirically do receive zero gradient on the first step, if any.
@@ -240,10 +222,6 @@ def test_known_zero_init_params_have_zero_grad_on_first_step():
 
     # neuromod output layer is zero-init → target=0 → delta_nm=0 → zero grad
     # on itself until perturbation. Known and accepted.
-    # input_v_proj is zero-init → inject_msg is zero regardless of
-    # input_ste_weights, so nothing downstream depends on input_v_proj.weight
-    # → zero grad on weight until perturbation.
-    # Same argument for prev_motor_proj.weight and decay_proj.bias/weight.
     #
     # The test does NOT assert a specific list — it just ensures phase1_step
     # runs and produces finite loss even when those paths start zero.

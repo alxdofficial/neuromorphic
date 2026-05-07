@@ -45,10 +45,10 @@ def _make_tiny_llama(d_lm: int = 32, n_layers: int = 4, vocab: int = 256):
 
 def _tiny_walker_cfg(D_s: int, vocab: int, T: int = 8):
     return GraphWalkerConfig(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=D_s, D_s=D_s, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=vocab,
         # Single-knob clock under external-surprise plasticity:
@@ -120,7 +120,7 @@ def test_phase1_step_runs_and_gradient_reaches_all_trainables():
     """End-to-end: one phase-1 step should produce a finite loss and
     backward must reach every trainable parameter, including:
     - Llama-side: W_in, W_out, scale (MemInjectLayer)
-    - Walker-side: content_mlp, q_proj, k_all, nbr_id_to_s, mem_input_v_proj,
+    - Walker-side: content_mlp, q_proj, k_all, nbr_id_to_s,
                    walker_state_alpha, neuromod subtree
     """
     torch.manual_seed(0)
@@ -130,7 +130,6 @@ def test_phase1_step_runs_and_gradient_reaches_all_trainables():
     # Perturb zero-init gates so paths through them carry gradient.
     m = w.memory
     with torch.no_grad():
-        m.prev_motor_proj.weight.normal_(std=0.05)
         m.decay_proj.weight.normal_(std=0.05)
         m.decay_proj.bias.normal_(std=0.05)
         m.readout.pred_head.proj.weight.normal_(std=0.05)

@@ -7,7 +7,7 @@
    when a block has zero valid horizons (typical for T=1 generation
    steps inside an AR rollout).
 3. unfreeze_all() re-freezes the standalone-only walker params
-   (token_to_state, input_v_proj). Without this they re-enter the
+   (token_to_state). Without this they re-enter the
    optimizer state every cycle as dead weights.
 4. begin_segment(clear_neuromod_carryover=True) wipes the previous
    segment's neuromod snapshot. model.begin_segment defaults to
@@ -34,10 +34,10 @@ from src.graph_walker.pretrained.train_phase1 import (
 
 def _tiny_cfg(**overrides):
     base = dict(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=32, D_s=32, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=64,
         mod_period=8, tbptt_block=8, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
@@ -135,7 +135,6 @@ def test_unfreeze_all_keeps_standalone_only_params_frozen():
     w = _make_tiny_wrapper()
     # First sanity: init froze them.
     assert w.memory.token_to_state.weight.requires_grad is False
-    assert w.memory.input_v_proj.weight.requires_grad is False
 
     # Toggle phase 2 freeze, then unfreeze_all — the dead params must NOT
     # come back as trainable.
@@ -145,7 +144,6 @@ def test_unfreeze_all_keeps_standalone_only_params_frozen():
     assert w.memory.token_to_state.weight.requires_grad is False, (
         "unfreeze_all re-enabled token_to_state — dead weight in optimizer"
     )
-    assert w.memory.input_v_proj.weight.requires_grad is False
 
 
 # -- 5. begin_segment(clear_neuromod_carryover) --

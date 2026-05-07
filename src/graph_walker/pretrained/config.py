@@ -116,9 +116,9 @@ class PretrainedGWConfig:
           - `plasticity_mode = "neuromod_only"` — drops the additive δ_hebb
             term; Hebbian-flavored stats (co_visit, E_bias) become inputs
             to neuromod instead. Surprise also enters as a per-col feature.
-          - Default topology (16x16, L=4) gives N=1024 columns — good balance
-            of capacity vs per-token wall time. Override `plane_rows` etc via
-            `mem_kw` for smaller smoke runs.
+          - Default topology (32x32 single grid) gives N=1024 columns — good
+            balance of capacity vs per-token wall time. Override `grid_rows`
+            etc via `mem_kw` for smaller smoke runs.
         """
         base = dict(
             D_s=d_mem,
@@ -209,12 +209,12 @@ class PretrainedGWConfig:
     @classmethod
     def tiny_test(cls, **kw) -> "PretrainedGWConfig":
         """Miniature config for CPU smoke tests — uses SmolLM2-135M + a
-        tiny graph walker (8x8, L=2). Runs in a few seconds."""
+        tiny graph walker (8×8 single grid). Runs in a few seconds."""
         tiny_mem = GraphWalkerConfig(
-            plane_rows=8, plane_cols=8, L=2,
-            K=8, D_model=64, D_s=64, D_id=16,
+            grid_rows=8, grid_cols=8,
+            K=8, D_model=64, D_s=64, D_id=16, radius=2,
             n_heads=2, n_hops=3,
-            D_q_in=16, D_q_per_head=16, n_score_heads=2,
+            D_q_per_head=16, n_score_heads=2,
             K_horizons=4, K_buf=4,
             vocab_size=256,
             # Single-knob clock invariant: T == mod_period == tbptt_block

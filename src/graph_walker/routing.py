@@ -53,11 +53,10 @@ class StepRoutingChoices:
        so routing forward is deterministic; log-π is recomputed under
        current policy with grad.
 
-    `anchor_idx` is None on non-new-window steps (anchor pick only fires
-    at segment start; within a window walkers roam using `walker_pos_in`).
-    `edge_idx` is present every step.
+    `edge_idx` is the only routing decision per step now that anchoring
+    has been removed — every step the walker scores its K out-neighbors
+    and picks one.
     """
-    anchor_idx: torch.Tensor | None  # [B*H] long, or None
     edge_idx: torch.Tensor           # [B*H] long
 
 

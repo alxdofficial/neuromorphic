@@ -144,7 +144,7 @@ class IntegratedLM(nn.Module):
             # not token ids, and the walker has no LM head of its own, so
             # these get no gradient and are dead weight in the optimizer
             # state.
-            for p_name in ("token_to_state", "input_v_proj", "tied_token_emb"):
+            for p_name in ("token_to_state", "tied_token_emb"):
                 p = getattr(self.memory, p_name).weight
                 p.requires_grad = False
             # `state_to_model` and the entire `readout` submodule (multi-
@@ -153,12 +153,6 @@ class IntegratedLM(nn.Module):
             self.memory.state_to_model.weight.requires_grad = False
             for p in self.memory.readout.parameters():
                 p.requires_grad = False
-            # `prev_motor_proj` only contributes when is_new_window fires
-            # mid-segment. Under T = mod_period (the integration's clock
-            # invariant) it fires exactly once per segment at tick 0,
-            # where `prev_motor` is always zeros from begin_segment — so
-            # the Linear's weight gradient is identically zero. Freeze.
-            self.memory.prev_motor_proj.weight.requires_grad = False
 
             # Disable activation checkpointing on the whole-block forward in
             # the integration training path. This is the OPPOSITE of the
@@ -335,7 +329,7 @@ class IntegratedLM(nn.Module):
 
         What's saved:
         - `s` (LIF state per column)
-        - `prev_motor`, `walker_pos`, `walker_state`
+        - `walker_pos`, `walker_state`
         - `surprise_ema`, `surprise_prev`
         - `_log_pi_sum`, `_log_pi_count` (phase-2 routing log-π accumulator)
         - `tick_counter`, `window_len` (segment-level counters)
@@ -364,7 +358,6 @@ class IntegratedLM(nn.Module):
 
         return {
             "s": _clone_or_none(m.s),
-            "prev_motor": _clone_or_none(m.prev_motor),
             "walker_pos": _clone_or_none(m.walker_pos),
             "walker_state": _clone_or_none(m.walker_state),
             "surprise_ema": _clone_or_none(m.surprise_ema),
@@ -396,7 +389,6 @@ class IntegratedLM(nn.Module):
                 setattr(m, name, v.clone())
 
         _restore("s")
-        _restore("prev_motor")
         _restore("walker_pos")
         _restore("walker_state")
         _restore("surprise_ema")
@@ -514,12 +506,11 @@ class IntegratedLM(nn.Module):
         # Earlier this only re-froze 2 of 6 dead params, so cycle-phase-1
         # rebuilds optimizer state for ~10M params that get no gradient.
         if self.memory is not None:
-            for p_name in ("token_to_state", "input_v_proj", "tied_token_emb"):
+            for p_name in ("token_to_state", "tied_token_emb"):
                 getattr(self.memory, p_name).weight.requires_grad = False
             self.memory.state_to_model.weight.requires_grad = False
             for p in self.memory.readout.parameters():
                 p.requires_grad = False
-            self.memory.prev_motor_proj.weight.requires_grad = False
 
     def freeze_all_but_E_bias_and_neuromod(self) -> None:
         """Phase-2 minimal policy surface: only neuromod + E_bias evolve.

@@ -18,7 +18,7 @@ Captured body (one block of TBPTT):
             * ``ce_loss_buf``, ``balance_loss_buf``, ``block_horizon_*`` ← detached
             * ``ce_masked_buf`` ← ``ce_masked.detach()`` (for surprise EMA)
             * ``memory.s`` ← ``out.s_new``                — state evolution
-            * ``memory.walker_pos`` / ``walker_state`` / ``prev_motor`` ← out.*
+            * ``memory.walker_pos`` / ``walker_state`` ← out.*
             * ``memory.co_visit_flat`` += ``out.co_visit_total`` (in-place)
             * ``memory.visit_count`` += ``out.visit_count_total``  (in-place)
 
@@ -178,7 +178,6 @@ class CapturedBlockTrainer:
         # re-execute each replay with current parameter values.
         memory._horizon_logits_cache = None
         memory._alpha_cache = None
-        memory._input_keys_cache = None
         memory._k_all_cache = None
         memory._ensure_block_caches(memory.tied_token_emb.weight)
 
@@ -197,8 +196,8 @@ class CapturedBlockTrainer:
         with ctx:
             out = self._block_callable(
                 memory.s, memory.walker_pos, memory.walker_state,
-                memory.prev_motor, e_bias,
-                self.tokens_buf, self.tau_buf, self.eps_buf, True,
+                e_bias,
+                self.tokens_buf, self.tau_buf, self.eps_buf,
             )
 
             # Per-horizon CE — kept in fp32 for stable accumulation.
@@ -247,7 +246,6 @@ class CapturedBlockTrainer:
             memory.s.copy_(out.s_new)
             memory.walker_pos.copy_(out.walker_pos_new)
             memory.walker_state.copy_(out.walker_state_new)
-            memory.prev_motor.copy_(out.prev_motor_new)
 
             # Non-grad accumulators — in-place add into stable buffers.
             memory.co_visit_flat.add_(out.co_visit_total)

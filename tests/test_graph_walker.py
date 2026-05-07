@@ -11,12 +11,12 @@ from src.graph_walker.train_phase1 import phase1_step
 
 
 def _tiny_cfg(**overrides) -> GraphWalkerConfig:
-    """Small config: 2 planes × 8×8 = 128 columns, vocab 256."""
+    """Small config: single 16×8 = 128-column substrate, vocab 256."""
     base = dict(
-        plane_rows=8, plane_cols=8, L=2,
+        grid_rows=16, grid_cols=8, radius=2,
         K=8, D_model=64, D_s=64, D_id=16,
         n_heads=2, n_hops=3,
-        D_q_in=16, D_q_per_head=16, n_score_heads=2,
+        D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=256,
         mod_period=4, tbptt_block=4, segment_T=8,
@@ -47,16 +47,15 @@ def test_single_step_shape():
     assert torch.isfinite(r.logits).all()
 
 
-def test_persistent_walker_step_visits_start_and_endpoint():
-    """Each token now anchors H input columns and advances H persistent walkers."""
+def test_persistent_walker_step_visits_endpoint():
+    """Each token, every walker hops once and visit_count records the landing."""
     lm, tokens, cfg = _make(B=2, T=1)
     lm.memory.begin_segment(B=2, device=tokens.device)
     _ = lm.memory.step(tokens[:, 0])
-    # visit_count should count at least start-cols + next-cols for each head.
     assert lm.memory.visit_count is not None
     total_visits = lm.memory.visit_count.sum().item()
-    expected_min = 2 * cfg.n_heads * 2             # B × H × (start + endpoint)
-    assert total_visits >= expected_min - 1       # might be slightly off-by-one
+    expected = 2 * cfg.n_heads                   # B × H landings per step
+    assert total_visits == expected
 
 
 def test_non_visited_columns_preserved():
@@ -68,8 +67,8 @@ def test_non_visited_columns_preserved():
     s_after = lm.memory.s
     # At least some columns should be unchanged (not on any trajectory)
     unchanged = torch.all(s_before == s_after, dim=-1)  # [B, N] bool
-    # Persistent-walker mode only touches start-cols and one hop endpoint.
-    assert unchanged.sum().item() > 2 * (cfg.N - 2 * cfg.n_heads - 1)
+    # Walker writes only at its current column per step.
+    assert unchanged.sum().item() > 2 * (cfg.N - cfg.n_heads - 1)
 
 
 def test_walker_positions_persist_across_tokens():
@@ -86,8 +85,8 @@ def test_walker_positions_persist_across_tokens():
 
 def test_gradient_flow_through_trajectory():
     """Backprop through logits reaches all trainable params, and at least
-    one routing-related param (q_proj, k_proj, or input_q_proj) has a
-    non-zero gradient — confirming the straight-through estimator wires up.
+    one routing-related param (q_proj, k_proj) has a non-zero gradient —
+    confirming the straight-through estimator wires up.
 
     We don't require ALL routing params to have non-zero grad on a given
     random seed because per-sample Gumbel noise patterns can occasionally
@@ -104,14 +103,9 @@ def test_gradient_flow_through_trajectory():
     loss = torch.stack(logits_all).float().sum()
     loss.backward()
 
-    # content_mlp has three possible shapes: Sequential (shared, shallow),
-    # PerPlaneMLP (one W1 per plane), or DeepContentMLP (ModuleList of
-    # residual FFN blocks). Pick a representative tensor from whichever
-    # is in use and verify gradient reaches it.
+    # content_mlp uses DeepContentMLP (in_proj + ResidualFFN blocks).
     params = dict(lm.memory.named_parameters())
-    if "cols.content_mlp.W1" in params:
-        content_name = "cols.content_mlp.W1"
-    elif "cols.content_mlp.in_proj.weight" in params:
+    if "cols.content_mlp.in_proj.weight" in params:
         content_name = "cols.content_mlp.in_proj.weight"
     else:
         content_name = "cols.content_mlp.0.weight"
@@ -126,7 +120,6 @@ def test_gradient_flow_through_trajectory():
     routing_names = [
         "cols.q_proj.0.weight", "cols.q_proj.2.weight",
         "cols.k_proj.0.weight", "cols.k_proj.2.weight",
-        "input_q_proj.weight",
     ]
     routing_grads = []
     for name in routing_names:
@@ -139,11 +132,7 @@ def test_gradient_flow_through_trajectory():
 
 
 def test_load_balance_loss_carries_gradient_to_routing():
-    """load_balance_loss must actually back-prop into routing params.
-    Previously the loss was hard-coded to zero and visit_freq was detached,
-    so this aux loss was a silent no-op. Here we back-prop ONLY the
-    load-balance loss and check routing params move.
-    """
+    """load_balance_loss must actually back-prop into routing params."""
     torch.manual_seed(0)
     lm, tokens, cfg = _make(B=2, T=4)
     lm.memory.begin_segment(B=2, device=tokens.device)
@@ -156,9 +145,7 @@ def test_load_balance_loss_carries_gradient_to_routing():
     assert lb_total.requires_grad, "load_balance_loss must carry gradient"
     lb_total.backward()
 
-    routing_names = [
-        "cols.q_proj.2.weight", "cols.k_proj.2.weight", "input_q_proj.weight",
-    ]
+    routing_names = ["cols.q_proj.2.weight", "cols.k_proj.2.weight"]
     grads = {
         n: dict(lm.memory.named_parameters())[n].grad for n in routing_names
     }
@@ -167,51 +154,6 @@ def test_load_balance_loss_carries_gradient_to_routing():
         f"load-balance loss produced zero grad on all routing params: "
         f"{ {n: g.abs().sum().item() for n, g in grads.items()} }"
     )
-
-
-def test_prev_motor_chain_updates_and_influences_routing():
-    """After a step, prev_motor stores the step's motor output, and once
-    prev_motor_proj learns non-zero weights the start-col query depends on it.
-    """
-    torch.manual_seed(0)
-    lm, tokens, cfg = _make(B=2, T=3)
-    lm.memory.begin_segment(B=2, device=tokens.device)
-    # Initial prev_motor is zero
-    assert torch.all(lm.memory.prev_motor == 0)
-
-    r0 = lm.memory.step(tokens[:, 0])
-    # After step, prev_motor equals the internal state-space motor
-    assert torch.allclose(lm.memory.prev_motor, r0.motor_state)
-
-    # Override prev_motor_proj with non-zero weights so the chain is active.
-    with torch.no_grad():
-        lm.memory.prev_motor_proj.weight.normal_(std=0.1)
-
-    # With non-zero prev_motor and non-zero projection, two identical-token
-    # steps produce different start-col distributions (since prev_motor
-    # differs between them).
-    lm.memory.begin_segment(B=2, device=tokens.device)
-    same_tok = tokens[:, 0]
-    # Drive prev_motor to two different values manually, verify start-col
-    # softmax query changes.
-    lm.memory.prev_motor = torch.randn_like(lm.memory.prev_motor)
-    q1 = lm.memory.token_to_state(
-        lm.memory.tied_token_emb(same_tok)
-    ) + lm.memory.prev_motor_proj(lm.memory.prev_motor)
-    lm.memory.prev_motor = torch.randn_like(lm.memory.prev_motor)
-    q2 = lm.memory.token_to_state(
-        lm.memory.tied_token_emb(same_tok)
-    ) + lm.memory.prev_motor_proj(lm.memory.prev_motor)
-    assert not torch.allclose(q1, q2), "prev_motor should influence start-col query"
-
-
-def test_prev_motor_detached_on_detach_state():
-    lm, tokens, cfg = _make(B=2, T=3)
-    lm.memory.begin_segment(B=2, device=tokens.device)
-    _ = lm.memory.step(tokens[:, 0])
-    assert lm.memory.prev_motor.requires_grad or lm.memory.prev_motor.grad_fn is not None
-    lm.memory.detach_state()
-    assert lm.memory.prev_motor.grad_fn is None
 
 
 def test_k_buf_must_be_at_least_k_horizons():

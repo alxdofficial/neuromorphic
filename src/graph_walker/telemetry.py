@@ -4,14 +4,14 @@ Coverage (~40 metrics across 8 categories):
 - training        loss, ce, aux_ce, load_balance, grad_norm, lr, tok/sec
 - column_state    ||s|| percentiles, touched_frac, visit_entropy
 - walker_heads    ||walker_state|| per head, walker_state_alpha per head,
-                  head co-location rate, head-plane distribution
+                  head co-location rate
 - routing         tau, epsilon, routing_entropy, edge_diversity,
                   exploration_rate
 - neuromod        ||delta_nm||, gamma, ||E_bias|| / max / >thresh frac,
                   per-layer grad norm
 - surprise        per-horizon surprise EMA, plast_eta, hebb-vs-nm magnitude
 - gradients       per-component grad norms (token_emb, content_mlp,
-                  q_proj, k_all, nbr_id_to_s, mem_input_v_proj,
+                  q_proj, k_all, nbr_id_to_s,
                   state_to_model, walker_state_alpha, neuromod.*)
 - llama           W_in/W_out grad+value norms, scale norm,
                   inject_residual_norm, ce_minus_vanilla (when available)
@@ -240,12 +240,12 @@ class StatsCollector:
         if m is not None:
             for prefix in (
                 "tied_token_emb", "cols.content_mlp", "cols.q_proj",
-                "cols.k_proj", "nbr_id_to_s", "mem_input_v_proj",
+                "cols.k_proj", "nbr_id_to_s",
                 "state_to_model", "walker_state_alpha",
                 "neuromod.edge_mlp", "neuromod.feature_proj",
                 "neuromod.layers", "neuromod.blend_logit",
                 "neuromod.edge_bias_proj",
-                "input_q_proj", "out_k_proj", "out_v_proj",
+                "out_k_proj", "out_v_proj",
             ):
                 gn = 0.0
                 for name, p in m.named_parameters():

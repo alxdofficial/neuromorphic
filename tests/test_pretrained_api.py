@@ -5,7 +5,7 @@ Covers:
   produces a finite motor_state.
 - walk_segment: [B, T, D_s] → [B, T, D_s] readouts. Gradient flows
   through all expected params including the pretrained-only
-  `mem_input_v_proj`.
+  the walker's projections.
 - Block-vs-per-token parity for the compiled block path.
 """
 
@@ -19,10 +19,10 @@ from src.graph_walker.standalone import StandaloneLM
 
 def _tiny_cfg(**overrides) -> GraphWalkerConfig:
     base = dict(
-        plane_rows=8, plane_cols=8, L=2,
+        grid_rows=8, grid_cols=8, radius=2,
         K=8, D_model=64, D_s=64, D_id=16,
         n_heads=2, n_hops=3,
-        D_q_in=16, D_q_per_head=16, n_score_heads=2,
+        D_q_per_head=16, n_score_heads=2,
         K_horizons=4, K_buf=4,
         vocab_size=256,
         mod_period=4, tbptt_block=4, segment_T=8,
@@ -75,7 +75,7 @@ def test_walk_segment_shapes_and_finite():
 def test_walk_segment_gradient_reaches_pretrained_only_params():
     """Backward from a readouts.pow(2).mean() loss (proxy for the gradient
     Llama would inject through W_out) should reach:
-    - mem_input_v_proj (only used in the external-h path)
+    - h_mem (so W_in would learn)
     - content_mlp, q_proj, k_all, nbr_id_to_s, walker_state_alpha
     """
     torch.manual_seed(0)
@@ -84,7 +84,6 @@ def test_walk_segment_gradient_reaches_pretrained_only_params():
     m = lm.memory
     # Perturb zero-init gates so the gradient chain has signal.
     with torch.no_grad():
-        m.prev_motor_proj.weight.normal_(std=0.05)
         m.decay_proj.weight.normal_(std=0.05)
         m.decay_proj.bias.normal_(std=0.05)
         m.readout.pred_head.proj.weight.normal_(std=0.05)
@@ -103,12 +102,6 @@ def test_walk_segment_gradient_reaches_pretrained_only_params():
     # h_mem must receive gradient (so W_in would learn)
     assert h_mem.grad is not None
     assert h_mem.grad.abs().sum() > 0, "h_mem (Llama hidden proxy) got no grad"
-
-    # mem_input_v_proj must receive gradient (pretrained-only path)
-    assert m.mem_input_v_proj.weight.grad is not None
-    assert m.mem_input_v_proj.weight.grad.abs().sum() > 0, (
-        "mem_input_v_proj got no gradient — pretrained anchor-v-inject path broken"
-    )
 
     # Sanity: shared walker params get gradient too. The walker is vocab-
     # agnostic now — `state_to_model` (only used by the dropped aux CE

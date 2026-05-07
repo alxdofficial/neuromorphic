@@ -71,10 +71,10 @@ def test_replay_falls_back_to_sample_when_saved_idx_none():
 
 def _tiny_walker_cfg(D_s=32, T=4):
     return GraphWalkerConfig(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=D_s, D_s=D_s, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=128,
         mod_period=T, tbptt_block=T, segment_T=T,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
@@ -348,10 +348,10 @@ def test_grpo_replay_spans_multiple_tbptt_blocks():
     vocab = 256
     # Multi-block config: tbptt_block=4 < T_pre + L_gen - 1 = 11 → 3 blocks.
     walker_cfg = GraphWalkerConfig(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=d_lm, D_s=d_lm, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=vocab,
         mod_period=4, tbptt_block=4, segment_T=4,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,

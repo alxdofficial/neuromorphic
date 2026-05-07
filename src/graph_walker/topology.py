@@ -1,6 +1,9 @@
-"""Graph topology — static after init. Same grid + Watts-Strogatz as
-column-graph, but WITHOUT inverse adjacency (graph-walker doesn't need
-scatter-gather; it walks).
+"""Graph topology — single flat substrate of N columns laid out on a 2D
+torus, with K out-edges per column drawn from a Moore-radius local
+neighborhood and Watts-Strogatz random rewiring.
+
+There are no planes — every column is structurally equal. Walkers
+traverse this single homogeneous concept space.
 """
 
 from __future__ import annotations
@@ -15,16 +18,12 @@ class Topology:
     out_nbrs: torch.Tensor        # [N, K] int64 — destination col for each out-edge
     edge_src: torch.Tensor        # [N*K] int64 — source col per flat-edge-idx
     edge_dst: torch.Tensor        # [N*K] int64 — dest col per flat-edge-idx
-    plane_ids: torch.Tensor       # [N] int64
-    input_positions: torch.Tensor  # [N_per_plane] int64 — plane 0 cols
 
     def move_to(self, device: torch.device) -> "Topology":
         return Topology(
             out_nbrs=self.out_nbrs.to(device),
             edge_src=self.edge_src.to(device),
             edge_dst=self.edge_dst.to(device),
-            plane_ids=self.plane_ids.to(device),
-            input_positions=self.input_positions.to(device),
         )
 
 
@@ -32,147 +31,90 @@ def _moore_offsets(radius: int) -> list[tuple[int, int]]:
     offs = []
     for dr in range(-radius, radius + 1):
         for dc in range(-radius, radius + 1):
+            if dr == 0 and dc == 0:
+                continue
             offs.append((dr, dc))
     return offs
 
 
-def _intra_plane_candidates(rows, cols, r, c, radius):
-    cands = []
-    for dr, dc in _moore_offsets(radius):
-        if dr == 0 and dc == 0:
-            continue
-        nr = (r + dr) % rows
-        nc = (c + dc) % cols
-        cands.append((nr, nc))
-    return cands
-
-
-def _inter_plane_candidates(rows, cols, r, c, radius):
-    cands = []
-    for dr, dc in _moore_offsets(radius):
-        nr = (r + dr) % rows
-        nc = (c + dc) % cols
-        cands.append((nr, nc))
-    return cands
-
-
 def build_topology(
-    plane_rows: int,
-    plane_cols: int,
-    L: int,
+    grid_rows: int,
+    grid_cols: int,
     K: int,
     p_rewire: float,
-    K_intra_fraction: float,
     seed: int,
-    K_inter_bwd_fraction: float = 0.5,
-    intra_radius: int = 2,
-    inter_radius: int = 2,
+    radius: int = 3,
     verbose: bool = False,
 ) -> Topology:
-    """Build the graph-walker topology.
+    """Build a single-grid Watts-Strogatz topology.
 
-    Each column gets ``K`` outgoing edges, partitioned into three groups:
-      - ``K_intra``    edges to the same plane (Moore radius ``intra_radius``)
-      - ``K_inter_fwd`` edges to plane ``(p + 1) % L`` (forward in depth)
-      - ``K_inter_bwd`` edges to plane ``(p - 1) % L`` (backward in depth)
+    Each of the ``N = grid_rows * grid_cols`` columns gets ``K`` outgoing
+    edges. Initial neighbors are sampled (without replacement) from the
+    local Moore neighborhood of radius ``radius`` (so each column has
+    ``(2*radius+1)^2 - 1`` candidates). Then with probability ``p_rewire``
+    each edge has its destination replaced by a uniform-random column
+    anywhere in the graph — the Watts-Strogatz small-world shuffle.
 
-    Where:
-      ``K_intra        = round(K · K_intra_fraction)``
-      ``K_inter_total  = K − K_intra``
-      ``K_inter_bwd    = round(K_inter_total · K_inter_bwd_fraction)``
-      ``K_inter_fwd    = K_inter_total − K_inter_bwd``
+    With ``radius=3`` we have ``48`` candidates per column, comfortably
+    above ``K=16`` so the local-neighbor sampling is well-defined.
 
-    With defaults (K_intra_fraction=0.5, K_inter_bwd_fraction=0.5), edges
-    split roughly into thirds across (same plane, forward, backward) — no
-    structural feed-forward bias. Set ``K_inter_bwd_fraction=0.0`` for the
-    legacy forward-only behaviour.
-
-    On top of this structured topology, ``p_rewire`` fraction of edges have
-    their destination replaced by a uniform-random global column.
+    With ``p_rewire=0.3`` the graph is well past the small-world transition
+    (~0.1) and has plenty of long-range shortcuts so any column is reachable
+    from any other in ~log(N) hops.
     """
-    N_per_plane = plane_rows * plane_cols
-    N = L * N_per_plane
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if not 0.0 <= p_rewire <= 1.0:
+        raise ValueError("p_rewire must be in [0, 1]")
+    if radius < 1:
+        raise ValueError("radius must be >= 1")
+
+    N = grid_rows * grid_cols
+    max_local = (2 * radius + 1) ** 2 - 1
+    if K > max_local:
+        raise ValueError(
+            f"K={K} exceeds Moore-radius-{radius} candidate count "
+            f"({max_local}). Increase radius or reduce K."
+        )
 
     g = torch.Generator().manual_seed(seed)
 
-    def to_flat(p, r, c):
-        return p * N_per_plane + r * plane_cols + c
+    def to_flat(r: int, c: int) -> int:
+        return r * grid_cols + c
 
-    plane_ids = torch.empty(N, dtype=torch.int64)
-    for p in range(L):
-        for r in range(plane_rows):
-            for c in range(plane_cols):
-                plane_ids[to_flat(p, r, c)] = p
-
-    input_positions = torch.tensor(
-        [to_flat(0, r, c) for r in range(plane_rows) for c in range(plane_cols)],
-        dtype=torch.int64,
-    )
-
-    # Out-edge budget: K = K_intra + K_inter_fwd + K_inter_bwd.
-    K_intra = max(1, int(round(K * K_intra_fraction)))
-    K_inter_total = K - K_intra
-    K_inter_bwd = int(round(K_inter_total * K_inter_bwd_fraction))
-    K_inter_fwd = K_inter_total - K_inter_bwd
-
+    offsets = _moore_offsets(radius)
     out_nbrs = torch.empty(N, K, dtype=torch.int64)
 
     import time as _time
-    t_topo_start = _time.perf_counter()
-    last_print = t_topo_start
+    t_start = _time.perf_counter()
+    last_print = t_start
     cols_done = 0
 
-    for p in range(L):
-        for r in range(plane_rows):
-            for c in range(plane_cols):
-                src = to_flat(p, r, c)
-                if verbose:
-                    cols_done += 1
-                    now = _time.perf_counter()
-                    if now - last_print > 2.0:
-                        pct = 100.0 * cols_done / N
-                        rate = cols_done / (now - t_topo_start)
-                        eta = (N - cols_done) / max(rate, 1e-6)
-                        print(
-                            f"  [topology] {cols_done}/{N} cols ({pct:.0f}%), "
-                            f"{rate:.0f} cols/s, ETA {eta:.0f}s",
-                            flush=True,
-                        )
-                        last_print = now
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            src = to_flat(r, c)
+            if verbose:
+                cols_done += 1
+                now = _time.perf_counter()
+                if now - last_print > 2.0:
+                    pct = 100.0 * cols_done / N
+                    rate = cols_done / (now - t_start)
+                    eta = (N - cols_done) / max(rate, 1e-6)
+                    print(
+                        f"  [topology] {cols_done}/{N} cols ({pct:.0f}%), "
+                        f"{rate:.0f} cols/s, ETA {eta:.0f}s",
+                        flush=True,
+                    )
+                    last_print = now
 
-                # Intra-plane neighbours (same plane p).
-                intra_cands = _intra_plane_candidates(
-                    plane_rows, plane_cols, r, c, intra_radius,
-                )
-                idx = torch.randperm(len(intra_cands), generator=g)[:K_intra]
-                intra_flat = [to_flat(p, *intra_cands[int(i)]) for i in idx]
-
-                # Forward inter-plane neighbours (plane p+1).
-                inter_cands = _inter_plane_candidates(
-                    plane_rows, plane_cols, r, c, inter_radius,
-                )
-                if K_inter_fwd > 0:
-                    p_fwd = (p + 1) % L
-                    idx = torch.randperm(len(inter_cands), generator=g)[:K_inter_fwd]
-                    inter_fwd_flat = [
-                        to_flat(p_fwd, *inter_cands[int(i)]) for i in idx
-                    ]
-                else:
-                    inter_fwd_flat = []
-
-                # Backward inter-plane neighbours (plane p-1).
-                if K_inter_bwd > 0:
-                    p_bwd = (p - 1) % L
-                    idx = torch.randperm(len(inter_cands), generator=g)[:K_inter_bwd]
-                    inter_bwd_flat = [
-                        to_flat(p_bwd, *inter_cands[int(i)]) for i in idx
-                    ]
-                else:
-                    inter_bwd_flat = []
-
-                out_nbrs[src] = torch.tensor(
-                    intra_flat + inter_fwd_flat + inter_bwd_flat, dtype=torch.int64,
-                )
+            cands = [
+                to_flat((r + dr) % grid_rows, (c + dc) % grid_cols)
+                for dr, dc in offsets
+            ]
+            idx = torch.randperm(len(cands), generator=g)[:K]
+            out_nbrs[src] = torch.tensor(
+                [cands[int(i)] for i in idx], dtype=torch.int64,
+            )
 
     # Watts-Strogatz rewiring
     rand = torch.rand(N, K, generator=g)
@@ -183,7 +125,7 @@ def build_topology(
 
     if verbose:
         print(
-            f"  [topology] done in {_time.perf_counter() - t_topo_start:.1f}s",
+            f"  [topology] done in {_time.perf_counter() - t_start:.1f}s",
             flush=True,
         )
 
@@ -197,6 +139,4 @@ def build_topology(
         out_nbrs=out_nbrs,
         edge_src=edge_src,
         edge_dst=edge_dst,
-        plane_ids=plane_ids,
-        input_positions=input_positions,
     )

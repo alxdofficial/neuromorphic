@@ -33,10 +33,10 @@ def _make_tiny_llama(d_lm=32, n_layers=4, vocab=256):
 
 def _tiny_walker_cfg(D_s, vocab, T=8):
     return GraphWalkerConfig(
-        plane_rows=4, plane_cols=4, L=2,
+        grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=D_s, D_s=D_s, D_id=8,
         n_heads=2, n_hops=2,
-        D_q_in=8, D_q_per_head=8, n_score_heads=2,
+        D_q_per_head=8, n_score_heads=2,
         K_horizons=4, K_buf=4, vocab_size=vocab,
         # Single-knob clock under external-surprise plasticity.
         mod_period=T, tbptt_block=T, segment_T=T,
@@ -62,7 +62,6 @@ def _make_tiny_wrapper(d_lm=32, vocab=256, T=8):
 def _perturb_walker_weights(w):
     m = w.memory
     with torch.no_grad():
-        m.prev_motor_proj.weight.normal_(std=0.05)
         m.decay_proj.weight.normal_(std=0.05)
         m.decay_proj.bias.normal_(std=0.05)
         m.readout.pred_head.proj.weight.normal_(std=0.05)

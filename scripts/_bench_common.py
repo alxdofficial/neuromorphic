@@ -18,12 +18,12 @@ from src.graph_walker.config import GraphWalkerConfig
 
 # Production walker config: what's on main today (~25M trainable, fits cudagraph).
 PRODUCTION_KNOBS = dict(
-    plane_rows=16, plane_cols=16, L=4,
+    grid_rows=32, grid_cols=32, radius=3,
     K=16, D_s=256, D_id=512, D_model=256,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
     n_heads=4, n_hops=4,
-    n_score_heads=4, D_q_per_head=64, D_q_in=64,
+    n_score_heads=4, D_q_per_head=64,
     K_horizons=8, K_buf=8,
     neuromod_D_mod=512, neuromod_n_layers=6, neuromod_n_heads=8,
     neuromod_edge_hidden=384,
@@ -32,17 +32,15 @@ PRODUCTION_KNOBS = dict(
 # Target walker config (~110M trainable). Per memory/walker_target_config.md.
 # Currently breaks cudagraph compile; runnable in eager mode.
 TARGET_KNOBS = dict(
-    plane_rows=32, plane_cols=32, L=4,           # N = 4096
+    grid_rows=64, grid_cols=64, radius=5,         # N = 4096
     K=96, D_s=768, D_id=512, D_model=1024,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
     n_heads=4, n_hops=4,
-    n_score_heads=4, D_q_per_head=64, D_q_in=64,
+    n_score_heads=4, D_q_per_head=64,
     K_horizons=8, K_buf=8,
     neuromod_D_mod=512, neuromod_n_layers=6, neuromod_n_heads=8,
     neuromod_edge_hidden=384,
-    K_intra_fraction=0.5, K_inter_bwd_fraction=0.5,
-    intra_radius=3, inter_radius=3,
 )
 
 
@@ -52,10 +50,10 @@ def add_walker_config_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--target-config", action="store_true",
                     help="Load the ~110M target walker config preset.")
     # Topology
-    ap.add_argument("--plane-rows", type=int, default=None)
-    ap.add_argument("--plane-cols", type=int, default=None)
-    ap.add_argument("--L", dest="L", type=int, default=None,
-                    help="Number of planes")
+    ap.add_argument("--grid-rows", type=int, default=None)
+    ap.add_argument("--grid-cols", type=int, default=None)
+    ap.add_argument("--radius", type=int, default=None,
+                    help="Moore-radius for neighbor candidate sampling")
     ap.add_argument("--walker-K", type=int, default=None,
                     help="Out-edges per column (walker topology)")
     # Widths
@@ -103,7 +101,7 @@ def walker_cfg_from_args(args: argparse.Namespace, T: int, vocab: int) -> GraphW
     knobs = dict(TARGET_KNOBS if args.target_config else PRODUCTION_KNOBS)
     # Per-arg overrides (only set if user supplied)
     overrides = {
-        "plane_rows": args.plane_rows, "plane_cols": args.plane_cols, "L": args.L,
+        "grid_rows": args.grid_rows, "grid_cols": args.grid_cols, "radius": args.radius,
         "K": args.walker_K, "D_s": args.D_s, "D_id": args.D_id, "D_model": args.D_model,
         "content_mlp_depth": args.content_depth,
         "D_hid_content": args.D_hid_content,
@@ -129,7 +127,7 @@ def walker_cfg_from_args(args: argparse.Namespace, T: int, vocab: int) -> GraphW
 
 def print_config_summary(walker_cfg: GraphWalkerConfig, label: str) -> None:
     print(f"  walker config ({label}):")
-    print(f"    N = {walker_cfg.N} ({walker_cfg.plane_rows}x{walker_cfg.plane_cols}x{walker_cfg.L}), K = {walker_cfg.K}")
+    print(f"    N = {walker_cfg.N} ({walker_cfg.grid_rows}x{walker_cfg.grid_cols}), K = {walker_cfg.K}, radius = {walker_cfg.radius}")
     print(f"    D_s = {walker_cfg.D_s}, D_id = {walker_cfg.D_id}, D_model = {walker_cfg.D_model}")
     print(f"    content depth = {walker_cfg.content_mlp_depth}, D_hid_content = {walker_cfg.D_hid_content}")
     print(f"    n_heads = {walker_cfg.n_heads}, n_hops = {walker_cfg.n_hops}")
