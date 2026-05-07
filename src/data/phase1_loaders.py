@@ -94,7 +94,13 @@ def pretokenized_phase1_iter(
 
 @dataclass
 class _TokenStreamBuffer:
-    """Accumulate tokens in a flat list; flush BS*T at a time as [BS, T]."""
+    """Accumulate tokens in a flat list; flush BS*T at a time as [BS, T].
+
+    Also maintains a parallel "supervised-target" mask stream. By
+    default every token is supervised (mask=True); the chat-SFT loader
+    sets mask=False for non-assistant tokens (user, system, role
+    headers, padding) so they're excluded from CE via ignore_index.
+    """
 
     bs: int
     T: int
@@ -103,22 +109,55 @@ class _TokenStreamBuffer:
 
     def __post_init__(self) -> None:
         self._buf: list[int] = []
+        self._mask_buf: list[bool] = []
 
-    def push(self, token_ids: list[int]) -> None:
-        if token_ids:
-            self._buf.extend(token_ids)
-            self._buf.append(self.eos_id)
+    def push(
+        self,
+        token_ids: list[int],
+        target_mask: list[bool] | None = None,
+    ) -> None:
+        if not token_ids:
+            return
+        if target_mask is None:
+            # Default: every pushed token is a valid supervised target.
+            target_mask = [True] * len(token_ids)
+        if len(target_mask) != len(token_ids):
+            raise ValueError(
+                f"target_mask len {len(target_mask)} != "
+                f"token_ids len {len(token_ids)}"
+            )
+        self._buf.extend(token_ids)
+        self._mask_buf.extend(target_mask)
+        # The trailing eos_id is a document boundary, not assistant
+        # content — keep it in inputs but don't supervise.
+        self._buf.append(self.eos_id)
+        self._mask_buf.append(False)
 
     def ready(self) -> bool:
         return len(self._buf) >= self.bs * self.T
 
-    def pop_batch(self) -> torch.Tensor:
-        """Return [BS, T] int64 on `device`. Trims buffer."""
+    def pop_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(input_ids[BS, T], target_ids[BS, T])`` on ``device``.
+
+        ``target_ids`` is ``input_ids`` with -100 (PyTorch
+        ``ignore_index``) wherever the target_mask was False — that is,
+        wherever the corresponding token is NOT a supervised assistant
+        position. ``F.cross_entropy(..., ignore_index=-100)`` then
+        skips those positions exactly. The trainer is responsible for
+        passing ``ignore_index=-100``; without it the -100 values would
+        be treated as out-of-vocab token ids and crash.
+        """
         n = self.bs * self.T
         chunk = self._buf[:n]
+        mask_chunk = self._mask_buf[:n]
         self._buf = self._buf[n:]
+        self._mask_buf = self._mask_buf[n:]
         arr = np.asarray(chunk, dtype=np.int64).reshape(self.bs, self.T)
-        return torch.from_numpy(arr).to(self.device, non_blocking=True)
+        mask_arr = np.asarray(mask_chunk, dtype=bool).reshape(self.bs, self.T)
+        target_arr = np.where(mask_arr, arr, np.int64(-100))
+        input_t = torch.from_numpy(arr).to(self.device, non_blocking=True)
+        target_t = torch.from_numpy(target_arr).to(self.device, non_blocking=True)
+        return input_t, target_t
 
 
 def fineweb_edu_phase1_iter(
@@ -170,11 +209,12 @@ def fineweb_edu_phase1_iter(
             )
             buf.push(ids)
             while buf.ready():
-                input_ids = buf.pop_batch()
-                # Phase1Batch convention: target_ids == input_ids
-                # (trainer does the shift internally — see Phase1Batch
-                # docstring in train_phase1.py)
-                yield Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
+                input_ids, target_ids = buf.pop_batch()
+                # FineWeb-edu has no role structure — every token is a
+                # valid supervised target, target_ids == input_ids
+                # (Phase1Batch convention: trainer does the shift
+                # internally, see Phase1Batch docstring).
+                yield Phase1Batch(input_ids=input_ids, target_ids=target_ids)
                 yielded += 1
                 if max_batches is not None and yielded >= max_batches:
                     return
@@ -237,19 +277,66 @@ def chat_sft_phase1_iter(
         messages = example.get("messages") or example.get("conversation")
         if not messages:
             continue
+        # Build the (token_ids, target_mask) stream by templating each
+        # message INDIVIDUALLY and using the cumulative-length boundary
+        # detection trick (same approach as preprocess_wildchat_llama32):
+        # apply_chat_template(messages[:i+1]) - apply_chat_template(messages[:i])
+        # gives the token range owned by message i. We mask everything
+        # whose owning role != "assistant" — that drops user, system,
+        # AND the chat-template injected role headers / EOT markers
+        # within those non-assistant turns. Assistant role headers and
+        # EOT markers also fall in the "assistant" range and DO get
+        # supervised, which matches standard chat-SFT practice (the
+        # assistant turn IS the model's output, headers and all).
         try:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+            full_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False,
             )
         except Exception:
             continue
-        ids = tokenizer.encode(
-            text, add_special_tokens=False, truncation=True, max_length=T * 4,
-        )
-        buf.push(ids)
+        if not isinstance(full_ids, list):
+            full_ids = list(full_ids)
+        # Drop sessions that are too long to fit a useful chunk; the
+        # streaming buffer would shred them across batch boundaries
+        # which would scramble the role-mask alignment.
+        if len(full_ids) > T * 4:
+            continue
+        target_mask: list[bool] = [False] * len(full_ids)
+        prev_end = 0
+        ok = True
+        for i, m in enumerate(messages):
+            role = m.get("role") or m.get("from")
+            try:
+                cum_ids = tokenizer.apply_chat_template(
+                    messages[:i + 1], tokenize=True,
+                    add_generation_prompt=False,
+                )
+            except Exception:
+                ok = False
+                break
+            cur_end = len(cum_ids)
+            if role == "assistant":
+                for k in range(prev_end, min(cur_end, len(full_ids))):
+                    target_mask[k] = True
+            prev_end = cur_end
+        if not ok:
+            continue
+        # Sanity: per-turn templating may drift from full-sequence
+        # templating; if so the role-mask alignment is unreliable, skip.
+        if prev_end != len(full_ids):
+            continue
+        buf.push(full_ids, target_mask=target_mask)
         while buf.ready():
-            input_ids = buf.pop_batch()
-            yield Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
+            input_ids, target_ids = buf.pop_batch()
+            # Assistant-only mask: target_ids has -100 (PyTorch
+            # ignore_index) at user/system/template positions, so CE
+            # only counts assistant-turn predictions. The trainer
+            # (phase1_pretrained_step) passes ignore_index=-100 to
+            # F.cross_entropy. Without that the -100 values would be
+            # treated as out-of-vocab token ids and the call would
+            # crash — so the assistant mask and the trainer's
+            # ignore_index must stay in sync.
+            yield Phase1Batch(input_ids=input_ids, target_ids=target_ids)
             yielded += 1
             if max_batches is not None and yielded >= max_batches:
                 return

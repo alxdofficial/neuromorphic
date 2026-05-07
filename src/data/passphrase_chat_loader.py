@@ -176,8 +176,8 @@ def _build_chat_grpo_example(
     ref_ids = ref_ids[:L_ref]
 
     prefix_ids = fact_only_tpl + filler_ids + qa_tpl
-    # Pad/trim to exactly T_pre. We trim from the FILLER region (the
-    # middle) so fact + question stay intact.
+    # Pad/trim to exactly T_pre. We trim/pad from the FILLER region
+    # (the middle) so fact + question stay intact.
     if len(prefix_ids) > T_pre:
         # Should be rare given the available_filler arithmetic above;
         # handle defensively by trimming filler from the right.
@@ -186,11 +186,22 @@ def _build_chat_grpo_example(
         end = len(fact_only_tpl) + len(filler_ids)
         prefix_ids = prefix_ids[:end - excess] + prefix_ids[end:]
     elif len(prefix_ids) < T_pre:
-        # Pad with extra filler at the END of the filler region.
+        # Pad to T_pre with NEUTRAL pad tokens — NOT more chat-filler.
+        # Padding with chat-filler would silently override the
+        # `filler_mid_tokens` parameter (the curriculum knob), making
+        # all examples sit at the maximum fact-to-question distance
+        # regardless of `filler_min`/`filler_max`. Padding with pad
+        # tokens preserves the curriculum: `filler_mid_tokens` controls
+        # how much REAL chat content sits between fact and question;
+        # the rest of the prefix is "silent" PAD tokens that the walker
+        # still has to walk through but don't constitute confounding
+        # chat content for the LM.
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(tokenizer, "eos_token_id", 0)
         pad = T_pre - len(prefix_ids)
-        more = filler_pool.sample(pad)
         end = len(fact_only_tpl) + len(filler_ids)
-        prefix_ids = prefix_ids[:end] + more + prefix_ids[end:]
+        prefix_ids = prefix_ids[:end] + [pad_id] * pad + prefix_ids[end:]
     assert len(prefix_ids) == T_pre, (
         f"prefix_ids length {len(prefix_ids)} != T_pre {T_pre}"
     )

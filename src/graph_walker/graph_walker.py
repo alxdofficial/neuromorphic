@@ -646,6 +646,12 @@ class GraphWalkerMemory(nn.Module):
         # decision (so phase-1 forwards don't allocate an extra tensor).
         self._log_pi_sum = None
         self._log_pi_count = 0
+        # Load-balance auxiliary loss accumulator. Filled per step (or
+        # per block) by walk_segment; consumed by the trainer after
+        # the forward via `consume_load_balance_loss()`. Mean-normalized
+        # over the segment so the loss magnitude doesn't scale with T.
+        self._lb_loss_sum: torch.Tensor | None = None
+        self._lb_loss_count: int = 0
 
         # Invalidate block-level caches at segment boundary.
         self._horizon_logits_cache = None
@@ -973,6 +979,16 @@ class GraphWalkerMemory(nn.Module):
                 else self._log_pi_sum + out.log_pi_step
             )
             self._log_pi_count += 1
+        # Anti-collapse load-balance auxiliary loss accumulation. Kept
+        # outside the no_grad block so gradient flows back to routing
+        # scores → q_proj / k_proj. The trainer consumes this via
+        # `consume_load_balance_loss()` after the forward and adds
+        # `lambda_balance * lb_loss` to the main loss.
+        self._lb_loss_sum = (
+            out.load_balance_loss if self._lb_loss_sum is None
+            else self._lb_loss_sum + out.load_balance_loss
+        )
+        self._lb_loss_count += 1
         # Routing-trace capture: if a buffer was armed via
         # `start_capturing_routes()`, append this step's choices to it.
         # Used by phase-2 GRPO to record a no-grad sampling trace that a
@@ -1066,6 +1082,38 @@ class GraphWalkerMemory(nn.Module):
         self._log_pi_sum = None
         self._log_pi_count = 0
         return out
+
+    def consume_load_balance_loss(self) -> torch.Tensor | None:
+        """Return the accumulated load-balance auxiliary loss (sum / step
+        count) and clear the accumulator.
+
+        The load-balance loss `N · Σ_col P_mean[col] · f_mean[col]` is the
+        Switch-Transformer-style anti-collapse pressure: it's minimized
+        when both the soft routing distribution `P_mass` and the actual
+        visit fractions `f_mean` are uniform across columns. Without this
+        term in the optimizer's loss, walkers tend to collapse onto a
+        small subset of columns — defeating the "graph as concept space"
+        thesis where every column is supposed to carry a meaningful
+        meaning.
+
+        Trainer usage:
+            lb = model.memory.consume_load_balance_loss()
+            if lb is not None:
+                loss = loss + cfg.memory.lambda_balance * lb
+            loss.backward()
+
+        Returns None when no decisions were recorded since the last
+        `begin_segment` call (e.g., calling on a fresh module before any
+        forward).
+        """
+        if self._lb_loss_sum is None or self._lb_loss_count == 0:
+            self._lb_loss_sum = None
+            self._lb_loss_count = 0
+            return None
+        mean = self._lb_loss_sum / float(self._lb_loss_count)
+        self._lb_loss_sum = None
+        self._lb_loss_count = 0
+        return mean
 
     def consume_log_pi_mean(self) -> torch.Tensor | None:
         """Return the accumulated phase-2 log π MEAN (sum / step count).
@@ -1538,6 +1586,15 @@ class GraphWalkerMemory(nn.Module):
                         )
                 self.window_len += ticks
                 self.tick_counter += ticks
+                # Load-balance loss aggregated by walk_block_from_h is
+                # already a sum across the block's T_block steps —
+                # accumulate at the segment level so the per-step
+                # mean-normalization stays correct downstream.
+                self._lb_loss_sum = (
+                    out.load_balance_loss if self._lb_loss_sum is None
+                    else self._lb_loss_sum + out.load_balance_loss
+                )
+                self._lb_loss_count += ticks
                 # NOTE: walk_block_from_h drops log_pi_step. Phase-2 GRPO
                 # callers stay on the per-token preserve_graph=True path
                 # (T=1 per call), which keeps log_pi accumulation alive

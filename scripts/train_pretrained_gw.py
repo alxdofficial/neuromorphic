@@ -232,6 +232,15 @@ def main() -> None:
     with StatsCollector(work_dir=work_dir) as collector:
         step = start_step
         for batch in data_iter:
+            # Drive the walker's Gumbel τ / ε annealing schedule. Without
+            # this the walker reads training_step=0 forever and routing
+            # stays at gumbel_tau_start=2.0 / epsilon_start=0.05 — never
+            # anneals to the lower-noise end-of-schedule values, so the
+            # routing distribution stays softer than designed and the
+            # eventual Phase-2 hard-Categorical handoff sees a less
+            # decisive policy than it should.
+            if model.memory is not None:
+                model.memory.training_step = step
             stats = phase1_pretrained_step(
                 model, opt, batch,
                 amp_dtype=torch.bfloat16 if device.type == "cuda" else None,

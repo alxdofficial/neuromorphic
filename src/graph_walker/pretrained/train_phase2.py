@@ -79,12 +79,19 @@ class GRPOStats:
     gen_unique_count: int        # # unique generations among K rollouts; if 1, no signal
     grad_norm: float
     eos_fraction: float = 0.0
+    load_balance_loss: float = 0.0       # walker load-balance aux (pre-weight)
     # Per-group breakdown — populated when B>1. For B=1, each list has length 1.
     # Useful for the multi-session uniform-batched path which needs per-prompt
     # mean/std for honest logging (the global reward_mean above averages across
     # ALL B*K rollouts and obscures per-prompt variation).
     per_group_reward_mean: list[float] | None = None    # [B] per-prompt mean reward
     per_group_reward_std: list[float] | None = None     # [B] per-prompt std
+    # Per-group reward std clamping diagnostics — exposes the difference
+    # between the unclamped std (what we report) and the clamped std
+    # (what's actually used as the advantage divisor). When clamped > 0
+    # but unclamped ≈ 0, advantages were dampened by `adv_std_floor` —
+    # the actual learning signal is smaller than the reported std implies.
+    per_group_reward_std_clamped: list[float] | None = None  # [B] clamped at adv_std_floor
 
 
 def grpo_step(
@@ -241,6 +248,21 @@ def grpo_step(
     # variance proportionally to the parallelism — equivalent to the
     # prior K-only mean when B=1.
     loss = -(log_pi_mean * advantages.detach()).mean()
+
+    # Anti-collapse load-balance auxiliary loss (same Switch-Transformer
+    # pressure as Phase 1). The walker accumulates per-step lb-loss
+    # across the replay forward (begin_segment in replay_grpo_rollout
+    # resets the accumulator, so this is replay-only — sample-phase
+    # accumulation under no_grad is correctly discarded). Without this
+    # in Phase 2, any column-spreading achieved in Phase 1 can be
+    # undone by REINFORCE collapsing onto a few high-reward routes.
+    lb_loss_value: float = 0.0
+    if model.memory is not None and model.memory.cfg.lambda_balance > 0.0:
+        lb = model.memory.consume_load_balance_loss()
+        if lb is not None:
+            loss = loss + model.memory.cfg.lambda_balance * lb.float()
+            lb_loss_value = float(lb.detach())
+
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for _, p in model.trainable_parameters()],
@@ -268,8 +290,15 @@ def grpo_step(
 
     # Per-group reward stats — same r_grp/r_mean_grp/r_std_grp computed
     # earlier for advantage normalization, just exposed in the return.
+    # Both unclamped (true reward dispersion) AND clamped (the actual
+    # divisor used in advantage normalization). When unclamped < clamped,
+    # advantages were attenuated by `adv_std_floor` — the learning signal
+    # is smaller than the unclamped std implies.
     per_group_reward_mean = r_mean_grp.detach().squeeze(-1).tolist()  # [B]
-    per_group_reward_std = r_grp.std(dim=1).detach().tolist()         # [B] (un-clamped)
+    per_group_reward_std = r_grp.std(dim=1).detach().tolist()         # [B] unclamped
+    per_group_reward_std_clamped = (
+        r_std_grp.detach().squeeze(-1).tolist()
+    )                                                                  # [B] clamped
     eos_fraction = 0.0
     if sampled.eos_step is not None:
         eos_fraction = float((sampled.eos_step < gen_length).float().mean().detach())
@@ -288,8 +317,10 @@ def grpo_step(
         grad_norm=float(grad_norm) if isinstance(grad_norm, torch.Tensor)
                   else float(grad_norm),
         eos_fraction=eos_fraction,
+        load_balance_loss=lb_loss_value,
         per_group_reward_mean=per_group_reward_mean,
         per_group_reward_std=per_group_reward_std,
+        per_group_reward_std_clamped=per_group_reward_std_clamped,
     )
 
 
@@ -549,6 +580,12 @@ def grpo_session_step(
                 f"expected ({K},)"
             )
         loss = -(log_pi_mean * advantages.detach()).mean()
+
+        # Anti-collapse load-balance aux (same as grpo_step's loss).
+        if model.memory is not None and model.memory.cfg.lambda_balance > 0.0:
+            lb = model.memory.consume_load_balance_loss()
+            if lb is not None:
+                loss = loss + model.memory.cfg.lambda_balance * lb.float()
 
         # ---- Backward + step ----
         loss.backward()

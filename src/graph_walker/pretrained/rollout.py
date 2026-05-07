@@ -548,6 +548,7 @@ def autoregressive_rollout(
     grad_during_prefix: bool = True,
     grad_during_gen: bool = False,
     gen_sample_routing: bool = False,
+    update_plasticity: bool = True,
 ) -> RolloutOutput:
     """Run a prefix + generation rollout.
 
@@ -575,6 +576,17 @@ def autoregressive_rollout(
             Note: even with gen_sample_routing=True, log_pi from gen-time
             routing is consumed-and-discarded after prefix; only the
             prefix log_pi participates in REINFORCE.
+        update_plasticity: if True (default), at the end of the rollout
+            compute per-token CE against the actual next-token sequence
+            (= teacher-forced prefix tokens for the prefix portion +
+            sampled gen tokens for the gen portion) and call
+            ``model.memory.update_plasticity(per_token_ce)``. This
+            honors the unified surprise rule: the model is always
+            predicting the next token, and the walker's plastic state
+            updates from whatever surprise the actual next token
+            delivered — regardless of whether that token came from
+            data, a sampler, or a user. Set False for diagnostic /
+            snapshot-stable runs that must not mutate plastic state.
     """
     assert model.memory is not None, "rollout requires attached memory"
     device = next(model.parameters()).device
@@ -601,6 +613,13 @@ def autoregressive_rollout(
             out = model(prefix_ids, use_cache=True)
             past_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
+            # Hold a reference to the prefix logits so we can compute
+            # per-token CE against the prefix-shifted-by-1 targets at
+            # the end of the rollout (for plasticity surprise). Stored
+            # under no_grad to avoid bloating the autograd graph; this
+            # is a value-only use (plasticity surprise has no grad path
+            # in the unified-plasticity contract).
+            prefix_logits_for_surprise = out.logits.detach() if update_plasticity else None
             # Consume the MEAN (sum / step_count). The raw sum scales
             # with T_pre × n_hops × n_heads ≈ thousands of decisions per
             # rollout, producing gradient magnitudes thousands of times
@@ -610,6 +629,7 @@ def autoregressive_rollout(
         # Generation pass — freeze plasticity to keep the policy fixed.
         gen_ctx = torch.enable_grad() if grad_during_gen else torch.no_grad()
         new_tokens: list[torch.Tensor] = []
+        gen_logits: list[torch.Tensor] = []
         # train(True) during gen with phase=phase2 makes routing Categorical-
         # sample (more rollout variance). The accumulated log_pi from gen
         # is discarded post-rollout via the begin_segment reset on the
@@ -619,6 +639,11 @@ def autoregressive_rollout(
         with gen_ctx, _freeze_plasticity_ctx(model.memory):
             model.train(gen_train_mode)
             for _ in range(gen_length):
+                # `last_logits` here predicts the token we're ABOUT to
+                # sample. Capture it BEFORE sampling so we can compute
+                # CE against the sampled token after the loop.
+                if update_plasticity:
+                    gen_logits.append(last_logits.detach())
                 tok = _sample_next_token(last_logits, temperature, top_p)
                 new_tokens.append(tok)
                 out = model(
@@ -629,6 +654,45 @@ def autoregressive_rollout(
         new_tokens_t = torch.stack(new_tokens, dim=1) if new_tokens else \
                        torch.zeros(BS, 0, dtype=torch.long, device=device)
         full = torch.cat([prefix_ids, new_tokens_t], dim=1)
+
+        # Unified plasticity at inference. The surprise rule is:
+        #   "the model is always predicting the next token; the walker
+        #    updates from CE against whatever the actual next token was
+        #    — data, sample, user input, or tool output."
+        # Here the prefix's actual next-token sequence is prefix_ids
+        # itself (teacher-forced), and the gen's actual next-token
+        # sequence is the just-sampled new_tokens (self-prediction
+        # surprise = the model's distribution entropy at the chosen
+        # samples). Concatenate, compute per-token CE under no_grad,
+        # call update_plasticity. The walker doesn't know — and
+        # doesn't need to know — which was data vs sample.
+        if update_plasticity and model.memory is not None:
+            with torch.no_grad():
+                # Prefix CE: logits at position t predict prefix_ids[t+1].
+                # We have T_pre logits and need T_pre - 1 CE values
+                # (positions 0..T_pre-2 predicting 1..T_pre-1). The
+                # T_pre-1 logit is captured separately in gen_logits[0]
+                # which predicts the FIRST gen token.
+                prefix_logits_shift = prefix_logits_for_surprise[:, :-1, :]
+                prefix_targets = prefix_ids[:, 1:]
+                # Gen CE: gen_logits[i] predicts new_tokens[:, i].
+                # Stack to [BS, L_gen, V].
+                if gen_logits:
+                    gen_logits_t = torch.stack(gen_logits, dim=1)
+                    gen_targets = new_tokens_t
+                    full_logits = torch.cat(
+                        [prefix_logits_shift, gen_logits_t], dim=1,
+                    )                                          # [BS, T_pre-1+L_gen, V]
+                    full_targets = torch.cat(
+                        [prefix_targets, gen_targets], dim=1,
+                    )                                          # [BS, T_pre-1+L_gen]
+                else:
+                    full_logits = prefix_logits_shift
+                    full_targets = prefix_targets
+                per_token_ce = _per_token_ce_chunked(
+                    full_logits, full_targets,
+                )
+            model.memory.update_plasticity(per_token_ce)
 
         return RolloutOutput(
             generated=full,

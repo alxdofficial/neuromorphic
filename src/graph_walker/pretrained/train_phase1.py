@@ -66,6 +66,11 @@ class Phase1Stats:
                                          # whether the readout was actually doing
                                          # anything).
     tok_per_sec: float
+    load_balance_loss: float = 0.0       # walker load-balance aux (pre-weight).
+                                         # Watch this drift toward zero as
+                                         # walkers spread; if it stays high or
+                                         # grows over training, walkers are
+                                         # collapsing onto a small col subset.
 
 
 def phase1_pretrained_step(
@@ -125,8 +130,24 @@ def phase1_pretrained_step(
         ce = F.cross_entropy(
             logits_shift.reshape(-1, logits_shift.size(-1)).float(),
             targets_shift.reshape(-1),
+            ignore_index=-100,
         )
         loss = cfg.ce_weight * ce
+
+        # Anti-collapse load-balance auxiliary loss (Switch-Transformer
+        # style; minimized when walkers + columns are uniformly visited).
+        # Without this, walkers tend to pile onto a few columns over
+        # training and the rest of the graph becomes dead weight —
+        # directly undermines the "graph as concept space" thesis. The
+        # walker accumulates the per-step load-balance loss during its
+        # forward and we add the segment mean to the total loss here,
+        # weighted by the configured `lambda_balance` (default 0.01).
+        lb_loss_value: float = 0.0
+        if model.memory is not None and model.memory.cfg.lambda_balance > 0.0:
+            lb = model.memory.consume_load_balance_loss()
+            if lb is not None:
+                loss = loss + model.memory.cfg.lambda_balance * lb.float()
+                lb_loss_value = float(lb.detach())
 
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -144,10 +165,17 @@ def phase1_pretrained_step(
     # target so we feed only T-1 positions.
     if model.memory is not None:
         with torch.no_grad():
+            # When `targets_shift` has -100 (assistant-mask sentinel),
+            # F.cross_entropy(reduction='none', ignore_index=-100)
+            # outputs 0 at those positions instead of evaluating the
+            # CE — that's exactly what we want for surprise: the
+            # walker only sees surprise from supervised positions, and
+            # ignored positions contribute zero (no spurious signal).
             per_token_ce = F.cross_entropy(
                 logits_shift.reshape(-1, logits_shift.size(-1)).float(),
                 targets_shift.reshape(-1),
                 reduction="none",
+                ignore_index=-100,
             ).reshape(BS, T - 1)
         model.memory.update_plasticity(per_token_ce)
 
@@ -183,4 +211,5 @@ def phase1_pretrained_step(
                 else float(grad_norm),
         inject_residual_ratio=inject_ratio,
         tok_per_sec=tok_per_sec,
+        load_balance_loss=lb_loss_value,
     )

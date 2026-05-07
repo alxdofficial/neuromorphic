@@ -90,6 +90,37 @@ def _build_wave3_iter(args, tokenizer, device):
     )
 
 
+def _compute_assistant_gen_prompt(tokenizer) -> list[int]:
+    """Extract the chat-template tokens that open an assistant turn.
+
+    For Llama-3.2-Instruct this is roughly
+    `<|start_header_id|>assistant<|end_header_id|>\\n\\n`. Computed by
+    diffing `apply_chat_template(..., add_generation_prompt=True)` vs
+    `... add_generation_prompt=False)` on a single user message — the
+    suffix difference IS the gen-prompt tokens. Tokenizer-agnostic
+    (works for any chat-template that supports `add_generation_prompt`).
+    """
+    msgs = [{"role": "user", "content": "x"}]
+    with_prompt = tokenizer.apply_chat_template(
+        msgs, tokenize=True, add_generation_prompt=True,
+    )
+    no_prompt = tokenizer.apply_chat_template(
+        msgs, tokenize=True, add_generation_prompt=False,
+    )
+    if isinstance(with_prompt, list) and isinstance(no_prompt, list):
+        if len(with_prompt) <= len(no_prompt):
+            raise RuntimeError(
+                "tokenizer.apply_chat_template(add_generation_prompt=True) "
+                "did not produce additional tokens — chat template may not "
+                "support the gen-prompt cue"
+            )
+        return with_prompt[len(no_prompt):]
+    raise RuntimeError(
+        f"unexpected apply_chat_template return type: "
+        f"{type(with_prompt)}, {type(no_prompt)}"
+    )
+
+
 def _build_wave4_iter(args, tokenizer, device):
     """Wave 4: WildChat-1M turn-batched iterator (Verlog-style).
 
@@ -101,8 +132,14 @@ def _build_wave4_iter(args, tokenizer, device):
 
     Slots directly into grpo_session_step's uniform-batched fast path
     (same as Wave 3) — true B*K parallel rollouts per outer step.
+
+    Each TurnPair has the chat-template assistant-gen-prompt appended
+    to its prior (and stripped from the front of ref) so the LM
+    receives the same "begin assistant turn" cue Wave 3 uses via
+    `apply_chat_template(..., add_generation_prompt=True)`.
     """
     from src.data.wildchat_loader import wildchat_turn_pair_grpo_batch_iter
+    gen_prompt = _compute_assistant_gen_prompt(tokenizer)
     return wildchat_turn_pair_grpo_batch_iter(
         bin_path=args.wildchat_bin,
         turns_path=args.wildchat_turns,
@@ -112,6 +149,7 @@ def _build_wave4_iter(args, tokenizer, device):
         device=device,
         seed=args.seed,
         min_assistant_turns=args.min_assistant_turns,
+        assistant_gen_prompt=gen_prompt,
     )
 
 
@@ -195,13 +233,43 @@ def main() -> None:
                     help="If set, two-phase forward: walker absorbs the full "
                          "prefix but LM only attends to the last N tokens. "
                          "Forces walker to carry information beyond the LM's "
-                         "attention reach. None = LM sees everything walker "
-                         "sees (default). For Wave 3 with long filler, try "
-                         "256-512. For Wave 4 long chats, try 512-1024.")
+                         "attention reach. If unset, defaults are picked per "
+                         "data source: passphrase-chat-grpo → 512 (LM sees "
+                         "the question + recent filler tail; fact at prefix "
+                         "start is invisible to attention, walker MUST carry "
+                         "it via E_bias), wildchat-grpo → 1024 (longer "
+                         "chats need more visible context for natural "
+                         "continuation while still forcing cross-turn memory). "
+                         "Pass an explicit value (incl. 0 to disable) to "
+                         "override.")
     ap.add_argument("--filler-min", type=int, default=100)
     ap.add_argument("--filler-max", type=int, default=1500)
     ap.add_argument("--n-heldout", type=int, default=20)
     args = ap.parse_args()
+
+    # Per-data-source default for --lm-context-window. Without windowing,
+    # the LM attends over the FULL prefix and can solve memory tasks via
+    # standard attention — defeating the walker's purpose. Each data
+    # source has a different "right" window: passphrase prefixes are
+    # 2K-shaped with the fact at position 0, so 512 is plenty for the
+    # question-tail while keeping the fact invisible. WildChat prefixes
+    # vary; 1024 gives natural conversation context while still forcing
+    # cross-turn memory through the walker.
+    if args.lm_context_window is None:
+        if args.data == "passphrase-chat-grpo":
+            args.lm_context_window = 512
+        elif args.data == "wildchat-grpo":
+            args.lm_context_window = 1024
+        print(f"[setup] --lm-context-window auto-set to "
+              f"{args.lm_context_window} for --data {args.data}. "
+              "Pass --lm-context-window 0 to disable windowing.")
+    elif args.lm_context_window == 0:
+        # 0 = explicit disable. Convert to None for downstream code which
+        # treats None as "no windowing".
+        args.lm_context_window = None
+        print("[setup] --lm-context-window=0 → windowing disabled. "
+              "WARNING: walker will not be forced to carry information; "
+              "memory training signal may be weak.")
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -372,6 +440,26 @@ def main() -> None:
         import math
         return args.lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
+    # Resume optimizer + step state from the checkpoint if present.
+    # Without this, an interrupted Wave 3/4 run restarts AdamW moments
+    # (m, v) and the LR schedule from step 0 even when --resume reloads
+    # the model weights — silently changing training dynamics on
+    # resume. Phase-1 ckpts won't have these keys; that's fine since
+    # we only resume Phase 2 from a Phase 2 checkpoint.
+    start_step = 0
+    if "opt" in ckpt:
+        try:
+            opt.load_state_dict(ckpt["opt"])
+            print("[setup] resumed optimizer state (AdamW moments)")
+        except (ValueError, RuntimeError) as e:
+            # Trainable surface mismatch (e.g., resuming a "minimum"
+            # ckpt under "phase1" mode). Skip and warn.
+            print(f"[setup] WARNING: could not load optimizer state ({e}); "
+                  "starting with fresh AdamW moments")
+    if "step" in ckpt:
+        start_step = int(ckpt["step"])
+        print(f"[setup] resuming from step {start_step}")
+
     # ---- BERT-cosine reward ----
     print(f"[setup] loading BERT scorer (all-mpnet-base-v2) on {device}")
     bert_model = load_default_bert(device=device)
@@ -400,7 +488,7 @@ def main() -> None:
 
     model.train(False)  # walker train mode is set by sample/replay internally
     t0 = time.perf_counter()
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         # LR schedule
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step)

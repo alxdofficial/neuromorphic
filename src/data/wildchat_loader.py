@@ -219,11 +219,29 @@ class TurnPair:
         )
 
 
-def session_to_turn_pairs(session: MultiTurnSession) -> Iterator[TurnPair]:
+def session_to_turn_pairs(
+    session: MultiTurnSession,
+    *,
+    assistant_gen_prompt: list[int] | None = None,
+) -> Iterator[TurnPair]:
     """Walk a session and yield one TurnPair per assistant turn. The
     cumulative prior at turn t is concat of all turn ids at indices
     0..t-1. Skips the first assistant turn if there's no prior context
     (degenerate session).
+
+    ``assistant_gen_prompt`` is the chat-template's "open assistant
+    turn" token sequence (e.g. for Llama-3.2-Instruct it's the tokens
+    for ``<|start_header_id|>assistant<|end_header_id|>\\n\\n``).
+    When provided, the prior_ids has these tokens appended and the
+    corresponding prefix is STRIPPED from ref_ids — so the model is
+    asked to generate the response BODY starting after the role
+    header, instead of having to invent the role header itself. This
+    matches how the Wave 3 chat-injected loader uses
+    ``apply_chat_template(..., add_generation_prompt=True)``. Without
+    this, Wave 4 generation is out-of-distribution: the model would
+    spend its first few generated tokens recreating the role header
+    that was already implicitly present in the chat template, eating
+    into max_response_len and shifting reward measurement.
 
     The TurnPair's prior_ids is a fresh tensor (same device as the
     session's turn ids) — independent of the session, so the session
@@ -239,15 +257,35 @@ def session_to_turn_pairs(session: MultiTurnSession) -> Iterator[TurnPair]:
                 # context as a prefix to the NEXT assistant turn would
                 # be a malformed chat-template input.
                 continue
+
+            # Build the prior + the (optional) role-header gen prompt.
+            # The ref_ids has the role header stripped to match.
+            ref_ids = turn.ids
+            prior_list = list(cumulative)
+            if assistant_gen_prompt is not None:
+                hdr_len = len(assistant_gen_prompt)
+                ref_head = ref_ids[:hdr_len].tolist()
+                if ref_head == assistant_gen_prompt:
+                    # Move role header from ref → prior. Standard case.
+                    prior_list.extend(assistant_gen_prompt)
+                    ref_ids = ref_ids[hdr_len:]
+                else:
+                    # Turn does not start with the expected role-header
+                    # tokens (template mismatch / unusual session). Append
+                    # the gen prompt anyway so the model gets the
+                    # "begin assistant" cue, but DO NOT strip ref_ids —
+                    # we don't know what to strip.
+                    prior_list.extend(assistant_gen_prompt)
+
             prior_t = torch.tensor(
-                cumulative, dtype=torch.long, device=turn.ids.device,
+                prior_list, dtype=torch.long, device=turn.ids.device,
             )
             yield TurnPair(
                 prior_ids=prior_t,
-                ref_ids=turn.ids,
+                ref_ids=ref_ids,
                 session_idx=session.session_idx,
                 turn_idx=t,
-                prior_len=len(cumulative),
+                prior_len=len(prior_list),
             )
         cumulative.extend(turn.ids.cpu().tolist())
 
@@ -263,6 +301,7 @@ def wildchat_turn_pair_grpo_batch_iter(
     seed: int = 0,
     min_assistant_turns: int = 1,
     truncate_priors_to_min: bool = True,
+    assistant_gen_prompt: list[int] | None = None,
 ) -> Iterator[list[MultiTurnSession]]:
     """Yield batches of B turn-pairs from WildChat, each wrapped as a
     2-turn ``MultiTurnSession`` so they slot directly into
@@ -322,7 +361,9 @@ def wildchat_turn_pair_grpo_batch_iter(
                     session = next(session_iter)
                 except StopIteration:
                     break
-                pool.extend(session_to_turn_pairs(session))
+                pool.extend(session_to_turn_pairs(
+                    session, assistant_gen_prompt=assistant_gen_prompt,
+                ))
             if len(pool) < batch_size:
                 # Session iter exhausted and pool can't reach batch_size.
                 return
