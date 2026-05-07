@@ -650,7 +650,9 @@ class GraphWalkerMemory(nn.Module):
     # Block-level caches (static per forward within a TBPTT block)
     # -----------------------------------------------------------------
 
-    def compile_step(self, mode: str = "default") -> None:
+    def compile_step(
+        self, mode: str = "default", *, dynamic: bool | None = False,
+    ) -> None:
         """Compile the hot per-token graph core. Must be called after .cuda().
 
         Uses fullgraph=False so dynamo can graph-break around the Python
@@ -660,6 +662,11 @@ class GraphWalkerMemory(nn.Module):
         trigger their own graph breaks. On Triton 3.6 we avoid the
         TritonGPURemoveLayoutConversions randint-in-fusion crash by
         using rand+argmax for exploration sampling (see routing.py).
+
+        ``dynamic``: passed through to ``torch.compile``. ``False`` is
+        static-specialize (best per-iter, recompile per shape).
+        ``None`` is auto-detect (recompiles after the 2nd shape with a
+        shape-polymorphic kernel — useful for BS sweeps).
         """
         # Let unique/bincount stay in the compiled graph
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
@@ -671,7 +678,7 @@ class GraphWalkerMemory(nn.Module):
             torch._dynamo.config.cache_size_limit, 64,
         )
         self._compiled_step = torch.compile(
-            self._step_core_pure, mode=mode, fullgraph=False,
+            self._step_core_pure, mode=mode, fullgraph=False, dynamic=dynamic,
         )
 
     @torch._dynamo.disable
@@ -1445,6 +1452,7 @@ class GraphWalkerMemory(nn.Module):
 
     def compile_block_from_h(
         self, mode: str = "default", fullgraph: bool = True,
+        *, dynamic: bool | None = False,
     ) -> None:
         """Compile `block_forward_from_h` for whole-block fusion in the
         pretrained-LM integration path. ``walk_segment`` routes through
@@ -1457,6 +1465,15 @@ class GraphWalkerMemory(nn.Module):
         Llama's autograd graph, so the cudagraph variant
         (``"reduce-overhead"``) would conflict with Llama's dynamic
         activation addresses.
+
+        ``dynamic``: see ``compile_step``. NOTE first-compile cost on
+        the whole-block path is 10-15 min at T=256 production scale
+        because Dynamo unrolls the T_block loop into one giant FX graph
+        (op count multiplied by T). For dev iteration where compile
+        cost dominates, use the regional path
+        (``IntegratedLM.compile_walker_block(regional=True)``) instead
+        — same correctness, ~10× faster compile, ~5-15% lower per-iter
+        throughput.
         """
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
         torch._dynamo.config.allow_unspec_int_on_nn_module = True
@@ -1465,6 +1482,7 @@ class GraphWalkerMemory(nn.Module):
         )
         self._compiled_block_from_h = torch.compile(
             self.block_forward_from_h, mode=mode, fullgraph=fullgraph,
+            dynamic=dynamic,
         )
 
     def step_core_from_h(

@@ -245,23 +245,63 @@ class IntegratedLM(nn.Module):
             self.memory.detach_state()
 
     def compile_walker_block(
-        self, mode: str = "default", fullgraph: bool = True,
+        self,
+        mode: str = "default",
+        fullgraph: bool = True,
+        *,
+        regional: bool = False,
+        dynamic: bool | None = False,
     ) -> None:
-        """Compile the walker's whole-block forward path.
+        """Compile the walker's forward path. Two regimes:
 
-        ``walk_segment`` then routes each ``tbptt_block``-token window
-        through one compiled call instead of T_block per-token
-        ``step_core_from_h`` calls. Inductor fuses across step boundaries,
-        replacing the per-token launch overhead that bottlenecked the
-        eager Llama+walker path. ``mode="default"`` mirrors the standalone
-        speedup configuration (~3.7× over per-token eager); the
-        ``"reduce-overhead"`` cudagraph variant is incompatible with
+        **Whole-block (default, `regional=False`):** compile
+        ``block_forward_from_h`` — one big graph that unrolls T=mod_period
+        walker steps + the inject path. Inductor fuses across step
+        boundaries → ~3.7× over eager. **First-compile cost: 10-15 min**
+        (T=256 unrolling means thousands of ops to lower).
+
+        **Regional (`regional=True`):** compile ``step_core_from_h`` only
+        — the per-step graph that gets called T times in the Python loop.
+        Inductor fuses within each step (~2× over eager) but does NOT fuse
+        across step boundaries. **First-compile cost: 1-2 min** because
+        the per-step graph is ~T× smaller. This is the canonical PyTorch
+        recommendation for "repeated-block" patterns
+        (https://docs.pytorch.org/tutorials/recipes/regional_compilation.html).
+
+        Trade-off: regional gives 5-15% lower per-iter throughput in
+        exchange for an order-of-magnitude faster compile. Use it for
+        dev iteration / BS sweeps; flip to whole-block for final
+        production training where compile cost is amortized over a
+        ~30-hour run.
+
+        ``mode="default"`` mirrors the standalone speedup configuration;
+        the ``"reduce-overhead"`` cudagraph variant is incompatible with
         Llama's dynamic activation addresses.
+
+        ``dynamic=None`` enables PyTorch's auto-detect dynamic shapes
+        (after the second call with a different shape, inductor recompiles
+        a shape-polymorphic kernel). Useful for cross-shape compile reuse
+        in BS sweeps. ``dynamic=False`` (default) static-specializes —
+        best per-iter throughput but recompiles on every shape change.
+        ``dynamic=True`` is NOT supported (PyTorch warns it crashes / is
+        slow on big graphs like ours).
 
         Idempotent: calling twice replaces the compiled function.
         """
-        if self.memory is not None:
-            self.memory.compile_block_from_h(mode=mode, fullgraph=fullgraph)
+        if self.memory is None:
+            return
+        if dynamic is True:
+            raise ValueError(
+                "dynamic=True is unsafe for the walker's whole-block compile "
+                "(per PyTorch docs: crashes / runs slow on big graphs). "
+                "Use dynamic=None (auto-detect) or dynamic=False (default)."
+            )
+        if regional:
+            self.memory.compile_step(mode=mode, dynamic=dynamic)
+        else:
+            self.memory.compile_block_from_h(
+                mode=mode, fullgraph=fullgraph, dynamic=dynamic,
+            )
 
     # ------------------------------------------------------------------
     # AR-unroll support

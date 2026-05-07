@@ -197,8 +197,15 @@ def main():
         print(f"  inject (W_in/W_out/scale): {inject_params/1e6:.1f}M")
         print(f"  total trainable:           {walker_params/1e6:.1f}M")
         if args.compile_block:
-            print(f"  Compiling walker block (mode={args.compile_mode}) ...")
-            model.compile_walker_block(mode=args.compile_mode)
+            kind = "regional" if args.regional_compile else "whole-block"
+            dyn = None if args.dynamic_shapes else False
+            dyn_label = "dynamic=None" if args.dynamic_shapes else "dynamic=False"
+            print(f"  Compiling walker {kind} (mode={args.compile_mode}, {dyn_label}) ...")
+            model.compile_walker_block(
+                mode=args.compile_mode,
+                regional=args.regional_compile,
+                dynamic=dyn,
+            )
 
         opt_d = torch.optim.AdamW(
             [p for _, p in model.trainable_parameters()], lr=1e-4, fused=True,

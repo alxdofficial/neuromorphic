@@ -81,6 +81,19 @@ def add_walker_config_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune"],
                     help="torch.compile mode for compile_block.")
+    ap.add_argument("--regional-compile", action="store_true",
+                    help="Use regional compilation: compile step_core_from_h "
+                         "instead of the whole walk_segment block. ~10x faster "
+                         "first compile (1-2 min vs 10-15 min at T=256), at "
+                         "~5-15%% lower per-iter throughput. Recommended for "
+                         "dev iteration; flip off for final production runs.")
+    ap.add_argument("--dynamic-shapes", action="store_true",
+                    help="Pass dynamic=None to torch.compile (auto-detect "
+                         "shape variation). After the 2nd shape inductor "
+                         "compiles a shape-polymorphic kernel — useful for "
+                         "BS sweeps where you'd otherwise pay compile cost "
+                         "per BS. Cannot be combined with cudagraph "
+                         "(--compile-mode=reduce-overhead requires fixed shapes).")
 
 
 def walker_cfg_from_args(args: argparse.Namespace, T: int, vocab: int) -> GraphWalkerConfig:
