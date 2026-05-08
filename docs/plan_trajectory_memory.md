@@ -12,6 +12,56 @@ implement from it without re-reading the design conversation that produced it.
 
 ---
 
+## Motivation and goals
+
+**Problem.** Modern LLMs handle within-context information well but
+struggle with content beyond their context window. Pushing context
+arbitrarily large is expensive (quadratic attention, KV-cache memory
+growth, scarce long-context training data) and gives the model no
+inductive bias for what to forget. Existing alternatives have known
+limits:
+
+- **Vanilla long-context training** — quadratic cost; long-doc data is
+  sparse; no compression prior.
+- **RAG / external retrieval** — retrieval is decoupled from the LM's
+  reasoning; chunks are noisy; not trained end-to-end.
+- **Recurrent state models** (RWKV, Mamba, S4) — bounded inference
+  memory but the state is dense and opaque; selective retention is
+  implicit.
+- **`graph_walker`** (this project's prior approach) — per-token walker
+  over a concept graph. Suffers from launch overhead, neuromod gradient
+  noise, and a per-token plasticity timescale that doesn't match
+  meaningful "memory events."
+
+**Goal.** A memory module that:
+
+1. **Learns end-to-end** from NTP loss — no separate retrieval training,
+   no privileged supervision, no hand-crafted indexing.
+2. **Compresses lossy** — long content survives only as a sparse
+   trajectory through a fixed-size manifold. Mirrors human memory:
+   gist, not transcript.
+3. **Stays constant-footprint at inference** — the manifold doesn't
+   grow with session length; long sessions overwrite older state via
+   plasticity.
+4. **Plugs onto a frozen pretrained LM** — additive to a strong base
+   model, not a from-scratch training problem. Llama-3.2-1B as starting
+   point; same architecture should generalize to larger.
+5. **Has a learnable curriculum** — windows + cross-window TBPTT give
+   clear gradient signal to memory even when the LM's effective context
+   is intentionally capped.
+
+**Why a manifold of concepts?** Conceptually: thoughts are trajectories
+through a space of abstract primitives; concepts evolve as they're
+touched; recall is graph-autocompletion from a partial trajectory.
+Stronger inductive bias than dense recurrent memory, naturally extends
+to multi-modal substrates, and produces interpretable retrieval traces.
+
+**Out of scope for v1:** verbatim recall (would need an external
+non-overwriting store on top); cross-modal manifolds (extension, see
+§8); a concept-space planning model (NCP, see §8).
+
+---
+
 ## 1. Overview
 
 A **manifold of N abstract concepts**, each with a stable identity vector
@@ -1149,6 +1199,138 @@ is realized.
 
 ---
 
+## 10. Efficiency analysis: speed and VRAM
+
+Estimates below assume the v1 starting config (§4.4): N=2048,
+D_concept=256, K_max=32, J=4, K_read=K_write=8, D=4, BS=2,
+T_window=256, Llama-3.2-1B bf16, FlashAttention enabled, RTX 4090.
+Numbers are *rough* — bench early, don't trust point estimates.
+
+### 10.1 VRAM breakdown
+
+**Parameter memory (persistent):**
+
+| Component                      | Size                       | Notes                                |
+|--------------------------------|----------------------------|--------------------------------------|
+| Llama-3.2-1B (bf16, frozen)    | ~2.5 GB                    | No optimizer state                   |
+| concept_ids (fp32)             | N·D_concept·4 ≈ 2 MB       | Trainable                            |
+| concept_states (fp32 buffer)   | ~2 MB                      | Mutable activation-like state        |
+| state_init (fp32)              | ~2 MB                      | Trainable parameter                  |
+| edge_indices (int32)           | ~256 KB                    | Fixed at init                        |
+| Read + write modules           | ~10 MB                     | MLPs + cross-attn weights            |
+| MemInjectLayer adapter         | ~1 MB                      | W_in, W_out, scale, cross-attn       |
+| **Total params**               | **~2.5 GB**                | Llama dominates                      |
+
+**Optimizer state:** trainable params ≈ 20 MB; Adam (m + v) ≈ 40 MB.
+Trivial vs Llama's frozen 2.5 GB.
+
+**Activations during training (BS=2, D=4 windows, per-block Llama checkpointing):**
+
+| Component                                | Size estimate    | Notes                              |
+|------------------------------------------|------------------|------------------------------------|
+| Llama activations (1 window, FlashAttn)  | ~30–60 MB        | Per-block ckpt → recomputed in backward |
+| Read trajectory activations (D windows)  | ~20–40 MB        | J·K_read hops × small MLPs         |
+| Write trajectory activations (D windows) | ~20–40 MB        | Same scale as read                 |
+| Cross-window write graph skeleton        | ~10 MB           | Visited-concept refs, scatter_mean autograd nodes |
+| KV cache (2K context, bf16)              | ~250–500 MB      | Llama-1B specific                  |
+| **Working set with checkpointing**       | **~400–700 MB**  |                                    |
+| Without Llama checkpointing              | **~1.5–2.5 GB**  | D × per-window activations         |
+
+**Total VRAM training ≈ 3.5–5 GB** with checkpointing on a 24 GB GPU —
+plenty of headroom for BS=4 or D=8.
+
+**Inference (single user, no autograd):** Llama params + KV cache +
+manifold + transient trajectory states ≈ 3 GB total. Easily fits on
+consumer GPUs.
+
+### 10.2 Per-window time breakdown
+
+Per-window cost is dominated by Llama's transformer forward. Trajectory
+ops are small but launch-bound. RTX 4090, BS=2, bf16, FlashAttention:
+
+| Step                                       | Time (rough)   | Notes                                 |
+|--------------------------------------------|----------------|---------------------------------------|
+| Llama forward (1 window, 256 tok, 2K KV)   | ~25–40 ms      | Dominant; depends on KV cache state   |
+| Read trajectory (J=4, K=8, batched per hop) | ~3–5 ms       | 8 batched-J cross-attn calls          |
+| Write trajectory (similar shape)           | ~3–5 ms        |                                       |
+| MemInjectLayer cross-attn                  | ~1 ms          | One call per inject layer per window  |
+| scatter_mean + manifold update             | <1 ms          | Tiny tensor op                        |
+| **Per-window forward**                     | **~35–55 ms**  | Llama is ~75–85% of this              |
+
+**Training step (BS=2, D=4, with per-block Llama checkpointing):**
+- Forward: 4 × 50 ms ≈ 200 ms
+- Backward (with Llama recompute): ~350 ms
+- Optimizer + misc: ~30 ms
+- **Step ≈ 600 ms; throughput ≈ 3.5K tokens/sec**
+
+Comparable to graph_walker's ~5K tok/s post-scaleup (per project memory)
+— our per-token cost is *lower* (no per-token dispatch) but per-window
+Llama compute is *higher* (256-token forward vs graph_walker's smaller
+units). Net is a wash; the real win is gradient quality, not raw speed.
+
+### 10.3 Bottlenecks
+
+**Primary: Llama forward.** ~80% of step time. Frozen, but compute is
+unavoidable. Mitigations:
+- FlashAttention-2/3 on Llama's self-attention (likely already on from
+  graph_walker's setup; confirm).
+- bf16 everywhere it's safe.
+- KV cache reuse across windows — currently re-encodes prefix per window
+  via hard truncation; sliding KV cache is a v2 optimization.
+
+**Secondary: trajectory hop dispatch overhead.** Each hop has a few
+small kernel launches (history-attn, cross-attn, MLP, neighbor gather,
+softmax). At J=4, K=8, D=4 → ~256 small launches per training step.
+Mitigations:
+- Batch J across each hop (already specced — single batched cross-attn
+  per step instead of J separate ones).
+- `torch.compile` on the hop module — small, hot function with
+  predictable shapes; should benefit from kernel fusion.
+- Custom Triton kernel for "one trajectory hop" — fuses sub-ops.
+  Premature unless dispatch is measured-bottleneck.
+
+**Tertiary: cross-window TBPTT memory.** D windows of write graph alive
+during backward.
+- Linear-in-D first; constant-in-D autograd if OOM.
+- Llama-block checkpointing (priority 1).
+- Trajectory cross-attn checkpointing (priority 2).
+
+### 10.4 Optimization plan, priority-ranked
+
+1. **bf16 + FlashAttention on Llama** — should be standard; confirm on.
+2. **Llama-block gradient checkpointing** — required to fit D=4+ at
+   BS≥2 on 24 GB. Standard PyTorch utility.
+3. **`torch.compile` on trajectory hop module** — hot small function;
+   likely 1.5–2× speedup on hop dispatch. Low engineering cost.
+4. **Sliding KV cache for Llama context** — replaces hard truncation.
+   ~10–20% throughput win for long-doc Wave 1. Implementation: medium
+   (KV invalidation logic).
+5. **Trajectory cross-attn checkpointing** — needed only at D ≥ 8.
+6. **Constant-in-D autograd** — fallback for large D if linear-in-D
+   OOMs; sizable engineering cost.
+7. **Triton-fused hop kernel** — only if profiling shows dispatch is
+   the bottleneck. Probably premature.
+
+### 10.5 Compared to graph_walker
+
+graph_walker is launch-bound: per-token sequential dispatch through the
+walker. Our trajectory architecture moves dispatch from per-token to
+per-window — ~256× fewer hop dispatches per token, since each window's
+J·K hops produce content for all 256 tokens that follow.
+
+In return, each "memory event" is a J·K hop sequence rather than a
+single hop, but that's still much smaller than 256 per-token hops.
+Llama's forward is also more expensive per-window because we cap at 2K
+context (vs graph_walker's smaller windows), but that's the load-bearing
+training pressure — sacrificing it would defeat the architecture.
+
+Expected outcome: comparable raw throughput vs graph_walker, with
+**much cleaner gradient flow** (cross-window TBPTT on the actual write
+module, vs graph_walker's per-token surprise gating). The architectural
+win is gradient quality and training simplicity, not speed.
+
+---
+
 ## Appendix A: Glossary
 
 - **Manifold:** the graph of N concepts (with id + state vectors) +
@@ -1186,3 +1368,63 @@ is realized.
 - **Gumbel-top-1 STE:** discrete next-concept selection during
   training. Hard forward (one concept), soft backward (gradient through
   the softmax). Argmax at inference.
+
+---
+
+## Appendix B: Scaling knobs (capacity dials)
+
+Hyperparameters that tune model capacity. Listed roughly in order of
+impact on capability (vs operational knobs like LR, batch size, warmup
+which live in §4.4):
+
+| Knob                   | Controls                                       | Range          | Cost shape                              |
+|------------------------|------------------------------------------------|----------------|-----------------------------------------|
+| `N` (manifold size)    | Number of distinct concepts                    | 1024–16384     | Linear memory (params), trivial compute |
+| `D_concept`            | Per-concept rep dim (id + state share dim)     | 128–512        | Quadratic on cross-attn cost; expressivity |
+| `J`                    | Parallel trajectories per window               | 1–16           | Linear in compute; multi-head analog    |
+| `K_read` / `K_write`   | Trajectory length                              | 4–32           | Linear in compute; deeper manifold reach |
+| `K_max_neighbors`      | Sparse degree per concept                      | 8–64           | Linear in scoring cost; routing flexibility |
+| `D` (TBPTT depth)      | Cross-window gradient horizon                  | 2–16           | Linear in train-time VRAM (no inference cost) |
+| Llama base size        | LM backbone capacity                           | 1B / 3B / 8B   | Most expensive; affects everything      |
+| Inject layer L         | MemInjectLayer position in Llama stack         | 4–24           | Earlier = more LM-side processing after; later = quicker memory access |
+| Effective LM context cap | Sliding window for Llama                     | 1K–8K          | Smaller = stronger memory pressure, harder to converge |
+| `T_window`             | Window size in tokens                          | 128–512        | Smaller = finer plasticity; larger = more context per memory event |
+
+**Scaling rules of thumb:**
+
+- `K ≈ √N / 4` — trajectory length scales with manifold size so each
+  trajectory covers a meaningful fraction of the graph.
+- `K_max_neighbors ≈ √N / 2` — neighborhood grows with N to preserve
+  small-world graph diameter.
+- `D_concept ≈ D_lm / 8` — concept dim tracks LM hidden dim.
+- `J` is multi-head — independent of N. 4–8 sweet spot.
+- `D` (TBPTT depth) is bounded by VRAM, not by capacity needs.
+
+**Concrete tier presets:**
+
+| Tier     | N     | D_concept | K_read=K_write | J   | Memory params | Llama base | Use case                |
+|----------|-------|-----------|----------------|-----|---------------|------------|-------------------------|
+| smoke    | 1024  | 128       | 4              | 2   | ~2 MB         | 1B         | CPU smoke tests, debugging |
+| medium   | 2048  | 256       | 8              | 4   | ~8 MB         | 1B         | v1 default (§4.4)        |
+| large    | 4096  | 256       | 16             | 8   | ~16 MB        | 3B         | Post-v1 scale-up         |
+| xl       | 16384 | 512       | 32             | 8   | ~100 MB       | 8B         | Hypothetical ceiling     |
+
+The memory-side parameter count is **trivial** relative to the Llama
+backbone in all tiers — capacity scaling is essentially free in
+parameters; the real cost is in compute (J·K trajectory hops per
+window) and TBPTT memory (D windows alive during backward).
+
+**What to scale first when you have more compute, in order:**
+
+1. `D_concept` (more expressive concepts) — small change, big effect.
+2. `J` (more parallel retrieval / encoding) — multi-head capacity.
+3. `K_read = K_write` (deeper trajectories) — longer reach per window.
+4. `N` (more concepts) — diversifies the substrate; cheap.
+5. Llama base size — most expensive, but biggest direct capability boost.
+6. `D` (TBPTT depth) — only worth scaling if you can afford the VRAM
+   AND see continued improvement on long-horizon evals.
+
+What NOT to scale up casually: `K_max_neighbors` (more is rarely
+helpful past a small value), `T_window` (288, 320 don't matter much vs
+256; deviating breaks alignment with chat-template structure), effective
+LM context cap (raising it weakens memory training pressure).
