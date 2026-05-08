@@ -127,6 +127,30 @@ def test_write_module_collisions_get_averaged():
     assert torch.isfinite(new_states).all()
 
 
+def test_write_module_j_trajectories_diverge():
+    """Different head_queries should produce different write trajectories.
+    Tested in both inference (argmax) and training (Gumbel) modes.
+    Parallel to the read-module diversity test.
+    """
+    cfg = TrajMemConfig.small()
+    cfg.J = 4
+    cfg.validate()
+    m = Manifold(cfg)
+    prev_states = m.reset_states(batch_size=1)
+    cur_hid = torch.randn(1, cfg.T_window, cfg.d_lm)
+    surprise = torch.tensor([0.5])
+    wm = WriteTrajectoryGenerator(cfg)
+    for hard in (False, True):
+        torch.manual_seed(7)
+        _, vids, _ = wm(cur_hid, surprise, prev_states, m, hard=hard)
+        flattened = vids[0].tolist()
+        distinct_paths = len({tuple(p) for p in flattened})
+        assert distinct_paths >= 2, (
+            f"hard={hard}: all J={cfg.J} write trajectories produced same path: "
+            f"{flattened}"
+        )
+
+
 def test_write_then_read_uses_new_states():
     """End-to-end: write produces new_states; a subsequent read using those
     new_states should reflect the mutations."""

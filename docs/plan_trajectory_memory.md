@@ -911,13 +911,14 @@ src/trajectory_memory/
 ├── write_module.py         # WriteTrajectoryGenerator — J parallel + scatter_mean persist + mutate_write
 ├── integrated_lm.py        # IntegratedLM with reused MemInjectLayer + surprise pooling
 ├── tbptt.py                # multi-window TBPTT scaffolding + checkpointing
-├── config.py               # TrajMemConfig + factories (small / medium / large)
-└── tests/
-    ├── test_manifold.py
-    ├── test_read_module.py
-    ├── test_write_module.py
-    ├── test_tbptt.py
-    └── test_integration.py
+└── config.py               # TrajMemConfig + factories (small / medium / large)
+
+tests/                      # at repo root, per project convention
+├── test_trajectory_memory_manifold.py
+├── test_trajectory_memory_read.py
+├── test_trajectory_memory_write.py
+├── test_trajectory_memory_smoke.py        # IntegratedLM + TBPTT (no Llama)
+└── test_trajectory_memory_surprise.py     # _compute_surprise math
 ```
 
 Reuse from existing code:
@@ -925,8 +926,15 @@ Reuse from existing code:
 - `src/pretrained/hosts/llama.py` — Llama wrapper (already vocab-agnostic).
 - `src/pretrained/mem_inject_layer.py:MemInjectLayer` — drop-in reuse.
   KV source becomes our flattened read trajectory.
-- Telemetry plumbing from `src/graph_walker/telemetry.py`.
-- Training scaffolding from `src/graph_walker/pretrained/train_phase1.py`.
+
+Future-port from `abandoned/graph-walker` (the production lineage at
+3b69366; check out that branch to inspect or copy):
+
+- `src/graph_walker/telemetry.py` — telemetry framework / dashboard.
+- `src/graph_walker/pretrained/train_phase1.py` — phase-1 trainer scaffold.
+- `session_to_turn_pairs` + Verlog length-bucket batching — for Wave 2/4
+  TurnPair extraction.
+- `grpo_session_step` — for Wave 3/4 GRPO rollouts.
 
 ### 6.2 Build order
 
@@ -969,9 +977,10 @@ Reuse from existing code:
    - **Test:** D=2, gradient on window 0's write module params is
      non-zero when only window 1's loss is backpropagated.
 
-6. **Training loop**: minimal scaffold using
-   `src/graph_walker/pretrained/train_phase1.py` as reference. TF NTP on a
-   small long-document corpus (e.g., subset of FineWeb). Smoke-test then
+6. **Training loop**: minimal scaffold. Reference: check out
+   `abandoned/graph-walker` branch and adapt
+   `src/graph_walker/pretrained/train_phase1.py`. TF NTP on a small
+   long-document corpus (e.g., subset of FineWeb). Smoke-test then
    scale up.
 
 7. **Telemetry**: trajectory diversity (how different are the J

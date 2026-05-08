@@ -158,6 +158,13 @@ class Manifold(nn.Module):
         autograd safety).
 
     `edge_indices` is a registered buffer (int64 adjacency, fixed at init).
+
+    **Dtype caveat.** Per plan §4.4, memory params are policy fp32 (bf16
+    weight updates round small Adam steps to zero). PyTorch's `nn.Module
+    .to(dtype)` walks all submodules and casts every floating buffer +
+    parameter — calling it on the IntegratedLM containing this manifold
+    would silently violate the fp32 policy. Use `.to(device)` / `.cuda()`
+    only; load Llama in bf16 via `torch_dtype=` at construction time.
     """
 
     def __init__(self, cfg: TrajMemConfig):
