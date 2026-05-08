@@ -33,6 +33,13 @@ class PretrainedGWConfig:
     # dim is GraphWalkerConfig.D_s. If d_mem == D_s they match directly (no
     # extra projection); else W_in/W_out Xavier-init bridges them.
     d_mem: int = 512
+    # Bridge MLP hidden width inside MemInjectLayer. None → single Linear
+    # (legacy ~1M params). int → 2-layer MLP `Linear(d_lm, H) → GELU →
+    # Linear(H, d_mem)` (and symmetric for W_out). The bridge is the only
+    # place Llama-language → graph-language translation happens; a thin
+    # linear is bottlenecked at 1 rotation. Default: 2048 (= d_lm for
+    # Llama-1B), giving ~9.4M bridge params total.
+    bridge_hidden: int | None = 2048
     memory: GraphWalkerConfig = field(default_factory=GraphWalkerConfig)
 
     # === Inject gate ===

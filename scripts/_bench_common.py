@@ -23,7 +23,7 @@ from src.graph_walker.config import GraphWalkerConfig
 # of N). p_rewire=0.5 keeps the locality prior while shortening graph
 # diameter further; radius=4 supports the K=64 sampling.
 PRODUCTION_KNOBS = dict(
-    grid_rows=32, grid_cols=64, radius=4, p_rewire=0.5,
+    grid_rows=64, grid_cols=64, radius=4, p_rewire=0.5,
     K=64, D_s=256, D_id=512, D_model=256,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,

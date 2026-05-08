@@ -11,7 +11,7 @@ from dataclasses import dataclass
 @dataclass
 class GraphWalkerConfig:
     # --- Graph topology (single flat substrate, no planes) ---
-    grid_rows: int = 32                 # 32×64 = 2048 concept columns. Per-
+    grid_rows: int = 64                 # 64×64 = 4096 concept columns. Per-
     grid_cols: int = 64                 # token compute is invariant to N
                                         # (walkers visit only B·H cols per
                                         # step regardless of N), so N is pure

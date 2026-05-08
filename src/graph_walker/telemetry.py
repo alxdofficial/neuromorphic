@@ -257,11 +257,25 @@ class StatsCollector:
         # ---- Llama-side ----
         try:
             inj = wrapper.mem_inject
-            row["llama.W_in_norm"] = _norm(inj.W_in.weight)
-            row["llama.W_out_norm"] = _norm(inj.W_out.weight)
+            # W_in / W_out are either a single nn.Linear or an nn.Sequential
+            # 2-layer MLP; iterate parameters to handle both shapes.
+            def _module_norm(mod) -> float:
+                acc = 0.0
+                for p in mod.parameters():
+                    acc += _norm(p) ** 2
+                return math.sqrt(acc)
+
+            def _module_grad_norm(mod) -> float:
+                acc = 0.0
+                for p in mod.parameters():
+                    acc += _grad_norm(p) ** 2
+                return math.sqrt(acc)
+
+            row["llama.W_in_norm"] = _module_norm(inj.W_in)
+            row["llama.W_out_norm"] = _module_norm(inj.W_out)
             row["llama.scale_norm"] = _norm(inj.scale)
-            row["llama.W_in_grad_norm"] = _grad_norm(inj.W_in.weight)
-            row["llama.W_out_grad_norm"] = _grad_norm(inj.W_out.weight)
+            row["llama.W_in_grad_norm"] = _module_grad_norm(inj.W_in)
+            row["llama.W_out_grad_norm"] = _module_grad_norm(inj.W_out)
             row["llama.scale_grad_norm"] = _grad_norm(inj.scale)
         except Exception:
             pass

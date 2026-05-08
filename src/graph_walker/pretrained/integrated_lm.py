@@ -122,6 +122,7 @@ class IntegratedLM(nn.Module):
             d_mem=config.d_mem,
             scale_init=config.scale_init,
             memory_fn=None,
+            bridge_hidden=config.bridge_hidden,
         ))
 
         # The walker is vocab-agnostic in the integration path (no LM head,

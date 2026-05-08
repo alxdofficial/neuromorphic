@@ -8,10 +8,11 @@ regressions or progress without re-running every time.
 perfected scaleup from the standalone graph_walker branch, currently on
 `main`):
 
-- **Topology:** N=2048 columns (32×64 flat torus), K=64 out-edges, p_rewire=0.5, radius=4 (capacity bump 2026-05-08; runs prior to that date were at N=1024, K=32)
+- **Topology:** N=4096 columns (64×64 flat torus), K=64 out-edges, p_rewire=0.5, radius=4 (capacity bump 2026-05-08; pre-bump runs were at N=1024, K=32)
 - **Widths:** D_s=256, D_id=512, D_model=1024, content_mlp_depth=4, D_hid_content=1024, post_model_depth=2
 - **Neuromod:** 6 layers / 8 heads / D_mod=512 / edge_hidden=384
-- **Trainable params:** ~30.6M total (28.5M walker [8.7M graph + 19.8M neuromod] + 2.1M `MemInjectLayer.W_in`/`W_out`/`scale`)
+- **Bridge (`MemInjectLayer`):** 2-layer MLP with `bridge_hidden=2048` (= d_lm), GELU activation; richer Llama↔graph translator than the prior single linear (~10.5M vs ~1.0M).
+- **Trainable params:** ~40.0M total (29.5M walker [9.7M graph + 19.8M neuromod] + 10.5M bridge)
 
 Run benches via:
 - `scripts/bench_phase1.py` — Phase 1 paths A/B/C/D in one process (vanilla fwd / vanilla lm_head step / vanilla full step / Llama+GW step)
