@@ -220,9 +220,9 @@ class PretrainedGWConfig:
         tiny_mem = GraphWalkerConfig(
             grid_rows=8, grid_cols=8,
             K=8, D_model=64, D_s=64, D_id=16, radius=2,
-            n_heads=2, n_hops=3,
+            n_heads=2,
             D_q_per_head=16, n_score_heads=2,
-            K_horizons=4, K_buf=4,
+            K_horizons=4,
             vocab_size=256,
             # Single-knob clock invariant: T == mod_period == tbptt_block
             mod_period=8, tbptt_block=8, segment_T=8,

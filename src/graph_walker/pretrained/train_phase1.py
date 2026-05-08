@@ -47,7 +47,6 @@ class Phase1Batch:
     """
     input_ids: torch.Tensor        # [BS, T]
     target_ids: torch.Tensor       # [BS, T] — NOT pre-shifted
-    prev_token: torch.Tensor | None = None    # reserved (not currently used)
 
 
 @dataclass

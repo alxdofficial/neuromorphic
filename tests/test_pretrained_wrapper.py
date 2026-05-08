@@ -47,9 +47,9 @@ def _tiny_walker_cfg(D_s: int, vocab: int, T: int = 8):
     return GraphWalkerConfig(
         grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=D_s, D_s=D_s, D_id=8,
-        n_heads=2, n_hops=2,
+        n_heads=2,
         D_q_per_head=8, n_score_heads=2,
-        K_horizons=4, K_buf=4,
+        K_horizons=4,
         vocab_size=vocab,
         # Single-knob clock under external-surprise plasticity:
         # segment_T == mod_period == tbptt_block == T.

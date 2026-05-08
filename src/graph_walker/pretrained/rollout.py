@@ -22,15 +22,12 @@ Memory semantics during rollout:
   also captures logits for the per-token CE that drives plasticity post-
   opt.step (see `replay_grpo_rollout` → `ReplayResult`).
 
-`_freeze_plasticity_ctx` is retained as a no-op-equivalent safety net
-(sets mod_period ≈ ∞). Under the external-surprise design no plasticity
-firing happens inside the rollout regardless, but back-compat callers
-of `autoregressive_rollout` may still pass `freeze_plasticity=True`.
+Plasticity does not fire inside any rollout: `update_plasticity` is the
+sole entry point and the trainer calls it post-`loss.backward()`.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -132,23 +129,6 @@ class GRPOSampledRollout:
                                               # padding from the scored continuation.
 
 
-@contextmanager
-def _freeze_plasticity_ctx(memory):
-    """Pin the walker's plasticity off (mod_period → ∞) during the
-    generation phase so each new token doesn't trigger a fresh fire that
-    would re-randomize the policy mid-rollout."""
-    if memory is None:
-        yield
-        return
-    saved = memory.cfg.mod_period
-    try:
-        # Set to a huge number so window_len never reaches it.
-        memory.cfg.mod_period = 10**9
-        yield
-    finally:
-        memory.cfg.mod_period = saved
-
-
 def _sample_next_token(
     logits: torch.Tensor,            # [BS, vocab]
     temperature: float,
@@ -206,13 +186,9 @@ def sample_grpo_rollout(
     `generated` for the reward function, but never forwarded through
     the walker).
 
-    `_freeze_plasticity_ctx` is intentionally NOT used here. Under the
-    external-surprise design, plasticity only fires via
-    `update_plasticity` (called externally post-backward); forward-only
-    paths never trigger plasticity. The old freeze-by-mutating-mod_period
-    was a relic from an earlier design and silently corrupts the
-    `_active_neuromod_delta` rebuild that runs at TBPTT block boundaries (the
-    rebuild reads `cfg.mod_period` for co-visit normalization).
+    Plasticity does not fire here. Under the external-surprise design it
+    only fires via `update_plasticity`, which the trainer calls post-
+    backward — forward-only paths never trigger it.
 
     Routing during sample is gated on `model.memory.training` only —
     NOT `model.training` — so the host LM stays in eval mode (host
@@ -419,12 +395,10 @@ def replay_grpo_rollout(
     `model.preserve_autograd_graph()` is held across the replay forward.
     Without it, `walk_segment` would call `detach_state()` at every
     `tbptt_block`-token boundary inside the replay; that detach also
-    rebuilds `_active_neuromod_delta` via `_begin_plastic_window`, which reads
-    `cfg.mod_period`. Mutating mod_period to "freeze plasticity" (the
-    old `_freeze_plasticity_ctx` trick) would silently corrupt the
-    rebuilt active delta after the first block — replay log-probs after
-    that point would be gradients for a different policy than the
-    sampler used. preserve_graph=True bypasses both detach and rebuild.
+    rebuilds `_active_neuromod_delta` via `_begin_plastic_window`, so
+    replay log-probs after the first block would be gradients for a
+    different policy than the sampler used. preserve_graph=True bypasses
+    both detach and rebuild.
 
     Routing-mode toggle is on the walker only (NOT the model), so the
     host LM stays in caller-set mode and replay sees the same hidden-
@@ -653,7 +627,7 @@ def autoregressive_rollout(
         # next training step — only the consumed-after-prefix log_pi_mean
         # participates in REINFORCE.
         gen_train_mode = bool(gen_sample_routing)
-        with gen_ctx, _freeze_plasticity_ctx(model.memory):
+        with gen_ctx:
             model.train(gen_train_mode)
             for _ in range(gen_length):
                 # `last_logits` here predicts the token we're ABOUT to

@@ -19,13 +19,6 @@ class Topology:
     edge_src: torch.Tensor        # [N*K] int64 — source col per flat-edge-idx
     edge_dst: torch.Tensor        # [N*K] int64 — dest col per flat-edge-idx
 
-    def move_to(self, device: torch.device) -> "Topology":
-        return Topology(
-            out_nbrs=self.out_nbrs.to(device),
-            edge_src=self.edge_src.to(device),
-            edge_dst=self.edge_dst.to(device),
-        )
-
 
 def _moore_offsets(radius: int) -> list[tuple[int, int]]:
     offs = []

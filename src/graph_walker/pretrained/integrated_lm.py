@@ -331,7 +331,7 @@ class IntegratedLM(nn.Module):
         What's saved:
         - `s` (LIF state per column)
         - `walker_pos`, `walker_state`
-        - `surprise_ema`, `surprise_prev`
+        - `surprise_ema`
         - `_log_pi_sum`, `_log_pi_count` (phase-2 routing log-π accumulator)
         - `tick_counter`, `window_len` (segment-level counters)
         - `co_visit_flat`, `visit_count` (per-segment counters)
@@ -362,7 +362,6 @@ class IntegratedLM(nn.Module):
             "walker_pos": _clone_or_none(m.walker_pos),
             "walker_state": _clone_or_none(m.walker_state),
             "surprise_ema": _clone_or_none(m.surprise_ema),
-            "surprise_prev": _clone_or_none(m.surprise_prev),
             "_log_pi_sum": _clone_or_none(m._log_pi_sum),
             "_log_pi_count": int(m._log_pi_count),
             "tick_counter": int(m.tick_counter),
@@ -393,7 +392,6 @@ class IntegratedLM(nn.Module):
         _restore("walker_pos")
         _restore("walker_state")
         _restore("surprise_ema")
-        _restore("surprise_prev")
         _restore("co_visit_flat")
         _restore("visit_count")
         # log_pi sum: tensor or None
@@ -426,10 +424,6 @@ class IntegratedLM(nn.Module):
     # windows (no delta = no neuromod gradient) and the run silently
     # under-trains the meta-learning component until the first
     # plasticity event after resume re-populates them.
-    #
-    # `surprise_prev` (the prior-window surprise EMA snapshot) is also
-    # included: not yet directly read on resume, but symmetric with the
-    # neuromod-input snapshots and cheap to carry.
 
     def persistent_walker_state(self) -> dict:
         """Return the long-term walker state that should survive a
@@ -447,9 +441,6 @@ class IntegratedLM(nn.Module):
             "_neuromod_input_feats": _clone_or_none(m._neuromod_input_feats),
             "_neuromod_input_co_visit_flat":
                 _clone_or_none(m._neuromod_input_co_visit_flat),
-            "surprise_prev": _clone_or_none(
-                getattr(m, "surprise_prev", None),
-            ),
         }
 
     def load_persistent_walker_state(self, state: dict | None) -> None:
@@ -469,7 +460,6 @@ class IntegratedLM(nn.Module):
         _restore("_neuromod_input_ids")
         _restore("_neuromod_input_feats")
         _restore("_neuromod_input_co_visit_flat")
-        _restore("surprise_prev")
 
     # ------------------------------------------------------------------
     # Forward

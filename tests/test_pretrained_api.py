@@ -21,9 +21,9 @@ def _tiny_cfg(**overrides) -> GraphWalkerConfig:
     base = dict(
         grid_rows=8, grid_cols=8, radius=2,
         K=8, D_model=64, D_s=64, D_id=16,
-        n_heads=2, n_hops=3,
+        n_heads=2,
         D_q_per_head=16, n_score_heads=2,
-        K_horizons=4, K_buf=4,
+        K_horizons=4,
         vocab_size=256,
         mod_period=4, tbptt_block=4, segment_T=8,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,

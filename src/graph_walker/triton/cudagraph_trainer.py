@@ -291,9 +291,6 @@ class CapturedBlockTrainer:
             memory.co_visit_flat.zero_()
             if memory.visit_count is not None:
                 memory.visit_count.zero_()
-            # surprise_prev snapshot (no neuromod consumes it, but keep
-            # the contract stable).
-            memory.surprise_prev.copy_(memory.surprise_ema)
 
     def warmup_and_capture(self, n_warmup: int = 3, verbose: bool = False) -> None:
         """Warmup + capture, all on a dedicated side stream.
@@ -377,7 +374,6 @@ class CapturedBlockTrainer:
         if self.lm.memory.visit_count is not None:
             self.lm.memory.visit_count.zero_()
         self.lm.memory.surprise_ema.zero_()
-        self.lm.memory.surprise_prev.zero_()
 
         self._captured = True
 

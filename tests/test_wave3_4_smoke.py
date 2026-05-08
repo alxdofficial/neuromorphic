@@ -44,9 +44,9 @@ def _tiny_walker_cfg(D_s=32, T=8):
     return GraphWalkerConfig(
         grid_rows=4, grid_cols=4, radius=2,
         K=4, D_model=D_s, D_s=D_s, D_id=8,
-        n_heads=2, n_hops=2,
+        n_heads=2,
         D_q_per_head=8, n_score_heads=2,
-        K_horizons=4, K_buf=4, vocab_size=128256,
+        K_horizons=4, vocab_size=128256,
         mod_period=T, tbptt_block=T, segment_T=T,
         gumbel_tau_start=1.0, gumbel_tau_end=1.0, gumbel_anneal_steps=1,
         epsilon_start=0.0, epsilon_end=0.0, epsilon_anneal_steps=1,

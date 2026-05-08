@@ -46,12 +46,6 @@ class GraphWalkerConfig:
     # Radius 4 → 80 candidates, comfortable for K up to ~64-72.
     radius: int = 4
 
-    # --- Per-walker weight specialisation ---
-    # When True, content_mlp has H independent copies (one per walker head).
-    # MoE-style capacity: total params scale with H, but per-token compute
-    # is identical to the shared path since each walker still does one
-    # forward pass, just with its own weights.
-    per_head_content_mlp: bool = False
     content_mlp_depth: int = 4          # residual FFN blocks at D_s=1024,
                                         # D_hid=4·D_s. 4 stacked nonlinear
                                         # composition steps per walker per
@@ -73,12 +67,9 @@ class GraphWalkerConfig:
                                         # identity should be a rich semantic
                                         # vector ("what concept does this
                                         # column carry"), not a tiny ID tag.
-    ffn_mult_content: int = 4           # content_mlp: D_s + D_id → 4·D_s → D_s
-                                        # ONLY used when D_hid_content is None
-                                        # (legacy / small-D_s configs).
     # Hidden width of every content_mlp ResidualFFN block. Decoupled from
-    # D_s — when None the legacy `ffn_mult_content * D_s` formula applies.
-    D_hid_content: int | None = 1024
+    # D_s so content_mlp cost is O(D_s · D_hid_content) rather than O(D_s²).
+    D_hid_content: int = 1024
     # Post-readout model-space capacity. These blocks run once per token,
     # not once per hop, so they are a cheaper place to keep params than
     # the walker hot loop. The thesis is that the graph IS the model — the
@@ -91,17 +82,9 @@ class GraphWalkerConfig:
 
     # --- Graph-walker specifics ---
     n_heads: int = 4                    # H — parallel persistent walkers
-    # Legacy trajectory-depth knob kept for compatibility with older configs
-    # and future history-aware variants. In the current persistent-walker
-    # design the fast path advances one hop per token.
-    n_hops: int = 4
 
     # --- Multi-horizon readout ---
     K_horizons: int = 8
-    # Legacy compatibility field from the earlier token-clock surprise path.
-    # Current delayed-surprise code keeps the same lower-bound contract so old
-    # configs do not silently under-allocate history.
-    K_buf: int = 8
 
     # --- Clocks ---
     # `mod_period` is the plasticity window. `tbptt_block` is the
@@ -175,18 +158,10 @@ class GraphWalkerConfig:
             raise ValueError("p_rewire must be in [0, 1]")
         if self.radius < 1:
             raise ValueError("radius must be >= 1")
-        if self.n_hops < 1:
-            raise ValueError("n_hops must be >= 1")
         if self.n_heads < 1:
             raise ValueError("n_heads must be >= 1")
         if self.D_model < 1 or self.D_s < 1:
             raise ValueError("D_model and D_s must be positive")
-        if self.K_buf < self.K_horizons:
-            raise ValueError(
-                f"K_buf ({self.K_buf}) must be >= K_horizons ({self.K_horizons}) "
-                "— delayed multi-horizon surprise still needs at least one "
-                "history slot per horizon."
-            )
         if self.segment_T % self.mod_period != 0:
             raise ValueError(
                 f"segment_T ({self.segment_T}) must be a multiple of "

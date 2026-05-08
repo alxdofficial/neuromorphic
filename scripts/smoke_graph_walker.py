@@ -30,7 +30,7 @@ def main():
     if args.scale == "small":
         cfg = GraphWalkerConfig(
             grid_rows=16, grid_cols=12, radius=2, K=16,
-            D_model=128, D_s=128, D_id=16, n_heads=2, n_hops=3,
+            D_model=128, D_s=128, D_id=16, n_heads=2,
             D_q_per_head=32, n_score_heads=2,
             vocab_size=2000,
         )

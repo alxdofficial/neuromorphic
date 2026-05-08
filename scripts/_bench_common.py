@@ -27,9 +27,9 @@ PRODUCTION_KNOBS = dict(
     K=64, D_s=256, D_id=512, D_model=256,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
-    n_heads=4, n_hops=4,
+    n_heads=4,
     n_score_heads=4, D_q_per_head=64,
-    K_horizons=8, K_buf=8,
+    K_horizons=8,
     neuromod_D_mod=512, neuromod_n_layers=6, neuromod_n_heads=8,
     neuromod_edge_hidden=384,
 )
@@ -41,9 +41,9 @@ TARGET_KNOBS = dict(
     K=96, D_s=768, D_id=512, D_model=1024,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
-    n_heads=4, n_hops=4,
+    n_heads=4,
     n_score_heads=4, D_q_per_head=64,
-    K_horizons=8, K_buf=8,
+    K_horizons=8,
     neuromod_D_mod=512, neuromod_n_layers=6, neuromod_n_heads=8,
     neuromod_edge_hidden=384,
 )
@@ -72,7 +72,6 @@ def add_walker_config_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--post-model-depth", type=int, default=None)
     # Heads / scoring
     ap.add_argument("--n-heads", type=int, default=None)
-    ap.add_argument("--n-hops", type=int, default=None)
     # Neuromod
     ap.add_argument("--neuromod-D-mod", type=int, default=None)
     ap.add_argument("--neuromod-n-layers", type=int, default=None)
@@ -111,7 +110,7 @@ def walker_cfg_from_args(args: argparse.Namespace, T: int, vocab: int) -> GraphW
         "content_mlp_depth": args.content_depth,
         "D_hid_content": args.D_hid_content,
         "post_model_depth": args.post_model_depth,
-        "n_heads": args.n_heads, "n_hops": args.n_hops,
+        "n_heads": args.n_heads,
         "neuromod_D_mod": args.neuromod_D_mod,
         "neuromod_n_layers": args.neuromod_n_layers,
         "neuromod_n_heads": args.neuromod_n_heads,
@@ -135,7 +134,7 @@ def print_config_summary(walker_cfg: GraphWalkerConfig, label: str) -> None:
     print(f"    N = {walker_cfg.N} ({walker_cfg.grid_rows}x{walker_cfg.grid_cols}), K = {walker_cfg.K}, radius = {walker_cfg.radius}")
     print(f"    D_s = {walker_cfg.D_s}, D_id = {walker_cfg.D_id}, D_model = {walker_cfg.D_model}")
     print(f"    content depth = {walker_cfg.content_mlp_depth}, D_hid_content = {walker_cfg.D_hid_content}")
-    print(f"    n_heads = {walker_cfg.n_heads}, n_hops = {walker_cfg.n_hops}")
+    print(f"    n_heads = {walker_cfg.n_heads}")
     print(f"    neuromod = {walker_cfg.neuromod_n_layers}L/{walker_cfg.neuromod_n_heads}H, "
           f"D_mod = {walker_cfg.neuromod_D_mod}, edge_hidden = {walker_cfg.neuromod_edge_hidden}")
 

@@ -48,12 +48,6 @@ from src.graph_walker.topology import build_topology
 from src.graph_walker.triton.lif import sparse_lif_update
 
 
-class _NullCtx:
-    """Minimal no-op context for the autocast-defensive wrap in walk_segment."""
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
-
-
 def _rmsnorm(dim: int) -> nn.Module:
     return _FallbackRMSNorm(dim)
 
@@ -105,81 +99,6 @@ class _ResidualFFN(nn.Module):
         return self.down(F.gelu(self.up(self.norm(x))))
 
 
-class PerHeadDeepContentMLP(nn.Module):
-    """Per-head content MLP: H independent weight sets, one per walker index.
-
-    Each walker h uses its own (in_proj_h, ResidualFFN_h) — H disjoint sets
-    of parameters. Per-walker compute is identical to shared-weight
-    DeepContentMLP; only the total parameter count scales with H. This is
-    MoE-style capacity gain at constant per-token FLOPs.
-
-    Batched across H via einsum so we do one cuBLAS call per matmul, not H.
-    Each matmul has batch dim H, row dim B (not B·H), so M drops from
-    `B·H` to `B` per matmul. For small H this costs Tensor Core utilization;
-    for H=32 with D_hid=2048 the per-matmul workload is still large enough
-    to amortize launch overhead.
-    """
-
-    def __init__(
-        self, H: int, D_in: int, D_s: int, D_hid: int, n_layers: int,
-    ) -> None:
-        super().__init__()
-        self.H = H
-        self.D_s = D_s
-        self.D_hid = D_hid
-        self.n_layers = n_layers
-
-        # in_proj: [H, D_in, D_s], b: [H, D_s]
-        self.in_proj_w = nn.Parameter(torch.empty(H, D_in, D_s))
-        self.in_proj_b = nn.Parameter(torch.zeros(H, D_s))
-
-        # Per-head ResidualFFN block tensors stacked along H and n_layers.
-        # norm weight (RMSNorm gain): [H, n_layers, D_s]
-        self.norm_w = nn.Parameter(torch.ones(H, n_layers, D_s))
-        # up: [H, n_layers, D_s, D_hid]; bias: [H, n_layers, D_hid]
-        self.up_w = nn.Parameter(torch.empty(H, n_layers, D_s, D_hid))
-        self.up_b = nn.Parameter(torch.zeros(H, n_layers, D_hid))
-        # down: [H, n_layers, D_hid, D_s]; bias: [H, n_layers, D_s]
-        self.down_w = nn.Parameter(torch.empty(H, n_layers, D_hid, D_s))
-        self.down_b = nn.Parameter(torch.zeros(H, n_layers, D_s))
-
-        nn.init.normal_(self.in_proj_w, mean=0.0, std=0.014)
-        nn.init.normal_(self.up_w, mean=0.0, std=0.014)
-        # Depth-scaled init on final projection so sum of residuals stays bounded.
-        nn.init.normal_(
-            self.down_w, mean=0.0, std=(2.0 / D_hid) ** 0.5,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B*H, D_in] (flat, from the rest of the hot path).
-        Returns [B*H, D_s]."""
-        BH = x.shape[0]
-        assert BH % self.H == 0, (
-            f"input first dim {BH} not divisible by H={self.H}"
-        )
-        B = BH // self.H
-        x = x.view(B, self.H, -1)                                  # [B, H, D_in]
-
-        # in_proj: [B, H, D_in] × [H, D_in, D_s] → [B, H, D_s]
-        x = torch.einsum("bhd,hde->bhe", x, self.in_proj_w)
-        x = x + self.in_proj_b.unsqueeze(0)                        # broadcast over B
-
-        for i in range(self.n_layers):
-            # Per-head RMSNorm (scale-invariant so compute in input dtype).
-            rms = x.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-            x_n = x * rms * self.norm_w[:, i].to(x.dtype).unsqueeze(0)
-            # up: [B, H, D_s] × [H, D_s, D_hid] → [B, H, D_hid]
-            hid = torch.einsum("bhd,hde->bhe", x_n, self.up_w[:, i])
-            hid = hid + self.up_b[:, i].unsqueeze(0)
-            hid = F.gelu(hid)
-            # down: [B, H, D_hid] × [H, D_hid, D_s] → [B, H, D_s]
-            out = torch.einsum("bhd,hde->bhe", hid, self.down_w[:, i])
-            out = out + self.down_b[:, i].unsqueeze(0)
-            x = x + out
-
-        return x.reshape(BH, self.D_s)
-
-
 class ColumnCompute(nn.Module):
     """content_mlp (optionally per-plane) + shared q_proj + shared k_proj.
 
@@ -202,35 +121,13 @@ class ColumnCompute(nn.Module):
         D_steer = 3 * D_s + D_id
 
         self.content_norm = _rmsnorm(D_s)
-        # Decoupled content_mlp hidden width: explicit cfg.D_hid_content when
-        # set, else legacy ffn_mult_content × D_s. Pinning D_hid_content to
-        # a fixed value (e.g. 1024) makes content_mlp cost O(D_s · D_hid)
-        # instead of O(D_s²); see config.py for rationale.
-        D_hid_content = (
-            cfg.D_hid_content
-            if cfg.D_hid_content is not None
-            else cfg.ffn_mult_content * D_s
+        # Pinning D_hid_content to a fixed value (e.g. 1024) makes
+        # content_mlp cost O(D_s · D_hid) instead of O(D_s²).
+        self.content_mlp = DeepContentMLP(
+            D_in=D_steer, D_s=D_s,
+            D_hid=cfg.D_hid_content,
+            n_layers=cfg.content_mlp_depth,
         )
-        if cfg.per_head_content_mlp:
-            # MoE-style: H independent content_mlp copies, one per walker
-            # index. Total params scale with H while per-token compute is
-            # identical to the shared path (each walker still runs one
-            # forward pass, just with its own weights).
-            self.content_mlp = PerHeadDeepContentMLP(
-                H=cfg.n_heads,
-                D_in=D_steer, D_s=D_s,
-                D_hid=D_hid_content,
-                n_layers=cfg.content_mlp_depth,
-            )
-        else:
-            # Deep shared MLP stack — residual FFN blocks. Handles both
-            # shallow (depth=1) and deeper cases uniformly; keeps the
-            # RMSNorm + residual + GELU structure.
-            self.content_mlp = DeepContentMLP(
-                D_in=D_steer, D_s=D_s,
-                D_hid=D_hid_content,
-                n_layers=cfg.content_mlp_depth,
-            )
         self.q_proj = nn.Sequential(
             nn.Linear(D_steer, 2 * H * D_q),
             nn.GELU(),
@@ -447,7 +344,6 @@ class GraphWalkerMemory(nn.Module):
             persistent=True,
         )
         self.surprise_ema: torch.Tensor       # [B, K_h]
-        self.surprise_prev: torch.Tensor      # [B, K_h] — snapshot at window close
         self.tick_counter: int = 0
 
         # Window-accumulated stats for plasticity (reset every mod_period)
@@ -503,14 +399,10 @@ class GraphWalkerMemory(nn.Module):
         # walk_segment call. Set via `arm_replay_trace(trace)`.
         self._next_replay_trace: list | None = None
         self._log_pi_sum: torch.Tensor | None = None
-        # Companion counter for the running sum: the number of `_writeback_step_state`
-        # calls that have contributed a non-None `log_pi_step`. Each
-        # contribution is itself a sum across H walkers and across (anchor +
-        # n_hops) routing decisions per step, but for normalization purposes
-        # we use step-count as the denominator — fixed-topology runs have a
-        # constant ratio of decisions-per-step, so step-count and
-        # decision-count differ only by a constant scale that's absorbed
-        # into the learning rate.
+        # Companion counter: number of `_writeback_step_state` calls that
+        # contributed a non-None `log_pi_step` (one routing decision per
+        # walker per step). Used as the denominator for log_pi_mean so
+        # the gradient scale is invariant to T_pre.
         self._log_pi_count: int = 0
 
         # Per-block caches for values that depend only on Parameters (so
@@ -637,7 +529,6 @@ class GraphWalkerMemory(nn.Module):
         self.surprise_ema = torch.zeros(
             B, cfg.K_horizons, device=device, dtype=torch.float32,
         )
-        self.surprise_prev = torch.zeros_like(self.surprise_ema)
         self.tick_counter = 0
         self.window_len = 0
 
@@ -685,13 +576,8 @@ class GraphWalkerMemory(nn.Module):
 
         self._state_initialized = True
 
-    def reset_plastic_memory(self, device: torch.device | None = None) -> None:
-        """Hard reset of long-term plastic E_bias (in place, buffer-preserving).
-
-        `device` is kept as an optional argument for backwards-compatible
-        callers; `E_bias_flat` is now a registered buffer and lives on
-        whatever device the module was moved to.
-        """
+    def reset_plastic_memory(self) -> None:
+        """Hard reset of long-term plastic E_bias (in place, buffer-preserving)."""
         self.E_bias_flat.zero_()
         # Also clear any carried-over neuromod snapshot.
         self._neuromod_input_ids = None
@@ -874,7 +760,6 @@ class GraphWalkerMemory(nn.Module):
         self.walker_pos = self.walker_pos.detach()
         self.walker_state = self.walker_state.detach()
         self.surprise_ema = self.surprise_ema.detach()
-        self.surprise_prev = self.surprise_prev.detach()
         if self.co_visit_flat is not None:
             self.co_visit_flat = self.co_visit_flat.detach()
         if self.visit_count is not None:
@@ -1064,25 +949,6 @@ class GraphWalkerMemory(nn.Module):
             load_balance_loss=core.load_balance_loss,
         )
 
-    def consume_log_pi_sum(self) -> torch.Tensor | None:
-        """Return the accumulated phase-2 log π SUM and clear the buffer.
-
-        Returns None when no phase-2 routing decisions were recorded since
-        the last `begin_segment` call.
-
-        Note: callers training with REINFORCE should prefer
-        `consume_log_pi_mean()`. The raw sum scales with trajectory length
-        (T_pre × n_hops × n_heads decisions per rollout = ~thousands of
-        log probabilities summed), producing huge gradient magnitudes
-        without a corresponding learning-rate adjustment. Mean
-        normalization keeps the per-step gradient scale roughly invariant
-        to T_pre.
-        """
-        out = self._log_pi_sum
-        self._log_pi_sum = None
-        self._log_pi_count = 0
-        return out
-
     def consume_load_balance_loss(self) -> torch.Tensor | None:
         """Return the accumulated load-balance auxiliary loss (sum / step
         count) and clear the accumulator.
@@ -1121,9 +987,7 @@ class GraphWalkerMemory(nn.Module):
         This is the right normalization for REINFORCE: trajectory length
         affects the gradient direction the same way as the unnormalized
         sum, but the magnitude is now per-step-bounded (~|log p| ≈ a few
-        nats) regardless of T_pre. Without this normalization at our
-        n_hops=4, n_heads=4, T_pre=512 setup, the loss magnitude is
-        ~22,000× larger than per-step.
+        nats) regardless of T_pre.
 
         Returns None when no phase-2 decisions were recorded since the
         last `begin_segment` call. Clears the buffer + counter.
@@ -1439,8 +1303,6 @@ class GraphWalkerMemory(nn.Module):
     def walk_segment(
         self,
         h_mem: torch.Tensor,                     # [B, T, D_s]
-        input_ids: torch.Tensor | None = None,   # accepted for back-compat; unused
-        adapter: object | None = None,           # accepted for back-compat; unused
         *,
         preserve_graph: bool = False,
     ) -> torch.Tensor:
@@ -1464,10 +1326,6 @@ class GraphWalkerMemory(nn.Module):
           after `loss.backward()` and calls `update_plasticity(per_token_ce)`,
           which folds CE into `surprise_ema` and runs the plasticity step
           once per training step. See `update_plasticity` for details.
-
-        `input_ids` and `adapter` are accepted but ignored — kept in the
-        signature for back-compat with older callers. They will be removed
-        in a future cleanup.
         """
         B, T, D_s = h_mem.shape
         assert D_s == self.cfg.D_s, (
@@ -1876,17 +1734,6 @@ class GraphWalkerMemory(nn.Module):
             routing_choices=routing_choices_out,
         )
 
-    def readout_from_state_block(self, motor_state: torch.Tensor) -> torch.Tensor:
-        """Project graph-state readouts into model space and logits in batch."""
-        self._ensure_block_caches(self.tied_token_emb.weight)
-        if not torch.is_autocast_enabled():
-            motor_state = motor_state.to(self.state_to_model.weight.dtype)
-        motor = self.state_to_model(motor_state)
-        return self.readout(
-            motor, self.tied_token_emb.weight,
-            horizon_logits=self._horizon_logits_cache,
-        )
-
     def readout_ce_block(
         self,
         motor_state: torch.Tensor,   # [B, T, D_s]
@@ -1895,11 +1742,9 @@ class GraphWalkerMemory(nn.Module):
     ) -> torch.Tensor:
         """Factorized cross-entropy: never materializes [B, T, K_h, V].
 
-        Replaces the `readout_from_state_block → F.cross_entropy(logits_flat,
-        targets_flat)` path used for training loss. Memory-efficient at
-        large batch: at BS=88, T=48, K_h=8, V=32000 this frees ~4 GB that
-        the naive broadcast would spend on the big logit tensor and its
-        log_softmax save-for-backward.
+        Memory-efficient at large batch: at BS=88, T=48, K_h=8, V=32000
+        this frees ~4 GB that a naive broadcast would spend on the big
+        logit tensor and its log_softmax save-for-backward.
 
         Returns `[B, T, K_h]` float32 CE per (position, horizon), masked.
         """
@@ -1961,7 +1806,6 @@ class GraphWalkerMemory(nn.Module):
         helper methods this calls each have their own no_grad scope where
         needed:
           - `accumulate_block_ce`        @torch.no_grad
-          - `_finalize_surprise_window`  @torch.no_grad
           - `_plasticity_step`           @torch.no_grad
         The final `_begin_plastic_window()` call MUST run with gradients
         enabled — it runs the neuromod forward to build the next segment's
@@ -2026,31 +1870,17 @@ class GraphWalkerMemory(nn.Module):
         )
         # Stream into surprise_ema in token order.
         self.accumulate_block_ce(ce_block, valid_mask)
-        # Snapshot, fire plasticity, build next delta.
+        # Fire plasticity, build next delta.
         # `_plasticity_step` resets `window_len`, `co_visit_flat`, and
         # `visit_count`; `_begin_plastic_window` produces a fresh
         # grad-carrying `_active_neuromod_delta` for the next segment.
-        self._finalize_surprise_window()
         self._plasticity_step()
         self._begin_plastic_window()
-
-    @torch._dynamo.disable
-    @torch.no_grad()
-    def _finalize_surprise_window(self) -> None:
-        """Snapshot the current `surprise_ema` into `surprise_prev`.
-
-        The EMA itself was already streamed in via `accumulate_block_ce`
-        during each TBPTT flush, so this is a cheap snapshot now — no
-        readout re-run, no dense logit materialization. Keeps the
-        `surprise_prev` buffer available for downstream Δ-surprise consumers.
-        """
-        self.surprise_prev = self.surprise_ema.detach().clone()
 
     @torch._dynamo.disable
     def _maybe_close_plasticity_window(self) -> None:
         if self.window_len < self.cfg.mod_period:
             return
-        self._finalize_surprise_window()
         self._plasticity_step()
         # Start the next window's neuromod delta OUTSIDE the no_grad scope
         # of _plasticity_step so the delta carries a live grad_fn and
