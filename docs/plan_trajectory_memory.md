@@ -120,15 +120,19 @@ The id/state split has clean roles:
   consume it. Carries the etched trace from past writes.
 - **`edge_indices`** — sparse adjacency, fixed at init via small-world
   ring rewire (Watts-Strogatz style): concepts laid out on a ring of size
-  N; each concept's default neighbors are within ±radius positions
-  (wraparound); each default edge is rewired to a uniformly random target
-  with probability `p_rewire`. Result: ~half local + ~half random
-  connections, giving short paths between distant regions while
-  preserving semantic locality. Topology matches graph_walker's
-  initialization (`p_rewire=0.5`, `radius=4`). Used to mask the neighbor
-  softmax during trajectory hops (avoids N-way softmax per step).
-  Optional v2: periodic K-NN refresh on `concept_ids` cosine geometry
-  every N training steps. No scalar weights — edges are pure connectivity.
+  N; each concept's default neighbors are picked from within ±radius
+  positions (wraparound); each default edge is rewired to a uniformly
+  random target with probability `p_rewire`. Result: ~half local + ~half
+  random connections, giving short paths between distant regions while
+  preserving semantic locality. Constraint: `K_max <= 2*radius`, since
+  the local zone has 2*radius candidates. Defaults:
+  `K_max_neighbors=32`, `radius=16`, `p_rewire=0.5`. (Note: graph_walker
+  uses `radius=4` on a 2D Moore neighborhood with ~80 candidates; for
+  our 1D ring the radius needs to be K_max/2 to give the same K_max.)
+  Used to mask the neighbor softmax during trajectory hops (avoids N-way
+  softmax per step). Optional v2: periodic K-NN refresh on `concept_ids`
+  cosine geometry every N training steps. No scalar weights — edges are
+  pure connectivity.
 
 `D_concept = 256`. Same dim for id and state for symmetry — both occupy
 the same vector space, just different update dynamics.
@@ -505,7 +509,7 @@ for memory learning; sacrificing it is the last resort.
 | `D_concept`           | 256             | Concept id + state dim (single)  |
 | `K_max_neighbors`     | 32              | Sparse degree (matches graph_walker scale) |
 | `p_rewire`            | 0.5             | Watts-Strogatz rewire probability |
-| `radius`              | 4               | Local neighborhood radius on init ring |
+| `radius`              | 16              | 1D-ring local zone half-width (must be ≥ K_max/2) |
 | `J`                   | 4               | Parallel trajectories per window |
 | `K_read`              | 8               | Length of each read trajectory   |
 | `K_write`             | 8               | Length of each write trajectory  |
