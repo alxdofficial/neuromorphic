@@ -73,12 +73,37 @@ def init_small_world_ring(
         edge_indices[i] = (positions[i] + chosen_offsets) % N
 
     # Watts-Strogatz rewiring: each edge has probability p_rewire of being
-    # replaced with a uniform-random target.
+    # replaced. The replacement target must be (a) not the source row
+    # itself (no self-loops) and (b) not already a neighbor of that row
+    # (no duplicates within a row's neighbor list — these would reduce
+    # effective branching and waste trajectory hops). We iterate per row
+    # since the "no duplicates" constraint is per-row.
     rewire_mask = torch.rand(N, K_max, generator=generator) < p_rewire
     if rewire_mask.any():
-        n_rewire = int(rewire_mask.sum().item())
-        new_targets = torch.randint(0, N, (n_rewire,), generator=generator)
-        edge_indices[rewire_mask] = new_targets
+        for r in range(N):
+            cols = rewire_mask[r].nonzero(as_tuple=True)[0]
+            if len(cols) == 0:
+                continue
+            # Forbidden = self + the K_max - len(cols) neighbors that
+            # we're keeping (i.e., not rewiring this round).
+            keep_mask = ~rewire_mask[r]
+            forbidden = set(edge_indices[r][keep_mask].tolist()) | {r}
+            # Rewire each marked column with a target that's not in
+            # forbidden and not equal to any column we've already
+            # rewired in this row.
+            for c in cols.tolist():
+                # Bounded retries — at default scale (N=2048, K_max=32)
+                # this almost always succeeds in the first sample.
+                for _ in range(50):
+                    new = int(torch.randint(0, N, (1,), generator=generator).item())
+                    if new not in forbidden:
+                        edge_indices[r, c] = new
+                        forbidden.add(new)
+                        break
+                # If all 50 retries fail (only possible when N is small
+                # relative to K_max), leave the original local-zone
+                # neighbor — this falls back to a non-rewired edge,
+                # which is still a valid (local) connection.
 
     return edge_indices
 

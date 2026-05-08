@@ -113,8 +113,7 @@ class IntegratedLM(nn.Module):
                 f"inject_layer={L} but model has {hf_cfg.num_hidden_layers} layers"
             )
             orig_layer = self.host.layer_list()[L]
-            # memory_fn is set per forward via _set_memory_fn
-            self.mem_inject = MemInjectLayer(
+            mem_inject = MemInjectLayer(
                 orig_layer=orig_layer,
                 d_lm=cfg.d_lm,
                 d_mem=cfg.D_concept,
@@ -124,12 +123,18 @@ class IntegratedLM(nn.Module):
                 memory_fn=None,
                 bridge_hidden=cfg.bridge_hidden,
             )
-            self.host.replace_layer(L, self.mem_inject)
+            # Register under llama.model.layers[L] ONLY (via host.replace_layer).
+            # We deliberately do NOT store as `self.mem_inject` because that
+            # would alias it as a second submodule, duplicating its parameters
+            # in state_dict() under two paths (mem_inject.* AND
+            # llama.model.layers.{L}.*). PyTorch's state_dict walks all
+            # module-tree paths without deduplicating. Access via
+            # `self._mem_inject_layer()` instead.
+            self.host.replace_layer(L, mem_inject)
         else:
             # Test mode: no Llama. Skeleton for unit tests of the cycle wiring.
             self.llama = None
             self.host = None
-            self.mem_inject = None
 
         # ── 3. Memory modules (always present) ───────────────────────
         self.manifold = Manifold(cfg)
@@ -137,7 +142,12 @@ class IntegratedLM(nn.Module):
         self.write_module = WriteTrajectoryGenerator(cfg)
         self.read_attn = TrajectoryReadAttn(cfg.D_concept)
 
-    # ── memory wiring helper ─────────────────────────────────────────
+    # ── memory wiring helpers ────────────────────────────────────────
+
+    def _mem_inject_layer(self) -> MemInjectLayer:
+        """Return the MemInjectLayer that lives at `cfg.inject_layer` in
+        the Llama stack. Single registration path — see __init__ comment."""
+        return self.host.layer_list()[self.cfg.inject_layer]
 
     def _build_memory_fn(self, read_trajectory: Tensor):
         """Return a closure suitable for MemInjectLayer.memory_fn.
@@ -243,7 +253,8 @@ class IntegratedLM(nn.Module):
             surprise = torch.zeros(BS, device=prev_states.device, dtype=prev_states.dtype)
         else:
             # Wire memory_fn for this forward call.
-            self.mem_inject.memory_fn = self._build_memory_fn(read_visited)
+            mem_inject = self._mem_inject_layer()
+            mem_inject.memory_fn = self._build_memory_fn(read_visited)
             try:
                 lm_out = self.llama(
                     input_ids=lm_input_ids,
@@ -253,7 +264,7 @@ class IntegratedLM(nn.Module):
             finally:
                 # Always clear the closure to avoid leaking the trajectory tensor
                 # into a stale reference across windows.
-                self.mem_inject.memory_fn = None
+                mem_inject.memory_fn = None
 
             # Slice to the current-window positions (last T_window).
             full_logits = lm_out.logits                              # [BS, L_lm, V]

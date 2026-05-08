@@ -149,6 +149,24 @@ def test_tbptt_lm_context_grows_then_caps():
     assert out["final_lm_context"].shape[1] == cfg.T_window
 
 
+def test_integrated_lm_no_state_dict_duplicates():
+    """MemInjectLayer is registered ONLY under llama.model.layers[L] —
+    not also as `self.mem_inject` — so its parameters appear once in
+    state_dict(). Dual registration would bloat checkpoints and create
+    load ambiguity. (Test mode only checks that no `mem_inject` prefix
+    leaks into named_modules; the actual concern is real-Llama mode
+    which we can't load here without HF cache.)
+    """
+    cfg = TrajMemConfig.small()
+    model = IntegratedLM(cfg, attach_lm=False)
+    module_names = [n for n, _ in model.named_modules()]
+    # No top-level "mem_inject" submodule should exist regardless of mode.
+    leaked = [n for n in module_names if n.startswith("mem_inject")]
+    assert not leaked, (
+        f"`mem_inject` submodule leaked under top-level: {leaked}"
+    )
+
+
 def test_run_chunk_state_propagation_within_chunk():
     """Verify that within a chunk, each window's prev_states equals the
     previous window's new_states (state correctly carried forward).

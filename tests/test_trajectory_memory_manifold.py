@@ -53,6 +53,31 @@ def test_small_world_ring_K_too_large_raises():
         init_small_world_ring(N=64, K_max=8, p_rewire=0.5, radius=2)
 
 
+def test_small_world_ring_no_self_loops():
+    """Rewired edges must not target the source concept itself."""
+    edges = init_small_world_ring(
+        N=2048, K_max=32, p_rewire=0.5, radius=16,
+        generator=torch.Generator().manual_seed(0),
+    )
+    positions = torch.arange(2048, dtype=torch.int64).unsqueeze(1)
+    self_loops = (edges == positions).sum().item()
+    assert self_loops == 0, f"{self_loops} self-loops found in topology"
+
+
+def test_small_world_ring_no_duplicate_neighbors_per_row():
+    """No row should have the same neighbor twice — duplicates reduce
+    effective branching and waste trajectory hops."""
+    edges = init_small_world_ring(
+        N=2048, K_max=32, p_rewire=0.5, radius=16,
+        generator=torch.Generator().manual_seed(0),
+    )
+    dup_rows = sum(
+        1 for i in range(edges.shape[0])
+        if len(set(edges[i].tolist())) < edges.shape[1]
+    )
+    assert dup_rows == 0, f"{dup_rows} rows have duplicate neighbors"
+
+
 # ── scatter_mean_states ─────────────────────────────────────────────────
 
 
