@@ -70,6 +70,24 @@ class Phase1Stats:
                                          # walkers spread; if it stays high or
                                          # grows over training, walkers are
                                          # collapsing onto a small col subset.
+    supervised_frac: float = 1.0         # fraction of (B*T) target positions
+                                         # that ARE supervised (not -100).
+                                         # 1.0 for FineWeb (whole-text LM);
+                                         # ~0.75 for UltraChat (assistant-only
+                                         # SFT). Direct sanity check that the
+                                         # mask sidecar is loading correctly.
+    surprise_mask_drop_frac: float = 0.0 # fraction of positions skipped from
+                                         # the surprise EMA via valid_mask
+                                         # (== 1 - supervised_frac for the
+                                         # current Phase 1 wiring; tracking
+                                         # both is cheap and lets a future
+                                         # divergence between LM-CE-mask and
+                                         # plasticity-mask be detected).
+    # Pre-plasticity-reset visit_count [N] fp32. Captured BEFORE
+    # update_plasticity fires, because the plasticity step zeros this
+    # buffer as part of window close. Telemetry reads this in preference
+    # to memory.visit_count (which is post-reset and would be all zeros).
+    visit_count_snapshot: object = None
 
 
 def phase1_pretrained_step(
@@ -162,6 +180,16 @@ def phase1_pretrained_step(
     # fires the plasticity step once, and builds the next segment's
     # neuromod delta. The last position of each row has no supervised
     # target so we feed only T-1 positions.
+    supervised_frac = 1.0
+    surprise_mask_drop_frac = 0.0
+    # Snapshot visit_count BEFORE update_plasticity, because
+    # update_plasticity → _plasticity_step zeros visit_count and
+    # co_visit_flat as part of the window-close reset. Without this
+    # snapshot, telemetry's col.* metrics see post-reset zeros and
+    # report a permanently-empty walker substrate.
+    visit_count_snapshot: torch.Tensor | None = None
+    if model.memory is not None and model.memory.visit_count is not None:
+        visit_count_snapshot = model.memory.visit_count.detach().clone()
     if model.memory is not None:
         with torch.no_grad():
             # CE with ignore_index=-100 returns 0 at masked positions.
@@ -177,6 +205,8 @@ def phase1_pretrained_step(
                 ignore_index=-100,
             ).reshape(BS, T - 1)
             valid_mask = (targets_shift != -100)
+            supervised_frac = float(valid_mask.float().mean().item())
+            surprise_mask_drop_frac = 1.0 - supervised_frac
         model.memory.update_plasticity(per_token_ce, valid_mask=valid_mask)
 
     model.detach_memory()
@@ -212,4 +242,7 @@ def phase1_pretrained_step(
         inject_residual_ratio=inject_ratio,
         tok_per_sec=tok_per_sec,
         load_balance_loss=lb_loss_value,
+        supervised_frac=supervised_frac,
+        surprise_mask_drop_frac=surprise_mask_drop_frac,
+        visit_count_snapshot=visit_count_snapshot,
     )

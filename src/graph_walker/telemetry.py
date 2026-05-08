@@ -1,20 +1,22 @@
 """Telemetry — collect per-step training stats and stream them to disk.
 
-Coverage (~40 metrics across 8 categories):
-- training        loss, ce, aux_ce, load_balance, grad_norm, lr, tok/sec
-- column_state    ||s|| percentiles, touched_frac, visit_entropy
+Coverage by category (only what's actually emitted; if a key isn't
+listed here it isn't in the JSONL):
+- training        loss, ce, load_balance, grad_norm, lr, tok/sec,
+                  inject_residual_ratio, supervised_frac, surprise_mask_drop_frac
+- column_state    ||s|| percentiles, touched_frac, visit_entropy_norm,
+                  unique_columns_visited, dead_column_fraction (cumulative)
 - walker_heads    ||walker_state|| per head, walker_state_alpha per head,
                   head co-location rate
-- routing         tau, epsilon, routing_entropy, edge_diversity,
-                  exploration_rate
-- neuromod        ||delta_nm||, gamma, ||E_bias|| / max / >thresh frac,
-                  per-layer grad norm
-- surprise        per-horizon surprise EMA, plast_eta, hebb-vs-nm magnitude
-- gradients       per-component grad norms (token_emb, content_mlp,
-                  q_proj, k_all, nbr_id_to_s,
-                  state_to_model, walker_state_alpha, neuromod.*)
-- llama           W_in/W_out grad+value norms, scale norm,
-                  inject_residual_norm, ce_minus_vanilla (when available)
+- routing         tau, epsilon (scheduled value, not actual override rate)
+- neuromod        ||delta_nm||, has_active_neuromod_delta, snapshot_size,
+                  ||E_bias_flat||, E_bias_delta_norm
+- surprise        ||surprise_ema||, plast_eta, plasticity_mode
+- gradients       per-component grad norms (col_id, content_mlp, q_proj,
+                  k_proj, nbr_id_to_s, state_to_model, walker_state_alpha,
+                  neuromod.*)
+- llama           W_in/W_out norms (handles both nn.Linear and 2-layer
+                  Sequential bridge), scale norm, grad norms, inject_residual
 
 Usage:
     collector = StatsCollector(work_dir="outputs/run1")
@@ -104,6 +106,12 @@ class StatsCollector:
         # every step but only on params with non-None grad to keep cost
         # bounded.
         self._snap_count: int = 0
+        # Cumulative ever-visited mask for dead-column-fraction. ORd into
+        # over the lifetime of the run. visit_count itself is per-step
+        # (reset each begin_segment), so without this we have no visibility
+        # into "this column has never been touched in any step." Sized
+        # lazily on first snapshot since we don't know N until then.
+        self._cumulative_visited: torch.Tensor | None = None
 
     def close(self) -> None:
         self._fh.close()
@@ -144,7 +152,8 @@ class StatsCollector:
                     "reward_mean", "reward_std", "reward_min", "reward_max",
                     "log_pi_mean", "log_pi_max_abs",
                     "advantage_max", "advantage_std",
-                    "inject_residual_norm", "inject_residual_ratio"):
+                    "inject_residual_ratio",
+                    "supervised_frac", "surprise_mask_drop_frac"):
             if hasattr(stats, fld):
                 row[f"train.{fld}"] = float(getattr(stats, fld))
         # Integer fields (don't float-cast).
@@ -178,10 +187,34 @@ class StatsCollector:
                     s_norm, (0.5, 0.9, 0.99),
                 ).items()
             })
-            if m.visit_count is not None:
-                vc = m.visit_count.detach().float()
-                row["col.touched_frac"] = float((vc > 0).float().mean().item())
+            # Prefer stats.visit_count_snapshot (captured BEFORE the
+            # train step's update_plasticity fired and zeroed the live
+            # buffer). Falls back to m.visit_count for code paths that
+            # don't yet snapshot (e.g. Phase 2 sessions).
+            vc_src = getattr(stats, "visit_count_snapshot", None)
+            if vc_src is None:
+                vc_src = m.visit_count
+            if vc_src is not None:
+                vc = vc_src.detach().float()
+                visited_step = (vc > 0)
+                row["col.touched_frac"] = float(visited_step.float().mean().item())
                 row["col.visit_entropy_norm"] = _entropy_normalized(vc)
+                # Per-step unique columns hit (out of N). Direct readout of
+                # how widely the walker exercised the substrate THIS STEP.
+                row["col.unique_columns_visited"] = int(visited_step.sum().item())
+                # Cumulative ever-visited across the whole run. Catches
+                # "dead columns" — substrate that the walker never reaches,
+                # which is a sign of routing collapse / topology issues.
+                if (self._cumulative_visited is None
+                        or self._cumulative_visited.shape != visited_step.shape):
+                    self._cumulative_visited = visited_step.cpu().clone()
+                else:
+                    self._cumulative_visited = (
+                        self._cumulative_visited | visited_step.cpu()
+                    )
+                row["col.dead_column_fraction"] = float(
+                    1.0 - self._cumulative_visited.float().mean().item()
+                )
 
         # ---- walker heads ----
         if m is not None and m.walker_state is not None:
@@ -203,10 +236,16 @@ class StatsCollector:
                 )
 
         # ---- routing schedule ----
+        # These are the SCHEDULED knob values (what the schedule says
+        # tau/epsilon should be at this step). They are NOT the actual
+        # fraction of decisions where epsilon-exploration overrode
+        # argmax — that would require instrumenting routing.py to
+        # report exploration hits per call. Phase 2 uses hard
+        # Categorical and ignores these knobs entirely.
         if m is not None:
             tau, eps = m._schedule_tensors(torch.zeros(1, dtype=torch.long))
-            row["routing.tau"] = float(tau)
-            row["routing.epsilon"] = float(eps)
+            row["routing.tau_scheduled"] = float(tau)
+            row["routing.epsilon_scheduled"] = float(eps)
 
         # ---- neuromod ----
         if m is not None and m.neuromod is not None:
@@ -449,7 +488,8 @@ def plot_dashboard(stats_path: str | Path, out_dir: str | Path) -> list[Path]:
     # 4. routing schedule
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
     for ax, key in zip(axes,
-        ["routing.tau", "routing.epsilon", "surprise.plast_eta"]):
+        ["routing.tau_scheduled", "routing.epsilon_scheduled",
+         "surprise.plast_eta"]):
         ax.plot(steps, _series(key), lw=1)
         ax.set_title(key)
         ax.grid(alpha=0.3)
@@ -498,7 +538,7 @@ def plot_dashboard(stats_path: str | Path, out_dir: str | Path) -> list[Path]:
     fig, axes = plt.subplots(2, 2, figsize=(10, 6))
     for ax, key in zip(axes.flat, [
         "llama.scale_norm", "llama.W_out_norm",
-        "llama.W_out_grad_norm", "train.inject_residual_norm",
+        "llama.W_out_grad_norm", "train.inject_residual_ratio",
     ]):
         ax.plot(steps, _series(key), lw=1)
         ax.set_title(key)

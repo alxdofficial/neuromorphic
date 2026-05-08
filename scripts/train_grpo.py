@@ -531,13 +531,17 @@ def main() -> None:
 
     # ---- training loop ----
     stats_path = work_dir / "stats.jsonl"
-    stats_f = stats_path.open("a")
     print(f"[setup] writing stats to {stats_path}")
     print(f"[setup] starting training, max_steps={args.max_steps}, "
           f"K={args.grpo_K}, T_pre={args.T_pre}, gen_length={args.gen_length}")
 
     model.train(False)  # walker train mode is set by sample/replay internally
     t0 = time.perf_counter()
+    # StatsCollector handles JSONL write + collects walker-side telemetry
+    # (col.*, walker.*, routing.*, neuromod.*, llama.*, mem.*, nan.*,
+    # vram.*) directly from the wrapper every snapshot call. Phase-2-
+    # specific session metrics ride along via `extra=`.
+    collector = StatsCollector(work_dir=work_dir)
     for step in range(start_step, args.max_steps):
         # LR schedule
         for pg in opt.param_groups:
@@ -626,21 +630,26 @@ def main() -> None:
             if step % args.log_every == 0:
                 elapsed = time.perf_counter() - t0
                 steps_per_sec = (step + 1) / max(elapsed, 1e-9)
-                row = {
-                    "step": step,
-                    "phase": "phase2_mt",
-                    "n_assistant_turns": n_turns,
-                    "session_tokens": sstats.total_session_tokens,
-                    "mean_reward": mean_reward,
-                    "mean_grad_norm": mean_grad,
-                    "mean_loss": mean_loss,
-                    "eos_fraction": sstats.eos_fraction,
-                    "lr": opt.param_groups[0]["lr"],
-                    "steps_per_sec": steps_per_sec,
-                    "time_s": elapsed,
-                }
-                stats_f.write(json.dumps(row) + "\n")
-                stats_f.flush()
+                # Phase-2 session-level metrics ride in `extra`. Walker-
+                # side telemetry (col.*, walker.*, routing.*, neuromod.*,
+                # llama.*, mem.*, nan.*, vram.*) is harvested by snapshot()
+                # directly from the wrapper after grpo_session_step has
+                # already done detach_memory() — so visit_count etc. are
+                # the just-finished step's values.
+                collector.snapshot(
+                    model, step=step, phase="phase2_mt", stats=sstats,
+                    extra={
+                        "phase2.n_assistant_turns": n_turns,
+                        "phase2.session_tokens": sstats.total_session_tokens,
+                        "phase2.mean_reward": mean_reward,
+                        "phase2.mean_grad_norm": mean_grad,
+                        "phase2.mean_loss": mean_loss,
+                        "phase2.eos_fraction": sstats.eos_fraction,
+                        "train.lr": opt.param_groups[0]["lr"],
+                        "train.steps_per_sec": steps_per_sec,
+                        "train.time_s": elapsed,
+                    },
+                )
                 print(
                     f"[train] step={step} turns={n_turns} "
                     f"mean_r={mean_reward:.3f} mean_grad={mean_grad:.3f} "
@@ -673,7 +682,7 @@ def main() -> None:
         "args": vars(args),
         "walker_persistent": model.persistent_walker_state(),
     }, final_path)
-    stats_f.close()
+    collector.close()
     print(f"[done] wrote {final_path}", flush=True)
 
 
