@@ -302,7 +302,7 @@ def main():
         # (dynamic=None), inductor compiles a single shape-polymorphic
         # artifact that handles all shapes — the experiment is whether
         # that resolves the hang.
-        if args.compile_walk_block:
+        if args.compile_block:
             kind = "regional" if args.regional_compile else "whole-block"
             dyn = None if args.dynamic_shapes else False
             dyn_label = "dynamic=None" if args.dynamic_shapes else "dynamic=False"

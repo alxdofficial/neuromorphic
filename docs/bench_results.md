@@ -26,6 +26,37 @@ CLI flags worth knowing:
 
 ---
 
+## 2026-05-08 — Phase 1 + Phase 2 at bumped production config (N=4096, K=64, bridge=2048)
+
+**Config:** RTX 4090 · bf16 autocast · production walker (N=4096, K=64, p_rewire=0.5, radius=4, D_s=256, D_id=512, neuromod 6L/8H/D_mod=512/edge_hidden=384) · `MemInjectLayer` 2-layer MLP bridge with `bridge_hidden=2048` · `--regional-compile`. Trainable total **40.0M** (29.5M walker + 10.5M bridge).
+
+### Phase 1 — `bench_phase1.py --bs 8 --T 256 --regional-compile --skip-vanilla-full`
+
+| Path | tok/s | Peak VRAM | ms/iter | Notes |
+|---|---|---|---|---|
+| A — vanilla Llama fwd (`no_grad`) | **54.5k** | 3.08 GB | 37.6 | Pure inference reference. |
+| B — vanilla Llama lm_head step | **17.2k** | 10.24 GB | 119.1 | Backward through 16 frozen layers, only lm_head trainable. |
+| C — vanilla Llama full step | OOM | — | — | All 1.24B trainable; BS=8 OOMs alongside walker activations. (Pre-bump runs at BS=8 fit because walker was smaller — re-bench in a separate process if needed.) |
+| D — Llama + GW phase1 step | **1.7k** | 19.68 GB | 1215.3 | regional-compile mode. Vs 2026-05-02 BS=8 baseline (3.3k tok/s @ N=1024,K=32, single-linear bridge): ~2× walker slowdown from K=32→64 routing + bridge MLP. BS=20 OOMs at this config; max-fitting BS likely 12-14. |
+
+### Phase 2 — `bench_phase2.py --B 2 --K 4 --T-pre 256 --gen-length 128 --reward placeholder --regional-compile`
+
+Effective batch B·K=8, total seq T_pre+gen=384. Default B=8/K=8 OOMs at this config.
+
+| Path | gpu-tok/s | Peak VRAM | ms/iter | Notes |
+|---|---|---|---|---|
+| E — vanilla LM GRPO | **3.5k** | 12.93 GB | 878.9 | Reference: frozen Llama + lm_head, autoregressive sample (K=4, gen=128) + replay grpo_step. |
+| F — Llama + GW grpo_step | **1.0k** | 22.86 GB | 3031.9 | F vs E slowdown: **3.45×**. Near VRAM ceiling — no headroom to bump B or K at this config. |
+
+**Takeaways:**
+- N=4096 + K=64 + bridge=2048 nudged max-fitting BS down: Phase 1 BS=20 → ~12, Phase 2 B·K=64 → 8.
+- Walker cost is dominated by routing (linear in K) — K=32→64 is ~2× of the slowdown vs prior bench.
+- Bridge MLP is a small contributor: 10.5M params × 384 tokens × 2 directions ≈ 8 GFLOPs/iter (~0.1 ms on the 4090).
+- Phase 2 GW is ~3.5× vanilla; gap is dominated by the autoregressive walker step (every gen token = one walker hop, launch-bound).
+- For real waves at this config, plan on BS=8 Phase 1 / B·K=8 Phase 2 with `--regional-compile`; bigger BS requires either dropping `bridge_hidden` to 1024 (~5M bridge instead of 10M) or moving to whole-block compile.
+
+---
+
 ## 2026-05-02 — Three-way comparison at production config
 
 **Setup:** RTX 4090 · BS=4 · T=256 · bf16 autocast · fused AdamW · production walker config (N=1024, K=16, D_s=256, D_id=512, neuromod 6L/8H/D_mod=512/edge_hidden=384) · `_walker_cfg_for` overrides `mod_period = tbptt_block = T = 256` to satisfy the integration's external-surprise constraint · GW path uses `--compile-block`.
