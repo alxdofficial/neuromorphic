@@ -16,10 +16,15 @@ import torch
 from src.graph_walker.config import GraphWalkerConfig
 
 
-# Production walker config: what's on main today (~25M trainable, fits cudagraph).
+# Production walker config: what's on main today.
+# Capacity bump 2026-05-08: N=1024→2048, K=32→64, p_rewire=0.3→0.5,
+# radius=3→4. Per-token compute scales linearly in K (slightly slower)
+# but N is "free capacity" (walkers visit B·H cols per step regardless
+# of N). p_rewire=0.5 keeps the locality prior while shortening graph
+# diameter further; radius=4 supports the K=64 sampling.
 PRODUCTION_KNOBS = dict(
-    grid_rows=32, grid_cols=32, radius=3,
-    K=32, D_s=256, D_id=512, D_model=256,
+    grid_rows=32, grid_cols=64, radius=4, p_rewire=0.5,
+    K=64, D_s=256, D_id=512, D_model=256,
     content_mlp_depth=4, D_hid_content=1024,
     post_model_depth=2,
     n_heads=4, n_hops=4,

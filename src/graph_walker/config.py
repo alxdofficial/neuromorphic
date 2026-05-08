@@ -11,21 +11,21 @@ from dataclasses import dataclass
 @dataclass
 class GraphWalkerConfig:
     # --- Graph topology (single flat substrate, no planes) ---
-    grid_rows: int = 32                 # 32×32 = 1024 columns. Sized to the
-    grid_cols: int = 32                 # ~1500-2000-word active vocabulary that
-                                        # is the model's vocabulary of concepts;
-                                        # N is the vocab size. Per-token compute
-                                        # is invariant to N (walkers visit only
-                                        # B·H cols per step regardless of N), so
-                                        # N is pure capacity at no runtime cost.
-    K: int = 32                         # out-edges per column. With N=1024,
-                                        # K=32 gives each column meaningful
-                                        # branching at every hop without
-                                        # blowing up the per-step routing
-                                        # cost (which stays in the noise
-                                        # relative to content_mlp). At
-                                        # radius=3 we have 48 candidates per
-                                        # column so K=32 is comfortable.
+    grid_rows: int = 32                 # 32×64 = 2048 concept columns. Per-
+    grid_cols: int = 64                 # token compute is invariant to N
+                                        # (walkers visit only B·H cols per
+                                        # step regardless of N), so N is pure
+                                        # capacity at no runtime cost — the
+                                        # cheapest dimension to grow.
+    K: int = 64                         # out-edges per column. K=64 doubles
+                                        # local branching vs K=32 and
+                                        # doubles the plastic edge surface
+                                        # (E_bias_flat = N·K = 131K edges).
+                                        # Per-step routing cost scales
+                                        # linearly with K but stays in the
+                                        # noise relative to content_mlp. At
+                                        # radius=4 we have 80 candidates per
+                                        # column so K=64 is comfortable.
     # p_rewire: Watts-Strogatz rewiring probability. Each edge's destination
     # is, with probability p_rewire, replaced by a uniform-random column
     # anywhere in the graph. 0.0 = pure local grid.
@@ -41,10 +41,10 @@ class GraphWalkerConfig:
     # prior at init, more work for plasticity to learn which random edges
     # carry meaning. ε-exploration in routing.py provides per-decision
     # stochasticity on top.
-    p_rewire: float = 0.3
+    p_rewire: float = 0.5
     # Moore-radius for neighbour candidate sampling.
-    # Radius 3 → 48 candidates, comfortable for K up to ~48.
-    radius: int = 3
+    # Radius 4 → 80 candidates, comfortable for K up to ~64-72.
+    radius: int = 4
 
     # --- Per-walker weight specialisation ---
     # When True, content_mlp has H independent copies (one per walker head).

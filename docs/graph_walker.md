@@ -57,11 +57,11 @@ From [src/graph_walker/config.py](/home/alex/code/neuromorphic/src/graph_walker/
 (verified 2026-05-04 — earlier versions of this section had stale numbers):
 
 - topology:
-  - `32 × 32` flat torus (single substrate, no planes)
-  - `N = 1024` total columns
-  - `K = 32` outgoing edges per column
-  - `radius = 3` Moore-neighbourhood (48 candidates per column; K=32 fits)
-  - `p_rewire = 0.3` Watts-Strogatz
+  - `32 × 64` flat torus (single substrate, no planes)
+  - `N = 2048` total columns
+  - `K = 64` outgoing edges per column
+  - `radius = 4` Moore-neighbourhood (80 candidates per column; K=64 fits)
+  - `p_rewire = 0.5` Watts-Strogatz
 - widths:
   - `D_model = 1024` (external lexical width)
   - `D_s = 256` (graph state + walker state)
