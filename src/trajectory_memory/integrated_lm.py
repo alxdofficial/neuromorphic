@@ -243,14 +243,32 @@ class IntegratedLM(nn.Module):
 
         # ── 2. PREDICT ──────────────────────────────────────────────
         if self.llama is None:
-            # Test-mode fallback: no Llama, no logits, just current_hiddens
-            # = random so write has something to chew on. Surprise is 0.
-            logits = torch.zeros(BS, T_window, 1, device=prev_states.device)
-            current_hiddens = torch.randn(
-                BS, T_window, cfg.d_lm,
-                dtype=prev_states.dtype, device=prev_states.device,
-            )
-            surprise = torch.zeros(BS, device=prev_states.device, dtype=prev_states.dtype)
+            # Test-mode fallback: no Llama. We synthesize logits + hiddens
+            # + surprise that ALL flow gradient back through the read
+            # trajectory, so unit tests can exercise the full forward+backward
+            # path. Real-LM mode overrides these from Llama's actual outputs.
+            #
+            # Buffers `_test_proj` (D_concept→d_lm) and `_test_lm_head`
+            # (d_lm→fake_vocab) are registered lazily on first forward and
+            # held as non-persistent buffers (don't show up in state_dict).
+            traj_mean = read_visited.mean(dim=(1, 2))             # [BS, D_concept]
+            fake_vocab = 64                                        # small vocab for test rollouts
+            if not hasattr(self, "_test_proj"):
+                proj = torch.randn(
+                    cfg.D_concept, cfg.d_lm,
+                    dtype=prev_states.dtype, device=prev_states.device,
+                ) * 0.1
+                self.register_buffer("_test_proj", proj, persistent=False)
+                head = torch.randn(
+                    cfg.d_lm, fake_vocab,
+                    dtype=prev_states.dtype, device=prev_states.device,
+                ) * 0.1
+                self.register_buffer("_test_lm_head", head, persistent=False)
+            current_hiddens = (
+                traj_mean.unsqueeze(1).expand(BS, T_window, -1) @ self._test_proj
+            )                                                      # [BS, T_window, d_lm]
+            logits = current_hiddens @ self._test_lm_head          # [BS, T_window, fake_vocab]
+            surprise = read_visited.mean(dim=(1, 2, 3)) * 0.01     # [BS]
         else:
             # Wire memory_fn for this forward call.
             mem_inject = self._mem_inject_layer()

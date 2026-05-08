@@ -1,14 +1,8 @@
-"""Wave 4 entry point — long-session GRPO with chat data (plan §4.5).
+"""Wave 4 entry point — long-session GRPO (plan §4.5).
 
-Reads TurnPair parquet from preprocess_chat.py (same format as Wave 2),
-samples J responses per TurnPair via the model, scores against the
-ground-truth response (exact match + BERT cosine, per project policy),
-runs group-relative policy gradient.
-
-Differs from Wave 3 in that the data is multi-turn chat TurnPairs
-(prior includes prior conversation context) and the reward function is
-exact-match-or-BERT-cosine on the response. The architectural mechanics
-are otherwise the same as Wave 3.
+Reads TurnPair parquet (same format as Wave 2), samples J responses per
+TurnPair via the model, scores against ground-truth response with
+exact_match + BERT cosine, runs group-relative policy gradient.
 
 Usage:
     python scripts/train_wave4.py \\
@@ -27,8 +21,15 @@ import torch
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.data.tokenizer import get_tokenizer
 from src.trajectory_memory.integrated_lm import IntegratedLM
+from src.trajectory_memory.training import (
+    Phase2Trainer,
+    WarmupCosineScheduler,
+    build_optimizer,
+    capture_rng_state,
+    load_checkpoint,
+    save_checkpoint,
+)
 from src.trajectory_memory.training.loaders import TurnPairDataset
-from src.trajectory_memory.training.phase2 import grpo_step
 
 
 def main():
@@ -37,14 +38,19 @@ def main():
     ap.add_argument("--num-samples", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--num-steps", type=int, default=200)
+    ap.add_argument("--warmup-steps", type=int, default=20)
     ap.add_argument("--lr-memory", type=float, default=1e-4)
     ap.add_argument("--lr-adapter", type=float, default=5e-5)
+    ap.add_argument("--lr-min-ratio", type=float, default=0.1)
+    ap.add_argument("--grad-clip", type=float, default=1.0)
+    ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--config-tier", choices=["small", "medium", "large"],
                     default="medium")
     ap.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--checkpoint-in", type=Path, default=None)
     ap.add_argument("--checkpoint-out", type=Path, default=None)
+    ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--log-every", type=int, default=5)
     args = ap.parse_args()
 
@@ -52,81 +58,79 @@ def main():
     tokenizer = get_tokenizer()
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
+    optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_steps=args.warmup_steps,
+        total_steps=args.num_steps,
+        lr_min_ratio=args.lr_min_ratio,
+    )
+    trainer = Phase2Trainer(model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip)
+
     if args.checkpoint_in:
-        ckpt = torch.load(args.checkpoint_in, map_location=args.device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        ckpt = load_checkpoint(
+            args.checkpoint_in, model=model,
+            optimizer=optimizer, scheduler=scheduler,
+            map_location=args.device,
+        )
+        trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
 
-    memory_params = (
-        list(model.manifold.parameters())
-        + list(model.read_module.parameters())
-        + list(model.write_module.parameters())
-        + list(model.read_attn.parameters())
-    )
-    mem_inject = model.host.layer_list()[cfg.inject_layer]
-    adapter_params = [
-        p for n, p in mem_inject.named_parameters()
-        if p.requires_grad and not n.startswith("orig_layer")
-    ]
-    optimizer = torch.optim.AdamW([
-        {"params": memory_params, "lr": args.lr_memory},
-        {"params": adapter_params, "lr": args.lr_adapter},
-    ])
-
-    # Use TurnPairDataset (same as Wave 2) but treat each pair as a Wave 3-style
-    # GRPO example: prompt = prior_ids; gold = response_ids decoded.
-    dataset = TurnPairDataset(
-        args.data_paths, batch_size=1, pad_id=tokenizer.pad_token_id,
-    )
+    dataset = TurnPairDataset(args.data_paths, batch_size=1, pad_id=tokenizer.pad_token_id)
     print(f"Wave 4 dataset: {len(dataset._rows)} TurnPairs")
 
-    step = 0
-    rewards_history = []
+    rewards_history: list = []
     t_start = time.time()
-    for batch in dataset:
-        if step >= args.num_steps:
-            break
-        # batch is BS=1 TurnPair; unwrap.
-        prompt_ids = batch.prior_ids[0]
-        if (mask := batch.prior_mask[0]).all():
-            prompt_ids = prompt_ids
-        else:
-            # Strip padding.
-            prompt_ids = prompt_ids[mask]
-        gold_resp = batch.response_ids[0][batch.response_mask[0]]
-        gold_text = tokenizer.decode(gold_resp.tolist(), skip_special_tokens=True)
-        prompt_ids = prompt_ids.to(args.device)
+    while trainer.step_count < args.num_steps:
+        for batch in dataset:
+            if trainer.step_count >= args.num_steps:
+                break
+            prior_mask = batch.prior_mask[0]
+            prompt_ids = batch.prior_ids[0][prior_mask].to(args.device)
+            response_mask = batch.response_mask[0]
+            gold_resp = batch.response_ids[0][response_mask]
+            gold_text = tokenizer.decode(gold_resp.tolist(), skip_special_tokens=True)
 
-        out = grpo_step(
-            model, prompt_ids,
-            optimizer=optimizer,
-            num_samples=args.num_samples,
-            max_new_tokens=args.max_new_tokens,
-            reward_kind="exact_match_or_bert_cosine",
-            gold=gold_text,
-            meta={"all_answers": [gold_text]},
-            tokenizer=tokenizer,
-        )
-        rewards_history.append(sum(out["rewards"]) / len(out["rewards"]))
-        if step % args.log_every == 0:
-            avg = sum(rewards_history[-args.log_every:]) / max(
-                len(rewards_history[-args.log_every:]), 1
+            metrics = trainer.step(
+                prompt_ids,
+                num_samples=args.num_samples,
+                max_new_tokens=args.max_new_tokens,
+                reward_kind="exact_match_or_bert_cosine",
+                gold=gold_text,
+                meta={"all_answers": [gold_text]},
+                tokenizer=tokenizer,
+                temperature=args.temperature,
             )
-            elapsed = time.time() - t_start
-            print(f"  step {step:>4}  loss={out['policy_loss']:.4f}  "
-                  f"r={out['rewards']}  avg_r10={avg:.3f}  "
-                  f"({elapsed/(step+1):.2f}s/step)")
-        step += 1
+            mean_r = sum(metrics.rewards) / max(len(metrics.rewards), 1)
+            rewards_history.append(mean_r)
+
+            step = trainer.step_count
+            if step % args.log_every == 0:
+                avg = sum(rewards_history[-args.log_every:]) / max(
+                    len(rewards_history[-args.log_every:]), 1
+                )
+                elapsed = time.time() - t_start
+                print(f"  step {step:>4}  loss={metrics.policy_loss:.4f}  "
+                      f"r={[f'{r:.2f}' for r in metrics.rewards]}  "
+                      f"avg_r10={avg:.3f}  grad_norm={metrics.grad_norm:.2f}  "
+                      f"({elapsed/max(step, 1):.2f}s/step)")
+
+            if args.checkpoint_out is not None and step > 0 and step % args.save_every == 0:
+                save_checkpoint(
+                    args.checkpoint_out,
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    step=step,
+                    rng_state=capture_rng_state(),
+                    extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+                )
 
     if args.checkpoint_out:
-        args.checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": cfg.__dict__,
-            "rewards_history": rewards_history,
-        }, args.checkpoint_out)
-        print(f"Saved {args.checkpoint_out}")
+        save_checkpoint(
+            args.checkpoint_out,
+            model=model, optimizer=optimizer, scheduler=scheduler,
+            step=trainer.step_count,
+            rng_state=capture_rng_state(),
+            extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+        )
 
 
 if __name__ == "__main__":

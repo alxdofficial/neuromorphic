@@ -1,14 +1,21 @@
 """Phase 2 (AR GRPO) trainer for Wave 3 (verifiable-reward) and Wave 4
 (long-session). Implements GRPO: sample J responses per prompt, score each,
-compute group-relative advantage, policy gradient through both the LM
-token-sampling and the trajectory-routing decisions (plan §4.7).
+compute group-relative advantage, policy gradient (plan §4.7).
 
-This is the simplest viable single-pass GRPO trainer — no rewind-and-
-re-forward (§4.6 fallback). For multi-turn long sessions (Wave 4), we
-loop over assistant turns within a session, using TurnPair semantics.
+The `Phase2Trainer` class is the proper training harness with grad
+clipping, LR scheduling, metrics dict, and checkpoint integration. The
+legacy `grpo_step` free function is preserved for back-compat.
+
+NOTE on rollout efficiency: the current `grpo_rollout` does one
+`forward_window` call per generated token — correct but slow. A real
+training run should batch generation per-T_window (one read+predict+write
+cycle per window of generated tokens, with an HF `generate()`-style KV
+cache inside each window). Wired as a follow-up; see `_rollout_one`.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -19,78 +26,200 @@ from src.trajectory_memory.integrated_lm import IntegratedLM
 from src.trajectory_memory.training.rewards import compute_reward
 
 
-def grpo_rollout(
-    model: IntegratedLM,
-    prompt_ids: Tensor,                  # [T_prompt] int64 — single example
-    *,
-    num_samples: int,
-    max_new_tokens: int,
-    temperature: float = 1.0,
-    eos_id: int | None = None,
-) -> tuple[list[Tensor], list[Tensor]]:
-    """Sample `num_samples` AR responses from a single prompt.
+@dataclass
+class Phase2Metrics:
+    policy_loss: float
+    grad_norm: float
+    lr: list[float]
+    rewards: list[float]
+    advantages: list[float]
+    decoded: list[str]
+    mean_response_len: float
+
+
+def compute_grpo_advantages(rewards: Tensor, *, eps: float = 1e-6) -> Tensor:
+    """DeepSeek-style group-relative advantage: (r_i - mean(r)) / std(r).
+
+    Centers around 0 by construction; variance-normalized so loss scale
+    is consistent across prompts with different reward magnitudes.
+
+    Args:
+        rewards: [J] reward per sample.
+        eps:     numerical floor on std to avoid div-by-zero when all
+                 rewards are equal (degenerate group → zero advantage,
+                 zero gradient — that's the desired behavior).
 
     Returns:
-        sampled_ids:  list of [T_response] tensors per sample
-        token_logps:  list of [T_response] log-prob tensors (for policy gradient)
-
-    Memory state is RESET per sample (per-rollout independence). The
-    forward path is per-token AR generation with the trajectory-memory
-    cycle active per window boundary.
-
-    NOTE: This is a *minimal* implementation — it does AR generation by
-    running the model token-by-token through forward_window. For
-    production-scale GRPO, replace with batched HF `generate()` plus
-    a custom hook that fires the per-window read/write cycle.
+        [J] advantages.
     """
-    cfg = model.cfg
-    device = next(model.parameters()).device
-    eos_id = eos_id if eos_id is not None else cfg.T_window  # placeholder; replace with tokenizer.eos
-    samples: list[Tensor] = []
-    logps: list[Tensor] = []
+    if rewards.numel() == 0:
+        return rewards
+    mean_r = rewards.mean()
+    std_r = rewards.std(unbiased=False)
+    return (rewards - mean_r) / std_r.clamp_min(eps)
 
-    for _ in range(num_samples):
-        # State for this sample.
-        prev_states = model.manifold.reset_states(batch_size=1)
+
+class Phase2Trainer:
+    """Phase 2 GRPO trainer.
+
+    Usage:
+        trainer = Phase2Trainer(model, optimizer, scheduler=...)
+        for example in dataset:
+            metrics = trainer.step(
+                prompt_ids, num_samples=4, max_new_tokens=256,
+                reward_kind=example["reward_kind"], gold=...,
+                meta=example["meta"], tokenizer=tokenizer,
+            )
+    """
+
+    def __init__(
+        self,
+        model: IntegratedLM,
+        optimizer: Optimizer,
+        *,
+        scheduler: object | None = None,
+        grad_clip: float | None = 1.0,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.grad_clip = grad_clip
+        self._step_count = 0
+
+    @property
+    def step_count(self) -> int:
+        return self._step_count
+
+    def state_dict(self) -> dict:
+        return {"step_count": self._step_count}
+
+    def load_state_dict(self, state: dict) -> None:
+        self._step_count = state["step_count"]
+
+    def step(
+        self,
+        prompt_ids: Tensor,
+        *,
+        num_samples: int,
+        max_new_tokens: int,
+        reward_kind: str,
+        gold: str | None,
+        meta: dict | None,
+        tokenizer,
+        temperature: float = 1.0,
+    ) -> Phase2Metrics:
+        """One GRPO step on a single prompt."""
+        samples, logps = self._rollout(
+            prompt_ids,
+            num_samples=num_samples,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            eos_id=tokenizer.eos_token_id,
+        )
+
+        decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
+        rewards = [
+            compute_reward(reward_kind, c, gold=gold, meta=meta) for c in decoded
+        ]
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)
+        advantages = compute_grpo_advantages(rewards_t)
+
+        self.optimizer.zero_grad()
+        policy_loss = torch.zeros((), device=prompt_ids.device)
+        any_grad = False
+        for adv, lp in zip(advantages, logps):
+            if lp.numel() == 0:
+                continue
+            policy_loss = policy_loss + (-adv * lp.sum())
+            any_grad = True
+        policy_loss = policy_loss / max(num_samples, 1)
+        # If no samples produced any tokens (e.g., all hit eos immediately, or
+        # test-mode rollout with V=1 always sampling index 0), skip the
+        # optimizer update — there's nothing to learn from this step.
+        if any_grad:
+            policy_loss.backward()
+            grad_norm = self._clip_and_step()
+        else:
+            grad_norm = 0.0
+            if self.scheduler is not None:
+                self.scheduler.step()
+        self._step_count += 1
+
+        return Phase2Metrics(
+            policy_loss=float(policy_loss.detach()),
+            grad_norm=float(grad_norm),
+            lr=[g["lr"] for g in self.optimizer.param_groups],
+            rewards=rewards,
+            advantages=advantages.tolist(),
+            decoded=decoded,
+            mean_response_len=sum(len(s) for s in samples) / max(len(samples), 1),
+        )
+
+    # ── rollout (batched-per-token; correct but slow) ─────────────────
+
+    def _rollout(
+        self,
+        prompt_ids: Tensor,
+        *,
+        num_samples: int,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        eos_id: int | None = None,
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        """Sample `num_samples` AR responses from a single prompt.
+
+        Returns (samples, token_logps). See module docstring on efficiency.
+        """
+        cfg = self.model.cfg
+        device = next(self.model.parameters()).device
+
+        samples: list[Tensor] = []
+        logps: list[Tensor] = []
+
+        for _ in range(num_samples):
+            sample, lp = self._rollout_one(
+                prompt_ids, max_new_tokens=max_new_tokens,
+                temperature=temperature, eos_id=eos_id, device=device,
+            )
+            samples.append(sample)
+            logps.append(lp)
+        return samples, logps
+
+    def _rollout_one(
+        self,
+        prompt_ids: Tensor,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        eos_id: int | None,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor]:
+        """One AR sample. Token-by-token (slow but correct)."""
+        cfg = self.model.cfg
+        prev_states = self.model.manifold.reset_states(batch_size=1)
         prev_window_hiddens: Tensor | None = None
-        prev_lm_context: Tensor | None = None
 
-        # Generate AR. We accumulate tokens and run forward_window every
-        # T_window steps. (Production should use KV-cache for efficiency.)
-        # For this minimal version we tokenize-then-call once per
-        # T_window-aligned chunk.
-
+        cur_tokens = prompt_ids.tolist() if prompt_ids.dim() == 1 else prompt_ids[0].tolist()
         generated: list[int] = []
         per_tok_logp: list[Tensor] = []
-        prompt_list = prompt_ids.tolist()
 
-        # Pad prompt to start at a T_window boundary so the rolling
-        # context is well-defined. We just generate from the prompt
-        # forward; the first window is the prompt's last T_window tokens.
-        # This is a simplified rollout.
-        cur_tokens = list(prompt_list)
-
-        for _step in range(max_new_tokens):
-            # Build the LM input: last min(len(cur_tokens), effective_lm_context)
+        for _ in range(max_new_tokens):
             lm_input = torch.tensor(
                 cur_tokens[-cfg.effective_lm_context:],
                 dtype=torch.int64, device=device,
             ).unsqueeze(0)
             if lm_input.shape[1] < cfg.T_window:
-                # Need at least T_window tokens for forward_window.
-                # Pad on the left with pad_id (0 by convention).
                 pad_n = cfg.T_window - lm_input.shape[1]
                 lm_input = F.pad(lm_input, (pad_n, 0), value=0)
 
-            with torch.set_grad_enabled(True):
-                out = model.forward_window(
-                    lm_input_ids=lm_input,
-                    prev_window_hiddens=prev_window_hiddens,
-                    prev_states=prev_states,
-                    target_mask=None,
-                    hard_routing=True,
-                )
-            logits = out["logits"][:, -1, :].float()              # [1, V] for the next token
+            out = self.model.forward_window(
+                lm_input_ids=lm_input,
+                prev_window_hiddens=prev_window_hiddens,
+                prev_states=prev_states,
+                target_mask=None,
+                hard_routing=True,
+            )
+            logits = out["logits"][:, -1, :].float()
             probs = F.softmax(logits / temperature, dim=-1)
             sampled = torch.multinomial(probs, num_samples=1).item()
             logp = F.log_softmax(logits, dim=-1)[0, sampled]
@@ -98,21 +227,51 @@ def grpo_rollout(
             generated.append(sampled)
             cur_tokens.append(sampled)
 
-            if sampled == eos_id:
+            if eos_id is not None and sampled == eos_id:
                 break
 
-            # Update carries (only when we cross a window boundary —
-            # with this simple per-token loop we update every step,
-            # which is O(N) windows for an N-token response. A real
-            # implementation only crosses windows every T_window tokens).
             prev_states = out["new_states"].detach()
             prev_window_hiddens = out["current_hiddens"].detach()
-            prev_lm_context = lm_input[:, -(cfg.effective_lm_context - cfg.T_window):]
 
-        samples.append(torch.tensor(generated, dtype=torch.int64))
-        logps.append(torch.stack(per_tok_logp) if per_tok_logp else torch.zeros(0))
+        return (
+            torch.tensor(generated, dtype=torch.int64),
+            torch.stack(per_tok_logp) if per_tok_logp else torch.zeros(0),
+        )
 
-    return samples, logps
+    # ── helpers ───────────────────────────────────────────────────────
+
+    def _clip_and_step(self) -> float:
+        if self.grad_clip is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                (p for p in self.model.parameters() if p.requires_grad),
+                max_norm=self.grad_clip,
+            )
+        else:
+            grad_norm = torch.tensor(0.0)
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        return float(grad_norm)
+
+
+# ── Legacy free functions ─────────────────────────────────────────────
+
+
+def grpo_rollout(
+    model: IntegratedLM,
+    prompt_ids: Tensor,
+    *,
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    eos_id: int | None = None,
+):
+    """Compatibility shim around Phase2Trainer._rollout."""
+    trainer = Phase2Trainer(model, optimizer=torch.optim.SGD([torch.zeros(1)], lr=0))
+    return trainer._rollout(
+        prompt_ids, num_samples=num_samples,
+        max_new_tokens=max_new_tokens, temperature=temperature, eos_id=eos_id,
+    )
 
 
 def grpo_step(
@@ -128,50 +287,16 @@ def grpo_step(
     tokenizer,
     kl_coef: float = 0.0,
 ) -> dict:
-    """One GRPO training step on a single prompt.
-
-    Algorithm (plan §4.7):
-      1. Sample J responses from the current model.
-      2. Score each with `compute_reward(reward_kind, ...)`.
-      3. Group-relative advantage: a_i = r_i - mean(r) (no value baseline).
-      4. Policy loss = -mean_i (advantage_i * sum_t logp_i_t).
-      5. Optional KL to a reference model (skipped here — kl_coef=0).
-    """
-    samples, logps = grpo_rollout(
-        model, prompt_ids,
-        num_samples=num_samples,
-        max_new_tokens=max_new_tokens,
-        eos_id=tokenizer.eos_token_id,
+    """Compatibility shim — single GRPO step. Prefer `Phase2Trainer.step`."""
+    trainer = Phase2Trainer(model, optimizer)
+    m = trainer.step(
+        prompt_ids,
+        num_samples=num_samples, max_new_tokens=max_new_tokens,
+        reward_kind=reward_kind, gold=gold, meta=meta, tokenizer=tokenizer,
     )
-
-    # Decode samples and score.
-    decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
-    rewards = [
-        compute_reward(reward_kind, c, gold=gold, meta=meta) for c in decoded
-    ]
-    rewards_t = torch.tensor(rewards, dtype=torch.float32)
-
-    # Group-relative advantage (DeepSeek-style).
-    mean_r = rewards_t.mean()
-    std_r = rewards_t.std(unbiased=False).clamp_min(1e-6)
-    advantages = (rewards_t - mean_r) / std_r              # [J]
-
-    # Policy loss: maximize advantage * sum(logp_per_token).
-    # logps[i] has shape [T_response_i]; sum over T to get a scalar per sample.
-    policy_loss = torch.zeros((), device=samples[0].device)
-    for adv, lp in zip(advantages, logps):
-        if lp.numel() == 0:
-            continue
-        policy_loss = policy_loss + (-adv * lp.sum())
-    policy_loss = policy_loss / max(num_samples, 1)
-
-    optimizer.zero_grad()
-    policy_loss.backward()
-    optimizer.step()
-
     return {
-        "policy_loss": float(policy_loss.detach()),
-        "rewards": rewards,
-        "advantages": advantages.tolist(),
-        "decoded": decoded,
+        "policy_loss": m.policy_loss,
+        "rewards": m.rewards,
+        "advantages": m.advantages,
+        "decoded": m.decoded,
     }
