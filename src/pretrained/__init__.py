@@ -1,13 +1,11 @@
-"""Pretrained-LM + memory integration.
+"""Llama host adapters + MemInjectLayer.
 
-Host: Llama-3.2-3B (or 1B for dev). Frozen backbone. Memory graph reads and
-writes at one mid-stack layer via a per-dim scale gate. Phase 1 backprop
-bootstrap, Phase 2 autoregressive GRPO.
+Reused by `src.trajectory_memory.integrated_lm`:
+- `src.pretrained.hosts.build_host` for Llama-family attribute paths.
+- `src.pretrained.mem_inject_layer.MemInjectLayer` for the cross-attn
+  injection at one mid-stack Llama layer.
 
-Entry points:
-- `PretrainedLMWithMemory` wires the pieces together.
-- `MemInjectLayer` wraps the chosen LlamaDecoderLayer.
-
-Keep this module self-contained; do not import from `src.model.lm` or
-`src.model.scan` (those are the from-scratch LM, unused on this branch).
+Nothing else in this package — earlier graph_walker plumbing
+(`PretrainedLMWithMemory`, `MemAdapter`, rollout/training loops) is
+archived under `abandoned/graph-walker`.
 """

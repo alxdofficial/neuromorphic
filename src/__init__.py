@@ -1,1 +1,1 @@
-# Neuromorphic LM - Brain-Stack Architecture
+"""Trajectory-Memory LM — see docs/plan_trajectory_memory.md."""
