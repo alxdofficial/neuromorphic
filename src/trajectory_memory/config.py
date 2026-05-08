@@ -6,7 +6,7 @@ of docs/plan_trajectory_memory.md.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -63,11 +63,11 @@ class TrajMemConfig:
     seed_topology: int = 0
     seed_concepts: int = 0
 
-    # ── dtypes ────────────────────────────────────────────────────────
-    # Memory params (concept_ids, concept_states, MLPs) stay in fp32.
-    # bf16 weight updates round small Adam steps to zero — same lesson
-    # as graph_walker / pretrained.
-    memory_dtype: str = "fp32"
+    # Note on dtype policy: memory params (concept_ids, concept_states,
+    # MLPs) always stay in fp32 — bf16 weight updates round small Adam
+    # steps to zero (same lesson as graph_walker / pretrained). Llama's
+    # backbone runs in bf16; MemInjectLayer's W_in/W_out bridge handles
+    # the cross-dtype add. No knob — fp32-only by design.
 
     def __post_init__(self) -> None:
         self.validate()
@@ -89,7 +89,6 @@ class TrajMemConfig:
         assert self.T_window > 0
         assert self.D >= 2, "TBPTT depth < 2 starves the write module"
         assert self.effective_lm_context >= self.T_window
-        assert self.memory_dtype in {"fp32", "bf16", "fp16"}
 
     # ── factory presets ───────────────────────────────────────────────
 

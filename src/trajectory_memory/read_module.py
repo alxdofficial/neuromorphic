@@ -77,6 +77,31 @@ def gumbel_top1_ste(
     return one_hot, idx
 
 
+def per_j_attn(attn_module: "_CrossAttn", q: Tensor, kv: Tensor) -> Tensor:
+    """Apply cross-attention separately for each j in the J dim.
+
+    Used by both read_module and write_module to attend per-trajectory
+    without mixing across j.
+
+    Args:
+        attn_module: a `_CrossAttn` instance.
+        q:  [BS, J, d_q]
+        kv: [BS, J, NK, d_kv]
+
+    Returns:
+        [BS, J, d_q] — attention readout per (BS, J).
+
+    Implementation: fold J into BS, apply attn, fold back.
+    """
+    BS, J, D = q.shape
+    d_kv = kv.shape[-1]
+    NK = kv.shape[-2]
+    q_flat = q.reshape(BS * J, 1, D)
+    kv_flat = kv.reshape(BS * J, NK, d_kv)
+    out = attn_module(q_flat, kv_flat)                            # [BS*J, 1, D]
+    return out.reshape(BS, J, D)
+
+
 class _CrossAttn(nn.Module):
     """Single-head cross-attention. Q in d_q, KV in d_kv, both project to d.
 
@@ -165,7 +190,8 @@ class ReadTrajectoryGenerator(nn.Module):
 
         # Positional encoding for the visited list (used in history_attn keys).
         # Buffer so it moves to GPU with the module.
-        pe = make_pos_enc(cfg.K_read + 1, D) * cfg.pos_enc_scale
+        # Size K_read: indexed up to pos_enc[:K_read] in the longest hop.
+        pe = make_pos_enc(cfg.K_read, D) * cfg.pos_enc_scale
         self.register_buffer("pos_enc", pe, persistent=False)
 
     def forward(
@@ -233,20 +259,16 @@ class ReadTrajectoryGenerator(nn.Module):
             pos = self.pos_enc[: t + 1].unsqueeze(0).unsqueeze(1) # [1, 1, t+1, D]
             hist_kv = hist_kv + pos                               # broadcast
 
-            # history_attn: query = current_state ([BS, J, D]); kv per j.
-            # _CrossAttn supports [BS, *Q, ...] and [BS, *KV, ...] but each
-            # j has its own visited list, so we run J separate attentions
-            # by treating J as part of the leading shape and broadcasting.
-            history_attn_out = self._per_j_attn(
+            # history_attn: query per j attends over its own visited list.
+            history_attn_out = per_j_attn(
                 self.history_attn, current_state, hist_kv,
             )                                                     # [BS, J, D]
 
             # cross_attn: query per j attends over the same prev_window_hiddens.
-            # Broadcast prev_window_hiddens across J dim.
             prev_hid_bjt = prev_window_hiddens.unsqueeze(1).expand(
                 BS, J, T, d_lm,
             )
-            cross_attn_out = self._per_j_attn(
+            cross_attn_out = per_j_attn(
                 self.cross_attn, current_state, prev_hid_bjt,
             )                                                     # [BS, J, D]
 
@@ -277,27 +299,3 @@ class ReadTrajectoryGenerator(nn.Module):
         visited = torch.stack(visited_list, dim=2)                # [BS, J, K, D]
         visited_ids = torch.stack(visited_id_list, dim=2)         # [BS, J, K]
         return visited, visited_ids
-
-    @staticmethod
-    def _per_j_attn(
-        attn_module: _CrossAttn, q: Tensor, kv: Tensor,
-    ) -> Tensor:
-        """Apply attention separately for each j in the J dim.
-
-        q:  [BS, J, D]
-        kv: [BS, J, NK, d_kv]
-
-        Returns: [BS, J, D]
-
-        Implementation: fold J into BS, apply attn, fold back. This is
-        the per-j-independent attention semantically — attn_module's
-        internal flatten won't accidentally mix across j because the
-        leading batch is now BS*J.
-        """
-        BS, J, D = q.shape
-        d_kv = kv.shape[-1]
-        NK = kv.shape[-2]
-        q_flat = q.reshape(BS * J, 1, D)
-        kv_flat = kv.reshape(BS * J, NK, d_kv)
-        out = attn_module(q_flat, kv_flat)                        # [BS*J, 1, D]
-        return out.reshape(BS, J, D)

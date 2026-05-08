@@ -23,6 +23,7 @@ from src.trajectory_memory.read_module import (
     _CrossAttn,
     gumbel_top1_ste,
     make_pos_enc,
+    per_j_attn,
 )
 
 
@@ -85,7 +86,8 @@ class WriteTrajectoryGenerator(nn.Module):
         self.mutation_scale = cfg.mutation_init_scale
 
         # Positional encoding for visited list inside trajectory.
-        pe = make_pos_enc(cfg.K_write + 1, D) * cfg.pos_enc_scale
+        # Size K_write: indexed up to pos_enc[:K_write] in the longest hop.
+        pe = make_pos_enc(cfg.K_write, D) * cfg.pos_enc_scale
         self.register_buffer("pos_enc", pe, persistent=False)
 
     def forward(
@@ -156,14 +158,14 @@ class WriteTrajectoryGenerator(nn.Module):
                 hist_kv = torch.stack(proposed_new_list, dim=2)   # [BS, J, t, D]
                 pos = self.pos_enc[:t].unsqueeze(0).unsqueeze(1)
                 hist_kv = hist_kv + pos
-            history_attn_out = self._per_j_attn(
+            history_attn_out = per_j_attn(
                 self.history_attn, current_state, hist_kv,
             )
 
             prev_hid_bjt = current_window_hiddens.unsqueeze(1).expand(
                 BS, J, T, d_lm,
             )
-            cross_attn_out = self._per_j_attn(
+            cross_attn_out = per_j_attn(
                 self.cross_attn, current_state, prev_hid_bjt,
             )
 
@@ -208,16 +210,3 @@ class WriteTrajectoryGenerator(nn.Module):
         new_states = manifold.write_states(prev_states, flat_ids, flat_proposed)
 
         return new_states, visited_ids, proposed
-
-    @staticmethod
-    def _per_j_attn(
-        attn_module: _CrossAttn, q: Tensor, kv: Tensor,
-    ) -> Tensor:
-        """Same per-j attention helper as in read_module."""
-        BS, J, D = q.shape
-        d_kv = kv.shape[-1]
-        NK = kv.shape[-2]
-        q_flat = q.reshape(BS * J, 1, D)
-        kv_flat = kv.reshape(BS * J, NK, d_kv)
-        out = attn_module(q_flat, kv_flat)
-        return out.reshape(BS, J, D)

@@ -6,11 +6,12 @@ Three tensors, all fixed size at construction:
     concept_states : [N, D_concept]   volatile content, mutates on writes
     edge_indices   : [N, K_max]       sparse adjacency, fixed at init
 
-`concept_states` is held as an `nn.Parameter` *buffer* — a plain Tensor
-that can receive gradient via paths that consume it AND can be mutated
-in place via `scatter_mean_states`. The functional `scatter_mean_states`
-returns a *new* tensor for cross-window TBPTT safety; the in-place
-`replace_states` swaps the buffer for inference / sequence reset.
+`concept_states` is held as a non-persistent buffer — a regular Tensor
+(not an nn.Parameter) that receives gradient via paths that consume it,
+and can be reset to `state_init` via `reset_states()`. Mutations during
+training writes go through the **functional** `scatter_mean_states`,
+which returns a NEW tensor — leaves the buffer intact for cross-window
+autograd safety.
 
 `state_init` is a learnable `[N, D_concept]` parameter that's the reset
 target — not zeros — so concept_i has SOME content correlated with its
@@ -150,8 +151,9 @@ class Manifold(nn.Module):
     it's activation-like state that:
       - receives gradient through paths that consume it (cross-attn keys,
         history attention, etc.),
-      - gets mutated in place by `replace_states` for inference / reset,
-      - gets mutated *functionally* by `scatter_mean_states` during writes
+      - is reset in place to `state_init` by `reset_states()` for new
+        sequences / inference sessions,
+      - is mutated *functionally* by `scatter_mean_states` during writes
         (returns a new tensor, leaves the buffer intact for cross-window
         autograd safety).
 
@@ -163,12 +165,13 @@ class Manifold(nn.Module):
         self.cfg = cfg
         N, D = cfg.N, cfg.D_concept
 
-        # concept_ids: routing keys. Trainable. Init like nn.Embedding.
+        # concept_ids: routing keys. Trainable. Init N(0, 1/sqrt(D)) per
+        # plan §2.1 — keeps QK matmul magnitudes well-scaled at init.
         gen_c = torch.Generator().manual_seed(cfg.seed_concepts)
+        ids_std = 1.0 / (D ** 0.5)
         ids_init = torch.empty(N, D)
-        # nn.Embedding default init: N(0, 1)
         with torch.no_grad():
-            ids_init.normal_(0.0, 1.0, generator=gen_c)
+            ids_init.normal_(0.0, ids_std, generator=gen_c)
         self.concept_ids = nn.Parameter(ids_init)
 
         # state_init: learnable "good seed" the manifold resets to. Init
