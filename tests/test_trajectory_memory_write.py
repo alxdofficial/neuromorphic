@@ -77,18 +77,26 @@ def test_write_module_visited_concepts_change():
     assert diffs > 1e-4, "visited concepts unchanged after write"
 
 
-def test_write_module_grad_flows():
-    """Gradient should flow into write module params and (optionally) into
-    state_init through the prev_states gather path."""
+def test_write_module_all_params_receive_gradient():
+    """Every named parameter in write_module must receive gradient.
+    Pre-Gumbel-STE-fix, step_mlp / entry_mlp / head_query / attn weights
+    dead-ended at integer indices (mutate_mlp got grad through the
+    scatter_mean path, but routing did not).
+    """
     cfg, m, _, cur_hid, surprise = _small_setup(BS=2)
     wm = WriteTrajectoryGenerator(cfg)
     prev_states = m.reset_states(batch_size=2)
     new_states, _, _ = wm(cur_hid, surprise, prev_states, m, hard=True)
     new_states.sum().backward()
-    wm_grads = [p.grad for p in wm.parameters() if p.grad is not None]
-    assert len(wm_grads) > 0
-    # state_init should also pick up grad via prev_states
+
+    missing = [n for n, p in wm.named_parameters() if p.grad is None]
+    assert not missing, (
+        f"these write_module params got no gradient (routing dead-end?): {missing}"
+    )
     assert m.state_init.grad is not None
+    assert m.concept_ids.grad is not None, (
+        "concept_ids got no gradient — Q·K_id path dead-ended?"
+    )
 
 
 def test_write_module_concept_states_buffer_unchanged():

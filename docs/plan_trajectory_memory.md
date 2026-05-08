@@ -1,10 +1,13 @@
 # Trajectory-Memory LM: design, implementation plan, training notes
 
-**Status:** design draft, no code yet.
-**Branch:** `explore` (forked from `main` @ d873b9c).
-**Lineage:** refactor of the per-token `graph_walker` architecture on `main`.
-The persistent walker, neuromodulator, per-token routing, edge weights, and
-Hebbian plasticity all go away. Plasticity surface reduces to one channel:
+**Status:** v1 implementation landed on `main`. Tests + smoke runs pending in a
+torch-enabled environment; design notes here remain authoritative for the
+architecture (deviations should be documented as "implementation note" or
+fixed in code).
+**Lineage:** refactor of the per-token `graph_walker` architecture, which
+is now archived on the `abandoned/graph-walker` branch. The persistent
+walker, neuromodulator, per-token routing, edge weights, and Hebbian
+plasticity all go away. Plasticity surface reduces to one channel:
 concept-state mutation during writes.
 
 This doc is self-contained — someone picking it up cold should be able to
@@ -1013,9 +1016,13 @@ reuse:
   W4 — reused directly for our Wave 2 and Wave 4.
 - `grpo_session_step` — reused for Wave 3 and Wave 4.
 
-Old graph_walker stays on `main` as the production lineage during this
-exploration. If trajectory-memory wins, promote `explore` → `main` and
-archive graph_walker under `abandoned/`.
+Trajectory-memory has been promoted to `main`. The earlier graph_walker
+production state is preserved on `abandoned/graph-walker` (commit 3b69366);
+all graph_walker / column_graph / model / pretrained-extras code was
+removed from `main` in the post-promotion purge. To inspect or revive
+graph_walker's plumbing (e.g., to port `session_to_turn_pairs`,
+length-bucket batching, or `grpo_session_step` for the trainer scaffold),
+check out `abandoned/graph-walker`.
 
 ### 6.5 Evaluation suite
 

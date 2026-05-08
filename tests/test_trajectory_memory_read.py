@@ -54,11 +54,30 @@ def test_gumbel_top1_train_one_hot_forward():
 
 
 def test_gumbel_top1_train_grad_flows():
+    """Backprop through the STE one_hot must reach logits. Use a
+    non-constant downstream (one_hot · target) — `one_hot.sum()` would
+    be constant=BS (softmax rows sum to 1) and trivially zero-gradient."""
+    torch.manual_seed(0)
     logits = torch.randn(4, 8, requires_grad=True)
+    target = torch.randn(4, 8)
     one_hot, _ = gumbel_top1_ste(logits, tau=1.0, hard=True)
-    one_hot.sum().backward()
+    loss = (one_hot * target).sum()
+    loss.backward()
     assert logits.grad is not None
     assert logits.grad.abs().sum() > 0
+
+
+def test_gumbel_top1_no_nan_in_training():
+    """Regression for the clamp_min precedence bug. Pre-fix, training-mode
+    Gumbel produced NaNs because `-torch.log(x).clamp_min(1e-20)` parses
+    as `-(torch.log(x).clamp_min(1e-20))` — clamps the negative log to
+    1e-20, then negates → log(-1e-20) = NaN."""
+    torch.manual_seed(0)
+    logits = torch.randn(16, 32, requires_grad=True)
+    one_hot, idx = gumbel_top1_ste(logits, tau=1.0, hard=True)
+    assert torch.isfinite(one_hot).all(), "Gumbel produced NaN one_hot"
+    one_hot.sum().backward()
+    assert torch.isfinite(logits.grad).all(), "Gumbel produced NaN gradient"
 
 
 # ── ReadTrajectoryGenerator ─────────────────────────────────────────────
@@ -73,8 +92,8 @@ def test_read_module_construct():
     assert rm.history_attn is not None
     assert rm.cross_attn is not None
     assert rm.step_mlp is not None
-    # pos_enc buffer
-    assert rm.pos_enc.shape == (cfg.K_read + 1, cfg.D_concept)
+    # pos_enc buffer (size K_read — indexed pos_enc[:K_read] in longest hop)
+    assert rm.pos_enc.shape == (cfg.K_read, cfg.D_concept)
 
 
 def test_read_module_forward_shapes_inference():
@@ -95,22 +114,28 @@ def test_read_module_forward_shapes_train():
     assert visited.shape == (2, cfg.J, cfg.K_read, cfg.D_concept)
 
 
-def test_read_module_grad_flows_to_states_and_module():
-    """Gradient should flow to: read_module params, manifold.concept_ids,
-    and the per-batch states tensor."""
+def test_read_module_all_params_receive_gradient():
+    """Every named parameter in read_module must receive non-None gradient.
+    Routing differentiability via Gumbel-STE one_hot is the load-bearing
+    mechanism — if one_hot is discarded (bug 1), step_mlp / entry_mlp /
+    head_query / attn weights all dead-end at integer indices.
+    """
     cfg, m, _, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    states = m.reset_states(batch_size=2)  # carries grad to state_init
-
+    states = m.reset_states(batch_size=2)
     visited, _ = rm(prev_hid, states, m, hard=True)
     visited.sum().backward()
 
-    # rm parameters should have gradient
-    rm_grads = [p.grad for p in rm.parameters() if p.grad is not None]
-    assert len(rm_grads) > 0, "no gradient flowed into read module"
-    # concept_ids may or may not have gradient (only flows via QK matmul);
-    # state_init definitely should (states gather → visited)
+    missing = [n for n, p in rm.named_parameters() if p.grad is None]
+    assert not missing, (
+        f"these read_module params got no gradient (routing dead-end?): {missing}"
+    )
+    # state_init flows via the soft-gather of current_states.
     assert m.state_init.grad is not None
+    # concept_ids flows via Q · concept_ids in entry-point + per-hop scoring.
+    assert m.concept_ids.grad is not None, (
+        "concept_ids got no gradient — Q·K_id path dead-ended?"
+    )
 
 
 def test_read_module_does_not_mutate_concept_states():
@@ -141,21 +166,23 @@ def test_read_module_visited_states_match_states_at_visited_ids():
 
 
 def test_read_module_j_trajectories_diverge():
-    """Different head_queries should produce different trajectories
-    (mostly). With J=2 and small N, some collision is possible but not all
-    visits should be identical."""
+    """Different head_queries should produce different trajectories.
+    Tested in both inference (argmax) and training (Gumbel) modes.
+    Earlier head_query std=0.02 collapsed all J to identical paths
+    because pooled prev_hiddens dominated."""
     cfg = TrajMemConfig.small()
-    cfg.J = 4  # bump to make collision unlikely
+    cfg.J = 4
     cfg.validate()
     m = Manifold(cfg)
     states = m.reset_states(batch_size=1)
     prev_hid = torch.randn(1, cfg.T_window, cfg.d_lm)
     rm = ReadTrajectoryGenerator(cfg)
-    _, vids = rm(prev_hid, states, m, hard=False)
-    # vids: [1, J, K]. Across the J trajectories, at least some hops
-    # should differ.
-    flattened = vids[0].tolist()                                   # [J, K]
-    distinct_paths = len({tuple(p) for p in flattened})
-    assert distinct_paths >= 2, (
-        f"all J={cfg.J} trajectories produced the same path: {flattened}"
-    )
+    for hard in (False, True):
+        torch.manual_seed(42)
+        _, vids = rm(prev_hid, states, m, hard=hard)
+        flattened = vids[0].tolist()                              # [J, K]
+        distinct_paths = len({tuple(p) for p in flattened})
+        assert distinct_paths >= 2, (
+            f"hard={hard}: all J={cfg.J} trajectories produced the same path: "
+            f"{flattened}"
+        )

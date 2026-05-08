@@ -50,9 +50,10 @@ class WriteTrajectoryGenerator(nn.Module):
         d_lm = cfg.d_lm
 
         # J head queries — separate from read's, since these specialize
-        # for encoding (not retrieval).
+        # for encoding (not retrieval). std=1.0 to differentiate trajectories
+        # at init (see read_module for rationale).
         self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=0.02)
+        nn.init.normal_(self.head_query, std=1.0)
 
         # Entry-point MLP: takes pooled current_hiddens (d_lm) + head_query (D)
         # + surprise (1) → query in id-space (D).
@@ -121,7 +122,6 @@ class WriteTrajectoryGenerator(nn.Module):
         assert prev_states.shape == (BS, N, D)
         assert surprise.shape == (BS,), f"surprise shape {surprise.shape} != ({BS},)"
 
-        surprise_b = surprise.view(BS, 1, 1)                      # [BS, 1, 1]
         surprise_bj = surprise.view(BS, 1).expand(BS, J).unsqueeze(-1)  # [BS, J, 1]
 
         # ── 1. Entry-point selection ──────────────────────────────────
@@ -133,11 +133,16 @@ class WriteTrajectoryGenerator(nn.Module):
 
         ids = manifold.concept_ids
         entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)
-        _, entry_idx = gumbel_top1_ste(entry_logits, cfg.gumbel_tau, hard=hard)
+        entry_one_hot, entry_idx = gumbel_top1_ste(
+            entry_logits, cfg.gumbel_tau, hard=hard,
+        )                                                         # [BS, J, N], [BS, J]
 
         # ── 2. K_write hops + mutation proposals ─────────────────────
-        current = entry_idx                                       # [BS, J]
-        current_state = manifold.gather_states(prev_states, current)
+        current = entry_idx                                       # [BS, J] int
+        # Differentiable initial-state gather via entry one-hot.
+        current_state = torch.einsum(
+            "bjn,bnd->bjd", entry_one_hot, prev_states,
+        )                                                         # [BS, J, D]
 
         proposed_new_list: list[Tensor] = []         # mutated states (used for both history_attn and scatter)
         visited_id_list: list[Tensor] = []
@@ -179,27 +184,31 @@ class WriteTrajectoryGenerator(nn.Module):
             nbr_idx = manifold.get_neighbor_indices(current)
             nbr_ids = manifold.concept_ids[nbr_idx]               # [BS, J, K_max, D]
             nbr_logits = torch.einsum("bjd,bjkd->bjk", Q_t, nbr_ids)
-            _, next_local = gumbel_top1_ste(
+            nbr_one_hot, next_local = gumbel_top1_ste(
                 nbr_logits, cfg.gumbel_tau, hard=hard,
-            )
+            )                                                     # [BS, J, K_max], [BS, J]
             next_global = torch.gather(
                 nbr_idx, dim=2, index=next_local.unsqueeze(-1),
-            ).squeeze(-1)
+            ).squeeze(-1)                                         # [BS, J]
 
-            # mutate_write — proposed new state for this concept.
-            mutate_input = torch.cat(
-                [current_state, history_attn_out, cross_attn_out, surprise_bj],
-                dim=-1,
-            )
-            delta = self.mutate_mlp(mutate_input)                 # [BS, J, D]
+            # mutate_write — proposed new state for the *current* concept.
+            # Same input as step_mlp; compute once.
+            delta = self.mutate_mlp(step_input)                   # [BS, J, D]
             new_state = current_state + self.mutation_scale * delta  # [BS, J, D]
 
             visited_id_list.append(current)
             proposed_new_list.append(new_state)
 
-            # Move to next concept, fetch its raw (pre-mutation) state.
-            current = next_global
-            current_state = manifold.gather_states(prev_states, current)
+            # Move to next concept; differentiable soft gather over the
+            # neighbors of `current` by the Gumbel-STE one-hot. Gradient
+            # flows back to nbr_logits → Q_t → step_mlp.
+            current = next_global                                 # int, for next neighbor lookup
+            nbr_states_full = manifold.gather_states(
+                prev_states, nbr_idx,
+            )                                                     # [BS, J, K_max, D]
+            current_state = torch.einsum(
+                "bjk,bjkd->bjd", nbr_one_hot, nbr_states_full,
+            )                                                     # [BS, J, D]
 
         proposed = torch.stack(proposed_new_list, dim=2)          # [BS, J, K, D]
         visited_ids = torch.stack(visited_id_list, dim=2)         # [BS, J, K]

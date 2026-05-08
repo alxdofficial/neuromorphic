@@ -67,7 +67,13 @@ def gumbel_top1_ste(
         u = torch.rand_like(logits)
     else:
         u = torch.empty_like(logits).uniform_(0.0, 1.0, generator=generator)
-    g = -torch.log(-torch.log(u.clamp_min(1e-20)).clamp_min(1e-20))
+    # NB: parens are load-bearing. `-torch.log(x).clamp_min(1e-20)` parses as
+    # `-(torch.log(x).clamp_min(1e-20))`, which clamps the *negative* log to
+    # 1e-20 (i.e. all values become 1e-20), then negates → all `-1e-20` →
+    # `log(-1e-20)` = NaN. We need to clamp AFTER negating.
+    log_u = torch.log(u.clamp_min(1e-20))                # in (-46, 0]
+    neg_log_u = (-log_u).clamp_min(1e-20)                # positive
+    g = -torch.log(neg_log_u)                            # standard Gumbel(0,1)
     y = (logits + g) / tau
     soft = F.softmax(y, dim=-1)
     idx = soft.argmax(dim=-1)
@@ -163,9 +169,12 @@ class ReadTrajectoryGenerator(nn.Module):
         D = cfg.D_concept
         d_lm = cfg.d_lm
 
-        # J head queries to differentiate the parallel trajectories.
+        # J head queries to differentiate the parallel trajectories. Init
+        # large enough to dominate the pooled-hidden term in the entry MLP
+        # so the J trajectories don't collapse to identical paths at init.
+        # std=1.0 mirrors the magnitude of the projected pooled term.
         self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=0.02)
+        nn.init.normal_(self.head_query, std=1.0)
 
         # Entry-point MLP: takes pooled prev_hiddens (d_lm) + head_query (D)
         # and produces a query in concept-id space (D).
@@ -233,13 +242,20 @@ class ReadTrajectoryGenerator(nn.Module):
         # concept_ids: [N, D] → broadcast over BS, J.
         ids = manifold.concept_ids                                # [N, D]
         entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)  # [BS, J, N]
-        _, entry_idx = gumbel_top1_ste(entry_logits, cfg.gumbel_tau, hard=hard)
-        # entry_idx: [BS, J] int64
+        entry_one_hot, entry_idx = gumbel_top1_ste(
+            entry_logits, cfg.gumbel_tau, hard=hard,
+        )                                                         # [BS, J, N], [BS, J]
 
         # ── 2. K_read autoregressive hops ────────────────────────────
-        current = entry_idx                                       # [BS, J]
-        # Gather initial states. current_state: [BS, J, D].
-        current_state = manifold.gather_states(current_states, current)
+        current = entry_idx                                       # [BS, J] int (for next neighbor lookup)
+        # Gather initial state via the one-hot mixture so gradient flows
+        # back to entry_logits → entry_mlp → head_query.
+        # entry_one_hot: [BS, J, N]; current_states: [BS, N, D] → [BS, J, D].
+        # In forward, one_hot is one-hot, so this picks current_states[entry_idx];
+        # in backward, gradient flows via the soft probs (Gumbel-STE).
+        current_state = torch.einsum(
+            "bjn,bnd->bjd", entry_one_hot, current_states,
+        )                                                         # [BS, J, D]
 
         # Pre-allocate visited list. We accumulate via list-append for
         # readability; could be replaced with a pre-allocated tensor for
@@ -284,17 +300,26 @@ class ReadTrajectoryGenerator(nn.Module):
             nbr_logits = torch.einsum(
                 "bjd,bjkd->bjk", Q_t, nbr_ids,
             )                                                     # [BS, J, K_max]
-            _, next_local = gumbel_top1_ste(
+            nbr_one_hot, next_local = gumbel_top1_ste(
                 nbr_logits, cfg.gumbel_tau, hard=hard,
-            )                                                     # [BS, J] in [0, K_max)
+            )                                                     # [BS, J, K_max], [BS, J]
 
-            # Map local neighbor index to absolute concept id.
+            # Map local neighbor index to absolute concept id (int, for next
+            # iter's neighbor lookup).
             next_global = torch.gather(
                 nbr_idx, dim=2, index=next_local.unsqueeze(-1),
             ).squeeze(-1)                                         # [BS, J]
-
             current = next_global
-            current_state = manifold.gather_states(current_states, current)
+
+            # Differentiable next-state: soft gather over neighbor states by
+            # the Gumbel-STE one-hot. Gradient flows back to nbr_logits →
+            # Q_t → step_mlp / history_attn / cross_attn / current_state.
+            nbr_states_full = manifold.gather_states(
+                current_states, nbr_idx,
+            )                                                     # [BS, J, K_max, D]
+            current_state = torch.einsum(
+                "bjk,bjkd->bjd", nbr_one_hot, nbr_states_full,
+            )                                                     # [BS, J, D]
 
         visited = torch.stack(visited_list, dim=2)                # [BS, J, K, D]
         visited_ids = torch.stack(visited_id_list, dim=2)         # [BS, J, K]

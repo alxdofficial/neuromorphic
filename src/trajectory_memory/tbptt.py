@@ -11,12 +11,16 @@ plan §4.3.
 
 Usage:
     chunks = TBPTTChunker(cfg).split(input_ids)   # [num_chunks, D, T_window]
+    prev_states, prev_hiddens, prev_lm_ctx = None, None, None
     for chunk in chunks:
-        result = run_chunk(integrated_lm, chunk, prev_states, prev_hiddens)
+        result = run_chunk(
+            integrated_lm, chunk, prev_states, prev_hiddens, prev_lm_ctx,
+        )
         loss = result["aggregate_loss"]
         loss.backward()
-        prev_states = result["final_states"].detach()  # cut grad
+        prev_states = result["final_states"].detach()              # cut grad
         prev_hiddens = result["final_hiddens"].detach()
+        prev_lm_ctx = result["final_lm_context"]                   # already detached
 """
 
 from __future__ import annotations
@@ -67,11 +71,17 @@ def run_chunk(
     windows: Tensor,
     prev_states: Tensor,
     prev_window_hiddens: Tensor | None,
+    prev_lm_context: Tensor | None,
     *,
     target_mask: Tensor | None = None,
     hard_routing: bool = True,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
+
+    Maintains a rolling LM-context buffer of up to `cfg.effective_lm_context`
+    tokens. At each window, Llama sees the rolling buffer + the new window's
+    tokens (truncated to the cap); we only compute surprise on the new
+    window's positions (see plan §4.1).
 
     Args:
         model:               IntegratedLM
@@ -79,52 +89,77 @@ def run_chunk(
         prev_states:         [BS, N, D_concept] state at start of chunk
         prev_window_hiddens: [BS, T_window, d_lm] from window before this
                              chunk, or None if chunk starts a new sequence.
-        target_mask:         [BS, D, T_window] or None
+        prev_lm_context:     [BS, L] tokens from before this chunk, used as
+                             rolling LM context (no gradient — Llama is
+                             frozen and gradient cuts at chunk boundary
+                             anyway). None at sequence start.
+        target_mask:         [BS, D, T_window] or None — per-window mask
+                             over the CURRENT window's tokens for surprise.
         hard_routing:        Gumbel-STE if True
 
     Returns:
         dict with keys:
-            window_outputs:   list of D forward_window outputs
-            aggregate_loss:   scalar loss summed over windows (NTP CE)
-            final_states:     [BS, N, D_concept] state after last window
-            final_hiddens:    [BS, T_window, d_lm] hiddens of last window
-            surprise_history: [BS, D] surprise per window
+            window_outputs:    list of D forward_window outputs
+            aggregate_loss:    scalar loss summed over windows (NTP CE)
+            final_states:      [BS, N, D_concept] state after last window
+            final_hiddens:     [BS, T_window, d_lm] hiddens of last window
+            final_lm_context:  [BS, L] rolling buffer for next chunk's
+                               first-window LM context
+            surprise_history:  [BS, D] surprise per window
     """
     BS, D, T = windows.shape
     assert D == model.cfg.D, f"chunk has D={D}, expected {model.cfg.D}"
+    cfg = model.cfg
+    cap = cfg.effective_lm_context
 
     states = prev_states
     cur_prev_hiddens = prev_window_hiddens
+    # Rolling LM-context buffer. Tokens here are not in the autograd graph.
+    if prev_lm_context is None:
+        lm_buffer = torch.empty(BS, 0, dtype=windows.dtype, device=windows.device)
+    else:
+        lm_buffer = prev_lm_context.detach()                       # ensure no grad
 
     outputs: list[dict] = []
     losses: list[Tensor] = []
     surprises: list[Tensor] = []
 
     for d in range(D):
-        win_input = windows[:, d, :]                              # [BS, T_window]
+        win_input = windows[:, d, :]                               # [BS, T_window]
         win_mask = target_mask[:, d, :] if target_mask is not None else None
+
+        # Build the full LM input: rolling buffer + current window, capped.
+        lm_input_ids = torch.cat([lm_buffer, win_input], dim=1)
+        if lm_input_ids.shape[1] > cap:
+            lm_input_ids = lm_input_ids[:, -cap:]
+
         out = model.forward_window(
-            input_ids=win_input,
+            lm_input_ids=lm_input_ids,
             prev_window_hiddens=cur_prev_hiddens,
             prev_states=states,
             target_mask=win_mask,
             hard_routing=hard_routing,
         )
         outputs.append(out)
-        losses.append(out["surprise"].sum())                      # NTP CE summed across batch
+        losses.append(out["surprise"].sum())                       # NTP CE summed across batch
         surprises.append(out["surprise"])
 
         # Carry forward into next window.
         states = out["new_states"]
         cur_prev_hiddens = out["current_hiddens"]
+        # Buffer for next window's LM input — at most (cap - T_window)
+        # tokens, since each forward will append the next window of
+        # T_window tokens before truncation.
+        lm_buffer = lm_input_ids[:, -(cap - T):] if cap > T else lm_input_ids[:, :0]
 
-    aggregate_loss = torch.stack(losses).sum()                    # scalar
-    surprise_history = torch.stack(surprises, dim=1)              # [BS, D]
+    aggregate_loss = torch.stack(losses).sum()                     # scalar
+    surprise_history = torch.stack(surprises, dim=1)               # [BS, D]
 
     return {
         "window_outputs": outputs,
         "aggregate_loss": aggregate_loss,
         "final_states": states,
         "final_hiddens": cur_prev_hiddens,
+        "final_lm_context": lm_buffer,
         "surprise_history": surprise_history,
     }
