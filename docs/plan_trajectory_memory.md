@@ -1300,8 +1300,12 @@ during backward.
 1. **bf16 + FlashAttention on Llama** — should be standard; confirm on.
 2. **Llama-block gradient checkpointing** — required to fit D=4+ at
    BS≥2 on 24 GB. Standard PyTorch utility.
-3. **`torch.compile` on trajectory hop module** — hot small function;
-   likely 1.5–2× speedup on hop dispatch. Low engineering cost.
+3. **Regional + dynamic `torch.compile` on the trajectory hop module** —
+   hot small function with predictable shapes; likely 1.5–2× speedup on
+   hop dispatch. Low engineering cost. Match graph_walker's existing
+   compile pattern (`compile_walk_block`-style regional compile with
+   `dynamic=True` so varying BS / window contexts don't trigger
+   recompilation; useful for fast benching across configs).
 4. **Sliding KV cache for Llama context** — replaces hard truncation.
    ~10–20% throughput win for long-doc Wave 1. Implementation: medium
    (KV invalidation logic).
@@ -1309,7 +1313,24 @@ during backward.
 6. **Constant-in-D autograd** — fallback for large D if linear-in-D
    OOMs; sizable engineering cost.
 7. **Triton-fused hop kernel** — only if profiling shows dispatch is
-   the bottleneck. Probably premature.
+   the bottleneck. Almost certainly premature for v1 (see note below).
+
+**Note on custom Triton kernels — not needed for v1.** graph_walker
+required custom Triton (dendritic gather, fused per-token plasticity)
+for two architecture-specific reasons that do not apply here:
+
+- Per-token sequential dispatch produced ~20K-40K kernel launches per
+  step; torch.compile couldn't fuse across iterations because of the
+  per-token dependency chain.
+- The dendritic gather kernel avoided materializing a `[BS, N, K, D]`
+  intermediate — a memory-bandwidth problem, not just launch overhead.
+
+Our trajectory architecture has neither: per-step dispatch is ~50× less
+(per-window hop sequence instead of per-token), and the biggest tensor
+we touch is `concept_states[N, D_concept]` ≈ 2048×256, trivial. Regional
+`torch.compile` on the hop module should suffice — Triton stays as an
+"if profiling tells you to" v2 option, not a v1 requirement. This is a
+real architectural simplification worth not paying for prematurely.
 
 ### 10.5 Compared to graph_walker
 
