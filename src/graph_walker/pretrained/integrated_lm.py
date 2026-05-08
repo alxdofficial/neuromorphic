@@ -321,87 +321,45 @@ class IntegratedLM(nn.Module):
     # Per-batch state snapshot / restore (multi-turn GRPO support)
     # ------------------------------------------------------------------
 
+    # Class B working state, snapshotted at turn boundaries by multi-turn
+    # GRPO so K rollouts can diverge then the canonical batch state can be
+    # restored before advancing through the ground-truth turn.
+    #
+    # NOT saved (long-term Class A — keeps evolving across the session):
+    # `E_bias_flat`, `_neuromod_input_*`, `_active_neuromod_delta`.
+    _SNAPSHOT_TENSOR_FIELDS = (
+        "s", "walker_pos", "walker_state", "surprise_ema",
+        "co_visit_flat", "visit_count", "_log_pi_sum",
+    )
+    _SNAPSHOT_INT_FIELDS = ("_log_pi_count", "tick_counter", "window_len")
+
     def snapshot_memory_state(self) -> dict | None:
-        """Snapshot the walker's PER-BATCH working state for later
-        restoration. Used by multi-turn GRPO's aligned-trajectory
-        protocol: snapshot at turn boundary, K rollouts diverge, restore
-        before forwarding the ground-truth turn to advance the canonical
-        state.
-
-        What's saved:
-        - `s` (LIF state per column)
-        - `walker_pos`, `walker_state`
-        - `surprise_ema`
-        - `_log_pi_sum`, `_log_pi_count` (phase-2 routing log-π accumulator)
-        - `tick_counter`, `window_len` (segment-level counters)
-        - `co_visit_flat`, `visit_count` (per-segment counters)
-
-        What's NOT saved (keeps evolving across the whole session):
-        - `E_bias_flat` (long-term plastic state)
-        - `_neuromod_input_*` (neuromod cross-window snapshots)
-        - `_active_neuromod_delta` (current window's neuromod delta — this
-          IS captured indirectly via _neuromod_input's lifecycle, but
-          would need an explicit save if cross-rollout consistency is
-          ever needed)
-
-        Returns None if memory is detached. Returned dict's tensors are
-        clones (independent of the walker's live tensors). The caller
-        owns the dict.
-        """
-        if self.memory is None:
-            return None
+        """Returns None if memory is detached. Tensor fields are cloned
+        (independent of the walker's live tensors). The caller owns the
+        dict."""
         m = self.memory
-        if not getattr(m, "_state_initialized", False):
+        if m is None or not getattr(m, "_state_initialized", False):
             return None
-
-        def _clone_or_none(x):
-            return x.clone() if isinstance(x, torch.Tensor) else None
-
-        return {
-            "s": _clone_or_none(m.s),
-            "walker_pos": _clone_or_none(m.walker_pos),
-            "walker_state": _clone_or_none(m.walker_state),
-            "surprise_ema": _clone_or_none(m.surprise_ema),
-            "_log_pi_sum": _clone_or_none(m._log_pi_sum),
-            "_log_pi_count": int(m._log_pi_count),
-            "tick_counter": int(m.tick_counter),
-            "window_len": int(m.window_len),
-            "co_visit_flat": _clone_or_none(m.co_visit_flat),
-            "visit_count": _clone_or_none(m.visit_count),
-        }
+        snap: dict = {}
+        for name in self._SNAPSHOT_TENSOR_FIELDS:
+            v = getattr(m, name, None)
+            snap[name] = v.clone() if isinstance(v, torch.Tensor) else None
+        for name in self._SNAPSHOT_INT_FIELDS:
+            snap[name] = int(getattr(m, name, 0))
+        return snap
 
     def restore_memory_state(self, state: dict | None) -> None:
-        """Restore a snapshot from `snapshot_memory_state`. The walker's
-        per-batch working state is overwritten from clones of the
-        snapshot's tensors (so a subsequent forward doesn't mutate the
-        snapshot itself).
-
-        Long-term plastic state (E_bias_flat, _neuromod_input_*) is NOT
-        touched — it keeps evolving on its own update cadence.
-        """
+        """Restore a snapshot from `snapshot_memory_state`. Long-term
+        plastic state (`E_bias_flat`, `_neuromod_input_*`) is not
+        touched — it keeps evolving on its own update cadence."""
         if state is None or self.memory is None:
             return
         m = self.memory
-
-        def _restore(name):
+        for name in self._SNAPSHOT_TENSOR_FIELDS:
             v = state.get(name)
-            if isinstance(v, torch.Tensor):
-                setattr(m, name, v.clone())
-
-        _restore("s")
-        _restore("walker_pos")
-        _restore("walker_state")
-        _restore("surprise_ema")
-        _restore("co_visit_flat")
-        _restore("visit_count")
-        # log_pi sum: tensor or None
-        log_pi_sum = state.get("_log_pi_sum")
-        m._log_pi_sum = (
-            log_pi_sum.clone() if isinstance(log_pi_sum, torch.Tensor) else None
-        )
-        m._log_pi_count = int(state.get("_log_pi_count", 0))
-        m.tick_counter = int(state.get("tick_counter", 0))
-        m.window_len = int(state.get("window_len", 0))
+            setattr(m, name, v.clone() if isinstance(v, torch.Tensor) else None)
+        for name in self._SNAPSHOT_INT_FIELDS:
+            setattr(m, name, int(state.get(name, 0)))
 
     # ------------------------------------------------------------------
     # Persistent-state save/load (for checkpoint resume)
@@ -425,6 +383,12 @@ class IntegratedLM(nn.Module):
     # under-trains the meta-learning component until the first
     # plasticity event after resume re-populates them.
 
+    _PERSISTENT_TENSOR_FIELDS = (
+        "_neuromod_input_ids",
+        "_neuromod_input_feats",
+        "_neuromod_input_co_visit_flat",
+    )
+
     def persistent_walker_state(self) -> dict:
         """Return the long-term walker state that should survive a
         training restart. Pair with `load_persistent_walker_state` at
@@ -432,15 +396,9 @@ class IntegratedLM(nn.Module):
         m = self.memory
         if m is None:
             return {}
-
-        def _clone_or_none(x):
-            return x.clone() if isinstance(x, torch.Tensor) else None
-
         return {
-            "_neuromod_input_ids": _clone_or_none(m._neuromod_input_ids),
-            "_neuromod_input_feats": _clone_or_none(m._neuromod_input_feats),
-            "_neuromod_input_co_visit_flat":
-                _clone_or_none(m._neuromod_input_co_visit_flat),
+            name: (v.clone() if isinstance(v := getattr(m, name, None), torch.Tensor) else None)
+            for name in self._PERSISTENT_TENSOR_FIELDS
         }
 
     def load_persistent_walker_state(self, state: dict | None) -> None:
@@ -451,15 +409,10 @@ class IntegratedLM(nn.Module):
         if state is None or self.memory is None:
             return
         m = self.memory
-
-        def _restore(name):
+        for name in self._PERSISTENT_TENSOR_FIELDS:
             v = state.get(name)
             if isinstance(v, torch.Tensor):
                 setattr(m, name, v.clone())
-
-        _restore("_neuromod_input_ids")
-        _restore("_neuromod_input_feats")
-        _restore("_neuromod_input_co_visit_flat")
 
     # ------------------------------------------------------------------
     # Forward
