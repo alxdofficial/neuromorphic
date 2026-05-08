@@ -1767,30 +1767,42 @@ class GraphWalkerMemory(nn.Module):
     def accumulate_block_ce(
         self,
         ce_block: torch.Tensor,      # [B, T_block, K_h] — per-position per-horizon CE
-        valid_mask: torch.Tensor,    # [T_block, K_h] — True where target exists
+        valid_mask: torch.Tensor,    # [T_block, K_h] (shared) or [B, T_block, K_h] (per-row)
     ) -> None:
         """Stream the training flush's CE tensor into `surprise_ema`.
 
-        Replaces the old "re-run readout at window close" path. The training
-        loop already computes CE for every valid (position, horizon) pair in
-        the just-finished TBPTT block; that is exactly what surprise needs.
         Per horizon, apply the EMA recurrence
             surprise_ema[:, k] ← (1-α)·surprise_ema[:, k] + α·ce_block[:, i, k]
-        in token order, skipping positions where the target was masked out
-        (segment-boundary tail). T_block is small (≤ mod_period = 48–128),
-        so the Python loop overhead is negligible vs one dense readout call.
+        in token order, skipping positions where ``valid_mask`` is False.
+
+        ``valid_mask`` may be 2-D (``[T_block, K_h]``, shared across the
+        batch — used by the standalone walker for tail-padding masks) or
+        3-D (``[B, T_block, K_h]``, per-row — used by chat-SFT to skip
+        the user/system positions that the assistant mask zeroed out).
         """
         alpha = self.cfg.alpha_gamma_s
-        T_block, K_h = valid_mask.shape
+        if valid_mask.ndim == 2:
+            T_block, K_h = valid_mask.shape
+            valid_bool = valid_mask.bool().unsqueeze(0)     # [1, T_block, K_h]
+        elif valid_mask.ndim == 3:
+            B_v, T_block, K_h = valid_mask.shape
+            valid_bool = valid_mask.bool()
+            assert ce_block.shape[0] == B_v, (
+                f"ce_block batch {ce_block.shape[0]} != valid_mask batch {B_v}"
+            )
+        else:
+            raise ValueError(
+                f"valid_mask must be 2-D [T,K_h] or 3-D [B,T,K_h]; got shape "
+                f"{tuple(valid_mask.shape)}"
+            )
         assert ce_block.shape[1:] == (T_block, K_h), (
             f"ce_block shape {tuple(ce_block.shape)} mismatches valid_mask "
-            f"shape {tuple(valid_mask.shape)}"
+            f"T/K_h ({T_block}, {K_h})"
         )
         ema = self.surprise_ema.float()
         ce_fp32 = ce_block.float()
-        valid_bool = valid_mask.bool()
         for i in range(T_block):
-            valid_i = valid_bool[i].unsqueeze(0)            # [1, K_h] bool
+            valid_i = valid_bool[:, i]                       # [1 or B, K_h]
             candidate = (1.0 - alpha) * ema + alpha * ce_fp32[:, i, :]
             ema = torch.where(valid_i, candidate, ema)
         self.surprise_ema = ema
@@ -1799,6 +1811,7 @@ class GraphWalkerMemory(nn.Module):
     def update_plasticity(
         self,
         per_token_surprise: torch.Tensor | None,
+        valid_mask: torch.Tensor | None = None,
     ) -> None:
         """Externally-driven plasticity update. Call AFTER `loss.backward()`.
 
@@ -1828,6 +1841,14 @@ class GraphWalkerMemory(nn.Module):
             current ``_active_neuromod_delta`` into ``E_bias_flat``, snapshot,
             reset window counters), then build the next window's neuromod
             delta with a fresh forward pass.
+
+        ``valid_mask`` (optional ``[B, T]`` bool): per-position gate on
+        whether each (batch, position) participates in the EMA. False
+        positions are skipped entirely — the EMA does NOT see them as
+        "low surprise" (which would be wrong for assistant-mask SFT,
+        where masked user/system tokens have CE=0 from
+        ``ignore_index=-100`` but are not real surprise events).
+        Default ``None`` is equivalent to all-True.
 
         Why a single fire per call rather than a fire per ``mod_period``
         block: under external-surprise mode all ``T`` forward steps in the
@@ -1865,11 +1886,19 @@ class GraphWalkerMemory(nn.Module):
             .expand(B_in, T_in, K_h)
             .float()
         )
-        valid_mask = torch.ones(
-            T_in, K_h, dtype=torch.bool, device=per_token_surprise.device,
-        )
+        if valid_mask is None:
+            mask_3d = torch.ones(
+                T_in, K_h, dtype=torch.bool, device=per_token_surprise.device,
+            )
+        else:
+            assert valid_mask.shape == (B_in, T_in), (
+                f"valid_mask shape {tuple(valid_mask.shape)} must match "
+                f"per_token_surprise [B, T] = ({B_in}, {T_in})"
+            )
+            # [B, T] -> [B, T, K_h] (K_h broadcast)
+            mask_3d = valid_mask.bool().unsqueeze(-1).expand(B_in, T_in, K_h)
         # Stream into surprise_ema in token order.
-        self.accumulate_block_ce(ce_block, valid_mask)
+        self.accumulate_block_ce(ce_block, mask_3d)
         # Fire plasticity, build next delta.
         # `_plasticity_step` resets `window_len`, `co_visit_flat`, and
         # `visit_count`; `_begin_plastic_window` produces a fresh

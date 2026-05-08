@@ -371,60 +371,65 @@ def main() -> None:
             "or gen_length, or pick a model with longer positional context."
         )
 
-    # ---- Phase-1 priming step ----
+    # ---- Phase-1 priming step (cold-start only) ----
     # Runtime state buffers (`_neuromod_input_ids/feats/co_visit_flat`) are
-    # not in the model state_dict, so a fresh-loaded model has them all
-    # set to None. The first GRPO step would then have `_active_neuromod_delta
-    # = None` and routing scores would have no gradient to neuromod
-    # → `log_pi_mean.requires_grad = False` → backward fails.
+    # not in the model state_dict. On a cold start they are None, so the
+    # first GRPO step has `_active_neuromod_delta = None`, routing scores
+    # don't carry neuromod gradient, and backward fails. Running ONE
+    # Phase-1 step here populates them.
     #
-    # Fix: run ONE phase-1 step BEFORE applying the phase-2 freeze, with
-    # the full trainable surface. This populates `_neuromod_input_*` so
-    # the first GRPO step's `_begin_plastic_window` rebuilds a non-None
-    # `_active_neuromod_delta` and routing carries gradient.
-    print("[setup] phase-1 priming pass (populates _neuromod_input_*)")
-    # lr=0.0 — the prime exists ONLY to run forward + plasticity so
-    # the neuromod's `_neuromod_input_*` snapshot gets populated. Zero
-    # LR means opt.step() runs but produces no parameter updates, so
-    # the resumed model state is preserved bit-for-bit. (The prior
-    # lr=1e-7 was a "tiny but nonzero" hedge that was unnecessary —
-    # zero is the cleanest answer.)
-    prime_opt = torch.optim.AdamW(
-        [p for _, p in model.trainable_parameters()],
-        lr=0.0,
-        fused=torch.cuda.is_available(),
-    )
-    prime_vocab = model.llama.config.vocab_size
-    prime_in = torch.randint(
-        0, prime_vocab, (1, args.T_pre), dtype=torch.long, device=device,
-    )
-    phase1_pretrained_step(
-        model, prime_opt,
-        Phase1Batch(input_ids=prime_in, target_ids=prime_in),
-        amp_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    )
-    del prime_opt, prime_in
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    # Verify priming actually populated _neuromod_input_* — without these,
-    # the next GRPO step's _begin_plastic_window can't rebuild
-    # _active_neuromod_delta and routing has no grad. Fail loud at setup
-    # rather than silently producing zero-signal training.
+    # IMPORTANT: skip when the buffers were already loaded from
+    # `walker_persistent` above. Priming with random tokens overwrites
+    # the resumed snapshot AND commits a random-token-derived neuromod
+    # delta into `E_bias_flat` — silently corrupting the long-term
+    # plastic state every resume. The opt has lr=0 so model weights
+    # don't move, but `update_plasticity` mutates `E_bias_flat`
+    # regardless of optimizer LR.
     mem = model.memory
-    if mem._neuromod_input_ids is None or mem._neuromod_input_feats is None:
-        raise RuntimeError(
-            "phase-1 priming pass did not populate _neuromod_input_*. "
-            "Plasticity may have been suppressed by the loaded checkpoint "
-            "config. Cannot start GRPO without a valid neuromod snapshot."
+    needs_priming = (
+        mem._neuromod_input_ids is None
+        or mem._neuromod_input_feats is None
+        or (mem.cfg.plasticity_mode == "neuromod_only"
+            and mem._neuromod_input_co_visit_flat is None)
+    )
+    if not needs_priming:
+        print(f"[setup] skipping phase-1 priming — _neuromod_input_* "
+              f"already populated from ckpt "
+              f"({int(mem._neuromod_input_ids.numel())} touched cols)")
+    else:
+        print("[setup] phase-1 priming pass (populates _neuromod_input_*)")
+        prime_opt = torch.optim.AdamW(
+            [p for _, p in model.trainable_parameters()],
+            lr=0.0,
+            fused=torch.cuda.is_available(),
         )
-    if (mem.cfg.plasticity_mode == "neuromod_only"
-            and mem._neuromod_input_co_visit_flat is None):
-        raise RuntimeError(
-            "neuromod_only mode requires _neuromod_input_co_visit_flat; "
-            "priming did not produce it (plasticity didn't fire?)."
+        prime_vocab = model.llama.config.vocab_size
+        prime_in = torch.randint(
+            0, prime_vocab, (1, args.T_pre), dtype=torch.long, device=device,
         )
-    print(f"[setup] priming done; _neuromod_input_ids has "
-          f"{int(mem._neuromod_input_ids.numel())} touched cols")
+        phase1_pretrained_step(
+            model, prime_opt,
+            Phase1Batch(input_ids=prime_in, target_ids=prime_in),
+            amp_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        )
+        del prime_opt, prime_in
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if mem._neuromod_input_ids is None or mem._neuromod_input_feats is None:
+            raise RuntimeError(
+                "phase-1 priming pass did not populate _neuromod_input_*. "
+                "Plasticity may have been suppressed by the loaded "
+                "checkpoint config. Cannot start GRPO without a valid "
+                "neuromod snapshot."
+            )
+        if (mem.cfg.plasticity_mode == "neuromod_only"
+                and mem._neuromod_input_co_visit_flat is None):
+            raise RuntimeError(
+                "neuromod_only mode requires _neuromod_input_co_visit_flat; "
+                "priming did not produce it (plasticity didn't fire?)."
+            )
+        print(f"[setup] priming done; _neuromod_input_ids has "
+              f"{int(mem._neuromod_input_ids.numel())} touched cols")
 
     # ---- Phase-2 trainable surface ----
     # Default = same as Phase-1: all walker params + MemInjectLayer
@@ -476,19 +481,34 @@ def main() -> None:
     # the model weights — silently changing training dynamics on
     # resume. Phase-1 ckpts won't have these keys; that's fine since
     # we only resume Phase 2 from a Phase 2 checkpoint.
+    # The `step` counter is only meaningful when paired with a Phase-2
+    # optimizer state — both are saved together by this script's own
+    # ckpt writer. Phase-1 ckpts (from train_pretrained_gw.py) ALSO
+    # carry a `step` field, but its value is the Phase-1 step counter,
+    # not Phase 2's. Loading it unconditionally would silently make a
+    # Phase-2 run resume at an arbitrary high step (potentially past
+    # max_steps → no training). Use successful optimizer load as the
+    # marker that this is a Phase-2 resume.
     start_step = 0
+    opt_loaded = False
     if "opt" in ckpt:
         try:
             opt.load_state_dict(ckpt["opt"])
+            opt_loaded = True
             print("[setup] resumed optimizer state (AdamW moments)")
         except (ValueError, RuntimeError) as e:
             # Trainable surface mismatch (e.g., resuming a "minimum"
-            # ckpt under "phase1" mode). Skip and warn.
+            # ckpt under "phase1" mode, or resuming Phase 2 from a
+            # Phase 1 ckpt). Skip and warn.
             print(f"[setup] WARNING: could not load optimizer state ({e}); "
                   "starting with fresh AdamW moments")
-    if "step" in ckpt:
+    if "step" in ckpt and opt_loaded:
         start_step = int(ckpt["step"])
         print(f"[setup] resuming from step {start_step}")
+    elif "step" in ckpt:
+        print(f"[setup] ignoring ckpt step={ckpt['step']} (optimizer "
+              "state didn't match → likely a Phase-1 ckpt). Phase 2 "
+              "starts at step 0.")
 
     # ---- BERT-cosine reward ----
     print(f"[setup] loading BERT scorer (all-mpnet-base-v2) on {device}")

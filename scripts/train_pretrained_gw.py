@@ -211,8 +211,19 @@ def main() -> None:
         # Auto-detect pretokenized cache. The .bin already has chat
         # templates baked in; per-batch tokenize+template is skipped.
         pre_bin = _Path("data/phase_B/ultrachat_llama32.bin")
+        pre_mask = _Path("data/phase_B/ultrachat_llama32.bin.mask.bin")
+        if pre_bin.exists() and not pre_mask.exists():
+            raise FileNotFoundError(
+                f"{pre_bin} exists but the assistant-mask sidecar "
+                f"{pre_mask} is missing. Without the mask, training "
+                "treats user/system tokens as supervised targets — "
+                "whole-chat LM, NOT the assistant-only SFT we want. "
+                "Re-run scripts/preprocess_ultrachat_llama32.py to "
+                "regenerate both files (the script now writes the mask), "
+                "or delete the .bin to fall back to the streaming path."
+            )
         if pre_bin.exists():
-            print(f"[setup] using pretokenized {pre_bin}")
+            print(f"[setup] using pretokenized {pre_bin} + assistant mask")
             data_iter = pretokenized_phase1_iter(
                 pre_bin, bs=args.bs, T=args.T, device=device, seed=args.seed,
             )

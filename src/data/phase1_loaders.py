@@ -54,6 +54,14 @@ def pretokenized_phase1_iter(
     file and yields random T-token windows as ``[bs, T]`` int64 tensors,
     one batch at a time.
 
+    If a sibling ``{bin_path}.mask.bin`` exists (uint8, aligned 1:1 with
+    ``.bin``), it's used as an assistant-only loss mask: ``target_ids``
+    is set to -100 (PyTorch ``ignore_index``) at positions where the
+    mask byte is 0. Without it ``target_ids = input_ids`` (whole-text
+    LM, correct for FineWeb but WRONG for chat data — chat datasets MUST
+    be re-preprocessed with the latest preprocess script to ship the
+    mask sidecar).
+
     Memory ceiling: just the memmap (which the OS pages in/out) + one
     ``[bs, T]`` int64 batch (~bs*T*8 bytes). The full corpus never sits
     in process RAM.
@@ -76,6 +84,19 @@ def pretokenized_phase1_iter(
         raise ValueError(
             f"pretokenized file has {n_tokens} tokens, < bs*T={span}"
         )
+    mask_p = bin_p.parent / (bin_p.name + ".mask.bin")
+    if mask_p.exists():
+        mask_arr = np.memmap(mask_p, dtype=np.uint8, mode="r")
+        if mask_arr.shape[0] != n_tokens:
+            raise ValueError(
+                f"mask sidecar {mask_p} has {mask_arr.shape[0]} bytes; "
+                f"expected {n_tokens} (1:1 aligned with .bin)"
+            )
+        print(f"[pretokenized_phase1_iter] using assistant-mask sidecar "
+              f"{mask_p} ({100 * mask_arr.sum() / max(n_tokens, 1):.1f}% "
+              "supervised)")
+    else:
+        mask_arr = None
     rng = np.random.default_rng(seed)
     yielded = 0
     dev = torch.device(device)
@@ -83,10 +104,22 @@ def pretokenized_phase1_iter(
         # Sample bs starting offsets, slice T tokens each, stack.
         offsets = rng.integers(0, n_tokens - T + 1, size=bs)
         rows = np.empty((bs, T), dtype=np.int64)
-        for r, off in enumerate(offsets):
-            rows[r] = arr[int(off):int(off) + T]
-        input_ids = torch.from_numpy(rows).to(dev, non_blocking=True)
-        yield Phase1Batch(input_ids=input_ids, target_ids=input_ids.clone())
+        if mask_arr is not None:
+            mrows = np.empty((bs, T), dtype=np.bool_)
+            for r, off in enumerate(offsets):
+                rows[r] = arr[int(off):int(off) + T]
+                mrows[r] = mask_arr[int(off):int(off) + T].astype(np.bool_)
+            input_ids = torch.from_numpy(rows).to(dev, non_blocking=True)
+            mask_t = torch.from_numpy(mrows).to(dev, non_blocking=True)
+            target_ids = torch.where(
+                mask_t, input_ids, torch.full_like(input_ids, -100),
+            )
+        else:
+            for r, off in enumerate(offsets):
+                rows[r] = arr[int(off):int(off) + T]
+            input_ids = torch.from_numpy(rows).to(dev, non_blocking=True)
+            target_ids = input_ids.clone()
+        yield Phase1Batch(input_ids=input_ids, target_ids=target_ids)
         yielded += 1
         if max_batches is not None and yielded >= max_batches:
             return

@@ -59,6 +59,8 @@ class ReplayResult:
     """
     log_pi: torch.Tensor          # [B*K] mean log-π over routing decisions; grad attached
     per_token_ce: torch.Tensor    # [B*K, T_replay] no-grad CE for plasticity surprise
+    per_token_valid: torch.Tensor # [B*K, T_replay] bool — False where ignore_token_id
+                                  # matched. Pass to update_plasticity as `valid_mask`.
 
 
 def _per_token_ce_chunked(
@@ -66,7 +68,7 @@ def _per_token_ce_chunked(
     targets: torch.Tensor,           # [B*K, T] long
     chunk_size: int = 256,
     ignore_token_id: int | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Memory-bounded per-token CE.
 
     At production scales (V=128256 for Llama-3.2, T_replay~2K, B*K~64) a
@@ -89,8 +91,11 @@ def _per_token_ce_chunked(
         f"targets {tuple(targets.shape)} mismatches logits T={T}, BK={BK}"
     )
     if T == 0:
-        return torch.zeros(BK, 0, device=logits.device, dtype=torch.float32)
-    out_chunks = []
+        empty_ce = torch.zeros(BK, 0, device=logits.device, dtype=torch.float32)
+        empty_valid = torch.ones(BK, 0, device=logits.device, dtype=torch.bool)
+        return empty_ce, empty_valid
+    ce_chunks: list[torch.Tensor] = []
+    valid_chunks: list[torch.Tensor] = []
     for s in range(0, T, chunk_size):
         e = min(s + chunk_size, T)
         log_chunk = logits[:, s:e, :].float()
@@ -101,13 +106,14 @@ def _per_token_ce_chunked(
             reduction="none",
         ).reshape(BK, e - s)
         if ignore_token_id is not None:
-            ce = torch.where(
-                tgt_chunk == ignore_token_id,
-                torch.zeros_like(ce),
-                ce,
-            )
-        out_chunks.append(ce.detach())
-    return torch.cat(out_chunks, dim=1)
+            invalid = tgt_chunk == ignore_token_id
+            ce = torch.where(invalid, torch.zeros_like(ce), ce)
+            valid = ~invalid
+        else:
+            valid = torch.ones_like(tgt_chunk, dtype=torch.bool)
+        ce_chunks.append(ce.detach())
+        valid_chunks.append(valid)
+    return torch.cat(ce_chunks, dim=1), torch.cat(valid_chunks, dim=1)
 
 
 @dataclass
@@ -481,7 +487,7 @@ def replay_grpo_rollout(
                 # large [BK, early_len, V] tensor. The CE compute is
                 # no_grad — surprise signal does not need to backprop.
                 with torch.no_grad():
-                    ce_early = _per_token_ce_chunked(
+                    ce_early, valid_early = _per_token_ce_chunked(
                         out_early.logits, targets_full[:, :early_len],
                         ignore_token_id=ignore_token_id,
                     )
@@ -489,19 +495,20 @@ def replay_grpo_rollout(
                 model.memory.arm_replay_trace(full_trace[early_len:])
                 out_recent = model(recent_seq)
                 with torch.no_grad():
-                    ce_recent = _per_token_ce_chunked(
+                    ce_recent, valid_recent = _per_token_ce_chunked(
                         out_recent.logits, targets_full[:, early_len:],
                         ignore_token_id=ignore_token_id,
                     )
                 del out_recent
                 log_pi = model.memory.consume_log_pi_mean()
             per_token_ce = torch.cat([ce_early, ce_recent], dim=1)
+            per_token_valid = torch.cat([valid_early, valid_recent], dim=1)
         else:
             model.memory.arm_replay_trace(full_trace)
             with torch.enable_grad(), model.preserve_autograd_graph():
                 out = model(replay_seq)
                 with torch.no_grad():
-                    per_token_ce = _per_token_ce_chunked(
+                    per_token_ce, per_token_valid = _per_token_ce_chunked(
                         out.logits, targets_full,
                         ignore_token_id=ignore_token_id,
                     )
@@ -520,7 +527,11 @@ def replay_grpo_rollout(
                 "ran without grad enabled, or routing scores were "
                 "detached. REINFORCE backward will fail."
             )
-        return ReplayResult(log_pi=log_pi, per_token_ce=per_token_ce)
+        return ReplayResult(
+            log_pi=log_pi,
+            per_token_ce=per_token_ce,
+            per_token_valid=per_token_valid,
+        )
     finally:
         model.current_phase = saved_phase
         model.memory.train(saved_walker_training)
@@ -680,10 +691,10 @@ def autoregressive_rollout(
                 else:
                     full_logits = prefix_logits_shift
                     full_targets = prefix_targets
-                per_token_ce = _per_token_ce_chunked(
+                per_token_ce, per_token_valid = _per_token_ce_chunked(
                     full_logits, full_targets,
                 )
-            model.memory.update_plasticity(per_token_ce)
+            model.memory.update_plasticity(per_token_ce, valid_mask=per_token_valid)
 
         return RolloutOutput(
             generated=full,

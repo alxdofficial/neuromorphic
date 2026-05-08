@@ -238,6 +238,7 @@ def grpo_step(
     )
     log_pi_mean = replay.log_pi                                   # [B*K] grad
     per_token_ce = replay.per_token_ce                            # [B*K, T_replay]
+    per_token_valid = replay.per_token_valid                      # [B*K, T_replay] bool
     if log_pi_mean.shape != (BK,):
         raise ValueError(
             f"replay log_pi_mean returned shape {tuple(log_pi_mean.shape)}, "
@@ -280,7 +281,7 @@ def grpo_step(
     # sample time). Without this, E_bias_flat stays frozen during all of
     # Phase 2 and the long-term plastic encoding pathway is disabled.
     if model.memory is not None:
-        model.memory.update_plasticity(per_token_ce)
+        model.memory.update_plasticity(per_token_ce, valid_mask=per_token_valid)
     model.detach_memory()
 
     # Generation diversity: how many UNIQUE generations across all B*K
@@ -580,6 +581,7 @@ def grpo_session_step(
         )
         log_pi_mean = replay.log_pi                               # [K]
         per_token_ce = replay.per_token_ce                        # [K, T_replay]
+        per_token_valid = replay.per_token_valid                  # [K, T_replay] bool
         if log_pi_mean.shape != (K,):
             raise ValueError(
                 f"replay log_pi_mean returned shape {tuple(log_pi_mean.shape)}, "
@@ -606,7 +608,7 @@ def grpo_session_step(
         # plastic update commits the active neuromod delta into
         # E_bias_flat and rebuilds a fresh delta for the next turn.
         if model.memory is not None:
-            model.memory.update_plasticity(per_token_ce)
+            model.memory.update_plasticity(per_token_ce, valid_mask=per_token_valid)
         model.detach_memory()
 
         # ---- Stats ----

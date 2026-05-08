@@ -318,12 +318,12 @@ def test_grpo_step_fires_unified_plasticity():
     calls = []
     real_update = model.memory.update_plasticity
 
-    def spy(per_token_surprise):
+    def spy(per_token_surprise, valid_mask=None):
         calls.append(
             None if per_token_surprise is None
             else tuple(per_token_surprise.shape)
         )
-        return real_update(per_token_surprise)
+        return real_update(per_token_surprise, valid_mask=valid_mask)
 
     model.memory.update_plasticity = spy
 

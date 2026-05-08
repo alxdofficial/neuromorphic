@@ -164,19 +164,20 @@ def phase1_pretrained_step(
     # target so we feed only T-1 positions.
     if model.memory is not None:
         with torch.no_grad():
-            # When `targets_shift` has -100 (assistant-mask sentinel),
-            # F.cross_entropy(reduction='none', ignore_index=-100)
-            # outputs 0 at those positions instead of evaluating the
-            # CE — that's exactly what we want for surprise: the
-            # walker only sees surprise from supervised positions, and
-            # ignored positions contribute zero (no spurious signal).
+            # CE with ignore_index=-100 returns 0 at masked positions.
+            # Zero is NOT the same as "no surprise" for the EMA — it
+            # would be folded in as a strong signal of confidence at
+            # positions the LM didn't actually predict. Pass the
+            # explicit mask through update_plasticity so masked
+            # positions are skipped entirely from the EMA update.
             per_token_ce = F.cross_entropy(
                 logits_shift.reshape(-1, logits_shift.size(-1)).float(),
                 targets_shift.reshape(-1),
                 reduction="none",
                 ignore_index=-100,
             ).reshape(BS, T - 1)
-        model.memory.update_plasticity(per_token_ce)
+            valid_mask = (targets_shift != -100)
+        model.memory.update_plasticity(per_token_ce, valid_mask=valid_mask)
 
     model.detach_memory()
     elapsed = max(time.perf_counter() - t0, 1e-6)
