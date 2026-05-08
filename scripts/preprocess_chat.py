@@ -33,15 +33,24 @@ from src.trajectory_memory.data.tokenizer import get_tokenizer
 from src.trajectory_memory.data.turn_pair import session_to_turn_pairs
 
 
-# source → (HF id, config, split, message-extractor).
+# source → (HF id, config, split, message-extractor, optional filter fields).
+#
+# Note on schema specifics (verified 2026-05-08 against live datasets):
+# - UltraChat-200k: 207865 train_sft, 23110 test_sft (also train_gen / test_gen).
+#   `messages` is strictly alternating user/assistant, 4-12 turns typical.
+# - WildChat-1M: single "train" split (~1M sessions). MULTILINGUAL —
+#   `language` is e.g. "English" / "Spanish" (NOT ISO codes). Has per-session
+#   `toxic` and `redacted` flags; only ~30% are English + non-toxic + ≥4 turns.
+# - SmolTalk: mostly 2-turn instruction-tuning data, no stable session id.
 _SOURCES = {
     "ultrachat-200k": {
         "id": "HuggingFaceH4/ultrachat_200k",
         "config": None,
         "split": "train_sft",
-        # UltraChat uses "messages" column with [{"role", "content"}]
         "messages_col": "messages",
         "session_id_col": "prompt_id",
+        "language_col": None,           # already English-only
+        "toxic_col": None,
     },
     "wildchat-1m": {
         "id": "allenai/WildChat-1M",
@@ -49,13 +58,17 @@ _SOURCES = {
         "split": "train",
         "messages_col": "conversation",
         "session_id_col": "conversation_hash",
+        "language_col": "language",     # values like "English", "Spanish"
+        "toxic_col": "toxic",           # bool
     },
     "smoltalk": {
         "id": "HuggingFaceTB/smoltalk",
         "config": "all",
         "split": "train",
         "messages_col": "messages",
-        "session_id_col": None,   # smoltalk has no stable per-session id
+        "session_id_col": None,
+        "language_col": None,
+        "toxic_col": None,
     },
 }
 
@@ -95,6 +108,8 @@ def preprocess(
     min_prior_tokens: int,
     max_response_tokens: int,
     streaming: bool,
+    language_filter: str | None = None,    # e.g. "English" for WildChat
+    exclude_toxic: bool = True,
 ) -> None:
     info = _SOURCES[source]
     tok = get_tokenizer()
@@ -108,11 +123,27 @@ def preprocess(
     rows_turn = []
 
     n_sessions = 0
+    n_filtered_lang = 0
+    n_filtered_toxic = 0
     n_pairs = 0
     for ex in iterate_sessions(
         source, streaming=streaming, max_sessions=max_sessions,
     ):
         n_sessions += 1
+
+        # Filter: language (only WildChat has this column; UltraChat / SmolTalk
+        # are mono-lingual already).
+        if language_filter and info["language_col"]:
+            if ex.get(info["language_col"]) != language_filter:
+                n_filtered_lang += 1
+                continue
+
+        # Filter: toxic flag (WildChat only).
+        if exclude_toxic and info["toxic_col"]:
+            if ex.get(info["toxic_col"]):
+                n_filtered_toxic += 1
+                continue
+
         raw_msgs = ex.get(info["messages_col"]) or []
         msgs = normalize_messages(raw_msgs, source)
         if not msgs:
@@ -139,9 +170,11 @@ def preprocess(
             n_pairs += 1
 
         if n_sessions % 200 == 0:
-            print(f"  [{source}] sessions={n_sessions:>6} pairs={n_pairs:>6}")
+            print(f"  [{source}] sessions={n_sessions:>6} pairs={n_pairs:>6} "
+                  f"(filtered: lang={n_filtered_lang} toxic={n_filtered_toxic})")
 
-    print(f"  [{source}] total sessions={n_sessions} pairs={n_pairs}")
+    print(f"  [{source}] total sessions={n_sessions} pairs={n_pairs} "
+          f"(filtered: lang={n_filtered_lang} toxic={n_filtered_toxic})")
     if n_pairs == 0:
         print("  [warn] no pairs passed the length filter — output empty.")
         return
@@ -169,6 +202,13 @@ def main():
                     help="filter: drop pairs with prior_tokens < this (plan §4.5)")
     ap.add_argument("--max-response", type=int, default=2048,
                     help="truncate response to this many tokens")
+    ap.add_argument("--language", default="English",
+                    help="filter to this language (WildChat only; "
+                         "UltraChat/SmolTalk ignore this). "
+                         "WildChat values: 'English', 'Spanish', etc.")
+    ap.add_argument("--include-toxic", action="store_true",
+                    help="include sessions flagged toxic (WildChat only). "
+                         "Default: exclude toxic.")
     ap.add_argument("--streaming", action="store_true")
     args = ap.parse_args()
 
@@ -179,6 +219,8 @@ def main():
         min_prior_tokens=args.min_prior,
         max_response_tokens=args.max_response,
         streaming=args.streaming,
+        language_filter=args.language if args.language else None,
+        exclude_toxic=not args.include_toxic,
     )
 
 

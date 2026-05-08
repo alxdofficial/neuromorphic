@@ -38,9 +38,11 @@ from src.trajectory_memory.data.tokenizer import get_tokenizer
 # source → preprocessor function (returns (prompt_text, gold_text, reward_kind, meta))
 def _gsm8k_extract(ex):
     # gsm8k format: {"question", "answer": "...####N"}
+    # Verified 100% of train (7473) + test (1319) answers contain `####`.
+    # Final answers are integers per GSM8K spec, but the regex tolerates
+    # commas and decimals defensively.
     answer_text = ex["answer"]
-    # Final number after "####" is the gold.
-    match = re.search(r"####\s*(-?\d[\d,]*)", answer_text)
+    match = re.search(r"####\s*(-?\d[\d,]*\.?\d*)", answer_text)
     gold_num = match.group(1).replace(",", "") if match else None
     prompt = (
         "Solve this math problem step by step, then give the final answer.\n\n"
@@ -49,10 +51,24 @@ def _gsm8k_extract(ex):
     return prompt, answer_text, "exact_match", {"gold_number": gold_num}
 
 
-def _narrativeqa_extract(ex):
-    # narrativeqa: {"document": {"summary": {"text"}, "text"}, "question": {"text"}, "answers": [{"text"}, ...]}
+def _narrativeqa_extract(ex, *, passage_chars: int = 32000, use_summary: bool = False):
+    """Extract a NarrativeQA prompt + gold answers.
+
+    NarrativeQA's full `document.text` is huge (~700K chars / ~150K tokens).
+    `document.summary.text` is much shorter (~5K chars / ~1K tokens) and
+    fits in the LM's 2K context cap — defeats the memory-stress purpose.
+
+    We use a slice of the FULL document (default 32K chars ≈ 8K tokens)
+    so the passage extends well past the 2K LM cap, forcing the
+    trajectory module to bridge the gap. Pass `use_summary=True` to
+    fall back to the short summary (faster but less memory-stress).
+    """
     doc = ex["document"]
-    passage = doc.get("summary", {}).get("text") or doc.get("text", "")[:8000]
+    if use_summary:
+        passage = doc.get("summary", {}).get("text", "")
+    else:
+        full = doc.get("text", "")
+        passage = full[:passage_chars] if full else doc.get("summary", {}).get("text", "")
     question = ex["question"]["text"]
     gold_answers = [a["text"] for a in ex.get("answers", []) if a.get("text")]
     if not gold_answers:

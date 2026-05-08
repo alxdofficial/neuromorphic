@@ -54,20 +54,28 @@ _DATASETS = {
         "wave": "w1",
         "size": "27GB cached fully; streamable",
     },
-    "pg19": {
-        "id": "deepmind/pg19",
+    "wikipedia-en": {
+        "id": "wikimedia/wikipedia",
+        "config": "20231101.en",
+        "split": "train",
+        "wave": "w1",
+        "size": "~20GB; English Wikipedia 2023-11-01",
+    },
+    "slimpajama-6b": {
+        "id": "DKYoon/SlimPajama-6B",
         "config": None,
         "split": "train",
         "wave": "w1",
-        "size": "~12GB; long Project Gutenberg books",
+        "size": "~6GB; mixed-domain (books, web, code)",
     },
-    "the-stack-dedup": {
-        "id": "bigcode/the-stack-dedup",
-        "config": "data/python",       # python-only is small enough
-        "split": "train",
-        "wave": "w1",
-        "size": "~12GB python-only slice; streamable",
-    },
+    # ── Wave 1 — disabled / known-broken ──────────────────────────────
+    # `deepmind/pg19` is a script-based dataset; current `datasets`
+    # versions (>=3.0) removed script-based support. Use wikipedia-en or
+    # slimpajama-6b for long-form prose instead.
+    #
+    # `bigcode/the-stack-dedup` is GATED — requires HF auth + access
+    # request. Add it manually if you have access; otherwise use
+    # codeparrot/github-code (open) for code data.
     # ── Wave 2 (long chat) ───────────────────────────────────────────
     "ultrachat-200k": {
         "id": "HuggingFaceH4/ultrachat_200k",

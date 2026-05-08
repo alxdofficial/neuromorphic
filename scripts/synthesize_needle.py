@@ -36,14 +36,17 @@ _FILLER_SOURCES = {
         "id": "HuggingFaceFW/fineweb-edu", "config": "sample-10BT",
         "split": "train", "text_col": "text",
     },
-    "pg19": {
-        "id": "deepmind/pg19", "config": None, "split": "train",
-        "text_col": "text",
-    },
     "wikipedia-en": {
         "id": "wikimedia/wikipedia", "config": "20231101.en",
         "split": "train", "text_col": "text",
     },
+    "slimpajama-6b": {
+        "id": "DKYoon/SlimPajama-6B", "config": None,
+        "split": "train", "text_col": "text",
+    },
+    # NOTE: deepmind/pg19 is a script-based HF dataset and breaks on
+    # current `datasets` versions (script-based support removed). Use
+    # `wikipedia-en` or `slimpajama-6b` instead for long-form prose filler.
 }
 
 
@@ -64,7 +67,10 @@ def iter_filler_text(
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--filler-source", choices=list(_FILLER_SOURCES.keys()),
-                    default="pg19")
+                    default="fineweb-edu",
+                    help="default fineweb-edu (cached locally; "
+                         "pg19 was removed because deepmind/pg19 broke on "
+                         "current `datasets`)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--num-docs", type=int, default=1000)
     ap.add_argument("--streaming", action="store_true", default=True)
