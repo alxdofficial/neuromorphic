@@ -62,6 +62,11 @@ def main():
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--val-data-paths", nargs="+", type=Path, default=None,
+                    help="held-out val parquets (e.g., needle.val.parquet for "
+                         "memory-bridging probe). If set, eval at each save.")
+    ap.add_argument("--val-batches", type=int, default=20,
+                    help="number of val batches to average per eval pass")
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -99,6 +104,27 @@ def main():
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=0)
 
+    val_loader = None
+    if args.val_data_paths:
+        val_dataset = LongDocDataset(
+            args.val_data_paths,
+            chunk_tokens=cfg.D * cfg.T_window,
+            pad_id=pad_id, drop_short=False,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
+        print(f"Validation: {len(args.val_data_paths)} parquet(s), "
+              f"{args.val_batches} batches per eval")
+
+    def run_val() -> float:
+        if val_loader is None:
+            return float("nan")
+        losses_v: list[float] = []
+        for i, chunk_v in enumerate(val_loader):
+            if i >= args.val_batches:
+                break
+            losses_v.append(trainer.eval_wave1(chunk_v.to(args.device)))
+        return sum(losses_v) / max(len(losses_v), 1)
+
     print(f"Starting Wave 1 training: {args.num_steps} steps "
           f"(starting from step {trainer.step_count})")
     losses: list = []
@@ -120,15 +146,19 @@ def main():
                       f"grad_norm={metrics.grad_norm:.2f}  lr=[{lrs}]  "
                       f"({elapsed/max(step, 1):.2f}s/step)")
 
-            if args.checkpoint_out is not None and step > 0 and step % args.save_every == 0:
-                save_checkpoint(
-                    args.checkpoint_out,
-                    model=model, optimizer=optimizer, scheduler=scheduler,
-                    step=step,
-                    rng_state=capture_rng_state(),
-                    extra={"config": cfg.__dict__, "losses": losses},
-                )
-                print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
+            if step > 0 and step % args.save_every == 0:
+                if val_loader is not None:
+                    val_loss = run_val()
+                    print(f"  step {step:>5}  val_loss={val_loss:.4f}")
+                if args.checkpoint_out is not None:
+                    save_checkpoint(
+                        args.checkpoint_out,
+                        model=model, optimizer=optimizer, scheduler=scheduler,
+                        step=step,
+                        rng_state=capture_rng_state(),
+                        extra={"config": cfg.__dict__, "losses": losses},
+                    )
+                    print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
 
     if args.checkpoint_out is not None:
         save_checkpoint(

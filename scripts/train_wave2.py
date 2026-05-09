@@ -52,6 +52,9 @@ def main():
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--val-data-paths", nargs="+", type=Path, default=None,
+                    help="held-out TurnPair val parquets. If set, eval at each save.")
+    ap.add_argument("--val-batches", type=int, default=20)
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -81,16 +84,38 @@ def main():
     )
     print(f"Wave 2 dataset: {len(dataset._rows)} TurnPairs, {len(dataset)} batches/epoch")
 
+    val_dataset = None
+    if args.val_data_paths:
+        val_dataset = TurnPairDataset(
+            args.val_data_paths, batch_size=args.batch_size, pad_id=tokenizer.pad_token_id,
+        )
+        print(f"Validation: {len(val_dataset._rows)} TurnPairs, "
+              f"{args.val_batches} batches per eval")
+
+    def to_device(b):
+        b.prior_ids = b.prior_ids.to(args.device)
+        b.response_ids = b.response_ids.to(args.device)
+        b.prior_mask = b.prior_mask.to(args.device)
+        b.response_mask = b.response_mask.to(args.device)
+        return b
+
+    def run_val() -> float:
+        if val_dataset is None:
+            return float("nan")
+        losses_v: list[float] = []
+        for i, batch_v in enumerate(val_dataset):
+            if i >= args.val_batches:
+                break
+            losses_v.append(trainer.eval_wave2(to_device(batch_v)))
+        return sum(losses_v) / max(len(losses_v), 1)
+
     losses: list = []
     t_start = time.time()
     while trainer.step_count < args.num_steps:
         for batch in dataset:
             if trainer.step_count >= args.num_steps:
                 break
-            batch.prior_ids = batch.prior_ids.to(args.device)
-            batch.response_ids = batch.response_ids.to(args.device)
-            batch.prior_mask = batch.prior_mask.to(args.device)
-            batch.response_mask = batch.response_mask.to(args.device)
+            to_device(batch)
 
             metrics = trainer.step_wave2(batch)
             losses.append(metrics.loss)
@@ -104,15 +129,19 @@ def main():
                       f"grad_norm={metrics.grad_norm:.2f}  lr=[{lrs}]  "
                       f"({elapsed/max(step, 1):.2f}s/step)")
 
-            if args.checkpoint_out is not None and step > 0 and step % args.save_every == 0:
-                save_checkpoint(
-                    args.checkpoint_out,
-                    model=model, optimizer=optimizer, scheduler=scheduler,
-                    step=step,
-                    rng_state=capture_rng_state(),
-                    extra={"config": cfg.__dict__, "losses": losses},
-                )
-                print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
+            if step > 0 and step % args.save_every == 0:
+                if val_dataset is not None:
+                    val_loss = run_val()
+                    print(f"  step {step:>5}  val_loss={val_loss:.4f}")
+                if args.checkpoint_out is not None:
+                    save_checkpoint(
+                        args.checkpoint_out,
+                        model=model, optimizer=optimizer, scheduler=scheduler,
+                        step=step,
+                        rng_state=capture_rng_state(),
+                        extra={"config": cfg.__dict__, "losses": losses},
+                    )
+                    print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
 
     if args.checkpoint_out:
         save_checkpoint(

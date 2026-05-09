@@ -207,6 +207,74 @@ class Phase1Trainer:
             surprise_history=torch.stack(all_surprise, dim=1).detach() if all_surprise else None,
         )
 
+    # ── Validation (no-grad) ──────────────────────────────────────────
+
+    @torch.no_grad()
+    def eval_wave1(self, chunk: Tensor) -> float:
+        """Forward-only Wave 1 chunk; returns NTP loss. No grad, no opt step."""
+        cfg = self.model.cfg
+        BS, T_total = chunk.shape
+        assert T_total == cfg.D * cfg.T_window
+        prev_states = self.model.manifold.reset_states(batch_size=BS)
+        windows = chunk.view(BS, cfg.D, cfg.T_window)
+        out = run_chunk(
+            self.model, windows,
+            prev_states=prev_states,
+            prev_window_hiddens=None,
+            prev_lm_context=None,
+            target_mask=None,
+            hard_routing=True,
+        )
+        return float(out["aggregate_loss"].detach())
+
+    @torch.no_grad()
+    def eval_wave2(self, batch: TurnPairBatch) -> float:
+        """Forward-only Wave 2 TurnPair; returns response-masked NTP loss."""
+        cfg = self.model.cfg
+        BS = batch.prior_ids.shape[0]
+        device = batch.prior_ids.device
+        pad_token = 0
+
+        full_ids = torch.cat([batch.prior_ids, batch.response_ids], dim=1)
+        full_mask = torch.cat(
+            [torch.zeros_like(batch.prior_mask), batch.response_mask], dim=1,
+        )
+        T_full = full_ids.shape[1]
+        chunk_len = cfg.D * cfg.T_window
+        if T_full % chunk_len != 0:
+            pad_n = chunk_len - (T_full % chunk_len)
+            full_ids = torch.cat([
+                full_ids,
+                torch.full((BS, pad_n), pad_token, dtype=full_ids.dtype, device=device),
+            ], dim=1)
+            full_mask = torch.cat([
+                full_mask,
+                torch.zeros((BS, pad_n), dtype=torch.bool, device=device),
+            ], dim=1)
+            T_full = full_ids.shape[1]
+        n_chunks = T_full // chunk_len
+
+        prev_states = self.model.manifold.reset_states(batch_size=BS)
+        prev_window_hiddens: Tensor | None = None
+        prev_lm_context: Tensor | None = None
+        total = torch.zeros((), device=device)
+        for c in range(n_chunks):
+            ids = full_ids[:, c * chunk_len : (c + 1) * chunk_len]
+            mask = full_mask[:, c * chunk_len : (c + 1) * chunk_len]
+            out = run_chunk(
+                self.model, ids.view(BS, cfg.D, cfg.T_window),
+                prev_states=prev_states,
+                prev_window_hiddens=prev_window_hiddens,
+                prev_lm_context=prev_lm_context,
+                target_mask=mask.view(BS, cfg.D, cfg.T_window),
+                hard_routing=True,
+            )
+            total = total + out["aggregate_loss"]
+            prev_states = out["final_states"]
+            prev_window_hiddens = out["final_hiddens"]
+            prev_lm_context = out["final_lm_context"]
+        return float(total.detach())
+
     # ── helpers ───────────────────────────────────────────────────────
 
     def _clip_and_step(self) -> float:
