@@ -107,7 +107,15 @@ def compute_reward(
         if meta and meta.get("gold_number") is not None:
             return exact_match_gsm8k(candidate, meta["gold_number"])
         if meta and meta.get("gold_boxed") is not None:
-            return exact_match_string(candidate, meta["gold_boxed"])
+            # NuminaMath candidates produce chain-of-thought ending with
+            # `\boxed{ANSWER}`. Extract the LAST `\boxed{...}` from the
+            # candidate, compare to gold_boxed. Earlier code compared the
+            # full candidate string to the bare answer, scoring 0 for any
+            # candidate with reasoning around the box.
+            boxes = re.findall(r"\\boxed\{([^}]+)\}", candidate)
+            if not boxes:
+                return 0.0
+            return exact_match_string(boxes[-1], meta["gold_boxed"])
         return exact_match_string(candidate, gold or "")
     elif reward_kind == "exact_match_or_bert_cosine":
         all_answers = (meta or {}).get("all_answers", [gold] if gold else [])

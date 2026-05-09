@@ -110,44 +110,83 @@ def main():
         trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
         print(f"Resumed from {args.checkpoint_in} at step {ckpt.get('step')}")
 
+    # NOTE: BS>1 with cross-chunk state threading would require per-batch-
+    # element state reset (different docs in different slots, finishing at
+    # different times). For first training we restrict to BS=1 so the
+    # state-threading logic stays simple. Multi-stream batching is a TODO.
+    assert args.batch_size == 1, (
+        "BS>1 not yet supported with the post-fix state-threading W1 trainer. "
+        "Multi-stream batching (each batch slot independently advancing "
+        "through its own document, with per-slot reset) is a follow-up. "
+        "Use --batch-size 1 with --grad-accum-steps if you need bigger "
+        "effective batch."
+    )
+
     dataset = LongDocDataset(
         args.data_paths,
         chunk_tokens=cfg.D * cfg.T_window,
         pad_id=pad_id, drop_short=False,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=0)
 
-    val_loader = None
+    val_dataset = None
     if args.val_data_paths:
         val_dataset = LongDocDataset(
             args.val_data_paths,
             chunk_tokens=cfg.D * cfg.T_window,
             pad_id=pad_id, drop_short=False,
         )
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
         print(f"Validation: {len(args.val_data_paths)} parquet(s), "
               f"{args.val_batches} batches per eval")
 
     def run_val() -> float:
-        if val_loader is None:
+        if val_dataset is None:
             return float("nan")
         losses_v: list[float] = []
-        for i, chunk_v in enumerate(val_loader):
+        # Val loss with state RESET each chunk — purely per-chunk perplexity.
+        # (We could thread state through val docs too, but that's slower and
+        # the per-chunk number is easier to read for monitoring.)
+        for i, item in enumerate(val_dataset):
             if i >= args.val_batches:
                 break
-            losses_v.append(trainer.eval_wave1(chunk_v.to(args.device)))
+            chunk_v = item.input_ids.unsqueeze(0).to(args.device)
+            losses_v.append(trainer.eval_wave1(chunk_v))
         return sum(losses_v) / max(len(losses_v), 1)
 
     print(f"Starting Wave 1 training: {args.num_steps} steps "
           f"(starting from step {trainer.step_count})")
     losses: list = []
     t_start = time.time()
+    # Cross-chunk state for the single batch slot.
+    prev_states = None
+    prev_window_hiddens = None
+    prev_lm_context = None
+
     while trainer.step_count < args.num_steps:
-        for chunk in loader:
+        for item in dataset:
             if trainer.step_count >= args.num_steps:
                 break
-            chunk = chunk.to(args.device)
-            metrics = trainer.step_wave1(chunk)
+            # Doc-boundary reset: drop accumulated state at the start of a
+            # new document so memory isn't contaminated by the previous
+            # document's residue.
+            if item.is_doc_start:
+                prev_states = None
+                prev_window_hiddens = None
+                prev_lm_context = None
+            chunk = item.input_ids.unsqueeze(0).to(args.device)         # [1, T]
+            valid_mask = item.valid_mask.unsqueeze(0).to(args.device)   # [1, T]
+            # Reshape valid_mask to match the [BS, D, T_window] target_mask
+            # shape that step_wave1 / forward_window expect.
+            target_mask = valid_mask.view(1, cfg.D, cfg.T_window)
+            metrics = trainer.step_wave1(
+                chunk,
+                prev_states=prev_states,
+                prev_window_hiddens=prev_window_hiddens,
+                prev_lm_context=prev_lm_context,
+                target_mask=target_mask,
+            )
+            prev_states = metrics.final_states           # already detached
+            prev_window_hiddens = metrics.final_hiddens  # already detached
+            prev_lm_context = metrics.final_lm_context   # already detached
             losses.append(metrics.loss)
 
             step = trainer.step_count

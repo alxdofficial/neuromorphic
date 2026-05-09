@@ -244,9 +244,14 @@ class Phase2Trainer:
                 hard_routing=True,
             )
             logits = out["logits"][:, -1, :].float()
-            probs = F.softmax(logits / temperature, dim=-1)
+            # Sample under the TEMPERED distribution and record logp under
+            # the same distribution (policy-gradient correctness — when
+            # temperature != 1.0, the sampling distribution and the recorded
+            # logp must match, else the policy gradient is biased).
+            scaled_logits = logits / temperature
+            probs = F.softmax(scaled_logits, dim=-1)
             sampled = torch.multinomial(probs, num_samples=1).item()
-            logp = F.log_softmax(logits, dim=-1)[0, sampled]
+            logp = F.log_softmax(scaled_logits, dim=-1)[0, sampled]
             per_tok_logp.append(logp)
             generated.append(sampled)
             cur_tokens.append(sampled)

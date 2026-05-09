@@ -97,8 +97,15 @@ class Phase1Trainer:
         prev_states: Tensor | None = None,
         prev_window_hiddens: Tensor | None = None,
         prev_lm_context: Tensor | None = None,
+        target_mask: Tensor | None = None,          # [BS, D, T_window] bool
     ) -> Phase1Metrics:
-        """One Wave 1 step (long-doc TF NTP)."""
+        """One Wave 1 step (long-doc TF NTP).
+
+        `target_mask`: per-token mask True=include in NTP CE, False=skip.
+        Used to exclude pad-token tails from partial chunks (see
+        LongDocChunk.valid_mask). When None, all tokens contribute to loss
+        (caller's responsibility to pre-mask if needed).
+        """
         cfg = self.model.cfg
         BS, T_total = chunk.shape
         assert T_total == cfg.D * cfg.T_window, (
@@ -117,7 +124,7 @@ class Phase1Trainer:
             prev_states=prev_states,
             prev_window_hiddens=prev_window_hiddens,
             prev_lm_context=prev_lm_context,
-            target_mask=None,
+            target_mask=target_mask,
             hard_routing=True,
         )
         loss = out["aggregate_loss"]

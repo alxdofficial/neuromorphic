@@ -273,43 +273,46 @@ class IntegratedLM(nn.Module):
             # Wire memory_fn for this forward call.
             mem_inject = self._mem_inject_layer()
             mem_inject.memory_fn = self._build_memory_fn(read_visited)
-            # Capture the FINAL hidden state via a forward hook on the
-            # final RMS norm. Setting `output_hidden_states=True` would
-            # make HF transformers accumulate references to all 16 layers'
-            # outputs (~128MB held per call at BS=2, L_lm=1024); we only
-            # use the last layer's output (= input to lm_head). The hook
-            # captures it in O(1) memory.
-            captured: list[Tensor] = []
-
-            def _capture(_module, _inputs, output):
-                captured.append(output)
-
-            hook = self.llama.model.norm.register_forward_hook(_capture)
+            # Call the base model (returns hidden states) instead of the
+            # CausalLM wrapper. We then apply lm_head ONLY to the
+            # T_window+1 positions we actually need, instead of all L_lm
+            # positions. At BS=2 / L_lm=2048 / V=128256 / bf16, the full
+            # logit tensor would be ~1 GB; with T_window=256 we drop to
+            # ~130 MB and skip an expensive 2048-position matmul through
+            # lm_head on every forward.
             try:
-                lm_out = self.llama(
+                base_out = self.llama.model(
                     input_ids=lm_input_ids,
-                    output_hidden_states=False,
                     use_cache=False,
                 )
             finally:
-                # Always clear hook + closure to avoid leaking refs across windows.
-                hook.remove()
+                # Always clear closure to avoid leaking refs across windows.
                 mem_inject.memory_fn = None
 
-            # Slice to the current-window positions (last T_window).
-            full_logits = lm_out.logits                              # [BS, L_lm, V]
-            full_hiddens = captured[0]                               # [BS, L_lm, d_lm]
-            logits = full_logits[:, -T_window:, :]                   # [BS, T_window, V]
+            full_hiddens = base_out.last_hidden_state                # [BS, L_lm, d_lm]
             current_hiddens = full_hiddens[:, -T_window:, :].to(prev_states.dtype)
 
-            # Compute surprise: mean per-token NTP CE on the current window.
-            # Use FULL logits + lm_input_ids for the standard shift, then
-            # slice to the current window's predictions. The first prediction
-            # in the slice uses LM context that came BEFORE the current
-            # window (good — that's the whole point of the rolling context).
-            surprise = self._compute_surprise(
-                full_logits, lm_input_ids, T_window, target_mask,
+            # We want logits for the LAST T_window+1 hidden positions: the
+            # final T_window for downstream sampling/output (positions
+            # L_lm-T_window..L_lm-1), plus one extra to the LEFT (position
+            # L_lm-T_window-1) so the standard NTP shift can produce
+            # predictions for all T_window current-window targets.
+            #
+            # At the very first window of a sequence there's no rolling
+            # context yet, so L_lm == T_window — we take all available
+            # hidden states and `_compute_surprise_window` skips the first
+            # target (which has no predecessor).
+            n_needed = min(T_window + 1, full_hiddens.shape[1])
+            needed_hidden = full_hiddens[:, -n_needed:, :]
+            needed_logits = self.llama.lm_head(needed_hidden)        # [BS, n_needed, V]
+
+            surprise = self._compute_surprise_window(
+                needed_logits, lm_input_ids[:, -T_window:], target_mask,
             ).to(prev_states.dtype)
+
+            # Slice the final T_window logits for the output (caller may
+            # use them for AR sampling in W3/W4 rollouts).
+            logits = needed_logits[:, -T_window:, :]                 # [BS, T_window, V]
 
         # ── 3. WRITE ─────────────────────────────────────────────────
         # Detach surprise: it's a loss-derived scalar from the same logits
@@ -333,58 +336,57 @@ class IntegratedLM(nn.Module):
         }
 
     @staticmethod
-    def _compute_surprise(
-        full_logits: Tensor,
-        lm_input_ids: Tensor,
-        T_window: int,
-        target_mask: Tensor | None,
+    def _compute_surprise_window(
+        needed_logits: Tensor,        # [BS, T_window+1, V] — logits for the last T_window+1 positions
+        target_ids: Tensor,           # [BS, T_window]      — current window's tokens
+        target_mask: Tensor | None,   # [BS, T_window] bool — True=include in CE
     ) -> Tensor:
-        """Mean per-token NTP CE over the *current window's* target positions.
+        """Mean per-token NTP CE over the current window's target positions.
 
-        full_logits / lm_input_ids span the full LM context (up to
-        effective_lm_context tokens). The current window is the last
-        T_window tokens. This function takes the standard NTP shift on
-        the full sequence, then slices to just the predictions for the
-        current window.
+        Uses the standard NTP shift: position t in `needed_logits[:, :-1, :]`
+        predicts `target_ids[:, t]`. So `needed_logits` must include one
+        extra position to the left of the window (the "previous" token,
+        whose prediction is the first target).
 
-        target_mask (if provided) is a [BS, T_window] mask for the current
-        window's tokens; True = include in CE.
+        Earlier we received the full L_lm-token logits and shifted +
+        sliced inside this function, casting the entire sequence to fp32
+        — at L_lm=2048/V=128256 that was ~2 GB of throwaway compute per
+        forward. The new contract pre-slices, so we cast just T_window
+        positions.
         """
-        BS, L_lm, V = full_logits.shape
-        if L_lm < 2:
-            return torch.zeros(BS, device=full_logits.device)
+        BS, n_pos, V = needed_logits.shape
+        T_window = target_ids.shape[1]
+        assert n_pos in (T_window, T_window + 1), (
+            f"needed_logits has {n_pos} positions; expected T_window={T_window} "
+            f"or T_window+1={T_window+1}"
+        )
 
-        # Standard NTP shift on the full sequence.
-        # logits[i] predicts input_ids[i+1].
-        # Cast logits to fp32 for CE — bf16 softmax over V=32K can underflow.
-        shift_logits = full_logits[:, :-1, :].contiguous().float()  # [BS, L_lm-1, V] fp32
-        shift_targets = lm_input_ids[:, 1:].contiguous()            # [BS, L_lm-1]
+        # Standard NTP shift: needed_logits[:, :-1] predicts the targets
+        # whose predecessors are present.
+        shift_logits = needed_logits[:, :-1, :].float()    # [BS, n_pos-1, V] fp32
+        if n_pos == T_window + 1:
+            # Have predecessor for every target.
+            used_target_ids = target_ids                                  # [BS, T_window]
+            used_mask = target_mask
+        else:
+            # n_pos == T_window: very first window, no predecessor for
+            # target 0. Predict only targets 1..T_window-1.
+            used_target_ids = target_ids[:, 1:]                           # [BS, T_window-1]
+            used_mask = target_mask[:, 1:] if target_mask is not None else None
 
-        # Slice to the current window's predictions.
-        # Current window targets are lm_input_ids[L_lm - T_window : L_lm];
-        # in shift_targets these are at positions [L_lm - T_window - 1 : L_lm - 1].
-        # That's the last T_window positions of shift_targets.
-        # When L_lm == T_window we have only L_lm - 1 = T_window - 1 shift
-        # positions — the very first token of the current window has no
-        # predecessor to predict from. Take what we have.
-        n_take = min(T_window, L_lm - 1)
-        win_logits = shift_logits[:, -n_take:, :]                   # [BS, n_take, V]
-        win_targets = shift_targets[:, -n_take:]                    # [BS, n_take]
+        n_predicted = used_target_ids.shape[1]
         ce_per_tok = F.cross_entropy(
-            win_logits.reshape(-1, V),
-            win_targets.reshape(-1),
+            shift_logits.reshape(-1, V),
+            used_target_ids.reshape(-1),
             reduction="none",
-        ).reshape(BS, n_take)
+        ).reshape(BS, n_predicted)
 
-        if target_mask is not None:
-            # target_mask is [BS, T_window], aligned to current window.
-            # We take its last n_take entries (drop first if we lost one).
-            mask = target_mask[:, -n_take:].to(ce_per_tok.dtype)
+        if used_mask is not None:
+            mask = used_mask.to(ce_per_tok.dtype)
             ce_sum = (ce_per_tok * mask).sum(dim=1)
             ce_count = mask.sum(dim=1).clamp_min(1.0)
             return ce_sum / ce_count
-        else:
-            return ce_per_tok.mean(dim=1)
+        return ce_per_tok.mean(dim=1)
 
     # ── parameter accounting ─────────────────────────────────────────
 

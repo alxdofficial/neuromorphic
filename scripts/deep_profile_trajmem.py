@@ -164,10 +164,19 @@ def main():
                 hard_routing=True,
             )
 
-    # 2b. Llama forward only (no memory injection — disable memory_fn briefly).
+    # 2b. Llama forward only — keep MemInjectLayer in the path but feed it
+    # a zero memory readout so the bridge projection runs but adds nothing.
+    # `memory_fn=None` would trigger MemInjectLayer's safety assertion
+    # ("called without memory_fn but scale is not all-zero").
     inject_layer = model._mem_inject_layer()
     saved_memory_fn = inject_layer.memory_fn
-    inject_layer.memory_fn = None  # bypass memory; layer falls back to identity-add (or zero)
+
+    def _zero_memory_fn(h_mem):
+        # h_mem: [BS, T, D_concept] — return zeros of same shape so the
+        # bridge's W_out + scaled-add contributes zero residual delta.
+        return torch.zeros_like(h_mem)
+
+    inject_layer.memory_fn = _zero_memory_fn
 
     def llama_only_fwd():
         with torch.no_grad():
