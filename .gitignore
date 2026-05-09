@@ -19,3 +19,4 @@ wandb/
 test_output/
 # Training data — large binaries, kept locally but not tracked.
 /data/
+/logs/

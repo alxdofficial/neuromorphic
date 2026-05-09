@@ -5,7 +5,9 @@ Phase1Trainer.step_wave2.
 
 Usage:
     python scripts/train_wave2.py \\
-        --data-paths data/wave2/wildchat_long.parquet \\
+        --data-paths \\
+            data/wave2/ultrachat.parquet \\
+            data/wave2/wildchat_long.parquet \\
         --batch-size 2 --num-steps 500
 """
 

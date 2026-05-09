@@ -5,8 +5,9 @@ TurnPair via the model, scores against ground-truth response with
 exact_match + BERT cosine, runs group-relative policy gradient.
 
 Usage:
+    # W4 reuses the W2 WildChat parquet (plan §4.5 — no separate W4 dataset).
     python scripts/train_wave4.py \\
-        --data-paths data/wave4/wildchat_long.parquet \\
+        --data-paths data/wave2/wildchat_long.parquet \\
         --num-samples 4 --num-steps 200
 """
 

@@ -2,7 +2,11 @@
 
 Usage:
     python scripts/train_wave3.py \\
-        --data-paths data/wave3/gsm8k.parquet \\
+        --data-paths \\
+            data/wave3/gsm8k.parquet \\
+            data/wave3/numinamath.parquet \\
+            data/wave3/humaneval.parquet \\
+            data/wave3/narrativeqa.parquet \\
         --num-samples 4 --num-steps 200
 """
 

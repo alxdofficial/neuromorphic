@@ -12,7 +12,11 @@ Features:
 
 Usage:
     python scripts/train_wave1.py \\
-        --data-paths data/wave1/fineweb_edu.parquet data/wave1/needle.parquet \\
+        --data-paths \\
+            data/wave1/fineweb_edu.parquet \\
+            data/wave1/wikipedia_en.parquet \\
+            data/wave1/slimpajama_6b.parquet \\
+            data/wave1/needle.parquet \\
         --batch-size 2 --num-steps 1000 \\
         --checkpoint-out outputs/wave1/ckpt.pt
 """

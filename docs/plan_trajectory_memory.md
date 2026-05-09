@@ -545,6 +545,8 @@ Goal: teach the memory module to encode and retrieve. The architecture's
 most critical training stage; everything downstream assumes a working
 manifold.
 
+**Original target mix (aspirational):**
+
 | Source                                | Weight | Why                                          |
 |---------------------------------------|--------|----------------------------------------------|
 | Books (Gutenberg, Books3, BookCorpus) | 40%    | Strongest natural long-range structure (characters, plots, callbacks) |
@@ -552,6 +554,31 @@ manifold.
 | ArXiv papers                          | 15%    | Definition-use, terminology consistency, citations |
 | Web (FineWeb / RedPajama, length > 8K filter) | 10% | Diversity, but de-prioritized                |
 | Synthetic needle-in-haystack          | 10%    | Plant fact at position X, query at Y > X+2K. Forces measurable memory contribution to NTP loss. |
+
+**Actual implemented mix (2026-05-09):**
+
+| Source                                | Status | Notes |
+|---------------------------------------|--------|-------|
+| `HuggingFaceFW/fineweb-edu` (sample-10BT) | wired ✓ | `preprocess_longdoc.py fineweb-edu`. Edu-classifier filtered, len ≥ 4K tokens. |
+| `wikimedia/wikipedia` (20231101.en)   | wired ✓ | Encyclopedia long-form; substitute for ArXiv definition-use structure. |
+| `DKYoon/SlimPajama-6B`                | wired ✓ | RedPajama-derived mix incl. books — partial replacement for Books slot. |
+| Needle-haystack synthetic             | wired ✓ | `synthesize_needle.py` with curriculum distances 3K/8K/16K/32K, fillers from FineWeb-Edu. |
+| Books (pure)                          | gap — `deepmind/pg19` script-based, broke when `datasets ≥3.0` removed script support. SlimPajama provides partial coverage. |
+| Code                                  | gap — `bigcode/the-stack-dedup` is HF-gated. Open alternative `codeparrot/github-code` not yet wired into `preprocess_longdoc.py`. |
+| ArXiv                                 | gap — `EleutherAI/proof-pile-2` arXiv subset not yet wired. Partially substituted by Wikipedia structure. |
+
+**First preprocessing run (2026-05-09, ~600-800M tokens preprocessed):**
+
+| Source | Stream cap | Kept (≥4K tok) | Tokens (M) |
+|--------|-----------|----------------|-----------|
+| `wikipedia-en` | 100K | 3975 docs | 30.8 |
+| `slimpajama-6b` | 100K | 3134 docs | 35.5 |
+| `fineweb-edu` | 500K | TBD (expect ~15K) | ~75-100 |
+| `needle` | 5000 docs × 4 distance buckets | 20000 | ~200-240 |
+
+Long-doc keep rate at min_tokens=4096 is ~3-4% across all three real-text sources. To scale up to converged-Wave-1 size (~5-10B tokens), bump streams to 5M+ examples or relax min_tokens — the 4K threshold is the dominant bottleneck.
+
+For converged training, adding `codeparrot/github-code` is the highest-priority gap to close — its def→call structure is a distinct memory-pressure signal that no other source provides. arXiv (proof-pile-2) is second priority. AgentInstruct is a Wave 2/4 gap, not Wave 1.
 
 Format: streaming tokens, 256-token windows. No turn structure. NTP loss
 on every token. Surprise = mean per-token NTP CE per window.
@@ -569,17 +596,26 @@ memory across multi-turn structure.
 
 The challenge: standard chat datasets (UltraChat, ShareGPT) are mostly
 short — turns of a few hundred tokens, all fitting in the 2K cap. Memory
-wouldn't get exercised. Sources to use:
+wouldn't get exercised.
 
-- **WildChat filtered for session length** > 4K total tokens or > 10
-  turns. Aggressive filtering keeps only long sessions.
-- **AgentInstruct** (long tool-use sessions). Best non-synthetic
-  long-session source.
-- **LongAlpaca / LongInstruct**: long-context instruction tuning sets,
-  designed for this.
-- **Synthetic conversion**: take a long doc from Wave 1, generate
-  multi-turn Q&A about content scattered through it, format as chat.
-  Repurposes existing data.
+**Original target sources (aspirational):**
+- **WildChat filtered for session length** > 4K total tokens or > 10 turns.
+- **AgentInstruct** (long tool-use sessions).
+- **LongAlpaca / LongInstruct** (long-context instruction tuning).
+- **Synthetic conversion**: take a long doc from Wave 1, generate multi-turn Q&A about content scattered through it.
+
+**Actual implemented sources (2026-05-09):**
+
+| Source                                | Status | Notes |
+|---------------------------------------|--------|-------|
+| `allenai/WildChat-1M`                 | wired ✓ | `preprocess_chat.py wildchat-1m`. English-only + non-toxic filters; min_prior=4K. |
+| `HuggingFaceH4/ultrachat_200k`        | wired ✓ | `preprocess_chat.py ultrachat-200k`. Pre-filtered English. UltraChat sessions are short (~6 turns × ~200 tok); at min_prior=4K filter yields ~0 pairs. Used at **min_prior=1024** as instruction-format warmup; WildChat carries the long-prior weight. |
+| `HuggingFaceTB/smoltalk`              | wired (registry only) | Mostly 2-turn, less useful for memory; not used for first run. |
+| AgentInstruct                         | gap — `microsoft/orca-agentinstruct-1M-v1` not yet wired. |
+| LongAlpaca / LongInstruct             | gap — not wired. |
+| Synthetic chat conversion             | gap — converter not yet built. |
+
+For converged training, AgentInstruct would be the highest-priority gap to close — its long tool-use sessions are the closest non-synthetic match to deployment-shape Wave 4 use. WildChat-long covers a similar shape but with shorter, less structured tool-use signal.
 
 Format: TurnPair extraction via `session_to_turn_pairs` (graph_walker's
 existing util). For a session of N assistant turns, generate N training
@@ -597,11 +633,14 @@ Goal: AR rollouts + verifiable rewards to refine reasoning. Same
 structure as graph_walker's W3 but with memory in the loop and a
 different dataset shape.
 
-| Source                  | Use                                                  |
-|-------------------------|------------------------------------------------------|
-| GSM8K + NuminaMath-TIR  | Math word problems with verifiable answers           |
-| HumanEval / MBPP        | Code with verifiable test pass/fail                  |
-| NarrativeQA             | Long-context QA with reference answers — natural memory-stress format (prior includes full passage, often > 4K tokens) |
+**Implemented sources (2026-05-09, all wired ✓):**
+
+| Source                            | HF id                  | Use |
+|-----------------------------------|------------------------|-----|
+| GSM8K (full train, 7473 examples) | `openai/gsm8k`         | Math word problems; gold = number after `####`, regex tolerates decimals/commas/negatives. |
+| NuminaMath-TIR (50K examples)     | `AI-MO/NuminaMath-TIR` | Math with code execution; gold = final `\boxed{}` answer. |
+| HumanEval (full test, 164)        | `openai_humaneval`     | Code with verifiable test pass/fail; rule_based_exec reward. |
+| NarrativeQA (5K examples)         | `deepmind/narrativeqa` | Long-context QA. **Uses 32K-char slice of full document** (~8K tokens) so prompt extends past 2K LM cap (memory-stress). `use_summary=True` available as fallback for faster but lower-stress runs. |
 
 Format: `(prompt, response)`. For math/code, prompt is the problem.
 For NarrativeQA, prompt is `passage + question`. 1–5k prompts × 4–8
@@ -621,9 +660,20 @@ is the dominant write-strength signal.
 Goal: align memory behavior in deployment-shaped scenarios. Stresses
 lifelong-style behavior across many turns.
 
+**Original target sources:**
 - **WildChat-long → TurnPair extraction**, filtered for prior length > 4K
 - **AgentInstruct → TurnPair extraction** (long tool-use sessions)
 - Optional: curated Claude Code session traces or other agentic datasets
+
+**Implemented (2026-05-09):**
+
+| Source                     | Status | Notes |
+|----------------------------|--------|-------|
+| WildChat-long (reuse W2)   | wired ✓ | Same parquet as W2 (`data/wave2/wildchat_long.parquet`); English+non-toxic, min_prior=4K. |
+| AgentInstruct              | gap    | `microsoft/orca-agentinstruct-1M-v1` not yet wired. |
+| Claude Code session traces | gap    | No corpus exists. |
+
+For converged training, AgentInstruct is the highest-priority W4 add — it's the only non-synthetic source designed specifically for long tool-use session structure. Without it, W4 is essentially "WildChat reused with GRPO instead of TF" rather than the deployment-shape coverage the plan calls for.
 
 Format: TurnPair, length-bucketed (graph_walker's existing W4 approach:
 sort by prior length, sample windows of B near-uniform-length neighbors,
