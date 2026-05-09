@@ -135,6 +135,81 @@ samples** for Phase 2.
 - Phase 2's 22 GB peak (T2) sits near our 24 GB ceiling. K=8 would not
   fit; T_gen=128+ marginal. KV caching for AR would help both.
 
+---
+
+## 2026-05-09 — Phase 1 + Phase 2 at each path's own max BS / K
+
+Replaces the BS=2/K=4 shared-shape table above with a more honest
+"each path at its own max-fitting size" comparison (per the project
+convention "Bench at each path's own optimal BS"). Same hardware,
+same medium config, eager mode. Per-path BS / K values are
+hard-coded in `scripts/bench_compare.py`.
+
+| Path | BS / K | tok/s | peak GB | ms/iter |
+|------|-------:|------:|--------:|--------:|
+| **Phase 1** (T=1024 chunk for trajmem; T=1024 for vanilla) |  |  |  |  |
+| V1.A — vanilla Llama fwd (no_grad)        | BS=48 | **48.7k** | 16.90 | 1009 |
+| V1.B — vanilla Llama lm_head TF step      | BS=5  | **17.0k** | 20.32 |  302 |
+| T1   — Llama + trajmem step               | BS=4  | **9.9k**  | 18.46 |  415 |
+| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
+| V2   — vanilla Llama GRPO step            | K=10  | **42.5**  | 18.80 | 15050 |
+| T2   — Llama + trajmem two-pass GRPO step | K=4   | **32.4**  | 22.00 |  7900 |
+
+**Per-path slowdowns at each path's own optimal size:**
+- **T1 vs V1.B: 1.72×** (vanilla 17.0k, ours 9.9k tok/s). Improved from
+  the BS=2-shared 1.80× — vanilla doesn't gain from BS=2 → BS=5 since
+  it was already throughput-saturated.
+- **T2 vs V2: 1.31×** (similar story; V2 also saturated by K=8).
+
+**Throughput-saturation observations:**
+- V1.A vanilla forward has the same tok/s at BS=16 (7.29 GB) as at
+  BS=48 (16.90 GB). Llama bf16 forward is GPU-saturated around
+  ~49k tok/s on this card regardless of BS.
+- V1.B and V2 are similarly saturated; bumping BS just trades VRAM
+  headroom for nothing. Reported max-BS rows are for "we used the
+  whole GPU" parity, not for throughput gains.
+- T1 and T2 are at their actual VRAM caps. T1 BS=8 OOMs in eager
+  (per `bench_trajmem.py` sweep); T2 K=5+ would push past 24 GB.
+
+**The honest framing:** the memory module's overhead at peak is
+**~7k tok/s for Phase 1** (V1.B 17.0k → T1 9.9k). Architecturally
+that's mostly the per-window Llama forward re-encoding the rolling
+LM context buffer (no sliding KV cache yet — see "Optimization
+candidates" below).
+
+**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+
+### Why is T1 ~1.7× slower than V1.B?
+
+Not the memory modules themselves — they're <1% of FLOPs (per
+`docs/profile_analysis.md`). The dominant overhead is Llama itself
+running **multiple forwards per "chunk"** while the rolling LM
+context grows.
+
+- V1.B does **1 forward at T=1024**, full sequence, one shot.
+- T1 does **4 forwards** at T_window=256 each, but with a rolling
+  context buffer that grows window-by-window: 256 → 512 → 768 → 1024
+  tokens fed to Llama. Total LM tokens processed per chunk = ~2560.
+- Naive expected ratio: 2.5×. Measured 1.72×. T1 is actually
+  *better-than-naive* per LM token (smaller forwards have lower
+  attention cost than one big one).
+- In real W1 training with state threading and a doc-long stream,
+  the LM context fills to the 2048 cap and stays there → per-window
+  forwards get bigger → real-training T1 is slower than this synthetic
+  bench shows.
+- The fix is sliding KV cache so each window's forward is just the
+  new 256 tokens against cached 1792. That's the dominant lever.
+
+### Optimization candidates (not yet tried)
+
+| Lever | Est. win | Cost | Notes |
+|-------|---------:|------|-------|
+| Sliding KV cache for Llama | 30-50% | medium | Layer-8 inject changes per window so KV reuse needs custom logic for layers 0-7 + recompute for 8+. |
+| `--compile` (bench is eager) | 28% at low BS | trivial | Already wired into `train_wave1.py`. Not yet tested at the new max BS. |
+| Autocast bf16 (manifold scatter dtype refactor) | 5-10% | medium | Blocked on `scatter_mean` dtype mismatch — see profile_analysis.md. |
+| Share d_lm↔D_concept projections (bridge / read-attn / write-attn) | 3-5% | medium | Three separate copies of the same shape projection today. |
+| Llama-block gradient checkpointing | 0% speed, ~50% VRAM | small | Lets us push T1 to BS=8+ (gradient quality not throughput). |
+
 ## Cross-references
 
 - `scripts/bench_trajmem.py` — Phase 1 sweep harness

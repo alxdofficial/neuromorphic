@@ -106,8 +106,14 @@ def main():
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     if args.compile:
+        # dynamic=True: forward_window's lm_input_ids varies in length as the
+        # rolling buffer grows (256, 512, 768, ..., up to effective_lm_context).
+        # With dynamic=False we recompile per shape and hit dynamo's
+        # recompile_limit (8) by chunk 3. dynamic=True trades 6% per-step
+        # speed for stable performance across chunks. See
+        # `scripts/experiment_compile_dynamic.py`.
         model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=False,
+            model.forward_window, mode="default", dynamic=True,
         )
         print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
 

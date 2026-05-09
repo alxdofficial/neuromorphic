@@ -234,6 +234,142 @@ Items #1 and #2 combined would land another ~10% on top of the compile
 win, but they're real engineering, not 1-line audits. Worth doing only
 if the first training run shows we need more headroom.
 
+---
+
+# Update — 2026-05-09 (afternoon): Decomposing the 1.72× T1 vs V1.B gap
+
+A second profiling pass with a "where does the slowdown actually live?"
+question. Three new experiment scripts:
+
+- `scripts/experiment_memory_cost.py` — compares 5 paths (vanilla single-fwd,
+  vanilla 4×growing-fwd, trajmem-no-memory, trajmem-bridge-only, full
+  trajmem) at BS=4 to isolate memory module cost from per-window structure
+  cost.
+- `scripts/experiment_lm_context.py` — sweeps `effective_lm_context`
+  (256, 1024, 2048) × eager/compile to isolate rolling-buffer cost.
+- `scripts/experiment_compile_dynamic.py` — `torch.compile`'s `dynamic`
+  flag and `mode='reduce-overhead'` at the production setting.
+
+## Headline finding: **the memory module per se is essentially free**
+
+| Path | tok/s | step ms | Notes |
+|------|------:|--------:|-------|
+| trajmem ec=256 eager | **19.0k** | 215 | Each window only sees its own 256 tokens; no rolling buffer |
+| trajmem ec=256 compile | **23.4k** | 175 | Compile gives 23% at this shape |
+| vanilla V1.B (T=1024 single fwd) | 17.0k | 237 | Reference baseline |
+| trajmem ec=1024 eager | 9.9k | 414 | Rolling buffer growing to 1024 |
+| trajmem ec=2048 eager | 9.9k | 414 | Same as ec=1024 (single chunk doesn't fill 2K) |
+| trajmem ec=2048 compile dynamic=True | 11.3k | 363 | Avoids recompile thrashing |
+
+**The trajmem trainer at ec=256 (no rolling buffer) is FASTER than vanilla
+V1.B**: 19.0k vs 17.0k tok/s. The memory module's read/write/bridge ops
+are net cheap because they let us run Llama at smaller per-window T,
+which more than offsets their direct cost.
+
+## What the rolling buffer actually costs
+
+The `effective_lm_context = 2048` cap (the load-bearing knob in plan §4.1)
+forces Llama to re-encode the rolling LM context buffer at every window:
+
+- ec=256: per-window LM input is fixed at 256 → step 215 ms
+- ec=1024: per-window LM input grows 256 → 1024 → step 414 ms (+92%)
+
+That ~200 ms gap is **all** Llama re-encoding the prefix per window.
+The memory module didn't get any more expensive between these two
+configs — Llama got more expensive.
+
+## Decomposition (`experiment_memory_cost.py`, BS=4):
+
+| Path | step ms | Δ vs prior |
+|------|--------:|----:|
+| P0 vanilla single-fwd T=1024 (= V1.B) | 237 | — |
+| P2 trajmem with memory bypassed (scale=0, read/write skipped) | 360 | +123 ms (per-window LM forward shape cost) |
+| P3 trajmem with bridge cross-attn active (KV=zeros) | 360 | +0 ms (bridge cross-attn is noise) |
+| P4 full trajmem (= T1) | 414 | +54 ms (read+write trajectory hops) |
+
+So of the 177 ms gap between V1.B (237) and T1 (414):
+- **123 ms (69%)** = running Llama 4 times with growing context instead
+  of once at T=1024
+- **54 ms (30%)** = read+write trajectory hops + scatter_mean
+- **<1 ms (~0%)** = MemInjectLayer bridge cross-attn
+
+The memory module accounts for ~30% of the gap, the rolling-buffer
+structure accounts for ~70%.
+
+## What this changes about the optimization plan
+
+The original profile (above) said: 99% of FLOPs are in Llama, can't
+optimize Llama. Still true. But the breakdown above tells us **the
+optimization target is "reduce how much Llama runs"** — not "reduce
+how much memory module runs". Three concrete lines:
+
+### Tier 1 (architectural, 30-50% potential)
+
+**Sliding KV cache for Llama.** The dominant lever. Each window today
+re-encodes the full rolling buffer (256 → 2048 tokens by chunk 2). With
+KV cache, each window's forward becomes ≈ ec=256 cost (~215 ms) +
+small per-window cache append work. Approaches the vanilla speed ceiling.
+
+Architectural complication: MemInjectLayer at layer 8 changes per window
+(memory readout differs). Layers 0-7 KV cache is reusable; layers 8+
+need to recompute the KV for cached positions because their input (h_inj
+= h + scale·W_out(memory)) differs per window. Math is straightforward;
+implementation is ~1-2 days of careful code in `forward_window`.
+
+### Tier 2 (kept-promise compile, ~14% steady-state)
+
+**`torch.compile(..., dynamic=True)`** — landed in this update, in both
+`train_wave1.py` and `train_wave2.py`. The previous `dynamic=False`
+recompiled per LM-input shape; with rolling-buffer growth across chunks,
+a typical training run sees 8+ distinct shapes and hits `recompile_limit=8`
+within a few chunks. `dynamic=True` compiles a single graph that
+handles varying shapes — slightly less optimized per shape but stable
+across long training runs.
+
+Single-chunk synthetic bench (the only kind we currently have) doesn't
+trigger the recompile thrashing because it only sees 4 shapes. Real
+training will.
+
+### Tier 3 (smaller, refactor-required)
+
+- **Pre-allocate trajectory buffers** in read/write modules instead of
+  `visited_list.append(...)` etc. The Python list-append pattern triggers
+  CPU/GPU sync points → blocks `mode='reduce-overhead'` cudagraph (we
+  observed 90+ "cudagraph partition due to non gpu ops" splits).
+  Estimated 5-15% additional with cudagraph fully enabled.
+- **Share d_lm↔D_concept projections** across MemInjectLayer / read-attn
+  / write-attn (3 separate copies today). Estimated 3-5%.
+- **autocast(bf16)** with manifold dtype refactor. Estimated 5-10%.
+- **Gradient checkpointing** on Llama backbone — no speed; lets us push
+  BS≥8 if gradient quality matters more than wall-clock.
+
+## Recommendation
+
+Launch Wave 1 with `--compile` (now `dynamic=True`) at the current speed
+(~11.5k tok/s eager / ~13k+ compile expected). Watch the loss curve for
+~1-2k steps. Only invest in KV cache if the loss curve is healthy AND
+the wall-clock cost actually matters for the run length we want.
+
+The memory graph itself has been verified-cheap. Further code-level
+optimization on it has small ceilings; the architectural lever is
+KV cache.
+
+## Reproducing
+
+```
+# Original profiling
+PYTHONPATH=. python scripts/deep_profile_trajmem.py --bs 4
+
+# New decomposition experiments
+PYTHONPATH=. python scripts/experiment_memory_cost.py
+PYTHONPATH=. python scripts/experiment_lm_context.py
+PYTHONPATH=. python scripts/experiment_compile_dynamic.py
+```
+
+---
+
+## Original profile (BS=2 numbers, retained for history)
+
 ## Reproducing
 
 ```

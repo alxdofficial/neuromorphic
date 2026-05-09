@@ -1,8 +1,9 @@
 """Phase 1 + Phase 2 throughput comparison: vanilla Llama vs trajectory-memory.
 
-Runs each path at the production config (medium tier, BS=2, --compile)
-and prints a comparison table. All paths use bf16 + Flash Attention via
-HF transformers; backward time is included for training paths.
+Each path runs at its own max-fitting BS (project memory: "Bench at each
+path's own optimal BS — for cross-path throughput comparisons, each
+scenario reported at its own max-fitting BS, not forced to share BS").
+Per-path values hard-coded below; adjust if hardware/config changes.
 
 Phase 1 (long-doc TF NTP) — paths:
   V1.A — vanilla Llama forward (no_grad)
@@ -13,8 +14,11 @@ Phase 2 (GRPO) — paths:
   V2   — vanilla Llama GRPO (J-sample + TF-replay, lm_head-only train)
   T2   — Llama + trajectory-memory two-pass GRPO step (Phase2Trainer.step)
 
+All paths use bf16 + Flash Attention via HF transformers; backward time
+included for training paths.
+
 Usage:
-    PYTHONPATH=. python scripts/bench_compare.py --bs 2 --compile
+    PYTHONPATH=. python scripts/bench_compare.py
 """
 
 from __future__ import annotations
@@ -39,6 +43,18 @@ from src.trajectory_memory.training import (  # noqa: E402
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Per-path BS / K — each scenario tuned to its own max-fitting size on
+# RTX 4090 24 GB, medium config, eager. Aim is each path peaking near
+# ~21 GB. Adjust if hardware / config changes.
+# ──────────────────────────────────────────────────────────────────────
+BS_V1A_FWD = 48     # vanilla Llama fwd no_grad — small footprint, lots of headroom
+BS_V1B_STEP = 5     # vanilla Llama lm_head step — backward activations
+BS_T1_TRAJMEM = 4   # trajmem step — bench_trajmem.py sweep shows BS=8 OOMs
+K_V2_VANILLA = 10   # vanilla GRPO group size
+K_T2_TRAJMEM = 4    # trajmem GRPO — K=4 already 22 GB peak
+
+
 def _make_fake_tokenizer():
     """Minimal tokenizer stub for Phase2Trainer.step (decode + eos_id)."""
     class T:
@@ -55,13 +71,11 @@ def _make_fake_tokenizer():
     return T()
 
 
-def bench_phase1_vanilla(args, device, llama, vocab):
-    """V1.A: vanilla Llama forward (no_grad). V1.B: vanilla Llama lm_head step."""
-    BS = args.bs
+def bench_phase1_vanilla_fwd(args, device, llama, vocab, BS):
+    """V1.A: vanilla Llama forward (no_grad)."""
     T = args.t_phase1
     input_ids = torch.randint(0, vocab, (BS, T), device=device)
 
-    # V1.A — forward only
     llama.train(False)
     for p in llama.parameters():
         p.requires_grad = False
@@ -70,11 +84,20 @@ def bench_phase1_vanilla(args, device, llama, vocab):
         with torch.no_grad():
             return llama(input_ids).logits
 
-    print("\n[V1.A] Vanilla Llama forward (no_grad)")
-    tps_a, mem_a, _ = bench("vanilla Llama fwd (no_grad)",
-                             vanilla_fwd, args.warmup, args.iter, BS, T)
+    print(f"\n[V1.A] Vanilla Llama forward (no_grad) BS={BS}")
+    tps, mem, _ = bench("vanilla Llama fwd (no_grad)",
+                         vanilla_fwd, args.warmup, args.iter, BS, T)
+    cleanup_cuda()
+    return tps, mem
 
-    # V1.B — lm_head-only train step
+
+def bench_phase1_vanilla_step(args, device, llama, vocab, BS):
+    """V1.B: vanilla Llama lm_head-only TF training step (backward included)."""
+    T = args.t_phase1
+    input_ids = torch.randint(0, vocab, (BS, T), device=device)
+
+    for p in llama.parameters():
+        p.requires_grad = False
     for p in llama.lm_head.parameters():
         p.requires_grad = True
     llama.train(True)
@@ -92,23 +115,23 @@ def bench_phase1_vanilla(args, device, llama, vocab):
         loss.backward()
         opt.step()
 
-    print("\n[V1.B] Vanilla Llama lm_head TF step")
-    tps_b, mem_b, _ = bench("vanilla Llama step (lm_head)",
-                             vanilla_step, args.warmup, args.iter, BS, T)
+    print(f"\n[V1.B] Vanilla Llama lm_head TF step BS={BS}")
+    tps, mem, _ = bench("vanilla Llama step (lm_head)",
+                         vanilla_step, args.warmup, args.iter, BS, T)
 
     # Reset llama to frozen for next caller.
     for p in llama.parameters():
         p.requires_grad = False
     llama.train(False)
+    del opt
     cleanup_cuda()
-    return (tps_a, mem_a), (tps_b, mem_b)
+    return tps, mem
 
 
-def bench_phase1_trajmem(args, device):
+def bench_phase1_trajmem(args, device, BS):
     """T1: Llama + trajmem full Phase1Trainer.step_wave1."""
     cfg = getattr(TrajMemConfig, args.config_tier)()
     T = cfg.D * cfg.T_window
-    BS = args.bs
 
     model = IntegratedLM(cfg, model_name=args.model, attach_lm=True).to(device)
     if args.compile:
@@ -133,14 +156,13 @@ def bench_phase1_trajmem(args, device):
     return tps, mem
 
 
-def bench_phase2_vanilla(args, device, llama, vocab):
+def bench_phase2_vanilla(args, device, llama, vocab, K):
     """V2: vanilla Llama GRPO (sample J responses no_grad, TF replay,
     backward through lm_head). Mimics what `Phase2Trainer.step` does
     with vanilla Llama as the policy (no memory module)."""
     BS = 1  # Phase 2 is per-prompt
     T_pre = args.t_prompt
     T_gen = args.t_gen
-    K = args.num_samples
     prompt_ids = torch.randint(0, vocab, (BS, T_pre), device=device)
 
     # Set up: only lm_head trainable.
@@ -201,13 +223,12 @@ def bench_phase2_vanilla(args, device, llama, vocab):
     return tps, mem, ms
 
 
-def bench_phase2_trajmem(args, device):
+def bench_phase2_trajmem(args, device, K):
     """T2: Llama + trajmem Phase2Trainer.step (two-pass GRPO)."""
     cfg = getattr(TrajMemConfig, args.config_tier)()
     BS = 1
     T_pre = args.t_prompt
     T_gen = args.t_gen
-    K = args.num_samples
 
     model = IntegratedLM(cfg, model_name=args.model, attach_lm=True).to(device)
     if args.compile:
@@ -247,16 +268,12 @@ def main():
     ap.add_argument("--model", default="meta-llama/Llama-3.2-1B")
     ap.add_argument("--config-tier", choices=["small", "medium", "large"],
                     default="medium")
-    ap.add_argument("--bs", type=int, default=2,
-                    help="BS for Phase 1 paths (V1.A, V1.B, T1)")
     ap.add_argument("--t-phase1", type=int, default=1024,
                     help="Sequence length for Phase 1 paths (= D × T_window)")
     ap.add_argument("--t-prompt", type=int, default=1024,
                     help="Phase 2 prompt length")
     ap.add_argument("--t-gen", type=int, default=64,
                     help="Phase 2 max generated tokens per sample")
-    ap.add_argument("--num-samples", type=int, default=4,
-                    help="Phase 2 GRPO group size K")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile model.forward_window for trajmem paths")
     ap.add_argument("--warmup", type=int, default=3)
@@ -278,9 +295,14 @@ def main():
     print(f"  model:       {args.model}")
     print(f"  config tier: {args.config_tier}")
     print(f"  compile:     {'on' if args.compile else 'off'}")
-    print(f"  Phase 1:     BS={args.bs}, T={args.t_phase1}")
-    print(f"  Phase 2:     T_prompt={args.t_prompt}, T_gen={args.t_gen}, "
-          f"K={args.num_samples}")
+    print(f"  Per-path BS / K (each at its own max-fitting size):")
+    print(f"    V1.A vanilla fwd:   BS={BS_V1A_FWD}")
+    print(f"    V1.B vanilla step:  BS={BS_V1B_STEP}")
+    print(f"    T1   trajmem step:  BS={BS_T1_TRAJMEM}")
+    print(f"    V2   vanilla GRPO:  K={K_V2_VANILLA}")
+    print(f"    T2   trajmem GRPO:  K={K_T2_TRAJMEM}")
+    print(f"  Phase 1: T={args.t_phase1}")
+    print(f"  Phase 2: T_prompt={args.t_prompt}, T_gen={args.t_gen}")
 
     # Load Llama once for vanilla paths.
     if not args.skip_phase1 or not args.skip_phase2:
@@ -294,8 +316,9 @@ def main():
     p2_v = p2_t = None
 
     if not args.skip_phase1:
-        p1_a, p1_b = bench_phase1_vanilla(args, device, llama, vocab)
-        p1_t = bench_phase1_trajmem(args, device)
+        p1_a = bench_phase1_vanilla_fwd(args, device, llama, vocab, BS_V1A_FWD)
+        p1_b = bench_phase1_vanilla_step(args, device, llama, vocab, BS_V1B_STEP)
+        p1_t = bench_phase1_trajmem(args, device, BS_T1_TRAJMEM)
 
     if not args.skip_phase2:
         # Re-load llama since trajmem path freed it (also reset frozen
@@ -305,38 +328,44 @@ def main():
                 args.model, dtype=torch.bfloat16,
             ).to(device)
             vocab = llama.config.vocab_size
-        p2_v = bench_phase2_vanilla(args, device, llama, vocab)
+        p2_v = bench_phase2_vanilla(args, device, llama, vocab, K_V2_VANILLA)
         del llama
         cleanup_cuda()
-        p2_t = bench_phase2_trajmem(args, device)
+        p2_t = bench_phase2_trajmem(args, device, K_T2_TRAJMEM)
 
     # ── Summary table ────────────────────────────────────────────────
     print("\n" + "=" * 76)
-    print("SUMMARY")
+    print("SUMMARY (each path at its own max-fitting BS / K)")
     print("=" * 76)
 
     def row(label: str, tps, mem):
         if tps is None:
-            print(f"  {label:<50}      n/a")
+            print(f"  {label:<55}      n/a")
             return
-        print(f"  {label:<50} {tps/1000:>8.1f}k tok/s   {mem:>5.2f} GB")
+        # Phase 1 numbers are k tok/s; Phase 2 (GRPO) is tens of tok/s — show
+        # both at the same precision regardless of magnitude.
+        if tps >= 1000:
+            tps_str = f"{tps/1000:>7.1f}k tok/s"
+        else:
+            tps_str = f"{tps:>7.1f}  tok/s"
+        print(f"  {label:<55} {tps_str}   {mem:>5.2f} GB")
 
     if not args.skip_phase1:
         print("Phase 1 (long-doc TF NTP):")
-        row(f"  V1.A — vanilla Llama fwd (no_grad)", *p1_a)
-        row(f"  V1.B — vanilla Llama lm_head TF step", *p1_b)
-        row(f"  T1   — Llama + trajmem step", *p1_t)
+        row(f"  V1.A — vanilla Llama fwd (no_grad)   BS={BS_V1A_FWD}", *p1_a)
+        row(f"  V1.B — vanilla Llama lm_head step    BS={BS_V1B_STEP}", *p1_b)
+        row(f"  T1   — Llama + trajmem step          BS={BS_T1_TRAJMEM}", *p1_t)
         if p1_b[0] and p1_t[0]:
-            print(f"\n  T1 vs V1.B slowdown: "
-                  f"{p1_b[0] / p1_t[0]:.2f}× "
-                  f"(adding the memory module costs {p1_b[0] - p1_t[0]:.0f} tok/s)")
+            print(f"\n  T1 vs V1.B (per-token tput, each at own max BS): "
+                  f"{p1_b[0] / p1_t[0]:.2f}×")
 
     if not args.skip_phase2:
-        print("\nPhase 2 (GRPO, K samples × prompt+gen tokens, lm_head trainable):")
-        row(f"  V2   — vanilla Llama GRPO step", p2_v[0], p2_v[1])
-        row(f"  T2   — Llama + trajmem two-pass GRPO step", p2_t[0], p2_t[1])
+        print("\nPhase 2 (GRPO, lm_head trainable for vanilla):")
+        row(f"  V2   — vanilla Llama GRPO step       K={K_V2_VANILLA}", *p2_v[:2])
+        row(f"  T2   — Llama + trajmem two-pass GRPO K={K_T2_TRAJMEM}", *p2_t[:2])
         if p2_v[0] and p2_t[0]:
-            print(f"\n  T2 vs V2 slowdown: {p2_v[0] / p2_t[0]:.2f}×")
+            print(f"\n  T2 vs V2 (per-token tput, each at own max K): "
+                  f"{p2_v[0] / p2_t[0]:.2f}×")
 
 
 if __name__ == "__main__":

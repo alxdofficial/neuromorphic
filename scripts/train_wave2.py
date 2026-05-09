@@ -81,8 +81,11 @@ def main():
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
     if args.compile:
+        # dynamic=True so the rolling LM context's varying length doesn't
+        # trigger dynamo recompiles per shape (hits recompile_limit=8 within
+        # a few chunks otherwise). See `scripts/experiment_compile_dynamic.py`.
         model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=False,
+            model.forward_window, mode="default", dynamic=True,
         )
         print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
