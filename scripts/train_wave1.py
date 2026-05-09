@@ -67,6 +67,10 @@ def main():
                          "memory-bridging probe). If set, eval at each save.")
     ap.add_argument("--val-batches", type=int, default=20,
                     help="number of val batches to average per eval pass")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile model.forward_window. ~28% speedup at "
+                         "BS=2 with ~2 min cold-start. Recommended for "
+                         "production runs (see docs/bench_results.md).")
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -78,6 +82,12 @@ def main():
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    if args.compile:
+        model.forward_window = torch.compile(
+            model.forward_window, mode="default", dynamic=False,
+        )
+        print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
 
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
     scheduler = WarmupCosineScheduler(

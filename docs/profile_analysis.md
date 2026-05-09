@@ -163,25 +163,76 @@ just confirming we're already on the fast path.
   max-autotune costs minutes of compile time for marginal gains at this
   scale.
 
-## Recommended optimization order
+## What landed (2026-05-09)
 
-1. **Audit data-movement (item 1).** Highest expected return, no
-   architecture change. Mostly removing redundant `.to()` and `.detach()`
-   calls. Estimated 5-8% speedup.
+**Wired `--compile` into `train_wave1.py` + `train_wave2.py`.** This was
+the actual low-hanging fruit — the bench had already shown 28% speedup
+at BS=2 from `torch.compile(model.forward_window)`, but that win was
+unreachable from the trainer entrypoints. Now they pass `--compile` to
+flip it on. ~2 min cold-start per first step; pays for itself within
+~10 steps.
 
-2. **Compile read+write modules (item 3).** Trivial code change (1-2
-   lines), modest win. Combine with #1 since they touch related code paths.
+## What was attempted but deferred
 
-3. **Share d_lm projections (item 2).** Bigger refactor — touches read/
-   write/bridge module structure — but addresses a real architectural
-   issue (params over-allocated to translation) AND gives speed back.
-   Worth doing alongside the param-allocation rebalance we discussed
-   earlier.
+**Audit data-movement (item 1) — turned out NOT to be 1-line fixes.**
 
-Items 1+2+3 combined should land us at ~10-15% step speedup, which is
-real but not transformative. The real ceiling is the 99% Llama backbone
-share — to break through that we'd need either a smaller backbone (out
-of scope) or a fundamentally different architecture (out of scope).
+The explicit `prev_window_hiddens.to(prev_states.dtype)` casts in
+`forward_window` are *structurally* needed: read_module and write_module
+both contain `cat([pooled_hiddens, head_query, ...])` operations, and
+`head_query` is an `nn.Parameter` stored in fp32. PyTorch's `cat` with
+mixed dtypes promotes to fp32 (it's in autocast's "promote" list), so
+cat operands must already be same dtype.
+
+To remove the casts we'd need to either:
+- Refactor read/write modules to avoid the cat (e.g., split into two
+  parallel projections + add), or
+- Explicitly cast `head_query` per call to match input dtype
+
+Neither is a 1-line change. They're worth doing alongside the broader
+"share d_lm↔D_concept projections" architectural cleanup, not as a
+standalone optimization.
+
+**Autocast(bf16) wrapping — blocked on scatter_mean dtype.**
+
+Tried `with torch.autocast("cuda", dtype=torch.bfloat16): trainer.step_wave1(chunk)`.
+Hits `RuntimeError: scatter(): Expected self.dtype to be equal to src.dtype`
+inside `Manifold.write` — the scatter destination buffer is fp32
+(per the manifold-fp32 design rule) but autocast made the source bf16.
+
+Fixing requires either:
+- Changing the manifold scatter to accept mixed dtypes (with explicit
+  cast), or
+- Keeping `concept_states` buffer in bf16 (drops fp32 accuracy benefit)
+
+Both are real architectural decisions, not low-hanging. Documented for
+future work.
+
+**Compile read/write modules separately — already happens implicitly.**
+
+`torch.compile(model.forward_window)` traces *through* `forward_window`,
+which calls `read_module(...)` and `write_module(...)` directly. Inductor
+already fuses kernels inside those modules as part of the traced graph.
+Adding separate `torch.compile()` wrappers would either be redundant or
+fight with the outer compile. Verified empirically — top kernels in the
+profile are tensor-core gemms, which is what we'd want from inductor.
+
+## Realistic ceiling
+
+The 99% Llama-share ceiling stands. Items that genuinely could help
+beyond the compile flag we just landed:
+
+1. **Share d_lm↔D_concept projections** — saves both params and
+   per-window compute. Real refactor (~1 day work). Pairs with the
+   param-allocation rebalancing discussion. Estimated 3-5%.
+2. **Manifold dtype refactor** — make scatter_mean dtype-agnostic, then
+   wrap forward in autocast(bf16) for kernel-level wins. Real work but
+   self-contained. Estimated 5-10%.
+3. **Gradient checkpointing on Llama** — saves memory not speed; would
+   let us push BS=8+, useful at large config later.
+
+Items #1 and #2 combined would land another ~10% on top of the compile
+win, but they're real engineering, not 1-line audits. Worth doing only
+if the first training run shows we need more headroom.
 
 ## Reproducing
 

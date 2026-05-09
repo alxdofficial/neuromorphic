@@ -72,8 +72,8 @@ Cold-start compile cost ~1-3 min per BS; reuses across iters within a run.
 
 ### Recommended production setting
 
-**`--config-tier medium --batch-size 2 --compile`** (when compile lands in
-trainer entrypoints):
+**`--config-tier medium --batch-size 2 --compile`** (compile flag is now
+wired into `train_wave1.py` / `train_wave2.py`):
 
 - 9.1k tok/s — peak throughput (tied with BS=1 + compile)
 - 10.5 GB peak — leaves 14 GB headroom for variable-length W2 batches,
