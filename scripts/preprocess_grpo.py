@@ -51,33 +51,79 @@ def _gsm8k_extract(ex):
     return prompt, answer_text, "exact_match", {"gold_number": gold_num}
 
 
-def _narrativeqa_extract(ex, *, passage_chars: int = 32000, use_summary: bool = False):
+def _narrativeqa_extract(
+    ex,
+    *,
+    tokenizer=None,
+    max_prompt_tokens: int = 8192,
+    use_summary: bool = False,
+):
     """Extract a NarrativeQA prompt + gold answers.
 
     NarrativeQA's full `document.text` is huge (~700K chars / ~150K tokens).
     `document.summary.text` is much shorter (~5K chars / ~1K tokens) and
     fits in the LM's 2K context cap — defeats the memory-stress purpose.
 
-    We use a slice of the FULL document (default 32K chars ≈ 8K tokens)
-    so the passage extends well past the 2K LM cap, forcing the
-    trajectory module to bridge the gap. Pass `use_summary=True` to
-    fall back to the short summary (faster but less memory-stress).
+    We slice the FULL document and truncate **at token level** so the
+    final tokenized prompt fits inside `max_prompt_tokens` while preserving
+    the trailing `Question: ... Answer:` markers. Earlier versions used a
+    fixed `passage_chars=32000` and let the caller truncate via
+    `prompt_ids[:max_prompt_tokens]`, which dropped the question on
+    ~26% of examples (the truncation cuts from the END). This version
+    fixes that.
+
+    Pass `use_summary=True` to fall back to the short summary (faster but
+    less memory-stress).
     """
     doc = ex["document"]
-    if use_summary:
-        passage = doc.get("summary", {}).get("text", "")
-    else:
-        full = doc.get("text", "")
-        passage = full[:passage_chars] if full else doc.get("summary", {}).get("text", "")
+    full_passage = (
+        doc.get("summary", {}).get("text", "")
+        if use_summary else doc.get("text", "")
+    )
+    if not full_passage:
+        return None
     question = ex["question"]["text"]
     gold_answers = [a["text"] for a in ex.get("answers", []) if a.get("text")]
     if not gold_answers:
         return None
     gold = gold_answers[0]
-    prompt = (
-        f"Read the following passage and answer the question.\n\n"
-        f"Passage:\n{passage}\n\nQuestion: {question}\n\nAnswer:"
-    )
+
+    intro = "Read the following passage and answer the question.\n\nPassage:\n"
+    suffix = f"\n\nQuestion: {question}\n\nAnswer:"
+
+    if tokenizer is None:
+        # Fallback path (no tokenizer available — use char approx).
+        # ~3 chars/token for English narrative; leave headroom.
+        passage_chars = (max_prompt_tokens - 200) * 3
+        passage = full_passage[:passage_chars]
+    else:
+        # Token-aware truncation: ensure the full prompt fits, with the
+        # passage absorbing all the truncation (intro + question + answer
+        # marker stay intact). Pre-trim at char-level first so we don't
+        # spend O(150K tokens) tokenizing each NarrativeQA passage when
+        # we'll only keep the first ~8K.
+        intro_ids = tokenizer.encode(intro, add_special_tokens=True)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        margin = 16  # safety for tokenizer joining quirks at boundaries
+        passage_budget = max_prompt_tokens - len(intro_ids) - len(suffix_ids) - margin
+        if passage_budget < 256:
+            return None  # question too long; skip this example
+        # Conservative char→token estimate: 5 chars/token (loose upper bound
+        # — actual narrative text is ~3.5-4 chars/token, but tokenizers
+        # sometimes split short words into more tokens than chars/avg
+        # suggests). We tokenize a slice ~25% over budget then truncate
+        # precisely.
+        passage_chars_safe = passage_budget * 5 + 200
+        passage_ids = tokenizer.encode(
+            full_passage[:passage_chars_safe], add_special_tokens=False,
+        )
+        if len(passage_ids) > passage_budget:
+            passage_ids = passage_ids[:passage_budget]
+            passage = tokenizer.decode(passage_ids, skip_special_tokens=True)
+        else:
+            passage = full_passage[:passage_chars_safe]
+
+    prompt = f"{intro}{passage}{suffix}"
     return prompt, gold, "exact_match_or_bert_cosine", {"all_answers": gold_answers}
 
 
@@ -159,6 +205,12 @@ def preprocess(
     rows_reward = []
     rows_meta = []
 
+    # NarrativeQA needs the tokenizer to do passage-budget truncation so the
+    # `Question: .../Answer:` suffix isn't cut off. Other extracts ignore it.
+    extract_kwargs = {}
+    if source == "narrativeqa":
+        extract_kwargs = {"tokenizer": tok, "max_prompt_tokens": max_prompt_tokens}
+
     n_seen = 0
     n_kept = 0
     for ex in iterate_examples(
@@ -166,7 +218,7 @@ def preprocess(
     ):
         n_seen += 1
         try:
-            result = extract(ex)
+            result = extract(ex, **extract_kwargs)
         except Exception as e:
             print(f"  [warn] extract failed at {n_seen}: {e}")
             continue

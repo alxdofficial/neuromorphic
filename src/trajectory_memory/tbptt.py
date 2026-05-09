@@ -140,7 +140,19 @@ def run_chunk(
             target_mask=win_mask,
             hard_routing=hard_routing,
         )
-        outputs.append(out)
+        # Strip heavy tensors before appending — `outputs` is only used for
+        # debug/test inspection downstream. `logits` is [BS, T_window, V]
+        # (~500MB across a chunk at vocab=128K, BS=2, T_window=256).
+        # `current_hiddens` is also redundant since we keep it as
+        # `cur_prev_hiddens` and it surfaces as `final_hiddens`. Carry only
+        # the small per-window metadata + the new_states tensor (needed by
+        # tests).
+        outputs.append({
+            "new_states": out["new_states"],
+            "read_visited": out["read_visited"],
+            "write_visited": out["write_visited"],
+            "surprise": out["surprise"],
+        })
         losses.append(out["surprise"].sum())                       # NTP CE summed across batch
         surprises.append(out["surprise"])
 

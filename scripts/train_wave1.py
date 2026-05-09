@@ -96,7 +96,10 @@ def main():
         total_steps=args.num_steps,
         lr_min_ratio=args.lr_min_ratio,
     )
-    trainer = Phase1Trainer(model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip)
+    trainer = Phase1Trainer(
+        model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     if args.checkpoint_in is not None:
         ckpt = load_checkpoint(

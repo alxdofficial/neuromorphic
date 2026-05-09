@@ -62,11 +62,17 @@ class Phase1Trainer:
         *,
         scheduler: object | None = None,    # WarmupCosineScheduler-like
         grad_clip: float | None = 1.0,
+        pad_token_id: int = 0,
     ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.grad_clip = grad_clip
+        # pad_token_id is used in step_wave2 / eval_wave2 for chunk padding.
+        # Default 0 (legacy) only for backward compat with toy tests; real
+        # training MUST pass the tokenizer's pad_token_id (128001 for
+        # Llama-3) so Llama doesn't see synthetic `!` tokens in its context.
+        self.pad_token_id = pad_token_id
         self._step_count = 0
 
     @property
@@ -143,7 +149,7 @@ class Phase1Trainer:
         cfg = self.model.cfg
         BS = batch.prior_ids.shape[0]
         device = batch.prior_ids.device
-        pad_token = 0
+        pad_token = self.pad_token_id
 
         full_ids = torch.cat([batch.prior_ids, batch.response_ids], dim=1)
         full_mask = torch.cat(
@@ -233,7 +239,7 @@ class Phase1Trainer:
         cfg = self.model.cfg
         BS = batch.prior_ids.shape[0]
         device = batch.prior_ids.device
-        pad_token = 0
+        pad_token = self.pad_token_id
 
         full_ids = torch.cat([batch.prior_ids, batch.response_ids], dim=1)
         full_mask = torch.cat(

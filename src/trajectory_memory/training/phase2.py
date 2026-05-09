@@ -109,12 +109,30 @@ class Phase2Trainer:
         temperature: float = 1.0,
     ) -> Phase2Metrics:
         """One GRPO step on a single prompt."""
+        # Llama-3 has two natural stop signals: `<|end_of_text|>` (eos,
+        # 128001) used for math/code completions, and `<|eot_id|>` (128009)
+        # used to terminate an assistant turn in the chat template. Wave 3
+        # data uses the former; Wave 4 (TurnPair from preprocess_chat.py)
+        # appends the latter. Passing both as stop_ids covers both reward
+        # shapes without needing source-aware plumbing.
+        stop_ids = {tokenizer.eos_token_id}
+        # `<|eot_id|>` is Llama-3's chat-turn terminator. Add it if the
+        # tokenizer recognizes it; some tokenizers (e.g. test fakes) won't.
+        if hasattr(tokenizer, "convert_tokens_to_ids"):
+            try:
+                eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                unk = getattr(tokenizer, "unk_token_id", None)
+                if eot_id is not None and eot_id != unk:
+                    stop_ids.add(eot_id)
+            except Exception:
+                pass
         samples, logps = self._rollout(
             prompt_ids,
             num_samples=num_samples,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            eos_id=tokenizer.eos_token_id,
+            stop_ids=stop_ids,
+            pad_id=getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id,
         )
 
         decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
@@ -164,7 +182,8 @@ class Phase2Trainer:
         num_samples: int,
         max_new_tokens: int,
         temperature: float = 1.0,
-        eos_id: int | None = None,
+        stop_ids: set[int] | None = None,
+        pad_id: int = 0,
     ) -> tuple[list[Tensor], list[Tensor]]:
         """Sample `num_samples` AR responses from a single prompt.
 
@@ -179,7 +198,8 @@ class Phase2Trainer:
         for _ in range(num_samples):
             sample, lp = self._rollout_one(
                 prompt_ids, max_new_tokens=max_new_tokens,
-                temperature=temperature, eos_id=eos_id, device=device,
+                temperature=temperature, stop_ids=stop_ids,
+                pad_id=pad_id, device=device,
             )
             samples.append(sample)
             logps.append(lp)
@@ -191,7 +211,8 @@ class Phase2Trainer:
         *,
         max_new_tokens: int,
         temperature: float,
-        eos_id: int | None,
+        stop_ids: set[int] | None,
+        pad_id: int,
         device: torch.device,
     ) -> tuple[Tensor, Tensor]:
         """One AR sample. Token-by-token (slow but correct)."""
@@ -210,7 +231,10 @@ class Phase2Trainer:
             ).unsqueeze(0)
             if lm_input.shape[1] < cfg.T_window:
                 pad_n = cfg.T_window - lm_input.shape[1]
-                lm_input = F.pad(lm_input, (pad_n, 0), value=0)
+                # Left-pad with the tokenizer's pad token (= eos_token for
+                # Llama-3, id 128001). Earlier `value=0` padded with `!`
+                # (token 0), which corrupted the LM's leading context.
+                lm_input = F.pad(lm_input, (pad_n, 0), value=pad_id)
 
             out = self.model.forward_window(
                 lm_input_ids=lm_input,
@@ -227,7 +251,7 @@ class Phase2Trainer:
             generated.append(sampled)
             cur_tokens.append(sampled)
 
-            if eos_id is not None and sampled == eos_id:
+            if stop_ids is not None and sampled in stop_ids:
                 break
 
             prev_states = out["new_states"].detach()

@@ -273,20 +273,32 @@ class IntegratedLM(nn.Module):
             # Wire memory_fn for this forward call.
             mem_inject = self._mem_inject_layer()
             mem_inject.memory_fn = self._build_memory_fn(read_visited)
+            # Capture the FINAL hidden state via a forward hook on the
+            # final RMS norm. Setting `output_hidden_states=True` would
+            # make HF transformers accumulate references to all 16 layers'
+            # outputs (~128MB held per call at BS=2, L_lm=1024); we only
+            # use the last layer's output (= input to lm_head). The hook
+            # captures it in O(1) memory.
+            captured: list[Tensor] = []
+
+            def _capture(_module, _inputs, output):
+                captured.append(output)
+
+            hook = self.llama.model.norm.register_forward_hook(_capture)
             try:
                 lm_out = self.llama(
                     input_ids=lm_input_ids,
-                    output_hidden_states=True,
+                    output_hidden_states=False,
                     use_cache=False,
                 )
             finally:
-                # Always clear the closure to avoid leaking the trajectory tensor
-                # into a stale reference across windows.
+                # Always clear hook + closure to avoid leaking refs across windows.
+                hook.remove()
                 mem_inject.memory_fn = None
 
             # Slice to the current-window positions (last T_window).
             full_logits = lm_out.logits                              # [BS, L_lm, V]
-            full_hiddens = lm_out.hidden_states[-1]                  # [BS, L_lm, d_lm]
+            full_hiddens = captured[0]                               # [BS, L_lm, d_lm]
             logits = full_logits[:, -T_window:, :]                   # [BS, T_window, V]
             current_hiddens = full_hiddens[:, -T_window:, :].to(prev_states.dtype)
 
