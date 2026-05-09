@@ -22,6 +22,12 @@ import torch
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.data.tokenizer import get_tokenizer
 from src.trajectory_memory.integrated_lm import IntegratedLM
+from src.trajectory_memory.training.metrics import (
+    grad_norms_by_component, surprise_stats, vram_stats,
+)
+from src.trajectory_memory.training.plotting import (
+    save_training_plots, dump_history_json,
+)
 from src.trajectory_memory.training import (
     Phase1Trainer,
     WarmupCosineScheduler,
@@ -64,6 +70,10 @@ def main():
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile model.forward_window. ~28% speedup at "
                          "low BS, ~2 min cold-start. See docs/bench_results.md.")
+    ap.add_argument("--plot-path", type=Path, default=None,
+                    help="If set, save a multi-panel diagnostic plot here every "
+                         "--plot-every-seconds. PNG; overwritten in place.")
+    ap.add_argument("--plot-every-seconds", type=float, default=180.0)
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -140,6 +150,15 @@ def main():
 
     losses: list = []
     t_start = time.time()
+    last_plot_t = time.time()
+    last_step_t = time.time()
+    history: dict = {
+        "step": [], "loss": [], "grad_norm": [], "lr": [],
+        "surprise_mean": [], "surprise_std": [],
+        "tok_per_sec": [], "vram_peak_gb": [],
+        "val_step": [], "val_loss": {},
+    }
+
     while trainer.step_count < args.num_steps:
         for batch in dataset:
             if trainer.step_count >= args.num_steps:
@@ -150,6 +169,30 @@ def main():
             losses.append(metrics.loss)
 
             step = trainer.step_count
+            now = time.time()
+            history["step"].append(step)
+            history["loss"].append(metrics.loss)
+            history["grad_norm"].append(metrics.grad_norm)
+            history["lr"].append(list(metrics.lr))
+            if metrics.surprise_history is not None:
+                ss = surprise_stats(metrics.surprise_history)
+                history["surprise_mean"].append(ss["mean"])
+                history["surprise_std"].append(ss["std"])
+            else:
+                history["surprise_mean"].append(0.0)
+                history["surprise_std"].append(0.0)
+            try:
+                for comp, val in grad_norms_by_component(model).items():
+                    history.setdefault(f"grad_norm_{comp}", []).append(val)
+            except Exception:
+                pass
+            n_tok = batch.prior_ids.shape[1] + batch.response_ids.shape[1]
+            history["tok_per_sec"].append(
+                batch.prior_ids.shape[0] * n_tok / max(now - last_step_t, 1e-6),
+            )
+            last_step_t = now
+            history["vram_peak_gb"].append(vram_stats()["peak_gb"])
+
             if step % args.log_every == 0:
                 avg = sum(losses[-args.log_every:]) / max(len(losses[-args.log_every:]), 1)
                 elapsed = time.time() - t_start
@@ -162,6 +205,8 @@ def main():
                 if val_dataset is not None:
                     val_loss = run_val()
                     print(f"  step {step:>5}  val_loss={val_loss:.4f}")
+                    history["val_step"].append(step)
+                    history["val_loss"].setdefault("val", []).append(val_loss)
                 if args.checkpoint_out is not None:
                     save_checkpoint(
                         args.checkpoint_out,
@@ -171,6 +216,14 @@ def main():
                         extra={"config": cfg.__dict__, "losses": losses},
                     )
                     print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
+
+            # Live plot refresh.
+            if args.plot_path is not None:
+                if now - last_plot_t > args.plot_every_seconds:
+                    save_training_plots(history, args.plot_path)
+                    dump_history_json(history, args.plot_path.with_suffix(".json"))
+                    last_plot_t = now
+                    print(f"  step {step:>5}  plot saved to {args.plot_path}")
 
     if args.checkpoint_out:
         save_checkpoint(

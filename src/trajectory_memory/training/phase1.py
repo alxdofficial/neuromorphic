@@ -184,7 +184,14 @@ class Phase1Trainer:
         prev_lm_context: Tensor | None = None
 
         self.optimizer.zero_grad()
-        total_loss = torch.zeros((), device=device)
+        # Per-chunk backward + detach is the standard TBPTT pattern for
+        # variable-length sequences: bound activation memory at one
+        # chunk's worth, accumulate gradients across chunks via the
+        # optimizer's grad buffers, do one optimizer.step at the end.
+        # The earlier "single total_loss.backward()" pattern OOMd at BS=1
+        # on long WildChat priors (10K+ tokens / 10+ chunks of activations
+        # held alive simultaneously).
+        total_loss_value = 0.0
         all_surprise: list[Tensor] = []
 
         for c in range(n_chunks):
@@ -201,20 +208,26 @@ class Phase1Trainer:
                 target_mask=win_mask,
                 hard_routing=True,
             )
-            total_loss = total_loss + out["aggregate_loss"]
-            all_surprise.append(out["surprise_history"])
+            chunk_loss = out["aggregate_loss"]
+            # Per-chunk backward — accumulates grad into optimizer's
+            # buffers, releases this chunk's activations before the next
+            # chunk allocates its own.
+            chunk_loss.backward()
+            total_loss_value = total_loss_value + float(chunk_loss.detach())
+            all_surprise.append(out["surprise_history"].detach())
 
-            # Detach for cross-chunk TBPTT cut.
+            # Detach for cross-chunk state carry. Already cut from autograd
+            # by the per-chunk backward, but keep .detach() to drop the
+            # graph node references explicitly.
             prev_states = out["final_states"].detach()
             prev_window_hiddens = out["final_hiddens"].detach()
             prev_lm_context = out["final_lm_context"]
 
-        total_loss.backward()
         grad_norm = self._clip_and_step()
         self._step_count += 1
 
         return Phase1Metrics(
-            loss=float(total_loss.detach()),
+            loss=total_loss_value,
             grad_norm=float(grad_norm),
             lr=self._current_lrs(),
             surprise_history=torch.stack(all_surprise, dim=1).detach() if all_surprise else None,

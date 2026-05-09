@@ -33,6 +33,15 @@ from torch.utils.data import DataLoader
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.data.tokenizer import get_tokenizer
 from src.trajectory_memory.integrated_lm import IntegratedLM
+from src.trajectory_memory.training.metrics import (
+    grad_norms_by_component,
+    surprise_stats,
+    vram_stats,
+)
+from src.trajectory_memory.training.plotting import (
+    save_training_plots,
+    dump_history_json,
+)
 from src.trajectory_memory.training import (
     Phase1Trainer,
     WarmupCosineScheduler,
@@ -78,6 +87,12 @@ def main():
                     help="torch.compile model.forward_window. ~28% speedup at "
                          "BS=2 with ~2 min cold-start. Recommended for "
                          "production runs (see docs/bench_results.md).")
+    ap.add_argument("--plot-path", type=Path, default=None,
+                    help="If set, save a multi-panel diagnostic plot here "
+                         "every --plot-every-seconds. PNG; overwritten in "
+                         "place. Companion .json dump is written next to it.")
+    ap.add_argument("--plot-every-seconds", type=float, default=180.0,
+                    help="Seconds between plot refreshes (default 180 = 3 min).")
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -155,38 +170,60 @@ def main():
         pad_id=pad_id, drop_short=False,
     )
 
-    val_dataset = None
+    # Per-source val datasets — each parquet path gets its own dataset
+    # and its own loss series. Lets us plot the needle val loss
+    # specifically (memory-bridging probe) alongside other sources.
+    val_datasets: dict[str, LongDocDataset] = {}
     if args.val_data_paths:
-        val_dataset = LongDocDataset(
-            args.val_data_paths,
-            chunk_tokens=cfg.D * cfg.T_window,
-            pad_id=pad_id, drop_short=False,
-        )
-        print(f"Validation: {len(args.val_data_paths)} parquet(s), "
-              f"{args.val_batches} batches per eval")
+        for p in args.val_data_paths:
+            # Source label = stem without trailing ".val" if present.
+            label = Path(p).stem.replace(".val", "")
+            val_datasets[label] = LongDocDataset(
+                [p],
+                chunk_tokens=cfg.D * cfg.T_window,
+                pad_id=pad_id, drop_short=False,
+            )
+        print(f"Validation: {len(val_datasets)} source(s) "
+              f"({', '.join(val_datasets.keys())}), "
+              f"{args.val_batches} batches per eval per source")
 
-    def run_val() -> float:
-        if val_dataset is None:
-            return float("nan")
-        losses_v: list[float] = []
-        # Val loss with state RESET each chunk — purely per-chunk perplexity.
-        # (We could thread state through val docs too, but that's slower and
-        # the per-chunk number is easier to read for monitoring.)
-        for i, item in enumerate(val_dataset):
-            if i >= args.val_batches:
-                break
-            chunk_v = item.input_ids.unsqueeze(0).to(args.device)
-            losses_v.append(trainer.eval_wave1(chunk_v))
-        return sum(losses_v) / max(len(losses_v), 1)
+    def run_val_per_source() -> dict[str, float]:
+        """Returns {source_label: mean_val_loss}. State reset each chunk."""
+        out: dict[str, float] = {}
+        for label, vds in val_datasets.items():
+            losses_v: list[float] = []
+            for i, item in enumerate(vds):
+                if i >= args.val_batches:
+                    break
+                chunk_v = item.input_ids.unsqueeze(0).to(args.device)
+                losses_v.append(trainer.eval_wave1(chunk_v))
+            out[label] = sum(losses_v) / max(len(losses_v), 1)
+        return out
 
     print(f"Starting Wave 1 training: {args.num_steps} steps "
           f"(starting from step {trainer.step_count})")
     losses: list = []
     t_start = time.time()
+    last_plot_t = time.time()
+    # Live history dict — populated each step, plotted every plot-every-seconds.
+    history: dict = {
+        "step": [],
+        "loss": [],
+        "grad_norm": [],
+        "lr": [],
+        "surprise_mean": [],
+        "surprise_std": [],
+        "tok_per_sec": [],
+        "vram_peak_gb": [],
+        "val_step": [],
+        "val_loss": {},  # {source: [vals indexed by val_step]}
+    }
+    # Per-component grad-norm series initialized lazily once we see them.
     # Cross-chunk state for the single batch slot.
     prev_states = None
     prev_window_hiddens = None
     prev_lm_context = None
+    last_step_t = time.time()
 
     while trainer.step_count < args.num_steps:
         for item in dataset:
@@ -201,8 +238,6 @@ def main():
                 prev_lm_context = None
             chunk = item.input_ids.unsqueeze(0).to(args.device)         # [1, T]
             valid_mask = item.valid_mask.unsqueeze(0).to(args.device)   # [1, T]
-            # Reshape valid_mask to match the [BS, D, T_window] target_mask
-            # shape that step_wave1 / forward_window expect.
             target_mask = valid_mask.view(1, cfg.D, cfg.T_window)
             metrics = trainer.step_wave1(
                 chunk,
@@ -211,10 +246,43 @@ def main():
                 prev_lm_context=prev_lm_context,
                 target_mask=target_mask,
             )
-            prev_states = metrics.final_states           # already detached
-            prev_window_hiddens = metrics.final_hiddens  # already detached
-            prev_lm_context = metrics.final_lm_context   # already detached
+            prev_states = metrics.final_states
+            prev_window_hiddens = metrics.final_hiddens
+            prev_lm_context = metrics.final_lm_context
             losses.append(metrics.loss)
+
+            # ── Per-step metric collection for live monitoring ─────
+            step = trainer.step_count
+            now = time.time()
+            history["step"].append(step)
+            history["loss"].append(metrics.loss)
+            history["grad_norm"].append(metrics.grad_norm)
+            history["lr"].append(list(metrics.lr))
+            # Surprise distribution (per-window NTP CE — should drop as
+            # memory learns to bridge the LM cap).
+            if metrics.surprise_history is not None:
+                ss = surprise_stats(metrics.surprise_history)
+                history["surprise_mean"].append(ss["mean"])
+                history["surprise_std"].append(ss["std"])
+            else:
+                history["surprise_mean"].append(0.0)
+                history["surprise_std"].append(0.0)
+            # Per-component grad norms (safe: grads still populated from
+            # this step; zero_grad in the NEXT step will clear).
+            try:
+                comp_norms = grad_norms_by_component(model)
+                for comp, val in comp_norms.items():
+                    history.setdefault(f"grad_norm_{comp}", []).append(val)
+            except Exception:
+                pass
+            # Throughput (tok/s for this step).
+            chunk_tokens = chunk.shape[1]
+            dt = max(now - last_step_t, 1e-6)
+            history["tok_per_sec"].append(chunk_tokens / dt)
+            last_step_t = now
+            # VRAM peak.
+            v = vram_stats()
+            history["vram_peak_gb"].append(v["peak_gb"])
 
             step = trainer.step_count
             if step % args.log_every == 0:
@@ -226,9 +294,13 @@ def main():
                       f"({elapsed/max(step, 1):.2f}s/step)")
 
             if step > 0 and step % args.save_every == 0:
-                if val_loader is not None:
-                    val_loss = run_val()
-                    print(f"  step {step:>5}  val_loss={val_loss:.4f}")
+                if val_datasets:
+                    per_source = run_val_per_source()
+                    history["val_step"].append(step)
+                    for src, v in per_source.items():
+                        history["val_loss"].setdefault(src, []).append(v)
+                    pretty = "  ".join(f"{s}={v:.3f}" for s, v in per_source.items())
+                    print(f"  step {step:>5}  val: {pretty}")
                 if args.checkpoint_out is not None:
                     save_checkpoint(
                         args.checkpoint_out,
@@ -238,6 +310,16 @@ def main():
                         extra={"config": cfg.__dict__, "losses": losses},
                     )
                     print(f"  saved checkpoint to {args.checkpoint_out} at step {step}")
+
+            # ── Live plot refresh (time-based, default 3 min) ─────
+            if args.plot_path is not None:
+                if now - last_plot_t > args.plot_every_seconds:
+                    save_training_plots(history, args.plot_path)
+                    json_path = args.plot_path.with_suffix(".json")
+                    dump_history_json(history, json_path)
+                    last_plot_t = now
+                    print(f"  step {step:>5}  plot saved to {args.plot_path} "
+                          f"(history: {json_path})")
 
     if args.checkpoint_out is not None:
         save_checkpoint(

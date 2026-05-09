@@ -100,10 +100,46 @@ debug iteration where startup time matters more than steady-state speed.
 
 ---
 
+---
+
+## 2026-05-09 — Phase 1 + Phase 2 comparison vs vanilla Llama
+
+Re-ran with all the post-audit fixes landed (chunk state threading,
+output_hidden_states hook, logits-slicing, run_chunk strip, two-pass
+GRPO). RTX 4090, eager, medium config, **BS=2** for Phase 1 / **K=4
+samples** for Phase 2.
+
+| Path | tok/s | peak GB | ms/iter |
+|------|------:|--------:|--------:|
+| **Phase 1** (BS=2, T=1024, lm_head-only trainable for vanilla) |  |  |  |
+| V1.A — vanilla Llama forward (no_grad) | **52.0k** | 3.08 | 39.4 |
+| V1.B — vanilla Llama lm_head TF step | **16.8k** | 10.26 | 122.0 |
+| T1 — Llama + trajmem step | **9.3k** | 12.07 | 219.6 |
+| **Phase 2** (T_pre=1024, T_gen=64, K=4 samples) |  |  |  |
+| V2 — vanilla Llama GRPO step | ~43 | 10.31 | 5965 |
+| T2 — Llama + trajmem two-pass GRPO step | ~35 | 22.00 | 7354 |
+
+**Slowdowns:**
+- T1 vs V1.B: **1.80×** — memory module costs ~7.5k tok/s (bridge MLP
+  + read/write trajectory hops × D=4 windows).
+- T2 vs V2: **1.23×** — smaller relative slowdown because Phase 2 is
+  dominated by serial AR sampling (no KV cache in either path).
+
+**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py --bs 2 \
+--t-phase1 1024 --t-prompt 1024 --t-gen 64 --num-samples 4`
+
+**Notes:**
+- Phase 2 throughput is ~3 orders of magnitude lower than Phase 1 in
+  tok/s. That's an architectural property of AR-without-KV-cache, not
+  a memory-module problem — vanilla is also slow at this shape.
+- Phase 2's 22 GB peak (T2) sits near our 24 GB ceiling. K=8 would not
+  fit; T_gen=128+ marginal. KV caching for AR would help both.
+
 ## Cross-references
 
-- `scripts/bench_trajmem.py` — the bench harness
+- `scripts/bench_trajmem.py` — Phase 1 sweep harness
+- `scripts/bench_compare.py` — Phase 1 + Phase 2 vs vanilla comparison
 - `scripts/_bench_common.py` — `bench()` timing primitive (warmup, sync,
   OOM cleanup, peak-mem stats)
 - graph_walker's `docs/bench_results.md` (on `abandoned/graph-walker`) —
-  vanilla Llama paths A/B/C reference numbers
+  reference numbers for an architecture with similar memory bridge.
