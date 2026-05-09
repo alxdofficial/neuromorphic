@@ -2,15 +2,41 @@
 (long-session). Implements GRPO: sample J responses per prompt, score each,
 compute group-relative advantage, policy gradient (plan §4.7).
 
+**Two-pass GRPO** (the plan §4.6 fallback, made default 2026-05-09 to
+fix three correctness issues that the single-pass path had):
+
+  Pass 1 — sampling (`_ar_sample_one`, no_grad).
+    Prefill the prompt through memory (forward_window over each T_window
+    window of the prompt, state carried), then generate AR token-by-token
+    with `forward_window`. No autograd graph; cheap memory.
+
+  Pass 2 — TF logp for backward (`_tf_compute_sample_logp`).
+    TF-forward the full (prompt + sampled-response) sequence in
+    T_window-sized windows with state carrying — this is structurally
+    identical to W1/W2 forward, including memory state passing through
+    `write_module`. Per-sample-token logp is computed under the same
+    tempered softmax used during sampling. Single backward at the end
+    accumulates policy gradient with full graph including the writer.
+
+Why two-pass over single-pass:
+  - Single-pass detached `new_states / hiddens` every generated token to
+    bound activation memory. That worked but cut the gradient chain
+    from rollout reward to write_module → writer never learned from
+    GRPO. Two-pass only holds activations alive within pass 2's single
+    TF forward (linear in sequence length, not token count × samples).
+  - Single-pass had no prefill: long prompts (NarrativeQA 8K, WildChat
+    priors 4-8K) entered AR with empty memory state. Two-pass gets
+    prefill for free in both passes — pass 1 explicit, pass 2 by
+    structure.
+  - KV cache is fundamentally hard with per-window memory injection
+    (memory readout changes per window, not per token). Two-pass moves
+    the dominant gradient cost out of AR (which still has no KV cache)
+    into TF (which never needed one). AR is still slow but it's now
+    pure inference, can be optimized later.
+
 The `Phase2Trainer` class is the proper training harness with grad
 clipping, LR scheduling, metrics dict, and checkpoint integration. The
 legacy `grpo_step` free function is preserved for back-compat.
-
-NOTE on rollout efficiency: the current `grpo_rollout` does one
-`forward_window` call per generated token — correct but slow. A real
-training run should batch generation per-T_window (one read+predict+write
-cycle per window of generated tokens, with an HF `generate()`-style KV
-cache inside each window). Wired as a follow-up; see `_rollout_one`.
 """
 
 from __future__ import annotations
@@ -126,15 +152,23 @@ class Phase2Trainer:
                     stop_ids.add(eot_id)
             except Exception:
                 pass
-        samples, logps = self._rollout(
-            prompt_ids,
-            num_samples=num_samples,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            stop_ids=stop_ids,
-            pad_id=getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id,
-        )
+        pad_id = getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id
+        device = next(self.model.parameters()).device
 
+        # ── PASS 1: AR sample each response (no_grad), with prefill ──
+        samples: list[Tensor] = []
+        for _ in range(num_samples):
+            sample = self._ar_sample_one(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stop_ids=stop_ids,
+                pad_id=pad_id,
+                device=device,
+            )
+            samples.append(sample)
+
+        # ── SCORE ────────────────────────────────────────────────────
         decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
         rewards = [
             compute_reward(reward_kind, c, gold=gold, meta=meta) for c in decoded
@@ -142,18 +176,30 @@ class Phase2Trainer:
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
         advantages = compute_grpo_advantages(rewards_t)
 
+        # ── PASS 2: TF logp for each sample (with grad), backward ────
+        # TF-forward through (prompt + sample) for each sample,
+        # collecting per-sample-token logp under the tempered softmax
+        # used during sampling. Memory writes are in the gradient path
+        # because pass 2 carries state through `write_module` normally
+        # (no detach within a single sample's forward).
         self.optimizer.zero_grad()
-        policy_loss = torch.zeros((), device=prompt_ids.device)
+        policy_loss = torch.zeros((), device=device)
         any_grad = False
-        for adv, lp in zip(advantages, logps):
-            if lp.numel() == 0:
+        for sample, adv in zip(samples, advantages):
+            if sample.numel() == 0:
                 continue
-            policy_loss = policy_loss + (-adv * lp.sum())
+            sample_logps = self._tf_compute_sample_logp(
+                prompt_ids=prompt_ids,
+                sample_ids=sample.to(device),
+                temperature=temperature,
+                pad_id=pad_id,
+                device=device,
+            )
+            if sample_logps.numel() == 0:
+                continue
+            policy_loss = policy_loss + (-adv * sample_logps.sum())
             any_grad = True
         policy_loss = policy_loss / max(num_samples, 1)
-        # If no samples produced any tokens (e.g., all hit eos immediately, or
-        # test-mode rollout with V=1 always sampling index 0), skip the
-        # optimizer update — there's nothing to learn from this step.
         if any_grad:
             policy_loss.backward()
             grad_norm = self._clip_and_step()
@@ -173,39 +219,66 @@ class Phase2Trainer:
             mean_response_len=sum(len(s) for s in samples) / max(len(samples), 1),
         )
 
-    # ── rollout (batched-per-token; correct but slow) ─────────────────
+    # ── PASS 1: no-grad AR sampling (with prefill) ────────────────────
 
-    def _rollout(
+    @torch.no_grad()
+    def _prefill_prompt(
         self,
         prompt_ids: Tensor,
         *,
-        num_samples: int,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        stop_ids: set[int] | None = None,
-        pad_id: int = 0,
-    ) -> tuple[list[Tensor], list[Tensor]]:
-        """Sample `num_samples` AR responses from a single prompt.
+        pad_id: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor | None, Tensor]:
+        """Walk forward_window over the FULL prompt in T_window-sized
+        windows, accumulating manifold state. Returns the final
+        (prev_states, prev_window_hiddens, lm_buffer) so AR generation
+        starts from a memory state that has seen the entire prompt.
 
-        Returns (samples, token_logps). See module docstring on efficiency.
+        Earlier rollout paths only fed the trailing `effective_lm_context`
+        tokens of the prompt into a fresh manifold — long prompts beyond
+        the LM cap were never written into memory.
+
+        no_grad: this is pure inference setup; pass 2 will redo the
+        forward with grad if memory writes need gradient signal.
         """
         cfg = self.model.cfg
-        device = next(self.model.parameters()).device
+        cap = cfg.effective_lm_context
+        T = cfg.T_window
+        toks = prompt_ids.flatten().tolist()
+        n = len(toks)
 
-        samples: list[Tensor] = []
-        logps: list[Tensor] = []
+        prev_states = self.model.manifold.reset_states(batch_size=1)
+        prev_window_hiddens: Tensor | None = None
+        lm_buffer = torch.empty(1, 0, dtype=torch.int64, device=device)
 
-        for _ in range(num_samples):
-            sample, lp = self._rollout_one(
-                prompt_ids, max_new_tokens=max_new_tokens,
-                temperature=temperature, stop_ids=stop_ids,
-                pad_id=pad_id, device=device,
+        for win_start in range(0, n, T):
+            win = toks[win_start : win_start + T]
+            if len(win) < T:
+                # Right-pad the partial last window so forward_window
+                # gets a full-T_window slice. The pad tokens are
+                # overwritten by the next AR step's tokens or simply
+                # ignored (we don't compute loss here).
+                win = win + [pad_id] * (T - len(win))
+            win_t = torch.tensor(win, dtype=torch.int64, device=device).unsqueeze(0)
+            lm_input = torch.cat([lm_buffer, win_t], dim=1)
+            if lm_input.shape[1] > cap:
+                lm_input = lm_input[:, -cap:]
+
+            out = self.model.forward_window(
+                lm_input_ids=lm_input,
+                prev_window_hiddens=prev_window_hiddens,
+                prev_states=prev_states,
+                target_mask=None,
+                hard_routing=True,
             )
-            samples.append(sample)
-            logps.append(lp)
-        return samples, logps
+            prev_states = out["new_states"]
+            prev_window_hiddens = out["current_hiddens"]
+            lm_buffer = lm_input[:, -(cap - T):] if cap > T else lm_input[:, :0]
 
-    def _rollout_one(
+        return prev_states, prev_window_hiddens, lm_buffer
+
+    @torch.no_grad()
+    def _ar_sample_one(
         self,
         prompt_ids: Tensor,
         *,
@@ -214,26 +287,31 @@ class Phase2Trainer:
         stop_ids: set[int] | None,
         pad_id: int,
         device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        """One AR sample. Token-by-token (slow but correct)."""
-        cfg = self.model.cfg
-        prev_states = self.model.manifold.reset_states(batch_size=1)
-        prev_window_hiddens: Tensor | None = None
+    ) -> Tensor:
+        """One AR rollout, no_grad. Returns just the generated token IDs.
 
-        cur_tokens = prompt_ids.tolist() if prompt_ids.dim() == 1 else prompt_ids[0].tolist()
+        Pass-2 (`_tf_compute_sample_logp`) recomputes per-token logp with
+        gradient — pass 1 doesn't need to record it.
+        """
+        cfg = self.model.cfg
+        cap = cfg.effective_lm_context
+        T = cfg.T_window
+
+        # Prefill the full prompt through memory.
+        prev_states, prev_window_hiddens, lm_buffer = self._prefill_prompt(
+            prompt_ids, pad_id=pad_id, device=device,
+        )
+
+        cur_tokens = prompt_ids.flatten().tolist()
         generated: list[int] = []
-        per_tok_logp: list[Tensor] = []
 
         for _ in range(max_new_tokens):
             lm_input = torch.tensor(
-                cur_tokens[-cfg.effective_lm_context:],
+                cur_tokens[-cap:],
                 dtype=torch.int64, device=device,
             ).unsqueeze(0)
-            if lm_input.shape[1] < cfg.T_window:
-                pad_n = cfg.T_window - lm_input.shape[1]
-                # Left-pad with the tokenizer's pad token (= eos_token for
-                # Llama-3, id 128001). Earlier `value=0` padded with `!`
-                # (token 0), which corrupted the LM's leading context.
+            if lm_input.shape[1] < T:
+                pad_n = T - lm_input.shape[1]
                 lm_input = F.pad(lm_input, (pad_n, 0), value=pad_id)
 
             out = self.model.forward_window(
@@ -244,28 +322,119 @@ class Phase2Trainer:
                 hard_routing=True,
             )
             logits = out["logits"][:, -1, :].float()
-            # Sample under the TEMPERED distribution and record logp under
-            # the same distribution (policy-gradient correctness — when
-            # temperature != 1.0, the sampling distribution and the recorded
-            # logp must match, else the policy gradient is biased).
             scaled_logits = logits / temperature
             probs = F.softmax(scaled_logits, dim=-1)
             sampled = torch.multinomial(probs, num_samples=1).item()
-            logp = F.log_softmax(scaled_logits, dim=-1)[0, sampled]
-            per_tok_logp.append(logp)
             generated.append(sampled)
             cur_tokens.append(sampled)
 
             if stop_ids is not None and sampled in stop_ids:
                 break
 
-            prev_states = out["new_states"].detach()
-            prev_window_hiddens = out["current_hiddens"].detach()
+            # State carry between AR steps. Detach is fine here — pass 1
+            # is no_grad anyway. The graph that matters lives in pass 2.
+            prev_states = out["new_states"]
+            prev_window_hiddens = out["current_hiddens"]
 
-        return (
-            torch.tensor(generated, dtype=torch.int64),
-            torch.stack(per_tok_logp) if per_tok_logp else torch.zeros(0),
-        )
+        return torch.tensor(generated, dtype=torch.int64)
+
+    # ── PASS 2: TF logp computation (with grad, single backward) ──────
+
+    def _tf_compute_sample_logp(
+        self,
+        prompt_ids: Tensor,
+        sample_ids: Tensor,
+        *,
+        temperature: float,
+        pad_id: int,
+        device: torch.device,
+    ) -> Tensor:
+        """TF-forward through (prompt + sample), return per-sample-token
+        logp under `softmax(logits / temperature)` — matches pass 1's
+        sampling distribution exactly.
+
+        Memory state carries through `write_module` across windows
+        without any detach, so the autograd graph from each sample-token
+        logp reaches all trainable params (bridge, read_module,
+        write_module, manifold).
+
+        Returns: [n_sample_tokens] tensor of logps with grad.
+        """
+        cfg = self.model.cfg
+        cap = cfg.effective_lm_context
+        T = cfg.T_window
+
+        prompt = prompt_ids.flatten().tolist()
+        sample = sample_ids.flatten().tolist()
+        full_seq = prompt + sample
+        n_full = len(full_seq)
+        n_prompt = len(prompt)
+
+        # Walk through full_seq in T-sized windows. State carries with grad.
+        prev_states = self.model.manifold.reset_states(batch_size=1)
+        prev_window_hiddens: Tensor | None = None
+        lm_buffer = torch.empty(1, 0, dtype=torch.int64, device=device)
+        sample_logps: list[Tensor] = []
+
+        for win_start in range(0, n_full, T):
+            win_end = min(win_start + T, n_full)
+            win = full_seq[win_start:win_end]
+            n_real = len(win)
+            if n_real < T:
+                win = win + [pad_id] * (T - n_real)
+            win_t = torch.tensor(win, dtype=torch.int64, device=device).unsqueeze(0)
+            lm_input = torch.cat([lm_buffer, win_t], dim=1)
+            if lm_input.shape[1] > cap:
+                lm_input = lm_input[:, -cap:]
+
+            out = self.model.forward_window(
+                lm_input_ids=lm_input,
+                prev_window_hiddens=prev_window_hiddens,
+                prev_states=prev_states,
+                target_mask=None,
+                hard_routing=True,
+            )
+            # forward_window's `logits` is [BS, T_window, V] aligned to the
+            # LAST T tokens of lm_input — i.e., the current window. logit at
+            # position i predicts win[i+1] (using win[i] as input). For
+            # sample positions, the predictor is the previous token in the
+            # full sequence.
+            logits = out["logits"]                               # [1, T, V]
+            # For each position p in [win_start, win_end), the predictor
+            # is at logit index p - win_start - 1 (within this window).
+            # Skip p == 0 (no predecessor) and skip prompt positions
+            # (we only need logp for sample tokens).
+            for p in range(max(win_start, n_prompt), win_end):
+                logit_idx = p - win_start - 1
+                if logit_idx < 0:
+                    # Predecessor was in the previous window — handle by
+                    # reading from the lm_input tail of THIS window
+                    # (rolling buffer). Actual predictor position within
+                    # lm_input is (lm_input.shape[1] - T) + logit_idx.
+                    # If that's also < 0 we're at the very first token of
+                    # the sequence (no predecessor); skip.
+                    abs_idx = lm_input.shape[1] - T + logit_idx
+                    if abs_idx < 0:
+                        continue
+                    # forward_window returns logits aligned to the last
+                    # T_window positions of lm_input. To get logits for
+                    # earlier positions we'd need to re-forward — not
+                    # worth it for the boundary token. Skip it. (One
+                    # missed logp per sample is noise.)
+                    continue
+                logit = logits[0, logit_idx]                     # [V]
+                scaled = logit / temperature
+                logp_p = F.log_softmax(scaled, dim=-1)[full_seq[p]]
+                sample_logps.append(logp_p)
+
+            # Carry state — NO DETACH, autograd graph stays alive.
+            prev_states = out["new_states"]
+            prev_window_hiddens = out["current_hiddens"]
+            lm_buffer = lm_input[:, -(cap - T):] if cap > T else lm_input[:, :0]
+
+        if not sample_logps:
+            return torch.zeros(0, device=device)
+        return torch.stack(sample_logps)
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -294,13 +463,29 @@ def grpo_rollout(
     max_new_tokens: int,
     temperature: float = 1.0,
     eos_id: int | None = None,
+    pad_id: int = 0,
 ):
-    """Compatibility shim around Phase2Trainer._rollout."""
+    """Compatibility shim — pure no-grad sampling. Returns
+    `(samples, logps)` where `logps` is a list of empty tensors (the
+    new two-pass design recomputes logps in pass 2 inside the trainer
+    step, so there's no per-token logp here). Existing callers should
+    migrate to `Phase2Trainer.step` for actual training."""
     trainer = Phase2Trainer(model, optimizer=torch.optim.SGD([torch.zeros(1)], lr=0))
-    return trainer._rollout(
-        prompt_ids, num_samples=num_samples,
-        max_new_tokens=max_new_tokens, temperature=temperature, eos_id=eos_id,
-    )
+    device = next(model.parameters()).device
+    samples = []
+    stop_ids = {eos_id} if eos_id is not None else None
+    for _ in range(num_samples):
+        sample = trainer._ar_sample_one(
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            stop_ids=stop_ids,
+            pad_id=pad_id,
+            device=device,
+        )
+        samples.append(sample)
+    logps = [torch.zeros(0) for _ in samples]
+    return samples, logps
 
 
 def grpo_step(

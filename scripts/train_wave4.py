@@ -49,7 +49,11 @@ def main():
                     default="medium")
     ap.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--checkpoint-in", type=Path, default=None)
+    ap.add_argument("--checkpoint-in", type=Path, default=None,
+                    help="checkpoint to resume from OR warm-start from. "
+                         "When loading W3 to start W4, always pass --warm-start.")
+    ap.add_argument("--warm-start", action="store_true",
+                    help="Load only model weights (no optimizer/scheduler/step).")
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--log-every", type=int, default=5)
@@ -69,12 +73,24 @@ def main():
     trainer = Phase2Trainer(model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip)
 
     if args.checkpoint_in:
-        ckpt = load_checkpoint(
-            args.checkpoint_in, model=model,
-            optimizer=optimizer, scheduler=scheduler,
-            map_location=args.device,
-        )
-        trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
+        if args.warm_start:
+            ckpt = load_checkpoint(
+                args.checkpoint_in, model=model,
+                optimizer=None, scheduler=None,
+                map_location=args.device,
+            )
+            print(f"Warm-started from {args.checkpoint_in}")
+        else:
+            ckpt = load_checkpoint(
+                args.checkpoint_in, model=model,
+                optimizer=optimizer, scheduler=scheduler,
+                map_location=args.device,
+            )
+            trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
+            from src.trajectory_memory.training.checkpoint import restore_rng_state
+            if "rng_state" in ckpt:
+                restore_rng_state(ckpt["rng_state"])
+            print(f"Resumed from {args.checkpoint_in} step {ckpt.get('step')}")
 
     dataset = TurnPairDataset(args.data_paths, batch_size=1, pad_id=tokenizer.pad_token_id)
     print(f"Wave 4 dataset: {len(dataset._rows)} TurnPairs")

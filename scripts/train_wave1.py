@@ -59,6 +59,13 @@ def main():
     ap.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--checkpoint-in", type=Path, default=None)
+    ap.add_argument("--warm-start", action="store_true",
+                    help="Load only model weights from --checkpoint-in; "
+                         "do NOT restore optimizer state, scheduler state, "
+                         "or step count. Use when starting a NEW wave from "
+                         "a previous wave's checkpoint (default behavior is "
+                         "full resume — appropriate only when continuing the "
+                         "same wave's training).")
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
@@ -102,13 +109,33 @@ def main():
     )
 
     if args.checkpoint_in is not None:
-        ckpt = load_checkpoint(
-            args.checkpoint_in, model=model,
-            optimizer=optimizer, scheduler=scheduler,
-            map_location=args.device,
-        )
-        trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
-        print(f"Resumed from {args.checkpoint_in} at step {ckpt.get('step')}")
+        if args.warm_start:
+            # Warm-start: load model weights only. Optimizer/scheduler/step
+            # stay fresh — appropriate when starting a new wave from a
+            # previous wave's checkpoint (the LR schedule for THIS wave
+            # should run from step 0).
+            ckpt = load_checkpoint(
+                args.checkpoint_in, model=model,
+                optimizer=None, scheduler=None,
+                map_location=args.device,
+            )
+            print(f"Warm-started model from {args.checkpoint_in} "
+                  f"(optimizer/scheduler/step reset to fresh)")
+        else:
+            # Full resume: restore everything.
+            ckpt = load_checkpoint(
+                args.checkpoint_in, model=model,
+                optimizer=optimizer, scheduler=scheduler,
+                map_location=args.device,
+            )
+            trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
+            # Restore RNG state for reproducibility on resume (was saved
+            # but never restored before).
+            from src.trajectory_memory.training.checkpoint import restore_rng_state
+            if "rng_state" in ckpt:
+                restore_rng_state(ckpt["rng_state"])
+            print(f"Resumed from {args.checkpoint_in} at step {ckpt.get('step')} "
+                  f"(optimizer/scheduler/RNG restored)")
 
     # NOTE: BS>1 with cross-chunk state threading would require per-batch-
     # element state reset (different docs in different slots, finishing at
