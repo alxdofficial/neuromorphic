@@ -28,22 +28,32 @@ Per project memory:
 params
 
 **Config (`TrajMemConfig.medium`):**
-- Manifold: N=2048 concepts · D_concept=256 · K_max_neighbors=32 ·
-  radius=16 · p_rewire=0.5
+- Manifold: N=4096 concepts · D_concept=256 · K_max_neighbors=64 ·
+  radius=32 · p_rewire=0.5 · **262K directed edges**
 - Trajectories: J=4 · K_read=8 · K_write=8
 - Window: T_window=256 · D=4 (TBPTT depth) · **chunk = D × T_window =
   1024 tokens**
 - Bridge: `MemInjectLayer` 2-layer MLP, `bridge_hidden=2048` (= d_lm),
   inject at layer 8
-- Trainable params: **4.5M** (≪ Llama; backbone frozen)
+- Trainable params: **16.5M** (≪ Llama; backbone frozen)
+  - bridge 9.44M · write 2.49M · read 2.43M · manifold 2.10M
+
+(History: prior to 2026-05-09 bump, medium was N=2048, K=32 → 65K edges,
+15.4M trainable. Bench numbers were within ~1% — manifold is too small
+relative to Llama for the bump to dominate throughput.)
 
 ### Sweep — `bench_trajmem.py --config-tier medium --bs 1 --max-bs 32`
 
+Numbers below are at the **post-bump medium config** (N=4096, K=64,
+trainable 16.46M). Bench was re-run after the bump; throughput within
+~1% of pre-bump values, peak GB up by ~0.05GB (manifold is small
+relative to Llama).
+
 | BS | eager tok/s | eager peak GB | compile tok/s | compile peak GB |
 |----|------------:|-------------:|--------------:|---------------:|
-| 1  | 7.1k | 7.4  | **9.1k** | **5.7**  |
-| 2  | 8.1k | 13.1 | **9.1k** | 10.5     |
-| 4  | **8.6k** | 21.5 | 8.6k | 22.2 |
+| 1  | 7.1k | 7.5  | **9.1k** | **5.7**  |
+| 2  | 8.1k | 13.1 | **9.1k** | 10.6     |
+| 4  | **8.5k** | 21.6 | 8.5k | 22.3 |
 | 8  | OOM  | —    | OOM      | —        |
 
 `compile` flag: `torch.compile(model.forward_window, mode="default", dynamic=False)`.

@@ -23,9 +23,9 @@ class TrajMemConfig:
     """
 
     # ── manifold capacity ─────────────────────────────────────────────
-    N: int = 2048
+    N: int = 4096
     D_concept: int = 256
-    K_max_neighbors: int = 32
+    K_max_neighbors: int = 64
 
     # ── topology (small-world ring rewire) ────────────────────────────
     # 1D ring with each concept's K_max nearest neighbors as the local
@@ -35,7 +35,7 @@ class TrajMemConfig:
     # candidates for K=64) — for our 1D ring topology we need
     # radius >= K_max/2.
     p_rewire: float = 0.5
-    radius: int = 16
+    radius: int = 32
 
     # ── trajectory shape ──────────────────────────────────────────────
     J: int = 4
