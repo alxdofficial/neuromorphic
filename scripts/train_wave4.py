@@ -59,6 +59,9 @@ def main():
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--log-every", type=int, default=5)
+    ap.add_argument("--no-compile", dest="compile", action="store_false",
+                    help="Disable torch.compile (default ON).")
+    ap.set_defaults(compile=True)
     ap.add_argument("--clip-eps", type=float, default=0.2,
                     help="PPO IS-ratio clip; default 0.2 (TRL/verl).")
     ap.add_argument("--clip-eps-higher", type=float, default=None,
@@ -71,6 +74,11 @@ def main():
     tokenizer = get_tokenizer()
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
+    if args.compile:
+        model.forward_window = torch.compile(
+            model.forward_window, mode="default", dynamic=True,
+        )
+        print("Compiled model.forward_window (cold-start ~1-3 min on first step).")
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
     scheduler = WarmupCosineScheduler(
         optimizer,

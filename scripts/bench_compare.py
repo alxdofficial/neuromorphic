@@ -52,7 +52,7 @@ BS_V1A_FWD = 48     # vanilla Llama fwd no_grad — small footprint, lots of hea
 BS_V1B_STEP = 5     # vanilla Llama lm_head step — backward activations
 BS_T1_TRAJMEM = 4   # trajmem step (KV cache) — sweep shows BS=8 OOMs eager
 K_V2_VANILLA = 12   # vanilla GRPO with KV cache (K=14 OOMs; pass-2 holds K forwards' activations)
-K_T2_TRAJMEM = 6    # trajmem GRPO with KV cache (K=8 OOMs)
+K_T2_TRAJMEM = 16   # trajmem GRPO with shared prefill (Phase D) — was K=6 at 20.92 GB
 
 
 def _make_fake_tokenizer():

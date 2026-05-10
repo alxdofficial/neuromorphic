@@ -270,6 +270,86 @@ generation window (with surprise=0 per plan §5.4, since AR-generated
 tokens have no NTP target). KV cache makes the per-token LM forwards
 cheap.
 
+---
+
+## 2026-05-10 — Phase 2 GRPO correctness + shared-prefill efficiency
+
+Big GRPO refactor landed across five phases (A-F). Adds the
+correctness pieces production GRPO implementations all carry (KL term,
+PPO importance-sampling clip, length-bias-free loss aggregation) AND
+the shared-prefill efficiency win for pass 2.
+
+### Final per-path table
+
+| Path | BS / K | tok/s | peak GB | ms/iter |
+|------|-------:|------:|--------:|--------:|
+| **Phase 1** (T=1024) |  |  |  |  |
+| V1.A — vanilla Llama fwd (no_grad)              | BS=48 | **48.7k** | 16.90 | 1009 |
+| V1.B — vanilla Llama lm_head TF step            | BS=5  | **16.9k** | 20.32 |  302 |
+| T1   — Llama + trajmem step (KV cache)          | BS=4  | **17.7k** | 15.07 |  231 |
+| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
+| V2   — vanilla Llama GRPO step (KV cache)       | K=12  | **173.6** | 21.65 | 4425 |
+| T2   — Llama + trajmem GRPO (KV+shared prefill) | **K=16** | **132.8** | **12.78** | 7709 |
+
+### Phase D shared-prefill memory + K wins
+
+The dominant pass-2 cost was K full forwards through (prompt + sample)
+each with their own activation graph. Phase D refactor: encode prompt
+ONCE no_grad, then K per-sample TF forwards start from that shared
+prefill state. Cost of "no_grad prefill": prompt-position writes don't
+get gradient (only sample-position writes do). Acceptable — GRPO is
+optimizing the rollout policy; sample-position writes are the ones
+that directly affect reward.
+
+| Stage | T2 tok/s | T2 peak GB | T2 K |
+|-------|---------:|-----------:|-----:|
+| Pre-KV-cache (yesterday) | 32.4 | 22.00 | 4 |
+| KV cache only (today AM) | 104.8 | 20.92 | 6 |
+| KV cache + shared prefill (today PM) | **132.8** | **12.78** | **16** |
+
+Bigger K = better GRPO group-relative advantage estimates. K=16 matches
+DeepSeek-R1's group size; the project was previously at K=4-6 which
+the audit flagged as too noisy for stable GRPO.
+
+### Phase A-B-D correctness summary (also landed today)
+
+- **Dr.GRPO loss normalization** — divide by `K * max_new_tokens` not
+  just `K` (removes documented length-bias pathology, arxiv 2503.20783).
+- **PPO importance-sampling clip** — `clip(ratio, 1-ε, 1+ε)` with
+  ε=0.2 default (matches TRL/verl). Optional asymmetric upper clip
+  via `--clip-eps-higher` (DeepSeek-R1's `clip_higher` mode).
+- **KL regularization to reference policy** — `β * D_KL(π_θ ‖ π_ref)`
+  with β=0.001 (verl default). Reference is the loaded `--checkpoint-in`
+  weights at start of Phase 2. K3 estimator. Param-swap pattern shares
+  the ref forward across K samples (one swap-cycle per step).
+- **Eval methods now use KV cache** — eval_wave1/eval_wave2 had the
+  rolling-buffer fallback, busting compile cache on every val pass.
+  Now matches training mode.
+- **Partial-window write fix** — when AR stops mid-window, don't pad
+  with zeros and write to manifold (would scatter zero into selected
+  concept slots). If n_win < T/2, skip the write; else pad with the
+  last real hidden.
+- **Default temperature** 1.0 → 0.7 (matches DeepSeek-R1, verl).
+
+### CLI flags added
+
+```bash
+--clip-eps        0.2     # PPO IS clip width (TRL/verl default)
+--clip-eps-higher None    # DeepSeek-R1 asymmetric upper bound
+--kl-coef         0.001   # KL term weight (verl default; 0 disables)
+--no-compile              # opt out of torch.compile (default ON)
+```
+
+### Diagnostics added to `Phase2Metrics`
+
+- `clip_fraction`: % of tokens where ratio was clipped this step
+- `mean_ratio`: mean(ratio); should stay near 1.0
+- `kl_to_ref`: mean per-token K3 KL estimate; rises if drift exceeds reg
+
+Surfaced in trainer log lines.
+
+**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+
 ## Cross-references
 
 - `scripts/bench_trajmem.py` — Phase 1 sweep harness

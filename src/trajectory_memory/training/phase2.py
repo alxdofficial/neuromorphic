@@ -171,6 +171,79 @@ class Phase2Trainer:
         }
 
     @torch.no_grad()
+    def _compute_ref_logps_batch(
+        self,
+        prompt_ids: Tensor,
+        sample_ids_list: list[Tensor],
+        *,
+        temperature: float,
+        pad_id: int,
+        device: torch.device,
+    ) -> list[Tensor | None]:
+        """No-grad: compute REFERENCE-policy logps for K samples in ONE
+        swap-in/swap-out cycle. Returns list of [n_sample_tokens] tensors
+        (or None for empty samples).
+
+        Phase D1 optimization: shared no_grad ref-policy prefill across
+        all K samples (instead of K full prompt+sample forwards each
+        with their own ref prefill). Same param-swap pattern as the old
+        `_compute_ref_logps` but amortized over K rather than per-sample.
+        """
+        K = len(sample_ids_list)
+        if self.ref_state is None or self.kl_coef == 0:
+            return [None] * K
+
+        # Save current trainable params.
+        saved = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        results: list[Tensor | None] = []
+        try:
+            # Swap in ref params for the whole batch.
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    p.data.copy_(self.ref_state[name])
+
+            # Shared ref-policy prefill (encoded once under ref weights).
+            # Test-mode (no real Llama) skips shared prefill.
+            ref_prefill = None
+            if self.model.llama is not None:
+                ref_prefill = self._prefill_prompt(
+                    prompt_ids, pad_id=pad_id, device=device,
+                )
+
+            import copy
+            for sample_ids in sample_ids_list:
+                if sample_ids.numel() == 0:
+                    results.append(None)
+                    continue
+                # Per-sample ref prefill state (cloned so each sample's
+                # ref forward extends independently).
+                sample_prefill = None
+                if ref_prefill is not None:
+                    sample_prefill = (
+                        ref_prefill[0].detach().clone(),
+                        ref_prefill[1].detach().clone(),
+                        copy.deepcopy(ref_prefill[2]),
+                    )
+                ref_logps = self._tf_compute_sample_logp(
+                    prompt_ids=prompt_ids, sample_ids=sample_ids,
+                    temperature=temperature, pad_id=pad_id, device=device,
+                    prefill_state=sample_prefill,
+                )
+                results.append(
+                    ref_logps.detach() if ref_logps.numel() > 0 else None
+                )
+        finally:
+            # Restore current params.
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    p.data.copy_(saved[name])
+        return results
+
+    @torch.no_grad()
     def _compute_ref_logps(
         self,
         prompt_ids: Tensor,
@@ -180,41 +253,15 @@ class Phase2Trainer:
         pad_id: int,
         device: torch.device,
     ) -> Tensor | None:
-        """No-grad TF-forward through (prompt + sample) under the REFERENCE
-        policy. Returns per-sample-token logp.
-
-        Implementation: temporarily swap the trainable params to the ref
-        snapshot, call `_tf_compute_sample_logp` (no_grad context), restore
-        the current params. Two memcpy passes per call (~66 MB each at
-        medium config — trivial).
-        """
-        if self.ref_state is None or self.kl_coef == 0:
-            return None
-
-        # Save current trainable params.
-        saved = {
-            name: p.detach().clone()
-            for name, p in self.model.named_parameters()
-            if p.requires_grad
-        }
-        try:
-            # Swap in ref params.
-            for name, p in self.model.named_parameters():
-                if p.requires_grad:
-                    p.data.copy_(self.ref_state[name])
-            # Compute under ref policy. _tf_compute_sample_logp returns
-            # tensors with grad enabled by default; we're inside @no_grad
-            # so the returned logp tensors are leaf-no-grad.
-            ref_logps = self._tf_compute_sample_logp(
-                prompt_ids=prompt_ids, sample_ids=sample_ids,
-                temperature=temperature, pad_id=pad_id, device=device,
-            )
-            return ref_logps.detach() if ref_logps.numel() > 0 else None
-        finally:
-            # Restore current params.
-            for name, p in self.model.named_parameters():
-                if p.requires_grad:
-                    p.data.copy_(saved[name])
+        """Single-sample backwards-compat wrapper around
+        `_compute_ref_logps_batch`. Used only by tests; production call
+        site uses the batch version directly to share the param-swap
+        across K samples."""
+        results = self._compute_ref_logps_batch(
+            prompt_ids, [sample_ids],
+            temperature=temperature, pad_id=pad_id, device=device,
+        )
+        return results[0]
 
     def step(
         self,
@@ -277,9 +324,29 @@ class Phase2Trainer:
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
         advantages = compute_grpo_advantages(rewards_t)
 
+        # ── PASS 2 SHARED PREFILL (Phase D1, no_grad) ─────────────────
+        # Encode the prompt ONCE under the current policy, no_grad, to
+        # obtain a shared starting state for the K per-sample TF replays.
+        # Without this, each sample re-encodes the prompt — at typical
+        # T_pre=1024 + T_gen=64 + K=6 that's ~78% wasted compute.
+        # Cost of sharing: prompt-position writes don't get gradient
+        # signal (only sample-position writes do). Acceptable: GRPO is
+        # optimizing the rollout policy, sample-position writes are the
+        # ones that directly affect reward.
+        # Test-mode (no real Llama) skips shared prefill — the synthetic
+        # logits path doesn't benefit and the prefill machinery uses
+        # forward_window directly.
+        shared_prefill = None
+        if self.model.llama is not None:
+            with torch.no_grad():
+                shared_prefill = self._prefill_prompt(
+                    prompt_ids, pad_id=pad_id, device=device,
+                )
+                # shared_prefill = (prev_states, prev_window_hiddens, kv_cache)
+
         # ── PASS 2: TF logp + PPO-clip surrogate + KL to reference ───
-        # TF-forward through (prompt + sample) under CURRENT policy with
-        # grad → sample_logps_new. Compute IS ratio against pass-1 logp,
+        # TF-forward through SAMPLE only (with grad), starting from the
+        # shared prefill state. Compute IS ratio against pass-1 logp,
         # apply PPO clip, accumulate weighted advantage. Optionally add
         # KL(π_θ ‖ π_ref) regularization computed under a temporarily-
         # swapped ref-policy forward pass.
@@ -299,15 +366,35 @@ class Phase2Trainer:
         clip_high = 1.0 + (self.clip_eps_higher if self.clip_eps_higher is not None
                            else self.clip_eps)
 
-        for sample, logp_old, adv in zip(samples, samples_logp_old, advantages):
+        # Pre-compute ref-policy logps for all K samples in ONE swap-in
+        # cycle (Phase D1 + B4). When kl_coef=0 or no ref_state, returns
+        # list of Nones.
+        ref_logps_list = self._compute_ref_logps_batch(
+            prompt_ids, [s.to(device) for s in samples],
+            temperature=temperature, pad_id=pad_id, device=device,
+        )
+
+        for i, (sample, logp_old, adv) in enumerate(zip(samples, samples_logp_old, advantages)):
             if sample.numel() == 0:
                 continue
+            # Per-sample prefill state: deep-clone the shared prefill so
+            # each sample's writes evolve the manifold + cache independently.
+            if shared_prefill is not None:
+                import copy
+                prefill_state = (
+                    shared_prefill[0].detach().clone(),
+                    shared_prefill[1].detach().clone(),
+                    copy.deepcopy(shared_prefill[2]),  # KV cache deep-clone
+                )
+            else:
+                prefill_state = None
             sample_logps_new = self._tf_compute_sample_logp(
                 prompt_ids=prompt_ids,
                 sample_ids=sample.to(device),
                 temperature=temperature,
                 pad_id=pad_id,
                 device=device,
+                prefill_state=prefill_state,
             )
             if sample_logps_new.numel() == 0:
                 continue
@@ -333,22 +420,17 @@ class Phase2Trainer:
             n_total += int(n_new)
             ratio_sum += float(ratio.detach().sum())
 
-            # KL term against reference policy (no_grad ref forward).
-            if self.ref_state is not None and self.kl_coef > 0:
-                ref_logps = self._compute_ref_logps(
-                    prompt_ids=prompt_ids,
-                    sample_ids=sample.to(device),
-                    temperature=temperature, pad_id=pad_id, device=device,
-                )
-                if ref_logps is not None and ref_logps.numel() == n_new:
-                    # John Schulman's K3 estimator: KL ≈ exp(log r) - log r - 1
-                    # where log r = logp_new - logp_ref. Always non-negative,
-                    # low-variance, exact in expectation.
-                    log_r = sample_logps_new - ref_logps
-                    kl_per_tok = log_r.exp() - log_r - 1.0
-                    kl_loss = kl_loss + kl_per_tok.sum()
-                    kl_sum += float(kl_per_tok.detach().sum())
-                    kl_count += int(n_new)
+            # KL term against reference policy (precomputed in batch above).
+            ref_logps = ref_logps_list[i]
+            if ref_logps is not None and ref_logps.numel() == n_new:
+                # John Schulman's K3 estimator: KL ≈ exp(log r) - log r - 1
+                # where log r = logp_new - logp_ref. Always non-negative,
+                # low-variance, exact in expectation.
+                log_r = sample_logps_new - ref_logps.to(sample_logps_new.dtype)
+                kl_per_tok = log_r.exp() - log_r - 1.0
+                kl_loss = kl_loss + kl_per_tok.sum()
+                kl_sum += float(kl_per_tok.detach().sum())
+                kl_count += int(n_new)
 
             any_grad = True
 
@@ -724,17 +806,31 @@ class Phase2Trainer:
         temperature: float,
         pad_id: int,
         device: torch.device,
+        prefill_state: tuple | None = None,
     ) -> Tensor:
         """TF-forward through (prompt + sample) with KV cache, return
-        per-sample-token logp under `softmax(logits / temperature)` —
-        matches pass 1's sampling distribution.
+        per-sample-token logp under `softmax(logits / temperature)`.
 
-        Memory state carries through `write_module` across windows
+        Two modes:
+
+        - **Self-contained** (`prefill_state=None`, default): walks the
+          full `prompt + sample` sequence with grad. Used by tests and
+          by the legacy `grpo_step` shim.
+
+        - **Shared-prefill** (Phase D1): caller passes
+          `prefill_state = (prev_states, prev_window_hiddens, kv_cache)`
+          from a prior no_grad prompt encoding (`_pass2_shared_prefill`).
+          We skip the prompt windows and walk only the sample tokens
+          starting from the prefill state. Per-step pass 2 cost drops
+          ~3-4× when K > 1 samples share the same prompt — the prompt
+          is encoded ONCE no_grad rather than K times with grad.
+
+        Memory state carries through `write_module` across sample windows
         without any detach, so the autograd graph from each sample-token
-        logp reaches all trainable params (bridge, read_module,
-        write_module, manifold). KV cache also carries with grad —
-        backward through cached KV tensors propagates to the prior
-        window's bridge-after-layer-8 trainable params.
+        logp reaches all trainable params. KV cache also carries with
+        grad. In shared-prefill mode the prefill's contribution is
+        detached (no_grad) — write_module gets gradient signal only from
+        sample-position writes, which is what GRPO actually optimizes.
 
         Returns: [n_sample_tokens] tensor of logps with grad.
         """
@@ -744,20 +840,31 @@ class Phase2Trainer:
         cap = cfg.effective_lm_context
         T = cfg.T_window
 
-        prompt = prompt_ids.flatten().tolist()
         sample = sample_ids.flatten().tolist()
-        full_seq = prompt + sample
-        n_full = len(full_seq)
-        n_prompt = len(prompt)
+        n_sample = len(sample)
 
-        prev_states = self.model.manifold.reset_states(batch_size=1)
-        prev_window_hiddens: Tensor | None = None
-        kv_cache: object | None = None
+        if prefill_state is not None:
+            # Shared-prefill mode: prompt already encoded no_grad upstream.
+            prev_states, prev_window_hiddens, kv_cache = prefill_state
+            seq_to_walk = sample
+            n_walk = n_sample
+            first_sample_offset = 0
+        else:
+            # Self-contained: walk full (prompt + sample).
+            prompt = prompt_ids.flatten().tolist()
+            n_prompt = len(prompt)
+            prev_states = self.model.manifold.reset_states(batch_size=1)
+            prev_window_hiddens: Tensor | None = None
+            kv_cache: object | None = None
+            seq_to_walk = prompt + sample
+            n_walk = len(seq_to_walk)
+            first_sample_offset = n_prompt
+
         sample_logps: list[Tensor] = []
 
-        for win_start in range(0, n_full, T):
-            win_end = min(win_start + T, n_full)
-            win = full_seq[win_start:win_end]
+        for win_start in range(0, n_walk, T):
+            win_end = min(win_start + T, n_walk)
+            win = seq_to_walk[win_start:win_end]
             n_real = len(win)
             if n_real < T:
                 win = win + [pad_id] * (T - n_real)
@@ -792,7 +899,7 @@ class Phase2Trainer:
             #     compute below.
             logits = out["logits"]                               # [1, T, V]
 
-            for p in range(max(win_start, n_prompt), win_end):
+            for p in range(max(win_start, first_sample_offset), win_end):
                 if p == win_start:
                     # Predecessor is the previous window's last hidden.
                     if last_prev_logit is None:
@@ -818,7 +925,7 @@ class Phase2Trainer:
                     logit_idx = p - win_start - 1
                     logit_vec = logits[0, logit_idx]             # [V]
                 scaled = logit_vec / temperature
-                logp_p = F.log_softmax(scaled, dim=-1)[full_seq[p]]
+                logp_p = F.log_softmax(scaled, dim=-1)[seq_to_walk[p]]
                 sample_logps.append(logp_p)
 
             # Carry state — NO DETACH, autograd graph stays alive across
