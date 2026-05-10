@@ -87,6 +87,12 @@ def main():
                     help="torch.compile model.forward_window. ~28% speedup at "
                          "BS=2 with ~2 min cold-start. Recommended for "
                          "production runs (see docs/bench_results.md).")
+    ap.add_argument("--use-kv-cache", action="store_true",
+                    help="Use HF DynamicCache to skip re-encoding the rolling "
+                         "LM context buffer per window. ~1.8× speedup on Phase 1 "
+                         "(measured: 9.9k → 17.7k tok/s at BS=4, eager). "
+                         "Cache is sliding-window trimmed to "
+                         "effective_lm_context. Strongly recommended.")
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here "
                          "every --plot-every-seconds. PNG; overwritten in "
@@ -127,7 +133,10 @@ def main():
     trainer = Phase1Trainer(
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
+        use_kv_cache=args.use_kv_cache,
     )
+    if args.use_kv_cache:
+        print("KV cache enabled — Llama re-encodes only new T_window tokens per window.")
 
     if args.checkpoint_in is not None:
         if args.warm_start:
@@ -229,6 +238,7 @@ def main():
     prev_states = None
     prev_window_hiddens = None
     prev_lm_context = None
+    past_kv = None  # KV-cache mode only: carries across chunks of the same doc
     last_step_t = time.time()
 
     while trainer.step_count < args.num_steps:
@@ -242,6 +252,7 @@ def main():
                 prev_states = None
                 prev_window_hiddens = None
                 prev_lm_context = None
+                past_kv = None
             chunk = item.input_ids.unsqueeze(0).to(args.device)         # [1, T]
             valid_mask = item.valid_mask.unsqueeze(0).to(args.device)   # [1, T]
             target_mask = valid_mask.view(1, cfg.D, cfg.T_window)
@@ -251,10 +262,12 @@ def main():
                 prev_window_hiddens=prev_window_hiddens,
                 prev_lm_context=prev_lm_context,
                 target_mask=target_mask,
+                past_key_values=past_kv,
             )
             prev_states = metrics.final_states
             prev_window_hiddens = metrics.final_hiddens
             prev_lm_context = metrics.final_lm_context
+            past_kv = metrics.final_past_key_values
             losses.append(metrics.loss)
 
             # ── Per-step metric collection for live monitoring ─────

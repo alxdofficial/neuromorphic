@@ -210,6 +210,66 @@ context grows.
 | Share d_lm↔D_concept projections (bridge / read-attn / write-attn) | 3-5% | medium | Three separate copies of the same shape projection today. |
 | Llama-block gradient checkpointing | 0% speed, ~50% VRAM | small | Lets us push T1 to BS=8+ (gradient quality not throughput). |
 
+---
+
+## 2026-05-10 — KV cache landed: trajmem now matches/beats vanilla
+
+Sliding KV cache implemented for both Phase 1 (rolling LM context buffer)
+and Phase 2 (AR sampling + TF replay). HF DynamicCache, sliding-window
+trimmed to `effective_lm_context`. Cache carries across windows of a
+chunk; detached at chunk boundaries (mirrors `prev_states.detach()`).
+
+Vanilla GRPO sampling in `bench_compare.py` was previously not using
+KV cache — that handicapped vanilla unfairly. Fixed: V2 now uses HF
+DynamicCache for AR. Both vanilla + trajmem benched at each path's
+max-fitting BS / K (project convention).
+
+| Path | BS / K | tok/s | peak GB | ms/iter |
+|------|-------:|------:|--------:|--------:|
+| **Phase 1** (T=1024) |  |  |  |  |
+| V1.A — vanilla Llama fwd (no_grad)         | BS=48 | **48.7k** | 16.90 | 1009 |
+| V1.B — vanilla Llama lm_head TF step       | BS=5  | **16.9k** | 20.32 |  302 |
+| T1   — Llama + trajmem step (KV cache)     | BS=4  | **17.7k** | **15.07** |  232 |
+| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
+| V2   — vanilla Llama GRPO step (KV cache)  | K=12  | **169.5** | 21.65 | 4530 |
+| T2   — Llama + trajmem two-pass GRPO (KV cache) | K=6   | **104.8** | 20.92 | 3664 |
+
+**Per-path slowdowns:**
+- **T1 vs V1.B: 0.96× — trajmem is now FASTER than vanilla**, with 5 GB
+  less memory peak. Memory module pays for itself by letting Llama do
+  smaller per-window forwards.
+- T2 vs V2: 1.62× — vanilla Phase 2 fits twice the K (12 vs 6), reflecting
+  the genuine memory cost of read+write per generation window. Both
+  paths got 3-4× faster overall vs the no-KV baseline below.
+
+**Comparison vs the no-KV-cache baseline (above table):**
+
+| Path | Old tok/s | New tok/s | Speedup |
+|------|----------:|----------:|--------:|
+| T1 (Phase 1 trajmem) | 9.9k | **17.7k** | **1.79×** |
+| V2 (vanilla GRPO) | 42.5 | **169.5** | **4.00×** |
+| T2 (trajmem GRPO) | 32.4 | **104.8** | **3.23×** |
+
+The Phase 1 1.72× T1-vs-V1.B gap from yesterday is **completely closed**
+— trajmem now beats vanilla per-token AND uses less memory. The
+prior measurement bottleneck (rolling buffer re-encoding per window)
+turned out to be the entire architectural cost; sliding KV cache made
+it disappear.
+
+**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+**Trainer flag:** `train_wave{1,2}.py --use-kv-cache` (off by default
+for backward compat; production runs should always set it).
+
+### Phase 2 architectural fix bundled with KV cache
+
+The pre-KV `_ar_sample_one` was also incorrect: it called
+`forward_window` per generated token, which fired read+write per token
+(should be per memory window per design). Fixed alongside the cache
+work — read fires once per generation window, write fires once per
+generation window (with surprise=0 per plan §5.4, since AR-generated
+tokens have no NTP target). KV cache makes the per-token LM forwards
+cheap.
+
 ## Cross-references
 
 - `scripts/bench_trajmem.py` — Phase 1 sweep harness

@@ -50,9 +50,9 @@ from src.trajectory_memory.training import (  # noqa: E402
 # ──────────────────────────────────────────────────────────────────────
 BS_V1A_FWD = 48     # vanilla Llama fwd no_grad — small footprint, lots of headroom
 BS_V1B_STEP = 5     # vanilla Llama lm_head step — backward activations
-BS_T1_TRAJMEM = 4   # trajmem step — bench_trajmem.py sweep shows BS=8 OOMs
-K_V2_VANILLA = 10   # vanilla GRPO group size
-K_T2_TRAJMEM = 4    # trajmem GRPO — K=4 already 22 GB peak
+BS_T1_TRAJMEM = 4   # trajmem step (KV cache) — sweep shows BS=8 OOMs eager
+K_V2_VANILLA = 12   # vanilla GRPO with KV cache (K=14 OOMs; pass-2 holds K forwards' activations)
+K_T2_TRAJMEM = 6    # trajmem GRPO with KV cache (K=8 OOMs)
 
 
 def _make_fake_tokenizer():
@@ -139,16 +139,19 @@ def bench_phase1_trajmem(args, device, BS):
             model.forward_window, mode="default", dynamic=False,
         )
     optimizer = build_optimizer(model, lr_memory=3e-4, lr_adapter=1e-4)
-    trainer = Phase1Trainer(model, optimizer, scheduler=None, grad_clip=1.0)
+    trainer = Phase1Trainer(
+        model, optimizer, scheduler=None, grad_clip=1.0,
+        use_kv_cache=True,  # ~1.79× speedup; matches what trainers use in production
+    )
     vocab = model.llama.config.vocab_size
     chunk = torch.randint(0, vocab, (BS, T), device=device)
 
     def step():
         trainer.step_wave1(chunk)
 
-    print("\n[T1] Llama + trajmem Phase1Trainer.step_wave1")
+    print("\n[T1] Llama + trajmem Phase1Trainer.step_wave1 (KV cache enabled)")
     label = f"trajmem step (tier={args.config_tier}" + (
-        ", compile" if args.compile else "") + ")"
+        ", compile" if args.compile else "") + ", kv-cache)"
     tps, mem, _ = bench(label, step, args.warmup, args.iter, BS, T)
 
     del trainer, optimizer, model
@@ -178,21 +181,33 @@ def bench_phase2_vanilla(args, device, llama, vocab, K):
 
     @torch.no_grad()
     def sample_one():
-        # Greedy AR sample for K_gen tokens — speed reference, not real
-        # GRPO sampling (which would do multinomial; cost is similar).
-        cur = prompt_ids.clone()
-        for _ in range(T_gen):
-            logits = llama(cur).logits[:, -1, :]
-            next_tok = logits.argmax(dim=-1, keepdim=True)
-            cur = torch.cat([cur, next_tok], dim=1)
-        return cur[:, T_pre:]
+        # AR sample for T_gen tokens with HF KV cache (= what production
+        # vanilla GRPO does — TRL, OpenRLHF, vLLM all use KV cache for
+        # sampling). Without KV cache vanilla pays O(T_pre+T_gen) per token,
+        # which is unrealistic and unfairly handicaps the vanilla baseline.
+        from transformers import DynamicCache
+        cache = DynamicCache()
+        # Prefill the prompt.
+        out = llama(prompt_ids, past_key_values=cache, use_cache=True)
+        cache = out.past_key_values
+        last_logit = out.logits[:, -1, :]
+        next_tok = last_logit.argmax(dim=-1, keepdim=True)
+        gen = [next_tok]
+        for _ in range(T_gen - 1):
+            out = llama(next_tok, past_key_values=cache, use_cache=True)
+            cache = out.past_key_values
+            last_logit = out.logits[:, -1, :]
+            next_tok = last_logit.argmax(dim=-1, keepdim=True)
+            gen.append(next_tok)
+        return torch.cat(gen, dim=1)
 
     def grpo_step():
         opt.zero_grad(set_to_none=True)
-        # Pass 1 — K samples
+        # Pass 1 — K samples (KV-cached AR).
         samples = [sample_one() for _ in range(K)]
         advantages = torch.tensor([1.0, -1.0] * (K // 2), device=device)[:K]
-        # Pass 2 — TF replay
+        # Pass 2 — TF replay over (prompt + sample). One forward per sample
+        # at full length, returning logits for shifted positions.
         loss = torch.zeros((), device=device)
         for s, adv in zip(samples, advantages):
             full = torch.cat([prompt_ids, s], dim=1)

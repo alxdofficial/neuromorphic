@@ -41,6 +41,7 @@ class Phase1Metrics:
     final_states: Tensor | None = None
     final_hiddens: Tensor | None = None
     final_lm_context: Tensor | None = None
+    final_past_key_values: object | None = None  # KV-cache mode only
 
 
 class Phase1Trainer:
@@ -63,6 +64,7 @@ class Phase1Trainer:
         scheduler: object | None = None,    # WarmupCosineScheduler-like
         grad_clip: float | None = 1.0,
         pad_token_id: int = 0,
+        use_kv_cache: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -73,6 +75,11 @@ class Phase1Trainer:
         # training MUST pass the tokenizer's pad_token_id (128001 for
         # Llama-3) so Llama doesn't see synthetic `!` tokens in its context.
         self.pad_token_id = pad_token_id
+        # use_kv_cache: route through tbptt.run_chunk's KV-cache path so each
+        # window's Llama forward only encodes the new T_window tokens against
+        # cached prior windows' KVs. ~30-50% speedup on Phase 1; see
+        # docs/profile_analysis.md and bench numbers in docs/bench_results.md.
+        self.use_kv_cache = use_kv_cache
         self._step_count = 0
 
     @property
@@ -98,13 +105,17 @@ class Phase1Trainer:
         prev_window_hiddens: Tensor | None = None,
         prev_lm_context: Tensor | None = None,
         target_mask: Tensor | None = None,          # [BS, D, T_window] bool
+        past_key_values: object | None = None,
     ) -> Phase1Metrics:
         """One Wave 1 step (long-doc TF NTP).
 
         `target_mask`: per-token mask True=include in NTP CE, False=skip.
         Used to exclude pad-token tails from partial chunks (see
-        LongDocChunk.valid_mask). When None, all tokens contribute to loss
-        (caller's responsibility to pre-mask if needed).
+        LongDocChunk.valid_mask). When None, all tokens contribute to loss.
+
+        `past_key_values`: only used when `self.use_kv_cache=True`. Pass
+        `final_past_key_values` from the previous chunk's metrics to thread
+        the KV cache across chunks; pass None for the first chunk of a doc.
         """
         cfg = self.model.cfg
         BS, T_total = chunk.shape
@@ -126,12 +137,20 @@ class Phase1Trainer:
             prev_lm_context=prev_lm_context,
             target_mask=target_mask,
             hard_routing=True,
+            use_kv_cache=self.use_kv_cache,
+            past_key_values=past_key_values,
         )
         loss = out["aggregate_loss"]
         loss.backward()
 
         grad_norm = self._clip_and_step()
         self._step_count += 1
+
+        # KV-cache-mode: detach final cache for cross-chunk carry.
+        final_cache = out.get("final_past_key_values", None)
+        if final_cache is not None:
+            from src.trajectory_memory.tbptt import _detach_kv_cache
+            final_cache = _detach_kv_cache(final_cache)
 
         return Phase1Metrics(
             loss=float(loss.detach()),
@@ -141,6 +160,7 @@ class Phase1Trainer:
             final_states=out["final_states"].detach(),
             final_hiddens=out["final_hiddens"].detach(),
             final_lm_context=out["final_lm_context"],
+            final_past_key_values=final_cache,
         )
 
     # ── Wave 2: long-chat TF NTP (TurnPair) ───────────────────────────
@@ -182,6 +202,7 @@ class Phase1Trainer:
         prev_states = self.model.manifold.reset_states(batch_size=BS)
         prev_window_hiddens: Tensor | None = None
         prev_lm_context: Tensor | None = None
+        past_kv: object | None = None
 
         self.optimizer.zero_grad()
         # Per-chunk backward + detach is the standard TBPTT pattern for
@@ -207,6 +228,8 @@ class Phase1Trainer:
                 prev_lm_context=prev_lm_context,
                 target_mask=win_mask,
                 hard_routing=True,
+                use_kv_cache=self.use_kv_cache,
+                past_key_values=past_kv,
             )
             chunk_loss = out["aggregate_loss"]
             # Per-chunk backward — accumulates grad into optimizer's
@@ -222,6 +245,10 @@ class Phase1Trainer:
             prev_states = out["final_states"].detach()
             prev_window_hiddens = out["final_hiddens"].detach()
             prev_lm_context = out["final_lm_context"]
+            past_kv = out.get("final_past_key_values", None)
+            if past_kv is not None:
+                from src.trajectory_memory.tbptt import _detach_kv_cache
+                past_kv = _detach_kv_cache(past_kv)
 
         grad_norm = self._clip_and_step()
         self._step_count += 1

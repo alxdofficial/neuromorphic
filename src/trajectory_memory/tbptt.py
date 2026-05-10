@@ -66,6 +66,46 @@ class TBPTTChunker:
         ]
 
 
+def _trim_kv_cache(cache, max_len: int):
+    """Sliding-window trim a HF DynamicCache to keep the LAST max_len tokens.
+
+    Mutates `cache` in place. Returns `cache` for chaining.
+
+    HF transformers 5.x exposes per-layer cache as `cache.layers[i].keys`
+    and `.values`. Cache.crop() truncates from the END (keeps first N) —
+    we need to keep the LAST N (most recent), so we slice manually.
+
+    Trimming is a tensor slice — autograd through earlier window's backward
+    still works on the surviving slice. Dropped entries are released from
+    the autograd graph.
+    """
+    if cache is None:
+        return None
+    cur_len = cache.get_seq_length()
+    if cur_len <= max_len:
+        return cache
+    drop = cur_len - max_len
+    for layer in cache.layers:
+        if not layer.is_initialized:
+            continue
+        layer.keys = layer.keys[..., drop:, :]
+        layer.values = layer.values[..., drop:, :]
+    return cache
+
+
+def _detach_kv_cache(cache):
+    """Detach all tensors in cache so a new TBPTT chunk starts with no
+    autograd history through cached KVs (mirrors `prev_states.detach()`)."""
+    if cache is None:
+        return None
+    for layer in cache.layers:
+        if not layer.is_initialized:
+            continue
+        layer.keys = layer.keys.detach()
+        layer.values = layer.values.detach()
+    return cache
+
+
 def run_chunk(
     model: IntegratedLM,
     windows: Tensor,
@@ -75,13 +115,25 @@ def run_chunk(
     *,
     target_mask: Tensor | None = None,
     hard_routing: bool = True,
+    use_kv_cache: bool = False,
+    past_key_values: object | None = None,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 
-    Maintains a rolling LM-context buffer of up to `cfg.effective_lm_context`
-    tokens. At each window, Llama sees the rolling buffer + the new window's
-    tokens (truncated to the cap); we only compute surprise on the new
-    window's positions (see plan §4.1).
+    Two execution modes:
+
+    - **Rolling-buffer mode** (`use_kv_cache=False`, default): maintains
+      a rolling LM-context buffer of up to `cfg.effective_lm_context`
+      tokens. At each window, Llama re-encodes the rolling buffer +
+      the new window's tokens.
+
+    - **KV-cache mode** (`use_kv_cache=True`): each window's Llama forward
+      only encodes the new T_window tokens against `past_key_values`
+      (HF DynamicCache). The cache is trimmed to `cfg.effective_lm_context`
+      tokens (sliding window). Across chunks the cache is detached but
+      can be carried (see `_detach_kv_cache` and the trainer wiring).
+      ~30-50% faster on Phase 1 — the rolling-buffer re-encode was ~70%
+      of the T1 vs V1.B gap (see docs/profile_analysis.md).
 
     Args:
         model:               IntegratedLM
@@ -89,23 +141,27 @@ def run_chunk(
         prev_states:         [BS, N, D_concept] state at start of chunk
         prev_window_hiddens: [BS, T_window, d_lm] from window before this
                              chunk, or None if chunk starts a new sequence.
-        prev_lm_context:     [BS, L] tokens from before this chunk, used as
-                             rolling LM context (no gradient — Llama is
-                             frozen and gradient cuts at chunk boundary
-                             anyway). None at sequence start.
+        prev_lm_context:     Rolling-buffer mode: [BS, L] tokens from prior
+                             chunk to seed the buffer. KV-cache mode: ignored
+                             (use `past_key_values` instead).
         target_mask:         [BS, D, T_window] or None — per-window mask
                              over the CURRENT window's tokens for surprise.
         hard_routing:        Gumbel-STE if True
+        use_kv_cache:        Switch to KV-cache mode.
+        past_key_values:     KV-cache mode: HF DynamicCache from previous
+                             chunk (detached) or None. Updated in-place;
+                             `final_past_key_values` returned for next chunk.
 
     Returns:
         dict with keys:
-            window_outputs:    list of D forward_window outputs
-            aggregate_loss:    scalar loss summed over windows (NTP CE)
-            final_states:      [BS, N, D_concept] state after last window
-            final_hiddens:     [BS, T_window, d_lm] hiddens of last window
-            final_lm_context:  [BS, L] rolling buffer for next chunk's
-                               first-window LM context
-            surprise_history:  [BS, D] surprise per window
+            window_outputs:        list of D forward_window outputs
+            aggregate_loss:        scalar loss summed over windows (NTP CE)
+            final_states:          [BS, N, D_concept] state after last window
+            final_hiddens:         [BS, T_window, d_lm] hiddens of last window
+            final_lm_context:      Rolling-buffer mode: [BS, L] for next chunk.
+                                   KV-cache mode: empty (not used).
+            final_past_key_values: KV-cache mode only — updated cache.
+            surprise_history:      [BS, D] surprise per window
     """
     BS, D, T = windows.shape
     assert D == model.cfg.D, f"chunk has D={D}, expected {model.cfg.D}"
@@ -114,8 +170,12 @@ def run_chunk(
 
     states = prev_states
     cur_prev_hiddens = prev_window_hiddens
-    # Rolling LM-context buffer. Tokens here are not in the autograd graph.
-    if prev_lm_context is None:
+    cache = past_key_values if use_kv_cache else None
+
+    # Rolling LM-context buffer (rolling-buffer mode only; ignored in cache mode).
+    if use_kv_cache:
+        lm_buffer = torch.empty(BS, 0, dtype=windows.dtype, device=windows.device)
+    elif prev_lm_context is None:
         lm_buffer = torch.empty(BS, 0, dtype=windows.dtype, device=windows.device)
     else:
         lm_buffer = prev_lm_context.detach()                       # ensure no grad
@@ -128,25 +188,42 @@ def run_chunk(
         win_input = windows[:, d, :]                               # [BS, T_window]
         win_mask = target_mask[:, d, :] if target_mask is not None else None
 
-        # Build the full LM input: rolling buffer + current window, capped.
-        lm_input_ids = torch.cat([lm_buffer, win_input], dim=1)
-        if lm_input_ids.shape[1] > cap:
-            lm_input_ids = lm_input_ids[:, -cap:]
+        if use_kv_cache:
+            # KV-cache mode: pass only the new window's T_window tokens.
+            # last_prev_logit_hidden gives surprise CE the predecessor for
+            # target 0 — uses prev_window_hiddens last position.
+            last_prev_logit_hidden = (
+                cur_prev_hiddens[:, -1:, :] if cur_prev_hiddens is not None else None
+            )
+            out = model.forward_window(
+                lm_input_ids=win_input,
+                prev_window_hiddens=cur_prev_hiddens,
+                prev_states=states,
+                target_mask=win_mask,
+                hard_routing=hard_routing,
+                past_key_values=cache,
+                use_kv_cache=True,
+                last_prev_logit_hidden=last_prev_logit_hidden,
+            )
+            cache = out.get("new_past_key_values", cache)
+            # Sliding-window trim so cache size stays bounded.
+            cache = _trim_kv_cache(cache, cap)
+        else:
+            # Rolling-buffer mode: build rolling LM context.
+            lm_input_ids = torch.cat([lm_buffer, win_input], dim=1)
+            if lm_input_ids.shape[1] > cap:
+                lm_input_ids = lm_input_ids[:, -cap:]
+            out = model.forward_window(
+                lm_input_ids=lm_input_ids,
+                prev_window_hiddens=cur_prev_hiddens,
+                prev_states=states,
+                target_mask=win_mask,
+                hard_routing=hard_routing,
+            )
+            # Buffer for next window's LM input — at most (cap - T_window) tokens.
+            lm_buffer = lm_input_ids[:, -(cap - T):] if cap > T else lm_input_ids[:, :0]
 
-        out = model.forward_window(
-            lm_input_ids=lm_input_ids,
-            prev_window_hiddens=cur_prev_hiddens,
-            prev_states=states,
-            target_mask=win_mask,
-            hard_routing=hard_routing,
-        )
-        # Strip heavy tensors before appending — `outputs` is only used for
-        # debug/test inspection downstream. `logits` is [BS, T_window, V]
-        # (~500MB across a chunk at vocab=128K, BS=2, T_window=256).
-        # `current_hiddens` is also redundant since we keep it as
-        # `cur_prev_hiddens` and it surfaces as `final_hiddens`. Carry only
-        # the small per-window metadata + the new_states tensor (needed by
-        # tests).
+        # Strip heavy tensors before appending — `outputs` is debug-only.
         outputs.append({
             "new_states": out["new_states"],
             "read_visited": out["read_visited"],
@@ -159,15 +236,11 @@ def run_chunk(
         # Carry forward into next window.
         states = out["new_states"]
         cur_prev_hiddens = out["current_hiddens"]
-        # Buffer for next window's LM input — at most (cap - T_window)
-        # tokens, since each forward will append the next window of
-        # T_window tokens before truncation.
-        lm_buffer = lm_input_ids[:, -(cap - T):] if cap > T else lm_input_ids[:, :0]
 
     aggregate_loss = torch.stack(losses).sum()                     # scalar
     surprise_history = torch.stack(surprises, dim=1)               # [BS, D]
 
-    return {
+    result = {
         "window_outputs": outputs,
         "aggregate_loss": aggregate_loss,
         "final_states": states,
@@ -175,3 +248,6 @@ def run_chunk(
         "final_lm_context": lm_buffer,
         "surprise_history": surprise_history,
     }
+    if use_kv_cache:
+        result["final_past_key_values"] = cache
+    return result

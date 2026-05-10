@@ -178,52 +178,78 @@ class IntegratedLM(nn.Module):
         *,
         target_mask: Tensor | None = None,
         hard_routing: bool = True,
+        past_key_values: object | None = None,
+        use_kv_cache: bool = False,
+        last_prev_logit_hidden: Tensor | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 
-        The "current window" is the LAST `cfg.T_window` positions of
-        `lm_input_ids`. Llama processes the full `lm_input_ids` (the
-        rolling 2K-or-less LM context); we slice logits and hidden states
-        for just the current window for surprise + write conditioning.
-        See plan §4.1 — this is how the deliberate 2K LM context cap is
-        implemented.
+        Two execution modes:
+
+        - **Rolling-buffer mode** (`use_kv_cache=False`, default):
+          `lm_input_ids` carries the full rolling LM context (last
+          `effective_lm_context` tokens). Llama re-encodes the prefix
+          every window. The current window is `lm_input_ids[:, -T_window:]`.
+
+        - **KV-cache mode** (`use_kv_cache=True`): `lm_input_ids` is just
+          the new T_window tokens. `past_key_values` carries cached KVs
+          from prior windows; Llama only encodes the new tokens against
+          the cache. Massively cheaper at long context. Returns the
+          updated cache so the caller can carry it across windows of a
+          chunk. See `docs/profile_analysis.md` for measured wins
+          (rolling-buffer is ~70% of T1 vs V1.B slowdown).
 
         Args:
-            lm_input_ids:        [BS, L_lm] full LM context. The last
-                                 T_window positions are the current window
-                                 (whose tokens we predict and whose hidden
-                                 states drive the write trajectory).
-                                 `L_lm` must be ≥ T_window and ≤
-                                 `cfg.effective_lm_context`. The caller
-                                 (run_chunk) maintains the rolling buffer.
+            lm_input_ids:        Rolling-buffer mode: [BS, L_lm] with
+                                 L_lm in [T_window, effective_lm_context].
+                                 KV-cache mode: [BS, T_window] (new tokens only).
             prev_window_hiddens: [BS, T_window, d_lm] from previous window.
                                  None at the very first window of a sequence.
             prev_states:         [BS, N, D_concept] manifold state going in.
             target_mask:         [BS, T_window] bool (True = include in
-                                 surprise CE), aligned to the current window
-                                 (NOT the full LM context). None → all eligible.
+                                 surprise CE), aligned to the current window.
             hard_routing:        Gumbel-STE if True, argmax if False.
+            past_key_values:     KV-cache mode only. HF DynamicCache (or
+                                 None for first window of chunk). Tokens
+                                 already in the cache are NOT re-encoded;
+                                 their KVs were computed at their original
+                                 encoding time and remain valid.
+            use_kv_cache:        Switch between the two modes (above).
+            last_prev_logit_hidden: KV-cache mode optional. The last hidden
+                                 of the previous window (`prev_window_hiddens
+                                 [:, -1:, :]` projected through the same path
+                                 — but normally identical). Used to compute
+                                 the predecessor logit for target 0 of the
+                                 current window so we don't drop a CE token.
+                                 None → first window of chunk → drop target 0.
 
         Returns:
             dict with keys:
-                logits:           [BS, T_window, V] — logits for the current window only
-                current_hiddens:  [BS, T_window, d_lm]
-                new_states:       [BS, N, D_concept]
-                read_visited:     [BS, J, K_read]
-                write_visited:    [BS, J, K_write]
-                surprise:         [BS] mean per-token CE over the current window
+                logits:               [BS, T_window, V] — logits for the current window
+                current_hiddens:      [BS, T_window, d_lm]
+                new_states:           [BS, N, D_concept]
+                read_visited:         [BS, J, K_read]
+                write_visited:        [BS, J, K_write]
+                surprise:             [BS] mean per-token CE over the current window
+                new_past_key_values:  KV-cache mode only — updated cache for next window
         """
         cfg = self.cfg
         T_window = cfg.T_window
         BS, L_lm = lm_input_ids.shape
-        assert L_lm >= T_window, (
-            f"lm_input_ids length {L_lm} < T_window {T_window}; the current "
-            f"window must always be at the tail of lm_input_ids."
-        )
-        assert L_lm <= cfg.effective_lm_context, (
-            f"lm_input_ids length {L_lm} > effective_lm_context "
-            f"{cfg.effective_lm_context}; truncate before calling."
-        )
+        if use_kv_cache:
+            assert L_lm == T_window, (
+                f"KV-cache mode expects lm_input_ids of shape [BS, T_window]; "
+                f"got L_lm={L_lm} != T_window={T_window}."
+            )
+        else:
+            assert L_lm >= T_window, (
+                f"lm_input_ids length {L_lm} < T_window {T_window}; the current "
+                f"window must always be at the tail of lm_input_ids."
+            )
+            assert L_lm <= cfg.effective_lm_context, (
+                f"lm_input_ids length {L_lm} > effective_lm_context "
+                f"{cfg.effective_lm_context}; truncate before calling."
+            )
 
         # ── 1. READ ──────────────────────────────────────────────────
         if prev_window_hiddens is None:
@@ -275,39 +301,63 @@ class IntegratedLM(nn.Module):
             mem_inject.memory_fn = self._build_memory_fn(read_visited)
             # Call the base model (returns hidden states) instead of the
             # CausalLM wrapper. We then apply lm_head ONLY to the
-            # T_window+1 positions we actually need, instead of all L_lm
-            # positions. At BS=2 / L_lm=2048 / V=128256 / bf16, the full
-            # logit tensor would be ~1 GB; with T_window=256 we drop to
-            # ~130 MB and skip an expensive 2048-position matmul through
-            # lm_head on every forward.
+            # T_window+1 positions we actually need.
+            new_past_key_values = None
             try:
-                base_out = self.llama.model(
-                    input_ids=lm_input_ids,
-                    use_cache=False,
-                )
+                if use_kv_cache:
+                    # KV-cache mode: encode only the new T_window tokens
+                    # against `past_key_values`. The cache transparently
+                    # carries prior windows' KVs; HF Llama auto-handles
+                    # position_ids from cache_position.
+                    base_out = self.llama.model(
+                        input_ids=lm_input_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    new_past_key_values = base_out.past_key_values
+                else:
+                    base_out = self.llama.model(
+                        input_ids=lm_input_ids,
+                        use_cache=False,
+                    )
             finally:
                 # Always clear closure to avoid leaking refs across windows.
                 mem_inject.memory_fn = None
 
-            full_hiddens = base_out.last_hidden_state                # [BS, L_lm, d_lm]
+            full_hiddens = base_out.last_hidden_state                # [BS, *, d_lm]
+            # In KV-cache mode `*` is T_window (only new tokens encoded).
+            # In rolling-buffer mode `*` is L_lm (full context).
             current_hiddens = full_hiddens[:, -T_window:, :].to(prev_states.dtype)
 
-            # We want logits for the LAST T_window+1 hidden positions: the
-            # final T_window for downstream sampling/output (positions
-            # L_lm-T_window..L_lm-1), plus one extra to the LEFT (position
-            # L_lm-T_window-1) so the standard NTP shift can produce
-            # predictions for all T_window current-window targets.
+            # Build `needed_hidden` for surprise CE: T_window+1 hiddens
+            # (one predecessor + T_window targets) when available,
+            # T_window otherwise (drop target 0 — first window of chunk).
             #
-            # At the very first window of a sequence there's no rolling
-            # context yet, so L_lm == T_window — we take all available
-            # hidden states and `_compute_surprise_window` skips the first
-            # target (which has no predecessor).
-            n_needed = min(T_window + 1, full_hiddens.shape[1])
-            needed_hidden = full_hiddens[:, -n_needed:, :]
+            # KV-cache mode: full_hiddens has shape [BS, T_window, d_lm].
+            # The predecessor for target 0 is the last hidden of the
+            # previous window — passed as `last_prev_logit_hidden`. If
+            # None, we drop target 0 (matches first-window behavior).
+            #
+            # Rolling-buffer mode: full_hiddens has the predecessor at
+            # position [-T_window-1] when L_lm > T_window. We slice
+            # min(T_window+1, L_lm) tail positions.
+            if use_kv_cache:
+                if last_prev_logit_hidden is not None:
+                    needed_hidden = torch.cat(
+                        [last_prev_logit_hidden.to(full_hiddens.dtype),
+                         full_hiddens], dim=1,
+                    )                                                # [BS, T_window+1, d_lm]
+                else:
+                    needed_hidden = full_hiddens                     # [BS, T_window, d_lm]
+            else:
+                n_needed = min(T_window + 1, full_hiddens.shape[1])
+                needed_hidden = full_hiddens[:, -n_needed:, :]
+
             needed_logits = self.llama.lm_head(needed_hidden)        # [BS, n_needed, V]
 
+            target_ids = lm_input_ids[:, -T_window:]
             surprise = self._compute_surprise_window(
-                needed_logits, lm_input_ids[:, -T_window:], target_mask,
+                needed_logits, target_ids, target_mask,
             ).to(prev_states.dtype)
 
             # Slice the final T_window logits for the output (caller may
@@ -326,7 +376,7 @@ class IntegratedLM(nn.Module):
             hard=hard_routing,
         )
 
-        return {
+        out = {
             "logits": logits,
             "current_hiddens": current_hiddens,
             "new_states": new_states,
@@ -334,6 +384,9 @@ class IntegratedLM(nn.Module):
             "write_visited": write_visited_ids,
             "surprise": surprise,
         }
+        if use_kv_cache and self.llama is not None:
+            out["new_past_key_values"] = new_past_key_values
+        return out
 
     @staticmethod
     def _compute_surprise_window(
