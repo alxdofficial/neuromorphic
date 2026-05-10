@@ -311,28 +311,45 @@ class IntegratedLM(nn.Module):
                     # against `past_key_values`. The cache transparently
                     # carries prior windows' KVs.
                     #
-                    # CRITICAL — RoPE position correctness: when the cache
-                    # has been sliding-window trimmed, `cache.get_seq_length()`
-                    # reports the trimmed length, NOT the absolute position
-                    # of the next token. HF would then assign new tokens
-                    # `position_ids = [trimmed_len, trimmed_len+1, ...]`
-                    # but the cached KVs have RoPE rotations baked in at
-                    # their ORIGINAL absolute positions. The relative-position
-                    # math used in attention would be wrong.
+                    # TWO position-related concerns require passing two
+                    # separate things to llama.model():
                     #
-                    # Fix: pass `cache_position` explicitly with absolute
-                    # positions. The caller (run_chunk / Phase 2 prefill)
-                    # tracks `cache_abs_pos` = absolute position of the
-                    # next token to encode, advancing it across trims.
+                    # (a) RoPE: cached KVs have rotations baked in at their
+                    #     ORIGINAL abs positions. New Q must use absolute
+                    #     positions so Q·K relative math is consistent.
+                    #     → `position_ids = [abs_pos, abs_pos+1, ...]`
+                    #
+                    # (b) Causal mask: HF builds the mask via
+                    #     `key_index <= cache_position[query]`. The mask
+                    #     iterates over [0..target_length-1] where
+                    #     target_length = cache.get_seq_length() + new_len.
+                    #     If we pass absolute cache_position, ALL key
+                    #     indices end up <= cache_position[q] → ALL allowed
+                    #     → future tokens within the new window leak into
+                    #     past queries. LABEL LEAKAGE.
+                    #     → `cache_position = [cache_len, cache_len+1, ...]`
+                    #     (cache-internal indices, NOT absolute)
+                    #
+                    # Decoupling these two is the only correct path with
+                    # HF's API. Verified separately with a small smoke.
+                    n_new = lm_input_ids.shape[1]
+                    cache_len_before = (
+                        past_key_values.get_seq_length()
+                        if past_key_values is not None else 0
+                    )
                     cache_position = torch.arange(
-                        cache_abs_pos,
-                        cache_abs_pos + lm_input_ids.shape[1],
+                        cache_len_before, cache_len_before + n_new,
                         device=lm_input_ids.device,
                     )
+                    position_ids = torch.arange(
+                        cache_abs_pos, cache_abs_pos + n_new,
+                        device=lm_input_ids.device,
+                    ).unsqueeze(0)
                     base_out = self.llama.model(
                         input_ids=lm_input_ids,
                         past_key_values=past_key_values,
                         cache_position=cache_position,
+                        position_ids=position_ids,
                         use_cache=True,
                     )
                     new_past_key_values = base_out.past_key_values
@@ -482,16 +499,31 @@ class IntegratedLM(nn.Module):
 
         if used_mask is not None:
             mask = used_mask.to(ce_per_tok.dtype)
-            ce_sum = (ce_per_tok * mask).sum(dim=1)              # [BS]
-            ce_count = mask.sum(dim=1)                           # [BS]
+            # Weighted sum: each token contributes weight × CE.
+            ce_weighted_sum = (ce_per_tok * mask).sum(dim=1)     # [BS]
+            # Sum of weights — used for the per-window MEAN (writer
+            # surprise). Divides out the weights to give "typical CE per
+            # unit of weight" — what the writer should care about as a
+            # magnitude signal.
+            weight_sum = mask.sum(dim=1)                         # [BS]
+            # Count of nonzero-weight (=valid) positions — used as the
+            # divisor for the LOSS aggregation in tbptt.run_chunk. This
+            # is what makes prior_loss_weight=0.1 actually scale prior
+            # tokens' gradient by 0.1×: the weighted sum carries the 0.1
+            # factor, and dividing by COUNT (not weight_sum) preserves it.
+            # If we divided by weight_sum the 0.1 would cancel out.
+            valid_count = (mask > 0).to(ce_per_tok.dtype).sum(dim=1)
         else:
-            ce_sum = ce_per_tok.sum(dim=1)
-            ce_count = torch.full(
+            ce_weighted_sum = ce_per_tok.sum(dim=1)
+            weight_sum = torch.full(
                 (BS,), float(n_predicted),
                 dtype=ce_per_tok.dtype, device=ce_per_tok.device,
             )
-        ce_mean = ce_sum / ce_count.clamp_min(1.0)
-        return ce_mean, ce_sum, ce_count
+            valid_count = weight_sum.clone()
+        # Per-window mean: weighted average for writer surprise.
+        ce_mean = ce_weighted_sum / weight_sum.clamp_min(1.0)
+        # Return (mean_for_writer, weighted_sum_for_loss, valid_count_for_norm).
+        return ce_mean, ce_weighted_sum, valid_count
 
     # ── parameter accounting ─────────────────────────────────────────
 

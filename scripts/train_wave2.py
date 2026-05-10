@@ -89,9 +89,9 @@ def main():
     tokenizer = get_tokenizer()
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
-    if model.llama is not None and hasattr(model.llama, "gradient_checkpointing_enable"):
-        model.llama.gradient_checkpointing_enable()
-        print("Llama gradient checkpointing enabled.")
+    # NOTE: gradient_checkpointing is INCOMPATIBLE with use_cache=True
+    # (HF silently sets use_cache=False, returning None for past_key_values).
+    # KV cache (1.79× speedup) wins over checkpointing's activation savings.
     if args.compile:
         # dynamic=True so the rolling LM context's varying length doesn't
         # trigger dynamo recompiles per shape (hits recompile_limit=8 within

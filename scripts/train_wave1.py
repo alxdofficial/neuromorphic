@@ -111,14 +111,15 @@ def main():
     pad_id = tokenizer.pad_token_id
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
-    # B11 fix — enable Llama gradient checkpointing. The earlier tbptt.py
-    # docstring claimed this was on; it wasn't. Cuts ~3-4× Llama activation
-    # memory for D=4 windows at the cost of 1.5-2× longer backward (Llama
-    # forward is recomputed during backward). Required to fit BS>1 or
-    # config-tier=large; saves headroom for state threading + KV cache.
-    if model.llama is not None and hasattr(model.llama, "gradient_checkpointing_enable"):
-        model.llama.gradient_checkpointing_enable()
-        print("Llama gradient checkpointing enabled.")
+    # NOTE: HF Llama's gradient_checkpointing IS INCOMPATIBLE with
+    # use_cache=True / past_key_values. Enabling it forces use_cache=False
+    # silently and `past_key_values` returns None — defeating our KV cache
+    # entirely. (Verified: HF prints "use_cache=True is incompatible with
+    # gradient checkpointing. Setting use_cache=False.")
+    # We pick KV cache (1.79× speedup, 5 GB less mem in production) over
+    # gradient checkpointing. With BS=1 (W1's assertion), activation memory
+    # isn't the bottleneck. If config-tier=large or BS>1 ever needs it,
+    # add `--no-kv-cache --grad-checkpoint` as a separate path.
 
     if args.compile:
         # dynamic=True: forward_window's lm_input_ids varies in length as the

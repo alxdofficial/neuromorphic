@@ -373,13 +373,19 @@ class Phase1Trainer:
         if prev_states is None:
             prev_states = self.model.manifold.reset_states(batch_size=BS)
         windows = chunk.view(BS, cfg.D, cfg.T_window)
+        # Eval uses DETERMINISTIC routing (hard_routing=False = argmax,
+        # no Gumbel noise). Without this, two eval runs on the same
+        # checkpoint disagree because routing noise picks different
+        # memory paths. Especially harmful for needle-haystack val
+        # where memory pathways need to be consistent for the probe to
+        # measure anything.
         out = run_chunk(
             self.model, windows,
             prev_states=prev_states,
             prev_window_hiddens=prev_window_hiddens,
             prev_lm_context=prev_lm_context,
             target_mask=None,
-            hard_routing=True,
+            hard_routing=False,
             use_kv_cache=self.use_kv_cache,
             past_key_values=past_key_values,
             cache_abs_pos=cache_abs_pos,
@@ -434,7 +440,7 @@ class Phase1Trainer:
                 prev_window_hiddens=prev_window_hiddens,
                 prev_lm_context=prev_lm_context,
                 target_mask=mask.view(BS, cfg.D, cfg.T_window),
-                hard_routing=True,
+                hard_routing=False,  # eval: deterministic routing
                 use_kv_cache=self.use_kv_cache,  # match training to keep compile cache hot
                 past_key_values=past_kv,
             )

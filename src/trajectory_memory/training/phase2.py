@@ -224,12 +224,11 @@ class Phase2Trainer:
             # Test-mode (no real Llama) skips shared prefill.
             ref_prefill = None
             if self.model.llama is not None:
-                # _prefill_prompt now returns 5-tuple (N4 fix); we only
-                # need the first 3 elements for prefill_state passing.
-                _ref = self._prefill_prompt(
+                # Keep full 5-tuple so per-sample ref TF replay can thread
+                # cache_abs_pos to forward_window for RoPE correctness.
+                ref_prefill = self._prefill_prompt(
                     prompt_ids, pad_id=pad_id, device=device,
                 )
-                ref_prefill = _ref[:3]  # (states, hiddens, kv_cache)
 
             import copy
             for sample_ids in sample_ids_list:
@@ -240,10 +239,13 @@ class Phase2Trainer:
                 # ref forward extends independently).
                 sample_prefill = None
                 if ref_prefill is not None:
+                    _rps, _rph, _rkv, _rlr, _rap = ref_prefill
                     sample_prefill = (
-                        ref_prefill[0].detach().clone(),
-                        ref_prefill[1].detach().clone(),
-                        copy.deepcopy(ref_prefill[2]),
+                        _rps.detach().clone(),
+                        _rph.detach().clone() if _rph is not None else None,
+                        copy.deepcopy(_rkv),
+                        _rlr.detach().clone() if _rlr is not None else None,
+                        _rap,
                     )
                 ref_logps = self._tf_compute_sample_logp(
                     prompt_ids=prompt_ids, sample_ids=sample_ids,
@@ -381,11 +383,13 @@ class Phase2Trainer:
         shared_prefill = None
         if self.model.llama is not None:
             with torch.no_grad():
-                _sp = self._prefill_prompt(
+                # Keep all 5 elements — _tf_compute_sample_logp needs
+                # last_real_hidden (for first-sample-token predecessor
+                # logit) AND abs_pos (for cache_position threading on
+                # subsequent forward_window calls in the TF loop).
+                shared_prefill = self._prefill_prompt(
                     prompt_ids, pad_id=pad_id, device=device,
                 )
-                # _prefill_prompt now returns 5-tuple (N4 fix); use first 3.
-                shared_prefill = _sp[:3]  # (states, hiddens, kv_cache)
 
         # ── PASS 2: TF logp + PPO-clip surrogate + KL to reference ───
         # TF-forward through SAMPLE only (with grad), starting from the
@@ -424,10 +428,13 @@ class Phase2Trainer:
             # each sample's writes evolve the manifold + cache independently.
             if shared_prefill is not None:
                 import copy
+                _sps, _sph, _skv, _slr, _sap = shared_prefill
                 prefill_state = (
-                    shared_prefill[0].detach().clone(),
-                    shared_prefill[1].detach().clone(),
-                    copy.deepcopy(shared_prefill[2]),  # KV cache deep-clone
+                    _sps.detach().clone(),
+                    _sph.detach().clone() if _sph is not None else None,
+                    copy.deepcopy(_skv),  # KV cache deep-clone
+                    _slr.detach().clone() if _slr is not None else None,
+                    _sap,  # int, no clone needed
                 )
             else:
                 prefill_state = None
@@ -597,20 +604,40 @@ class Phase2Trainer:
         # N4 — encode the trailing partial window (if any) via direct
         # llama.model call. NO padding, NO memory ops. Just extends the
         # KV cache with REAL tokens at correct absolute positions.
+        # CRUCIAL: MemInjectLayer's scale is non-zero (init=0.1) and its
+        # forward() raises if memory_fn is None and scale != 0 (silent-
+        # bypass footgun). For the tail-encode call we install a
+        # zero-returning memory_fn so the bridge runs as a no-op and the
+        # forward succeeds. Cleared after the call.
         last_real_hidden: Tensor | None = None
         n_tail = n - n_aligned
         if n_tail > 0:
             tail = toks[n_aligned:]
             tail_t = torch.tensor(tail, dtype=torch.int64, device=device).unsqueeze(0)
+            n_cache_before = (
+                kv_cache.get_seq_length() if kv_cache is not None else 0
+            )
             cache_position = torch.arange(
+                n_cache_before, n_cache_before + n_tail, device=device,
+            )
+            position_ids = torch.arange(
                 abs_pos, abs_pos + n_tail, device=device,
-            )
-            base_out = self.model.llama.model(
-                input_ids=tail_t,
-                past_key_values=kv_cache,
-                cache_position=cache_position,
-                use_cache=True,
-            )
+            ).unsqueeze(0)
+
+            mem_inject = self.model._mem_inject_layer()
+            def _zero_memory(h_mem):
+                return torch.zeros_like(h_mem)
+            mem_inject.memory_fn = _zero_memory
+            try:
+                base_out = self.model.llama.model(
+                    input_ids=tail_t,
+                    past_key_values=kv_cache,
+                    cache_position=cache_position,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+            finally:
+                mem_inject.memory_fn = None
             kv_cache = base_out.past_key_values
             abs_pos += n_tail
             kv_cache = _trim_kv_cache(kv_cache, cap)
@@ -976,7 +1003,11 @@ class Phase2Trainer:
 
         if prefill_state is not None:
             # Shared-prefill mode: prompt already encoded no_grad upstream.
-            prev_states, prev_window_hiddens, kv_cache = prefill_state
+            # Now a 5-tuple — last_real_hidden + abs_pos let us thread
+            # cache_abs_pos to forward_window for RoPE correctness on the
+            # cached prompt KVs.
+            (prev_states, prev_window_hiddens, kv_cache,
+             last_real_hidden, cache_abs_pos) = prefill_state
             seq_to_walk = sample
             n_walk = n_sample
             first_sample_offset = 0
@@ -987,6 +1018,8 @@ class Phase2Trainer:
             prev_states = self.model.manifold.reset_states(batch_size=1)
             prev_window_hiddens: Tensor | None = None
             kv_cache: object | None = None
+            last_real_hidden: Tensor | None = None
+            cache_abs_pos = 0
             seq_to_walk = prompt + sample
             n_walk = len(seq_to_walk)
             first_sample_offset = n_prompt
@@ -1031,6 +1064,7 @@ class Phase2Trainer:
                 past_key_values=kv_cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit,
+                cache_abs_pos=cache_abs_pos,
                 force_surprise=0.0 if in_shared_prefill_mode else None,
             )
             # In KV-cache mode forward_window's `logits` is [1, T, V]
@@ -1078,10 +1112,12 @@ class Phase2Trainer:
                 sample_logps.append(logp_p)
 
             # Carry state — NO DETACH, autograd graph stays alive across
-            # windows of a sample. KV cache likewise.
+            # windows of a sample. KV cache likewise. Advance abs_pos by
+            # window length so subsequent windows get correct RoPE.
             prev_states = out["new_states"]
             prev_window_hiddens = out["current_hiddens"]
             kv_cache = out.get("new_past_key_values", kv_cache)
+            cache_abs_pos = out.get("new_cache_abs_pos", cache_abs_pos + T)
             kv_cache = _trim_kv_cache(kv_cache, cap)
 
         if not sample_logps:
