@@ -106,6 +106,9 @@ def main():
     rows_answer = []
     rows_needle_pos = []
     rows_query_pos = []
+    rows_answer_start = []
+    rows_answer_end = []
+    n_answer_located = 0
 
     for needle_doc in generate_needle_docs(
         fillers,
@@ -117,10 +120,40 @@ def main():
         rows_num_tokens.append(len(ids))
         rows_target_distance.append(needle_doc.target_distance)
         rows_answer.append(needle_doc.answer)
-        # Convert char positions to approximate token positions (4 chars/tok).
+
+        # EXACT answer-span token positions (Tier 2 #5 follow-up).
+        # Re-tokenize the answer string in two variants (with/without
+        # leading space — Llama BPE quirk where leading space changes
+        # the first token) and search for the variant that matches the
+        # tokens in `ids`. Search backwards from end since answer always
+        # follows the query.
+        ans_start = -1
+        ans_end = -1
+        for variant in [needle_doc.answer, " " + needle_doc.answer]:
+            cand = tok.encode(variant, add_special_tokens=False)
+            if not cand:
+                continue
+            # Search from end backwards (answer is always near the end).
+            for i in range(len(ids) - len(cand), -1, -1):
+                if ids[i:i + len(cand)] == cand:
+                    ans_start = i
+                    ans_end = i + len(cand)
+                    break
+            if ans_start >= 0:
+                break
+        if ans_start >= 0:
+            n_answer_located += 1
+        rows_answer_start.append(ans_start if ans_start >= 0 else -1)
+        rows_answer_end.append(ans_end if ans_end >= 0 else -1)
+
+        # Approximate token positions for needle/query (legacy columns;
+        # `LongDocDataset` post-Tier-1 uses `answer_start_token` /
+        # `answer_end_token` as the source of truth for the loss mask).
         rows_needle_pos.append(needle_doc.needle_pos_chars // 4)
         rows_query_pos.append(needle_doc.query_pos_chars // 4)
 
+    print(f"  located answer span in {n_answer_located}/{len(rows_input_ids)} docs "
+          f"({100*n_answer_located/max(len(rows_input_ids),1):.1f}%)")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table({
         "input_ids": rows_input_ids,
@@ -129,6 +162,10 @@ def main():
         "answer": rows_answer,
         "needle_pos_token": rows_needle_pos,
         "query_pos_token": rows_query_pos,
+        # EXACT answer-span token positions for `LongDocDataset`'s
+        # answer_span_weight loss mask. -1 if not locatable.
+        "answer_start_token": rows_answer_start,
+        "answer_end_token": rows_answer_end,
         "source": ["needle-haystack"] * len(rows_input_ids),
     })
     pq.write_table(table, args.output)

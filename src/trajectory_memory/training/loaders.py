@@ -117,17 +117,42 @@ class LongDocDataset(IterableDataset):
     def _load_sources(self) -> list[dict]:
         """Read each parquet, extract input_ids + needle metadata when
         present. Returns a list of {name, rows: [{input_ids, ans_start,
-        ans_end}, ...]} dicts, one per source path."""
-        # Lazy tokenizer load — only needed if any source has needle metadata.
+        ans_end}, ...]} dicts, one per source path.
+
+        Two paths for needle answer-span:
+          (a) PREFERRED — `answer_start_token` + `answer_end_token`
+              columns precomputed at synthesizer time (exact, fast).
+          (b) FALLBACK — `answer` + `query_pos_token` columns (older
+              parquet schema). Re-tokenize answer at runtime and locate
+              via subseq match. Less reliable when query_pos_token's
+              chars/4 estimate is way off.
+        """
         tok = None
         sources: list[dict] = []
         for path in self.paths:
             tbl = pq.read_table(path)
             cols = set(tbl.column_names)
-            has_needle = "answer" in cols and "query_pos_token" in cols
+            has_exact_span = (
+                "answer_start_token" in cols and "answer_end_token" in cols
+            )
+            has_needle_legacy = "answer" in cols and "query_pos_token" in cols
             ids_col = tbl.column("input_ids").to_pylist()
 
-            if has_needle:
+            if has_exact_span:
+                # Path (a): use precomputed exact token positions.
+                start_col = tbl.column("answer_start_token").to_pylist()
+                end_col = tbl.column("answer_end_token").to_pylist()
+                rows = []
+                for ids, s, e in zip(ids_col, start_col, end_col):
+                    ans_start = s if (s is not None and s >= 0) else None
+                    ans_end = e if (e is not None and e >= 0) else None
+                    rows.append({
+                        "input_ids": ids,
+                        "ans_start": ans_start,
+                        "ans_end": ans_end,
+                    })
+            elif has_needle_legacy:
+                # Path (b): legacy parquet — locate at runtime.
                 if tok is None:
                     from src.trajectory_memory.data.tokenizer import get_tokenizer
                     tok = get_tokenizer()
