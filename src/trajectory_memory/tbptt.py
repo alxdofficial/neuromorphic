@@ -118,6 +118,7 @@ def run_chunk(
     use_kv_cache: bool = False,
     past_key_values: object | None = None,
     cache_abs_pos: int = 0,
+    per_slot_state: object | None = None,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 
@@ -212,24 +213,54 @@ def run_chunk(
             last_prev_logit_hidden = (
                 cur_prev_hiddens[:, -1:, :] if cur_prev_hiddens is not None else None
             )
+            # Per-slot mode: cache lives in per_slot_state, not the
+            # `cache` local. The legacy single-cache path passes
+            # past_key_values=cache + cache_abs_pos=abs_pos; per-slot
+            # passes per_slot_state and forward_window pulls the cache
+            # from there.
+            using_per_slot = per_slot_state is not None
             out = model.forward_window(
                 lm_input_ids=win_input,
                 prev_window_hiddens=cur_prev_hiddens,
                 prev_states=states,
                 target_mask=win_mask,
                 hard_routing=hard_routing,
-                past_key_values=cache,
+                past_key_values=None if using_per_slot else cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit_hidden,
                 cache_abs_pos=abs_pos,
+                per_slot_state=per_slot_state,
             )
-            cache = out.get("new_past_key_values", cache)
-            abs_pos = out.get("new_cache_abs_pos", abs_pos + win_input.shape[1])
-            # Sliding-window trim so cache size stays bounded.
-            # NOTE: abs_pos is NOT reset by trim — new tokens still get the
-            # correct absolute position, so RoPE math against the (older,
-            # at-original-position) cached KVs is consistent.
-            cache = _trim_kv_cache(cache, cap)
+            n_new = win_input.shape[1]
+            if using_per_slot:
+                # Update per-slot bookkeeping after the forward.
+                per_slot_state.cache = out.get("new_past_key_values")
+                per_slot_state.advance_after_forward(n_new)
+                # Sliding-window trim. `_trim_kv_cache` mutates `cache`
+                # in place and returns it; we update per_slot_state's
+                # valid_lens to reflect the trim.
+                cache_len_before_trim = (
+                    per_slot_state.cache.get_seq_length()
+                    if per_slot_state.cache is not None else 0
+                )
+                per_slot_state.cache = _trim_kv_cache(
+                    per_slot_state.cache, cap,
+                )
+                cache_len_after_trim = (
+                    per_slot_state.cache.get_seq_length()
+                    if per_slot_state.cache is not None else 0
+                )
+                if cache_len_after_trim < cache_len_before_trim:
+                    per_slot_state.trim_after_cache_trim(cache_len_after_trim)
+            else:
+                cache = out.get("new_past_key_values", cache)
+                abs_pos = out.get("new_cache_abs_pos", abs_pos + n_new)
+                # Sliding-window trim so cache size stays bounded.
+                # NOTE: abs_pos is NOT reset by trim — new tokens still
+                # get the correct absolute position, so RoPE math
+                # against the (older, at-original-position) cached KVs
+                # is consistent.
+                cache = _trim_kv_cache(cache, cap)
         else:
             # Rolling-buffer mode: build rolling LM context.
             lm_input_ids = torch.cat([lm_buffer, win_input], dim=1)

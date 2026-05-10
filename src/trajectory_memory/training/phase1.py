@@ -132,6 +132,7 @@ class Phase1Trainer:
         target_mask: Tensor | None = None,          # [BS, D, T_window] bool
         past_key_values: object | None = None,
         cache_abs_pos: int = 0,
+        per_slot_state: object | None = None,
     ) -> Phase1Metrics:
         """One Wave 1 step (long-doc TF NTP).
 
@@ -166,6 +167,7 @@ class Phase1Trainer:
             use_kv_cache=self.use_kv_cache,
             past_key_values=past_key_values,
             cache_abs_pos=cache_abs_pos,
+            per_slot_state=per_slot_state,
         )
         loss = out["aggregate_loss"]
         loss.backward()

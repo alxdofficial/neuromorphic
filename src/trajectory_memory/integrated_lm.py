@@ -183,6 +183,7 @@ class IntegratedLM(nn.Module):
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
         force_surprise: float | None = None,
+        per_slot_state: object | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -307,52 +308,98 @@ class IntegratedLM(nn.Module):
             new_past_key_values = None
             try:
                 if use_kv_cache:
-                    # KV-cache mode: encode only the new T_window tokens
-                    # against `past_key_values`. The cache transparently
-                    # carries prior windows' KVs.
-                    #
-                    # TWO position-related concerns require passing two
-                    # separate things to llama.model():
-                    #
-                    # (a) RoPE: cached KVs have rotations baked in at their
-                    #     ORIGINAL abs positions. New Q must use absolute
-                    #     positions so Q·K relative math is consistent.
-                    #     → `position_ids = [abs_pos, abs_pos+1, ...]`
-                    #
-                    # (b) Causal mask: HF builds the mask via
-                    #     `key_index <= cache_position[query]`. The mask
-                    #     iterates over [0..target_length-1] where
-                    #     target_length = cache.get_seq_length() + new_len.
-                    #     If we pass absolute cache_position, ALL key
-                    #     indices end up <= cache_position[q] → ALL allowed
-                    #     → future tokens within the new window leak into
-                    #     past queries. LABEL LEAKAGE.
-                    #     → `cache_position = [cache_len, cache_len+1, ...]`
-                    #     (cache-internal indices, NOT absolute)
-                    #
-                    # Decoupling these two is the only correct path with
-                    # HF's API. Verified separately with a small smoke.
                     n_new = lm_input_ids.shape[1]
-                    cache_len_before = (
-                        past_key_values.get_seq_length()
-                        if past_key_values is not None else 0
-                    )
-                    cache_position = torch.arange(
-                        cache_len_before, cache_len_before + n_new,
-                        device=lm_input_ids.device,
-                    )
-                    position_ids = torch.arange(
-                        cache_abs_pos, cache_abs_pos + n_new,
-                        device=lm_input_ids.device,
-                    ).unsqueeze(0)
-                    base_out = self.llama.model(
-                        input_ids=lm_input_ids,
-                        past_key_values=past_key_values,
-                        cache_position=cache_position,
-                        position_ids=position_ids,
-                        use_cache=True,
-                    )
-                    new_past_key_values = base_out.past_key_values
+                    if per_slot_state is not None:
+                        # ── PER-SLOT KV CACHE PATH ─────────────────────
+                        # Multi-stream training: each batch slot has its
+                        # own independent doc lifecycle. We use one
+                        # batched DynamicCache (shared tensor) but mask
+                        # each slot to only see its OWN valid cached K/V
+                        # via a custom 4D attention_mask. Avoids the
+                        # lockstep-reset hack that wipes ALL slots'
+                        # cache when ANY slot's doc starts. See
+                        # `src/trajectory_memory/per_slot_kv.py`.
+                        from src.trajectory_memory.per_slot_kv import (
+                            build_per_slot_4d_mask,
+                            build_per_slot_position_ids,
+                        )
+                        cache = per_slot_state.cache
+                        cache_len_before = (
+                            cache.get_seq_length() if cache is not None else 0
+                        )
+                        cache_position = torch.arange(
+                            cache_len_before, cache_len_before + n_new,
+                            device=lm_input_ids.device,
+                        )
+                        # Per-slot RoPE positions
+                        position_ids = build_per_slot_position_ids(
+                            per_slot_state.abs_pos, n_new,
+                            device=lm_input_ids.device,
+                        )
+                        # Per-slot 4D attention mask (slot-validity gating
+                        # + causal-within-new). Use the LM's compute dtype
+                        # so SDPA's additive mask combines correctly.
+                        # We use bf16 (Llama's dtype) for the mask.
+                        mask_dtype = next(self.llama.parameters()).dtype
+                        attention_mask = build_per_slot_4d_mask(
+                            valid_len=per_slot_state.valid_len,
+                            q_len=n_new,
+                            cache_len_old=cache_len_before,
+                            device=lm_input_ids.device,
+                            dtype=mask_dtype,
+                        )
+                        base_out = self.llama.model(
+                            input_ids=lm_input_ids,
+                            past_key_values=cache,
+                            cache_position=cache_position,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                            use_cache=True,
+                        )
+                        new_past_key_values = base_out.past_key_values
+                    else:
+                        # ── LEGACY single-stream / lockstep path ──────
+                        # KV-cache mode: encode only the new T_window
+                        # tokens against `past_key_values`. The cache
+                        # transparently carries prior windows' KVs.
+                        #
+                        # TWO position-related concerns require passing
+                        # two separate things to llama.model():
+                        #
+                        # (a) RoPE: cached KVs have rotations baked in
+                        #     at their ORIGINAL abs positions. New Q
+                        #     must use absolute positions so Q·K
+                        #     relative math is consistent.
+                        #     → `position_ids = [abs_pos, abs_pos+1, ...]`
+                        #
+                        # (b) Causal mask: HF builds the mask via
+                        #     `key_index <= cache_position[query]`. If
+                        #     we pass absolute cache_position, ALL key
+                        #     indices end up <= cache_position[q] → ALL
+                        #     allowed → future tokens within the new
+                        #     window leak into past queries. LABEL LEAK.
+                        #     → `cache_position = [cache_len, ...]`
+                        #     (cache-internal indices, NOT absolute)
+                        cache_len_before = (
+                            past_key_values.get_seq_length()
+                            if past_key_values is not None else 0
+                        )
+                        cache_position = torch.arange(
+                            cache_len_before, cache_len_before + n_new,
+                            device=lm_input_ids.device,
+                        )
+                        position_ids = torch.arange(
+                            cache_abs_pos, cache_abs_pos + n_new,
+                            device=lm_input_ids.device,
+                        ).unsqueeze(0)
+                        base_out = self.llama.model(
+                            input_ids=lm_input_ids,
+                            past_key_values=past_key_values,
+                            cache_position=cache_position,
+                            position_ids=position_ids,
+                            use_cache=True,
+                        )
+                        new_past_key_values = base_out.past_key_values
                 else:
                     base_out = self.llama.model(
                         input_ids=lm_input_ids,

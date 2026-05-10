@@ -204,14 +204,12 @@ def main():
     # `torch.where` on the `is_doc_start_per_slot` mask (see the train
     # loop below).
     #
-    # KV cache + multi-stream uses LOCKSTEP RESET: when ANY slot's doc
-    # boundary fires, reset the WHOLE batched cache. This costs the
-    # other slots their cache for a few windows (until refilled), but
-    # is much simpler than per-slot cache lifecycle (which would need
-    # custom attention_mask + per-slot RoPE positions). At BS=4, ~24%
-    # of steps trigger a whole-cache reset; other 76% get full KV
-    # cache benefit. Net throughput is well above rolling-buffer mode
-    # which OOMs at BS=4.
+    # KV cache + multi-stream uses PER-SLOT KV CACHE LIFECYCLE
+    # (vLLM/SGLang inflight-batching pattern adapted for training).
+    # See `src/trajectory_memory/per_slot_kv.py`. Each slot's cache
+    # validity is tracked separately; slot resets just zero the
+    # bookkeeping (no tensor wipe). The earlier lockstep-reset hack
+    # (cost ~24% of steps a full cache wipe) is now eliminated.
 
     if args.batch_size == 1:
         dataset = LongDocDataset(
@@ -339,8 +337,20 @@ def main():
     prev_states = None
     prev_window_hiddens = None
     prev_lm_context = None
-    past_kv = None  # KV-cache mode only: carries across chunks of the same doc
-    cache_abs_pos = 0  # N1: absolute position counter for RoPE correctness
+    past_kv = None  # BS=1 KV-cache path only
+    cache_abs_pos = 0  # BS=1 KV-cache path only
+    # Multi-stream (BS>1) per-slot cache state. Replaces the lockstep
+    # past_kv + cache_abs_pos when BS>1.
+    per_slot_state = None
+    if args.batch_size > 1 and args.use_kv_cache:
+        from src.trajectory_memory.per_slot_kv import PerSlotCacheState
+        per_slot_state = PerSlotCacheState.fresh(
+            batch_size=args.batch_size,
+            max_cache_len=cfg.effective_lm_context,
+            device=args.device,
+        )
+        print(f"Per-slot KV cache enabled (BS={args.batch_size}, "
+              f"max_cache_len={cfg.effective_lm_context}).")
     last_step_t = time.time()
 
     while trainer.step_count < args.num_steps:
@@ -392,14 +402,15 @@ def main():
                             torch.zeros_like(prev_window_hiddens),
                             prev_window_hiddens,
                         )
-                    # Whole-buffer reset on any slot reset (simple +
-                    # correct; non-resetting slots will rebuild their
-                    # buffer over the next ~8 windows).
+                    # Per-slot KV cache: just zero the slot's bookkeeping;
+                    # the cache TENSOR is left intact. Slot's stale
+                    # positions get masked out by the 4D attention mask
+                    # built in `forward_window`. Other slots keep their
+                    # full valid cache.
+                    if per_slot_state is not None:
+                        per_slot_state.reset_slots(is_start)
+                    # Rolling-buffer fallback (only used when --no-kv-cache).
                     prev_lm_context = None
-                    # KV cache disabled in multi-stream mode (forced
-                    # above); cache_abs_pos stays 0.
-                    past_kv = None
-                    cache_abs_pos = 0
 
                 chunk = item.input_ids.to(args.device)            # [BS, T]
                 valid_mask = item.valid_mask.to(args.device)      # [BS, T]
@@ -414,12 +425,22 @@ def main():
                 target_mask=target_mask,
                 past_key_values=past_kv,
                 cache_abs_pos=cache_abs_pos,
+                per_slot_state=per_slot_state,
             )
             prev_states = metrics.final_states
             prev_window_hiddens = metrics.final_hiddens
             prev_lm_context = metrics.final_lm_context
-            past_kv = metrics.final_past_key_values
-            cache_abs_pos = metrics.final_cache_abs_pos
+            # In per-slot mode, cache + abs_pos live in per_slot_state
+            # (mutated in place by run_chunk). Don't read final_*_cache
+            # fields from metrics in that case. Also: detach the cache's
+            # K/V tensors so the per-step .backward() doesn't try to
+            # traverse them again on the next step.
+            if per_slot_state is None:
+                past_kv = metrics.final_past_key_values
+                cache_abs_pos = metrics.final_cache_abs_pos
+            else:
+                from src.trajectory_memory.tbptt import _detach_kv_cache
+                per_slot_state.cache = _detach_kv_cache(per_slot_state.cache)
             losses.append(metrics.loss)
 
             # Per-source train loss tracking. In multi-stream mode the
