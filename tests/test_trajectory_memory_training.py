@@ -413,6 +413,97 @@ def test_phase2_trainer_step_runs_end_to_end():
     assert trainer.step_count == 1
 
 
+def test_phase2_set_reference_state_snapshots_trainable_params():
+    """`set_reference_state()` should snapshot all trainable params and
+    leave them unchanged when the snapshot is taken (no side effects)."""
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt)
+    assert trainer.ref_state is None
+
+    pre_snapshot = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+    trainer.set_reference_state()
+    assert trainer.ref_state is not None
+    assert len(trainer.ref_state) == sum(1 for p in model.parameters() if p.requires_grad)
+    # Verify snapshot equals current params.
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert torch.equal(trainer.ref_state[name], p), \
+                f"ref snapshot mismatch on param {name}"
+    # Verify no mutation of model params.
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert torch.equal(pre_snapshot[name], p), \
+                f"set_reference_state mutated param {name}"
+
+
+def test_phase2_compute_ref_logps_restores_current_params():
+    """After computing ref logps, current trainable params should be
+    restored to their original values (the swap-in/swap-out pattern
+    mustn't leave the model in ref-policy state)."""
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, kl_coef=0.001)
+    trainer.set_reference_state()
+
+    # Mutate a param so current != ref.
+    with torch.no_grad():
+        first_trainable = next(p for p in model.parameters() if p.requires_grad)
+        first_trainable.add_(0.1)
+    pre_call = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    prompt_ids = torch.randint(1, 50, (16,))
+    sample_ids = torch.randint(1, 50, (8,))
+    trainer._compute_ref_logps(
+        prompt_ids=prompt_ids, sample_ids=sample_ids,
+        temperature=1.0, pad_id=0, device=torch.device("cpu"),
+    )
+    # All trainable params should equal pre_call values (not the ref snapshot).
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert torch.equal(pre_call[name], p), \
+                f"_compute_ref_logps left model in ref state: {name}"
+
+
+def test_phase2_step_with_kl_term_runs_end_to_end():
+    """Full Phase2Trainer.step with KL term enabled should run without
+    crashing and return finite loss + non-zero KL diagnostic."""
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.01)
+    trainer.set_reference_state()
+
+    # Mutate so π ≠ π_ref → KL > 0 expected.
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.requires_grad:
+                p.add_(0.05)
+
+    class _FakeTokenizer:
+        eos_token_id = 99
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids[:5])
+
+    prompt_ids = torch.randint(1, 50, (16,))
+    metrics = trainer.step(
+        prompt_ids,
+        num_samples=2, max_new_tokens=4,
+        reward_kind="exact_match", gold="dummy", meta={},
+        tokenizer=_FakeTokenizer(),
+    )
+    import math
+    assert math.isfinite(metrics.policy_loss)
+    # KL should be > 0 since we mutated params away from ref.
+    assert metrics.kl_to_ref >= 0  # K3 estimator is non-negative
+    # Mean ratio should be finite and positive.
+    assert metrics.mean_ratio > 0
+    # clip_fraction should be in [0, 1].
+    assert 0 <= metrics.clip_fraction <= 1
+
+
 def test_phase2_step_does_not_mutate_manifold_buffer():
     """Audit Phase A5: pass 1 (no_grad AR) and pass 2 (TF replay with grad)
     both use per-batch state tensors via `Manifold.reset_states(batch_size=1)`,

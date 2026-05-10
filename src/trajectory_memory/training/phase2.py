@@ -61,6 +61,13 @@ class Phase2Metrics:
     advantages: list[float]
     decoded: list[str]
     mean_response_len: float
+    # IS-clipping diagnostics (Phase B): fraction of tokens whose ratio
+    # was clipped, mean ratio. Both useful for catching policy drift.
+    clip_fraction: float = 0.0
+    mean_ratio: float = 1.0
+    # KL diagnostics (Phase B): mean per-token KL to reference policy.
+    # Zero when no ref_state set (KL term off).
+    kl_to_ref: float = 0.0
 
 
 def compute_grpo_advantages(rewards: Tensor, *, eps: float = 1e-6) -> Tensor:
@@ -105,12 +112,37 @@ class Phase2Trainer:
         *,
         scheduler: object | None = None,
         grad_clip: float | None = 1.0,
+        clip_eps: float = 0.2,
+        clip_eps_higher: float | None = None,
+        kl_coef: float = 0.001,
     ):
+        """
+        Args:
+            clip_eps: PPO importance-sampling ratio clip width (symmetric).
+                Default 0.2 matches TRL/verl. Set to a large number (e.g. 10)
+                AND set `clip_eps_higher` to the same to disable clipping.
+            clip_eps_higher: optional asymmetric upper clip (DeepSeek-R1's
+                `clip_higher` mode). When None, uses symmetric `clip_eps`.
+                When set, ratio is clamped to [1 - clip_eps, 1 + clip_eps_higher],
+                allowing the policy to grow more freely while still bounding
+                downside drift. R1 used clip_eps_higher=10.
+            kl_coef: weight on the `KL(π_θ || π_ref)` regularization term.
+                Default 0.001 matches verl. Set to 0 to disable. Reference
+                policy must be set via `set_reference_state()` for KL to
+                fire.
+        """
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.grad_clip = grad_clip
+        self.clip_eps = clip_eps
+        self.clip_eps_higher = clip_eps_higher
+        self.kl_coef = kl_coef
         self._step_count = 0
+        # Reference policy snapshot (Phase B): set ONCE via
+        # `set_reference_state()` before training starts. Used for KL
+        # regularization to keep the policy near its Phase-1-end state.
+        self.ref_state: dict[str, Tensor] | None = None
 
     @property
     def step_count(self) -> int:
@@ -121,6 +153,68 @@ class Phase2Trainer:
 
     def load_state_dict(self, state: dict) -> None:
         self._step_count = state["step_count"]
+
+    def set_reference_state(self) -> None:
+        """Snapshot current trainable params as the reference policy π_ref.
+
+        Call ONCE after loading the Phase 1 checkpoint and BEFORE starting
+        Phase 2 training. The snapshot is used by `_compute_ref_logps` to
+        compute the KL regularization term.
+
+        Memory cost: ~size of trainable params (16.5M for medium config
+        in fp32 = ~66 MB on GPU).
+        """
+        self.ref_state = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+
+    @torch.no_grad()
+    def _compute_ref_logps(
+        self,
+        prompt_ids: Tensor,
+        sample_ids: Tensor,
+        *,
+        temperature: float,
+        pad_id: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        """No-grad TF-forward through (prompt + sample) under the REFERENCE
+        policy. Returns per-sample-token logp.
+
+        Implementation: temporarily swap the trainable params to the ref
+        snapshot, call `_tf_compute_sample_logp` (no_grad context), restore
+        the current params. Two memcpy passes per call (~66 MB each at
+        medium config — trivial).
+        """
+        if self.ref_state is None or self.kl_coef == 0:
+            return None
+
+        # Save current trainable params.
+        saved = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        try:
+            # Swap in ref params.
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    p.data.copy_(self.ref_state[name])
+            # Compute under ref policy. _tf_compute_sample_logp returns
+            # tensors with grad enabled by default; we're inside @no_grad
+            # so the returned logp tensors are leaf-no-grad.
+            ref_logps = self._tf_compute_sample_logp(
+                prompt_ids=prompt_ids, sample_ids=sample_ids,
+                temperature=temperature, pad_id=pad_id, device=device,
+            )
+            return ref_logps.detach() if ref_logps.numel() > 0 else None
+        finally:
+            # Restore current params.
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    p.data.copy_(saved[name])
 
     def step(
         self,
@@ -155,10 +249,16 @@ class Phase2Trainer:
         pad_id = getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id
         device = next(self.model.parameters()).device
 
-        # ── PASS 1: AR sample each response (no_grad), with prefill ──
+        # ── PASS 1: AR sample each response (no_grad, with prefill).
+        # Returns (sample_ids, sample_logp_old) per sample. logp_old is the
+        # detached log-prob of each sampled token under the policy at
+        # SAMPLING time — used by pass 2 for the PPO importance-sampling
+        # ratio. Recording it here is essentially free (softmax already
+        # computed for sampling).
         samples: list[Tensor] = []
+        samples_logp_old: list[Tensor] = []
         for _ in range(num_samples):
-            sample = self._ar_sample_one(
+            sample, logp_old = self._ar_sample_one(
                 prompt_ids,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -167,6 +267,7 @@ class Phase2Trainer:
                 device=device,
             )
             samples.append(sample)
+            samples_logp_old.append(logp_old)
 
         # ── SCORE ────────────────────────────────────────────────────
         decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
@@ -176,29 +277,81 @@ class Phase2Trainer:
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
         advantages = compute_grpo_advantages(rewards_t)
 
-        # ── PASS 2: TF logp for each sample (with grad), backward ────
-        # TF-forward through (prompt + sample) for each sample,
-        # collecting per-sample-token logp under the tempered softmax
-        # used during sampling. Memory writes are in the gradient path
-        # because pass 2 carries state through `write_module` normally
-        # (no detach within a single sample's forward).
+        # ── PASS 2: TF logp + PPO-clip surrogate + KL to reference ───
+        # TF-forward through (prompt + sample) under CURRENT policy with
+        # grad → sample_logps_new. Compute IS ratio against pass-1 logp,
+        # apply PPO clip, accumulate weighted advantage. Optionally add
+        # KL(π_θ ‖ π_ref) regularization computed under a temporarily-
+        # swapped ref-policy forward pass.
         self.optimizer.zero_grad()
         policy_loss = torch.zeros((), device=device)
+        kl_loss = torch.zeros((), device=device)
         any_grad = False
-        for sample, adv in zip(samples, advantages):
+
+        # Diagnostics
+        n_clipped = 0
+        n_total = 0
+        ratio_sum = 0.0
+        kl_sum = 0.0
+        kl_count = 0
+
+        clip_low = 1.0 - self.clip_eps
+        clip_high = 1.0 + (self.clip_eps_higher if self.clip_eps_higher is not None
+                           else self.clip_eps)
+
+        for sample, logp_old, adv in zip(samples, samples_logp_old, advantages):
             if sample.numel() == 0:
                 continue
-            sample_logps = self._tf_compute_sample_logp(
+            sample_logps_new = self._tf_compute_sample_logp(
                 prompt_ids=prompt_ids,
                 sample_ids=sample.to(device),
                 temperature=temperature,
                 pad_id=pad_id,
                 device=device,
             )
-            if sample_logps.numel() == 0:
+            if sample_logps_new.numel() == 0:
                 continue
-            policy_loss = policy_loss + (-adv * sample_logps.sum())
+
+            # Align logp_old to logp_new — logp_old has one entry per
+            # sampled token; logp_new may drop the very-first token of the
+            # sequence if there's no in-graph predecessor (see
+            # `_tf_compute_sample_logp` boundary handling). Take the tail.
+            n_new = sample_logps_new.numel()
+            logp_old_aligned = logp_old[-n_new:].to(device).to(sample_logps_new.dtype)
+
+            # PPO importance-sampling ratio + clip surrogate.
+            log_ratio = sample_logps_new - logp_old_aligned
+            ratio = log_ratio.exp()
+            clipped_ratio = torch.clamp(ratio, clip_low, clip_high)
+            # Loss is -min(r·A, clip(r)·A) (we minimize → negate the
+            # surrogate objective).
+            surrogate = -torch.min(adv * ratio, adv * clipped_ratio)
+            policy_loss = policy_loss + surrogate.sum()
+
+            # Diagnostics.
+            n_clipped += int(((ratio < clip_low) | (ratio > clip_high)).sum())
+            n_total += int(n_new)
+            ratio_sum += float(ratio.detach().sum())
+
+            # KL term against reference policy (no_grad ref forward).
+            if self.ref_state is not None and self.kl_coef > 0:
+                ref_logps = self._compute_ref_logps(
+                    prompt_ids=prompt_ids,
+                    sample_ids=sample.to(device),
+                    temperature=temperature, pad_id=pad_id, device=device,
+                )
+                if ref_logps is not None and ref_logps.numel() == n_new:
+                    # John Schulman's K3 estimator: KL ≈ exp(log r) - log r - 1
+                    # where log r = logp_new - logp_ref. Always non-negative,
+                    # low-variance, exact in expectation.
+                    log_r = sample_logps_new - ref_logps
+                    kl_per_tok = log_r.exp() - log_r - 1.0
+                    kl_loss = kl_loss + kl_per_tok.sum()
+                    kl_sum += float(kl_per_tok.detach().sum())
+                    kl_count += int(n_new)
+
             any_grad = True
+
         # Audit fix (Phase A1, Dr.GRPO): normalize by `K * max_new_tokens`
         # rather than just `K`. The earlier `sum(logp) / K` per sample
         # gives long completions larger |loss| for the same advantage,
@@ -207,9 +360,13 @@ class Phase2Trainer:
         # under negative advantage). See arxiv 2503.20783 (Sea AI Lab,
         # COLM 2025). Dividing by a constant `max_new_tokens` is
         # length-agnostic.
-        policy_loss = policy_loss / max(num_samples * max_new_tokens, 1)
+        denom = max(num_samples * max_new_tokens, 1)
+        policy_loss = policy_loss / denom
+        kl_loss = kl_loss / denom
+        total_loss = policy_loss + self.kl_coef * kl_loss
+
         if any_grad:
-            policy_loss.backward()
+            total_loss.backward()
             grad_norm = self._clip_and_step()
         else:
             grad_norm = 0.0
@@ -218,13 +375,16 @@ class Phase2Trainer:
         self._step_count += 1
 
         return Phase2Metrics(
-            policy_loss=float(policy_loss.detach()),
+            policy_loss=float(total_loss.detach()),
             grad_norm=float(grad_norm),
             lr=[g["lr"] for g in self.optimizer.param_groups],
             rewards=rewards,
             advantages=advantages.tolist(),
             decoded=decoded,
             mean_response_len=sum(len(s) for s in samples) / max(len(samples), 1),
+            clip_fraction=n_clipped / max(n_total, 1),
+            mean_ratio=ratio_sum / max(n_total, 1),
+            kl_to_ref=kl_sum / max(kl_count, 1),
         )
 
     # ── PASS 1: no-grad AR sampling (with prefill, KV-cached) ────────
@@ -346,6 +506,11 @@ class Phase2Trainer:
         )
 
         generated: list[int] = []
+        # `logp_old` records logp_pi_old(token) at sampling time, used by
+        # pass 2's PPO-clip importance-sampling ratio. Detached / no_grad
+        # — pass 2 recomputes logp_new under autograd.
+        logp_old_list: list[Tensor] = []
+
         # First generated token: predict from the LAST cached hidden
         # (= prev_window_hiddens[:, -1:, :], the prompt's last position).
         # prev_window_hiddens was cast to manifold's fp32 dtype inside
@@ -353,12 +518,18 @@ class Phase2Trainer:
         lm_head_dtype = next(self.model.llama.lm_head.parameters()).dtype
         last_hidden = prev_window_hiddens[:, -1:, :].to(lm_head_dtype)
         first_logit = self.model.llama.lm_head(last_hidden).float()
-        probs = F.softmax(first_logit[:, -1, :] / temperature, dim=-1)
+        scaled = first_logit[:, -1, :] / temperature
+        log_probs = F.log_softmax(scaled, dim=-1)
+        probs = log_probs.exp()
         first_token = int(torch.multinomial(probs, num_samples=1).item())
         generated.append(first_token)
+        logp_old_list.append(log_probs[0, first_token].detach())
 
         if stop_ids is not None and first_token in stop_ids:
-            return torch.tensor(generated, dtype=torch.int64)
+            return (
+                torch.tensor(generated, dtype=torch.int64),
+                torch.stack(logp_old_list).cpu(),
+            )
 
         # Generation windows.
         stopped = False
@@ -402,9 +573,12 @@ class Phase2Trainer:
 
                     # Sample next token from this hidden's logit.
                     logits = self.model.llama.lm_head(hidden).float()
-                    probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+                    scaled = logits[:, -1, :] / temperature
+                    log_probs = F.log_softmax(scaled, dim=-1)
+                    probs = log_probs.exp()
                     sampled = int(torch.multinomial(probs, num_samples=1).item())
                     generated.append(sampled)
+                    logp_old_list.append(log_probs[0, sampled].detach())
 
                     if stop_ids is not None and sampled in stop_ids:
                         stopped = True
@@ -461,7 +635,10 @@ class Phase2Trainer:
         # part of any window's hiddens (i.e. window's last sample triggered
         # stop before the next iter could forward it). Actually no — we
         # KEEP it in `generated` since it's the stop token / completion.
-        return torch.tensor(generated, dtype=torch.int64)
+        return (
+            torch.tensor(generated, dtype=torch.int64),
+            torch.stack(logp_old_list).cpu() if logp_old_list else torch.zeros(0),
+        )
 
     @torch.no_grad()
     def _ar_sample_one_test_mode(
@@ -473,9 +650,10 @@ class Phase2Trainer:
         stop_ids: set[int] | None,
         pad_id: int,
         device: torch.device,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """Test-mode AR loop — uses forward_window for each generated token.
-        Slow but works without real Llama. Used by `test_phase2_trainer_*`."""
+        Slow but works without real Llama. Used by `test_phase2_trainer_*`.
+        Returns (sample_ids, sample_logp_old)."""
         cfg = self.model.cfg
         cap = cfg.effective_lm_context
         T = cfg.T_window
@@ -505,6 +683,7 @@ class Phase2Trainer:
 
         cur_tokens = list(toks)
         generated: list[int] = []
+        logp_old_list: list[Tensor] = []
         for _ in range(max_new_tokens):
             lm_input = torch.tensor(
                 cur_tokens[-cap:], dtype=torch.int64, device=device,
@@ -519,15 +698,21 @@ class Phase2Trainer:
                 target_mask=None, hard_routing=True,
             )
             logits = out["logits"][:, -1, :].float()
-            probs = F.softmax(logits / temperature, dim=-1)
+            scaled = logits / temperature
+            log_probs = F.log_softmax(scaled, dim=-1)
+            probs = log_probs.exp()
             sampled = int(torch.multinomial(probs, num_samples=1).item())
             generated.append(sampled)
+            logp_old_list.append(log_probs[0, sampled].detach())
             cur_tokens.append(sampled)
             if stop_ids is not None and sampled in stop_ids:
                 break
             prev_states = out["new_states"]
             prev_window_hiddens = out["current_hiddens"]
-        return torch.tensor(generated, dtype=torch.int64)
+        return (
+            torch.tensor(generated, dtype=torch.int64),
+            torch.stack(logp_old_list).cpu() if logp_old_list else torch.zeros(0),
+        )
 
     # ── PASS 2: TF logp computation (with grad, single backward, KV-cached) ──
 
@@ -686,7 +871,7 @@ def grpo_rollout(
     samples = []
     stop_ids = {eos_id} if eos_id is not None else None
     for _ in range(num_samples):
-        sample = trainer._ar_sample_one(
+        sample, _logp_old = trainer._ar_sample_one(
             prompt_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,

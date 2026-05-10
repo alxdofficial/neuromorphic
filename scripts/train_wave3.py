@@ -61,6 +61,19 @@ def main():
     ap.add_argument("--checkpoint-out", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--log-every", type=int, default=5)
+    # ── GRPO regularization (Phase B) ────────────────────────────────
+    ap.add_argument("--clip-eps", type=float, default=0.2,
+                    help="PPO importance-sampling ratio clip width. "
+                         "Default 0.2 matches TRL/verl. Set high (e.g. 10) "
+                         "to effectively disable clipping.")
+    ap.add_argument("--clip-eps-higher", type=float, default=None,
+                    help="Asymmetric upper clip (DeepSeek-R1's `clip_higher`). "
+                         "When set, ratio clamped to [1-clip_eps, 1+clip_eps_higher]. "
+                         "R1 used 10. None → symmetric.")
+    ap.add_argument("--kl-coef", type=float, default=0.001,
+                    help="Weight on KL(π_θ || π_ref) regularization. "
+                         "Default 0.001 matches verl. 0 disables KL term. "
+                         "Reference is the loaded --checkpoint-in weights.")
     args = ap.parse_args()
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
@@ -74,7 +87,12 @@ def main():
         total_steps=args.num_steps,
         lr_min_ratio=args.lr_min_ratio,
     )
-    trainer = Phase2Trainer(model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip)
+    trainer = Phase2Trainer(
+        model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
+        clip_eps=args.clip_eps,
+        clip_eps_higher=args.clip_eps_higher,
+        kl_coef=args.kl_coef,
+    )
 
     if args.checkpoint_in:
         if args.warm_start:
@@ -95,6 +113,12 @@ def main():
             if "rng_state" in ckpt:
                 restore_rng_state(ckpt["rng_state"])
             print(f"Resumed from {args.checkpoint_in}")
+
+    # Snapshot the loaded weights as π_ref for KL regularization. This is
+    # the post-Phase-1 (= pre-Phase-2) policy by construction.
+    if args.kl_coef > 0:
+        trainer.set_reference_state()
+        print(f"Reference policy snapshot taken (kl_coef={args.kl_coef}).")
 
     dataset = PromptResponseDataset(args.data_paths)
     print(f"Wave 3 dataset: {len(dataset)} prompts")
@@ -130,6 +154,9 @@ def main():
                 print(f"  step {step:>4}  loss={metrics.policy_loss:.4f}  "
                       f"r={[f'{r:.2f}' for r in metrics.rewards]}  "
                       f"avg_r10={avg:.3f}  grad_norm={metrics.grad_norm:.2f}  "
+                      f"clip_frac={metrics.clip_fraction:.3f}  "
+                      f"mean_ratio={metrics.mean_ratio:.3f}  "
+                      f"kl={metrics.kl_to_ref:.4f}  "
                       f"({elapsed/max(step, 1):.2f}s/step)")
 
             if args.checkpoint_out is not None and step > 0 and step % args.save_every == 0:
