@@ -34,7 +34,12 @@ from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.data.tokenizer import get_tokenizer
 from src.trajectory_memory.integrated_lm import IntegratedLM
 from src.trajectory_memory.training.metrics import (
+    concept_state_drift,
+    effective_lr_by_component,
     grad_norms_by_component,
+    logit_stats,
+    param_norms_by_component,
+    routing_entropy,
     surprise_stats,
     trajectory_diversity_stats,
     vram_stats,
@@ -300,6 +305,75 @@ def main():
             out[label] = sum(losses_v) / max(len(losses_v), 1)
         return out
 
+    def run_answer_only_val() -> dict[str, float]:
+        """Second val pass — only computes loss on ANSWER-span tokens
+        (mask >= answer_span_weight threshold). The clean memory-probe
+        diagnostic: directly measures whether memory retrieves the
+        planted answer, without dilution by the 30K filler tokens.
+        Only runs on sources with answer-span metadata (i.e., needle).
+
+        Cost: ~30s per save (one extra val pass through needle val).
+        """
+        out: dict[str, float] = {}
+        for label, vds in val_datasets.items():
+            # Only needle has answer-span metadata; skip others.
+            # We detect by checking if any val_mask value > 50 (the
+            # answer_span_weight default is 100; filler is 1.0).
+            losses_v: list[float] = []
+            n_answer_chunks = 0
+            v_prev_states = None
+            v_prev_hiddens = None
+            v_prev_lm_ctx = None
+            v_past_kv = None
+            v_cache_abs = 0
+            for i, item in enumerate(vds):
+                if i >= args.val_batches:
+                    break
+                if item.is_doc_start:
+                    v_prev_states = None
+                    v_prev_hiddens = None
+                    v_prev_lm_ctx = None
+                    v_past_kv = None
+                    v_cache_abs = 0
+                chunk_v = item.input_ids.unsqueeze(0).to(args.device)
+                # Build BINARY answer-only mask: 1.0 where answer span,
+                # 0.0 elsewhere. Skip chunk entirely if no answer tokens.
+                answer_only_mask = (item.valid_mask >= 50.0).float().unsqueeze(0).to(args.device)
+                if answer_only_mask.sum() == 0:
+                    # Still need to thread state through this chunk for the
+                    # later chunks, but don't count this one in the loss.
+                    target_mask_v = answer_only_mask.view(1, cfg.D, cfg.T_window)
+                    ev = trainer.eval_wave1(
+                        chunk_v,
+                        prev_states=v_prev_states,
+                        prev_window_hiddens=v_prev_hiddens,
+                        prev_lm_context=v_prev_lm_ctx,
+                        target_mask=target_mask_v,
+                        past_key_values=v_past_kv,
+                        cache_abs_pos=v_cache_abs,
+                    )
+                else:
+                    target_mask_v = answer_only_mask.view(1, cfg.D, cfg.T_window)
+                    ev = trainer.eval_wave1(
+                        chunk_v,
+                        prev_states=v_prev_states,
+                        prev_window_hiddens=v_prev_hiddens,
+                        prev_lm_context=v_prev_lm_ctx,
+                        target_mask=target_mask_v,
+                        past_key_values=v_past_kv,
+                        cache_abs_pos=v_cache_abs,
+                    )
+                    losses_v.append(ev["loss"])
+                    n_answer_chunks += 1
+                v_prev_states = ev["final_states"]
+                v_prev_hiddens = ev["final_hiddens"]
+                v_prev_lm_ctx = ev["final_lm_context"]
+                v_past_kv = ev["final_past_key_values"]
+                v_cache_abs = ev["final_cache_abs_pos"]
+            if losses_v:
+                out[label] = sum(losses_v) / len(losses_v)
+        return out
+
     print(f"Starting Wave 1 training: {args.num_steps} steps "
           f"(starting from step {trainer.step_count})")
     losses: list = []
@@ -505,10 +579,22 @@ def main():
                 rs = trajectory_diversity_stats(metrics.read_visited_ids, cfg.N)
                 history.setdefault("read_unique_frac", []).append(rs["unique_frac"])
                 history.setdefault("read_self_overlap", []).append(rs["self_overlap_rate"])
+                # Routing entropy (sharpest collapse detector). Healthy
+                # for N=4096 with 4 trajectories × K=8 reads per step =
+                # 32 visits/step: entropy should be log(min(32, 4096))
+                # ≈ 3.5 nats early; rises toward log(4096)≈8.3 as
+                # routing diversifies across many concepts. If it drops
+                # toward log(4-8)≈1-2, routing is collapsing.
+                history.setdefault("read_routing_entropy", []).append(
+                    routing_entropy(metrics.read_visited_ids, cfg.N),
+                )
             if metrics.write_visited_ids is not None:
                 ws = trajectory_diversity_stats(metrics.write_visited_ids, cfg.N)
                 history.setdefault("write_unique_frac", []).append(ws["unique_frac"])
                 history.setdefault("write_self_overlap", []).append(ws["self_overlap_rate"])
+                history.setdefault("write_routing_entropy", []).append(
+                    routing_entropy(metrics.write_visited_ids, cfg.N),
+                )
             # Surprise distribution (per-window NTP CE — should drop as
             # memory learns to bridge the LM cap).
             if metrics.surprise_history is not None:
@@ -524,6 +610,27 @@ def main():
                 comp_norms = grad_norms_by_component(model)
                 for comp, val in comp_norms.items():
                     history.setdefault(f"grad_norm_{comp}", []).append(val)
+                # Per-component param norms (param-explosion detector).
+                comp_params = param_norms_by_component(model)
+                for comp, val in comp_params.items():
+                    history.setdefault(f"param_norm_{comp}", []).append(val)
+                # Effective LR per component = lr · ||grad|| / ||param||.
+                # Sanity range 1e-5 to 1e-3; >1e-2 unstable; <1e-7 stuck.
+                eff_lrs = effective_lr_by_component(
+                    comp_norms, comp_params, list(metrics.lr),
+                )
+                for comp, val in eff_lrs.items():
+                    history.setdefault(f"eff_lr_{comp}", []).append(val)
+            except Exception:
+                pass
+            # Concept-state drift (manifold runaway detector).
+            try:
+                if metrics.final_states is not None:
+                    drift = concept_state_drift(
+                        metrics.final_states, model.manifold.state_init,
+                    )
+                    history.setdefault("concept_drift_mean", []).append(drift["mean_drift"])
+                    history.setdefault("concept_drift_max", []).append(drift["max_drift"])
             except Exception:
                 pass
             # Throughput (tok/s for this step).
@@ -558,6 +665,18 @@ def main():
                     # Best-val score = first source's loss (typically `needle`,
                     # the memory-bridging probe). Falls back to mean if needed.
                     cur_val = next(iter(per_source.values()), None)
+                    # Answer-only val (the clean memory-probe diagnostic).
+                    # Second val pass with binary answer-only mask.
+                    answer_only = run_answer_only_val()
+                    for src, v in answer_only.items():
+                        history.setdefault("val_answer_loss", {}).setdefault(
+                            src, [],
+                        ).append(v)
+                    if answer_only:
+                        ans_pretty = "  ".join(
+                            f"{s}={v:.3f}" for s, v in answer_only.items()
+                        )
+                        print(f"  step {step:>5}  val ANSWER-ONLY: {ans_pretty}")
                 if args.checkpoint_out is not None:
                     save_checkpoint(
                         args.checkpoint_out,

@@ -70,17 +70,20 @@ Cold-start compile cost ~1-3 min per BS; reuses across iters within a run.
   GB; BS=4 compile uses 22.2 GB (compile keeps a few extra graph buffers
   resident).
 
-### Recommended production setting (UPDATED 2026-05-10)
+### Recommended production setting (UPDATED 2026-05-10, then -10 again post-multi-stream)
 
-This subsection was for the pre-KV-cache era. Current production
-defaults (post-KV-cache + post-grad-checkpointing-removal):
+Current production defaults (post-KV-cache + post-multi-stream + post-
+per-slot-KV-cache):
 
-- **`train_wave1.py`** asserts BS=1 (state-threading limitation). KV
-  cache + compile both default ON. Real-world tok/s in BS=1 + state-
-  threaded mode TBD (smoke shows ~5k tok/s steady-state).
-- **`train_wave2.py`** runs `--batch-size 2` (TurnPair length-bucketed).
-  KV cache + compile both default ON. `--prior-loss-weight 0.1`
-  default (B12 fix).
+- **`train_wave1.py`** defaults `--batch-size 4` (multi-stream via
+  `BatchedLongDocDataset` with per-slot KV cache lifecycle). KV cache
+  + compile both default ON. Real-world steady-state ~16k tok/s
+  (~0.25s/step at BS=4 × T_chunk=1024). VRAM ~10.6 GB peak. BS=1
+  single-stream still works as a fallback.
+- **`train_wave2.py`** runs `--batch-size 1` (TurnPair length-bucketed,
+  variable-length priors → BS>1 truncation drops data; W2 OOMd at
+  BS=2 in earlier smoke). KV cache + compile both default ON.
+  `--prior-loss-weight 0.1` default (B12 fix).
 - Use `--no-compile` for debug iteration (skip ~2 min cold-start).
 - Use `--no-kv-cache` only for the rolling-buffer fallback path
   (slower but useful for reproducing legacy bench numbers).

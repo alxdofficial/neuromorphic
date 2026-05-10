@@ -142,3 +142,103 @@ def vram_stats() -> dict[str, float]:
         "alloc_gb": torch.cuda.memory_allocated() / 1e9,
         "peak_gb": torch.cuda.max_memory_allocated() / 1e9,
     }
+
+
+def routing_entropy(
+    visited_ids: torch.Tensor, N: int,
+) -> float:
+    """Visit-distribution entropy across the N concepts.
+
+    For each concept c in [0, N), count how often it appears in
+    `visited_ids`. Compute entropy = -Σ p(c) log p(c) where p(c) is the
+    visit fraction. Returns entropy in nats.
+
+    Use as a routing-collapse detector. Healthy memory routing has
+    high entropy (visits spread across many concepts). Pathological
+    collapse (routing always picks the same K concepts) has low
+    entropy. For uniform visits across all N concepts, entropy is
+    log(N) ≈ 8.3 for N=4096. For collapse onto 4 concepts, entropy
+    is log(4) ≈ 1.4.
+
+    Returns 0.0 if visited_ids is empty.
+    """
+    flat = visited_ids.detach().reshape(-1)
+    if flat.numel() == 0:
+        return 0.0
+    counts = torch.bincount(flat.cpu(), minlength=N).float()
+    total = counts.sum()
+    if total == 0:
+        return 0.0
+    p = counts / total
+    # entropy = -Σ p log p, ignoring p=0 (0*log0 = 0)
+    nonzero = p > 0
+    entropy = -(p[nonzero] * p[nonzero].log()).sum()
+    return float(entropy)
+
+
+def concept_state_drift(
+    current_states: torch.Tensor,        # [BS, N, D] OR [N, D]
+    state_init: torch.Tensor,            # [N, D]
+) -> dict[str, float]:
+    """Per-concept drift from state_init. Detects manifold runaway —
+    if mean drift grows unboundedly, the manifold is exploding (writes
+    aren't being well-regulated). If max drift is much greater than
+    mean, a few concepts are absorbing all the writes (over-attractor).
+
+    Returns:
+        mean_drift: average L2(current[c] - init[c]) across concepts
+        max_drift:  max L2 drift across concepts
+    """
+    if current_states.dim() == 3:
+        # [BS, N, D] → average over batch first
+        current = current_states.mean(dim=0)
+    else:
+        current = current_states
+    delta = (current - state_init).detach()    # [N, D]
+    per_concept_l2 = delta.float().pow(2).sum(dim=-1).sqrt()    # [N]
+    return {
+        "mean_drift": float(per_concept_l2.mean()),
+        "max_drift": float(per_concept_l2.max()),
+    }
+
+
+def effective_lr_by_component(
+    grad_norms: dict[str, float],
+    param_norms: dict[str, float],
+    lr_per_group: list[float],
+) -> dict[str, float]:
+    """Effective LR = (lr · ||grad||) / ||param|| per component. The
+    "fractional update size" each component sees per step. Healthy is
+    1e-5 to 1e-3; >1e-2 is unstable; <1e-7 is not learning.
+
+    Uses lr_per_group[0] as the effective LR for all components (a
+    coarse approximation — components actually map to either group 0
+    [memory] or group 1 [adapter] depending on `build_optimizer`'s
+    classification, but for plotting purposes the order-of-magnitude
+    is what matters).
+    """
+    if not lr_per_group:
+        return {}
+    lr = lr_per_group[0]
+    out: dict[str, float] = {}
+    for label, gn in grad_norms.items():
+        pn = param_norms.get(label, 0.0)
+        if pn > 0:
+            out[label] = (lr * gn) / pn
+        else:
+            out[label] = 0.0
+    return out
+
+
+def logit_stats(logits: torch.Tensor) -> dict[str, float]:
+    """Per-token logit std + range. Detects logit collapse (std → 0)
+    or explosion (huge max-min range). Healthy logits have std ~1-3
+    and range a few × std. Pre-softmax."""
+    if logits.numel() == 0:
+        return {"std": 0.0, "range": 0.0, "max": 0.0}
+    flat = logits.detach().float().reshape(-1)
+    return {
+        "std": float(flat.std()),
+        "range": float(flat.max() - flat.min()),
+        "max": float(flat.max()),
+    }

@@ -128,8 +128,8 @@ The id/state split has clean roles:
   random target with probability `p_rewire`. Result: ~half local + ~half
   random connections, giving short paths between distant regions while
   preserving semantic locality. Constraint: `K_max <= 2*radius`, since
-  the local zone has 2*radius candidates. Defaults:
-  `K_max_neighbors=32`, `radius=16`, `p_rewire=0.5`. (Note: graph_walker
+  the local zone has 2*radius candidates. Defaults (medium tier, post
+  2026-05-09 bump): `K_max_neighbors=64`, `radius=32`, `p_rewire=0.5`. (Note: graph_walker
   uses `radius=4` on a 2D Moore neighborhood with ~80 candidates; for
   our 1D ring the radius needs to be K_max/2 to give the same K_max.)
   Used to mask the neighbor softmax during trajectory hops (avoids N-way
@@ -542,8 +542,8 @@ capacity at trivial perf cost):
 | `bridge_hidden`       | 2048            | MemInjectLayer 2-layer MLP hidden dim |
 | `D_lm`                | 2048 (Llama)    | Llama hidden dim                 |
 | Effective LM context  | 2048            | Sliding KV cache cap (was hard-trunc; now KV-cached) |
-| LR (memory params)    | 3e-4            | Read+write modules + manifold    |
-| LR (Llama-side adapters) | 1e-4         | W_in, W_out, scale, cross-attn   |
+| LR (memory params)    | **1.5e-4**      | Read+write modules + manifold (Tier 2 #8 — halved from 3e-4 for stability) |
+| LR (Llama-side adapters) | **5e-5**     | W_in, W_out, scale, cross-attn (halved from 1e-4) |
 | Mutation init scale   | 0.1             | `new = state + 0.1 · MLP(...)`   |
 | Surprise pool         | weighted mean   | Per-token weighted CE → window scalar (writer input) |
 | `state_init`          | learnable `[N, D_concept]` | Reset target each sequence |
@@ -1667,8 +1667,8 @@ which live in §4.4):
 | Tier     | N     | D_concept | K_read=K_write | J   | Memory params | Llama base | Use case                |
 |----------|-------|-----------|----------------|-----|---------------|------------|-------------------------|
 | smoke    | 1024  | 128       | 4              | 2   | ~2 MB         | 1B         | CPU smoke tests, debugging |
-| medium   | 2048  | 256       | 8              | 4   | ~8 MB         | 1B         | v1 default (§4.4)        |
-| large    | 4096  | 256       | 16             | 8   | ~16 MB        | 3B         | Post-v1 scale-up         |
+| **medium** | **4096** | 256   | 8              | 4   | **~16.5M (post-bump)** | 1B | **v1 default (§4.4 — N=4096 / K=64)** |
+| large    | 8192  | 256       | 16             | 8   | ~33 MB        | 3B         | Post-v1 scale-up        |
 | xl       | 16384 | 512       | 32             | 8   | ~100 MB       | 8B         | Hypothetical ceiling     |
 
 The memory-side parameter count is **trivial** relative to the Llama
