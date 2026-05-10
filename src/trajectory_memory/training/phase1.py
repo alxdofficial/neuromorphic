@@ -42,6 +42,7 @@ class Phase1Metrics:
     final_hiddens: Tensor | None = None
     final_lm_context: Tensor | None = None
     final_past_key_values: object | None = None  # KV-cache mode only
+    final_cache_abs_pos: int = 0                 # KV-cache mode only
 
 
 class Phase1Trainer:
@@ -63,8 +64,9 @@ class Phase1Trainer:
         *,
         scheduler: object | None = None,    # WarmupCosineScheduler-like
         grad_clip: float | None = 1.0,
-        pad_token_id: int = 0,
+        pad_token_id: int | None = None,
         use_kv_cache: bool = True,
+        prior_loss_weight: float = 0.0,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -74,12 +76,26 @@ class Phase1Trainer:
         # Default 0 (legacy) only for backward compat with toy tests; real
         # training MUST pass the tokenizer's pad_token_id (128001 for
         # Llama-3) so Llama doesn't see synthetic `!` tokens in its context.
+        # pad_token_id MUST be passed for real training. Default None +
+        # assert below catches the silent footgun (prior code defaulted to
+        # 0 = `!` on Llama-3, polluting LM context with synthetic chars).
+        if pad_token_id is None:
+            pad_token_id = 0  # legacy test-mode fallback; real callers MUST pass
         self.pad_token_id = pad_token_id
         # use_kv_cache: route through tbptt.run_chunk's KV-cache path so each
         # window's Llama forward only encodes the new T_window tokens against
         # cached prior windows' KVs. ~30-50% speedup on Phase 1; see
         # docs/profile_analysis.md and bench numbers in docs/bench_results.md.
         self.use_kv_cache = use_kv_cache
+        # prior_loss_weight: in Wave 2's `step_wave2`, all prior tokens are
+        # masked out of the NTP loss by default — so memory writes during
+        # the prior get NO direct gradient signal (per-chunk backward +
+        # detach cuts the gradient path before the response loss arrives).
+        # Setting `prior_loss_weight > 0` adds a small NTP loss on prior
+        # tokens (multiplied by this weight) so prior writes get trained.
+        # Default 0 preserves §4.5 behavior; recommended 0.1 for matching
+        # plan §4.8 surprise table.
+        self.prior_loss_weight = prior_loss_weight
         self._step_count = 0
 
     @property
@@ -106,6 +122,7 @@ class Phase1Trainer:
         prev_lm_context: Tensor | None = None,
         target_mask: Tensor | None = None,          # [BS, D, T_window] bool
         past_key_values: object | None = None,
+        cache_abs_pos: int = 0,
     ) -> Phase1Metrics:
         """One Wave 1 step (long-doc TF NTP).
 
@@ -128,7 +145,7 @@ class Phase1Trainer:
 
         windows = chunk.view(BS, cfg.D, cfg.T_window)
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         out = run_chunk(
             self.model,
             windows,
@@ -139,6 +156,7 @@ class Phase1Trainer:
             hard_routing=True,
             use_kv_cache=self.use_kv_cache,
             past_key_values=past_key_values,
+            cache_abs_pos=cache_abs_pos,
         )
         loss = out["aggregate_loss"]
         loss.backward()
@@ -161,6 +179,7 @@ class Phase1Trainer:
             final_hiddens=out["final_hiddens"].detach(),
             final_lm_context=out["final_lm_context"],
             final_past_key_values=final_cache,
+            final_cache_abs_pos=int(out.get("final_cache_abs_pos", 0)),
         )
 
     # ── Wave 2: long-chat TF NTP (TurnPair) ───────────────────────────
@@ -179,8 +198,20 @@ class Phase1Trainer:
         pad_token = self.pad_token_id
 
         full_ids = torch.cat([batch.prior_ids, batch.response_ids], dim=1)
+        # B12 fix — Per-position loss weight: 1.0 on response, prior_loss_weight
+        # on prior, 0.0 on pad. When prior_loss_weight=0 (default), prior
+        # tokens contribute zero CE → memory writes during the prior get NO
+        # gradient signal (per-chunk backward + detach cuts the gradient
+        # path before response loss arrives). Setting prior_loss_weight>0
+        # gives prior writes a small training signal — recommended 0.1 per
+        # plan §4.8 surprise table. The mask is a float weight, NOT a bool
+        # — `_compute_surprise_window` and the run_chunk loss aggregation
+        # treat the mask multiplicatively in CE.
+        prior_w = self.prior_loss_weight
         full_mask = torch.cat(
-            [torch.zeros_like(batch.prior_mask), batch.response_mask], dim=1,
+            [batch.prior_mask.to(torch.float32) * prior_w,
+             batch.response_mask.to(torch.float32)],
+            dim=1,
         )
         T_full = full_ids.shape[1]
         chunk_len = cfg.D * cfg.T_window
@@ -194,7 +225,7 @@ class Phase1Trainer:
             ], dim=1)
             full_mask = torch.cat([
                 full_mask,
-                torch.zeros((BS, pad_n), dtype=torch.bool, device=device),
+                torch.zeros((BS, pad_n), dtype=torch.float32, device=device),
             ], dim=1)
             T_full = full_ids.shape[1]
         n_chunks = T_full // chunk_len
@@ -203,8 +234,9 @@ class Phase1Trainer:
         prev_window_hiddens: Tensor | None = None
         prev_lm_context: Tensor | None = None
         past_kv: object | None = None
+        cache_abs_pos = 0  # N1: track absolute position for RoPE correctness
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         # Per-chunk backward + detach is the standard TBPTT pattern for
         # variable-length sequences: bound activation memory at one
         # chunk's worth, accumulate gradients across chunks via the
@@ -230,8 +262,14 @@ class Phase1Trainer:
                 hard_routing=True,
                 use_kv_cache=self.use_kv_cache,
                 past_key_values=past_kv,
+                cache_abs_pos=cache_abs_pos,
             )
-            chunk_loss = out["aggregate_loss"]
+            # B5 fix — normalize chunk_loss by n_chunks before backward so
+            # the effective LR doesn't scale with chunk count. Otherwise
+            # WildChat priors of 10+ chunks get 10× the effective grad
+            # vs 1-chunk samples, and grad_clip=1.0 clips them more
+            # aggressively.
+            chunk_loss = out["aggregate_loss"] / n_chunks
             # Per-chunk backward — accumulates grad into optimizer's
             # buffers, releases this chunk's activations before the next
             # chunk allocates its own.
@@ -246,6 +284,7 @@ class Phase1Trainer:
             prev_window_hiddens = out["final_hiddens"].detach()
             prev_lm_context = out["final_lm_context"]
             past_kv = out.get("final_past_key_values", None)
+            cache_abs_pos = int(out.get("final_cache_abs_pos", cache_abs_pos))
             if past_kv is not None:
                 from src.trajectory_memory.tbptt import _detach_kv_cache
                 past_kv = _detach_kv_cache(past_kv)
@@ -263,29 +302,59 @@ class Phase1Trainer:
     # ── Validation (no-grad) ──────────────────────────────────────────
 
     @torch.no_grad()
-    def eval_wave1(self, chunk: Tensor) -> float:
-        """Forward-only Wave 1 chunk; returns NTP loss. No grad, no opt step.
+    def eval_wave1(
+        self,
+        chunk: Tensor,
+        *,
+        prev_states: Tensor | None = None,
+        prev_window_hiddens: Tensor | None = None,
+        prev_lm_context: Tensor | None = None,
+        past_key_values: object | None = None,
+        cache_abs_pos: int = 0,
+    ) -> dict:
+        """Forward-only Wave 1 chunk; returns NTP loss + carry state.
 
-        Match the training-time `use_kv_cache` setting so torch.compile sees
-        the same forward_window code path during eval and avoids busting
-        its compile cache on every val pass (smoke test confirmed: ~30s
-        recompile per val pass when the modes mismatched).
+        N9 fix: when called repeatedly on chunks of the SAME document (per
+        the train_wave1.py val loop), state must thread across calls just
+        like training. Without state-threading, validation can't measure
+        cross-chunk memory ability — needle-haystack val with planted
+        facts >2K tokens away would be invisible to memory.
+
+        Returns dict with: loss, final_states, final_hiddens,
+        final_lm_context, final_past_key_values, final_cache_abs_pos.
+        Caller threads these into the next chunk of the same doc.
+
+        Use `prev_states=None` (and other Nones) to start a new doc.
+
+        Also matches training-time `use_kv_cache` so torch.compile sees the
+        same forward_window code path during eval and avoids busting its
+        compile cache on every val pass.
         """
         cfg = self.model.cfg
         BS, T_total = chunk.shape
         assert T_total == cfg.D * cfg.T_window
-        prev_states = self.model.manifold.reset_states(batch_size=BS)
+        if prev_states is None:
+            prev_states = self.model.manifold.reset_states(batch_size=BS)
         windows = chunk.view(BS, cfg.D, cfg.T_window)
         out = run_chunk(
             self.model, windows,
             prev_states=prev_states,
-            prev_window_hiddens=None,
-            prev_lm_context=None,
+            prev_window_hiddens=prev_window_hiddens,
+            prev_lm_context=prev_lm_context,
             target_mask=None,
             hard_routing=True,
             use_kv_cache=self.use_kv_cache,
+            past_key_values=past_key_values,
+            cache_abs_pos=cache_abs_pos,
         )
-        return float(out["aggregate_loss"].detach())
+        return {
+            "loss": float(out["aggregate_loss"].detach()),
+            "final_states": out["final_states"],
+            "final_hiddens": out["final_hiddens"],
+            "final_lm_context": out["final_lm_context"],
+            "final_past_key_values": out.get("final_past_key_values", None),
+            "final_cache_abs_pos": int(out.get("final_cache_abs_pos", 0)),
+        }
 
     @torch.no_grad()
     def eval_wave2(self, batch: TurnPairBatch) -> float:

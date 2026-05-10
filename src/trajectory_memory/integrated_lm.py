@@ -181,6 +181,7 @@ class IntegratedLM(nn.Module):
         past_key_values: object | None = None,
         use_kv_cache: bool = False,
         last_prev_logit_hidden: Tensor | None = None,
+        cache_abs_pos: int = 0,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -307,11 +308,30 @@ class IntegratedLM(nn.Module):
                 if use_kv_cache:
                     # KV-cache mode: encode only the new T_window tokens
                     # against `past_key_values`. The cache transparently
-                    # carries prior windows' KVs; HF Llama auto-handles
-                    # position_ids from cache_position.
+                    # carries prior windows' KVs.
+                    #
+                    # CRITICAL — RoPE position correctness: when the cache
+                    # has been sliding-window trimmed, `cache.get_seq_length()`
+                    # reports the trimmed length, NOT the absolute position
+                    # of the next token. HF would then assign new tokens
+                    # `position_ids = [trimmed_len, trimmed_len+1, ...]`
+                    # but the cached KVs have RoPE rotations baked in at
+                    # their ORIGINAL absolute positions. The relative-position
+                    # math used in attention would be wrong.
+                    #
+                    # Fix: pass `cache_position` explicitly with absolute
+                    # positions. The caller (run_chunk / Phase 2 prefill)
+                    # tracks `cache_abs_pos` = absolute position of the
+                    # next token to encode, advancing it across trims.
+                    cache_position = torch.arange(
+                        cache_abs_pos,
+                        cache_abs_pos + lm_input_ids.shape[1],
+                        device=lm_input_ids.device,
+                    )
                     base_out = self.llama.model(
                         input_ids=lm_input_ids,
                         past_key_values=past_key_values,
+                        cache_position=cache_position,
                         use_cache=True,
                     )
                     new_past_key_values = base_out.past_key_values
@@ -386,6 +406,7 @@ class IntegratedLM(nn.Module):
         }
         if use_kv_cache and self.llama is not None:
             out["new_past_key_values"] = new_past_key_values
+            out["new_cache_abs_pos"] = cache_abs_pos + lm_input_ids.shape[1]
         return out
 
     @staticmethod

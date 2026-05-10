@@ -117,6 +117,7 @@ def run_chunk(
     hard_routing: bool = True,
     use_kv_cache: bool = False,
     past_key_values: object | None = None,
+    cache_abs_pos: int = 0,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 
@@ -171,6 +172,14 @@ def run_chunk(
     states = prev_states
     cur_prev_hiddens = prev_window_hiddens
     cache = past_key_values if use_kv_cache else None
+    # Absolute position counter — tracks position of next token to encode.
+    # Required for RoPE correctness: when cache is sliding-window trimmed,
+    # `cache.get_seq_length()` no longer reflects absolute position. We pass
+    # `cache_position` explicitly to llama.model() based on this counter so
+    # new tokens get RoPE rotations matching their TRUE positions, allowing
+    # the cached KVs (which baked their original-position rotations in) to
+    # combine correctly in attention.
+    abs_pos = cache_abs_pos
 
     # Rolling LM-context buffer (rolling-buffer mode only; ignored in cache mode).
     if use_kv_cache:
@@ -204,9 +213,14 @@ def run_chunk(
                 past_key_values=cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit_hidden,
+                cache_abs_pos=abs_pos,
             )
             cache = out.get("new_past_key_values", cache)
+            abs_pos = out.get("new_cache_abs_pos", abs_pos + win_input.shape[1])
             # Sliding-window trim so cache size stays bounded.
+            # NOTE: abs_pos is NOT reset by trim — new tokens still get the
+            # correct absolute position, so RoPE math against the (older,
+            # at-original-position) cached KVs is consistent.
             cache = _trim_kv_cache(cache, cap)
         else:
             # Rolling-buffer mode: build rolling LM context.
@@ -250,4 +264,5 @@ def run_chunk(
     }
     if use_kv_cache:
         result["final_past_key_values"] = cache
+        result["final_cache_abs_pos"] = abs_pos
     return result

@@ -110,7 +110,14 @@ def main():
     pad_id = tokenizer.pad_token_id
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
-    print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    # B11 fix — enable Llama gradient checkpointing. The earlier tbptt.py
+    # docstring claimed this was on; it wasn't. Cuts ~3-4× Llama activation
+    # memory for D=4 windows at the cost of 1.5-2× longer backward (Llama
+    # forward is recomputed during backward). Required to fit BS>1 or
+    # config-tier=large; saves headroom for state threading + KV cache.
+    if model.llama is not None and hasattr(model.llama, "gradient_checkpointing_enable"):
+        model.llama.gradient_checkpointing_enable()
+        print("Llama gradient checkpointing enabled.")
 
     if args.compile:
         # dynamic=True: forward_window's lm_input_ids varies in length as the
@@ -135,6 +142,7 @@ def main():
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
         use_kv_cache=args.use_kv_cache,
+        prior_loss_weight=0.0,  # W1 has no prior/response distinction
     )
     if args.use_kv_cache:
         print("KV cache enabled — Llama re-encodes only new T_window tokens per window.")
@@ -204,15 +212,46 @@ def main():
               f"{args.val_batches} batches per eval per source")
 
     def run_val_per_source() -> dict[str, float]:
-        """Returns {source_label: mean_val_loss}. State reset each chunk."""
+        """Returns {source_label: mean_val_loss}.
+
+        N9 fix: state THREADS across chunks of the same val doc, just like
+        training. Without this, val on long docs (especially needle-haystack
+        with planted facts >2K tokens away) couldn't measure cross-chunk
+        memory ability — eval would invalidate the architecture's whole point.
+        Reset on `is_doc_start` (matches training behavior).
+        """
         out: dict[str, float] = {}
         for label, vds in val_datasets.items():
             losses_v: list[float] = []
+            v_prev_states = None
+            v_prev_hiddens = None
+            v_prev_lm_ctx = None
+            v_past_kv = None
+            v_cache_abs = 0
             for i, item in enumerate(vds):
                 if i >= args.val_batches:
                     break
+                if item.is_doc_start:
+                    v_prev_states = None
+                    v_prev_hiddens = None
+                    v_prev_lm_ctx = None
+                    v_past_kv = None
+                    v_cache_abs = 0
                 chunk_v = item.input_ids.unsqueeze(0).to(args.device)
-                losses_v.append(trainer.eval_wave1(chunk_v))
+                ev = trainer.eval_wave1(
+                    chunk_v,
+                    prev_states=v_prev_states,
+                    prev_window_hiddens=v_prev_hiddens,
+                    prev_lm_context=v_prev_lm_ctx,
+                    past_key_values=v_past_kv,
+                    cache_abs_pos=v_cache_abs,
+                )
+                losses_v.append(ev["loss"])
+                v_prev_states = ev["final_states"]
+                v_prev_hiddens = ev["final_hiddens"]
+                v_prev_lm_ctx = ev["final_lm_context"]
+                v_past_kv = ev["final_past_key_values"]
+                v_cache_abs = ev["final_cache_abs_pos"]
             out[label] = sum(losses_v) / max(len(losses_v), 1)
         return out
 
@@ -240,6 +279,7 @@ def main():
     prev_window_hiddens = None
     prev_lm_context = None
     past_kv = None  # KV-cache mode only: carries across chunks of the same doc
+    cache_abs_pos = 0  # N1: absolute position counter for RoPE correctness
     last_step_t = time.time()
 
     while trainer.step_count < args.num_steps:
@@ -254,6 +294,7 @@ def main():
                 prev_window_hiddens = None
                 prev_lm_context = None
                 past_kv = None
+                cache_abs_pos = 0  # N1: absolute position counter resets on new doc
             chunk = item.input_ids.unsqueeze(0).to(args.device)         # [1, T]
             valid_mask = item.valid_mask.unsqueeze(0).to(args.device)   # [1, T]
             target_mask = valid_mask.view(1, cfg.D, cfg.T_window)
@@ -264,11 +305,13 @@ def main():
                 prev_lm_context=prev_lm_context,
                 target_mask=target_mask,
                 past_key_values=past_kv,
+                cache_abs_pos=cache_abs_pos,
             )
             prev_states = metrics.final_states
             prev_window_hiddens = metrics.final_hiddens
             prev_lm_context = metrics.final_lm_context
             past_kv = metrics.final_past_key_values
+            cache_abs_pos = metrics.final_cache_abs_pos
             losses.append(metrics.loss)
 
             # ── Per-step metric collection for live monitoring ─────

@@ -76,11 +76,18 @@ class LongDocDataset(IterableDataset):
         self.drop_short = drop_short
         self.shuffle = shuffle
         self.seed = seed
+        # B2 fix — track epoch count so each iter gets a different shuffle.
+        # The earlier `random.Random(seed)` per __iter__ produced identical
+        # batch order every epoch → multi-epoch training degenerated into
+        # deterministic memorization passes (gradient noise ≪ what should
+        # be expected; momentum/Adam stats drift along a fixed trajectory).
+        self._epoch = 0
 
     def __iter__(self) -> Iterator[LongDocChunk]:
         worker_info = torch.utils.data.get_worker_info()
-        seed = self.seed + (worker_info.id if worker_info else 0)
+        seed = self.seed + self._epoch + (worker_info.id if worker_info else 0)
         rng = random.Random(seed)
+        self._epoch += 1
 
         paths = list(self.paths)
         if self.shuffle:
@@ -147,6 +154,7 @@ class TurnPairDataset:
         self.pad_id = pad_id
         self.bucket_window = bucket_window
         self.seed = seed
+        self._epoch = 0  # B2 fix — see LongDocDataset
 
         # Load all rows into memory (TurnPair datasets are small enough).
         rows = []
@@ -176,7 +184,8 @@ class TurnPairDataset:
         return n_windows * batches_per_window
 
     def __iter__(self) -> Iterator[TurnPairBatch]:
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
         # Walk in bucket-sized windows; within each bucket emit ALL examples
         # in batches of size `batch_size` (length-similar within a batch).
         # Earlier behavior emitted only ONE batch per bucket and discarded
@@ -261,6 +270,7 @@ class PromptResponseDataset:
         self.paths = [Path(p) for p in parquet_paths]
         self.shuffle = shuffle
         self.seed = seed
+        self._epoch = 0  # B2 fix — see LongDocDataset
 
         import json as _json
         rows = []
@@ -281,7 +291,8 @@ class PromptResponseDataset:
         return len(self._rows)
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
         rows = list(self._rows)
         if self.shuffle:
             rng.shuffle(rows)
