@@ -373,28 +373,38 @@ class Phase2Trainer:
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
         advantages = compute_grpo_advantages(rewards_t)
 
-        # ── PASS 2 SHARED PREFILL (Phase D1, no_grad) ─────────────────
-        # Encode the prompt ONCE under the current policy, no_grad, to
-        # obtain a shared starting state for the K per-sample TF replays.
-        # Without this, each sample re-encodes the prompt — at typical
-        # T_pre=1024 + T_gen=64 + K=6 that's ~78% wasted compute.
-        # Cost of sharing: prompt-position writes don't get gradient
-        # signal (only sample-position writes do). Acceptable: GRPO is
-        # optimizing the rollout policy, sample-position writes are the
-        # ones that directly affect reward.
-        # Test-mode (no real Llama) skips shared prefill — the synthetic
-        # logits path doesn't benefit and the prefill machinery uses
-        # forward_window directly.
-        shared_prefill = None
-        if self.model.llama is not None:
-            with torch.no_grad():
-                # Keep all 5 elements — _tf_compute_sample_logp needs
-                # last_real_hidden (for first-sample-token predecessor
-                # logit) AND abs_pos (for cache_position threading on
-                # subsequent forward_window calls in the TF loop).
-                shared_prefill = self._prefill_prompt(
-                    prompt_ids, pad_id=pad_id, device=device,
-                )
+        # Phase 2 perf fix (#8) — early-exit on zero-advantage groups.
+        # When all rewards in a GRPO group are equal, advantages are all
+        # zero (group-relative center) → policy gradient is exactly zero
+        # → entire pass 2 + backward is wasted compute. Common with
+        # sparse exact-match rewards early in training. Only safe to skip
+        # when there's also no KL term — KL would otherwise still pull
+        # the policy toward π_ref independently of advantage.
+        no_signal = (
+            advantages.abs().max() < 1e-8
+            and (self.kl_coef == 0 or self.ref_state is None)
+        )
+        if no_signal:
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scheduler is not None:
+                self.scheduler.step()
+            self._step_count += 1
+            return Phase2Metrics(
+                policy_loss=0.0, grad_norm=0.0,
+                lr=[g["lr"] for g in self.optimizer.param_groups],
+                rewards=rewards, advantages=advantages.tolist(),
+                decoded=decoded,
+                mean_response_len=sum(len(s) for s in samples) / max(len(samples), 1),
+                clip_fraction=0.0, mean_ratio=1.0, kl_to_ref=0.0,
+            )
+
+        # ── PASS 2 SHARED PREFILL ─────────────────────────────────────
+        # Reuses pass 1's prefill — same weights (no optimizer step yet),
+        # deterministic routing in _prefill_prompt, and pass 1's
+        # `pass1_prefill_shared` is only deep-cloned for samples (the
+        # original is preserved). Re-encoding under no_grad here was
+        # redundant compute (~78% saved at T_pre=1024 / K=6+).
+        shared_prefill = pass1_prefill_shared
 
         # ── PASS 2: TF logp + PPO-clip surrogate + KL to reference ───
         # TF-forward through SAMPLE only (with grad), starting from the
@@ -868,15 +878,28 @@ class Phase2Trainer:
                     pad_position_ids = torch.arange(
                         abs_pos, abs_pos + n_pad, device=device,
                     ).unsqueeze(0)
-                    # Memory_fn from this window is still installed; the
-                    # pad encoding will use it (consistent with pass 2).
-                    pad_out = self.model.llama.model(
-                        input_ids=pad_t,
-                        past_key_values=kv_cache,
-                        cache_position=pad_cache_position,
-                        position_ids=pad_position_ids,
-                        use_cache=True,
-                    )
+                    # CRASH FIX — the AR loop's `finally` block above
+                    # cleared mem_inject.memory_fn, so the prior comment
+                    # "memory_fn is still installed" was wrong. Re-install
+                    # the SAME read-trajectory's memory_fn for pad encoding
+                    # so it's consistent with pass 2 (which keeps memory_fn
+                    # installed for the entire window's encoding).
+                    # Without this re-install, MemInjectLayer raises
+                    # "called without memory_fn but scale is not all-zero",
+                    # crashing every Phase 2 step where AR generates
+                    # T/2..T-1 tokens (very common at default
+                    # --max-new-tokens 256).
+                    mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
+                    try:
+                        pad_out = self.model.llama.model(
+                            input_ids=pad_t,
+                            past_key_values=kv_cache,
+                            cache_position=pad_cache_position,
+                            position_ids=pad_position_ids,
+                            use_cache=True,
+                        )
+                    finally:
+                        mem_inject.memory_fn = None
                     kv_cache = pad_out.past_key_values
                     abs_pos += n_pad
                     pad_hiddens = pad_out.last_hidden_state
@@ -1125,47 +1148,74 @@ class Phase2Trainer:
             )
             # In KV-cache mode forward_window's `logits` is [1, T, V]
             # aligned to the new window's T positions. logit at index i
-            # predicts win[i+1] (since position i's hidden contains the
-            # context to predict the next token).
+            # predicts win[i+1] (i's hidden contains the context to
+            # predict the next token).
             #
-            # For sample positions p in [n_prompt, n_full):
-            #   - if p > win_start: predictor logit is logits[0, p - win_start - 1]
-            #   - if p == win_start: predictor logit is the NTP-shift
-            #     left predecessor — i.e., the hidden of position
-            #     win_start-1 (last position of previous window). When
-            #     we have prev_window_hiddens (always except very first
-            #     window), this is `last_prev_logit` whose logit we
-            #     compute below.
+            # For sample positions p in [first_sample_offset, n_full):
+            #   - if p > win_start: predictor logit = logits[0, p - win_start - 1]
+            #   - if p == win_start: predictor logit = lm_head(last_prev_logit)
+            #     (the previous window's last hidden). If last_prev_logit
+            #     is None (very first window of sequence), drop position 0.
             logits = out["logits"]                               # [1, T, V]
 
-            for p in range(max(win_start, first_sample_offset), win_end):
-                if p == win_start:
-                    # Predecessor is the previous window's last hidden.
+            # Phase 2 perf fix (#5) — vectorize: stack all predictor
+            # logits for THIS window's sample positions into [n_pred, V],
+            # one log_softmax + one gather per window instead of one per
+            # token. Old loop was 1024 small softmaxes/step at K=16
+            # T_gen=64 — now n_windows softmaxes/step.
+            sample_lo = max(win_start, first_sample_offset)
+            sample_hi = win_end
+            if sample_lo < sample_hi:
+                # Targets for sample positions [sample_lo, sample_hi).
+                target_ids = torch.tensor(
+                    seq_to_walk[sample_lo:sample_hi],
+                    dtype=torch.int64, device=device,
+                )                                                # [n_pred]
+                if sample_lo == win_start:
+                    # First sample position needs last_prev_logit
+                    # (predecessor is from previous window).
                     if last_prev_logit is None:
-                        continue  # very first token of sequence — skip
-                    if self.model.llama is None:
-                        # Test mode — synthesize via the same path
-                        # forward_window uses for its synthetic logits.
-                        logit_at_pred = (
-                            last_prev_logit.to(self.model._test_proj.dtype)
-                            @ self.model._test_lm_head
-                        )                                        # [1, 1, V]
+                        # Very first token of sequence — drop it.
+                        target_ids = target_ids[1:]
+                        if target_ids.numel() == 0:
+                            # carry state below; nothing to log this window
+                            pred_logits = None
+                        else:
+                            pred_logits = logits[0, :target_ids.numel(), :]
                     else:
-                        # prev_window_hiddens is in manifold's fp32; cast
-                        # to lm_head's native dtype (bf16).
-                        lm_head_dtype = next(
-                            self.model.llama.lm_head.parameters()
-                        ).dtype
-                        logit_at_pred = self.model.llama.lm_head(
-                            last_prev_logit.to(lm_head_dtype)
-                        )                                        # [1, 1, V]
-                    logit_vec = logit_at_pred[0, 0]              # [V]
+                        # Compute first-position logit from last_prev_logit.
+                        if self.model.llama is None:
+                            first_logit = (
+                                last_prev_logit.to(self.model._test_proj.dtype)
+                                @ self.model._test_lm_head
+                            )[0, 0:1, :]                          # [1, V]
+                        else:
+                            lm_head_dtype = next(
+                                self.model.llama.lm_head.parameters()
+                            ).dtype
+                            first_logit = self.model.llama.lm_head(
+                                last_prev_logit.to(lm_head_dtype)
+                            )[0, 0:1, :]                          # [1, V]
+                        n_after_first = target_ids.numel() - 1
+                        if n_after_first > 0:
+                            rest_logits = logits[0, :n_after_first, :]
+                            pred_logits = torch.cat(
+                                [first_logit, rest_logits], dim=0,
+                            )                                     # [n_pred, V]
+                        else:
+                            pred_logits = first_logit             # [1, V]
                 else:
-                    logit_idx = p - win_start - 1
-                    logit_vec = logits[0, logit_idx]             # [V]
-                scaled = logit_vec / temperature
-                logp_p = F.log_softmax(scaled, dim=-1)[seq_to_walk[p]]
-                sample_logps.append(logp_p)
+                    # All sample positions are p > win_start; predictor
+                    # index = p - win_start - 1.
+                    first_idx = sample_lo - win_start - 1
+                    pred_logits = logits[0, first_idx:first_idx + target_ids.numel(), :]
+
+                if pred_logits is not None and pred_logits.shape[0] > 0:
+                    scaled = pred_logits / temperature
+                    logps = F.log_softmax(scaled.float(), dim=-1).gather(
+                        -1, target_ids.unsqueeze(-1),
+                    ).squeeze(-1)                                  # [n_pred]
+                    sample_logps.append(logps)
 
             # Carry state — NO DETACH, autograd graph stays alive across
             # windows of a sample. KV cache likewise. Advance abs_pos by
@@ -1178,7 +1228,9 @@ class Phase2Trainer:
 
         if not sample_logps:
             return torch.zeros(0, device=device)
-        return torch.stack(sample_logps)
+        # Each entry is now a [n_pred_in_window] tensor (post-#5
+        # vectorization), not a scalar — use cat not stack.
+        return torch.cat(sample_logps)
 
     # ── helpers ───────────────────────────────────────────────────────
 

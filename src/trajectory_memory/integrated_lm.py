@@ -367,57 +367,77 @@ class IntegratedLM(nn.Module):
             # In rolling-buffer mode `*` is L_lm (full context).
             current_hiddens = full_hiddens[:, -T_window:, :].to(prev_states.dtype)
 
-            # Build `needed_hidden` for surprise CE: T_window+1 hiddens
-            # (one predecessor + T_window targets) when available,
-            # T_window otherwise (drop target 0 — first window of chunk).
+            # Phase 2 perf fix (#4) — when force_surprise is given (Phase 2
+            # response-window TF replay sets it to 0.0 per N2), skip the
+            # vocab-sized CE entirely. The earlier code computed a full
+            # `_compute_surprise_window` (256 × 128K-vocab CE) and then
+            # overwrote `surprise` with zero — pure waste at K samples × N
+            # windows per step.
             #
-            # KV-cache mode: full_hiddens has shape [BS, T_window, d_lm].
-            # The predecessor for target 0 is the last hidden of the
-            # previous window — passed as `last_prev_logit_hidden`. If
-            # None, we drop target 0 (matches first-window behavior).
-            #
-            # Rolling-buffer mode: full_hiddens has the predecessor at
-            # position [-T_window-1] when L_lm > T_window. We slice
-            # min(T_window+1, L_lm) tail positions.
-            if use_kv_cache:
-                if last_prev_logit_hidden is not None:
-                    needed_hidden = torch.cat(
-                        [last_prev_logit_hidden.to(full_hiddens.dtype),
-                         full_hiddens], dim=1,
-                    )                                                # [BS, T_window+1, d_lm]
-                else:
-                    needed_hidden = full_hiddens                     # [BS, T_window, d_lm]
-            else:
-                n_needed = min(T_window + 1, full_hiddens.shape[1])
-                needed_hidden = full_hiddens[:, -n_needed:, :]
-
-            needed_logits = self.llama.lm_head(needed_hidden)        # [BS, n_needed, V]
-
-            target_ids = lm_input_ids[:, -T_window:]
-            # N6 — _compute_surprise_window now returns (mean, sum, count).
-            # Mean is the per-window surprise that the writer consumes
-            # (a magnitude per window). Sum/count are surfaced in the
-            # output dict so run_chunk can aggregate as token-weighted
-            # CE across the chunk (avoids overweighting sparse windows).
-            surprise_mean, surprise_sum, surprise_count = self._compute_surprise_window(
-                needed_logits, target_ids, target_mask,
-            )
-            surprise = surprise_mean.to(prev_states.dtype)
-            # N2 fix — Phase 2 pass-2 must reproduce pass-1's memory
-            # dynamics. Pass 1 wrote response windows with surprise=0 (per
-            # plan §5.4 — generated tokens have no NTP target). If pass 2
-            # writes those same windows with CE-derived surprise, the
-            # writer mutates differently → memory state diverges → the IS
-            # ratio numerator/denominator condition on different states →
-            # PPO surrogate becomes meaningless.
-            # `force_surprise=0.0` overrides the CE-computed surprise for
-            # response windows in pass 2 of GRPO.
+            # We still need logits over T_window for the output (caller
+            # uses them for AR sampling). KV-cache mode: full_hiddens IS
+            # the T_window of new positions, so logits = lm_head(full_hiddens).
+            # Rolling-buffer mode: take the last T_window hiddens. Skip the
+            # +1 predecessor hidden since we don't need a CE target on
+            # position 0.
             if force_surprise is not None:
-                surprise = torch.full_like(surprise, force_surprise)
+                # Synthesize zero surprise + skip CE; still emit logits.
+                if use_kv_cache:
+                    needed_hidden = full_hiddens
+                else:
+                    needed_hidden = full_hiddens[:, -T_window:, :]
+                needed_logits = self.llama.lm_head(needed_hidden)    # [BS, T_window, V]
+                surprise_mean = torch.full(
+                    (BS,), float(force_surprise),
+                    dtype=full_hiddens.dtype, device=full_hiddens.device,
+                )
+                surprise_weighted_sum = torch.zeros_like(surprise_mean)
+                surprise_count = torch.zeros_like(surprise_mean)
+                surprise = surprise_mean.to(prev_states.dtype)
+                logits = needed_logits[:, -T_window:, :]
+            else:
+                # Build `needed_hidden` for surprise CE: T_window+1 hiddens
+                # (one predecessor + T_window targets) when available,
+                # T_window otherwise (drop target 0 — first window of chunk).
+                #
+                # KV-cache mode: full_hiddens has shape [BS, T_window, d_lm].
+                # The predecessor for target 0 is the last hidden of the
+                # previous window — passed as `last_prev_logit_hidden`. If
+                # None, we drop target 0 (matches first-window behavior).
+                #
+                # Rolling-buffer mode: full_hiddens has the predecessor at
+                # position [-T_window-1] when L_lm > T_window. We slice
+                # min(T_window+1, L_lm) tail positions.
+                if use_kv_cache:
+                    if last_prev_logit_hidden is not None:
+                        needed_hidden = torch.cat(
+                            [last_prev_logit_hidden.to(full_hiddens.dtype),
+                             full_hiddens], dim=1,
+                        )                                            # [BS, T_window+1, d_lm]
+                    else:
+                        needed_hidden = full_hiddens                 # [BS, T_window, d_lm]
+                else:
+                    n_needed = min(T_window + 1, full_hiddens.shape[1])
+                    needed_hidden = full_hiddens[:, -n_needed:, :]
 
-            # Slice the final T_window logits for the output (caller may
-            # use them for AR sampling in W3/W4 rollouts).
-            logits = needed_logits[:, -T_window:, :]                 # [BS, T_window, V]
+                needed_logits = self.llama.lm_head(needed_hidden)    # [BS, n_needed, V]
+
+                target_ids = lm_input_ids[:, -T_window:]
+                # N6 — _compute_surprise_window returns (mean, weighted_sum,
+                # count). Mean is the per-window surprise that the writer
+                # consumes (a magnitude per window). Weighted_sum keeps
+                # float-mask weights (e.g. prior_loss_weight=0.1) baked in
+                # — used by run_chunk for token-weighted chunk-level CE.
+                surprise_mean, surprise_weighted_sum, surprise_count = (
+                    self._compute_surprise_window(
+                        needed_logits, target_ids, target_mask,
+                    )
+                )
+                surprise = surprise_mean.to(prev_states.dtype)
+
+                # Slice the final T_window logits for the output (caller may
+                # use them for AR sampling in W3/W4 rollouts).
+                logits = needed_logits[:, -T_window:, :]             # [BS, T_window, V]
 
         # ── 3. WRITE ─────────────────────────────────────────────────
         # Detach surprise: it's a loss-derived scalar from the same logits

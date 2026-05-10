@@ -84,6 +84,9 @@ def main():
                          "Reference is the loaded --checkpoint-in weights.")
     args = ap.parse_args()
 
+    # Allow TF32 for fp32 matmul (memory params, bridge, lm_head).
+    torch.set_float32_matmul_precision("high")
+
     cfg = getattr(TrajMemConfig, args.config_tier)()
     tokenizer = get_tokenizer()
 

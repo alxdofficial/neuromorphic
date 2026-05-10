@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--plot-every-seconds", type=float, default=180.0)
     args = ap.parse_args()
 
+    # Allow TF32 for fp32 matmul (memory params, bridge, lm_head).
+    torch.set_float32_matmul_precision("high")
+
     cfg = getattr(TrajMemConfig, args.config_tier)()
     tokenizer = get_tokenizer()
 

@@ -103,6 +103,11 @@ def main():
                     help="Seconds between plot refreshes (default 180 = 3 min).")
     args = ap.parse_args()
 
+    # Allow TF32 for fp32 matmul (memory params, bridge, lm_head). On Ampere
+    # and later this trades trivial precision for a meaningful speedup; the
+    # bf16 backbone is unaffected.
+    torch.set_float32_matmul_precision("high")
+
     cfg = getattr(TrajMemConfig, args.config_tier)()
     print(f"Config tier: {args.config_tier}")
     print(f"  N={cfg.N}, J={cfg.J}, K_read={cfg.K_read}, D={cfg.D}, T_window={cfg.T_window}")
