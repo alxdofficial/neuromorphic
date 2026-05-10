@@ -713,30 +713,39 @@ directly. Drop-in substitution of the trajectory module for graph_walker.
   architecture is plumbed correctly before throwing real training
   compute at it.
 
-### 4.6 AR rewind-and-re-forward (fallback, not default)
+### 4.6 Two-pass GRPO (default — was originally documented here as fallback)
 
-Documented as a fallback for handling exposure bias on memory writes:
+The two-pass structure is now the default for Wave 3 / Wave 4 (changed
+2026-05-09 from single-pass; see §4.7 for the bug rationale):
 
 ```
-Per window:
-    1. Pass 1 (loss): AR-generate the assistant turn, compute loss
-       (NTP or GRPO advantage) on predictions, discard memory writes.
-    2. Pass 2 (memory): TF over the same window with the *generated*
-       tokens (or ground truth, if available), run the write module,
-       scatter_mean into the manifold.
-    3. Carry Pass 2's manifold state into the next window.
+Per prompt × K samples:
+    Pass 1 (sampling, no_grad, KV-cached):
+      - Walk forward_window over prompt → KV cache + manifold state
+      - AR-generate K samples token-by-token with KV cache
+      - Per-window memory ops: read at window start, write at window end
+      - Record logp_old per sampled token (cheap, near-free)
+    Pass 2 (TF replay, with grad):
+      - Shared no_grad prefill: encode prompt ONCE
+      - Per sample: TF-replay sample suffix only with grad
+      - Recompute logp_new per sample-token under current policy
+      - Compute IS ratio, PPO clip, advantage-weighted policy loss
+    Optional Pass 2.5 (KL term, no_grad, ref-policy):
+      - Param-swap to ref weights, shared ref prefill, K ref TF replays
+      - K3 KL estimator added to total loss
+    Single backward at end of step.
 ```
 
-**Default for Wave 3 / Wave 4 GRPO is single-pass** — rollout, score,
-policy gradient through both LM tokens and trajectory routing decisions,
-with memory writes conditioning on AR hiddens. Phase 2 explicitly trains
-on AR generations, so the train/inference distribution mismatch on memory
-writes is generally benign.
+Originally listed as "fallback for exposure bias" with single-pass as
+default. Single-pass turned out to have a real bug: detaching state
+per generated token to bound activation memory cut the gradient chain
+to write_module. Two-pass replaces this; see §4.7 for full mechanics.
 
-Reserve rewind for the case where post-Wave-4 evals show memory
-degradation specifically traceable to exposure bias (e.g., memory works
-in TF eval but degrades under AR rollout). 2× compute per window — pay
-only when needed.
+The "rewind-and-re-forward over the SAME ground-truth tokens" idea
+(replace generated tokens with ground truth in pass 2) remains a
+fallback for the edge case where post-Wave-4 evals show memory
+degradation specifically traceable to exposure bias. Not currently
+implemented — pass 2 always uses the sampled tokens (matching pass 1).
 
 ### 4.7 Training-phase mapping vs graph_walker
 
@@ -751,21 +760,70 @@ Phase 2 (AR GRPO). Both carry over with minor adaptations:
 - Cross-window TBPTT (D windows) replaces within-T TBPTT (`tbptt_block`
   tokens). Same idea, different boundary.
 
-**Phase 2 (AR GRPO) — works.**
-- Trajectory module is just another stochastic policy head. Rollout
-  samples both LM tokens and trajectory routing choices; reward →
-  group-relative advantage → policy gradient through both kinds of
-  decisions.
-- Policy granularity is much smaller than walker's per-token policy:
-  J·K decisions per window instead of T per window. Lower variance,
-  easier training.
-- Default is single-pass (§4.8); rewind-and-re-forward (§4.6) only as
-  fallback if exposure bias proves problematic.
+**Phase 2 (AR GRPO) — implemented as two-pass.**
 
-Existing trainers in `src/graph_walker/pretrained/` (`train_phase1.py`,
-`train_phase2.py`, `train_loop.py`, `rollout.py`) are reusable as
-scaffolding — per-step logic changes but the cycle structure
-(bootstrap → cycle, group rollout, replay) is the same.
+Single-pass GRPO (§4.8 default) had a real bug: detaching state per AR
+token to bound activation memory cut the gradient chain to write_module
+entirely. Replaced with **two-pass GRPO** (originally listed as fallback
+§4.6, made default 2026-05-09):
+
+  Pass 1 — sample (`_ar_sample_one`, no_grad, KV-cached, with prefill).
+    Walk forward_window over the prompt to populate KV cache + manifold
+    state, then AR-generate token-by-token with KV cache. Per-window
+    memory ops (read once at start, write once at end of each
+    T_window=256-token block of generated tokens), NOT per-token. Each
+    sampled token's `logp_old` recorded for pass 2's IS clip.
+
+  Pass 2 — TF replay (`_tf_compute_sample_logp`, with grad).
+    TF-forward through (prompt + sample) in T_window windows. Memory
+    state carries through `write_module` without detach. **Shared
+    prefill** (no_grad) optimization: prompt is encoded ONCE, K samples
+    each start from the cloned prefill state — saves ~3-4× pass 2 cost
+    when K > 1.
+
+GRPO regularization (matches DeepSeek-R1, TRL, verl, OpenRLHF):
+
+- **Group-relative advantage**: `(reward - mean(rewards)) / std(rewards)`
+- **Dr.GRPO loss normalization**: divide by `K * max_new_tokens`
+  (constant), not `K * len(sample)`. Removes documented length-bias
+  pathologies (arxiv 2503.20783, Sea AI Lab COLM 2025).
+- **PPO importance-sampling clip**: `clip(ratio, 1-ε, 1+ε)` with ε=0.2
+  default. Optional asymmetric upper clip via `--clip-eps-higher`
+  (DeepSeek-R1's `clip_higher` mode, e.g. ε=10).
+- **KL regularization to reference policy**: `β * D_KL(π_θ ‖ π_ref)`
+  with β=0.001 (verl default). Reference is `--checkpoint-in` weights
+  snapshotted by `Phase2Trainer.set_reference_state()` at trainer init.
+  K3 estimator: `KL ≈ exp(log r) - log r - 1`. Param-swap pattern
+  shares the ref forward across K samples (one swap-cycle per step).
+
+Trajectory module's discrete routing (Gumbel-top-1 STE) gets gradient
+via straight-through estimator — backward through soft probabilities
+flows into the routing modules. The plan originally also wanted explicit
+`log P(routing_decision) × advantage` REINFORCE terms, but Gumbel-STE
+is sufficient as a first iteration; deferred as future work (would need
+a "replay mode" for read/write modules so pass 2 can recompute logp at
+the *same* routing path that pass 1 sampled).
+
+Diagnostics surfaced in `Phase2Metrics`:
+- `clip_fraction`: % of tokens where ratio was clipped this step
+- `mean_ratio`: mean(ratio); should stay near 1.0 if policy isn't drifting
+- `kl_to_ref`: mean per-token K3 KL estimate
+
+Policy granularity remains much smaller than walker's per-token policy:
+J·K decisions per window instead of T per window. Lower variance,
+easier training.
+
+KV cache (sliding-window-trimmed to `effective_lm_context`) was added
+2026-05-10 to all four waves. Phase 1 went from 9.9k → 17.7k tok/s
+(1.79× speedup, 5GB less memory) — the rolling LM buffer re-encode was
+~70% of the T1-vs-vanilla gap. Phase 2 went 32.4 → 132.8 tok/s with
+shared prefill + bigger K (4 → 16). See `docs/bench_results.md`.
+
+Trainer scaffolding lives in `src/trajectory_memory/training/`:
+`Phase1Trainer.step_wave1` / `step_wave2`, `Phase2Trainer.step`. Entry
+points `scripts/train_wave{1,2,3,4}.py`. Defaults: `--use-kv-cache`
+ON, `--compile` ON, `--temperature 0.7`, `--clip-eps 0.2`,
+`--kl-coef 0.001`.
 
 ### 4.8 Training mechanics (operational details)
 
@@ -786,16 +844,38 @@ How the per-window loop actually runs in each wave.
   it emits an end-of-turn token (or hits a max-tokens cap, typically
   1K–2K tokens).
 
-**Single-pass GRPO (default — Wave 3 / Wave 4):**
-1. TF-forward the prior through Llama → prior hiddens. Memory writes at
-   each prior window boundary use clean TF hiddens.
-2. AR-sample the assistant response, recording per-token logprobs for
-   policy gradient. Memory writes at response window boundaries use AR
-   hiddens.
-3. Score the rollout (verifiable for Wave 3, exact-match + BERT cosine
-   for Wave 4).
-4. Compute group-relative advantage; backprop policy gradient through
-   both LM token sampling and trajectory routing decisions.
+**Two-pass GRPO (current default for Wave 3 / Wave 4 — implementation
+in `Phase2Trainer.step`):**
+
+The original §4.8 single-pass design (sample with logp recorded, single
+backward) had a real bug: detaching state per generated token to bound
+memory cut the gradient chain to write_module. Replaced with the
+§4.6 fallback as default (2026-05-09):
+
+1. **Pass 1 — sample (no_grad, KV-cached, with prefill).** Walk
+   forward_window over the prompt to populate KV cache + manifold state.
+   AR-generate the assistant response token-by-token with KV cache
+   (1-token forward against cached prefix per token). Record `logp_old`
+   per sampled token (cheap — softmax is computed for sampling anyway).
+   Per-window memory ops: read once at start of each generation window,
+   write once at end. NOT per-token (that was a separate fixed bug).
+
+2. **Pass 2 — TF replay (with grad).** Shared no_grad prefill runs the
+   prompt through forward_window ONCE. K samples each TF-replay only
+   the SAMPLE portion from the cloned prefill state, with grad through
+   write_module. Per-sample-token logp recomputed under current policy
+   (= `logp_new`).
+
+3. **Score the rollout** (verifiable for Wave 3, exact-match + BERT
+   cosine for Wave 4).
+
+4. **PPO-clipped GRPO loss + KL regularization:**
+   - Group-relative advantage: `A = (r - mean(r)) / std(r)`
+   - IS ratio: `r = exp(logp_new - logp_old)`, clipped to `[1-ε, 1+ε]`
+   - Surrogate: `loss = -min(A·r, A·clip(r))`
+   - KL term: `β · D_KL(π_θ ‖ π_ref)` via K3 estimator
+   - Total: `(loss + β·kl) / (K · max_new_tokens)` — Dr.GRPO norm
+   - Single backward at end of step.
 
 **Surprise per wave:**
 
