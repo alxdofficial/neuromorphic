@@ -1093,14 +1093,16 @@ Reuse from existing code:
 - `src/pretrained/mem_inject_layer.py:MemInjectLayer` — drop-in reuse.
   KV source becomes our flattened read trajectory.
 
-Future-port from `abandoned/graph-walker` (the production lineage at
-3b69366; check out that branch to inspect or copy):
+Landed in this repo (originally specced as future-ports from
+`abandoned/graph-walker`, all now reimplemented or no longer needed):
 
-- `src/graph_walker/telemetry.py` — telemetry framework / dashboard.
-- `src/graph_walker/pretrained/train_phase1.py` — phase-1 trainer scaffold.
-- `session_to_turn_pairs` + Verlog length-bucket batching — for Wave 2/4
-  TurnPair extraction.
-- `grpo_session_step` — for Wave 3/4 GRPO rollouts.
+- `src/trajectory_memory/training/plotting.py` + per-step history dict
+  in `train_wave1.py` / `train_wave2.py` — telemetry + 9-panel PNG.
+- `src/trajectory_memory/training/phase1.py` — Phase 1 trainer scaffold.
+- `src/trajectory_memory/training/phase2.py` — Phase 2 (GRPO) trainer
+  scaffold (replaces the old `grpo_session_step`).
+- `src/trajectory_memory/training/loaders.py:TurnPairDataset` — long-chat
+  TurnPair extraction + length-bucket batching.
 
 ### 6.2 Build order
 
@@ -1143,16 +1145,16 @@ Future-port from `abandoned/graph-walker` (the production lineage at
    - **Test:** D=2, gradient on window 0's write module params is
      non-zero when only window 1's loss is backpropagated.
 
-6. **Training loop**: minimal scaffold. Reference: check out
-   `abandoned/graph-walker` branch and adapt
-   `src/graph_walker/pretrained/train_phase1.py`. TF NTP on a small
-   long-document corpus (e.g., subset of FineWeb). Smoke-test then
-   scale up.
+6. **Training loop** (LANDED): see
+   `src/trajectory_memory/training/phase1.py` (Wave 1 + Wave 2) and
+   `src/trajectory_memory/training/phase2.py` (Wave 3 + Wave 4 GRPO).
+   Entry scripts at `scripts/train_wave{1,2,3,4}.py`.
 
-7. **Telemetry**: trajectory diversity (how different are the J
-   trajectories?), surprise distribution, concept state norm trajectory,
-   scatter_mean collision rate, read-vs-write distinguishability.
-   Dashboard à la `src/graph_walker/telemetry.py`.
+7. **Telemetry** (LANDED): trajectory diversity, surprise distribution,
+   inject SNR, per-component grad norms, throughput/VRAM, read/write
+   `unique_frac` + `self_overlap`. See `src/trajectory_memory/training/
+   plotting.py` + per-step history dict in `train_wave1.py`. Dashboard
+   is a 9-panel PNG refreshed every `--plot-every-seconds`.
 
 8. **Long-context evals**: synthetic recall task — embed a fact early
    in the doc, query at a position far enough that Llama's 2K sliding
@@ -1184,12 +1186,13 @@ reuse:
   flattened read trajectory rather than walker readout).
 - `update_plasticity` external trigger — gone; plasticity is internal
   to the write module's scatter_mean.
-- Telemetry — reusable framework, new metrics to add.
-- Phase 1 trainer — reusable scaffold; per-step logic changes
-  substantially.
-- `session_to_turn_pairs` and Verlog-style length-bucket batching from
-  W4 — reused directly for our Wave 2 and Wave 4.
-- `grpo_session_step` — reused for Wave 3 and Wave 4.
+- Telemetry — reimplemented in `src/trajectory_memory/training/plotting.py`.
+- Phase 1 trainer — reimplemented in
+  `src/trajectory_memory/training/phase1.py`.
+- `session_to_turn_pairs` + Verlog-style length-bucket batching —
+  reimplemented in `src/trajectory_memory/training/loaders.py:TurnPairDataset`.
+- `grpo_session_step` — superseded by `Phase2Trainer.step` in
+  `src/trajectory_memory/training/phase2.py` (two-pass GRPO).
 
 Trajectory-memory has been promoted to `main`. The earlier graph_walker
 production state is preserved on `abandoned/graph-walker` (commit 3b69366);
@@ -1418,10 +1421,16 @@ is realized.
 
 ## 10. Efficiency analysis: speed and VRAM
 
-Estimates below assume the v1 starting config (§4.4): N=2048,
-D_concept=256, K_max=32, J=4, K_read=K_write=8, D=4, BS=2,
-T_window=256, Llama-3.2-1B bf16, FlashAttention enabled, RTX 4090.
-Numbers are *rough* — bench early, don't trust point estimates.
+> **2026-05-10 update:** all sub-sections below were written before the
+> KV-cache and shared-prefill landings. Headline-number sections (§10.1
+> VRAM, §10.2 per-window time, §10.4 priorities) have been retro-edited
+> to match the bench reality. **For current production numbers always
+> consult `docs/bench_results.md` — that doc is the source of truth;
+> this section is design rationale.**
+
+Current `medium` config (§4.4 table): N=4096, D_concept=256, K_max=64,
+J=4, K_read=K_write=8, D=4, T_window=256, Llama-3.2-1B bf16,
+FlashAttention enabled, RTX 4090. Phase 1 BS=4 max, Phase 2 K=16 max.
 
 ### 10.1 VRAM breakdown
 
@@ -1453,8 +1462,22 @@ Trivial vs Llama's frozen 2.5 GB.
 | **Working set with checkpointing**       | **~400–700 MB**  |                                    |
 | Without Llama checkpointing              | **~1.5–2.5 GB**  | D × per-window activations         |
 
-**Total VRAM training ≈ 3.5–5 GB** with checkpointing on a 24 GB GPU —
-plenty of headroom for BS=4 or D=8.
+**Measured VRAM in production (2026-05-10 bench, KV cache + no grad
+checkpointing):**
+- Phase 1 BS=4: **~15 GB peak** (T1 trajmem step). BS=5 would fit; BS=8 OOMs.
+- Phase 2 K=16: **~13 GB peak** (T2 GRPO with shared prefill).
+- KV cache is the dominant live tensor (~2-4 GB for 2K context).
+
+**KV cache vs gradient checkpointing — mutually exclusive.** HF's
+Llama silently sets `use_cache=False` when gradient checkpointing is
+on, returning `past_key_values=None`. We picked the cache (~1.79×
+speedup, 5 GB less peak in practice) over the activation savings; see
+the NOTE in `scripts/train_wave1.py`. If a config-tier-large run
+needs gradient checkpointing, it must also pass `--no-kv-cache`.
+
+The earlier "3.5–5 GB" estimate was the pre-KV-cache projection with
+gradient checkpointing on. Reality with KV cache + no checkpointing
+runs 11-15 GB on `medium`.
 
 **Inference (single user, no autograd):** Llama params + KV cache +
 manifold + transient trajectory states ≈ 3 GB total. Easily fits on
@@ -1462,75 +1485,76 @@ consumer GPUs.
 
 ### 10.2 Per-window time breakdown
 
-Per-window cost is dominated by Llama's transformer forward. Trajectory
-ops are small but launch-bound. RTX 4090, BS=2, bf16, FlashAttention:
+> **Superseded:** the rough estimates below were pre-KV-cache. See
+> `docs/bench_results.md` for measured numbers. Current Phase 1 throughput
+> is ~17.7K tok/s (5× the projection here), and trajmem is now FASTER
+> than vanilla per-token because the per-window Llama forward only
+> encodes the new T_window=256 tokens against the cached prefix
+> instead of re-encoding the rolling buffer.
 
-| Step                                       | Time (rough)   | Notes                                 |
-|--------------------------------------------|----------------|---------------------------------------|
-| Llama forward (1 window, 256 tok, 2K KV)   | ~25–40 ms      | Dominant; depends on KV cache state   |
-| Read trajectory (J=4, K=8, batched per hop) | ~3–5 ms       | 8 batched-J cross-attn calls          |
-| Write trajectory (similar shape)           | ~3–5 ms        |                                       |
-| MemInjectLayer cross-attn                  | ~1 ms          | One call per inject layer per window  |
-| scatter_mean + manifold update             | <1 ms          | Tiny tensor op                        |
-| **Per-window forward**                     | **~35–55 ms**  | Llama is ~75–85% of this              |
-
-**Training step (BS=2, D=4, with per-block Llama checkpointing):**
-- Forward: 4 × 50 ms ≈ 200 ms
-- Backward (with Llama recompute): ~350 ms
-- Optimizer + misc: ~30 ms
-- **Step ≈ 600 ms; throughput ≈ 3.5K tokens/sec**
-
-Comparable to graph_walker's ~5K tok/s post-scaleup (per project memory)
-— our per-token cost is *lower* (no per-token dispatch) but per-window
-Llama compute is *higher* (256-token forward vs graph_walker's smaller
-units). Net is a wash; the real win is gradient quality, not raw speed.
+Architectural rationale (still valid): per-window cost is dominated by
+Llama's transformer forward; trajectory ops are small but launch-bound.
+The KV cache eliminated the rolling-buffer re-encode that was ~70% of
+the T1-vs-V1.B gap (per `docs/profile_analysis.md`).
 
 ### 10.3 Bottlenecks
 
 **Primary: Llama forward.** ~80% of step time. Frozen, but compute is
-unavoidable. Mitigations:
-- FlashAttention-2/3 on Llama's self-attention (likely already on from
-  graph_walker's setup; confirm).
-- bf16 everywhere it's safe.
-- KV cache reuse across windows — currently re-encodes prefix per window
-  via hard truncation; sliding KV cache is a v2 optimization.
+unavoidable. Mitigations LANDED:
+- FlashAttention (default).
+- bf16 backbone.
+- **Sliding KV cache** (was specced as "v2 optimization" here; landed
+  2026-05-10). Eliminated rolling-buffer re-encode; closed the entire
+  T1-vs-V1.B gap and made trajmem faster than vanilla per-token.
 
 **Secondary: trajectory hop dispatch overhead.** Each hop has a few
 small kernel launches (history-attn, cross-attn, MLP, neighbor gather,
 softmax). At J=4, K=8, D=4 → ~256 small launches per training step.
-Mitigations:
-- Batch J across each hop (already specced — single batched cross-attn
-  per step instead of J separate ones).
-- `torch.compile` on the hop module — small, hot function with
-  predictable shapes; should benefit from kernel fusion.
-- Custom Triton kernel for "one trajectory hop" — fuses sub-ops.
-  Premature unless dispatch is measured-bottleneck.
+Mitigations LANDED:
+- Batched J cross-attn per hop.
+- `torch.compile(model.forward_window, dynamic=True)` (default ON in
+  Wave 1/2 entry scripts).
 
 **Tertiary: cross-window TBPTT memory.** D windows of write graph alive
-during backward.
-- Linear-in-D first; constant-in-D autograd if OOM.
-- Llama-block checkpointing (priority 1).
-- Trajectory cross-attn checkpointing (priority 2).
+during backward. Currently linear-in-D — fits with KV cache + no
+gradient checkpointing at BS=4. Constant-in-D autograd remains the
+fallback for D≥8 / large-tier configs.
+
+**Phase 2 specific:** ~30% slowdown vs vanilla GRPO at K=16 (132.8 vs
+173.6 tok/s in current bench). The remaining cost is read+write per
+generation window (architecturally unavoidable — that's the side-car).
+Bigger win available from batched K rollouts (currently serial), see
+§10.4.
 
 ### 10.4 Optimization plan, priority-ranked
 
-1. **bf16 + FlashAttention on Llama** — should be standard; confirm on.
-2. **Llama-block gradient checkpointing** — required to fit D=4+ at
-   BS≥2 on 24 GB. Standard PyTorch utility.
-3. **Regional + dynamic `torch.compile` on the trajectory hop module** —
-   hot small function with predictable shapes; likely 1.5–2× speedup on
-   hop dispatch. Low engineering cost. Match graph_walker's existing
-   compile pattern (`compile_walk_block`-style regional compile with
-   `dynamic=True` so varying BS / window contexts don't trigger
-   recompilation; useful for fast benching across configs).
-4. **Sliding KV cache for Llama context** — replaces hard truncation.
-   ~10–20% throughput win for long-doc Wave 1. Implementation: medium
-   (KV invalidation logic).
-5. **Trajectory cross-attn checkpointing** — needed only at D ≥ 8.
-6. **Constant-in-D autograd** — fallback for large D if linear-in-D
-   OOMs; sizable engineering cost.
-7. **Triton-fused hop kernel** — only if profiling shows dispatch is
-   the bottleneck. Almost certainly premature for v1 (see note below).
+**LANDED (2026-05-10):**
+1. ✅ bf16 + FlashAttention on Llama backbone.
+2. ✅ Sliding KV cache for Llama context (was #4 here, promoted to #1
+   in practice; 1.79× Phase 1 speedup, eliminated T1-vs-V1.B gap).
+3. ✅ Regional + dynamic `torch.compile(forward_window)` (~28% at low BS).
+4. ✅ Phase 2 shared-prefill (K-1 prompt encodings saved per step).
+5. ✅ Phase 2 two-pass GRPO (single backward at end of TF replay).
+
+**STILL OPEN (priority-ranked):**
+1. **Phase 2 batched-K rollouts** — current AR sampling loop generates
+   K samples serially (Python loop over K). Highest-value Phase 2
+   speedup remaining. Estimated: 2-3× pass-1 wall time reduction.
+   Implementation: medium (need to expand memory states + KV cache to
+   K batch slots, maintain active/eos mask).
+2. **Phase 2 routing-frozen fix** — N3's `hard_routing=False` in pass 2
+   means routing modules (entry_mlp, step_mlp, head_query) get no
+   gradient. Proper fix: record routing decisions in pass 1, force
+   them in pass 2. ~150-200 LOC. Phase 2 currently only refines
+   bridge + cross-attn + writer mutate_mlp.
+3. **Constant-in-D autograd** — fallback for D≥8 if linear-in-D OOMs;
+   sizable engineering cost. Not blocking; D=4 at BS=4 fits with KV
+   cache + no checkpointing.
+4. **Reference-policy frozen side-car copy** — `_compute_ref_logps`
+   currently param-swap-loads ref weights every Phase 2 step. Keep a
+   permanent frozen-copy of trainable side-car params on GPU instead.
+5. **Triton-fused hop kernel** — only if profiling shows dispatch is
+   the bottleneck. Almost certainly premature (see note below).
 
 **Note on custom Triton kernels — not needed for v1.** graph_walker
 required custom Triton (dendritic gather, fused per-token plasticity)

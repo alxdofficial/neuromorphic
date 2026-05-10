@@ -1,8 +1,7 @@
 """Shared bench utilities (timing primitive, OOM cleanup).
 
-Ported from graph_walker's `_bench_common.py` (abandoned/graph-walker tip)
-with the walker-config wiring stripped out — trajectory-memory uses
-`TrajMemConfig` tier presets instead.
+`bench()` does the warmup + sync + peak-mem accounting; the bench scripts
+(`bench_trajmem.py`, `bench_compare.py`) call it for every measurement.
 """
 
 from __future__ import annotations

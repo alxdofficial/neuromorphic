@@ -1,8 +1,9 @@
 """Trajectory-memory Phase 1 (W1 long-doc TF NTP) throughput bench.
 
-Mirrors graph_walker's `bench_phase1.py` path-D pattern. Skips vanilla
-Llama paths (A/B/C) — those numbers are already known from the
-graph_walker era and don't change.
+Skips vanilla Llama paths (A/B/C) — hardware-bound and already known
+from prior measurements (see `abandoned/graph-walker` branch's
+`docs/bench_results.md` for those numbers). This bench only exercises
+the trajmem-specific path (D).
 
 Per project memory:
 - "Bench with fixed params, never sweep" — one config tier per run.

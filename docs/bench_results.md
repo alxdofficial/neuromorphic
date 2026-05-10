@@ -238,13 +238,20 @@ max-fitting BS / K (project convention).
 | V2   — vanilla Llama GRPO step (KV cache)  | K=12  | **169.5** | 21.65 | 4530 |
 | T2   — Llama + trajmem two-pass GRPO (KV cache) | K=6   | **104.8** | 20.92 | 3664 |
 
-**Per-path slowdowns:**
+**Per-path slowdowns (this AM table):**
 - **T1 vs V1.B: 0.96× — trajmem is now FASTER than vanilla**, with 5 GB
   less memory peak. Memory module pays for itself by letting Llama do
   smaller per-window forwards.
 - T2 vs V2: 1.62× — vanilla Phase 2 fits twice the K (12 vs 6), reflecting
   the genuine memory cost of read+write per generation window. Both
   paths got 3-4× faster overall vs the no-KV baseline below.
+
+> Note: this 1.62× gap is for the AM (KV cache only) bench. The PM
+> "shared-prefill" bench below pushes T2 to K=16 / 132.8 tok/s, closing
+> the gap to ~1.31× and roughly halving peak memory. See the PM table.
+
+**Trainer flag:** `train_wave{1,2}.py --no-kv-cache` to opt out (KV
+cache defaults ON post-2026-05-10).
 
 **Comparison vs the no-KV-cache baseline (above table):**
 
@@ -261,8 +268,6 @@ turned out to be the entire architectural cost; sliding KV cache made
 it disappear.
 
 **Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
-**Trainer flag:** `train_wave{1,2}.py --use-kv-cache` (off by default
-for backward compat; production runs should always set it).
 
 ### Phase 2 architectural fix bundled with KV cache
 

@@ -3,11 +3,12 @@
 Per plan §4.5, the four waves need:
 
   Wave 1 (long-doc TF):
-    - Books / long stories: deepmind/pg19 (Project Gutenberg books)
-    - Code: bigcode/the-stack-dedup (subset)
-    - ArXiv: EleutherAI/proof-pile-2 (arXiv subset) — optional
-    - Web: HuggingFaceFW/fineweb-edu (filtered for length)
+    - Web: HuggingFaceFW/fineweb-edu (filtered for length) — primary
+    - Wikipedia (en) — primary
     - Synthetic needle-in-haystack: generated from above bodies (no download)
+    - GAPS (per project_data_state.md): Books deepmind/pg19 broke on
+      datasets>=3.0; Code bigcode/the-stack-dedup is HF-gated and not
+      currently fetched. ArXiv EleutherAI/proof-pile-2 also optional.
 
   Wave 2 (long-chat TF):
     - HuggingFaceH4/ultrachat_200k

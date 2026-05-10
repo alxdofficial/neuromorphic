@@ -1,5 +1,14 @@
 # Trajectory-Memory Performance Profile (2026-05-09)
 
+> **SUPERSEDED 2026-05-10 — KV cache landed.** The headline finding
+> below ("Llama re-encode is 70% of the slowdown") was correct
+> diagnostically but the fix shipped: sliding KV cache eliminated the
+> rolling-buffer re-encode entirely. Phase 1 went from 9.9k tok/s
+> (here) to **17.7k tok/s** (current). Trajmem now beats vanilla
+> per-token. See `docs/bench_results.md` 2026-05-10 PM section for
+> current numbers. This doc is retained for the Llama-bound vs
+> memory-bound decomposition methodology, which is still useful.
+
 Deep profile of the Phase 1 (Wave 1 long-doc TF NTP) training step at the
 production config. Identifies what's unavoidable Llama cost vs what's
 fixable in our code.

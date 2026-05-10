@@ -2,8 +2,10 @@
 
 These tests run the full per-window cycle and TBPTT chunk path using
 `attach_lm=False`, which fakes the LM forward (random hiddens, zero
-logits). Real-Llama integration tests need access to the HF cache and
-live in test_trajectory_memory_llama.py.
+logits). Real-Llama smoke is exercised by the train_wave{1,2,3,4}.py
+entry scripts when run with --num-steps 1-5; there is currently no
+dedicated test file for the Llama-attached path (HF model load makes
+it too heavy for the unit-test loop).
 """
 
 from __future__ import annotations
