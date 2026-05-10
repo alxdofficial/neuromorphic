@@ -1,7 +1,13 @@
 """Parquet dataset readers + collators for each wave's preprocessed format.
 
 - `LongDocDataset`        — Wave 1 (long-doc TF). Reads {input_ids, num_tokens}
-                            parquet, packs into D*T_window chunks.
+                            parquet, packs into D*T_window chunks. Round-robin
+                            interleaves across sources so a small needle source
+                            isn't starved by a larger fineweb source. Also
+                            reads needle answer metadata (when present) and
+                            applies an `answer_span_weight` boost so the
+                            5-token answer gradient isn't buried under 30K
+                            filler tokens.
 - `TurnPairDataset`       — Wave 2 / Wave 4 (chat TurnPairs). Reads
                             {prior_ids, response_ids} parquet,
                             length-buckets for batching.
@@ -35,14 +41,21 @@ class LongDocChunk:
     - `is_doc_start`: True iff this is the first chunk of a new document.
                       Trainer resets `prev_states / hiddens / lm_context`
                       when this fires.
-    - `valid_mask`:   [chunk_tokens] bool — True for real tokens, False for
-                      pad tokens added at the end of partial chunks. Used
-                      by `step_wave1` as `target_mask` so pad positions
-                      don't contribute to NTP CE.
+    - `valid_mask`:   [chunk_tokens] FLOAT32 — per-token weight for NTP CE.
+                      0.0 for pad tokens (excluded from loss).
+                      1.0 for normal real tokens.
+                      `answer_span_weight` (default 100.0) for tokens that
+                      fall in the needle-answer span. Lets the few critical
+                      answer tokens drive a meaningful gradient signal
+                      against the overwhelming filler background.
+    - `source`:       which preprocessor parquet this chunk came from
+                      (e.g. "fineweb_edu", "needle"). Used by the trainer
+                      for per-source train-loss telemetry.
     """
     input_ids: Tensor
     is_doc_start: bool
     valid_mask: Tensor
+    source: str = ""
 
 
 class LongDocDataset(IterableDataset):
@@ -51,12 +64,28 @@ class LongDocDataset(IterableDataset):
     within a chunk (per plan §4.5). Trailing partial chunks are padded
     with `pad_id` if `drop_short=False`, else dropped.
 
-    Yields `LongDocChunk` (not bare tensors). The `is_doc_start` flag
-    lets the trainer reset manifold/hidden/LM state at document
-    boundaries while threading state through consecutive chunks of the
-    same document — critical for memory to be load-bearing on long docs
-    (otherwise each chunk fits in the LM cap and direct attention can
-    solve the loss without using memory).
+    Source-mix interleaving (Tier 1 fix): instead of iterating ALL of
+    source A's docs before any of source B (the prior bug that caused
+    a 10k-step run to never reach `needle` because `slimpajama` had
+    33M tokens to chew through first), we round-robin sample across
+    sources document-by-document. Each source's doc queue is
+    independently shuffled; the per-doc source choice is random
+    weighted by remaining queue length so each source ends in step
+    with the others (proportional to its size).
+
+    Answer-span weighting (Tier 1 fix): if the parquet contains the
+    needle-haystack metadata columns (`answer`, `query_pos_token`),
+    we tokenize the answer string at __init__ time, locate it in
+    each doc's token sequence, and emit a float32 `valid_mask` that
+    weights answer-span tokens by `answer_span_weight` (default 100×)
+    relative to filler. Without this, the 5-token answer gradient is
+    invisible against 30K filler tokens — even a perfect-retrieval
+    model only moves the average doc loss by ~0.001 nats.
+
+    Yields `LongDocChunk` (with float `valid_mask` post-fix). The
+    `is_doc_start` flag lets the trainer reset manifold/hidden/LM
+    state at document boundaries while threading state through
+    consecutive chunks of the same document.
     """
 
     def __init__(
@@ -68,6 +97,7 @@ class LongDocDataset(IterableDataset):
         drop_short: bool = False,
         shuffle: bool = True,
         seed: int = 0,
+        answer_span_weight: float = 100.0,
     ):
         super().__init__()
         self.paths = [Path(p) for p in parquet_paths]
@@ -76,12 +106,94 @@ class LongDocDataset(IterableDataset):
         self.drop_short = drop_short
         self.shuffle = shuffle
         self.seed = seed
+        self.answer_span_weight = answer_span_weight
         # B2 fix — track epoch count so each iter gets a different shuffle.
-        # The earlier `random.Random(seed)` per __iter__ produced identical
-        # batch order every epoch → multi-epoch training degenerated into
-        # deterministic memorization passes (gradient noise ≪ what should
-        # be expected; momentum/Adam stats drift along a fixed trajectory).
         self._epoch = 0
+        # Pre-load all sources at init time. This trades a one-time RAM
+        # cost (~few hundred MB for our W1 dataset) for clean source-mix
+        # interleaving and zero per-doc parquet I/O during iteration.
+        self._sources = self._load_sources()
+
+    def _load_sources(self) -> list[dict]:
+        """Read each parquet, extract input_ids + needle metadata when
+        present. Returns a list of {name, rows: [{input_ids, ans_start,
+        ans_end}, ...]} dicts, one per source path."""
+        # Lazy tokenizer load — only needed if any source has needle metadata.
+        tok = None
+        sources: list[dict] = []
+        for path in self.paths:
+            tbl = pq.read_table(path)
+            cols = set(tbl.column_names)
+            has_needle = "answer" in cols and "query_pos_token" in cols
+            ids_col = tbl.column("input_ids").to_pylist()
+
+            if has_needle:
+                if tok is None:
+                    from src.trajectory_memory.data.tokenizer import get_tokenizer
+                    tok = get_tokenizer()
+                answer_col = tbl.column("answer").to_pylist()
+                query_pos_col = tbl.column("query_pos_token").to_pylist()
+                rows = []
+                for ids, answer, qp in zip(ids_col, answer_col, query_pos_col):
+                    ans_start, ans_end = self._locate_answer_span(
+                        ids, answer, qp, tok,
+                    )
+                    rows.append({
+                        "input_ids": ids,
+                        "ans_start": ans_start,
+                        "ans_end": ans_end,
+                    })
+            else:
+                rows = [
+                    {"input_ids": ids, "ans_start": None, "ans_end": None}
+                    for ids in ids_col
+                ]
+
+            sources.append({
+                "name": path.stem.split(".")[0],   # "fineweb_edu" from "fineweb_edu.train.parquet"
+                "rows": rows,
+            })
+        return sources
+
+    @staticmethod
+    def _locate_answer_span(
+        input_ids: list[int],
+        answer_text: str,
+        query_pos_token: int | None,
+        tokenizer,
+    ) -> tuple[int | None, int | None]:
+        """Find the answer-token span inside `input_ids` so the trainer can
+        weight it. The answer immediately follows the query in the synth
+        template, so we search starting from `query_pos_token`.
+
+        BPE quirk: `tokenizer.encode("K7T9XB")` may differ from the answer
+        as it appears IN context (with leading space). We try both
+        leading-space and no-leading-space tokenizations and take whichever
+        matches first.
+
+        Returns (start, end) absolute token positions, or (None, None) if
+        the answer can't be located (e.g. multi-token answer that
+        retokenizes differently).
+        """
+        if not answer_text or not input_ids:
+            return None, None
+        # Search lower bound — start near the query if we have it, else 0.
+        lo = max(0, (query_pos_token or 0) - 4)
+
+        # Try multiple encodings to handle the BPE leading-space quirk.
+        candidates = [
+            tokenizer.encode(answer_text, add_special_tokens=False),
+            tokenizer.encode(" " + answer_text, add_special_tokens=False),
+        ]
+        for cand in candidates:
+            if not cand:
+                continue
+            n = len(cand)
+            # Linear scan from lo onward.
+            for i in range(lo, len(input_ids) - n + 1):
+                if input_ids[i:i + n] == cand:
+                    return i, i + n
+        return None, None
 
     def __iter__(self) -> Iterator[LongDocChunk]:
         worker_info = torch.utils.data.get_worker_info()
@@ -89,34 +201,250 @@ class LongDocDataset(IterableDataset):
         rng = random.Random(seed)
         self._epoch += 1
 
-        paths = list(self.paths)
-        if self.shuffle:
-            rng.shuffle(paths)
-
-        for path in paths:
-            tbl = pq.read_table(path, columns=["input_ids"])
-            rows = tbl.column("input_ids").to_pylist()
+        # Per-source independently shuffled doc queues. Iterate via .pop()
+        # from end (O(1)).
+        per_source_queues: list[list[int]] = []
+        for src in self._sources:
+            indices = list(range(len(src["rows"])))
             if self.shuffle:
-                rng.shuffle(rows)
-            for ids in rows:
-                if not ids:
-                    continue
-                for chunk_idx, start in enumerate(
-                    range(0, len(ids), self.chunk_tokens),
-                ):
-                    chunk = ids[start : start + self.chunk_tokens]
-                    n_real = len(chunk)
-                    if n_real < self.chunk_tokens:
-                        if self.drop_short:
-                            continue
-                        chunk = chunk + [self.pad_id] * (self.chunk_tokens - n_real)
-                    valid_mask = torch.zeros(self.chunk_tokens, dtype=torch.bool)
-                    valid_mask[:n_real] = True
-                    yield LongDocChunk(
-                        input_ids=torch.tensor(chunk, dtype=torch.int64),
-                        is_doc_start=(chunk_idx == 0),
-                        valid_mask=valid_mask,
+                rng.shuffle(indices)
+            per_source_queues.append(indices)
+
+        # Active-source rotation: each iteration picks a source weighted by
+        # its remaining queue length, pops one doc, yields its chunks. When
+        # a source's queue empties, it drops out of the rotation. Result:
+        # each source is fully consumed exactly once per epoch, with docs
+        # interleaved across sources rather than concatenated.
+        while True:
+            active = [i for i, q in enumerate(per_source_queues) if q]
+            if not active:
+                break
+            weights = [len(per_source_queues[i]) for i in active]
+            chosen = rng.choices(active, weights=weights, k=1)[0]
+            doc_idx = per_source_queues[chosen].pop()
+            doc = self._sources[chosen]["rows"][doc_idx]
+            ids = doc["input_ids"]
+            if not ids:
+                continue
+            ans_start = doc["ans_start"]
+            ans_end = doc["ans_end"]
+            source_name = self._sources[chosen]["name"]
+
+            for chunk_idx, start in enumerate(
+                range(0, len(ids), self.chunk_tokens),
+            ):
+                chunk = ids[start : start + self.chunk_tokens]
+                n_real = len(chunk)
+                if n_real < self.chunk_tokens:
+                    if self.drop_short:
+                        continue
+                    chunk = chunk + [self.pad_id] * (self.chunk_tokens - n_real)
+
+                # Float mask: 0 for pad, 1 for filler real tokens, boost
+                # for answer-span tokens within this chunk.
+                valid_mask = torch.zeros(self.chunk_tokens, dtype=torch.float32)
+                valid_mask[:n_real] = 1.0
+                if ans_start is not None and ans_end is not None:
+                    chunk_lo = start
+                    chunk_hi = start + n_real    # exclusive
+                    overlap_lo = max(ans_start, chunk_lo)
+                    overlap_hi = min(ans_end, chunk_hi)
+                    if overlap_lo < overlap_hi:
+                        local_lo = overlap_lo - chunk_lo
+                        local_hi = overlap_hi - chunk_lo
+                        valid_mask[local_lo:local_hi] = self.answer_span_weight
+
+                yield LongDocChunk(
+                    input_ids=torch.tensor(chunk, dtype=torch.int64),
+                    is_doc_start=(chunk_idx == 0),
+                    valid_mask=valid_mask,
+                    source=source_name,
+                )
+
+
+# ── Wave 1 BATCHED multi-stream dataset (Tier 4 #13) ──────────────────
+
+
+@dataclass
+class BatchedLongDocChunk:
+    """A batched W1 chunk where each batch slot may be at a different
+    point in a different document.
+
+    - `input_ids`:               [BS, chunk_tokens]
+    - `is_doc_start_per_slot`:   [BS] bool — True for slots starting a new doc
+    - `valid_mask`:              [BS, chunk_tokens] float — per-slot loss weights
+    - `sources`:                 list[str] of length BS — per-slot source name
+    """
+    input_ids: Tensor
+    is_doc_start_per_slot: Tensor
+    valid_mask: Tensor
+    sources: list[str]
+
+
+class BatchedLongDocDataset(IterableDataset):
+    """Multi-stream W1 dataset: maintains BS parallel "lanes," each with its
+    own current-doc + chunk position. Per training step yields ONE chunk
+    per slot (batched). When a slot's doc finishes, that slot independently
+    pulls the next doc from a SHARED source pool so source-mix interleaving
+    is preserved across slots.
+
+    Use when --batch-size > 1 in `train_wave1.py`. The trainer is
+    responsible for per-slot state reset using `is_doc_start_per_slot`:
+
+        if batch.is_doc_start_per_slot.any():
+            fresh_states = manifold.reset_states(BS)
+            mask = batch.is_doc_start_per_slot[:, None, None]
+            prev_states = torch.where(mask, fresh_states, prev_states)
+            ... (same for hiddens, lm_buffer)
+
+    Wraps `LongDocDataset`'s source loader; reuses the same parquet
+    parsing + answer-span metadata extraction.
+    """
+
+    def __init__(
+        self,
+        parquet_paths: list[Path],
+        *,
+        batch_size: int,
+        chunk_tokens: int,
+        pad_id: int,
+        drop_short: bool = False,
+        shuffle: bool = True,
+        seed: int = 0,
+        answer_span_weight: float = 100.0,
+    ):
+        super().__init__()
+        assert batch_size >= 1, f"batch_size must be >= 1, got {batch_size}"
+        # Reuse single-stream dataset for source loading + metadata.
+        self._base = LongDocDataset(
+            parquet_paths,
+            chunk_tokens=chunk_tokens,
+            pad_id=pad_id,
+            drop_short=drop_short,
+            shuffle=shuffle,
+            seed=seed,
+            answer_span_weight=answer_span_weight,
+        )
+        self.batch_size = batch_size
+        self.chunk_tokens = chunk_tokens
+        self.pad_id = pad_id
+        self.answer_span_weight = answer_span_weight
+        self.shuffle = shuffle
+        self.seed = seed
+        # Track epoch separately from base so multi-stream and single-stream
+        # don't fight over shuffle seeds.
+        self._epoch = 0
+
+    @property
+    def _sources(self):
+        return self._base._sources
+
+    def __iter__(self) -> Iterator[BatchedLongDocChunk]:
+        worker_info = torch.utils.data.get_worker_info()
+        seed = self.seed + self._epoch + (worker_info.id if worker_info else 0)
+        rng = random.Random(seed)
+        self._epoch += 1
+
+        # Shared source pool: per-source shuffled doc indices, popped by
+        # whichever slot needs a doc next. Keeps source-mix interleaving
+        # across slots (the small needle source isn't starved by the larger
+        # fineweb source — same proportional draw as single-stream).
+        per_source_queues: list[list[int]] = []
+        for src in self._sources:
+            indices = list(range(len(src["rows"])))
+            if self.shuffle:
+                rng.shuffle(indices)
+            per_source_queues.append(indices)
+
+        def pop_doc() -> tuple[int, int] | None:
+            """Pull (source_idx, doc_idx) from the shared pool, weighted by
+            remaining queue lengths. Returns None when all sources empty."""
+            active = [i for i, q in enumerate(per_source_queues) if q]
+            if not active:
+                return None
+            weights = [len(per_source_queues[i]) for i in active]
+            chosen = rng.choices(active, weights=weights, k=1)[0]
+            doc_idx = per_source_queues[chosen].pop()
+            return chosen, doc_idx
+
+        # Per-slot state: which doc, which chunk in that doc, source name.
+        slots: list[dict] = [
+            {"doc": None, "chunk_idx": 0, "source_name": "", "ans_start": None,
+             "ans_end": None}
+            for _ in range(self.batch_size)
+        ]
+
+        while True:
+            # Refill empty slots from the shared pool. If the pool is dry,
+            # this slot will stay empty and we end the epoch this iter.
+            for slot in slots:
+                if slot["doc"] is None:
+                    pop = pop_doc()
+                    if pop is None:
+                        continue
+                    src_idx, doc_idx = pop
+                    row = self._sources[src_idx]["rows"][doc_idx]
+                    slot["doc"] = row["input_ids"]
+                    slot["ans_start"] = row["ans_start"]
+                    slot["ans_end"] = row["ans_end"]
+                    slot["chunk_idx"] = 0
+                    slot["source_name"] = self._sources[src_idx]["name"]
+
+            # End-of-epoch: any slot that still has no doc → epoch done.
+            if any(slot["doc"] is None for slot in slots):
+                return
+
+            # Build one batched chunk: pull current chunk from each slot.
+            batch_input_ids: list[Tensor] = []
+            batch_is_start: list[bool] = []
+            batch_valid_mask: list[Tensor] = []
+            batch_sources: list[str] = []
+
+            for slot in slots:
+                doc_ids = slot["doc"]
+                ci = slot["chunk_idx"]
+                start = ci * self.chunk_tokens
+                ids_chunk = doc_ids[start : start + self.chunk_tokens]
+                n_real = len(ids_chunk)
+                if n_real < self.chunk_tokens:
+                    ids_chunk = list(ids_chunk) + [self.pad_id] * (
+                        self.chunk_tokens - n_real
                     )
+
+                # Per-token mask: 0 for pad, 1 for filler real token,
+                # answer_span_weight for needle answer-span tokens (when
+                # the metadata is present and overlaps this chunk).
+                valid_mask = torch.zeros(self.chunk_tokens, dtype=torch.float32)
+                valid_mask[:n_real] = 1.0
+                if slot["ans_start"] is not None and slot["ans_end"] is not None:
+                    chunk_lo = start
+                    chunk_hi = start + n_real
+                    overlap_lo = max(slot["ans_start"], chunk_lo)
+                    overlap_hi = min(slot["ans_end"], chunk_hi)
+                    if overlap_lo < overlap_hi:
+                        local_lo = overlap_lo - chunk_lo
+                        local_hi = overlap_hi - chunk_lo
+                        valid_mask[local_lo:local_hi] = self.answer_span_weight
+
+                batch_input_ids.append(
+                    torch.tensor(ids_chunk, dtype=torch.int64),
+                )
+                batch_is_start.append(ci == 0)
+                batch_valid_mask.append(valid_mask)
+                batch_sources.append(slot["source_name"])
+
+                # Advance slot. If we just emitted the last chunk of this
+                # doc, mark slot for refill on next iteration.
+                slot["chunk_idx"] += 1
+                if start + self.chunk_tokens >= len(doc_ids):
+                    slot["doc"] = None
+
+            yield BatchedLongDocChunk(
+                input_ids=torch.stack(batch_input_ids),
+                is_doc_start_per_slot=torch.tensor(batch_is_start, dtype=torch.bool),
+                valid_mask=torch.stack(batch_valid_mask),
+                sources=batch_sources,
+            )
 
 
 # ── Wave 2 / Wave 4 TurnPair ───────────────────────────────────────────

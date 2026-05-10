@@ -45,8 +45,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--num-steps", type=int, default=500)
     ap.add_argument("--warmup-steps", type=int, default=50)
-    ap.add_argument("--lr-memory", type=float, default=3e-4)
-    ap.add_argument("--lr-adapter", type=float, default=1e-4)
+    # Tier 2 #8 — peak LR halved for stability (matches train_wave1.py default).
+    ap.add_argument("--lr-memory", type=float, default=1.5e-4)
+    ap.add_argument("--lr-adapter", type=float, default=5e-5)
     ap.add_argument("--lr-min-ratio", type=float, default=0.1)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--config-tier", choices=["small", "medium", "large"],
