@@ -413,6 +413,43 @@ def test_phase2_trainer_step_runs_end_to_end():
     assert trainer.step_count == 1
 
 
+def test_phase2_step_does_not_mutate_manifold_buffer():
+    """Audit Phase A5: pass 1 (no_grad AR) and pass 2 (TF replay with grad)
+    both use per-batch state tensors via `Manifold.reset_states(batch_size=1)`,
+    which returns a fresh tensor expanded from `state_init`. Neither path
+    should mutate the persistent `manifold.concept_states` buffer.
+
+    If the buffer were mutated, subsequent prompts in the same training
+    session would inherit polluted state from the previous prompt's
+    rollout writes.
+    """
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0)
+
+    class _FakeTokenizer:
+        eos_token_id = 99
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids[:5])
+
+    buffer_before = model.manifold.concept_states.detach().clone()
+
+    prompt_ids = torch.randint(1, 50, (16,))
+    trainer.step(
+        prompt_ids,
+        num_samples=2, max_new_tokens=4,
+        reward_kind="exact_match", gold="dummy", meta={},
+        tokenizer=_FakeTokenizer(),
+    )
+
+    buffer_after = model.manifold.concept_states.detach().clone()
+    assert torch.equal(buffer_before, buffer_after), (
+        "Phase2Trainer.step mutated manifold.concept_states buffer — "
+        "subsequent prompts would inherit polluted state."
+    )
+
+
 # ── BERT cosine availability (slow, optional) ──────────────────────────
 
 

@@ -199,7 +199,15 @@ class Phase2Trainer:
                 continue
             policy_loss = policy_loss + (-adv * sample_logps.sum())
             any_grad = True
-        policy_loss = policy_loss / max(num_samples, 1)
+        # Audit fix (Phase A1, Dr.GRPO): normalize by `K * max_new_tokens`
+        # rather than just `K`. The earlier `sum(logp) / K` per sample
+        # gives long completions larger |loss| for the same advantage,
+        # producing the documented length-bias pathologies in GRPO
+        # (completion-length explosion in correct-bias mode; "long-wrong"
+        # under negative advantage). See arxiv 2503.20783 (Sea AI Lab,
+        # COLM 2025). Dividing by a constant `max_new_tokens` is
+        # length-agnostic.
+        policy_loss = policy_loss / max(num_samples * max_new_tokens, 1)
         if any_grad:
             policy_loss.backward()
             grad_norm = self._clip_and_step()
@@ -410,25 +418,41 @@ class Phase2Trainer:
             # ── (d) WRITE at end of window ──
             cur_hiddens = torch.cat(window_hiddens_list, dim=1)  # [1, n_win, d_lm]
             n_win = cur_hiddens.shape[1]
-            if n_win < T:
-                pad = torch.zeros(
-                    1, T - n_win, cfg.d_lm,
-                    dtype=cur_hiddens.dtype, device=device,
-                )
-                cur_hiddens_padded = torch.cat([cur_hiddens, pad], dim=1)
+            # Audit fix (Phase A2): partial windows pad with zero hiddens
+            # which would scatter_mean *zero* into selected concept slots
+            # (polluting them on every short completion). Two safeguards:
+            #   1. If the window is mostly zeros (n_win < T/2), skip the
+            #      write entirely. Sparse short writes wouldn't carry
+            #      meaningful signal anyway.
+            #   2. Otherwise, build prev_window_hiddens by repeating the
+            #      LAST real hidden over the pad positions (instead of
+            #      zeros) so subsequent reads aren't fed garbage.
+            if n_win < T // 2:
+                # Skip write — too few real tokens to carry useful signal.
+                # Just propagate previous state forward unchanged. Carry
+                # the real hiddens (no pad) as prev_window_hiddens so the
+                # NEXT window's read isn't conditioned on zero pad.
+                pad = cur_hiddens[:, -1:, :].expand(1, T - n_win, cfg.d_lm)
+                prev_window_hiddens = torch.cat([cur_hiddens, pad], dim=1)
             else:
-                cur_hiddens_padded = cur_hiddens
+                # Pad by repeating the last real hidden (not zeros) so the
+                # write module sees coherent content rather than zeros.
+                if n_win < T:
+                    pad = cur_hiddens[:, -1:, :].expand(1, T - n_win, cfg.d_lm)
+                    cur_hiddens_padded = torch.cat([cur_hiddens, pad], dim=1)
+                else:
+                    cur_hiddens_padded = cur_hiddens
 
-            cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
-            # Surprise=0 during AR (per plan §5.4 — generated tokens have
-            # no NTP target).
-            surprise = torch.zeros(1, dtype=prev_states.dtype, device=device)
-            new_states, _, _ = self.model.write_module(
-                cur_hiddens_mem, surprise, prev_states, self.model.manifold,
-                hard=True,
-            )
-            prev_states = new_states
-            prev_window_hiddens = cur_hiddens_padded
+                cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
+                # Surprise=0 during AR (per plan §5.4 — generated tokens have
+                # no NTP target).
+                surprise = torch.zeros(1, dtype=prev_states.dtype, device=device)
+                new_states, _, _ = self.model.write_module(
+                    cur_hiddens_mem, surprise, prev_states, self.model.manifold,
+                    hard=True,
+                )
+                prev_states = new_states
+                prev_window_hiddens = cur_hiddens_padded
 
             # ── (e) Trim cache ──
             kv_cache = _trim_kv_cache(kv_cache, cap)

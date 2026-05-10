@@ -44,7 +44,9 @@ def main():
     ap.add_argument("--lr-adapter", type=float, default=5e-5)
     ap.add_argument("--lr-min-ratio", type=float, default=0.1)
     ap.add_argument("--grad-clip", type=float, default=1.0)
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperature", type=float, default=0.7,
+                    help="Sampling temperature for AR rollouts. 0.7 matches "
+                         "DeepSeek-R1 / verl defaults; lower variance at small K.")
     ap.add_argument("--config-tier", choices=["small", "medium", "large"],
                     default="medium")
     ap.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")

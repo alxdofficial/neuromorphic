@@ -264,7 +264,13 @@ class Phase1Trainer:
 
     @torch.no_grad()
     def eval_wave1(self, chunk: Tensor) -> float:
-        """Forward-only Wave 1 chunk; returns NTP loss. No grad, no opt step."""
+        """Forward-only Wave 1 chunk; returns NTP loss. No grad, no opt step.
+
+        Match the training-time `use_kv_cache` setting so torch.compile sees
+        the same forward_window code path during eval and avoids busting
+        its compile cache on every val pass (smoke test confirmed: ~30s
+        recompile per val pass when the modes mismatched).
+        """
         cfg = self.model.cfg
         BS, T_total = chunk.shape
         assert T_total == cfg.D * cfg.T_window
@@ -277,6 +283,7 @@ class Phase1Trainer:
             prev_lm_context=None,
             target_mask=None,
             hard_routing=True,
+            use_kv_cache=self.use_kv_cache,
         )
         return float(out["aggregate_loss"].detach())
 
@@ -310,6 +317,7 @@ class Phase1Trainer:
         prev_states = self.model.manifold.reset_states(batch_size=BS)
         prev_window_hiddens: Tensor | None = None
         prev_lm_context: Tensor | None = None
+        past_kv: object | None = None
         total = torch.zeros((), device=device)
         for c in range(n_chunks):
             ids = full_ids[:, c * chunk_len : (c + 1) * chunk_len]
@@ -321,11 +329,14 @@ class Phase1Trainer:
                 prev_lm_context=prev_lm_context,
                 target_mask=mask.view(BS, cfg.D, cfg.T_window),
                 hard_routing=True,
+                use_kv_cache=self.use_kv_cache,  # match training to keep compile cache hot
+                past_key_values=past_kv,
             )
             total = total + out["aggregate_loss"]
             prev_states = out["final_states"]
             prev_window_hiddens = out["final_hiddens"]
             prev_lm_context = out["final_lm_context"]
+            past_kv = out.get("final_past_key_values", None)
         return float(total.detach())
 
     # ── helpers ───────────────────────────────────────────────────────
