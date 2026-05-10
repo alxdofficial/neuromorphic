@@ -64,7 +64,7 @@ class Phase1Trainer:
         scheduler: object | None = None,    # WarmupCosineScheduler-like
         grad_clip: float | None = 1.0,
         pad_token_id: int = 0,
-        use_kv_cache: bool = False,
+        use_kv_cache: bool = True,
     ):
         self.model = model
         self.optimizer = optimizer

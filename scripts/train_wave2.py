@@ -67,13 +67,12 @@ def main():
     ap.add_argument("--val-data-paths", nargs="+", type=Path, default=None,
                     help="held-out TurnPair val parquets. If set, eval at each save.")
     ap.add_argument("--val-batches", type=int, default=20)
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile model.forward_window. ~28% speedup at "
-                         "low BS, ~2 min cold-start. See docs/bench_results.md.")
-    ap.add_argument("--use-kv-cache", action="store_true",
-                    help="Use HF DynamicCache to skip re-encoding the rolling "
-                         "LM context buffer per window. ~1.8× speedup. "
-                         "Strongly recommended.")
+    ap.add_argument("--no-compile", dest="compile", action="store_false",
+                    help="Disable torch.compile (default ON). ~28% speedup at "
+                         "low BS, ~2 min cold-start.")
+    ap.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
+                    help="Disable sliding KV cache (default ON). ~1.79× speedup.")
+    ap.set_defaults(compile=True, use_kv_cache=True)
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here every "
                          "--plot-every-seconds. PNG; overwritten in place.")

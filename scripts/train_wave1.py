@@ -83,16 +83,17 @@ def main():
                          "memory-bridging probe). If set, eval at each save.")
     ap.add_argument("--val-batches", type=int, default=20,
                     help="number of val batches to average per eval pass")
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile model.forward_window. ~28% speedup at "
-                         "BS=2 with ~2 min cold-start. Recommended for "
-                         "production runs (see docs/bench_results.md).")
-    ap.add_argument("--use-kv-cache", action="store_true",
-                    help="Use HF DynamicCache to skip re-encoding the rolling "
-                         "LM context buffer per window. ~1.8× speedup on Phase 1 "
-                         "(measured: 9.9k → 17.7k tok/s at BS=4, eager). "
-                         "Cache is sliding-window trimmed to "
-                         "effective_lm_context. Strongly recommended.")
+    ap.add_argument("--no-compile", dest="compile", action="store_false",
+                    help="Disable torch.compile (default ON). Compile gives "
+                         "~28% speedup at BS=2 with a ~2 min cold-start; "
+                         "disable for fast smoke iteration where startup time "
+                         "matters more than steady-state speed.")
+    ap.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
+                    help="Disable sliding KV cache (default ON). KV cache "
+                         "gives ~1.79× speedup on Phase 1 by skipping the "
+                         "rolling LM buffer re-encode per window. Disable "
+                         "only to benchmark the rolling-buffer fallback path.")
+    ap.set_defaults(compile=True, use_kv_cache=True)
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here "
                          "every --plot-every-seconds. PNG; overwritten in "
