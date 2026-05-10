@@ -135,18 +135,120 @@ def test_per_slot_position_ids():
 
 @pytest.mark.skipif(
     os.environ.get("RUN_HEAVY_TESTS") != "1",
-    reason="heavy: requires real Llama download. Set RUN_HEAVY_TESTS=1.",
+    reason="heavy: requires real Llama. Set RUN_HEAVY_TESTS=1.",
 )
-def test_bs4_multi_stream_matches_bs1_sequential():
-    """The acid test: BS=4 multi-stream forward through Llama should
-    produce per-slot logits that match (mod fp tolerance) what you'd
-    get from 4 sequential BS=1 runs of the same per-slot doc sequences.
+def test_bs2_multi_stream_matches_bs1_sequential():
+    """ACID test: BS=2 multi-stream Llama forward should produce per-slot
+    logits matching what 2 sequential BS=1 runs of the same per-slot
+    sequences would produce. Catches off-by-one in 4D mask, position_ids
+    threading, or per-slot cache lifecycle.
 
-    Setup: build 4 fake "docs" of varying length. Run them as BS=4
-    multi-stream with per-slot KV cache (using our 4D mask). Run them
-    as 4 sequential BS=1 forwards (HF defaults). Compare logits at
-    each token position."""
-    # TODO: implement when we wire forward_window to use the new path.
-    # Will be the regression test that catches off-by-one bugs in the
-    # mask construction or position_ids threading.
-    pass
+    Method: 2 different short token sequences, processed in chunks of 4.
+    Reference: each through `llama.model()` standalone with fresh cache.
+    Multi-stream: both as BS=2 batched with our 4D mask + per-slot
+    position_ids + per-slot cache state. Compare logits per-token.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, DynamicCache
+
+    from src.trajectory_memory.per_slot_kv import (
+        PerSlotCacheState,
+        build_per_slot_4d_mask,
+        build_per_slot_position_ids,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_name = "meta-llama/Llama-3.2-1B"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16,
+    ).to(device)
+    model.requires_grad_(False)
+    model_inference_mode = model.eval()  # PyTorch's set-eval-mode (not Python eval)
+    del model_inference_mode  # the assignment is just to avoid lint complaints
+
+    torch.manual_seed(0)
+    n_chunks = 3
+    chunk_size = 4
+    seq_a = torch.randint(0, 32000, (n_chunks * chunk_size,), device=device)
+    seq_b = torch.randint(0, 32000, (n_chunks * chunk_size,), device=device)
+
+    # ── Reference: BS=1 sequential per slot ──
+    @torch.no_grad()
+    def run_bs1(seq):
+        cache = DynamicCache()
+        all_logits = []
+        cache_len = 0
+        for c in range(n_chunks):
+            chunk = seq[c * chunk_size:(c + 1) * chunk_size].unsqueeze(0)
+            out = model.model(
+                input_ids=chunk,
+                past_key_values=cache,
+                cache_position=torch.arange(
+                    cache_len, cache_len + chunk_size, device=device,
+                ),
+                position_ids=torch.arange(
+                    cache_len, cache_len + chunk_size, device=device,
+                ).unsqueeze(0),
+                use_cache=True,
+            )
+            cache = out.past_key_values
+            cache_len += chunk_size
+            all_logits.append(model.lm_head(out.last_hidden_state[0]))
+        return torch.cat(all_logits, dim=0)            # [n_total, V]
+
+    logits_a_ref = run_bs1(seq_a)
+    logits_b_ref = run_bs1(seq_b)
+
+    # ── Multi-stream: BS=2 per-slot ──
+    @torch.no_grad()
+    def run_bs2_multi():
+        state = PerSlotCacheState.fresh(2, max_cache_len=64, device=device)
+        all_logits = [[], []]
+        for c in range(n_chunks):
+            chunk_a = seq_a[c * chunk_size:(c + 1) * chunk_size]
+            chunk_b = seq_b[c * chunk_size:(c + 1) * chunk_size]
+            chunk = torch.stack([chunk_a, chunk_b], dim=0)
+            cache_len_old = (
+                state.cache.get_seq_length()
+                if state.cache is not None else 0
+            )
+            cache_position = torch.arange(
+                cache_len_old, cache_len_old + chunk_size, device=device,
+            )
+            position_ids = build_per_slot_position_ids(
+                state.abs_pos, chunk_size, device=device,
+            )
+            attention_mask = build_per_slot_4d_mask(
+                valid_len=state.valid_len,
+                q_len=chunk_size,
+                cache_len_old=cache_len_old,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            out = model.model(
+                input_ids=chunk,
+                past_key_values=state.cache,
+                cache_position=cache_position,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            state.cache = out.past_key_values
+            state.advance_after_forward(chunk_size)
+            chunk_logits = model.lm_head(out.last_hidden_state)
+            all_logits[0].append(chunk_logits[0])
+            all_logits[1].append(chunk_logits[1])
+        return torch.cat(all_logits[0], dim=0), torch.cat(all_logits[1], dim=0)
+
+    logits_a_multi, logits_b_multi = run_bs2_multi()
+
+    # ── Compare ──
+    diff_a = (logits_a_ref.float() - logits_a_multi.float()).abs().max().item()
+    diff_b = (logits_b_ref.float() - logits_b_multi.float()).abs().max().item()
+    print(f"slot 0 max abs diff: {diff_a:.4e}")
+    print(f"slot 1 max abs diff: {diff_b:.4e}")
+    # bf16 numerical noise tolerance — different attention backends
+    # can produce ~1e-2 to 1e-1 logit differences. Catastrophic divergence
+    # (>1) indicates real bug.
+    assert diff_a < 1.0, f"slot 0 logits diverged: {diff_a}"
+    assert diff_b < 1.0, f"slot 1 logits diverged: {diff_b}"
