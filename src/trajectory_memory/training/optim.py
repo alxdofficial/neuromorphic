@@ -62,4 +62,9 @@ def build_optimizer(
             "lr": lr_memory,
         })
 
-    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+    # N8 — fused AdamW: PyTorch docs note fused implementations are
+    # generally faster than foreach, foreach faster than for-loop.
+    # AdamW has stable CUDA fused since 2.x. Negligible overhead if
+    # `fused` arg not supported on this device (falls back to foreach).
+    fused = torch.cuda.is_available()
+    return torch.optim.AdamW(groups, weight_decay=weight_decay, fused=fused)

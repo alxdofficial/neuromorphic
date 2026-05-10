@@ -190,8 +190,16 @@ def run_chunk(
         lm_buffer = prev_lm_context.detach()                       # ensure no grad
 
     outputs: list[dict] = []
-    losses: list[Tensor] = []
     surprises: list[Tensor] = []
+    # N6 — token-weighted aggregation: accumulate sum + count across all
+    # windows (instead of summing per-window means). Sparse windows
+    # contribute proportionally to their real-token count, not equally
+    # to full windows.
+    chunk_ce_sum: Tensor | None = None
+    chunk_ce_count: Tensor | None = None
+    # Fallback path for test mode (no real Llama → no surprise_sum/count
+    # in `out`): aggregate per-window mean × T_window like before.
+    losses_fallback: list[Tensor] = []
 
     for d in range(D):
         win_input = windows[:, d, :]                               # [BS, T_window]
@@ -244,14 +252,35 @@ def run_chunk(
             "write_visited": out["write_visited"],
             "surprise": out["surprise"],
         })
-        losses.append(out["surprise"].sum())                       # NTP CE summed across batch
+        # N6 — accumulate token-weighted sum + count if real Llama
+        # (forward_window surfaces them); else fall back to per-window
+        # mean (test mode).
+        if "surprise_sum" in out and "surprise_count" in out:
+            # Note: out["surprise_sum"] is detached (per integrated_lm.py).
+            # We need the WITH-GRAD version for backward. Recompute
+            # mean*count from the non-detached surprise:
+            cnt = out["surprise_count"]
+            ce_sum_with_grad = out["surprise"] * cnt   # surprise has grad
+            if chunk_ce_sum is None:
+                chunk_ce_sum = ce_sum_with_grad.sum()  # sum across BS
+                chunk_ce_count = cnt.sum()
+            else:
+                chunk_ce_sum = chunk_ce_sum + ce_sum_with_grad.sum()
+                chunk_ce_count = chunk_ce_count + cnt.sum()
+        else:
+            losses_fallback.append(out["surprise"].sum())
         surprises.append(out["surprise"])
 
         # Carry forward into next window.
         states = out["new_states"]
         cur_prev_hiddens = out["current_hiddens"]
 
-    aggregate_loss = torch.stack(losses).sum()                     # scalar
+    if chunk_ce_sum is not None:
+        # Token-weighted aggregation. `chunk_ce_count.clamp_min(1.0)`
+        # avoids div-by-zero when all windows are pad-only.
+        aggregate_loss = chunk_ce_sum / chunk_ce_count.clamp_min(1.0)
+    else:
+        aggregate_loss = torch.stack(losses_fallback).sum()
     surprise_history = torch.stack(surprises, dim=1)               # [BS, D]
 
     result = {

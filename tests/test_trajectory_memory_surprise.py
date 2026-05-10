@@ -25,7 +25,7 @@ def test_compute_surprise_window_no_mask_matches_manual_ce():
     needed_logits = torch.randn(BS, T_window + 1, V)
     target_ids = torch.randint(0, V, (BS, T_window))
 
-    surprise = IntegratedLM._compute_surprise_window(
+    surprise, _ce_sum, _ce_count = IntegratedLM._compute_surprise_window(
         needed_logits, target_ids, target_mask=None,
     )
 
@@ -49,7 +49,7 @@ def test_compute_surprise_window_with_mask_filters_correctly():
     target_mask = torch.zeros(BS, T_window, dtype=torch.bool)
     target_mask[:, :4] = True
 
-    surprise = IntegratedLM._compute_surprise_window(
+    surprise, _ce_sum, _ce_count = IntegratedLM._compute_surprise_window(
         needed_logits, target_ids, target_mask=target_mask,
     )
 
@@ -71,7 +71,7 @@ def test_compute_surprise_window_zero_mask_does_not_nan():
     needed_logits = torch.randn(BS, T_window + 1, V)
     target_ids = torch.randint(0, V, (BS, T_window))
     target_mask = torch.zeros(BS, T_window, dtype=torch.bool)
-    surprise = IntegratedLM._compute_surprise_window(
+    surprise, _ce_sum, _ce_count = IntegratedLM._compute_surprise_window(
         needed_logits, target_ids, target_mask=target_mask,
     )
     assert torch.isfinite(surprise).all()
@@ -87,10 +87,10 @@ def test_compute_surprise_window_uses_fp32_for_bf16_logits():
     needed_bf16 = torch.randn(BS, T_window + 1, V).to(torch.bfloat16)
     target_ids = torch.randint(0, V, (BS, T_window))
 
-    surprise_bf16 = IntegratedLM._compute_surprise_window(
+    surprise_bf16, _, _ = IntegratedLM._compute_surprise_window(
         needed_bf16, target_ids, target_mask=None,
     )
-    surprise_fp32 = IntegratedLM._compute_surprise_window(
+    surprise_fp32, _, _ = IntegratedLM._compute_surprise_window(
         needed_bf16.float(), target_ids, target_mask=None,
     )
     assert torch.allclose(surprise_bf16, surprise_fp32, atol=0.5)
@@ -106,7 +106,7 @@ def test_compute_surprise_window_short_context_path():
     # T_window positions (no +1)
     needed_logits = torch.randn(BS, T_window, V)
     target_ids = torch.randint(0, V, (BS, T_window))
-    surprise = IntegratedLM._compute_surprise_window(
+    surprise, _ce_sum, _ce_count = IntegratedLM._compute_surprise_window(
         needed_logits, target_ids, target_mask=None,
     )
     assert surprise.shape == (BS,)

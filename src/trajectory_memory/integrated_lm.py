@@ -377,9 +377,15 @@ class IntegratedLM(nn.Module):
             needed_logits = self.llama.lm_head(needed_hidden)        # [BS, n_needed, V]
 
             target_ids = lm_input_ids[:, -T_window:]
-            surprise = self._compute_surprise_window(
+            # N6 — _compute_surprise_window now returns (mean, sum, count).
+            # Mean is the per-window surprise that the writer consumes
+            # (a magnitude per window). Sum/count are surfaced in the
+            # output dict so run_chunk can aggregate as token-weighted
+            # CE across the chunk (avoids overweighting sparse windows).
+            surprise_mean, surprise_sum, surprise_count = self._compute_surprise_window(
                 needed_logits, target_ids, target_mask,
-            ).to(prev_states.dtype)
+            )
+            surprise = surprise_mean.to(prev_states.dtype)
             # N2 fix — Phase 2 pass-2 must reproduce pass-1's memory
             # dynamics. Pass 1 wrote response windows with surprise=0 (per
             # plan §5.4 — generated tokens have no NTP target). If pass 2
@@ -416,6 +422,12 @@ class IntegratedLM(nn.Module):
             "write_visited": write_visited_ids,
             "surprise": surprise,
         }
+        if self.llama is not None:
+            # N6 — surface raw sum + count per window so run_chunk can
+            # aggregate token-weighted across the chunk. Test mode skips
+            # this (synthetic logits don't compute real CE).
+            out["surprise_sum"] = surprise_sum.detach()
+            out["surprise_count"] = surprise_count.detach()
         if use_kv_cache and self.llama is not None:
             out["new_past_key_values"] = new_past_key_values
             out["new_cache_abs_pos"] = cache_abs_pos + lm_input_ids.shape[1]
@@ -426,19 +438,20 @@ class IntegratedLM(nn.Module):
         needed_logits: Tensor,        # [BS, T_window+1, V] — logits for the last T_window+1 positions
         target_ids: Tensor,           # [BS, T_window]      — current window's tokens
         target_mask: Tensor | None,   # [BS, T_window] bool — True=include in CE
-    ) -> Tensor:
-        """Mean per-token NTP CE over the current window's target positions.
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Per-window NTP CE statistics: returns (mean, sum, count) all
+        shaped [BS]. Mean is what the writer module's surprise input
+        consumes (a magnitude per window); (sum, count) are what
+        run_chunk uses to aggregate a TOKEN-WEIGHTED chunk loss (N6 fix).
 
-        Uses the standard NTP shift: position t in `needed_logits[:, :-1, :]`
-        predicts `target_ids[:, t]`. So `needed_logits` must include one
-        extra position to the left of the window (the "previous" token,
-        whose prediction is the first target).
-
-        Earlier we received the full L_lm-token logits and shifted +
-        sliced inside this function, casting the entire sequence to fp32
-        — at L_lm=2048/V=128256 that was ~2 GB of throwaway compute per
-        forward. The new contract pre-slices, so we cast just T_window
-        positions.
+        Earlier this function returned only `mean`. tbptt.run_chunk then
+        summed those means across windows. For W2 with response masking
+        concentrated in the last chunk, a sparse last window (1 real
+        token) got the same window-level loss weight as a full window
+        (256 real tokens) — distorting training toward fragments. The
+        new contract surfaces sum + count so tbptt can aggregate as
+        `total_sum / total_count` (token-weighted) rather than
+        `sum_of_means` (window-equal).
         """
         BS, n_pos, V = needed_logits.shape
         T_window = target_ids.shape[1]
@@ -469,10 +482,16 @@ class IntegratedLM(nn.Module):
 
         if used_mask is not None:
             mask = used_mask.to(ce_per_tok.dtype)
-            ce_sum = (ce_per_tok * mask).sum(dim=1)
-            ce_count = mask.sum(dim=1).clamp_min(1.0)
-            return ce_sum / ce_count
-        return ce_per_tok.mean(dim=1)
+            ce_sum = (ce_per_tok * mask).sum(dim=1)              # [BS]
+            ce_count = mask.sum(dim=1)                           # [BS]
+        else:
+            ce_sum = ce_per_tok.sum(dim=1)
+            ce_count = torch.full(
+                (BS,), float(n_predicted),
+                dtype=ce_per_tok.dtype, device=ce_per_tok.device,
+            )
+        ce_mean = ce_sum / ce_count.clamp_min(1.0)
+        return ce_mean, ce_sum, ce_count
 
     # ── parameter accounting ─────────────────────────────────────────
 
