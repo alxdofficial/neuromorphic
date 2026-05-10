@@ -36,6 +36,7 @@ from src.trajectory_memory.integrated_lm import IntegratedLM
 from src.trajectory_memory.training.metrics import (
     grad_norms_by_component,
     surprise_stats,
+    trajectory_diversity_stats,
     vram_stats,
 )
 from src.trajectory_memory.training.plotting import (
@@ -184,8 +185,7 @@ def main():
         "BS>1 not yet supported with the post-fix state-threading W1 trainer. "
         "Multi-stream batching (each batch slot independently advancing "
         "through its own document, with per-slot reset) is a follow-up. "
-        "Use --batch-size 1 with --grad-accum-steps if you need bigger "
-        "effective batch."
+        "Use --batch-size 1 if you need bigger effective batch."
     )
 
     dataset = LongDocDataset(
@@ -193,6 +193,16 @@ def main():
         chunk_tokens=cfg.D * cfg.T_window,
         pad_id=pad_id, drop_short=False,
     )
+    # B6 fix — on resume, advance dataset epoch counter by step_count so
+    # resumed training doesn't replay the head of the shuffle order. Each
+    # epoch's shuffle uses seed + epoch (B2 fix), so bumping epoch gives a
+    # fresh shuffle that doesn't overlap the pre-resume one. Approximate —
+    # we don't truly seek to step N within an epoch — but eliminates the
+    # head-overtraining/tail-undertraining pathology.
+    if trainer.step_count > 0:
+        dataset._epoch = trainer.step_count
+        print(f"Dataset epoch advanced to {trainer.step_count} for resume "
+              f"(avoids replaying head of shuffle order)")
 
     # Per-source val datasets — each parquet path gets its own dataset
     # and its own loss series. Lets us plot the needle val loss
@@ -314,6 +324,25 @@ def main():
             cache_abs_pos = metrics.final_cache_abs_pos
             losses.append(metrics.loss)
 
+            # S5 fix — NaN-loss kill switch + grad-spike alert.
+            import math, sys
+            if not math.isfinite(metrics.loss):
+                print(f"FATAL: non-finite loss ({metrics.loss}) at step "
+                      f"{trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            if not math.isfinite(metrics.grad_norm):
+                print(f"FATAL: non-finite grad_norm ({metrics.grad_norm}) at "
+                      f"step {trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            # Grad-spike alert: warn if grad_norm > 5× recent median (last 100).
+            recent_gn = history.get("grad_norm", [])[-100:]
+            if len(recent_gn) >= 20:
+                med = sorted(recent_gn)[len(recent_gn) // 2]
+                if med > 0 and metrics.grad_norm > 5 * med:
+                    print(f"  WARN step {trainer.step_count}: grad_norm "
+                          f"{metrics.grad_norm:.2f} = {metrics.grad_norm/med:.1f}× "
+                          f"recent median {med:.2f}")
+
             # ── Per-step metric collection for live monitoring ─────
             step = trainer.step_count
             now = time.time()
@@ -321,6 +350,21 @@ def main():
             history["loss"].append(metrics.loss)
             history["grad_norm"].append(metrics.grad_norm)
             history["lr"].append(list(metrics.lr))
+            # B8 — inject SNR (memory-contribution diagnostic).
+            inj = metrics.inject_norm
+            hid = metrics.hidden_norm
+            history.setdefault("inject_norm", []).append(inj)
+            history.setdefault("hidden_norm", []).append(hid)
+            history.setdefault("inject_snr", []).append(inj / max(hid, 1e-9))
+            # B9 — trajectory diversity (read + write paths).
+            if metrics.read_visited_ids is not None:
+                rs = trajectory_diversity_stats(metrics.read_visited_ids, cfg.N)
+                history.setdefault("read_unique_frac", []).append(rs["unique_frac"])
+                history.setdefault("read_self_overlap", []).append(rs["self_overlap_rate"])
+            if metrics.write_visited_ids is not None:
+                ws = trajectory_diversity_stats(metrics.write_visited_ids, cfg.N)
+                history.setdefault("write_unique_frac", []).append(ws["unique_frac"])
+                history.setdefault("write_self_overlap", []).append(ws["self_overlap_rate"])
             # Surprise distribution (per-window NTP CE — should drop as
             # memory learns to bridge the LM cap).
             if metrics.surprise_history is not None:

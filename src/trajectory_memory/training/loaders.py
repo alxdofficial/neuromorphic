@@ -220,8 +220,17 @@ class TurnPairDataset:
                 response_mask = torch.zeros((BS, t_resp_max), dtype=torch.bool)
 
                 for i, r in enumerate(picks):
-                    # Truncate prior from the LEFT (keep the most recent context).
-                    p = r["prior_ids"][-t_prior_min:]
+                    # B4 fix — Truncate prior from LEFT (keep recent context)
+                    # but preserve BOS at position 0. Llama-3 expects
+                    # `<|begin_of_text|>` as token 0; without it, attention
+                    # produces different distributions than training.
+                    full_prior = r["prior_ids"]
+                    if len(full_prior) <= t_prior_min:
+                        p = full_prior  # no truncation needed
+                    else:
+                        bos = full_prior[0]  # preserve original BOS
+                        # Take last (t_prior_min - 1) tokens, prepend BOS
+                        p = [bos] + list(full_prior[-(t_prior_min - 1):])
                     prior_ids[i, :len(p)] = torch.tensor(p, dtype=torch.int64)
                     prior_mask[i, :len(p)] = True
                     resp = r["response_ids"][:t_resp_max]

@@ -54,7 +54,13 @@ def save_checkpoint(
         state["rng_state"] = rng_state
     if extra is not None:
         state["extra"] = extra
-    torch.save(state, path)
+    # N10 fix — atomic save: write to .tmp then os.replace. Process kill
+    # mid-torch.save() would otherwise corrupt the only checkpoint with
+    # nothing to recover from.
+    import os
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(
@@ -90,12 +96,20 @@ def load_checkpoint(
 
 
 def capture_rng_state() -> dict:
-    """Capture torch + Python random RNG state for deterministic resume."""
+    """Capture torch + Python random + numpy RNG state for deterministic
+    resume. Numpy added per S6 — sklearn, scipy, pandas use it; missing it
+    would silently diverge on resume even though core training paths use
+    torch.random."""
     import random
     state: dict = {
         "torch_cpu": torch.random.get_rng_state(),
         "python": random.getstate(),
     }
+    try:
+        import numpy as np
+        state["numpy"] = np.random.get_state()
+    except ImportError:
+        pass
     if torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
     return state
@@ -108,5 +122,11 @@ def restore_rng_state(state: dict) -> None:
         torch.random.set_rng_state(state["torch_cpu"])
     if "python" in state:
         random.setstate(state["python"])
+    if "numpy" in state:
+        try:
+            import numpy as np
+            np.random.set_state(state["numpy"])
+        except ImportError:
+            pass
     if "torch_cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["torch_cuda"])

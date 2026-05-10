@@ -43,6 +43,15 @@ class Phase1Metrics:
     final_lm_context: Tensor | None = None
     final_past_key_values: object | None = None  # KV-cache mode only
     final_cache_abs_pos: int = 0                 # KV-cache mode only
+    # B9 fix — surface visited IDs across windows for trajectory-diversity
+    # telemetry. Shape after stacking: [BS, n_windows, J, K_read|K_write].
+    read_visited_ids: Tensor | None = None
+    write_visited_ids: Tensor | None = None
+    # B8 fix — inject SNR diagnostics. Read from MemInjectLayer's
+    # `_last_inj_norm` and `_last_hidden_norm` buffers (last forward only).
+    # If memory module silently collapses (scale → 0), inject_snr → 0.
+    inject_norm: float = 0.0
+    hidden_norm: float = 0.0
 
 
 class Phase1Trainer:
@@ -170,6 +179,30 @@ class Phase1Trainer:
             from src.trajectory_memory.tbptt import _detach_kv_cache
             final_cache = _detach_kv_cache(final_cache)
 
+        # B9 — collect visited IDs across windows for trajectory diversity.
+        # `out["window_outputs"]` is a list of D dicts; each has read/write_visited
+        # of shape [BS, J, K_*]. Stack along window axis.
+        try:
+            read_ids = torch.stack(
+                [w["read_visited"] for w in out["window_outputs"]], dim=1,
+            ).detach()
+        except Exception:
+            read_ids = None
+        try:
+            write_ids = torch.stack(
+                [w["write_visited"] for w in out["window_outputs"]], dim=1,
+            ).detach()
+        except Exception:
+            write_ids = None
+
+        # B8 — inject SNR readout (cheap detached scalars).
+        inj_norm = 0.0
+        hid_norm = 0.0
+        if self.model.llama is not None:
+            mil = self.model._mem_inject_layer()
+            inj_norm = float(mil._last_inj_norm.item())
+            hid_norm = float(mil._last_hidden_norm.item())
+
         return Phase1Metrics(
             loss=float(loss.detach()),
             grad_norm=float(grad_norm),
@@ -180,6 +213,10 @@ class Phase1Trainer:
             final_lm_context=out["final_lm_context"],
             final_past_key_values=final_cache,
             final_cache_abs_pos=int(out.get("final_cache_abs_pos", 0)),
+            read_visited_ids=read_ids,
+            write_visited_ids=write_ids,
+            inject_norm=inj_norm,
+            hidden_norm=hid_norm,
         )
 
     # ── Wave 2: long-chat TF NTP (TurnPair) ───────────────────────────

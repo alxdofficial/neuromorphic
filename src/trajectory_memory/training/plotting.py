@@ -85,11 +85,17 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
-    # ── 3. Grad norm overall (log scale) ─────────────────────────────
+    # ── 3. Inject SNR (memory contribution diagnostic) ───────────────
+    # Replaces the prior "grad_norm overall" panel which was redundant
+    # with panel 4 (per-component). B8 fix — surfaces the
+    # MemInjectLayer._last_inj_norm / _last_hidden_norm ratio so we can
+    # see if memory module silently collapses (scale → 0 → snr → 0).
     ax = axes[0, 2]
-    if steps and "grad_norm" in history:
-        ax.plot(steps, history["grad_norm"], color="C2")
-    ax.set_title("Grad norm (overall)")
+    if steps and "inject_snr" in history:
+        snr = history["inject_snr"]
+        ax.plot(steps[:len(snr)], snr, color="C2", label="inject/hidden")
+        ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Inject SNR (||scale·W_out(readout)|| / ||hidden||)")
     ax.set_xlabel("step")
     ax.set_yscale("log")
     ax.grid(alpha=0.3, which="both")

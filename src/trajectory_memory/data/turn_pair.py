@@ -78,6 +78,12 @@ def session_to_turn_pairs(
         # turn k. Then we add the assistant header so the response is
         # what follows the header.
         prior_msgs = messages[:k]
+        # S8 fix — skip assistant-first sessions (k=0 with assistant role)
+        # which would call apply_chat_template([]) → IndexError. The chat
+        # template needs at least one prior message to bracket the
+        # assistant header.
+        if not prior_msgs:
+            continue
         # Use tokenize=False then encode — apply_chat_template's tokenize=True
         # path returns a BatchEncoding (not a flat list) in some transformers
         # versions, which complicates downstream typing.
