@@ -512,7 +512,7 @@ class IntegratedLM(nn.Module):
             # whenever any non-1.0 weight is in play). Verified numerically:
             # mask=[0.1,0.1,1,1] CE=[1,1,1,1] gave 4.0 instead of 2.2.
             # `surprise_count` stays detached — it's just an integer divisor.
-            out["surprise_weighted_sum"] = surprise_sum
+            out["surprise_weighted_sum"] = surprise_weighted_sum
             out["surprise_count"] = surprise_count.detach()
         if use_kv_cache and self.llama is not None:
             out["new_past_key_values"] = new_past_key_values

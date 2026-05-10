@@ -227,6 +227,13 @@ class TurnPairDataset:
                     full_prior = r["prior_ids"]
                     if len(full_prior) <= t_prior_min:
                         p = full_prior  # no truncation needed
+                    elif t_prior_min == 1:
+                        # Edge case: degenerate batch with a 1-token prior.
+                        # `full_prior[-(t_prior_min - 1):]` = `full_prior[0:]`
+                        # = entire list, then `[bos] + entire_list` would
+                        # overflow the prior_ids[i, :len(p)] slice.
+                        # Just keep BOS only.
+                        p = [full_prior[0]]
                     else:
                         bos = full_prior[0]  # preserve original BOS
                         # Take last (t_prior_min - 1) tokens, prepend BOS
