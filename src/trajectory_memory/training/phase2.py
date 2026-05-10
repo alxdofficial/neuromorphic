@@ -319,9 +319,33 @@ class Phase2Trainer:
         # SAMPLING time — used by pass 2 for the PPO importance-sampling
         # ratio. Recording it here is essentially free (softmax already
         # computed for sampling).
+        # N7 fix — shared pass-1 prefill across K samples. Encode the
+        # prompt ONCE (single forward through K windows), then K
+        # independent generation branches start from cloned prefill state.
+        # Saves K-1 prompt prefills per step; for K=8 / T_pre=1024 / T_gen=64
+        # that's a ~4-5× reduction in pass-1 wall time.
+        pass1_prefill_shared = None
+        if self.model.llama is not None:
+            pass1_prefill_shared = self._prefill_prompt(
+                prompt_ids, pad_id=pad_id, device=device,
+            )
+
         samples: list[Tensor] = []
         samples_logp_old: list[Tensor] = []
+        import copy
         for _ in range(num_samples):
+            # Per-sample clone of prefill state — each sample's AR loop
+            # mutates manifold + cache independently.
+            per_sample_prefill = None
+            if pass1_prefill_shared is not None:
+                _ps, _ph, _kv, _lr, _ap = pass1_prefill_shared
+                per_sample_prefill = (
+                    _ps.detach().clone(),
+                    _ph.detach().clone() if _ph is not None else None,
+                    copy.deepcopy(_kv),
+                    _lr.detach().clone() if _lr is not None else None,
+                    _ap,
+                )
             sample, logp_old = self._ar_sample_one(
                 prompt_ids,
                 max_new_tokens=max_new_tokens,
@@ -329,6 +353,7 @@ class Phase2Trainer:
                 stop_ids=stop_ids,
                 pad_id=pad_id,
                 device=device,
+                prefill_state=per_sample_prefill,
             )
             samples.append(sample)
             samples_logp_old.append(logp_old)
@@ -609,6 +634,7 @@ class Phase2Trainer:
         stop_ids: set[int] | None,
         pad_id: int,
         device: torch.device,
+        prefill_state: tuple | None = None,
     ) -> Tensor:
         """One AR rollout, no_grad, with per-window memory + KV cache.
 
@@ -623,11 +649,13 @@ class Phase2Trainer:
                (d) write once at end of window
                (e) trim cache to effective_lm_context
 
-        Pre-KV-cache version padded every token to T_window and called
-        forward_window per-token, which fired read+write per-token AND
-        re-encoded the entire rolling buffer per-token. This version
-        keeps memory ops at proper window boundaries AND each token's LM
-        forward is a single 1-token forward against KV cache.
+        N7 fix — `prefill_state` argument lets the caller share a
+        pre-computed prefill (states, hiddens, kv_cache, last_real_hidden,
+        abs_pos) across K samples instead of K separate prefills. Caller
+        is responsible for cloning the state per sample (deep_copy of
+        cache, .clone() of states/hiddens). When None, we prefill ourselves
+        (legacy behavior, used by test mode and the legacy `grpo_rollout`
+        shim).
 
         Pass 2 (`_tf_compute_sample_logp`) recomputes per-token logp with
         gradient — pass 1 doesn't need to record it.
@@ -649,13 +677,21 @@ class Phase2Trainer:
         T = cfg.T_window
 
         # Prefill — populates manifold state and KV cache for the prompt.
-        # N4 fix — `last_real_hidden` is the hidden of the actual last
-        # prompt token (no pad), and `abs_pos` is the absolute position
-        # counter after all prompt tokens have been encoded.
-        (prev_states, prev_window_hiddens, kv_cache,
-         last_real_hidden, abs_pos) = self._prefill_prompt(
-            prompt_ids, pad_id=pad_id, device=device,
-        )
+        # N7 fix — accept a pre-computed prefill_state from the caller
+        # (shared across K samples), or compute one ourselves (legacy
+        # path, used by `grpo_rollout` shim). Caller-provided state has
+        # already been cloned per-sample so this AR loop's mutations
+        # don't affect other samples.
+        if prefill_state is not None:
+            (prev_states, prev_window_hiddens, kv_cache,
+             last_real_hidden, abs_pos) = prefill_state
+        else:
+            # N4 — `last_real_hidden` is the actual last prompt token's
+            # hidden (no pad), `abs_pos` is the abs position counter.
+            (prev_states, prev_window_hiddens, kv_cache,
+             last_real_hidden, abs_pos) = self._prefill_prompt(
+                prompt_ids, pad_id=pad_id, device=device,
+            )
 
         generated: list[int] = []
         # `logp_old` records logp_pi_old(token) at sampling time, used by
