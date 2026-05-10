@@ -369,6 +369,7 @@ class Phase1Trainer:
         prev_states: Tensor | None = None,
         prev_window_hiddens: Tensor | None = None,
         prev_lm_context: Tensor | None = None,
+        target_mask: Tensor | None = None,
         past_key_values: object | None = None,
         cache_abs_pos: int = 0,
     ) -> dict:
@@ -407,7 +408,7 @@ class Phase1Trainer:
             prev_states=prev_states,
             prev_window_hiddens=prev_window_hiddens,
             prev_lm_context=prev_lm_context,
-            target_mask=None,
+            target_mask=target_mask,
             hard_routing=False,
             use_kv_cache=self.use_kv_cache,
             past_key_values=past_key_values,
@@ -424,7 +425,7 @@ class Phase1Trainer:
 
     @torch.no_grad()
     def eval_wave2(self, batch: TurnPairBatch) -> float:
-        """Forward-only Wave 2 TurnPair; returns response-masked NTP loss."""
+        """Forward-only Wave 2 TurnPair; mirrors the training loss mask."""
         cfg = self.model.cfg
         BS = batch.prior_ids.shape[0]
         device = batch.prior_ids.device
@@ -432,7 +433,9 @@ class Phase1Trainer:
 
         full_ids = torch.cat([batch.prior_ids, batch.response_ids], dim=1)
         full_mask = torch.cat(
-            [torch.zeros_like(batch.prior_mask), batch.response_mask], dim=1,
+            [batch.prior_mask.to(torch.float32) * self.prior_loss_weight,
+             batch.response_mask.to(torch.float32)],
+            dim=1,
         )
         T_full = full_ids.shape[1]
         chunk_len = cfg.D * cfg.T_window
@@ -444,7 +447,7 @@ class Phase1Trainer:
             ], dim=1)
             full_mask = torch.cat([
                 full_mask,
-                torch.zeros((BS, pad_n), dtype=torch.bool, device=device),
+                torch.zeros((BS, pad_n), dtype=torch.float32, device=device),
             ], dim=1)
             T_full = full_ids.shape[1]
         n_chunks = T_full // chunk_len

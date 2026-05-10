@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Callable
 
 
 def exact_match_string(candidate: str, gold: str) -> float:
@@ -115,13 +114,6 @@ def humaneval_check(candidate_code: str, test_code: str, entry_point: str) -> fl
     and resource limits. Wire one before enabling for training.
     """
     return 0.0
-
-
-_REWARD_DISPATCH: dict[str, Callable] = {
-    "exact_match": exact_match_string,
-    "exact_match_or_bert_cosine": narrativeqa_match,
-    "rule_based_exec": humaneval_check,
-}
 
 
 def compute_reward(

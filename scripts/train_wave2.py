@@ -198,6 +198,17 @@ def main():
 
             step = trainer.step_count
             now = time.time()
+
+            import math, sys
+            if not math.isfinite(metrics.loss):
+                print(f"FATAL: non-finite loss ({metrics.loss}) at step "
+                      f"{step}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            if not math.isfinite(metrics.grad_norm):
+                print(f"FATAL: non-finite grad_norm ({metrics.grad_norm}) at "
+                      f"step {step}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+
             history["step"].append(step)
             history["loss"].append(metrics.loss)
             history["grad_norm"].append(metrics.grad_norm)

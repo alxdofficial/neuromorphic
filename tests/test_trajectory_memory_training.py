@@ -21,7 +21,7 @@ from src.trajectory_memory.training.checkpoint import (
     restore_rng_state,
     save_checkpoint,
 )
-from src.trajectory_memory.training.loaders import TurnPairBatch
+from src.trajectory_memory.training.loaders import TurnPairBatch, TurnPairDataset
 from src.trajectory_memory.training.lr_schedule import (
     WarmupCosineScheduler,
     warmup_then_cosine,
@@ -340,6 +340,43 @@ def test_checkpoint_rng_state_round_trip(tmp_path: Path):
     restore_rng_state(snapshot)
     a2 = torch.rand(8)
     assert torch.allclose(a1, a2)
+
+
+def test_checkpoint_rng_restore_accepts_cuda_mapped_tensors():
+    """Loading a checkpoint with map_location='cuda' moves RNG tensors too.
+
+    `restore_rng_state` should normalize CPU/default-generator state back to
+    CPU tensors before calling torch.random.set_rng_state.
+    """
+    torch.manual_seed(123)
+    snapshot = capture_rng_state()
+    if torch.cuda.is_available():
+        snapshot["torch_cpu"] = snapshot["torch_cpu"].cuda()
+        if "torch_cuda" in snapshot:
+            snapshot["torch_cuda"] = [s.cuda() for s in snapshot["torch_cuda"]]
+    restore_rng_state(snapshot)
+
+
+def test_turn_pair_dataset_len_matches_small_dataset_iteration(tmp_path: Path):
+    """Small TurnPair datasets should report the batches they actually yield."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "turn_pairs.parquet"
+    rows = 4
+    pq.write_table(
+        pa.table({
+            "prior_ids": [[1, 2, 3 + i] for i in range(rows)],
+            "response_ids": [[4, 5 + i] for i in range(rows)],
+            "source": ["test"] * rows,
+        }),
+        path,
+    )
+
+    ds = TurnPairDataset([path], batch_size=2, pad_id=0)
+    yielded = list(ds)
+    assert len(ds) == 2
+    assert len(yielded) == len(ds)
 
 
 def test_phase1_trainer_resume_continues_step_count(tmp_path: Path):

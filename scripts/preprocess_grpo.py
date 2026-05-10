@@ -161,7 +161,10 @@ _SOURCES = {
         "extract": _narrativeqa_extract,
     },
     "humaneval": {
-        "id": "openai_humaneval", "config": None, "split": "test",
+        # `openai/openai_humaneval` is the canonical HF id; bare
+        # `openai_humaneval` resolves via legacy alias but the org-prefixed
+        # form is documented and avoids future rename breakage.
+        "id": "openai/openai_humaneval", "config": None, "split": "test",
         "extract": _humaneval_extract,
     },
     "numinamath": {

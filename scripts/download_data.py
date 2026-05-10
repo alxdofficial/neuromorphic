@@ -108,7 +108,9 @@ _DATASETS = {
         "size": "~200MB",
     },
     "humaneval": {
-        "id": "openai_humaneval",
+        # Canonical HF id is `openai/openai_humaneval`; bare alias still
+        # resolves but org-prefixed avoids future rename.
+        "id": "openai/openai_humaneval",
         "config": None,
         "split": "test",                # HumanEval has no train split
         "wave": "w3",

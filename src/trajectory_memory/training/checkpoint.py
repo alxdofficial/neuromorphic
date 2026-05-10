@@ -124,7 +124,10 @@ def restore_rng_state(state: dict) -> None:
     """Restore RNG state from `capture_rng_state()`."""
     import random
     if "torch_cpu" in state:
-        torch.random.set_rng_state(state["torch_cpu"])
+        cpu_state = state["torch_cpu"]
+        if torch.is_tensor(cpu_state):
+            cpu_state = cpu_state.cpu()
+        torch.random.set_rng_state(cpu_state)
     if "python" in state:
         random.setstate(state["python"])
     if "numpy" in state:
@@ -134,4 +137,8 @@ def restore_rng_state(state: dict) -> None:
         except ImportError:
             pass
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        cuda_states = [
+            s.cpu() if torch.is_tensor(s) else s
+            for s in state["torch_cuda"]
+        ]
+        torch.cuda.set_rng_state_all(cuda_states)

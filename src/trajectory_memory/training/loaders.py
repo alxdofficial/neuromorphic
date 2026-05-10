@@ -179,9 +179,11 @@ class TurnPairDataset:
         # per window. We drop incomplete tails on both axes.
         n = len(self._rows)
         bucket = self.bucket_window
-        n_windows = max(n - bucket + 1, 1) // bucket
-        batches_per_window = bucket // self.batch_size
-        return n_windows * batches_per_window
+        total = 0
+        for start in range(0, max(n - bucket + 1, 1), bucket):
+            window_len = min(bucket, max(n - start, 0))
+            total += window_len // self.batch_size
+        return total
 
     def __iter__(self) -> Iterator[TurnPairBatch]:
         rng = random.Random(self.seed + self._epoch)

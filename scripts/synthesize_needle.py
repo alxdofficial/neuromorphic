@@ -73,7 +73,15 @@ def main():
                          "current `datasets`)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--num-docs", type=int, default=1000)
-    ap.add_argument("--streaming", action="store_true", default=True)
+    # Default ON because fineweb-edu is too big to materialize. The earlier
+    # `action="store_true", default=True` made the flag a no-op (stayed
+    # True regardless of whether --streaming was passed). Use the
+    # paired-flag pattern so users can opt out via --no-streaming.
+    ap.add_argument("--streaming", action="store_true",
+                    help="Stream the dataset (default ON). Required for "
+                         "fineweb-edu at full scale.")
+    ap.add_argument("--no-streaming", dest="streaming", action="store_false")
+    ap.set_defaults(streaming=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--distances", nargs="+", type=int,
                     default=[3000, 8000, 16000, 32000],

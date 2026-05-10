@@ -17,7 +17,7 @@ Usage:
             data/wave1/wikipedia_en.parquet \\
             data/wave1/slimpajama_6b.parquet \\
             data/wave1/needle.parquet \\
-        --batch-size 2 --num-steps 1000 \\
+        --batch-size 1 --num-steps 1000 \\
         --checkpoint-out outputs/wave1/ckpt.pt
 """
 
@@ -57,7 +57,7 @@ from src.trajectory_memory.training.loaders import LongDocDataset
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-paths", nargs="+", required=True, type=Path)
-    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--num-steps", type=int, default=1000)
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--lr-memory", type=float, default=3e-4)
@@ -254,11 +254,14 @@ def main():
                     v_past_kv = None
                     v_cache_abs = 0
                 chunk_v = item.input_ids.unsqueeze(0).to(args.device)
+                valid_mask_v = item.valid_mask.unsqueeze(0).to(args.device)
+                target_mask_v = valid_mask_v.view(1, cfg.D, cfg.T_window)
                 ev = trainer.eval_wave1(
                     chunk_v,
                     prev_states=v_prev_states,
                     prev_window_hiddens=v_prev_hiddens,
                     prev_lm_context=v_prev_lm_ctx,
+                    target_mask=target_mask_v,
                     past_key_values=v_past_kv,
                     cache_abs_pos=v_cache_abs,
                 )

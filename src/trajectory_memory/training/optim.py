@@ -66,5 +66,7 @@ def build_optimizer(
     # generally faster than foreach, foreach faster than for-loop.
     # AdamW has stable CUDA fused since 2.x. Negligible overhead if
     # `fused` arg not supported on this device (falls back to foreach).
-    fused = torch.cuda.is_available()
+    fused = torch.cuda.is_available() and any(
+        p.is_cuda for group in groups for p in group["params"]
+    )
     return torch.optim.AdamW(groups, weight_decay=weight_decay, fused=fused)
