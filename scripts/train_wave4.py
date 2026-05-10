@@ -36,7 +36,8 @@ from src.trajectory_memory.training.loaders import TurnPairDataset
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-paths", nargs="+", required=True, type=Path)
-    ap.add_argument("--num-samples", type=int, default=4)
+    ap.add_argument("--num-samples", type=int, default=8,
+                    help="GRPO group size K. Default 8 matches TRL.")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--num-steps", type=int, default=200)
     ap.add_argument("--warmup-steps", type=int, default=20)
@@ -93,6 +94,7 @@ def main():
         kl_coef=args.kl_coef,
     )
 
+    resumed_ref = False
     if args.checkpoint_in:
         if args.warm_start:
             ckpt = load_checkpoint(
@@ -107,15 +109,27 @@ def main():
                 optimizer=optimizer, scheduler=scheduler,
                 map_location=args.device,
             )
-            trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
+            ts = ckpt.get("trainer_state", {"step_count": ckpt.get("step", 0)})
+            trainer.load_state_dict(ts)
+            if trainer.ref_state is not None:
+                resumed_ref = True
             from src.trajectory_memory.training.checkpoint import restore_rng_state
             if "rng_state" in ckpt:
                 restore_rng_state(ckpt["rng_state"])
             print(f"Resumed from {args.checkpoint_in} step {ckpt.get('step')}")
 
     if args.kl_coef > 0:
-        trainer.set_reference_state()
-        print(f"Reference policy snapshot taken (kl_coef={args.kl_coef}).")
+        if not args.checkpoint_in:
+            raise SystemExit(
+                "ERROR: --kl-coef > 0 requires --checkpoint-in. Without it, "
+                "set_reference_state() snapshots random init as π_ref."
+            )
+        if args.warm_start or not resumed_ref:
+            trainer.set_reference_state()
+            print(f"Reference policy snapshot taken (kl_coef={args.kl_coef}).")
+        else:
+            print(f"Reference policy restored from checkpoint "
+                  f"(kl_coef={args.kl_coef}).")
 
     dataset = TurnPairDataset(args.data_paths, batch_size=1, pad_id=tokenizer.pad_token_id)
     print(f"Wave 4 dataset: {len(dataset._rows)} TurnPairs")
@@ -166,6 +180,7 @@ def main():
                     step=step,
                     rng_state=capture_rng_state(),
                     extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+                    trainer_state=trainer.state_dict(),
                 )
 
     if args.checkpoint_out:
@@ -175,6 +190,7 @@ def main():
             step=trainer.step_count,
             rng_state=capture_rng_state(),
             extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+            trainer_state=trainer.state_dict(),
         )
 
 

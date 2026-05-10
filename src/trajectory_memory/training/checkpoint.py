@@ -28,6 +28,7 @@ def save_checkpoint(
     scheduler: Any = None,
     rng_state: dict | None = None,
     extra: dict | None = None,
+    trainer_state: dict | None = None,
 ) -> None:
     """Save a training checkpoint.
 
@@ -54,6 +55,10 @@ def save_checkpoint(
         state["rng_state"] = rng_state
     if extra is not None:
         state["extra"] = extra
+    if trainer_state is not None:
+        # N5 — top-level trainer state slot (currently used by Phase2Trainer
+        # to persist `ref_state` across resume).
+        state["trainer_state"] = trainer_state
     # N10 fix — atomic save: write to .tmp then os.replace. Process kill
     # mid-torch.save() would otherwise corrupt the only checkpoint with
     # nothing to recover from.

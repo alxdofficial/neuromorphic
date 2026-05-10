@@ -144,9 +144,10 @@ def _numinamath_extract(ex):
         f"Problem: {ex['problem']}\n\nSolution:"
     )
     gold = ex["solution"]
-    # Try to extract the final boxed answer
-    match = re.search(r"\\boxed\{([^}]+)\}", gold)
-    gold_boxed = match.group(1) if match else None
+    # B3 fix — brace-balanced extractor for nested-brace answers like
+    # `\boxed{\frac{1}{2}}` (the prior `[^}]+` regex stopped at first `}`).
+    from src.trajectory_memory.training.rewards import extract_last_boxed
+    gold_boxed = extract_last_boxed(gold)
     return prompt, gold, "exact_match", {"gold_boxed": gold_boxed}
 
 

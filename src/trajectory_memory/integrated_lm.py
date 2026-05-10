@@ -182,6 +182,7 @@ class IntegratedLM(nn.Module):
         use_kv_cache: bool = False,
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
+        force_surprise: float | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -379,6 +380,17 @@ class IntegratedLM(nn.Module):
             surprise = self._compute_surprise_window(
                 needed_logits, target_ids, target_mask,
             ).to(prev_states.dtype)
+            # N2 fix — Phase 2 pass-2 must reproduce pass-1's memory
+            # dynamics. Pass 1 wrote response windows with surprise=0 (per
+            # plan §5.4 — generated tokens have no NTP target). If pass 2
+            # writes those same windows with CE-derived surprise, the
+            # writer mutates differently → memory state diverges → the IS
+            # ratio numerator/denominator condition on different states →
+            # PPO surrogate becomes meaningless.
+            # `force_surprise=0.0` overrides the CE-computed surprise for
+            # response windows in pass 2 of GRPO.
+            if force_surprise is not None:
+                surprise = torch.full_like(surprise, force_surprise)
 
             # Slice the final T_window logits for the output (caller may
             # use them for AR sampling in W3/W4 rollouts).

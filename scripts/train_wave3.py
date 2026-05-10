@@ -35,7 +35,11 @@ from src.trajectory_memory.training.loaders import PromptResponseDataset
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-paths", nargs="+", required=True, type=Path)
-    ap.add_argument("--num-samples", type=int, default=4)
+    ap.add_argument("--num-samples", type=int, default=8,
+                    help="GRPO group size K. Default 8 matches TRL's "
+                         "current num_generations default; DeepSeek-R1 "
+                         "used 16. K<8 makes group-relative advantage "
+                         "estimates noisy.")
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--num-steps", type=int, default=200)
     ap.add_argument("--warmup-steps", type=int, default=20)
@@ -103,6 +107,7 @@ def main():
         kl_coef=args.kl_coef,
     )
 
+    resumed_ref = False  # B7/N5 — track whether ckpt restored ref_state
     if args.checkpoint_in:
         if args.warm_start:
             ckpt = load_checkpoint(
@@ -117,17 +122,34 @@ def main():
                 optimizer=optimizer, scheduler=scheduler,
                 map_location=args.device,
             )
-            trainer.load_state_dict({"step_count": ckpt.get("step", 0)})
+            ts = ckpt.get("trainer_state", {"step_count": ckpt.get("step", 0)})
+            trainer.load_state_dict(ts)
+            if trainer.ref_state is not None:
+                resumed_ref = True
             from src.trajectory_memory.training.checkpoint import restore_rng_state
             if "rng_state" in ckpt:
                 restore_rng_state(ckpt["rng_state"])
             print(f"Resumed from {args.checkpoint_in}")
 
-    # Snapshot the loaded weights as π_ref for KL regularization. This is
-    # the post-Phase-1 (= pre-Phase-2) policy by construction.
+    # B7 + N5 fix — snapshot ref policy ONLY on warm-start (or fresh run
+    # with --kl-coef>0 + a checkpoint to load). On full resume, ref_state
+    # comes from the loaded checkpoint via load_state_dict — re-snapshotting
+    # would drift the anchor to the mid-training resumed policy. Hard error
+    # if user enables KL without giving us weights to anchor against.
     if args.kl_coef > 0:
-        trainer.set_reference_state()
-        print(f"Reference policy snapshot taken (kl_coef={args.kl_coef}).")
+        if not args.checkpoint_in:
+            raise SystemExit(
+                "ERROR: --kl-coef > 0 requires --checkpoint-in to define the "
+                "reference policy. Snapshotting random init as π_ref would "
+                "regularize toward noise. Set --kl-coef 0 to disable KL or "
+                "pass --checkpoint-in <Phase 1 checkpoint>."
+            )
+        if args.warm_start or not resumed_ref:
+            trainer.set_reference_state()
+            print(f"Reference policy snapshot taken (kl_coef={args.kl_coef}).")
+        else:
+            print(f"Reference policy restored from checkpoint "
+                  f"(kl_coef={args.kl_coef}).")
 
     dataset = PromptResponseDataset(args.data_paths)
     print(f"Wave 3 dataset: {len(dataset)} prompts")
@@ -175,6 +197,7 @@ def main():
                     step=step,
                     rng_state=capture_rng_state(),
                     extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+                    trainer_state=trainer.state_dict(),
                 )
                 print(f"  saved checkpoint at step {step}")
 
@@ -185,6 +208,7 @@ def main():
             step=trainer.step_count,
             rng_state=capture_rng_state(),
             extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+            trainer_state=trainer.state_dict(),
         )
         print(f"Saved {args.checkpoint_out}")
 

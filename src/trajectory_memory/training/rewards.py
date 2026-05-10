@@ -27,6 +27,35 @@ def exact_match_string(candidate: str, gold: str) -> float:
     return float(candidate.strip().lower() == gold.strip().lower())
 
 
+def extract_last_boxed(text: str) -> str | None:
+    """Extract content of the LAST `\\boxed{...}` from `text`, handling
+    nested braces. Returns None if no `\\boxed` found.
+
+    B3 fix: prior implementation used `re.findall(r'\\\\boxed\\{([^}]+)\\}',...)`
+    which broke on nested braces (e.g. `\\boxed{\\frac{1}{2}}` returned
+    `\\frac{1` instead of `\\frac{1}{2}`). NumniaMath answers commonly
+    include `\\frac{}{}`, `\\sqrt{}`, etc.
+    """
+    target = "\\boxed{"
+    # Find LAST occurrence
+    idx = text.rfind(target)
+    if idx < 0:
+        return None
+    start = idx + len(target)
+    depth = 1
+    i = start
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    return None  # unbalanced
+
+
 def exact_match_gsm8k(candidate: str, gold_number: str) -> float:
     """Extract the final number from `candidate` and compare to gold_number.
 
@@ -108,14 +137,12 @@ def compute_reward(
             return exact_match_gsm8k(candidate, meta["gold_number"])
         if meta and meta.get("gold_boxed") is not None:
             # NuminaMath candidates produce chain-of-thought ending with
-            # `\boxed{ANSWER}`. Extract the LAST `\boxed{...}` from the
-            # candidate, compare to gold_boxed. Earlier code compared the
-            # full candidate string to the bare answer, scoring 0 for any
-            # candidate with reasoning around the box.
-            boxes = re.findall(r"\\boxed\{([^}]+)\}", candidate)
-            if not boxes:
+            # `\boxed{ANSWER}`. B3 fix: use brace-balanced extractor for
+            # nested-brace answers like `\boxed{\frac{1}{2}}`.
+            box = extract_last_boxed(candidate)
+            if box is None:
                 return 0.0
-            return exact_match_string(boxes[-1], meta["gold_boxed"])
+            return exact_match_string(box, meta["gold_boxed"])
         return exact_match_string(candidate, gold or "")
     elif reward_kind == "exact_match_or_bert_cosine":
         all_answers = (meta or {}).get("all_answers", [gold] if gold else [])

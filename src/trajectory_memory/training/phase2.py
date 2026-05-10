@@ -149,10 +149,24 @@ class Phase2Trainer:
         return self._step_count
 
     def state_dict(self) -> dict:
-        return {"step_count": self._step_count}
+        # N5 fix — persist ref_state across resume so the KL anchor doesn't
+        # drift to the resumed policy. Without this, every full resume calls
+        # `set_reference_state()` again and snapshots the resumed (i.e.,
+        # mid-Phase-2-trained) weights as π_ref, defeating the point of KL
+        # regularization.
+        d: dict = {"step_count": self._step_count}
+        if self.ref_state is not None:
+            # Move to CPU for portability of the saved blob.
+            d["ref_state"] = {n: t.detach().cpu() for n, t in self.ref_state.items()}
+        return d
 
     def load_state_dict(self, state: dict) -> None:
         self._step_count = state["step_count"]
+        if "ref_state" in state:
+            # Restore ref_state. The checkpoint blob has CPU tensors;
+            # move them to the model's device.
+            device = next(self.model.parameters()).device
+            self.ref_state = {n: t.to(device) for n, t in state["ref_state"].items()}
 
     def set_reference_state(self) -> None:
         """Snapshot current trainable params as the reference policy π_ref.
@@ -210,9 +224,12 @@ class Phase2Trainer:
             # Test-mode (no real Llama) skips shared prefill.
             ref_prefill = None
             if self.model.llama is not None:
-                ref_prefill = self._prefill_prompt(
+                # _prefill_prompt now returns 5-tuple (N4 fix); we only
+                # need the first 3 elements for prefill_state passing.
+                _ref = self._prefill_prompt(
                     prompt_ids, pad_id=pad_id, device=device,
                 )
+                ref_prefill = _ref[:3]  # (states, hiddens, kv_cache)
 
             import copy
             for sample_ids in sample_ids_list:
@@ -339,10 +356,11 @@ class Phase2Trainer:
         shared_prefill = None
         if self.model.llama is not None:
             with torch.no_grad():
-                shared_prefill = self._prefill_prompt(
+                _sp = self._prefill_prompt(
                     prompt_ids, pad_id=pad_id, device=device,
                 )
-                # shared_prefill = (prev_states, prev_window_hiddens, kv_cache)
+                # _prefill_prompt now returns 5-tuple (N4 fix); use first 3.
+                shared_prefill = _sp[:3]  # (states, hiddens, kv_cache)
 
         # ── PASS 2: TF logp + PPO-clip surrogate + KL to reference ───
         # TF-forward through SAMPLE only (with grad), starting from the
@@ -478,15 +496,35 @@ class Phase2Trainer:
         *,
         pad_id: int,
         device: torch.device,
-    ) -> tuple[Tensor, Tensor | None, object]:
-        """Walk forward_window over the FULL prompt in T_window-sized
-        windows, accumulating manifold state AND populating an HF KV cache.
-        Returns (prev_states, prev_window_hiddens, kv_cache).
+    ) -> tuple[Tensor, Tensor | None, object, Tensor | None, int]:
+        """Walk forward_window over the prompt in T_window-sized windows,
+        accumulating manifold state AND populating an HF KV cache.
+
+        N4 fix — handles prompts whose length is NOT divisible by T_window
+        without putting pad tokens in the KV cache:
+          - Full T-aligned windows: encoded via forward_window (memory ops fire)
+          - Trailing partial window (n_tail < T): encoded via direct
+            llama.model call WITHOUT memory ops AND WITHOUT padding —
+            real tokens only enter the KV cache.
+
+        The trailing tail's last hidden is what AR sampling uses for the
+        FIRST generated token's logit (instead of the prior version's
+        pad-position hidden). Returns the tail's last hidden as
+        `last_real_hidden`; `_ar_sample_one` uses this as the predecessor
+        for the first sampled token.
+
+        Returns (prev_states, prev_window_hiddens, kv_cache,
+                 last_real_hidden, abs_pos).
+            - prev_window_hiddens is the LAST FULL T-window's hiddens (used
+              by the next memory window's read trajectory)
+            - last_real_hidden is the hidden of the actual last prompt
+              token (used by AR for first-token logit)
+            - abs_pos is the absolute position counter after all prompt
+              tokens have been encoded (= n)
 
         Long prompts (NarrativeQA 8K, WildChat 4K+) were previously not
-        being properly written into memory in the old per-token AR loop;
-        prefill makes the entire prompt's content visible to the manifold
-        before generation starts.
+        properly written into memory in the old per-token AR loop;
+        prefill makes the entire prompt's T-aligned portion visible.
 
         no_grad — pure inference setup. Pass 2 redoes a TF forward with
         grad if memory writes need gradient signal.
@@ -502,14 +540,12 @@ class Phase2Trainer:
         prev_states = self.model.manifold.reset_states(batch_size=1)
         prev_window_hiddens: Tensor | None = None
         kv_cache: object | None = None
+        abs_pos = 0
 
-        for win_start in range(0, n, T):
+        # Encode full T-aligned windows via forward_window (memory ops fire).
+        n_aligned = (n // T) * T
+        for win_start in range(0, n_aligned, T):
             win = toks[win_start : win_start + T]
-            if len(win) < T:
-                # Right-pad partial last window — pad positions get
-                # encoded but their hiddens are discarded later (we're
-                # done with this prompt).
-                win = win + [pad_id] * (T - len(win))
             win_t = torch.tensor(win, dtype=torch.int64, device=device).unsqueeze(0)
 
             last_prev_logit = (
@@ -521,17 +557,47 @@ class Phase2Trainer:
                 prev_window_hiddens=prev_window_hiddens,
                 prev_states=prev_states,
                 target_mask=None,
-                hard_routing=True,
+                hard_routing=False,  # N3 — deterministic routing in pass 1
                 past_key_values=kv_cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit,
+                cache_abs_pos=abs_pos,
             )
             prev_states = out["new_states"]
             prev_window_hiddens = out["current_hiddens"]
             kv_cache = out.get("new_past_key_values", kv_cache)
+            abs_pos = out.get("new_cache_abs_pos", abs_pos + T)
             kv_cache = _trim_kv_cache(kv_cache, cap)
 
-        return prev_states, prev_window_hiddens, kv_cache
+        # N4 — encode the trailing partial window (if any) via direct
+        # llama.model call. NO padding, NO memory ops. Just extends the
+        # KV cache with REAL tokens at correct absolute positions.
+        last_real_hidden: Tensor | None = None
+        n_tail = n - n_aligned
+        if n_tail > 0:
+            tail = toks[n_aligned:]
+            tail_t = torch.tensor(tail, dtype=torch.int64, device=device).unsqueeze(0)
+            cache_position = torch.arange(
+                abs_pos, abs_pos + n_tail, device=device,
+            )
+            base_out = self.model.llama.model(
+                input_ids=tail_t,
+                past_key_values=kv_cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            kv_cache = base_out.past_key_values
+            abs_pos += n_tail
+            kv_cache = _trim_kv_cache(kv_cache, cap)
+            # last hidden of the actual last prompt token — used by AR for
+            # the first generated token's logit.
+            last_real_hidden = base_out.last_hidden_state[:, -1:, :]
+        elif prev_window_hiddens is not None:
+            # No tail; last real hidden is the last position of the last
+            # encoded full window.
+            last_real_hidden = prev_window_hiddens[:, -1:, :]
+
+        return prev_states, prev_window_hiddens, kv_cache, last_real_hidden, abs_pos
 
     @torch.no_grad()
     def _ar_sample_one(
@@ -583,7 +649,11 @@ class Phase2Trainer:
         T = cfg.T_window
 
         # Prefill — populates manifold state and KV cache for the prompt.
-        prev_states, prev_window_hiddens, kv_cache = self._prefill_prompt(
+        # N4 fix — `last_real_hidden` is the hidden of the actual last
+        # prompt token (no pad), and `abs_pos` is the absolute position
+        # counter after all prompt tokens have been encoded.
+        (prev_states, prev_window_hiddens, kv_cache,
+         last_real_hidden, abs_pos) = self._prefill_prompt(
             prompt_ids, pad_id=pad_id, device=device,
         )
 
@@ -593,12 +663,14 @@ class Phase2Trainer:
         # — pass 2 recomputes logp_new under autograd.
         logp_old_list: list[Tensor] = []
 
-        # First generated token: predict from the LAST cached hidden
-        # (= prev_window_hiddens[:, -1:, :], the prompt's last position).
-        # prev_window_hiddens was cast to manifold's fp32 dtype inside
-        # forward_window; lm_head expects Llama's native dtype (bf16).
+        # First generated token: predict from `last_real_hidden` (= the
+        # actual last prompt position's hidden, NOT a pad token).
+        # last_real_hidden is in Llama's native dtype (bf16).
         lm_head_dtype = next(self.model.llama.lm_head.parameters()).dtype
-        last_hidden = prev_window_hiddens[:, -1:, :].to(lm_head_dtype)
+        last_hidden = (
+            last_real_hidden if last_real_hidden is not None
+            else prev_window_hiddens[:, -1:, :]
+        ).to(lm_head_dtype)
         first_logit = self.model.llama.lm_head(last_hidden).float()
         scaled = first_logit[:, -1, :] / temperature
         log_probs = F.log_softmax(scaled, dim=-1)
@@ -628,9 +700,24 @@ class Phase2Trainer:
             # one hidden and one new sampled token.
 
             # ── (a, b) READ for this window + install memory_fn ──
+            # N3 fix — deterministic routing (argmax, no Gumbel noise)
+            # in pass 1. Pass 2's TF replay also uses argmax → same
+            # routing path on both sides → IS ratio numerator/denominator
+            # condition on the SAME memory state. Tradeoff: lose Gumbel
+            # exploration of routing during pass 1; routing decisions are
+            # deterministic given the input. Accepted because the
+            # alternative (record + replay) is a much bigger refactor.
+            # Short-prompt edge case: if prompt < T_window, no full
+            # window was encoded so prev_window_hiddens is None. Fall
+            # back to zeros (matches forward_window's first-window logic).
+            if prev_window_hiddens is None:
+                prev_window_hiddens = torch.zeros(
+                    1, T, cfg.d_lm,
+                    dtype=prev_states.dtype, device=device,
+                )
             prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
             read_visited, _ = self.model.read_module(
-                prev_hid_mem, prev_states, self.model.manifold, hard=True,
+                prev_hid_mem, prev_states, self.model.manifold, hard=False,
             )
             mem_inject = self.model._mem_inject_layer()
             mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
@@ -644,11 +731,17 @@ class Phase2Trainer:
                     input_ids = torch.tensor(
                         [[last_token]], dtype=torch.int64, device=device,
                     )
+                    # N1 — pass cache_position for RoPE correctness.
+                    cache_position = torch.tensor(
+                        [abs_pos], dtype=torch.int64, device=device,
+                    )
                     base_out = self.model.llama.model(
                         input_ids=input_ids,
                         past_key_values=kv_cache,
+                        cache_position=cache_position,
                         use_cache=True,
                     )
+                    abs_pos += 1
                     kv_cache = base_out.past_key_values
                     hidden = base_out.last_hidden_state          # [1, 1, d_lm]
                     window_hiddens_list.append(hidden)
@@ -703,9 +796,11 @@ class Phase2Trainer:
                 # Surprise=0 during AR (per plan §5.4 — generated tokens have
                 # no NTP target).
                 surprise = torch.zeros(1, dtype=prev_states.dtype, device=device)
+                # N3 fix — deterministic routing here too (matches pass 2
+                # replay's deterministic routing in the writer).
                 new_states, _, _ = self.model.write_module(
                     cur_hiddens_mem, surprise, prev_states, self.model.manifold,
-                    hard=True,
+                    hard=False,
                 )
                 prev_states = new_states
                 prev_window_hiddens = cur_hiddens_padded
@@ -874,15 +969,33 @@ class Phase2Trainer:
                 prev_window_hiddens[:, -1:, :]
                 if prev_window_hiddens is not None else None
             )
+            # N2 fix — when in shared-prefill mode (sample-only TF replay),
+            # this loop processes RESPONSE windows. Pass 1's `_ar_sample_one`
+            # wrote response windows with `surprise=0` (per plan §5.4 —
+            # generated tokens have no NTP target). Pass 2 must do the
+            # same; otherwise the writer mutates differently than pass 1
+            # did, the memory state diverges, and the IS ratio's numerator/
+            # denominator condition on different states.
+            # N3 fix — also use deterministic routing (`hard_routing=False`
+            # = argmax, no Gumbel noise) in pass 2's sample-window TF
+            # replay. Pass 1 used Gumbel-stochastic routing but didn't
+            # record the routing decisions; if pass 2 resamples with
+            # Gumbel, routing diverges → memory paths diverge. Argmax on
+            # both sides gives a SINGLE consistent routing path that pass
+            # 1 and pass 2 will follow (ignoring the Gumbel sampling
+            # entirely is a tradeoff — we lose stochastic exploration of
+            # routing in exchange for IS-ratio correctness).
+            in_shared_prefill_mode = prefill_state is not None
             out = self.model.forward_window(
                 lm_input_ids=win_t,
                 prev_window_hiddens=prev_window_hiddens,
                 prev_states=prev_states,
                 target_mask=None,
-                hard_routing=True,
+                hard_routing=not in_shared_prefill_mode,
                 past_key_values=kv_cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit,
+                force_surprise=0.0 if in_shared_prefill_mode else None,
             )
             # In KV-cache mode forward_window's `logits` is [1, T, V]
             # aligned to the new window's T positions. logit at index i
