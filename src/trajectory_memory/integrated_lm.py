@@ -426,8 +426,47 @@ class IntegratedLM(nn.Module):
         # deflate logits in service of write strength rather than NTP. The
         # write module sees surprise as a constant signal; its trainable
         # behavior is in mutate_mlp's response, not in shaping surprise.
+        #
+        # Pad-token contamination guard — when target_mask is provided and
+        # any position has weight 0 (pad), replace those positions'
+        # hiddens with the LAST REAL position's hidden before the write
+        # module sees them. The write module pools current_hiddens by
+        # mean (entry MLP) and uses them as cross-attn KV at every hop
+        # (line 170 of write_module.py); pad-position hiddens carry
+        # garbage signal from Llama (they're outputs of forwarding pad
+        # tokens) and would dilute the mean and add noise to attention.
+        # Mirrors what pass 1's _ar_sample_one does for partial-generation
+        # windows. Only kicks in when target_mask is not None AND there's
+        # actually some pad — otherwise no-op.
+        write_hiddens = current_hiddens
+        if target_mask is not None:
+            real = (target_mask > 0)                          # [BS, T_window] bool
+            # Per-batch last-real index (0 if no real token in this row).
+            # `arange * real.long()` ranks positions; argmax picks the
+            # highest-indexed real position. Falls back to 0 (idx 0) for
+            # all-pad rows — guarded below.
+            arange_t = torch.arange(
+                T_window, device=current_hiddens.device,
+            ).unsqueeze(0)
+            last_real_idx = (arange_t * real.long()).argmax(dim=1)  # [BS]
+            last_real_h = current_hiddens.gather(
+                1, last_real_idx.view(BS, 1, 1).expand(BS, 1, cfg.d_lm),
+            )                                                 # [BS, 1, d_lm]
+            write_hiddens = torch.where(
+                real.unsqueeze(-1), current_hiddens,
+                last_real_h.expand_as(current_hiddens),
+            )
+            # Degenerate: row has zero real tokens (full-pad chunk).
+            # Replace its hiddens with zeros to avoid scattering whatever
+            # garbage the lookup happened to hit. Write_module still runs
+            # but its pooling sees a zero signal → write is near-noop.
+            no_real = (real.sum(dim=1) == 0).view(BS, 1, 1)
+            if no_real.any():
+                write_hiddens = torch.where(
+                    no_real, torch.zeros_like(write_hiddens), write_hiddens,
+                )
         new_states, write_visited_ids, _ = self.write_module(
-            current_hiddens, surprise.detach(), prev_states, self.manifold,
+            write_hiddens, surprise.detach(), prev_states, self.manifold,
             hard=hard_routing,
         )
 
