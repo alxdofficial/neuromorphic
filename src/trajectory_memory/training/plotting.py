@@ -49,7 +49,10 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    # 4×3 grid (12 panels) — added per-source train loss + needle-answer-only
+    # val + per-source surprise (Tier 3 follow-up to land actual diagnostics
+    # for the memory-bridging behavior we care about).
+    fig, axes = plt.subplots(4, 3, figsize=(15, 16))
     steps = history.get("step", [])
 
     # ── 1. Train loss ────────────────────────────────────────────────
@@ -62,7 +65,7 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
             avg = _running_mean(history["loss"], window)
             ax.plot(steps, avg, label=f"avg{window}", color="C0")
         ax.legend(loc="upper right", fontsize=8)
-    ax.set_title("Train loss")
+    ax.set_title("Train loss (all sources)")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
@@ -181,6 +184,85 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
         ax.plot(steps[:len(history["vram_peak_gb"])],
                 history["vram_peak_gb"], color="C5")
     ax.set_title("VRAM peak (GB)")
+    ax.set_xlabel("step")
+    ax.grid(alpha=0.3)
+
+    # ── 10. Per-source TRAIN loss (the actual memory-bridging diagnostic) ─
+    # If memory works, the needle source's per-step loss should drop
+    # FASTER than fineweb/wiki/slimpajama (because needle docs require
+    # memory retrieval at the answer position; other sources don't).
+    # Tracking this in train (not just val) gives signal every step
+    # rather than every save.
+    ax = axes[3, 0]
+    by_source = history.get("loss_by_source", {})
+    if by_source:
+        for src in sorted(by_source.keys()):
+            entries = by_source[src]
+            if not entries:
+                continue
+            xs = [e[0] for e in entries]
+            ys = [e[1] for e in entries]
+            # Smooth with a running window for readability.
+            window = max(8, len(ys) // 50) if len(ys) >= 8 else 1
+            smoothed = _running_mean(ys, window)
+            label = src
+            if "needle" in src.lower():
+                label = f"{src} (memory probe)"
+            ax.plot(xs, smoothed,
+                    label=label,
+                    linewidth=2.0 if "needle" in src.lower() else 1.0,
+                    alpha=0.9 if "needle" in src.lower() else 0.7)
+        ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Train loss by source (smoothed)")
+    ax.set_xlabel("step")
+    ax.grid(alpha=0.3)
+
+    # ── 11. Needle-answer-only val loss ──────────────────────────────
+    # Computed in `eval_wave1` from the answer_span tokens only — NOT
+    # the diluted full-doc average (which is dominated by 30K filler
+    # tokens whose loss barely moves regardless of memory). This is
+    # THE metric to track for memory-bridging — should drop sharply
+    # if memory is doing its job, regardless of filler loss trends.
+    ax = axes[3, 1]
+    val_step = history.get("val_step", [])
+    answer_only = history.get("val_answer_loss", {})  # {source: [vals]}
+    if val_step and answer_only:
+        for source, vals in answer_only.items():
+            if not vals:
+                continue
+            ax.plot(val_step[:len(vals)], vals, marker="o", markersize=4,
+                    label=source, linewidth=2.0)
+        ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Val ANSWER-only loss (memory probe)")
+    ax.set_xlabel("step")
+    ax.grid(alpha=0.3)
+
+    # ── 12. Per-source surprise (per-window CE, by source) ───────────
+    # Same idea as panel 10 but for the writer surprise signal: does
+    # surprise (per-window mean CE) drop more on needle than fineweb?
+    # Surprise ≠ loss in the prior_loss_weight=0 W1 case (here they
+    # match) but it's a separate diagnostic that comes from the writer's
+    # input, not the optimizer's loss.
+    ax = axes[3, 2]
+    surprise_by_source = history.get("surprise_by_source", {})
+    if surprise_by_source:
+        for src in sorted(surprise_by_source.keys()):
+            entries = surprise_by_source[src]
+            if not entries:
+                continue
+            xs = [e[0] for e in entries]
+            ys = [e[1] for e in entries]
+            window = max(8, len(ys) // 50) if len(ys) >= 8 else 1
+            smoothed = _running_mean(ys, window)
+            label = src
+            if "needle" in src.lower():
+                label = f"{src} (memory probe)"
+            ax.plot(xs, smoothed,
+                    label=label,
+                    linewidth=2.0 if "needle" in src.lower() else 1.0,
+                    alpha=0.9 if "needle" in src.lower() else 0.7)
+        ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Per-window surprise by source (writer's CE input)")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 

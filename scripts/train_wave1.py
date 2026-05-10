@@ -430,6 +430,22 @@ def main():
                 history["loss_by_source"].setdefault(src_label, []).append(
                     (trainer.step_count, metrics.loss),
                 )
+            # Per-source surprise (writer's CE input). Surprise is computed
+            # per-window inside forward_window; metrics.surprise_history is
+            # [BS, D] when available. Average across windows then attribute
+            # per-slot to the slot's source. Lets us see if the writer's
+            # surprise drops faster on needle docs (memory active) vs
+            # generic LM docs.
+            history.setdefault("surprise_by_source", {})
+            sh = metrics.surprise_history
+            if sh is not None and sh.dim() == 2:
+                # Per-slot mean surprise across the chunk's D windows.
+                slot_means = sh.float().mean(dim=1).tolist()
+                for slot_idx, src_label in enumerate(step_sources):
+                    if slot_idx < len(slot_means):
+                        history["surprise_by_source"].setdefault(
+                            src_label, [],
+                        ).append((trainer.step_count, slot_means[slot_idx]))
 
             # S5 fix — NaN-loss kill switch + grad-spike alert.
             import math, sys
