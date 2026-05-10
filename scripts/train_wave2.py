@@ -140,6 +140,12 @@ def main():
     dataset = TurnPairDataset(
         args.data_paths, batch_size=args.batch_size, pad_id=tokenizer.pad_token_id,
     )
+    # B6 — on resume, advance dataset epoch counter so resumed run gets a
+    # fresh shuffle instead of replaying the head of the deterministic
+    # shuffle order. Same logic as train_wave1.py.
+    if trainer.step_count > 0:
+        dataset._epoch = trainer.step_count
+        print(f"Dataset epoch advanced to {trainer.step_count} for resume")
     print(f"Wave 2 dataset: {len(dataset._rows)} TurnPairs, {len(dataset)} batches/epoch")
 
     val_dataset = None

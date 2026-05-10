@@ -152,6 +152,8 @@ def main():
                   f"(kl_coef={args.kl_coef}).")
 
     dataset = PromptResponseDataset(args.data_paths)
+    if trainer.step_count > 0:
+        dataset._epoch = trainer.step_count  # B6 — fresh shuffle on resume
     print(f"Wave 3 dataset: {len(dataset)} prompts")
 
     rewards_history: list = []

@@ -70,20 +70,24 @@ Cold-start compile cost ~1-3 min per BS; reuses across iters within a run.
   GB; BS=4 compile uses 22.2 GB (compile keeps a few extra graph buffers
   resident).
 
-### Recommended production setting
+### Recommended production setting (UPDATED 2026-05-10)
 
-**`--config-tier medium --batch-size 2 --compile`** (compile flag is now
-wired into `train_wave1.py` / `train_wave2.py`):
+This subsection was for the pre-KV-cache era. Current production
+defaults (post-KV-cache + post-grad-checkpointing-removal):
 
-- 9.1k tok/s — peak throughput (tied with BS=1 + compile)
-- 10.5 GB peak — leaves 14 GB headroom for variable-length W2 batches,
-  optimizer state growth, occasional long needle docs
-- Pays the ~2 min compile cold-start once; amortized over hours-long
-  training runs
+- **`train_wave1.py`** asserts BS=1 (state-threading limitation). KV
+  cache + compile both default ON. Real-world tok/s in BS=1 + state-
+  threaded mode TBD (smoke shows ~5k tok/s steady-state).
+- **`train_wave2.py`** runs `--batch-size 2` (TurnPair length-bucketed).
+  KV cache + compile both default ON. `--prior-loss-weight 0.1`
+  default (B12 fix).
+- Use `--no-compile` for debug iteration (skip ~2 min cold-start).
+- Use `--no-kv-cache` only for the rolling-buffer fallback path
+  (slower but useful for reproducing legacy bench numbers).
 
-Alternative: **`--config-tier medium --batch-size 4`** (eager, no compile)
-— 8.6k tok/s at 21.5 GB. 6% slower but no compile cold-start, useful for
-debug iteration where startup time matters more than steady-state speed.
+NOTE: do NOT enable `gradient_checkpointing_enable()` while KV cache
+is on — HF silently sets `use_cache=False` and discards
+`past_key_values`. Verified empirically. They're mutually exclusive.
 
 ### Caveats
 

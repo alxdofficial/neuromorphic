@@ -132,6 +132,8 @@ def main():
                   f"(kl_coef={args.kl_coef}).")
 
     dataset = TurnPairDataset(args.data_paths, batch_size=1, pad_id=tokenizer.pad_token_id)
+    if trainer.step_count > 0:
+        dataset._epoch = trainer.step_count  # B6 — fresh shuffle on resume
     print(f"Wave 4 dataset: {len(dataset._rows)} TurnPairs")
 
     rewards_history: list = []

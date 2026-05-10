@@ -451,10 +451,26 @@ at every prediction step. The LM only ever sees its 2K sliding window
 plus the read trajectories. Cross-window dependencies must route
 through the manifold.
 
-**Implementation: hard truncation.** At each window's prediction step,
-the LM input is `tokens[max(0, end-2048):end]`. Some redundancy in
-re-encoding the prefix per window, but simplest. Sliding KV cache (more
-efficient, more bookkeeping) is a v2 optimization.
+**Implementation: sliding KV cache (LANDED 2026-05-10).** Each window's
+forward only encodes the new T_window tokens against an HF DynamicCache
+that carries prior windows' KVs. Sliding-window-trimmed at
+`effective_lm_context = 2048` tokens. Cache carries across windows of
+a chunk; detached (but kept) at chunk boundaries.
+
+CRITICAL implementation detail — `cache_position` must be CACHE-INTERNAL
+indices (0..target_length-1) for HF's causal mask to be correct, BUT
+`position_ids` must be ABSOLUTE positions for RoPE to be consistent
+with cached KVs (which baked in their original-position rotations).
+Both are passed to `llama.model()` separately.
+
+ALSO CRITICAL — gradient checkpointing is INCOMPATIBLE with use_cache=True
+in HF Llama (silently sets use_cache=False). We pick KV cache (1.79× /
+~5 GB win) over gradient checkpointing for our BS=1/2 use case. Don't
+re-enable gradient_checkpointing_enable() unless you switch to
+`--no-kv-cache` for a particular run.
+
+The earlier hard-truncation rolling-buffer mode is preserved as the
+`--no-kv-cache` fallback.
 
 The 2K cap is the load-bearing knob: smaller cap → stronger memory
 pressure but harder convergence; larger cap → direct attention solves
@@ -503,29 +519,36 @@ For v1 use linear-in-D at D=4 or 8 — see if it fits. If OOM, bump to
 constant-in-D *before* reducing D. Depth is the load-bearing parameter
 for memory learning; sacrificing it is the last resort.
 
-### 4.4 Hyperparameters (starting values)
+### 4.4 Hyperparameters (current `medium` config)
 
-| Knob                  | Start           | Notes                            |
+Updated 2026-05-09 to match `TrajMemConfig.medium()` in code (the
+2026-05-09 N=2048→4096 / K=32→64 bump landed for richer manifold
+capacity at trivial perf cost):
+
+| Knob                  | Value           | Notes                            |
 |-----------------------|-----------------|----------------------------------|
 | `T_window`            | 256             | Window size in tokens            |
-| `N`                   | 2048            | Manifold size                    |
+| `N`                   | **4096**        | Manifold size (post-bump)        |
 | `D_concept`           | 256             | Concept id + state dim (single)  |
-| `K_max_neighbors`     | 32              | Sparse degree (matches graph_walker scale) |
+| `K_max_neighbors`     | **64**          | Sparse degree (post-bump)        |
 | `p_rewire`            | 0.5             | Watts-Strogatz rewire probability |
-| `radius`              | 16              | 1D-ring local zone half-width (must be ≥ K_max/2) |
+| `radius`              | **32**          | 1D-ring local zone half-width (≥ K_max/2) |
 | `J`                   | 4               | Parallel trajectories per window |
 | `K_read`              | 8               | Length of each read trajectory   |
 | `K_write`             | 8               | Length of each write trajectory  |
 | `D` (TBPTT depth)     | 4               | Windows of cross-window grad     |
 | Llama base            | Llama-3.2-1B    | Frozen backbone                  |
 | Inject layer L        | 8 (mid-stack)   | Where MemInjectLayer goes        |
+| `bridge_hidden`       | 2048            | MemInjectLayer 2-layer MLP hidden dim |
 | `D_lm`                | 2048 (Llama)    | Llama hidden dim                 |
-| Effective LM context  | 2048            | Hard-truncated sliding window    |
+| Effective LM context  | 2048            | Sliding KV cache cap (was hard-trunc; now KV-cached) |
 | LR (memory params)    | 3e-4            | Read+write modules + manifold    |
 | LR (Llama-side adapters) | 1e-4         | W_in, W_out, scale, cross-attn   |
 | Mutation init scale   | 0.1             | `new = state + 0.1 · MLP(...)`   |
-| Surprise pool         | mean            | Per-token CE → window scalar     |
+| Surprise pool         | weighted mean   | Per-token weighted CE → window scalar (writer input) |
 | `state_init`          | learnable `[N, D_concept]` | Reset target each sequence |
+| Trainable params      | **16.46M**      | bridge 9.44M + write 2.49M + read 2.43M + manifold 2.10M |
+| `prior_loss_weight` (W2) | **0.1**      | NTP CE weight on prior tokens (B12). Was 0; matches §4.8 surprise table. |
 
 K scales with N if you sweep manifold size: rough rule `K ≈ √N / 4`. J
 is multi-head — independent of N.
@@ -796,13 +819,26 @@ GRPO regularization (matches DeepSeek-R1, TRL, verl, OpenRLHF):
   K3 estimator: `KL ≈ exp(log r) - log r - 1`. Param-swap pattern
   shares the ref forward across K samples (one swap-cycle per step).
 
-Trajectory module's discrete routing (Gumbel-top-1 STE) gets gradient
-via straight-through estimator — backward through soft probabilities
-flows into the routing modules. The plan originally also wanted explicit
-`log P(routing_decision) × advantage` REINFORCE terms, but Gumbel-STE
-is sufficient as a first iteration; deferred as future work (would need
-a "replay mode" for read/write modules so pass 2 can recompute logp at
-the *same* routing path that pass 1 sampled).
+**Phase 2 routing is currently FROZEN — known limitation.** The IS-ratio
+correctness fix (N3) switched both pass-1 and pass-2 to `hard_routing=False`
+(deterministic argmax, no Gumbel noise) so the same routing path fires
+on both sides → IS ratio is meaningful. But `argmax + one_hot` has no
+gradient path back to logits → `entry_mlp`, `step_mlp`, `head_query`
+in the read/write modules receive ZERO gradient in Phase 2.
+
+Effect: Phase 2 GRPO refines `mutate_mlp` (writer's content output),
+`read_attn` (Llama bridge cross-attn), W_in/W_out/scale (MemInjectLayer
+adapter), and concept_states/concept_ids (via gradient through the
+attention chain) — but routing decisions are LOCKED at Phase-1-end
+values. Acceptable for first GRPO runs since Phase 1 trains routing
+via Gumbel-STE; bigger Phase 2 refinements would benefit from also
+training routing.
+
+Proper fix (deferred): record routing IDs/seeds in pass 1, force them
+in pass 2 (`hard=True` with shared Gumbel state) so both passes follow
+the same path AND gradient flows via STE. Real refactor — affects
+read/write module forward signatures and per-window seed plumbing
+through generation windows.
 
 Diagnostics surfaced in `Phase2Metrics`:
 - `clip_fraction`: % of tokens where ratio was clipped this step
@@ -1200,18 +1236,49 @@ architecture's intended capability — long-range retrieval and use.
 
 **Memory utilization metrics (training-side telemetry, continuous):**
 
-These don't measure capability directly but flag training pathologies
-early:
+WIRED as of 2026-05-10 (see `train_wave1.py` history dict + plotting.py
+9-panel PNG). Per-step:
 
-- Concept state norm distribution — drift / collapse detection.
-- Trajectory diversity — cosine similarity matrix between the J
-  trajectories per window. Collapse to identical paths is a failure mode.
-- scatter_mean collision rate — J trajectories agreeing on same concept
-  = potential redundancy or genuine consensus.
-- Read trajectory entropy — uniform distribution = uninformative
-  retrieval, peaked = useful.
-- Manifold capacity proxy — variance of `concept_states` across N. All
-  concepts converging to the center is a failure mode.
+- **`loss`** — train NTP CE (token-weighted average across chunk; N6 fix).
+- **`grad_norm` (overall and by component)** — `bridge_in_llama`,
+  `read`, `write`, `manifold`, `llama_other`. The pre-Phase-D
+  writer-zero-grad bug would have shown as flat `grad_norm_write`.
+- **`inject_snr` = ‖scale·W_out(readout)‖ / ‖hidden‖** — memory-module
+  contribution diagnostic. Read from MemInjectLayer's `_last_inj_norm`
+  / `_last_hidden_norm` buffers. Plot panel 3. Flat at zero = memory
+  silently collapsed (scale → 0).
+- **`read_unique_frac`, `write_unique_frac`, `read_self_overlap`,
+  `write_self_overlap`** — per-step trajectory diversity (computed
+  from `read_visited`/`write_visited` IDs across windows). Collapse
+  to identical paths is a failure mode.
+- **`surprise_mean / surprise_std`** — per-window NTP CE distribution
+  (writer's input). Flat or rising = memory not learning to predict.
+- **`tok_per_sec`** — throughput (regression detector).
+- **`vram_peak_gb`** — memory creep detector.
+- **LR per param group** — schedule sanity check.
+
+Per-save-step (validation):
+- **Per-source val loss** — needle val plotted distinctly as the
+  memory-bridging probe. Other sources (FineWeb, Wikipedia, SlimPajama)
+  side-by-side. State THREADS across val chunks of the same doc (N9
+  fix) so the needle val actually measures cross-chunk memory ability.
+
+Per-step alerts:
+- **NaN-loss kill switch** — `assert math.isfinite(loss)` →
+  `sys.exit(1)`. Same for `grad_norm`.
+- **Grad-spike alert** — warn if grad_norm > 5× rolling-100 median.
+
+Phase 2 specific (`Phase2Metrics`):
+- **`clip_fraction`** — % of tokens where IS ratio was clipped (PPO).
+- **`mean_ratio`** — mean(ratio); should stay ~1 if policy isn't drifting.
+- **`kl_to_ref`** — K3 estimator of KL(π_θ ‖ π_ref).
+(currently logged to stdout only — full plot wiring is a known gap.)
+
+Not yet wired (potential future work):
+- Cumulative dead-concept tracking (concepts never visited).
+- Routing entropy (per-hop softmax distribution).
+- scatter_mean cross-trajectory collision rate.
+- Per-window surprise within chunk (D-axis structure currently aggregated).
 
 **Cadence summary:**
 

@@ -430,6 +430,7 @@ class Phase1Trainer:
         prev_window_hiddens: Tensor | None = None
         prev_lm_context: Tensor | None = None
         past_kv: object | None = None
+        cache_abs_pos = 0  # N1 — RoPE positions thread across chunks too
         total = torch.zeros((), device=device)
         for c in range(n_chunks):
             ids = full_ids[:, c * chunk_len : (c + 1) * chunk_len]
@@ -443,12 +444,14 @@ class Phase1Trainer:
                 hard_routing=False,  # eval: deterministic routing
                 use_kv_cache=self.use_kv_cache,  # match training to keep compile cache hot
                 past_key_values=past_kv,
+                cache_abs_pos=cache_abs_pos,
             )
             total = total + out["aggregate_loss"]
             prev_states = out["final_states"]
             prev_window_hiddens = out["final_hiddens"]
             prev_lm_context = out["final_lm_context"]
             past_kv = out.get("final_past_key_values", None)
+            cache_abs_pos = int(out.get("final_cache_abs_pos", cache_abs_pos))
         return float(total.detach())
 
     # ── helpers ───────────────────────────────────────────────────────

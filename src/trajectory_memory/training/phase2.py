@@ -830,37 +830,64 @@ class Phase2Trainer:
             # ── (d) WRITE at end of window ──
             cur_hiddens = torch.cat(window_hiddens_list, dim=1)  # [1, n_win, d_lm]
             n_win = cur_hiddens.shape[1]
-            # Audit fix (Phase A2): partial windows pad with zero hiddens
-            # which would scatter_mean *zero* into selected concept slots
-            # (polluting them on every short completion). Two safeguards:
-            #   1. If the window is mostly zeros (n_win < T/2), skip the
-            #      write entirely. Sparse short writes wouldn't carry
-            #      meaningful signal anyway.
-            #   2. Otherwise, build prev_window_hiddens by repeating the
-            #      LAST real hidden over the pad positions (instead of
-            #      zeros) so subsequent reads aren't fed garbage.
+            # Audit fix #3 (post-Day-3) — pass 1 must use the SAME padding
+            # strategy as pass 2's TF replay so memory state evolves
+            # identically across passes (otherwise IS ratio is wrong on
+            # the last partial window). Pass 2's TF replay encodes the
+            # tail as `pad_id` tokens through Llama, getting Llama's
+            # actual hidden representation for pad. Pass 1 here mimics
+            # that by feeding pad_id tokens to llama.model() to get the
+            # same pad-position hiddens.
+            #
+            # Audit fix (Phase A2) preserved — if window is mostly empty
+            # (n_win < T/2), still skip the write entirely; sparse short
+            # writes wouldn't carry useful signal anyway.
             if n_win < T // 2:
-                # Skip write — too few real tokens to carry useful signal.
-                # Just propagate previous state forward unchanged. Carry
-                # the real hiddens (no pad) as prev_window_hiddens so the
-                # NEXT window's read isn't conditioned on zero pad.
                 pad = cur_hiddens[:, -1:, :].expand(1, T - n_win, cfg.d_lm)
                 prev_window_hiddens = torch.cat([cur_hiddens, pad], dim=1)
             else:
-                # Pad by repeating the last real hidden (not zeros) so the
-                # write module sees coherent content rather than zeros.
                 if n_win < T:
-                    pad = cur_hiddens[:, -1:, :].expand(1, T - n_win, cfg.d_lm)
-                    cur_hiddens_padded = torch.cat([cur_hiddens, pad], dim=1)
+                    # Forward T - n_win pad_id tokens through Llama to get
+                    # their hiddens — mirrors what pass 2 does when its
+                    # last sample window is also partial.
+                    n_pad = T - n_win
+                    pad_t = torch.full(
+                        (1, n_pad), pad_id,
+                        dtype=torch.int64, device=device,
+                    )
+                    pad_cache_position = torch.arange(
+                        kv_cache.get_seq_length() if kv_cache is not None else 0,
+                        (kv_cache.get_seq_length() if kv_cache is not None else 0) + n_pad,
+                        device=device,
+                    )
+                    pad_position_ids = torch.arange(
+                        abs_pos, abs_pos + n_pad, device=device,
+                    ).unsqueeze(0)
+                    # Memory_fn from this window is still installed; the
+                    # pad encoding will use it (consistent with pass 2).
+                    pad_out = self.model.llama.model(
+                        input_ids=pad_t,
+                        past_key_values=kv_cache,
+                        cache_position=pad_cache_position,
+                        position_ids=pad_position_ids,
+                        use_cache=True,
+                    )
+                    kv_cache = pad_out.past_key_values
+                    abs_pos += n_pad
+                    pad_hiddens = pad_out.last_hidden_state
+                    cur_hiddens_padded = torch.cat([cur_hiddens, pad_hiddens], dim=1)
                 else:
                     cur_hiddens_padded = cur_hiddens
 
                 cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
-                # Surprise=0 during AR (per plan §5.4 — generated tokens have
-                # no NTP target).
                 surprise = torch.zeros(1, dtype=prev_states.dtype, device=device)
-                # N3 fix — deterministic routing here too (matches pass 2
-                # replay's deterministic routing in the writer).
+                # N3 — deterministic argmax routing in pass 1. Honest note:
+                # this means routing modules' weights (entry_mlp, step_mlp,
+                # head_query) are FROZEN in Phase 2 (no gradient through
+                # argmax). Refining them under GRPO would require recording
+                # routing IDs in pass 1 and forcing them in pass 2 — real
+                # refactor, deferred. Phase 2 trains writer mutate_mlp +
+                # bridge + cross-attn; routing is locked at Phase-1-end values.
                 new_states, _, _ = self.model.write_module(
                     cur_hiddens_mem, surprise, prev_states, self.model.manifold,
                     hard=False,
