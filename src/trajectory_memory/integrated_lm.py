@@ -440,10 +440,20 @@ class IntegratedLM(nn.Module):
             "surprise": surprise,
         }
         if self.llama is not None:
-            # N6 — surface raw sum + count per window so run_chunk can
-            # aggregate token-weighted across the chunk. Test mode skips
-            # this (synthetic logits don't compute real CE).
-            out["surprise_sum"] = surprise_sum.detach()
+            # N6 — surface raw weighted sum + count per window so run_chunk
+            # can aggregate token-weighted across the chunk.
+            #
+            # CRITICAL: `surprise_weighted_sum` MUST keep its autograd graph
+            # — it carries the float-mask weights (e.g. prior_loss_weight=0.1)
+            # baked into the scalar. The earlier code surfaced a DETACHED
+            # `surprise_sum` and tbptt.run_chunk reconstructed
+            # `surprise_mean * count` to recover grad. That reconstruction
+            # equals `weighted_sum * count / weight_sum`, which silently
+            # cancels float-mask weights when weight_sum != count (i.e.,
+            # whenever any non-1.0 weight is in play). Verified numerically:
+            # mask=[0.1,0.1,1,1] CE=[1,1,1,1] gave 4.0 instead of 2.2.
+            # `surprise_count` stays detached — it's just an integer divisor.
+            out["surprise_weighted_sum"] = surprise_sum
             out["surprise_count"] = surprise_count.detach()
         if use_kv_cache and self.llama is not None:
             out["new_past_key_values"] = new_past_key_values

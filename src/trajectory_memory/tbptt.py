@@ -255,12 +255,14 @@ def run_chunk(
         # N6 — accumulate token-weighted sum + count if real Llama
         # (forward_window surfaces them); else fall back to per-window
         # mean (test mode).
-        if "surprise_sum" in out and "surprise_count" in out:
-            # Note: out["surprise_sum"] is detached (per integrated_lm.py).
-            # We need the WITH-GRAD version for backward. Recompute
-            # mean*count from the non-detached surprise:
+        if "surprise_weighted_sum" in out and "surprise_count" in out:
+            # `surprise_weighted_sum` HAS grad and HAS the float-mask
+            # weights baked in (e.g. prior_loss_weight=0.1). Use it
+            # directly as the with-grad CE sum. The earlier reconstruction
+            # `surprise * count` divided out the mask weights — broke
+            # prior_loss_weight entirely.
             cnt = out["surprise_count"]
-            ce_sum_with_grad = out["surprise"] * cnt   # surprise has grad
+            ce_sum_with_grad = out["surprise_weighted_sum"]
             if chunk_ce_sum is None:
                 chunk_ce_sum = ce_sum_with_grad.sum()  # sum across BS
                 chunk_ce_count = cnt.sum()
@@ -291,6 +293,13 @@ def run_chunk(
         "final_lm_context": lm_buffer,
         "surprise_history": surprise_history,
     }
+    # Surface chunk-level weighted CE sum (with grad) + valid token count
+    # (detached) so callers spanning multiple chunks (Phase 1 step_wave2)
+    # can aggregate token-weighted across chunks rather than chunk-equal.
+    # chunk_ce_sum is None in test-mode fallback.
+    if chunk_ce_sum is not None:
+        result["chunk_ce_sum"] = chunk_ce_sum
+        result["chunk_ce_count"] = chunk_ce_count
     if use_kv_cache:
         result["final_past_key_values"] = cache
         result["final_cache_abs_pos"] = abs_pos

@@ -365,7 +365,12 @@ class Phase2Trainer:
         rewards = [
             compute_reward(reward_kind, c, gold=gold, meta=meta) for c in decoded
         ]
-        rewards_t = torch.tensor(rewards, dtype=torch.float32)
+        # Build advantages directly on the training device. Earlier code
+        # built on CPU and relied on PyTorch's 0-dim CPU↔CUDA broadcast
+        # to multiply with `ratio` later. That works on modern PyTorch but
+        # is fragile (changes with version, breaks on non-zero-dim ops)
+        # and silently slow if it ever falls back to host sync.
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
         advantages = compute_grpo_advantages(rewards_t)
 
         # ── PASS 2 SHARED PREFILL (Phase D1, no_grad) ─────────────────
@@ -1061,10 +1066,34 @@ class Phase2Trainer:
                 win = win + [pad_id] * (T - n_real)
             win_t = torch.tensor(win, dtype=torch.int64, device=device).unsqueeze(0)
 
-            last_prev_logit = (
-                prev_window_hiddens[:, -1:, :]
-                if prev_window_hiddens is not None else None
-            )
+            # Predecessor for position win_start (used to compute the
+            # first-token logit of this window). Default: last position of
+            # the previous window's hiddens.
+            #
+            # CRITICAL — for the first sample window in shared-prefill
+            # mode (win_start == 0 AND prefill_state is not None AND
+            # last_real_hidden is provided), the predecessor MUST be
+            # `last_real_hidden` (the actual final-prompt-token's hidden,
+            # which may have come from a partial trailing window in
+            # _prefill_prompt). pass 1's `_ar_sample_one` samples the
+            # first generated token from `last_real_hidden`; if pass 2
+            # uses `prev_window_hiddens[-1:]` instead (the last position
+            # of the last FULL T-window), it conditions on a different
+            # state. The IS-ratio numerator/denominator then compute logp
+            # for the same action under different states — meaningless
+            # surrogate. Only an issue when prompt length is not a
+            # multiple of T_window.
+            if (
+                win_start == 0
+                and prefill_state is not None
+                and last_real_hidden is not None
+            ):
+                last_prev_logit = last_real_hidden
+            else:
+                last_prev_logit = (
+                    prev_window_hiddens[:, -1:, :]
+                    if prev_window_hiddens is not None else None
+                )
             # N2 fix — when in shared-prefill mode (sample-only TF replay),
             # this loop processes RESPONSE windows. Pass 1's `_ar_sample_one`
             # wrote response windows with `surprise=0` (per plan §5.4 —

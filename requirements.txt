@@ -5,7 +5,11 @@
 torch>=2.0.0
 
 # HuggingFace libraries
-transformers>=4.35.0
+# transformers >=5.0 required for the modern DynamicCache API
+# (cache.layers[i].keys/.values/.is_initialized/.get_seq_length()) used
+# by src/trajectory_memory/tbptt.py:_trim_kv_cache + _detach_kv_cache.
+# Older 4.x cache was tuple/list-shaped — incompatible.
+transformers>=5.0.0
 datasets>=2.14.0
 tokenizers>=0.15.0
 

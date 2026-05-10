@@ -281,6 +281,25 @@ class Phase1Trainer:
         # The earlier "single total_loss.backward()" pattern OOMd at BS=1
         # on long WildChat priors (10K+ tokens / 10+ chunks of activations
         # held alive simultaneously).
+        #
+        # Token-weighted cross-chunk normalization: pre-compute the total
+        # valid token count from full_mask (cheap, no forward needed). Per
+        # chunk, backward `chunk_ce_sum / total_valid_count` — equivalent
+        # to summing per-chunk weighted CE then dividing by total count
+        # (proper token-weighted overall mean). The earlier `chunk_loss
+        # / n_chunks` was chunk-equal weighted: a chunk with 1 valid
+        # token contributed the same gradient as a chunk with 1024 valid
+        # tokens. Bad for Wave 2 where response often concentrates in
+        # a few chunks while priors span many.
+        total_valid_count = float((full_mask > 0).sum().item())
+        # Guard: degenerate batch with zero valid tokens → no learning,
+        # return early with zero loss to avoid div-by-zero.
+        if total_valid_count == 0:
+            self._step_count += 1
+            return Phase1Metrics(
+                loss=0.0, grad_norm=0.0, lr=self._current_lrs(),
+                surprise_history=None,
+            )
         total_loss_value = 0.0
         all_surprise: list[Tensor] = []
 
@@ -301,12 +320,16 @@ class Phase1Trainer:
                 past_key_values=past_kv,
                 cache_abs_pos=cache_abs_pos,
             )
-            # B5 fix — normalize chunk_loss by n_chunks before backward so
-            # the effective LR doesn't scale with chunk count. Otherwise
-            # WildChat priors of 10+ chunks get 10× the effective grad
-            # vs 1-chunk samples, and grad_clip=1.0 clips them more
-            # aggressively.
-            chunk_loss = out["aggregate_loss"] / n_chunks
+            # Token-weighted cross-chunk aggregation: scale by 1/total_count
+            # so summing across chunks gives sum(weighted_CE) / total_count.
+            # chunk_ce_sum is the with-grad weighted-CE sum across windows
+            # in this chunk (carries float-mask weights baked in).
+            if "chunk_ce_sum" in out:
+                chunk_loss = out["chunk_ce_sum"] / total_valid_count
+            else:
+                # Test-mode fallback — no chunk_ce_sum surfaced; revert to
+                # the previous chunk-equal pattern.
+                chunk_loss = out["aggregate_loss"] / n_chunks
             # Per-chunk backward — accumulates grad into optimizer's
             # buffers, releases this chunk's activations before the next
             # chunk allocates its own.
@@ -431,7 +454,14 @@ class Phase1Trainer:
         prev_lm_context: Tensor | None = None
         past_kv: object | None = None
         cache_abs_pos = 0  # N1 — RoPE positions thread across chunks too
-        total = torch.zeros((), device=device)
+        # Token-weighted cross-chunk aggregation (mirrors step_wave2):
+        # accumulate sum + count separately, divide once at end. The
+        # earlier `total = sum(aggregate_loss)` was chunk-equal-weighted,
+        # so a 1024-valid-token chunk contributed the same as a
+        # 1-valid-token chunk → val_loss became hard to interpret across
+        # examples of varying length.
+        total_ce_sum = torch.zeros((), device=device)
+        total_count = 0.0
         for c in range(n_chunks):
             ids = full_ids[:, c * chunk_len : (c + 1) * chunk_len]
             mask = full_mask[:, c * chunk_len : (c + 1) * chunk_len]
@@ -446,13 +476,21 @@ class Phase1Trainer:
                 past_key_values=past_kv,
                 cache_abs_pos=cache_abs_pos,
             )
-            total = total + out["aggregate_loss"]
+            if "chunk_ce_sum" in out:
+                total_ce_sum = total_ce_sum + out["chunk_ce_sum"].detach()
+                total_count += float(out["chunk_ce_count"].sum().item())
+            else:
+                # Test-mode fallback.
+                total_ce_sum = total_ce_sum + out["aggregate_loss"].detach()
+                total_count += 1.0
             prev_states = out["final_states"]
             prev_window_hiddens = out["final_hiddens"]
             prev_lm_context = out["final_lm_context"]
             past_kv = out.get("final_past_key_values", None)
             cache_abs_pos = int(out.get("final_cache_abs_pos", cache_abs_pos))
-        return float(total.detach())
+        if total_count == 0:
+            return 0.0
+        return float(total_ce_sum / max(total_count, 1.0))
 
     # ── helpers ───────────────────────────────────────────────────────
 
