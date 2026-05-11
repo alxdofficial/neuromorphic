@@ -685,11 +685,14 @@ prior to 0). Prior tokens get TF-forwarded but contribute zero NTP loss.
 
 Replaces graph_walker's W2 (was UltraChat).
 
-#### Wave 3 — Phase 2 (GRPO) — Verifiable-reward reasoning
+#### Wave 3 — Phase 2 (GRPO) — Long-context QA / memory training
 
-Goal: AR rollouts + verifiable rewards to refine reasoning. Same
-structure as graph_walker's W3 but with memory in the loop and a
-different dataset shape.
+Goal: AR rollouts + verifiable rewards to refine the memory module's
+long-range retrieval and write/read routing. Same structure as
+graph_walker's W3 but with memory in the loop and a memory-stress
+dataset shape. **Strategy A** (default, decided 2026-05-11) excludes
+reasoning datasets from the train mix — see rationale below and §4.7
+for the cold-start-SFT alternative.
 
 **Strategy A (default, decided 2026-05-11): memory-only training mix.**
 
@@ -770,9 +773,13 @@ directly. Drop-in substitution of the trajectory module for graph_walker.
 - W1 changes from generic FineWeb to a targeted long-doc mix. Biggest
   change, driven by our memory-specific training pressure.
 - W2 changes from UltraChat to filtered-long-chat + AgentInstruct.
-- W3 keeps the verifiable-reward GRPO structure but uses real reasoning
-  datasets (GSM8K, NuminaMath, HumanEval) instead of synthetic 2-turn
-  passphrase. Adds NarrativeQA for memory stress.
+- W3 keeps the verifiable-reward GRPO structure but is now **memory-only**
+  (Strategy A, 2026-05-11): NarrativeQA + MuSiQue + HotpotQA-padded +
+  2WikiMultiHopQA-padded + QuALITY. ~37K prompts at 91.5% >2K context.
+  GSM8K / NuminaMath / HumanEval are held out as zero-shot capability
+  evals — Llama-3.2-1B-base can't reason without a CoT cold-start SFT
+  phase, and including reasoning under GRPO would confound the memory
+  research story.
 - W4 retains the WildChat-TurnPair structure unchanged.
 
 #### Cross-cutting
@@ -965,8 +972,15 @@ memory cut the gradient chain to write_module. Replaced with the
    write_module. Per-sample-token logp recomputed under current policy
    (= `logp_new`).
 
-3. **Score the rollout** (verifiable for Wave 3, exact-match + BERT
-   cosine for Wave 4).
+3. **Score the rollout** via reward function dispatched by `reward_kind`
+   stored per example:
+   - `exact_match` (gsm8k, numinamath — held out from training, eval only)
+   - `exact_match_or_bert_cosine` (narrativeqa, multi-gold)
+   - `f1_qa` (musique, hotpotqa, 2wikimultihop — token-overlap F1 with
+     SQuAD-style normalization; supports best-of-aliases)
+   - `mc_letter` (quality — parse first A/B/C/D letter from candidate)
+   - `rule_based_exec` (humaneval — DISABLED in v1, needs sandbox)
+   See `src/trajectory_memory/training/rewards.py`.
 
 4. **PPO-clipped GRPO loss + KL regularization:**
    - Group-relative advantage: `A = (r - mean(r)) / std(r)`

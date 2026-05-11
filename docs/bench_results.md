@@ -55,13 +55,22 @@ a bigger GPU.
 
 **Phase 2 (Wave 3/4 GRPO) at real-data scales (RTX 4090, K=8):**
 
-| Dataset            | Prompt | Gen cap | Step time | Peak VRAM | Notes              |
+| Dataset (Strategy A train mix)  | Prompt | Gen cap | Step time | Peak VRAM | Notes              |
+|---------------------------------|--------|---------|-----------|-----------|--------------------|
+| narrativeqa                     | ~8000  | ~30     | ~0.88s    | ~3.4 GB   | 4.8K prompts (gen-bounded — short answers) |
+| musique                         | ~2300  | 256     | ~1.7s     | ~3.4 GB   | 10K prompts |
+| hotpotqa (padded N=40)          | ~6600  | 256     | ~1.8s     | ~3.5 GB   | 12K prompts |
+| 2wikimultihop (padded N=60)     | ~6100  | 256     | ~1.7s     | ~3.5 GB   | 8K prompts |
+| quality                         | ~5900  | 32      | ~1.5s     | ~3.4 GB   | 2.5K prompts (MC, short gen) |
+| wave4 chat                      | ~1024  | 512     | ~3.8s     | ~4.0 GB   | per-prompt heaviest config |
+
+Eval-only (held out from train mix per Strategy A — bench numbers kept for reference):
+
+| Dataset (eval-only)| Prompt | Gen cap | Step time | Peak VRAM | Notes              |
 |--------------------|--------|---------|-----------|-----------|--------------------|
-| gsm8k typical      | ~100   | 256     | 1.76s     | 3.42 GB   | 7.5K prompts → 3.6 hr/epoch |
-| numinamath p90     | ~141   | 256     | 1.79s     | 3.42 GB   | 50K prompts → 24.9 hr/epoch |
-| humaneval p90      | ~227   | 256     | 1.76s     | 3.43 GB   | 164 prompts → 5 min/epoch |
-| narrativeqa        | ~8000  | ~30     | 0.88s     | 3.40 GB   | 4.8K prompts → 1.2 hr/epoch (gen-bounded, not prompt-bounded) |
-| wave4 chat         | ~1024  | 512     | 3.79s     | 4.01 GB   | per-prompt heaviest config |
+| gsm8k typical      | ~100   | 256     | 1.76s     | 3.42 GB   | reasoning capability eval only |
+| numinamath p90     | ~141   | 256     | 1.79s     | 3.42 GB   | reasoning capability eval only |
+| humaneval p90      | ~227   | 256     | 1.76s     | 3.43 GB   | reasoning capability eval only |
 
 **K-scaling at gsm8k-typical (prompt=100, gen=256):**
 
