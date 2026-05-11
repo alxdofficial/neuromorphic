@@ -159,19 +159,17 @@ def main():
         total_steps=args.num_steps,
         lr_min_ratio=args.lr_min_ratio,
     )
-    # use_kv_cache=False (rolling-buffer mode). At BS=8 multi-stream, the
-    # shared KV cache had to be wiped lockstep whenever ANY slot crossed
-    # a doc boundary — which happens ~90% of windows given typical
-    # ~1000-token doc lengths. Net effect: Llama's "long-context" KV
-    # benefit was lost almost every window anyway. Rolling-buffer mode
-    # is ~2.15× slower per step but threads each slot's context per-row
-    # via lm_buffer, eliminating the lockstep-wipe contamination.
-    # See docs/bench_results.md for the comparison.
+    # use_kv_cache=True with NO doc-boundary resets (Transformer-XL style;
+    # see the multi-stream branch above). KV cache trims to
+    # effective_lm_context=2048 naturally; cross-doc attention is permitted
+    # and self-cleans as old-doc K/V drops out of the cache. RoPE
+    # shift-equivariance means cache_abs_pos can grow unboundedly without
+    # affecting attention scores — only relative positions (bounded by
+    # the cache cap) matter.
     trainer = Phase1Trainer(
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
         prior_loss_weight=0.0,  # W1 has no prior/response distinction
-        use_kv_cache=False,
     )
 
     if args.checkpoint_in is not None:
@@ -407,57 +405,33 @@ def main():
             if trainer.step_count >= args.num_steps:
                 break
 
-            # Branch on single-stream vs multi-stream batch shape.
+            # Transformer-XL / RMT-style continuous training: we do NOT
+            # reset any per-row state at doc boundaries. Each batch row
+            # is treated as a continuous corpus stream — the trajectory-
+            # memory's write_module gradually overwrites stale concepts
+            # as new-doc tokens are processed (same role as TXL's mems).
+            # KV cache trims naturally to effective_lm_context; cross-doc
+            # attention contamination is "limited impact" per Llama 3's
+            # finding (§3.4 of arXiv:2407.21783). RoPE position values can
+            # grow unboundedly without breaking attention due to shift-
+            # equivariance: only RELATIVE positions matter, and the cache
+            # trim keeps the relative-position span bounded by cap=2048.
+            # Eliminates the lockstep wipe entirely.
             if args.batch_size == 1:
                 # ── Single-stream path ───────────────────────────────
-                if item.is_doc_start:
-                    prev_states = None
-                    prev_window_hiddens = None
-                    prev_lm_context = None
-                    past_kv = None
-                    cache_abs_pos = 0
                 chunk = item.input_ids.unsqueeze(0).to(args.device)         # [1, T]
                 valid_mask = item.valid_mask.unsqueeze(0).to(args.device)   # [1, T]
                 target_mask = valid_mask.view(1, cfg.D, cfg.T_window)
                 step_sources = [getattr(item, "source", "") or "unknown"]
             else:
                 # ── Multi-stream path (BS > 1) ───────────────────────
-                # Per-slot reset on prev_states (batched, easy). Rolling-
-                # buffer mode (use_kv_cache=False) — lm_buffer is per-row
-                # but shares a uniform row length, so we still lockstep-
-                # wipe it on any-slot-boundary to avoid prior-doc tokens
-                # leaking into a new-doc slot's row. The win over the
-                # KV-cache path: no shared cache with position-coupled
-                # rotations, so the "Llama sees only 256 tokens of context"
-                # contamination at every boundary is gone — non-resetting
-                # slots rebuild their rolling-buffer context within a few
-                # windows.
                 BS_chunk = item.input_ids.shape[0]
-                is_start = item.is_doc_start_per_slot.to(args.device)  # [BS]
-
                 if prev_states is None:
+                    # First chunk of training only; subsequent chunks
+                    # carry state via the loop's prev_states = metrics.final_states.
                     prev_states = model.manifold.reset_states(
                         batch_size=BS_chunk,
                     ).to(args.device)
-
-                if is_start.any():
-                    fresh_states = model.manifold.reset_states(
-                        batch_size=BS_chunk,
-                    ).to(args.device)
-                    prev_states = torch.where(
-                        is_start[:, None, None], fresh_states, prev_states,
-                    )
-                    # Lockstep wipe of LM-side state to keep memory and
-                    # Llama temporally aligned. Per-slot doc start signals
-                    # "no predecessor"; matching single-stream semantics,
-                    # we set prev_window_hiddens to None instead of zeros
-                    # so run_chunk skips first-token-of-window prediction
-                    # rather than predicting from fake-zero context.
-                    prev_window_hiddens = None
-                    past_kv = None
-                    cache_abs_pos = 0
-                    prev_lm_context = None
-
                 chunk = item.input_ids.to(args.device)            # [BS, T]
                 valid_mask = item.valid_mask.to(args.device)      # [BS, T]
                 target_mask = valid_mask.view(BS_chunk, cfg.D, cfg.T_window)

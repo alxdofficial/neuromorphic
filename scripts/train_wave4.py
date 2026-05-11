@@ -14,6 +14,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
+import sys
 import time
 from pathlib import Path
 
@@ -161,6 +163,14 @@ def main():
                 tokenizer=tokenizer,
                 temperature=args.temperature,
             )
+            if not math.isfinite(metrics.policy_loss):
+                print(f"FATAL: non-finite policy_loss ({metrics.policy_loss}) "
+                      f"at step {trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            if not math.isfinite(metrics.grad_norm):
+                print(f"FATAL: non-finite grad_norm ({metrics.grad_norm}) at "
+                      f"step {trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
             mean_r = sum(metrics.rewards) / max(len(metrics.rewards), 1)
             rewards_history.append(mean_r)
 
