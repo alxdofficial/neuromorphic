@@ -22,6 +22,71 @@ Per project memory:
 
 ---
 
+## 2026-05-11 — Phase 1 + Phase 2 after architectural perf push
+
+Headline: shipped 5 perf changes — Hopfield-tied entry projection,
+cross-attn K/V sharing across J + across hops, bf16 cross-attn body,
+trajectory-generator activation checkpointing, dropped per-slot KV cache
+complexity. Plus 3 Phase 2 GRPO changes — batched K rollouts at BS=K,
+selective log-softmax, per-sample backward in Pass 2.
+
+**Phase 1 Wave 1 throughput sweep (RTX 4090, medium tier, KV cache ON):**
+
+| BS | compile | peak VRAM | tok/s | ms/iter |
+|----|---------|-----------|-------|---------|
+| 4  | OFF     | 9.44 GB   | 17.4k | 235     |
+| 8  | OFF     | 16.2 GB   | 19.8k | 413     |
+| 12 | OFF     | 22.9 GB   | 20.5k | 600     |
+| **4**  | **ON**  | **7.16 GB**  | **26.0k** | **158** |
+| **8**  | **ON**  | **11.6 GB**  | **27.2k** | **301** |
+| 12 | ON      | 22.9 GB   | 20.5k | 599 (compile regressed here) |
+| 16 | ON      | OOM       | —     | —       |
+
+**Recommended production:** BS=8 with `--compile` → 27.2k tok/s,
+11.6 GB peak, ~13 GB headroom. This is the new train_wave1.py default.
+Previous baseline was BS=4 at 17k tok/s — **60% more useful throughput
+with margin**.
+
+Speed ceiling: throughput plateau between BS=4 and BS=8 (+4.6%) shows
+we're at the GPU's per-token compute limit for Llama-3.2-1B forward+
+backward on this hardware. Further gains would require Llama
+quantization, vLLM-style rollout overlap (Phase 2 only), or moving to
+a bigger GPU.
+
+**Phase 2 (Wave 3/4 GRPO) at real-data scales (RTX 4090, K=8):**
+
+| Dataset            | Prompt | Gen cap | Step time | Peak VRAM | Notes              |
+|--------------------|--------|---------|-----------|-----------|--------------------|
+| gsm8k typical      | ~100   | 256     | 1.76s     | 3.42 GB   | 7.5K prompts → 3.6 hr/epoch |
+| numinamath p90     | ~141   | 256     | 1.79s     | 3.42 GB   | 50K prompts → 24.9 hr/epoch |
+| humaneval p90      | ~227   | 256     | 1.76s     | 3.43 GB   | 164 prompts → 5 min/epoch |
+| narrativeqa        | ~8000  | ~30     | 0.88s     | 3.40 GB   | 4.8K prompts → 1.2 hr/epoch (gen-bounded, not prompt-bounded) |
+| wave4 chat         | ~1024  | 512     | 3.79s     | 4.01 GB   | per-prompt heaviest config |
+
+**K-scaling at gsm8k-typical (prompt=100, gen=256):**
+
+| K  | Step time | Peak VRAM |
+|----|-----------|-----------|
+| 8  | 1.76s     | 3.42 GB   |
+| 16 | 1.94s     | 3.45 GB   |
+| 32 | 2.42s     | 4.22 GB   |
+
+K=16 is +10% time / +3% VRAM over K=8; K=32 is +37% time / +24% VRAM.
+All fit comfortably; K=8 is the practical sweet spot, K=16 if more
+samples per group is worth the cost.
+
+**Pass-1 rollout speedup (R1, batched K rollouts vs serial K calls):**
+
+| K | prompt | gen | serial | batched | speedup |
+|---|--------|-----|--------|---------|---------|
+| 4 | 1024   | 256 | 5.98s  | 1.56s   | **3.84×** |
+| 8 | 512    | 128 | 5.28s  | 0.78s   | **6.79×** |
+| 8 | 1024   | 256 | 11.28s | 1.57s   | **7.20×** |
+
+Rollout went from dominating Phase 2 step time to ~half of it.
+
+---
+
 ## 2026-05-09 — Phase 1 (Wave 1) at v1-default config (medium tier)
 
 **Hardware:** RTX 4090 (25.3 GB) · bf16 (Llama backbone) · fp32 memory

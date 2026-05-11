@@ -158,20 +158,33 @@ Read conditions only on `prev_window_hiddens: [256, D_lm]` — Llama's
 hidden states from the previous window. No separate endpoint or boundary
 state.
 
-**Entry-point selection (J trajectories via head queries):**
+**Entry-point selection — Hopfield-tied projection (shared with write):**
+
+The `EntryProjector` module (`src/trajectory_memory/read_module.py`) is
+**shared** between the read and write modules. Same `head_query: [J, D_concept]`
++ same `entry_mlp` for both heads:
 
 ```
 pooled = mean(prev_window_hiddens)                    # [D_lm]
 for j in 1..J:
-    Q_entry[j] = MLP_entry(concat(pooled, head_query_r[j]))   # [D_concept]
+    Q_entry[j] = entry_proj(pooled, head_query[j])    # [D_concept]
     score[j]   = Q_entry[j] @ concept_ids.T           # [N]
     entry[j]   = gumbel_top1(score[j])                # discrete selection
 ```
 
-`head_query_r: [J, D_concept]` is a learnable table. Each j gets a
-different bias toward different regions of the manifold — same multi-head
-trick attention uses. Without per-j bias, the J trajectories would
-collapse to near-identical paths.
+**Why shared:** read at window d+1 and write at window d both pool the
+same hiddens (window d's). Shared projection ⇒ same address logits ⇒
+write deposits where the next read will retrieve from, *by construction*.
+This is the modern-Hopfield-network identity: attention-on-energy-surface
+is one step of gradient descent on the surface the write just deposited.
+Without this tie, read and write collapse to disjoint subsets under
+Gumbel-top-1 routing and write_module's gradient drops to zero. See
+[feedback_write_grad_collapse memory] for the empirical history.
+
+`head_query: [J, D_concept]` is the learnable per-trajectory bias. Each j
+gets a different bias toward different regions of the manifold — same
+multi-head trick attention uses. Without per-j bias the J trajectories
+would collapse to near-identical paths.
 
 **K_read autoregressive hops, all J trajectories batched:**
 
@@ -219,22 +232,32 @@ Output: stack visited lists → `[J, K_read, D_concept]` → flatten to
 Same shape as read. Crucial differences:
 
 - Conditions on `current_window_hiddens` (now available) plus a
-  window-level surprise signal.
-- **Separate parameters** from read module.
+  window-level surprise signal (consumed by hop / mutate MLPs, NOT by
+  the entry projection — see §2.2 on Hopfield tie).
+- **Shares entry projection** with read (§2.2). All hop-level MLPs
+  (`step_mlp`, `history_attn`, `cross_attn`) and the `mutate_mlp` are
+  independent.
 - **Persistent mutation:** visited concept states get written back into
   the manifold via `scatter_mean` (handles collisions across J
   trajectories). `mutate_write` is the only mutation function (read
   module has none).
 - No Hebbian update — there is no `edge_weights` to update.
 
-**Entry-point selection (J head queries, conditioned on surprise):**
+**Entry-point selection (uses shared EntryProjector, identical pool of
+current_window_hiddens that next window's read will see as
+prev_window_hiddens):**
 
 ```
 pooled = mean(current_window_hiddens)
 for j in 1..J:
-    Q_entry[j] = MLP_entry_w(concat(pooled, head_query_w[j], surprise))
+    Q_entry[j] = entry_proj(pooled, head_query[j])   # same as read!
     entry[j]   = gumbel_top1(Q_entry[j] @ concept_ids.T)
 ```
+
+Note: surprise is no longer an input to entry routing — only to per-hop
+step_mlp and mutate_mlp. Surprise controls *write strength*, not *write
+location*. Putting surprise back in the address would re-introduce the
+read/write divergence pathology.
 
 **K_write autoregressive hops, all J batched:**
 
@@ -494,19 +517,32 @@ linked into the autograd graph.
 
 ### 4.3 Gradient checkpointing strategy
 
-At D = 4–8 windows, activation memory grows linearly with D unless
-checkpointed. Priority order:
+What we ship in production (verified on RTX 4090, BS=8 D=4, 11.6 GB peak):
 
-1. **Llama forward** — checkpoint every transformer block. Standard,
-   biggest win.
-2. **Cross-attention in trajectory generators** (read and write) —
-   checkpoint per hop. Each hop's cross-attn over 256 tokens is the
-   second-biggest cost.
-3. **Trajectory generator MLPs** — small, skip unless tight.
+1. **Llama gradient checkpointing — OFF.** Tried, regressed VRAM by
+   ~+6 GB and slowed steps by ~25% in our setup. Likely a bad
+   interaction between HF's `gradient_checkpointing_enable` wrapper and
+   our custom `MemInjectLayer` replacing transformer layer 8 (the
+   wrapper expects a stock transformer block at every position). Not
+   debugged further — the win below made it unnecessary.
+2. **Trajectory-generator activation checkpointing — ON.** `read_module`
+   and `write_module` forward calls are wrapped with
+   `torch.utils.checkpoint(use_reentrant=False)` inside `forward_window`.
+   Per-hop cross-attn + history-attn + step_mlp activations get
+   recomputed in backward. Cheap because trajectory generators are small.
+3. **Cross-attn K/V sharing — ON.** `_CrossAttn.precompute_kv()` computes
+   K, V from `prev_window_hiddens` once per window and reuses across
+   J trajectories and K_read/K_write hops. Saves the per-hop
+   `[BS, J, T, d_lm]` materialization that `.expand().reshape()` was
+   forcing. ~3–4 GB at BS=4 D=4 freed.
+4. **bf16 autocast on cross-attn body — ON.** Manifold stays fp32 (Adam
+   stability), but the cross-attn matmuls + softmax run under
+   `torch.autocast(bf16)`. Halves activation memory on attention without
+   touching the param storage.
 
-With (1) + (2), forward is recomputed once during backward. Cost: ~2×
-forward FLOPs. Memory drops to ~1× window-of-activations + a slim
-per-window write graph skeleton (visited concept ID / state references).
+The combination above puts BS=8 D=4 at 11.6 GB / 27.2k tok/s with
+`torch.compile` on (the production config). BS=12 fits but compile
+regresses on that shape. BS=16 OOMs.
 
 **Linear-in-D vs constant-in-D:**
 
@@ -515,9 +551,8 @@ per-window write graph skeleton (visited concept ID / state references).
 - Constant-in-D: custom autograd function streams windows, checkpointing
   at window boundaries. Memory bounded regardless of D. Harder to write.
 
-For v1 use linear-in-D at D=4 or 8 — see if it fits. If OOM, bump to
-constant-in-D *before* reducing D. Depth is the load-bearing parameter
-for memory learning; sacrificing it is the last resort.
+We use linear-in-D at D=4 in production. The architectural fixes above
+gave enough headroom that constant-in-D isn't needed at current scale.
 
 ### 4.4 Hyperparameters (current `medium` config)
 
@@ -783,26 +818,40 @@ Phase 2 (AR GRPO). Both carry over with minor adaptations:
 - Cross-window TBPTT (D windows) replaces within-T TBPTT (`tbptt_block`
   tokens). Same idea, different boundary.
 
-**Phase 2 (AR GRPO) — implemented as two-pass.**
+**Phase 2 (AR GRPO) — implemented as two-pass with batched rollouts.**
 
 Single-pass GRPO (§4.8 default) had a real bug: detaching state per AR
 token to bound activation memory cut the gradient chain to write_module
 entirely. Replaced with **two-pass GRPO** (originally listed as fallback
 §4.6, made default 2026-05-09):
 
-  Pass 1 — sample (`_ar_sample_one`, no_grad, KV-cached, with prefill).
-    Walk forward_window over the prompt to populate KV cache + manifold
-    state, then AR-generate token-by-token with KV cache. Per-window
-    memory ops (read once at start, write once at end of each
-    T_window=256-token block of generated tokens), NOT per-token. Each
-    sampled token's `logp_old` recorded for pass 2's IS clip.
+  Pass 1 — sample (`_ar_sample_batch`, no_grad, KV-cached, with prefill).
+    Walk `forward_window` over the prompt at BS=1 to populate KV cache +
+    manifold state. Then expand the prefill state to BS=K and run all K
+    rollouts **in parallel as a single BS=K AR loop** (R1 optimization,
+    2026-05-11). Per-sample EOS tracking via a `finished` mask; finished
+    samples get force-padded for remaining steps. Per-window memory ops
+    (read at window start, write at window end) fire at BS=K. Each
+    sampled token's `logp_old` recorded for pass 2's IS clip. Replaces
+    K × T_gen sequential single-token forwards with T_gen BS=K forwards
+    — kills the launch-bound bottleneck. Bench at K=8, prompt=1K, gen=256:
+    rollout time dropped 11.3s → 1.6s (7.2× speedup) vs the prior
+    K-serial implementation.
 
   Pass 2 — TF replay (`_tf_compute_sample_logp`, with grad).
     TF-forward through (prompt + sample) in T_window windows. Memory
     state carries through `write_module` without detach. **Shared
     prefill** (no_grad) optimization: prompt is encoded ONCE, K samples
-    each start from the cloned prefill state — saves ~3-4× pass 2 cost
-    when K > 1.
+    each start from the cloned prefill state. **Selective log-softmax**
+    (R2): logp = gather(scaled, target) - logsumexp(scaled) instead of
+    `F.log_softmax().gather()` — avoids the [n_pred, V=128k] transient.
+    **Per-sample backward** (R3): each sample's policy + KL loss
+    `.backward()` fires inside the loop, freeing that sample's TF
+    activation graph before the next sample's graph builds. PyTorch
+    accumulates gradients into `.grad` buffers across the K backwards;
+    mathematically identical to a joint backward (`∇Σᵢ lᵢ = Σᵢ ∇lᵢ`)
+    but ~K× less peak VRAM. Bench at K=8 / prompt=512 / gen=256: total
+    step (pass 1 + pass 2 + backward) = 1.78s at 3.48 GB peak.
 
 GRPO regularization (matches DeepSeek-R1, TRL, verl, OpenRLHF):
 
