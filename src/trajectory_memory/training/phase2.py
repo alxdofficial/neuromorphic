@@ -486,6 +486,16 @@ class Phase2Trainer:
             )
             if sample_logps_new.numel() == 0:
                 continue
+            # Edge case: if a sample is so short that its TF replay only
+            # spans the very first sample-position (logp derived from the
+            # detached last_prev_logit predecessor + frozen lm_head), the
+            # resulting logp has no autograd graph and `.backward()` would
+            # crash. This is rare (model emits EOS as the FIRST sampled
+            # token, leaving a 1-token sample), but observed once per
+            # ~hundred steps on an untrained backbone. Skip — no useful
+            # gradient signal anyway.
+            if not sample_logps_new.requires_grad:
+                continue
 
             # Align logp_old to logp_new — logp_old has one entry per
             # sampled token; logp_new may drop the very-first token of the

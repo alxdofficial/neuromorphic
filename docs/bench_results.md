@@ -53,18 +53,28 @@ backward on this hardware. Further gains would require Llama
 quantization, vLLM-style rollout overlap (Phase 2 only), or moving to
 a bigger GPU.
 
-**Phase 2 (Wave 3/4 GRPO) at real-data scales (RTX 4090, K=8):**
+**Phase 2 (Wave 3 GRPO) on REAL Strategy A data (RTX 4090, K=8, max_new=256,
+re-measured 2026-05-11 on actual parquet prompts, not synthetic random tokens):**
 
-| Dataset (Strategy A train mix)  | Prompt | Gen cap | Step time | Peak VRAM | Notes              |
-|---------------------------------|--------|---------|-----------|-----------|--------------------|
-| narrativeqa                     | ~8000  | ~30     | ~0.88s    | ~3.4 GB   | 4.8K prompts (gen-bounded — short answers) |
-| musique                         | ~2300  | 256     | ~1.7s     | ~3.4 GB   | 10K prompts |
-| hotpotqa (padded N=40)          | ~6600  | 256     | ~1.8s     | ~3.5 GB   | 12K prompts |
-| 2wikimultihop (padded N=60)     | ~6100  | 256     | ~1.7s     | ~3.5 GB   | 8K prompts |
-| quality                         | ~5900  | 32      | ~1.5s     | ~3.4 GB   | 2.5K prompts (MC, short gen) |
-| wave4 chat                      | ~1024  | 512     | ~3.8s     | ~4.0 GB   | per-prompt heaviest config |
+| Source                          | N      | Avg prompt | Step time | Peak VRAM | Tok/s gen | Wall-time per epoch |
+|---------------------------------|--------|------------|-----------|-----------|-----------|---------------------|
+| narrativeqa                     | 4,764  | 8175       | 2.37s     | 3.72 GB   | 642       | **3.1 hr**          |
+| musique                         | 10,000 | 1762       | 2.03s     | 3.72 GB   | 767       | **5.6 hr**          |
+| hotpotqa (padded N=40)          | 12,000 | 6833       | 2.30s     | 3.72 GB   | 783       | **7.7 hr**          |
+| 2wikimultihop (padded N=60)     | 8,000  | 6177       | 2.29s     | 3.72 GB   | 825       | **5.1 hr**          |
+| quality                         | 2,523  | 6569       | 2.30s     | 3.72 GB   | 738       | **1.6 hr**          |
+| **TOTAL (one Wave 3 epoch)**    | **37,287** | —      | —         | —         | —         | **23.2 hr**         |
 
-Eval-only (held out from train mix per Strategy A — bench numbers kept for reference):
+Headline: full Wave 3 epoch on the Strategy A memory mix is **23.2 hours**
+on a single 4090. Multi-epoch GRPO (2-4 epochs typical) → ~2-4 days.
+
+VRAM is uniform at 3.72 GB across all sources (bounded by Llama's
+sliding-window KV cache + manifold state + Pass 2 activation peak —
+prompt length doesn't matter, only the cap and the K=8 BS-K rollout).
+Plenty of headroom for K=16 (+10% step time) or BS_outer > 1.
+
+Eval-only (held out from train mix per Strategy A — bench numbers kept
+for reference):
 
 | Dataset (eval-only)| Prompt | Gen cap | Step time | Peak VRAM | Notes              |
 |--------------------|--------|---------|-----------|-----------|--------------------|
