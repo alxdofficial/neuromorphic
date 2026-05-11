@@ -701,3 +701,43 @@ class PromptResponseDataset:
             rng.shuffle(rows)
         for r in rows:
             yield r
+
+    def iter_batched(
+        self,
+        batch_size: int,
+        *,
+        min_prompt_len: int | None = None,
+    ):
+        """Yield groups of `batch_size` rows with similar prompt lengths
+        (length-bucketed sampling for Phase 2 BS_outer > 1).
+
+        Algorithm: sort rows by num_prompt, partition into consecutive
+        chunks of `batch_size`, shuffle chunk order so we don't always
+        train short→long within an epoch. Each chunk's rows are
+        sorted-similar in length, so batched prefill pads at most by
+        the longest-vs-shortest ratio within the chunk.
+
+        `min_prompt_len`: optional filter — drop rows whose prompt is
+        shorter than this. Useful to ensure all prompts in a batch
+        comfortably exceed `effective_lm_context=2048` so that after
+        prefill all rows' KV caches are at the same (trimmed) length,
+        eliminating the need for per-row cache padding.
+        """
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        rows = list(self._rows)
+        if min_prompt_len is not None:
+            rows = [r for r in rows if len(r["prompt_ids"]) >= min_prompt_len]
+        if not rows:
+            return
+        # Sort by prompt length ascending; group into batch-size chunks.
+        rows.sort(key=lambda r: len(r["prompt_ids"]))
+        n_full = len(rows) // batch_size
+        chunks = [rows[i * batch_size:(i + 1) * batch_size] for i in range(n_full)]
+        # Tail rows that don't fill a batch are dropped (consistent batching
+        # is more important than seeing every example each epoch — they'll
+        # come back next epoch with a different shuffle).
+        if self.shuffle:
+            rng.shuffle(chunks)
+        for chunk in chunks:
+            yield chunk

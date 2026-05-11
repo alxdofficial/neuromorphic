@@ -602,6 +602,90 @@ def test_phase2_step_with_kl_term_runs_end_to_end():
     assert 0 <= metrics.clip_fraction <= 1
 
 
+def test_phase2_step_batched_runs_end_to_end():
+    """BS_outer multi-prompt step (step_batched) should accept a list of
+    prompts, score per-group, and accumulate gradients across M*K
+    samples — all without crashing. Test runs in attach_lm=False mode
+    so it exercises the test-mode AR path (serial K loops within batched
+    step), validates orchestration only."""
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.0)
+
+    class _FakeTokenizer:
+        eos_token_id = 99
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids[:5])
+
+    M = 3
+    K = 2
+    prompts = [torch.randint(1, 50, (1, 16)) for _ in range(M)]
+    per_prompt_meta = [
+        {"reward_kind": "exact_match", "gold": "dummy", "meta": {}}
+        for _ in range(M)
+    ]
+    metrics = trainer.step_batched(
+        prompts, per_prompt_meta,
+        num_samples=K, max_new_tokens=4,
+        tokenizer=_FakeTokenizer(),
+    )
+    import math
+    assert math.isfinite(metrics.policy_loss)
+    assert len(metrics.rewards) == M * K
+    assert len(metrics.advantages) == M * K
+    assert len(metrics.decoded) == M * K
+    assert 0 <= metrics.clip_fraction <= 1
+
+
+def test_phase2_step_batched_per_group_advantages():
+    """Advantages must be normalized PER GROUP (per prompt's K samples),
+    not globally across M*K. Verify via a controlled reward injection."""
+    import src.trajectory_memory.training.phase2 as phase2_mod
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.0)
+
+    class _FakeTokenizer:
+        eos_token_id = 99
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids[:5])
+
+    # Inject controlled rewards:
+    # Prompt 0's K samples get rewards [0.0, 1.0] → after normalization,
+    #   advantages should center at 0 with magnitude 1.
+    # Prompt 1's K samples get rewards [0.5, 0.5] → degenerate group,
+    #   advantages should both be 0.
+    # If advantages were normalized GLOBALLY (wrongly) across all 4
+    # samples, prompt 1's samples would get non-zero advantage.
+    rewards_iter = iter([0.0, 1.0, 0.5, 0.5])
+    orig_compute = phase2_mod.compute_reward
+    try:
+        phase2_mod.compute_reward = lambda *a, **k: next(rewards_iter)
+        prompts = [torch.randint(1, 50, (1, 16)), torch.randint(1, 50, (1, 16))]
+        per_prompt_meta = [
+            {"reward_kind": "exact_match", "gold": "dummy", "meta": {}}
+            for _ in range(2)
+        ]
+        metrics = trainer.step_batched(
+            prompts, per_prompt_meta,
+            num_samples=2, max_new_tokens=4,
+            tokenizer=_FakeTokenizer(),
+        )
+    finally:
+        phase2_mod.compute_reward = orig_compute
+
+    # advantages layout: [prompt0_sample0, prompt0_sample1, prompt1_sample0, prompt1_sample1]
+    adv = metrics.advantages
+    # Prompt 0: r=[0, 1] → mean=0.5, std~0.5 → normalized to ~[-1, 1]
+    assert abs(adv[0]) > 0.5, f"Prompt 0 samples should have non-zero adv; got {adv[:2]}"
+    assert abs(adv[1]) > 0.5
+    # Prompt 1: r=[0.5, 0.5] → mean=0.5, std=0 → advantage=0 (degenerate)
+    assert abs(adv[2]) < 1e-4, f"Prompt 1 (degenerate group) should have zero adv; got {adv[2]}"
+    assert abs(adv[3]) < 1e-4
+
+
 def test_phase2_step_does_not_mutate_manifold_buffer():
     """Audit Phase A5: pass 1 (no_grad AR) and pass 2 (TF replay with grad)
     both use per-batch state tensors via `Manifold.reset_states(batch_size=1)`,

@@ -82,6 +82,24 @@ for reference):
 | numinamath p90     | ~141   | 256     | 1.79s     | 3.42 GB   | reasoning capability eval only |
 | humaneval p90      | ~227   | 256     | 1.76s     | 3.43 GB   | reasoning capability eval only |
 
+**BS_outer (multi-prompt batching) sweep at hotpotqa-typical
+(prompt~6.6K, K=8, max_new=256, RTX 4090):**
+
+| BS_outer M | Step time | Per-prompt | Peak VRAM | Speedup vs M=1 | Wave 3 epoch |
+|------------|-----------|------------|-----------|-----------------|--------------|
+| 1          | 2.15s     | 2.15s      | 3.72 GB   | 1.00×           | 23.2 hr      |
+| 2          | 2.78s     | 1.39s      | 4.34 GB   | 1.55×           | 14.9 hr      |
+| **4**      | **4.03s** | **1.01s**  | **6.00 GB** | **2.14×**     | **10.8 hr**  |
+| 8          | 6.57s     | 0.82s      | 9.32 GB   | 2.62×           | 8.9 hr       |
+| 12         | 9.24s     | 0.77s      | 12.64 GB  | 2.80×           | 8.3 hr       |
+
+Production recommendation: **BS_outer=4 with K=8** (M*K=32 rollouts in
+parallel per optimizer step). Cuts Wave 3 epoch from 23.2 → 10.8 hr,
+fits at ~6 GB peak with plenty of headroom for a longer K or BS_outer
+later. Diminishing returns past M=4 because prefill is still serial
+(M sequential BS=1 prefills per step) — only the AR rollout + Pass 2
+TF replay are batched.
+
 **K-scaling at gsm8k-typical (prompt=100, gen=256):**
 
 | K  | Step time | Peak VRAM |

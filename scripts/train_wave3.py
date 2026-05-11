@@ -111,6 +111,21 @@ def main():
                          "humaneval=1'. Used to bias the training mix toward "
                          "long-context (memory-engaging) sources. Default: "
                          "uniform (1.0 for all).")
+    ap.add_argument("--bs-outer", type=int, default=1,
+                    help="BS_outer — number of prompts per optimizer step. "
+                         "1 = single-prompt step() (legacy). >1 = batched "
+                         "step_batched(): M prompts × K samples = M*K parallel "
+                         "rollouts, per-group advantage, per-sample backward, "
+                         "single optimizer.step. Requires length-bucketed "
+                         "sampler (auto-enabled when --bs-outer > 1). "
+                         "Bench: M=4 gives ~2.1× per-prompt speedup at ~6 GB "
+                         "peak vs M=1 at 3.7 GB.")
+    ap.add_argument("--bs-outer-min-prompt-len", type=int, default=2048,
+                    help="When --bs-outer > 1, only include prompts with "
+                         "at least this many tokens. Ensures all prompts "
+                         "in a batch hit the effective_lm_context cap after "
+                         "prefill, so KV caches stack cleanly. Default 2048 "
+                         "matches cfg.effective_lm_context.")
     args = ap.parse_args()
 
     # Allow TF32 for fp32 matmul (memory params, bridge, lm_head).
@@ -202,6 +217,64 @@ def main():
 
     rewards_history: list = []
     t_start = time.time()
+
+    if args.bs_outer > 1:
+        # ── BS_outer > 1 path: length-bucketed batches, step_batched().
+        print(f"BS_outer mode: M={args.bs_outer}, K={args.num_samples}, "
+              f"min_prompt_len={args.bs_outer_min_prompt_len}.")
+        while trainer.step_count < args.num_steps:
+            for batch in dataset.iter_batched(
+                args.bs_outer, min_prompt_len=args.bs_outer_min_prompt_len,
+            ):
+                if trainer.step_count >= args.num_steps:
+                    break
+                prompts = [
+                    torch.tensor(ex["prompt_ids"], dtype=torch.int64).to(args.device).unsqueeze(0)
+                    for ex in batch
+                ]
+                per_prompt_meta = [
+                    {
+                        "reward_kind": ex["reward_kind"],
+                        "gold": tokenizer.decode(ex["gold_ids"], skip_special_tokens=True),
+                        "meta": ex["meta"],
+                    } for ex in batch
+                ]
+                metrics = trainer.step_batched(
+                    prompts, per_prompt_meta,
+                    num_samples=args.num_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    tokenizer=tokenizer,
+                    temperature=args.temperature,
+                )
+                mean_r = sum(metrics.rewards) / max(len(metrics.rewards), 1)
+                rewards_history.append(mean_r)
+
+                step = trainer.step_count
+                if step % args.log_every == 0:
+                    avg = sum(rewards_history[-args.log_every:]) / max(
+                        len(rewards_history[-args.log_every:]), 1
+                    )
+                    elapsed = time.time() - t_start
+                    print(f"  step {step:>4} M={args.bs_outer}  "
+                          f"loss={metrics.policy_loss:.4f}  "
+                          f"avg_r={mean_r:.3f}  avg_r10={avg:.3f}  "
+                          f"grad_norm={metrics.grad_norm:.2f}  "
+                          f"clip_frac={metrics.clip_fraction:.3f}  "
+                          f"mean_ratio={metrics.mean_ratio:.3f}  "
+                          f"kl={metrics.kl_to_ref:.4f}  "
+                          f"({elapsed/max(step, 1):.2f}s/step)")
+
+                if args.checkpoint_out is not None and step > 0 and step % args.save_every == 0:
+                    save_checkpoint(
+                        args.checkpoint_out,
+                        model=model, optimizer=optimizer, scheduler=scheduler,
+                        step=step, trainer_state=trainer.state_dict(),
+                        rng_state=capture_rng_state(),
+                    )
+                    print(f"  saved checkpoint at step {step}")
+        # Exit early — single-prompt loop below is for legacy --bs-outer=1.
+        return
+
     while trainer.step_count < args.num_steps:
         for example in dataset:
             if trainer.step_count >= args.num_steps:

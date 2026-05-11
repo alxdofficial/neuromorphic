@@ -559,6 +559,241 @@ class Phase2Trainer:
             kl_to_ref=kl_sum / max(kl_count, 1),
         )
 
+    def step_batched(
+        self,
+        prompts: list[Tensor],
+        per_prompt_meta: list[dict],
+        *,
+        num_samples: int,
+        max_new_tokens: int,
+        tokenizer,
+        temperature: float = 1.0,
+    ) -> Phase2Metrics:
+        """BS_outer multi-prompt GRPO step.
+
+        Processes M prompts in parallel: one batched AR rollout at
+        BS=M*K (where K = num_samples), per-prompt-group advantage
+        normalization, then per-sample backward across all M*K samples.
+        Single `optimizer.step()` at the end.
+
+        Args:
+            prompts: list of M prompt_id tensors, each shape [1, prompt_len_i].
+                MUST be length-bucketed so that after prefill all KV caches
+                hit the same `effective_lm_context` cap (use
+                `PromptResponseDataset.iter_batched(M, min_prompt_len=cap)`).
+            per_prompt_meta: list of M dicts, each with keys
+                {"reward_kind", "gold", "meta"} for the per-prompt
+                reward function call.
+
+        Returns: Phase2Metrics aggregated across all M*K rollouts.
+        """
+        # Reuse the existing single-prompt step's stop-id setup.
+        stop_ids = {tokenizer.eos_token_id}
+        if hasattr(tokenizer, "convert_tokens_to_ids"):
+            try:
+                eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                unk = getattr(tokenizer, "unk_token_id", None)
+                if eot_id is not None and eot_id != unk:
+                    stop_ids.add(eot_id)
+            except Exception:
+                pass
+        pad_id = getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id
+        device = next(self.model.parameters()).device
+        M = len(prompts)
+        K = num_samples
+
+        # ── PASS 1 prefill: M sequential BS=1 prefills (no_grad). Each is
+        # fast and the time savings of batching prefill (vs the gain from
+        # batching the much longer AR rollout) is small relative to the
+        # complexity of variable-length BS=M prefill with attention_mask.
+        prefills = []
+        if self.model.llama is not None:
+            for p in prompts:
+                prefills.append(self._prefill_prompt(p, pad_id=pad_id, device=device))
+
+        # ── PASS 1 batched AR: M*K rollouts in parallel.
+        if self.model.llama is not None:
+            samples_grouped, logp_old_grouped = self._ar_sample_outer_batch(
+                prompts, prefills,
+                num_samples=K, max_new_tokens=max_new_tokens,
+                temperature=temperature, stop_ids=stop_ids,
+                pad_id=pad_id, device=device,
+            )
+        else:
+            # Test-mode fallback — serial single-prompt AR per group.
+            samples_grouped = []
+            logp_old_grouped = []
+            for p in prompts:
+                g_samples = []; g_logps = []
+                for _ in range(K):
+                    s, lp = self._ar_sample_one(
+                        p, max_new_tokens=max_new_tokens, temperature=temperature,
+                        stop_ids=stop_ids, pad_id=pad_id, device=device,
+                    )
+                    g_samples.append(s); g_logps.append(lp)
+                samples_grouped.append(g_samples); logp_old_grouped.append(g_logps)
+
+        # ── SCORE per-prompt-group.
+        rewards_per_group: list[list[float]] = []
+        decoded_per_group: list[list[str]] = []
+        for g in range(M):
+            meta = per_prompt_meta[g]
+            rk = meta["reward_kind"]
+            gold = meta.get("gold")
+            ex_meta = meta.get("meta") or {}
+            decoded_g = [
+                tokenizer.decode(s.tolist(), skip_special_tokens=True)
+                for s in samples_grouped[g]
+            ]
+            decoded_per_group.append(decoded_g)
+            rewards_g = [
+                compute_reward(rk, c, gold=gold, meta=ex_meta) for c in decoded_g
+            ]
+            rewards_per_group.append(rewards_g)
+
+        # ── Per-group advantages. Each group of K gets its own
+        # mean/std normalization (advantage is GROUP-relative, per
+        # the GRPO definition).
+        rewards_t = torch.tensor(rewards_per_group, dtype=torch.float32, device=device)
+        # Shape [M, K]. Normalize per row.
+        advantages = torch.zeros_like(rewards_t)
+        for g in range(M):
+            advantages[g] = compute_grpo_advantages(rewards_t[g])
+
+        # If ALL groups have zero advantage AND no KL term, no signal.
+        no_signal = (
+            advantages.abs().max() < 1e-8
+            and (self.kl_coef == 0 or self.ref_state is None)
+        )
+        if no_signal:
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scheduler is not None:
+                self.scheduler.step()
+            self._step_count += 1
+            flat_samples = [s for g in samples_grouped for s in g]
+            flat_decoded = [c for g in decoded_per_group for c in g]
+            flat_rewards = [r for g in rewards_per_group for r in g]
+            return Phase2Metrics(
+                policy_loss=0.0, grad_norm=0.0,
+                lr=[gr["lr"] for gr in self.optimizer.param_groups],
+                rewards=flat_rewards, advantages=advantages.flatten().tolist(),
+                decoded=flat_decoded,
+                mean_response_len=(
+                    sum(len(s) for s in flat_samples) / max(len(flat_samples), 1)
+                ),
+                clip_fraction=0.0, mean_ratio=1.0, kl_to_ref=0.0,
+            )
+
+        # ── PASS 2 + per-sample backward across all M*K samples.
+        self.optimizer.zero_grad()
+        any_grad = False
+        total_loss_value = 0.0
+
+        n_clipped = 0; n_total = 0; ratio_sum = 0.0
+        kl_sum = 0.0; kl_count = 0
+
+        clip_low = 1.0 - self.clip_eps
+        clip_high = 1.0 + (self.clip_eps_higher if self.clip_eps_higher is not None
+                           else self.clip_eps)
+        denom = max(M * K * max_new_tokens, 1)
+
+        # Pre-compute reference logps per sample, one swap-cycle per prompt.
+        ref_logps_per_group: list[list[Tensor | None]] = []
+        if self.ref_state is not None and self.kl_coef != 0:
+            for g in range(M):
+                ref_logps_per_group.append(self._compute_ref_logps_batch(
+                    prompts[g],
+                    [s.to(device) for s in samples_grouped[g]],
+                    temperature=temperature, pad_id=pad_id, device=device,
+                ))
+        else:
+            ref_logps_per_group = [[None] * K for _ in range(M)]
+
+        import copy as _copy
+        for g in range(M):
+            adv_group = advantages[g]                                          # [K]
+            for k in range(K):
+                sample = samples_grouped[g][k]
+                logp_old = logp_old_grouped[g][k]
+                adv = adv_group[k]
+                if sample.numel() == 0:
+                    continue
+
+                # Per-sample TF replay with prompt g's prefill state.
+                if self.model.llama is not None and prefills:
+                    _sps, _sph, _skv, _slr, _sap = prefills[g]
+                    prefill_state = (
+                        _sps.detach().clone(),
+                        _sph.detach().clone() if _sph is not None else None,
+                        _copy.deepcopy(_skv),
+                        _slr.detach().clone() if _slr is not None else None,
+                        _sap,
+                    )
+                else:
+                    prefill_state = None
+                sample_logps_new = self._tf_compute_sample_logp(
+                    prompt_ids=prompts[g],
+                    sample_ids=sample.to(device),
+                    temperature=temperature, pad_id=pad_id, device=device,
+                    prefill_state=prefill_state,
+                )
+                if sample_logps_new.numel() == 0:
+                    continue
+                if not sample_logps_new.requires_grad:
+                    continue
+
+                n_new = sample_logps_new.numel()
+                logp_old_aligned = logp_old[-n_new:].to(device).to(sample_logps_new.dtype)
+                log_ratio = sample_logps_new - logp_old_aligned
+                ratio = log_ratio.exp()
+                clipped_ratio = torch.clamp(ratio, clip_low, clip_high)
+                surrogate = -torch.min(adv * ratio, adv * clipped_ratio)
+                sample_policy_loss = surrogate.sum() / denom
+
+                n_clipped += int(((ratio < clip_low) | (ratio > clip_high)).sum())
+                n_total += int(n_new)
+                ratio_sum += float(ratio.detach().sum())
+
+                ref_logps = ref_logps_per_group[g][k]
+                sample_kl_loss = torch.zeros((), device=device)
+                if ref_logps is not None and ref_logps.numel() == n_new:
+                    log_r = sample_logps_new - ref_logps.to(sample_logps_new.dtype)
+                    kl_per_tok = log_r.exp() - log_r - 1.0
+                    sample_kl_loss = kl_per_tok.sum() / denom
+                    kl_sum += float(kl_per_tok.detach().sum())
+                    kl_count += int(n_new)
+
+                sample_total_loss = sample_policy_loss + self.kl_coef * sample_kl_loss
+                sample_total_loss.backward()
+                total_loss_value += float(sample_total_loss.detach())
+                any_grad = True
+
+        if any_grad:
+            grad_norm = self._clip_and_step()
+        else:
+            grad_norm = 0.0
+            if self.scheduler is not None:
+                self.scheduler.step()
+        self._step_count += 1
+
+        flat_samples = [s for g in samples_grouped for s in g]
+        flat_decoded = [c for g in decoded_per_group for c in g]
+        flat_rewards = [r for g in rewards_per_group for r in g]
+        return Phase2Metrics(
+            policy_loss=total_loss_value,
+            grad_norm=float(grad_norm),
+            lr=[gr["lr"] for gr in self.optimizer.param_groups],
+            rewards=flat_rewards,
+            advantages=advantages.flatten().tolist(),
+            decoded=flat_decoded,
+            mean_response_len=(
+                sum(len(s) for s in flat_samples) / max(len(flat_samples), 1)
+            ),
+            clip_fraction=n_clipped / max(n_total, 1),
+            mean_ratio=ratio_sum / max(n_total, 1),
+            kl_to_ref=kl_sum / max(kl_count, 1),
+        )
+
     # ── PASS 1: no-grad AR sampling (with prefill, KV-cached) ────────
 
     @torch.no_grad()
@@ -1051,6 +1286,66 @@ class Phase2Trainer:
             layer.values = layer.values.expand(K, -1, -1, -1).contiguous()
         return cache
 
+    def _stack_kv_caches(self, caches: list, K_per_cache: int):
+        """Stack M BS=1 DynamicCaches into one BS=M*K cache, where each
+        BS=1 cache gets K-replicated first. Layout:
+          rows [0:K]       = K replicas of caches[0]
+          rows [K:2K]      = K replicas of caches[1]
+          ...
+          rows [(M-1)K:MK] = K replicas of caches[M-1]
+
+        Used by BS_outer multi-prompt AR rollout to merge M independent
+        prefill caches into one batched cache for parallel generation.
+
+        REQUIRES: all caches have the SAME `get_seq_length()` — enforced
+        upstream by length-bucketed sampler with `min_prompt_len >= cap`
+        so post-prefill caches are all trimmed to exactly `cap` length.
+        """
+        from transformers import DynamicCache
+        if not caches:
+            return None
+        # All caches must agree on sequence length (length-bucketed).
+        lengths = [c.get_seq_length() for c in caches if c is not None]
+        if not lengths:
+            return None
+        assert len(set(lengths)) == 1, (
+            f"_stack_kv_caches requires all caches to have the same "
+            f"seq_length; got {lengths}. Length-bucket your batches "
+            f"(or filter to prompts >= effective_lm_context tokens) so "
+            f"after trim all caches are the same size."
+        )
+
+        out = DynamicCache()
+        n_layers = len(caches[0].layers)
+        for li in range(n_layers):
+            # Concat keys / values across the batch dim. Each contributing
+            # cache layer is [1, n_kv_heads, T, head_dim]; we expand to
+            # [K, ...] then concat M-fold → [M*K, ...].
+            keys_list = []
+            vals_list = []
+            for c in caches:
+                lay = c.layers[li]
+                if not lay.is_initialized:
+                    keys_list.append(None); vals_list.append(None)
+                    continue
+                k_exp = lay.keys.expand(K_per_cache, -1, -1, -1).contiguous()
+                v_exp = lay.values.expand(K_per_cache, -1, -1, -1).contiguous()
+                keys_list.append(k_exp)
+                vals_list.append(v_exp)
+            if any(k is None for k in keys_list):
+                # Mixed init state — should not happen for fresh prefills.
+                # Fall through with whatever we have.
+                continue
+            stacked_k = torch.cat(keys_list, dim=0)         # [M*K, n_kv_heads, T, head_dim]
+            stacked_v = torch.cat(vals_list, dim=0)
+            # Construct a layer with these tensors. Use the same layer
+            # class as the source to handle any subclass-specific state.
+            out_layer = type(caches[0].layers[li])()
+            out_layer.keys = stacked_k
+            out_layer.values = stacked_v
+            out.layers.append(out_layer)
+        return out
+
     @torch.no_grad()
     def _ar_sample_batch(
         self,
@@ -1287,6 +1582,264 @@ class Phase2Trainer:
             samples.append(seq.cpu())
             logps.append(lp.cpu())
         return samples, logps
+
+    # ── PASS 1 (M-PROMPT BATCHED): M prompts × K samples each ──
+
+    @torch.no_grad()
+    def _ar_sample_outer_batch(
+        self,
+        prompts: list[Tensor],
+        prefills: list[tuple],
+        *,
+        num_samples: int,
+        max_new_tokens: int,
+        temperature: float,
+        stop_ids: set[int] | None,
+        pad_id: int,
+        device: torch.device,
+    ) -> tuple[list[list[Tensor]], list[list[Tensor]]]:
+        """M prompts × K samples each, all M*K rollouts in parallel at BS=M*K.
+
+        Caller provides:
+          - prompts: list of M prompt token tensors [1, prompt_len_i].
+            Used for tokenizer-shape consistency only; the AR loop reads
+            from `prefills`.
+          - prefills: list of M prefill states, each a 5-tuple
+            (states[1, N, D], hiddens[1, T, d_lm] | None, kv_cache,
+             last_real_hidden[1, 1, d_lm] | None, abs_pos: int).
+
+        REQUIRES: all M prefills' kv_caches have the SAME seq_length
+        (enforced upstream by length-bucketed sampler with min_prompt_len
+        >= cap so post-prefill caches all hit `cap` after trim).
+
+        Returns:
+          samples_grouped: list of M lists, each containing K truncated
+                           sample tensors.
+          logps_grouped:   same shape, K logp_old tensors per group.
+
+        Stride convention for the BS=M*K dimension:
+          row [g*K + k]  =  sample k of prompt g.
+        """
+        from src.trajectory_memory.tbptt import _trim_kv_cache
+        import copy as _copy
+
+        cfg = self.model.cfg
+        cap = cfg.effective_lm_context
+        T = cfg.T_window
+        M = len(prompts)
+        K = num_samples
+        BS = M * K
+
+        # ── Stack M prefill states → BS=M*K via expand+concat across M.
+        # Each prefill is BS=1. We expand each to BS=K, then concat M of
+        # them to get BS=M*K with the stride convention above.
+        states_pieces, hiddens_pieces, lrh_pieces = [], [], []
+        abs_pos_per_row = torch.empty(BS, dtype=torch.long, device=device)
+        for g, prefill in enumerate(prefills):
+            ps_1, ph_1, _kv_1, lrh_1, abs_pos_g = prefill
+            # Clone to keep caller's prefill_state intact (Pass 2 still
+            # uses it for shared-prefill TF replay).
+            states_pieces.append(ps_1.detach().clone().expand(K, -1, -1).contiguous())
+            if ph_1 is not None:
+                hiddens_pieces.append(ph_1.detach().clone().expand(K, -1, -1).contiguous())
+            if lrh_1 is not None:
+                lrh_pieces.append(lrh_1.detach().clone().expand(K, -1, -1).contiguous())
+            abs_pos_per_row[g * K:(g + 1) * K] = abs_pos_g
+
+        prev_states = torch.cat(states_pieces, dim=0)                          # [BS, N, D]
+        prev_window_hiddens = (
+            torch.cat(hiddens_pieces, dim=0) if hiddens_pieces else None
+        )                                                                       # [BS, T, d_lm] or None
+        last_real_hidden = (
+            torch.cat(lrh_pieces, dim=0) if lrh_pieces else None
+        )                                                                       # [BS, 1, d_lm] or None
+
+        # ── Stack M cloned BS=1 caches → BS=M*K via the helper.
+        cloned_caches = [_copy.deepcopy(prefill[2]) for prefill in prefills]
+        kv_cache = self._stack_kv_caches(cloned_caches, K_per_cache=K)
+
+        # ── Output buffers.
+        generated = torch.full(
+            (BS, max_new_tokens), pad_id, dtype=torch.int64, device=device,
+        )
+        logp_old = torch.zeros((BS, max_new_tokens), device=device)
+        finished = torch.zeros(BS, dtype=torch.bool, device=device)
+        n_gen = 0
+
+        stop_ids_t = (
+            torch.tensor(list(stop_ids), dtype=torch.int64, device=device)
+            if stop_ids else None
+        )
+
+        def _update_finished(sampled: Tensor) -> None:
+            nonlocal finished
+            if stop_ids_t is not None:
+                is_stop = (sampled.unsqueeze(-1) == stop_ids_t).any(dim=-1)
+                finished = finished | is_stop
+
+        # ── First token: per-row position_ids since abs_pos differs across
+        # the M groups (each prompt had its own prefill length). Each row's
+        # next token is at position abs_pos_per_row[row].
+        lm_head_dtype = next(self.model.llama.lm_head.parameters()).dtype
+        first_hidden = (
+            last_real_hidden if last_real_hidden is not None
+            else prev_window_hiddens[:, -1:, :]
+        ).to(lm_head_dtype)
+        first_logits = self.model.llama.lm_head(first_hidden).float()
+        scaled = first_logits[:, -1, :] / temperature                          # [BS, V]
+        log_probs = F.log_softmax(scaled, dim=-1)
+        probs = log_probs.exp()
+        first_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)     # [BS]
+        generated[:, 0] = first_tokens
+        logp_old[:, 0] = log_probs.gather(
+            1, first_tokens.unsqueeze(-1),
+        ).squeeze(-1).detach()
+        n_gen = 1
+        _update_finished(first_tokens)
+
+        # ── Generation windows.
+        while n_gen < max_new_tokens and not finished.all():
+            if prev_window_hiddens is None:
+                prev_window_hiddens = torch.zeros(
+                    BS, T, cfg.d_lm,
+                    dtype=prev_states.dtype, device=device,
+                )
+            prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
+            read_visited, _ = self.model.read_module(
+                prev_hid_mem, prev_states, self.model.manifold, hard=False,
+            )
+            mem_inject = self.model._mem_inject_layer()
+            mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
+
+            window_hiddens_list: list[Tensor] = []
+            n_window = min(T, max_new_tokens - n_gen)
+            try:
+                for _ in range(n_window):
+                    last_token = generated[:, n_gen - 1:n_gen]                  # [BS, 1]
+                    cache_len_now = (
+                        kv_cache.get_seq_length() if kv_cache is not None else 0
+                    )
+                    cache_position = torch.tensor(
+                        [cache_len_now], dtype=torch.int64, device=device,
+                    )
+                    # Per-row position_ids — each row has its own abs_pos.
+                    position_ids = abs_pos_per_row.unsqueeze(-1)               # [BS, 1]
+                    base_out = self.model.llama.model(
+                        input_ids=last_token,
+                        past_key_values=kv_cache,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        use_cache=True,
+                    )
+                    abs_pos_per_row = abs_pos_per_row + 1
+                    kv_cache = base_out.past_key_values
+                    hidden = base_out.last_hidden_state                         # [BS, 1, d_lm]
+                    window_hiddens_list.append(hidden)
+
+                    logits = self.model.llama.lm_head(hidden).float()
+                    scaled = logits[:, -1, :] / temperature                     # [BS, V]
+                    log_probs = F.log_softmax(scaled, dim=-1)
+                    probs = log_probs.exp()
+                    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                    sampled = torch.where(
+                        finished, torch.full_like(sampled, pad_id), sampled,
+                    )
+                    logp_sample = log_probs.gather(
+                        1, sampled.unsqueeze(-1),
+                    ).squeeze(-1)
+                    logp_sample = torch.where(
+                        finished, torch.zeros_like(logp_sample), logp_sample,
+                    )
+
+                    generated[:, n_gen] = sampled
+                    logp_old[:, n_gen] = logp_sample.detach()
+                    n_gen += 1
+                    _update_finished(sampled)
+
+                    if finished.all():
+                        break
+            finally:
+                mem_inject.memory_fn = None
+
+            if not window_hiddens_list:
+                break
+
+            # WRITE at window end (BS=M*K). Mirror _ar_sample_batch's
+            # pad-token-forward strategy for partial windows.
+            cur_hiddens = torch.cat(window_hiddens_list, dim=1)                 # [BS, n_win, d_lm]
+            n_win = cur_hiddens.shape[1]
+
+            if n_win < T // 2:
+                pad_h = cur_hiddens[:, -1:, :].expand(BS, T - n_win, cfg.d_lm)
+                prev_window_hiddens = torch.cat([cur_hiddens, pad_h], dim=1)
+            else:
+                if n_win < T:
+                    n_pad = T - n_win
+                    pad_t = torch.full(
+                        (BS, n_pad), pad_id, dtype=torch.int64, device=device,
+                    )
+                    cache_len_now = (
+                        kv_cache.get_seq_length() if kv_cache is not None else 0
+                    )
+                    pad_cache_position = torch.arange(
+                        cache_len_now, cache_len_now + n_pad, device=device,
+                    )
+                    # Per-row pad position_ids (continue each row's abs_pos).
+                    pad_position_ids = (
+                        abs_pos_per_row.unsqueeze(-1)
+                        + torch.arange(n_pad, device=device).unsqueeze(0)
+                    )                                                            # [BS, n_pad]
+                    mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
+                    try:
+                        pad_out = self.model.llama.model(
+                            input_ids=pad_t,
+                            past_key_values=kv_cache,
+                            cache_position=pad_cache_position,
+                            position_ids=pad_position_ids,
+                            use_cache=True,
+                        )
+                    finally:
+                        mem_inject.memory_fn = None
+                    kv_cache = pad_out.past_key_values
+                    abs_pos_per_row = abs_pos_per_row + n_pad
+                    pad_hiddens = pad_out.last_hidden_state
+                    cur_hiddens_padded = torch.cat([cur_hiddens, pad_hiddens], dim=1)
+                else:
+                    cur_hiddens_padded = cur_hiddens
+
+                cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
+                surprise = torch.zeros(BS, dtype=prev_states.dtype, device=device)
+                new_states, _, _ = self.model.write_module(
+                    cur_hiddens_mem, surprise, prev_states, self.model.manifold,
+                    hard=False,
+                )
+                prev_states = new_states
+                prev_window_hiddens = cur_hiddens_padded
+
+            kv_cache = _trim_kv_cache(kv_cache, cap)
+
+        # ── Split per-row outputs into M groups of K, truncate each at first stop.
+        samples_grouped: list[list[Tensor]] = []
+        logps_grouped: list[list[Tensor]] = []
+        for g in range(M):
+            group_samples: list[Tensor] = []
+            group_logps: list[Tensor] = []
+            for k in range(K):
+                row = g * K + k
+                seq = generated[row, :n_gen]
+                lp = logp_old[row, :n_gen]
+                if stop_ids_t is not None and seq.numel() > 0:
+                    is_stop = (seq.unsqueeze(-1) == stop_ids_t).any(dim=-1)
+                    stop_pos = is_stop.nonzero(as_tuple=True)[0]
+                    if stop_pos.numel() > 0:
+                        first_stop = int(stop_pos[0].item())
+                        seq = seq[:first_stop + 1]
+                        lp = lp[:first_stop + 1]
+                group_samples.append(seq.cpu())
+                group_logps.append(lp.cpu())
+            samples_grouped.append(group_samples)
+            logps_grouped.append(group_logps)
+        return samples_grouped, logps_grouped
 
     # ── PASS 2: TF logp computation (with grad, single backward, KV-cached) ──
 
