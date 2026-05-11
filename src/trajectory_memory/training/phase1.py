@@ -20,6 +20,7 @@ preserved for backward-compatibility with the old train_wave*.py scripts.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -482,7 +483,11 @@ class Phase1Trainer:
     # ── helpers ───────────────────────────────────────────────────────
 
     def _clip_and_step(self) -> float:
-        """Clip gradients, step optimizer + scheduler, return grad_norm."""
+        """Clip gradients, step optimizer + scheduler, return grad_norm.
+
+        Skips optimizer.step() if grad_norm is non-finite so callers can
+        abort cleanly without a NaN/Inf weight corruption first.
+        """
         if self.grad_clip is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 (p for p in self.model.parameters() if p.requires_grad),
@@ -490,10 +495,14 @@ class Phase1Trainer:
             )
         else:
             grad_norm = torch.tensor(0.0)
+        gn_val = float(grad_norm)
+        if not math.isfinite(gn_val):
+            self.optimizer.zero_grad(set_to_none=True)
+            return gn_val
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
-        return float(grad_norm)
+        return gn_val
 
     def _current_lrs(self) -> list[float]:
         return [g["lr"] for g in self.optimizer.param_groups]

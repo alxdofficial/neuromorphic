@@ -723,6 +723,186 @@ def test_phase2_step_does_not_mutate_manifold_buffer():
     )
 
 
+# ── BS_outer KV-cache stacking (unit + slow real-LM integration) ──────
+
+
+def test_stack_kv_caches_layout():
+    """`_stack_kv_caches` must produce a (M*K) batched cache where rows
+    [g*K:(g+1)*K] are K replicas of caches[g]. Verifies layout used by
+    `_ar_sample_outer_batch` for per-prompt-group advantage stride."""
+    from transformers import DynamicCache
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.0)
+
+    M = 3
+    K = 2
+    T = 8
+    n_heads = 2
+    head_dim = 4
+    caches = []
+    for g in range(M):
+        c = DynamicCache()
+        for li in range(2):
+            lay = type(c.layers[li] if c.layers else c.layers)
+        # Build with two layers — use the existing class on a primed cache.
+        # Easiest: call cache.update() once per layer to materialize.
+        for li in range(2):
+            # Distinct values per (group, layer) so we can verify striping.
+            k_fill = float(g * 10 + li + 1)
+            v_fill = float(g * 10 + li + 1 + 100)
+            k = torch.full((1, n_heads, T, head_dim), k_fill)
+            v = torch.full((1, n_heads, T, head_dim), v_fill)
+            c.update(k, v, layer_idx=li)
+        caches.append(c)
+
+    out = trainer._stack_kv_caches(caches, K_per_cache=K)
+    assert out is not None
+    assert len(out.layers) == 2
+    for li in range(2):
+        keys = out.layers[li].keys
+        assert keys.shape == (M * K, n_heads, T, head_dim), (
+            f"expected [{M*K}, {n_heads}, {T}, {head_dim}], got {keys.shape}"
+        )
+        # Stride check: rows [g*K:(g+1)*K] should match caches[g]'s fill.
+        for g in range(M):
+            expected = float(g * 10 + li + 1)
+            block = keys[g * K:(g + 1) * K]
+            assert torch.allclose(block, torch.full_like(block, expected)), (
+                f"layer={li}, group={g}: expected fill={expected}, got "
+                f"{block.flatten()[:4].tolist()}"
+            )
+
+
+def test_stack_kv_caches_asserts_uniform_length():
+    """`_stack_kv_caches` requires all input caches to have the same
+    seq_length — non-uniform should raise AssertionError so callers
+    can surface the bucketing bug instead of silently misalign."""
+    from transformers import DynamicCache
+    torch.manual_seed(0)
+    model = _build_test_model(D=2)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.0)
+
+    n_heads = 2
+    head_dim = 4
+    c1 = DynamicCache()
+    c1.update(torch.zeros(1, n_heads, 8, head_dim),
+              torch.zeros(1, n_heads, 8, head_dim), layer_idx=0)
+    c2 = DynamicCache()
+    c2.update(torch.zeros(1, n_heads, 12, head_dim),
+              torch.zeros(1, n_heads, 12, head_dim), layer_idx=0)
+
+    with pytest.raises(AssertionError, match="same.*seq_length"):
+        trainer._stack_kv_caches([c1, c2], K_per_cache=2)
+
+
+@pytest.mark.slow
+def test_phase2_step_batched_attach_lm_end_to_end():
+    """End-to-end smoke of `step_batched` with attach_lm=True — exercises
+    real Llama prefill, `_ar_sample_outer_batch` with stacked DynamicCache,
+    per-row RoPE positions, and MemInjectLayer. Slow (loads Llama-3.2-1B
+    + runs one step), marked `slow` so it skips by default."""
+    from transformers import AutoTokenizer
+    cfg = TrajMemConfig.medium()
+    # Shrink memory side for test speed; d_lm must match Llama-3.2-1B (2048).
+    cfg.N = 64
+    cfg.D = 2
+    cfg.J = 2
+    cfg.K_read = 2
+    cfg.K_write = 2
+    cfg.K_max_neighbors = 8
+    cfg.radius = 4
+    # Shrink T_window so a modest test prompt can still trigger ≥1 full
+    # window of forward_window (where write_module fires). With the medium
+    # default T_window=256, the test prompts below would all go through
+    # the no-write trailing-tail path and #4 wouldn't be exercised.
+    cfg.T_window = 64
+    cfg.effective_lm_context = 256
+    cfg.validate()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    model = IntegratedLM(cfg, attach_lm=True).to(device)
+    opt = _build_optimizer(model)
+    trainer = Phase2Trainer(model, opt, grad_clip=1.0, kl_coef=0.0)
+
+    # Two prompts long enough (>= T_window=64) so prefill encodes ≥1 full
+    # window and write_module fires during it.
+    M = 2
+    K = 2
+    long_prompt_text = (
+        "Paris is the capital of France. " * 20
+        + "What is the capital of France?"
+    )
+    long_prompt_text_2 = (
+        "Jupiter is the largest planet in our solar system. " * 20
+        + "Which is the largest planet?"
+    )
+    prompts = [
+        torch.tensor(tokenizer.encode(long_prompt_text), dtype=torch.int64)
+            .unsqueeze(0).to(device),
+        torch.tensor(tokenizer.encode(long_prompt_text_2), dtype=torch.int64)
+            .unsqueeze(0).to(device),
+    ]
+    # Pad/truncate to equal length.
+    L = min(p.shape[1] for p in prompts)
+    prompts = [p[:, :L] for p in prompts]
+    assert L >= cfg.T_window, (
+        f"Test prompts must be ≥ T_window={cfg.T_window} for write_module "
+        f"to fire during prefill; got L={L}"
+    )
+
+    per_prompt_meta = [
+        {"reward_kind": "exact_match", "gold": "Paris", "meta": {}},
+        {"reward_kind": "exact_match", "gold": "Jupiter", "meta": {}},
+    ]
+    # Inject non-degenerate rewards so advantages aren't all-zero (would
+    # trigger the no_signal early-exit and zero gradients before our
+    # write_module-grad check). On an untrained Llama-3.2-1B base the
+    # actual reward is almost always 0, so we mock per-sample rewards
+    # to give a non-trivial advantage signal.
+    import src.trajectory_memory.training.phase2 as phase2_mod
+    rewards_iter = iter([0.0, 1.0, 1.0, 0.0])  # M*K=4 with mixed advantage per group
+    orig_compute = phase2_mod.compute_reward
+    try:
+        phase2_mod.compute_reward = lambda *a, **k: next(rewards_iter)
+        metrics = trainer.step_batched(
+            prompts, per_prompt_meta,
+            num_samples=K, max_new_tokens=4,
+            tokenizer=tokenizer,
+        )
+    finally:
+        phase2_mod.compute_reward = orig_compute
+
+    assert math.isfinite(metrics.policy_loss)
+    assert len(metrics.rewards) == M * K
+    assert len(metrics.decoded) == M * K
+    assert math.isfinite(metrics.grad_norm)
+
+    # (#4) write_module must receive gradient from Phase 2 GRPO. Confirms
+    # the train_writes=True prefill + un-detached clone path actually
+    # wires reward signal back to prompt-side memory writes. Before #4
+    # this check would have failed: every write_module parameter would
+    # have grad either None or all-zeros.
+    write_module_has_grad = False
+    write_grad_count = 0
+    write_total = 0
+    for name, p in trainer.model.write_module.named_parameters():
+        if not p.requires_grad:
+            continue
+        write_total += 1
+        if p.grad is not None and p.grad.abs().sum() > 0:
+            write_module_has_grad = True
+            write_grad_count += 1
+    assert write_module_has_grad, (
+        f"write_module received no gradient — Pass 2 backward did not "
+        f"reach into the prompt prefill's autograd graph. #4 fix broken. "
+        f"({write_grad_count}/{write_total} params have nonzero grad)"
+    )
+
+
 # ── BERT cosine availability (slow, optional) ──────────────────────────
 
 

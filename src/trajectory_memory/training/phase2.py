@@ -41,6 +41,8 @@ legacy `grpo_step` free function is preserved for back-compat.
 
 from __future__ import annotations
 
+import math
+from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -333,8 +335,14 @@ class Phase2Trainer:
         # plumbing.
         pass1_prefill_shared = None
         if self.model.llama is not None:
+            # train_writes=True keeps write_module's autograd graph alive
+            # so Pass 2 backward propagates reward signal into the prompt-
+            # side memory writes (audit fix #4). Llama and read_module
+            # still run no_grad inside _prefill_prompt — only write_module
+            # activations are retained.
             pass1_prefill_shared = self._prefill_prompt(
                 prompt_ids, pad_id=pad_id, device=device,
+                train_writes=True,
             )
 
         if self.model.llama is not None:
@@ -464,11 +472,16 @@ class Phase2Trainer:
                 continue
             # Per-sample prefill state: deep-clone the shared prefill so
             # each sample's writes evolve the manifold + cache independently.
+            # CRITICAL (#4 fix): do NOT .detach() the manifold state — we
+            # want backward to flow through it back to write_module's
+            # autograd graph from Pass 1 prefill. The .clone() preserves
+            # graph linkage. (Llama hiddens and KV cache are no_grad —
+            # detaching them is fine, no graph to preserve.)
             if shared_prefill is not None:
                 import copy
                 _sps, _sph, _skv, _slr, _sap = shared_prefill
                 prefill_state = (
-                    _sps.detach().clone(),
+                    _sps.clone(),
                     _sph.detach().clone() if _sph is not None else None,
                     copy.deepcopy(_skv),  # KV cache deep-clone
                     _slr.detach().clone() if _slr is not None else None,
@@ -531,13 +544,19 @@ class Phase2Trainer:
                 kl_sum += float(kl_per_tok.detach().sum())
                 kl_count += int(n_new)
 
-            # Per-sample backward — frees this sample's activation graph
-            # before next iteration builds its own.
+            # Per-sample backward — frees this sample's TF replay graph,
+            # but keeps the SHARED prefill graph alive (via retain_graph)
+            # so the next sample's backward can also flow through
+            # write_module. The shared prefill graph is freed when the
+            # `shared_prefill` reference goes out of scope at function end.
             sample_total_loss = sample_policy_loss + self.kl_coef * sample_kl_loss
-            sample_total_loss.backward()
+            sample_total_loss.backward(retain_graph=True)
             total_loss_value += float(sample_total_loss.detach())
             any_grad = True
 
+        # Release the shared prefill graph explicitly so the next step's
+        # prefill activations don't pile on top.
+        del shared_prefill, pass1_prefill_shared
         if any_grad:
             grad_norm = self._clip_and_step()
         else:
@@ -602,14 +621,19 @@ class Phase2Trainer:
         M = len(prompts)
         K = num_samples
 
-        # ── PASS 1 prefill: M sequential BS=1 prefills (no_grad). Each is
-        # fast and the time savings of batching prefill (vs the gain from
-        # batching the much longer AR rollout) is small relative to the
-        # complexity of variable-length BS=M prefill with attention_mask.
+        # ── PASS 1 prefill: M sequential BS=1 prefills. Each is fast and
+        # the time savings of batching prefill (vs the gain from batching
+        # the much longer AR rollout) is small relative to the complexity
+        # of variable-length BS=M prefill with attention_mask.
+        # train_writes=True keeps each prompt's write_module autograd
+        # graph alive so Pass 2 backward propagates reward signal into
+        # prompt-side memory writes (audit fix #4).
         prefills = []
         if self.model.llama is not None:
             for p in prompts:
-                prefills.append(self._prefill_prompt(p, pad_id=pad_id, device=device))
+                prefills.append(self._prefill_prompt(
+                    p, pad_id=pad_id, device=device, train_writes=True,
+                ))
 
         # ── PASS 1 batched AR: M*K rollouts in parallel.
         if self.model.llama is not None:
@@ -720,10 +744,14 @@ class Phase2Trainer:
                     continue
 
                 # Per-sample TF replay with prompt g's prefill state.
+                # (#4 fix) Keep `_sps.clone()` un-detached so backward
+                # flows through Pass 1's write_module graph; Llama hiddens
+                # + KV cache are no_grad regardless, so .detach() on
+                # _sph/_slr is fine.
                 if self.model.llama is not None and prefills:
                     _sps, _sph, _skv, _slr, _sap = prefills[g]
                     prefill_state = (
-                        _sps.detach().clone(),
+                        _sps.clone(),
                         _sph.detach().clone() if _sph is not None else None,
                         _copy.deepcopy(_skv),
                         _slr.detach().clone() if _slr is not None else None,
@@ -764,10 +792,17 @@ class Phase2Trainer:
                     kl_count += int(n_new)
 
                 sample_total_loss = sample_policy_loss + self.kl_coef * sample_kl_loss
-                sample_total_loss.backward()
+                # (#4 fix) retain_graph=True keeps the shared prefill
+                # autograd graph alive across all M*K per-sample backwards,
+                # so write_module receives gradient contributions from all
+                # samples that traverse it. Graph is freed when prefills
+                # goes out of scope at function end.
+                sample_total_loss.backward(retain_graph=True)
                 total_loss_value += float(sample_total_loss.detach())
                 any_grad = True
 
+        # Release the shared prefill graph explicitly.
+        del prefills
         if any_grad:
             grad_norm = self._clip_and_step()
         else:
@@ -796,13 +831,13 @@ class Phase2Trainer:
 
     # ── PASS 1: no-grad AR sampling (with prefill, KV-cached) ────────
 
-    @torch.no_grad()
     def _prefill_prompt(
         self,
         prompt_ids: Tensor,
         *,
         pad_id: int,
         device: torch.device,
+        train_writes: bool = False,
     ) -> tuple[Tensor, Tensor | None, object, Tensor | None, int]:
         """Walk forward_window over the prompt in T_window-sized windows,
         accumulating manifold state AND populating an HF KV cache.
@@ -833,9 +868,40 @@ class Phase2Trainer:
         properly written into memory in the old per-token AR loop;
         prefill makes the entire prompt's T-aligned portion visible.
 
-        no_grad — pure inference setup. Pass 2 redoes a TF forward with
-        grad if memory writes need gradient signal.
+        train_writes — when True, enables grad through write_module
+        during the prefill so Pass 2 backward propagates into write_module
+        via manifold_state → read_module path. Llama and read_module
+        still run in no_grad (frozen / not needed for prefill-side grad);
+        write_module's intermediate activations get stored (~MB-scale).
+        When False (default), the whole prefill runs no_grad — used for
+        the reference-policy prefill and other callers that don't need
+        write-module gradient flow.
+
+        Pass 2 redoes a TF forward with grad over the response either way.
         """
+        from src.trajectory_memory.tbptt import _trim_kv_cache
+        # When train_writes=False we want strict no_grad over the whole
+        # body. When True, the forward_window calls thread grad through
+        # write_module specifically; the trailing tail encode below is
+        # explicitly wrapped in no_grad since no write fires there.
+        outer_grad_ctx = (
+            _nullcontext() if train_writes else torch.no_grad()
+        )
+        with outer_grad_ctx:
+            return self._prefill_prompt_body(
+                prompt_ids, pad_id=pad_id, device=device,
+                train_writes=train_writes,
+            )
+
+    def _prefill_prompt_body(
+        self,
+        prompt_ids: Tensor,
+        *,
+        pad_id: int,
+        device: torch.device,
+        train_writes: bool,
+    ) -> tuple[Tensor, Tensor | None, object, Tensor | None, int]:
+        """Inner prefill loop. See `_prefill_prompt` for docs."""
         from src.trajectory_memory.tbptt import _trim_kv_cache
 
         cfg = self.model.cfg
@@ -869,6 +935,7 @@ class Phase2Trainer:
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit,
                 cache_abs_pos=abs_pos,
+                write_only_grad=train_writes,
             )
             prev_states = out["new_states"]
             prev_window_hiddens = out["current_hiddens"]
@@ -904,13 +971,19 @@ class Phase2Trainer:
                 return torch.zeros_like(h_mem)
             mem_inject.memory_fn = _zero_memory
             try:
-                base_out = self.model.llama.model(
-                    input_ids=tail_t,
-                    past_key_values=kv_cache,
-                    cache_position=cache_position,
-                    position_ids=position_ids,
-                    use_cache=True,
-                )
+                # No write_module fires in the tail encode — Llama-only,
+                # just to extend the KV cache + grab last_real_hidden.
+                # Wrap in no_grad even when train_writes=True since this
+                # path's hiddens are only used for AR rollout's first
+                # generated token, never feed write_module.
+                with torch.no_grad():
+                    base_out = self.model.llama.model(
+                        input_ids=tail_t,
+                        past_key_values=kv_cache,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        use_cache=True,
+                    )
             finally:
                 mem_inject.memory_fn = None
             kv_cache = base_out.past_key_values
@@ -2075,6 +2148,11 @@ class Phase2Trainer:
     # ── helpers ───────────────────────────────────────────────────────
 
     def _clip_and_step(self) -> float:
+        """Clip gradients, step optimizer + scheduler, return grad_norm.
+
+        Skips optimizer.step() if grad_norm is non-finite so callers can
+        abort cleanly without a NaN/Inf weight corruption first.
+        """
         if self.grad_clip is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 (p for p in self.model.parameters() if p.requires_grad),
@@ -2082,10 +2160,14 @@ class Phase2Trainer:
             )
         else:
             grad_norm = torch.tensor(0.0)
+        gn_val = float(grad_norm)
+        if not math.isfinite(gn_val):
+            self.optimizer.zero_grad(set_to_none=True)
+            return gn_val
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
-        return float(grad_norm)
+        return gn_val
 
 
 # ── Legacy free functions ─────────────────────────────────────────────

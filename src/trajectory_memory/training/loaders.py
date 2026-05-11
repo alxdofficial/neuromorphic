@@ -415,8 +415,12 @@ class BatchedLongDocDataset(IterableDataset):
                     slot["chunk_idx"] = 0
                     slot["source_name"] = self._sources[src_idx]["name"]
 
-            # End-of-epoch: any slot that still has no doc → epoch done.
-            if any(slot["doc"] is None for slot in slots):
+            # End-of-epoch: only when ALL slots are empty (pool dry AND
+            # every slot has finished its last doc). If only some slots
+            # are empty, drain the remaining ones by padding inactive
+            # slots with mask=0 — this avoids dropping the tail of up to
+            # BS-1 docs whenever the source pool dries up.
+            if all(slot["doc"] is None for slot in slots):
                 return
 
             # Build one batched chunk: pull current chunk from each slot.
@@ -426,6 +430,22 @@ class BatchedLongDocDataset(IterableDataset):
             batch_sources: list[str] = []
 
             for slot in slots:
+                if slot["doc"] is None:
+                    # Inactive slot — emit a pad chunk with zero mask so
+                    # the trainer computes no loss on it. is_start=False
+                    # to avoid spurious lockstep resets of the active
+                    # slots that still have valid docs.
+                    pad_chunk = [self.pad_id] * self.chunk_tokens
+                    batch_input_ids.append(
+                        torch.tensor(pad_chunk, dtype=torch.int64),
+                    )
+                    batch_is_start.append(False)
+                    batch_valid_mask.append(
+                        torch.zeros(self.chunk_tokens, dtype=torch.float32),
+                    )
+                    batch_sources.append("")
+                    continue
+
                 doc_ids = slot["doc"]
                 ci = slot["chunk_idx"]
                 start = ci * self.chunk_tokens

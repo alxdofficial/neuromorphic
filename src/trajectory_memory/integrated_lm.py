@@ -19,6 +19,7 @@ target-eligible positions. The data loader provides the target mask
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext as _nullcontext
 
 import torch
 import torch.nn as nn
@@ -191,6 +192,7 @@ class IntegratedLM(nn.Module):
         use_kv_cache: bool = False,
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
+        write_only_grad: bool = False,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -277,7 +279,16 @@ class IntegratedLM(nn.Module):
         # use_reentrant=False the per-hop python loop checkpoints cleanly
         # — backward recomputes the trajectory in one extra forward pass.
         # In no_grad / eval contexts checkpoint is a no-op.
-        if torch.is_grad_enabled():
+        if write_only_grad:
+            # Phase 2 prompt prefill: we ONLY want grad through write_module
+            # to train prompt-side memory encoding. Read trajectories during
+            # prefill don't need grad — Pass 2 response replay covers
+            # response-time reads with grad. Saves activation memory.
+            with torch.no_grad():
+                read_visited, read_visited_ids = self.read_module(
+                    prev_hid_mem, prev_states, self.manifold, hard=hard_routing,
+                )
+        elif torch.is_grad_enabled():
             read_visited, read_visited_ids = torch.utils.checkpoint.checkpoint(
                 self.read_module,
                 prev_hid_mem, prev_states, self.manifold,
@@ -321,39 +332,45 @@ class IntegratedLM(nn.Module):
             mem_inject = self._mem_inject_layer()
             mem_inject.memory_fn = self._build_memory_fn(read_visited)
             new_past_key_values = None
+            # Llama is frozen — when `write_only_grad` is set we wrap its
+            # forward in no_grad so its activations are not stored for
+            # backward (saves ~32MB/window × #windows). Write_module still
+            # gets grad via the detached current_hiddens path below.
+            llama_ctx = torch.no_grad() if write_only_grad else _nullcontext()
             try:
-                if use_kv_cache:
-                    # KV-cache mode (Phase 2 rollout): encode only the new
-                    # `n_new` tokens against `past_key_values`. Pass
-                    # cache_position (cache-internal indices) and
-                    # position_ids (absolute, for RoPE) separately. See
-                    # earlier comment about LABEL LEAK if these are mixed.
-                    n_new = lm_input_ids.shape[1]
-                    cache_len_before = (
-                        past_key_values.get_seq_length()
-                        if past_key_values is not None else 0
-                    )
-                    cache_position = torch.arange(
-                        cache_len_before, cache_len_before + n_new,
-                        device=lm_input_ids.device,
-                    )
-                    position_ids = torch.arange(
-                        cache_abs_pos, cache_abs_pos + n_new,
-                        device=lm_input_ids.device,
-                    ).unsqueeze(0)
-                    base_out = self.llama.model(
-                        input_ids=lm_input_ids,
-                        past_key_values=past_key_values,
-                        cache_position=cache_position,
-                        position_ids=position_ids,
-                        use_cache=True,
-                    )
-                    new_past_key_values = base_out.past_key_values
-                else:
-                    base_out = self.llama.model(
-                        input_ids=lm_input_ids,
-                        use_cache=False,
-                    )
+                with llama_ctx:
+                    if use_kv_cache:
+                        # KV-cache mode (Phase 2 rollout): encode only the new
+                        # `n_new` tokens against `past_key_values`. Pass
+                        # cache_position (cache-internal indices) and
+                        # position_ids (absolute, for RoPE) separately. See
+                        # earlier comment about LABEL LEAK if these are mixed.
+                        n_new = lm_input_ids.shape[1]
+                        cache_len_before = (
+                            past_key_values.get_seq_length()
+                            if past_key_values is not None else 0
+                        )
+                        cache_position = torch.arange(
+                            cache_len_before, cache_len_before + n_new,
+                            device=lm_input_ids.device,
+                        )
+                        position_ids = torch.arange(
+                            cache_abs_pos, cache_abs_pos + n_new,
+                            device=lm_input_ids.device,
+                        ).unsqueeze(0)
+                        base_out = self.llama.model(
+                            input_ids=lm_input_ids,
+                            past_key_values=past_key_values,
+                            cache_position=cache_position,
+                            position_ids=position_ids,
+                            use_cache=True,
+                        )
+                        new_past_key_values = base_out.past_key_values
+                    else:
+                        base_out = self.llama.model(
+                            input_ids=lm_input_ids,
+                            use_cache=False,
+                        )
             finally:
                 # Always clear closure to avoid leaking refs across windows.
                 mem_inject.memory_fn = None

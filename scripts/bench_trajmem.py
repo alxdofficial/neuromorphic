@@ -78,7 +78,10 @@ def run_one_bs(
         optimizer = build_optimizer(
             model, lr_memory=3e-4, lr_adapter=1e-4,
         )
-        trainer = Phase1Trainer(model, optimizer, scheduler=None, grad_clip=1.0)
+        trainer = Phase1Trainer(
+            model, optimizer, scheduler=None, grad_clip=1.0,
+            use_kv_cache=args.use_kv_cache,
+        )
     except torch.cuda.OutOfMemoryError:
         print(f"  [BS={BS}]                                          OOM during model build")
         cleanup_cuda()
@@ -87,6 +90,7 @@ def run_one_bs(
     label = (
         f"trajmem step (tier={args.config_tier}"
         + (", compile" if args.compile else "")
+        + ("" if args.use_kv_cache else ", no-KV")
         + f", BS={BS})"
     )
     step_fn = _make_step_fn(trainer, BS, T_chunk, model.llama.config.vocab_size, device)
@@ -112,6 +116,11 @@ def main():
                     help="Cap for the doubling sweep")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the per-window forward")
+    ap.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
+                    help="Disable KV cache (rolling-buffer mode). Tests "
+                         "the speed cost of dropping KV cache to resolve "
+                         "#1 (lockstep multi-stream wipe).")
+    ap.set_defaults(use_kv_cache=True)
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--warmup", type=int, default=3)

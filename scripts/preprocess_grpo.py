@@ -169,19 +169,32 @@ def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384,
     if not paragraphs or not question or not answer:
         return None
 
-    # Build context with one paragraph per line, title-prefixed.
-    parts = []
+    # Build context with one paragraph per line, title-prefixed. Split
+    # into supporting (answer-evidence) and other so distractor injection
+    # can pin supporting in the front half.
+    supporting_parts = []
+    other_parts = []
     for p in paragraphs:
         title = p.get("title", "").strip()
         body = p.get("paragraph_text", "").strip()
         if not body:
             continue
-        parts.append(f"Title: {title}\n{body}" if title else body)
+        formatted = f"Title: {title}\n{body}" if title else body
+        if p.get("is_supporting"):
+            supporting_parts.append(formatted)
+        else:
+            other_parts.append(formatted)
+    parts = supporting_parts + other_parts
 
     if pool is not None and n_distractors > 0 and rng is not None:
-        context = _inject_distractors(parts, pool, n_distractors, rng)
+        context = _inject_distractors(
+            supporting_parts, other_parts, pool, n_distractors, rng,
+        )
     else:
-        context = "\n\n".join(parts)
+        all_parts = list(parts)
+        if rng is not None:
+            rng.shuffle(all_parts)
+        context = "\n\n".join(all_parts)
     intro = "Read the following passages and answer the question.\n\n"
     suffix = f"\n\nQuestion: {question}\n\nAnswer:"
 
@@ -225,17 +238,32 @@ def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384,
     if not titles or not sentences or not question or not answer:
         return None
 
-    parts = []
+    # supporting_facts.title lists the titles of paragraphs that hold the
+    # answer evidence. Use that to split into supporting vs distractor own.
+    sf = ex.get("supporting_facts") or {}
+    supporting_titles = set(sf.get("title") or [])
+
+    supporting_parts = []
+    other_parts = []
     for title, sents in zip(titles, sentences):
         body = " ".join(s.strip() for s in sents if s).strip()
         if not body:
             continue
-        parts.append(f"Title: {title}\n{body}")
+        formatted = f"Title: {title}\n{body}"
+        if title in supporting_titles:
+            supporting_parts.append(formatted)
+        else:
+            other_parts.append(formatted)
 
     if pool is not None and n_distractors > 0 and rng is not None:
-        context = _inject_distractors(parts, pool, n_distractors, rng)
+        context = _inject_distractors(
+            supporting_parts, other_parts, pool, n_distractors, rng,
+        )
     else:
-        context = "\n\n".join(parts)
+        all_parts = supporting_parts + other_parts
+        if rng is not None:
+            rng.shuffle(all_parts)
+        context = "\n\n".join(all_parts)
     intro = "Read the following passages and answer the question.\n\n"
     suffix = f"\n\nQuestion: {question}\n\nAnswer:"
 
@@ -278,17 +306,32 @@ def _2wikimultihop_extract(ex, *, tokenizer=None, max_prompt_tokens=8192,
     if not titles or not sentences or not question or not answer:
         return None
 
-    parts = []
+    # supporting_facts.title lists titles of evidence paragraphs (same
+    # schema as HotpotQA).
+    sf = ex.get("supporting_facts") or {}
+    supporting_titles = set(sf.get("title") or [])
+
+    supporting_parts = []
+    other_parts = []
     for title, sents in zip(titles, sentences):
         body = " ".join(s.strip() for s in sents if isinstance(s, str)).strip()
         if not body:
             continue
-        parts.append(f"Title: {title}\n{body}")
+        formatted = f"Title: {title}\n{body}"
+        if title in supporting_titles:
+            supporting_parts.append(formatted)
+        else:
+            other_parts.append(formatted)
 
     if pool is not None and n_distractors > 0 and rng is not None:
-        context = _inject_distractors(parts, pool, n_distractors, rng)
+        context = _inject_distractors(
+            supporting_parts, other_parts, pool, n_distractors, rng,
+        )
     else:
-        context = "\n\n".join(parts)
+        all_parts = supporting_parts + other_parts
+        if rng is not None:
+            rng.shuffle(all_parts)
+        context = "\n\n".join(all_parts)
     if not context:
         return None
     intro = "Read the following passages and answer the question.\n\n"
@@ -357,19 +400,48 @@ def _build_paragraph_pool_musique(examples: list[dict]) -> list[tuple[str, str]]
 
 
 def _inject_distractors(
-    own_parts: list[str],
+    supporting_parts: list[str],
+    other_own_parts: list[str],
     pool: list[tuple[str, str]],
     n_distractors: int,
     rng,
 ) -> str:
-    """Interleave the example's own context paragraphs with N random
-    distractor paragraphs sampled from `pool`. Order is randomized so
-    supporting paragraphs aren't always grouped at the start."""
+    """Interleave the example's context paragraphs with N random distractor
+    paragraphs sampled from `pool`.
+
+    Supporting paragraphs (the ones that contain the answer evidence) are
+    placed at random positions in the front half of the result so that
+    later prefix-truncation that keeps ≥50% of paragraphs is guaranteed
+    to preserve every supporting one. Non-supporting own + distractors
+    fill the remaining slots in random order.
+
+    Args:
+        supporting_parts: paragraphs that contain answer-evidence;
+                          must survive truncation.
+        other_own_parts:  the example's other own paragraphs (no
+                          evidence); can be dropped by truncation.
+        pool:             distractor pool of (title, body) pairs.
+        n_distractors:    how many distractors to inject from `pool`.
+    """
     distractor_idxs = rng.sample(range(len(pool)), min(n_distractors, len(pool)))
-    extra_parts = [f"Title: {t}\n{b}" if t else b for t, b in (pool[i] for i in distractor_idxs)]
-    combined = list(own_parts) + extra_parts
-    rng.shuffle(combined)
-    return "\n\n".join(combined)
+    distractors = [
+        f"Title: {t}\n{b}" if t else b
+        for t, b in (pool[i] for i in distractor_idxs)
+    ]
+    others = list(other_own_parts) + distractors
+    rng.shuffle(others)
+
+    if not supporting_parts:
+        return "\n\n".join(others)
+
+    total = len(supporting_parts) + len(others)
+    front_cap = max(len(supporting_parts), total // 2)
+    front_others_count = max(0, front_cap - len(supporting_parts))
+    front = list(supporting_parts) + others[:front_others_count]
+    rng.shuffle(front)
+    back = others[front_others_count:]
+    rng.shuffle(back)
+    return "\n\n".join(front + back)
 
 
 def _quality_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):

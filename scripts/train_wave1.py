@@ -136,14 +136,19 @@ def main():
     # cache (1.79× speedup, ~3 GB less mem) over checkpointing.
 
     if args.compile:
-        # dynamic=True: forward_window's lm_input_ids varies in length as the
-        # rolling buffer grows (256, 512, 768, ..., up to effective_lm_context).
-        # With dynamic=False we recompile per shape and hit dynamo's
-        # recompile_limit (8) by chunk 3. dynamic=True trades 6% per-step
-        # speed for stable performance across chunks. See
-        # `scripts/experiment_compile_dynamic.py`.
+        # dynamic=False: KV-cache mode (default) means every forward_window
+        # call passes lm_input_ids of fixed length T_window=256 — no shape
+        # variation, so no recompile cliff. dynamic=True was needed when
+        # we used rolling-buffer mode (lm_input_ids grew 256/512/.../2048
+        # across windows of a chunk), but with the KV cache restored
+        # (2026-05-11) the rolling-buffer path is only the fallback.
+        # dynamic=True also triggers an AOT autograd partitioner bug with
+        # our combination of bf16 autocast + activation checkpointing on
+        # trajectory generators: `AssertionError: Node add_NNNN was
+        # invalid, but is output` from `min_cut_rematerialization_partition`.
+        # dynamic=False avoids the bug and is faster.
         model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=True,
+            model.forward_window, mode="default", dynamic=False,
         )
         print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
 
@@ -154,10 +159,19 @@ def main():
         total_steps=args.num_steps,
         lr_min_ratio=args.lr_min_ratio,
     )
+    # use_kv_cache=False (rolling-buffer mode). At BS=8 multi-stream, the
+    # shared KV cache had to be wiped lockstep whenever ANY slot crossed
+    # a doc boundary — which happens ~90% of windows given typical
+    # ~1000-token doc lengths. Net effect: Llama's "long-context" KV
+    # benefit was lost almost every window anyway. Rolling-buffer mode
+    # is ~2.15× slower per step but threads each slot's context per-row
+    # via lm_buffer, eliminating the lockstep-wipe contamination.
+    # See docs/bench_results.md for the comparison.
     trainer = Phase1Trainer(
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
         prior_loss_weight=0.0,  # W1 has no prior/response distinction
+        use_kv_cache=False,
     )
 
     if args.checkpoint_in is not None:
@@ -408,11 +422,16 @@ def main():
                 step_sources = [getattr(item, "source", "") or "unknown"]
             else:
                 # ── Multi-stream path (BS > 1) ───────────────────────
-                # Per-slot reset on prev_states (batched, easy). KV cache
-                # is shared across the batch — when ANY slot crosses a doc
-                # boundary we wipe past_kv lockstep (simpler than the
-                # per-slot 4D-mask machinery we deleted; small efficiency
-                # cost for big code simplification).
+                # Per-slot reset on prev_states (batched, easy). Rolling-
+                # buffer mode (use_kv_cache=False) — lm_buffer is per-row
+                # but shares a uniform row length, so we still lockstep-
+                # wipe it on any-slot-boundary to avoid prior-doc tokens
+                # leaking into a new-doc slot's row. The win over the
+                # KV-cache path: no shared cache with position-coupled
+                # rotations, so the "Llama sees only 256 tokens of context"
+                # contamination at every boundary is gone — non-resetting
+                # slots rebuild their rolling-buffer context within a few
+                # windows.
                 BS_chunk = item.input_ids.shape[0]
                 is_start = item.is_doc_start_per_slot.to(args.device)  # [BS]
 
@@ -428,13 +447,13 @@ def main():
                     prev_states = torch.where(
                         is_start[:, None, None], fresh_states, prev_states,
                     )
-                    if prev_window_hiddens is not None:
-                        prev_window_hiddens = torch.where(
-                            is_start[:, None, None],
-                            torch.zeros_like(prev_window_hiddens),
-                            prev_window_hiddens,
-                        )
-                    # Lockstep KV cache reset.
+                    # Lockstep wipe of LM-side state to keep memory and
+                    # Llama temporally aligned. Per-slot doc start signals
+                    # "no predecessor"; matching single-stream semantics,
+                    # we set prev_window_hiddens to None instead of zeros
+                    # so run_chunk skips first-token-of-window prediction
+                    # rather than predicting from fake-zero context.
+                    prev_window_hiddens = None
                     past_kv = None
                     cache_abs_pos = 0
                     prev_lm_context = None
@@ -592,9 +611,26 @@ def main():
                 avg = sum(losses[-args.log_every:]) / max(len(losses[-args.log_every:]), 1)
                 elapsed = time.time() - t_start
                 lrs = " ".join(f"{lr:.2e}" for lr in metrics.lr)
+                # Memory-health one-liner: routing diversity + write_module
+                # grad norm. If read/write_unique_frac collapses toward 0
+                # or write_module grad norm flatlines at 0, memory is
+                # bottlenecked.
+                ruf = history.get("read_unique_frac", [None])[-1]
+                wuf = history.get("write_unique_frac", [None])[-1]
+                w_gn = history.get("grad_norm_write_module", [None])[-1]
+                rent = history.get("read_routing_entropy", [None])[-1]
+                mem_str = (
+                    f" r_uf={ruf:.3f}" if ruf is not None else ""
+                ) + (
+                    f" w_uf={wuf:.3f}" if wuf is not None else ""
+                ) + (
+                    f" r_ent={rent:.2f}" if rent is not None else ""
+                ) + (
+                    f" w_gn={w_gn:.2e}" if w_gn is not None else ""
+                )
                 print(f"  step {step:>5}  loss={metrics.loss:.4f}  avg10={avg:.4f}  "
                       f"grad_norm={metrics.grad_norm:.2f}  lr=[{lrs}]  "
-                      f"({elapsed/max(step, 1):.2f}s/step)")
+                      f"({elapsed/max(step, 1):.2f}s/step){mem_str}")
 
             if step > 0 and step % args.save_every == 0:
                 cur_val = None

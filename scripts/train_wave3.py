@@ -35,6 +35,8 @@ against it, add them explicitly with a small weight (e.g. gsm8k=1).
 from __future__ import annotations
 
 import argparse
+import math
+import sys
 import time
 from pathlib import Path
 
@@ -120,12 +122,13 @@ def main():
                          "sampler (auto-enabled when --bs-outer > 1). "
                          "Bench: M=4 gives ~2.1× per-prompt speedup at ~6 GB "
                          "peak vs M=1 at 3.7 GB.")
-    ap.add_argument("--bs-outer-min-prompt-len", type=int, default=2048,
+    ap.add_argument("--bs-outer-min-prompt-len", type=int, default=None,
                     help="When --bs-outer > 1, only include prompts with "
                          "at least this many tokens. Ensures all prompts "
                          "in a batch hit the effective_lm_context cap after "
-                         "prefill, so KV caches stack cleanly. Default 2048 "
-                         "matches cfg.effective_lm_context.")
+                         "prefill, so KV caches stack cleanly. Default: "
+                         "auto-derived from cfg.effective_lm_context "
+                         "(2048 for medium, 4096 for large).")
     args = ap.parse_args()
 
     # Allow TF32 for fp32 matmul (memory params, bridge, lm_head).
@@ -133,6 +136,12 @@ def main():
 
     cfg = getattr(TrajMemConfig, args.config_tier)()
     tokenizer = get_tokenizer()
+
+    # Auto-derive bs-outer min-prompt-len from cfg if not specified.
+    # Stacked-cache path requires uniform post-prefill seq_length, which
+    # only holds if every prompt is long enough to hit the truncation cap.
+    if args.bs_outer_min_prompt_len is None:
+        args.bs_outer_min_prompt_len = cfg.effective_lm_context
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
     if args.compile:
@@ -223,9 +232,11 @@ def main():
         print(f"BS_outer mode: M={args.bs_outer}, K={args.num_samples}, "
               f"min_prompt_len={args.bs_outer_min_prompt_len}.")
         while trainer.step_count < args.num_steps:
+            saw_batch = False
             for batch in dataset.iter_batched(
                 args.bs_outer, min_prompt_len=args.bs_outer_min_prompt_len,
             ):
+                saw_batch = True
                 if trainer.step_count >= args.num_steps:
                     break
                 prompts = [
@@ -246,6 +257,14 @@ def main():
                     tokenizer=tokenizer,
                     temperature=args.temperature,
                 )
+                if not math.isfinite(metrics.policy_loss):
+                    print(f"FATAL: non-finite policy_loss ({metrics.policy_loss}) "
+                          f"at step {trainer.step_count}. Aborting.", file=sys.stderr)
+                    sys.exit(1)
+                if not math.isfinite(metrics.grad_norm):
+                    print(f"FATAL: non-finite grad_norm ({metrics.grad_norm}) at "
+                          f"step {trainer.step_count}. Aborting.", file=sys.stderr)
+                    sys.exit(1)
                 mean_r = sum(metrics.rewards) / max(len(metrics.rewards), 1)
                 rewards_history.append(mean_r)
 
@@ -272,6 +291,26 @@ def main():
                         rng_state=capture_rng_state(),
                     )
                     print(f"  saved checkpoint at step {step}")
+            if not saw_batch:
+                raise RuntimeError(
+                    f"iter_batched(batch_size={args.bs_outer}, "
+                    f"min_prompt_len={args.bs_outer_min_prompt_len}) yielded no "
+                    f"batches — dataset has {len(dataset)} prompts but none "
+                    f"meet the min_prompt_len filter. Lower --bs-outer-min-prompt-len "
+                    f"or supply longer prompts."
+                )
+        # Final checkpoint save (covers the case where num_steps isn't a
+        # multiple of save_every).
+        if args.checkpoint_out:
+            save_checkpoint(
+                args.checkpoint_out,
+                model=model, optimizer=optimizer, scheduler=scheduler,
+                step=trainer.step_count,
+                rng_state=capture_rng_state(),
+                extra={"config": cfg.__dict__, "rewards_history": rewards_history},
+                trainer_state=trainer.state_dict(),
+            )
+            print(f"Saved {args.checkpoint_out}")
         # Exit early — single-prompt loop below is for legacy --bs-outer=1.
         return
 
@@ -292,6 +331,14 @@ def main():
                 tokenizer=tokenizer,
                 temperature=args.temperature,
             )
+            if not math.isfinite(metrics.policy_loss):
+                print(f"FATAL: non-finite policy_loss ({metrics.policy_loss}) "
+                      f"at step {trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            if not math.isfinite(metrics.grad_norm):
+                print(f"FATAL: non-finite grad_norm ({metrics.grad_norm}) at "
+                      f"step {trainer.step_count}. Aborting.", file=sys.stderr)
+                sys.exit(1)
             mean_r = sum(metrics.rewards) / max(len(metrics.rewards), 1)
             rewards_history.append(mean_r)
 
