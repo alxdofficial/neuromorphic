@@ -119,6 +119,7 @@ def run_chunk(
     use_kv_cache: bool = True,
     past_key_values: object | None = None,
     cache_abs_pos: int = 0,
+    tau: float | None = None,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 
@@ -191,6 +192,12 @@ def run_chunk(
     # to full windows.
     chunk_ce_sum: Tensor | None = None
     chunk_ce_count: Tensor | None = None
+    # Routing aux-loss accumulators (Switch-style load-balance + ST-MoE
+    # z-loss). Surfaced per-window by forward_window; averaged over D
+    # windows here so the chunk-level aux loss has a consistent scale
+    # regardless of D (TBPTT depth).
+    chunk_aux_lb: Tensor | None = None
+    chunk_aux_z: Tensor | None = None
     # Fallback path for test mode (no real Llama → no surprise_sum/count
     # in `out`): aggregate per-window mean × T_window like before.
     losses_fallback: list[Tensor] = []
@@ -214,6 +221,7 @@ def run_chunk(
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit_hidden,
                 cache_abs_pos=abs_pos,
+                tau=tau,
             )
             n_new = win_input.shape[1]
             cache = out.get("new_past_key_values", cache)
@@ -234,6 +242,7 @@ def run_chunk(
                 prev_states=states,
                 target_mask=win_mask,
                 hard_routing=hard_routing,
+                tau=tau,
             )
             lm_buffer = lm_input_ids[:, -(cap - T):] if cap > T else lm_input_ids[:, :0]
 
@@ -265,6 +274,15 @@ def run_chunk(
             losses_fallback.append(out["surprise"].sum())
         surprises.append(out["surprise"])
 
+        # Accumulate routing aux losses per window. forward_window already
+        # combined read+write inside each window; here we just sum across
+        # the D windows and divide once at the end.
+        _lb = out.get("aux_load_balance")
+        _z = out.get("aux_z_loss")
+        if _lb is not None:
+            chunk_aux_lb = _lb if chunk_aux_lb is None else chunk_aux_lb + _lb
+            chunk_aux_z = _z if chunk_aux_z is None else chunk_aux_z + _z
+
         # Carry forward into next window.
         states = out["new_states"]
         cur_prev_hiddens = out["current_hiddens"]
@@ -277,6 +295,12 @@ def run_chunk(
         aggregate_loss = torch.stack(losses_fallback).sum()
     surprise_history = torch.stack(surprises, dim=1)               # [BS, D]
 
+    # Average aux losses over the D windows of this chunk so the
+    # chunk-level magnitude is independent of D.
+    if chunk_aux_lb is not None:
+        chunk_aux_lb = chunk_aux_lb / float(D)
+        chunk_aux_z = chunk_aux_z / float(D)
+
     result = {
         "window_outputs": outputs,
         "aggregate_loss": aggregate_loss,
@@ -284,6 +308,8 @@ def run_chunk(
         "final_hiddens": cur_prev_hiddens,
         "final_lm_context": lm_buffer,
         "surprise_history": surprise_history,
+        "aux_load_balance": chunk_aux_lb,
+        "aux_z_loss": chunk_aux_z,
     }
     # Surface chunk-level weighted CE sum (with grad) + valid token count
     # (detached) so callers spanning multiple chunks (Phase 1 step_wave2)

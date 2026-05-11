@@ -116,6 +116,24 @@ def main():
                          "place. Companion .json dump is written next to it.")
     ap.add_argument("--plot-every-seconds", type=float, default=180.0,
                     help="Seconds between plot refreshes (default 180 = 3 min).")
+    # Routing-collapse mitigations (canonical Switch-Transformer / ST-MoE /
+    # VQ-VAE values). The prior Wave 1 run plateaued because routing
+    # saturated → entry_proj gradient died → manifold stuck. These four
+    # knobs implement the layered defense the literature converged on.
+    ap.add_argument("--load-balance-coef", type=float, default=1e-2,
+                    help="Switch-Transformer aux-loss coefficient. 0 disables.")
+    ap.add_argument("--z-loss-coef", type=float, default=1e-3,
+                    help="ST-MoE router z-loss coefficient. 0 disables.")
+    ap.add_argument("--revive-every", type=int, default=500,
+                    help="VQ-VAE dead-code revival cadence (steps). 0 disables.")
+    ap.add_argument("--revive-threshold", type=float, default=1e-5,
+                    help="usage_ema below this counts a concept as dead.")
+    ap.add_argument("--tau-init", type=float, default=1.0,
+                    help="Gumbel temperature at step 0.")
+    ap.add_argument("--tau-floor", type=float, default=0.5,
+                    help="Gumbel temperature floor (saturation guard).")
+    ap.add_argument("--tau-decay-rate", type=float, default=1e-4,
+                    help="τ = max(floor, init·exp(-rate·step)).")
     args = ap.parse_args()
 
     # Allow TF32 for fp32 matmul (memory params, bridge, lm_head). On Ampere
@@ -170,6 +188,13 @@ def main():
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
         prior_loss_weight=0.0,  # W1 has no prior/response distinction
+        load_balance_coef=args.load_balance_coef,
+        z_loss_coef=args.z_loss_coef,
+        revive_every=args.revive_every,
+        revive_threshold=args.revive_threshold,
+        tau_init=args.tau_init,
+        tau_floor=args.tau_floor,
+        tau_decay_rate=args.tau_decay_rate,
     )
 
     if args.checkpoint_in is not None:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.manifold import Manifold
@@ -100,7 +103,7 @@ def test_read_module_construct():
 def test_read_module_forward_shapes_inference():
     cfg, m, states, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    visited, vids = rm(prev_hid, states, m, hard=False)
+    visited, vids, _ = rm(prev_hid, states, m, hard=False)
     assert visited.shape == (2, cfg.J, cfg.K_read, cfg.D_concept)
     assert vids.shape == (2, cfg.J, cfg.K_read)
     assert vids.dtype == torch.int64
@@ -111,7 +114,7 @@ def test_read_module_forward_shapes_inference():
 def test_read_module_forward_shapes_train():
     cfg, m, states, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    visited, vids = rm(prev_hid, states, m, hard=True)
+    visited, vids, _ = rm(prev_hid, states, m, hard=True)
     assert visited.shape == (2, cfg.J, cfg.K_read, cfg.D_concept)
 
 
@@ -124,7 +127,7 @@ def test_read_module_all_params_receive_gradient():
     cfg, m, _, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
     states = m.reset_states(batch_size=2)
-    visited, _ = rm(prev_hid, states, m, hard=True)
+    visited, _, _ = rm(prev_hid, states, m, hard=True)
     visited.sum().backward()
 
     missing = [n for n, p in rm.named_parameters() if p.grad is None]
@@ -154,7 +157,7 @@ def test_read_module_visited_states_match_states_at_visited_ids():
     """visited[b, j, t] should equal states[b, visited_ids[b, j, t]]."""
     cfg, m, states, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    visited, vids = rm(prev_hid, states, m, hard=False)
+    visited, vids, _ = rm(prev_hid, states, m, hard=False)
     # In read path, visited list contains the RAW pre-mutation states.
     BS = 2
     for b in range(BS):
@@ -180,10 +183,60 @@ def test_read_module_j_trajectories_diverge():
     rm = ReadTrajectoryGenerator(cfg)
     for hard in (False, True):
         torch.manual_seed(42)
-        _, vids = rm(prev_hid, states, m, hard=hard)
+        _, vids, _ = rm(prev_hid, states, m, hard=hard)
         flattened = vids[0].tolist()                              # [J, K]
         distinct_paths = len({tuple(p) for p in flattened})
         assert distinct_paths >= 2, (
             f"hard={hard}: all J={cfg.J} trajectories produced the same path: "
             f"{flattened}"
         )
+
+
+# ── routing aux losses (Switch + ST-MoE) ────────────────────────────────
+
+def test_routing_aux_losses_uniform_vs_concentrated():
+    """Switch-style load_balance is N at maximally concentrated routing
+    and 1 at perfectly uniform. z_loss is 0 when logits are all-zero."""
+    from src.trajectory_memory.read_module import routing_aux_losses
+    N = 16
+    # Uniform: all logits zero → P_i = 1/N for all i.
+    # Hard selection split uniformly across N (one sample per concept).
+    uniform_logits = torch.zeros(N, N)
+    uniform_oh = torch.eye(N)
+    a = routing_aux_losses(uniform_logits, uniform_oh)
+    assert abs(a["load_balance"].item() - 1.0) < 1e-4, (
+        f"uniform load_balance should be 1.0, got {a['load_balance'].item():.4f}"
+    )
+    # logsumexp of zero vec of length N = log(N); z_loss = log(N)².
+    expected_z = math.log(N) ** 2
+    assert abs(a["z_loss"].item() - expected_z) < 0.1, (
+        f"z_loss at zero logits should be log(N)²≈{expected_z:.2f}, "
+        f"got {a['z_loss'].item():.4f}"
+    )
+    # Concentrated: all selections pick concept 0, all softmax mass on 0.
+    spike_logits = torch.zeros(N, N)
+    spike_logits[:, 0] = 100.0
+    spike_oh = torch.zeros(N, N); spike_oh[:, 0] = 1.0
+    b = routing_aux_losses(spike_logits, spike_oh)
+    # f_0 = 1, P_0 ≈ 1, so loss ≈ N · 1 · 1 = N
+    assert abs(b["load_balance"].item() - N) < 1.0, (
+        f"concentrated load_balance should be ~N={N}, got {b['load_balance'].item():.4f}"
+    )
+    # z_loss with logsumexp ≈ 100 → 10000
+    assert b["z_loss"].item() > 9000, (
+        f"z_loss should be ~10000 with spike logits, got {b['z_loss'].item():.4f}"
+    )
+
+
+def test_routing_aux_losses_gradient_flows():
+    """Both aux losses must produce gradient back to logits (entry_proj
+    weights, etc.) — otherwise they don't actually push routing."""
+    from src.trajectory_memory.read_module import routing_aux_losses
+    N = 8
+    logits = torch.zeros(2, 3, N, requires_grad=True)
+    # Make a one-hot — doesn't need to match logits for the loss math.
+    oh = F.one_hot(torch.randint(0, N, (2, 3)), num_classes=N).float()
+    a = routing_aux_losses(logits, oh)
+    (a["load_balance"] + a["z_loss"]).backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0, "no gradient flowed to logits"

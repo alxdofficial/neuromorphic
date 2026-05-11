@@ -223,3 +223,68 @@ def test_manifold_write_states_returns_new_tensor():
     assert new is not prev  # new tensor
     # And m.concept_states (the buffer) should NOT have been touched.
     assert torch.allclose(m.concept_states, m.state_init.detach())
+
+
+# ── usage tracking + dead-code revival (VQ-VAE pattern) ─────────────────
+
+def test_manifold_record_visits_updates_usage_ema():
+    """record_visits should EMA-blend per-concept selection counts into
+    usage_ema."""
+    from src.trajectory_memory.config import TrajMemConfig
+    cfg = TrajMemConfig.small()
+    cfg.N = 32
+    cfg.validate()
+    m = Manifold(cfg)
+    # All-zero usage at init
+    assert m.usage_ema.abs().sum() == 0
+    # Visit concept 5 a bunch
+    vids = torch.full((4, 2, 8), 5, dtype=torch.int64)  # [BS, J, K]
+    m.record_visits(vids, ema_decay=0.0)
+    # ema_decay=0 → no smoothing, usage = current step fraction
+    assert m.usage_ema[5] > 0.99, f"concept 5 should hog all usage, got {m.usage_ema[5]}"
+    assert m.usage_ema[3] < 1e-6
+
+
+def test_manifold_revive_dead_concepts_replaces_dead():
+    """100% concentrated routing onto a tiny active set → all other
+    concepts have usage_ema==0 → revival should catch them all and
+    re-seed their concept_ids from an active concept + noise. Mimics
+    the Wave-1 plateau where ~3 concepts dominated routing for 4096."""
+    from src.trajectory_memory.config import TrajMemConfig
+    cfg = TrajMemConfig.small()
+    cfg.N = 16
+    cfg.validate()
+    m = Manifold(cfg)
+    # Every visit goes to concept 0 or 1; rest never visited.
+    for _ in range(200):
+        vids = torch.cat([
+            torch.zeros(50, dtype=torch.int64),
+            torch.ones(50, dtype=torch.int64),
+        ])
+        m.record_visits(vids)
+    assert m.usage_ema[2:].abs().max().item() < 1e-9
+    assert m.usage_ema[0].item() > 0.1 and m.usage_ema[1].item() > 0.1
+    dead_id_before = m.concept_ids.data[5].clone()
+    n_revived = m.revive_dead_concepts(threshold=1e-5)
+    assert n_revived == cfg.N - 2, (
+        f"expected to revive all {cfg.N - 2} dead concepts, got {n_revived}"
+    )
+    dead_id_after = m.concept_ids.data[5]
+    assert not torch.allclose(dead_id_before, dead_id_after), (
+        "revived concept's id should have changed"
+    )
+    # Revived concept's usage was bumped to threshold*2 (grace period).
+    assert abs(m.usage_ema[5].item() - 2e-5) < 1e-10
+
+
+def test_manifold_revive_with_no_active_concepts_is_safe():
+    """Edge case: at very early training, every concept may be 'dead'
+    (no visits yet). revive should no-op gracefully."""
+    from src.trajectory_memory.config import TrajMemConfig
+    cfg = TrajMemConfig.small()
+    cfg.N = 8
+    cfg.validate()
+    m = Manifold(cfg)
+    # No visits recorded; all concepts have usage 0
+    n = m.revive_dead_concepts(threshold=0.5)
+    assert n == 0, "should no-op when no concepts are active to seed from"

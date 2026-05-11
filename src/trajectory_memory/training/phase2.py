@@ -1127,7 +1127,7 @@ class Phase2Trainer:
                     dtype=prev_states.dtype, device=device,
                 )
             prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
-            read_visited, _ = self.model.read_module(
+            read_visited, _, _ = self.model.read_module(
                 prev_hid_mem, prev_states, self.model.manifold, hard=False,
             )
             mem_inject = self.model._mem_inject_layer()
@@ -1249,7 +1249,7 @@ class Phase2Trainer:
                 # routing IDs in pass 1 and forcing them in pass 2 — real
                 # refactor, deferred. Phase 2 trains writer mutate_mlp +
                 # bridge + cross-attn; routing is locked at Phase-1-end values.
-                new_states, _, _ = self.model.write_module(
+                new_states, _, _, _ = self.model.write_module(
                     cur_hiddens_mem, surprise, prev_states, self.model.manifold,
                     hard=False,
                 )
@@ -1530,7 +1530,7 @@ class Phase2Trainer:
                     dtype=prev_states.dtype, device=device,
                 )
             prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
-            read_visited, _ = self.model.read_module(
+            read_visited, _, _ = self.model.read_module(
                 prev_hid_mem, prev_states, self.model.manifold, hard=False,
             )
             mem_inject = self.model._mem_inject_layer()
@@ -1630,7 +1630,7 @@ class Phase2Trainer:
 
                 cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
                 surprise = torch.zeros(K, dtype=prev_states.dtype, device=device)
-                new_states, _, _ = self.model.write_module(
+                new_states, _, _, _ = self.model.write_module(
                     cur_hiddens_mem, surprise, prev_states, self.model.manifold,
                     hard=False,
                 )
@@ -1778,7 +1778,7 @@ class Phase2Trainer:
                     dtype=prev_states.dtype, device=device,
                 )
             prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
-            read_visited, _ = self.model.read_module(
+            read_visited, _, _ = self.model.read_module(
                 prev_hid_mem, prev_states, self.model.manifold, hard=False,
             )
             mem_inject = self.model._mem_inject_layer()
@@ -1882,7 +1882,7 @@ class Phase2Trainer:
 
                 cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
                 surprise = torch.zeros(BS, dtype=prev_states.dtype, device=device)
-                new_states, _, _ = self.model.write_module(
+                new_states, _, _, _ = self.model.write_module(
                     cur_hiddens_mem, surprise, prev_states, self.model.manifold,
                     hard=False,
                 )

@@ -77,6 +77,15 @@ class Phase1Trainer:
         pad_token_id: int | None = None,
         use_kv_cache: bool = True,
         prior_loss_weight: float = 0.0,
+        # Routing-collapse mitigations (Switch + ST-MoE + VQ-VAE pattern).
+        # Defaults are the canonical values from those papers.
+        load_balance_coef: float = 1e-2,
+        z_loss_coef: float = 1e-3,
+        revive_every: int = 500,            # steps between dead-code revival
+        revive_threshold: float = 1e-5,     # usage_ema below this = dead
+        tau_init: float = 1.0,              # Gumbel temp at step 0
+        tau_floor: float = 0.5,             # never drop below this
+        tau_decay_rate: float = 1e-4,       # τ = max(floor, init·exp(-rate·step))
     ):
         self.model = model
         self.optimizer = optimizer
@@ -105,7 +114,25 @@ class Phase1Trainer:
         # Default 0 preserves §4.5 behavior; recommended 0.1 for matching
         # plan §4.8 surprise table.
         self.prior_loss_weight = prior_loss_weight
+        # Routing aux losses + revival + temp schedule.
+        self.load_balance_coef = load_balance_coef
+        self.z_loss_coef = z_loss_coef
+        self.revive_every = revive_every
+        self.revive_threshold = revive_threshold
+        self.tau_init = tau_init
+        self.tau_floor = tau_floor
+        self.tau_decay_rate = tau_decay_rate
         self._step_count = 0
+
+    def _current_tau(self) -> float:
+        """Gumbel temperature schedule: exponentially decay from tau_init
+        toward tau_floor. Floor prevents the saturation pathology that
+        killed entry_proj's gradient in the Wave-1 plateau analysis."""
+        import math as _m
+        return max(
+            self.tau_floor,
+            self.tau_init * _m.exp(-self.tau_decay_rate * self._step_count),
+        )
 
     @property
     def step_count(self) -> int:
@@ -154,6 +181,7 @@ class Phase1Trainer:
         windows = chunk.view(BS, cfg.D, cfg.T_window)
 
         self.optimizer.zero_grad(set_to_none=True)
+        tau_eff = self._current_tau()
         out = run_chunk(
             self.model,
             windows,
@@ -165,12 +193,39 @@ class Phase1Trainer:
             use_kv_cache=self.use_kv_cache,
             past_key_values=past_key_values,
             cache_abs_pos=cache_abs_pos,
+            tau=tau_eff,
         )
         loss = out["aggregate_loss"]
+        # Switch-Transformer + ST-MoE routing aux losses. Coefficients are
+        # the canonical values from those papers (1e-2 and 1e-3 respectively).
+        # Skipped if forward_window didn't surface them (e.g., the rare test
+        # path that bypasses both modules — defensive).
+        aux_lb = out.get("aux_load_balance")
+        aux_z = out.get("aux_z_loss")
+        if aux_lb is not None:
+            loss = loss + self.load_balance_coef * aux_lb
+        if aux_z is not None:
+            loss = loss + self.z_loss_coef * aux_z
         loss.backward()
 
         grad_norm = self._clip_and_step()
         self._step_count += 1
+
+        # VQ-VAE-style dead-concept revival + usage tracking. Done AFTER
+        # the optimizer step so the revived concept's reset doesn't get
+        # immediately undone. Record visits on every step; revive only
+        # periodically (cheap O(N) scan).
+        with torch.no_grad():
+            for w in out["window_outputs"]:
+                self.model.manifold.record_visits(w["read_visited"])
+                self.model.manifold.record_visits(w["write_visited"])
+            if (
+                self.revive_every > 0
+                and self._step_count % self.revive_every == 0
+            ):
+                self.model.manifold.revive_dead_concepts(
+                    threshold=self.revive_threshold,
+                )
 
         # KV-cache-mode: detach final cache for cross-chunk carry.
         final_cache = out.get("final_past_key_values", None)

@@ -29,7 +29,7 @@ def test_write_module_construct():
 def test_write_module_forward_shapes():
     cfg, m, prev_states, cur_hid, surprise = _small_setup(BS=2)
     wm = WriteTrajectoryGenerator(cfg)
-    new_states, vids, proposed = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, vids, proposed, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
     assert new_states.shape == (2, cfg.N, cfg.D_concept)
     assert vids.shape == (2, cfg.J, cfg.K_write)
     assert proposed.shape == (2, cfg.J, cfg.K_write, cfg.D_concept)
@@ -40,7 +40,7 @@ def test_write_module_returns_new_tensor_not_inplace():
     cfg, m, prev_states, cur_hid, surprise = _small_setup(BS=2)
     wm = WriteTrajectoryGenerator(cfg)
     prev_clone = prev_states.clone()
-    new_states, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, _, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
     assert torch.allclose(prev_states, prev_clone), "write mutated prev_states"
     assert new_states is not prev_states
 
@@ -49,7 +49,7 @@ def test_write_module_only_visited_concepts_change():
     """Concepts NOT visited by any trajectory should retain prev_states value."""
     cfg, m, prev_states, cur_hid, surprise = _small_setup(BS=1)
     wm = WriteTrajectoryGenerator(cfg)
-    new_states, vids, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, vids, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
 
     # Build mask of visited concepts
     visited_set = set(vids[0].flatten().tolist())
@@ -71,7 +71,7 @@ def test_write_module_visited_concepts_change():
     wm = WriteTrajectoryGenerator(cfg)
     # Use surprise=1.0 for noticeable mutation
     surprise = torch.tensor([1.0])
-    new_states, vids, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, vids, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
 
     visited_set = sorted(set(vids[0].flatten().tolist()))
     diffs = (new_states[0, visited_set] - prev_states[0, visited_set]).abs().sum()
@@ -87,7 +87,7 @@ def test_write_module_all_params_receive_gradient():
     cfg, m, _, cur_hid, surprise = _small_setup(BS=2)
     wm = WriteTrajectoryGenerator(cfg)
     prev_states = m.reset_states(batch_size=2)
-    new_states, _, _ = wm(cur_hid, surprise, prev_states, m, hard=True)
+    new_states, _, _, _ = wm(cur_hid, surprise, prev_states, m, hard=True)
     new_states.sum().backward()
 
     missing = [n for n, p in wm.named_parameters() if p.grad is None]
@@ -123,7 +123,7 @@ def test_write_module_collisions_get_averaged():
     cur_hid = torch.randn(1, cfg.T_window, cfg.d_lm)
     surprise = torch.tensor([1.0])
     wm = WriteTrajectoryGenerator(cfg)
-    new_states, vids, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, vids, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
     # No NaNs / Infs
     assert torch.isfinite(new_states).all()
 
@@ -143,7 +143,7 @@ def test_write_module_j_trajectories_diverge():
     wm = WriteTrajectoryGenerator(cfg)
     for hard in (False, True):
         torch.manual_seed(7)
-        _, vids, _ = wm(cur_hid, surprise, prev_states, m, hard=hard)
+        _, vids, _, _ = wm(cur_hid, surprise, prev_states, m, hard=hard)
         flattened = vids[0].tolist()
         distinct_paths = len({tuple(p) for p in flattened})
         assert distinct_paths >= 2, (
@@ -162,14 +162,14 @@ def test_write_then_read_uses_new_states():
     rm = ReadTrajectoryGenerator(cfg)
     surprise = torch.tensor([1.0])
 
-    new_states, vids_w, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
+    new_states, vids_w, _, _ = wm(cur_hid, surprise, prev_states, m, hard=False)
 
     # A read on new_states vs prev_states. The visited concepts have
     # different state, so a read that hits one of those should produce
     # different visited values.
     prev_hid = torch.randn(1, cfg.T_window, cfg.d_lm)
-    visited_a, _ = rm(prev_hid, prev_states, m, hard=False)
-    visited_b, _ = rm(prev_hid, new_states, m, hard=False)
+    visited_a, _, _ = rm(prev_hid, prev_states, m, hard=False)
+    visited_b, _, _ = rm(prev_hid, new_states, m, hard=False)
     # Some difference somewhere (read trajectories may visit different
     # concepts but at least the fact that the underlying states differ
     # means visited contents will too if they overlap). We test that the
@@ -204,7 +204,7 @@ def test_write_module_state_bounded_over_many_windows():
     norms = [initial_norm]
     with torch.no_grad():
         for _ in range(200):
-            states, _, _ = wm(cur_hid, surprise, states, m, hard=False)
+            states, _, _, _ = wm(cur_hid, surprise, states, m, hard=False)
             norms.append(states.norm().item())
 
     # Boundedness check: after 200 windows of self-driven updates, the

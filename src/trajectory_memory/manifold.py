@@ -233,6 +233,14 @@ class Manifold(nn.Module):
         )
         self.register_buffer("edge_indices", edges, persistent=True)
 
+        # Per-concept usage EMA — tracks how often each concept gets selected
+        # during routing. Updated by record_visits() each forward window;
+        # consumed by revive_dead_concepts() to find dead concepts. Persists
+        # in state_dict so a resumed run keeps its usage history.
+        self.register_buffer(
+            "usage_ema", torch.zeros(N), persistent=True,
+        )
+
     # ── reset semantics ──────────────────────────────────────────────
 
     def reset_states(self, batch_size: int | None = None) -> Tensor:
@@ -252,6 +260,79 @@ class Manifold(nn.Module):
         else:
             # Broadcast to [BS, N, D]; keep gradient flowing through state_init.
             return self.state_init.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+
+    # ── usage tracking + dead-code revival ────────────────────────────
+
+    @torch.no_grad()
+    def record_visits(self, visited_ids: Tensor, ema_decay: float = 0.99) -> None:
+        """Update per-concept usage EMA from a tensor of visit IDs.
+
+        Standard VQ-VAE codebook-collapse mitigation pattern: each step,
+        EMA-blend a per-concept selection histogram into a long-running
+        usage tracker. `revive_dead_concepts()` then uses this to identify
+        and re-initialize permanently dead concepts.
+
+        Args:
+            visited_ids: int64 of any shape — flatten counted as visits.
+            ema_decay:   smoothing factor (0.99 ≈ 100-step horizon).
+        """
+        flat = visited_ids.reshape(-1)
+        if flat.numel() == 0:
+            return
+        counts = torch.bincount(flat, minlength=self.cfg.N).to(self.usage_ema.dtype)
+        # Normalize per-step counts to fraction so EMA is unit-scale
+        # regardless of how many visits we tracked this call.
+        counts = counts / counts.sum().clamp_min(1.0)
+        self.usage_ema.mul_(ema_decay).add_(counts, alpha=1.0 - ema_decay)
+
+    @torch.no_grad()
+    def revive_dead_concepts(
+        self, threshold: float = 1e-5, jitter: float = 0.02,
+    ) -> int:
+        """Re-initialize dead concepts (usage_ema < threshold).
+
+        Replaces each dead concept's concept_id and state_init row with a
+        randomly-chosen ACTIVE concept's row + small noise. This is the
+        VQ-VAE codebook revival pattern: rescue dead codes by seeding them
+        near a high-frequency code so they have a chance to take over a
+        sub-region of the embedding space.
+
+        Returns:
+            Number of concepts that were revived.
+        """
+        usage = self.usage_ema
+        N = self.cfg.N
+        D = self.cfg.D_concept
+        dead_mask = usage < threshold                                  # [N]
+        n_dead = int(dead_mask.sum().item())
+        if n_dead == 0:
+            return 0
+        # Active concepts (above threshold). If none active yet (very
+        # early training), do nothing — there's nothing to copy from.
+        active_idx = (~dead_mask).nonzero(as_tuple=False).squeeze(-1)  # [n_active]
+        if active_idx.numel() == 0:
+            return 0
+        # For each dead concept, pick a random active concept to seed from.
+        dead_idx = dead_mask.nonzero(as_tuple=False).squeeze(-1)       # [n_dead]
+        seed_pick = active_idx[
+            torch.randint(0, active_idx.numel(), (n_dead,), device=usage.device)
+        ]                                                              # [n_dead]
+        # Replace concept_ids (the address keys) — this is what biases
+        # routing toward the seed concept's neighborhood.
+        noise_ids = torch.randn_like(self.concept_ids[dead_idx]) * jitter
+        self.concept_ids.data[dead_idx] = (
+            self.concept_ids.data[seed_pick] + noise_ids
+        )
+        # Replace state_init too (the per-concept default state) so reads
+        # at revived concepts return sensible content, not zeros.
+        noise_state = torch.randn_like(self.state_init[dead_idx]) * jitter
+        self.state_init.data[dead_idx] = (
+            self.state_init.data[seed_pick] + noise_state
+        )
+        # Reset usage so revived concepts get a fresh chance (don't
+        # immediately re-revive next step).
+        self.usage_ema[dead_idx] = threshold * 2.0
+        return n_dead
 
     # ── neighbor lookup ──────────────────────────────────────────────
 

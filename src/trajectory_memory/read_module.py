@@ -40,6 +40,56 @@ def make_pos_enc(K: int, D: int) -> Tensor:
     return pe
 
 
+def routing_aux_losses(logits: Tensor, one_hot: Tensor) -> dict[str, Tensor]:
+    """Compute Switch-Transformer load-balance + ST-MoE z-loss at a routing
+    decision. Returns scalars suitable for adding to the training loss.
+
+    Args:
+        logits:  [..., N] pre-softmax routing scores (differentiable)
+        one_hot: [..., N] hard one-hot selection from Gumbel-STE
+                 (forward-detached; its sum-over-vocab is 1 per row)
+
+    Returns:
+        {
+          'load_balance': scalar  — Switch loss: N · Σᵢ fᵢ · Pᵢ
+                                    minimized when routing is uniform
+          'z_loss':       scalar  — mean of (logsumexp(logits))²
+                                    keeps logit magnitudes from saturating
+        }
+
+    The caller multiplies each by its coefficient (typically
+    load_balance: 1e-2, z_loss: 1e-3) and adds to the total loss.
+    """
+    N = logits.shape[-1]
+    # Flatten everything but the last dim — treats each row as one routing
+    # decision. Works for entry-router [BS, J, N] and per-hop [BS, J, K_max].
+    flat_logits = logits.reshape(-1, N)              # [M, N]
+    flat_oh = one_hot.reshape(-1, N)                 # [M, N]
+    if flat_logits.shape[0] == 0:
+        # Degenerate — return zero scalars with grad to logits to keep
+        # autograd happy.
+        z = (flat_logits * 0.0).sum()
+        return {"load_balance": z, "z_loss": z}
+
+    # Pᵢ: mean softmax probability mass on concept i across the batch.
+    # Differentiable — gradient flows back through softmax to logits.
+    P = F.softmax(flat_logits, dim=-1).mean(dim=0)   # [N]
+    # fᵢ: fraction of HARD selections that picked concept i.
+    # Detached — treated as a constant load indicator.
+    f = flat_oh.detach().mean(dim=0)                 # [N]
+    # Switch loss: N · Σᵢ fᵢ · Pᵢ. Uniform routing → Σ (1/N)(1/N) · N = 1.
+    # Fully one-hot on a single concept → 1 · 1 · N = N. So loss grows
+    # linearly with concentration severity.
+    load_balance = N * (f * P).sum()
+
+    # z-loss: penalize magnitude of logsumexp (= log normalizer of softmax).
+    # Keeps logits near zero magnitude → softmax stays in active range.
+    # ST-MoE shows this strictly improves stability with no quality cost.
+    z_loss = (torch.logsumexp(flat_logits, dim=-1) ** 2).mean()
+
+    return {"load_balance": load_balance, "z_loss": z_loss}
+
+
 def gumbel_top1_ste(
     logits: Tensor,
     tau: float,
@@ -305,7 +355,8 @@ class ReadTrajectoryGenerator(nn.Module):
         manifold: Manifold,
         *,
         hard: bool = True,
-    ) -> tuple[Tensor, Tensor]:
+        tau: float | None = None,
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """Generate J parallel trajectories.
 
         Args:
@@ -313,10 +364,18 @@ class ReadTrajectoryGenerator(nn.Module):
             current_states:      [BS, N, D_concept]
             manifold:            Manifold (concept_ids + edge_indices)
             hard:                Gumbel-STE if True, argmax if False
+            tau:                 Gumbel-softmax temperature override. None
+                                 falls back to cfg.gumbel_tau (1.0). Trainer
+                                 passes a scheduled value (with a floor of
+                                 0.5) — see Phase1Trainer's _current_tau.
 
         Returns:
             visited:     [BS, J, K_read, D_concept]
             visited_ids: [BS, J, K_read] int64
+            aux:         {'load_balance': scalar, 'z_loss': scalar}
+                         summed across the entry routing and all K_read
+                         hops. The trainer multiplies by coefficients and
+                         adds to the main loss before backward.
         """
         cfg = self.cfg
         BS, T, d_lm = prev_window_hiddens.shape
@@ -324,6 +383,7 @@ class ReadTrajectoryGenerator(nn.Module):
         J, K = cfg.J, cfg.K_read
         N = cfg.N
         assert current_states.shape == (BS, N, D)
+        tau_eff = cfg.gumbel_tau if tau is None else float(tau)
 
         # ── 1. Pick J entry concepts ──────────────────────────────────
         pooled = prev_window_hiddens.mean(dim=1)                  # [BS, d_lm]
@@ -340,8 +400,13 @@ class ReadTrajectoryGenerator(nn.Module):
         ids = manifold.concept_ids                                # [N, D]
         entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)  # [BS, J, N]
         entry_one_hot, entry_idx = gumbel_top1_ste(
-            entry_logits, cfg.gumbel_tau, hard=hard,
+            entry_logits, tau_eff, hard=hard,
         )                                                         # [BS, J, N], [BS, J]
+        # Accumulate routing aux losses (Switch load-balance + ST-MoE z-loss).
+        # Computed at each routing decision; summed before return.
+        _aux_lb = routing_aux_losses(entry_logits, entry_one_hot)
+        aux_lb_total = _aux_lb["load_balance"]
+        aux_z_total = _aux_lb["z_loss"]
 
         # ── 2. K_read autoregressive hops ────────────────────────────
         current = entry_idx                                       # [BS, J] int (for next neighbor lookup)
@@ -396,8 +461,11 @@ class ReadTrajectoryGenerator(nn.Module):
                 "bjd,bjkd->bjk", Q_t, nbr_ids,
             )                                                     # [BS, J, K_max]
             nbr_one_hot, next_local = gumbel_top1_ste(
-                nbr_logits, cfg.gumbel_tau, hard=hard,
+                nbr_logits, tau_eff, hard=hard,
             )                                                     # [BS, J, K_max], [BS, J]
+            _aux_hop = routing_aux_losses(nbr_logits, nbr_one_hot)
+            aux_lb_total = aux_lb_total + _aux_hop["load_balance"]
+            aux_z_total = aux_z_total + _aux_hop["z_loss"]
 
             # Map local neighbor index to absolute concept id (int, for next
             # iter's neighbor lookup).
@@ -418,4 +486,12 @@ class ReadTrajectoryGenerator(nn.Module):
 
         visited = torch.stack(visited_list, dim=2)                # [BS, J, K, D]
         visited_ids = torch.stack(visited_id_list, dim=2)         # [BS, J, K]
-        return visited, visited_ids
+        # Average aux losses over the (entry + K_read) routing decisions so
+        # the magnitude doesn't depend on K_read. Trainer applies the
+        # coefficient on top.
+        n_routes = 1 + K
+        aux = {
+            "load_balance": aux_lb_total / n_routes,
+            "z_loss": aux_z_total / n_routes,
+        }
+        return visited, visited_ids, aux

@@ -25,6 +25,7 @@ from src.trajectory_memory.read_module import (
     gumbel_top1_ste,
     make_pos_enc,
     per_j_attn,
+    routing_aux_losses,
 )
 
 
@@ -117,7 +118,8 @@ class WriteTrajectoryGenerator(nn.Module):
         manifold: Manifold,
         *,
         hard: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        tau: float | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """Run write trajectories and return new manifold state.
 
         Args:
@@ -126,11 +128,14 @@ class WriteTrajectoryGenerator(nn.Module):
             prev_states:            [BS, N, D_concept]
             manifold:               Manifold instance
             hard:                   Gumbel-STE if True, argmax if False
+            tau:                    Gumbel temperature override; None → cfg.gumbel_tau.
 
         Returns:
             new_states:  [BS, N, D] — manifold state after scatter_mean
             visited_ids: [BS, J, K_write] int64
             proposed:    [BS, J, K_write, D] proposed new states (for telemetry)
+            aux:         {'load_balance': scalar, 'z_loss': scalar} routing
+                         aux losses summed over (entry + K_write) decisions.
         """
         cfg = self.cfg
         BS, T, d_lm = current_window_hiddens.shape
@@ -139,6 +144,7 @@ class WriteTrajectoryGenerator(nn.Module):
         N = cfg.N
         assert prev_states.shape == (BS, N, D)
         assert surprise.shape == (BS,), f"surprise shape {surprise.shape} != ({BS},)"
+        tau_eff = cfg.gumbel_tau if tau is None else float(tau)
 
         surprise_bj = surprise.view(BS, 1).expand(BS, J).unsqueeze(-1)  # [BS, J, 1]
 
@@ -158,8 +164,12 @@ class WriteTrajectoryGenerator(nn.Module):
         ids = manifold.concept_ids
         entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)
         entry_one_hot, entry_idx = gumbel_top1_ste(
-            entry_logits, cfg.gumbel_tau, hard=hard,
+            entry_logits, tau_eff, hard=hard,
         )                                                         # [BS, J, N], [BS, J]
+        # Routing aux losses — accumulated across entry + K_write hops.
+        _aux_e = routing_aux_losses(entry_logits, entry_one_hot)
+        aux_lb_total = _aux_e["load_balance"]
+        aux_z_total = _aux_e["z_loss"]
 
         # ── 2. K_write hops + mutation proposals ─────────────────────
         current = entry_idx                                       # [BS, J] int
@@ -207,8 +217,11 @@ class WriteTrajectoryGenerator(nn.Module):
             nbr_ids = manifold.concept_ids[nbr_idx]               # [BS, J, K_max, D]
             nbr_logits = torch.einsum("bjd,bjkd->bjk", Q_t, nbr_ids)
             nbr_one_hot, next_local = gumbel_top1_ste(
-                nbr_logits, cfg.gumbel_tau, hard=hard,
+                nbr_logits, tau_eff, hard=hard,
             )                                                     # [BS, J, K_max], [BS, J]
+            _aux_h = routing_aux_losses(nbr_logits, nbr_one_hot)
+            aux_lb_total = aux_lb_total + _aux_h["load_balance"]
+            aux_z_total = aux_z_total + _aux_h["z_loss"]
             next_global = torch.gather(
                 nbr_idx, dim=2, index=next_local.unsqueeze(-1),
             ).squeeze(-1)                                         # [BS, J]
@@ -246,4 +259,9 @@ class WriteTrajectoryGenerator(nn.Module):
         flat_proposed = proposed.reshape(BS, J * K, D)            # [BS, J*K, D]
         new_states = manifold.write_states(prev_states, flat_ids, flat_proposed)
 
-        return new_states, visited_ids, proposed
+        n_routes = 1 + K
+        aux = {
+            "load_balance": aux_lb_total / n_routes,
+            "z_loss": aux_z_total / n_routes,
+        }
+        return new_states, visited_ids, proposed, aux

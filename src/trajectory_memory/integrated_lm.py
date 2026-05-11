@@ -193,6 +193,7 @@ class IntegratedLM(nn.Module):
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
         write_only_grad: bool = False,
+        tau: float | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -285,18 +286,20 @@ class IntegratedLM(nn.Module):
             # prefill don't need grad — Pass 2 response replay covers
             # response-time reads with grad. Saves activation memory.
             with torch.no_grad():
-                read_visited, read_visited_ids = self.read_module(
-                    prev_hid_mem, prev_states, self.manifold, hard=hard_routing,
+                read_visited, read_visited_ids, read_aux = self.read_module(
+                    prev_hid_mem, prev_states, self.manifold,
+                    hard=hard_routing, tau=tau,
                 )
         elif torch.is_grad_enabled():
-            read_visited, read_visited_ids = torch.utils.checkpoint.checkpoint(
+            read_visited, read_visited_ids, read_aux = torch.utils.checkpoint.checkpoint(
                 self.read_module,
                 prev_hid_mem, prev_states, self.manifold,
-                hard=hard_routing, use_reentrant=False,
+                hard=hard_routing, tau=tau, use_reentrant=False,
             )                                                      # [BS, J, K_read, D]
         else:
-            read_visited, read_visited_ids = self.read_module(
-                prev_hid_mem, prev_states, self.manifold, hard=hard_routing,
+            read_visited, read_visited_ids, read_aux = self.read_module(
+                prev_hid_mem, prev_states, self.manifold,
+                hard=hard_routing, tau=tau,
             )
 
         # ── 2. PREDICT ──────────────────────────────────────────────
@@ -484,16 +487,23 @@ class IntegratedLM(nn.Module):
         # Activation-checkpoint the write trajectory too — same rationale
         # as read_module above.
         if torch.is_grad_enabled():
-            new_states, write_visited_ids, _ = torch.utils.checkpoint.checkpoint(
+            new_states, write_visited_ids, _, write_aux = torch.utils.checkpoint.checkpoint(
                 self.write_module,
                 write_hiddens, surprise.detach(), prev_states, self.manifold,
-                hard=hard_routing, use_reentrant=False,
+                hard=hard_routing, tau=tau, use_reentrant=False,
             )
         else:
-            new_states, write_visited_ids, _ = self.write_module(
+            new_states, write_visited_ids, _, write_aux = self.write_module(
                 write_hiddens, surprise.detach(), prev_states, self.manifold,
-                hard=hard_routing,
+                hard=hard_routing, tau=tau,
             )
+
+        # Combine read + write aux losses. Each side already averaged over
+        # (entry + K_hops) internally; here we sum the two sides so the
+        # window-level aux loss is in a comparable scale (one read pass +
+        # one write pass per window).
+        aux_load_balance = read_aux["load_balance"] + write_aux["load_balance"]
+        aux_z_loss = read_aux["z_loss"] + write_aux["z_loss"]
 
         out = {
             "logits": logits,
@@ -502,6 +512,8 @@ class IntegratedLM(nn.Module):
             "read_visited": read_visited_ids,
             "write_visited": write_visited_ids,
             "surprise": surprise,
+            "aux_load_balance": aux_load_balance,
+            "aux_z_loss": aux_z_loss,
         }
         if self.llama is not None:
             # N6 — surface raw weighted sum + count per window so run_chunk
