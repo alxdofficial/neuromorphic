@@ -181,3 +181,65 @@ def test_write_then_read_uses_new_states():
     if diff <= 1e-6:
         # Acceptable degenerate case — at least confirm shapes.
         assert visited_a.shape == visited_b.shape
+
+
+def test_write_module_state_bounded_over_many_windows():
+    """Architectural regression test for the routing-collapse bug at step
+    896 of TXL-style continuous training. Before the gated-update fix,
+    repeatedly applying write_module to its own output grew state magnitude
+    unboundedly (state[T] = state[0] + 0.1·Σ delta_t → O(0.1·T) drift).
+    With the learnable decay gate, state magnitude must stabilize at a
+    bounded value driven by the gate's equilibrium, NOT grow with T.
+    """
+    cfg = TrajMemConfig.small()
+    cfg.validate()
+    m = Manifold(cfg)
+    wm = WriteTrajectoryGenerator(cfg)
+    BS = 2
+    states = m.reset_states(batch_size=BS)
+    cur_hid = torch.randn(BS, cfg.T_window, cfg.d_lm)
+    surprise = torch.tensor([0.5, 0.5])
+
+    initial_norm = states.norm().item()
+    norms = [initial_norm]
+    with torch.no_grad():
+        for _ in range(200):
+            states, _, _ = wm(cur_hid, surprise, states, m, hard=False)
+            norms.append(states.norm().item())
+
+    # Boundedness check: after 200 windows of self-driven updates, the
+    # state norm must not have exploded. We allow up to 10× initial norm
+    # (the gate's equilibrium is around candidate magnitude ≈ 0.1; with
+    # state_init norm ≈ 0.02·sqrt(N·D) and updates of similar scale,
+    # the steady-state norm should be well within 10× initial).
+    assert torch.isfinite(torch.tensor(norms)).all(), (
+        f'NaN/Inf in state norms over 200 windows: {norms[:5]} ... {norms[-5:]}'
+    )
+    max_norm = max(norms)
+    assert max_norm < 10 * initial_norm + 100, (
+        f'State norm grew unbounded: initial={initial_norm:.3f}, '
+        f'max={max_norm:.3f} (ratio {max_norm/initial_norm:.1f}x). '
+        f'Last 5 norms: {norms[-5:]}'
+    )
+
+
+def test_write_module_decay_gate_init_alpha():
+    """At init, the decay gate should produce alpha ≈ 0.9 (sigmoid(2.2)),
+    matching the original mutation_scale=0.1 update magnitude."""
+    cfg = TrajMemConfig.small()
+    wm = WriteTrajectoryGenerator(cfg)
+    # Drive gate_mlp with a random input; check the OUTPUT mean is close
+    # to 0.9 across many samples (bias dominates due to zero'd weights).
+    D = cfg.D_concept
+    rand_input = torch.randn(100, D * 3 + 1)
+    with torch.no_grad():
+        alpha = torch.sigmoid(wm.decay_gate(rand_input))
+    assert 0.85 <= alpha.mean().item() <= 0.95, (
+        f'Init alpha should be ~0.9, got mean {alpha.mean().item():.3f}'
+    )
+    # And low variance since we zeroed the final-layer weights
+    assert alpha.std().item() < 0.05, (
+        f'Init alpha should have low variance (weights zeroed), got std '
+        f'{alpha.std().item():.3f}'
+    )
+

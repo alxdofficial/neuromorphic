@@ -71,16 +71,38 @@ class WriteTrajectoryGenerator(nn.Module):
             nn.Linear(D, D, bias=True),
         )
 
-        # mutate_write MLP — produces the proposed new state.
-        # `new = state + mutation_init_scale * MLP(state, cross_attn, history_attn, surprise)`
-        # mutation_init_scale keeps writes small at init so the manifold
-        # doesn't drift wildly in the first few training steps.
+        # mutate_write MLP — produces the candidate write.
+        # Original: `new = state + mutation_init_scale * mutate_mlp(...)`
+        # Replaced with gated convex combination (see decay_gate below):
+        #   `new = α·state + (1−α)·(mutation_scale * mutate_mlp(...))`
+        # This bounds state magnitude — the original additive update had
+        # NO bound on accumulated state and collapsed routing at step ~900
+        # under TXL-style continuous training (see commit msg for fix #4
+        # follow-up). Mutation_scale on the candidate keeps the early-
+        # training behavior close to the original (small writes at init)
+        # while α handles forgetting.
         self.mutate_mlp = nn.Sequential(
             nn.Linear(D * 3 + 1, D, bias=True),
             nn.GELU(),
             nn.Linear(D, D, bias=True),
         )
         self.mutation_scale = cfg.mutation_init_scale
+
+        # Learnable decay gate — per-trajectory-hop sigmoid α ∈ [0, 1].
+        # α = 1 → fully retain old state; α = 0 → fully overwrite with
+        # candidate. Init bias = 2.2 → sigmoid(2.2) ≈ 0.9, matching the
+        # original "10% update per hop" rate. Model learns when to
+        # forget more aggressively (α → 0) on surprising windows.
+        self.decay_gate = nn.Sequential(
+            nn.Linear(D * 3 + 1, D, bias=True),
+            nn.GELU(),
+            nn.Linear(D, 1, bias=True),
+        )
+        nn.init.constant_(self.decay_gate[-1].bias, 2.2)
+        # Zero out the final-layer weights so the bias dominates at init
+        # (otherwise random initialization produces α with high variance
+        # across hops, destabilizing the first few training steps).
+        nn.init.zeros_(self.decay_gate[-1].weight)
 
         # Positional encoding for visited list inside trajectory.
         # Size K_write: indexed up to pos_enc[:K_write] in the longest hop.
@@ -194,7 +216,13 @@ class WriteTrajectoryGenerator(nn.Module):
             # mutate_write — proposed new state for the *current* concept.
             # Same input as step_mlp; compute once.
             delta = self.mutate_mlp(step_input)                   # [BS, J, D]
-            new_state = current_state + self.mutation_scale * delta  # [BS, J, D]
+            candidate = self.mutation_scale * delta               # [BS, J, D]
+            # Learnable decay gate: convex combination of old state and
+            # candidate. Bounds state magnitude by the candidate magnitude
+            # at equilibrium (≈mutation_scale * mlp_output_scale), rather
+            # than letting it accumulate unboundedly.
+            alpha = torch.sigmoid(self.decay_gate(step_input))    # [BS, J, 1]
+            new_state = alpha * current_state + (1.0 - alpha) * candidate
 
             visited_id_list.append(current)
             proposed_new_list.append(new_state)
