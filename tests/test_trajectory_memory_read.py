@@ -240,3 +240,28 @@ def test_routing_aux_losses_gradient_flows():
     (a["load_balance"] + a["z_loss"]).backward()
     assert logits.grad is not None
     assert logits.grad.abs().sum() > 0, "no gradient flowed to logits"
+
+
+def test_gumbel_top1_ste_accepts_tensor_tau():
+    """tau as a 0-dim tensor must work (used by trainer's per-step
+    schedule to avoid Dynamo recompiles on changing Python floats)."""
+    from src.trajectory_memory.read_module import gumbel_top1_ste
+    logits = torch.randn(4, 8)
+    tau_t = torch.tensor(0.7)
+    oh, idx = gumbel_top1_ste(logits, tau_t, hard=True)
+    assert oh.shape == (4, 8)
+    assert idx.shape == (4,)
+
+
+def test_read_module_accepts_tensor_tau():
+    """read_module must accept tau as a tensor without crashing or
+    breaking the routing math."""
+    cfg = TrajMemConfig.small()
+    rm = ReadTrajectoryGenerator(cfg)
+    m = Manifold(cfg)
+    states = m.reset_states(batch_size=2)
+    prev_hid = torch.randn(2, cfg.T_window, cfg.d_lm)
+    tau_t = torch.tensor(0.7)
+    visited, vids, aux = rm(prev_hid, states, m, hard=True, tau=tau_t)
+    assert visited.shape == (2, cfg.J, cfg.K_read, cfg.D_concept)
+    assert "load_balance" in aux

@@ -131,15 +131,24 @@ class Phase1Trainer:
         self.tau_decay_rate = tau_decay_rate
         self._step_count = 0
 
-    def _current_tau(self) -> float:
+    def _current_tau(self) -> Tensor:
         """Gumbel temperature schedule: exponentially decay from tau_init
         toward tau_floor. Floor prevents the saturation pathology that
-        killed entry_proj's gradient in the Wave-1 plateau analysis."""
+        killed entry_proj's gradient in the Wave-1 plateau analysis.
+
+        Returns a 0-dim CUDA tensor (not a Python float!) because dynamo
+        specializes on Python scalar values and recompiles every step
+        when tau changes. Passing as a tensor makes it a dynamic input
+        — one compile, reused forever. This was an actual ~35% per-step
+        slowdown until we found it.
+        """
         import math as _m
-        return max(
+        val = max(
             self.tau_floor,
             self.tau_init * _m.exp(-self.tau_decay_rate * self._step_count),
         )
+        device = next(self.model.parameters()).device
+        return torch.tensor(val, device=device, dtype=torch.float32)
 
     @property
     def step_count(self) -> int:

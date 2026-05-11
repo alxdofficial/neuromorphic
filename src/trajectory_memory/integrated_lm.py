@@ -211,7 +211,7 @@ class IntegratedLM(nn.Module):
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
         write_only_grad: bool = False,
-        tau: float | None = None,
+        tau: Tensor | float | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 

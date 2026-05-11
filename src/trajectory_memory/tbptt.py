@@ -119,7 +119,7 @@ def run_chunk(
     use_kv_cache: bool = True,
     past_key_values: object | None = None,
     cache_abs_pos: int = 0,
-    tau: float | None = None,
+    tau: Tensor | float | None = None,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 

@@ -129,7 +129,7 @@ class WriteTrajectoryGenerator(nn.Module):
         manifold: Manifold,
         *,
         hard: bool = True,
-        tau: float | None = None,
+        tau: Tensor | float | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """Run write trajectories and return new manifold state.
 
@@ -155,7 +155,10 @@ class WriteTrajectoryGenerator(nn.Module):
         N = cfg.N
         assert prev_states.shape == (BS, N, D)
         assert surprise.shape == (BS,), f"surprise shape {surprise.shape} != ({BS},)"
-        tau_eff = cfg.gumbel_tau if tau is None else float(tau)
+        # Tensor pass-through (same rationale as read_module — avoids the
+        # per-step Dynamo recompile triggered by Python-scalar specialization
+        # of an exp-decay-schedule tau).
+        tau_eff = cfg.gumbel_tau if tau is None else tau
 
         surprise_bj = surprise.view(BS, 1).expand(BS, J).unsqueeze(-1)  # [BS, J, 1]
 

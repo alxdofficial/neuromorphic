@@ -92,7 +92,7 @@ def routing_aux_losses(logits: Tensor, one_hot: Tensor) -> dict[str, Tensor]:
 
 def gumbel_top1_ste(
     logits: Tensor,
-    tau: float,
+    tau: Tensor | float,
     *,
     hard: bool,
     generator: torch.Generator | None = None,
@@ -355,7 +355,7 @@ class ReadTrajectoryGenerator(nn.Module):
         manifold: Manifold,
         *,
         hard: bool = True,
-        tau: float | None = None,
+        tau: Tensor | float | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """Generate J parallel trajectories.
 
@@ -383,7 +383,10 @@ class ReadTrajectoryGenerator(nn.Module):
         J, K = cfg.J, cfg.K_read
         N = cfg.N
         assert current_states.shape == (BS, N, D)
-        tau_eff = cfg.gumbel_tau if tau is None else float(tau)
+        # Tau: leave as tensor if caller passed a tensor (dynamo treats it as
+        # a dynamic input → 1 compile reused forever). Only cast to float if
+        # absent (use cfg default — also a Python scalar, but compiled once).
+        tau_eff = cfg.gumbel_tau if tau is None else tau
 
         # ── 1. Pick J entry concepts ──────────────────────────────────
         pooled = prev_window_hiddens.mean(dim=1)                  # [BS, d_lm]
