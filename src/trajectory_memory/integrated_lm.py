@@ -110,11 +110,29 @@ class IntegratedLM(nn.Module):
                 self.host.freeze_backbone()
 
             # ── 2. Replace inject layer with MemInjectLayer ───────────
+            # If cfg.inject_layer_frac is set, derive the layer index from
+            # it scaled to the actual Llama depth — this keeps "mid-stack"
+            # placement consistent across model sizes (Llama-3.2-1B/3B/etc.
+            # have different num_hidden_layers). Falls back to the explicit
+            # cfg.inject_layer otherwise. Mutating cfg here is fine: it's a
+            # per-instance dataclass.
+            n_layers = hf_cfg.num_hidden_layers
+            if cfg.inject_layer_frac is not None:
+                cfg.inject_layer = int(cfg.inject_layer_frac * n_layers)
             L = cfg.inject_layer
-            assert L < hf_cfg.num_hidden_layers, (
-                f"inject_layer={L} but model has {hf_cfg.num_hidden_layers} layers"
+            assert L < n_layers, (
+                f"inject_layer={L} but model has {n_layers} layers"
             )
             orig_layer = self.host.layer_list()[L]
+            # MemInjectLayer.scale_init: per-d_lm-dim learnable scalar
+            # initialized at 0.1 (10% memory contribution at start). Small
+            # but non-zero so memory gradient flows from step 0; the
+            # scalar trains up if memory becomes useful. Hard-coded because
+            # 0.1 is a sensible mid-point for "start small, learn the right
+            # mix" — changing it changes how aggressively memory takes
+            # over early; literature on adapter scaling (LoRA α, residual
+            # branch init) consistently chooses 0.01-0.1 for similar
+            # reasons.
             mem_inject = MemInjectLayer(
                 orig_layer=orig_layer,
                 d_lm=cfg.d_lm,

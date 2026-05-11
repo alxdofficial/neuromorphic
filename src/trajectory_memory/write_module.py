@@ -91,15 +91,26 @@ class WriteTrajectoryGenerator(nn.Module):
 
         # Learnable decay gate — per-trajectory-hop sigmoid α ∈ [0, 1].
         # α = 1 → fully retain old state; α = 0 → fully overwrite with
-        # candidate. Init bias = 2.2 → sigmoid(2.2) ≈ 0.9, matching the
-        # original "10% update per hop" rate. Model learns when to
-        # forget more aggressively (α → 0) on surprising windows.
+        # candidate. The bias is initialized to reproduce the
+        # pre-decay-gate update rate: legacy was `new = old + s·mlp(...)`
+        # which is equivalent (in steady-state magnitude terms) to
+        # `new = α_target · old + (1-α_target) · candidate` with
+        #     α_target = 1 / (1 + s).
+        # Inverting the sigmoid gives the right bias:
+        #     bias = logit(α_target) = log(α_target / (1 - α_target))
+        #          = log(1/s) = -log(s).
+        # For s = mutation_init_scale = 0.1 this gives bias = log(10) ≈ 2.30.
+        # Decay-gate output sits near α_target at init; over training,
+        # the model can lower α (forget more on surprising windows) or
+        # raise it (preserve state where doing so helps the LM loss).
         self.decay_gate = nn.Sequential(
             nn.Linear(D * 3 + 1, D, bias=True),
             nn.GELU(),
             nn.Linear(D, 1, bias=True),
         )
-        nn.init.constant_(self.decay_gate[-1].bias, 2.2)
+        import math as _math
+        _decay_bias_init = -_math.log(self.mutation_scale)
+        nn.init.constant_(self.decay_gate[-1].bias, _decay_bias_init)
         # Zero out the final-layer weights so the bias dominates at init
         # (otherwise random initialization produces α with high variance
         # across hops, destabilizing the first few training steps).

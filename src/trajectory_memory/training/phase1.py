@@ -82,7 +82,10 @@ class Phase1Trainer:
         load_balance_coef: float = 1e-2,
         z_loss_coef: float = 1e-3,
         revive_every: int = 500,            # steps between dead-code revival
-        revive_threshold: float = 1e-5,     # usage_ema below this = dead
+        # `None` → auto-derive as 1/(100·N), i.e. 1% of uniform-routing
+        # usage. Scales correctly across manifold sizes. At N=4096 this
+        # gives 2.4e-6 (a concept visited ≤1% of uniform is "dead").
+        revive_threshold: float | None = None,
         tau_init: float = 1.0,              # Gumbel temp at step 0
         tau_floor: float = 0.5,             # never drop below this
         tau_decay_rate: float = 1e-4,       # τ = max(floor, init·exp(-rate·step))
@@ -118,6 +121,10 @@ class Phase1Trainer:
         self.load_balance_coef = load_balance_coef
         self.z_loss_coef = z_loss_coef
         self.revive_every = revive_every
+        # Auto-derive revive_threshold from manifold size so it scales
+        # with N. Default 1/(100·N) = 1% of perfectly-uniform routing.
+        if revive_threshold is None:
+            revive_threshold = 1.0 / (100.0 * model.cfg.N)
         self.revive_threshold = revive_threshold
         self.tau_init = tau_init
         self.tau_floor = tau_floor

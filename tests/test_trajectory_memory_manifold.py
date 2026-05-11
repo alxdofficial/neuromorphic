@@ -288,3 +288,25 @@ def test_manifold_revive_with_no_active_concepts_is_safe():
     # No visits recorded; all concepts have usage 0
     n = m.revive_dead_concepts(threshold=0.5)
     assert n == 0, "should no-op when no concepts are active to seed from"
+
+
+# ── magic-number scaling fixes ──────────────────────────────────────────
+
+def test_manifold_state_init_scales_with_D_concept():
+    """state_init std should be 1/sqrt(D_concept), giving per-concept
+    state norm ≈ 1 regardless of D. Previously hardcoded at 0.02 which
+    broke when scaling D."""
+    from src.trajectory_memory.config import TrajMemConfig
+    for D in [128, 256, 512]:
+        cfg = TrajMemConfig.small()
+        cfg.D_concept = D
+        cfg.K_max_neighbors = min(8, D)
+        cfg.validate()
+        m = Manifold(cfg)
+        per_concept_norm = m.state_init.norm(dim=-1)
+        mean_norm = per_concept_norm.mean().item()
+        # Expected: std × sqrt(D) = (1/sqrt(D)) × sqrt(D) = 1.0
+        assert 0.85 < mean_norm < 1.15, (
+            f"D={D}: per-concept state norm should be ~1.0 (Glorot), "
+            f"got mean {mean_norm:.3f}"
+        )

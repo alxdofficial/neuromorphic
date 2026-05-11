@@ -206,12 +206,16 @@ class Manifold(nn.Module):
             ids_init.normal_(0.0, ids_std, generator=gen_c)
         self.concept_ids = nn.Parameter(ids_init)
 
-        # state_init: learnable "good seed" the manifold resets to. Init
-        # near zero so reads in early training don't get noise; the optimizer
-        # will pull it toward a useful starting point.
+        # state_init: learnable "good seed" the manifold resets to. Init at
+        # the same Glorot-style scale as concept_ids (std=1/sqrt(D)) so the
+        # per-concept state norm at init is O(1) and scale-invariant across
+        # D_concept choices. The write_module's decay-gate equilibrium
+        # bounds further drift; what state_init controls is the early-
+        # training trajectory, not the steady-state magnitude.
+        state_init_std = 1.0 / (D ** 0.5)
         state_init = torch.empty(N, D)
         with torch.no_grad():
-            state_init.normal_(0.0, 0.02, generator=gen_c)
+            state_init.normal_(0.0, state_init_std, generator=gen_c)
         self.state_init = nn.Parameter(state_init)
 
         # concept_states: activation-like, starts at state_init's value.

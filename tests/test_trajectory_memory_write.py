@@ -223,23 +223,25 @@ def test_write_module_state_bounded_over_many_windows():
     )
 
 
-def test_write_module_decay_gate_init_alpha():
-    """At init, the decay gate should produce alpha ≈ 0.9 (sigmoid(2.2)),
-    matching the original mutation_scale=0.1 update magnitude."""
-    cfg = TrajMemConfig.small()
-    wm = WriteTrajectoryGenerator(cfg)
-    # Drive gate_mlp with a random input; check the OUTPUT mean is close
-    # to 0.9 across many samples (bias dominates due to zero'd weights).
-    D = cfg.D_concept
-    rand_input = torch.randn(100, D * 3 + 1)
-    with torch.no_grad():
-        alpha = torch.sigmoid(wm.decay_gate(rand_input))
-    assert 0.85 <= alpha.mean().item() <= 0.95, (
-        f'Init alpha should be ~0.9, got mean {alpha.mean().item():.3f}'
-    )
-    # And low variance since we zeroed the final-layer weights
-    assert alpha.std().item() < 0.05, (
-        f'Init alpha should have low variance (weights zeroed), got std '
-        f'{alpha.std().item():.3f}'
-    )
+def test_write_module_decay_gate_init_alpha_derived_from_mutation_scale():
+    """Init alpha should match α_target = 1 / (1 + mutation_scale), derived
+    so the decay-gate update rate matches the legacy `new = old + s·mlp`
+    formulation. Test across multiple mutation_scale values to verify
+    the derivation, not just the default."""
+    import math
+    for s in [0.05, 0.1, 0.2]:
+        cfg = TrajMemConfig.small()
+        cfg.mutation_init_scale = s
+        wm = WriteTrajectoryGenerator(cfg)
+        D = cfg.D_concept
+        rand_input = torch.randn(100, D * 3 + 1)
+        with torch.no_grad():
+            alpha = torch.sigmoid(wm.decay_gate(rand_input))
+        expected_alpha = 1.0 / (1.0 + s)
+        assert abs(alpha.mean().item() - expected_alpha) < 0.01, (
+            f'mutation_scale={s}: init alpha should be {expected_alpha:.3f}, '
+            f'got mean {alpha.mean().item():.3f}'
+        )
+        # Low variance since we zeroed the final-layer weights
+        assert alpha.std().item() < 0.05
 

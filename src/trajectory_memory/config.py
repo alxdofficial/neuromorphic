@@ -47,7 +47,14 @@ class TrajMemConfig:
 
     # ── llama integration ────────────────────────────────────────────
     d_lm: int = 2048              # llama-3.2-1B hidden dim; overridden post-load
-    inject_layer: int = 8         # mid-stack
+    # `inject_layer` is the absolute layer index. Setting it directly is
+    # backward-compatible. Prefer `inject_layer_frac` to keep mid-stack
+    # placement under different Llama sizes — set frac to non-None and it
+    # OVERRIDES inject_layer at IntegratedLM construction with
+    # int(frac × num_hidden_layers). Default 8 ≈ mid for Llama-3.2-1B
+    # (16 layers × 0.5).
+    inject_layer: int = 8
+    inject_layer_frac: float | None = None
     bridge_hidden: int | None = 2048  # MemInjectLayer bridge MLP hidden dim
 
     # ── training (cross-window TBPTT) ────────────────────────────────
