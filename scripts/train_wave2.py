@@ -92,11 +92,13 @@ def main():
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
     if args.compile:
-        # dynamic=True so the rolling LM context's varying length doesn't
-        # trigger dynamo recompiles per shape (hits recompile_limit=8 within
-        # a few chunks otherwise). See `scripts/experiment_compile_dynamic.py`.
+        # dynamic=False — dynamic=True triggers an AOT autograd partitioner
+        # bug (`AssertionError: Node add_NNNN was invalid, but is output`)
+        # under bf16 autocast + trajectory-generator AC. Same fix that
+        # train_wave1.py applied. KV cache mode keeps lm_input_ids at a
+        # fixed T_window=256 anyway, so dynamic=False has no downside here.
         model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=True,
+            model.forward_window, mode="default", dynamic=False,
         )
         print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
