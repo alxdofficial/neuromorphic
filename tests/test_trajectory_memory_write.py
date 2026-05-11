@@ -21,7 +21,8 @@ def _small_setup(BS: int = 2):
 def test_write_module_construct():
     cfg = TrajMemConfig.small()
     wm = WriteTrajectoryGenerator(cfg)
-    assert wm.head_query.shape == (cfg.J, cfg.D_concept)
+    # entry_proj (Hopfield-tied; standalone copy in tests)
+    assert wm.entry_proj.head_query.shape == (cfg.J, cfg.D_concept)
     assert wm.mutate_mlp is not None
 
 

@@ -321,44 +321,50 @@ class Phase2Trainer:
         # SAMPLING time — used by pass 2 for the PPO importance-sampling
         # ratio. Recording it here is essentially free (softmax already
         # computed for sampling).
-        # N7 fix — shared pass-1 prefill across K samples. Encode the
-        # prompt ONCE (single forward through K windows), then K
-        # independent generation branches start from cloned prefill state.
-        # Saves K-1 prompt prefills per step; for K=8 / T_pre=1024 / T_gen=64
-        # that's a ~4-5× reduction in pass-1 wall time.
+        #
+        # N7 fix — shared pass-1 prefill across K samples (encode prompt
+        # ONCE). For real Llama we then run all K AR rollouts IN PARALLEL
+        # at BS=K via `_ar_sample_batch` — replaces K × T_gen sequential
+        # single-token forwards with T_gen BS=K forwards (~K× launch
+        # overhead reduction; rollout is launch-bound on a single 4090).
+        # For test mode (no real Llama, attach_lm=False), we fall back to
+        # the K-serial path since `_ar_sample_one_test_mode` uses
+        # forward_window directly and doesn't share the BS=K KV cache
+        # plumbing.
         pass1_prefill_shared = None
         if self.model.llama is not None:
             pass1_prefill_shared = self._prefill_prompt(
                 prompt_ids, pad_id=pad_id, device=device,
             )
 
-        samples: list[Tensor] = []
-        samples_logp_old: list[Tensor] = []
-        import copy
-        for _ in range(num_samples):
-            # Per-sample clone of prefill state — each sample's AR loop
-            # mutates manifold + cache independently.
-            per_sample_prefill = None
-            if pass1_prefill_shared is not None:
-                _ps, _ph, _kv, _lr, _ap = pass1_prefill_shared
-                per_sample_prefill = (
-                    _ps.detach().clone(),
-                    _ph.detach().clone() if _ph is not None else None,
-                    copy.deepcopy(_kv),
-                    _lr.detach().clone() if _lr is not None else None,
-                    _ap,
-                )
-            sample, logp_old = self._ar_sample_one(
+        if self.model.llama is not None:
+            # Batched rollout — single call, K samples in parallel.
+            samples, samples_logp_old = self._ar_sample_batch(
                 prompt_ids,
+                num_samples=num_samples,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 stop_ids=stop_ids,
                 pad_id=pad_id,
                 device=device,
-                prefill_state=per_sample_prefill,
+                prefill_state=pass1_prefill_shared,
             )
-            samples.append(sample)
-            samples_logp_old.append(logp_old)
+        else:
+            # Test-mode fallback (no Llama) — K serial AR loops.
+            samples = []
+            samples_logp_old = []
+            for _ in range(num_samples):
+                sample, logp_old = self._ar_sample_one(
+                    prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    stop_ids=stop_ids,
+                    pad_id=pad_id,
+                    device=device,
+                    prefill_state=None,
+                )
+                samples.append(sample)
+                samples_logp_old.append(logp_old)
 
         # ── SCORE ────────────────────────────────────────────────────
         decoded = [tokenizer.decode(s.tolist(), skip_special_tokens=True) for s in samples]
@@ -412,10 +418,16 @@ class Phase2Trainer:
         # apply PPO clip, accumulate weighted advantage. Optionally add
         # KL(π_θ ‖ π_ref) regularization computed under a temporarily-
         # swapped ref-policy forward pass.
+        # R3: per-sample backward — accumulate gradients sample-by-sample
+        # rather than holding all K autograd graphs alive until a joint
+        # backward. PyTorch's optimizer.zero_grad() at start + per-sample
+        # backward() leaves grad buffers accumulating; this is
+        # mathematically identical to a joint backward
+        # (∇Σᵢ lᵢ = Σᵢ ∇lᵢ) but cuts peak VRAM by ~K× because each
+        # sample's TF activation graph is freed after its backward fires.
         self.optimizer.zero_grad()
-        policy_loss = torch.zeros((), device=device)
-        kl_loss = torch.zeros((), device=device)
         any_grad = False
+        total_loss_value = 0.0          # scalar for reporting only
 
         # Diagnostics
         n_clipped = 0
@@ -435,6 +447,17 @@ class Phase2Trainer:
             prompt_ids, [s.to(device) for s in samples],
             temperature=temperature, pad_id=pad_id, device=device,
         )
+
+        # Audit fix (Phase A1, Dr.GRPO): normalize by `K * max_new_tokens`
+        # rather than just `K`. The earlier `sum(logp) / K` per sample
+        # gives long completions larger |loss| for the same advantage,
+        # producing the documented length-bias pathologies in GRPO
+        # (completion-length explosion in correct-bias mode; "long-wrong"
+        # under negative advantage). See arxiv 2503.20783 (Sea AI Lab,
+        # COLM 2025). Dividing by a constant `max_new_tokens` is
+        # length-agnostic. Applied per-sample so the sum-of-backwards
+        # equals the joint-backward gradient.
+        denom = max(num_samples * max_new_tokens, 1)
 
         for i, (sample, logp_old, adv) in enumerate(zip(samples, samples_logp_old, advantages)):
             if sample.numel() == 0:
@@ -478,7 +501,7 @@ class Phase2Trainer:
             # Loss is -min(r·A, clip(r)·A) (we minimize → negate the
             # surrogate objective).
             surrogate = -torch.min(adv * ratio, adv * clipped_ratio)
-            policy_loss = policy_loss + surrogate.sum()
+            sample_policy_loss = surrogate.sum() / denom
 
             # Diagnostics.
             n_clipped += int(((ratio < clip_low) | (ratio > clip_high)).sum())
@@ -487,33 +510,25 @@ class Phase2Trainer:
 
             # KL term against reference policy (precomputed in batch above).
             ref_logps = ref_logps_list[i]
+            sample_kl_loss = torch.zeros((), device=device)
             if ref_logps is not None and ref_logps.numel() == n_new:
                 # John Schulman's K3 estimator: KL ≈ exp(log r) - log r - 1
                 # where log r = logp_new - logp_ref. Always non-negative,
                 # low-variance, exact in expectation.
                 log_r = sample_logps_new - ref_logps.to(sample_logps_new.dtype)
                 kl_per_tok = log_r.exp() - log_r - 1.0
-                kl_loss = kl_loss + kl_per_tok.sum()
+                sample_kl_loss = kl_per_tok.sum() / denom
                 kl_sum += float(kl_per_tok.detach().sum())
                 kl_count += int(n_new)
 
+            # Per-sample backward — frees this sample's activation graph
+            # before next iteration builds its own.
+            sample_total_loss = sample_policy_loss + self.kl_coef * sample_kl_loss
+            sample_total_loss.backward()
+            total_loss_value += float(sample_total_loss.detach())
             any_grad = True
 
-        # Audit fix (Phase A1, Dr.GRPO): normalize by `K * max_new_tokens`
-        # rather than just `K`. The earlier `sum(logp) / K` per sample
-        # gives long completions larger |loss| for the same advantage,
-        # producing the documented length-bias pathologies in GRPO
-        # (completion-length explosion in correct-bias mode; "long-wrong"
-        # under negative advantage). See arxiv 2503.20783 (Sea AI Lab,
-        # COLM 2025). Dividing by a constant `max_new_tokens` is
-        # length-agnostic.
-        denom = max(num_samples * max_new_tokens, 1)
-        policy_loss = policy_loss / denom
-        kl_loss = kl_loss / denom
-        total_loss = policy_loss + self.kl_coef * kl_loss
-
         if any_grad:
-            total_loss.backward()
             grad_norm = self._clip_and_step()
         else:
             grad_norm = 0.0
@@ -522,7 +537,7 @@ class Phase2Trainer:
         self._step_count += 1
 
         return Phase2Metrics(
-            policy_loss=float(total_loss.detach()),
+            policy_loss=total_loss_value,
             grad_norm=float(grad_norm),
             lr=[g["lr"] for g in self.optimizer.param_groups],
             rewards=rewards,
@@ -1009,6 +1024,260 @@ class Phase2Trainer:
             torch.stack(logp_old_list).cpu() if logp_old_list else torch.zeros(0),
         )
 
+    # ── PASS 1 (BATCHED): K rollouts in parallel at BS=K ──
+
+    def _expand_kv_cache_to_K(self, cache, K: int):
+        """In-place: expand a BS=1 DynamicCache to BS=K by duplicating
+        each layer's keys/values along the batch dim. Returns the same
+        cache object after mutation. Caller is responsible for cloning
+        the BS=1 cache first if they want to preserve it (we do this in
+        `_ar_sample_batch`)."""
+        if cache is None:
+            return None
+        for layer in cache.layers:
+            if not layer.is_initialized:
+                continue
+            layer.keys = layer.keys.expand(K, -1, -1, -1).contiguous()
+            layer.values = layer.values.expand(K, -1, -1, -1).contiguous()
+        return cache
+
+    @torch.no_grad()
+    def _ar_sample_batch(
+        self,
+        prompt_ids: Tensor,
+        *,
+        num_samples: int,
+        max_new_tokens: int,
+        temperature: float,
+        stop_ids: set[int] | None,
+        pad_id: int,
+        device: torch.device,
+        prefill_state: tuple | None = None,
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        """K AR rollouts in parallel at BS=K. Replaces K serial
+        `_ar_sample_one` calls.
+
+        Same per-window structure (read at window start → AR within →
+        write at window end → trim cache), but all K samples advance
+        in lockstep via the BS dimension. Cuts Pass-1 launch count
+        by ~K× — the dominant cost in our AR rollout (launch-bound
+        single-token forwards).
+
+        Per-sample EOS tracking via a `finished` mask. Once a sample
+        emits a stop token, its subsequent token positions get force-
+        written to pad_id and logp 0 (compute still runs at that slot
+        but those positions are dropped on return — static padding).
+
+        Returns:
+            samples:    list of K [n_k] int64 tensors (truncated at first stop).
+            logps_old:  list of K [n_k] float tensors aligned to `samples`.
+        """
+        from src.trajectory_memory.tbptt import _trim_kv_cache
+        import copy as _copy
+
+        cfg = self.model.cfg
+        cap = cfg.effective_lm_context
+        T = cfg.T_window
+        K = num_samples
+
+        # ── Prefill (BS=1, shared); clone internally so pass 2 can
+        # safely reuse the caller's prefill_state unmodified.
+        if prefill_state is not None:
+            (ps_1, ph_1, kv_1, lr_1, abs_pos) = prefill_state
+            prev_states_1 = ps_1.detach().clone()
+            prev_window_hiddens_1 = ph_1.detach().clone() if ph_1 is not None else None
+            kv_cache = _copy.deepcopy(kv_1)
+            last_real_hidden_1 = lr_1.detach().clone() if lr_1 is not None else None
+        else:
+            (prev_states_1, prev_window_hiddens_1, kv_cache,
+             last_real_hidden_1, abs_pos) = self._prefill_prompt(
+                prompt_ids, pad_id=pad_id, device=device,
+            )
+
+        # ── Expand prefill state from BS=1 to BS=K.
+        prev_states = prev_states_1.expand(K, -1, -1).contiguous()
+        prev_window_hiddens = (
+            prev_window_hiddens_1.expand(K, -1, -1).contiguous()
+            if prev_window_hiddens_1 is not None else None
+        )
+        last_real_hidden = (
+            last_real_hidden_1.expand(K, -1, -1).contiguous()
+            if last_real_hidden_1 is not None else None
+        )
+        kv_cache = self._expand_kv_cache_to_K(kv_cache, K)
+
+        # ── Output buffers (preallocated to max_new_tokens; truncated on return).
+        generated = torch.full(
+            (K, max_new_tokens), pad_id, dtype=torch.int64, device=device,
+        )
+        logp_old = torch.zeros((K, max_new_tokens), device=device)
+        finished = torch.zeros(K, dtype=torch.bool, device=device)
+        n_gen = 0
+
+        stop_ids_t = (
+            torch.tensor(list(stop_ids), dtype=torch.int64, device=device)
+            if stop_ids else None
+        )
+
+        def _update_finished(sampled: Tensor) -> None:
+            nonlocal finished
+            if stop_ids_t is not None:
+                is_stop = (sampled.unsqueeze(-1) == stop_ids_t).any(dim=-1)
+                finished = finished | is_stop
+
+        # ── First token: predict from last_real_hidden (per-sample).
+        lm_head_dtype = next(self.model.llama.lm_head.parameters()).dtype
+        last_hidden = (
+            last_real_hidden if last_real_hidden is not None
+            else prev_window_hiddens[:, -1:, :]
+        ).to(lm_head_dtype)
+        first_logits = self.model.llama.lm_head(last_hidden).float()
+        scaled = first_logits[:, -1, :] / temperature                # [K, V]
+        log_probs = F.log_softmax(scaled, dim=-1)
+        probs = log_probs.exp()
+        first_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [K]
+        generated[:, 0] = first_tokens
+        logp_old[:, 0] = log_probs.gather(
+            1, first_tokens.unsqueeze(-1),
+        ).squeeze(-1).detach()
+        n_gen = 1
+        _update_finished(first_tokens)
+
+        # ── Generation windows.
+        while n_gen < max_new_tokens and not finished.all():
+            # READ at window start (BS=K).
+            if prev_window_hiddens is None:
+                prev_window_hiddens = torch.zeros(
+                    K, T, cfg.d_lm,
+                    dtype=prev_states.dtype, device=device,
+                )
+            prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
+            read_visited, _ = self.model.read_module(
+                prev_hid_mem, prev_states, self.model.manifold, hard=False,
+            )
+            mem_inject = self.model._mem_inject_layer()
+            mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
+
+            window_hiddens_list: list[Tensor] = []
+            n_window = min(T, max_new_tokens - n_gen)
+            try:
+                # AR-generate up to T tokens within this window.
+                for _ in range(n_window):
+                    last_token_K = generated[:, n_gen - 1:n_gen]   # [K, 1]
+                    cache_position = torch.tensor(
+                        [abs_pos], dtype=torch.int64, device=device,
+                    )
+                    base_out = self.model.llama.model(
+                        input_ids=last_token_K,
+                        past_key_values=kv_cache,
+                        cache_position=cache_position,
+                        use_cache=True,
+                    )
+                    abs_pos += 1
+                    kv_cache = base_out.past_key_values
+                    hidden = base_out.last_hidden_state              # [K, 1, d_lm]
+                    window_hiddens_list.append(hidden)
+
+                    logits = self.model.llama.lm_head(hidden).float()
+                    scaled = logits[:, -1, :] / temperature          # [K, V]
+                    log_probs = F.log_softmax(scaled, dim=-1)
+                    probs = log_probs.exp()
+                    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                    # Force pad for already-finished samples; their logp stays 0.
+                    sampled = torch.where(
+                        finished, torch.full_like(sampled, pad_id), sampled,
+                    )
+                    logp_sample = log_probs.gather(
+                        1, sampled.unsqueeze(-1),
+                    ).squeeze(-1)
+                    logp_sample = torch.where(
+                        finished, torch.zeros_like(logp_sample), logp_sample,
+                    )
+
+                    generated[:, n_gen] = sampled
+                    logp_old[:, n_gen] = logp_sample.detach()
+                    n_gen += 1
+                    _update_finished(sampled)
+
+                    if finished.all():
+                        break
+            finally:
+                mem_inject.memory_fn = None
+
+            if not window_hiddens_list:
+                break
+
+            # WRITE at window end (BS=K). Mirrors _ar_sample_one's
+            # pad-token-forward strategy for partial windows so pass-2
+            # TF replay sees the same memory state evolution.
+            cur_hiddens = torch.cat(window_hiddens_list, dim=1)      # [K, n_win, d_lm]
+            n_win = cur_hiddens.shape[1]
+
+            if n_win < T // 2:
+                pad_h = cur_hiddens[:, -1:, :].expand(K, T - n_win, cfg.d_lm)
+                prev_window_hiddens = torch.cat([cur_hiddens, pad_h], dim=1)
+            else:
+                if n_win < T:
+                    n_pad = T - n_win
+                    pad_t = torch.full(
+                        (K, n_pad), pad_id, dtype=torch.int64, device=device,
+                    )
+                    cache_len_now = (
+                        kv_cache.get_seq_length() if kv_cache is not None else 0
+                    )
+                    pad_cache_position = torch.arange(
+                        cache_len_now, cache_len_now + n_pad, device=device,
+                    )
+                    pad_position_ids = torch.arange(
+                        abs_pos, abs_pos + n_pad, device=device,
+                    ).unsqueeze(0).expand(K, -1)
+                    mem_inject.memory_fn = self.model._build_memory_fn(read_visited)
+                    try:
+                        pad_out = self.model.llama.model(
+                            input_ids=pad_t,
+                            past_key_values=kv_cache,
+                            cache_position=pad_cache_position,
+                            position_ids=pad_position_ids,
+                            use_cache=True,
+                        )
+                    finally:
+                        mem_inject.memory_fn = None
+                    kv_cache = pad_out.past_key_values
+                    abs_pos += n_pad
+                    pad_hiddens = pad_out.last_hidden_state
+                    cur_hiddens_padded = torch.cat([cur_hiddens, pad_hiddens], dim=1)
+                else:
+                    cur_hiddens_padded = cur_hiddens
+
+                cur_hiddens_mem = cur_hiddens_padded.to(prev_states.dtype)
+                surprise = torch.zeros(K, dtype=prev_states.dtype, device=device)
+                new_states, _, _ = self.model.write_module(
+                    cur_hiddens_mem, surprise, prev_states, self.model.manifold,
+                    hard=False,
+                )
+                prev_states = new_states
+                prev_window_hiddens = cur_hiddens_padded
+
+            kv_cache = _trim_kv_cache(kv_cache, cap)
+
+        # ── Truncate per-sample at first stop.
+        samples: list[Tensor] = []
+        logps: list[Tensor] = []
+        for k in range(K):
+            seq = generated[k, :n_gen]
+            lp = logp_old[k, :n_gen]
+            if stop_ids_t is not None and seq.numel() > 0:
+                is_stop = (seq.unsqueeze(-1) == stop_ids_t).any(dim=-1)
+                stop_pos = is_stop.nonzero(as_tuple=True)[0]
+                if stop_pos.numel() > 0:
+                    first_stop = int(stop_pos[0].item())
+                    seq = seq[:first_stop + 1]
+                    lp = lp[:first_stop + 1]
+            samples.append(seq.cpu())
+            logps.append(lp.cpu())
+        return samples, logps
+
     # ── PASS 2: TF logp computation (with grad, single backward, KV-cached) ──
 
     def _tf_compute_sample_logp(
@@ -1211,10 +1480,18 @@ class Phase2Trainer:
                     pred_logits = logits[0, first_idx:first_idx + target_ids.numel(), :]
 
                 if pred_logits is not None and pred_logits.shape[0] > 0:
-                    scaled = pred_logits / temperature
-                    logps = F.log_softmax(scaled.float(), dim=-1).gather(
+                    # R2: selective log-softmax — gather + logsumexp
+                    # instead of full log_softmax + gather. Avoids
+                    # transiently materializing the [n_pred, V] log_softmax
+                    # output tensor (V=128k → ~25 MB per window of n_pred
+                    # tokens). Math is identical:
+                    #   logp(t) = scaled[t] - logsumexp(scaled, dim=-1)
+                    scaled = (pred_logits / temperature).float()
+                    target_logits = scaled.gather(
                         -1, target_ids.unsqueeze(-1),
                     ).squeeze(-1)                                  # [n_pred]
+                    lse = torch.logsumexp(scaled, dim=-1)          # [n_pred]
+                    logps = target_logits - lse                    # [n_pred]
                     sample_logps.append(logps)
 
             # Carry state — NO DETACH, autograd graph stays alive across

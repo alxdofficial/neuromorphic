@@ -144,7 +144,11 @@ def test_tbptt_lm_context_grows_then_caps():
     windows = input_ids.view(BS, cfg.D, cfg.T_window)
     prev_states = model.manifold.reset_states(batch_size=BS)
 
-    out = run_chunk(model, windows, prev_states, prev_window_hiddens=None, prev_lm_context=None)
+    out = run_chunk(
+        model, windows, prev_states,
+        prev_window_hiddens=None, prev_lm_context=None,
+        use_kv_cache=False,  # this test specifically exercises rolling-buffer mode
+    )
     # After D=4 windows, the rolling buffer should be exactly cap - T_window
     # = T_window (so when window D+1 arrives, the new lm_input is exactly
     # cap = 2 * T_window).

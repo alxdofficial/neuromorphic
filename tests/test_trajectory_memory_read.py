@@ -86,9 +86,10 @@ def test_gumbel_top1_no_nan_in_training():
 def test_read_module_construct():
     cfg = TrajMemConfig.small()
     rm = ReadTrajectoryGenerator(cfg)
-    # head_query, MLPs, attn modules all present
-    assert rm.head_query.shape == (cfg.J, cfg.D_concept)
-    assert rm.entry_mlp is not None
+    # entry_proj (Hopfield-tied; standalone copy in tests), MLPs, attn
+    # modules all present.
+    assert rm.entry_proj.head_query.shape == (cfg.J, cfg.D_concept)
+    assert rm.entry_proj.entry_mlp is not None
     assert rm.history_attn is not None
     assert rm.cross_attn is not None
     assert rm.step_mlp is not None

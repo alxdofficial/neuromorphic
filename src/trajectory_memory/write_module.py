@@ -21,6 +21,7 @@ from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.manifold import Manifold
 from src.trajectory_memory.read_module import (
     _CrossAttn,
+    EntryProjector,
     gumbel_top1_ste,
     make_pos_enc,
     per_j_attn,
@@ -43,25 +44,20 @@ class WriteTrajectoryGenerator(nn.Module):
                  proposed:      [BS, J, K_write, D]  proposed states (debug/telemetry)
     """
 
-    def __init__(self, cfg: TrajMemConfig):
+    def __init__(
+        self, cfg: TrajMemConfig, *, entry_proj: "EntryProjector | None" = None,
+    ):
         super().__init__()
         self.cfg = cfg
         D = cfg.D_concept
         d_lm = cfg.d_lm
 
-        # J head queries — separate from read's, since these specialize
-        # for encoding (not retrieval). std=1.0 to differentiate trajectories
-        # at init (see read_module for rationale).
-        self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=1.0)
-
-        # Entry-point MLP: takes pooled current_hiddens (d_lm) + head_query (D)
-        # + surprise (1) → query in id-space (D).
-        self.entry_mlp = nn.Sequential(
-            nn.Linear(d_lm + D + 1, D, bias=True),
-            nn.GELU(),
-            nn.Linear(D, D, bias=True),
-        )
+        # Entry projection: shared with the read module (Hopfield-tied keys)
+        # when constructed via IntegratedLM. Surprise is intentionally NOT
+        # an input — it controls write strength downstream (step_mlp,
+        # mutate_mlp), not address. Routing surprise into the address would
+        # re-introduce read/write divergence and starve write of gradient.
+        self.entry_proj = entry_proj if entry_proj is not None else EntryProjector(cfg)
 
         # Per-hop attention.
         d_attn = D
@@ -125,11 +121,17 @@ class WriteTrajectoryGenerator(nn.Module):
         surprise_bj = surprise.view(BS, 1).expand(BS, J).unsqueeze(-1)  # [BS, J, 1]
 
         # ── 1. Entry-point selection ──────────────────────────────────
+        # Hopfield-tied: shares EntryProjector with read_module. Pool of
+        # current window hiddens here matches what next window's read will
+        # pool as its prev_window_hiddens, so write deposits at the slot
+        # the next read will retrieve from.
         pooled = current_window_hiddens.mean(dim=1)               # [BS, d_lm]
-        pooled_j = pooled.unsqueeze(1).expand(BS, J, d_lm)
-        hq = self.head_query.unsqueeze(0).expand(BS, J, D)
-        entry_input = torch.cat([pooled_j, hq, surprise_bj], dim=-1)
-        Q_entry = self.entry_mlp(entry_input)                     # [BS, J, D]
+        Q_entry = self.entry_proj(pooled)                         # [BS, J, D]
+
+        # Precompute cross_attn K,V on current_window_hiddens — identical
+        # for all j and all K_write hops. Avoids per-hop re-projection and
+        # the J-broadcast materialization.
+        cross_K, cross_V = self.cross_attn.precompute_kv(current_window_hiddens)
 
         ids = manifold.concept_ids
         entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)
@@ -167,11 +169,9 @@ class WriteTrajectoryGenerator(nn.Module):
                 self.history_attn, current_state, hist_kv,
             )
 
-            prev_hid_bjt = current_window_hiddens.unsqueeze(1).expand(
-                BS, J, T, d_lm,
-            )
-            cross_attn_out = per_j_attn(
-                self.cross_attn, current_state, prev_hid_bjt,
+            # Shared-KV fast path: no J broadcast, K/V already projected.
+            cross_attn_out = self.cross_attn.forward_with_kv(
+                current_state, cross_K, cross_V,
             )
 
             # Step query for next-hop selection.

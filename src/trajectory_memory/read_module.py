@@ -113,7 +113,18 @@ class _CrossAttn(nn.Module):
 
     Used in two places:
     - history_attn: Q = current state, KV = visited list + pos_enc
+                    KV genuinely differs per (b, j) trajectory; use
+                    `forward(q, kv)` with kv shape [BS, J, NK, d_kv].
     - cross_attn:   Q = current state, KV = window hiddens
+                    KV is the SAME for all j and all hops within a window.
+                    Use `precompute_kv(kv)` once per window, then
+                    `forward_with_kv(q, K, V)` per hop. This avoids
+                    materializing a J-broadcasted copy of `kv` and skips
+                    redundant W_k / W_v projections at each hop.
+
+    Both fast paths run in bf16 inside autocast — Linear weights stay
+    fp32, but activations and matmuls are bf16 (~50% memory cut). The
+    fp32 caller boundary is preserved (output is cast back).
 
     Single-head suffices because trajectory hops are small and we don't
     need multi-head expressivity; if benching shows it's too lossy we can
@@ -130,25 +141,116 @@ class _CrossAttn(nn.Module):
             nn.init.xavier_uniform_(m.weight)
 
     def forward(self, q: Tensor, kv: Tensor) -> Tensor:
-        """
+        """Per-(b,j) attention path. kv shape includes the same leading
+        dims as q (the per_j_attn caller folds J into BS).
+
         Args:
             q:  [BS, *Q, d_q]
             kv: [BS, *KV, d_kv]
         Returns:
             [BS, *Q, d_attn]
         """
-        Q = self.W_q(q)                                          # [BS, *Q, d_attn]
-        K = self.W_k(kv)                                         # [BS, *KV, d_attn]
-        V = self.W_v(kv)
-        # Flatten Q-extra-dims and KV-extra-dims for bmm-friendly attention.
-        BS = q.shape[0]
-        Q2 = Q.reshape(BS, -1, self.d_attn)                      # [BS, NQ, d]
-        K2 = K.reshape(BS, -1, self.d_attn)                      # [BS, NK, d]
-        V2 = V.reshape(BS, -1, self.d_attn)
-        scores = torch.bmm(Q2, K2.transpose(1, 2)) / math.sqrt(self.d_attn)
-        attn = F.softmax(scores, dim=-1)
-        out2 = torch.bmm(attn, V2)                               # [BS, NQ, d]
-        return out2.reshape(*Q.shape)                            # [BS, *Q, d]
+        out_dtype = q.dtype
+        with torch.autocast(
+            device_type="cuda" if q.is_cuda else "cpu",
+            dtype=torch.bfloat16, enabled=q.is_cuda,
+        ):
+            Q = self.W_q(q)                                          # [BS, *Q, d_attn]
+            K = self.W_k(kv)                                         # [BS, *KV, d_attn]
+            V = self.W_v(kv)
+            # Flatten Q-extra-dims and KV-extra-dims for bmm-friendly attention.
+            BS = q.shape[0]
+            Q2 = Q.reshape(BS, -1, self.d_attn)                      # [BS, NQ, d]
+            K2 = K.reshape(BS, -1, self.d_attn)                      # [BS, NK, d]
+            V2 = V.reshape(BS, -1, self.d_attn)
+            scores = torch.bmm(Q2, K2.transpose(1, 2)) / math.sqrt(self.d_attn)
+            attn = F.softmax(scores, dim=-1)
+            out2 = torch.bmm(attn, V2)                               # [BS, NQ, d]
+            out = out2.reshape(*Q.shape)
+        return out.to(out_dtype)
+
+    def precompute_kv(self, kv: Tensor) -> tuple[Tensor, Tensor]:
+        """Project KV once per window. Used by `cross_attn` (KV = window
+        hiddens, identical across all j and all hops). Returns bf16 tensors
+        on CUDA so downstream `forward_with_kv` stays in bf16.
+
+        Args:
+            kv: [BS, NK, d_kv]  — no J dim. Typically window hiddens.
+        Returns:
+            K, V: each [BS, NK, d_attn]
+        """
+        with torch.autocast(
+            device_type="cuda" if kv.is_cuda else "cpu",
+            dtype=torch.bfloat16, enabled=kv.is_cuda,
+        ):
+            K = self.W_k(kv)
+            V = self.W_v(kv)
+        return K, V
+
+    def forward_with_kv(self, q: Tensor, K: Tensor, V: Tensor) -> Tensor:
+        """Per-hop attention reusing precomputed K, V (no J broadcast,
+        no W_k / W_v re-projection). Returns dtype matching `q`.
+
+        Args:
+            q: [BS, J, d_q] or [BS, *Q, d_q]
+            K, V: [BS, NK, d_attn] (from `precompute_kv`)
+        Returns:
+            [BS, *Q, d_attn]
+        """
+        out_dtype = q.dtype
+        with torch.autocast(
+            device_type="cuda" if q.is_cuda else "cpu",
+            dtype=torch.bfloat16, enabled=q.is_cuda,
+        ):
+            Q = self.W_q(q)                                          # [BS, *Q, d_attn]
+            BS = q.shape[0]
+            Q2 = Q.reshape(BS, -1, self.d_attn)                      # [BS, NQ, d]
+            scores = torch.bmm(Q2, K.transpose(1, 2)) / math.sqrt(self.d_attn)
+            attn = F.softmax(scores, dim=-1)
+            out2 = torch.bmm(attn, V)                                # [BS, NQ, d]
+            out = out2.reshape(*Q.shape)
+        return out.to(out_dtype)
+
+
+class EntryProjector(nn.Module):
+    """Shared entry-point projection used by BOTH read and write modules.
+
+    Hopfield-tied keys: write deposits into the manifold at slot
+    `argmax(W·pooled)`, and the next window's read retrieves at the same
+    `argmax(W·pooled')` — when the underlying hiddens are the same window
+    (write[d] and read[d+1] both pool window d), shared `W` makes the
+    address agree by construction. This guarantees write's parameters get
+    gradient through the read's gather.
+
+    Owns `head_query` and `entry_mlp`. Surprise is intentionally NOT an
+    input here — it controls *write strength* (step_mlp / mutate_mlp), not
+    write *location*. Putting surprise in the address would re-introduce
+    read/write divergence.
+    """
+
+    def __init__(self, cfg: TrajMemConfig):
+        super().__init__()
+        D = cfg.D_concept
+        d_lm = cfg.d_lm
+        self.J = cfg.J
+        self.D = D
+        # std=1.0 to dominate the projected pooled term so J trajectories
+        # don't collapse to identical paths at init.
+        self.head_query = nn.Parameter(torch.empty(cfg.J, D))
+        nn.init.normal_(self.head_query, std=1.0)
+        self.entry_mlp = nn.Sequential(
+            nn.Linear(d_lm + D, D, bias=True),
+            nn.GELU(),
+            nn.Linear(D, D, bias=True),
+        )
+
+    def forward(self, pooled: Tensor) -> Tensor:
+        """pooled: [BS, d_lm] → Q_entry: [BS, J, D_concept]."""
+        BS, d_lm = pooled.shape
+        J, D = self.J, self.D
+        pooled_j = pooled.unsqueeze(1).expand(BS, J, d_lm)        # [BS, J, d_lm]
+        hq = self.head_query.unsqueeze(0).expand(BS, J, D)        # [BS, J, D]
+        return self.entry_mlp(torch.cat([pooled_j, hq], dim=-1))  # [BS, J, D]
 
 
 class ReadTrajectoryGenerator(nn.Module):
@@ -163,26 +265,19 @@ class ReadTrajectoryGenerator(nn.Module):
                 visited_ids: [BS, J, K_read] (int64) — for telemetry/debug
     """
 
-    def __init__(self, cfg: TrajMemConfig):
+    def __init__(
+        self, cfg: TrajMemConfig, *, entry_proj: "EntryProjector | None" = None,
+    ):
         super().__init__()
         self.cfg = cfg
         D = cfg.D_concept
         d_lm = cfg.d_lm
 
-        # J head queries to differentiate the parallel trajectories. Init
-        # large enough to dominate the pooled-hidden term in the entry MLP
-        # so the J trajectories don't collapse to identical paths at init.
-        # std=1.0 mirrors the magnitude of the projected pooled term.
-        self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=1.0)
-
-        # Entry-point MLP: takes pooled prev_hiddens (d_lm) + head_query (D)
-        # and produces a query in concept-id space (D).
-        self.entry_mlp = nn.Sequential(
-            nn.Linear(d_lm + D, D, bias=True),
-            nn.GELU(),
-            nn.Linear(D, D, bias=True),
-        )
+        # Entry projection: shared with the write module when constructed
+        # via IntegratedLM (Hopfield-tied keys); standalone when None
+        # (test-only). Sharing the projection makes write deposit at the
+        # address that the next window's read will retrieve from.
+        self.entry_proj = entry_proj if entry_proj is not None else EntryProjector(cfg)
 
         # Per-hop attention modules:
         d_attn = D
@@ -232,11 +327,13 @@ class ReadTrajectoryGenerator(nn.Module):
 
         # ── 1. Pick J entry concepts ──────────────────────────────────
         pooled = prev_window_hiddens.mean(dim=1)                  # [BS, d_lm]
-        # Broadcast pooled across J, concat head_query.
-        pooled_j = pooled.unsqueeze(1).expand(BS, J, d_lm)        # [BS, J, d_lm]
-        hq = self.head_query.unsqueeze(0).expand(BS, J, D)        # [BS, J, D]
-        entry_input = torch.cat([pooled_j, hq], dim=-1)           # [BS, J, d_lm+D]
-        Q_entry = self.entry_mlp(entry_input)                     # [BS, J, D]
+        Q_entry = self.entry_proj(pooled)                         # [BS, J, D]
+
+        # Precompute cross_attn K,V on prev_window_hiddens — identical for
+        # all j and all K_read hops in this window. Avoids re-projecting
+        # K/V at each hop and avoids the J-broadcast materialization that
+        # `per_j_attn` would force.
+        cross_K, cross_V = self.cross_attn.precompute_kv(prev_window_hiddens)
 
         # Score each entry query against all N concept_ids.
         # concept_ids: [N, D] → broadcast over BS, J.
@@ -281,11 +378,9 @@ class ReadTrajectoryGenerator(nn.Module):
             )                                                     # [BS, J, D]
 
             # cross_attn: query per j attends over the same prev_window_hiddens.
-            prev_hid_bjt = prev_window_hiddens.unsqueeze(1).expand(
-                BS, J, T, d_lm,
-            )
-            cross_attn_out = per_j_attn(
-                self.cross_attn, current_state, prev_hid_bjt,
+            # Use the shared-KV fast path — no J broadcast, K/V already cached.
+            cross_attn_out = self.cross_attn.forward_with_kv(
+                current_state, cross_K, cross_V,
             )                                                     # [BS, J, D]
 
             # Step MLP → query in id-space.

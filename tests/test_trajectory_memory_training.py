@@ -279,10 +279,10 @@ def test_checkpoint_round_trip_model_state(tmp_path: Path):
     model2 = _build_test_model(D=2)
     opt2 = _build_optimizer(model2)
 
-    # Pre-load: pick a parameter that's NOT cfg-seeded — read_module
-    # weights use the global RNG, so torch.manual_seed differentiates.
-    s1 = model1.read_module.entry_mlp[0].weight.detach().clone()
-    s2 = model2.read_module.entry_mlp[0].weight.detach().clone()
+    # Pre-load: pick a parameter that's NOT cfg-seeded — entry_proj's
+    # entry_mlp uses the global RNG, so torch.manual_seed differentiates.
+    s1 = model1.entry_proj.entry_mlp[0].weight.detach().clone()
+    s2 = model2.entry_proj.entry_mlp[0].weight.detach().clone()
     assert not torch.allclose(s1, s2), "test setup: models should start different"
 
     state = load_checkpoint(ckpt_path, model=model2, optimizer=opt2)
@@ -290,7 +290,7 @@ def test_checkpoint_round_trip_model_state(tmp_path: Path):
     assert state["extra"]["foo"] == "bar"
 
     # Post-load: states match.
-    s2_after = model2.read_module.entry_mlp[0].weight.detach().clone()
+    s2_after = model2.entry_proj.entry_mlp[0].weight.detach().clone()
     assert torch.allclose(s1, s2_after)
 
 

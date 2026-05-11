@@ -2,25 +2,31 @@
 gradient flow.
 
 Linear-in-D implementation: every window's autograd graph stays alive
-until backward fires at the end of the chunk. With per-block Llama
-checkpointing (already on inside the LM forward), memory cost is roughly
-1 window of activations + a slim per-window write graph skeleton.
+until backward fires at the end of the chunk. Memory cost is roughly
+D × per-window activations.
 
-Constant-in-D (custom autograd streaming) is a v2 optimization — see
-plan §4.3.
+KV cache (single-stream lockstep) is on by default — Llama re-encodes
+only the new T_window tokens each window. For BS>1, the per-slot
+multi-stream complexity was removed in favor of lockstep reset when
+any slot crosses a doc boundary (small efficiency cost, large code
+simplification).
 
 Usage:
     chunks = TBPTTChunker(cfg).split(input_ids)   # [num_chunks, D, T_window]
     prev_states, prev_hiddens, prev_lm_ctx = None, None, None
+    past_kv, cache_abs_pos = None, 0
     for chunk in chunks:
         result = run_chunk(
             integrated_lm, chunk, prev_states, prev_hiddens, prev_lm_ctx,
+            past_key_values=past_kv, cache_abs_pos=cache_abs_pos,
         )
         loss = result["aggregate_loss"]
         loss.backward()
         prev_states = result["final_states"].detach()              # cut grad
         prev_hiddens = result["final_hiddens"].detach()
         prev_lm_ctx = result["final_lm_context"]                   # already detached
+        past_kv = _detach_kv_cache(result["final_past_key_values"])
+        cache_abs_pos = result["final_cache_abs_pos"]
 """
 
 from __future__ import annotations
@@ -69,15 +75,10 @@ class TBPTTChunker:
 def _trim_kv_cache(cache, max_len: int):
     """Sliding-window trim a HF DynamicCache to keep the LAST max_len tokens.
 
-    Mutates `cache` in place. Returns `cache` for chaining.
-
-    HF transformers 5.x exposes per-layer cache as `cache.layers[i].keys`
-    and `.values`. Cache.crop() truncates from the END (keeps first N) —
-    we need to keep the LAST N (most recent), so we slice manually.
-
-    Trimming is a tensor slice — autograd through earlier window's backward
-    still works on the surviving slice. Dropped entries are released from
-    the autograd graph.
+    Used by Phase 2 rollout (long generated sequences capped to a sliding
+    context). Phase 1 training uses rolling-buffer mode and never sees a
+    cache, so this helper is Phase-2-only despite being colocated here for
+    historical reasons.
     """
     if cache is None:
         return None
@@ -94,8 +95,8 @@ def _trim_kv_cache(cache, max_len: int):
 
 
 def _detach_kv_cache(cache):
-    """Detach all tensors in cache so a new TBPTT chunk starts with no
-    autograd history through cached KVs (mirrors `prev_states.detach()`)."""
+    """Detach all cache tensors so a new GRPO step starts with no autograd
+    history. Phase-2 rollout helper."""
     if cache is None:
         return None
     for layer in cache.layers:
@@ -115,27 +116,25 @@ def run_chunk(
     *,
     target_mask: Tensor | None = None,
     hard_routing: bool = True,
-    use_kv_cache: bool = False,
+    use_kv_cache: bool = True,
     past_key_values: object | None = None,
     cache_abs_pos: int = 0,
-    per_slot_state: object | None = None,
 ) -> dict:
     """Run D consecutive windows with autograd kept alive across the chunk.
 
     Two execution modes:
 
-    - **Rolling-buffer mode** (`use_kv_cache=False`, default): maintains
-      a rolling LM-context buffer of up to `cfg.effective_lm_context`
-      tokens. At each window, Llama re-encodes the rolling buffer +
-      the new window's tokens.
+    - **KV-cache mode** (default, recommended): each window's Llama
+      forward encodes only the new T_window tokens against
+      `past_key_values`. Cache is sliding-window trimmed to
+      `cfg.effective_lm_context`. Across chunks the cache is detached
+      but threaded (single-stream lockstep — for BS>1 the caller resets
+      the cache to None whenever any slot crosses a doc boundary).
 
-    - **KV-cache mode** (`use_kv_cache=True`): each window's Llama forward
-      only encodes the new T_window tokens against `past_key_values`
-      (HF DynamicCache). The cache is trimmed to `cfg.effective_lm_context`
-      tokens (sliding window). Across chunks the cache is detached but
-      can be carried (see `_detach_kv_cache` and the trainer wiring).
-      ~30-50% faster on Phase 1 — the rolling-buffer re-encode was ~70%
-      of the T1 vs V1.B gap (see docs/profile_analysis.md).
+    - **Rolling-buffer mode** (`use_kv_cache=False`): maintains a rolling
+      LM-context buffer of up to `cfg.effective_lm_context` tokens. At
+      each window, Llama re-encodes the buffer + new tokens. ~1.79×
+      slower per step on Phase 1 — only used as a no-cache fallback.
 
     Args:
         model:               IntegratedLM
@@ -143,16 +142,16 @@ def run_chunk(
         prev_states:         [BS, N, D_concept] state at start of chunk
         prev_window_hiddens: [BS, T_window, d_lm] from window before this
                              chunk, or None if chunk starts a new sequence.
-        prev_lm_context:     Rolling-buffer mode: [BS, L] tokens from prior
-                             chunk to seed the buffer. KV-cache mode: ignored
-                             (use `past_key_values` instead).
-        target_mask:         [BS, D, T_window] or None — per-window mask
-                             over the CURRENT window's tokens for surprise.
-        hard_routing:        Gumbel-STE if True
-        use_kv_cache:        Switch to KV-cache mode.
+        prev_lm_context:     Rolling-buffer mode: [BS, L] tokens from
+                             prior chunk. KV-cache mode: ignored.
+        target_mask:         [BS, D, T_window] or None.
+        hard_routing:        Gumbel-STE if True.
+        use_kv_cache:        Pick mode (above).
         past_key_values:     KV-cache mode: HF DynamicCache from previous
-                             chunk (detached) or None. Updated in-place;
-                             `final_past_key_values` returned for next chunk.
+                             chunk (detached) or None.
+        cache_abs_pos:       KV-cache mode: absolute position of next
+                             token in the cache (for RoPE correctness
+                             across cache trims).
 
     Returns:
         dict with keys:
@@ -161,8 +160,9 @@ def run_chunk(
             final_states:          [BS, N, D_concept] state after last window
             final_hiddens:         [BS, T_window, d_lm] hiddens of last window
             final_lm_context:      Rolling-buffer mode: [BS, L] for next chunk.
-                                   KV-cache mode: empty (not used).
+                                   KV-cache mode: empty.
             final_past_key_values: KV-cache mode only — updated cache.
+            final_cache_abs_pos:   KV-cache mode only.
             surprise_history:      [BS, D] surprise per window
     """
     BS, D, T = windows.shape
@@ -173,16 +173,9 @@ def run_chunk(
     states = prev_states
     cur_prev_hiddens = prev_window_hiddens
     cache = past_key_values if use_kv_cache else None
-    # Absolute position counter — tracks position of next token to encode.
-    # Required for RoPE correctness: when cache is sliding-window trimmed,
-    # `cache.get_seq_length()` no longer reflects absolute position. We pass
-    # `cache_position` explicitly to llama.model() based on this counter so
-    # new tokens get RoPE rotations matching their TRUE positions, allowing
-    # the cached KVs (which baked their original-position rotations in) to
-    # combine correctly in attention.
     abs_pos = cache_abs_pos
 
-    # Rolling LM-context buffer (rolling-buffer mode only; ignored in cache mode).
+    # Rolling LM-context buffer (rolling-buffer mode only).
     if use_kv_cache:
         lm_buffer = torch.empty(BS, 0, dtype=windows.dtype, device=windows.device)
     elif prev_lm_context is None:
@@ -208,61 +201,30 @@ def run_chunk(
 
         if use_kv_cache:
             # KV-cache mode: pass only the new window's T_window tokens.
-            # last_prev_logit_hidden gives surprise CE the predecessor for
-            # target 0 — uses prev_window_hiddens last position.
             last_prev_logit_hidden = (
                 cur_prev_hiddens[:, -1:, :] if cur_prev_hiddens is not None else None
             )
-            # Per-slot mode: cache lives in per_slot_state, not the
-            # `cache` local. The legacy single-cache path passes
-            # past_key_values=cache + cache_abs_pos=abs_pos; per-slot
-            # passes per_slot_state and forward_window pulls the cache
-            # from there.
-            using_per_slot = per_slot_state is not None
             out = model.forward_window(
                 lm_input_ids=win_input,
                 prev_window_hiddens=cur_prev_hiddens,
                 prev_states=states,
                 target_mask=win_mask,
                 hard_routing=hard_routing,
-                past_key_values=None if using_per_slot else cache,
+                past_key_values=cache,
                 use_kv_cache=True,
                 last_prev_logit_hidden=last_prev_logit_hidden,
                 cache_abs_pos=abs_pos,
-                per_slot_state=per_slot_state,
             )
             n_new = win_input.shape[1]
-            if using_per_slot:
-                # Update per-slot bookkeeping after the forward.
-                per_slot_state.cache = out.get("new_past_key_values")
-                per_slot_state.advance_after_forward(n_new)
-                # Sliding-window trim. `_trim_kv_cache` mutates `cache`
-                # in place and returns it; we update per_slot_state's
-                # valid_lens to reflect the trim.
-                cache_len_before_trim = (
-                    per_slot_state.cache.get_seq_length()
-                    if per_slot_state.cache is not None else 0
-                )
-                per_slot_state.cache = _trim_kv_cache(
-                    per_slot_state.cache, cap,
-                )
-                cache_len_after_trim = (
-                    per_slot_state.cache.get_seq_length()
-                    if per_slot_state.cache is not None else 0
-                )
-                if cache_len_after_trim < cache_len_before_trim:
-                    per_slot_state.trim_after_cache_trim(cache_len_after_trim)
-            else:
-                cache = out.get("new_past_key_values", cache)
-                abs_pos = out.get("new_cache_abs_pos", abs_pos + n_new)
-                # Sliding-window trim so cache size stays bounded.
-                # NOTE: abs_pos is NOT reset by trim — new tokens still
-                # get the correct absolute position, so RoPE math
-                # against the (older, at-original-position) cached KVs
-                # is consistent.
-                cache = _trim_kv_cache(cache, cap)
+            cache = out.get("new_past_key_values", cache)
+            abs_pos = out.get("new_cache_abs_pos", abs_pos + n_new)
+            # Sliding-window trim. abs_pos is NOT reset by trim — new
+            # tokens still get correct absolute positions, so RoPE math
+            # against (older, at-original-position) cached KVs stays
+            # consistent.
+            cache = _trim_kv_cache(cache, cap)
         else:
-            # Rolling-buffer mode: build rolling LM context.
+            # Rolling-buffer fallback.
             lm_input_ids = torch.cat([lm_buffer, win_input], dim=1)
             if lm_input_ids.shape[1] > cap:
                 lm_input_ids = lm_input_ids[:, -cap:]
@@ -273,7 +235,6 @@ def run_chunk(
                 target_mask=win_mask,
                 hard_routing=hard_routing,
             )
-            # Buffer for next window's LM input — at most (cap - T_window) tokens.
             lm_buffer = lm_input_ids[:, -(cap - T):] if cap > T else lm_input_ids[:, :0]
 
         # Strip heavy tensors before appending — `outputs` is debug-only.

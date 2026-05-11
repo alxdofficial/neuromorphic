@@ -64,12 +64,13 @@ from src.trajectory_memory.training.loaders import (
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-paths", nargs="+", required=True, type=Path)
-    ap.add_argument("--batch-size", type=int, default=4,
-                    help="Multi-stream BS (Tier 4 #13). Each batch slot "
-                         "is an independent doc with its own state lifecycle. "
-                         "BS=4 is bench-optimal on RTX 4090 (15 GB peak with "
-                         "KV cache); BS=8 OOMs. BS=1 falls back to the "
-                         "single-stream LongDocDataset.")
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="Multi-stream BS. Each batch slot is an "
+                         "independent doc with its own state lifecycle. "
+                         "BS=8 with --compile is bench-optimal on RTX 4090 "
+                         "(~12 GB peak, 27k tok/s). BS=12 fits but compile "
+                         "regression on that shape; BS=16 OOMs. BS=1 falls "
+                         "back to single-stream LongDocDataset.")
     ap.add_argument("--num-steps", type=int, default=1000)
     ap.add_argument("--warmup-steps", type=int, default=100)
     # Tier 2 #8 — peak LR halved from 3e-4 → 1.5e-4 for memory params.
@@ -108,12 +109,7 @@ def main():
                          "~28% speedup at BS=2 with a ~2 min cold-start; "
                          "disable for fast smoke iteration where startup time "
                          "matters more than steady-state speed.")
-    ap.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
-                    help="Disable sliding KV cache (default ON). KV cache "
-                         "gives ~1.79× speedup on Phase 1 by skipping the "
-                         "rolling LM buffer re-encode per window. Disable "
-                         "only to benchmark the rolling-buffer fallback path.")
-    ap.set_defaults(compile=True, use_kv_cache=True)
+    ap.set_defaults(compile=True)
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here "
                          "every --plot-every-seconds. PNG; overwritten in "
@@ -135,15 +131,9 @@ def main():
     pad_id = tokenizer.pad_token_id
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
-    # NOTE: HF Llama's gradient_checkpointing IS INCOMPATIBLE with
-    # use_cache=True / past_key_values. Enabling it forces use_cache=False
-    # silently and `past_key_values` returns None — defeating our KV cache
-    # entirely. (Verified: HF prints "use_cache=True is incompatible with
-    # gradient checkpointing. Setting use_cache=False.")
-    # We pick KV cache (1.79× speedup, 5 GB less mem in production) over
-    # gradient checkpointing. With BS=1 (W1's assertion), activation memory
-    # isn't the bottleneck. If config-tier=large or BS>1 ever needs it,
-    # add `--no-kv-cache --grad-checkpoint` as a separate path.
+    # NOTE: HF Llama's gradient_checkpointing is incompatible with use_cache=True
+    # (silently sets use_cache=False, defeating our KV cache). We pick KV
+    # cache (1.79× speedup, ~3 GB less mem) over checkpointing.
 
     if args.compile:
         # dynamic=True: forward_window's lm_input_ids varies in length as the
@@ -167,11 +157,8 @@ def main():
     trainer = Phase1Trainer(
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
-        use_kv_cache=args.use_kv_cache,
         prior_loss_weight=0.0,  # W1 has no prior/response distinction
     )
-    if args.use_kv_cache:
-        print("KV cache enabled — Llama re-encodes only new T_window tokens per window.")
 
     if args.checkpoint_in is not None:
         if args.warm_start:
@@ -209,12 +196,11 @@ def main():
     # `torch.where` on the `is_doc_start_per_slot` mask (see the train
     # loop below).
     #
-    # KV cache + multi-stream uses PER-SLOT KV CACHE LIFECYCLE
-    # (vLLM/SGLang inflight-batching pattern adapted for training).
-    # See `src/trajectory_memory/per_slot_kv.py`. Each slot's cache
-    # validity is tracked separately; slot resets just zero the
-    # bookkeeping (no tensor wipe). The earlier lockstep-reset hack
-    # (cost ~24% of steps a full cache wipe) is now eliminated.
+    # Phase 1 uses rolling-buffer Llama (no KV cache), so multi-stream
+    # batching just resets `prev_states` per-slot via torch.where. The
+    # earlier per-slot KV cache machinery (and the lockstep wipe hack
+    # that preceded it) is gone — rolling buffer carries no cross-window
+    # state that needs slot-aware lifecycle.
 
     if args.batch_size == 1:
         dataset = LongDocDataset(
@@ -339,30 +325,17 @@ def main():
                 # Build BINARY answer-only mask: 1.0 where answer span,
                 # 0.0 elsewhere. Skip chunk entirely if no answer tokens.
                 answer_only_mask = (item.valid_mask >= 50.0).float().unsqueeze(0).to(args.device)
-                if answer_only_mask.sum() == 0:
-                    # Still need to thread state through this chunk for the
-                    # later chunks, but don't count this one in the loss.
-                    target_mask_v = answer_only_mask.view(1, cfg.D, cfg.T_window)
-                    ev = trainer.eval_wave1(
-                        chunk_v,
-                        prev_states=v_prev_states,
-                        prev_window_hiddens=v_prev_hiddens,
-                        prev_lm_context=v_prev_lm_ctx,
-                        target_mask=target_mask_v,
-                        past_key_values=v_past_kv,
-                        cache_abs_pos=v_cache_abs,
-                    )
-                else:
-                    target_mask_v = answer_only_mask.view(1, cfg.D, cfg.T_window)
-                    ev = trainer.eval_wave1(
-                        chunk_v,
-                        prev_states=v_prev_states,
-                        prev_window_hiddens=v_prev_hiddens,
-                        prev_lm_context=v_prev_lm_ctx,
-                        target_mask=target_mask_v,
-                        past_key_values=v_past_kv,
-                        cache_abs_pos=v_cache_abs,
-                    )
+                target_mask_v = answer_only_mask.view(1, cfg.D, cfg.T_window)
+                ev = trainer.eval_wave1(
+                    chunk_v,
+                    prev_states=v_prev_states,
+                    prev_window_hiddens=v_prev_hiddens,
+                    prev_lm_context=v_prev_lm_ctx,
+                    target_mask=target_mask_v,
+                    past_key_values=v_past_kv,
+                    cache_abs_pos=v_cache_abs,
+                )
+                if answer_only_mask.sum() > 0:
                     losses_v.append(ev["loss"])
                     n_answer_chunks += 1
                 v_prev_states = ev["final_states"]
@@ -407,24 +380,12 @@ def main():
         "loss_by_source": {},  # {source: [(step, loss), ...]}
     }
     # Per-component grad-norm series initialized lazily once we see them.
-    # Cross-chunk state for the single batch slot.
+    # Cross-chunk state.
     prev_states = None
     prev_window_hiddens = None
     prev_lm_context = None
-    past_kv = None  # BS=1 KV-cache path only
-    cache_abs_pos = 0  # BS=1 KV-cache path only
-    # Multi-stream (BS>1) per-slot cache state. Replaces the lockstep
-    # past_kv + cache_abs_pos when BS>1.
-    per_slot_state = None
-    if args.batch_size > 1 and args.use_kv_cache:
-        from src.trajectory_memory.per_slot_kv import PerSlotCacheState
-        per_slot_state = PerSlotCacheState.fresh(
-            batch_size=args.batch_size,
-            max_cache_len=cfg.effective_lm_context,
-            device=args.device,
-        )
-        print(f"Per-slot KV cache enabled (BS={args.batch_size}, "
-              f"max_cache_len={cfg.effective_lm_context}).")
+    past_kv = None
+    cache_abs_pos = 0
     last_step_t = time.time()
 
     while trainer.step_count < args.num_steps:
@@ -447,17 +408,14 @@ def main():
                 step_sources = [getattr(item, "source", "") or "unknown"]
             else:
                 # ── Multi-stream path (BS > 1) ───────────────────────
-                # Per-slot reset: where is_doc_start_per_slot[i] is True,
-                # zero out slot i's state. `prev_states` is naturally
-                # batched [BS, N, D]; we use torch.where to selectively
-                # reset only the slots that need it. The shared
-                # rolling-buffer prev_lm_context is reset whenever ANY
-                # slot needs reset (per-slot lm_buffer would require
-                # custom attention_mask plumbing — deferred).
+                # Per-slot reset on prev_states (batched, easy). KV cache
+                # is shared across the batch — when ANY slot crosses a doc
+                # boundary we wipe past_kv lockstep (simpler than the
+                # per-slot 4D-mask machinery we deleted; small efficiency
+                # cost for big code simplification).
                 BS_chunk = item.input_ids.shape[0]
                 is_start = item.is_doc_start_per_slot.to(args.device)  # [BS]
 
-                # Initialize state on very first iteration.
                 if prev_states is None:
                     prev_states = model.manifold.reset_states(
                         batch_size=BS_chunk,
@@ -476,14 +434,9 @@ def main():
                             torch.zeros_like(prev_window_hiddens),
                             prev_window_hiddens,
                         )
-                    # Per-slot KV cache: just zero the slot's bookkeeping;
-                    # the cache TENSOR is left intact. Slot's stale
-                    # positions get masked out by the 4D attention mask
-                    # built in `forward_window`. Other slots keep their
-                    # full valid cache.
-                    if per_slot_state is not None:
-                        per_slot_state.reset_slots(is_start)
-                    # Rolling-buffer fallback (only used when --no-kv-cache).
+                    # Lockstep KV cache reset.
+                    past_kv = None
+                    cache_abs_pos = 0
                     prev_lm_context = None
 
                 chunk = item.input_ids.to(args.device)            # [BS, T]
@@ -499,22 +452,12 @@ def main():
                 target_mask=target_mask,
                 past_key_values=past_kv,
                 cache_abs_pos=cache_abs_pos,
-                per_slot_state=per_slot_state,
             )
             prev_states = metrics.final_states
             prev_window_hiddens = metrics.final_hiddens
             prev_lm_context = metrics.final_lm_context
-            # In per-slot mode, cache + abs_pos live in per_slot_state
-            # (mutated in place by run_chunk). Don't read final_*_cache
-            # fields from metrics in that case. Also: detach the cache's
-            # K/V tensors so the per-step .backward() doesn't try to
-            # traverse them again on the next step.
-            if per_slot_state is None:
-                past_kv = metrics.final_past_key_values
-                cache_abs_pos = metrics.final_cache_abs_pos
-            else:
-                from src.trajectory_memory.tbptt import _detach_kv_cache
-                per_slot_state.cache = _detach_kv_cache(per_slot_state.cache)
+            past_kv = metrics.final_past_key_values
+            cache_abs_pos = metrics.final_cache_abs_pos
             losses.append(metrics.loss)
 
             # Per-source train loss tracking. In multi-stream mode the

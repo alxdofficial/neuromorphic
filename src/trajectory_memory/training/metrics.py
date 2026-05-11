@@ -22,6 +22,11 @@ _COMPONENT_PREFIXES: list[tuple[str, str]] = [
     # generic llama.
     ("llama.model.layers.", "bridge_in_llama"),  # MemInjectLayer adapter
     ("manifold.", "manifold"),
+    # Hopfield-tied entry projection — shared between read and write.
+    # Lives at the IntegratedLM root (`entry_proj.*`); named_parameters
+    # deduplicates so the read/write module submodule references don't
+    # double-count.
+    ("entry_proj.", "entry"),
     ("read_module.", "read"),
     ("read_attn.", "read"),
     ("write_module.", "write"),

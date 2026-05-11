@@ -71,15 +71,13 @@ def main():
     ap.add_argument("--no-compile", dest="compile", action="store_false",
                     help="Disable torch.compile (default ON). ~28% speedup at "
                          "low BS, ~2 min cold-start.")
-    ap.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
-                    help="Disable sliding KV cache (default ON). ~1.79× speedup.")
     ap.add_argument("--prior-loss-weight", type=float, default=0.1,
                     help="Weight on NTP CE for prior tokens (B12 fix; default 0.1). "
                          "Without this (=0), prior memory writes get no gradient "
                          "signal because per-chunk backward + detach cuts grad "
                          "before response loss arrives. Set 0 for legacy §4.5 "
                          "behavior; 0.1 matches §4.8 surprise table intent.")
-    ap.set_defaults(compile=True, use_kv_cache=True)
+    ap.set_defaults(compile=True)
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here every "
                          "--plot-every-seconds. PNG; overwritten in place.")
@@ -93,9 +91,6 @@ def main():
     tokenizer = get_tokenizer()
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
-    # NOTE: gradient_checkpointing is INCOMPATIBLE with use_cache=True
-    # (HF silently sets use_cache=False, returning None for past_key_values).
-    # KV cache (1.79× speedup) wins over checkpointing's activation savings.
     if args.compile:
         # dynamic=True so the rolling LM context's varying length doesn't
         # trigger dynamo recompiles per shape (hits recompile_limit=8 within
@@ -114,11 +109,8 @@ def main():
     trainer = Phase1Trainer(
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
-        use_kv_cache=args.use_kv_cache,
         prior_loss_weight=args.prior_loss_weight,
     )
-    if args.use_kv_cache:
-        print("KV cache enabled.")
 
     if args.checkpoint_in:
         if args.warm_start:

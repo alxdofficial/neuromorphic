@@ -66,6 +66,9 @@ def run_one_bs(
     T_chunk = cfg.D * cfg.T_window
     try:
         model = IntegratedLM(cfg, model_name=args.model, attach_lm=True).to(device)
+        # NOTE: HF gradient_checkpointing currently REGRESSES memory in our
+        # setup (~+6 GB at BS=4) — likely interaction with our custom
+        # MemInjectLayer at layer 8. Leave it OFF until investigated.
         if args.compile:
             # Compile the per-window step. forward_window is the tightest
             # hot loop; run_chunk iterates D times over it.

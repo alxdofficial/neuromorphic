@@ -23,6 +23,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import Tensor
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -30,7 +31,7 @@ from src.pretrained.hosts import build_host
 from src.pretrained.mem_inject_layer import MemInjectLayer
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.manifold import Manifold
-from src.trajectory_memory.read_module import ReadTrajectoryGenerator
+from src.trajectory_memory.read_module import EntryProjector, ReadTrajectoryGenerator
 from src.trajectory_memory.write_module import WriteTrajectoryGenerator
 
 
@@ -138,8 +139,15 @@ class IntegratedLM(nn.Module):
 
         # ── 3. Memory modules (always present) ───────────────────────
         self.manifold = Manifold(cfg)
-        self.read_module = ReadTrajectoryGenerator(cfg)
-        self.write_module = WriteTrajectoryGenerator(cfg)
+        # Hopfield-tied: shared entry projection between read and write so
+        # write[d] deposits at the slot read[d+1] retrieves from. Pool of
+        # window d hiddens is the same input both modules see at that
+        # boundary; shared W → identical address logits → gradient flows
+        # through write's params via downstream reads. See
+        # docs/plan_trajectory_memory.md (write-grad fix) for context.
+        self.entry_proj = EntryProjector(cfg)
+        self.read_module = ReadTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
+        self.write_module = WriteTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
         self.read_attn = TrajectoryReadAttn(cfg.D_concept)
 
     # ── memory wiring helpers ────────────────────────────────────────
@@ -178,12 +186,11 @@ class IntegratedLM(nn.Module):
         *,
         target_mask: Tensor | None = None,
         hard_routing: bool = True,
+        force_surprise: float | None = None,
         past_key_values: object | None = None,
         use_kv_cache: bool = False,
         last_prev_logit_hidden: Tensor | None = None,
         cache_abs_pos: int = 0,
-        force_surprise: float | None = None,
-        per_slot_state: object | None = None,
     ) -> dict:
         """Run one window: read → predict → write.
 
@@ -192,58 +199,56 @@ class IntegratedLM(nn.Module):
         - **Rolling-buffer mode** (`use_kv_cache=False`, default):
           `lm_input_ids` carries the full rolling LM context (last
           `effective_lm_context` tokens). Llama re-encodes the prefix
-          every window. The current window is `lm_input_ids[:, -T_window:]`.
+          every window. The Phase 1 trainer uses this — simpler code, and
+          enables Llama gradient checkpointing.
 
         - **KV-cache mode** (`use_kv_cache=True`): `lm_input_ids` is just
           the new T_window tokens. `past_key_values` carries cached KVs
-          from prior windows; Llama only encodes the new tokens against
-          the cache. Massively cheaper at long context. Returns the
-          updated cache so the caller can carry it across windows of a
-          chunk. See `docs/profile_analysis.md` for measured wins
-          (rolling-buffer is ~70% of T1 vs V1.B slowdown).
+          across calls. Used by Phase 2 AR rollout where each generation
+          step calls forward_window with one new token. Llama gradient
+          checkpointing is implicitly disabled when `use_cache=True` (HF
+          requirement) — fine for rollout (no backprop) and Phase 2 replay
+          which doesn't need it.
+
+        We removed the per-slot multi-stream KV cache machinery (was needed
+        for Phase 1 multi-doc batches; rolling-buffer mode replaces it).
 
         Args:
-            lm_input_ids:        Rolling-buffer mode: [BS, L_lm] with
-                                 L_lm in [T_window, effective_lm_context].
-                                 KV-cache mode: [BS, T_window] (new tokens only).
-            prev_window_hiddens: [BS, T_window, d_lm] from previous window.
-                                 None at the very first window of a sequence.
+            lm_input_ids:        Rolling-buffer mode: [BS, L_lm] with L_lm
+                                 in [T_window, effective_lm_context].
+                                 KV-cache mode: [BS, n_new] new tokens only.
+            prev_window_hiddens: [BS, T_window, d_lm] from previous window
+                                 (None at first window of a sequence).
             prev_states:         [BS, N, D_concept] manifold state going in.
-            target_mask:         [BS, T_window] bool (True = include in
-                                 surprise CE), aligned to the current window.
-            hard_routing:        Gumbel-STE if True, argmax if False.
-            past_key_values:     KV-cache mode only. HF DynamicCache (or
-                                 None for first window of chunk). Tokens
-                                 already in the cache are NOT re-encoded;
-                                 their KVs were computed at their original
-                                 encoding time and remain valid.
-            use_kv_cache:        Switch between the two modes (above).
-            last_prev_logit_hidden: KV-cache mode optional. The last hidden
-                                 of the previous window (`prev_window_hiddens
-                                 [:, -1:, :]` projected through the same path
-                                 — but normally identical). Used to compute
-                                 the predecessor logit for target 0 of the
-                                 current window so we don't drop a CE token.
-                                 None → first window of chunk → drop target 0.
+            target_mask:         [BS, T_window] bool — include in surprise CE.
+            hard_routing:        Gumbel-STE if True.
+            force_surprise:      Phase 2 perf fix — skip vocab-sized CE.
+            past_key_values:     KV-cache mode: HF DynamicCache or None.
+            use_kv_cache:        Pick between modes (above).
+            last_prev_logit_hidden: KV-cache mode optional. Predecessor for
+                                 target 0 of current window.
+            cache_abs_pos:       KV-cache mode: absolute position of next
+                                 token (for RoPE correctness across cache
+                                 trims).
 
         Returns:
             dict with keys:
-                logits:               [BS, T_window, V] — logits for the current window
+                logits:               [BS, T_window, V]
                 current_hiddens:      [BS, T_window, d_lm]
                 new_states:           [BS, N, D_concept]
                 read_visited:         [BS, J, K_read]
                 write_visited:        [BS, J, K_write]
-                surprise:             [BS] mean per-token CE over the current window
-                new_past_key_values:  KV-cache mode only — updated cache for next window
+                surprise:             [BS] mean per-token CE
+                new_past_key_values:  KV-cache mode only — updated cache
+                new_cache_abs_pos:    KV-cache mode only
         """
         cfg = self.cfg
         T_window = cfg.T_window
         BS, L_lm = lm_input_ids.shape
         if use_kv_cache:
-            assert L_lm == T_window, (
-                f"KV-cache mode expects lm_input_ids of shape [BS, T_window]; "
-                f"got L_lm={L_lm} != T_window={T_window}."
-            )
+            # KV-cache mode: any positive number of new tokens (1 for AR step,
+            # T_window for prefill window, etc).
+            assert L_lm >= 1, f"KV-cache mode needs at least 1 new token; got {L_lm}"
         else:
             assert L_lm >= T_window, (
                 f"lm_input_ids length {L_lm} < T_window {T_window}; the current "
@@ -266,9 +271,22 @@ class IntegratedLM(nn.Module):
             )
 
         prev_hid_mem = prev_window_hiddens.to(prev_states.dtype)
-        read_visited, read_visited_ids = self.read_module(
-            prev_hid_mem, prev_states, self.manifold, hard=hard_routing,
-        )                                                          # [BS, J, K_read, D]
+        # Activation-checkpoint the trajectory generator: K_read=8 hops of
+        # cross_attn + history_attn + step_mlp produce ~hundreds of MB of
+        # intermediate activations across D=4 windows. With
+        # use_reentrant=False the per-hop python loop checkpoints cleanly
+        # — backward recomputes the trajectory in one extra forward pass.
+        # In no_grad / eval contexts checkpoint is a no-op.
+        if torch.is_grad_enabled():
+            read_visited, read_visited_ids = torch.utils.checkpoint.checkpoint(
+                self.read_module,
+                prev_hid_mem, prev_states, self.manifold,
+                hard=hard_routing, use_reentrant=False,
+            )                                                      # [BS, J, K_read, D]
+        else:
+            read_visited, read_visited_ids = self.read_module(
+                prev_hid_mem, prev_states, self.manifold, hard=hard_routing,
+            )
 
         # ── 2. PREDICT ──────────────────────────────────────────────
         if self.llama is None:
@@ -302,104 +320,35 @@ class IntegratedLM(nn.Module):
             # Wire memory_fn for this forward call.
             mem_inject = self._mem_inject_layer()
             mem_inject.memory_fn = self._build_memory_fn(read_visited)
-            # Call the base model (returns hidden states) instead of the
-            # CausalLM wrapper. We then apply lm_head ONLY to the
-            # T_window+1 positions we actually need.
             new_past_key_values = None
             try:
                 if use_kv_cache:
+                    # KV-cache mode (Phase 2 rollout): encode only the new
+                    # `n_new` tokens against `past_key_values`. Pass
+                    # cache_position (cache-internal indices) and
+                    # position_ids (absolute, for RoPE) separately. See
+                    # earlier comment about LABEL LEAK if these are mixed.
                     n_new = lm_input_ids.shape[1]
-                    if per_slot_state is not None:
-                        # ── PER-SLOT KV CACHE PATH ─────────────────────
-                        # Multi-stream training: each batch slot has its
-                        # own independent doc lifecycle. We use one
-                        # batched DynamicCache (shared tensor) but mask
-                        # each slot to only see its OWN valid cached K/V
-                        # via a custom 4D attention_mask. Avoids the
-                        # lockstep-reset hack that wipes ALL slots'
-                        # cache when ANY slot's doc starts. See
-                        # `src/trajectory_memory/per_slot_kv.py`.
-                        from src.trajectory_memory.per_slot_kv import (
-                            build_per_slot_4d_mask,
-                            build_per_slot_position_ids,
-                        )
-                        cache = per_slot_state.cache
-                        cache_len_before = (
-                            cache.get_seq_length() if cache is not None else 0
-                        )
-                        cache_position = torch.arange(
-                            cache_len_before, cache_len_before + n_new,
-                            device=lm_input_ids.device,
-                        )
-                        # Per-slot RoPE positions
-                        position_ids = build_per_slot_position_ids(
-                            per_slot_state.abs_pos, n_new,
-                            device=lm_input_ids.device,
-                        )
-                        # Per-slot 4D attention mask (slot-validity gating
-                        # + causal-within-new). Use the LM's compute dtype
-                        # so SDPA's additive mask combines correctly.
-                        # We use bf16 (Llama's dtype) for the mask.
-                        mask_dtype = next(self.llama.parameters()).dtype
-                        attention_mask = build_per_slot_4d_mask(
-                            valid_len=per_slot_state.valid_len,
-                            q_len=n_new,
-                            cache_len_old=cache_len_before,
-                            device=lm_input_ids.device,
-                            dtype=mask_dtype,
-                        )
-                        base_out = self.llama.model(
-                            input_ids=lm_input_ids,
-                            past_key_values=cache,
-                            cache_position=cache_position,
-                            position_ids=position_ids,
-                            attention_mask=attention_mask,
-                            use_cache=True,
-                        )
-                        new_past_key_values = base_out.past_key_values
-                    else:
-                        # ── LEGACY single-stream / lockstep path ──────
-                        # KV-cache mode: encode only the new T_window
-                        # tokens against `past_key_values`. The cache
-                        # transparently carries prior windows' KVs.
-                        #
-                        # TWO position-related concerns require passing
-                        # two separate things to llama.model():
-                        #
-                        # (a) RoPE: cached KVs have rotations baked in
-                        #     at their ORIGINAL abs positions. New Q
-                        #     must use absolute positions so Q·K
-                        #     relative math is consistent.
-                        #     → `position_ids = [abs_pos, abs_pos+1, ...]`
-                        #
-                        # (b) Causal mask: HF builds the mask via
-                        #     `key_index <= cache_position[query]`. If
-                        #     we pass absolute cache_position, ALL key
-                        #     indices end up <= cache_position[q] → ALL
-                        #     allowed → future tokens within the new
-                        #     window leak into past queries. LABEL LEAK.
-                        #     → `cache_position = [cache_len, ...]`
-                        #     (cache-internal indices, NOT absolute)
-                        cache_len_before = (
-                            past_key_values.get_seq_length()
-                            if past_key_values is not None else 0
-                        )
-                        cache_position = torch.arange(
-                            cache_len_before, cache_len_before + n_new,
-                            device=lm_input_ids.device,
-                        )
-                        position_ids = torch.arange(
-                            cache_abs_pos, cache_abs_pos + n_new,
-                            device=lm_input_ids.device,
-                        ).unsqueeze(0)
-                        base_out = self.llama.model(
-                            input_ids=lm_input_ids,
-                            past_key_values=past_key_values,
-                            cache_position=cache_position,
-                            position_ids=position_ids,
-                            use_cache=True,
-                        )
-                        new_past_key_values = base_out.past_key_values
+                    cache_len_before = (
+                        past_key_values.get_seq_length()
+                        if past_key_values is not None else 0
+                    )
+                    cache_position = torch.arange(
+                        cache_len_before, cache_len_before + n_new,
+                        device=lm_input_ids.device,
+                    )
+                    position_ids = torch.arange(
+                        cache_abs_pos, cache_abs_pos + n_new,
+                        device=lm_input_ids.device,
+                    ).unsqueeze(0)
+                    base_out = self.llama.model(
+                        input_ids=lm_input_ids,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        use_cache=True,
+                    )
+                    new_past_key_values = base_out.past_key_values
                 else:
                     base_out = self.llama.model(
                         input_ids=lm_input_ids,
@@ -410,8 +359,8 @@ class IntegratedLM(nn.Module):
                 mem_inject.memory_fn = None
 
             full_hiddens = base_out.last_hidden_state                # [BS, *, d_lm]
-            # In KV-cache mode `*` is T_window (only new tokens encoded).
-            # In rolling-buffer mode `*` is L_lm (full context).
+            # KV-cache mode: full_hiddens has the new n_new positions only.
+            # Rolling-buffer mode: it has the full L_lm context, take tail.
             current_hiddens = full_hiddens[:, -T_window:, :].to(prev_states.dtype)
 
             # Phase 2 perf fix (#4) — when force_surprise is given (Phase 2
@@ -420,13 +369,6 @@ class IntegratedLM(nn.Module):
             # `_compute_surprise_window` (256 × 128K-vocab CE) and then
             # overwrote `surprise` with zero — pure waste at K samples × N
             # windows per step.
-            #
-            # We still need logits over T_window for the output (caller
-            # uses them for AR sampling). KV-cache mode: full_hiddens IS
-            # the T_window of new positions, so logits = lm_head(full_hiddens).
-            # Rolling-buffer mode: take the last T_window hiddens. Skip the
-            # +1 predecessor hidden since we don't need a CE target on
-            # position 0.
             if force_surprise is not None:
                 # Synthesize zero surprise + skip CE; still emit logits.
                 if use_kv_cache:
@@ -445,28 +387,18 @@ class IntegratedLM(nn.Module):
             else:
                 # Build `needed_hidden` for surprise CE: T_window+1 hiddens
                 # (one predecessor + T_window targets) when available,
-                # T_window otherwise (drop target 0 — first window of chunk).
-                #
-                # KV-cache mode: full_hiddens has shape [BS, T_window, d_lm].
-                # The predecessor for target 0 is the last hidden of the
-                # previous window — passed as `last_prev_logit_hidden`. If
-                # None, we drop target 0 (matches first-window behavior).
-                #
-                # Rolling-buffer mode: full_hiddens has the predecessor at
-                # position [-T_window-1] when L_lm > T_window. We slice
-                # min(T_window+1, L_lm) tail positions.
-                if use_kv_cache:
-                    if last_prev_logit_hidden is not None:
-                        needed_hidden = torch.cat(
-                            [last_prev_logit_hidden.to(full_hiddens.dtype),
-                             full_hiddens], dim=1,
-                        )                                            # [BS, T_window+1, d_lm]
-                    else:
-                        needed_hidden = full_hiddens                 # [BS, T_window, d_lm]
+                # T_window otherwise (drop target 0 — first window of chunk
+                # has no predecessor).
+                if use_kv_cache and last_prev_logit_hidden is not None:
+                    needed_hidden = torch.cat(
+                        [last_prev_logit_hidden.to(full_hiddens.dtype),
+                         full_hiddens], dim=1,
+                    )                                            # [BS, n_new+1, d_lm]
+                elif use_kv_cache:
+                    needed_hidden = full_hiddens                 # [BS, n_new, d_lm]
                 else:
                     n_needed = min(T_window + 1, full_hiddens.shape[1])
                     needed_hidden = full_hiddens[:, -n_needed:, :]
-
                 needed_logits = self.llama.lm_head(needed_hidden)    # [BS, n_needed, V]
 
                 target_ids = lm_input_ids[:, -T_window:]
@@ -532,10 +464,19 @@ class IntegratedLM(nn.Module):
                 write_hiddens = torch.where(
                     no_real, torch.zeros_like(write_hiddens), write_hiddens,
                 )
-        new_states, write_visited_ids, _ = self.write_module(
-            write_hiddens, surprise.detach(), prev_states, self.manifold,
-            hard=hard_routing,
-        )
+        # Activation-checkpoint the write trajectory too — same rationale
+        # as read_module above.
+        if torch.is_grad_enabled():
+            new_states, write_visited_ids, _ = torch.utils.checkpoint.checkpoint(
+                self.write_module,
+                write_hiddens, surprise.detach(), prev_states, self.manifold,
+                hard=hard_routing, use_reentrant=False,
+            )
+        else:
+            new_states, write_visited_ids, _ = self.write_module(
+                write_hiddens, surprise.detach(), prev_states, self.manifold,
+                hard=hard_routing,
+            )
 
         out = {
             "logits": logits,

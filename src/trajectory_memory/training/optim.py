@@ -36,12 +36,16 @@ def build_optimizer(
         in `attach_lm=False` test mode).
     """
     cfg = model.cfg
-    memory_params = (
+    # Hopfield-tied entry projection lives both at `model.entry_proj` and
+    # as a submodule of read_module and write_module (same Python object).
+    # Without dedup AdamW would double-count it; dict-by-id collapses
+    # references back to one parameter per id.
+    memory_params = list({id(p): p for p in (
         list(model.manifold.parameters())
         + list(model.read_module.parameters())
         + list(model.write_module.parameters())
         + list(model.read_attn.parameters())
-    )
+    )}.values())
     adapter_params: list = []
     if model.host is not None:
         mem_inject = model.host.layer_list()[cfg.inject_layer]
