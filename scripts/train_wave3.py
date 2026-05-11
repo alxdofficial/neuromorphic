@@ -1,25 +1,35 @@
 """Wave 3 entry point — verifiable-reward GRPO (plan §4.5).
 
-Usage (basic):
-    python scripts/train_wave3.py \\
-        --data-paths \\
-            data/wave3/gsm8k.parquet \\
-            data/wave3/numinamath.parquet \\
-            data/wave3/humaneval.parquet \\
-            data/wave3/narrativeqa.parquet \\
-        --num-samples 8 --num-steps 200
+**Strategy A (current default, 2026-05-11): memory-only training mix.**
+We train Phase 2 ONLY on long-context QA where the memory module is the
+load-bearing component. Reasoning datasets (gsm8k, numinamath, humaneval)
+are *excluded* from the train mix — Llama-3.2-1B-base doesn't reason
+zero-shot, and we don't want to confound the memory research story by
+training a reasoner under GRPO. Those datasets become held-out evals
+instead. See plan §4.5 for the full rationale.
 
-Usage (long-context-biased mix, ≥80% memory-engaging):
+Usage (Strategy A — memory mix, 91% prompts >2K context):
     python scripts/train_wave3.py \\
         --data-paths \\
-            data/wave3/gsm8k.parquet \\
-            data/wave3/narrativeqa.parquet \\
+            data/wave3/narrativeqa.train.parquet \\
             data/wave3/musique.parquet \\
             data/wave3/hotpotqa.parquet \\
             data/wave3/2wikimultihop.parquet \\
             data/wave3/quality.parquet \\
-        --source-weights "narrativeqa=3,musique=3,hotpotqa=3,2wikimultihop=2,quality=2,gsm8k=1" \\
         --num-samples 8 --num-steps 1000
+
+Usage (with source upweighting to bias toward NarrativeQA's hardest split):
+    python scripts/train_wave3.py \\
+        --data-paths data/wave3/narrativeqa.train.parquet \\
+                     data/wave3/musique.parquet \\
+                     data/wave3/hotpotqa.parquet \\
+                     data/wave3/2wikimultihop.parquet \\
+                     data/wave3/quality.parquet \\
+        --source-weights "narrativeqa=2,musique=1,hotpotqa=1,2wikimultihop=1,quality=2" \\
+        --num-samples 8 --num-steps 1000
+
+If you want to include reasoning datasets despite Strategy A's argument
+against it, add them explicitly with a small weight (e.g. gsm8k=1).
 """
 
 from __future__ import annotations

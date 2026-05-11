@@ -691,36 +691,36 @@ Goal: AR rollouts + verifiable rewards to refine reasoning. Same
 structure as graph_walker's W3 but with memory in the loop and a
 different dataset shape.
 
-**Implemented sources (updated 2026-05-11):**
+**Strategy A (default, decided 2026-05-11): memory-only training mix.**
 
-Reasoning track (short prompts, fits Llama's 2K direct attention — memory side-car gets only indirect gradient via reward):
+Phase 2 trains *only* on long-context QA where the memory module is the load-bearing component. Reasoning datasets (gsm8k, numinamath, humaneval) are explicitly excluded from the train mix.
 
-| Source                            | HF id                  | Length | Reward |
-|-----------------------------------|------------------------|--------|--------|
-| GSM8K (full train, 7473)          | `openai/gsm8k`         | ~77 tok | `exact_match` (numeric extraction) |
-| NuminaMath-TIR (50K)              | `AI-MO/NuminaMath-TIR` | ~89 tok prompt / up to 2K gold (chain-of-thought) | `exact_match` on `\boxed{}` |
-| HumanEval (full test, 164)        | `openai_humaneval`     | ~132 tok | `rule_based_exec` (DISABLED in v1, needs sandbox) |
+Rationale: Llama-3.2-1B-base does not zero-shot reason. To make it generate useful chain-of-thought on math/code we would need a separate SFT cold-start phase. Including reasoning data in Phase 2 GRPO would (a) confound the memory research story ("did the model fail because memory failed or because it can't reason?"), and (b) likely fail to learn anything useful from sparse rewards on un-bootstrapped CoT. We use those datasets as **held-out evals** instead, scoring zero-shot capability at checkpoint time without using them as gradient signal. See plan §4.7 for the cold-start-SFT alternative if we later decide reasoning capability is worth pursuing.
 
-Memory-stress track (long prompts >2K — Llama's KV cache slides off and Llama must rely on the manifold for retrieval):
+**Memory-track sources (the Wave 3 train mix):**
 
-| Source                            | HF id                          | Length | Reward |
-|-----------------------------------|--------------------------------|--------|--------|
-| NarrativeQA (~5K)                 | `deepmind/narrativeqa`         | ~8K tok prompt, ~6 tok answer | `exact_match_or_bert_cosine` (multi-gold) |
-| **MuSiQue-Ans (new 2026-05-11)**  | `dgslibisey/MuSiQue`           | ~14K tok packed prompt (multi-hop QA) | `f1_qa` |
-| **HotpotQA distractor (new)**     | `hotpotqa/hotpot_qa` (distractor) | ~12K tok | `f1_qa` |
-| **2WikiMultiHopQA (new)**         | `xanhho/2WikiMultihopQA`       | ~6.5K tok | `f1_qa` |
-| **QuALITY (new)**                 | `emozilla/quality`             | ~6K tok | `mc_letter` (cheapest verifiable) |
+| Source                            | HF id                                | N      | Avg context | >2K | Reward |
+|-----------------------------------|--------------------------------------|--------|-------------|-----|--------|
+| **NarrativeQA**                   | `deepmind/narrativeqa`               | 4,764  | 8,126 tok   | 100% | `exact_match_or_bert_cosine` (multi-gold) |
+| **MuSiQue-Ans**                   | `dgslibisey/MuSiQue`                 | 10,000 | 2,304 tok   | 68%  | `f1_qa` |
+| **HotpotQA distractor** (padded)  | `hotpotqa/hotpot_qa` (distractor)    | 12,000 | 6,633 tok   | 100% | `f1_qa` |
+| **2WikiMultiHopQA** (padded)      | `framolfese/2WikiMultihopQA`         | 8,000  | 6,091 tok   | 100% | `f1_qa` |
+| **QuALITY**                       | `emozilla/quality`                   | 2,523  | 5,870 tok   | 100% | `mc_letter` |
+| **Total memory track**            |                                      | **37,287** | —      | **91.5%** | — |
+
+Padding mechanism for HotpotQA / 2WikiMultiHopQA: native distractor splits yield only ~1-1.5K-token prompts (fits in Llama's KV cache → no memory engagement). We apply LongBench-style mixup via `--pad-with-distractors N` in `preprocess_grpo.py` — for each example, sample N random paragraphs from the dataset's full pool and interleave with the example's own context. Brings both sources up to 6-7K-token prompts at 100% memory engagement.
 
 Format: `(prompt_ids, gold_ids, reward_kind, meta_json)` parquet per source. Each example is one prompt; trainer samples K=8 responses, computes group-relative reward against `gold_ids`.
 
-`train_wave3.py --source-weights` accepts upsampling weights per source for biasing the training mix toward memory-stress sources. Recommended mix (≥80% long-context) is in the script docstring.
+`train_wave3.py --source-weights` accepts per-source upsampling weights for biasing the mix further. Default is uniform; see script docstring for examples.
 
-Held out for eval (don't train on — see plan §6.5):
-- LongMemEval, MemoryAgentBench, LongBench/LongBench-v2 test splits, InfiniteBench, LooGLE, L-Eval, ZeroSCROLLS.
+**Held out for eval (excluded from training):**
+- Reasoning datasets: gsm8k, numinamath, humaneval (Strategy A — capability eval only).
+- Memory benchmarks: LongMemEval, MemoryAgentBench, LongBench v1/v2 test splits, InfiniteBench, LooGLE, L-Eval, ZeroSCROLLS — these are our memory-probe eval targets per §6.5, training on them would contaminate the benchmark.
 
-Synthesizer follow-ups (Tier 2 deferred):
-- **RULER** (NVIDIA, Apache-2.0) — NIAH variants, configurable 4K-1M lengths, exact-match reward. Best lever to scale memory-stress data without scraping new sources.
-- **BABILong** — 20 bAbI tasks wrapped in PG-19 background, accuracy reward.
+**Synthesizer follow-ups (Tier 2, deferred):**
+- **RULER** (NVIDIA, Apache-2.0) — NIAH variants, configurable 4K-1M lengths, exact-match reward. Highest-leverage future addition for scaling memory-stress data without scraping new sources.
+- **BABILong** — 20 bAbI reasoning tasks wrapped in PG-19 background, accuracy reward.
 
 Routes through `grpo_session_step` like the existing graph_walker plan.
 Surprise during the response (sampled) windows: 0 (default) or entropy

@@ -151,7 +151,8 @@ def _numinamath_extract(ex):
     return prompt, gold, "exact_match", {"gold_boxed": gold_boxed}
 
 
-def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
+def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384,
+                     pool=None, n_distractors=0, rng=None):
     """MuSiQue-Ans: multi-hop QA over Wikipedia paragraphs with distractors.
 
     Format: {"paragraphs": [{"idx", "title", "paragraph_text", "is_supporting"}],
@@ -176,7 +177,11 @@ def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
         if not body:
             continue
         parts.append(f"Title: {title}\n{body}" if title else body)
-    context = "\n\n".join(parts)
+
+    if pool is not None and n_distractors > 0 and rng is not None:
+        context = _inject_distractors(parts, pool, n_distractors, rng)
+    else:
+        context = "\n\n".join(parts)
     intro = "Read the following passages and answer the question.\n\n"
     suffix = f"\n\nQuestion: {question}\n\nAnswer:"
 
@@ -201,7 +206,8 @@ def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
     return prompt, answer, "f1_qa", {"all_answers": all_answers}
 
 
-def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
+def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384,
+                      pool=None, n_distractors=0, rng=None):
     """HotpotQA distractor split: 10 paragraphs (some supporting, some
     distractor) and a multi-hop question.
 
@@ -225,7 +231,11 @@ def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
         if not body:
             continue
         parts.append(f"Title: {title}\n{body}")
-    context = "\n\n".join(parts)
+
+    if pool is not None and n_distractors > 0 and rng is not None:
+        context = _inject_distractors(parts, pool, n_distractors, rng)
+    else:
+        context = "\n\n".join(parts)
     intro = "Read the following passages and answer the question.\n\n"
     suffix = f"\n\nQuestion: {question}\n\nAnswer:"
 
@@ -248,34 +258,37 @@ def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
     return prompt, answer, "f1_qa", {"all_answers": [answer]}
 
 
-def _2wikimultihop_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):
+def _2wikimultihop_extract(ex, *, tokenizer=None, max_prompt_tokens=8192,
+                            pool=None, n_distractors=0, rng=None):
     """2WikiMultiHopQA: multi-hop chains across Wikipedia paragraphs.
 
-    HF schema (`xanhho/2WikiMultihopQA`):
-      context: [[title, [s, s, ...]], ...]
+    HF schema (`framolfese/2WikiMultihopQA` — used because the canonical
+    `xanhho/2WikiMultihopQA` requires a Python loading script which HF
+    datasets ≥3.0 no longer supports):
+      context: {"title": [...], "sentences": [[s, s, ...], ...]}
+        — same shape as HotpotQA, identical extractor logic.
       question, answer
       supporting_facts (for eval)
     """
-    ctx_raw = ex.get("context") or []
+    ctx = ex.get("context") or {}
+    titles = ctx.get("title") or []
+    sentences = ctx.get("sentences") or []
     question = ex.get("question") or ""
     answer = ex.get("answer") or ""
-    if not ctx_raw or not question or not answer:
+    if not titles or not sentences or not question or not answer:
         return None
 
     parts = []
-    for item in ctx_raw:
-        # Robust to (title, sentences) and (title, [sentences]) shapes.
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        title, sents = item[0], item[1]
-        if isinstance(sents, list):
-            body = " ".join(s.strip() for s in sents if isinstance(s, str)).strip()
-        else:
-            body = str(sents).strip()
+    for title, sents in zip(titles, sentences):
+        body = " ".join(s.strip() for s in sents if isinstance(s, str)).strip()
         if not body:
             continue
         parts.append(f"Title: {title}\n{body}")
-    context = "\n\n".join(parts)
+
+    if pool is not None and n_distractors > 0 and rng is not None:
+        context = _inject_distractors(parts, pool, n_distractors, rng)
+    else:
+        context = "\n\n".join(parts)
     if not context:
         return None
     intro = "Read the following passages and answer the question.\n\n"
@@ -298,6 +311,65 @@ def _2wikimultihop_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):
 
     prompt = f"{intro}{context}{suffix}"
     return prompt, answer, "f1_qa", {"all_answers": [answer]}
+
+
+# ── LongBench-style distractor mixup ──────────────────────────────────
+#
+# Native HotpotQA-distractor / 2WikiMultiHopQA prompts are only ~1.3K /
+# ~0.9K tokens — they fit comfortably in Llama's 2K KV cache and don't
+# exercise the memory module. The LongBench benchmark "packs" multiple
+# examples' contexts together to extend each example to 6K-12K tokens.
+# We replicate that: for each example we sample K random distractor
+# paragraphs from OTHER examples in the same source and interleave them
+# with the example's own passages. The model still has to find the
+# relevant 10-ish supporting paragraphs among the larger context — that's
+# exactly the long-range retrieval pattern we want to train.
+
+
+def _build_paragraph_pool_hotpotqa(examples: list[dict]) -> list[tuple[str, str]]:
+    """Flatten all hotpotqa contexts into a (title, body) pool."""
+    pool: list[tuple[str, str]] = []
+    for ex in examples:
+        ctx = ex.get("context") or {}
+        titles = ctx.get("title") or []
+        sentences = ctx.get("sentences") or []
+        for title, sents in zip(titles, sentences):
+            body = " ".join(s.strip() for s in sents if isinstance(s, str)).strip()
+            if body:
+                pool.append((title, body))
+    return pool
+
+
+def _build_paragraph_pool_musique(examples: list[dict]) -> list[tuple[str, str]]:
+    """Flatten all musique paragraphs into a (title, body) pool. Excludes
+    `is_supporting=True` paragraphs to avoid sampling someone else's
+    *answer* as a distractor in our context."""
+    pool: list[tuple[str, str]] = []
+    for ex in examples:
+        for p in ex.get("paragraphs", []):
+            if p.get("is_supporting"):
+                continue
+            title = (p.get("title") or "").strip()
+            body = (p.get("paragraph_text") or "").strip()
+            if body:
+                pool.append((title, body))
+    return pool
+
+
+def _inject_distractors(
+    own_parts: list[str],
+    pool: list[tuple[str, str]],
+    n_distractors: int,
+    rng,
+) -> str:
+    """Interleave the example's own context paragraphs with N random
+    distractor paragraphs sampled from `pool`. Order is randomized so
+    supporting paragraphs aren't always grouped at the start."""
+    distractor_idxs = rng.sample(range(len(pool)), min(n_distractors, len(pool)))
+    extra_parts = [f"Title: {t}\n{b}" if t else b for t, b in (pool[i] for i in distractor_idxs)]
+    combined = list(own_parts) + extra_parts
+    rng.shuffle(combined)
+    return "\n\n".join(combined)
 
 
 def _quality_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):
@@ -394,7 +466,10 @@ _SOURCES = {
         "extract": _hotpotqa_extract,
     },
     "2wikimultihop": {
-        "id": "xanhho/2WikiMultihopQA", "config": None, "split": "train",
+        # framolfese mirror — canonical xanhho/2WikiMultihopQA requires a
+        # Python loading script (blocked by HF datasets ≥3.0). framolfese
+        # uses HotpotQA-style context dict.
+        "id": "framolfese/2WikiMultihopQA", "config": None, "split": "train",
         "extract": _2wikimultihop_extract,
     },
     "quality": {
@@ -426,6 +501,8 @@ def preprocess(
     max_prompt_tokens: int,
     max_gold_tokens: int,
     streaming: bool,
+    n_distractors: int = 0,
+    seed: int = 0,
 ) -> None:
     info = _SOURCES[source]
     tok = get_tokenizer()
@@ -446,11 +523,55 @@ def preprocess(
     if source in ("narrativeqa", "musique", "hotpotqa", "2wikimultihop", "quality"):
         extract_kwargs = {"tokenizer": tok, "max_prompt_tokens": max_prompt_tokens}
 
+    # LongBench-style distractor padding for short multi-hop QA sources.
+    # Requires non-streaming mode because we need to build the
+    # paragraph pool first. Only meaningful for {musique, hotpotqa,
+    # 2wikimultihop} — the others are either already long or have a
+    # different prompt structure.
+    pool = None
+    rng = None
+    if n_distractors > 0:
+        if source not in ("musique", "hotpotqa", "2wikimultihop"):
+            print(f"  [warn] --pad-with-distractors only supported for "
+                  f"musique/hotpotqa/2wikimultihop, skipping for {source}")
+        elif streaming:
+            raise ValueError(
+                "--pad-with-distractors requires non-streaming mode "
+                "(need to materialize the example pool first). Run "
+                "without --streaming."
+            )
+        else:
+            print(f"  [{source}] building distractor pool ({max_examples or 'all'} examples)...")
+            import random as _random
+            rng = _random.Random(seed)
+            all_examples = list(iterate_examples(
+                source, streaming=False, max_examples=max_examples,
+            ))
+            if source == "musique":
+                pool = _build_paragraph_pool_musique(all_examples)
+            else:
+                pool = _build_paragraph_pool_hotpotqa(all_examples)
+            print(f"  [{source}] pool: {len(pool)} paragraphs from {len(all_examples)} examples")
+            extract_kwargs["pool"] = pool
+            extract_kwargs["n_distractors"] = n_distractors
+            extract_kwargs["rng"] = rng
+            # Use the pre-loaded examples for iteration.
+            iter_source = iter(all_examples)
+        # Sentinel for the loop below.
+        use_preloaded = pool is not None
+    else:
+        use_preloaded = False
+        iter_source = None
+
     n_seen = 0
     n_kept = 0
-    for ex in iterate_examples(
-        source, streaming=streaming, max_examples=max_examples,
-    ):
+    if use_preloaded:
+        iterator = iter_source
+    else:
+        iterator = iterate_examples(
+            source, streaming=streaming, max_examples=max_examples,
+        )
+    for ex in iterator:
         n_seen += 1
         try:
             result = extract(ex, **extract_kwargs)
@@ -502,6 +623,14 @@ def main():
     ap.add_argument("--max-prompt-tokens", type=int, default=8192)
     ap.add_argument("--max-gold-tokens", type=int, default=2048)
     ap.add_argument("--streaming", action="store_true")
+    ap.add_argument(
+        "--pad-with-distractors", type=int, default=0,
+        help="LongBench-style distractor mixup: append N random paragraphs "
+             "from other examples' contexts to extend the prompt. Only "
+             "supported for {musique, hotpotqa, 2wikimultihop}. Requires "
+             "non-streaming mode (builds pool first). "
+             "Recommended: 40-60 for hotpotqa/2wikimultihop to hit ~6-8K tokens.",
+    )
     args = ap.parse_args()
 
     preprocess(
@@ -511,6 +640,7 @@ def main():
         max_prompt_tokens=args.max_prompt_tokens,
         max_gold_tokens=args.max_gold_tokens,
         streaming=args.streaming,
+        n_distractors=args.pad_with_distractors,
     )
 
 
