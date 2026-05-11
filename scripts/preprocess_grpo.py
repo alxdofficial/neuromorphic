@@ -151,6 +151,217 @@ def _numinamath_extract(ex):
     return prompt, gold, "exact_match", {"gold_boxed": gold_boxed}
 
 
+def _musique_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
+    """MuSiQue-Ans: multi-hop QA over Wikipedia paragraphs with distractors.
+
+    Format: {"paragraphs": [{"idx", "title", "paragraph_text", "is_supporting"}],
+             "question", "answer", "answer_aliases": [str]}.
+
+    Build prompt by concatenating ALL paragraphs (supporting + distractors)
+    in given order — that's the standard packing the LongBench mixup uses
+    to get ~14K-token contexts that exercise memory.
+    """
+    paragraphs = ex.get("paragraphs", [])
+    question = ex.get("question") or ""
+    answer = ex.get("answer") or ""
+    aliases = ex.get("answer_aliases") or []
+    if not paragraphs or not question or not answer:
+        return None
+
+    # Build context with one paragraph per line, title-prefixed.
+    parts = []
+    for p in paragraphs:
+        title = p.get("title", "").strip()
+        body = p.get("paragraph_text", "").strip()
+        if not body:
+            continue
+        parts.append(f"Title: {title}\n{body}" if title else body)
+    context = "\n\n".join(parts)
+    intro = "Read the following passages and answer the question.\n\n"
+    suffix = f"\n\nQuestion: {question}\n\nAnswer:"
+
+    # Token-aware truncation (mirrors narrativeqa pattern).
+    if tokenizer is not None:
+        intro_ids = tokenizer.encode(intro, add_special_tokens=True)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        margin = 16
+        budget = max_prompt_tokens - len(intro_ids) - len(suffix_ids) - margin
+        if budget < 512:
+            return None
+        passage_chars_safe = budget * 5 + 200
+        passage_ids = tokenizer.encode(
+            context[:passage_chars_safe], add_special_tokens=False,
+        )
+        if len(passage_ids) > budget:
+            passage_ids = passage_ids[:budget]
+            context = tokenizer.decode(passage_ids, skip_special_tokens=True)
+
+    prompt = f"{intro}{context}{suffix}"
+    all_answers = [answer] + [a for a in aliases if a]
+    return prompt, answer, "f1_qa", {"all_answers": all_answers}
+
+
+def _hotpotqa_extract(ex, *, tokenizer=None, max_prompt_tokens=16384):
+    """HotpotQA distractor split: 10 paragraphs (some supporting, some
+    distractor) and a multi-hop question.
+
+    HF schema (`hotpotqa/hotpot_qa`, config `distractor`):
+      context: {"title": [...], "sentences": [[s, s, ...], ...]}
+      question, answer
+      type: 'bridge' | 'comparison'
+      supporting_facts: {"title": [...], "sent_id": [...]}  (for eval, not used here)
+    """
+    ctx = ex.get("context") or {}
+    titles = ctx.get("title") or []
+    sentences = ctx.get("sentences") or []
+    question = ex.get("question") or ""
+    answer = ex.get("answer") or ""
+    if not titles or not sentences or not question or not answer:
+        return None
+
+    parts = []
+    for title, sents in zip(titles, sentences):
+        body = " ".join(s.strip() for s in sents if s).strip()
+        if not body:
+            continue
+        parts.append(f"Title: {title}\n{body}")
+    context = "\n\n".join(parts)
+    intro = "Read the following passages and answer the question.\n\n"
+    suffix = f"\n\nQuestion: {question}\n\nAnswer:"
+
+    if tokenizer is not None:
+        intro_ids = tokenizer.encode(intro, add_special_tokens=True)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        margin = 16
+        budget = max_prompt_tokens - len(intro_ids) - len(suffix_ids) - margin
+        if budget < 512:
+            return None
+        passage_chars_safe = budget * 5 + 200
+        passage_ids = tokenizer.encode(
+            context[:passage_chars_safe], add_special_tokens=False,
+        )
+        if len(passage_ids) > budget:
+            passage_ids = passage_ids[:budget]
+            context = tokenizer.decode(passage_ids, skip_special_tokens=True)
+
+    prompt = f"{intro}{context}{suffix}"
+    return prompt, answer, "f1_qa", {"all_answers": [answer]}
+
+
+def _2wikimultihop_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):
+    """2WikiMultiHopQA: multi-hop chains across Wikipedia paragraphs.
+
+    HF schema (`xanhho/2WikiMultihopQA`):
+      context: [[title, [s, s, ...]], ...]
+      question, answer
+      supporting_facts (for eval)
+    """
+    ctx_raw = ex.get("context") or []
+    question = ex.get("question") or ""
+    answer = ex.get("answer") or ""
+    if not ctx_raw or not question or not answer:
+        return None
+
+    parts = []
+    for item in ctx_raw:
+        # Robust to (title, sentences) and (title, [sentences]) shapes.
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        title, sents = item[0], item[1]
+        if isinstance(sents, list):
+            body = " ".join(s.strip() for s in sents if isinstance(s, str)).strip()
+        else:
+            body = str(sents).strip()
+        if not body:
+            continue
+        parts.append(f"Title: {title}\n{body}")
+    context = "\n\n".join(parts)
+    if not context:
+        return None
+    intro = "Read the following passages and answer the question.\n\n"
+    suffix = f"\n\nQuestion: {question}\n\nAnswer:"
+
+    if tokenizer is not None:
+        intro_ids = tokenizer.encode(intro, add_special_tokens=True)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        margin = 16
+        budget = max_prompt_tokens - len(intro_ids) - len(suffix_ids) - margin
+        if budget < 512:
+            return None
+        passage_chars_safe = budget * 5 + 200
+        passage_ids = tokenizer.encode(
+            context[:passage_chars_safe], add_special_tokens=False,
+        )
+        if len(passage_ids) > budget:
+            passage_ids = passage_ids[:budget]
+            context = tokenizer.decode(passage_ids, skip_special_tokens=True)
+
+    prompt = f"{intro}{context}{suffix}"
+    return prompt, answer, "f1_qa", {"all_answers": [answer]}
+
+
+def _quality_extract(ex, *, tokenizer=None, max_prompt_tokens=8192):
+    """QuALITY: multiple-choice QA over ~5K-token articles.
+
+    HF schema (`emozilla/quality`):
+      article (str)
+      question (str)
+      options (list[str], 4 options)
+      gold_label (int, 1-indexed) OR answer (int 0-indexed)
+
+    Reward: mc_letter — string-match the candidate's first A/B/C/D letter
+    against the gold letter. Cheapest verifiable reward in our suite.
+    """
+    article = ex.get("article") or ""
+    question = ex.get("question") or ""
+    options = ex.get("options") or []
+    # HF version stores gold as 1-indexed `gold_label`; some mirrors use
+    # 0-indexed `answer`. Accept either.
+    gold_idx = ex.get("gold_label")
+    if gold_idx is not None:
+        gold_idx = int(gold_idx) - 1   # to 0-indexed
+    else:
+        gold_idx = ex.get("answer")
+        gold_idx = int(gold_idx) if gold_idx is not None else None
+
+    if not article or not question or len(options) != 4 or gold_idx is None:
+        return None
+    if not (0 <= gold_idx < 4):
+        return None
+    gold_letter = "ABCD"[gold_idx]
+    gold_text = options[gold_idx]
+
+    # Build prompt.
+    intro = "Read the following passage and answer the multiple-choice question.\n\nPassage:\n"
+    options_block = "\n".join(
+        f"{letter}. {opt}" for letter, opt in zip("ABCD", options)
+    )
+    suffix = f"\n\nQuestion: {question}\n\n{options_block}\n\nAnswer:"
+
+    if tokenizer is not None:
+        intro_ids = tokenizer.encode(intro, add_special_tokens=True)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        margin = 16
+        budget = max_prompt_tokens - len(intro_ids) - len(suffix_ids) - margin
+        if budget < 512:
+            return None
+        passage_chars_safe = budget * 5 + 200
+        passage_ids = tokenizer.encode(
+            article[:passage_chars_safe], add_special_tokens=False,
+        )
+        if len(passage_ids) > budget:
+            passage_ids = passage_ids[:budget]
+            article = tokenizer.decode(passage_ids, skip_special_tokens=True)
+
+    prompt = f"{intro}{article}{suffix}"
+    # gold_text is the option content; gold_letter is the MC label.
+    # mc_letter reward keys on `gold_letter`; we keep `gold_text` for
+    # debug / alternative scoring.
+    return prompt, gold_letter, "mc_letter", {
+        "gold_letter": gold_letter, "gold_text": gold_text,
+    }
+
+
 _SOURCES = {
     "gsm8k": {
         "id": "openai/gsm8k", "config": "main", "split": "train",
@@ -170,6 +381,25 @@ _SOURCES = {
     "numinamath": {
         "id": "AI-MO/NuminaMath-TIR", "config": None, "split": "train",
         "extract": _numinamath_extract,
+    },
+    # Long-context multi-hop QA additions (memory-stress training data).
+    # All use F1 reward, packing all distractor + supporting paragraphs
+    # into the prompt to force memory engagement.
+    "musique": {
+        "id": "dgslibisey/MuSiQue", "config": None, "split": "train",
+        "extract": _musique_extract,
+    },
+    "hotpotqa": {
+        "id": "hotpotqa/hotpot_qa", "config": "distractor", "split": "train",
+        "extract": _hotpotqa_extract,
+    },
+    "2wikimultihop": {
+        "id": "xanhho/2WikiMultihopQA", "config": None, "split": "train",
+        "extract": _2wikimultihop_extract,
+    },
+    "quality": {
+        "id": "emozilla/quality", "config": None, "split": "train",
+        "extract": _quality_extract,
     },
 }
 
@@ -209,10 +439,11 @@ def preprocess(
     rows_reward = []
     rows_meta = []
 
-    # NarrativeQA needs the tokenizer to do passage-budget truncation so the
-    # `Question: .../Answer:` suffix isn't cut off. Other extracts ignore it.
+    # Long-context sources need the tokenizer to do passage-budget
+    # truncation so the question / answer markers aren't cut off when
+    # the document is longer than `max_prompt_tokens`.
     extract_kwargs = {}
-    if source == "narrativeqa":
+    if source in ("narrativeqa", "musique", "hotpotqa", "2wikimultihop", "quality"):
         extract_kwargs = {"tokenizer": tok, "max_prompt_tokens": max_prompt_tokens}
 
     n_seen = 0

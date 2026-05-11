@@ -691,22 +691,36 @@ Goal: AR rollouts + verifiable rewards to refine reasoning. Same
 structure as graph_walker's W3 but with memory in the loop and a
 different dataset shape.
 
-**Implemented sources (2026-05-09, all wired ✓):**
+**Implemented sources (updated 2026-05-11):**
 
-| Source                            | HF id                  | Use |
-|-----------------------------------|------------------------|-----|
-| GSM8K (full train, 7473 examples) | `openai/gsm8k`         | Math word problems; gold = number after `####`, regex tolerates decimals/commas/negatives. |
-| NuminaMath-TIR (50K examples)     | `AI-MO/NuminaMath-TIR` | Math with code execution; gold = final `\boxed{}` answer. |
-| HumanEval (full test, 164)        | `openai_humaneval`     | Code with verifiable test pass/fail; rule_based_exec reward. |
-| NarrativeQA (5K examples)         | `deepmind/narrativeqa` | Long-context QA. **Uses 32K-char slice of full document** (~8K tokens) so prompt extends past 2K LM cap (memory-stress). `use_summary=True` available as fallback for faster but lower-stress runs. |
+Reasoning track (short prompts, fits Llama's 2K direct attention — memory side-car gets only indirect gradient via reward):
 
-Format: `(prompt, response)`. For math/code, prompt is the problem.
-For NarrativeQA, prompt is `passage + question`. 1–5k prompts × 4–8
-responses each.
+| Source                            | HF id                  | Length | Reward |
+|-----------------------------------|------------------------|--------|--------|
+| GSM8K (full train, 7473)          | `openai/gsm8k`         | ~77 tok | `exact_match` (numeric extraction) |
+| NuminaMath-TIR (50K)              | `AI-MO/NuminaMath-TIR` | ~89 tok prompt / up to 2K gold (chain-of-thought) | `exact_match` on `\boxed{}` |
+| HumanEval (full test, 164)        | `openai_humaneval`     | ~132 tok | `rule_based_exec` (DISABLED in v1, needs sandbox) |
 
-Reward: rule-based accuracy for math/code (exact match on final answer);
-exact match + BERT cosine for NarrativeQA (matches project's stored
-reward preference — no LLM-as-judge).
+Memory-stress track (long prompts >2K — Llama's KV cache slides off and Llama must rely on the manifold for retrieval):
+
+| Source                            | HF id                          | Length | Reward |
+|-----------------------------------|--------------------------------|--------|--------|
+| NarrativeQA (~5K)                 | `deepmind/narrativeqa`         | ~8K tok prompt, ~6 tok answer | `exact_match_or_bert_cosine` (multi-gold) |
+| **MuSiQue-Ans (new 2026-05-11)**  | `dgslibisey/MuSiQue`           | ~14K tok packed prompt (multi-hop QA) | `f1_qa` |
+| **HotpotQA distractor (new)**     | `hotpotqa/hotpot_qa` (distractor) | ~12K tok | `f1_qa` |
+| **2WikiMultiHopQA (new)**         | `xanhho/2WikiMultihopQA`       | ~6.5K tok | `f1_qa` |
+| **QuALITY (new)**                 | `emozilla/quality`             | ~6K tok | `mc_letter` (cheapest verifiable) |
+
+Format: `(prompt_ids, gold_ids, reward_kind, meta_json)` parquet per source. Each example is one prompt; trainer samples K=8 responses, computes group-relative reward against `gold_ids`.
+
+`train_wave3.py --source-weights` accepts upsampling weights per source for biasing the training mix toward memory-stress sources. Recommended mix (≥80% long-context) is in the script docstring.
+
+Held out for eval (don't train on — see plan §6.5):
+- LongMemEval, MemoryAgentBench, LongBench/LongBench-v2 test splits, InfiniteBench, LooGLE, L-Eval, ZeroSCROLLS.
+
+Synthesizer follow-ups (Tier 2 deferred):
+- **RULER** (NVIDIA, Apache-2.0) — NIAH variants, configurable 4K-1M lengths, exact-match reward. Best lever to scale memory-stress data without scraping new sources.
+- **BABILong** — 20 bAbI tasks wrapped in PG-19 background, accuracy reward.
 
 Routes through `grpo_session_step` like the existing graph_walker plan.
 Surprise during the response (sampled) windows: 0 (default) or entropy

@@ -1,13 +1,25 @@
 """Wave 3 entry point — verifiable-reward GRPO (plan §4.5).
 
-Usage:
+Usage (basic):
     python scripts/train_wave3.py \\
         --data-paths \\
             data/wave3/gsm8k.parquet \\
             data/wave3/numinamath.parquet \\
             data/wave3/humaneval.parquet \\
             data/wave3/narrativeqa.parquet \\
-        --num-samples 4 --num-steps 200
+        --num-samples 8 --num-steps 200
+
+Usage (long-context-biased mix, ≥80% memory-engaging):
+    python scripts/train_wave3.py \\
+        --data-paths \\
+            data/wave3/gsm8k.parquet \\
+            data/wave3/narrativeqa.parquet \\
+            data/wave3/musique.parquet \\
+            data/wave3/hotpotqa.parquet \\
+            data/wave3/2wikimultihop.parquet \\
+            data/wave3/quality.parquet \\
+        --source-weights "narrativeqa=3,musique=3,hotpotqa=3,2wikimultihop=2,quality=2,gsm8k=1" \\
+        --num-samples 8 --num-steps 1000
 """
 
 from __future__ import annotations
@@ -82,6 +94,13 @@ def main():
                     help="Weight on KL(π_θ || π_ref) regularization. "
                          "Default 0.001 matches verl. 0 disables KL term. "
                          "Reference is the loaded --checkpoint-in weights.")
+    ap.add_argument("--source-weights", type=str, default=None,
+                    help="Per-source upsampling weights in 'name=w,name=w' "
+                         "format. e.g. 'narrativeqa=3,musique=3,hotpotqa=3,"
+                         "2wikimultihop=3,quality=3,gsm8k=1,numinamath=1,"
+                         "humaneval=1'. Used to bias the training mix toward "
+                         "long-context (memory-engaging) sources. Default: "
+                         "uniform (1.0 for all).")
     args = ap.parse_args()
 
     # Allow TF32 for fp32 matmul (memory params, bridge, lm_head).
@@ -154,10 +173,22 @@ def main():
             print(f"Reference policy restored from checkpoint "
                   f"(kl_coef={args.kl_coef}).")
 
-    dataset = PromptResponseDataset(args.data_paths)
+    source_weights: dict[str, float] | None = None
+    if args.source_weights:
+        source_weights = {}
+        for item in args.source_weights.split(","):
+            if "=" not in item:
+                continue
+            name, w = item.split("=", 1)
+            source_weights[name.strip()] = float(w.strip())
+    dataset = PromptResponseDataset(args.data_paths, source_weights=source_weights)
     if trainer.step_count > 0:
         dataset._epoch = trainer.step_count  # B6 — fresh shuffle on resume
-    print(f"Wave 3 dataset: {len(dataset)} prompts")
+    if source_weights:
+        print(f"Wave 3 dataset: {len(dataset)} prompts (post-weighting). "
+              f"Source breakdown: {dataset.source_breakdown()}")
+    else:
+        print(f"Wave 3 dataset: {len(dataset)} prompts")
 
     rewards_history: list = []
     t_start = time.time()

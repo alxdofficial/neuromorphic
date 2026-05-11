@@ -629,6 +629,14 @@ class PromptResponseDataset:
     Doesn't pad / batch — GRPO rollout is typically per-example (or
     small fixed batches with same-length prompts). We yield one example
     at a time; trainer can batch if it wants.
+
+    `source_weights` (optional) — per-source multiplier on appearance
+    frequency. Rows from each source are replicated `weight` times before
+    shuffling. Use to upweight long-context / memory-relevant sources
+    (e.g. {"narrativeqa": 3.0, "musique": 3.0, "gsm8k": 1.0}). Default 1.0
+    for any unmentioned source. Fractional weights are supported via
+    rounding to nearest int (≥1) — so 1.5× replication ≈ 1 or 2 copies.
+    For finer-grained mixing, also use `target_long_frac` (below).
     """
 
     def __init__(
@@ -637,6 +645,7 @@ class PromptResponseDataset:
         *,
         shuffle: bool = True,
         seed: int = 0,
+        source_weights: dict[str, float] | None = None,
     ):
         self.paths = [Path(p) for p in parquet_paths]
         self.shuffle = shuffle
@@ -645,21 +654,44 @@ class PromptResponseDataset:
 
         import json as _json
         rows = []
+        per_source_counts: dict[str, int] = {}
         for path in self.paths:
             tbl = pq.read_table(path)
             cols = {c: tbl.column(c).to_pylist() for c in tbl.column_names}
             for i in range(len(cols["prompt_ids"])):
+                src = cols["source"][i]
                 rows.append({
                     "prompt_ids": cols["prompt_ids"][i],
                     "gold_ids": cols["gold_ids"][i],
-                    "source": cols["source"][i],
+                    "source": src,
                     "reward_kind": cols["reward_kind"][i],
                     "meta": _json.loads(cols["meta_json"][i]) if cols["meta_json"][i] else {},
                 })
+                per_source_counts[src] = per_source_counts.get(src, 0) + 1
+
+        # Apply per-source weights via replication.
+        self.source_weights = source_weights or {}
+        if self.source_weights:
+            weighted_rows = []
+            for r in rows:
+                w = float(self.source_weights.get(r["source"], 1.0))
+                # Replicate (rounded to nearest int, ≥1).
+                n_copies = max(1, int(round(w)))
+                weighted_rows.extend([r] * n_copies)
+            rows = weighted_rows
+
         self._rows = rows
+        self._per_source_counts = per_source_counts
 
     def __len__(self) -> int:
         return len(self._rows)
+
+    def source_breakdown(self) -> dict[str, int]:
+        """Return effective per-source counts after weighting — for logging."""
+        out: dict[str, int] = {}
+        for r in self._rows:
+            out[r["source"]] = out.get(r["source"], 0) + 1
+        return out
 
     def __iter__(self):
         rng = random.Random(self.seed + self._epoch)

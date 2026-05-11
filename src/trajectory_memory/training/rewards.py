@@ -11,6 +11,10 @@ rule-based rewards.
 - `humaneval_check`       — DISABLED in v1 (returns 0.0). Running model
                              code needs sandboxing — wire a Docker / firejail
                              runner before enabling.
+- `f1_qa`                  — Multi-hop QA SQuAD-style F1 over tokens.
+                             Used by MuSiQue, HotpotQA, 2WikiMultiHopQA.
+- `mc_letter`              — Multiple-choice letter match (A/B/C/D).
+                             Used by QuALITY.
 
 Reward functions return a float in [0, 1] (1 = perfect, 0 = miss).
 """
@@ -18,6 +22,8 @@ Reward functions return a float in [0, 1] (1 = perfect, 0 = miss).
 from __future__ import annotations
 
 import re
+import string
+from collections import Counter
 from functools import lru_cache
 
 
@@ -106,6 +112,90 @@ def narrativeqa_match(candidate: str, gold_answers: list[str]) -> float:
     return max(bert_cosine(candidate, g) for g in gold_answers)
 
 
+def _normalize_qa_answer(text: str) -> str:
+    """SQuAD/MuSiQue/HotpotQA normalization: lowercase, strip articles,
+    strip punctuation, collapse whitespace. Standard recipe — matches what
+    the original SQuAD eval script does, and what MuSiQue/HotpotQA evals
+    use too."""
+    text = text.lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = "".join(ch for ch in text if ch not in string.punctuation)
+    text = " ".join(text.split())
+    return text
+
+
+def f1_qa(candidate: str, gold: str) -> float:
+    """Token-overlap F1 between candidate and gold, post-normalization.
+    Standard SQuAD/MuSiQue/HotpotQA eval metric.
+
+    Returns float in [0, 1]. Empty answers return 0 unless both are empty
+    (then 1 — degenerate but matches SQuAD convention)."""
+    cand_norm = _normalize_qa_answer(candidate)
+    gold_norm = _normalize_qa_answer(gold)
+    cand_toks = cand_norm.split()
+    gold_toks = gold_norm.split()
+    if not cand_toks or not gold_toks:
+        # Both empty → 1; one empty → 0.
+        return float(not cand_toks and not gold_toks)
+    common = Counter(cand_toks) & Counter(gold_toks)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(cand_toks)
+    recall = num_same / len(gold_toks)
+    return 2 * precision * recall / (precision + recall)
+
+
+def f1_qa_max(candidate: str, golds: list[str]) -> float:
+    """F1 vs the best of a list of gold answers (handles answer_aliases
+    in MuSiQue / multiple-reference style)."""
+    if not golds:
+        return 0.0
+    return max(f1_qa(candidate, g) for g in golds)
+
+
+# ── Multiple-choice (QuALITY) ─────────────────────────────────────────
+
+
+_MC_LETTER_RE = re.compile(r"^\s*\(?([A-Da-d])[\)\.\s]")
+
+
+def mc_letter(candidate: str, gold_letter: str) -> float:
+    """Parse the FIRST letter from the candidate (A/B/C/D) and compare to
+    gold_letter. Tolerant to common formats: 'A', 'A.', 'A)', '(A)',
+    '  A  ', 'Answer: A', etc.
+
+    Strategy: find the first occurrence of 'A'-'D' that's followed by a
+    delimiter (`.`, `)`, whitespace, or end of string), or that appears
+    after the word 'answer'. Matches what eval harnesses (lm-eval-harness,
+    LongBench's MC scorer) do for MC tasks."""
+    if not candidate:
+        return 0.0
+    gold = gold_letter.strip().upper()
+    if gold not in ("A", "B", "C", "D"):
+        return 0.0
+
+    # First pass: look for a delimiter pattern at the start.
+    m = _MC_LETTER_RE.match(candidate)
+    if m:
+        return float(m.group(1).upper() == gold)
+
+    # Second pass: "answer is A" / "Answer: B" style.
+    m = re.search(
+        r"(?:answer|choice)(?:\s+is)?\s*[:\-]?\s*\(?([A-Da-d])\b",
+        candidate, flags=re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1).upper() == gold)
+
+    # Last resort: any standalone letter A-D in the first 100 chars.
+    head = candidate[:100]
+    m = re.search(r"\b([A-Da-d])\b", head)
+    if m:
+        return float(m.group(1).upper() == gold)
+    return 0.0
+
+
 def humaneval_check(candidate_code: str, test_code: str, entry_point: str) -> float:
     """Run candidate code against the gold test; 1 if it passes, 0 otherwise.
 
@@ -145,4 +235,13 @@ def compute_reward(
             (meta or {}).get("test", ""),
             (meta or {}).get("entry_point", ""),
         )
+    elif reward_kind == "f1_qa":
+        # Multi-hop QA F1. Golds is a list (answer + aliases). Used by
+        # MuSiQue (answer_aliases), HotpotQA (single answer), and
+        # 2WikiMultiHopQA (single answer + supporting_facts).
+        golds = (meta or {}).get("all_answers", [gold] if gold else [])
+        return f1_qa_max(candidate, golds)
+    elif reward_kind == "mc_letter":
+        # Multiple-choice (QuALITY). gold_letter = 'A'/'B'/'C'/'D'.
+        return mc_letter(candidate, (meta or {}).get("gold_letter", ""))
     raise ValueError(f"unknown reward_kind: {reward_kind}")

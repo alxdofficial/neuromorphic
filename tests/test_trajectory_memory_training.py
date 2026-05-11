@@ -257,6 +257,67 @@ def test_compute_reward_unknown_kind_raises():
         compute_reward("not_a_reward_kind", "x")
 
 
+def test_f1_qa_basic():
+    """f1_qa is SQuAD-style token overlap F1 with answer normalization."""
+    from src.trajectory_memory.training.rewards import f1_qa
+    # Perfect match → 1.0
+    assert f1_qa("Paris", "Paris") == 1.0
+    # Case + article + punctuation normalization
+    assert f1_qa("the paris.", "Paris") == 1.0
+    # Partial overlap — "answer is Paris" vs "Paris" gets F1 between 0 and 1
+    f1 = f1_qa("answer is Paris", "Paris")
+    assert 0.0 < f1 < 1.0
+    # Zero overlap
+    assert f1_qa("dog", "cat") == 0.0
+    # Empty candidate
+    assert f1_qa("", "Paris") == 0.0
+
+
+def test_f1_qa_max_picks_best_alias():
+    """f1_qa_max takes max over a list of gold aliases."""
+    from src.trajectory_memory.training.rewards import f1_qa_max
+    golds = ["Paris", "Paris, France", "City of Paris"]
+    # Candidate matches first gold perfectly → 1.0
+    assert f1_qa_max("Paris", golds) == 1.0
+    # Candidate matches second gold better
+    assert f1_qa_max("Paris France", golds) > f1_qa_max("Paris France", ["Madrid"])
+    # No alias list
+    assert f1_qa_max("Paris", []) == 0.0
+
+
+def test_mc_letter_parses_common_formats():
+    """mc_letter handles bare letter, parenthesized, 'Answer: X', etc."""
+    from src.trajectory_memory.training.rewards import mc_letter
+    assert mc_letter("A", "A") == 1.0
+    assert mc_letter("A.", "A") == 1.0
+    assert mc_letter("(A)", "A") == 1.0
+    assert mc_letter("  A  ", "A") == 1.0
+    assert mc_letter("Answer: B", "B") == 1.0
+    assert mc_letter("The answer is C.", "C") == 1.0
+    # Wrong letter
+    assert mc_letter("B", "A") == 0.0
+    # Lowercase candidate
+    assert mc_letter("a", "A") == 1.0
+
+
+def test_compute_reward_f1_qa_via_dispatch():
+    """compute_reward routes 'f1_qa' to f1_qa_max with all_answers meta."""
+    r = compute_reward(
+        "f1_qa", "Paris",
+        gold="Paris", meta={"all_answers": ["Paris", "City of Light"]},
+    )
+    assert r == 1.0
+
+
+def test_compute_reward_mc_letter_via_dispatch():
+    r = compute_reward("mc_letter", "B", gold="B", meta={"gold_letter": "B"})
+    assert r == 1.0
+    r = compute_reward("mc_letter", "Answer: A", gold="A", meta={"gold_letter": "A"})
+    assert r == 1.0
+    r = compute_reward("mc_letter", "C", gold="B", meta={"gold_letter": "B"})
+    assert r == 0.0
+
+
 # ── Checkpoint round-trip ──────────────────────────────────────────────
 
 
