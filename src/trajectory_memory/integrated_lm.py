@@ -176,6 +176,46 @@ class IntegratedLM(nn.Module):
         the Llama stack. Single registration path — see __init__ comment."""
         return self.host.layer_list()[self.cfg.inject_layer]
 
+    def compile_inner_modules(self) -> None:
+        """Compile the inner modules — read_module, write_module,
+        MemInjectLayer.forward — separately, instead of compiling the
+        whole `forward_window`.
+
+        Why: `forward_window` is a branchy orchestrator with many
+        None-or-tensor inputs, KV-cache mutation, train/val grad
+        differences, and rolling-buffer vs KV-cache modes — torch.compile
+        retraces on each combination and hits the recompile cap (~64+
+        distinct call signatures). The inner modules have stable shapes
+        and 1-2 variants each, so they compile cleanly.
+
+        From profile_analysis.md: read_module + write_module = 39% of
+        forward_window time. Inductor fusion on their attn + MLP ops
+        typically gives 1.5-2× speedup, saving ~10-15% of step time vs
+        full eager.
+
+        Big-Llama compile (StaticCache + reduce-overhead mode) is the
+        bigger win — see research_backlog.md.
+
+        Call this AFTER IntegratedLM construction and BEFORE running.
+        """
+        import torch
+        self.read_module.forward = torch.compile(
+            self.read_module.forward, mode="default", dynamic=False,
+        )
+        self.write_module.forward = torch.compile(
+            self.write_module.forward, mode="default", dynamic=False,
+        )
+        mem_inject = self._mem_inject_layer()
+        # dynamic=True for mem_inject: rolling-buffer mode feeds Llama a
+        # cumulative window (256 / 512 / ... / 2048 tokens), so the
+        # attention_mask shape passed to layer 8 varies per call. With
+        # dynamic=False these recompile on each shape and exceed
+        # recompile_limit=8 → fall back to eager. dynamic=True compiles
+        # once with symbolic shapes.
+        mem_inject.forward = torch.compile(
+            mem_inject.forward, mode="default", dynamic=True,
+        )
+
     def _build_memory_fn(self, read_trajectory: Tensor):
         """Return a closure suitable for MemInjectLayer.memory_fn.
 
@@ -387,6 +427,18 @@ class IntegratedLM(nn.Module):
                             use_cache=True,
                         )
                         new_past_key_values = base_out.past_key_values
+                        # Enforce the effective_lm_context cap on the
+                        # rolling KV cache (post-fix 2026-05-12). Without
+                        # this, Llama attends over the full unbounded
+                        # cache, making memory functionally redundant —
+                        # the cap is the design-intent context limit that
+                        # forces memory to carry info beyond Llama's
+                        # attention range. See research_backlog item on
+                        # context-cap enforcement.
+                        from src.trajectory_memory.tbptt import _crop_kv_cache
+                        new_past_key_values = _crop_kv_cache(
+                            new_past_key_values, cfg.effective_lm_context,
+                        )
                     else:
                         base_out = self.llama.model(
                             input_ids=lm_input_ids,

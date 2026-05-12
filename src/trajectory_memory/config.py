@@ -62,9 +62,34 @@ class TrajMemConfig:
     effective_lm_context: int = 2048  # hard-truncate LM input
 
     # ── trajectory mechanics ─────────────────────────────────────────
-    mutation_init_scale: float = 0.1   # `new = state + 0.1 * MLP(...)`
-    gumbel_tau: float = 1.0            # Gumbel-softmax temperature
+    # mutation_init_scale: retained only for backward-compat with old
+    # checkpoints. The write module now uses an nn.GRUCell (target-form
+    # + bounded tanh + per-element update gate), so there's no candidate-
+    # scale knob. Kept here so loading an old config doesn't crash.
+    mutation_init_scale: float = 0.1
+    gumbel_tau: float = 1.0            # legacy — unused after switch to softmax-STE
     pos_enc_scale: float = 1.0         # multiplier on positional encoding
+
+    # Learnable logit-scale for cosine routing (CLIP-style).
+    # Effective scale = exp(logit_scale_init).clamp(max=20). Init at 1.5
+    # → exp(1.5) ≈ 4.5 → cosine logits scaled to [-4.5, 4.5] before softmax.
+    # Without this, cosine logits ∈ [-1, 1] are dominated by the Gumbel(0,1)
+    # noise (std 1.28) that the older routing used, so routing was random.
+    # With softmax-STE (no Gumbel), the scale governs softmax temperature
+    # directly: too small → flat softmax → no specialization; too large →
+    # peaked softmax → gradient only flows to top-1.
+    logit_scale_init: float = 1.5
+
+    # ── magnitude bounding ────────────────────────────────────────────
+    # Apply normalization at consumption boundaries so unbounded parameter
+    # drift doesn't translate into unbounded state magnitudes (the
+    # state-drift bug from Wave 1 run @ step ~14500). Four sites:
+    #   1. concept_states     — GRUCell (in write_module) bounds via tanh.
+    #   2. state_init         — L2-normalize at reset_states() consumption.
+    #   3. concept_ids        — L2-normalize at every routing dot-product.
+    #   4. MemInjectLayer.scale — tanh-clamp at consumption.
+    # `state_init_norm` sets the target L2 norm for the reset-state.
+    state_init_norm: float = 1.0       # ≈ Glorot init norm at D=256
 
     # ── init seeds ────────────────────────────────────────────────────
     seed_topology: int = 0

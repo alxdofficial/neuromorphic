@@ -40,25 +40,39 @@ def make_pos_enc(K: int, D: int) -> Tensor:
     return pe
 
 
-def routing_aux_losses(logits: Tensor, one_hot: Tensor) -> dict[str, Tensor]:
+def routing_aux_losses(
+    logits: Tensor,
+    one_hot: Tensor,
+    *,
+    z_loss_logits: Tensor | None = None,
+) -> dict[str, Tensor]:
     """Compute Switch-Transformer load-balance + ST-MoE z-loss at a routing
     decision. Returns scalars suitable for adding to the training loss.
 
     Args:
-        logits:  [..., N] pre-softmax routing scores (differentiable)
-        one_hot: [..., N] hard one-hot selection from Gumbel-STE
-                 (forward-detached; its sum-over-vocab is 1 per row)
+        logits:        [..., N] post-softmax-input routing scores
+                       (differentiable, typically scaled by logit_scale)
+        one_hot:       [..., N] hard one-hot selection from softmax-STE
+                       (forward-detached; its sum-over-vocab is 1 per row)
+        z_loss_logits: optional [..., N] — if provided, z_loss uses these
+                       instead of `logits`. Pass the UNSCALED cosine logits
+                       so z_loss penalizes raw logit magnitude (per ST-MoE
+                       convention) without fighting `logit_scale_raw`
+                       learning to grow. With scaled logits, z_loss would
+                       drive logit_scale toward zero — the opposite of
+                       what we want.
 
     Returns:
         {
           'load_balance': scalar  — Switch loss: N · Σᵢ fᵢ · Pᵢ
-                                    minimized when routing is uniform
-          'z_loss':       scalar  — mean of (logsumexp(logits))²
-                                    keeps logit magnitudes from saturating
+                                    minimized when routing is uniform.
+                                    Uses `logits` (the scaled version is
+                                    correct — penalizes actual softmax
+                                    distribution after temperature).
+          'z_loss':       scalar  — mean of (logsumexp(z_loss_logits))²
+                                    keeps RAW logit magnitudes from
+                                    saturating; orthogonal to logit_scale.
         }
-
-    The caller multiplies each by its coefficient (typically
-    load_balance: 1e-2, z_loss: 1e-3) and adds to the total loss.
     """
     N = logits.shape[-1]
     # Flatten everything but the last dim — treats each row as one routing
@@ -83,11 +97,54 @@ def routing_aux_losses(logits: Tensor, one_hot: Tensor) -> dict[str, Tensor]:
     load_balance = N * (f * P).sum()
 
     # z-loss: penalize magnitude of logsumexp (= log normalizer of softmax).
-    # Keeps logits near zero magnitude → softmax stays in active range.
-    # ST-MoE shows this strictly improves stability with no quality cost.
-    z_loss = (torch.logsumexp(flat_logits, dim=-1) ** 2).mean()
+    # Compute on UNSCALED logits when provided — this controls raw cosine
+    # magnitudes without fighting the learnable logit_scale_raw.
+    z_logits = z_loss_logits if z_loss_logits is not None else logits
+    z_flat = z_logits.reshape(-1, N)
+    z_loss = (torch.logsumexp(z_flat, dim=-1) ** 2).mean()
 
     return {"load_balance": load_balance, "z_loss": z_loss}
+
+
+def softmax_top1_ste(
+    logits: Tensor,
+    *,
+    hard: bool,
+) -> tuple[Tensor, Tensor]:
+    """Softmax-top-1 with straight-through estimator (no Gumbel noise).
+
+    Modern MoE pattern (Mixtral / DeepSeek). Forward picks argmax; backward
+    routes through softmax probabilities.
+
+    Why no Gumbel: with cosine routing the logits are bounded in [-1, 1],
+    so Gumbel(0,1) noise (std ~1.28) dominates the signal — routing is
+    random regardless of weights. Pre-multiplying logits by a learnable
+    `logit_scale` (caller's responsibility) restores signal dominance.
+    Without the noise term, exploration comes from random init + the
+    load-balance aux loss, same as standard MoE.
+
+    `hard=False` returns the argmax one-hot directly without an STE path.
+    That hard one-hot has no autograd link back to `logits` (argmax is
+    non-differentiable) — so this branch silently kills gradient into
+    routing. It's safe inside `torch.no_grad()` (inference / eval) but
+    a trap during training. The assert below catches the trap.
+    """
+    soft = F.softmax(logits, dim=-1)
+    idx = soft.argmax(dim=-1)
+    hard_one_hot = F.one_hot(idx, num_classes=logits.shape[-1]).to(soft.dtype)
+    if not hard:
+        # Defensive — never silently kill routing gradient. If a future
+        # caller passes hard=False during training (grad-enabled), error
+        # loudly instead of returning a graph-disconnected one-hot.
+        assert not torch.is_grad_enabled(), (
+            "softmax_top1_ste(hard=False) returns a non-differentiable "
+            "one-hot; only use inside torch.no_grad(). For training, pass "
+            "hard=True (straight-through forward=hard / backward=soft)."
+        )
+        return hard_one_hot, idx
+    # Straight-through: forward hard, backward soft probabilities.
+    one_hot = (hard_one_hot - soft).detach() + soft
+    return one_hot, idx
 
 
 def gumbel_top1_ste(
@@ -287,7 +344,13 @@ class EntryProjector(nn.Module):
         # std=1.0 to dominate the projected pooled term so J trajectories
         # don't collapse to identical paths at init.
         self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=1.0)
+        # Init std lowered from 1.0 → 0.1 (2026-05-12). At std=1.0 the
+        # per-head bias norm (~sqrt(D)≈16) overwhelmed mean-pooled LM
+        # content (norm ~sqrt(D/T_window)≈1) by ~16× → entry routing
+        # was mostly head-bias-driven at init, with content as a small
+        # perturbation. Lower std makes content dominate from the start;
+        # heads still differ enough at init for J trajectories to diverge.
+        nn.init.normal_(self.head_query, std=0.1)
         self.entry_mlp = nn.Sequential(
             nn.Linear(d_lm + D, D, bias=True),
             nn.GELU(),
@@ -348,6 +411,15 @@ class ReadTrajectoryGenerator(nn.Module):
         pe = make_pos_enc(cfg.K_read, D) * cfg.pos_enc_scale
         self.register_buffer("pos_enc", pe, persistent=False)
 
+        # Learnable logit scale (CLIP-style). Cosine routing produces logits
+        # in [-1, 1]; without scaling, softmax is near-uniform and routing
+        # can't depend on the cosine signal. effective_scale =
+        # exp(logit_scale_raw).clamp(max=20) so the optimizer can sharpen
+        # routing as training proceeds.
+        self.logit_scale_raw = nn.Parameter(
+            torch.tensor(float(cfg.logit_scale_init))
+        )
+
     def forward(
         self,
         prev_window_hiddens: Tensor,
@@ -399,15 +471,27 @@ class ReadTrajectoryGenerator(nn.Module):
         cross_K, cross_V = self.cross_attn.precompute_kv(prev_window_hiddens)
 
         # Score each entry query against all N concept_ids.
-        # concept_ids: [N, D] → broadcast over BS, J.
-        ids = manifold.concept_ids                                # [N, D]
-        entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)  # [BS, J, N]
-        entry_one_hot, entry_idx = gumbel_top1_ste(
-            entry_logits, tau_eff, hard=hard,
+        # L2-normalize both Q and K → cosine similarity, bounded ∈ [-1, 1].
+        # Decouples entry selection from raw vector magnitudes so the
+        # Gumbel τ schedule operates on a stable, interpretable scale.
+        # concept_ids_normed: [N, D] → broadcast over BS, J.
+        ids = manifold.concept_ids_normed                         # [N, D]
+        entry_logits_raw = torch.einsum(
+            "bjd,nd->bjn", F.normalize(Q_entry, dim=-1), ids,
+        )                                                         # [BS, J, N] ∈ [-1,1]
+        # Scale cosine logits so signal dominates softmax temperature.
+        # exp(logit_scale_raw).clamp(max=20) — learnable, init exp(1.5)≈4.5.
+        eff_scale = self.logit_scale_raw.exp().clamp(max=20.0)
+        entry_logits = entry_logits_raw * eff_scale
+        entry_one_hot, entry_idx = softmax_top1_ste(
+            entry_logits, hard=hard,
         )                                                         # [BS, J, N], [BS, J]
         # Accumulate routing aux losses (Switch load-balance + ST-MoE z-loss).
-        # Computed at each routing decision; summed before return.
-        _aux_lb = routing_aux_losses(entry_logits, entry_one_hot)
+        # z_loss on the raw (unscaled) cosine logits so it doesn't oppose
+        # logit_scale_raw learning to grow.
+        _aux_lb = routing_aux_losses(
+            entry_logits, entry_one_hot, z_loss_logits=entry_logits_raw,
+        )
         aux_lb_total = _aux_lb["load_balance"]
         aux_z_total = _aux_lb["z_loss"]
 
@@ -457,16 +541,20 @@ class ReadTrajectoryGenerator(nn.Module):
             )                                                     # [BS, J, 3D]
             Q_t = self.step_mlp(step_input)                       # [BS, J, D]
 
-            # Score against neighbors of current[j]. neighbor ids: [BS, J, K_max, D].
+            # Score against neighbors of current[j]. Cosine similarity (L2-
+            # normalized) — same rationale as the entry-point scoring.
             nbr_idx = manifold.get_neighbor_indices(current)      # [BS, J, K_max]
-            nbr_ids = manifold.concept_ids[nbr_idx]               # [BS, J, K_max, D]
-            nbr_logits = torch.einsum(
-                "bjd,bjkd->bjk", Q_t, nbr_ids,
-            )                                                     # [BS, J, K_max]
-            nbr_one_hot, next_local = gumbel_top1_ste(
-                nbr_logits, tau_eff, hard=hard,
+            nbr_ids = manifold.concept_ids_normed[nbr_idx]        # [BS, J, K_max, D]
+            nbr_logits_raw = torch.einsum(
+                "bjd,bjkd->bjk", F.normalize(Q_t, dim=-1), nbr_ids,
+            )                                                     # [BS, J, K_max] ∈ [-1,1]
+            nbr_logits = nbr_logits_raw * eff_scale
+            nbr_one_hot, next_local = softmax_top1_ste(
+                nbr_logits, hard=hard,
             )                                                     # [BS, J, K_max], [BS, J]
-            _aux_hop = routing_aux_losses(nbr_logits, nbr_one_hot)
+            _aux_hop = routing_aux_losses(
+                nbr_logits, nbr_one_hot, z_loss_logits=nbr_logits_raw,
+            )
             aux_lb_total = aux_lb_total + _aux_hop["load_balance"]
             aux_z_total = aux_z_total + _aux_hop["z_loss"]
 

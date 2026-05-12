@@ -250,13 +250,13 @@ if the first training run shows we need more headroom.
 A second profiling pass with a "where does the slowdown actually live?"
 question. Three new experiment scripts:
 
-- `scripts/experiment_memory_cost.py` — compares 5 paths (vanilla single-fwd,
+- `scripts/bench/experiment_memory_cost.py` — compares 5 paths (vanilla single-fwd,
   vanilla 4×growing-fwd, trajmem-no-memory, trajmem-bridge-only, full
   trajmem) at BS=4 to isolate memory module cost from per-window structure
   cost.
-- `scripts/experiment_lm_context.py` — sweeps `effective_lm_context`
+- `scripts/bench/experiment_lm_context.py` — sweeps `effective_lm_context`
   (256, 1024, 2048) × eager/compile to isolate rolling-buffer cost.
-- `scripts/experiment_compile_dynamic.py` — `torch.compile`'s `dynamic`
+- `scripts/bench/experiment_compile_dynamic.py` — `torch.compile`'s `dynamic`
   flag and `mode='reduce-overhead'` at the production setting.
 
 ## Headline finding: **the memory module per se is essentially free**
@@ -367,12 +367,12 @@ KV cache.
 
 ```
 # Original profiling
-PYTHONPATH=. python scripts/deep_profile_trajmem.py --bs 4
+PYTHONPATH=. python scripts/bench/deep_profile_trajmem.py --bs 4
 
 # New decomposition experiments
-PYTHONPATH=. python scripts/experiment_memory_cost.py
-PYTHONPATH=. python scripts/experiment_lm_context.py
-PYTHONPATH=. python scripts/experiment_compile_dynamic.py
+PYTHONPATH=. python scripts/bench/experiment_memory_cost.py
+PYTHONPATH=. python scripts/bench/experiment_lm_context.py
+PYTHONPATH=. python scripts/bench/experiment_compile_dynamic.py
 ```
 
 ---
@@ -382,6 +382,6 @@ PYTHONPATH=. python scripts/experiment_compile_dynamic.py
 ## Reproducing
 
 ```
-PYTHONPATH=. python scripts/deep_profile_trajmem.py --bs 2
-PYTHONPATH=. python scripts/deep_profile_trajmem.py --bs 2 --compile
+PYTHONPATH=. python scripts/bench/deep_profile_trajmem.py --bs 2
+PYTHONPATH=. python scripts/bench/deep_profile_trajmem.py --bs 2 --compile
 ```

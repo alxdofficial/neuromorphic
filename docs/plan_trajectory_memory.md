@@ -103,13 +103,22 @@ repeated visits.
 
 ### 2.1 Manifold
 
-Three tensors, fixed size:
+Five tensors, fixed size — two trainable parameters, three buffers:
 
 ```
 Manifold:
+    # Trainable parameters
     concept_ids    : [N, D_concept]    stable routing keys, only updated via backprop
-    concept_states : [N, D_concept]    volatile content, mutates on write visits
+    state_init     : [N, D_concept]    learnable reset content, used by reset_states()
+
+    # Non-persistent runtime buffer
+    concept_states : [N, D_concept]    volatile content; reset to state_init each sequence;
+                                       mutates on write visits within a sequence
+
+    # Persistent buffers (saved in state_dict)
     edge_indices   : [N, K_max]        sparse adjacency, fixed at init
+    usage_ema      : [N]               per-concept EMA of visit frequency (γ=0.99 decay);
+                                       drives dead-concept revival
 ```
 
 The id/state split has clean roles:
@@ -118,9 +127,18 @@ The id/state split has clean roles:
   through the neighbor-scoring paths. Never mutated by visits. Keeps
   "concept i" recognizable across training even when its state has been
   pushed around by aggressive plasticity.
+- **`state_init`** — learnable **reset content**. `concept_states` is
+  reset to `state_init` at every training sequence start (see
+  `Manifold.reset_states`). Backprop trains it to a "good default"
+  manifold seed.
 - **`concept_states`** — content **payload**. Mutated on every write visit
-  (persistent), and also receives backprop gradient through whatever paths
-  consume it. Carries the etched trace from past writes.
+  via functional `scatter_mean_states` (returns a new tensor, autograd-safe
+  across TBPTT windows). Non-persistent — not in state_dict, runtime-only.
+- **`usage_ema`** — per-concept visit-frequency EMA (γ=0.99 decay,
+  ~100-step horizon). Updated by `Manifold.record_visits()` after every
+  forward chunk. Drives the `revive_dead_concepts()` defense against
+  codebook collapse — concepts with usage below threshold get their `id`
+  and `state_init` rows replaced by jittered copies of high-usage concepts.
 - **`edge_indices`** — sparse adjacency, fixed at init via small-world
   ring rewire (Watts-Strogatz style): concepts laid out on a ring of size
   N; each concept's default neighbors are picked from within ±radius
@@ -165,12 +183,19 @@ The `EntryProjector` module (`src/trajectory_memory/read_module.py`) is
 + same `entry_mlp` for both heads:
 
 ```
-pooled = mean(prev_window_hiddens)                    # [D_lm]
-for j in 1..J:
-    Q_entry[j] = entry_proj(pooled, head_query[j])    # [D_concept]
-    score[j]   = Q_entry[j] @ concept_ids.T           # [N]
-    entry[j]   = gumbel_top1(score[j])                # discrete selection
+pooled = mean(prev_window_hiddens)                    # [BS, D_lm]
+Q_entry = entry_proj(pooled)                          # [BS, J, D_concept]
+                                                      #   internally: head_query broadcast over BS,
+                                                      #   then entry_mlp([pooled, head_query[j]])
+# L2-normalize both Q and K — cosine similarity, bounded ∈ [-1, 1].
+score   = F.normalize(Q_entry, dim=-1) @ concept_ids_normed.T   # [BS, J, N]
+entry   = gumbel_top1(score, tau)                               # [BS, J]
 ```
+
+(Note: `EntryProjector.forward(pooled)` takes only `pooled`. The J
+`head_query` rows are stored as a parameter inside the module and
+broadcast/concatenated with `pooled` internally — the caller doesn't
+pass `head_query` per-j.)
 
 **Why shared:** read at window d+1 and write at window d both pool the
 same hiddens (window d's). Shared projection ⇒ same address logits ⇒
@@ -201,13 +226,22 @@ for t in 1..K_read:
         )
         Q_t = MLP_step_read(current_state[j], history_attn, cross_attn)
 
-        # pure QK matmul: Q_t against neighbor id_vecs, no edge bias
-        nbr_ids = concept_ids[edge_indices[current[j]]]   # [K_max, D_concept]
-        next_logits = Q_t @ nbr_ids.T                     # [K_max]
-        next[j] = gumbel_top1(next_logits)                # discrete pick
+        # L2-normalized cosine routing — Q and concept_ids both normed,
+        # logits ∈ [-1, 1]. Stable Gumbel-τ semantics independent of
+        # magnitude drift on either side.
+        nbr_ids = concept_ids_normed[edge_indices[current[j]]]    # [K_max, D]
+        next_logits = F.normalize(Q_t, dim=-1) @ nbr_ids.T        # [K_max]
+        next[j] = gumbel_top1(next_logits)                        # discrete pick
 
-        # append raw state to visited list — no mutation
-        visited[j].append(concept_states[current[j]])
+        # append current state to visited list — no mutation
+        visited[j].append(current_state[j])
+
+        # IMPORTANT — differentiable soft-gather, not raw indexing:
+        # current_state[j] = sum_k(nbr_one_hot[j,k] * prev_states[nbr[j,k]])
+        # nbr_one_hot is the Gumbel-STE one-hot from next_logits, so
+        # gradient flows next_logits → Q_t → step_mlp. Raw integer
+        # indexing (concept_states[current[j]]) would dead-end the
+        # routing gradient.
         current[j] = next[j]
         current_state[j] = concept_states[current[j]]
 ```
@@ -221,11 +255,39 @@ for t in 1..K_read:
   inference.** Phase 1 needs Gumbel-STE so subsequent hops have a hard
   `current[j]` index for `concept_states[current[j]]` lookup. (Same
   trick graph_walker's Phase 1 already uses for walker routing.)
+- **Temperature schedule:** `tau` is exponentially decayed from
+  `tau_init=1.0` toward `tau_floor=0.5` over training (controlled by the
+  trainer). Passed as a 0-dim tensor (not a Python float) to avoid per-
+  step `torch.compile` recompiles on changing scalars.
 - Per-hop MLPs are shared across j; the j-divergence comes from per-j
   entry + per-j accumulated history, not per-j params.
 
 Output: stack visited lists → `[J, K_read, D_concept]` → flatten to
 `[J·K_read, D_concept]` for Llama.
+
+**Routing-collapse defenses (apply to both read and write).** Codebook-
+collapse failure modes — only a few concepts ever fire — are a known risk
+for any Gumbel-routed memory. Four layered defenses:
+
+1. **Switch-Transformer load-balance loss** (coef α=1e-2). Penalizes
+   non-uniform routing across concepts: `lb = N · Σ_i (f_i · P_i)`
+   where `f_i` is the fraction of samples routed to concept `i` (hard
+   selection, detached) and `P_i` is the mean softmax probability of `i`.
+   Minimized at uniform routing → 1; pinned at concentrated routing → N.
+2. **ST-MoE router z-loss** (coef β=1e-3). Penalizes saturated logits:
+   `z = mean(logsumexp(logits, dim=-1)^2)`. Keeps logits in a moderate
+   range, avoiding the "one concept wins everything" failure.
+3. **Dead-concept revival.** Every `revive_every` steps, concepts with
+   `usage_ema < revive_threshold` get their `concept_ids` and
+   `state_init` rows replaced by jittered copies of high-usage concepts.
+   Direct fix for VQ-VAE-style dead codes.
+4. **Tau floor.** The Gumbel temperature never drops below 0.5 — keeps
+   exploration alive late in training, prevents the routing from
+   becoming purely deterministic.
+
+Aux losses are computed by `routing_aux_losses()` in `read_module.py` and
+applied at both read and write paths. Average over D windows in
+`run_chunk` to keep chunk-level scale consistent.
 
 ### 2.3 Write module (end of window)
 
@@ -248,10 +310,10 @@ current_window_hiddens that next window's read will see as
 prev_window_hiddens):**
 
 ```
-pooled = mean(current_window_hiddens)
-for j in 1..J:
-    Q_entry[j] = entry_proj(pooled, head_query[j])   # same as read!
-    entry[j]   = gumbel_top1(Q_entry[j] @ concept_ids.T)
+pooled  = mean(current_window_hiddens)                # [BS, D_lm]
+Q_entry = entry_proj(pooled)                          # same module as read; [BS, J, D_concept]
+score   = F.normalize(Q_entry, dim=-1) @ concept_ids_normed.T   # [BS, J, N], cosine
+entry   = gumbel_top1(score, tau)                                # [BS, J]
 ```
 
 Note: surprise is no longer an input to entry routing — only to per-hop
@@ -262,30 +324,52 @@ read/write divergence pathology.
 **K_write autoregressive hops, all J batched:**
 
 ```
-for t in 1..K_write:
+for t in 0..K_write-1:
     for j in 1..J (batched):
-        history_attn = attn(
-            query=current_state[j],
-            keys/values=proposed[j][:t] + pos_enc[:t],
-        )
+        # history_attn input: at t=0 use current_state as a placeholder
+        # (no proposals yet); for t>0 stack the prior t proposed-states
+        # plus pos_enc[:t].
+        if t == 0:
+            hist_kv = current_state[j].unsqueeze(seq=1)
+        else:
+            hist_kv = stack(proposed[j][:t]) + pos_enc[:t]
+        history_attn = attn(query=current_state[j], keys/values=hist_kv)
+
         cross_attn = attn(
             query=current_state[j],
             keys/values=current_window_hiddens,
         )
-        Q_t = MLP_step_write(
-            current_state[j], history_attn, cross_attn, surprise,
-        )
+        step_input = concat(current_state[j], history_attn, cross_attn, surprise)
+        Q_t = step_mlp(step_input)
 
-        next_logits = Q_t @ concept_ids[edge_indices[current[j]]].T
-        next[j] = gumbel_top1(next_logits)
+        # L2-normalized cosine routing — concept_ids_normed bounds
+        # logits in [-1, 1]. Decouples selection from concept_ids
+        # magnitude drift (post-fix 2026-05-12). See §3.2.
+        next_logits = F.normalize(Q_t, dim=-1) @ concept_ids_normed[edge_indices[current[j]]].T
+        next[j] = gumbel_top1(next_logits, tau)
 
-        # produce proposed new state — do NOT write to manifold yet
-        new_state = mutate_write(
-            current_state[j], cross_attn, history_attn, surprise,
-        )
+        # State mutation — `nn.GRUCell` (replaced the previous
+        # `mutate_mlp + decay_gate` formulation 2026-05-12).
+        # GRUCell internally computes:
+        #     z         = σ(W_z·[step_input, current_state])    # update gate
+        #     r         = σ(W_r·[step_input, current_state])    # reset gate
+        #     candidate = tanh(W_h·[step_input, r * current_state])  # bounded
+        #     new_state = (1 - z) * current_state + z * candidate
+        # tanh bound on the candidate makes ||new_state|| ≤ √D = 16
+        # for D=256 — convex combination of bounded with bounded. Direct
+        # fix for the state-explosion bug seen in the previous decay-
+        # gated formulation (see commit 2026-05-12 + research_backlog
+        # item on state-drift bounding).
+        new_state = state_update(step_input, current_state[j])
+
         proposed[j].append((current[j], new_state))
         current[j] = next[j]
-        current_state[j] = concept_states[current[j]]   # raw lookup; pre-mutation values
+        # Differentiable soft-gather (NOT raw indexing) — same as read path:
+        # current_state[j] = Σ_k nbr_one_hot[j,k] * prev_states[nbr[j,k]]
+        # nbr_one_hot is the Gumbel-STE one-hot from next_logits, so
+        # gradient flows next_logits → Q_t → step_mlp. Using
+        # `concept_states[next[j]]` directly would dead-end the routing
+        # gradient and is what previously caused write-grad collapse.
 ```
 
 **Conflict resolution at end of write — functional scatter_mean:**
@@ -334,7 +418,12 @@ MemInjectLayer at layer L:
         keys   = read_trajectory,     # [BS, J·K_read, D_concept]
         values = read_trajectory,
     )
-    h' = h + scale * W_out(attn_out)
+    # Scale is tanh-clamped: effective_scale = scale_max · tanh(scale_raw)
+    # with scale_raw init'd to atanh(scale_init / scale_max). Bounds the
+    # injection magnitude so runaway gradients on scale can't trash
+    # Llama's residual stream (post-fix 2026-05-12).
+    effective_scale = scale_max · tanh(scale_raw)
+    h' = h + effective_scale * W_out(attn_out)
     orig_layer_L(h')                  (frozen)
   ▼
 layers L+1..N-1                        (frozen)
@@ -579,10 +668,11 @@ capacity at trivial perf cost):
 | Effective LM context  | 2048            | Sliding KV cache cap (was hard-trunc; now KV-cached) |
 | LR (memory params)    | **1.5e-4**      | Read+write modules + manifold (Tier 2 #8 — halved from 3e-4 for stability) |
 | LR (Llama-side adapters) | **5e-5**     | W_in, W_out, scale, cross-attn (halved from 1e-4) |
-| Mutation init scale   | 0.1             | `new = state + 0.1 · MLP(...)`   |
+| State update          | `nn.GRUCell`    | Per-hop state mutation in `write_module`. Replaced `mutate_mlp + decay_gate` 2026-05-12. Internally: `new = (1−z)·state + z·tanh(W·[step_input, r·state])`, with `z`, `r` learned per-element gates. tanh on candidate makes `‖state‖ ≤ √D = 16` for D=256 — convex-combination-of-bounded-with-bounded → architecturally drift-bounded. Replaces stale `mutation_init_scale` knob (kept in config for backward compat with old ckpts but unused). |
+| `state_init_norm`     | 1.0             | Target L2 norm of `state_init` at consumption (in `reset_states`). Prevents gradient-driven magnitude drift on the reset target from feeding into the manifold. |
 | Surprise pool         | weighted mean   | Per-token weighted CE → window scalar (writer input) |
 | `state_init`          | learnable `[N, D_concept]` | Reset target each sequence |
-| Trainable params      | **16.46M**      | bridge 9.44M + write 2.49M + read 2.43M + manifold 2.10M |
+| Trainable params      | **~17.3M**      | bridge 9.44M + write 2.69M + read 2.23M + manifold 2.10M + shared entry_proj 0.66M + MemInjectLayer cross-attn 0.20M (measured from `outputs/wave1/ckpt.pt` @ step 12K) |
 | `prior_loss_weight` (W2) | **0.1**      | NTP CE weight on prior tokens (B12). Was 0; matches §4.8 surprise table. |
 
 K scales with N if you sweep manifold size: rough rule `K ≈ √N / 4`. J
@@ -680,8 +770,12 @@ existing util). For a session of N assistant turns, generate N training
 examples, each `(prior, response)`. Filter for `len(prior) > 4K` so
 memory has work to do.
 
-Surprise: per-token NTP CE only on response tokens (data loader masks
-prior to 0). Prior tokens get TF-forwarded but contribute zero NTP loss.
+Surprise / NTP loss: response tokens get weight 1.0; prior tokens get
+weight `prior_loss_weight` (default **0.1** per §4.4, B12). With
+`prior_loss_weight=0.1`, prior tokens contribute 10% weight to both the
+loss and the surprise scalar — kept above zero so the model retains the
+prior NTP signal. Set to 0 explicitly via trainer arg if you want the
+old "response-tokens-only" behavior.
 
 Replaces graph_walker's W2 (was UltraChat).
 
@@ -927,7 +1021,7 @@ shared prefill + bigger K (4 → 16). See `docs/bench_results.md`.
 
 Trainer scaffolding lives in `src/trajectory_memory/training/`:
 `Phase1Trainer.step_wave1` / `step_wave2`, `Phase2Trainer.step`. Entry
-points `scripts/train_wave{1,2,3,4}.py`. Defaults: `--use-kv-cache`
+points `scripts/training/train_wave{1,2,3,4}.py`. Defaults: `--use-kv-cache`
 ON, `--compile` ON, `--temperature 0.7`, `--clip-eps 0.2`,
 `--kl-coef 0.001`.
 
@@ -1149,19 +1243,36 @@ New package `src/trajectory_memory/`:
 ```
 src/trajectory_memory/
 ├── __init__.py
-├── manifold.py             # Manifold class — concept_ids, concept_states, edge_indices
+├── manifold.py             # Manifold class — concept_ids, concept_states, edge_indices, usage_ema
 ├── read_module.py          # ReadTrajectoryGenerator — J parallel autoregressive
-├── write_module.py         # WriteTrajectoryGenerator — J parallel + scatter_mean persist + mutate_write
+├── write_module.py         # WriteTrajectoryGenerator — J parallel + scatter_mean persist + mutate_write + decay_gate
 ├── integrated_lm.py        # IntegratedLM with reused MemInjectLayer + surprise pooling
 ├── tbptt.py                # multi-window TBPTT scaffolding + checkpointing
-└── config.py               # TrajMemConfig + factories (small / medium / large)
+├── config.py               # TrajMemConfig + factories (small / medium / large)
+├── data/                   # streaming + tokenizer + chat + turn_pair + needle_haystack
+│   ├── chat.py
+│   ├── needle_haystack.py
+│   ├── streaming.py
+│   ├── tokenizer.py
+│   └── turn_pair.py
+└── training/               # phase 1 + phase 2 trainers, loaders, metrics, plotting
+    ├── checkpoint.py
+    ├── loaders.py
+    ├── lr_schedule.py
+    ├── metrics.py
+    ├── optim.py
+    ├── phase1.py
+    ├── phase2.py
+    ├── plotting.py
+    └── rewards.py
 
 tests/                      # at repo root, per project convention
 ├── test_trajectory_memory_manifold.py
 ├── test_trajectory_memory_read.py
 ├── test_trajectory_memory_write.py
 ├── test_trajectory_memory_smoke.py        # IntegratedLM + TBPTT (no Llama)
-└── test_trajectory_memory_surprise.py     # _compute_surprise math
+├── test_trajectory_memory_surprise.py     # _compute_surprise math
+└── test_trajectory_memory_training.py     # trainer scaffold + step_wave{1,2} smoke
 ```
 
 Reuse from existing code:
@@ -1225,7 +1336,7 @@ Landed in this repo (originally specced as future-ports from
 6. **Training loop** (LANDED): see
    `src/trajectory_memory/training/phase1.py` (Wave 1 + Wave 2) and
    `src/trajectory_memory/training/phase2.py` (Wave 3 + Wave 4 GRPO).
-   Entry scripts at `scripts/train_wave{1,2,3,4}.py`.
+   Entry scripts at `scripts/training/train_wave{1,2,3,4}.py`.
 
 7. **Telemetry** (LANDED): trajectory diversity, surprise distribution,
    inject SNR, per-component grad norms, throughput/VRAM, read/write
@@ -1549,7 +1660,7 @@ checkpointing):**
 Llama silently sets `use_cache=False` when gradient checkpointing is
 on, returning `past_key_values=None`. We picked the cache (~1.79×
 speedup, 5 GB less peak in practice) over the activation savings; see
-the NOTE in `scripts/train_wave1.py`. If a config-tier-large run
+the NOTE in `scripts/training/train_wave1.py`. If a config-tier-large run
 needs gradient checkpointing, it must also pass `--no-kv-cache`.
 
 The earlier "3.5–5 GB" estimate was the pre-KV-cache projection with

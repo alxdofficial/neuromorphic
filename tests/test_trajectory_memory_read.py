@@ -103,7 +103,8 @@ def test_read_module_construct():
 def test_read_module_forward_shapes_inference():
     cfg, m, states, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    visited, vids, _ = rm(prev_hid, states, m, hard=False)
+    with torch.no_grad():
+        visited, vids, _ = rm(prev_hid, states, m, hard=False)
     assert visited.shape == (2, cfg.J, cfg.K_read, cfg.D_concept)
     assert vids.shape == (2, cfg.J, cfg.K_read)
     assert vids.dtype == torch.int64
@@ -157,7 +158,8 @@ def test_read_module_visited_states_match_states_at_visited_ids():
     """visited[b, j, t] should equal states[b, visited_ids[b, j, t]]."""
     cfg, m, states, prev_hid = _small_setup(BS=2)
     rm = ReadTrajectoryGenerator(cfg)
-    visited, vids, _ = rm(prev_hid, states, m, hard=False)
+    with torch.no_grad():
+        visited, vids, _ = rm(prev_hid, states, m, hard=False)
     # In read path, visited list contains the RAW pre-mutation states.
     BS = 2
     for b in range(BS):
@@ -183,13 +185,57 @@ def test_read_module_j_trajectories_diverge():
     rm = ReadTrajectoryGenerator(cfg)
     for hard in (False, True):
         torch.manual_seed(42)
-        _, vids, _ = rm(prev_hid, states, m, hard=hard)
+        if not hard:
+            with torch.no_grad():
+                _, vids, _ = rm(prev_hid, states, m, hard=hard)
+        else:
+            _, vids, _ = rm(prev_hid, states, m, hard=hard)
         flattened = vids[0].tolist()                              # [J, K]
         distinct_paths = len({tuple(p) for p in flattened})
         assert distinct_paths >= 2, (
             f"hard={hard}: all J={cfg.J} trajectories produced the same path: "
             f"{flattened}"
         )
+
+
+def test_read_module_routing_depends_on_input():
+    """CONTENT-ADDRESSED MEMORY CONTRACT: different prev_window_hiddens
+    must produce different entry-concept selections. Otherwise routing
+    is ignoring the LM context and reading from a fixed lookup — which
+    is exactly the failure mode the Gumbel-noise bug caused
+    (r_uf=0.22 constant across 7K steps regardless of input).
+
+    Uses two distinct random LM contexts (more realistic than
+    zero-vs-constant, which could pass even if routing only reacts to
+    norm rather than direction)."""
+    cfg = TrajMemConfig.small()
+    cfg.J = 4
+    cfg.validate()
+    torch.manual_seed(0)
+    m = Manifold(cfg)
+    states = m.reset_states(batch_size=1)
+    rm = ReadTrajectoryGenerator(cfg)
+
+    # Two LM contexts from different random seeds — both standard-Gaussian
+    # so norms match (no shortcut via magnitude). The routing must
+    # respond to direction, not just scale.
+    g_a = torch.Generator().manual_seed(11)
+    g_b = torch.Generator().manual_seed(22)
+    prev_hid_a = torch.randn(1, cfg.T_window, cfg.d_lm, generator=g_a)
+    prev_hid_b = torch.randn(1, cfg.T_window, cfg.d_lm, generator=g_b)
+
+    with torch.no_grad():
+        _, vids_a, _ = rm(prev_hid_a, states, m, hard=False)
+        _, vids_b, _ = rm(prev_hid_b, states, m, hard=False)
+
+    entry_a = vids_a[0, :, 0].tolist()                            # [J] entry concepts
+    entry_b = vids_b[0, :, 0].tolist()
+    n_differ = sum(1 for a, b in zip(entry_a, entry_b) if a != b)
+    assert n_differ >= 1, (
+        f"Read routing ignored input direction: same entry concepts {entry_a} "
+        f"chosen for two random LM contexts. Architecture is not "
+        f"content-addressable. (This is the Gumbel-noise failure mode.)"
+    )
 
 
 # ── routing aux losses (Switch + ST-MoE) ────────────────────────────────

@@ -53,6 +53,21 @@ class Phase1Metrics:
     # If memory module silently collapses (scale → 0), inject_snr → 0.
     inject_norm: float = 0.0
     hidden_norm: float = 0.0
+    # Routing/bridge architectural-health scalars. Added after the
+    # Gumbel-noise bug — these surface the parameters whose values
+    # failed to learn during Wave 1, so a sustained-flat trace is a
+    # smoke alarm.
+    bridge_scale_raw_mean: float = 0.0      # MemInjectLayer.scale_raw.mean()
+    read_logit_scale: float = 0.0           # exp(read_module.logit_scale_raw)
+    write_logit_scale: float = 0.0          # exp(write_module.logit_scale_raw)
+    # Loss component breakdown — each is the post-coefficient
+    # contribution to `loss`, so they sum to `loss` (within rounding).
+    # Watching the relative magnitudes catches: (a) aux losses
+    # dominating CE (over-regularized to uniform routing), (b) CE
+    # diverging while aux stays flat, etc.
+    ntp_ce_loss: float = 0.0                # post-prior_loss_weight CE
+    aux_lb_loss: float = 0.0                # post-coef load_balance contribution
+    aux_z_loss: float = 0.0                 # post-coef z_loss contribution
 
 
 class Phase1Trainer:
@@ -117,6 +132,7 @@ class Phase1Trainer:
         # Default 0 preserves §4.5 behavior; recommended 0.1 for matching
         # plan §4.8 surprise table.
         self.prior_loss_weight = prior_loss_weight
+        self._warned_prior_loss_weight = False  # one-shot warn at step_wave2
         # Routing aux losses + revival + temp schedule.
         self.load_balance_coef = load_balance_coef
         self.z_loss_coef = z_loss_coef
@@ -212,15 +228,20 @@ class Phase1Trainer:
             tau=tau_eff,
         )
         loss = out["aggregate_loss"]
+        ntp_loss_value = float(loss.detach())
         # Switch-Transformer + ST-MoE routing aux losses. Coefficients are
         # the canonical values from those papers (1e-2 and 1e-3 respectively).
         # Skipped if forward_window didn't surface them (e.g., the rare test
         # path that bypasses both modules — defensive).
         aux_lb = out.get("aux_load_balance")
         aux_z = out.get("aux_z_loss")
+        aux_lb_value = 0.0
+        aux_z_value = 0.0
         if aux_lb is not None:
+            aux_lb_value = float(aux_lb.detach()) * self.load_balance_coef
             loss = loss + self.load_balance_coef * aux_lb
         if aux_z is not None:
+            aux_z_value = float(aux_z.detach()) * self.z_loss_coef
             loss = loss + self.z_loss_coef * aux_z
         loss.backward()
 
@@ -267,10 +288,22 @@ class Phase1Trainer:
         # B8 — inject SNR readout (cheap detached scalars).
         inj_norm = 0.0
         hid_norm = 0.0
+        bridge_scale_raw_mean = 0.0
         if self.model.llama is not None:
             mil = self.model._mem_inject_layer()
             inj_norm = float(mil._last_inj_norm.item())
             hid_norm = float(mil._last_hidden_norm.item())
+            bridge_scale_raw_mean = float(mil.scale_raw.detach().mean().item())
+
+        # Routing logit_scale telemetry — detects the Gumbel-noise-dominant
+        # routing pathology: if logit_scale doesn't grow above ~exp(1.5),
+        # cosine signal is being out-noised in the softmax temperature.
+        read_logit_scale = float(
+            self.model.read_module.logit_scale_raw.detach().exp().item()
+        )
+        write_logit_scale = float(
+            self.model.write_module.logit_scale_raw.detach().exp().item()
+        )
 
         return Phase1Metrics(
             loss=float(loss.detach()),
@@ -286,6 +319,12 @@ class Phase1Trainer:
             write_visited_ids=write_ids,
             inject_norm=inj_norm,
             hidden_norm=hid_norm,
+            bridge_scale_raw_mean=bridge_scale_raw_mean,
+            read_logit_scale=read_logit_scale,
+            write_logit_scale=write_logit_scale,
+            ntp_ce_loss=ntp_loss_value,
+            aux_lb_loss=aux_lb_value,
+            aux_z_loss=aux_z_value,
         )
 
     # ── Wave 2: long-chat TF NTP (TurnPair) ───────────────────────────
@@ -298,6 +337,18 @@ class Phase1Trainer:
         chunk boundary, accumulates loss across chunks, single backward
         per example.
         """
+        if not self._warned_prior_loss_weight and self.prior_loss_weight == 0.0:
+            self._warned_prior_loss_weight = True
+            import warnings
+            warnings.warn(
+                "step_wave2() with prior_loss_weight=0: prior tokens "
+                "contribute zero CE → memory writes during the prior get "
+                "no gradient signal (per-chunk backward + detach cuts "
+                "the path before response loss arrives). Recommended: "
+                "pass prior_loss_weight=0.1 to Phase1Trainer (the "
+                "train_wave2.py script default).",
+                stacklevel=2,
+            )
         cfg = self.model.cfg
         BS = batch.prior_ids.shape[0]
         device = batch.prior_ids.device
@@ -399,6 +450,16 @@ class Phase1Trainer:
                 # Test-mode fallback — no chunk_ce_sum surfaced; revert to
                 # the previous chunk-equal pattern.
                 chunk_loss = out["aggregate_loss"] / n_chunks
+            # Mirror Wave 1's aux-loss handling — without this Wave 2
+            # backprops only CE, leaving routing unregularized
+            # (load-balance + z-loss) on long-chat data. The Wave 1
+            # loop adds them at line ~240.
+            aux_lb = out.get("aux_load_balance")
+            aux_z = out.get("aux_z_loss")
+            if aux_lb is not None:
+                chunk_loss = chunk_loss + self.load_balance_coef * aux_lb
+            if aux_z is not None:
+                chunk_loss = chunk_loss + self.z_loss_coef * aux_z
             # Per-chunk backward — accumulates grad into optimizer's
             # buffers, releases this chunk's activations before the next
             # chunk allocates its own.

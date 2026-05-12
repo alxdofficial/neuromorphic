@@ -16,10 +16,12 @@ analysis.
 
 ```
 src/trajectory_memory/    — core architecture (manifold, read/write modules,
-                            IntegratedLM, TBPTT)
+                            IntegratedLM, TBPTT) plus data/ + training/ subpackages
 src/pretrained/           — reused Llama host adapters + MemInjectLayer
 tests/                    — unit + smoke tests for the trajectory modules
-docs/                     — design, plan, training notes
+scripts/                  — entry points (training/, data/, bench/, diagnostics/)
+                            see scripts/README.md
+docs/                     — design, plan, eval, bench results, research backlog
 ```
 
 ## Tests

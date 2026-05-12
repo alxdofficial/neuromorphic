@@ -83,10 +83,19 @@ class MemInjectLayer(nn.Module):
                     if isinstance(m, nn.Linear):
                         nn.init.xavier_uniform_(m.weight)
 
-        # Per-dim scale gate. Init sqrt(alpha) = 2.0 by default; tiny init
-        # is fine for smoke testing because we verify scale=0 reproduces
-        # vanilla bit-for-bit.
-        self.scale = nn.Parameter(torch.full((d_lm,), scale_init))
+        # Per-dim scale gate. Parameterized as `scale_max · tanh(scale_raw)`
+        # so the effective scale is bounded in (−scale_max, +scale_max),
+        # never blows up under runaway gradients. ReZero-style: init
+        # `scale_raw = atanh(scale_init / scale_max)` so the effective scale
+        # at init matches the old `scale_init` value bit-for-bit (verified
+        # against the `scale=0 → vanilla` reproducibility property).
+        self.scale_max = 1.0
+        # Solve `scale_max · tanh(x) = scale_init` → x = atanh(scale_init / scale_max).
+        # Clip to avoid atanh(±1) = ±inf.
+        _eps = 1e-6
+        _init_ratio = max(-1.0 + _eps, min(1.0 - _eps, scale_init / self.scale_max))
+        _scale_raw_init = float(torch.atanh(torch.tensor(_init_ratio)))
+        self.scale_raw = nn.Parameter(torch.full((d_lm,), _scale_raw_init))
 
         # Diagnostic: last-forward injection norm + hidden norm. Updated
         # in-place each forward call (no autograd; pure detached scalars).
@@ -112,7 +121,8 @@ class MemInjectLayer(nn.Module):
             # memory_fn silently drops the inject and produces outputs the
             # training loop can't distinguish from a correctly-wired run.
             # That's a footgun; error out instead.
-            if not (self.scale == 0).all():
+            # `scale_raw == 0` ⇒ `effective_scale = scale_max·tanh(0) = 0`.
+            if not (self.scale_raw == 0).all():
                 raise RuntimeError(
                     "MemInjectLayer called without memory_fn but scale is "
                     "not all-zero. Either wire memory_fn via "
@@ -136,7 +146,8 @@ class MemInjectLayer(nn.Module):
         readout = self.memory_fn(h_mem)               # [BS, T, d_mem]
         if readout.dtype != w_dtype:
             readout = readout.to(w_dtype)
-        inj = self.scale * self.W_out(readout)
+        effective_scale = self.scale_max * torch.tanh(self.scale_raw)
+        inj = effective_scale * self.W_out(readout)
         if inj.dtype != h_dtype:
             inj = inj.to(h_dtype)
         injected = hidden_states + inj

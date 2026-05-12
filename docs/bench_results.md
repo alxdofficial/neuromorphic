@@ -11,7 +11,7 @@ graph_walker's measurements (see `abandoned/graph-walker` →
 trajectory-memory specifically.
 
 Run benches via:
-- `scripts/bench_trajmem.py` — Phase 1 (Wave 1 long-doc TF NTP) bench.
+- `scripts/bench/bench_trajmem.py` — Phase 1 (Wave 1 long-doc TF NTP) bench.
   Default sweeps BS via doubling from `--bs` anchor until OOM, picks
   peak. Pass `--no-sweep` for a fixed-BS run.
 
@@ -234,7 +234,7 @@ samples** for Phase 2.
 - T2 vs V2: **1.23×** — smaller relative slowdown because Phase 2 is
   dominated by serial AR sampling (no KV cache in either path).
 
-**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py --bs 2 \
+**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py --bs 2 \
 --t-phase1 1024 --t-prompt 1024 --t-gen 64 --num-samples 4`
 
 **Notes:**
@@ -252,7 +252,7 @@ Replaces the BS=2/K=4 shared-shape table above with a more honest
 "each path at its own max-fitting size" comparison (per the project
 convention "Bench at each path's own optimal BS"). Same hardware,
 same medium config, eager mode. Per-path BS / K values are
-hard-coded in `scripts/bench_compare.py`.
+hard-coded in `scripts/bench/bench_compare.py`.
 
 | Path | BS / K | tok/s | peak GB | ms/iter |
 |------|-------:|------:|--------:|--------:|
@@ -286,7 +286,7 @@ that's mostly the per-window Llama forward re-encoding the rolling
 LM context buffer (no sliding KV cache yet — see "Optimization
 candidates" below).
 
-**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
 
 ### Why is T1 ~1.7× slower than V1.B?
 
@@ -372,7 +372,7 @@ prior measurement bottleneck (rolling buffer re-encoding per window)
 turned out to be the entire architectural cost; sliding KV cache made
 it disappear.
 
-**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
 
 ### Phase 2 architectural fix bundled with KV cache
 
@@ -462,13 +462,13 @@ the audit flagged as too noisy for stable GRPO.
 
 Surfaced in trainer log lines.
 
-**Reproducing:** `PYTHONPATH=. python scripts/bench_compare.py`
+**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
 
 ## Cross-references
 
-- `scripts/bench_trajmem.py` — Phase 1 sweep harness
-- `scripts/bench_compare.py` — Phase 1 + Phase 2 vs vanilla comparison
-- `scripts/_bench_common.py` — `bench()` timing primitive (warmup, sync,
+- `scripts/bench/bench_trajmem.py` — Phase 1 sweep harness
+- `scripts/bench/bench_compare.py` — Phase 1 + Phase 2 vs vanilla comparison
+- `scripts/bench/_bench_common.py` — `bench()` timing primitive (warmup, sync,
   OOM cleanup, peak-mem stats)
 - graph_walker's `docs/bench_results.md` (on `abandoned/graph-walker`) —
   reference numbers for an architecture with similar memory bridge.

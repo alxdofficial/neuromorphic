@@ -178,7 +178,10 @@ def test_manifold_reset_states_per_batch():
     assert states.shape == (BS, cfg.N, cfg.D_concept)
     # All batch elements should be initialized identically (broadcast)
     assert torch.allclose(states[0], states[1])
-    assert torch.allclose(states[0], m.state_init)
+    # Returned states are L2-normalized state_init at `cfg.state_init_norm`,
+    # NOT the raw `state_init` parameter (consumption-site normalization
+    # prevents unbounded state_init drift from feeding into the manifold).
+    assert torch.allclose(states[0], m.state_init_normed)
 
 
 def test_manifold_reset_states_grad_flows_to_state_init():
@@ -207,8 +210,8 @@ def test_manifold_gather_states():
     concept_id = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64)
     gathered = m.gather_states(states, concept_id)
     assert gathered.shape == (BS, 3, cfg.D_concept)
-    assert torch.allclose(gathered[0, 0], m.state_init[0])
-    assert torch.allclose(gathered[1, 2], m.state_init[5])
+    assert torch.allclose(gathered[0, 0], m.state_init_normed[0])
+    assert torch.allclose(gathered[1, 2], m.state_init_normed[5])
 
 
 def test_manifold_write_states_returns_new_tensor():
@@ -222,7 +225,7 @@ def test_manifold_write_states_returns_new_tensor():
     assert new.shape == prev.shape
     assert new is not prev  # new tensor
     # And m.concept_states (the buffer) should NOT have been touched.
-    assert torch.allclose(m.concept_states, m.state_init.detach())
+    assert torch.allclose(m.concept_states, m.state_init_normed.detach())
 
 
 # ── usage tracking + dead-code revival (VQ-VAE pattern) ─────────────────

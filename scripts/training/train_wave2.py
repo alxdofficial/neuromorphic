@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo  # noqa: F401 — needed for torch._dynamo.config access
 
 from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.data.tokenizer import get_tokenizer
@@ -92,15 +93,11 @@ def main():
 
     model = IntegratedLM(cfg, model_name=args.model_name, attach_lm=True).to(args.device)
     if args.compile:
-        # dynamic=False — dynamic=True triggers an AOT autograd partitioner
-        # bug (`AssertionError: Node add_NNNN was invalid, but is output`)
-        # under bf16 autocast + trajectory-generator AC. Same fix that
-        # train_wave1.py applied. KV cache mode keeps lm_input_ids at a
-        # fixed T_window=256 anyway, so dynamic=False has no downside here.
-        model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=False,
-        )
-        print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
+        # See train_wave1.py + IntegratedLM.compile_inner_modules for
+        # rationale. Inner modules (read/write/mem_inject) have stable
+        # shapes and compile cleanly; forward_window orchestrator does not.
+        model.compile_inner_modules()
+        print("Compiled inner modules (read/write/mem_inject). Cold-start ~1-2 min.")
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
     scheduler = WarmupCosineScheduler(
         optimizer,

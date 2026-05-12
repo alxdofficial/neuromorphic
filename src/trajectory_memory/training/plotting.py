@@ -32,12 +32,29 @@ from pathlib import Path
 from typing import Any
 
 
-def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
+def save_training_plots(
+    history: dict[str, Any],
+    output_path: Path,
+    *,
+    routing_uniform_baseline: float | None = None,
+    vanilla_floor: float | None = None,
+) -> None:
     """Render multi-panel training plot to `output_path` (PNG).
 
     Imports matplotlib lazily so the dependency is optional. If
     matplotlib isn't installed, the call is a no-op (the JSON dump
     still happens via `dump_history_json`).
+
+    Args:
+        routing_uniform_baseline: expected `read_unique_frac` under
+            uniform-random routing. Drawn as a dashed horizontal line
+            on the trajectory-diversity panel. If `r_uf` flatlines at
+            this value, routing isn't depending on input (the Gumbel-
+            noise bug). Compute as `1 - ((N-1)/N) ** (BS*J*K*D)` for
+            the trainer's config.
+        vanilla_floor: vanilla Llama bulk-token NTP CE on the same
+            data. Drawn as a dashed horizontal line on val_loss. Tells
+            us how close memory is to "not hurting."
     """
     try:
         import matplotlib
@@ -55,17 +72,38 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     fig, axes = plt.subplots(4, 3, figsize=(15, 16))
     steps = history.get("step", [])
 
-    # ── 1. Train loss ────────────────────────────────────────────────
+    # ── 1. Train loss — total + component breakdown ─────────────────
+    # The 3 components (NTP CE, aux load_balance, aux z_loss) are
+    # already coefficient-multiplied, so they sum to total `loss`.
+    # Watching the breakdown catches: aux losses dominating CE
+    # (over-regularized to uniform routing) or CE diverging while aux
+    # stays flat (memory injecting noise that Llama can't suppress).
     ax = axes[0, 0]
     if steps and "loss" in history:
-        ax.plot(steps, history["loss"], alpha=0.3, label="loss", linewidth=0.8)
-        # Running window-32 mean for readability over noisy per-step loss.
         if len(steps) >= 8:
             window = max(8, len(steps) // 50)
             avg = _running_mean(history["loss"], window)
-            ax.plot(steps, avg, label=f"avg{window}", color="C0")
+            ax.plot(steps, avg, label=f"total (avg{window})", color="black",
+                    linewidth=1.5)
+        else:
+            ax.plot(steps, history["loss"], label="total", color="black")
+        for key, color, label in [
+            ("ntp_ce_loss", "C0", "NTP CE"),
+            ("aux_lb_loss", "C1", "load_balance"),
+            ("aux_z_loss", "C2", "z_loss"),
+        ]:
+            vals = history.get(key, [])
+            if not vals:
+                continue
+            if len(steps) >= 8:
+                window = max(8, len(steps) // 50)
+                vals_smooth = _running_mean(vals, window)
+            else:
+                vals_smooth = vals
+            ax.plot(steps[:len(vals_smooth)], vals_smooth,
+                    label=label, color=color, alpha=0.8)
         ax.legend(loc="upper right", fontsize=8)
-    ax.set_title("Train loss (all sources)")
+    ax.set_title("Train loss — components sum to total")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
@@ -83,8 +121,12 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
             ax.plot(val_step[:len(vals)], vals, marker="o", markersize=3,
                     label=label,
                     linewidth=2.0 if "needle" in source.lower() else 1.0)
+        if vanilla_floor is not None:
+            ax.axhline(y=vanilla_floor, color="gray", linestyle="--",
+                       alpha=0.6,
+                       label=f"vanilla Llama floor ({vanilla_floor:.2f})")
         ax.legend(loc="upper right", fontsize=8)
-    ax.set_title("Val loss (needle = memory-bridging probe)")
+    ax.set_title("Val loss — distance to vanilla floor = memory cost")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
@@ -155,6 +197,10 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     ax.grid(alpha=0.3)
 
     # ── 7. Trajectory diversity ──────────────────────────────────────
+    # Healthy specialization: r_uf BELOW the uniform-random baseline
+    # (concepts are re-visited because they're meaningful), not at it.
+    # Above the baseline = routing more diverse than random (rare).
+    # Right at the baseline = the Gumbel-noise bug (routing is random).
     ax = axes[2, 0]
     if steps and "read_unique_frac" in history:
         ax.plot(steps[:len(history["read_unique_frac"])],
@@ -162,10 +208,14 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     if steps and "write_unique_frac" in history:
         ax.plot(steps[:len(history["write_unique_frac"])],
                 history["write_unique_frac"], label="write")
+    if routing_uniform_baseline is not None:
+        ax.axhline(y=routing_uniform_baseline, color="red", linestyle="--",
+                   alpha=0.6,
+                   label=f"uniform-random ({routing_uniform_baseline:.3f})")
     if "read_unique_frac" in history or "write_unique_frac" in history:
         ax.legend(loc="upper right", fontsize=8)
         ax.set_ylim(0, 1)
-    ax.set_title("Trajectory diversity (unique concepts visited / N)")
+    ax.set_title("Trajectory diversity — at red line = random routing")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
@@ -178,12 +228,30 @@ def save_training_plots(history: dict[str, Any], output_path: Path) -> None:
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 
-    # ── 9. VRAM peak ─────────────────────────────────────────────────
+    # ── 9. Architectural-health scalars ──────────────────────────────
+    # Three params that must move from init for training to work:
+    #   - bridge scale_raw mean (should drift from `scale_init` as the
+    #     bridge learns whether/how much to use memory)
+    #   - read/write logit_scale (cosine→softmax temperature; if stuck
+    #     near exp(init), softmax may still be too flat to specialize)
+    # Flat traces here = the Gumbel-noise / aux-loss bugs re-emerging.
     ax = axes[2, 2]
-    if steps and "vram_peak_gb" in history:
-        ax.plot(steps[:len(history["vram_peak_gb"])],
-                history["vram_peak_gb"], color="C5")
-    ax.set_title("VRAM peak (GB)")
+    if steps and "bridge_scale_raw_mean" in history:
+        ax.plot(steps[:len(history["bridge_scale_raw_mean"])],
+                history["bridge_scale_raw_mean"],
+                label="bridge scale_raw mean", color="C0")
+    if steps and "read_logit_scale" in history:
+        ax.plot(steps[:len(history["read_logit_scale"])],
+                history["read_logit_scale"],
+                label="read logit_scale (exp)", color="C1")
+    if steps and "write_logit_scale" in history:
+        ax.plot(steps[:len(history["write_logit_scale"])],
+                history["write_logit_scale"],
+                label="write logit_scale (exp)", color="C2")
+    if (steps and ("bridge_scale_raw_mean" in history
+                   or "read_logit_scale" in history)):
+        ax.legend(loc="upper left", fontsize=8)
+    ax.set_title("Bridge gate + routing logit_scale (must move from init)")
     ax.set_xlabel("step")
     ax.grid(alpha=0.3)
 

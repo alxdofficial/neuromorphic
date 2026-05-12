@@ -107,6 +107,31 @@ def _detach_kv_cache(cache):
     return cache
 
 
+def _crop_kv_cache(cache, max_length: int):
+    """Crop each layer's K/V tensors to the last `max_length` positions.
+
+    Enforces `cfg.effective_lm_context` as a sliding-window cap on Llama's
+    attention. Without this, our KV-cache-mode training lets Llama see the
+    entire doc (cache grows unbounded), so memory has no functional role.
+    Cropping makes the cap effective and forces memory to carry info past
+    the LM's attention range.
+
+    Idempotent: if cache length is already ≤ max_length, no-op. Called
+    after each `forward_window`'s Llama forward in KV-cache mode.
+    """
+    if cache is None or max_length <= 0:
+        return cache
+    for layer in cache.layers:
+        if not layer.is_initialized:
+            continue
+        seq_len = layer.keys.shape[-2]
+        if seq_len > max_length:
+            # keys/values shape: [BS, n_heads, seq, head_dim]
+            layer.keys = layer.keys[..., -max_length:, :]
+            layer.values = layer.values[..., -max_length:, :]
+    return cache
+
+
 def run_chunk(
     model: IntegratedLM,
     windows: Tensor,

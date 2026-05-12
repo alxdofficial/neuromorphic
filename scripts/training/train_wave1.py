@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo  # noqa: F401 — needed for torch._dynamo.config access below
 from torch.utils.data import DataLoader
 
 from src.trajectory_memory.config import TrajMemConfig
@@ -165,10 +166,14 @@ def main():
         # trajectory generators: `AssertionError: Node add_NNNN was
         # invalid, but is output` from `min_cut_rematerialization_partition`.
         # dynamic=False avoids the bug and is faster.
-        model.forward_window = torch.compile(
-            model.forward_window, mode="default", dynamic=False,
-        )
-        print("Compiled model.forward_window (cold-start on first step ~1-3 min).")
+        # Compile the INNER modules, not the orchestrator. forward_window
+        # has 64+ distinct input signatures (None-or-tensor inputs,
+        # train/val grad, KV-cache fill states) which thrashes dynamo.
+        # Inner modules (read_module, write_module, MemInjectLayer) have
+        # 1-2 variants each and compile cleanly. See
+        # IntegratedLM.compile_inner_modules docstring + profile_analysis.md.
+        model.compile_inner_modules()
+        print("Compiled inner modules (read/write/mem_inject). Cold-start ~1-2 min.")
 
     optimizer = build_optimizer(model, lr_memory=args.lr_memory, lr_adapter=args.lr_adapter)
     scheduler = WarmupCosineScheduler(
@@ -535,6 +540,21 @@ def main():
             history.setdefault("inject_norm", []).append(inj)
             history.setdefault("hidden_norm", []).append(hid)
             history.setdefault("inject_snr", []).append(inj / max(hid, 1e-9))
+            # Architectural-health scalars (added after the Gumbel-noise
+            # bug). Flat traces = the bugs we just fixed re-emerging.
+            history.setdefault("bridge_scale_raw_mean", []).append(
+                metrics.bridge_scale_raw_mean,
+            )
+            history.setdefault("read_logit_scale", []).append(
+                metrics.read_logit_scale,
+            )
+            history.setdefault("write_logit_scale", []).append(
+                metrics.write_logit_scale,
+            )
+            # Loss component breakdown (sums to `loss`).
+            history.setdefault("ntp_ce_loss", []).append(metrics.ntp_ce_loss)
+            history.setdefault("aux_lb_loss", []).append(metrics.aux_lb_loss)
+            history.setdefault("aux_z_loss", []).append(metrics.aux_z_loss)
             # B9 — trajectory diversity (read + write paths).
             if metrics.read_visited_ids is not None:
                 rs = trajectory_diversity_stats(metrics.read_visited_ids, cfg.N)
@@ -684,7 +704,20 @@ def main():
             # ── Live plot refresh (time-based, default 3 min) ─────
             if args.plot_path is not None:
                 if now - last_plot_t > args.plot_every_seconds:
-                    save_training_plots(history, args.plot_path)
+                    # Uniform-random routing baseline for the r_uf panel.
+                    # Total per-step visits across BS docs × J trajectories
+                    # × K_read hops × D windows = effective draws over N
+                    # concepts (without replacement is wishful; treat as
+                    # with-replacement which slightly overestimates). The
+                    # Gumbel-noise bug had r_uf flatlined exactly here.
+                    visits = (cfg.D * cfg.J * cfg.K_read
+                              * args.batch_size)
+                    uniform_baseline = 1.0 - ((cfg.N - 1) / cfg.N) ** visits
+                    save_training_plots(
+                        history, args.plot_path,
+                        routing_uniform_baseline=uniform_baseline,
+                        vanilla_floor=2.44,  # measured in baseline_numbers.md
+                    )
                     json_path = args.plot_path.with_suffix(".json")
                     dump_history_json(history, json_path)
                     last_plot_t = now

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from src.trajectory_memory.config import TrajMemConfig
@@ -218,11 +219,13 @@ class Manifold(nn.Module):
             state_init.normal_(0.0, state_init_std, generator=gen_c)
         self.state_init = nn.Parameter(state_init)
 
-        # concept_states: activation-like, starts at state_init's value.
+        # concept_states: activation-like, starts at the L2-normalized
+        # `state_init`'s value (matches what `reset_states()` returns).
         # Held as a non-persistent buffer so state-dict checkpoints don't
         # save activation snapshots; only state_init persists.
+        _init_state = F.normalize(state_init, dim=-1) * cfg.state_init_norm
         self.register_buffer(
-            "concept_states", state_init.detach().clone(),
+            "concept_states", _init_state.detach().clone(),
             persistent=False,
         )
 
@@ -247,8 +250,31 @@ class Manifold(nn.Module):
 
     # ── reset semantics ──────────────────────────────────────────────
 
+    @property
+    def state_init_normed(self) -> Tensor:
+        """L2-normalized `state_init` at the configured target norm.
+
+        Consumption-site normalization: keeps reset-state magnitude
+        bounded regardless of how the optimizer evolves the raw
+        parameter. Gradient flows back to the raw `state_init`
+        (`F.normalize` is differentiable).
+        """
+        return F.normalize(self.state_init, dim=-1) * self.cfg.state_init_norm
+
+    @property
+    def concept_ids_normed(self) -> Tensor:
+        """L2-normalized `concept_ids`. Consume this at every routing
+        dot-product so logits live in [-1, 1] (cosine similarity).
+
+        Decouples routing from concept_ids magnitude — a concept can't
+        dominate selection just by growing its norm. Also makes the
+        Gumbel temperature `tau` semantically stable across training.
+        """
+        return F.normalize(self.concept_ids, dim=-1)
+
     def reset_states(self, batch_size: int | None = None) -> Tensor:
-        """Reset `concept_states` to `state_init`. Called at sequence start.
+        """Reset `concept_states` to (normalized) `state_init`. Called at
+        sequence start.
 
         If batch_size is provided, returns a per-batch state tensor of
         shape [BS, N, D_concept] — used inside TBPTT where each batch
@@ -257,13 +283,14 @@ class Manifold(nn.Module):
         If batch_size is None, mutates the buffer in place (useful for
         single-stream inference) and returns it.
         """
+        init = self.state_init_normed
         if batch_size is None:
             with torch.no_grad():
-                self.concept_states.copy_(self.state_init)
+                self.concept_states.copy_(init)
             return self.concept_states
         else:
             # Broadcast to [BS, N, D]; keep gradient flowing through state_init.
-            return self.state_init.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+            return init.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
 
     # ── usage tracking + dead-code revival ────────────────────────────
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from src.trajectory_memory.config import TrajMemConfig
@@ -23,6 +24,7 @@ from src.trajectory_memory.read_module import (
     _CrossAttn,
     EntryProjector,
     gumbel_top1_ste,
+    softmax_top1_ste,
     make_pos_enc,
     per_j_attn,
     routing_aux_losses,
@@ -72,54 +74,37 @@ class WriteTrajectoryGenerator(nn.Module):
             nn.Linear(D, D, bias=True),
         )
 
-        # mutate_write MLP — produces the candidate write.
-        # Original: `new = state + mutation_init_scale * mutate_mlp(...)`
-        # Replaced with gated convex combination (see decay_gate below):
-        #   `new = α·state + (1−α)·(mutation_scale * mutate_mlp(...))`
-        # This bounds state magnitude — the original additive update had
-        # NO bound on accumulated state and collapsed routing at step ~900
-        # under TXL-style continuous training (see commit msg for fix #4
-        # follow-up). Mutation_scale on the candidate keeps the early-
-        # training behavior close to the original (small writes at init)
-        # while α handles forgetting.
-        self.mutate_mlp = nn.Sequential(
-            nn.Linear(D * 3 + 1, D, bias=True),
-            nn.GELU(),
-            nn.Linear(D, D, bias=True),
-        )
-        self.mutation_scale = cfg.mutation_init_scale
-
-        # Learnable decay gate — per-trajectory-hop sigmoid α ∈ [0, 1].
-        # α = 1 → fully retain old state; α = 0 → fully overwrite with
-        # candidate. The bias is initialized to reproduce the
-        # pre-decay-gate update rate: legacy was `new = old + s·mlp(...)`
-        # which is equivalent (in steady-state magnitude terms) to
-        # `new = α_target · old + (1-α_target) · candidate` with
-        #     α_target = 1 / (1 + s).
-        # Inverting the sigmoid gives the right bias:
-        #     bias = logit(α_target) = log(α_target / (1 - α_target))
-        #          = log(1/s) = -log(s).
-        # For s = mutation_init_scale = 0.1 this gives bias = log(10) ≈ 2.30.
-        # Decay-gate output sits near α_target at init; over training,
-        # the model can lower α (forget more on surprising windows) or
-        # raise it (preserve state where doing so helps the LM loss).
-        self.decay_gate = nn.Sequential(
-            nn.Linear(D * 3 + 1, D, bias=True),
-            nn.GELU(),
-            nn.Linear(D, 1, bias=True),
-        )
-        import math as _math
-        _decay_bias_init = -_math.log(self.mutation_scale)
-        nn.init.constant_(self.decay_gate[-1].bias, _decay_bias_init)
-        # Zero out the final-layer weights so the bias dominates at init
-        # (otherwise random initialization produces α with high variance
-        # across hops, destabilizing the first few training steps).
-        nn.init.zeros_(self.decay_gate[-1].weight)
+        # State update — `nn.GRUCell` replaces the previous
+        # mutate_mlp + decay_gate combo. GRUCell does:
+        #
+        #     z       = sigmoid(W_z · [step_input, current_state])   # update gate
+        #     r       = sigmoid(W_r · [step_input, current_state])   # reset gate
+        #     candidate = tanh(W_h · [step_input, r * current_state])  # bounded
+        #     new     = (1 - z) * current_state + z * candidate
+        #
+        # The previous additive-then-blend formulation had an unbounded
+        # candidate (`mutation_scale * mlp(...)`) — over many writes the
+        # convex combination still accumulated drift since `current_state`
+        # could grow unboundedly. GRUCell's tanh bound on the candidate
+        # makes `||current_state|| <= 1` by induction (convex combination
+        # of bounded with bounded). Direct fix for the step-14564
+        # drift bug in the Wave 1 run.
+        #
+        # Input size: same as before — concat[current_state(D),
+        # history_attn(D), cross_attn(D), surprise(1)] = 3D + 1.
+        self.state_update = nn.GRUCell(input_size=D * 3 + 1, hidden_size=D)
 
         # Positional encoding for visited list inside trajectory.
         # Size K_write: indexed up to pos_enc[:K_write] in the longest hop.
         pe = make_pos_enc(cfg.K_write, D) * cfg.pos_enc_scale
         self.register_buffer("pos_enc", pe, persistent=False)
+
+        # Learnable logit scale (CLIP-style). Same rationale as read_module:
+        # cosine routing produces logits in [-1, 1]; need scaling for the
+        # softmax to be selective. See read_module for full reasoning.
+        self.logit_scale_raw = nn.Parameter(
+            torch.tensor(float(cfg.logit_scale_init))
+        )
 
     def forward(
         self,
@@ -175,13 +160,22 @@ class WriteTrajectoryGenerator(nn.Module):
         # the J-broadcast materialization.
         cross_K, cross_V = self.cross_attn.precompute_kv(current_window_hiddens)
 
-        ids = manifold.concept_ids
-        entry_logits = torch.einsum("bjd,nd->bjn", Q_entry, ids)
-        entry_one_hot, entry_idx = gumbel_top1_ste(
-            entry_logits, tau_eff, hard=hard,
+        # Cosine routing for entry (was raw dot product; this lets the same
+        # learnable logit_scale govern signal-to-noise as in read_module).
+        ids_normed = manifold.concept_ids_normed
+        entry_logits_raw = torch.einsum(
+            "bjd,nd->bjn", F.normalize(Q_entry, dim=-1), ids_normed,
+        )                                                         # ∈ [-1, 1]
+        eff_scale = self.logit_scale_raw.exp().clamp(max=20.0)
+        entry_logits = entry_logits_raw * eff_scale
+        entry_one_hot, entry_idx = softmax_top1_ste(
+            entry_logits, hard=hard,
         )                                                         # [BS, J, N], [BS, J]
-        # Routing aux losses — accumulated across entry + K_write hops.
-        _aux_e = routing_aux_losses(entry_logits, entry_one_hot)
+        # Routing aux losses — z_loss on the unscaled cosine to avoid
+        # fighting logit_scale_raw growth.
+        _aux_e = routing_aux_losses(
+            entry_logits, entry_one_hot, z_loss_logits=entry_logits_raw,
+        )
         aux_lb_total = _aux_e["load_balance"]
         aux_z_total = _aux_e["z_loss"]
 
@@ -228,28 +222,34 @@ class WriteTrajectoryGenerator(nn.Module):
             Q_t = self.step_mlp(step_input)                       # [BS, J, D]
 
             nbr_idx = manifold.get_neighbor_indices(current)
-            nbr_ids = manifold.concept_ids[nbr_idx]               # [BS, J, K_max, D]
-            nbr_logits = torch.einsum("bjd,bjkd->bjk", Q_t, nbr_ids)
-            nbr_one_hot, next_local = gumbel_top1_ste(
-                nbr_logits, tau_eff, hard=hard,
+            # L2-normalized routing: cosine similarity, bounded ∈ [-1, 1].
+            # Decouples next-hop selection from concept_ids magnitude
+            # so the Gumbel τ schedule operates on a stable scale.
+            nbr_ids = manifold.concept_ids_normed[nbr_idx]        # [BS, J, K_max, D]
+            nbr_logits_raw = torch.einsum(
+                "bjd,bjkd->bjk", F.normalize(Q_t, dim=-1), nbr_ids,
+            )                                                     # ∈ [-1, 1]
+            nbr_logits = nbr_logits_raw * eff_scale
+            nbr_one_hot, next_local = softmax_top1_ste(
+                nbr_logits, hard=hard,
             )                                                     # [BS, J, K_max], [BS, J]
-            _aux_h = routing_aux_losses(nbr_logits, nbr_one_hot)
+            _aux_h = routing_aux_losses(
+                nbr_logits, nbr_one_hot, z_loss_logits=nbr_logits_raw,
+            )
             aux_lb_total = aux_lb_total + _aux_h["load_balance"]
             aux_z_total = aux_z_total + _aux_h["z_loss"]
             next_global = torch.gather(
                 nbr_idx, dim=2, index=next_local.unsqueeze(-1),
             ).squeeze(-1)                                         # [BS, J]
 
-            # mutate_write — proposed new state for the *current* concept.
-            # Same input as step_mlp; compute once.
-            delta = self.mutate_mlp(step_input)                   # [BS, J, D]
-            candidate = self.mutation_scale * delta               # [BS, J, D]
-            # Learnable decay gate: convex combination of old state and
-            # candidate. Bounds state magnitude by the candidate magnitude
-            # at equilibrium (≈mutation_scale * mlp_output_scale), rather
-            # than letting it accumulate unboundedly.
-            alpha = torch.sigmoid(self.decay_gate(step_input))    # [BS, J, 1]
-            new_state = alpha * current_state + (1.0 - alpha) * candidate
+            # mutate_write — GRUCell state update.
+            # GRUCell expects 2D tensors (batch, features), so flatten
+            # [BS, J, ...] → [BS*J, ...] and reshape back after.
+            BS_, J_, D_ = current_state.shape
+            new_state = self.state_update(
+                step_input.reshape(BS_ * J_, -1),
+                current_state.reshape(BS_ * J_, D_),
+            ).view(BS_, J_, D_)
 
             visited_id_list.append(current)
             proposed_new_list.append(new_state)

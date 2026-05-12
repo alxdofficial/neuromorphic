@@ -130,9 +130,10 @@ def _make_model_with_overrides(scale_zero=False, skip_read_write=False):
 
     if scale_zero:
         # Force scale to all-zero so MemInjectLayer's bypass path triggers.
+        # tanh(0)=0, so zeroing scale_raw makes the effective scale zero.
         with torch.no_grad():
             mem_inject = model._mem_inject_layer()
-            mem_inject.scale.zero_()
+            mem_inject.scale_raw.zero_()
 
     if skip_read_write:
         # Replace forward methods with zero-returning stubs that match shapes.
