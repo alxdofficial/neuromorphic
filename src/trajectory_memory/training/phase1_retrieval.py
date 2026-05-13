@@ -46,9 +46,24 @@ class RetrievalMetrics:
     w_uf: float = 0.0          # write routing uniformity
     r_ent: float = 0.0         # read entropy (over visited concepts)
     w_gn: float = 0.0          # write_module gradient norm
+    r_gn: float = 0.0          # read_module gradient norm
+    mi_gn: float = 0.0         # mem_inject (W_in, W_out, scale) gradient norm
     mem_inject_scale: float = 0.0
     write_logit_scale: float = 0.0
     read_logit_scale: float = 0.0
+    # Answer-prediction quality.
+    answer_acc: float = 0.0    # fraction of answer tokens where argmax == target
+    # Mechanistic retrieval check: fraction of read-trajectory concepts that
+    # are in the TARGET fact's write trajectory. Random baseline ≈ 0.01;
+    # > 0.1 means the read is preferentially finding the target's memory region.
+    read_target_overlap: float = 0.0
+    # Manifold state diagnostics (after all 8 writes).
+    state_norm_mean: float = 0.0
+    state_norm_std: float = 0.0
+    # Per-class breakdown (val only — empty for train). Maps "class.attr" → loss.
+    per_key_loss: dict[str, float] = field(default_factory=dict)
+    per_key_acc: dict[str, float] = field(default_factory=dict)
+    per_key_n: dict[str, int] = field(default_factory=dict)
 
 
 # ── Sampler ──
@@ -223,6 +238,9 @@ class Phase1RetrievalTrainer:
         device = next(self.model.parameters()).device
 
         passages, qa, answer_mask = self._build_tensors(batch, device)
+        target_idxs = torch.tensor(
+            [c["target_idx"] for c in batch], dtype=torch.long, device=device,
+        )  # [M]
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -233,6 +251,7 @@ class Phase1RetrievalTrainer:
         # ── 8 write windows (no loss, gradient alive through write_module).
         aux_lb_acc = None
         aux_z_acc = None
+        write_visited_per_fact: list[Tensor] = []  # 8× [M, J, K_write]
         for i in range(8):
             ids = passages[:, i, :]                                # [M, T]
             out = self.model.forward_window(
@@ -246,12 +265,21 @@ class Phase1RetrievalTrainer:
             )
             prev_state = out["new_states"]
             prev_hiddens = out["current_hiddens"]
+            wv = out.get("write_visited")
+            if wv is not None:
+                write_visited_per_fact.append(wv.detach())
             # Accumulate aux routing losses across windows.
             lb = out.get("aux_load_balance")
             z = out.get("aux_z_loss")
             if lb is not None:
                 aux_lb_acc = lb if aux_lb_acc is None else aux_lb_acc + lb
                 aux_z_acc = z if aux_z_acc is None else aux_z_acc + z
+
+        # Snapshot the manifold state after all 8 writes for diagnostics.
+        with torch.no_grad():
+            state_norms = prev_state.norm(dim=-1)               # [M, N]
+            state_norm_mean = float(state_norms.mean())
+            state_norm_std = float(state_norms.std())
 
         # ── Read + answer window (loss on answer tokens only).
         out_qa = self.model.forward_window(
@@ -277,6 +305,12 @@ class Phase1RetrievalTrainer:
         ).reshape(M, T - 1)
         n_answer = shift_mask.float().sum().clamp_min(1.0)
         answer_loss = (per_tok_ce * shift_mask.float()).sum() / n_answer
+
+        # Answer-token argmax accuracy.
+        with torch.no_grad():
+            preds = shift_logits.argmax(dim=-1)                     # [M, T-1]
+            correct = (preds == shift_targets) & shift_mask
+            answer_acc = float(correct.sum().float() / n_answer)
 
         # Accumulate aux losses from the answer window too.
         lb_qa = out_qa.get("aux_load_balance")
@@ -312,12 +346,10 @@ class Phase1RetrievalTrainer:
                     torch.stack([p.grad.norm() for p in trainable_params if p.grad is not None])
                 )
 
-        # write_module grad norm specifically (for diagnostic).
-        wm_grad_sqsum = 0.0
-        for p in self.model.write_module.parameters():
-            if p.grad is not None:
-                wm_grad_sqsum += float(p.grad.detach().pow(2).sum())
-        wm_grad_norm = math.sqrt(wm_grad_sqsum)
+        # Per-module grad norms for diagnostic.
+        wm_grad_norm = _module_grad_norm(self.model.write_module)
+        rm_grad_norm = _module_grad_norm(self.model.read_module)
+        mi_grad_norm = _mem_inject_grad_norm(self.model)
 
         # Step + zero.
         self.optimizer.step()
@@ -326,11 +358,19 @@ class Phase1RetrievalTrainer:
         self._step_count += 1
 
         # Telemetry — read final scales + routing uniformity from the read+answer window.
-        read_visited = out_qa.get("read_visited")     # [M, J, K]
-        write_visited = out_qa.get("write_visited")
+        read_visited = out_qa.get("read_visited")     # [M, J, K_read]
+        write_visited_qa = out_qa.get("write_visited")
         r_uf = _routing_uniformity(read_visited, self.model.cfg.N) if read_visited is not None else 0.0
-        w_uf = _routing_uniformity(write_visited, self.model.cfg.N) if write_visited is not None else 0.0
+        w_uf = _routing_uniformity(write_visited_qa, self.model.cfg.N) if write_visited_qa is not None else 0.0
         r_ent = _routing_entropy(read_visited, self.model.cfg.N) if read_visited is not None else 0.0
+
+        # Mechanistic: read-vs-target-write concept overlap.
+        if write_visited_per_fact and read_visited is not None:
+            wv_stack = torch.stack(write_visited_per_fact, dim=1)  # [M, 8, J, K_write]
+            target_wv = wv_stack[torch.arange(M, device=device), target_idxs]  # [M, J, K_write]
+            read_target_overlap = _concept_overlap(read_visited, target_wv)
+        else:
+            read_target_overlap = 0.0
 
         return RetrievalMetrics(
             loss=float(answer_loss.detach()),
@@ -342,22 +382,34 @@ class Phase1RetrievalTrainer:
             w_uf=w_uf,
             r_ent=r_ent,
             w_gn=wm_grad_norm,
+            r_gn=rm_grad_norm,
+            mi_gn=mi_grad_norm,
             mem_inject_scale=_mem_inject_scale(self.model),
             read_logit_scale=_logit_scale(self.model.read_module),
             write_logit_scale=_logit_scale(self.model.write_module),
+            answer_acc=answer_acc,
+            read_target_overlap=read_target_overlap,
+            state_norm_mean=state_norm_mean,
+            state_norm_std=state_norm_std,
         )
 
     @torch.no_grad()
     def eval_step(self, batch: list[dict]) -> RetrievalMetrics:
-        """Validation step — no backward, no optimizer.step."""
+        """Validation step — no backward, no optimizer.step. Returns
+        aggregate loss/accuracy AND per-(class,attr) breakdown in
+        `per_key_loss` / `per_key_acc` / `per_key_n` dicts."""
         cfg = self.model.cfg
         T = cfg.T_window
         M = len(batch)
         device = next(self.model.parameters()).device
         passages, qa, answer_mask = self._build_tensors(batch, device)
+        target_idxs = torch.tensor(
+            [c["target_idx"] for c in batch], dtype=torch.long, device=device,
+        )
 
         prev_state = self.model.manifold.reset_states(batch_size=M)
         prev_hiddens: Tensor | None = None
+        write_visited_per_fact: list[Tensor] = []
         for i in range(8):
             out = self.model.forward_window(
                 lm_input_ids=passages[:, i, :],
@@ -370,6 +422,9 @@ class Phase1RetrievalTrainer:
             )
             prev_state = out["new_states"]
             prev_hiddens = out["current_hiddens"]
+            wv = out.get("write_visited")
+            if wv is not None:
+                write_visited_per_fact.append(wv)
 
         out_qa = self.model.forward_window(
             lm_input_ids=qa,
@@ -388,12 +443,58 @@ class Phase1RetrievalTrainer:
             shift_logits.reshape(-1, V), shift_targets.reshape(-1),
             reduction="none",
         ).reshape(M, T - 1)
+        # Per-chunk loss (mean CE over its answer tokens).
+        per_chunk_tok_count = shift_mask.float().sum(dim=1).clamp_min(1.0)  # [M]
+        per_chunk_loss = (per_tok_ce * shift_mask.float()).sum(dim=1) / per_chunk_tok_count  # [M]
         n_answer = shift_mask.float().sum().clamp_min(1.0)
         answer_loss = (per_tok_ce * shift_mask.float()).sum() / n_answer
 
+        # Per-chunk accuracy.
+        preds = shift_logits.argmax(dim=-1)
+        correct = (preds == shift_targets) & shift_mask
+        per_chunk_acc = correct.float().sum(dim=1) / per_chunk_tok_count  # [M]
+        answer_acc = float(correct.sum().float() / n_answer)
+
+        # Per-class breakdown.
+        per_key_loss: dict[str, float] = {}
+        per_key_acc: dict[str, float] = {}
+        per_key_n: dict[str, int] = {}
+        for m, chunk in enumerate(batch):
+            meta = chunk.get("metadata", {})
+            key = f"{meta.get('target_entity_class', '?')}.{meta.get('target_attribute', '?')}"
+            n = per_key_n.get(key, 0)
+            ploss = per_key_loss.get(key, 0.0)
+            pacc = per_key_acc.get(key, 0.0)
+            per_key_loss[key] = (ploss * n + float(per_chunk_loss[m])) / (n + 1)
+            per_key_acc[key] = (pacc * n + float(per_chunk_acc[m])) / (n + 1)
+            per_key_n[key] = n + 1
+
+        # Routing diagnostics.
+        read_visited = out_qa.get("read_visited")
+        write_visited_qa = out_qa.get("write_visited")
+        r_uf = _routing_uniformity(read_visited, self.model.cfg.N) if read_visited is not None else 0.0
+        w_uf = _routing_uniformity(write_visited_qa, self.model.cfg.N) if write_visited_qa is not None else 0.0
+        r_ent = _routing_entropy(read_visited, self.model.cfg.N) if read_visited is not None else 0.0
+
+        if write_visited_per_fact and read_visited is not None:
+            wv_stack = torch.stack(write_visited_per_fact, dim=1)
+            target_wv = wv_stack[torch.arange(M, device=device), target_idxs]
+            read_target_overlap = _concept_overlap(read_visited, target_wv)
+        else:
+            read_target_overlap = 0.0
+
+        state_norms = prev_state.norm(dim=-1)
         return RetrievalMetrics(
             loss=float(answer_loss.detach()),
             answer_token_count=int(n_answer.item()),
+            r_uf=r_uf, w_uf=w_uf, r_ent=r_ent,
+            answer_acc=answer_acc,
+            read_target_overlap=read_target_overlap,
+            state_norm_mean=float(state_norms.mean()),
+            state_norm_std=float(state_norms.std()),
+            per_key_loss=per_key_loss,
+            per_key_acc=per_key_acc,
+            per_key_n=per_key_n,
         )
 
 
@@ -443,3 +544,45 @@ def _logit_scale(module: Any) -> float:
     if module is None or not hasattr(module, "logit_scale_raw"):
         return 0.0
     return float(module.logit_scale_raw.detach().exp().clamp_max(20.0))
+
+
+def _module_grad_norm(module: Any) -> float:
+    """L2 norm of all gradients in a module."""
+    sqsum = 0.0
+    for p in module.parameters():
+        if p.grad is not None:
+            sqsum += float(p.grad.detach().pow(2).sum())
+    return math.sqrt(sqsum)
+
+
+def _mem_inject_grad_norm(model: IntegratedLM) -> float:
+    """L2 norm of gradients in mem_inject (W_in, W_out, scale_raw)."""
+    layer = model._mem_inject_layer()
+    if layer is None:
+        return 0.0
+    return _module_grad_norm(layer)
+
+
+def _concept_overlap(read_visited: Tensor, target_writes: Tensor) -> float:
+    """Fraction of unique read-trajectory concepts that ALSO appear in the
+    target fact's write trajectory. Computed per-batch-element, then meaned.
+
+    read_visited:   [M, J, K_read]  int64 concept indices visited by read
+    target_writes:  [M, J, K_write] int64 concept indices visited by target's write
+    Returns scalar in [0, 1].
+
+    Random baseline: with K_read · J unique reads and K_write · J unique target
+    writes drawn from N concepts, expected overlap fraction ≈
+    K_write·J / N ≈ 32 / 4096 ≈ 0.008. Anything > 0.05 means the read is
+    preferentially navigating to the target's region.
+    """
+    M = read_visited.shape[0]
+    read_flat = read_visited.reshape(M, -1)
+    write_flat = target_writes.reshape(M, -1)
+    accum = 0.0
+    for b in range(M):
+        rs = set(read_flat[b].tolist())
+        ts = set(write_flat[b].tolist())
+        if rs:
+            accum += len(rs & ts) / len(rs)
+    return accum / max(M, 1)

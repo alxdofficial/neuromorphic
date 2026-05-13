@@ -230,12 +230,14 @@ def main():
         if step % args.log_every == 0 or step == 1:
             avg_loss = sum(loss_window) / len(loss_window)
             print(
-                f"step {step:>5}  loss={metrics.loss:.4f}  avg{len(loss_window)}={avg_loss:.4f}  "
+                f"step {step:>5}  loss={metrics.loss:.4f}  acc={metrics.answer_acc:.3f}  "
+                f"avg{len(loss_window)}={avg_loss:.4f}  "
                 f"r_uf={metrics.r_uf:.3f}  w_uf={metrics.w_uf:.3f}  "
-                f"r_ent={metrics.r_ent:.3f}  w_gn={metrics.w_gn:.3f}  "
+                f"w_gn={metrics.w_gn:.3f}  r_gn={metrics.r_gn:.3f}  mi_gn={metrics.mi_gn:.3f}  "
+                f"R↔T={metrics.read_target_overlap:.3f}  "
                 f"mi_scale={metrics.mem_inject_scale:.3f}  "
-                f"r_logit={metrics.read_logit_scale:.2f}  w_logit={metrics.write_logit_scale:.2f}  "
-                f"grad_norm={metrics.grad_norm:.2f}  "
+                f"|s|={metrics.state_norm_mean:.2f}±{metrics.state_norm_std:.2f}  "
+                f"grad={metrics.grad_norm:.2f}  "
                 f"({step_s:.2f}s/step)",
                 flush=True,
             )
@@ -245,27 +247,54 @@ def main():
             "aux_lb": metrics.aux_load_balance, "aux_z": metrics.aux_z_loss,
             "grad_norm": metrics.grad_norm,
             "r_uf": metrics.r_uf, "w_uf": metrics.w_uf,
-            "r_ent": metrics.r_ent, "w_gn": metrics.w_gn,
+            "r_ent": metrics.r_ent,
+            "w_gn": metrics.w_gn, "r_gn": metrics.r_gn, "mi_gn": metrics.mi_gn,
             "mem_inject_scale": metrics.mem_inject_scale,
             "read_logit_scale": metrics.read_logit_scale,
             "write_logit_scale": metrics.write_logit_scale,
+            "answer_acc": metrics.answer_acc,
+            "read_target_overlap": metrics.read_target_overlap,
+            "state_norm_mean": metrics.state_norm_mean,
+            "state_norm_std": metrics.state_norm_std,
             "step_s": step_s,
             "wall_s_cumulative": wall_s_cumulative,
         })
 
         # ── Validation ──
         if val_sampler and step % args.val_every == 0:
-            val_losses = []
+            val_losses, val_accs, val_overlaps = [], [], []
+            # Aggregate per-class loss/acc across val batches.
+            agg_loss: dict[str, list[float]] = {}
+            agg_acc: dict[str, list[float]] = {}
             for _ in range(args.val_batches):
                 vb = val_sampler.sample_batch(args.batch_size)
                 vm = trainer.eval_step(vb)
                 val_losses.append(vm.loss)
+                val_accs.append(vm.answer_acc)
+                val_overlaps.append(vm.read_target_overlap)
+                for key, n in vm.per_key_n.items():
+                    agg_loss.setdefault(key, []).extend([vm.per_key_loss[key]] * n)
+                    agg_acc.setdefault(key, []).extend([vm.per_key_acc[key]] * n)
             avg_val = sum(val_losses) / len(val_losses)
-            print(f"  [val @ step {step}] avg loss over {len(val_losses)} "
-                  f"batches: {avg_val:.4f}", flush=True)
+            avg_acc = sum(val_accs) / len(val_accs)
+            avg_overlap = sum(val_overlaps) / len(val_overlaps)
+            per_key_loss_agg = {k: sum(v) / len(v) for k, v in agg_loss.items()}
+            per_key_acc_agg = {k: sum(v) / len(v) for k, v in agg_acc.items()}
+            per_key_n_agg = {k: len(v) for k, v in agg_loss.items()}
+            print(
+                f"  [val @ step {step}] loss={avg_val:.4f}  acc={avg_acc:.3f}  "
+                f"read↔target_overlap={avg_overlap:.3f}  (over {len(val_losses)} batches)",
+                flush=True,
+            )
             _log_jsonl(args.log_jsonl, {
-                "step": step, "phase": "val", "loss": avg_val,
+                "step": step, "phase": "val",
+                "loss": avg_val,
+                "answer_acc": avg_acc,
+                "read_target_overlap": avg_overlap,
                 "n_batches": len(val_losses),
+                "per_key_loss": per_key_loss_agg,
+                "per_key_acc": per_key_acc_agg,
+                "per_key_n": per_key_n_agg,
             })
 
         # ── Save ──
