@@ -24,7 +24,7 @@ class TrajMemConfig:
 
     # ── manifold capacity ─────────────────────────────────────────────
     N: int = 4096
-    D_concept: int = 256
+    D_concept: int = 1024
     K_max_neighbors: int = 64
 
     # ── topology (small-world ring rewire) ────────────────────────────
@@ -89,7 +89,7 @@ class TrajMemConfig:
     #   3. concept_ids        — L2-normalize at every routing dot-product.
     #   4. MemInjectLayer.scale — tanh-clamp at consumption.
     # `state_init_norm` sets the target L2 norm for the reset-state.
-    state_init_norm: float = 1.0       # ≈ Glorot init norm at D=256
+    state_init_norm: float = 1.0       # target L2 norm for state_init at consumption
 
     # ── init seeds ────────────────────────────────────────────────────
     seed_topology: int = 0

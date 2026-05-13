@@ -78,6 +78,15 @@ def main():
                          "signal because per-chunk backward + detach cuts grad "
                          "before response loss arrives. Set 0 for legacy §4.5 "
                          "behavior; 0.1 matches §4.8 surprise table intent.")
+    # Routing aux coefs — keep aligned with Wave 1 v2 (post-Gumbel-fix).
+    # 1e-2 + 1e-3 (the trainer defaults) were too strong for our cosine
+    # routing; without these flags Wave 2 would silently revert.
+    ap.add_argument("--load-balance-coef", type=float, default=1e-3,
+                    help="Switch-style load_balance aux loss coef. "
+                         "Default 1e-3 (matches Wave 1 v2).")
+    ap.add_argument("--z-loss-coef", type=float, default=0.0,
+                    help="ST-MoE z_loss aux coef. Default 0 — redundant "
+                         "with cosine routing's bounded logits.")
     ap.set_defaults(compile=True)
     ap.add_argument("--plot-path", type=Path, default=None,
                     help="If set, save a multi-panel diagnostic plot here every "
@@ -109,6 +118,8 @@ def main():
         model, optimizer, scheduler=scheduler, grad_clip=args.grad_clip,
         pad_token_id=tokenizer.pad_token_id,
         prior_loss_weight=args.prior_loss_weight,
+        load_balance_coef=args.load_balance_coef,
+        z_loss_coef=args.z_loss_coef,
     )
 
     if args.checkpoint_in:

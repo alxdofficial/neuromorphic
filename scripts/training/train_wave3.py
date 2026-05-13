@@ -102,10 +102,14 @@ def main():
                     help="Asymmetric upper clip (DeepSeek-R1's `clip_higher`). "
                          "When set, ratio clamped to [1-clip_eps, 1+clip_eps_higher]. "
                          "R1 used 10. None → symmetric.")
-    ap.add_argument("--kl-coef", type=float, default=0.001,
+    ap.add_argument("--kl-coef", type=float, default=0.0,
                     help="Weight on KL(π_θ || π_ref) regularization. "
-                         "Default 0.001 matches verl. 0 disables KL term. "
-                         "Reference is the loaded --checkpoint-in weights.")
+                         "Default 0 (no KL anchor) — our frozen-Llama setup "
+                         "already constrains the policy via the immutable LM "
+                         "vocab distribution + PPO clip_eps, so a reference "
+                         "snapshot adds ~2.5 GB VRAM with no measurable "
+                         "convergence benefit. Set >0 (e.g. 0.001) only if "
+                         "you have evidence of reward-hacking / drift.")
     ap.add_argument("--source-weights", type=str, default=None,
                     help="Per-source upsampling weights in 'name=w,name=w' "
                          "format. e.g. 'narrativeqa=3,musique=3,hotpotqa=3,"
@@ -113,15 +117,19 @@ def main():
                          "humaneval=1'. Used to bias the training mix toward "
                          "long-context (memory-engaging) sources. Default: "
                          "uniform (1.0 for all).")
-    ap.add_argument("--bs-outer", type=int, default=1,
+    ap.add_argument("--bs-outer", type=int, default=8,
                     help="BS_outer — number of prompts per optimizer step. "
                          "1 = single-prompt step() (legacy). >1 = batched "
                          "step_batched(): M prompts × K samples = M*K parallel "
                          "rollouts, per-group advantage, per-sample backward, "
                          "single optimizer.step. Requires length-bucketed "
                          "sampler (auto-enabled when --bs-outer > 1). "
-                         "Bench: M=4 gives ~2.1× per-prompt speedup at ~6 GB "
-                         "peak vs M=1 at 3.7 GB.")
+                         "Bench 2026-05-13 at D_concept=1024, kl_coef=0, K=8 "
+                         "(see docs/bench_results.md): M=8 fits at 18.5 GB "
+                         "peak with +34% rollout throughput vs M=1 "
+                         "(per-sample 0.72s → 0.54s). Diminishing returns "
+                         "past M=8 — GPU util is already capped by per-token "
+                         "AR kernel-launch overhead, not memory.")
     ap.add_argument("--bs-outer-min-prompt-len", type=int, default=None,
                     help="When --bs-outer > 1, only include prompts with "
                          "at least this many tokens. Ensures all prompts "

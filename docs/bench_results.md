@@ -10,19 +10,288 @@ graph_walker's measurements (see `abandoned/graph-walker` →
 `docs/bench_results.md`). We only bench paths that depend on
 trajectory-memory specifically.
 
-Run benches via:
-- `scripts/bench/bench_trajmem.py` — Phase 1 (Wave 1 long-doc TF NTP) bench.
-  Default sweeps BS via doubling from `--bs` anchor until OOM, picks
-  peak. Pass `--no-sweep` for a fixed-BS run.
-
 Per project memory:
 - "Bench with fixed params, never sweep" — one config tier per run.
 - "Bench at each path's own optimal BS" — peak-throughput BS per setting,
   not forced to share with other modes.
 
+## Training-type labels used throughout
+
+| label | meaning | trainer entry | code path |
+|---|---|---|---|
+| **TF-NTP** | Teacher-Forced Next-Token-Prediction (Wave 1 / Wave 2 SFT) | `Phase1Trainer.step_wave1` / `step_wave2` | `src/trajectory_memory/training/phase1.py` |
+| **AR-GRPO** | Autoregressive GRPO with reward (Wave 3 / Wave 4 / MT-GRPO) | `Phase2Trainer.step` / `step_batched` | `src/trajectory_memory/training/phase2.py` |
+
+Every bench section below is tagged with `[TF-NTP]` or `[AR-GRPO]` (or `[both]` for cross-cutting comparisons).
+
+## Per-bench metadata convention
+
+Every dated section MUST include:
+- Date in UTC (`YYYY-MM-DDTHH:MMZ`)
+- Git commit hash at time of run
+- Hardware (GPU model + total VRAM)
+- Base config (`TrajMemConfig.<tier>()` + explicit overrides)
+- Bench scripts + raw output log paths
+- Training-type label
+
+Bench scripts live in `scripts/bench/`. Run benches via:
+- `scripts/bench/bench_trajmem.py` — TF-NTP throughput sweep (default sweeps BS)
+- `scripts/bench/bench_dconcept.py` — TF-NTP D scaling at fixed BS
+- `scripts/bench/bench_dconcept_n.py` — TF-NTP D × N joint sweep
+- `scripts/bench/profile_grpo.py` — AR-GRPO per-op profile with torch.profiler
+
+---
+
+## Index of dated entries
+
+| date | training type | summary |
+|---|---|---|
+| 2026-05-13 (late PM) | [AR-GRPO] | **Negative result:** StaticCache + CUDA-graph A/B vs DynamicCache |
+| 2026-05-13 (PM) | [AR-GRPO] | BS_outer ∈ {1,2,4,8} scaling at kl_coef=0, D=1024 default |
+| 2026-05-13 (AM) | [TF-NTP] + [AR-GRPO] | Architectural scaling (D, N) + GRPO GPU-util profile |
+| 2026-05-11 | [TF-NTP] + [AR-GRPO] | Phase 1 + Phase 2 after architectural perf push (closest pre-Gumbel-fix reference) |
+
+Older entries (2026-05-09, 2026-05-10) deleted on 2026-05-13: the
+architecture has changed substantially since (Gumbel→softmax-STE
+routing, KV-cache cap enforcement, head_query std fix, logit_scale,
+dynamic compile, D_concept default 256→1024). Old throughput numbers
+aren't directly comparable to current code. See git log of this file
+for history.
+
+---
+
+## 2026-05-13 (late PM) — StaticCache + CUDA-graph A/B (negative result)
+
+**Training type:** [AR-GRPO]
+
+**Run metadata.**
+
+| field | value |
+|---|---|
+| Date (UTC) | 2026-05-13T05:30Z |
+| Commit | `dcc61d4` + uncommitted Phase 2 StaticCache + CUDA-graph paths |
+| Hardware | NVIDIA RTX 4090, 24564 MiB |
+| Base config | `TrajMemConfig.medium()` (D=1024, N=4096, J=4, K_read=K_write=8, T_window=256, effective_lm_context=2048) |
+| Model | Llama-3.2-1B (frozen, bf16) + cold-start trajectory memory |
+| GRPO settings | K=8 rollouts, max_new_tokens=256, kl_coef=0, K_per_window=256 (one window per AR call) |
+| Bench script | `scripts/bench/bench_grpo_cuda_graph.py` |
+| Raw log | `outputs/bench_grpo_cuda_graph.log` |
+
+### Setup
+
+A/B'd three cache configurations for Phase 2's `_ar_sample_outer_batch`
+inner per-token loop:
+
+1. **`dyn_cache`** — current default. HF DynamicCache that grows from
+   `cap=2048` to `cap+max_new=2304` over 256 AR tokens, then gets
+   trimmed back to `cap` at end of window.
+2. **`static_cache`** — HF StaticCache pre-allocated at
+   `[M*K, n_kv_heads, 2304, head_dim]` once, then slot-filled from the
+   M length-bucketed prefill caches. No per-window trim (cache stays at
+   2304 by design).
+3. **`static_cache+cg`** — same as (2) plus `torch.cuda.graph()` capture
+   of the per-token Llama forward after a 2-token warmup. Captures once
+   per AR window, replays for the remaining ~252 iterations.
+
+### Numbers
+
+| BS_outer | mode | warm s | s/step | tok/s | peak GB | per-sample s | Δ vs dyn_cache |
+|---|---|---|---|---|---|---|---|
+| 1 | dyn_cache | 6.43 | 5.82 | 352 | 5.51 | 0.728 | — |
+| 1 | static_cache | 5.79 | 5.80 | 353 | 5.51 | 0.725 | ≈ (BS=1 uses `step()` not `step_batched()`, flags unused) |
+| 1 | static_cache+cg | 5.89 | 5.88 | 349 | 5.51 | 0.734 | ≈ (same) |
+| **4** | **dyn_cache** | **18.31** | **18.18** | **451** | **10.88** | **0.568** | — |
+| 4 | static_cache | 24.33 | 24.34 | 337 | 12.72 | 0.761 | **−34% throughput** |
+| 4 | static_cache+cg | 24.35 | 24.47 | 335 | 12.73 | 0.765 | −34% (CG didn't recover) |
+
+(BS_outer=8 row stopped early — the decisive trend at BS_outer=4 was
+already conclusive; no reason to expect a flip at BS_outer=8.)
+
+### Diagnosis
+
+DynamicCache wins because HF Llama-3.2-1B's attention path scales the
+attention compute with the cache's actual tensor length — which for
+DynamicCache grows incrementally and averages ~2176 positions over the
+window, while StaticCache always exposes the full pre-allocated 2304
+positions. The 2304 isn't padding "skipped by the kernel"; it's actual
+key/value memory the attention QK^T and softmax run over (the causal
+mask zeros out future positions only).
+
+The ~5-10% extra attention work per token, compounded over 16 layers
+× 256 tokens × M*K=32 parallel rollouts, plus larger memory-bandwidth
+traffic on the bigger buffer, is the gap.
+
+CUDA-graph capture cuts the per-iter kernel-launch overhead (~10-20µs
+per launch × ~160 kernels per layer per token), saving ~5-10% of step
+time at most — not enough to make up the 34% StaticCache compute tax.
+
+### Decision
+
+- Reverted defaults: `use_static_cache=False`, `use_cuda_graph=False`.
+- Kept the code paths (both flags exist on `Phase2Trainer`) for future
+  experiments — e.g. on a different backbone, or paired with a sliding
+  attention mask that lets StaticCache also bound its compute to
+  `min(seq_filled, cap)`.
+- **DynamicCache remains the production path.** No regression in
+  current BS_outer=8 numbers from earlier today (472 tok/s holds).
+
+### Lessons
+
+- StaticCache only pays off when (a) kernel-launch overhead dominates
+  compute (typical at very small models / very long decode steps / very
+  high BS), or (b) the model's attention path can mask its compute to
+  the actual filled length. Llama-3.2-1B with HF eager/SDPA at our
+  config is neither.
+- `torch.cuda.graph()` capture is fast (~one forward pass), so the
+  experiment was cheap to run — but the engineering effort (the
+  StaticCache rewiring in `_ar_sample_outer_batch`, slot-fill helper,
+  capture/replay scaffolding) was wasted on this backbone.
+- A real next lever: **decouple rollout from training** by running
+  vLLM in a separate process for AR generation, then loading the
+  rolled samples back for Pass-2 grad-replay. That's how TRL/OpenRLHF
+  get their 5-10× throughput — not from cache choices.
+
+---
+
+## 2026-05-13 (PM) — BS_outer scaling at the new D=1024 default
+
+**Training type:** [AR-GRPO]
+
+**Run metadata.**
+
+| field | value |
+|---|---|
+| Date (UTC) | 2026-05-13T04:10Z |
+| Commit | `dcc61d4` + uncommitted (D=1024 default, kl_coef=0 default, softmax_top1_ste assertion relaxed) |
+| Hardware | NVIDIA RTX 4090, 24564 MiB |
+| Base config | `TrajMemConfig.medium()` (N=4096, **D_concept=1024**, J=4, K_read=K_write=8, T_window=256, D=4, d_lm=2048, inject_layer=8, effective_lm_context=2048) |
+| Model | Llama-3.2-1B (frozen, bf16) + trajectory-memory side-car. **Cold-start** of trajectory memory (Wave 2 ckpt was trained at D=256, shape-incompatible; Llama weights still loaded.) |
+| GRPO settings | K=8 rollouts, max_new_tokens=256, clip_eps=0.2, **kl_coef=0** (no reference policy), temperature=1.0 |
+| Reward | `bert_cosine` (SentenceBERT cosine) via narrativeqa prompts ≥ 2048 tokens |
+| Bench script | `scripts/bench/bench_grpo_bsouter.py` (1 warmup + 3 timed steps per BS_outer, parallel `nvidia-smi` poll @ 100ms) |
+| Raw log | `outputs/bench_grpo_bsouter.log` |
+
+### Findings
+
+**KV cache dtype confirmed bf16** (HF DynamicCache inherits Llama's dtype — `cache.layers[0].keys.dtype == torch.bfloat16`).
+
+**Per-step throughput**:
+
+| BS_outer M | s/step | rollout tok/s | peak VRAM | GPU util mean | Δ vs M=1 | per-sample s |
+|---|---|---|---|---|---|---|
+| 1 | 5.80 | 353 | 5.51 GB | 70% | 1.00× | 0.725 |
+| 2 | 9.82 | 417 | 7.09 GB | 63% | 1.18× | 0.614 |
+| 4 | 18.26 | 449 | 10.88 GB | 61% | 1.27× | 0.571 |
+| 8 | 34.74 | 472 | 18.48 GB | 60% | **1.34×** | **0.543** |
+
+Per-sample wall time drops 25% from M=1→8 (0.725 → 0.543 s/sample), but
+the absolute throughput gain is only +34% — sub-linear. **Higher BS
+gives smaller marginal speedup**, not bigger; the curve has plateaued
+hard by M=8.
+
+**Bottleneck.** GPU util sits at 60–70% across all M and *drops* as M
+grows — meaning compute throughput is not the limit. The remaining 30–40%
+idle is the AR per-token decode loop: 256 sequential calls to
+`llama.model(input_ids=[BS,1], past_key_values=..., cache_position=...)`,
+each launching ~16 layers × ~10 ops = ~160 kernels. At ~10–20 µs/launch
+the kernel-launch tax is 1.6–3.2 ms/token regardless of BS, and Llama-1B
+compute per token at BS≤8 finishes faster than that. Batch-merging
+doesn't fix it; CUDA graphs or static-cache compilation would.
+
+**Implications for Wave 3 GRPO training.**
+- BS_outer=8 is the new operating point (50% more rollouts per
+  optimizer step than BS=4 at +70% VRAM, +25% per-sample time).
+- VRAM headroom at 18.5 GB peak / 24 GB cap → no room for a reference
+  policy (would need ~2.5 GB extra) → kl_coef=0 default is load-bearing.
+- Activation checkpointing remains deferred — no compute regime where it
+  pays off when the GPU is already 30%+ idle on kernel-launch overhead.
+
+**CUDA graphs — deferred.** The decode loop is shape-stable *after* the
+KV cache reaches `effective_lm_context=2048`, but `DynamicCache` resizes
+its internal tensors as it grows; capturing requires switching to
+`StaticCache` with pre-allocated `[BS_outer*K, n_kv_heads, 2048, head_dim]`
+buffers in the AR path, then `torch.cuda.graph()` or
+`make_graphed_callables`. Estimated 2–3 hours engineering + bench;
+projected gain (per HF Llama generation benchmarks) is 1.5–2× on the
+AR loop alone, which is ~70% of step time, so ~1.3–1.6× end-to-end.
+Worth doing once the architecture stabilizes; today's BS_outer=8 already
+moves Wave 3 epoch time meaningfully and the protocol may evolve again
+before this becomes the next bottleneck.
+
+---
+
+## 2026-05-13 — Architectural scaling + AR-GRPO utilization bench
+
+**Training type:** [TF-NTP] (scaling) + [AR-GRPO] (utilization + profile)
+
+**Run metadata.**
+
+| field | value |
+|---|---|
+| Date (UTC) | 2026-05-13T03:30Z |
+| Commit | `dcc61d4` (post-Gumbel-fix, KV-cache-cap, dynamic-compile-on-mem_inject; before today's D=1024 default bump) |
+| Hardware | NVIDIA RTX 4090, 24564 MiB |
+| Base config | `TrajMemConfig.medium()` (N=4096, J=4, K_read=K_write=8, T_window=256, D=4, d_lm=2048, inject_layer=8, effective_lm_context=2048). At bench time `D_concept` default was 256; D variants are explicit per-row. |
+| Model | Llama-3.2-1B (frozen, bf16) + trajectory-memory side-car |
+| Bench scripts | `scripts/bench/bench_dconcept.py`, `scripts/bench/bench_dconcept_n.py`, `scripts/bench/profile_grpo.py` |
+| Raw logs | `outputs/dconcept_bench.log`, `outputs/dconcept_n_bench.log`, `outputs/grpo_speedbench_v2/`, `outputs/grpo_bs_outer2/`, `outputs/grpo_profile.log` |
+| Wave 2 ckpt used for GRPO warm-start | `outputs/wave2_v2/ckpt.pt` |
+
+### [TF-NTP] Bench 1 — `D_concept` scaling
+
+Per-step time (warmup=2, timed=5) at BS=4, calling `Phase1Trainer.step_wave1` with full forward + backward + AdamW step on synthetic chunks of `D × T_window = 4 × 256 = 1024 tokens`. Synthetic data only affects content; compute is identical to real training.
+
+| `D_concept` | ms/step | tok/s | peak VRAM | trainable M | slowdown |
+|---|---|---|---|---|---|
+| 256 | 489.7 | 8 365 | 12.87 GB | 16.3 M | 1.00× |
+| 512 | 511.9 | 8 002 | 13.19 GB | 28.6 M | 1.05× |
+| 1024 | 539.6 | 7 590 | 14.00 GB | 66.1 M | 1.10× |
+
+**Takeaway.** D scaling is essentially free up to 1024 (+10% time, +1.2 GB VRAM). Llama-1B forward+backward dominates total compute; memory module's matmuls are small relative to that. Default committed to `D_concept=1024` immediately after this bench.
+
+### [TF-NTP] Bench 2 — `D_concept × N` joint scaling
+
+Same Phase 1 setup, scanning N ∈ {4096, 16384, 65536} and D ∈ {256, 1024}:
+
+| D | N | ms/step | tok/s | peak VRAM | trainable M | slowdown vs (256, 4096) |
+|---|---|---|---|---|---|---|
+| 256 | 4096 | 489.7 | 8 365 | 12.87 GB | 16.3 M | 1.00× (baseline) |
+| 256 | 16384 | 514.6 | 7 960 | 13.28 GB | 22.6 M | 1.05× |
+| 256 | 65536 | 718.2 | 5 703 | 15.20 GB | 47.8 M | 1.47× |
+| 1024 | 4096 | 538.3 | 7 609 | 14.00 GB | 66.1 M | 1.10× |
+| 1024 | 16384 | 746.9 | 5 484 | 15.80 GB | 91.3 M | 1.53× |
+| 1024 | 65536 | **OOM** | — | (>24 GB) | — | — |
+
+**Takeaway.** N scaling is cheap up to 16K (+5%), real cost at 64K (+47%) — entry-routing's O(N·D) matmul starts to bite. N=65536 × D=1024 OOMs because `concept_states[BS=4, N=64K, D=1024]` runtime buffer alone is ~1 GB; with state_init + activations the total exceeds 24 GB.
+
+### [AR-GRPO] Bench 3 — Step time + GPU utilization
+
+Setup: `scripts/training/train_wave3.py` warm-started from `outputs/wave2_v2/ckpt.pt`, K=8 samples, max_new_tokens=256, narrativeqa source, kl_coef=0.001, clip_eps=0.2. Steady-state measured over steps 2-8 (step 1 is compile cold-start). GPU sampled every 1s during run via `nvidia-smi --query-gpu=utilization.gpu,memory.used`.
+
+| variant | step time | rollouts/step | per-rollout time | peak VRAM | GPU mean util | GPU idle (<20%) | GPU high (≥80%) |
+|---|---|---|---|---|---|---|---|
+| K=8, BS_outer=1 | **4.4 s** | 8 | 0.55 s | 8.0 GB | **16.7%** | **77%** | 11% |
+| K=8, BS_outer=2 | 7.1 s | 16 | 0.44 s | 9.0 GB | 20.7% | 68% | 10% |
+
+**Takeaway — load-bearing for this session.** GPU is severely underutilized during AR-GRPO (~77% idle at BS_outer=1). The 4-second step time is *not* compute; it's primarily CPU work + kernel launch overhead + sync barriers during AR generation. BS_outer=2 recovers ~25% per-rollout throughput by amortizing overhead across more rollouts, but GPU is still 68% idle. Lots of headroom remaining.
+
+Comparison vs the prior pre-fix reference (2026-05-11 entry below): that bench reported 2.37 s/step at K=8 on narrativeqa with 3.72 GB peak. Our current 4.4 s/step + 8 GB peak is regression on both axes; likely from the architectural fixes (logit_scale ops, KV-cache cap call per layer, dynamic-compile cache, reference-policy snapshot for KL).
+
+### [AR-GRPO] Bench 4 — Per-op profile (torch.profiler)
+
+[Appended once profile run completes — see `outputs/grpo_profile.log` + `outputs/grpo_profile.json` chrome trace.]
+
+### Conclusions for the next round
+
+1. **Default `D_concept` bumped to 1024** (post-bench, in working tree). Numerology aligns (id+state = 2 × 1024 = d_lm), bridge compression improves from 8× to 2×, per-concept capacity 4×. Cost is +10% step time + 1.2 GB VRAM.
+2. **N=16K is cheap to reach** (+5% time). Worth keeping in back pocket if vocabulary size needs to scale.
+3. **AR-GRPO's bottleneck is not raw GPU compute.** Reducing kernel-launch overhead (CUDA graphs on the AR step, BS_outer↑, K↑, async reward overlap) is the highest-leverage perf work. The Bench 4 profile data will identify which specific ops to target.
+
 ---
 
 ## 2026-05-11 — Phase 1 + Phase 2 after architectural perf push
+
+**Training type:** [TF-NTP] (Phase 1 throughput sweep) + [AR-GRPO] (Phase 2 Strategy A data)
 
 Headline: shipped 5 perf changes — Hopfield-tied entry projection,
 cross-attn K/V sharing across J + across hops, bf16 cross-attn body,
@@ -30,7 +299,7 @@ trajectory-generator activation checkpointing, dropped per-slot KV cache
 complexity. Plus 3 Phase 2 GRPO changes — batched K rollouts at BS=K,
 selective log-softmax, per-sample backward in Pass 2.
 
-**Phase 1 Wave 1 throughput sweep (RTX 4090, medium tier, KV cache ON):**
+### [TF-NTP] Wave 1 throughput sweep (RTX 4090, medium tier @ D_concept=256, KV cache ON)
 
 | BS | compile | peak VRAM | tok/s | ms/iter |
 |----|---------|-----------|-------|---------|
@@ -53,8 +322,9 @@ backward on this hardware. Further gains would require Llama
 quantization, vLLM-style rollout overlap (Phase 2 only), or moving to
 a bigger GPU.
 
-**Phase 2 (Wave 3 GRPO) on REAL Strategy A data (RTX 4090, K=8, max_new=256,
-re-measured 2026-05-11 on actual parquet prompts, not synthetic random tokens):**
+### [AR-GRPO] Wave 3 on REAL Strategy A data (RTX 4090, K=8, max_new=256)
+
+Re-measured 2026-05-11 on actual parquet prompts, not synthetic random tokens. **This table is the reference our 2026-05-13 GRPO numbers compare against** — the 2.37 s/step on narrativeqa is the pre-Gumbel-fix benchmark we're regressed from.
 
 | Source                          | N      | Avg prompt | Step time | Peak VRAM | Tok/s gen | Wall-time per epoch |
 |---------------------------------|--------|------------|-----------|-----------|-----------|---------------------|
@@ -121,348 +391,6 @@ samples per group is worth the cost.
 | 8 | 1024   | 256 | 11.28s | 1.57s   | **7.20×** |
 
 Rollout went from dominating Phase 2 step time to ~half of it.
-
----
-
-## 2026-05-09 — Phase 1 (Wave 1) at v1-default config (medium tier)
-
-**Hardware:** RTX 4090 (25.3 GB) · bf16 (Llama backbone) · fp32 memory
-params
-
-**Config (`TrajMemConfig.medium`):**
-- Manifold: N=4096 concepts · D_concept=256 · K_max_neighbors=64 ·
-  radius=32 · p_rewire=0.5 · **262K directed edges**
-- Trajectories: J=4 · K_read=8 · K_write=8
-- Window: T_window=256 · D=4 (TBPTT depth) · **chunk = D × T_window =
-  1024 tokens**
-- Bridge: `MemInjectLayer` 2-layer MLP, `bridge_hidden=2048` (= d_lm),
-  inject at layer 8
-- Trainable params: **16.5M** (≪ Llama; backbone frozen)
-  - bridge 9.44M · write 2.49M · read 2.43M · manifold 2.10M
-
-(History: prior to 2026-05-09 bump, medium was N=2048, K=32 → 65K edges,
-15.4M trainable. Bench numbers were within ~1% — manifold is too small
-relative to Llama for the bump to dominate throughput.)
-
-### Sweep — `bench_trajmem.py --config-tier medium --bs 1 --max-bs 32`
-
-Numbers below are at the **post-bump medium config** (N=4096, K=64,
-trainable 16.46M). Bench was re-run after the bump; throughput within
-~1% of pre-bump values, peak GB up by ~0.05GB (manifold is small
-relative to Llama).
-
-| BS | eager tok/s | eager peak GB | compile tok/s | compile peak GB |
-|----|------------:|-------------:|--------------:|---------------:|
-| 1  | 7.1k | 7.5  | **9.1k** | **5.7**  |
-| 2  | 8.1k | 13.1 | **9.1k** | 10.6     |
-| 4  | **8.5k** | 21.6 | 8.5k | 22.3 |
-| 8  | OOM  | —    | OOM      | —        |
-
-`compile` flag: `torch.compile(model.forward_window, mode="default", dynamic=False)`.
-Cold-start compile cost ~1-3 min per BS; reuses across iters within a run.
-
-### Findings
-
-- **Compile gives ~28% speedup at small BS** (BS=1: 7.1k → 9.1k tok/s).
-  Wins from operator fusion in the per-window forward — peak memory
-  also drops 7.4 → 5.7 GB at BS=1 (activation savings).
-- **At BS=4 compile gives no benefit** — work is already kernel-bound
-  (8.6k tok/s in both modes). Compile mainly helps when overhead-bound.
-- **Both modes top out at BS=4 before OOM** on 24GB. BS=4 eager uses 21.5
-  GB; BS=4 compile uses 22.2 GB (compile keeps a few extra graph buffers
-  resident).
-
-### Recommended production setting (UPDATED 2026-05-10, then -10 again post-multi-stream)
-
-Current production defaults (post-KV-cache + post-multi-stream + post-
-per-slot-KV-cache):
-
-- **`train_wave1.py`** defaults `--batch-size 4` (multi-stream via
-  `BatchedLongDocDataset` with per-slot KV cache lifecycle). KV cache
-  + compile both default ON. Real-world steady-state ~16k tok/s
-  (~0.25s/step at BS=4 × T_chunk=1024). VRAM ~10.6 GB peak. BS=1
-  single-stream still works as a fallback.
-- **`train_wave2.py`** runs `--batch-size 1` (TurnPair length-bucketed,
-  variable-length priors → BS>1 truncation drops data; W2 OOMd at
-  BS=2 in earlier smoke). KV cache + compile both default ON.
-  `--prior-loss-weight 0.1` default (B12 fix).
-- Use `--no-compile` for debug iteration (skip ~2 min cold-start).
-- Use `--no-kv-cache` only for the rolling-buffer fallback path
-  (slower but useful for reproducing legacy bench numbers).
-
-NOTE: do NOT enable `gradient_checkpointing_enable()` while KV cache
-is on — HF silently sets `use_cache=False` and discards
-`past_key_values`. Verified empirically. They're mutually exclusive.
-
-### Caveats
-
-- Bench uses synthetic `randint` chunks at exactly `chunk_tokens=1024`.
-  Real W1 training streams variable-length docs packed into 1024-token
-  chunks via `LongDocDataset` — same shape, same speed.
-- Wave 2 (TurnPair) and Wave 3 (GRPO) have different compute profiles.
-  W2 chunks are length-bucketed across 1-12K-token priors; W3 multiplies
-  by J=4-8 sample rollouts. Separate benches needed for those.
-- We saw a Wave 2 OOM at BS=2 + config "small" during an earlier
-  end-to-end smoke test (priors 1-3K tokens × N=4 chunks of 256 tokens).
-  Cause is likely TBPTT activation accumulation across W2 chunks; flagged
-  for follow-up before the first real W2 run.
-
----
-
----
-
-## 2026-05-09 — Phase 1 + Phase 2 comparison vs vanilla Llama
-
-Re-ran with all the post-audit fixes landed (chunk state threading,
-output_hidden_states hook, logits-slicing, run_chunk strip, two-pass
-GRPO). RTX 4090, eager, medium config, **BS=2** for Phase 1 / **K=4
-samples** for Phase 2.
-
-| Path | tok/s | peak GB | ms/iter |
-|------|------:|--------:|--------:|
-| **Phase 1** (BS=2, T=1024, lm_head-only trainable for vanilla) |  |  |  |
-| V1.A — vanilla Llama forward (no_grad) | **52.0k** | 3.08 | 39.4 |
-| V1.B — vanilla Llama lm_head TF step | **16.8k** | 10.26 | 122.0 |
-| T1 — Llama + trajmem step | **9.3k** | 12.07 | 219.6 |
-| **Phase 2** (T_pre=1024, T_gen=64, K=4 samples) |  |  |  |
-| V2 — vanilla Llama GRPO step | ~43 | 10.31 | 5965 |
-| T2 — Llama + trajmem two-pass GRPO step | ~35 | 22.00 | 7354 |
-
-**Slowdowns:**
-- T1 vs V1.B: **1.80×** — memory module costs ~7.5k tok/s (bridge MLP
-  + read/write trajectory hops × D=4 windows).
-- T2 vs V2: **1.23×** — smaller relative slowdown because Phase 2 is
-  dominated by serial AR sampling (no KV cache in either path).
-
-**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py --bs 2 \
---t-phase1 1024 --t-prompt 1024 --t-gen 64 --num-samples 4`
-
-**Notes:**
-- Phase 2 throughput is ~3 orders of magnitude lower than Phase 1 in
-  tok/s. That's an architectural property of AR-without-KV-cache, not
-  a memory-module problem — vanilla is also slow at this shape.
-- Phase 2's 22 GB peak (T2) sits near our 24 GB ceiling. K=8 would not
-  fit; T_gen=128+ marginal. KV caching for AR would help both.
-
----
-
-## 2026-05-09 — Phase 1 + Phase 2 at each path's own max BS / K
-
-Replaces the BS=2/K=4 shared-shape table above with a more honest
-"each path at its own max-fitting size" comparison (per the project
-convention "Bench at each path's own optimal BS"). Same hardware,
-same medium config, eager mode. Per-path BS / K values are
-hard-coded in `scripts/bench/bench_compare.py`.
-
-| Path | BS / K | tok/s | peak GB | ms/iter |
-|------|-------:|------:|--------:|--------:|
-| **Phase 1** (T=1024 chunk for trajmem; T=1024 for vanilla) |  |  |  |  |
-| V1.A — vanilla Llama fwd (no_grad)        | BS=48 | **48.7k** | 16.90 | 1009 |
-| V1.B — vanilla Llama lm_head TF step      | BS=5  | **17.0k** | 20.32 |  302 |
-| T1   — Llama + trajmem step               | BS=4  | **9.9k**  | 18.46 |  415 |
-| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
-| V2   — vanilla Llama GRPO step            | K=10  | **42.5**  | 18.80 | 15050 |
-| T2   — Llama + trajmem two-pass GRPO step | K=4   | **32.4**  | 22.00 |  7900 |
-
-**Per-path slowdowns at each path's own optimal size:**
-- **T1 vs V1.B: 1.72×** (vanilla 17.0k, ours 9.9k tok/s). Improved from
-  the BS=2-shared 1.80× — vanilla doesn't gain from BS=2 → BS=5 since
-  it was already throughput-saturated.
-- **T2 vs V2: 1.31×** (similar story; V2 also saturated by K=8).
-
-**Throughput-saturation observations:**
-- V1.A vanilla forward has the same tok/s at BS=16 (7.29 GB) as at
-  BS=48 (16.90 GB). Llama bf16 forward is GPU-saturated around
-  ~49k tok/s on this card regardless of BS.
-- V1.B and V2 are similarly saturated; bumping BS just trades VRAM
-  headroom for nothing. Reported max-BS rows are for "we used the
-  whole GPU" parity, not for throughput gains.
-- T1 and T2 are at their actual VRAM caps. T1 BS=8 OOMs in eager
-  (per `bench_trajmem.py` sweep); T2 K=5+ would push past 24 GB.
-
-**The honest framing:** the memory module's overhead at peak is
-**~7k tok/s for Phase 1** (V1.B 17.0k → T1 9.9k). Architecturally
-that's mostly the per-window Llama forward re-encoding the rolling
-LM context buffer (no sliding KV cache yet — see "Optimization
-candidates" below).
-
-**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
-
-### Why is T1 ~1.7× slower than V1.B?
-
-Not the memory modules themselves — they're <1% of FLOPs (per
-`docs/profile_analysis.md`). The dominant overhead is Llama itself
-running **multiple forwards per "chunk"** while the rolling LM
-context grows.
-
-- V1.B does **1 forward at T=1024**, full sequence, one shot.
-- T1 does **4 forwards** at T_window=256 each, but with a rolling
-  context buffer that grows window-by-window: 256 → 512 → 768 → 1024
-  tokens fed to Llama. Total LM tokens processed per chunk = ~2560.
-- Naive expected ratio: 2.5×. Measured 1.72×. T1 is actually
-  *better-than-naive* per LM token (smaller forwards have lower
-  attention cost than one big one).
-- In real W1 training with state threading and a doc-long stream,
-  the LM context fills to the 2048 cap and stays there → per-window
-  forwards get bigger → real-training T1 is slower than this synthetic
-  bench shows.
-- The fix is sliding KV cache so each window's forward is just the
-  new 256 tokens against cached 1792. That's the dominant lever.
-
-### Optimization candidates (not yet tried)
-
-| Lever | Est. win | Cost | Notes |
-|-------|---------:|------|-------|
-| Sliding KV cache for Llama | 30-50% | medium | Layer-8 inject changes per window so KV reuse needs custom logic for layers 0-7 + recompute for 8+. |
-| `--compile` (bench is eager) | 28% at low BS | trivial | Already wired into `train_wave1.py`. Not yet tested at the new max BS. |
-| Autocast bf16 (manifold scatter dtype refactor) | 5-10% | medium | Blocked on `scatter_mean` dtype mismatch — see profile_analysis.md. |
-| Share d_lm↔D_concept projections (bridge / read-attn / write-attn) | 3-5% | medium | Three separate copies of the same shape projection today. |
-| Llama-block gradient checkpointing | 0% speed, ~50% VRAM | small | Lets us push T1 to BS=8+ (gradient quality not throughput). |
-
----
-
-## 2026-05-10 — KV cache landed: trajmem now matches/beats vanilla
-
-Sliding KV cache implemented for both Phase 1 (rolling LM context buffer)
-and Phase 2 (AR sampling + TF replay). HF DynamicCache, sliding-window
-trimmed to `effective_lm_context`. Cache carries across windows of a
-chunk; detached at chunk boundaries (mirrors `prev_states.detach()`).
-
-Vanilla GRPO sampling in `bench_compare.py` was previously not using
-KV cache — that handicapped vanilla unfairly. Fixed: V2 now uses HF
-DynamicCache for AR. Both vanilla + trajmem benched at each path's
-max-fitting BS / K (project convention).
-
-| Path | BS / K | tok/s | peak GB | ms/iter |
-|------|-------:|------:|--------:|--------:|
-| **Phase 1** (T=1024) |  |  |  |  |
-| V1.A — vanilla Llama fwd (no_grad)         | BS=48 | **48.7k** | 16.90 | 1009 |
-| V1.B — vanilla Llama lm_head TF step       | BS=5  | **16.9k** | 20.32 |  302 |
-| T1   — Llama + trajmem step (KV cache)     | BS=4  | **17.7k** | **15.07** |  232 |
-| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
-| V2   — vanilla Llama GRPO step (KV cache)  | K=12  | **169.5** | 21.65 | 4530 |
-| T2   — Llama + trajmem two-pass GRPO (KV cache) | K=6   | **104.8** | 20.92 | 3664 |
-
-**Per-path slowdowns (this AM table):**
-- **T1 vs V1.B: 0.96× — trajmem is now FASTER than vanilla**, with 5 GB
-  less memory peak. Memory module pays for itself by letting Llama do
-  smaller per-window forwards.
-- T2 vs V2: 1.62× — vanilla Phase 2 fits twice the K (12 vs 6), reflecting
-  the genuine memory cost of read+write per generation window. Both
-  paths got 3-4× faster overall vs the no-KV baseline below.
-
-> Note: this 1.62× gap is for the AM (KV cache only) bench. The PM
-> "shared-prefill" bench below pushes T2 to K=16 / 132.8 tok/s, closing
-> the gap to ~1.31× and roughly halving peak memory. See the PM table.
-
-**Trainer flag:** `train_wave{1,2}.py --no-kv-cache` to opt out (KV
-cache defaults ON post-2026-05-10).
-
-**Comparison vs the no-KV-cache baseline (above table):**
-
-| Path | Old tok/s | New tok/s | Speedup |
-|------|----------:|----------:|--------:|
-| T1 (Phase 1 trajmem) | 9.9k | **17.7k** | **1.79×** |
-| V2 (vanilla GRPO) | 42.5 | **169.5** | **4.00×** |
-| T2 (trajmem GRPO) | 32.4 | **104.8** | **3.23×** |
-
-The Phase 1 1.72× T1-vs-V1.B gap from yesterday is **completely closed**
-— trajmem now beats vanilla per-token AND uses less memory. The
-prior measurement bottleneck (rolling buffer re-encoding per window)
-turned out to be the entire architectural cost; sliding KV cache made
-it disappear.
-
-**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
-
-### Phase 2 architectural fix bundled with KV cache
-
-The pre-KV `_ar_sample_one` was also incorrect: it called
-`forward_window` per generated token, which fired read+write per token
-(should be per memory window per design). Fixed alongside the cache
-work — read fires once per generation window, write fires once per
-generation window (with surprise=0 per plan §5.4, since AR-generated
-tokens have no NTP target). KV cache makes the per-token LM forwards
-cheap.
-
----
-
-## 2026-05-10 — Phase 2 GRPO correctness + shared-prefill efficiency
-
-Big GRPO refactor landed across five phases (A-F). Adds the
-correctness pieces production GRPO implementations all carry (KL term,
-PPO importance-sampling clip, length-bias-free loss aggregation) AND
-the shared-prefill efficiency win for pass 2.
-
-### Final per-path table
-
-| Path | BS / K | tok/s | peak GB | ms/iter |
-|------|-------:|------:|--------:|--------:|
-| **Phase 1** (T=1024) |  |  |  |  |
-| V1.A — vanilla Llama fwd (no_grad)              | BS=48 | **48.7k** | 16.90 | 1009 |
-| V1.B — vanilla Llama lm_head TF step            | BS=5  | **16.9k** | 20.32 |  302 |
-| T1   — Llama + trajmem step (KV cache)          | BS=4  | **17.7k** | 15.07 |  231 |
-| **Phase 2** (T_prompt=1024, T_gen=64) |  |  |  |  |
-| V2   — vanilla Llama GRPO step (KV cache)       | K=12  | **173.6** | 21.65 | 4425 |
-| T2   — Llama + trajmem GRPO (KV+shared prefill) | **K=16** | **132.8** | **12.78** | 7709 |
-
-### Phase D shared-prefill memory + K wins
-
-The dominant pass-2 cost was K full forwards through (prompt + sample)
-each with their own activation graph. Phase D refactor: encode prompt
-ONCE no_grad, then K per-sample TF forwards start from that shared
-prefill state. Cost of "no_grad prefill": prompt-position writes don't
-get gradient (only sample-position writes do). Acceptable — GRPO is
-optimizing the rollout policy; sample-position writes are the ones
-that directly affect reward.
-
-| Stage | T2 tok/s | T2 peak GB | T2 K |
-|-------|---------:|-----------:|-----:|
-| Pre-KV-cache (yesterday) | 32.4 | 22.00 | 4 |
-| KV cache only (today AM) | 104.8 | 20.92 | 6 |
-| KV cache + shared prefill (today PM) | **132.8** | **12.78** | **16** |
-
-Bigger K = better GRPO group-relative advantage estimates. K=16 matches
-DeepSeek-R1's group size; the project was previously at K=4-6 which
-the audit flagged as too noisy for stable GRPO.
-
-### Phase A-B-D correctness summary (also landed today)
-
-- **Dr.GRPO loss normalization** — divide by `K * max_new_tokens` not
-  just `K` (removes documented length-bias pathology, arxiv 2503.20783).
-- **PPO importance-sampling clip** — `clip(ratio, 1-ε, 1+ε)` with
-  ε=0.2 default (matches TRL/verl). Optional asymmetric upper clip
-  via `--clip-eps-higher` (DeepSeek-R1's `clip_higher` mode).
-- **KL regularization to reference policy** — `β * D_KL(π_θ ‖ π_ref)`
-  with β=0.001 (verl default). Reference is the loaded `--checkpoint-in`
-  weights at start of Phase 2. K3 estimator. Param-swap pattern shares
-  the ref forward across K samples (one swap-cycle per step).
-- **Eval methods now use KV cache** — eval_wave1/eval_wave2 had the
-  rolling-buffer fallback, busting compile cache on every val pass.
-  Now matches training mode.
-- **Partial-window write fix** — when AR stops mid-window, don't pad
-  with zeros and write to manifold (would scatter zero into selected
-  concept slots). If n_win < T/2, skip the write; else pad with the
-  last real hidden.
-- **Default temperature** 1.0 → 0.7 (matches DeepSeek-R1, verl).
-
-### CLI flags added
-
-```bash
---clip-eps        0.2     # PPO IS clip width (TRL/verl default)
---clip-eps-higher None    # DeepSeek-R1 asymmetric upper bound
---kl-coef         0.001   # KL term weight (verl default; 0 disables)
---no-compile              # opt out of torch.compile (default ON)
-```
-
-### Diagnostics added to `Phase2Metrics`
-
-- `clip_fraction`: % of tokens where ratio was clipped this step
-- `mean_ratio`: mean(ratio); should stay near 1.0
-- `kl_to_ref`: mean per-token K3 KL estimate; rises if drift exceeds reg
-
-Surfaced in trainer log lines.
-
-**Reproducing:** `PYTHONPATH=. python scripts/bench/bench_compare.py`
 
 ## Cross-references
 

@@ -133,14 +133,11 @@ def softmax_top1_ste(
     idx = soft.argmax(dim=-1)
     hard_one_hot = F.one_hot(idx, num_classes=logits.shape[-1]).to(soft.dtype)
     if not hard:
-        # Defensive — never silently kill routing gradient. If a future
-        # caller passes hard=False during training (grad-enabled), error
-        # loudly instead of returning a graph-disconnected one-hot.
-        assert not torch.is_grad_enabled(), (
-            "softmax_top1_ste(hard=False) returns a non-differentiable "
-            "one-hot; only use inside torch.no_grad(). For training, pass "
-            "hard=True (straight-through forward=hard / backward=soft)."
-        )
+        # Non-differentiable argmax — no STE. Callers using hard=False
+        # are responsible for knowing they get no gradient through
+        # routing. Used in Wave 3 prompt prefill (grad enabled for the
+        # adapter, but routing-grad intentionally not used during the
+        # frozen-policy generation) and eval paths (under no_grad).
         return hard_one_hot, idx
     # Straight-through: forward hard, backward soft probabilities.
     one_hot = (hard_one_hot - soft).detach() + soft

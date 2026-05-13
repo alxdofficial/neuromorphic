@@ -117,6 +117,8 @@ class Phase2Trainer:
         clip_eps: float = 0.2,
         clip_eps_higher: float | None = None,
         kl_coef: float = 0.001,
+        use_static_cache: bool = False,
+        use_cuda_graph: bool = False,
     ):
         """
         Args:
@@ -132,6 +134,27 @@ class Phase2Trainer:
                 Default 0.001 matches verl. Set to 0 to disable. Reference
                 policy must be set via `set_reference_state()` for KL to
                 fire.
+            use_static_cache: when True, Pass-1 AR rollout for
+                BS_outer > 1 uses a pre-allocated `StaticCache` at
+                `[M*K, n_kv_heads, cap + max_new, head_dim]` instead of
+                stacking M cloned `DynamicCache`s. **Default False**
+                because bench (2026-05-13) at our config showed it
+                ~34% SLOWER per step than DynamicCache: HF Llama-3.2-1B's
+                attention computes over the full pre-allocated buffer
+                regardless of how many positions are filled (~5-10%
+                more attention work, plus more buffer-bandwidth pressure
+                — and that compounds). Kept as an opt-in for future
+                experiments (e.g., on a backbone where the pre-allocated
+                buffer is small relative to the per-token compute).
+            use_cuda_graph: when True, captures the steady-state per-token
+                decode kernel sequence after a few warmup tokens and
+                replays it for the remaining tokens of each AR window.
+                Requires `use_static_cache=True`. **Default False**
+                because bench showed the gain (kernel-launch savings) did
+                NOT compensate for StaticCache's higher per-token compute
+                cost — net slower than the DynamicCache baseline. Only
+                takes effect in the BS_outer > 1 path
+                (`_ar_sample_outer_batch`).
         """
         self.model = model
         self.optimizer = optimizer
@@ -140,6 +163,8 @@ class Phase2Trainer:
         self.clip_eps = clip_eps
         self.clip_eps_higher = clip_eps_higher
         self.kl_coef = kl_coef
+        self.use_static_cache = use_static_cache
+        self.use_cuda_graph = use_cuda_graph and use_static_cache
         self._step_count = 0
         # Reference policy snapshot (Phase B): set ONCE via
         # `set_reference_state()` before training starts. Used for KL
@@ -1419,6 +1444,69 @@ class Phase2Trainer:
             out.layers.append(out_layer)
         return out
 
+    def _dynamic_to_static_cache(
+        self, caches: list, K_per_cache: int, max_cache_len: int,
+        device: torch.device, dtype: torch.dtype,
+    ):
+        """Allocate a `StaticCache` at `[M*K, n_kv_heads, max_cache_len,
+        head_dim]` and slot-fill from M BS=1 DynamicCaches. Used by the
+        BS_outer > 1 AR path when `use_static_cache=True`.
+
+        Layout mirrors `_stack_kv_caches`:
+          rows [0:K]       = K replicas of caches[0]
+          rows [K:2K]      = K replicas of caches[1]
+          ...
+
+        max_cache_len must be >= longest input cache's seq_length, and
+        should equal `cfg.effective_lm_context + max_new_tokens` so that
+        the AR loop never overflows (no per-window trim needed).
+        """
+        from transformers import StaticCache
+        if not caches:
+            return None
+        # All inputs must have the same prefill length (length-bucketed).
+        lengths = [c.get_seq_length() for c in caches if c is not None]
+        assert lengths, "no caches to convert"
+        assert len(set(lengths)) == 1, (
+            f"_dynamic_to_static_cache requires same prefill length; "
+            f"got {lengths}"
+        )
+        T_prompt = lengths[0]
+        assert T_prompt <= max_cache_len, (
+            f"prefill {T_prompt} exceeds max_cache_len {max_cache_len}"
+        )
+        M = len(caches)
+        BS = M * K_per_cache
+
+        # Probe head/dim from layer 0.
+        lay0 = caches[0].layers[0]
+        n_kv_heads = lay0.keys.shape[1]
+        head_dim = lay0.keys.shape[3]
+
+        sc = StaticCache(config=self.model.llama.config, max_cache_len=max_cache_len)
+        sc.early_initialization(
+            batch_size=BS, num_heads=n_kv_heads, head_dim=head_dim,
+            dtype=dtype, device=device,
+        )
+
+        # Slot-fill each layer: for each prompt g, copy its BS=1 K/V into
+        # rows [g*K : (g+1)*K], positions [:T_prompt].
+        n_layers = len(caches[0].layers)
+        for li in range(n_layers):
+            dst_k = sc.layers[li].keys     # [BS, n_kv_heads, max_cache_len, head_dim]
+            dst_v = sc.layers[li].values
+            for g, c in enumerate(caches):
+                src_k = c.layers[li].keys    # [1, n_kv_heads, T_prompt, head_dim]
+                src_v = c.layers[li].values
+                # expand(K, ...) makes K aliasing views — contiguous() materializes.
+                dst_k[g * K_per_cache:(g + 1) * K_per_cache, :, :T_prompt, :] = (
+                    src_k.to(dtype).expand(K_per_cache, -1, -1, -1)
+                )
+                dst_v[g * K_per_cache:(g + 1) * K_per_cache, :, :T_prompt, :] = (
+                    src_v.to(dtype).expand(K_per_cache, -1, -1, -1)
+                )
+        return sc
+
     @torch.no_grad()
     def _ar_sample_batch(
         self,
@@ -1727,9 +1815,27 @@ class Phase2Trainer:
             torch.cat(lrh_pieces, dim=0) if lrh_pieces else None
         )                                                                       # [BS, 1, d_lm] or None
 
-        # ── Stack M cloned BS=1 caches → BS=M*K via the helper.
-        cloned_caches = [_copy.deepcopy(prefill[2]) for prefill in prefills]
-        kv_cache = self._stack_kv_caches(cloned_caches, K_per_cache=K)
+        # ── Stack M BS=1 caches → BS=M*K. Two paths:
+        #   - use_static_cache=False (legacy): clone M DynamicCaches, then
+        #     concat into one BS=M*K DynamicCache. Cache grows as AR runs,
+        #     gets trimmed at end of each window to keep last `cap` tokens.
+        #   - use_static_cache=True (default): allocate one StaticCache at
+        #     [M*K, n_kv, cap + max_new_tokens, head_dim] and slot-fill from
+        #     the M BS=1 DynamicCaches. Fixed buffer → no growth, no trim,
+        #     cuda-graph friendly. Llama attends to `cap + n_gen_so_far`
+        #     instead of strictly `cap` — small soft cap relaxation, fine
+        #     for Phase 2 (frozen Llama, gradient flows to memory).
+        if self.use_static_cache:
+            kv_max_len = cap + max_new_tokens
+            kv_dtype = next(self.model.llama.parameters()).dtype
+            kv_cache = self._dynamic_to_static_cache(
+                [prefill[2] for prefill in prefills],
+                K_per_cache=K, max_cache_len=kv_max_len,
+                device=device, dtype=kv_dtype,
+            )
+        else:
+            cloned_caches = [_copy.deepcopy(prefill[2]) for prefill in prefills]
+            kv_cache = self._stack_kv_caches(cloned_caches, K_per_cache=K)
 
         # ── Output buffers.
         generated = torch.full(
@@ -1771,6 +1877,21 @@ class Phase2Trainer:
         _update_finished(first_tokens)
 
         # ── Generation windows.
+        # CUDA-graph state — recaptured at each window's start (one capture
+        # per window's worth of decodes, then replayed for the rest).
+        # Per-window because mem_inject.memory_fn is re-bound to a new
+        # closure (new flat_traj tensor) at each window; the captured
+        # kernels reference the previous window's flat_traj memory and
+        # would feed stale memory readouts on replay otherwise.
+        cuda_graph_active = (
+            self.use_cuda_graph and self.use_static_cache and kv_cache is not None
+        )
+        # Number of warmup tokens before capturing. The first 1-2 tokens
+        # may differ from steady state (cuBLAS algo autotune, lazy allocations)
+        # so we don't capture them — capture at WARMUP_ITERS index and
+        # replay for iters > WARMUP_ITERS.
+        WARMUP_ITERS = 2
+
         while n_gen < max_new_tokens and not finished.all():
             if prev_window_hiddens is None:
                 prev_window_hiddens = torch.zeros(
@@ -1786,27 +1907,76 @@ class Phase2Trainer:
 
             window_hiddens_list: list[Tensor] = []
             n_window = min(T, max_new_tokens - n_gen)
+
+            # Per-window CUDA-graph state (reset each window).
+            decode_graph: torch.cuda.CUDAGraph | None = None
+            input_ids_buf: Tensor | None = None
+            cache_position_buf: Tensor | None = None
+            position_ids_buf: Tensor | None = None
+            captured_hidden: Tensor | None = None
             try:
-                for _ in range(n_window):
+                for tok_idx in range(n_window):
                     last_token = generated[:, n_gen - 1:n_gen]                  # [BS, 1]
                     cache_len_now = (
                         kv_cache.get_seq_length() if kv_cache is not None else 0
                     )
-                    cache_position = torch.tensor(
-                        [cache_len_now], dtype=torch.int64, device=device,
+                    if isinstance(cache_len_now, Tensor):
+                        cache_len_now = int(cache_len_now.item())
+                    cur_pos_ids = abs_pos_per_row.unsqueeze(-1)                # [BS, 1]
+
+                    use_graph_now = (
+                        cuda_graph_active and tok_idx >= WARMUP_ITERS
                     )
-                    # Per-row position_ids — each row has its own abs_pos.
-                    position_ids = abs_pos_per_row.unsqueeze(-1)               # [BS, 1]
-                    base_out = self.model.llama.model(
-                        input_ids=last_token,
-                        past_key_values=kv_cache,
-                        cache_position=cache_position,
-                        position_ids=position_ids,
-                        use_cache=True,
-                    )
+                    if use_graph_now and decode_graph is None:
+                        # ── CAPTURE at first post-warmup token.
+                        input_ids_buf = last_token.detach().clone().contiguous()
+                        cache_position_buf = torch.tensor(
+                            [cache_len_now], dtype=torch.int64, device=device,
+                        )
+                        position_ids_buf = cur_pos_ids.detach().clone().contiguous()
+                        # PyTorch idiom: settle allocator + stream sync, then capture.
+                        torch.cuda.synchronize()
+                        s = torch.cuda.Stream()
+                        s.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(s):
+                            decode_graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(decode_graph):
+                                cap_out = self.model.llama.model(
+                                    input_ids=input_ids_buf,
+                                    past_key_values=kv_cache,
+                                    cache_position=cache_position_buf,
+                                    position_ids=position_ids_buf,
+                                    use_cache=True,
+                                )
+                                captured_hidden = cap_out.last_hidden_state
+                        torch.cuda.current_stream().wait_stream(s)
+                        # The capture pass itself executed the forward at
+                        # this iteration's inputs (StaticCache was advanced
+                        # by one slot at cache_position cache_len_now).
+                        hidden = captured_hidden.clone()
+                    elif use_graph_now:
+                        # ── REPLAY.
+                        input_ids_buf.copy_(last_token)
+                        cache_position_buf.fill_(cache_len_now)
+                        position_ids_buf.copy_(cur_pos_ids)
+                        decode_graph.replay()
+                        hidden = captured_hidden.clone()
+                    else:
+                        # Eager warmup iterations (and the non-cuda-graph path).
+                        cache_position = torch.tensor(
+                            [cache_len_now], dtype=torch.int64, device=device,
+                        )
+                        base_out = self.model.llama.model(
+                            input_ids=last_token,
+                            past_key_values=kv_cache,
+                            cache_position=cache_position,
+                            position_ids=cur_pos_ids,
+                            use_cache=True,
+                        )
+                        kv_cache = base_out.past_key_values
+                        hidden = base_out.last_hidden_state                     # [BS, 1, d_lm]
+
                     abs_pos_per_row = abs_pos_per_row + 1
-                    kv_cache = base_out.past_key_values
-                    hidden = base_out.last_hidden_state                         # [BS, 1, d_lm]
                     window_hiddens_list.append(hidden)
 
                     logits = self.model.llama.lm_head(hidden).float()
@@ -1889,7 +2059,10 @@ class Phase2Trainer:
                 prev_states = new_states
                 prev_window_hiddens = cur_hiddens_padded
 
-            kv_cache = _trim_kv_cache(kv_cache, cap)
+            # Trim only applies to the DynamicCache path. StaticCache has
+            # fixed max_cache_len = cap + max_new_tokens and never overflows.
+            if not self.use_static_cache:
+                kv_cache = _trim_kv_cache(kv_cache, cap)
 
         # ── Split per-row outputs into M groups of K, truncate each at first stop.
         samples_grouped: list[list[Tensor]] = []
