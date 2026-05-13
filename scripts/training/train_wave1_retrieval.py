@@ -72,6 +72,10 @@ def parse_args():
                          "8 writes + 1 read.")
     ap.add_argument("--load-balance-coef", type=float, default=1e-2)
     ap.add_argument("--z-loss-coef", type=float, default=1e-3)
+    ap.add_argument("--flat-bank", action="store_true",
+                    help="Architectural ablation: use FlatReadModule / "
+                         "FlatWriteModule (top-K cell attention, no graph "
+                         "walks). Same manifold size, simpler mechanism.")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--val-batches", type=int, default=20,
@@ -152,7 +156,9 @@ def main():
     # ── Model ──
     cfg = getattr(TrajMemConfig, args.config_tier)()
     cfg.D = max(cfg.D, args.tbptt_depth)
+    cfg.flat_bank = args.flat_bank
     cfg.validate()
+    print(f"Architecture: {'flat-bank (top-K)' if cfg.flat_bank else 'trajectory (graph walks)'}")
     print(f"Config: N={cfg.N}, D_concept={cfg.D_concept}, J={cfg.J}, "
           f"T_window={cfg.T_window}, D={cfg.D}, "
           f"effective_lm_context={cfg.effective_lm_context}", flush=True)

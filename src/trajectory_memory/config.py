@@ -95,6 +95,13 @@ class TrajMemConfig:
     seed_topology: int = 0
     seed_concepts: int = 0
 
+    # ── Architectural ablation ─────────────────────────────────────────
+    # flat_bank=True swaps the trajectory read/write modules for simpler
+    # top-K cell-attention modules over the same 4096×D_concept manifold.
+    # Used to test whether the trajectory + graph machinery adds value
+    # over a flat memory bank at same capacity.
+    flat_bank: bool = False
+
     # Note on dtype policy: memory params (concept_ids, concept_states,
     # MLPs) always stay in fp32 — bf16 weight updates round small Adam
     # steps to zero (same lesson as graph_walker / pretrained). Llama's

@@ -34,6 +34,7 @@ from src.trajectory_memory.config import TrajMemConfig
 from src.trajectory_memory.manifold import Manifold
 from src.trajectory_memory.read_module import EntryProjector, ReadTrajectoryGenerator
 from src.trajectory_memory.write_module import WriteTrajectoryGenerator
+from src.trajectory_memory.flat_modules import FlatReadModule, FlatWriteModule
 
 
 class TrajectoryReadAttn(nn.Module):
@@ -165,8 +166,15 @@ class IntegratedLM(nn.Module):
         # through write's params via downstream reads. See
         # docs/plan_trajectory_memory.md (write-grad fix) for context.
         self.entry_proj = EntryProjector(cfg)
-        self.read_module = ReadTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
-        self.write_module = WriteTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
+        # Architectural ablation: cfg.flat_bank=True swaps the trajectory
+        # read/write modules for simpler top-K-cell flat-attention modules.
+        # Default False = the trajectory design.
+        if getattr(cfg, "flat_bank", False):
+            self.read_module = FlatReadModule(cfg)
+            self.write_module = FlatWriteModule(cfg)
+        else:
+            self.read_module = ReadTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
+            self.write_module = WriteTrajectoryGenerator(cfg, entry_proj=self.entry_proj)
         self.read_attn = TrajectoryReadAttn(cfg.D_concept)
 
     # ── memory wiring helpers ────────────────────────────────────────
