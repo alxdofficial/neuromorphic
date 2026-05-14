@@ -109,7 +109,15 @@ def routing_aux_losses(
 # Shazeer 2017 noisy gating std for trajectory-routing softmax during
 # training. Encourages exploration of new cells; combats early routing
 # collapse (where one cell wins and never lets go).
-_ROUTING_NOISE_STD = 0.5
+#
+# Set to 0.0 after a calibration run: noise=0.5 combined with the smaller
+# init below drowned routing signal — logit_scale_raw failed to grow,
+# w_gn stuck near zero, model degenerated to "mem_inject does everything"
+# (same failure mode as the broken flat-bank). Lower-temperature softmax
+# (logit_scale_init=0.5) + small init (std=0.05) are doing the exploration
+# work without needing additional noise. Re-enable (e.g. 0.2 with anneal)
+# if mode collapse re-emerges in later experiments.
+_ROUTING_NOISE_STD = 0.0
 
 
 def softmax_top1_ste(
@@ -354,15 +362,16 @@ class EntryProjector(nn.Module):
             nn.GELU(),
             nn.Linear(D, D, bias=True),
         )
-        # Small router init (Switch / GShard convention). Default nn.Linear
-        # init was concentrating routing onto a tiny manifold subset
-        # (~8.7% of cells; see project_trajectory_underperformance_diagnosis
-        # memory). Smaller init keeps initial routing near-uniform so the
-        # load-balance aux + training gradient can spread queries before
-        # any single cell wins decisively.
-        nn.init.normal_(self.entry_mlp[0].weight, std=0.01)
+        # Smaller-than-Xavier router init (Switch / GShard inspiration).
+        # Default nn.Linear init was concentrating routing onto ~8.7% of
+        # cells (see project_trajectory_underperformance_diagnosis memory).
+        # std=0.05 is ~half of Xavier-fan-in (~0.04 std at this layer
+        # width); keeps initial routing softer without going so small that
+        # entry_mlp outputs are ~zero (std=0.01 over-corrected: noise
+        # had nothing to fight against, logit_scale couldn't grow).
+        nn.init.normal_(self.entry_mlp[0].weight, std=0.05)
         nn.init.zeros_(self.entry_mlp[0].bias)
-        nn.init.normal_(self.entry_mlp[-1].weight, std=0.01)
+        nn.init.normal_(self.entry_mlp[-1].weight, std=0.05)
         nn.init.zeros_(self.entry_mlp[-1].bias)
 
     def forward(self, pooled: Tensor) -> Tensor:
