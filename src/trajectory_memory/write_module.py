@@ -168,8 +168,12 @@ class WriteTrajectoryGenerator(nn.Module):
         )                                                         # ∈ [-1, 1]
         eff_scale = self.logit_scale_raw.exp().clamp(max=20.0)
         entry_logits = entry_logits_raw * eff_scale
+        # Shazeer 2017 noisy gating during training: prevents early routing
+        # collapse onto a small manifold subset.
+        from src.trajectory_memory.read_module import _ROUTING_NOISE_STD
+        _noise = _ROUTING_NOISE_STD if self.training else 0.0
         entry_one_hot, entry_idx = softmax_top1_ste(
-            entry_logits, hard=hard,
+            entry_logits, hard=hard, noise_std=_noise,
         )                                                         # [BS, J, N], [BS, J]
         # Routing aux losses — z_loss on the unscaled cosine to avoid
         # fighting logit_scale_raw growth.
@@ -231,7 +235,7 @@ class WriteTrajectoryGenerator(nn.Module):
             )                                                     # ∈ [-1, 1]
             nbr_logits = nbr_logits_raw * eff_scale
             nbr_one_hot, next_local = softmax_top1_ste(
-                nbr_logits, hard=hard,
+                nbr_logits, hard=hard, noise_std=_noise,
             )                                                     # [BS, J, K_max], [BS, J]
             _aux_h = routing_aux_losses(
                 nbr_logits, nbr_one_hot, z_loss_logits=nbr_logits_raw,

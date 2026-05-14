@@ -70,7 +70,11 @@ def parse_args():
                     help="TBPTT depth in windows. Set to 9 (or higher) for "
                          "this protocol so write-gradients flow through all "
                          "8 writes + 1 read.")
-    ap.add_argument("--load-balance-coef", type=float, default=1e-2)
+    # Bumped from 1e-2 → 3e-2. Standard MoE uses ~1e-2 for 64-128 experts;
+    # we have N=4096 cells, so spreading routing across all of them needs
+    # proportionally stronger pressure. Combats the observed 8.7%-cell-
+    # utilization mode collapse in the trajectory model.
+    ap.add_argument("--load-balance-coef", type=float, default=3e-2)
     ap.add_argument("--z-loss-coef", type=float, default=1e-3)
     ap.add_argument("--flat-bank", action="store_true",
                     help="Architectural ablation: use FlatReadModule / "

@@ -78,7 +78,13 @@ class TrajMemConfig:
     # With softmax-STE (no Gumbel), the scale governs softmax temperature
     # directly: too small → flat softmax → no specialization; too large →
     # peaked softmax → gradient only flows to top-1.
-    logit_scale_init: float = 1.5
+    # Initial value of the learnable softmax temperature (log-scale): the
+    # effective scale is exp(logit_scale_init). Lower init -> closer to
+    # uniform softmax -> more exploration early in training. Was 1.5
+    # (exp ≈ 4.5, confident routing from step 1); lowered to 0.5
+    # (exp ≈ 1.65) so the load-balance aux can spread queries before
+    # one cell locks in.
+    logit_scale_init: float = 0.5
 
     # ── magnitude bounding ────────────────────────────────────────────
     # Apply normalization at consumption boundaries so unbounded parameter

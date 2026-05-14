@@ -106,40 +106,41 @@ def routing_aux_losses(
     return {"load_balance": load_balance, "z_loss": z_loss}
 
 
+# Shazeer 2017 noisy gating std for trajectory-routing softmax during
+# training. Encourages exploration of new cells; combats early routing
+# collapse (where one cell wins and never lets go).
+_ROUTING_NOISE_STD = 0.5
+
+
 def softmax_top1_ste(
     logits: Tensor,
     *,
     hard: bool,
+    noise_std: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
     """Softmax-top-1 with straight-through estimator (no Gumbel noise).
 
     Modern MoE pattern (Mixtral / DeepSeek). Forward picks argmax; backward
     routes through softmax probabilities.
 
-    Why no Gumbel: with cosine routing the logits are bounded in [-1, 1],
-    so Gumbel(0,1) noise (std ~1.28) dominates the signal — routing is
-    random regardless of weights. Pre-multiplying logits by a learnable
-    `logit_scale` (caller's responsibility) restores signal dominance.
-    Without the noise term, exploration comes from random init + the
-    load-balance aux loss, same as standard MoE.
+    `noise_std > 0` adds Gaussian noise to logits before softmax (Shazeer
+    2017 noisy gating). Encourages exploration during training; combats
+    early routing collapse where one cell wins and never lets go. Set this
+    only when training; pass 0 at eval.
 
     `hard=False` returns the argmax one-hot directly without an STE path.
     That hard one-hot has no autograd link back to `logits` (argmax is
     non-differentiable) — so this branch silently kills gradient into
     routing. It's safe inside `torch.no_grad()` (inference / eval) but
-    a trap during training. The assert below catches the trap.
+    a trap during training.
     """
+    if noise_std > 0:
+        logits = logits + noise_std * torch.randn_like(logits)
     soft = F.softmax(logits, dim=-1)
     idx = soft.argmax(dim=-1)
     hard_one_hot = F.one_hot(idx, num_classes=logits.shape[-1]).to(soft.dtype)
     if not hard:
-        # Non-differentiable argmax — no STE. Callers using hard=False
-        # are responsible for knowing they get no gradient through
-        # routing. Used in Wave 3 prompt prefill (grad enabled for the
-        # adapter, but routing-grad intentionally not used during the
-        # frozen-policy generation) and eval paths (under no_grad).
         return hard_one_hot, idx
-    # Straight-through: forward hard, backward soft probabilities.
     one_hot = (hard_one_hot - soft).detach() + soft
     return one_hot, idx
 
@@ -353,6 +354,16 @@ class EntryProjector(nn.Module):
             nn.GELU(),
             nn.Linear(D, D, bias=True),
         )
+        # Small router init (Switch / GShard convention). Default nn.Linear
+        # init was concentrating routing onto a tiny manifold subset
+        # (~8.7% of cells; see project_trajectory_underperformance_diagnosis
+        # memory). Smaller init keeps initial routing near-uniform so the
+        # load-balance aux + training gradient can spread queries before
+        # any single cell wins decisively.
+        nn.init.normal_(self.entry_mlp[0].weight, std=0.01)
+        nn.init.zeros_(self.entry_mlp[0].bias)
+        nn.init.normal_(self.entry_mlp[-1].weight, std=0.01)
+        nn.init.zeros_(self.entry_mlp[-1].bias)
 
     def forward(self, pooled: Tensor) -> Tensor:
         """pooled: [BS, d_lm] → Q_entry: [BS, J, D_concept]."""
@@ -480,8 +491,9 @@ class ReadTrajectoryGenerator(nn.Module):
         # exp(logit_scale_raw).clamp(max=20) — learnable, init exp(1.5)≈4.5.
         eff_scale = self.logit_scale_raw.exp().clamp(max=20.0)
         entry_logits = entry_logits_raw * eff_scale
+        _noise = _ROUTING_NOISE_STD if self.training else 0.0
         entry_one_hot, entry_idx = softmax_top1_ste(
-            entry_logits, hard=hard,
+            entry_logits, hard=hard, noise_std=_noise,
         )                                                         # [BS, J, N], [BS, J]
         # Accumulate routing aux losses (Switch load-balance + ST-MoE z-loss).
         # z_loss on the raw (unscaled) cosine logits so it doesn't oppose
@@ -547,7 +559,7 @@ class ReadTrajectoryGenerator(nn.Module):
             )                                                     # [BS, J, K_max] ∈ [-1,1]
             nbr_logits = nbr_logits_raw * eff_scale
             nbr_one_hot, next_local = softmax_top1_ste(
-                nbr_logits, hard=hard,
+                nbr_logits, hard=hard, noise_std=_noise,
             )                                                     # [BS, J, K_max], [BS, J]
             _aux_hop = routing_aux_losses(
                 nbr_logits, nbr_one_hot, z_loss_logits=nbr_logits_raw,
