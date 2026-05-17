@@ -33,7 +33,7 @@ from src.trajectory_memory_v2.config import TrajMemV2Config
 from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
 from src.trajectory_memory_v2.trainer import Phase1RetrievalTrainerV2
 from scripts.data.wave1.common.sampler import CompositeRetrievalAdapter
-from src.trajectory_memory.training.phase1_retrieval import RetrievalSampler  # reused
+from src.trajectory_memory_v2._data import RetrievalSampler
 
 
 def get_tokenizer():

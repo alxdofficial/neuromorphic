@@ -27,8 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from src.pretrained.hosts import build_host
 from src.pretrained.mem_inject_layer import MemInjectLayer
-from src.trajectory_memory.integrated_lm import TrajectoryReadAttn
-from src.trajectory_memory.read_module import EntryProjector
+from src.trajectory_memory_v2._shared import EntryProjector, TrajectoryReadAttn
 from src.trajectory_memory_v2.config import TrajMemV2Config
 from src.trajectory_memory_v2.manifold import VocabularyManifold
 from src.trajectory_memory_v2.read_module import ReadModule

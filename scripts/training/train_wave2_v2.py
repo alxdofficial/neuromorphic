@@ -27,7 +27,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.trajectory_memory.training.loaders import TurnPairDataset  # reuse v1 loader
+from src.trajectory_memory_v2._data import TurnPairDataset
 from src.trajectory_memory_v2.config import TrajMemV2Config
 from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
 from src.trajectory_memory_v2.wave2_trainer import Wave2TrainerV2

@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch.nn as nn
 from torch import Tensor
 
-from src.trajectory_memory.read_module import EntryProjector
+from src.trajectory_memory_v2._shared import EntryProjector
 from src.trajectory_memory_v2.config import TrajMemV2Config
 from src.trajectory_memory_v2.manifold import VocabularyManifold
 from src.trajectory_memory_v2.walker import TrajectoryWalker, WalkerResult

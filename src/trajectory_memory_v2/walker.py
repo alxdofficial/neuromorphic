@@ -39,10 +39,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# Import shared utilities from v1 — these are unchanged.
-from src.trajectory_memory.read_module import (
+from src.trajectory_memory_v2._shared import (
+    CrossAttention,
     EntryProjector,
-    _CrossAttn as CrossAttention,
     per_j_attn,
     routing_aux_losses,
     softmax_top1_ste,
