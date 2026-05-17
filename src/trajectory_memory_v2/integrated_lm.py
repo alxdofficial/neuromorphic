@@ -127,6 +127,11 @@ class IntegratedLMV2(nn.Module):
 
     # ── per-window forward ───────────────────────────────────────────
 
+    def forward(self, *args, **kwargs):
+        """Alias to forward_window. Required for torch.func.functional_call,
+        which dispatches through nn.Module.__call__ → forward."""
+        return self.forward_window(*args, **kwargs)
+
     def forward_window(
         self,
         lm_input_ids: Tensor,                            # [BS, T]

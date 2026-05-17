@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.func import functional_call
 from torch.optim import Optimizer
 
 from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
@@ -98,7 +99,7 @@ class Wave3TrainerV2:
         self.load_balance_coef = load_balance_coef if load_balance_coef is not None else cfg.load_balance_coef
         self.z_loss_coef = z_loss_coef if z_loss_coef is not None else cfg.z_loss_coef
         self._step_count = 0
-        self._ref_model: Optional[IntegratedLMV2] = None
+        self._ref_params: Optional[dict[str, Tensor]] = None
 
     @property
     def step_count(self) -> int:
@@ -112,14 +113,21 @@ class Wave3TrainerV2:
 
     @torch.no_grad()
     def set_reference_state(self) -> None:
-        """Snapshot current model weights as the reference policy π_ref
-        for KL regularization. Call once at the start of training (or
-        periodically to refresh; the original GRPO recipe keeps it fixed)."""
-        # Snapshot only Llama's lm_head + bridge weights + walker weights.
-        # We use a fresh IntegratedLMV2 with the same cfg but no Llama
-        # reload (share llama.model weights via deepcopy of state_dict).
-        self._ref_state_dict = {
-            k: v.detach().clone() for k, v in self.model.state_dict().items()
+        """Snapshot current model PARAMETERS as the reference policy π_ref
+        for KL regularization. Buffers (manifold edge state, step_counter,
+        etc.) are intentionally excluded so the reference forward sees the
+        LIVE memory state — the policy is being regularized, not the
+        memory contents.
+
+        Call once at the start of training (the original GRPO recipe keeps
+        the reference fixed; some variants refresh it periodically).
+        """
+        # Detached + cloned so the snapshot doesn't share storage with
+        # live params (which would defeat the purpose under any in-place
+        # update by the optimizer).
+        self._ref_params: dict[str, Tensor] = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
         }
 
     def _truncate_and_pad(self, ids: list[int], target_len: int) -> list[int]:
@@ -208,37 +216,53 @@ class Wave3TrainerV2:
             rewards.append(float(r))
         return rewards
 
-    def _compute_log_probs(
+    def _prepare_lp_inputs(
         self,
         prompt_ids_tensor: Tensor,        # [1, prompt_len]
-        prompt_mask: Tensor,              # [1, prompt_len]
         response_ids: list[int],          # generated tokens
-    ) -> Tensor:
-        """Recompute log π(response_token_t | prompt + response[:t]) per
-        token under the CURRENT policy (gradient enabled).
-
-        KL-to-reference is deferred to a follow-up — the safe pattern is
-        `torch.func.functional_call(model, ref_params, ...)` so the
-        model's live weights aren't swapped (which breaks autograd if
-        the same weights are still referenced by an in-flight backward).
-        """
+    ) -> tuple[Optional[Tensor], Optional[Tensor], int, int]:
+        """Build the (full_ids, full_mask, prompt_len, resp_len_kept) tuple
+        used by both current-policy and reference-policy log-prob compute.
+        Returns (None, None, 0, 0) if there's nothing to score."""
         device = prompt_ids_tensor.device
         if not response_ids:
-            return torch.zeros(0, device=device)
+            return None, None, 0, 0
         T = self.model.cfg.T_window
         full_ids = torch.cat([
             prompt_ids_tensor[0],
             torch.tensor(response_ids, dtype=torch.long, device=device),
         ]).unsqueeze(0)
+        prompt_len = prompt_ids_tensor.shape[1]
         if full_ids.shape[1] > T:
             full_ids = full_ids[:, :T]
-            resp_len_kept = T - prompt_ids_tensor.shape[1]
+            resp_len_kept = T - prompt_len
             if resp_len_kept <= 0:
-                return torch.zeros(0, device=device)
+                return None, None, 0, 0
         else:
             resp_len_kept = len(response_ids)
         full_mask = (full_ids != self.pad_token_id)
+        return full_ids, full_mask, prompt_len, resp_len_kept
 
+    def _gather_response_logprobs(
+        self, logits: Tensor, full_ids: Tensor, prompt_len: int, resp_len_kept: int,
+    ) -> Tensor:
+        """Slice logits → log-probs of the response tokens."""
+        resp_slice_logits = logits[0, prompt_len - 1 : prompt_len - 1 + resp_len_kept, :]
+        resp_targets = full_ids[0, prompt_len : prompt_len + resp_len_kept]
+        log_probs = F.log_softmax(resp_slice_logits.float(), dim=-1)
+        return log_probs.gather(-1, resp_targets.unsqueeze(-1)).squeeze(-1)
+
+    def _compute_log_probs(
+        self,
+        prompt_ids_tensor: Tensor,
+        response_ids: list[int],
+    ) -> Tensor:
+        """Per-token log π under the CURRENT policy. Gradient enabled."""
+        full_ids, full_mask, prompt_len, resp_len_kept = self._prepare_lp_inputs(
+            prompt_ids_tensor, response_ids,
+        )
+        if full_ids is None:
+            return torch.zeros(0, device=prompt_ids_tensor.device)
         out = self.model.forward_window(
             lm_input_ids=full_ids,
             attention_mask=full_mask,
@@ -246,13 +270,48 @@ class Wave3TrainerV2:
             hard_routing=False,
             write_mode="passage",
         )
-        logits = out["logits"]
-        prompt_len = prompt_ids_tensor.shape[1]
-        resp_slice_logits = logits[0, prompt_len - 1 : prompt_len - 1 + resp_len_kept, :]
-        resp_targets = full_ids[0, prompt_len : prompt_len + resp_len_kept]
-        log_probs = F.log_softmax(resp_slice_logits.float(), dim=-1)
-        token_lp = log_probs.gather(-1, resp_targets.unsqueeze(-1)).squeeze(-1)
-        return token_lp
+        return self._gather_response_logprobs(out["logits"], full_ids, prompt_len, resp_len_kept)
+
+    @torch.no_grad()
+    def _compute_log_probs_ref(
+        self,
+        prompt_ids_tensor: Tensor,
+        response_ids: list[int],
+    ) -> Tensor:
+        """Per-token log π under the REFERENCE policy.
+
+        Uses `torch.func.functional_call` so the live model parameters
+        are NOT modified — avoids the in-place-update autograd violation
+        a state_dict swap would trigger. Live buffers (manifold edge
+        state etc.) ARE used because we want the reference forward to
+        see the same memory state as the current-policy forward; only
+        the policy weights differ.
+        """
+        if self._ref_params is None:
+            return torch.zeros(0, device=prompt_ids_tensor.device)
+        full_ids, full_mask, prompt_len, resp_len_kept = self._prepare_lp_inputs(
+            prompt_ids_tensor, response_ids,
+        )
+        if full_ids is None:
+            return torch.zeros(0, device=prompt_ids_tensor.device)
+        # functional_call dispatches through model.__call__ → model.forward,
+        # which we aliased to forward_window in IntegratedLMV2.
+        out = functional_call(
+            self.model,
+            self._ref_params,
+            args=(full_ids,),
+            kwargs=dict(
+                attention_mask=full_mask,
+                prev_window_hiddens=None,
+                hard_routing=False,
+                write_mode="passage",
+            ),
+            tie_weights=True,
+            strict=False,
+        )
+        return self._gather_response_logprobs(
+            out["logits"], full_ids, prompt_len, resp_len_kept,
+        )
 
     def step(self, example: dict) -> V2Wave3Metrics:
         """One GRPO update step on a single prompt.
@@ -323,15 +382,23 @@ class Wave3TrainerV2:
             # the fresh post-prompt state, not the previous rollout's writes.
             snap_j = self.model.manifold.snapshot_edge_state()
             try:
-                lp_cur = self._compute_log_probs(prompt_t, prompt_mask, resp)
+                lp_cur = self._compute_log_probs(prompt_t, resp)
+                if self._ref_params is not None and self.kl_coef > 0:
+                    lp_ref = self._compute_log_probs_ref(prompt_t, resp)
+                else:
+                    lp_ref = None
             finally:
                 self.model.manifold.restore_edge_state(snap_j)
             if lp_cur.numel() == 0:
                 continue
             # Policy-gradient: -advantage · sum_t log π(token_t)
             pg_loss = pg_loss - advantages[j] * lp_cur.sum()
-            # KL term deferred — see _compute_log_probs docstring.
-            # kl_loss stays zero until ref-policy plumbing lands.
+            # KL via Schulman's k3 estimator: always-nonneg, unbiased.
+            # k3 = exp(log_ratio) - 1 - log_ratio  where log_ratio = log π/π_ref
+            if lp_ref is not None and lp_ref.numel() == lp_cur.numel():
+                log_ratio = lp_cur - lp_ref.detach()
+                k3 = log_ratio.exp() - 1.0 - log_ratio
+                kl_loss = kl_loss + k3.mean()
             n_kept += 1
             n_walker_calls += 1  # forward_window aux losses
         if n_kept == 0:
