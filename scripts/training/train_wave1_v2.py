@@ -92,6 +92,10 @@ def parse_args():
     ap.add_argument("--log-jsonl", type=str, default=None)
     ap.add_argument("--plot-path", type=str, default=None)
     ap.add_argument("--baselines-json", type=str, default=None)
+    ap.add_argument("--compile", action="store_true",
+                    help="Wrap model.llama with torch.compile. ~30-60s warmup, "
+                    "fuses kernels in the Llama forward, useful when GPU SMs "
+                    "are underutilized due to kernel-launch overhead.")
 
     return ap.parse_args()
 
@@ -121,6 +125,14 @@ def main():
     tokenizer = get_tokenizer()
     print("Loading model...", flush=True)
     model = IntegratedLMV2(cfg, model_name="meta-llama/Llama-3.2-1B").to(args.device)
+    if args.compile:
+        # Compile only the Llama backbone: stable shapes (T=256 always),
+        # bulk of the compute. The walker has dynamic shapes (active-edge
+        # count changes per step) so compiling forward_window risks
+        # recompiles; Llama-only is the safe sweet spot.
+        print("Compiling model.llama (torch.compile, mode=default)...",
+              flush=True)
+        model.llama = torch.compile(model.llama)
 
     # ── Optimizer / scheduler ──
     # Two param groups: adapter (memory + entry_proj + walker), Llama if unfrozen

@@ -78,7 +78,13 @@ class VocabularyManifold(nn.Module):
         # edge_state evolves via EMA from write traversals. Gradient
         # flows through it during backward (so signature_fn gets trained)
         # but the optimizer does not apply gradient steps to it.
-        self.register_buffer("edge_state", torch.zeros(N, K_max, D))
+        # Stored bf16: the walker reads under autocast (which casts to bf16
+        # anyway), so persistent fp32 buys no precision but doubles VRAM
+        # (~270 MB at N=4096, K_max=32, D=1024).
+        self.register_buffer(
+            "edge_state",
+            torch.zeros(N, K_max, D, dtype=torch.bfloat16),
+        )
         self.register_buffer(
             "edge_dst",
             torch.full((N, K_max), -1, dtype=torch.long),
