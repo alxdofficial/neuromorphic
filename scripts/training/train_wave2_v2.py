@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.trajectory_memory_v2._data import TurnPairDataset
 from src.trajectory_memory_v2.config import TrajMemV2Config
 from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
+from scripts.training._dashboard import DashboardRenderer
 from src.trajectory_memory_v2.wave2_trainer import Wave2TrainerV2
 
 
@@ -71,6 +72,8 @@ def parse_args():
                     help="Path to a Wave 1 v2 ckpt to warm-start from")
     ap.add_argument("--checkpoint-in", type=str, default=None)
     ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--plot-every-secs", type=float, default=180.0)
+    ap.add_argument("--plot-out", default=None)
     ap.add_argument("--log-jsonl", type=str, default=None)
 
     return ap.parse_args()
@@ -171,6 +174,18 @@ def main():
         trainer.load_state_dict(ck["trainer_state"])
         print(f"Resumed from {args.checkpoint_in} at step {trainer.step_count}")
 
+    # Dashboard (background plot renderer)
+    plot_out = args.plot_out or (
+        str(Path(args.log_jsonl).with_suffix(".plot.png")) if args.log_jsonl else None
+    )
+    dashboard = (
+        DashboardRenderer(args.log_jsonl, plot_out, args.plot_every_secs)
+        if args.log_jsonl and plot_out else None
+    )
+    if dashboard and args.plot_every_secs > 0:
+        print(f"Dashboard: re-rendering {plot_out} every {args.plot_every_secs}s",
+              flush=True)
+
     # Training loop
     t_start = time.time()
     loss_window = []
@@ -230,6 +245,9 @@ def main():
             "step_s": step_s,
             "wall_s_cumulative": wall_s_cumulative,
         })
+
+        if dashboard:
+            dashboard.maybe_render()
 
         # ── Validation ──
         if val_dataset is not None and step % args.val_every == 0:

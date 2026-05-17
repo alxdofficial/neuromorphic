@@ -34,6 +34,7 @@ from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
 from src.trajectory_memory_v2.trainer import Phase1RetrievalTrainerV2
 from scripts.data.wave1.common.sampler import CompositeRetrievalAdapter
 from src.trajectory_memory_v2._data import RetrievalSampler
+from scripts.training._dashboard import DashboardRenderer
 
 
 def get_tokenizer():
@@ -83,6 +84,11 @@ def parse_args():
     ap.add_argument("--checkpoint-out", type=str, default=None)
     ap.add_argument("--checkpoint-in", type=str, default=None)
     ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--plot-every-secs", type=float, default=180.0,
+                    help="Re-render dashboard PNG every N wall-clock seconds "
+                    "(0 disables). Requires --log-jsonl.")
+    ap.add_argument("--plot-out", default=None,
+                    help="Dashboard PNG path. Defaults to <log_jsonl>.plot.png.")
     ap.add_argument("--log-jsonl", type=str, default=None)
     ap.add_argument("--plot-path", type=str, default=None)
     ap.add_argument("--baselines-json", type=str, default=None)
@@ -184,6 +190,18 @@ def main():
         trainer.load_state_dict(ck["trainer_state"])
         print(f"Resumed from {args.checkpoint_in} at step {trainer.step_count}")
 
+    # ── Dashboard (background plot renderer) ──
+    plot_out = args.plot_out or (
+        str(Path(args.log_jsonl).with_suffix(".plot.png")) if args.log_jsonl else None
+    )
+    dashboard = (
+        DashboardRenderer(args.log_jsonl, plot_out, args.plot_every_secs)
+        if args.log_jsonl and plot_out else None
+    )
+    if dashboard and args.plot_every_secs > 0:
+        print(f"Dashboard: re-rendering {plot_out} every {args.plot_every_secs}s",
+              flush=True)
+
     # ── Training loop ──
     t_start = time.time()
     loss_window: list[float] = []
@@ -263,6 +281,9 @@ def main():
             "step_s": step_s,
             "wall_s_cumulative": wall_s_cumulative,
         })
+
+        if dashboard:
+            dashboard.maybe_render()
 
         # ── Validation ──
         if val_sampler is not None and step % args.val_every == 0:
