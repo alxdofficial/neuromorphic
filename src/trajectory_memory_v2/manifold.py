@@ -401,6 +401,34 @@ class VocabularyManifold(nn.Module):
         }
 
     @torch.no_grad()
+    def snapshot_edge_state(self) -> dict:
+        """Clone every per-edge buffer. Use this around eval to prevent val
+        writes from contaminating the training manifold. Pair with
+        `restore_edge_state(snap)` in a try/finally.
+        """
+        return {
+            "edge_state": self.edge_state.clone(),
+            "edge_dst": self.edge_dst.clone(),
+            "edge_active": self.edge_active.clone(),
+            "visit_count": self.visit_count.clone(),
+            "last_visit": self.last_visit.clone(),
+            "alloc_step": self.alloc_step.clone(),
+            "specificity": self.specificity.clone(),
+            "step_counter": self.step_counter.clone(),
+        }
+
+    @torch.no_grad()
+    def restore_edge_state(self, snap: dict) -> None:
+        self.edge_state.copy_(snap["edge_state"])
+        self.edge_dst.copy_(snap["edge_dst"])
+        self.edge_active.copy_(snap["edge_active"])
+        self.visit_count.copy_(snap["visit_count"])
+        self.last_visit.copy_(snap["last_visit"])
+        self.alloc_step.copy_(snap["alloc_step"])
+        self.specificity.copy_(snap["specificity"])
+        self.step_counter.copy_(snap["step_counter"])
+
+    @torch.no_grad()
     def reset_edge_memory(self) -> None:
         """Reset all edges to empty. Useful for restart-from-scratch
         scenarios; does NOT reset concept_ids."""

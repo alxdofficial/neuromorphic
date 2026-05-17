@@ -196,8 +196,14 @@ class CrossAttention(nn.Module):
             Q2 = Q.reshape(BS, -1, self.d_attn)
             scores = torch.bmm(Q2, K.transpose(1, 2)) / math.sqrt(self.d_attn)
             if key_mask is not None:
+                # Guard against rows where ALL keys are pad — softmax over
+                # all -inf is NaN. Force such rows to attend over all
+                # positions (best-effort fallback, contributes whatever
+                # the projected pad-hiddens encode but doesn't poison).
+                any_valid = key_mask.any(dim=-1, keepdim=True)        # [BS, 1]
+                safe_key_mask = key_mask | (~any_valid)               # [BS, NK]
                 scores = scores.masked_fill(
-                    ~key_mask.reshape(BS, 1, -1), float("-inf"),
+                    ~safe_key_mask.reshape(BS, 1, -1), float("-inf"),
                 )
             attn = F.softmax(scores, dim=-1)
             out2 = torch.bmm(attn, V)

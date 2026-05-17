@@ -160,10 +160,17 @@ class Phase1RetrievalTrainerV2:
         M = len(batch)
         pad_id = self.pad_token_id
 
-        # Passages: [M, 8, T]
-        passages = torch.zeros(M, 8, T, dtype=torch.long, device=device)
+        # Passages: [M, 8, T]. Init with pad_id (not 0) so any unfilled
+        # rows are masked out by `(passage != pad_id)` downstream — if a
+        # chunk ever returns < 8 facts, the missing rows look like pure
+        # padding instead of all-zero "real" tokens.
+        passages = torch.full((M, 8, T), pad_id, dtype=torch.long, device=device)
         for m, chunk in enumerate(batch):
-            for i, p in enumerate(chunk["fact_passages_token_ids"]):
+            passages_in = chunk["fact_passages_token_ids"]
+            assert len(passages_in) == 8, (
+                f"expected 8 passages per chunk, got {len(passages_in)}"
+            )
+            for i, p in enumerate(passages_in):
                 passages[m, i] = torch.tensor(
                     self._pad_or_trunc(p, T, pad_id), device=device,
                 )
@@ -274,17 +281,30 @@ class Phase1RetrievalTrainerV2:
 
     def _entry_contrastive(
         self,
-        passage_hiddens_per_window: list[Tensor],  # 8 × [M, T, d_lm]
-        q_hiddens: Tensor,                          # [M, q_len, d_lm]
-        target_idxs: Tensor,                        # [M] long
+        passage_hiddens_per_window: list[Tensor],   # 8 × [M, T, d_lm]
+        passage_masks_per_window: list[Tensor],     # 8 × [M, T] bool
+        q_hiddens: Tensor,                           # [M, q_len, d_lm]
+        q_mask: Tensor,                              # [M, q_len] bool
+        target_idxs: Tensor,                         # [M] long
     ) -> Tensor:
-        """InfoNCE on entry-projector outputs between matched (Q, P) pairs."""
+        """InfoNCE on entry-projector outputs between matched (Q, P) pairs.
+
+        Pool is MASKED — unmasked mean would average in pad-token hidden
+        states (~80% of the pool for a 50-token passage padded to T=256),
+        which would teach the projector to align padding noise.
+        """
         M = target_idxs.shape[0]
-        # Mean-pool to d_lm
-        p_pools = torch.stack(
-            [h.mean(dim=1) for h in passage_hiddens_per_window], dim=1,
-        )  # [M, 8, d_lm]
-        q_pool = q_hiddens.mean(dim=1)              # [M, d_lm]
+
+        def _masked_mean(h: Tensor, m: Tensor) -> Tensor:
+            mf = m.to(h.dtype).unsqueeze(-1)               # [M, T, 1]
+            return (h * mf).sum(dim=1) / mf.sum(dim=1).clamp_min(1.0)
+
+        p_pool_list = [
+            _masked_mean(h, m)
+            for h, m in zip(passage_hiddens_per_window, passage_masks_per_window)
+        ]
+        p_pools = torch.stack(p_pool_list, dim=1)          # [M, 8, d_lm]
+        q_pool = _masked_mean(q_hiddens, q_mask)           # [M, d_lm]
 
         # Project via shared entry_proj to D_concept; mean over J
         d_lm = p_pools.shape[-1]
@@ -452,22 +472,23 @@ class Phase1RetrievalTrainerV2:
         aux_lb_acc = torch.zeros((), device=device)
         aux_z_acc = torch.zeros((), device=device)
 
-        prev_hiddens: Optional[Tensor] = None
-        prev_mask: Optional[Tensor] = None
+        # Wave 1 writes 8 INDEPENDENT facts; each passage's write must NOT
+        # see the prior fact's memory. Pass prev_window_hiddens=None so
+        # mem_inject is zero-readout for fact-write windows. (Streaming
+        # Wave 2 keeps the carry-over by design — there the prior context
+        # is *what we're trying to retrieve from*.)
         for i in range(8):
             passage_ids_i = passages[:, i, :]
             passage_mask_i = (passage_ids_i != self.pad_token_id)
             out = self.model.forward_window(
                 lm_input_ids=passage_ids_i,
-                prev_window_hiddens=prev_hiddens,
+                prev_window_hiddens=None,
                 attention_mask=passage_mask_i,
-                prev_attention_mask=prev_mask,
+                prev_attention_mask=None,
                 hard_routing=True,
                 write_mode="passage",
             )
-            prev_hiddens = out["current_hiddens"]
-            prev_mask = passage_mask_i
-            passage_hiddens_per_window.append(prev_hiddens)
+            passage_hiddens_per_window.append(out["current_hiddens"])
             passage_masks_per_window.append(passage_mask_i)
             write_visited_per_fact.append(out["write_visited_ids"].detach())
             write_step_queries_per_fact.append(out["write_step_queries"])
@@ -481,9 +502,9 @@ class Phase1RetrievalTrainerV2:
 
         out_qa = self.model.forward_window(
             lm_input_ids=qa,
-            prev_window_hiddens=prev_hiddens,
+            prev_window_hiddens=None,           # read_conditioning_hiddens wins
             attention_mask=qa_mask,
-            prev_attention_mask=prev_mask,
+            prev_attention_mask=None,
             read_conditioning_hiddens=q_hiddens,
             read_conditioning_mask=q_mask,
             hard_routing=True,
@@ -515,7 +536,11 @@ class Phase1RetrievalTrainerV2:
 
         # ── 4. Contrastive losses ────────────────────────────────
         l_contrast_entry = self._entry_contrastive(
-            passage_hiddens_per_window, q_hiddens, target_idxs,
+            passage_hiddens_per_window,
+            passage_masks_per_window,
+            q_hiddens,
+            q_mask,
+            target_idxs,
         )
         # Per-step contrastive on step_queries (matches read at QA window
         # with the TARGET fact's write step_queries)
@@ -633,10 +658,9 @@ class Phase1RetrievalTrainerV2:
         - No backprop, no optimizer step, no step_counter advance.
         - hard_routing=False (argmax — STE not needed in eval).
         - Computes per-task loss/acc breakdown via the chunk's metadata.
-
-        WARNING: edge state IS mutated by the writes during eval (same as
-        v1's eval_step). If we wanted strict-isolation eval we'd snapshot
-        + restore the manifold; for v1 parity we don't.
+        - Snapshot/restore manifold edge buffers around the call so val
+          writes don't contaminate training memory.
+        - Passes the same attention masks as the train step.
         """
         cfg = self.model.cfg
         M = len(batch)
@@ -651,28 +675,41 @@ class Phase1RetrievalTrainerV2:
         question_lens = tensors["question_lens"]
         target_idxs = tensors["target_idxs"]
 
-        # Run 8 writes
-        write_visited_per_fact: list[Tensor] = []
-        prev_hiddens: Optional[Tensor] = None
-        for i in range(8):
-            out = self.model.forward_window(
-                lm_input_ids=passages[:, i, :],
-                prev_window_hiddens=prev_hiddens,
-                hard_routing=False,
-                write_mode="passage",
-            )
-            prev_hiddens = out["current_hiddens"]
-            write_visited_per_fact.append(out["write_visited_ids"])
+        # Snapshot training memory — val writes mutate buffers in-place.
+        snap = self.model.manifold.snapshot_edge_state()
+        try:
+            # Run 8 INDEPENDENT writes (no cross-fact context — same as train)
+            write_visited_per_fact: list[Tensor] = []
+            for i in range(8):
+                passage_ids_i = passages[:, i, :]
+                passage_mask_i = (passage_ids_i != self.pad_token_id)
+                out = self.model.forward_window(
+                    lm_input_ids=passage_ids_i,
+                    prev_window_hiddens=None,
+                    attention_mask=passage_mask_i,
+                    prev_attention_mask=None,
+                    hard_routing=False,
+                    write_mode="passage",
+                )
+                write_visited_per_fact.append(out["write_visited_ids"])
 
-        # Question-conditioned read forward
-        q_hiddens = self._compute_question_hiddens(question_ids, question_lens)
-        out_qa = self.model.forward_window(
-            lm_input_ids=qa,
-            prev_window_hiddens=prev_hiddens,
-            hard_routing=False,
-            write_mode="qa",
-            read_conditioning_hiddens=q_hiddens,
-        )
+            # Question-conditioned read forward
+            q_hiddens = self._compute_question_hiddens(question_ids, question_lens)
+            q_mask = (question_ids != self.pad_token_id)
+            qa_mask = (qa != self.pad_token_id)
+            out_qa = self.model.forward_window(
+                lm_input_ids=qa,
+                prev_window_hiddens=None,
+                attention_mask=qa_mask,
+                prev_attention_mask=None,
+                read_conditioning_hiddens=q_hiddens,
+                read_conditioning_mask=q_mask,
+                hard_routing=False,
+                write_mode="qa",
+            )
+        finally:
+            # Restore training memory regardless of any error inside the try.
+            self.model.manifold.restore_edge_state(snap)
 
         # Answer loss + accuracy
         logits = out_qa["logits"]
