@@ -133,6 +133,15 @@ class TrajectoryWalker(nn.Module):
         self.lambda_edge = nn.Parameter(
             torch.tensor(cfg.lambda_edge_init, dtype=torch.float32),
         )
+        # Learnable reuse bonus added to existing-edge dsts in the combined
+        # logits. Encourages routing toward already-allocated cells so the
+        # walker reuses the abstract vocabulary instead of constantly
+        # allocating new edges. Default init = 1.0 (~ one std-dev of vocab
+        # logits); model can adjust if reuse pressure should be higher or
+        # lower based on training signal.
+        self.reuse_bonus = nn.Parameter(
+            torch.tensor(cfg.reuse_bonus_init, dtype=torch.float32),
+        )
 
     def forward(
         self,
@@ -285,7 +294,21 @@ class TrajectoryWalker(nn.Module):
                 dim=2, index=safe_dsts, src=edge_score.to(edge_contrib.dtype),
             )                                               # [BS, J, N]
 
-            combined = vocab_logits + self.lambda_edge * edge_contrib
+            # Reuse bonus: existing-edge dsts get a constant boost so the
+            # walker prefers reusing vocab over allocating new edges. Build
+            # a 0/1 mask at active-edge dst positions, multiply by the
+            # learnable bonus.
+            existing_dst_mask = torch.zeros_like(vocab_logits)
+            existing_dst_mask.scatter_(
+                dim=2, index=safe_dsts,
+                src=edge_active.to(existing_dst_mask.dtype),
+            )
+
+            combined = (
+                vocab_logits
+                + self.lambda_edge * edge_contrib
+                + self.reuse_bonus * existing_dst_mask
+            )
 
             # Top-1 selection with STE
             combined_one_hot, next_idx = softmax_top1_ste(
@@ -310,17 +333,23 @@ class TrajectoryWalker(nn.Module):
             # learnable per-position later if needed.
             cue_D = cfg.cue_decay * cue_D + self.cue_proj(next_embed)
 
-            # ── WRITE: update edges (no grad through update path) ──
+            # ── WRITE / READ side effects on manifold (no-grad) ──
+            src_flat = current.reshape(-1)                   # [BS*J]
+            dst_flat = next_idx.reshape(-1)                  # [BS*J]
             if write_mode:
                 # signature = step_query (v1 simplification; no signature_fn).
-                # Flatten over BS, J for batched update.
-                src_flat = current.reshape(-1)               # [BS*J]
-                dst_flat = next_idx.reshape(-1)              # [BS*J]
                 sig_flat = step_query.reshape(-1, D)         # [BS*J, D]
                 # Detach is intentional — update is no_grad anyway,
                 # but be explicit so future readers don't get confused.
                 manifold.update_edges(
                     src_flat.detach(), dst_flat.detach(), sig_flat.detach(),
+                )
+            else:
+                # Read mode: the chosen next_idx might match an existing
+                # edge's dst. If so, that edge was "retrieved" — record it
+                # for the W-TinyLFU eviction signal.
+                manifold.record_read_touch(
+                    src_flat.detach(), dst_flat.detach(),
                 )
 
             # Track diagnostic

@@ -103,8 +103,19 @@ class VocabularyManifold(nn.Module):
             "specificity",
             torch.zeros(N, K_max),
         )
+        # W-TinyLFU read/write touch EMAs — the eviction signal.
+        # Both decay each step by `touch_ema_decay`; touch events
+        # increment by 1. See `_select_eviction_victim`.
+        self.register_buffer(
+            "write_touches_ema",
+            torch.zeros(N, K_max, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "read_touches_ema",
+            torch.zeros(N, K_max, dtype=torch.float32),
+        )
         # Global step counter — incremented externally by the trainer.
-        # Used for staleness computation and alloc_step grace-period.
+        # Used for age-based eviction protection.
         self.register_buffer(
             "step_counter",
             torch.zeros((), dtype=torch.long),
@@ -248,6 +259,8 @@ class VocabularyManifold(nn.Module):
         self.visit_count[src, slot] += 1
         self.last_visit[src, slot] = step
         self.specificity[src, slot] = new_spec
+        # W-TinyLFU: record a write touch on this edge.
+        self.write_touches_ema[src, slot] += 1.0
 
     def _allocate_or_evict(
         self, src: int, dst: int, sig: Tensor, step: int,
@@ -286,10 +299,11 @@ class VocabularyManifold(nn.Module):
         self.visit_count[src, slot] = 1
         self.last_visit[src, slot] = step
         self.alloc_step[src, slot] = step
-        # Initial specificity = 1.0 (moderately novel by default —
-        # a brand-new edge has no prior to compare against, so we set
-        # it mid-range. Subsequent updates EMA this toward true novelty).
+        # Initial specificity = 1.0 (moderately novel by default).
         self.specificity[src, slot] = 1.0
+        # W-TinyLFU: fresh slot. 1 write so far, 0 reads.
+        self.write_touches_ema[src, slot] = 1.0
+        self.read_touches_ema[src, slot] = 0.0
 
     def _free_slot(self, src: int, slot: int) -> None:
         """Reset a slot to empty (called during eviction)."""
@@ -300,10 +314,24 @@ class VocabularyManifold(nn.Module):
         self.last_visit[src, slot] = 0
         self.alloc_step[src, slot] = -1
         self.specificity[src, slot] = 0.0
+        self.write_touches_ema[src, slot] = 0.0
+        self.read_touches_ema[src, slot] = 0.0
 
     def _select_eviction_victim(self, src: int, step: int) -> int:
-        """Pick the highest eviction-score slot in src's outgoing list.
-        Respect protection floors. Returns -1 if all are protected."""
+        """W-TinyLFU: evict the slot with the lowest read/write ratio.
+
+        Effectiveness = (reads + α) / (writes + β). Higher = more retrieval
+        bang per write event = keep. Lower = wrote often but rarely
+        retrieved = evict. This works for long-horizon memory because the
+        ratio doesn't decay with idle time, only with new touches — an
+        edge can sit untouched for thousands of steps and still survive if
+        its ratio is high.
+
+        Brand-new edges (age < protect_min_age) are unconditionally
+        protected — they haven't had enough chances to accumulate
+        evidence. If too many slots are age-protected, the floor is
+        bypassed (lockup prevention).
+        """
         cfg = self.cfg
         K_max = cfg.K_max
 
@@ -311,62 +339,76 @@ class VocabularyManifold(nn.Module):
         if not active.any():
             return -1
 
-        # ── Protection floors (per-slot) ──
         ages = step - self.alloc_step[src].clamp_min(0)
         ages = ages.masked_fill(~active, 0)
-        # Unit-scale state norm (D-invariant). Raw L2 of a D-dim vector
-        # scales as O(√D); dividing by √D gives a scale comparable across
-        # different D_concept and to the [0, 1] thresholds below.
-        sqrt_D = math.sqrt(float(cfg.D_concept))
-        state_norm_unit = self.edge_state[src].norm(dim=-1) / sqrt_D  # [K_max]
+        young = ages < cfg.protect_min_age                   # [K_max] bool
 
-        protected_mask = (
-            active
-            & (ages >= cfg.protect_min_age)
-            & (self.specificity[src] >= cfg.protect_min_spec)
-            & (state_norm_unit >= cfg.protect_min_norm)
-        )
-
-        # Cap protected fraction — if too many are protected, allow evicting
-        # from the protected set (so the system can't lock up).
-        n_protected = int(protected_mask.sum().item())
-        if n_protected > cfg.protect_max_frac * K_max:
+        # Bypass age protection if too many slots are young (lockup risk).
+        n_young = int((young & active).sum().item())
+        if n_young > cfg.protect_max_frac * K_max:
             evictable_mask = active
         else:
-            evictable_mask = active & ~protected_mask
+            evictable_mask = active & ~young
 
         if not evictable_mask.any():
             return -1
 
-        # ── 4-feature eviction score (high score = more evictable) ──
-        # Each term is monotonic-bounded so all four actually discriminate
-        # (the previous `clamp(0, 1)` on raw L2 zeroed-out the norm term
-        # for any edge with norm ≥ 1, which is every active edge).
-        visit_term = 1.0 / (self.visit_count[src].float() + 1.0)             # [0, 0.5]
-        stale_term = (step - self.last_visit[src]).clamp_min(0).float() / cfg.evict_horizon
-        stale_term = stale_term.clamp(0, 1)                                   # [0, 1]
-        # Smooth, non-saturating: ~1 for empty edges, → 0 as state grows
-        norm_term = 1.0 / (1.0 + state_norm_unit)                             # (0, 1]
-        # spec ∈ [0, 2] (cosine-distance EMA); clamp at spec_ref to bound term
-        spec_term = self.specificity[src].clamp(0, cfg.spec_ref) / cfg.spec_ref  # [0, 1]
-
-        scores = (
-            cfg.evict_w_visit * visit_term
-            + cfg.evict_w_stale * stale_term
-            + cfg.evict_w_norm * norm_term
-            - cfg.evict_w_spec * spec_term
-        )
-
-        scores = scores.masked_fill(~evictable_mask, float("-inf"))
-        victim = int(scores.argmax().item())
+        # W-TinyLFU effectiveness ratio with Laplace smoothing.
+        reads = self.read_touches_ema[src]
+        writes = self.write_touches_ema[src]
+        effectiveness = (reads + cfg.evict_smoothing_alpha) / (
+            writes + cfg.evict_smoothing_beta
+        )                                                    # [K_max]
+        # Pick argmin among evictable slots
+        effectiveness = effectiveness.masked_fill(~evictable_mask, float("inf"))
+        victim = int(effectiveness.argmin().item())
         return victim
 
     # ── Step counter management ─────────────────────────────────────────
 
     @torch.no_grad()
     def advance_step(self, n: int = 1) -> None:
-        """Increment the global step counter. Called by the trainer."""
+        """Increment the global step counter AND decay touch EMAs.
+
+        Decaying both EMAs once per step gives the W-TinyLFU eviction
+        signal its memory horizon (set by `touch_ema_decay` — at 0.999,
+        ~1000-step effective memory).
+        """
         self.step_counter += n
+        decay = float(self.cfg.touch_ema_decay) ** n
+        self.write_touches_ema.mul_(decay)
+        self.read_touches_ema.mul_(decay)
+
+    @torch.no_grad()
+    def record_read_touch(self, src: Tensor, dst: Tensor) -> None:
+        """Record a 'read used this edge' event for each (src, dst) pair
+        where an active edge from src already points at dst.
+
+        Called from the walker after each READ-mode hop (write_mode=False).
+        Vectorized via scatter_add on the flattened buffer.
+
+        Args:
+            src: [M] long — source node ids (one per traversal-hop event)
+            dst: [M] long — chosen next_idx for each event
+        """
+        if src.numel() == 0:
+            return
+        K_max = self.cfg.K_max
+        # For each m: which slot of src[m]'s edge list has edge_dst == dst[m]?
+        slots = self.edge_dst[src]              # [M, K_max]
+        active = self.edge_active[src]          # [M, K_max]
+        matches = (slots == dst.unsqueeze(-1)) & active  # [M, K_max]
+        if not matches.any():
+            return
+        # Flat indices into the [N, K_max] buffer; scatter_add ones.
+        m_idx, k_idx = matches.nonzero(as_tuple=True)        # [num_matches] each
+        src_for_match = src[m_idx]
+        flat_idx = src_for_match * K_max + k_idx
+        flat_buf = self.read_touches_ema.view(-1)
+        flat_buf.scatter_add_(
+            0, flat_idx,
+            torch.ones_like(flat_idx, dtype=flat_buf.dtype),
+        )
 
     # ── Diagnostics ─────────────────────────────────────────────────────
 
@@ -386,6 +428,14 @@ class VocabularyManifold(nn.Module):
         spec = self.specificity[active]
         vc = self.visit_count[active].float()
         ages = (self.step_counter - self.alloc_step.clamp_min(0))[active].float()
+        reads = self.read_touches_ema[active]
+        writes = self.write_touches_ema[active]
+        # Effectiveness (the eviction signal). Reported in stats so we can
+        # watch the distribution shift over training.
+        effectiveness = (
+            (reads + cfg.evict_smoothing_alpha)
+            / (writes + cfg.evict_smoothing_beta)
+        )
 
         return {
             "n_active_edges": n_active,
@@ -397,6 +447,10 @@ class VocabularyManifold(nn.Module):
             "mean_state_norm": float(norms.mean()) if n_active else 0.0,
             "mean_specificity": float(spec.mean()) if n_active else 0.0,
             "mean_visit_count": float(vc.mean()) if n_active else 0.0,
+            "mean_read_touches": float(reads.mean()) if n_active else 0.0,
+            "mean_write_touches": float(writes.mean()) if n_active else 0.0,
+            "mean_effectiveness": float(effectiveness.mean()) if n_active else 0.0,
+            "min_effectiveness": float(effectiveness.min()) if n_active else 0.0,
             "mean_age": float(ages.mean()) if n_active else 0.0,
         }
 
@@ -414,6 +468,8 @@ class VocabularyManifold(nn.Module):
             "last_visit": self.last_visit.clone(),
             "alloc_step": self.alloc_step.clone(),
             "specificity": self.specificity.clone(),
+            "write_touches_ema": self.write_touches_ema.clone(),
+            "read_touches_ema": self.read_touches_ema.clone(),
             "step_counter": self.step_counter.clone(),
         }
 
@@ -426,6 +482,8 @@ class VocabularyManifold(nn.Module):
         self.last_visit.copy_(snap["last_visit"])
         self.alloc_step.copy_(snap["alloc_step"])
         self.specificity.copy_(snap["specificity"])
+        self.write_touches_ema.copy_(snap["write_touches_ema"])
+        self.read_touches_ema.copy_(snap["read_touches_ema"])
         self.step_counter.copy_(snap["step_counter"])
 
     @torch.no_grad()
@@ -439,4 +497,6 @@ class VocabularyManifold(nn.Module):
         self.last_visit.zero_()
         self.alloc_step.fill_(-1)
         self.specificity.zero_()
+        self.write_touches_ema.zero_()
+        self.read_touches_ema.zero_()
         # Keep step_counter — it represents training progress, not memory state

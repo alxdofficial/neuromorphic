@@ -45,8 +45,6 @@ def _make_cfg() -> TrajMemV2Config:
         ema_alpha_base=0.3,  # slightly more aggressive for the synthetic test
         ema_alpha_min=0.01,
         protect_min_age=1,
-        protect_min_spec=0.05,
-        protect_min_norm=0.05,
         lambda_edge_init=1.0,  # strong edge weighting for this test
     )
     cfg.validate()

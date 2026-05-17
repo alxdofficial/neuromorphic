@@ -15,8 +15,6 @@ from src.trajectory_memory_v2.write_module import WriteModule
 def _small_cfg() -> TrajMemV2Config:
     cfg = TrajMemV2Config.small()
     cfg.protect_min_age = 1
-    cfg.protect_min_spec = 0.1
-    cfg.protect_min_norm = 0.05
     cfg.validate()
     return cfg
 

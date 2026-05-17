@@ -46,42 +46,46 @@ class TrajMemV2Config:
     ema_alpha_base: float = 0.1
     ema_alpha_min: float = 0.01
 
-    # ── Eviction policy ───────────────────────────────────────────────────
-    # eviction_score = w_visit·visit_term + w_stale·stale_term
-    #                + w_norm·norm_term - w_spec·spec_term
-    # All four terms are scaled to [0, 1] BEFORE weighting, so the
-    # weights below are directly comparable. None are learnable — they
-    # are static hyperparameters; the eviction step is no-grad so we
-    # can't backprop through victim selection.
+    # ── Eviction policy: W-TinyLFU read/write ratio ───────────────────────
+    # Each edge tracks two EMAs (decayed each step by `touch_ema_decay`):
+    #   write_touches_ema — incremented when the walker writes to this edge
+    #   read_touches_ema  — incremented when a read trajectory chose this
+    #                       edge's dst (= "the model actually retrieved it")
     #
-    # Term semantics (higher score = more evictable):
-    #   visit_term = 1 / (visit_count + 1)            — rare → high
-    #   stale_term = (step - last_visit) / horizon    — old → high
-    #   norm_term  = 1 / (1 + ||state||/√D)           — weak → high
-    #   spec_term  = clip(spec, 0, spec_ref) / spec_ref — high spec SUBTRACTED
-    evict_w_visit: float = 1.0
-    evict_w_stale: float = 0.5
-    evict_w_norm: float = 0.3
-    evict_w_spec: float = 0.5
-    evict_horizon: int = 5000   # staleness denominator (steps)
+    # Effectiveness = (reads + α) / (writes + β) with Laplace smoothing:
+    #   α = small prior on reads (so brand-new edges don't sit at 0)
+    #   β = prior on writes (set so a 0-read/1-write edge isn't instantly
+    #       evicted)
+    # Evict argmin(effectiveness). Long-horizon retention works correctly:
+    # an edge can sit idle for 10K steps and survive if its read/write
+    # ratio stays high — what matters is "did retrieval find this useful?",
+    # not "was it visited recently."
+    touch_ema_decay: float = 0.999     # ~1000-step memory at decay = 0.999
+    evict_smoothing_alpha: float = 1.0  # prior reads
+    evict_smoothing_beta: float = 4.0   # prior writes
 
-    # ── Specificity tracking ──────────────────────────────────────────────
-    # Specificity is the EMA of cosine distance between successive write
-    # signatures and the current edge state. High spec = "writes here
-    # keep adding novel directions"; low spec = "writes here are
-    # refining / redundant". Bounded per-update in [0, 2]; EMA-smoothed
-    # over the recent `spec_ema_beta` window.
-    spec_ema_beta: float = 0.1   # EMA β → ~1/β-step memory
-    spec_ref: float = 1.0        # normalizer for spec_term (≈ steady-state cap)
+    # ── Specificity (diagnostic only — not used in eviction policy) ──────
+    # EMA of cosine distance between successive write signatures and the
+    # current edge state. High spec = novel writes; low = refining.
+    # Reported in edge_stats() for monitoring; no longer drives eviction.
+    spec_ema_beta: float = 0.1
+    spec_ref: float = 1.0
 
-    # ── Eviction protection floors ────────────────────────────────────────
-    # An edge is unconditionally protected if ALL these hold. All units
-    # below are POST-normalization (specificity ∈ [0, 2], state_norm_unit
-    # = ||state|| / √D ∈ [0, ~1] for typical adapter outputs).
-    protect_min_age: int = 50      # steps since allocation
-    protect_min_spec: float = 0.3  # specificity floor (cosine-distance EMA)
-    protect_min_norm: float = 0.3  # state_norm_unit floor
-    protect_max_frac: float = 0.30  # fraction of K_max that can be protected
+    # ── Eviction protection (single age floor) ────────────────────────────
+    # Brand-new edges (age < protect_min_age) are protected from eviction —
+    # they need time to accumulate read/write evidence. If too many slots
+    # are protected (lockup risk), the floor is bypassed for that source.
+    protect_min_age: int = 50
+    protect_max_frac: float = 0.30  # fraction of K_max that can be age-protected
+
+    # ── Reuse bonus (encourages routing toward existing edges) ────────────
+    # Walker adds `reuse_bonus * existing_dst_mask` to the combined routing
+    # logits. Pulls the walker toward already-allocated cells unless the
+    # vocab score for a non-edge cell is enough higher to overcome it.
+    # Learnable scalar so the model can tune the pressure during training.
+    # Default 1.0 ≈ one std-dev of vocab logits (significant but not
+    # dominant — a much better non-edge cell can still win).
+    reuse_bonus_init: float = 1.0
 
     # ── Routing score composition ─────────────────────────────────────────
     # combined_score = vocab_score + λ · edge_score

@@ -11,8 +11,6 @@ from src.trajectory_memory_v2.manifold import VocabularyManifold
 def _small_cfg() -> TrajMemV2Config:
     cfg = TrajMemV2Config.small()  # N=64, D_concept=128, K_max=8
     cfg.protect_min_age = 2
-    cfg.protect_min_spec = 0.5
-    cfg.protect_min_norm = 0.1
     cfg.validate()
     return cfg
 
@@ -152,40 +150,37 @@ def test_fan_out_cap_triggers_eviction():
     assert (m.edge_dst[src] == new_dst).any()
 
 
-def test_eviction_picks_lowest_visit_count_under_equal_other_features():
-    """Eviction prefers low-visit-count slots when other features are equal."""
+def test_eviction_evicts_most_written_unread_edge():
+    """W-TinyLFU: when nothing has been retrieved, the most-written edge
+    has the lowest read/write ratio and gets evicted first."""
     cfg = _small_cfg()
     m = VocabularyManifold(cfg)
     src = 0
-    # Fill all slots with edges at increasing visit counts
+    # Fill K_max slots, varying write counts.
     for dst in range(cfg.K_max):
-        sig = torch.randn(1, cfg.D_concept)
         m.update_edges(
             torch.tensor([src], dtype=torch.long),
             torch.tensor([dst], dtype=torch.long),
-            sig,
+            torch.randn(1, cfg.D_concept),
         )
-        # Visit some edges more than others — give dst=3 many extra updates
-        for _ in range(dst):  # dst=0 gets 1 visit, dst=K_max-1 gets K_max visits
+        for _ in range(dst):  # dst=0 → 1 write; dst=K_max-1 → K_max writes
             m.update_edges(
                 torch.tensor([src], dtype=torch.long),
                 torch.tensor([dst], dtype=torch.long),
                 torch.randn(1, cfg.D_concept),
             )
-    # Advance step counter past min_age
-    m.advance_step(100)
+    m.advance_step(100)  # past age protection
 
-    # Now allocate one more; the edge with lowest visit count
-    # (dst=0, visited once) should be the victim
-    sig = torch.randn(1, cfg.D_concept)
+    # Force eviction by allocating a new edge.
     m.update_edges(
         torch.tensor([src], dtype=torch.long),
         torch.tensor([99], dtype=torch.long),
-        sig,
+        torch.randn(1, cfg.D_concept),
     )
 
-    # dst=0 should be gone; dst=99 should be present
-    assert not (m.edge_dst[src] == 0).any()
+    # With reads=0 everywhere, effectiveness = α / (writes + β) is monotone
+    # decreasing in writes — most-written slot (dst=K_max-1) gets evicted.
+    assert not (m.edge_dst[src] == cfg.K_max - 1).any()
     assert (m.edge_dst[src] == 99).any()
 
 
@@ -211,45 +206,36 @@ def test_alpha_floor_prevents_silent_freeze():
     )
 
 
-def test_specificity_protection():
-    """Edges with high specificity resist eviction even when stale."""
+def test_read_touched_edge_resists_eviction():
+    """W-TinyLFU's whole point: an edge that's actually been retrieved
+    survives over an equally-written but never-retrieved one."""
     cfg = _small_cfg()
     cfg.protect_min_age = 1
-    cfg.protect_min_spec = 0.5
-    cfg.protect_min_norm = 0.1
     m = VocabularyManifold(cfg)
-    src = 0
-    # Allocate one edge with a strong, distinct signature (high specificity)
-    strong_sig = torch.randn(1, cfg.D_concept) * 5.0
-    m.update_edges(
-        torch.tensor([src], dtype=torch.long),
-        torch.tensor([42], dtype=torch.long),
-        strong_sig,
-    )
-    # Fill remaining slots with weaker, redundant signatures
-    weak_sig = torch.zeros(1, cfg.D_concept) + 0.001
-    for dst in range(1, cfg.K_max):
+    src_long = torch.tensor([0], dtype=torch.long)
+    # Allocate K_max edges, each with one write
+    for dst in range(cfg.K_max):
         m.update_edges(
-            torch.tensor([src], dtype=torch.long),
-            torch.tensor([dst], dtype=torch.long),
-            weak_sig.clone(),
+            src_long, torch.tensor([dst], dtype=torch.long),
+            torch.randn(1, cfg.D_concept),
         )
-
-    # Advance past min_age
+    # One of the allocated edges (dst=3) is repeatedly retrieved
+    favored_dst = 3
+    for _ in range(50):
+        m.record_read_touch(src_long, torch.tensor([favored_dst], dtype=torch.long))
     m.advance_step(10)
 
-    # Now write to a new dst — eviction must occur
-    sig = torch.randn(1, cfg.D_concept)
+    # Force an eviction
     m.update_edges(
-        torch.tensor([src], dtype=torch.long),
-        torch.tensor([99], dtype=torch.long),
-        sig,
+        src_long, torch.tensor([99], dtype=torch.long),
+        torch.randn(1, cfg.D_concept),
     )
 
-    # The strong-signature edge (dst=42) should NOT be evicted
-    assert (m.edge_dst[src] == 42).any(), (
-        "Specificity protection failed: strong-signature edge was evicted"
+    # The heavily-read edge must survive; the new one (dst=99) must be present
+    assert (m.edge_dst[0] == favored_dst).any(), (
+        "W-TinyLFU failed: read-touched edge was evicted"
     )
+    assert (m.edge_dst[0] == 99).any()
 
 
 def test_step_counter_persists():
