@@ -348,10 +348,16 @@ class TrajectoryWalker(nn.Module):
             src_flat = current.reshape(-1)                   # [BS*J]
             dst_flat = next_idx.reshape(-1)                  # [BS*J]
             if write_mode:
-                # signature = step_query (v1 simplification; no signature_fn).
-                sig_flat = step_query.reshape(-1, D)         # [BS*J, D]
-                # Detach is intentional — update is no_grad anyway,
-                # but be explicit so future readers don't get confused.
+                # Signature = RMS-normed step_query. The unit-RMS form
+                # bounds edge_state magnitude (EMA of unit vectors stays
+                # unit-ish) regardless of how big step_query grows over
+                # training. Only direction matters downstream — routing
+                # dot-products RMS-norm again anyway — so we lose no
+                # signal. Without this the edge_state norm tracked
+                # step_query norms (~210 in smoke), saturating the
+                # `state_norm_unit` eviction term and inflating the
+                # `concept_ids_pairwise_cos` diagnostic.
+                sig_flat = rms_norm_last(step_query).reshape(-1, D)  # [BS*J, D]
                 manifold.update_edges(
                     src_flat.detach(), dst_flat.detach(), sig_flat.detach(),
                 )
