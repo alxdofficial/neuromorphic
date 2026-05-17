@@ -27,6 +27,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from src.trajectory_memory_v2.integrated_lm import IntegratedLMV2
+from src.trajectory_memory_v2.manifold import rms_norm_last
 
 
 @dataclass
@@ -108,24 +109,26 @@ class Phase1RetrievalTrainerV2:
         pad_token_id: int,
         scheduler: Any | None = None,
         grad_clip: float | None = 1.0,
-        load_balance_coef: float = 1e-4,
-        z_loss_coef: float = 1e-4,
-        contrast_coef: float = 0.1,
-        contrast_temperature: float = 0.07,
-        per_step_contrast_coef: float = 0.05,
-        per_step_contrast_temperature: float = 0.07,
+        load_balance_coef: float | None = None,
+        z_loss_coef: float | None = None,
+        contrast_coef: float | None = None,
+        contrast_temperature: float | None = None,
+        per_step_contrast_coef: float | None = None,
+        per_step_contrast_temperature: float | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.grad_clip = grad_clip
         self.pad_token_id = pad_token_id
-        self.load_balance_coef = load_balance_coef
-        self.z_loss_coef = z_loss_coef
-        self.contrast_coef = contrast_coef
-        self.contrast_temperature = contrast_temperature
-        self.per_step_contrast_coef = per_step_contrast_coef
-        self.per_step_contrast_temperature = per_step_contrast_temperature
+        # Coefs/temperatures: kwarg overrides cfg; otherwise read from cfg.
+        cfg = model.cfg
+        self.load_balance_coef = load_balance_coef if load_balance_coef is not None else cfg.load_balance_coef
+        self.z_loss_coef = z_loss_coef if z_loss_coef is not None else cfg.z_loss_coef
+        self.contrast_coef = contrast_coef if contrast_coef is not None else cfg.contrast_coef
+        self.contrast_temperature = contrast_temperature if contrast_temperature is not None else cfg.contrast_temperature
+        self.per_step_contrast_coef = per_step_contrast_coef if per_step_contrast_coef is not None else cfg.per_step_contrast_coef
+        self.per_step_contrast_temperature = per_step_contrast_temperature if per_step_contrast_temperature is not None else cfg.per_step_contrast_temperature
         self._step_count = 0
 
     @property
@@ -265,6 +268,12 @@ class Phase1RetrievalTrainerV2:
         q_qentry = self.model.entry_proj(q_pool)                         # [M, J, D]
         q_pool_D = q_qentry.mean(dim=1)                                  # [M, D]
 
+        # L2-normalize for cosine-based InfoNCE. Routing uses RMS-norm
+        # internally, which differs from L2 only by a uniform magnitude
+        # factor (sqrt(D)) — the *direction* of the projector's output is
+        # what both losses ultimately compare, so cosine similarity here
+        # is the right pairing geometry. (Using rms_norm here would
+        # produce O(D)-magnitude logits that saturate the softmax.)
         q_n = F.normalize(q_pool_D, dim=-1)
         p_n = F.normalize(p_pool_D, dim=-1)
         S = (q_n @ p_n.T) / self.contrast_temperature                    # [M, M*8]

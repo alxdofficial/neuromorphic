@@ -95,9 +95,10 @@ class Wave2TrainerV2:
         response_ids = batch.response_ids.to(device)
         prior_mask = batch.prior_mask.to(device)
 
-        if train:
-            self.optimizer.zero_grad(set_to_none=True)
-            self.model.manifold.advance_step()
+        # NOTE: zero_grad + manifold.advance_step belong in `step()`, not
+        # here — _forward is shared by step() and eval_step() and must be
+        # pure computation. Calling them here would silently re-zero
+        # gradients during eval.
         aux_lb_acc = torch.zeros((), device=device)
         aux_z_acc = torch.zeros((), device=device)
         n_walker_calls = 0
@@ -191,6 +192,8 @@ class Wave2TrainerV2:
         batch.response_mask: [BS, T_response] bool
         """
         self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.model.manifold.advance_step()
         total_loss, answer_loss, aux_lb_acc, aux_z_acc, n_answer = self._forward(
             batch, train=True,
         )

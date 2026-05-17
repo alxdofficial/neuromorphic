@@ -18,6 +18,7 @@ read/write modules.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -174,6 +175,40 @@ class IntegratedLMV2(nn.Module):
         read_result: Optional[WalkerResult] = None
         write_result: Optional[WalkerResult] = None
 
+        # Mixed-precision: wrap the entire forward in bf16 autocast on CUDA.
+        # Llama backbone is already bf16-stored; this puts adapter
+        # activations (walker MLPs, cross_attn, history_attn, step_mlp,
+        # cue_proj, mem_inject bridges) into bf16 too — large VRAM
+        # savings on the activation tape (typically the dominant cost).
+        # Master weights (id_basis, id_proj, walker MLPs) stay fp32 for
+        # optimizer stability; only matmul activations downcast.
+        # Loss-shaped scalars (aux_lb, aux_z, logits→CE) are explicitly
+        # cast back to fp32 at use sites by the trainer.
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda" else nullcontext()
+        )
+        with autocast_ctx:
+            return self._forward_window_inner(
+                lm_input_ids, prev_window_hiddens, hard_routing,
+                write_mode, read_conditioning_hiddens,
+                read_result, write_result,
+            )
+
+    def _forward_window_inner(
+        self,
+        lm_input_ids: Tensor,
+        prev_window_hiddens: Optional[Tensor],
+        hard_routing: bool,
+        write_mode: str,
+        read_conditioning_hiddens: Optional[Tensor],
+        read_result: Optional["WalkerResult"],
+        write_result: Optional["WalkerResult"],
+    ) -> dict:
+        cfg = self.cfg
+        BS, T = lm_input_ids.shape
+        device = lm_input_ids.device
+
         # ── 1. Run Llama on this window to get hiddens ──────────────
         # In v2 we always need this window's hiddens (either for writing
         # or as context for reads). We do NOT skip llama for writes.
@@ -248,17 +283,22 @@ class IntegratedLMV2(nn.Module):
             out["write_step_queries"] = write_result.step_queries
             out["write_entry_logits_max"] = write_result.entry_logits_max
 
-        # Aux losses
-        aux_lb = torch.zeros((), device=device)
-        aux_z = torch.zeros((), device=device)
+        # Aux losses — cast to fp32 at the boundary. logsumexp inside
+        # routing_aux_losses can lose precision in bf16 with N=4096, and
+        # downstream loss arithmetic expects fp32.
+        aux_lb = torch.zeros((), device=device, dtype=torch.float32)
+        aux_z = torch.zeros((), device=device, dtype=torch.float32)
         if read_result is not None:
-            aux_lb = aux_lb + read_result.aux_lb
-            aux_z = aux_z + read_result.aux_z
+            aux_lb = aux_lb + read_result.aux_lb.float()
+            aux_z = aux_z + read_result.aux_z.float()
         if write_result is not None:
-            aux_lb = aux_lb + write_result.aux_lb
-            aux_z = aux_z + write_result.aux_z
+            aux_lb = aux_lb + write_result.aux_lb.float()
+            aux_z = aux_z + write_result.aux_z.float()
         out["aux_load_balance"] = aux_lb
         out["aux_z_loss"] = aux_z
+        # Cast logits to fp32 for CE loss accuracy (cheap and safer than
+        # letting bf16 CE underflow on tail-probability tokens).
+        out["logits"] = logits.float() if logits.dtype != torch.float32 else logits
 
         return out
 

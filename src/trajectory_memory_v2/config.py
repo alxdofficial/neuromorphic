@@ -49,20 +49,38 @@ class TrajMemV2Config:
     # ── Eviction policy ───────────────────────────────────────────────────
     # eviction_score = w_visit·visit_term + w_stale·stale_term
     #                + w_norm·norm_term - w_spec·spec_term
-    # Each term clipped to [0, 1] before weighting.
+    # All four terms are scaled to [0, 1] BEFORE weighting, so the
+    # weights below are directly comparable. None are learnable — they
+    # are static hyperparameters; the eviction step is no-grad so we
+    # can't backprop through victim selection.
+    #
+    # Term semantics (higher score = more evictable):
+    #   visit_term = 1 / (visit_count + 1)            — rare → high
+    #   stale_term = (step - last_visit) / horizon    — old → high
+    #   norm_term  = 1 / (1 + ||state||/√D)           — weak → high
+    #   spec_term  = clip(spec, 0, spec_ref) / spec_ref — high spec SUBTRACTED
     evict_w_visit: float = 1.0
     evict_w_stale: float = 0.5
     evict_w_norm: float = 0.3
     evict_w_spec: float = 0.5
-    evict_horizon: int = 5000  # staleness denominator (steps)
-    spec_ref: float = 10.0  # specificity normalization constant
+    evict_horizon: int = 5000   # staleness denominator (steps)
+
+    # ── Specificity tracking ──────────────────────────────────────────────
+    # Specificity is the EMA of cosine distance between successive write
+    # signatures and the current edge state. High spec = "writes here
+    # keep adding novel directions"; low spec = "writes here are
+    # refining / redundant". Bounded per-update in [0, 2]; EMA-smoothed
+    # over the recent `spec_ema_beta` window.
+    spec_ema_beta: float = 0.1   # EMA β → ~1/β-step memory
+    spec_ref: float = 1.0        # normalizer for spec_term (≈ steady-state cap)
 
     # ── Eviction protection floors ────────────────────────────────────────
-    # An edge is unconditionally protected if ALL these hold.
-    # Cap on the protected set to prevent lockup.
-    protect_min_age: int = 50  # steps since allocation
-    protect_min_spec: float = 1.0  # accumulated specificity
-    protect_min_norm: float = 0.3  # state vector norm
+    # An edge is unconditionally protected if ALL these hold. All units
+    # below are POST-normalization (specificity ∈ [0, 2], state_norm_unit
+    # = ||state|| / √D ∈ [0, ~1] for typical adapter outputs).
+    protect_min_age: int = 50      # steps since allocation
+    protect_min_spec: float = 0.3  # specificity floor (cosine-distance EMA)
+    protect_min_norm: float = 0.3  # state_norm_unit floor
     protect_max_frac: float = 0.30  # fraction of K_max that can be protected
 
     # ── Routing score composition ─────────────────────────────────────────
@@ -71,10 +89,20 @@ class TrajMemV2Config:
     # λ is a learnable scalar, initialized below.
     lambda_edge_init: float = 0.5
 
+    # Running-cue leaky integrator decay (in walker step loop).
+    # cue_D ← cue_decay · cue_D + cue_proj(next_embed)
+    # 0 = no history (only current visit); 1 = unbounded sum (the old bug).
+    # 0.7 → ~3.3-step effective memory; preserves recency-weighted
+    # magnitude info across hops without unbounded blow-up.
+    cue_decay: float = 0.7
+
     # ── SimVQ reparameterization of concept_ids ───────────────────────────
-    # Same as v1: concept_ids = id_proj(id_basis), with id_proj init to
-    # identity. Prevents codebook collapse during training.
-    simvq_init_std: float = 0.02  # std for id_basis init
+    # concept_ids = id_proj(id_basis), with id_proj init to identity +
+    # a small Gaussian perturbation. The perturbation breaks the perfect
+    # symmetry that would otherwise make every concept_id rotate in
+    # lock-step under early gradients (since they all share id_proj.weight).
+    simvq_init_std: float = 0.02       # std for id_basis init
+    id_proj_perturb_std: float = 0.001  # off-identity noise on id_proj.weight
 
     # ── Routing aux losses ────────────────────────────────────────────────
     # NOTE: lower than v1's 1e-2 / 1e-3 because v2 routes over the FULL

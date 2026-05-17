@@ -21,6 +21,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from src.trajectory_memory_v2.config import TrajMemV2Config
@@ -63,7 +64,15 @@ class VocabularyManifold(nn.Module):
         self.id_basis = nn.Parameter(ids_init)
         self.id_proj = nn.Linear(D, D, bias=False)
         with torch.no_grad():
-            self.id_proj.weight.copy_(torch.eye(D))
+            # Identity + small perturbation. Pure identity init means
+            # routing gradients perturb id_proj.weight identically for
+            # every concept_id (since concept_ids = id_proj @ id_basis
+            # shares one weight matrix). The perturbation breaks that
+            # exact symmetry, so different cells start individuating
+            # immediately rather than after id_basis catches up.
+            self.id_proj.weight.copy_(
+                torch.eye(D) + cfg.id_proj_perturb_std * torch.randn(D, D)
+            )
 
         # ── Edge memory: buffers, not parameters ──
         # edge_state evolves via EMA from write traversals. Gradient
@@ -204,19 +213,35 @@ class VocabularyManifold(nn.Module):
         return -1
 
     def _update_existing_slot(self, slot: int, src: int, sig: Tensor, step: int) -> None:
-        """EMA-update an existing edge slot."""
+        """EMA-update an existing edge slot.
+
+        Specificity = EMA-tracked **cosine distance** between the new
+        signature and the current edge state. Cosine is scale-invariant,
+        so a high-specificity edge means "successive writes here keep
+        rotating the state" (genuinely novel content), while low-spec
+        means "writes keep landing on the same direction" (refining or
+        redundant). Bounded in [0, 2] per update, EMA-smoothed.
+        """
         cfg = self.cfg
         old_state = self.edge_state[src, slot]
         visit = int(self.visit_count[src, slot].item())
 
-        # α = max(α_base / (1 + log(1 + visit)), α_min)
+        # α = max(α_base / (1 + log(1 + visit)), α_min) — EMA on edge_state
         alpha = cfg.ema_alpha_base / (1.0 + math.log(1.0 + visit))
         alpha = max(alpha, cfg.ema_alpha_min)
 
-        # Specificity accumulator — EMA-decayed surprise
-        delta_norm = (sig - old_state).norm().item()
-        new_spec = 0.99 * float(self.specificity[src, slot].item()) + delta_norm
-        new_spec = min(new_spec, cfg.spec_ref)  # clip to bound magnitude
+        # Specificity: cosine-distance-based novelty, EMA-smoothed.
+        if old_state.norm().item() > 1e-6:
+            cos_sim = float(F.cosine_similarity(
+                sig.unsqueeze(0), old_state.unsqueeze(0), dim=-1,
+            ).item())
+            cos_dist = 1.0 - cos_sim  # ∈ [0, 2]
+        else:
+            cos_dist = 1.0  # zero prior — treat first overlay as moderately novel
+        new_spec = (
+            (1.0 - cfg.spec_ema_beta) * float(self.specificity[src, slot].item())
+            + cfg.spec_ema_beta * cos_dist
+        )
 
         # In-place updates
         self.edge_state[src, slot] = (1 - alpha) * old_state + alpha * sig
@@ -261,11 +286,10 @@ class VocabularyManifold(nn.Module):
         self.visit_count[src, slot] = 1
         self.last_visit[src, slot] = step
         self.alloc_step[src, slot] = step
-        # Initial specificity = norm of the initial signature (first
-        # write IS a "surprise" relative to the zero prior state).
-        self.specificity[src, slot] = min(
-            float(sig.norm().item()), self.cfg.spec_ref,
-        )
+        # Initial specificity = 1.0 (moderately novel by default —
+        # a brand-new edge has no prior to compare against, so we set
+        # it mid-range. Subsequent updates EMA this toward true novelty).
+        self.specificity[src, slot] = 1.0
 
     def _free_slot(self, src: int, slot: int) -> None:
         """Reset a slot to empty (called during eviction)."""
@@ -290,21 +314,23 @@ class VocabularyManifold(nn.Module):
         # ── Protection floors (per-slot) ──
         ages = step - self.alloc_step[src].clamp_min(0)
         ages = ages.masked_fill(~active, 0)
-        state_norms = self.edge_state[src].norm(dim=-1)      # [K_max]
+        # Unit-scale state norm (D-invariant). Raw L2 of a D-dim vector
+        # scales as O(√D); dividing by √D gives a scale comparable across
+        # different D_concept and to the [0, 1] thresholds below.
+        sqrt_D = math.sqrt(float(cfg.D_concept))
+        state_norm_unit = self.edge_state[src].norm(dim=-1) / sqrt_D  # [K_max]
 
         protected_mask = (
             active
             & (ages >= cfg.protect_min_age)
             & (self.specificity[src] >= cfg.protect_min_spec)
-            & (state_norms >= cfg.protect_min_norm)
+            & (state_norm_unit >= cfg.protect_min_norm)
         )
 
         # Cap protected fraction — if too many are protected, allow evicting
         # from the protected set (so the system can't lock up).
         n_protected = int(protected_mask.sum().item())
-        n_active = int(active.sum().item())
         if n_protected > cfg.protect_max_frac * K_max:
-            # Allow eviction from protected ones too
             evictable_mask = active
         else:
             evictable_mask = active & ~protected_mask
@@ -312,12 +338,17 @@ class VocabularyManifold(nn.Module):
         if not evictable_mask.any():
             return -1
 
-        # ── Normalized 4-component score ──
-        visit_term = 1.0 / (self.visit_count[src].float() + 1.0)
+        # ── 4-feature eviction score (high score = more evictable) ──
+        # Each term is monotonic-bounded so all four actually discriminate
+        # (the previous `clamp(0, 1)` on raw L2 zeroed-out the norm term
+        # for any edge with norm ≥ 1, which is every active edge).
+        visit_term = 1.0 / (self.visit_count[src].float() + 1.0)             # [0, 0.5]
         stale_term = (step - self.last_visit[src]).clamp_min(0).float() / cfg.evict_horizon
-        stale_term = stale_term.clamp(0, 1)
-        norm_term = (1.0 - state_norms.clamp(0, 1)).clamp(0, 1)
-        spec_term = (self.specificity[src] / cfg.spec_ref).clamp(0, 1)
+        stale_term = stale_term.clamp(0, 1)                                   # [0, 1]
+        # Smooth, non-saturating: ~1 for empty edges, → 0 as state grows
+        norm_term = 1.0 / (1.0 + state_norm_unit)                             # (0, 1]
+        # spec ∈ [0, 2] (cosine-distance EMA); clamp at spec_ref to bound term
+        spec_term = self.specificity[src].clamp(0, cfg.spec_ref) / cfg.spec_ref  # [0, 1]
 
         scores = (
             cfg.evict_w_visit * visit_term
@@ -326,7 +357,6 @@ class VocabularyManifold(nn.Module):
             - cfg.evict_w_spec * spec_term
         )
 
-        # Mask out non-evictable; pick argmax of remaining
         scores = scores.masked_fill(~evictable_mask, float("-inf"))
         victim = int(scores.argmax().item())
         return victim

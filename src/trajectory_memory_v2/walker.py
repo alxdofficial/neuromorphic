@@ -195,14 +195,10 @@ class TrajectoryWalker(nn.Module):
         entry_embed = torch.einsum("bjn,nd->bjd", entry_one_hot, concept_ids)  # [BS, J, D]
         current = entry_idx                                 # [BS, J] long
 
-        # Initialize running cue from pooled context.
-        cue = pooled.unsqueeze(1).expand(BS, J, d_lm)       # [BS, J, d_lm]
-        # Project pooled into D-space for use in step_mlp
-        # We'll use a small projection — for simplicity, use cross_attn
-        # output at the entry as the initial cue contribution.
-        # Actually, since pool is d_lm dim and we need D, use the entry
-        # query Q_entry as the initial D-dim cue. It's already the
-        # projection of pooled into vocab space.
+        # Initialize running cue with Q_entry (the D-dim projection of
+        # pooled context). The cue accumulates a leaky integration of
+        # each visited node's embedding across hops — see the per-hop
+        # update below.
         cue_D = Q_entry                                     # [BS, J, D]
 
         # Accumulators
@@ -268,9 +264,13 @@ class TrajectoryWalker(nn.Module):
             # Scatter edge_score onto N-space (using edge_dsts as indices)
             # safe_dsts: replace -1 with 0 (will contribute 0 since masked)
             safe_dsts = edge_dsts.clamp_min(0)              # [BS, J, K_max]
+            # Match dtypes for scatter_add_ — under bf16 autocast
+            # vocab_logits is bf16; edge_score may be fp32 (came from
+            # an einsum whose inputs included fp32 buffers). Cast src
+            # to match self.
             edge_contrib = torch.zeros_like(vocab_logits)   # [BS, J, N]
             edge_contrib.scatter_add_(
-                dim=2, index=safe_dsts, src=edge_score,
+                dim=2, index=safe_dsts, src=edge_score.to(edge_contrib.dtype),
             )                                               # [BS, J, N]
 
             combined = vocab_logits + self.lambda_edge * edge_contrib
@@ -288,8 +288,15 @@ class TrajectoryWalker(nn.Module):
             # Differentiable gather for next node's embedding
             next_embed = torch.einsum("bjn,nd->bjd", combined_one_hot, concept_ids)
 
-            # Update running cue (cumulative summary of recall)
-            cue_D = cue_D + self.cue_proj(next_embed)
+            # Update running cue: leaky integrator. Each new visit's
+            # contribution decays the previous cue by `cue_decay`, then
+            # adds the freshly-projected next_embed. Bounds steady-state
+            # magnitude to ~|cue_proj output| / (1 - cue_decay), preserving
+            # recency-weighted relative magnitude information across hops
+            # (older visits weight less, but their direction persists).
+            # The decay is a static hyperparameter; it could be made
+            # learnable per-position later if needed.
+            cue_D = cfg.cue_decay * cue_D + self.cue_proj(next_embed)
 
             # ── WRITE: update edges (no grad through update path) ──
             if write_mode:
