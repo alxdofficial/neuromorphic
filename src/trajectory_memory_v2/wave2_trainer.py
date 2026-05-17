@@ -111,20 +111,26 @@ class Wave2TrainerV2:
             T_prior = max_prior_len
 
         prev_hiddens: Optional[Tensor] = None
+        prev_mask: Optional[Tensor] = None
         n_prior_windows = max(1, (T_prior + T - 1) // T)
         for w in range(n_prior_windows):
             start = w * T
             end = min(start + T, T_prior)
             window_ids = prior_ids[:, start:end]
+            window_mask_w = prior_mask[:, start:end]
             if window_ids.shape[1] < T:
                 pad = torch.full(
                     (BS, T - window_ids.shape[1]),
                     self.pad_token_id, dtype=torch.long, device=device,
                 )
                 window_ids = torch.cat([window_ids, pad], dim=1)
+                mask_pad = torch.zeros(BS, T - window_mask_w.shape[1], dtype=torch.bool, device=device)
+                window_mask_w = torch.cat([window_mask_w, mask_pad], dim=1)
             out = self.model.forward_window(
                 lm_input_ids=window_ids,
                 prev_window_hiddens=prev_hiddens,
+                attention_mask=window_mask_w,
+                prev_attention_mask=prev_mask,
                 hard_routing=True,
                 write_mode="passage",
             )
@@ -134,6 +140,7 @@ class Wave2TrainerV2:
             # the prior-window Llama would unroll ~max_prior_windows×T tokens
             # of backprop through 1B params and OOM.
             prev_hiddens = out["current_hiddens"].detach()
+            prev_mask = window_mask_w
             aux_lb_acc = aux_lb_acc + out["aux_load_balance"]
             aux_z_acc = aux_z_acc + out["aux_z_loss"]
             n_walker_calls += 1
@@ -154,6 +161,8 @@ class Wave2TrainerV2:
         out_resp = self.model.forward_window(
             lm_input_ids=response_window,
             prev_window_hiddens=prev_hiddens,
+            attention_mask=response_mask_w,
+            prev_attention_mask=prev_mask,
             hard_routing=True,
             write_mode="passage",
         )

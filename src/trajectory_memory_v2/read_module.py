@@ -41,6 +41,7 @@ class ReadModule(nn.Module):
         prev_window_hiddens: Tensor,    # [BS, T, d_lm] — the conditioning
         manifold: VocabularyManifold,
         *,
+        window_mask: "Tensor | None" = None,  # [BS, T] bool — True=real
         hard: bool = True,
     ) -> WalkerResult:
         """Walk a read trajectory over `prev_window_hiddens`.
@@ -56,6 +57,7 @@ class ReadModule(nn.Module):
             window_hiddens=prev_window_hiddens,
             entry_proj=self.entry_proj,
             manifold=manifold,
+            window_mask=window_mask,
             write_mode=False,
             hard_routing=hard,
         )

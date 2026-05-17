@@ -168,7 +168,18 @@ class Phase1RetrievalTrainerV2:
                     self._pad_or_trunc(p, T, pad_id), device=device,
                 )
 
-        # Question + answer concatenated. We need the answer position mask.
+        # Question + answer concatenated. The answer mask gates which
+        # positions contribute to the CE loss.
+        #
+        # When the sampler provides `answer_content_token_positions` (offsets
+        # within `answer_token_ids` that carry the actual memory-load-bearing
+        # content — e.g. "doctor" inside the templated "X works as a doctor"),
+        # we mask ONLY those positions. Otherwise the loss trains the
+        # template scaffold via plain LM, letting the model reach high
+        # accuracy without ever consulting memory.
+        #
+        # Fall back to the full answer span when content positions are
+        # missing or empty (older datasets, ambiguous answers).
         qa_seqs = []
         answer_masks = []
         question_lens = []
@@ -178,9 +189,21 @@ class Phase1RetrievalTrainerV2:
             qa = q + a
             qa = self._pad_or_trunc(qa, T, pad_id)
             qa_seqs.append(qa)
-            # Mask is True for answer positions
-            mask = [False] * len(q) + [True] * len(a) + [False] * max(0, T - len(q) - len(a))
-            answer_masks.append(mask[:T])
+
+            content_positions = chunk.get("answer_content_token_positions") or []
+            if content_positions:
+                mask = [False] * T
+                for offset in content_positions:
+                    qa_pos = len(q) + offset
+                    if 0 <= qa_pos < T:
+                        mask[qa_pos] = True
+            else:
+                mask = (
+                    [False] * len(q)
+                    + [True] * len(a)
+                    + [False] * max(0, T - len(q) - len(a))
+                )[:T]
+            answer_masks.append(mask)
             question_lens.append(min(len(q), T))
 
         qa = torch.tensor(qa_seqs, dtype=torch.long, device=device)
@@ -234,8 +257,10 @@ class Phase1RetrievalTrainerV2:
             )
         mem_inject.memory_fn = zero_readout
         try:
+            q_mask = (question_ids != self.pad_token_id)
             base_out = self.model.llama.model(
                 input_ids=question_ids,
+                attention_mask=q_mask,
                 output_hidden_states=True,
                 use_cache=False,
                 return_dict=True,
@@ -421,21 +446,29 @@ class Phase1RetrievalTrainerV2:
 
         # ── 1. Run 8 passage windows (writes) ────────────────────
         passage_hiddens_per_window: list[Tensor] = []
+        passage_masks_per_window: list[Tensor] = []
         write_visited_per_fact: list[Tensor] = []
         write_step_queries_per_fact: list[Tensor] = []
         aux_lb_acc = torch.zeros((), device=device)
         aux_z_acc = torch.zeros((), device=device)
 
         prev_hiddens: Optional[Tensor] = None
+        prev_mask: Optional[Tensor] = None
         for i in range(8):
+            passage_ids_i = passages[:, i, :]
+            passage_mask_i = (passage_ids_i != self.pad_token_id)
             out = self.model.forward_window(
-                lm_input_ids=passages[:, i, :],
+                lm_input_ids=passage_ids_i,
                 prev_window_hiddens=prev_hiddens,
+                attention_mask=passage_mask_i,
+                prev_attention_mask=prev_mask,
                 hard_routing=True,
                 write_mode="passage",
             )
             prev_hiddens = out["current_hiddens"]
+            prev_mask = passage_mask_i
             passage_hiddens_per_window.append(prev_hiddens)
+            passage_masks_per_window.append(passage_mask_i)
             write_visited_per_fact.append(out["write_visited_ids"].detach())
             write_step_queries_per_fact.append(out["write_step_queries"])
             aux_lb_acc = aux_lb_acc + out["aux_load_balance"]
@@ -443,13 +476,18 @@ class Phase1RetrievalTrainerV2:
 
         # ── 2. Question-conditioned read forward ─────────────────
         q_hiddens = self._compute_question_hiddens(question_ids, question_lens)
+        q_mask = (question_ids != self.pad_token_id)
+        qa_mask = (qa != self.pad_token_id)
 
         out_qa = self.model.forward_window(
             lm_input_ids=qa,
             prev_window_hiddens=prev_hiddens,
-            hard_routing=True,
-            write_mode="qa",  # no write trajectory here; only read+answer
+            attention_mask=qa_mask,
+            prev_attention_mask=prev_mask,
             read_conditioning_hiddens=q_hiddens,
+            read_conditioning_mask=q_mask,
+            hard_routing=True,
+            write_mode="qa",
         )
         aux_lb_acc = aux_lb_acc + out_qa["aux_load_balance"]
         aux_z_acc = aux_z_acc + out_qa["aux_z_loss"]

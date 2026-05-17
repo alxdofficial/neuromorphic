@@ -130,6 +130,9 @@ class IntegratedLMV2(nn.Module):
         lm_input_ids: Tensor,                            # [BS, T]
         prev_window_hiddens: Optional[Tensor] = None,    # [BS, T_prev, d_lm]
         *,
+        attention_mask: Optional[Tensor] = None,         # [BS, T] bool — for lm_input_ids
+        prev_attention_mask: Optional[Tensor] = None,    # [BS, T_prev] — for prev_window_hiddens
+        read_conditioning_mask: Optional[Tensor] = None, # [BS, T_cond] — for read_conditioning_hiddens
         hard_routing: bool = True,
         write_mode: str = "passage",                     # "passage" or "qa"
         read_conditioning_hiddens: Optional[Tensor] = None,
@@ -192,6 +195,7 @@ class IntegratedLMV2(nn.Module):
             return self._forward_window_inner(
                 lm_input_ids, prev_window_hiddens, hard_routing,
                 write_mode, read_conditioning_hiddens,
+                attention_mask, prev_attention_mask, read_conditioning_mask,
                 read_result, write_result,
             )
 
@@ -202,12 +206,23 @@ class IntegratedLMV2(nn.Module):
         hard_routing: bool,
         write_mode: str,
         read_conditioning_hiddens: Optional[Tensor],
+        attention_mask: Optional[Tensor],
+        prev_attention_mask: Optional[Tensor],
+        read_conditioning_mask: Optional[Tensor],
         read_result: Optional["WalkerResult"],
         write_result: Optional["WalkerResult"],
     ) -> dict:
         cfg = self.cfg
         BS, T = lm_input_ids.shape
         device = lm_input_ids.device
+
+        # Resolve read conditioning + its mask (explicit override beats prev_window)
+        if read_conditioning_hiddens is not None:
+            read_cond = read_conditioning_hiddens
+            read_mask = read_conditioning_mask
+        else:
+            read_cond = prev_window_hiddens
+            read_mask = prev_attention_mask
 
         # ── 1. Run Llama on this window to get hiddens ──────────────
         # In v2 we always need this window's hiddens (either for writing
@@ -218,45 +233,38 @@ class IntegratedLMV2(nn.Module):
                 BS, T, cfg.d_lm, device=device, dtype=torch.float32,
             )
             logits = torch.zeros(BS, T, 100, device=device)
-            # In test mode we still want reads if prev/read_cond is given
-            read_cond = (
-                read_conditioning_hiddens
-                if read_conditioning_hiddens is not None
-                else prev_window_hiddens
-            )
+            # In test mode we still want reads if read_cond is given
             if read_cond is not None:
                 read_result = self.read_module(
-                    read_cond, self.manifold, hard=hard_routing,
+                    read_cond, self.manifold,
+                    window_mask=read_mask, hard=hard_routing,
                 )
         else:
-            # Set memory_fn for this forward (controlled below)
             mem_inject = self._mem_inject_layer()
 
             # Build the read trajectory FIRST (for the read injection
             # during the Llama forward), then run Llama.
-            read_cond = (
-                read_conditioning_hiddens
-                if read_conditioning_hiddens is not None
-                else prev_window_hiddens
-            )
             if read_cond is not None:
                 read_result: WalkerResult = self.read_module(
-                    read_cond, self.manifold, hard=hard_routing,
+                    read_cond, self.manifold,
+                    window_mask=read_mask, hard=hard_routing,
                 )
-                # Embed memory_fn
                 mem_inject.memory_fn = self._build_memory_fn(read_result.visited_embeds)
             else:
-                # No prior context — disable memory for this window
                 mem_inject.memory_fn = self._zero_readout
                 read_result = None
 
-            # Run Llama
-            base_out = self.llama.model(
+            # Run Llama — pass attention_mask so the backbone doesn't
+            # attend across pad positions.
+            llama_kwargs = dict(
                 input_ids=lm_input_ids,
                 output_hidden_states=True,
                 use_cache=False,
                 return_dict=True,
             )
+            if attention_mask is not None:
+                llama_kwargs["attention_mask"] = attention_mask
+            base_out = self.llama.model(**llama_kwargs)
             full_hiddens = base_out.last_hidden_state              # [BS, T, d_lm]
             current_hiddens = full_hiddens
             logits = self.llama.lm_head(full_hiddens)             # [BS, T, V]
@@ -264,7 +272,8 @@ class IntegratedLMV2(nn.Module):
         # ── 2. Run write trajectory if requested ─────────────────────
         if write_mode == "passage":
             write_result = self.write_module(
-                current_hiddens, self.manifold, hard=hard_routing,
+                current_hiddens, self.manifold,
+                window_mask=attention_mask, hard=hard_routing,
             )
 
         # ── 3. Package output ───────────────────────────────────────

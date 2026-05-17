@@ -139,6 +139,7 @@ class TrajectoryWalker(nn.Module):
         window_hiddens: Tensor,          # [BS, T, d_lm]
         entry_proj: EntryProjector,      # shared with paired write/read module
         manifold: VocabularyManifold,
+        window_mask: Optional[Tensor] = None,  # [BS, T] bool — True=real, False=pad
         write_mode: bool = False,
         hard_routing: bool = True,
     ) -> WalkerResult:
@@ -167,7 +168,15 @@ class TrajectoryWalker(nn.Module):
         N = cfg.N
 
         # ── ENTRY: global lookup ────────────────────────────────────
-        pooled = window_hiddens.mean(dim=1)               # [BS, d_lm]
+        # Masked mean-pool. Without the mask, pad-token hiddens dilute
+        # the pooled context — for a 50-token passage padded to T=256,
+        # ~80% of the pool would be pad-token noise.
+        if window_mask is not None:
+            mask_f = window_mask.to(window_hiddens.dtype).unsqueeze(-1)   # [BS, T, 1]
+            denom = mask_f.sum(dim=1).clamp_min(1.0)                      # [BS, 1]
+            pooled = (window_hiddens * mask_f).sum(dim=1) / denom         # [BS, d_lm]
+        else:
+            pooled = window_hiddens.mean(dim=1)            # [BS, d_lm]
         Q_entry = entry_proj(pooled)                       # [BS, J, D]
 
         ids_normed = manifold.concept_ids_normed           # [N, D] (computed every call)
@@ -208,6 +217,9 @@ class TrajectoryWalker(nn.Module):
 
         # Precompute cross_attn KV for the window (one-time per call).
         cross_K, cross_V = self.cross_attn.precompute_kv(window_hiddens)
+        # cross_attn key mask: per-batch [BS, T] → broadcast over J inside
+        # forward_with_kv. Bool: True = real token (attendable).
+        cross_key_mask = window_mask  # may be None
 
         # Edge-score diagnostic
         edge_active_steps = 0
@@ -227,7 +239,7 @@ class TrajectoryWalker(nn.Module):
 
             # Cross-attention over the window's Llama hiddens
             cross_attn_out = self.cross_attn.forward_with_kv(
-                current_embed, cross_K, cross_V,
+                current_embed, cross_K, cross_V, key_mask=cross_key_mask,
             )                                               # [BS, J, D]
 
             # Step query: combine all four signals

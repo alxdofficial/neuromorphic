@@ -40,6 +40,7 @@ class WriteModule(nn.Module):
         current_window_hiddens: Tensor,    # [BS, T, d_lm]
         manifold: VocabularyManifold,
         *,
+        window_mask: "Tensor | None" = None,  # [BS, T] bool — True=real
         hard: bool = True,
     ) -> WalkerResult:
         """Walk a write trajectory over the current window's hiddens.
@@ -53,6 +54,7 @@ class WriteModule(nn.Module):
             window_hiddens=current_window_hiddens,
             entry_proj=self.entry_proj,
             manifold=manifold,
+            window_mask=window_mask,
             write_mode=True,
             hard_routing=hard,
         )

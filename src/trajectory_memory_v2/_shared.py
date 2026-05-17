@@ -147,7 +147,10 @@ class CrossAttention(nn.Module):
         for m in (self.W_q, self.W_k, self.W_v):
             nn.init.xavier_uniform_(m.weight)
 
-    def forward(self, q: Tensor, kv: Tensor) -> Tensor:
+    def forward(self, q: Tensor, kv: Tensor, key_mask: Tensor | None = None) -> Tensor:
+        """key_mask: [BS, NK] bool — True = real, False = pad. If given,
+        pad-position scores are masked to -inf before softmax so they
+        contribute zero to attention output."""
         out_dtype = q.dtype
         with torch.autocast(
             device_type="cuda" if q.is_cuda else "cpu",
@@ -161,6 +164,11 @@ class CrossAttention(nn.Module):
             K2 = K.reshape(BS, -1, self.d_attn)
             V2 = V.reshape(BS, -1, self.d_attn)
             scores = torch.bmm(Q2, K2.transpose(1, 2)) / math.sqrt(self.d_attn)
+            if key_mask is not None:
+                # key_mask: [BS_outer, NK]; broadcast to [BS, NQ, NK].
+                scores = scores.masked_fill(
+                    ~key_mask.reshape(BS, 1, -1), float("-inf"),
+                )
             attn = F.softmax(scores, dim=-1)
             out2 = torch.bmm(attn, V2)
             out = out2.reshape(*Q.shape)
@@ -175,7 +183,9 @@ class CrossAttention(nn.Module):
             V = self.W_v(kv)
         return K, V
 
-    def forward_with_kv(self, q: Tensor, K: Tensor, V: Tensor) -> Tensor:
+    def forward_with_kv(
+        self, q: Tensor, K: Tensor, V: Tensor, key_mask: Tensor | None = None,
+    ) -> Tensor:
         out_dtype = q.dtype
         with torch.autocast(
             device_type="cuda" if q.is_cuda else "cpu",
@@ -185,6 +195,10 @@ class CrossAttention(nn.Module):
             BS = q.shape[0]
             Q2 = Q.reshape(BS, -1, self.d_attn)
             scores = torch.bmm(Q2, K.transpose(1, 2)) / math.sqrt(self.d_attn)
+            if key_mask is not None:
+                scores = scores.masked_fill(
+                    ~key_mask.reshape(BS, 1, -1), float("-inf"),
+                )
             attn = F.softmax(scores, dim=-1)
             out2 = torch.bmm(attn, V)
             out = out2.reshape(*Q.shape)
