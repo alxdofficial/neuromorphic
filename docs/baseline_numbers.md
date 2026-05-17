@@ -1,0 +1,471 @@
+# Trajectory-Memory: diagnostic metrics + per-version baselines
+
+Single source of truth for "is the architecture working?" questions across
+versions. Every claim about a model should cite a row in one of these tables.
+
+Status: 2026-05-17, after v2 vocab-trajectory 10K-step run on composite_v1
+and the audit that recovered ~7K lines of deleted diagnostics from git.
+
+---
+
+## Section 0 — Recovery status
+
+The `bf86253` "purge v1 from main" commit deleted substantial diagnostic
+infrastructure. Status after recovery:
+
+| Asset | Status | Location |
+|---|---|---|
+| **Output JSONs** (em_vanilla.json, em_ours.json, gap_decomp_*, scale_sweep, etc.) | **PERMANENTLY LOST** — never committed | none — would need re-run |
+| Old `docs/baseline_numbers.md` (336 lines) | recovered from git | `docs/baseline_numbers_historical.md` |
+| Old `docs/bench_results.md` (402 lines) | recovered | `docs/bench_results_historical.md` |
+| Old `docs/wave1_retrieval_pretraining.md` (594 lines) | recovered | `docs/wave1_retrieval_pretraining_historical.md` |
+| Old `docs/wave1_v3_protocol.md` (155 lines) | recovered | `docs/wave1_v3_protocol_historical.md` |
+| Old `docs/profile_analysis.md` (387 lines) | recovered | `docs/profile_analysis_historical.md` |
+| Old `docs/plan_trajectory_memory.md` (1880 lines) | recovered | `docs/plan_trajectory_memory_historical.md` |
+| Old diagnostic scripts (13 files, 3,231 lines) | recovered | `scripts/eval/legacy/` |
+| v1 trajectory codebase | preserved | branch `abandoned/trajectory-memory-v1` (tip `7bec656`) |
+
+What we have for v1 numbers post-recovery: published numbers in the
+historical baseline doc, but the per-doc/per-distance JSONs that backed
+them are not on disk. Any new comparison requires re-running.
+
+---
+
+## Section 1 — Complete metric taxonomy
+
+Twelve families. Marked as **[legacy]** if recovered from deleted scripts,
+**[live]** if currently emitted by the v2 trainer, or **[planned]** if
+still to be wired.
+
+### 1A. Loss / accuracy — headline numbers
+
+| Metric | Definition | Status | Where |
+|---|---|---|---|
+| `loss` | Total = answer_loss + Σ(coef × aux) | **live** | train.jsonl |
+| `answer_loss` | NLL on answer-content tokens (mean per token) | **live** | train+val.jsonl |
+| `answer_acc` | argmax-match accuracy on answer-content tokens | **live** | train+val.jsonl |
+| `val_loss` / `val_acc` | held-out variants | **live** | val records |
+| `per_key_loss` | per-task answer NLL | **live** | val records |
+| **NTP CE** (full vocab, all valid tokens) | bench_vanilla_llama.py — unweighted per-source CE | **[legacy]** | needs port to v2 |
+| **Answer-span CE** | bench_vanilla_llama.py — CE on `valid_mask & is_answer` only | **[legacy]** | needs port |
+| **First-token-only NLL** | NLL on JUST the first answer-content token (kills teacher-forcing leak) | **[planned]** | not wired |
+
+### 1B. Routing health (the v1 collapse failure mode)
+
+| Metric | Definition | Healthy | v1 catastrophic |
+|---|---|---|---|
+| `w_unique_per_window` | mean unique cells visited by write trajs | > 0.10 · K_max | 0.003 |
+| `r_unique_per_window` | same for read | > 0.10 · K_max | collapsed to 1 |
+| `w_unique_per_traj`, `r_unique_per_traj` | per-trajectory | > 0.3 · K_hop | 1 |
+| `read_entry_entropy`, `write_entry_entropy` | Shannon entropy of entry distribution | > 1 nat | ≈ 0 |
+| `aux_lb` | Switch-style load-balance loss | falling, MA < 100 | exploded to 10⁴+ |
+| `aux_z` | router z-loss | falling, MA < 300 | unbounded |
+| `entry_logits_max` | max entry routing logit | < 10 | > 100 saturated |
+| **Lifetime utilization** (% cells ever written / read) | running counter across full run | > 50% / > 20% | **v1: 8.7% / 3.7%** |
+| **`r_uf` uniform-random check** | bench_vanilla_llama old: r_uf=1−(N−1/N)^K_read; collapsed routing matches this exactly | should DIFFER from uniform formula | **v1: 0.224 matches `1-(4095/4096)^1024` exactly** ⇒ uniform random |
+| `usage_ema` per concept | (legacy) running EMA of cell use | should have peaks | **v1: max 0.0006 = 1/N (flat)** |
+| `r_self_overlap` | within-trajectory revisits | > 0 | **v1: 0.0** |
+
+### 1C. Read↔write alignment
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `rw_overlap_entry` | Jaccard of read-entry ∩ write-entry for target fact | > 0.5 |
+| `rw_overlap_hop` | same for non-entry hops | > 0.1 |
+| `rw_overlap_all` | combined | > 0.3 |
+| `rw_overlap_target` | restricted to target fact vs distractors | > 0.4 |
+
+### 1D. Edge / state health
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `mean_edge_state_norm` | mean L2 of populated edge_state | ≈ √D (32) |
+| `n_active_edges` | populated edge count | grows then plateaus 50-80% N·K_max |
+| `edge_active_fraction` | / (N·K_max) | as above |
+| `mean_visit_count` | mean writes per active edge | grows; not too lopsided |
+| `mean_edge_specificity` | cosine-distance EMA per edge | 0.3–0.7 |
+| `mean_edge_age` | mean step-count since last visit | growing ⇒ stale edges |
+| `mean_fan_out` | mean out-degree | > 0; plateau means topology used |
+
+### 1E. Gradient health
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `grad_norm` | total pre-clip | < 10 typical |
+| `grad_norm_{module}` | per-module: entry_proj, walker.read/write, mem_inject, lambda_edge, read_attn, concept_ids | non-zero each |
+| Grad spike count >50/1000 | how often pathological | < 5 |
+
+### 1F. Contrastive alignment loss
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `l_contrast_entry` | entry-cell InfoNCE (read entry positive = write target entry) | ↓ from ~3.7 to <1.5 |
+| `l_contrast_per_step` | per-hop trajectory-state InfoNCE | ↓ from ~2.0 to <0.7 |
+
+### 1G. Throughput / efficiency
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `step_s` | wall-clock per training step | stable ±10% |
+| VRAM peak | max GPU memory during step | < device limit |
+| SM utilization | GPU utilization during step | > 80% compute-bound |
+| Tok/sec (training) | BS × n_windows × T / step_s | varies by config |
+
+### 1H. Concept-space health (SimVQ-specific, v2)
+
+| Metric | Definition | Healthy |
+|---|---|---|
+| `concept_ids_norm_mean` | mean L2 of post-projection concept embeddings | stable, ~√D |
+| `concept_ids_norm_cv` | CV of concept-ID norms | small (~0.05) |
+| `concept_ids_pairwise_cos` | avg pairwise cosine of concept_ids | near 0 |
+
+### 1I. Memory-contribution probes — THE "is memory helping?" tests
+
+The most important section. v2 10K run revealed all gaps to vanilla can be
+explained by format-learning + teacher-forced AR — memory itself contributed
+zero. These probes are the only way to catch that.
+
+| Probe | Definition | Healthy target | Status |
+|---|---|---|---|
+| **NLL with-mem vs no-mem (paired)** | same chunks, run twice: full memory vs empty manifold + skipped writes | gap > 0.5 nat per content token | **[planned]** ad-hoc this session showed 0.00 |
+| **NLL with-mem vs vanilla no-ctx** | paired comparison to frozen Llama with question only | gap > 1 nat | **[planned]** ad-hoc this session |
+| **NLL with-mem vs vanilla full-ctx** | paired comparison to Llama with 8 passages in context | small gap OK | **[planned]** ad-hoc |
+| **First-token-only NLL** | score ONLY the first content token (kills teacher-forced leak) | matches with/without-mem gap above | **[planned]** |
+| **Generation EM** | autoregressive decode, exact match | passphrase verbatim > 30% | **[legacy]** bench_em_accuracy.py |
+| **Generation tok-acc** | argmax-on-answer-tokens (TF-EM upper bound) | > 50% | **[legacy]** |
+| **Per-distance CE** | bins: 0-2K, 2K-5K, 5K-12K, 12K-24K, 24K+ | should be near-flat if memory works | **[legacy]** bench_em_accuracy.py |
+| **Decode probe** | feed read trajectory to Llama (skip rest of context), inspect emitted tokens | content-relevant tokens, not gibberish | **[legacy]** decode_probe.py + viz_trajectory_decoder.py |
+| **Memory readout norm** | hook `mem_inject.memory_fn` output | non-zero (>0.01), varying per question | **[planned]** |
+| **Cross-question read divergence** | same chunk + 2 questions: are read trajectories distinct? | Jaccard < 0.5 | **[planned]** |
+| **Scale sweep** | multiply trained scale_raw by f ∈ {0, 0.25, 0.5, 0.75, 1.0, 1.5}, measure CE | non-monotonic with sweet spot ≠ 0 | **[legacy]** bench_scale_sweep.py — v1 result was strictly monotonic (memory = noise) |
+
+### 1J. Gap decomposition (v1 legacy methodology)
+
+Critical for honest accounting of WHY our number differs from vanilla.
+
+| Probe | Definition | Status |
+|---|---|---|
+| **scale_zero (identity scaffold)** | force the bridge scale_raw to 0 → IntegratedLM is byte-identical to vanilla Llama. Measures scaffolding overhead | **[legacy]** bench_gap_decomp.py |
+| **scale_trained** | normal memory readout | **[legacy]** |
+| **scale_trained_readout_zero** | trained scale, but force memory_fn → 0. Sanity check for W_out bias contribution | **[legacy]** |
+| **Memory injection cost** | scale_trained − scale_zero | should be ≤ 0 for "memory helps"; v1 was +0.09 (small cost) |
+| **`inject_snr`** | ‖memory_injection‖ / ‖hidden_state‖ | < 0.1 if memory is a gentle modulation; > 0.5 means major rewrite | **[legacy training telemetry]** |
+| **`scale_raw` final state** | learned per-feature gate values | should move from init if memory is useful | **[legacy]** v1: 0.0964 vs init 0.1 (never moved) |
+
+### 1K. Interpretability / visualization (legacy, very valuable)
+
+| Probe | Definition | Status |
+|---|---|---|
+| **Concept dictionary** | for each cell, synthesize length-1 trajectory + decode 100 samples + summarize | **[legacy stub]** viz_trajectory_decoder.py |
+| **Interpolation panel** | decode along shortest graph path A→B between concept pairs | **[legacy stub]** |
+| **Counterfactual probe** | take real trajectory, swap one hop, decode | **[legacy stub]** |
+| **Manifold viz** | 3D projection of concept_ids; nearest-neighbor structure | **[legacy]** viz_manifold.py (311 lines) |
+| **Concept↔language** | concept-language correspondence probe | **[legacy stub]** viz_concept_language.py |
+| **Needle decode panel** | decode write_trajectory at needle position | **[legacy stub]** viz_needle_recall.py |
+
+### 1L. Architectural ablations (need to rebuild for v2)
+
+| Ablation | Question | Status |
+|---|---|---|
+| **Flat-bank baseline** | replace trajectory walks with top-K cell attention at same params | **v1 had it; needs port to v2 vocab-trajectory** |
+| **Single hop (K=1)** | does multi-hop add anything? | needs flag in walker |
+| **No graph (full N×N routing)** | is the small-world graph helping? | needs flag |
+| **No decay gate** | is state-magnitude bounding load-bearing? | needs flag |
+| **No load-balance loss** | regression test | needs flag |
+| **No revival / no W-TinyLFU** | does eviction policy matter? | needs flag |
+| **Backbone size up (3B)** | does architecture scale? | needs config |
+
+---
+
+## Section 2 — Required baselines (must be measured for every version)
+
+These are the comparison points for **every** new version's diagnostic run.
+
+| Baseline | Why | How |
+|---|---|---|
+| **Vanilla Llama no-ctx** | the floor — model has only the question | tokenize Q+A, frozen Llama forward, NLL on A-content tokens |
+| **Vanilla Llama full-ctx** | the ceiling — Llama with all passages in context | tokenize 8×P+Q+A, frozen Llama forward, NLL on A-content |
+| **Vanilla Llama 2K-cap** | the "memory matters" floor — Llama can't see >2K | rolling KV-cache with 2K cap |
+| **scale=0 identity scaffold (ours)** | our scaffolding without memory injection. Isolates scaffold overhead | force `mem_inject.scale_raw = 0` |
+| **Flat-bank at same params** | architectural ablation — does the graph buy anything over flat attention? | replace walker with top-K cell attn |
+
+---
+
+## Section 3 — Version inventory (Trajectory-Memory week)
+
+Six distinct v1 versions + the v2 rewrite. All v1 versions are on
+`abandoned/trajectory-memory-v1` (tip `7bec656`) — checkout the commit to
+get that exact code state.
+
+| # | Version | Commit | Date | Architectural change | Trained on composite_v1? |
+|---|---|---|---|---|---|
+| V1.0 | Trajectory + softmax-STE | `dcc61d4` | 2026-05-12 | per-cell state + softmax-STE routing | No — trained on older data |
+| V1.1 | + Wave 1 v4 protocol | `d95f4b9` | 2026-05-13 | data protocol change, arch unchanged | possible |
+| V1.2 | + flat-bank ablation + decode probe | `f2f77ea` | 2026-05-13 | flat-bank module added alongside | yes |
+| V1.3 | + Mixtral routing fixes | `311c2aa` | 2026-05-14 | small init, noisy gating, lower temp, stronger LB | **never retrained** |
+| V1.4 | + dial-back tuning | `c103ffe` | 2026-05-14 | noise=0, init std 0.01→0.05 | **never retrained** |
+| **V1.5** | **+ per-hop contrastive loss** | **`7bec656`** | 2026-05-14/15 | InfoNCE for entry + per-hop trajectory state | **never trained on composite_v1** |
+| V2.0 | vocabulary-trajectory rewrite | `6cb713c` | 2026-05-17 | vocab id_basis + SimVQ + sparse edges | Wave 1 v5 smoke |
+| **V2.13** | **current** | **`65fe2f1`** | **2026-05-17** | + bf16 edges + RMS-norm + W-TinyLFU + all v2 fixes | **YES — 10K run we just did** |
+
+---
+
+## Section 4 — Per-version results
+
+### Vanilla Llama-3.2-1B (no memory side-car)
+
+| Metric | Value | Val set | Source |
+|---|---:|---|---|
+| Params total / trainable | 1.24B / 0 | — | architecture |
+| NLL/tok full answer (no ctx) | **5.6753** | composite_v1 val, 80 chunks | this session |
+| NLL/tok full answer (full ctx, 8 P) | **4.8130** | same | this session |
+| Passphrase content NLL (no ctx) | 1.9730 | single chunk | this session |
+| **NTP CE on bulk text** (legacy v1 era) | **2.4367** weighted | fineweb/wiki/slim/needle, 800 chunks | `outputs/vanilla_llama_train_floor.json` (lost) |
+| NTP CE per source: fineweb_edu | ~2.3 | 200 chunks | lost |
+| NTP CE per source: wikipedia | ~2.2 | 200 chunks | lost |
+| NTP CE per source: slimpajama | ~2.3 | 200 chunks | lost |
+| NTP CE per source: needle | ~2.7 | 200 chunks | lost |
+| **Answer-only CE (full-ctx)** | 1.18 | needle val, 100 docs | lost |
+| **Answer-only CE (2K-cap)** | 4.08 | same | lost |
+| tok-acc (full-ctx) | 73% | needle val | lost |
+| tok-acc (2K-cap) | 41% | same | lost |
+| Per-doc EM (full-ctx) | 6% | same | lost |
+| Per-doc EM (2K-cap) | 3% | same | lost |
+| FWD throughput (single fwd, BS=8) | ~0.01s | — | this session |
+
+### V1.5 — trajectory v1 + per-hop contrastive (`7bec656`)
+
+| Metric | Value | Status |
+|---|---:|---|
+| Trained on composite_v1? | NO | needs retrain |
+| Trained on Wave 1 v4? | Possibly (need to check) | TBD |
+| All other metrics | unknown | need run |
+
+### V1.0–V1.4 — earlier v1 variants
+
+All from `abandoned/trajectory-memory-v1` parent commits. None trained on
+composite_v1. Historical numbers we have from the v1 era (Wave 1 v4 val set,
+**not** composite_v1):
+
+| Variant | val_loss @ step 10K | cells written | EM | tok-acc | answer-CE |
+|---|---:|---:|---:|---:|---:|
+| V1.0 pre-Mixtral | 1.23 | 357/4096 (8.7%) | — | — | — |
+| Flat-bank baseline | **1.15** | 2,214/4096 (54%) | — | — | — |
+| V1 (older bug-era, KV-cache uncapped) | 3.12 answer-CE | — | 5% | 52% | 3.12 |
+| V1 (2K-cap inference, post-patch) | 6.5 answer-CE | — | 0% | 19.5% | ~6.5 |
+
+Note: per-distance CE for V1 (2K-cap inference): {0-2K: 4.00, 2K-5K: 6.22, 5K-12K: 8.09, 12K-24K: 7.32, 24K+: 8.24}. Confirmed memory cannot carry information past the 2K window.
+
+V1 era param state (best ckpt @ step 7000):
+- `r_uf = 0.224 ± 0.002` — exactly matches `1 − (4095/4096)^1024` (uniform random)
+- `usage_ema` max = 0.0006 (= 1/N, fully flat)
+- `r_self_overlap = 0.0` (no revisits)
+- `scale_raw` final mean = 0.0964 (init was 0.1 — **never moved**)
+- `inject_snr ≈ 0.65` — injection has 65% of hidden-state norm (not gentle)
+- Gap decomp: scale_zero CE = 2.37 / scale_trained CE = 2.46 / **memory cost = +0.09 nat**
+- Scale sweep: strictly monotonic, no sweet spot — memory readout is noise
+
+### V2.13 — vocabulary-trajectory (current, `65fe2f1`), 10K-step ckpt
+
+#### Architecture summary
+- N=4096 concepts × D=1024 with SimVQ id_basis + id_proj reparameterization
+- K_max=32 edges/concept (≈ 131K total edge slots)
+- J=4 parallel trajectories, K_read=K_write=8 hops
+- Llama-3.2-1B frozen except adapter (~6.3M)
+- 48.2M trainable
+
+#### Loss / acc trajectory
+| step | train_loss MA | train_ans MA | train_acc | val_loss | val_acc |
+|---:|---:|---:|---:|---:|---:|
+| 1000 | 2.85 | 2.56 | 0.50 | 2.00 | 0.54 |
+| 3000 | 2.02 | 1.80 | 0.55 | 1.66 | 0.57 |
+| 5000 | 1.80 | 1.64 | 0.57 | 1.52 | 0.59 |
+| 6000 | 1.67 | 1.50 | 0.58 | **1.44** | **0.59** |
+| 9500 | — | — | — | 1.42 | 0.62 |
+| 10000 | 1.66 | — | — | 1.66 | 0.55 |
+
+#### Routing health
+| step | `w_unique_per_window` MA | `aux_lb` MA | `aux_z` MA |
+|---:|---:|---:|---:|
+| 1K | 5.88 | 710 | 329 |
+| 5K | 8.95 | 61 | 116 |
+| 10K | ~7.8 | ~50 | ~80 |
+
+#### Memory-contribution probes ⚠️
+| Probe | Value | Verdict |
+|---|---:|---|
+| NLL with-mem | 1.79 | vs vanilla no-ctx 5.67 |
+| NLL no-mem (empty manifold, no writes) | **1.79** | **identical** |
+| NLL vanilla no-ctx | 5.67 | gap of 3.88 nat looks impressive… |
+| NLL vanilla full-ctx | 4.81 | …but |
+| Passphrase content NLL: with-mem | **1.974** | |
+| Passphrase content NLL: without-mem | **1.974** | **= with-mem to 3 decimals** |
+| Passphrase content NLL: vanilla no-ctx | **1.973** | **= both v2 modes** |
+| **Verdict** | **memory contributes zero** | the v2→vanilla gap is all teacher-forced AR continuation + format learning, not retrieval |
+
+#### Per-task val NLL (mean across 20 val records during training)
+| Task | mean NLL | min | max | spread |
+|---|---:|---:|---:|---:|
+| calendar.free_at | 0.73 | 0.49 | 0.94 | 0.45 |
+| knights.identity_of | 0.59 | 0.45 | 0.82 | 0.37 |
+| revisions.how_many_revisions | 0.46 | 0.08 | 1.31 | 1.24 |
+| theory_of_mind.has_seen | 0.84 | 0.55 | 2.01 | 1.46 |
+| triage.what_blocks | 0.89 | 0.08 | 1.95 | 1.87 |
+| triage.is_ready | 0.63 | 0.00 | 2.49 | 2.49 |
+| theory_of_mind.where_belief | 1.58 | 1.24 | 2.84 | 1.61 |
+| theory_of_mind.where_actually | 1.66 | 1.15 | 4.95 | 3.81 |
+| preferences.preference_cancelled | 1.89 | 0.76 | 3.99 | 3.23 |
+| boxes.final_state | 1.74 | 1.24 | 2.89 | 1.65 |
+| preferences.preference_recall | 1.64 | 0.97 | 2.72 | 1.75 |
+| passphrase.verbatim_recall | 2.26 | 2.04 | 3.20 | 1.16 |
+| revisions.current_value | 2.40 | 1.44 | 5.50 | 4.06 |
+| calendar.next_event_on | 2.66 | 1.42 | 6.61 | 5.19 |
+| biographical.atomic | 3.65 | 2.45 | 4.83 | 2.38 |
+| biographical.relational_1hop | 4.30 | 2.80 | 5.61 | 2.81 |
+| biographical.relational_2hop | 5.86 | 3.77 | 9.00 | 5.24 |
+| biographical.aggregation_which | 5.90 | 4.03 | 7.40 | 3.37 |
+| biographical.temporal_years_between | 6.59 | 5.27 | 10.19 | 4.92 |
+
+#### Throughput
+| Metric | Value |
+|---|---|
+| Train step time (BS=8) | 1.15 s/step |
+| Train tok/sec | ~17.2K |
+| VRAM peak | 23.7 / 24.5 GB |
+| GPU SM util | ~60% |
+| Final wall clock | ~3.2 h |
+
+---
+
+## Section 5 — The plan
+
+### 5A. First — build the unified diagnostic suite
+
+A single command that, given a ckpt, emits **every metric in Section 1**.
+
+```
+scripts/eval/eval_v2_full.py \
+    --ckpt outputs/wave1_v2/ckpt.10000.pt \
+    --val-dir data/wave1/composite_v1/val \
+    --output outputs/wave1_v2/eval_full.json
+```
+
+Output: JSON with all Section 1 families filled. Plus a markdown report
+that drops into Section 4 of this doc as a new row.
+
+Components:
+- (port from legacy) bench_vanilla_llama: vanilla Llama no_ctx / full_ctx / 2K-cap CE + tok-acc
+- (port from legacy) bench_em_accuracy: per-distance, generation-based EM (priority 2)
+- (port from legacy) bench_gap_decomp: scale=0 / scale_trained for v2's mem_inject
+- (port from legacy) bench_scale_sweep: scale-factor sweep
+- (port from legacy) decode_probe: feed read trajectory directly to Llama
+- (new) with-mem vs no-mem paired NLL — true ablation, not the broken scale=0 one
+- (new) cross-question read divergence
+- (new) memory readout norm + variance
+- (new) first-token-only NLL (kills teacher-forcing leak)
+- (live, already there) all 42 training JSONL metrics — log final-step values
+
+### 5B. Second — run on V2.13 ckpts to fill in baseline_numbers.md
+
+Run on `ckpt.7000.pt`, `ckpt.10000.pt`, and the saved `ckpt.pt` (whichever
+is best). Estimated: 30-45 min per ckpt.
+
+### 5C. Third — retrain selected v1 versions on composite_v1
+
+User selected for retraining (paired with the new diagnostic suite):
+1. **V1.0** (`dcc61d4`) — pre-Mixtral, softmax-STE
+2. **V1.3** (`311c2aa`) or **V1.4** (`c103ffe`) — Mixtral routing fixes
+3. **V1.5** (`7bec656`) — + per-hop contrastive loss (the final v1 state)
+4. **Flat-bank baseline** — to be built inside v2 codebase for fair compare
+
+Cost: each retrain ~3h (BS=8, 10K steps). Plus eval ~30 min each.
+4 versions × 3.5h ≈ 14 hours of compute. Overnight job.
+
+Caveats:
+- V1.0 → V1.5 used `src/trajectory_memory/` which is on the
+  `abandoned/trajectory-memory-v1` branch. Checking out + retraining will
+  need worktree to avoid clobbering current v2 work.
+- V1's `train_wave1_retrieval.py` uses CompositeRetrievalAdapter (which is
+  still in `scripts/data/wave1/common/sampler.py` on the v1 branch).
+  Should work out of the box on composite_v1.
+- The flat-bank "port to v2" is a new module, not just a config flag.
+  Worth doing because it's the cleanest "does the graph help?" ablation.
+
+### 5D. Open questions to confirm with user before launching
+
+1. Train each v1 version with same hyperparameters as v2 (BS=8, 10K, lr=3e-4)? Y/N
+2. Use the existing composite_v1 train/val split for fair comparison? Y/N
+3. For the flat-bank port: top-K attention over N concept_ids (no edges), parameter-matched to v2's walker. OK?
+4. Should the v1 retrains run in a git worktree (`isolate=worktree`) so they
+   don't disturb v2 dev on main? Recommended yes.
+5. Diagnostic suite build first (~half day) before any retrain starts? Y/N
+
+---
+
+## Section 6 — Diagnostic-suite design notes
+
+What each metric measures (the user's specific ask):
+
+**Loss/accuracy:**
+- `loss` / `answer_loss` / `answer_acc`: training signal magnitude — what
+  the optimizer is responding to. **Misleading by itself** because the QA
+  window contains the gold answer (teacher forcing leaks).
+- `per_key_loss`: which tasks the model is learning. Detects task-level
+  failure modes (e.g., biographical relational stuck high).
+
+**Routing health:**
+- `w_unique_*` / `r_unique_*`: how many distinct cells get used? Low
+  values = routing collapse. v1's catastrophic collapse was at 0.003.
+- `read/write_entry_entropy`: are entry cells diverse? Distribution
+  measure rather than just count.
+- `aux_lb` / `aux_z`: training-time regularizers. Should fall during
+  training; if they don't, routing isn't optimizing.
+- Lifetime utilization: % of N cells ever used. Reveals dead-cell problems.
+
+**Read↔write alignment:**
+- `rw_overlap_*`: do reads find cells writes used? Without alignment, the
+  graph is decorative. Per-chunk, per-target, per-hop break-downs.
+
+**Edge/state:**
+- `mean_edge_state_norm`: bounded? v1 had explosion to 210 before RMS-norm
+  fix.
+- `n_active_edges` / `edge_active_fraction`: graph coverage.
+- `mean_visit_count`: distribution — should be lumpy if some edges matter
+  more than others.
+- `mean_edge_age` / `mean_edge_specificity`: eviction/freshness health.
+
+**Gradient health:**
+- `grad_norm` total: detect spikes (numerical instability).
+- Per-module: which modules are getting trained vs starving? Caught the
+  v1 write-grad collapse.
+
+**Contrastive losses:**
+- `l_contrast_entry`: pushes read entry-cell toward write entry-cell.
+- `l_contrast_per_step`: pushes per-hop trajectory states to align.
+
+**Concept space:**
+- `concept_ids_*`: SimVQ-specific. Detects embedding-norm collapse.
+
+**Memory contribution (the most important):**
+- with-mem − no-mem NLL: direct test. Zero = memory does nothing.
+- vs vanilla no-ctx: does our adapter add value beyond Llama?
+- vs vanilla full-ctx: how much retrieval are we doing vs just lookup?
+- first-token-only NLL: removes teacher-forced AR leak in answer span.
+- gen EM / tok-acc: honest decode-based test, no teacher forcing.
+- per-distance CE: needle eval, distance bins.
+- decode probe: feed read trajectory directly to Llama, inspect tokens.
+- readout norm: is the memory bridge actually outputting nonzero values?
+- cross-question divergence: does the same chunk's memory route to
+  different cells for different questions? (If not, memory ignores Q.)
+
+**Gap decomposition (v1 methodology):**
+- scale_zero (scaffolding-only): isolates non-memory overhead.
+- scale_trained (memory on): full system.
+- Difference = pure memory injection cost. Should be ≤ 0 if memory helps.
+- inject_snr: magnitude ratio. > 0.5 means memory is a big perturbation.
+- scale_raw final value vs init: did the bridge learn to use memory?
+- Scale sweep: monotonic ⇒ memory is noise; non-monotonic with sweet
+  spot ⇒ memory carries useful signal.
+
+**Throughput:**
+- step_s / VRAM / SM-util: efficiency. Subordinate to correctness.
