@@ -256,8 +256,18 @@ class Wave3TrainerV2:
         self,
         prompt_ids_tensor: Tensor,
         response_ids: list[int],
+        prompt_hiddens: Optional[Tensor] = None,
+        prompt_mask_for_read: Optional[Tensor] = None,
     ) -> Tensor:
-        """Per-token log π under the CURRENT policy. Gradient enabled."""
+        """Per-token log π under the CURRENT policy. Gradient enabled.
+
+        When `prompt_hiddens` is provided, they are used as
+        `read_conditioning_hiddens` so the read trajectory fires and
+        mem_inject's bridge MLPs see a non-zero readout — required for
+        PG gradient to actually flow through the adapter weights. Without
+        it, `mem_inject` falls back to zero_readout and the trainable
+        params (walker MLPs, bridge weights) don't affect logits.
+        """
         full_ids, full_mask, prompt_len, resp_len_kept = self._prepare_lp_inputs(
             prompt_ids_tensor, response_ids,
         )
@@ -267,6 +277,8 @@ class Wave3TrainerV2:
             lm_input_ids=full_ids,
             attention_mask=full_mask,
             prev_window_hiddens=None,
+            read_conditioning_hiddens=prompt_hiddens,
+            read_conditioning_mask=prompt_mask_for_read,
             hard_routing=False,
             write_mode="passage",
         )
@@ -277,6 +289,8 @@ class Wave3TrainerV2:
         self,
         prompt_ids_tensor: Tensor,
         response_ids: list[int],
+        prompt_hiddens: Optional[Tensor] = None,
+        prompt_mask_for_read: Optional[Tensor] = None,
     ) -> Tensor:
         """Per-token log π under the REFERENCE policy.
 
@@ -303,6 +317,8 @@ class Wave3TrainerV2:
             kwargs=dict(
                 attention_mask=full_mask,
                 prev_window_hiddens=None,
+                read_conditioning_hiddens=prompt_hiddens,
+                read_conditioning_mask=prompt_mask_for_read,
                 hard_routing=False,
                 write_mode="passage",
             ),
@@ -362,12 +378,31 @@ class Wave3TrainerV2:
         advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-6)
 
         # 3. Differentiable log-probs of generated tokens under current policy
-        #    AND reference policy.
+        #    AND reference policy. Precompute prompt hiddens once and pass
+        #    as read_conditioning_hiddens so the read trajectory fires and
+        #    mem_inject's bridge MLPs actually affect logits — otherwise
+        #    PG has no learning signal (memory_fn would be zero_readout).
         prompt_t = torch.tensor(
             self._truncate_and_pad(prompt_ids, T)[:min(len(prompt_ids), T)],
             dtype=torch.long, device=device,
         ).unsqueeze(0)
         prompt_mask = (prompt_t != self.pad_token_id)
+        # Detached prompt-only forward to source the read conditioning.
+        # No backward through this — its only role is to feed
+        # read_conditioning_hiddens into the per-rollout log-prob call.
+        snap_prompt = self.model.manifold.snapshot_edge_state()
+        try:
+            with torch.no_grad():
+                prompt_out = self.model.forward_window(
+                    lm_input_ids=prompt_t,
+                    attention_mask=prompt_mask,
+                    prev_window_hiddens=None,
+                    hard_routing=False,
+                    write_mode="passage",
+                )
+                prompt_hiddens = prompt_out["current_hiddens"].detach()
+        finally:
+            self.model.manifold.restore_edge_state(snap_prompt)
 
         pg_loss = torch.zeros((), device=device)
         kl_loss = torch.zeros((), device=device)
@@ -382,9 +417,17 @@ class Wave3TrainerV2:
             # the fresh post-prompt state, not the previous rollout's writes.
             snap_j = self.model.manifold.snapshot_edge_state()
             try:
-                lp_cur = self._compute_log_probs(prompt_t, resp)
+                lp_cur = self._compute_log_probs(
+                    prompt_t, resp,
+                    prompt_hiddens=prompt_hiddens,
+                    prompt_mask_for_read=prompt_mask,
+                )
                 if self._ref_params is not None and self.kl_coef > 0:
-                    lp_ref = self._compute_log_probs_ref(prompt_t, resp)
+                    lp_ref = self._compute_log_probs_ref(
+                        prompt_t, resp,
+                        prompt_hiddens=prompt_hiddens,
+                        prompt_mask_for_read=prompt_mask,
+                    )
                 else:
                     lp_ref = None
             finally:
