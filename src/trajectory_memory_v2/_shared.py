@@ -231,7 +231,14 @@ class EntryProjector(nn.Module):
         self.J = cfg.J
         self.D = D
         self.head_query = nn.Parameter(torch.empty(cfg.J, D))
-        nn.init.normal_(self.head_query, std=0.1)
+        # Scale init by 1/√D (Xavier-style). With std=0.1 fixed, the J
+        # head biases would dominate the entry_mlp content at init for
+        # large D (magnitude ~√D × 0.1 = 3.2 at D=1024), collapsing the
+        # J trajectories toward the same direction before training. The
+        # 1/√D scale keeps the head bias magnitude unit-order regardless
+        # of D, leaving room for the content signal to differentiate
+        # trajectories quickly.
+        nn.init.normal_(self.head_query, std=1.0 / math.sqrt(D))
         self.entry_mlp = nn.Sequential(
             nn.Linear(d_lm + D, D, bias=True),
             nn.GELU(),

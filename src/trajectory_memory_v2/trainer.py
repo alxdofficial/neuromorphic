@@ -160,15 +160,16 @@ class Phase1RetrievalTrainerV2:
         M = len(batch)
         pad_id = self.pad_token_id
 
-        # Passages: [M, 8, T]. Init with pad_id (not 0) so any unfilled
-        # rows are masked out by `(passage != pad_id)` downstream — if a
-        # chunk ever returns < 8 facts, the missing rows look like pure
-        # padding instead of all-zero "real" tokens.
-        passages = torch.full((M, 8, T), pad_id, dtype=torch.long, device=device)
+        # Passages: [M, n_facts, T]. Init with pad_id (not 0) so any
+        # unfilled rows are masked out by `(passage != pad_id)`
+        # downstream — if a chunk ever returns < n_facts, the missing
+        # rows look like pure padding instead of all-zero "real" tokens.
+        n_facts = cfg.n_facts_per_chunk
+        passages = torch.full((M, n_facts, T), pad_id, dtype=torch.long, device=device)
         for m, chunk in enumerate(batch):
             passages_in = chunk["fact_passages_token_ids"]
-            assert len(passages_in) == 8, (
-                f"expected 8 passages per chunk, got {len(passages_in)}"
+            assert len(passages_in) == n_facts, (
+                f"expected {n_facts} passages per chunk, got {len(passages_in)}"
             )
             for i, p in enumerate(passages_in):
                 passages[m, i] = torch.tensor(
@@ -308,10 +309,11 @@ class Phase1RetrievalTrainerV2:
 
         # Project via shared entry_proj to D_concept; mean over J
         d_lm = p_pools.shape[-1]
-        p_qentry = self.model.entry_proj(p_pools.reshape(M * 8, d_lm))  # [M*8, J, D]
-        p_pool_D = p_qentry.mean(dim=1)                                  # [M*8, D]
-        q_qentry = self.model.entry_proj(q_pool)                         # [M, J, D]
-        q_pool_D = q_qentry.mean(dim=1)                                  # [M, D]
+        n_facts = self.model.cfg.n_facts_per_chunk
+        p_qentry = self.model.entry_proj(p_pools.reshape(M * n_facts, d_lm))  # [M*N, J, D]
+        p_pool_D = p_qentry.mean(dim=1)                                       # [M*N, D]
+        q_qentry = self.model.entry_proj(q_pool)                              # [M, J, D]
+        q_pool_D = q_qentry.mean(dim=1)                                       # [M, D]
 
         # L2-normalize for cosine-based InfoNCE. Routing uses RMS-norm
         # internally, which differs from L2 only by a uniform magnitude
@@ -321,8 +323,8 @@ class Phase1RetrievalTrainerV2:
         # produce O(D)-magnitude logits that saturate the softmax.)
         q_n = F.normalize(q_pool_D, dim=-1)
         p_n = F.normalize(p_pool_D, dim=-1)
-        S = (q_n @ p_n.T) / self.contrast_temperature                    # [M, M*8]
-        labels = torch.arange(M, device=S.device) * 8 + target_idxs
+        S = (q_n @ p_n.T) / self.contrast_temperature                    # [M, M*N]
+        labels = torch.arange(M, device=S.device) * n_facts + target_idxs
         return F.cross_entropy(S, labels)
 
     def _per_step_contrastive(
@@ -472,12 +474,14 @@ class Phase1RetrievalTrainerV2:
         aux_lb_acc = torch.zeros((), device=device)
         aux_z_acc = torch.zeros((), device=device)
 
-        # Wave 1 writes 8 INDEPENDENT facts; each passage's write must NOT
-        # see the prior fact's memory. Pass prev_window_hiddens=None so
-        # mem_inject is zero-readout for fact-write windows. (Streaming
-        # Wave 2 keeps the carry-over by design — there the prior context
-        # is *what we're trying to retrieve from*.)
-        for i in range(8):
+        # Wave 1 writes n_facts INDEPENDENT facts; each passage's write
+        # must NOT see the prior fact's memory. Pass
+        # prev_window_hiddens=None so mem_inject is zero-readout for
+        # fact-write windows. (Streaming Wave 2 keeps the carry-over by
+        # design — there the prior context is *what we're trying to
+        # retrieve from*.)
+        n_facts = cfg.n_facts_per_chunk
+        for i in range(n_facts):
             passage_ids_i = passages[:, i, :]
             passage_mask_i = (passage_ids_i != self.pad_token_id)
             out = self.model.forward_window(
@@ -512,9 +516,10 @@ class Phase1RetrievalTrainerV2:
         )
         aux_lb_acc = aux_lb_acc + out_qa["aux_load_balance"]
         aux_z_acc = aux_z_acc + out_qa["aux_z_loss"]
-        # Average aux over 8 writes + 1 read
-        aux_lb_acc = aux_lb_acc / 9.0
-        aux_z_acc = aux_z_acc / 9.0
+        # Average aux over n_facts writes + 1 read
+        n_walker_calls = n_facts + 1
+        aux_lb_acc = aux_lb_acc / float(n_walker_calls)
+        aux_z_acc = aux_z_acc / float(n_walker_calls)
 
         # ── 3. Answer loss (NTP on answer tokens) ─────────────────
         logits = out_qa["logits"]                                   # [M, T, V]
@@ -678,9 +683,9 @@ class Phase1RetrievalTrainerV2:
         # Snapshot training memory — val writes mutate buffers in-place.
         snap = self.model.manifold.snapshot_edge_state()
         try:
-            # Run 8 INDEPENDENT writes (no cross-fact context — same as train)
+            # Run n_facts INDEPENDENT writes (same as train)
             write_visited_per_fact: list[Tensor] = []
-            for i in range(8):
+            for i in range(cfg.n_facts_per_chunk):
                 passage_ids_i = passages[:, i, :]
                 passage_mask_i = (passage_ids_i != self.pad_token_id)
                 out = self.model.forward_window(

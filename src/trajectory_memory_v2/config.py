@@ -124,9 +124,20 @@ class TrajMemV2Config:
     per_step_contrast_coef: float = 0.05  # on step_queries between matched read/write
     per_step_contrast_temperature: float = 0.07
 
-    # ── Tripwire thresholds for telemetry ─────────────────────────────────
-    tripwire_min_alpha: float = 0.005  # warn if min(α) over edges falls below
-    tripwire_max_eviction_rate: float = 0.20  # warn if >20% of edges evicted/step
+    # ── Wave 1 retrieval task structure ──────────────────────────────────
+    # Number of distinct fact passages written per chunk before the
+    # question is asked. Used by Phase1RetrievalTrainerV2 and must match
+    # the sampler's `chunk_size`. Scaling curriculum: 8 → 16 → 32.
+    n_facts_per_chunk: int = 8
+
+    # ── Llama injection ───────────────────────────────────────────────────
+    # `inject_layer_frac` of n_layers down the Llama stack is where
+    # MemInjectLayer replaces the original transformer block. 0.5 = mid.
+    # `mem_inject_scale_init` controls how strongly the memory output is
+    # added to the residual at init — small values give Llama time to
+    # learn before memory dominates.
+    inject_layer_frac: float = 0.5
+    mem_inject_scale_init: float = 0.1
 
     @classmethod
     def small(cls) -> "TrajMemV2Config":

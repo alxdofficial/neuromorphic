@@ -36,10 +36,6 @@ from src.trajectory_memory_v2.walker import WalkerResult
 from src.trajectory_memory_v2.write_module import WriteModule
 
 
-# Default Llama inject layer (mid-stack). Can override via cfg or arg.
-_DEFAULT_INJECT_LAYER_FRAC = 0.5
-
-
 class IntegratedLMV2(nn.Module):
     """Llama + vocabulary-trajectory memory, wired for Wave 1 and streaming."""
 
@@ -51,7 +47,7 @@ class IntegratedLMV2(nn.Module):
         attach_lm: bool = True,
         llama_dtype: str = "bf16",
         freeze_backbone: bool = True,
-        inject_layer_frac: float = _DEFAULT_INJECT_LAYER_FRAC,
+        inject_layer_frac: float | None = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -70,16 +66,22 @@ class IntegratedLMV2(nn.Module):
             if freeze_backbone:
                 self.host.freeze_backbone()
 
-            # Replace mid-stack layer with MemInjectLayer
+            # Replace layer at `inject_layer_frac` of the stack with
+            # MemInjectLayer. kwarg overrides cfg, cfg overrides default.
+            inject_frac = (
+                inject_layer_frac
+                if inject_layer_frac is not None
+                else cfg.inject_layer_frac
+            )
             n_layers = hf_cfg.num_hidden_layers
-            self.inject_layer = int(inject_layer_frac * n_layers)
+            self.inject_layer = int(inject_frac * n_layers)
             assert self.inject_layer < n_layers
             orig_layer = self.host.layer_list()[self.inject_layer]
             mem_inject = MemInjectLayer(
                 orig_layer=orig_layer,
                 d_lm=cfg.d_lm,
                 d_mem=cfg.D_concept,
-                scale_init=0.1,
+                scale_init=cfg.mem_inject_scale_init,
                 memory_fn=None,
                 bridge_hidden=cfg.D_concept,
             )
