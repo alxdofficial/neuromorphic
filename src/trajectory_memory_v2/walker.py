@@ -142,6 +142,17 @@ class TrajectoryWalker(nn.Module):
         self.reuse_bonus = nn.Parameter(
             torch.tensor(cfg.reuse_bonus_init, dtype=torch.float32),
         )
+        # Learnable cue decay (leaky integrator in the hop loop). Stored
+        # as a logit; transformed via sigmoid to stay in (0, 1) without
+        # constraints on the optimizer. Init logit = inverse_sigmoid(0.7)
+        # ≈ 0.847. Model can push toward longer-horizon cue (decay → 1)
+        # or instant-overwrite (decay → 0) based on task.
+        init_decay = float(cfg.cue_decay)
+        init_decay = min(max(init_decay, 1e-3), 1.0 - 1e-3)
+        cue_logit_init = math.log(init_decay / (1.0 - init_decay))
+        self.cue_decay_logit = nn.Parameter(
+            torch.tensor(cue_logit_init, dtype=torch.float32),
+        )
 
     def forward(
         self,
@@ -323,15 +334,15 @@ class TrajectoryWalker(nn.Module):
             # Differentiable gather for next node's embedding
             next_embed = torch.einsum("bjn,nd->bjd", combined_one_hot, concept_ids)
 
-            # Update running cue: leaky integrator. Each new visit's
-            # contribution decays the previous cue by `cue_decay`, then
-            # adds the freshly-projected next_embed. Bounds steady-state
-            # magnitude to ~|cue_proj output| / (1 - cue_decay), preserving
-            # recency-weighted relative magnitude information across hops
-            # (older visits weight less, but their direction persists).
-            # The decay is a static hyperparameter; it could be made
-            # learnable per-position later if needed.
-            cue_D = cfg.cue_decay * cue_D + self.cue_proj(next_embed)
+            # Update running cue: leaky integrator with LEARNABLE decay.
+            # `cue_decay = sigmoid(cue_decay_logit) ∈ (0, 1)`. Each new
+            # visit's contribution decays the previous cue, then adds the
+            # freshly-projected next_embed. Bounds steady-state magnitude
+            # to ~|cue_proj output| / (1 - cue_decay). Model can learn
+            # task-appropriate horizon (cue_decay → 1 keeps long history;
+            # → 0 acts like instant overwrite).
+            cue_decay = torch.sigmoid(self.cue_decay_logit)
+            cue_D = cue_decay * cue_D + self.cue_proj(next_embed)
 
             # ── WRITE / READ side effects on manifold (no-grad) ──
             src_flat = current.reshape(-1)                   # [BS*J]

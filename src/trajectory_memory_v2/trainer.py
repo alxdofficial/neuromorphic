@@ -393,11 +393,18 @@ class Phase1RetrievalTrainerV2:
         return float(-(p[nz] * p[nz].log()).sum())
 
     @staticmethod
-    def _bank_health(concept_ids: Tensor, sample: int = 128) -> tuple[float, float, float]:
+    def _bank_health(concept_ids: Tensor, sample: int | None = None) -> tuple[float, float, float]:
         """Returns (norm_mean, norm_cv, pairwise_cos_mean).
-        Subsamples `sample` concept_ids to keep pairwise cost bounded.
+
+        Subsamples up to `sample` concept_ids to keep pairwise cost
+        bounded. If sample is None, uses `min(256, N // 16)` so the
+        estimate is dense enough at the `medium` config (N=4096 →
+        sample=256) and at `large` (N=8192 → sample=512 capped to 256).
+        Floor of 64 to avoid noisy estimates on `small` (N=64).
         """
         N, D = concept_ids.shape
+        if sample is None:
+            sample = max(64, min(256, N // 16))
         with torch.no_grad():
             norms = concept_ids.norm(dim=-1)
             norm_mean = float(norms.mean())
