@@ -39,6 +39,7 @@ class V2Wave2Metrics:
     answer_token_count: int = 0
     aux_load_balance: float = 0.0
     aux_z_loss: float = 0.0
+    l_contrast_per_step: float = 0.0
     grad_norm: float = 0.0
     n_active_edges: int = 0
     edge_active_fraction: float = 0.0
@@ -50,7 +51,17 @@ class V2Wave2Metrics:
 
 
 class Wave2TrainerV2:
-    """SFT trainer for chat data, streaming mode."""
+    """SFT trainer for chat data, streaming mode.
+
+    Loss = answer_NTP + aux_load_balance + aux_z_loss + per_step_contrastive
+
+    Per-step contrastive pairs each window's write step_queries with the
+    NEXT window's read step_queries (both condition on the same source
+    hiddens — the current window — so they should produce aligned hop
+    trajectories). Without this loss the write walker's MLPs (step_mlp,
+    cross_attn, history_attn, cue_proj) get only routing aux gradient,
+    not semantic alignment signal.
+    """
 
     def __init__(
         self,
@@ -60,17 +71,22 @@ class Wave2TrainerV2:
         pad_token_id: int,
         scheduler: Any | None = None,
         grad_clip: float | None = 1.0,
-        load_balance_coef: float = 1e-4,
-        z_loss_coef: float = 1e-4,
-        max_prior_windows: int = 4,  # cap prior context (saves memory)
+        load_balance_coef: float | None = None,
+        z_loss_coef: float | None = None,
+        per_step_contrast_coef: float | None = None,
+        per_step_contrast_temperature: float | None = None,
+        max_prior_windows: int = 4,
     ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.grad_clip = grad_clip
         self.pad_token_id = pad_token_id
-        self.load_balance_coef = load_balance_coef
-        self.z_loss_coef = z_loss_coef
+        cfg = model.cfg
+        self.load_balance_coef = load_balance_coef if load_balance_coef is not None else cfg.load_balance_coef
+        self.z_loss_coef = z_loss_coef if z_loss_coef is not None else cfg.z_loss_coef
+        self.per_step_contrast_coef = per_step_contrast_coef if per_step_contrast_coef is not None else cfg.per_step_contrast_coef
+        self.per_step_contrast_temperature = per_step_contrast_temperature if per_step_contrast_temperature is not None else cfg.per_step_contrast_temperature
         self.max_prior_windows = max_prior_windows
         self._step_count = 0
 
@@ -112,6 +128,14 @@ class Wave2TrainerV2:
 
         prev_hiddens: Optional[Tensor] = None
         prev_mask: Optional[Tensor] = None
+        # Per-window step_queries for the streaming per-step contrastive.
+        # At each window w we collect both the write_step_queries (from
+        # this window's write trajectory) and the read_step_queries
+        # (which used the PREVIOUS window's hiddens for conditioning).
+        # The pair (write@w, read@(w+1)) is the alignment target — same
+        # source hiddens, different MLPs; contrastive forces convergence.
+        write_sq_per_window: list[Tensor] = []
+        read_sq_per_window: list[Optional[Tensor]] = []
         n_prior_windows = max(1, (T_prior + T - 1) // T)
         for w in range(n_prior_windows):
             start = w * T
@@ -134,16 +158,13 @@ class Wave2TrainerV2:
                 hard_routing=True,
                 write_mode="passage",
             )
-            # Detach to prevent unbounded BPTT through the prior-window Llama
-            # passes. prev_hiddens is only used as read conditioning at the
-            # next window — read_module operates on it but gradient through
-            # the prior-window Llama would unroll ~max_prior_windows×T tokens
-            # of backprop through 1B params and OOM.
             prev_hiddens = out["current_hiddens"].detach()
             prev_mask = window_mask_w
             aux_lb_acc = aux_lb_acc + out["aux_load_balance"]
             aux_z_acc = aux_z_acc + out["aux_z_loss"]
             n_walker_calls += 1
+            write_sq_per_window.append(out["write_step_queries"])
+            read_sq_per_window.append(out.get("read_step_queries"))
 
         T_response = response_ids.shape[1]
         if T_response > T:
@@ -169,6 +190,8 @@ class Wave2TrainerV2:
         aux_lb_acc = aux_lb_acc + out_resp["aux_load_balance"]
         aux_z_acc = aux_z_acc + out_resp["aux_z_loss"]
         n_walker_calls += 1
+        write_sq_per_window.append(out_resp["write_step_queries"])
+        read_sq_per_window.append(out_resp.get("read_step_queries"))
 
         aux_lb_acc = aux_lb_acc / max(n_walker_calls, 1)
         aux_z_acc = aux_z_acc / max(n_walker_calls, 1)
@@ -185,12 +208,56 @@ class Wave2TrainerV2:
         n_answer = shift_mask.float().sum().clamp_min(1.0)
         answer_loss = (per_tok_ce * shift_mask.float()).sum() / n_answer
 
+        # Streaming per-step contrastive: for each window w in 0..N-2,
+        # pair write_step_queries[w] with read_step_queries[w+1].
+        l_contrast_per_step = self._streaming_per_step_contrastive(
+            write_sq_per_window, read_sq_per_window,
+        )
+
         total_loss = (
             answer_loss
             + self.load_balance_coef * aux_lb_acc
             + self.z_loss_coef * aux_z_acc
+            + self.per_step_contrast_coef * l_contrast_per_step
         )
-        return total_loss, answer_loss, aux_lb_acc, aux_z_acc, n_answer
+        return total_loss, answer_loss, aux_lb_acc, aux_z_acc, l_contrast_per_step, n_answer
+
+    def _streaming_per_step_contrastive(
+        self,
+        write_sq: list[Tensor],
+        read_sq: list[Optional[Tensor]],
+    ) -> Tensor:
+        """InfoNCE pairing write@w step_queries with read@(w+1) step_queries.
+
+        Both condition on the same hiddens (window w's Llama output) but
+        go through different walker MLPs — contrastive forces those MLPs
+        to produce aligned trajectories.
+        """
+        device = write_sq[0].device
+        pairs = []
+        for w in range(len(write_sq) - 1):
+            rsq = read_sq[w + 1]
+            if rsq is None:
+                continue
+            pairs.append((write_sq[w], rsq))
+        if not pairs:
+            return torch.zeros((), device=device, dtype=torch.float32)
+        losses = []
+        for write_step_queries, read_step_queries in pairs:
+            # Each is [BS, J, K, D] — average over J trajectories then per-hop InfoNCE
+            BS = write_step_queries.shape[0]
+            K = min(write_step_queries.shape[2], read_step_queries.shape[2])
+            for k in range(K):
+                w_k = write_step_queries[:, :, k, :].mean(dim=1)   # [BS, D]
+                r_k = read_step_queries[:, :, k, :].mean(dim=1)    # [BS, D]
+                w_n = F.normalize(w_k, dim=-1)
+                r_n = F.normalize(r_k, dim=-1)
+                S = (r_n @ w_n.T) / self.per_step_contrast_temperature  # [BS, BS]
+                labels = torch.arange(BS, device=S.device)
+                losses.append(F.cross_entropy(S, labels))
+        if not losses:
+            return torch.zeros((), device=device, dtype=torch.float32)
+        return torch.stack(losses).mean()
 
     def step(self, batch) -> V2Wave2Metrics:
         """One gradient update over a TurnPairBatch.
@@ -203,7 +270,7 @@ class Wave2TrainerV2:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         self.model.manifold.advance_step()
-        total_loss, answer_loss, aux_lb_acc, aux_z_acc, n_answer = self._forward(
+        total_loss, answer_loss, aux_lb_acc, aux_z_acc, l_contrast, n_answer = self._forward(
             batch, train=True,
         )
 
@@ -228,6 +295,7 @@ class Wave2TrainerV2:
             answer_token_count=int(n_answer.item()),
             aux_load_balance=float(aux_lb_acc.detach()),
             aux_z_loss=float(aux_z_acc.detach()),
+            l_contrast_per_step=float(l_contrast.detach()),
             grad_norm=float(grad_norm.detach()) if isinstance(grad_norm, Tensor) else float(grad_norm),
             n_active_edges=edge_stats["n_active_edges"],
             edge_active_fraction=edge_stats["active_fraction"],
@@ -249,7 +317,7 @@ class Wave2TrainerV2:
         around the call site.
         """
         self.model.eval()
-        total_loss, answer_loss, aux_lb_acc, aux_z_acc, n_answer = self._forward(
+        total_loss, answer_loss, aux_lb_acc, aux_z_acc, l_contrast, n_answer = self._forward(
             batch, train=False,
         )
         edge_stats = self.model.manifold.edge_stats()
@@ -259,6 +327,7 @@ class Wave2TrainerV2:
             answer_token_count=int(n_answer.item()),
             aux_load_balance=float(aux_lb_acc.detach()),
             aux_z_loss=float(aux_z_acc.detach()),
+            l_contrast_per_step=float(l_contrast.detach()),
             grad_norm=0.0,
             n_active_edges=edge_stats["n_active_edges"],
             edge_active_fraction=edge_stats["active_fraction"],

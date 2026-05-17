@@ -7,6 +7,7 @@ so the v2 package is self-contained. Originals preserved on
 Public surface:
 - `RetrievalSampler` — composite-v1 fact-pool sampler (Wave 1)
 - `TurnPairBatch`, `TurnPairDataset` — chat parquet reader (Wave 2)
+- `PromptResponseDataset` — Wave 3 GRPO prompt/gold parquet reader
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Iterable
 
 import pyarrow.parquet as pq
 import torch
@@ -194,3 +195,86 @@ class TurnPairDataset:
                     response_mask=response_mask,
                     sources=[r["source"] for r in picks],
                 )
+
+
+# ── Wave 3 GRPO prompt/response reader ────────────────────────────────────
+
+
+class PromptResponseDataset:
+    """Loads a Wave 3 prompt-response parquet for GRPO.
+
+    Each example is one prompt; the trainer rolls out J responses and
+    computes group-relative reward against `gold_ids` (or gold text via
+    `meta`). Yields one example at a time; trainer batches if it wants.
+
+    Expected parquet columns (per `scripts/data/preprocess_grpo.py`):
+        prompt_ids: List[int]
+        gold_ids:   List[int]
+        source:     str         "gsm8k" / "narrativeqa" / etc.
+        reward_kind: str        "exact_match" / "f1_qa" / etc.
+        meta_json:  str         JSON-encoded per-example metadata
+
+    `source_weights` (optional) — per-source multiplier on replication
+    frequency before shuffling. Use to upweight long-context sources
+    (e.g. {"narrativeqa": 3.0, "musique": 3.0, "gsm8k": 1.0}). Rounded
+    to nearest int ≥ 1.
+    """
+
+    def __init__(
+        self,
+        parquet_paths: list[Path],
+        *,
+        shuffle: bool = True,
+        seed: int = 0,
+        source_weights: dict[str, float] | None = None,
+    ):
+        self.paths = [Path(p) for p in parquet_paths]
+        self.shuffle = shuffle
+        self.seed = seed
+        self._epoch = 0
+
+        rows = []
+        per_source_counts: dict[str, int] = {}
+        for path in self.paths:
+            tbl = pq.read_table(path)
+            cols = {c: tbl.column(c).to_pylist() for c in tbl.column_names}
+            for i in range(len(cols["prompt_ids"])):
+                src = cols["source"][i]
+                rows.append({
+                    "prompt_ids": cols["prompt_ids"][i],
+                    "gold_ids": cols["gold_ids"][i],
+                    "source": src,
+                    "reward_kind": cols["reward_kind"][i],
+                    "meta": json.loads(cols["meta_json"][i]) if cols["meta_json"][i] else {},
+                })
+                per_source_counts[src] = per_source_counts.get(src, 0) + 1
+
+        self.source_weights = source_weights or {}
+        if self.source_weights:
+            weighted_rows = []
+            for r in rows:
+                w = float(self.source_weights.get(r["source"], 1.0))
+                n_copies = max(1, int(round(w)))
+                weighted_rows.extend([r] * n_copies)
+            rows = weighted_rows
+
+        self._rows = rows
+        self._per_source_counts = per_source_counts
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def source_breakdown(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for r in self._rows:
+            out[r["source"]] = out.get(r["source"], 0) + 1
+        return out
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        rows = list(self._rows)
+        if self.shuffle:
+            rng.shuffle(rows)
+        for r in rows:
+            yield r
