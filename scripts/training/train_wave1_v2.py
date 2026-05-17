@@ -162,14 +162,14 @@ def main():
         cd = Path(args.composite_dir)
         train_sampler = CompositeRetrievalAdapter(
             cd / "passages.jsonl", cd / "questions.jsonl",
-            chunk_size=8, seed=args.seed,
+            chunk_size=cfg.n_facts_per_chunk, seed=args.seed,
         )
         val_sampler = None
         if args.composite_val_dir is not None:
             vd = Path(args.composite_val_dir)
             val_sampler = CompositeRetrievalAdapter(
                 vd / "passages.jsonl", vd / "questions.jsonl",
-                chunk_size=8, seed=args.seed + 1,
+                chunk_size=cfg.n_facts_per_chunk, seed=args.seed + 1,
             )
         print(f"Train composite: {len(train_sampler.facts)} questions")
         if val_sampler:

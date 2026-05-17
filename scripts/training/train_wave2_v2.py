@@ -232,6 +232,7 @@ def main():
         _log_jsonl(args.log_jsonl, {
             "step": step, "phase": "train",
             "loss": metrics.loss, "answer_loss": metrics.answer_loss,
+            "l_contrast_per_step": metrics.l_contrast_per_step,
             "answer_tokens": metrics.answer_token_count,
             "aux_lb": metrics.aux_load_balance, "aux_z": metrics.aux_z_loss,
             "grad_norm": metrics.grad_norm,

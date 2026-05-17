@@ -258,21 +258,27 @@ class Wave3TrainerV2:
         response_ids: list[int],
         prompt_hiddens: Optional[Tensor] = None,
         prompt_mask_for_read: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Per-token log π under the CURRENT policy. Gradient enabled.
+
+        Returns (log_probs, aux_load_balance, aux_z_loss). The aux losses
+        from this forward must be added into total_loss to keep routing
+        regularized during GRPO — without this the router gets no
+        load-balance pressure during Phase 2 and can drift toward a few
+        hot cells over a long run.
 
         When `prompt_hiddens` is provided, they are used as
         `read_conditioning_hiddens` so the read trajectory fires and
         mem_inject's bridge MLPs see a non-zero readout — required for
-        PG gradient to actually flow through the adapter weights. Without
-        it, `mem_inject` falls back to zero_readout and the trainable
-        params (walker MLPs, bridge weights) don't affect logits.
+        PG gradient to actually flow through the adapter weights.
         """
         full_ids, full_mask, prompt_len, resp_len_kept = self._prepare_lp_inputs(
             prompt_ids_tensor, response_ids,
         )
+        device = prompt_ids_tensor.device
         if full_ids is None:
-            return torch.zeros(0, device=prompt_ids_tensor.device)
+            zero = torch.zeros((), device=device)
+            return torch.zeros(0, device=device), zero, zero
         out = self.model.forward_window(
             lm_input_ids=full_ids,
             attention_mask=full_mask,
@@ -282,7 +288,8 @@ class Wave3TrainerV2:
             hard_routing=False,
             write_mode="passage",
         )
-        return self._gather_response_logprobs(out["logits"], full_ids, prompt_len, resp_len_kept)
+        lp = self._gather_response_logprobs(out["logits"], full_ids, prompt_len, resp_len_kept)
+        return lp, out["aux_load_balance"], out["aux_z_loss"]
 
     @torch.no_grad()
     def _compute_log_probs_ref(
@@ -417,7 +424,7 @@ class Wave3TrainerV2:
             # the fresh post-prompt state, not the previous rollout's writes.
             snap_j = self.model.manifold.snapshot_edge_state()
             try:
-                lp_cur = self._compute_log_probs(
+                lp_cur, aux_lb_j, aux_z_j = self._compute_log_probs(
                     prompt_t, resp,
                     prompt_hiddens=prompt_hiddens,
                     prompt_mask_for_read=prompt_mask,
@@ -434,6 +441,11 @@ class Wave3TrainerV2:
                 self.model.manifold.restore_edge_state(snap_j)
             if lp_cur.numel() == 0:
                 continue
+            # Accumulate aux losses only for rollouts that contribute to
+            # the PG loss — otherwise the n_kept divisor below inflates
+            # the aux coefficients vs pg/kl whenever a rollout is empty.
+            aux_lb_acc = aux_lb_acc + aux_lb_j
+            aux_z_acc = aux_z_acc + aux_z_j
             # Policy-gradient: -advantage · sum_t log π(token_t)
             pg_loss = pg_loss - advantages[j] * lp_cur.sum()
             # KL via Schulman's k3 estimator: always-nonneg, unbiased.
@@ -455,8 +467,15 @@ class Wave3TrainerV2:
             )
         pg_loss = pg_loss / n_kept
         kl_loss = kl_loss / n_kept
+        aux_lb_acc = aux_lb_acc / n_kept
+        aux_z_acc = aux_z_acc / n_kept
 
-        total_loss = pg_loss + self.kl_coef * kl_loss
+        total_loss = (
+            pg_loss
+            + self.kl_coef * kl_loss
+            + self.load_balance_coef * aux_lb_acc
+            + self.z_loss_coef * aux_z_acc
+        )
         total_loss.backward()
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -474,8 +493,8 @@ class Wave3TrainerV2:
             loss=float(total_loss.detach()),
             pg_loss=float(pg_loss.detach()),
             kl_loss=float(kl_loss.detach()),
-            aux_load_balance=float(aux_lb_acc.detach()) if isinstance(aux_lb_acc, Tensor) else 0.0,
-            aux_z_loss=float(aux_z_acc.detach()) if isinstance(aux_z_acc, Tensor) else 0.0,
+            aux_load_balance=float(aux_lb_acc.detach()),
+            aux_z_loss=float(aux_z_acc.detach()),
             mean_reward=float(rewards_t.mean()),
             max_reward=float(rewards_t.max()),
             min_reward=float(rewards_t.min()),

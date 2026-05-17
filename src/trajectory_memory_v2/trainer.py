@@ -455,6 +455,7 @@ class Phase1RetrievalTrainerV2:
 
     def step(self, batch: list[dict]) -> V2RetrievalMetrics:
         """One gradient update over a batch of M chunks."""
+        self.model.train()
         cfg = self.model.cfg
         M = len(batch)
         device = next(self.model.parameters()).device
@@ -674,6 +675,7 @@ class Phase1RetrievalTrainerV2:
           writes don't contaminate training memory.
         - Passes the same attention masks as the train step.
         """
+        self.model.train(mode=False)
         cfg = self.model.cfg
         M = len(batch)
         device = next(self.model.parameters()).device

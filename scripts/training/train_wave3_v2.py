@@ -125,9 +125,6 @@ def main():
         top_p=args.top_p,
         kl_coef=args.kl_coef,
     )
-    trainer.set_reference_state()
-    print("Reference policy snapshot saved.", flush=True)
-
     dataset = PromptResponseDataset(parquet_paths=args.data_paths, seed=args.seed)
     print(f"Dataset: {len(dataset)} examples; sources={dataset.source_breakdown()}",
           flush=True)
@@ -139,6 +136,11 @@ def main():
         scheduler.load_state_dict(ck["scheduler_state_dict"])
         trainer.load_state_dict(ck["trainer_state"])
         print(f"Resumed from {args.checkpoint_in} at step {trainer.step_count}", flush=True)
+
+    # Snapshot ref policy AFTER any warm-start load so π_ref matches the
+    # weights GRPO is about to update (not the random init).
+    trainer.set_reference_state()
+    print("Reference policy snapshot saved.", flush=True)
 
     # Dashboard (background plot renderer)
     plot_out = args.plot_out or (
