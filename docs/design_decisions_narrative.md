@@ -357,9 +357,10 @@ The full V2 design package:
   EMA-decayed counters and an age floor. When a write needs to create a
   new edge and the source cell is at K_max, the lowest-effectiveness
   edge gets evicted.
-- **Per-window walker** (not per-token): walker fires once per
-  256-token window. Massively reduces kernel-launch overhead vs V1's
-  per-token walks.
+- **Per-window walker preserved** (not per-token): walker fires once
+  per 256-token window. This was the V1.0 redesign (see V1.0 section),
+  inherited unchanged into V2 — not a V2-specific innovation. The
+  per-token graph_walker era was pre-V1.0.
 - **Hopfield-tied EntryProjector**: read and write share entry
   projection weights. The contrastive loss on entries becomes
   unnecessary by construction (they project from the same projector).
