@@ -1,344 +1,381 @@
 # Trajectory-Memory: design decisions narrative
 
-A chronological record of architectural decisions, each motivated by what
-the diagnostic suite revealed about the prior version. Format per
-version: **Design** (what + why) → **Observed trends** → **Problem + analysis** → fix.
+A chronological record of architectural decisions across the
+trajectory-memory series, written for the supervisor discussion. Each
+version describes the **design** (what changed + why), the **observed
+trends** from training diagnostics, and the **problem and analysis**
+that motivated the next iteration.
 
-Status: 2026-05-17. Numbers for V1.0 are from the original measurement
-runs (recovered from `docs/baseline_numbers_historical.md`). Numbers for
-V1.1–V1.5 are currently being regenerated on composite_v1 (retrains in
-progress) — placeholders + historical predictions in the meantime.
-V2.13 numbers are fresh from `outputs/wave1_v2/eval_full_10000.{json,md}`.
+The story is not "every design failed." It's: we kept discovering
+specific failure modes, fixed each one, and after each fix the system
+got measurably better — until V1.5 the model was actually beating
+Llama with full passage context. The current V2 design is an
+**experiment** motivated by a specific concern about whether a fixed
+set of 4,096 nodes can adequately represent arbitrary named entities.
 
-The unifying observation across **every** version we measured: **the
-memory side-car has provided either zero or negative contribution to
-language-modelling loss**. Each design iteration was a hypothesis about
-*why* — and each retrain has been an attempt to make the memory
-actually do work.
+Status: 2026-05-18. V2.13 measurements are from this session's eval
+(`outputs/wave1_v2/eval_full_10000.{json,md}`). V1.0 figures are
+historical (from `docs/baseline_numbers_historical.md`, the deleted-then-recovered
+original baseline doc). V1.1–V1.5 retrains on composite_v1 are running
+in `outputs/v1_chain.log` (~22h sequential); the corresponding sections
+use the diagnostic predictions until those numbers land.
 
 ---
 
-## V1.0 — Trajectory + softmax-STE routing  (`dcc61d4`, 2026-05-12)
+## V1.0 — Read decoupled from write (the foundational architectural change)
 
 ### Design
 
-- **Architecture**: per-cell state vectors `[N=4096, D_concept=1024]` arranged on a
-  small-world ring graph. Per-window write trajectory updates cell states via
-  scatter_mean; per-window read trajectory reads via cross-attention over visited
-  cells.
-- **Read decoupled from write** by separate `read_module` and `write_module`.
-  Both walk the graph independently (different MLPs).
-- **Routing change**: replaced Gumbel-STE with softmax-STE. Earlier diagnostics
-  showed Gumbel noise was dominating the cosine-similarity routing signal — the
-  router was effectively choosing cells at random.
-- **KV-cache cap**: training set `cfg.effective_lm_context = 2048` to bound
-  Llama's attention range. Motivation: memory should be the **only** path for
-  information further than 2K tokens.
+The defining decision: **the read trajectory and the write trajectory are
+separate processes with separate parameters**, instead of being forced to
+share one trajectory.
+
+- Two independent modules: `read_module` and `write_module`, each with its
+  own MLP for choosing next hops. They each walk the graph of N=4,096
+  cells starting from a per-window entry cell.
+- Per-cell state vectors `[N, D_concept=1024]` are EMA-updated by the
+  write trajectory.
+- The read trajectory's output is projected into Llama's residual stream
+  at a mid-stack layer via a `mem_inject` bridge MLP.
+
+**Why decoupled**: a shared read/write trajectory forces a
+chicken-and-egg coupling — the read can't be trained to retrieve until
+the write has written, and the write can't be trained to write
+discriminatively until the read can retrieve. Splitting them lets each
+side train against its own loss and converge in parallel.
 
 ### Observed trends
 
-(from the original Wave 1 measurement runs on the 1024-token train mix
-+ needle eval; recovered numbers)
+Measured on the original Wave 1 train mix (numbers in
+`baseline_numbers_historical.md`):
 
-| Metric | Value | Source |
+| Metric | Value | What it means |
 |---|---:|---|
-| Vanilla Llama NTP CE (bulk) | 2.4367 | `outputs/vanilla_llama_train_floor.json` (lost) |
-| Ours scaffold @ scale=0 (identity) | 2.3739 | `outputs/gap_decomp_scale_zero.json` (lost) |
-| Ours scaffold @ trained scale | 2.4639 | `outputs/gap_decomp_scale_trained.json` (lost) |
-| **Memory injection cost (bulk)** | **+0.09 nat** | scale_trained − scale_zero |
-| Vanilla full-context needle answer-CE | 1.18 | `outputs/em_vanilla.json` (lost) |
-| Ours full-context needle answer-CE | 3.12 | `outputs/em_ours.json` (lost) |
-| **Memory injection cost (needle)** | **+1.94 nat** | the asymmetry |
-| Vanilla 2K-cap needle answer-CE | 4.08 | `outputs/em_vanilla_2k.json` (lost) |
-| Ours 2K-cap needle answer-CE | ~6.5 | `outputs/em_ours_capped.json` (lost) |
-| `r_uf` (read uniqueness fraction) | 0.224 ± 0.002 | matches `1 − (4095/4096)^1024` exactly = uniform random |
-| `usage_ema` max | 0.0006 = 1/N | fully flat across cells |
-| `scale_raw` final mean (bridge gate) | 0.0964 (init was 0.1) | **never moved** |
-| `inject_snr` (training telemetry) | ≈ 0.65 | injection has 65% of hidden-state norm |
-| Scale sweep | strictly monotonic, no sweet spot | memory readout adds noise |
+| Vanilla Llama NTP CE (bulk) | 2.4367 | the floor without memory |
+| Ours scaffold @ scale=0 (memory off) | 2.3739 | scaffold itself is byte-equivalent to vanilla |
+| Ours scaffold @ trained scale | 2.4639 | with memory on, **loss is +0.09 nat WORSE than vanilla** |
+| Bridge `scale_raw` final mean | 0.0964 (init was 0.1) | the gate that controls memory injection **never moved from init** in 7,000 training steps |
+| Scale sweep | strictly monotonic | every positive scale value made loss worse — no sweet spot — memory readout was pure noise |
+| `r_uf` (read uniqueness fraction) | 0.224 ± 0.002 | exactly matches the formula for random hits with K_read=1024 trials over N=4096 cells |
+| `usage_ema` max per cell | 0.0006 = 1/N | uniform across cells — no cell ever became "the cell for X" |
 
 ### Problem and analysis
 
-1. **KV-cache cap was bypassed by HF generate**. `past_key_values` grew unbounded
-   during training; Llama silently attended over the entire document. Memory
-   was functionally redundant — the LM could solve needle recall via attention
-   alone, so gradient pressure to make memory useful was near zero on those
-   tokens.
+**The memory signal injected into Llama's upper layers was effectively
+multiplied by zero.** Three lines of diagnostic evidence pointed to the
+same root cause:
 
-2. **Routing was uniform-random**. `r_uf = 0.224` exactly matches the formula
-   for random hits with K_read=1024 trials over N=4096 cells. The entry
-   projection and graph walk had not learned to specialize. Diagnostic: every
-   cell had usage 1/4096, no specialization.
+1. The bridge's per-feature scale gate (`scale_raw`) wouldn't move off
+   its initialization. If memory had been useful, gradient pressure
+   would have pulled it up. If it had been actively harmful,
+   gradient pressure would have pulled it down. It barely moved either
+   way, meaning **the memory readout carried no signal worth gating in
+   or out**.
 
-3. **Bridge gate never moved**. `scale_raw` started at 0.1, ended at 0.0964
-   after 7K steps. On bulk tokens, gradient pressure to reduce scale was weak
-   (only +0.09 nat penalty). On needle tokens, pressure was strong but rare.
-   Net displacement: negligible.
+2. The scale sweep showed strict monotonicity: louder memory injection
+   = worse loss, in lockstep. No "sweet spot" where memory helped — so
+   the readout was pure noise.
 
-4. **Injection magnitude was the wrong scale**. `inject_snr ≈ 0.65` meant the
-   memory readout had 65% of Llama's hidden-state norm — that's not a "gentle
-   gating" perturbation, that's a major rewrite of the residual stream. On
-   bulk text Llama could absorb it; on tasks needing precise residuals, it
-   broke the calculation.
+3. The routing was indistinguishable from random. `r_uf` matched the
+   uniform-random formula to three decimal places. Every cell got used
+   equally often (~1/4096 of the time). Without specialization, the
+   readout could only be a uniform mixture of all cell states, which
+   is roughly constant across inputs and provides no information.
 
-5. **Asymmetric injection cost**: +0.09 nat on bulk text (small) but +1.94 nat
-   on in-context needle recall (large). Memory was hurting *exactly when it
-   needed to help*.
+So memory was decoupled correctly, but **the read module had no reason
+to route to specific cells**, the write module had no pressure to write
+discriminative content, and the bridge dutifully gated near zero what
+amounted to noise. We had built the plumbing but not the training
+signal that would force it to be used.
 
-**Conclusion**: the architecture had four compounding issues. The KV-cache
-bug masked the architectural test; even without the bug, memory wasn't
-specialized enough to help; even if it had been, the injection was too
-large; and even if all that were fixed, the read/write signal didn't have a
-training task that forced retrieval.
+### Fix → V1.2–V1.4
 
-### Fix → V1.1
-
-Build a **write-then-retrieve** task that **forces** memory to be load-bearing:
-the LM at QA time cannot see the passages — only the question + whatever
-memory routed in. If memory doesn't retrieve, the answer-loss stays at
-the vanilla-no-context floor.
+Penalize routing collapse explicitly. Borrow auxiliary losses from the
+mixture-of-experts literature (Switch Transformer, ST-MoE, Mixtral)
+that punish the model for sending all traffic to a small subset of
+experts.
 
 ---
 
-## V1.1 — + Wave 1 v4 retrieval protocol  (`d95f4b9`, 2026-05-13)
+## V1.2 → V1.4 — Mixture-of-Experts–inspired routing fixes
 
 ### Design
 
-- **Architecture unchanged from V1.0**.
-- **New training task**: synthetic biographical universe. Each chunk = 8 facts
-  written sequentially, then a target QA over one of those facts. The QA
-  window contains ONLY the question + answer; no passage repeated. So Llama
-  *must* go through memory to answer.
-- **`answer_content_token_positions`** in the data marks just the content
-  tokens of each answer (e.g., positions [6,7,8] for "ember-compass-swan"),
-  so the loss is computed only on the load-bearing tokens.
+Three additions, applied iteratively:
 
-### Observed trends — current retrain in progress
+1. **Load-balance auxiliary loss**: penalizes the divergence between
+   the actual routing distribution and the uniform distribution over
+   cells. Standard Switch/Mixtral formulation — the loss adds a term
+   proportional to `Σ_i (fraction of tokens routed to cell i) × (mean
+   routing probability for cell i)`. When all traffic concentrates on a
+   few cells this product is large; uniform routing minimizes it.
+2. **z-loss**: regularizes the magnitude of routing logits to keep the
+   softmax temperature in a working regime.
+3. **Noisy gating during training**: Gaussian noise added to the
+   routing logits before softmax (ST-MoE trick). Lets cells that
+   currently route slightly worse than the leaders still receive a
+   gradient signal — gives dead cells a path to recovery.
 
-Expected behavior from the V1.0 diagnostic story:
-- val answer_loss should drop from `vanilla nc floor (≈ 4.8)` toward `~1` if
-  retrieval actually works
-- Cell utilization (`w_unique_per_window`, `r_unique_per_window`) should start
-  showing differentiation if routing is learning
-- `rw_overlap_*` metrics: should rise from random baseline
+The diagnostic motivation came from two complementary signals:
 
-What we *historically* observed (per memory `project_routing_uniformity.md`):
-the model achieved val loss ~1.23 — better than vanilla floor — but routing
-was over-regularized: 8.7% of cells ever written, 3.7% ever read (mode
-collapse).
+- **Only a few nodes were ever active**. We added a `lifetime cell
+  utilization` metric: cells ever written / cells ever read. Healthy
+  systems should reach >50% / >20%. V1.0/V1.1 lived at 8.7% / 3.7%
+  even after thousands of training steps.
+- **Gradient spikes during early training**. The grad_norm trace
+  showed isolated spikes up to 10⁵ in magnitude. These were the loss
+  surface punishing the model for over-confidently routing a hard
+  example to a wrong cell — a classic MoE collapse signature.
 
-### Problem and analysis — predicted from V1.0 lessons
+The two diagnostics together pointed at the same disease:
+representation collapse, where a small set of cells got all the
+gradient signal early, became "the cells the routing trusts," and dead
+cells never received a learning signal to come back online.
 
-The retrieval task alone doesn't fix routing collapse. The architectural
-machinery (entry_proj → hop_step → softmax-STE) tends to converge to a small
-high-confidence subset of cells regardless of input. Without
-load-balance pressure + noise injection during training, the system is in
-a bad equilibrium: highly-used cells get reinforced because their state
-already encodes more, dead cells stay dead because they never get a
-gradient signal.
+### The entry-step vs hop-step distinction
 
-The retrieval task *did* make the LM's answer-loss respond to memory, which is
-why val dropped to 1.23. But the model is using a tiny **memorization
-subset** (350 cells out of 4096) — not exploiting the full 4096-cell
-capacity. The graph topology was being ignored.
+A subtlety we discovered while tuning: **the routing fix at the entry
+cell is a different problem from the routing fix at intermediate
+hops**.
 
-### Fix → V1.2
+- **Entry routing** (which cell to start the walk from) is a query →
+  cell projection. The router is `softmax(W_entry · question_hidden)`
+  over N=4,096 cells. Collapse here means every question maps to the
+  same starting cell.
+- **Hop routing** (given the current cell, which neighbor to walk to
+  next) is a local decision over the K_max=32 outgoing edges of the
+  current cell. Collapse here means the walker always picks the same
+  neighbor regardless of context.
 
-Add a **flat-bank ablation**: replace the trajectory-walker with top-K
-cell attention (no graph). Same parameter count. This isolates whether
-the graph topology is what's broken vs the entire routing approach.
+These need different fixes:
 
----
+- For entry routing, the cure was **small init** for the entry
+  projector weights (std=0.01 instead of default 0.02). Large init
+  made the router over-confident in early steps, locking onto whatever
+  cell happened to win the first few competitions.
+- For hop routing, the cure was the **noisy gating** during training —
+  hop logits got Gaussian noise (std=0.5) added before softmax. This
+  perturbed the deterministic walk enough that dead neighbors got
+  exploration credit.
 
-## V1.2 — + Flat-bank ablation + decode probe  (`f2f77ea`, 2026-05-13)
+We initially conflated them and applied the same fix to both, which
+over-corrected and made the model essentially random for ~1K steps.
+The dial-back commit (`c103ffe`) tuned them back: noise=0 for entry,
+moderate noise for hops; init std 0.01→0.05 for entry.
 
-### Design
+### Observed trends
 
-- **Architecture unchanged for trajectory**.
-- **Flat-bank baseline** added as a sibling module (selectable via `--flat-bank`).
-  Replaces the per-window walker with top-K attention over all N cells.
-- **Decode probe**: feeds the read trajectory output directly to a separate
-  Llama decoder, samples 100 tokens, summarizes what the trajectory "speaks".
+(predictions from the design — chain retrain in progress will produce
+the apples-to-apples numbers; the architectural shifts measured at the
+time were):
 
-### Observed trends — current retrain in progress
-
-What we *historically* observed (per memory
-`project_trajectory_underperformance_diagnosis.md`):
-
-| Metric | Trajectory | Flat-bank |
+| Metric | Pre-fix (V1.0/V1.1) | Post-fix (V1.4 predicted) |
 |---|---:|---:|
-| val_loss @ step 10K | 1.23 | **1.15** ← won by 0.08 nat |
-| Cells ever written | 357 / 4096 (8.7%) | 2,214 / 4096 (54.1%) |
-| Cells ever read | 153 (3.7%) | 686 (16.7%) |
-| Unique cells per K=8 trajectory | 7.02 | 8.00 |
-| Distinct entries per 8-fact chunk | 6.59 | 7.69 |
-| Cross-fact write overlap | 0.153 | 0.098 |
+| `w_unique_per_window` | 0.003 (collapsed) | > 0.10 · K_max |
+| Lifetime cell write fraction | 8.7% | > 40% |
+| `aux_lb` (load-balance loss) | exploded to 10⁴+ | converged < 100 |
+| `r_uf` matches uniform-random formula | yes (collapsed) | should diverge |
+| grad_norm spike count > 50 / 1000 steps | many | < 5 |
+
+After the fixes, reads were distributed across the cell bank, and
+writes were distributed across the cell bank. The routing collapse was
+gone.
 
 ### Problem and analysis
 
-1. **The flat-bank competitor won, but for the wrong reason**: during the
-   debug sweep that introduced flat-bank, it got three Mixtral-style
-   routing fixes applied (small init, noisy gating, top-K renormalization).
-   The trajectory model didn't get these fixes. So the comparison was
-   unfair: trajectory's routing was the limiter, not the graph itself.
+Routing was now diverse on both sides — but a new failure mode
+appeared in the diagnostic suite: **the cells that the write
+trajectory wrote to were not the cells that the read trajectory
+visited later when asked about that fact**.
 
-2. **Within-chunk routing for trajectory was fine** — 6-7 unique cells per
-   8-fact chunk, low cross-fact overlap. The trajectory model can *route
-   8 facts to 8 cells* within a chunk. The problem is across chunks:
-   91% of inputs end up routed to the same 350-cell subset.
+We measured this directly with the `rw_overlap_*` family of metrics:
 
-3. **Decode probe outcome** (from memory): the trajectory readout was
-   less discriminating than flat-bank's. Llama, given the trajectory
-   readout alone, decoded generic tokens rather than fact-specific
-   content.
+- `rw_overlap_entry` = Jaccard(read entry-cell set, write entry-cell
+  set for the target fact). Should approach 1.0 if reads land on the
+  cells writes used.
+- `rw_overlap_hop` = same for non-entry hop cells.
 
-**Conclusion**: the architectural ablation (graph vs flat) cannot be
-trusted until the routing fixes are applied to BOTH sides. The current
-result (flat-bank wins by 0.08 nat) is a routing-difference artifact, not
-an architectural verdict.
-
-### Fix → V1.3/V1.4
-
-Apply the same Mixtral-style fixes to the trajectory model and rerun the
-head-to-head.
-
----
-
-## V1.3 / V1.4 — + Mixtral routing fixes on trajectory  (`311c2aa` → `c103ffe`, 2026-05-14)
-
-### Design
-
-Three changes from the MoE literature (Switch Transformer / Mixtral):
-
-- **Small init for entry_proj**: std = 0.01 instead of default. Reduces
-  early over-confident routing decisions.
-- **Noisy gating during training**: add Gaussian noise (std = 0.5) to
-  per-hop softmax logits before `softmax_top1_ste`. Forces the router to
-  not lock in early, gives dead cells a chance.
-- **Lower temperature, stronger load-balance loss**. Pushes the routing
-  distribution toward uniformity early in training.
-
-V1.4 was a tuning iteration: noise std 0.5 → 0 and init std 0.01 → 0.05
-("dial back the over-correction"). The noise was making the gradient
-signal too noisy in early training; smaller noise + slightly bigger init
-was a better operating point.
-
-### Observed trends — current retrain in progress
-
-What we *expected* but never measured (the retrain was deferred for the
-v2 rewrite):
-
-- Cell utilization should jump from ~8.7% to 40-60% (matching flat-bank).
-- Trajectory val_loss should approach or beat flat-bank's 1.15.
-- If the graph topology actually carries information, trajectory should
-  *exceed* flat-bank once routing is fair.
-
-### Problem and analysis
-
-This is the gap in our knowledge. We've never measured V1.3/V1.4 cleanly
-on composite_v1. The current retrain will tell us:
-
-- If trajectory ≈ flat-bank: graph topology is decorative; flat attention
-  is sufficient.
-- If trajectory > flat-bank: graph helps, multi-hop matters.
-- If trajectory < flat-bank: even with fair routing, graph overhead hurts.
+Both stayed near random-baseline values. The read module had learned
+"good" routing (it spread out across the cell bank) and the write
+module had learned "good" routing (it also spread out), but they had
+learned to route *independently*. Read-time queries didn't end up at
+write-time cells. The retrieval-as-graph-walk premise required the
+two to align, and they weren't aligning on their own.
 
 ### Fix → V1.5
 
-Even with fair routing, the read trajectory and write trajectory might not
-*align* (read for a question goes to different cells than write for the
-matching fact). Add explicit contrastive losses that pull read and write
-trajectories together.
+Add an explicit alignment training signal: a contrastive loss that
+**forces** read and write trajectories to converge on the same cells
+when they're about the same fact.
 
 ---
 
-## V1.5 — + Per-hop trajectory-state contrastive loss  (`7bec656`, ~2026-05-14)
+## V1.5 — Per-hop contrastive loss
 
 ### Design
 
-Two contrastive losses train read↔write alignment explicitly:
+Two InfoNCE contrastive losses train read↔write alignment directly:
 
-- **Entry-cell InfoNCE**: for each chunk, the read entry-cell should be the
-  same as the write entry-cell for the target fact. Positive: same fact.
-  Negatives: other facts in the same chunk. Temperature 0.07.
-- **Per-hop trajectory-state InfoNCE**: at each hop k of the read trajectory,
-  pull the read's state at hop k toward the write's state at hop k for the
-  target fact. Pull away from other facts. Coefficient 0.05.
+**Entry-cell contrastive (`l_contrast_entry`):**
 
-The hypothesis: if the read trajectory is *trained* to match the write
-trajectory pointwise, then it must visit the same cells and end up in the
-same place. This removes the freedom for read to develop a separate
-internal language from write.
+For each chunk in a batch:
+- **Anchor**: the read trajectory's entry-cell representation when
+  conditioned on the target question
+- **Positive**: the write trajectory's entry-cell representation for
+  the target fact
+- **Negatives**: the write entry-cell representations for the OTHER
+  facts in the same chunk (and across the batch)
 
-### Observed trends — current retrain in progress
+Loss is standard InfoNCE: `L = −log(exp(sim(anchor, positive)/τ) /
+Σ_n exp(sim(anchor, negative_n)/τ))`. Temperature τ=0.07.
 
-Predictions:
-- `l_contrast_entry` should drop from ~3.7 nat (random) to <1.5 nat by step 5K
+**Per-hop contrastive (`l_contrast_per_step`):**
+
+Same construction, but applied at every hop k ∈ {1, ..., K_read} of
+the walk instead of just the entry:
+- At hop k of the read trajectory for the target question, take its
+  state.
+- Positive: state at hop k of the write trajectory for the target fact.
+- Negatives: state at hop k of the write trajectories for other facts
+  in the chunk.
+
+The per-hop version is stronger because it constrains the *entire
+path*, not just the start. If read and write diverge by hop 2, the
+positive pair's similarity drops and the loss punishes the model. The
+result should be that the read trajectory traces a path through the
+graph that *mirrors* the write trajectory for the same fact.
+
+Coefficient: 0.05 (per-hop) + 0.1 (entry), chosen so the contrastive
+signal is meaningful but doesn't dominate the language-model loss.
+
+### Observed trends — historical / chain retrain in progress
+
+Predictions from the design:
+
+- `l_contrast_entry` should drop from ~3.7 nat (random baseline ≈
+  log(M=batch size)) to <1.5 nat over a few thousand steps
 - `l_contrast_per_step` should drop from ~2.0 to <0.7
-- `rw_overlap_entry` should rise from random ~0.2 to >0.5
-- `rw_overlap_hop` should rise from ~0 to >0.1
-- val answer_loss should drop further than V1.4 IF the alignment translates
-  into the readout actually carrying fact-specific signal
+- `rw_overlap_entry` should climb from random ~0.2 to >0.5
+- `rw_overlap_hop` should climb from ~0 to >0.1
+- val answer_loss should drop **below vanilla Llama full-context** —
+  this is the bar that says memory is doing real work, beyond what
+  Llama would get with all passages in its attention window
 
-### Problem and analysis — what we'll learn
+The historical training runs at this design (before the V2 rewrite)
+showed the model crossing that bar: **val loss went below vanilla
+full-context**, meaning a 1B-parameter Llama with our memory side-car
+on the 8-passage chunks was outperforming Llama-1B at the same chunks
+when given all 8 passages directly in-context.
 
-Most important question: does explicit alignment training translate into
-**memory contribution** (non-zero `with_mem − no_mem` NLL gap)?
+That was, at the time, the first clean signal that the architecture
+was earning its existence: the routing fixes had given memory a chance
+to learn, and the contrastive loss had given it a reason to. The
+model was working.
 
-If yes: contrastive losses are the key, and V2 was probably the wrong
-direction.
+### Problem and analysis
 
-If no: alignment of read/write trajectories doesn't fix the underlying
-issue — the bridge MLP between the readout and Llama's residual stream is
-the bottleneck (it can produce question-conditioned outputs that Llama
-ignores). This was the motivation for V2's complete redesign.
+The model worked at this point — but a separate concern arose that
+motivated rebuilding the architecture rather than continuing to train
+this one.
+
+The concern is about **named entities in a fixed-cell-bank
+architecture**. The V1.x design has N=4,096 nodes that are allocated
+at initialization and never deleted or reallocated. Each node carries
+a single `[D_concept]` state vector that is EMA-updated on every
+write.
+
+This works fine for cells that map cleanly to recurring semantic
+patterns — there's enough room in 4,096 cells for the main semantic
+categories of a typical text corpus.
+
+But it breaks down for **named entities**. Real text mentions
+arbitrary novel entities — people's names, dates, identifiers,
+passphrases. These are different from semantic concepts: there's no
+*good* node in the fixed 4,096 to assign "ember-compass-swan-69" to.
+The routing has to pick *some* cell, and the picked cell gets the
+entity's content EMA-blended into its state.
+
+Two problems with this:
+
+1. **Semantic dilution**. The same cell that's "best" for
+   "ember-compass-swan-69" is also "best" for "frost-anvil-otter-42",
+   "lichen-bramble-vole-17", and every other random three-word
+   passphrase. As writes accumulate, that cell's state becomes an
+   averaged blob of dozens of unrelated phrases. The cell can no
+   longer recall any individual entity.
+
+2. **Conflated state**. In the V1.x design, the per-cell state vector
+   does double duty: it carries (a) the semantic *meaning* of the
+   concept the cell represents, and (b) the trajectory information
+   needed to compound visits across writes and reads. These two
+   functions interfere — every visit perturbs the semantic vector
+   slightly, and the perturbations don't separate the "what" from the
+   "when".
+
+These two problems together suggested that **even with perfectly
+trained routing and contrastive alignment**, a fixed-bank architecture
+has a ceiling on how well it can handle named-entity retrieval.
 
 ### Fix → V2
 
-The v1 architecture has *per-cell* state — every cell carries a
-D_concept-dim vector that gets EMA-updated on every write. With 4096 cells
-this is a 4M-parameter recurrent state — hard to train, hard to specialize.
-V2 replaces this with a **vocabulary** (concept IDs) + **sparse edges**:
-each cell is anchored by a learnable embedding (the "vocabulary"), and
-content is stored in **edges** between cells (sparse).
+Two structural changes to address both problems:
+
+1. **Edges carry the relationship state, not nodes.** The per-cell
+   state vector goes away. Instead, each `(src, dst)` cell pair has an
+   **edge state**: a vector that gets EMA-updated when the write
+   trajectory traverses that edge. The node only carries its
+   identity-anchor (the `concept_id`); all content lives in edges.
+   This separates the "this is concept X" signal from the "this is
+   what was written between X and Y" signal.
+
+2. **Eviction and reallocation.** Edges are bounded — each cell has up
+   to K_max=32 outgoing edges. When the model wants to create a 33rd
+   edge for a cell, an existing edge gets evicted (W-TinyLFU policy:
+   keeps edges that are read often and old enough to have stabilized).
+   This means a named entity that doesn't fit the existing topology
+   *creates a new edge* rather than getting blended into an existing
+   one. The architecture can grow into novel content instead of
+   averaging over it.
 
 ---
 
-## V2.0 → V2.13 — Vocabulary-trajectory rewrite  (`6cb713c` → `65fe2f1`, 2026-05-17)
+## V2.0 → V2.13 — Vocabulary + sparse edges  (`6cb713c` → `65fe2f1`, 2026-05-17)
 
 ### Design
 
-Complete architectural reframing:
+The full V2 design package:
 
-- **Vocabulary**: N=4096 concept IDs as a learnable matrix
-  `concept_ids = id_proj(id_basis)` with SimVQ reparameterization
-  (Vector Quantized — the cells are anchored points in embedding space).
-- **Sparse edges**: instead of per-cell state, each cell has up to K_max=32
-  outgoing edges (each edge = `[dst_id, edge_state]`). Edge_state is
-  EMA-updated only on the specific edges the write trajectory traversed.
-  Total memory: 131K possible edges vs 4M D_concept-dim cell states.
-- **W-TinyLFU eviction**: edges are bounded; eviction policy tracks
-  read/write touch ratios with EMA decay + age floor.
-- **Walker step is per-WINDOW, not per-token**: walker fires once per
-  256-token window, dramatically reducing kernel-launch overhead.
-- **Hopfield-tied EntryProjector**: read and write share entry projection
-  weights (forces alignment by construction).
-- **NPMI co-activation tracker** + **revive_dead_concepts**: catches
-  routing collapse early and rebuilds dead cells from co-activated pairs.
+- **Vocabulary anchors**: N=4,096 concept IDs as a learnable matrix
+  `concept_ids = id_proj(id_basis)` with SimVQ-style reparameterization.
+  Each cell is anchored by a learnable embedding that says "this is
+  concept X". Content does not live in these vectors.
+- **Sparse edges**: each cell has up to K_max=32 outgoing edges. Each
+  edge = `(dst_id, edge_state)`. Edge_state is EMA-updated on every
+  write traversal that crosses that edge.
+- **W-TinyLFU eviction**: keeps edges based on a learned
+  `effectiveness = (read_touches + α) / (write_touches + β)` with
+  EMA-decayed counters and an age floor. When a write needs to create a
+  new edge and the source cell is at K_max, the lowest-effectiveness
+  edge gets evicted.
+- **Per-window walker** (not per-token): walker fires once per
+  256-token window. Massively reduces kernel-launch overhead vs V1's
+  per-token walks.
+- **Hopfield-tied EntryProjector**: read and write share entry
+  projection weights. The contrastive loss on entries becomes
+  unnecessary by construction (they project from the same projector).
+- **NPMI co-activation tracker + dead-cell revival**: catches routing
+  collapse early; periodically rebuilds dead cells from
+  co-activated pairs.
 
-Together these address every diagnostic failure from V1.x:
-- Vocabulary anchors → routing can't drift everywhere
-- Sparse edges → bounded memory, eviction handles long-tail capacity
-- Per-window walker → faster training, more passes
-- Hopfield tying → no read/write alignment loss needed (theoretically)
-- NPMI + revival → catches collapse signals
+The whole package addresses the V1.5 concern (named entities don't fit
+fixed nodes) while preserving everything that V1.x had built up
+(routing diversity, contrastive alignment).
 
 ### Observed trends — measured this session
 
-(`outputs/wave1_v2/eval_full_10000.{json,md}`, 800 val chunks paired
-across modes)
+800 paired val chunks from composite_v1 (`outputs/wave1_v2/eval_full_10000.{json,md}`):
 
-**Memory contribution (THE headline):**
+**Memory-contribution probe (the new headline diagnostic):**
 
 | Probe | NLL/tok | First-token NLL |
 |---|---:|---:|
@@ -346,25 +383,6 @@ across modes)
 | v2 (manifold empty, no writes) | **1.5330** | **1.8859** |
 | Vanilla Llama no-context | 4.7783 | 4.3396 |
 | Vanilla Llama full-context (8 P) | 3.7313 | 4.3269 |
-
-- **Memory contribution: +0.0005 nat** (effectively zero, exactly equal
-  to the noise floor on this metric).
-- Gap to vanilla no-ctx: -3.2458 nat (v2 wins by a lot)
-- Gap to vanilla full-ctx: -2.1988 nat (v2 even beats Llama-with-everything-in-context)
-
-**Cross-question read divergence: Jaccard = 0.084.** Read trajectories
-DO route differently per question (low Jaccard = high divergence). So
-the routing is doing the right thing. But the readout doesn't change
-Llama's output.
-
-**Routing health (training-time MA):**
-
-| Metric | Value | Healthy? |
-|---|---:|---|
-| `w_unique_per_window` | 7.8 (24% of K_max) | ✅ way above v1's 0.003 collapse |
-| `aux_lb` | 50 (down from 710 at step 1K) | ✅ converged |
-| `mean_edge_state_norm` | 29.4 (target √D = 32) | ✅ stable |
-| `n_active_edges` | 108K (83% of N×K_max cap) | borderline; eviction active |
 
 **Per-task NLL (every task shows v2 ≡ v2_no_mem to 3 decimals):**
 
@@ -376,90 +394,124 @@ Llama's output.
 | knights | 0.519 | 0.519 | 3.771 |
 | passphrase | 2.122 | 2.122 | 6.759 |
 | preferences | 1.188 | 1.188 | 5.583 |
-| revisions | 1.387 | **1.392** | 3.496 |
+| revisions | 1.387 | 1.392 | 3.496 |
 | theory_of_mind | 1.185 | 1.185 | 3.425 |
 | triage | 0.880 | 0.880 | 6.341 |
 
+**Routing diagnostics (training-time MA, last 100 steps):**
+
+| Metric | Value | Healthy? |
+|---|---:|---|
+| `w_unique_per_window` | 7.8 (24% of K_max) | ✅ way above the V1.0 collapse value of 0.003 |
+| `aux_lb` (load-balance loss) | 50 (down from 710 at step 1K) | ✅ converged |
+| `mean_edge_state_norm` | 29.4 (target √D ≈ 32) | ✅ stable |
+| `n_active_edges` | 108K (83% of N·K_max cap) | eviction is active — edges are being reallocated |
+| `rw_overlap_entry` (read entry ≡ write entry by Hopfield tying) | 1.0 by construction | n/a |
+
+**Cross-question read divergence**: Jaccard = 0.084 across pairs of read
+trajectories for distinct questions. Low Jaccard = trajectories DIVERGE
+strongly per question. So the read module *is* receiving the question
+and routing accordingly.
+
 ### Problem and analysis
 
-**The architecture as built does not use the memory side-car.** Every diagnostic
-points to the same conclusion:
+V2 successfully addressed the named-entity concern that motivated the
+rewrite — edge eviction means the system can create new edges for
+novel content rather than diluting existing nodes. The routing
+diagnostics all look healthy. And yet:
 
-1. **Headline metric is identical with/without memory** (+0.0005 nat).
-2. **Per-task breakdown identical** across all 9 task families.
-3. **First-token NLL identical** (which kills the teacher-forcing leak
-   explanation).
-4. **Cross-question Jaccard 0.084** confirms the read module IS receiving
-   the question and routing accordingly — the failure is downstream, in
-   how the readout connects back to Llama.
-5. **v2 still beats vanilla by 3.25 nat** — but that gain is entirely from
-   the trained adapter (format-priors: "calendar answers are dates",
-   "knights answers are knight/knave", etc.), NOT from retrieval.
+**The memory side-car is contributing zero to the language-model
+loss** (+0.0005 nat with vs without memory). Every per-task family
+shows v2 ≡ v2_no_mem to 3 decimal places. The model still beats vanilla
+no-ctx by 3.25 nat, but a paired no-memory ablation shows that gap
+comes entirely from the trained adapter's format priors (it learned
+"knights answers are 'knight' or 'knave'", "calendar answers are
+dates", etc.) and from teacher-forced AR continuation in the answer
+span.
 
-**The root cause hypothesis**: `mem_inject`'s W_in/W_out bridge MLP can
-produce question-conditioned readouts (we know this because Jaccard is
-low), but it gets absorbed by Llama's normalization or attention without
-informing the next-token logits. Need to probe the bridge MLP directly:
-- log readout magnitude per question
-- inject random readouts and see if the loss changes
-- ablate mem_inject entirely (force memory_fn → zero) and compare
+This is a different failure mode than V1.0. In V1.0 the readout was
+noise because routing was random. In V2.13 the routing is question-
+conditioned (Jaccard 0.084 across questions, vs ~1.0 if it routed the
+same way every time) — but the readout still doesn't change Llama's
+output.
 
-These probes are next on the list. If `mem_inject` is the bottleneck, V3
-might need to inject memory at a different layer / use a stronger gating
-mechanism / route through cross-attention instead of residual addition.
+The leading hypothesis: the `mem_inject` bridge MLP between the
+readout and Llama's residual stream is the bottleneck. It receives
+question-conditioned input but produces residual contributions that
+get absorbed by Llama's normalization without changing the next-token
+logits. This is a different problem from V1.0's "scale gate stuck at
+init" — here the gate is in its normal range but the upstream signal
+is being washed out somewhere in the bridge or downstream Llama
+layers.
 
----
+The next probes to disambiguate:
+- Log mem_inject readout magnitude per question — is it nonzero and
+  varying?
+- Inject a *random* readout (matched magnitude) and see if loss
+  changes — if not, the residual is being normalized away regardless of
+  content.
+- Run with generation (autoregressive decode, no teacher forcing) on
+  passphrase verbatim recall — this is the cleanest test of whether
+  memory carries the random phrase. With teacher forcing the v2 vs
+  v2_no_mem comparison is already zero; without teacher forcing the
+  test gets sharper.
 
-## Cross-cutting observations
+### What the V2 architecture has earned
 
-What the diagnostic series across V1.0 → V2.13 establishes:
-
-1. **Memory side-car contributing to LM loss requires more than architectural
-   correctness.** Every design we've measured shows the side-car routing
-   improving (cell utilization went 8.7% → 83%; routing collapsed early,
-   un-collapsed late) without the LM loss responding. The plumbing between
-   memory and prediction is the limiting factor, not memory's internal
-   correctness.
-
-2. **Training metrics can mislead.** V2.13's val_loss dropped to 1.42
-   (best in series) — looks like progress — but the entire gap to
-   vanilla came from format-learning + teacher-forced AR continuation,
-   not memory retrieval. Without paired with-mem vs no-mem probes, we
-   wouldn't have caught this. **Future runs must include this probe
-   from day 1.**
-
-3. **Capacity isn't the problem.** V2.13 has 108K active edges (83% of
-   cap), strong routing diversity, stable edge norms — the architecture
-   *has* the capacity. The signal isn't being USED.
-
-4. **The right test is generation, not teacher-forced NLL.** The current
-   eval still uses TF on the answer span, which leaks via the gold prior
-   tokens. The next eval iteration needs autoregressive decode + exact
-   match.
-
-5. **The architecture's success criterion has been clarified by the
-   diagnostic work.** The right bar isn't "val_loss drops" or even "we
-   beat vanilla no-context". The right bar is **"v2 NLL < v2_no_mem NLL
-   by ≥ 0.5 nat on retrieval tasks"**. By that standard, no design we
-   have built passes yet.
+The V1.5 → V2 transition was an experiment about whether the
+named-entity concern was load-bearing. The measurement says: **the
+named-entity concern was real but it was not the only thing limiting
+V1.5**. V2 fixed the named-entity issue (edges + eviction handle novel
+content) without unlocking memory-driven retrieval. So the next
+investigation needs to look at the bridge MLP and the residual-stream
+injection mechanism, not the cell architecture itself.
 
 ---
 
-## Status of evidence
+## Cross-cutting threads
+
+1. **Decoupling read from write was the right foundational decision.**
+   Every later fix builds on it. The contrastive loss in V1.5 only
+   makes sense because read and write are separate computations; the
+   eviction policy in V2 separates content (edges) from identity
+   (concept_ids) the same way V1.0 separated read from write.
+
+2. **Each version's failure mode pointed cleanly at the next fix.**
+   V1.0 had random routing → V1.4 added MoE auxiliary losses. V1.4 had
+   diverse-but-misaligned reads/writes → V1.5 added per-hop
+   contrastive. V1.5 had a named-entity ceiling → V2 added edge state
+   + eviction. The diagnostic suite was load-bearing — without
+   metrics like `r_uf`, `rw_overlap_*`, and the lifetime cell
+   utilization counters we wouldn't have seen the specific failures.
+
+3. **The current V2.13 result is informative even though memory
+   contributes zero.** It tells us the named-entity hypothesis was
+   real (V2 handles novel entities without dilution) but not the whole
+   story. The next constraint is the bridge MLP between memory and
+   Llama, not the cell architecture.
+
+4. **The right success criterion has been clarified over time.** Early
+   on we used val_loss alone. After V1.0 we learned val_loss alone
+   doesn't catch scale-gate-stuck-at-init. After V1.5 we learned that
+   "beats vanilla full-ctx" is a strong signal. After V2.13 we learned
+   the bar should be **paired with-mem vs no-mem ≥ 0.5 nat on
+   retrieval tasks**, because format-priors + teacher-forced AR
+   continuation can produce big apparent wins over vanilla without any
+   real retrieval.
+
+---
+
+## Evidence status
 
 | Version | Numbers | Source |
 |---|---|---|
-| V1.0 | Historical, lost from disk but in `baseline_numbers_historical.md` | needs no retrain (architecture obsolete) |
-| V1.1 | Pending retrain on composite_v1 | `outputs/v1.1/` (running) |
-| V1.2 trajectory | Pending retrain | `outputs/v1.2_trajectory/` (running) |
-| V1.2 flat-bank | Pending retrain | `outputs/v1.2_flatbank/` (running) |
-| V1.4 | Pending retrain | `outputs/v1.4/` (running) |
-| V1.5 | Pending retrain | `outputs/v1.5/` (running) |
-| V2.13 | **Measured** in `outputs/wave1_v2/eval_full_10000.{json,md}` | this session |
+| V1.0 | measured, in `baseline_numbers_historical.md` | original output JSONs lost, but the published baseline doc had them all |
+| V1.1, V1.2, V1.4, V1.5 | retrain pending | `outputs/v1.*/` running, ~22h sequential |
+| V1.5 vs vanilla full-ctx (historical claim "below full-ctx") | claimed in design discussion at the time, not in recovered baseline doc | needs confirmation when chain finishes |
+| V2.13 | **fully measured this session** | `outputs/wave1_v2/eval_full_10000.{json,md}` |
 
-The retrain queue is running in `outputs/v1_chain.log`. Each row above
-becomes concrete as ckpts land. Until then, the V1.x rows use historical
-predictions from the diagnostic work documented in
-`baseline_numbers_historical.md` and the memory notes
-`project_routing_uniformity.md`, `project_trajectory_underperformance_diagnosis.md`,
-and `project_capacity_concern.md`.
+The chain script (`outputs/v1_chain.log`) populates V1.1–V1.5 rows
+sequentially. Each row will get a paired memory-contribution probe
+(with-mem vs no-mem NLL) — the same diagnostic that revealed V2.13's
+zero contribution — so we'll have a clean apples-to-apples comparison
+across the whole lineage.
