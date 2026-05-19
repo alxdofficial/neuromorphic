@@ -206,7 +206,7 @@ get that exact code state.
 | V1.4 | + dial-back tuning | `c103ffe` | 2026-05-14 | noise=0, init std 0.01→0.05 | **never retrained** |
 | **V1.5** | **+ per-hop contrastive loss** | **`7bec656`** | 2026-05-14/15 | InfoNCE for entry + per-hop trajectory state | **never trained on composite_v1** |
 | V2.0 | vocabulary-trajectory rewrite | `6cb713c` | 2026-05-17 | vocab id_basis + SimVQ + sparse edges | Wave 1 v5 smoke |
-| **V2.13** | **current** | **`65fe2f1`** | **2026-05-17** | + bf16 edges + RMS-norm + W-TinyLFU + all v2 fixes | **YES — 10K run we just did** |
+| **V2** | **current** | **`65fe2f1`** | **2026-05-17** | + bf16 edges + RMS-norm + W-TinyLFU + all v2 fixes | **YES — 10K run we just did** |
 
 ---
 
@@ -222,7 +222,7 @@ infer from format): biographical, passphrase. **Format/state-tracking tasks**
 
 ### Mean NLL/tok on content tokens — with memory active
 
-| Task | V1.5 trajectory | V1.2 flat-bank | V2.13 vocab | Llama no-ctx | Llama full-ctx |
+| Task | V1.5 trajectory | flat-bank | V2 vocab | Llama no-ctx | Llama full-ctx |
 |---|---:|---:|---:|---:|---:|
 | biographical | 3.833 | 4.018 | 3.903 | 5.049 | 3.546 |
 | boxes | 3.152 | 1.917 | 1.605 | 4.342 | 3.781 |
@@ -237,7 +237,7 @@ infer from format): biographical, passphrase. **Format/state-tracking tasks**
 
 ### Mean NLL/tok on content tokens — memory disabled
 
-| Task | V1.5 no-mem | V1.2 flat-bank no-mem | V2.13 no-mem |
+| Task | V1.5 no-mem | flat-bank no-mem | V2 no-mem |
 |---|---:|---:|---:|
 | biographical | 4.413 | 5.094 | 3.903 |
 | boxes | 1.595 | 3.520 | 1.605 |
@@ -252,7 +252,7 @@ infer from format): biographical, passphrase. **Format/state-tracking tasks**
 
 ### Memory contribution Δ = (with-mem) − (no-mem). Negative = memory helps.
 
-| Task | V1.5 Δ | V1.2 flat-bank Δ | V2.13 Δ |
+| Task | V1.5 Δ | flat-bank Δ | V2 Δ |
 |---|---:|---:|---:|
 | **biographical** (true retrieval) | **−0.580 ✓** | **−1.076 ✓** | 0.000 |
 | **passphrase** (verbatim recall) | +0.069 | **−4.068 ✓** | 0.000 |
@@ -282,8 +282,8 @@ infer from format): biographical, passphrase. **Format/state-tracking tasks**
 
 ### Verdict per-task
 
-- **biographical (the canonical retrieval task)**: every architecture that's measured helps. V1.5 −0.58 mean / −0.22 first-token; flat-bank −1.08 / −1.38; V2.13 0.00 (memory off entirely).
-- **passphrase (verbatim random recall)**: only flat-bank does real work (−4.07 mean, −6.19 first-token). V1.5 is essentially noise; V2.13 is zero.
+- **biographical (the canonical retrieval task)**: every architecture that's measured helps. V1.5 −0.58 mean / −0.22 first-token; flat-bank −1.08 / −1.38; V2 0.00 (memory off entirely).
+- **passphrase (verbatim random recall)**: only flat-bank does real work (−4.07 mean, −6.19 first-token). V1.5 is essentially noise; V2 is zero.
 - **state-tracking tasks (boxes, theory_of_mind, triage)**: flat-bank's memory helps hugely (−1.6 to −2.4 nat). V1.5's memory ACTIVELY HURTS these (+0.5 to +1.6 nat) — the contrastive loss likely overfit the trajectory for retrieval and made it noisy for everything else.
 - **format-determined tasks (knights, calendar)**: memory neutral across all models (these don't need memory).
 
@@ -317,6 +317,246 @@ Llama no-context gets 2.84 because it doesn't know the format space at all
 (must predict from full 128K vocab). The 1.12 nat gap is mostly format priors
 + teacher-forced AR continuation within the answer span, NOT retrieval. The
 honest "retrieval test" is the biographical + passphrase rows.
+
+---
+
+## Section 3.6 — Per-task read↔write overlap (composite_v1 val, 400 paired chunks)
+
+Measured 2026-05-18. `rw_target_all = |R ∩ W_target| / |R|` — fraction of read
+cells the read trajectory visited that are also in the target passage's write
+cells. **rw_target_lift = rw_target_all − rw_distractor_mean** (mean overlap against the
+7 non-target passages). Positive lift = read is task-specific (lands on target
+more than distractors). Random baseline ≈ 0.008 (J·K_w/N = 32/4096).
+
+### Overall
+
+| Architecture | rw_target_all | rw_target_entry | rw_target_hop | rw_distractor_mean | **lift** | NLL Δ (mem) |
+|---|---:|---:|---:|---:|---:|---:|
+| V1.5 trajectory + per-hop contrastive | 0.124 | **0.442** | **0.005** | 0.126 | **−0.001** | +0.306 HARM |
+| flat-bank | 0.169 | 0.414 | 0.092 | 0.172 | **−0.003** | **−1.231 HELP** |
+| V2 vocabulary-trajectory | 0.180 | 0.317 | **0.189** | 0.120 | **+0.061** | ~0 |
+
+### Per-task — V1.5 (entry routing precise, hops at random floor)
+
+| Task | rw_target_all | rw_target_entry | rw_target_hop | distract | **lift** |
+|---|---:|---:|---:|---:|---:|
+| biographical | 0.110 | 0.407 | 0.001 | 0.106 | +0.005 |
+| boxes | 0.101 | 0.422 | 0.004 | 0.097 | +0.004 |
+| calendar | 0.176 | **0.585** | 0.002 | 0.176 | −0.000 |
+| knights | 0.079 | 0.337 | 0.003 | 0.077 | +0.002 |
+| **passphrase** | 0.053 | 0.188 | 0.007 | 0.104 | **−0.052** |
+| preferences | 0.127 | 0.454 | 0.003 | 0.130 | −0.003 |
+| revisions | 0.139 | 0.476 | 0.010 | 0.122 | +0.017 |
+| theory_of_mind | 0.076 | 0.315 | 0.010 | 0.089 | −0.014 |
+| triage | 0.222 | **0.691** | 0.008 | 0.206 | +0.016 |
+
+**Pattern**: entry routing is highly task-specific (31–69% match vs ~0.008 random
+floor). But after the entry, hops are at or below random across every task
+(0.001–0.010). The trajectory walker takes random steps after the first cell.
+**Net lift = 0** — the entry-cell precision is exactly cancelled by random hops.
+
+### Per-task — flat-bank (lift = 0 by this metric — wrong probe for the architecture)
+
+| Task | rw_target_all | rw_target_entry | rw_target_hop | distract | **lift** |
+|---|---:|---:|---:|---:|---:|
+| biographical | 0.208 | 0.500 | 0.066 | 0.209 | −0.001 |
+| boxes | 0.167 | 0.394 | 0.095 | 0.163 | +0.005 |
+| calendar | 0.167 | 0.452 | 0.096 | 0.171 | −0.004 |
+| knights | 0.182 | 0.362 | 0.116 | 0.161 | +0.020 |
+| passphrase | 0.156 | 0.500 | 0.071 | 0.156 | +0.000 |
+| preferences | 0.152 | 0.398 | 0.095 | 0.160 | −0.009 |
+| revisions | 0.151 | 0.390 | 0.090 | 0.169 | −0.018 |
+| theory_of_mind | 0.158 | 0.393 | 0.093 | 0.175 | −0.017 |
+| triage | 0.164 | 0.347 | 0.106 | 0.170 | −0.007 |
+
+**Important caveat**: flat-bank operates via continuous top-K attention over all
+N cells, weighted by query–cell similarity. "Visited cells" is the discrete
+top-K subset reported for telemetry. The actual readout signal is a
+weighted sum over many cells, not a discrete cell-set intersection. So
+rw_target_lift ≈ 0 here doesn't mean the memory doesn't work — it means the
+discrete top-K metric is *the wrong probe for flat-bank*. The −1.23 nat NLL
+contribution proves the bridge IS extracting useful information; it's just
+operating on continuous attention weights that this metric doesn't see.
+
+### Per-task — V2 vocabulary-trajectory (POSITIVE lift, especially on state-tracking)
+
+| Task | rw_target_all | rw_target_entry | rw_target_hop | distract | **lift** |
+|---|---:|---:|---:|---:|---:|
+| **boxes** | **0.495** | 0.226 | **0.922** | 0.343 | **+0.152** |
+| **revisions** | **0.442** | 0.207 | **0.545** | 0.321 | **+0.121** |
+| **theory_of_mind** | 0.184 | **0.750** | 0.000 | 0.028 | **+0.157** |
+| preferences | 0.189 | 0.370 | 0.129 | 0.099 | **+0.090** |
+| passphrase | 0.094 | 0.362 | 0.046 | 0.040 | +0.055 |
+| knights | 0.061 | 0.426 | 0.000 | 0.020 | +0.040 |
+| biographical | **0.027** | **0.048** | 0.004 | 0.020 | +0.007 |
+| calendar | 0.098 | 0.479 | 0.000 | 0.095 | +0.003 |
+| triage | 0.107 | 0.119 | 0.108 | 0.125 | −0.018 |
+
+**The headline V2 result**: routing **does** find target-specific cells (overall
+lift +0.061). Boxes hop overlap is 0.92 — V2 almost perfectly traces the
+target passage's state-mutation trajectory. Theory_of_mind entry overlap is
+0.75. Revisions hop is 0.55.
+
+**But** V2's per-task NLL memory contribution is 0.000 on every task. So:
+- V2's routing landed on the right cells
+- The bridge MLP between memory readout and Llama's residual stream is what's
+  broken — it can't extract a useful direction from the (correctly-retrieved)
+  cell states
+
+**Per-task asymmetry inside V2**: it excels at state-tracking tasks (boxes
+0.92 hop overlap, revisions 0.55) but **fails on biographical** (0.027
+rw_target_all, 0.048 entry overlap, 0.004 hop — almost no retrieval). The vocab
+trajectory architecture is biased toward sequential state mutations over
+random-fact lookup, possibly because biographical chunks present 8 unrelated
+facts (no inter-fact structure) while state-tracking chunks chain through a
+single entity's state.
+
+### The three-architecture diagnosis
+
+| Architecture | Routing | Bridge MLP | Mem Δ NLL | Failure mode |
+|---|---|---|---|---|
+| **V1.5** | Entry yes, hops random | Could pass entry signal | +0.306 harm | Random hops drown the entry signal |
+| **flat-bank** | Continuous (this metric doesn't measure) | **Works** | **−1.231 help** | None — this is what success looks like |
+| **V2** | Yes (+0.061 lift, +0.92 hop on boxes) | **Broken** | ~0 | Routing finds info; bridge fails to convey to Llama |
+
+The bottleneck is **architecture-specific**:
+- V1.5 needs hop-routing fixed (the trajectory walker is the bug)
+- V2 needs the bridge MLP fixed (routing works, integration with Llama doesn't)
+
+### Hop reachability probe (2026-05-18) — the topology is the V1.5 ceiling
+
+#### What reachability measures
+
+The trajectory walker is graph-constrained: at each hop k≥1, it can only
+move to a cell that is in the current cell's K_max=32 outgoing-edge
+neighbors. So whether the read can reach the target write's hop-k cell
+depends on whether that cell IS in the read's current neighborhood. If
+it isn't, the trajectory is geometrically blocked — no routing decision
+(perfect loss or not) can pick it.
+
+For each (chunk, read trajectory j, hop k≥1):
+
+1. Read's previous-hop cell: `R_prev = read_visited[chunk, j, k-1]`
+2. R_prev's K_max neighbors: `neighbors(R_prev)` — from the manifold's
+   `edge_indices` (V1.5) or active `edge_dst` (V2)
+3. Target write's hop-k cells across J=4 write trajectories:
+   `W_target_k = {write_visited[chunk, target_idx, j', k] : j'=0..J-1}`
+4. Reachable indicator: 1 if `W_target_k ∩ neighbors(R_prev) ≠ ∅`, else 0
+
+Per-hop reachability at hop k = mean of the indicator across (chunks × J
+read trajectories). Overall reachability = mean of per-hop values across
+k=1..K_read-1.
+
+**Random baseline** ≈ `K_max·J / N = 32·4 / 4096 ≈ 0.031`. If reach is
+at or below this, routing isn't doing better than a random walker. Above
+0.031 means the routing has landed on cells whose neighborhoods
+preferentially contain target writes.
+
+#### What routing efficiency measures
+
+Derived ratio: **efficiency = rw_target_hop / reachability**.
+
+- `rw_target_hop` = `|R_hop ∩ W_target_hop| / |R_hop|` — fraction of unique
+  read non-entry cells that are in the target write's non-entry cell
+  set (a precision-style measure).
+- `reachability` = fraction of (chunk, j, k) events where the target
+  was reachable at all.
+
+Their ratio is interpretable as "given the target IS reachable, how often
+does the routing pick it?" — the diagnostic that disambiguates **loss
+failure** (low efficiency despite high reach) from **topology failure**
+(low reach regardless of efficiency). The ratio can occasionally exceed
+100% when the J read trajectories converge to a small set of cells that
+all happen to match target writes (V2 boxes hits 146%), so it's a rough
+indicator rather than a strict probability. A 4% efficiency unambiguously
+means the loss is wasting reachability; 70% efficiency unambiguously
+means the loss is using most of what reach allows.
+
+#### Results
+
+**V1.5 (400 chunks, composite_v1 val):**
+
+| Per-hop reach | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 | k=7 | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| V1.5 | **0.48** | 0.08 | 0.06 | 0.07 | 0.04 | 0.07 | 0.04 | **0.12** |
+
+V1.5 collapses 6× between hop 1 (0.48) and hop 2 (0.08). Hop 1 is high
+because the entry contrastive landed the read's entry cell near the
+target's entry cell — their immediate neighborhoods overlap. After one
+step the read is at an essentially random cell and reachability drops
+to the random-walker floor of `K_max·J/N = 32·4/4096 ≈ 0.031`.
+
+Per-task V1.5 reachability is 0.09–0.20 across all tasks — the fixed
+small-world ring + NPMI plasticity has approximately the same shape
+regardless of task family.
+
+**V2 (400 chunks, composite_v1 val):**
+
+| Per-hop reach | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 | k=7 | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| V2 | 0.34 | 0.23 | 0.21 | 0.29 | 0.25 | 0.29 | 0.28 | **0.27** |
+
+V2 is **remarkably flat across hops** — W-TinyLFU eviction + NPMI
+plasticity built edges that span the trajectories, not just the immediate
+entry neighborhood. The 2.24× higher mean reachability is the topological
+gap V1.5 cannot close with loss changes.
+
+**Per-task V2 reachability** reveals the adaptive-topology story:
+
+| Task | V2 reach | V2 rw_target_hop | efficiency = rw_target_hop/reach |
+|---|---:|---:|---:|
+| **boxes** | **0.633** | 0.922 | 146% (across J trajs) |
+| **revisions** | **0.610** | 0.545 | 89% |
+| triage | 0.412 | 0.108 | 26% |
+| preferences | 0.315 | 0.129 | 41% |
+| passphrase | 0.140 | 0.046 | 33% |
+| **biographical** | **0.116** | 0.004 | **3%** |
+| theory_of_mind | 0.101 | 0.000 | (entry-only) |
+| knights | 0.062 | 0.000 | (entry-only) |
+| calendar | 0.053 | 0.000 | (entry-only) |
+
+State-tracking tasks (boxes, revisions) get **5× the reachability** of
+biographical (0.63 vs 0.12). The dynamic topology builds dense edges
+along chains of sequential state mutation, and sparse edges for tasks
+without that structure.
+
+**Biographical fails in V2 for the same reason V1.5 fails on everything**:
+V2's biographical reachability (0.116) is essentially identical to V1.5's
+overall reachability (0.120). When 8 within-chunk facts share no
+sequential structure, the dynamic topology can't form the chains hop
+routing needs. The W-TinyLFU eviction designed to handle named entities
+didn't help here — the problem isn't "cell overloaded" but "no chain to
+navigate."
+
+### Routing efficiency: separating loss failure from topology failure
+
+| Architecture | reach | rw_target_hop | **efficiency** | Diagnosis |
+|---|---:|---:|---:|---|
+| **V1.5** | 0.12 | 0.005 | **4%** | Both broken: bad topology AND bad routing supervision |
+| **V2** | 0.27 | 0.189 | **70%** | Topology fixed; routing supervision adequate via edge-state |
+
+V1.5 fails on *both axes*: only 12% of hops can reach the target, AND
+within the 12% where it can, the contrastive loss picks correctly 4%
+of the time. V2 wins on both: 2.3× reachability from dynamic edges,
+plus 70% efficient at converting reachability into actual target hits.
+
+### Implication: V1.5 is not loss-fixable
+
+A perfect per-hop cell-index CE loss on V1.5 could at most push
+rw_target_hop from 0.005 → ~0.12 (the reachability ceiling). That's a 24×
+improvement and would prove the contrastive failure was real, but it's
+still well below V2's 0.19 — and far below the >0.5 "healthy" target.
+
+V1.5 needs both routing supervision AND topology adaptation (i.e.,
+something like V2's W-TinyLFU + NPMI plasticity). The fixed small-world
+ring + per-cell state architecture genuinely doesn't admit task-specific
+trajectories. The thesis "fixed grammar over learned vocabulary" loses
+regardless of what loss is applied on top.
+
+V2's measured 0.27 reachability is what V2 actually bought beyond "tune
+loss." It bought *the graph the trajectories need to exist on.* The
+"learned topology over fixed-vocabulary" compromise wasn't a stylistic
+preference — it was necessary.
 
 ---
 
@@ -375,7 +615,7 @@ V1 era param state (best ckpt @ step 7000):
 - Gap decomp: scale_zero CE = 2.37 / scale_trained CE = 2.46 / **memory cost = +0.09 nat**
 - Scale sweep: strictly monotonic, no sweet spot — memory readout is noise
 
-### V2.13 — vocabulary-trajectory (current, `65fe2f1`), 10K-step ckpt
+### V2 — vocabulary-trajectory (current, `65fe2f1`), 10K-step ckpt
 
 #### Architecture summary
 - N=4096 concepts × D=1024 with SimVQ id_basis + id_proj reparameterization
@@ -475,7 +715,7 @@ Components:
 - (new) first-token-only NLL (kills teacher-forcing leak)
 - (live, already there) all 42 training JSONL metrics — log final-step values
 
-### 5B. Second — run on V2.13 ckpts to fill in baseline_numbers.md
+### 5B. Second — run on V2 ckpts to fill in baseline_numbers.md
 
 Run on `ckpt.7000.pt`, `ckpt.10000.pt`, and the saved `ckpt.pt` (whichever
 is best). Estimated: 30-45 min per ckpt.

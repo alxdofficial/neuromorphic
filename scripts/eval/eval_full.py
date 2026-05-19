@@ -66,8 +66,8 @@ def parse_args():
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--markdown", type=Path, default=None,
                     help="Optional: also emit a markdown summary.")
-    ap.add_argument("--version-label", type=str, default="V2.13",
-                    help="Label for the markdown report (e.g. V1.5, V2.13).")
+    ap.add_argument("--version-label", type=str, default="V2",
+                    help="Label for the markdown report (e.g. V1.5, V2).")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()

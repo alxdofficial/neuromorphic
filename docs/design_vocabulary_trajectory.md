@@ -45,6 +45,69 @@ edges, which form a sparse graph encoding "what kinds of trajectories
 traverse this transition." Recall becomes generative — start with a cue,
 autocomplete a vocabulary-trajectory by walking the graph.
 
+### The second motivation, surfaced by per-task R↔W diagnostics (2026-05-18)
+
+V1.5's per-hop contrastive loss tried to fix read↔write hop alignment by
+pulling the read trajectory's per-hop state vector toward the write
+trajectory's per-hop state vector for the target fact (InfoNCE,
+mean-pooled across J trajectories). The loss value dropped from ~2.0 to
+~1.43 during training — but per-task RW overlap on val showed
+`rw_target_hop ≈ 0.005`, at or below the random floor of 0.008. **The
+contrastive loss optimized, but the routing decisions didn't change.**
+Three compounding causes (full detail in design_decisions_narrative.md):
+
+1. **State-vector loss vs cell-decision routing.** The loss compared
+   continuous embeddings. The optimizer can satisfy it by moving cell
+   embeddings together, not by changing which cell the routing picks.
+2. **Mean-pool over J trajectories** before the InfoNCE wipes out the
+   per-trajectory signal — 4 wandering paths whose mean happens to align
+   can satisfy the loss.
+3. **Compounding neighbor constraint.** Hop routing is restricted to the
+   current cell's K_max=32 outgoing edges. If hop k-1 picked the wrong
+   cell, the target's hop k cell isn't even *reachable* — the loss can
+   pull the step query in the right direction but argmax over a wrong
+   neighborhood picks whatever IS available.
+
+V2 addresses this **structurally**, not through more elaborate loss:
+- Routing signal lives in `edge_state` (mutable, EMA-updated by writes),
+  so the per-hop routing decision is supervised by the topology that
+  writes built rather than a separate contrastive objective.
+- W-TinyLFU eviction + plasticity refresh let the graph topology *adapt*
+  during training. An edge that's needed for the target trajectory but
+  doesn't exist yet can come into being.
+- Hopfield-tied EntryProjector makes entry alignment automatic by
+  construction (read and write share entry weights), eliminating the
+  need for an entry-contrastive loss for that supervision.
+
+The empirical validation came after V2 landed: V2.13's `rw_target_hop`
+on boxes = **0.92**, on revisions = 0.55; overall target_lift +0.061
+(reads task-specific). V2's routing genuinely walks the target's
+trajectory **without any per-hop contrastive loss at all** — the
+structural signal worked where V1.5's loss-based supervision failed.
+
+### The compromise
+
+V2 trades one prior for another. V1.5 committed to a **fixed graph
+topology** (small-world ring, never reshapes) as part of the grammar
+thesis — "the graph IS the learned grammar." Routing was supervised by
+loss because the topology was a fixed scaffold. V2 lets the topology
+adapt through edge eviction and NPMI plasticity — easier to train, but a
+less strong commitment to "there is a fixed grammar." The grammar in V2
+is *learned topology* + *learned vocabulary*, while V1.5 was *learned
+vocabulary* over a *fixed grammar*. Both are graph-manifold designs;
+V2's degrees of freedom are higher, and that's why the routing learned.
+
+There is a thesis cost. The original grammar argument said the COMPOSITION
+of fixed cells (vocab) via fixed edges (grammar) yields combinatorial
+capacity. V2 keeps the cells fixed-ish (vocabulary anchors) but lets the
+edges restructure. That makes V2 closer to "structured attention with
+eviction" than to "graph grammar," and the architecture loses some of its
+distinction from learned attention banks. Whether that distinction is
+worth defending (against flat-bank baselines that already work via
+continuous attention) is the open question — and per-task RW overlap on
+V2 says the trajectory routing IS doing something different (boxes 0.92
+hop overlap is not what attention does), so the bet is still live.
+
 ---
 
 ## Core thesis

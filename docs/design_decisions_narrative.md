@@ -13,7 +13,7 @@ Llama with full passage context. The current V2 design is an
 **experiment** motivated by a specific concern about whether a fixed
 set of 4,096 nodes can adequately represent arbitrary named entities.
 
-Status: 2026-05-18. V2.13 measurements are from this session's eval
+Status: 2026-05-18. V2 measurements are from this session's eval
 (`outputs/wave1_v2/eval_full_10000.{json,md}`). V1.0 figures are
 historical (from `docs/baseline_numbers_historical.md`, the deleted-then-recovered
 original baseline doc). V1.1–V1.5 retrains on composite_v1 are running
@@ -274,15 +274,51 @@ model was working.
 
 ### Problem and analysis
 
-The model worked at this point — but a separate concern arose that
-motivated rebuilding the architecture rather than continuing to train
-this one.
+The model worked on aggregate val_loss but a 2026-05-18 per-task R↔W
+overlap eval (composite_v1 val, 400 paired chunks) revealed that
+**hop routing was at the random floor across every task**. Entry
+routing landed on the target passage's entry cell ~44% of the time
+(55× random), but the trajectory after the entry was indistinguishable
+from a random walk: `rw_target_hop ≈ 0.005` against a random floor of
+0.008. Per-task target_lift was essentially zero on every task and
+slightly negative on passphrase. The aggregate `l_contrast_per_step`
+loss had dropped from ~2.0 to ~1.43, so the loss WAS optimized — but
+the actual cell-routing decisions didn't change.
 
-The concern is about **named entities in a fixed-cell-bank
-architecture**. The V1.x design has N=4,096 nodes that are allocated
-at initialization and never deleted or reallocated. Each node carries
-a single `[D_concept]` state vector that is EMA-updated on every
-write.
+Three compounding causes:
+
+1. **State-vector loss vs cell-decision routing.** The per-hop
+   contrastive operates on the trajectory's per-hop state vector
+   (`current_state[visited_cell]` in `read_module.py:544`), pulling it
+   toward the write trajectory's per-hop state vector for the target.
+   But "state at hop k" IS the cell embedding of whichever cell got
+   routed to. If the read landed on the wrong cell, the loss pushes
+   two different cell embeddings together — a degenerate fixed point
+   where the optimizer can satisfy the loss by collapsing cell
+   embeddings rather than changing the routing decision.
+
+2. **Mean-pool over J trajectories before InfoNCE wipes the per-trajectory
+   signal.** The trainer code in `phase1_retrieval.py:640-641` averages
+   `read_states[:, :, k, :].mean(dim=1)` across J=4 trajectories before
+   the contrastive comparison. Four wandering paths whose mean happens
+   to align satisfy the loss; no individual trajectory is required to
+   follow the write's path.
+
+3. **Compounding neighbor constraint plus STE noise.** Hop routing is
+   restricted to the current cell's K_max=32 outgoing edges. If hop
+   k-1 picked the wrong cell, hop k is choosing among the wrong
+   neighborhood — the target's hop k cell often isn't even reachable.
+   The contrastive gradient can pull the step_query in the right
+   direction, but the discrete argmax on the forward pass picks
+   whatever IS available among the wrong neighbors. The gradient
+   through softmax-STE is too noisy to override this discrete
+   constraint within the loss's effective signal range.
+
+A separate concern surfaced around the same time: **named entities in
+a fixed-cell-bank architecture**. The V1.x design has N=4,096 nodes
+that are allocated at initialization and never deleted or
+reallocated. Each node carries a single `[D_concept]` state vector
+that is EMA-updated on every write.
 
 This works fine for cells that map cleanly to recurring semantic
 patterns — there's enough room in 4,096 cells for the main semantic
@@ -318,7 +354,8 @@ has a ceiling on how well it can handle named-entity retrieval.
 
 ### Fix → V2
 
-Two structural changes to address both problems:
+V2 addresses *both* the per-hop training failure AND the named-entity
+ceiling with a single structural shift. Three changes:
 
 1. **Edges carry the relationship state, not nodes.** The per-cell
    state vector goes away. Instead, each `(src, dst)` cell pair has an
@@ -326,20 +363,72 @@ Two structural changes to address both problems:
    trajectory traverses that edge. The node only carries its
    identity-anchor (the `concept_id`); all content lives in edges.
    This separates the "this is concept X" signal from the "this is
-   what was written between X and Y" signal.
+   what was written between X and Y" signal — fixing the dilution
+   problem AND giving the hop routing a richer signal to match against
+   (the edge state encodes what writes traversed this transition).
 
 2. **Eviction and reallocation.** Edges are bounded — each cell has up
    to K_max=32 outgoing edges. When the model wants to create a 33rd
    edge for a cell, an existing edge gets evicted (W-TinyLFU policy:
    keeps edges that are read often and old enough to have stabilized).
-   This means a named entity that doesn't fit the existing topology
-   *creates a new edge* rather than getting blended into an existing
-   one. The architecture can grow into novel content instead of
-   averaging over it.
+   A named entity that doesn't fit the existing topology *creates a
+   new edge* rather than getting blended into an existing one. The
+   architecture can grow into novel content instead of averaging over
+   it.
+
+3. **Routing supervision via structure, not loss.** Because hop
+   routing in V2 cosine-matches step_queries against `edge_state`
+   (where the writes have actually deposited content), the per-hop
+   routing decision is supervised by *what writes built*, not by a
+   separate contrastive loss trying to wrangle continuous embeddings
+   into discrete decisions. Combined with NPMI plasticity refresh and
+   W-TinyLFU eviction, the graph topology adapts to the actual task
+   structure during training — edges that should exist come into
+   being; edges that don't get used die.
+
+The empirical confirmation came after V2 landed: V2's
+`rw_target_hop` on boxes = **0.92**, on revisions = 0.55; overall
+target_lift +0.061. V2's routing genuinely walks the target's
+trajectory **without any per-hop contrastive loss at all**. The
+structural routing signal worked where V1.5's loss-based supervision
+failed.
+
+### The compromise
+
+V2 gives the routing more degrees of freedom (learnable graph
+topology) than V1.5 had (fixed small-world ring). That makes routing
+training easier — the topology adapts to fit the task instead of the
+loss having to fight a fixed scaffold. But it weakens one part of the
+original graph-manifold thesis:
+
+V1.5 committed to a **fixed grammar** (the graph topology) over a
+**learned vocabulary** (the cell embeddings). The grammar argument
+said: the combinatorial capacity of trajectories through a fixed
+graph IS the architecture's advantage over flat banks. The graph
+encodes prior structure about which concepts connect to which.
+
+V2 retains the vocabulary anchors as a fixed-ish set of concepts
+(SimVQ-projected `concept_ids`) but lets the edges restructure via
+eviction + plasticity. The "grammar" is now learned rather than fixed.
+This puts V2 closer to "structured attention with adaptive topology"
+than to "graph grammar over a fixed scaffold."
+
+The trade is deliberate: V1.5's stronger structural commitment didn't
+train (hop routing at random floor); V2's weaker commitment did train
+(boxes hop 0.92). The bet is that V2's *learned* topology still
+captures enough compositional structure to distinguish it from flat
+attention. Per-task R↔W overlap on V2 supports this — boxes 0.92
+hop overlap is not what attention does — but the bridge MLP failure
+(V2 memory NLL Δ ≈ 0) keeps the case unproven for now.
+
+If V1.5 could be rehabilitated with a different routing-supervision
+loss (per-hop cell-index CE instead of state-vector InfoNCE) it would
+recover the stronger thesis. That experiment is open; see open
+questions below.
 
 ---
 
-## V2.0 → V2.13 — Vocabulary + sparse edges  (`6cb713c` → `65fe2f1`, 2026-05-17)
+## V2.0 → V2 — Vocabulary + sparse edges  (`6cb713c` → `65fe2f1`, 2026-05-17)
 
 ### Design
 
@@ -431,7 +520,7 @@ dates", etc.) and from teacher-forced AR continuation in the answer
 span.
 
 This is a different failure mode than V1.0. In V1.0 the readout was
-noise because routing was random. In V2.13 the routing is question-
+noise because routing was random. In V2 the routing is question-
 conditioned (Jaccard 0.084 across questions, vs ~1.0 if it routed the
 same way every time) — but the readout still doesn't change Llama's
 output.
@@ -485,7 +574,7 @@ injection mechanism, not the cell architecture itself.
    metrics like `r_uf`, `rw_overlap_*`, and the lifetime cell
    utilization counters we wouldn't have seen the specific failures.
 
-3. **The current V2.13 result is informative even though memory
+3. **The current V2 result is informative even though memory
    contributes zero.** It tells us the named-entity hypothesis was
    real (V2 handles novel entities without dilution) but not the whole
    story. The next constraint is the bridge MLP between memory and
@@ -494,7 +583,7 @@ injection mechanism, not the cell architecture itself.
 4. **The right success criterion has been clarified over time.** Early
    on we used val_loss alone. After V1.0 we learned val_loss alone
    doesn't catch scale-gate-stuck-at-init. After V1.5 we learned that
-   "beats vanilla full-ctx" is a strong signal. After V2.13 we learned
+   "beats vanilla full-ctx" is a strong signal. After V2 we learned
    the bar should be **paired with-mem vs no-mem ≥ 0.5 nat on
    retrieval tasks**, because format-priors + teacher-forced AR
    continuation can produce big apparent wins over vanilla without any
@@ -509,10 +598,10 @@ injection mechanism, not the cell architecture itself.
 | V1.0 | measured, in `baseline_numbers_historical.md` | original output JSONs lost, but the published baseline doc had them all |
 | V1.1, V1.2, V1.4, V1.5 | retrain pending | `outputs/v1.*/` running, ~22h sequential |
 | V1.5 vs vanilla full-ctx (historical claim "below full-ctx") | claimed in design discussion at the time, not in recovered baseline doc | needs confirmation when chain finishes |
-| V2.13 | **fully measured this session** | `outputs/wave1_v2/eval_full_10000.{json,md}` |
+| V2 | **fully measured this session** | `outputs/wave1_v2/eval_full_10000.{json,md}` |
 
 The chain script (`outputs/v1_chain.log`) populates V1.1–V1.5 rows
 sequentially. Each row will get a paired memory-contribution probe
-(with-mem vs no-mem NLL) — the same diagnostic that revealed V2.13's
+(with-mem vs no-mem NLL) — the same diagnostic that revealed V2's
 zero contribution — so we'll have a clean apples-to-apples comparison
 across the whole lineage.

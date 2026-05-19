@@ -3,7 +3,7 @@
 
 Mirrors scripts/eval/eval_full.py from v2 but uses v1's IntegratedLM +
 Phase1RetrievalTrainer. Computes paired with-mem vs no-mem NLL on
-composite_v1 val for apples-to-apples comparison with V2.13.
+composite_v1 val for apples-to-apples comparison with V2.
 
 Usage:
   python scripts/eval/eval_full_v1.py \\
