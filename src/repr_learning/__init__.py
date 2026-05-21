@@ -9,7 +9,14 @@ Design doc: docs/v2.1_repr_learning.md
 """
 from .config import ReprConfig
 from .model import ReprLearningModel
-from .encoder import V21Encoder, FlatBaselineEncoder, ContinuousBaselineEncoder
+from .encoder import (
+    ContinuousBaselineEncoder,
+    FlatBaselineEncoder,
+    MemorizingBaselineEncoder,
+    NullEncoder,
+    RecurrentBaselineEncoder,
+    V21Encoder,
+)
 
 __all__ = [
     "ReprConfig",
@@ -17,4 +24,7 @@ __all__ = [
     "V21Encoder",
     "FlatBaselineEncoder",
     "ContinuousBaselineEncoder",
+    "MemorizingBaselineEncoder",
+    "RecurrentBaselineEncoder",
+    "NullEncoder",
 ]

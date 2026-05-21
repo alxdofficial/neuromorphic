@@ -8,6 +8,7 @@ to prevent classification collapse — where the model would otherwise
 always pick the same few nodes.
 """
 from __future__ import annotations
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -59,7 +60,10 @@ def gumbel_argmax_ste(
     return idx, one_hot_ste
 
 
-def load_balance_loss(scores: Tensor) -> Tensor:
+def load_balance_loss(
+    scores: Tensor,
+    picks: Optional[Tensor] = None,
+) -> Tensor:
     """Switch Transformer-style load-balance aux loss.
 
     Encourages uniform usage across all N nodes by penalizing the
@@ -68,6 +72,12 @@ def load_balance_loss(scores: Tensor) -> Tensor:
 
     Args:
         scores: [batch_dims..., N] raw logits.
+        picks: optional [batch_dims...] long tensor of actually-selected
+               indices. If provided, f is computed from these (matches
+               the routes actually used in the forward pass). If None,
+               falls back to raw-score argmax — fine when scores
+               dominate Gumbel noise, but misleading at init when
+               argmax(scores) ≠ argmax(scores + gumbel).
 
     Returns:
         scalar loss. Multiply by α (e.g., 0.01) and add to total loss.
@@ -76,9 +86,12 @@ def load_balance_loss(scores: Tensor) -> Tensor:
     flat_scores = scores.reshape(-1, N)  # [B*S, N]
     M = flat_scores.shape[0]
 
-    # Empirical fraction of times each node was picked (top-1)
-    picks = flat_scores.argmax(dim=-1)  # [M]
-    f = torch.bincount(picks, minlength=N).float() / max(M, 1)  # [N]
+    # Empirical fraction of times each node was picked.
+    if picks is None:
+        picks_flat = flat_scores.argmax(dim=-1)
+    else:
+        picks_flat = picks.reshape(-1)
+    f = torch.bincount(picks_flat, minlength=N).float() / max(M, 1)  # [N]
 
     # Mean softmax probability per node across all events
     probs = F.softmax(flat_scores, dim=-1)  # [M, N]
@@ -86,3 +99,24 @@ def load_balance_loss(scores: Tensor) -> Tensor:
 
     # Switch-style: N · Σ_i (f_i · P_i). Min when uniform.
     return N * (f.to(P.dtype) * P).sum()
+
+
+def router_z_loss(scores: Tensor) -> Tensor:
+    """Mixtral / Switch-Transformer-v2 router z-loss.
+
+    Penalizes (logsumexp(scores))² averaged over routing events. The
+    softmax is scale-invariant — adding a constant to every score gives
+    the same picks — so without z-loss the network is free to push logits
+    arbitrarily large. Large logits in turn make Gumbel noise irrelevant
+    (sharp picks), which removes exploration and amplifies any incipient
+    routing imbalance. z-loss caps that pressure.
+
+    Args:
+        scores: [..., N] raw logits (post-scale, pre-softmax).
+
+    Returns:
+        scalar loss. Multiply by ~1e-3 and add to total loss.
+    """
+    # logsumexp over the routing-dim. Average over all routing events.
+    lse = torch.logsumexp(scores.float(), dim=-1)
+    return lse.pow(2).mean()

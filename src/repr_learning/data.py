@@ -49,8 +49,13 @@ def sample_span_mask(
     while len(masked) < target_n and attempts < seq_len * 4:
         span_len = rng.randint(span_min, span_max)
         start = rng.randint(0, max(seq_len - span_len, 0))
+        # Cap span to remaining budget so we don't overshoot target_ratio.
+        # Iterate, count new additions only (existing ones are no-ops).
         for i in range(start, min(start + span_len, seq_len)):
-            masked.add(i)
+            if i not in masked:
+                masked.add(i)
+                if len(masked) >= target_n:
+                    break
         attempts += 1
 
     return sorted(masked)

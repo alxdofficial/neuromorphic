@@ -56,7 +56,19 @@ def main():
           f"masked {mask_positions.sum().item()}/{mask_positions.numel()} positions")
     print()
 
-    for variant in ["v21", "flat_baseline", "continuous_baseline"]:
+    variants = [
+        "v21",
+        "flat_baseline",
+        "continuous_baseline",
+        "memorizing_baseline",
+        "recurrent_baseline",
+    ]
+    # recurrent_baseline (Mamba) requires CUDA — skip on CPU
+    if device == "cpu":
+        variants = [v for v in variants if v != "recurrent_baseline"]
+        print("Note: skipping recurrent_baseline on CPU (Mamba requires CUDA)\n")
+
+    for variant in variants:
         print(f"=== Variant: {variant} ===")
         model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
         n_trainable = model.n_trainable_params()
