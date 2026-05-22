@@ -54,7 +54,17 @@ class JEPAPredictor(nn.Module):
 
 @torch.no_grad()
 def init_ema_target(online: nn.Module) -> nn.Module:
-    """Create a deep-copy EMA target with parameters frozen (no_grad)."""
+    """Create a deep-copy EMA target with parameters frozen.
+
+    Target follows the parent model's train/eval mode. We intentionally
+    do NOT force .train(False) here: for Gumbel-STE encoders (V2.1, A),
+    deterministic targets remove the only source of batch-level variance
+    the online encoder can match, which lets it collapse to a constant
+    pick while VicReg (measured on online) sees stochastic spread that
+    masks the collapse. Keeping target in train mode means target picks
+    are noisy too; the predictor sees varied targets and cannot win with
+    a constant output.
+    """
     target = copy.deepcopy(online)
     for p in target.parameters():
         p.requires_grad = False

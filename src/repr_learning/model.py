@@ -171,6 +171,7 @@ class ReprLearningModel(nn.Module):
             n_heads=predictor_n_heads,
         ).to(device)
         self.jepa_target_encoder = init_ema_target(self.encoder).to(device)
+        self._jepa_active = True
 
     @torch.no_grad()
     def update_jepa_target(self, tau: float = 0.996):
@@ -181,8 +182,8 @@ class ReprLearningModel(nn.Module):
         self,
         chunk_1_ids: Tensor,
         chunk_2_ids: Tensor,
-        var_coef: float = 1.0,
-        cov_coef: float = 0.04,
+        var_coef: float = 5.0,
+        cov_coef: float = 0.5,
     ) -> dict:
         """JEPA cross-chunk encoding prediction loss.
 
@@ -225,9 +226,16 @@ class ReprLearningModel(nn.Module):
         # 4. Prediction loss (MSE)
         loss_pred = F.mse_loss(memory_2_pred, memory_2_target)
 
-        # 5. VicReg anti-collapse — applied to online memory_1
+        # 5. VicReg anti-collapse — applied to BOTH online memory_1 and
+        # target memory_2. Online VicReg gives the encoder gradient pressure;
+        # target VicReg is a diagnostic (target has no grad, so the value
+        # tells us whether the EMA-tracked encoder is collapsing on val
+        # data even though no gradient pushes it directly).
         loss_var = vicreg_variance_loss(memory_1)
         loss_cov = vicreg_covariance_loss(memory_1)
+        with torch.no_grad():
+            target_var_diag = vicreg_variance_loss(memory_2_target)
+            target_cov_diag = vicreg_covariance_loss(memory_2_target)
 
         # 6. Encoder aux losses (load_balance, codebook_orth, z_loss — V2.1-specific)
         loss_aux = aux.get(
@@ -256,12 +264,207 @@ class ReprLearningModel(nn.Module):
             "loss_jepa": loss_pred.detach(),
             "loss_var": loss_var.detach(),
             "loss_cov": loss_cov.detach(),
+            "loss_var_target": target_var_diag.detach(),
+            "loss_cov_target": target_cov_diag.detach(),
             "loss_aux": loss_aux.detach() if isinstance(loss_aux, Tensor) else loss_aux,
             "loss_orth": loss_orth.detach() if isinstance(loss_orth, Tensor) else loss_orth,
             "loss_z": loss_z.detach() if isinstance(loss_z, Tensor) else loss_z,
             "memory": memory_1,
+            "memory_target": memory_2_target,
             "aux": aux,
             "memory_shape": tuple(memory_1.shape),
+        }
+
+    def compute_sentence_recon_loss(
+        self,
+        batch,                          # SentenceChunkBatch
+        window_size: int = 1024,
+    ) -> dict:
+        """v1g sentence-level shuffled-retrieval loss with restricted attention.
+
+        Pipeline:
+          1. Encoder ingests the full chunk via 4 × `window_size` streaming
+             writes (memory state persistent across writes).
+          2. For each (batch element, queried sentence), build a decoder
+             input where unmasked + revealed positions carry GT embeddings
+             and still-masked positions carry mask_embed.
+          3. Build a custom 4D attention mask: query i attends to key j iff
+             (j is a visible position, i.e., memory token OR unmasked OR
+             revealed) OR (i == j, self-attention). Still-masked positions
+             can therefore predict from visible context but cannot share
+             info with each other.
+          4. One Llama forward over [BK, M + L_max, d_llama] with that mask.
+          5. CE loss on still-masked positions only.
+        """
+        device = batch.input_ids.device
+        B, T = batch.input_ids.shape
+        K = batch.query_input_ids.shape[1]
+        L_max = batch.query_input_ids.shape[2]
+
+        # ---- 1. Encode chunk via streaming writes ----
+        embed = self.decoder.llama.get_input_embeddings()
+        with torch.no_grad():
+            chunk_embeds = embed(batch.input_ids)
+        n_windows = (T + window_size - 1) // window_size
+        state = self.encoder.init_streaming_state(B, device, chunk_embeds.dtype)
+        for w in range(n_windows):
+            s = w * window_size
+            e = min(s + window_size, T)
+            state, _ = self.encoder.streaming_write(
+                state, chunk_embeds[:, s:e, :], batch.attention_mask[:, s:e],
+                chunk_offset=s,
+            )
+        memory, finalize_aux = self.encoder.finalize_memory(state)
+        # memory: [B, M, d_llama] — placeholder [B, 0, d_llama] for MT and Vanilla.
+
+        # ---- 2. Flatten (B, K) -> BK ----
+        BK = B * K
+        query_ids_flat = batch.query_input_ids.reshape(BK, L_max).to(device)
+        mask_flat = batch.mask_positions.reshape(BK, L_max).to(device)
+        reveal_flat = batch.reveal_positions.reshape(BK, L_max).to(device)
+        lengths_flat = batch.query_lengths.reshape(BK).to(device)
+
+        # ---- 2b. MT special path: retrieve per-sentence ----
+        # MT's finalize_memory returns a placeholder + the KV bank in aux.
+        # Each queried sentence gets its own top-K retrieval from the bank.
+        mt_bank = finalize_aux.get("mt_bank")
+        if mt_bank is not None:
+            K_retrieve = self.cfg.n_flat_codes  # match baseline memory tok count
+            mt_memory_bk, mt_aux = self.encoder.retrieve_per_sentence(
+                mt_bank,
+                chunk_embeds,                          # raw embeds for query (no leak)
+                batch.query_starts.to(device),
+                batch.query_lengths.to(device),
+                batch.mask_positions.to(device),
+                batch.reveal_positions.to(device),
+                K=K_retrieve,
+            )
+            # mt_memory_bk: [BK, K_retrieve, d_llama]
+            # Replace finalize_aux's mt_bank with the actual aux losses + diagnostics
+            finalize_aux = {k: v for k, v in finalize_aux.items() if k != "mt_bank"}
+            finalize_aux.update(mt_aux)
+            M = K_retrieve
+        else:
+            M = memory.shape[1]
+            mt_memory_bk = None
+
+        # ---- 3. Per-position predicates ----
+        pos_idx = torch.arange(L_max, device=device).unsqueeze(0)
+        valid_pos = pos_idx < lengths_flat.unsqueeze(1)         # [BK, L_max]
+        still_masked = mask_flat & ~reveal_flat & valid_pos     # predict here
+        is_visible_sent = (~still_masked) & valid_pos           # unmasked OR revealed (non-pad)
+
+        # ---- 4. Decoder input embeddings: GT at visible, mask_vec at still-masked ----
+        with torch.no_grad():
+            sent_embeds = embed(query_ids_flat)                  # [BK, L_max, d_llama]
+        sent_embeds = sent_embeds.clone()
+        mask_vec = self.decoder.mask_embed.to(sent_embeds.dtype)
+        sent_embeds = torch.where(
+            still_masked.unsqueeze(-1),
+            mask_vec.view(1, 1, -1).expand_as(sent_embeds),
+            sent_embeds,
+        )
+        # Pad positions: zero them so they contribute nothing through any
+        # subsequent attention. (They're also masked out as attention keys.)
+        sent_embeds = sent_embeds * valid_pos.unsqueeze(-1).to(sent_embeds.dtype)
+
+        # ---- 5. Per-query memory tokens; prepend ----
+        # Three cases:
+        #   - MT: per-sentence retrieval already produced mt_memory_bk [BK, K_retr, d_llama]
+        #   - Standard memory variants: replicate single [B, M, d] memory across K queries
+        #   - Vanilla (M=0): skip memory entirely (reshape with -1 fails on 0 elements)
+        if mt_memory_bk is not None:
+            memory_bk = mt_memory_bk.to(sent_embeds.dtype)
+            full_embeds = torch.cat([memory_bk, sent_embeds], dim=1)
+        elif M > 0:
+            d_mem = memory.shape[-1]
+            memory_bk = (
+                memory.unsqueeze(1).expand(B, K, M, d_mem).reshape(BK, M, d_mem)
+                .to(sent_embeds.dtype)
+            )
+            full_embeds = torch.cat([memory_bk, sent_embeds], dim=1)
+        else:
+            full_embeds = sent_embeds
+        T_total = full_embeds.shape[1]
+
+        # ---- 6. Custom 4D attention mask ----
+        # attend[i, j] = is_visible[j] OR (i == j). Memory tokens always visible.
+        is_visible_full = torch.cat([
+            torch.ones(BK, M, dtype=torch.bool, device=device),
+            is_visible_sent,
+        ], dim=1)                                                # [BK, T_total]
+        eye = torch.eye(T_total, dtype=torch.bool, device=device)
+        attn_mask_2d = is_visible_full.unsqueeze(1) | eye.unsqueeze(0)
+        # Additive bias form for Llama / SDPA: 0 = attend, large negative = ignore.
+        # Use Llama dtype so the cast inside SDPA doesn't drop precision unexpectedly.
+        attn_dtype = full_embeds.dtype
+        zero = torch.zeros((), device=device, dtype=attn_dtype)
+        neg_inf = torch.finfo(attn_dtype).min
+        ninf = torch.full((), neg_inf, device=device, dtype=attn_dtype)
+        additive_mask = torch.where(attn_mask_2d, zero, ninf).unsqueeze(1)
+        # additive_mask: [BK, 1, T_total, T_total]
+
+        # ---- 7. Llama forward (bidirectional via custom mask) ----
+        # `logits_to_keep=L_max` makes HF compute lm_head only on the last
+        # L_max positions (= sentence positions, since memory is prepended).
+        # Saves vocab × M = 128k × 36 unnecessary logit computations per BK item.
+        out = self.decoder.llama(
+            inputs_embeds=full_embeds,
+            attention_mask=additive_mask,
+            logits_to_keep=L_max,
+        )
+        sent_logits = out.logits                                # [BK, L_max, vocab]
+
+        # ---- 8. CE loss on still-masked positions ----
+        if still_masked.any():
+            loss_recon = F.cross_entropy(
+                sent_logits[still_masked].float(),
+                query_ids_flat[still_masked],
+                reduction="mean",
+            )
+        else:
+            loss_recon = (memory.float().sum() * 0.0
+                          + self.decoder.mask_embed.float().sum() * 0.0)
+
+        # ---- 9. Aux loss aggregation ----
+        loss_aux = finalize_aux.get(
+            "load_balance_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss_orth = finalize_aux.get(
+            "codebook_orth_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss_z = finalize_aux.get(
+            "z_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss = (
+            loss_recon
+            + self.cfg.load_balance_coef * loss_aux
+            + self.cfg.codebook_orth_coef * loss_orth
+            + self.cfg.z_loss_coef * loss_z
+        )
+
+        return {
+            "loss": loss,
+            "loss_recon": loss_recon.detach(),
+            "loss_aux": loss_aux.detach() if isinstance(loss_aux, Tensor) else loss_aux,
+            "loss_orth": loss_orth.detach() if isinstance(loss_orth, Tensor) else loss_orth,
+            "loss_z": loss_z.detach() if isinstance(loss_z, Tensor) else loss_z,
+            "memory": memory,
+            "memory_shape": tuple(memory.shape),
+            "n_writes": n_windows,
+            "n_still_masked": still_masked.sum().detach(),
+            "n_revealed": (mask_flat & reveal_flat & valid_pos).sum().detach(),
+            "n_visible_in_query": is_visible_sent.sum().detach(),
+            "aux": finalize_aux,
+            # Diagnostic-only (no grad needed); used by inspect_v1g.py
+            "sent_logits": sent_logits.detach(),
+            "still_masked": still_masked,
+            "query_ids_flat": query_ids_flat,
+            # MT's actual per-sentence memory [BK, K_retrieve, d_llama] when applicable
+            "mt_memory_bk": mt_memory_bk,
         }
 
     def compute_hsm_loss(

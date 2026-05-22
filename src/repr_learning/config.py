@@ -112,6 +112,20 @@ class ReprConfig:
     qformer_diversity_coef: float = 1.0      # base coef
     qformer_diversity_scale: float = 1000.0  # multiplier (matches B's recipe)
 
+    # ── B (continuous_baseline) diversity scale ───────────────────────────
+    # Multiplier on B's squared-off-diag-cos penalty inside finalize_memory
+    # and forward. Held at 1000 for v1e/v1f back-compat; v1g lowered it
+    # after observing aux stuck at ~2000 (62% of total loss) on 500-step
+    # smoke. Lower scale frees gradient budget for recon and lets the
+    # competing slot-attn vs diversity balance settle to a new equilibrium.
+    b_diversity_scale: float = 1000.0
+
+    # ── MT (memorizing_baseline) diversity scale ─────────────────────────
+    # Same penalty applied to MT's retrieved memory tokens to fight slot
+    # collapse. Default 1000 for v1e back-compat; v1g lowers to 50 same
+    # as B for the same reason (otherwise aux dominates recon).
+    mt_diversity_scale: float = 1000.0
+
     # ── Role embeddings on V2.1 memory tokens ──────────────────────────────
     # Llama receives 96 memory tokens but has no built-in way to tell src
     # from edge from dst. A learned per-role bias (added at projection time)

@@ -62,6 +62,7 @@ def ema_tau_at_step(step: int, max_steps: int,
 def run_val(model, val_dl, device, n_batches: int = 25) -> dict:
     model.train(False)
     losses_jepa, losses_var, losses_cov = [], [], []
+    target_vars, target_covs = [], []
     for i, batch in enumerate(val_dl):
         if i >= n_batches:
             break
@@ -71,12 +72,16 @@ def run_val(model, val_dl, device, n_batches: int = 25) -> dict:
         losses_jepa.append(float(out["loss_jepa"]))
         losses_var.append(float(out["loss_var"]))
         losses_cov.append(float(out["loss_cov"]))
+        target_vars.append(float(out["loss_var_target"]))
+        target_covs.append(float(out["loss_cov_target"]))
     model.train(True)
     n = max(len(losses_jepa), 1)
     return {
         "val_loss_jepa": sum(losses_jepa) / n,
         "val_loss_var": sum(losses_var) / n,
         "val_loss_cov": sum(losses_cov) / n,
+        "val_loss_var_target": sum(target_vars) / n,
+        "val_loss_cov_target": sum(target_covs) / n,
         "val_n_batches": len(losses_jepa),
     }
 
@@ -168,6 +173,8 @@ def train_one_variant(
             "loss_jepa": float(out["loss_jepa"]),
             "loss_var": float(out["loss_var"]),
             "loss_cov": float(out["loss_cov"]),
+            "loss_var_target": float(out["loss_var_target"]),
+            "loss_cov_target": float(out["loss_cov_target"]),
             "grad_norm": float(gn),
             "lr": lr,
             "ema_tau": tau,
@@ -224,11 +231,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variants", nargs="+", default=[
         "v21", "flat_baseline", "continuous_baseline",
-        "memorizing_baseline", "recurrent_baseline",
+        "recurrent_baseline",
     ])
-    # vanilla_llama excluded: NullEncoder produces empty memory; predictor
-    # has nothing to operate on. The "no-memory floor" doesn't make sense
-    # for JEPA.
+    # Excluded from JEPA:
+    # - vanilla_llama: NullEncoder produces empty memory; predictor has
+    #   nothing to operate on. The "no-memory floor" doesn't apply.
+    # - memorizing_baseline (MT): retrieval-based memory selects content
+    #   FROM the input chunk itself rather than producing an abstract latent
+    #   representation. Predicting chunk_2's retrieved tokens from chunk_1's
+    #   retrieved tokens is closer to a generative LM task than a
+    #   representation-prediction task. Structural mismatch with JEPA.
     ap.add_argument("--steps", type=int, default=30_000)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--log-every", type=int, default=200)

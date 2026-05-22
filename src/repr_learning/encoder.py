@@ -159,11 +159,16 @@ class SmallBiTransformer(nn.Module):
         )
         nn.init.normal_(self.pos_embed, std=0.01)
 
-    def forward(self, token_embeds: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, token_embeds: Tensor, attention_mask: Optional[Tensor] = None,
+                position_offset: int = 0) -> Tensor:
         # token_embeds: [B, T, d_llama]; cast to encoder dtype (fp32 trainable)
         h = self.in_proj(token_embeds.to(self.in_proj.weight.dtype))   # [B, T, d_enc]
         T = h.shape[1]
-        h = h + self.pos_embed[:, :T, :]                   # add position
+        # position_offset enables window-aware encoding when called repeatedly
+        # over windows of a longer chunk. v1g passes `position_offset=w*window_size`
+        # per streaming write so token@chunk_pos=1500 gets pos_embed[1500], NOT
+        # pos_embed[476] like it would if every window started from index 0.
+        h = h + self.pos_embed[:, position_offset:position_offset + T, :]
         if attention_mask is not None:
             # nn.TransformerEncoder expects True = mask (don't attend)
             src_key_padding_mask = ~attention_mask         # True where padded
@@ -662,39 +667,61 @@ class FlatBaselineEncoder(nn.Module):
             nn.LayerNorm(cfg.d_llama),
         )
 
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """v1g streaming init: per-batch slot queries. State lives in the
+        encoder's native dtype (fp32); the `dtype` arg is the Llama-side
+        dtype and is ignored here."""
+        del dtype
+        return self.code_queries.unsqueeze(0).expand(
+            batch_size, -1, -1,
+        ).contiguous()
+
+    def streaming_write(
+        self, state: Tensor, token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None, chunk_offset: int = 0,
+    ) -> tuple[Tensor, dict]:
+        """One v1g write: refresh slot queries by cross-attending to a new
+        1024-token window. Returns updated slot queries; no aux losses fire
+        here — routing/diversity get computed once in `finalize_memory`."""
+        text_h = self.bi_transformer(token_embeds, attention_mask,
+                                      position_offset=chunk_offset)
+        kv_mask = ~attention_mask if attention_mask is not None else None
+        new_state = self.slot_attn(state, text_h, key_padding_mask=kv_mask)
+        return new_state, {}
+
+    def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
+        """Project the final slot-query state to memory tokens + aux losses."""
+        cfg = self.cfg
+        code_q = self.code_head(state)
+        scores = (code_q @ self.concept_id.T) * self.score_log_scale.exp()
+        code_id, onehot = gumbel_argmax_ste(
+            scores, cfg.selection_temperature, self.training,
+        )
+        code_emb = onehot @ self.concept_id
+        memory = self.proj_code(code_emb)
+        with torch.no_grad():
+            ent = -(F.softmax(scores, dim=-1)
+                    * F.log_softmax(scores, dim=-1)).sum(-1).mean()
+        aux = {
+            "load_balance_loss": load_balance_loss(scores, picks=code_id),
+            "picked_ids": code_id,
+            "routing_entropy": ent,
+        }
+        return memory, aux
+
     def forward(
         self,
         token_embeds: Tensor,
         attention_mask: Optional[Tensor] = None,
         mask_positions: Optional[Tensor] = None,
     ) -> tuple[Tensor, dict]:
-        cfg = self.cfg
+        """Single-window forward (legacy path) — equivalent to one streaming
+        write + finalize. Kept so existing HSM/JEPA scripts work unchanged."""
+        del mask_positions
         B = token_embeds.shape[0]
-        del mask_positions  # unused
-
-        text_h = self.bi_transformer(token_embeds, attention_mask)
-        code_queries = self.code_queries.unsqueeze(0).expand(B, -1, -1)
-        kv_mask = ~attention_mask if attention_mask is not None else None
-        code_slots = self.slot_attn(code_queries, text_h, key_padding_mask=kv_mask)
-
-        code_q = self.code_head(code_slots)                       # [B, M, D_concept]
-        scores = (code_q @ self.concept_id.T) * self.score_log_scale.exp()  # [B, M, N]
-        code_id, onehot = gumbel_argmax_ste(
-            scores, cfg.selection_temperature, self.training,
-        )
-        code_emb = onehot @ self.concept_id                        # [B, M, D_concept]
-        memory = self.proj_code(code_emb)                          # [B, M, d_llama]
-
-        with torch.no_grad():
-            ent = -(F.softmax(scores, dim=-1)
-                    * F.log_softmax(scores, dim=-1)).sum(-1).mean()
-
-        aux = {
-            "load_balance_loss": load_balance_loss(scores, picks=code_id),
-            "picked_ids": code_id,                                 # [B, M]
-            "routing_entropy": ent,
-        }
-        return memory, aux
+        state = self.init_streaming_state(B, token_embeds.device, token_embeds.dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        return self.finalize_memory(state)
 
 
 class ContinuousBaselineEncoder(nn.Module):
@@ -749,14 +776,61 @@ class ContinuousBaselineEncoder(nn.Module):
             nn.LayerNorm(cfg.d_llama),
         )
 
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """v1g streaming init: per-batch slot state. State lives in the
+        encoder's native dtype (fp32); the Llama-side `dtype` arg is unused
+        here — the encoder casts inputs to its weights' dtype internally."""
+        del dtype
+        return self.cont_queries.unsqueeze(0).expand(
+            batch_size, -1, -1,
+        ).contiguous()
+
+    def streaming_write(
+        self, state: Tensor, token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None, chunk_offset: int = 0,
+    ) -> tuple[Tensor, dict]:
+        """One v1g write: two rounds of inverted slot attention over a new
+        1024-token window, with `state` as the input slot queries. This is
+        the canonical streaming Slot Attention recipe — each write is an
+        iteration of refinement using the next window's tokens."""
+        text_h = self.bi_transformer(token_embeds, attention_mask,
+                                      position_offset=chunk_offset)
+        kv_mask = ~attention_mask if attention_mask is not None else None
+        state = self.slot_attn(state, text_h, key_padding_mask=kv_mask)
+        state = self.slot_attn_2(state, text_h, key_padding_mask=kv_mask)
+        return state, {}
+
+    def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
+        """Project final slot state to d_llama + compute diversity loss."""
+        cont_vec = self.cont_head(state)
+        memory = self.proj_cont(cont_vec)
+        with torch.amp.autocast("cuda", enabled=False):
+            def _diversity(x):
+                x_norm = F.normalize(x.float(), dim=-1)
+                cos = x_norm @ x_norm.transpose(1, 2)
+                M = cos.shape[1]
+                eye = torch.eye(M, dtype=torch.bool, device=cos.device)
+                off_diag = cos[:, ~eye].view(cos.shape[0], -1)
+                return off_diag.pow(2).mean()
+            diversity_slots = _diversity(state)
+            diversity_mem = _diversity(memory)
+            diversity_loss = diversity_slots + diversity_mem
+        aux = {
+            "load_balance_loss": self.cfg.b_diversity_scale * diversity_loss,
+            "diversity_slots_raw": diversity_slots,
+            "diversity_mem_raw": diversity_mem,
+            "cont_vec_norm": cont_vec.norm(dim=-1).mean(),
+        }
+        return memory, aux
+
     def forward(
         self,
         token_embeds: Tensor,
         attention_mask: Optional[Tensor] = None,
         mask_positions: Optional[Tensor] = None,
     ) -> tuple[Tensor, dict]:
+        del mask_positions
         B = token_embeds.shape[0]
-        del mask_positions  # unused
 
         text_h = self.bi_transformer(token_embeds, attention_mask)
         cont_queries = self.cont_queries.unsqueeze(0).expand(B, -1, -1)
@@ -791,7 +865,7 @@ class ContinuousBaselineEncoder(nn.Module):
         # contribution after load_balance_coef=0.01 multiplier is up to
         # ~20 nat at full collapse, dominating recon's ~7 nat.
         aux = {
-            "load_balance_loss": 1000.0 * diversity_loss,
+            "load_balance_loss": self.cfg.b_diversity_scale * diversity_loss,
             "diversity_slots_raw": diversity_slots,
             "diversity_mem_raw": diversity_mem,
             "cont_vec_norm": cont_vec.norm(dim=-1).mean(),
@@ -845,6 +919,151 @@ class MemorizingBaselineEncoder(nn.Module):
             nn.LayerNorm(cfg.d_llama),
         )
         self.n_retrieve = cfg.n_flat_codes  # 96 — match V2.1 memory token count
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """v1g streaming init: accumulate per-window kv pairs as we go."""
+        return []
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+        """Build the KV bank one 1024-token window at a time. Each window's
+        bi_transformer only sees its own window (same constraint as A/B), so
+        MT no longer has a 4× attention-span advantage over A/B."""
+        text_h = self.bi_transformer(token_embeds, attention_mask,
+                                      position_offset=chunk_offset)
+        kv = self.kv_head(text_h)
+        keys, values = kv.chunk(2, dim=-1)
+        state.append({
+            "keys": keys,
+            "values": values,
+            "attention_mask": attention_mask,
+        })
+        return state, {}
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        """Concat per-window kv pairs into the full chunk bank."""
+        if not state:
+            raise RuntimeError("MT finalize_memory called with no writes")
+        keys = torch.cat([s["keys"] for s in state], dim=1)
+        values = torch.cat([s["values"] for s in state], dim=1)
+        if state[0]["attention_mask"] is not None:
+            attention_mask = torch.cat([s["attention_mask"] for s in state], dim=1)
+        else:
+            attention_mask = None
+        B = keys.shape[0]
+
+        placeholder = torch.zeros(
+            B, 0, self.cfg.d_llama,
+            device=keys.device, dtype=keys.dtype,
+        )
+        aux = {
+            "load_balance_loss": torch.zeros(
+                (), device=keys.device, dtype=torch.float32,
+            ),
+            "mt_bank": {
+                "keys": keys,
+                "values": values,
+                "attention_mask": attention_mask,
+            },
+        }
+        return placeholder, aux
+
+    def retrieve_per_sentence(
+        self,
+        bank: dict,
+        chunk_embeds: Tensor,            # [B, T, d_llama] raw Llama embeds for query
+        query_starts: Tensor,            # [B, K_query] long — sentence start in chunk
+        query_lengths: Tensor,           # [B, K_query] long
+        mask_positions: Tensor,          # [B, K_query, L_max] bool
+        reveal_positions: Tensor,        # [B, K_query, L_max] bool
+        K: int,                          # retrieval budget per query
+    ) -> tuple[Tensor, dict]:
+        """For each queried sentence: pool query from that sentence's visible
+        positions, score against the bank, retrieve top-K values, project to
+        d_llama. Returns [B*K_query, K, d_llama] memory.
+
+        The query is pooled from `bi_transformer.in_proj(chunk_embeds)` — a
+        per-position linear projection of raw Llama embeddings, WITHOUT the
+        transformer attention layers. This prevents the bidirectional encoder
+        attention from leaking still-masked tokens' content into the visible
+        positions used for query pooling."""
+        keys = bank["keys"]
+        values = bank["values"]
+        attn_mask = bank["attention_mask"]
+        B, T, d_value = keys.shape
+        K_query = query_starts.shape[1]
+        L_max = mask_positions.shape[2]
+        BK = B * K_query
+        device = keys.device
+
+        # Build [B, K_query, T] mask: True where chunk position t is INSIDE
+        # sentence k_query AND that sentence position is VISIBLE (unmasked
+        # or revealed). This is the set of positions we pool the query from.
+        pos_idx = torch.arange(T, device=device).view(1, 1, T)
+        q_starts = query_starts.unsqueeze(-1)
+        q_lengths = query_lengths.unsqueeze(-1)
+        in_sentence = (pos_idx >= q_starts) & (pos_idx < q_starts + q_lengths)
+
+        sent_pos = (pos_idx - q_starts).clamp(min=0, max=L_max - 1)
+        still_masked = mask_positions & ~reveal_positions  # [B, K_query, L_max]
+        sm_at_pos = still_masked.gather(2, sent_pos)        # [B, K_query, T]
+        visible_for_pool = in_sentence & ~sm_at_pos
+        if attn_mask is not None:
+            visible_for_pool = visible_for_pool & attn_mask.unsqueeze(1)
+
+        # Project raw embeds to d_enc per-position (NO attention). This is
+        # the query-side encoder; it cannot encode info from masked positions
+        # because there's no cross-position mixing.
+        q_proj = self.bi_transformer.in_proj(
+            chunk_embeds.to(self.bi_transformer.in_proj.weight.dtype)
+        )  # [B, T, d_enc]
+
+        # Pool one query per (b, k_query) from q_proj at visible positions
+        contrib = visible_for_pool.to(q_proj.dtype).unsqueeze(-1)  # [B, K_query, T, 1]
+        denom = contrib.sum(dim=2).clamp(min=1.0)                  # [B, K_query, 1]
+        q_pool = (q_proj.unsqueeze(1) * contrib).sum(dim=2) / denom  # [B, K_query, d_enc]
+        query = self.query_head(q_pool)                            # [B, K_query, d_value]
+
+        # Score keys against per-(b, k_query) query
+        scores = torch.einsum("btd,bkd->bkt", keys, query)          # [B, K_query, T]
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask.unsqueeze(1), float("-inf"))
+
+        # Top-K per query
+        K_retrieve = min(K, T)
+        top_scores, top_idx = scores.topk(K_retrieve, dim=-1)        # [B, K_query, K_retrieve]
+        # Gather values along T
+        values_exp = values.unsqueeze(1).expand(B, K_query, T, d_value)
+        top_idx_exp = top_idx.unsqueeze(-1).expand(B, K_query, K_retrieve, d_value)
+        retrieved = values_exp.gather(2, top_idx_exp)               # [B, K_query, K, d_value]
+
+        # STE gradient pathway (same recipe as the single-query forward)
+        soft_w = F.softmax(top_scores, dim=-1).unsqueeze(-1)
+        soft_unit = soft_w * K_retrieve
+        gate = 1.0 + (soft_unit - soft_unit.detach())
+        retrieved = retrieved * gate
+
+        # Flatten to [BK, K_retrieve, d_value] and project to d_llama
+        retrieved_bk = retrieved.reshape(BK, K_retrieve, d_value)
+        memory = self.proj_value(retrieved_bk)                       # [BK, K, d_llama]
+
+        # Diversity loss on retrieved memory (same recipe as forward; same
+        # known caveat that the loss may not actually reduce diversity).
+        with torch.amp.autocast("cuda", enabled=False):
+            mem_norm = F.normalize(memory.float(), dim=-1)
+            cos = mem_norm @ mem_norm.transpose(1, 2)
+            Mtok = cos.shape[1]
+            eye = torch.eye(Mtok, dtype=torch.bool, device=cos.device)
+            off_diag = cos[:, ~eye].view(cos.shape[0], -1)
+            diversity_loss = off_diag.pow(2).mean()
+
+        aux = {
+            "load_balance_loss": self.cfg.mt_diversity_scale * diversity_loss,
+            "diversity_raw": diversity_loss,
+            "retrieved_score_mean": scores.masked_fill(
+                scores == float("-inf"), 0.0
+            ).mean(),
+        }
+        return memory, aux
 
     def forward(
         self,
@@ -931,7 +1150,7 @@ class MemorizingBaselineEncoder(nn.Module):
             diversity_loss = off_diag.pow(2).mean()
 
         aux = {
-            "load_balance_loss": 1000.0 * diversity_loss,
+            "load_balance_loss": self.cfg.mt_diversity_scale * diversity_loss,
             "diversity_raw": diversity_loss,
             "retrieved_score_max": scores.masked_fill(
                 scores == float("-inf"), 0.0
@@ -958,6 +1177,19 @@ class NullEncoder(nn.Module):
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        # NullEncoder has no slot state; we stash (B, device, dtype) in a
+        # zero-width tensor so finalize_memory can recover B and the device.
+        return torch.zeros(batch_size, 0, self.cfg.d_llama, device=device, dtype=dtype)
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+        del chunk_offset  # Null encoder has no encoder modules
+        return state, {}
+
+    def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
+        aux = {"load_balance_loss": torch.zeros((), device=state.device, dtype=torch.float32)}
+        return state, aux
 
     def forward(
         self,
@@ -1032,6 +1264,29 @@ class RecurrentBaselineEncoder(nn.Module):
         )
 
         self.target_len = cfg.n_flat_codes  # 96
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """Mamba's SSM hidden state IS naturally streaming, but plumbing the
+        mamba_ssm state across multiple forwards is fragile. Equivalent:
+        accumulate window tokens, run one forward over the concatenation.
+        State is a list of (token_embeds, attention_mask) tuples."""
+        return []
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+        del chunk_offset  # Mamba SSM doesn't use positional embed
+        state.append((token_embeds, attention_mask))
+        return state, {}
+
+    def finalize_memory(self, state: list) -> tuple[Tensor, dict]:
+        """Concat accumulated windows and run the standard Mamba forward."""
+        if not state:
+            raise RuntimeError("Mamba finalize_memory called with no writes")
+        token_embeds = torch.cat([t for t, _ in state], dim=1)
+        if state[0][1] is None:
+            attention_mask = None
+        else:
+            attention_mask = torch.cat([m for _, m in state], dim=1)
+        return self.forward(token_embeds, attention_mask)
 
     def forward(
         self,
