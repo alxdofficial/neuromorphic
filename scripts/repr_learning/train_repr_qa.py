@@ -210,6 +210,7 @@ def train_one_variant(
     # different stream than the original anyway. Just resume the optimizer
     # state and start consuming fresh batches at start_step.
     step = start_step
+    last_completed = start_step - 1  # for the final save (= last step whose body finished)
     for batch in train_dl:
         if step >= n_steps:
             break
@@ -263,11 +264,16 @@ def train_one_variant(
                   flush=True)
 
         if step > 0 and step % save_every == 0:
+            # `step` here is the last completed step. Resume reads N → starts at N+1.
             save_checkpoint(model, opt, step, ckpt_path)
 
+        last_completed = step
         step += 1
 
-    save_checkpoint(model, opt, step, ckpt_path)
+    # Final save: `step` has been incremented past the last completed iter
+    # (or equals start_step if the loop never ran). Persist last_completed so
+    # resume's `+ 1` lands on the correct next step.
+    save_checkpoint(model, opt, last_completed, ckpt_path)
     final_val = run_val(model, val_dl, device, val_batches, window_size)
     jsonl_fp.write(json.dumps({
         "phase": "val", "step": step, "variant": variant,
@@ -329,6 +335,30 @@ def main():
 
     if "v21" in args.variants:
         raise SystemExit("v21 is not supported in v1h yet.")
+
+    # Flag/weight consistency. The flags toggle source *availability*; the
+    # weights control *sampling*. A source with weight=0 is never sampled,
+    # so enabling the flag without bumping the weight is a no-op that
+    # silently loads ~570MB of data (HotpotQA) or downloads NarrativeQA
+    # while contributing nothing. Surface this immediately.
+    if args.narrative and args.mix_weights[2] <= 0:
+        raise SystemExit(
+            "--narrative is set but mix_weights[2] (NarrativeQA) is 0. "
+            "Either drop --narrative or pass --mix-weights with a positive "
+            "third value (e.g. --mix-weights 0.5 0.3 0.2)."
+        )
+    if (not args.no_hotpot) and args.mix_weights[1] <= 0:
+        # HotpotQA is on by default; if user explicitly zeros the weight
+        # they likely meant to disable the source entirely.
+        raise SystemExit(
+            "HotpotQA is enabled but mix_weights[1] is 0. Either pass "
+            "--no-hotpot or set --mix-weights with a positive second value."
+        )
+    if args.mix_weights[0] <= 0:
+        raise SystemExit(
+            "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
+            "source and cannot be disabled."
+        )
 
     cfg = ReprConfig(
         batch_size=args.batch_size,

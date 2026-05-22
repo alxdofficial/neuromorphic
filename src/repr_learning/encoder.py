@@ -263,6 +263,11 @@ class _InvertedSlotAttn(nn.Module):
         key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         # slots: [B, N_slots, d_enc]    inputs: [B, T, d_enc]
+        orig_slots = slots
+        all_padded = None
+        if key_padding_mask is not None:
+            all_padded = key_padding_mask.all(dim=-1)         # [B]
+
         inputs_n = self.norm_inputs(inputs)
         slots_n = self.norm_slots(slots)
 
@@ -293,16 +298,21 @@ class _InvertedSlotAttn(nn.Module):
 
         # All-padded rows: every key was masked, so any update is junk from
         # zero-embed positions. Zero the update so slots pass through unchanged.
-        if key_padding_mask is not None:
-            all_padded = key_padding_mask.all(dim=-1)         # [B]
-            if all_padded.any():
-                updates = updates * (~all_padded).to(updates.dtype).view(-1, 1, 1)
+        if all_padded is not None and all_padded.any():
+            updates = updates * (~all_padded).to(updates.dtype).view(-1, 1, 1)
 
         slots = slots + updates          # residual
-        # FFN residual is row-local and safe to apply unconditionally — even
-        # for all-padded rows it's just an identity-shaped no-op on the slot
-        # state we passed in.
+        # FFN residual: applied to ALL rows because torch ops don't short-circuit.
+        # Even with all-padded inputs, FFN(norm(slots)) is generally nonzero
+        # (it sees the prior slot state, not the inputs). For all-padded rows
+        # we restore the pre-call state at the end so the streaming-write
+        # invariant holds: an all-padded window is a no-op on slot state.
         slots = slots + self.ffn(self.norm_ffn(slots))
+
+        if all_padded is not None and all_padded.any():
+            keep = (~all_padded).to(slots.dtype).view(-1, 1, 1)
+            slots = slots * keep + orig_slots * (1.0 - keep)
+
         return slots
 
 

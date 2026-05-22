@@ -509,10 +509,18 @@ def make_mixed_qa_dataloader(
 ) -> DataLoader:
     """Build a mixed QA dataloader. Any of (composite, hotpot, narrative)
     can be disabled by passing `None` paths or `False` flags; the weights
-    for disabled sources are dropped and the remaining weights renormalize."""
+    for disabled sources are dropped and the remaining weights renormalize.
+
+    Sources with weight ≤ 0 are also skipped — they'd consume memory (and in
+    the case of HotpotQA/NarrativeQA, slow data loading) without ever being
+    sampled. Pass a flag *or* a positive weight, not both with one of them
+    silently inert.
+    """
     sources, src_weights, names = [], [], []
 
-    if composite_passages_path is not None and composite_questions_path is not None:
+    if (composite_passages_path is not None
+            and composite_questions_path is not None
+            and weights[0] > 0):
         sources.append(QADataset(
             Path(composite_passages_path), Path(composite_questions_path),
             chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
@@ -521,7 +529,7 @@ def make_mixed_qa_dataloader(
         ))
         src_weights.append(weights[0]); names.append("composite_v1")
 
-    if use_hotpot:
+    if use_hotpot and weights[1] > 0:
         hp_split = "train" if split == "train" else "validation"
         sources.append(HotpotQADataset(
             split=hp_split, tokenizer=tokenizer, chunk_size=chunk_size,
@@ -530,7 +538,7 @@ def make_mixed_qa_dataloader(
         ))
         src_weights.append(weights[1]); names.append("hotpot_qa")
 
-    if use_narrative:
+    if use_narrative and weights[2] > 0:
         nq_split = "train" if split == "train" else "validation"
         sources.append(NarrativeQADataset(
             split=nq_split, tokenizer=tokenizer, chunk_size=chunk_size,

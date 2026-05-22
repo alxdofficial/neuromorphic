@@ -153,6 +153,45 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
     bn = bottleneck_floats(variant, cfg)
     print(f"  [E] pre-projection bottleneck = {bn} floats")
 
+    # ---- (E.5) All-padded streaming-write invariant ----
+    # HotpotQA contexts are often <2048 tokens, so later 1024-token windows
+    # are entirely padding. An all-pad streaming_write must be a no-op on the
+    # encoder state; if it isn't, the encoder silently corrupts memory on
+    # those mixed-source rows.
+    allpad_delta = 0.0
+    if variant not in ("vanilla_llama",):
+        with torch.no_grad():
+            B_p = 2
+            T_p = cfg.fixed_window_size
+            d_p = llama.config.hidden_size
+            tok_embeds = torch.zeros(B_p, T_p, d_p, device=device, dtype=torch.bfloat16)
+            attn_zero = torch.zeros(B_p, T_p, dtype=torch.bool, device=device)
+            state_a = model.encoder.init_streaming_state(B_p, device, tok_embeds.dtype)
+            state_b, _ = model.encoder.streaming_write(state_a, tok_embeds, attn_zero, chunk_offset=0)
+
+            # Flatten state to a tensor for delta. State shape varies by variant —
+            # try the common 'slots' / 'bank' / Tensor cases.
+            def _state_to_tensor(s):
+                if isinstance(s, torch.Tensor):
+                    return s
+                if isinstance(s, dict):
+                    parts = [v for v in s.values() if isinstance(v, torch.Tensor)]
+                    if parts:
+                        return torch.cat([p.flatten() for p in parts])
+                if isinstance(s, (tuple, list)):
+                    parts = [v for v in s if isinstance(v, torch.Tensor)]
+                    if parts:
+                        return torch.cat([p.flatten() for p in parts])
+                return None
+
+            ta = _state_to_tensor(state_a)
+            tb = _state_to_tensor(state_b)
+            if ta is not None and tb is not None and ta.shape == tb.shape:
+                allpad_delta = float((tb.float() - ta.float()).norm())
+    print(f"  [E.5] all-pad streaming-write delta = {allpad_delta:.4f} "
+          f"(expected ≈ 0 for all memory variants)")
+    allpad_ok = allpad_delta < 1e-3 if variant not in ("vanilla_llama",) else True
+
     # ---- (F) Zero-memory ablation ----
     # Override the encoder's output with zeros and re-run.
     if variant == "vanilla_llama":
@@ -196,6 +235,8 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
         "aux_ok": aux_ok,
         "bottleneck": bn,
         "zero_mem_delta": delta,
+        "allpad_delta": allpad_delta,
+        "allpad_ok": allpad_ok,
     }
 
 
@@ -206,14 +247,17 @@ def main():
     tok = AutoTokenizer.from_pretrained(cfg.llama_model)
     llama, _ = load_frozen_llama(cfg.llama_model, dtype=torch.bfloat16)
 
-    # Mixed-source training batch
-    print("\nLoading mixed-source dataloader (composite + HotpotQA + NarrativeQA)...")
+    # Mixed-source training batch — must mirror train_repr_qa.py defaults so
+    # the audit reflects the actual launch configuration. composite + HotpotQA
+    # at (0.7, 0.3); NarrativeQA disabled.
+    print("\nLoading mixed-source dataloader (composite + HotpotQA)...")
     dl_mixed = make_mixed_qa_dataloader(
         cfg, tok,
         composite_passages_path=REPO / "data/wave1/composite_v1/train/passages.jsonl",
         composite_questions_path=REPO / "data/wave1/composite_v1/train/questions.jsonl",
-        use_hotpot=True, use_narrative=True, split="train",
+        use_hotpot=True, use_narrative=False, split="train",
         chunk_size=4096, passages_per_chunk=300, batch_size=2, seed=42,
+        weights=(0.7, 0.3, 0.0),
     )
     batch_mixed = next(iter(dl_mixed))
     batch_mixed = to_device(batch_mixed, device)
@@ -235,15 +279,28 @@ def main():
     print(header)
     print("  " + "-" * (len(header) - 2))
     all_ok = True
+    # At random init, memory is noise so Δ < 0 is expected for memory variants;
+    # the threshold checks the encoder is *plumbed* (its output reaches the
+    # decoder and changes loss). For vanilla there's no memory by design.
+    ZERO_MEM_MIN_ABS_DELTA = 0.1
     for r in summary:
+        is_vanilla = (r["variant"] == "vanilla_llama")
+        delta_ok = is_vanilla or abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA
+        aux_ok = r["aux_ok"]
+        finite_ok = r["finite_loss"]
+        grads_ok = r["all_grads_ok"]
         marks = [
-            "✓" if r["finite_loss"] else "✗",
-            "✓" if r["all_grads_ok"] else "✗",
+            "✓" if finite_ok else "✗",
+            "✓" if grads_ok else "✗",
         ]
+        allpad_ok = r["allpad_ok"]
         print(f"  {r['variant']:<22} {marks[0]:>7} {marks[1]:>7} "
               f"{r['aux_pct']:>5.1f}% {r['bottleneck']:>10,} "
-              f"{r['zero_mem_delta']:>+8.3f}")
-        if not r["finite_loss"] or not r["all_grads_ok"]:
+              f"{r['zero_mem_delta']:>+8.3f}"
+              f"  aux_ok={'✓' if aux_ok else '✗'}"
+              f"  Δ_ok={'✓' if delta_ok else '✗'}"
+              f"  pad_ok={'✓' if allpad_ok else '✗'} (Δ={r['allpad_delta']:.3f})")
+        if not (finite_ok and grads_ok and aux_ok and delta_ok and allpad_ok):
             all_ok = False
 
     # Bottleneck parity check
