@@ -467,6 +467,147 @@ class ReprLearningModel(nn.Module):
             "mt_memory_bk": mt_memory_bk,
         }
 
+    def compute_qa_loss(
+        self,
+        batch,                          # QABatch from data_qa.py
+        window_size: int = 1024,
+    ) -> dict:
+        """v1h composite-QA loss.
+
+        Pipeline (matches the memory paradigm — decoder never sees raw context):
+          1. Encoder ingests context via streaming writes → memory tokens.
+             Original context tokens are dropped after this step.
+          2. Decoder forward on `[memory, question, answer]` only.
+          3. Teacher-forced CE on answer-content positions: at answer slot t
+             the model uses (memory, question, GT_answer[:t]) to predict
+             GT_answer[t]; loss only on the load-bearing content tokens
+             (`answer_content_mask`), not on padding or filler answer tokens.
+        """
+        device = batch.context_ids.device
+        B, T_ctx = batch.context_ids.shape
+        T_q = batch.question_ids.shape[1]
+        T_a = batch.answer_ids.shape[1]
+
+        embed = self.decoder.llama.get_input_embeddings()
+
+        # ---- 1. Encode context (no_grad embed lookup) ----
+        with torch.no_grad():
+            ctx_embeds = embed(batch.context_ids)
+        n_windows = (T_ctx + window_size - 1) // window_size
+        state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+        for w in range(n_windows):
+            s = w * window_size
+            e = min(s + window_size, T_ctx)
+            state, _ = self.encoder.streaming_write(
+                state, ctx_embeds[:, s:e, :], batch.context_mask[:, s:e],
+                chunk_offset=s,
+            )
+        memory, finalize_aux = self.encoder.finalize_memory(state)
+        # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla
+        M = memory.shape[1]
+
+        # ---- 2. MT branch: retrieve per-chunk using question as query ----
+        mt_bank = finalize_aux.get("mt_bank")
+        if mt_bank is not None:
+            with torch.no_grad():
+                q_embeds_for_query = embed(batch.question_ids)
+            K_retrieve = self.cfg.n_flat_codes
+            memory, mt_aux = self.encoder.retrieve_for_query(
+                mt_bank, q_embeds_for_query, batch.question_mask, K=K_retrieve,
+            )
+            finalize_aux = {k: v for k, v in finalize_aux.items() if k != "mt_bank"}
+            finalize_aux.update(mt_aux)
+            M = K_retrieve
+
+        # ---- 3. Build decoder input: [memory, question, answer] ----
+        with torch.no_grad():
+            q_embeds = embed(batch.question_ids)
+            a_embeds = embed(batch.answer_ids)
+        if M > 0:
+            memory_dec = memory.to(q_embeds.dtype)
+            full_embeds = torch.cat([memory_dec, q_embeds, a_embeds], dim=1)
+        else:
+            full_embeds = torch.cat([q_embeds, a_embeds], dim=1)
+        T_total = M + T_q + T_a
+
+        # Padding mask (Llama applies its native causal mask on top)
+        mem_mask = torch.ones(B, M, dtype=torch.bool, device=device)
+        attn_mask = torch.cat([mem_mask, batch.question_mask, batch.answer_mask], dim=1)
+
+        # ---- 4. Llama forward ----
+        # Keep T_a + 1 last logits. logits_to_keep counts from the end, so the
+        # kept logits are at positions [M+T_q-1, M+T_q+T_a-1]:
+        #   - position M+T_q-1 (last question token) predicts answer[0]
+        #   - position M+T_q+t-1 predicts answer[t]
+        # We slice off the last kept logit (which would predict past-end).
+        out = self.decoder.llama(
+            inputs_embeds=full_embeds,
+            attention_mask=attn_mask.to(torch.long),
+            logits_to_keep=T_a + 1,
+        )
+        pred_logits = out.logits[:, :-1, :]                  # [B, T_a, vocab]
+
+        # ---- 5. CE on content positions only ----
+        targets = batch.answer_ids                            # [B, T_a]
+        loss_mask = batch.answer_content_mask                 # [B, T_a]
+
+        if loss_mask.any():
+            loss_recon = F.cross_entropy(
+                pred_logits[loss_mask].float(),
+                targets[loss_mask],
+                reduction="mean",
+            )
+        else:
+            # No content positions to score — fall back to all-answer span,
+            # or return zero with grad attached so backward succeeds.
+            loss_recon = (memory.float().sum() * 0.0
+                          + self.decoder.mask_embed.float().sum() * 0.0)
+
+        # ---- 6. Aux loss aggregation ----
+        loss_aux = finalize_aux.get(
+            "load_balance_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss_orth = finalize_aux.get(
+            "codebook_orth_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss_z = finalize_aux.get(
+            "z_loss",
+            torch.zeros((), device=device, dtype=loss_recon.dtype),
+        )
+        loss = (
+            loss_recon
+            + self.cfg.load_balance_coef * loss_aux
+            + self.cfg.codebook_orth_coef * loss_orth
+            + self.cfg.z_loss_coef * loss_z
+        )
+        # Vanilla has no trainable params in the QA loss path (Llama is frozen
+        # and mask_embed isn't used without a [MASK] token in the input). Add
+        # a zero-weighted mask_embed term so backward has a grad to compute;
+        # mask_embed itself receives zero gradient.
+        loss = loss + 0.0 * self.decoder.mask_embed.float().sum()
+
+        # ---- 7. Diagnostics: top-1 accuracy on content positions ----
+        with torch.no_grad():
+            preds = pred_logits.argmax(dim=-1)
+            n_content = loss_mask.float().sum().clamp(min=1.0)
+            top1_acc = ((preds == targets) & loss_mask).float().sum() / n_content
+
+        return {
+            "loss": loss,
+            "loss_recon": loss_recon.detach(),
+            "loss_aux": loss_aux.detach() if isinstance(loss_aux, Tensor) else loss_aux,
+            "loss_orth": loss_orth.detach() if isinstance(loss_orth, Tensor) else loss_orth,
+            "loss_z": loss_z.detach() if isinstance(loss_z, Tensor) else loss_z,
+            "memory": memory,
+            "memory_shape": tuple(memory.shape),
+            "n_writes": n_windows,
+            "n_content_positions": int(loss_mask.sum().item()),
+            "top1_acc": top1_acc.detach(),
+            "aux": finalize_aux,
+        }
+
     def compute_hsm_loss(
         self,
         chunk_1_ids: Tensor,             # [B, T1] long

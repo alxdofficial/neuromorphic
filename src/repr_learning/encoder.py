@@ -172,6 +172,18 @@ class SmallBiTransformer(nn.Module):
         if attention_mask is not None:
             # nn.TransformerEncoder expects True = mask (don't attend)
             src_key_padding_mask = ~attention_mask         # True where padded
+            # Defensive: when a sample's window is 100% padding (can happen
+            # for shorter inputs like HotpotQA contexts that don't fill the
+            # 4096-token budget across all four 1024-token windows), the
+            # all-True padding mask makes softmax over all-masked keys
+            # produce NaN. Unmask position 0 in any such row — that row's
+            # output is meaningless anyway (no valid tokens in this window),
+            # but it stays finite and the downstream slot state isn't
+            # contaminated for the OTHER rows in the batch.
+            all_padded_rows = src_key_padding_mask.all(dim=-1)  # [B]
+            if all_padded_rows.any():
+                src_key_padding_mask = src_key_padding_mask.clone()
+                src_key_padding_mask[all_padded_rows, 0] = False
         else:
             src_key_padding_mask = None
         out = self.transformer(h, src_key_padding_mask=src_key_padding_mask)
@@ -966,6 +978,69 @@ class MemorizingBaselineEncoder(nn.Module):
             },
         }
         return placeholder, aux
+
+    def retrieve_for_query(
+        self,
+        bank: dict,
+        question_embeds: Tensor,         # [B, T_q, d_llama] raw Llama embeds of the question
+        question_mask: Tensor,           # [B, T_q] bool — True at valid question positions
+        K: int,                          # retrieval budget
+    ) -> tuple[Tensor, dict]:
+        """v1h QA retrieval — one query per chunk, pooled from question tokens.
+
+        The query is the mean of `bi_transformer.in_proj(question_embeds)` over
+        valid question positions. No bi_transformer attention is applied —
+        same recipe as `retrieve_per_sentence` (avoids any contextual leak).
+        Returns [B, K, d_llama] retrieved memory tokens, one set per example."""
+        keys = bank["keys"]
+        values = bank["values"]
+        attn_mask = bank["attention_mask"]
+        B, T, d_value = keys.shape
+        device = keys.device
+
+        # Project question embeds to d_enc via in_proj only (no attention)
+        q_proj = self.bi_transformer.in_proj(
+            question_embeds.to(self.bi_transformer.in_proj.weight.dtype)
+        )                                                       # [B, T_q, d_enc]
+        contrib = question_mask.to(q_proj.dtype).unsqueeze(-1)  # [B, T_q, 1]
+        denom = contrib.sum(dim=1).clamp(min=1.0)                # [B, 1]
+        q_pool = (q_proj * contrib).sum(dim=1) / denom            # [B, d_enc]
+        query = self.query_head(q_pool)                          # [B, d_value]
+
+        # Score keys against the single per-example query
+        scores = torch.einsum("btd,bd->bt", keys, query)         # [B, T]
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+
+        K_retrieve = min(K, T)
+        top_scores, top_idx = scores.topk(K_retrieve, dim=-1)    # [B, K]
+        top_idx_exp = top_idx.unsqueeze(-1).expand(B, K_retrieve, d_value)
+        retrieved = values.gather(1, top_idx_exp)                 # [B, K, d_value]
+
+        # STE gradient
+        soft_w = F.softmax(top_scores, dim=-1).unsqueeze(-1)
+        gate = 1.0 + (soft_w * K_retrieve - (soft_w * K_retrieve).detach())
+        retrieved = retrieved * gate
+
+        memory = self.proj_value(retrieved)                       # [B, K, d_llama]
+
+        # Diversity loss on retrieved memory (same recipe)
+        with torch.amp.autocast("cuda", enabled=False):
+            mem_norm = F.normalize(memory.float(), dim=-1)
+            cos = mem_norm @ mem_norm.transpose(1, 2)
+            Mtok = cos.shape[1]
+            eye = torch.eye(Mtok, dtype=torch.bool, device=cos.device)
+            off_diag = cos[:, ~eye].view(cos.shape[0], -1)
+            diversity_loss = off_diag.pow(2).mean()
+
+        aux = {
+            "load_balance_loss": self.cfg.mt_diversity_scale * diversity_loss,
+            "diversity_raw": diversity_loss,
+            "retrieved_score_mean": scores.masked_fill(
+                scores == float("-inf"), 0.0
+            ).mean(),
+        }
+        return memory, aux
 
     def retrieve_per_sentence(
         self,
