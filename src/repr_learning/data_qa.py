@@ -108,18 +108,47 @@ class QADataset(IterableDataset):
               f"across {len(self.sampler._families)} task families")
 
     def __iter__(self) -> Iterator[dict]:
-        # CompositeSampler is already seeded; just keep emitting chunks
+        # Worker-aware RNG for evidence/distractor interleaving
+        worker_info = torch.utils.data.get_worker_info()
+        wid = worker_info.id if worker_info is not None else 0
+        rng = random.Random(self.seed + wid * 100_003 + 31)
+
         while True:
             chunk = self.sampler.sample_chunk(self.passages_per_chunk)
             passages = chunk["passages"]
             target_q = chunk["target_question"]
+            evidence_idxs = set(chunk["evidence_idxs"])
 
-            # Pack passages into a single context up to chunk_size tokens.
-            # The evidence may or may not all fit if chunk_size is tight.
-            # Order: keep the sampler's shuffle (positional fairness already
-            # handled inside sample_chunk).
+            # Split into evidence vs distractors. Evidence MUST end up in
+            # the 4096-token context, otherwise the example is unsolvable
+            # by the encoder and the loss signal is misleading.
+            evidence = [passages[i] for i in evidence_idxs]
+            distractors = [passages[i] for i, _ in enumerate(passages) if i not in evidence_idxs]
+
+            # Pack evidence first; if it can't fit alone, skip this example.
+            ev_tokens = [p["passage_token_ids"] for p in evidence]
+            ev_total = sum(len(t) for t in ev_tokens) + max(0, len(ev_tokens) - 1)
+            if ev_total > self.chunk_size:
+                continue  # evidence-too-big; resample
+
+            # Greedily insert distractors at random positions until budget exhausted
+            rng.shuffle(distractors)
+            packed = list(ev_tokens)
+            cur_total = ev_total
+            for d in distractors:
+                d_tokens = d["passage_token_ids"]
+                add_cost = len(d_tokens) + 1  # plus separator
+                if cur_total + add_cost > self.chunk_size:
+                    continue  # this distractor too big; try next (might be smaller)
+                insert_pos = rng.randint(0, len(packed))
+                packed.insert(insert_pos, d_tokens)
+                cur_total += add_cost
+
+            # Final shuffle of evidence positions within the packed list:
+            # at this point evidence is interleaved with distractors via
+            # the random insertions above, so positional fairness holds.
             ctx_tokens, valid_len = _pack_context(
-                [p["passage_token_ids"] for p in passages],
+                packed,
                 chunk_size=self.chunk_size,
                 sep_token_id=self.sep_token_id,
                 pad_token_id=self.pad_token_id,
@@ -130,8 +159,6 @@ class QADataset(IterableDataset):
             content_positions = list(
                 target_q.get("answer_content_token_positions") or []
             )
-            # If no content positions specified, fall back to the full
-            # answer span (the trainer's default behavior in v4/v5).
             if not content_positions:
                 content_positions = list(range(len(a_ids)))
 

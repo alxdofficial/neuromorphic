@@ -290,7 +290,18 @@ class _InvertedSlotAttn(nn.Module):
         attn = attn / attn.sum(dim=-1, keepdim=True)
 
         updates = attn @ v               # [B, N_slots, d]
+
+        # All-padded rows: every key was masked, so any update is junk from
+        # zero-embed positions. Zero the update so slots pass through unchanged.
+        if key_padding_mask is not None:
+            all_padded = key_padding_mask.all(dim=-1)         # [B]
+            if all_padded.any():
+                updates = updates * (~all_padded).to(updates.dtype).view(-1, 1, 1)
+
         slots = slots + updates          # residual
+        # FFN residual is row-local and safe to apply unconditionally — even
+        # for all-padded rows it's just an identity-shaped no-op on the slot
+        # state we passed in.
         slots = slots + self.ffn(self.norm_ffn(slots))
         return slots
 

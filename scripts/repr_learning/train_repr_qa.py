@@ -66,10 +66,17 @@ def run_val(model, val_dl, device, n_batches: int, window_size: int) -> dict:
         out = model.compute_qa_loss(batch, window_size=window_size)
         losses.append(float(out["loss_recon"]))
         accs.append(float(out["top1_acc"]))
-        for fam in batch.task_family:
+        # Per-family: use per-row loss instead of batch-wide mean (a 2-row
+        # batch with rows from families X and Y was previously credited
+        # the same mean to both, hiding genuine per-family differences).
+        if "per_example_loss" in out:
+            per_ex = out["per_example_loss"].detach().cpu().tolist()
+        else:
+            per_ex = [float(out["loss_recon"])] * len(batch.task_family)
+        for fam, l in zip(batch.task_family, per_ex):
             d = per_fam_stats.setdefault(fam, {"n": 0, "loss": 0.0})
             d["n"] += 1
-            d["loss"] += float(out["loss_recon"])
+            d["loss"] += float(l)
     model.train(True)
     n = max(len(losses), 1)
     fam_summary = {f: {"n": v["n"], "mean_loss": v["loss"] / max(v["n"], 1)}
@@ -114,14 +121,24 @@ def train_one_variant(
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
 
-    opt = torch.optim.AdamW(
-        model.trainable_parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.95),
-    )
+    is_vanilla = (variant == "vanilla_llama")
 
-    train_dl = make_mixed_qa_dataloader(
+    # vanilla_llama has no encoder and no real trainable parameters that
+    # affect the loss (mask_embed is gated to 0 contribution for QA).
+    # Running a training loop on it just wastes GPU time and rewrites the
+    # opt state. Treat it as eval-only: build the val dataloader, run it,
+    # write a single final-val row, and return.
+    if not is_vanilla:
+        opt = torch.optim.AdamW(
+            model.trainable_parameters(),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+            betas=(0.9, 0.95),
+        )
+    else:
+        opt = None
+
+    train_dl = None if is_vanilla else make_mixed_qa_dataloader(
         cfg, tokenizer,
         composite_passages_path=COMPOSITE_TRAIN_P,
         composite_questions_path=COMPOSITE_TRAIN_Q,
@@ -144,6 +161,34 @@ def train_one_variant(
     ckpt_path = out_dir / f"ckpts/{variant}.last.pt"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if is_vanilla:
+        # Eval-only path. Skip any prior jsonl and run a single final-val pass.
+        if jsonl_path.exists():
+            jsonl_path.unlink()
+        t_start = time.time()
+        final_val = run_val(model, val_dl, device, val_batches, window_size)
+        elapsed = time.time() - t_start
+        with open(jsonl_path, "w") as fp:
+            fp.write(json.dumps({
+                "phase": "val", "step": 0, "variant": variant,
+                "final": True, "eval_only": True, **final_val,
+            }) + "\n")
+        print(f"  [eval-only] vanilla_llama val_recon={final_val['val_loss_recon']:.4f}  "
+              f"top1={final_val['val_top1_acc']*100:.1f}%  ({elapsed:.1f}s)", flush=True)
+        summary = {
+            "variant": variant,
+            "trainable_params": n_trainable,
+            "n_steps": 0,
+            "elapsed_s": elapsed,
+            "final_val_loss_recon": final_val["val_loss_recon"],
+            "final_val_top1_acc": final_val["val_top1_acc"],
+            "final_val_per_family": final_val["val_per_family"],
+            "eval_only": True,
+        }
+        del model
+        torch.cuda.empty_cache()
+        return summary
+
     start_step = 0
     if resume and ckpt_path.exists():
         sd = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -159,9 +204,13 @@ def train_one_variant(
     t_start = time.time()
     last_print_step, last_print_time = start_step, t_start
 
-    for step, batch in enumerate(train_dl):
-        if step < start_step:
-            continue
+    # Resume: use a local step counter rather than skipping batches from the
+    # iterator. The dataloader is seeded but stochastic per worker; replaying
+    # start_step batches is wasted compute and the resumed run sees a
+    # different stream than the original anyway. Just resume the optimizer
+    # state and start consuming fresh batches at start_step.
+    step = start_step
+    for batch in train_dl:
         if step >= n_steps:
             break
 
@@ -216,6 +265,8 @@ def train_one_variant(
         if step > 0 and step % save_every == 0:
             save_checkpoint(model, opt, step, ckpt_path)
 
+        step += 1
+
     save_checkpoint(model, opt, step, ckpt_path)
     final_val = run_val(model, val_dl, device, val_batches, window_size)
     jsonl_fp.write(json.dumps({
@@ -264,11 +315,16 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-hotpot", action="store_true",
                     help="Disable HotpotQA source (default: enabled)")
-    ap.add_argument("--no-narrative", action="store_true",
-                    help="Disable NarrativeQA source (default: enabled)")
-    ap.add_argument("--mix-weights", nargs=3, type=float, default=[0.5, 0.25, 0.25],
+    ap.add_argument("--narrative", action="store_true",
+                    help="Enable NarrativeQA source (default: DISABLED — most "
+                         "examples fall into random-window label noise because "
+                         "documents are typically ~75k tokens and the answer "
+                         "isn't tokenizer-matched. Re-enable only after building "
+                         "an evidence-anchored cached pipeline.)")
+    ap.add_argument("--mix-weights", nargs=3, type=float, default=[0.7, 0.3, 0.0],
                     metavar=("COMPOSITE", "HOTPOT", "NARRATIVE"),
-                    help="Sampling weights for the three sources")
+                    help="Sampling weights for the three sources. Default has "
+                         "narrative at 0 since --narrative is disabled by default.")
     args = ap.parse_args()
 
     if "v21" in args.variants:
@@ -313,7 +369,7 @@ def main():
             passages_per_chunk=args.passages_per_chunk,
             resume=args.resume,
             use_hotpot=not args.no_hotpot,
-            use_narrative=not args.no_narrative,
+            use_narrative=args.narrative,
             mix_weights=tuple(args.mix_weights),
         )
         summaries.append(s)

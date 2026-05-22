@@ -519,49 +519,92 @@ class ReprLearningModel(nn.Module):
             finalize_aux.update(mt_aux)
             M = K_retrieve
 
-        # ---- 3. Build decoder input: [memory, question, answer] ----
+        # ---- 3. Per-row packing of [memory, real_q, real_a] + trailing pad ----
+        # AVOIDS the alignment bug where right-padded questions caused
+        # answer[0] to be predicted from a pad-embedding position when
+        # batched examples had different question lengths. With per-row
+        # packing, the last real-question token is always immediately
+        # followed by the first real-answer token, regardless of batch
+        # variation.
         with torch.no_grad():
             q_embeds = embed(batch.question_ids)
             a_embeds = embed(batch.answer_ids)
+
+        q_lens = batch.question_mask.sum(dim=1)               # [B]
+        a_lens = batch.answer_mask.sum(dim=1)                 # [B]
+        T_total = M + T_q + T_a                                # upper bound
+
+        # Determine dtype for full_embeds. memory might be empty (vanilla)
+        # in which case use q_embeds dtype.
         if M > 0:
+            embed_dtype = memory.dtype
             memory_dec = memory.to(q_embeds.dtype)
-            full_embeds = torch.cat([memory_dec, q_embeds, a_embeds], dim=1)
         else:
-            full_embeds = torch.cat([q_embeds, a_embeds], dim=1)
-        T_total = M + T_q + T_a
+            embed_dtype = q_embeds.dtype
+            memory_dec = None
 
-        # Padding mask (Llama applies its native causal mask on top)
-        mem_mask = torch.ones(B, M, dtype=torch.bool, device=device)
-        attn_mask = torch.cat([mem_mask, batch.question_mask, batch.answer_mask], dim=1)
+        full_embeds = torch.zeros(B, T_total, q_embeds.shape[-1],
+                                   device=device, dtype=q_embeds.dtype)
+        attn_mask_full = torch.zeros(B, T_total, dtype=torch.bool, device=device)
+        # Per-row alignment: at prediction position M+t_q+k-1 predict answer[k]
+        pred_mask = torch.zeros(B, T_total - 1, dtype=torch.bool, device=device)
+        pred_targets = torch.zeros(B, T_total - 1, dtype=torch.long, device=device)
 
-        # ---- 4. Llama forward ----
-        # Keep T_a + 1 last logits. logits_to_keep counts from the end, so the
-        # kept logits are at positions [M+T_q-1, M+T_q+T_a-1]:
-        #   - position M+T_q-1 (last question token) predicts answer[0]
-        #   - position M+T_q+t-1 predicts answer[t]
-        # We slice off the last kept logit (which would predict past-end).
+        for i in range(B):
+            t_q = int(q_lens[i].item())
+            t_a = int(a_lens[i].item())
+            # Place memory
+            if M > 0:
+                full_embeds[i, :M] = memory_dec[i]
+                attn_mask_full[i, :M] = True
+            # Place real question
+            if t_q > 0:
+                full_embeds[i, M:M + t_q] = q_embeds[i, :t_q]
+                attn_mask_full[i, M:M + t_q] = True
+            # Place real answer
+            if t_a > 0:
+                full_embeds[i, M + t_q:M + t_q + t_a] = a_embeds[i, :t_a]
+                attn_mask_full[i, M + t_q:M + t_q + t_a] = True
+            # Per-row prediction alignment: logit at position p predicts token at p+1
+            # To predict answer[k] (real token at position M+t_q+k), we use
+            # the logit at position M+t_q+k-1. Loss only at content positions.
+            for k in range(t_a):
+                if not batch.answer_content_mask[i, k]:
+                    continue
+                pred_pos = M + t_q + k - 1
+                if 0 <= pred_pos < T_total - 1:
+                    pred_mask[i, pred_pos] = True
+                    pred_targets[i, pred_pos] = batch.answer_ids[i, k]
+
+        # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
         out = self.decoder.llama(
             inputs_embeds=full_embeds,
-            attention_mask=attn_mask.to(torch.long),
-            logits_to_keep=T_a + 1,
+            attention_mask=attn_mask_full.to(torch.long),
         )
-        pred_logits = out.logits[:, :-1, :]                  # [B, T_a, vocab]
+        logits = out.logits                                    # [B, T_total, vocab]
+        pred_logits_all = logits[:, :-1, :]                    # [B, T_total-1, vocab]
 
         # ---- 5. CE on content positions only ----
-        targets = batch.answer_ids                            # [B, T_a]
-        loss_mask = batch.answer_content_mask                 # [B, T_a]
-
-        if loss_mask.any():
+        if pred_mask.any():
             loss_recon = F.cross_entropy(
-                pred_logits[loss_mask].float(),
-                targets[loss_mask],
+                pred_logits_all[pred_mask].float(),
+                pred_targets[pred_mask],
                 reduction="mean",
             )
+            # Per-example CE for telemetry (per-family aggregation in trainer)
+            per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
+            with torch.no_grad():
+                for i in range(B):
+                    if pred_mask[i].any():
+                        per_example_loss[i] = F.cross_entropy(
+                            pred_logits_all[i, pred_mask[i]].float(),
+                            pred_targets[i, pred_mask[i]],
+                            reduction="mean",
+                        ).detach()
         else:
-            # No content positions to score — fall back to all-answer span,
-            # or return zero with grad attached so backward succeeds.
             loss_recon = (memory.float().sum() * 0.0
                           + self.decoder.mask_embed.float().sum() * 0.0)
+            per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
 
         # ---- 6. Aux loss aggregation ----
         loss_aux = finalize_aux.get(
@@ -590,9 +633,9 @@ class ReprLearningModel(nn.Module):
 
         # ---- 7. Diagnostics: top-1 accuracy on content positions ----
         with torch.no_grad():
-            preds = pred_logits.argmax(dim=-1)
-            n_content = loss_mask.float().sum().clamp(min=1.0)
-            top1_acc = ((preds == targets) & loss_mask).float().sum() / n_content
+            preds_full = pred_logits_all.argmax(dim=-1)        # [B, T_total-1]
+            n_content_total = pred_mask.float().sum().clamp(min=1.0)
+            top1_acc = ((preds_full == pred_targets) & pred_mask).float().sum() / n_content_total
 
         return {
             "loss": loss,
@@ -603,8 +646,9 @@ class ReprLearningModel(nn.Module):
             "memory": memory,
             "memory_shape": tuple(memory.shape),
             "n_writes": n_windows,
-            "n_content_positions": int(loss_mask.sum().item()),
+            "n_content_positions": int(pred_mask.sum().item()),
             "top1_acc": top1_acc.detach(),
+            "per_example_loss": per_example_loss,             # [B] for per-family aggregation
             "aux": finalize_aux,
         }
 
