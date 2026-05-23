@@ -286,27 +286,30 @@ def _row_mean(per_row: Tensor, has_real: Optional[Tensor]) -> Tensor:
 def loss_proportional(
     pins_mask: Optional[Tensor],   # [B, N]
     blobs: dict,
-    target_mass_per_pin: float = 1.0,
 ) -> Tensor:
-    """L_proportional = ((Σ_k s_k · w_k − N_pins) / N_pins)²
+    """L_proportional = ((Σ_k s_k · w_k − K) / K)²
 
-    Mass-balance: total signed blob mass should match the number of pins.
+    Mass-balance: total signed blob mass should be on the order of K
+    (≈ one mass unit per blob). Originally targeted N_pins but with
+    K=51 vs N_pins=1024 the loss was stuck at its max (~1.0) because
+    the target was unreachable — pulled blob_mass in a wrong direction.
+    Target = K is achievable when each blob has w_k ≈ 1 (the softplus
+    init's natural state) and most signs near +1.
+
     Per-row, then averaged over rows that *have* real pins (all-pad rows
-    are skipped — otherwise the clamped N=1 target adds bogus pressure).
+    skipped to avoid bogus pressure when there's no observation).
     """
     _, _, _, _, w, s = derive_blob_quantities(blobs)
     blob_mass = (s * w).sum(dim=-1)                                  # [B]
+    K = float(w.shape[1])
 
     if pins_mask is not None:
         N_raw = pins_mask.to(w.dtype).sum(dim=-1)                    # [B]
         has_real = N_raw > 0
-        N = N_raw.clamp(min=1.0)
     else:
-        N = torch.full_like(blob_mass, w.shape[1])
         has_real = None
 
-    target = target_mass_per_pin * N
-    rel_err = (blob_mass - target) / N                               # [B]
+    rel_err = (blob_mass - K) / K                                    # [B]
     return _row_mean(rel_err.pow(2), has_real)
 
 
