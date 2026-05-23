@@ -42,12 +42,17 @@ def init_splat_state(
     B: int, K: int, d: int,
     device: torch.device, dtype: torch.dtype,
 ) -> dict:
-    """Initial blob state. Random centers, small isotropic covariance,
-    uniform weights, sign-logits near 0 (so tanh is in the high-gradient
-    region and signs are agnostic at start)."""
+    """Initial blob state.
+
+    Naming convention (subtle — read carefully):
+      `log_diag_sigma` stores **log σ²** (log of the variance, i.e.
+      log of the diagonal entries of Σ). So exp(log_diag_sigma) = σ²
+      and exp(0.5 * log_diag_sigma) = σ (std dev). The "sigma" in the
+      name refers to Σ (the covariance), not σ (std dev) — Σ_ii = σ²_i.
+    """
     # μ_k ~ N(0, 1/d) — small random
     mu = torch.randn(B, K, d, device=device, dtype=dtype) * (d ** -0.5)
-    # log σ_i ~ N(0, 0.1) — σ ≈ 1 with small variance
+    # log σ²_i ~ N(0, 0.1) — σ² ≈ 1 ⇒ σ ≈ 1 with small variance
     log_diag_sigma = torch.randn(B, K, d, device=device, dtype=dtype) * 0.1
     # w_raw such that softplus(w_raw) ≈ 1/K (uniform mass over K blobs)
     target_w = 1.0 / K
@@ -58,16 +63,22 @@ def init_splat_state(
     s_logit = torch.randn(B, K, device=device, dtype=dtype) * 0.1
     return {
         "mu": mu,
-        "log_diag_sigma": log_diag_sigma,
+        "log_diag_sigma": log_diag_sigma,    # log σ² (not log σ!)
         "w_raw": w_raw,
         "s_logit": s_logit,
     }
 
 
 def derive_blob_quantities(blobs: dict):
-    """Derive (μ, σ², 1/σ², log|Σ|, w, s) from raw parameters."""
+    """Derive quantities from raw parameters.
+
+    `log_diag_sigma` stores log σ² (log of variance). So:
+      diag_sigma_sq  = exp(log_diag_sigma)       = σ²    (variance)
+      inv_diag_sigma_sq = exp(-log_diag_sigma)   = 1/σ²  (precision)
+      log_det_sigma  = sum(log_diag_sigma)       = log|Σ|
+    """
     mu = blobs["mu"]                                    # [B, K, d]
-    log_diag_sigma = blobs["log_diag_sigma"]           # [B, K, d]
+    log_diag_sigma = blobs["log_diag_sigma"]           # [B, K, d]  log σ²
     diag_sigma = torch.exp(log_diag_sigma)              # σ², element-wise
     inv_diag_sigma = torch.exp(-log_diag_sigma)         # 1/σ², element-wise
     log_det_sigma = log_diag_sigma.sum(dim=-1)         # [B, K]  Σ log σ²_i = log |Σ|
@@ -219,7 +230,11 @@ def density_at_points(points: Tensor, blobs: dict) -> Tensor:
 
     log_terms = log_abs_sw.unsqueeze(1) + log_gauss                  # [B, N, K]
     max_log = log_terms.max(dim=-1, keepdim=True).values             # [B, N, 1]
-    norm_terms = torch.exp(log_terms - max_log)                      # [B, N, K]
+    # Detach max_log in the subtraction (standard softmax stability trick:
+    # the argmax index shouldn't carry gradient). The exp(max_log) on the
+    # outside re-applies the absolute scale; that one is NOT detached, so
+    # the gradient through the scale is preserved.
+    norm_terms = torch.exp(log_terms - max_log.detach())             # [B, N, K]
 
     signed_norm = (sign_sw.unsqueeze(1) * norm_terms).sum(dim=-1)    # [B, N]
     rho = signed_norm * torch.exp(max_log).squeeze(-1)               # [B, N]
@@ -289,7 +304,9 @@ def loss_adjust(blobs_new: dict, blobs_old: dict) -> Tensor:
 
     mu_old = blobs_old["mu"]                                         # [B, K, d]
     mu_new = blobs_new["mu"]
-    sigma_old = torch.exp(0.5 * blobs_old["log_diag_sigma"])         # σ, not σ²
+    # log_diag_sigma stores log σ² (variance). exp(0.5 · log σ²) = σ (std dev).
+    # The W₂² formula for diagonal Gaussians uses the per-dim std dev.
+    sigma_old = torch.exp(0.5 * blobs_old["log_diag_sigma"])
     sigma_new = torch.exp(0.5 * blobs_new["log_diag_sigma"])
 
     # W₂² per blob for diagonal Σ:
