@@ -495,28 +495,20 @@ class ReprLearningModel(nn.Module):
         # ---- 1. Encode context (no_grad embed lookup) ----
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)
-            # Plastic variant: also embed the question now (read conditioning)
-            # and compute per-token surprise = frozen-Llama NLL with no memory.
-            # The surprise is the bio signal that gates plasticity strength.
+            # Plastic variant: also compute per-token surprise from a frozen-
+            # Llama forward over context with no memory injected. The surprise
+            # is the bio signal that gates plasticity strength during write.
             if self.variant == "plastic_baseline":
-                q_embeds_for_read = embed(batch.question_ids)
-                # One Llama forward over context tokens, no memory injected.
-                # NLL[t] = -log p(t_k | t_{<k}). High = unpredictable token,
-                # write strongly. Low = predictable, skip.
                 ctx_logits = self.decoder.llama(
                     input_ids=batch.context_ids,
                     attention_mask=batch.context_mask.to(torch.long),
                 ).logits                                                  # [B, T_ctx, V]
                 log_probs = F.log_softmax(ctx_logits[:, :-1, :].float(), dim=-1)
-                tgt = batch.context_ids[:, 1:]                            # next-token targets
+                tgt = batch.context_ids[:, 1:]
                 nll = -log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [B, T_ctx-1]
-                # Pad to T_ctx so we can window-slice cleanly. The first
-                # position has no prior context — give it 0 surprise.
                 ctx_surprise = F.pad(nll, (1, 0), value=0.0)              # [B, T_ctx]
-                # Mask out padded positions (they shouldn't drive plasticity).
                 ctx_surprise = ctx_surprise * batch.context_mask.to(ctx_surprise.dtype)
             else:
-                q_embeds_for_read = None
                 ctx_surprise = None
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
@@ -529,11 +521,6 @@ class ReprLearningModel(nn.Module):
             state, _ = self.encoder.streaming_write(
                 state, ctx_embeds[:, s:e, :], batch.context_mask[:, s:e],
                 chunk_offset=s, **extra,
-            )
-        # Plastic: stash the question as read conditioning before finalize.
-        if self.variant == "plastic_baseline":
-            state = self.encoder.stash_question(
-                state, q_embeds_for_read, batch.question_mask,
             )
         memory, finalize_aux = self.encoder.finalize_memory(state)
         # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla
@@ -610,10 +597,40 @@ class ReprLearningModel(nn.Module):
                     pred_targets[i, pred_pos] = batch.answer_ids[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
-        out = self.decoder.llama(
-            inputs_embeds=full_embeds,
-            attention_mask=attn_mask_full.to(torch.long),
-        )
+        # Plastic variant: install a forward_pre_hook on the chosen Llama
+        # decoder layer that calls encoder.inject (W_in → substrate.read →
+        # W_out + scale, added as residual). Each position k queries the
+        # substrate with its own current h_k. The hook is removed in finally
+        # so the shared Llama module is unmodified across variants.
+        plastic_hook_handle = None
+        if self.variant == "plastic_baseline":
+            fast_state = finalize_aux["plastic_fast_state"]
+            inject_layer_idx = self.encoder.inject_layer_idx
+            encoder_ref = self.encoder
+
+            def pre_hook(module, args, kwargs):
+                # args: (hidden_states, ...). We mutate args[0] via encoder.inject.
+                if not args:
+                    return None
+                hidden_states = args[0]
+                injected = encoder_ref.inject(hidden_states, fast_state)
+                new_args = (injected,) + args[1:]
+                return new_args, kwargs
+
+            plastic_hook_handle = (
+                self.decoder.llama.model.layers[inject_layer_idx]
+                .register_forward_pre_hook(pre_hook, with_kwargs=True)
+            )
+
+        try:
+            out = self.decoder.llama(
+                inputs_embeds=full_embeds,
+                attention_mask=attn_mask_full.to(torch.long),
+            )
+        finally:
+            if plastic_hook_handle is not None:
+                plastic_hook_handle.remove()
+
         logits = out.logits                                    # [B, T_total, vocab]
         pred_logits_all = logits[:, :-1, :]                    # [B, T_total-1, vocab]
 

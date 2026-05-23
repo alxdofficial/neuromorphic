@@ -113,8 +113,17 @@ class PlasticityController(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 2),
         )
+        # Final layer: weight=0 so the controller's output is fixed-bias at
+        # init regardless of features. Bias chosen so:
+        #   gain_init  = 0.05  → small but nonzero plasticity from step 0
+        #   decay_init = sigmoid(0) = 0.5
+        # Without nonzero gain init, fast_state stays at zero across all
+        # write windows and the substrate carries no context information.
         nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            self.net[-1].bias.zero_()
+            self.net[-1].bias[0] = 0.05  # gain
+            # bias[1] = 0 → decay starts at 0.5
 
     def forward(
         self,

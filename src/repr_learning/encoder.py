@@ -1449,29 +1449,35 @@ class PlasticBaselineEncoder(nn.Module):
       Gradient flows through plasticity steps within the chunk (chunk-bounded
       BPTT: detach at chunk boundary, not at window boundary).
 
-    Read (question-conditioned, one read per chunk for first cut):
-      pooled question embed → ReadHead → M conditioning vectors of h_sub each
-                            → PlasticSubstrate.read (weights frozen)
-                            → M memory tokens of h_sub each
-                            → project to d_llama → memory tokens prepended
+    Read (per-position, via a pre-hook on one Llama layer):
+      At Llama layer L's input, each position k has hidden state h_k that
+      encodes question + previously-read memory + answer-so-far. That h_k
+      is the conditioning:
+          h_mem  = W_in(h_k)                     [B, T, h_sub]
+          rd     = substrate.read(h_mem, fast)   [B, T, h_sub]
+          inj    = scale ⊙ W_out(rd)             [B, T, d_llama]
+          h_in'  = h_k + inj                     residual injection
+      Then layer L processes h_in'. Each Llama position queries the substrate
+      with its own current state — different positions get different memory.
 
-    Bottleneck (matched to A/B/MT/Mamba at v1h scale):
-      M × h_sub = 36 × 725 = 26,100 floats per read call.
+    Substrate "memory" lives in the plastic weight state, not in any
+    prepended token tensor. compute_qa_loss skips the prepend entirely for
+    this variant and installs the pre-hook.
     """
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
 
-        # Substrate dimensions — keep h_sub matched to baselines' per-slot dim
-        # so the per-read bottleneck (M × h_sub) is identical.
         self.h_sub = cfg.d_continuous  # 725
-        self.M = cfg.n_flat_codes      # 36 in v1h
         self.D = getattr(cfg, "plastic_depth", 4)
+        # Llama layer index at which to inject memory. Mid-depth gets refined
+        # hidden states without being too late to influence subsequent layers.
+        self.inject_layer_idx = getattr(cfg, "plastic_inject_layer", 8)
 
-        from .plastic_substrate import PlasticSubstrate, ReadHead
+        from .plastic_substrate import PlasticSubstrate
 
-        # Project Llama-side d_llama → h_sub for substrate input
+        # Project Llama-side d_llama → h_sub for substrate input on the WRITE path.
         self.token_proj = nn.Sequential(
             nn.Linear(cfg.d_llama, self.h_sub, bias=False),
             nn.LayerNorm(self.h_sub),
@@ -1479,31 +1485,36 @@ class PlasticBaselineEncoder(nn.Module):
 
         self.substrate = PlasticSubstrate(D=self.D, h_sub=self.h_sub)
 
-        # ReadHead: pooled-question d_llama vector → M conditioning vectors of h_sub
-        self.read_head = ReadHead(
-            d_in=cfg.d_llama, h_sub=self.h_sub, M=self.M,
-        )
+        # READ-path projections (the MemInject bridge between d_llama and h_sub).
+        # Trained end-to-end via gradient from QA loss through the pre-hook.
+        # Both xavier_uniform so the injection has *some* signal at step 0 —
+        # zero-init W_out would kill gradient flow back to the entire substrate
+        # at step 0 (matmul with a zero weight = no gradient on either input).
+        # The tanh-bounded `scale_raw` (init small) plays the role of the
+        # neutrality knob.
+        self.W_in = nn.Linear(cfg.d_llama, self.h_sub, bias=False)
+        self.W_out = nn.Linear(self.h_sub, cfg.d_llama, bias=False)
+        nn.init.xavier_uniform_(self.W_in.weight)
+        nn.init.xavier_uniform_(self.W_out.weight, gain=0.1)
 
-        # Final projection h_sub → d_llama for prepending to Llama input
-        self.proj_to_llama = nn.Sequential(
-            nn.Linear(self.h_sub, cfg.d_llama // 2), nn.GELU(),
-            nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+        # Per-dim scale (tanh-bounded, ReZero-style). scale_raw=atanh(0.05/1)
+        # ⇒ effective scale ≈ 0.05 at init — the injection is small but
+        # nonzero, so Llama is barely perturbed and gradient can still flow.
+        self.scale_max = 1.0
+        scale_init = 0.05
+        _scale_raw_init = float(torch.atanh(torch.tensor(scale_init / self.scale_max)))
+        self.scale_raw = nn.Parameter(
+            torch.full((cfg.d_llama,), _scale_raw_init),
         )
 
     # ── Streaming interface (matches other encoders) ──────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype):
-        """State is a dict: fast weights for the substrate, plus a buffer of
-        the question embedding that will be passed into read_for_query later.
-        The caller stashes question_embeds via `state['question_embeds']`
-        before calling finalize_memory / read_for_query.
+        """State is a dict with the substrate fast weights. The question is
+        no longer stashed — reads are per-position via the MemInject hook
+        installed by compute_qa_loss, not a one-shot question-conditioned read.
         """
         fast = self.substrate.init_fast_state(batch_size, device, dtype)
-        return {
-            "fast_state": fast,
-            "question_embeds": None,        # set by compute_qa_loss before read
-            "question_mask": None,
-        }
+        return {"fast_state": fast}
 
     def streaming_write(
         self, state, token_embeds, attention_mask=None, chunk_offset=0,
@@ -1535,52 +1546,53 @@ class PlasticBaselineEncoder(nn.Module):
         state["fast_state"] = new_fast
         return state, {}
 
-    def stash_question(self, state, question_embeds, question_mask):
-        """Caller calls this between streaming_write and finalize_memory to
-        provide the read conditioning. Keeps the streaming interface unchanged
-        for the rest of the call chain.
-        """
-        state = dict(state)
-        state["question_embeds"] = question_embeds
-        state["question_mask"] = question_mask
-        return state
-
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
-        """Do the question-conditioned read and produce memory tokens."""
-        if state["question_embeds"] is None:
-            raise RuntimeError(
-                "PlasticBaselineEncoder.finalize_memory called without a "
-                "question stashed in state. compute_qa_loss must call "
-                "encoder.stash_question(state, question_embeds, question_mask) "
-                "before finalize_memory."
-            )
-        # Cast inputs to substrate compute dtype.
-        w_dtype = next(self.read_head.parameters()).dtype
-        q_embeds = state["question_embeds"].to(w_dtype)              # [B, T_q, d_llama]
-        q_mask = state["question_mask"]                              # [B, T_q]
-        # Pool question to a single d_llama vector (mean over real tokens)
-        m = q_mask.to(w_dtype).unsqueeze(-1)                         # [B, T_q, 1]
-        denom = m.sum(dim=1).clamp(min=1.0)                          # [B, 1]
-        pooled = (q_embeds * m).sum(dim=1) / denom                   # [B, d_llama]
+        """Return an empty memory tensor (no prepend) + the fast_state in aux.
+        compute_qa_loss reads fast_state from aux and uses it to install the
+        per-position MemInject pre-hook during the Llama forward.
+        """
+        fast_state = state["fast_state"]
+        # Determine B, device, dtype from fast_state[0] to construct the
+        # empty memory placeholder.
+        B = fast_state[0].shape[0]
+        device = fast_state[0].device
+        dtype = next(self.W_out.parameters()).dtype
+        empty_mem = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
 
-        cond = self.read_head(pooled)                                # [B, M, h_sub]
-        fast_state = [w.to(w_dtype) for w in state["fast_state"]]
-        mem_sub = self.substrate.read(cond, fast_state)              # [B, M, h_sub]
-        memory = self.proj_to_llama(mem_sub)                         # [B, M, d_llama]
-
-        # Diagnostic: norm of fast-weight state per block
         with torch.no_grad():
             fast_norms = torch.stack(
-                [w.flatten(1).norm(dim=-1).mean() for w in state["fast_state"]]
+                [w.flatten(1).norm(dim=-1).mean() for w in fast_state]
             ).mean()
         aux = {
-            "load_balance_loss": torch.zeros(
-                (), device=memory.device, dtype=memory.dtype,
-            ),
+            "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
             "fast_state_norm": fast_norms,
-            "mem_sub_norm": mem_sub.norm(dim=-1).mean(),
+            # compute_qa_loss reads this to wire the per-position hook.
+            "plastic_fast_state": fast_state,
         }
-        return memory, aux
+        return empty_mem, aux
+
+    def inject(self, hidden_states: Tensor, fast_state: list[Tensor]) -> Tensor:
+        """The per-position memory injection. Used by the pre-hook closure
+        installed in compute_qa_loss.
+
+        hidden_states: [B, T, d_llama] from the layer ABOUT to receive it
+        fast_state   : the substrate state from the write phase
+
+        Returns hidden_states + scale ⊙ W_out(substrate.read(W_in(hidden_states))).
+        """
+        h_dtype = hidden_states.dtype
+        w_dtype = next(self.W_in.parameters()).dtype
+        h = hidden_states.to(w_dtype) if h_dtype != w_dtype else hidden_states
+
+        h_mem = self.W_in(h)                                       # [B, T, h_sub]
+        # Cast fast_state to substrate dtype (idempotent if already matching)
+        fs = [w.to(w_dtype) for w in fast_state]
+        readout = self.substrate.read(h_mem, fs)                   # [B, T, h_sub]
+        eff_scale = self.scale_max * torch.tanh(self.scale_raw)    # [d_llama]
+        inj = eff_scale * self.W_out(readout)                       # [B, T, d_llama]
+
+        out = hidden_states + (inj.to(h_dtype) if inj.dtype != h_dtype else inj)
+        return out
 
     def forward(
         self,
@@ -1588,10 +1600,9 @@ class PlasticBaselineEncoder(nn.Module):
         attention_mask: Optional[Tensor] = None,
         mask_positions: Optional[Tensor] = None,
     ) -> tuple[Tensor, dict]:
-        """Non-streaming forward — used by the older sentence-recon code path.
-        For QA, compute_qa_loss drives streaming + stash_question + finalize.
-        Here we just write the whole chunk in one window with no surprise,
-        and return memory conditioned on a pooled-token-embedding query.
+        """Non-streaming forward — only used by older code paths. For QA,
+        compute_qa_loss handles the streaming write + per-position read hook.
+        Here we just ingest the input as one window and return empty memory.
         """
         del mask_positions
         B = token_embeds.shape[0]
@@ -1599,11 +1610,4 @@ class PlasticBaselineEncoder(nn.Module):
         dtype = token_embeds.dtype
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
-        # Use the input tokens themselves as the "question" — degenerate
-        # but lets this forward stand on its own for diagnostics.
-        state = self.stash_question(
-            state, token_embeds,
-            attention_mask if attention_mask is not None
-            else torch.ones(B, token_embeds.shape[1], dtype=torch.bool, device=device),
-        )
         return self.finalize_memory(state)
