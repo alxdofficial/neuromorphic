@@ -226,14 +226,18 @@ class ReprConfig:
 
     # ── Graph substrate (Exp 1) ───────────────────────────────────────────
     # See docs/exp1_graph_baseline.md for design.
-    # K_max=68, d_node=d_state=128 → bottleneck K_max·(2·d_node + d_state)
-    # = 68 · 384 = 26,112 floats (matches A/B/MT/Mamba's 26,100 band).
+    # K_max=68, d_node=d_state=128. Bottleneck convention matches splat:
+    # K_max·(2·d_node + d_state + 1) = 68·385 = 26,180 floats — counts all
+    # per-edge floats including the saliency_logit scalar (same precedent as
+    # splat's w_raw/s_logit counting). 0.3% over the 26,100 baselines band.
     graph_K_max: int = 68          # edge budget
     graph_d_node: int = 128        # endpoint dim
     graph_d_state: int = 128       # edge state dim
-    graph_updater_layers: int = 3  # transformer-updater depth
-    graph_d_updater: int = 256     # updater token dim
-    graph_d_proj_hidden: int = 256 # fused edge → d_llama projection MLP hidden
+    # Updater + projection scaling chosen to land at ~14-15M trainable params
+    # (matches A/B/MT/Mamba's 12.5-14.9M band).
+    graph_updater_layers: int = 4  # transformer-updater depth
+    graph_d_updater: int = 384     # updater token dim
+    graph_d_proj_hidden: int = 1024 # fused edge → d_llama projection MLP hidden
     # Auxiliary loss coefficients (pre-normalized; pure importance weights).
     graph_lambda_connect: float = 0.1   # snap-when-similar pressure
     graph_lambda_adjust: float = 0.05   # saliency-weighted proximal pressure on edges
