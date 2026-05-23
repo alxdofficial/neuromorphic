@@ -1528,20 +1528,19 @@ class PlasticBaselineEncoder(nn.Module):
                        context with no memory). If None, treated as zeros.
         """
         del chunk_offset  # plasticity is order-agnostic at the moment
-        # Cast Llama-side embeddings to substrate (fp32) dtype for stable plasticity.
-        w_dtype = next(self.token_proj.parameters()).dtype
-        token_embeds = token_embeds.to(w_dtype)
-        x = self.token_proj(token_embeds)                            # [B, T_w, h_sub]
-        B, T_w, _ = x.shape
-        if surprise is None:
-            surprise = torch.zeros(B, T_w, device=x.device, dtype=x.dtype)
-        else:
-            surprise = surprise.to(x.dtype)
-        # Ensure fast_state dtype matches substrate compute dtype.
-        fast_state = [w.to(x.dtype) for w in state["fast_state"]]
-        new_fast = self.substrate.write_window(
-            x, surprise, fast_state, attention_mask=attention_mask,
-        )
+        # Substrate runs in bf16 (matches Llama's dtype) for tensor-core speed.
+        # Parameter weights are fp32; autocast handles the mixed-precision matmul.
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            x = self.token_proj(token_embeds)                        # [B, T_w, h_sub]
+            B, T_w, _ = x.shape
+            if surprise is None:
+                surprise = torch.zeros(B, T_w, device=x.device, dtype=x.dtype)
+            else:
+                surprise = surprise.to(x.dtype)
+            fast_state = [w.to(x.dtype) for w in state["fast_state"]]
+            new_fast = self.substrate.write_window(
+                x, surprise, fast_state, attention_mask=attention_mask,
+            )
         state = dict(state)
         state["fast_state"] = new_fast
         return state, {}
@@ -1581,15 +1580,13 @@ class PlasticBaselineEncoder(nn.Module):
         Returns hidden_states + scale ⊙ W_out(substrate.read(W_in(hidden_states))).
         """
         h_dtype = hidden_states.dtype
-        w_dtype = next(self.W_in.parameters()).dtype
-        h = hidden_states.to(w_dtype) if h_dtype != w_dtype else hidden_states
-
-        h_mem = self.W_in(h)                                       # [B, T, h_sub]
-        # Cast fast_state to substrate dtype (idempotent if already matching)
-        fs = [w.to(w_dtype) for w in fast_state]
-        readout = self.substrate.read(h_mem, fs)                   # [B, T, h_sub]
-        eff_scale = self.scale_max * torch.tanh(self.scale_raw)    # [d_llama]
-        inj = eff_scale * self.W_out(readout)                       # [B, T, d_llama]
+        # Substrate runs in bf16; autocast handles fp32-weight × bf16-input.
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            h_mem = self.W_in(hidden_states)                       # [B, T, h_sub]
+            fs = [w.to(h_mem.dtype) for w in fast_state]
+            readout = self.substrate.read(h_mem, fs)               # [B, T, h_sub]
+            eff_scale = self.scale_max * torch.tanh(self.scale_raw) # [d_llama]
+            inj = eff_scale * self.W_out(readout)                  # [B, T, d_llama]
 
         out = hidden_states + (inj.to(h_dtype) if inj.dtype != h_dtype else inj)
         return out
