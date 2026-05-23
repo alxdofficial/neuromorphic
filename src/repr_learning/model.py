@@ -495,10 +495,16 @@ class ReprLearningModel(nn.Module):
         # ---- 1. Encode context (no_grad embed lookup) ----
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)
-            # Plastic variant: also compute per-token surprise from a frozen-
-            # Llama forward over context with no memory injected. The surprise
-            # is the bio signal that gates plasticity strength during write.
-            if self.variant == "plastic_baseline":
+            # Plastic variant + surprise enabled: extra frozen-Llama forward
+            # over the full context to compute per-token NLL as the
+            # neuromodulator signal. Off by default — the surprise pass on
+            # 4096 tokens is the dominant cost (6× slowdown). Re-enable via
+            # cfg.plastic_use_surprise for ablation.
+            use_surprise = (
+                self.variant == "plastic_baseline"
+                and getattr(self.cfg, "plastic_use_surprise", False)
+            )
+            if use_surprise:
                 ctx_logits = self.decoder.llama(
                     input_ids=batch.context_ids,
                     attention_mask=batch.context_mask.to(torch.long),

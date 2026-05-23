@@ -212,6 +212,18 @@ class ReprConfig:
     save_every: int = 5000
     eval_every: int = 1000
 
+    # ── Plastic substrate (Exp 2) ──────────────────────────────────────────
+    # Depth of the substrate stack. D=8 puts plastic at ~13M trainable
+    # params (matching the 12.5-14.9M band of the other memory variants).
+    plastic_depth: int = 8
+    # When False, the plasticity controller receives surprise=0 instead of
+    # the per-token Llama NLL. The extra Llama-on-context forward dominates
+    # plastic's per-step cost (6× slowdown vs other variants), so keeping
+    # it off matches step time. Re-enable for ablation studies.
+    plastic_use_surprise: bool = False
+    # Llama layer index at which to inject the per-position memory readout.
+    plastic_inject_layer: int = 8
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42
     device: str = "cuda"
