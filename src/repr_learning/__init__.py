@@ -12,6 +12,7 @@ from .model import ReprLearningModel
 from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
+    GraphBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     PlasticBaselineEncoder,
@@ -30,5 +31,6 @@ __all__ = [
     "RecurrentBaselineEncoder",
     "PlasticBaselineEncoder",
     "SplatBaselineEncoder",
+    "GraphBaselineEncoder",
     "NullEncoder",
 ]

@@ -1610,6 +1610,227 @@ class PlasticBaselineEncoder(nn.Module):
         return self.finalize_memory(state)
 
 
+class GraphBaselineEncoder(nn.Module):
+    """Exp 1: graph baseline. Bounded-budget edge memory with continuous
+    (src, dst, state) tuples and soft node-reuse via attention snap.
+
+    Substrate: K_max edges in continuous space (no codebook). Per window,
+    the updater transformer reads (encoded pins + current edges) and
+    proposes (src, dst, state, snap_gates, keep_gate, saliency_delta) per
+    slot. Proposed endpoints are soft-snapped to existing endpoints to
+    encourage graph connectivity.
+
+    Read: K_max edge tokens prepended to Llama input. Each token =
+    fused MLP of concat(src, dst, state, saliency_emb). Same prepend
+    pattern as B/MT — no MemInject hook.
+
+    See docs/exp1_graph_baseline.md.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        self.K_max = cfg.graph_K_max
+        self.d_node = cfg.graph_d_node
+        self.d_state = cfg.graph_d_state
+        self.d_updater = cfg.graph_d_updater
+        self.n_updater_layers = cfg.graph_updater_layers
+
+        self.lambda_connect = cfg.graph_lambda_connect
+        self.lambda_adjust = cfg.graph_lambda_adjust
+
+        from .graph_substrate import GraphUpdater
+
+        # Pin encoder: project Llama token embeds → updater dim
+        self.pin_encoder = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.d_updater * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(self.d_updater * 2, self.d_updater),
+            nn.LayerNorm(self.d_updater),
+        )
+
+        self.updater = GraphUpdater(
+            d=self.d_updater,
+            K_max=self.K_max,
+            d_node=self.d_node,
+            d_state=self.d_state,
+            n_layers=self.n_updater_layers,
+            n_heads=4,
+            ffn_mult=4,
+        )
+
+        # Fused edge → memory token projection
+        # Input: concat(src, dst, state, saliency_scalar) → d_proj_hidden → d_llama
+        edge_concat_dim = 2 * self.d_node + self.d_state + 1
+        self.proj_to_llama = nn.Sequential(
+            nn.Linear(edge_concat_dim, cfg.graph_d_proj_hidden), nn.GELU(),
+            nn.Linear(cfg.graph_d_proj_hidden, cfg.d_llama),
+            nn.LayerNorm(cfg.d_llama),
+        )
+
+    # ── Streaming interface ───────────────────────────────────────────────
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        from .graph_substrate import init_graph_state
+        edges = init_graph_state(
+            batch_size, self.K_max, self.d_node, self.d_state,
+            device, dtype=next(self.pin_encoder.parameters()).dtype,
+        )
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return {
+            "edges": edges,
+            "aux_accum": zero.clone(),
+            "L_connect_accum": zero.clone(),
+            "L_adjust_accum": zero.clone(),
+            "n_windows": 0,
+        }
+
+    def streaming_write(
+        self, state, token_embeds, attention_mask=None, chunk_offset=0,
+    ):
+        """One write pass over a window. Updates all K_max edge slots via
+        the transformer-updater + soft-snap on endpoints."""
+        del chunk_offset
+        from .graph_substrate import soft_snap, loss_connectivity, loss_adjust
+
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        token_embeds = token_embeds.to(w_dtype)
+
+        # All-padded window: substrate unchanged
+        if attention_mask is not None and not attention_mask.any():
+            return state, {}
+
+        # Encode pins
+        pins = self.pin_encoder(token_embeds)                    # [B, T_w, d_updater]
+        if attention_mask is not None:
+            pins_pad_mask = ~attention_mask
+            all_pad_rows = pins_pad_mask.all(dim=-1)
+            if all_pad_rows.any():
+                pins_pad_mask = pins_pad_mask.clone()
+                pins_pad_mask[all_pad_rows, 0] = False
+            has_real = attention_mask.any(dim=-1)
+        else:
+            pins_pad_mask = None
+            has_real = None
+
+        edges_old = state["edges"]
+        proposed, gates = self.updater(pins, edges_old, pins_pad_mask=pins_pad_mask)
+
+        # Soft snap: resolve proposed endpoints against the bank of existing
+        # endpoints. endpoint_bank = concat all old src+dst across slots.
+        endpoint_bank = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
+        # [B, 2*K_max, d_node]
+        snapped_src, max_sim_src = soft_snap(
+            proposed["src"], endpoint_bank, gates["snap_gate_src"],
+        )
+        snapped_dst, max_sim_dst = soft_snap(
+            proposed["dst"], endpoint_bank, gates["snap_gate_dst"],
+        )
+
+        # Apply keep_gate: preserve old vs use snapped proposal
+        kg = gates["keep_gate"].unsqueeze(-1)
+        edges_new = {
+            "src": kg * edges_old["src"] + (1 - kg) * snapped_src,
+            "dst": kg * edges_old["dst"] + (1 - kg) * snapped_dst,
+            "state": kg * edges_old["state"]
+                     + (1 - kg) * proposed["state"],
+            "saliency_logit": proposed["saliency_logit"],
+        }
+
+        # Per-row all-pad protection on the edges update
+        if attention_mask is not None:
+            has_real_f = has_real.to(w_dtype)
+            keep_mask = has_real_f.view(-1, 1, 1)
+            keep_mask_1d = has_real_f.view(-1, 1)
+            edges_new = {
+                "src": edges_new["src"] * keep_mask + edges_old["src"] * (1 - keep_mask),
+                "dst": edges_new["dst"] * keep_mask + edges_old["dst"] * (1 - keep_mask),
+                "state": edges_new["state"] * keep_mask + edges_old["state"] * (1 - keep_mask),
+                "saliency_logit": edges_new["saliency_logit"] * keep_mask_1d
+                                  + edges_old["saliency_logit"] * (1 - keep_mask_1d),
+            }
+
+        # Aux losses
+        L_connect = loss_connectivity(
+            gates["snap_gate_src"], gates["snap_gate_dst"],
+            max_sim_src, max_sim_dst,
+            has_real=has_real,
+        )
+        L_adj = loss_adjust(edges_new, edges_old, has_real=has_real)
+
+        weighted_aux = (
+            self.lambda_connect * L_connect
+            + self.lambda_adjust * L_adj
+        )
+
+        new_state = dict(state)
+        new_state["edges"] = edges_new
+        new_state["aux_accum"] = state["aux_accum"] + weighted_aux
+        new_state["L_connect_accum"] = state["L_connect_accum"] + L_connect.detach()
+        new_state["L_adjust_accum"] = state["L_adjust_accum"] + L_adj.detach()
+        new_state["n_windows"] = state["n_windows"] + 1
+        return new_state, {
+            "graph_L_connect": L_connect.detach(),
+            "graph_L_adjust": L_adj.detach(),
+        }
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        """Project K_max edges to d_llama memory tokens (fused per-edge MLP),
+        prepended by compute_qa_loss like the other prepend variants."""
+        edges = state["edges"]
+        B = edges["src"].shape[0]
+        device = edges["src"].device
+        dtype = next(self.proj_to_llama.parameters()).dtype
+
+        # Pack per-edge features: (src, dst, state, saliency_scalar)
+        sal = torch.sigmoid(edges["saliency_logit"]).unsqueeze(-1)    # [B, K_max, 1]
+        edge_feats = torch.cat([
+            edges["src"], edges["dst"], edges["state"], sal,
+        ], dim=-1)                                                     # [B, K_max, 2d_n+d_s+1]
+        memory = self.proj_to_llama(edge_feats.to(dtype))              # [B, K_max, d_llama]
+
+        n_w = max(state["n_windows"], 1)
+        graph_aux = state["aux_accum"] / n_w
+
+        with torch.no_grad():
+            sal_mean = torch.sigmoid(edges["saliency_logit"]).mean()
+            src_norm = edges["src"].norm(dim=-1).mean()
+            # Endpoint reuse diagnostic: average cosine between all (src, dst) endpoints
+            ep_bank = torch.cat([edges["src"], edges["dst"]], dim=1)   # [B, 2K, d]
+            ep_norm = F.normalize(ep_bank, dim=-1, eps=1e-6)
+            cos_matrix = ep_norm @ ep_norm.transpose(-1, -2)           # [B, 2K, 2K]
+            # Mean off-diagonal cosine — higher = more node reuse
+            K2 = ep_bank.shape[1]
+            off_diag_mask = ~torch.eye(K2, dtype=torch.bool, device=device)
+            ep_reuse = cos_matrix[:, off_diag_mask].mean()
+
+        aux = {
+            "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
+            "graph_aux": graph_aux,
+            "graph_L_connect": state["L_connect_accum"] / n_w,
+            "graph_L_adjust": state["L_adjust_accum"] / n_w,
+            "graph_saliency_mean": sal_mean,
+            "graph_src_norm": src_norm,
+            "graph_endpoint_reuse": ep_reuse,
+        }
+        return memory, aux
+
+    def forward(
+        self,
+        token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        mask_positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, dict]:
+        """Non-streaming forward — used by older code paths."""
+        del mask_positions
+        B = token_embeds.shape[0]
+        device = token_embeds.device
+        dtype = token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        return self.finalize_memory(state)
+
+
 class SplatBaselineEncoder(nn.Module):
     """Exp 3: Gaussian Splat baseline.
 

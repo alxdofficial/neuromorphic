@@ -224,21 +224,38 @@ class ReprConfig:
     # Llama layer index at which to inject the per-position memory readout.
     plastic_inject_layer: int = 8
 
+    # ── Graph substrate (Exp 1) ───────────────────────────────────────────
+    # See docs/exp1_graph_baseline.md for design.
+    # K_max=68, d_node=d_state=128 → bottleneck K_max·(2·d_node + d_state)
+    # = 68 · 384 = 26,112 floats (matches A/B/MT/Mamba's 26,100 band).
+    graph_K_max: int = 68          # edge budget
+    graph_d_node: int = 128        # endpoint dim
+    graph_d_state: int = 128       # edge state dim
+    graph_updater_layers: int = 3  # transformer-updater depth
+    graph_d_updater: int = 256     # updater token dim
+    graph_d_proj_hidden: int = 256 # fused edge → d_llama projection MLP hidden
+    # Auxiliary loss coefficients (pre-normalized; pure importance weights).
+    graph_lambda_connect: float = 0.1   # snap-when-similar pressure
+    graph_lambda_adjust: float = 0.05   # saliency-weighted proximal pressure on edges
+
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.
-    # K=51, d=256 → bottleneck K·(2d+2) = 26,214 floats (matches 26,100
-    # band of A/B/MT/Mamba prepend variants).
-    splat_K: int = 51              # number of signed Gaussian blobs (fixed)
-    splat_d: int = 256             # latent space dimensionality
-    splat_K_rays: int = 8          # ray probes per Llama position at read time
+    # v3 sweep: K=100, d=128 → bottleneck K·(2d+2) = 25,800 floats
+    # (matches 26,100 band of A/B/MT/Mamba). Roughly 2x more blobs vs v2
+    # (was K=51) at half the per-blob width; tests whether more cells help
+    # at the cost of narrower per-blob representation.
+    splat_K: int = 100             # number of signed Gaussian blobs (fixed)
+    splat_d: int = 128             # latent space dimensionality
+    splat_K_rays: int = 16         # ray probes per Llama position at read time
     splat_updater_layers: int = 3  # TransformerUpdater cross+self-attn depth
     splat_inject_layer: int = 8    # Llama layer to install the read pre-hook
-    # Auxiliary loss coefficients (importance weights — sublosses are
-    # internally normalized so these are pure relative-importance scalars).
+    # Auxiliary loss coefficients. v3 raises λ_adj 10× (v2 had L_adj=47.9 at
+    # convergence — blobs never stabilized) and λ_sat 50× (signs were
+    # saturating with old λ=0.001 contributing essentially nothing).
     splat_alpha_pin: float = 0.1
     splat_beta_prop: float = 0.1
-    splat_lambda_adj: float = 0.05
-    splat_lambda_sat: float = 0.001
+    splat_lambda_adj: float = 0.5
+    splat_lambda_sat: float = 0.05
 
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42

@@ -94,6 +94,15 @@ CRITICAL_PARAMS = {
         "encoder.read_post.0.weight",
         "encoder.scale_raw",
     ],
+    "graph_baseline": [
+        # Updater out_head drives all per-edge proposals + gates.
+        # Pin encoder gets QA gradient through the cross-attention.
+        # proj_to_llama projects edges into Llama's memory tokens.
+        "encoder.pin_encoder.0.weight",
+        "encoder.updater.out_head.weight",
+        "encoder.updater.edge_in_proj.weight",
+        "encoder.proj_to_llama.0.weight",
+    ],
     "vanilla_llama": [],  # no encoder params
 }
 
@@ -123,6 +132,10 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
         # (μ, log_diag_Σ, w_raw, s_logit). This is the "memory bottleneck"
         # for parity with prepend variants' M · d_node_state.
         return cfg.splat_K * (2 * cfg.splat_d + 2)
+    if variant == "graph_baseline":
+        # Graph memory is K_max edges, each (src, dst, state) + saliency_logit.
+        #   K_max · (2·d_node + d_state + 1)
+        return cfg.graph_K_max * (2 * cfg.graph_d_node + cfg.graph_d_state + 1)
     if variant == "vanilla_llama":
         return 0
     raise ValueError(variant)
@@ -174,13 +187,15 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
     recon = float(out["loss_recon"])
     aux = float(out["loss_aux"])
     aux_contrib = cfg.load_balance_coef * aux
-    # Splat: aux is pre-weighted and added directly (not via load_balance_coef).
+    # Splat / Graph: aux pre-weighted and added directly to total (not via load_balance_coef).
     splat_aux_contrib = float(out.get("splat_aux", 0.0) or 0.0)
-    total = recon + aux_contrib + splat_aux_contrib
-    pct = 100 * (aux_contrib + splat_aux_contrib) / max(total, 1e-6)
+    graph_aux_contrib = float(out.get("graph_aux", 0.0) or 0.0)
+    extra_aux = splat_aux_contrib + graph_aux_contrib
+    total = recon + aux_contrib + extra_aux
+    pct = 100 * (aux_contrib + extra_aux) / max(total, 1e-6)
     print(f"  [C] recon={recon:.3f}  aux_raw={aux:.3f}  "
           f"aux_contrib={aux_contrib:.3f}  splat_aux={splat_aux_contrib:.3f}  "
-          f"({pct:.1f}% of total)")
+          f"graph_aux={graph_aux_contrib:.3f}  ({pct:.1f}% of total)")
     aux_ok = pct < 50  # ad-hoc threshold
 
     # ---- (D) Memory shape ----
@@ -344,7 +359,7 @@ def main():
 
     variants = ["flat_baseline", "continuous_baseline", "memorizing_baseline",
                 "recurrent_baseline", "plastic_baseline", "splat_baseline",
-                "vanilla_llama"]
+                "graph_baseline", "vanilla_llama"]
 
     summary = []
     for v in variants:
@@ -373,6 +388,7 @@ def main():
         elif is_per_pos:
             delta_ok = abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA_PER_POS
         else:
+            # Includes graph_baseline as a prepend variant with full 0.1 threshold
             delta_ok = abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA
         aux_ok = r["aux_ok"]
         finite_ok = r["finite_loss"]
@@ -391,9 +407,10 @@ def main():
         if not (finite_ok and grads_ok and aux_ok and delta_ok and allpad_ok):
             all_ok = False
 
-    # Bottleneck parity check — plastic and splat are excluded because they
-    # use per-position reads (different bottleneck shape than prepend variants).
-    EXEMPT_VARIANTS = {"plastic_baseline", "splat_baseline"}
+    # Bottleneck parity check — plastic/splat use per-position reads (different
+    # shape than prepend variants); graph has K_max·(2d_n+d_s+1) which can't
+    # hit exact 26,100 with integer K. All three reported separately.
+    EXEMPT_VARIANTS = {"plastic_baseline", "splat_baseline", "graph_baseline"}
     bn_vals = [
         r["bottleneck"] for r in summary
         if r["bottleneck"] > 0 and r["variant"] not in EXEMPT_VARIANTS

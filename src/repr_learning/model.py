@@ -16,6 +16,7 @@ from .config import ReprConfig
 from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
+    GraphBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     PlasticBaselineEncoder,
@@ -48,6 +49,7 @@ class ReprLearningModel(nn.Module):
         "recurrent_baseline": RecurrentBaselineEncoder,
         "plastic_baseline": PlasticBaselineEncoder,
         "splat_baseline": SplatBaselineEncoder,
+        "graph_baseline": GraphBaselineEncoder,
         "vanilla_llama": NullEncoder,
     }
 
@@ -713,6 +715,19 @@ class ReprLearningModel(nn.Module):
                 "splat_L_adj": finalize_aux.get("splat_L_adj"),
                 "splat_L_sat": finalize_aux.get("splat_L_sat"),
             }
+
+        # Graph variant: pre-weighted aux (λ_connect·L_connect + λ_adj·L_adj)
+        graph_aux = finalize_aux.get("graph_aux", None)
+        graph_telemetry = None
+        if graph_aux is not None:
+            loss = loss + graph_aux.to(loss.dtype)
+            graph_telemetry = {
+                "graph_aux": graph_aux.detach(),
+                "graph_L_connect": finalize_aux.get("graph_L_connect"),
+                "graph_L_adjust": finalize_aux.get("graph_L_adjust"),
+                "graph_saliency_mean": finalize_aux.get("graph_saliency_mean"),
+                "graph_endpoint_reuse": finalize_aux.get("graph_endpoint_reuse"),
+            }
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;
@@ -741,6 +756,8 @@ class ReprLearningModel(nn.Module):
         }
         if splat_telemetry is not None:
             out.update(splat_telemetry)
+        if graph_telemetry is not None:
+            out.update(graph_telemetry)
         return out
 
     def compute_hsm_loss(
