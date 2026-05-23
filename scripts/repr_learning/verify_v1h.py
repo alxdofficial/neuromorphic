@@ -122,9 +122,7 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
         #   K · (d + d + 1 + 1) = K · (2d + 2)
         # (μ, log_diag_Σ, w_raw, s_logit). This is the "memory bottleneck"
         # for parity with prepend variants' M · d_node_state.
-        K = getattr(cfg, "splat_K", 51)
-        d = getattr(cfg, "splat_d", 256)
-        return K * (2 * d + 2)
+        return cfg.splat_K * (2 * cfg.splat_d + 2)
     if variant == "vanilla_llama":
         return 0
     raise ValueError(variant)
@@ -176,10 +174,13 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
     recon = float(out["loss_recon"])
     aux = float(out["loss_aux"])
     aux_contrib = cfg.load_balance_coef * aux
-    total = recon + aux_contrib
-    pct = 100 * aux_contrib / max(total, 1e-6)
+    # Splat: aux is pre-weighted and added directly (not via load_balance_coef).
+    splat_aux_contrib = float(out.get("splat_aux", 0.0) or 0.0)
+    total = recon + aux_contrib + splat_aux_contrib
+    pct = 100 * (aux_contrib + splat_aux_contrib) / max(total, 1e-6)
     print(f"  [C] recon={recon:.3f}  aux_raw={aux:.3f}  "
-          f"aux_contrib={aux_contrib:.3f}  ({pct:.1f}% of total)")
+          f"aux_contrib={aux_contrib:.3f}  splat_aux={splat_aux_contrib:.3f}  "
+          f"({pct:.1f}% of total)")
     aux_ok = pct < 50  # ad-hoc threshold
 
     # ---- (D) Memory shape ----

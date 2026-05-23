@@ -14,7 +14,9 @@ from .encoder import (
     FlatBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
+    PlasticBaselineEncoder,
     RecurrentBaselineEncoder,
+    SplatBaselineEncoder,
     V21Encoder,
 )
 
@@ -26,5 +28,7 @@ __all__ = [
     "ContinuousBaselineEncoder",
     "MemorizingBaselineEncoder",
     "RecurrentBaselineEncoder",
+    "PlasticBaselineEncoder",
+    "SplatBaselineEncoder",
     "NullEncoder",
 ]

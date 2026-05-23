@@ -700,10 +700,19 @@ class ReprLearningModel(nn.Module):
         )
         # Splat variant: pre-weighted aux total (alpha·L_pin + beta·L_prop +
         # lambda·L_adj + lambda_sat·L_sat) added directly; coefficients are
-        # already baked in by the encoder.
+        # already baked in by the encoder. We also stash the individual
+        # sublosses on `splat_telemetry` for trainer logging + audit.
         splat_aux = finalize_aux.get("splat_aux", None)
+        splat_telemetry = None
         if splat_aux is not None:
             loss = loss + splat_aux.to(loss.dtype)
+            splat_telemetry = {
+                "splat_aux": splat_aux.detach(),
+                "splat_L_pin": finalize_aux.get("splat_L_pin"),
+                "splat_L_prop": finalize_aux.get("splat_L_prop"),
+                "splat_L_adj": finalize_aux.get("splat_L_adj"),
+                "splat_L_sat": finalize_aux.get("splat_L_sat"),
+            }
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;
@@ -716,7 +725,7 @@ class ReprLearningModel(nn.Module):
             n_content_total = pred_mask.float().sum().clamp(min=1.0)
             top1_acc = ((preds_full == pred_targets) & pred_mask).float().sum() / n_content_total
 
-        return {
+        out = {
             "loss": loss,
             "loss_recon": loss_recon.detach(),
             "loss_aux": loss_aux.detach() if isinstance(loss_aux, Tensor) else loss_aux,
@@ -730,6 +739,9 @@ class ReprLearningModel(nn.Module):
             "per_example_loss": per_example_loss,             # [B] for per-family aggregation
             "aux": finalize_aux,
         }
+        if splat_telemetry is not None:
+            out.update(splat_telemetry)
+        return out
 
     def compute_hsm_loss(
         self,

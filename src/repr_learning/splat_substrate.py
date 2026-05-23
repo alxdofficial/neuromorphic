@@ -202,16 +202,19 @@ def ray_features(
 # ─────────────────────────────────────────────────────────────────────────
 
 def density_at_points(points: Tensor, blobs: dict) -> Tensor:
-    """ρ(p) = Σ_k s_k · w_k · N(p; μ_k, diag σ_k²).
+    """Normalized signed density at each point — the analogue of
+    `ray_features`'s I_total channel.
 
-    Used by L_pin (compute ρ at each pin). The same log-space technique:
-    drop the (2π)^{-d/2} prefactor (constant); compute per-blob log-density
-    minus its max for stability.
+    NOT the literal Gaussian mixture density. In d=256 the absolute density
+    is ~exp(-d) and underflows to zero, killing L_pin's gradient. We use
+    the *normalized* (max-subtracted) signed sum instead — it preserves
+    relative blob contributions and is bounded in (-K, +K], so the L_pin
+    hinge can compare it against a finite margin.
 
     points: [B, N, d]
-    Returns: [B, N]  signed density at each point (in arbitrary units —
-             the absolute scale is consistent across points so the L_pin
-             margin/hinge still makes sense relatively).
+    Returns: [B, N]  normalized signed "support" at each point.
+             Positive = supported by positive blobs.
+             Negative = carved out by negative blobs.
     """
     mu, _diag, inv_diag, log_det, w, s = derive_blob_quantities(blobs)
 
@@ -230,15 +233,13 @@ def density_at_points(points: Tensor, blobs: dict) -> Tensor:
 
     log_terms = log_abs_sw.unsqueeze(1) + log_gauss                  # [B, N, K]
     max_log = log_terms.max(dim=-1, keepdim=True).values             # [B, N, 1]
-    # Detach max_log in the subtraction (standard softmax stability trick:
-    # the argmax index shouldn't carry gradient). The exp(max_log) on the
-    # outside re-applies the absolute scale; that one is NOT detached, so
-    # the gradient through the scale is preserved.
+    # Standard softmax-stability subtraction with max detached. Do NOT
+    # reabsorb exp(max_log): at d=256 max_log ≈ -128 ⇒ exp underflows to
+    # literal 0 in fp32, killing gradient to mu/log_diag_sigma/w/s.
     norm_terms = torch.exp(log_terms - max_log.detach())             # [B, N, K]
 
-    signed_norm = (sign_sw.unsqueeze(1) * norm_terms).sum(dim=-1)    # [B, N]
-    rho = signed_norm * torch.exp(max_log).squeeze(-1)               # [B, N]
-    return rho
+    rho_norm = (sign_sw.unsqueeze(1) * norm_terms).sum(dim=-1)       # [B, N]
+    return rho_norm
 
 
 def loss_pin(
@@ -247,11 +248,16 @@ def loss_pin(
     blobs: dict,
     margin: float = 1.0,
 ) -> Tensor:
-    """L_pin = mean over real pins of softplus(margin - ρ(p)).
+    """L_pin = mean over real pins of softplus(margin - ρ_norm(p)).
 
-    A pin in negative density is penalized hardest. A pin in flat (ρ ≈ 0)
-    region gets margin pressure. A pin already in a well-supported region
-    (ρ > margin) is satisfied.
+    `ρ_norm` is the *normalized* signed density from density_at_points
+    (in (-K, +K] range), NOT the absolute Gaussian density (which
+    underflows at d=256). A pin in a negative-supported region is
+    penalized hardest. A pin near no blob (ρ_norm ≈ 0) gets margin
+    pressure. A pin in a well-supported region (ρ_norm > margin) is
+    satisfied.
+
+    All-padded rows contribute zero since `pins_mask` zeros them out.
     """
     rho = density_at_points(pins, blobs)                             # [B, N]
     penalty = F.softplus(margin - rho)                               # [B, N]
@@ -264,6 +270,19 @@ def loss_pin(
     return loss
 
 
+def _row_mean(per_row: Tensor, has_real: Optional[Tensor]) -> Tensor:
+    """Average per-row loss values, masking out rows with no real pins.
+
+    All-pad rows would otherwise contribute spurious pressure (e.g. comparing
+    blob_mass against a clamped N=1 target). Skip them entirely.
+    """
+    if has_real is None:
+        return per_row.mean()
+    mask = has_real.to(per_row.dtype)                                 # [B]
+    n_real = mask.sum().clamp(min=1.0)
+    return (per_row * mask).sum() / n_real
+
+
 def loss_proportional(
     pins_mask: Optional[Tensor],   # [B, N]
     blobs: dict,
@@ -271,33 +290,37 @@ def loss_proportional(
 ) -> Tensor:
     """L_proportional = ((Σ_k s_k · w_k − N_pins) / N_pins)²
 
-    Mass-balance: total signed blob mass should match the number of pins
-    (under the unit target_mass_per_pin convention). Order-1 in normalized
-    form.
+    Mass-balance: total signed blob mass should match the number of pins.
+    Per-row, then averaged over rows that *have* real pins (all-pad rows
+    are skipped — otherwise the clamped N=1 target adds bogus pressure).
     """
     _, _, _, _, w, s = derive_blob_quantities(blobs)
     blob_mass = (s * w).sum(dim=-1)                                  # [B]
 
     if pins_mask is not None:
-        N = pins_mask.to(w.dtype).sum(dim=-1).clamp(min=1.0)         # [B]
+        N_raw = pins_mask.to(w.dtype).sum(dim=-1)                    # [B]
+        has_real = N_raw > 0
+        N = N_raw.clamp(min=1.0)
     else:
         N = torch.full_like(blob_mass, w.shape[1])
+        has_real = None
 
     target = target_mass_per_pin * N
     rel_err = (blob_mass - target) / N                               # [B]
-    return rel_err.pow(2).mean()
+    return _row_mean(rel_err.pow(2), has_real)
 
 
-def loss_adjust(blobs_new: dict, blobs_old: dict) -> Tensor:
+def loss_adjust(
+    blobs_new: dict, blobs_old: dict,
+    has_real: Optional[Tensor] = None,
+) -> Tensor:
     """L_adjust = mass-weighted sum of W₂² between matched old/new blobs.
 
     For diagonal Σ:
         W₂²(N(μ₁, σ₁²), N(μ₂, σ₂²))  =  ‖μ₁ − μ₂‖²  +  ‖σ₁ − σ₂‖²
 
     γ_k = w_k_old — established blobs are stickier.
-    Normalized by Σ_k γ_k so the coefficient is a pure importance weight.
-
-    Plus a small per-blob (Δw)² term and (Δs_logit)² term.
+    Per-row mass-weighted average, then averaged over rows with real pins.
     """
     _, _, _, _, w_old, s_old = derive_blob_quantities(blobs_old)
     _, _, _, _, w_new, s_new = derive_blob_quantities(blobs_new)
@@ -305,11 +328,9 @@ def loss_adjust(blobs_new: dict, blobs_old: dict) -> Tensor:
     mu_old = blobs_old["mu"]                                         # [B, K, d]
     mu_new = blobs_new["mu"]
     # log_diag_sigma stores log σ² (variance). exp(0.5 · log σ²) = σ (std dev).
-    # The W₂² formula for diagonal Gaussians uses the per-dim std dev.
     sigma_old = torch.exp(0.5 * blobs_old["log_diag_sigma"])
     sigma_new = torch.exp(0.5 * blobs_new["log_diag_sigma"])
 
-    # W₂² per blob for diagonal Σ:
     w2_mu = (mu_new - mu_old).pow(2).sum(dim=-1)                     # [B, K]
     w2_sigma = (sigma_new - sigma_old).pow(2).sum(dim=-1)            # [B, K]
     w2_per_blob = w2_mu + w2_sigma                                   # [B, K]
@@ -317,21 +338,24 @@ def loss_adjust(blobs_new: dict, blobs_old: dict) -> Tensor:
     dw = (w_new - w_old).pow(2)                                      # [B, K]
     ds = (s_new - s_old).pow(2)                                      # [B, K]
 
-    gamma = w_old                                                    # [B, K]  stickiness
+    gamma = w_old                                                    # [B, K]
     denom = gamma.sum(dim=-1).clamp(min=1e-6)                        # [B]
 
     weighted = gamma * (w2_per_blob + dw + ds)                       # [B, K]
-    per_batch = weighted.sum(dim=-1) / denom                         # [B]
-    return per_batch.mean()
+    per_row = weighted.sum(dim=-1) / denom                           # [B]
+    return _row_mean(per_row, has_real)
 
 
-def loss_sign_saturation(blobs: dict, target: float = 0.3) -> Tensor:
-    """Tiny penalty: keep tanh(s_logit) bounded away from ±1 to preserve
-    gradient on the sign channel. Penalize tanh² exceeding `target`.
-    """
-    s = torch.tanh(blobs["s_logit"])
-    excess = (s.pow(2) - target).clamp(min=0.0)
-    return excess.mean()
+def loss_sign_saturation(
+    blobs: dict, has_real: Optional[Tensor] = None,
+    target: float = 0.3,
+) -> Tensor:
+    """Keep tanh(s_logit) bounded away from ±1 to preserve sign-channel
+    gradient. Per-row mean, then averaged over rows with real pins."""
+    s = torch.tanh(blobs["s_logit"])                                 # [B, K]
+    excess = (s.pow(2) - target).clamp(min=0.0)                      # [B, K]
+    per_row = excess.mean(dim=-1)                                    # [B]
+    return _row_mean(per_row, has_real)
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -243,6 +243,11 @@ def train_one_variant(
             "lr": lr,
             "memory_M": out["memory_shape"][1],
         }
+        # Splat-variant sublosses (only present when variant == splat_baseline)
+        for key in ("splat_aux", "splat_L_pin", "splat_L_prop",
+                    "splat_L_adj", "splat_L_sat"):
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         jsonl_fp.write(json.dumps(row) + "\n")
 
         if step % log_every == 0:

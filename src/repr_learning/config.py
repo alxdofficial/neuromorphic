@@ -224,6 +224,22 @@ class ReprConfig:
     # Llama layer index at which to inject the per-position memory readout.
     plastic_inject_layer: int = 8
 
+    # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
+    # See docs/exp3_gaussian_splat_baseline.md for full design.
+    # K=51, d=256 → bottleneck K·(2d+2) = 26,214 floats (matches 26,100
+    # band of A/B/MT/Mamba prepend variants).
+    splat_K: int = 51              # number of signed Gaussian blobs (fixed)
+    splat_d: int = 256             # latent space dimensionality
+    splat_K_rays: int = 8          # ray probes per Llama position at read time
+    splat_updater_layers: int = 3  # TransformerUpdater cross+self-attn depth
+    splat_inject_layer: int = 8    # Llama layer to install the read pre-hook
+    # Auxiliary loss coefficients (importance weights — sublosses are
+    # internally normalized so these are pure relative-importance scalars).
+    splat_alpha_pin: float = 0.1
+    splat_beta_prop: float = 0.1
+    splat_lambda_adj: float = 0.05
+    splat_lambda_sat: float = 0.001
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42
     device: str = "cuda"

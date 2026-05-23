@@ -1635,19 +1635,18 @@ class SplatBaselineEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Substrate dimensions
-        self.d = getattr(cfg, "splat_d", 256)
-        self.K = getattr(cfg, "splat_K", 51)
-        self.K_rays = getattr(cfg, "splat_K_rays", 8)
-        self.n_updater_layers = getattr(cfg, "splat_updater_layers", 3)
-        # Llama layer to inject memory at
-        self.inject_layer_idx = getattr(cfg, "splat_inject_layer", 8)
+        # Substrate dimensions (typed ReprConfig fields — see config.py)
+        self.d = cfg.splat_d
+        self.K = cfg.splat_K
+        self.K_rays = cfg.splat_K_rays
+        self.n_updater_layers = cfg.splat_updater_layers
+        self.inject_layer_idx = cfg.splat_inject_layer
 
         # Aux loss coefficients (importance weights; losses are pre-normalized)
-        self.alpha_pin = getattr(cfg, "splat_alpha_pin", 0.1)
-        self.beta_prop = getattr(cfg, "splat_beta_prop", 0.1)
-        self.lambda_adj = getattr(cfg, "splat_lambda_adj", 0.05)
-        self.lambda_sat = getattr(cfg, "splat_lambda_sat", 0.001)
+        self.alpha_pin = cfg.splat_alpha_pin
+        self.beta_prop = cfg.splat_beta_prop
+        self.lambda_adj = cfg.splat_lambda_adj
+        self.lambda_sat = cfg.splat_lambda_sat
 
         from .splat_substrate import TransformerUpdater
 
@@ -1723,9 +1722,14 @@ class SplatBaselineEncoder(nn.Module):
             batch_size, self.K, self.d, device,
             dtype=next(self.pin_encoder.parameters()).dtype,
         )
+        zero = torch.zeros((), device=device, dtype=torch.float32)
         return {
             "blobs": blobs,
-            "aux_accum": torch.zeros((), device=device, dtype=torch.float32),
+            "aux_accum": zero.clone(),
+            "L_pin_accum": zero.clone(),
+            "L_prop_accum": zero.clone(),
+            "L_adj_accum": zero.clone(),
+            "L_sat_accum": zero.clone(),
             "n_windows": 0,
         }
 
@@ -1782,12 +1786,17 @@ class SplatBaselineEncoder(nn.Module):
                       + blobs_old["s_logit"] * (1 - has_real.view(-1, 1)),
             }
 
-        # Per-window aux losses
+        # Per-window aux losses — masked by has_real so all-padded rows
+        # don't contribute spurious pressure to L_prop / L_adj / L_sat.
         pins_real_mask = attention_mask if attention_mask is not None else None
+        if attention_mask is not None:
+            has_real_rows = attention_mask.any(dim=-1)              # [B]
+        else:
+            has_real_rows = None
         L_pin = loss_pin(pins, pins_real_mask, blobs_new)
         L_prop = loss_proportional(pins_real_mask, blobs_new)
-        L_adj = loss_adjust(blobs_new, blobs_old)
-        L_sat = loss_sign_saturation(blobs_new)
+        L_adj = loss_adjust(blobs_new, blobs_old, has_real=has_real_rows)
+        L_sat = loss_sign_saturation(blobs_new, has_real=has_real_rows)
 
         weighted_aux = (
             self.alpha_pin * L_pin
@@ -1799,6 +1808,12 @@ class SplatBaselineEncoder(nn.Module):
         new_state = dict(state)
         new_state["blobs"] = blobs_new
         new_state["aux_accum"] = state["aux_accum"] + weighted_aux
+        # Accumulate sublosses separately for telemetry (averaged in finalize)
+        for key, val in [
+            ("L_pin_accum", L_pin), ("L_prop_accum", L_prop),
+            ("L_adj_accum", L_adj), ("L_sat_accum", L_sat),
+        ]:
+            new_state[key] = state.get(key, torch.zeros((), device=val.device, dtype=val.dtype)) + val.detach()
         new_state["n_windows"] = state["n_windows"] + 1
         return new_state, {
             # Per-window diagnostics (detached, for jsonl logging)
@@ -1811,7 +1826,11 @@ class SplatBaselineEncoder(nn.Module):
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
         """Returns empty memory + blobs in aux (read happens via inject hook
         in compute_qa_loss). The accumulated aux loss is averaged over windows
-        and packed under `splat_aux` for direct addition to total loss."""
+        and packed under `splat_aux` for direct addition to total loss.
+
+        Individual splat sublosses (L_pin/L_prop/L_adj/L_sat, averaged) are
+        also surfaced as detached scalars for trainer logging + audit.
+        """
         blobs = state["blobs"]
         B = blobs["mu"].shape[0]
         device = blobs["mu"].device
@@ -1825,11 +1844,20 @@ class SplatBaselineEncoder(nn.Module):
             sign_abs = torch.tanh(blobs["s_logit"]).abs().mean()
             w_mean = F.softplus(blobs["w_raw"]).mean()
             mu_norm = blobs["mu"].norm(dim=-1).mean()
+            L_pin_avg = state["L_pin_accum"] / n_w
+            L_prop_avg = state["L_prop_accum"] / n_w
+            L_adj_avg = state["L_adj_accum"] / n_w
+            L_sat_avg = state["L_sat_accum"] / n_w
 
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
             "splat_aux": splat_aux,
             "splat_blobs": blobs,
+            # Surfaced for trainer logging + verify_v1h aux dominance check
+            "splat_L_pin": L_pin_avg,
+            "splat_L_prop": L_prop_avg,
+            "splat_L_adj": L_adj_avg,
+            "splat_L_sat": L_sat_avg,
             # Diagnostics
             "splat_sign_abs_mean": sign_abs,
             "splat_w_mean": w_mean,
