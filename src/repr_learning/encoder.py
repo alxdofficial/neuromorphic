@@ -1436,3 +1436,174 @@ class RecurrentBaselineEncoder(nn.Module):
             "h_pooled_norm": h_pooled.norm(dim=-1).mean(),
         }
         return memory, aux
+
+
+class PlasticBaselineEncoder(nn.Module):
+    """Exp 2: plastic substrate — stack of gated-MLP blocks whose weights
+    are updated by a Hebbian + Oja basis modulated by a learnable per-block
+    controller. The substrate ENCODES the context into its weight state.
+
+    Streaming write (per window):
+      tokens [B, T_w, d_llama] → project to h_sub → PlasticSubstrate.write_window
+      The substrate's fast-weight state [D × B × h × h] mutates across windows.
+      Gradient flows through plasticity steps within the chunk (chunk-bounded
+      BPTT: detach at chunk boundary, not at window boundary).
+
+    Read (question-conditioned, one read per chunk for first cut):
+      pooled question embed → ReadHead → M conditioning vectors of h_sub each
+                            → PlasticSubstrate.read (weights frozen)
+                            → M memory tokens of h_sub each
+                            → project to d_llama → memory tokens prepended
+
+    Bottleneck (matched to A/B/MT/Mamba at v1h scale):
+      M × h_sub = 36 × 725 = 26,100 floats per read call.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        # Substrate dimensions — keep h_sub matched to baselines' per-slot dim
+        # so the per-read bottleneck (M × h_sub) is identical.
+        self.h_sub = cfg.d_continuous  # 725
+        self.M = cfg.n_flat_codes      # 36 in v1h
+        self.D = getattr(cfg, "plastic_depth", 4)
+
+        from .plastic_substrate import PlasticSubstrate, ReadHead
+
+        # Project Llama-side d_llama → h_sub for substrate input
+        self.token_proj = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.h_sub, bias=False),
+            nn.LayerNorm(self.h_sub),
+        )
+
+        self.substrate = PlasticSubstrate(D=self.D, h_sub=self.h_sub)
+
+        # ReadHead: pooled-question d_llama vector → M conditioning vectors of h_sub
+        self.read_head = ReadHead(
+            d_in=cfg.d_llama, h_sub=self.h_sub, M=self.M,
+        )
+
+        # Final projection h_sub → d_llama for prepending to Llama input
+        self.proj_to_llama = nn.Sequential(
+            nn.Linear(self.h_sub, cfg.d_llama // 2), nn.GELU(),
+            nn.Linear(cfg.d_llama // 2, cfg.d_llama),
+            nn.LayerNorm(cfg.d_llama),
+        )
+
+    # ── Streaming interface (matches other encoders) ──────────────────────
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """State is a dict: fast weights for the substrate, plus a buffer of
+        the question embedding that will be passed into read_for_query later.
+        The caller stashes question_embeds via `state['question_embeds']`
+        before calling finalize_memory / read_for_query.
+        """
+        fast = self.substrate.init_fast_state(batch_size, device, dtype)
+        return {
+            "fast_state": fast,
+            "question_embeds": None,        # set by compute_qa_loss before read
+            "question_mask": None,
+        }
+
+    def streaming_write(
+        self, state, token_embeds, attention_mask=None, chunk_offset=0,
+        surprise=None,
+    ):
+        """One write pass over a window.
+
+        token_embeds : [B, T_w, d_llama]
+        attention_mask: [B, T_w] True where real (not padding)
+        surprise     : [B, T_w] per-token surprise (NLL from frozen Llama on
+                       context with no memory). If None, treated as zeros.
+        """
+        del chunk_offset  # plasticity is order-agnostic at the moment
+        # Cast Llama-side embeddings to substrate (fp32) dtype for stable plasticity.
+        w_dtype = next(self.token_proj.parameters()).dtype
+        token_embeds = token_embeds.to(w_dtype)
+        x = self.token_proj(token_embeds)                            # [B, T_w, h_sub]
+        B, T_w, _ = x.shape
+        if surprise is None:
+            surprise = torch.zeros(B, T_w, device=x.device, dtype=x.dtype)
+        else:
+            surprise = surprise.to(x.dtype)
+        # Ensure fast_state dtype matches substrate compute dtype.
+        fast_state = [w.to(x.dtype) for w in state["fast_state"]]
+        new_fast = self.substrate.write_window(
+            x, surprise, fast_state, attention_mask=attention_mask,
+        )
+        state = dict(state)
+        state["fast_state"] = new_fast
+        return state, {}
+
+    def stash_question(self, state, question_embeds, question_mask):
+        """Caller calls this between streaming_write and finalize_memory to
+        provide the read conditioning. Keeps the streaming interface unchanged
+        for the rest of the call chain.
+        """
+        state = dict(state)
+        state["question_embeds"] = question_embeds
+        state["question_mask"] = question_mask
+        return state
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        """Do the question-conditioned read and produce memory tokens."""
+        if state["question_embeds"] is None:
+            raise RuntimeError(
+                "PlasticBaselineEncoder.finalize_memory called without a "
+                "question stashed in state. compute_qa_loss must call "
+                "encoder.stash_question(state, question_embeds, question_mask) "
+                "before finalize_memory."
+            )
+        # Cast inputs to substrate compute dtype.
+        w_dtype = next(self.read_head.parameters()).dtype
+        q_embeds = state["question_embeds"].to(w_dtype)              # [B, T_q, d_llama]
+        q_mask = state["question_mask"]                              # [B, T_q]
+        # Pool question to a single d_llama vector (mean over real tokens)
+        m = q_mask.to(w_dtype).unsqueeze(-1)                         # [B, T_q, 1]
+        denom = m.sum(dim=1).clamp(min=1.0)                          # [B, 1]
+        pooled = (q_embeds * m).sum(dim=1) / denom                   # [B, d_llama]
+
+        cond = self.read_head(pooled)                                # [B, M, h_sub]
+        fast_state = [w.to(w_dtype) for w in state["fast_state"]]
+        mem_sub = self.substrate.read(cond, fast_state)              # [B, M, h_sub]
+        memory = self.proj_to_llama(mem_sub)                         # [B, M, d_llama]
+
+        # Diagnostic: norm of fast-weight state per block
+        with torch.no_grad():
+            fast_norms = torch.stack(
+                [w.flatten(1).norm(dim=-1).mean() for w in state["fast_state"]]
+            ).mean()
+        aux = {
+            "load_balance_loss": torch.zeros(
+                (), device=memory.device, dtype=memory.dtype,
+            ),
+            "fast_state_norm": fast_norms,
+            "mem_sub_norm": mem_sub.norm(dim=-1).mean(),
+        }
+        return memory, aux
+
+    def forward(
+        self,
+        token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        mask_positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, dict]:
+        """Non-streaming forward — used by the older sentence-recon code path.
+        For QA, compute_qa_loss drives streaming + stash_question + finalize.
+        Here we just write the whole chunk in one window with no surprise,
+        and return memory conditioned on a pooled-token-embedding query.
+        """
+        del mask_positions
+        B = token_embeds.shape[0]
+        device = token_embeds.device
+        dtype = token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        # Use the input tokens themselves as the "question" — degenerate
+        # but lets this forward stand on its own for diagnostics.
+        state = self.stash_question(
+            state, token_embeds,
+            attention_mask if attention_mask is not None
+            else torch.ones(B, token_embeds.shape[1], dtype=torch.bool, device=device),
+        )
+        return self.finalize_memory(state)

@@ -69,6 +69,18 @@ CRITICAL_PARAMS = {
     "recurrent_baseline": [
         "encoder.bottleneck.weight", "encoder.proj_to_llama.0.weight",
     ],
+    "plastic_baseline": [
+        # The slow inits get gradient through the read pass; the
+        # controllers get gradient through the chunk's write history.
+        # We check controllers.0.net.2 (the OUTPUT layer of the plasticity
+        # controller) because it's zero-init — net.0 sees zero grad at
+        # step 0 by design and warms up only once net.2 deviates from zero.
+        "encoder.substrate.blocks.0.W_slow",
+        "encoder.substrate.controllers.0.net.2.weight",
+        "encoder.read_head.queries",
+        "encoder.read_head.proj.weight",
+        "encoder.proj_to_llama.0.weight",
+    ],
     "vanilla_llama": [],  # no encoder params
 }
 
@@ -83,6 +95,9 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
         return cfg.n_flat_codes * cfg.d_mt_value
     if variant == "recurrent_baseline":
         return cfg.n_flat_codes * cfg.d_recurrent
+    if variant == "plastic_baseline":
+        # M conditioning vectors of h_sub (=d_continuous) read per call.
+        return cfg.n_flat_codes * cfg.d_continuous
     if variant == "vanilla_llama":
         return 0
     raise ValueError(variant)
@@ -170,18 +185,26 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
             state_b, _ = model.encoder.streaming_write(state_a, tok_embeds, attn_zero, chunk_offset=0)
 
             # Flatten state to a tensor for delta. State shape varies by variant —
-            # try the common 'slots' / 'bank' / Tensor cases.
+            # try the common 'slots' / 'bank' / Tensor / list-of-tensors / dict cases.
             def _state_to_tensor(s):
                 if isinstance(s, torch.Tensor):
-                    return s
-                if isinstance(s, dict):
-                    parts = [v for v in s.values() if isinstance(v, torch.Tensor)]
-                    if parts:
-                        return torch.cat([p.flatten() for p in parts])
+                    return s.flatten()
                 if isinstance(s, (tuple, list)):
-                    parts = [v for v in s if isinstance(v, torch.Tensor)]
+                    parts = []
+                    for v in s:
+                        sub = _state_to_tensor(v)
+                        if sub is not None:
+                            parts.append(sub)
                     if parts:
-                        return torch.cat([p.flatten() for p in parts])
+                        return torch.cat(parts)
+                if isinstance(s, dict):
+                    parts = []
+                    for v in s.values():
+                        sub = _state_to_tensor(v)
+                        if sub is not None:
+                            parts.append(sub)
+                    if parts:
+                        return torch.cat(parts)
                 return None
 
             ta = _state_to_tensor(state_a)
@@ -267,7 +290,7 @@ def main():
     print(f"  a content positions: {batch_mixed.answer_content_mask.sum(dim=1).tolist()}")
 
     variants = ["flat_baseline", "continuous_baseline", "memorizing_baseline",
-                "recurrent_baseline", "vanilla_llama"]
+                "recurrent_baseline", "plastic_baseline", "vanilla_llama"]
 
     summary = []
     for v in variants:

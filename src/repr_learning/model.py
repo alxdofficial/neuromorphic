@@ -18,6 +18,7 @@ from .encoder import (
     FlatBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
+    PlasticBaselineEncoder,
     RecurrentBaselineEncoder,
     V21Encoder,
 )
@@ -44,6 +45,7 @@ class ReprLearningModel(nn.Module):
         "continuous_baseline": ContinuousBaselineEncoder,
         "memorizing_baseline": MemorizingBaselineEncoder,
         "recurrent_baseline": RecurrentBaselineEncoder,
+        "plastic_baseline": PlasticBaselineEncoder,
         "vanilla_llama": NullEncoder,
     }
 
@@ -493,14 +495,45 @@ class ReprLearningModel(nn.Module):
         # ---- 1. Encode context (no_grad embed lookup) ----
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)
+            # Plastic variant: also embed the question now (read conditioning)
+            # and compute per-token surprise = frozen-Llama NLL with no memory.
+            # The surprise is the bio signal that gates plasticity strength.
+            if self.variant == "plastic_baseline":
+                q_embeds_for_read = embed(batch.question_ids)
+                # One Llama forward over context tokens, no memory injected.
+                # NLL[t] = -log p(t_k | t_{<k}). High = unpredictable token,
+                # write strongly. Low = predictable, skip.
+                ctx_logits = self.decoder.llama(
+                    input_ids=batch.context_ids,
+                    attention_mask=batch.context_mask.to(torch.long),
+                ).logits                                                  # [B, T_ctx, V]
+                log_probs = F.log_softmax(ctx_logits[:, :-1, :].float(), dim=-1)
+                tgt = batch.context_ids[:, 1:]                            # next-token targets
+                nll = -log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [B, T_ctx-1]
+                # Pad to T_ctx so we can window-slice cleanly. The first
+                # position has no prior context — give it 0 surprise.
+                ctx_surprise = F.pad(nll, (1, 0), value=0.0)              # [B, T_ctx]
+                # Mask out padded positions (they shouldn't drive plasticity).
+                ctx_surprise = ctx_surprise * batch.context_mask.to(ctx_surprise.dtype)
+            else:
+                q_embeds_for_read = None
+                ctx_surprise = None
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T_ctx)
+            extra = {}
+            if ctx_surprise is not None:
+                extra["surprise"] = ctx_surprise[:, s:e]
             state, _ = self.encoder.streaming_write(
                 state, ctx_embeds[:, s:e, :], batch.context_mask[:, s:e],
-                chunk_offset=s,
+                chunk_offset=s, **extra,
+            )
+        # Plastic: stash the question as read conditioning before finalize.
+        if self.variant == "plastic_baseline":
+            state = self.encoder.stash_question(
+                state, q_embeds_for_read, batch.question_mask,
             )
         memory, finalize_aux = self.encoder.finalize_memory(state)
         # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla
