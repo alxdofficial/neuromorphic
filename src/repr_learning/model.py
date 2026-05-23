@@ -20,6 +20,7 @@ from .encoder import (
     NullEncoder,
     PlasticBaselineEncoder,
     RecurrentBaselineEncoder,
+    SplatBaselineEncoder,
     V21Encoder,
 )
 from .decoder import FrozenLlamaDecoder
@@ -46,6 +47,7 @@ class ReprLearningModel(nn.Module):
         "memorizing_baseline": MemorizingBaselineEncoder,
         "recurrent_baseline": RecurrentBaselineEncoder,
         "plastic_baseline": PlasticBaselineEncoder,
+        "splat_baseline": SplatBaselineEncoder,
         "vanilla_llama": NullEncoder,
     }
 
@@ -603,27 +605,42 @@ class ReprLearningModel(nn.Module):
                     pred_targets[i, pred_pos] = batch.answer_ids[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
-        # Plastic variant: install a forward_pre_hook on the chosen Llama
-        # decoder layer that calls encoder.inject (W_in → substrate.read →
-        # W_out + scale, added as residual). Each position k queries the
-        # substrate with its own current h_k. The hook is removed in finally
-        # so the shared Llama module is unmodified across variants.
-        plastic_hook_handle = None
+        # Plastic/Splat variants: install a forward_pre_hook on the chosen
+        # Llama decoder layer that calls encoder.inject(hidden_states, state).
+        # The hook is removed in finally so the shared Llama module is
+        # unmodified across variants.
+        hook_handle = None
         if self.variant == "plastic_baseline":
-            fast_state = finalize_aux["plastic_fast_state"]
+            state_for_hook = finalize_aux["plastic_fast_state"]
             inject_layer_idx = self.encoder.inject_layer_idx
             encoder_ref = self.encoder
 
             def pre_hook(module, args, kwargs):
-                # args: (hidden_states, ...). We mutate args[0] via encoder.inject.
                 if not args:
                     return None
                 hidden_states = args[0]
-                injected = encoder_ref.inject(hidden_states, fast_state)
+                injected = encoder_ref.inject(hidden_states, state_for_hook)
                 new_args = (injected,) + args[1:]
                 return new_args, kwargs
 
-            plastic_hook_handle = (
+            hook_handle = (
+                self.decoder.llama.model.layers[inject_layer_idx]
+                .register_forward_pre_hook(pre_hook, with_kwargs=True)
+            )
+        elif self.variant == "splat_baseline":
+            blobs_for_hook = finalize_aux["splat_blobs"]
+            inject_layer_idx = self.encoder.inject_layer_idx
+            encoder_ref = self.encoder
+
+            def pre_hook(module, args, kwargs):
+                if not args:
+                    return None
+                hidden_states = args[0]
+                injected = encoder_ref.inject(hidden_states, blobs_for_hook)
+                new_args = (injected,) + args[1:]
+                return new_args, kwargs
+
+            hook_handle = (
                 self.decoder.llama.model.layers[inject_layer_idx]
                 .register_forward_pre_hook(pre_hook, with_kwargs=True)
             )
@@ -634,8 +651,8 @@ class ReprLearningModel(nn.Module):
                 attention_mask=attn_mask_full.to(torch.long),
             )
         finally:
-            if plastic_hook_handle is not None:
-                plastic_hook_handle.remove()
+            if hook_handle is not None:
+                hook_handle.remove()
 
         logits = out.logits                                    # [B, T_total, vocab]
         pred_logits_all = logits[:, :-1, :]                    # [B, T_total-1, vocab]
@@ -681,6 +698,12 @@ class ReprLearningModel(nn.Module):
             + self.cfg.codebook_orth_coef * loss_orth
             + self.cfg.z_loss_coef * loss_z
         )
+        # Splat variant: pre-weighted aux total (alpha·L_pin + beta·L_prop +
+        # lambda·L_adj + lambda_sat·L_sat) added directly; coefficients are
+        # already baked in by the encoder.
+        splat_aux = finalize_aux.get("splat_aux", None)
+        if splat_aux is not None:
+            loss = loss + splat_aux.to(loss.dtype)
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;

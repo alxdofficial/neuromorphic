@@ -82,6 +82,18 @@ CRITICAL_PARAMS = {
         "encoder.W_in.weight",
         "encoder.scale_raw",
     ],
+    "splat_baseline": [
+        # Updater output head writes the blob deltas; pin encoder + read
+        # heads carry gradient through the read injection. scale_raw is the
+        # gate that makes the injection nonzero from step 0.
+        "encoder.pin_encoder.0.weight",
+        "encoder.updater.out_head.weight",
+        "encoder.updater.blob_in_proj.weight",
+        "encoder.origin_head.0.weight",
+        "encoder.direction_head.0.weight",
+        "encoder.read_post.0.weight",
+        "encoder.scale_raw",
+    ],
     "vanilla_llama": [],  # no encoder params
 }
 
@@ -104,6 +116,15 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
         # one-shot M × h_sub bottleneck. We report h_sub as the per-call
         # width; verify_v1h's bottleneck-parity check is variant-aware below.
         return cfg.d_continuous
+    if variant == "splat_baseline":
+        # Splat memory is K signed Gaussian blobs in a shared latent space
+        # with diagonal Σ. Persistent state per batch element:
+        #   K · (d + d + 1 + 1) = K · (2d + 2)
+        # (μ, log_diag_Σ, w_raw, s_logit). This is the "memory bottleneck"
+        # for parity with prepend variants' M · d_node_state.
+        K = getattr(cfg, "splat_K", 51)
+        d = getattr(cfg, "splat_d", 256)
+        return K * (2 * d + 2)
     if variant == "vanilla_llama":
         return 0
     raise ValueError(variant)
@@ -253,6 +274,18 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
         model.encoder.inject = orig
         print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
               f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
+    elif variant == "splat_baseline":
+        # Splat: same inject-hook pattern as plastic. Override to no-op.
+        orig = model.encoder.inject
+        def zero_inject(hidden_states, blobs):
+            return hidden_states
+        model.encoder.inject = zero_inject
+        with torch.no_grad():
+            out_zm = model.compute_qa_loss(batch_mixed)
+        delta = float(out_zm["loss_recon"]) - recon
+        model.encoder.inject = orig
+        print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
+              f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
     else:
         # A/B/Mamba: override finalize_memory to return zeros
         orig = model.encoder.finalize_memory
@@ -309,7 +342,8 @@ def main():
     print(f"  a content positions: {batch_mixed.answer_content_mask.sum(dim=1).tolist()}")
 
     variants = ["flat_baseline", "continuous_baseline", "memorizing_baseline",
-                "recurrent_baseline", "plastic_baseline", "vanilla_llama"]
+                "recurrent_baseline", "plastic_baseline", "splat_baseline",
+                "vanilla_llama"]
 
     summary = []
     for v in variants:
@@ -328,14 +362,15 @@ def main():
     # zero-init fast weights), so we use a much looser threshold for it —
     # the gradient-flow check above is the real plumbing test for plastic.
     ZERO_MEM_MIN_ABS_DELTA = 0.1
-    ZERO_MEM_MIN_ABS_DELTA_PLASTIC = 1e-3
+    ZERO_MEM_MIN_ABS_DELTA_PER_POS = 1e-3   # per-position-read variants
+    PER_POS_VARIANTS = {"plastic_baseline", "splat_baseline"}
     for r in summary:
         is_vanilla = (r["variant"] == "vanilla_llama")
-        is_plastic = (r["variant"] == "plastic_baseline")
+        is_per_pos = r["variant"] in PER_POS_VARIANTS
         if is_vanilla:
             delta_ok = True
-        elif is_plastic:
-            delta_ok = abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA_PLASTIC
+        elif is_per_pos:
+            delta_ok = abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA_PER_POS
         else:
             delta_ok = abs(r["zero_mem_delta"]) >= ZERO_MEM_MIN_ABS_DELTA
         aux_ok = r["aux_ok"]
@@ -355,21 +390,22 @@ def main():
         if not (finite_ok and grads_ok and aux_ok and delta_ok and allpad_ok):
             all_ok = False
 
-    # Bottleneck parity check — plastic is excluded because it uses per-position
-    # reads (bandwidth h_sub per Llama position), not a one-shot prepended block.
-    # Its bottleneck shape is fundamentally different by design.
+    # Bottleneck parity check — plastic and splat are excluded because they
+    # use per-position reads (different bottleneck shape than prepend variants).
+    EXEMPT_VARIANTS = {"plastic_baseline", "splat_baseline"}
     bn_vals = [
         r["bottleneck"] for r in summary
-        if r["bottleneck"] > 0 and r["variant"] != "plastic_baseline"
+        if r["bottleneck"] > 0 and r["variant"] not in EXEMPT_VARIANTS
     ]
     if len(set(bn_vals)) == 1:
         print(f"\n  ✓ Bottleneck parity: all prepend variants at {bn_vals[0]:,} floats")
-        plastic_bn = next(
-            (r["bottleneck"] for r in summary if r["variant"] == "plastic_baseline"),
-            None,
-        )
-        if plastic_bn is not None:
-            print(f"    plastic: {plastic_bn:,} floats/position × T positions/chunk")
+        for v_name in EXEMPT_VARIANTS:
+            v_bn = next(
+                (r["bottleneck"] for r in summary if r["variant"] == v_name),
+                None,
+            )
+            if v_bn is not None:
+                print(f"    {v_name}: {v_bn:,} floats (variant-specific shape)")
     else:
         print(f"\n  ✗ FAIL: bottleneck mismatch: {sorted(set(bn_vals))}")
         all_ok = False

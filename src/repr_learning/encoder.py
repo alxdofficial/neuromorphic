@@ -1608,3 +1608,285 @@ class PlasticBaselineEncoder(nn.Module):
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         return self.finalize_memory(state)
+
+
+class SplatBaselineEncoder(nn.Module):
+    """Exp 3: Gaussian Splat baseline.
+
+    Memory is a fixed-K signed Gaussian mixture in a shared latent space.
+    Writes (per 1024-token window) call a TransformerUpdater that takes
+    (encoded pins + current blobs) → outputs target blob parameters. 4
+    write calls per 4096-token chunk; gradient flows through the BPTT chain
+    of all 4 updater calls.
+
+    Reads (per Llama position) emit K_rays ray directions and one origin
+    from h_llama. Each ray's response = closed-form signed line integral
+    of the density field. K_rays × 3 features (total, pos-only, neg-only)
+    per position, projected to d_llama, injected via the MemInject pre-hook.
+
+    Auxiliary losses (pin satisfaction, mass proportionality, proximal
+    stickiness, sign-saturation) are accumulated per-window during write
+    and packed into `aux["splat_aux"]` for compute_qa_loss to add.
+
+    See docs/exp3_gaussian_splat_baseline.md.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        # Substrate dimensions
+        self.d = getattr(cfg, "splat_d", 256)
+        self.K = getattr(cfg, "splat_K", 51)
+        self.K_rays = getattr(cfg, "splat_K_rays", 8)
+        self.n_updater_layers = getattr(cfg, "splat_updater_layers", 3)
+        # Llama layer to inject memory at
+        self.inject_layer_idx = getattr(cfg, "splat_inject_layer", 8)
+
+        # Aux loss coefficients (importance weights; losses are pre-normalized)
+        self.alpha_pin = getattr(cfg, "splat_alpha_pin", 0.1)
+        self.beta_prop = getattr(cfg, "splat_beta_prop", 0.1)
+        self.lambda_adj = getattr(cfg, "splat_lambda_adj", 0.05)
+        self.lambda_sat = getattr(cfg, "splat_lambda_sat", 0.001)
+
+        from .splat_substrate import TransformerUpdater
+
+        # Pin encoder: project Llama token embeds → latent d
+        self.pin_encoder = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.d * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(self.d * 2, self.d),
+            nn.LayerNorm(self.d),
+        )
+
+        # The transformer-updater that writes blob targets
+        self.updater = TransformerUpdater(
+            d=self.d, K=self.K,
+            n_layers=self.n_updater_layers,
+            n_heads=4, ffn_mult=4,
+        )
+
+        # ── Read path ──────────────────────────────────────────────
+        # Origin: per-position projection d_llama → d
+        self.origin_head = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.d, bias=False),
+            nn.LayerNorm(self.d),
+        )
+        # Directions: per-position projection d_llama → K_rays × d (low-rank for params)
+        self.direction_mid = self.d  # rank of the dir-head bottleneck
+        self.direction_head = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.direction_mid * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(self.direction_mid * 2, self.K_rays * self.d),
+        )
+        # Default xavier init — direction-magnitude doesn't matter (we
+        # normalize to unit vectors), but the gradient signal back through
+        # the unit-normalization needs the pre-norm vector to have
+        # non-vanishing magnitude.
+        with torch.no_grad():
+            for m in self.direction_head:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+
+        # Read post-projection: K_rays × 4 features → d_llama
+        # (channels: I_total, I_pos, I_neg, log_max/d — see ray_features)
+        self.ray_feat_per = 4
+        ray_feat_dim = self.K_rays * self.ray_feat_per
+        self.read_post = nn.Sequential(
+            nn.Linear(ray_feat_dim, cfg.d_llama, bias=False),
+            nn.GELU(),
+            nn.Linear(cfg.d_llama, cfg.d_llama),
+        )
+        # Default xavier; `scale_raw` (init 0.05) provides the small-injection
+        # bias. Aggressive gain=0.1 cascading kills grad signal at step 0.
+        with torch.no_grad():
+            for m in self.read_post:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+
+        # ReZero-style tanh-bounded scale for the residual injection
+        self.scale_max = 1.0
+        scale_init = 0.05
+        _scale_raw_init = float(
+            torch.atanh(torch.tensor(scale_init / self.scale_max))
+        )
+        self.scale_raw = nn.Parameter(
+            torch.full((cfg.d_llama,), _scale_raw_init),
+        )
+
+    # ── Streaming interface ───────────────────────────────────────────────
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        from .splat_substrate import init_splat_state
+        # Use the encoder's compute dtype (fp32 for splat — high-D Gaussians
+        # are precision-sensitive; cast inputs at the boundary).
+        blobs = init_splat_state(
+            batch_size, self.K, self.d, device,
+            dtype=next(self.pin_encoder.parameters()).dtype,
+        )
+        return {
+            "blobs": blobs,
+            "aux_accum": torch.zeros((), device=device, dtype=torch.float32),
+            "n_windows": 0,
+        }
+
+    def streaming_write(
+        self, state, token_embeds, attention_mask=None, chunk_offset=0,
+    ):
+        """One write pass over a window. Updates blobs via TransformerUpdater.
+        Computes per-window aux losses (pin/proportional/adjust/sign-sat)
+        and accumulates into state["aux_accum"]."""
+        del chunk_offset
+        from .splat_substrate import (
+            loss_pin, loss_proportional, loss_adjust, loss_sign_saturation,
+        )
+
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        token_embeds = token_embeds.to(w_dtype)
+
+        # All-padded window: the substrate must not change. Returning the
+        # state untouched satisfies the all-pad streaming-write invariant
+        # and avoids cross-attention NaN (softmax over all-masked keys).
+        if attention_mask is not None and not attention_mask.any():
+            return state, {}
+
+        # Encode pins
+        pins = self.pin_encoder(token_embeds)                    # [B, T_w, d]
+        if attention_mask is not None:
+            pins_pad_mask = ~attention_mask                       # True = padded
+            # Defensively unmask position 0 in any row that's all-padded
+            # (per-row protection — entire batch all-padded was handled above).
+            all_pad_rows = pins_pad_mask.all(dim=-1)
+            if all_pad_rows.any():
+                pins_pad_mask = pins_pad_mask.clone()
+                pins_pad_mask[all_pad_rows, 0] = False
+        else:
+            pins_pad_mask = None
+
+        blobs_old = state["blobs"]
+        blobs_new = self.updater(pins, blobs_old, pins_pad_mask=pins_pad_mask)
+
+        # Per-row all-padded protection on the blob update: rows whose pin
+        # window is all-padded should not have their blobs changed. We mask
+        # the update by gating the new blob params with has_real.
+        if attention_mask is not None:
+            has_real = attention_mask.any(dim=-1).to(w_dtype)    # [B]
+            keep = has_real.view(-1, 1, 1)                        # broadcast over (K, d)
+            blobs_new = {
+                "mu": blobs_new["mu"] * keep
+                      + blobs_old["mu"] * (1 - keep),
+                "log_diag_sigma": blobs_new["log_diag_sigma"] * keep
+                      + blobs_old["log_diag_sigma"] * (1 - keep),
+                "w_raw": blobs_new["w_raw"] * has_real.view(-1, 1)
+                      + blobs_old["w_raw"] * (1 - has_real.view(-1, 1)),
+                "s_logit": blobs_new["s_logit"] * has_real.view(-1, 1)
+                      + blobs_old["s_logit"] * (1 - has_real.view(-1, 1)),
+            }
+
+        # Per-window aux losses
+        pins_real_mask = attention_mask if attention_mask is not None else None
+        L_pin = loss_pin(pins, pins_real_mask, blobs_new)
+        L_prop = loss_proportional(pins_real_mask, blobs_new)
+        L_adj = loss_adjust(blobs_new, blobs_old)
+        L_sat = loss_sign_saturation(blobs_new)
+
+        weighted_aux = (
+            self.alpha_pin * L_pin
+            + self.beta_prop * L_prop
+            + self.lambda_adj * L_adj
+            + self.lambda_sat * L_sat
+        )
+
+        new_state = dict(state)
+        new_state["blobs"] = blobs_new
+        new_state["aux_accum"] = state["aux_accum"] + weighted_aux
+        new_state["n_windows"] = state["n_windows"] + 1
+        return new_state, {
+            # Per-window diagnostics (detached, for jsonl logging)
+            "splat_L_pin": L_pin.detach(),
+            "splat_L_prop": L_prop.detach(),
+            "splat_L_adj": L_adj.detach(),
+            "splat_L_sat": L_sat.detach(),
+        }
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        """Returns empty memory + blobs in aux (read happens via inject hook
+        in compute_qa_loss). The accumulated aux loss is averaged over windows
+        and packed under `splat_aux` for direct addition to total loss."""
+        blobs = state["blobs"]
+        B = blobs["mu"].shape[0]
+        device = blobs["mu"].device
+        dtype = next(self.read_post.parameters()).dtype
+        empty_mem = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
+
+        n_w = max(state["n_windows"], 1)
+        splat_aux = state["aux_accum"] / n_w
+
+        with torch.no_grad():
+            sign_abs = torch.tanh(blobs["s_logit"]).abs().mean()
+            w_mean = F.softplus(blobs["w_raw"]).mean()
+            mu_norm = blobs["mu"].norm(dim=-1).mean()
+
+        aux = {
+            "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
+            "splat_aux": splat_aux,
+            "splat_blobs": blobs,
+            # Diagnostics
+            "splat_sign_abs_mean": sign_abs,
+            "splat_w_mean": w_mean,
+            "splat_mu_norm_mean": mu_norm,
+        }
+        return empty_mem, aux
+
+    def inject(self, hidden_states: Tensor, blobs: dict) -> Tensor:
+        """Per-position memory injection. Used by the pre-hook in
+        compute_qa_loss. h_llama → (origin, K_rays directions) → line-integral
+        ray features → residual injection.
+        """
+        from .splat_substrate import ray_features
+
+        h_dtype = hidden_states.dtype
+        w_dtype = next(self.origin_head.parameters()).dtype
+        h = hidden_states.to(w_dtype) if h_dtype != w_dtype else hidden_states
+
+        # B, T, d_llama
+        B, T, _ = h.shape
+
+        # Origin per Llama position
+        o = self.origin_head(h)                                  # [B, T, d]
+
+        # K_rays directions, normalized to unit length
+        dirs = self.direction_head(h)                            # [B, T, K_rays·d]
+        dirs = dirs.reshape(B, T, self.K_rays, self.d)
+        dirs = F.normalize(dirs, dim=-1, eps=1e-6)               # unit vectors
+
+        # Per-ray features: [B, T, K_rays, 4]
+        # Cast blobs to compute dtype (they live in fp32; w_dtype is fp32 too)
+        blobs_cast = {k: v.to(w_dtype) if v.dtype != w_dtype else v
+                      for k, v in blobs.items()}
+        feats = ray_features(o, dirs, blobs_cast)                # [B, T, K_rays, 4]
+
+        # Flatten to [B, T, K_rays · 4] and project to d_llama
+        feats_flat = feats.reshape(B, T, self.K_rays * self.ray_feat_per)
+        inj_d = self.read_post(feats_flat)                       # [B, T, d_llama]
+
+        eff_scale = self.scale_max * torch.tanh(self.scale_raw)  # [d_llama]
+        inj = eff_scale * inj_d                                  # [B, T, d_llama]
+
+        out = hidden_states + (inj.to(h_dtype) if inj.dtype != h_dtype else inj)
+        return out
+
+    def forward(
+        self,
+        token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        mask_positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, dict]:
+        """Non-streaming forward — only used by older code paths."""
+        del mask_positions
+        B = token_embeds.shape[0]
+        device = token_embeds.device
+        dtype = token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        return self.finalize_memory(state)
+
