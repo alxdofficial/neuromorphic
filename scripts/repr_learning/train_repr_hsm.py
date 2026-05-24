@@ -227,7 +227,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variants", nargs="+", default=[
         "v21", "flat_baseline", "continuous_baseline",
-        "memorizing_baseline", "recurrent_baseline", "vanilla_llama",
+        "memorizing_baseline", "recurrent_baseline", "graph_baseline",
+        "vanilla_llama",
     ])
     ap.add_argument("--steps", type=int, default=30_000)
     ap.add_argument("--batch-size", type=int, default=2)

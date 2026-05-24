@@ -40,17 +40,37 @@ from torch import Tensor
 def init_graph_state(
     B: int, K_max: int, d_node: int, d_state: int,
     device: torch.device, dtype: torch.dtype,
+    init_src: Optional[Tensor] = None,        # [K_max, d_node] learned init
+    init_dst: Optional[Tensor] = None,
+    init_state: Optional[Tensor] = None,
+    init_saliency_logit: float = -4.0,         # sigmoid(-4) ≈ 0.018
 ) -> dict:
-    """Initial graph: K_max random edges with low initial saliency.
+    """Initial graph state, deterministic given (B, init_*).
 
-    All edges start with random src/dst/state and saliency ≈ 0.5 (sigmoid
-    of zero — agnostic about which edges are important until training
-    teaches the updater).
+    Caller passes learned init parameters from the encoder (one set per
+    K_max slot). These are expanded across the batch — same input must
+    produce same memory in eval mode (no per-forward randomness).
+
+    saliency_logit defaults to -4 so new/untrained slots start LOW
+    priority (≈0.02). The updater can raise saliency via its delta head
+    when it decides a slot is informative; high-saliency edges then
+    become "sticky" via L_adjust weighting.
     """
-    src = torch.randn(B, K_max, d_node, device=device, dtype=dtype) * (d_node ** -0.5)
-    dst = torch.randn(B, K_max, d_node, device=device, dtype=dtype) * (d_node ** -0.5)
-    state = torch.randn(B, K_max, d_state, device=device, dtype=dtype) * (d_state ** -0.5)
-    saliency_logit = torch.zeros(B, K_max, device=device, dtype=dtype)
+    if init_src is None:
+        src = torch.zeros(B, K_max, d_node, device=device, dtype=dtype)
+    else:
+        src = init_src.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
+    if init_dst is None:
+        dst = torch.zeros(B, K_max, d_node, device=device, dtype=dtype)
+    else:
+        dst = init_dst.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
+    if init_state is None:
+        state = torch.zeros(B, K_max, d_state, device=device, dtype=dtype)
+    else:
+        state = init_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
+    saliency_logit = torch.full(
+        (B, K_max), float(init_saliency_logit), device=device, dtype=dtype,
+    )
     return {
         "src": src,                          # [B, K_max, d_node]
         "dst": dst,                          # [B, K_max, d_node]
@@ -67,34 +87,70 @@ def soft_snap(
     predicted_v: Tensor,         # [B, K_max, d_node]   fresh proposals
     endpoint_bank: Tensor,       # [B, 2*K_max, d_node] all current src+dst
     snap_gate: Tensor,           # [B, K_max] in [0,1]  learned snap coefficient
-    temperature: float = 1.0,
+    *,
+    temperature: float = 0.1,
+    top_k: int = 4,
+    exclude_self: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """Soft snap proposed endpoint to nearest existing endpoint.
 
     output = snap_gate · (attention over endpoint_bank by similarity to predicted)
            + (1 − snap_gate) · predicted_v
 
-    When snap_gate ≈ 1 and the predicted vector is close to some existing
-    endpoint, the output IS that endpoint (graph stays connected). When
-    snap_gate ≈ 0, the output is the raw proposal (a new node is born).
+    With (temperature=0.1, top_k=4) the attention concentrates ~95%+ mass
+    on the nearest single endpoint — actually behaves like a snap rather
+    than a diffuse average. Top-k masking before softmax bounds gradient
+    flow to the K nearest candidates.
+
+    exclude_self: endpoint_bank is conventionally arranged as
+        [src(0), src(1), ..., src(K-1), dst(0), dst(1), ..., dst(K-1)]
+    Slot i's proposal is a residual from its own old src/dst, so the
+    nearest match would always be itself unless we mask out positions
+    {i, K+i} per slot. Required for L_connectivity to actually push
+    toward sharing across slots, not self-stickiness.
 
     Returns: (out_v, max_sim)
         out_v  : [B, K_max, d_node] resolved endpoint vector
-        max_sim: [B, K_max] cosine similarity to the *nearest* existing
-                            endpoint, used by L_connectivity to penalize
-                            "low snap when something close exists"
+        max_sim: [B, K_max] cosine similarity to the *nearest* non-self
+                            existing endpoint, used by L_connectivity.
     """
-    pred_norm = F.normalize(predicted_v, dim=-1, eps=1e-6)             # [B, K_max, d]
+    B, K, d = predicted_v.shape
+    K2 = endpoint_bank.shape[1]
+
+    pred_norm = F.normalize(predicted_v, dim=-1, eps=1e-6)             # [B, K, d]
     bank_norm = F.normalize(endpoint_bank, dim=-1, eps=1e-6)           # [B, 2K, d]
-    sim = pred_norm @ bank_norm.transpose(-1, -2)                      # [B, K_max, 2K]
+    sim = pred_norm @ bank_norm.transpose(-1, -2)                      # [B, K, 2K]
 
-    attn = F.softmax(sim / temperature, dim=-1)                        # [B, K_max, 2K]
-    attended = attn @ endpoint_bank                                    # [B, K_max, d]
+    if exclude_self and K2 == 2 * K:
+        slot = torch.arange(K, device=sim.device)
+        self_mask = torch.zeros(K, K2, dtype=torch.bool, device=sim.device)
+        self_mask[slot, slot] = True               # self-src
+        self_mask[slot, K + slot] = True           # self-dst
+        sim = sim.masked_fill(self_mask.unsqueeze(0), float("-inf"))
 
-    sg = snap_gate.unsqueeze(-1)                                       # [B, K_max, 1]
-    out_v = sg * attended + (1.0 - sg) * predicted_v                   # [B, K_max, d]
+    # max_sim is computed AFTER self-mask so L_connectivity sees the
+    # nearest *other* endpoint, not the slot's own residual seed.
+    max_sim = sim.max(dim=-1).values                                   # [B, K]
 
-    max_sim = sim.max(dim=-1).values                                   # [B, K_max]
+    # Top-k attention: zero out non-top-k similarities, then softmax with
+    # low temperature for sharp peak. K2 might be < top_k in degenerate
+    # configs, so guard the topk call.
+    k_eff = min(top_k, K2) if top_k is not None else K2
+    if k_eff < K2:
+        topk_vals, _ = sim.topk(k_eff, dim=-1)
+        threshold = topk_vals[..., -1:].detach()                       # [B, K, 1]
+        sim_attn = torch.where(
+            sim >= threshold, sim, torch.full_like(sim, float("-inf")),
+        )
+    else:
+        sim_attn = sim
+
+    attn = F.softmax(sim_attn / temperature, dim=-1)                   # [B, K, 2K]
+    attended = attn @ endpoint_bank                                    # [B, K, d]
+
+    sg = snap_gate.unsqueeze(-1)                                       # [B, K, 1]
+    out_v = sg * attended + (1.0 - sg) * predicted_v                   # [B, K, d]
+
     return out_v, max_sim
 
 
@@ -230,12 +286,15 @@ class GraphUpdater(nn.Module):
         nn.init.normal_(self.out_head.weight, std=0.01)
         nn.init.zeros_(self.out_head.bias)
 
-        # Bias keep_gate's pre-sigmoid input so init ≈ "preserve old" (gate ≈ 0.7)
-        # Index of keep_gate in the output dim:
+        # Bias keep_gate init to 0.0 → sigmoid(0)=0.5 (neutral). With
+        # learned-init edges (audit C1), the init is meaningful but not
+        # sacred — first writes should be free to overwrite ~50%. The
+        # 0.85 bias used previously biased keep≈0.7 and let random init
+        # garbage persist across writes (and we now have non-random init,
+        # so the "preserve" bias loses its rationale).
         self._keep_idx = d_node + d_node + d_state + 2
         with torch.no_grad():
-            # bias[keep_idx] = logit(0.7) ≈ 0.85, biases initial gate toward "keep"
-            self.out_head.bias[self._keep_idx] = 0.85
+            self.out_head.bias[self._keep_idx] = 0.0
 
     def forward(
         self,

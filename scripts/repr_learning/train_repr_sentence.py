@@ -254,7 +254,7 @@ def main():
     # MT now uses per-sentence retrieval cap K = n_flat_codes (= 36).
     ap.add_argument("--variants", nargs="+", default=[
         "flat_baseline", "continuous_baseline", "memorizing_baseline",
-        "recurrent_baseline", "vanilla_llama",
+        "recurrent_baseline", "graph_baseline", "vanilla_llama",
     ])
     ap.add_argument("--steps", type=int, default=10_000)
     ap.add_argument("--batch-size", type=int, default=2)

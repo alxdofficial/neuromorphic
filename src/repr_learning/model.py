@@ -132,6 +132,15 @@ class ReprLearningModel(nn.Module):
             + self.cfg.codebook_orth_coef * loss_orth
             + self.cfg.z_loss_coef * loss_z
         )
+        # Variant-specific aux (graph_baseline / splat_baseline) — pre-weighted
+        # by the encoder. Same pattern as compute_qa_loss; audit M1 required
+        # this here too so non-QA training paths actually train these losses.
+        splat_aux = aux.get("splat_aux", None)
+        if splat_aux is not None:
+            loss = loss + splat_aux.to(loss.dtype)
+        graph_aux = aux.get("graph_aux", None)
+        if graph_aux is not None:
+            loss = loss + graph_aux.to(loss.dtype)
 
         out = {
             "loss": loss,
@@ -264,6 +273,13 @@ class ReprLearningModel(nn.Module):
             + self.cfg.codebook_orth_coef * loss_orth
             + self.cfg.z_loss_coef * loss_z
         )
+        # Variant-specific aux (graph / splat) — audit M1.
+        splat_aux = aux.get("splat_aux", None)
+        if splat_aux is not None:
+            loss = loss + splat_aux.to(loss.dtype)
+        graph_aux = aux.get("graph_aux", None)
+        if graph_aux is not None:
+            loss = loss + graph_aux.to(loss.dtype)
 
         return {
             "loss": loss,
@@ -451,6 +467,13 @@ class ReprLearningModel(nn.Module):
             + self.cfg.codebook_orth_coef * loss_orth
             + self.cfg.z_loss_coef * loss_z
         )
+        # Variant-specific aux (graph / splat) — audit M1.
+        splat_aux = finalize_aux.get("splat_aux", None)
+        if splat_aux is not None:
+            loss = loss + splat_aux.to(loss.dtype)
+        graph_aux = finalize_aux.get("graph_aux", None)
+        if graph_aux is not None:
+            loss = loss + graph_aux.to(loss.dtype)
 
         return {
             "loss": loss,
@@ -477,6 +500,7 @@ class ReprLearningModel(nn.Module):
         self,
         batch,                          # QABatch from data_qa.py
         window_size: int = 1024,
+        zero_memory: bool = False,
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -488,6 +512,14 @@ class ReprLearningModel(nn.Module):
              the model uses (memory, question, GT_answer[:t]) to predict
              GT_answer[t]; loss only on the load-bearing content tokens
              (`answer_content_mask`), not on padding or filler answer tokens.
+
+        zero_memory: diagnostic ablation. When True the decoder runs with
+            NO memory contribution — prepend variants get their memory
+            tensor zeroed AND those positions masked OUT of attention;
+            MemInject variants (plastic, splat) skip the forward_pre_hook
+            so Llama runs unmodified. Useful for measuring how much each
+            architecture's memory actually contributes vs the parametric
+            Llama floor (vanilla_llama).
         """
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
@@ -583,8 +615,9 @@ class ReprLearningModel(nn.Module):
         for i in range(B):
             t_q = int(q_lens[i].item())
             t_a = int(a_lens[i].item())
-            # Place memory
-            if M > 0:
+            # Place memory (zero_memory: leave embeds as zeros AND keep
+            # attn_mask_full False so Llama can't attend to those positions)
+            if M > 0 and not zero_memory:
                 full_embeds[i, :M] = memory_dec[i]
                 attn_mask_full[i, :M] = True
             # Place real question
@@ -612,7 +645,12 @@ class ReprLearningModel(nn.Module):
         # The hook is removed in finally so the shared Llama module is
         # unmodified across variants.
         hook_handle = None
-        if self.variant == "plastic_baseline":
+        if zero_memory:
+            # Skip hook installation entirely for plastic/splat — Llama
+            # forward runs unmodified (no fast-weight delta, no splat
+            # density injection). Matches "no memory" for prepend variants.
+            pass
+        elif self.variant == "plastic_baseline":
             state_for_hook = finalize_aux["plastic_fast_state"]
             inject_layer_idx = self.encoder.inject_layer_idx
             encoder_ref = self.encoder
@@ -860,6 +898,13 @@ class ReprLearningModel(nn.Module):
             + self.cfg.codebook_orth_coef * loss_orth
             + self.cfg.z_loss_coef * loss_z
         )
+        # Variant-specific aux (graph / splat) — audit M1.
+        splat_aux = aux.get("splat_aux", None)
+        if splat_aux is not None:
+            loss = loss + splat_aux.to(loss.dtype)
+        graph_aux = aux.get("graph_aux", None)
+        if graph_aux is not None:
+            loss = loss + graph_aux.to(loss.dtype)
 
         return {
             "loss": loss,

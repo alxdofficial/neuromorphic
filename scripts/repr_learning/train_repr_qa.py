@@ -248,15 +248,32 @@ def train_one_variant(
                     "splat_L_adj", "splat_L_sat"):
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        # Graph-variant sublosses (only present when variant == graph_baseline)
+        for key in ("graph_aux", "graph_L_connect", "graph_L_adjust",
+                    "graph_saliency_mean", "graph_endpoint_reuse"):
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         jsonl_fp.write(json.dumps(row) + "\n")
 
         if step % log_every == 0:
             now = time.time()
             sps = (step - last_print_step) / max(now - last_print_time, 1e-9)
             last_print_step, last_print_time = step, now
+            # Display the variant-specific aux that's actually contributing
+            # to the loss: graph_aux for graph_baseline, splat_aux for splat,
+            # plain loss_aux (load_balance+orth+z) for everything else.
+            if "graph_aux" in out and out["graph_aux"] is not None:
+                aux_display = float(out["graph_aux"])
+                aux_tag = "g_aux"
+            elif "splat_aux" in out and out["splat_aux"] is not None:
+                aux_display = float(out["splat_aux"])
+                aux_tag = "s_aux"
+            else:
+                aux_display = float(out["loss_aux"])
+                aux_tag = "aux"
             print(f"  step {step:6d}/{n_steps}  recon={float(out['loss_recon']):.4f}  "
                   f"top1={float(out['top1_acc'])*100:5.1f}%  "
-                  f"aux={float(out['loss_aux']):.3f}  "
+                  f"{aux_tag}={aux_display:.3f}  "
                   f"gnorm={float(gn):6.2f}  lr={lr:.2e}  ({sps:.1f} step/s)",
                   flush=True)
 
@@ -310,6 +327,7 @@ def main():
     ap.add_argument("--variants", nargs="+", default=[
         "flat_baseline", "continuous_baseline", "memorizing_baseline",
         "recurrent_baseline", "plastic_baseline", "splat_baseline",
+        "graph_baseline",
         "vanilla_llama",
     ])
     ap.add_argument("--steps", type=int, default=10_000)

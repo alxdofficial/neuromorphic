@@ -1669,12 +1669,34 @@ class GraphBaselineEncoder(nn.Module):
             nn.LayerNorm(cfg.d_llama),
         )
 
+        # Learned deterministic initial edges (audit C1). Without this the
+        # substrate would re-randomize every forward, leaving training-time
+        # non-determinism AND requiring keep_gate to "overwrite garbage"
+        # rather than "update meaningful prior". Random init kept here as
+        # the PARAMETER init seed (one-shot at module construction).
+        self.init_src = nn.Parameter(
+            torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
+        )
+        self.init_dst = nn.Parameter(
+            torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
+        )
+        self.init_state = nn.Parameter(
+            torch.randn(self.K_max, self.d_state) * (self.d_state ** -0.5)
+        )
+        # Saliency starts low (sigmoid(-4) ≈ 0.018) — slots are
+        # uninformative until the updater raises saliency via its delta head.
+        self.init_saliency_logit = -4.0
+
     # ── Streaming interface ───────────────────────────────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype):
         from .graph_substrate import init_graph_state
         edges = init_graph_state(
             batch_size, self.K_max, self.d_node, self.d_state,
             device, dtype=next(self.pin_encoder.parameters()).dtype,
+            init_src=self.init_src,
+            init_dst=self.init_dst,
+            init_state=self.init_state,
+            init_saliency_logit=self.init_saliency_logit,
         )
         zero = torch.zeros((), device=device, dtype=torch.float32)
         return {
@@ -1727,14 +1749,18 @@ class GraphBaselineEncoder(nn.Module):
             proposed["dst"], endpoint_bank, gates["snap_gate_dst"],
         )
 
-        # Apply keep_gate: preserve old vs use snapped proposal
+        # Apply keep_gate: preserve old vs use snapped proposal. Saliency
+        # logit gets the same gate (audit M2) so keep=1 truly preserves
+        # the slot rather than letting saliency drift independently.
         kg = gates["keep_gate"].unsqueeze(-1)
+        kg_1d = gates["keep_gate"]                                # [B, K]
         edges_new = {
             "src": kg * edges_old["src"] + (1 - kg) * snapped_src,
             "dst": kg * edges_old["dst"] + (1 - kg) * snapped_dst,
             "state": kg * edges_old["state"]
                      + (1 - kg) * proposed["state"],
-            "saliency_logit": proposed["saliency_logit"],
+            "saliency_logit": (kg_1d * edges_old["saliency_logit"]
+                               + (1 - kg_1d) * proposed["saliency_logit"]),
         }
 
         # Per-row all-pad protection on the edges update
