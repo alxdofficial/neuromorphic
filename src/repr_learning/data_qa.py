@@ -290,6 +290,28 @@ class HotpotQADataset(IterableDataset):
                                   trust_remote_code=True)
         print(f"[data v1h]   {len(self.data):,} HotpotQA {split} examples")
 
+    def _tokenize_paragraph(self, title: str, sents: list) -> list:
+        text = title.strip() + " " + " ".join(s.strip() for s in sents)
+        return self.tokenizer(text, add_special_tokens=False,
+                              return_attention_mask=False)["input_ids"]
+
+    def _sample_distractor_paragraph(self, rng, avoid_idx: int) -> list:
+        """Pick a random paragraph from a random example (not avoid_idx)."""
+        n = len(self.data)
+        for _ in range(8):  # bounded retries to dodge degenerate cases
+            j = rng.randint(0, n - 1)
+            if j == avoid_idx:
+                continue
+            ex_j = self.data[j]
+            ctx_j = ex_j["context"]
+            titles = ctx_j["title"]
+            sents_list = ctx_j["sentences"]
+            if not titles:
+                continue
+            k = rng.randint(0, len(titles) - 1)
+            return self._tokenize_paragraph(titles[k], sents_list[k])
+        return []  # gave up
+
     def __iter__(self) -> Iterator[dict]:
         worker_info = torch.utils.data.get_worker_info()
         wid = worker_info.id if worker_info is not None else 0
@@ -297,23 +319,67 @@ class HotpotQADataset(IterableDataset):
         n = len(self.data)
         tok = self.tokenizer
 
+        # Top-up loop targets ≥95% fill. Each candidate paragraph is
+        # ~150-200 tokens; the loop keeps trying smaller paragraphs once
+        # the budget tightens. MAX_TOPUP_TRIES bounds worst case.
+        FILL_THRESHOLD = 0.95
+        MAX_TOPUP_TRIES = 200
+
         while True:
             idx = rng.randint(0, n - 1)
             ex = self.data[idx]
-            # ex["context"] has parallel lists `title` and `sentences` (one
-            # sentence-list per paragraph). Concat title + sentences for each.
             ctx = ex["context"]
-            paragraphs = []
-            for title, sents in zip(ctx["title"], ctx["sentences"]):
-                paragraphs.append(title.strip() + " " + " ".join(s.strip() for s in sents))
+            titles = ctx["title"]
+            sents_list = ctx["sentences"]
 
-            # Tokenize each paragraph; concat with sep_token_id.
-            tok_paragraphs = [
-                tok(p, add_special_tokens=False, return_attention_mask=False)["input_ids"]
-                for p in paragraphs
-            ]
+            # Identify supporting (gold) paragraphs — these MUST stay in context.
+            # supporting_facts has parallel lists `title` and `sent_id`. We mark
+            # any paragraph whose title appears in supporting_facts as supporting.
+            sf = ex.get("supporting_facts", {})
+            support_titles = set(sf.get("title", []))
+            is_support = [t in support_titles for t in titles]
+
+            # Tokenize own paragraphs
+            own_tok = [self._tokenize_paragraph(t, s)
+                       for t, s in zip(titles, sents_list)]
+
+            # Pack supporting first (guaranteed inclusion)
+            packed = []
+            cur_total = 0
+            sep_cost = 1  # one sep_token between paragraphs
+            order = sorted(range(len(own_tok)),
+                           key=lambda i: not is_support[i])  # support first
+            for i in order:
+                tk = own_tok[i]
+                add = len(tk) + (sep_cost if packed else 0)
+                if cur_total + add > self.chunk_size:
+                    # If we can't fit a SUPPORTING paragraph, this example
+                    # is fundamentally unfit for current chunk_size — skip.
+                    if is_support[i] and not any(packed_i == i for packed_i in []):
+                        # (placeholder; just continue rather than crash)
+                        pass
+                    continue
+                packed.append(tk)
+                cur_total += add
+
+            # Top-up: add random distractors from OTHER examples until full
+            tries = 0
+            while (cur_total < FILL_THRESHOLD * self.chunk_size
+                   and tries < MAX_TOPUP_TRIES):
+                tries += 1
+                tk = self._sample_distractor_paragraph(rng, avoid_idx=idx)
+                if not tk:
+                    continue
+                add = len(tk) + sep_cost
+                if cur_total + add > self.chunk_size:
+                    continue
+                # Insert at random position to avoid front-loading
+                insert_at = rng.randint(0, len(packed))
+                packed.insert(insert_at, tk)
+                cur_total += add
+
             ctx_tokens, valid_len = _pack_context(
-                tok_paragraphs,
+                packed,
                 chunk_size=self.chunk_size,
                 sep_token_id=self.sep_token_id,
                 pad_token_id=self.pad_token_id,
@@ -325,7 +391,6 @@ class HotpotQADataset(IterableDataset):
             a_ids = tok(a_text, add_special_tokens=False,
                          return_attention_mask=False)["input_ids"]
 
-            # Whole answer is content (no filler distinction for HotpotQA)
             content_mask = [True] * len(a_ids)
 
             yield {

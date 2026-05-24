@@ -338,7 +338,10 @@ def main():
     ap.add_argument("--val-batches", type=int, default=10)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--window-size", type=int, default=1024)
-    ap.add_argument("--passages-per-chunk", type=int, default=300)
+    ap.add_argument("--passages-per-chunk", type=int, default=0,
+                    help="composite_v1 passages sampled per chunk. 0 = auto: "
+                         "scales with chunk_size (~75 per 1024 tokens). "
+                         "Manual override accepted as positive int.")
     ap.add_argument("--b-diversity-scale", type=float, default=50.0)
     ap.add_argument("--mt-diversity-scale", type=float, default=50.0)
     ap.add_argument("--out-tag", type=str, default="v1h")
@@ -398,6 +401,15 @@ def main():
         mt_diversity_scale=args.mt_diversity_scale,
         d_mamba=768,
     )
+
+    # Auto-scale composite passages_per_chunk with chunk_size if user passed 0.
+    # composite_v1 passages average ~13 tokens; we target ~75 passages per
+    # 1024 chunk tokens so the chunk fills to ~95% even after rejecting
+    # over-long candidates.
+    if args.passages_per_chunk <= 0:
+        args.passages_per_chunk = max(75, (args.chunk_size // 1024) * 75)
+        print(f"[auto] composite passages_per_chunk = {args.passages_per_chunk} "
+              f"(scaled for chunk_size={args.chunk_size})")
 
     print(f"v1h config: chunk={args.chunk_size}, window={args.window_size}, "
           f"passages_per_chunk={args.passages_per_chunk}")
