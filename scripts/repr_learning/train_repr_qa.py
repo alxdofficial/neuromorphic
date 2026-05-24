@@ -115,6 +115,8 @@ def train_one_variant(
     use_musique: bool = False, use_babilong: bool = False,
     babilong_config: str = "4k",
     mix_weights: tuple = (0.5, 0.25, 0.25, 0.0, 0.0),
+    patience: int = 5,                       # eval-points without improvement → stop
+    min_step_for_stop: int = 2000,           # don't stop during warmup-noise era
 ) -> dict:
     device = "cuda"
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
@@ -173,6 +175,15 @@ def train_one_variant(
     best_val_recon = float("inf")
     best_val_step = -1
     BEST_MIN_STEP = max(1000, n_steps // 10)
+    # Patience-based early stopping. After each val past MIN_STEP_FOR_STOP,
+    # if smoothed val (rolling mean of last 3 evals) hasn't improved for
+    # `patience` consecutive evals, break training. Lets fast-convergers
+    # bail early and slow-convergers use the full max-steps budget.
+    early_stopped = False
+    stopped_at_step = n_steps
+    patience_counter = 0
+    recent_vals = []                  # rolling window of last 3 val_recon
+    best_smoothed = float("inf")
 
     if is_vanilla:
         # Eval-only path. Skip any prior jsonl and run a single final-val pass.
@@ -305,6 +316,26 @@ def train_one_variant(
                 save_checkpoint(model, opt, step, best_ckpt_path)
                 print(f"    [best ckpt @ {step}]  val_recon={best_val_recon:.4f}",
                       flush=True)
+            # Patience-based early stop. Use smoothed val (rolling mean of
+            # last 3 evals) for the plateau check so single-eval noise
+            # doesn't trigger stops. Only active past min_step_for_stop.
+            recent_vals.append(vm["val_loss_recon"])
+            if len(recent_vals) > 3:
+                recent_vals.pop(0)
+            smoothed = sum(recent_vals) / len(recent_vals)
+            if step >= min_step_for_stop and patience > 0:
+                if smoothed < best_smoothed - 1e-4:
+                    best_smoothed = smoothed
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"    [early stop @ {step}]  smoothed val "
+                              f"{smoothed:.4f} stalled for {patience} evals "
+                              f"(best smoothed {best_smoothed:.4f})", flush=True)
+                        early_stopped = True
+                        stopped_at_step = step
+                        break
 
         if step > 0 and step % save_every == 0:
             # `step` here is the last completed step. Resume reads N → starts at N+1.
@@ -340,6 +371,8 @@ def train_one_variant(
         "best_val_loss_recon": (best_val_recon if best_val_step >= 0
                                 else final_val["val_loss_recon"]),
         "best_val_step": best_val_step,
+        "early_stopped": early_stopped,
+        "stopped_at_step": stopped_at_step,
     }
     del model, opt
     torch.cuda.empty_cache()
@@ -393,6 +426,14 @@ def main():
                     help="Sampling weights for (composite, hotpot, narrative, "
                          "musique, babilong). Older 3-tuple callers still work; "
                          "missing entries default to 0.")
+    ap.add_argument("--patience", type=int, default=5,
+                    help="Patience-based early stop: number of consecutive val "
+                         "evals without improvement (on smoothed val_recon) "
+                         "before training stops. 0 disables. Default 5 "
+                         "(= 2500-step plateau window at val_every=500).")
+    ap.add_argument("--min-step-for-stop", type=int, default=2000,
+                    help="Don't trigger early-stop before this step. Skips "
+                         "warmup-noise era where val is bouncy. Default 2000.")
     args = ap.parse_args()
 
     if "v21" in args.variants:
@@ -475,6 +516,8 @@ def main():
             use_babilong=args.babilong,
             babilong_config=args.babilong_config,
             mix_weights=tuple(args.mix_weights),
+            patience=args.patience,
+            min_step_for_stop=args.min_step_for_stop,
         )
         summaries.append(s)
 
