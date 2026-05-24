@@ -112,7 +112,9 @@ def train_one_variant(
     val_batches: int, out_dir: Path, chunk_size: int, window_size: int,
     passages_per_chunk: int, resume: bool = False,
     use_hotpot: bool = True, use_narrative: bool = True,
-    mix_weights: tuple = (0.5, 0.25, 0.25),
+    use_musique: bool = False, use_babilong: bool = False,
+    babilong_config: str = "4k",
+    mix_weights: tuple = (0.5, 0.25, 0.25, 0.0, 0.0),
 ) -> dict:
     device = "cuda"
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
@@ -143,6 +145,8 @@ def train_one_variant(
         composite_passages_path=COMPOSITE_TRAIN_P,
         composite_questions_path=COMPOSITE_TRAIN_Q,
         use_hotpot=use_hotpot, use_narrative=use_narrative,
+        use_musique=use_musique, use_babilong=use_babilong,
+        babilong_config=babilong_config,
         split="train",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
         weights=mix_weights, num_workers=0, seed=42,
@@ -152,6 +156,8 @@ def train_one_variant(
         composite_passages_path=COMPOSITE_VAL_P,
         composite_questions_path=COMPOSITE_VAL_Q,
         use_hotpot=use_hotpot, use_narrative=use_narrative,
+        use_musique=use_musique, use_babilong=use_babilong,
+        babilong_config=babilong_config,
         split="validation",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
         weights=mix_weights, num_workers=0, seed=7,
@@ -367,15 +373,26 @@ def main():
     ap.add_argument("--no-hotpot", action="store_true",
                     help="Disable HotpotQA source (default: enabled)")
     ap.add_argument("--narrative", action="store_true",
-                    help="Enable NarrativeQA source (default: DISABLED — most "
-                         "examples fall into random-window label noise because "
-                         "documents are typically ~75k tokens and the answer "
-                         "isn't tokenizer-matched. Re-enable only after building "
-                         "an evidence-anchored cached pipeline.)")
-    ap.add_argument("--mix-weights", nargs=3, type=float, default=[0.7, 0.3, 0.0],
-                    metavar=("COMPOSITE", "HOTPOT", "NARRATIVE"),
-                    help="Sampling weights for the three sources. Default has "
-                         "narrative at 0 since --narrative is disabled by default.")
+                    help="Enable NarrativeQA source (default: DISABLED). "
+                         "Uses random window (oracle-centering removed in "
+                         "post-audit fix).")
+    ap.add_argument("--musique", action="store_true",
+                    help="Enable MuSiQue-Ans source (default: DISABLED). "
+                         "Contamination-controlled 2-4 hop QA — complements "
+                         "HotpotQA by eliminating shortcut reasoning.")
+    ap.add_argument("--babilong", action="store_true",
+                    help="Enable BABILong source (default: DISABLED). "
+                         "Synthetic state-tracking, pre-formatted at the "
+                         "config length (4k/8k/16k).")
+    ap.add_argument("--babilong-config", type=str, default="4k",
+                    help="BABILong length config (matches our tranches). "
+                         "Choices: 0k, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k.")
+    ap.add_argument("--mix-weights", nargs="+", type=float,
+                    default=[0.7, 0.3, 0.0, 0.0, 0.0],
+                    metavar="W",
+                    help="Sampling weights for (composite, hotpot, narrative, "
+                         "musique, babilong). Older 3-tuple callers still work; "
+                         "missing entries default to 0.")
     args = ap.parse_args()
 
     if "v21" in args.variants:
@@ -454,6 +471,9 @@ def main():
             resume=args.resume,
             use_hotpot=not args.no_hotpot,
             use_narrative=args.narrative,
+            use_musique=args.musique,
+            use_babilong=args.babilong,
+            babilong_config=args.babilong_config,
             mix_weights=tuple(args.mix_weights),
         )
         summaries.append(s)
