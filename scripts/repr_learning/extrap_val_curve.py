@@ -149,7 +149,11 @@ def main():
             filtered = list(zip(steps, losses))
 
         s_f, L_f = zip(*filtered)
-        observed_best = min(losses)
+        # Match best.pt selection policy: lowest val past the warmup
+        # window. Using min(losses) over all vals would let early-warmup
+        # flukes show up as observed_best (and disagree with what we'd
+        # actually reload as the "best ckpt").
+        observed_best = min(L_f)
         observed_final = losses[-1]
         a, b, l_inf, _, _ = fit_one(list(s_f), list(L_f))
 

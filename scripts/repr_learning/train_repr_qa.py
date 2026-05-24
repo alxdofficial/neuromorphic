@@ -335,6 +335,10 @@ def train_one_variant(
                               f"(best smoothed {best_smoothed:.4f})", flush=True)
                         early_stopped = True
                         stopped_at_step = step
+                        # Audit fix #9: stamp last_completed BEFORE break
+                        # so the final .last.pt save records the correct
+                        # step (otherwise it'd be one save_every behind).
+                        last_completed = step
                         break
 
         if step > 0 and step % save_every == 0:
@@ -417,9 +421,11 @@ def main():
                     help="Enable BABILong source (default: DISABLED). "
                          "Synthetic state-tracking, pre-formatted at the "
                          "config length (4k/8k/16k).")
-    ap.add_argument("--babilong-config", type=str, default="4k",
-                    help="BABILong length config (matches our tranches). "
-                         "Choices: 0k, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k.")
+    ap.add_argument("--babilong-config", type=str, default="auto",
+                    help="BABILong length config. 'auto' picks the closest "
+                         "config below chunk_size (e.g. 4k for chunk=4096, "
+                         "8k for chunk=8192). Manual: 0k, 1k, 2k, 4k, 8k, "
+                         "16k, 32k, 64k, 128k.")
     ap.add_argument("--mix-weights", nargs="+", type=float,
                     default=[0.7, 0.3, 0.0, 0.0, 0.0],
                     metavar="W",
@@ -444,6 +450,10 @@ def main():
     # so enabling the flag without bumping the weight is a no-op that
     # silently loads ~570MB of data (HotpotQA) or downloads NarrativeQA
     # while contributing nothing. Surface this immediately.
+    # Pad mix_weights to length 5 for the 5-source schema.
+    padded_weights = list(args.mix_weights) + [0.0] * (5 - len(args.mix_weights))
+    args.mix_weights = padded_weights
+
     if args.narrative and args.mix_weights[2] <= 0:
         raise SystemExit(
             "--narrative is set but mix_weights[2] (NarrativeQA) is 0. "
@@ -462,6 +472,18 @@ def main():
             "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
             "source and cannot be disabled."
         )
+    if args.musique and args.mix_weights[3] <= 0:
+        raise SystemExit(
+            "--musique is set but mix_weights[3] (MuSiQue) is 0. Either drop "
+            "--musique or pass --mix-weights with a positive fourth value "
+            "(e.g. --mix-weights 0.4 0.2 0.2 0.2)."
+        )
+    if args.babilong and args.mix_weights[4] <= 0:
+        raise SystemExit(
+            "--babilong is set but mix_weights[4] (BABILong) is 0. Either drop "
+            "--babilong or pass --mix-weights with a positive fifth value "
+            "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
+        )
 
     cfg = ReprConfig(
         batch_size=args.batch_size,
@@ -477,6 +499,26 @@ def main():
         mt_diversity_scale=args.mt_diversity_scale,
         d_mamba=768,
     )
+
+    # Auto-pick BABILong config to match chunk_size (audit fix #10).
+    if args.babilong_config == "auto":
+        # Map chunk_size to nearest BABILong config at or below it.
+        cs = args.chunk_size
+        if cs >= 16384:
+            args.babilong_config = "16k"
+        elif cs >= 8192:
+            args.babilong_config = "8k"
+        elif cs >= 4096:
+            args.babilong_config = "4k"
+        elif cs >= 2048:
+            args.babilong_config = "2k"
+        elif cs >= 1024:
+            args.babilong_config = "1k"
+        else:
+            args.babilong_config = "0k"
+        if args.babilong:
+            print(f"[auto] babilong_config = {args.babilong_config} "
+                  f"(scaled for chunk_size={args.chunk_size})")
 
     # Auto-scale composite passages_per_chunk with chunk_size if user passed 0.
     # composite_v1 passages average ~13 tokens; we target ~75 passages per

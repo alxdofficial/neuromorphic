@@ -167,7 +167,21 @@ def main():
     llama, _ = load_frozen_llama("meta-llama/Llama-3.2-1B", dtype=torch.bfloat16)
     llama = llama.to(device)
 
-    cfg = ReprConfig()
+    # Build cfg with the SAME overrides train_repr_qa.py main() uses for v1h.
+    # Default ReprConfig has older shapes (n_flat_codes=96, max_window=1024)
+    # which cause load_state_dict size-mismatch failures on v1h checkpoints.
+    cfg = ReprConfig(
+        batch_size=args.batch_size,
+        fixed_window_size=args.window_size,
+        max_window_size=args.chunk_size,
+        max_steps=10_000,
+        warmup_steps=500,
+        d_node_state=128,
+        n_edges=68,
+        n_flat_codes=36,
+        edge_token_packing="fused",
+        d_mamba=768,
+    )
     print(f"Building val dataloader: chunk={args.chunk_size} window={args.window_size}", flush=True)
     val_dl = make_mixed_qa_dataloader(
         cfg, tokenizer,

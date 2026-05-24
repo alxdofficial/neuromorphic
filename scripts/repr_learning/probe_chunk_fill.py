@@ -25,18 +25,51 @@ from src.repr_learning.config import ReprConfig
 from src.repr_learning.data_qa import make_mixed_qa_dataloader
 
 
+def _classify_src(fam: str) -> str:
+    """Map task_family string to high-level source bucket."""
+    if fam == "hotpot_qa":
+        return "hotpot"
+    if fam == "narrative_qa":
+        return "narrative"
+    if fam == "musique":
+        return "musique"
+    if fam.startswith("babilong_"):
+        return "babilong"
+    return "composite"
+
+
 def probe_one(chunk_size: int, n_batches: int, passages_per_chunk: int,
-              tokenizer, cfg: ReprConfig) -> dict:
-    print(f"\n=== chunk_size={chunk_size} (passages_per_chunk={passages_per_chunk}) ===", flush=True)
+              tokenizer, cfg: ReprConfig,
+              use_musique: bool, use_babilong: bool,
+              babilong_config: str) -> dict:
+    enabled = ["composite", "hotpot", "narrative"]
+    weights = [0.4, 0.2, 0.2]
+    if use_musique:
+        enabled.append("musique"); weights.append(0.1)
+    if use_babilong:
+        enabled.append("babilong"); weights.append(0.1)
+    # Renormalize the 5-tuple expected by the loader
+    weights5 = [
+        weights[0],
+        weights[1],
+        weights[2],
+        weights[3] if use_musique else 0.0,
+        weights[-1] if use_babilong else 0.0,
+    ]
+
+    print(f"\n=== chunk_size={chunk_size} (passages_per_chunk={passages_per_chunk}, "
+          f"sources={enabled}) ===", flush=True)
 
     dl = make_mixed_qa_dataloader(
         cfg, tokenizer,
         composite_passages_path=REPO / "data/wave1/composite_v1/val/passages.jsonl",
         composite_questions_path=REPO / "data/wave1/composite_v1/val/questions.jsonl",
         use_hotpot=True, use_narrative=True,
+        use_musique=use_musique, use_babilong=use_babilong,
+        babilong_config=babilong_config,
         split="validation", chunk_size=chunk_size,
         passages_per_chunk=passages_per_chunk,
-        weights=(0.5, 0.25, 0.25), batch_size=4,
+        weights=tuple(weights5), batch_size=4,
     )
 
     per_src = defaultdict(list)
@@ -45,20 +78,12 @@ def probe_one(chunk_size: int, n_batches: int, passages_per_chunk: int,
             break
         real_per_row = batch.context_mask.sum(dim=-1).tolist()
         for fam, real in zip(batch.task_family, real_per_row):
-            # task_family for HotpotQA is "hotpot_qa", NarrativeQA is "narrative_qa",
-            # composite is one of the composite task families.
-            if fam == "hotpot_qa":
-                src = "hotpot"
-            elif fam == "narrative_qa":
-                src = "narrative"
-            else:
-                src = "composite"
-            per_src[src].append(real / chunk_size)
+            per_src[_classify_src(fam)].append(real / chunk_size)
 
     print(f"{'source':<12} {'n':>5} {'fill avg':>10} {'fill min':>10} {'fill max':>10}")
     print("-" * 50)
     results = {}
-    for src in ["composite", "hotpot", "narrative"]:
+    for src in enabled:
         vals = per_src.get(src, [])
         if not vals:
             print(f"{src:<12} {0:>5}  (no samples)")
@@ -77,6 +102,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tranches", type=int, nargs="+", default=[4096, 8192, 16384])
     ap.add_argument("--n-batches", type=int, default=20)
+    ap.add_argument("--musique", action="store_true",
+                    help="Also probe MuSiQue-Ans fill rates.")
+    ap.add_argument("--babilong", action="store_true",
+                    help="Also probe BABILong fill rates.")
+    ap.add_argument("--babilong-config", type=str, default="auto",
+                    help="BABILong length config or 'auto' to match each tranche.")
     args = ap.parse_args()
 
     print("Loading tokenizer...", flush=True)
@@ -85,22 +116,38 @@ def main():
         tok.pad_token = tok.eos_token
     cfg = ReprConfig()
 
+    def auto_babilong_config(cs: int) -> str:
+        if cs >= 16384: return "16k"
+        if cs >= 8192:  return "8k"
+        if cs >= 4096:  return "4k"
+        if cs >= 2048:  return "2k"
+        if cs >= 1024:  return "1k"
+        return "0k"
+
     all_results = {}
     for cs in args.tranches:
         # Match the trainer's auto-scaling: 75 passages per 1024 tokens
         ppc = max(75, (cs // 1024) * 75)
-        all_results[cs] = probe_one(cs, args.n_batches, ppc, tok, cfg)
+        bcfg = auto_babilong_config(cs) if args.babilong_config == "auto" else args.babilong_config
+        all_results[cs] = probe_one(
+            cs, args.n_batches, ppc, tok, cfg,
+            use_musique=args.musique,
+            use_babilong=args.babilong,
+            babilong_config=bcfg,
+        )
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("SUMMARY (avg fill rate per source per tranche)")
-    print("=" * 60)
-    print(f"{'chunk_size':<12} {'composite':>10} {'hotpot':>10} {'narrative':>10}")
+    print("=" * 80)
+    cols = ["composite", "hotpot", "narrative"]
+    if args.musique:  cols.append("musique")
+    if args.babilong: cols.append("babilong")
+    header = "  ".join(f"{c:>10}" for c in cols)
+    print(f"{'chunk_size':<12} {header}")
     for cs in args.tranches:
         r = all_results[cs]
-        c = r.get("composite", {}).get("avg", float("nan"))
-        h = r.get("hotpot", {}).get("avg", float("nan"))
-        n = r.get("narrative", {}).get("avg", float("nan"))
-        print(f"{cs:<12} {c:>10.3f} {h:>10.3f} {n:>10.3f}")
+        row = "  ".join(f"{r.get(c, {}).get('avg', float('nan')):>10.3f}" for c in cols)
+        print(f"{cs:<12} {row}")
 
 
 if __name__ == "__main__":

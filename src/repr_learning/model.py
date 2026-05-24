@@ -581,6 +581,16 @@ class ReprLearningModel(nn.Module):
             finalize_aux.update(mt_aux)
             M = K_retrieve
 
+        # zero_memory ablation: for prepend variants we DROP the memory
+        # slots entirely (M=0) so the question starts at RoPE position 0,
+        # matching vanilla_llama's positional layout. Previously we kept
+        # the M slots but attended-out: that left the question at
+        # position M, biasing zero-mem reports by memory length.
+        # For MemInject variants (plastic/splat) M is already 0 here;
+        # zero_memory just skips hook installation below.
+        if zero_memory:
+            M = 0
+
         # ---- 3. Per-row packing of [memory, real_q, real_a] + trailing pad ----
         # AVOIDS the alignment bug where right-padded questions caused
         # answer[0] to be predicted from a pad-embedding position when

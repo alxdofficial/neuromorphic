@@ -343,24 +343,28 @@ class HotpotQADataset(IterableDataset):
             own_tok = [self._tokenize_paragraph(t, s)
                        for t, s in zip(titles, sents_list)]
 
-            # Pack supporting first (guaranteed inclusion)
+            # Pack supporting first (guaranteed inclusion). If ANY support
+            # paragraph won't fit chunk_size, this example is unsolvable —
+            # skip it (resample) rather than yield an example whose answer
+            # is not derivable from the visible context.
             packed = []
             cur_total = 0
             sep_cost = 1  # one sep_token between paragraphs
             order = sorted(range(len(own_tok)),
                            key=lambda i: not is_support[i])  # support first
+            example_ok = True
             for i in order:
                 tk = own_tok[i]
                 add = len(tk) + (sep_cost if packed else 0)
                 if cur_total + add > self.chunk_size:
-                    # If we can't fit a SUPPORTING paragraph, this example
-                    # is fundamentally unfit for current chunk_size — skip.
-                    if is_support[i] and not any(packed_i == i for packed_i in []):
-                        # (placeholder; just continue rather than crash)
-                        pass
-                    continue
+                    if is_support[i]:
+                        example_ok = False
+                        break  # bail; this example is unsolvable
+                    continue   # non-supporting can be skipped
                 packed.append(tk)
                 cur_total += add
+            if not example_ok:
+                continue  # outer while loop — resample a different example
 
             # Top-up: add random distractors from OTHER examples until full
             tries = 0
@@ -593,18 +597,26 @@ class MuSiQueDataset(IterableDataset):
                        for p in paragraphs]
             is_support = [bool(p["is_supporting"]) for p in paragraphs]
 
+            # Pack supports first; skip example if any support won't fit
+            # (would yield an unsolvable QA pair otherwise).
             packed = []
             cur_total = 0
             sep_cost = 1
             order = sorted(range(len(own_tok)),
                            key=lambda i: not is_support[i])
+            example_ok = True
             for i in order:
                 tk = own_tok[i]
                 add = len(tk) + (sep_cost if packed else 0)
                 if cur_total + add > self.chunk_size:
+                    if is_support[i]:
+                        example_ok = False
+                        break
                     continue
                 packed.append(tk)
                 cur_total += add
+            if not example_ok:
+                continue  # outer while — resample
 
             tries = 0
             while (cur_total < FILL_THRESHOLD * self.chunk_size
@@ -689,21 +701,38 @@ class BABILongDataset(IterableDataset):
 
         from datasets import load_dataset
         # BABILong on HF is `RMT-team/babilong` with configs per length and
-        # one split per task (qa1-qa20). We pool all 20 tasks for diversity.
+        # one split per task (qa1-qa20). We pool tasks for diversity and
+        # partition each task by deterministic index hash into train/val
+        # so train and val don't sample the same examples (audit fix #1).
+        # Convention: examples whose index % 5 == 0 are val, else train.
+        # 80/20 split, deterministic, no shuffle dependence.
         print(f"[data v1h] loading BABILong config={config_name}, {len(self.tasks)} tasks "
               f"(downloads ~per-task on first call)...")
-        # Map our high-level split to BABILong's only split per task.
-        # BABILong provides task names as splits (qa1, qa2, ... qa20).
+        VAL_MOD = 5
+        is_val = split not in ("train",)
         self.task_data = {}
         for task in self.tasks:
             try:
-                ds = load_dataset("RMT-team/babilong", config_name, split=task)
-                self.task_data[task] = ds
+                ds_full = load_dataset("RMT-team/babilong", config_name, split=task)
             except Exception as e:
                 print(f"[data v1h]   skipping {task} ({type(e).__name__}: {e})")
+                continue
+            # Partition by index for clean train/val separation.
+            if is_val:
+                keep_idx = [i for i in range(len(ds_full)) if i % VAL_MOD == 0]
+            else:
+                keep_idx = [i for i in range(len(ds_full)) if i % VAL_MOD != 0]
+            if not keep_idx:
+                print(f"[data v1h]   {task}: 0 rows after {split} partition — skipping")
+                continue
+            ds = ds_full.select(keep_idx)
+            if len(ds) == 0:
+                print(f"[data v1h]   {task}: empty after select — skipping (audit #6)")
+                continue
+            self.task_data[task] = ds
         total = sum(len(d) for d in self.task_data.values())
         print(f"[data v1h]   {total:,} total BABILong examples across "
-              f"{len(self.task_data)} tasks at {config_name}")
+              f"{len(self.task_data)} tasks at {config_name} ({split} partition)")
 
     def __iter__(self) -> Iterator[dict]:
         worker_info = torch.utils.data.get_worker_info()
