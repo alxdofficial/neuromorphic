@@ -41,26 +41,40 @@ from torch import Tensor
 def init_splat_state(
     B: int, K: int, d: int,
     device: torch.device, dtype: torch.dtype,
+    init_mu: Optional[Tensor] = None,
+    init_log_diag_sigma: Optional[Tensor] = None,
+    init_w_raw: Optional[Tensor] = None,
+    init_s_logit: Optional[Tensor] = None,
 ) -> dict:
-    """Initial blob state.
+    """Initial blob state — deterministic given (B, init_*).
+
+    Per audit2 #2, callers should pass learned nn.Parameter inits from
+    the encoder so the same input yields the same memory in eval mode.
+    Fallback: deterministic zero/uniform inits (NOT random per-forward).
 
     Naming convention (subtle — read carefully):
       `log_diag_sigma` stores **log σ²** (log of the variance, i.e.
       log of the diagonal entries of Σ). So exp(log_diag_sigma) = σ²
-      and exp(0.5 * log_diag_sigma) = σ (std dev). The "sigma" in the
-      name refers to Σ (the covariance), not σ (std dev) — Σ_ii = σ²_i.
+      and exp(0.5 * log_diag_sigma) = σ (std dev).
     """
-    # μ_k ~ N(0, 1/d) — small random
-    mu = torch.randn(B, K, d, device=device, dtype=dtype) * (d ** -0.5)
-    # log σ²_i ~ N(0, 0.1) — σ² ≈ 1 ⇒ σ ≈ 1 with small variance
-    log_diag_sigma = torch.randn(B, K, d, device=device, dtype=dtype) * 0.1
-    # w_raw such that softplus(w_raw) ≈ 1/K (uniform mass over K blobs)
-    target_w = 1.0 / K
-    # softplus^{-1}(y) = log(exp(y) - 1)
-    w_raw = torch.full((B, K), math.log(math.exp(target_w) - 1.0),
-                       device=device, dtype=dtype)
-    # s_logit ~ N(0, 0.1) — signs near 0 (tanh ≈ 0), high-gradient region
-    s_logit = torch.randn(B, K, device=device, dtype=dtype) * 0.1
+    if init_mu is not None:
+        mu = init_mu.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
+    else:
+        mu = torch.zeros(B, K, d, device=device, dtype=dtype)
+    if init_log_diag_sigma is not None:
+        log_diag_sigma = init_log_diag_sigma.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
+    else:
+        log_diag_sigma = torch.zeros(B, K, d, device=device, dtype=dtype)
+    if init_w_raw is not None:
+        w_raw = init_w_raw.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1).contiguous()
+    else:
+        target_w = 1.0 / K
+        w_raw = torch.full((B, K), math.log(math.exp(target_w) - 1.0),
+                           device=device, dtype=dtype)
+    if init_s_logit is not None:
+        s_logit = init_s_logit.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1).contiguous()
+    else:
+        s_logit = torch.zeros(B, K, device=device, dtype=dtype)
     return {
         "mu": mu,
         "log_diag_sigma": log_diag_sigma,    # log σ² (not log σ!)

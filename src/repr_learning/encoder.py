@@ -28,6 +28,30 @@ from .config import ReprConfig
 from .selection import gumbel_argmax_ste, load_balance_loss, router_z_loss
 
 
+@torch.no_grad()
+def _sinusoidal_pe(seq_len: int, d_model: int, offset: int = 0,
+                    *, device=None, dtype=torch.float32) -> Tensor:
+    """Standard sinusoidal positional encoding for write-side pin tokens
+    (audit2 #5). Without this, graph/splat/plastic writes are order-
+    invariant within a 1024-token window (their pooling/cross-attn over
+    pins doesn't carry token position).
+
+    Returns [seq_len, d_model] PE for positions [offset, offset+seq_len).
+    """
+    if d_model <= 0 or seq_len <= 0:
+        return torch.zeros(seq_len, d_model, device=device, dtype=dtype)
+    positions = torch.arange(offset, offset + seq_len,
+                              device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
+    d_half = (d_model + 1) // 2
+    div = torch.exp(torch.arange(d_half, device=device, dtype=torch.float32)
+                    * (-math.log(10000.0) / d_model))                       # [d/2]
+    angles = positions * div                                                # [T, d/2]
+    pe = torch.zeros(seq_len, d_model, device=device, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(angles)[:, : pe[:, 0::2].shape[-1]]
+    pe[:, 1::2] = torch.cos(angles)[:, : pe[:, 1::2].shape[-1]]
+    return pe.to(dtype)
+
+
 class QFormerAdapter(nn.Module):
     """BLIP-2 / Flamingo-style cross-attention adapter.
 
@@ -1033,13 +1057,49 @@ class MemorizingBaselineEncoder(nn.Module):
         if attn_mask is not None:
             scores = scores.masked_fill(~attn_mask, float("-inf"))
 
+        # Audit2 #7: guard against all-pad query / fewer-than-K valid keys.
+        # Without guards, softmax over all -inf returns NaN, contaminating
+        # the memory tensor.
+        if attn_mask is not None:
+            valid_per_row = attn_mask.sum(dim=-1)                # [B]
+            any_valid = valid_per_row > 0
+        else:
+            valid_per_row = torch.full((B,), T, device=device, dtype=torch.long)
+            any_valid = torch.ones(B, dtype=torch.bool, device=device)
+
         K_retrieve = min(K, T)
         top_scores, top_idx = scores.topk(K_retrieve, dim=-1)    # [B, K]
+        # Mask top entries that came from padded positions (when row has
+        # fewer than K valid keys, some top picks are padded). Use a per-row
+        # K_valid = min(K, valid_count) to know how many top picks are real.
+        rank = torch.arange(K_retrieve, device=device).unsqueeze(0)  # [1, K]
+        per_row_K = valid_per_row.unsqueeze(-1).clamp(max=K_retrieve)  # [B, 1]
+        valid_topk = rank < per_row_K                                # [B, K]
+        # Sanitize -inf top scores so softmax doesn't see them; replace
+        # invalid entries' scores with a finite low value (they're masked
+        # out of the soft weights anyway via valid_topk).
+        top_scores = torch.where(
+            torch.isfinite(top_scores), top_scores,
+            torch.full_like(top_scores, -1e4),
+        )
+
         top_idx_exp = top_idx.unsqueeze(-1).expand(B, K_retrieve, d_value)
         retrieved = values.gather(1, top_idx_exp)                 # [B, K, d_value]
 
-        # STE gradient
-        soft_w = F.softmax(top_scores, dim=-1).unsqueeze(-1)
+        # Zero out invalid (padded) top-K positions in retrieved
+        retrieved = retrieved * valid_topk.unsqueeze(-1).to(retrieved.dtype)
+        # All-pad-query rows: zero memory entirely
+        retrieved = retrieved * any_valid.view(B, 1, 1).to(retrieved.dtype)
+
+        # STE gradient with the same valid-K masking on soft weights
+        masked_scores = top_scores.masked_fill(~valid_topk, float("-inf"))
+        # If a row has ZERO valid top entries (all-pad), masked_scores is
+        # all -inf → softmax NaN. Replace with zero gate for those rows.
+        row_has_valid = valid_topk.any(dim=-1, keepdim=True)      # [B, 1]
+        safe_masked = torch.where(
+            row_has_valid, masked_scores, torch.zeros_like(masked_scores),
+        )
+        soft_w = F.softmax(safe_masked, dim=-1).unsqueeze(-1)
         gate = 1.0 + (soft_w * K_retrieve - (soft_w * K_retrieve).detach())
         retrieved = retrieved * gate
 
@@ -1527,12 +1587,16 @@ class PlasticBaselineEncoder(nn.Module):
         surprise     : [B, T_w] per-token surprise (NLL from frozen Llama on
                        context with no memory). If None, treated as zeros.
         """
-        del chunk_offset  # plasticity is order-agnostic at the moment
         # Substrate runs in bf16 (matches Llama's dtype) for tensor-core speed.
         # Parameter weights are fp32; autocast handles the mixed-precision matmul.
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             x = self.token_proj(token_embeds)                        # [B, T_w, h_sub]
             B, T_w, _ = x.shape
+            # Audit2 #5: add sinusoidal PE so within-window order matters.
+            # Was order-invariant before (Hebbian write averages over T).
+            pe = _sinusoidal_pe(T_w, x.shape[-1], offset=chunk_offset,
+                                 device=x.device, dtype=x.dtype)
+            x = x + pe.unsqueeze(0)
             if surprise is None:
                 surprise = torch.zeros(B, T_w, device=x.device, dtype=x.dtype)
             else:
@@ -1712,7 +1776,6 @@ class GraphBaselineEncoder(nn.Module):
     ):
         """One write pass over a window. Updates all K_max edge slots via
         the transformer-updater + soft-snap on endpoints."""
-        del chunk_offset
         from .graph_substrate import soft_snap, loss_connectivity, loss_adjust
 
         w_dtype = next(self.pin_encoder.parameters()).dtype
@@ -1724,6 +1787,13 @@ class GraphBaselineEncoder(nn.Module):
 
         # Encode pins
         pins = self.pin_encoder(token_embeds)                    # [B, T_w, d_updater]
+        # Audit2 #5: add sinusoidal PE so within-window token order matters.
+        # Without this the updater's cross-attn over pins is order-invariant.
+        T_w = pins.shape[1]
+        pe = _sinusoidal_pe(T_w, pins.shape[-1], offset=chunk_offset,
+                             device=pins.device, dtype=pins.dtype)
+        pins = pins + pe.unsqueeze(0)
+
         if attention_mask is not None:
             pins_pad_mask = ~attention_mask
             all_pad_rows = pins_pad_mask.all(dim=-1)
@@ -1814,6 +1884,13 @@ class GraphBaselineEncoder(nn.Module):
             edges["src"], edges["dst"], edges["state"], sal,
         ], dim=-1)                                                     # [B, K_max, 2d_n+d_s+1]
         memory = self.proj_to_llama(edge_feats.to(dtype))              # [B, K_max, d_llama]
+        # Audit2 #4: gate the projected memory by saliency AFTER the
+        # LayerNorm inside proj_to_llama. Without this, low-saliency
+        # slots still emit full-scale Llama tokens (norm ~45) — the
+        # saliency feature gets washed by norm. Multiply post-norm:
+        # low-saliency edge → low-magnitude memory token, the decoder
+        # mostly ignores it.
+        memory = memory * sal.to(memory.dtype)
 
         n_w = max(state["n_windows"], 1)
         graph_aux = state["aux_accum"] / n_w
@@ -1960,6 +2037,26 @@ class SplatBaselineEncoder(nn.Module):
             torch.full((cfg.d_llama,), _scale_raw_init),
         )
 
+        # Learned deterministic initial blobs (audit2 #2). Previously
+        # init_splat_state re-randomized per forward → same input gave
+        # different memory. Now these nn.Parameter inits are expanded
+        # across the batch in init_streaming_state for determinism.
+        import math as _math
+        self.init_mu = nn.Parameter(
+            torch.randn(self.K, self.d) * (self.d ** -0.5)
+        )
+        self.init_log_diag_sigma = nn.Parameter(
+            torch.randn(self.K, self.d) * 0.1
+        )
+        target_w = 1.0 / self.K
+        self.init_w_raw = nn.Parameter(
+            torch.full((self.K,), _math.log(_math.exp(target_w) - 1.0))
+        )
+        # Signs start near 0 (tanh ≈ 0, high-gradient region).
+        self.init_s_logit = nn.Parameter(
+            torch.randn(self.K) * 0.1
+        )
+
     # ── Streaming interface ───────────────────────────────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype):
         from .splat_substrate import init_splat_state
@@ -1968,6 +2065,10 @@ class SplatBaselineEncoder(nn.Module):
         blobs = init_splat_state(
             batch_size, self.K, self.d, device,
             dtype=next(self.pin_encoder.parameters()).dtype,
+            init_mu=self.init_mu,
+            init_log_diag_sigma=self.init_log_diag_sigma,
+            init_w_raw=self.init_w_raw,
+            init_s_logit=self.init_s_logit,
         )
         zero = torch.zeros((), device=device, dtype=torch.float32)
         return {
@@ -1986,7 +2087,6 @@ class SplatBaselineEncoder(nn.Module):
         """One write pass over a window. Updates blobs via TransformerUpdater.
         Computes per-window aux losses (pin/proportional/adjust/sign-sat)
         and accumulates into state["aux_accum"]."""
-        del chunk_offset
         from .splat_substrate import (
             loss_pin, loss_proportional, loss_adjust, loss_sign_saturation,
         )
@@ -2002,6 +2102,11 @@ class SplatBaselineEncoder(nn.Module):
 
         # Encode pins
         pins = self.pin_encoder(token_embeds)                    # [B, T_w, d]
+        # Audit2 #5: sinusoidal PE so within-window token order matters.
+        T_w = pins.shape[1]
+        pe = _sinusoidal_pe(T_w, pins.shape[-1], offset=chunk_offset,
+                             device=pins.device, dtype=pins.dtype)
+        pins = pins + pe.unsqueeze(0)
         if attention_mask is not None:
             pins_pad_mask = ~attention_mask                       # True = padded
             # Defensively unmask position 0 in any row that's all-padded

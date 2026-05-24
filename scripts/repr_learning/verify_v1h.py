@@ -116,17 +116,21 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
     if variant == "continuous_baseline":
         return cfg.n_flat_codes * cfg.d_continuous
     if variant == "memorizing_baseline":
+        # MT post-retrieval bottleneck (the K tokens that reach Llama).
+        # See raw_bank_floats() for the full pre-retrieval bank size —
+        # MT is genuinely a "retrieval upper bound" with much more state.
         return cfg.n_flat_codes * cfg.d_mt_value
     if variant == "recurrent_baseline":
         return cfg.n_flat_codes * cfg.d_recurrent
     if variant == "plastic_baseline":
-        # Plastic does per-Llama-position reads via a MemInject pre-hook,
-        # not a prepended fixed-M block. The "bottleneck" here is the
-        # per-position bandwidth h_sub. Across T tokens per chunk the
-        # total bandwidth is T × h_sub — comparable to the other variants'
-        # one-shot M × h_sub bottleneck. We report h_sub as the per-call
-        # width; verify_v1h's bottleneck-parity check is variant-aware below.
-        return cfg.d_continuous
+        # Plastic state is the PER-BATCH fast weight matrix stack:
+        # plastic_depth layers × h_sub × h_sub (h_sub = d_continuous = 725
+        # by default). That's 8 × 725² ≈ 4.2M floats per example —
+        # ~161x the other "matched" baselines. Previously misreported as
+        # just h_sub (audit2 #1). Reporting honestly is non-negotiable
+        # for fair capacity comparison; architectural rebalance (low-rank
+        # updates, smaller depth) is a separate discussion.
+        return cfg.plastic_depth * cfg.d_continuous * cfg.d_continuous
     if variant == "splat_baseline":
         # Splat memory is K signed Gaussian blobs in a shared latent space
         # with diagonal Σ. Persistent state per batch element:
@@ -145,26 +149,28 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
 
 def decoder_interface_floats(variant: str, cfg: ReprConfig,
                               chunk_size: int = 4096) -> int:
-    """Floats that flow into the frozen Llama per decode step — the only
-    truly architecture-neutral capacity measure (the frozen decoder
-    interface is the same for all variants).
+    """Floats flowing into the frozen Llama per decode step.
+    Interpretation per family:
+      - Prepend (A/B/MT/Mamba/graph): M × d_llama (one-shot prepended tensor).
+      - MemInject (plastic, splat): PER-POSITION bandwidth (h_sub for
+        plastic, K_blobs for splat). The decoder pays this cost at every
+        decode position, but each position's delta is small compared to
+        the full persistent state.
 
-    Prepend variants (A/B/MT/Mamba/graph): M memory tokens × d_llama
-        — these are the prepended tensor's shape.
-    MemInject variants (plastic/splat): the modification is applied at
-        ONE layer to T positions; effective bandwidth per decode is
-        T × d_llama (full hidden dim) but the modification is computed
-        from a tiny state — the *information-theoretic* bound is the
-        state size, so we use bottleneck_floats() as the upper bound.
+    Note: this metric is NOT directly comparable across families. Use
+    the (state_KB, decoder_KB, compress_x) tuple holistically.
     """
     if variant == "vanilla_llama":
         return 0
-    if variant in ("plastic_baseline", "splat_baseline"):
-        # MemInject: information flowing through the layer hook is
-        # bounded above by the state. (The hook re-evaluates a function
-        # of the state at every position, but conveys at most state-many
-        # independent floats of new info.)
-        return bottleneck_floats(variant, cfg)
+    if variant == "plastic_baseline":
+        # Per-position: rank-bounded delta of size h_sub flowing into one
+        # Llama layer's hidden_states. Full state is plastic_depth · h_sub²
+        # but only h_sub-worth of info enters per token.
+        return cfg.d_continuous
+    if variant == "splat_baseline":
+        # Per-position: density evaluation produces K-blob mixture values
+        # of size K (one scalar per blob, weighted by ρ).
+        return cfg.splat_K
     # Prepend variants — M memory tokens at d_llama dim, one per chunk
     M = cfg.n_flat_codes if variant != "graph_baseline" else cfg.graph_K_max
     return M * cfg.d_llama
@@ -182,6 +188,20 @@ def compression_ratio(variant: str, cfg: ReprConfig,
         return 0.0
     input_floats = chunk_size * cfg.d_llama  # raw embedding bytes
     return input_floats / state
+
+
+def raw_bank_floats(variant: str, cfg: ReprConfig,
+                    chunk_size: int = 4096) -> int:
+    """Pre-retrieval/pre-compression raw state held by the encoder.
+    For MT this is the full key+value bank (chunk_size × 2 × d_value) —
+    far larger than what reaches Llama. Other variants typically equal
+    their bottleneck_floats (no separate bank). Audit2 #3."""
+    if variant == "memorizing_baseline":
+        # Full bank: every context token's (key, value) is kept until
+        # question-conditioned retrieval. This is MT's "non-parametric
+        # storage" à la Memorizing Transformer.
+        return chunk_size * 2 * cfg.d_mt_value
+    return bottleneck_floats(variant, cfg)
 
 
 def encoder_trainable_params(variant: str, llama, cfg: ReprConfig) -> int:
@@ -318,60 +338,17 @@ def audit_variant(variant, llama, tokenizer, cfg, batch_mixed, batch_composite, 
     allpad_ok = allpad_delta < 1e-3 if variant not in ("vanilla_llama",) else True
 
     # ---- (F) Zero-memory ablation ----
-    # Override the encoder's output with zeros and re-run.
+    # Audit2 #8: use the unified zero_memory=True kwarg on compute_qa_loss
+    # instead of per-variant monkey-patching. The kwarg drops M=0 for
+    # prepend and skips MemInject hooks for plastic/splat, so the delta
+    # is variant-neutral and matches eval_zero_mem.py.
     if variant == "vanilla_llama":
-        # No memory anyway; ablation is trivially 0.
         delta = 0.0
         print(f"  [F] zero-mem ablation: N/A (vanilla has no memory)")
-    elif variant == "memorizing_baseline":
-        # MT: override retrieve_for_query to return zeros
-        orig = model.encoder.retrieve_for_query
-        def zero_retrieve(bank, question_embeds, question_mask, K):
-            mem, aux_ret = orig(bank, question_embeds, question_mask, K)
-            return torch.zeros_like(mem), aux_ret
-        model.encoder.retrieve_for_query = zero_retrieve
-        with torch.no_grad():
-            out_zm = model.compute_qa_loss(batch_mixed)
-        delta = float(out_zm["loss_recon"]) - recon
-        model.encoder.retrieve_for_query = orig
-        print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
-              f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
-    elif variant == "plastic_baseline":
-        # Plastic: substrate effect is via the inject pre-hook on a Llama
-        # layer. Override `inject` to a no-op (returns hidden_states unchanged).
-        orig = model.encoder.inject
-        def zero_inject(hidden_states, fast_state):
-            return hidden_states
-        model.encoder.inject = zero_inject
-        with torch.no_grad():
-            out_zm = model.compute_qa_loss(batch_mixed)
-        delta = float(out_zm["loss_recon"]) - recon
-        model.encoder.inject = orig
-        print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
-              f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
-    elif variant == "splat_baseline":
-        # Splat: same inject-hook pattern as plastic. Override to no-op.
-        orig = model.encoder.inject
-        def zero_inject(hidden_states, blobs):
-            return hidden_states
-        model.encoder.inject = zero_inject
-        with torch.no_grad():
-            out_zm = model.compute_qa_loss(batch_mixed)
-        delta = float(out_zm["loss_recon"]) - recon
-        model.encoder.inject = orig
-        print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
-              f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
     else:
-        # A/B/Mamba: override finalize_memory to return zeros
-        orig = model.encoder.finalize_memory
-        def zero_finalize(state):
-            mem, aux_fin = orig(state)
-            return torch.zeros_like(mem), aux_fin
-        model.encoder.finalize_memory = zero_finalize
         with torch.no_grad():
-            out_zm = model.compute_qa_loss(batch_mixed)
+            out_zm = model.compute_qa_loss(batch_mixed, zero_memory=True)
         delta = float(out_zm["loss_recon"]) - recon
-        model.encoder.finalize_memory = orig
         print(f"  [F] zero-mem ablation: recon_with_mem={recon:.3f}  "
               f"recon_zero_mem={float(out_zm['loss_recon']):.3f}  Δ={delta:+.3f}")
 
@@ -492,27 +469,35 @@ def main():
     # Tokens, Mamba SSM literature). No single "memory capacity" number
     # is unbiased; report a vector that lets readers compare on the axis
     # they care about.
-    print(f"\n{'='*78}\n  CAPACITY VECTOR (4 numbers per variant + compression ratio)\n{'='*78}")
-    cap_header = (f"  {'variant':<22} {'state_KB':>9} {'decoder_KB':>11} "
-                  f"{'enc_params':>11} {'compress_x':>11}")
+    print(f"\n{'='*94}\n  CAPACITY VECTOR (5 numbers per variant + compression ratio)\n{'='*94}")
+    cap_header = (f"  {'variant':<22} {'state_KB':>10} {'raw_bank_KB':>12} "
+                  f"{'decoder_KB':>12} {'enc_params':>12} {'compress_x':>11}")
     print(cap_header)
     print("  " + "-" * (len(cap_header) - 2))
     for r in summary:
         state = bottleneck_floats(r["variant"], cfg)
+        raw_bank = raw_bank_floats(r["variant"], cfg)
         dec = decoder_interface_floats(r["variant"], cfg)
         compress = compression_ratio(r["variant"], cfg)
         try:
             enc_params = encoder_trainable_params(r["variant"], llama, cfg)
         except Exception:
             enc_params = -1
-        print(f"  {r['variant']:<22} {state * 4 / 1024:>9.1f} "
-              f"{dec * 4 / 1024:>11.1f} "
-              f"{enc_params:>11,} "
+        print(f"  {r['variant']:<22} {state * 4 / 1024:>10.1f} "
+              f"{raw_bank * 4 / 1024:>12.1f} "
+              f"{dec * 4 / 1024:>12.1f} "
+              f"{enc_params:>12,} "
               f"{compress:>10.1f}x")
-    print("\n  state_KB     = total persistent state across the encode (fp32 bytes/1024)")
-    print("  decoder_KB   = floats flowing into frozen Llama per decode (interface bandwidth)")
+    print("\n  state_KB     = persistent state seen by Llama (post-retrieval for MT, equals raw for others)")
+    print("  raw_bank_KB  = total raw state the encoder holds (MT keeps full per-token KV; others = state_KB)")
+    print("  decoder_KB   = floats flowing into Llama per decode (prepend: M·d_llama; MemInject: per-position bw)")
     print("  enc_params   = trainable parameters in encoder only (excludes frozen Llama)")
     print("  compress_x   = chunk_size·d_llama / state_floats — raw input bytes / state bytes")
+    print("\n  Notes:")
+    print("  - MT has ~227x larger raw_bank than state_KB (full bank pre-retrieval); it's a")
+    print("    'retrieval upper bound' — much more state than the matched baselines.")
+    print("  - graph's decoder_KB is 1.9x prepend baselines (K_max=68 vs M=36 tokens).")
+    print("  - plastic's state is 161x baselines (8 layers × h_sub² fast weights), not 1/36th.")
 
     print(f"\n  OVERALL: {'PASS — safe to launch 10k run' if all_ok else 'FAIL — do not launch'}")
 
