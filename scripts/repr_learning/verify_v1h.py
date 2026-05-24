@@ -108,7 +108,9 @@ CRITICAL_PARAMS = {
 
 
 def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
-    """Per-query floats at the pre-projection point."""
+    """Per-query floats at the pre-projection point — the 'total state'
+    column of the 4-number bottleneck vector. Counts what persists
+    across the encode."""
     if variant == "flat_baseline":
         return cfg.n_flat_codes * cfg.d_concept_baseline
     if variant == "continuous_baseline":
@@ -139,6 +141,63 @@ def bottleneck_floats(variant: str, cfg: ReprConfig) -> int:
     if variant == "vanilla_llama":
         return 0
     raise ValueError(variant)
+
+
+def decoder_interface_floats(variant: str, cfg: ReprConfig,
+                              chunk_size: int = 4096) -> int:
+    """Floats that flow into the frozen Llama per decode step — the only
+    truly architecture-neutral capacity measure (the frozen decoder
+    interface is the same for all variants).
+
+    Prepend variants (A/B/MT/Mamba/graph): M memory tokens × d_llama
+        — these are the prepended tensor's shape.
+    MemInject variants (plastic/splat): the modification is applied at
+        ONE layer to T positions; effective bandwidth per decode is
+        T × d_llama (full hidden dim) but the modification is computed
+        from a tiny state — the *information-theoretic* bound is the
+        state size, so we use bottleneck_floats() as the upper bound.
+    """
+    if variant == "vanilla_llama":
+        return 0
+    if variant in ("plastic_baseline", "splat_baseline"):
+        # MemInject: information flowing through the layer hook is
+        # bounded above by the state. (The hook re-evaluates a function
+        # of the state at every position, but conveys at most state-many
+        # independent floats of new info.)
+        return bottleneck_floats(variant, cfg)
+    # Prepend variants — M memory tokens at d_llama dim, one per chunk
+    M = cfg.n_flat_codes if variant != "graph_baseline" else cfg.graph_K_max
+    return M * cfg.d_llama
+
+
+def compression_ratio(variant: str, cfg: ReprConfig,
+                      chunk_size: int = 4096) -> float:
+    """Input bytes / state bytes. Higher = harder compression.
+    Universal across architectures because both sides are measured in
+    same units (fp32 floats × 4 bytes)."""
+    if variant == "vanilla_llama":
+        return 0.0
+    state = bottleneck_floats(variant, cfg)
+    if state == 0:
+        return 0.0
+    input_floats = chunk_size * cfg.d_llama  # raw embedding bytes
+    return input_floats / state
+
+
+def encoder_trainable_params(variant: str, llama, cfg: ReprConfig) -> int:
+    """Count trainable params in the encoder module only (decoder
+    contributions are frozen Llama + tiny mask_embed). For fair compare
+    against Memorizing Transformer-style 'non-parametric' arches."""
+    from src.repr_learning.model import ReprLearningModel
+    m = ReprLearningModel(cfg, variant=variant, llama_model=llama)
+    total = 0
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("encoder."):
+            total += p.numel()
+    del m
+    return total
 
 
 @torch.enable_grad()
@@ -366,7 +425,7 @@ def main():
         r = audit_variant(v, llama, tok, cfg, batch_mixed, None, device)
         summary.append(r)
 
-    print(f"\n{'='*78}\n  SUMMARY\n{'='*78}")
+    print(f"\n{'='*78}\n  SUMMARY (health checks)\n{'='*78}")
     header = f"  {'variant':<22} {'finite':>7} {'grads':>7} {'aux%':>6} {'bn_floats':>10} {'Δ_mem':>8}"
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -427,6 +486,33 @@ def main():
     else:
         print(f"\n  ✗ FAIL: bottleneck mismatch: {sorted(set(bn_vals))}")
         all_ok = False
+
+    # ── 4-number bottleneck vector ───────────────────────────────────────
+    # Per research-recommended methodology (Memorizing Transformer, Gist
+    # Tokens, Mamba SSM literature). No single "memory capacity" number
+    # is unbiased; report a vector that lets readers compare on the axis
+    # they care about.
+    print(f"\n{'='*78}\n  CAPACITY VECTOR (4 numbers per variant + compression ratio)\n{'='*78}")
+    cap_header = (f"  {'variant':<22} {'state_KB':>9} {'decoder_KB':>11} "
+                  f"{'enc_params':>11} {'compress_x':>11}")
+    print(cap_header)
+    print("  " + "-" * (len(cap_header) - 2))
+    for r in summary:
+        state = bottleneck_floats(r["variant"], cfg)
+        dec = decoder_interface_floats(r["variant"], cfg)
+        compress = compression_ratio(r["variant"], cfg)
+        try:
+            enc_params = encoder_trainable_params(r["variant"], llama, cfg)
+        except Exception:
+            enc_params = -1
+        print(f"  {r['variant']:<22} {state * 4 / 1024:>9.1f} "
+              f"{dec * 4 / 1024:>11.1f} "
+              f"{enc_params:>11,} "
+              f"{compress:>10.1f}x")
+    print("\n  state_KB     = total persistent state across the encode (fp32 bytes/1024)")
+    print("  decoder_KB   = floats flowing into frozen Llama per decode (interface bandwidth)")
+    print("  enc_params   = trainable parameters in encoder only (excludes frozen Llama)")
+    print("  compress_x   = chunk_size·d_llama / state_floats — raw input bytes / state bytes")
 
     print(f"\n  OVERALL: {'PASS — safe to launch 10k run' if all_ok else 'FAIL — do not launch'}")
 

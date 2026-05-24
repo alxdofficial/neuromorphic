@@ -159,7 +159,14 @@ def train_one_variant(
 
     jsonl_path = out_dir / f"jsonl/{variant}.jsonl"
     ckpt_path = out_dir / f"ckpts/{variant}.last.pt"
+    best_ckpt_path = out_dir / f"ckpts/{variant}.best.pt"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    # Best-checkpoint tracking. Only consider vals from step >= BEST_MIN_STEP
+    # (10% of total steps, min 1000) to filter early-warmup flukes — LR is
+    # still ramping and val noise dominates real signal at low steps.
+    best_val_recon = float("inf")
+    best_val_step = -1
+    BEST_MIN_STEP = max(1000, n_steps // 10)
 
     if is_vanilla:
         # Eval-only path. Skip any prior jsonl and run a single final-val pass.
@@ -284,6 +291,14 @@ def train_one_variant(
             print(f"    [val @ {step}]  recon={vm['val_loss_recon']:.4f}  "
                   f"top1={vm['val_top1_acc']*100:.1f}%",
                   flush=True)
+            # Best-checkpoint save: only past the warmup-fluke window.
+            if (step >= BEST_MIN_STEP
+                    and vm["val_loss_recon"] < best_val_recon):
+                best_val_recon = vm["val_loss_recon"]
+                best_val_step = step
+                save_checkpoint(model, opt, step, best_ckpt_path)
+                print(f"    [best ckpt @ {step}]  val_recon={best_val_recon:.4f}",
+                      flush=True)
 
         if step > 0 and step % save_every == 0:
             # `step` here is the last completed step. Resume reads N → starts at N+1.
@@ -316,6 +331,9 @@ def train_one_variant(
         "final_val_loss_recon": final_val["val_loss_recon"],
         "final_val_top1_acc": final_val["val_top1_acc"],
         "final_val_per_family": final_val["val_per_family"],
+        "best_val_loss_recon": (best_val_recon if best_val_step >= 0
+                                else final_val["val_loss_recon"]),
+        "best_val_step": best_val_step,
     }
     del model, opt
     torch.cuda.empty_cache()

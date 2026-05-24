@@ -473,29 +473,16 @@ class NarrativeQADataset(IterableDataset):
             # Tokenize document fully (this can be slow for very long docs)
             doc_ids = tok(doc_text, add_special_tokens=False,
                            return_attention_mask=False)["input_ids"]
-
-            # Try to find the answer span in the document tokens
             a_ids_full = tok(a_text, add_special_tokens=False,
                               return_attention_mask=False)["input_ids"]
-            anchor_pos = -1
-            if len(a_ids_full) > 0 and len(a_ids_full) <= 40:
-                # Naive substring search on token list
-                target = a_ids_full
-                for i in range(0, len(doc_ids) - len(target) + 1, 1):
-                    if doc_ids[i:i + len(target)] == target:
-                        anchor_pos = i
-                        break
 
-            if anchor_pos >= 0:
-                # Center the window on the answer (with some randomness)
-                half = cs // 2
-                jitter = rng.randint(-half // 4, half // 4)
-                start = max(0, anchor_pos + len(a_ids_full) // 2 - half + jitter)
-                start = min(start, max(0, len(doc_ids) - cs))
-            else:
-                # Answer not found in tokens (paraphrase or oov tokenization).
-                # Random window — model still tries to answer from partial context.
-                start = rng.randint(0, max(0, len(doc_ids) - cs))
+            # Random window. (Prior version centered the window on a
+            # substring-match of the answer in the document — that leaks
+            # the answer location at training time, which is an oracle the
+            # model wouldn't have at deploy time. Random window is the
+            # honest baseline; pair with summary-as-context mode if a
+            # "retrieval-free ceiling" is wanted.)
+            start = rng.randint(0, max(0, len(doc_ids) - cs))
 
             ctx_tokens = doc_ids[start:start + cs]
             valid_len = len(ctx_tokens)
