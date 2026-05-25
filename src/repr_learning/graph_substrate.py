@@ -95,7 +95,7 @@ def expert_choice_routing(
     proposed_endpoints: Tensor,       # [B, 2K, d_node] — fresh proposals (proposed_src then proposed_dst)
     strength_scale: float = 8.0,
     margin: Optional[float] = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Each existing endpoint picks its top-1 NON-SELF proposal by cosine affinity.
 
     CRITICAL — self-mask. Proposals are emitted as residuals from old slot content
@@ -127,8 +127,15 @@ def expert_choice_routing(
         pick_count   : [B, 2K] int — # endpoints that picked each proposal
                        (column reduction of the picks). Decoupled from update_alpha
                        so u (popularity) and admission can use independent signals.
+        load_balance_loss : scalar — Switch Transformer (Fedus et al. 2021)
+                       2K · Σ_p (f_p · P_p) where f_p = empirical pick fraction,
+                       P_p = average softmax probability per proposal. Equals 1
+                       at perfectly uniform routing, > 1 under concentration.
+                       Returned RAW; coefficient applied in model.compute_qa_loss
+                       (cfg.load_balance_coef = 0.01 by Switch Transformer default).
     """
     import math
+    from .selection import load_balance_loss as _load_balance_loss
     B, twoK, d = endpoints.shape
 
     e_norm = F.normalize(endpoints, dim=-1, eps=1e-6)            # [B, 2K, d]
@@ -142,6 +149,15 @@ def expert_choice_routing(
     # Pick top-1 non-self proposal per endpoint
     pick_strength, picked_idx = affinity.max(dim=-1)              # [B, 2K]
 
+    # Load-balance loss on the routing distribution (Switch Transformer formula).
+    # Computed on the affinity matrix BEFORE the alpha-gate (which is the actual
+    # routing decision). The masked diagonal contributes ~0 probability via
+    # softmax(-inf) = 0, so self-pick can't game the loss. Without this aux loss,
+    # the routing collapses: all proposals end up similar → all endpoints pick
+    # the same target → state field degenerates (verified empirically v1h_t4k_v3,
+    # state_diversity ≈ 0.0001).
+    lb_loss = _load_balance_loss(affinity, picks=picked_idx)
+
     # Update strength = sigmoid(scale · (cos - margin)).
     if margin is None:
         margin = math.sqrt(2.0 * math.log(max(twoK, 2)) / max(d, 1))
@@ -153,7 +169,7 @@ def expert_choice_routing(
     pick_count = one_hot.sum(dim=1)                               # [B, 2K proposal]
     novelty = 1.0 / (1.0 + pick_count)                            # in (0, 1]
 
-    return picked_idx, update_alpha, novelty, pick_count
+    return picked_idx, update_alpha, novelty, pick_count, lb_loss
 
 
 def gather_picked_proposals(

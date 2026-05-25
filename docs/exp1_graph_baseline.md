@@ -297,3 +297,71 @@ patience is in flight.
 - The architecture may shine on tasks where edges-as-relations carry
   load: kinship chains (CLUTRR), state tracking (Boxes), versioned
   facts. None of those are weighted heavily in this mix.
+
+## Diagnostic deep-dive: within-chunk state collapse (2026-05-25)
+
+Post-training analysis on `best.pt @ step 7500`:
+
+**Probes run:**
+1. **Slot diversity over windows (random + real data, multiple seeds):**
+   Per-slot state vectors collapse from init diversity 0.93 to ~**0.0001**
+   after the first window of writes. Per-element std across slots ≈ 0.2%
+   of vector norm — slots are functionally identical within a chunk.
+   src/dst maintain modest diversity (~0.07-0.28) because routing
+   preserves SOME differentiation, but state is degenerate.
+2. **Cross-chunk variance:** Mean-state across 8 val batches has
+   diversity 0.57 — different chunks produce different states, but
+   each chunk's slots all converge to that chunk's single direction.
+3. **State ablation:** zeroing the state field hurts val_recon by
+   only +0.12 nat (3.22 → 3.34); randomizing it hurts +0.13 nat.
+   For comparison, the gap to mamba is 0.55 nat. State contributes
+   weakly; the readout has learned to mostly ignore it.
+4. **Top-1 inversion:** ablating state to zero raises top-1 accuracy
+   from 35.7% to 38.2% (random state: 40.5%) — the degenerate signal
+   is mildly *harmful* for top-1.
+5. **Train loss trajectory:** train loss plateaus at the same 2.5-2.9
+   range from step 4500-10000 — rules out under-training. Model is
+   stuck, not learning more.
+6. **Routing concentration probe:** pick_count after training has
+   max=12 (vs uniform mean=1.0), 43% of proposals get zero picks.
+   Routing IS concentrated, BUT proposed_endpoint diversity is 0.002
+   (all proposals are essentially the same direction), so the
+   concentration is forced by proposal homogeneity, not routing
+   preference.
+
+**Root cause:** the TransformerUpdater has shared weights across all K=68
+slots. Its output deltas converge to a single direction during training
+(whatever the QA loss prefers globally). All slots get added the same
+delta → all proposals are similar → routing concentrates on a few
+"closest" proposals → state field carries only chunk-level information.
+
+## Fix: load-balance auxiliary loss (Switch Transformer, Fedus 2021)
+
+Added to combat the diagnosed collapse:
+```
+load_balance_loss = N · Σ_p (f_p · P_p)
+  f_p = fraction of endpoints whose argmax landed on proposal p
+  P_p = mean softmax probability for proposal p across endpoints
+  N = 2 × K_max = 136
+```
+Equals 1.0 at perfectly uniform routing; > 1.0 under concentration.
+Coefficient: `cfg.load_balance_coef = 0.01` (Switch Transformer default,
+already used by 5 other variants; no new hyperparameter).
+
+**Caveat from the empirical probe:** with our specific failure mode
+(proposals all-similar), the softmax distribution P_p is near-uniform
+even when actual pick_count f_p is concentrated. The Switch formula
+`N·Σf·P` collapses to `Σf = 1.0` when P is uniform, regardless of f.
+So at inference on the collapsed ckpt, LB reads 1.0 despite
+concentration. The hope is that during training the gradient signal
+(small but nonzero) breaks the symmetry early, before proposals fully
+homogenize. If this doesn't pan out, the next fix is a direct
+proposal-orthogonality penalty `||P̃ᵀ P̃ − I||²` summed off-diagonal,
+which targets proposal homogeneity directly. That stays under the same
+0.01 coef bucket so still zero new hyperparameters.
+
+Implementation: `src/repr_learning/graph_substrate.py:expert_choice_routing`
+returns LB loss as 5th tuple element; encoder accumulates across windows
+and surfaces averaged value via the standard `load_balance_loss` aux key.
+`model.compute_qa_loss` already weights this by `cfg.load_balance_coef`
+for all variants.

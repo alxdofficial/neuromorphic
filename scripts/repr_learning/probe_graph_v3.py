@@ -66,7 +66,7 @@ def probe_self_pick(enc, n_windows=5, seed=0):
         proposals = enc.updater(pins, edges_old, pins_pad_mask=None)
         endpoints = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
         proposed_endpoints = torch.cat([proposals["src"], proposals["dst"]], dim=1)
-        picked_idx, alpha, _novelty, _pc = expert_choice_routing(
+        picked_idx, alpha, _novelty, _pc, _lb = expert_choice_routing(
             endpoints, proposed_endpoints, strength_scale=enc.update_strength_scale,
         )
         self_pick = (picked_idx == torch.arange(2 * K).unsqueeze(0)).float().mean()

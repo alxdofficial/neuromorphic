@@ -1960,6 +1960,9 @@ class GraphBaselineEncoder(nn.Module):
             # Cross-window diagnostic accumulators (no aux loss)
             "pick_strength_accum": zero.clone(),
             "overwrite_count_accum": zero.clone(),
+            # Load-balance aux loss accumulator (Switch Transformer, Fedus 2021).
+            # Weighted by cfg.load_balance_coef=0.01 in model.compute_qa_loss.
+            "lb_loss_accum": zero.clone(),
         }
 
     def streaming_write(
@@ -2025,7 +2028,7 @@ class GraphBaselineEncoder(nn.Module):
         endpoints = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
         # [B, 2K, d_node]
         proposed_endpoints = torch.cat([proposals["src"], proposals["dst"]], dim=1)
-        picked_idx, update_alpha, novelty, pick_count = expert_choice_routing(
+        picked_idx, update_alpha, novelty, pick_count, lb_loss = expert_choice_routing(
             endpoints, proposed_endpoints,
             strength_scale=self.update_strength_scale,
         )
@@ -2139,10 +2142,14 @@ class GraphBaselineEncoder(nn.Module):
         new_outer_state["n_windows"] = state["n_windows"] + 1
         new_outer_state["pick_strength_accum"] = state["pick_strength_accum"] + pick_strength_mean
         new_outer_state["overwrite_count_accum"] = state["overwrite_count_accum"] + overwrite_count
+        # Accumulate LB loss with gradient flow (the aux loss term).
+        # Per-window, then averaged across windows in finalize_memory.
+        new_outer_state["lb_loss_accum"] = state["lb_loss_accum"] + lb_loss.to(state["lb_loss_accum"].dtype)
 
         return new_outer_state, {
             "graph_pick_strength": pick_strength_mean,
             "graph_overwrite_count": overwrite_count,
+            "graph_lb_loss": lb_loss.detach(),
         }
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
@@ -2176,11 +2183,19 @@ class GraphBaselineEncoder(nn.Module):
             overwrites_per_row_per_window = (state["overwrite_count_accum"] / max(n_w * B, 1)).to(torch.float32)
             age_mean = edges["age"].mean()
 
+        # Switch Transformer load-balance loss, averaged over the windows
+        # in this chunk. Surfaced under the standard `load_balance_loss`
+        # key — model.compute_qa_loss already multiplies it by
+        # cfg.load_balance_coef (=0.01, the literature default).
+        # Added to combat empirically-verified state-field collapse in
+        # v1h_t4k_v3 (state diversity ≈ 0.0001 across slots) — see
+        # `docs/exp1_graph_baseline.md` for the diagnostic.
+        lb_loss_avg = (state["lb_loss_accum"] / n_w).to(memory.dtype)
+
         aux = {
-            # No load_balance for graph_baseline (no codebook routing).
-            "load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype),
-            # No graph_aux — no auxiliary loss. Keep the key for
-            # downstream compatibility (model.py reads it as optional).
+            "load_balance_loss": lb_loss_avg,
+            # graph_aux kept for backward compatibility (zero; the actual
+            # aux loss now flows via load_balance_loss above).
             "graph_aux": torch.zeros((), device=device, dtype=memory.dtype),
             "graph_u_mean": u_mean,
             "graph_src_norm": src_norm,
@@ -2188,6 +2203,7 @@ class GraphBaselineEncoder(nn.Module):
             "graph_pick_strength_avg": pick_strength_mean,
             "graph_overwrites_per_row_per_window": overwrites_per_row_per_window,
             "graph_age_mean": age_mean,
+            "graph_lb_loss": lb_loss_avg.detach(),
         }
         return memory, aux
 

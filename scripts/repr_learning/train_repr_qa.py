@@ -342,7 +342,7 @@ def train_one_variant(
         for key in ("graph_aux", "graph_endpoint_reuse",
                     "graph_u_mean", "graph_pick_strength_avg",
                     "graph_overwrites_per_row_per_window", "graph_age_mean",
-                    "graph_src_norm"):
+                    "graph_src_norm", "graph_lb_loss"):
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         jsonl_fp.write(json.dumps(row) + "\n")
