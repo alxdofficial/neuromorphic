@@ -1,30 +1,35 @@
-"""Exp 1: graph substrate — bounded budget of continuous edges.
+"""Graph substrate: expert-choice routing + derived saliency.
 
-Memory is K_max edges, each (src, dst, state) ∈ R^d_node × R^d_node × R^d_state.
-All endpoints and states are continuous (no codebook constraint — relaxes V2.1's
-4096-node quantization). Nodes are implicit in edge endpoints; reusing an
-endpoint vector across edges = sharing a node.
+Per-window protocol:
+  1. GraphUpdater emits K_max (src, dst, state) proposals via cross-attention
+     to the input pins. NO gates, NO saliency_delta — just the proposals.
+  2. Expert-choice routing: every existing endpoint (2·K_max of them, src+dst
+     across all slots) picks the proposal with which it has highest cosine
+     affinity. Each endpoint then updates toward its pick, with strength
+     gated by the affinity score (high score = full overwrite, low = no-op).
+     Reuse falls out of geometry: similar existing endpoints pick the same
+     proposal and converge, like k-means cluster centers.
+  3. Saliency = EMA of POPULARITY (no learned scalar). Popularity =
+     pick_count / (pick_count + 1) ∈ [0, 1), where pick_count is how many
+     endpoints picked this slot's proposed endpoints (column reduction of
+     the routing matrix). A slot whose proposals are repeatedly picked has
+     high saliency; one whose proposals are ignored decays toward zero.
+     Used to gate readout and to identify eviction victims when novel
+     proposals arrive. Was previously wired to update_alpha (selectivity,
+     a row property of the picker) — fixed.
+  4. Eviction/creation: top-N most novel proposals and bottom-N deadest
+     eligible slots are paired; each pair is admitted iff `novelty > u`
+     (the proposal is more novel than the slot is alive). Fully
+     comparative — no absolute thresholds. Cap N = ⌈5% × K_max⌉ ≈ 3.
 
-Per 1024-token window, a TransformerUpdater reads (encoded pin tokens +
-current edge tokens) and outputs for each edge slot:
-    - proposed (src, dst, state)
-    - keep_gate ∈ [0,1]: preserve old vs overwrite with proposed
-    - saliency ∈ [0,1]: per-edge confidence, used in prepend tokens
+Read (handled in encoder.GraphReadout): directional W_src / W_dst transforms
+(R-GCN-style) then a cross-edge message-passing block, then projection to
+d_llama. Saliency gate multiplies each token's contribution.
 
-Connectivity (the distinguishing ingredient): proposed endpoints get
-soft-snapped to existing endpoint vectors via attention, with a learned
-snap_gate per emission. L_connectivity penalizes "novel but similar to
-existing" — encourages a graph with shared nodes rather than 2·K_max
-disjoint endpoints.
-
-Read: K_max edges projected to d_llama via fused MLP (concat(src, dst, state)
-→ d_llama), prepended to Llama input (same pattern as B/MT, no MemInject hook).
-
-See docs/exp1_graph_baseline.md for full design.
+See docs/exp1_graph_baseline.md for full design + citations.
 """
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -43,18 +48,15 @@ def init_graph_state(
     init_src: Optional[Tensor] = None,        # [K_max, d_node] learned init
     init_dst: Optional[Tensor] = None,
     init_state: Optional[Tensor] = None,
-    init_saliency_logit: float = -4.0,         # sigmoid(-4) ≈ 0.018
+    grace_windows: int = 4,
 ) -> dict:
-    """Initial graph state, deterministic given (B, init_*).
+    """Initial state for expert-choice graph.
 
-    Caller passes learned init parameters from the encoder (one set per
-    K_max slot). These are expanded across the batch — same input must
-    produce same memory in eval mode (no per-forward randomness).
-
-    saliency_logit defaults to -4 so new/untrained slots start LOW
-    priority (≈0.02). The updater can raise saliency via its delta head
-    when it decides a slot is informative; high-saliency edges then
-    become "sticky" via L_adjust weighting.
+    Slot state:
+      src, dst, state — same as before, from learned init parameters.
+      u   — EMA of pick-affinity (init 1.0 so first windows have max-priority).
+      age — windows since last overwrite (init = grace_windows so initial slots
+            are immediately eligible after grace expires).
     """
     if init_src is None:
         src = torch.zeros(B, K_max, d_node, device=device, dtype=dtype)
@@ -68,166 +70,269 @@ def init_graph_state(
         state = torch.zeros(B, K_max, d_state, device=device, dtype=dtype)
     else:
         state = init_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
-    saliency_logit = torch.full(
-        (B, K_max), float(init_saliency_logit), device=device, dtype=dtype,
+
+    # u init 1.0 = max priority. Combined with age >= grace at init, all initial
+    # slots are protected for one full grace cycle, then compete on merit.
+    u = torch.ones(B, K_max, device=device, dtype=dtype)
+    age = torch.full(
+        (B, K_max), float(grace_windows), device=device, dtype=torch.float32,
     )
     return {
-        "src": src,                          # [B, K_max, d_node]
-        "dst": dst,                          # [B, K_max, d_node]
-        "state": state,                      # [B, K_max, d_state]
-        "saliency_logit": saliency_logit,    # [B, K_max]  (sigmoid → [0,1])
+        "src": src,
+        "dst": dst,
+        "state": state,
+        "u": u,
+        "age": age,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Soft snap to existing endpoints
+# Expert-choice routing (B)
 # ─────────────────────────────────────────────────────────────────────────
 
-def soft_snap(
-    predicted_v: Tensor,         # [B, K_max, d_node]   fresh proposals
-    endpoint_bank: Tensor,       # [B, 2*K_max, d_node] all current src+dst
-    snap_gate: Tensor,           # [B, K_max] in [0,1]  learned snap coefficient
-    *,
-    temperature: float = 0.1,
-    top_k: int = 4,
-    exclude_self: bool = True,
-) -> tuple[Tensor, Tensor]:
-    """Soft snap proposed endpoint to nearest existing endpoint.
+def expert_choice_routing(
+    endpoints: Tensor,                # [B, 2K, d_node] — existing endpoints (src then dst stacked)
+    proposed_endpoints: Tensor,       # [B, 2K, d_node] — fresh proposals (proposed_src then proposed_dst)
+    strength_scale: float = 8.0,
+    margin: Optional[float] = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Each existing endpoint picks its top-1 NON-SELF proposal by cosine affinity.
 
-    output = snap_gate · (attention over endpoint_bank by similarity to predicted)
-           + (1 − snap_gate) · predicted_v
+    CRITICAL — self-mask. Proposals are emitted as residuals from old slot content
+    (proposed_endpoint[i] = old_endpoint[i] + Δ from a small-init head). Without
+    masking, endpoint i would always pick proposal i (its own near-identical
+    residual), defeating the entire expert-choice clustering mechanism. We mask
+    the diagonal so each endpoint must choose among OTHER slots' proposals.
 
-    With (temperature=0.1, top_k=4) the attention concentrates ~95%+ mass
-    on the nearest single endpoint — actually behaves like a snap rather
-    than a diffuse average. Top-k masking before softmax bounds gradient
-    flow to the K nearest candidates.
+    Update-strength margin. Without a margin, cosine=0 (random) maps to α=0.5
+    (large update toward noise). We use sigmoid(scale · (cos - margin)) with
+    margin = sqrt(2·log(2K)/d) ≈ 0.28 for our config — the expected nearest-of-N
+    random cosine. So α stays near 0 unless the pick is clearly above noise.
 
-    exclude_self: endpoint_bank is conventionally arranged as
-        [src(0), src(1), ..., src(K-1), dst(0), dst(1), ..., dst(K-1)]
-    Slot i's proposal is a residual from its own old src/dst, so the
-    nearest match would always be itself unless we mask out positions
-    {i, K+i} per slot. Required for L_connectivity to actually push
-    toward sharing across slots, not self-stickiness.
+    Novelty signal — pick-count based.
+      novelty[p] = 1 / (1 + pick_count[p])
+        where pick_count[p] = number of endpoints whose argmax landed on p.
+      A proposal nobody picked → novelty = 1.0 (orphan, admit candidate).
+      A proposal popular with many endpoints → novelty → 0 (already covered).
+    This is a COLUMN reduction of the affinity matrix (vs u's ROW reduction),
+    structurally independent of u so the admission gate `novelty > u` can fire.
+    Same precedent as VQ-VAE codebook dead-code revival (EMA-usage thresholding).
+    Earlier draft used `1 - max_affinity` (row reduction), which was coupled
+    with u and made admission structurally impossible — bug fixed here.
 
-    Returns: (out_v, max_sim)
-        out_v  : [B, K_max, d_node] resolved endpoint vector
-        max_sim: [B, K_max] cosine similarity to the *nearest* non-self
-                            existing endpoint, used by L_connectivity.
+    Returns:
+        picked_idx   : [B, 2K] int — which proposal each endpoint picked (≠ self)
+        update_alpha : [B, 2K] in [0,1] — soft update strength
+        novelty      : [B, 2K] in (0, 1] — per-proposal novelty for admission
+        pick_count   : [B, 2K] int — # endpoints that picked each proposal
+                       (column reduction of the picks). Decoupled from update_alpha
+                       so u (popularity) and admission can use independent signals.
     """
-    B, K, d = predicted_v.shape
-    K2 = endpoint_bank.shape[1]
+    import math
+    B, twoK, d = endpoints.shape
 
-    pred_norm = F.normalize(predicted_v, dim=-1, eps=1e-6)             # [B, K, d]
-    bank_norm = F.normalize(endpoint_bank, dim=-1, eps=1e-6)           # [B, 2K, d]
-    sim = pred_norm @ bank_norm.transpose(-1, -2)                      # [B, K, 2K]
+    e_norm = F.normalize(endpoints, dim=-1, eps=1e-6)            # [B, 2K, d]
+    p_norm = F.normalize(proposed_endpoints, dim=-1, eps=1e-6)   # [B, 2K, d]
+    affinity = e_norm @ p_norm.transpose(-1, -2)                  # [B, 2K (endpoint), 2K (proposal)]
 
-    if exclude_self and K2 == 2 * K:
-        slot = torch.arange(K, device=sim.device)
-        self_mask = torch.zeros(K, K2, dtype=torch.bool, device=sim.device)
-        self_mask[slot, slot] = True               # self-src
-        self_mask[slot, K + slot] = True           # self-dst
-        sim = sim.masked_fill(self_mask.unsqueeze(0), float("-inf"))
+    # Self-mask diagonal — endpoint i CANNOT pick proposal i (its own residual)
+    diag_mask = torch.eye(twoK, dtype=torch.bool, device=affinity.device)
+    affinity = affinity.masked_fill(diag_mask.unsqueeze(0), float("-inf"))
 
-    # max_sim is computed AFTER self-mask so L_connectivity sees the
-    # nearest *other* endpoint, not the slot's own residual seed.
-    max_sim = sim.max(dim=-1).values                                   # [B, K]
+    # Pick top-1 non-self proposal per endpoint
+    pick_strength, picked_idx = affinity.max(dim=-1)              # [B, 2K]
 
-    # Top-k attention: zero out non-top-k similarities, then softmax with
-    # low temperature for sharp peak. K2 might be < top_k in degenerate
-    # configs, so guard the topk call.
-    k_eff = min(top_k, K2) if top_k is not None else K2
-    if k_eff < K2:
-        topk_vals, _ = sim.topk(k_eff, dim=-1)
-        threshold = topk_vals[..., -1:].detach()                       # [B, K, 1]
-        sim_attn = torch.where(
-            sim >= threshold, sim, torch.full_like(sim, float("-inf")),
-        )
-    else:
-        sim_attn = sim
+    # Update strength = sigmoid(scale · (cos - margin)).
+    if margin is None:
+        margin = math.sqrt(2.0 * math.log(max(twoK, 2)) / max(d, 1))
+    update_alpha = torch.sigmoid(strength_scale * (pick_strength - margin))
 
-    attn = F.softmax(sim_attn / temperature, dim=-1)                   # [B, K, 2K]
-    attended = attn @ endpoint_bank                                    # [B, K, d]
+    # Pick count: # endpoints whose argmax landed on each proposal
+    # one_hot[B, endpoint, proposal] = 1 iff this endpoint picked this proposal
+    one_hot = F.one_hot(picked_idx, num_classes=twoK).to(affinity.dtype)
+    pick_count = one_hot.sum(dim=1)                               # [B, 2K proposal]
+    novelty = 1.0 / (1.0 + pick_count)                            # in (0, 1]
 
-    sg = snap_gate.unsqueeze(-1)                                       # [B, K, 1]
-    out_v = sg * attended + (1.0 - sg) * predicted_v                   # [B, K, d]
-
-    return out_v, max_sim
+    return picked_idx, update_alpha, novelty, pick_count
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Auxiliary losses
-# ─────────────────────────────────────────────────────────────────────────
-
-def _row_mean(per_row: Tensor, has_real: Optional[Tensor]) -> Tensor:
-    """Mean over batch rows, masking all-padded rows."""
-    if has_real is None:
-        return per_row.mean()
-    mask = has_real.to(per_row.dtype)
-    n_real = mask.sum().clamp(min=1.0)
-    if per_row.dim() == 1:
-        return (per_row * mask).sum() / n_real
-    # broadcast mask across trailing dims
-    expand = (-1,) + (1,) * (per_row.dim() - 1)
-    return (per_row * mask.view(*expand)).sum() / (n_real * per_row[0].numel())
-
-
-def loss_connectivity(
-    snap_gate_src: Tensor,       # [B, K_max] ∈ [0,1]
-    snap_gate_dst: Tensor,       # [B, K_max]
-    max_sim_src: Tensor,         # [B, K_max]
-    max_sim_dst: Tensor,         # [B, K_max]
-    has_real: Optional[Tensor] = None,
+def gather_picked_proposals(
+    proposed_endpoints: Tensor,       # [B, 2K, d_node]
+    picked_idx: Tensor,                # [B, 2K] int
 ) -> Tensor:
-    """L_connectivity = mean over emitted endpoints of:
-                       max(sim_to_nearest, 0) · (1 − snap_gate)
-
-    Penalizes "you generated something near an existing endpoint but didn't
-    snap to it." Pushes the model toward graph connectivity — same vector
-    reused across multiple edges instead of two-near-clones.
-    """
-    pen_src = max_sim_src.clamp(min=0.0) * (1.0 - snap_gate_src)       # [B, K_max]
-    pen_dst = max_sim_dst.clamp(min=0.0) * (1.0 - snap_gate_dst)       # [B, K_max]
-    per_row = (pen_src.mean(dim=-1) + pen_dst.mean(dim=-1)) * 0.5     # [B]
-    return _row_mean(per_row, has_real)
-
-
-def loss_adjust(
-    edges_new: dict, edges_old: dict,
-    has_real: Optional[Tensor] = None,
-) -> Tensor:
-    """L_adjust = saliency-weighted L2 change in edge state between old/new.
-
-    Established (high-saliency) edges are stickier — penalized more for
-    being modified. Newly-created/low-saliency edges can change freely.
-    """
-    # Use OLD saliency as the stickiness weight (established knowledge is sticky)
-    weight = torch.sigmoid(edges_old["saliency_logit"])                # [B, K_max]
-    denom = weight.sum(dim=-1).clamp(min=1e-6)                         # [B]
-
-    delta_src = (edges_new["src"] - edges_old["src"]).pow(2).sum(-1)   # [B, K_max]
-    delta_dst = (edges_new["dst"] - edges_old["dst"]).pow(2).sum(-1)
-    delta_st = (edges_new["state"] - edges_old["state"]).pow(2).sum(-1)
-    delta = delta_src + delta_dst + delta_st                            # [B, K_max]
-
-    per_row = (delta * weight).sum(dim=-1) / denom                     # [B]
-    return _row_mean(per_row, has_real)
+    """For each endpoint, fetch the proposal it picked. Returns [B, 2K, d_node]."""
+    B, twoK, d = proposed_endpoints.shape
+    idx = picked_idx.unsqueeze(-1).expand(-1, -1, d)              # [B, 2K, d]
+    return proposed_endpoints.gather(dim=1, index=idx)            # [B, 2K, d]
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Transformer updater
+# Saliency update (derived from observable signals)
+# ─────────────────────────────────────────────────────────────────────────
+
+def update_pick_affinity_ema(
+    u_old: Tensor,                     # [B, K_max]
+    pick_count: Tensor,                # [B, 2K] — per-proposal popularity (column sum of picks)
+    decay: float = 0.95,
+) -> Tensor:
+    """Per-slot u = EMA of per-slot POPULARITY (how often others picked this slot).
+
+    Architecture P1 fix (was buggy): u previously took update_alpha, which is
+    "how strongly THIS slot's endpoints picked OTHER proposals" — that's
+    SELECTIVITY (a property of the picker), not popularity (a property of the
+    picked). The result: a slot that picked aggressively but was never picked
+    BACK would read as alive, while an unpicked-but-passive slot would die.
+
+    The correct signal is pick_count (column reduction): how many endpoints
+    chose this slot's proposal endpoints. Same intuition as DNC usage tracking
+    and VQ-VAE codebook EMA-usage — survive if you're being USED, not if
+    you're using.
+
+    Normalization: pick_count → popularity in [0, 1) via pc/(pc+1):
+      pc=0 (orphan)   → pop=0     (eviction candidate)
+      pc=1 (typical)  → pop=0.5
+      pc=2            → pop=0.67
+      pc=5 (very hot) → pop=0.83
+    This matches u's prior [0, 1] range so existing thresholds still make sense.
+
+    Slot k's two proposal endpoints (positions k and K+k in the proposal bank)
+    each have their own pick_count. We use the max so a slot stays alive if
+    EITHER side is being picked — biases toward retention, consistent with
+    using max alpha previously.
+    """
+    K = u_old.shape[1]
+    pc_src = pick_count[:, :K]                                     # [B, K]
+    pc_dst = pick_count[:, K:]                                     # [B, K]
+    per_slot_pc = torch.maximum(pc_src, pc_dst)                    # [B, K]
+    popularity = per_slot_pc / (per_slot_pc + 1.0)                 # [B, K], in [0, 1)
+    return decay * u_old + (1.0 - decay) * popularity.to(u_old.dtype)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Slot recycling (eviction + creation)
+# ─────────────────────────────────────────────────────────────────────────
+
+def recycle_dead_slots(
+    edges: dict,
+    proposals: dict,                   # dict with src/dst/state, all [B, K, *]
+    novelty: Tensor,                   # [B, 2K] — pick-count-based novelty from expert_choice_routing
+    grace_windows: int = 4,
+    max_overwrites_fraction: float = 0.05,
+) -> tuple[dict, Tensor]:
+    """Fully percentile-based top-N variable-count overwrite.
+
+    Pipeline:
+      1. Compute per-proposal novelty = 1 - mean(max_affinity over src/dst).
+      2. Take the top-N most novel proposals as CANDIDATES (N=ceil(frac·K)).
+      3. Take the bottom-N most dead eligible (past-grace) slots as CANDIDATE victims.
+      4. Pair them in order (most-novel proposal ↔ deadest slot).
+      5. ADMIT each pair only if novelty > u — i.e., the proposal is more
+         novel than the slot is alive. Pure value comparison, no absolute
+         threshold. Both quantities are in roughly [0, 1]; tie defaults to
+         keeping memory (bias toward stability).
+
+    Why fully comparative (no absolute floors):
+      The earlier draft had `novelty > 0.5 AND u < 0.05` as admission gates.
+      Both numbers were defensible but arbitrary. `novelty > u` is purely
+      structural — "the proposal is worth more in attention than what's
+      already there." No magic numbers; scales naturally with whatever u/novelty
+      distributions the model produces.
+
+    Cold-start behavior is automatic:
+      In the first window, all slots have u=1.0 (PER max-priority init).
+      No novelty value can exceed 1.0, so zero overwrites until u values
+      begin to decay. Grace period (age >= grace_windows) is kept as a
+      structural integer-level guard, independent of the value comparison.
+
+    Why not one-per-window:
+      Too conservative for dense text — a window introducing 5 new entities
+      could only admit one. 5% of K_max (≈3 for K_max=68) matches typical
+      cache eviction batch sizes and biological consolidation rates.
+
+    Returns: (new_edges_dict, overwrite_mask[B, K] bool — True where overwrites landed)
+    """
+    B, K, _ = edges["src"].shape
+    device = edges["src"].device
+    N = max(1, int(max_overwrites_fraction * K))                    # eviction cap
+
+    # 1. Per-slot proposal novelty = max(novelty_src, novelty_dst).
+    # Each "proposal slot k" emits both a proposed src (index k in the bank)
+    # and a proposed dst (index K+k). If EITHER side is orphaned (nobody
+    # picked it), the proposal as a whole represents new content — admit.
+    # Using max (not mean) means we don't lose half-novel proposals just
+    # because the other side fits an existing cluster.
+    novelty_src = novelty[:, :K]                                     # [B, K]
+    novelty_dst = novelty[:, K:]
+    per_slot_novelty = torch.maximum(novelty_src, novelty_dst)       # [B, K]
+    novelty = per_slot_novelty  # rename for clarity downstream
+
+    # 2. Top-N most novel proposals (regardless of absolute novelty).
+    top_novelty, top_prop_idx = novelty.topk(N, dim=-1)             # [B, N]
+
+    # 3. Bottom-N eligible slots by u (most-dead first). Mask grace-protected
+    # slots to +inf so they can't be selected.
+    eligible = edges["age"] >= grace_windows                        # [B, K] bool
+    u_masked = torch.where(
+        eligible, edges["u"], torch.full_like(edges["u"], float("inf")),
+    )
+    bot_u_neg, victim_idx = (-u_masked).topk(N, dim=-1)             # negative trick: top-N of -u = bottom-N of u
+    bot_u = -bot_u_neg                                              # [B, N] actual u values
+
+    # 4. Per-pair admission — fully comparative. A pair is admitted iff the
+    # proposal's novelty is at least the slot's aliveness. Both quantities are
+    # roughly in [0, 1]; the criterion is "the new content is worth at least
+    # as much in attention as what's already there."
+    #
+    # `>=` (not `>`) is intentional: at cold start, all slots have u=1.0 and
+    # orphan proposals have novelty=1.0; under `>` cold-start admission never
+    # fires for that exact tie. With `>=` an orphan can claim a fresh slot
+    # immediately. In steady state ties are essentially zero-measure (continuous
+    # popularity values), so the "stability bias" of `>` was decorative — the
+    # real safety guard is the grace_windows + max_overwrites_fraction cap.
+    pair_admit = top_novelty >= bot_u.to(top_novelty.dtype)
+    # [B, N]
+
+    # 5. Apply overwrites. Loop over the N pair positions (small, vectorized).
+    new_edges = {k: v.clone() for k, v in edges.items()}
+    overwrite_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
+
+    # Pre-compute max u per row for PER-style cold-start seeding (consistent
+    # across all overwrites in this window; doesn't get re-computed after each).
+    u_max_per_row = edges["u"].max(dim=-1).values                   # [B]
+
+    for n in range(N):
+        rows_admit = pair_admit[:, n]                               # [B] bool
+        if not rows_admit.any():
+            continue
+        active_rows = torch.where(rows_admit)[0]
+        prop_idx = top_prop_idx[active_rows, n]                     # [N_active]
+        slot_idx = victim_idx[active_rows, n]                       # [N_active]
+        new_edges["src"][active_rows, slot_idx] = proposals["src"][active_rows, prop_idx]
+        new_edges["dst"][active_rows, slot_idx] = proposals["dst"][active_rows, prop_idx]
+        new_edges["state"][active_rows, slot_idx] = proposals["state"][active_rows, prop_idx]
+        new_edges["age"][active_rows, slot_idx] = 0.0
+        new_edges["u"][active_rows, slot_idx] = u_max_per_row[active_rows].to(new_edges["u"].dtype)
+        overwrite_mask[active_rows, slot_idx] = True
+
+    return new_edges, overwrite_mask
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Transformer updater — emits raw proposals only, no gates
 # ─────────────────────────────────────────────────────────────────────────
 
 class GraphUpdater(nn.Module):
     """Cross-attention updater. Takes encoded pins + current edges, outputs
-    per-slot edge proposals + gates + saliency.
+    per-slot raw proposals (src, dst, state). No snap_gate, no keep_gate, no
+    saliency_delta — those concepts are subsumed by expert-choice routing
+    (snap=affinity, keep=alpha-gating, saliency=usage EMA).
 
-    Architecture:
+    Architecture (unchanged from v1/v2 except output head):
       - Encode current edges as K_max tokens: concat(src, dst, state) → MLP → d
-      - K_max learned positional embeddings (per-slot identity)
+      - NO slot_pos (fix A) — slots distinguished by content alone
       - n_layers of (cross-attn to pins, self-attn among slots, FFN)
-      - Output head: per-slot (proposed_src, proposed_dst, proposed_state,
-                              snap_gate_src, snap_gate_dst,
-                              keep_gate, saliency_logit_delta)
+      - Output head: per-slot (proposed_src, proposed_dst, proposed_state),
+                     applied as residuals on the encoded-old.
     """
 
     def __init__(
@@ -246,14 +351,11 @@ class GraphUpdater(nn.Module):
         self.d_node = d_node
         self.d_state = d_state
 
-        # Encode old edge params as d-dim tokens
-        edge_in_dim = 2 * d_node + d_state + 1   # +1 for saliency_logit
+        edge_in_dim = 2 * d_node + d_state                         # no saliency field
         self.edge_in_proj = nn.Linear(edge_in_dim, d)
 
-        # K_max learned positional embeddings (stable slot identity)
-        self.slot_pos = nn.Parameter(torch.randn(K_max, d) * (d ** -0.5))
+        # Fix A: NO slot_pos parameter. Slot identity must come from content.
 
-        # Layer stack
         self.cross_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.cross_attns = nn.ModuleList([
             nn.MultiheadAttention(d, n_heads, batch_first=True)
@@ -274,57 +376,31 @@ class GraphUpdater(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Output head — per-slot. Small init so first call ≈ identity-ish.
-        out_dim = (
-            d_node + d_node + d_state    # proposed src, dst, state
-            + 2                            # snap_gate_src, snap_gate_dst (sigmoid)
-            + 1                            # keep_gate (sigmoid)
-            + 1                            # saliency_logit delta
-        )
+        # Output head: just the three residual deltas
+        out_dim = d_node + d_node + d_state
         self.out_norm = nn.LayerNorm(d)
         self.out_head = nn.Linear(d, out_dim)
         nn.init.normal_(self.out_head.weight, std=0.01)
         nn.init.zeros_(self.out_head.bias)
-
-        # Bias keep_gate init to 0.0 → sigmoid(0)=0.5 (neutral). With
-        # learned-init edges (audit C1), the init is meaningful but not
-        # sacred — first writes should be free to overwrite ~50%. The
-        # 0.85 bias used previously biased keep≈0.7 and let random init
-        # garbage persist across writes (and we now have non-random init,
-        # so the "preserve" bias loses its rationale).
-        self._keep_idx = d_node + d_node + d_state + 2
-        with torch.no_grad():
-            self.out_head.bias[self._keep_idx] = 0.0
 
     def forward(
         self,
         pins: Tensor,                          # [B, N, d]
         edges_old: dict,
         pins_pad_mask: Optional[Tensor] = None,  # [B, N] True = padded
-    ) -> tuple[dict, dict]:
-        """Returns (proposed_components, gates_dict).
-
-        proposed_components: dict with raw 'src', 'dst', 'state' before snap
-        gates_dict: 'snap_gate_src', 'snap_gate_dst', 'keep_gate', 'saliency_logit_delta'
-        """
-        B = pins.shape[0]
-
-        # 1. Encode old edge params as token features
+    ) -> dict:
+        """Returns proposals dict with keys 'src', 'dst', 'state',
+        each [B, K_max, d_node|d_state]."""
         old_concat = torch.cat([
-            edges_old["src"],                              # [B, K_max, d_node]
-            edges_old["dst"],
-            edges_old["state"],
-            edges_old["saliency_logit"].unsqueeze(-1),     # [B, K_max, 1]
-        ], dim=-1)                                          # [B, K_max, edge_in_dim]
-        edge_tok = self.edge_in_proj(old_concat)            # [B, K_max, d]
-        edge_tok = edge_tok + self.slot_pos.unsqueeze(0)
+            edges_old["src"], edges_old["dst"], edges_old["state"],
+        ], dim=-1)
+        edge_tok = self.edge_in_proj(old_concat)                    # [B, K, d]
+        # No slot_pos addition (fix A).
 
-        # 2. Layer stack
         for L in range(len(self.cross_attns)):
             q = self.cross_norms[L](edge_tok)
             attn_out, _ = self.cross_attns[L](
-                q, pins, pins,
-                key_padding_mask=pins_pad_mask,
+                q, pins, pins, key_padding_mask=pins_pad_mask,
             )
             edge_tok = edge_tok + attn_out
 
@@ -334,38 +410,14 @@ class GraphUpdater(nn.Module):
 
             edge_tok = edge_tok + self.ffns[L](self.ffn_norms[L](edge_tok))
 
-        # 3. Output head
-        raw = self.out_head(self.out_norm(edge_tok))        # [B, K_max, out_dim]
-
+        raw = self.out_head(self.out_norm(edge_tok))                # [B, K, out_dim]
         d_node, d_state = self.d_node, self.d_state
-        cursor = 0
-        proposed_src = raw[..., cursor : cursor + d_node]; cursor += d_node
-        proposed_dst = raw[..., cursor : cursor + d_node]; cursor += d_node
-        proposed_state = raw[..., cursor : cursor + d_state]; cursor += d_state
-        snap_logit_src = raw[..., cursor]; cursor += 1
-        snap_logit_dst = raw[..., cursor]; cursor += 1
-        keep_logit = raw[..., cursor]; cursor += 1
-        saliency_delta = raw[..., cursor]; cursor += 1
+        delta_src = raw[..., :d_node]
+        delta_dst = raw[..., d_node:2 * d_node]
+        delta_state = raw[..., 2 * d_node:2 * d_node + d_state]
 
-        # The proposed deltas are added to the encoded-old quantities so
-        # output ≈ old at init (small-init head). For continuous fields
-        # this is the residual-style init we used for plastic and splat.
-        proposed_src = edges_old["src"] + proposed_src
-        proposed_dst = edges_old["dst"] + proposed_dst
-        proposed_state = edges_old["state"] + proposed_state
-
-        # New saliency = old + delta, kept as a logit
-        new_saliency_logit = edges_old["saliency_logit"] + saliency_delta
-
-        proposed = {
-            "src": proposed_src,
-            "dst": proposed_dst,
-            "state": proposed_state,
-            "saliency_logit": new_saliency_logit,
+        return {
+            "src":   edges_old["src"]   + delta_src,
+            "dst":   edges_old["dst"]   + delta_dst,
+            "state": edges_old["state"] + delta_state,
         }
-        gates = {
-            "snap_gate_src": torch.sigmoid(snap_logit_src),
-            "snap_gate_dst": torch.sigmoid(snap_logit_dst),
-            "keep_gate": torch.sigmoid(keep_logit),
-        }
-        return proposed, gates

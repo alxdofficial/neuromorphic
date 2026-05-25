@@ -1,7 +1,17 @@
 # Representation Learning Results — Cross-Objective Summary
 
 Centralized scoreboard for v1 representation-learning runs. Pairs with
-`docs/repr_learning_baselines.md` (architectural lineage / citations).
+`docs/repr_learning_baselines.md` (architectural lineage / citations) and
+`docs/dataset_examples.md` (per-source token census).
+
+> **Caveat on the val_recon numbers below**: `run_val` advances the val
+> DataLoader iterator each call (no fixed val set yet — task #614 pending),
+> so the same checkpoint evaluated twice can differ by 0.4-0.7 nat on
+> aggregate val_recon. The **streaming-best** number (best `val_recon` seen
+> across all in-training val checkpoints) is more trustworthy than the
+> final-eval number; in tables that show both, prefer streaming-best.
+> `top1_acc` is a counting statistic and much more stable across re-evals.
+> When this is fixed, the numbers should be re-collected.
 
 **Objectives:**
 - **HSM** — hidden-state matching, v1e. Frozen-Llama hidden-state MSE across

@@ -56,10 +56,36 @@ def to_device(batch, device):
 
 
 @torch.no_grad()
-def run_val(model, val_dl, device, n_batches: int, window_size: int) -> dict:
+def materialize_val_set(val_dl, n_batches: int) -> list:
+    """Drain the streaming val_dl ONCE into a fixed list of batches.
+
+    Fixes the val sampling variance bug (#614). Previously each `run_val` call
+    advanced the val DataLoader iterator → different random batches per eval →
+    0.4-0.7 nat noise between streaming-best and final-eval on the SAME model.
+    Materializing the set once means every eval is on the same data → numbers
+    become directly comparable and the streaming-best vs final-eval gap closes
+    to ~zero (modulo checkpoint differences).
+
+    Memory cost: ~2 MB for 30 batches × 2 examples × 4096 tokens × int64. Trivial.
+    """
+    fixed = []
+    for i, batch in enumerate(val_dl):
+        if i >= n_batches:
+            break
+        fixed.append(batch)
+    return fixed
+
+
+def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
+    """Eval on a fixed val_set (list of batches from materialize_val_set).
+
+    n_batches caps the iteration in case val_set has more batches than we want
+    to spend time on (e.g., subsampling for a fast in-training eval). To use the
+    full set, pass n_batches >= len(val_set).
+    """
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
-    for i, batch in enumerate(val_dl):
+    for i, batch in enumerate(val_set):
         if i >= n_batches:
             break
         batch = to_device(batch, device)
@@ -89,7 +115,12 @@ def run_val(model, val_dl, device, n_batches: int, window_size: int) -> dict:
     }
 
 
-def save_checkpoint(model, opt, step, path: Path):
+def save_checkpoint(model, opt, step, path: Path, **extras):
+    """Persist model + opt state. `extras` lets callers stash auxiliary
+    tracking fields (best_val_recon / best_val_step) so resume can pick
+    them up; without that, resume starts best_val_recon=inf and the very
+    first val of the resumed run overwrites the genuine prior best.pt.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def keep(k: str) -> bool:
@@ -97,13 +128,15 @@ def save_checkpoint(model, opt, step, path: Path):
             return True
         return "lora_" in k
 
-    torch.save({
+    payload = {
         "step": step,
         "model_state_dict": {
             k: v for k, v in model.state_dict().items() if keep(k)
         },
         "optimizer_state_dict": opt.state_dict(),
-    }, path)
+    }
+    payload.update(extras)
+    torch.save(payload, path)
 
 
 def train_one_variant(
@@ -125,13 +158,13 @@ def train_one_variant(
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
 
-    is_vanilla = (variant == "vanilla_llama")
+    is_vanilla = variant in ("vanilla_llama", "vanilla_full_context")
 
-    # vanilla_llama has no encoder and no real trainable parameters that
-    # affect the loss (mask_embed is gated to 0 contribution for QA).
-    # Running a training loop on it just wastes GPU time and rewrites the
-    # opt state. Treat it as eval-only: build the val dataloader, run it,
-    # write a single final-val row, and return.
+    # vanilla_* variants have no trainable encoder params:
+    #   - vanilla_llama: no memory at all (loss floor reference)
+    #   - vanilla_full_context: passes raw context embeddings as memory (loss ceiling)
+    # Both just establish reference points for the variant comparison;
+    # training them is wasted compute. Treat as eval-only.
     if not is_vanilla:
         opt = torch.optim.AdamW(
             model.trainable_parameters(),
@@ -164,6 +197,14 @@ def train_one_variant(
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
         weights=mix_weights, num_workers=0, seed=7,
     )
+    # Fixes #614: drain val_dl ONCE into a fixed list so every run_val call
+    # sees the same batches. Without this, in-training val and final-eval got
+    # different random draws → 0.4-0.7 nat noise → streaming-best was biased
+    # low (cherry-picked from many noisy draws) and final-eval was a one-shot
+    # gamble. With a fixed set: streaming val and final eval directly comparable.
+    print(f"  Materializing fixed val set ({val_batches} batches)...")
+    val_set = materialize_val_set(val_dl, val_batches)
+    print(f"  Fixed val set ready: {len(val_set)} batches.")
 
     jsonl_path = out_dir / f"jsonl/{variant}.jsonl"
     ckpt_path = out_dir / f"ckpts/{variant}.last.pt"
@@ -175,29 +216,32 @@ def train_one_variant(
     best_val_recon = float("inf")
     best_val_step = -1
     BEST_MIN_STEP = max(1000, n_steps // 10)
-    # Patience-based early stopping. After each val past MIN_STEP_FOR_STOP,
-    # if smoothed val (rolling mean of last 3 evals) hasn't improved for
-    # `patience` consecutive evals, break training. Lets fast-convergers
-    # bail early and slow-convergers use the full max-steps budget.
+    # Patience-based early stopping (best.pt staleness criterion). Counts
+    # eval points since the last best.pt update. Stop only when no new
+    # global best has been seen for `patience` consecutive evals past
+    # min_step_for_stop. Previous "smoothed-mean" criterion triggered on
+    # volatility and could fire on the same step that just produced a new
+    # best.pt — invalidated several runs. Best-staleness avoids that
+    # pathology entirely: the moment a true improvement lands, the counter
+    # resets, so we never stop within `patience * val_every` steps of an
+    # actual improvement.
     early_stopped = False
     stopped_at_step = n_steps
-    patience_counter = 0
-    recent_vals = []                  # rolling window of last 3 val_recon
-    best_smoothed = float("inf")
+    evals_since_best = 0
 
     if is_vanilla:
         # Eval-only path. Skip any prior jsonl and run a single final-val pass.
         if jsonl_path.exists():
             jsonl_path.unlink()
         t_start = time.time()
-        final_val = run_val(model, val_dl, device, val_batches, window_size)
+        final_val = run_val(model, val_set, device, val_batches, window_size)
         elapsed = time.time() - t_start
         with open(jsonl_path, "w") as fp:
             fp.write(json.dumps({
                 "phase": "val", "step": 0, "variant": variant,
                 "final": True, "eval_only": True, **final_val,
             }) + "\n")
-        print(f"  [eval-only] vanilla_llama val_recon={final_val['val_loss_recon']:.4f}  "
+        print(f"  [eval-only] {variant} val_recon={final_val['val_loss_recon']:.4f}  "
               f"top1={final_val['val_top1_acc']*100:.1f}%  ({elapsed:.1f}s)", flush=True)
         summary = {
             "variant": variant,
@@ -219,7 +263,21 @@ def train_one_variant(
         model.load_state_dict(sd["model_state_dict"], strict=False)
         opt.load_state_dict(sd["optimizer_state_dict"])
         start_step = int(sd.get("step", 0)) + 1
-        print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1}")
+        # Restore best-tracking so we don't overwrite the prior best.pt with
+        # a worse first-val from the resumed run. Older ckpts didn't store
+        # these — fall back to inf and warn so the user knows the prior best
+        # is at risk of being clobbered on the next improvement check.
+        if "best_val_recon" in sd and "best_val_step" in sd:
+            best_val_recon = float(sd["best_val_recon"])
+            best_val_step = int(sd["best_val_step"])
+            evals_since_best = int(sd.get("evals_since_best", 0))
+            print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1} "
+                  f"(prior best={best_val_recon:.4f} @ step {best_val_step}, "
+                  f"evals_since_best={evals_since_best})")
+        else:
+            print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1} "
+                  f"(WARN: no best_val_recon in ckpt — first val will define "
+                  f"a new best.pt; prior best.pt may be overwritten)")
     else:
         if jsonl_path.exists():
             jsonl_path.unlink()
@@ -260,21 +318,31 @@ def train_one_variant(
             "variant": variant,
             "loss": float(out["loss"]),
             "loss_recon": float(out["loss_recon"]),
-            "loss_aux": float(out["loss_aux"]),
+            "loss_aux": float(out["loss_aux"]),               # load_balance only (unweighted)
             "top1_acc": float(out["top1_acc"]),
             "n_content_positions": int(out["n_content_positions"]),
             "grad_norm": float(gn),
             "lr": lr,
             "memory_M": out["memory_shape"][1],
         }
+        # Per-component aux breakdown (unweighted). Lets us see WHICH aux
+        # term is exploding when total aux spikes — previously we only had
+        # the sum, and a load_balance=1392 spike was indistinguishable from
+        # an orth_loss=1392 spike. Both have very different root causes.
+        for key in ("loss_orth", "loss_z"):
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         # Splat-variant sublosses (only present when variant == splat_baseline)
         for key in ("splat_aux", "splat_L_pin", "splat_L_prop",
                     "splat_L_adj", "splat_L_sat"):
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
-        # Graph-variant sublosses (only present when variant == graph_baseline)
-        for key in ("graph_aux", "graph_L_connect", "graph_L_adjust",
-                    "graph_saliency_mean", "graph_endpoint_reuse"):
+        # Graph-variant telemetry (only present when variant == graph_baseline).
+        # v3 has no aux loss; logged keys are derived diagnostic signals.
+        for key in ("graph_aux", "graph_endpoint_reuse",
+                    "graph_u_mean", "graph_pick_strength_avg",
+                    "graph_overwrites_per_row_per_window", "graph_age_mean",
+                    "graph_src_norm"):
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         jsonl_fp.write(json.dumps(row) + "\n")
@@ -283,12 +351,18 @@ def train_one_variant(
             now = time.time()
             sps = (step - last_print_step) / max(now - last_print_time, 1e-9)
             last_print_step, last_print_time = step, now
-            # Display the variant-specific aux that's actually contributing
-            # to the loss: graph_aux for graph_baseline, splat_aux for splat,
-            # plain loss_aux (load_balance+orth+z) for everything else.
-            if "graph_aux" in out and out["graph_aux"] is not None:
-                aux_display = float(out["graph_aux"])
-                aux_tag = "g_aux"
+            # Display the variant-specific signal that's actually informative:
+            # - splat_aux: weighted aux contributing to loss
+            # - graph: u/pick/overwrite signals (no aux loss in v3 — graph_aux
+            #   is always 0, so displaying it tells you nothing)
+            # - else: plain loss_aux (load_balance+orth+z)
+            extra_field = ""
+            if variant == "graph_baseline":
+                u_mean = float(out.get("graph_u_mean", 0.0) or 0.0)
+                pick = float(out.get("graph_pick_strength_avg", 0.0) or 0.0)
+                ow = float(out.get("graph_overwrites_per_row_per_window", 0.0) or 0.0)
+                extra_field = f"u={u_mean:.3f} pick={pick:.3f} ow={ow:.3f}"
+                aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])
                 aux_tag = "s_aux"
@@ -298,41 +372,39 @@ def train_one_variant(
             print(f"  step {step:6d}/{n_steps}  recon={float(out['loss_recon']):.4f}  "
                   f"top1={float(out['top1_acc'])*100:5.1f}%  "
                   f"{aux_tag}={aux_display:.3f}  "
+                  f"{extra_field + '  ' if extra_field else ''}"
                   f"gnorm={float(gn):6.2f}  lr={lr:.2e}  ({sps:.1f} step/s)",
                   flush=True)
 
         if step > 0 and step % val_every == 0:
-            vm = run_val(model, val_dl, device, val_batches, window_size)
+            vm = run_val(model, val_set, device, val_batches, window_size)
             val_row = {"phase": "val", "step": step, "variant": variant, **vm}
             jsonl_fp.write(json.dumps(val_row) + "\n")
             print(f"    [val @ {step}]  recon={vm['val_loss_recon']:.4f}  "
                   f"top1={vm['val_top1_acc']*100:.1f}%",
                   flush=True)
             # Best-checkpoint save: only past the warmup-fluke window.
-            if (step >= BEST_MIN_STEP
-                    and vm["val_loss_recon"] < best_val_recon):
+            # This is also the patience-reset signal — if best.pt updates,
+            # the model is still improving; clear the staleness counter.
+            improved = (step >= BEST_MIN_STEP
+                        and vm["val_loss_recon"] < best_val_recon - 1e-4)
+            if improved:
                 best_val_recon = vm["val_loss_recon"]
                 best_val_step = step
                 save_checkpoint(model, opt, step, best_ckpt_path)
                 print(f"    [best ckpt @ {step}]  val_recon={best_val_recon:.4f}",
                       flush=True)
-            # Patience-based early stop. Use smoothed val (rolling mean of
-            # last 3 evals) for the plateau check so single-eval noise
-            # doesn't trigger stops. Only active past min_step_for_stop.
-            recent_vals.append(vm["val_loss_recon"])
-            if len(recent_vals) > 3:
-                recent_vals.pop(0)
-            smoothed = sum(recent_vals) / len(recent_vals)
-            if step >= min_step_for_stop and patience > 0:
-                if smoothed < best_smoothed - 1e-4:
-                    best_smoothed = smoothed
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"    [early stop @ {step}]  smoothed val "
-                              f"{smoothed:.4f} stalled for {patience} evals "
-                              f"(best smoothed {best_smoothed:.4f})", flush=True)
+                evals_since_best = 0
+            else:
+                # No improvement. Only count it against patience past
+                # min_step_for_stop (warmup eval points don't trigger stops).
+                if step >= min_step_for_stop:
+                    evals_since_best += 1
+                    if patience > 0 and evals_since_best >= patience:
+                        print(f"    [early stop @ {step}]  {evals_since_best} "
+                              f"evals without best.pt update "
+                              f"(best val_recon={best_val_recon:.4f} "
+                              f"@ step {best_val_step})", flush=True)
                         early_stopped = True
                         stopped_at_step = step
                         # Audit fix #9: stamp last_completed BEFORE break
@@ -343,7 +415,14 @@ def train_one_variant(
 
         if step > 0 and step % save_every == 0:
             # `step` here is the last completed step. Resume reads N → starts at N+1.
-            save_checkpoint(model, opt, step, ckpt_path)
+            # Stash best tracking in last.pt so resume preserves prior best.pt
+            # rather than overwriting it with a worse first-val.
+            save_checkpoint(
+                model, opt, step, ckpt_path,
+                best_val_recon=best_val_recon,
+                best_val_step=best_val_step,
+                evals_since_best=evals_since_best,
+            )
 
         last_completed = step
         step += 1
@@ -351,18 +430,37 @@ def train_one_variant(
     # Final save: `step` has been incremented past the last completed iter
     # (or equals start_step if the loop never ran). Persist last_completed so
     # resume's `+ 1` lands on the correct next step.
-    save_checkpoint(model, opt, last_completed, ckpt_path)
-    final_val = run_val(model, val_dl, device, val_batches, window_size)
+    save_checkpoint(
+        model, opt, last_completed, ckpt_path,
+        best_val_recon=best_val_recon,
+        best_val_step=best_val_step,
+        evals_since_best=evals_since_best,
+    )
+
+    # Final eval on BEST.PT, not on the last training step's weights.
+    # Previously we evaluated whatever weights were in memory at end of
+    # training — which is .last.pt, NOT .best.pt. With the patience
+    # criterion, .last.pt is by definition a checkpoint that did NOT beat
+    # the best. So final-eval was systematically biased high (worse) vs
+    # the model's actual peak. Loading best.pt before the final eval gives
+    # the trustworthy "what's the best this variant achieved" number.
+    if best_ckpt_path.exists():
+        sd = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(sd["model_state_dict"], strict=False)
+        print(f"  [loaded best.pt @ step {best_val_step} for final eval]", flush=True)
+    final_val = run_val(model, val_set, device, val_batches, window_size)
     jsonl_fp.write(json.dumps({
         "phase": "val", "step": step, "variant": variant,
-        "final": True, **final_val,
+        "final": True, "evaluated_on_best": best_ckpt_path.exists(),
+        "best_step": best_val_step, **final_val,
     }) + "\n")
     jsonl_fp.close()
 
     elapsed = time.time() - t_start
+    src = f"best.pt @ {best_val_step}" if best_ckpt_path.exists() else f"last weights"
     print(f"  DONE: {step} steps in {elapsed/60:.1f} min  "
           f"final val_recon={final_val['val_loss_recon']:.4f} "
-          f"top1={final_val['val_top1_acc']*100:.1f}%", flush=True)
+          f"top1={final_val['val_top1_acc']*100:.1f}% ({src})", flush=True)
 
     summary = {
         "variant": variant,
@@ -389,14 +487,20 @@ def main():
         "flat_baseline", "continuous_baseline", "memorizing_baseline",
         "recurrent_baseline", "plastic_baseline", "splat_baseline",
         "graph_baseline",
-        "vanilla_llama",
+        "vanilla_llama",          # loss floor
+        "vanilla_full_context",   # loss ceiling
     ])
     ap.add_argument("--steps", type=int, default=10_000)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--save-every", type=int, default=2000)
-    ap.add_argument("--val-batches", type=int, default=10)
+    ap.add_argument("--val-batches", type=int, default=32,
+                    help="Number of batches in the fixed val set. With the "
+                         "composite mix sampling 9 families + 3 external sources, "
+                         "10 batches ≈ 1 example per family (high per-family "
+                         "noise). 32 batches × BS=2 = 64 examples ≈ ~5 per family. "
+                         "Bumped from old default of 10.")
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--window-size", type=int, default=1024)
     ap.add_argument("--passages-per-chunk", type=int, default=0,
@@ -433,13 +537,19 @@ def main():
                          "musique, babilong). Older 3-tuple callers still work; "
                          "missing entries default to 0.")
     ap.add_argument("--patience", type=int, default=5,
-                    help="Patience-based early stop: number of consecutive val "
-                         "evals without improvement (on smoothed val_recon) "
-                         "before training stops. 0 disables. Default 5 "
-                         "(= 2500-step plateau window at val_every=500).")
-    ap.add_argument("--min-step-for-stop", type=int, default=2000,
+                    help="Stop training when best.pt hasn't updated for this "
+                         "many consecutive val evals past --min-step-for-stop. "
+                         "Best-staleness criterion (was previously smoothed "
+                         "rolling mean — that one triggered on volatility "
+                         "and could fire on the same step a new best landed). "
+                         "0 disables. Default 5 (≈ 2500-step plateau at "
+                         "val_every=500).")
+    ap.add_argument("--min-step-for-stop", type=int, default=3000,
                     help="Don't trigger early-stop before this step. Skips "
-                         "warmup-noise era where val is bouncy. Default 2000.")
+                         "warmup-noise era where val is bouncy. Bumped 2000→"
+                         "3000 after tranche 1 v2: flat_baseline was still "
+                         "improving past step 5000 when patience fired at 5k. "
+                         "Slow learners need more runway before plateau check.")
     args = ap.parse_args()
 
     if "v21" in args.variants:

@@ -224,12 +224,12 @@ class ReprConfig:
     # Llama layer index at which to inject the per-position memory readout.
     plastic_inject_layer: int = 8
 
-    # ── Graph substrate (Exp 1) ───────────────────────────────────────────
+    # ── Graph substrate (Exp 1 v3) ────────────────────────────────────────
     # See docs/exp1_graph_baseline.md for design.
     # K_max=68, d_node=d_state=128. Bottleneck convention matches splat:
-    # K_max·(2·d_node + d_state + 1) = 68·385 = 26,180 floats — counts all
-    # per-edge floats including the saliency_logit scalar (same precedent as
-    # splat's w_raw/s_logit counting). 0.3% over the 26,100 baselines band.
+    # K_max·(2·d_node + d_state + 1) = 68·385 = 26,180 floats — the +1 is now
+    # the `u` (pick-affinity EMA) scalar, replacing the v1/v2 learned
+    # saliency_logit. Same float-count, different semantics.
     graph_K_max: int = 68          # edge budget
     graph_d_node: int = 128        # endpoint dim
     graph_d_state: int = 128       # edge state dim
@@ -237,10 +237,24 @@ class ReprConfig:
     # (matches A/B/MT/Mamba's 12.5-14.9M band).
     graph_updater_layers: int = 4  # transformer-updater depth
     graph_d_updater: int = 384     # updater token dim
-    graph_d_proj_hidden: int = 1024 # fused edge → d_llama projection MLP hidden
-    # Auxiliary loss coefficients (pre-normalized; pure importance weights).
-    graph_lambda_connect: float = 0.1   # snap-when-similar pressure
-    graph_lambda_adjust: float = 0.05   # saliency-weighted proximal pressure on edges
+    # graph_d_proj_hidden was the v1/v2 projection MLP hidden dim. v3 uses
+    # graph_readout_d_hidden (below) inside GraphReadout instead. Field
+    # removed to avoid confusion — if you see it elsewhere, that code is stale.
+    # v3 expert-choice + saliency hyperparameters (research-derived; see doc).
+    graph_u_decay: float = 0.95              # pick-affinity EMA decay (recency, ~13-win half-life)
+    graph_grace_windows: int = 4             # cold-start immunity (PER max-priority + S3-FIFO probation)
+    # Overwrite policy: variable count per window in [0, max_fraction * K_max].
+    # Fully percentile-based — no absolute thresholds.
+    #  - Selection (who's a candidate): top-N by rank
+    #      (top-N novel proposals + bottom-N most-dead eligible slots)
+    #  - Admission (does the swap happen): pure value comparison
+    #      novelty > u → the proposal is worth more than the slot is alive
+    # Cold-start protection emerges naturally: u inits at 1.0, no novelty
+    # value can exceed it, so no overwrites until u starts decaying.
+    graph_max_overwrites_fraction: float = 0.05  # ceiling: ≤5% of slots per window (=3 for K=68)
+    graph_update_strength_scale: float = 4.0     # multiplier on cosine before sigmoid → α
+    graph_readout_n_heads: int = 4               # cross-edge message-passing attention heads
+    graph_readout_d_hidden: int = 512            # d_hidden inside the directional readout
 
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.

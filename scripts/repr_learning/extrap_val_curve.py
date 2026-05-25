@@ -82,15 +82,28 @@ def steps_to_within(a: float, b: float, l_inf: float,
 
 
 def load_variant_jsonl(jsonl_path: Path) -> tuple[list[int], list[float], dict]:
-    """Returns (steps, val_losses, final_summary_dict)."""
+    """Returns (steps, val_losses, final_summary_dict).
+
+    Rows excluded from the time-series fit:
+      - eval_only:             vanilla row at step 0 (not a training point)
+      - final (any flavor):    the post-training row whose `step` equals the
+                                end-of-training step but whose loss came from
+                                running val AFTER loading best.pt. This row's
+                                loss doesn't correspond to the model state at
+                                that step — its inclusion biased the fit
+                                downward at the tail and produced too-optimistic
+                                L_inf extrapolations for variants whose best.pt
+                                was much earlier than the end of training.
+    Both kinds get captured into final_summary for the reporting layer; they
+    just don't enter the curve fit.
+    """
     steps, losses = [], []
     final_summary = {}
     with jsonl_path.open() as f:
         for line in f:
             row = json.loads(line)
             if row.get("phase") == "val" and "val_loss_recon" in row:
-                # Skip the "eval-only" vanilla row at step 0
-                if row.get("eval_only"):
+                if row.get("eval_only") or row.get("final"):
                     final_summary = row
                     continue
                 steps.append(int(row["step"]))

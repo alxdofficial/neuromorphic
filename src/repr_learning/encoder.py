@@ -42,8 +42,11 @@ def _sinusoidal_pe(seq_len: int, d_model: int, offset: int = 0,
         return torch.zeros(seq_len, d_model, device=device, dtype=dtype)
     positions = torch.arange(offset, offset + seq_len,
                               device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
-    d_half = (d_model + 1) // 2
-    div = torch.exp(torch.arange(d_half, device=device, dtype=torch.float32)
+    # Standard transformer PE: 10000^(-2i/d) for i in [0, d/2). Use the
+    # even-indexed positions of d_model. Earlier version used (-i/d) which
+    # compressed the frequency range by a factor of 2 — frequencies were
+    # too high, distinguishability between nearby positions degraded.
+    div = torch.exp(torch.arange(0, d_model, 2, device=device, dtype=torch.float32)
                     * (-math.log(10000.0) / d_model))                       # [d/2]
     angles = positions * div                                                # [T, d/2]
     pe = torch.zeros(seq_len, d_model, device=device, dtype=torch.float32)
@@ -1367,6 +1370,91 @@ class NullEncoder(nn.Module):
         return memory, aux
 
 
+class FullContextEncoder(nn.Module):
+    """Vanilla full-context — the CEILING reference.
+
+    Passes the raw token embeddings through unchanged as "memory tokens."
+    No encoding, no compression — Llama literally sees the full context
+    prepended to the question. Establishes the upper bound: what frozen
+    Llama achieves when the entire source is visible.
+
+    Companion to NullEncoder (the floor with NO memory). Together they
+    bracket every compressed memory variant:
+        NullEncoder (floor)  ≤  any memory variant  ≤  FullContextEncoder (ceiling)
+
+    Any variant that doesn't beat NullEncoder has useless memory; any that
+    approaches FullContextEncoder has near-perfect compression. The variants
+    in between tell us the bits-per-information cost of each architecture.
+
+    Caveat: this variant has zero compression — its "memory" is the raw
+    text (M = chunk_size = 4096). Reads via the same prepend pathway as
+    other prepend variants. Llama-3.2-1B has a 128k context window so
+    prepending 4k + question + answer fits comfortably.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        # Start with an empty memory; streaming_write accumulates token embeds
+        # across windows so that finalize_memory returns the full context.
+        return {
+            "context_embeds": None,
+            "_B": batch_size,
+            "_device": device,
+            "_dtype": dtype,
+        }
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+        # Accumulate raw embeddings across the streaming windows. attention_mask
+        # is honored: padded positions still occupy slots but are zero-vectored
+        # so the decoder's positional encoding tracks correctly.
+        del chunk_offset
+        if attention_mask is not None:
+            mask = attention_mask.to(token_embeds.dtype).unsqueeze(-1)
+            token_embeds = token_embeds * mask
+        prev = state.get("context_embeds")
+        if prev is None:
+            new = token_embeds
+        else:
+            new = torch.cat([prev, token_embeds], dim=1)
+        new_state = dict(state)
+        new_state["context_embeds"] = new
+        return new_state, {}
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        ctx = state.get("context_embeds")
+        if ctx is None:
+            ctx = torch.zeros(
+                state["_B"], 0, self.cfg.d_llama,
+                device=state["_device"], dtype=state["_dtype"],
+            )
+        aux = {
+            "load_balance_loss": torch.zeros(
+                (), device=ctx.device, dtype=ctx.dtype,
+            ),
+        }
+        return ctx, aux
+
+    def forward(
+        self,
+        token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        mask_positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, dict]:
+        del mask_positions
+        if attention_mask is not None:
+            mask = attention_mask.to(token_embeds.dtype).unsqueeze(-1)
+            token_embeds = token_embeds * mask
+        aux = {
+            "load_balance_loss": torch.zeros(
+                (), device=token_embeds.device, dtype=torch.float32,
+            ),
+        }
+        return token_embeds, aux
+
+
 class RecurrentBaselineEncoder(nn.Module):
     """Baseline 5: Mamba state-space-model bottleneck.
 
@@ -1674,19 +1762,120 @@ class PlasticBaselineEncoder(nn.Module):
         return self.finalize_memory(state)
 
 
+class GraphReadout(nn.Module):
+    """Fix E — directional R-GCN-style + cross-edge message passing.
+
+    Before projection to d_llama:
+      1. Encode each edge with TWO separate transforms — W_src for the
+         source endpoint, W_dst for the destination — so direction matters.
+         "Alice mother-of Bob" and "Bob mother-of Alice" map to different
+         representations because (src, dst) order changes which weights
+         see which endpoint.
+      2. Cross-edge self-attention lets each edge token gather context from
+         peer edges. This is what makes the readout actually graph-aware:
+         edge_7 attending to edge_23 lets the decoder pick up "these two
+         edges share an endpoint" via geometric clustering in the post-attn
+         hidden states.
+      3. FFN + projection to d_llama, with a saliency u-gate so dead slots
+         contribute ~zero.
+
+    Total cost: ~3M extra params over the old proj_to_llama MLP. Compute
+    is one self-attention block over K_max=68 tokens — negligible.
+    """
+
+    def __init__(
+        self,
+        d_node: int,
+        d_state: int,
+        d_llama: int,
+        d_hidden: int,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.d_hidden = d_hidden
+
+        # Directional encoding (R-GCN-style separate transforms)
+        self.W_src = nn.Linear(d_node, d_hidden)
+        self.W_dst = nn.Linear(d_node, d_hidden)
+        self.W_state = nn.Linear(d_state, d_hidden)
+
+        # Message-passing across edges (1 layer of self-attention).
+        # Reads each edge's neighborhood via attention over all K_max tokens.
+        self.cross_edge_norm = nn.LayerNorm(d_hidden)
+        self.cross_edge_attn = nn.MultiheadAttention(
+            d_hidden, n_heads, batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(d_hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_hidden, 4 * d_hidden), nn.GELU(),
+            nn.Linear(4 * d_hidden, d_hidden),
+        )
+
+        # Final projection to d_llama
+        self.proj_norm = nn.LayerNorm(d_hidden)
+        self.proj = nn.Sequential(
+            nn.Linear(d_hidden, d_llama),
+            nn.LayerNorm(d_llama),
+        )
+
+    def forward(
+        self,
+        src: Tensor,           # [B, K, d_node]
+        dst: Tensor,           # [B, K, d_node]
+        state: Tensor,         # [B, K, d_state]
+        u: Tensor,             # [B, K] — pick-affinity EMA, in [0, 1]
+    ) -> Tensor:
+        # 1. Directional edge encoding (src and dst contribute through
+        # DIFFERENT weight matrices — sums asymmetrically).
+        h = self.W_src(src) + self.W_dst(dst) + self.W_state(state)  # [B, K, d_hidden]
+
+        # 2. Cross-edge message passing (self-attention over K edges)
+        q = self.cross_edge_norm(h)
+        attn_out, _ = self.cross_edge_attn(q, q, q)
+        h = h + attn_out
+        h = h + self.ffn(self.ffn_norm(h))
+
+        # 3. Project to d_llama
+        h = self.proj_norm(h)
+        memory = self.proj(h)                                          # [B, K, d_llama]
+
+        # 4. Saliency gate — absolute, not median-centered.
+        # u ∈ [0, 1]; threshold=0.5 maps to gate=0.5, u→1 gives gate→0.88,
+        # u→0 gives gate→0.12. So a fully-dead bank fades out, a fully-live
+        # bank reads at full strength, and there's a smooth transition.
+        # (Earlier we used u - u.median(), but median-centering means a
+        # uniformly dead bank still gets gate=0.5 — the gate provided no
+        # absolute signal. Fixed-threshold sigmoid is what actually fades.)
+        gate = torch.sigmoid(8.0 * (u - 0.5))
+        memory = memory * gate.unsqueeze(-1).to(memory.dtype)
+        return memory
+
+
 class GraphBaselineEncoder(nn.Module):
-    """Exp 1: graph baseline. Bounded-budget edge memory with continuous
-    (src, dst, state) tuples and soft node-reuse via attention snap.
+    """Graph baseline: expert-choice routing + derived saliency.
 
-    Substrate: K_max edges in continuous space (no codebook). Per window,
-    the updater transformer reads (encoded pins + current edges) and
-    proposes (src, dst, state, snap_gates, keep_gate, saliency_delta) per
-    slot. Proposed endpoints are soft-snapped to existing endpoints to
-    encourage graph connectivity.
+    Substrate: K_max=68 edges in continuous space. Each slot holds
+    (src, dst, state, u, age). u is the EMA of pick-affinity from
+    expert-choice routing (NOT a learned scalar). age is windows since
+    the slot was last overwritten — provides cold-start immunity.
 
-    Read: K_max edge tokens prepended to Llama input. Each token =
-    fused MLP of concat(src, dst, state, saliency_emb). Same prepend
-    pattern as B/MT — no MemInject hook.
+    Write per window:
+      - GraphUpdater produces K_max raw proposals (src/dst/state) via
+        cross-attention to pins. NO snap_gate / keep_gate / saliency_delta.
+      - Expert-choice routing: every existing endpoint (2K of them) picks
+        the proposal with highest cosine affinity and updates toward it
+        with strength = sigmoid(affinity_scale · cosine). Reuse emerges
+        geometrically — multiple endpoints near the same proposal converge
+        toward it (k-means dynamics).
+      - State follows max(src_α, dst_α) of its slot toward its OWN proposal.
+      - u ← decay·u + (1-decay)·per_slot_pick_strength
+      - Recycle: novel-but-unclaimed proposal overwrites the lowest-u
+        eligible slot (with PER-style max-priority re-seeding).
+
+    Read (GraphReadout):
+      - Directional W_src / W_dst encoding (asymmetric in src vs dst)
+      - 1× self-attention across edges (message passing)
+      - Project to d_llama, gate by absolute saliency u (sigmoid(8(u-0.5)))
 
     See docs/exp1_graph_baseline.md.
     """
@@ -1701,8 +1890,11 @@ class GraphBaselineEncoder(nn.Module):
         self.d_updater = cfg.graph_d_updater
         self.n_updater_layers = cfg.graph_updater_layers
 
-        self.lambda_connect = cfg.graph_lambda_connect
-        self.lambda_adjust = cfg.graph_lambda_adjust
+        # Expert-choice + saliency knobs (derived from research; see doc).
+        self.u_decay = cfg.graph_u_decay
+        self.grace_windows = cfg.graph_grace_windows
+        self.max_overwrites_fraction = cfg.graph_max_overwrites_fraction
+        self.update_strength_scale = cfg.graph_update_strength_scale
 
         from .graph_substrate import GraphUpdater
 
@@ -1724,20 +1916,22 @@ class GraphBaselineEncoder(nn.Module):
             ffn_mult=4,
         )
 
-        # Fused edge → memory token projection
-        # Input: concat(src, dst, state, saliency_scalar) → d_proj_hidden → d_llama
-        edge_concat_dim = 2 * self.d_node + self.d_state + 1
-        self.proj_to_llama = nn.Sequential(
-            nn.Linear(edge_concat_dim, cfg.graph_d_proj_hidden), nn.GELU(),
-            nn.Linear(cfg.graph_d_proj_hidden, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+        # Fix E — directional readout with cross-edge message passing.
+        # W_src and W_dst are separate linear transforms so (src, dst) order
+        # carries meaning (R-GCN style). Cross-edge attention lets each edge
+        # token gather context from peer edges — gives the readout genuine
+        # graph structure to use, instead of treating edges as a flat bag.
+        self.readout = GraphReadout(
+            d_node=self.d_node,
+            d_state=self.d_state,
+            d_llama=cfg.d_llama,
+            d_hidden=cfg.graph_readout_d_hidden,
+            n_heads=cfg.graph_readout_n_heads,
         )
 
-        # Learned deterministic initial edges (audit C1). Without this the
-        # substrate would re-randomize every forward, leaving training-time
-        # non-determinism AND requiring keep_gate to "overwrite garbage"
-        # rather than "update meaningful prior". Random init kept here as
-        # the PARAMETER init seed (one-shot at module construction).
+        # Learned deterministic initial slot content (one set per slot).
+        # Same precedent as v1/v2 — the parameter init is a one-shot random
+        # seed; the .Parameter wrapper makes it trainable.
         self.init_src = nn.Parameter(
             torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
         )
@@ -1747,9 +1941,6 @@ class GraphBaselineEncoder(nn.Module):
         self.init_state = nn.Parameter(
             torch.randn(self.K_max, self.d_state) * (self.d_state ** -0.5)
         )
-        # Saliency starts low (sigmoid(-4) ≈ 0.018) — slots are
-        # uninformative until the updater raises saliency via its delta head.
-        self.init_saliency_logit = -4.0
 
     # ── Streaming interface ───────────────────────────────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype):
@@ -1760,23 +1951,44 @@ class GraphBaselineEncoder(nn.Module):
             init_src=self.init_src,
             init_dst=self.init_dst,
             init_state=self.init_state,
-            init_saliency_logit=self.init_saliency_logit,
+            grace_windows=self.grace_windows,
         )
         zero = torch.zeros((), device=device, dtype=torch.float32)
         return {
             "edges": edges,
-            "aux_accum": zero.clone(),
-            "L_connect_accum": zero.clone(),
-            "L_adjust_accum": zero.clone(),
             "n_windows": 0,
+            # Cross-window diagnostic accumulators (no aux loss)
+            "pick_strength_accum": zero.clone(),
+            "overwrite_count_accum": zero.clone(),
         }
 
     def streaming_write(
         self, state, token_embeds, attention_mask=None, chunk_offset=0,
     ):
-        """One write pass over a window. Updates all K_max edge slots via
-        the transformer-updater + soft-snap on endpoints."""
-        from .graph_substrate import soft_snap, loss_connectivity, loss_adjust
+        """Expert-choice write pass.
+
+        Pipeline per window:
+          1. Encode pins (+ PE).
+          2. Updater emits 68 raw proposals via cross-attention.
+          3. Expert-choice: every endpoint picks top-1 proposal, updates with
+             affinity-gated soft strength. Reuse falls out of geometry.
+          4. State update: each slot's state moves toward an alpha-weighted
+             combination of the states from the slots that its src and dst
+             endpoints picked. Keeps state coherent with the routing decisions
+             (was buggy — previously used slot's OWN proposed state regardless
+             of routing).
+          5. EMA saliency u from POPULARITY (pick_count, column reduction) —
+             "how often is this slot's identity being picked by others." Was
+             buggy — previously used update_alpha (selectivity, row property).
+          6. Recycle: novel proposal claims lowest-saliency eligible slot.
+             Admission uses `novelty >= u` so cold-start ties admit.
+          7. Increment age.
+        No aux loss; no learned saliency. All discipline is structural.
+        """
+        from .graph_substrate import (
+            expert_choice_routing, gather_picked_proposals,
+            update_pick_affinity_ema, recycle_dead_slots,
+        )
 
         w_dtype = next(self.pin_encoder.parameters()).dtype
         token_embeds = token_embeds.to(w_dtype)
@@ -1785,10 +1997,8 @@ class GraphBaselineEncoder(nn.Module):
         if attention_mask is not None and not attention_mask.any():
             return state, {}
 
-        # Encode pins
+        # 1. Pins (+ sinusoidal PE — audit2 #5)
         pins = self.pin_encoder(token_embeds)                    # [B, T_w, d_updater]
-        # Audit2 #5: add sinusoidal PE so within-window token order matters.
-        # Without this the updater's cross-attn over pins is order-invariant.
         T_w = pins.shape[1]
         pe = _sinusoidal_pe(T_w, pins.shape[-1], offset=chunk_offset,
                              device=pins.device, dtype=pins.dtype)
@@ -1806,115 +2016,178 @@ class GraphBaselineEncoder(nn.Module):
             has_real = None
 
         edges_old = state["edges"]
-        proposed, gates = self.updater(pins, edges_old, pins_pad_mask=pins_pad_mask)
+        K = self.K_max
 
-        # Soft snap: resolve proposed endpoints against the bank of existing
-        # endpoints. endpoint_bank = concat all old src+dst across slots.
-        endpoint_bank = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
-        # [B, 2*K_max, d_node]
-        snapped_src, max_sim_src = soft_snap(
-            proposed["src"], endpoint_bank, gates["snap_gate_src"],
-        )
-        snapped_dst, max_sim_dst = soft_snap(
-            proposed["dst"], endpoint_bank, gates["snap_gate_dst"],
+        # 2. Raw proposals (no gates, no saliency)
+        proposals = self.updater(pins, edges_old, pins_pad_mask=pins_pad_mask)
+
+        # 3. Expert-choice routing for endpoints
+        endpoints = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
+        # [B, 2K, d_node]
+        proposed_endpoints = torch.cat([proposals["src"], proposals["dst"]], dim=1)
+        picked_idx, update_alpha, novelty, pick_count = expert_choice_routing(
+            endpoints, proposed_endpoints,
+            strength_scale=self.update_strength_scale,
         )
 
-        # Apply keep_gate: preserve old vs use snapped proposal. Saliency
-        # logit gets the same gate (audit M2) so keep=1 truly preserves
-        # the slot rather than letting saliency drift independently.
-        kg = gates["keep_gate"].unsqueeze(-1)
-        kg_1d = gates["keep_gate"]                                # [B, K]
-        edges_new = {
-            "src": kg * edges_old["src"] + (1 - kg) * snapped_src,
-            "dst": kg * edges_old["dst"] + (1 - kg) * snapped_dst,
-            "state": kg * edges_old["state"]
-                     + (1 - kg) * proposed["state"],
-            "saliency_logit": (kg_1d * edges_old["saliency_logit"]
-                               + (1 - kg_1d) * proposed["saliency_logit"]),
+        # Apply update: new = (1-α)·old + α·picked_proposal
+        picked = gather_picked_proposals(proposed_endpoints, picked_idx)
+        alpha = update_alpha.unsqueeze(-1).to(w_dtype)              # [B, 2K, 1]
+        new_endpoints = (1 - alpha) * endpoints + alpha * picked
+        new_src = new_endpoints[:, :K, :]
+        new_dst = new_endpoints[:, K:, :]
+
+        # 4. State update — gather state from the SLOTS that were picked, not
+        # from slot k's own proposal (architecture P1 fix). Each endpoint pick
+        # is a vote to merge with that proposal's slot identity; if slot k's
+        # src endpoint picked proposal j and dst endpoint picked proposal l,
+        # then slot k is moving toward being a chimera (src from j, dst from l).
+        # The state should reflect the same routing decisions, not stay tied
+        # to slot k's OWN cross-attention output.
+        #
+        # Slot of each picked endpoint = picked_idx % K (proposals are stacked
+        # [src; dst] so positions [0, K) are slot k's proposed src and [K, 2K)
+        # are slot k's proposed dst — both share state slot k).
+        slot_of_pick = picked_idx % K                              # [B, 2K]
+        # Gather state from each picked slot for both src-endpoint and dst-endpoint picks
+        d_state = proposals["state"].shape[-1]
+        slot_src = slot_of_pick[:, :K].unsqueeze(-1).expand(-1, -1, d_state)  # [B, K, d_state]
+        slot_dst = slot_of_pick[:, K:].unsqueeze(-1).expand(-1, -1, d_state)
+        state_from_src_pick = proposals["state"].gather(dim=1, index=slot_src)
+        state_from_dst_pick = proposals["state"].gather(dim=1, index=slot_dst)
+        # Combine via per-endpoint alpha. Higher-confidence endpoint dominates;
+        # if both picked the same slot, the combined state is just that slot's
+        # state (unambiguous).
+        alpha_src_e = update_alpha[:, :K].unsqueeze(-1).to(w_dtype)  # [B, K, 1]
+        alpha_dst_e = update_alpha[:, K:].unsqueeze(-1).to(w_dtype)
+        total_alpha = alpha_src_e + alpha_dst_e + 1e-6
+        picked_state = (alpha_src_e * state_from_src_pick
+                        + alpha_dst_e * state_from_dst_pick) / total_alpha
+        # Per-slot update strength = max of the two endpoint alphas (kept
+        # for parity with the endpoint update — slot moves if EITHER endpoint
+        # is being aggressively routed).
+        alpha_state = torch.maximum(alpha_src_e, alpha_dst_e)        # [B, K, 1]
+        new_state_field = (1 - alpha_state) * edges_old["state"] + alpha_state * picked_state
+
+        # 5. Saliency EMA update — uses POPULARITY (pick_count column reduction),
+        # not selectivity (update_alpha row property). See update_pick_affinity_ema
+        # docstring for why this matters (was a P1 audit finding).
+        new_u = update_pick_affinity_ema(
+            edges_old["u"], pick_count.to(edges_old["u"].dtype),
+            decay=self.u_decay,
+        )
+
+        new_age = edges_old["age"] + 1.0
+        edges_after_routing = {
+            "src": new_src, "dst": new_dst, "state": new_state_field,
+            "u": new_u, "age": new_age,
         }
 
-        # Per-row all-pad protection on the edges update
+        # Per-row all-pad protection (rows with no real tokens revert to old)
         if attention_mask is not None:
             has_real_f = has_real.to(w_dtype)
-            keep_mask = has_real_f.view(-1, 1, 1)
-            keep_mask_1d = has_real_f.view(-1, 1)
-            edges_new = {
-                "src": edges_new["src"] * keep_mask + edges_old["src"] * (1 - keep_mask),
-                "dst": edges_new["dst"] * keep_mask + edges_old["dst"] * (1 - keep_mask),
-                "state": edges_new["state"] * keep_mask + edges_old["state"] * (1 - keep_mask),
-                "saliency_logit": edges_new["saliency_logit"] * keep_mask_1d
-                                  + edges_old["saliency_logit"] * (1 - keep_mask_1d),
+            km = has_real_f.view(-1, 1, 1)
+            km_1d = has_real_f.view(-1, 1)
+            edges_after_routing = {
+                "src":   edges_after_routing["src"]   * km   + edges_old["src"]   * (1 - km),
+                "dst":   edges_after_routing["dst"]   * km   + edges_old["dst"]   * (1 - km),
+                "state": edges_after_routing["state"] * km   + edges_old["state"] * (1 - km),
+                "u":     edges_after_routing["u"]     * km_1d.to(edges_old["u"].dtype)
+                         + edges_old["u"] * (1 - km_1d.to(edges_old["u"].dtype)),
+                "age":   edges_after_routing["age"]   * km_1d.to(edges_old["age"].dtype)
+                         + edges_old["age"] * (1 - km_1d.to(edges_old["age"].dtype)),
             }
 
-        # Aux losses
-        L_connect = loss_connectivity(
-            gates["snap_gate_src"], gates["snap_gate_dst"],
-            max_sim_src, max_sim_dst,
-            has_real=has_real,
-        )
-        L_adj = loss_adjust(edges_new, edges_old, has_real=has_real)
-
-        weighted_aux = (
-            self.lambda_connect * L_connect
-            + self.lambda_adjust * L_adj
+        # 6. Recycle dead slots with novel proposals — variable count in
+        # [0, ceil(max_overwrites_fraction * K_max)]. A quiet window with no
+        # novel content produces zero overwrites; a busy window can refresh
+        # up to the cap.
+        edges_new, overwrite_mask = recycle_dead_slots(
+            edges_after_routing, proposals, novelty,
+            grace_windows=self.grace_windows,
+            max_overwrites_fraction=self.max_overwrites_fraction,
         )
 
-        new_state = dict(state)
-        new_state["edges"] = edges_new
-        new_state["aux_accum"] = state["aux_accum"] + weighted_aux
-        new_state["L_connect_accum"] = state["L_connect_accum"] + L_connect.detach()
-        new_state["L_adjust_accum"] = state["L_adjust_accum"] + L_adj.detach()
-        new_state["n_windows"] = state["n_windows"] + 1
-        return new_state, {
-            "graph_L_connect": L_connect.detach(),
-            "graph_L_adjust": L_adj.detach(),
+        # All-pad row protection MUST be re-applied AFTER recycling — the
+        # earlier protection only restored values; recycling then runs and can
+        # overwrite slots on those rows (its eligibility check is age >= grace,
+        # which post-protection age IS valid → recycle can fire). Bug found by
+        # external audit: a row with no real tokens could have its substrate
+        # destroyed. Re-apply the masking on edges_new and zero the
+        # overwrite_mask for all-pad rows so the diagnostic stays honest.
+        if attention_mask is not None:
+            km = has_real_f.view(-1, 1, 1)
+            km_1d = has_real_f.view(-1, 1)
+            edges_new = {
+                "src":   edges_new["src"]   * km   + edges_old["src"]   * (1 - km),
+                "dst":   edges_new["dst"]   * km   + edges_old["dst"]   * (1 - km),
+                "state": edges_new["state"] * km   + edges_old["state"] * (1 - km),
+                "u":     edges_new["u"]     * km_1d.to(edges_old["u"].dtype)
+                         + edges_old["u"] * (1 - km_1d.to(edges_old["u"].dtype)),
+                "age":   edges_new["age"]   * km_1d.to(edges_old["age"].dtype)
+                         + edges_old["age"] * (1 - km_1d.to(edges_old["age"].dtype)),
+            }
+            overwrite_mask = overwrite_mask & has_real.view(-1, 1)
+
+        # Diagnostics (detached scalars; no gradient flow)
+        with torch.no_grad():
+            pick_strength_mean = update_alpha.mean()
+            overwrite_count = overwrite_mask.sum().to(torch.float32)
+
+        new_outer_state = dict(state)
+        new_outer_state["edges"] = edges_new
+        new_outer_state["n_windows"] = state["n_windows"] + 1
+        new_outer_state["pick_strength_accum"] = state["pick_strength_accum"] + pick_strength_mean
+        new_outer_state["overwrite_count_accum"] = state["overwrite_count_accum"] + overwrite_count
+
+        return new_outer_state, {
+            "graph_pick_strength": pick_strength_mean,
+            "graph_overwrite_count": overwrite_count,
         }
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
-        """Project K_max edges to d_llama memory tokens (fused per-edge MLP),
-        prepended by compute_qa_loss like the other prepend variants."""
+        """Readout: directional W_src/W_dst + cross-edge message
+        passing → per-edge d_llama token. Saliency u gates the contribution."""
         edges = state["edges"]
         B = edges["src"].shape[0]
         device = edges["src"].device
-        dtype = next(self.proj_to_llama.parameters()).dtype
 
-        # Pack per-edge features: (src, dst, state, saliency_scalar)
-        sal = torch.sigmoid(edges["saliency_logit"]).unsqueeze(-1)    # [B, K_max, 1]
-        edge_feats = torch.cat([
-            edges["src"], edges["dst"], edges["state"], sal,
-        ], dim=-1)                                                     # [B, K_max, 2d_n+d_s+1]
-        memory = self.proj_to_llama(edge_feats.to(dtype))              # [B, K_max, d_llama]
-        # Audit2 #4: gate the projected memory by saliency AFTER the
-        # LayerNorm inside proj_to_llama. Without this, low-saliency
-        # slots still emit full-scale Llama tokens (norm ~45) — the
-        # saliency feature gets washed by norm. Multiply post-norm:
-        # low-saliency edge → low-magnitude memory token, the decoder
-        # mostly ignores it.
-        memory = memory * sal.to(memory.dtype)
+        memory = self.readout(
+            edges["src"], edges["dst"], edges["state"], edges["u"],
+        )                                                              # [B, K_max, d_llama]
 
         n_w = max(state["n_windows"], 1)
-        graph_aux = state["aux_accum"] / n_w
 
         with torch.no_grad():
-            sal_mean = torch.sigmoid(edges["saliency_logit"]).mean()
+            u_mean = edges["u"].mean()
             src_norm = edges["src"].norm(dim=-1).mean()
             # Endpoint reuse diagnostic: average cosine between all (src, dst) endpoints
             ep_bank = torch.cat([edges["src"], edges["dst"]], dim=1)   # [B, 2K, d]
             ep_norm = F.normalize(ep_bank, dim=-1, eps=1e-6)
-            cos_matrix = ep_norm @ ep_norm.transpose(-1, -2)           # [B, 2K, 2K]
-            # Mean off-diagonal cosine — higher = more node reuse
+            cos_matrix = ep_norm @ ep_norm.transpose(-1, -2)
             K2 = ep_bank.shape[1]
             off_diag_mask = ~torch.eye(K2, dtype=torch.bool, device=device)
             ep_reuse = cos_matrix[:, off_diag_mask].mean()
+            pick_strength_mean = (state["pick_strength_accum"] / n_w).to(torch.float32)
+            # overwrites_per_row_per_window — average count, NOT a 0-1 rate.
+            # E.g. at max_overwrites_fraction=0.05 × K_max=68 → cap=3, so this
+            # tops out at 3.0 if every window saturates eviction. The earlier
+            # name `graph_overwrite_rate` was misleading (suggested a fraction).
+            overwrites_per_row_per_window = (state["overwrite_count_accum"] / max(n_w * B, 1)).to(torch.float32)
+            age_mean = edges["age"].mean()
 
         aux = {
-            "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
-            "graph_aux": graph_aux,
-            "graph_L_connect": state["L_connect_accum"] / n_w,
-            "graph_L_adjust": state["L_adjust_accum"] / n_w,
-            "graph_saliency_mean": sal_mean,
+            # No load_balance for graph_baseline (no codebook routing).
+            "load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype),
+            # No graph_aux — no auxiliary loss. Keep the key for
+            # downstream compatibility (model.py reads it as optional).
+            "graph_aux": torch.zeros((), device=device, dtype=memory.dtype),
+            "graph_u_mean": u_mean,
             "graph_src_norm": src_norm,
             "graph_endpoint_reuse": ep_reuse,
+            "graph_pick_strength_avg": pick_strength_mean,
+            "graph_overwrites_per_row_per_window": overwrites_per_row_per_window,
+            "graph_age_mean": age_mean,
         }
         return memory, aux
 

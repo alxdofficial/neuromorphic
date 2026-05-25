@@ -31,21 +31,20 @@ from src.repr_learning.config import ReprConfig
 from src.repr_learning.data_qa import make_mixed_qa_dataloader
 from src.repr_learning.decoder import load_frozen_llama
 from src.repr_learning.model import ReprLearningModel
-
-
-def to_device(batch, device):
-    for f in ("context_ids", "context_mask", "question_ids", "question_mask",
-              "answer_ids", "answer_mask", "answer_content_mask"):
-        setattr(batch, f, getattr(batch, f).to(device, non_blocking=True))
-    return batch
+from scripts.repr_learning.train_repr_qa import materialize_val_set, to_device
 
 
 @torch.no_grad()
-def run_val_pass(model, val_dl, device, n_batches: int, window_size: int,
+def run_val_pass(model, val_set, device, n_batches: int, window_size: int,
                  zero_memory: bool) -> Dict:
+    """Run val over a fixed materialized list of batches. Critical: pass the
+    SAME list to both `normal` and `zero` calls so the two scores compare
+    apples-to-apples. Previously this took a streaming val_dl and the second
+    call drained a different chunk of the stream — gaps were noisy and biased.
+    """
     model.train(False)
     losses, accs, per_fam = [], [], {}
-    for i, batch in enumerate(val_dl):
+    for i, batch in enumerate(val_set):
         if i >= n_batches:
             break
         batch = to_device(batch, device)
@@ -73,7 +72,7 @@ def run_val_pass(model, val_dl, device, n_batches: int, window_size: int,
 
 
 def evaluate_variant(variant: str, ckpt_path: Path, llama, tokenizer,
-                     cfg: ReprConfig, val_dl, device, n_batches: int,
+                     cfg: ReprConfig, val_set, device, n_batches: int,
                      window_size: int) -> Dict:
     print(f"\n=== {variant}  ({ckpt_path}) ===", flush=True)
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
@@ -91,9 +90,11 @@ def evaluate_variant(variant: str, ckpt_path: Path, llama, tokenizer,
         print(f"  WARN: unexpected keys: {unexpected[:5]}"
               f"{'...' if len(unexpected) > 5 else ''}", flush=True)
 
-    normal = run_val_pass(model, val_dl, device, n_batches, window_size,
+    # Both passes over the SAME materialized list — gap is now a pure
+    # within-batch comparison, not contaminated by streaming sampling noise.
+    normal = run_val_pass(model, val_set, device, n_batches, window_size,
                           zero_memory=False)
-    zero = run_val_pass(model, val_dl, device, n_batches, window_size,
+    zero = run_val_pass(model, val_set, device, n_batches, window_size,
                         zero_memory=True)
     del model
     torch.cuda.empty_cache()
@@ -195,11 +196,18 @@ def main():
         weights=tuple(args.mix_weights),
         batch_size=args.batch_size,
     )
+    # Materialize once — all variants and both (normal, zero) passes see the
+    # IDENTICAL list of batches. Without this, the streaming val_dl gives a
+    # different sample to each pass and gaps get contaminated by sampling
+    # variance (same root cause as the trainer-side val noise fix).
+    val_set = materialize_val_set(val_dl, args.val_batches)
+    print(f"Materialized val_set: {len(val_set)} batches (shared across variants and passes)",
+          flush=True)
 
     results = []
     for var, path in pairs:
         try:
-            r = evaluate_variant(var, path, llama, tokenizer, cfg, val_dl,
+            r = evaluate_variant(var, path, llama, tokenizer, cfg, val_set,
                                  device, args.val_batches, args.window_size)
             results.append(r)
         except Exception as e:

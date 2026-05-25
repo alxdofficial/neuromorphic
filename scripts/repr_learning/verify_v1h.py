@@ -95,13 +95,19 @@ CRITICAL_PARAMS = {
         "encoder.scale_raw",
     ],
     "graph_baseline": [
-        # Updater out_head drives all per-edge proposals + gates.
-        # Pin encoder gets QA gradient through the cross-attention.
-        # proj_to_llama projects edges into Llama's memory tokens.
+        # Updater out_head drives all per-edge proposals (no gates in v3).
+        # Pin encoder gets QA gradient through cross-attention to pins.
+        # GraphReadout is the new readout path (replaces v1/v2 proj_to_llama):
+        #   W_src/W_dst — directional R-GCN-style transforms (must train)
+        #   cross_edge_attn.in_proj — message-passing self-attention over edges
+        #   proj.0 — final projection to d_llama
         "encoder.pin_encoder.0.weight",
         "encoder.updater.out_head.weight",
         "encoder.updater.edge_in_proj.weight",
-        "encoder.proj_to_llama.0.weight",
+        "encoder.readout.W_src.weight",
+        "encoder.readout.W_dst.weight",
+        "encoder.readout.cross_edge_attn.in_proj_weight",
+        "encoder.readout.proj.0.weight",
     ],
     "vanilla_llama": [],  # no encoder params
 }

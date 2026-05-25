@@ -6,13 +6,25 @@ borrows, and any modifications we made for our text-window
 reconstruction setup. Cite this in any publication that uses
 these baselines.
 
-All five baselines (V2.1 + four) and `vanilla_llama` are matched at:
-- **Pre-projection bottleneck width**: ~69,600 floats per chunk
-- **Post-projection memory tokens to Llama**: 96 × 2048 = 196,608 floats
-- **Decoder**: frozen Llama-3.2-1B; only encoder-side params trainable
+We currently compare **8 variants** in the trainer:
+- **A** (`flat_baseline`) — flat codebook, prepend reads
+- **B** (`continuous_baseline`) — continuous slots with slot-attention, prepend reads
+- **MT** (`memorizing_baseline`) — per-token kNN retrieval bank, prepend reads
+- **Mamba** (`recurrent_baseline`) — recurrent SSM encoder, prepend reads
+- **plastic** (`plastic_baseline`) — Hebbian fast-weights, per-position MemInject reads
+- **splat** (`splat_baseline`) — signed Gaussian mixture, per-position MemInject reads (see `docs/exp3_gaussian_splat_baseline.md`)
+- **graph** (`graph_baseline`) — bounded edge memory with expert-choice routing (see `docs/exp1_graph_baseline.md`)
+- **vanilla** (`vanilla_llama`) — no-memory loss floor
 
-Trainable parameter counts vary because each architecture's natural
-allocation differs (codebook size, slot mechanism, recurrent state).
+All variants are matched at a comparable pre-projection bottleneck
+width per window (~26,000 floats in current v1h sizing) — the precise
+formulas differ by substrate. Per-architecture float-counts are
+reported by `scripts/repr_learning/verify_v1h.py`.
+
+- **Decoder**: frozen Llama-3.2-1B; only encoder-side params trainable
+- Trainable param counts vary because each architecture's natural
+  allocation differs (codebook size, slot mechanism, recurrent state,
+  fast-weights matrix, edge bank, etc.)
 
 ## V2.1 (our model)
 
@@ -101,6 +113,14 @@ unstructured continuous slots at matched bottleneck width.
 
 ## Baseline 4 — Memorizing Transformers (`MemorizingBaselineEncoder`)
 
+> **MT is a different memory class from A / B / plastic / splat / graph.** Its raw
+> memory bank is ~23,200 KB vs the bottleneck-matched variants' ~26 KB — about
+> 900× larger. MT is included as a **published reference architecture**, not as
+> an apples-to-apples competitor. **Expect MT to score well** because it has
+> dramatically more memory; the interesting comparison is among the
+> bottleneck-matched class (A, B, plastic, splat, graph) which all share the
+> ~26 KB budget.
+
 **Archetype**: kNN / retrieval-augmented memory family — store
 verbatim, retrieve at decode.
 
@@ -116,8 +136,11 @@ original MT paper) so the encoder outputs a fixed 96 memory tokens to
 Llama. Added a soft STE gate so gradient flows back to the
 key-producing weights despite the hard selection.
 
-**Tests:** whether structured compression (V2.1, A, B) beats retrieval
-from a verbatim per-token KV bank at matched memory-token budget.
+**Tests:** establishes where a retrieval-augmented architecture (with a
+large verbatim bank) lands on this benchmark. Performance better than
+the bottleneck-matched variants is expected and not the win condition
+for our own designs — what matters is whether structured compression at
+26 KB approaches the retrieval-augmented reference at 23,200 KB.
 
 ## Baseline 5 — Mamba SSM (`RecurrentBaselineEncoder`)
 
@@ -298,3 +321,31 @@ protocol-mismatch reasons.
 
 Bibtex entries available at the bottom of this document. (TODO: add
 bibtex on first publication.)
+
+---
+
+## plastic_baseline — Hebbian fast weights
+
+**Closest archetype**: [Schmidhuber 1992 — *Learning to control fast-weight memories*](https://www.semanticscholar.org/paper/Learning-to-Control-Fast-Weight-Memories%3A-An-to-Schmidhuber/3eedf48ed1a9f9bef0c46a91be5f33ae2887d77c) and the modern revival in [Schlag, Irie & Schmidhuber 2021 — *Linear Transformers Are Secretly Fast Weight Programmers*](https://arxiv.org/abs/2102.11174).
+
+**Mechanism**: a per-layer plastic matrix `M ∈ R^{d_h × d_h}` is updated by Hebbian outer-products of (key, value) pairs derived from the input. Reads project a query to a key, retrieve M·k, project back. We keep `plastic_depth` parallel matrices for capacity. Update rule is the standard `M ← decay·M + η·(v ⊗ k)`.
+
+**Differences from canonical Schlag-style**: per-position MemInject reads (decoder hidden state queries the fast weights), not per-token-prepend. This tests "fast weights as inline retrieval" rather than "fast weights as compressed context vector." Update writes happen once per chunk (not per token) to match streaming-window protocol of the other variants.
+
+---
+
+## splat_baseline — Gaussian mixture memory
+
+See **[`docs/exp3_gaussian_splat_baseline.md`](exp3_gaussian_splat_baseline.md)** for the full design. Short version: memory is K signed Gaussians in d_latent space; reads emit ray probes from each decoder position and integrate the signed-density field along each ray. Influenced by 3D Gaussian Splatting (Kerbl et al. 2023) translated to text-memory.
+
+---
+
+## graph_baseline — bounded edge memory with expert-choice routing
+
+See **[`docs/exp1_graph_baseline.md`](exp1_graph_baseline.md)** for the full design. Short version: 68 (src, dst, state) edge slots; per-window, a small transformer produces 68 candidate edge updates; expert-choice routing has each existing endpoint pick the most-similar new proposal (geometric clustering ⇒ node reuse without learned gates); saliency = EMA of pick affinity (derived, not learned); slot recycling via percentile-based admission (`novelty > u`). Directional R-GCN-style readout with cross-edge message passing.
+
+---
+
+## vanilla_llama — no-memory loss floor
+
+The frozen Llama-3.2-1B decoder running with **zero memory tokens prepended**. Only trainable parameter is `mask_embed` (single 2048-dim vector). Establishes the reconstruction loss floor: any memory architecture that doesn't beat this number isn't doing anything useful.

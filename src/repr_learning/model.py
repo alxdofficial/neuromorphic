@@ -16,6 +16,7 @@ from .config import ReprConfig
 from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
+    FullContextEncoder,
     GraphBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
@@ -50,7 +51,8 @@ class ReprLearningModel(nn.Module):
         "plastic_baseline": PlasticBaselineEncoder,
         "splat_baseline": SplatBaselineEncoder,
         "graph_baseline": GraphBaselineEncoder,
-        "vanilla_llama": NullEncoder,
+        "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
+        "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
 
     def __init__(
@@ -764,17 +766,23 @@ class ReprLearningModel(nn.Module):
                 "splat_L_sat": finalize_aux.get("splat_L_sat"),
             }
 
-        # Graph variant: pre-weighted aux (λ_connect·L_connect + λ_adj·L_adj)
+        # Graph variant: v3 has no aux loss (graph_aux is zero); telemetry
+        # keys are derived signals (u, age, pick strength, overwrite rate).
+        # Legacy keys (L_connect, L_adjust, saliency_mean) kept as None for
+        # back-compat with downstream plotting code that .get()s them.
         graph_aux = finalize_aux.get("graph_aux", None)
         graph_telemetry = None
         if graph_aux is not None:
             loss = loss + graph_aux.to(loss.dtype)
             graph_telemetry = {
                 "graph_aux": graph_aux.detach(),
-                "graph_L_connect": finalize_aux.get("graph_L_connect"),
-                "graph_L_adjust": finalize_aux.get("graph_L_adjust"),
-                "graph_saliency_mean": finalize_aux.get("graph_saliency_mean"),
                 "graph_endpoint_reuse": finalize_aux.get("graph_endpoint_reuse"),
+                # v3 derived-signal telemetry (replaces L_connect / L_adjust / saliency_logit)
+                "graph_u_mean": finalize_aux.get("graph_u_mean"),
+                "graph_pick_strength_avg": finalize_aux.get("graph_pick_strength_avg"),
+                "graph_overwrites_per_row_per_window": finalize_aux.get("graph_overwrites_per_row_per_window"),
+                "graph_age_mean": finalize_aux.get("graph_age_mean"),
+                "graph_src_norm": finalize_aux.get("graph_src_norm"),
             }
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add

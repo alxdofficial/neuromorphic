@@ -15,6 +15,12 @@ Mamba, and Vanilla (loss floor).
 
 ## 1. Dataset
 
+> **For per-source token statistics and worked examples of every task
+> family**, see **[`docs/dataset_examples.md`](dataset_examples.md)** — it
+> covers the 9 composite_v1 families plus HotpotQA, NarrativeQA, MuSiQue,
+> BABILong with one fully-reconstructed example each plus a unified
+> n_questions / token-budget census.
+
 **FineWeb-edu** (HuggingFaceTB/fineweb-edu) — high-quality web text
 filtered for educational content. Pretokenized with the Llama-3.2
 tokenizer (`meta-llama/Llama-3.2-1B`, vocab=128,256).
