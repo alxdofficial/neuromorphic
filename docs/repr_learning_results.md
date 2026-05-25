@@ -4,14 +4,11 @@ Centralized scoreboard for v1 representation-learning runs. Pairs with
 `docs/repr_learning_baselines.md` (architectural lineage / citations) and
 `docs/dataset_examples.md` (per-source token census).
 
-> **Caveat on the val_recon numbers below**: `run_val` advances the val
-> DataLoader iterator each call (no fixed val set yet — task #614 pending),
-> so the same checkpoint evaluated twice can differ by 0.4-0.7 nat on
-> aggregate val_recon. The **streaming-best** number (best `val_recon` seen
-> across all in-training val checkpoints) is more trustworthy than the
-> final-eval number; in tables that show both, prefer streaming-best.
-> `top1_acc` is a counting statistic and much more stable across re-evals.
-> When this is fixed, the numbers should be re-collected.
+> **Update 2026-05-25**: the val-sampling bug (task #614) is fixed —
+> `materialize_val_set` pins a fixed val batch list so the same checkpoint
+> evaluated twice now agrees to <0.01 nat. Numbers below the "v1h_t4k_v3"
+> section use the corrected protocol; earlier sections still carry the
+> streaming-val caveat.
 
 **Objectives:**
 - **HSM** — hidden-state matching, v1e. Frozen-Llama hidden-state MSE across
@@ -28,7 +25,71 @@ notes).
 
 ---
 
-## 1. Headline scoreboard
+## 0. v1h_t4k_v3 — QA on composite_v1 + HotpotQA + NarrativeQA (2026-05-25, **current**)
+
+The headline tranche: 5 trainable + 2 vanilla on the v1h QA loss
+(per-token CE on the answer span). Protocol matches tranche-1-v2 for
+direct comparison: chunk=4096, window=1024, mix [0.5, 0.25, 0.25]
+(composite/hotpot/narrative). Max 20K steps with patience early-stop
+(5 consecutive non-improving vals = 2500-step plateau detector).
+
+This is the **first tranche with trustworthy val** (materialized fixed
+val set, best.pt eval), and the **first with the graph_baseline P1
+fixes** (u from pick_count popularity, state from picked, all-pad
+post-recycle protection — see `docs/exp1_graph_baseline.md`).
+
+| variant | val_recon | best_step | trained_to | notes |
+|---|---:|---:|---:|---|
+| **recurrent_baseline** (mamba) | **2.674** | 9500 | 10000 | tight val noise, clearly plateaued |
+| continuous_baseline | 2.692 | 15500 | 18000 | longest-converging top variant |
+| memorizing_baseline | 2.703 | 12000 | 14500 | top 3 within 0.03 nat |
+| ─────────────────── | ─── | ─── | ─── | ─── |
+| graph_baseline | 3.257 | 7500 | 10000 | high val variance — patience may have fired prematurely (see below) |
+| flat_baseline | 3.396 | 6500 | 9000 | known underperformer at this scale |
+| vanilla_full_context (no train) | 3.448 | 0 | — | in-context Llama ceiling reference |
+| vanilla_llama (no train) | 5.115 | 0 | — | no-memory floor |
+
+**Key reads:**
+- Top tier (mamba, continuous, memorizing) tied within 0.03 nat. Mamba
+  wins narrowly with the smallest param count.
+- Graph (3.26) is **0.55 nat behind the top tier**, only 0.2 nat ahead
+  of the no-train vanilla_full_context (3.45). The architecture trains
+  cleanly but doesn't compete on this task at this scale.
+- Vanilla floor (5.12) gives a 2.4-nat gap from the trained models —
+  memory does meaningful work for everyone.
+
+**Graph's val variance:**
+Comparing oscillation amplitude over the last 5 vals:
+
+```
+GRAPH    7500-10000: 3.26 → 3.28 → 3.44 → 3.46 → 3.31 → 3.42  (±0.10 nat)
+MAMBA    7500-10000: 2.67 → 2.69 → 2.72 → 2.68 → 2.67 → 2.68  (±0.025 nat)
+```
+
+Graph's noise is **4× larger** than mamba's. Suspected cause: stochastic
+write dynamics (recycling picks vary with batch composition + popularity-
+based admission). With patience threshold 1e-4 and patience=5, graph
+plateaus in noise rather than in true convergence. The top1 accuracy at
+step 8500 (41.4%) was actually higher than at the best-val step 7500
+(39.3%) — consistent with val variance rather than true plateau.
+
+→ Diagnostic in flight: longer graph run with disabled patience to test
+if val continues to drop with more compute.
+
+**What changed since tranche-1-v2 (pre-fix):**
+- Graph P1 architecture fixes (u, state, recycle, all-pad protection)
+- All-variant trustworthy eval (materialize_val_set + best.pt eval)
+- Patience-based early stop (best.pt staleness criterion)
+
+Lineage:
+- Trainer: `scripts/repr_learning/train_repr_qa.py`
+- Eval: `scripts/repr_learning/eval_best.py`
+- Launch: `scripts/training/launch_t4k_v3_overnight.sh`
+- Per-variant jsonl: `outputs/repr_learning/v1h_t4k_v3_<variant>/jsonl/`
+
+---
+
+## 1. Earlier scoreboard (v1e + v1g — pre-fix, streaming-val caveat applies)
 
 Lower is better in every column. **Bold** = best memory variant per objective.
 
