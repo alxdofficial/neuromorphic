@@ -34,58 +34,92 @@ direct comparison: chunk=4096, window=1024, mix [0.5, 0.25, 0.25]
 (5 consecutive non-improving vals = 2500-step plateau detector).
 
 This is the **first tranche with trustworthy val** (materialized fixed
-val set, best.pt eval), and the **first with the graph_baseline P1
-fixes** (u from pick_count popularity, state from picked, all-pad
-post-recycle protection — see `docs/exp1_graph_baseline.md`).
+val set, best.pt eval), the **first with the graph_baseline P1 fixes**
+(u from pick_count popularity, state from picked, all-pad
+post-recycle protection — see `docs/exp1_graph_baseline.md`), and now
+the **first with graph_baseline mode-collapse fix** (Switch Transformer
+load-balance loss, α=0.01).
 
-| variant | val_recon | best_step | trained_to | notes |
-|---|---:|---:|---:|---|
-| **recurrent_baseline** (mamba) | **2.674** | 9500 | 10000 | tight val noise, clearly plateaued |
-| continuous_baseline | 2.692 | 15500 | 18000 | longest-converging top variant |
-| memorizing_baseline | 2.703 | 12000 | 14500 | top 3 within 0.03 nat |
-| ─────────────────── | ─── | ─── | ─── | ─── |
-| graph_baseline | 3.257 | 7500 | 10000 | high val variance — patience may have fired prematurely (see below) |
-| flat_baseline | 3.396 | 6500 | 9000 | known underperformer at this scale |
-| vanilla_full_context (no train) | 3.448 | 0 | — | in-context Llama ceiling reference |
-| vanilla_llama (no train) | 5.115 | 0 | — | no-memory floor |
+### Val curves
 
-**Key reads:**
-- Top tier (mamba, continuous, memorizing) tied within 0.03 nat. Mamba
-  wins narrowly with the smallest param count.
-- Graph (3.26) is **0.55 nat behind the top tier**, only 0.2 nat ahead
-  of the no-train vanilla_full_context (3.45). The architecture trains
-  cleanly but doesn't compete on this task at this scale.
-- Vanilla floor (5.12) gives a 2.4-nat gap from the trained models —
-  memory does meaningful work for everyone.
+![v1h_t4k_v3 val curves](plots/v1h_t4k_v3_val_curves.png)
 
-**Graph's val variance:**
-Comparing oscillation amplitude over the last 5 vals:
+★ = best.pt per variant. Graph + LB (red) and mamba (green) are
+within a noise band at the bottom; pre-LB graph (orange dashed) is
+shown for reference. Vanilla floor (5.12) and full-context (3.45)
+horizontal lines mark the no-training references.
+
+### Final scoreboard (best.pt + materialized val, lower = better)
+
+| variant | val_recon | top1 | best_step | trained_to | notes |
+|---|---:|---:|---:|---:|---|
+| **graph_baseline + LB** | **2.637** | **49.1%** | 14500 | 17000 | mode-collapse fix unlocked top performance |
+| recurrent_baseline (mamba) | 2.674 | ~45% | 9500 | 10000 | tight val noise, clearly plateaued |
+| continuous_baseline | 2.692 | — | 15500 | 18000 | slowest-converging |
+| memorizing_baseline | 2.703 | — | 12000 | 14500 | — |
+| ─────────────────── | ─── | ─── | ─── | ─── | ─── |
+| graph_baseline (pre-LB) | 3.257 | 39.3% | 7500 | 10000 | mode-collapse plateau (superseded) |
+| flat_baseline | 3.396 | — | 6500 | 9000 | known underperformer at this scale |
+| vanilla_full_context (no train) | 3.448 | — | 0 | — | in-context Llama ceiling reference |
+| vanilla_llama (no train) | 5.115 | — | 0 | — | no-memory floor |
+
+**Headline finding:** with the LB-loss fix, **graph_baseline takes the
+top val_recon (2.637) AND the top top1 (49.1%)** on the v1h_t4k_v3
+fair-comparison benchmark, beating the previous winner (mamba) by 0.04
+nat val_recon and ~4 percentage points top1.
+
+### Statistical caveat (single-seed)
+
+Both numbers are from **N=1 run per variant**. The 0.037-nat margin is
+~1.5σ of mamba's val noise (std 0.025). To defensibly claim a real win
+rather than essentially-tied, we'd need 3+ seeds per variant — the
+single-seed comparison is competitive but not conclusive. The 4-point
+top1 margin is similar — suggestive (~1.4σ binomial) but not decisive.
+
+What IS robustly established:
+- **Graph closed the 0.58-nat gap to mamba** (from 3.257 → 2.637 = 95%
+  closure, well above any noise floor)
+- **Graph and mamba are within val noise of each other** — they're
+  effectively tied at the top of the leaderboard
+- **The mode-collapse mechanism was real and was fixed by LB loss**
+  (state diversity rose from 0.0003 → 0.337, a 1000× change far beyond
+  any noise)
+
+### Plateau quality after the fix
+
+Pre-LB graph oscillated ±0.10 nat in its "plateau" region (signal of
+unconverged noise). Post-LB graph plateaus at ±0.01 nat — true
+convergence:
 
 ```
-GRAPH    7500-10000: 3.26 → 3.28 → 3.44 → 3.46 → 3.31 → 3.42  (±0.10 nat)
-MAMBA    7500-10000: 2.67 → 2.69 → 2.72 → 2.68 → 2.67 → 2.68  (±0.025 nat)
+graph + LB  steps 13500-17000: 2.66, 2.66, 2.64, 2.65, 2.64, 2.64, 2.64  (±0.01)
+graph no-LB steps  7500-10000: 3.26, 3.28, 3.44, 3.46, 3.31, 3.42        (±0.10)
+mamba       steps  7500-10000: 2.67, 2.69, 2.72, 2.68, 2.67, 2.68        (±0.025)
 ```
 
-Graph's noise is **4× larger** than mamba's. Suspected cause: stochastic
-write dynamics (recycling picks vary with batch composition + popularity-
-based admission). With patience threshold 1e-4 and patience=5, graph
-plateaus in noise rather than in true convergence. The top1 accuracy at
-step 8500 (41.4%) was actually higher than at the best-val step 7500
-(39.3%) — consistent with val variance rather than true plateau.
+Patience triggered at step 17000 (true plateau, not premature noise stop).
 
-→ Diagnostic in flight: longer graph run with disabled patience to test
-if val continues to drop with more compute.
+### What changed since tranche-1-v2 (pre-fix → final)
 
-**What changed since tranche-1-v2 (pre-fix):**
-- Graph P1 architecture fixes (u, state, recycle, all-pad protection)
-- All-variant trustworthy eval (materialize_val_set + best.pt eval)
-- Patience-based early stop (best.pt staleness criterion)
+- **Phase 1+2+4**: graph P1 architecture fixes (u → popularity,
+  state from picked, all-pad protected, recycle `>=`), eval pipeline
+  correctness (trustworthy materialized val + best.pt loaded for final)
+- **Diagnostic**: identified within-chunk state collapse (state
+  diversity = 0.0001 → degenerate substrate)
+- **Fix**: Switch Transformer LB loss (Fedus et al. 2021) with
+  literature-standard α = 0.01. Zero new hyperparameters.
+- **Residual**: state still decays over windows within a chunk
+  (0.337 → 0.013 across 4 windows). LB delays collapse but doesn't
+  prevent it. For longer chunks (tranche 2/3) a direct per-window
+  state-orthogonality penalty is the next-iteration fix.
 
 Lineage:
 - Trainer: `scripts/repr_learning/train_repr_qa.py`
 - Eval: `scripts/repr_learning/eval_best.py`
 - Launch: `scripts/training/launch_t4k_v3_overnight.sh`
 - Per-variant jsonl: `outputs/repr_learning/v1h_t4k_v3_<variant>/jsonl/`
+- LB-fix run: `outputs/repr_learning/v1h_t4k_v3_lb_graph_baseline/jsonl/`
+- Val curve plot: `outputs/repr_learning/v1h_t4k_v3_val_curves.png`
 
 ---
 

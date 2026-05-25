@@ -254,38 +254,41 @@ Trainable param count: ~16M (matches A/B/MT/Mamba's 12-15M band).
 - Structure probe (`scripts/repr_learning/probe_graph_v3.py`) confirms: self-pick masked (rate 0.0), gate response u=1 vs u=0 differs by 54×, u std across slots = 0.088 (not uniform).
 - All-pad row protection verified post-recycle (row substrate preserved when no real tokens).
 
-## Empirical results (v1h_t4k_v3, 2026-05-25)
-
-After all P1 fixes + post-recycle all-pad protection:
+## Empirical results (v1h_t4k_v3, 2026-05-25) — final after LB-loss fix
 
 ```
 val_recon (lower=better, trustworthy materialized-val protocol):
 
-  recurrent_baseline (mamba)   2.674   ← winner
-  continuous_baseline          2.692
-  memorizing_baseline          2.703
-  ───────────────────────────────────
-  graph_baseline               3.257   ← 0.55 nat behind top
-  flat_baseline                3.396
-  vanilla_full_context (no-train)  3.448
-  vanilla_llama (no-mem floor)     5.115
+  graph_baseline + LB        2.637    top1 49.1%   ← TOP (this work)
+  recurrent_baseline (mamba) 2.674    top1 ~45%
+  continuous_baseline        2.692
+  memorizing_baseline        2.703
+  ──────────────────────────────────────
+  graph_baseline (pre-LB)    3.257    top1 39.3%   ← superseded
+  flat_baseline              3.396
+  vanilla_full_context       3.448
+  vanilla_llama              5.115
 ```
 
-**Read.** Graph trains stably and beats the no-memory floor by 1.86 nat,
-but is **0.55 nat behind** the simpler top-tier baselines and only 0.2
-nat ahead of in-context Llama without training. The architecture is
-correct (mechanics healthy, gradients flow) but not yet competitive at
-this scale on this task mix.
+**Headline:** with the LB-loss fix, graph_baseline takes the top spot
+on both val_recon and top1, beating the previous best (mamba) by 0.04
+nat val_recon and ~4 percentage points top1.
 
-**Caveat — likely under-trained.** Graph's val curve oscillates ±0.1 nat
-between adjacent checkpoints in the "plateau" region; mamba oscillates
-±0.025 nat. The patience early-stop (5 evals without 1e-4 improvement)
-fired at step 10000 likely from val variance, not true convergence. Top1
-accuracy at step 8500 (41.4%) was higher than at the best-val step 7500
-(39.3%), inconsistent with a true plateau. The stochastic write
-dynamics (recycling decisions vary with batch composition) plausibly
-inflate weight-update variance between vals. A longer run with relaxed
-patience is in flight.
+**Single-seed caveat:** both numbers are from N=1 run per variant.
+The 0.037-nat margin to mamba is ~1.5σ of mamba's val noise (std 0.025).
+Robustly established is the 0.62-nat improvement over pre-LB graph and
+the now-competitive standing within the top-tier band; the
+"strictly beats mamba" claim needs multi-seed replication to defend.
+
+**Plateau quality after the fix.** Pre-LB graph oscillated ±0.10 nat
+("plateau in noise"); post-LB graph oscillates ±0.01 nat (true
+convergence):
+```
+post-LB  step 13500-17000:  2.66 2.66 2.64 2.65 2.64 2.64 2.64
+pre-LB   step  7500-10000:  3.26 3.28 3.44 3.46 3.31 3.42
+mamba    step  7500-10000:  2.67 2.69 2.72 2.68 2.67 2.68
+```
+Patience triggered at step 17000 = true plateau, not premature stop.
 
 **What the result tells us — irrespective of training duration:**
 - The graph mechanics are not buggy; they're orthogonal to whatever
