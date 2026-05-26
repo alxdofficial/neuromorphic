@@ -53,28 +53,35 @@ horizontal lines mark the no-training references.
 
 | variant | val_recon | top1 | best_step | trained_to | notes |
 |---|---:|---:|---:|---:|---|
-| **graph_baseline + LB** | **2.637** | **49.1%** | 14500 | 17000 | mode-collapse fix unlocked top performance |
-| recurrent_baseline (mamba) | 2.674 | ~45% | 9500 | 10000 | tight val noise, clearly plateaued |
-| continuous_baseline | 2.692 | — | 15500 | 18000 | slowest-converging |
-| memorizing_baseline | 2.703 | — | 12000 | 14500 | — |
+| **graph_baseline + LB** | **2.637** | 49.1% | 14500 | 17000 | **val_recon winner**; LB fix unlocked top performance |
+| recurrent_baseline (mamba) | 2.674 | 45.7% | 9500 | 10000 | tight val noise, clearly plateaued |
+| continuous_baseline | 2.692 | **50.9%** | 15500 | 18000 | **top-1 winner**; slowest-converging |
+| memorizing_baseline | 2.703 | 47.3% | 12000 | 14500 | — |
 | ─────────────────── | ─── | ─── | ─── | ─── | ─── |
 | graph_baseline (pre-LB) | 3.257 | 39.3% | 7500 | 10000 | mode-collapse plateau (superseded) |
-| flat_baseline | 3.396 | — | 6500 | 9000 | known underperformer at this scale |
-| vanilla_full_context (no train) | 3.448 | — | 0 | — | in-context Llama ceiling reference |
-| vanilla_llama (no train) | 5.115 | — | 0 | — | no-memory floor |
+| flat_baseline | 3.396 | 38.9% | 6500 | 9000 | known underperformer at this scale |
+| vanilla_full_context (no train) | 3.448 | 49.7% | 0 | — | in-context Llama ceiling reference |
+| vanilla_llama (no train) | 5.115 | 28.2% | 0 | — | no-memory floor |
+| plastic_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
+| splat_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
+
+**Two-metric reading.** Graph + LB wins **val_recon** (the loss being optimized). Continuous wins **top-1 accuracy** (50.9% vs Graph's 49.1%). Vanilla_full_context (no training) also lands at 49.7% top-1, suggesting top-1 on this mix is partly anchored to Llama's in-context priors. val_recon is the more discriminating metric here.
 
 **Headline finding:** with the LB-loss fix, **graph_baseline takes the
-top val_recon (2.637) AND the top top1 (49.1%)** on the v1h_t4k_v3
-fair-comparison benchmark, beating the previous winner (mamba) by 0.04
-nat val_recon and ~4 percentage points top1.
+top val_recon (2.637)** on the v1h_t4k_v3 fair-comparison benchmark,
+beating the previous val_recon leader (mamba) by 0.037 nat. On top-1
+the leaderboard is different — **continuous_baseline tops at 50.9%**,
+graph lands second at 49.1%, with vanilla_full_context (no training)
+itself reaching 49.7% top-1. See "two-metric reading" above.
 
 ### Statistical caveat (single-seed)
 
-Both numbers are from **N=1 run per variant**. The 0.037-nat margin is
-~1.5σ of mamba's val noise (std 0.025). To defensibly claim a real win
-rather than essentially-tied, we'd need 3+ seeds per variant — the
-single-seed comparison is competitive but not conclusive. The 4-point
-top1 margin is similar — suggestive (~1.4σ binomial) but not decisive.
+All numbers are from **N=1 run per variant**. The 0.037-nat val_recon
+margin (graph vs mamba) is ~1.5σ of mamba's val noise (std 0.025). To
+defensibly claim a real win rather than essentially-tied, we'd need 3+
+seeds per variant — the single-seed comparison is competitive but not
+conclusive. The ~1.8-point top1 gap (continuous vs graph) is similar
+order of magnitude and likewise not decisive.
 
 What IS robustly established:
 - **Graph closed the 0.58-nat gap to mamba** (from 3.257 → 2.637 = 95%
