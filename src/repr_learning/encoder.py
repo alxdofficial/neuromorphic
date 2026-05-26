@@ -1917,7 +1917,7 @@ class GraphBaselineEncoder(nn.Module):
             d_node=self.d_node,
             d_state=self.d_state,
             n_layers=self.n_updater_layers,
-            n_heads=4,
+            n_heads=16,            # v4.2: bumped 4→16 to reduce per-head V-collapse risk
             ffn_mult=4,
         )
 

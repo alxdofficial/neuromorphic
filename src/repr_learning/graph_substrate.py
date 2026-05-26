@@ -227,6 +227,97 @@ def update_pick_affinity_ema(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Modern attention block (v4.2 — fixes V-projection rank collapse)
+#
+# Replaces nn.MultiheadAttention which lacks 3 fixes that are standard in
+# transformers since 2020-2021:
+#   1. QK-Norm (Henry et al. 2020) — LayerNorm Q, K projections inside
+#      attention before computing QK^T. Prevents attention score blowup
+#      and keeps gradients on Wv well-conditioned.
+#   2. KV input LN (NormFormer / HybridNorm) — separately LayerNorm the
+#      K/V source inside the attn block. (Upstream pin_encoder ends in
+#      LN but we add PE after, breaking it.)
+#   3. Post-attention LN (NormFormer, Shleifer 2021) — LayerNorm attn_out
+#      BEFORE the residual add. Caps the magnitude so attn_out can't
+#      dominate the residual stream and collapse rank.
+# Plus n_heads bumped 4 → 16: harder for all heads to collapse to the
+# same V direction simultaneously.
+#
+# Empirical motivation: v4.1 measurement showed Q_proj rank 46/68 (diverse
+# queries), V_proj rank 21/1024 (moderate), but attn_w @ V rank=1 → the V
+# projection had learned to compress everything to one dominant direction
+# because there was no constraint preventing it.
+# ─────────────────────────────────────────────────────────────────────────
+
+class QKNormAttention(nn.Module):
+    """Multi-head attention with QK-Norm. Q, K projections are L-normalized
+    (per-head LayerNorm) BEFORE QK^T. Output goes through standard out_proj.
+
+    Forward: Q_in [B, Nq, D], KV_in [B, Nkv, D], optional kv_pad_mask [B, Nkv]
+    where True = padded (will be masked out of attention).
+    """
+    def __init__(self, d: int, n_heads: int):
+        super().__init__()
+        assert d % n_heads == 0, f"d={d} not divisible by n_heads={n_heads}"
+        self.d = d
+        self.n_heads = n_heads
+        self.d_head = d // n_heads
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.k_proj = nn.Linear(d, d, bias=False)
+        self.v_proj = nn.Linear(d, d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        # Per-head LN on Q and K (QK-Norm). LN over the head dim.
+        self.q_norm = nn.LayerNorm(self.d_head)
+        self.k_norm = nn.LayerNorm(self.d_head)
+
+    def forward(self, q_in, kv_in, kv_pad_mask=None):
+        B, Nq, D = q_in.shape
+        Nkv = kv_in.shape[1]
+        H, Dh = self.n_heads, self.d_head
+        q = self.q_proj(q_in).view(B, Nq, H, Dh).transpose(1, 2)    # [B, H, Nq, Dh]
+        k = self.k_proj(kv_in).view(B, Nkv, H, Dh).transpose(1, 2)  # [B, H, Nkv, Dh]
+        v = self.v_proj(kv_in).view(B, Nkv, H, Dh).transpose(1, 2)  # [B, H, Nkv, Dh]
+        # QK-Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # Build attn mask from kv_pad_mask. SDPA convention: bool mask where
+        # True = include in attention (NOT masked).
+        attn_mask = None
+        if kv_pad_mask is not None:
+            # kv_pad_mask: [B, Nkv] True=padded → invert and broadcast to [B, 1, 1, Nkv]
+            attn_mask = (~kv_pad_mask).view(B, 1, 1, Nkv).expand(B, H, Nq, Nkv)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, Nq, D)
+        return self.o_proj(out)
+
+
+class AttnBlock(nn.Module):
+    """Pre-Q-LN + KV-LN + QK-Norm attention + post-attn-LN + residual.
+
+    Structure (per NormFormer + QK-Norm best practices):
+      q_norm    = LN(Q_in)
+      kv_norm   = LN(KV_in)
+      attn_out  = QKNormAttention(q_norm, kv_norm, kv_pad_mask)
+      attn_out  = post_norm(attn_out)            # ← caps magnitude
+      return     Q_in + attn_out                  # ← residual
+    For self-attention, pass kv=q.
+    """
+    def __init__(self, d: int, n_heads: int):
+        super().__init__()
+        self.q_in_norm = nn.LayerNorm(d)
+        self.kv_in_norm = nn.LayerNorm(d)
+        self.attn = QKNormAttention(d, n_heads)
+        self.post_norm = nn.LayerNorm(d)
+
+    def forward(self, q, kv, kv_pad_mask=None):
+        q_n = self.q_in_norm(q)
+        kv_n = self.kv_in_norm(kv)
+        out = self.attn(q_n, kv_n, kv_pad_mask=kv_pad_mask)
+        out = self.post_norm(out)
+        return q + out
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Transformer updater — emits FREE-TARGET proposals (v4: not residuals)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -253,7 +344,7 @@ class GraphUpdater(nn.Module):
         d_node: int,
         d_state: int,
         n_layers: int = 3,
-        n_heads: int = 4,
+        n_heads: int = 16,           # v4.2: 4→16, harder for heads to all collapse
         ffn_mult: int = 4,
     ):
         super().__init__()
@@ -262,20 +353,17 @@ class GraphUpdater(nn.Module):
         self.d_node = d_node
         self.d_state = d_state
 
-        edge_in_dim = 2 * d_node + d_state                         # no saliency field
+        edge_in_dim = 2 * d_node + d_state
         self.edge_in_proj = nn.Linear(edge_in_dim, d)
 
-        # Fix A: NO slot_pos parameter. Slot identity must come from content.
-
-        self.cross_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
-        self.cross_attns = nn.ModuleList([
-            nn.MultiheadAttention(d, n_heads, batch_first=True)
-            for _ in range(n_layers)
+        # v4.2: use AttnBlock with QK-Norm + KV-LN + post-attn-LN instead of
+        # stock nn.MultiheadAttention (which lacks all three and caused the
+        # V-projection rank collapse documented in v4.1).
+        self.cross_blocks = nn.ModuleList([
+            AttnBlock(d, n_heads) for _ in range(n_layers)
         ])
-        self.self_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
-        self.self_attns = nn.ModuleList([
-            nn.MultiheadAttention(d, n_heads, batch_first=True)
-            for _ in range(n_layers)
+        self.self_blocks = nn.ModuleList([
+            AttnBlock(d, n_heads) for _ in range(n_layers)
         ])
         self.ffn_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.ffns = nn.ModuleList([
@@ -312,17 +400,13 @@ class GraphUpdater(nn.Module):
         edge_tok = self.edge_in_proj(old_concat)                    # [B, K, d]
         # No slot_pos addition (fix A).
 
-        for L in range(len(self.cross_attns)):
-            q = self.cross_norms[L](edge_tok)
-            attn_out, _ = self.cross_attns[L](
-                q, pins, pins, key_padding_mask=pins_pad_mask,
-            )
-            edge_tok = edge_tok + attn_out
-
-            q = self.self_norms[L](edge_tok)
-            attn_out, _ = self.self_attns[L](q, q, q)
-            edge_tok = edge_tok + attn_out
-
+        for L in range(len(self.cross_blocks)):
+            # Cross-attn: slots query pins. AttnBlock handles q-LN, kv-LN,
+            # QK-norm, post-attn-LN, residual.
+            edge_tok = self.cross_blocks[L](edge_tok, pins, kv_pad_mask=pins_pad_mask)
+            # Self-attn among slots. Same wrapper, kv = q.
+            edge_tok = self.self_blocks[L](edge_tok, edge_tok, kv_pad_mask=None)
+            # FFN with pre-LN (unchanged).
             edge_tok = edge_tok + self.ffns[L](self.ffn_norms[L](edge_tok))
 
         raw = self.out_head(self.out_norm(edge_tok))                # [B, K, out_dim]
