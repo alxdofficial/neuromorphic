@@ -343,8 +343,8 @@ def build_animation(frames, src_xy, dst_xy, state_labels, overwrites,
             marker=dict(size=marker_size, color=marker_colors,
                         symbol="circle", line=dict(color="black", width=0.8),
                         opacity=0.95),
-            name="src", showlegend=(fi == 0),
-            hovertext=[f"slot {k}<br>u={u[k]:.3f}<br>cluster={labels[k]}"
+            name="src endpoint (●)", showlegend=(fi == 0),
+            hovertext=[f"slot {k} • src endpoint<br>u={u[k]:.3f}<br>cluster={labels[k]}"
                        for k in range(K)],
             hoverinfo="text", xaxis="x", yaxis="y",
         ))
@@ -353,11 +353,25 @@ def build_animation(frames, src_xy, dst_xy, state_labels, overwrites,
             marker=dict(size=marker_size, color=marker_colors,
                         symbol="diamond", line=dict(color="black", width=0.8),
                         opacity=0.85),
-            name="dst", showlegend=(fi == 0),
-            hovertext=[f"slot {k}<br>u={u[k]:.3f}<br>cluster={labels[k]}"
+            name="dst endpoint (◆)", showlegend=(fi == 0),
+            hovertext=[f"slot {k} • dst endpoint<br>u={u[k]:.3f}<br>cluster={labels[k]}"
                        for k in range(K)],
             hoverinfo="text", xaxis="x", yaxis="y",
         ))
+
+        # Slot-index text labels for the top-5 highest-u slots
+        # (track salient edges across frames without label clutter)
+        top_k_idx = np.argsort(-u)[:5]
+        for k in top_k_idx:
+            mid_x = 0.5 * (src_xy[fi, k, 0] + dst_xy[fi, k, 0])
+            mid_y = 0.5 * (src_xy[fi, k, 1] + dst_xy[fi, k, 1])
+            traces.append(go.Scatter(
+                x=[mid_x], y=[mid_y], mode="text",
+                text=[f"#{k}"],
+                textfont=dict(size=11, color="black", family="Arial Black"),
+                showlegend=False, hoverinfo="skip",
+                xaxis="x", yaxis="y",
+            ))
 
         # Connectivity marker (vertical line at current frame, on bottom panel)
         y_max = max(max(max(series[t]["n_comp"]) for t in thresholds),
@@ -402,6 +416,26 @@ def build_animation(frames, src_xy, dst_xy, state_labels, overwrites,
     )
     fig.update_xaxes(showgrid=False, zeroline=False, row=1, col=1)
     fig.update_yaxes(showgrid=False, zeroline=False, scaleanchor="x", row=1, col=1)
+
+    # Encoding legend as a paper annotation (top-right of plot area)
+    legend_text = (
+        "<b>Frame = cumulative substrate state after that window's write</b><br>"
+        "(NOT a per-window delta; each write blends into the persistent 68 edges)<br><br>"
+        "<b>● circle</b> = src endpoint &nbsp; <b>◆ diamond</b> = dst endpoint<br>"
+        "<b>line</b> connects (src_k, dst_k) = edge k &nbsp;&nbsp;"
+        "<b>#k</b> labels the top-5 most-salient slots<br>"
+        "<b>color</b> = k-means(8) cluster on the edge's state vector<br>"
+        "<b>marker size</b> = saliency u (popularity in routing)<br>"
+        "<b>red line</b> = endpoint jumped &gt;0.5 cos this frame (recycle event)<br>"
+        "<b>gray fade</b> = last 3 frames' edges (trail effect)"
+    )
+    fig.add_annotation(
+        text=legend_text, xref="paper", yref="paper",
+        x=1.005, y=0.98, xanchor="left", yanchor="top",
+        showarrow=False, align="left",
+        font=dict(size=10), bgcolor="rgba(245,245,245,0.95)",
+        bordercolor="#888", borderwidth=1, borderpad=8,
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(str(out_path), include_plotlyjs="cdn")
