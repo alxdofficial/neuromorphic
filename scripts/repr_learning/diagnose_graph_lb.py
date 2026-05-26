@@ -32,7 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.repr_learning.config import ReprConfig
 from src.repr_learning.encoder import GraphBaselineEncoder
-from src.repr_learning.graph_substrate import expert_choice_routing
+# v3-only — `expert_choice_routing` was removed in v4. Import lazily in main()
+# so this module can still be imported by code-scanners / collectors.
+# from src.repr_learning.graph_substrate import expert_choice_routing
 
 ROOT = Path("/home/alex/code/neuromorphic")
 OUT = ROOT / "docs/plots"
@@ -332,6 +334,15 @@ def fig_routing_matrix():
         proposals = enc.updater(pins, state["edges"])
         endpoints = torch.cat([state["edges"]["src"], state["edges"]["dst"]], dim=1)
         prop_ep = torch.cat([proposals["src"], proposals["dst"]], dim=1)
+        # v3-only API — lazy import; raises a clear error against v4.
+        try:
+            from src.repr_learning.graph_substrate import expert_choice_routing
+        except ImportError:
+            raise RuntimeError(
+                "This v3-only diagnostic uses `expert_choice_routing`, which "
+                "was removed in v4. Checkout tag `graph_baseline_v3_lb_locked` "
+                "to run this script."
+            ) from None
         picked_idx, _, _, pick_count, _ = expert_choice_routing(
             endpoints, prop_ep, strength_scale=enc.update_strength_scale,
         )

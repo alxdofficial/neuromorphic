@@ -1895,7 +1895,11 @@ class GraphBaselineEncoder(nn.Module):
         # but unused. u_decay still drives the saliency EMA that feeds the gate MLP.
         self.u_decay = cfg.graph_u_decay
         self.grace_windows = cfg.graph_grace_windows  # unused in v4
-        self.gate_init_bias = getattr(cfg, "graph_gate_init_bias", 3.0)
+        # gate init bias = 1.0 → g_init ≈ 0.27 (anchor-leaning but with meaningful
+        # gradient signal to learn from; bias=3.0 was too sticky — observed g
+        # frozen at 0.05 through 500 steps because the gradient through
+        # sigmoid(logit-3)·g(1-g) was too small to overcome warmup LRs).
+        self.gate_init_bias = getattr(cfg, "graph_gate_init_bias", 1.0)
 
         from .graph_substrate import GraphUpdater, GraphGate
 
@@ -1939,9 +1943,12 @@ class GraphBaselineEncoder(nn.Module):
             n_heads=cfg.graph_readout_n_heads,
         )
 
-        # Learned deterministic initial slot content (one set per slot).
-        # Same precedent as v1/v2 — the parameter init is a one-shot random
-        # seed; the .Parameter wrapper makes it trainable.
+        # Learned chunk-initial slot content — the K=68 "blank-page templates"
+        # the substrate starts from at the beginning of every chunk. Independent
+        # of the gate mechanism: init params encode useful default knowledge
+        # before any text is seen; the gate decides per-window how much each
+        # slot should absorb NEW info from proposals. Both serve different
+        # purposes and both should be learnable.
         self.init_src = nn.Parameter(
             torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
         )
@@ -2054,6 +2061,18 @@ class GraphBaselineEncoder(nn.Module):
         new_dst   = (1 - g_exp) * edges_old["dst"]   + g_exp * picked_dst
         new_state_field = (1 - g_exp) * edges_old["state"] + g_exp * picked_state
 
+        # RMSNorm src/dst endpoints (no learnable scale). Stabilizes
+        # `picked - old` magnitude so the gradient on g doesn't depend on
+        # endpoint norm drift across windows. Routing uses cosine so this
+        # changes routing decisions only by removing scale noise. State is
+        # left un-normalized — it's semantic info consumed by GraphReadout,
+        # not a geometric position.
+        def _rmsnorm(x, eps=1e-6):
+            d = x.shape[-1]
+            return x * (d ** 0.5) / (x.pow(2).sum(-1, keepdim=True).sqrt() + eps)
+        new_src = _rmsnorm(new_src)
+        new_dst = _rmsnorm(new_dst)
+
         # 6. Saliency EMA (informational — feeds gate next window).
         new_u = update_pick_affinity_ema(
             edges_old["u"], pick_count.to(edges_old["u"].dtype),
@@ -2084,7 +2103,7 @@ class GraphBaselineEncoder(nn.Module):
         # Telemetry (detached scalars; no gradient flow).
         with torch.no_grad():
             g_f = g.float()
-            pick_aff_mean = pick_affinity.mean()
+            pick_aff_mean = pick_affinity.float().mean()
             gate_mean = g_f.mean()
             frac_anchor      = (g_f < 0.1).float().mean()
             frac_loadbearer  = ((g_f >= 0.1) & (g_f < 0.7)).float().mean()

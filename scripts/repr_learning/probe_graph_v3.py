@@ -46,7 +46,9 @@ import torch
 
 from src.repr_learning.config import ReprConfig
 from src.repr_learning.encoder import GraphBaselineEncoder, GraphReadout
-from src.repr_learning.graph_substrate import expert_choice_routing
+# v3-only — `expert_choice_routing` was removed in v4. Lazy import inside
+# probe_self_pick so this module is at least importable under v4.
+# from src.repr_learning.graph_substrate import expert_choice_routing
 
 
 def _streaming_step(enc, state, te, am, w, T):
@@ -58,6 +60,14 @@ def probe_self_pick(enc, n_windows=5, seed=0):
     torch.manual_seed(seed)
     B, T = 2, 256
     state = enc.init_streaming_state(B, torch.device("cpu"), torch.float32)
+    # v3-only API — lazy import; raises a clear error against v4.
+    try:
+        from src.repr_learning.graph_substrate import expert_choice_routing
+    except ImportError:
+        raise RuntimeError(
+            "This v3-only probe uses `expert_choice_routing`, which was "
+            "removed in v4. Checkout tag `graph_baseline_v3_lb_locked` to run."
+        ) from None
     te = torch.randn(B, T, enc.cfg.d_llama)
     K = enc.K_max
     self_pick_fractions, update_alphas = [], []
