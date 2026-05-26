@@ -1950,15 +1950,13 @@ class GraphBaselineEncoder(nn.Module):
         # before any text is seen; the gate decides per-window how much each
         # slot should absorb NEW info from proposals. Both learnable.
         #
-        # Init src/dst with std=1 (RMS≈1) to match the post-RMSNorm scale.
-        # Previously initialized at std=d^-0.5 (RMS=0.088) → first-window
-        # endpoints would jump ~11× in scale even at g=0 due to RMSNorm
-        # forcing RMS=1. State stays at d^-0.5 since it's NOT RMSNorm'd.
+        # Init src/dst/state with std=1 (RMS≈1) to match the post-RMSNorm scale.
+        # All three fields are now RMSNorm'd post-blend (state added in collapse
+        # fix), so init must also be at RMS=1 to avoid a magnitude discontinuity
+        # at first write.
         self.init_src = nn.Parameter(torch.randn(self.K_max, self.d_node))
         self.init_dst = nn.Parameter(torch.randn(self.K_max, self.d_node))
-        self.init_state = nn.Parameter(
-            torch.randn(self.K_max, self.d_state) * (self.d_state ** -0.5)
-        )
+        self.init_state = nn.Parameter(torch.randn(self.K_max, self.d_state))
 
     # ── Streaming interface ───────────────────────────────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype):
@@ -2090,17 +2088,23 @@ class GraphBaselineEncoder(nn.Module):
         new_dst   = (1 - g_exp) * edges_old["dst"]   + g_exp * picked_dst
         new_state_field = (1 - g_exp) * edges_old["state"] + g_exp * picked_state
 
-        # RMSNorm src/dst endpoints (no learnable scale). Stabilizes
-        # `picked - old` magnitude so the gradient on g doesn't depend on
-        # endpoint norm drift across windows. Routing uses cosine so this
-        # changes routing decisions only by removing scale noise. State is
-        # left un-normalized — it's semantic info consumed by GraphReadout,
-        # not a geometric position.
+        # RMSNorm src/dst/state (no learnable scale). Stabilizes magnitude
+        # so the blend `new = (1-g)*old + g*picked` actually respects g —
+        # without normalization, picked can be 10-15× the magnitude of old,
+        # making the (1-g) "anchor" weight effectively meaningless. Originally
+        # only src/dst were normed (state was left raw on the assumption
+        # readout could handle it), but state has TWO consumers — the readout
+        # AND the next window's GraphUpdater + GraphGate. State norm growing
+        # 1→35 across 4 windows was the documented root cause of v4 collapse
+        # (state_eff_rank: 52→2 in one window, then endpoints collapse via
+        # the routing cascade). Normalizing state fixes the cascade at the
+        # source.
         def _rmsnorm(x, eps=1e-6):
             d = x.shape[-1]
             return x * (d ** 0.5) / (x.pow(2).sum(-1, keepdim=True).sqrt() + eps)
         new_src = _rmsnorm(new_src)
         new_dst = _rmsnorm(new_dst)
+        new_state_field = _rmsnorm(new_state_field)
 
         # 6. Saliency EMA — track popularity of THIS slot's adopted content,
         # NOT popularity of this slot's own (possibly-not-adopted) proposal.
