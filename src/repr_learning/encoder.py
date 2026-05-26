@@ -1890,13 +1890,14 @@ class GraphBaselineEncoder(nn.Module):
         self.d_updater = cfg.graph_d_updater
         self.n_updater_layers = cfg.graph_updater_layers
 
-        # Expert-choice + saliency knobs (derived from research; see doc).
+        # v4 knobs. grace_windows / max_overwrites_fraction / update_strength_scale
+        # are inert in v4 (no recycle, no alpha) — kept on cfg for backward compat
+        # but unused. u_decay still drives the saliency EMA that feeds the gate MLP.
         self.u_decay = cfg.graph_u_decay
-        self.grace_windows = cfg.graph_grace_windows
-        self.max_overwrites_fraction = cfg.graph_max_overwrites_fraction
-        self.update_strength_scale = cfg.graph_update_strength_scale
+        self.grace_windows = cfg.graph_grace_windows  # unused in v4
+        self.gate_init_bias = getattr(cfg, "graph_gate_init_bias", 3.0)
 
-        from .graph_substrate import GraphUpdater
+        from .graph_substrate import GraphUpdater, GraphGate
 
         # Pin encoder: project Llama token embeds → updater dim
         self.pin_encoder = nn.Sequential(
@@ -1914,6 +1915,15 @@ class GraphBaselineEncoder(nn.Module):
             n_layers=self.n_updater_layers,
             n_heads=4,
             ffn_mult=4,
+        )
+
+        # v4 per-slot learned update gate. Replaces v3's alpha = sigmoid(scale·
+        # (cos - margin)) AND v3's recycle_dead_slots. Anchor-default init bias
+        # (g ≈ 0.05 at init) → model has to learn when to unlock updates.
+        self.gate = GraphGate(
+            d_state=self.d_state,
+            hidden=64,
+            init_bias=self.gate_init_bias,
         )
 
         # Fix E — directional readout with cross-edge message passing.
@@ -1957,40 +1967,38 @@ class GraphBaselineEncoder(nn.Module):
         return {
             "edges": edges,
             "n_windows": 0,
-            # Cross-window diagnostic accumulators (no aux loss)
-            "pick_strength_accum": zero.clone(),
-            "overwrite_count_accum": zero.clone(),
-            # Load-balance aux loss accumulator (Switch Transformer, Fedus 2021).
-            # Weighted by cfg.load_balance_coef=0.01 in model.compute_qa_loss.
-            "lb_loss_accum": zero.clone(),
+            # v4 cross-window diagnostic accumulators (no aux loss anywhere).
+            "pick_affinity_accum": zero.clone(),
+            "gate_mean_accum": zero.clone(),
+            "frac_anchor_accum": zero.clone(),        # g < 0.1
+            "frac_loadbearer_accum": zero.clone(),    # 0.1 ≤ g < 0.7
+            "frac_jumpedship_accum": zero.clone(),    # g ≥ 0.7
+            "frac_selfpick_accum": zero.clone(),      # slot picked its own proposal
         }
 
     def streaming_write(
         self, state, token_embeds, attention_mask=None, chunk_offset=0,
     ):
-        """Expert-choice write pass.
+        """v4 write pass: free-target proposals + learned per-slot gate.
 
         Pipeline per window:
           1. Encode pins (+ PE).
-          2. Updater emits 68 raw proposals via cross-attention.
-          3. Expert-choice: every endpoint picks top-1 proposal, updates with
-             affinity-gated soft strength. Reuse falls out of geometry.
-          4. State update: each slot's state moves toward an alpha-weighted
-             combination of the states from the slots that its src and dst
-             endpoints picked. Keeps state coherent with the routing decisions
-             (was buggy — previously used slot's OWN proposed state regardless
-             of routing).
-          5. EMA saliency u from POPULARITY (pick_count, column reduction) —
-             "how often is this slot's identity being picked by others." Was
-             buggy — previously used update_alpha (selectivity, row property).
-          6. Recycle: novel proposal claims lowest-saliency eligible slot.
-             Admission uses `novelty >= u` so cold-start ties admit.
+          2. Updater emits K free-target proposals via cross-attention (src,
+             dst, state per slot — absolute positions, not residuals).
+          3. Per-slot routing: each slot k picks one proposal j* by combined
+             cosine affinity (src+dst). Self-pick is allowed.
+          4. Gate MLP computes g_k ∈ [0,1] per slot from (state_old, picked_state,
+             pick_affinity, u_old).
+          5. Blend: new_X_k = (1-g_k) * old_X_k + g_k * picked_X_j* for X in
+             {src, dst, state}. g_k near 0 = anchor; near 1 = jumped ship.
+          6. EMA u from pick popularity (informational; feeds the gate MLP).
           7. Increment age.
-        No aux loss; no learned saliency. All discipline is structural.
+
+        No aux loss. No recycle (g_k ≈ 1 IS recycle, learned). No alpha
+        formula (g_k replaces it).
         """
         from .graph_substrate import (
-            expert_choice_routing, gather_picked_proposals,
-            update_pick_affinity_ema, recycle_dead_slots,
+            slot_routing, gather_picked_per_slot, update_pick_affinity_ema,
         )
 
         w_dtype = next(self.pin_encoder.parameters()).dtype
@@ -2021,104 +2029,46 @@ class GraphBaselineEncoder(nn.Module):
         edges_old = state["edges"]
         K = self.K_max
 
-        # 2. Raw proposals (no gates, no saliency)
+        # 2. Free-target proposals (v4: not residuals).
         proposals = self.updater(pins, edges_old, pins_pad_mask=pins_pad_mask)
 
-        # 3. Expert-choice routing for endpoints
-        endpoints = torch.cat([edges_old["src"], edges_old["dst"]], dim=1)
-        # [B, 2K, d_node]
-        proposed_endpoints = torch.cat([proposals["src"], proposals["dst"]], dim=1)
-        picked_idx, update_alpha, novelty, pick_count, lb_loss = expert_choice_routing(
-            endpoints, proposed_endpoints,
-            strength_scale=self.update_strength_scale,
-        )
+        # 3. Per-slot routing — each slot picks one proposal (self-pick allowed).
+        picked_idx, pick_affinity, pick_count = slot_routing(edges_old, proposals)
 
-        # Apply update: new = (1-α)·old + α·picked_proposal
-        picked = gather_picked_proposals(proposed_endpoints, picked_idx)
-        alpha = update_alpha.unsqueeze(-1).to(w_dtype)              # [B, 2K, 1]
-        new_endpoints = (1 - alpha) * endpoints + alpha * picked
-        new_src = new_endpoints[:, :K, :]
-        new_dst = new_endpoints[:, K:, :]
+        # Fetch picked field-values for each slot
+        picked_src   = gather_picked_per_slot(proposals["src"],   picked_idx)
+        picked_dst   = gather_picked_per_slot(proposals["dst"],   picked_idx)
+        picked_state = gather_picked_per_slot(proposals["state"], picked_idx)
 
-        # 4. State update — gather state from the SLOTS that were picked, not
-        # from slot k's own proposal (architecture P1 fix). Each endpoint pick
-        # is a vote to merge with that proposal's slot identity; if slot k's
-        # src endpoint picked proposal j and dst endpoint picked proposal l,
-        # then slot k is moving toward being a chimera (src from j, dst from l).
-        # The state should reflect the same routing decisions, not stay tied
-        # to slot k's OWN cross-attention output.
-        #
-        # Slot of each picked endpoint = picked_idx % K (proposals are stacked
-        # [src; dst] so positions [0, K) are slot k's proposed src and [K, 2K)
-        # are slot k's proposed dst — both share state slot k).
-        slot_of_pick = picked_idx % K                              # [B, 2K]
-        # Gather state from each picked slot for both src-endpoint and dst-endpoint picks
-        d_state = proposals["state"].shape[-1]
-        slot_src = slot_of_pick[:, :K].unsqueeze(-1).expand(-1, -1, d_state)  # [B, K, d_state]
-        slot_dst = slot_of_pick[:, K:].unsqueeze(-1).expand(-1, -1, d_state)
-        state_from_src_pick = proposals["state"].gather(dim=1, index=slot_src)
-        state_from_dst_pick = proposals["state"].gather(dim=1, index=slot_dst)
-        # Combine via per-endpoint alpha. Higher-confidence endpoint dominates;
-        # if both picked the same slot, the combined state is just that slot's
-        # state (unambiguous).
-        alpha_src_e = update_alpha[:, :K].unsqueeze(-1).to(w_dtype)  # [B, K, 1]
-        alpha_dst_e = update_alpha[:, K:].unsqueeze(-1).to(w_dtype)
-        total_alpha = alpha_src_e + alpha_dst_e + 1e-6
-        picked_state = (alpha_src_e * state_from_src_pick
-                        + alpha_dst_e * state_from_dst_pick) / total_alpha
-        # Per-slot update strength = max of the two endpoint alphas (kept
-        # for parity with the endpoint update — slot moves if EITHER endpoint
-        # is being aggressively routed).
-        alpha_state = torch.maximum(alpha_src_e, alpha_dst_e)        # [B, K, 1]
-        new_state_field = (1 - alpha_state) * edges_old["state"] + alpha_state * picked_state
+        # 4. Learned gate per slot. Anchor-by-default (init bias makes g≈0.05).
+        g = self.gate(
+            edges_old["state"].to(self.gate.net[0].weight.dtype),
+            picked_state.to(self.gate.net[0].weight.dtype),
+            pick_affinity.to(self.gate.net[0].weight.dtype),
+            edges_old["u"].to(self.gate.net[0].weight.dtype),
+        ).to(w_dtype)                                            # [B, K]
+        g_exp = g.unsqueeze(-1)                                  # [B, K, 1]
 
-        # 5. Saliency EMA update — uses POPULARITY (pick_count column reduction),
-        # not selectivity (update_alpha row property). See update_pick_affinity_ema
-        # docstring for why this matters (was a P1 audit finding).
+        # 5. Blend — same g for src/dst/state (slot is one decision unit).
+        new_src   = (1 - g_exp) * edges_old["src"]   + g_exp * picked_src
+        new_dst   = (1 - g_exp) * edges_old["dst"]   + g_exp * picked_dst
+        new_state_field = (1 - g_exp) * edges_old["state"] + g_exp * picked_state
+
+        # 6. Saliency EMA (informational — feeds gate next window).
         new_u = update_pick_affinity_ema(
             edges_old["u"], pick_count.to(edges_old["u"].dtype),
             decay=self.u_decay,
         )
 
         new_age = edges_old["age"] + 1.0
-        edges_after_routing = {
+        edges_new = {
             "src": new_src, "dst": new_dst, "state": new_state_field,
             "u": new_u, "age": new_age,
         }
 
-        # Per-row all-pad protection (rows with no real tokens revert to old)
+        # Per-row all-pad protection
         if attention_mask is not None:
             has_real_f = has_real.to(w_dtype)
-            km = has_real_f.view(-1, 1, 1)
-            km_1d = has_real_f.view(-1, 1)
-            edges_after_routing = {
-                "src":   edges_after_routing["src"]   * km   + edges_old["src"]   * (1 - km),
-                "dst":   edges_after_routing["dst"]   * km   + edges_old["dst"]   * (1 - km),
-                "state": edges_after_routing["state"] * km   + edges_old["state"] * (1 - km),
-                "u":     edges_after_routing["u"]     * km_1d.to(edges_old["u"].dtype)
-                         + edges_old["u"] * (1 - km_1d.to(edges_old["u"].dtype)),
-                "age":   edges_after_routing["age"]   * km_1d.to(edges_old["age"].dtype)
-                         + edges_old["age"] * (1 - km_1d.to(edges_old["age"].dtype)),
-            }
-
-        # 6. Recycle dead slots with novel proposals — variable count in
-        # [0, ceil(max_overwrites_fraction * K_max)]. A quiet window with no
-        # novel content produces zero overwrites; a busy window can refresh
-        # up to the cap.
-        edges_new, overwrite_mask = recycle_dead_slots(
-            edges_after_routing, proposals, novelty,
-            grace_windows=self.grace_windows,
-            max_overwrites_fraction=self.max_overwrites_fraction,
-        )
-
-        # All-pad row protection MUST be re-applied AFTER recycling — the
-        # earlier protection only restored values; recycling then runs and can
-        # overwrite slots on those rows (its eligibility check is age >= grace,
-        # which post-protection age IS valid → recycle can fire). Bug found by
-        # external audit: a row with no real tokens could have its substrate
-        # destroyed. Re-apply the masking on edges_new and zero the
-        # overwrite_mask for all-pad rows so the diagnostic stays honest.
-        if attention_mask is not None:
             km = has_real_f.view(-1, 1, 1)
             km_1d = has_real_f.view(-1, 1)
             edges_new = {
@@ -2130,26 +2080,35 @@ class GraphBaselineEncoder(nn.Module):
                 "age":   edges_new["age"]   * km_1d.to(edges_old["age"].dtype)
                          + edges_old["age"] * (1 - km_1d.to(edges_old["age"].dtype)),
             }
-            overwrite_mask = overwrite_mask & has_real.view(-1, 1)
 
-        # Diagnostics (detached scalars; no gradient flow)
+        # Telemetry (detached scalars; no gradient flow).
         with torch.no_grad():
-            pick_strength_mean = update_alpha.mean()
-            overwrite_count = overwrite_mask.sum().to(torch.float32)
+            g_f = g.float()
+            pick_aff_mean = pick_affinity.mean()
+            gate_mean = g_f.mean()
+            frac_anchor      = (g_f < 0.1).float().mean()
+            frac_loadbearer  = ((g_f >= 0.1) & (g_f < 0.7)).float().mean()
+            frac_jumpedship  = (g_f >= 0.7).float().mean()
+            self_idx = torch.arange(K, device=picked_idx.device).unsqueeze(0)
+            frac_selfpick = (picked_idx == self_idx).float().mean()
 
         new_outer_state = dict(state)
         new_outer_state["edges"] = edges_new
         new_outer_state["n_windows"] = state["n_windows"] + 1
-        new_outer_state["pick_strength_accum"] = state["pick_strength_accum"] + pick_strength_mean
-        new_outer_state["overwrite_count_accum"] = state["overwrite_count_accum"] + overwrite_count
-        # Accumulate LB loss with gradient flow (the aux loss term).
-        # Per-window, then averaged across windows in finalize_memory.
-        new_outer_state["lb_loss_accum"] = state["lb_loss_accum"] + lb_loss.to(state["lb_loss_accum"].dtype)
+        new_outer_state["pick_affinity_accum"] = state["pick_affinity_accum"] + pick_aff_mean
+        new_outer_state["gate_mean_accum"] = state["gate_mean_accum"] + gate_mean
+        new_outer_state["frac_anchor_accum"] = state["frac_anchor_accum"] + frac_anchor
+        new_outer_state["frac_loadbearer_accum"] = state["frac_loadbearer_accum"] + frac_loadbearer
+        new_outer_state["frac_jumpedship_accum"] = state["frac_jumpedship_accum"] + frac_jumpedship
+        new_outer_state["frac_selfpick_accum"] = state["frac_selfpick_accum"] + frac_selfpick
 
         return new_outer_state, {
-            "graph_pick_strength": pick_strength_mean,
-            "graph_overwrite_count": overwrite_count,
-            "graph_lb_loss": lb_loss.detach(),
+            "graph_pick_affinity": pick_aff_mean,
+            "graph_gate_mean": gate_mean,
+            "graph_frac_anchor": frac_anchor,
+            "graph_frac_loadbearer": frac_loadbearer,
+            "graph_frac_jumpedship": frac_jumpedship,
+            "graph_frac_selfpick": frac_selfpick,
         }
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
@@ -2175,35 +2134,30 @@ class GraphBaselineEncoder(nn.Module):
             K2 = ep_bank.shape[1]
             off_diag_mask = ~torch.eye(K2, dtype=torch.bool, device=device)
             ep_reuse = cos_matrix[:, off_diag_mask].mean()
-            pick_strength_mean = (state["pick_strength_accum"] / n_w).to(torch.float32)
-            # overwrites_per_row_per_window — average count, NOT a 0-1 rate.
-            # E.g. at max_overwrites_fraction=0.05 × K_max=68 → cap=3, so this
-            # tops out at 3.0 if every window saturates eviction. The earlier
-            # name `graph_overwrite_rate` was misleading (suggested a fraction).
-            overwrites_per_row_per_window = (state["overwrite_count_accum"] / max(n_w * B, 1)).to(torch.float32)
             age_mean = edges["age"].mean()
-
-        # Switch Transformer load-balance loss, averaged over the windows
-        # in this chunk. Surfaced under the standard `load_balance_loss`
-        # key — model.compute_qa_loss already multiplies it by
-        # cfg.load_balance_coef (=0.01, the literature default).
-        # Added to combat empirically-verified state-field collapse in
-        # v1h_t4k_v3 (state diversity ≈ 0.0001 across slots) — see
-        # `docs/exp1_graph_baseline.md` for the diagnostic.
-        lb_loss_avg = (state["lb_loss_accum"] / n_w).to(memory.dtype)
+            # v4 telemetry: averages across windows of this chunk
+            pick_aff_avg = (state["pick_affinity_accum"] / n_w).to(torch.float32)
+            gate_avg = (state["gate_mean_accum"] / n_w).to(torch.float32)
+            frac_anchor_avg = (state["frac_anchor_accum"] / n_w).to(torch.float32)
+            frac_loadbearer_avg = (state["frac_loadbearer_accum"] / n_w).to(torch.float32)
+            frac_jumpedship_avg = (state["frac_jumpedship_accum"] / n_w).to(torch.float32)
+            frac_selfpick_avg = (state["frac_selfpick_accum"] / n_w).to(torch.float32)
 
         aux = {
-            "load_balance_loss": lb_loss_avg,
-            # graph_aux kept for backward compatibility (zero; the actual
-            # aux loss now flows via load_balance_loss above).
+            # No aux loss in v4 — supply zero under the standard key so the
+            # outer trainer's `+ coef * aux["load_balance_loss"]` is a no-op.
+            "load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype),
             "graph_aux": torch.zeros((), device=device, dtype=memory.dtype),
             "graph_u_mean": u_mean,
             "graph_src_norm": src_norm,
             "graph_endpoint_reuse": ep_reuse,
-            "graph_pick_strength_avg": pick_strength_mean,
-            "graph_overwrites_per_row_per_window": overwrites_per_row_per_window,
             "graph_age_mean": age_mean,
-            "graph_lb_loss": lb_loss_avg.detach(),
+            "graph_pick_affinity_avg": pick_aff_avg,
+            "graph_gate_mean_avg": gate_avg,
+            "graph_frac_anchor_avg": frac_anchor_avg,
+            "graph_frac_loadbearer_avg": frac_loadbearer_avg,
+            "graph_frac_jumpedship_avg": frac_jumpedship_avg,
+            "graph_frac_selfpick_avg": frac_selfpick_avg,
         }
         return memory, aux
 

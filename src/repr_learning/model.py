@@ -777,12 +777,16 @@ class ReprLearningModel(nn.Module):
             graph_telemetry = {
                 "graph_aux": graph_aux.detach(),
                 "graph_endpoint_reuse": finalize_aux.get("graph_endpoint_reuse"),
-                # v3 derived-signal telemetry (replaces L_connect / L_adjust / saliency_logit)
                 "graph_u_mean": finalize_aux.get("graph_u_mean"),
-                "graph_pick_strength_avg": finalize_aux.get("graph_pick_strength_avg"),
-                "graph_overwrites_per_row_per_window": finalize_aux.get("graph_overwrites_per_row_per_window"),
                 "graph_age_mean": finalize_aux.get("graph_age_mean"),
                 "graph_src_norm": finalize_aux.get("graph_src_norm"),
+                # v4 telemetry: per-slot gate distribution + routing diagnostics
+                "graph_pick_affinity_avg": finalize_aux.get("graph_pick_affinity_avg"),
+                "graph_gate_mean_avg": finalize_aux.get("graph_gate_mean_avg"),
+                "graph_frac_anchor_avg": finalize_aux.get("graph_frac_anchor_avg"),
+                "graph_frac_loadbearer_avg": finalize_aux.get("graph_frac_loadbearer_avg"),
+                "graph_frac_jumpedship_avg": finalize_aux.get("graph_frac_jumpedship_avg"),
+                "graph_frac_selfpick_avg": finalize_aux.get("graph_frac_selfpick_avg"),
             }
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add

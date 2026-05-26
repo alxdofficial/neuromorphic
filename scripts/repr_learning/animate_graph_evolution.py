@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Animate graph_baseline edge evolution over one HotpotQA sample.
+"""[v3-ONLY — does not run on v4 architecture; targets v3 ckpts]
+Animate graph_baseline edge evolution over one HotpotQA sample.
 
 Loads the v1h_t4k_v3 LB-fixed graph checkpoint, runs a single chunk
 forward through 4 streaming windows, captures per-window edge state,

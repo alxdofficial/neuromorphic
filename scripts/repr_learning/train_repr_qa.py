@@ -338,11 +338,12 @@ def train_one_variant(
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         # Graph-variant telemetry (only present when variant == graph_baseline).
-        # v3 has no aux loss; logged keys are derived diagnostic signals.
+        # v4 has no aux loss; logged keys are gate-distribution diagnostics.
         for key in ("graph_aux", "graph_endpoint_reuse",
-                    "graph_u_mean", "graph_pick_strength_avg",
-                    "graph_overwrites_per_row_per_window", "graph_age_mean",
-                    "graph_src_norm", "graph_lb_loss"):
+                    "graph_u_mean", "graph_age_mean", "graph_src_norm",
+                    "graph_pick_affinity_avg", "graph_gate_mean_avg",
+                    "graph_frac_anchor_avg", "graph_frac_loadbearer_avg",
+                    "graph_frac_jumpedship_avg", "graph_frac_selfpick_avg"):
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         jsonl_fp.write(json.dumps(row) + "\n")
@@ -358,10 +359,15 @@ def train_one_variant(
             # - else: plain loss_aux (load_balance+orth+z)
             extra_field = ""
             if variant == "graph_baseline":
-                u_mean = float(out.get("graph_u_mean", 0.0) or 0.0)
-                pick = float(out.get("graph_pick_strength_avg", 0.0) or 0.0)
-                ow = float(out.get("graph_overwrites_per_row_per_window", 0.0) or 0.0)
-                extra_field = f"u={u_mean:.3f} pick={pick:.3f} ow={ow:.3f}"
+                # v4: show gate distribution (anchor/loadbearer/jumpedship)
+                # + self-pick rate. Tells you immediately whether g is doing
+                # anything (gate≈0.05 + no escalation = stubborn-stuck).
+                g = float(out.get("graph_gate_mean_avg", 0.0) or 0.0)
+                fa = float(out.get("graph_frac_anchor_avg", 0.0) or 0.0)
+                fl = float(out.get("graph_frac_loadbearer_avg", 0.0) or 0.0)
+                fj = float(out.get("graph_frac_jumpedship_avg", 0.0) or 0.0)
+                fs = float(out.get("graph_frac_selfpick_avg", 0.0) or 0.0)
+                extra_field = f"g={g:.3f} a/l/j={fa:.2f}/{fl:.2f}/{fj:.2f} self={fs:.2f}"
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])

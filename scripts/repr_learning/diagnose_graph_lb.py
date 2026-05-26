@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Diagnostic plots for graph_baseline + LB ckpt vs no-LB ckpt.
+"""[v3-ONLY — does not run on v4 architecture]
+
+Diagnostic plots for v3 graph_baseline (residual proposals + expert-choice
+routing + recycle). Uses APIs that no longer exist in v4
+(`expert_choice_routing`, `recycle_dead_slots`). To re-run on a v3 ckpt:
+  git checkout graph_baseline_v3_lb_locked
+v4 needs its own diagnostic suite (gate distribution over training, endpoint
+reuse curve under free targets, etc).
 
 Produces 6 figures into docs/plots/ for the meeting:
   1. Per-family val_recon bar chart

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Graph baseline v3 structure probe.
+"""[v3-ONLY — does not run on v4 architecture]
+Graph baseline v3 structure probe.
 
 Replaces the v1/v2 probes that tested snap_gate / saliency_logit / soft_snap
 (all removed). The v3 probes target the new mechanics:
