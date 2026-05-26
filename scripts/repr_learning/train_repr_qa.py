@@ -338,14 +338,28 @@ def train_one_variant(
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         # Graph-variant telemetry (only present when variant == graph_baseline).
-        # v4 has no aux loss; logged keys are gate-distribution diagnostics.
-        for key in ("graph_aux", "graph_endpoint_reuse",
-                    "graph_u_mean", "graph_age_mean", "graph_src_norm",
-                    "graph_pick_affinity_avg", "graph_gate_mean_avg",
-                    "graph_frac_anchor_avg", "graph_frac_loadbearer_avg",
-                    "graph_frac_jumpedship_avg", "graph_frac_selfpick_avg"):
+        # v4 has no aux loss; logged keys are gate-distribution + endpoint
+        # clustering diagnostics.
+        # Whitelisted scalars + a glob for per-window breakdown keys.
+        _graph_scalar_keys = (
+            "graph_aux", "graph_endpoint_reuse",
+            "graph_u_mean", "graph_age_mean", "graph_src_norm",
+            "graph_pick_affinity_avg", "graph_gate_mean_avg",
+            "graph_frac_anchor_avg", "graph_frac_loadbearer_avg",
+            "graph_frac_jumpedship_avg", "graph_frac_selfpick_avg",
+            # Specialization + endpoint clustering (audit-2 additions)
+            "graph_g_slot_std", "graph_g_slot_range",
+            "graph_endpoint_eff_rank", "graph_endpoint_cos_max",
+        )
+        for key in _graph_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        # Per-window breakdown: graph_g_mean_w0..w3, graph_frac_*_w0..w3
+        for k, v in out.items():
+            if v is None: continue
+            if (k.startswith("graph_g_mean_w") or
+                (k.startswith("graph_frac_") and k.endswith(("_w0", "_w1", "_w2", "_w3")))):
+                row[k] = float(v)
         jsonl_fp.write(json.dumps(row) + "\n")
 
         if step % log_every == 0:
