@@ -1922,8 +1922,9 @@ class GraphBaselineEncoder(nn.Module):
         )
 
         # v4 per-slot learned update gate. Replaces v3's alpha = sigmoid(scale·
-        # (cos - margin)) AND v3's recycle_dead_slots. Anchor-default init bias
-        # (g ≈ 0.05 at init) → model has to learn when to unlock updates.
+        # (cos - margin)) AND v3's recycle_dead_slots. Anchor-leaning init bias
+        # = 1.0 → g ≈ 0.27 at init (load-bearer regime; escapes sigmoid
+        # saturation that pinned g at 0.05 with the earlier bias=3.0).
         self.gate = GraphGate(
             d_state=self.d_state,
             hidden=64,
@@ -1947,14 +1948,14 @@ class GraphBaselineEncoder(nn.Module):
         # the substrate starts from at the beginning of every chunk. Independent
         # of the gate mechanism: init params encode useful default knowledge
         # before any text is seen; the gate decides per-window how much each
-        # slot should absorb NEW info from proposals. Both serve different
-        # purposes and both should be learnable.
-        self.init_src = nn.Parameter(
-            torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
-        )
-        self.init_dst = nn.Parameter(
-            torch.randn(self.K_max, self.d_node) * (self.d_node ** -0.5)
-        )
+        # slot should absorb NEW info from proposals. Both learnable.
+        #
+        # Init src/dst with std=1 (RMS≈1) to match the post-RMSNorm scale.
+        # Previously initialized at std=d^-0.5 (RMS=0.088) → first-window
+        # endpoints would jump ~11× in scale even at g=0 due to RMSNorm
+        # forcing RMS=1. State stays at d^-0.5 since it's NOT RMSNorm'd.
+        self.init_src = nn.Parameter(torch.randn(self.K_max, self.d_node))
+        self.init_dst = nn.Parameter(torch.randn(self.K_max, self.d_node))
         self.init_state = nn.Parameter(
             torch.randn(self.K_max, self.d_state) * (self.d_state ** -0.5)
         )
@@ -1971,16 +1972,30 @@ class GraphBaselineEncoder(nn.Module):
             grace_windows=self.grace_windows,
         )
         zero = torch.zeros((), device=device, dtype=torch.float32)
+        # Per-window history — list (Python) of scalar stats, one entry per
+        # streaming_write call. Lets us plot "what does each window position
+        # look like" separately from the window-averaged value, AND keep a
+        # per-slot g vector for specialization analysis (std across slots,
+        # min, max).
         return {
             "edges": edges,
             "n_windows": 0,
-            # v4 cross-window diagnostic accumulators (no aux loss anywhere).
             "pick_affinity_accum": zero.clone(),
             "gate_mean_accum": zero.clone(),
             "frac_anchor_accum": zero.clone(),        # g < 0.1
             "frac_loadbearer_accum": zero.clone(),    # 0.1 ≤ g < 0.7
             "frac_jumpedship_accum": zero.clone(),    # g ≥ 0.7
             "frac_selfpick_accum": zero.clone(),      # slot picked its own proposal
+            # Per-window history (list of [B]-mean scalars; final length = n_windows)
+            "per_window_g_mean": [],
+            "per_window_frac_anchor": [],
+            "per_window_frac_loadbearer": [],
+            "per_window_frac_jumpedship": [],
+            # Per-slot g accumulator [B, K] — averaged across windows in finalize.
+            # Used to compute slot-specialization metrics (std/min/max across slots).
+            "g_per_slot_accum": torch.zeros(
+                batch_size, self.K_max, device=device, dtype=torch.float32,
+            ),
         }
 
     def streaming_write(
@@ -2047,12 +2062,26 @@ class GraphBaselineEncoder(nn.Module):
         picked_dst   = gather_picked_per_slot(proposals["dst"],   picked_idx)
         picked_state = gather_picked_per_slot(proposals["state"], picked_idx)
 
-        # 4. Learned gate per slot. Anchor-by-default (init bias makes g≈0.05).
+        # 4. Learned gate per slot. Anchor-by-default (init bias g≈0.27).
+        # Geometric features (cos_src, cos_dst, self_pick) let the gate see
+        # WHAT it's about to change, not just semantic state.
+        with torch.amp.autocast("cuda", enabled=False):
+            old_src_n = F.normalize(edges_old["src"].float(), dim=-1, eps=1e-6)
+            old_dst_n = F.normalize(edges_old["dst"].float(), dim=-1, eps=1e-6)
+            pick_src_n = F.normalize(picked_src.float(), dim=-1, eps=1e-6)
+            pick_dst_n = F.normalize(picked_dst.float(), dim=-1, eps=1e-6)
+            cos_src = (old_src_n * pick_src_n).sum(-1)           # [B, K]
+            cos_dst = (old_dst_n * pick_dst_n).sum(-1)
+        self_idx_per_slot = torch.arange(K, device=picked_idx.device).unsqueeze(0)
+        self_pick_flag = (picked_idx == self_idx_per_slot).to(self.gate.net[0].weight.dtype)
         g = self.gate(
             edges_old["state"].to(self.gate.net[0].weight.dtype),
             picked_state.to(self.gate.net[0].weight.dtype),
             pick_affinity.to(self.gate.net[0].weight.dtype),
             edges_old["u"].to(self.gate.net[0].weight.dtype),
+            cos_src.to(self.gate.net[0].weight.dtype),
+            cos_dst.to(self.gate.net[0].weight.dtype),
+            self_pick_flag,
         ).to(w_dtype)                                            # [B, K]
         g_exp = g.unsqueeze(-1)                                  # [B, K, 1]
 
@@ -2073,10 +2102,16 @@ class GraphBaselineEncoder(nn.Module):
         new_src = _rmsnorm(new_src)
         new_dst = _rmsnorm(new_dst)
 
-        # 6. Saliency EMA (informational — feeds gate next window).
+        # 6. Saliency EMA — track popularity of THIS slot's adopted content,
+        # NOT popularity of this slot's own (possibly-not-adopted) proposal.
+        # If slot k adopted proposal j (picked_idx[k] = j), then u[k] reflects
+        # how popular j was. Audit M1 fix — old code mismatched ~80% of slots.
+        popularity = pick_count / (pick_count + 1.0)                          # [B, K]
+        adopted_popularity = popularity.gather(
+            dim=1, index=picked_idx,
+        ).to(edges_old["u"].dtype)
         new_u = update_pick_affinity_ema(
-            edges_old["u"], pick_count.to(edges_old["u"].dtype),
-            decay=self.u_decay,
+            edges_old["u"], adopted_popularity, decay=self.u_decay,
         )
 
         new_age = edges_old["age"] + 1.0
@@ -2120,6 +2155,13 @@ class GraphBaselineEncoder(nn.Module):
         new_outer_state["frac_loadbearer_accum"] = state["frac_loadbearer_accum"] + frac_loadbearer
         new_outer_state["frac_jumpedship_accum"] = state["frac_jumpedship_accum"] + frac_jumpedship
         new_outer_state["frac_selfpick_accum"] = state["frac_selfpick_accum"] + frac_selfpick
+        # Per-window history (specialization breakdown by window position)
+        new_outer_state["per_window_g_mean"] = state["per_window_g_mean"] + [gate_mean.detach()]
+        new_outer_state["per_window_frac_anchor"] = state["per_window_frac_anchor"] + [frac_anchor.detach()]
+        new_outer_state["per_window_frac_loadbearer"] = state["per_window_frac_loadbearer"] + [frac_loadbearer.detach()]
+        new_outer_state["per_window_frac_jumpedship"] = state["per_window_frac_jumpedship"] + [frac_jumpedship.detach()]
+        # Per-slot g accumulator (for specialization metric in finalize)
+        new_outer_state["g_per_slot_accum"] = state["g_per_slot_accum"] + g_f.detach()
 
         return new_outer_state, {
             "graph_pick_affinity": pick_aff_mean,
@@ -2162,6 +2204,39 @@ class GraphBaselineEncoder(nn.Module):
             frac_jumpedship_avg = (state["frac_jumpedship_accum"] / n_w).to(torch.float32)
             frac_selfpick_avg = (state["frac_selfpick_accum"] / n_w).to(torch.float32)
 
+            # ── Per-slot specialization metric ──
+            # g_per_slot [B, K] = average g for each slot across the windows.
+            # If slots specialize (some always stubborn, some always merge),
+            # the std across slots is high. Uniform behavior → std near 0.
+            g_per_slot = state["g_per_slot_accum"] / n_w                         # [B, K]
+            g_slot_std = g_per_slot.std(dim=-1).mean().to(torch.float32)         # avg over batch
+            g_slot_min = g_per_slot.min(dim=-1).values.mean().to(torch.float32)
+            g_slot_max = g_per_slot.max(dim=-1).values.mean().to(torch.float32)
+            g_slot_range = g_slot_max - g_slot_min                               # specialization breadth
+
+            # ── Endpoint clustering (threshold-free) ──
+            # Question: are clusters forming? I.e., do multiple endpoints end up
+            # at the same location in node space?
+            #
+            # Three threshold-free metrics:
+            #   1. endpoint_eff_rank: # of SVD directions needed for 95% of
+            #      endpoint variance. 1 = total collapse (1D ridge); 2K = fully
+            #      scattered. If the model groups endpoints into ~N clusters,
+            #      eff_rank ≈ N. Direct answer to "how many distinct locations".
+            #   2. endpoint_cos_mean: average pairwise cosine across endpoints.
+            #      ~0 = random/scattered; →1 = collapsed. (Same as graph_endpoint_reuse
+            #      already computed above; kept here for adjacency to the other two.)
+            #   3. endpoint_cos_max: hottest pair. Catches "two endpoints exactly
+            #      coincide" even when the rest are scattered.
+            # No thresholds, no magic numbers. The trio together gives a complete
+            # picture of how the endpoints are distributed in node space.
+            _Xc = ep_bank - ep_bank.mean(dim=1, keepdim=True)
+            _S = torch.linalg.svdvals(_Xc)                                      # [B, min(2K, d)]
+            _var = _S ** 2
+            _cumfrac = _var.cumsum(dim=-1) / _var.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            endpoint_eff_rank = ((_cumfrac < 0.95).float().sum(dim=-1) + 1).mean().to(torch.float32)
+            endpoint_cos_max = cos_matrix[:, off_diag_mask].max().to(torch.float32)
+
         aux = {
             # No aux loss in v4 — supply zero under the standard key so the
             # outer trainer's `+ coef * aux["load_balance_loss"]` is a no-op.
@@ -2177,7 +2252,23 @@ class GraphBaselineEncoder(nn.Module):
             "graph_frac_loadbearer_avg": frac_loadbearer_avg,
             "graph_frac_jumpedship_avg": frac_jumpedship_avg,
             "graph_frac_selfpick_avg": frac_selfpick_avg,
+            # Per-slot specialization (high std/range = some slots stubborn, others not)
+            "graph_g_slot_std": g_slot_std,
+            "graph_g_slot_range": g_slot_range,
+            # Endpoint clustering (threshold-free)
+            "graph_endpoint_eff_rank": endpoint_eff_rank,
+            "graph_endpoint_cos_max": endpoint_cos_max,
         }
+        # Per-window history (stack into fixed-length tensors for jsonl-friendly logging).
+        # Variable n_w handled by padding with -1 for windows that didn't happen
+        # (e.g. all-pad chunks). Trainer logs each window position separately.
+        for tag, key in [("g_mean", "per_window_g_mean"),
+                          ("frac_anchor", "per_window_frac_anchor"),
+                          ("frac_loadbearer", "per_window_frac_loadbearer"),
+                          ("frac_jumpedship", "per_window_frac_jumpedship")]:
+            vals = state[key]
+            for wi, v in enumerate(vals):
+                aux[f"graph_{tag}_w{wi}"] = v.to(torch.float32)
         return memory, aux
 
     def forward(

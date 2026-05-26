@@ -240,21 +240,14 @@ class ReprConfig:
     # graph_d_proj_hidden was the v1/v2 projection MLP hidden dim. v3 uses
     # graph_readout_d_hidden (below) inside GraphReadout instead. Field
     # removed to avoid confusion — if you see it elsewhere, that code is stale.
-    # v3 expert-choice + saliency hyperparameters (research-derived; see doc).
-    graph_u_decay: float = 0.95              # pick-affinity EMA decay (recency, ~13-win half-life)
-    graph_grace_windows: int = 4             # cold-start immunity (PER max-priority + S3-FIFO probation)
-    # Overwrite policy: variable count per window in [0, max_fraction * K_max].
-    # Fully percentile-based — no absolute thresholds.
-    #  - Selection (who's a candidate): top-N by rank
-    #      (top-N novel proposals + bottom-N most-dead eligible slots)
-    #  - Admission (does the swap happen): pure value comparison
-    #      novelty > u → the proposal is worth more than the slot is alive
-    # Cold-start protection emerges naturally: u inits at 1.0, no novelty
-    # value can exceed it, so no overwrites until u starts decaying.
-    graph_max_overwrites_fraction: float = 0.05  # ceiling: ≤5% of slots per window (=3 for K=68)
-    graph_update_strength_scale: float = 4.0     # multiplier on cosine before sigmoid → α
-    graph_readout_n_heads: int = 4               # cross-edge message-passing attention heads
-    graph_readout_d_hidden: int = 512            # d_hidden inside the directional readout
+    # v4 graph_baseline knobs.
+    graph_u_decay: float = 0.5               # fast EMA for 4-window chunks (was 0.95; left u init-dominated)
+    graph_gate_init_bias: float = 1.0        # gate init: sigmoid(-1) ≈ 0.27 (anchor-leaning, escapes saturation)
+    graph_grace_windows: int = 4             # [unused in v4] kept for backward-compat with cfg loaders
+    graph_max_overwrites_fraction: float = 0.05  # [unused in v4] recycle was removed
+    graph_update_strength_scale: float = 4.0     # [unused in v4] alpha-from-cosine was replaced by GraphGate
+    graph_readout_n_heads: int = 4           # cross-edge message-passing attention heads
+    graph_readout_d_hidden: int = 512        # d_hidden inside the directional readout
 
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.

@@ -787,7 +787,19 @@ class ReprLearningModel(nn.Module):
                 "graph_frac_loadbearer_avg": finalize_aux.get("graph_frac_loadbearer_avg"),
                 "graph_frac_jumpedship_avg": finalize_aux.get("graph_frac_jumpedship_avg"),
                 "graph_frac_selfpick_avg": finalize_aux.get("graph_frac_selfpick_avg"),
+                # Per-slot specialization
+                "graph_g_slot_std": finalize_aux.get("graph_g_slot_std"),
+                "graph_g_slot_range": finalize_aux.get("graph_g_slot_range"),
+                # Hub-and-spoke topology
+                "graph_frac_hubs": finalize_aux.get("graph_frac_hubs"),
+                "graph_degree_max": finalize_aux.get("graph_degree_max"),
+                "graph_degree_mean": finalize_aux.get("graph_degree_mean"),
             }
+            # Pass through per-window breakdown keys (graph_g_mean_w0, graph_frac_anchor_w0, etc.)
+            for k, v in finalize_aux.items():
+                if k.startswith("graph_g_mean_w") or k.startswith("graph_frac_"):
+                    if k not in graph_telemetry:   # don't clobber the _avg keys
+                        graph_telemetry[k] = v
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;

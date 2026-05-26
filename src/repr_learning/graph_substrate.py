@@ -74,9 +74,10 @@ def init_graph_state(
     else:
         state = init_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).contiguous()
 
-    # u init 1.0 = max priority. Combined with age >= grace at init, all initial
-    # slots are protected for one full grace cycle, then compete on merit.
-    u = torch.ones(B, K_max, device=device, dtype=dtype)
+    # u init 0.5 = neutral midpoint (was 1.0 — v3 needed it as grace protection
+    # against eviction; v4 has no eviction so the inflated init no longer serves
+    # a purpose and just biases the gate/readout toward "all slots important").
+    u = torch.full((B, K_max), 0.5, device=device, dtype=dtype)
     age = torch.full(
         (B, K_max), float(grace_windows), device=device, dtype=torch.float32,
     )
@@ -139,30 +140,38 @@ def gather_picked_per_slot(field: Tensor, picked_idx: Tensor) -> Tensor:
 # ─────────────────────────────────────────────────────────────────────────
 
 class GraphGate(nn.Module):
-    """Per-slot update gate g_k ∈ [0,1] computed from semantic context.
+    """Per-slot update gate g_k ∈ [0,1] computed from semantic + geometric context.
 
     Inputs per slot:
       - state_old_k       [d_state]   "what info am I currently carrying"
       - picked_state_k    [d_state]   "what info would I become"
       - pick_affinity_k   [1]         "how confident am I in this merge target"
-      - u_old_k           [1]         "am I a popular merge target"
+      - u_old_k           [1]         "is my current content popular"
+      - cos_src_k         [1]         "would src endpoint move much?"  (1=no move, -1=opposite)
+      - cos_dst_k         [1]         "would dst endpoint move much?"
+      - self_pick_k       [1]         "did I pick my own proposal? (1=yes,0=no)"
 
     Output: g_k ∈ [0,1], anchor-default biased so g_init ≈ sigmoid(-init_bias).
+
+    The 3 extra geometric features (cos_src, cos_dst, self_pick) let the gate
+    see WHAT it's about to change, not just the semantic state info. A gate
+    that wants to anchor can choose g≈0 when cos_src/dst are high (small move)
+    AND when state would barely change; can choose g≈1 when both endpoints are
+    about to swing far AND state is novel.
 
     The init_bias makes the model stubborn-by-default; gradient from downstream
     loss has to push the MLP to UNLOCK updates for specific slots/contexts.
     """
 
-    def __init__(self, d_state: int, hidden: int = 64, init_bias: float = 3.0):
+    def __init__(self, d_state: int, hidden: int = 64, init_bias: float = 1.0):
         super().__init__()
-        in_dim = 2 * d_state + 2          # state_old + picked_state + affinity + u
+        in_dim = 2 * d_state + 5         # state_old + picked_state + 5 scalars
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
-        # Output-layer bias init: large negative → sigmoid(neg) ≈ 0 → anchor.
-        # Weights init from default; pre-sigmoid output starts near -init_bias.
+        # Output-layer bias init: negative → sigmoid(neg) ≈ small → anchor-leaning.
         nn.init.normal_(self.net[2].weight, std=0.01)
         nn.init.constant_(self.net[2].bias, -float(init_bias))
 
@@ -172,11 +181,16 @@ class GraphGate(nn.Module):
         picked_state: Tensor,           # [B, K, d_state]
         pick_affinity: Tensor,          # [B, K]
         u_old: Tensor,                  # [B, K]
+        cos_src: Tensor,                # [B, K]
+        cos_dst: Tensor,                # [B, K]
+        self_pick: Tensor,              # [B, K] in {0, 1}
     ) -> Tensor:
         """Returns g ∈ [0,1] per slot, shape [B, K]."""
         inp = torch.cat([
             state_old, picked_state,
             pick_affinity.unsqueeze(-1), u_old.unsqueeze(-1),
+            cos_src.unsqueeze(-1), cos_dst.unsqueeze(-1),
+            self_pick.unsqueeze(-1),
         ], dim=-1)                                                    # [B, K, in_dim]
         logit = self.net(inp).squeeze(-1)                              # [B, K]
         return torch.sigmoid(logit)
@@ -188,23 +202,28 @@ class GraphGate(nn.Module):
 
 def update_pick_affinity_ema(
     u_old: Tensor,                     # [B, K]
-    pick_count: Tensor,                # [B, K] — per-slot popularity (v4: per-slot, not per-endpoint)
-    decay: float = 0.95,
+    adopted_popularity: Tensor,        # [B, K] — popularity of THIS slot's adopted proposal
+    decay: float = 0.5,
 ) -> Tensor:
-    """Per-slot u = EMA of pick popularity (how many other slots picked this
-    slot's proposal). Informational only in v4 — feeds the GraphGate MLP as one
-    of four signals. No longer triggers eviction (eviction is now g_k ≈ 1).
+    """Per-slot u = EMA of the popularity of the proposal THIS slot adopted.
+
+    v4 semantic fix: after slot k adopts proposal j, u[k] should reflect the
+    popularity of proposal j (the content slot k now carries), not the
+    popularity of proposal k (slot k's own pitched proposal that was probably
+    NOT what slot k ended up with). Caller computes
+    `adopted_popularity = pop.gather(1, picked_idx)` before passing in.
+
+    Default decay 0.5 (was 0.95): for 4-window chunks, 0.5 gives
+    u_w4 ≈ 0.0625·u_init + 0.94·recent_pop → real adoption-popularity tracking.
+    0.95 left u_w4 ≈ 0.81·u_init + 0.19·recent_pop → init-dominated, useless.
 
     Normalization pick_count → popularity in [0, 1) via pc/(pc+1):
       pc=0 (orphan)   → pop=0
       pc=1 (typical)  → pop=0.5
       pc=2            → pop=0.67
       pc=5 (very hot) → pop=0.83
-
-    Decay = 0.95 over windows ≈ ~20-window memory horizon.
     """
-    popularity = pick_count / (pick_count + 1.0)
-    return decay * u_old + (1.0 - decay) * popularity.to(u_old.dtype)
+    return decay * u_old + (1.0 - decay) * adopted_popularity.to(u_old.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────
