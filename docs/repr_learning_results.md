@@ -284,15 +284,15 @@ dropped — the v4/v5 lineage in §0–§0.1 is the current state.
 | plastic_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
 | splat_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
 
-The graph_baseline rows from this tranche (pre-LB and +LB) are dropped here —
-they are superseded by the v4.2 / v5.1-first / v5.4 lineage in §0–§0.1, which
-trained on the current packing.
+The graph_baseline rows from this run (pre-LB and +LB) are dropped here —
+they are superseded by the v4.2 / v5.1-first / v5.4 lineage in §0–§0.1
+(same data packing — direct comparison stands).
 
-**Two-metric reading.** Mamba (recurrent) wins this tranche's **val_recon** at
-2.674. Continuous wins **top-1 accuracy** at 50.9%. Vanilla_full_context (no
-training) lands at 49.7% top-1, suggesting top-1 on this mix is partly
-anchored to Llama's in-context priors; val_recon is the more discriminating
-metric.
+**Two-metric reading.** Mamba (recurrent) is best non-graph at val_recon
+2.674; v5.4 at 2.079 is 0.60 nat better. Continuous wins **top-1 accuracy**
+at 50.9% (vs v5.4's 57%); vanilla_full_context (no training) lands at 49.7%
+top-1, suggesting top-1 on this mix is partly anchored to Llama's in-context
+priors. val_recon is the more discriminating metric.
 
 ### Statistical caveat (single-seed)
 
