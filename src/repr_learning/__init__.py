@@ -13,6 +13,7 @@ from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
     GraphBaselineEncoder,
+    GraphV5BaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     PlasticBaselineEncoder,
@@ -32,5 +33,6 @@ __all__ = [
     "PlasticBaselineEncoder",
     "SplatBaselineEncoder",
     "GraphBaselineEncoder",
+    "GraphV5BaselineEncoder",
     "NullEncoder",
 ]

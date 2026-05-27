@@ -2627,3 +2627,420 @@ class SplatBaselineEncoder(nn.Module):
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         return self.finalize_memory(state)
 
+
+class GraphV5BaselineEncoder(nn.Module):
+    """Graph v5: shared node bank (Slot Attention init) + soft-pointer edges.
+
+    See src/repr_learning/graph_substrate_v5.py for full design notes.
+    High level: K_node continuous node vectors live in a shared bank N that
+    is sampled fresh per forward pass from a learned (μ, σ). Per window,
+    pins competitively write to N. K_edge edges hold query vectors that
+    point into N by soft attention; multiple edges can point to the same
+    N entry (cross-edge node reuse) and the same entry can serve src in
+    one edge and dst in another (cross-role reuse).
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        self.K_node = cfg.graph_v5_K_node
+        self.K_edge = cfg.graph_v5_K_edge
+        self.d_node = cfg.graph_v5_d_node
+        self.d_state = cfg.graph_v5_d_state
+        self.d_updater = cfg.graph_v5_d_updater
+        self.n_updater_layers = cfg.graph_v5_updater_layers
+
+        from .graph_substrate_v5 import (
+            HolisticUpdater, NodeGate, EdgeGate, GraphReadoutV5,
+            MessagePassingReadoutV5, SoftPointer,
+        )
+
+        # Pin encoder: Llama embed → updater dim
+        self.pin_encoder = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.d_updater * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(self.d_updater * 2, self.d_updater),
+            nn.LayerNorm(self.d_updater),
+        )
+
+        # Chunk-fresh init: learn ONLY the (μ, σ) of the per-pass noise.
+        # No per-slot trained params — every slot draws from the same
+        # distribution at chunk start.
+        # Initial σ ≈ 1.0 means slots start as ~N(μ, 1) — full noise.
+        init_log_sigma = float(cfg.graph_v5_init_log_sigma)
+        self.mu_node = nn.Parameter(torch.zeros(self.d_node))
+        self.log_sigma_node = nn.Parameter(torch.full((self.d_node,), init_log_sigma))
+        self.mu_state = nn.Parameter(torch.zeros(self.d_state))
+        self.log_sigma_state = nn.Parameter(torch.full((self.d_state,), init_log_sigma))
+        self.mu_q = nn.Parameter(torch.zeros(self.d_node))
+        self.log_sigma_q = nn.Parameter(torch.full((self.d_node,), init_log_sigma))
+
+        # v5.1: ONE holistic updater that emits node updates + edge proposals
+        # from a joint cross-attn(pins) + self-attn(nodes ↔ edges) stack.
+        # v5.2: K_proposal can differ from K_edge — decoupled proposal pool
+        # acts as encoder-internal scratch (not bottleneck). Existing edges
+        # pick from K_proposal candidates in slot routing.
+        self.K_proposal = cfg.graph_v5_K_proposal
+        self.updater = HolisticUpdater(
+            d=self.d_updater,
+            K_node=self.K_node,
+            K_edge=self.K_edge,
+            K_proposal=self.K_proposal if self.K_proposal != self.K_edge else 0,
+            d_node=self.d_node,
+            d_state=self.d_state,
+            d_pin=self.d_updater,
+            n_layers=self.n_updater_layers,
+            n_heads=cfg.graph_v5_updater_n_heads,
+            ffn_mult=4,
+        )
+
+        # Per-slot anchor-biased gate for the node bank update.
+        self.node_gate = NodeGate(
+            d_node=self.d_node,
+            hidden=64,
+            init_bias=cfg.graph_v5_node_gate_init_bias,
+        )
+
+        self.edge_gate = EdgeGate(
+            d_node=self.d_node,
+            d_state=self.d_state,
+            hidden=64,
+            init_bias=cfg.graph_v5_edge_gate_init_bias,
+        )
+
+        # v5.4: message-passing readout (replaces v5.3 cross-edge-attention readout).
+        # T rounds of bipartite MP on (nodes, edges), Q/K/V split with K=N (stable
+        # geometry) and V=msg_buf (evolving content). Outputs K_node tokens.
+        # Two oversmoothing defenses post-audit (2026-05-27):
+        #   - degree_normalize: per-node mean over incoming messages (else hubs dominate)
+        #   - anchor_strength:  GCNII-style seed re-blend each round (else identity drifts)
+        self.readout = MessagePassingReadoutV5(
+            d_node=self.d_node,
+            d_state=self.d_state,
+            d_llama=cfg.d_llama,
+            T=cfg.graph_v5_n_message_rounds,
+            d_mlp_hidden=cfg.graph_v5_mp_d_hidden,
+            anchor_strength=cfg.graph_v5_mp_anchor_strength,
+            degree_normalize=cfg.graph_v5_mp_degree_normalize,
+        )
+
+        # v5.3: trained soft-pointer with K/V split + learnable temperature.
+        # Shared across all call sites (src/dst, existing/proposal, readout).
+        # Init τ from cfg.graph_v5_read_temperature; init W_k, W_v to identity
+        # so the module starts equal to the unprojected stateless variant.
+        self.soft_pointer = SoftPointer(
+            d_node=self.d_node,
+            init_temperature=float(cfg.graph_v5_read_temperature),
+            kv_split=bool(cfg.graph_v5_soft_pointer_kv_split),
+        )
+        # Kept for back-compat with diagnostic scripts that read this field.
+        self.read_temperature = float(cfg.graph_v5_read_temperature)
+
+    # ── Streaming interface ───────────────────────────────────────────────
+    def init_streaming_state(self, batch_size: int, device, dtype, seed=None):
+        """If seed is given, init noise is deterministic (for eval).
+        If None, samples from global RNG (training default)."""
+        from .graph_substrate_v5 import init_graph_v5_state
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed))
+        else:
+            gen = None
+        state = init_graph_v5_state(
+            B=batch_size,
+            K_node=self.K_node,
+            K_edge=self.K_edge,
+            d_node=self.d_node,
+            d_state=self.d_state,
+            mu_node=self.mu_node,
+            log_sigma_node=self.log_sigma_node,
+            mu_state=self.mu_state,
+            log_sigma_state=self.log_sigma_state,
+            mu_q=self.mu_q,
+            log_sigma_q=self.log_sigma_q,
+            device=device,
+            dtype=w_dtype,
+            generator=gen,
+        )
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        # Per-window accumulators (averaged over windows in finalize).
+        return {
+            **state,
+            "n_windows": 0,
+            "node_gate_mean_accum": zero.clone(),
+            "edge_gate_mean_accum": zero.clone(),
+            "edge_pick_affinity_accum": zero.clone(),
+            "edge_frac_selfpick_accum": zero.clone(),
+            "edge_pick_entropy_accum": zero.clone(),
+        }
+
+    def streaming_write(
+        self, state, token_embeds, attention_mask=None, chunk_offset=0,
+    ):
+        """v5.1 per-window protocol — holistic updater + endpoint routing:
+          1. Encode pins (+ sinusoidal PE).
+          2. HolisticUpdater(pins, N_old, edges_old) → (node_update, edge_proposals).
+          3. Apply N update first (per-slot anchor-biased gate) → N_new.
+          4. Materialize edge endpoints (existing + proposals) against N_new.
+          5. Slot routing on materialized endpoints: each edge picks one
+             proposal by cos affinity; multiple edges CAN pick the same.
+          6. Per-edge gate blends old → picked queries (storage stays in
+             query space; materialization will follow bank evolution).
+          7. RMSNorm queries + state.
+        """
+        from .graph_substrate_v5 import (
+            slot_routing_on_endpoints, gather_picked_per_slot, _rmsnorm,
+        )
+
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        token_embeds = token_embeds.to(w_dtype)
+
+        # All-padded window: substrate unchanged.
+        if attention_mask is not None and not attention_mask.any():
+            return state, {}
+
+        # 1. Pins + sinusoidal PE
+        pins = self.pin_encoder(token_embeds)                  # [B, T_w, d_updater]
+        T_w = pins.shape[1]
+        pe = _sinusoidal_pe(T_w, pins.shape[-1], offset=chunk_offset,
+                             device=pins.device, dtype=pins.dtype)
+        pins = pins + pe.unsqueeze(0)
+
+        if attention_mask is not None:
+            pins_pad_mask = ~attention_mask
+            all_pad_rows = pins_pad_mask.all(dim=-1)
+            if all_pad_rows.any():
+                pins_pad_mask = pins_pad_mask.clone()
+                pins_pad_mask[all_pad_rows, 0] = False
+            has_real = attention_mask.any(dim=-1)
+        else:
+            pins_pad_mask = None
+            has_real = None
+
+        N_old = state["N"]
+        q_src_old = state["q_src"]
+        q_dst_old = state["q_dst"]
+        edge_state_old = state["state"]
+        edges_old_dict = {
+            "q_src": q_src_old, "q_dst": q_dst_old, "state": edge_state_old,
+        }
+
+        # 2. Holistic updater — joint cross-attn(pins) + self-attn(nodes ↔ edges).
+        node_update, proposals = self.updater(
+            pins, N_old, edges_old_dict, pins_pad_mask=pins_pad_mask,
+        )
+
+        # 3. Apply node update FIRST (per-slot anchor-biased gate, additive blend).
+        g_node = self.node_gate(N_old.to(w_dtype), node_update.to(w_dtype))  # [B, K_node]
+        g_node_exp = g_node.unsqueeze(-1)
+        N_new = N_old + g_node_exp * (node_update - N_old)
+        N_new = _rmsnorm(N_new)
+
+        # 4. Materialize ALL queries (existing edges + proposals) against N_new.
+        # Routing happens on these materialized endpoints — grounded in the
+        # ACTUAL node space edges would land on after the update.
+        endpoint_src_old, _   = self.soft_pointer(q_src_old, N_new)
+        endpoint_dst_old, _   = self.soft_pointer(q_dst_old, N_new)
+        endpoint_src_prop, _  = self.soft_pointer(proposals["q_src"], N_new)
+        endpoint_dst_prop, _  = self.soft_pointer(proposals["q_dst"], N_new)
+
+        # 5. Slot routing on materialized endpoints.
+        picked_idx, pick_affinity, pick_count = slot_routing_on_endpoints(
+            endpoint_src_old, endpoint_dst_old,
+            endpoint_src_prop, endpoint_dst_prop,
+        )
+        picked_q_src = gather_picked_per_slot(proposals["q_src"], picked_idx)
+        picked_q_dst = gather_picked_per_slot(proposals["q_dst"], picked_idx)
+        picked_state = gather_picked_per_slot(proposals["state"], picked_idx)
+
+        # 6. Per-edge gate blends old → picked. Anchor-biased init.
+        g = self.edge_gate(
+            q_src_old.to(w_dtype), q_dst_old.to(w_dtype), edge_state_old.to(w_dtype),
+            picked_q_src.to(w_dtype), picked_q_dst.to(w_dtype),
+            picked_state.to(w_dtype),
+        )                                                       # [B, K_edge]
+        g_exp = g.unsqueeze(-1)
+
+        q_src_new = (1 - g_exp) * q_src_old + g_exp * picked_q_src
+        q_dst_new = (1 - g_exp) * q_dst_old + g_exp * picked_q_dst
+        edge_state_new = (1 - g_exp) * edge_state_old + g_exp * picked_state
+
+        # 7. RMSNorm queries + edge state.
+        q_src_new = _rmsnorm(q_src_new)
+        q_dst_new = _rmsnorm(q_dst_new)
+        edge_state_new = _rmsnorm(edge_state_new)
+
+        # Per-row all-pad protection
+        if attention_mask is not None:
+            has_real_f = has_real.to(w_dtype)
+            km = has_real_f.view(-1, 1, 1)
+            N_new = N_new * km + N_old * (1 - km)
+            q_src_new = q_src_new * km + q_src_old * (1 - km)
+            q_dst_new = q_dst_new * km + q_dst_old * (1 - km)
+            edge_state_new = edge_state_new * km + edge_state_old * (1 - km)
+
+        with torch.no_grad():
+            node_gate_mean = g_node.float().mean().to(torch.float32)
+            edge_gate_mean = g.float().mean().to(torch.float32)
+            pick_aff_mean = pick_affinity.float().mean().to(torch.float32)
+            # frac_selfpick only meaningful when K_proposal == K_edge (legacy
+            # mode where proposal index k corresponds to edge slot k). With
+            # decoupled K_proposal, proposals have no slot identity → set to 0.
+            if self.K_proposal == self.K_edge:
+                K = q_src_old.shape[1]
+                self_idx = torch.arange(K, device=picked_idx.device).unsqueeze(0)
+                frac_selfpick = (picked_idx == self_idx).float().mean().to(torch.float32)
+            else:
+                frac_selfpick = torch.zeros((), device=picked_idx.device, dtype=torch.float32)
+            pp = pick_count.float() / (pick_count.float().sum(dim=-1, keepdim=True) + 1e-6)
+            pick_entropy = -(pp.clamp_min(1e-8) * pp.clamp_min(1e-8).log()).sum(-1).mean()
+            pick_entropy = pick_entropy.to(torch.float32)
+
+        new_state = dict(state)
+        new_state["N"] = N_new
+        new_state["q_src"] = q_src_new
+        new_state["q_dst"] = q_dst_new
+        new_state["state"] = edge_state_new
+        new_state["n_windows"] = state["n_windows"] + 1
+        new_state["node_gate_mean_accum"] = (
+            state["node_gate_mean_accum"] + node_gate_mean
+        )
+        new_state["edge_gate_mean_accum"] = (
+            state["edge_gate_mean_accum"] + edge_gate_mean
+        )
+        new_state["edge_pick_affinity_accum"] = (
+            state["edge_pick_affinity_accum"] + pick_aff_mean
+        )
+        new_state["edge_frac_selfpick_accum"] = (
+            state["edge_frac_selfpick_accum"] + frac_selfpick
+        )
+        new_state["edge_pick_entropy_accum"] = (
+            state["edge_pick_entropy_accum"] + pick_entropy
+        )
+
+        return new_state, {
+            "graph_v5_node_gate_mean": node_gate_mean,
+            "graph_v5_edge_gate_mean": edge_gate_mean,
+            "graph_v5_edge_pick_affinity": pick_aff_mean,
+            "graph_v5_edge_frac_selfpick": frac_selfpick,
+            "graph_v5_edge_pick_entropy": pick_entropy,
+        }
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        """Materialize edge endpoints by soft-pointer attention into N,
+        then run the shared role-disambiguated readout to per-edge memory tokens."""
+        N = state["N"]                                          # [B, K_node, d_node]
+        q_src = state["q_src"]
+        q_dst = state["q_dst"]
+        edge_state = state["state"]
+        device = N.device
+        n_w = max(state["n_windows"], 1)
+
+        # Soft-pointer α via SoftPointer (W_k + learnable τ); telemetry
+        # endpoints computed as α @ N directly, bypassing the dead W_v
+        # which drifts under weight decay and would corrupt endpoint metrics.
+        _, attn_src = self.soft_pointer(q_src, N)
+        _, attn_dst = self.soft_pointer(q_dst, N)
+        endpoint_src = torch.matmul(attn_src, N)
+        endpoint_dst = torch.matmul(attn_dst, N)
+
+        # v5.4: message-passing readout. K = N (stable address), V = msg_buf
+        # (evolving content). T rounds of MP. Outputs K_node memory tokens.
+        memory, mp_telem = self.readout(N, attn_src, attn_dst, edge_state)
+
+        with torch.no_grad():
+            # Soft-pointer sharpness (low entropy = sharply pointing at one node;
+            # high entropy = spread / mixture). Per-edge entropy over K_node.
+            def _ent(p):
+                p = p.clamp_min(1e-8)
+                return -(p * p.log()).sum(-1)
+            edge_src_entropy = _ent(attn_src).mean().to(torch.float32)
+            edge_dst_entropy = _ent(attn_dst).mean().to(torch.float32)
+
+            # Cross-edge reuse: among the K_edge picks (argmax), how many unique
+            # bank entries are touched? Lower = more reuse. Also report fraction
+            # of pairs where (edge_i.src ≈ edge_j.dst or edge_j.src) by argmax.
+            src_argmax = attn_src.argmax(dim=-1)                # [B, K_edge]
+            dst_argmax = attn_dst.argmax(dim=-1)                # [B, K_edge]
+            all_picks = torch.cat([src_argmax, dst_argmax], dim=-1)
+            n_unique_list = [
+                torch.unique(all_picks[b]).numel() for b in range(all_picks.shape[0])
+            ]
+            n_unique = torch.tensor(n_unique_list, device=device, dtype=torch.float32)
+            unique_frac = (n_unique / float(all_picks.shape[-1])).mean()
+
+            # Cross-role reuse: how often does a slot appear as both src somewhere
+            # and dst elsewhere? Mean over batch of (|src_set ∩ dst_set| / K_node).
+            overlap_list = []
+            for b in range(all_picks.shape[0]):
+                src_set = torch.unique(src_argmax[b])
+                dst_set = torch.unique(dst_argmax[b])
+                overlap_list.append(
+                    (src_set.unsqueeze(0) == dst_set.unsqueeze(1)).any(dim=0).float().sum()
+                )
+            cross_role_overlap = torch.stack(overlap_list) / float(self.K_node)
+            cross_role_overlap = cross_role_overlap.mean().to(torch.float32)
+
+            # Endpoint cosine after materialization — if our soft pointers
+            # are sharply pointing at distinct N entries, this should look
+            # like the inter-N cosine; if everything collapses to one mixture,
+            # it will be near 1.
+            ep_bank = torch.cat([endpoint_src, endpoint_dst], dim=1)
+            ep_norm = F.normalize(ep_bank, dim=-1, eps=1e-6)
+            cos_mat = ep_norm @ ep_norm.transpose(-1, -2)
+            K2 = ep_bank.shape[1]
+            off_diag = ~torch.eye(K2, dtype=torch.bool, device=device)
+            endpoint_cos_mean = cos_mat[:, off_diag].mean().to(torch.float32)
+            endpoint_cos_max = cos_mat[:, off_diag].max().to(torch.float32)
+
+            node_gate_avg = (state["node_gate_mean_accum"] / n_w).to(torch.float32)
+            edge_gate_avg = (state["edge_gate_mean_accum"] / n_w).to(torch.float32)
+            edge_pick_aff_avg = (state["edge_pick_affinity_accum"] / n_w).to(torch.float32)
+            edge_frac_selfpick_avg = (state["edge_frac_selfpick_accum"] / n_w).to(torch.float32)
+            edge_pick_entropy_avg = (state["edge_pick_entropy_accum"] / n_w).to(torch.float32)
+            # v5.3: current learned soft-pointer τ (telemetry — watch it sharpen)
+            sp_temperature = self.soft_pointer.temperature.detach().to(torch.float32)
+
+        aux = {
+            # No aux loss in v5 (yet) — keep the standard key as a zero so the
+            # outer trainer's `+ coef * aux["load_balance_loss"]` is a no-op.
+            "load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype),
+            "graph_aux": torch.zeros((), device=device, dtype=memory.dtype),
+            # Read-time soft-pointer sharpness + reuse
+            "graph_v5_edge_src_entropy": edge_src_entropy,
+            "graph_v5_edge_dst_entropy": edge_dst_entropy,
+            "graph_v5_unique_picks_frac": unique_frac,
+            "graph_v5_cross_role_overlap": cross_role_overlap,
+            "graph_v5_endpoint_cos_mean": endpoint_cos_mean,
+            "graph_v5_endpoint_cos_max": endpoint_cos_max,
+            # Per-window averages (write-side)
+            "graph_v5_node_gate_mean_avg": node_gate_avg,
+            "graph_v5_edge_gate_mean_avg": edge_gate_avg,
+            "graph_v5_edge_pick_affinity_avg": edge_pick_aff_avg,
+            "graph_v5_edge_frac_selfpick_avg": edge_frac_selfpick_avg,
+            "graph_v5_edge_pick_entropy_avg": edge_pick_entropy_avg,
+            "graph_v5_soft_pointer_temperature": sp_temperature,
+            # v5.4: per-round MP telemetry (oversmoothing / vanishing / etc.)
+            "graph_v5_mp_buf_norm_per_round": mp_telem["mp_buf_norm_per_round"],
+            "graph_v5_mp_agg_norm_per_round": mp_telem["mp_agg_norm_per_round"],
+            "graph_v5_mp_buf_cross_node_cos_per_round": mp_telem["mp_buf_cross_node_cos_per_round"],
+        }
+        return memory, aux
+
+    def forward(
+        self,
+        token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        mask_positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, dict]:
+        """Non-streaming forward — used by older code paths."""
+        del mask_positions
+        B = token_embeds.shape[0]
+        device = token_embeds.device
+        dtype = token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        return self.finalize_memory(state)
+

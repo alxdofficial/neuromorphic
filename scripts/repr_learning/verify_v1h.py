@@ -401,7 +401,7 @@ def main():
 
     variants = ["flat_baseline", "continuous_baseline", "memorizing_baseline",
                 "recurrent_baseline", "plastic_baseline", "splat_baseline",
-                "graph_baseline", "vanilla_llama"]
+                "graph_baseline", "graph_v5_baseline", "vanilla_llama"]
 
     summary = []
     for v in variants:

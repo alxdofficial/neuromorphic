@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""[v3-ONLY — does not run on v4 architecture; targets v3 ckpts]
-Animate graph_baseline edge evolution over one HotpotQA sample.
+"""Animate graph_baseline edge evolution over one HotpotQA sample.
 
 Loads the v1h_t4k_v3 LB-fixed graph checkpoint, runs a single chunk
 forward through 4 streaming windows, captures per-window edge state,
@@ -44,8 +43,8 @@ from src.repr_learning.data_qa import HotpotQADataset, collate_qa
 
 
 ROOT = Path("/home/alex/code/neuromorphic")
-CKPT = ROOT / "outputs/repr_learning/v1h_t4k_v3_lb_graph_baseline/ckpts/graph_baseline.best.pt"
-OUT = ROOT / "docs/plots/graph_evolution.html"
+CKPT = ROOT / "outputs/repr_learning/v1h_t4k_v4_2_graph_baseline/ckpts/graph_baseline.best.pt"
+OUT = ROOT / "docs/plots/graph_evolution_v4_2.html"
 
 
 def load_encoder(ckpt_path: Path) -> tuple[GraphBaselineEncoder, ReprConfig, int]:

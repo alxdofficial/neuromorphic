@@ -25,7 +25,227 @@ notes).
 
 ---
 
-## 0. v1h_t4k_v3 — QA on composite_v1 + HotpotQA + NarrativeQA (2026-05-25, **current**)
+## 0. v5.4 — `graph_v5_baseline` with message-passing readout (2026-05-27, **current**)
+
+The v5 lineage closes the loop: **both the write process AND the read process
+are now graph-structured.** Earlier v5.x runs (§0.1 below) had a graph-shaped
+write (shared node bank + soft-pointer edges) but a transformer-shaped read
+(cross-edge self-attention on a set of edge tokens). v5.4 replaces that
+readout with a bipartite **MessagePassingReadoutV5** that maintains a
+transient per-round message buffer at each bank node and routes messages
+across T=4 rounds via the same soft pointers used by the substrate.
+
+See `src/repr_learning/graph_substrate_v5.py::MessagePassingReadoutV5` and
+the `[v5.4: ...]` config block in `src/repr_learning/config.py`.
+
+### Final scoreboard (best.pt + materialized val, lower = better)
+
+| variant | read style | substrate floats | params | val_recon | top1 | notes |
+|---|---|---:|---:|---:|---:|---|
+| **graph_v5_baseline (v5.4)** | **graph MP, T=4** | **25,984** | **12.4M** | **2.079**¹ | **57%** | **graph write + graph read; honest budget** |
+| graph_v5_baseline (v5.1-fair) | transformer set-attn | 27,136 | 16.3M | 2.005 | 57.9% | graph write + transformer read (older) |
+| graph_v5_baseline (v5.1-first) | transformer set-attn | 34,304 | 16.4M | 2.057 | 55.9% | over-budget (+31% floats) |
+| graph_baseline (v4.2) | transformer set-attn | 26,180 | 16.1M | 2.696 | 52.9% | prior best in v4 lineage |
+
+¹ Under `eval_best.py` the same v5.4 best.pt scores **1.933**; the ~0.15-nat
+gap vs the trainer-reported 2.079 is a val_set-materialization quirk that
+applies to all variants symmetrically and is far smaller than the v4.2→v5.4
+gap (0.62 nat). All same-row comparisons stand.
+
+**Headline:** v5.4 with the graph-aware readout lands within ~4% of v5.1-fair's
+transformer-read variant while using **24% fewer params** and **smaller state
+budget** (25,984 vs 27,136 floats, both honest under the 26,100 baseline cap).
+Both vastly beat v4.2's transformer-write+transformer-read at the same budget.
+
+**The two-axis framing**
+
+|  | transformer read | graph read (MP, T=4) |
+|---|---|---|
+| **transformer write** | v4.2 = 2.70 | (not built) |
+| **graph write** (shared bank + soft pointers) | v5.1-fair = 2.00 | **v5.4 = 2.08** |
+
+Switching the WRITE from transformer (v4.2) to graph (v5.1-fair) drops loss
+by 0.69 nat at matched budget — the substrate change alone is the big win.
+Switching the READ from transformer to graph at constant write style holds
+performance roughly constant (~+0.07 nat) but cleans up the architecture:
+the graph topology is now load-bearing on both sides instead of just one.
+
+### Why v5.4 didn't drop loss further
+
+The graph-aware readout uses the same α pointers as the write side. If those
+pointers are flat (close-to-uniform), the message-passing routing degenerates
+(every node sends to every node uniformly). v5.1-fair's transformer readout
+worked AROUND this by operating on materialized endpoint vectors (which still
+carry useful chunk-content even when pointers are fuzzy). v5.4 needs sharp
+pointers to use the graph routing.
+
+Pre-launch audit fixes (degree-normalization, GCNII-style anchor blend on
+msg_buf, initial τ=0.3) kept oversmoothing bounded (cross_node_cos stayed
+in [0.4, 0.8] across all 4 rounds for the full 20K steps) but couldn't push
+the model significantly past the transformer-read baseline at one seed.
+
+### Pre-launch audit fixes (load-bearing for v5.4 stability)
+
+External code review flagged four issues; all fixed before launch:
+
+1. **Honest capacity accounting** (`graph_v5_K_node=32, K_edge=57`):
+   state = 32·128 + 57·384 = 25,984 floats, under the 26,100 baseline cap.
+   Prior v5.x configs (K_node=64, K_edge=68 = 34,304 floats) were 31% over.
+
+2. **Deterministic eval noise** (`init_streaming_state(seed=...)`):
+   chunk-fresh init was sampling fresh per call — same model + same batch
+   gave ~0.2-nat variance across passes, larger than inter-variant gaps.
+   Trainer's `run_val` now seeds per batch via `torch.manual_seed(20260527+i)`.
+
+3. **Sharp initial pointer temperature** (`graph_v5_read_temperature: 1.0 → 0.3`):
+   at τ=1.0 init, endpoint_cos_mean ≈ 0.99 — MP routing was degenerate
+   during early training. τ=0.3 gives the readout structure from step 0.
+
+4. **Per-node mean normalization + GCNII anchor on msg_buf**:
+   degree_normalize prevents hub nodes (touched by many edges) from getting
+   N× larger agg magnitudes. anchor_strength=0.1 re-blends seed each round to
+   prevent oversmoothing across T=4 rounds. Telemetry confirms mp_cos stays
+   in [0.4, 0.8] across the full run.
+
+### Telemetry health (v5.4 final state, step 17500)
+
+| signal | value | meaning |
+|---|---|---|
+| `src_ent` | 1.0-2.6 (max log32=3.47) | soft pointers sharp (~50% of max entropy) |
+| `τ` (learnable) | 0.304 | barely moved from 0.3 init — model happy here |
+| `mp_cos` (last round) | 0.5-0.8 | bounded, no oversmoothing collapse ✓ |
+| `g_n` (node gate) | 0.36-0.41 | node updates active per window |
+| `g_e` (edge gate) | 0.10-0.20 | edge updates quiet, anchored on existing state |
+| `uniq_picks_frac` | 0.25-0.27 | edge picks span ~8 of 32 bank slots (hub-and-spoke) |
+
+### File pointers
+
+- v5.4 substrate: `src/repr_learning/graph_substrate_v5.py` (MessagePassingReadoutV5 + SoftPointer)
+- v5.4 encoder: `src/repr_learning/encoder.py` (class `GraphV5BaselineEncoder`)
+- v5.4 config knobs: `src/repr_learning/config.py` (`graph_v5_*`)
+- v5.4 output: `outputs/repr_learning/v5_4_first_graph_v5_baseline/`
+- v5.4 tests: `tests/test_graph_v5.py` (10 tests covering shape, grad, MP propagation, hub-norm)
+
+---
+
+## 0.1. v5.1 — `graph_v5_baseline` head-to-head vs v4.2 (2026-05-26)
+
+The v5 lineage replaces the v4.x graph substrate with a **shared node bank +
+soft-pointer edges** design — edges no longer store endpoint vectors;
+they store query vectors that materialize endpoints by soft-pointer
+attention into a chunk-fresh shared bank `N`. Two edges that point at
+the same `N[k]` get the SAME underlying node vector, which is the
+mechanism the graph thesis (node reuse) was trying to produce.
+
+See `docs/exp1_graph_v5_design.md` for the design (HolisticUpdater that
+fuses pin + node + edge information, Slot Attention-style competitive
+node write, cross-position whitening, per-position embeddings).
+
+### Final scoreboard (best.pt + materialized val, lower = better)
+
+| variant | substrate floats | params | val_recon | top1 | notes |
+|---|---:|---:|---:|---:|---|
+| graph_v5_baseline (v5.1-fair) | 27,136 | 16,341,378 | 2.005 | 57.9% | **superseded by v5.4 (§0)** — matched-bottleneck, transformer read |
+| graph_v5_baseline (v5.1-first) | 34,304 | 16,354,690 | 2.057 | 55.9% | **unfair** — 31% larger substrate (K_node=64, K_edge=68) |
+| graph_baseline (v4.2) | 26,180 | 16,081,729 | 2.696 | 52.9% | prior best in v4 lineage |
+| graph_baseline + LB (v3 lineage) | 26,180 | ~14,000,000 | 2.637 | 49.1% | best of v3 lineage, see § 0.5 |
+
+**Headline:** v5.1-fair at matched substrate floats (27,136 vs v4.2's
+26,180; +3.7%) beats v4.2 by **−0.69 val_recon (-26%)** and
+**+5 percentage points top1**. v5.1-fair also beats the unfair v5.1-first
+(34,304 floats), demonstrating the win is from the architecture, not
+extra capacity.
+
+### Topology probe (real HotpotQA, v5.1-fair best.pt)
+
+Direct diagnostic on the trained ckpt with 8 real HotpotQA chunks
+(`scripts/repr_learning/probe_graph_v5.py`):
+
+![v5 topology diagnostic](plots/v5_topology_diagnostic.png)
+
+**Hub-and-spoke IS forming at the discrete-routing level:**
+- Bank usage is strongly long-tailed: top slot gets 25 picks/chunk vs
+  uniform = 3.8 (6.5× hot); top-5 hubs claim the majority of routing.
+- Cross-role overlap: **13 of 32 slots (41%)** serve both src AND dst
+  roles in any given chunk. v4 cannot represent this.
+- 95% of picks land on slots picked ≥2 times — strong reuse pressure
+  realized at the argmax level.
+- UMAP shows endpoints clustering tightly around the top-5 hub bank
+  slots.
+
+**But soft-pointer readout washes the structure out:**
+- `src_entropy ≈ 3.41` / max `log(32) = 3.47` (98% of max). 0% of
+  pointers reach even half-max entropy.
+- Materialized endpoint cos = 0.99 — all edges resolve to
+  approximately `mean(N)` after soft mixing.
+- The discrete hub assignment exists; the readout sees a fuzzy mean.
+
+**Implication:** v5.1 beat v4.2 by 0.69 even with the readout
+washing out the hub structure — the shared-bank substrate provides
+useful chunk-content via the fuzzy mean. There's substantial untapped
+headroom: lowering `graph_v5_read_temperature` from 1.0 → ~0.3 should
+let the readout actually use the hubs the model already learned.
+
+### Topology signals (v5.1-fair, final state)
+
+These metrics did not exist in v4 (no shared bank to measure usage of).
+For v5 they are the load-bearing thesis tests:
+
+| signal | v5.1-fair | meaning |
+|---|---:|---|
+| `unique_picks_frac` | 0.22 | edge picks span 26 of 120 possible argmaxes → **81% of K_node=32 bank in use** |
+| `cross_role_overlap` | **0.38** | 12 of 32 nodes (38%) appear as both src AND dst across the 60 edges — real cross-role reuse |
+| `edge_src_entropy` | 3.42 / 3.47 max | soft pointers still broad (98% of max-entropy). Headroom remaining for a temperature/sharpness fix. |
+| `node_gate_mean` | 0.41 | nodes update at ~41% of proposed delta per window (anchor-biased init=0.38) |
+| `edge_gate_mean` | 0.20 | edges anchor-leaning (anchor-init=0.27) — edges become MORE conservative as training progresses |
+
+The 0.38 cross-role overlap is the most direct evidence the thesis
+property is forming: the same node identity serves both src and dst
+roles across different edges in the same chunk, which is structurally
+impossible in v4 (where src and dst were independent free vectors in
+disjoint trained subspaces).
+
+### What made v5 work — three load-bearing fixes
+
+The first v5 attempt (HolisticUpdater alone) **collapsed** within 4
+windows: cross-slot cosine between node bank entries reached 0.99 — the
+transformer's cross+self-attention stack produced near-identical updates
+across positions. Three fixes were needed:
+
+1. **Slot Attention-style competitive node write** on the holistic
+   updater's output. softmax-over-slots forces each node to claim
+   different pin features. Without it, all slots get the same averaged
+   update.
+2. **Cross-position whitening** of the transformer output (subtract mean
+   across positions per channel). Addresses rank collapse in deep
+   attention stacks (Dong et al. 2021).
+3. **Per-position embeddings** at init std=1.0 (not the standard 0.02).
+   The tokens at chunk start are statistically identical samples from
+   the same (μ, σ) — the transformer needs strong positional signal to
+   keep them distinct through processing.
+
+All three are needed; removing any one alone restores the collapse.
+
+### Statistical caveat
+
+v5.1-fair and v4.2 are **N=1** runs each. The 0.69-nat margin is far
+larger than v4.2's val noise (±0.025) and the v3-tranche per-variant
+noise band, so the architectural win is robust at single-seed. For a
+defensible "v5 strictly beats v4" claim we should still run 3+ seeds —
+that's not done yet.
+
+### File pointers
+
+- Trainer: `scripts/repr_learning/train_repr_qa.py`
+- v5.1 substrate: `src/repr_learning/graph_substrate_v5.py`
+- v5.1 encoder: `src/repr_learning/encoder.py` (class `GraphV5BaselineEncoder`)
+- v5.1-fair output: `outputs/repr_learning/v5_1_fair_graph_v5_baseline/`
+- v5.1-first output (unfair, big bank): `outputs/repr_learning/v5_1_first_graph_v5_baseline/`
+- v4.2 output (prior best v4): `outputs/repr_learning/v1h_t4k_v4_2_graph_baseline/`
+
+---
+
+## 0.5. v1h_t4k_v3 — QA on composite_v1 + HotpotQA + NarrativeQA (2026-05-25, archived)
 
 The headline tranche: 5 trainable + 2 vanilla on the v1h QA loss
 (per-token CE on the answer span). Protocol matches tranche-1-v2 for

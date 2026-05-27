@@ -18,6 +18,7 @@ from .encoder import (
     FlatBaselineEncoder,
     FullContextEncoder,
     GraphBaselineEncoder,
+    GraphV5BaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     PlasticBaselineEncoder,
@@ -51,6 +52,7 @@ class ReprLearningModel(nn.Module):
         "plastic_baseline": PlasticBaselineEncoder,
         "splat_baseline": SplatBaselineEncoder,
         "graph_baseline": GraphBaselineEncoder,
+        "graph_v5_baseline": GraphV5BaselineEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -800,6 +802,13 @@ class ReprLearningModel(nn.Module):
                 if k.startswith("graph_g_mean_w") or k.startswith("graph_frac_"):
                     if k not in graph_telemetry:   # don't clobber the _avg keys
                         graph_telemetry[k] = v
+            # v5.1 telemetry pass-through — all graph_v5_* keys from finalize_aux
+            # (node/edge gates, pick affinity/entropy, soft-pointer sharpness +
+            # reuse, cross-role overlap). Lifted to top-level out so the trainer
+            # can log them via out.get(key) without unpacking aux dict.
+            for k, v in finalize_aux.items():
+                if k.startswith("graph_v5_"):
+                    graph_telemetry[k] = v
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;

@@ -1,9 +1,19 @@
 # Exp 1 — `graph_baseline` design
 
+> **2026-05-26 — SUPERSEDED BY v5.** This doc describes the v3/v4
+> lineage (per-edge free-vector endpoints + expert/slot-choice routing).
+> The v5 lineage replaces this with a **shared node bank + soft-pointer
+> edges** and significantly outperforms v4 at matched bottleneck
+> (val_recon 2.005 vs 2.696, −26%; top1 57.9% vs 52.9%, +5%).
+> See `docs/exp1_graph_v5_design.md` for the current canonical
+> architecture and `docs/repr_learning_results.md` § 0 for the head-to-head.
+>
+> This doc is kept for historical context — v4.2 still ships under the
+> `graph_baseline` variant name and is the comparison anchor for v5.
+
 Canonical reference for the graph-structured memory variant. Earlier
 prototype iterations (with snap_gate / L_connectivity / learned saliency)
-are kept in git history only; this doc describes the current
-implementation.
+are kept in git history only; this doc describes the v3/v4 line.
 
 ## TL;DR
 

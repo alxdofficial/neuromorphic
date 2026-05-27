@@ -85,7 +85,7 @@ def main():
     # random-init weights and silently produce garbage (audit issue #5).
     TRAINABLE = {"flat_baseline", "continuous_baseline", "memorizing_baseline",
                  "recurrent_baseline", "plastic_baseline", "splat_baseline",
-                 "graph_baseline", "v21"}
+                 "graph_baseline", "graph_v5_baseline", "v21"}
     if args.variant in TRAINABLE and args.ckpt is None:
         raise SystemExit(
             f"ERROR: --ckpt is required for trainable variant {args.variant!r}. "

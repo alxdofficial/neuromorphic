@@ -85,9 +85,16 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     """
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
+    # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
+    # init was sampling fresh noise per call → same model + same batch produced
+    # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
+    # In eval mode (model.train(False)) dropout is off so this is safe.
+    rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
     for i, batch in enumerate(val_set):
         if i >= n_batches:
             break
+        torch.manual_seed(20260527 + i)  # batch-dependent deterministic seed
         batch = to_device(batch, device)
         out = model.compute_qa_loss(batch, window_size=window_size)
         losses.append(float(out["loss_recon"]))
@@ -104,6 +111,10 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
             d["n"] += 1
             d["loss"] += float(l)
     model.train(True)
+    # Restore training RNG state so eval doesn't perturb the training stream.
+    torch.set_rng_state(rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state)
     n = max(len(losses), 1)
     fam_summary = {f: {"n": v["n"], "mean_loss": v["loss"] / max(v["n"], 1)}
                    for f, v in per_fam_stats.items()}
@@ -354,6 +365,38 @@ def train_one_variant(
         for key in _graph_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        # Graph v5.1 telemetry (only present when variant == graph_v5_baseline).
+        # Probes the soft-pointer mechanism: are queries sharp, do edges
+        # converge on shared nodes, are roles mixing.
+        _graph_v5_scalar_keys = (
+            # Per-window write-side
+            "graph_v5_node_gate_mean", "graph_v5_edge_gate_mean",
+            "graph_v5_edge_pick_affinity", "graph_v5_edge_frac_selfpick",
+            "graph_v5_edge_pick_entropy",
+            # Chunk-end (averaged) write-side
+            "graph_v5_node_gate_mean_avg", "graph_v5_edge_gate_mean_avg",
+            "graph_v5_edge_pick_affinity_avg", "graph_v5_edge_frac_selfpick_avg",
+            "graph_v5_edge_pick_entropy_avg",
+            # Chunk-end read-side: soft pointer sharpness + reuse
+            "graph_v5_edge_src_entropy", "graph_v5_edge_dst_entropy",
+            "graph_v5_unique_picks_frac", "graph_v5_cross_role_overlap",
+            "graph_v5_endpoint_cos_mean", "graph_v5_endpoint_cos_max",
+            # v5.3+: learnable soft-pointer temperature (scalar)
+            "graph_v5_soft_pointer_temperature",
+        )
+        for key in _graph_v5_scalar_keys:
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
+        # v5.4: per-round MP telemetry — log final-round value as a scalar so
+        # it shows up in jsonl plotting. Full arrays kept in aux for probes.
+        for arr_key, scalar_key in [
+            ("graph_v5_mp_buf_norm_per_round",            "graph_v5_mp_buf_norm_final"),
+            ("graph_v5_mp_agg_norm_per_round",            "graph_v5_mp_agg_norm_final"),
+            ("graph_v5_mp_buf_cross_node_cos_per_round",  "graph_v5_mp_buf_cross_node_cos_final"),
+        ]:
+            arr = out.get(arr_key)
+            if arr is not None and len(arr) > 0:
+                row[scalar_key] = float(arr[-1])
         # Per-window breakdown: graph_g_mean_w0..w3, graph_frac_*_w0..w3
         for k, v in out.items():
             if v is None: continue
@@ -382,6 +425,30 @@ def train_one_variant(
                 fj = float(out.get("graph_frac_jumpedship_avg", 0.0) or 0.0)
                 fs = float(out.get("graph_frac_selfpick_avg", 0.0) or 0.0)
                 extra_field = f"g={g:.3f} a/l/j={fa:.2f}/{fl:.2f}/{fj:.2f} self={fs:.2f}"
+                aux_tag, aux_display = "aux", float(out["loss_aux"])
+            elif variant == "graph_v5_baseline":
+                # v5.1: show node/edge gates + soft-pointer sharpness + reuse.
+                # Key signals:
+                #   g_n / g_e: node and edge gate means (anchor-init ≈ 0.38 / 0.27)
+                #   selfpick: fraction of edges picking their own slot's proposal
+                #   src_ent: soft-pointer entropy (low = sharp, high = spread)
+                #   uniq: fraction of unique bank entries among edge picks
+                #         (low = high reuse, which is the THESIS goal)
+                #   xrole: cross-role overlap (slots appearing as both src+dst)
+                gn = float(out.get("graph_v5_node_gate_mean_avg", 0.0) or 0.0)
+                ge = float(out.get("graph_v5_edge_gate_mean_avg", 0.0) or 0.0)
+                se = float(out.get("graph_v5_edge_src_entropy", 0.0) or 0.0)
+                uq = float(out.get("graph_v5_unique_picks_frac", 0.0) or 0.0)
+                # v5.3+: learnable soft-pointer τ (should drift toward 0 if model
+                # finds sharper routing helpful). v5.4+: cross-node cos at the
+                # LAST MP round (oversmoothing canary — high = collapse).
+                tau = float(out.get("graph_v5_soft_pointer_temperature", 0.0) or 0.0)
+                mp_cos_arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
+                mp_cos_last = float(mp_cos_arr[-1]) if mp_cos_arr is not None and len(mp_cos_arr) > 0 else 0.0
+                extra_field = (
+                    f"g_n={gn:.2f} g_e={ge:.2f} src_ent={se:.2f} uniq={uq:.2f} "
+                    f"τ={tau:.3f} mp_cos={mp_cos_last:.3f}"
+                )
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])
@@ -512,6 +579,9 @@ def main():
     ])
     ap.add_argument("--steps", type=int, default=10_000)
     ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="Override cfg.learning_rate (default 1e-4). Scale with "
+                         "BS — e.g. sqrt rule: 1e-4×sqrt(BS/2) → BS=16 ≈ 2.5e-4.")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--save-every", type=int, default=2000)
@@ -628,6 +698,7 @@ def main():
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,
         d_mamba=768,
+        **({"learning_rate": args.lr} if args.lr is not None else {}),
     )
 
     # Auto-pick BABILong config to match chunk_size (audit fix #10).

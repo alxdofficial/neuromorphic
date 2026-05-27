@@ -249,6 +249,61 @@ class ReprConfig:
     graph_readout_n_heads: int = 4           # cross-edge message-passing attention heads
     graph_readout_d_hidden: int = 512        # d_hidden inside the directional readout
 
+    # ── Graph v5 (Exp 1 v5): shared node bank + soft-pointer edges ─────────
+    # See src/repr_learning/graph_substrate_v5.py for the design.
+    #
+    # HONEST capacity accounting (revised 2026-05-27 post-audit):
+    # Both N (bank) AND edges persist across windows. v5.4's MP readout
+    # also EMITS K_node tokens directly. Both must count toward bottleneck:
+    #     state = K_node·d_node + K_edge·(2·d_node + d_state)
+    # At K_node=32, K_edge=57, d_node=d_state=128: 4,096 + 21,888 = 25,984.
+    # Matches 26,100 baseline budget within 0.4%. Prior config (K_node=64,
+    # K_edge=68) was 34,304 floats = 31% over budget; comparisons against
+    # baselines at the old config were unfairly favorable to v5.
+    #
+    # K_proposal IS still encoder-internal (per-window scratch, discarded
+    # after slot routing — does not persist, never reaches decoder).
+    graph_v5_K_node: int = 32              # # shared node slots (counts toward bottleneck)
+    graph_v5_K_edge: int = 57              # # persistent edges (counts toward bottleneck)
+    graph_v5_K_proposal: int = 80          # # per-window candidate proposals (encoder-internal scratch)
+    graph_v5_d_node: int = 128             # node vector dim
+    graph_v5_d_state: int = 128            # edge state dim
+    graph_v5_d_updater: int = 384          # edge updater token dim
+    graph_v5_updater_layers: int = 4       # transformer-updater depth
+    graph_v5_updater_n_heads: int = 16     # heads in edge updater AttnBlocks (matches v4.2)
+    graph_v5_node_gate_init_bias: float = 0.5  # node write gate init → sigmoid(-0.5) ≈ 0.38
+    graph_v5_edge_gate_init_bias: float = 1.0  # edge update gate init → sigmoid(-1) ≈ 0.27 (anchor)
+    graph_v5_init_log_sigma: float = 0.0   # initial log σ for (μ, σ) of N/state/q init noise (σ=1.0)
+    # Init τ for the trained soft pointer. Lowered 1.0 → 0.3 (2026-05-27 post-
+    # audit): at τ=1.0, endpoint_cos_mean≈0.99 at init → MP routing degenerate
+    # in early training. Starting sharper gives v5.4's MP readout meaningful
+    # structure from step 0. Learnable τ can still drift up if model wants.
+    graph_v5_read_temperature: float = 0.3
+    # v5.3: trained soft pointer with K/V split. K_split projects N through
+    # separate W_k (for scoring) and W_v (for aggregation) — Csordás et al.
+    # 2019 fix for the DNC pathology where N playing both roles produces
+    # flat noisy address distributions. Combined with learnable τ above.
+    graph_v5_soft_pointer_kv_split: bool = True
+    graph_v5_readout_n_heads: int = 4      # [legacy v5.3 GraphReadoutV5] cross-edge MP heads
+    graph_v5_readout_d_hidden: int = 512   # [legacy v5.3 GraphReadoutV5] d_hidden
+    # v5.4: message-passing readout (replaces v5.3's cross-edge attention readout).
+    # T rounds of bipartite MP, Q/K/V split with K=N (stable address book) and
+    # V=msg_buf (evolving content). Outputs K_node memory tokens to Llama.
+    # T=4 chosen 2026-05-27: at K_node=64 with sharp pointers, 4-hop reach is
+    # plenty for the multi-hop tasks in composite_v1.
+    graph_v5_n_message_rounds: int = 4
+    graph_v5_mp_d_hidden: int = 256        # msg_mlp hidden dim (2× d_node default)
+    # Per-node mean normalization on aggregation (GAT/mean style). Without
+    # this, hub nodes touched by N edges get N× larger agg than isolated
+    # nodes → variance imbalance + hub-driven oversmoothing. Default ON
+    # (added 2026-05-27 post-audit).
+    graph_v5_mp_degree_normalize: bool = True
+    # GCNII-style anchor strength: at each MP round, blend the updated buf
+    # with the seed = W_init(N). (1-α)·updated + α·seed. Prevents msg_buf
+    # from drifting away from node identity over T rounds. α=0 disables.
+    # Default 0.1 (light touch — empirical sweet spot in GCNII literature).
+    graph_v5_mp_anchor_strength: float = 0.1
+
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.
     # v3 sweep: K=100, d=128 → bottleneck K·(2d+2) = 25,800 floats
