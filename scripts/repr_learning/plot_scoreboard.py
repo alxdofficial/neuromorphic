@@ -76,65 +76,63 @@ def _collect_outputs_root(out_root: Path) -> dict:
 
 
 def plot_3d(data: dict, out_path: Path) -> None:
-    import plotly.graph_objects as go
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers projection)
 
     # Single 3D scatter: x=best_step, y=val_recon, z=top1.
-    # The "good corner" is (low x, low y, high z): fast to converge, low loss,
-    # high accuracy. Markers stay one trace per variant so the legend lists
-    # them individually instead of being collapsed by group.
-    fig = go.Figure()
+    # x and y both reversed so the "good corner" — fast convergence, low
+    # loss, high top-1 — ends up at the front-right-top of the box.
+    fig = plt.figure(figsize=(11, 8))
+    ax = fig.add_subplot(111, projection="3d")
 
     for label, d in data.items():
-        symbol = "diamond" if d["group"] == "graph_v5" else "circle"
-        fig.add_trace(go.Scatter3d(
-            x=[d["step"]],
-            y=[d["val_recon"]],
-            z=[d["top1"] * 100.0],
-            mode="markers+text",
-            marker=dict(size=10, color=d["color"], symbol=symbol,
-                        line=dict(color="#222", width=0.8)),
-            text=[label.split(" (")[0]],
-            textposition="top center",
-            textfont=dict(size=11),
-            name=label,
-            hovertext=(f"{label}<br>"
-                       f"best_step: {d['step']}<br>"
-                       f"val_recon: {d['val_recon']:.3f}<br>"
-                       f"top-1: {d['top1']*100:.1f}%"),
-            hoverinfo="text",
-        ))
+        marker = "D" if d["group"] == "graph_v5" else "o"
+        ax.scatter(
+            [d["step"]], [d["val_recon"]], [d["top1"] * 100.0],
+            c=[d["color"]], s=180, marker=marker,
+            edgecolors="#222", linewidths=0.6,
+            label=label, depthshade=False,
+        )
+        short = label.split(" (")[0]
+        ax.text(d["step"], d["val_recon"], d["top1"] * 100.0 + 1.3,
+                short, fontsize=10, ha="center")
 
-    fig.update_layout(
-        title=("Scoreboard: best_step × val_recon × top-1 "
-               "(good corner = front-left-top)"),
-        scene=dict(
-            xaxis=dict(title="steps to best.pt", autorange="reversed"),
-            yaxis=dict(title="val_recon (lower better)", autorange="reversed"),
-            zaxis=dict(title="top-1 accuracy (%)"),
-            aspectmode="cube",
-        ),
-        legend=dict(itemsizing="constant"),
-        height=750,
-    )
-    fig.write_html(str(out_path), include_plotlyjs=True, full_html=True)
+    ax.set_xlabel("steps to best.pt", labelpad=8)
+    ax.set_ylabel("val_recon (lower = better)", labelpad=8)
+    ax.set_zlabel("top-1 accuracy (%)", labelpad=8)
+    ax.invert_xaxis()
+    ax.invert_yaxis()
+    # Tilt + spin so the "good" corner (low step, low val_recon, high top1)
+    # is front-and-up. azim=-60 + elev=20 puts that corner toward the
+    # viewer; with x and y both inverted it lands on the top-right.
+    ax.view_init(elev=22, azim=-60)
+    ax.set_title("Scoreboard: best_step × val_recon × top-1\n"
+                 "(good corner = front-right-top)")
+    ax.legend(loc="upper left", fontsize=9, bbox_to_anchor=(0.02, 0.98))
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
     print(f"[output] wrote {out_path}")
 
 
 def plot_per_family(data: dict, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
+    # narrative_qa is dropped at the current chunk_size=4096 tranche:
+    # the NarrativeQA story doesn't fit, so the per-family loss reflects
+    # truncation rather than comprehension. Will become informative at
+    # the 8K / 16K tranches.
+    EXCLUDE = {"narrative_qa"}
+
     # Union of families across variants. Preserve roughly stable order with
-    # composite_v1's 9 first, then external corpora (hotpot_qa, narrative_qa).
+    # composite_v1's 9 first, then external corpora (hotpot_qa).
     canonical_order = [
         "biographical", "hotpot_qa", "boxes", "calendar", "preferences",
         "theory_of_mind", "knights", "triage", "revisions", "passphrase",
-        "narrative_qa",
     ]
     all_families = set()
     for d in data.values():
-        all_families.update(d["per_family"].keys())
+        all_families.update(k for k in d["per_family"].keys() if k not in EXCLUDE)
     families = [f for f in canonical_order if f in all_families]
-    # Catch any unexpected new family.
     for f in sorted(all_families - set(canonical_order)):
         families.append(f)
 
@@ -188,7 +186,7 @@ def main() -> None:
               f"top1={d['top1']*100:.1f}%  families={len(d['per_family'])}")
 
     if args.mode in ("3d", "both"):
-        plot_3d(data, args.out_dir / "scoreboard_3d.html")
+        plot_3d(data, args.out_dir / "scoreboard_3d.png")
     if args.mode in ("family", "both"):
         plot_per_family(data, args.out_dir / "scoreboard_per_family.png")
 
