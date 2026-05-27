@@ -44,8 +44,14 @@ from src.repr_learning.data_qa import HotpotQADataset, collate_qa
 
 
 ROOT = Path("/home/alex/code/neuromorphic")
-CKPT = ROOT / "outputs/repr_learning/v5_1_fair_graph_v5_baseline/ckpts/graph_v5_baseline.best.pt"
+CKPT = ROOT / "outputs/repr_learning/v5_4_first_graph_v5_baseline/ckpts/graph_v5_baseline.best.pt"
 OUT = ROOT / "docs/plots/v5_topology_diagnostic.png"
+# Keys that legitimately differ between v5.4 and current code (e.g. dead
+# soft_pointer.W_v weights that the readout no longer consumes). Anything
+# else missing/unexpected indicates checkpoint/config drift and should
+# raise — silent random-init renders are a footgun.
+ALLOWED_MISSING: set[str] = set()
+ALLOWED_UNEXPECTED = {"soft_pointer.W_v.weight"}
 
 
 def load_encoder(ckpt_path: Path) -> tuple[GraphV5BaselineEncoder, ReprConfig, int]:
@@ -56,9 +62,16 @@ def load_encoder(ckpt_path: Path) -> tuple[GraphV5BaselineEncoder, ReprConfig, i
                  if k.startswith("encoder.")}
     missing, unexpected = enc.load_state_dict(enc_state, strict=False)
     step = sd.get("step", -1)
+    bad_missing = [k for k in missing if k not in ALLOWED_MISSING]
+    bad_unexpected = [k for k in unexpected if k not in ALLOWED_UNEXPECTED]
     print(f"[ckpt] step={step} | missing={len(missing)} | unexpected={len(unexpected)}")
-    if missing:
-        print(f"  missing examples: {missing[:5]}")
+    if bad_missing or bad_unexpected:
+        raise RuntimeError(
+            f"checkpoint/config drift detected:\n"
+            f"  missing (not in ALLOWED_MISSING): {bad_missing[:10]}\n"
+            f"  unexpected (not in ALLOWED_UNEXPECTED): {bad_unexpected[:10]}\n"
+            f"if this is intentional, update ALLOWED_MISSING/UNEXPECTED."
+        )
     enc.train(False)
     return enc, cfg, step
 
@@ -100,10 +113,16 @@ def run_forward(enc, cfg, llama_embed, batch, device):
     q_dst = state["q_dst"]
     edge_state = state["state"]
 
-    # Materialize at the encoder's configured temperature
-    temp = enc.read_temperature
-    endpoint_src, attn_src = materialize_endpoints(q_src, N, temperature=temp)
-    endpoint_dst, attn_dst = materialize_endpoints(q_dst, N, temperature=temp)
+    # v5.4 uses a trained SoftPointer (W_k key projection + learnable τ).
+    # Older v5.x ckpts pre-date soft_pointer; fall back to the stateless
+    # materialize_endpoints function for those.
+    if hasattr(enc, "soft_pointer"):
+        endpoint_src, attn_src = enc.soft_pointer(q_src, N)
+        endpoint_dst, attn_dst = enc.soft_pointer(q_dst, N)
+    else:
+        temp = enc.read_temperature
+        endpoint_src, attn_src = materialize_endpoints(q_src, N, temperature=temp)
+        endpoint_dst, attn_dst = materialize_endpoints(q_dst, N, temperature=temp)
     return {
         "N": N, "q_src": q_src, "q_dst": q_dst, "state": edge_state,
         "endpoint_src": endpoint_src, "endpoint_dst": endpoint_dst,
@@ -113,8 +132,11 @@ def run_forward(enc, cfg, llama_embed, batch, device):
 
 def analyze(probe_out, K_node, K_edge):
     """Print numerical summary + return arrays for plotting."""
-    attn_src = probe_out["attn_src"].float().cpu()                   # [B, K_edge, K_node]
-    attn_dst = probe_out["attn_dst"].float().cpu()
+    # detach() because enc.soft_pointer keeps grad-tracking enabled on
+    # its W_k/log_tau leaf tensors even under torch.no_grad — without
+    # detach, downstream .numpy() calls raise.
+    attn_src = probe_out["attn_src"].detach().float().cpu()           # [B, K_edge, K_node]
+    attn_dst = probe_out["attn_dst"].detach().float().cpu()
     B = attn_src.shape[0]
 
     # ── Bank usage ──────────────────────────────────────────────────────
@@ -162,8 +184,8 @@ def analyze(probe_out, K_node, K_edge):
     print(f"  Fraction below 50% of max entropy: {frac_sharp:.2f}  (sharp = good)")
 
     # ── Cross-edge endpoint sharing ──────────────────────────────────────
-    endpoint_src = probe_out["endpoint_src"].float().cpu()
-    endpoint_dst = probe_out["endpoint_dst"].float().cpu()
+    endpoint_src = probe_out["endpoint_src"].detach().float().cpu()
+    endpoint_dst = probe_out["endpoint_dst"].detach().float().cpu()
     ep_bank = torch.cat([endpoint_src, endpoint_dst], dim=1)          # [B, 2K_edge, d_node]
     ep_n = F.normalize(ep_bank, dim=-1, eps=1e-6)
     cos_mat = ep_n @ ep_n.transpose(-1, -2)
