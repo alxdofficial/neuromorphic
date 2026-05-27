@@ -118,6 +118,9 @@ def _snapshot(enc, state, window: int) -> dict:
                   attn_src[0].clamp_min(1e-8).log()).sum(-1)).cpu().numpy()
     dst_ent = (-(attn_dst[0].clamp_min(1e-8) *
                   attn_dst[0].clamp_min(1e-8).log()).sum(-1)).cpu().numpy()
+    # Full distributions for top-K edge rendering. attn_src[0]: [K_edge, K_node].
+    src_attn = attn_src[0].cpu().numpy()
+    dst_attn = attn_dst[0].cpu().numpy()
     return {
         "window": window,
         "N": N[0].float().cpu().numpy(),
@@ -126,6 +129,8 @@ def _snapshot(enc, state, window: int) -> dict:
         "dst_argmax": dst_argmax,
         "src_ent": src_ent,
         "dst_ent": dst_ent,
+        "src_attn": src_attn,
+        "dst_attn": dst_attn,
     }
 
 
@@ -180,35 +185,6 @@ def umap_edge_state_to_hsv(frames, seed: int = 42) -> dict:
         if fi not in out:
             out[fi] = ["rgba(180,180,180,0.4)"] * K_e
     return out
-
-
-def fit_global_pca(frames, n_components: int = 2):
-    """Run PCA on union of N states across all frames.
-    Linear, deterministic — every run gives the same layout for a given
-    ckpt, no init-sensitivity. The fraction of variance captured by
-    top-k PCs is data-dependent (typically 40-55% for k=3 in our regime).
-
-    Honest geometric view: if PCA shows nodes clustered, they really are
-    similar in the top-k variance directions. UMAP can fabricate clusters
-    that don't exist in the original space.
-    """
-    all_N = []
-    sizes = []
-    for f in frames:
-        all_N.append(f["N"])
-        sizes.append(f["N"].shape[0])
-    stacked = np.concatenate(all_N, axis=0)
-    # Center the data — PCA assumes mean=0
-    stacked_centered = stacked - stacked.mean(axis=0, keepdims=True)
-    # SVD: stacked = U·diag(s)·Vt; top-k principal directions are rows of Vt
-    _, _, Vt = np.linalg.svd(stacked_centered, full_matrices=False)
-    emb = stacked_centered @ Vt[:n_components].T
-    layouts = []
-    offset = 0
-    for sz in sizes:
-        layouts.append(emb[offset:offset + sz])
-        offset += sz
-    return layouts
 
 
 def fit_global_umap(frames, n_components: int = 2):
@@ -302,7 +278,8 @@ def build_animation(frames, K_node, K_edge, out_path: Path,
                     metric_y_domain=(0.04, 0.22),
                     height: int = 1100,
                     text_y_offset: float = -0.18,
-                    text_width: int = 1100):
+                    text_width: int = 1100,
+                    edge_topk: int = 1):
     """Render the per-window v5 graph evolution as an interactive HTML.
 
     `panels` is a list of dicts, one per graph subplot:
@@ -375,49 +352,87 @@ def build_animation(frames, K_node, K_edge, out_path: Path,
         return out
 
     def _graph_traces(panel, frame, edge_colors, pc, show_legend_nodes):
-        """Emit graph traces for a single panel given a frame's state."""
+        """Emit graph traces for a single panel given a frame's state.
+
+        Always emits `K_edge * edge_topk * edge_topk` edge traces (constant
+        across frames so plotly's index-based animation works). When
+        edge_topk > 1, each edge slot fans out into top-K_src × top-K_dst
+        candidate lines, opacity = α_src * α_dst (raw joint weight). Top-1
+        × top-1 is naturally most opaque; tails fade with the model's true
+        confidence. Init frames emit empty placeholders.
+        """
         layout_arr = panel["layouts"][_frame_idx_lookup[frame_uid(frame)]]
         dim = panel["dim"]
         axis_kwargs = panel["axis_kwargs"]
         out_traces = []
+        K = edge_topk
+        has_data = (frame["src_argmax"] is not None and frame["window"] != -1)
+        if has_data and K > 1:
+            # Top-K indices and weights per edge. attn shape: [K_edge, K_node].
+            src_attn = frame["src_attn"]; dst_attn = frame["dst_attn"]
+            # argsort descending — slice first K.
+            src_topk_idx = np.argsort(-src_attn, axis=-1)[:, :K]   # [K_edge, K]
+            dst_topk_idx = np.argsort(-dst_attn, axis=-1)[:, :K]
+            src_topk_w = np.take_along_axis(src_attn, src_topk_idx, axis=-1)
+            dst_topk_w = np.take_along_axis(dst_attn, dst_topk_idx, axis=-1)
         for ei in range(K_edge):
-            if frame["src_argmax"] is None or frame["window"] == -1:
-                if dim == 3:
-                    out_traces.append(go.Scatter3d(
-                        x=[], y=[], z=[], mode="lines",
-                        line=dict(color=edge_colors[ei], width=2),
-                        showlegend=False, hoverinfo="skip",
-                        **axis_kwargs,
-                    ))
-                else:
-                    out_traces.append(go.Scatter(
-                        x=[], y=[], mode="lines",
-                        line=dict(color=edge_colors[ei], width=1.5),
-                        showlegend=False, hoverinfo="skip",
-                        **axis_kwargs,
-                    ))
-                continue
-            s = int(frame["src_argmax"][ei]); d = int(frame["dst_argmax"][ei])
-            if dim == 3:
-                x0, y0, z0 = layout_arr[s]; x1, y1, z1 = layout_arr[d]
-                out_traces.append(go.Scatter3d(
-                    x=[x0, x1], y=[y0, y1], z=[z0, z1], mode="lines",
-                    line=dict(color=edge_colors[ei], width=3),
-                    opacity=0.75, showlegend=False,
-                    hovertext=f"edge {ei}: slot {s} → slot {d}",
-                    hoverinfo="text",
-                    **axis_kwargs,
-                ))
-            else:
-                x0, y0 = layout_arr[s]; x1, y1 = layout_arr[d]
-                out_traces.append(go.Scatter(
-                    x=[x0, x1], y=[y0, y1], mode="lines",
-                    line=dict(color=edge_colors[ei], width=1.5),
-                    opacity=0.75, showlegend=False,
-                    hovertext=f"edge {ei}: slot {s} → slot {d}",
-                    hoverinfo="text",
-                    **axis_kwargs,
-                ))
+            for si in range(K):
+                for di in range(K):
+                    if not has_data:
+                        if dim == 3:
+                            out_traces.append(go.Scatter3d(
+                                x=[], y=[], z=[], mode="lines",
+                                line=dict(color=edge_colors[ei], width=1),
+                                opacity=0.0, showlegend=False, hoverinfo="skip",
+                                **axis_kwargs,
+                            ))
+                        else:
+                            out_traces.append(go.Scatter(
+                                x=[], y=[], mode="lines",
+                                line=dict(color=edge_colors[ei], width=0.8),
+                                opacity=0.0, showlegend=False, hoverinfo="skip",
+                                **axis_kwargs,
+                            ))
+                        continue
+                    if K > 1:
+                        s = int(src_topk_idx[ei, si])
+                        d = int(dst_topk_idx[ei, di])
+                        joint = float(src_topk_w[ei, si] * dst_topk_w[ei, di])
+                        # sqrt(joint) compresses the dynamic range: top-1×top-1
+                        # stays clearly dominant, "asymmetric" pairs (one strong
+                        # endpoint, one weak) become visible, "doubly weak"
+                        # pairs still fade. Top-1 is rendered fully opaque so
+                        # the model's primary choice is always obvious.
+                        op = 1.0 if (si == 0 and di == 0) else float(np.sqrt(joint))
+                        lw = 2.5 if (si == 0 and di == 0) else 0.8
+                        hover = (f"edge {ei}: slot {s} → slot {d} "
+                                 f"(α_src={src_topk_w[ei, si]:.2f}, "
+                                 f"α_dst={dst_topk_w[ei, di]:.2f}, "
+                                 f"joint={joint:.3f})")
+                    else:
+                        s = int(frame["src_argmax"][ei])
+                        d = int(frame["dst_argmax"][ei])
+                        op = 0.75
+                        lw = 3 if dim == 3 else 1.5
+                        hover = f"edge {ei}: slot {s} → slot {d}"
+                    if dim == 3:
+                        x0, y0, z0 = layout_arr[s]; x1, y1, z1 = layout_arr[d]
+                        out_traces.append(go.Scatter3d(
+                            x=[x0, x1], y=[y0, y1], z=[z0, z1], mode="lines",
+                            line=dict(color=edge_colors[ei], width=lw),
+                            opacity=op, showlegend=False,
+                            hovertext=hover, hoverinfo="text",
+                            **axis_kwargs,
+                        ))
+                    else:
+                        x0, y0 = layout_arr[s]; x1, y1 = layout_arr[d]
+                        out_traces.append(go.Scatter(
+                            x=[x0, x1], y=[y0, y1], mode="lines",
+                            line=dict(color=edge_colors[ei], width=lw),
+                            opacity=op, showlegend=False,
+                            hovertext=hover, hoverinfo="text",
+                            **axis_kwargs,
+                        ))
         # bank nodes
         hover_texts = [
             f"node {k}<br>picks this window: {int(pc[k])}"
@@ -646,10 +661,12 @@ def main():
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--window-size", type=int, default=1024)
-    ap.add_argument("--layout", choices=["2d", "3d", "both", "quad"], default="quad",
-                    help="2d: 2D UMAP only. 3d: 3D UMAP only. both: 2D+3D UMAP "
-                         "side-by-side. quad (default): 2D UMAP | 3D UMAP on top "
-                         "row, 2D PCA | 3D PCA on second row, shared metrics + text.")
+    ap.add_argument("--edge-topk", type=int, default=1,
+                    help="For each edge slot, render top-K source nodes × top-K "
+                         "dest nodes as K² lines with opacity = α_src × α_dst "
+                         "(joint softmax weight). Default 1 = original argmax. "
+                         "Try 5 to see SoftPointer's full distribution; tails "
+                         "fade with the model's true confidence.")
     args = ap.parse_args()
 
     enc, cfg, step = load_encoder(args.ckpt)
@@ -672,74 +689,25 @@ def main():
     frames = stream_with_capture(enc, cfg, llama_embed, batch, device,
                                   window_size=args.window_size)
 
-    # Fit the projection(s) we'll need.
-    umap_2d = umap_3d = pca_2d = pca_3d = None
-    if args.layout in ("2d", "both", "quad"):
-        print("[layout] UMAP 2D")
-        umap_2d = fit_global_umap(frames, n_components=2)
-    if args.layout in ("3d", "both", "quad"):
-        print("[layout] UMAP 3D")
-        umap_3d = fit_global_umap(frames, n_components=3)
-    if args.layout == "quad":
-        print("[layout] PCA 2D + PCA 3D")
-        pca_2d = fit_global_pca(frames, n_components=2)
-        pca_3d = fit_global_pca(frames, n_components=3)
+    # 2D UMAP is the only layout we render now — 3D/quad were dropped because
+    # the supervisor-facing story works best with a single panel and PCA gave
+    # consistent topology with UMAP (PCA's stretched view was signal, not bug,
+    # but UMAP is easier to read at a glance).
+    print("[layout] UMAP 2D")
+    umap_2d = fit_global_umap(frames, n_components=2)
 
     # Decode per-window text for the side panel (init frame gets empty).
     window_texts = _decode_window_texts(batch, tokenizer, args.window_size)
 
-    # Build the panels list — one per graph subplot. Each carries its own
-    # axis binding and paper-coord domain. The metric panel and text
-    # annotation are appended automatically by build_animation.
-    panels: list[dict] = []
-    height = 1100
-    if args.layout == "2d":
-        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
-                            layouts=umap_2d,
-                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
-                            x_domain=(0.0, 1.0), y_domain=(0.32, 0.98)))
-    elif args.layout == "3d":
-        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
-                            layouts=umap_3d,
-                            axis_kwargs={"scene": "scene"},
-                            x_domain=(0.0, 1.0), y_domain=(0.32, 0.98)))
-    elif args.layout == "both":
-        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
-                            layouts=umap_2d,
-                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
-                            x_domain=(0.0, 0.46), y_domain=(0.32, 0.98)))
-        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
-                            layouts=umap_3d,
-                            axis_kwargs={"scene": "scene"},
-                            x_domain=(0.54, 1.0), y_domain=(0.32, 0.98)))
-    elif args.layout == "quad":
-        height = 1500
-        # Row 1 (top): UMAP-2D | UMAP-3D, y in [0.66, 0.98]
-        # Row 2 (mid): PCA-2D  | PCA-3D,  y in [0.30, 0.62]
-        # Metric panel: y in [0.04, 0.24]
-        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
-                            layouts=umap_2d,
-                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
-                            x_domain=(0.0, 0.46), y_domain=(0.66, 0.98)))
-        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
-                            layouts=umap_3d,
-                            axis_kwargs={"scene": "scene"},
-                            x_domain=(0.54, 1.0), y_domain=(0.66, 0.98)))
-        panels.append(dict(title="v5 graph (2D PCA)", dim=2,
-                            layouts=pca_2d,
-                            axis_kwargs={"xaxis": "x2", "yaxis": "y2"},
-                            x_domain=(0.0, 0.46), y_domain=(0.30, 0.62)))
-        panels.append(dict(title="v5 graph (3D PCA)", dim=3,
-                            layouts=pca_3d,
-                            axis_kwargs={"scene": "scene2"},
-                            x_domain=(0.54, 1.0), y_domain=(0.30, 0.62)))
-
-    metric_y_domain = (0.04, 0.24) if args.layout == "quad" else (0.04, 0.22)
+    panels: list[dict] = [dict(
+        title="v5 graph (2D UMAP)", dim=2, layouts=umap_2d,
+        axis_kwargs={"xaxis": "x", "yaxis": "y"},
+        x_domain=(0.0, 1.0), y_domain=(0.32, 0.98),
+    )]
     build_animation(frames, cfg.graph_v5_K_node, cfg.graph_v5_K_edge, args.out,
                      panels=panels,
                      window_texts=window_texts,
-                     height=height,
-                     metric_y_domain=metric_y_domain)
+                     edge_topk=args.edge_topk)
 
 
 if __name__ == "__main__":
