@@ -182,10 +182,46 @@ def umap_edge_state_to_hsv(frames, seed: int = 42) -> dict:
     return out
 
 
+def fit_global_pca(frames, n_components: int = 2):
+    """Run PCA on union of N states across all frames.
+    Linear, deterministic — every run gives the same layout for a given
+    ckpt, no init-sensitivity. The fraction of variance captured by
+    top-k PCs is data-dependent (typically 40-55% for k=3 in our regime).
+
+    Honest geometric view: if PCA shows nodes clustered, they really are
+    similar in the top-k variance directions. UMAP can fabricate clusters
+    that don't exist in the original space.
+    """
+    all_N = []
+    sizes = []
+    for f in frames:
+        all_N.append(f["N"])
+        sizes.append(f["N"].shape[0])
+    stacked = np.concatenate(all_N, axis=0)
+    # Center the data — PCA assumes mean=0
+    stacked_centered = stacked - stacked.mean(axis=0, keepdims=True)
+    # SVD: stacked = U·diag(s)·Vt; top-k principal directions are rows of Vt
+    _, _, Vt = np.linalg.svd(stacked_centered, full_matrices=False)
+    emb = stacked_centered @ Vt[:n_components].T
+    layouts = []
+    offset = 0
+    for sz in sizes:
+        layouts.append(emb[offset:offset + sz])
+        offset += sz
+    return layouts
+
+
 def fit_global_umap(frames, n_components: int = 2):
     """Run UMAP on union of N states across all frames for stable layout.
-    n_components=2 → 2D layouts (legacy); n_components=3 → 3D (interactive
-    rotation, more freedom for 32-points-in-128D compression artifacts).
+    n_components=2 → 2D layouts (default, animations work cleanly);
+    n_components=3 → 3D (interactive rotation but plotly's Scatter3d
+    doesn't smoothly transition between animation frames the way Scatter
+    does, so animation is more "jump-cut" than fade).
+
+    min_dist=0.8 (up from default 0.3): the trained bank vectors cluster
+    moderately (cross_node_cos ~0.5–0.8 from training telemetry), so a
+    lower min_dist would crunch them together in UMAP space. 0.8 forces
+    more visible separation between distinct nodes.
     """
     import umap
     all_N = []
@@ -195,7 +231,7 @@ def fit_global_umap(frames, n_components: int = 2):
         sizes.append(f["N"].shape[0])
     stacked = np.concatenate(all_N, axis=0)
     stacked_n = stacked / (np.linalg.norm(stacked, axis=-1, keepdims=True) + 1e-6)
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.3, metric="cosine",
+    reducer = umap.UMAP(n_neighbors=10, min_dist=0.8, metric="cosine",
                         random_state=42, n_components=n_components)
     emb = reducer.fit_transform(stacked_n)
     layouts = []
@@ -257,51 +293,61 @@ def _decode_window_texts(batch, tokenizer, window_size: int, max_chars: int = 90
     return texts
 
 
-def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
+
+def build_animation(frames, K_node, K_edge, out_path: Path,
+                    panels: list,
                     window_texts: Optional[list[str]] = None,
-                    n_trail: int = 2, three_d: bool = True):
+                    metric_axes: Optional[dict] = None,
+                    metric_x_domain=(0.0, 1.0),
+                    metric_y_domain=(0.04, 0.22),
+                    height: int = 1100,
+                    text_y_offset: float = -0.18,
+                    text_width: int = 1100):
+    """Render the per-window v5 graph evolution as an interactive HTML.
+
+    `panels` is a list of dicts, one per graph subplot:
+        {
+            "title": str,                    # subplot title
+            "dim": 2 or 3,                   # dimension
+            "layouts": list[np.ndarray],     # per-frame [K_node, dim]
+            "axis_kwargs": dict,             # trace axis binding, e.g. {"xaxis":"x","yaxis":"y"} or {"scene":"scene"}
+            "x_domain": tuple[float, float], # paper-coord x extent
+            "y_domain": tuple[float, float], # paper-coord y extent
+        }
+
+    `metric_axes` defaults to {"xaxis": "x2", "yaxis": "y2"} when 1 panel,
+    or chosen based on panel count (next available axis IDs after panels).
+    """
     F_n = len(frames)
-    n_dim = layouts[0].shape[1]
-    assert n_dim in (2, 3), f"layouts must be 2D or 3D, got {n_dim}D"
-    if three_d and n_dim != 3:
-        raise ValueError("three_d=True but layouts are 2D — pass n_components=3 to fit_global_umap")
-    if not three_d and n_dim != 2:
-        raise ValueError("three_d=False but layouts are 3D — pass n_components=2 to fit_global_umap")
     n_unique, cross_role, ent_src, ent_dst = compute_frame_stats(frames, K_node)
     max_ent = float(np.log(K_node))
-
-    fig = make_subplots(
-        rows=2, cols=1, row_heights=[0.78, 0.22],
-        vertical_spacing=0.08,
-        specs=[
-            [{"type": "scene"} if three_d else {"type": "xy"}],
-            [{"type": "xy"}],
-        ],
-        subplot_titles=(
-            f"v5 graph: bank nodes + edges in {'3D' if three_d else '2D'} UMAP",
-            "Per-window structure metrics",
-        ),
-    )
-
-    # Per-frame metric traces are included in every frame's data (NOT added
-    # statically) so that plotly's animation — which replaces fig.data by
-    # index — doesn't wipe them when stepping between frames.
     x_idx = list(range(F_n))
     frame_labels = ["init" if f["window"] == -1 else f"w{f['window']}" for f in frames]
-    fig.update_xaxes(title_text="frame", row=2, col=1,
-                     tickmode="array", tickvals=x_idx, ticktext=frame_labels)
-    fig.update_yaxes(title_text="count / entropy", row=2, col=1)
 
-    def _bottom_panel_traces(current_fi):
-        """Three metric lines + a vertical marker at current frame.
-        Legend entries are always-shown (legendgroup dedupes across frames)."""
+    # Choose metric panel axis IDs based on which xy axes the panels used.
+    # Count xy panels among panels; metric panel gets the next xy axis IDs.
+    n_xy_panels = sum(1 for p in panels if p["dim"] == 2)
+    if metric_axes is None:
+        if n_xy_panels == 0:
+            metric_axes = {"xaxis": "x", "yaxis": "y"}
+        else:
+            metric_axes = {"xaxis": f"x{n_xy_panels + 1}", "yaxis": f"y{n_xy_panels + 1}"}
+
+    # Build a "naked" Figure (no make_subplots); we'll set axes/scenes by hand
+    # via layout_kwargs. This is simpler than juggling make_subplots specs
+    # for arbitrary panel counts.
+    fig = go.Figure()
+
+    # ── helpers ─────────────────────────────────────────────────────────
+    def _metric_traces(current_fi):
         out = []
+        ax = metric_axes
         out.append(go.Scatter(
             x=x_idx, y=n_unique, mode="lines+markers",
             name=f"# unique slots touched (max={K_node})",
             line=dict(color="#3cb44b", width=2), marker=dict(size=8),
             showlegend=True, legendgroup="metric_unique",
-            xaxis="x2", yaxis="y2",
+            **ax,
         ))
         out.append(go.Scatter(
             x=x_idx, y=cross_role, mode="lines+markers",
@@ -309,7 +355,7 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
             line=dict(color="#e6194b", width=2),
             marker=dict(size=8, symbol="diamond"),
             showlegend=True, legendgroup="metric_xrole",
-            xaxis="x2", yaxis="y2",
+            **ax,
         ))
         out.append(go.Scatter(
             x=x_idx, y=ent_src, mode="lines+markers",
@@ -317,20 +363,100 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
             line=dict(color="#4363d8", width=2, dash="dash"),
             marker=dict(size=7),
             showlegend=True, legendgroup="metric_ent",
-            xaxis="x2", yaxis="y2",
+            **ax,
         ))
         y_top = max(K_node, max_ent + 0.5)
         out.append(go.Scatter(
-            x=[current_fi, current_fi], y=[0, y_top],
-            mode="lines",
-            line=dict(color="rgba(0,0,0,0.4)", width=2, dash="dot"),
+            x=[current_fi, current_fi], y=[0, y_top], mode="lines",
+            line=dict(color="gray", width=1, dash="dot"),
             showlegend=False, hoverinfo="skip",
-            xaxis="x2", yaxis="y2",
+            **ax,
         ))
         return out
 
-    # Compute pick counts per frame (used for hover only — node sizing/coloring
-    # is uniform now since edge density already conveys popularity).
+    def _graph_traces(panel, frame, edge_colors, pc, show_legend_nodes):
+        """Emit graph traces for a single panel given a frame's state."""
+        layout_arr = panel["layouts"][_frame_idx_lookup[frame_uid(frame)]]
+        dim = panel["dim"]
+        axis_kwargs = panel["axis_kwargs"]
+        out_traces = []
+        for ei in range(K_edge):
+            if frame["src_argmax"] is None or frame["window"] == -1:
+                if dim == 3:
+                    out_traces.append(go.Scatter3d(
+                        x=[], y=[], z=[], mode="lines",
+                        line=dict(color=edge_colors[ei], width=2),
+                        showlegend=False, hoverinfo="skip",
+                        **axis_kwargs,
+                    ))
+                else:
+                    out_traces.append(go.Scatter(
+                        x=[], y=[], mode="lines",
+                        line=dict(color=edge_colors[ei], width=1.5),
+                        showlegend=False, hoverinfo="skip",
+                        **axis_kwargs,
+                    ))
+                continue
+            s = int(frame["src_argmax"][ei]); d = int(frame["dst_argmax"][ei])
+            if dim == 3:
+                x0, y0, z0 = layout_arr[s]; x1, y1, z1 = layout_arr[d]
+                out_traces.append(go.Scatter3d(
+                    x=[x0, x1], y=[y0, y1], z=[z0, z1], mode="lines",
+                    line=dict(color=edge_colors[ei], width=3),
+                    opacity=0.75, showlegend=False,
+                    hovertext=f"edge {ei}: slot {s} → slot {d}",
+                    hoverinfo="text",
+                    **axis_kwargs,
+                ))
+            else:
+                x0, y0 = layout_arr[s]; x1, y1 = layout_arr[d]
+                out_traces.append(go.Scatter(
+                    x=[x0, x1], y=[y0, y1], mode="lines",
+                    line=dict(color=edge_colors[ei], width=1.5),
+                    opacity=0.75, showlegend=False,
+                    hovertext=f"edge {ei}: slot {s} → slot {d}",
+                    hoverinfo="text",
+                    **axis_kwargs,
+                ))
+        # bank nodes
+        hover_texts = [
+            f"node {k}<br>picks this window: {int(pc[k])}"
+            for k in range(K_node)
+        ]
+        labels = [str(k) for k in range(K_node)]
+        if dim == 3:
+            out_traces.append(go.Scatter3d(
+                x=layout_arr[:, 0], y=layout_arr[:, 1], z=layout_arr[:, 2],
+                mode="markers+text",
+                marker=dict(size=5, color="white",
+                            line=dict(color="#222222", width=1)),
+                text=labels, textposition="top center",
+                textfont=dict(size=9, color="#222222", family="Arial"),
+                name=f"bank node 0–{K_node - 1}", showlegend=show_legend_nodes,
+                legendgroup="bank_node",
+                hovertext=hover_texts, hoverinfo="text",
+                **axis_kwargs,
+            ))
+        else:
+            out_traces.append(go.Scatter(
+                x=layout_arr[:, 0], y=layout_arr[:, 1], mode="markers+text",
+                marker=dict(size=18, color="white", symbol="circle",
+                            line=dict(color="#222222", width=1.2)),
+                text=labels, textposition="middle center",
+                textfont=dict(size=8, color="#222222", family="Arial"),
+                name=f"bank node 0–{K_node - 1}", showlegend=show_legend_nodes,
+                legendgroup="bank_node",
+                hovertext=hover_texts, hoverinfo="text",
+                **axis_kwargs,
+            ))
+        return out_traces
+
+    # Each frame holds an ordered list of traces — metric panel + each panel's
+    # graph traces. Order must be stable across frames so plotly's index-based
+    # animation update works.
+    def frame_uid(f): return ("init" if f["window"] == -1 else f["window"])
+    _frame_idx_lookup = {frame_uid(f): i for i, f in enumerate(frames)}
+
     pick_counts_per_frame = []
     for f in frames:
         pc = np.zeros(K_node)
@@ -338,123 +464,35 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
             for k in f["src_argmax"].tolist() + f["dst_argmax"].tolist():
                 pc[k] += 1
         pick_counts_per_frame.append(pc)
-
-    # Per-edge color from UMAP-3D(edge_state) → HSV. Each edge's color
-    # reflects its state-vector content; edges with similar relational
-    # content get similar colors (consistent across frames).
     edge_colors_per_frame = umap_edge_state_to_hsv(frames)
 
-    # ── Frame builder ──
-    # Each frame includes ALL traces (top-panel viz + bottom-panel metrics).
-    # plotly's animation replaces fig.data by index when stepping between
-    # frames — include metric traces per-frame to persist. Per-edge colors
-    # mean we emit K_edge edge traces (one each), giving each its own color.
     plotly_frames = []
     for fi in range(F_n):
-        traces = list(_bottom_panel_traces(fi))   # 4 traces: 3 metric lines + vertical marker
+        traces = list(_metric_traces(fi))  # 4 metric traces
         f = frames[fi]
-        layout = layouts[fi]
         pc = pick_counts_per_frame[fi]
         edge_colors = edge_colors_per_frame[fi]
+        for pi, panel in enumerate(panels):
+            # Show legend bank-node entry only on the FIRST panel to avoid duplicates.
+            traces.extend(_graph_traces(panel, f, edge_colors, pc,
+                                         show_legend_nodes=(pi == 0)))
 
-        # One trace per edge (so each gets its own UMAP→HSV color).
-        # Self-loops drawn as a tiny circle at the slot position.
-        for ei in range(K_edge):
-            if f["src_argmax"] is None or f["window"] == -1:
-                # init frame — emit empty placeholder to keep trace-index stable
-                if three_d:
-                    traces.append(go.Scatter3d(
-                        x=[], y=[], z=[], mode="lines",
-                        line=dict(color=edge_colors[ei], width=2),
-                        showlegend=False, hoverinfo="skip",
-                        scene="scene",
-                    ))
-                else:
-                    traces.append(go.Scatter(
-                        x=[], y=[], mode="lines",
-                        line=dict(color=edge_colors[ei], width=1.5),
-                        showlegend=False, hoverinfo="skip",
-                        xaxis="x", yaxis="y",
-                    ))
-                continue
-            s = int(f["src_argmax"][ei]); d = int(f["dst_argmax"][ei])
-            if three_d:
-                x0, y0, z0 = layout[s]; x1, y1, z1 = layout[d]
-                traces.append(go.Scatter3d(
-                    x=[x0, x1], y=[y0, y1], z=[z0, z1], mode="lines",
-                    line=dict(color=edge_colors[ei], width=3),
-                    opacity=0.75, showlegend=False,
-                    hovertext=f"edge {ei}: slot {s} → slot {d}",
-                    hoverinfo="text",
-                    scene="scene",
-                ))
-            else:
-                x0, y0 = layout[s]; x1, y1 = layout[d]
-                traces.append(go.Scatter(
-                    x=[x0, x1], y=[y0, y1], mode="lines",
-                    line=dict(color=edge_colors[ei], width=1.8),
-                    opacity=0.75,
-                    showlegend=False,
-                    hovertext=f"edge {ei}: slot {s} → slot {d}",
-                    hoverinfo="text",
-                    xaxis="x", yaxis="y",
-                ))
-
-        # Bank nodes — circles with persistent numeric labels (0..K_node-1).
-        # The number is purely positional ID, not semantic content (slot
-        # identities are arbitrary per-chunk). Same k in window 1 vs window 4
-        # lets you watch how that specific node drifts through semantic
-        # (UMAP) space as its content evolves window-to-window.
-        hover_texts = [
-            f"node {k}<br>picks this window: {int(pc[k])}"
-            for k in range(K_node)
-        ]
-        labels = [str(k) for k in range(K_node)]
-        if three_d:
-            traces.append(go.Scatter3d(
-                x=layout[:, 0], y=layout[:, 1], z=layout[:, 2],
-                mode="markers+text",
-                marker=dict(size=6, color="white",
-                            line=dict(color="#222222", width=1)),
-                text=labels, textposition="top center",
-                textfont=dict(size=10, color="#222222", family="Arial"),
-                name=f"bank node 0–{K_node - 1}", showlegend=True,
-                legendgroup="bank_node",
-                hovertext=hover_texts, hoverinfo="text",
-                scene="scene",
-            ))
-        else:
-            traces.append(go.Scatter(
-                x=layout[:, 0], y=layout[:, 1], mode="markers+text",
-                marker=dict(size=24, color="white",
-                            symbol="circle",
-                            line=dict(color="#222222", width=1.5)),
-                text=labels, textposition="middle center",
-                textfont=dict(size=9, color="#222222", family="Arial"),
-                name=f"bank node 0–{K_node - 1}", showlegend=True,
-                legendgroup="bank_node",
-                hovertext=hover_texts, hoverinfo="text",
-                xaxis="x", yaxis="y",
-            ))
-
-        # Per-frame text annotation: shows the actual tokens consumed in
-        # this window. Sits below the metric panel so users can visually
-        # correlate "this passage came in → these nodes/edges shifted."
+        # Per-frame text annotation
         if window_texts is not None and fi < len(window_texts):
             text = window_texts[fi]
         else:
             text = ""
         text_anno = dict(
-            name="window_text_panel",  # named so plotly replaces (not stacks) across frames
-            x=0.0, y=-0.18, xref="paper", yref="paper",
+            name="window_text_panel",
+            x=0.0, y=text_y_offset, xref="paper", yref="paper",
             xanchor="left", yanchor="top", showarrow=False,
             align="left",
             text=(f"<b>Window text:</b><br>{text}" if text
                   else "<b>Window text:</b> <i>[init — no tokens consumed yet]</i>"),
             font=dict(size=11, family="monospace", color="#222"),
-            bgcolor="rgba(245,245,245,1.0)",  # full opacity to prevent blend with stale frames
+            bgcolor="rgba(245,245,245,1.0)",
             bordercolor="#888", borderwidth=1,
-            width=1100,
+            width=text_width,
         )
         plotly_frames.append(go.Frame(
             data=traces, name=frame_labels[fi],
@@ -465,26 +503,10 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
             ),
         ))
 
-    # Default the initial visible frame to w0 (window 0, not chunk init) so
-    # the user sees edges immediately on load. Init frame is still in the
-    # animation, just not the landing frame.
     initial_frame_idx = 1 if F_n > 1 else 0
     fig.add_traces(plotly_frames[initial_frame_idx].data)
     fig.frames = plotly_frames
-    # Initial annotation = the initial frame's annotation. Per-frame
-    # annotations from frame.layout replace this on slider/play because
-    # plotly merges layout dicts by KEY, and we use the same "annotations"
-    # list-key everywhere, so the most recent layout's annotations list wins.
-    # (Earlier attempts that left annotations in both static AND frame layouts
-    # caused STACKING — two text panels visible per frame, the static one
-    # stuck at w0's text.)
-    initial_annos = list(plotly_frames[initial_frame_idx].layout.annotations or ())
 
-    # 300ms transition gives smooth node/edge interpolation between frames.
-    # (The "opacity blend on text" bug from an earlier session was actually
-    # a static-layout-annotation stacking issue, not a transition issue —
-    # fixed separately by removing the static annotation. Annotations
-    # don't fade through transitions; they just replace on the next frame.)
     steps = [dict(method="animate",
                    args=[[f.name], dict(mode="immediate",
                                          frame=dict(duration=800, redraw=True),
@@ -494,23 +516,16 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
                      currentvalue=dict(prefix="frame: "),
                      pad=dict(t=40), steps=steps)]
 
-    # Responsive layout: NO fixed width. Title carries the key context.
-    # Plotly's native legend (right side, INSIDE the figure) replaces the
-    # external paper-coordinate annotation that was getting cropped off.
-    fig.update_layout(
+    # Build layout: per-panel axis/scene domains, metric axes, title, sliders.
+    layout_kwargs = dict(
         title=dict(
             text=_frame_title(initial_frame_idx, frames, n_unique, cross_role,
                                 ent_src, max_ent, K_node, K_edge),
             x=0.02, xanchor="left",
         ),
-        height=1050,
+        height=height,
         autosize=True,
         margin=dict(l=60, r=180, t=80, b=320),
-        # No annotations in the static layout — plotly's animation merge
-        # APPENDS frame.layout.annotations rather than replacing, so a static
-        # text panel would stack on top of each frame's text panel. The
-        # post_script below fires Plotly.animate on load to render the
-        # initial frame's text immediately (no static annotation needed).
         sliders=sliders,
         legend=dict(
             x=1.02, y=1.0, xanchor="left", yanchor="top",
@@ -530,15 +545,66 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
                                               mode="immediate")])],
         )],
     )
-    fig.update_xaxes(showgrid=False, zeroline=False, row=1, col=1)
-    fig.update_yaxes(showgrid=False, zeroline=False, scaleanchor="x", row=1, col=1)
+
+    # Set per-panel axes/scenes. Track which xy axis number we're on.
+    xy_counter = 0
+    for panel in panels:
+        if panel["dim"] == 2:
+            xy_counter += 1
+            ax_suffix = "" if xy_counter == 1 else str(xy_counter)
+            layout_kwargs[f"xaxis{ax_suffix}"] = dict(
+                domain=list(panel["x_domain"]),
+                anchor=f"y{ax_suffix}",
+                showgrid=False, zeroline=False,
+                title=dict(text=panel.get("title"), font=dict(size=12)),
+            )
+            layout_kwargs[f"yaxis{ax_suffix}"] = dict(
+                domain=list(panel["y_domain"]),
+                anchor=f"x{ax_suffix}",
+                showgrid=False, zeroline=False,
+                scaleanchor=f"x{ax_suffix}",
+            )
+        else:  # 3D
+            scene_name = panel["axis_kwargs"]["scene"]
+            layout_kwargs[scene_name] = dict(
+                domain=dict(x=list(panel["x_domain"]),
+                            y=list(panel["y_domain"])),
+                aspectmode="data",
+                dragmode="orbit",
+            )
+            # Add subplot title as a paper-coord annotation since 3D scenes
+            # don't have native titles in plotly.
+            if panel.get("title"):
+                layout_kwargs.setdefault("annotations", []).append(dict(
+                    text=f"<b>{panel['title']}</b>",
+                    x=(panel["x_domain"][0] + panel["x_domain"][1]) / 2,
+                    y=panel["y_domain"][1] + 0.015,
+                    xref="paper", yref="paper",
+                    showarrow=False, font=dict(size=12),
+                    xanchor="center", yanchor="bottom",
+                ))
+
+    # Metric panel axes. Trace-axis name like "x3" maps to layout property
+    # "xaxis3" (with the digits appended after "axis"). For the base axis
+    # "x"/"y", the layout key is "xaxis"/"yaxis" with no suffix.
+    mx = metric_axes["xaxis"]; my = metric_axes["yaxis"]
+    mx_layout_key = "xaxis" if mx == "x" else f"xaxis{mx[1:]}"
+    my_layout_key = "yaxis" if my == "y" else f"yaxis{my[1:]}"
+    layout_kwargs[mx_layout_key] = dict(
+        domain=list(metric_x_domain),
+        anchor=my,
+        tickmode="array", tickvals=x_idx, ticktext=frame_labels,
+        title_text="frame",
+    )
+    layout_kwargs[my_layout_key] = dict(
+        domain=list(metric_y_domain),
+        anchor=mx,
+        title_text="count / entropy",
+    )
+
+    fig.update_layout(**layout_kwargs)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # responsive=True → fills container, useful when the HTML is loaded into
-    # a wider viewport than the default 700px plotly fallback.
-    # post_script: fire Plotly.animate to initial frame on load so the
-    # initial render shows the initial frame's text annotation. Without
-    # this the page loads blank-text until the user moves the slider.
     initial_frame_name = plotly_frames[initial_frame_idx].name
     post_script = f"""
     setTimeout(function() {{
@@ -555,12 +621,12 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
                     post_script=post_script)
     print(f"[output] wrote {out_path}")
 
-    # Console summary
     print(f"\n[per-frame stats]")
     print(f"  unique slots touched: {n_unique}")
     print(f"  cross-role overlap:   {cross_role}")
     print(f"  mean src entropy:     {[f'{e:.2f}' if not np.isnan(e) else 'init' for e in ent_src]}")
     print(f"  (max entropy = log({K_node}) = {max_ent:.2f})")
+
 
 
 def _frame_title(fi, frames, n_unique, cross_role, ent_src, max_ent, K_node, K_edge):
@@ -580,10 +646,11 @@ def main():
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--window-size", type=int, default=1024)
-    ap.add_argument("--2d", dest="two_d", action="store_true",
-                    help="Render in 2D UMAP (default: 3D, interactive rotation, more freedom for 128D→k compression).")
+    ap.add_argument("--layout", choices=["2d", "3d", "both", "quad"], default="quad",
+                    help="2d: 2D UMAP only. 3d: 3D UMAP only. both: 2D+3D UMAP "
+                         "side-by-side. quad (default): 2D UMAP | 3D UMAP on top "
+                         "row, 2D PCA | 3D PCA on second row, shared metrics + text.")
     args = ap.parse_args()
-    three_d = not args.two_d
 
     enc, cfg, step = load_encoder(args.ckpt)
     print(f"[ckpt] step={step}")
@@ -604,15 +671,75 @@ def main():
     print(f"[forward] streaming chunk ({args.chunk_size // args.window_size} windows) on {device}")
     frames = stream_with_capture(enc, cfg, llama_embed, batch, device,
                                   window_size=args.window_size)
-    n_dim = 3 if three_d else 2
-    print(f"[layout] global UMAP (n_components={n_dim}) over {len(frames)} snapshots")
-    layouts = fit_global_umap(frames, n_components=n_dim)
+
+    # Fit the projection(s) we'll need.
+    umap_2d = umap_3d = pca_2d = pca_3d = None
+    if args.layout in ("2d", "both", "quad"):
+        print("[layout] UMAP 2D")
+        umap_2d = fit_global_umap(frames, n_components=2)
+    if args.layout in ("3d", "both", "quad"):
+        print("[layout] UMAP 3D")
+        umap_3d = fit_global_umap(frames, n_components=3)
+    if args.layout == "quad":
+        print("[layout] PCA 2D + PCA 3D")
+        pca_2d = fit_global_pca(frames, n_components=2)
+        pca_3d = fit_global_pca(frames, n_components=3)
 
     # Decode per-window text for the side panel (init frame gets empty).
     window_texts = _decode_window_texts(batch, tokenizer, args.window_size)
 
-    build_animation(frames, layouts, cfg.graph_v5_K_node, cfg.graph_v5_K_edge,
-                     args.out, window_texts=window_texts, three_d=three_d)
+    # Build the panels list — one per graph subplot. Each carries its own
+    # axis binding and paper-coord domain. The metric panel and text
+    # annotation are appended automatically by build_animation.
+    panels: list[dict] = []
+    height = 1100
+    if args.layout == "2d":
+        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
+                            layouts=umap_2d,
+                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
+                            x_domain=(0.0, 1.0), y_domain=(0.32, 0.98)))
+    elif args.layout == "3d":
+        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
+                            layouts=umap_3d,
+                            axis_kwargs={"scene": "scene"},
+                            x_domain=(0.0, 1.0), y_domain=(0.32, 0.98)))
+    elif args.layout == "both":
+        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
+                            layouts=umap_2d,
+                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
+                            x_domain=(0.0, 0.46), y_domain=(0.32, 0.98)))
+        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
+                            layouts=umap_3d,
+                            axis_kwargs={"scene": "scene"},
+                            x_domain=(0.54, 1.0), y_domain=(0.32, 0.98)))
+    elif args.layout == "quad":
+        height = 1500
+        # Row 1 (top): UMAP-2D | UMAP-3D, y in [0.66, 0.98]
+        # Row 2 (mid): PCA-2D  | PCA-3D,  y in [0.30, 0.62]
+        # Metric panel: y in [0.04, 0.24]
+        panels.append(dict(title="v5 graph (2D UMAP)", dim=2,
+                            layouts=umap_2d,
+                            axis_kwargs={"xaxis": "x", "yaxis": "y"},
+                            x_domain=(0.0, 0.46), y_domain=(0.66, 0.98)))
+        panels.append(dict(title="v5 graph (3D UMAP)", dim=3,
+                            layouts=umap_3d,
+                            axis_kwargs={"scene": "scene"},
+                            x_domain=(0.54, 1.0), y_domain=(0.66, 0.98)))
+        panels.append(dict(title="v5 graph (2D PCA)", dim=2,
+                            layouts=pca_2d,
+                            axis_kwargs={"xaxis": "x2", "yaxis": "y2"},
+                            x_domain=(0.0, 0.46), y_domain=(0.30, 0.62)))
+        panels.append(dict(title="v5 graph (3D PCA)", dim=3,
+                            layouts=pca_3d,
+                            axis_kwargs={"scene": "scene2"},
+                            x_domain=(0.54, 1.0), y_domain=(0.30, 0.62)))
+
+    metric_y_domain = (0.04, 0.24) if args.layout == "quad" else (0.04, 0.22)
+    build_animation(frames, cfg.graph_v5_K_node, cfg.graph_v5_K_edge, args.out,
+                     panels=panels,
+                     window_texts=window_texts,
+                     height=height,
+                     metric_y_domain=metric_y_domain)
 
 
 if __name__ == "__main__":
