@@ -182,8 +182,11 @@ def umap_edge_state_to_hsv(frames, seed: int = 42) -> dict:
     return out
 
 
-def fit_global_umap(frames):
-    """Run UMAP on union of N states across all frames for stable layout."""
+def fit_global_umap(frames, n_components: int = 2):
+    """Run UMAP on union of N states across all frames for stable layout.
+    n_components=2 → 2D layouts (legacy); n_components=3 → 3D (interactive
+    rotation, more freedom for 32-points-in-128D compression artifacts).
+    """
     import umap
     all_N = []
     sizes = []
@@ -193,7 +196,7 @@ def fit_global_umap(frames):
     stacked = np.concatenate(all_N, axis=0)
     stacked_n = stacked / (np.linalg.norm(stacked, axis=-1, keepdims=True) + 1e-6)
     reducer = umap.UMAP(n_neighbors=15, min_dist=0.3, metric="cosine",
-                        random_state=42, n_components=2)
+                        random_state=42, n_components=n_components)
     emb = reducer.fit_transform(stacked_n)
     layouts = []
     offset = 0
@@ -255,16 +258,29 @@ def _decode_window_texts(batch, tokenizer, window_size: int, max_chars: int = 90
 
 
 def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
-                    window_texts: Optional[list[str]] = None, n_trail: int = 2):
+                    window_texts: Optional[list[str]] = None,
+                    n_trail: int = 2, three_d: bool = True):
     F_n = len(frames)
+    n_dim = layouts[0].shape[1]
+    assert n_dim in (2, 3), f"layouts must be 2D or 3D, got {n_dim}D"
+    if three_d and n_dim != 3:
+        raise ValueError("three_d=True but layouts are 2D — pass n_components=3 to fit_global_umap")
+    if not three_d and n_dim != 2:
+        raise ValueError("three_d=False but layouts are 3D — pass n_components=2 to fit_global_umap")
     n_unique, cross_role, ent_src, ent_dst = compute_frame_stats(frames, K_node)
     max_ent = float(np.log(K_node))
 
     fig = make_subplots(
         rows=2, cols=1, row_heights=[0.78, 0.22],
         vertical_spacing=0.08,
-        subplot_titles=("v5 graph: bank nodes + edges in 2D UMAP",
-                         "Per-window structure metrics"),
+        specs=[
+            [{"type": "scene"} if three_d else {"type": "xy"}],
+            [{"type": "xy"}],
+        ],
+        subplot_titles=(
+            f"v5 graph: bank nodes + edges in {'3D' if three_d else '2D'} UMAP",
+            "Per-window structure metrics",
+        ),
     )
 
     # Per-frame metric traces are included in every frame's data (NOT added
@@ -346,24 +362,43 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
         for ei in range(K_edge):
             if f["src_argmax"] is None or f["window"] == -1:
                 # init frame — emit empty placeholder to keep trace-index stable
-                traces.append(go.Scatter(
-                    x=[], y=[], mode="lines",
-                    line=dict(color=edge_colors[ei], width=1.5),
-                    showlegend=False, hoverinfo="skip",
-                    xaxis="x", yaxis="y",
-                ))
+                if three_d:
+                    traces.append(go.Scatter3d(
+                        x=[], y=[], z=[], mode="lines",
+                        line=dict(color=edge_colors[ei], width=2),
+                        showlegend=False, hoverinfo="skip",
+                        scene="scene",
+                    ))
+                else:
+                    traces.append(go.Scatter(
+                        x=[], y=[], mode="lines",
+                        line=dict(color=edge_colors[ei], width=1.5),
+                        showlegend=False, hoverinfo="skip",
+                        xaxis="x", yaxis="y",
+                    ))
                 continue
             s = int(f["src_argmax"][ei]); d = int(f["dst_argmax"][ei])
-            x0, y0 = layout[s]; x1, y1 = layout[d]
-            traces.append(go.Scatter(
-                x=[x0, x1], y=[y0, y1], mode="lines",
-                line=dict(color=edge_colors[ei], width=1.8),
-                opacity=0.75,
-                showlegend=False,
-                hovertext=f"edge {ei}: slot {s} → slot {d}",
-                hoverinfo="text",
-                xaxis="x", yaxis="y",
-            ))
+            if three_d:
+                x0, y0, z0 = layout[s]; x1, y1, z1 = layout[d]
+                traces.append(go.Scatter3d(
+                    x=[x0, x1], y=[y0, y1], z=[z0, z1], mode="lines",
+                    line=dict(color=edge_colors[ei], width=3),
+                    opacity=0.75, showlegend=False,
+                    hovertext=f"edge {ei}: slot {s} → slot {d}",
+                    hoverinfo="text",
+                    scene="scene",
+                ))
+            else:
+                x0, y0 = layout[s]; x1, y1 = layout[d]
+                traces.append(go.Scatter(
+                    x=[x0, x1], y=[y0, y1], mode="lines",
+                    line=dict(color=edge_colors[ei], width=1.8),
+                    opacity=0.75,
+                    showlegend=False,
+                    hovertext=f"edge {ei}: slot {s} → slot {d}",
+                    hoverinfo="text",
+                    xaxis="x", yaxis="y",
+                ))
 
         # Bank nodes — circles with persistent numeric labels (0..K_node-1).
         # The number is purely positional ID, not semantic content (slot
@@ -375,18 +410,32 @@ def build_animation(frames, layouts, K_node, K_edge, out_path: Path,
             for k in range(K_node)
         ]
         labels = [str(k) for k in range(K_node)]
-        traces.append(go.Scatter(
-            x=layout[:, 0], y=layout[:, 1], mode="markers+text",
-            marker=dict(size=24, color="white",
-                        symbol="circle",
-                        line=dict(color="#222222", width=1.5)),
-            text=labels, textposition="middle center",
-            textfont=dict(size=9, color="#222222", family="Arial"),
-            name=f"bank node 0–{K_node - 1}", showlegend=True,
-            legendgroup="bank_node",
-            hovertext=hover_texts, hoverinfo="text",
-            xaxis="x", yaxis="y",
-        ))
+        if three_d:
+            traces.append(go.Scatter3d(
+                x=layout[:, 0], y=layout[:, 1], z=layout[:, 2],
+                mode="markers+text",
+                marker=dict(size=6, color="white",
+                            line=dict(color="#222222", width=1)),
+                text=labels, textposition="top center",
+                textfont=dict(size=10, color="#222222", family="Arial"),
+                name=f"bank node 0–{K_node - 1}", showlegend=True,
+                legendgroup="bank_node",
+                hovertext=hover_texts, hoverinfo="text",
+                scene="scene",
+            ))
+        else:
+            traces.append(go.Scatter(
+                x=layout[:, 0], y=layout[:, 1], mode="markers+text",
+                marker=dict(size=24, color="white",
+                            symbol="circle",
+                            line=dict(color="#222222", width=1.5)),
+                text=labels, textposition="middle center",
+                textfont=dict(size=9, color="#222222", family="Arial"),
+                name=f"bank node 0–{K_node - 1}", showlegend=True,
+                legendgroup="bank_node",
+                hovertext=hover_texts, hoverinfo="text",
+                xaxis="x", yaxis="y",
+            ))
 
         # Per-frame text annotation: shows the actual tokens consumed in
         # this window. Sits below the metric panel so users can visually
@@ -531,7 +580,10 @@ def main():
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--window-size", type=int, default=1024)
+    ap.add_argument("--2d", dest="two_d", action="store_true",
+                    help="Render in 2D UMAP (default: 3D, interactive rotation, more freedom for 128D→k compression).")
     args = ap.parse_args()
+    three_d = not args.two_d
 
     enc, cfg, step = load_encoder(args.ckpt)
     print(f"[ckpt] step={step}")
@@ -552,14 +604,15 @@ def main():
     print(f"[forward] streaming chunk ({args.chunk_size // args.window_size} windows) on {device}")
     frames = stream_with_capture(enc, cfg, llama_embed, batch, device,
                                   window_size=args.window_size)
-    print(f"[layout] global UMAP over {len(frames)} snapshots")
-    layouts = fit_global_umap(frames)
+    n_dim = 3 if three_d else 2
+    print(f"[layout] global UMAP (n_components={n_dim}) over {len(frames)} snapshots")
+    layouts = fit_global_umap(frames, n_components=n_dim)
 
     # Decode per-window text for the side panel (init frame gets empty).
     window_texts = _decode_window_texts(batch, tokenizer, args.window_size)
 
     build_animation(frames, layouts, cfg.graph_v5_K_node, cfg.graph_v5_K_edge,
-                     args.out, window_texts=window_texts)
+                     args.out, window_texts=window_texts, three_d=three_d)
 
 
 if __name__ == "__main__":
